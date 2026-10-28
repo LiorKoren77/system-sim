@@ -937,7 +937,7 @@ links: []
                    "node 'u': client needs rate.base");
 }
 
-TEST_CASE("a client op share must be a number in (0, 1]") {
+TEST_CASE("a client op share must be a number above zero and at most one") {
   require_rejected("simsys_share_zero.yaml", R"(
 version: 1
 name: t
