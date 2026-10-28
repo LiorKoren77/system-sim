@@ -263,7 +263,7 @@ together with named modules today; Clang 18 is kept for formatting only."
 **Files:**
 - Modify: `src/core/core.cppm`
 - Create: `tests/unit/test_units.cpp`
-- Modify: `tests/CMakeLists.txt`; delete `tests/unit/placeholder.cpp`
+- Modify: `tests/CMakeLists.txt`
 
 - [ ] **Step 1: Write the failing tests**
 
