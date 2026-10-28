@@ -61,9 +61,9 @@ do not support yet (phase 2)". `explain` works for every type.
 | `version` | integer | yes | read | always `1` (unquoted) |
 | `name` | string | yes | read | non-empty; shown in reports |
 | `seed` | integer | no | checked | default 1; within the range of `int`. Printed by `explain`, used from phase 2 (noise) |
-| `duration` | duration | yes | read | simulated span of `run` |
+| `duration` | duration | yes | read | simulated span of `run`; must be positive |
 | `step` | duration | no | read | default `100ms`; must be positive |
-| `warmup` | duration | no | read | steps before it are left out of the report; default 0 |
+| `warmup` | duration | no | read | steps before it are left out of the report; default 0; must be shorter than `duration`, so the report never covers an empty window (`run --duration` obeys the same rule) |
 | `datacenters` | map | no | read | see below; default: one datacenter `main` |
 | `nodes` | map id → node | yes | read | non-empty; ids are non-empty and unique |
 | `links` | list | yes | read | `[]` for none |
@@ -90,7 +90,7 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 | `type` | enum | all | read | one of the catalogue below |
 | `dc` | string | all | read | a declared datacenter; default as above. Decides whether a link without `latency` is intra- or cross-DC |
 | `replicas` | integer > 0 | all | read | N identical copies behind an equal split: each copy sees `demand / N` with the node's full capacity, concurrency and queue limit; backlog and drops are reported summed. No effect on a client |
-| `capacity` | rate or byte rate | all but `client` | read | service rate **per replica**; default per type (§6 of the spec). A byte rate (`500MB/s`) is read as objects of 1 MB per second |
+| `capacity` | rate or byte rate | all but `client` | read | service rate **per replica**; default per type (§6 of the spec). A byte rate (`500MB/s`) is read as objects of 1 MB per second. At most `1e15/s` (`1e15B/s` for a byte rate) |
 | `latency` | duration | all but `client` | read | service time of one request; default per type |
 | `advanced` | map | all but `client` | read | see next table |
 | `ops` | map | `client`, `service`, `ws_gateway` | read (client, service); checked (ws_gateway) | client: op → share; otherwise op → step list (below) |
@@ -105,7 +105,7 @@ A key outside its row is an error, e.g. `key 'capacity' is not valid for type 'c
 | key | type | default | meaning |
 |---|---|---|---|
 | `queue_limit` | integer > 0 | 1000 (chosen) | requests that may wait per replica; beyond it the excess is dropped |
-| `concurrency` | integer > 0 | implied: `max(1, ceil(capacity × latency))` | servers per replica, the c of M/M/c. The default is Little's law at full load (busy servers = throughput × time in service), which keeps the rate and the Erlang C term describing one machine |
+| `concurrency` | integer in [1, 100000] | implied: `max(1, ceil(capacity × latency))`, capped at 100000 | servers per replica, the c of M/M/c. The cap exists because the Erlang C term costs O(c) per node per step. The default is Little's law at full load (busy servers = throughput × time in service), which keeps the rate and the Erlang C term describing one machine |
 | `service_variability` | number ≥ 0 | 1.0 (2.0 for `external_sink`) | squared coefficient of variation (SCV) of service time; 1 = exponential |
 | `burstiness` | number ≥ 0 | 1.0 | **new in v1.1**: SCV of inter-arrival times; 1 = Poisson. With `service_variability` it forms the Allen–Cunneen factor `(burstiness + service_variability) / 2` that scales the queueing wait (Kingman's correction) |
 | `yellow` | number in (0, 1] | 0.70 | utilization where the node turns yellow |
@@ -124,7 +124,7 @@ A **step** is `{to: <node id>, op: <op name>, on: always|miss|failure, mode: seq
 | `op` | the incoming op | read | required in `then` steps, which have no incoming op to inherit |
 | `on` | `always` | read | `miss` applies to the flow a cache/CDN did not serve, `failure` to failed requests. In phase 1 only `always` steps fire: services have nothing to miss and no failures are modelled |
 | `mode` | `sequential` | read | sequential steps add their latencies; **all parallel steps of an op form one group wherever they sit** among the sequential ones, and the group costs its slowest branch |
-| `factor` | 1 | read | finite, positive; multiplies the flow (fan-out: one post → 100 feed writes) |
+| `factor` | 1 | read | finite, positive, at most `1e6`; multiplies the flow (fan-out: one post → 100 feed writes) |
 
 An op with an empty step list (`deliver: []`) is terminal: the node serves it and forwards
 nothing. *(graph)* Every step needs a link that carries demand from the node to its
@@ -134,7 +134,7 @@ target and, if that link lists `ops`, lists the step's op.
 
 | type | own keys | phase 1 |
 |---|---|---|
-| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate.base` and `ops` read; `timeout` checked (a duration), not yet used; `keys`, `sizes`, `retries` ignored |
+| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate.base` (at most `1e15/s`) and `ops` read; `timeout` checked (a duration), not yet used; `keys`, `sizes`, `retries` ignored |
 | `cdn` | `ttl`, `hit_ratio` (`fixed: h` or `model` †), `origin` (node id) | `origin` checked (a declared node); others ignored |
 | `load_balancer` | `policy` `round_robin|least_connections|weighted|consistent_hash`, `vnodes` (int, consistent_hash) | ignored |
 | `rate_limiter` | `algorithm` `token_bucket|leaky_bucket|fixed_window|sliding_log|sliding_counter`, `limit` (rate), `burst` (int), `backend` (node id of a cache holding counters) | `backend` checked; others ignored |
@@ -206,14 +206,21 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 | metric | `node` | `op` | `max` | phase 1 evaluates |
 |---|---|---|---|---|
 | `p50_latency`, `p95_latency`, `p99_latency` | required, a **client** | optional, one the client sends | duration | the client's estimated end-to-end percentile; without `op`, the worst of its ops |
-| `drop_rate` | optional | optional | number in [0, 1] | dropped / offered requests over the whole scenario (see note) |
-| `utilization` | optional | optional | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup (see note) |
-| `queue_lag` | optional | optional | duration | reported `skipped` until phase 2 |
-| `staleness` | optional | optional | duration | reported `skipped` until phase 2 |
+| `drop_rate` | optional | not allowed | number in [0, 1] | the node's dropped / the requests sent to it, after warmup; without `node`, the worst node's (see note) |
+| `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup |
+| `queue_lag` | optional | not allowed | duration | reported `skipped` until phase 2 |
+| `staleness` | optional | not allowed | duration | reported `skipped` until phase 2 |
 
 The kind of `max` follows the metric, so `0.01` can never be read as 0.01 seconds.
-Note: phase 1 measures `drop_rate` for the whole scenario even when `node` is given, and
-reports a `utilization` SLO without `node` as `skipped`.
+`op` is only valid for latency metrics (`slo: op is only valid for latency metrics`): drop
+rate and utilization are measured per node, not per op.
+
+Note: `drop_rate` is per node, Σ dropped / Σ demand of that node, so it stays in [0, 1]
+even when fan-out multiplies the clients' requests before they reach it (one post → 100
+feed writes would make "dropped anywhere / offered by clients" 90). Without `node` it is
+the worst node's, since every node must keep the bound; the table header names that node.
+When no step was observed every SLO is `skipped` and `run` exits 1: no data is an error,
+not a pass.
 
 ## Faults
 

@@ -2,21 +2,22 @@
 // wrappers over library calls so they stay testable without a process.
 //
 // Exit codes: 0 the run worked and every SLO passed, 2 it worked but an SLO failed, 1 an
-// error (bad file, bad option, a scenario the engine cannot run yet).
+// error (bad file, bad option, a scenario the engine cannot run yet, or a run that observed
+// no step: no data is an error, not a pass).
 #include <unistd.h>  // isatty, STDOUT_FILENO: POSIX, which is fine for this project
 #include <CLI/CLI.hpp>
 
+#include <array>
 #include <cstdio>
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <map>
-#include <memory>
 #include <optional>
 #include <print>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -47,23 +48,12 @@ namespace engine = simsys::engine;
 namespace graph = simsys::graph;
 namespace report = simsys::report;
 
-// GCC 14.2 workaround (release builds only, verified 2026-10-28 with gcc14-release): at
-// -O3 this unit destroys a Graph, hence a model::Scenario and its NodeSpec::ops map,
-// through destructors read from the modules, and calls
-// std::map<std::string, std::vector<model::Step>>::~map out of line without emitting it;
-// no module object file emits it either, so the link fails with an undefined reference.
-// Destroying such a map in code of our own makes GCC instantiate the destructor in this
-// unit, after which it inlines or emits it as usual. `gnu::used` keeps the otherwise
-// uncalled function (and the instantiation) from being discarded. An explicit
-// instantiation (`template class std::map<...>;`) does not help: it skips the defaulted
-// destructor.
-[[gnu::used]] void instantiate_ops_map_destructor(
-    std::map<std::string, std::vector<simsys::model::Step>>* ops) {
-  std::destroy_at(ops);
-}
-
 // Compiler-style `file:line:column: error: message`, so editors can jump to it. Line 0
 // means the location is unknown (e.g. an empty file), so there is no position to print.
+// C++20 std::format: type-safe formatting into a std::string, with `{}` placeholders
+// checked against the arguments at compile time. Replaces snprintf (buffer sizes, format
+// and argument mismatches) and std::ostringstream chains. Strings and integers only here
+// (see the note above on doubles).
 std::string describe(const simsys::config::ConfigError& error) {
   if (error.line == 0) return std::format("{}: error: {}", error.file, error.message);
   return std::format("{}:{}:{}: error: {}", error.file, error.line, error.column, error.message);
@@ -114,7 +104,11 @@ bool use_color(const ReportOptions& options) {
   return options.format == "table" && !options.no_color && isatty(STDOUT_FILENO) != 0;
 }
 
-// Prints the summary with its SLO verdicts and turns them into the exit code.
+// Prints the summary with its SLO verdicts and turns them into the exit code. A run that
+// observed no step evaluated nothing: all_pass of all-skipped SLOs is true, but no data is
+// an error, not a pass, so it exits 1. (An exit code needs a process to test; the library
+// half of this contract is pinned in tests/unit/test_report.cpp, "an empty observation
+// window evaluates nothing".)
 int print_report(const report::Summary& summary, const ReportOptions& options) {
   const auto& slos = summary.graph().scenario().slos;
   const auto results = report::evaluate_slos(summary, slos);
@@ -123,6 +117,7 @@ int print_report(const report::Summary& summary, const ReportOptions& options) {
   } else {
     std::print("{}", report::render_table(summary, results, use_color(options)));
   }
+  if (summary.observed_steps() == 0) return 1;
   return report::all_pass(results) ? 0 : 2;
 }
 
@@ -172,6 +167,43 @@ int run_estimate(const std::filesystem::path& file, const ReportOptions& options
   return print_report(summary, options);
 }
 
+// A duration in the largest unit that divides it exactly, so it reads as a scenario writes
+// it: 10s, 2m, 1500ms. Integer arithmetic on the tick count (nanoseconds) only: this unit
+// never formats doubles (see the note at the top).
+std::string describe_duration(simsys::SimTime t) {
+  struct Unit {
+    std::string_view name;
+    long long ns;
+  };
+  constexpr std::array units{
+      Unit{"h", 3'600'000'000'000}, Unit{"m", 60'000'000'000}, Unit{"s", 1'000'000'000},
+      Unit{"ms", 1'000'000},        Unit{"us", 1'000},         Unit{"ns", 1}};
+  const long long ticks = t.count();
+  for (const auto& unit : units) {
+    if (ticks != 0 && ticks % unit.ns == 0) return std::format("{}{}", ticks / unit.ns, unit.name);
+  }
+  return "0s";
+}
+
+// `--duration` overrides the scenario's; like the scenario's own, it must leave a non-empty
+// window after the warmup (the loader enforces the same rule on the file). The text is
+// the user's, so the message echoes what they typed.
+std::expected<simsys::SimTime, std::string> run_duration(const std::filesystem::path& file,
+                                                         const simsys::model::Scenario& scenario,
+                                                         const std::optional<std::string>& text) {
+  if (!text) return scenario.duration;
+  const auto parsed = simsys::parse_duration(*text);
+  if (!parsed) {
+    return std::unexpected(std::format("{}: error: --duration '{}': {}", file.string(),
+                                       parsed.error().input, parsed.error().message));
+  }
+  if (parsed->count() <= scenario.warmup.count()) {
+    return std::unexpected(std::format("{}: error: --duration {} is not longer than the warmup {}",
+                                       file.string(), *text, describe_duration(scenario.warmup)));
+  }
+  return *parsed;
+}
+
 // What `run` takes beyond the report options.
 struct RunArgs {
   std::optional<std::string> duration{};  // overrides the scenario's
@@ -188,14 +220,10 @@ int run_scenario(const std::filesystem::path& file, const RunArgs& args,
     return 1;
   }
   const auto& scenario = g->scenario();
-  auto duration = scenario.duration;
-  if (args.duration) {
-    const auto parsed = simsys::parse_duration(*args.duration);
-    if (!parsed) {
-      print_error("--duration '" + parsed.error().input + "': " + parsed.error().message);
-      return 1;
-    }
-    duration = *parsed;
+  const auto duration = run_duration(file, scenario, args.duration);
+  if (!duration) {
+    print_error(duration.error());
+    return 1;
   }
   auto sim = create_simulation(*g, file);
   if (!sim) {
@@ -223,7 +251,7 @@ int run_scenario(const std::filesystem::path& file, const RunArgs& args,
   };
   // C++20 designated initializers: members named at the call site, in declaration order,
   // replacing a positional `{duration, step}` where a reader must remember which is which.
-  sim->run({.duration = duration, .step = scenario.step}, observe);
+  sim->run({.duration = *duration, .step = scenario.step}, observe);
   return print_report(summary, options);
 }
 

@@ -79,10 +79,18 @@ class Summary {
 
   [[nodiscard]] std::vector<NodeSummary> nodes() const;  // indexed like Graph::nodes()
   [[nodiscard]] std::vector<OpSummary> ops() const;      // clients in node order, ops by name
+  // Zero means the window after warmup was empty: there is no data, which the SLO
+  // verdicts and the renderers report as such (nothing is evaluated, nothing passes).
   [[nodiscard]] std::size_t observed_steps() const { return observed_steps_; }
-  // Requests dropped anywhere over requests offered by the clients, over observed steps;
-  // 0 when nothing was offered.
+  // One node's drop rate: the requests it dropped over the requests sent to it, summed
+  // over the observed steps (Σ dropped / Σ demand), so always in [0, 1]; 0 when nothing
+  // reached it. An unknown id is a programmer error (the loader checks SLO nodes): throws
+  // std::invalid_argument.
+  [[nodiscard]] double drop_rate(std::string_view node) const;
+  // The worst node's drop rate: every node must keep its own, so the worst one decides.
   [[nodiscard]] double drop_rate() const;
+  // The id of the node with the highest drop rate; empty when no node dropped anything.
+  [[nodiscard]] std::string_view worst_drop_node() const;
   [[nodiscard]] std::string_view scenario_name() const;
   [[nodiscard]] const graph::Graph& graph() const { return *graph_; }
 
@@ -98,10 +106,12 @@ class Summary {
     double rho_time{};  // Σ rho·dt
     double peak_rho{};
     double peak_backlog{};
+    double demand{};   // Σ demand_per_s·dt: requests sent to the node
     double dropped{};  // Σ dropped_per_s·dt
     double red_time_s{};
     bool unavailable{};
     void add(const engine::NodeSample& sample, double dt_s);
+    [[nodiscard]] double drop_rate() const;
   };
   // Every member has an initializer, even `{}`: GCC's -Wmissing-field-initializers flags
   // a designated initializer that omits one without.
@@ -117,6 +127,7 @@ class Summary {
 
   [[nodiscard]] double step_length_s(SimTime t);
   [[nodiscard]] OpTotals& totals_for(const engine::ResponseSample& sample, std::size_t hint);
+  [[nodiscard]] std::size_t worst_drop_index() const;
 
   // A pointer, not a reference, so a Summary stays copy- and move-assignable.
   const graph::Graph* graph_;
@@ -124,8 +135,6 @@ class Summary {
   std::optional<SimTime> last_t_;
   std::size_t observed_steps_{};
   double observed_s_{};
-  double offered_requests_{};
-  double dropped_requests_{};
   std::vector<NodeTotals> nodes_;
   std::vector<OpTotals> ops_;
 };
@@ -148,7 +157,8 @@ class Summary {
 
 // For plotting: one CSV row per node per step,
 // `t_s,node,rho,backlog,drops_per_s,latency_ms,zone`. The header is written on
-// construction. Pattern: Observer, like Summary. `out` and `g` must outlive the writer.
+// construction; the column rules are at SeriesWriter::observe in report.cpp.
+// Pattern: Observer, like Summary. `out` and `g` must outlive the writer.
 class SeriesWriter {
  public:
   SeriesWriter(std::ostream& out, const graph::Graph& g);
@@ -157,6 +167,7 @@ class SeriesWriter {
  private:
   std::ostream* out_;
   std::vector<std::string> ids_;
+  std::vector<bool> is_client_;  // indexed like ids_
 };
 
 }  // namespace simsys::report

@@ -173,6 +173,12 @@ struct Resolved {
   return {for_type(n.type).service_time, Source::type_default};
 }
 
+// The most servers c one replica may have, implied or written as advanced.concurrency
+// (the loader rejects more). Chosen, not from the book: the Erlang C term sums c terms, so
+// it costs O(c) per node per step, and 100k servers per replica already models any single
+// tier of the book's designs; more is a sign the rate and latency describe different things.
+inline constexpr int max_concurrency = 100'000;
+
 // The number of servers c that makes a node one consistent machine. Little's law
 // (L = lambda * W) applied to the servers at full load: the requests in service equal
 // throughput times time in service, so c = service_rate * service_time. Rounded up
@@ -180,9 +186,14 @@ struct Resolved {
 // time describe the same requests; a scenario that disagrees sets advanced.concurrency.
 // Without it the fluid drain (which uses the rate) and the Erlang C term (which uses
 // c / time) would model two different machines; see fluid::Capacity.
+//
+// Capped at max_concurrency, and the cap is applied to the double BEFORE the int cast:
+// casting a double that no int can hold (100M/s x 1 h = 3.6e11 servers) is undefined
+// behaviour, not a large number.
 [[nodiscard]] int implied_concurrency(Rate service_rate, SimTime service_time) {
   const double busy_servers = service_rate.per_second * seconds(service_time);
-  return std::max(1, static_cast<int>(std::ceil(busy_servers)));
+  const double servers = std::clamp(std::ceil(busy_servers), 1.0, double{max_concurrency});
+  return static_cast<int>(servers);
 }
 
 // Fold scenario values over defaults into the engine's Capacity. Every fallback is
