@@ -6,6 +6,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -2460,5 +2461,39 @@ TEST_CASE("concurrency, step factors, rates and capacities have upper bounds") {
                                  "  a: {type: service, capacity: 1e15/s, "
                                  "ops: {x: [{to: b, factor: 1e6}]}}\n"
                                  "  b: {type: blob_store, capacity: 1e15B/s}\n"));
+  }
+}
+
+TEST_CASE("a node's per-op cost is typed and must be a positive finite number") {
+  SECTION("a service's cost map loads, keyed by op") {
+    const auto path = write_temp("simsys_cost_loads.yaml",
+                                 scenario_with("  a: {type: service, cost: {write: 3, read: 1}}\n"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    REQUIRE(s->nodes[0].cost == std::map<std::string, double>{{"read", 1.0}, {"write", 3.0}});
+  }
+  SECTION("a cost of zero") {
+    require_rejected("simsys_cost_zero.yaml", scenario_with("  a: {type: service, cost: {x: 0}}\n"),
+                     "node 'a': cost 'x' must be a positive finite number");
+  }
+  SECTION("a cost that overflows to infinity") {
+    require_rejected("simsys_cost_inf.yaml",
+                     scenario_with("  a: {type: service, cost: {x: 1e400}}\n"),
+                     "node 'a': cost 'x' must be a positive finite number");
+  }
+  SECTION("a cost that is not a map") {
+    require_rejected("simsys_cost_scalar.yaml", scenario_with("  a: {type: service, cost: 5}\n"),
+                     "node 'a': cost must be a map of op to units");
+  }
+  SECTION("a client has no capacity to charge a cost against") {
+    require_rejected(
+        "simsys_cost_client.yaml",
+        scenario_with("  u: {type: client, rate: {base: 1/s}, ops: {a: 1}, cost: {a: 2}}\n"),
+        "node 'u': key 'cost' is not valid for type 'client'");
+  }
+  SECTION("a cache accepts a cost map") {
+    require_loaded("simsys_cost_cache.yaml",
+                   scenario_with("  c: {type: cache, cost: {read: 2}}\n"));
   }
 }
