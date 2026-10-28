@@ -480,3 +480,124 @@ TEST_CASE("op latency is weighted by the requests answered, not offered", "[repo
   REQUIRE_THAT(ops[0].mean_s, WithinRel(0.001, 1e-12));
   REQUIRE_THAT(ops[0].offered_per_s, WithinRel(100.0, 1e-12));  // offered still counts all
 }
+
+namespace {
+// u(100/s) -> lb -> api (2 replicas): the balancer's policy decides how api's replicas queue.
+Scenario balanced(simsys::model::LbPolicy policy) {
+  Scenario s{.name = "balanced", .version = 1, .duration = 1s};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"call", 1.0}}}},
+      NodeSpec{.id = "lb", .type = NodeType::load_balancer, .policy = policy},
+      NodeSpec{.id = "api", .type = NodeType::service, .replicas = 2, .capacity = Rate{1000}}};
+  s.links = {LinkSpec{.from = "u", .to = "lb"}, LinkSpec{.from = "lb", .to = "api"}};
+  return s;
+}
+
+// u(100/s) -> limiter (token bucket 1k/s, burst 100, counters kept in `counters`) -> api, with
+// `counters` a cache that answers every read (fixed hit ratio 1.0, cache-aside).
+Scenario limited_with_counters() {
+  Scenario s{.name = "counted", .version = 1, .duration = 1s};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"call", 1.0}}}},
+      NodeSpec{.id = "limiter",
+               .type = NodeType::rate_limiter,
+               .capacity = Rate{1e6},
+               .algorithm = LimiterAlgorithm::token_bucket,
+               .limit = Rate{1000},
+               .burst = 100,
+               .backend = "counters"},
+      NodeSpec{.id = "api", .type = NodeType::service, .capacity = Rate{10'000}},
+      NodeSpec{.id = "counters",
+               .type = NodeType::cache,
+               .capacity = Rate{100'000},
+               .hit_ratio = simsys::model::HitRatio{.fixed = 1.0},
+               .strategy = simsys::model::CacheStrategy::cache_aside}};
+  s.links = {LinkSpec{.from = "u", .to = "limiter"}, LinkSpec{.from = "limiter", .to = "api"},
+             LinkSpec{.from = "limiter", .to = "counters"}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("explain prints each node type's policy line", "[report]") {
+  SECTION("a load balancer names its policy and the node behind it is pooled") {
+    const auto g =
+        *simsys::graph::Graph::build(balanced(simsys::model::LbPolicy::least_connections));
+    const auto text = simsys::report::render_explain(g);
+    CAPTURE(text);
+    REQUIRE(text.find("policy=least_connections") != std::string::npos);
+    REQUIRE(text.find("pooled") != std::string::npos);
+    REQUIRE(text.find("rate: base 100/s") != std::string::npos);  // the client's line
+  }
+  SECTION(
+      "a rate limiter shows its algorithm, limit, burst and counter backend; a cache its model") {
+    const auto g = *simsys::graph::Graph::build(limited_with_counters());
+    const auto text = simsys::report::render_explain(g);
+    CAPTURE(text);
+    REQUIRE(text.find("algorithm=token_bucket limit=1k/s burst=100 backend=counters") !=
+            std::string::npos);
+    REQUIRE(text.find("hit_ratio=1 (fixed) strategy=cache_aside write_ops=write") !=
+            std::string::npos);
+  }
+}
+
+TEST_CASE("explain prints the client's curve summary with wave, spikes and noise", "[report]") {
+  using namespace simsys::workload;
+  auto s = mm1(100);
+  s.nodes[0].workload->curve = {
+      .base = Rate{800},
+      .wave = Wave{.shape = WaveShape::sine, .period = 24h, .amplitude = 0.6, .peak_at = 20h},
+      .spikes = {Spike{.at = 1h, .duration = 5min, .factor = 2.0},
+                 Spike{.at = 2h, .duration = 5min, .factor = 2.0},
+                 Spike{.at = 3h, .duration = 5min, .factor = 2.0}}};
+  s.nodes[0].workload->noise = Noise{.sigma = 0.15, .correlation = 5min};
+  const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(s));
+  CAPTURE(text);
+  // The code prints the Greek letters sigma and tau as UTF-8: pinned as it is.
+  REQUIRE(text.find("wave sine P=24h A=0.6 peak 20:00") != std::string::npos);
+  REQUIRE(text.find("spikes 3") != std::string::npos);
+  REQUIRE(text.find("noise \u03c3=0.15 \u03c4=5m") != std::string::npos);
+}
+
+// The node table always has a `rejected` column (a number per node), but the header line
+// mentions a reject rate only when some rate limiter refused anything: a scenario without a
+// limiter should not grow a "reject rate 0%" it has no meaning for.
+TEST_CASE("the table has a reject rate only when something was refused", "[report]") {
+  const auto plain = mm1(500);
+  const auto plain_graph = *simsys::graph::Graph::build(plain);
+  const auto plain_text =
+      simsys::report::render_table(summarize(plain, plain_graph), {}, /*color=*/false);
+  CAPTURE(plain_text);
+  REQUIRE(plain_text.find("reject rate") == std::string::npos);
+
+  const auto overloaded = limited();
+  const auto overloaded_graph = *simsys::graph::Graph::build(overloaded);
+  const auto overloaded_text =
+      simsys::report::render_table(summarize(overloaded, overloaded_graph), {}, /*color=*/false);
+  CAPTURE(overloaded_text);
+  REQUIRE(overloaded_text.find("rejected") != std::string::npos);
+  REQUIRE(overloaded_text.find("reject rate") != std::string::npos);
+}
+
+TEST_CASE("the JSON always carries reject_rate and worst_reject_node", "[report]") {
+  const auto s = mm1(500);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto json = simsys::report::render_json(summarize(s, g), {});
+  CAPTURE(json);
+  // No refusals: the rate is the number 0 and there is no worst node (null, not "").
+  REQUIRE(json.find("\"reject_rate\": 0,\n") != std::string::npos);
+  REQUIRE(json.find("\"worst_reject_node\": null") != std::string::npos);
+}
+
+TEST_CASE("the CSV series has the rejected_per_s column right after drops_per_s", "[report]") {
+  const auto s = mm1(500);
+  const auto g = *simsys::graph::Graph::build(s);
+  std::ostringstream out;
+  simsys::report::SeriesWriter writer{out, g};
+  const auto text = out.str();  // the header is written on construction, before any step
+  REQUIRE(text.substr(0, text.find('\n') + 1) ==
+          "t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone\n");
+}

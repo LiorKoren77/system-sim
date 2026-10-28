@@ -132,3 +132,36 @@ TEST_CASE("book scenarios are refused by run until their node types exist", "[sc
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message.find("phase 2") != std::string::npos);
 }
+
+// Phase 2a runs the nodes up to the cache: the two tutorials and the rate-limiter lab use only
+// those. Every other lab and every book scenario still needs a later phase's node types, so
+// the set of runnable scenarios is pinned by name: a node type added in a later phase makes
+// this fail and forces whoever adds it to update the list on purpose.
+TEST_CASE("labs and tutorials that run under phase 2a are: hello, chain, rate-limiter",
+          "[scenario]") {
+  std::vector<std::string> runnable;
+  for (const auto& file : scenario_files()) {
+    CAPTURE(file);
+    const auto s = *simsys::config::load(file);
+    const auto g = *simsys::graph::Graph::build(s);
+    if (simsys::engine::Simulation::create(g)) runnable.push_back(s.name);
+  }
+  std::ranges::sort(runnable);
+  REQUIRE(runnable == std::vector<std::string>{"chain", "hello", "lab-rate-limiter"});
+}
+
+TEST_CASE("a refused scenario's message names the first unsupported node and the phase",
+          "[scenario]") {
+  const auto s = *simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} +
+                                       "/book/url-shortener/scenario.yaml");
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto sim = simsys::engine::Simulation::create(g);
+  REQUIRE_FALSE(sim.has_value());
+  const auto& message = sim.error().message;
+  CAPTURE(message);
+  REQUIRE(message.find("phase 2") != std::string::npos);
+  // Name some node of the scenario: the engine reports the first unsupported one it meets.
+  const auto names_a_node = std::ranges::any_of(
+      s.nodes, [&](const auto& node) { return message.find(node.id) != std::string::npos; });
+  REQUIRE(names_a_node);
+}
