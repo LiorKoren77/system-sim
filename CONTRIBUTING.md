@@ -79,6 +79,11 @@ Write for a reader who has read the book but has not studied queueing theory.
   undefined references at link time. Workaround: `src/model/model.cpp`, compiled with
   `-fno-inline`, calls each such member so libsimsys.a defines it; a new undefined
   reference of this kind gets one more `emit_special_members` line there.
+- Fifth GCC 14.2 defect (2026-10-28): a lambda passed to a range adaptor such as
+  `std::views::chunk_by` inside a module's member function is emitted in more than one
+  object file ("multiple definition" of the lambda's conversion to a function pointer at
+  link time). Workaround: a named function in `detail::` instead of the lambda
+  (`graph.cppm`'s `detail::same_op`).
 
 ## 4. Clean code, named patterns, TDD
 
