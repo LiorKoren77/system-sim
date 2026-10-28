@@ -26,7 +26,9 @@
 
 **Lessons for implementers (found in Part A reviews):**
 - Catch2 `Approx(x).margin(m)` never tightens below the default relative epsilon (~1.19e-5); tight checks use `REQUIRE_THAT(v, WithinRel(e, 1e-12))` / `WithinAbs`.
-- `std::chrono` operators (`/`, `<=`, `zero()`) are not reachable from an interface that does not include `<chrono>` (GMF declarations are only reachable when the interface used them); write `rtt.count() / 2`, `dt.count() <= 0`.
+- Non-member `std::chrono` operators (`/`, `<=`, `+`) are invisible in an interface that does not include `<chrono>`: declarations in another module's global module fragment are never exported, so neither ordinary nor argument-dependent lookup finds them ([basic.lookup.argdep]/4.3). Member functions still work (`SimTime::zero()`, `h /= 2`). Write `rtt.count() / 2`, `dt.count() <= 0`.
+- **Implied concurrency (from the defaults review):** when `advanced.concurrency` is absent, `c = max(1, ceil(service_rate × service_time))` (Little's law at full load: busy servers = throughput × time in service). The default `c = 1` contradicted every type default (service 2k/s × 1 ms = 2 servers; cache 100k/s × 250 µs = 25) and inflated Erlang waits. Blob stores count 1 MB objects (`blob_object_bytes`, chosen): 500 MB/s → 500/s, service 30 ms + 10 ms per MB; CDN service time is `network_read_1mb` per spec §6.
+- **Variance across the max-blend:** the mean takes `max(fluid, stochastic)` but the variance always keeps the stochastic term (plus service variance); taking the variance from the winning term made p99 drop 4.7× as a backlog doubled.
 - A translation unit iterating `Flow::entries()` must `#include <span>` itself on GCC 14.
 - `Flow::add`/`scale` throw `std::invalid_argument` on negative or non-finite values; `FluidQueue::advance` throws on `dt <= 0`; `erlang_c`/`mmc_wait` throw on `servers < 1`. These are programmer errors; config validation keeps user input out.
 - `FluidQueue` reports `inf` latency for a zero-capacity node: the engine must never multiply a latency by a zero weight (skip zero-flow branches), and reports print `inf` as "unavailable".
