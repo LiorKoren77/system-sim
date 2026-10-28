@@ -116,3 +116,22 @@ TEST_CASE("a default LinkSpec is outbound, carries all ops, weight one, no laten
   REQUIRE(l.weight == 1.0);
   REQUIRE_FALSE(l.latency.has_value());
 }
+
+// `write_ops` absent means "the type's default", present means exactly the list written. One
+// helper, model::write_ops_of, applies the default, so the loader, the graph, the behaviours and
+// explain cannot disagree: a cache writes with `write`, a database with the four SQL statements
+// that change rows; a database told `[write]` has exactly that one write op.
+TEST_CASE("write_ops absent is the type's default and present is exactly what was written",
+          "[model]") {
+  using simsys::model::NodeSpec;
+  using simsys::model::write_ops_of;
+  REQUIRE(write_ops_of(NodeSpec{.type = NodeType::cache}) == std::vector<std::string>{"write"});
+  REQUIRE(write_ops_of(NodeSpec{.type = NodeType::sql_db}) ==
+          std::vector<std::string>{"delete", "insert", "update", "write"});
+  NodeSpec db{.type = NodeType::sql_db};
+  db.write_ops = std::vector<std::string>{"write"};
+  REQUIRE(write_ops_of(db) == std::vector<std::string>{"write"});
+  NodeSpec cache{.type = NodeType::cache};
+  cache.write_ops = std::vector<std::string>{"set", "delete"};
+  REQUIRE(write_ops_of(cache) == std::vector<std::string>{"set", "delete"});
+}

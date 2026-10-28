@@ -1224,6 +1224,98 @@ TEST_CASE("a write_back cache serves writes itself and flushes them asynchronous
   REQUIRE_THAT(delivered, WithinRel(1.0, 1e-12));
 }
 
+// Both kinds of then step on one cache: the miss step's `factor` multiplies the read misses
+// (100 reads, h = 0.75: 25 misses x 2 = 50 queries), and an always step fires for every
+// request the cache handles, writes included (writes do not miss, so the miss step sends none).
+TEST_CASE(
+    "a cache's miss then step multiplies its factor into the read misses and an always step "
+    "fires for writes too",
+    "[behaviours]") {
+  auto s = cached_front(CacheStrategy::cache_aside, 0.75, false);  // ops read, set, write
+  s.nodes[2].then = {Step{.to = "svc", .op = "q", .on = StepCondition::miss, .factor = 2.0},
+                     Step{.to = "audit", .op = "log"}};
+  s.nodes.push_back(NodeSpec{.id = "svc", .type = NodeType::service});
+  s.nodes.push_back(NodeSpec{.id = "audit", .type = NodeType::service});
+  s.links.push_back(LinkSpec{.from = "cache", .to = "svc", .latency = 0s});
+  s.links.push_back(LinkSpec{.from = "cache", .to = "audit", .latency = 0s});
+  const auto g = *simsys::graph::Graph::build(s);
+  const CacheBehaviour cache{g, *g.index_of("cache")};
+  const auto svc = *g.index_of("svc");
+  const auto audit = *g.index_of("audit");
+  const auto reads = cache.route(flow_of("read", 100), 0s, 100ms);
+  REQUIRE_THAT(sent_to(reads, svc).rate_of("q").per_second, WithinRel(50.0, 1e-12));
+  REQUIRE_THAT(sent_to(reads, audit).rate_of("log").per_second, WithinRel(100.0, 1e-12));
+  const auto writes = cache.route(flow_of("write", 40), 0s, 100ms);
+  REQUIRE(sent_to(writes, svc).total().per_second == 0.0);
+  REQUIRE_THAT(sent_to(writes, audit).rate_of("log").per_second, WithinRel(40.0, 1e-12));
+}
+
+// Write-back with an audit step: the flush to the store is asynchronous (nobody waits for it),
+// the audit step is an ordinary call (the cache answers once the audit has). So a write's
+// response is own 1 ms + the audit's 5 ms (zero-latency link), whatever the store takes, and it
+// is answered as often as the audit answers it, whatever the store does with the flush.
+TEST_CASE("a write_back cache waits for its always then step but not for its flush",
+          "[behaviours]") {
+  auto s = cached_front(CacheStrategy::write_back, 0.8, true);
+  s.nodes[2].then = {Step{.to = "audit", .op = "log"}};
+  s.nodes.push_back(NodeSpec{.id = "audit", .type = NodeType::service});
+  s.links.push_back(LinkSpec{.from = "cache", .to = "audit", .latency = 0s});
+  const auto g = *simsys::graph::Graph::build(s);
+  const CacheBehaviour cache{g, *g.index_of("cache")};
+  const auto db = *g.index_of("db");
+  const auto audit = *g.index_of("audit");
+  const auto r =
+      cache.response("write", LatencyEstimate{0.001, 0.0}, [&](std::size_t node, std::string_view) {
+        return LatencyEstimate{node == audit ? 0.005 : 1.0, 0.0};
+      });
+  REQUIRE_THAT(r.mean_s, WithinRel(0.006, 1e-12));  // own + audit, no db
+  const double delivered = cache.delivered(
+      "write", 1.0, [&](std::size_t node, std::string_view) { return node == db ? 0.0 : 0.5; });
+  REQUIRE_THAT(delivered, WithinRel(0.5, 1e-12));
+  const auto routed = cache.route(flow_of("write", 50), 0s, 100ms);
+  REQUIRE_THAT(sent_to(routed, db).rate_of("write").per_second, WithinRel(50.0, 1e-12));
+  REQUIRE_THAT(sent_to(routed, audit).rate_of("log").per_second, WithinRel(50.0, 1e-12));
+}
+
+// A pin across the HopBlocks refactor: one op with every kind of block a service has.
+// api.go = [a parallel, b parallel, c.read (a cache, h = 0.75), d on miss, e on miss], zero-latency
+// links, own 1 ms; a 2 ms, b 3 ms, c 0.25 ms, d 4 ms, e 5 ms. The sequential parts add, the two
+// parallel calls cost their slowest, and the miss block (d then e, 9 ms) is taken by 25 %:
+//   1 + 0.25 + 0.25 x (4 + 5) + max(2, 3) = 6.5 ms.
+TEST_CASE("a service's parallel, sequential and miss blocks compose to 6.5 ms", "[behaviours]") {
+  Scenario s{.name = "mix", .version = 1, .duration = 1min};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"go", 1.0}}}},
+      NodeSpec{.id = "api",
+               .type = NodeType::service,
+               .ops = {{"go",
+                        {Step{.to = "a", .op = "x", .mode = StepMode::parallel},
+                         Step{.to = "b", .op = "x", .mode = StepMode::parallel},
+                         Step{.to = "c", .op = "read"},
+                         Step{.to = "d", .op = "x", .on = StepCondition::miss},
+                         Step{.to = "e", .op = "x", .on = StepCondition::miss}}}}},
+      NodeSpec{.id = "a", .type = NodeType::service},
+      NodeSpec{.id = "b", .type = NodeType::service},
+      NodeSpec{.id = "c", .type = NodeType::cache, .hit_ratio = HitRatio{.fixed = 0.75}},
+      NodeSpec{.id = "d", .type = NodeType::service},
+      NodeSpec{.id = "e", .type = NodeType::service}};
+  s.links = {LinkSpec{.from = "u", .to = "api", .latency = 0s}};
+  for (const auto* target : {"a", "b", "c", "d", "e"}) {
+    s.links.push_back(LinkSpec{.from = "api", .to = target, .latency = 0s});
+  }
+  const auto g = *simsys::graph::Graph::build(s);
+  const ServiceBehaviour api{g, *g.index_of("api")};
+  const std::map<std::string, double, std::less<>> response_s{
+      {"a", 0.002}, {"b", 0.003}, {"c", 0.00025}, {"d", 0.004}, {"e", 0.005}};
+  const auto r =
+      api.response("go", LatencyEstimate{0.001, 0.0}, [&](std::size_t node, std::string_view) {
+        return LatencyEstimate{response_s.at(g.nodes()[node].spec.id), 0.0};
+      });
+  REQUIRE_THAT(r.mean_s, WithinRel(0.0065, 1e-12));
+}
+
 // ---- SqlDbBehaviour (plan 2b, Task 4) ----
 
 namespace {
@@ -1281,6 +1373,20 @@ TEST_CASE("reads and writes are classified by write_ops", "[behaviours]") {
     REQUIRE(narrow.is_write("insert"));
     REQUIRE_FALSE(narrow.is_write("write"));
   }
+}
+
+// `write_ops` stated on a database replaces the database default; it does not add to it. A
+// scenario that says only `write` is a write means exactly that: an `insert` is then a read.
+TEST_CASE("an explicit write_ops of just write on a sql database means exactly that",
+          "[behaviours]") {
+  auto s = sql_front();
+  s.nodes[1].write_ops = std::vector<std::string>{"write"};
+  const auto g = *simsys::graph::Graph::build(s);
+  const SqlDbBehaviour db{g, *g.index_of("db")};
+  REQUIRE(db.is_write("write"));
+  REQUIRE_FALSE(db.is_write("insert"));
+  REQUIRE_FALSE(db.is_write("update"));
+  REQUIRE_FALSE(db.is_write("delete"));
 }
 
 // The engine holds the primary's and the replicas' queues and hands the behaviour the sojourn
