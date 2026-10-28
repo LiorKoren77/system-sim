@@ -146,7 +146,7 @@ nodes:
   thing: {type: quantum_db}
 links: []
 )",
-                   "unknown node type 'quantum_db'");
+                   "node 'thing': unknown node type 'quantum_db'");
 }
 
 TEST_CASE("a node without a type is rejected") {
@@ -173,7 +173,7 @@ nodes:
     ops: {read: [{to: cache, op: read}]}
 links: []
 )",
-                   "step refers to unknown node 'cache'");
+                   "node 'api': step refers to unknown node 'cache'");
 }
 
 TEST_CASE("a then-step pointing at an undeclared node is rejected") {
@@ -189,7 +189,7 @@ nodes:
     then: [{to: nowhere, op: write}]
 links: []
 )",
-                   "step refers to unknown node 'nowhere'");
+                   "node 'workers': step refers to unknown node 'nowhere'");
 }
 
 TEST_CASE("consumes, backend and origin must name declared nodes") {
@@ -202,7 +202,7 @@ nodes:
   workers: {type: worker_pool, consumes: ghost}
 links: []
 )",
-                     "consumes refers to unknown node 'ghost'");
+                     "node 'workers': consumes refers to unknown node 'ghost'");
   }
   SECTION("backend") {
     require_rejected("simsys_bad_backend.yaml", R"(
@@ -213,7 +213,7 @@ nodes:
   front: {type: cache, backend: ghost}
 links: []
 )",
-                     "backend refers to unknown node 'ghost'");
+                     "node 'front': backend refers to unknown node 'ghost'");
   }
   SECTION("origin") {
     require_rejected("simsys_bad_origin.yaml", R"(
@@ -224,7 +224,7 @@ nodes:
   edge: {type: cdn, origin: ghost}
 links: []
 )",
-                     "origin refers to unknown node 'ghost'");
+                     "node 'edge': origin refers to unknown node 'ghost'");
   }
 }
 
@@ -249,7 +249,7 @@ nodes:
   api: {type: service, capacity: fast/s}
 links: []
 )",
-                   "capacity: expected a number");
+                   "node 'api': capacity: expected a number");
 }
 
 TEST_CASE("a missing top-level key is reported") {
@@ -365,7 +365,7 @@ nodes:
   api: {type: service, capacity: 1k/s, latency: soon}
 links: []
 )",
-                     "latency: expected a number");
+                     "node 'api': latency: expected a number");
   }
   SECTION("a link latency that is not a number") {
     require_rejected("simsys_bad_link_latency.yaml", R"(
@@ -378,7 +378,7 @@ nodes:
 links:
   - {from: users, to: api, latency: never}
 )",
-                     "latency: expected a number");
+                     "link users -> api: latency: expected a number");
   }
 }
 
@@ -437,7 +437,7 @@ nodes:
   workers: {type: worker_pool, consumes: [q]}
 links: []
 )",
-                     "consumes must be a scalar");
+                     "node 'workers': consumes must be a scalar");
   }
   SECTION("type") {
     require_rejected("simsys_type_map.yaml", R"(
@@ -448,7 +448,7 @@ nodes:
   thing: {type: {x: 1}}
 links: []
 )",
-                     "type must be a scalar");
+                     "node 'thing': type must be a scalar");
   }
 }
 
@@ -477,7 +477,7 @@ nodes:
     ops: {read: [cache]}
 links: []
 )",
-                     "step must be a map");
+                     "node 'api': step must be a map");
   }
   SECTION("a link that is a scalar") {
     require_rejected("simsys_link_scalar.yaml", R"(
@@ -502,7 +502,7 @@ nodes:
   workers: {type: worker_pool, consumes: queue, then: api}
 links: []
 )",
-                     "then must be a list");
+                     "node 'workers': then must be a list");
   }
 }
 
@@ -538,7 +538,7 @@ nodes:
     ops: {read: [{op: read}]}
 links: []
 )",
-                     "step needs a 'to'");
+                     "node 'api': step needs a 'to'");
   }
   SECTION("a link without 'from'") {
     require_rejected("simsys_link_no_from.yaml", R"(
@@ -632,21 +632,23 @@ TEST_CASE("a non-client op value must be a step list") {
   };
   SECTION("a map value that is neither a list nor a number") {
     require_rejected("simsys_op_map.yaml", service_ops("{read: {to: ghost}}"),
-                     "op 'read' must be a step list");
+                     "node 'api': op 'read' must be a step list");
   }
   SECTION("a text value that is not a number") {
     require_rejected("simsys_op_text.yaml", service_ops("{read: fast}"),
-                     "op 'read' must be a step list");
+                     "node 'api': op 'read' must be a step list");
   }
   SECTION("ops given as a scalar") {
-    require_rejected("simsys_ops_scalar.yaml", service_ops("hello"), "ops must be a map");
+    require_rejected("simsys_ops_scalar.yaml", service_ops("hello"),
+                     "node 'api': ops must be a map");
   }
   SECTION("ops given as a list") {
-    require_rejected("simsys_ops_list.yaml", service_ops("[ghost]"), "ops must be a map");
+    require_rejected("simsys_ops_list.yaml", service_ops("[ghost]"),
+                     "node 'api': ops must be a map");
   }
   SECTION("a service op that is a share is rejected: only a client's ops are shares") {
     require_rejected("simsys_op_share.yaml", service_ops("{ping: 0.5}"),
-                     "op 'ping' must be a step list");
+                     "node 'api': op 'ping' must be a step list");
   }
   SECTION("an empty step list is a valid terminal op") {
     const auto path = write_temp("simsys_op_empty_list.yaml", service_ops("{read: []}"));
@@ -873,7 +875,7 @@ nodes:
     advanced: {queue_limit: -5}
 links: []
 )",
-                     "node 'a': advanced.queue_limit must be positive");
+                     "node 'a': advanced.queue_limit must be a positive integer");
   }
   SECTION("negative burstiness") {
     require_rejected("simsys_bad_burstiness.yaml", R"(
@@ -1118,4 +1120,362 @@ TEST_CASE("an unknown slo metric or a bad max is rejected") {
     require_rejected("simsys_slo_no_node.yaml", with_slo("{metric: p50_latency, max: 1s}"),
                      "slo: p50_latency needs a node");
   }
+}
+
+// ---- Review batch: the review's five proposed tests, verbatim -------------------------
+
+TEST_CASE("a misspelt key inside a step, rate, link, slo or advanced block is rejected") {
+  const auto with = [](std::string_view nodes, std::string_view tail = "links: []\n") {
+    return "version: 1\nname: t\nduration: 1m\nnodes:\n" + std::string{nodes} + std::string{tail};
+  };
+  SECTION("step") {
+    require_rejected("simsys_typo_step.yaml",
+                     with("  a: {type: service, ops: {x: [{to: a, fator: 2}]}}\n"),
+                     "node 'a': unknown step key 'fator'");
+  }
+  SECTION("rate") {
+    require_rejected("simsys_typo_rate.yaml",
+                     with("  u: {type: client, rate: {base: 1/s, wav: x}, ops: {a: 1}}\n"),
+                     "node 'u': unknown rate key 'wav'");
+  }
+  SECTION("link") {
+    require_rejected("simsys_typo_link.yaml",
+                     with("  a: {type: service}\n  b: {type: service}\n",
+                          "links: [{from: a, to: b, wieght: 2}]\n"),
+                     "link a -> b: unknown key 'wieght'");
+  }
+  SECTION("slo") {
+    require_rejected(
+        "simsys_typo_slo.yaml",
+        with("  a: {type: service}\n", "links: []\nslo: [{metric: drop_rate, max: 0.1, nod: a}]\n"),
+        "slo: unknown key 'nod'");
+  }
+  SECTION("advanced") {
+    require_rejected("simsys_typo_advanced.yaml",
+                     with("  a: {type: service, advanced: {yelow: 0.5}}\n"),
+                     "node 'a': unknown advanced key 'yelow'");
+  }
+}
+
+TEST_CASE("a client needs ops and a then step needs an explicit op") {
+  SECTION("client without ops") {
+    require_rejected("simsys_client_no_ops.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  u: {type: client, rate: {base: 1/s}}
+links: []
+)",
+                     "node 'u': client needs ops");
+  }
+  SECTION("then step without op: nothing to inherit") {
+    require_rejected("simsys_then_no_op.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  w: {type: worker_pool, then: [{to: w}]}
+links: []
+)",
+                     "node 'w': then step needs an 'op'");
+  }
+}
+
+TEST_CASE("slo must be a list of entries that each name a metric and a max") {
+  const auto with_slo = [](std::string_view slo) {
+    return "version: 1\nname: t\nduration: 1m\nnodes:\n  a: {type: service}\nlinks: []\nslo: " +
+           std::string{slo} + "\n";
+  };
+  SECTION("a map instead of a list") {
+    require_rejected("simsys_slo_map.yaml", with_slo("{metric: drop_rate, max: 1}"),
+                     "slo must be a list");
+  }
+  SECTION("no metric") {
+    require_rejected("simsys_slo_no_metric.yaml", with_slo("[{max: 1}]"),
+                     "slo: entry needs a metric");
+  }
+  SECTION("no max") {
+    require_rejected("simsys_slo_no_max.yaml", with_slo("[{metric: drop_rate}]"),
+                     "slo: drop_rate needs a max");
+  }
+}
+
+TEST_CASE("a link's ops must be a list of op names") {
+  const auto with_ops = [](std::string_view ops) {
+    return "version: 1\nname: t\nduration: 1m\nnodes:\n  a: {type: service}\n  b: {type: service}\n"
+           "links: [{from: a, to: b, ops: " +
+           std::string{ops} + "}]\n";
+  };
+  SECTION("a scalar") {
+    require_rejected("simsys_link_ops_scalar.yaml", with_ops("read"),
+                     "link a -> b: ops must be a list of op names");
+  }
+  SECTION("a nested list") {
+    require_rejected("simsys_link_ops_nested.yaml", with_ops("[[read]]"),
+                     "link a -> b: ops must be a list of op names");
+  }
+}
+
+TEST_CASE("a key written twice in one map is rejected at its second occurrence") {
+  const auto path = write_temp("simsys_duplicate_key.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a:
+    type: service
+    capacity: 1k/s
+    capacity: 2k/s
+links: []
+)");
+  const auto s = simsys::config::load(path.string());
+  REQUIRE_FALSE(s.has_value());
+  REQUIRE(s.error().message == "duplicate key 'capacity'");
+  CHECK(s.error().line == 9);
+  CHECK(s.error().column == 5);
+}
+
+// ---- Review batch: rules the review found missing -------------------------------------
+
+namespace {
+
+// The fixed header every scenario below shares, so each test shows only what it is about.
+std::string scenario_with(std::string_view nodes, std::string_view tail = "links: []\n") {
+  return "version: 1\nname: t\nduration: 1m\nnodes:\n" + std::string{nodes} + std::string{tail};
+}
+
+// Loads `yaml` and asserts it is accepted (the message of a rejection is shown otherwise).
+void require_loaded(std::string_view file_name, std::string_view yaml) {
+  CAPTURE(yaml);
+  const auto path = write_temp(file_name, yaml);
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+}
+
+}  // namespace
+
+TEST_CASE("a link's ops list may not be empty") {
+  // An empty list would load as "carry all ops" (the model's meaning of no filter): the
+  // opposite of what was written.
+  require_rejected("simsys_link_ops_empty.yaml",
+                   scenario_with("  a: {type: service}\n  b: {type: service}\n",
+                                 "links: [{from: a, to: b, ops: []}]\n"),
+                   "link a -> b: ops must name at least one op (omit it to carry all)");
+}
+
+TEST_CASE("ops and then are accepted only on the types the schema gives them") {
+  SECTION("a cache has no ops: it serves reads and forwards misses through then") {
+    require_rejected("simsys_cache_ops.yaml",
+                     scenario_with("  d: {type: sql_db}\n"
+                                   "  c: {type: cache, ops: {read: [{to: d}]}}\n"),
+                     "node 'c': key 'ops' is not valid for type 'cache'");
+  }
+  SECTION("a service has no then: its steps hang off each op") {
+    require_rejected("simsys_service_then.yaml",
+                     scenario_with("  d: {type: sql_db}\n"
+                                   "  s: {type: service, then: [{to: d, op: write}]}\n"),
+                     "node 's': key 'then' is not valid for type 'service'");
+  }
+  SECTION("a client is a traffic source and has no capacity") {
+    require_rejected(
+        "simsys_client_capacity.yaml",
+        scenario_with("  u: {type: client, rate: {base: 1/s}, ops: {a: 1}, capacity: 1/s}\n"),
+        "node 'u': key 'capacity' is not valid for type 'client'");
+  }
+}
+
+TEST_CASE("latency SLOs must name a client and one of its ops; ratio maxima lie in [0, 1]") {
+  const auto with_slo = [](std::string_view entry) {
+    return scenario_with(
+        "  u: {type: client, rate: {base: 1/s}, ops: {a: 1}}\n"
+        "  s: {type: service}\n",
+        "links: []\nslo: [" + std::string{entry} + "]\n");
+  };
+  SECTION("a percentile on a service, which originates no requests") {
+    require_rejected("simsys_slo_latency_service.yaml",
+                     with_slo("{metric: p99_latency, node: s, max: 1s}"),
+                     "slo: p99_latency needs a client node, 's' is a service");
+  }
+  SECTION("an op the client does not offer") {
+    require_rejected("simsys_slo_unknown_op.yaml",
+                     with_slo("{metric: p99_latency, node: u, op: ghost, max: 1s}"),
+                     "slo: client 'u' has no op 'ghost'");
+  }
+  SECTION("a utilization bound above 100%") {
+    require_rejected("simsys_slo_utilization_range.yaml",
+                     with_slo("{metric: utilization, max: 1.5}"),
+                     "slo: utilization max must be between 0 and 1");
+  }
+  SECTION("a latency SLO without op covers all of the client's ops") {
+    require_loaded("simsys_slo_all_ops.yaml", with_slo("{metric: p99_latency, node: u, max: 1s}"));
+  }
+}
+
+TEST_CASE("a node may not send to itself and a link may not loop") {
+  SECTION("a step to its own node") {
+    require_rejected("simsys_step_self.yaml",
+                     scenario_with("  s: {type: service, ops: {read: [{to: s}]}}\n"),
+                     "node 's': a step may not target its own node");
+  }
+  SECTION("a link from a node to itself") {
+    require_rejected("simsys_link_self.yaml",
+                     scenario_with("  s: {type: service}\n", "links: [{from: s, to: s}]\n"),
+                     "link s -> s: from and to must differ");
+  }
+}
+
+TEST_CASE("two links between the same pair in the same direction are rejected") {
+  const auto with_links = [](std::string_view links) {
+    return scenario_with("  a: {type: service}\n  b: {type: service}\n",
+                         "links: " + std::string{links} + "\n");
+  };
+  SECTION("the same from and to") {
+    require_rejected("simsys_link_duplicate.yaml",
+                     with_links("[{from: a, to: b}, {from: a, to: b, ops: [x]}]"),
+                     "link a -> b: duplicate link (put several ops or a weight on one link)");
+  }
+  SECTION("an `in` link mirrors an `out` link: both carry demand from a to b") {
+    require_rejected("simsys_link_duplicate_in.yaml",
+                     with_links("[{from: a, to: b, dir: inout}, {from: b, to: a, dir: in}]"),
+                     "link b -> a: duplicate link (put several ops or a weight on one link)");
+  }
+  SECTION("links in opposite directions are two different links") {
+    require_loaded("simsys_link_opposite.yaml", with_links("[{from: a, to: b}, {from: b, to: a}]"));
+  }
+}
+
+TEST_CASE("empty op names are rejected everywhere") {
+  SECTION("a client op share") {
+    require_rejected("simsys_empty_op_client.yaml",
+                     scenario_with("  u: {type: client, rate: {base: 1/s}, ops: {\"\": 1}}\n"),
+                     "node 'u': op name must not be empty");
+  }
+  SECTION("a service op") {
+    require_rejected("simsys_empty_op_service.yaml",
+                     scenario_with("  u: {type: service, ops: {'': []}}\n"),
+                     "node 'u': op name must not be empty");
+  }
+  SECTION("a step's op") {
+    require_rejected("simsys_empty_op_step.yaml",
+                     scenario_with("  d: {type: sql_db}\n"
+                                   "  s: {type: service, ops: {read: [{to: d, op: ''}]}}\n"),
+                     "node 's': step op must not be empty");
+  }
+  SECTION("a link's op filter") {
+    require_rejected("simsys_empty_op_link.yaml",
+                     scenario_with("  a: {type: service}\n  b: {type: service}\n",
+                                   "links: [{from: a, to: b, ops: [x, '']}]\n"),
+                     "link a -> b: op name must not be empty");
+  }
+  SECTION("an slo's op") {
+    require_rejected(
+        "simsys_empty_op_slo.yaml",
+        scenario_with("  u: {type: client, rate: {base: 1/s}, ops: {a: 1}}\n",
+                      "links: []\nslo: [{metric: p99_latency, node: u, op: '', max: 1s}]\n"),
+        "slo: op name must not be empty");
+  }
+}
+
+TEST_CASE("a null value is reported at its own key") {
+  // Line 1 is the empty line after R"( ; `capacity:` is on line 8. yaml-cpp places a null
+  // value where the next token starts (line 9, `links`), which would send the reader to
+  // the wrong line.
+  const auto path = write_temp("simsys_null_capacity.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a:
+    type: service
+    capacity:
+links: []
+)");
+  const auto s = simsys::config::load(path.string());
+  REQUIRE_FALSE(s.has_value());
+  REQUIRE(s.error().message == "node 'a': capacity must not be empty");
+  CHECK(s.error().line == 8);
+}
+
+TEST_CASE("the share-sum message shows the real sum") {
+  // With 6 significant digits ({:g}) the sum 1.000002 printed as "1", contradicting
+  // "expected 1".
+  require_rejected(
+      "simsys_share_sum_digits.yaml",
+      scenario_with("  u: {type: client, rate: {base: 1/s}, ops: {a: 0.5, b: 0.500002}}\n"),
+      "node 'u': op shares sum to 1.000002, expected 1");
+}
+
+TEST_CASE("version must be a whole number") {
+  const auto with_version = [](std::string_view version) {
+    return "version: " + std::string{version} +
+           "\nname: t\nduration: 1m\nnodes:\n  a: {type: service}\nlinks: []\n";
+  };
+  // One rule for every integer key: a number is a plain (unquoted) scalar. A quoted "1" is
+  // a string in YAML, so it is no version, as `replicas: "4"` is no replica count.
+  SECTION("a quoted number is a string") {
+    require_rejected("simsys_version_quoted.yaml", with_version("\"1\""),
+                     "version must be a whole number");
+  }
+  SECTION("a decimal") {
+    require_rejected("simsys_version_decimal.yaml", with_version("1.0"),
+                     "version must be a whole number");
+  }
+  SECTION("a quoted replica count is a string too") {
+    require_rejected("simsys_replicas_quoted.yaml",
+                     scenario_with("  a: {type: service, replicas: \"4\"}\n"),
+                     "node 'a': replicas must be a positive integer");
+  }
+}
+
+TEST_CASE("faults must be a list") {
+  require_rejected("simsys_faults_scalar.yaml",
+                   scenario_with("  a: {type: service}\n", "links: []\nfaults: 5\n"),
+                   "faults must be a list");
+}
+
+TEST_CASE("advanced.queue_limit must be a positive whole number") {
+  // The schema types queue_limit as an int: a waiting room holds whole requests.
+  require_rejected("simsys_queue_limit_fraction.yaml",
+                   scenario_with("  a: {type: service, advanced: {queue_limit: 2.5}}\n"),
+                   "node 'a': advanced.queue_limit must be a positive integer");
+}
+
+TEST_CASE("the threshold message names the defaulted side") {
+  SECTION("red given, yellow defaulted") {
+    require_rejected("simsys_threshold_default_yellow.yaml",
+                     scenario_with("  a: {type: service, advanced: {red: 0.5}}\n"),
+                     "node 'a': advanced.yellow (default 0.7) must be below advanced.red");
+  }
+  SECTION("yellow given, red defaulted") {
+    require_rejected("simsys_threshold_default_red.yaml",
+                     scenario_with("  a: {type: service, advanced: {yellow: 0.95}}\n"),
+                     "node 'a': advanced.yellow must be below advanced.red (default 0.9)");
+  }
+}
+
+TEST_CASE("datacenter entries are maps with non-empty names; latency is a list") {
+  const auto with_datacenters = [](std::string_view datacenters) {
+    return "version: 1\nname: t\nduration: 1m\ndatacenters: " + std::string{datacenters} +
+           "\nnodes:\n  a: {type: service}\nlinks: []\n";
+  };
+  SECTION("a datacenter given as a number") {
+    require_rejected("simsys_dc_scalar.yaml", with_datacenters("{eu: 5}"),
+                     "datacenters: 'eu' must be a map");
+  }
+  SECTION("an empty datacenter name") {
+    require_rejected("simsys_dc_empty_name.yaml", with_datacenters("{'': {}}"),
+                     "datacenters: name must not be empty");
+  }
+  SECTION("the reserved latency key holds a list") {
+    require_rejected("simsys_dc_latency.yaml", with_datacenters("{eu: {}, latency: garbage}"),
+                     "datacenters: latency must be a list");
+  }
+}
+
+TEST_CASE("a client with an empty op map is told it needs an op") {
+  require_rejected("simsys_client_empty_ops.yaml",
+                   scenario_with("  u: {type: client, rate: {base: 1/s}, ops: {}}\n"),
+                   "node 'u': client needs at least one op");
 }
