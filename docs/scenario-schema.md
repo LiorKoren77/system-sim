@@ -143,7 +143,7 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 | `type` | enum | all | read | one of the catalogue below |
 | `dc` | string | all | read | a declared datacenter; default as above. Decides whether a link without `latency` is intra- or cross-DC |
 | `replicas` | integer > 0 | all | read | N identical copies: each copy sees its share of the demand with the node's full capacity, concurrency and queue limit; backlog and drops are reported summed. How the demand is shared depends on a load balancer in front ([below](#load_balancer)); without one, `demand / N` each. No effect on a client |
-| `capacity` | rate or byte rate | all but `client` | read | service rate **per replica**; default per type (§6 of the spec; 100k/s for `load_balancer`, `rate_limiter` and `cache`). A byte rate (`500MB/s`) is read as objects of 1 MB per second. At most `1e15/s` (`1e15B/s` for a byte rate). An error on a `leaky_bucket` limiter |
+| `capacity` | rate or byte rate | all but `client` | read | service rate **per replica**; default per type (§6 of the spec; 100k/s for `load_balancer`, `rate_limiter` and `cache`). A byte rate (`500MB/s`) is read as objects of 1 MB per second, an object size no scenario states, so `explain` tags such a capacity, `capacity=500/s (scenario: 500MB/s at 1MB/object; byte flows: phase 2c)` (a `blob_store`'s default, spec §6's 500 MB/s, likewise with `default:`), and gives its check the load but no percentage and no zone, `(not checked: capacity from 500MB/s at 1MB/object; byte flows: phase 2c)`, until phase 2c's byte flows take each op's own size. At most `1e15/s` (`1e15B/s` for a byte rate). An error on a `leaky_bucket` limiter |
 | `latency` | duration | all but `client` | read | service time of one request; default per type (50 µs for `load_balancer` and `rate_limiter`, 250 µs for `cache`: the spec's memory read). An error on a `leaky_bucket` limiter |
 | `advanced` | map | all but `client` | read | see next table |
 | `ops` | map | `client`, `service`, `ws_gateway` | read (client, service); checked (ws_gateway) | client: op → share; otherwise op → step list (below) |
@@ -176,7 +176,7 @@ A **step** is `{to: <node id>, op: <op name>, on: always|miss|failure, mode: seq
 |---|---|---|---|
 | `to` | required | read | a declared node, **not the node itself** (a retry, the one reason to call yourself, is `client.retries`); *(graph)* not a client (clients only send) |
 | `op` | the incoming op | read | required in `then` steps, which have no incoming op to inherit |
-| `on` | `always` | read | `miss` applies to the flow a cache/CDN did not serve, `failure` to failed requests. In an op's step list, an `on: miss` step belongs to the nearest unconditional step before it, its lookup, which must ask a `cache` for a read, leave the miss to the application, and be waited for. *(graph)* `node 'web': an 'on: miss' step must follow a cache or cdn step`; `... cannot follow a write to cache 'c' (writes do not miss)`; `... cannot follow read_through cache 'c' (the cache already fetched the miss)`; `... cannot follow cdn 'edge' (the cdn already fetched the miss from its origin)` (a CDN fetches its own misses, see [`cdn`](#cdn)); `... and the cache step it follows must be sequential (the miss step waits for the cache's answer)`. A miss step is taken by the miss fraction `1 − h` of the requests (`h` the cache's hit ratio, stated or [resolved at build](#che-hit-ratios); a cache built in code without one counts as `h = 0`, and `explain` marks the checks that rest on it). After a lookup of `factor: k` it sends `k(1 − h)` requests per request: every missed lookup is fetched. Several `on: miss` steps after one lookup form one block that a miss takes whole, one step after another: the response adds `1 − h` × the sum of their hops on average, with the hit/miss spread in the variance, and a miss is answered only if every fetch is. (For latency, a request's `k` lookups are assumed to hit or miss together.) `failure` steps never fire before phase 2c |
+| `on` | `always` | read | `miss` applies to the flow a cache did not serve, `failure` to failed requests. In an op's step list, an `on: miss` step belongs to the nearest unconditional step before it, its lookup, which must ask a `cache` for a read, leave the miss to the application, and be waited for. *(graph)* `node 'web': an 'on: miss' step must follow a cache step`; `... cannot follow a write to cache 'c' (writes do not miss)`; `... cannot follow read_through cache 'c' (the cache already fetched the miss)`; `... cannot follow cdn 'edge' (the cdn already fetched the miss from its origin)` (a CDN fetches its own misses, see [`cdn`](#cdn)); `... and the cache step it follows must be sequential (the miss step waits for the cache's answer)`. A miss step is taken by the miss fraction `1 − h` of the requests (`h` the cache's hit ratio, stated or [resolved at build](#che-hit-ratios); a cache built in code without one counts as `h = 0`, and `explain` marks the checks that rest on it). After a lookup of `factor: k` it sends `k(1 − h)` requests per request: every missed lookup is fetched. Several `on: miss` steps after one lookup form one block that a miss takes whole, one step after another: the response adds `1 − h` × the sum of their hops on average, with the hit/miss spread in the variance, and a miss is answered only if every fetch is. (For latency, a request's `k` lookups are assumed to hit or miss together.) `failure` steps never fire before phase 2c |
 | `mode` | `sequential` | read | sequential steps add their latencies; **all parallel steps of an op form one group wherever they sit** among the sequential ones, and the group costs its slowest branch |
 | `factor` | 1 | read | finite, positive, at most `1e6`; multiplies the flow (fan-out: one post → 100 feed writes) |
 
@@ -189,7 +189,7 @@ target and, if that link lists `ops`, lists the step's op.
 | type | own keys | status |
 |---|---|---|
 | `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `keys` read by the [`che` caches](#che-hit-ratios) downstream (`keys must be a map`, `keys needs zipf and space, or uniform`, `keys takes zipf+space or uniform, not both`, `keys.zipf must be a finite non-negative number`, `keys.space must be a positive count`, `keys.uniform must be a positive count`; `space` and `uniform` are [counts](#values): `100M`); `timeout` checked (a duration), not yet used; `sizes`, `retries` ignored |
-| `cdn` | `origin` (node id, required), `hit_ratio` (`{fixed: h}` or `che`, optional), `keys`, `ttl` | read and run (phase 2b), see [`cdn`](#cdn) |
+| `cdn` | `origin` (node id, required), `hit_ratio` (`{fixed: h}` or `che`, optional), `keys`, `ttl`, `write_ops` | read and run (phase 2b), see [`cdn`](#cdn) |
 | `load_balancer` | `policy`, `vnodes` | read and run, see [`load_balancer`](#load_balancer) |
 | `rate_limiter` | `algorithm`, `limit`, `burst`, `window`, `backend` | read and run, see [`rate_limiter`](#rate_limiter) |
 | `service` | `ops`, `cost` | read and run |
@@ -358,7 +358,7 @@ Refused at build *(graph)*:
 - a `then` step on miss on a `read_through` cache, which already fetches its misses from its
   `backend` (each miss would be fetched twice): `node 'c': a then step on miss and a read_through
   backend both fetch the miss`;
-- a service's `on: miss` step after a cache (or CDN) that has a `then` step on miss, the same
+- a service's `on: miss` step after a cache that has a `then` step on miss, the same
   double fetch from the other side: `node 'api': an 'on: miss' step cannot follow cache 'c',
   whose own then step on miss already fetches the miss`;
 - a parallel `then` step on miss (a miss waits for it): `node 'c': a then step on miss must be
@@ -452,28 +452,37 @@ a CDN server without the file requests it from the origin, stores it and returns
 
 | key | rule | message on violation |
 |---|---|---|
-| `origin` | required; a declared node that is not a client, with a link from the CDN | `node 'edge': a cdn needs an origin`; `node 'edge': origin refers to unknown node 'x'`; `node 'edge': origin must not be a client`; *(graph)* `node 'edge': origin 'x' needs a link from the cdn` |
+| `origin` | required; a declared node that is not a client and not the CDN itself, with a link from the CDN. Another CDN is fine: a tiered CDN (edge → regional → origin), whose second tier's `che` is computed over the first tier's misses | `node 'edge': a cdn needs an origin`; `node 'edge': origin refers to unknown node 'x'`; `node 'edge': origin 'u' is a client; clients only send`; `node 'edge': a cdn cannot be its own origin`; *(graph)* `node 'edge': origin 'x' needs a link from the cdn`; `node 'edge': origin 'x' closes a call cycle` (the origin calls back into the CDN, so a miss would wait for itself) |
 | `hit_ratio` | `{fixed: h}` (`0 ≤ h ≤ 1`) or `che`, as a cache's; optional: without one every read misses (`h = 0`) and still runs | `node 'edge': hit_ratio must be che or {fixed: h}` |
 | `keys` | the CDN's size in **objects** (not bytes: byte flows are phase 2c), a positive [count](#values); a `che` hit ratio resolves from it and the `keys` of the clients that reach the CDN, exactly as a [cache's](#che-hit-ratios) | `node 'edge': keys must be a positive integer` |
 | `ttl` | a positive duration, printed and not modelled | `node 'edge': ttl must be positive` |
+| `write_ops` | the ops that are writes, as a [cache's](#cache) (default `[write]`): a CDN **refuses** them (below) and caches every other op as a read. Name an `upload` or a `purge` here when a client sends it through the CDN, or the CDN answers the hit share of it from the edge; `explain` lists what the CDN serves, `serves: read, upload` | `node 'edge': write_ops must name at least one op` |
 
 Refused:
 
-- *(graph)* a write reaching the CDN (an op in `write_ops`: `write` for a CDN), from a client or a
-  step: the CDN has no write path, content changes at the origin: `node 'edge': a cdn does not
-  take writes`;
+- *(graph)* a write reaching the CDN (an op in `write_ops`, `write` by default), from a client or
+  a step: the CDN has no write path, content changes at the origin: `node 'edge': a cdn does not
+  take writes ('upload' from 'users')`, naming the op and a node that sends it;
 - *(graph)* a service's `on: miss` step after a CDN lookup, which would fetch every miss a second
   time (see [Steps](#steps)); a CDN built in code with `then` steps: `node 'edge': a cdn has no
-  then steps (it fetches its misses from its origin)`;
+  then steps (it fetches its misses from its origin)`, with a cache `strategy`: `node 'edge': a
+  cdn has no strategy (it reads through to its origin)`, or with a `backend`: `node 'edge': a cdn
+  has no backend (its origin is the store behind it)`;
 - *(run, estimate)* a byte `capacity` (`capacity: 100GB/s`): `node 'edge': a cdn with a byte
-  capacity needs byte flows (phase 2c)`; `explain` shows it;
+  capacity needs byte flows (phase 2c)`; `explain` shows it, tagged and not checked (see
+  `capacity` in [Node (common keys)](#node-common-keys));
 - *(run, estimate)* `hit_ratio: che` without `keys`: `explain` shows `hit_ratio=che`, counts every
   read as a miss and marks the checks behind it as an upper bound; a run refuses it (`node 'edge':
   hit_ratio che needs keys (the cdn's size in objects)`) rather than silently run `h = 0`.
 
-`explain` shows a CDN as it shows a cache, plus where the misses go: `hit_ratio=0.95 (fixed)
-misses → media_store ttl=1h`, and the origin's check line counts the miss share
-(news-feed's `media_store` is offered 5 % of the CDN's reads).
+`explain` shows a CDN as it shows a cache, plus where the misses go and what it serves:
+`hit_ratio=0.95 (fixed) misses → media_store ttl=1h  serves: read_media`, and the origin's check
+line counts the miss share (news-feed's `media_store` is offered 5 % of the CDN's reads). A CDN
+without a hit ratio reads `hit_ratio=none (every read misses: h = 0)`: that is what runs, so the
+origin's check is a plain one, not the upper bound of an unsized `che`.
+
+A `che` CDN is the Che approximation over its `keys` objects: LRU eviction and independent
+requests from the clients' key popularity, as for a cache.
 
 Not modelled: bytes and bandwidth (phase 2c), TTL expiry and the stale content it serves, a cold
 edge, invalidation and purges, the choice of the nearest point of presence (the client's links
@@ -559,13 +568,14 @@ Size a database off rho = 1, as the examples here are.
 write_ops=write,insert` (`(default)` after a shard count or lag the scenario left out, `(unused:
 no replicas)` after a lag with `replicas: 1`; `pool` only when stated, and in the queue numbers
 `capacity=400/s (pool 4 / 10ms)  ...  c=4 (pool)` when it binds). Every write op that reaches the
-database with no stated cost is printed with its default and where it comes from, `cost: insert 5
-(default: spec §6 5k reads/1k writes)`, beside the costs the scenario states. Its check splits the
+database with no stated cost is printed with its default, after the costs the scenario states,
+and where the default comes from once: `cost: insert 5 (default: spec §6 5k reads/1k writes)`,
+`cost: read 2; insert 5, update 5 (defaults: spec §6 5k reads/1k writes)`. Its check splits the
 paper load in capacity units, and says so; for the example above (1000 selects/s and 60 inserts/s
 on copies of 1k/s): `primary 300 units/s vs 1k/s (30%, green), each replica 800 units/s vs 1k/s
 (80%, yellow)`. The total capacity counts primaries that serve no reads, so when its average's
 zone is milder than the busiest copy's, the headline gives the busiest copy's: `peak offered
-1.3k/s vs 3k/s total capacity  (43.3%, yellow at the busiest copy)`.
+1.3k units/s vs 3k/s total capacity  (43.3%, yellow at the busiest copy)`.
 
 Not modelled: replication conflicts and multi-primary set-ups, failover, transactions and
 locks, waiting for a free connection beyond the pool's queue, cross-shard queries, hot shards

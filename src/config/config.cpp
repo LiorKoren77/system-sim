@@ -100,7 +100,7 @@ struct OwnKeys {
 // `then` (steps after processing) to the five types the schema lists for it.
 constexpr std::array<OwnKeys, model::node_type_names.size()> own_keys_by_type{{
     {model::NodeType::client, "rate ops keys sizes timeout retries"},
-    {model::NodeType::cdn, "ttl hit_ratio origin keys"},
+    {model::NodeType::cdn, "ttl hit_ratio origin keys write_ops"},
     {model::NodeType::load_balancer, "policy vnodes"},
     {model::NodeType::rate_limiter, "algorithm limit burst window backend"},
     {model::NodeType::service, "ops cost"},
@@ -2165,9 +2165,10 @@ CheckResult read_cache_strategy(const Site& site, const YAML::Node& body, model:
 
 // `write_ops: [write, delete]`: the ops that change data; every other op is a read. Stored
 // exactly as written; absent stays absent (model::write_ops_of applies the type's default, a
-// cache's `write` or a database's four SQL writes). An empty list would make every op a read,
-// which a cache or a database that is written to never is, so it is refused rather than read as
-// "no writes".
+// cache's or a CDN's `write` or a database's four SQL writes). An empty list would make every op
+// a read, which a cache or a database that is written to never is, so it is refused rather than
+// read as "no writes". On a CDN the list names the ops it refuses (it has no write path, so the
+// graph refuses a write op that reaches it) instead of caching them as reads.
 CheckResult read_write_ops(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   const auto list = body["write_ops"];
   if (!list) return {};
@@ -2280,16 +2281,22 @@ CheckResult read_sql_keys(const Site& site, const YAML::Node& body, model::NodeS
 // it answers the hits and fetches the misses from the origin as the same op.
 
 // `origin: media_store`, required: the node the CDN fetches its misses from. read_node_routing
-// has already checked that it exists; it must also be a server, since a client only sends.
+// has already checked that it exists (the lookup below still guards against a miss rather than
+// dereference an end iterator); it must also be a server, since a client only sends (the graph's
+// words for any call to a client), and not the CDN itself, which could never answer its own miss.
 CheckResult read_cdn_origin(const Site& site, const YAML::Node& body, model::NodeSpec& node,
                             const Declarations& declared) {
   const auto value = body["origin"];
   if (!value) return site.fail(body, "a cdn needs an origin");
   const auto id = scalar_text(value);
-  const auto& target = declared.nodes[declared.ids.find(id)->second];
-  if (target.type == model::NodeType::client) {
-    return site.fail(value, "origin must not be a client");
+  const auto found = declared.ids.find(id);
+  if (found == declared.ids.end()) {
+    return site.fail(value, std::format("origin refers to unknown node '{}'", id));
   }
+  if (declared.nodes[found->second].type == model::NodeType::client) {
+    return site.fail(value, std::format("origin '{}' is a client; clients only send", id));
+  }
+  if (id == node.id) return site.fail(value, "a cdn cannot be its own origin");
   node.origin = id;
   return {};
 }
@@ -2297,7 +2304,8 @@ CheckResult read_cdn_origin(const Site& site, const YAML::Node& body, model::Nod
 // The hit ratio in the cache's own grammar, `{fixed: h}` or `che`; optional: a CDN without
 // one misses every read (h = 0, graph::Graph::backend_fraction). `keys: 100k` is its size in
 // objects, which a `che` hit ratio needs (read_cache_size). `ttl` is read as a cache's is
-// (positive), printed by explain and not modelled.
+// (positive), printed by explain and not modelled. `write_ops` names the ops that are writes
+// (read_write_ops): the graph refuses them at a CDN, and caches every other op as a read.
 CheckResult read_cdn_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node,
                           const Declarations& declared) {
   if (node.type != model::NodeType::cdn) return {};
@@ -2308,7 +2316,8 @@ CheckResult read_cdn_keys(const Site& site, const YAML::Node& body, model::NodeS
         return read_hit_ratio(this_node, body, node);
       })
       .and_then([&] { return read_cache_size(this_node, body, node); })
-      .and_then([&] { return read_cache_ttl(this_node, body, node); });
+      .and_then([&] { return read_cache_ttl(this_node, body, node); })
+      .and_then([&] { return read_write_ops(this_node, body, node); });
 }
 
 // ---- Node bodies: the second pass -----------------------------------------------------
