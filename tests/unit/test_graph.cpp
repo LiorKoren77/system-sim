@@ -1481,3 +1481,82 @@ TEST_CASE("a ring-partitioned cache that is also sent to directly is an error", 
   REQUIRE(built.error().message ==
           "node 'c': keys are partitioned by ring 'ring' but 'web' also sends to it directly");
 }
+
+// ---- SQL database (plan 2b, Task 4; review of 48d4d0b) ----
+
+namespace {
+// u -> db, or u -> ring -> db through a consistent-hash balancer of one vnode per server: a SQL
+// database of 3 copies (one primary, two read replicas) of 5k/s and 10 ms each.
+Scenario database_behind_ring(bool ring) {
+  Scenario s{.name = "db", .version = 1, .duration = 1min};
+  NodeSpec db{.id = "db",
+              .type = NodeType::sql_db,
+              .replicas = 3,
+              .capacity = Rate{5000},
+              .latency = 10ms};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{1000}},
+                                           .op_shares = {{"select", 0.9}, {"insert", 0.1}}}},
+             std::move(db)};
+  if (!ring) {
+    s.links = {LinkSpec{.from = "u", .to = "db"}};
+    return s;
+  }
+  s.nodes.push_back(NodeSpec{
+      .id = "ring", .type = NodeType::load_balancer, .policy = LbPolicy::consistent_hash, .vnodes = 1});
+  s.links = {LinkSpec{.from = "u", .to = "ring"}, LinkSpec{.from = "ring", .to = "db"}};
+  return s;
+}
+}  // namespace
+
+// The database driver, not a balancer, sends writes to the primary and reads to a replica, and
+// a sharding key spreads the shards evenly: a hash ring in front leaves the copies even
+// (imbalance 1), so explain and the engine agree that no copy is hot (review of 48d4d0b, I1).
+TEST_CASE("a hash ring imposes no hot copy on a database", "[graph]") {
+  const auto g = Graph::build(database_behind_ring(true));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE(g->nodes()[*g->index_of("db")].imbalance == 1.0);
+}
+
+// A database is a leaf: it answers every query itself (behaviours::SqlDbBehaviour), so a link
+// that would carry demand out of it would carry nothing. Graph::build refuses one in a scenario
+// built in code with the loader's message, whichever end writes it.
+TEST_CASE("a link that carries demand out of a database is refused", "[graph]") {
+  auto s = database_behind_ring(false);
+  s.nodes.push_back(NodeSpec{.id = "audit", .type = NodeType::service});
+  SECTION("written from the database") {
+    s.links.push_back(LinkSpec{.from = "db", .to = "audit"});
+  }
+  SECTION("written from the other end with dir: in") {
+    s.links.push_back(LinkSpec{.from = "audit", .to = "db", .dir = Direction::in});
+  }
+  const auto g = Graph::build(s);
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message == "node 'db': a database calls nobody");
+}
+
+// Little's law, concurrency in service = throughput × service time, read backwards: a copy with
+// `pool` connections has at most `pool` queries in service, so it serves at most pool / service
+// time (review of 48d4d0b, C3). 5k/s × 10 ms implies 50 in service; `pool: 4` allows 4, so
+// 4 / 10 ms = 400/s with c = 4. A pool of 100 binds nothing: 5k/s and the implied c = 50 stay.
+TEST_CASE("a database's pool bounds its throughput by Little's law and never raises it",
+          "[graph]") {
+  auto s = database_behind_ring(false);
+  SECTION("pool 4 of an implied 50") {
+    s.nodes[1].pool = 4;
+    const auto g = *Graph::build(s);
+    const auto& capacity = g.nodes()[1].capacity;
+    REQUIRE_THAT(capacity.service_rate.per_second, WithinRel(400.0, 1e-12));
+    REQUIRE(capacity.concurrency == 4);
+    REQUIRE_THAT(capacity.service_time_s, WithinRel(0.010, 1e-12));
+  }
+  SECTION("pool 100 of an implied 50") {
+    s.nodes[1].pool = 100;
+    const auto g = *Graph::build(s);
+    const auto& capacity = g.nodes()[1].capacity;
+    REQUIRE_THAT(capacity.service_rate.per_second, WithinRel(5000.0, 1e-12));
+    REQUIRE(capacity.concurrency == 50);
+  }
+}

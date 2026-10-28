@@ -8,6 +8,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // C++20 `import`: brings the module's exported names into this translation unit without
@@ -898,12 +899,16 @@ TEST_CASE("explain writes a key space beyond the G prefix in plain digits", "[re
 namespace {
 // u(1000 reads/s + 100 writes/s) -> db: a SQL database of 3 copies (1 primary + 2 replicas),
 // capacity 1000/s per copy, 1 ms service time, a replication lag of 50 ms, zero-latency link.
-// The staleness the node reports is then 50 ms + the primary's write sojourn (about 1.1 ms).
+// A `write` costs 1 unit (stated: the database default is 5), so loads are requests: the primary
+// runs at 100/s (rho 0.1) and each replica at 500 + 100 = 600/s (rho 0.6). The staleness the
+// node reports is then 50 ms + the write's sojourn at the primary (1.11 ms) and at a replica
+// (2.5 ms): M/M/1 sojourns rho / (1 − rho) × s + s.
 Scenario replicated_db() {
   Scenario s{.name = "replicated", .version = 1, .duration = 2s, .warmup = 500ms};
   NodeSpec db{
       .id = "db", .type = NodeType::sql_db, .replicas = 3, .capacity = Rate{1000}, .latency = 1ms};
   db.replication_lag = 50ms;
+  db.cost = {{"write", 1.0}};
   s.nodes = {NodeSpec{.id = "u",
                       .type = NodeType::client,
                       .workload = Workload{.curve = {.base = Rate{1100}},
@@ -912,6 +917,18 @@ Scenario replicated_db() {
              std::move(db)};
   s.links = {LinkSpec{.from = "u", .to = "db", .latency = 0s}};
   return s;
+}
+
+// The number after the first `"key": ` in `json` (the first node that has the key: a database's,
+// as the other nodes print null for these).
+double json_value(const std::string& json, std::string_view key) {
+  const std::string field = "\"" + std::string{key} + "\": ";
+  auto at = json.find(field);
+  while (at != std::string::npos && json.compare(at + field.size(), 4, "null") == 0) {
+    at = json.find(field, at + 1);
+  }
+  REQUIRE(at != std::string::npos);
+  return std::stod(json.substr(at + field.size()));
 }
 }  // namespace
 
@@ -939,13 +956,130 @@ TEST_CASE("the staleness SLO compares the replication lag plus write sojourn wit
   SECTION("40 ms fails") {
     REQUIRE(check(40ms).status == simsys::report::SloStatus::fail);
   }
-  SECTION("the JSON carries staleness_s for the database") {
+  SECTION("the JSON carries staleness_s for the database, with its value") {
     s.slos = {};
     const auto g = *simsys::graph::Graph::build(s);
     const auto summary = summarize(s, g);
     const auto json =
         simsys::report::render_json(summary, simsys::report::evaluate_slos(summary, s.slos));
-    REQUIRE(json.find("\"staleness_s\"") != std::string::npos);
+    CAPTURE(json);
+    // M/M/1 sojourn rho / (1 − rho) × s + s at the primary (rho 0.1) and at a replica (0.6).
+    const double primary = 0.1 / 0.9 * 0.001 + 0.001;
+    const double replica = 0.6 / 0.4 * 0.001 + 0.001;
+    REQUIRE_THAT(json_value(json, "staleness_s"), WithinRel(0.050 + primary + replica, 1e-9));
+    REQUIRE(json_value(json, "replication_dropped_per_s") == 0.0);
+  }
+}
+
+// A replica that cannot keep up with the writes it replays drops some of them, and from then on
+// it never holds what the primary holds: no staleness bound means anything (review of 48d4d0b,
+// C1). 2 copies, 800 reads/s + 400 writes/s at 1000/s per copy: the replica is sent 1200/s,
+// fills its queue by 5 s and then drops 200/s in its queue's mix, a third of it (66.7/s)
+// replicated writes. The staleness SLO fails on them whatever the mean staleness (here within
+// its 10 s bound), and says why;
+// the table and the JSON carry the number.
+TEST_CASE("the staleness SLO fails when a replica drops replicated writes", "[report]") {
+  auto s = replicated_db();
+  s.duration = 10s;
+  s.warmup = 6s;  // after the replica's queue is full: a steady 200/s of drops
+  s.nodes[0].workload = Workload{.curve = {.base = Rate{1200}},
+                                 .op_shares = {{"read", 800.0 / 1200.0}, {"write", 400.0 / 1200.0}}};
+  s.nodes[1].replicas = 2;
+  s.slos = {simsys::model::SloSpec{
+      .metric = simsys::model::SloMetric::staleness, .node = "db", .max = 10s}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  // The mean staleness (about 1.05 s: the replica's full queue drains in 1 s) is within 10 s.
+  REQUIRE(*summary.nodes()[1].mean_staleness_s < 10.0);
+  REQUIRE_THAT(summary.nodes()[1].mean_replication_dropped_per_s.value(),
+               WithinRel(200.0 * 400.0 / 1200.0, 1e-6));
+  const auto results = simsys::report::evaluate_slos(summary, s.slos);
+  REQUIRE(results[0].status == simsys::report::SloStatus::fail);
+  REQUIRE(results[0].note == "replica diverges: drops 66.7/s replicated writes");
+  const auto table = simsys::report::render_table(summary, results, false);
+  CAPTURE(table);
+  REQUIRE(table.contains("replica diverges: drops 66.7/s replicated writes"));
+  const auto json = simsys::report::render_json(summary, results);
+  CAPTURE(json);
+  REQUIRE_THAT(json_value(json, "replication_dropped_per_s"), WithinRel(200.0 / 3.0, 1e-6));
+  REQUIRE(json.contains("\"note\": \"replica diverges: drops 66.7/s replicated writes\""));
+}
+
+// Shards × replicas (review of 48d4d0b): explain's total counts N × S copies, 3 × 2 of 1k/s, and
+// its per-copy split divides each load by the shards: one primary is sent 100 / 2 = 50 writes/s,
+// one replica 1000 / (2 × 2) + 100 / 2 = 300/s.
+TEST_CASE("explain counts every copy of every shard and splits the load per copy", "[report]") {
+  auto s = replicated_db();
+  s.nodes[1].shards = 2;
+  const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(s));
+  CAPTURE(text);
+  REQUIRE(text.contains("vs 6k/s total capacity"));
+  REQUIRE(
+      text.contains("primary 50/s vs 1k/s (5%, green), each replica 300/s vs 1k/s (30%, green)"));
+}
+
+// The database driver, not the balancer, decides where a query goes (writes to the primary,
+// reads to a replica), so a hash ring in front of a database imposes no hot copy: explain
+// splits its load like any database's and has no hottest-copy line (review of 48d4d0b, I1).
+TEST_CASE("a hash ring in front of a database leaves its copies even in explain", "[report]") {
+  auto s = replicated_db();
+  s.nodes.push_back(NodeSpec{.id = "ring",
+                             .type = NodeType::load_balancer,
+                             .policy = simsys::model::LbPolicy::consistent_hash,
+                             .vnodes = 1});
+  s.links = {LinkSpec{.from = "u", .to = "ring", .latency = 0s},
+             LinkSpec{.from = "ring", .to = "db", .latency = 0s}};
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  REQUIRE_FALSE(text.contains("hottest copy"));
+  REQUIRE(text.contains("each replica 600/s vs 1k/s (60%, green)"));
+}
+
+// A database's total capacity counts primaries that serve no reads, so its average can look
+// green while every replica is red: the headline's zone is the busiest copy's. 2 copies, 1000
+// reads/s + 100 writes/s: 1.1k/s of 2k/s is 55 % on average, but the replica carries all 1.1k/s
+// against 1k/s, 110 %, red.
+TEST_CASE("explain gives a database the zone of its busiest copy", "[report]") {
+  auto s = replicated_db();
+  s.nodes[1].replicas = 2;
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  REQUIRE(text.contains("vs 2k/s total capacity  (55%, red at the busiest copy)"));
+  REQUIRE(text.contains("each replica 1.1k/s vs 1k/s (110%, red)"));
+}
+
+// `replication_lag` describes how far replicas run behind; with `replicas: 1` there is none, so
+// the lag is accepted (a scenario may keep it while trying one copy) and marked unused.
+TEST_CASE("explain marks a replication lag without replicas as unused", "[report]") {
+  auto s = replicated_db();
+  s.nodes[1].replicas = 1;
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  REQUIRE(text.contains("lag=50ms (unused: no replicas)"));
+}
+
+// Little's law: a copy has at most `pool` queries in service, each for one service time, so it
+// serves at most pool / service time. 4 connections of 10 ms are 400/s: explain shows the bound
+// and where it came from. A pool above the concurrency the disk implies (5k/s × 150 us < 1) binds
+// nothing, and c stays implied.
+TEST_CASE("explain shows the throughput a small pool allows", "[report]") {
+  auto s = replicated_db();
+  SECTION("pool 4 of 10 ms queries") {
+    s.nodes[1].capacity = Rate{5000};
+    s.nodes[1].latency = 10ms;
+    s.nodes[1].pool = 4;
+    const auto text = explain_of(s);
+    CAPTURE(text);
+    REQUIRE(text.contains("capacity=400/s (pool 4 / 10ms)"));
+    REQUIRE(text.contains("c=4 (pool)"));
+  }
+  SECTION("a pool that binds nothing") {
+    s.nodes[1].pool = 32;
+    const auto text = explain_of(s);
+    CAPTURE(text);
+    REQUIRE(text.contains("capacity=1k/s (scenario)"));
+    REQUIRE(text.contains("c=1 (implied)"));
+    REQUIRE(text.contains("pool=32"));
   }
 }
 
