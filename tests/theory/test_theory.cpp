@@ -3,7 +3,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <map>
 #include <stdexcept>
@@ -713,6 +715,94 @@ TEST_CASE("consistent hashing loads the hottest replica by the imbalance factor"
   const auto r = (*Simulation::create(*Graph::build(s))).step(0s, 100ms);
   REQUIRE_THAT(r.nodes[2].rho, WithinRel(0.99, 1e-12));
   REQUIRE_THAT(r.nodes[2].drain_per_s, WithinRel(3600.0, 1e-12));  // the group still drains all
+}
+
+// The work balance of one step at one node (group totals, capacity units):
+//   backlog before + demand × dt = (drain + dropped) × dt + backlog after.
+// Nothing is created or lost inside a node, however its replicas are modelled.
+namespace {
+void require_conserved(double backlog_before, const simsys::engine::NodeSample& n, double dt_s) {
+  REQUIRE_THAT(backlog_before + n.demand_per_s * dt_s,
+               WithinRel((n.drain_per_s + n.dropped_per_s) * dt_s + n.backlog, 1e-12));
+}
+}  // namespace
+
+// A hash ring with vnodes 1 over 4 copies: the hottest copy holds k = min(1 + 1/sqrt(1), 4) = 2
+// times the average share, the other three split what is left. At 3000/s (750/s per copy on
+// average) the hot copy is sent 2 × 750 = 1500/s against 1000/s capacity, so it sheds 500/s
+// once its 100-request room is full; each cool copy is sent (4 - 2)/(4 - 1) × 750 = 500/s and
+// serves all of it. The group drains 1000 + 3 × 500 = 2500/s: only the hot copy's excess is lost.
+TEST_CASE(
+    "a saturated hash ring sheds only the hottest copy's excess; the cooler copies serve their "
+    "share",
+    "[theory]") {
+  Scenario s = lb_front(LbPolicy::consistent_hash, 4, 3000);
+  s.nodes[1].vnodes = 1;
+  s.nodes[2].advanced.queue_limit = 100;
+  const auto g = *Graph::build(s);
+  auto sim = *Simulation::create(g);
+  double backlog = 0.0;
+  simsys::engine::StepRecord last;
+  sim.run({.duration = 2s, .step = 100ms}, [&](const auto& r) {
+    require_conserved(backlog, r.nodes[2], 0.1);
+    backlog = r.nodes[2].backlog;
+    last = r;
+  });
+  const auto& a = last.nodes[2];
+  REQUIRE_THAT(a.demand_per_s, WithinRel(3000.0, 1e-12));
+  REQUIRE_THAT(a.drain_per_s, WithinRel(2500.0, 1e-12));
+  REQUIRE_THAT(a.dropped_per_s, WithinRel(500.0, 1e-12));
+  REQUIRE_THAT(a.backlog, WithinRel(100.0, 1e-12));  // the hot copy's room; the cool ones are empty
+  REQUIRE(a.rho == 1.0);                             // reported: the hottest copy
+  REQUIRE(a.zone == simsys::fluid::Zone::red);
+  const auto settled = sim.estimate();
+  REQUIRE_THAT(settled.nodes[2].drain_per_s, WithinRel(2500.0, 1e-12));
+  REQUIRE_THAT(settled.nodes[2].dropped_per_s, WithinRel(500.0, 1e-12));
+}
+
+// A pooled group (least_connections) is ONE queue of N × the capacity and N × the waiting
+// room: 3 copies of 1000/s with room for 100 each make a 3000/s pool with room for 300. At
+// 4500/s the room fills by 1500 × 0.1 = 150 per step, is full after two steps, and from then
+// on the pool sheds 1500/s; no step creates or loses work.
+TEST_CASE("a pooled group conserves work every step and its waiting room is replicas × queue_limit",
+          "[theory]") {
+  Scenario s = lb_front(LbPolicy::least_connections, 3, 4500);
+  s.nodes[2].advanced.queue_limit = 100;
+  auto sim = *Simulation::create(*Graph::build(s));
+  double backlog = 0.0;
+  double most_waiting = 0.0;
+  simsys::engine::StepRecord last;
+  sim.run({.duration = 2s, .step = 100ms}, [&](const auto& r) {
+    require_conserved(backlog, r.nodes[2], 0.1);
+    backlog = r.nodes[2].backlog;
+    most_waiting = std::max(most_waiting, backlog);
+    last = r;
+  });
+  REQUIRE_THAT(most_waiting, WithinRel(300.0, 1e-12));
+  REQUIRE_THAT(last.nodes[2].drain_per_s, WithinRel(3000.0, 1e-12));
+  REQUIRE_THAT(last.nodes[2].dropped_per_s, WithinRel(1500.0, 1e-12));
+}
+
+// Behind a hash ring a node is two kinds of copy: the hottest, which a request reaches with
+// probability k/N (it holds k times the average share), and the N - 1 cooler ones, which split
+// the rest. A request's sojourn is therefore a mixture: with probability k/N the hot copy's
+// M/M/1 sojourn at rho_hot = k × rho, otherwise a cool copy's at
+// rho_cool = (N - k)/(N - 1) × rho. Here N = 4, vnodes 150 (k = 1 + 1/sqrt(150) ≈ 1.082),
+// average rho 0.85 on 1000/s copies with 1 ms service.
+TEST_CASE("an imbalanced node's latency is the share-weighted mixture of the hot and cool copies",
+          "[theory]") {
+  constexpr double copies = 4;
+  constexpr double rho = 0.85;
+  Scenario s = lb_front(LbPolicy::consistent_hash, 4, rho * copies * 1000);
+  s.nodes[1].vnodes = 150;
+  const auto r = (*Simulation::create(*Graph::build(s))).step(0s, 100ms);
+  const double k = 1.0 + 1.0 / std::sqrt(150.0);
+  const double rho_cool = (copies - k) / (copies - 1) * rho;
+  const double hot = simsys::queueing::mmc_wait(1, k * rho, 0.001).mean_s + 0.001;
+  const double cool = simsys::queueing::mmc_wait(1, rho_cool, 0.001).mean_s + 0.001;
+  const double expected = k / copies * hot + (1 - k / copies) * cool;
+  REQUIRE_THAT(r.nodes[2].latency.mean_s, WithinRel(expected, 1e-9));
+  REQUIRE_THAT(r.nodes[2].rho, WithinRel(k * rho, 1e-12));  // rho and zone: the hottest copy's
 }
 
 // The balancer is itself a queue (100k/s, 50 us, so c = ceil(100000 * 50e-6) = 5 servers
