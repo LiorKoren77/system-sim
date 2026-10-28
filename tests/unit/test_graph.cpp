@@ -3,7 +3,10 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstddef>
+#include <limits>
 #include <map>
 #include <string>
 #include <string_view>
@@ -73,6 +76,9 @@ TEST_CASE("topological order puts every node after the nodes that send to it", "
   // of the graph's vector (pointer + size), replacing `const std::vector<T>&`; the test
   // can search it like any range but cannot modify it.
   const auto order = g->topological_order();
+  // C++20 ranges algorithms: std::ranges::find takes the range itself instead of an
+  // iterator pair (`std::find(order.begin(), order.end(), x)`), so begin and end cannot be
+  // mixed up between two containers; later uses here add projections and predicates.
   const auto pos = [&](std::string_view id) {
     return std::ranges::find(order, *g->index_of(id)) - order.begin();
   };
@@ -176,18 +182,31 @@ TEST_CASE("demand_link finds the link in either spelling of the direction", "[gr
 
 TEST_CASE("the feedback edge closes the loop seen from the clients, whatever the node order",
           "[graph]") {
-  Scenario s{.name = "loop", .version = 1, .duration = 1min};
-  s.nodes = {service("q", {{"publish", {Step{.to = "sync", .op = "job"}}}}),
-             service("sync", {{"job", {Step{.to = "chat", .op = "push"}}}}),
-             service("chat", {{"msg", {Step{.to = "q", .op = "publish"}}}}),
-             client("u", Rate{1}, {{"msg", 1.0}})};  // client last
-  s.links = {LinkSpec{.from = "u", .to = "chat"}, LinkSpec{.from = "chat", .to = "q"},
-             LinkSpec{.from = "q", .to = "sync"}, LinkSpec{.from = "sync", .to = "chat"}};
-  const auto g = Graph::build(s);
-  REQUIRE(g.has_value());
-  const auto feedback = [](const simsys::graph::ResolvedLink& l) { return l.feedback; };
-  REQUIRE(std::ranges::count_if(g->links(), feedback) == 1);
-  REQUIRE(g->nodes()[std::ranges::find_if(g->links(), feedback)->from].spec.id == "sync");
+  const std::array nodes{client("u", Rate{1}, {{"msg", 1.0}}),
+                         service("chat", {{"msg", {Step{.to = "q", .op = "publish"}}}}),
+                         service("q", {{"publish", {Step{.to = "sync", .op = "job"}}}}),
+                         service("sync", {{"job", {Step{.to = "chat", .op = "push"}}}})};
+  std::array<std::size_t, nodes.size()> file_order{0, 1, 2, 3};
+  int orders_tried = 0;
+  // C++20 std::ranges::next_permutation: rearranges the range into the next permutation in
+  // lexicographic order and returns {end, found}; `found` turns false after the last one.
+  // Starting from the sorted order, the loop visits all 4! = 24 file orders of the nodes.
+  do {
+    Scenario s{.name = "loop", .version = 1, .duration = 1min};
+    for (const std::size_t i : file_order) s.nodes.push_back(nodes[i]);
+    // Links name nodes by id, so they are the same whatever the file order.
+    s.links = {LinkSpec{.from = "u", .to = "chat"}, LinkSpec{.from = "chat", .to = "q"},
+               LinkSpec{.from = "q", .to = "sync"}, LinkSpec{.from = "sync", .to = "chat"}};
+    const auto g = Graph::build(s);
+    REQUIRE(g.has_value());
+    const auto feedback = [](const simsys::graph::ResolvedLink& l) { return l.feedback; };
+    REQUIRE(std::ranges::count_if(g->links(), feedback) == 1);
+    const auto& back = *std::ranges::find_if(g->links(), feedback);
+    REQUIRE(g->nodes()[back.from].spec.id == "sync");
+    REQUIRE(g->nodes()[back.to].spec.id == "chat");
+    ++orders_tried;
+  } while (std::ranges::next_permutation(file_order).found);
+  REQUIRE(orders_tried == 24);
 }
 
 TEST_CASE("a cross edge into a finished subtree is not feedback", "[graph]") {
@@ -240,4 +259,95 @@ TEST_CASE("a link longer than a million steps is rejected", "[graph]") {
   // C++20 std::string::starts_with: a prefix test in one call, replacing
   // `s.compare(0, prefix.size(), prefix) == 0` or `s.rfind(prefix, 0) == 0`.
   REQUIRE(g.error().message.starts_with("link api -> db: latency is 3600000000 steps"));
+}
+
+TEST_CASE("a node cycle that is not a call cycle keeps every synchronous hop", "[graph]") {
+  // A.x -> B.y and B.z -> A.w: the nodes form a cycle, the calls do not.
+  Scenario s{.name = "xcycle", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{10}, {{"x", 0.5}, {"z", 0.5}}),
+             service("A", {{"x", {Step{.to = "B", .op = "y"}}}}),
+             service("B", {{"z", {Step{.to = "A", .op = "w"}}}})};
+  s.links = {LinkSpec{.from = "u", .to = "A", .ops = {"x"}},
+             LinkSpec{.from = "u", .to = "B", .ops = {"z"}}, LinkSpec{.from = "A", .to = "B"},
+             LinkSpec{.from = "B", .to = "A"}};
+  const auto g = Graph::build(s);
+  REQUIRE(g.has_value());
+  REQUIRE(std::ranges::count_if(g->links(), [](const auto& l) { return l.feedback; }) ==
+          1);  // node level
+  const auto a = *g->index_of("A"), b = *g->index_of("B");
+  REQUIRE_FALSE(g->is_async_hop(a, "x", b, "y"));
+  REQUIRE_FALSE(g->is_async_hop(b, "z", a, "w"));  // synchronous even though B -> A is the
+                                                   // node-level back edge
+}
+
+TEST_CASE("a node loop that ends in a terminal op has no asynchronous hop", "[graph]") {
+  // chat.msg -> q.publish -> sync.job -> chat.push: the nodes loop, but push makes no call.
+  Scenario s{.name = "loop", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{1}, {{"msg", 1.0}}),
+             service("chat", {{"msg", {Step{.to = "q", .op = "publish"}}}, {"push", {}}}),
+             service("q", {{"publish", {Step{.to = "sync", .op = "job"}}}}),
+             service("sync", {{"job", {Step{.to = "chat", .op = "push"}}}})};
+  s.links = {LinkSpec{.from = "u", .to = "chat"}, LinkSpec{.from = "chat", .to = "q"},
+             LinkSpec{.from = "q", .to = "sync"}, LinkSpec{.from = "sync", .to = "chat"}};
+  const auto g = *Graph::build(s);
+  const auto chat = *g.index_of("chat"), q = *g.index_of("q"), sync = *g.index_of("sync");
+  REQUIRE_FALSE(g.is_async_hop(chat, "msg", q, "publish"));
+  REQUIRE_FALSE(g.is_async_hop(q, "publish", sync, "job"));
+  REQUIRE_FALSE(g.is_async_hop(sync, "job", chat, "push"));  // push is terminal: no call cycle
+}
+
+TEST_CASE("a true call cycle (chat.msg -> q -> sync -> chat.msg) closes asynchronously",
+          "[graph]") {
+  Scenario s{.name = "loop2", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{1}, {{"msg", 1.0}}),
+             service("chat", {{"msg", {Step{.to = "q", .op = "publish"}}}}),
+             service("q", {{"publish", {Step{.to = "sync", .op = "job"}}}}),
+             service("sync", {{"job", {Step{.to = "chat", .op = "msg", .factor = 0.5}}}})};
+  s.links = {LinkSpec{.from = "u", .to = "chat"}, LinkSpec{.from = "chat", .to = "q"},
+             LinkSpec{.from = "q", .to = "sync"}, LinkSpec{.from = "sync", .to = "chat"}};
+  const auto g = *Graph::build(s);
+  const auto chat = *g.index_of("chat"), q = *g.index_of("q"), sync = *g.index_of("sync");
+  REQUIRE(g.is_async_hop(sync, "job", chat, "msg"));  // the hop that closes the cycle
+  REQUIRE_FALSE(g.is_async_hop(chat, "msg", q, "publish"));
+  REQUIRE_FALSE(g.is_async_hop(q, "publish", sync, "job"));
+}
+
+TEST_CASE("a drained link keeps its route with share zero and the others split the rest",
+          "[graph]") {
+  Scenario s = chain();
+  s.nodes.push_back(service("api2"));
+  s.links.push_back(LinkSpec{.from = "users", .to = "api2", .weight = 0});
+  const auto g = *Graph::build(s);
+  const auto routes = g.client_routes(0);
+  REQUIRE(routes.size() == 2);
+  REQUIRE(
+      std::ranges::find(routes, *g.index_of("api"), &simsys::graph::ClientRoute::target)->share ==
+      1.0);
+  REQUIRE(
+      std::ranges::find(routes, *g.index_of("api2"), &simsys::graph::ClientRoute::target)->share ==
+      0.0);
+}
+
+TEST_CASE("programmatic scenarios with negative latency or a bad weight are rejected", "[graph]") {
+  Scenario s = chain();
+  s.links[0].latency = simsys::SimTime{-1};
+  auto g = Graph::build(s);
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message == "link users -> api: latency must not be negative");
+  for (const double weight :
+       {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity(), -1.0}) {
+    s = chain();
+    s.links[0].weight = weight;
+    g = Graph::build(s);
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == "link users -> api: weight must be a finite non-negative number");
+  }
+}
+
+TEST_CASE("a programmatic scenario with a non-positive step is rejected", "[graph]") {
+  Scenario s = chain();
+  s.step = simsys::SimTime{0};
+  const auto g = Graph::build(s);
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message == "step must be positive");
 }
