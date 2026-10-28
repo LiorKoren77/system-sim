@@ -143,7 +143,8 @@ TEST_CASE("the noise multiplier is never negative", "[workload]") {
   for (int i = 0; i < 10'000; ++i) REQUIRE(n.next(100ms) >= 0.0);
 }
 
-TEST_CASE("over a long run the multiplier averages one with standard deviation sigma", "[workload]") {
+TEST_CASE("over a long run the multiplier averages one with standard deviation sigma",
+          "[workload]") {
   // Ornstein-Uhlenbeck with stationary standard deviation sigma; sampled once per correlation
   // time the values are nearly independent, so 20k samples pin the moments to a few percent.
   NoiseProcess n{Noise{.sigma = 0.1, .correlation = 1s}, 42};
@@ -172,9 +173,12 @@ TEST_CASE("consecutive samples are correlated over the correlation time", "[work
   REQUIRE(cov / var > 0.95);  // e^{-0.1/10} = 0.990
 }
 
-TEST_CASE("a non-positive correlation time or a negative sigma is a programmer error", "[workload]") {
-  REQUIRE_THROWS_AS((NoiseProcess{Noise{.sigma = 0.1, .correlation = 0s}, 1}), std::invalid_argument);
-  REQUIRE_THROWS_AS((NoiseProcess{Noise{.sigma = -0.1, .correlation = 1s}, 1}), std::invalid_argument);
+TEST_CASE("a non-positive correlation time or a negative sigma is a programmer error",
+          "[workload]") {
+  REQUIRE_THROWS_AS((NoiseProcess{Noise{.sigma = 0.1, .correlation = 0s}, 1}),
+                    std::invalid_argument);
+  REQUIRE_THROWS_AS((NoiseProcess{Noise{.sigma = -0.1, .correlation = 1s}, 1}),
+                    std::invalid_argument);
 }
 
 TEST_CASE("samples yields one rate per step from zero up to but excluding until", "[workload]") {
@@ -190,22 +194,26 @@ TEST_CASE("samples yields one rate per step from zero up to but excluding until"
 TEST_CASE("samples carries the time of each sample", "[workload]") {
   const RateCurve c{.base = Rate{1}};
   auto gen = simsys::workload::samples(c, 1s, 3s);
+  // std::generator's iterator is input-only: it has operator* but no operator->, so (*it).t.
   auto it = gen.begin();
-  REQUIRE(it->t == 0s);
+  REQUIRE((*it).t == 0s);
   ++it;
-  REQUIRE(it->t == 1s);
+  REQUIRE((*it).t == 1s);
   ++it;
-  REQUIRE(it->t == 2s);
+  REQUIRE((*it).t == 2s);
   ++it;
   REQUIRE(it == gen.end());
 }
 
-TEST_CASE("samples with noise applies the seeded multiplier and stays deterministic", "[workload]") {
+TEST_CASE("samples with noise applies the seeded multiplier and stays deterministic",
+          "[workload]") {
   const RateCurve c{.base = Rate{1000}};
   const Noise noise{.sigma = 0.2, .correlation = 1s};
   std::vector<double> a, b;
-  for (const auto& s : simsys::workload::samples(c, 100ms, 1s, noise, /*seed=*/5)) a.push_back(s.rate.per_second);
-  for (const auto& s : simsys::workload::samples(c, 100ms, 1s, noise, /*seed=*/5)) b.push_back(s.rate.per_second);
+  for (const auto& s : simsys::workload::samples(c, 100ms, 1s, noise, /*seed=*/5))
+    a.push_back(s.rate.per_second);
+  for (const auto& s : simsys::workload::samples(c, 100ms, 1s, noise, /*seed=*/5))
+    b.push_back(s.rate.per_second);
   REQUIRE(a == b);
   REQUIRE(a.size() == 10);
   REQUIRE(a != std::vector<double>(10, 1000.0));  // the noise did something
