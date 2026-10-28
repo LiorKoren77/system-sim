@@ -55,6 +55,8 @@ Write for a reader who has read the book but has not studied queueing theory.
   clang-format only. Named modules. No raw `new`, no macros,
   exceptions only for programmer errors.
 - Tests are part of the teaching material: name them after the property they prove.
+  Test names must not contain `[` or `]`: Catch2's ctest discovery reads those as tags and
+  merges every later case into one failing entry (hit twice on 2026-10-28).
 - Scenario YAML files get a README explaining the design and the mechanisms the model
   abstracts away.
 - Commit messages explain *why*; the diff shows *what*.
