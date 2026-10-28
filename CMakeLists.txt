@@ -26,6 +26,7 @@ target_sources(simsys
     src/config/config.cppm
     src/queueing/queueing.cppm
     src/flow/flow.cppm
+    src/fluid/fluid.cppm
   PRIVATE                               # module implementation units are ordinary sources
     src/config/config.cpp)
 target_link_libraries(simsys PUBLIC yaml-cpp::yaml-cpp PRIVATE simsys_warnings)
