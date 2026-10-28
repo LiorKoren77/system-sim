@@ -100,16 +100,32 @@ TEST_CASE("a ramp over zero time is a step at t = 0 from `from` to `to`", "[work
   REQUIRE(c.rate_at(0s).per_second == 2000);
 }
 
-TEST_CASE("a ramp without a base rate to be relative to is a programmer error", "[workload]") {
-  // The ramp is a multiplier of `base`; with base 0, or with points replacing the base,
-  // there is nothing to be relative to. The config loader rejects both scenarios.
+TEST_CASE("a ramp sets the level itself, so the base does not scale it", "[workload]") {
+  // The ramp's rate is absolute: from + (to - from) x fraction. The base is not a divisor
+  // (the loader still asks for one, to keep the file's intent explicit), so even base 0
+  // gives the ramp's own rate.
   RateCurve zero_base{.base = Rate{0}};
   zero_base.ramp = Ramp{.from = Rate{0}, .to = Rate{2000}, .over = 10min};
-  REQUIRE_THROWS_AS(zero_base.rate_at(5min), std::invalid_argument);
+  REQUIRE_THAT(zero_base.rate_at(5min).per_second, WithinRel(1000.0, 1e-12));
+}
+
+TEST_CASE("a ramp next to points is a programmer error", "[workload]") {
+  // Points replace the level and so does a ramp: two levels at once have no meaning. The
+  // config loader rejects the scenario ("rate.ramp needs rate.base").
   RateCurve with_points{.base = Rate{1000}};
   with_points.points = Points{.at = {{0s, Rate{1000}}}};
   with_points.ramp = Ramp{.from = Rate{0}, .to = Rate{2000}, .over = 10min};
   REQUIRE_THROWS_AS(with_points.rate_at(5min), std::invalid_argument);
+}
+
+TEST_CASE("a ramp on a tiny base yields a finite rate, even at a zero-wave trough", "[workload]") {
+  // A ramp used to be the multiplier ramp/base: 1e15 / 1e-300 overflows to infinity, and
+  // infinity x a wave trough of 0 is NaN. As an absolute level it is just 1e15 x the wave.
+  const RateCurve curve{
+      .base = Rate{1e-300},
+      .wave = Wave{.shape = WaveShape::sine, .period = 2min, .amplitude = 1.0, .peak_at = 0s},
+      .ramp = Ramp{.from = Rate{1e15}, .to = Rate{1e15}, .over = 5min}};
+  for (const auto t : {0s, 30s, 60s, 90s}) REQUIRE(std::isfinite(curve.rate_at(t).per_second));
 }
 
 TEST_CASE(
@@ -295,4 +311,62 @@ TEST_CASE("samples with noise applies the seeded multiplier and stays determinis
 TEST_CASE("samples with a non-positive step is a programmer error", "[workload]") {
   const RateCurve c{.base = Rate{1}};
   REQUIRE_THROWS_AS(simsys::workload::samples(c, 0s, 1s).begin(), std::invalid_argument);
+}
+
+TEST_CASE("samples stops cleanly when the next step would overflow the clock", "[workload]") {
+  const RateCurve c{.base = Rate{1}};
+  const simsys::SimTime huge{std::numeric_limits<std::int64_t>::max() - 10};
+  int n = 0;
+  for (const auto& s : simsys::workload::samples(
+           c, huge, simsys::SimTime{std::numeric_limits<std::int64_t>::max()})) {
+    ++n;
+    REQUIRE(s.t.count() >= 0);
+  }
+  REQUIRE(n == 2);  // t = 0 and t = huge; a third step would overflow
+}
+
+TEST_CASE(
+    "the first noisy sample already includes one noise step, as the engine's first offer does",
+    "[workload]") {
+  // The engine ticks a client's noise by dt and then offers (engine forward pass), so the
+  // rate offered at t = 0 is already curve x one noise step; samples does the same.
+  const RateCurve c{.base = Rate{1000}};
+  const Noise noise{.sigma = 0.2, .correlation = 1s};
+  NoiseProcess process{noise, 5};
+  const double first_multiplier = process.next(100ms);
+  auto gen = simsys::workload::samples(c, 100ms, 1s, noise, 5);
+  REQUIRE((*gen.begin()).rate.per_second == 1000 * first_multiplier);
+}
+
+TEST_CASE("noisy samples advance the noise at the noise step and keep every k-th sample",
+          "[workload]") {
+  // `simsys curve --noise --step 1s` on a scenario stepping every 100 ms must print the noise
+  // a run sees: the process advances every 100 ms and every tenth sample is printed.
+  const RateCurve c{.base = Rate{1000}};
+  const Noise noise{.sigma = 0.2, .correlation = 1s};
+  std::vector<double> fine, coarse;
+  for (const auto& s : simsys::workload::samples(c, 100ms, 3s, noise, 5))
+    fine.push_back(s.rate.per_second);
+  for (const auto& s : simsys::workload::samples(c, 1s, 3s, noise, 5, /*noise_step=*/100ms))
+    coarse.push_back(s.rate.per_second);
+  REQUIRE(fine.size() == 30);
+  REQUIRE(coarse == std::vector<double>{fine[0], fine[10], fine[20]});
+}
+
+TEST_CASE("a sample step that is not a multiple of the noise step is a programmer error",
+          "[workload]") {
+  const RateCurve c{.base = Rate{1}};
+  const Noise noise{.sigma = 0.2, .correlation = 1s};
+  REQUIRE_THROWS_AS(simsys::workload::samples(c, 150ms, 1s, noise, 5, 100ms).begin(),
+                    std::invalid_argument);
+  REQUIRE_THROWS_AS(simsys::workload::samples(c, 1s, 1s, noise, 5, 0s).begin(),
+                    std::invalid_argument);
+}
+
+TEST_CASE("wave shape names round-trip through one table", "[workload]") {
+  for (const auto& row : simsys::workload::wave_shape_table) {
+    REQUIRE(simsys::workload::parse_wave_shape(row.name) == row.value);
+    REQUIRE(simsys::workload::to_string(row.value) == row.name);
+  }
+  REQUIRE_FALSE(simsys::workload::parse_wave_shape("triangle").has_value());
 }

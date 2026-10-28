@@ -2,6 +2,7 @@
 // and specs carry the schema's defaults.
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -11,6 +12,7 @@
 // when a std header is included after a module that included it in its global module fragment.
 import simsys.core;
 import simsys.model;
+import simsys.workload;
 
 using namespace std::chrono_literals;
 using simsys::model::NodeType;
@@ -29,9 +31,48 @@ TEST_CASE("parse_node_type rejects unknown names", "[model]") {
 }
 
 TEST_CASE("the node type table is complete at compile time", "[model]") {
-  static_assert(simsys::model::table_follows_enum_order());
+  static_assert(simsys::core::follows_enum_order(simsys::model::node_type_table));
   static_assert(simsys::model::parse_node_type("service") == NodeType::service);
   static_assert(simsys::model::to_string(NodeType::frontier) == "frontier");
+  SUCCEED();
+}
+
+namespace {
+// Two broken tables, to show that round_trips catches both ways a table can be wrong.
+enum class Colour { red, green };
+constexpr auto duplicated_name = std::to_array<simsys::core::EnumName<Colour>>({
+    {Colour::red, "red"},
+    {Colour::green, "red"},
+});
+constexpr auto out_of_order = std::to_array<simsys::core::EnumName<Colour>>({
+    {Colour::green, "green"},
+    {Colour::red, "red"},
+});
+}  // namespace
+
+// static_assert: the proof runs while compiling, so a broken table never builds; the test
+// case only gives the proof a name students can find.
+TEST_CASE("every enum name table round-trips and ends at its last enumerator", "[model]") {
+  using simsys::core::round_trips;
+  static_assert(round_trips(simsys::model::node_type_table));
+  static_assert(round_trips(simsys::model::direction_table));
+  static_assert(round_trips(simsys::model::slo_metric_table));
+  static_assert(round_trips(simsys::model::step_condition_table));
+  static_assert(round_trips(simsys::model::step_mode_table));
+  static_assert(round_trips(simsys::workload::wave_shape_table));
+  // Nothing can count an enum's enumerators, so "the table is complete" is pinned by its
+  // last row: a new enumerator appended without a row breaks one of these.
+  static_assert(simsys::model::node_type_table.back().value == NodeType::frontier);
+  static_assert(simsys::model::direction_table.back().value == simsys::model::Direction::inout);
+  static_assert(simsys::model::slo_metric_table.back().value ==
+                simsys::model::SloMetric::staleness);
+  static_assert(simsys::model::step_condition_table.back().value ==
+                simsys::model::StepCondition::failure);
+  static_assert(simsys::model::step_mode_table.back().value == simsys::model::StepMode::parallel);
+  static_assert(simsys::workload::wave_shape_table.back().value ==
+                simsys::workload::WaveShape::diurnal);
+  static_assert(!round_trips(duplicated_name));
+  static_assert(!round_trips(out_of_order));
   SUCCEED();
 }
 

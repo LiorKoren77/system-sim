@@ -1164,6 +1164,110 @@ TEST_CASE("unknown keys inside wave, ramp, a spike or noise are rejected") {
   require_all_rejected("simsys_unknown_curve_key.yaml", cases);
 }
 
+TEST_CASE("every rate-curve bound names the offending entry") {
+  const RateRejection cases[] = {
+      {"{base: 1/s, ramp: {from: 2e15/s, to: 1/s, over: 1m}}",
+       "node 'u': rate.ramp.from must be at most 1e15/s"},
+      {"{base: 1/s, ramp: {from: 0/s, to: 2e15/s, over: 1m}}",
+       "node 'u': rate.ramp.to must be at most 1e15/s"},
+      {"{points: [[0s, 1/s], [1h, 2e15/s]]}", "node 'u': rate.points[2] must be at most 1e15/s"},
+      {"{base: 1/s, spikes: [{at: 0s, for: 1s, factor: 2}, {at: 5s, for: 1s, factor: 2e6}]}",
+       "node 'u': rate.spikes[2].factor must be at most 1e6"},
+      {"{base: 1/s, noise: {sigma: 11, correlation: 5m}}",
+       "node 'u': rate.noise.sigma must be at most 10"},
+  };
+  require_all_rejected("simsys_curve_bounds.yaml", cases);
+}
+
+TEST_CASE("a curve block of the wrong YAML shape says which shape it needs") {
+  const RateRejection cases[] = {
+      {"{base: 1/s, wave: [sine]}", "node 'u': rate.wave must be a map"},
+      {"{base: 1/s, ramp: 5}", "node 'u': rate.ramp must be a map"},
+      {"{base: 1/s, noise: [0.1]}", "node 'u': rate.noise must be a map"},
+      {"{base: 1/s, spikes: {at: 0s}}", "node 'u': rate.spikes must be a list"},
+      {"{base: 1/s, spikes: [5]}", "node 'u': rate.spikes[1] must be a map"},
+      {"{points: 5}", "node 'u': rate.points must be a list"},
+      {"{points: [{t: 0s, r: 1/s}]}", "node 'u': rate.points entries are [time, rate] pairs"},
+      {"{base: 1/s, wave: {shape: sine, period: 1h, amplitude: 0.5, peak_at: [0s]}}",
+       "node 'u': rate.wave.peak_at must be a scalar"},
+  };
+  require_all_rejected("simsys_curve_shapes.yaml", cases);
+}
+
+TEST_CASE("an unquoted clock time is read as hours and minutes after midnight") {
+  // YAML 1.1 read 20:30 as the base-60 integer 1230; yaml-cpp keeps the text, and the loader
+  // reads it as a clock time: 20 h 30 min after t = 0, which is midnight.
+  const auto path = write_temp("simsys_unquoted_clock.yaml", R"(
+version: 1
+name: t
+duration: 24h
+nodes:
+  u:
+    type: client
+    rate:
+      base: 1k/s
+      wave: {shape: sine, period: 24h, amplitude: 0.5, peak_at: 20:30}
+      spikes: [{at: 12:00, for: 10m, factor: 2}]
+    ops: {a: 1}
+  v: {type: client, rate: {points: [[06:15, 1k/s]]}, ops: {a: 1}}
+links: []
+)");
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  const auto& u = s->nodes[0].workload->curve;
+  CHECK(u.wave->peak_at == 20h + 30min);
+  CHECK(u.spikes[0].at == 12h);
+  CHECK(s->nodes[1].workload->curve.points->at[0].first == 6h + 15min);
+}
+
+TEST_CASE("overlapping spike factors may not multiply past a million") {
+  SECTION("two spikes at the same moment compound past the bound") {
+    const RateRejection cases[] = {
+        {"{base: 1/s, spikes: [{at: 1m, for: 1m, factor: 1000}, {at: 1m, for: 1m, factor: 1001}]}",
+         "node 'u': rate.spikes: overlapping factors multiply to more than 1e6"},
+        // The second starts inside the first: their product counts from its start.
+        {"{base: 1/s, spikes: [{at: 0s, for: 1h, factor: 1000}, {at: 30m, for: 1m, "
+         "factor: 1001}]}",
+         "node 'u': rate.spikes: overlapping factors multiply to more than 1e6"},
+    };
+    require_all_rejected("simsys_spikes_overlap.yaml", cases);
+  }
+  SECTION("exactly a million, or back-to-back spikes that never overlap, load") {
+    for (const auto rate :
+         {"{base: 1/s, spikes: [{at: 1m, for: 1m, factor: 1000}, {at: 1m, for: 1m, factor: 1000}]}",
+          "{base: 1/s, spikes: [{at: 0s, for: 1m, factor: 1e6}, {at: 1m, for: 1m, factor: "
+          "1e6}]}"}) {
+      const auto path = write_temp("simsys_spikes_ok.yaml", client_with_rate(rate));
+      const auto s = simsys::config::load(path.string());
+      INFO((s ? "" : s.error().message));
+      REQUIRE(s.has_value());
+    }
+  }
+}
+
+TEST_CASE("values that are not numbers say so") {
+  const RateRejection cases[] = {
+      {"{base: 1/s, wave: {shape: sine, period: 1h, amplitude: \"0.5\", peak_at: 0s}}",
+       "node 'u': rate.wave.amplitude must be a number"},
+      {"{base: 1/s, spikes: [{at: 0s, for: 1s, factor: lots}]}",
+       "node 'u': rate.spikes[1].factor must be a number"},
+      {"{base: 1/s, noise: {sigma: ~, correlation: 5m}}",
+       "node 'u': rate.noise.sigma must not be empty"},
+      // NaN is a number in YAML (.nan), just not one in range: the range message.
+      {"{base: 1/s, wave: {shape: sine, period: 1h, amplitude: .nan, peak_at: 0s}}",
+       "node 'u': rate.wave.amplitude must be between 0 and 1"},
+  };
+  require_all_rejected("simsys_curve_not_numbers.yaml", cases);
+}
+
+TEST_CASE("a scalar rate says rate must be a map") {
+  const RateRejection cases[] = {
+      {"100/s", "node 'u': rate must be a map (write rate: {base: 100/s})"},
+  };
+  require_all_rejected("simsys_scalar_rate.yaml", cases);
+}
+
 TEST_CASE("a client op share must be a number above zero and at most one") {
   require_rejected("simsys_share_zero.yaml", R"(
 version: 1
@@ -2466,8 +2570,9 @@ TEST_CASE("concurrency, step factors, rates and capacities have upper bounds") {
 
 TEST_CASE("a node's per-op cost is typed and must be a positive finite number") {
   SECTION("a service's cost map loads, keyed by op") {
-    const auto path = write_temp("simsys_cost_loads.yaml",
-                                 scenario_with("  a: {type: service, cost: {write: 3, read: 1}}\n"));
+    const auto path =
+        write_temp("simsys_cost_loads.yaml",
+                   scenario_with("  a: {type: service, cost: {write: 3, read: 1}}\n"));
     const auto s = simsys::config::load(path.string());
     INFO((s ? "" : s.error().message));
     REQUIRE(s.has_value());
@@ -2496,4 +2601,13 @@ TEST_CASE("a node's per-op cost is typed and must be a positive finite number") 
     require_loaded("simsys_cost_cache.yaml",
                    scenario_with("  c: {type: cache, cost: {read: 2}}\n"));
   }
+}
+
+TEST_CASE("cost is capped") {
+  // The same bound as a step's fan-out factor (max_step_factor): a request costing more than
+  // a million units is a typo, and rate x cost must stay far from overflowing a double.
+  require_rejected("simsys_cost_too_big.yaml",
+                   scenario_with("  a: {type: service, cost: {x: 1e7}}\n"),
+                   "node 'a': cost 'x' must be at most 1e6");
+  require_loaded("simsys_cost_max.yaml", scenario_with("  a: {type: service, cost: {x: 1e6}}\n"));
 }
