@@ -25,7 +25,7 @@ nodes:
     burst: 2000
     backend: rules_cache
 
-  rules_cache: {type: cache, eviction: lru, keys: 10k, strategy: cache_aside}
+  rules_cache: {type: cache, eviction: lru, keys: 10k, hit_ratio: che, strategy: cache_aside}
 
   lb: {type: load_balancer, policy: round_robin}
 

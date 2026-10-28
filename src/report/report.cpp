@@ -688,6 +688,28 @@ template <class T, class F>
   return text;
 }
 
+// A cache's model (plan 2a refinement 7): `hit_ratio=0.8 (fixed) strategy=cache_aside
+// write_ops=write backend=db keys=20M eviction=lru ttl=5m`, the keys the scenario left out
+// omitted (strategy and write_ops always have a value: their defaults).
+[[nodiscard]] std::string cache_summary(const model::NodeSpec& spec) {
+  if (spec.type != model::NodeType::cache) return {};
+  std::string text = "  hit_ratio=";
+  if (!spec.hit_ratio) {
+    text += "none";
+  } else if (spec.hit_ratio->che) {
+    text += "che";
+  } else {
+    text += num(spec.hit_ratio->fixed.value_or(0.0), 6) + " (fixed)";
+  }
+  text += " strategy=" + std::string{model::to_string(spec.strategy)} +
+          " write_ops=" + join(spec.write_ops, ",");
+  if (spec.backend) text += " backend=" + *spec.backend;
+  if (spec.keys) text += " keys=" + with_si_prefix(static_cast<double>(*spec.keys));
+  if (spec.eviction) text += " eviction=" + *spec.eviction;
+  if (spec.ttl) text += " ttl=" + fmt_duration(*spec.ttl);
+  return text;
+}
+
 [[nodiscard]] std::string server_details(const graph::ResolvedNode& node) {
   const auto& spec = node.spec;
   const auto& cap = node.capacity;
@@ -718,11 +740,11 @@ template <class T, class F>
   for (std::size_t i = 0; i < g.nodes().size(); ++i) {
     const auto& node = g.nodes()[i];
     const bool client = node.spec.type == model::NodeType::client;
-    rows.push_back(
-        {{node.spec.id},
-         {std::string{model::to_string(node.spec.type)}},
-         {client ? client_details(node.spec)
-                 : server_details(node) + balancing_summary(g, i) + limiter_summary(node.spec)}});
+    rows.push_back({{node.spec.id},
+                    {std::string{model::to_string(node.spec.type)}},
+                    {client ? client_details(node.spec)
+                            : server_details(node) + balancing_summary(g, i) +
+                                  limiter_summary(node.spec) + cache_summary(node.spec)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }
@@ -911,10 +933,25 @@ void forward_limited(const graph::Graph& g, const ForwardRoutes& table, std::siz
   }
 }
 
-// Forwards what reached node `from` along its unconditional `ops` steps (rate × factor),
-// as ServiceBehaviour::route does, or over a load balancer's or a rate limiter's routes. Flow over
-// a feedback link goes to `fed_back`: its target came earlier in the order, so it counts in the
-// next pass.
+// Forwards what a cache passes on to its store: rate × Graph::backend_fraction (1 − h of a
+// read under read_through, every write under write_through and write_around), as
+// CacheBehaviour::route does. The hits stop here.
+void forward_cached(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
+                    std::vector<OpLoad>& fed_back) {
+  const auto& node = g.nodes()[from];
+  if (!node.backend) return;           // cache_aside: the service's on-miss step carries the misses
+  const OpLoad arriving = load[from];  // a copy, as in forward_steps
+  auto& destination = g.links()[*node.backend_link].feedback ? fed_back : load;
+  for (const auto& [op, rate] : arriving) {
+    destination[*node.backend][op] += rate * g.backend_fraction(from, op);
+  }
+}
+
+// Forwards what reached node `from` along its resolved `ops` hops (rate × factor × the share
+// of requests that take the hop: 1, or a cache's miss fraction 1 − h for an `on: miss`
+// step; graph::ServiceHop), as ServiceBehaviour::route does, or over a load balancer's or a
+// rate limiter's routes, or to a cache's store. Flow over a feedback link goes to `fed_back`:
+// its target came earlier in the order, so it counts in the next pass.
 void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_t from,
                    std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   const auto& spec = g.nodes()[from].spec;
@@ -927,17 +964,18 @@ void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_
     forward_limited(g, table, from, load, fed_back);
     return;
   }
+  if (spec.type == model::NodeType::cache) {
+    forward_cached(g, from, load, fed_back);
+    return;
+  }
   const OpLoad arriving = load[from];  // a copy: a step may target `from` itself
   for (const auto& [op, rate] : arriving) {
-    const auto steps = spec.ops.find(op);
-    if (steps == spec.ops.end()) continue;
-    for (const auto& step : steps->second) {
-      if (step.on != model::StepCondition::always) continue;  // phase 1: never fire
-      const auto target = g.index_of(step.to);
-      const auto link = target ? g.demand_link(from, *target) : std::nullopt;
-      if (!link) continue;  // Graph::build proved both exist; skip defensively
+    for (const graph::ServiceHop& hop : g.service_hops(from, op)) {
+      if (hop.fraction <= 0.0) continue;  // never taken (on: failure, or a cache that always hits)
+      const auto link = g.demand_link(from, hop.target);
+      if (!link) continue;  // Graph::build proved it exists; skip defensively
       auto& destination = g.links()[*link].feedback ? fed_back : load;
-      destination[*target][step.op] += rate * step.factor;
+      destination[hop.target][hop.op] += rate * hop.factor * hop.fraction;
     }
   }
 }

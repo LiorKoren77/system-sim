@@ -1,6 +1,7 @@
 // Module `simsys.behaviours`: what each node type does with flow (client: offer load
 // along its routes; service: forward step demand, serve the rest; load balancer: pass
-// everything on across its links; rate limiter: pass on what it admits, reject the rest)
+// everything on across its links; rate limiter: pass on what it admits, reject the rest;
+// cache: answer, and pass to its store what its strategy sends there)
 // and how it composes response latency from its own sojourn plus link legs and downstream
 // responses.
 //
@@ -30,6 +31,7 @@ module;
 #include <limits>
 #include <map>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -180,6 +182,16 @@ struct Branch {
 // node that splits an op: ClientBehaviour and LoadBalancerBehaviour.
 [[nodiscard]] flow::LatencyEstimate mixture(std::span<const Branch> branches);
 
+// A hop that only a share `fraction` of the requests take (an `on: miss` step after a cache,
+// a read_through cache's fetch from its store): with probability f the request pays `hop`,
+// otherwise nothing. The two-point mixture {f: hop, 1 − f: 0} (see `mixture`):
+//   mean     = f · m
+//   variance = f · v + f (1 − f) · m²     (law of total variance: within + between)
+// Added to the sequential parts before it, it gives the hit/miss mixture of the whole
+// response: own + mixture{h: 0, 1 − h: hop} = mixture{h: own, 1 − h: own + hop}.
+// f >= 1 is the hop itself; f <= 0 is nothing (and never asks for a possibly infinite hop).
+[[nodiscard]] flow::LatencyEstimate conditional_hop(double fraction, flow::LatencyEstimate hop);
+
 // Delivered fractions (plan 2a refinement 8, see NodeBehaviour): a request is answered only
 // if every part of its path answers it, so the fractions of SEQUENTIAL parts multiply (the
 // limiter's own admission x the counter check x the api: 0.25 x 1 x 0.9), and so do a
@@ -203,11 +215,15 @@ struct Branch {
 // own sojourn is the node's one service time: the queue is not a multi-class one), the
 // burstiness a cost adds (a cost-c request arrives as a batch of c units at once, so
 // Kingman's `burstiness`, the SCV of arrivals taken unit by unit, understates its arrival
-// variability and the queueing wait with it), retries and timeouts, and conditional steps (`on:
-// miss` / `on: failure`): a service has no cache to miss and phase 1 models no failures, so those
-// steps never fire here. A service has no `then` steps either (the loader rejects them for this
-// type): everything it sends is per op. Hops that close a call cycle are asynchronous
-// hand-offs (see `response`).
+// variability and the queueing wait with it), retries and timeouts, and `on: failure` steps:
+// phase 2a models no failures, so those never fire here. A service has no `then` steps either
+// (the loader rejects them for this type): everything it sends is per op. Hops that close a
+// call cycle are asynchronous hand-offs (see `response`).
+// Cache-aside (ch. 1, plan 2a refinement 7): a step `{to: db, on: miss}` after a step to a
+// cache is taken by the cache's miss fraction 1 − h of the requests only
+// (graph::Graph::service_hops resolves that `fraction` once): it forwards rate × factor ×
+// (1 − h), costs the response (1 − h) × the hop on average plus the spread between hit and
+// miss (conditional_hop), and fails a request only when it is taken (`delivered`).
 class ServiceBehaviour {
  public:
   ServiceBehaviour(const graph::Graph& g, std::size_t self);
@@ -241,7 +257,11 @@ class ServiceBehaviour {
     flow::LatencyEstimate slowest_parallel{};  // running max: no buffer of branches
     for (const Hop& hop : hops_of(op)) {
       if (hop.asynchronous) continue;  // closes a call cycle: adds no latency to the caller
-      const auto leg = round_trip(hop.link_leg_s) + downstream(hop.target, hop.op);
+      // A hop taken by a share of the requests only (an `on: miss` step) is the mixture of
+      // taking it and not (conditional_hop); the slowest-branch max below treats that mixture
+      // as one branch, the same approximation as for any parallel branch.
+      const auto leg = conditional_hop(hop.fraction,
+                                       round_trip(hop.link_leg_s) + downstream(hop.target, hop.op));
       if (hop.mode == model::StepMode::sequential) {
         total += leg;
       } else {
@@ -254,13 +274,16 @@ class ServiceBehaviour {
   }
 
   // own × the delivered fraction of every hop the op waits for, sequential or parallel
-  // (the rules above `mixture`);
-  // asynchronous hops are hand-offs that cannot fail the caller and are skipped.
+  // (the rules above `mixture`); asynchronous hops are hand-offs that cannot fail the caller
+  // and are skipped. A hop taken by a share f of the requests only fails those: a request
+  // gets through it with probability (1 − f) + f · d (a split between "not taken", which
+  // always passes, and "taken", which passes d of the time).
   [[nodiscard]] double delivered(std::string_view op, double own,
                                  FractionLookup auto&& downstream) const {
     double fraction = own;
     for (const Hop& hop : hops_of(op)) {
-      if (!hop.asynchronous) fraction *= downstream(hop.target, hop.op);
+      if (hop.asynchronous) continue;
+      fraction *= (1.0 - hop.fraction) + hop.fraction * downstream(hop.target, hop.op);
     }
     return fraction;
   }
@@ -271,7 +294,8 @@ class ServiceBehaviour {
     std::string op;      // the op sent downstream
     std::size_t target;  // node index
     std::size_t link;    // link index the demand travels on
-    double factor;       // downstream requests per incoming request
+    double factor;       // downstream requests per request that takes the hop
+    double fraction;     // share of the requests that take it (graph::ServiceHop), in (0, 1]
     model::StepMode mode;
     double link_leg_s;  // one-way link latency in seconds
     bool asynchronous;  // closes a call cycle: not waited for, see `response`
@@ -280,8 +304,7 @@ class ServiceBehaviour {
   // std::span<const Hop> rather than `const std::vector<Hop>&`: a span can also say "no
   // hops" (an empty view) without a static empty vector to point at.
   [[nodiscard]] std::span<const Hop> hops_of(std::string_view op) const;
-  void add_hops(const graph::Graph& g, const std::string& op,
-                const std::vector<model::Step>& steps);
+  void add_hops(const graph::Graph& g, const std::string& op);
 
   std::size_t self_;
   // std::less<> (C++14 transparent comparator) lets find() take a string_view without
@@ -693,15 +716,98 @@ class RateLimiterBehaviour {
   double log_sum_{0.0};
 };
 
+// Models: the "Cache" tier of System Design Interview (Alex Xu, vol. 1) ch. 1 ("Scale from
+// zero to millions of users": a memory store in front of the database for data read often
+// and changed rarely) and its uses in ch. 8 (URL shortener: <shortURL, longURL> in a
+// cache), ch. 11 (news feed caches), ch. 12 (chat), ch. 13 (autocomplete) and ch. 14
+// (YouTube metadata). Plan 2a refinement 7. Captured: the cache is a queue of its own
+// (default 100k/s, 0.1 ms: an in-memory lookup, see simsys.defaults) that answers every
+// request sent to it, hits and misses alike, at its `cost` per op; a FIXED hit ratio h, the
+// share of reads it answers from memory; which ops are writes (`write_ops`, every other op
+// is a read); and the strategy, i.e. who talks to the store:
+//   cache_aside   -> the application. The cache serves everything and forwards nothing; the
+//                    service's `{to: db, on: miss}` step carries the misses (ServiceBehaviour).
+//   read_through  -> the cache. It forwards 1 − h of each read to its `backend` as the same op
+//                    and answers a miss after the fetch: response = the mixture
+//                    {h: own, 1 − h: own + two link legs + the backend's response}.
+//   write_through -> every write goes on to the backend, synchronously: own + the hop.
+//   write_around  -> the same flow as write_through: writes skip the cache and go to the
+//                    store. What differs is what the cache holds afterwards (fewer entries
+//                    nobody reads again), which shows in the hit ratio, and h is fixed here.
+//   write_back    -> phase 2b (the engine refuses it): writes acknowledged by the cache and
+//                    flushed later need a queue of dirty entries.
+// Under read_through a write is served by the cache alone (the application writes the store
+// itself, as in cache_aside); under the write strategies a read miss is the application's to
+// fetch (a service `on: miss` step), as in cache_aside. Which share of each op goes to the
+// store is graph::Graph::backend_fraction, the one rule the paper load and the call-cycle
+// search share with this behaviour.
+// Ignored: which keys are popular (h is a number, not a function of the cache size and the
+// key distribution: the Che approximation arrives in 2b), entries expiring by TTL and the
+// eviction order (`ttl`, `eviction` are read and printed only), a cold cache filling up
+// after a start or a flush, the thundering herd of misses when a hot key expires (every
+// miss is an independent request to the store), and invalidation traffic.
+class CacheBehaviour {
+ public:
+  CacheBehaviour(const graph::Graph& g, std::size_t self);
+
+  // Serves every incoming op (`served` is the whole input: a miss is answered too, after
+  // the fetch) and forwards rate × backend share of each op to the backend. `now` and `dt`
+  // are unused: with a fixed hit ratio the cache holds no state between steps.
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+
+  // Capacity units one request of `op` consumes: the spec's `cost` entry, else 1 (a hit and
+  // a miss cost the cache the same lookup; the miss's fetch is charged to the backend).
+  [[nodiscard]] double cost(std::string_view op) const;
+
+  // own sojourn + the backend hop for the share that takes it (conditional_hop): nothing
+  // under cache_aside, (1 − h) × the hop for a read_through read, the whole hop for a
+  // write_through or write_around write.
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view op, flow::LatencyEstimate own,
+                                               ResponseLookup auto&& downstream) const {
+    const double share = backend_share(op);
+    if (share <= 0.0) return own;
+    return own + conditional_hop(
+                     share, round_trip(backend_->link_leg_s) + downstream(backend_->target, op));
+  }
+
+  // own × ((1 − f) + f × the backend's delivered fraction), f the share that goes to the
+  // backend: a hit is answered by the cache alone, a forwarded request only if the store
+  // answers it ("own × (h + (1 − h) · backend)" for a read_through read).
+  [[nodiscard]] double delivered(std::string_view op, double own,
+                                 FractionLookup auto&& downstream) const {
+    const double share = backend_share(op);
+    if (share <= 0.0) return own;
+    return own * ((1.0 - share) + share * downstream(backend_->target, op));
+  }
+
+ private:
+  // The store hop, resolved once; absent for cache_aside (no backend edge). Always waited
+  // for, like a limiter's counter check: a store makes no call back into its cache, so the
+  // hop closes no call cycle in any design the book draws.
+  struct BackendHop {
+    std::size_t target;
+    std::size_t link;
+    double link_leg_s;
+  };
+
+  // graph::Graph::backend_fraction of `op`, taken once per op that can reach the cache
+  // (graph::Graph::arriving_ops); 0 for any other op, which a built graph never sends here.
+  [[nodiscard]] double backend_share(std::string_view op) const;
+
+  std::optional<BackendHop> backend_{};
+  std::map<std::string, double, std::less<>> share_by_op_;  // std::less<>: find by string_view
+  std::map<std::string, double, std::less<>> cost_by_op_;   // only the ops listed in `cost`
+};
+
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
 // std::visit; a std::variant instead of an abstract base keeps every behaviour a plain
 // value (no heap allocation, no virtual calls, copyable). Phase 2a appended the load
-// balancer and the rate limiter; later phases append the rest (cache, queue, ...).
+// balancer, the rate limiter and the cache; later phases append the rest (queue, ...).
 // C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
 // it holds) dispatched with std::visit. Closed: adding an alternative means editing this
 // line, and every std::visit that does not handle it then fails to compile.
-using Behaviour =
-    std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour, RateLimiterBehaviour>;
+using Behaviour = std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour,
+                               RateLimiterBehaviour, CacheBehaviour>;
 
 }  // namespace simsys::behaviours
 
@@ -712,6 +818,7 @@ namespace simsys::behaviours {
 static_assert(NodeBehaviour<ServiceBehaviour>);
 static_assert(NodeBehaviour<LoadBalancerBehaviour>);
 static_assert(NodeBehaviour<RateLimiterBehaviour>);
+static_assert(NodeBehaviour<CacheBehaviour>);
 static_assert(RequestSource<ClientBehaviour>);
 
 namespace detail {
@@ -759,12 +866,22 @@ flow::LatencyEstimate mixture(std::span<const Branch> branches) {
   return {.mean_s = mean, .variance_s2 = within + between};
 }
 
+flow::LatencyEstimate conditional_hop(double fraction, flow::LatencyEstimate hop) {
+  if (fraction >= 1.0) return hop;
+  if (fraction <= 0.0) return {};
+  // C++20 std::to_array: the two branches as a std::array, its size deduced.
+  return mixture(std::to_array<Branch>(
+      {{.share = fraction, .latency = hop}, {.share = 1.0 - fraction, .latency = {}}}));
+}
+
 // ---- ServiceBehaviour ----
 
 // Only `ops` steps: a service has no `then` (loader-enforced, see the class comment).
 ServiceBehaviour::ServiceBehaviour(const graph::Graph& g, std::size_t self)
     : self_{self}, cost_by_op_{g.nodes()[self].spec.cost.begin(), g.nodes()[self].spec.cost.end()} {
-  for (const auto& [op, steps] : g.nodes()[self].spec.ops) add_hops(g, op, steps);
+  // C++20 std::views::keys: a lazy view of each map entry's key (the op name), replacing a
+  // loop over the pairs that ignores `.second`; nothing is copied.
+  for (const auto& op : g.nodes()[self].spec.ops | std::views::keys) add_hops(g, op);
 }
 
 double ServiceBehaviour::cost(std::string_view op) const {
@@ -772,22 +889,24 @@ double ServiceBehaviour::cost(std::string_view op) const {
   return found == cost_by_op_.end() ? 1.0 : found->second;
 }
 
-void ServiceBehaviour::add_hops(const graph::Graph& g, const std::string& op,
-                                const std::vector<model::Step>& steps) {
+// The graph's resolved hops (graph::Graph::service_hops), minus those no request takes: an
+// `on: failure` step (no failures before phase 2c) and an `on: miss` step after a cache
+// that always hits. Such a hop forwards nothing and adds nothing, so it is left out rather
+// than carried as a zero branch.
+void ServiceBehaviour::add_hops(const graph::Graph& g, const std::string& op) {
   auto& hops = hops_by_op_[op];
-  for (const auto& step : steps) {
-    // Only unconditional steps: see the class comment for why miss/failure never fire.
-    if (step.on != model::StepCondition::always) continue;
-    // Graph::build already proved the target exists and a link carries the demand.
-    const auto target = *g.index_of(step.to);
-    const auto link = *g.demand_link(self_, target);
-    hops.push_back(Hop{.op = step.op,
-                       .target = target,
+  for (const graph::ServiceHop& resolved : g.service_hops(self_, op)) {
+    if (resolved.fraction <= 0.0) continue;
+    // Graph::build already proved a link carries the demand.
+    const auto link = *g.demand_link(self_, resolved.target);
+    hops.push_back(Hop{.op = resolved.op,
+                       .target = resolved.target,
                        .link = link,
-                       .factor = step.factor,
-                       .mode = step.mode,
+                       .factor = resolved.factor,
+                       .fraction = resolved.fraction,
+                       .mode = resolved.mode,
                        .link_leg_s = seconds(g.links()[link].one_way),
-                       .asynchronous = g.is_async_hop(self_, op, target, step.op)});
+                       .asynchronous = g.is_async_hop(self_, op, resolved.target, resolved.op)});
   }
 }
 
@@ -806,7 +925,7 @@ Routed ServiceBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*
     if (rate.per_second <= 0.0) continue;
     for (const Hop& hop : hops_of(op)) {
       detail::flow_towards(routed.outgoing, hop.target, hop.link)
-          .add(hop.op, Rate{rate.per_second * hop.factor});
+          .add(hop.op, Rate{rate.per_second * hop.factor * hop.fraction});
     }
   }
   detail::sort_by_destination(routed.outgoing);
@@ -1050,6 +1169,45 @@ Routed RateLimiterBehaviour::route(const flow::Flow& in, SimTime now, SimTime dt
     // counter is how it decides (ch. 4).
     detail::flow_towards(routed.outgoing, backend_->target, backend_->link)
         .add(graph::counter_op, Rate{offered});
+  }
+  detail::sort_by_destination(routed.outgoing);
+  return routed;
+}
+
+// ---- CacheBehaviour ----
+
+// Graph::build resolved the backend edge (only for a strategy in which the cache calls the
+// store) and checked the fixed hit ratio; Simulation::create refuses a cache without one.
+CacheBehaviour::CacheBehaviour(const graph::Graph& g, std::size_t self)
+    : cost_by_op_{g.nodes()[self].spec.cost.begin(), g.nodes()[self].spec.cost.end()} {
+  const auto& resolved = g.nodes()[self];
+  if (!resolved.backend) return;
+  backend_ = BackendHop{.target = *resolved.backend,
+                        .link = *resolved.backend_link,
+                        .link_leg_s = seconds(g.links()[*resolved.backend_link].one_way)};
+  for (const auto& op : g.arriving_ops(self))
+    share_by_op_.emplace(op, g.backend_fraction(self, op));
+}
+
+double CacheBehaviour::cost(std::string_view op) const {
+  const auto found = cost_by_op_.find(op);
+  return found == cost_by_op_.end() ? 1.0 : found->second;
+}
+
+double CacheBehaviour::backend_share(std::string_view op) const {
+  const auto found = share_by_op_.find(op);
+  return found == share_by_op_.end() ? 0.0 : found->second;
+}
+
+Routed CacheBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
+  Routed routed;
+  for (const auto& [op, rate] : in.entries()) {
+    if (rate.per_second <= 0.0) continue;  // no empty branches (see ServiceBehaviour::route)
+    routed.served.add(op, rate);
+    const double share = backend_share(op);
+    if (share <= 0.0) continue;
+    detail::flow_towards(routed.outgoing, backend_->target, backend_->link)
+        .add(op, Rate{rate.per_second * share});
   }
   detail::sort_by_destination(routed.outgoing);
   return routed;
