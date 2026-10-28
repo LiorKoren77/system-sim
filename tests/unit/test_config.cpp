@@ -3117,6 +3117,13 @@ TEST_CASE("a sql database's shards, pool, replication lag and write ops are type
     REQUIRE(s.nodes[0].write_ops == std::vector<std::string>{"write"});
     REQUIRE(simsys::model::write_ops_of(s.nodes[0]) == std::vector<std::string>{"write"});
   }
+  // A write costs a database 5 capacity units by default (spec §6: SQL 5k reads/s vs 1k
+  // writes/s); `cost` states another price, as on a service or a cache.
+  SECTION("cost is a database key") {
+    const auto s =
+        load_accepted("simsys_sql_cost.yaml", db_scenario("replicas: 2, cost: {insert: 2}"));
+    REQUIRE(s.nodes[0].cost == std::map<std::string, double>{{"insert", 2.0}});
+  }
   SECTION("shards of zero") {
     require_rejected("simsys_sql_shards_zero.yaml", db_scenario("shards: 0"),
                      "node 'db': shards must be a positive integer");
@@ -3139,5 +3146,34 @@ TEST_CASE("a sql database's shards, pool, replication lag and write ops are type
     require_rejected("simsys_sql_pool_and_concurrency.yaml",
                      db_scenario("pool: 8, advanced: {concurrency: 8}"),
                      "node 'db': pool and advanced.concurrency are the same setting");
+  }
+}
+
+// A database answers every query itself and calls nobody (behaviours::SqlDbBehaviour), so a link
+// that would carry demand out of it would carry nothing: the loader refuses it, whichever end
+// writes it (review of 48d4d0b).
+TEST_CASE("a link that carries demand out of a sql database is refused") {
+  const std::string nodes = "  u: {type: client, rate: {base: 1000/s}, ops: {select: 1}}\n"
+                            "  db: {type: sql_db, replicas: 2}\n"
+                            "  audit: {type: service}\n";
+  SECTION("written from the database") {
+    require_rejected("simsys_sql_link_out.yaml",
+                     scenario_with(nodes, "links:\n"
+                                          "  - {from: u, to: db}\n"
+                                          "  - {from: db, to: audit}\n"),
+                     "node 'db': a database calls nobody");
+  }
+  SECTION("written from the other end with dir: in") {
+    require_rejected("simsys_sql_link_in.yaml",
+                     scenario_with(nodes, "links:\n"
+                                          "  - {from: u, to: db}\n"
+                                          "  - {from: audit, to: db, dir: in}\n"),
+                     "node 'db': a database calls nobody");
+  }
+  SECTION("a link into the database is fine") {
+    require_loaded("simsys_sql_link_into.yaml",
+                   scenario_with(nodes, "links:\n"
+                                        "  - {from: u, to: db}\n"
+                                        "  - {from: db, to: audit, dir: in}\n"));
   }
 }

@@ -1375,6 +1375,21 @@ TEST_CASE("reads and writes are classified by write_ops", "[behaviours]") {
   }
 }
 
+// A write costs a database 5 capacity units unless `cost` says otherwise: the spec's §6 table
+// gives one SQL machine "5k reads" or "1k writes" per second, 5000 / 1000 = 5 (a write's disk
+// seek and log flush). A read costs 1, and a stated cost wins over the default.
+TEST_CASE("a sql database's writes cost five units by default", "[behaviours]") {
+  auto s = sql_front();
+  s.nodes[1].cost = {{"update", 2.0}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const SqlDbBehaviour db{g, *g.index_of("db")};
+  REQUIRE(db.cost("write") == 5.0);
+  REQUIRE(db.cost("insert") == 5.0);
+  REQUIRE(db.cost("delete") == 5.0);
+  REQUIRE(db.cost("update") == 2.0);
+  REQUIRE(db.cost("select") == 1.0);
+}
+
 // `write_ops` stated on a database replaces the database default; it does not add to it. A
 // scenario that says only `write` is a write means exactly that: an `insert` is then a read.
 TEST_CASE("an explicit write_ops of just write on a sql database means exactly that",

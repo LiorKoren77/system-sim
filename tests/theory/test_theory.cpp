@@ -1264,6 +1264,9 @@ namespace {
 // service time, the link has zero latency, so a response is the database's own sojourn.
 // Node indices: u 0, db 1. An op with no load is left out of the client's mix.
 // `pool` and `replication_lag` are set only when given.
+// A `write` costs 1 capacity unit here (stated in `cost`), not the database default of 5 (spec
+// §6: "SQL 5k reads" vs "1k writes" per second): every derivation below then has one unit per
+// query, so its rates are requests. The default has a test of its own (it clears the `cost`).
 Scenario sql_front(int replicas, std::optional<int> shards, double reads, double writes,
                    std::optional<int> pool = std::nullopt,
                    std::optional<simsys::SimTime> replication_lag = std::nullopt) {
@@ -1279,6 +1282,7 @@ Scenario sql_front(int replicas, std::optional<int> shards, double reads, double
   db.shards = shards;
   db.pool = pool;
   db.replication_lag = replication_lag;
+  db.cost = {{"write", 1.0}};
   s.nodes = {NodeSpec{.id = "u",
                       .type = NodeType::client,
                       .workload = Workload{.curve = {.base = Rate{reads + writes}},
@@ -1337,17 +1341,23 @@ TEST_CASE("shards divide both loads", "[theory]") {
   REQUIRE_THAT(client_mean_s(r, "write"), WithinRel(primary.mean_s + 0.001, 1e-9));
 }
 
-// A replica applies a write `replication_lag` after the primary has finished it, so data a
-// replica serves can be as old as: the lag + the time the primary took over the write (its
-// sojourn: wait + service). With no replica nothing is stale.
-TEST_CASE("staleness is the replication lag plus the primary's write sojourn", "[theory]") {
-  SECTION("three copies: 50 ms lag, writes at rho 0.1") {
+// A replica applies a write `replication_lag` after the primary has finished it, and then waits
+// its turn in the replica's own queue behind the reads and the other replayed writes, so data a
+// replica serves can be as old as: the primary's sojourn (wait + service) + the lag + the
+// replica's sojourn. With 3 copies, 1000 reads/s and 100 writes/s the primary runs at rho 0.1
+// and each replica at (500 + 100) / 1000 = 0.6 (M/M/1 waits, `mmc_wait` with c = 1). With no
+// replica nothing is stale.
+TEST_CASE("staleness is the replication lag plus the write's sojourn at the primary and a replica",
+          "[theory]") {
+  SECTION("three copies: 50 ms lag, the primary at rho 0.1, the replicas at 0.6") {
     const auto r = (*Simulation::create(
                         *Graph::build(sql_front(3, std::nullopt, 1000, 100, std::nullopt, 50ms))))
                        .step(0s, 100ms);
     REQUIRE(r.nodes[1].staleness_s.has_value());
     const auto primary = simsys::queueing::mmc_wait(1, 0.1, 0.001);
-    REQUIRE_THAT(*r.nodes[1].staleness_s, WithinRel(0.050 + primary.mean_s + 0.001, 1e-9));
+    const auto replica = simsys::queueing::mmc_wait(1, 0.6, 0.001);
+    REQUIRE_THAT(*r.nodes[1].staleness_s,
+                 WithinRel(0.050 + primary.mean_s + 0.001 + replica.mean_s + 0.001, 1e-9));
   }
   SECTION("one copy: nothing is stale") {
     const auto r = (*Simulation::create(
@@ -1361,13 +1371,137 @@ TEST_CASE("staleness is the replication lag plus the primary's write sojourn", "
   }
 }
 
-// `pool` is the connection pool: the number of requests each queue serves at once, so each is
-// an M/M/c queue with c = pool instead of M/M/1. Reads only, 3 copies: each of the 2 replicas
-// sees 500/s (rho 0.5), and the response is Erlang C's wait for c = 4 plus the service time.
-TEST_CASE("pool sets the concurrency of both queues", "[theory]") {
+// The two queues a write crosses on its way to a reader both count, with their waits (review of
+// 48d4d0b, C1). 3 copies, 200 reads/s and 800 writes/s: the primary runs at 800 / 1000 = 0.8,
+// so a write waits rho / (1 − rho) × s = 4 ms there (M/M/1), four times its 1 ms service; each
+// replica applies the 800 writes plus its 100 reads, rho 0.9, and waits 9 ms. Staleness =
+// 50 ms lag + (4 + 1) ms at the primary + (9 + 1) ms at the replica = 65 ms.
+TEST_CASE("staleness counts the wait in the primary's write queue and the replica's sojourn",
+          "[theory]") {
+  const auto r = (*Simulation::create(
+                      *Graph::build(sql_front(3, std::nullopt, 200, 800, std::nullopt, 50ms))))
+                     .step(0s, 100ms);
+  const auto primary = simsys::queueing::mmc_wait(1, 0.8, 0.001);
+  const auto replica = simsys::queueing::mmc_wait(1, 0.9, 0.001);
+  REQUIRE(r.nodes[1].staleness_s.has_value());
+  REQUIRE_THAT(*r.nodes[1].staleness_s,
+               WithinRel(0.050 + primary.mean_s + 0.001 + replica.mean_s + 0.001, 1e-9));
+  REQUIRE_THAT(*r.nodes[1].staleness_s, WithinRel(0.065, 1e-9));
+}
+
+// A replica replays the primary's log, and the log holds only the writes the primary COMMITTED
+// (review of 48d4d0b, C2): what the primary dropped never reaches a replica. 2 copies, 100
+// reads/s + 1500 writes/s, 1000/s per copy, settled (estimate: both queues full). The primary
+// drains 1000 writes/s and drops 500. The replica is sent its 100 reads + the 1000 committed
+// writes = 1100/s against 1000/s: it drops 100/s in its queue's mix, 100 × 100/1100 reads (the
+// clients' part, in the node's drops) and 100 × 1000/1100 replicated writes (reported apart,
+// `replication_dropped_per_s`). Every write costs 1 here (the fixture), so units are requests.
+TEST_CASE("replicas replay only the writes the primary committed", "[theory]") {
+  const auto r =
+      (*Simulation::create(*Graph::build(sql_front(2, std::nullopt, 100, 1500)))).estimate();
+  REQUIRE(r.converged);
+  REQUIRE_THAT(r.nodes[1].dropped_per_s, WithinRel(500.0 + 100.0 * 100.0 / 1100.0, 1e-6));
+  REQUIRE(r.nodes[1].replication_dropped_per_s.has_value());
+  REQUIRE_THAT(*r.nodes[1].replication_dropped_per_s, WithinRel(100.0 * 1000.0 / 1100.0, 1e-6));
+}
+
+// The balance demand·dt = (drain + dropped)·dt + Δbacklog holds for the CLIENTS' queries even
+// while a replica is overloaded by replication (review of 48d4d0b, I4). 2 copies, 800 reads/s +
+// 400 writes/s: the primary commits all 400 writes (rho 0.4); the replica is sent 800 + 400 =
+// 1200/s against 1000/s, its queue grows by 20 a step and is full (1000) from step 50 on. Its
+// content keeps the arrival mix, 800 : 400, so the backlog the node shows is the clients' two
+// thirds of the full queue, 1000 × 800/1200 = 666.7, below queue_limit while it already drops;
+// the replicated third of the drops is reported apart.
+TEST_CASE("a database's client totals balance while a replica drops replicated writes",
+          "[theory]") {
+  auto sim = *Simulation::create(*Graph::build(sql_front(2, std::nullopt, 800, 400)));
+  double in = 0.0;
+  double out = 0.0;
+  double backlog = 0.0;
+  for (int k = 0; k < 200; ++k) {
+    const auto record = sim.step(k * 100ms, 100ms);  // kept: `db` refers into it
+    const auto& db = record.nodes[1];
+    in += db.demand_per_s * 0.1;
+    out += (db.drain_per_s + db.dropped_per_s) * 0.1;
+    backlog = db.backlog;
+  }
+  REQUIRE_THAT(in, WithinRel(out + backlog, 1e-9));
+  REQUIRE_THAT(backlog, WithinRel(1000.0 * 800.0 / 1200.0, 1e-6));
+  // 200/s dropped at the replica, a third of it replicated writes.
+  REQUIRE_THAT(sim.estimate().nodes[1].replication_dropped_per_s.value(),
+               WithinRel(200.0 * 400.0 / 1200.0, 1e-6));
+}
+
+// Replicated writes a replica dropped are a database's number: 0 while every replica keeps up,
+// empty for a node that keeps no replicated data.
+TEST_CASE("only a database reports replication drops", "[theory]") {
+  SECTION("a database whose replicas keep up drops none") {
+    const auto r =
+        (*Simulation::create(*Graph::build(sql_front(3, std::nullopt, 1000, 100)))).estimate();
+    REQUIRE(r.nodes[1].replication_dropped_per_s.value_or(-1.0) == 0.0);
+  }
+  SECTION("a service has none to report") {
+    const auto r = (*Simulation::create(*Graph::build(mm1(500)))).estimate();
+    REQUIRE_FALSE(r.nodes[1].replication_dropped_per_s.has_value());
+  }
+}
+
+// `pool` is the connection pool: how many queries one copy has in service at once, the c of its
+// M/M/c queue. Little's law (concurrency in service = throughput × service time) ties it to the
+// throughput: 5k/s × 10 ms keeps 50 queries in service, and `pool: 25` lets only 25 run, so a
+// copy serves at most 25 / 10 ms = 2500/s with 25 servers. Reads only, 3 copies: each of the 2
+// replicas is sent 500/s, rho 500 / 2500 = 0.2, and a read waits Erlang C's wait for c = 25
+// plus its 10 ms.
+TEST_CASE("a pool below Little's law's concurrency is each queue's c and bounds its rate",
+          "[theory]") {
+  auto s = sql_front(3, std::nullopt, 1000, 0, 25);
+  s.nodes[1].capacity = Rate{5000};
+  s.nodes[1].latency = 10ms;
+  const auto r = (*Simulation::create(*Graph::build(s))).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[1].rho, WithinRel(0.2, 1e-9));
+  const auto pooled = simsys::queueing::mmc_wait(25, 0.2, 0.010);
+  REQUIRE_THAT(client_mean_s(r, "read"), WithinRel(pooled.mean_s + 0.010, 1e-9));
+}
+
+// A pool at or above the concurrency Little's law implies changes nothing: the disk, not the
+// connections, is the limit (review of 48d4d0b, C3). 1000/s × 1 ms implies one query in service;
+// `pool: 4` leaves the replicas at M/M/1, rho 0.5, as with no pool at all.
+TEST_CASE("a pool above the concurrency Little's law implies changes nothing", "[theory]") {
   const auto r =
       (*Simulation::create(*Graph::build(sql_front(3, std::nullopt, 1000, 0, 4)))).step(0s, 100ms);
   REQUIRE_THAT(r.nodes[1].rho, WithinRel(0.5, 1e-9));
-  const auto pooled = simsys::queueing::mmc_wait(4, 0.5, 0.001);
-  REQUIRE_THAT(client_mean_s(r, "read"), WithinRel(pooled.mean_s + 0.001, 1e-9));
+  const auto single = simsys::queueing::mmc_wait(1, 0.5, 0.001);
+  REQUIRE_THAT(client_mean_s(r, "read"), WithinRel(single.mean_s + 0.001, 1e-9));
+}
+
+// A small pool caps the throughput, it never speeds the disk: 4 connections of a 10 ms query
+// carry 4 / 0.010 = 400 queries/s (Little's law), whatever the disk's 5k/s. One copy, 3000
+// reads/s: it drains 400/s at rho 1 and, settled with a full queue, drops the other 2600/s.
+TEST_CASE("a small pool bounds a database's throughput", "[theory]") {
+  auto s = sql_front(1, std::nullopt, 3000, 0, 4);
+  s.nodes[1].capacity = Rate{5000};
+  s.nodes[1].latency = 10ms;
+  const auto r = (*Simulation::create(*Graph::build(s))).estimate();
+  REQUIRE_THAT(r.nodes[1].rho, WithinRel(1.0, 1e-12));
+  REQUIRE_THAT(r.nodes[1].drain_per_s, WithinRel(400.0, 1e-9));
+  REQUIRE_THAT(r.nodes[1].dropped_per_s, WithinRel(2600.0, 1e-9));
+}
+
+// A write costs a database 5 capacity units unless the scenario says otherwise: the spec's §6
+// table gives one SQL machine "5k reads" or "1k writes" per second (a write's disk seek and
+// log flush), 5000 / 1000 = 5 reads' worth. One copy of 1000 units/s, 100 writes/s: 500
+// units/s, rho 0.5. A stated `cost` replaces the default.
+TEST_CASE("a write costs five units on a database by default", "[theory]") {
+  auto s = sql_front(1, std::nullopt, 0, 100);
+  s.nodes[1].cost.clear();
+  SECTION("the default") {
+    const auto r = (*Simulation::create(*Graph::build(s))).step(0s, 100ms);
+    REQUIRE_THAT(r.nodes[1].demand_per_s, WithinRel(500.0, 1e-9));
+    REQUIRE_THAT(r.nodes[1].rho, WithinRel(0.5, 1e-9));
+  }
+  SECTION("a stated cost") {
+    s.nodes[1].cost = {{"write", 2.0}};
+    const auto r = (*Simulation::create(*Graph::build(s))).step(0s, 100ms);
+    REQUIRE_THAT(r.nodes[1].rho, WithinRel(0.2, 1e-9));
+  }
 }
