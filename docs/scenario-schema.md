@@ -37,14 +37,12 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `service` | ops, steps, per-op `cost` |
 | `load_balancer` | every policy |
 | `rate_limiter` | every algorithm, with or without a counter `backend` |
-| `cache` | a fixed or [`che`](#che-hit-ratios) hit ratio, the four synchronous strategies (`cache_aside`, `read_through`, `write_through`, `write_around`), no `then` steps |
+| `cache` | a fixed or [`che`](#che-hit-ratios) hit ratio, every strategy (`write_back` with an asynchronous flush), [`then` steps](#then-steps-on-a-cache) |
 
 Everything else is refused before the first step, with exit code 1:
 
 | what | message | runs from |
 |---|---|---|
-| a cache with `strategy: write_back` | `node 'c' has strategy write_back (writes flushed later), which run/estimate do not support yet (phase 2b)` | 2b |
-| a cache with `then` steps | `node 'c' has then steps (fired per hit or miss), which run/estimate do not support yet (phase 2b)` | 2b |
 | `sql_db`, `cdn` | `node 'x' has type 'cdn', which run/estimate do not support yet (phase 2)` | 2b |
 | `blob_store`, `message_queue`, `worker_pool`, `external_sink` | the same message | 2c |
 | `kv_cluster`, `ws_gateway`, `service_discovery` | the same message | 3 |
@@ -147,7 +145,7 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 | `advanced` | map | all but `client` | read | see next table |
 | `ops` | map | `client`, `service`, `ws_gateway` | read (client, service); checked (ws_gateway) | client: op → share; otherwise op → step list (below) |
 | `cost` | map op → number | `service`, `cache` | read | **new in v1.2**: the capacity units one request of that op consumes; an op not listed costs 1. Each value is a positive finite number (`cost 'write' must be a positive finite number`, also for a quoted `"3"`) of at most 1e6 (`cost 'write' must be at most 1e6`); anything but a map is `cost must be a map of op to units`, a bare `cost:` is `cost must not be empty (write {} for none)`. `capacity` is then a rate of units: demand is `Σ rate_op × cost_op`, and the node's demand, drops and backlog are reported in units. What it forwards stays requests (a drained `write` of cost 3 is one `write` downstream). A load balancer and a rate limiter charge 1 per request, and `cost` is not a key of theirs. A `worker_pool`'s `cost` is a different key (a duration per job, phase 2c) |
-| `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | checked | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step; `explain`'s paper load follows a cache's `then` steps (an unconditional one carries everything the cache answered, an `on: miss` one `1 − h` of the reads and none of the writes); `run`/`estimate` refuse a cache's `then` until phase 2b |
+| `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | read (cache); checked (others) | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step; a cache's `then` steps run (an unconditional one carries everything the cache answered, an `on: miss` one `1 − h` of the reads and none of the writes; see [`then` steps on a cache](#then-steps-on-a-cache)), and `explain`'s paper load follows them the same way |
 
 A key outside its row is an error, e.g. `key 'capacity' is not valid for type 'client'`
 (a client is a traffic source with no service rate, service time or waiting room) or
@@ -329,7 +327,28 @@ What each strategy passes to its `backend`, as the same op:
 | `read_through` | `1 − h` of each read; a read's response is the mixture `{h: own, 1 − h: own + hop}` | nothing |
 | `write_through` | nothing (a miss is the application's `on: miss` step) | every write, synchronously: own + hop |
 | `write_around` | as `write_through` | as `write_through`: the same flow. The difference is what the cache holds afterwards, which shows in the hit ratio, and `h` is fixed here |
-| `write_back` | refused by `run`/`estimate` until phase 2b (a queue of dirty entries flushed later) | |
+| `write_back` | nothing (a miss is the application's `on: miss` step, as under `cache_aside`) | every write, **asynchronously**: the cache acknowledges it from memory (response = own sojourn) and flushes it to the store later. The store still absorbs every write (an upper bound: no coalescing of repeated writes to one key); the flush adds no latency and cannot fail a client request. Not modelled: the dirty-entry queue, how far the store lags, writes lost when the cache dies before a flush |
+
+The write-back flush is asynchronous **by design**, not because it closes a call cycle: the graph
+marks every `(cache, write) -> (backend, write)` hop of a `write_back` cache as an asynchronous
+hop at build. It needs a `backend` and a link to it like every other strategy but `cache_aside`.
+
+#### `then` steps on a cache
+
+A cache's `then` steps say what happens after it answers, when the cache sits **in front of** the
+next tier instead of beside the application: ch. 1's read path draws the arrow "on a miss, go on
+to the next tier", and ch. 13's browser cache is one (`then: [{to: lb, op: suggest, on: miss}]`:
+a hit is answered in the browser, a miss goes on to the load balancer).
+
+| `on` | flow (per request the cache handles) | response | delivered |
+|---|---|---|---|
+| `always` (default) | every op, `× factor`, as `step.op` | own + the hop (two link legs + the target's response) for every request | × the target's delivered fraction |
+| `miss` | `(1 − h) × factor` of each **read**; writes do not miss and send nothing | the mixture `{h: own, 1 − h: own + hop}`; several miss steps form one block that a miss takes in turn | `(1 − f) + f × Π d` over the block, `f = 1 − h` |
+| `failure` | nothing before phase 2c | — | — |
+
+A `read_through` cache already fetches its misses from its `backend`, so a `then` step on miss
+would fetch each miss twice: *(graph)* `node 'c': a then step on miss and a read_through backend
+both fetch the miss`. A `then` step must be carried by a link like any step.
 
 Not modelled: TTL expiry, eviction orders other than LRU (a `che` cache is LRU's model whatever
 its `eviction`), temporal locality, a cold start, the thundering herd of a hot key's misses,

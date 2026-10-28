@@ -1014,7 +1014,8 @@ void forward_limited(const graph::Graph& g, const ForwardRoutes& table, std::siz
 }
 
 // Forwards what a cache passes on to its store: rate × Graph::backend_fraction (1 − h of a
-// read under read_through, every write under write_through and write_around), as
+// read under read_through, every write under write_through, write_around and write_back: a
+// write-back flush is asynchronous, but the store still absorbs it), as
 // CacheBehaviour::route does. A cache_aside cache has no backend: the service's on-miss step
 // carries its misses.
 void forward_to_backend(const graph::Graph& g, std::size_t from, const OpLoad& arriving,
@@ -1030,7 +1031,7 @@ void forward_to_backend(const graph::Graph& g, std::size_t from, const OpLoad& a
 // Forwards along a cache's `then` steps (what happens after it answers: ch. 13's browser
 // cache sends its misses on to the servers): rate × factor × Graph::then_fraction, the whole
 // flow for an unconditional step and the misses (1 − h of a read) for an `on: miss` one.
-// The engine runs these from phase 2b on; on paper they are plain multiplications.
+// The same multiplications as CacheBehaviour::route (plan 2b refinement 5).
 void forward_then_steps(const graph::Graph& g, std::size_t from, const OpLoad& arriving,
                         std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   for (const model::Step& step : g.nodes()[from].spec.then) {
