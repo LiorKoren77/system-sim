@@ -45,17 +45,22 @@ table below is the comparison at `burst: 500`, the setting the "things to try" s
 
 What happens at the spikes:
 - **Token bucket**: at the start of each spike the full bucket lets its 500 tokens through
-  on top of the refill, 600 requests in one 100 ms step, while the api clears 120. Its
-  queue fills (400), drops 60-80 requests and stays above 100 ms for about 2 s per spike;
-  after that exactly 1k/s gets through (api at 83 %). "A burst passes untouched" is the
-  whole point of the algorithm, and the api must be sized for it.
+  on top of the refill, 600 requests in one 100 ms step, while the api clears 120. The
+  response stays above 100 ms for about 2 s per spike. Under the 5x and the 20x spikes the
+  queue fills (400) and overflows: the 140 drops are 60 at the 5x spike and 80 at the 20x
+  one. Under the 2x spike it reaches 320 and drops nothing. After the surge exactly 1k/s
+  gets through (api at 83 %). "A burst passes untouched" is the whole point of the
+  algorithm, and the api must be sized for it.
 - **Leaky bucket**: the api never sees more than 1k/s (peak rho 0.83, no queue, no drops);
   the waiting happens in the bucket instead. A full bucket of 500 at 1k/s is a 0.5 s wait,
   and during the 2-minute 2x spike the bucket stays full the whole time: 122 s of red on
   the limiter, a p99 of 621 ms. Smooth for the server, slow for the client.
 - **Fixed window**: each window's first step takes the whole 1000 (10k/s for 100 ms, the
-  fluid's version of ch. 4's "edge" burst), so under every spike the api's queue fills
-  once a second: 9.6k drops, 96 s red during the 2-minute spike alone.
+  fluid's version of ch. 4's "edge" burst), so under every spike the api's queue takes a
+  surge once a second, each window anew. Under the 5x spike (30 s) and the 20x spike (5 s)
+  it fills and overflows: the 9.6k drops are 7.2k and 2.4k, with 18 s and 2 s red. Under
+  the 2x spike (2 min) it reaches 240 every second and drops nothing, but it is red for 96 s
+  of the 116 s in all.
 - **Sliding counter**: the estimate counts the previous window too, so nothing like a
   window's worth enters at once; under a flood it admits a little below the limit (the
   higher reject rate, 15.1 %). The api peaks briefly (backlog 80, about 0.3 s red per

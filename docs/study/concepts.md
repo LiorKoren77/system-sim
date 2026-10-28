@@ -4,7 +4,7 @@
 
 | Concept or constraint | File | Kind |
 |---|---|---|
-| `NodeBehaviour<B>` | `src/engine/behaviours.cppm` | requires-expression: `route` and `response` with exact result types |
+| `NodeBehaviour<B>` | `src/engine/behaviours.cppm` | requires-expression: `route` (on a non-const behaviour), `cost`, `response` and `delivered` with exact result types |
 | `RequestSource<S>` | `src/engine/behaviours.cppm` | requires-expression: `offer`, `response`, `ops` |
 | `ResponseLookup<F>` | `src/engine/behaviours.cppm` | built from the standard `std::invocable` and `std::convertible_to` |
 | `StepObserver<F>` | `src/engine/engine.cppm` | an alias of `std::invocable<F, const StepRecord&>` |
@@ -21,17 +21,27 @@ checks the expression's type against another concept. From `behaviours.cppm`:
 
 ```cpp
 template <class B>
-concept NodeBehaviour = requires(const B b, const flow::Flow& in, flow::LatencyEstimate own) {
-  { b.route(in) } -> std::same_as<Routed>;
+concept NodeBehaviour = requires(const B b, B& node, const flow::Flow& in, SimTime now, SimTime dt,
+                                 flow::LatencyEstimate own) {
+  { node.route(in, now, dt) } -> std::same_as<Routed>;
+  { b.cost(std::string_view{}) } -> std::same_as<double>;
   {
     b.response(std::string_view{}, own,
                [](std::size_t, std::string_view) { return flow::LatencyEstimate{}; })
   } -> std::same_as<flow::LatencyEstimate>;
+  {
+    b.delivered(std::string_view{}, 1.0, [](std::size_t, std::string_view) { return 1.0; })
+  } -> std::same_as<double>;
 };
 ```
 
-The parameters `b`, `in`, `own` are never created; they only give the expressions something
-to name. Concepts can also be composed from standard ones with `&&`:
+The parameters `b`, `node`, `in`, `now`, `dt`, `own` are never created; they only give the
+expressions something to name. Two of them name the same behaviour on purpose: `route(in,
+now, dt)` is required on a **non-const** `B& node`, because a stateful behaviour (a rate
+limiter's bucket and window counters) changes itself as it steps; a stateless one (a
+service) may still declare `route` const, which a non-const object can call too. `cost`,
+`response` and `delivered` are required on the `const B b`: asking a behaviour about its
+latency must not change it. Concepts can also be composed from standard ones with `&&`:
 
 ```cpp
 template <class F>

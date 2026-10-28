@@ -311,22 +311,24 @@ struct Overloaded : Fs... {
          type == cache;
 }
 
-// Why a node of a simulated type still cannot run, if it cannot: a cache whose model needs
-// phase 2b (a `che` hit ratio, computed by the Che approximation; the write_back strategy, a
-// queue of dirty entries flushed later; `then` steps, which fire per hit or miss) or that a
-// scenario built in code left without a hit ratio (the loader requires one).
+// Why a node of a simulated type still cannot run, if it cannot: a cache that a scenario built
+// in code left without a number or `che` for its hit ratio (the loader requires one: the same
+// message), or whose model needs phase 2b (a `che` hit ratio, computed by the Che
+// approximation; the write_back strategy, a queue of dirty entries flushed later; `then`
+// steps, which fire per hit or miss). The phase-2b refusals end like an unsupported type's,
+// "which run/estimate do not support yet (phase 2b)", so every "not yet" reads the same.
 [[nodiscard]] std::optional<std::string> not_runnable_yet(const model::NodeSpec& spec) {
   if (spec.type != model::NodeType::cache) return std::nullopt;
-  const std::string node = "node '" + spec.id + "': ";
-  if (!spec.hit_ratio) return node + "cache needs a hit_ratio";
-  if (spec.hit_ratio->che || !spec.hit_ratio->fixed) {
-    return node + "hit_ratio che (the Che approximation) is computed from phase 2b on; " +
-           "run/estimate need {fixed: h} until then";
-  }
+  const std::string node = "node '" + spec.id + "'";
+  const bool has_number = spec.hit_ratio && spec.hit_ratio->fixed;
+  const bool is_che = spec.hit_ratio && spec.hit_ratio->che;
+  if (!has_number && !is_che) return node + ": cache needs a hit_ratio";
+  const std::string not_yet = ", which run/estimate do not support yet (phase 2b)";
+  if (is_che) return node + " has hit_ratio che (the Che approximation)" + not_yet;
   if (spec.strategy == model::CacheStrategy::write_back) {
-    return node + "strategy write_back (writes flushed later) runs from phase 2b on";
+    return node + " has strategy write_back (writes flushed later)" + not_yet;
   }
-  if (!spec.then.empty()) return node + "a cache's then steps run from phase 2b on";
+  if (!spec.then.empty()) return node + " has then steps (fired per hit or miss)" + not_yet;
   return std::nullopt;
 }
 
@@ -507,7 +509,7 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
     // `burst`), so the queue does the leaking.
     case model::NodeType::rate_limiter:
       return make_server(behaviours::RateLimiterBehaviour{g, index}, resolved);
-    // A cache's queue is the lookup itself (the type's 100k/s, 0.1 ms, or the scenario's
+    // A cache's queue is the lookup itself (the type's 100k/s, 250 us, or the scenario's
     // numbers); the store behind it, if its strategy calls one, is a node of its own.
     case model::NodeType::cache:
       return make_server(behaviours::CacheBehaviour{g, index}, resolved);

@@ -222,8 +222,12 @@ inline constexpr auto limiter_algorithm_table = std::to_array<core::EnumName<Lim
 
 // How a cache and the store behind it share reads and writes (System Design Interview
 // ch. 1 "Cache", and the caches of ch. 8 url shortener, ch. 11 news feed, ch. 12 chat, ch. 13
-// autocomplete, ch. 14 YouTube). In the fluid model (plan 2a refinement 7, see
-// behaviours::CacheBehaviour), with a fixed hit ratio h:
+// autocomplete, ch. 14 YouTube). Names: ch. 1 draws one pattern, the application reading the
+// cache and fetching a miss from the database itself, and calls it a "read-through cache";
+// the industry's name for that pattern is cache-aside, and that is ours. Our `read_through`
+// is the cache-driven fetch (the cache itself loads a miss), and the write strategies are
+// general caching practice; the book names none of them. In the fluid model (plan 2a
+// refinement 7, see behaviours::CacheBehaviour), with a fixed hit ratio h:
 //   cache_aside   -> "lazy loading": the APPLICATION asks the cache, and on a miss reads the
 //                    store itself (a service step `{to: db, on: miss}`, which carries the miss
 //                    fraction 1 - h); the cache only answers. Writes go to the store through
@@ -256,7 +260,8 @@ inline constexpr auto cache_strategy_table = std::to_array<core::EnumName<CacheS
 }
 
 // The strategies in which the CACHE talks to the store, so it needs a `backend` (and a link
-// to it): all but cache_aside, where the application does.
+// to it): all but cache_aside, where the application does (and where a backend is refused:
+// it would never be called).
 [[nodiscard]] constexpr bool needs_backend(CacheStrategy s) {
   return s != CacheStrategy::cache_aside;
 }
@@ -264,7 +269,8 @@ inline constexpr auto cache_strategy_table = std::to_array<core::EnumName<CacheS
 // A cache's `hit_ratio`: `{fixed: h}`, the share of reads the cache answers, given by the
 // scenario (0 <= h <= 1), or `che`: computed from the cache size (`keys`), the key
 // popularity and the eviction policy by the Che approximation (phase 2b; until then the
-// graph has no number for it and the engine refuses it). Exactly one of the two is set.
+// graph has no number for it and the engine refuses it). The loader sets exactly one of the
+// two; a HitRatio{} built in code sets neither, which counts as no hit ratio at all.
 struct HitRatio {
   std::optional<double> fixed{};
   bool che{false};
@@ -365,10 +371,11 @@ struct NodeSpec {
   // Caches only (plan 2a refinement 7; declared after `backend`, for designated
   // initializers): the hit ratio (required by the loader; a scenario built in code may
   // leave it empty, which the engine refuses), the strategy (default cache_aside, the
-  // book's ch. 1 pattern), the ops that are writes (every other op is a read), and the
-  // sizing keys the Che approximation of phase 2b will use: `keys` (how many entries fit),
-  // `eviction` (lru, lfu, fifo or ttl) and `ttl`. A `backend` on a cache names the store
-  // the cache itself calls (read_through, write_through, write_around, write_back).
+  // pattern ch. 1 draws and calls read-through), the ops that are writes (every other op is a
+  // read), and the sizing keys the Che approximation of phase 2b will use: `keys` (how many entries
+  // fit), `eviction` (lru, lfu, fifo or ttl) and `ttl`. A `backend` on a cache names the store the
+  // cache itself calls (read_through, write_through, write_around, write_back); a CDN reads
+  // `hit_ratio` too (its `on: miss` steps use it).
   std::optional<HitRatio> hit_ratio{};
   CacheStrategy strategy{CacheStrategy::cache_aside};
   std::vector<std::string> write_ops{std::string{default_write_op}};
