@@ -67,7 +67,10 @@ TEST_CASE("a ramp moves linearly from `from` to `to` over `over`, then holds", "
   REQUIRE(c.rate_at(3h).per_second == 2000);
 }
 
-TEST_CASE("scripted spikes multiply during [at, at + for) and overlapping spikes compound", "[workload]") {
+TEST_CASE(
+    "scripted spikes multiply from at until at + duration, end exclusive, and overlapping spikes "
+    "compound",
+    "[workload]") {
   RateCurve c{.base = Rate{100}};
   c.spikes = {Spike{.at = 5min, .duration = 30s, .factor = 5},
               Spike{.at = 5min + 10s, .duration = 10s, .factor = 2}};
@@ -77,7 +80,8 @@ TEST_CASE("scripted spikes multiply during [at, at + for) and overlapping spikes
   REQUIRE(c.rate_at(5min + 30s).per_second == 100);  // the end is exclusive
 }
 
-TEST_CASE("points replace the base with a piecewise-linear rate and hold the last value", "[workload]") {
+TEST_CASE("points replace the base with a piecewise-linear rate and hold the last value",
+          "[workload]") {
   RateCurve c{.base = Rate{999}};
   c.points = Points{.at = {{0s, Rate{1000}}, {1h, Rate{5000}}}};
   REQUIRE(c.rate_at(0s).per_second == 1000);
@@ -105,7 +109,8 @@ TEST_CASE("time past 24 h wraps the wave by its period", "[workload]") {
   REQUIRE_THAT(c.rate_at(44h).per_second, WithinRel(1500.0, 1e-12));
 }
 
-TEST_CASE("wave_multiplier is exposed so the curve command can print the shape alone", "[workload]") {
+TEST_CASE("wave_multiplier is exposed so the curve command can print the shape alone",
+          "[workload]") {
   const Wave w{.shape = WaveShape::square, .period = 1h, .amplitude = 1.0, .peak_at = 0s};
   REQUIRE(simsys::workload::wave_multiplier(w, 0s) == 2.0);
   REQUIRE(simsys::workload::wave_multiplier(w, 30min) == 0.0);
