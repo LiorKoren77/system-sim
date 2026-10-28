@@ -20,6 +20,7 @@ module;
 // (GCC 14.2 'Bad file data' bug, CLAUDE.md §3). This unit imports the whole module
 // chain; it compiles only with -flarge-source-files (top-level CMakeLists.txt).
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <expected>
 #include <functional>
@@ -94,6 +95,19 @@ struct StepRecord {
   std::vector<ResponseSample> responses{};
 };
 
+// How long to run and how far to advance per step.
+struct RunOptions {
+  SimTime duration{};
+  SimTime step{};
+};
+
+// What `run` hands each step's record to.
+// C++20 concept from a standard one: std::invocable<F, Args...> is "F can be called with
+// Args". Naming the requirement turns a bad observer into one clear error at the call
+// ("constraint StepObserver not satisfied") instead of a page of template instantiation.
+template <class F>
+concept StepObserver = std::invocable<F, const StepRecord&>;
+
 class Simulation {
  public:
   // C++23 std::expected<T, E>: a runnable Simulation or the reason the graph cannot be
@@ -112,6 +126,27 @@ class Simulation {
   // through. Record time is 0.
   [[nodiscard]] StepRecord estimate() const;
 
+  // Steps from t = 0 while t < duration (so duration / step records, the last at
+  // duration - step) and hands every record to `observer`.
+  // Pattern: Observer — the loop keeps no record itself, so a 24 h run at 100 ms steps
+  // (864 000 records) uses no more memory than one step; reports, SLO checks and the CSV
+  // series writer are observers that keep only what they need.
+  // C++20 abbreviated function template with a constrained placeholder:
+  // `StepObserver auto&&` reads "anything satisfying StepObserver", replacing
+  // `template <class F> requires StepObserver<F> void run(RunOptions, F&&)`. Defined here
+  // because a template's body must be visible to the importer that instantiates it.
+  // Throws std::invalid_argument for step <= 0 or duration < 0 (programmer errors: the
+  // loader validates the scenario's values).
+  void run(RunOptions options, StepObserver auto&& observer) {
+    require_valid(options);
+    // `.count()` comparisons: chrono's non-member `<` is invisible in this interface
+    // (it does not include <chrono>, CLAUDE.md §3); `+=` is a member and works. Both
+    // operands are SimTime, so their counts are in the same unit (nanoseconds).
+    for (SimTime now{0}; now.count() < options.duration.count(); now += options.step) {
+      observer(step(now, options.step));
+    }
+  }
+
  private:
   // advance: one real step. settle: jump to the long-run state (FluidQueue::settle) and
   // read links without their delay (in the long run a link delivers what it is sent).
@@ -129,6 +164,10 @@ class Simulation {
     std::vector<std::size_t> incoming_links{};            // links delivering demand here
     std::vector<std::size_t> outgoing_links{};            // links this node sends demand on
     flow::Flow inflow{};                                  // this step's arrivals
+    // Services: what one copy's queue holds, per op, in requests (not per second; Flow
+    // is reused as "a number per op"). Its total agrees with the queue's backlog to
+    // rounding. See serve().
+    flow::Flow waiting{};
     ResponseTable responses{};
   };
 
@@ -138,6 +177,7 @@ class Simulation {
   };
 
   explicit Simulation(const graph::Graph& g);
+  static void require_valid(const RunOptions& options);
   [[nodiscard]] static Node make_node(const graph::Graph& g, std::size_t index);
   [[nodiscard]] static int line_steps(const graph::ResolvedLink& link);
   void connect(const graph::Graph& g);
@@ -148,6 +188,8 @@ class Simulation {
   [[nodiscard]] behaviours::Routed serve(std::size_t index,
                                          const behaviours::ServiceBehaviour& service, SimTime dt,
                                          Mode mode, NodeSample& sample);
+  [[nodiscard]] static flow::Flow take_drained(Node& node, const flow::Flow& content,
+                                               const fluid::FluidStep& copy_step);
   void send(std::size_t index, const behaviours::Routed& routed, Mode mode);
   void backward_pass(const std::vector<NodeSample>& samples);
   [[nodiscard]] std::vector<ResponseSample> client_responses() const;
@@ -199,14 +241,21 @@ void add_once(std::vector<std::size_t>& links, std::size_t link) {
   if (!std::ranges::contains(links, link)) links.push_back(link);
 }
 
-// Share of this step's arrivals the node passes on. drain/demand: below capacity 1, in
-// overload the served part (drops and the growing backlog stay behind, so dropped flow
-// never propagates downstream), above 1 while a backlog is worked off (the drained
-// backlog leaves with this step's op mix). Never NaN or negative: demand > 0 is checked
-// and drain >= 0. Known gap: with no arrivals at all a draining backlog forwards nothing,
-// because the fluid queue does not remember which ops are waiting.
-[[nodiscard]] double served_fraction(const fluid::FluidStep& step) {
-  return step.demand_per_s > 0.0 ? step.drain_per_s / step.demand_per_s : 1.0;
+// What one copy's queue holds during a step, per op, in requests: what was waiting plus
+// this step's arrivals (rate × dt).
+[[nodiscard]] flow::Flow queue_content(const flow::Flow& waiting, const flow::Flow& arrivals,
+                                       SimTime dt) {
+  flow::Flow content = waiting;
+  content += arrivals.scaled(seconds(dt));
+  return content;
+}
+
+// The long-run queue of estimate(): FluidQueue::settle sets the total backlog, and in
+// the long run the queue holds the arrival mix, so each op waits in proportion to its
+// arrival rate: arrivals × backlog / demand (rate × seconds = requests).
+[[nodiscard]] flow::Flow settled_waiting(const flow::Flow& arrivals, double backlog) {
+  const double demand_per_s = arrivals.total().per_second;
+  return demand_per_s > 0.0 ? arrivals.scaled(backlog / demand_per_s) : flow::Flow{};
 }
 
 // A replica group of `replicas` identical copies behind an equal split (plan refinement
@@ -310,6 +359,13 @@ StepRecord Simulation::step(SimTime now, SimTime dt) {
   return evaluate(now, dt, Mode::advance);
 }
 
+void Simulation::require_valid(const RunOptions& options) {
+  if (options.step.count() <= 0) throw std::invalid_argument{"Simulation::run: step must be > 0"};
+  if (options.duration.count() < 0) {
+    throw std::invalid_argument{"Simulation::run: duration must be >= 0"};
+  }
+}
+
 // The long run of an acyclic graph is reached in one settle pass: every node settles to
 // its demand, and the links pass flow straight through in topological order. A feedback
 // link is read before its source has run, so each pass carries the loop's flow one lap
@@ -337,7 +393,7 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
 // Forward pass (spec §3.2-3.4), nodes in topological order. For each node:
 //   1. receive: pop every incoming link into the node's inflow;
 //   2. a client offers its load; a service runs its fluid queue on the inflow and routes
-//      the part it drained;
+//      the part it drained (backlog included, with the queue's op mix: see serve);
 //   3. send: accumulate the routed flow per link and push it into each link's delay line.
 // Why this order is right: a forward link's target comes later in the order, so it pops
 // after this step's push (a zero-step link delivers in the same step). A feedback link's
@@ -374,16 +430,55 @@ void Simulation::receive(std::size_t index, Mode mode) {
 }
 
 // One service step: equal split over replicas, the §3.3 fluid step per copy (settled
-// first when estimating), then route the drained share of the arrivals downstream.
+// first when estimating), then route what the queue drained downstream.
+//
+// The FluidQueue knows only totals (one backlog number); `node.waiting` adds which ops
+// are queued. Model: the queue is well-mixed FIFO fluid. Every request in it, whether it
+// waited from an earlier step or arrived in this one, is equally likely to be among the
+// drained, the dropped or the still waiting, so each part has the content's op mix:
+//   content   = waiting + arrivals × dt                     requests per op
+//   forwarded = content × drained / content_total           drained = drain × dt
+//   dropped   = content × dropped / content_total           discarded: never propagates
+//   waiting'  = content × backlog / content_total           = content − forwarded − dropped
+// The totals come from FluidQueue::advance, which stays the single source of truth;
+// waiting' is computed from the backlog directly rather than by subtraction, so it
+// cannot go negative by cancellation, and its total matches the backlog to rounding.
+// This is what makes "what a node drains is what the next node receives" hold even with
+// no arrivals at all: a node working off its backlog forwards the queued ops, not this
+// step's (empty) mix. (Phase 2's rate curves will exercise that zero-arrival case.)
+// Ignored: priorities, per-op service times and any reordering inside the queue.
 behaviours::Routed Simulation::serve(std::size_t index, const behaviours::ServiceBehaviour& service,
                                      SimTime dt, Mode mode, NodeSample& sample) {
   auto& node = nodes_[index];
   auto& queue = *node.queue;  // every service has a queue (make_node)
-  const Rate per_replica{node.inflow.total().per_second / node.replicas};
-  if (mode == Mode::settle) queue.settle(per_replica);
+  // Replicas (plan refinement 4): `waiting` and the queue describe one copy, which sees
+  // 1/replicas of the arrivals; take_drained scales the forwarded flow back to the group.
+  const flow::Flow arrivals = node.inflow.scaled(1.0 / node.replicas);
+  const Rate per_replica = arrivals.total();
+  if (mode == Mode::settle) {
+    queue.settle(per_replica);
+    node.waiting = settled_waiting(arrivals, queue.backlog());
+  }
+  const flow::Flow content = queue_content(node.waiting, arrivals, dt);
   const fluid::FluidStep copy_step = queue.advance(per_replica, dt);
   sample = group_sample(copy_step, node.replicas);
-  return service.route(node.inflow.scaled(served_fraction(copy_step)));
+  return service.route(take_drained(node, content, copy_step));
+}
+
+// Splits one copy's content (see serve) by the totals of its fluid step: keeps the
+// still-waiting part in `node.waiting` and returns the drained part as the group's
+// forwarded rate per op, content × (drain_per_s × replicas) / content_total: the
+// drained requests per copy (drain × dt) over dt, times the copies. An empty queue with
+// no arrivals has nothing to split.
+flow::Flow Simulation::take_drained(Node& node, const flow::Flow& content,
+                                    const fluid::FluidStep& copy_step) {
+  const double content_total = content.total().per_second;  // requests, see Node::waiting
+  if (content_total <= 0.0) {
+    node.waiting.clear();
+    return flow::Flow{};
+  }
+  node.waiting = content.scaled(copy_step.backlog / content_total);
+  return content.scaled(copy_step.drain_per_s * node.replicas / content_total);
 }
 
 void Simulation::send(std::size_t index, const behaviours::Routed& routed, Mode mode) {
