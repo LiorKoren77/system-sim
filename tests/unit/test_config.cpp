@@ -3349,6 +3349,17 @@ TEST_CASE("an id generator without a known algorithm is refused") {
   }
 }
 
+// Ch. 7's ticket server is ONE auto-increment database (two copies would hand out the same ids).
+// Graph::build refuses more replicas; the loader now does too, so `simsys validate` catches it
+// with a line number, with the graph's message (review of 3adc555, M3).
+TEST_CASE("the loader refuses a ticket server with more than one replica") {
+  require_rejected(
+      "simsys_id_ticket_replicas.yaml",
+      scenario_with("  ids: {type: id_generator, algorithm: ticket_server, replicas: 2}\n"),
+      "node 'ids': a ticket server is one auto-increment database: replicas must be 1 (ch. 7; "
+      "for more ids per second use snowflake)");
+}
+
 // `algorithm` on the other types is unchanged by this feature: a rate limiter has its own
 // (the case "a rate limiter's algorithm, limit, burst, window and backend are typed and checked"
 // above), and every other type still refuses the key. An id algorithm's names are not a
