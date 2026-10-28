@@ -27,11 +27,14 @@ simsys run      scenario.yaml [--duration 30s] [--seed N] [--report table|json]
 simsys curve    scenario.yaml <client> [--step 1m] [--until 1h] [--seed N] [--noise]
 ```
 
-`estimate` evaluates the long-run (steady) state once; `run` steps through the scenario and,
+`estimate` evaluates the long-run (steady) state once, at t = 0 (midnight): the rate curve's
+value there, without noise (its first line says so); `explain`'s static load checks use the
+curve's peak instead. `run` steps through the scenario and,
 with `--series`, writes one CSV row per node per step (`t_s,node,rho,backlog,drops_per_s,latency_ms,zone`),
 the file a plot or GUI reads. Exit codes: 0 every SLO passed, 2 an SLO failed, 1 an error.
 Colour is on when stdout is a terminal; `--no-color` turns it off and JSON never has it.
-`--seed` is reserved for phase 2 workload noise and has no effect on `run` yet.
+`run --seed N` replaces the scenario's `seed`, which seeds every client's `rate.noise`
+process: the same seed gives the same run, byte for byte; without a noise block it changes nothing.
 
 `curve` prints one client's offered rate over time as CSV (`t_s,rate_per_s`), sampled every
 `--step` from t = 0 (midnight) up to `--until` (default: the scenario's duration), so the

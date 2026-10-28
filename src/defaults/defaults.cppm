@@ -141,7 +141,7 @@ struct TypeDefaults {
   // silences -Wreturn-type and lets it optimise. Replaces __builtin_unreachable() or a
   // dummy fallback value that would hide a missing case. It is truly unreachable here:
   // the guard above rejects every value outside the catalogue, the catalogue is proven
-  // to list the enumerators in order (model::table_follows_enum_order), and -Wswitch
+  // to list the enumerators in order (core::follows_enum_order), and -Wswitch
   // proves every enumerator has a case that returns.
   std::unreachable();
 }

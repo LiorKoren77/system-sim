@@ -59,7 +59,7 @@ do not support yet (phase 2)". `explain` works for every type.
 |---|---|---|---|---|
 | `version` | integer | yes | read | always `1` (unquoted) |
 | `name` | string | yes | read | non-empty; shown in reports |
-| `seed` | integer | no | checked | default 1; within the range of `int`. Printed by `explain`, used from phase 2 (noise) |
+| `seed` | integer | no | checked | default 1; within the range of `int`. Printed by `explain`; seeds every client's `rate.noise` (`run --seed N` overrides it) |
 | `duration` | duration | yes | read | simulated span of `run`; must be positive |
 | `step` | duration | no | read | default `100ms`; must be positive |
 | `warmup` | duration | no | read | steps before it are left out of the report; default 0; must be shorter than `duration`, so the report never covers an empty window (`run --duration` obeys the same rule) |
@@ -104,7 +104,7 @@ A key outside its row is an error, e.g. `key 'capacity' is not valid for type 'c
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `queue_limit` | integer > 0 | 1000 (chosen) | requests that may wait per replica; beyond it the excess is dropped |
+| `queue_limit` | integer > 0 | 1000 (chosen) | units of work that may wait per replica (requests when every cost is 1; a request of `cost` 3 takes three); beyond it the excess is dropped |
 | `concurrency` | integer in [1, 100000] | implied: `max(1, ceil(capacity × latency))`, capped at 100000 | servers per replica, the c of M/M/c. The cap exists because the Erlang C term costs O(c) per node per step. The default is Little's law at full load (busy servers = throughput × time in service), which keeps the rate and the Erlang C term describing one machine |
 | `service_variability` | number ≥ 0 | 1.0 (2.0 for `external_sink`) | squared coefficient of variation (SCV) of service time; 1 = exponential |
 | `burstiness` | number ≥ 0 | 1.0 | **new in v1.1**: SCV of inter-arrival times; 1 = Poisson. With `service_variability` it forms the Allen–Cunneen factor `(burstiness + service_variability) / 2` that scales the queueing wait (Kingman's correction) |

@@ -930,7 +930,7 @@ void Summary::Moments::add(double w, double mean_s, double variance_s2) {
 
 // Demand, drops and backlog arrive in capacity units (engine::NodeSample): a request of
 // an op with `cost` 3 counts three times. The tables keep their column names; with every
-// cost at its default of 1, units are requests. A node's drop rate is so the share of the
+// cost at its default of 1, units are requests. A node's drop rate is therefore the share of the
 // work it was sent that it shed, the same ratio when costs are uniform.
 void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
   rho_time += sample.rho * dt_s;
@@ -952,6 +952,9 @@ void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
     unavailable = true;
     return;
   }
+  // Weighted by the requests OFFERED, dropped ones included: a request a full queue shed
+  // never saw this latency, but the engine reports no per-op rejection yet. Once the
+  // rejection channel lands (Task 9) the weight becomes the requests actually answered.
   by_offered.add(sample.offered.per_second * dt_s, response.mean_s, response.variance_s2);
   by_time.add(dt_s, response.mean_s, response.variance_s2);
 }

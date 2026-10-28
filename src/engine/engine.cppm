@@ -80,7 +80,7 @@ class DelayLine {
 // Demand, drain, drops and backlog are in CAPACITY UNITS (per second for the rates), the
 // unit `capacity` is a rate of (phase 2a refinement 4): a request of an op with `cost` 3
 // counts three times. With every cost at its default of 1, units are requests, as in
-// phase 1. The drop ratio dropped / demand is so the share of the node's work it shed.
+// phase 1. The drop ratio dropped / demand is therefore the share of the node's work it shed.
 struct NodeSample {
   double demand_per_s{};
   double drain_per_s{};
@@ -203,6 +203,9 @@ class Simulation {
   };
 
   Simulation() = default;  // only for settling_copy(), which fills every member
+  // Copying a Simulation works only inside this module under GCC 14: an importer that
+  // copies one gets undefined references to its implicit special members. settling_copy,
+  // a member compiled in this module, is where estimate() copies; callers only move.
   explicit Simulation(const graph::Graph& g);
   void require_valid(const RunOptions& options) const;
   void require_scenario_step(SimTime dt) const;
@@ -609,9 +612,12 @@ void Simulation::receive(std::size_t index, Mode mode) {
 // cannot go negative by cancellation, and its total matches the backlog to rounding.
 // This is what makes "what a node drains is what the next node receives" hold even with
 // no arrivals at all: a node working off its backlog forwards the queued ops, not this
-// step's (empty) mix. (Phase 2's rate curves will exercise that zero-arrival case.)
-// With a constant op mix the order makes no difference; once phase 2's rate curves vary
-// the mix, a FIFO queue would forward the old mix first and this one forwards a blend.
+// step's (empty) mix. (A rate curve that falls to zero, e.g. points ending at 0/s,
+// reaches that zero-arrival case.)
+// With a constant op mix the order makes no difference. A rate curve scales a client's
+// total, not its op shares, so one client's mix is constant; the mix at a node varies when
+// clients with different curves, or paths of different delay, feed it. Then a FIFO queue
+// would forward the old mix first and this one forwards a blend.
 // Ignored: FIFO order, tail drop (a full real queue rejects the newest arrivals),
 // priorities and per-op service times (a costly op uses more capacity, not a longer
 // sojourn: see ServiceBehaviour).
@@ -688,7 +694,10 @@ void Simulation::backward_pass(const std::vector<NodeSample>& samples) {
 // Every client op in node order then op order, after the backward pass filled every
 // service's table: a client's response is the share-weighted mixture over its routes.
 // `offered` is what the client sent this step (curve × noise × op share), so reports
-// weight each step's latency by the load that actually saw it.
+// weight each step's latency by the load that saw it. That pairing assumes the curve
+// changes slowly relative to the end-to-end delay: this step's response is composed from
+// queues fed by flow sent up to d steps ago (d = the path's delay in steps), so the latency
+// a spike causes is attributed to the requests offered d steps later.
 std::vector<ResponseSample> Simulation::client_responses(SimTime now) const {
   const auto lookup = [this](std::size_t target, std::string_view op) -> flow::LatencyEstimate {
     return response_of(target, op);
