@@ -3,6 +3,8 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <chrono>
+#include <cmath>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -114,4 +116,63 @@ TEST_CASE("wave_multiplier is exposed so the curve command can print the shape a
   const Wave w{.shape = WaveShape::square, .period = 1h, .amplitude = 1.0, .peak_at = 0s};
   REQUIRE(simsys::workload::wave_multiplier(w, 0s) == 2.0);
   REQUIRE(simsys::workload::wave_multiplier(w, 30min) == 0.0);
+}
+
+using simsys::workload::Noise;
+using simsys::workload::NoiseProcess;
+
+TEST_CASE("noise with sigma zero is exactly one", "[workload]") {
+  NoiseProcess n{Noise{.sigma = 0.0, .correlation = 5min}, /*seed=*/7};
+  for (int i = 0; i < 10; ++i) REQUIRE(n.next(100ms) == 1.0);
+}
+
+TEST_CASE("the same seed gives the same noise path and a different seed differs", "[workload]") {
+  const Noise spec{.sigma = 0.2, .correlation = 5min};
+  NoiseProcess a{spec, 7}, b{spec, 7}, c{spec, 8};
+  bool any_difference = false;
+  for (int i = 0; i < 100; ++i) {
+    const double x = a.next(100ms);
+    REQUIRE(x == b.next(100ms));
+    if (x != c.next(100ms)) any_difference = true;
+  }
+  REQUIRE(any_difference);
+}
+
+TEST_CASE("the noise multiplier is never negative", "[workload]") {
+  NoiseProcess n{Noise{.sigma = 2.0, .correlation = 1s}, 1};
+  for (int i = 0; i < 10'000; ++i) REQUIRE(n.next(100ms) >= 0.0);
+}
+
+TEST_CASE("over a long run the multiplier averages one with standard deviation sigma", "[workload]") {
+  // Ornstein-Uhlenbeck with stationary standard deviation sigma; sampled once per correlation
+  // time the values are nearly independent, so 20k samples pin the moments to a few percent.
+  NoiseProcess n{Noise{.sigma = 0.1, .correlation = 1s}, 42};
+  double sum = 0, sum2 = 0;
+  const int samples = 20'000;
+  for (int i = 0; i < samples; ++i) {
+    const double x = n.next(1s);
+    sum += x;
+    sum2 += x * x;
+  }
+  const double mean = sum / samples, var = sum2 / samples - mean * mean;
+  REQUIRE_THAT(mean, WithinAbs(1.0, 0.01));
+  REQUIRE_THAT(std::sqrt(var), WithinAbs(0.1, 0.01));
+}
+
+TEST_CASE("consecutive samples are correlated over the correlation time", "[workload]") {
+  NoiseProcess n{Noise{.sigma = 0.3, .correlation = 10s}, 3};
+  double prev = n.next(100ms), cov = 0, var = 0;
+  const int samples = 50'000;
+  for (int i = 0; i < samples; ++i) {
+    const double x = n.next(100ms);
+    cov += (x - 1) * (prev - 1);
+    var += (x - 1) * (x - 1);
+    prev = x;
+  }
+  REQUIRE(cov / var > 0.95);  // e^{-0.1/10} = 0.990
+}
+
+TEST_CASE("a non-positive correlation time or a negative sigma is a programmer error", "[workload]") {
+  REQUIRE_THROWS_AS((NoiseProcess{Noise{.sigma = 0.1, .correlation = 0s}, 1}), std::invalid_argument);
+  REQUIRE_THROWS_AS((NoiseProcess{Noise{.sigma = -0.1, .correlation = 1s}, 1}), std::invalid_argument);
 }
