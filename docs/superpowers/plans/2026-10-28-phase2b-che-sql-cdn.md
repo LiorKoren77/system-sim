@@ -174,14 +174,14 @@ Correct and pinned by the reviewer: the plan numbers (replica 600/s, reads 3.0 m
 ### Task 6: ID generator as service sugar
 
 **Files:** model (`id_algorithm`), config (`algorithm` on id_generator: snowflake|ticket_server|uuid), graph (resolve defaults: snowflake capacity `4096 × 1000`/s per replica, 10 µs; ticket_server `replicas == 1` else error; uuid 1e9/s, 1 µs), engine (`create` accepts id_generator as a service), report (explain `algorithm=snowflake (4.1M/s per replica by design)`), tests, `scenarios/labs/unique-id/README.md` real numbers (ticket server at 8k/s saturates at ... vs snowflake).
-- [ ] Commit `nodes: id generator (snowflake, ticket server, uuid) as service sugar`
+- [x] Commit `nodes: id generator (snowflake, ticket server, uuid) as service sugar`
 
 ---
 
 ### Task 7: Series and JSON columns; explain propagation note
 
 **Files:** report, tests. CSV header `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`; op rows (a second CSV section? keep one file: node rows only; add `--series-ops out.csv` with `t_s,client,op,offered_per_s,answered_per_s,mean_ms`) — decide: two files is cleaner; `main.cpp` gains `--series-ops`. JSON ops gain `answered_per_s`. Explain: nodes reached only through types that do not yet propagate load get `(load not propagated: <type> is phase 2c/3)` instead of a green 0 %.
-- [ ] Commit `report: demand/drain/offered/answered columns; explain marks unpropagated load`
+- [x] Commit `report: demand/drain/offered/answered columns; explain marks unpropagated load`
 
 ---
 

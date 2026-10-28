@@ -228,10 +228,18 @@ std::expected<simsys::SimTime, std::string> run_duration(const std::filesystem::
 
 // What `run` takes beyond the report options.
 struct RunArgs {
-  std::optional<std::string> duration{};  // overrides the scenario's
-  std::optional<std::string> series{};    // CSV output path
-  std::optional<int> seed{};              // overrides the scenario's (see load_graph)
+  std::optional<std::string> duration{};    // overrides the scenario's
+  std::optional<std::string> series{};      // CSV output path, one row per node per step
+  std::optional<std::string> series_ops{};  // CSV output path, one row per client op per step
+  std::optional<int> seed{};                // overrides the scenario's (see load_graph)
 };
+
+// Opens `path` for a series file (`--series`, `--series-ops`), or says why it cannot.
+bool open_series(const std::string& path, std::ofstream& file) {
+  file.open(path);
+  if (!file) print_error(path + ": error: cannot open for writing");
+  return static_cast<bool>(file);
+}
 
 // `simsys run <file>`: steps through the scenario, feeding every record to the summary
 // and, when asked, to the CSV series (the contract a GUI plots from).
@@ -258,23 +266,23 @@ int run_scenario(const std::filesystem::path& file, const RunArgs& args,
     return 1;
   }
 
+  // Both files open before the run, so a bad path stops it before any step.
   std::ofstream series_file;
+  std::ofstream series_ops_file;
+  if (args.series && !open_series(*args.series, series_file)) return 1;
+  if (args.series_ops && !open_series(*args.series_ops, series_ops_file)) return 1;
   std::optional<report::SeriesWriter> series;
-  if (args.series) {
-    series_file.open(*args.series);
-    if (!series_file) {
-      print_error(*args.series + ": error: cannot open for writing");
-      return 1;
-    }
-    series.emplace(series_file, *g);
-  }
+  std::optional<report::OpSeriesWriter> series_ops;
+  if (args.series) series.emplace(series_file, *g);
+  if (args.series_ops) series_ops.emplace(series_ops_file, *g);
 
   report::Summary summary{*g, scenario.warmup};
   // Pattern: Observer — the step loop hands each record to one callable; this lambda fans
-  // it out to the two observers (summary, optional series) so neither knows of the other.
+  // it out to the observers (summary, optional node and op series) so none knows of another.
   const auto observe = [&](const engine::StepRecord& record) {
     summary.observe(record);
     if (series) series->observe(record);
+    if (series_ops) series_ops->observe(record);
   };
   // C++20 designated initializers: members named at the call site, in declaration order,
   // replacing a positional `{duration, step}` where a reader must remember which is which.
@@ -477,6 +485,8 @@ int main(int argc, char** argv) {
                   "simulated time, e.g. 30s (default: scenario's)");
   run->add_option("--seed", run_args.seed, "seed of the clients' rate noise (default: scenario's)");
   run->add_option("--series", run_args.series, "write one CSV row per node per step to this file");
+  run->add_option("--series-ops", run_args.series_ops,
+                  "write one CSV row per client op per step to this file");
 
   try {
     app.parse(argc, argv);

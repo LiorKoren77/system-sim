@@ -71,6 +71,17 @@ sawtooth`.
 `explain`'s `checks` block instead uses each client's **peak** over the run (see
 [Rate curve](#rate-curve-clientrate)), and passes at most `limit` on behind a rate limiter.
 
+**Load `explain` cannot follow yet.** The checks follow the load as the engine would: from
+the clients' routes, along `ops` steps, through load balancers and rate limiters, and on from
+caches and CDNs (their misses, their store, a cache's `then`). They do **not** follow yet a
+`blob_store`'s or a `worker_pool`'s `then`, nor a `message_queue`'s consumers (phase 2c), nor
+the `then` of a `notification_fanout` or a `frontier`. A node whose load can only come through one of those
+gets 0 on paper: a number that is missing, not zero. Its check line therefore has no
+percentage and no zone, but a mark naming the nearest such node's type on the way to it:
+`transcode_q  peak offered 0/s vs 1M/s total capacity  (load not propagated: blob_store is
+phase 2c)`, or `... (load not propagated: frontier is not modelled yet)`. A node that receives
+some load the checks do follow keeps its verdict, which then leaves out the unpropagated part.
+
 ## Values
 
 | kind | grammar | examples |
@@ -714,8 +725,9 @@ Per node and per step the numbers balance, `demand·dt = (drain + dropped)·dt +
 whatever reaches a node is served, shed or left waiting. A rejection is not a term of its
 own: a token bucket's or a window algorithm's rejections are inside `drain` (the limiter's
 queue checked them before refusing them), and a leaky bucket's overflow is the `dropped`
-term, reported as `rejected` instead. (`run --series` does not write demand and drain yet;
-see the phase 2b backlog.)
+term, reported as `rejected` instead. `run --series` writes demand and drain (phase 2b), so the
+identity can be checked from the file: summed over a run that starts empty,
+Σ demand·dt = Σ (drain + drops)·dt + the backlog left at the end.
 
 Neither kind of request is answered, so neither contributes latency: each step's response
 is weighted by the client's offered rate times the fraction its path **delivers** (a
@@ -730,8 +742,15 @@ for other nodes. Each SLO object has a `note`: `null`, or why the verdict is not
 against `max` alone (a replica that falls behind without bound).
 
 `run --series` writes one CSV row per node per step:
-`t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone` (`rejected_per_s` new in
-v1.2; a client row has zeros and zone `none`).
+`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`
+(`rejected_per_s` new in v1.2, `demand_per_s` and `drain_per_s` in phase 2b; demand, drain,
+drops and backlog in capacity units; a client row has zeros and zone `none`).
+`run --series-ops` writes one CSV row per client op per step (phase 2b):
+`t_s,client,op,offered_per_s,answered_per_s,mean_ms`, where `answered_per_s` is the part of
+the offered rate that came back answered (offered × the fraction the path delivered: below it
+when a limiter refuses or a queue drops, never above) and `mean_ms` the mean response of an
+answered request (`inf` when the path never answers). Numbers have 6 significant digits, `t_s`
+its shortest exact form. JSON's op entries carry `answered_per_s` beside `offered_per_s`.
 When no step was observed every SLO is `skipped` and `run` exits 1: no data is an error,
 not a pass.
 

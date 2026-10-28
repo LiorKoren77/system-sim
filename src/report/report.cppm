@@ -65,13 +65,15 @@ struct NodeSummary {
 
 // One (client, op) over the observed part of a run. Percentiles are a lognormal fit to
 // the latency moments averaged over the ANSWERED requests (plan 2a refinement 8: a refused
-// or dropped request saw no latency); `offered_per_s` still counts every request sent. An
-// infinite mean makes every latency infinite, which the renderers print as "unavailable"
-// (table) or null (JSON).
+// or dropped request saw no latency); `offered_per_s` still counts every request sent, and
+// `answered_per_s` the part of them that came back answered (plan 2b refinement 7), so
+// answered / offered is the fraction the path delivered. An infinite mean makes every latency
+// infinite, which the renderers print as "unavailable" (table) or null (JSON).
 struct OpSummary {
   std::string client{};
   std::string op{};
   double offered_per_s{};
+  double answered_per_s{};
   double mean_s{};
   double p50_s{};
   double p95_s{};
@@ -158,6 +160,7 @@ class Summary {
     std::size_t client{};
     std::string op{};
     double offered{};       // Σ offered·dt, requests
+    double answered{};      // Σ answered·dt, requests: the part of `offered` that came back
     Moments by_answered{};  // weighted by requests answered: what an average answer sees
     Moments by_time{};      // weighted by time: the fallback when nothing was answered
     bool unavailable{};
@@ -201,8 +204,9 @@ class Summary {
 [[nodiscard]] std::string render_explain(const graph::Graph& g);
 
 // For plotting: one CSV row per node per step,
-// `t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`. The header is written on
-// construction; the column rules are at SeriesWriter::observe in report.cpp.
+// `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`.
+// The header is written on construction; the column rules are at SeriesWriter::observe in
+// report.cpp.
 // Pattern: Observer, like Summary. `out` and `g` must outlive the writer.
 class SeriesWriter {
  public:
@@ -213,6 +217,21 @@ class SeriesWriter {
   std::ostream* out_;
   std::vector<std::string> ids_;
   std::vector<bool> is_client_;  // indexed like ids_
+};
+
+// For plotting what the clients see: one CSV row per (client, op) per step,
+// `t_s,client,op,offered_per_s,answered_per_s,mean_ms` (plan 2b refinement 7). The header is
+// written on construction; the column rules are at OpSeriesWriter::observe in report.cpp.
+// Pattern: Observer, like SeriesWriter: the CLI hands each step record to both, and neither
+// knows of the other. `out` and `g` must outlive the writer.
+class OpSeriesWriter {
+ public:
+  OpSeriesWriter(std::ostream& out, const graph::Graph& g);
+  void observe(const engine::StepRecord& record);
+
+ private:
+  std::ostream* out_;
+  std::vector<std::string> ids_;  // node ids, indexed like Graph::nodes(): a sample's client
 };
 
 }  // namespace simsys::report

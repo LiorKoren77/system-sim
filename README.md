@@ -30,15 +30,24 @@ simsys validate scenario.yaml        # types, references and units
 simsys explain  scenario.yaml        # every resolved number and where it came from
 simsys estimate scenario.yaml [--report table|json] [--no-color]
 simsys run      scenario.yaml [--duration 30s] [--seed N] [--report table|json]
-                              [--series out.csv] [--no-color]
+                              [--series out.csv] [--series-ops ops.csv] [--no-color]
 simsys curve    scenario.yaml <client> [--step 1m] [--until 1h] [--seed N] [--noise]
 ```
 
 `estimate` evaluates the long-run (steady) state once, at t = 0 (midnight): the rate curve's
 value there, without noise (its first line says so); `explain`'s static load checks use the
 curve's peak instead. `run` steps through the scenario and,
-with `--series`, writes one CSV row per node per step (`t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`),
-the file a plot or GUI reads. Exit codes: 0 every SLO passed, 2 an SLO failed, 1 an error.
+with `--series`, writes one CSV row per node per step
+(`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`),
+the file a plot or GUI reads; demand, drain, drops and backlog balance, so the fluid queue's
+conservation law, Σ demand·dt = Σ (drain + drops)·dt + backlog, can be checked from the file (a
+token bucket's or a window's refusals are inside drain; a leaky bucket's overflow is in
+`rejected_per_s`, in the drops' place). With `--series-ops`, it writes one CSV row per client op
+per step (`t_s,client,op,offered_per_s,answered_per_s,mean_ms`): what each client sent, the part
+of it that came back answered (a limiter's refusals and a queue's drops are not), and the mean
+response in milliseconds (`inf` when the path never answers). The JSON report's ops carry
+`answered_per_s` beside `offered_per_s` too.
+Exit codes: 0 every SLO passed, 2 an SLO failed, 1 an error.
 Colour is on when stdout is a terminal; `--no-color` turns it off and JSON never has it.
 `run --seed N` replaces the scenario's `seed`, which seeds every client's `rate.noise`
 process: the same seed gives the same run, byte for byte; without a noise block it changes nothing.
