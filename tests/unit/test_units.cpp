@@ -322,3 +322,43 @@ TEST_CASE("parse_byte_rate refuses a bit rate without its per-second denominator
   REQUIRE(parsed.error().input == "1Gbit");
   REQUIRE_THAT(parsed.error().message, Catch::Matchers::ContainsSubstring("must end with"));
 }
+
+// ---- format_size and format_byte_rate: sizes read back in the scenario's grammar ----
+
+TEST_CASE("format_size picks the largest unit that keeps the number at least 1") {
+  REQUIRE(simsys::format_size(simsys::Bytes{0.0}) == "0B");
+  REQUIRE(simsys::format_size(simsys::Bytes{0.5}) == "0.5B");  // below a byte: still bytes
+  REQUIRE(simsys::format_size(simsys::Bytes{125e6}) == "125MB");
+  // 1e15 B, the ceiling, is a million gigabytes: GB is the largest unit, in fixed notation.
+  REQUIRE(simsys::format_size(simsys::Bytes{1e15}) == "1000000GB");
+}
+
+TEST_CASE("format_size round-trips through parse_size") {
+  for (const double bytes : {0.0, 0.5, 200.0, 2e3, 1.5e9, 125e6, 5e7, 3e8, 123456789.0, 1e15}) {
+    CAPTURE(bytes);
+    const auto text = simsys::format_size(simsys::Bytes{bytes});
+    const auto parsed = simsys::parse_size(text);
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->count == bytes);  // shortest round-trip digits: exact
+  }
+}
+
+TEST_CASE("parse_size accepts 0B: a size, not a request, so it is no error here") {
+  // The loader refuses a zero request size (`sizes:`, a step's `size:`); the grammar does not.
+  REQUIRE(simsys::parse_size("0B").value().count == 0.0);
+}
+
+TEST_CASE("format_byte_rate never prints an exponent, however large or small the rate") {
+  // An author never writes 1e+291GB/s; explain and messages print what the grammar reads.
+  for (const double bytes_per_second : {1e15, 1e300, 1e-100, 5e-324}) {
+    CAPTURE(bytes_per_second);
+    const auto text = simsys::format_byte_rate(simsys::ByteRate{bytes_per_second});
+    CAPTURE(text);
+    // C++23 std::string::contains and C++20 ends_with: yes/no questions about the text,
+    // replacing `find('e') != npos` and a compare() at size() - 3, which read as index
+    // arithmetic when all the test asks is whether the character or suffix is there.
+    REQUIRE_FALSE(text.contains('e'));
+    REQUIRE(text.ends_with("B/s"));
+  }
+  REQUIRE(simsys::format_byte_rate(simsys::ByteRate{5e9}) == "5GB/s");  // 40 Gbit/s
+}

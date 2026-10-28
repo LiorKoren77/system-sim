@@ -593,8 +593,9 @@ TEST_CASE("book/url-shortener runs its 24 hours and meets both SLOs with a 0.881
 // ---- Request sizes and link bandwidth in the shipped scenarios (phase 2c, Task 1) --------------
 //
 // `sizes:` and `bandwidth:` used to be read and ignored; the loader now types them, so a shipped
-// scenario that names an op its client does not send (or writes a size the grammar refuses) would
-// stop loading. The sizes below are each scenario's own, with the arithmetic of its unit.
+// scenario that names an op its client does not send (or writes a size the grammar refuses, or
+// 0B) would stop loading: every scenario loading (above) proves those loader rules hold for all
+// of them. The sizes below are each scenario's own, with the arithmetic of its unit.
 
 namespace {
 
@@ -645,35 +646,6 @@ TEST_CASE("book scenarios and the kv-store lab state their request sizes in byte
   // kv-store lab: 1 KB = 1e3 B.
   const auto kv = load_scenario("/labs/kv-store/scenario.yaml");
   CHECK_THAT(stated_size_of(kv, "clients", "put"), Catch::Matchers::WithinRel(1e3, 1e-12));
-}
-
-TEST_CASE("every size a shipped scenario states names an op its client sends", "[scenario]") {
-  for (const auto& file : scenario_files()) {
-    CAPTURE(file);
-    const auto s = load_or_fail(file);
-    for (const auto& node : s.nodes) {
-      if (!node.workload) continue;
-      for (const auto& [op, size] : node.workload->sizes) {
-        CAPTURE(node.id, op);
-        const auto sends = std::ranges::any_of(
-            node.workload->op_shares, [&](const auto& share) { return share.first == op; });
-        CHECK(sends);
-        CHECK(size.count > 0.0);
-      }
-    }
-  }
-}
-
-TEST_CASE("every link bandwidth a shipped scenario states is a positive byte rate", "[scenario]") {
-  for (const auto& file : scenario_files()) {
-    CAPTURE(file);
-    const auto s = load_or_fail(file);
-    for (const auto& link : s.links) {
-      if (!link.bandwidth) continue;
-      CAPTURE(link.from, link.to);
-      CHECK(link.bandwidth->bytes_per_second > 0.0);
-    }
-  }
 }
 
 // ---- Request sizes (plan 2c refinement 1, Task 2) ----
