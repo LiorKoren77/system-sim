@@ -61,6 +61,10 @@ Write for a reader who has read the book but has not studied queueing theory.
 - Module interface units stay lean: no <chrono>/<filesystem>/<format>/<print> in the global
   module fragment of an interface that imports another module (GCC 14.2 'Bad file data'
   bug, verified 2026-10-28). Heavy headers go in the implementation unit.
+- Second GCC 14.2 defect (2026-10-28): in a TU that imports a module whose global module
+  fragment includes <format> (simsys.core does, through <chrono>), a std::format spec with a
+  precision such as `{:.15g}` throws std::format_error at run time. Use std::to_chars for
+  precise numbers; plain `{}`, width and fill specs are fine.
 
 ## 4. Clean code, named patterns, TDD
 

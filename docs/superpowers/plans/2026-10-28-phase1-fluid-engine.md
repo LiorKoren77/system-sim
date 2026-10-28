@@ -32,6 +32,7 @@
 - A translation unit iterating `Flow::entries()` must `#include <span>` itself on GCC 14.
 - `Flow::add`/`scale` throw `std::invalid_argument` on negative or non-finite values; `FluidQueue::advance` throws on `dt <= 0`; `erlang_c`/`mmc_wait` throw on `servers < 1`. These are programmer errors; config validation keeps user input out.
 - `FluidQueue` reports `inf` latency for a zero-capacity node: the engine must never multiply a latency by a zero weight (skip zero-flow branches), and reports print `inf` as "unavailable".
+- GCC 14.2 (second `<format>` defect, found in the config fix round): in a TU that imports a module whose global module fragment includes `<format>` (e.g. `simsys.core` via `<chrono>`), a `std::format` spec with a precision such as `{:.15g}` throws `std::format_error` at run time. Use `std::to_chars(..., chars_format::general, 15)` for precise numbers; plain `{}` and width/fill specs work.
 - Later optimisation, not now: intern op names to an integer `OpId` at load time and index flows by it.
 
 ---
