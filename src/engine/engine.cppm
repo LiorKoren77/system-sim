@@ -77,6 +77,10 @@ class DelayLine {
 
 // One node's numbers for one step. Rates and backlog are summed over replicas (plan
 // refinement 4); rho, latency and zone are per copy, which all copies share.
+// Demand, drain, drops and backlog are in CAPACITY UNITS (per second for the rates), the
+// unit `capacity` is a rate of (phase 2a refinement 4): a request of an op with `cost` 3
+// counts three times. With every cost at its default of 1, units are requests, as in
+// phase 1. The drop ratio dropped / demand is so the share of the node's work it shed.
 struct NodeSample {
   double demand_per_s{};
   double drain_per_s{};
@@ -186,8 +190,8 @@ class Simulation {
     std::vector<std::size_t> incoming_links{};  // links delivering demand here
     std::vector<std::size_t> outgoing_links{};  // links this node sends demand on
     flow::Flow inflow{};                        // this step's arrivals
-    // Services: what one copy's queue holds, per op, in requests (not per second; Flow
-    // is reused as "a number per op"). Its total agrees with the queue's backlog to
+    // Services: what one copy's queue holds, per op, in capacity units (not per second;
+    // Flow is reused as "a number per op"). Its total agrees with the queue's backlog to
     // rounding. See serve().
     flow::Flow waiting{};
     ResponseTable responses{};
@@ -254,8 +258,8 @@ void add_once(std::vector<std::size_t>& links, std::size_t link) {
   if (!std::ranges::contains(links, link)) links.push_back(link);
 }
 
-// What one copy's queue holds during a step, per op, in requests: what was waiting plus
-// this step's arrivals (rate × dt).
+// What one copy's queue holds during a step, per op, in capacity units: what was waiting
+// plus this step's arrivals (rate × dt).
 [[nodiscard]] flow::Flow queue_content(const flow::Flow& waiting, const flow::Flow& arrivals,
                                        SimTime dt) {
   flow::Flow content = waiting;
@@ -265,10 +269,35 @@ void add_once(std::vector<std::size_t>& links, std::size_t link) {
 
 // The long-run queue of estimate(): FluidQueue::settle sets the total backlog, and in
 // the long run the queue holds the arrival mix, so each op waits in proportion to its
-// arrival rate: arrivals × backlog / demand (rate × seconds = requests).
+// arrival rate: arrivals × backlog / demand (units per second × seconds = units).
 [[nodiscard]] flow::Flow settled_waiting(const flow::Flow& arrivals, double backlog) {
   const double demand_per_s = arrivals.total().per_second;
   return demand_per_s > 0.0 ? arrivals.scaled(backlog / demand_per_s) : flow::Flow{};
+}
+
+// Requests per second -> capacity units per second: each op's rate × its cost (plan 2a
+// refinement 4). Demand in units is Σ rate_op × cost_op, the load the node's capacity
+// (a rate of units) is compared with: 300 req/s of an op of cost 3 is 900 units/s, so a
+// 1000 units/s node runs at rho = 0.9.
+[[nodiscard]] flow::Flow in_units(const flow::Flow& requests,
+                                  const behaviours::ServiceBehaviour& service) {
+  flow::Flow units;
+  for (const auto& [op, rate] : requests.entries()) {
+    units.add(op, Rate{rate.per_second * service.cost(op)});
+  }
+  return units;
+}
+
+// The inverse: units per second of each op -> requests per second (units / cost). What a
+// node forwards downstream is requests, whatever they cost here: the next node prices
+// them with its own costs.
+[[nodiscard]] flow::Flow in_requests(const flow::Flow& units,
+                                     const behaviours::ServiceBehaviour& service) {
+  flow::Flow requests;
+  for (const auto& [op, rate] : units.entries()) {
+    requests.add(op, Rate{rate.per_second / service.cost(op)});
+  }
+  return requests;
 }
 
 // A replica group of `replicas` identical copies behind an equal split (plan refinement
@@ -552,18 +581,29 @@ void Simulation::receive(std::size_t index, Mode mode) {
   }
 }
 
-// One service step: equal split over replicas, the §3.3 fluid step per copy (settled
-// first when estimating), then route what the queue drained downstream.
+// One service step: equal split over replicas, arrivals priced in capacity units, the
+// §3.3 fluid step per copy (settled first when estimating), then route what the queue
+// drained downstream, converted back to requests.
+//
+// Capacity units (plan 2a refinement 4): the queue holds WORK, not requests. An op of
+// cost c_op arriving at r_op req/s brings r_op × c_op units/s (in_units), the
+// FluidQueue serves `capacity` units/s, and everything below is in units. Only on the
+// way out does a drained op become requests again: forwarded units / c_op (in_requests).
 //
 // The FluidQueue knows only totals (one backlog number); `node.waiting` adds which ops
 // are queued. Model: the queue is well-mixed (random-order) fluid, not FIFO, and drops
-// are taken proportionally, not from the tail. Every request in it, whether it waited
-// from an earlier step or arrived in this one, is equally likely to be among the
-// drained, the dropped or the still waiting, so each part has the content's op mix:
-//   content   = waiting + arrivals × dt                     requests per op
+// are taken proportionally, not from the tail. Every unit of work in it, whether it
+// waited from an earlier step or arrived in this one, is equally likely to be among the
+// drained, the dropped or the still waiting, so each part has the content's op mix in
+// units:
+//   content   = waiting + arrivals × dt                     units per op
 //   forwarded = content × drained / content_total           drained = drain × dt
 //   dropped   = content × dropped / content_total           discarded: never propagates
 //   waiting'  = content × backlog / content_total           = content − forwarded − dropped
+// Mixing in units, not requests, means a cost-4 op takes four times the drain of a cost-1
+// op per request: ops x (cost 1) and y (cost 4) at 500 req/s each bring 500 + 2000 units/s;
+// a 1000 units/s node drains them 1:4 in units, 200 + 800 units/s, which is 200 x and 200 y
+// requests per second.
 // The totals come from FluidQueue::advance, which stays the single source of truth;
 // waiting' is computed from the backlog directly rather than by subtraction, so it
 // cannot go negative by cancellation, and its total matches the backlog to rounding.
@@ -573,14 +613,15 @@ void Simulation::receive(std::size_t index, Mode mode) {
 // With a constant op mix the order makes no difference; once phase 2's rate curves vary
 // the mix, a FIFO queue would forward the old mix first and this one forwards a blend.
 // Ignored: FIFO order, tail drop (a full real queue rejects the newest arrivals),
-// priorities and per-op service times.
+// priorities and per-op service times (a costly op uses more capacity, not a longer
+// sojourn: see ServiceBehaviour).
 behaviours::Routed Simulation::serve(std::size_t index, const behaviours::ServiceBehaviour& service,
                                      SimTime dt, Mode mode, NodeSample& sample) {
   auto& node = nodes_[index];
   auto& queue = *node.queue;  // every service has a queue (make_node)
   // Replicas (plan refinement 4): `waiting` and the queue describe one copy, which sees
   // 1/replicas of the arrivals; take_drained scales the forwarded flow back to the group.
-  const flow::Flow arrivals = node.inflow.scaled(1.0 / node.replicas);
+  const flow::Flow arrivals = in_units(node.inflow, service).scaled(1.0 / node.replicas);
   const Rate per_replica = arrivals.total();
   if (mode == Mode::settle) {
     queue.settle(per_replica);
@@ -589,17 +630,17 @@ behaviours::Routed Simulation::serve(std::size_t index, const behaviours::Servic
   const flow::Flow content = queue_content(node.waiting, arrivals, dt);
   const fluid::FluidStep copy_step = queue.advance(per_replica, dt);
   sample = group_sample(copy_step, node.replicas);
-  return service.route(take_drained(node, content, copy_step));
+  return service.route(in_requests(take_drained(node, content, copy_step), service));
 }
 
 // Splits one copy's content (see serve) by the totals of its fluid step: keeps the
 // still-waiting part in `node.waiting` and returns the drained part as the group's
-// forwarded rate per op, content × (drain_per_s × replicas) / content_total: the
-// drained requests per copy (drain × dt) over dt, times the copies. An empty queue with
+// forwarded rate per op in units, content × (drain_per_s × replicas) / content_total:
+// the drained units per copy (drain × dt) over dt, times the copies. An empty queue with
 // no arrivals has nothing to split.
 flow::Flow Simulation::take_drained(Node& node, const flow::Flow& content,
                                     const fluid::FluidStep& copy_step) {
-  const double content_total = content.total().per_second;  // requests, see Node::waiting
+  const double content_total = content.total().per_second;  // units, see Node::waiting
   if (content_total <= 0.0) {
     node.waiting.clear();
     return flow::Flow{};

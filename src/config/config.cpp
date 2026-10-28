@@ -13,6 +13,7 @@ module;
 #include <expected>
 #include <format>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -101,8 +102,8 @@ constexpr std::array<OwnKeys, model::node_type_names.size()> own_keys_by_type{{
     {model::NodeType::cdn, "ttl hit_ratio origin"},
     {model::NodeType::load_balancer, "policy vnodes"},
     {model::NodeType::rate_limiter, "algorithm limit burst backend"},
-    {model::NodeType::service, "ops"},
-    {model::NodeType::cache, "eviction strategy keys hit_ratio backend ttl then"},
+    {model::NodeType::service, "ops cost"},
+    {model::NodeType::cache, "eviction strategy keys hit_ratio backend ttl then cost"},
     {model::NodeType::sql_db, "replication_lag shards pool"},
     {model::NodeType::kv_cluster, "nodes vnodes replication write_quorum read_quorum mode"},
     {model::NodeType::message_queue, "partitions retention"},
@@ -1066,6 +1067,47 @@ CheckResult read_advanced(const Site& site, const YAML::Node& body, model::NodeS
   return check_thresholds_ordered(site, advanced, node);
 }
 
+// ---- Per-op cost (plan 2a refinement 4) ----
+
+// The types whose `cost` is a map op -> capacity units. A worker_pool's `cost` is a
+// different key with the same spelling (a duration per job, read in phase 2c), so the
+// reader is chosen by type, not by the key alone.
+bool has_cost_map(model::NodeType type) {
+  return type == model::NodeType::service || type == model::NodeType::cache;
+}
+
+// One `op: units` entry. Positive (a free op would be served without using capacity, and
+// a negative one would give capacity back) and finite (an op that never finishes is a
+// capacity of zero, which the capacity key already says).
+std::expected<std::pair<std::string, double>, ConfigError> read_cost_entry(
+    const Site& site, const YamlElement& entry) {
+  auto op = read_op_name(site, entry.first, "cost op");
+  if (!op) return std::unexpected(op.error());
+  const auto label = std::format("cost '{}'", *op);
+  if (auto checked = check_entry_not_null(site, entry, label); !checked) {
+    return std::unexpected(checked.error());
+  }
+  const auto units = number_value(entry.second);
+  if (units && is_positive(*units)) return std::pair{std::move(*op), *units};
+  return site.fail(entry.second, std::format("{} must be a positive finite number", label));
+}
+
+// `cost: {write: 3, read: 1}`: the capacity units one request of each op consumes; ops
+// not listed cost 1 (model::NodeSpec::cost).
+CheckResult read_cost(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  const auto cost = body["cost"];
+  if (!cost || !has_cost_map(node.type)) return {};
+  if (auto checked = check_not_null(site, body, "cost", "cost", empty_map); !checked) {
+    return checked;
+  }
+  if (!cost.IsMap()) return site.fail(cost, "cost must be a map of op to units");
+  auto entries =
+      collect_each(cost, [&](const YamlElement& entry) { return read_cost_entry(site, entry); });
+  if (!entries) return std::unexpected(entries.error());
+  node.cost = {std::make_move_iterator(entries->begin()), std::make_move_iterator(entries->end())};
+  return {};
+}
+
 // The keys every node type shares. `ops`, `then` and the node references (backend, ...)
 // are read in the second pass, once every id is known.
 CheckResult read_common_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node,
@@ -1120,6 +1162,9 @@ std::expected<model::NodeSpec, ConfigError> read_node_declaration(const Site& si
   // other types' own keys in a later step.
   model::NodeSpec node{.id = *name, .type = *type};
   if (auto read = read_common_keys(this_node, entry.second, node, datacenters); !read) {
+    return std::unexpected(read.error());
+  }
+  if (auto read = read_cost(this_node, entry.second, node); !read) {
     return std::unexpected(read.error());
   }
   return node;

@@ -615,6 +615,15 @@ template <class T, class F>
   return join(parts, "  ");
 }
 
+// "cost: read 1, write 3" (ops sorted by name), or nothing when every op costs the
+// default one unit.
+[[nodiscard]] std::string cost_summary(const model::NodeSpec& spec) {
+  if (spec.cost.empty()) return {};
+  std::vector<std::string> entries;
+  for (const auto& [op, units] : spec.cost) entries.push_back(op + " " + num(units, 6));
+  return "  cost: " + join(entries, ", ");
+}
+
 [[nodiscard]] std::string server_details(const graph::ResolvedNode& node) {
   const auto& spec = node.spec;
   const auto& cap = node.capacity;
@@ -637,7 +646,7 @@ template <class T, class F>
       "queue_limit=" + num(cap.queue_limit, 6) + " " + std::string{provenance(queue_source)},
       "variability=" + num(cap.service_variability, 3),
       "burstiness=" + num(cap.burstiness, 3)};
-  return join(parts, "  ");
+  return join(parts, "  ") + cost_summary(spec);
 }
 
 [[nodiscard]] std::string explain_nodes(const graph::Graph& g) {
@@ -718,6 +727,14 @@ using OpLoad = std::map<std::string, double, std::less<>>;
   return load;
 }
 
+// Capacity units one request of `op` uses at a node: its `cost` entry, else 1. The same
+// rule as behaviours::ServiceBehaviour::cost, read off the spec because explain runs on
+// any graph, including types the engine does not simulate yet.
+[[nodiscard]] double cost_of(const model::NodeSpec& spec, const std::string& op) {
+  const auto found = spec.cost.find(op);
+  return found == spec.cost.end() ? 1.0 : found->second;
+}
+
 // Forwards what reached node `from` along its unconditional `ops` steps (rate × factor),
 // as ServiceBehaviour::route does. Flow over a feedback link goes to `fed_back`: its
 // target came earlier in the order, so it counts in the next pass.
@@ -755,7 +772,9 @@ struct PaperLoad {
 
 // One pass: what the clients send plus what the feedback links carried in the previous
 // pass (`fed_back`, replaced by this pass's), pushed through every node in topological
-// order. Returns the total offered rate per node.
+// order. Returns the total offered load per node in capacity units (Σ rate_op × cost_op,
+// plan 2a refinement 4), the quantity the node's capacity is a rate of. Forwarding stays
+// in requests: a cost prices work at one node, it does not multiply requests.
 [[nodiscard]] std::vector<double> paper_pass(const graph::Graph& g,
                                              const std::vector<OpLoad>& offered,
                                              std::vector<OpLoad>& fed_back) {
@@ -767,10 +786,13 @@ struct PaperLoad {
   for (const auto index : g.topological_order()) forward_steps(g, index, load, next_fed_back);
   fed_back = std::move(next_fed_back);
   std::vector<double> totals;
-  for (const auto& ops : load) {
-    // C++23 std::ranges::fold_left over C++20 std::views::values: sum the rates of a map
-    // without a hand-written loop (and without std::accumulate's int-initial-value trap).
-    totals.push_back(std::ranges::fold_left(ops | std::views::values, 0.0, std::plus<>{}));
+  for (std::size_t i = 0; i < load.size(); ++i) {
+    const auto& spec = g.nodes()[i].spec;
+    // C++23 std::ranges::fold_left: a left fold over a range, without a hand-written loop
+    // (and without std::accumulate's int-initial-value trap); each op weighed by its cost.
+    totals.push_back(std::ranges::fold_left(load[i], 0.0, [&](double sum, const auto& entry) {
+      return sum + entry.second * cost_of(spec, entry.first);
+    }));
   }
   return totals;
 }
@@ -811,7 +833,7 @@ struct PaperLoad {
 }
 
 // Utilization at the paper load: offered / (capacity per replica × replicas), with the
-// node's own zone thresholds.
+// node's own zone thresholds. Both are in capacity units (requests when every cost is 1).
 [[nodiscard]] std::string check_details(const graph::ResolvedNode& node, double offered) {
   const double total_capacity = node.capacity.service_rate.per_second * node.spec.replicas;
   const std::string head =
@@ -866,6 +888,10 @@ void Summary::Moments::add(double w, double mean_s, double variance_s2) {
   weighted_square += w * (variance_s2 + mean_s * mean_s);
 }
 
+// Demand, drops and backlog arrive in capacity units (engine::NodeSample): a request of
+// an op with `cost` 3 counts three times. The tables keep their column names; with every
+// cost at its default of 1, units are requests. A node's drop rate is so the share of the
+// work it was sent that it shed, the same ratio when costs are uniform.
 void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
   rho_time += sample.rho * dt_s;
   demand += sample.demand_per_s * dt_s;

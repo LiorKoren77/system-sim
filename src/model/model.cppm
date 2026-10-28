@@ -198,7 +198,14 @@ struct NodeSpec {
   Advanced advanced{};
   std::map<std::string, std::vector<Step>> ops{};  // incoming op -> steps (service, ws_gateway)
   std::vector<Step> then{};                        // steps after processing (workers, caches...)
-  std::optional<Workload> workload{};              // clients only
+  // Capacity units one request of an op consumes (plan 2a refinement 4; service, cache):
+  // `capacity` is then a rate of units, and a `write` of cost 3 uses three times the
+  // capacity of a `read` of cost 1. An op not listed costs 1, so an empty map is the
+  // phase-1 node where every request costs the same. Declared after ops/then so that
+  // designated initializers, which must follow declaration order, can write
+  // `{..., .ops = ..., .cost = ...}`.
+  std::map<std::string, double> cost{};
+  std::optional<Workload> workload{};  // clients only
 };
 
 // One row of a name table: an enumerator and the word the scenario schema spells it
