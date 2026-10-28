@@ -357,6 +357,11 @@ struct Step {
   StepCondition on{StepCondition::always};  // `miss`: only cache misses go on (ch. 1 cache)
   StepMode mode{StepMode::sequential};
   double factor{1.0};  // fan-out: one post -> 100 feed writes (ch. 11 news feed)
+  // The payload this step's request carries (plan 2c refinement 1), when the step states one:
+  // a worker or service that sends bytes of its own, such as ch. 14's transcoders writing a
+  // 50 MB rendition to the blob store. Absent: the request keeps its incoming size while it
+  // keeps its op name, and a renamed op is unsized (the graph resolves this in phase 2c).
+  std::optional<Bytes> size{};
 };
 
 // The `advanced:` block. Optionals: absent means "use the type default" (simsys.defaults).
@@ -411,6 +416,13 @@ struct Workload {
   // which keys it asks for (fine unless a `che` cache downstream needs to know).
   std::optional<KeySpec> keys{};
   std::optional<SimTime> timeout{};
+  // The size of one request of each op the client sends, for the ops that carry bytes (plan
+  // 2c refinement 1, `sizes:` on a client): ch. 14 YouTube's 50 MB stream and 300 MB upload,
+  // ch. 15 Google Drive's 500 KB average file. An op not listed is unsized, which only a
+  // byte-sized node or a bandwidth link minds; a request-counting node never needs a size.
+  // Each size is the op's mean: the model ignores a size distribution, headers and protocol
+  // overhead, and compression. Sorted by op, like op_shares.
+  std::map<std::string, Bytes> sizes{};
 };
 
 struct NodeSpec {
@@ -552,6 +564,11 @@ struct LinkSpec {
   std::vector<std::string> ops{};    // empty = all ops
   std::optional<SimTime> latency{};  // one-way; absent -> datacenter default
   double weight{1.0};                // share when several links carry the same op
+  // The bytes per second the network hop can carry (spec section 3.4: a link's bandwidth "caps
+  // bytes/s and queues the excess like a node"), written in bytes or, as a network is rated,
+  // in bits (40Gbit/s = 5e9 B/s). Absent: the link only adds its latency, the pipe is never the
+  // constraint. Typed by the loader now; the engine models the pipe in phase 2c (Task 5).
+  std::optional<ByteRate> bandwidth{};
 };
 
 // drop_rate and reject_rate are two different promises: a drop is a node FAILING (its

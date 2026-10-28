@@ -141,6 +141,16 @@ struct ByteRate {
   auto operator<=>(const ByteRate&) const = default;
 };
 
+// A size in bytes: one request's payload (ch. 14 YouTube's 50 MB stream and 300 MB upload,
+// ch. 15 Google Drive's 500 KB average file). A third strong type beside Rate and ByteRate, so
+// a size cannot be passed where a throughput is expected, nor a throughput where a size is:
+// sizes divide byte rates into request rates (2k streams/s of 50 MB fill 100 GB/s), and mixing
+// the two would be a silent unit error. A double, as the byte rates it is divided into.
+struct Bytes {
+  double count;
+  auto operator<=>(const Bytes&) const = default;
+};
+
 struct ParseError {
   std::string input;
   std::string message;
@@ -161,8 +171,8 @@ struct Scale {
 };
 
 // Pattern: Table-driven method (Code Complete) — each grammar (duration units,
-// request-rate prefixes, byte-rate prefixes) is a constant table searched by one
-// function, so adding a unit is a one-line data change instead of another `if` branch.
+// request-rate prefixes, byte-rate prefixes, size units) is a constant table searched by
+// one function, so adding a unit is a one-line data change instead of another `if` branch.
 constexpr std::array duration_units{Scale{"ns", 1.0}, Scale{"us", 1e3}, Scale{"ms", 1e6},
                                     Scale{"s", 1e9},  Scale{"m", 60e9}, Scale{"h", 3600e9}};
 constexpr std::array rate_prefixes{Scale{"", 1.0}, Scale{"k", 1e3}, Scale{"M", 1e6},
@@ -172,6 +182,20 @@ constexpr std::array rate_prefixes{Scale{"", 1.0}, Scale{"k", 1e3}, Scale{"M", 1
 // capital `K` for request rates), and the error message says which spelling to use.
 constexpr std::array byte_prefixes{Scale{"", 1.0}, Scale{"K", 1e3}, Scale{"M", 1e6},
                                    Scale{"G", 1e9}};
+// Sizes take the byte-rate prefixes with the B written: 1 KB = 1000 B, never 1024. Decimal
+// because the book's back-of-the-envelope estimates round each power of two to a power of
+// ten (ch. 2: 2^10 is "a thousand", a KB), and the cloud vendors' storage and network
+// rates are decimal (a "1 Gbit/s" port is 1e9 bit/s). Binary units (KiB = 1024 B) are
+// refused rather than silently read as their decimal neighbour (2.4% off; 7.4% for GiB).
+constexpr std::array size_units{Scale{"B", 1.0}, Scale{"KB", 1e3}, Scale{"MB", 1e6},
+                                Scale{"GB", 1e9}};
+// The largest size a scenario may state: 1e15 B, a petabyte. Chosen, not from the book: it is
+// the loader's ceiling on a rate and a byte rate (1e15/s, 1e15 B/s), and six orders of
+// magnitude above the book's largest object (ch. 14's 300 MB upload), while a size times the
+// largest rate (1e15 B x 1e15/s = 1e30 B/s) is still far from a double's limit (~1.8e308).
+inline constexpr double max_size_bytes = 1e15;
+// A network is rated in bits per second and a byte is 8 bits: 1 Gbit/s carries 1.25e8 B/s.
+inline constexpr double bits_per_byte = 8.0;
 
 // C++23 std::unexpected<E>: wraps an error so it can be returned through a
 // std::expected<T, E>; the caller gets `.error()` instead of an exception.
@@ -289,6 +313,39 @@ split_non_negative_number(std::string_view text, std::string_view input) {
   return scaled + 0.0;
 }
 
+// The units of a table as a sentence lists them: {B, KB, MB, GB} -> "B, KB, MB or GB".
+// Derived from the table, as list_prefixes is, so the message cannot go stale.
+[[nodiscard]] std::string list_units(std::span<const Scale> table) {
+  std::string listed;
+  for (std::size_t i = 0; i < table.size(); ++i) {
+    if (i > 0) listed += i + 1 == table.size() ? " or " : ", ";
+    listed += table[i].suffix;
+  }
+  return listed;
+}
+
+// Every parse_size error ends with the grammar, so an author who wrote `10` or `1KiB` learns
+// what to write instead.
+[[nodiscard]] ParseError with_size_grammar(ParseError error) {
+  error.message += "; a size is a number and " + list_units(size_units) + " (50MB)";
+  return error;
+}
+
+// How many bytes one size `unit` holds.
+[[nodiscard]] std::expected<double, ParseError> bytes_per(std::string_view unit,
+                                                          std::string_view input) {
+  if (unit.empty()) return fail(input, "missing size unit");
+  if (auto factor = find_scale(size_units, unit)) return *factor;
+  return fail(input, "unknown size unit '" + std::string{unit} + "'");
+}
+
+// At most max_size_bytes. `+ 0.0` turns "-0B" into +0 B, as in parse_scaled_number.
+[[nodiscard]] std::expected<double, ParseError> require_size_in_range(double bytes,
+                                                                      std::string_view input) {
+  if (bytes > max_size_bytes) return fail(input, "size must be at most 1e15B");
+  return bytes + 0.0;
+}
+
 // "09" -> 9. Exactly two ASCII digits, nothing else. std::from_chars alone would also
 // accept "-5" (a sign), so the digit check comes first; from_chars then does the
 // conversion without locale lookups or allocation.
@@ -361,12 +418,33 @@ export namespace simsys {
       .transform([](double v) { return Rate{v}; });
 }
 
-// "500MB/s" -> ByteRate{5e8}. Accepts the prefixes "", K, M, G before "B/s".
+// "500MB/s" -> ByteRate{5e8}. Accepts the prefixes "", K, M, G before "B/s". A network's
+// rate may be written in bits instead: "40Gbit/s" -> ByteRate{5e9} (bytes = bits / 8), with
+// the SI prefixes "", k, M, G of a request rate, as networks are rated (kbit/s, Gbit/s).
 [[nodiscard]] std::expected<ByteRate, ParseError> parse_byte_rate(std::string_view text) {
+  if (text.ends_with("bit/s")) {
+    const auto number_text = text.substr(0, text.size() - 5);  // drop "bit/s"
+    return detail::parse_scaled_number(number_text, text, detail::rate_prefixes)
+        .transform([](double bits) { return ByteRate{bits / detail::bits_per_byte}; });
+  }
   if (!text.ends_with("B/s")) return detail::fail(text, "byte rate must end with 'B/s'");
   const auto number_text = text.substr(0, text.size() - 3);  // drop "B/s"
   return detail::parse_scaled_number(number_text, text, detail::byte_prefixes)
       .transform([](double v) { return ByteRate{v}; });
+}
+
+// "50MB" -> Bytes{5e7}: a non-negative number and one of B, KB, MB, GB (decimal), at most
+// 1e15 B. Three steps, as parse_duration: split off the number, look the unit up, check the
+// range; every error states the grammar (with_size_grammar).
+[[nodiscard]] std::expected<Bytes, ParseError> parse_size(std::string_view text) {
+  auto split = detail::split_non_negative_number(text, text);
+  if (!split) return std::unexpected(detail::with_size_grammar(split.error()));
+  auto [value, unit] = *split;
+  auto scale = detail::bytes_per(unit, text);
+  if (!scale) return std::unexpected(detail::with_size_grammar(scale.error()));
+  auto bytes = detail::require_size_in_range(value * *scale, text);
+  if (!bytes) return std::unexpected(detail::with_size_grammar(bytes.error()));
+  return Bytes{*bytes};
 }
 
 }  // namespace simsys
