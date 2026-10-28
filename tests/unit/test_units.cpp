@@ -180,3 +180,33 @@ TEST_CASE("simsys time literals equal their std::chrono counterparts") {
   static_assert(2_s == 2s);
   REQUIRE(7_ns == 7ns);
 }
+
+TEST_CASE("parse_clock_time reads HH:MM as an offset from midnight") {
+  // Simulated time starts at 00:00 (phase 2a refinement 1), so a clock time is a duration.
+  REQUIRE(simsys::parse_clock_time("00:00").value() == 0s);
+  REQUIRE(simsys::parse_clock_time("20:00").value() == 20h);
+  REQUIRE(simsys::parse_clock_time("09:30").value() == 9h + 30min);
+  REQUIRE(simsys::parse_clock_time("23:59").value() == 23h + 59min);
+}
+
+TEST_CASE("parse_clock_time rejects malformed and out-of-range times with a structured error") {
+  require_rejected(simsys::parse_clock_time("24:00"), "24:00", "hour must be 00-23");
+  require_rejected(simsys::parse_clock_time("12:60"), "12:60", "minute must be 00-59");
+  require_rejected(simsys::parse_clock_time("1200"), "1200", "expected HH:MM");
+  require_rejected(simsys::parse_clock_time("12:0"), "12:0", "expected HH:MM");
+  require_rejected(simsys::parse_clock_time("ab:cd"), "ab:cd", "expected HH:MM");
+}
+
+TEST_CASE("parse_time_point accepts a clock time or a duration") {
+  // `at:` and `peak_at:` take either form; both yield an offset from midnight (t = 0).
+  REQUIRE(simsys::parse_time_point("12:00").value() == 12h);
+  REQUIRE(simsys::parse_time_point("5m").value() == 5min);
+  require_rejected(simsys::parse_time_point("noon"), "noon", "expected HH:MM or a duration");
+}
+
+TEST_CASE("simsys minute and hour literals equal their std::chrono counterparts") {
+  using namespace simsys::literals;
+  static_assert(5_min == 5min);
+  static_assert(24_h == 24h);
+  SUCCEED();
+}
