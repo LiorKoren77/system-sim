@@ -23,6 +23,7 @@ module;
 #include <cmath>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <span>
@@ -186,6 +187,20 @@ class ServiceBehaviour {
   // building a std::string for every lookup.
   std::map<std::string, std::vector<Hop>, std::less<>> hops_by_op_;
 };
+
+// The seed of client `index`'s noise process (spec phase 2a refinement 3): one
+// std::mt19937_64 per client, so adding a client never changes another client's noise.
+// The scenario seed is multiplied by 0x9E3779B97F4A7C15, 2^64 divided by the golden ratio,
+// the increment of the splitmix64 generator: the multiplication (mod 2^64) spreads
+// consecutive seeds across all 64 bits, so seeds 1 and 2 start unrelated streams instead
+// of engines whose states differ in one low bit. XOR with the node index then separates
+// the clients of one scenario. The engine (Task 6) and `simsys curve --noise` both call
+// this, so the curve command prints exactly the noise a run will use.
+inline constexpr std::uint64_t golden_ratio_increment = 0x9E3779B97F4A7C15;
+
+[[nodiscard]] constexpr std::uint64_t client_seed(int seed, std::size_t index) {
+  return (static_cast<std::uint64_t>(seed) * golden_ratio_increment) ^ std::uint64_t{index};
+}
 
 // Models: the "User" box at the top of every System Design Interview diagram — web and
 // mobile clients as one aggregate source of load (ch. 1; the ch. 2 back-of-the-envelope
@@ -369,7 +384,7 @@ Routed ServiceBehaviour::route(const flow::Flow& in) const {
 ClientBehaviour::ClientBehaviour(const graph::Graph& g, std::size_t self) {
   const auto& workload = g.nodes()[self].spec.workload;
   if (!workload) return;  // a client without a workload offers nothing
-  base_ = workload->base;
+  base_ = workload->curve.base;
   for (const auto& [op, share] : workload->op_shares) ops_.push_back(op);
   std::ranges::sort(ops_);
   for (const auto& route : g.client_routes(self)) {

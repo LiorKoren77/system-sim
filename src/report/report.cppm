@@ -151,6 +151,10 @@ class Summary {
                                        bool color);
 // For programs: the same content as JSON (two-space indent, seconds, null for infinity).
 [[nodiscard]] std::string render_json(const Summary& summary, std::span<const SloResult> slos);
+// A number for machines (CSV): the shortest text that reads back to the same double (0.1,
+// 2, 4000), locale-independent (std::to_chars). `simsys curve` prints its columns with it.
+[[nodiscard]] std::string format_number(double value);
+
 // `simsys explain`: every resolved number with its provenance, the links, the step order
 // and a static load check (offered load vs capacity, no queueing).
 [[nodiscard]] std::string render_explain(const graph::Graph& g);

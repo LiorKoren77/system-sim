@@ -38,14 +38,15 @@ Scenario mm1(double demand, std::optional<double> queue_limit = std::nullopt) {
   // declaration order, and leaves the rest at their defaults. Replaces positional braces,
   // which break silently when members are reordered; a scenario reads like its YAML.
   Scenario s{.name = "mm1", .version = 1, .duration = 2s, .warmup = 500ms};
-  s.nodes = {NodeSpec{.id = "c",
-                      .type = NodeType::client,
-                      .workload = Workload{.base = Rate{demand}, .op_shares = {{"op", 1.0}}}},
-             NodeSpec{.id = "s",
-                      .type = NodeType::service,
-                      .capacity = Rate{1000},
-                      .latency = 1ms,
-                      .advanced = {.queue_limit = queue_limit}}};
+  s.nodes = {
+      NodeSpec{.id = "c",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{demand}}, .op_shares = {{"op", 1.0}}}},
+      NodeSpec{.id = "s",
+               .type = NodeType::service,
+               .capacity = Rate{1000},
+               .latency = 1ms,
+               .advanced = {.queue_limit = queue_limit}}};
   s.links = {simsys::model::LinkSpec{
       .from = "c", .to = "s", .dir = simsys::model::Direction::inout, .latency = 0s}};
   return s;
@@ -59,7 +60,7 @@ Scenario fan_out() {
   s.nodes = {
       NodeSpec{.id = "users",
                .type = NodeType::client,
-               .workload = Workload{.base = Rate{100}, .op_shares = {{"post", 1.0}}}},
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"post", 1.0}}}},
       NodeSpec{.id = "api",
                .type = NodeType::service,
                .capacity = Rate{10'000},
@@ -74,17 +75,18 @@ Scenario fan_out() {
 // job back to `a`. A loop of gain `gain`: a's offered load is 100 / (1 - gain).
 Scenario loop(double gain) {
   Scenario s{.name = "loop", .version = 1, .duration = 10s};
-  s.nodes = {NodeSpec{.id = "users",
-                      .type = NodeType::client,
-                      .workload = Workload{.base = Rate{100}, .op_shares = {{"msg", 1.0}}}},
-             NodeSpec{.id = "a",
-                      .type = NodeType::service,
-                      .capacity = Rate{10'000},
-                      .ops = {{"msg", {Step{.to = "b", .op = "job", .factor = gain}}}}},
-             NodeSpec{.id = "b",
-                      .type = NodeType::service,
-                      .capacity = Rate{10'000},
-                      .ops = {{"job", {Step{.to = "a", .op = "msg"}}}}}};
+  s.nodes = {
+      NodeSpec{.id = "users",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"msg", 1.0}}}},
+      NodeSpec{.id = "a",
+               .type = NodeType::service,
+               .capacity = Rate{10'000},
+               .ops = {{"msg", {Step{.to = "b", .op = "job", .factor = gain}}}}},
+      NodeSpec{.id = "b",
+               .type = NodeType::service,
+               .capacity = Rate{10'000},
+               .ops = {{"job", {Step{.to = "a", .op = "msg"}}}}}};
   s.links = {LinkSpec{.from = "users", .to = "a", .dir = simsys::model::Direction::inout},
              LinkSpec{.from = "a", .to = "b"}, LinkSpec{.from = "b", .to = "a"}};
   return s;

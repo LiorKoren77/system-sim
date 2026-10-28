@@ -8,11 +8,14 @@
 #include <CLI/CLI.hpp>
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <generator>
 #include <optional>
 #include <print>
 #include <span>
@@ -27,11 +30,13 @@
 // redefinition errors when a std header is #included after importing a module that
 // included the same header in its global module fragment.
 import simsys.core;
+import simsys.behaviours; // client_seed: the noise seed the engine gives each client
 import simsys.config;
 import simsys.engine;
 import simsys.graph;
 import simsys.model;
 import simsys.report;
+import simsys.workload;
 
 // Every engine call below lives in a named helper, never in main()'s body: GCC 14.2 at
 // -O2 crashes ("in ipa_comdats") when Graph::build, Simulation::create and step are
@@ -255,6 +260,134 @@ int run_scenario(const std::filesystem::path& file, const RunArgs& args,
   return print_report(summary, options);
 }
 
+// What `curve` takes beyond the file.
+struct CurveArgs {
+  std::string client{};
+  std::string step{"1m"};
+  std::optional<std::string> until{};  // default: the scenario's duration
+  std::optional<int> seed{};           // default: the scenario's seed
+  bool noise{};
+};
+
+// A client node and its index among the scenario's nodes: the index the graph and the
+// engine use (Graph keeps the scenario's node order), from which its noise seed derives.
+struct ClientRef {
+  const simsys::model::NodeSpec* spec;
+  std::size_t index;
+};
+
+// "a service", "an id_generator".
+std::string_view article_for(std::string_view noun) {
+  // C++23 std::string_view::contains: a yes/no membership test, replacing the
+  // `find(c) != npos` comparison that reads as index arithmetic.
+  return std::string_view{"aeiou"}.contains(noun.front()) ? "an" : "a";
+}
+
+// The client `id` names, or the message to print.
+std::expected<ClientRef, std::string> find_client(const std::filesystem::path& file,
+                                                  const simsys::model::Scenario& scenario,
+                                                  std::string_view id) {
+  for (std::size_t i = 0; i < scenario.nodes.size(); ++i) {
+    const auto& node = scenario.nodes[i];
+    if (node.id != id) continue;
+    if (node.type == simsys::model::NodeType::client && node.workload) return ClientRef{&node, i};
+    const auto type = simsys::model::to_string(node.type);
+    return std::unexpected(std::format("{}: error: '{}' is {} {}, not a client", file.string(), id,
+                                       article_for(type), type));
+  }
+  return std::unexpected(std::format("{}: error: no client '{}'", file.string(), id));
+}
+
+// A duration option of `curve` (`--step`, `--until`), echoed in its message as typed.
+std::expected<simsys::SimTime, std::string> curve_duration(const std::filesystem::path& file,
+                                                           std::string_view option,
+                                                           const std::string& text) {
+  const auto parsed = simsys::parse_duration(text);
+  if (!parsed) {
+    return std::unexpected(std::format("{}: error: {} '{}': {}", file.string(), option,
+                                       parsed.error().input, parsed.error().message));
+  }
+  return *parsed;
+}
+
+// The sampling grid of `curve`: a positive step, and an end (exclusive) that defaults to
+// the scenario's duration.
+struct CurveGrid {
+  simsys::SimTime step;
+  simsys::SimTime until;
+};
+
+std::expected<CurveGrid, std::string> curve_grid(const std::filesystem::path& file,
+                                                 const simsys::model::Scenario& scenario,
+                                                 const CurveArgs& args) {
+  const auto step = curve_duration(file, "--step", args.step);
+  if (!step) return std::unexpected(step.error());
+  if (step->count() <= 0) {
+    return std::unexpected(std::format("{}: error: --step must be positive", file.string()));
+  }
+  if (!args.until) return CurveGrid{.step = *step, .until = scenario.duration};
+  return curve_duration(file, "--until", *args.until).transform([&](simsys::SimTime until) {
+    return CurveGrid{.step = *step, .until = until};
+  });
+}
+
+// The client's curve as a lazy stream of samples: the deterministic curve, or with
+// `--noise` the curve times the client's noise process, seeded exactly as the engine seeds
+// it (behaviours::client_seed), so the printed noise is the noise a run will see.
+// C++23 std::generator<T> (from <generator>): a coroutine-backed, lazy, single-pass range.
+// simsys.workload produces samples one co_yield at a time; this file only iterates the
+// range, so a day at 1 s steps (86 400 rows) is printed without ever being stored. The
+// pre-C++23 way was a std::vector filled up front or a callback parameter.
+std::expected<std::generator<simsys::workload::Sample>, std::string> curve_samples(
+    const std::filesystem::path& file, const simsys::model::Scenario& scenario,
+    const ClientRef& client, const CurveArgs& args, const CurveGrid& grid) {
+  const auto& workload = *client.spec->workload;
+  if (!args.noise) return simsys::workload::samples(workload.curve, grid.step, grid.until);
+  if (!workload.noise) {
+    return std::unexpected(
+        std::format("{}: error: client '{}' has no noise block", file.string(), client.spec->id));
+  }
+  const auto seed =
+      simsys::behaviours::client_seed(args.seed.value_or(scenario.seed), client.index);
+  return simsys::workload::samples(workload.curve, grid.step, grid.until, *workload.noise, seed);
+}
+
+// One CSV row per sample, numbers in their shortest round-trip form (simsys.report: this
+// file never formats doubles itself, see the note at the top).
+void print_samples(std::generator<simsys::workload::Sample>& samples) {
+  std::println("t_s,rate_per_s");
+  for (const auto& sample : samples) {
+    std::println("{},{}", report::format_number(simsys::seconds(sample.t)),
+                 report::format_number(sample.rate.per_second));
+  }
+}
+
+// `simsys curve <file> <client>`: the client's offered rate over time as CSV, for a plot.
+int run_curve(const std::filesystem::path& file, const CurveArgs& args) {
+  const auto scenario = simsys::config::load(file.string());
+  if (!scenario) {
+    print_error(describe(scenario.error()));
+    return 1;
+  }
+  const auto client = find_client(file, *scenario, args.client);
+  if (!client) {
+    print_error(client.error());
+    return 1;
+  }
+  const auto grid = curve_grid(file, *scenario, args);
+  if (!grid) {
+    print_error(grid.error());
+    return 1;
+  }
+  auto samples = curve_samples(file, *scenario, *client, args, *grid);
+  if (!samples) {
+    print_error(samples.error());
+    return 1;
+  }
+  print_samples(*samples);
+  return 0;
+}
+
 // The options `estimate` and `run` share.
 void add_report_options(CLI::App& command, ReportOptions& options) {
   command.add_option("--report", options.format, "output format: table (default) or json")
@@ -285,6 +418,17 @@ int main(int argc, char** argv) {
         ->required()
         ->check(CLI::ExistingFile);
   }
+  CurveArgs curve_args;
+  auto* curve = app.add_subcommand("curve", "print a client's rate curve as CSV (t_s,rate_per_s)");
+  curve->add_option("file", scenario_file, "scenario YAML file")
+      ->required()
+      ->check(CLI::ExistingFile);
+  curve->add_option("client", curve_args.client, "id of a client node")->required();
+  curve->add_option("--step", curve_args.step, "time between samples (default 1m)");
+  curve->add_option("--until", curve_args.until,
+                    "end of the curve, exclusive (default: scenario's duration)");
+  curve->add_option("--seed", curve_args.seed, "noise seed (default: scenario's seed)");
+  curve->add_flag("--noise", curve_args.noise, "multiply in the client's seeded noise");
   add_report_options(*estimate, report_options);
   add_report_options(*run, report_options);
   run->add_option("--duration", run_args.duration,
@@ -304,5 +448,6 @@ int main(int argc, char** argv) {
   if (explain->parsed()) return run_explain(scenario_file);
   if (estimate->parsed()) return run_estimate(scenario_file, report_options);
   if (run->parsed()) return run_scenario(scenario_file, run_args, report_options);
+  if (curve->parsed()) return run_curve(scenario_file, curve_args);
   return 0;
 }

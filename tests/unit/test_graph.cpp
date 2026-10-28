@@ -41,7 +41,7 @@ namespace {
 NodeSpec client(std::string id, Rate base, std::vector<std::pair<std::string, double>> ops) {
   return NodeSpec{.id = std::move(id),
                   .type = NodeType::client,
-                  .workload = Workload{.base = base, .op_shares = std::move(ops)}};
+                  .workload = Workload{.curve = {.base = base}, .op_shares = std::move(ops)}};
 }
 NodeSpec service(std::string id, std::map<std::string, std::vector<Step>> ops = {}) {
   return NodeSpec{.id = std::move(id), .type = NodeType::service, .ops = std::move(ops)};

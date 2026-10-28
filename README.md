@@ -24,13 +24,33 @@ simsys explain  scenario.yaml        # every resolved number and where it came f
 simsys estimate scenario.yaml [--report table|json] [--no-color]
 simsys run      scenario.yaml [--duration 30s] [--seed N] [--report table|json]
                               [--series out.csv] [--no-color]
+simsys curve    scenario.yaml <client> [--step 1m] [--until 1h] [--seed N] [--noise]
 ```
 
 `estimate` evaluates the long-run (steady) state once; `run` steps through the scenario and,
 with `--series`, writes one CSV row per node per step (`t_s,node,rho,backlog,drops_per_s,latency_ms,zone`),
 the file a plot or GUI reads. Exit codes: 0 every SLO passed, 2 an SLO failed, 1 an error.
 Colour is on when stdout is a terminal; `--no-color` turns it off and JSON never has it.
-`--seed` is reserved for phase 2 workload noise and has no effect yet.
+`--seed` is reserved for phase 2 workload noise and has no effect on `run` yet.
+
+`curve` prints one client's offered rate over time as CSV (`t_s,rate_per_s`), sampled every
+`--step` from t = 0 (midnight) up to `--until` (default: the scenario's duration), so the
+`rate:` block (base or points, times wave, ramp and spikes) can be plotted before anything
+runs. `--noise` multiplies in the client's `rate.noise` process, seeded from `--seed` (default:
+the scenario's seed) exactly as the engine will seed that client. On the
+[rate-limiter lab](scenarios/labs/rate-limiter/), the 5x spike at 5 minutes:
+
+```
+$ simsys curve scenarios/labs/rate-limiter/scenario.yaml clients --step 1m | head -8
+t_s,rate_per_s
+0,800
+60,800
+120,800
+180,800
+240,800
+300,4000
+360,800
+```
 
 `explain` on the [chain tutorial](scenarios/tutorial/chain/) (trimmed):
 
@@ -38,7 +58,7 @@ Colour is on when stdout is a terminal; `--no-color` turns it off and JSON never
 $ simsys explain scenarios/tutorial/chain/scenario.yaml
 scenario chain  version 1  duration 2m  step 100ms  warmup 10s  seed 1
 nodes:
-  users  client   dc=main  offered=1.5k/s  ops: read 80%, write 20%  (rate curve: base only in phase 1)
+  users  client   dc=main  rate: base 1.5k/s  ops: read 80%, write 20%
   api    service  dc=main  replicas=2  capacity=1k/s (scenario)  service_time=500us (scenario)  c=1 (implied)  queue_limit=1000 (default)  ...
   db     service  dc=main  replicas=1  capacity=5k/s (scenario)  service_time=2ms (scenario)  c=10 (implied)  queue_limit=500 (scenario)  ...
 links:

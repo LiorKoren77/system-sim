@@ -250,7 +250,7 @@ struct Overloaded : Fs... {
   std::vector<std::pair<std::string, Rate>> offered;
   if (!spec.workload) return offered;
   for (const auto& [op, share] : spec.workload->op_shares) {
-    offered.emplace_back(op, Rate{spec.workload->base.per_second * share});
+    offered.emplace_back(op, Rate{spec.workload->curve.base.per_second * share});
   }
   // C++20 ranges algorithm with a projection: std::ranges::sort takes the container
   // itself (no begin/end pair to mismatch), `{}` is the default comparison (std::less),

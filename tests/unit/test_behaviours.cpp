@@ -47,17 +47,17 @@ namespace {
 // users -> web -> {cache, db}; web.get = [cache.read, db.select x2]; put is terminal at web.
 Scenario two_hop(StepMode mode) {
   Scenario s{.name = "t", .version = 1, .duration = 1min};
-  s.nodes = {
-      NodeSpec{.id = "users",
-               .type = NodeType::client,
-               .workload = Workload{.base = Rate{100}, .op_shares = {{"get", 0.8}, {"put", 0.2}}}},
-      NodeSpec{.id = "web",
-               .type = NodeType::service,
-               .ops = {{"get",
-                        {Step{.to = "cache", .op = "read", .mode = mode},
-                         Step{.to = "db", .op = "select", .mode = mode, .factor = 2}}}}},
-      NodeSpec{.id = "cache", .type = NodeType::service},
-      NodeSpec{.id = "db", .type = NodeType::service}};
+  s.nodes = {NodeSpec{.id = "users",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{100}},
+                                           .op_shares = {{"get", 0.8}, {"put", 0.2}}}},
+             NodeSpec{.id = "web",
+                      .type = NodeType::service,
+                      .ops = {{"get",
+                               {Step{.to = "cache", .op = "read", .mode = mode},
+                                Step{.to = "db", .op = "select", .mode = mode, .factor = 2}}}}},
+             NodeSpec{.id = "cache", .type = NodeType::service},
+             NodeSpec{.id = "db", .type = NodeType::service}};
   s.links = {LinkSpec{.from = "users", .to = "web", .latency = 1ms},
              LinkSpec{.from = "web", .to = "cache", .latency = 0s},
              LinkSpec{.from = "web", .to = "db", .latency = 10ms}};
@@ -160,11 +160,12 @@ TEST_CASE("a client's response adds its link's two legs to the first hop's respo
 
 TEST_CASE("a client op split across two links mixes the responses by share", "[behaviours]") {
   Scenario s{.name = "split", .version = 1, .duration = 1min};
-  s.nodes = {NodeSpec{.id = "u",
-                      .type = NodeType::client,
-                      .workload = Workload{.base = Rate{100}, .op_shares = {{"id", 1.0}}}},
-             NodeSpec{.id = "fast", .type = NodeType::service},
-             NodeSpec{.id = "slow", .type = NodeType::service}};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"id", 1.0}}}},
+      NodeSpec{.id = "fast", .type = NodeType::service},
+      NodeSpec{.id = "slow", .type = NodeType::service}};
   s.links = {LinkSpec{.from = "u", .to = "fast", .latency = 0s, .weight = 3},
              LinkSpec{.from = "u", .to = "slow", .latency = 0s, .weight = 1}};
   const auto g = *simsys::graph::Graph::build(s);
@@ -223,18 +224,19 @@ TEST_CASE("the hop that closes a call cycle forwards flow but adds no latency to
           "[behaviours]") {
   // chat.msg -> q.publish -> sync.job -> chat.msg: a true call cycle; sync -> chat closes it.
   Scenario s{.name = "loop2", .version = 1, .duration = 1min};
-  s.nodes = {NodeSpec{.id = "u",
-                      .type = NodeType::client,
-                      .workload = Workload{.base = Rate{1}, .op_shares = {{"msg", 1.0}}}},
-             NodeSpec{.id = "chat",
-                      .type = NodeType::service,
-                      .ops = {{"msg", {Step{.to = "q", .op = "publish"}}}}},
-             NodeSpec{.id = "q",
-                      .type = NodeType::service,
-                      .ops = {{"publish", {Step{.to = "sync", .op = "job"}}}}},
-             NodeSpec{.id = "sync",
-                      .type = NodeType::service,
-                      .ops = {{"job", {Step{.to = "chat", .op = "msg", .factor = 0.5}}}}}};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1}}, .op_shares = {{"msg", 1.0}}}},
+      NodeSpec{.id = "chat",
+               .type = NodeType::service,
+               .ops = {{"msg", {Step{.to = "q", .op = "publish"}}}}},
+      NodeSpec{.id = "q",
+               .type = NodeType::service,
+               .ops = {{"publish", {Step{.to = "sync", .op = "job"}}}}},
+      NodeSpec{.id = "sync",
+               .type = NodeType::service,
+               .ops = {{"job", {Step{.to = "chat", .op = "msg", .factor = 0.5}}}}}};
   s.links = {LinkSpec{.from = "u", .to = "chat", .latency = 0s},
              LinkSpec{.from = "chat", .to = "q", .latency = 0s},
              LinkSpec{.from = "q", .to = "sync", .latency = 0s},
@@ -255,9 +257,10 @@ TEST_CASE("a node-level back edge that is not a call cycle still adds its latenc
   // A.x -> B.y and B.z -> A.w: B -> A closes the node cycle, but B.z really waits for A.w.
   Scenario s{.name = "xcycle", .version = 1, .duration = 1min};
   s.nodes = {
-      NodeSpec{.id = "u",
-               .type = NodeType::client,
-               .workload = Workload{.base = Rate{10}, .op_shares = {{"x", 0.5}, {"z", 0.5}}}},
+      NodeSpec{
+          .id = "u",
+          .type = NodeType::client,
+          .workload = Workload{.curve = {.base = Rate{10}}, .op_shares = {{"x", 0.5}, {"z", 0.5}}}},
       NodeSpec{.id = "A", .type = NodeType::service, .ops = {{"x", {Step{.to = "B", .op = "y"}}}}},
       NodeSpec{.id = "B", .type = NodeType::service, .ops = {{"z", {Step{.to = "A", .op = "w"}}}}}};
   s.links = {LinkSpec{.from = "u", .to = "A", .ops = {"x"}, .latency = 0s},
@@ -274,7 +277,7 @@ TEST_CASE("a node-level back edge that is not a call cycle still adds its latenc
 
 TEST_CASE("a client with a zero base rate offers nothing", "[behaviours]") {
   Scenario s = two_hop(StepMode::sequential);
-  s.nodes[0].workload->base = Rate{0};
+  s.nodes[0].workload->curve.base = Rate{0};
   const auto g = *simsys::graph::Graph::build(s);
   REQUIRE(ClientBehaviour{g, *g.index_of("users")}.offer(0s).outgoing.empty());
 }
