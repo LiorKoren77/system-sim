@@ -3181,3 +3181,74 @@ TEST_CASE("a link that carries demand out of a sql database is refused") {
                                  "  - {from: db, to: audit, dir: in}\n"));
   }
 }
+
+// ---- Request-based CDN (plan 2b refinement 4, Task 5) ----
+//
+// A `cdn` (book ch. 1: a cache at the network's edge, serving static files close to the user)
+// is a read-only cache in front of an `origin`, the node it fetches its misses from. The origin
+// is now part of the model (NodeSpec::origin), not only a reference the loader checks, so a CDN
+// without one has nowhere to send its misses and is refused here.
+namespace {
+// A client reading through the CDN `cdn` (whose own YAML mapping is `body`) to the service
+// `origin`, linked u -> cdn -> origin.
+std::string cdn_scenario(std::string_view body) {
+  return scenario_with(
+      "  u: {type: client, rate: {base: 100/s}, ops: {read: 1}}\n"
+      "  cdn: {type: cdn, " +
+          std::string{body} +
+          "}\n"
+          "  origin: {type: service}\n",
+      "links:\n"
+      "  - {from: u, to: cdn, dir: inout}\n"
+      "  - {from: cdn, to: origin, dir: inout}\n");
+}
+simsys::model::Scenario load_cdn(std::string_view file_name, std::string_view body) {
+  const auto path = write_temp(file_name, cdn_scenario(body));
+  auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  return *s;
+}
+}  // namespace
+
+// NodeSpec::origin is the name of the node the CDN fetches its misses from; the graph turns it
+// into a demand edge cdn -> origin. (The name `origin` for the field is this test's proposal.)
+TEST_CASE("a cdn's origin is stored on the node") {
+  const auto s = load_cdn("simsys_cdn_origin.yaml", "hit_ratio: {fixed: 0.95}, origin: origin");
+  const auto& cdn = s.nodes[1];
+  REQUIRE(cdn.type == simsys::model::NodeType::cdn);
+  REQUIRE(cdn.origin == "origin");
+  REQUIRE_FALSE(s.nodes[0].origin.has_value());  // only a cdn has one
+}
+
+TEST_CASE("a cdn without an origin is refused: its misses would have nowhere to go") {
+  require_rejected("simsys_cdn_no_origin.yaml", cdn_scenario("hit_ratio: {fixed: 0.95}"),
+                   "node 'cdn': a cdn needs an origin");
+}
+
+// The origin is a server the CDN calls. A client offers traffic and receives none, so a CDN
+// whose "origin" is a client could never forward a miss to it. (The message is this test's
+// proposal; the implementer may reword it, and then this expectation moves with it.)
+TEST_CASE("a cdn whose origin is a client is refused") {
+  require_rejected("simsys_cdn_origin_client.yaml", cdn_scenario("origin: u"),
+                   "node 'cdn': origin must not be a client");
+}
+
+TEST_CASE("a cdn's hit ratio is fixed or che, and its ttl is accepted") {
+  SECTION("fixed") {
+    const auto s =
+        load_cdn("simsys_cdn_fixed.yaml", "ttl: 1h, hit_ratio: {fixed: 0.95}, origin: origin");
+    REQUIRE(s.nodes[1].hit_ratio.has_value());
+    REQUIRE(s.nodes[1].hit_ratio->fixed == 0.95);
+  }
+  SECTION("che") {
+    const auto s = load_cdn("simsys_cdn_che.yaml", "ttl: 24h, hit_ratio: che, origin: origin");
+    REQUIRE(s.nodes[1].hit_ratio.has_value());
+    REQUIRE(s.nodes[1].hit_ratio->che);
+    REQUIRE_FALSE(s.nodes[1].hit_ratio->fixed.has_value());
+  }
+  SECTION("none: a cdn without a hit ratio loads, and misses every time") {
+    const auto s = load_cdn("simsys_cdn_no_ratio.yaml", "origin: origin");
+    REQUIRE_FALSE(s.nodes[1].hit_ratio.has_value());
+  }
+}

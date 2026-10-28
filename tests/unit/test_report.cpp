@@ -1099,3 +1099,61 @@ TEST_CASE("explain prints a sql database as primary plus replicas with shards, l
   REQUIRE(text.find("lag=50ms") != std::string::npos);
   REQUIRE(text.find("pool=32") != std::string::npos);
 }
+
+// ---- Request-based CDN (plan 2b refinement 4, Task 5) ----
+
+namespace {
+// u(1k/s read) -> `cdn_id` (a CDN, fixed hit ratio 0.95, origin `origin`) -> origin (a service of
+// 5k/s). The CDN has the given byte capacity when one is passed.
+Scenario cdn_reported(std::string cdn_id = "cdn", std::optional<simsys::ByteRate> bytes = {}) {
+  Scenario s{.name = "cdn-report", .version = 1, .duration = 1min};
+  NodeSpec cdn{.id = cdn_id,
+               .type = NodeType::cdn,
+               .byte_capacity = bytes,
+               .hit_ratio = simsys::model::HitRatio{.fixed = 0.95}};
+  cdn.origin = "origin";
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"read", 1.0}}}},
+      std::move(cdn), NodeSpec{.id = "origin", .type = NodeType::service, .capacity = Rate{5000}}};
+  s.links = {LinkSpec{.from = "u", .to = cdn_id}, LinkSpec{.from = cdn_id, .to = "origin"}};
+  return s;
+}
+}  // namespace
+
+// Explain shows a CDN as it shows a cache: the hit ratio and where it comes from, and, because
+// a CDN forwards its own misses, where they go. The exact wording ("misses → origin", after the
+// hit ratio and before the ttl) is this test's proposal; the implementer may adjust it and move
+// these expectations with it.
+TEST_CASE("explain shows a cdn's hit ratio and where its misses go", "[report]") {
+  const auto built = simsys::graph::Graph::build(cdn_reported());
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto text = simsys::report::render_explain(*built);
+  CAPTURE(text);
+  REQUIRE(text.contains("hit_ratio=0.95 (fixed)"));
+  REQUIRE(text.contains("misses → origin"));
+}
+
+// The paper load follows the miss edge: the origin is checked against 5 % of the 1k/s reads
+// (1 - 0.95 = 0.05, so 50/s), not against zero (an edge that explain ignored) or all 1k/s.
+TEST_CASE("explain's paper load sends the origin the cdn's miss share", "[report]") {
+  const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(cdn_reported()));
+  CAPTURE(text);
+  REQUIRE(check_line(text, "cdn").contains("peak offered 1k/s"));
+  REQUIRE(check_line(text, "origin").contains("peak offered 50/s"));
+}
+
+// A CDN sized in bytes (`capacity: 100GB/s`) builds and explains; only the engine refuses to run
+// it until phase 2c models byte flows, as it refuses a cache without a hit ratio.
+TEST_CASE("explain still renders a cdn that has a byte capacity", "[report]") {
+  const auto built = simsys::graph::Graph::build(cdn_reported("cdn_us", simsys::ByteRate{100e9}));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto text = simsys::report::render_explain(*built);
+  CAPTURE(text);
+  REQUIRE(text.contains("cdn_us"));
+  REQUIRE(text.contains("hit_ratio=0.95 (fixed)"));
+  REQUIRE(text.contains("misses → origin"));
+}

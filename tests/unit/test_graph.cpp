@@ -1559,3 +1559,135 @@ TEST_CASE("a database's pool bounds its throughput by Little's law and never rai
     REQUIRE(capacity.concurrency == 50);
   }
 }
+
+// ---- Request-based CDN (plan 2b refinement 4, Task 5) ----
+//
+// A CDN (book ch. 1: a cache at the network's edge; ch. 13's browser cache is the same idea one
+// hop closer to the user) is a read-only cache in front of its `origin`. It answers the hit
+// fraction h itself and sends the misses, as the SAME op, to the origin: a demand edge
+// cdn -> origin carrying 1 - h of each read op, exactly as a read_through cache's backend hop.
+namespace {
+// A CDN with the given hit ratio (a fixed one or che) and origin; `origin` is assigned after the
+// designated initializer, so these tests do not depend on where the field is declared.
+NodeSpec cdn_node(std::optional<HitRatio> hit, std::optional<std::string> origin = "origin") {
+  NodeSpec node{.id = "cdn", .type = NodeType::cdn, .hit_ratio = hit};
+  node.origin = std::move(origin);
+  return node;
+}
+// u (100/s, the given ops) -> cdn -> origin (a service), both links of default latency.
+// Node indices: u 0, cdn 1, origin 2.
+Scenario cdn_front(NodeSpec cdn,
+                   std::vector<std::pair<std::string, double>> ops = {{"read", 1.0}}) {
+  Scenario s{.name = "cdn-front", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, std::move(ops)), std::move(cdn), service("origin")};
+  s.links = {LinkSpec{.from = "u", .to = "cdn", .dir = Direction::inout},
+             LinkSpec{.from = "cdn", .to = "origin", .dir = Direction::inout}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("a cdn with a fixed hit ratio sends the misses to its origin as the same op", "[graph]") {
+  const auto built = Graph::build(cdn_front(cdn_node(HitRatio{.fixed = 0.95})));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto& g = *built;
+  const auto cdn = *g.index_of("cdn");
+  const auto origin = *g.index_of("origin");
+  REQUIRE_THAT(*g.hit_ratio(cdn), WithinRel(0.95, 1e-12));
+  // The demand edge cdn -> origin exists, over the link the scenario draws between them.
+  const auto link = g.demand_link(cdn, origin);
+  REQUIRE(link.has_value());
+  REQUIRE(std::ranges::contains(g.edges(), DemandEdge{.from = cdn, .to = origin, .link = *link}));
+  // The edge carries the miss share of the read op: 1 - 0.95 = 0.05 of every `read` the cdn is
+  // asked. This test proposes that Graph::backend_fraction (today a cache's read_through share)
+  // also answers for a cdn's origin; the implementer may name another accessor and move this line.
+  REQUIRE_THAT(g.backend_fraction(cdn, "read"), WithinRel(0.05, 1e-12));
+  // Same op name on both sides: the origin is asked for `read`, not for a renamed op.
+  // C++20 std::ranges::equal: element-wise equality of two ranges (here a span and a vector),
+  // replacing `std::equal(a.begin(), a.end(), b.begin(), b.end())`; the test reads as "the ops
+  // that arrive are exactly {read}".
+  REQUIRE(std::ranges::equal(g.arriving_ops(cdn), std::vector<std::string>{"read"}));
+  REQUIRE(std::ranges::equal(g.arriving_ops(origin), std::vector<std::string>{"read"}));
+}
+
+// "Missing every time" is the safe side for a capacity check on paper: a CDN the scenario gave
+// no hit ratio still runs, and its origin is planned for the whole read load (h = 0).
+TEST_CASE("a cdn without a hit ratio misses every read and still builds", "[graph]") {
+  const auto built = Graph::build(cdn_front(cdn_node(std::nullopt)));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto cdn = *built->index_of("cdn");
+  REQUIRE_FALSE(built->hit_ratio(cdn).has_value());
+  REQUIRE_THAT(built->backend_fraction(cdn, "read"), WithinRel(1.0, 1e-12));
+}
+
+// A CDN serves static files from the edge and has no write path: there is nothing in its model
+// that a write could update, so a write that reaches it is a mistake in the scenario. "A write"
+// is whatever model::write_ops_of says for the node: a CDN's default is the op `write`, and a
+// scenario's `write_ops` replaces it, exactly as for a cache.
+TEST_CASE("a write op reaching a cdn is refused", "[graph]") {
+  const std::string expected = "node 'cdn': a cdn does not take writes";
+  SECTION("the default write op, sent by a client") {
+    const auto g =
+        Graph::build(cdn_front(cdn_node(HitRatio{.fixed = 0.95}), {{"read", 0.9}, {"write", 0.1}}));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == expected);
+  }
+  SECTION("an op the scenario lists in write_ops, sent by a client") {
+    auto cdn = cdn_node(HitRatio{.fixed = 0.95});
+    cdn.write_ops = std::vector<std::string>{"purge"};
+    const auto g = Graph::build(cdn_front(std::move(cdn), {{"read", 0.9}, {"purge", 0.1}}));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == expected);
+  }
+  SECTION("an op that is not in write_ops is a read, even if it is called write") {
+    auto cdn = cdn_node(HitRatio{.fixed = 0.95});
+    cdn.write_ops = std::vector<std::string>{"purge"};
+    const auto g = Graph::build(cdn_front(std::move(cdn), {{"read", 0.9}, {"write", 0.1}}));
+    INFO((g ? "" : g.error().message));
+    REQUIRE(g.has_value());
+  }
+  SECTION("sent by a service step") {
+    Scenario s{.name = "cdn-behind-web", .version = 1, .duration = 1min};
+    s.nodes = {client("u", Rate{100}, {{"put", 1.0}}),
+               service("web", {{"put", {Step{.to = "cdn", .op = "write"}}}}),
+               cdn_node(HitRatio{.fixed = 0.95}), service("origin")};
+    s.links = {LinkSpec{.from = "u", .to = "web", .dir = Direction::inout},
+               LinkSpec{.from = "web", .to = "cdn", .dir = Direction::inout},
+               LinkSpec{.from = "cdn", .to = "origin", .dir = Direction::inout}};
+    const auto g = Graph::build(std::move(s));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == expected);
+  }
+}
+
+// The loader refuses a cdn without an origin (config tests); a scenario built in code skips the
+// loader, so the graph repeats the rule, as it does for a limiter without a limit.
+TEST_CASE("a cdn built in code without an origin is refused", "[graph]") {
+  const auto g = Graph::build(cdn_front(cdn_node(HitRatio{.fixed = 0.95}, std::nullopt)));
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message == "node 'cdn': a cdn needs an origin");
+}
+
+// Che for a cdn resolves as for a cache: the size in keys (`keys` on the node, set in code here;
+// config.cpp's own_keys_by_type row for cdn does not list `keys` yet, see the report) and the key
+// distribution of the clients that reach it, found by walking the demand edges back upstream.
+TEST_CASE("a che cdn resolves its hit ratio from the keys of the clients upstream", "[graph]") {
+  auto cdn = cdn_node(HitRatio{.che = true});
+  cdn.keys = 1000;
+  auto s = cdn_front(std::move(cdn));
+  s.nodes[0].workload->keys = KeySpec{.zipf = 1.0, .space = 10'000};
+  const auto built = Graph::build(std::move(s));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto h = built->hit_ratio(*built->index_of("cdn"));
+  REQUIRE(h.has_value());
+  // The same number a che cache of 1000 keys gets for Zipf(1) over 10k keys (see the che cache
+  // tests above): the Che approximation, not a value stated by the scenario.
+  REQUIRE_THAT(*h, WithinRel(simsys::caching::che_hit_ratio(
+                                 1000, simsys::caching::Popularity::zipf(1.0, 10'000)),
+                             1e-12));
+  // And the miss share it sends the origin is the complement.
+  REQUIRE_THAT(built->backend_fraction(*built->index_of("cdn"), "read"),
+               WithinRel(1.0 - *h, 1e-12));
+}

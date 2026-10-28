@@ -28,9 +28,11 @@ import simsys.model;
 import simsys.workload;
 
 using namespace std::chrono_literals;
+using Catch::Matchers::WithinAbs;
 using Catch::Matchers::WithinRel;
 using simsys::Rate;
 using simsys::behaviours::CacheBehaviour;
+using simsys::behaviours::CdnBehaviour;  // the name is this test file's proposal (plan Task 5)
 using simsys::behaviours::ClientBehaviour;
 using simsys::behaviours::LoadBalancerBehaviour;
 using simsys::behaviours::Outgoing;
@@ -140,6 +142,7 @@ static_assert(simsys::behaviours::RequestSource<ClientBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<LoadBalancerBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<RateLimiterBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<CacheBehaviour>);
+static_assert(simsys::behaviours::NodeBehaviour<CdnBehaviour>);
 
 // And the negative: a type that routes flow but cannot answer for its latency is not a
 // NodeBehaviour, so the engine refuses it at compile time instead of misbehaving at run time.
@@ -1422,4 +1425,91 @@ TEST_CASE("a sql database's response is the sojourn the engine chose, with no do
   REQUIRE_FALSE(asked);
   REQUIRE_THAT(db.delivered("read", 0.9, [](std::size_t, std::string_view) { return 0.1; }),
                WithinRel(0.9, 1e-12));
+}
+
+// ---- CdnBehaviour (plan 2b refinement 4, Task 5) ----
+//
+// A CDN (book ch. 1: a cache at the network's edge) answers the share h of the reads it is sent
+// from its own store and fetches the rest, 1 - h, from its origin as the SAME op: the shape of a
+// read_through cache, without a write path (the graph refuses a write that reaches a CDN). The
+// behaviour's name, CdnBehaviour, is this test file's proposal; the implementer may pick another
+// and rename it here.
+
+namespace {
+// u -> cdn -> origin. Node indices: u 0, cdn 1, origin 2. The cdn has the given fixed hit ratio
+// and the origin is a plain service 1 ms away one way; u -> cdn has no latency.
+Scenario cdn_in_front(double hit) {
+  Scenario s{.name = "cdn", .version = 1, .duration = 1min};
+  NodeSpec cdn{.id = "cdn", .type = NodeType::cdn, .hit_ratio = HitRatio{.fixed = hit}};
+  cdn.origin = "origin";
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"read", 1.0}}}},
+      std::move(cdn), NodeSpec{.id = "origin", .type = NodeType::service}};
+  s.links = {LinkSpec{.from = "u", .to = "cdn", .latency = 0s},
+             LinkSpec{.from = "cdn", .to = "origin", .latency = 1ms}};
+  return s;
+}
+}  // namespace
+
+// With hit ratio 0.95 the fluid model sends the miss fraction 0.05 of the reads on, unchanged,
+// and the CDN itself answers every request (`served` is all of the input, hits and misses
+// alike, as for a read_through cache): 100 reads/s in, 5 reads/s to the origin.
+TEST_CASE("a cdn forwards its miss fraction of a read to the origin unchanged", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(cdn_in_front(0.95));
+  CdnBehaviour cdn{g, *g.index_of("cdn")};
+  const auto origin = *g.index_of("origin");
+  const auto routed = cdn.route(flow_of("read", 100), 0s, 100ms);
+  REQUIRE(routed.outgoing.size() == 1);
+  REQUIRE(routed.outgoing[0].target == origin);
+  REQUIRE_THAT(routed.outgoing[0].flow.rate_of("read").per_second, WithinRel(5.0, 1e-12));
+  REQUIRE_THAT(routed.outgoing[0].flow.total().per_second, WithinRel(5.0, 1e-12));  // only `read`
+  REQUIRE_THAT(routed.served.rate_of("read").per_second, WithinRel(100.0, 1e-12));
+  REQUIRE(routed.rejected.empty());
+}
+
+TEST_CASE("a cdn that always hits sends nothing to its origin", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(cdn_in_front(1.0));
+  CdnBehaviour cdn{g, *g.index_of("cdn")};
+  const auto routed = cdn.route(flow_of("read", 100), 0s, 100ms);
+  REQUIRE_THAT(sent_to(routed, *g.index_of("origin")).total().per_second, WithinAbs(0.0, 1e-12));
+  REQUIRE_THAT(routed.served.rate_of("read").per_second, WithinRel(100.0, 1e-12));
+}
+
+// Same mixture as the read_through cache's response, with h = 0.95. Hit (95 %): own sojourn only,
+// mean 1 ms, variance 4e-8. Miss (5 %): own + the hop to the origin, 2 legs of 1 ms + the
+// origin's response (5 ms, variance 1e-6): mean 8 ms, variance 4e-8 + 1e-6 = 1.04e-6.
+// A mixture (law of total variance, as for a client's split routes):
+//   mean     = 0.95 x 1 ms + 0.05 x 8 ms                          = 1.35 ms  (= own + 0.05 x hop of
+//   7 ms) variance = Σ s_i v_i + Σ s_i (m_i - mean)²
+//            = (0.95 x 4e-8 + 0.05 x 1.04e-6) + (0.95 x (0.35 ms)² + 0.05 x (6.65 ms)²)
+//            = 9.0e-8 + (1.16375e-7 + 2.211125e-6) = 2.4175e-6
+TEST_CASE("a cdn's response is its own sojourn plus the miss share of the origin hop",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(cdn_in_front(0.95));
+  CdnBehaviour cdn{g, *g.index_of("cdn")};
+  const auto origin = *g.index_of("origin");
+  std::vector<std::pair<std::size_t, std::string>> asked;
+  const auto r = cdn.response("read", LatencyEstimate{0.001, 4e-8},
+                              [&](std::size_t node, std::string_view op) {
+                                asked.emplace_back(node, std::string{op});
+                                return LatencyEstimate{0.005, 1e-6};
+                              });
+  REQUIRE_THAT(r.mean_s, WithinRel(0.00135, 1e-12));
+  REQUIRE_THAT(r.variance_s2, WithinRel(2.4175e-6, 1e-9));
+  REQUIRE(asked.size() == 1);
+  REQUIRE(asked[0] == std::pair{origin, std::string{"read"}});  // the same op, not a renamed one
+}
+
+// Of the requests sent to the cdn, the hits (95 %) are answered by the cdn alone; the misses
+// (5 %) only as often as the origin answers them. Sequential parts multiply, a split is the
+// share-weighted mean: arriving fraction 0.9 x (0.95 + 0.05 x 0.5) = 0.9 x 0.975 = 0.8775.
+TEST_CASE("a cdn delivers its hits plus its misses times the origin's delivered fraction",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(cdn_in_front(0.95));
+  const CdnBehaviour cdn{g, *g.index_of("cdn")};
+  const double delivered =
+      cdn.delivered("read", 0.9, [](std::size_t, std::string_view) { return 0.5; });
+  REQUIRE_THAT(delivered, WithinRel(0.8775, 1e-12));
 }

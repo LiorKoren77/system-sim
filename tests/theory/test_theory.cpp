@@ -1505,3 +1505,99 @@ TEST_CASE("a write costs five units on a database by default", "[theory]") {
     REQUIRE_THAT(r.nodes[1].rho, WithinRel(0.2, 1e-9));
   }
 }
+
+// ---- Request-based CDN (plan 2b refinement 4, Task 5) ----
+//
+// Book ch. 1: a CDN is a cache at the network's edge. Here it is a read-only cache in front of
+// an origin: it answers the share h of the reads itself and sends the misses, as the same op, to
+// the origin. Everything but the hit ratio is chosen so the numbers come from it alone.
+
+namespace {
+// u (`reads`/s of `read`) -> cdn -> origin. The cdn (10k/s, 1 ms service: c = 10 servers) has the
+// given hit ratio (none: it misses every read); the origin (1000/s, 10 ms service: c = 10) is far
+// from saturated at the loads used. The u -> cdn link has no latency, the cdn -> origin link
+// 10 ms one way (a round trip of 20 ms): the "origin hop" a miss adds is that plus the origin's
+// response. Node indices: u 0, cdn 1, origin 2.
+Scenario cdn_origin_chain(double reads, std::optional<double> hit) {
+  Scenario s{.name = "cdn-origin", .version = 1, .duration = 10s};
+  NodeSpec cdn{.id = "cdn", .type = NodeType::cdn, .capacity = Rate{10'000}, .latency = 1ms};
+  if (hit) cdn.hit_ratio = HitRatio{.fixed = *hit};
+  cdn.origin = "origin";
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{reads}}, .op_shares = {{"read", 1.0}}}},
+      std::move(cdn),
+      NodeSpec{.id = "origin", .type = NodeType::service, .capacity = Rate{1000}, .latency = 10ms}};
+  s.links = {LinkSpec{.from = "u", .to = "cdn", .latency = 0s},
+             LinkSpec{.from = "cdn", .to = "origin", .latency = 10ms}};
+  return s;
+}
+}  // namespace
+
+// 1000 reads/s at a CDN that hits 95 % of them:
+//   cdn:    demand 1000/s, capacity 10k/s over c = 10 servers (10k/s x 1 ms), rho = 0.1;
+//   origin: demand 1000 x (1 - 0.95) = 50/s of the same op, capacity 1000/s, c = 10 (1000/s x
+//           10 ms), rho = 50 / 1000 = 0.05.
+// Each node's own sojourn is its M/M/c wait plus its service time (Erlang C: mmc_wait):
+//   cdn    mmc_wait(10, 0.1, 1 ms)   = 1.25e-11 s  (P(wait) = 1.13e-7, theta = 1 ms / 9)
+//   origin mmc_wait(10, 0.05, 10 ms) = 1.8e-13 s   (P(wait) = 1.72e-10, theta = 10 ms / 9.5)
+// so almost nothing queues and the sojourns are the service times, 1 ms and 10 ms. A read the cdn
+// hits costs its own sojourn; one it misses adds the origin hop (2 x 10 ms of link + the origin's
+// sojourn), taken by 5 % of the reads:
+//   mean = cdn + 0.05 x (2 x 10 ms + origin) = 1 ms + 0.05 x 30 ms = 2.5 ms (to within 1e-10 s).
+TEST_CASE("a cdn answers its hits alone and sends the origin the miss share of the reads",
+          "[theory]") {
+  const auto g = *Graph::build(cdn_origin_chain(1000, 0.95));
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const auto r = (*Simulation::create(g)).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[*g.index_of("cdn")].demand_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(r.nodes[*g.index_of("origin")].demand_per_s, WithinRel(50.0, 1e-9));
+  const auto cdn = simsys::queueing::mmc_wait(10, 0.1, 0.001).mean_s + 0.001;
+  const auto origin = simsys::queueing::mmc_wait(10, 0.05, 0.010).mean_s + 0.010;
+  REQUIRE_THAT(r.nodes[*g.index_of("cdn")].latency.mean_s, WithinRel(cdn, 1e-9));
+  REQUIRE_THAT(r.nodes[*g.index_of("origin")].latency.mean_s, WithinRel(origin, 1e-9));
+  REQUIRE(r.responses.size() == 1);
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(cdn + 0.05 * (2 * 0.010 + origin), 1e-9));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.0025, 1e-7));  // the napkin number
+  REQUIRE_THAT(r.responses[0].answered.per_second, WithinRel(1000.0, 1e-9));
+  // The long-run state agrees: nothing here depends on the order of the steps.
+  const auto settled = (*Simulation::create(g)).estimate();
+  REQUIRE_THAT(settled.nodes[*g.index_of("origin")].demand_per_s, WithinRel(50.0, 1e-9));
+}
+
+// A CDN the scenario gave no hit ratio misses every read (h = 0) but still runs and still adds
+// its own hop: 400 reads/s all reach the origin (rho = 400 / 1000 = 0.4, c = 10, a queue worth
+// mmc_wait(10, 0.4, 10 ms) = 1.47e-5 s of waiting: P(wait) = 0.0088, theta = 10 ms / 6).
+TEST_CASE("a cdn without a hit ratio runs and passes every read on to its origin", "[theory]") {
+  const auto g = *Graph::build(cdn_origin_chain(400, std::nullopt));
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const auto r = (*Simulation::create(g)).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[*g.index_of("origin")].demand_per_s, WithinRel(400.0, 1e-9));
+  const auto cdn = simsys::queueing::mmc_wait(10, 0.04, 0.001).mean_s + 0.001;  // rho 400/10k
+  const auto origin = simsys::queueing::mmc_wait(10, 0.4, 0.010).mean_s + 0.010;
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(cdn + (2 * 0.010 + origin), 1e-9));
+}
+
+// A CDN sized in bytes per second needs the byte flows of phase 2c (what each request weighs, a
+// link's bandwidth). Until then the graph builds it (explain shows it) and the engine refuses it,
+// as it refuses a cache without a hit ratio. The node is called cdn_us as in book/youtube.
+TEST_CASE("a cdn with a byte capacity builds but the engine refuses to run it until phase 2c",
+          "[theory]") {
+  auto s = cdn_origin_chain(1000, 0.95);
+  s.nodes[1].id = "cdn_us";
+  s.nodes[1].byte_capacity = simsys::ByteRate{100e9};
+  s.links = {LinkSpec{.from = "u", .to = "cdn_us", .latency = 0s},
+             LinkSpec{.from = "cdn_us", .to = "origin", .latency = 10ms}};
+  const auto g = Graph::build(std::move(s));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto sim = Simulation::create(*g);
+  REQUIRE_FALSE(sim.has_value());
+  REQUIRE(sim.error().message ==
+          "node 'cdn_us': a cdn with a byte capacity needs byte flows (phase 2c)");
+}
