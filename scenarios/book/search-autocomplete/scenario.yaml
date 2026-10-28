@@ -1,0 +1,84 @@
+# System Design Interview vol. 1, ch. 13 — Search autocomplete.
+# Book numbers: 10M DAU, 10 searches/day, ~20 characters per query → ~24k requests/s
+# average (one per keystroke), peak 2x. Trie served from cache; rebuilt weekly from
+# aggregated query logs. Browser caching cuts a large share of requests.
+version: 1
+name: search-autocomplete
+seed: 1
+duration: 24h
+step: 100ms
+warmup: 2m
+
+nodes:
+  users:
+    type: client
+    rate:
+      base: 24k/s
+      wave: {shape: sine, period: 24h, amplitude: 0.5, peak_at: 20:00}
+    ops: {suggest: 0.95, search: 0.05}
+    keys: {zipf: 1.2, space: 100M}            # prefixes are extremely skewed
+    timeout: 100ms
+
+  browser_cache:                              # client-side caching of suggestions
+    type: cache
+    eviction: ttl
+    ttl: 1h
+    keys: 1M
+    hit_ratio: {fixed: 0.40}
+    then: [{to: lb, op: suggest, on: miss}]
+
+  lb: {type: load_balancer, policy: round_robin}
+
+  api:
+    type: service
+    replicas: 10
+    capacity: 5k/s
+    latency: 0.5ms
+    ops:
+      suggest:
+        - {to: trie_cache, op: read}
+        - {to: trie_db, op: read, on: miss}
+      search:
+        - {to: query_log_q, op: publish}
+
+  trie_cache:
+    type: cache
+    eviction: lru
+    keys: 50M
+    hit_ratio: che
+    strategy: read_through
+    backend: trie_db
+
+  trie_db:
+    type: search_index
+    replicas: 4
+    capacity: 2k/s
+    latency: 5ms
+    build_interval: 24h
+
+  query_log_q: {type: message_queue, partitions: 8}
+
+  aggregators:
+    type: worker_pool
+    consumes: query_log_q
+    workers: 4
+    cost: 2ms
+    then: [{to: aggregated_store, op: write}]
+
+  aggregated_store: {type: blob_store, capacity: 100MB/s}
+
+links:
+  - {from: users, to: browser_cache, dir: inout}
+  - {from: browser_cache, to: lb, dir: inout}
+  - {from: users, to: lb, dir: inout, ops: [search]}
+  - {from: lb, to: api, dir: inout}
+  - {from: api, to: trie_cache, dir: inout}
+  - {from: api, to: trie_db, dir: inout}
+  - {from: api, to: query_log_q}
+  - {from: trie_cache, to: trie_db, dir: inout}
+  - {from: query_log_q, to: aggregators}
+  - {from: aggregators, to: aggregated_store}
+
+slo:
+  - {metric: p99_latency, node: users, op: suggest, max: 100ms}
+  - {metric: drop_rate, max: 0.0005}
