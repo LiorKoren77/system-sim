@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -25,18 +26,25 @@ import simsys.model;
 // WithinRel, which apply only the tolerance you give them.
 using namespace std::chrono_literals;
 using Catch::Approx;
+using Catch::Matchers::WithinRel;
 using simsys::Rate;
 using simsys::engine::Simulation;
+using simsys::graph::Graph;
 using simsys::model::Direction;
 using simsys::model::LinkSpec;
 using simsys::model::NodeSpec;
 using simsys::model::NodeType;
 using simsys::model::Scenario;
+using simsys::model::Step;
 using simsys::model::Workload;
 
 namespace {
 // One client, one M/M/1 server: 1000/s capacity, 1 ms service, zero-latency link.
 Scenario mm1(double demand) {
+  // C++20 designated initializers: `.name = ...` names each member being set, in
+  // declaration order, and leaves the rest at their defaults. Replaces positional braces
+  // (which break silently when members are reordered) or a default object assigned field
+  // by field; here a scenario reads like the YAML it stands for.
   Scenario s{.name = "mm1", .version = 1, .duration = 10s};
   s.nodes = {
       NodeSpec{.id = "c",
@@ -44,6 +52,29 @@ Scenario mm1(double demand) {
                .workload = Workload{.base = Rate{demand}, .op_shares = {{"op", 1.0}}}},
       NodeSpec{.id = "s", .type = NodeType::service, .capacity = Rate{1000}, .latency = 1ms}};
   s.links = {LinkSpec{.from = "c", .to = "s", .dir = Direction::inout, .latency = 0s}};
+  return s;
+}
+
+// c(100/s) -> f -> g, and g sends half of what it serves back to f (factor 0.5) over a
+// feedback link of the given latency: a loop of gain 0.5.
+Scenario half_loop(simsys::SimTime feedback_latency) {
+  Scenario s{.name = "half-loop", .version = 1, .duration = 2s};
+  s.nodes = {NodeSpec{.id = "c",
+                      .type = NodeType::client,
+                      .workload = Workload{.base = Rate{100}, .op_shares = {{"x", 1.0}}}},
+             NodeSpec{.id = "f",
+                      .type = NodeType::service,
+                      .capacity = Rate{1e6},
+                      .latency = 100us,
+                      .ops = {{"x", {Step{.to = "g", .op = "x"}}}}},
+             NodeSpec{.id = "g",
+                      .type = NodeType::service,
+                      .capacity = Rate{1e6},
+                      .latency = 100us,
+                      .ops = {{"x", {Step{.to = "f", .op = "x", .factor = 0.5}}}}}};
+  s.links = {LinkSpec{.from = "c", .to = "f", .latency = 0s},
+             LinkSpec{.from = "f", .to = "g", .latency = 0s},
+             LinkSpec{.from = "g", .to = "f", .latency = feedback_latency}};
   return s;
 }
 }  // namespace
@@ -295,4 +326,97 @@ TEST_CASE("two runs of the same scenario produce identical records", "[theory]")
     REQUIRE(a[i].nodes[1].backlog == b[i].nodes[1].backlog);
     REQUIRE(a[i].responses[0].response == b[i].responses[0].response);
   }
+}
+
+TEST_CASE(
+    "estimate finds the fixed point base/(1-g) of a loop that feeds back half its flow, whatever "
+    "ran before",
+    "[theory]") {
+  // f's demand d satisfies d = 100 + 0.5 d, so d = 100 / (1 - 0.5) = 200 (a geometric series:
+  // each lap returns half of the previous one).
+  const auto g = *Graph::build(half_loop(0s));
+  auto sim = *Simulation::create(g);
+  REQUIRE_THAT(sim.estimate().nodes[1].demand_per_s, WithinRel(200.0, 1e-9));
+  for (int i = 0; i < 5; ++i) (void)sim.step(i * 100ms, 100ms);
+  REQUIRE_THAT(sim.estimate().nodes[1].demand_per_s, WithinRel(200.0, 1e-9));
+}
+
+TEST_CASE("a three-step feedback link re-injects flow exactly three steps later", "[theory]") {
+  // f(k) = 100 + 0.5 * g.drain(k - 3): the client's 100/s, plus half of what went round three
+  // steps ago.
+  auto sim = *Simulation::create(*Graph::build(half_loop(300ms)));
+  const double expected[] = {100, 100, 100, 150, 150, 150, 175};
+  for (int k = 0; k < 7; ++k) {
+    REQUIRE_THAT(sim.step(k * 100ms, 100ms).nodes[1].demand_per_s, WithinRel(expected[k], 1e-12));
+  }
+}
+
+TEST_CASE("a client's first response already includes the hops its flow has not reached yet",
+          "[theory]") {
+  // c -(150 ms)-> s: 2 delay steps. At step 0 nothing has reached s, but the response the
+  // client is promised already has both 150 ms legs and s's empty-queue response, its 1 ms
+  // service time. Once the flow arrives (step 2) s runs at rho 0.5 and the response is the
+  // steady one: 0.300 + 0.002 (M/M/1: rho / (mu - lambda) + 1 / mu).
+  Scenario s = mm1(500);
+  s.links[0].latency = 150ms;
+  const auto g = *Graph::build(s);
+  auto sim = *Simulation::create(g);
+  const double steady = sim.estimate().responses[0].response.mean_s;
+  REQUIRE_THAT(steady, WithinRel(0.302, 1e-9));
+  REQUIRE_THAT(sim.step(0s, 100ms).responses[0].response.mean_s, WithinRel(0.301, 1e-9));
+  REQUIRE_THAT(sim.step(100ms, 100ms).responses[0].response.mean_s, WithinRel(0.301, 1e-9));
+  REQUIRE_THAT(sim.step(200ms, 100ms).responses[0].response.mean_s, WithinRel(steady, 1e-9));
+}
+
+TEST_CASE(
+    "run and step refuse a step that differs from the scenario's, since delay lines are "
+    "sized for it",
+    "[theory]") {
+  auto sim = *Simulation::create(*Graph::build(mm1(500)));  // scenario step: 100 ms
+  REQUIRE_THROWS_AS(sim.run({.duration = 1s, .step = 10ms}, [](const auto&) {}),
+                    std::invalid_argument);
+  REQUIRE_THROWS_AS(sim.step(0s, 10ms), std::invalid_argument);
+}
+
+TEST_CASE("a loop of gain one settles at saturation: the entry node sheds what the client adds",
+          "[theory]") {
+  // g returns everything it serves, so f's demand grows by the client's 100/s per lap until
+  // f saturates at 1e6/s. That is a steady state of the fluid model: f drains 1e6/s, g
+  // serves exactly its capacity and returns all of it, and f drops the client's 100/s.
+  Scenario s = half_loop(0s);
+  s.nodes[2].ops["x"][0].factor = 1.0;
+  const auto e = (*Simulation::create(*Graph::build(s))).estimate();
+  REQUIRE(e.converged);
+  REQUIRE_THAT(e.nodes[1].demand_per_s, WithinRel(1e6 + 100, 1e-12));
+  REQUIRE_THAT(e.nodes[1].drain_per_s, WithinRel(1e6, 1e-12));
+  REQUIRE_THAT(e.nodes[1].dropped_per_s, WithinRel(100.0, 1e-9));
+  REQUIRE_THAT(e.nodes[2].demand_per_s, WithinRel(1e6, 1e-12));
+}
+
+TEST_CASE("estimate reports no steady state for a loop of gain one that nothing saturates",
+          "[theory]") {
+  // As above, but with capacities no lap can reach (1e12/s; concurrency 1 keeps the
+  // implied server count small): the demand grows by 100/s every pass and never stops
+  // changing, so estimate hits its pass cap and says so instead of returning a number.
+  Scenario s = half_loop(0s);
+  s.nodes[2].ops["x"][0].factor = 1.0;
+  for (const std::size_t i : {1U, 2U}) {
+    s.nodes[i].capacity = Rate{1e12};
+    s.nodes[i].advanced.concurrency = 1;
+  }
+  const auto e = (*Simulation::create(*Graph::build(s))).estimate();
+  REQUIRE_FALSE(e.converged);
+}
+
+TEST_CASE("run emits ceil(duration / step) records", "[theory]") {
+  auto sim = *Simulation::create(*Graph::build(mm1(500)));
+  int n = 0;
+  sim.run({.duration = 1s, .step = 100ms}, [&](const auto&) { ++n; });
+  REQUIRE(n == 10);
+  Scenario s = mm1(500);
+  s.step = 300ms;
+  auto sim2 = *Simulation::create(*Graph::build(s));
+  n = 0;
+  sim2.run({.duration = 1s, .step = 300ms}, [&](const auto&) { ++n; });
+  REQUIRE(n == 4);  // 0, 300, 600, 900 ms: the last step runs past the duration
 }
