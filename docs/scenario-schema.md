@@ -25,7 +25,7 @@ do not support yet (phase 2)". `explain` works for every type.
 | rate | number + optional `k M G` (decimal) + `/s` | `1.5k/s`, `500/s` |
 | byte rate | number + optional `K M G` (decimal, capital K) + `B/s` | `500MB/s` |
 | size † | `B KB MB GB` | `200B`, `2KB` |
-| clock time † | `HH:MM`, for `at:` / `peak_at:` | `"20:00"` |
+| clock time | `HH:MM`, for `at:` / `peak_at:` / a point's time; hours and minutes after midnight (t = 0) | `20:00`, `"20:00"` |
 | integer | a plain whole number: no quotes, no `+`, no `0x`, no `3.0`, no `1e3` | `4` |
 | number | a plain decimal; `.nan`, `.inf` and `nan`/`inf` are rejected | `0.8`, `1e-3` |
 
@@ -51,8 +51,7 @@ do not support yet (phase 2)". `explain` works for every type.
   'service'`).
 - **Clock times**: yaml-cpp reads an unquoted `20:00` as the text `20:00`. YAML 1.1
   readers (PyYAML, for example) read it as the sexagesimal integer 1200, so quote clock
-  times (`peak_at: "20:00"`) if the file is also read by other tools. Phase 1 reads no
-  clock times.
+  times (`peak_at: "20:00"`) if the file is also read by other tools.
 
 ## Top level
 
@@ -94,7 +93,7 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 | `latency` | duration | all but `client` | read | service time of one request; default per type |
 | `advanced` | map | all but `client` | read | see next table |
 | `ops` | map | `client`, `service`, `ws_gateway` | read (client, service); checked (ws_gateway) | client: op → share; otherwise op → step list (below) |
-| `cost` | map op → number | `service`, `cache` | read (service); checked (cache) | **new in phase 2a**: the capacity units one request of that op consumes; an op not listed costs 1. Each value is a positive finite number (`cost 'x' must be a positive finite number`); anything but a map is `cost must be a map of op to units`. `capacity` is then a rate of units: demand is `Σ rate_op × cost_op`, and the node's demand, drops and backlog are reported in units. What it forwards stays requests (a drained `write` of cost 3 is one `write` downstream). A `worker_pool`'s `cost` is a different key (a duration per job, below) |
+| `cost` | map op → number | `service`, `cache` | read (service); checked (cache) | **new in phase 2a**: the capacity units one request of that op consumes; an op not listed costs 1. Each value is a positive finite number (`cost 'x' must be a positive finite number`) of at most 1e6 (`cost 'x' must be at most 1e6`); anything but a map is `cost must be a map of op to units`. `capacity` is then a rate of units: demand is `Σ rate_op × cost_op`, and the node's demand, drops and backlog are reported in units. What it forwards stays requests (a drained `write` of cost 3 is one `write` downstream). A `worker_pool`'s `cost` is a different key (a duration per job, below) |
 | `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | checked | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step and drawn by `explain`; simulated with these types from phase 2 |
 
 A key outside its row is an error, e.g. `key 'capacity' is not valid for type 'client'`
@@ -173,12 +172,16 @@ rate:
   points: [[0s, 1k/s], [1h, 5k/s]]          # replaces base †
   noise:  {sigma: 0.15, correlation: 5m}    # †
 ```
-All keys are **read** by the loader and printed by `explain` and `simsys curve`; the engine
-still offers `base` only until clients follow the curve (phase 2a, Task 6).
+All keys are **read**: the loader types them, `explain` and `simsys curve` print them, and
+`run` offers the curve (with its noise) at every step.
 
-Composition: `rate(t) = level(t) × wave(t) × ramp(t) × Π active spike factors × noise(t)`,
-where `level` is `base`, or `points` interpolated linearly (held flat before the first and
-after the last entry). t = 0 is midnight: a time point (`peak_at`, `at`, a point's time) is a
+Composition: `rate(t) = level(t) × wave(t) × Π active spike factors × noise(t)`, where
+`level` is the ramp's rate `from + (to − from) × min(t / over, 1)` when there is a ramp,
+else `points` interpolated linearly (held flat before the first and after the last entry),
+else `base`. (The ramp is the spec's multiplier `ramp/base` times `base`, applied as the
+level itself: the same numbers, without a division that overflows for a tiny base.) Every
+accepted curve is finite: each level is at most `1e15/s`, the wave at most 2× and the
+product of the spikes active at any moment at most `1e6`. t = 0 is midnight: a time point (`peak_at`, `at`, a point's time) is a
 clock time `HH:MM` (quoted or not) or a duration from the start (`5m`).
 
 | Key | Rule | Message on violation |
@@ -187,12 +190,20 @@ clock time `HH:MM` (quoted or not) or a duration from the start (`5m`).
 | `base` | a rate, at most `1e15/s` | `rate.base must be at most 1e15/s` |
 | `points` | a non-empty list of `[time, rate]` pairs, sorted by time (equal times make a step), rates at most `1e15/s` | `rate.points must have at least one entry`, `rate.points entries are [time, rate] pairs`, `rate.points must be sorted by time` |
 | `wave` | all of `shape` (`sine`, `square`, `diurnal`), `period` > 0, `amplitude` in [0, 1], `peak_at` | `rate.wave needs shape, period, amplitude and peak_at`, `rate.wave.amplitude must be between 0 and 1`, ... |
-| `ramp` | all of `from`, `to` (rates), `over` > 0; needs a `base` above `0/s` (it is a multiplier `from/base → to/base`) | `rate.ramp needs from, to and over`, `rate.ramp needs rate.base` |
-| `spikes` | a list; each spike has `at`, `for` > 0 and `factor` in (0, 1e6] | `rate.spikes[2].factor must be positive` (numbered from 1) |
-| `noise` | `sigma` ≥ 0 (stationary standard deviation), `correlation` > 0 (τ) | `rate.noise needs sigma and correlation` |
+| `ramp` | all of `from`, `to` (rates, at most `1e15/s`), `over` > 0; needs a `base` above `0/s` and no `points`. The ramp sets the level, so `base` is not used in the arithmetic; the rule is kept so a file always states the client's nominal rate | `rate.ramp needs from, to and over`, `rate.ramp needs rate.base`, `rate.ramp.to must be at most 1e15/s` |
+| `spikes` | a list; each spike has `at`, `for` > 0 and `factor` in (0, 1e6]; the factors of the spikes active at any one moment multiply to at most `1e6` | `rate.spikes[2].factor must be positive` (numbered from 1), `rate.spikes: overlapping factors multiply to more than 1e6` |
+| `noise` | `sigma` in [0, 10] (stationary standard deviation), `correlation` > 0 (τ) | `rate.noise needs sigma and correlation`, `rate.noise.sigma must be at most 10` |
 
 Every block rejects unknown keys (`unknown rate.wave key 'colour'`,
-`unknown rate.spikes[1] key 'why'`).
+`unknown rate.spikes[1] key 'why'`). A numeric key says what is wrong with its value:
+`rate.wave.amplitude must not be empty` (a bare key), `... must be a number` (text, or a
+quoted `"0.5"`), or its range message (`.nan` and `.inf` included). `rate` itself is a map;
+the phase-1 spelling `rate: 100/s` gives `rate must be a map (write rate: {base: 100/s})`.
+
+`explain`'s `checks` block uses each client's **peak** rate over the run (the curve sampled
+every minute, plus every spike start and point time; no noise), summed as if every client
+peaked at once: the safe side of a back-of-the-envelope check ("peak QPS", ch. 2). The
+header names the span: `checks (peak offered load over the first 24h, no queueing):`.
 
 ## Links
 

@@ -1076,9 +1076,15 @@ bool has_cost_map(model::NodeType type) {
   return type == model::NodeType::service || type == model::NodeType::cache;
 }
 
+// The largest cost one request may have. Chosen, not from the book: the same bound as a
+// step's fan-out factor (max_step_factor), for the same reason. A request a million times
+// dearer than the cheapest is no realistic op mix (it is a typo), and rate x cost stays far
+// from overflowing a double (1e15/s x 1e6 = 1e21).
+inline constexpr double max_cost_units = max_step_factor;
+
 // One `op: units` entry. Positive (a free op would be served without using capacity, and
-// a negative one would give capacity back) and finite (an op that never finishes is a
-// capacity of zero, which the capacity key already says).
+// a negative one would give capacity back), finite (an op that never finishes is a
+// capacity of zero, which the capacity key already says) and at most max_cost_units.
 std::expected<std::pair<std::string, double>, ConfigError> read_cost_entry(
     const Site& site, const YamlElement& entry) {
   auto op = read_op_name(site, entry.first, "cost op");
@@ -1088,8 +1094,13 @@ std::expected<std::pair<std::string, double>, ConfigError> read_cost_entry(
     return std::unexpected(checked.error());
   }
   const auto units = number_value(entry.second);
-  if (units && is_positive(*units)) return std::pair{std::move(*op), *units};
-  return site.fail(entry.second, std::format("{} must be a positive finite number", label));
+  if (!units || !is_positive(*units)) {
+    return site.fail(entry.second, std::format("{} must be a positive finite number", label));
+  }
+  if (*units > max_cost_units) {
+    return site.fail(entry.second, std::format("{} must be at most 1e6", label));
+  }
+  return std::pair{std::move(*op), *units};
 }
 
 // `cost: {write: 3, read: 1}`: the capacity units one request of each op consumes; ops
@@ -1220,43 +1231,10 @@ CheckResult check_known_keys(const Site& site, const YAML::Node& map, std::strin
   return {};
 }
 
-// One word of a word-valued key (`on: miss`, `dir: inout`) and the enumerator it means.
-template <typename E>
-struct NamedValue {
-  std::string_view name;
-  E value;
-};
-
-// Pattern: Table-driven method — each enum the schema spells as a word is a table of
-// {word, enumerator}; one lookup in each direction serves them all.
-constexpr std::array<NamedValue<model::StepCondition>, 3> step_conditions{{
-    {"always", model::StepCondition::always},
-    {"miss", model::StepCondition::miss},
-    {"failure", model::StepCondition::failure},
-}};
-constexpr std::array<NamedValue<model::StepMode>, 2> step_modes{{
-    {"sequential", model::StepMode::sequential},
-    {"parallel", model::StepMode::parallel},
-}};
-// The direction and SLO metric names live next to their enums in simsys.model
-// (model::parse_direction, model::parse_slo_metric), shared with the report.
-// The wave shapes of a client's rate curve (simsys.workload).
-constexpr std::array<NamedValue<workload::WaveShape>, 3> wave_shapes{{
-    {"sine", workload::WaveShape::sine},
-    {"square", workload::WaveShape::square},
-    {"diurnal", workload::WaveShape::diurnal},
-}};
-
-template <typename E, std::size_t N>
-std::optional<E> find_named(const std::array<NamedValue<E>, N>& table, std::string_view name) {
-  const auto row = std::ranges::find(table, name, &NamedValue<E>::name);
-  if (row == table.end()) return std::nullopt;
-  return row->value;
-}
-
 // An optional word-valued key: absent keeps `target`'s default; present must be a word
-// `parse` recognises (model::parse_direction, or a lookup in one of the tables above),
-// otherwise `requirement` ("dir must be in, out or inout") is the message.
+// `parse` recognises (model::parse_direction, model::parse_step_mode, ...: each a lookup in
+// the enum's name table, core::parse_in), otherwise `requirement` ("dir must be in, out or
+// inout") is the message.
 // C++20 requires-clause: `parse` must turn a word into a std::optional<E>, the shape of
 // every lookup here; a lookup of another shape fails at the call, not inside the body.
 template <typename E, typename Parse>
@@ -1270,15 +1248,6 @@ CheckResult read_optional_word(const Site& site, const YAML::Node& parent, std::
   if (!word) return site.fail(value, requirement);
   target = *word;
   return {};
-}
-
-// The same with a local table as the lookup.
-template <typename E, std::size_t N>
-CheckResult read_optional_word(const Site& site, const YAML::Node& parent, std::string_view key,
-                               const std::array<NamedValue<E>, N>& table,
-                               std::string_view requirement, E& target) {
-  const auto lookup = [&table](std::string_view name) { return find_named(table, name); };
-  return read_optional_word(site, parent, key, lookup, requirement, target);
 }
 
 // An optional numeric key: absent keeps `target`'s default; present must be a number that
@@ -1331,12 +1300,12 @@ std::expected<std::string, ConfigError> read_step_op(const Site& site, const YAM
 // `mode` decides whether latencies add (sequential) or overlap (parallel: the max counts),
 // `factor` multiplies the flow (fan-out on write: one post -> 100 feed writes, ch. 11).
 CheckResult read_step_attributes(const Site& site, const YAML::Node& yaml, model::Step& step) {
-  if (auto read = read_optional_word(site, yaml, "on", step_conditions,
+  if (auto read = read_optional_word(site, yaml, "on", model::parse_step_condition,
                                      "step condition must be always, miss or failure", step.on);
       !read) {
     return read;
   }
-  if (auto read = read_optional_word(site, yaml, "mode", step_modes,
+  if (auto read = read_optional_word(site, yaml, "mode", model::parse_step_mode,
                                      "step mode must be sequential or parallel", step.mode);
       !read) {
     return read;
@@ -1502,15 +1471,42 @@ CheckResult check_curve_block(const Site& site, const YAML::Node& block, std::st
   return site.fail(block, std::format("{} needs {}", label, spoken_list(keys)));
 }
 
-// `block[key]` as a number that passes `in_range`, else "<label>.<key> must be <requirement>".
+// YAML's spellings of not-a-number and infinity (YAML 1.2 core schema). They are numbers in
+// YAML, just not finite ones, so a key answers them with its range message, not "must be a
+// number".
+constexpr std::array<std::string_view, 12> yaml_special_floats{".nan",  ".NaN",  ".NAN",  ".inf",
+                                                               ".Inf",  ".INF",  "+.inf", "+.Inf",
+                                                               "+.INF", "-.inf", "-.Inf", "-.INF"};
+
+// Is `node` written as a number at all, finite or not, in range or not? A plain scalar
+// that reads whole as a decimal (1e309 included, which is out of range, not "no number"),
+// or one of YAML's NaN/infinity spellings. A quoted "0.5", a word, a list or a map is not.
+bool is_written_as_number(const YAML::Node& node) {
+  const auto text = number_text(node);
+  if (text.empty()) return false;
+  const auto parsed = parse_whole<double>(text);
+  return parsed || parsed.error() == NumberFault::out_of_range ||
+         std::ranges::contains(yaml_special_floats, std::string_view{text});
+}
+
+// `block[key]` as a number that passes `in_range`. Otherwise the message says what is
+// wrong: "<label>.<key> must not be empty" for a bare key, "must be a number" for text or
+// a quoted number (a typed language rejects "0.5" where a double is expected), and
+// "must be <requirement>" for a number out of range (NaN and infinity included).
 std::expected<double, ConfigError> read_curve_number(const Site& site, const YAML::Node& block,
                                                      std::string_view label, std::string_view key,
                                                      bool (*in_range)(double),
                                                      std::string_view requirement) {
-  const auto number = number_value(block[std::string{key}]);
+  const auto full = std::format("{}.{}", label, key);
+  if (auto checked = check_not_null(site, block, key, full); !checked) {
+    return std::unexpected(checked.error());
+  }
+  const auto value = block[std::string{key}];
+  if (!is_written_as_number(value))
+    return site.fail(value, std::format("{} must be a number", full));
+  const auto number = number_value(value);
   if (number && in_range(*number)) return *number;
-  return site.fail(shape_site(block, key),
-                   std::format("{}.{} must be {}", label, key, requirement));
+  return site.fail(value, std::format("{} must be {}", full, requirement));
 }
 
 // `block[key]` as a duration above zero: a period, a spike's length, a ramp's length, a
@@ -1538,7 +1534,7 @@ std::expected<SimTime, ConfigError> read_time_point(const Site& site, const YAML
 
 std::expected<workload::WaveShape, ConfigError> read_wave_shape(const Site& site,
                                                                 const YAML::Node& wave) {
-  if (const auto shape = find_named(wave_shapes, scalar_text(wave["shape"]))) return *shape;
+  if (const auto shape = workload::parse_wave_shape(scalar_text(wave["shape"]))) return *shape;
   return site.fail(shape_site(wave, "shape"), "rate.wave.shape must be sine, square or diurnal");
 }
 
@@ -1593,7 +1589,8 @@ std::expected<workload::Ramp, ConfigError> read_ramp(const Site& site, const YAM
 
 // A spike's factor is above zero (a zero factor silences the client; leave the spike out)
 // and at most max_step_factor, the bound of a step's fan-out factor, for the same reason:
-// rate x factor must stay far from overflowing a double.
+// rate x factor must stay far from overflowing a double. Overlapping spikes multiply, so
+// read_spikes bounds their product too (check_spike_product).
 std::expected<workload::Spike, ConfigError> read_spike(const Site& site, const YAML::Node& spike,
                                                        std::string_view label) {
   if (auto checked = check_curve_block(site, spike, label, spike_keys); !checked) {
@@ -1617,6 +1614,37 @@ std::expected<workload::Spike, ConfigError> read_spike(const Site& site, const Y
   return site.fail(spike["factor"], std::format("{}.factor must be at most 1e6", label));
 }
 
+// Is `spike` active at `t`, i.e. at <= t < at + duration? The same rule as the curve's
+// (workload::RateCurve::rate_at), written as a difference so it cannot overflow: both
+// times are offsets from t = 0, never negative.
+bool spike_active_at(const workload::Spike& spike, SimTime t) {
+  return spike.at.count() <= t.count() && t.count() - spike.at.count() < spike.duration.count();
+}
+
+// The product of the factors of every spike active at `t`: overlapping spikes compound.
+double spike_product_at(const std::vector<workload::Spike>& spikes, SimTime t) {
+  double product = 1.0;
+  for (const auto& spike : spikes) {
+    if (spike_active_at(spike, t)) product *= spike.factor;
+  }
+  return product;
+}
+
+// Overlapping spikes compound, so bounding each factor by max_step_factor is not enough:
+// a thousand spikes of 1e6 at the same moment multiply to infinity. The bound applies to
+// the product at every moment. The product is a step function that rises only where a
+// spike starts (it falls where one ends), so its maximum is reached at some spike's `at`,
+// and checking every start finds it: n starts x n spikes, O(n^2), fine for the handful of
+// spikes a scenario has.
+CheckResult check_spike_product(const Site& site, const YAML::Node& list,
+                                const std::vector<workload::Spike>& spikes) {
+  const bool bounded = std::ranges::all_of(spikes, [&](const workload::Spike& spike) {
+    return spike_product_at(spikes, spike.at) <= max_step_factor;
+  });
+  if (bounded) return {};
+  return site.fail(list, "rate.spikes: overlapping factors multiply to more than 1e6");
+}
+
 // Spikes are numbered from 1 in messages, as an author counts them ("rate.spikes[2]").
 std::expected<std::vector<workload::Spike>, ConfigError> read_spikes(const Site& site,
                                                                      const YAML::Node& rate) {
@@ -1632,7 +1660,7 @@ std::expected<std::vector<workload::Spike>, ConfigError> read_spikes(const Site&
     if (!spike) return std::unexpected(spike.error());
     spikes.push_back(*spike);
   }
-  return spikes;
+  return check_spike_product(site, list, spikes).transform([&] { return std::move(spikes); });
 }
 
 // One `[time, rate]` entry of a trace; `label` ("rate.points[2]") prefixes a unit error.
@@ -1694,14 +1722,16 @@ CheckResult read_wave_term(const Site& site, const YAML::Node& rate, workload::R
   return read_wave(site, rate["wave"]).transform(store_in(curve.wave));
 }
 
-// A ramp is a multiplier relative to `base` (from/base -> to/base, phase 2a refinement 2),
-// so it needs a nonzero base to be relative to: next to `points`, or with a base of 0/s,
-// it has no meaning.
+// A ramp's rate is the client's level while it is in force (workload::RateCurve: the spec's
+// multiplier ramp/base times base, applied without the division). It needs no base for the
+// arithmetic, but the rule "a ramp needs a positive rate.base" is kept on purpose: the file
+// then always states the client's nominal rate (explain prints it; deleting the ramp leaves
+// a complete curve), and next to `points`, which are a level too, a ramp has no meaning.
 CheckResult read_ramp_term(const Site& site, const YAML::Node& rate, workload::RateCurve& curve) {
   if (!rate["ramp"]) return {};
   if (auto checked = check_not_null(site, rate, "ramp", "rate.ramp"); !checked) return checked;
-  // One message for both: a base of 0/s is no base to be relative to. workload's ramp
-  // term throws for either (a programmer error), so no scenario may reach it.
+  // One message for both. workload's rate_at throws for a ramp next to points (a
+  // programmer error), so no scenario may reach it.
   if (curve.points || curve.base.per_second <= 0.0) {
     return site.fail(rate["ramp"], "rate.ramp needs rate.base");
   }
@@ -1771,9 +1801,13 @@ CheckResult read_noise_term(const Site& site, const YAML::Node& rate,
 CheckResult read_rate(const Site& site, const YAML::Node& body, model::Workload& workload) {
   if (auto checked = check_not_null(site, body, "rate", "rate"); !checked) return checked;
   const auto rate = body["rate"];
-  if (!rate || !rate.IsMap()) {
-    return site.fail(rate ? rate : body, "client needs rate.base or rate.points");
+  if (!rate) return site.fail(body, "client needs rate.base or rate.points");
+  // `rate: 100/s` was the phase-1 spelling of a constant rate; say how to write it now.
+  if (rate.IsScalar()) {
+    return site.fail(rate,
+                     std::format("rate must be a map (write rate: {{base: {}}})", rate.Scalar()));
   }
+  if (!rate.IsMap()) return site.fail(rate, "rate must be a map");
   if (auto checked = check_known_keys(site, rate, rate_keys, "rate key"); !checked) return checked;
   if (auto read = read_rate_curve(site, rate).transform(store_in(workload.curve)); !read) {
     return read;

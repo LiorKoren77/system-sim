@@ -109,9 +109,15 @@ constexpr double rounds_to_one = 0.9995;
   return fmt_duration(seconds(t));
 }
 
-// A count with an SI prefix and four significant digits: 500, 1.5k, 2M.
+// From here on the largest prefix, G, would need an exponent itself ("1e+04G").
+constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
+
+// A count with an SI prefix and four significant digits: 500, 1.5k, 2M. Past 9999G it is
+// written in plain scientific notation (1e+15), which parse_rate reads back too; G stays
+// the largest prefix, as in the scenario grammar (core's rate_prefixes stop at G).
 [[nodiscard]] std::string with_si_prefix(double value) {
   if (!std::isfinite(value)) return "unavailable";
+  if (std::abs(value) >= beyond_prefixes) return num(value);
   for (const auto& prefix : si_prefixes) {
     if (std::abs(value) >= prefix.size) return num(value / prefix.size) + std::string{prefix.name};
   }
@@ -538,19 +544,6 @@ template <class T, class F>
 
 // ---- the rate curve in one line ----
 
-[[nodiscard]] std::string_view wave_shape_name(workload::WaveShape shape) {
-  using enum workload::WaveShape;
-  switch (shape) {
-    case sine:
-      return "sine";
-    case square:
-      return "square";
-    case diurnal:
-      return "diurnal";
-  }
-  std::unreachable();
-}
-
 [[nodiscard]] std::string two_digits(std::int64_t value) {
   return (value < 10 ? "0" : "") + std::to_string(value);
 }
@@ -570,16 +563,19 @@ template <class T, class F>
 [[nodiscard]] std::string level_summary(const workload::RateCurve& curve) {
   if (!curve.points) return "base " + fmt_rate(curve.base.per_second);
   const auto& at = curve.points->at;
-  // C++20 std::ranges::minmax with a projection: the lowest and highest rate of the trace
-  // in one pass, comparing by the rate member instead of through a hand-written lambda.
+  // C++20 std::views::values: a view of each pair's second member (here the rate of each
+  // (time, rate) point), without copying them out. C++20 std::ranges::minmax with a
+  // projection: the lowest and highest rate of the trace in one pass, comparing by the rate
+  // member instead of through a hand-written lambda.
   const auto [low, high] = std::ranges::minmax(at | std::views::values, {}, &Rate::per_second);
   return "points " + std::to_string(at.size()) + " (" + fmt_rate(low.per_second) + ".." +
          fmt_rate(high.per_second) + ")";
 }
 
 [[nodiscard]] std::string wave_summary(const workload::Wave& wave) {
-  return "wave " + std::string{wave_shape_name(wave.shape)} + " P=" + fmt_duration(wave.period) +
-         " A=" + num(wave.amplitude) + " peak " + clock_or_duration(wave.peak_at);
+  return "wave " + std::string{workload::to_string(wave.shape)} +
+         " P=" + fmt_duration(wave.period) + " A=" + num(wave.amplitude) + " peak " +
+         clock_or_duration(wave.peak_at);
 }
 
 [[nodiscard]] std::string ramp_summary(const workload::Ramp& ramp) {
@@ -708,20 +704,60 @@ template <class T, class F>
 // Offered rate per op arriving at each node, requests per second.
 using OpLoad = std::map<std::string, double, std::less<>>;
 
-// What the clients send at t = 0, the time `estimate` evaluates: the curve's rate there
-// (rate_at, so a points-only client counts too; no noise) × op share × route share on
-// each route.
+// ---- the peak a client offers ----
+//
+// The book's estimate is "peak QPS = 2 x average" (System Design Interview ch. 2): a design
+// is sized for its busiest moment, not for its average or for midnight. So the checks use
+// each client's PEAK rate over the run, found by sampling the deterministic curve (no
+// noise: noise is a random excursion around the curve, not part of the plan on paper).
+
+// One sample a minute: fine enough for any wave (a day has 1440 samples) and for ramps,
+// cheap enough for runs of weeks. Chosen, not from the book.
+constexpr SimTime peak_sample_step = 1_min;
+
+// Moments where a curve's peak can fall between two whole minutes: a spike's start (a
+// spike shorter than a minute could hide between samples) and a point of a trace (its
+// rates are reached exactly at its times, and interpolation peaks there).
+[[nodiscard]] std::vector<SimTime> breakpoints(const workload::RateCurve& curve) {
+  std::vector<SimTime> times;
+  for (const auto& spike : curve.spikes) times.push_back(spike.at);
+  if (curve.points) {
+    for (const auto& [time, rate] : curve.points->at) times.push_back(time);
+  }
+  return times;
+}
+
+// The highest rate the curve reaches in [0, duration): every minute, plus the breakpoints.
+// The whole run, not one wave period: a spike, a ramp or a trace can peak after the
+// wave's first cycle, and sampling a long run is still cheap.
+[[nodiscard]] double peak_rate(const workload::RateCurve& curve, SimTime duration) {
+  double peak = curve.rate_at(SimTime{0}).per_second;
+  for (const auto& sample : workload::samples(curve, peak_sample_step, duration)) {
+    peak = std::max(peak, sample.rate.per_second);
+  }
+  for (const auto t : breakpoints(curve)) {
+    if (t.count() < duration.count()) peak = std::max(peak, curve.rate_at(t).per_second);
+  }
+  return peak;
+}
+
+// What the clients send at their peaks: each client's peak rate (peak_rate; a points-only
+// client counts too) × op share × route share on each route. Each client's own peak, even
+// when two clients peak at different times: an upper bound on the load at any one moment,
+// which is the safe side for a capacity check on paper. (`estimate` evaluates t = 0
+// instead; the two agree for a constant rate.)
 [[nodiscard]] std::vector<OpLoad> client_load(const graph::Graph& g) {
   std::vector<OpLoad> load(g.nodes().size());
+  const auto duration = g.scenario().duration;
   for (std::size_t client = 0; client < g.nodes().size(); ++client) {
     const auto& workload = g.nodes()[client].spec.workload;
     if (!workload) continue;
-    const double rate_at_zero = workload->curve.rate_at(SimTime{0}).per_second;
+    const double peak = peak_rate(workload->curve, duration);
     for (const auto& route : g.client_routes(client)) {
       const auto share =
           std::ranges::find(workload->op_shares, route.op, &std::pair<std::string, double>::first);
       if (share == workload->op_shares.end()) continue;
-      load[route.target][route.op] += rate_at_zero * share->second * route.share;
+      load[route.target][route.op] += peak * share->second * route.share;
     }
   }
   return load;
@@ -799,6 +835,8 @@ struct PaperLoad {
 
 // No total moved by more than the tolerance (NaN never counts as unchanged).
 [[nodiscard]] bool settled(std::span<const double> before, std::span<const double> after) {
+  // C++23 std::views::zip: walks two ranges in lockstep and yields pairs of references,
+  // replacing an index loop over both spans (and stops at the shorter one).
   return std::ranges::all_of(std::views::zip(before, after), [](const auto& pair) {
     const auto [b, a] = pair;
     return a == b || std::abs(a - b) <= paper_tolerance * std::abs(a);
@@ -832,12 +870,12 @@ struct PaperLoad {
   return {.totals = std::move(totals), .converged = false};
 }
 
-// Utilization at the paper load: offered / (capacity per replica × replicas), with the
-// node's own zone thresholds. Both are in capacity units (requests when every cost is 1).
+// Utilization at the paper load: peak offered / (capacity per replica × replicas), with
+// the node's own zone thresholds. Both are in capacity units (requests when every cost is 1).
 [[nodiscard]] std::string check_details(const graph::ResolvedNode& node, double offered) {
   const double total_capacity = node.capacity.service_rate.per_second * node.spec.replicas;
   const std::string head =
-      "offered " + fmt_rate(offered) + " vs " + fmt_rate(total_capacity) + " total capacity  ";
+      "peak offered " + fmt_rate(offered) + " vs " + fmt_rate(total_capacity) + " total capacity  ";
   if (total_capacity <= 0.0) return head + "(no capacity, red)";
   const double rho = offered / total_capacity;
   return head + "(" + percent(rho) + ", " +
@@ -853,7 +891,9 @@ struct PaperLoad {
     rows.push_back({{node.spec.id}, {check_details(node, load.totals[i])}});
   }
   const std::string note = load.converged ? "" : "  (no steady state: a loop of gain >= 1)\n";
-  return "checks:\n" + aligned(rows, Align::all_left) + note;
+  const std::string header = "checks (peak offered load over the first " +
+                             fmt_duration(g.scenario().duration) + ", no queueing):\n";
+  return header + aligned(rows, Align::all_left) + note;
 }
 
 // ---- CSV ----
@@ -955,8 +995,6 @@ void Summary::observe(const engine::StepRecord& record) {
   if (record.t.count() < warmup_.count()) return;  // warmup: the queues are still filling
   ++observed_steps_;
   observed_s_ += dt_s;
-  // C++23 std::views::zip: walks two ranges in lockstep and yields pairs of references,
-  // replacing an index loop over both vectors (and stops at the shorter one).
   for (auto [totals, sample] : std::views::zip(nodes_, record.nodes)) totals.add(sample, dt_s);
   for (std::size_t k = 0; k < record.responses.size(); ++k) {
     const auto& sample = record.responses[k];

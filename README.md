@@ -35,9 +35,12 @@ Colour is on when stdout is a terminal; `--no-color` turns it off and JSON never
 
 `curve` prints one client's offered rate over time as CSV (`t_s,rate_per_s`), sampled every
 `--step` from t = 0 (midnight) up to `--until` (default: the scenario's duration), so the
-`rate:` block (base or points, times wave, ramp and spikes) can be plotted before anything
-runs. `--noise` multiplies in the client's `rate.noise` process, seeded from `--seed` (default:
-the scenario's seed) exactly as the engine will seed that client. On the
+`rate:` block (base, points or a ramp, times wave and spikes) can be plotted before anything
+runs. `--noise` multiplies in the client's `rate.noise` process exactly as a run sees it:
+seeded from `--seed` (default: the scenario's seed) as the engine seeds that client, advanced
+every scenario `step` (so `--step` must be a multiple of it; every k-th value is printed),
+and stepped once before each value is read, as the engine ticks a client before it offers,
+so the t = 0 row already includes one noise step. On the
 [rate-limiter lab](scenarios/labs/rate-limiter/), the 5x spike at 5 minutes:
 
 ```
@@ -65,12 +68,14 @@ links:
   users -> api  inout  one_way=250us (intra_dc_rtt/2)  delay_steps=0
   api -> db     inout  one_way=250us (intra_dc_rtt/2)  delay_steps=0
 order: users, api, db
-checks:
-  api  offered 1.5k/s vs 2k/s total capacity  (75%, yellow)
-  db   offered 1.8k/s vs 5k/s total capacity  (36%, green)
+checks (peak offered load over the first 2m, no queueing):
+  api  peak offered 1.5k/s vs 2k/s total capacity  (75%, yellow)
+  db   peak offered 1.8k/s vs 5k/s total capacity  (36%, green)
 ```
 
-and `run`, whose utilizations agree with the static checks above:
+The checks use each client's peak rate over the run (its curve sampled every minute, no
+noise), the number a back-of-the-envelope estimate sizes for. Here the rate is constant, so
+`run`'s utilizations agree with them:
 
 ```
 $ simsys run scenarios/tutorial/chain/scenario.yaml
@@ -91,10 +96,10 @@ slo
   PASS    drop_rate    -      -      0         0
 ```
 
-What phase 1 runs: clients (base rate only: the rate curve's waves, spikes and ramps are
-ignored) and services, with their queues, links, fan-out steps and feedback loops. Every
-other node type (load balancers, caches, databases, queues, CDNs, ...) already validates and
-appears in `explain` with its resolved numbers, but `estimate` and `run` stop with
+What runs today: clients (the whole rate curve, with its seeded noise) and services, with
+their queues, links, fan-out steps and feedback loops. Every other node type (load
+balancers, caches, databases, queues, CDNs, ...) already validates and appears in
+`explain` with its resolved numbers, but `estimate` and `run` stop with
 "which run/estimate do not support yet (phase 2)" and exit 1. A `sweep` command
 (`--param nodes.users.rate.base=1k/s..100k/s:10`) is planned.
 
