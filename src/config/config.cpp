@@ -1119,6 +1119,46 @@ CheckResult read_cost(const Site& site, const YAML::Node& body, model::NodeSpec&
   return {};
 }
 
+// ---- Load balancer keys (plan 2a refinement 5) ----
+
+// `policy: least_connections`; absent means round_robin (the schema's default), filled in
+// here so every later stage reads a policy instead of re-deciding the default.
+CheckResult read_lb_policy(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  node.policy = model::LbPolicy::round_robin;
+  if (!body["policy"]) return {};
+  auto word = scalar_value(site, body, "policy");
+  if (!word) return std::unexpected(word.error());
+  const auto policy = model::parse_lb_policy(*word);
+  if (!policy) {
+    return site.fail(body["policy"],
+                     "policy must be round_robin, least_connections, weighted or consistent_hash");
+  }
+  node.policy = *policy;
+  return {};
+}
+
+// `vnodes: 150`: virtual nodes per server on the hash ring, so it means something only to
+// consistent_hash; on another policy it is a leftover from an edit, not a no-op to accept.
+// Absent, the graph uses model::default_vnodes.
+CheckResult read_vnodes(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  const auto value = body["vnodes"];
+  if (!value) return {};
+  if (auto checked = check_not_null(site, body, "vnodes", "vnodes"); !checked) return checked;
+  auto count = read_positive_int(site, value, "vnodes");
+  if (!count) return std::unexpected(count.error());
+  if (node.policy != model::LbPolicy::consistent_hash) {
+    return site.fail(value, "vnodes applies only to consistent_hash");
+  }
+  node.vnodes = *count;
+  return {};
+}
+
+// The policy first: whether `vnodes` is allowed depends on it.
+CheckResult read_balancer_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (node.type != model::NodeType::load_balancer) return {};
+  return read_lb_policy(site, body, node).and_then([&] { return read_vnodes(site, body, node); });
+}
+
 // The keys every node type shares. `ops`, `then` and the node references (backend, ...)
 // are read in the second pass, once every id is known.
 CheckResult read_common_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node,
@@ -1176,6 +1216,9 @@ std::expected<model::NodeSpec, ConfigError> read_node_declaration(const Site& si
     return std::unexpected(read.error());
   }
   if (auto read = read_cost(this_node, entry.second, node); !read) {
+    return std::unexpected(read.error());
+  }
+  if (auto read = read_balancer_keys(this_node, entry.second, node); !read) {
     return std::unexpected(read.error());
   }
   return node;

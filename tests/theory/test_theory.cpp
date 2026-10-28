@@ -655,8 +655,8 @@ TEST_CASE("the curve command's noisy samples at the scenario step are the run's 
 // each with mean wait rho / (mu - lambda) = 9 ms (book ch. 1: a plain load balancer).
 TEST_CASE("round robin keeps replicas as independent queues: each copy is an M/M/1 at its share",
           "[theory]") {
-  const auto r =
-      (*Simulation::create(*Graph::build(lb_front(LbPolicy::round_robin, 2, 1800)))).step(0s, 100ms);
+  const auto r = (*Simulation::create(*Graph::build(lb_front(LbPolicy::round_robin, 2, 1800))))
+                     .step(0s, 100ms);
   const auto& a = r.nodes[2];
   REQUIRE_THAT(a.rho, WithinRel(0.9, 1e-12));
   const auto w = simsys::queueing::mmc_wait(1, 0.9, 0.001);
@@ -668,14 +668,16 @@ TEST_CASE("round robin keeps replicas as independent queues: each copy is an M/M
 // queue with c = 2 servers. Its wait is ErlangC(c, rho) * s / (c (1 - rho)), which at the
 // same rho is far below the M/M/1 wait of round robin (the pooling effect).
 TEST_CASE("least connections pools the replicas: one M/M/c queue with c = replicas", "[theory]") {
-  const auto r = (*Simulation::create(*Graph::build(lb_front(LbPolicy::least_connections, 2, 1800))))
-                     .step(0s, 100ms);
+  const auto r =
+      (*Simulation::create(*Graph::build(lb_front(LbPolicy::least_connections, 2, 1800))))
+          .step(0s, 100ms);
   const auto& a = r.nodes[2];
   REQUIRE_THAT(a.rho, WithinRel(0.9, 1e-12));
   const auto w = simsys::queueing::mmc_wait(2, 0.9, 0.001);  // ErlangC(2, 0.9) s / (2 (1 - 0.9))
   REQUIRE_THAT(a.latency.mean_s, WithinRel(w.mean_s + 0.001, 1e-9));
   const auto round_robin =
-      (*Simulation::create(*Graph::build(lb_front(LbPolicy::round_robin, 2, 1800)))).step(0s, 100ms);
+      (*Simulation::create(*Graph::build(lb_front(LbPolicy::round_robin, 2, 1800))))
+          .step(0s, 100ms);
   REQUIRE(a.latency.mean_s < round_robin.nodes[2].latency.mean_s);
 }
 

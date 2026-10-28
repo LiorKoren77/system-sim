@@ -2617,8 +2617,9 @@ TEST_CASE("a load balancer's policy and vnodes are typed and checked") {
   // read `least_connections` instead of `simsys::model::LbPolicy::least_connections`.
   using enum simsys::model::LbPolicy;
   SECTION("a named policy loads as the enum") {
-    const auto path = write_temp("simsys_lb_policy.yaml",
-                                 scenario_with("  lb: {type: load_balancer, policy: least_connections}\n"));
+    const auto path =
+        write_temp("simsys_lb_policy.yaml",
+                   scenario_with("  lb: {type: load_balancer, policy: least_connections}\n"));
     const auto s = simsys::config::load(path.string());
     INFO((s ? "" : s.error().message));
     REQUIRE(s.has_value());
