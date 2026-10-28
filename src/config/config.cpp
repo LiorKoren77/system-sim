@@ -101,7 +101,7 @@ constexpr std::array<OwnKeys, model::node_type_names.size()> own_keys_by_type{{
     {model::NodeType::client, "rate ops keys sizes timeout retries"},
     {model::NodeType::cdn, "ttl hit_ratio origin"},
     {model::NodeType::load_balancer, "policy vnodes"},
-    {model::NodeType::rate_limiter, "algorithm limit burst backend"},
+    {model::NodeType::rate_limiter, "algorithm limit burst window backend"},
     {model::NodeType::service, "ops cost"},
     {model::NodeType::cache, "eviction strategy keys hit_ratio backend ttl then cost"},
     {model::NodeType::sql_db, "replication_lag shards pool"},
@@ -1929,6 +1929,88 @@ std::expected<model::Workload, ConfigError> read_workload(const Site& site,
   return workload;
 }
 
+// ---- Rate limiter keys (plan 2a refinement 6) -------------------------------------------
+//
+// Read in the second pass, where every reader above is declared and every node's type is
+// known (`backend` must name a cache). Order matters: the default burst is limit x window.
+
+// `algorithm: sliding_log`; absent means token_bucket (the book's first and most common
+// algorithm, ch. 4), filled in here so every later stage reads an algorithm.
+CheckResult read_limiter_algorithm(const Site& site, const YAML::Node& body,
+                                   model::NodeSpec& node) {
+  node.algorithm = model::LimiterAlgorithm::token_bucket;
+  return read_optional_word(site, body, "algorithm", model::parse_limiter_algorithm,
+                            "algorithm must be token_bucket, leaky_bucket, fixed_window, "
+                            "sliding_log or sliding_counter",
+                            *node.algorithm);
+}
+
+// `limit: 1k/s`, required: it is the one number that makes a limiter limit. Positive: a
+// limit of 0/s is a wall, which a missing link says more plainly.
+CheckResult read_limiter_limit(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (!body["limit"]) return site.fail(body, "rate_limiter needs a limit");
+  auto limit = read_bounded_rate(site, body, "limit", "limit");
+  if (!limit) return std::unexpected(limit.error());
+  if (!is_positive(limit->per_second)) return site.fail(body["limit"], "limit must be positive");
+  node.limit = *limit;
+  return {};
+}
+
+// `window: 500ms`, default model::default_limiter_window (1 s). Zero would make a window
+// hold nothing and the default burst zero.
+CheckResult read_limiter_window(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  node.window = model::default_limiter_window;
+  if (!body["window"]) return {};
+  auto window = parse_duration_key(site, body, "window");
+  if (!window) return std::unexpected(window.error());
+  if (window->count() <= 0) return site.fail(body["window"], "window must be positive");
+  node.window = *window;
+  return {};
+}
+
+// `burst: 500`, a whole number of requests. Default limit x window, rounded up: a windowed
+// algorithm lets at most one window's worth through at once, so that IS its burst; a token
+// bucket has no window of its own, and one window's worth (one second's, by default) is
+// the conventional sizing of its bucket for want of a better number.
+CheckResult read_limiter_burst(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (body["burst"]) {
+    if (auto checked = check_not_null(site, body, "burst", "burst"); !checked) return checked;
+    return read_positive_int(site, body["burst"], "burst").transform(store_in(node.burst));
+  }
+  const double per_window = model::limiter_burst(node);  // limit x window, rounded up
+  if (per_window > std::numeric_limits<int>::max()) {
+    return site.fail(body, "limit x window is too large for a burst; give burst explicitly");
+  }
+  node.burst = static_cast<int>(per_window);
+  return {};
+}
+
+// `backend: counters`: the counter store every admitted request consults (ch. 4 keeps the
+// counters in Redis). read_node_routing has already checked that the node exists; here it
+// must also be a cache, the only type that models an in-memory key-value store in 2a.
+CheckResult read_limiter_backend(const Site& site, const YAML::Node& body, model::NodeSpec& node,
+                                 const Declarations& declared) {
+  if (!body["backend"]) return {};
+  const auto id = scalar_text(body["backend"]);
+  const auto& target = declared.nodes[declared.ids.find(id)->second];
+  if (target.type != model::NodeType::cache) {
+    return site.fail(body["backend"], "backend must be a cache");
+  }
+  node.backend = id;
+  return {};
+}
+
+CheckResult read_limiter_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node,
+                              const Declarations& declared) {
+  if (node.type != model::NodeType::rate_limiter) return {};
+  const auto this_node = node_site(site, node.id);
+  return read_limiter_algorithm(this_node, body, node)
+      .and_then([&] { return read_limiter_limit(this_node, body, node); })
+      .and_then([&] { return read_limiter_window(this_node, body, node); })
+      .and_then([&] { return read_limiter_burst(this_node, body, node); })
+      .and_then([&] { return read_limiter_backend(this_node, body, node, declared); });
+}
+
 // ---- Node bodies: the second pass -----------------------------------------------------
 
 // A client offers traffic (its `ops` are shares of its rate); every other node forwards
@@ -1968,9 +2050,11 @@ CheckResult read_node_routing(const Site& site, const YAML::Node& body, model::N
 CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarations& declared) {
   auto node = declared.nodes.begin();
   for (const auto& entry : nodes) {
-    if (auto read = read_node_routing(site, entry.second, *node++, declared.ids); !read) {
+    if (auto read = read_node_routing(site, entry.second, *node, declared.ids); !read) {
       return read;
     }
+    if (auto read = read_limiter_keys(site, entry.second, *node, declared); !read) return read;
+    ++node;
   }
   return {};
 }

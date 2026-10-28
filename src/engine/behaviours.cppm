@@ -1,7 +1,8 @@
 // Module `simsys.behaviours`: what each node type does with flow (client: offer load
 // along its routes; service: forward step demand, serve the rest; load balancer: pass
-// everything on across its links) and how it composes response latency from its own
-// sojourn plus link legs and downstream responses.
+// everything on across its links; rate limiter: pass on what it admits, reject the rest)
+// and how it composes response latency from its own sojourn plus link legs and downstream
+// responses.
 //
 // Latency composes on the reply path. A hop to a downstream node costs two link legs
 // (request out, reply back) plus that node's own response; sequential hops add, parallel
@@ -55,11 +56,15 @@ struct Outgoing {
 };
 
 // What a behaviour does with one step's flow: what it forwards (one Outgoing per
-// (target, link), sorted by target then link so runs are deterministic) and what it
-// serves itself (the load its own queue sees).
+// (target, link), sorted by target then link so runs are deterministic), what it
+// serves itself (the load its own queue sees) and what it refuses (`rejected`: admission
+// control, plan 2a refinement 6; only a rate limiter fills it). Rejected flow is answered
+// at once ("429 Too Many Requests", ch. 4) and never forwarded; the engine counts it in the
+// node's `rejected_per_s`, which the drop rate adds to the queue's drops.
 struct Routed {
   std::vector<Outgoing> outgoing{};
   flow::Flow served{};
+  flow::Flow rejected{};
 };
 
 // C++20 concept: a named, compile-time predicate on a type. Replaces SFINAE tricks
@@ -85,7 +90,7 @@ concept ResponseLookup = std::invocable<F, std::size_t, std::string_view> &&
 // refinement 4): the engine charges the node's queue in units, not requests.
 // `route(in, dt)` takes the step length and is called on a non-const behaviour (`node`):
 // a stateless node (service, load balancer) ignores dt and may declare route const, but
-// a stateful one (the rate limiter's token bucket, next) refills by dt and must change
+// a stateful one (the rate limiter's token bucket) refills by dt and must change
 // itself. Requiring it on `B&` admits both; `cost` and `response` stay const.
 template <class B>
 concept NodeBehaviour =
@@ -351,6 +356,64 @@ class ClientBehaviour {
   std::vector<std::string> ops_;
 };
 
+}  // namespace simsys::behaviours
+
+// Not exported: an implementation piece of the two forwarding behaviours below. It has
+// module linkage (a named namespace, not an anonymous one: GCC 14 rejects a member of
+// internal-linkage type in an exported class of a module interface).
+namespace simsys::behaviours::detail {
+
+// How a node that forwards by LINK (a load balancer, a rate limiter) passes each op on:
+// over every route whose link carries it, at the shares graph::Graph::routes_for gives
+// (link weights renormalised over those links), and how the response of such a node mixes
+// its routes. Pattern: Composition over inheritance — LoadBalancerBehaviour and
+// RateLimiterBehaviour each hold one Forwarding instead of repeating the per-op legs, or sharing
+// them through a base class.
+class Forwarding {
+ public:
+  Forwarding(const graph::Graph& g, std::size_t self);
+
+  // Adds `rate` of `op` to `outgoing`, split over the op's routes.
+  void forward(std::string_view op, Rate rate, std::vector<Outgoing>& outgoing) const;
+
+  // The share-weighted mixture (see `mixture`) over the routes carrying `op` of (two link
+  // legs + the downstream node's response to `op`). A route whose hop closes a call cycle
+  // (graph::Graph::is_async_hop) is a hand-off the caller does not wait for: its branch
+  // costs nothing. No routes (a terminal limiter): zero, the node answers itself.
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view op,
+                                               ResponseLookup auto&& downstream) const {
+    std::vector<Branch> branches;
+    for (const Leg& leg : legs_of(op)) {
+      if (leg.share <= 0.0) continue;  // see ClientBehaviour::response
+      branches.push_back(
+          {.share = leg.share,
+           .latency = leg.asynchronous ? flow::LatencyEstimate{}
+                                       : round_trip(leg.link_leg_s) + downstream(leg.target, op)});
+    }
+    return mixture(branches);
+  }
+
+ private:
+  // One route of one op, resolved against the graph once at construction.
+  struct Leg {
+    std::size_t target;
+    std::size_t link;
+    double share;       // fraction of this op's requests taking this link
+    double link_leg_s;  // one-way link latency in seconds
+    bool asynchronous;  // closes a call cycle: not waited for, see `response`
+  };
+
+  [[nodiscard]] std::span<const Leg> legs_of(std::string_view op) const;
+
+  // Per op that can reach the node (graph::Graph::arriving_ops). std::less<> as in
+  // ServiceBehaviour: find() takes a string_view.
+  std::map<std::string, std::vector<Leg>, std::less<>> legs_by_op_;
+};
+
+}  // namespace simsys::behaviours::detail
+
+export namespace simsys::behaviours {
+
 // Models: the "Load balancer" box of System Design Interview (Alex Xu, vol. 1) ch. 1 —
 // the single public entry that spreads requests over a stateless web tier so that servers
 // can be added or lose one without users noticing — and the hash ring of ch. 5
@@ -387,42 +450,114 @@ class LoadBalancerBehaviour {
   // costs nothing beyond the balancer's own sojourn.
   [[nodiscard]] flow::LatencyEstimate response(std::string_view op, flow::LatencyEstimate own,
                                                ResponseLookup auto&& downstream) const {
-    std::vector<Branch> branches;
-    for (const Leg& leg : legs_of(op)) {
-      if (leg.share <= 0.0) continue;  // see ClientBehaviour::response
-      branches.push_back(
-          {.share = leg.share,
-           .latency = leg.asynchronous ? flow::LatencyEstimate{}
-                                       : round_trip(leg.link_leg_s) + downstream(leg.target, op)});
-    }
-    return own + mixture(branches);
+    return own + forwarding_.response(op, downstream);
   }
 
  private:
-  // One route of one op, resolved against the graph once at construction.
-  struct Leg {
+  detail::Forwarding forwarding_;
+};
+
+// Models: the "Rate limiter" of System Design Interview (Alex Xu, vol. 1) ch. 4 — a
+// middleware in front of the API servers that counts each client's requests in a fast
+// store (Redis in the book) and answers "429 Too Many Requests" once a client is over its
+// limit. Captured (plan 2a refinement 6): the limiter is a queue of its own (default
+// 100k/s, 50 us: an in-memory counter check, see simsys.defaults) that sees EVERY request,
+// admitted or not; what it admits goes on over its links like a load balancer's flow; what
+// it refuses is `rejected`, answered at once and never forwarded; with a `backend` (the
+// counter store) every admitted request first makes one `counter` request there, which
+// adds that hop to the response. The five algorithms of ch. 4 reduce, for a fluid with no
+// individual requests, to two mechanisms:
+//  - token_bucket: a bucket of at most `burst` tokens, refilled at `limit` per second, one
+//    token per request. Over a step of length dt the bucket holds L tokens and receives
+//    limit·dt more, so it can admit
+//      admitted = min(in, limit + L/dt)              (requests per second)
+//      L       <- clamp(L + (limit − admitted)·dt, 0, burst)
+//    Below the limit everything passes and the bucket fills; a burst above it passes until
+//    the bucket is empty; then exactly `limit` passes.
+//  - fixed_window, sliding_log, sliding_counter: at most limit × window requests per
+//    window. They differ in WHICH window they count (a calendar window, the exact last
+//    `window` seconds of timestamps, or a weighted blend of two windows), which matters
+//    only for request-level timing: the fixed window's double burst at a boundary, the
+//    log's memory per request, the counter's approximation error. A fluid keeps the one
+//    number they share, the burst they tolerate: each is a token bucket of burst
+//    limit × window (window default 1 s).
+//  - leaky_bucket: a FIFO queue drained at `limit` with room for `burst`; excess waits
+//    instead of being rejected, and a full bucket overflows. That is exactly the node's
+//    own FluidQueue with service rate `limit` and queue_limit `burst`
+//    (graph::leaky_bucket_capacity), so this behaviour admits everything it drains and the
+//    queue's ordinary drops are the bucket's overflow.
+// Ignored: per-client keys (one aggregate limit for all clients: the book's per-user,
+// per-IP or per-API rules would need flows per key), the race conditions and
+// synchronisation of distributed counters (ch. 4's Lua scripts and sorted sets), the
+// exact window boundary effects named above, the rate-limit headers a client could back
+// off on (rejected requests are not retried), and soft limits. Several replicas share ONE
+// limit (the counters are central), so the bucket is the group's, not one per copy.
+class RateLimiterBehaviour {
+ public:
+  RateLimiterBehaviour(const graph::Graph& g, std::size_t self);
+
+  // Admits min(in, limit + tokens/dt) of the inflow (all of it for a leaky bucket), the
+  // same fraction of every op; forwards the admitted flow over the routes that carry each
+  // op (not the backend link); sends one `counter` request per admitted request to the
+  // backend; rejects the rest. Refills or spends the bucket by dt: route changes the
+  // limiter, so it is not const (see NodeBehaviour).
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime dt);
+
+  // One capacity unit per request, admitted or rejected: the check costs the same.
+  [[nodiscard]] double cost(std::string_view /*op*/) const { return 1.0; }
+
+  // own sojourn + the counter store hop (two link legs + the backend's `counter` response)
+  // + the downstream mixture as for a load balancer. The counter check happens BEFORE the
+  // request is passed on, so the two hops are sequential and add. This is the response of
+  // an ADMITTED request; a rejected one would see only `own`, and plan 2a refinement 8
+  // keeps rejected requests out of the latency samples.
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view op, flow::LatencyEstimate own,
+                                               ResponseLookup auto&& downstream) const {
+    flow::LatencyEstimate total = own;
+    if (backend_) {
+      total += round_trip(backend_->link_leg_s) + downstream(backend_->target, graph::counter_op);
+    }
+    return total + forwarding_.response(op, downstream);
+  }
+
+  // Spends every token: the long-run state has no burst credit left, so a full bucket would
+  // only delay a settle (Simulation::estimate) by the passes it takes to drain. Empty, the
+  // first settle pass already admits min(in, limit) (see Simulation::settling_copy).
+  void empty_bucket() { tokens_ = 0.0; }
+
+ private:
+  // The counter store hop, resolved once. Always waited for: the backend is a cache, whose
+  // `counter` op makes no further calls, so the hop can close no call cycle.
+  struct BackendHop {
     std::size_t target;
     std::size_t link;
-    double share;       // fraction of this op's requests taking this link
-    double link_leg_s;  // one-way link latency in seconds
-    bool asynchronous;  // closes a call cycle: not waited for, see `response`
+    double link_leg_s;
   };
 
-  [[nodiscard]] std::span<const Leg> legs_of(std::string_view op) const;
+  // The admitted rate of `offered` requests per second over a step of dt_s seconds, and
+  // the bucket after it (the formula block in the class comment).
+  [[nodiscard]] double admit(double offered_per_s, double dt_s);
 
-  // Per op that can reach the balancer (graph::Graph::arriving_ops). std::less<> as in
-  // ServiceBehaviour: find() takes a string_view.
-  std::map<std::string, std::vector<Leg>, std::less<>> legs_by_op_;
+  detail::Forwarding forwarding_;
+  std::optional<BackendHop> backend_{};
+  model::LimiterAlgorithm algorithm_;
+  double limit_per_s_;
+  double burst_;
+  // Starts FULL (= burst): a limiter that has been idle holds a full bucket, which is how a
+  // run's first seconds would meet a real one. The cost is a first burst of up to `burst`
+  // extra requests at t = 0; a scenario's `warmup` keeps it out of the summary.
+  double tokens_;
 };
 
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
 // std::visit; a std::variant instead of an abstract base keeps every behaviour a plain
 // value (no heap allocation, no virtual calls, copyable). Phase 2 appends alternatives
-// (cache, queue, load balancer, ...).
+// (cache, queue, ...).
 // C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
 // it holds) dispatched with std::visit. Closed: adding an alternative means editing this
 // line, and every std::visit that does not handle it then fails to compile.
-using Behaviour = std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour>;
+using Behaviour =
+    std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour, RateLimiterBehaviour>;
 
 }  // namespace simsys::behaviours
 
@@ -432,6 +567,7 @@ namespace simsys::behaviours {
 // contract breaks this module's build, not only a test's.
 static_assert(NodeBehaviour<ServiceBehaviour>);
 static_assert(NodeBehaviour<LoadBalancerBehaviour>);
+static_assert(NodeBehaviour<RateLimiterBehaviour>);
 static_assert(RequestSource<ClientBehaviour>);
 
 namespace detail {
@@ -589,9 +725,9 @@ Routed ClientBehaviour::offer(SimTime now) const {
   return routed;
 }
 
-// ---- LoadBalancerBehaviour ----
+// ---- detail::Forwarding ----
 
-LoadBalancerBehaviour::LoadBalancerBehaviour(const graph::Graph& g, std::size_t self) {
+detail::Forwarding::Forwarding(const graph::Graph& g, std::size_t self) {
   for (const auto& op : g.arriving_ops(self)) {
     auto& legs = legs_by_op_[op];
     for (const auto& route : g.routes_for(self, op)) {
@@ -604,25 +740,90 @@ LoadBalancerBehaviour::LoadBalancerBehaviour(const graph::Graph& g, std::size_t 
   }
 }
 
-// An op the graph did not list as arriving has no legs: none can reach the balancer in a
+// An op the graph did not list as arriving has no legs: none can reach the node in a
 // graph that Graph::build accepted.
-std::span<const LoadBalancerBehaviour::Leg> LoadBalancerBehaviour::legs_of(
-    std::string_view op) const {
+std::span<const detail::Forwarding::Leg> detail::Forwarding::legs_of(std::string_view op) const {
   const auto found = legs_by_op_.find(op);
   if (found == legs_by_op_.end()) return {};
   return found->second;
 }
 
+void detail::Forwarding::forward(std::string_view op, Rate rate,
+                                 std::vector<Outgoing>& outgoing) const {
+  if (rate.per_second <= 0.0) return;  // no empty branches (see ServiceBehaviour::route)
+  for (const Leg& leg : legs_of(op)) {
+    if (leg.share <= 0.0) continue;
+    detail::flow_towards(outgoing, leg.target, leg.link).add(op, Rate{rate.per_second * leg.share});
+  }
+}
+
+// ---- LoadBalancerBehaviour ----
+
+LoadBalancerBehaviour::LoadBalancerBehaviour(const graph::Graph& g, std::size_t self)
+    : forwarding_{g, self} {}
+
 Routed LoadBalancerBehaviour::route(const flow::Flow& in, SimTime /*dt*/) const {
   Routed routed;
   for (const auto& [op, rate] : in.entries()) {
     routed.served.add(op, rate);
-    if (rate.per_second <= 0.0) continue;  // no empty branches (see ServiceBehaviour::route)
-    for (const Leg& leg : legs_of(op)) {
-      if (leg.share <= 0.0) continue;
-      detail::flow_towards(routed.outgoing, leg.target, leg.link)
-          .add(op, Rate{rate.per_second * leg.share});
+    forwarding_.forward(op, rate, routed.outgoing);
+  }
+  detail::sort_by_destination(routed.outgoing);
+  return routed;
+}
+
+// ---- RateLimiterBehaviour ----
+
+// Graph::build proved the limit is there and positive, and resolved the backend's link.
+RateLimiterBehaviour::RateLimiterBehaviour(const graph::Graph& g, std::size_t self)
+    : forwarding_{g, self},
+      algorithm_{g.nodes()[self].spec.algorithm.value_or(model::LimiterAlgorithm::token_bucket)},
+      limit_per_s_{g.nodes()[self].spec.limit->per_second},
+      burst_{model::limiter_burst(g.nodes()[self].spec)},
+      tokens_{burst_} {
+  const auto& resolved = g.nodes()[self];
+  if (resolved.backend) {
+    backend_ = BackendHop{.target = *resolved.backend,
+                          .link = *resolved.backend_link,
+                          .link_leg_s = seconds(g.links()[*resolved.backend_link].one_way)};
+  }
+}
+
+// Token bucket (and the windowed algorithms, whose burst_ is limit x window): admit what
+// the refill plus the bucket allows, then settle the bucket's account. The tokens are
+// requests: limit_per_s_ x dt_s new ones arrive this step, admitted x dt_s leave. A leaky
+// bucket admits all: its queue (the node's FluidQueue) already held back what exceeds the
+// leak rate, and dropped what overflowed.
+double RateLimiterBehaviour::admit(double offered_per_s, double dt_s) {
+  if (algorithm_ == model::LimiterAlgorithm::leaky_bucket) return offered_per_s;
+  const double admitted = std::min(offered_per_s, limit_per_s_ + tokens_ / dt_s);
+  tokens_ = std::clamp(tokens_ + (limit_per_s_ - admitted) * dt_s, 0.0, burst_);
+  return admitted;
+}
+
+// Every op keeps the same admitted fraction: the limiter counts requests, not ops, so
+// under a limit the op mix that gets through is the mix that arrived (and so is the
+// rejected part). Zero rates are skipped, so an empty or idle inflow yields empty flows.
+Routed RateLimiterBehaviour::route(const flow::Flow& in, SimTime dt) {
+  Routed routed;
+  const double offered = in.total().per_second;
+  const double admitted = admit(offered, seconds(dt));
+  // Exactly 1 when everything passes, so nothing is "rejected" by rounding.
+  const double fraction = admitted >= offered ? 1.0 : admitted / offered;
+  for (const auto& [op, rate] : in.entries()) {
+    if (rate.per_second <= 0.0) continue;
+    const double passed = rate.per_second * fraction;
+    const double refused = rate.per_second - passed;
+    if (passed > 0.0) {
+      routed.served.add(op, Rate{passed});
+      forwarding_.forward(op, Rate{passed}, routed.outgoing);
     }
+    if (refused > 0.0) routed.rejected.add(op, Rate{refused});
+  }
+  if (backend_ && admitted > 0.0) {
+    // One counter check per admitted request (plan 2a refinement 6).
+    detail::flow_towards(routed.outgoing, backend_->target, backend_->link)
+        .add(graph::counter_op, Rate{admitted});
   }
   detail::sort_by_destination(routed.outgoing);
   return routed;

@@ -108,8 +108,8 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
 // purpose. It goes green when the cache node exists: do not weaken it to a skip.
 TEST_CASE("labs/rate-limiter runs in phase 2a", "[scenario]") {
   using namespace std::chrono_literals;
-  const auto s = simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} +
-                                      "/labs/rate-limiter/scenario.yaml");
+  const auto s =
+      simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/labs/rate-limiter/scenario.yaml");
   if (!s) FAIL(s.error().file << ":" << s.error().line << ": " << s.error().message);
   const auto g = simsys::graph::Graph::build(*s);
   if (!g) FAIL(g.error().message);

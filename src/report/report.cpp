@@ -366,7 +366,7 @@ struct Overloaded : Fs... {
 [[nodiscard]] Row node_row(const NodeSummary& node, const graph::ResolvedNode& resolved,
                            bool color) {
   if (resolved.spec.type == model::NodeType::client)
-    return {{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}};
+    return {{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}};
   const auto colour_of = [&](double rho) {
     return color ? ansi_for(fluid::zone_of(rho, resolved.capacity)) : std::string_view{};
   };
@@ -375,13 +375,19 @@ struct Overloaded : Fs... {
           {num(node.peak_rho), colour_of(node.peak_rho)},
           {with_si_prefix(node.peak_backlog)},
           {with_si_prefix(node.total_dropped)},
+          {with_si_prefix(node.total_rejected)},
           {num(node.red_time_s)},
           {node.unavailable ? "unavailable" : ""}};
 }
 
 [[nodiscard]] std::string node_table(const Summary& summary, bool color) {
-  std::vector<Row> rows{
-      {{"node"}, {"mean_rho"}, {"peak_rho"}, {"peak_backlog"}, {"dropped"}, {"red_s"}}};
+  std::vector<Row> rows{{{"node"},
+                         {"mean_rho"},
+                         {"peak_rho"},
+                         {"peak_backlog"},
+                         {"dropped"},
+                         {"rejected"},
+                         {"red_s"}}};
   const auto nodes = summary.nodes();
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     rows.push_back(node_row(nodes[i], summary.graph().nodes()[i], color));
@@ -486,6 +492,7 @@ struct Overloaded : Fs... {
                           json_field("peak_rho", json_number(n.peak_rho)),
                           json_field("peak_backlog", json_number(n.peak_backlog)),
                           json_field("dropped", json_number(n.total_dropped)),
+                          json_field("rejected", json_number(n.total_rejected)),
                           json_field("red_s", json_number(n.red_time_s)),
                           json_field("unavailable", n.unavailable ? "true" : "false")};
   return json_object(fields);
@@ -656,6 +663,20 @@ template <class T, class F>
   return text;
 }
 
+// A rate limiter's algorithm and its numbers with the defaults applied (plan 2a refinement
+// 6): `algorithm=token_bucket limit=1k/s burst=500 window=1s backend=counters`. The window
+// is printed for every algorithm because it sets the default burst of all of them.
+[[nodiscard]] std::string limiter_summary(const model::NodeSpec& spec) {
+  if (spec.type != model::NodeType::rate_limiter || !spec.limit) return {};
+  const auto algorithm = spec.algorithm.value_or(model::LimiterAlgorithm::token_bucket);
+  std::string text = "  algorithm=" + std::string{model::to_string(algorithm)} +
+                     " limit=" + fmt_rate(spec.limit->per_second) +
+                     " burst=" + num(model::limiter_burst(spec), 10) +
+                     " window=" + fmt_duration(model::limiter_window(spec));
+  if (spec.backend) text += " backend=" + *spec.backend;
+  return text;
+}
+
 [[nodiscard]] std::string server_details(const graph::ResolvedNode& node) {
   const auto& spec = node.spec;
   const auto& cap = node.capacity;
@@ -689,7 +710,8 @@ template <class T, class F>
     rows.push_back(
         {{node.spec.id},
          {std::string{model::to_string(node.spec.type)}},
-         {client ? client_details(node.spec) : server_details(node) + balancing_summary(g, i)}});
+         {client ? client_details(node.spec)
+                 : server_details(node) + balancing_summary(g, i) + limiter_summary(node.spec)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }
@@ -822,16 +844,46 @@ void forward_balanced(const graph::Graph& g, std::size_t from, std::vector<OpLoa
   }
 }
 
+// Forwards what a rate limiter admits in the long run, min(arriving, limit), the same
+// fraction of every op, over its routes as a balancer would, plus one `counter` request
+// per admitted request to its backend. On paper the burst is spent (a peak lasts longer
+// than a bucket), and a leaky bucket's queue also leaks at `limit`, so one rule covers
+// every algorithm.
+void forward_limited(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
+                     std::vector<OpLoad>& fed_back) {
+  const auto& node = g.nodes()[from];
+  const OpLoad arriving = load[from];  // a copy, as in forward_steps
+  // C++23 std::ranges::fold_left: a left fold over a range, without a hand-written loop
+  // (and without std::accumulate's int-initial-value trap): here the sum of the op rates.
+  const double offered = std::ranges::fold_left(arriving | std::views::values, 0.0, std::plus<>{});
+  const double admitted = std::min(offered, node.spec.limit->per_second);
+  const double fraction = offered > 0.0 ? admitted / offered : 0.0;
+  for (const auto& [op, rate] : arriving) {
+    for (const auto& route : g.routes_for(from, op)) {
+      auto& destination = g.links()[route.link].feedback ? fed_back : load;
+      destination[route.target][op] += rate * fraction * route.share;
+    }
+  }
+  if (node.backend) {
+    auto& destination = g.links()[*node.backend_link].feedback ? fed_back : load;
+    destination[*node.backend][std::string{graph::counter_op}] += admitted;
+  }
+}
+
 // Forwards what reached node `from` along its unconditional `ops` steps (rate × factor),
-// as ServiceBehaviour::route does, or over a load balancer's routes. Flow over a feedback
-// link goes to `fed_back`: its target came earlier in the order, so it counts in the next
-// pass.
+// as ServiceBehaviour::route does, or over a load balancer's or a rate limiter's routes. Flow over
+// a feedback link goes to `fed_back`: its target came earlier in the order, so it counts in the
+// next pass.
 void forward_steps(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
                    std::vector<OpLoad>& fed_back) {
   const auto& spec = g.nodes()[from].spec;
   if (spec.type == model::NodeType::client) return;  // client routes are in client_load
   if (spec.type == model::NodeType::load_balancer) {
     forward_balanced(g, from, load, fed_back);
+    return;
+  }
+  if (spec.type == model::NodeType::rate_limiter) {
+    forward_limited(g, from, load, fed_back);
     return;
   }
   const OpLoad arriving = load[from];  // a copy: a step may target `from` itself
@@ -880,8 +932,7 @@ struct PaperLoad {
   std::vector<double> totals;
   for (std::size_t i = 0; i < load.size(); ++i) {
     const auto& spec = g.nodes()[i].spec;
-    // C++23 std::ranges::fold_left: a left fold over a range, without a hand-written loop
-    // (and without std::accumulate's int-initial-value trap); each op weighed by its cost.
+    // std::ranges::fold_left (see forward_limited), each op weighed by its cost.
     totals.push_back(std::ranges::fold_left(load[i], 0.0, [&](double sum, const auto& entry) {
       return sum + entry.second * cost_of(spec, entry.first);
     }));
@@ -994,6 +1045,7 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
   peak_rho = std::max(peak_rho, sample.rho);
   peak_backlog = std::max(peak_backlog, sample.backlog);
   dropped += sample.dropped_per_s * dt_s;
+  rejected += sample.rejected_per_s * dt_s;
   if (sample.zone == fluid::Zone::red) red_time_s += dt_s;
   if (!std::isfinite(sample.latency.mean_s)) unavailable = true;
 }
@@ -1070,6 +1122,7 @@ std::vector<NodeSummary> Summary::nodes() const {
                               .peak_rho = t.peak_rho,
                               .peak_backlog = t.peak_backlog,
                               .total_dropped = t.dropped,
+                              .total_rejected = t.rejected,
                               .red_time_s = t.red_time_s,
                               .unavailable = t.unavailable});
   }
@@ -1105,8 +1158,10 @@ std::vector<OpSummary> Summary::ops() const {
 // Per node, not per scenario: a node's drops are a fraction of what it was sent, so the
 // ratio stays in [0, 1] even when fan-out (ch. 11) multiplies the client's requests 100
 // times before they reach it. Dividing by what the clients offered would not be a ratio.
+// Plan 2a refinement 8: a rejected request failed as surely as a dropped one. Both are
+// parts of the demand (a limiter rejects what its queue drained), so the ratio stays <= 1.
 double Summary::NodeTotals::drop_rate() const {
-  return demand > 0.0 ? dropped / demand : 0.0;
+  return demand > 0.0 ? (dropped + rejected) / demand : 0.0;
 }
 
 // The first of equal maxima (std::ranges::max_element keeps it), so ties name the

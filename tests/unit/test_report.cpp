@@ -99,17 +99,17 @@ Scenario loop(double gain) {
 // keeps the first step, where the bucket may still hold tokens, out of the summary.
 Scenario limited() {
   Scenario s{.name = "limited", .version = 1, .duration = 1s, .warmup = 500ms};
-  s.nodes = {NodeSpec{.id = "u",
-                      .type = NodeType::client,
-                      .workload = Workload{.curve = {.base = Rate{4000}},
-                                           .op_shares = {{"call", 1.0}}}},
-             NodeSpec{.id = "limiter",
-                      .type = NodeType::rate_limiter,
-                      .capacity = Rate{1e6},
-                      .algorithm = LimiterAlgorithm::token_bucket,
-                      .limit = Rate{1000},
-                      .burst = 100},
-             NodeSpec{.id = "api", .type = NodeType::service, .capacity = Rate{10'000}}};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{4000}}, .op_shares = {{"call", 1.0}}}},
+      NodeSpec{.id = "limiter",
+               .type = NodeType::rate_limiter,
+               .capacity = Rate{1e6},
+               .algorithm = LimiterAlgorithm::token_bucket,
+               .limit = Rate{1000},
+               .burst = 100},
+      NodeSpec{.id = "api", .type = NodeType::service, .capacity = Rate{10'000}}};
   s.links = {LinkSpec{.from = "u", .to = "limiter", .latency = 0s},
              LinkSpec{.from = "limiter", .to = "api", .latency = 0s}};
   return s;

@@ -2694,14 +2694,16 @@ TEST_CASE("a rate limiter's algorithm, limit, burst, window and backend are type
   }
   SECTION("each algorithm name loads as its enumerator") {
     const std::pair<std::string_view, simsys::model::LimiterAlgorithm> names[] = {
-        {"token_bucket", token_bucket},   {"leaky_bucket", leaky_bucket},
-        {"fixed_window", fixed_window},   {"sliding_log", sliding_log},
+        {"token_bucket", token_bucket},
+        {"leaky_bucket", leaky_bucket},
+        {"fixed_window", fixed_window},
+        {"sliding_log", sliding_log},
         {"sliding_counter", sliding_counter}};
     for (const auto& [name, algorithm] : names) {
       CAPTURE(name);
-      const auto path = write_temp(
-          "simsys_limiter_algorithm.yaml",
-          limiter_scenario("algorithm: " + std::string{name} + ", limit: 100/s"));
+      const auto path =
+          write_temp("simsys_limiter_algorithm.yaml",
+                     limiter_scenario("algorithm: " + std::string{name} + ", limit: 100/s"));
       const auto s = simsys::config::load(path.string());
       INFO((s ? "" : s.error().message));
       REQUIRE(s.has_value());
@@ -2718,8 +2720,7 @@ TEST_CASE("a rate limiter's algorithm, limit, burst, window and backend are type
     REQUIRE(s->nodes[0].window == 500ms);
   }
   SECTION("defaults: token_bucket, a window of 1s, and a burst of limit times window") {
-    const auto path =
-        write_temp("simsys_limiter_defaults.yaml", limiter_scenario("limit: 1k/s"));
+    const auto path = write_temp("simsys_limiter_defaults.yaml", limiter_scenario("limit: 1k/s"));
     const auto s = simsys::config::load(path.string());
     INFO((s ? "" : s.error().message));
     REQUIRE(s.has_value());
@@ -2734,8 +2735,7 @@ TEST_CASE("a rate limiter's algorithm, limit, burst, window and backend are type
                      "node 'limiter': rate_limiter needs a limit");
   }
   SECTION("a burst of zero") {
-    require_rejected("simsys_limiter_burst_zero.yaml",
-                     limiter_scenario("limit: 1k/s, burst: 0"),
+    require_rejected("simsys_limiter_burst_zero.yaml", limiter_scenario("limit: 1k/s, burst: 0"),
                      "node 'limiter': burst must be a positive integer");
   }
   SECTION("a window of zero") {
@@ -2744,8 +2744,7 @@ TEST_CASE("a rate limiter's algorithm, limit, burst, window and backend are type
                      "node 'limiter': window must be positive");
   }
   SECTION("an unknown algorithm") {
-    require_rejected("simsys_limiter_magic.yaml",
-                     limiter_scenario("algorithm: magic, limit: 1k/s"),
+    require_rejected("simsys_limiter_magic.yaml", limiter_scenario("algorithm: magic, limit: 1k/s"),
                      "node 'limiter': algorithm must be token_bucket, leaky_bucket, "
                      "fixed_window, sliding_log or sliding_counter");
   }
@@ -2755,11 +2754,10 @@ TEST_CASE("a rate limiter's algorithm, limit, burst, window and backend are type
                      "node 'limiter': backend refers to unknown node 'nope'");
   }
   SECTION("a backend that is a service, not a cache") {
-    require_rejected(
-        "simsys_limiter_backend_service.yaml",
-        scenario_with("  limiter: {type: rate_limiter, limit: 1k/s, backend: api}\n"
-                      "  api: {type: service}\n",
-                      "links: [{from: limiter, to: api}]\n"),
-        "node 'limiter': backend must be a cache");
+    require_rejected("simsys_limiter_backend_service.yaml",
+                     scenario_with("  limiter: {type: rate_limiter, limit: 1k/s, backend: api}\n"
+                                   "  api: {type: service}\n",
+                                   "links: [{from: limiter, to: api}]\n"),
+                     "node 'limiter': backend must be a cache");
   }
 }
