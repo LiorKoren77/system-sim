@@ -527,6 +527,45 @@ TEST_CASE("a burst on a windowed limiter written in code is rejected", "[graph]"
   REQUIRE(Graph::build(behind_limiter(limiter_of(leaky_bucket, 50))).has_value());
 }
 
+// A windowed algorithm moves its counters at window boundaries, and the fluid engine can
+// only see a boundary at a step boundary: a 150 ms window stepped every 100 ms would reset
+// at 100 ms and 200 ms, so neither its length nor its limit x window would be the one the
+// scenario states. The window must hold a whole number of steps, at least one. A bucket
+// uses its window only to size the default burst, so any positive window will do there.
+TEST_CASE("a windowed limiter's window must be a whole number of steps", "[graph]") {
+  using enum simsys::model::LimiterAlgorithm;
+  const auto with_window = [](simsys::model::LimiterAlgorithm algorithm,
+                              std::optional<simsys::SimTime> window) {
+    auto limiter = limiter_of(algorithm, std::nullopt);
+    limiter.window = window;
+    return behind_limiter(std::move(limiter));
+  };
+  for (const auto algorithm : {fixed_window, sliding_log, sliding_counter}) {
+    const auto off_grid = Graph::build(with_window(algorithm, 150ms));
+    REQUIRE_FALSE(off_grid.has_value());
+    REQUIRE(off_grid.error().message ==
+            "node 'limiter': window must be a positive whole number of steps "
+            "(window 150ms, step 100ms)");
+    const auto under_a_step = Graph::build(with_window(algorithm, 50ms));
+    REQUIRE_FALSE(under_a_step.has_value());
+    REQUIRE(under_a_step.error().message ==
+            "node 'limiter': window must be a positive whole number of steps "
+            "(window 50ms, step 100ms)");
+    REQUIRE(Graph::build(with_window(algorithm, 100ms)).has_value());
+    REQUIRE(Graph::build(with_window(algorithm, 1s)).has_value());
+    // No window stated: the default one second is checked against the step too.
+    auto odd_step = with_window(algorithm, std::nullopt);
+    odd_step.step = 30ms;
+    const auto default_window = Graph::build(odd_step);
+    REQUIRE_FALSE(default_window.has_value());
+    REQUIRE(default_window.error().message ==
+            "node 'limiter': window must be a positive whole number of steps "
+            "(window 1s, step 30ms)");
+  }
+  REQUIRE(Graph::build(with_window(token_bucket, 150ms)).has_value());
+  REQUIRE(Graph::build(with_window(leaky_bucket, 150ms)).has_value());
+}
+
 // A leaky bucket's queue IS the bucket (D/1: one slot leaking a request every 1/limit), so a
 // capacity, latency, concurrency, queue limit or service variability would be a second,
 // contradicting statement of `limit`, `burst` and the regular leak.
