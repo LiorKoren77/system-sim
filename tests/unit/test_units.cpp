@@ -165,6 +165,14 @@ TEST_CASE("seconds and from_seconds round-trip SimTime through double") {
   REQUIRE(simsys::seconds(simsys::from_seconds(2.5)) == Catch::Approx(2.5));
 }
 
+TEST_CASE("from_seconds rounds half to even, unlike parse_duration's half away from zero") {
+  REQUIRE(simsys::from_seconds(2.5e-9) == 2ns);
+  REQUIRE(simsys::parse_duration("2.5ns").value() == 3ns);
+}
+
+// The literals are consteval, so an out-of-range one (`9223372036854775808_ns`, or
+// `9223372037_s`, whose nanoseconds exceed int64) is a compile error, not a runtime
+// failure: it cannot be a TEST_CASE. Uncomment one of those to see the diagnostic.
 TEST_CASE("simsys time literals equal their std::chrono counterparts") {
   using namespace simsys::literals;
   static_assert(250_us == 250us);
