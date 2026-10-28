@@ -5,9 +5,13 @@
 // Latency composes on the reply path. A hop to a downstream node costs two link legs
 // (request out, reply back) plus that node's own response; sequential hops add, parallel
 // hops cost the slowest branch, and a client op split over several links is a
-// share-weighted mixture of its routes. A hop over a feedback link (one that closes a
-// cycle, graph::Graph::mark_feedback) is asynchronous: its flow goes round, a step later,
-// but the sender does not wait for it, so it adds nothing to the response.
+// share-weighted mixture of its routes. A hop that closes a cycle of CALLS
+// (graph::Graph::is_async_hop: chat.msg -> queue -> sync.job -> chat.msg) is asynchronous:
+// its flow goes round, but the sender does not wait for it, so it adds nothing to the
+// response. A hop over a node-level feedback link that closes no call cycle (A.x -> B.y,
+// B.z -> A.w: the boxes loop, the calls do not) is waited for like any other, one step
+// stale: the backward pass reads the target's response from the previous step's table,
+// because in topological order the target has not been refreshed yet.
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -86,6 +90,9 @@ concept NodeBehaviour = requires(const B b, const flow::Flow& in, flow::LatencyE
 // A source of requests: it offers load at simulated time `now` instead of routing an
 // incoming flow, lists the ops it sends (one latency report each), and composes the
 // response time it sees for each of them. Signatures only, as for NodeBehaviour.
+// C++20 std::span<const std::string>: a non-owning view (pointer + size) of the op names,
+// replacing `const std::vector<std::string>&`; a source may store its ops in any
+// contiguous container and callers can read but not modify them.
 template <class S>
 concept RequestSource = requires(const S s, SimTime now) {
   { s.offer(now) } -> std::same_as<Routed>;
@@ -106,23 +113,25 @@ concept RequestSource = requires(const S s, SimTime now) {
 // cost table), retries and timeouts, and conditional steps (`on: miss` / `on: failure`):
 // a service has no cache to miss and phase 1 models no failures, so those steps never
 // fire here. A service has no `then` steps either (the loader rejects them for this
-// type): everything it sends is per op. Hops over feedback links are asynchronous
+// type): everything it sends is per op. Hops that close a call cycle are asynchronous
 // hand-offs (see `response`).
 class ServiceBehaviour {
  public:
   ServiceBehaviour(const graph::Graph& g, std::size_t self);
 
   // Serves every incoming op and forwards rate × factor along each of the op's steps,
-  // feedback hops included (their flow arrives at the target a step later).
+  // asynchronous hops included (over a feedback link, the flow arrives a step later).
   // Returns a fresh Routed every call; if profiling shows the per-step allocations
   // matter, the engine can pass a scratch `Routed&` to be cleared and refilled instead.
   [[nodiscard]] Routed route(const flow::Flow& in) const;
 
   // Response time of `op`: own sojourn + Σ sequential hops + slowest parallel hop, where
-  // a hop is two link legs plus the downstream node's response. Feedback hops are
-  // skipped: closing a cycle, they are a fire-and-forget hand-off of work the caller
-  // does not wait for (graph::Graph::mark_feedback). Defined here because it is a
-  // template (the constrained `auto` parameter makes it one).
+  // a hop is two link legs plus the downstream node's response. Asynchronous hops are
+  // skipped: closing a call cycle, they are a fire-and-forget hand-off of work the caller
+  // does not wait for (graph::Graph::is_async_hop). A hop over a node-level feedback link
+  // that closes no call cycle is counted; `downstream` then returns the target's previous
+  // step (see the module comment). Defined here because it is a template (the
+  // constrained `auto` parameter makes it one).
   //
   // C++20 abbreviated function template with a constrained placeholder:
   // `ResponseLookup auto&&` means "any type satisfying ResponseLookup", replacing
@@ -133,7 +142,7 @@ class ServiceBehaviour {
     flow::LatencyEstimate total = own;
     flow::LatencyEstimate slowest_parallel{};  // running max: no buffer of branches
     for (const Hop& hop : hops_of(op)) {
-      if (hop.feedback) continue;  // asynchronous: adds no latency to the caller
+      if (hop.asynchronous) continue;  // closes a call cycle: adds no latency to the caller
       const auto leg = round_trip(hop.link_leg_s) + downstream(hop.target, hop.op);
       if (hop.mode == model::StepMode::sequential) {
         total += leg;
@@ -155,7 +164,7 @@ class ServiceBehaviour {
     double factor;       // downstream requests per incoming request
     model::StepMode mode;
     double link_leg_s;  // one-way link latency in seconds
-    bool feedback;      // over a cycle-closing link: asynchronous, see `response`
+    bool asynchronous;  // closes a call cycle: not waited for, see `response`
   };
 
   // Fixed propagation delay out and back: it has a mean but no variance.
@@ -166,9 +175,8 @@ class ServiceBehaviour {
     return {.mean_s = 2.0 * link_leg_s, .variance_s2 = 0.0};
   }
 
-  // C++20 std::span<const Hop>: a non-owning view (pointer + size) of the hops stored in
-  // the map, replacing `const std::vector<Hop>&` (which could not express "no hops"
-  // without a static empty vector) or a pointer/length pair.
+  // std::span<const Hop> rather than `const std::vector<Hop>&`: a span can also say "no
+  // hops" (an empty view) without a static empty vector to point at.
   [[nodiscard]] std::span<const Hop> hops_of(std::string_view op) const;
   void add_hops(const graph::Graph& g, const std::string& op,
                 const std::vector<model::Step>& steps);
@@ -212,6 +220,9 @@ class ClientBehaviour {
   // graph guarantees a route for every op of the workload.
   [[nodiscard]] flow::LatencyEstimate response(std::string_view op,
                                                ResponseLookup auto&& downstream) const {
+    // C++20 ranges algorithm: std::ranges::binary_search takes the sorted vector itself
+    // instead of an iterator pair, so begin and end cannot come from different containers
+    // (find_if, find and sort below work the same way, some with a projection).
     if (!std::ranges::binary_search(ops_, op)) {
       throw std::invalid_argument{"ClientBehaviour::response: the client does not send op '" +
                                   std::string{op} + "'"};
@@ -285,7 +296,8 @@ static_assert(RequestSource<ClientBehaviour>);
 
 namespace detail {
 
-// The outgoing flow towards (target, link), created on first use.
+// The outgoing flow towards (target, link), created on first use. std::ranges::find_if:
+// the predicate form of the ranges algorithms introduced in ClientBehaviour::response.
 [[nodiscard]] flow::Flow& flow_towards(std::vector<Outgoing>& outgoing, std::size_t target,
                                        std::size_t link) {
   const auto found = std::ranges::find_if(
@@ -326,7 +338,7 @@ void ServiceBehaviour::add_hops(const graph::Graph& g, const std::string& op,
                        .factor = step.factor,
                        .mode = step.mode,
                        .link_leg_s = seconds(g.links()[link].one_way),
-                       .feedback = g.links()[link].feedback});
+                       .asynchronous = g.is_async_hop(self_, op, target, step.op)});
   }
 }
 

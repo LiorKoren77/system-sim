@@ -22,6 +22,7 @@
 module;
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -40,6 +41,15 @@ void require_finite_non_negative(double value, const char* message) {
   // LIKELY/UNLIKELY macro. Here the branch is only ever taken by a programmer error.
   if (!std::isfinite(value) || value < 0.0) [[unlikely]]
     throw std::invalid_argument{message};
+}
+
+// The larger of two moments, NaN if either is NaN. std::max(a, b) is `a < b ? b : a`, and
+// every comparison with NaN is false, so it returns its FIRST argument when the second is
+// NaN: a NaN branch after a finite one would vanish from the maximum, and the result would
+// depend on branch order. A NaN latency means an upstream bug, so it must stay visible.
+[[nodiscard]] double nan_propagating_max(double a, double b) {
+  if (std::isnan(a) || std::isnan(b)) return std::numeric_limits<double>::quiet_NaN();
+  return std::max(a, b);
 }
 }  // namespace simsys::flow
 
@@ -79,6 +89,7 @@ struct LatencyEstimate {
 // Recorded improvement for a later phase (the spec owns this decision): for n iid
 // branches P(max <= x) = F(x)^n, so the exact quantile is
 //   quantile_max(p) = quantile_single(p^(1/n)).
+// A NaN in any branch makes that moment of the result NaN, whatever its position.
 [[nodiscard]] LatencyEstimate parallel_max(std::span<const LatencyEstimate> branches);
 
 // A flow: rate per op name, additive.
@@ -146,8 +157,8 @@ LatencyEstimate& LatencyEstimate::operator+=(const LatencyEstimate& other) {
 LatencyEstimate parallel_max(std::span<const LatencyEstimate> branches) {
   LatencyEstimate slowest{};
   for (const auto& branch : branches) {
-    slowest.mean_s = std::max(slowest.mean_s, branch.mean_s);
-    slowest.variance_s2 = std::max(slowest.variance_s2, branch.variance_s2);
+    slowest.mean_s = nan_propagating_max(slowest.mean_s, branch.mean_s);
+    slowest.variance_s2 = nan_propagating_max(slowest.variance_s2, branch.variance_s2);
   }
   return slowest;
 }
