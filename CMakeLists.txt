@@ -44,6 +44,7 @@ target_sources(simsys
     src/report/report.cppm
   PRIVATE                               # module implementation units are ordinary sources
     src/config/config.cpp
+    src/model/model.cpp
     src/report/report.cpp)
 target_link_libraries(simsys PUBLIC yaml-cpp::yaml-cpp PRIVATE simsys_warnings)
 # GCC 14.2 + named modules: each import maps the imported module's whole line table (its
@@ -57,6 +58,15 @@ target_link_libraries(simsys PUBLIC yaml-cpp::yaml-cpp PRIVATE simsys_warnings)
 # it: the tests and the CLI import the modules but export none, and compile without it.
 # Verified 2026-10-28.
 target_compile_options(simsys PRIVATE -flarge-source-files)
+# GCC 14.2 at -O2/-O3: a unit importing simsys.model calls compiler-generated special
+# members of std templates over model types (std::optional<Workload>'s move constructor,
+# the NodeSpec::ops map's destructor) out of line without emitting them, and once the
+# optimiser has inlined every call in the module's own objects no object defines them:
+# undefined references at link time. model.cpp calls each of them; -fno-inline keeps those
+# calls out of line, so that object file defines them (see its header comment). -fno-inline
+# for the whole build is not an option: it crashes GCC in ipa_comdats on report.cpp, and
+# -fkeep-inline-functions crashes it in the gimplifier. Verified 2026-10-28.
+set_source_files_properties(src/model/model.cpp PROPERTIES COMPILE_OPTIONS -fno-inline)
 
 # --- executable --------------------------------------------------------------
 add_executable(simsys_cli src/cli/main.cpp)

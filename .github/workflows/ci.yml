@@ -16,8 +16,9 @@ jobs:
       - name: Test
         run: ctest --preset gcc14-debug
   # The Release preset (-O3) hits GCC 14.2 optimiser bugs that Debug never does (an
-  # internal compiler error in ipa_comdats, see CMakeLists.txt), so it is built and
-  # tested too.
+  # internal compiler error in ipa_comdats; undefined references to special members that
+  # importers of simsys.model never emit, see CMakeLists.txt and src/model/model.cpp), so it
+  # is built and tested too.
   build-test-release:
     runs-on: ubuntu-24.04
     steps:

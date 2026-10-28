@@ -65,6 +65,13 @@ Write for a reader who has read the book but has not studied queueing theory.
   fragment includes <format> (simsys.core does, through <chrono>), a std::format spec with a
   precision such as `{:.15g}` throws std::format_error at run time. Use std::to_chars for
   precise numbers; plain `{}`, width and fill specs are fine.
+- Third GCC 14.2 defect (2026-10-28), release builds only: a TU importing simsys.model
+  calls compiler-generated special members of std templates over model types (e.g.
+  `std::optional<Workload>`'s move constructor, the `NodeSpec::ops` map's destructor) out
+  of line without emitting them, and at -O2/-O3 no module object file defines them either:
+  undefined references at link time. Workaround: `src/model/model.cpp`, compiled with
+  `-fno-inline`, calls each such member so libsimsys.a defines it; a new undefined
+  reference of this kind gets one more `emit_special_members` line there.
 
 ## 4. Clean code, named patterns, TDD
 
