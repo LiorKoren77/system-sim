@@ -1,11 +1,16 @@
 # System Design Interview vol. 1, ch. 8 — URL shortener.
 # Book numbers: 100M URLs/day written (~1,160/s), read:write 10:1 (~11,600/s reads),
 # 365B records over 10 years, 7-char base-62 short URLs.
+# Sized with the book's remedies, not by loosening the SLOs (see README): a stateless web tier
+# scaled out, a cache absorbing the reads, and the database sharded.
 version: 1
 name: url-shortener
 seed: 1
 duration: 24h
-step: 100ms
+# 1 s steps: the fluid step is exact while demand is constant within it, and the daily sine moves
+# by at most 0.003 % of its peak in a second; the summary and SLO numbers match a 100 ms run to
+# 1e-8 (README, "What the model captures"), at a tenth of the steps (86k instead of 864k).
+step: 1s
 warmup: 2m
 
 nodes:
@@ -18,6 +23,8 @@ nodes:
     keys: {zipf: 1.0, space: 100M}           # a few short links get most of the clicks
     timeout: 1s
 
+  # 20k/s sits just above the 19.2k/s peak and below the web tier's 24k/s: legitimate traffic
+  # passes, and a flood is refused here before it can push the web tier into red.
   limiter:
     type: rate_limiter
     algorithm: token_bucket
@@ -30,9 +37,11 @@ nodes:
 
   lb: {type: load_balancer, policy: round_robin}
 
+  # Stateless web tier scaled out (ch. 1, "stateless web tier"; ch. 8 wrap-up): 19.2k/s at the
+  # 14:00 peak (12.8k/s x 1.5) over 8 x 3k/s = 80 %, yellow. 7 replicas would be 91 %, red.
   web:
     type: service
-    replicas: 6
+    replicas: 8
     capacity: 3k/s
     latency: 0.3ms
     ops:
@@ -48,9 +57,16 @@ nodes:
     keys: 20M                                # 20 % of the key space; Che/LRU gives h ≈ 0.88
     hit_ratio: che
 
+  # Writes at the peak: 9 % of 19.2k/s = 1.728k/s, x cost 5 = 8.64k units/s, where one primary
+  # commits 5k units/s (spec §6: 1k writes/s). Read replicas do not help: each one replays every
+  # write of its shard. So the data is sharded (ch. 1 "sharding", ch. 8 wrap-up; 365B rows over
+  # 10 years would not fit one box anyway): 3 shards, each a primary + 2 read replicas. Per copy
+  # at the peak: primary 8.64k/3 = 2.88k units/s (58 %), replica 2.08k reads/6 + 2.88k = 3.23k
+  # units/s (65 %). With 2 shards the replicas would be at 97 %, red.
   url_db:
     type: sql_db
-    replicas: 3                              # 1 primary + 2 read replicas
+    replicas: 3                              # 1 primary + 2 read replicas per shard
+    shards: 3
     capacity: 5k/s
     replication_lag: 50ms
     advanced: {queue_limit: 1000}

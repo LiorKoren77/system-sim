@@ -188,8 +188,8 @@ Correct and pinned by the reviewer: the plan numbers (replica 600/s, reads 3.0 m
 ### Task 8: The first book system runs
 
 **Files:** `tests/scenario/test_scenarios.cpp` (the runnable set becomes hello, chain, lab-rate-limiter, lab-consistent-hashing, lab-unique-id, url-shortener), `scenarios/book/url-shortener/README.md` (real numbers: cache hit ratio from Che, p99 per op, the 10:1 read/write split at the db, what fails when the cache is removed), `README.md`.
-- [ ] `simsys run scenarios/book/url-shortener/scenario.yaml` exits 0 (if an SLO fails on the shipped numbers, judge: fix the scenario's sizing with the book's figures, not the SLO; say so).
-- [ ] Commit `scenarios: url-shortener runs end to end; READMEs with real numbers`
+- [x] `simsys run scenarios/book/url-shortener/scenario.yaml` exits 0 (if an SLO fails on the shipped numbers, judge: fix the scenario's sizing with the book's figures, not the SLO; say so).
+- [x] Commit `scenarios: url-shortener runs end to end; READMEs with real numbers`
 
 ---
 
