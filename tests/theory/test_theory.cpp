@@ -1601,3 +1601,18 @@ TEST_CASE("a cdn with a byte capacity builds but the engine refuses to run it un
   REQUIRE(sim.error().message ==
           "node 'cdn_us': a cdn with a byte capacity needs byte flows (phase 2c)");
 }
+
+// A `che` CDN without a `keys` size has no number for h: explain shows the paper load as an upper
+// bound (every read a miss), but a run would silently replace the Che approximation the scenario
+// asked for by h = 0, so the engine refuses it and says what is missing.
+TEST_CASE("a che cdn without a keys size builds but the engine refuses to run it", "[theory]") {
+  auto s = cdn_origin_chain(1000, std::nullopt);
+  s.nodes[1].hit_ratio = HitRatio{.che = true};
+  const auto g = Graph::build(std::move(s));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto sim = Simulation::create(*g);
+  REQUIRE_FALSE(sim.has_value());
+  REQUIRE(sim.error().message ==
+          "node 'cdn': hit_ratio che needs keys (the cdn's size in objects)");
+}

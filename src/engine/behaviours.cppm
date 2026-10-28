@@ -990,16 +990,67 @@ class SqlDbBehaviour {
   std::map<std::string, double, std::less<>> cost_by_op_;
 };
 
+// Models: the CDN of System Design Interview (Alex Xu, vol. 1) ch. 1 ("Content delivery network":
+// geographically dispersed servers that keep static files close to the user) and ch. 14 (the
+// CDN that streams YouTube's videos); ch. 13's browser cache sits in the same place, one hop
+// closer. Plan 2b refinement 4. Captured: the CDN is a read-only cache in front of its `origin`.
+// It is a queue of its own (default 100k/s, 10 ms: serving a ~1 MB object over the network, see
+// simsys.defaults) that answers every read sent to it; the share h it hits (`hit_ratio`, fixed or
+// che) it answers alone, the misses 1 − h it fetches from the origin as the SAME op and answers
+// after the fetch (book ch. 1: "if the CDN server does not have the image in the cache, it
+// requests the file from the origin"). So it behaves exactly like a read_through cache whose
+// backend is the origin:
+//   flow to the origin = rate × (1 − h) of each read           (graph::Graph::backend_fraction)
+//   response           = mixture {h: own, 1 − h: own + two link legs + the origin's response}
+//   delivered          = own × (h + (1 − h) × the origin's delivered fraction)
+// A CDN without a hit ratio misses every read (h = 0): the safe side on paper. It takes no
+// writes: graph::Graph::build refuses a write op (model::write_ops_of) that reaches one.
+// Ignored: bytes (a CDN sized in `capacity: 100GB/s` waits for phase 2c's byte flows; the engine
+// refuses it), the TTL and the stale content it serves (`ttl` is accepted and not modelled), a
+// cold edge warming up, invalidation, the choice of the nearest PoP (a client's links say which
+// CDN it uses) and the CDN's price.
+// Pattern: Delegation (composition over inheritance) — a CDN IS the read_through shape of a
+// cache, so CdnBehaviour holds a CacheBehaviour and forwards every call to it rather than
+// restating route/response/delivered. graph::Graph resolves the origin as the cache's backend
+// (ResolvedNode::backend) with the read_through share, which is all CacheBehaviour reads.
+class CdnBehaviour {
+ public:
+  CdnBehaviour(const graph::Graph& g, std::size_t self) : cache_{g, self} {}
+
+  // Serves every read and forwards rate × (1 − h) of it to the origin (the class comment).
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const {
+    return cache_.route(in, now, dt);
+  }
+
+  // Capacity units one request of `op` consumes: 1 (a CDN has no `cost` key).
+  [[nodiscard]] double cost(std::string_view op) const { return cache_.cost(op); }
+
+  // own + (1 − h) × the origin hop, as a hit/miss mixture (the class comment).
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view op, flow::LatencyEstimate own,
+                                               ResponseLookup auto&& downstream) const {
+    return cache_.response(op, own, downstream);
+  }
+
+  // own × (h + (1 − h) × the origin's delivered fraction).
+  [[nodiscard]] double delivered(std::string_view op, double own,
+                                 FractionLookup auto&& downstream) const {
+    return cache_.delivered(op, own, downstream);
+  }
+
+ private:
+  CacheBehaviour cache_;
+};
+
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
 // std::visit; a std::variant instead of an abstract base keeps every behaviour a plain
 // value (no heap allocation, no virtual calls, copyable). Phase 2a appended the load
-// balancer, the rate limiter and the cache, phase 2b the SQL database; later phases append the
-// rest (queue, ...).
+// balancer, the rate limiter and the cache, phase 2b the SQL database and the CDN; later phases
+// append the rest (queue, ...).
 // C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
 // it holds) dispatched with std::visit. Closed: adding an alternative means editing this
 // line, and every std::visit that does not handle it then fails to compile.
 using Behaviour = std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour,
-                               RateLimiterBehaviour, CacheBehaviour, SqlDbBehaviour>;
+                               RateLimiterBehaviour, CacheBehaviour, SqlDbBehaviour, CdnBehaviour>;
 
 }  // namespace simsys::behaviours
 
@@ -1012,6 +1063,7 @@ static_assert(NodeBehaviour<LoadBalancerBehaviour>);
 static_assert(NodeBehaviour<RateLimiterBehaviour>);
 static_assert(NodeBehaviour<CacheBehaviour>);
 static_assert(NodeBehaviour<SqlDbBehaviour>);
+static_assert(NodeBehaviour<CdnBehaviour>);
 static_assert(RequestSource<ClientBehaviour>);
 
 namespace detail {

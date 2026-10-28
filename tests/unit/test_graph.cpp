@@ -809,35 +809,56 @@ TEST_CASE("a miss step after a write lookup is refused", "[graph]") {
           "miss)");
 }
 
-// A CDN is a cache at the network's edge (ch. 1): a fixed hit ratio on it means what it means
-// on a cache, so a service's miss step after a CDN lookup is taken by 1 - h of the requests.
-TEST_CASE("a cdn's fixed hit ratio feeds its miss steps", "[graph]") {
-  NodeSpec cdn{.id = "cdn", .type = NodeType::cdn, .hit_ratio = HitRatio{.fixed = 0.95}};
-  const auto built = Graph::build(
-      cached_web(std::move(cdn), {Step{.to = "cdn", .op = "read"},
-                                  Step{.to = "db", .op = "read", .on = StepCondition::miss}}));
-  INFO((built ? "" : built.error().message));
-  REQUIRE(built.has_value());
-  REQUIRE(built->hit_ratio(*built->index_of("cdn")).has_value());
-  REQUIRE_THAT(*built->hit_ratio(*built->index_of("cdn")), WithinRel(0.95, 1e-12));
-  const auto hops = built->service_hops(*built->index_of("web"), "get");
-  REQUIRE(hops.size() == 2);
-  REQUIRE_THAT(hops[1].fraction, WithinRel(0.05, 1e-12));
+// A web tier in front of a CDN: u -> web -> cdn -> db, with `steps` as web's steps for `get` and
+// db the CDN's origin (cached_web's scenario plus the link the origin needs).
+Scenario web_behind_cdn(std::optional<HitRatio> hit, std::vector<Step> steps) {
+  NodeSpec cdn{.id = "cdn", .type = NodeType::cdn, .hit_ratio = hit};
+  cdn.origin = "db";
+  auto s = cached_web(std::move(cdn), std::move(steps));
+  s.links.push_back(LinkSpec{.from = "cdn", .to = "db", .dir = Direction::inout});
+  return s;
 }
 
-// A `che` CDN needs a size in keys for the Che approximation, which the scenario schema gives a
-// CDN only with phase 2b's CDN task: until then the graph builds (so explain can print the
-// scenario) but has no number for it, and its misses count as every read.
-TEST_CASE("a che cdn without a keys size builds a graph with no static hit ratio", "[graph]") {
-  NodeSpec cdn{.id = "cdn", .type = NodeType::cdn, .hit_ratio = HitRatio{.che = true}};
-  const auto built = Graph::build(
-      cached_web(std::move(cdn), {Step{.to = "cdn", .op = "read"},
+// A CDN is a cache at the network's edge (ch. 1): a fixed hit ratio on it means what it means on
+// a cache. But a CDN fetches its own misses from its origin (plan 2b refinement 4), so the miss
+// share 1 - h travels on the cdn -> origin edge, and a service's `on: miss` step after a CDN
+// lookup, which would fetch every miss a second time, is refused, as after a read_through cache.
+TEST_CASE("a cdn's fixed hit ratio feeds its own origin edge, not a service's miss step",
+          "[graph]") {
+  SECTION("the misses go to the origin") {
+    const auto built =
+        Graph::build(web_behind_cdn(HitRatio{.fixed = 0.95}, {Step{.to = "cdn", .op = "read"}}));
+    INFO((built ? "" : built.error().message));
+    REQUIRE(built.has_value());
+    const auto cdn = *built->index_of("cdn");
+    REQUIRE_THAT(*built->hit_ratio(cdn), WithinRel(0.95, 1e-12));
+    REQUIRE_THAT(built->backend_fraction(cdn, "read"), WithinRel(0.05, 1e-12));
+  }
+  SECTION("a service's miss step after the cdn is refused") {
+    const auto built = Graph::build(web_behind_cdn(
+        HitRatio{.fixed = 0.95}, {Step{.to = "cdn", .op = "read"},
                                   Step{.to = "db", .op = "read", .on = StepCondition::miss}}));
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message ==
+            "node 'web': an 'on: miss' step cannot follow cdn 'cdn' (the cdn already fetched the "
+            "miss from its origin)");
+  }
+}
+
+// A `che` CDN needs a size in keys for the Che approximation. Without one the graph still builds
+// (so explain can print the scenario) but has no number for it, and its misses count as every
+// read: the whole read load goes on to the origin, the safe side on paper.
+TEST_CASE(
+    "a che cdn without a keys size builds with no hit ratio and sends every read to its "
+    "origin",
+    "[graph]") {
+  const auto built =
+      Graph::build(web_behind_cdn(HitRatio{.che = true}, {Step{.to = "cdn", .op = "read"}}));
   INFO((built ? "" : built.error().message));
   REQUIRE(built.has_value());
-  REQUIRE_FALSE(built->hit_ratio(*built->index_of("cdn")).has_value());
-  REQUIRE_THAT(built->service_hops(*built->index_of("web"), "get")[1].fraction,
-               WithinRel(1.0, 1e-12));
+  const auto cdn = *built->index_of("cdn");
+  REQUIRE_FALSE(built->hit_ratio(cdn).has_value());
+  REQUIRE_THAT(built->backend_fraction(cdn, "read"), WithinRel(1.0, 1e-12));
 }
 
 // read_through: on a miss the cache itself fetches from its backend; write_through: it writes
@@ -1690,4 +1711,37 @@ TEST_CASE("a che cdn resolves its hit ratio from the keys of the clients upstrea
   // And the miss share it sends the origin is the complement.
   REQUIRE_THAT(built->backend_fraction(*built->index_of("cdn"), "read"),
                WithinRel(1.0 - *h, 1e-12));
+}
+
+// The origin is a server the CDN calls on a miss, reached over a link from the CDN: a scenario
+// built in code gets the loader's rules (config tests) from the graph, with the same words.
+TEST_CASE("a cdn built in code needs an origin it can call", "[graph]") {
+  SECTION("not a client") {
+    const auto g = Graph::build(cdn_front(cdn_node(HitRatio{.fixed = 0.95}, "u")));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == "node 'cdn': origin must not be a client");
+  }
+  SECTION("a node that exists") {
+    const auto g = Graph::build(cdn_front(cdn_node(HitRatio{.fixed = 0.95}, "ghost")));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == "node 'cdn': origin refers to unknown node 'ghost'");
+  }
+  SECTION("over a link from the cdn") {
+    auto s = cdn_front(cdn_node(HitRatio{.fixed = 0.95}));
+    s.links.pop_back();  // cdn -> origin
+    const auto g = Graph::build(std::move(s));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == "node 'cdn': origin 'origin' needs a link from the cdn");
+  }
+}
+
+// A CDN fetches its own misses, so a `then` step (which the loader never gives a CDN) would fetch
+// them twice or add a hop the edge-cache model has no place for: refused in code too.
+TEST_CASE("a cdn built in code with then steps is refused", "[graph]") {
+  auto cdn = cdn_node(HitRatio{.fixed = 0.95});
+  cdn.then = {Step{.to = "origin", .op = "read", .on = StepCondition::miss}};
+  const auto g = Graph::build(cdn_front(std::move(cdn)));
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message ==
+          "node 'cdn': a cdn has no then steps (it fetches its misses from its origin)");
 }

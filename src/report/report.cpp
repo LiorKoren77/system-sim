@@ -836,20 +836,42 @@ template <class T>
 // write_ops=write backend=db keys=20M eviction=lru ttl=5m`, the keys the scenario left out
 // omitted (strategy and write_ops always have a value: their defaults). A che hit ratio shows
 // its provenance instead of `(fixed)` (hit_ratio_summary).
-[[nodiscard]] std::string cache_summary(const graph::Graph& g, std::size_t cache) {
-  const auto& node = g.nodes()[cache];
-  const auto& spec = node.spec;
-  if (spec.type != model::NodeType::cache) return {};
-  std::string text = "  hit_ratio=" + hit_ratio_summary(node);
+// `hit_ratio=0.8 (fixed)`, `hit_ratio=0.732 (che: ...)`, `hit_ratio=che` (no number) or
+// `hit_ratio=none`: what a cache and a CDN both open with.
+[[nodiscard]] std::string hit_ratio_text(const graph::Graph& g, const graph::ResolvedNode& node) {
+  std::string text = "hit_ratio=" + hit_ratio_summary(node);
   if (node.hit_ratio && node.hit_ratio->keys) {
     text += che_provenance(g, node);
   } else if (node.hit_ratio) {
     text += " (fixed)";
   }
+  return text;
+}
+
+[[nodiscard]] std::string cache_summary(const graph::Graph& g, std::size_t cache) {
+  const auto& node = g.nodes()[cache];
+  const auto& spec = node.spec;
+  if (spec.type != model::NodeType::cache) return {};
+  std::string text = "  " + hit_ratio_text(g, node);
   text += " strategy=" + std::string{model::to_string(spec.strategy)} + write_ops_summary(g, cache);
   if (spec.backend) text += " backend=" + *spec.backend;
   if (spec.keys) text += " keys=" + fmt_count(static_cast<double>(*spec.keys));
   if (spec.eviction) text += " eviction=" + *spec.eviction;
+  if (spec.ttl) text += " ttl=" + fmt_duration(*spec.ttl);
+  return text;
+}
+
+// A CDN's model (plan 2b refinement 4), shown as a cache's is: `hit_ratio=0.95 (fixed) misses →
+// media_store keys=100k ttl=1h`. "misses → media_store": the CDN fetches what it misses from its
+// origin, so the reader sees where the 1 − h of the reads go (the check lines below count them
+// there). The keys the scenario left out are omitted.
+[[nodiscard]] std::string cdn_summary(const graph::Graph& g, std::size_t cdn) {
+  const auto& node = g.nodes()[cdn];
+  const auto& spec = node.spec;
+  if (spec.type != model::NodeType::cdn) return {};
+  std::string text = "  " + hit_ratio_text(g, node);
+  if (spec.origin) text += " misses → " + *spec.origin;
+  if (spec.keys) text += " keys=" + fmt_count(static_cast<double>(*spec.keys));
   if (spec.ttl) text += " ttl=" + fmt_duration(*spec.ttl);
   return text;
 }
@@ -955,7 +977,7 @@ struct QueueProvenance {
          {std::string{model::to_string(node.spec.type)}},
          {client ? client_details(node.spec)
                  : server_details(node) + balancing_summary(g, i) + limiter_summary(node.spec) +
-                       cache_summary(g, i) + database_summary(node)}});
+                       cache_summary(g, i) + cdn_summary(g, i) + database_summary(node)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }
@@ -1144,10 +1166,10 @@ void forward_limited(const graph::Graph& g, const ForwardRoutes& table, std::siz
 }
 
 // Forwards what a cache passes on to its store: rate × Graph::backend_fraction (1 − h of a
-// read under read_through, every write under write_through, write_around and write_back: a
-// write-back flush is asynchronous, but the store still absorbs it), as
-// CacheBehaviour::route does. A cache_aside cache has no backend: the service's on-miss step
-// carries its misses.
+// read under read_through and at a CDN, whose store is its origin; every write under
+// write_through, write_around and write_back: a write-back flush is asynchronous, but the store
+// still absorbs it), as CacheBehaviour::route does. A cache_aside cache has no backend: the
+// service's on-miss step carries its misses.
 void forward_to_backend(const graph::Graph& g, std::size_t from, const OpLoad& arriving,
                         std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   const auto& node = g.nodes()[from];
@@ -1175,7 +1197,8 @@ void forward_then_steps(const graph::Graph& g, std::size_t from, const OpLoad& a
   }
 }
 
-// What a cache passes on: to its store, and along its `then` steps. The hits stop here.
+// What a cache or a CDN passes on: to its store (a CDN's origin), and along its `then` steps.
+// The hits stop here.
 void forward_cached(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
                     std::vector<OpLoad>& fed_back) {
   const OpLoad arriving = load[from];  // a copy, as in forward_steps
@@ -1201,7 +1224,7 @@ void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_
     forward_limited(g, table, from, load, fed_back);
     return;
   }
-  if (spec.type == model::NodeType::cache) {
+  if (spec.type == model::NodeType::cache || spec.type == model::NodeType::cdn) {
     forward_cached(g, from, load, fed_back);
     return;
   }
@@ -1309,10 +1332,10 @@ struct PaperLoad {
 // ---- loads that rest on an unknown hit ratio ----
 //
 // A cache or CDN with no number for h (a CDN without a hit ratio, or with `che` but no `keys`
-// size before phase 2b's Task 5; a cache built in code without one: Graph::build resolves every
-// other `che` to a number) counts every read as a miss on paper (Graph::service_hops): the
-// nodes behind its misses are checked against their worst case, an upper bound. Their check
-// lines say so, or a student would read a red database as a flaw of the design.
+// size; a cache built in code without one: Graph::build resolves every other `che` to a number)
+// counts every read as a miss on paper (Graph::service_hops): the nodes behind its misses are
+// checked against their worst case, an upper bound. Their check lines say so, or a student would
+// read a red database as a flaw of the design.
 
 // Does `node` miss at a rate nobody knows yet?
 [[nodiscard]] bool unknown_misses(const graph::Graph& g, std::size_t node) {
@@ -1322,8 +1345,8 @@ struct PaperLoad {
 }
 
 // The nodes that receive miss flow of such a cache directly: the targets of a service's
-// `on: miss` steps after it (ServiceHop::lookup), its read_through backend, and the targets of
-// its own `on: miss` then-steps.
+// `on: miss` steps after it (ServiceHop::lookup), its read_through backend (a CDN's origin), and
+// the targets of its own `on: miss` then-steps.
 [[nodiscard]] std::vector<std::size_t> unknown_miss_targets(const graph::Graph& g) {
   std::vector<std::size_t> targets;
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
@@ -1339,7 +1362,7 @@ struct PaperLoad {
     }
     if (!unknown_misses(g, node)) continue;
     const auto& backend = g.nodes()[node].backend;
-    if (backend && spec.strategy == model::CacheStrategy::read_through) targets.push_back(*backend);
+    if (backend && graph::fetches_read_misses(spec)) targets.push_back(*backend);
     for (const model::Step& step : spec.then) {
       if (step.on == model::StepCondition::miss) targets.push_back(*g.index_of(step.to));
     }
