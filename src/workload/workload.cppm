@@ -6,9 +6,9 @@
 // function of time, so the peak is a *moment* a design must survive rather than a
 // constant. Captured: daily cycles (wave), launches and migrations (ramp), flash crowds
 // and retry storms (spikes), and replayed production traces (points). Ignored: anything
-// random — noise is a separate, seeded process (Task 3) the client multiplies in — and
-// any feedback from the system (a slow site does not lower this curve; real users would
-// give up, which the model does not capture).
+// random — noise is a separate, seeded process (NoiseProcess below) the client multiplies
+// in — and any feedback from the system (a slow site does not lower this curve; real users
+// would give up, which the model does not capture).
 //
 // Composition (spec §8, phase 2a refinement 2):
 //
@@ -50,17 +50,18 @@ export namespace simsys::workload {
 enum class WaveShape { sine, square, diurnal };
 
 // A periodic multiplier. `amplitude` is the relative swing: 0.5 means the peak is 1.5 x
-// and the trough 0.5 x the level. The loader keeps it in [0, 1] (Task 5), so no
-// multiplier, and therefore no rate, is ever negative.
+// and the trough 0.5 x the level. It must lie in [0, 1], so no multiplier, and therefore
+// no rate, is ever negative: the config loader rejects a scenario outside that range, and
+// wave_multiplier throws for one (a programmer error).
 //
 // Every member of the structs below has a default member initializer, even `{}`, so
 // callers can use C++20 designated initializers (`Wave{.amplitude = 0.3}`) without
 // tripping -Wmissing-field-initializers (an error under -Werror; see model.cppm).
 struct Wave {
   WaveShape shape{WaveShape::sine};
-  SimTime period{24_h};  // one day: the cycle every user-facing service shows
-  double amplitude{0.5};
-  SimTime peak_at{};  // where the wave is highest; a clock time, e.g. 20:00
+  SimTime period{24_h};   // one day: the cycle every user-facing service shows
+  double amplitude{0.5};  // chosen: peak 1.5 x, trough 0.5 x the mean; not from the book
+  SimTime peak_at{};      // where the wave is highest; a clock time, e.g. 20:00
 };
 
 // A linear change of the rate from `from` to `to` over the first `over` of the run,
@@ -79,8 +80,10 @@ struct Spike {
   double factor{1.0};
 };
 
-// A recorded or hand-drawn rate trace: (time, rate) pairs, sorted by time and non-empty
-// (the loader guarantees both). Replaces `base`; the other terms still multiply it.
+// A recorded or hand-drawn rate trace: (time, rate) pairs, non-empty and with
+// non-decreasing times (the config loader rejects an empty or unsorted trace). Two points
+// at the same time make a step: the later one takes effect from that instant. Replaces
+// `base`; the wave and spikes still multiply it (a ramp cannot: see RateCurve::rate_at).
 struct Points {
   std::vector<std::pair<SimTime, Rate>> at{};
 };
@@ -94,12 +97,16 @@ struct RateCurve {
   std::vector<Spike> spikes{};
 
   // The deterministic rate at time `t`: everything except noise.
+  // Throws std::invalid_argument for a wave with a non-positive period or an amplitude
+  // outside [0, 1], for empty points, and for a ramp with base 0 or with points (it has
+  // nothing to be relative to). All are programmer errors: the config loader rejects
+  // such a scenario with a message naming the offending key.
   [[nodiscard]] Rate rate_at(SimTime t) const;
 };
 
 // The wave term alone, exposed so `simsys curve` can print a shape on its own.
-// Throws std::invalid_argument if `w.period` is not positive (a programmer error: the
-// loader rejects such a scenario).
+// Throws std::invalid_argument if `w.period` is not positive or `w.amplitude` is outside
+// [0, 1] (programmer errors: the config loader rejects such a scenario).
 [[nodiscard]] double wave_multiplier(const Wave& w, SimTime t);
 
 // Spec §9.2 workload noise: a multiplier 1 + x on the rate, where x is an Ornstein-Uhlenbeck
@@ -117,9 +124,9 @@ struct Noise {
 //
 // Determinism contract: the same Noise and the same seed give the same path, bit for bit.
 // Use one process per client (they must not share an engine, or adding a client would
-// change every other client's noise); the engine derives each client's seed from the
-// scenario seed and the client's index (Task 6), so runs are reproducible and clients are
-// independent.
+// change every other client's noise); the simulation engine is to derive each client's
+// seed from the scenario's one `seed` (spec §9.2) and the client's index, so runs are
+// reproducible and clients are independent.
 class NoiseProcess {
  public:
   // Throws std::invalid_argument for sigma < 0 or correlation <= 0 (programmer errors: the
@@ -181,9 +188,10 @@ namespace simsys::workload::detail {
 // A "textbook consumer-web day", one value per hour from 00:00 to 23:00: night trough
 // 0.40 at 04:00, a morning rise as people wake and commute, a midday plateau, a small
 // afternoon lull, and the evening peak 1.60 at 20:00 when people are home on their phones,
-// then a decline toward midnight. CHOSEN, not measured: it has the shape the book's
-// "peak QPS = 2 x average" rule of thumb (ch. 2) assumes and that public traffic graphs
-// of consumer sites show, with peak/trough = 4. It is a teaching default, not data.
+// then a decline toward midnight. CHOSEN, not measured: it has the shape public traffic
+// graphs of consumer sites show, with peak/trough = 4. Its peak is 1.6 x the daily mean,
+// gentler than the book's "peak QPS = 2 x average" rule of thumb (ch. 2); for the book's
+// 2 x use `sine` with amplitude 1.0. It is a teaching default, not data.
 //
 // Pattern: Table-driven method — the shape is data (24 numbers), read by one
 // interpolation function, so a different day is a different table, not different code.
@@ -197,8 +205,7 @@ inline constexpr std::array<double, 24> diurnal_day{
 
 // C++20 consteval: an immediate function, evaluated only at compile time (a call that
 // cannot be is a compile error). Unlike a constexpr function it can never silently run
-// at run time; here it exists only to feed the static_assert. C++20 also made
-// std::array's accessors and range-for over it usable in constant expressions this way.
+// at run time; here it exists only to feed the static_assert.
 consteval double mean_of(const std::array<double, 24>& table) {
   double sum = 0;
   for (double v : table) sum += v;
@@ -210,22 +217,31 @@ static_assert(mean_of(diurnal_day) - 1.0 < 1e-12 && 1.0 - mean_of(diurnal_day) <
 // The table's peak hour (20 for the table above). The wave places this hour at the
 // user's `peak_at`, so `peak_at: 20:00` reproduces the table and `peak_at: 13:00` shifts
 // the whole day by -7 h (a different time zone, a lunchtime-heavy service).
-// C++20 constexpr algorithms: std::ranges::max_element runs at compile time, so the peak
-// hour is derived from the table instead of being a second, hand-kept constant that
-// could drift from it.
+// C++20 ranges algorithms (namespace std::ranges): each takes the whole container instead
+// of a begin/end iterator pair, and accepts a projection (see interpolate below). What
+// C++20 adds here is that overload; like its C++17 counterpart std::max_element it is
+// constexpr, so the peak hour is derived from the table at compile time instead of being
+// a second, hand-kept constant that could drift from it.
 inline constexpr auto diurnal_peak_hour =
     static_cast<double>(std::ranges::max_element(diurnal_day) - diurnal_day.begin());
 
-// Phase of `t` within the wave, as a fraction of the period: wrap(t - peak_at, P) / P in
-// [0, 1), where 0 is the peak. Done on integer nanoseconds: `%` is exact (fmod on
-// seconds would round), and C++ `%` keeps the dividend's sign, so a time before the peak
-// (negative difference) gets P added to land in [0, P).
+// `x` wrapped into [0, period). C++ `%` keeps the dividend's sign, so a negative x gives
+// a remainder in (-period, 0], and adding period lands it in [0, period). Neither step can
+// overflow: |x % period| < period.
+[[nodiscard]] std::int64_t wrap(std::int64_t x, std::int64_t period) {
+  const std::int64_t remainder = x % period;
+  return remainder < 0 ? remainder + period : remainder;
+}
+
+// Phase of `t` within the wave: wrap(t - peak_at, P), in [0, P) nanoseconds, where 0 is
+// the peak. Done on integer nanoseconds, because `%` is exact (fmod on seconds would
+// round). Both times are wrapped BEFORE subtracting: t - peak_at itself could overflow
+// int64 for extreme values, while the difference of two wrapped values lies in (-P, P),
+// and one more wrap gives the same phase.
 [[nodiscard]] std::int64_t phase_ns(const Wave& w, SimTime t) {
   const std::int64_t period = w.period.count();
   if (period <= 0) throw std::invalid_argument{"wave period must be positive"};
-  std::int64_t phase = (t.count() - w.peak_at.count()) % period;
-  if (phase < 0) phase += period;
-  return phase;
+  return wrap(wrap(t.count(), period) - wrap(w.peak_at.count(), period), period);
 }
 
 // Sine: 1 + A cos(2 pi phi / P). A cosine so the peak sits at phi = 0 (t = peak_at);
@@ -238,13 +254,15 @@ inline constexpr auto diurnal_peak_hour =
 }
 
 // Square: 1 + A for the half period centred on the peak, 1 - A for the other half.
-// "Centred" means the distance to the nearest peak, min(phi, P - phi), is at most P/4;
-// both edges belong to the high half. Compared as 4 d <= P on integers: exact, no
-// rounding can move an edge. Mean over a period: 1.
+// "Centred" means the distance to the nearest peak, d = min(phi, P - phi), is at most
+// P/4; both edges belong to the high half. Compared as d <= P / 4 in INTEGER division:
+// for a whole number d, d <= P/4 holds exactly when d <= floor(P/4), so the truncation
+// loses nothing (P = 6: d = 1 is high, d = 2 is low, as 2 > 1.5). This is exact, so no
+// rounding can move an edge, and unlike 4 d <= P it cannot overflow. Mean over a period: 1.
 [[nodiscard]] double square(const Wave& w, std::int64_t phase) {
   const std::int64_t period = w.period.count();
   const std::int64_t distance_to_peak = std::min(phase, period - phase);
-  return 4 * distance_to_peak <= period ? 1.0 + w.amplitude : 1.0 - w.amplitude;
+  return distance_to_peak <= period / 4 ? 1.0 + w.amplitude : 1.0 - w.amplitude;
 }
 
 // Diurnal: 1 + A (table(h) - 1), where h is the table hour the phase maps to (the peak
@@ -264,44 +282,63 @@ inline constexpr auto diurnal_peak_hour =
   return 1.0 + w.amplitude * (table - 1.0);
 }
 
-// Ramp: (from + (to - from) x min(t / over, 1)) / base — the ramp's rate as a multiplier
-// of `base`, so the spec's "ramp from 0 to 2000/s" with base 1000/s doubles the base at
-// the end. Before t = 0 the fraction is clamped to 0; `over == 0` jumps straight to `to`.
-// A ramp needs a base to be relative to: with base 0 (typically because `points` set the
-// level) the term is 1. The loader rejects a ramp without a base (Task 5).
+// How far along the ramp is at `t`: 0 up to t = 0, t / over during the ramp, 1 from
+// t = over on. Decided on integer nanoseconds first, so the ends are exact and a zero
+// (or negative) `over` is a clean step at t = 0: `from` before it, `to` from it on.
+[[nodiscard]] double ramp_fraction(SimTime t, SimTime over) {
+  if (t.count() < 0) return 0.0;
+  if (t.count() >= over.count()) return 1.0;
+  return seconds(t) / seconds(over);  // 0 <= t < over here, so over > 0
+}
+
+// Ramp: (from + (to - from) x fraction(t)) / base — the ramp's rate as a multiplier of
+// `base`, so the spec's "ramp from 0 to 2000/s" with base 1000/s doubles the base at the
+// end. A ramp needs a base to be relative to, so base 0 throws std::invalid_argument (a
+// programmer error: the config loader rejects a ramp without rate.base).
 [[nodiscard]] double ramp_multiplier(const Ramp& r, Rate base, SimTime t) {
-  if (base.per_second == 0.0) return 1.0;
-  const double over = seconds(r.over);
-  const double fraction = over <= 0.0 ? 1.0 : std::clamp(seconds(t) / over, 0.0, 1.0);
+  if (base.per_second == 0.0) throw std::invalid_argument{"a ramp needs a nonzero base rate"};
+  const double fraction = ramp_fraction(t, r.over);
   const double level = r.from.per_second + (r.to.per_second - r.from.per_second) * fraction;
   return level / base.per_second;
 }
 
-// Spikes: the product of `factor` over every spike active at t, i.e. at <= t < at +
-// duration (end exclusive, so back-to-back spikes never overlap). Overlapping spikes
+// Is `s` active at `t`, i.e. at <= t < at + duration? End exclusive, so back-to-back
+// spikes never overlap. Written as t - at < duration rather than t < at + duration: the
+// sum overflows int64 for a huge duration (the spike would wrongly switch off), while the
+// difference cannot: at <= t is checked first, and `at` is never negative (the config
+// loader reads it with parse_time_point, which yields offsets from t = 0), so the
+// difference lies in [0, t].
+[[nodiscard]] bool active(const Spike& s, SimTime t) {
+  return s.at.count() <= t.count() && t.count() - s.at.count() < s.duration.count();
+}
+
+// Spikes: the product of `factor` over every spike active at t. Overlapping spikes
 // compound: a 5 x flash crowd plus a 2 x retry storm is 10 x.
 [[nodiscard]] double spikes_multiplier(const std::vector<Spike>& spikes, SimTime t) {
   double product = 1.0;
   for (const auto& s : spikes) {
-    const bool active = s.at.count() <= t.count() && t.count() < s.at.count() + s.duration.count();
-    if (active) product *= s.factor;
+    if (active(s, t)) product *= s.factor;
   }
   return product;
 }
 
 // Points: piecewise-linear interpolation, held flat outside the trace —
-// t <= first time: first rate; t >= last time: last rate; otherwise
-// r0 + (r1 - r0) (t - t0) / (t1 - t0) between the neighbours t0 <= t < t1.
+// t < first time: first rate; t >= last time: last rate; otherwise
+// r0 + (r1 - r0) (t - t0) / (t1 - t0) between the neighbours t0 <= t < t1, where t0 is
+// the LAST point at or before t. Precondition: times non-decreasing (unsorted input is a
+// config loader error). Equal times are allowed and make a step: the search for "the
+// first point strictly after t" skips every point at t, so the later of two equal-time
+// points wins from that instant on, and t1 > t0 always holds (no division by zero).
 // Throws std::invalid_argument on an empty trace (a programmer error: the loader rejects it).
 [[nodiscard]] double interpolate(const Points& points, SimTime t) {
   const auto& at = points.at;
   if (at.empty()) throw std::invalid_argument{"points must not be empty"};
-  if (t.count() <= at.front().first.count()) return at.front().second.per_second;
+  if (t.count() < at.front().first.count()) return at.front().second.per_second;
   if (t.count() >= at.back().first.count()) return at.back().second.per_second;
-  // C++20 ranges algorithm with a projection: std::ranges::upper_bound takes the whole
-  // vector (no begin/end pair) and a projection that says *which part* of each element
-  // to compare, here the time in nanoseconds — replacing a hand-written comparator lambda
-  // over pairs. It returns the first point strictly after t; the one before it is <= t.
+  // A projection says *which part* of each element to compare, here the time in
+  // nanoseconds — replacing a hand-written comparator lambda over pairs.
+  // std::ranges::upper_bound returns the first point strictly after t; since
+  // t >= the first time, it is not the first point, and the one before it is <= t.
   const auto next = std::ranges::upper_bound(at, t.count(), {},
                                              [](const auto& point) { return point.first.count(); });
   const auto& [t1, r1] = *next;
@@ -316,6 +353,11 @@ inline constexpr auto diurnal_peak_hour =
 namespace simsys::workload {
 
 double wave_multiplier(const Wave& w, SimTime t) {
+  // Written as !(in range) so a NaN amplitude is rejected too (every comparison with NaN
+  // is false).
+  if (!(w.amplitude >= 0.0 && w.amplitude <= 1.0)) {
+    throw std::invalid_argument{"wave amplitude must be in [0, 1]"};
+  }
   const auto phase = detail::phase_ns(w, t);
   // C++20 `using enum`: brings the enumerators into this scope so the cases read `sine`
   // instead of `WaveShape::sine`, without making the enum unscoped everywhere.
@@ -328,11 +370,12 @@ double wave_multiplier(const Wave& w, SimTime t) {
     case diurnal:
       return detail::diurnal(w, phase);
   }
-  // C++23 std::unreachable(): tells the compiler (and the reader) that control cannot get
-  // here — the switch covers every enumerator — replacing a dummy `return 1.0;` that would
-  // hide a missing case. Reaching it would be undefined behaviour, so -Wswitch (which warns
-  // when an enumerator is added without a case) is the guard.
-  std::unreachable();
+  // No `default:` on purpose: -Wswitch (an error under -Werror) then flags an enumerator
+  // added without a case. That guards the CODE, not the VALUE: a WaveShape can still hold
+  // a number that names no enumerator (static_cast<WaveShape>(7)), and control reaches
+  // here. That is a programmer error, so it throws rather than returning a made-up
+  // multiplier (or invoking std::unreachable, which would make it undefined behaviour).
+  throw std::logic_error{"unknown wave shape"};
 }
 
 // C++11 <random>, explained here because this is the module's first use. std::mt19937_64
@@ -364,6 +407,9 @@ double NoiseProcess::next(SimTime dt) {
 }
 
 Rate RateCurve::rate_at(SimTime t) const {
+  // A ramp is a multiplier relative to `base`; points replace the base, so the
+  // combination has no meaning (the config loader says "rate.ramp needs rate.base").
+  if (ramp && points) throw std::invalid_argument{"a ramp needs a base rate, not points"};
   const double level = points ? detail::interpolate(*points, t) : base.per_second;
   const double wave_term = wave ? wave_multiplier(*wave, t) : 1.0;
   const double ramp_term = ramp ? detail::ramp_multiplier(*ramp, base, t) : 1.0;
