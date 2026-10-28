@@ -9,6 +9,7 @@ module;
 #include <cmath>
 #include <concepts>
 #include <cstddef>
+#include <cstdlib>
 #include <expected>
 #include <format>
 #include <functional>
@@ -131,16 +132,19 @@ constexpr fluid::Capacity engine_capacity_defaults{};
 constexpr double default_yellow = engine_capacity_defaults.yellow;
 constexpr double default_red = engine_capacity_defaults.red;
 
-// Range rules for the numeric keys. Non-finite values (inf, nan) fail all of them: an
-// infinite variability or threshold has no meaning in the queueing formulas.
+// Range rules for the numeric keys. NaN and infinity written as such never reach them
+// (parse_yaml_double rejects them as no finite number); a decimal too large for a double
+// (1e309) arrives rounded to infinity and fails every rule but is_zero_or_more, whose key
+// has its own upper bound. An infinite variability or threshold has no meaning in the
+// queueing formulas.
 bool is_positive(double v) {
   return std::isfinite(v) && v > 0;
 }
 bool is_non_negative(double v) {
   return std::isfinite(v) && v >= 0;
 }
-// Non-negative, infinity included (NaN fails): for a key whose upper bound is a separate
-// rule with its own message, such as a link weight.
+// Non-negative, infinity included: for a key whose upper bound is a separate rule with its
+// own message, such as a link weight, so 1e309 is reported as too large, not as negative.
 bool is_zero_or_more(double v) {
   return v >= 0;
 }
@@ -170,8 +174,9 @@ struct AdvancedNumber {
 // range-checking code is written once. The integer keys are not rows: they are read like
 // `replicas` (see advanced_integer_keys).
 constexpr std::array<AdvancedNumber, 4> advanced_numbers{{
-    {"service_variability", is_non_negative, "non-negative", &model::Advanced::service_variability},
-    {"burstiness", is_non_negative, "non-negative", &model::Advanced::burstiness},
+    {"service_variability", is_non_negative, "a finite non-negative number",
+     &model::Advanced::service_variability},
+    {"burstiness", is_non_negative, "a finite non-negative number", &model::Advanced::burstiness},
     {"yellow", is_unit_fraction, "in (0, 1]", &model::Advanced::yellow},
     {"red", is_unit_fraction, "in (0, 1]", &model::Advanced::red},
 }};
@@ -278,39 +283,47 @@ std::string number_text(const YAML::Node& node) {
   return node.IsScalar() && node.Tag() == "?" ? node.Scalar() : std::string{};
 }
 
-// The whole text as a T, or nothing: from_chars never throws and reports how far it got;
-// the whole text must be consumed, so "0.5x" is no number and "4.0" is no int. For an int
-// it rejects "abc", "+1" and "0x1" and accepts "-1" (callers check the sign).
+// Why a numeric text is no value of the wanted type. `out_of_range` is a well-formed number
+// beyond the type's range (99999999999 for an int, 1e309 for a double), so a reader can
+// answer with the key's range message; anything else is `not_a_number`.
+enum class NumberFault { not_a_number, out_of_range };
+
+// The whole text as a T: from_chars never throws and reports how far it got; the whole text
+// must be consumed, so "0.5x" is no number and "4.0" is no int. For an int it rejects "abc",
+// "+1" and "0x1" and accepts "-1" (callers check the sign).
 template <typename T>
-std::optional<T> parse_whole(std::string_view text) {
+std::expected<T, NumberFault> parse_whole(std::string_view text) {
   T value{};
   const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-  if (error != std::errc{} || end != text.data() + text.size()) return std::nullopt;
+  if (end != text.data() + text.size()) return std::unexpected(NumberFault::not_a_number);
+  if (error == std::errc::result_out_of_range) return std::unexpected(NumberFault::out_of_range);
+  if (error != std::errc{}) return std::unexpected(NumberFault::not_a_number);
   return value;
 }
 
-// YAML 1.2's spellings of infinity and not-a-number; from_chars knows only "inf" and "nan".
-constexpr std::array<std::string_view, 3> yaml_infinity{".inf", ".Inf", ".INF"};
-constexpr std::array<std::string_view, 3> yaml_not_a_number{".nan", ".NaN", ".NAN"};
+// A decimal beyond the range of a double, rounded as IEEE 754 rounds it: an overflow to
+// infinity (1e309, -1e309), an underflow to zero or a subnormal (1e-400). from_chars says
+// only "out of range", not which way; std::strtod (C89) returns the rounded value
+// (+-HUGE_VAL, infinity under IEEE 754, for an overflow). It only sees text that from_chars
+// read whole as a decimal, which it reads the same way: the program never calls setlocale,
+// so the "C" locale's '.' is the decimal point for both.
+double rounded_out_of_range(std::string_view text) {
+  return std::strtod(std::string{text}.c_str(), nullptr);
+}
 
-// A number as YAML writes it: a decimal or exponent form through parse_whole, or one of
-// YAML's own `.inf`, `-.inf`, `.nan`. Reading those as the values they mean lets each range
-// rule reject them with its own message ("weight must be at most 1e9") instead of "no number".
+// A number as YAML writes it, or nothing.
+// - Not-a-number and infinity are no finite number in any spelling, so every key answers
+//   them with its own "must be a finite ..." message: YAML's `.nan`, `.inf`, `-.inf` are no
+//   text from_chars reads, and its own `nan`, `inf`, `infinity` are read as values and
+//   rejected by the one isfinite test below.
+// - A decimal beyond a double's range is a number all the same, rounded (see above), so the
+//   key's range rule rejects 1e309 with its range message ("weight must be at most 1e9"),
+//   not as no number, and 1e-400 is zero.
 std::optional<double> parse_yaml_double(std::string_view text) {
-  // C++20 std::string_view::starts_with (and its twin ends_with): a prefix test in one call,
-  // replacing `!text.empty() && text[0] == '-'` or compare(0, n, prefix) arithmetic.
-  const bool negative = text.starts_with('-');
-  const auto magnitude = negative || text.starts_with('+') ? text.substr(1) : text;
-  // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
-  // `std::find(begin, end, value) != end`.
-  if (std::ranges::contains(yaml_infinity, magnitude)) {
-    return negative ? -std::numeric_limits<double>::infinity()
-                    : std::numeric_limits<double>::infinity();
-  }
-  if (std::ranges::contains(yaml_not_a_number, text)) {
-    return std::numeric_limits<double>::quiet_NaN();
-  }
-  return parse_whole<double>(text);
+  const auto value = parse_whole<double>(text);
+  if (value) return std::isfinite(*value) ? std::optional{*value} : std::nullopt;
+  if (value.error() == NumberFault::out_of_range) return rounded_out_of_range(text);
+  return std::nullopt;
 }
 
 // The value of a numeric key, or nothing when it is no number (see number_text).
@@ -445,6 +458,18 @@ std::expected<std::string, ConfigError> read_op_name(const Site& site, const YAM
   return site.fail(name, std::format("{} must not be empty", label));
 }
 
+// The name a map key spells. A list or map is valid YAML as a key (`[a, b]: 1`) but names
+// nothing, and yaml-cpp's Scalar() reads it as "", which surfaced as "unknown key ''". `noun`
+// names the key in the message: "top-level key", "node id", "advanced key", ... A null key
+// (`~: 1`) is passed on as "", so the caller's own empty-name message applies.
+std::expected<std::string, ConfigError> key_name(const Site& site, const YAML::Node& key,
+                                                 std::string_view noun) {
+  if (key.IsMap() || key.IsSequence()) {
+    return site.fail(key, std::format("{} must be a scalar", noun));
+  }
+  return scalar_text(key);
+}
+
 // ---- Repeated keys --------------------------------------------------------------------
 //
 // yaml-cpp keeps both entries of a key written twice in one map: a lookup by name sees the
@@ -463,66 +488,145 @@ CheckResult check_map_keys_unique(const Site& site, const YAML::Node& map, std::
   return {};
 }
 
+// ---- Alias expansion -----------------------------------------------------------------
+//
 // YAML aliases: `&name` anchors a node and `*name` refers back to it. yaml-cpp resolves an
 // alias to the anchored node itself, shared, not to a copy. A walk that follows every
 // reference therefore meets a shared node once per path to it, and nested aliases multiply
 // the paths: 8 nested lists that each repeat the level below 10 times reach the innermost
-// map 10^8 times from a few hundred bytes of text (the "billion laughs" pattern), and the
-// loader would run for minutes. The walk below visits each map and list once, so it is
-// linear in the size of the document (times a log for the set). Checking a shared node once
-// is also the right meaning: its keys are the same wherever it is referenced.
+// map 10^8 times from a few hundred bytes of text (the "billion laughs" pattern). The walk
+// below descends into each map and list once, so the repeated-key check stays cheap, and a
+// shared node is checked once, which is also the right meaning: its keys are the same
+// wherever it is referenced.
 //
-// Pattern: Visited set — the guard of a graph traversal. A tree whose aliases share subtrees
-// is a directed acyclic graph, and the set makes a depth-first walk visit each vertex once.
+// The typed readers that build the Scenario do expand aliases: to them a shared step list is
+// there once per op that refers to it. Three nested anchors (one step list in every op, one
+// op map in every service) make a few kilobytes of text into millions of steps; a 10 KB
+// file of that shape took about a minute and 800 MB to load. So the same walk also measures
+// the expanded document and the loader refuses it past a cap, before any reader runs.
+//
+// yaml-cpp 0.8 does not implement YAML merge keys (`<<: *base`): `<<` is an ordinary key
+// here, checked like any other, and adds no expansion of its own.
+
+// The most entries (maps, lists and scalar values, each counted once per place the readers
+// meet it) a scenario may expand to. The largest shipped scenario has 247; a million is far
+// beyond any hand-written design and loads in seconds (about 4 s for 986 000 entries in a
+// Debug build, measured 2026-10-28). A file of a million entries written out without
+// aliases (tens of megabytes) gets the same message.
+inline constexpr std::size_t max_expanded_entries = 1'000'000;
+
+// The count of an expansion past what std::size_t holds, or of a node that contains itself:
+// yaml-cpp registers an anchor when its node starts, so `&loop [*loop]` is a list holding
+// itself, and its expansion has no end.
+inline constexpr std::size_t uncountable = std::numeric_limits<std::size_t>::max();
+
+std::size_t add_saturating(std::size_t a, std::size_t b) {
+  return b > uncountable - a ? uncountable : a + b;
+}
+
+// "This memo entry is `node`": is() is yaml-cpp's only identity test.
+auto holds_node(const YAML::Node& node) {
+  return [&node](const auto& entry) { return entry.node.is(node); };
+}
+
+// Pattern: Memoization — the expanded size of each map and list, computed once and looked up
+// at every later reference; it doubles as the visited set (the guard of a graph traversal)
+// that makes the depth-first walk visit each vertex of the alias DAG once.
 //
 // yaml-cpp gives a node no address or id; its only identity test is `a.is(b)`. An alias
 // reports its anchor's Mark (line, column), so a shared node is filed under one position.
-// The set files nodes by Mark and compares with is() only within one position: distinct
-// maps and lists start at distinct positions (verified 2026-10-28 with yaml-cpp on every
-// scenario and on nested flow and block collections), so a bucket holds one node, a visit
-// costs O(log n) and the walk O(n log n). The is() test keeps it correct even if two
-// containers did share a position.
-class VisitedNodes {
+// The memo files nodes by Mark and compares with is() only within one position. The maps
+// and lists the walk visits start at distinct positions; a map used as a key can share its
+// position with its parent (a block map's Mark is that of its first key), but the walk
+// never descends into keys, and is() keeps a lookup correct whenever two nodes do share a
+// position. A bucket so holds one node in practice, a lookup costs O(log n), and the walk
+// O(n log n).
+class ExpandedSizes {
  public:
-  // True the first time `node` is offered, false every time after.
-  bool first_visit(const YAML::Node& node) {
-    auto& bucket = by_position_[{node.Mark().line, node.Mark().column}];
-    const auto same_node = [&node](const YAML::Node& seen) { return seen.is(node); };
-    if (std::ranges::any_of(bucket, same_node)) return false;
-    bucket.push_back(node);
-    return true;
+  // The size recorded for `node`, or nothing the first time the walk meets it.
+  [[nodiscard]] std::optional<std::size_t> find(const YAML::Node& node) const {
+    const auto bucket = by_position_.find(position(node));
+    if (bucket == by_position_.end()) return std::nullopt;
+    const auto entry = std::ranges::find_if(bucket->second, holds_node(node));
+    if (entry == bucket->second.end()) return std::nullopt;
+    return entry->size;
+  }
+
+  // Records `node`'s size, replacing the one recorded before.
+  void record(const YAML::Node& node, std::size_t size) {
+    auto& bucket = by_position_[position(node)];
+    const auto entry = std::ranges::find_if(bucket, holds_node(node));
+    if (entry != bucket.end()) {
+      entry->size = size;
+    } else {
+      bucket.push_back({.node = node, .size = size});
+    }
   }
 
  private:
-  std::map<std::pair<int, int>, std::vector<YAML::Node>> by_position_;
+  struct Entry {
+    YAML::Node node;
+    std::size_t size;
+  };
+
+  static std::pair<int, int> position(const YAML::Node& node) {
+    return {node.Mark().line, node.Mark().column};
+  }
+
+  std::map<std::pair<int, int>, std::vector<Entry>> by_position_;
 };
 
-// Every map of the document, at any depth: a depth-first walk through maps and lists that
-// visits each of them once, however many aliases refer to it.
-CheckResult check_unique_keys(const Site& site, const YAML::Node& node, VisitedNodes& visited) {
-  if (!node.IsMap() && !node.IsSequence()) return {};
-  if (!visited.first_visit(node)) return {};
+// One depth-first walk over every map and list of the document: checks each map's keys
+// (once per map) and returns how many entries `node` expands to. A map or list is 1 plus the
+// expanded sizes of its values or elements, each counted once per occurrence; a scalar is 1;
+// keys are names, not entries, and are not descended into.
+std::expected<std::size_t, ConfigError> walk_expanded(const Site& site, const YAML::Node& node,
+                                                      ExpandedSizes& sizes) {
+  if (!node.IsMap() && !node.IsSequence()) return 1;
+  if (const auto known = sizes.find(node)) return *known;
+  // Uncountable while its children are walked: met again before then, it contains itself.
+  sizes.record(node, uncountable);
   if (node.IsMap()) {
-    if (auto checked = check_map_keys_unique(site, node, "key"); !checked) return checked;
+    if (auto checked = check_map_keys_unique(site, node, "key"); !checked) {
+      return std::unexpected(checked.error());
+    }
   }
+  std::size_t size = 1;
   for (const auto& element : node) {
     // A map entry's child is its value; a list element is itself the child (a YamlElement
     // is a Node too, hence the cast to pick that view of it).
     const auto& child = node.IsMap() ? element.second : static_cast<const YAML::Node&>(element);
-    if (auto checked = check_unique_keys(site, child, visited); !checked) return checked;
+    const auto child_size = walk_expanded(site, child, sizes);
+    if (!child_size) return child_size;
+    size = add_saturating(size, *child_size);
   }
-  return {};
+  sizes.record(node, size);
+  return size;
 }
 
-// The top-level keys, then the node ids (with the more specific message), then the rest.
-CheckResult check_no_repeated_keys(const Site& site, const YAML::Node& root) {
+std::string entry_count(std::size_t entries) {
+  if (entries == uncountable) return "more entries than can be counted";
+  return std::format("{} entries", entries);
+}
+
+CheckResult check_expansion_capped(const Site& site, const YAML::Node& root, std::size_t entries) {
+  if (entries <= max_expanded_entries) return {};
+  return site.fail(root, std::format("aliases expand the scenario to {}; at most {}",
+                                     entry_count(entries), max_expanded_entries));
+}
+
+// The top-level keys, then the node ids (with the more specific message), then one walk over
+// the whole document: every map's keys, and the size the aliases expand it to.
+CheckResult check_keys_and_expansion(const Site& site, const YAML::Node& root) {
   if (!root.IsMap()) return {};
   if (auto checked = check_map_keys_unique(site, root, "key"); !checked) return checked;
   if (const auto nodes = root["nodes"]; nodes.IsMap()) {
     if (auto checked = check_map_keys_unique(site, nodes, "node id"); !checked) return checked;
   }
-  VisitedNodes visited;
-  return check_unique_keys(site, root, visited);
+  ExpandedSizes sizes;
+  return walk_expanded(site, root, sizes).and_then([&](std::size_t entries) {
+    return check_expansion_capped(site, root, entries);
+  });
 }
 
 // ---- Top level ------------------------------------------------------------------------
@@ -539,9 +643,10 @@ CheckResult check_required_top_level_keys(const Site& site, const YAML::Node& ro
 // A misspelt optional key ("wramup") would otherwise be ignored and its default used.
 CheckResult check_known_top_level_keys(const Site& site, const YAML::Node& root) {
   for (const auto& entry : root) {
-    const auto& key = entry.first;
-    if (lists_word(top_level_keys, key.Scalar())) continue;
-    return site.fail(key, std::format("unknown top-level key '{}'", key.Scalar()));
+    auto key = key_name(site, entry.first, "top-level key");
+    if (!key) return std::unexpected(key.error());
+    if (lists_word(top_level_keys, *key)) continue;
+    return site.fail(entry.first, std::format("unknown top-level key '{}'", *key));
   }
   return {};
 }
@@ -591,7 +696,7 @@ CheckResult check_sections_not_null(const Site& site, const YAML::Node& root) {
 
 CheckResult check_top_level(const Site& site, const YAML::Node& root) {
   if (auto checked = check_root_is_map(site, root); !checked) return checked;
-  if (auto checked = check_no_repeated_keys(site, root); !checked) return checked;
+  if (auto checked = check_keys_and_expansion(site, root); !checked) return checked;
   if (auto checked = check_required_top_level_keys(site, root); !checked) return checked;
   if (auto checked = check_known_top_level_keys(site, root); !checked) return checked;
   if (auto checked = check_sections_not_null(site, root); !checked) return checked;
@@ -606,8 +711,11 @@ CheckResult read_version(const Site& site, const YAML::Node& root, int& version)
   if (auto checked = check_not_null(site, root, "version", "version"); !checked) return checked;
   const auto value = root["version"];
   const auto number = parse_whole<int>(number_text(value));
-  if (!number) return site.fail(value, "version must be a whole number");
-  if (*number != 1) return site.fail(value, "version must be 1");
+  if (!number && number.error() == NumberFault::not_a_number) {
+    return site.fail(value, "version must be a whole number");
+  }
+  // A whole number past the int range is no 1 either.
+  if (!number || *number != 1) return site.fail(value, "version must be 1");
   version = *number;
   return {};
 }
@@ -625,6 +733,11 @@ CheckResult read_seed(const Site& site, const YAML::Node& root, int& seed) {
   if (!value) return {};
   if (auto checked = check_not_null(site, root, "seed", "seed"); !checked) return checked;
   const auto number = parse_whole<int>(number_text(value));
+  if (!number && number.error() == NumberFault::out_of_range) {
+    return site.fail(value,
+                     std::format("seed must be between {} and {}", std::numeric_limits<int>::min(),
+                                 std::numeric_limits<int>::max()));
+  }
   if (!number) return site.fail(value, "seed must be an integer");
   seed = *number;
   return {};
@@ -668,7 +781,10 @@ CheckResult check_datacenter_settings(const Site& site, const YamlElement& entry
   if (!entry.second.IsMap()) return site.fail(entry.second, std::format("{} must be a map", label));
   if (entry.second.size() == 0) return {};
   const auto key = (*entry.second.begin()).first;
-  return site.fail(key, std::format("{} has unknown key '{}'", label, scalar_text(key)));
+  return key_name(site, key, std::format("{} key", label))
+      .and_then([&](const std::string& name) -> CheckResult {
+        return site.fail(key, std::format("{} has unknown key '{}'", label, name));
+      });
 }
 
 CheckResult read_datacenter(const Site& site, const YamlElement& entry, Datacenters& names) {
@@ -706,7 +822,11 @@ std::expected<Datacenters, ConfigError> read_datacenters(const Site& site, const
       return std::unexpected(read.error());
     }
   }
-  if (names.empty()) return site.fail(map, "datacenters must not be empty");
+  // About `datacenters` as a whole, so at its key: the map's own position is its first entry
+  // (`latency`, the only key that declares no datacenter).
+  if (names.empty()) {
+    return site.fail(key_node(root, "datacenters"), "datacenters must not be empty");
+  }
   return names;
 }
 
@@ -722,9 +842,10 @@ bool accepts_key(model::NodeType type, std::string_view key) {
 CheckResult check_allowed_keys(const Site& site, const YAML::Node& body,
                                const model::NodeSpec& node) {
   for (const auto& entry : body) {
-    const auto key = entry.first.Scalar();
-    if (accepts_key(node.type, key)) continue;
-    return site.fail(entry.first, std::format("key '{}' is not valid for type '{}'", key,
+    auto key = key_name(site, entry.first, "key");
+    if (!key) return std::unexpected(key.error());
+    if (accepts_key(node.type, *key)) continue;
+    return site.fail(entry.first, std::format("key '{}' is not valid for type '{}'", *key,
                                               model::to_string(node.type)));
   }
   return {};
@@ -740,6 +861,8 @@ CheckResult read_dc(const Site& site, const YAML::Node& body, model::NodeSpec& n
   }
   auto name = scalar_value(site, body, "dc");
   if (!name) return std::unexpected(name.error());
+  // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
+  // `std::find(begin, end, value) != end`.
   if (!std::ranges::contains(datacenters, *name)) {
     return site.fail(body["dc"], std::format("unknown datacenter '{}'", *name));
   }
@@ -765,6 +888,8 @@ CheckResult read_replicas(const Site& site, const YAML::Node& body, model::NodeS
 // "B/s" suffix decides which parser reads it and which field receives it, so a text that
 // neither parser accepts gets the message of the parser its suffix selects.
 std::expected<void, ParseError> read_capacity_text(std::string_view text, model::NodeSpec& node) {
+  // C++20 std::string_view::ends_with (and its twin starts_with): a suffix test in one call,
+  // replacing compare(size() - n, n, suffix) and its length arithmetic.
   if (text.ends_with("B/s")) return parse_byte_rate(text).transform(store_in(node.byte_capacity));
   return parse_rate(text).transform(store_in(node.capacity));
 }
@@ -799,8 +924,8 @@ bool is_advanced_key(std::string_view name) {
 
 // One known, non-null advanced value into its field. store_in also assigns the int that
 // read_positive_int produces to queue_limit's std::optional<double>.
-CheckResult read_advanced_value(const Site& site, const YamlElement& entry, model::NodeSpec& node) {
-  const auto name = entry.first.Scalar();
+CheckResult read_advanced_value(const Site& site, const YamlElement& entry, std::string_view name,
+                                model::NodeSpec& node) {
   const auto label = std::format("advanced.{}", name);
   if (name == "concurrency") {
     return read_positive_int(site, entry.second, label)
@@ -816,15 +941,16 @@ CheckResult read_advanced_value(const Site& site, const YamlElement& entry, mode
 }
 
 CheckResult read_advanced_entry(const Site& site, const YamlElement& entry, model::NodeSpec& node) {
-  const auto name = entry.first.Scalar();
-  if (!is_advanced_key(name)) {
-    return site.fail(entry.first, std::format("unknown advanced key '{}'", name));
+  const auto name = key_name(site, entry.first, "advanced key");
+  if (!name) return std::unexpected(name.error());
+  if (!is_advanced_key(*name)) {
+    return site.fail(entry.first, std::format("unknown advanced key '{}'", *name));
   }
-  if (auto checked = check_entry_not_null(site, entry, std::format("advanced.{}", name));
+  if (auto checked = check_entry_not_null(site, entry, std::format("advanced.{}", *name));
       !checked) {
     return checked;
   }
-  return read_advanced_value(site, entry, node);
+  return read_advanced_value(site, entry, *name, node);
 }
 
 // "advanced.yellow", or "advanced.yellow (default 0.7)" when the scenario left it out, so
@@ -897,19 +1023,21 @@ Site node_site(const Site& site, std::string_view id) {
   return site.within(std::format("node '{}'", id));
 }
 
-// Repeated ids were rejected by check_no_repeated_keys, before any node was read.
+// Repeated ids were rejected by check_keys_and_expansion, before any node was read.
 std::expected<model::NodeSpec, ConfigError> read_node_declaration(const Site& site,
                                                                   const YamlElement& entry,
                                                                   const Datacenters& datacenters) {
   const auto& id = entry.first;
-  if (id.Scalar().empty()) return site.fail(id, "node id must not be empty");
-  const auto this_node = node_site(site, id.Scalar());
+  const auto name = key_name(site, id, "node id");
+  if (!name) return std::unexpected(name.error());
+  if (name->empty()) return site.fail(id, "node id must not be empty");
+  const auto this_node = node_site(site, *name);
   const auto type = read_node_type(this_node, id, entry.second);
   if (!type) return std::unexpected(type.error());
   // Members the common keys leave unset keep the schema defaults declared in simsys.model;
   // ops, then and the client workload are read in the second pass (read_node_bodies), the
   // other types' own keys in a later step.
-  model::NodeSpec node{.id = id.Scalar(), .type = *type};
+  model::NodeSpec node{.id = *name, .type = *type};
   if (auto read = read_common_keys(this_node, entry.second, node, datacenters); !read) {
     return std::unexpected(read.error());
   }
@@ -958,9 +1086,10 @@ CheckResult check_reference(const Site& site, const YAML::Node& parent, std::str
 CheckResult check_known_keys(const Site& site, const YAML::Node& map, std::string_view allowed,
                              std::string_view kind) {
   for (const auto& entry : map) {
-    const auto key = entry.first.Scalar();
-    if (lists_word(allowed, key)) continue;
-    return site.fail(entry.first, std::format("unknown {} '{}'", kind, key));
+    auto key = key_name(site, entry.first, kind);
+    if (!key) return std::unexpected(key.error());
+    if (lists_word(allowed, *key)) continue;
+    return site.fail(entry.first, std::format("unknown {} '{}'", kind, *key));
   }
   return {};
 }
@@ -1086,8 +1215,8 @@ CheckResult read_step_attributes(const Site& site, const YAML::Node& yaml, model
       !read) {
     return read;
   }
-  return read_optional_number(site, yaml, "factor", is_positive, "step factor must be positive",
-                              step.factor);
+  return read_optional_number(site, yaml, "factor", is_positive,
+                              "step factor must be a finite positive number", step.factor);
 }
 
 // A step back to its own node would re-inject its whole flow every time step: the fluid
@@ -1385,14 +1514,14 @@ CheckResult read_link_ops(const Site& site, const YAML::Node& link, std::vector<
 // op over its links as share_i = weight_i / (sum of the weights), so 1e9 leaves any real
 // ratio expressible (a billion to one) while every sum of weights stays finite. Without a
 // bound, 1e308 + 1e308 overflows to inf and inf / inf is NaN, a share that poisons every
-// rate downstream; `.inf` does the same directly.
+// rate downstream; 1e309, rounded to infinity, does the same directly.
 inline constexpr double max_link_weight = 1e9;
 
 // `weight` is the link's share when several links carry the same op (a weighted load
 // balancer, ch. 1); 0 is allowed: a drained backend that receives nothing.
 CheckResult read_link_weight(const Site& site, const YAML::Node& link, double& weight) {
   if (auto read = read_optional_number(site, link, "weight", is_zero_or_more,
-                                       "weight must be non-negative", weight);
+                                       "weight must be a finite non-negative number", weight);
       !read) {
     return read;
   }
