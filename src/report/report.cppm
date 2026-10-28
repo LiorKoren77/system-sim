@@ -39,17 +39,19 @@ struct NodeSummary {
   double mean_rho{};       // time-averaged utilization (busy fraction)
   double peak_rho{};       // highest utilization of any observed step
   double peak_backlog{};   // most requests waiting at the end of any observed step
-  double total_dropped{};  // requests shed because the waiting room was full
+  double total_dropped{};  // requests shed because the waiting room was full: failures
   // Requests refused by policy (a rate limiter's 429s, plan 2a refinement 6): answered at
-  // once, never forwarded, and counted with the drops in the drop rate.
+  // once, never forwarded, and counted apart from the drops (reject_rate, not drop_rate).
   double total_rejected{};
   double red_time_s{};  // seconds spent in the red zone
   bool unavailable{};   // the node's latency was infinite in some observed step
 };
 
 // One (client, op) over the observed part of a run. Percentiles are a lognormal fit to
-// the time-averaged moments ("estimated"); an infinite mean makes every latency infinite,
-// which the renderers print as "unavailable" (table) or null (JSON).
+// the latency moments averaged over the ANSWERED requests (plan 2a refinement 8: a refused
+// or dropped request saw no latency); `offered_per_s` still counts every request sent. An
+// infinite mean makes every latency infinite, which the renderers print as "unavailable"
+// (table) or null (JSON).
 struct OpSummary {
   std::string client{};
   std::string op{};
@@ -85,16 +87,22 @@ class Summary {
   // Zero means the window after warmup was empty: there is no data, which the SLO
   // verdicts and the renderers report as such (nothing is evaluated, nothing passes).
   [[nodiscard]] std::size_t observed_steps() const { return observed_steps_; }
-  // One node's drop rate: the requests it failed (dropped from a full queue or rejected
-  // by a rate limiter, plan 2a refinement 8) over the requests sent to it, summed over the
-  // observed steps (Σ (dropped + rejected) / Σ demand), so always in [0, 1]; 0 when nothing
-  // reached it. From the client's side both are failed requests. An unknown id is a programmer
-  // error (the loader checks SLO nodes): throws std::invalid_argument.
+  // One node's drop rate: the requests it FAILED (shed from a full queue) over the requests
+  // sent to it, summed over the observed steps (Σ dropped / Σ demand), so always in [0, 1];
+  // 0 when nothing reached it. An unknown id is a programmer error (the loader checks SLO
+  // nodes): throws std::invalid_argument.
   [[nodiscard]] double drop_rate(std::string_view node) const;
   // The worst node's drop rate: every node must keep its own, so the worst one decides.
   [[nodiscard]] double drop_rate() const;
   // The id of the node with the highest drop rate; empty when no node dropped anything.
   [[nodiscard]] std::string_view worst_drop_node() const;
+  // The same three for REJECTIONS, a rate limiter's refusals by policy (Σ rejected / Σ
+  // demand; a leaky bucket's overflow included): a limiter that sheds what its limit says
+  // is working, not failing, so its refusals are kept out of the drop rate (D5 of the
+  // rate-limiter review) and get an SLO metric of their own.
+  [[nodiscard]] double reject_rate(std::string_view node) const;
+  [[nodiscard]] double reject_rate() const;
+  [[nodiscard]] std::string_view worst_reject_node() const;
   [[nodiscard]] std::string_view scenario_name() const;
   [[nodiscard]] const graph::Graph& graph() const { return *graph_; }
 
@@ -117,22 +125,25 @@ class Summary {
     bool unavailable{};
     void add(const engine::NodeSample& sample, double dt_s);
     [[nodiscard]] double drop_rate() const;
+    [[nodiscard]] double reject_rate() const;
   };
   // Every member has an initializer, even `{}`: GCC's -Wmissing-field-initializers flags
   // a designated initializer that omits one without.
   struct OpTotals {
     std::size_t client{};
     std::string op{};
-    double offered{};      // Σ offered·dt, requests
-    Moments by_offered{};  // weighted by requests offered: what an average request sees
-    Moments by_time{};     // weighted by time: the fallback when nothing was offered
+    double offered{};       // Σ offered·dt, requests
+    Moments by_answered{};  // weighted by requests answered: what an average answer sees
+    Moments by_time{};      // weighted by time: the fallback when nothing was answered
     bool unavailable{};
     void add(const engine::ResponseSample& sample, double dt_s);
   };
 
   [[nodiscard]] double step_length_s(SimTime t);
   [[nodiscard]] OpTotals& totals_for(const engine::ResponseSample& sample, std::size_t hint);
-  [[nodiscard]] std::size_t worst_drop_index() const;
+  // The index of the node with the highest `rate` (drop or reject), the first of equals.
+  [[nodiscard]] std::size_t worst_index(double (NodeTotals::*rate)() const) const;
+  [[nodiscard]] double node_rate(std::string_view node, double (NodeTotals::*rate)() const) const;
 
   // A pointer, not a reference, so a Summary stays copy- and move-assignable.
   const graph::Graph* graph_;
@@ -165,7 +176,7 @@ class Summary {
 [[nodiscard]] std::string render_explain(const graph::Graph& g);
 
 // For plotting: one CSV row per node per step,
-// `t_s,node,rho,backlog,drops_per_s,latency_ms,zone`. The header is written on
+// `t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`. The header is written on
 // construction; the column rules are at SeriesWriter::observe in report.cpp.
 // Pattern: Observer, like Summary. `out` and `g` must outlive the writer.
 class SeriesWriter {

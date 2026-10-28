@@ -1,6 +1,7 @@
 # Lab: System Design Interview vol. 1, ch. 4 — Rate limiter.
 # Compare algorithms under a bursty client. The same file is run with `--param
-# nodes.limiter.algorithm=token_bucket|leaky_bucket|fixed_window|sliding_log|sliding_counter`.
+# nodes.limiter.algorithm=token_bucket|leaky_bucket|fixed_window|sliding_log|sliding_counter`;
+# a windowed algorithm also needs `burst` swapped for `window` (see the note on the limiter).
 version: 1
 name: lab-rate-limiter
 seed: 1
@@ -20,6 +21,10 @@ nodes:
     ops: {call: 1.0}
     timeout: 1s
 
+  # To switch algorithm: token_bucket and leaky_bucket take `burst` (the bucket's size);
+  # fixed_window, sliding_log and sliding_counter take `window` instead (e.g. `window: 1s`,
+  # at most limit x window per window) and refuse a `burst`. A leaky_bucket also refuses
+  # capacity, latency and advanced.queue_limit/concurrency: its queue IS the bucket.
   limiter:
     type: rate_limiter
     algorithm: token_bucket

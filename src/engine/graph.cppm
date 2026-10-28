@@ -98,7 +98,7 @@ struct ResolvedNode {
   std::optional<std::size_t> backend_link{};
 };
 
-// The op a rate limiter sends its counter store once per admitted request (plan 2a
+// The op a rate limiter sends its counter store once per request it checks (plan 2a
 // refinement 6): "read and increment this client's counter" (ch. 4's Redis INCR + EXPIRE).
 inline constexpr std::string_view counter_op = "counter";
 
@@ -369,7 +369,9 @@ namespace {
 }
 
 // Graph::build also takes rate limiters written in code, which the loader never checked:
-// the same rules as config's read_limiter_* (a limit, positive; burst and window positive).
+// the same rules as config's read_limiter_* and check_leaky_bucket_keys (a limit, positive;
+// burst and window positive; a burst only on a bucket; a leaky bucket states nothing but
+// limit and burst).
 [[nodiscard]] std::optional<EngineError> invalid_limiter(const model::NodeSpec& spec) {
   const std::string name = "node '" + spec.id + "': ";
   if (!spec.limit) return EngineError{name + "rate_limiter needs a limit"};
@@ -379,27 +381,46 @@ namespace {
   if (spec.burst && *spec.burst <= 0) return EngineError{name + "burst must be a positive integer"};
   if (spec.window && spec.window->count() <= 0)
     return EngineError{name + "window must be positive"};
+  const auto algorithm = spec.algorithm.value_or(model::LimiterAlgorithm::token_bucket);
+  if (spec.burst && model::is_windowed(algorithm)) {
+    return EngineError{name + "burst applies only to token_bucket and leaky_bucket"};
+  }
+  const bool restates_queue =
+      spec.capacity || spec.latency || spec.advanced.queue_limit || spec.advanced.concurrency;
+  if (algorithm == model::LimiterAlgorithm::leaky_bucket && restates_queue) {
+    return EngineError{name +
+                       "leaky_bucket takes limit and burst; capacity, latency, concurrency and "
+                       "queue_limit are not valid"};
+  }
   return std::nullopt;
 }
 
 // A leaky bucket (ch. 4) IS a queue: requests join a FIFO bucket that leaks at the fixed
 // rate `limit`, and only a full bucket (`burst` waiting) turns requests away. So the
-// limiter's own queue becomes the bucket: service rate = limit, waiting room = burst. Both
-// are the limiter's TOTALS, so with N replicas each copy gets 1/N of them (the engine models
-// one copy, see engine::Simulation::make_server; a pooled group multiplies them back). The
-// service time stays the type's or the scenario's (50 us by default: a counter check), so
-// a request's sojourn is its wait in the bucket plus that check. The scenario's `capacity`
-// and `advanced.queue_limit` are overridden: for a leaky bucket they would be a second,
-// contradicting statement of the limit and the burst.
+// limiter's own queue becomes the bucket, modelled as ONE leak slot:
+//   service rate  = limit          (one request leaves every 1/limit seconds)
+//   service time  = 1 / limit      (the slot is busy for exactly that interval)
+//   concurrency   = 1, service_variability = 0   (one server, deterministic service)
+//   queue_limit   = burst          (the bucket's room)
+// so below the limit a request waits as in an M/D/1 queue (Poisson arrivals, deterministic
+// leak): the Pollaczek-Khinchine wait, half the M/M/1 wait (fluid::FluidQueue::sojourn's
+// Allen-Cunneen factor (1 + 0) / 2), plus the 1/limit leak interval itself. Above it the
+// backlog fills and the overflow is refused (the engine reports it as `rejected`, the
+// bucket's policy, not as a drop). `limit` and `burst` are the limiter's TOTALS, so with N
+// replicas each copy is one slot of limit/N with room burst/N (the engine models one copy,
+// see engine::Simulation::make_server). The loader and invalid_limiter refuse a `capacity`,
+// `latency`, concurrency or queue limit on a leaky bucket: they would restate the bucket.
+// `advanced.service_variability` is overridden to 0 (the leak is regular by definition); the
+// variability of ARRIVALS (`advanced.burstiness`) is still the scenario's to set.
 [[nodiscard]] fluid::Capacity leaky_bucket_capacity(const model::NodeSpec& spec,
                                                     fluid::Capacity capacity) {
   const double replicas = spec.replicas;
-  capacity.service_rate = Rate{spec.limit->per_second / replicas};
+  const double leak_per_copy = spec.limit->per_second / replicas;
+  capacity.service_rate = Rate{leak_per_copy};
+  capacity.service_time_s = 1.0 / leak_per_copy;
+  capacity.concurrency = 1;
+  capacity.service_variability = 0.0;
   capacity.queue_limit = model::limiter_burst(spec) / replicas;
-  if (!spec.advanced.concurrency) {
-    capacity.concurrency = defaults::implied_concurrency(
-        capacity.service_rate, defaults::resolve_service_time(spec).value);
-  }
   return capacity;
 }
 
@@ -607,7 +628,9 @@ Graph::Result Graph::resolve_nodes() {
     };
     if (is_leaky_bucket(spec)) {
       node.capacity = leaky_bucket_capacity(spec, node.capacity);
-      node.service_rate_source = defaults::Source::scenario;  // the limit is the scenario's
+      // Both follow from the scenario's `limit`.
+      node.service_rate_source = defaults::Source::scenario;
+      node.service_time_source = defaults::Source::scenario;
     }
     nodes_.push_back(std::move(node));
   }
@@ -696,7 +719,7 @@ Graph::Result Graph::connect_step(std::size_t from, const model::Step& step) {
   return {};
 }
 
-// A rate limiter's `backend` is the counter store it consults once per admitted request
+// A rate limiter's `backend` is the counter store it consults once per request it checks
 // (plan 2a refinement 6): a demand edge limiter -> backend carrying op `counter`, on the
 // link that carries demand between them. The loader checked that the backend exists and
 // is a cache; a scenario built in code is checked for existence here.

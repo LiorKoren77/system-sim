@@ -87,9 +87,12 @@ class DelayLine {
 // counts three times. With every cost at its default of 1, units are requests, as in
 // phase 1. The drop ratio dropped / demand is therefore the share of the node's work it shed.
 // `rejected_per_s` is a second way to shed (plan 2a refinement 6): requests a rate limiter
-// refused by policy, after its own queue drained them, so they are part of `drain_per_s`
-// too and are never forwarded. Dropped and rejected together are what the node failed
-// (report::Summary::drop_rate). A limiter's every op costs 1, so these units are requests.
+// refused by POLICY, never forwarded. For the token bucket and the windowed algorithms they
+// are refused after the limiter's queue drained them, so they are part of `drain_per_s`
+// too; for a leaky bucket they are its queue's overflow ("bucket full"), which is then
+// reported here and not in `dropped_per_s`. Drops are failures, rejections are the policy
+// working: report::Summary keeps a drop rate and a reject rate apart. A limiter's every op
+// costs 1, so these units are requests.
 struct NodeSample {
   double demand_per_s{};
   double drain_per_s{};
@@ -101,11 +104,17 @@ struct NodeSample {
   fluid::Zone zone{fluid::Zone::green};
 };
 
-// What a client sees for one op: the rate it offers and the response time it gets.
+// What a client sees for one op: the rate it offers, the part of it that comes back
+// answered, and the response time an answered request gets. `answered` = offered × the
+// delivered fraction the backward pass composes along the op's path (plan 2a refinement 8,
+// behaviours::NodeBehaviour::delivered): a request a limiter refused or a full queue dropped
+// is not answered, and reports weigh latency by `answered` so that those requests, which
+// never saw the path's latency, do not dilute it.
 struct ResponseSample {
   std::size_t client{};
   std::string op{};
   Rate offered{};
+  Rate answered{};
   flow::LatencyEstimate response{};
 };
 
@@ -189,9 +198,15 @@ class Simulation {
   // read links without their delay (in the long run a link delivers what it is sent).
   enum class Mode { advance, settle };
 
-  // Per-op response times of one node, kept across steps: a feedback target reads the
-  // previous step's entry. std::less<> (transparent) lets find() take a string_view.
-  using ResponseTable = std::map<std::string, flow::LatencyEstimate, std::less<>>;
+  // What the backward pass knows about one (node, op): the response time of an answered
+  // request and the fraction of the requests that are answered (plan 2a refinement 8).
+  struct Answer {
+    flow::LatencyEstimate latency{};
+    double delivered{1.0};  // 1 until the first backward pass: nothing lost yet
+  };
+  // Per-op answers of one node, kept across steps: a feedback target reads the previous
+  // step's entry. std::less<> (transparent) lets find() take a string_view.
+  using ResponseTable = std::map<std::string, Answer, std::less<>>;
 
   // Identical replica copies modelled by ONE queue (make_server): each copy is sent
   // `demand_share` of the group's arrivals, there are `copies` of them, and a request of the
@@ -217,6 +232,9 @@ class Simulation {
     std::vector<std::size_t> incoming_links{};  // links delivering demand here
     std::vector<std::size_t> outgoing_links{};  // links this node sends demand on
     flow::Flow inflow{};                        // this step's arrivals
+    // The share of this step's arrivals the node passes on (served / inflow, at most 1): the
+    // node's own factor in its delivered fraction (see forward_pass).
+    double passed{1.0};
     ResponseTable responses{};
   };
 
@@ -255,9 +273,11 @@ class Simulation {
   [[nodiscard]] static flow::Flow take_drained(CopyGroup& group, const flow::Flow& content,
                                                const fluid::FluidStep& copy_step);
   void send(std::size_t index, const behaviours::Routed& routed, Mode mode);
+  void account_rejections(std::size_t index, const behaviours::Routed& routed, NodeSample& sample);
   void backward_pass(const std::vector<NodeSample>& samples);
   [[nodiscard]] std::vector<ResponseSample> client_responses(SimTime now) const;
   [[nodiscard]] flow::LatencyEstimate response_of(std::size_t node, std::string_view op) const;
+  [[nodiscard]] double delivered_of(std::size_t node, std::string_view op) const;
 
   std::vector<Node> nodes_;
   std::vector<Link> links_;
@@ -352,7 +372,7 @@ inline constexpr std::size_t max_copy_groups = 2;
 // (plan refinement 4): N copies behind an equal split each saw demand / N, so the group's
 // rates and backlog are the copy's times N. A pooled group is one copy (its queue IS the
 // group); a hash ring adds its hot copy (1) and its cool ones (N - 1). `rejected_per_s`
-// stays 0: a queue never rejects; the forward pass fills it from the behaviour's Routed.
+// stays 0: a queue never rejects; the forward pass fills it (account_rejections).
 void add_copies(NodeSample& sample, const fluid::FluidStep& copy_step, double copies) {
   sample.demand_per_s += copy_step.demand_per_s * copies;
   sample.drain_per_s += copy_step.drain_per_s * copies;
@@ -361,7 +381,8 @@ void add_copies(NodeSample& sample, const fluid::FluidStep& copy_step, double co
 }
 
 // estimate()'s stopping rule: a pass changed nothing that matters when every node's
-// demand and every response a client sees moved by at most this fraction of its value.
+// demand and every response (and answered rate) a client sees moved by at most this
+// fraction of its value.
 // 1e-12 is a few thousand ulps of a double: as close to "exactly equal" as rounding allows.
 inline constexpr double settle_tolerance = 1e-12;
 // ...and the most passes it tries. Each pass costs microseconds per node, so the cap
@@ -382,7 +403,9 @@ inline constexpr int max_settle_passes = 100'000;
     if (!unchanged(before.nodes[i].demand_per_s, after.nodes[i].demand_per_s)) return false;
   }
   for (std::size_t i = 0; i < after.responses.size(); ++i) {
-    if (!unchanged(before.responses[i].response.mean_s, after.responses[i].response.mean_s)) {
+    if (!unchanged(before.responses[i].response.mean_s, after.responses[i].response.mean_s) ||
+        !unchanged(before.responses[i].answered.per_second,
+                   after.responses[i].answered.per_second)) {
       return false;
     }
   }
@@ -453,9 +476,10 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
     case model::NodeType::load_balancer:
       return make_server(behaviours::LoadBalancerBehaviour{g, index}, resolved);
     // A rate limiter's queue is built like any server's from the resolved capacity: for the
-    // token bucket family a plain gate (the type's 100k/s, 50 us check, or the scenario's
-    // `capacity`), for a leaky bucket the bucket itself (graph::leaky_bucket_capacity set
-    // service rate = limit and queue_limit = burst), so the queue does the leaking.
+    // token bucket and the windowed algorithms a plain gate (the type's 100k/s, 50 us check,
+    // or the scenario's `capacity`), for a leaky bucket the bucket itself
+    // (graph::leaky_bucket_capacity: one deterministic slot leaking at `limit`, room
+    // `burst`), so the queue does the leaking.
     case model::NodeType::rate_limiter:
       return make_server(behaviours::RateLimiterBehaviour{g, index}, resolved);
     default:  // create() admitted only simulated types: the rest are services
@@ -647,15 +671,16 @@ Simulation Simulation::settling_copy() const {
   for (auto& node : scratch.nodes_) {
     node.inflow.clear();
     for (auto& group : node.copy_groups) group.waiting.clear();
-    for (auto& [op, response] : node.responses) response = flow::LatencyEstimate{};
+    for (auto& [op, answer] : node.responses) answer = Answer{};
+    node.passed = 1.0;
     if (auto* client = std::get_if<behaviours::ClientBehaviour>(&node.behaviour)) {
       client->reset_noise();
     }
-    // A full bucket would let the first settle passes admit more than the limit and take
-    // burst / ((in - limit) x dt) passes to drain; empty, the first pass admits min(in,
-    // limit), the long-run rate (see RateLimiterBehaviour::empty_bucket).
+    // Every settle pass starts at t = 0, so a window would never close and a full bucket
+    // would take burst / ((in - limit) x dt) passes to drain: the scratch limiter admits
+    // min(in, limit), each algorithm's long-run rate (RateLimiterBehaviour::use_long_run_rate).
     if (auto* limiter = std::get_if<behaviours::RateLimiterBehaviour>(&node.behaviour)) {
-      limiter->empty_bucket();
+      limiter->use_long_run_rate();
     }
   }
   scratch.links_.assign(links_.size(), Link{.line = DelayLine{0}});
@@ -676,7 +701,8 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
 //      mode never ticks, so estimate sees the curve without noise at the time it passes,
 //      t = 0); any other node (service, load balancer, rate limiter) runs its fluid queue
 //      on the inflow and routes the part it drained (backlog included, with the queue's op
-//      mix: see serve); what the route rejects is recorded and goes nowhere;
+//      mix: see serve) for the step [now, now + dt); what the route rejects is recorded
+//      and goes nowhere (account_rejections);
 //   3. send: accumulate the routed flow per link and push it into each link's delay line.
 // Why this order is right: a forward link's target comes later in the order, so it pops
 // after this step's push (a zero-step link delivers in the same step). A feedback link's
@@ -689,22 +715,41 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode,
     receive(index, mode);
     // A client's sample stays all zeros, green: a source has no queue.
     const behaviours::Routed routed = std::visit(
-        Overloaded{
-            [&](behaviours::ClientBehaviour& client) {
-              if (mode == Mode::advance) client.tick(now, dt);
-              return client.offer(now);
-            },
-            // A generic lambda: every other alternative is a queueing node.
-            // Overload resolution prefers the non-template ClientBehaviour&
-            // lambda for a client, so this one sees only servers.
-            [&](auto& server) { return server.route(serve(index, dt, mode, samples[index]), dt); }},
+        Overloaded{[&](behaviours::ClientBehaviour& client) {
+                     if (mode == Mode::advance) client.tick(now, dt);
+                     return client.offer(now);
+                   },
+                   // A generic lambda: every other alternative is a queueing node.
+                   // Overload resolution prefers the non-template ClientBehaviour&
+                   // lambda for a client, so this one sees only servers.
+                   [&](auto& server) {
+                     return server.route(serve(index, dt, mode, samples[index]), now, dt);
+                   }},
         nodes_[index].behaviour);
-    // `routed.served` (the flow the behaviour accepted: its input minus what it rejected) is
-    // not read here: a node's numbers come from its queues (NodeSample). It is still built
-    // per step; reusing a scratch Routed across steps would save that allocation (backlog).
-    samples[index].rejected_per_s = routed.rejected.total().per_second;
+    account_rejections(index, routed, samples[index]);
     send(index, routed, mode);
   }
+}
+
+// What a node refused and what it passed on this step:
+//  - `rejected_per_s` is what the behaviour refused; for a leaky bucket, whose behaviour
+//    refuses nothing, it is the bucket's overflow, moved out of `dropped_per_s` (the queue
+//    reports it as a drop, but "bucket full, 429" is the policy, not a failure);
+//  - `passed` = served / inflow (requests), the node's own factor in its delivered
+//    fraction: a token-family limiter's admitted / offered, a queue's drain / demand. A
+//    step that works off a backlog serves more than it receives; the excess answers
+//    requests of earlier steps, which the per-step pairing cannot credit to them, so the
+//    factor is capped at 1. No arrivals: 1 (nothing was lost).
+void Simulation::account_rejections(std::size_t index, const behaviours::Routed& routed,
+                                    NodeSample& sample) {
+  auto& node = nodes_[index];
+  sample.rejected_per_s = routed.rejected.total().per_second;
+  const auto* limiter = std::get_if<behaviours::RateLimiterBehaviour>(&node.behaviour);
+  if (limiter != nullptr && limiter->refuses_on_overflow()) {
+    sample.rejected_per_s += std::exchange(sample.dropped_per_s, 0.0);
+  }
+  const double arrived = node.inflow.total().per_second;
+  node.passed = arrived > 0.0 ? std::min(routed.served.total().per_second / arrived, 1.0) : 1.0;
 }
 
 // In settle mode the links have no delay: in the long run a link delivers exactly what
@@ -839,9 +884,18 @@ void Simulation::send(std::size_t index, const behaviours::Routed& routed, Mode 
 // The tables hold every op that can reach the node from construction on
 // (register_reachable_ops) and refresh all of them every step, so an op whose flow has
 // not arrived yet, or has paused, is estimated at the node's current load.
+//
+// Next to each latency it composes the DELIVERED fraction (plan 2a refinement 8): the share
+// of the node's requests of that op that come back answered, the node's own `passed` share
+// times what its downstream calls deliver (behaviours::NodeBehaviour::delivered: sequential
+// parts multiply, splits mix by share). A feedback target is read one step stale, as for
+// latency.
 void Simulation::backward_pass(const std::vector<NodeSample>& samples) {
   const auto lookup = [this](std::size_t target, std::string_view op) -> flow::LatencyEstimate {
     return response_of(target, op);
+  };
+  const auto fraction = [this](std::size_t target, std::string_view op) {
+    return delivered_of(target, op);
   };
   // C++20 std::views::reverse: walks the order back to front without copying it,
   // replacing a reverse-iterator loop (rbegin/rend) or a reversed copy.
@@ -850,8 +904,9 @@ void Simulation::backward_pass(const std::vector<NodeSample>& samples) {
     // Only servers compose a response here; clients are read in client_responses().
     std::visit(Overloaded{[](const behaviours::ClientBehaviour&) {},
                           [&](const auto& server) {
-                            for (auto& [op, response] : node.responses) {
-                              response = server.response(op, samples[index].latency, lookup);
+                            for (auto& [op, answer] : node.responses) {
+                              answer.latency = server.response(op, samples[index].latency, lookup);
+                              answer.delivered = server.delivered(op, node.passed, fraction);
                             }
                           }},
                node.behaviour);
@@ -869,13 +924,20 @@ std::vector<ResponseSample> Simulation::client_responses(SimTime now) const {
   const auto lookup = [this](std::size_t target, std::string_view op) -> flow::LatencyEstimate {
     return response_of(target, op);
   };
+  const auto fraction = [this](std::size_t target, std::string_view op) {
+    return delivered_of(target, op);
+  };
   std::vector<ResponseSample> responses;
   for (std::size_t index = 0; index < nodes_.size(); ++index) {
     const auto* client = std::get_if<behaviours::ClientBehaviour>(&nodes_[index].behaviour);
     if (client == nullptr) continue;
     for (const auto& [op, offered] : client->offered(now)) {
-      responses.push_back(ResponseSample{
-          .client = index, .op = op, .offered = offered, .response = client->response(op, lookup)});
+      responses.push_back(
+          ResponseSample{.client = index,
+                         .op = op,
+                         .offered = offered,
+                         .answered = Rate{offered.per_second * client->delivered(op, fraction)},
+                         .response = client->response(op, lookup)});
     }
   }
   return responses;
@@ -885,7 +947,14 @@ std::vector<ResponseSample> Simulation::client_responses(SimTime now) const {
 flow::LatencyEstimate Simulation::response_of(std::size_t node, std::string_view op) const {
   const auto& table = nodes_[node].responses;
   const auto found = table.find(op);
-  return found == table.end() ? flow::LatencyEstimate{} : found->second;
+  return found == table.end() ? flow::LatencyEstimate{} : found->second.latency;
+}
+
+// One for an op no flow can bring to the node: nothing of it is lost there.
+double Simulation::delivered_of(std::size_t node, std::string_view op) const {
+  const auto& table = nodes_[node].responses;
+  const auto found = table.find(op);
+  return found == table.end() ? 1.0 : found->second.delivered;
 }
 
 }  // namespace simsys::engine
