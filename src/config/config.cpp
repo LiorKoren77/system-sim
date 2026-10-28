@@ -5,12 +5,14 @@ module;
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <expected>
 #include <format>
 #include <functional>
 #include <set>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -199,6 +201,9 @@ std::expected<NodeDecl, ConfigError> read_node_declaration(const std::string& fi
 // The id goes into the set first, so a repeated id is reported before its body is read.
 CheckResult add_node_declaration(const std::string& file, const YAML::Node& id,
                                  const YAML::Node& body, Declarations& declared) {
+  if (id.Scalar().empty()) {
+    return std::unexpected(error_at(file, id, "node id must not be empty"));
+  }
   // set::insert returns {iterator, inserted}; `inserted` is false when the id was there.
   if (!declared.ids.insert(id.Scalar()).second) {
     return std::unexpected(error_at(file, id, std::format("duplicate node id '{}'", id.Scalar())));
@@ -250,12 +255,30 @@ CheckResult check_step_list(const std::string& file, const YAML::Node& steps, co
   return {};
 }
 
-// A service's ops map each op to a step list; a client's ops map each op to a traffic
-// share (a number), which names no node and is skipped.
+// True when the whole text is a number ("1", "0.5"): a traffic share. from_chars never
+// throws and reports how far it got; the whole text must be consumed, so "0.5x" is no number.
+bool is_number(std::string_view text) {
+  double value{};
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+  return error == std::errc{} && end == text.data() + text.size();
+}
+
+// An op is a step list (a service's op) or a share (a client's op, a number); a share names
+// no node. Anything else, such as a map or a word, is neither and would silently do nothing.
+CheckResult check_op(const std::string& file, const YAML::Node& name, const YAML::Node& value,
+                     const NodeIds& ids) {
+  if (is_sequence(value)) return check_step_list(file, value, ids);
+  if (value.IsScalar() && is_number(value.Scalar())) return {};
+  return std::unexpected(
+      error_at(file, value, std::format("op '{}' must be a step list or a share", name.Scalar())));
+}
+
+// `ops` is optional; when present it is a map from op name to step list or share.
 CheckResult check_op_steps(const std::string& file, const YAML::Node& ops, const NodeIds& ids) {
+  if (!ops) return {};
+  if (!ops.IsMap()) return std::unexpected(error_at(file, ops, "ops must be a map"));
   for (const auto& op : ops) {
-    if (!is_sequence(op.second)) continue;
-    if (auto checked = check_step_list(file, op.second, ids); !checked) return checked;
+    if (auto checked = check_op(file, op.first, op.second, ids); !checked) return checked;
   }
   return {};
 }
@@ -336,13 +359,17 @@ std::expected<std::vector<LinkDecl>, ConfigError> collect_links(const std::strin
   return collected;
 }
 
-// Pattern: Chain of validators (fail-fast)
-// Fail-fast sequence of checks: each returns std::expected<T, ConfigError> (T is void for a
-// pure check, the parsed value otherwise); the first error wins.
+// Pattern: Validation pipeline — a sequence of independent checks run in order; the first
+// error stops the run so the user sees one precise message. Each check returns
+// std::expected<T, ConfigError> (T is void for a pure check, the parsed value otherwise).
 std::expected<Scenario, ConfigError> validate(const std::string& file, const YAML::Node& root) {
   if (auto checked = check_top_level(file, root); !checked) return std::unexpected(checked.error());
   auto name = scalar_value(file, root, "name");
   if (!name) return std::unexpected(name.error());
+  // A null `name:` has the empty scalar too.
+  if (name->empty()) {
+    return std::unexpected(error_at(file, root["name"], "name must not be empty"));
+  }
   auto duration = parse_duration_key(file, root, "duration");
   if (!duration) return std::unexpected(duration.error());
   auto declared = collect_node_declarations(file, root["nodes"]);
