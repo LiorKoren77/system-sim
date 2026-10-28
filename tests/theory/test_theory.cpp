@@ -20,6 +20,7 @@ import simsys.engine;
 import simsys.fluid;
 import simsys.graph;
 import simsys.model;
+import simsys.queueing;
 import simsys.workload;
 
 // A note for test authors: `Approx(x).margin(m)` passes when the value is within the
@@ -33,6 +34,7 @@ using simsys::Rate;
 using simsys::engine::Simulation;
 using simsys::graph::Graph;
 using simsys::model::Direction;
+using simsys::model::LbPolicy;
 using simsys::model::LinkSpec;
 using simsys::model::NodeSpec;
 using simsys::model::NodeType;
@@ -78,6 +80,26 @@ Scenario half_loop(simsys::SimTime feedback_latency) {
   s.links = {LinkSpec{.from = "c", .to = "f", .latency = 0s},
              LinkSpec{.from = "f", .to = "g", .latency = 0s},
              LinkSpec{.from = "g", .to = "f", .latency = feedback_latency}};
+  return s;
+}
+
+// u(demand/s) -> lb -> a: the service `a` has 1000/s capacity, 1 ms service time and the
+// given replicas; both links have zero latency; the balancer keeps its default capacity
+// (100k/s) and latency (50 us), so it adds only its own tiny sojourn.
+Scenario lb_front(LbPolicy policy, int replicas, double demand) {
+  Scenario s{.name = "lb-front", .version = 1, .duration = 10s};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{demand}}, .op_shares = {{"op", 1.0}}}},
+      NodeSpec{.id = "lb", .type = NodeType::load_balancer, .policy = policy},
+      NodeSpec{.id = "a",
+               .type = NodeType::service,
+               .replicas = replicas,
+               .capacity = Rate{1000},
+               .latency = 1ms}};
+  s.links = {LinkSpec{.from = "u", .to = "lb", .latency = 0s},
+             LinkSpec{.from = "lb", .to = "a", .latency = 0s}};
   return s;
 }
 }  // namespace
@@ -626,4 +648,59 @@ TEST_CASE("the curve command's noisy samples at the scenario step are the run's 
   int k = 0;
   for (const auto& sample : samples)
     REQUIRE(sim.step(k++ * 100ms, 100ms).responses[0].offered.per_second == sample.rate.per_second);
+}
+
+// Round robin deals requests out blindly, so each replica has its own queue: two copies at
+// 1000/s each under 1800/s total are two independent M/M/1 queues at rho = 900 / 1000 = 0.9,
+// each with mean wait rho / (mu - lambda) = 9 ms (book ch. 1: a plain load balancer).
+TEST_CASE("round robin keeps replicas as independent queues: each copy is an M/M/1 at its share",
+          "[theory]") {
+  const auto r =
+      (*Simulation::create(*Graph::build(lb_front(LbPolicy::round_robin, 2, 1800)))).step(0s, 100ms);
+  const auto& a = r.nodes[2];
+  REQUIRE_THAT(a.rho, WithinRel(0.9, 1e-12));
+  const auto w = simsys::queueing::mmc_wait(1, 0.9, 0.001);
+  REQUIRE_THAT(a.latency.mean_s, WithinRel(w.mean_s + 0.001, 1e-9));
+}
+
+// Least connections sends each request to the copy with the fewest requests in flight, so
+// a request waits only when every copy is busy: the replicas behave as one pool, an M/M/c
+// queue with c = 2 servers. Its wait is ErlangC(c, rho) * s / (c (1 - rho)), which at the
+// same rho is far below the M/M/1 wait of round robin (the pooling effect).
+TEST_CASE("least connections pools the replicas: one M/M/c queue with c = replicas", "[theory]") {
+  const auto r = (*Simulation::create(*Graph::build(lb_front(LbPolicy::least_connections, 2, 1800))))
+                     .step(0s, 100ms);
+  const auto& a = r.nodes[2];
+  REQUIRE_THAT(a.rho, WithinRel(0.9, 1e-12));
+  const auto w = simsys::queueing::mmc_wait(2, 0.9, 0.001);  // ErlangC(2, 0.9) s / (2 (1 - 0.9))
+  REQUIRE_THAT(a.latency.mean_s, WithinRel(w.mean_s + 0.001, 1e-9));
+  const auto round_robin =
+      (*Simulation::create(*Graph::build(lb_front(LbPolicy::round_robin, 2, 1800)))).step(0s, 100ms);
+  REQUIRE(a.latency.mean_s < round_robin.nodes[2].latency.mean_s);
+}
+
+// A hash ring with v virtual nodes per server spreads keys unevenly: the busiest server
+// holds about 1 + 1/sqrt(v) times the average share (a heuristic from the book ch. 5).
+// With v = 100 the hottest of 4 copies sees 900/s * 1.1 = 990/s, so rho = 0.99.
+TEST_CASE("consistent hashing loads the hottest replica by the imbalance factor", "[theory]") {
+  Scenario s = lb_front(LbPolicy::consistent_hash, 4, 3600);  // 900/s per copy on average
+  s.nodes[1].vnodes = 100;                                    // hottest copy sees 990/s
+  const auto r = (*Simulation::create(*Graph::build(s))).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[2].rho, WithinRel(0.99, 1e-12));
+  REQUIRE_THAT(r.nodes[2].drain_per_s, WithinRel(3600.0, 1e-12));  // the group still drains all
+}
+
+// The balancer is itself a queue (100k/s, 50 us, so c = ceil(100000 * 50e-6) = 5 servers
+// implied); at 900/s its rho is 0.009. Adding it to a chain must add exactly its own
+// sojourn, mmc_wait(5, 0.009, 50 us) + 50 us, plus two zero-latency link legs.
+TEST_CASE("a load balancer in the chain costs its own service time and nothing else", "[theory]") {
+  const auto without = (*Simulation::create(*Graph::build(mm1(900)))).step(0s, 100ms);
+  const auto with =
+      (*Simulation::create(*Graph::build(lb_front(LbPolicy::round_robin, 1, 900)))).step(0s, 100ms);
+  REQUIRE(with.responses.size() == 1);
+  REQUIRE(without.responses.size() == 1);
+  const auto lb_wait = simsys::queueing::mmc_wait(5, 900.0 / 100000.0, 50e-6);
+  const double lb_sojourn = lb_wait.mean_s + 50e-6;
+  REQUIRE_THAT(with.responses[0].response.mean_s - without.responses[0].response.mean_s,
+               WithinRel(lb_sojourn, 1e-6));
 }

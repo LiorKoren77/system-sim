@@ -30,10 +30,12 @@ using namespace std::chrono_literals;
 using Catch::Matchers::WithinRel;
 using simsys::Rate;
 using simsys::behaviours::ClientBehaviour;
+using simsys::behaviours::LoadBalancerBehaviour;
 using simsys::behaviours::Outgoing;
 using simsys::behaviours::ServiceBehaviour;
 using simsys::flow::Flow;
 using simsys::flow::LatencyEstimate;
+using simsys::model::LbPolicy;
 using simsys::model::LinkSpec;
 using simsys::model::NodeSpec;
 using simsys::model::NodeType;
@@ -65,17 +67,32 @@ Scenario two_hop(StepMode mode) {
              LinkSpec{.from = "web", .to = "db", .latency = 10ms}};
   return s;
 }
+// u -> lb -> {a (weight 3), b (weight 1)}, zero-latency links.
+Scenario weighted_lb() {
+  Scenario s{.name = "lb", .version = 1, .duration = 1min};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"get", 1.0}}}},
+             NodeSpec{.id = "lb", .type = NodeType::load_balancer, .policy = LbPolicy::weighted},
+             NodeSpec{.id = "a", .type = NodeType::service},
+             NodeSpec{.id = "b", .type = NodeType::service}};
+  s.links = {LinkSpec{.from = "u", .to = "lb", .latency = 0s},
+             LinkSpec{.from = "lb", .to = "a", .latency = 0s, .weight = 3},
+             LinkSpec{.from = "lb", .to = "b", .latency = 0s, .weight = 1}};
+  return s;
+}
 }  // namespace
 
 // C++20 concepts checked at compile time: the behaviours must satisfy the engine's
 // requirements, or this file does not compile.
 static_assert(simsys::behaviours::NodeBehaviour<ServiceBehaviour>);
 static_assert(simsys::behaviours::RequestSource<ClientBehaviour>);
+static_assert(simsys::behaviours::NodeBehaviour<LoadBalancerBehaviour>);
 
 // And the negative: a type that routes flow but cannot answer for its latency is not a
 // NodeBehaviour, so the engine refuses it at compile time instead of misbehaving at run time.
 struct NoResponse {
-  simsys::behaviours::Routed route(const Flow&) const;
+  simsys::behaviours::Routed route(const Flow&, simsys::SimTime) const;
 };
 static_assert(!simsys::behaviours::NodeBehaviour<NoResponse>);
 
@@ -96,7 +113,7 @@ TEST_CASE("a service forwards each step's op scaled by its factor and serves eve
   Flow in;
   in.add("get", Rate{50});
   in.add("put", Rate{5});  // no steps: terminal op, served locally
-  const auto routed = web.route(in);
+  const auto routed = web.route(in, 100ms);
   REQUIRE(routed.outgoing.size() == 2);
   // C++20 ranges algorithm with a projection: `&Outgoing::target` is applied to each
   // element before comparing with the db's index, replacing a lambda passed to std::find_if.
@@ -111,7 +128,7 @@ TEST_CASE("a service forwards each step's op scaled by its factor and serves eve
 TEST_CASE("a service with no incoming flow forwards nothing", "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(two_hop(StepMode::sequential));
   const ServiceBehaviour web{g, *g.index_of("web")};
-  const auto routed = web.route(Flow{});
+  const auto routed = web.route(Flow{}, 100ms);
   REQUIRE(routed.outgoing.empty());
   REQUIRE(routed.served.empty());
 }
@@ -205,7 +222,7 @@ TEST_CASE("two steps to the same target merge into one outgoing flow carrying bo
   const auto g = *simsys::graph::Graph::build(s);
   Flow in;
   in.add("get", Rate{10});
-  const auto routed = ServiceBehaviour{g, *g.index_of("web")}.route(in);
+  const auto routed = ServiceBehaviour{g, *g.index_of("web")}.route(in, 100ms);
   REQUIRE(routed.outgoing.size() == 1);
   REQUIRE_THAT(routed.outgoing[0].flow.rate_of("select").per_second, WithinRel(10.0, 1e-12));
   REQUIRE_THAT(routed.outgoing[0].flow.rate_of("count").per_second, WithinRel(5.0, 1e-12));
@@ -247,7 +264,7 @@ TEST_CASE("the hop that closes a call cycle forwards flow but adds no latency to
   const ServiceBehaviour sync{g, *g.index_of("sync")};
   Flow in;
   in.add("job", Rate{3});
-  REQUIRE(sync.route(in).outgoing.size() == 1);  // flow still goes round
+  REQUIRE(sync.route(in, 100ms).outgoing.size() == 1);  // flow still goes round
   const auto r =
       sync.response("job", LatencyEstimate{0.002, 0.0},
                     [](std::size_t, std::string_view) { return LatencyEstimate{99.0, 99.0}; });
@@ -341,4 +358,37 @@ TEST_CASE("a service's cost per op comes from its spec and defaults to one", "[b
   const ServiceBehaviour web{g, *g.index_of("web")};
   REQUIRE(web.cost("get") == 2.5);
   REQUIRE(web.cost("put") == 1.0);
+}
+
+TEST_CASE("a load balancer forwards every incoming op across its routes and serves nothing itself",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(weighted_lb());
+  LoadBalancerBehaviour lb{g, *g.index_of("lb")};
+  Flow in;
+  in.add("get", Rate{100});
+  const auto routed = lb.route(in, 100ms);
+  REQUIRE(routed.outgoing.size() == 2);
+  const auto to_a = std::ranges::find(routed.outgoing, *g.index_of("a"), &Outgoing::target);
+  const auto to_b = std::ranges::find(routed.outgoing, *g.index_of("b"), &Outgoing::target);
+  REQUIRE(to_a != routed.outgoing.end());
+  REQUIRE(to_b != routed.outgoing.end());
+  REQUIRE_THAT(to_a->flow.rate_of("get").per_second, WithinRel(75.0, 1e-12));
+  REQUIRE_THAT(to_b->flow.rate_of("get").per_second, WithinRel(25.0, 1e-12));
+  // It handled every request (its own tiny service time), though it answers none itself.
+  REQUIRE_THAT(routed.served.total().per_second, WithinRel(100.0, 1e-12));
+}
+
+TEST_CASE("a load balancer's response is its own sojourn plus the share-weighted downstream mixture",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(weighted_lb());
+  const LoadBalancerBehaviour lb{g, *g.index_of("lb")};
+  const auto r = lb.response("get", LatencyEstimate{0.0001, 0.0},
+                             [&](std::size_t node, std::string_view) {
+                               return node == *g.index_of("a") ? LatencyEstimate{0.001, 0.0}
+                                                               : LatencyEstimate{0.005, 0.0};
+                             });
+  REQUIRE_THAT(r.mean_s, WithinRel(0.0001 + 0.75 * 0.001 + 0.25 * 0.005, 1e-12));
+  // Between-branch variance of a two-point mixture: s_a s_b (m_a - m_b)^2; each branch is
+  // deterministic and the links add nothing, so all of the variance is the spread between them.
+  REQUIRE_THAT(r.variance_s2, WithinRel(0.75 * 0.25 * (0.004 * 0.004), 1e-9));
 }

@@ -2611,3 +2611,56 @@ TEST_CASE("cost is capped") {
                    "node 'a': cost 'x' must be at most 1e6");
   require_loaded("simsys_cost_max.yaml", scenario_with("  a: {type: service, cost: {x: 1e6}}\n"));
 }
+
+TEST_CASE("a load balancer's policy and vnodes are typed and checked") {
+  // C++20 `using enum`: brings LbPolicy's enumerators into this scope so the checks below
+  // read `least_connections` instead of `simsys::model::LbPolicy::least_connections`.
+  using enum simsys::model::LbPolicy;
+  SECTION("a named policy loads as the enum") {
+    const auto path = write_temp("simsys_lb_policy.yaml",
+                                 scenario_with("  lb: {type: load_balancer, policy: least_connections}\n"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    REQUIRE(s->nodes[0].policy == least_connections);
+  }
+  SECTION("no policy key: the loader fills in round_robin") {
+    const auto path =
+        write_temp("simsys_lb_default.yaml", scenario_with("  lb: {type: load_balancer}\n"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    REQUIRE(s->nodes[0].policy == round_robin);
+  }
+  SECTION("consistent_hash takes a vnodes count") {
+    const auto path = write_temp(
+        "simsys_lb_vnodes.yaml",
+        scenario_with("  lb: {type: load_balancer, policy: consistent_hash, vnodes: 100}\n"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    REQUIRE(s->nodes[0].policy == consistent_hash);
+    REQUIRE(s->nodes[0].vnodes == 100);
+  }
+  SECTION("an unknown policy") {
+    require_rejected(
+        "simsys_lb_sideways.yaml", scenario_with("  lb: {type: load_balancer, policy: sideways}\n"),
+        "node 'lb': policy must be round_robin, least_connections, weighted or consistent_hash");
+  }
+  SECTION("vnodes of zero") {
+    require_rejected(
+        "simsys_lb_vnodes_zero.yaml",
+        scenario_with("  lb: {type: load_balancer, policy: consistent_hash, vnodes: 0}\n"),
+        "node 'lb': vnodes must be a positive integer");
+  }
+  SECTION("vnodes without consistent_hash") {
+    require_rejected("simsys_lb_vnodes_rr.yaml",
+                     scenario_with("  lb: {type: load_balancer, vnodes: 10}\n"),
+                     "node 'lb': vnodes applies only to consistent_hash");
+  }
+  SECTION("a policy on a service") {
+    require_rejected("simsys_policy_service.yaml",
+                     scenario_with("  s: {type: service, policy: round_robin}\n"),
+                     "node 's': key 'policy' is not valid for type 'service'");
+  }
+}
