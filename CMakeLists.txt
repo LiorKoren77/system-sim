@@ -14,6 +14,16 @@ endif()
 
 include(cmake/Dependencies.cmake)
 
+# GCC 14.2 + named modules: each import maps the imported module's whole line table (its
+# global-module-fragment headers included) into this translation unit's source-location
+# space. A unit at the end of a deep import chain (simsys.engine imports behaviours,
+# graph, fluid, flow, model, core ...) runs out of it ("unable to represent further
+# imported source locations") and the compiler then crashes in write_location while
+# writing the module. -flarge-source-files gives up some column precision in diagnostics
+# for a much larger line range. Verified 2026-10-28; every module unit needs the same
+# setting, so it applies to all of our targets.
+add_compile_options(-flarge-source-files)
+
 # One warning set for all of our targets (never applied to third-party code).
 add_library(simsys_warnings INTERFACE)
 target_compile_options(simsys_warnings INTERFACE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
