@@ -207,6 +207,12 @@ Fix-round notes: no pinned test value moved under I2 (every pinned delivered/ans
 
 Schema v1.3 (keys, sql, cdn, id keys; che resolution; staleness; columns; runnable set), spec §18 (refinements 1–7), `docs/study/numerics.md`, README. Commit `docs: schema v1.3, spec §18, numerics note`.
 
+- [x] `docs/study/numerics.md` (landed early, 640f959).
+- [x] Schema v1.3: "New in v1.3" list, "What runs in phase 2b" with the type message spelled out and the six runnable scenarios, lower bounds on `not checked` lines, the che loop error, staleness on a single-copy database.
+- [x] Spec §18: fifteen entries (the seven refinements as finally implemented, each with its review corrections, plus filtered popularity, ring partitioning, write cost 5, pool, staleness and missed writes, byte-derived capacities, answered = offered − lost, explain's marks); §7's `cdn`, `cache`, `sql_db` and `id_generator` rows revised; §6 points at the write cost.
+- [x] README (phase 2b status, `--series-ops` and youtube `explain` examples) and the study index's "where to look" for the 2b patterns.
+- [x] Commit `docs: schema v1.3, spec §18 phase 2b refinements, README for the runnable set`
+
 ---
 
 ## Phase 2c backlog (found in 2b)
