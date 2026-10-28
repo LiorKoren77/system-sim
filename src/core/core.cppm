@@ -315,12 +315,14 @@ export namespace simsys {
 
 // A point on the simulated timeline, in either of the two spellings scenario authors use:
 // a clock time ("20:00") or a duration from the start ("90m"). Both are offsets from
-// t = 0. One combined message on failure, so an author who wrote the wrong form learns
-// about both.
+// t = 0. Text with a colon was meant as a clock time, so it gets parse_clock_time's own,
+// precise message ("hour must be 00-23"); any other text that is not a duration gets one
+// combined message, so an author who wrote neither form learns about both.
 [[nodiscard]] std::expected<SimTime, ParseError> parse_time_point(std::string_view text) {
   // C++23 std::string_view::contains: replaces `find(c) != npos`, which reads as
   // arithmetic on an index when all we want is a yes/no question.
-  auto parsed = text.contains(':') ? parse_clock_time(text) : parse_duration(text);
+  if (text.contains(':')) return parse_clock_time(text);
+  auto parsed = parse_duration(text);
   if (!parsed) return detail::fail(text, "expected HH:MM or a duration");
   return parsed;
 }
