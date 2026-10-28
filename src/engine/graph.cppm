@@ -60,7 +60,7 @@ struct ResolvedLink {
   model::Direction dir{model::Direction::out};
   SimTime one_way{};
   defaults::Source latency_source{defaults::Source::dc_default};
-  int delay_steps{};  // ceil(one_way / step) when one_way >= step / 2, else 0; >= 1 if feedback
+  int delay_steps{};  // round(one_way / step), halves away from zero; >= 1 if feedback
   bool feedback{false};
   std::vector<std::string> ops{};  // empty = all ops
   double weight{1.0};
@@ -175,19 +175,16 @@ namespace {
   return text;
 }
 
-// How many whole steps a hop of `one_way` delays the flow (spec §3.4). A hop shorter than
-// half a step only adds latency (the reply path accounts for it): its flow arrives closer
-// to this step than to the next, so it passes through in the same step. Any longer hop
-// also delays the flow through a ring buffer of ceil(one_way / step) steps, so the flow
-// never arrives before it could have: a 75 ms cross-datacenter hop (half the book's
-// 150 ms round trip) at 100 ms steps arrives one step late. The spec's text says
-// "longer than a step"; with one-way latencies (plan refinement 5) that would let a
-// cross-datacenter hop through instantly. count(): chrono's non-member operators are
-// not visible here.
+// How many whole steps a hop of `one_way` delays the flow (spec §3.4, refined): the
+// nearest whole number of steps, halves rounded away from zero. A hop shorter than half
+// a step only adds latency (the reply path accounts for it) and its flow passes through
+// in the same step; a 75 ms cross-datacenter hop (half the book's 150 ms round trip) at
+// 100 ms steps arrives one step late; 250 ms arrives three steps late. Rounding to the
+// nearest step keeps the average arrival time honest: ceil alone would delay every
+// 101 ms hop by two steps. count(): chrono's non-member operators are not visible here.
 [[nodiscard]] int delay_steps_for(SimTime one_way, SimTime step) {
-  if (2 * one_way.count() < step.count()) return 0;
-  return static_cast<int>(
-      std::ceil(static_cast<double>(one_way.count()) / static_cast<double>(step.count())));
+  const auto ratio = static_cast<double>(one_way.count()) / static_cast<double>(step.count());
+  return static_cast<int>(std::llround(ratio));
 }
 
 }  // namespace
