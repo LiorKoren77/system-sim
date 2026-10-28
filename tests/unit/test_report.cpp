@@ -18,6 +18,7 @@ import simsys.engine;
 import simsys.graph;
 import simsys.model;
 import simsys.report;
+import simsys.workload;
 
 using namespace std::chrono_literals;
 using Catch::Approx;
@@ -338,4 +339,32 @@ TEST_CASE("explain says when a loop of gain >= 1 has no steady state", "[report]
   const auto text = simsys::report::render_explain(g);
   CAPTURE(text);
   REQUIRE(text.ends_with("  (no steady state: a loop of gain >= 1)\n"));
+}
+
+TEST_CASE("explain summarises the client's curve and checks the peak offered load", "[report]") {
+  // A daily sine around 1k/s peaking at noon offers 1.5k/s at 12:00: a service of 1.2k/s
+  // looks fine at t = 0 (500/s, midnight's trough) and is overloaded at the peak, which is
+  // what a back-of-the-envelope check must catch ("peak QPS", ch. 2).
+  Scenario s{.name = "peak", .version = 1, .duration = 24h};
+  s.nodes = {
+      NodeSpec{.id = "users",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1000},
+                                              .wave =
+                                                  simsys::workload::Wave{
+                                                      .shape = simsys::workload::WaveShape::sine,
+                                                      .period = 24h,
+                                                      .amplitude = 0.5,
+                                                      .peak_at = 12h}},
+                                    .op_shares = {{"op", 1.0}}}},
+      NodeSpec{.id = "api", .type = NodeType::service, .capacity = Rate{1200}, .latency = 1ms}};
+  s.links = {LinkSpec{.from = "users", .to = "api", .dir = simsys::model::Direction::inout}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto text = simsys::report::render_explain(g);
+  CAPTURE(text);
+  REQUIRE(text.find("rate: base 1k/s, wave sine P=24h A=0.5 peak 12:00") != std::string::npos);
+  REQUIRE(text.find("checks (peak offered load over the first 24h, no queueing):\n") !=
+          std::string::npos);
+  REQUIRE(text.find("  api  peak offered 1.5k/s vs 1.2k/s total capacity  (125%, red)\n") !=
+          std::string::npos);
 }
