@@ -1,4 +1,5 @@
 // Properties of the unit parsers that scenario files rely on.
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -156,4 +157,18 @@ TEST_CASE("prefix errors list the prefixes valid for that unit, so k versus K is
                    "unknown prefix 'k' (expected K, M, G)");
   require_rejected(simsys::parse_rate("10K/s"), "10K/s", "unknown prefix 'K' (expected k, M, G)");
   require_rejected(simsys::parse_byte_rate("B/s"), "B/s", "expected a number");
+}
+
+TEST_CASE("seconds and from_seconds round-trip SimTime through double") {
+  REQUIRE(simsys::seconds(1500ms) == Catch::Approx(1.5));
+  REQUIRE(simsys::from_seconds(0.0001) == 100us);
+  REQUIRE(simsys::seconds(simsys::from_seconds(2.5)) == Catch::Approx(2.5));
+}
+
+TEST_CASE("simsys time literals equal their std::chrono counterparts") {
+  using namespace simsys::literals;
+  static_assert(250_us == 250us);
+  static_assert(150_ms == 150ms);
+  static_assert(2_s == 2s);
+  REQUIRE(7_ns == 7ns);
 }
