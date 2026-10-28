@@ -665,12 +665,14 @@ TEST_CASE("nodes the paper load does reach keep their verdict and are not marked
     REQUIRE(line.contains("green"));
     REQUIRE_FALSE(line.contains("load not propagated"));
   }
-  // The CDNs and the blob stores fed straight from clients or caches carry their own note
-  // (capacity from bytes: no verdict), not the propagation mark.
+  // The CDNs and the blob store fed straight from clients or caches are checked in MB/s (plan 2c
+  // refinement 2), with a percentage and a zone: no "not checked" note, no propagation mark.
   for (const auto* id : {"cdn_us", "original_store"}) {
     CAPTURE(id);
     const auto line = check_line(text, id);
-    REQUIRE(line.contains("not checked: capacity from"));
+    REQUIRE(line.contains("MB/s"));
+    REQUIRE(line.contains("green"));
+    REQUIRE_FALSE(line.contains("not checked"));
     REQUIRE_FALSE(line.contains("load not propagated"));
   }
 }

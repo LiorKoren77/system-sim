@@ -31,6 +31,7 @@ using namespace std::chrono_literals;
 using Catch::Matchers::WithinAbs;
 using Catch::Matchers::WithinRel;
 using simsys::Rate;
+using simsys::behaviours::BlobStoreBehaviour;
 using simsys::behaviours::CacheBehaviour;
 using simsys::behaviours::CdnBehaviour;
 using simsys::behaviours::ClientBehaviour;
@@ -147,6 +148,7 @@ static_assert(simsys::behaviours::NodeBehaviour<LoadBalancerBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<RateLimiterBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<CacheBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<CdnBehaviour>);
+static_assert(simsys::behaviours::NodeBehaviour<BlobStoreBehaviour>);
 
 // And the negative: a type that routes flow but cannot answer for its latency is not a
 // NodeBehaviour, so the engine refuses it at compile time instead of misbehaving at run time.
@@ -1514,4 +1516,111 @@ TEST_CASE("a cdn delivers its hits plus its misses times the origin's delivered 
   const double delivered =
       cdn.delivered("read", 0.9, [](std::size_t, std::string_view) { return 0.5; });
   REQUIRE_THAT(delivered, WithinRel(0.8775, 1e-12));
+}
+
+// ---- Byte-sized nodes count megabytes (plan 2c refinement 2, Task 3) ----
+//
+// A node whose capacity is a byte rate (a blob store's default, spec section 6's 500 MB/s, or a
+// CDN's stated `capacity: 100GB/s`) counts one MB as one unit of capacity, so a request of op o
+// costs request_bytes(o) / 1e6 units: a 50 MB upload costs 50, a 2 KB read 2e3 / 1e6 = 0.002.
+// The sizes are the clients' (`sizes:`), resolved once by the graph (Graph::request_bytes).
+
+namespace {
+// u (sizes: upload 50 MB, read 2 KB) -> store (a blob store with its type's default capacity,
+// byte-sized). Node indices: u 0, store 1; zero-latency link.
+Scenario sized_blob_front() {
+  Scenario s{.name = "blob", .version = 1, .duration = 1min};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{100}},
+                                           .op_shares = {{"upload", 0.5}, {"read", 0.5}},
+                                           .sizes = {{"upload", simsys::Bytes{50e6}},
+                                                     {"read", simsys::Bytes{2e3}}}}},
+             NodeSpec{.id = "store", .type = NodeType::blob_store}};
+  s.links = {LinkSpec{.from = "u", .to = "store", .latency = 0s}};
+  return s;
+}
+
+// u (sizes: stream 50 MB) -> cdn (fixed hit ratio 0.95, origin `origin`) -> origin (a service,
+// which counts requests). The cdn is byte-sized (100 GB/s) when `bytes` is given, else it counts
+// requests (the default 100k/s). Node indices: u 0, cdn 1, origin 2.
+Scenario stream_cdn_front(std::optional<simsys::ByteRate> bytes) {
+  Scenario s{.name = "stream-cdn", .version = 1, .duration = 1min};
+  NodeSpec cdn{.id = "cdn",
+               .type = NodeType::cdn,
+               .byte_capacity = bytes,
+               .hit_ratio = HitRatio{.fixed = 0.95}};
+  cdn.origin = "origin";
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{100}},
+                                           .op_shares = {{"stream", 1.0}},
+                                           .sizes = {{"stream", simsys::Bytes{50e6}}}}},
+             std::move(cdn), NodeSpec{.id = "origin", .type = NodeType::service}};
+  s.links = {LinkSpec{.from = "u", .to = "cdn", .latency = 0s},
+             LinkSpec{.from = "cdn", .to = "origin", .latency = 1ms}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("a byte-sized blob store charges a request its size in megabytes", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(sized_blob_front());
+  const BlobStoreBehaviour store{g, *g.index_of("store")};
+  REQUIRE_THAT(store.cost("upload"), WithinRel(50.0, 1e-12));  // 50e6 B / 1e6 B per unit
+  REQUIRE_THAT(store.cost("read"), WithinRel(0.002, 1e-12));   // 2e3 B / 1e6 B per unit
+}
+
+// A blob store without `then` steps is a leaf (book ch. 14's S3-like store): it answers every
+// request itself and calls nobody, as a database does.
+TEST_CASE("a blob store serves every op and forwards nothing", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(sized_blob_front());
+  const BlobStoreBehaviour store{g, *g.index_of("store")};
+  Flow in;
+  in.add("upload", Rate{5});
+  in.add("read", Rate{1000});
+  const auto routed = store.route(in, 0s, 100ms);
+  REQUIRE(routed.outgoing.empty());
+  REQUIRE(routed.rejected.empty());
+  REQUIRE_THAT(routed.served.rate_of("upload").per_second, WithinRel(5.0, 1e-12));
+  REQUIRE_THAT(routed.served.rate_of("read").per_second, WithinRel(1000.0, 1e-12));
+}
+
+// The response of a leaf is its own sojourn, nobody downstream is asked, and the delivered
+// fraction is the node's own (the same contract as SqlDbBehaviour above).
+TEST_CASE("a blob store's response is its own sojourn and asks nobody downstream", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(sized_blob_front());
+  const BlobStoreBehaviour store{g, *g.index_of("store")};
+  const LatencyEstimate own{0.040015, 2e-7};
+  bool asked = false;
+  const auto lookup = [&](std::size_t, std::string_view) {
+    asked = true;
+    return LatencyEstimate{99.0, 99.0};
+  };
+  REQUIRE(store.response("upload", own, lookup) == own);
+  REQUIRE_FALSE(asked);
+  REQUIRE_THAT(store.delivered("upload", 0.9, [](std::size_t, std::string_view) { return 0.1; }),
+               WithinRel(0.9, 1e-12));
+}
+
+TEST_CASE("a byte-sized cdn charges a request its size in megabytes", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(stream_cdn_front(simsys::ByteRate{100e9}));
+  const CdnBehaviour cdn{g, *g.index_of("cdn")};
+  REQUIRE_THAT(cdn.cost("stream"), WithinRel(50.0, 1e-12));  // 50e6 B / 1e6 B per unit
+}
+
+TEST_CASE("a cdn that counts requests charges one unit per request whatever the size",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(stream_cdn_front(std::nullopt));
+  const CdnBehaviour cdn{g, *g.index_of("cdn")};
+  REQUIRE(cdn.cost("stream") == 1.0);
+}
+
+// Charging megabytes changes what an op costs, not what it forwards: the origin is asked for the
+// miss share (5 %) of the REQUESTS, not of the megabytes.
+TEST_CASE("a byte-sized cdn still forwards its miss share of the requests", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(stream_cdn_front(simsys::ByteRate{100e9}));
+  CdnBehaviour cdn{g, *g.index_of("cdn")};
+  const auto routed = cdn.route(flow_of("stream", 100), 0s, 100ms);
+  REQUIRE(routed.outgoing.size() == 1);
+  REQUIRE_THAT(routed.outgoing[0].flow.rate_of("stream").per_second, WithinRel(5.0, 1e-12));
 }
