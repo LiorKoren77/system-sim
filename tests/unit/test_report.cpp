@@ -1370,11 +1370,10 @@ TEST_CASE("explain says what a snowflake generator stands for", "[report]") {
   CAPTURE(text);
   const auto line = node_line(text, "ids");
   REQUIRE(line.contains("algorithm=snowflake (4.096M/s per replica by design)"));
-  REQUIRE(line.contains("capacity=4.096M/s"));
-  REQUIRE(line.contains("service_time=10us"));
-  // The algorithm supplied these numbers, the scenario did not.
-  REQUIRE_FALSE(line.contains("capacity=4.096M/s (scenario)"));
-  REQUIRE_FALSE(line.contains("service_time=10us (scenario)"));
+  // The algorithm supplied these numbers, the scenario did not, and the tag says so: not
+  // "(default)", which elsewhere means the node TYPE's number (review of 3adc555, M5).
+  REQUIRE(line.contains("capacity=4.096M/s (algorithm)"));
+  REQUIRE(line.contains("service_time=10us (algorithm)"));
 }
 
 TEST_CASE("explain says a ticket server is one database doing 1k writes a second", "[report]") {
@@ -1382,8 +1381,8 @@ TEST_CASE("explain says a ticket server is one database doing 1k writes a second
   CAPTURE(text);
   const auto line = node_line(text, "ids");
   REQUIRE(line.contains("algorithm=ticket_server (one database: 1k/s, spec §6 writes)"));
-  REQUIRE(line.contains("capacity=1k/s"));
-  REQUIRE(line.contains("service_time=1ms"));
+  REQUIRE(line.contains("capacity=1k/s (algorithm)"));
+  REQUIRE(line.contains("service_time=1ms (algorithm)"));
 }
 
 TEST_CASE("explain says a uuid generator is unbounded in practice", "[report]") {
@@ -1401,11 +1400,12 @@ TEST_CASE("explain tags a capacity the scenario stated on an id generator as sce
       explain_of(id_reported(simsys::model::IdAlgorithm::ticket_server, 1, Rate{8000}));
   CAPTURE(text);
   const auto line = node_line(text, "ids");
-  REQUIRE(line.contains("algorithm=ticket_server"));
   REQUIRE(line.contains("capacity=8k/s (scenario)"));
-  // The service time was not stated: the algorithm's 1 ms stands, untagged as the scenario's.
-  REQUIRE(line.contains("service_time=1ms"));
-  REQUIRE_FALSE(line.contains("service_time=1ms (scenario)"));
+  // Beside a stated capacity the algorithm's own rate is the default it overrides, and the
+  // wording says so rather than reading as a second capacity (review of 3adc555, M5).
+  REQUIRE(line.contains("algorithm=ticket_server (one database; default 1k/s, spec §6 writes)"));
+  // The service time was not stated: the algorithm's 1 ms stands, tagged as the algorithm's.
+  REQUIRE(line.contains("service_time=1ms (algorithm)"));
 }
 
 // The paper load is checked against the node's total: 3 snowflake machines x 4.096M/s =

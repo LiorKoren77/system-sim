@@ -96,10 +96,7 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
     //  - url-shortener passes its SLOs, but 24 h at 1 s is 86.4k steps: 0.4 s in Release, 6.1 to
     //    6.6 s in a Debug build (measured 2026-10-28), over the five seconds below. Its own test
     //    runs it end to end with no time limit and pins its SLO results.
-    if (s.name == "lab-unique-id" || s.name == "url-shortener") {
-      ++ran;
-      continue;
-    }
+    if (s.name == "lab-unique-id" || s.name == "url-shortener") continue;  // not run here
     ++ran;
     auto& sim = *created;
     simsys::report::Summary summary{g, s.warmup};
@@ -116,7 +113,7 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
       REQUIRE(r.status != simsys::report::SloStatus::fail);
     }
   }
-  CHECK(ran > 0);  // the tutorials at least always run
+  CHECK(ran > 0);  // the tutorials at least always run here (the two above are not counted)
 }
 
 // Phase 2a's goal: the rate-limiter lab, which uses a client with spikes, a rate limiter, a
@@ -396,6 +393,24 @@ TEST_CASE("labs/unique-id passes its SLOs once the link weights route to the sno
     REQUIRE(r.status == simsys::report::SloStatus::pass);
   }
   REQUIRE(slo_of(results, simsys::model::SloMetric::drop_rate).observed == 0.0);
+}
+
+// The lab's snowflake states neither a capacity nor a latency: the algorithm supplies them
+// (review of 3adc555, I3), 2^12 ids per millisecond = 4.096M/s and 10 us per machine, so four
+// machines give 4 x 4.096M = 16.384M/s, printed with four significant digits.
+TEST_CASE("labs/unique-id's snowflake takes its capacity and latency from the algorithm",
+          "[scenario]") {
+  const auto s = load_scenario("/labs/unique-id/scenario.yaml");
+  const auto snowflake = std::ranges::find(s.nodes, "snowflake", &simsys::model::NodeSpec::id);
+  REQUIRE(snowflake != s.nodes.end());
+  REQUIRE_FALSE(snowflake->capacity.has_value());
+  REQUIRE_FALSE(snowflake->latency.has_value());
+  const auto g = simsys::graph::Graph::build(s);
+  if (!g) FAIL(g.error().message);
+  const auto text = simsys::report::render_explain(*g);
+  CAPTURE(text);
+  REQUIRE(text.contains("capacity=4.096M/s (algorithm)  service_time=10us (algorithm)"));
+  REQUIRE(check_line_of(text, "snowflake").contains("16.38M/s total capacity"));
 }
 
 // The two book scenarios that use `algorithm: snowflake` still load, build and explain, and now
