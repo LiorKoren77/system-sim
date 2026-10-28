@@ -2,7 +2,8 @@
 // node capacities with provenance, link latencies and delay-line lengths, demand edges,
 // a topological order, routes of the nodes that split flow (clients, load balancers),
 // what each load balancer does to the replicas behind it, feedback edges for node cycles and
-// asynchronous hops for call cycles. Cycles are found at two levels, for two different questions:
+// asynchronous hops for call cycles and write-back flushes. Cycles are found at two levels, for two
+// different questions:
 //  - Node level (Graph::order_nodes): which LINK closes a loop of boxes? Its flow goes
 //    through a delay line of at least one step, so the forward pass can run in
 //    topological order (spec §3.1: cycles use the previous step's value).
@@ -37,7 +38,9 @@
 // `on: miss` step after it into a hop taken by the miss fraction 1 - h of the requests
 // (Graph::service_hops), and, for the strategies in which the cache itself talks to the store,
 // a demand edge to its `backend` (Graph::backend_fraction says which share of each op takes
-// it).
+// it; a write_back cache's flush over it is asynchronous by design, detail::write_back_flushes),
+// and its `then` steps, demand edges like a service's steps whose share of each op is
+// Graph::then_fraction (plan 2b refinement 5: what goes on to the next tier after the cache).
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -255,9 +258,9 @@ struct DemandEdge {
   bool operator==(const DemandEdge&) const = default;
 };
 
-// A hop that closes a cycle of calls: node `from`, handling `op`, sends `target_op` to
-// node `to`, and following the calls from there leads back to (from, op). The caller
-// does not wait for it (see Graph::is_async_hop).
+// A hop the caller does not wait for (see Graph::is_async_hop): node `from`, handling `op`,
+// sends `target_op` to node `to`, and either following the calls from there leads back to
+// (from, op) (a call cycle), or the hop is a write_back cache's flush to its store.
 struct AsyncHop {
   std::size_t from{};
   std::string op{};
@@ -320,8 +323,9 @@ class Graph {
   //     misses to the service's `on: miss` step; under the write strategies a read miss is
   //     the application's business too);
   //   writes: 1 under write_through and write_around (synchronous), and under write_back
-  //     (every write is flushed eventually: an upper bound, no coalescing; phase 2b runs it),
-  //     else 0 (cache_aside and read_through: the service writes the store itself).
+  //     (every write is flushed eventually: an upper bound, no coalescing; the flush is an
+  //     asynchronous hop, detail::write_back_flushes), else 0 (cache_aside and read_through:
+  //     the service writes the store itself).
   // 0 for any node that is not a cache with a backend edge. An unknown hit ratio counts as
   // h = 0 (every read misses), as in service_hops.
   [[nodiscard]] double backend_fraction(std::size_t node, std::string_view op) const;
@@ -332,7 +336,8 @@ class Graph {
   [[nodiscard]] double then_fraction(std::size_t node, const model::Step& step,
                                      std::string_view op) const;
   // Does node `from`, handling `op`, hand `target_op` off to node `to` without waiting?
-  // True exactly for the hops that close a call cycle (see detail::find_async_hops).
+  // True exactly for the hops that close a call cycle (see detail::find_async_hops) and for a
+  // write_back cache's flushes to its store (detail::write_back_flushes).
   [[nodiscard]] bool is_async_hop(std::size_t from, std::string_view op, std::size_t to,
                                   std::string_view target_op) const;
   // Every asynchronous hop, sorted by (from, op, to, target_op).
@@ -527,7 +532,9 @@ namespace {
 // hit ratio is a probability, a strategy in which the cache calls the store needs to know
 // which node that is, and one in which it does not (cache_aside) must not name one: it would
 // never be called (config's read_hit_ratio and read_cache_strategy). A cache with no
-// hit ratio at all builds (explain can show it); the engine refuses to run it.
+// hit ratio at all builds (explain can show it); the engine refuses to run it. A read_through
+// cache fetches its misses from its backend itself, so a `then` step on miss would fetch each
+// miss a second time (plan 2b refinement 5): the two together are refused.
 [[nodiscard]] std::optional<EngineError> invalid_cache(const model::NodeSpec& spec) {
   const std::string name = "node '" + spec.id + "': ";
   if (spec.hit_ratio && spec.hit_ratio->fixed) {
@@ -542,6 +549,11 @@ namespace {
   if (!model::needs_backend(spec.strategy) && spec.backend) {
     return EngineError{name + "backend is unused with strategy " +
                        std::string{model::to_string(spec.strategy)}};
+  }
+  const bool then_on_miss = std::ranges::any_of(
+      spec.then, [](const model::Step& step) { return step.on == model::StepCondition::miss; });
+  if (spec.strategy == model::CacheStrategy::read_through && then_on_miss) {
+    return EngineError{name + "a then step on miss and a read_through backend both fetch the miss"};
   }
   return std::nullopt;
 }
@@ -628,7 +640,8 @@ struct Call {
 // a positive share (a drained route, weight 0, carries no request, so it makes no call and
 // can close no call cycle); a limiter with a backend also calls (backend, counter) first.
 // A cache that passes a share of an op on to its backend calls (backend, op) (write_back's
-// later flush excepted: nobody waits for it). A node with `ops` steps calls what its
+// later flush excepted: nobody waits for it, see write_back_flushes), and (target, step.op)
+// along each `then` step that carries a share of the op. A node with `ops` steps calls what its
 // resolved hops (Graph::service_hops) say with a positive fraction: an `on: miss` step is a
 // call for the requests that miss, one that never fires (fraction 0) is none.
 // Pattern: Adapter — the forwarders' routes, the caches' backend shares and the resolved
@@ -659,12 +672,26 @@ void add_backend_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls)
   }
 }
 
+// A cache's `then` steps (plan 2b refinement 5) fire per request the cache handles: every one
+// for an `on: always` step, the read misses for an `on: miss` one (Graph::then_fraction).
+void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
+  for (const auto& op : g.arriving_ops(cache)) {
+    for (const model::Step& step : g.nodes()[cache].spec.then) {
+      if (g.then_fraction(cache, step, op) <= 0.0) continue;  // never fires: no call
+      calls[Call{cache, op}].push_back(model::Step{.to = step.to, .op = step.op});
+    }
+  }
+}
+
 [[nodiscard]] ForwardedSteps forwarder_steps(const Graph& g) {
   ForwardedSteps forwarded;
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
     const auto& resolved = g.nodes()[node];
     add_hop_steps(g, node, forwarded);
-    if (is_cache(resolved.spec)) add_backend_steps(g, node, forwarded);
+    if (is_cache(resolved.spec)) {
+      add_backend_steps(g, node, forwarded);
+      add_then_steps(g, node, forwarded);
+    }
     if (!forwards_by_link(resolved.spec.type)) continue;
     for (const auto& op : g.arriving_ops(node)) {
       auto& steps = forwarded[Call{node, op}];
@@ -707,16 +734,16 @@ void add_backend_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls)
 
 // The hops that close a call cycle: the back edges of a depth-first search over (node, op)
 // vertices, with an edge (node, op) -> (step.to, step.op) for every hop that fires (an
-// unconditional step, or an `on: miss` step after a cache that misses; `then` steps belong
-// to node types the engine does not run yet), an edge (lb, op) -> (target, op) for every
-// route of a load balancer that carries the op, and (cache, op) -> (backend, op) for what a
-// cache passes on (forwarder_steps). Same white/grey/black classification
-// as Graph::order_nodes, one level finer: there the vertices are boxes, here they are
-// the calls a request makes. A back edge is a call that, followed far enough, calls
-// itself: chat.msg -> queue.publish -> sync.job -> chat.msg. A request cannot wait for
-// its own descendant, so that hop is a fire-and-forget hand-off (the latency model
-// skips it). A node loop that ends in a terminal op (sync.job -> chat.push) has no back
-// edge here, so every one of its hops is waited for.
+// unconditional step, or an `on: miss` step after a cache that misses; of the `then` steps
+// only a cache's, the other node types that have them do not run yet), an edge (lb, op) ->
+// (target, op) for every route of a load balancer that carries the op, and (cache, op) ->
+// (backend, op) for what a cache passes on synchronously (forwarder_steps). Same white/grey/black
+// classification as Graph::order_nodes, one level finer: there the vertices are boxes, here they
+// are the calls a request makes. A back edge is a call that, followed far enough, calls itself:
+// chat.msg -> queue.publish -> sync.job -> chat.msg. A request cannot wait for its own descendant,
+// so that hop is a fire-and-forget hand-off (the latency model skips it). A node loop that ends in
+// a terminal op (sync.job -> chat.push) has no back edge here, so every one of its hops is waited
+// for.
 [[nodiscard]] std::vector<AsyncHop> find_async_hops(const Graph& g) {
   enum class Colour { grey, black };  // absent from the map = white (not yet visited)
   std::map<Call, Colour> colour;
@@ -755,6 +782,38 @@ void add_backend_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls)
   // Two identical steps of one op are one hop. C++20 ranges algorithms take the vector
   // itself instead of an iterator pair; std::ranges::unique returns the subrange of
   // leftovers to erase, the erase-unique idiom without begin/end bookkeeping.
+  std::ranges::sort(hops);
+  const auto duplicates = std::ranges::unique(hops);
+  hops.erase(duplicates.begin(), duplicates.end());
+  return hops;
+}
+
+// The flush hops of every write_back cache: (cache, write) -> (backend, write) for each write op
+// that reaches it (plan 2b refinement 5). Asynchronous BY DESIGN, not because they close a call
+// cycle: the cache acknowledges the write from its own memory and flushes it later, so nobody
+// waits for the flush. It still forwards every write (Graph::backend_fraction is 1), so the
+// store's load is unchanged; the latency model skips it like any asynchronous hop.
+[[nodiscard]] std::vector<AsyncHop> write_back_flushes(const Graph& g) {
+  std::vector<AsyncHop> flushes;
+  for (std::size_t cache = 0; cache < g.nodes().size(); ++cache) {
+    const auto& resolved = g.nodes()[cache];
+    if (!is_cache(resolved.spec) || !resolved.backend) continue;
+    if (resolved.spec.strategy != model::CacheStrategy::write_back) continue;
+    for (const auto& op : g.arriving_ops(cache)) {
+      if (g.backend_fraction(cache, op) <= 0.0) continue;  // a read: write_back sends none
+      flushes.push_back({cache, op, *resolved.backend, op});
+    }
+  }
+  return flushes;
+}
+
+// The call-cycle hops and the write-back flushes, sorted and without duplicates, as
+// Graph::is_async_hop's binary search needs them.
+[[nodiscard]] std::vector<AsyncHop> async_hops(const Graph& g) {
+  auto hops = find_async_hops(g);
+  // (C++23's std::vector::append_range would say this in one call; GCC 14's library lacks it.)
+  const auto flushes = write_back_flushes(g);
+  hops.insert(hops.end(), flushes.begin(), flushes.end());
   std::ranges::sort(hops);
   const auto duplicates = std::ranges::unique(hops);
   hops.erase(duplicates.begin(), duplicates.end());
@@ -946,7 +1005,7 @@ std::expected<Graph, EngineError> Graph::build(model::Scenario scenario) {
                          .and_then([&] { return graph.check_routed_ops(); });
   if (!built) return std::unexpected{built.error()};
   graph.order_nodes();
-  graph.async_hops_ = detail::find_async_hops(graph);
+  graph.async_hops_ = detail::async_hops(graph);
   if (auto checked = graph.check_cache_backend_calls(); !checked) {
     return std::unexpected{checked.error()};
   }
