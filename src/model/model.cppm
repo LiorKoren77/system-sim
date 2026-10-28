@@ -62,25 +62,19 @@ enum class NodeType : std::uint8_t {
   frontier
 };
 
-// One row of the catalogue: an enumerator and its YAML spelling, side by side, so a row
-// can never pair a name with the wrong enumerator.
-struct NodeTypeName {
-  NodeType type;
-  std::string_view name;
-};
-
 // Pattern: Table-driven method — one constant table drives both directions of the
-// enum <-> string mapping, so adding a node type is one enumerator plus one row here
-// (plus its defaults: -Wswitch in defaults::for_type is what catches a NEW enumerator,
-// since nothing here can count the enumerators; is_cataloged() then rejects an
-// enumerator that got a case but no row).
+// enum <-> string mapping (core::EnumName, core::name_in, core::parse_in), so adding a
+// node type is one enumerator plus one row here (plus its defaults: -Wswitch in
+// defaults::for_type is what catches a NEW enumerator, since nothing can count the
+// enumerators; the static_assert on the last row at the end of this file catches an
+// enumerator appended without a row).
 // C++20 std::to_array: builds a std::array from a braced list and deduces its size, so
-// the 18 is never written by hand. Replaces `std::array<NodeTypeName, 18>{...}`, whose
-// count must be kept in sync manually (CTAD alone cannot deduce from nested braces).
+// the 18 is never written by hand. Replaces `std::array<EnumName<NodeType>, 18>{...}`,
+// whose count must be kept in sync manually (CTAD alone cannot deduce from nested braces).
 // `inline` is not needed for linkage: a const variable in a module interface's purview
 // already has external linkage in C++20 ([basic.link]/3.2), unlike a header constant.
 // It is kept so the declaration reads like the C++17 header-style constants students know.
-inline constexpr auto node_type_table = std::to_array<NodeTypeName>({
+inline constexpr auto node_type_table = std::to_array<core::EnumName<NodeType>>({
     {NodeType::client, "client"},
     {NodeType::cdn, "cdn"},
     {NodeType::load_balancer, "load_balancer"},
@@ -101,20 +95,6 @@ inline constexpr auto node_type_table = std::to_array<NodeTypeName>({
     {NodeType::frontier, "frontier"},
 });
 
-// C++20 `consteval`: an immediate function, which may ONLY run at compile time (calling
-// it at run time is a compile error). Stronger than constexpr, which merely allows it;
-// right here because this is a build-time proof, used in static_assert below and in the
-// tests. Row i must hold the enumerator whose value is i, so indexing the table by
-// std::to_underlying(type) is correct.
-[[nodiscard]] consteval bool table_follows_enum_order() {
-  for (std::size_t i = 0; i < node_type_table.size(); ++i) {
-    // C++23 std::to_underlying: the enum's integer value without a static_cast that could
-    // silently accept the wrong type (it always yields exactly the underlying type).
-    if (std::to_underlying(node_type_table[i].type) != i) return false;
-  }
-  return true;
-}
-
 // The names alone, derived from the table at compile time (an immediately invoked
 // constexpr lambda), for callers that iterate the catalogue's spellings.
 inline constexpr auto node_type_names = [] {
@@ -124,6 +104,8 @@ inline constexpr auto node_type_names = [] {
 }();
 
 // False for a value cast from an integer that names no enumerator.
+// C++23 std::to_underlying: the enum's integer value without a static_cast that could
+// silently accept the wrong type (it always yields exactly the underlying type).
 [[nodiscard]] constexpr bool is_cataloged(NodeType t) {
   return std::to_underlying(t) < node_type_table.size();
 }
@@ -133,19 +115,35 @@ inline constexpr auto node_type_names = [] {
 // An uncataloged value is a programmer error (the loader only produces valid types).
 [[nodiscard]] constexpr std::string_view to_string(NodeType t) {
   if (!is_cataloged(t)) throw std::invalid_argument{"unknown NodeType"};
-  return node_type_table[std::to_underlying(t)].name;
+  return core::name_in(node_type_table, t);
 }
 
 // The inverse of to_string; std::nullopt for a name not in the catalogue.
 [[nodiscard]] constexpr std::optional<NodeType> parse_node_type(std::string_view name) {
-  for (const auto& row : node_type_table) {
-    if (row.name == name) return row.type;
-  }
-  return std::nullopt;
+  return core::parse_in(node_type_table, name);
 }
 
 enum class StepCondition { always, miss, failure };
 enum class StepMode { sequential, parallel };
+
+// Pattern: Table-driven method — the words of a step's `on:` and `mode:`, read by the
+// loader from these tables (core::parse_in) like every other enum the schema spells.
+inline constexpr auto step_condition_table = std::to_array<core::EnumName<StepCondition>>({
+    {StepCondition::always, "always"},
+    {StepCondition::miss, "miss"},
+    {StepCondition::failure, "failure"},
+});
+inline constexpr auto step_mode_table = std::to_array<core::EnumName<StepMode>>({
+    {StepMode::sequential, "sequential"},
+    {StepMode::parallel, "parallel"},
+});
+
+[[nodiscard]] constexpr std::optional<StepCondition> parse_step_condition(std::string_view name) {
+  return core::parse_in(step_condition_table, name);
+}
+[[nodiscard]] constexpr std::optional<StepMode> parse_step_mode(std::string_view name) {
+  return core::parse_in(step_mode_table, name);
+}
 
 // One thing a node does with an incoming op: forward (a multiple of) it to `to` as `op`.
 // Every struct below is an aggregate (public members, no constructors) with default
@@ -208,67 +206,21 @@ struct NodeSpec {
   std::optional<Workload> workload{};  // clients only
 };
 
-// One row of a name table: an enumerator and the word the scenario schema spells it
-// with, side by side (the same shape as NodeTypeName above, for the smaller enums).
-template <typename E>
-struct EnumName {
-  E value;
-  std::string_view name;
-};
-
-// Row i of `table` must hold the enumerator whose value is i, so a lookup by
-// std::to_underlying is correct. consteval: a build-time proof, used in static_asserts at
-// the end of this file (see table_follows_enum_order above).
-template <typename E, std::size_t N>
-[[nodiscard]] consteval bool follows_enum_order(const std::array<EnumName<E>, N>& table) {
-  for (std::size_t i = 0; i < N; ++i) {
-    // C++20 std::cmp_not_equal: compares integers of different signedness by value. An
-    // int enum's value against a std::size_t index with plain != would convert the int to
-    // unsigned first (-1 == SIZE_MAX) and warn under -Wsign-compare; this cannot.
-    if (std::cmp_not_equal(std::to_underlying(table[i].value), i)) return false;
-  }
-  return true;
-}
-
-// The word for `value`. An enumerator without a row (a value cast from an integer) is a
-// programmer error: the loader only produces cataloged values.
-template <typename E, std::size_t N>
-[[nodiscard]] constexpr std::string_view name_in(const std::array<EnumName<E>, N>& table, E value) {
-  const auto index = std::to_underlying(value);
-  // C++20 std::in_range<T>(x): "does x fit in T?", correct for any mix of signed and
-  // unsigned types (a negative int does not fit in std::size_t). Replaces a hand-written
-  // `x >= 0` test, which warns as always true for an unsigned underlying type.
-  if (!std::in_range<std::size_t>(index) || static_cast<std::size_t>(index) >= N) {
-    throw std::invalid_argument{"enumerator without a name"};
-  }
-  return table[static_cast<std::size_t>(index)].name;
-}
-
-// The inverse of name_in; std::nullopt for a word not in the table.
-template <typename E, std::size_t N>
-[[nodiscard]] constexpr std::optional<E> parse_in(const std::array<EnumName<E>, N>& table,
-                                                  std::string_view name) {
-  for (const auto& row : table) {
-    if (row.name == name) return row.value;
-  }
-  return std::nullopt;
-}
-
 enum class Direction { in, out, inout };
 
 // Pattern: Table-driven method — as node_type_table: one table, read in both directions by
 // to_string/parse_direction, shared by the loader (reads `dir:`) and the report (prints it).
-inline constexpr auto direction_table = std::to_array<EnumName<Direction>>({
+inline constexpr auto direction_table = std::to_array<core::EnumName<Direction>>({
     {Direction::in, "in"},
     {Direction::out, "out"},
     {Direction::inout, "inout"},
 });
 
 [[nodiscard]] constexpr std::string_view to_string(Direction d) {
-  return name_in(direction_table, d);
+  return core::name_in(direction_table, d);
 }
 [[nodiscard]] constexpr std::optional<Direction> parse_direction(std::string_view name) {
-  return parse_in(direction_table, name);
+  return core::parse_in(direction_table, name);
 }
 
 struct LinkSpec {
@@ -292,7 +244,7 @@ enum class SloMetric {
 
 // Pattern: Table-driven method — the SLO metric names, read by the loader (`metric:`) and
 // printed by the report from this one table.
-inline constexpr auto slo_metric_table = std::to_array<EnumName<SloMetric>>({
+inline constexpr auto slo_metric_table = std::to_array<core::EnumName<SloMetric>>({
     {SloMetric::p50_latency, "p50_latency"},
     {SloMetric::p95_latency, "p95_latency"},
     {SloMetric::p99_latency, "p99_latency"},
@@ -303,10 +255,10 @@ inline constexpr auto slo_metric_table = std::to_array<EnumName<SloMetric>>({
 });
 
 [[nodiscard]] constexpr std::string_view to_string(SloMetric m) {
-  return name_in(slo_metric_table, m);
+  return core::name_in(slo_metric_table, m);
 }
 [[nodiscard]] constexpr std::optional<SloMetric> parse_slo_metric(std::string_view name) {
-  return parse_in(slo_metric_table, name);
+  return core::parse_in(slo_metric_table, name);
 }
 
 struct SloSpec {
@@ -337,9 +289,18 @@ struct Scenario {
 
 }  // namespace simsys::model
 
-// Compile-time table check: a misordered row in node_type_table breaks the build here,
-// not a scenario at run time.
-static_assert(simsys::model::table_follows_enum_order());
-static_assert(simsys::model::parse_node_type("frontier") == simsys::model::NodeType::frontier);
-static_assert(simsys::model::follows_enum_order(simsys::model::direction_table));
-static_assert(simsys::model::follows_enum_order(simsys::model::slo_metric_table));
+// Compile-time table checks: a misordered or duplicated row, or an enumerator appended
+// without a row, breaks the build here, not a scenario at run time. core::round_trips
+// proves each table's contract; the last-row asserts stand in for "every enumerator has a
+// row", which nothing in the language can count.
+static_assert(simsys::core::round_trips(simsys::model::node_type_table));
+static_assert(simsys::core::round_trips(simsys::model::direction_table));
+static_assert(simsys::core::round_trips(simsys::model::slo_metric_table));
+static_assert(simsys::core::round_trips(simsys::model::step_condition_table));
+static_assert(simsys::core::round_trips(simsys::model::step_mode_table));
+static_assert(simsys::model::node_type_table.back().value == simsys::model::NodeType::frontier);
+static_assert(simsys::model::direction_table.back().value == simsys::model::Direction::inout);
+static_assert(simsys::model::slo_metric_table.back().value == simsys::model::SloMetric::staleness);
+static_assert(simsys::model::step_condition_table.back().value ==
+              simsys::model::StepCondition::failure);
+static_assert(simsys::model::step_mode_table.back().value == simsys::model::StepMode::parallel);

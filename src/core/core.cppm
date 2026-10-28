@@ -14,6 +14,7 @@ module;
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <limits>
@@ -348,3 +349,82 @@ export namespace simsys {
 }
 
 }  // namespace simsys
+
+// ---- Enum <-> word tables -------------------------------------------------------------
+//
+// Every enum the scenario schema spells as a word (node types, link directions, SLO
+// metrics, step conditions and modes, wave shapes) is one constant table of rows
+// {enumerator, word}, read in both directions by the two lookups below. The tables live
+// next to their enums (simsys.model, simsys.workload); the machinery lives here, once.
+// Pattern: Table-driven method — adding a word is one row of data, not another `if`.
+export namespace simsys::core {
+
+// One row of a name table: an enumerator and the word the scenario schema spells it with,
+// side by side, so a row can never pair a word with the wrong enumerator.
+template <typename E>
+struct EnumName {
+  E value;
+  std::string_view name;
+};
+
+// Row i of `table` must hold the enumerator whose value is i, so a lookup by
+// std::to_underlying is correct. consteval: a build-time proof, used in static_asserts.
+template <typename E, std::size_t N>
+[[nodiscard]] consteval bool follows_enum_order(const std::array<EnumName<E>, N>& table) {
+  for (std::size_t i = 0; i < N; ++i) {
+    // C++23 std::to_underlying: the enum's integer value without a static_cast that could
+    // silently accept the wrong type (it always yields exactly the underlying type).
+    // C++20 std::cmp_not_equal: compares integers of different signedness by value. An
+    // int enum's value against a std::size_t index with plain != would convert the int to
+    // unsigned first (-1 == SIZE_MAX) and warn under -Wsign-compare; this cannot.
+    if (std::cmp_not_equal(std::to_underlying(table[i].value), i)) return false;
+  }
+  return true;
+}
+
+// The word for `value`, by index (see follows_enum_order). An enumerator without a row (a
+// value cast from an integer) is a programmer error: the loader only produces cataloged
+// values.
+template <typename E, std::size_t N>
+[[nodiscard]] constexpr std::string_view name_in(const std::array<EnumName<E>, N>& table, E value) {
+  const auto index = std::to_underlying(value);
+  // C++20 std::in_range<T>(x): "does x fit in T?", correct for any mix of signed and
+  // unsigned types (a negative int does not fit in std::size_t). Replaces a hand-written
+  // `x >= 0` test, which warns as always true for an unsigned underlying type.
+  if (!std::in_range<std::size_t>(index) || static_cast<std::size_t>(index) >= N) {
+    throw std::invalid_argument{"enumerator without a name"};
+  }
+  return table[static_cast<std::size_t>(index)].name;
+}
+
+// The inverse of name_in; std::nullopt for a word not in the table.
+template <typename E, std::size_t N>
+[[nodiscard]] constexpr std::optional<E> parse_in(const std::array<EnumName<E>, N>& table,
+                                                  std::string_view name) {
+  for (const auto& row : table) {
+    if (row.name == name) return row.value;
+  }
+  return std::nullopt;
+}
+
+// The whole contract of a table, proven at compile time: every word is unique (else
+// parse_in would find only the first), and every enumerator survives the round trip
+// parse_in(name_in(v)) == v (which fails for a misordered table, since name_in indexes by
+// value). C++20 consteval: an immediate function, evaluated only during compilation, so
+// the proof costs nothing at run time and a broken table is a build error at its
+// static_assert, next to the table (model.cppm, workload.cppm).
+template <typename E, std::size_t N>
+[[nodiscard]] consteval bool round_trips(const std::array<EnumName<E>, N>& table) {
+  for (std::size_t i = 0; i < N; ++i) {
+    for (std::size_t j = i + 1; j < N; ++j) {
+      if (table[i].name == table[j].name) return false;
+    }
+  }
+  if (!follows_enum_order(table)) return false;
+  for (const auto& row : table) {
+    if (parse_in(table, name_in(table, row.value)) != row.value) return false;
+  }
+  return true;
+}
+
+}  // namespace simsys::core

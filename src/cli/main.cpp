@@ -317,14 +317,26 @@ struct CurveGrid {
   simsys::SimTime until;
 };
 
+// With --noise, the noise advances at the scenario's step, as in a run, and every k-th
+// value is printed; so --step must be a whole number of scenario steps.
+std::expected<simsys::SimTime, std::string> check_noise_step(
+    const std::filesystem::path& file, const simsys::model::Scenario& scenario,
+    const CurveArgs& args, simsys::SimTime step) {
+  if (!args.noise || step.count() % scenario.step.count() == 0) return step;
+  return std::unexpected(std::format("{}: error: --step must be a multiple of the scenario step {}",
+                                     file.string(), describe_duration(scenario.step)));
+}
+
 std::expected<CurveGrid, std::string> curve_grid(const std::filesystem::path& file,
                                                  const simsys::model::Scenario& scenario,
                                                  const CurveArgs& args) {
-  const auto step = curve_duration(file, "--step", args.step);
+  auto step = curve_duration(file, "--step", args.step);
   if (!step) return std::unexpected(step.error());
   if (step->count() <= 0) {
     return std::unexpected(std::format("{}: error: --step must be positive", file.string()));
   }
+  step = check_noise_step(file, scenario, args, *step);
+  if (!step) return std::unexpected(step.error());
   if (!args.until) return CurveGrid{.step = *step, .until = scenario.duration};
   return curve_duration(file, "--until", *args.until).transform([&](simsys::SimTime until) {
     return CurveGrid{.step = *step, .until = until};
@@ -332,8 +344,11 @@ std::expected<CurveGrid, std::string> curve_grid(const std::filesystem::path& fi
 }
 
 // The client's curve as a lazy stream of samples: the deterministic curve, or with
-// `--noise` the curve times the client's noise process, seeded exactly as the engine seeds
-// it (behaviours::client_seed), so the printed noise is the noise a run will see.
+// `--noise` the curve times the client's noise process, so the printed noise is the noise
+// a run will see: seeded exactly as the engine seeds it (behaviours::client_seed), advanced
+// every scenario step (the engine's dt) whatever --step prints, and ticked before each
+// value is read, as the engine ticks a client before it offers. The t = 0 row therefore
+// already includes one noise step, like the first step of a run.
 // C++23 std::generator<T> (from <generator>): a coroutine-backed, lazy, single-pass range.
 // simsys.workload produces samples one co_yield at a time; this file only iterates the
 // range, so a day at 1 s steps (86 400 rows) is printed without ever being stored. The
@@ -349,7 +364,8 @@ std::expected<std::generator<simsys::workload::Sample>, std::string> curve_sampl
   }
   const auto seed =
       simsys::behaviours::client_seed(args.seed.value_or(scenario.seed), client.index);
-  return simsys::workload::samples(workload.curve, grid.step, grid.until, *workload.noise, seed);
+  return simsys::workload::samples(workload.curve, grid.step, grid.until, *workload.noise, seed,
+                                   scenario.step);
 }
 
 // One CSV row per sample, numbers in their shortest round-trip form (simsys.report: this
@@ -428,7 +444,9 @@ int main(int argc, char** argv) {
   curve->add_option("--until", curve_args.until,
                     "end of the curve, exclusive (default: scenario's duration)");
   curve->add_option("--seed", curve_args.seed, "noise seed (default: scenario's seed)");
-  curve->add_flag("--noise", curve_args.noise, "multiply in the client's seeded noise");
+  curve->add_flag("--noise", curve_args.noise,
+                  "multiply in the client's seeded noise, advanced every scenario step as in a run "
+                  "(--step must then be a multiple of it)");
   add_report_options(*estimate, report_options);
   add_report_options(*run, report_options);
   run->add_option("--duration", run_args.duration,

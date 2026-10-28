@@ -12,11 +12,17 @@
 //
 // Composition (spec §8, phase 2a refinement 2):
 //
-//     rate(t) = level(t) x wave(t) x ramp(t) x PRODUCT over active spikes of factor
-//     level(t) = points ? interpolate(points, t) : base
+//     rate(t)  = level(t) x wave(t) x PRODUCT over active spikes of factor
+//     level(t) = ramp ? from + (to - from) x fraction(t)      (the ramp's own rate)
+//              : points ? interpolate(points, t)
+//              : base
 //
-// Every term is a dimensionless multiplier around 1, so terms combine freely and each
-// can be read (and printed by `simsys curve`) on its own. Times are offsets from t = 0,
+// The spec writes the ramp as a multiplier ramp(t)/base of the base; base x ramp(t)/base
+// IS the ramp's rate, so the ramp is applied as the level itself. Same numbers, without
+// the division: 1e15/s over a base of 1e-300/s would overflow to infinity, and infinity
+// x a wave trough of 0 is NaN. The wave and the spikes are dimensionless multipliers
+// around 1, so they combine freely and each can be read (and printed by `simsys curve`)
+// on its own. Times are offsets from t = 0,
 // which is midnight (phase 2a refinement 1), so `peak_at: 20:00` is 20 h after start.
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
@@ -36,6 +42,7 @@ module;
 #include <optional>
 #include <random>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -48,6 +55,22 @@ export namespace simsys::workload {
 // The three wave shapes. `sine` is the smooth textbook cycle, `square` an on/off
 // schedule (office hours, a batch window), `diurnal` a chosen consumer-web day.
 enum class WaveShape { sine, square, diurnal };
+
+// Pattern: Table-driven method — the words of `rate.wave.shape`, read by the loader and
+// printed by `explain` from this one table (core::EnumName; proven at the end of the file).
+// C++20 std::to_array: deduces the array's size from the braced list.
+inline constexpr auto wave_shape_table = std::to_array<core::EnumName<WaveShape>>({
+    {WaveShape::sine, "sine"},
+    {WaveShape::square, "square"},
+    {WaveShape::diurnal, "diurnal"},
+});
+
+[[nodiscard]] constexpr std::string_view to_string(WaveShape shape) {
+  return core::name_in(wave_shape_table, shape);
+}
+[[nodiscard]] constexpr std::optional<WaveShape> parse_wave_shape(std::string_view name) {
+  return core::parse_in(wave_shape_table, name);
+}
 
 // A periodic multiplier. `amplitude` is the relative swing: 0.5 means the peak is 1.5 x
 // and the trough 0.5 x the level. It must lie in [0, 1], so no multiplier, and therefore
@@ -65,7 +88,11 @@ struct Wave {
 };
 
 // A linear change of the rate from `from` to `to` over the first `over` of the run,
-// then `to` forever: a launch, a gradual traffic migration, a load-test ramp-up.
+// then `to` forever: a launch, a gradual traffic migration, a load-test ramp-up. The
+// ramp's rate replaces `base` as the level (see the composition above); the config loader
+// still asks for a positive `base` next to a ramp, a rule kept on purpose so a scenario
+// always states the client's nominal rate explicitly (explain prints it, and removing the
+// ramp leaves a complete curve).
 struct Ramp {
   Rate from{};
   Rate to{};
@@ -83,12 +110,13 @@ struct Spike {
 // A recorded or hand-drawn rate trace: (time, rate) pairs, non-empty and with
 // non-decreasing times (the config loader rejects an empty or unsorted trace). Two points
 // at the same time make a step: the later one takes effect from that instant. Replaces
-// `base`; the wave and spikes still multiply it (a ramp cannot: see RateCurve::rate_at).
+// `base`; the wave and spikes still multiply it (a ramp cannot: it is a level too).
 struct Points {
   std::vector<std::pair<SimTime, Rate>> at{};
 };
 
-// Spec §8: base x wave x ramp x spikes (x noise, applied by the client); points replace base.
+// Spec §8: level x wave x spikes (x noise, applied by the client), where the level is the
+// ramp's rate, else the points, else base.
 struct RateCurve {
   Rate base{};
   std::optional<Points> points{};
@@ -96,11 +124,14 @@ struct RateCurve {
   std::optional<Ramp> ramp{};
   std::vector<Spike> spikes{};
 
-  // The deterministic rate at time `t`: everything except noise.
+  // The deterministic rate at time `t`: everything except noise. Finite for every curve
+  // the config loader accepts: each level is at most 1e15/s, the wave at most 2 and the
+  // product of the spikes active at any moment at most 1e6 (loader bounds), so the rate
+  // stays below 2e21/s.
   // Throws std::invalid_argument for a wave with a non-positive period or an amplitude
-  // outside [0, 1], for empty points, and for a ramp with base 0 or with points (it has
-  // nothing to be relative to). All are programmer errors: the config loader rejects
-  // such a scenario with a message naming the offending key.
+  // outside [0, 1], for empty points, and for a ramp next to points (two levels). All are
+  // programmer errors: the config loader rejects such a scenario with a message naming
+  // the offending key.
   [[nodiscard]] Rate rate_at(SimTime t) const;
 };
 
@@ -168,15 +199,26 @@ struct Sample {
 // a caller's temporary would dangle by the time the body first runs. A by-value parameter
 // is moved or copied into the frame and lives as long as the generator does.
 //
-// Samples are taken at t = 0, step, 2 step, ... while t < until (end exclusive). Throws
-// std::invalid_argument if `step` is not positive.
+// Samples are taken at t = 0, step, 2 step, ... while t < until (end exclusive). The
+// stream stops early, cleanly, where the next step would overflow the int64 clock (only
+// reachable with a step or an end of hundreds of years). Throws std::invalid_argument if
+// `step` is not positive.
 [[nodiscard]] std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until);
 
-// The same stream with workload noise (spec §9.2): the generator owns a NoiseProcess seeded
-// with `seed` and multiplies rate_at(t) by noise.next(step) for each sample, so the noise
-// advances exactly once per sample and the same arguments give the same stream, bit for bit.
-// Throws std::invalid_argument for a non-positive `step`, or the NoiseProcess's own errors
-// (negative sigma, non-positive correlation), on the first begin().
+// The same stream with workload noise (spec §9.2), exactly as the engine offers it: the
+// generator owns a NoiseProcess seeded with `seed` and advances it every `noise_step`
+// (the scenario's step, the engine's dt); at each tick it first advances the noise and then
+// reads the rate, as the engine ticks a client before it offers. So the t = 0 sample
+// already includes one noise step. Every (step / noise_step)-th tick is yielded, so a
+// coarse print grid shows the noise a run sees rather than a process stepped coarsely
+// (whose path would differ). The same arguments give the same stream, bit for bit.
+// Throws std::invalid_argument, on the first begin(), for a non-positive `step` or
+// `noise_step`, a `step` that is not a multiple of `noise_step`, or the NoiseProcess's own
+// errors (negative sigma, non-positive correlation).
+[[nodiscard]] std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until,
+                                             Noise noise, std::uint64_t seed, SimTime noise_step);
+
+// The noisy stream with the noise advanced at the sample step itself (noise_step = step).
 [[nodiscard]] std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until,
                                              Noise noise, std::uint64_t seed);
 
@@ -291,15 +333,13 @@ inline constexpr auto diurnal_peak_hour =
   return seconds(t) / seconds(over);  // 0 <= t < over here, so over > 0
 }
 
-// Ramp: (from + (to - from) x fraction(t)) / base — the ramp's rate as a multiplier of
-// `base`, so the spec's "ramp from 0 to 2000/s" with base 1000/s doubles the base at the
-// end. A ramp needs a base to be relative to, so base 0 throws std::invalid_argument (a
-// programmer error: the config loader rejects a ramp without rate.base).
-[[nodiscard]] double ramp_multiplier(const Ramp& r, Rate base, SimTime t) {
-  if (base.per_second == 0.0) throw std::invalid_argument{"a ramp needs a nonzero base rate"};
+// Ramp: from + (to - from) x fraction(t), linear interpolation between the two rates.
+// The level itself, not a multiplier of `base` (see the composition at the top): no
+// division, so no overflow for a tiny base. Between two finite rates of at most 1e15/s it
+// stays finite and between them.
+[[nodiscard]] double ramp_level(const Ramp& r, SimTime t) {
   const double fraction = ramp_fraction(t, r.over);
-  const double level = r.from.per_second + (r.to.per_second - r.from.per_second) * fraction;
-  return level / base.per_second;
+  return r.from.per_second + (r.to.per_second - r.from.per_second) * fraction;
 }
 
 // Is `s` active at `t`, i.e. at <= t < at + duration? End exclusive, so back-to-back
@@ -346,6 +386,22 @@ inline constexpr auto diurnal_peak_hour =
   const double fraction =
       static_cast<double>(t.count() - t0.count()) / static_cast<double>(t1.count() - t0.count());
   return r0.per_second + (r1.per_second - r0.per_second) * fraction;
+}
+
+// The level the multipliers act on: the ramp's rate, else the points, else base.
+[[nodiscard]] double level_at(const RateCurve& curve, SimTime t) {
+  if (curve.ramp) return ramp_level(*curve.ramp, t);
+  if (curve.points) return interpolate(*curve.points, t);
+  return curve.base.per_second;
+}
+
+// Advances `t` by `step` unless that would pass `until` (or overflow int64), and says
+// whether it did. Precondition 0 <= t < until, so until - t is positive and cannot
+// overflow, while t + step could: comparing step with the room left avoids the sum.
+[[nodiscard]] bool advance_within(std::int64_t& t, std::int64_t step, std::int64_t until) {
+  if (step > until - t) return false;
+  t += step;
+  return true;
 }
 
 }  // namespace simsys::workload::detail
@@ -407,33 +463,57 @@ double NoiseProcess::next(SimTime dt) {
 }
 
 Rate RateCurve::rate_at(SimTime t) const {
-  // A ramp is a multiplier relative to `base`; points replace the base, so the
-  // combination has no meaning (the config loader says "rate.ramp needs rate.base").
+  // A ramp and points are both levels; the combination has no meaning (the config loader
+  // says "rate.ramp needs rate.base").
   if (ramp && points) throw std::invalid_argument{"a ramp needs a base rate, not points"};
-  const double level = points ? detail::interpolate(*points, t) : base.per_second;
   const double wave_term = wave ? wave_multiplier(*wave, t) : 1.0;
-  const double ramp_term = ramp ? detail::ramp_multiplier(*ramp, base, t) : 1.0;
-  return Rate{level * wave_term * ramp_term * detail::spikes_multiplier(spikes, t)};
+  return Rate{detail::level_at(*this, t) * wave_term * detail::spikes_multiplier(spikes, t)};
 }
 
 std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until) {
   if (step.count() <= 0) throw std::invalid_argument{"sample step must be positive"};
   // Loop on integer nanoseconds (exact; no floating-point drift accumulates in t).
-  for (std::int64_t t = 0; t < until.count(); t += step.count()) {
+  for (std::int64_t t = 0; t < until.count();) {
     const SimTime at{t};
     co_yield Sample{.t = at, .rate = curve.rate_at(at)};
+    if (!detail::advance_within(t, step.count(), until.count())) break;
   }
 }
 
 std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until, Noise noise,
-                               std::uint64_t seed) {
+                               std::uint64_t seed, SimTime noise_step) {
   if (step.count() <= 0) throw std::invalid_argument{"sample step must be positive"};
+  if (noise_step.count() <= 0) throw std::invalid_argument{"noise step must be positive"};
+  if (step.count() % noise_step.count() != 0) {
+    throw std::invalid_argument{"sample step must be a multiple of the noise step"};
+  }
+  const std::int64_t ticks_per_sample = step.count() / noise_step.count();
   // The process lives in the coroutine frame, so its state survives every suspension.
   NoiseProcess process{noise, seed};
-  for (std::int64_t t = 0; t < until.count(); t += step.count()) {
-    const SimTime at{t};
-    co_yield Sample{.t = at, .rate = Rate{curve.rate_at(at).per_second * process.next(step)}};
+  std::int64_t tick = 0;
+  for (std::int64_t t = 0; t < until.count(); ++tick) {
+    // Tick, then read the rate: the engine's order (a client ticks its noise by dt, then
+    // offers), so the multiplier at t already includes the step that ends at t.
+    const double multiplier = process.next(noise_step);
+    if (tick % ticks_per_sample == 0) {
+      const SimTime at{t};
+      co_yield Sample{.t = at, .rate = Rate{curve.rate_at(at).per_second * multiplier}};
+    }
+    if (!detail::advance_within(t, noise_step.count(), until.count())) break;
   }
 }
 
+// Not a coroutine itself (no co_yield here): it returns the generator the overload above
+// creates, which is where the checks run, on the first begin().
+std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until, Noise noise,
+                               std::uint64_t seed) {
+  return samples(std::move(curve), step, until, noise, seed, step);
+}
+
 }  // namespace simsys::workload
+
+// Compile-time proof of the wave-shape table (core::round_trips) and of its completeness:
+// its last row is the last enumerator, so a shape appended without a row breaks the build.
+static_assert(simsys::core::round_trips(simsys::workload::wave_shape_table));
+static_assert(simsys::workload::wave_shape_table.back().value ==
+              simsys::workload::WaveShape::diurnal);
