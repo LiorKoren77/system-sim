@@ -10,7 +10,10 @@ reproducible. Built to practise the systems in
 *System Design Interview* (Alex Xu, vol. 1) and, at the same time, to study and teach
 C++20/23: modules, concepts, ranges, coroutines, `std::expected` and friends.
 
-Status: design phase. See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
+Status: phase 0 complete — the project builds with GCC 14 named modules, `simsys validate`
+checks scenario files, and drafts of all 8 book systems and 4 labs live under
+[`scenarios/`](scenarios/). The engine arrives in phase 1.
+See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
 
 ## Planned CLI
@@ -25,7 +28,15 @@ simsys sweep    scenario.yaml --param nodes.users.rate.base=1k/s..100k/s:10 --me
 
 ## Toolchain
 
-GCC 14 (primary) or Clang 18, CMake ≥ 3.28, Ninja. C++23 with named modules.
+GCC 14 is required (it builds the named modules); Clang 18 is used for clang-format only.
+CMake ≥ 3.28, Ninja. C++23 with named modules.
+
+## Build
+
+```bash
+cmake --preset gcc14-debug && cmake --build --preset gcc14-debug && ctest --preset gcc14-debug
+./build/gcc14-debug/simsys validate scenarios/book/news-feed/scenario.yaml
+```
 
 ## Licence
 
