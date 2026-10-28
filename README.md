@@ -10,9 +10,16 @@ reproducible. Built to practise the systems in
 *System Design Interview* (Alex Xu, vol. 1) and, at the same time, to study and teach
 C++20/23: modules, concepts, ranges, coroutines, `std::expected` and friends.
 
-Status: phase 1 — the fluid engine runs clients and services; `simsys validate`,
-`explain`, `estimate` and `run` work, and drafts of all 8 book systems and 4 labs live
-under [`scenarios/`](scenarios/).
+Status: phase 2a. Clients follow rate curves (daily waves, ramps, scripted spikes,
+replayed points) with seeded Ornstein–Uhlenbeck noise; nodes charge a per-op `cost`; and
+load balancers (four policies), rate limiters (the five algorithms of ch. 4, with a counter
+store) and caches (a fixed hit ratio, four synchronous strategies) run next to clients and
+services. Refused requests are counted apart from dropped ones (`reject_rate`). The
+[rate-limiter lab](scenarios/labs/rate-limiter/) runs end to end; drafts of all 8 book
+systems and the other 3 labs live under [`scenarios/`](scenarios/) and validate and
+`explain`, waiting for phases 2b (Che cache model, SQL, CDN), 2c (blob store, queues,
+workers, external sinks, `sweep`) and 3. The scenario language is
+[`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.2).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
 
@@ -30,7 +37,7 @@ simsys curve    scenario.yaml <client> [--step 1m] [--until 1h] [--seed N] [--no
 `estimate` evaluates the long-run (steady) state once, at t = 0 (midnight): the rate curve's
 value there, without noise (its first line says so); `explain`'s static load checks use the
 curve's peak instead. `run` steps through the scenario and,
-with `--series`, writes one CSV row per node per step (`t_s,node,rho,backlog,drops_per_s,latency_ms,zone`),
+with `--series`, writes one CSV row per node per step (`t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`),
 the file a plot or GUI reads. Exit codes: 0 every SLO passed, 2 an SLO failed, 1 an error.
 Colour is on when stdout is a terminal; `--no-color` turns it off and JSON never has it.
 `run --seed N` replaces the scenario's `seed`, which seeds every client's `rate.noise`
@@ -84,10 +91,10 @@ noise), the number a back-of-the-envelope estimate sizes for. Here the rate is c
 $ simsys run scenarios/tutorial/chain/scenario.yaml
 scenario chain  1100 steps observed  drop rate 0%
 nodes
-  node   mean_rho  peak_rho  peak_backlog  dropped  red_s
-  users         -         -             -        -      -
-  api        0.75      0.75             0        0      0
-  db         0.36      0.36             0        0      0
+  node   mean_rho  peak_rho  peak_backlog  dropped  rejected  red_s
+  users         -         -             -        -         -      -
+  api        0.75      0.75             0        0         0      0
+  db         0.36      0.36             0        0         0      0
 ops (percentiles estimated: lognormal fit to the response moments)
   client.op    offered/s   mean     p50     p95     p99  (estimated)
   users.read        1.2k    5ms  4.35ms  10.4ms  14.8ms
@@ -99,12 +106,42 @@ slo
   PASS    drop_rate    -      -      0         0
 ```
 
-What runs today: clients (the whole rate curve, with its seeded noise) and services, with
-their queues, links, fan-out steps and feedback loops. Every other node type (load
-balancers, caches, databases, queues, CDNs, ...) already validates and appears in
-`explain` with its resolved numbers, but `estimate` and `run` stop with
-"which run/estimate do not support yet (phase 2)" and exit 1. A `sweep` command
-(`--param nodes.users.rate.base=1k/s..100k/s:10`) is planned.
+The second worked example is the [rate-limiter lab](scenarios/labs/rate-limiter/)
+(ch. 4): 800/s of `call` with three spikes (5x, 2x, 20x) through a 1k/s token bucket with
+`burst: 100`, whose counters live in a cache, in front of an api of 2 x 600/s. Each
+checked request reads its counter; what the bucket refuses is rejected (the book's 429),
+never forwarded, and reported apart from drops:
+
+```
+$ simsys run scenarios/labs/rate-limiter/scenario.yaml
+scenario lab-rate-limiter  17400 steps observed  drop rate 0%  reject rate 14.3% (worst: limiter)
+nodes
+  node      mean_rho  peak_rho  peak_backlog  dropped  rejected  red_s
+  clients          -         -             -        -         -      -
+  limiter    0.00954      0.16             0        0    236.7k      0
+  counters   0.00954      0.16             0        0         0      0
+  api         0.6817         1            80        0         0    1.5
+ops (percentiles estimated: lognormal fit to the response moments)
+  client.op     offered/s    mean  p50     p95     p99  (estimated)
+  clients.call        954  5.78ms  4ms  16.4ms  29.4ms
+slo
+  status  metric       node     op    observed  max
+  PASS    utilization  api      -     0.6817    0.9
+  PASS    p99_latency  clients  call  29.4ms    50ms
+```
+
+At the start of each spike the full bucket lets its 100 tokens through on top of the
+refill, the api's queue absorbs them (backlog 80, 1.5 s red in 29 minutes), and from then
+on exactly 1k/s passes. Latency counts only the requests that were answered. The lab's
+README compares the five algorithms at `burst: 500`, where the same surge overflows the
+api's queue and the p99 SLO fails.
+
+What runs today: clients, services, load balancers, rate limiters and caches with a fixed
+hit ratio. Every other node type (databases, queues, CDNs, ...) already validates and
+appears in `explain` with its resolved numbers, but `estimate` and `run` stop with
+"which run/estimate do not support yet (phase 2)" and exit 1; so does a cache with
+`hit_ratio: che`, `strategy: write_back` or `then` steps (phase 2b). A `sweep` command
+(`--param nodes.users.rate.base=1k/s..100k/s:10`) is planned for phase 2c.
 
 ## Toolchain
 

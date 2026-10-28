@@ -165,10 +165,10 @@ programmer should know" table.
 |---|---|---|
 | `client` | emits the workload curve per op; receives replies, fits percentiles; `timeout` turns the slow fraction into a retry feedback flow (phase 3) | all |
 | `cdn` | reads split by hit ratio (TTL + key skew model); misses go to origin; per-DC instance | 14, 15 |
-| `load_balancer` | splits inflow across replicas: equal (`round_robin`), by spare capacity (`least_connections`), by weights, `consistent_hash` with configurable imbalance | all |
-| `rate_limiter` | `token_bucket` (bucket level is fluid state, bursts pass until it empties), `leaky_bucket`, `fixed_window`, `sliding_window`; rejected flow counted as drops | 4, 8, 10 |
+| `load_balancer` | (revised, see §17) forwards every op over its links, split by link `weight`; the policy sets how the replicas *behind* it queue: `round_robin` / `weighted` independent copies, `least_connections` one pooled M/M/(c·N) queue, `consistent_hash` the hottest copy at `1 + 1/sqrt(vnodes)` × the average, queued apart from the cool ones | all |
+| `rate_limiter` | (revised, see §17) `token_bucket` (bucket level is fluid state, bursts pass until it empties), `leaky_bucket` (the node's own queue as one deterministic leak slot), `fixed_window`, `sliding_log`, `sliding_counter`, each stepped once per step; rejected flow is its own channel (`reject_rate`), never forwarded and not a drop; an optional counter `backend` sees every checked request | 4, 8, 10 |
 | `service` | per-op cost; downstream steps sequential (latencies add) or parallel (max); `replicas: N` | all |
-| `cache` | hit ratio from `fixed: h` or `che` (LRU under Zipf, from `keys` and skew); strategy `cache_aside` / `read_through` / `write_through` / `write_around` / `write_back` (buffered writes flushed at a rate) | 8, 11–14 |
+| `cache` | (revised, see §17) hit ratio from `fixed: h` (phase 2a) or `che` (LRU under Zipf, from `keys` and skew; phase 2b); `write_ops` name the writes, every other op is a read; strategy `cache_aside` (misses fetched by the service's `on: miss` step) / `read_through` / `write_through` / `write_around` (phase 2a) / `write_back` (buffered writes flushed at a rate; phase 2b) | 8, 11–14 |
 | `sql_db` | writes to primary, reads split over replicas, replication lag → staleness metric, connection pool as concurrency, sharding divides load | 8, 10–12, 15 |
 | `kv_cluster` | hash ring with virtual nodes → load imbalance factor; replication N amplifies writes; quorum W/R → latency is the W-th (R-th) order statistic of replica latencies; partition → unavailable fraction (CP) or stale fraction (AP) | 6, 11–13 |
 | `message_queue` | backlog level, consumer drain rate, lag = backlog / drain, partitions bound parallelism | 10–12, 14, 15 |
@@ -258,7 +258,7 @@ N identical nodes behind an implicit equal split.
 | Layer | What | Phase |
 |---|---|---|
 | 9.1 Analytic per node | Erlang C wait for Poisson arrivals; Kingman / Allen–Cunneen correction using `burstiness` (arrival SCV) and `service_variability` (service SCV); per-hop mean + variance → lognormal percentiles | 1 |
-| 9.2 Workload noise | Ornstein–Uhlenbeck multiplier on the rate curve (`sigma`, `correlation`); Poisson random spikes with random factor and duration; one `seed` | 2 |
+| 9.2 Workload noise | (revised, see §17) Ornstein–Uhlenbeck multiplier `1 + x`, floored at 0, on the rate curve (`sigma`, `correlation`), discretised exactly; one `std::mt19937_64` per client, seeded from the one `seed` and the client's index (phase 2a). Poisson random spikes with random factor and duration: deferred, scripted `spikes` stand in for them | 2a (spikes later) |
 | 9.3 Replications | any numeric parameter may be a distribution; `--replications N` runs seeds in parallel and reports median and 90 % bands; SLO result as "passes in k of N" | 3 |
 | 9.4 Random faults | `mtbf` / `mttr` per node, random latency spikes and partitions; chaos mode | 3 |
 
@@ -438,3 +438,86 @@ Further rules fixed while building phase 1:
   op whose every link has weight 0 is an error rather than a silent equal split.
 - **The schema is v1.1** (`docs/scenario-schema.md`): it lists every loader rule and,
   for each key, whether phase 1 reads it, only checks it, or ignores it.
+
+## 17. Phase 2a refinements (2026-10-28)
+
+Building phase 2a (plan `docs/superpowers/plans/2026-10-28-phase2a-workload-and-first-nodes.md`)
+fixed the following points. Where they conflict with an earlier section, this section
+wins; §7's `load_balancer`, `rate_limiter` and `cache` rows and §9.2 are updated in place.
+The rules a scenario author meets are in `docs/scenario-schema.md` (v1.2).
+
+1. **Simulated time starts at midnight.** `t = 0` is `00:00`; a clock time in `at:`,
+   `peak_at:` or a point is an offset from it, and a duration (`5m`) is accepted in the
+   same places. A top-level `start: HH:MM` could shift this later.
+2. **Rate curve composition.** `rate(t) = level(t) × wave(t) × Π active spike factors ×
+   noise(t)`, where the level is the ramp's rate if there is a ramp, else `points`
+   (linear, held flat outside the trace), else `base`. The plan wrote the ramp as a
+   multiplier `ramp(t)/base`; the code applies the ramp's rate as the level itself, the
+   same numbers without a division that overflows for a tiny base.
+3. **Noise** is an Ornstein–Uhlenbeck multiplier `1 + x`, floored at 0, stepped exactly:
+   `x_{k+1} = x_k·e^{−dt/τ} + σ·sqrt(1 − e^{−2dt/τ})·ξ` with `σ = noise.sigma` (the
+   stationary standard deviation) and `τ = noise.correlation`. Each client owns one
+   `std::mt19937_64` seeded with `(seed × 0x9E3779B97F4A7C15) XOR node index`, so runs
+   are byte-identical with the same standard library and clients are independent;
+   `simsys curve --noise` prints the same path.
+4. **Op cost.** A `service` or `cache` takes `cost: {op: units}` (default 1): demand is
+   `Σ rate_op × cost_op` against a capacity counted in units, and drops and backlog are in
+   units too; what the node forwards stays requests.
+5. **Load balancer policies.** The balancer splits by link weight whatever its policy; the
+   policy becomes the *replica model* of the node behind it: independent copies
+   (`round_robin`, `weighted`), one pooled M/M/(c·N) queue (`least_connections`, the
+   join-the-shortest-queue ideal), or a hot spot (`consistent_hash`: the hottest copy at
+   `1 + 1/sqrt(vnodes)` × the average, a chosen heuristic that understates the hottest of
+   many copies).
+6. **Rate limiter.** Every algorithm keeps the state ch. 4 describes and is stepped once
+   per step `[now, now + dt)` through `route(in, now, dt)`, with `W = limit × window`
+   (window 1 s by default); `burst` sizes the two buckets only and defaults to one
+   window's worth. Rejected flow is a channel of its own (`rejected_per_s`), never
+   forwarded and reported apart from drops; `estimate` uses each algorithm's long-run rate
+   `min(in, limit)`, and effects inside one step are not resolved.
+7. **Cache (2a scope).** Only `hit_ratio: {fixed: h}` runs; `write_ops` (default
+   `[write]`) names the writes and every other op is a read. `cache_aside` serves hits and
+   leaves the misses to the service's `{to: db, on: miss}` step, which fires for `1 − h`
+   of the preceding cache step; `read_through` forwards `1 − h` of each read to its
+   `backend`; `write_through` and `write_around` send every write there synchronously (the
+   same flow, since `h` is fixed); `che`, `write_back` and a cache's `then` steps wait for
+   phase 2b.
+8. **Rejections and the client.** Rejected and dropped requests are not answered and add
+   no latency. The backward pass carries a *delivered fraction* per (node, op) next to the
+   latency: the node's own `served / inflow` times its downstream's (sequential hops
+   multiply, splits mix by share), and a client's latency moments are weighted by
+   `offered × delivered`.
+
+Refinements that came out of review while building:
+
+9. **Hot and cool copies behind a hash ring.** The node behind a `consistent_hash`
+   balancer is two copy groups: one hot copy at `k/N` of the demand and `N − 1` cool copies
+   sharing `(N − k)/N`, each group with its own queue. A saturated hot copy sheds only its
+   own excess; the node reports the hot copy's rho and zone and, as latency, the mixture a
+   request sees.
+10. **The replica model, not the policy, must agree.** A node behind several balancers may
+    have only one replica model: `round_robin` and `weighted` agree (both independent),
+    `round_robin` and `least_connections` do not and are an error. A node reached both
+    through a balancer and directly takes the balancer's model for all its traffic.
+11. **Drained routes carry nothing.** A link of weight 0 brings no op to its target, closes
+    no call cycle and imposes no replica model; an op whose every link is drained is an
+    error.
+12. **Window algorithms per step.** The fixed window resets when `floor(now / window)`
+    changes (so a flood across a boundary gets 2W); the sliding log keeps a ring of the
+    last `ceil(window/dt)` steps' admitted counts (never more than W in any window); the
+    sliding counter uses `prev·(1 − f) + cur` and admits about 10/11 of the limit under a
+    flood at ten steps per window.
+13. **The leaky bucket is a deterministic leak slot.** Its queue is the limiter's own: one
+    server of service time `1/limit`, SCV 0 (M/D/1), with `queue_limit = burst`, so excess
+    waits and only a full bucket's overflow is rejected; `capacity`, `latency`,
+    `concurrency` and `queue_limit` on it are errors.
+14. **The counter store sees every checked request.** A limiter with a `backend` sends one
+    `counter` request per request it checks, admitted or refused, and the hop adds to an
+    admitted request's response.
+15. **Answered-weighted latency.** Percentiles are averaged over the requests answered,
+    each step weighted by the client's offered rate times its delivered fraction, so a
+    spike that a limiter mostly refuses weighs by the requests it answers, not by the
+    requests offered.
+16. **`reject_rate` versus `drop_rate`.** A drop is a node failing (its waiting room was
+    full); a rejection is a limiter's policy working (ch. 4's 429). Each is a per-node
+    ratio of its node's demand, with its own SLO metric, table column and CSV column.
