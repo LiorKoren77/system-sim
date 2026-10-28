@@ -149,6 +149,46 @@ struct ResolvedNode {
   std::optional<ResolvedHitRatio> hit_ratio{};
 };
 
+// Whether `op` changes data at the node `spec` describes (it is one of its write ops,
+// model::write_ops_of: a cache's `[write]`, a database's SQL statements, or the scenario's list);
+// every other op is a read. One rule for the graph, the engine's database split and explain.
+[[nodiscard]] bool is_write(const model::NodeSpec& spec, std::string_view op);
+
+// How a SQL database spreads its load over its copies (plan 2b refinement 3; book ch. 1,
+// "database replication" and "sharding"): N = replicas copies per shard, one primary and N − 1
+// read replicas, in S = shards shards. The share of the node's reads and of its writes that ONE
+// copy of each kind is sent:
+//                 copies        reads share        writes share
+//   primary       S             0 (1/S if N = 1)   1/S
+//   replica       (N − 1) S     1/((N − 1) S)      1/S   (it replays every write of its shard)
+// The writes a replica replays are the ones its primary COMMITTED: the engine applies the
+// replica's writes share to what the primaries drained (engine::Simulation::serve), explain to
+// the paper load (where nothing is dropped, so the two agree).
+struct DatabaseShares {
+  double primaries{1};
+  double replicas{0};  // (N − 1) S; 0 for a database without replicas
+  double primary_reads{1};
+  double primary_writes{1};
+  double replica_reads{0};
+  double replica_writes{0};
+};
+[[nodiscard]] DatabaseShares database_shares(const model::NodeSpec& spec);
+
+// What ONE primary and ONE replica carry when the database is sent `reads` and `writes` (any
+// unit: explain passes capacity units per second). Empty `replica` without replicas.
+struct DatabaseCopyLoads {
+  double primary{};
+  std::optional<double> replica{};
+};
+[[nodiscard]] DatabaseCopyLoads database_copy_loads(const model::NodeSpec& spec, double reads,
+                                                    double writes);
+
+// Whether a database's connection pool, not its disk, bounds its throughput: Little's law caps
+// a copy with `pool` connections at pool / service time, and this is below the `capacity` the
+// scenario (or the type) states. Graph::build then resolves the copy to that rate and c = pool
+// (apply_database_keys); explain says where the number came from.
+[[nodiscard]] bool pool_binds(const ResolvedNode& node);
+
 // The op a rate limiter sends its counter store once per request it checks (plan 2a
 // refinement 6): "read and increment this client's counter" (ch. 4's Redis INCR + EXPIRE).
 inline constexpr std::string_view counter_op = "counter";
@@ -554,12 +594,6 @@ namespace {
   return type == model::NodeType::cache || type == model::NodeType::cdn;
 }
 
-// Whether `op` changes data at `cache` (it is one of its write ops, model::write_ops_of); every
-// other op is a read, which can hit or miss.
-[[nodiscard]] bool is_write(const model::NodeSpec& cache, std::string_view op) {
-  return std::ranges::contains(model::write_ops_of(cache), op);
-}
-
 // Pattern: Strategy (enum-dispatched) — the cache strategy is a closed enum and this is the one
 // place that says which ops each strategy sends to the store (its backend hop, as the same op):
 // a read under read_through (its misses), a write under write_through, write_around and
@@ -638,6 +672,17 @@ namespace {
   return invalid_then_steps(spec);
 }
 
+// A database answers every query itself and calls nobody (behaviours::SqlDbBehaviour), so a link
+// that carries demand out of one (from it, or written from the other end with `dir: in`) would
+// carry nothing: refused, as the loader refuses it (config's check_link_sender), with its message.
+[[nodiscard]] std::optional<EngineError> invalid_link_from_database(const model::LinkSpec& link,
+                                                                    const model::NodeSpec& from,
+                                                                    const model::NodeSpec& to) {
+  const auto& sender = link.dir == model::Direction::in ? to : from;
+  if (sender.type != model::NodeType::sql_db) return std::nullopt;
+  return EngineError{"node '" + sender.id + "': a database calls nobody"};
+}
+
 // Graph::build also takes databases written in code: their `shards`, `pool` and
 // `replication_lag` obey the loader's rules (config's read_sql_keys), with its messages.
 [[nodiscard]] std::optional<EngineError> invalid_database(const model::NodeSpec& spec) {
@@ -657,16 +702,29 @@ namespace {
   return std::nullopt;
 }
 
-// What a database's own keys do to its resolved numbers (plan 2b refinement 3):
-//  - `pool` is the concurrency of every copy's queue, primary and replicas alike (the
-//    connection pool: how many queries one copy runs at once), in place of the c that
-//    Little's law implies from capacity × service time (defaults::implied_concurrency). The
-//    service rate stays `capacity`: a pool lets more queries wait in service at once, it
-//    does not make the disk faster.
+// What a database's own keys do to its resolved numbers (plan 2b refinement 3): `pool` is the
+// connection pool, how many queries one copy (primary or replica alike) has in service at once.
+// A copy already has a concurrency, the c Little's law implies from its capacity × service time
+// (defaults::implied_concurrency: 5k/s × 10 ms keeps 50 queries in service). A pool below it
+// leaves connections, not the disk, as the limit:
+//   c            = min(pool, implied c)
+//   service rate = min(capacity, pool / service time)
+// so 4 connections of 10 ms queries serve at most 400/s however fast the disk. A pool at or above
+// the implied c changes nothing: more connections never make the disk faster. The two lines
+// keep the queue one consistent machine (fluid::Capacity: the drain uses the rate, Erlang C
+// uses c and the service time, and rate = c / service time when the pool binds).
 // (Its `write_ops` need nothing here: model::write_ops_of gives an absent list the database
 // default, default_sql_write_ops, wherever it is read.)
 void apply_database_keys(ResolvedNode& node) {
-  if (node.spec.pool) node.capacity.concurrency = *node.spec.pool;
+  if (!node.spec.pool) return;
+  const int pool = *node.spec.pool;
+  auto& capacity = node.capacity;
+  capacity.concurrency = std::min(pool, capacity.concurrency);
+  // Little's law: concurrency in service = throughput × service time, so `pool` queries in
+  // service for service_time_s each leave at pool / service_time_s per second. (A zero service
+  // time gives +inf, which the min turns back into the capacity.)
+  const double pool_rate = static_cast<double>(pool) / capacity.service_time_s;
+  capacity.service_rate = Rate{std::min(capacity.service_rate.per_second, pool_rate)};
 }
 
 // A leaky bucket (ch. 4) IS a queue: requests join a FIFO bucket that leaks at the fixed
@@ -720,6 +778,47 @@ void apply_database_keys(ResolvedNode& node) {
 }
 
 }  // namespace
+
+bool is_write(const model::NodeSpec& spec, std::string_view op) {
+  return std::ranges::contains(model::write_ops_of(spec), op);
+}
+
+// The table at DatabaseShares. Without replicas the S primaries share reads and writes alike.
+DatabaseShares database_shares(const model::NodeSpec& spec) {
+  const double copies_per_shard = spec.replicas;
+  const double shards = spec.shards.value_or(1);
+  if (copies_per_shard < 2.0) {
+    return DatabaseShares{.primaries = shards,
+                          .replicas = 0.0,
+                          .primary_reads = 1.0 / shards,
+                          .primary_writes = 1.0 / shards};
+  }
+  const double replicas = (copies_per_shard - 1.0) * shards;
+  return DatabaseShares{.primaries = shards,
+                        .replicas = replicas,
+                        .primary_reads = 0.0,  // a primary serves no reads while replicas exist
+                        .primary_writes = 1.0 / shards,
+                        .replica_reads = 1.0 / replicas,
+                        .replica_writes = 1.0 / shards};
+}
+
+// One copy's load is its share of each kind: with N = 3, 1000 read units/s and 100 write
+// units/s, the primary carries 100/s and each replica 1000 / 2 + 100 = 600/s.
+DatabaseCopyLoads database_copy_loads(const model::NodeSpec& spec, double reads, double writes) {
+  const DatabaseShares shares = database_shares(spec);
+  DatabaseCopyLoads loads{.primary = reads * shares.primary_reads + writes * shares.primary_writes};
+  if (shares.replicas > 0.0) {
+    loads.replica = reads * shares.replica_reads + writes * shares.replica_writes;
+  }
+  return loads;
+}
+
+// The pool lowered the rate below the stated or default capacity (apply_database_keys).
+bool pool_binds(const ResolvedNode& node) {
+  return node.spec.type == model::NodeType::sql_db && node.spec.pool &&
+         node.capacity.service_rate.per_second <
+             defaults::resolve_service_rate(node.spec).value.per_second;
+}
 
 // The call-graph search lives in a named, unexported namespace (module linkage) rather
 // than the anonymous one: GCC 14 rejects std::map/std::vector of an internal-linkage type
@@ -1532,6 +1631,9 @@ Graph::Result Graph::resolve_links() {
                                          " names a node that does not exist"}};
     }
     if (auto invalid = invalid_link_numbers(spec)) return std::unexpected{std::move(*invalid)};
+    if (auto invalid = invalid_link_from_database(spec, nodes_[*from].spec, nodes_[*to].spec)) {
+      return std::unexpected{std::move(*invalid)};
+    }
     const bool cross_dc = nodes_[*from].spec.dc != nodes_[*to].spec.dc;
     const auto latency = defaults::resolve_link_latency(spec, cross_dc);
     const auto steps = whole_delay_steps(latency.value, scenario_.step);
@@ -2179,6 +2281,10 @@ Graph::Result Graph::mark_balanced_targets() {
             ", '" + spec.id + "' " + std::string{to_string(replica_model)} + ")"}};
       }
       if (!earlier) earlier = Marked{.model = replica_model, .balancer = balancer};
+      // A database's driver, not the balancer, picks its copy: writes go to the primary, reads
+      // to a replica, and a sharding key spreads the shards evenly. So a balancer's model
+      // imposes neither a pool nor a hot copy on it (engine::Simulation::make_database).
+      if (target.spec.type == model::NodeType::sql_db) continue;
       if (replica_model == ReplicaModel::pooled) target.pooled = true;
       if (replica_model == ReplicaModel::imbalanced) {
         target.keys_partitioned = true;  // each key hashes to one replica

@@ -131,6 +131,20 @@ TEST_CASE("invalid popularities are programmer errors", "[caching]") {
 - [ ] Tests (theory, pin with `mmc_wait`): `replicas: 3`, 1000 reads/s + 100 writes/s, capacity 1k/s per copy, 1 ms service: primary demand 100 (writes), replica pool demand = 1000/2 + 100 per copy = 600/s each; rho reported = max(primary 0.1, replica 0.6) = 0.6; read latency = Wq(replica copy) + s; write latency = Wq(primary) + s; staleness = 50 ms + write sojourn; `shards: 2` halves both; `replicas: 1`: reads and writes on the primary; `pool: 8` → concurrency 8 on both queues. Loader: `shards` positive int; `pool` positive int ≤ max_concurrency; `replication_lag` duration; `write_ops`. Report: `staleness` SLO passes/fails; JSON `staleness_s`. Explain line. Scenario: `labs/consistent-hashing` runs (cache che + LB consistent_hash + sql) and its README gets real numbers (vnodes 1 vs 100 vs 1000).
 - [ ] Commit `nodes: sql database with a primary, read replicas, shards and replication lag`
 
+**Review of 48d4d0b (adversarial, REQUEST_CHANGES) — fix round:**
+
+Correct and pinned by the reviewer: the plan numbers (replica 600/s, reads 3.0 ms, writes 1.61 ms, staleness 51.1 ms), shards/N=1/pool wiring, estimate = run, every lab README number, the ch. 5 quote, client-share conservation, per-op `own` for other node types.
+
+- [x] **C1 staleness ignores the replica's queue.** `staleness_s = lag + primary sojourn + replica sojourn` (a replayed write waits in the replica's queue too). A replica overloaded by replication drops replicated writes nobody sees; report them in `NodeSample::replication_dropped_per_s` (same optional convention as `staleness_s`), print them in the summary/JSON, and fail the `staleness` SLO when they are > 0 with "replica diverges: drops N/s replicated writes". Update the `NodeSample::staleness_s` comment, the `SqlDbBehaviour` header and the schema's Staleness paragraph.
+- [x] **C2 replicas replay the writes clients offered, not the ones the primary committed.** Serve the primary group first (groups are already primary-first), then send each replica `primary drained writes / S` instead of `writes / S`. Test A.
+- [x] **C3 `pool` breaks Little's law.** `c = min(pool, implied_concurrency)`, `service_rate = min(capacity, pool / service_time)`: a pool bounds throughput, never speeds the disk. Explain prints `capacity=400/s (pool 4 / 10ms)` when the pool binds. Comment `// Little's law: concurrency in service = throughput × service time`. Test: 5k/s, 10 ms, `pool: 4`, 3000 reads/s on `replicas: 1` → rho 1, drops ≈ 2600/s.
+- [x] **I1** a `consistent_hash` balancer's imbalance is not applied to `sql_db` (explain test: no `hottest copy`).
+- [x] **I2** `write_ops` is optional with type defaults (landed with the then-step round); drop the graph-level widening and the schema's "price" paragraph.
+- [x] **I3** `cost` is a valid `sql_db` key; write ops default to cost 5 (spec §6: SQL 5k reads/s vs 1k writes/s) with the citation; fix `behaviours.cppm`'s "costs more capacity via cost" claim to match.
+- [x] **I4** schema states backlog and drops are the clients' part; test D (client totals balance while a replica drops replicated writes).
+- [x] Minor: doc/comment example zone `(60%, green)`; README staleness 50.2 ms and a note that no write flows in that lab; "vnodes 1 fails only the cache SLO" in README and scenario header; `replication_lag` on `replicas: 1` explains as `(unused: no replicas)`; an outgoing link from a `sql_db` is refused ("a database calls nobody"); one graph-level `database_copy_loads(spec, reads, writes)` used by `make_database` and `database_check`; `record_sojourns` split (read mixture / write mixture / mix by rate); non-database fast path in `split_writes`/`group_arrivals`/`clients_part`; explain headline zone = worst copy for `sql_db`; JSON test checks the staleness value; tests A–D.
+- [x] Commit `nodes: sql database fixes from review — committed-write replay, replica staleness, pool bounds throughput`
+
 ---
 
 ### Task 5: CDN (request-based)

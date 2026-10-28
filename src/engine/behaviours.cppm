@@ -44,6 +44,7 @@ module;
 export module simsys.behaviours;
 
 import simsys.core;
+import simsys.defaults; // op_cost: a database write's default price
 import simsys.flow;
 import simsys.graph;
 import simsys.model;
@@ -922,19 +923,26 @@ class CacheBehaviour {
 //  - Database replication (ch. 1): `replicas: N` is one primary and N − 1 read replicas. Every
 //    write (an op in `write_ops`, default insert, update, delete and write) goes to the
 //    primary; reads go to the replicas, or to the primary when there are none (N = 1). Each
-//    replica applies every write the primary ships to it, so a replica's load is its share of
-//    the reads PLUS all the writes: the reason the book says replication scales reads, not
-//    writes.
+//    replica replays every write the primary COMMITTED (its log holds nothing the primary
+//    dropped), so a replica's load is its share of the reads PLUS all the committed writes:
+//    the reason the book says replication scales reads, not writes.
+//  - A write's price: the spec's "SQL 5k reads / 1k writes" per second makes a write cost 5
+//    capacity units (defaults::sql_write_cost) on the primary and on each replica that replays
+//    it, unless the scenario's `cost` says otherwise; a read costs 1.
 //  - Sharding (ch. 1, horizontal scaling): `shards: S` splits the data over S independent
 //    sets of the same shape (a primary and N − 1 replicas each), each seeing 1/S of the
 //    reads and of the writes: a perfect sharding key, no hot shard (the celebrity problem the
 //    book warns about is not modelled).
-//  - The connection pool (`pool`): how many queries one copy runs at once, the c of its M/M/c
-//    queue (graph::Graph::resolve_nodes applies it).
-//  - Replication lag (`replication_lag`, a constant): a replica applies a write that long after
-//    the primary finished it, so a read may return data as old as the lag plus the primary's
-//    write sojourn: the node's `staleness` (engine::NodeSample::staleness_s, the `staleness`
-//    SLO).
+//  - The connection pool (`pool`): how many queries one copy has in service at once. By
+//    Little's law (concurrency in service = throughput × service time) a pool below the c the
+//    capacity implies caps the copy at pool / service time with c = pool; a larger pool changes
+//    nothing (graph::apply_database_keys).
+//  - Replication lag (`replication_lag`, a constant): a replica receives a write that long after
+//    the primary finished it and then applies it after its own queue's wait, so a read may
+//    return data as old as the primary's write sojourn + the lag + the replica's sojourn: the
+//    node's `staleness` (engine::NodeSample::staleness_s, the `staleness` SLO). A replica too
+//    busy to replay every write drops some (engine::NodeSample::replication_dropped_per_s) and
+//    diverges for good: the `staleness` SLO then fails whatever the mean age.
 // Who does what: the ENGINE holds the two kinds of queue (primary and replica copies, see
 // engine::Simulation::make_database) and splits the load between them with `is_write`; it
 // hands `response` the sojourn of the queue the op uses (a write the primary's, a read a
@@ -943,8 +951,8 @@ class CacheBehaviour {
 // Ignored: replication conflicts and multi-primary set-ups, failover (a replica promoted when
 // the primary dies, ch. 1: no failures before phase 2c), transactions and locks, queueing for
 // a connection beyond the pool (a query waiting for a free connection waits in the same queue
-// here), cross-shard queries and joins, resharding, hot shards, per-op service times (a write's
-// disk seek costs more capacity via `cost`, not a longer service time), and read-your-writes:
+// here), cross-shard queries and joins, resharding, hot shards, per-op service times (a write
+// costs more capacity, 5 units by default, not a longer service time), and read-your-writes:
 // a client that reads right after writing may see the stale replica, which only the staleness
 // number tells.
 class SqlDbBehaviour {
@@ -955,8 +963,9 @@ class SqlDbBehaviour {
   // and `dt` are unused (a database holds no state between steps).
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
 
-  // Capacity units one query of `op` uses: the spec's `cost` entry, else 1 (on the primary
-  // and on each replica that applies it alike).
+  // Capacity units one query of `op` uses (defaults::op_cost): the spec's `cost` entry, else 5
+  // for a write (defaults::sql_write_cost), else 1; on the primary and on each replica that
+  // replays it alike.
   [[nodiscard]] double cost(std::string_view op) const;
 
   // Whether `op` changes data and so goes to the primary (it is in `write_ops`); every other
@@ -977,7 +986,8 @@ class SqlDbBehaviour {
 
  private:
   std::vector<std::string> write_ops_;
-  std::map<std::string, double, std::less<>> cost_by_op_;  // only the ops listed in `cost`
+  // The ops listed in `cost` and every write op (at its default unless listed); the rest cost 1.
+  std::map<std::string, double, std::less<>> cost_by_op_;
 };
 
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
@@ -1461,10 +1471,14 @@ Routed CacheBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt
 
 // ---- SqlDbBehaviour ----
 
-// The scenario's write ops as written, else the SQL default (model::write_ops_of).
+// The scenario's write ops as written, else the SQL default (model::write_ops_of), and their
+// prices resolved once (defaults::op_cost) so cost() is one lookup per op and step.
 SqlDbBehaviour::SqlDbBehaviour(const graph::Graph& g, std::size_t self)
     : write_ops_{model::write_ops_of(g.nodes()[self].spec)},
-      cost_by_op_{g.nodes()[self].spec.cost.begin(), g.nodes()[self].spec.cost.end()} {}
+      cost_by_op_{g.nodes()[self].spec.cost.begin(), g.nodes()[self].spec.cost.end()} {
+  const auto& spec = g.nodes()[self].spec;
+  for (const auto& op : write_ops_) cost_by_op_.try_emplace(op, defaults::op_cost(spec, op));
+}
 
 double SqlDbBehaviour::cost(std::string_view op) const {
   const auto found = cost_by_op_.find(op);

@@ -3153,27 +3153,31 @@ TEST_CASE("a sql database's shards, pool, replication lag and write ops are type
 // that would carry demand out of it would carry nothing: the loader refuses it, whichever end
 // writes it (review of 48d4d0b).
 TEST_CASE("a link that carries demand out of a sql database is refused") {
-  const std::string nodes = "  u: {type: client, rate: {base: 1000/s}, ops: {select: 1}}\n"
-                            "  db: {type: sql_db, replicas: 2}\n"
-                            "  audit: {type: service}\n";
+  const std::string nodes =
+      "  u: {type: client, rate: {base: 1000/s}, ops: {select: 1}}\n"
+      "  db: {type: sql_db, replicas: 2}\n"
+      "  audit: {type: service}\n";
   SECTION("written from the database") {
     require_rejected("simsys_sql_link_out.yaml",
-                     scenario_with(nodes, "links:\n"
-                                          "  - {from: u, to: db}\n"
-                                          "  - {from: db, to: audit}\n"),
+                     scenario_with(nodes,
+                                   "links:\n"
+                                   "  - {from: u, to: db}\n"
+                                   "  - {from: db, to: audit}\n"),
                      "node 'db': a database calls nobody");
   }
   SECTION("written from the other end with dir: in") {
     require_rejected("simsys_sql_link_in.yaml",
-                     scenario_with(nodes, "links:\n"
-                                          "  - {from: u, to: db}\n"
-                                          "  - {from: audit, to: db, dir: in}\n"),
+                     scenario_with(nodes,
+                                   "links:\n"
+                                   "  - {from: u, to: db}\n"
+                                   "  - {from: audit, to: db, dir: in}\n"),
                      "node 'db': a database calls nobody");
   }
   SECTION("a link into the database is fine") {
     require_loaded("simsys_sql_link_into.yaml",
-                   scenario_with(nodes, "links:\n"
-                                        "  - {from: u, to: db}\n"
-                                        "  - {from: db, to: audit, dir: in}\n"));
+                   scenario_with(nodes,
+                                 "links:\n"
+                                 "  - {from: u, to: db}\n"
+                                 "  - {from: db, to: audit, dir: in}\n"));
   }
 }

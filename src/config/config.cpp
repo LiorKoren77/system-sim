@@ -105,7 +105,7 @@ constexpr std::array<OwnKeys, model::node_type_names.size()> own_keys_by_type{{
     {model::NodeType::rate_limiter, "algorithm limit burst window backend"},
     {model::NodeType::service, "ops cost"},
     {model::NodeType::cache, "eviction strategy keys hit_ratio backend ttl then cost write_ops"},
-    {model::NodeType::sql_db, "replication_lag shards pool write_ops"},
+    {model::NodeType::sql_db, "replication_lag shards pool write_ops cost"},
     {model::NodeType::kv_cluster, "nodes vnodes replication write_quorum read_quorum mode"},
     {model::NodeType::message_queue, "partitions retention"},
     {model::NodeType::worker_pool, "consumes workers cost then"},
@@ -1070,11 +1070,13 @@ CheckResult read_advanced(const Site& site, const YAML::Node& body, model::NodeS
 
 // ---- Per-op cost (plan 2a refinement 4) ----
 
-// The types whose `cost` is a map op -> capacity units. A worker_pool's `cost` is a
+// The types whose `cost` is a map op -> capacity units (a SQL database's writes default to
+// defaults::sql_write_cost; a stated cost replaces it). A worker_pool's `cost` is a
 // different key with the same spelling (a duration per job, read in phase 2c), so the
 // reader is chosen by type, not by the key alone.
 bool has_cost_map(model::NodeType type) {
-  return type == model::NodeType::service || type == model::NodeType::cache;
+  return type == model::NodeType::service || type == model::NodeType::cache ||
+         type == model::NodeType::sql_db;
 }
 
 // The largest cost one request may have. Chosen, not from the book: the same bound as a
@@ -2448,28 +2450,41 @@ DemandPair demand_pair(const model::LinkSpec& link) {
   return {link.from, link.to};
 }
 
+// A database answers every query itself and calls nobody (behaviours::SqlDbBehaviour), so a
+// link that carries demand out of one (written from it, or from the other end with `dir: in`)
+// would carry nothing: refused at the database's name.
+CheckResult check_link_sender(const Site& site, const YAML::Node& link, const model::LinkSpec& spec,
+                              const Declarations& declared) {
+  const auto& sender = declared.nodes[declared.ids.find(demand_pair(spec).first)->second];
+  if (sender.type != model::NodeType::sql_db) return {};
+  return node_site(site, sender.id).fail(link, "a database calls nobody");
+}
+
 // One link per pair and demand direction: the graph routes an op over THE link between two
 // nodes, so a second one (for other ops, or a second weight) would be ignored or ambiguous.
 // Several ops go in one link's `ops`, a split goes in weights across different targets.
 std::expected<model::LinkSpec, ConfigError> read_unique_link(const Site& site,
                                                              const YAML::Node& link,
-                                                             const NodeIndex& ids,
+                                                             const Declarations& declared,
                                                              std::set<DemandPair>& seen) {
-  auto spec = read_link(site, link, ids);
-  if (!spec || seen.insert(demand_pair(*spec)).second) return spec;
+  auto spec = read_link(site, link, declared.ids);
+  if (!spec) return spec;
+  if (auto checked = check_link_sender(site, link, *spec, declared); !checked) {
+    return std::unexpected(checked.error());
+  }
+  if (seen.insert(demand_pair(*spec)).second) return spec;
   return link_site(site, spec->from, spec->to)
       .fail(link, "duplicate link (put several ops or a weight on one link)");
 }
 
-std::expected<std::vector<model::LinkSpec>, ConfigError> collect_links(const Site& site,
-                                                                       const YAML::Node& links,
-                                                                       const NodeIndex& ids) {
+std::expected<std::vector<model::LinkSpec>, ConfigError> collect_links(
+    const Site& site, const YAML::Node& links, const Declarations& declared) {
   // A bare `links:` (null) was reported at its key by check_sections_not_null.
   if (!links.IsSequence()) return site.fail(links, "links must be a list");
   std::set<DemandPair> seen;
   std::size_t index = 0;
   return collect_each(links, [&](const YAML::Node& link) {
-    return read_unique_link(link_index_site(site, ++index), link, ids, seen);
+    return read_unique_link(link_index_site(site, ++index), link, declared, seen);
   });
 }
 
@@ -2645,7 +2660,7 @@ std::expected<model::Scenario, ConfigError> validate(const std::string& file,
   if (auto read = read_node_bodies(site, root["nodes"], *declared); !read) {
     return std::unexpected(read.error());
   }
-  auto links = collect_links(site, root["links"], declared->ids);
+  auto links = collect_links(site, root["links"], *declared);
   if (!links) return std::unexpected(links.error());
   auto slos = collect_slos(site, root, *declared);
   if (!slos) return std::unexpected(slos.error());

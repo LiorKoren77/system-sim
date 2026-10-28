@@ -302,9 +302,10 @@ struct Overloaded : Fs... {
   return found->mean_rho;
 }
 
-// The named node's mean staleness (plan 2b refinement 3: a SQL database's replication lag plus
-// its primary's write sojourn, how old the data a read may return is), in seconds; empty for a
-// node with no lagging copies, whose staleness SLO is then skipped (nothing to observe).
+// The named node's mean staleness (plan 2b refinement 3: a SQL database's write sojourn at the
+// primary + replication lag + sojourn at a replica, how old the data a read may return is), in
+// seconds; empty for a node with no lagging copies, whose staleness SLO is then skipped (nothing
+// to observe).
 [[nodiscard]] std::optional<double> mean_staleness(std::span<const NodeSummary> nodes,
                                                    const model::SloSpec& slo) {
   const auto found = std::ranges::find(nodes, slo.node.value_or(""), &NodeSummary::id);
@@ -339,6 +340,18 @@ struct Overloaded : Fs... {
   std::unreachable();
 }
 
+// A staleness bound promises that a replica catches up within it. A replica that drops some of
+// the writes it replays never catches up (it no longer holds what the primary holds), so the
+// SLO fails whatever the mean age of what it does hold, and says why.
+void fail_if_replica_diverges(SloResult& result, std::span<const NodeSummary> nodes) {
+  const auto found = std::ranges::find(nodes, result.slo.node.value_or(""), &NodeSummary::id);
+  if (found == nodes.end()) return;
+  const double dropped_per_s = found->mean_replication_dropped_per_s.value_or(0.0);
+  if (dropped_per_s <= 0.0) return;
+  result.status = SloStatus::fail;
+  result.note = "replica diverges: drops " + fmt_rate(dropped_per_s) + " replicated writes";
+}
+
 // An SLO with nothing observed: phase 1 does not model the metric, or no step was observed.
 [[nodiscard]] SloResult skipped(const model::SloSpec& slo) {
   // C++20 designated initializers: name the fields being set, so `observed` and `status`
@@ -356,8 +369,10 @@ struct Overloaded : Fs... {
   const auto observed = observe_metric(summary, nodes, ops, slo);
   if (!observed) return skipped(slo);
   const bool within = *observed <= limit_value(slo.max);
-  return SloResult{
+  SloResult result{
       .slo = slo, .observed = observed, .status = within ? SloStatus::pass : SloStatus::fail};
+  if (slo.metric == model::SloMetric::staleness) fail_if_replica_diverges(result, nodes);
+  return result;
 }
 
 // ---- table ----
@@ -426,6 +441,21 @@ struct Overloaded : Fs... {
   return "nodes\n" + aligned(rows);
 }
 
+// A database's replication, which the node table has no columns for: the mean staleness and the
+// replayed writes its replicas dropped per second (a replica that drops any diverges). Only when
+// the run has a database.
+[[nodiscard]] std::string replication_table(const Summary& summary) {
+  std::vector<Row> rows{{{"database"}, {"staleness"}, {"replicated writes dropped/s"}}};
+  for (const auto& node : summary.nodes()) {
+    if (!node.mean_replication_dropped_per_s) continue;
+    rows.push_back({{node.id},
+                    {fmt_duration(node.mean_staleness_s.value_or(0.0))},
+                    {with_si_prefix(*node.mean_replication_dropped_per_s)}});
+  }
+  if (rows.size() == 1) return {};
+  return "replication\n" + aligned(rows);
+}
+
 [[nodiscard]] std::string op_table(const Summary& summary) {
   std::vector<Row> rows{
       {{"client.op"}, {"offered/s"}, {"mean"}, {"p50"}, {"p95"}, {"p99"}, {"(estimated)"}}};
@@ -461,12 +491,11 @@ struct Overloaded : Fs... {
     // an empty optional through, replacing `observed ? f(*observed) : nullopt`.
     const auto observed =
         r.observed.transform([&](double v) { return fmt_slo_value(r.slo.metric, v); });
-    rows.push_back({status_cell(r.status, color),
-                    {std::string{model::to_string(r.slo.metric)}},
-                    {r.slo.node.value_or("-")},
-                    {r.slo.op.value_or("-")},
-                    {observed.value_or("-")},
-                    {fmt_limit(r.slo.max)}});
+    Row row{status_cell(r.status, color), {std::string{model::to_string(r.slo.metric)}},
+            {r.slo.node.value_or("-")},   {r.slo.op.value_or("-")},
+            {observed.value_or("-")},     {fmt_limit(r.slo.max)}};
+    if (!r.note.empty()) row.push_back({r.note});  // a seventh, unlabelled column: why
+    rows.push_back(std::move(row));
   }
   return "slo\n" + aligned(rows, Align::all_left);
 }
@@ -527,7 +556,11 @@ struct Overloaded : Fs... {
       json_field("red_s", json_number(n.red_time_s)),
       json_field("unavailable", n.unavailable ? "true" : "false"),
       // null for a node with no lagging copies, and for an infinite one
-      json_field("staleness_s", n.mean_staleness_s ? json_number(*n.mean_staleness_s) : "null")};
+      json_field("staleness_s", n.mean_staleness_s ? json_number(*n.mean_staleness_s) : "null"),
+      // null for every node that is not a database
+      json_field("replication_dropped_per_s", n.mean_replication_dropped_per_s
+                                                  ? json_number(*n.mean_replication_dropped_per_s)
+                                                  : "null")};
   return json_object(fields);
 }
 
@@ -549,7 +582,8 @@ struct Overloaded : Fs... {
                           json_field("op", json_optional_string(r.slo.op)),
                           json_field("observed", r.observed ? json_number(*r.observed) : "null"),
                           json_field("max", json_number(limit_value(r.slo.max))),
-                          json_field("status", json_string(status_name(r.status)))};
+                          json_field("status", json_string(status_name(r.status))),
+                          json_field("note", r.note.empty() ? "null" : json_string(r.note))};
   return json_object(fields);
 }
 
@@ -827,25 +861,33 @@ template <class T>
   return "primary+" + std::to_string(replicas) + (replicas == 1 ? " replica" : " replicas");
 }
 
+// "  lag=50ms", "  lag=0s (default)", or "  lag=50ms (unused: no replicas)": with `replicas: 1`
+// nothing replicates, so a stated lag describes nothing (it is accepted, so a scenario can keep
+// it while trying one copy).
+[[nodiscard]] std::string lag_summary(const model::NodeSpec& spec) {
+  const std::string lag = "  lag=" + fmt_duration(spec.replication_lag.value_or(SimTime{0}));
+  if (!spec.replication_lag) return lag + " (default)";
+  return spec.replicas < 2 ? lag + " (unused: no replicas)" : lag;
+}
+
 // A SQL database's model (plan 2b refinement 3): `primary+2 replicas  shards=4  lag=50ms
 // pool=32  write_ops=insert,update`, the defaults applied and marked: one shard, no lag; `pool`
-// only when stated (c=... (pool) in the queue numbers says the same), and the write ops always
-// (the database default delete,insert,update,write, or the scenario's).
+// only when stated (the queue numbers say whether it binds: `capacity=400/s (pool 4 / 10ms)
+// ... c=4 (pool)`), and the write ops always (the database default delete,insert,update,write,
+// or the scenario's).
 [[nodiscard]] std::string database_summary(const graph::ResolvedNode& node) {
   const auto& spec = node.spec;
   if (spec.type != model::NodeType::sql_db) return {};
   std::string text = "  " + replica_set(spec.replicas) +
                      "  shards=" + std::to_string(spec.shards.value_or(1)) +
-                     if_defaulted(spec.shards) +
-                     "  lag=" + fmt_duration(spec.replication_lag.value_or(SimTime{0})) +
-                     if_defaulted(spec.replication_lag);
+                     if_defaulted(spec.shards) + lag_summary(spec);
   if (spec.pool) text += "  pool=" + std::to_string(*spec.pool);
   return text + "  write_ops=" + join(model::write_ops_of(spec), ",");
 }
 
 // Where each of a queue's four numbers came from, as explain prints it.
 struct QueueProvenance {
-  std::string_view capacity;
+  std::string capacity;
   std::string_view service_time;
   std::string_view concurrency;
   std::string_view queue_limit;
@@ -859,20 +901,31 @@ struct QueueProvenance {
 // A leaky bucket's queue is derived whole from the limiter (graph::leaky_bucket_capacity):
 // it drains at `limit` through one deterministic leak slot and holds `burst`. Any other
 // node's numbers are the scenario's, a default, or (c) implied by Little's law.
+// A database whose pool binds (graph::pool_binds): Little's law makes its rate pool / service
+// time and its c the pool, "capacity=400/s (pool 4 / 10ms) ... c=4 (pool)".
+[[nodiscard]] QueueProvenance pool_provenance(const graph::ResolvedNode& node) {
+  const auto& spec = node.spec;
+  const auto queue_source =
+      spec.advanced.queue_limit ? defaults::Source::scenario : defaults::Source::type_default;
+  return {"(pool " + std::to_string(*spec.pool) + " / " +
+              fmt_duration(node.capacity.service_time_s) + ")",
+          provenance(node.service_time_source), "(pool)", provenance(queue_source)};
+}
+
 [[nodiscard]] QueueProvenance queue_provenance(const graph::ResolvedNode& node) {
   if (is_leaky_bucket(node.spec)) return {"(limit)", "(limit)", "(leak slot)", "(burst)"};
+  if (graph::pool_binds(node)) return pool_provenance(node);
   const auto& spec = node.spec;
   // The graph keeps no provenance for queue_limit, so it is read off the spec: provenance
   // is about presence, not value. A scenario that writes the default (fluid::Capacity's
   // 1000) still wrote it, and explain says so.
   const auto queue_source =
       spec.advanced.queue_limit ? defaults::Source::scenario : defaults::Source::type_default;
-  // c is derived by Little's law unless the scenario sets it (defaults::implied_concurrency).
-  // A database's `pool` sets c as advanced.concurrency would (graph::apply_database_keys).
-  const std::string_view concurrency_source = spec.pool                   ? "(pool)"
-                                              : spec.advanced.concurrency ? "(scenario)"
-                                                                          : "(implied)";
-  return {provenance(node.service_rate_source), provenance(node.service_time_source),
+  // c is derived by Little's law unless the scenario sets it (defaults::implied_concurrency);
+  // a database's `pool` at or above that c binds nothing (graph::apply_database_keys).
+  const std::string_view concurrency_source =
+      spec.advanced.concurrency ? "(scenario)" : "(implied)";
+  return {std::string{provenance(node.service_rate_source)}, provenance(node.service_time_source),
           concurrency_source, provenance(queue_source)};
 }
 
@@ -883,7 +936,7 @@ struct QueueProvenance {
   const std::array parts{
       "dc=" + spec.dc,
       "replicas=" + std::to_string(spec.replicas),
-      "capacity=" + fmt_rate(cap.service_rate.per_second) + " " + std::string{source.capacity},
+      "capacity=" + fmt_rate(cap.service_rate.per_second) + " " + source.capacity,
       "service_time=" + fmt_duration(cap.service_time_s) + " " + std::string{source.service_time},
       "c=" + std::to_string(cap.concurrency) + " " + std::string{source.concurrency},
       "queue_limit=" + num(cap.queue_limit, 6) + " " + std::string{source.queue_limit},
@@ -1014,12 +1067,11 @@ constexpr SimTime peak_sample_step = 1_min;
   return load;
 }
 
-// Capacity units one request of `op` uses at a node: its `cost` entry, else 1. The same
-// rule as behaviours::ServiceBehaviour::cost, read off the spec because explain runs on
-// any graph, including types the engine does not simulate yet.
+// Capacity units one request of `op` uses at a node: its `cost` entry, else 5 for a database's
+// write, else 1 (defaults::op_cost, the rule the behaviours' cost() follow), read off the spec
+// because explain runs on any graph, including types the engine does not simulate yet.
 [[nodiscard]] double cost_of(const model::NodeSpec& spec, const std::string& op) {
-  const auto found = spec.cost.find(op);
-  return found == spec.cost.end() ? 1.0 : found->second;
+  return defaults::op_cost(spec, op);
 }
 
 // Each forwarding node's (load balancer's, rate limiter's) routes per op that can reach
@@ -1342,40 +1394,60 @@ struct PaperLoad {
          std::string{zone_name(fluid::zone_of(rho, node.capacity))} + ")";
 }
 
-// A SQL database's total capacity hides where its load goes (engine::Simulation::
-// make_database): with N copies per shard and S shards, ONE primary is sent writes / S and ONE
-// replica reads / ((N − 1) S) + writes / S (it applies every write of its shard), each against
-// one copy's capacity. "  primary 100/s vs 1k/s (10%, green), each replica 600/s vs 1k/s (60%,
-// yellow)"; without replicas, the primary alone with everything / S. In capacity units.
-[[nodiscard]] std::string database_check(const graph::ResolvedNode& node, const OpLoad& arriving) {
-  if (node.spec.type != model::NodeType::sql_db) return {};
-  const auto write_ops = model::write_ops_of(node.spec);
+// A database's paper load per copy (graph::database_copy_loads, the split the engine uses), in
+// capacity units: its arriving reads and writes, each op priced by its cost (a write 5 by
+// default). Empty for any other node.
+[[nodiscard]] std::optional<graph::DatabaseCopyLoads> database_loads(
+    const graph::ResolvedNode& node, const OpLoad& arriving) {
+  if (node.spec.type != model::NodeType::sql_db) return std::nullopt;
   double reads = 0.0;
   double writes = 0.0;
   for (const auto& [op, rate] : arriving) {
-    (std::ranges::contains(write_ops, op) ? writes : reads) += rate * cost_of(node.spec, op);
+    (graph::is_write(node.spec, op) ? writes : reads) += rate * cost_of(node.spec, op);
   }
-  const double shards = node.spec.shards.value_or(1);
-  const double copies_per_shard = node.spec.replicas;
-  if (copies_per_shard < 2.0) return "  " + copy_check("primary", (reads + writes) / shards, node);
-  const double replica = reads / ((copies_per_shard - 1.0) * shards) + writes / shards;
-  return "  " + copy_check("primary", writes / shards, node) + ", " +
-         copy_check("each replica", replica, node);
+  return graph::database_copy_loads(node.spec, reads, writes);
+}
+
+// A SQL database's total capacity hides where its load goes (engine::Simulation::
+// make_database): with N copies per shard and S shards, ONE primary is sent writes / S and ONE
+// replica reads / ((N − 1) S) + writes / S (it replays every write of its shard), each against
+// one copy's capacity. "  primary 100/s vs 1k/s (10%, green), each replica 600/s vs 1k/s (60%,
+// green)"; without replicas, the primary alone with everything / S. In capacity units.
+[[nodiscard]] std::string database_check(const graph::ResolvedNode& node,
+                                         const std::optional<graph::DatabaseCopyLoads>& loads) {
+  if (!loads) return {};
+  const std::string primary = "  " + copy_check("primary", loads->primary, node);
+  if (!loads->replica) return primary;
+  return primary + ", " + copy_check("each replica", *loads->replica, node);
+}
+
+// The zone the headline gives a node: its average's, except for a database, whose average counts
+// primaries that serve no reads (a green average beside red replicas): there the busiest copy's,
+// "(55%, red at the busiest copy)" when the two differ.
+[[nodiscard]] std::string headline_zone(const graph::ResolvedNode& node, double rho,
+                                        const std::optional<graph::DatabaseCopyLoads>& loads) {
+  const fluid::Zone average = fluid::zone_of(rho, node.capacity);
+  if (!loads) return std::string{zone_name(average)};
+  const double busiest_rho = std::max(loads->primary, loads->replica.value_or(0.0)) /
+                             node.capacity.service_rate.per_second;
+  const fluid::Zone busiest = fluid::zone_of(busiest_rho, node.capacity);
+  if (busiest == average) return std::string{zone_name(average)};
+  return std::string{zone_name(busiest)} + " at the busiest copy";
 }
 
 // Utilization at the paper load: peak offered / (capacity per replica × replicas, × shards
 // for a sharded database: every shard is a full set of copies), with the node's own zone
-// thresholds, and the hottest copy's behind a hash ring. Both are in capacity units
-// (requests when every cost is 1).
-[[nodiscard]] std::string check_details(const graph::ResolvedNode& node, double offered) {
+// thresholds (a database's busiest copy's, headline_zone), and the hottest copy's behind a hash
+// ring. Both are in capacity units (requests when every cost is 1).
+[[nodiscard]] std::string check_details(const graph::ResolvedNode& node, double offered,
+                                        const std::optional<graph::DatabaseCopyLoads>& loads) {
   const double copies = node.spec.replicas * node.spec.shards.value_or(1);
   const double total_capacity = node.capacity.service_rate.per_second * copies;
   const std::string head =
       "peak offered " + fmt_rate(offered) + " vs " + fmt_rate(total_capacity) + " total capacity  ";
   if (total_capacity <= 0.0) return head + "(no capacity, red)" + hottest_copy_check(node, offered);
   const double rho = offered / total_capacity;
-  return head + "(" + percent(rho) + ", " +
-         std::string{zone_name(fluid::zone_of(rho, node.capacity))} + ")" +
+  return head + "(" + percent(rho) + ", " + headline_zone(node, rho, loads) + ")" +
          hottest_copy_check(node, offered);
 }
 
@@ -1388,9 +1460,10 @@ struct PaperLoad {
     if (node.spec.type == model::NodeType::client) continue;  // a source: see its offered=
     const std::string note =
         upper_bound[i] ? " (hit ratio unknown: che counted as 0 — an upper bound)" : "";
+    const auto loads = database_loads(node, load.by_op[i]);
     rows.push_back(
         {{node.spec.id},
-         {check_details(node, load.totals[i]) + database_check(node, load.by_op[i]) + note}});
+         {check_details(node, load.totals[i], loads) + database_check(node, loads) + note}});
   }
   const std::string note = load.converged ? "" : "  (no steady state: a loop of gain >= 1)\n";
   const std::string header = "checks (peak offered load over the first " +
@@ -1447,6 +1520,10 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
   if (sample.staleness_s) {
     staleness_time += *sample.staleness_s * dt_s;  // an infinite staleness stays infinite
     staleness_seen_s += dt_s;
+  }
+  if (sample.replication_dropped_per_s) {
+    replication_dropped += *sample.replication_dropped_per_s * dt_s;
+    replication_dropped_seen_s += dt_s;
   }
 }
 
@@ -1527,6 +1604,10 @@ std::vector<NodeSummary> Summary::nodes() const {
                               .unavailable = t.unavailable});
     if (t.staleness_seen_s > 0.0)
       out.back().mean_staleness_s = t.staleness_time / t.staleness_seen_s;
+    if (t.replication_dropped_seen_s > 0.0) {
+      out.back().mean_replication_dropped_per_s =
+          t.replication_dropped / t.replication_dropped_seen_s;
+    }
   }
   return out;
 }
@@ -1637,8 +1718,8 @@ bool all_pass(std::span<const SloResult> results) {
 // With no observed step there are no node or op figures to show, only the skipped SLOs.
 std::string render_table(const Summary& summary, std::span<const SloResult> slos, bool color) {
   if (summary.observed_steps() == 0) return table_header(summary) + slo_table(slos, color);
-  return table_header(summary) + node_table(summary, color) + op_table(summary) +
-         slo_table(slos, color);
+  return table_header(summary) + node_table(summary, color) + replication_table(summary) +
+         op_table(summary) + slo_table(slos, color);
 }
 
 // With no observed step the drop and reject rates are null: there is no data, not a rate of 0.

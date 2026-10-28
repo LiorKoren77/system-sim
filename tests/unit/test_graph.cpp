@@ -1489,11 +1489,8 @@ namespace {
 // database of 3 copies (one primary, two read replicas) of 5k/s and 10 ms each.
 Scenario database_behind_ring(bool ring) {
   Scenario s{.name = "db", .version = 1, .duration = 1min};
-  NodeSpec db{.id = "db",
-              .type = NodeType::sql_db,
-              .replicas = 3,
-              .capacity = Rate{5000},
-              .latency = 10ms};
+  NodeSpec db{
+      .id = "db", .type = NodeType::sql_db, .replicas = 3, .capacity = Rate{5000}, .latency = 10ms};
   s.nodes = {NodeSpec{.id = "u",
                       .type = NodeType::client,
                       .workload = Workload{.curve = {.base = Rate{1000}},
@@ -1503,8 +1500,10 @@ Scenario database_behind_ring(bool ring) {
     s.links = {LinkSpec{.from = "u", .to = "db"}};
     return s;
   }
-  s.nodes.push_back(NodeSpec{
-      .id = "ring", .type = NodeType::load_balancer, .policy = LbPolicy::consistent_hash, .vnodes = 1});
+  s.nodes.push_back(NodeSpec{.id = "ring",
+                             .type = NodeType::load_balancer,
+                             .policy = LbPolicy::consistent_hash,
+                             .vnodes = 1});
   s.links = {LinkSpec{.from = "u", .to = "ring"}, LinkSpec{.from = "ring", .to = "db"}};
   return s;
 }

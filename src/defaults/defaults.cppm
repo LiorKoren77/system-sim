@@ -16,6 +16,8 @@ module;
 #include <cstddef>
 #include <optional>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 
 export module simsys.defaults;
@@ -28,8 +30,8 @@ export namespace simsys::defaults {
 
 // The book's latency table, as typed durations. One field per row we use.
 // `disk_seek` (spec §6: SQL writes) and `compress_1kb` (spec §6: service CPU cost unit)
-// are not used yet: they feed the per-operation cost table of phase 2, which is also
-// when the spec's "SQL 1k writes" figure arrives (phase 1 has one rate per node).
+// are not used yet: a cost is a share of a node's capacity, not a longer service time (see
+// sql_write_cost, which prices a SQL write from the spec's "1k writes" figure instead).
 struct LatencyNumbers {
   SimTime memory_read_1mb, ssd_random_read, disk_seek, disk_read_1mb, network_read_1mb,
       compress_1kb, intra_dc_rtt, cross_dc_rtt, third_party_api;
@@ -104,8 +106,8 @@ struct TypeDefaults {
       // rate spec "cache 100k"; time spec §6 "cache service time floor" (memory read)
       return {Rate{100'000}, t.memory_read_1mb};
     case sql_db:
-      // rate spec "SQL 5k reads"; time spec §6 "SQL/NoSQL read". Writes (1k/s, disk
-      // seek) wait for the phase-2 per-operation cost table.
+      // rate spec "SQL 5k reads"; time spec §6 "SQL/NoSQL read". Writes (spec "1k
+      // writes") cost more of this rate: sql_write_cost.
       return {Rate{5'000}, t.ssd_random_read};
     case kv_cluster:
       return {Rate{50'000}, t.ssd_random_read};  // rate spec "KV 50k"; time spec "NoSQL read"
@@ -144,6 +146,32 @@ struct TypeDefaults {
   // to list the enumerators in order (core::follows_enum_order), and -Wswitch
   // proves every enumerator has a case that returns.
   std::unreachable();
+}
+
+// The rate one SQL machine sustains when every query is a write: spec §6's QPS line, "SQL 5k
+// reads" and "1k writes" per second (a write pays a disk seek and a log flush a read does not).
+inline constexpr Rate sql_write_rate{1'000};
+
+// What a write costs a SQL database, in capacity units (plan 2a refinement 4: `capacity` is a
+// rate of units, a read costs 1): the machine that does 5000 reads/s does 1000 writes/s, so one
+// write takes the capacity of 5000 / 1000 = 5 reads. Charged by op_cost to every write op
+// (model::write_ops_of) the scenario gives no `cost` for, on the primary and on each replica
+// that replays it. Ignored: a write's longer service time (a cost uses more capacity, not a
+// longer sojourn) and the gap between an append-only log write and a random update.
+inline constexpr double sql_write_cost =
+    for_type(model::NodeType::sql_db).service_rate.per_second / sql_write_rate.per_second;
+
+// Capacity units one request of `op` uses at the node `spec` describes: its `cost` entry, else
+// sql_write_cost for a database's write op, else 1. The one place the rule lives, so the engine
+// (through the behaviours) and explain's paper load price every op alike.
+[[nodiscard]] double op_cost(const model::NodeSpec& spec, std::string_view op) {
+  const auto stated = spec.cost.find(std::string{op});
+  if (stated != spec.cost.end()) return stated->second;
+  // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
+  // `std::find(begin, end, value) != end`.
+  const bool database_write =
+      spec.type == model::NodeType::sql_db && std::ranges::contains(model::write_ops_of(spec), op);
+  return database_write ? sql_write_cost : 1.0;
 }
 
 // Where a resolved number came from, for `simsys explain`.
@@ -258,3 +286,4 @@ constexpr bool every_non_client_type_has_positive_defaults() {
 static_assert(
     simsys::defaults::for_type(simsys::model::NodeType::service).service_rate.per_second == 2000);
 static_assert(every_non_client_type_has_positive_defaults());
+static_assert(simsys::defaults::sql_write_cost == 5.0);  // spec §6: 5k reads/s vs 1k writes/s
