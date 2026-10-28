@@ -1,0 +1,97 @@
+# System Design Interview vol. 1, ch. 10 — Notification system.
+# Book numbers: 10M mobile push, 1M SMS, 5M email per day. Here scaled 10x for a busier
+# system (~1.9k/s average) with a marketing-blast spike.
+version: 1
+name: notification-system
+seed: 1
+duration: 24h
+step: 100ms
+warmup: 2m
+
+nodes:
+  services:                                   # internal services that trigger notifications
+    type: client
+    rate:
+      base: 1.9k/s
+      wave: {shape: sine, period: 24h, amplitude: 0.4, peak_at: 18:00}
+      spikes: [{at: 09:00, for: 15m, factor: 20}]       # marketing blast
+    ops: {notify: 1.0}
+    timeout: 5s
+
+  lb: {type: load_balancer, policy: round_robin}
+
+  notification_svc:
+    type: service
+    replicas: 4
+    capacity: 5k/s
+    latency: 1ms
+    ops:
+      notify:
+        - {to: user_cache, op: read}
+        - {to: user_db, op: read, on: miss}
+        - {to: user_limiter, op: check}
+        - {to: fanout, op: route}
+
+  user_cache: {type: cache, eviction: lru, keys: 5M, hit_ratio: che, strategy: cache_aside}
+  user_db: {type: sql_db, replicas: 2, capacity: 3k/s}
+
+  user_limiter:                               # per-user rate limit
+    type: rate_limiter
+    algorithm: sliding_counter
+    limit: 100k/s                             # aggregate; per-user rules are in the backend
+    backend: user_cache
+
+  fanout:
+    type: notification_fanout
+    dedup: 0.02
+    channels: {ios: ios_q, android: android_q, sms: sms_q, email: email_q}
+    then:
+      - {to: ios_q, op: publish, factor: 0.6}
+      - {to: android_q, op: publish, factor: 0.3}
+      - {to: sms_q, op: publish, factor: 0.05}
+      - {to: email_q, op: publish, factor: 0.3}
+      - {to: log_db, op: write}
+
+  ios_q:     {type: message_queue, partitions: 16}
+  android_q: {type: message_queue, partitions: 16}
+  sms_q:     {type: message_queue, partitions: 4}
+  email_q:   {type: message_queue, partitions: 8}
+
+  ios_workers:     {type: worker_pool, consumes: ios_q, workers: 50, cost: 20ms, then: [{to: apns, op: send}]}
+  android_workers: {type: worker_pool, consumes: android_q, workers: 50, cost: 20ms, then: [{to: fcm, op: send}]}
+  sms_workers:     {type: worker_pool, consumes: sms_q, workers: 20, cost: 50ms, then: [{to: sms_provider, op: send}]}
+  email_workers:   {type: worker_pool, consumes: email_q, workers: 20, cost: 30ms, then: [{to: email_provider, op: send}]}
+
+  apns:           {type: external_sink, latency: 150ms, failure_rate: 0.02}
+  fcm:            {type: external_sink, latency: 150ms, failure_rate: 0.02}
+  sms_provider:   {type: external_sink, latency: 500ms, failure_rate: 0.05}
+  email_provider: {type: external_sink, latency: 300ms, failure_rate: 0.01}
+
+  log_db: {type: kv_cluster, nodes: 3, replication: 2, write_quorum: 1, read_quorum: 1, capacity: 20k/s}
+
+links:
+  - {from: services, to: lb, dir: inout}
+  - {from: lb, to: notification_svc, dir: inout}
+  - {from: notification_svc, to: user_cache, dir: inout}
+  - {from: notification_svc, to: user_db, dir: inout}
+  - {from: notification_svc, to: user_limiter, dir: inout}
+  - {from: user_limiter, to: user_cache, dir: inout}
+  - {from: notification_svc, to: fanout}
+  - {from: fanout, to: ios_q}
+  - {from: fanout, to: android_q}
+  - {from: fanout, to: sms_q}
+  - {from: fanout, to: email_q}
+  - {from: fanout, to: log_db}
+  - {from: ios_q, to: ios_workers}
+  - {from: android_q, to: android_workers}
+  - {from: sms_q, to: sms_workers}
+  - {from: email_q, to: email_workers}
+  - {from: ios_workers, to: apns, dir: inout}
+  - {from: android_workers, to: fcm, dir: inout}
+  - {from: sms_workers, to: sms_provider, dir: inout}
+  - {from: email_workers, to: email_provider, dir: inout}
+
+slo:
+  - {metric: queue_lag, node: ios_q, max: 5m}
+  - {metric: queue_lag, node: sms_q, max: 10m}
+  - {metric: drop_rate, max: 0.001}
