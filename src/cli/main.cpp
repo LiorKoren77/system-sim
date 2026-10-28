@@ -6,8 +6,9 @@
 
 // C++20 `import`: brings the exported names of a named module into this translation
 // unit. Unlike #include, it does not re-parse text; the compiler reads a compiled
-// module interface (BMI). Imports go after the #includes to keep GCC 14 happy about
-// header state.
+// module interface (BMI). Imports go after the #includes because GCC 14 reports
+// redefinition errors when a std header is #included after importing a module that
+// included the same header in its global module fragment.
 import simsys.core;
 
 int main(int argc, char** argv) {

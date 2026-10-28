@@ -50,7 +50,9 @@ Write for a reader who has read the book but has not studied queueing theory.
 
 ## 3. General
 
-- C++23, GCC 14 primary, Clang 18 secondary. Named modules. No raw `new`, no macros,
+- C++23. GCC 14 is the only compiler that builds the project (Clang 18 lacks
+  std::expected/std::generator with both standard libraries); Clang 18 is used for
+  clang-format only. Named modules. No raw `new`, no macros,
   exceptions only for programmer errors.
 - Tests are part of the teaching material: name them after the property they prove.
 - Scenario YAML files get a README explaining the design and the mechanisms the model
