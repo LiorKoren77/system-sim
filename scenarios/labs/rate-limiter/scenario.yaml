@@ -1,0 +1,46 @@
+# Lab: System Design Interview vol. 1, ch. 4 — Rate limiter.
+# Compare algorithms under a bursty client. The same file is run with `--param
+# nodes.limiter.algorithm=token_bucket|leaky_bucket|fixed_window|sliding_log|sliding_counter`.
+version: 1
+name: lab-rate-limiter
+seed: 1
+duration: 30m
+step: 100ms
+warmup: 1m
+
+nodes:
+  clients:
+    type: client
+    rate:
+      base: 800/s
+      spikes:
+        - {at: 5m, for: 30s, factor: 5}
+        - {at: 15m, for: 2m, factor: 2}
+        - {at: 25m, for: 5s, factor: 20}
+    ops: {call: 1.0}
+    timeout: 1s
+
+  limiter:
+    type: rate_limiter
+    algorithm: token_bucket
+    limit: 1k/s
+    burst: 500
+    backend: counters
+
+  counters: {type: cache, eviction: ttl, ttl: 1m, keys: 1M, hit_ratio: {fixed: 1.0}, capacity: 100k/s, latency: 0.2ms}
+
+  api:
+    type: service
+    replicas: 2
+    capacity: 600/s
+    latency: 2ms
+    advanced: {queue_limit: 200}
+
+links:
+  - {from: clients, to: limiter, dir: inout}
+  - {from: limiter, to: counters, dir: inout}
+  - {from: limiter, to: api, dir: inout}
+
+slo:
+  - {metric: utilization, node: api, max: 0.9}
+  - {metric: p99_latency, node: clients, op: call, max: 50ms}
