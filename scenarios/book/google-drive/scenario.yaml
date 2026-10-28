@@ -47,10 +47,12 @@ nodes:
     capacity: 500/s
     latency: 20ms
     ops:
+      # size: 500KB is the book's average file (ch. 15, as sizes.upload and sizes.download above).
+      # Both steps rename the op (upload -> write, fetch -> read), so the byte-sized store needs it.
       upload:
-        - {to: cloud_storage, op: write, factor: 0.5}      # dedup halves stored blocks
+        - {to: cloud_storage, op: write, factor: 0.5, size: 500KB}      # dedup halves stored blocks
       fetch:
-        - {to: cloud_storage, op: read}
+        - {to: cloud_storage, op: read, size: 500KB}
 
   cloud_storage: {type: blob_store, capacity: 2GB/s}
   cold_storage: {type: blob_store, capacity: 200MB/s}
@@ -78,7 +80,8 @@ nodes:
     consumes: notify_q
     workers: 2
     cost: 10ms
-    then: [{to: cold_storage, op: write}]
+    # size: 500KB is the book's average file (ch. 15): the backup copies the file that was uploaded.
+    then: [{to: cold_storage, op: write, size: 500KB}]
 
 links:
   - {from: clients, to: lb, dir: inout, ops: [download, upload_meta, metadata, sync_poll]}

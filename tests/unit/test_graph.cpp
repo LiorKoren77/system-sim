@@ -2097,3 +2097,243 @@ TEST_CASE("a limiter's counter that its store counts as a read is refused", "[gr
     REQUIRE(g.has_value());
   }
 }
+
+// ---- One request size per (node, op), resolved at build (plan 2c refinement 1, Task 2) ----
+//
+// A byte-sized node counts megabytes, so it must know how big each request it serves is. The
+// graph resolves one size per (node, op) with a walk over the client routes and the steps that
+// mirrors the che key walk above: a request keeps its size while it keeps its op name, and a
+// step that renames the op gives an unsized request unless the step states `size:`.
+//
+// The accessor these tests propose: `Graph::request_bytes(node_index, op)` returns
+// `std::optional<simsys::Bytes>`: the size, or an empty optional for an unsized (node, op) and
+// for an op that never reaches the node, as `hit_ratio(index)` is empty for a node without one.
+
+namespace {
+// The size, in bytes, the graph resolved for `op` at the node `id`; empty when it has none.
+std::optional<double> request_bytes_at(const Graph& g, std::string_view id, std::string_view op) {
+  const auto size = g.request_bytes(*g.index_of(id), op);
+  if (!size) return std::nullopt;
+  return size->count;
+}
+
+// The same, for a size the test needs: it fails here, instead of dereferencing an empty optional.
+double bytes_required(const Graph& g, std::string_view id, std::string_view op) {
+  const auto size = request_bytes_at(g, id, op);
+  REQUIRE(size.has_value());
+  return *size;
+}
+
+// A client sending `op` at 100/s, each request `size` long (no size when empty).
+NodeSpec sized_client(std::string id, std::string op, std::optional<simsys::Bytes> size) {
+  auto node = client(std::move(id), Rate{100}, {{op, 1.0}});
+  if (size) node.workload->sizes = {{op, *size}};
+  return node;
+}
+
+// A blob store with no stated capacity: byte-sized by its type's default, spec section 6's
+// 500 MB/s.
+NodeSpec default_blob_store(std::string id = "store") {
+  return NodeSpec{.id = std::move(id), .type = NodeType::blob_store};
+}
+
+// u (sending `get` at the given size) -> lb -> svc -> store, with svc.get = [{store, step_op}] and
+// `store` the given node.
+Scenario sized_chain(std::optional<simsys::Bytes> size, Step step, NodeSpec store) {
+  Scenario s{.name = "sized", .version = 1, .duration = 1min};
+  s.nodes = {sized_client("u", "get", size), load_balancer("lb", LbPolicy::round_robin),
+             service("svc", {{"get", {std::move(step)}}}), std::move(store)};
+  const auto store_id = s.nodes.back().id;
+  s.links = {LinkSpec{.from = "u", .to = "lb"}, LinkSpec{.from = "lb", .to = "svc"},
+             LinkSpec{.from = "svc", .to = store_id}};
+  return s;
+}
+}  // namespace
+
+// 1 MB is the number a client states for `get`; the balancer routes it on and the service's step
+// keeps the op name, so every node on the way sees a request of exactly 1 MB = 1e6 B (decimal:
+// 1 MB = 1000 KB, as core::parse_size reads it).
+TEST_CASE("a request keeps its size through a balancer and a step with the same op", "[graph]") {
+  const auto built = Graph::build(
+      sized_chain(simsys::Bytes{1e6}, Step{.to = "store", .op = "get"}, default_blob_store()));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  for (const auto* node : {"lb", "svc", "store"}) {
+    CAPTURE(node);
+    const auto size = request_bytes_at(*built, node, "get");
+    REQUIRE(size.has_value());
+    REQUIRE_THAT(*size, WithinRel(1e6, 1e-12));
+  }
+}
+
+// A step that renames the op (get -> fetch) starts a new request whose size the client never
+// stated, so it is unsized. A request-counting node (a plain service) never needs a size, so the
+// scenario builds; the empty optional says so.
+TEST_CASE("a step that renames the op leaves the request unsized unless the step states a size",
+          "[graph]") {
+  SECTION("unsized") {
+    const auto built = Graph::build(
+        sized_chain(simsys::Bytes{1e6}, Step{.to = "store", .op = "fetch"}, service("store")));
+    INFO((built ? "" : built.error().message));
+    REQUIRE(built.has_value());
+    REQUIRE_FALSE(request_bytes_at(*built, "store", "fetch").has_value());
+    // The incoming op `get` still has its 1 MB at the service that renamed it.
+    REQUIRE_THAT(bytes_required(*built, "svc", "get"), WithinRel(1e6, 1e-12));
+  }
+  SECTION("sized by the step") {
+    const auto built = Graph::build(sized_chain(
+        simsys::Bytes{1e6}, Step{.to = "store", .op = "fetch", .size = simsys::Bytes{2e6}},
+        service("store")));
+    INFO((built ? "" : built.error().message));
+    REQUIRE(built.has_value());
+    const auto size = request_bytes_at(*built, "store", "fetch");  // 2 MB = 2e6 B
+    REQUIRE(size.has_value());
+    REQUIRE_THAT(*size, WithinRel(2e6, 1e-12));
+  }
+}
+
+// The size is a property of the request, so a client that states no size for an op leaves it
+// unsized all the way, and a request-counting node downstream is no error.
+TEST_CASE("an unsized op reaching a request-counting service builds and has no size", "[graph]") {
+  const auto built =
+      Graph::build(sized_chain(std::nullopt, Step{.to = "store", .op = "get"}, service("store")));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE_FALSE(request_bytes_at(*built, "store", "get").has_value());
+}
+
+// A limiter forwards by link, like a balancer: the op, and so the size, passes through it.
+TEST_CASE("a request keeps its size through a rate limiter's route", "[graph]") {
+  auto s = behind_limiter(limiter_of(simsys::model::LimiterAlgorithm::token_bucket, 50));
+  s.nodes[0].workload->sizes = {{"call", simsys::Bytes{2e3}}};  // 2 KB = 2000 B
+  const auto built = Graph::build(s);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto size = request_bytes_at(*built, "api", "call");
+  REQUIRE(size.has_value());
+  REQUIRE_THAT(*size, WithinRel(2e3, 1e-12));
+}
+
+// A cache forwards what it does not hold to its backend under the same op: the read miss under
+// read_through, the write under write_through (ch. 1's cache strategies). Same op, same bytes.
+TEST_CASE("a cache forwards a request to its backend with the size it arrived with", "[graph]") {
+  const auto forwarding = [](CacheStrategy strategy, std::string op, simsys::Bytes size) {
+    Scenario s{.name = "forwarding", .version = 1, .duration = 1min};
+    s.nodes = {sized_client("u", op, size), cache("cache", 0.8, strategy, "db"), service("db")};
+    s.links = {LinkSpec{.from = "u", .to = "cache"}, LinkSpec{.from = "cache", .to = "db"}};
+    return s;
+  };
+  SECTION("a read_through cache's miss") {
+    const auto built = Graph::build(forwarding(CacheStrategy::read_through, "read", {1e6}));
+    INFO((built ? "" : built.error().message));
+    REQUIRE(built.has_value());
+    REQUIRE_THAT(bytes_required(*built, "db", "read"), WithinRel(1e6, 1e-12));
+  }
+  SECTION("a write_through cache's write") {
+    const auto built = Graph::build(forwarding(CacheStrategy::write_through, "write", {2e3}));
+    INFO((built ? "" : built.error().message));
+    REQUIRE(built.has_value());
+    REQUIRE_THAT(bytes_required(*built, "db", "write"), WithinRel(2e3, 1e-12));
+  }
+}
+
+// A CDN is the read_through shape of a cache (plan 2b refinement 4): on a miss it fetches the
+// object from its origin. The origin is asked for the same stream, so it serves 50 MB = 5e7 B
+// per miss, and both the byte-sized CDN (capacity 100GB/s) and its blob-store origin know it.
+TEST_CASE("a cdn's origin receives its reads' size", "[graph]") {
+  NodeSpec cdn{.id = "cdn",
+               .type = NodeType::cdn,
+               .byte_capacity = simsys::ByteRate{100e9},
+               .hit_ratio = HitRatio{.fixed = 0.95}};
+  cdn.origin = "store";
+  Scenario s{.name = "cdn-sizes", .version = 1, .duration = 1min};
+  s.nodes = {sized_client("u", "stream", simsys::Bytes{50e6}), std::move(cdn),
+             default_blob_store()};
+  s.links = {LinkSpec{.from = "u", .to = "cdn"}, LinkSpec{.from = "cdn", .to = "store"}};
+  const auto built = Graph::build(s);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE_THAT(bytes_required(*built, "cdn", "stream"), WithinRel(5e7, 1e-12));
+  REQUIRE_THAT(bytes_required(*built, "store", "stream"), WithinRel(5e7, 1e-12));
+}
+
+namespace {
+// a and b (each sending `get` at its own size, none when empty) -> store (the given node).
+Scenario two_clients_one_store(std::optional<simsys::Bytes> a, std::optional<simsys::Bytes> b,
+                               NodeSpec store = default_blob_store()) {
+  Scenario s{.name = "two-senders", .version = 1, .duration = 1min};
+  s.nodes = {sized_client("a", "get", a), sized_client("b", "get", b), std::move(store)};
+  s.links = {LinkSpec{.from = "a", .to = "store"}, LinkSpec{.from = "b", .to = "store"}};
+  return s;
+}
+}  // namespace
+
+// Two clients may share a (node, op) only if they agree on its size: the byte-sized node counts
+// one number of megabytes per request, and a second size would make that number a guess.
+TEST_CASE("two clients sending one op at different sizes into a byte-sized store is an error",
+          "[graph]") {
+  const auto built = Graph::build(two_clients_one_store(simsys::Bytes{1e6}, simsys::Bytes{2e6}));
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'store': op 'get' arrives with two sizes, 1MB from 'a' and 2MB from 'b'");
+}
+
+TEST_CASE("two clients sending one op at the same size agree", "[graph]") {
+  const auto built = Graph::build(two_clients_one_store(simsys::Bytes{1e6}, simsys::Bytes{1e6}));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE_THAT(bytes_required(*built, "store", "get"), WithinRel(1e6, 1e-12));
+}
+
+// The senders in the message are whoever sent the request to the node, not always a client:
+// here two services each write to the store, each stating its own size on the step.
+TEST_CASE("two services whose steps state different sizes for one op name both senders",
+          "[graph]") {
+  Scenario s{.name = "two-steps", .version = 1, .duration = 1min};
+  s.nodes = {
+      sized_client("u", "go", std::nullopt),
+      service("a", {{"go", {Step{.to = "store", .op = "write", .size = simsys::Bytes{1e6}}}}}),
+      service("b", {{"go", {Step{.to = "store", .op = "write", .size = simsys::Bytes{2e6}}}}}),
+      default_blob_store()};
+  s.links = {LinkSpec{.from = "u", .to = "a"}, LinkSpec{.from = "u", .to = "b"},
+             LinkSpec{.from = "a", .to = "store"}, LinkSpec{.from = "b", .to = "store"}};
+  const auto built = Graph::build(s);
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'store': op 'write' arrives with two sizes, 1MB from 'a' and 2MB from 'b'");
+}
+
+// The blob store's capacity is a byte rate (spec section 6: 500 MB/s), so it counts megabytes
+// and every request it serves needs one. The message says where the capacity came from, and what
+// to add: a size on the step that sent the request, or on the client.
+TEST_CASE("an unsized op reaching a byte-sized store is an error that says where to add the size",
+          "[graph]") {
+  const std::string advice = "has no size: add size: to the step or sizes: to the client";
+  SECTION("sent by a service's renaming step") {
+    const auto built = Graph::build(
+        sized_chain(simsys::Bytes{1e6}, Step{.to = "store", .op = "fetch"}, default_blob_store()));
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message ==
+            "node 'store' counts bytes (capacity 500MB/s, default), but op 'fetch' from 'svc' " +
+                advice);
+  }
+  SECTION("sent by a client that states no size") {
+    const auto built = Graph::build(two_clients_one_store(std::nullopt, std::nullopt));
+    REQUIRE_FALSE(built.has_value());
+    // Two senders lack the size; the first in scenario order is named.
+    REQUIRE(built.error().message ==
+            "node 'store' counts bytes (capacity 500MB/s, default), but op 'get' from 'a' " +
+                advice);
+  }
+}
+
+// The same node, with the step stating the size: the scenario builds, and the step's 2 MB is the
+// size of `fetch` at the store (the incoming `get` size is not inherited by a renamed op).
+TEST_CASE("a step's size makes a renamed op acceptable to a byte-sized store", "[graph]") {
+  const auto built = Graph::build(sized_chain(
+      simsys::Bytes{1e6}, Step{.to = "store", .op = "fetch", .size = simsys::Bytes{2e6}},
+      default_blob_store()));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE_THAT(bytes_required(*built, "store", "fetch"), WithinRel(2e6, 1e-12));
+}

@@ -157,6 +157,46 @@ TEST_CASE("a byte capacity resolves to objects per second and counts as a scenar
   REQUIRE(r.value.per_second == Approx(200e6 / simsys::defaults::blob_object_bytes));
 }
 
+// Plan 2c refinement 2: a node is byte-sized when its capacity is a byte rate, and then counts
+// megabytes. Three ways to get there: a stated `capacity: 100GB/s` (byte_capacity, on a CDN or
+// a blob store), or a blob store's type default, spec section 6's 500 MB/s. A capacity stated
+// in requests (`capacity: 5k/s`) is a request count, whatever the type; so is a type whose
+// default is a request rate (a CDN without a capacity, every service).
+TEST_CASE("a blob store with no stated capacity is byte-sized by its type's default",
+          "[defaults]") {
+  REQUIRE(simsys::defaults::is_byte_sized(NodeSpec{.id = "blobs", .type = NodeType::blob_store}));
+}
+
+TEST_CASE("a cdn is byte-sized when its capacity is a byte rate", "[defaults]") {
+  NodeSpec cdn{.id = "cdn", .type = NodeType::cdn};
+  cdn.byte_capacity = simsys::ByteRate{100e9};
+  REQUIRE(simsys::defaults::is_byte_sized(cdn));
+}
+
+TEST_CASE("a node whose capacity counts requests is not byte-sized", "[defaults]") {
+  SECTION("a cdn with a request capacity") {
+    REQUIRE_FALSE(simsys::defaults::is_byte_sized(
+        NodeSpec{.id = "cdn", .type = NodeType::cdn, .capacity = Rate{100'000}}));
+  }
+  SECTION("a cdn with no capacity: its type default is a request rate") {
+    REQUIRE_FALSE(simsys::defaults::is_byte_sized(NodeSpec{.id = "cdn", .type = NodeType::cdn}));
+  }
+  SECTION("a blob store whose capacity is stated in requests") {
+    REQUIRE_FALSE(simsys::defaults::is_byte_sized(
+        NodeSpec{.id = "blobs", .type = NodeType::blob_store, .capacity = Rate{500}}));
+  }
+  SECTION("a service") {
+    REQUIRE_FALSE(
+        simsys::defaults::is_byte_sized(NodeSpec{.id = "api", .type = NodeType::service}));
+  }
+}
+
+// The unit of a byte-sized node's capacity is one megabyte (decimal, as every size in the
+// project): 500 MB/s is 500 units/s, and a 50 MB stream costs 50 units.
+TEST_CASE("a byte-sized node counts megabytes: the byte unit is 1e6 bytes", "[defaults]") {
+  STATIC_REQUIRE(simsys::defaults::byte_unit == 1e6);
+}
+
 TEST_CASE("an out-of-range node type is a programmer error", "[defaults]") {
   const auto bogus = static_cast<NodeType>(200);
   REQUIRE_THROWS_AS(simsys::defaults::for_type(bogus), std::invalid_argument);

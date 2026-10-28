@@ -74,7 +74,10 @@ nodes:
     workers: 400
     cost: 60s                                  # per 300 MB video
     then:
-      - {to: transcoded_store, op: write, factor: 4}     # 4 output resolutions
+      # size: 50MB is chosen, not the book's: one rendition is the size of one stream (sizes.stream
+      # above), since a stream is one rendition watched. The write renames the op, so the 300 MB
+      # upload's size does not carry over and the byte-sized store needs this one.
+      - {to: transcoded_store, op: write, factor: 4, size: 50MB}     # 4 output resolutions
       - {to: completion_q, op: publish}
 
   transcoded_store: {type: blob_store, dc: us-east, capacity: 10GB/s}

@@ -62,7 +62,9 @@ nodes:
     consumes: query_log_q
     workers: 4
     cost: 2ms
-    then: [{to: aggregated_store, op: write}]
+    # size: 1KB is chosen, not the book's: one aggregated row (a query string, its count and a
+    # timestamp). The write renames the op `publish`, so the byte-sized store needs a size here.
+    then: [{to: aggregated_store, op: write, size: 1KB}]
 
   aggregated_store: {type: blob_store, capacity: 100MB/s}
 
