@@ -1441,3 +1441,53 @@ TEST_CASE("explain checks an id generator against its replicas' total capacity",
   CAPTURE(text);
   REQUIRE(check_line(text, "ids").contains("peak offered 10/s vs 12.29M/s total capacity"));
 }
+
+// ---- Request sizes on byte-sized nodes (plan 2c refinement 1, Task 2) ----
+
+namespace {
+// u (sending `stream` at 1k/s, each request `stream_size` long) -> cdn (fixed hit ratio 0.95,
+// the given capacity) -> origin (a service of 5k/s, which counts requests).
+Scenario sized_cdn(simsys::Bytes stream_size, std::optional<simsys::ByteRate> bytes,
+                   std::optional<Rate> requests) {
+  Scenario s{.name = "sized-cdn", .version = 1, .duration = 1min};
+  NodeSpec cdn{.id = "cdn_us",
+               .type = NodeType::cdn,
+               .capacity = requests,
+               .byte_capacity = bytes,
+               .hit_ratio = simsys::model::HitRatio{.fixed = 0.95}};
+  cdn.origin = "origin";
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{1000}},
+                                           .op_shares = {{"stream", 1.0}},
+                                           .sizes = {{"stream", stream_size}}}},
+             std::move(cdn),
+             NodeSpec{.id = "origin", .type = NodeType::service, .capacity = Rate{5000}}};
+  s.links = {LinkSpec{.from = "u", .to = "cdn_us"}, LinkSpec{.from = "cdn_us", .to = "origin"}};
+  return s;
+}
+}  // namespace
+
+// A byte-sized node counts megabytes, so the size of each op it serves is the number behind its
+// capacity: explain prints it, 50 MB = 5e7 B written in the scenario's own grammar.
+TEST_CASE("explain prints the sizes of the ops a byte-sized node serves", "[report]") {
+  const auto text = explain_of(sized_cdn(simsys::Bytes{50e6}, simsys::ByteRate{100e9}, {}));
+  CAPTURE(text);
+  REQUIRE(node_line(text, "cdn_us").contains("sizes: stream 50MB"));
+}
+
+// Nothing to print where requests are counted: the sizes would be a number the node never uses.
+TEST_CASE("explain prints no sizes on a node that counts requests", "[report]") {
+  SECTION("a cdn with a request capacity") {
+    const auto text = explain_of(sized_cdn(simsys::Bytes{50e6}, {}, Rate{100'000}));
+    CAPTURE(text);
+    REQUIRE_FALSE(node_line(text, "cdn_us").empty());
+    REQUIRE_FALSE(node_line(text, "cdn_us").contains("sizes:"));
+  }
+  SECTION("the service behind a byte-sized cdn") {
+    const auto text = explain_of(sized_cdn(simsys::Bytes{50e6}, simsys::ByteRate{100e9}, {}));
+    CAPTURE(text);
+    REQUIRE_FALSE(node_line(text, "origin").empty());
+    REQUIRE_FALSE(node_line(text, "origin").contains("sizes:"));
+  }
+}

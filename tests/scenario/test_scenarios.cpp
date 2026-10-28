@@ -20,6 +20,7 @@
 // global module fragment.
 import simsys.config;
 import simsys.core;
+import simsys.defaults;
 import simsys.engine;
 import simsys.graph;
 import simsys.model;
@@ -601,4 +602,77 @@ TEST_CASE("every link bandwidth a shipped scenario states is a positive byte rat
       CHECK(link.bandwidth->bytes_per_second > 0.0);
     }
   }
+}
+
+// ---- Request sizes (plan 2c refinement 1, Task 2) ----
+//
+// A byte-sized node counts megabytes, so the graph refuses a scenario in which an op reaches one
+// without a size (Graph::build). Every shipped scenario builds, so every op that reaches one of
+// its byte-sized nodes has a size: the scenarios say so with `sizes:` on a client or `size:` on
+// a step that renames the op (youtube's transcoders, google-drive's block servers and backup
+// workers, search-autocomplete's aggregators, web-crawler's parser).
+
+TEST_CASE("every op that reaches a byte-sized node of a shipped scenario has a size",
+          "[scenario]") {
+  std::size_t byte_sized_nodes = 0;
+  for (const auto& file : scenario_files()) {
+    CAPTURE(file);
+    const auto g = build_or_fail(load_or_fail(file));
+    for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+      if (!simsys::defaults::is_byte_sized(g.nodes()[node].spec)) continue;
+      ++byte_sized_nodes;
+      for (const auto& op : g.arriving_ops(node)) {
+        CAPTURE(g.nodes()[node].spec.id, op);
+        CHECK(g.request_bytes(node, op).has_value());
+      }
+    }
+  }
+  // youtube alone has four (both CDNs and both stores): the loop is not vacuous.
+  CHECK(byte_sized_nodes >= 4);
+}
+
+namespace {
+// The size, in bytes, of `op` at node `id` of `g`; the test fails when there is none.
+double request_bytes_of(const simsys::graph::Graph& g, std::string_view id, std::string_view op) {
+  const auto size = g.request_bytes(*g.index_of(id), op);
+  if (!size) FAIL("no size for op '" << op << "' at node '" << id << "'");
+  return size->count;
+}
+}  // namespace
+
+// Ch. 14's numbers as the scenario states them (`sizes:` on the viewers, `size:` on the
+// transcoders' step):
+//  - a stream is 50 MB = 5e7 B, and both CDNs fetch their misses from transcoded_store as the same
+//    op, so the store sees one size (two CDNs agreeing, no conflict) of 5e7 B;
+//  - an upload is 300 MB = 3e8 B and goes straight from the viewers to original_store;
+//  - the transcoders write one rendition per output, which the scenario sizes like a stream,
+//    50 MB = 5e7 B, since the write renames the op and would otherwise be unsized.
+TEST_CASE("book/youtube sizes its streams, uploads and renditions at the byte-sized stores",
+          "[scenario]") {
+  const auto g = build_or_fail(load_scenario("/book/youtube/scenario.yaml"));
+  REQUIRE_THAT(request_bytes_of(g, "cdn_us", "stream"), Catch::Matchers::WithinRel(5e7, 1e-12));
+  REQUIRE_THAT(request_bytes_of(g, "cdn_eu", "stream"), Catch::Matchers::WithinRel(5e7, 1e-12));
+  REQUIRE_THAT(request_bytes_of(g, "transcoded_store", "stream"),
+               Catch::Matchers::WithinRel(5e7, 1e-12));
+  REQUIRE_THAT(request_bytes_of(g, "original_store", "upload"),
+               Catch::Matchers::WithinRel(3e8, 1e-12));
+  REQUIRE_THAT(request_bytes_of(g, "transcoded_store", "write"),
+               Catch::Matchers::WithinRel(5e7, 1e-12));
+}
+
+namespace {
+// The line that describes node `id` in explain's `nodes:` block: the first line that starts with
+// the id (the nodes come before the links and the checks).
+std::string node_line_of(const std::string& explain_text, const std::string& id) {
+  const auto at = explain_text.find("\n  " + id + " ");
+  REQUIRE(at != std::string::npos);
+  return explain_text.substr(at + 1, explain_text.find('\n', at + 1) - at - 1);
+}
+}  // namespace
+
+TEST_CASE("explain on book/youtube prints the stream size on the byte-sized cdn", "[scenario]") {
+  const auto g = build_or_fail(load_scenario("/book/youtube/scenario.yaml"));
+  const auto text = simsys::report::render_explain(g);
+  CAPTURE(text);
+  REQUIRE(node_line_of(text, "cdn_us").contains("sizes: stream 50MB"));
 }

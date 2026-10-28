@@ -56,7 +56,9 @@ nodes:
     ops:
       parse:
         - {to: content_seen, op: check}
-        - {to: content_store, op: write, on: miss}      # only new content is stored
+        # size: 500KB is the book's page (ch. 9: "500 KB per page", the header above). The write
+        # renames the op parse, so the byte-sized store needs a size here.
+        - {to: content_store, op: write, on: miss, size: 500KB}      # only new content is stored
         - {to: link_extractor, op: extract, on: miss}
 
   content_seen:                               # "content seen?" — hash lookup, ~30% duplicates
