@@ -3,7 +3,6 @@
 module;
 #include <yaml-cpp/yaml.h>
 
-#include <algorithm>
 #include <array>
 #include <charconv>
 #include <expected>
@@ -23,6 +22,7 @@ module;
 module simsys.config;
 
 import simsys.core;
+import simsys.model;
 
 namespace simsys::config::detail {
 
@@ -39,7 +39,7 @@ using NodeIds = std::set<std::string, std::less<>>;
 // What the first pass over `nodes` produces: the declarations in document order (for the
 // Scenario) and their ids as a set (for the duplicate and reference checks).
 struct Declarations {
-  std::vector<NodeDecl> nodes;
+  std::vector<model::NodeSpec> nodes;
   NodeIds ids;
 };
 
@@ -62,12 +62,6 @@ ConfigError error_at_mark(const std::string& file, const YAML::Mark& mark, std::
 
 ConfigError error_at(const std::string& file, const YAML::Node& node, std::string message) {
   return error_at_mark(file, node.Mark(), std::move(message));
-}
-
-bool is_known_type(std::string_view type) {
-  // C++20 std::ranges::find: takes the container itself instead of a begin/end pair,
-  // so the two iterators can never come from different containers.
-  return std::ranges::find(known_types, type) != known_types.end();
 }
 
 bool is_declared(const NodeIds& ids, std::string_view id) {
@@ -179,9 +173,9 @@ CheckResult check_capacity(const std::string& file, const YAML::Node& body) {
   });
 }
 
-std::expected<NodeDecl, ConfigError> read_node_declaration(const std::string& file,
-                                                           const YAML::Node& id,
-                                                           const YAML::Node& body) {
+std::expected<model::NodeSpec, ConfigError> read_node_declaration(const std::string& file,
+                                                                  const YAML::Node& id,
+                                                                  const YAML::Node& body) {
   if (!body.IsMap()) {
     return std::unexpected(
         error_at(file, body, std::format("node '{}' must be a map", id.Scalar())));
@@ -189,13 +183,16 @@ std::expected<NodeDecl, ConfigError> read_node_declaration(const std::string& fi
   if (!body["type"]) {
     return std::unexpected(error_at(file, id, std::format("node '{}' needs a type", id.Scalar())));
   }
-  auto type = scalar_value(file, body, "type");
-  if (!type) return std::unexpected(type.error());
-  if (!is_known_type(*type)) {
+  auto type_name = scalar_value(file, body, "type");
+  if (!type_name) return std::unexpected(type_name.error());
+  const auto type = model::parse_node_type(*type_name);
+  if (!type) {
     return std::unexpected(
-        error_at(file, body["type"], std::format("unknown node type '{}'", *type)));
+        error_at(file, body["type"], std::format("unknown node type '{}'", *type_name)));
   }
-  return NodeDecl{id.Scalar(), std::move(*type)};
+  // The other NodeSpec members keep the schema defaults declared in simsys.model; the
+  // typed keys (replicas, capacity, ops, ...) are read in later steps.
+  return model::NodeSpec{.id = id.Scalar(), .type = *type};
 }
 
 // The id goes into the set first, so a repeated id is reported before its body is read.
@@ -332,8 +329,8 @@ CheckResult check_link_end(const std::string& file, const YAML::Node& link, std:
   return check_reference(file, link, end, "link", ids);
 }
 
-std::expected<LinkDecl, ConfigError> read_link(const std::string& file, const YAML::Node& link,
-                                               const NodeIds& ids) {
+std::expected<model::LinkSpec, ConfigError> read_link(const std::string& file,
+                                                      const YAML::Node& link, const NodeIds& ids) {
   if (!link.IsMap()) return std::unexpected(error_at(file, link, "link must be a map"));
   if (auto from = check_link_end(file, link, "from", ids); !from) {
     return std::unexpected(from.error());
@@ -342,15 +339,15 @@ std::expected<LinkDecl, ConfigError> read_link(const std::string& file, const YA
   if (auto latency = check_optional_duration(file, link, "latency"); !latency) {
     return std::unexpected(latency.error());
   }
-  return LinkDecl{link["from"].Scalar(), link["to"].Scalar()};
+  return model::LinkSpec{.from = link["from"].Scalar(), .to = link["to"].Scalar()};
 }
 
-std::expected<std::vector<LinkDecl>, ConfigError> collect_links(const std::string& file,
-                                                                const YAML::Node& links,
-                                                                const NodeIds& ids) {
+std::expected<std::vector<model::LinkSpec>, ConfigError> collect_links(const std::string& file,
+                                                                       const YAML::Node& links,
+                                                                       const NodeIds& ids) {
   // A bare `links:` parses as null, which is not a list either.
   if (!links.IsSequence()) return std::unexpected(error_at(file, links, "links must be a list"));
-  std::vector<LinkDecl> collected;
+  std::vector<model::LinkSpec> collected;
   for (const auto& link : links) {
     auto read = read_link(file, link, ids);
     if (!read) return std::unexpected(read.error());
@@ -362,7 +359,8 @@ std::expected<std::vector<LinkDecl>, ConfigError> collect_links(const std::strin
 // Pattern: Validation pipeline — a sequence of independent checks run in order; the first
 // error stops the run so the user sees one precise message. Each check returns
 // std::expected<T, ConfigError> (T is void for a pure check, the parsed value otherwise).
-std::expected<Scenario, ConfigError> validate(const std::string& file, const YAML::Node& root) {
+std::expected<model::Scenario, ConfigError> validate(const std::string& file,
+                                                     const YAML::Node& root) {
   if (auto checked = check_top_level(file, root); !checked) return std::unexpected(checked.error());
   auto name = scalar_value(file, root, "name");
   if (!name) return std::unexpected(name.error());
@@ -379,15 +377,18 @@ std::expected<Scenario, ConfigError> validate(const std::string& file, const YAM
   }
   auto links = collect_links(file, root["links"], declared->ids);
   if (!links) return std::unexpected(links.error());
-  return Scenario{std::move(*name), root["version"].as<int>(), *duration,
-                  std::move(declared->nodes), std::move(*links)};
+  return model::Scenario{.name = std::move(*name),
+                         .version = root["version"].as<int>(),
+                         .duration = *duration,
+                         .nodes = std::move(declared->nodes),
+                         .links = std::move(*links)};
 }
 
 }  // namespace simsys::config::detail
 
 namespace simsys::config {
 
-std::expected<Scenario, ConfigError> load(const std::string& file) {
+std::expected<model::Scenario, ConfigError> load(const std::string& file) {
   // The only exception boundary: yaml-cpp reports syntax errors (LoadFile) by throwing,
   // and so does any shape mistake the checks above do not pre-empt (subscripting a
   // scalar, reading a missing node); we return std::expected, so callers never need a
