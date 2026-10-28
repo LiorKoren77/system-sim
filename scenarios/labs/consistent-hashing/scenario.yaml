@@ -27,7 +27,7 @@ nodes:
     type: cache
     replicas: 4
     eviction: lru
-    keys: 2M                                    # per server
+    keys: 2M                                    # per server: the ring splits the keys, 8M in total
     hit_ratio: che
     strategy: read_through                      # a miss reads db itself
     backend: db
