@@ -346,6 +346,11 @@ TEST_CASE("book/youtube validates and explains, and the engine refuses it at tra
   REQUIRE(cdn_us->byte_capacity == simsys::ByteRate{100e9});
   REQUIRE(cdn_us->hit_ratio.has_value());
   REQUIRE(cdn_us->hit_ratio->che);
+  // original_store counts the uploads as writes (review of plan 2c Task 3, I2): a 300 MB upload is
+  // acknowledged at its last byte, 300 MB x 40 ms = 12 s after its wait, not at its first MB.
+  const auto original = std::ranges::find(s->nodes, "original_store", &simsys::model::NodeSpec::id);
+  REQUIRE(original != s->nodes.end());
+  REQUIRE(original->write_ops == std::vector<std::string>{"upload"});
   const auto g = simsys::graph::Graph::build(*s);
   if (!g) FAIL(g.error().message);
   REQUIRE_THAT(*g->hit_ratio(*g->index_of("cdn_us")), Catch::Matchers::WithinAbs(0.642, 5e-4));
@@ -411,8 +416,7 @@ TEST_CASE("byte-sized capacities are checked in MB per second", "[scenario]") {
   REQUIRE(eu.contains("(14.1%, green)"));
   // original_store: 9.6 uploads/s x 300 MB = 2.88k MB/s of 5GB/s = 5k MB/s: 57.6 %.
   const auto original = check_line_of(youtube_text, "original_store");
-  REQUIRE(original.contains("peak offered 2.88k MB/s"));
-  REQUIRE(original.contains("vs 5k MB/s"));
+  REQUIRE(original.contains("peak offered 2.88k MB/s (9.6/s) vs 5k MB/s"));
   REQUIRE(original.contains("(57.6%, green)"));
   // transcoded_store: only the cdns' misses reach it on paper, 157.82 streams/s (printed to four
   // digits, 157.8) x 50 MB = 7.891k MB/s of 10GB/s = 10k MB/s: at least 78.9 %, a lower bound

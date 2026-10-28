@@ -884,6 +884,24 @@ links: []
   CHECK(s->nodes[0].byte_capacity == simsys::ByteRate{500e6});
 }
 
+// A blob store answers a write at its last byte and a read at its first megabyte (review of plan
+// 2c Task 3, I2), so which ops are writes matters there too: `write_ops` is a blob store's key, as
+// a cache's, a CDN's and a database's, stored as written (youtube's original_store lists `upload`).
+TEST_CASE("a blob store states which ops are writes with write_ops") {
+  const auto path = write_temp("simsys_blob_write_ops.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  b: {type: blob_store, capacity: 5GB/s, write_ops: [upload]}
+links: []
+)");
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->nodes[0].write_ops == std::vector<std::string>{"upload"});
+}
+
 TEST_CASE("advanced numeric keys are range-checked") {
   SECTION("concurrency of zero") {
     require_rejected("simsys_bad_concurrency.yaml", R"(
@@ -3294,7 +3312,8 @@ TEST_CASE("a cdn's hit ratio is fixed or che, and its ttl is accepted") {
 }
 
 // A che hit ratio needs the CDN's size, as a cache's does: `keys` on a cdn is how many objects
-// its edge holds (not bytes: byte flows are phase 2c), the Che approximation's cache size.
+// its edge holds (not bytes: what it moves in bytes is a byte `capacity`, which makes it count
+// megabytes), the Che approximation's cache size.
 TEST_CASE("a cdn states its size in keys for a che hit ratio") {
   const auto s =
       load_cdn("simsys_cdn_keys.yaml", "hit_ratio: che, keys: 100k, ttl: 24h, origin: origin");

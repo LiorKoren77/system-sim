@@ -1263,8 +1263,9 @@ TEST_CASE("explain's paper load sends the origin the cdn's miss share", "[report
   REQUIRE(check_line(text, "origin").contains("peak offered 50/s"));
 }
 
-// A CDN sized in bytes (`capacity: 100GB/s`) builds and explains; only the engine refuses to run
-// it until phase 2c models byte flows, as it refuses a cache without a hit ratio.
+// A CDN sized in bytes (`capacity: 100GB/s`) builds and explains with its hit ratio and its miss
+// edge, as one sized in requests does; it counts megabytes (plan 2c refinement 2), which the
+// checks below pin.
 TEST_CASE("explain still renders a cdn that has a byte capacity", "[report]") {
   const auto built = simsys::graph::Graph::build(cdn_reported("cdn_us", simsys::ByteRate{100e9}));
   INFO((built ? "" : built.error().message));
@@ -1511,4 +1512,55 @@ TEST_CASE("explain prints a byte-sized node's service time per megabyte", "[repo
   REQUIRE(node_line(text, "origin").contains("service_time=40ms per MB (default)"));
   const auto counting = explain_of(cdn_reported());
   REQUIRE_FALSE(node_line(counting, "cdn").contains("per MB"));
+}
+
+// A byte-sized node's capacity units are megabytes, so its waiting room is too, and its c servers
+// are megabyte slots (Little's law: c = MB/s x the time of one MB; an object holds one slot for its
+// whole transfer, review of plan 2c Task 3, I1). explain labels both: `c=1000 MB slots (implied)`
+// on a 100 GB/s CDN at 10 ms per MB, `c=20 MB slots` on a default blob store (500 MB/s x 40 ms),
+// and `queue_limit=1000 MB (default)`, the generic waiting room of 1000 units read in MB. A node
+// that counts requests keeps its bare numbers.
+TEST_CASE("explain labels a byte-sized node's c and queue_limit in megabytes", "[report]") {
+  auto s = cdn_reported("cdn_us", simsys::ByteRate{100e9});
+  s.nodes[2] = NodeSpec{.id = "origin", .type = NodeType::blob_store};
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  REQUIRE(node_line(text, "cdn_us")
+              .contains("c=1000 MB slots (implied)  queue_limit=1000 MB (default)"));
+  REQUIRE(
+      node_line(text, "origin").contains("c=20 MB slots (implied)  queue_limit=1000 MB (default)"));
+  const auto counting = explain_of(cdn_reported());
+  REQUIRE(node_line(counting, "cdn").contains("c=1000 (implied)  queue_limit=1000 (default)"));
+}
+
+namespace {
+// u (1 request/s of `op`, 300 MB) -> store, a blob store with the given write ops (its type's
+// default, `write`, when none are given).
+Scenario blob_store_reported(const std::string& op,
+                             std::optional<std::vector<std::string>> write_ops = {}) {
+  Scenario s{.name = "blob-report", .version = 1, .duration = 1min};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1}},
+                                    .op_shares = {{op, 1.0}},
+                                    .sizes = {{op, simsys::Bytes{300e6}}}}},
+      NodeSpec{.id = "store", .type = NodeType::blob_store, .write_ops = std::move(write_ops)}};
+  s.links = {LinkSpec{.from = "u", .to = "store"}};
+  return s;
+}
+}  // namespace
+
+// A blob store answers its writes at their last byte and everything else at its first megabyte
+// (review of plan 2c Task 3, I2), so explain says which ops are its writes, as it does for a
+// cache: the scenario's `write_ops`, else the default `write`, with a note when none of them
+// reaches the store (an upload not listed would be answered as a read).
+TEST_CASE("explain lists a blob store's write ops", "[report]") {
+  const auto stated = explain_of(blob_store_reported("upload", std::vector<std::string>{"upload"}));
+  CAPTURE(stated);
+  REQUIRE(node_line(stated, "store").contains("write_ops=upload"));
+  REQUIRE_FALSE(node_line(stated, "store").contains("never arrives"));
+  const auto defaulted = explain_of(blob_store_reported("upload"));
+  CAPTURE(defaulted);
+  REQUIRE(node_line(defaulted, "store").contains("write_ops=write (never arrives)"));
 }
