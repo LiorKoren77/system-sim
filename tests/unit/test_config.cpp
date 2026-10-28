@@ -3,6 +3,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -3058,5 +3059,73 @@ TEST_CASE(
     require_rejected("simsys_cache_eviction_magic.yaml",
                      cache_scenario("hit_ratio: {fixed: 0.5}, eviction: magic"),
                      "node 'c': eviction must be lru, lfu, fifo or ttl");
+  }
+}
+
+// Plan 2b, Task 4 / refinement 3: a SQL database is a primary plus read replicas; `shards`
+// splits the data, `pool` is the connection pool (the concurrency of each queue) and
+// `replication_lag` how far behind the replicas run. All four are typed at load time.
+TEST_CASE("a sql database's shards, pool, replication lag and write ops are typed and checked") {
+  const auto db_scenario = [](std::string_view body) {
+    return scenario_with("  db: {type: sql_db, " + std::string{body} + "}\n");
+  };
+  const auto load_accepted = [](std::string_view file_name, const std::string& yaml) {
+    const auto path = write_temp(file_name, yaml);
+    auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    return *s;
+  };
+  SECTION("every key loads as given") {
+    const auto s =
+        load_accepted("simsys_sql_all.yaml",
+                      db_scenario("replicas: 3, shards: 4, pool: 32, replication_lag: 50ms, "
+                                  "write_ops: [write, insert]"));
+    const auto& db = s.nodes[0];
+    REQUIRE(db.type == simsys::model::NodeType::sql_db);
+    REQUIRE(db.replicas == 3);
+    REQUIRE(db.shards == 4);
+    REQUIRE(db.pool == 32);
+    REQUIRE(db.replication_lag == 50ms);
+    REQUIRE(db.write_ops == std::vector<std::string>{"write", "insert"});
+  }
+  SECTION("a database with none of them leaves the optional keys absent") {
+    const auto s = load_accepted("simsys_sql_defaults.yaml", db_scenario("replicas: 2"));
+    const auto& db = s.nodes[0];
+    REQUIRE_FALSE(db.shards.has_value());
+    REQUIRE_FALSE(db.pool.has_value());
+    REQUIRE_FALSE(db.replication_lag.has_value());
+  }
+  // A database writes by default through the four SQL statements that change data; every
+  // other op (select, read, ...) is a read served by the replicas. Compared sorted: the
+  // order of a default is not part of the contract.
+  SECTION("the default write ops are write, insert, update and delete") {
+    const auto s = load_accepted("simsys_sql_write_ops_default.yaml", db_scenario("replicas: 2"));
+    auto write_ops = s.nodes[0].write_ops;
+    std::ranges::sort(write_ops);
+    REQUIRE(write_ops == std::vector<std::string>{"delete", "insert", "update", "write"});
+  }
+  SECTION("shards of zero") {
+    require_rejected("simsys_sql_shards_zero.yaml", db_scenario("shards: 0"),
+                     "node 'db': shards must be a positive integer");
+  }
+  SECTION("a pool of zero") {
+    require_rejected("simsys_sql_pool_zero.yaml", db_scenario("pool: 0"),
+                     "node 'db': pool must be a positive integer");
+  }
+  SECTION("a pool above 100000: Erlang C costs O(c) per node per step") {
+    require_rejected("simsys_sql_pool_too_big.yaml", db_scenario("pool: 200000"),
+                     "node 'db': pool must be at most 100000");
+  }
+  SECTION("a negative replication lag is refused with the duration parser's message") {
+    require_rejected("simsys_sql_lag_negative.yaml", db_scenario("replication_lag: -1ms"),
+                     "node 'db': replication_lag: expected a non-negative finite number");
+  }
+  // `pool` is sugar for `advanced.concurrency` (the connection pool is the number of
+  // requests the database serves at once): stating both is a contradiction waiting to happen.
+  SECTION("pool together with advanced.concurrency") {
+    require_rejected("simsys_sql_pool_and_concurrency.yaml",
+                     db_scenario("pool: 8, advanced: {concurrency: 8}"),
+                     "node 'db': pool and advanced.concurrency are the same setting");
   }
 }

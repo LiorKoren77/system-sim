@@ -892,3 +892,75 @@ TEST_CASE("explain writes a key space beyond the G prefix in plain digits", "[re
   CAPTURE(text);
   REQUIRE(text.contains(" (che: uniform over 20000000000000 keys from u)"));
 }
+
+// ---- SQL database: staleness SLO and explain line (plan 2b, Task 4) ----
+
+namespace {
+// u(1000 reads/s + 100 writes/s) -> db: a SQL database of 3 copies (1 primary + 2 replicas),
+// capacity 1000/s per copy, 1 ms service time, a replication lag of 50 ms, zero-latency link.
+// The staleness the node reports is then 50 ms + the primary's write sojourn (about 1.1 ms).
+Scenario replicated_db() {
+  Scenario s{.name = "replicated", .version = 1, .duration = 2s, .warmup = 500ms};
+  NodeSpec db{
+      .id = "db", .type = NodeType::sql_db, .replicas = 3, .capacity = Rate{1000}, .latency = 1ms};
+  db.replication_lag = 50ms;
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{1100}},
+                                           .op_shares = {{"read", 1000.0 / 1100.0},
+                                                         {"write", 100.0 / 1100.0}}}},
+             std::move(db)};
+  s.links = {LinkSpec{.from = "u", .to = "db", .latency = 0s}};
+  return s;
+}
+}  // namespace
+
+// The staleness SLO bounds how old the data a read may return is: the replication lag plus the
+// primary's write sojourn (book ch. 1: replicas lag behind the primary). 50 ms of lag fits a
+// 100 ms bound and breaks a 40 ms one, whatever the write sojourn adds.
+TEST_CASE("the staleness SLO compares the replication lag plus write sojourn with max",
+          "[report]") {
+  auto s = replicated_db();
+  const auto check = [&](simsys::SimTime max) {
+    s.slos = {simsys::model::SloSpec{
+        .metric = simsys::model::SloMetric::staleness, .node = "db", .max = max}};
+    const auto g = *simsys::graph::Graph::build(s);
+    const auto results = simsys::report::evaluate_slos(summarize(s, g), s.slos);
+    REQUIRE(results.size() == 1);
+    return results[0];
+  };
+  SECTION("100 ms passes") {
+    const auto result = check(100ms);
+    REQUIRE(result.status == simsys::report::SloStatus::pass);
+    REQUIRE(result.observed.has_value());
+    REQUIRE(*result.observed > 0.050);
+    REQUIRE(*result.observed < 0.100);
+  }
+  SECTION("40 ms fails") {
+    REQUIRE(check(40ms).status == simsys::report::SloStatus::fail);
+  }
+  SECTION("the JSON carries staleness_s for the database") {
+    s.slos = {};
+    const auto g = *simsys::graph::Graph::build(s);
+    const auto summary = summarize(s, g);
+    const auto json =
+        simsys::report::render_json(summary, simsys::report::evaluate_slos(summary, s.slos));
+    REQUIRE(json.find("\"staleness_s\"") != std::string::npos);
+  }
+}
+
+TEST_CASE("explain prints a sql database as primary plus replicas with shards, lag and pool",
+          "[report]") {
+  auto s = replicated_db();
+  s.nodes[1].shards = 4;
+  s.nodes[1].pool = 32;
+  const auto built = simsys::graph::Graph::build(s);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto text = simsys::report::render_explain(*built);
+  CAPTURE(text);
+  REQUIRE(text.find("primary+2 replicas") != std::string::npos);
+  REQUIRE(text.find("shards=4") != std::string::npos);
+  REQUIRE(text.find("lag=50ms") != std::string::npos);
+  REQUIRE(text.find("pool=32") != std::string::npos);
+}
