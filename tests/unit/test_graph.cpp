@@ -26,6 +26,7 @@ using Catch::Matchers::WithinRel;
 using simsys::Rate;
 using simsys::graph::Graph;
 using simsys::model::Direction;
+using simsys::model::LbPolicy;
 using simsys::model::LinkSpec;
 using simsys::model::NodeSpec;
 using simsys::model::NodeType;
@@ -45,6 +46,9 @@ NodeSpec client(std::string id, Rate base, std::vector<std::pair<std::string, do
 }
 NodeSpec service(std::string id, std::map<std::string, std::vector<Step>> ops = {}) {
   return NodeSpec{.id = std::move(id), .type = NodeType::service, .ops = std::move(ops)};
+}
+NodeSpec load_balancer(std::string id, LbPolicy policy) {
+  return NodeSpec{.id = std::move(id), .type = NodeType::load_balancer, .policy = policy};
 }
 Scenario chain() {  // users -> api -> db
   Scenario s{.name = "chain", .version = 1, .duration = 1min};
@@ -350,4 +354,69 @@ TEST_CASE("a programmatic scenario with a non-positive step is rejected", "[grap
   const auto g = Graph::build(s);
   REQUIRE_FALSE(g.has_value());
   REQUIRE(g.error().message == "step must be positive");
+}
+
+TEST_CASE("a load balancer splits each op across its outgoing links by weight", "[graph]") {
+  Scenario s{.name = "lb", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"get", 1.0}}), load_balancer("lb", LbPolicy::weighted),
+             service("a"), service("b")};
+  s.links = {LinkSpec{.from = "u", .to = "lb"}, LinkSpec{.from = "lb", .to = "a", .weight = 3},
+             LinkSpec{.from = "lb", .to = "b", .weight = 1}};
+  const auto g = *Graph::build(s);
+  // routes(i) is the generalised client_routes(i): any node that only splits flow
+  // (a client or a load balancer) has routes; a service has steps instead.
+  const auto routes = g.routes(*g.index_of("lb"));
+  REQUIRE(routes.size() == 2);
+  REQUIRE_THAT(std::ranges::find(routes, *g.index_of("a"), &simsys::graph::Route::target)->share,
+               WithinRel(0.75, 1e-12));
+  REQUIRE_THAT(std::ranges::find(routes, *g.index_of("b"), &simsys::graph::Route::target)->share,
+               WithinRel(0.25, 1e-12));
+}
+
+TEST_CASE("a load balancer's routes honour link op filters and reject an op no link carries",
+          "[graph]") {
+  Scenario s{.name = "lb", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"get", 0.5}, {"put", 0.5}}),
+             load_balancer("lb", LbPolicy::round_robin), service("a"), service("b")};
+  s.links = {LinkSpec{.from = "u", .to = "lb"},
+             LinkSpec{.from = "lb", .to = "a", .ops = {"get"}},
+             LinkSpec{.from = "lb", .to = "b", .ops = {"get"}}};
+  const auto g = Graph::build(s);
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message == "node 'lb': no link carries op 'put'");
+}
+
+TEST_CASE("least_connections marks its downstream service as pooled", "[graph]") {
+  Scenario s{.name = "lb", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"get", 1.0}}), load_balancer("lb", LbPolicy::least_connections),
+             service("a")};
+  s.nodes[2].replicas = 4;
+  s.links = {LinkSpec{.from = "u", .to = "lb"}, LinkSpec{.from = "lb", .to = "a"}};
+  const auto g = *Graph::build(s);
+  REQUIRE(g.nodes()[*g.index_of("a")].pooled);
+  REQUIRE(g.nodes()[*g.index_of("a")].imbalance == 1.0);
+}
+
+TEST_CASE("consistent_hash gives its downstream an imbalance of one plus one over root vnodes",
+          "[graph]") {
+  Scenario s{.name = "lb", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"get", 1.0}}), load_balancer("lb", LbPolicy::consistent_hash),
+             service("a")};
+  s.nodes[1].vnodes = 100;
+  s.nodes[2].replicas = 4;
+  s.links = {LinkSpec{.from = "u", .to = "lb"}, LinkSpec{.from = "lb", .to = "a"}};
+  const auto g = *Graph::build(s);
+  // 1 + 1/sqrt(100) = 1.1: the hottest of the ring's arcs carries about that much more than
+  // the average (a heuristic: the spread of a hash ring shrinks as 1/sqrt(vnodes)).
+  REQUIRE_THAT(g.nodes()[*g.index_of("a")].imbalance, WithinRel(1.1, 1e-12));
+  REQUIRE_FALSE(g.nodes()[*g.index_of("a")].pooled);
+}
+
+TEST_CASE("a load balancer needs at least one outgoing link", "[graph]") {
+  Scenario s{.name = "lb", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"get", 1.0}}), load_balancer("lb", LbPolicy::round_robin)};
+  s.links = {LinkSpec{.from = "u", .to = "lb"}};
+  const auto g = Graph::build(s);
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message == "node 'lb': a load balancer needs an outgoing link");
 }
