@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <span>
@@ -293,7 +294,8 @@ TEST_CASE("asking a client for an op it does not send is a programmer error", "[
 
 TEST_CASE("a client offers the curve's rate at the step's time", "[behaviours]") {
   Scenario s = two_hop(StepMode::sequential);
-  s.nodes[0].workload->curve.spikes = {simsys::workload::Spike{.at = 1s, .duration = 1s, .factor = 3}};
+  s.nodes[0].workload->curve.spikes = {
+      simsys::workload::Spike{.at = 1s, .duration = 1s, .factor = 3}};
   const auto g = *simsys::graph::Graph::build(s);
   ClientBehaviour c{g, *g.index_of("users"), simsys::behaviours::client_seed(1, 0)};
   REQUIRE_THAT(c.offer(0s).outgoing[0].flow.rate_of("get").per_second, WithinRel(80.0, 1e-12));
@@ -305,7 +307,8 @@ TEST_CASE("noise applies only after a tick and is deterministic per seed", "[beh
   s.nodes[0].workload->noise = simsys::workload::Noise{.sigma = 0.3, .correlation = 5s};
   const auto g = *simsys::graph::Graph::build(s);
   ClientBehaviour a{g, 0, 9}, b{g, 0, 9}, c{g, 0, 10};
-  REQUIRE_THAT(a.offer(0s).outgoing[0].flow.total().per_second, WithinRel(100.0, 1e-12));  // no tick yet
+  REQUIRE_THAT(a.offer(0s).outgoing[0].flow.total().per_second,
+               WithinRel(100.0, 1e-12));  // no tick yet
   a.tick(0s, 100ms);
   b.tick(0s, 100ms);
   c.tick(0s, 100ms);
@@ -318,6 +321,17 @@ TEST_CASE("client_seed separates seeds and clients", "[behaviours]") {
   REQUIRE(client_seed(1, 0) != client_seed(2, 0));
   REQUIRE(client_seed(1, 0) != client_seed(1, 1));
   REQUIRE(client_seed(1, 0) == client_seed(1, 0));
+}
+
+TEST_CASE("client_seed never gives two seed and client pairs the same engine seed",
+          "[behaviours]") {
+  using simsys::behaviours::client_seed;
+  REQUIRE(client_seed(1, 0) != client_seed(0, 1));  // plain seed ^ index would collide here
+  std::vector<std::uint64_t> seeds;
+  for (int seed = -100; seed <= 100; ++seed)
+    for (std::size_t i = 0; i < 64; ++i) seeds.push_back(client_seed(seed, i));
+  std::ranges::sort(seeds);
+  REQUIRE(std::ranges::adjacent_find(seeds) == seeds.end());
 }
 
 TEST_CASE("a service's cost per op comes from its spec and defaults to one", "[behaviours]") {
