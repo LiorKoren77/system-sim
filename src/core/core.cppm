@@ -60,7 +60,9 @@ struct ParseError {
 }  // namespace simsys
 
 // Not exported: importers cannot name anything in simsys::detail. It sits between the
-// two export blocks because it needs ParseError and the parsers below need it.
+// two export blocks because it needs ParseError and the parsers below need it. It has to
+// live outside the export blocks because everything inside an `export namespace` block is
+// exported.
 namespace simsys::detail {
 
 // One row of a unit table: "ms" -> 1e6, "k" -> 1e3, ...
@@ -69,14 +71,16 @@ struct Scale {
   double factor;
 };
 
-// Pattern: table-driven lookup — each grammar (duration units, request-rate prefixes,
-// byte-rate prefixes) is a constant table searched by one function, so adding a unit
-// is a one-line data change instead of another `if` branch.
+// Pattern: Table-driven method (Code Complete) — each grammar (duration units,
+// request-rate prefixes, byte-rate prefixes) is a constant table searched by one
+// function, so adding a unit is a one-line data change instead of another `if` branch.
 constexpr std::array duration_units{Scale{"ns", 1.0}, Scale{"us", 1e3}, Scale{"ms", 1e6},
                                     Scale{"s", 1e9},  Scale{"m", 60e9}, Scale{"h", 3600e9}};
 constexpr std::array rate_prefixes{Scale{"", 1.0}, Scale{"k", 1e3}, Scale{"M", 1e6},
                                    Scale{"G", 1e9}};
-// Capital K, matching how "KB" is written in scenario files.
+// Decimal SI prefixes, not binary: K = 1e3, not 1024. Capital K, matching how "KB" is
+// written in scenario files; lowercase `k` is deliberately rejected for bytes (and
+// capital `K` for request rates), and the error message says which spelling to use.
 constexpr std::array byte_prefixes{Scale{"", 1.0}, Scale{"K", 1e3}, Scale{"M", 1e6},
                                    Scale{"G", 1e9}};
 
@@ -111,6 +115,8 @@ constexpr std::array byte_prefixes{Scale{"", 1.0}, Scale{"K", 1e3}, Scale{"M", 1
   double value{};
   const auto* begin = text.data();
   const auto* end = begin + text.size();
+  // C++17 structured binding: unpacks the from_chars result (end pointer, error code)
+  // into two named variables instead of `result.ptr` / `result.ec`.
   auto [ptr, ec] = std::from_chars(begin, end, value);
   if (ec == std::errc::result_out_of_range) return fail(input, "number out of range");
   if (ec != std::errc{} || ptr == begin) return fail(input, "expected a number");
@@ -144,8 +150,10 @@ split_non_negative_number(std::string_view text, std::string_view input) {
   return fail(input, "unknown duration unit '" + std::string{unit} + "'");
 }
 
-// Rounds to whole nanoseconds, rejecting what SimTime cannot hold: values at or beyond
-// int64 max (llround would overflow) and non-zero values that would round to 0ns.
+// Rounds to whole nanoseconds, half away from zero (std::llround), so "0.5ns" is 1ns.
+// Rejects what SimTime cannot hold: values at or beyond int64 max (llround would
+// overflow). Of the values that round to 0ns, only exact zero is accepted; any
+// positive value that rounds to 0 (below 0.5ns) is rejected.
 [[nodiscard]] std::expected<SimTime, ParseError> to_sim_time(double nanoseconds,
                                                              std::string_view input) {
   // int64 -> double is lossy in general (2^63-1 becomes 2^63); the cast is explicit
@@ -159,16 +167,37 @@ split_non_negative_number(std::string_view text, std::string_view input) {
   return SimTime{count};
 }
 
-// Shared by both rate parsers: strip `denominator` ("/s" or "B/s"), parse the number,
-// scale it by its prefix from `table`. The caller has already checked the denominator.
-[[nodiscard]] std::expected<double, ParseError> parse_scaled_number(std::string_view text,
-                                                                    std::string_view denominator,
+// The prefixes a table accepts, for error messages: {"", k, M, G} -> "k, M, G". Derived
+// from the table so the message cannot go stale when a prefix is added.
+[[nodiscard]] std::string list_prefixes(std::span<const Scale> table) {
+  std::string listed;
+  for (const auto& row : table) {
+    if (row.suffix.empty()) continue;
+    if (!listed.empty()) listed += ", ";
+    listed += row.suffix;
+  }
+  return listed;
+}
+
+// Shared by both rate parsers: parse `number_text` (the input with its denominator
+// already stripped, e.g. "10k") and scale it by its prefix from `table`. `input` is the
+// full original text, kept for errors.
+[[nodiscard]] std::expected<double, ParseError> parse_scaled_number(std::string_view number_text,
+                                                                    std::string_view input,
                                                                     std::span<const Scale> table) {
-  auto split = split_non_negative_number(text.substr(0, text.size() - denominator.size()), text);
+  auto split = split_non_negative_number(number_text, input);
   if (!split) return std::unexpected(split.error());
   auto [value, prefix] = *split;
-  if (auto factor = find_scale(table, prefix)) return value * *factor;
-  return fail(text, "unknown rate suffix '" + std::string{prefix} + "'");
+  const auto factor = find_scale(table, prefix);
+  if (!factor) {
+    return fail(input, "unknown prefix '" + std::string{prefix} + "' (expected " +
+                           list_prefixes(table) + ")");
+  }
+  // The finite check must come after scaling: 1e308 is finite, 1e308 * 1e9 is not.
+  const double scaled = value * *factor;
+  if (!std::isfinite(scaled)) return fail(input, "rate out of range");
+  // `-0` passes the non-negative check (-0.0 < 0.0 is false); `+ 0.0` turns -0.0 into +0.0.
+  return scaled + 0.0;
 }
 
 }  // namespace simsys::detail
@@ -181,7 +210,6 @@ export namespace simsys {
 [[nodiscard]] std::expected<SimTime, ParseError> parse_duration(std::string_view text) {
   auto split = detail::split_non_negative_number(text, text);
   if (!split) return std::unexpected(split.error());
-  // C++17 structured binding; still the clearest way to unpack a pair.
   auto [value, unit] = *split;
   auto scale = detail::nanoseconds_per(unit, text);
   if (!scale) return std::unexpected(scale.error());
@@ -193,18 +221,19 @@ export namespace simsys {
   // C++20 std::string_view::ends_with: no more size arithmetic to check a suffix.
   if (!text.ends_with("/s")) return detail::fail(text, "rate must end with '/s'");
   // C++23 std::expected::transform: applies a function to the value if there is one and
-  // passes an error through untouched — the `if (!x) return unexpected` dance in one call.
-  return detail::parse_scaled_number(text, "/s", detail::rate_prefixes).transform([](double v) {
-    return Rate{v};
-  });
+  // passes an error through untouched. It fits here because the last step (wrapping the
+  // double in a Rate) cannot fail; steps that can fail still use the early-return pattern.
+  const auto number_text = text.substr(0, text.size() - 2);  // drop "/s"
+  return detail::parse_scaled_number(number_text, text, detail::rate_prefixes)
+      .transform([](double v) { return Rate{v}; });
 }
 
 // "500MB/s" -> ByteRate{5e8}. Accepts the prefixes "", K, M, G before "B/s".
 [[nodiscard]] std::expected<ByteRate, ParseError> parse_byte_rate(std::string_view text) {
   if (!text.ends_with("B/s")) return detail::fail(text, "byte rate must end with 'B/s'");
-  return detail::parse_scaled_number(text, "B/s", detail::byte_prefixes).transform([](double v) {
-    return ByteRate{v};
-  });
+  const auto number_text = text.substr(0, text.size() - 3);  // drop "B/s"
+  return detail::parse_scaled_number(number_text, text, detail::byte_prefixes)
+      .transform([](double v) { return ByteRate{v}; });
 }
 
 }  // namespace simsys
