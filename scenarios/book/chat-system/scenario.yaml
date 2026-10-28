@@ -1,0 +1,110 @@
+# System Design Interview vol. 1, ch. 12 — Chat system.
+# Book numbers: 50M DAU, 40 messages/user/day → ~23k messages/s average; 1:1 and small
+# group chats (≤100 members); online presence with 5-second heartbeats; push for offline.
+version: 1
+name: chat-system
+seed: 1
+duration: 24h
+step: 100ms
+warmup: 5m
+
+nodes:
+  users:
+    type: client
+    rate:
+      base: 60k/s                              # messages + heartbeats + API calls
+      wave: {shape: sine, period: 24h, amplitude: 0.5, peak_at: 21:00}
+    ops: {send: 0.35, heartbeat: 0.55, api: 0.10}
+    sizes: {send: 1KB}
+    timeout: 2s
+
+  lb: {type: load_balancer, policy: least_connections}
+
+  api_servers:                                 # stateless: login, signup, profile, service discovery
+    type: service
+    replicas: 6
+    capacity: 3k/s
+    latency: 1ms
+    ops:
+      api:
+        - {to: kv_cache, op: read}
+        - {to: user_db, op: read, on: miss}
+        - {to: discovery, op: lookup}
+
+  discovery: {type: service_discovery, failover: 10s, capacity: 50k/s, latency: 0.5ms}
+
+  chat_servers:                                # stateful websocket servers
+    type: ws_gateway
+    replicas: 20
+    max_connections: 100k
+    heartbeat: 5s
+    fanout: 1.4                                # avg recipients per message (1:1 + groups)
+    capacity: 10k/s
+    latency: 0.5ms
+    ops:
+      send:
+        - {to: id_gen, op: next_id}
+        - {to: message_q, op: publish}
+        - {to: message_store, op: write}
+      heartbeat:
+        - {to: presence, op: beat}
+
+  id_gen: {type: id_generator, algorithm: snowflake, replicas: 3}
+
+  message_q: {type: message_queue, partitions: 64}
+
+  sync_workers:                                # deliver to recipient's chat server or push
+    type: worker_pool
+    consumes: message_q
+    workers: 64
+    cost: 1ms
+    then:
+      - {to: presence, op: read}
+      - {to: chat_servers, op: deliver, factor: 1.4}
+      - {to: push, op: notify, factor: 0.3}    # 30% of recipients offline
+
+  message_store:                               # Cassandra-like: write-heavy, time-series keys
+    type: kv_cluster
+    nodes: 12
+    vnodes: 256
+    replication: 3
+    write_quorum: 2
+    read_quorum: 2
+    capacity: 10k/s                            # per node
+
+  presence:
+    type: kv_cluster
+    nodes: 4
+    replication: 2
+    write_quorum: 1
+    read_quorum: 1
+    capacity: 50k/s
+
+  kv_cache: {type: cache, eviction: lru, keys: 20M, hit_ratio: che, strategy: cache_aside}
+  user_db: {type: sql_db, replicas: 3, capacity: 4k/s}
+
+  push: {type: external_sink, latency: 150ms, failure_rate: 0.02}
+
+links:
+  - {from: users, to: lb, dir: inout}
+  - {from: lb, to: api_servers, dir: inout, ops: [api]}
+  - {from: lb, to: chat_servers, dir: inout, ops: [send, heartbeat]}
+  - {from: api_servers, to: kv_cache, dir: inout}
+  - {from: api_servers, to: user_db, dir: inout}
+  - {from: api_servers, to: discovery, dir: inout}
+  - {from: chat_servers, to: id_gen, dir: inout}
+  - {from: chat_servers, to: message_q}
+  - {from: chat_servers, to: message_store, dir: inout}
+  - {from: chat_servers, to: presence, dir: inout}
+  - {from: message_q, to: sync_workers}
+  - {from: sync_workers, to: presence, dir: inout}
+  - {from: sync_workers, to: chat_servers}
+  - {from: sync_workers, to: push, dir: inout}
+
+slo:
+  - {metric: p99_latency, node: users, op: send, max: 300ms}
+  - {metric: queue_lag, node: message_q, max: 10s}
+  - {metric: drop_rate, max: 0.001}
+
+faults:
+  - {at: 21:30, kind: node_down, node: chat_servers, for: 1m}   # one replica's worth; see README
