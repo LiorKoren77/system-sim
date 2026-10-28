@@ -11,11 +11,14 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <map>
+#include <memory>
 #include <optional>
 #include <print>
 #include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 // C++20 `import`: brings the exported names of a named module into this translation
 // unit. Unlike #include, it does not re-parse text; the compiler reads a compiled
@@ -43,6 +46,21 @@ namespace {
 namespace engine = simsys::engine;
 namespace graph = simsys::graph;
 namespace report = simsys::report;
+
+// GCC 14.2 workaround (release builds only, verified 2026-10-28 with gcc14-release): at
+// -O3 this unit destroys a Graph, hence a model::Scenario and its NodeSpec::ops map,
+// through destructors read from the modules, and calls
+// std::map<std::string, std::vector<model::Step>>::~map out of line without emitting it;
+// no module object file emits it either, so the link fails with an undefined reference.
+// Destroying such a map in code of our own makes GCC instantiate the destructor in this
+// unit, after which it inlines or emits it as usual. `gnu::used` keeps the otherwise
+// uncalled function (and the instantiation) from being discarded. An explicit
+// instantiation (`template class std::map<...>;`) does not help: it skips the defaulted
+// destructor.
+[[gnu::used]] void instantiate_ops_map_destructor(
+    std::map<std::string, std::vector<simsys::model::Step>>* ops) {
+  std::destroy_at(ops);
+}
 
 // Compiler-style `file:line:column: error: message`, so editors can jump to it. Line 0
 // means the location is unknown (e.g. an empty file), so there is no position to print.
