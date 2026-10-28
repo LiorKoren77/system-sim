@@ -24,6 +24,7 @@ import simsys.core;
 import simsys.defaults;
 import simsys.graph;
 import simsys.model;
+import simsys.report;
 
 using namespace std::chrono_literals;
 using Catch::Matchers::WithinRel;
@@ -1014,4 +1015,57 @@ TEST_CASE("a uniform key space gives the cache's share of the keys", "[graph]") 
   INFO((built ? "" : built.error().message));
   REQUIRE(built.has_value());
   REQUIRE_THAT(*built->hit_ratio(*built->index_of("cache")), WithinRel(0.25, 1e-6));
+}
+
+// Several replicas of one cache: how much they hold together depends on how keys reach them.
+// A round-robin balancer sends every key to every replica, so each replica's cache is a full
+// copy competing for the same hot keys, with `keys` capacity: the replicas together hit as
+// often as one of them. A consistent-hash ring (book ch. 5) sends each key to one replica
+// only, so the replicas partition the key space and together hold `keys × replicas` distinct
+// keys: for the Che approximation they are one cache of that size.
+namespace {
+// u (zipf 1 over 100k keys) -> lb (the given policy) -> cache (che, 10k keys, 4 replicas).
+Scenario replicated_che_cache(LbPolicy policy) {
+  Scenario s{.name = "replicated-cache", .version = 1, .duration = 1min};
+  auto cache_node = che_cache(10'000);
+  cache_node.replicas = 4;
+  s.nodes = {keyed_client("u", KeySpec{.zipf = 1.0, .space = 100'000}), load_balancer("lb", policy),
+             std::move(cache_node)};
+  s.links = {LinkSpec{.from = "u", .to = "lb"}, LinkSpec{.from = "lb", .to = "cache"}};
+  return s;
+}
+double che_over_100k_zipf1_keys(double capacity) {
+  return simsys::caching::che_hit_ratio(capacity, simsys::caching::Popularity::zipf(1.0, 100'000));
+}
+}  // namespace
+
+TEST_CASE("a cache partitioned by a consistent-hash ring has keys × replicas effective capacity",
+          "[graph]") {
+  const auto ring = Graph::build(replicated_che_cache(LbPolicy::consistent_hash));
+  INFO((ring ? "" : ring.error().message));
+  REQUIRE(ring.has_value());
+  REQUIRE_THAT(*ring->hit_ratio(*ring->index_of("cache")),
+               WithinRel(che_over_100k_zipf1_keys(40'000), 1e-12));
+
+  const auto round_robin = Graph::build(replicated_che_cache(LbPolicy::round_robin));
+  INFO((round_robin ? "" : round_robin.error().message));
+  REQUIRE(round_robin.has_value());
+  REQUIRE_THAT(*round_robin->hit_ratio(*round_robin->index_of("cache")),
+               WithinRel(che_over_100k_zipf1_keys(10'000), 1e-12));
+}
+
+// explain's view of the same fact: the provenance names the capacity the ring multiplied, so a
+// reader can see why the number is higher than the cache's own `keys` suggests.
+TEST_CASE("explain shows a ring-partitioned che cache's capacity as keys × replicas", "[graph]") {
+  const auto ring = Graph::build(replicated_che_cache(LbPolicy::consistent_hash));
+  REQUIRE(ring.has_value());
+  const auto ring_text = simsys::report::render_explain(*ring);
+  CAPTURE(ring_text);
+  REQUIRE(ring_text.contains(" (che: zipf 1 over 100k keys from u; 10k keys x 4 partitioned)"));
+
+  const auto round_robin = Graph::build(replicated_che_cache(LbPolicy::round_robin));
+  REQUIRE(round_robin.has_value());
+  const auto round_robin_text = simsys::report::render_explain(*round_robin);
+  CAPTURE(round_robin_text);
+  REQUIRE(round_robin_text.contains(" (che: zipf 1 over 100k keys from u)"));
 }
