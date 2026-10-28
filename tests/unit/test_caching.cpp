@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <stdexcept>
 #include <vector>
 
@@ -18,7 +19,8 @@ using Catch::Matchers::WithinRel;
 using simsys::caching::che_hit_ratio;
 using simsys::caching::Popularity;
 
-TEST_CASE("under a uniform distribution the hit ratio is the cache's share of the key space", "[caching]") {
+TEST_CASE("under a uniform distribution the hit ratio is the cache's share of the key space",
+          "[caching]") {
   // p_i = 1/N: the Che equation gives 1 - e^{-t/N} = C/N exactly, so h = C/N.
   REQUIRE_THAT(che_hit_ratio(500, Popularity::uniform(1000)), WithinRel(0.5, 1e-9));
   REQUIRE_THAT(che_hit_ratio(1000, Popularity::uniform(1000)), WithinRel(1.0, 1e-9));
@@ -37,8 +39,8 @@ TEST_CASE("the bucketed Zipf sum matches a dense sum to a tenth of a percent", "
   std::vector<double> p(n);
   double h_n = 0;
   for (int i = 1; i <= n; ++i) {
-    p[i - 1] = std::pow(i, -s);
-    h_n += p[i - 1];
+    p[static_cast<std::size_t>(i - 1)] = std::pow(i, -s);
+    h_n += p[static_cast<std::size_t>(i - 1)];
   }
   for (auto& x : p) x /= h_n;
   auto in_cache = [&](double t) {
@@ -65,7 +67,8 @@ TEST_CASE("a hotter key space (larger zipf exponent) hits more", "[caching]") {
 
 TEST_CASE("a hundred-million-key zipf space evaluates in well under a second", "[caching]") {
   const auto started = std::chrono::steady_clock::now();
-  const auto h = che_hit_ratio(20e6, Popularity::zipf(1.0, 100'000'000));  // url-shortener's url_cache
+  const auto h =
+      che_hit_ratio(20e6, Popularity::zipf(1.0, 100'000'000));  // url-shortener's url_cache
   const auto elapsed = std::chrono::steady_clock::now() - started;
   REQUIRE(h > 0.5);
   REQUIRE(h < 1.0);
@@ -79,9 +82,12 @@ TEST_CASE("invalid popularities are programmer errors", "[caching]") {
 }
 
 TEST_CASE("the HitRatioModel concept is satisfied by the fixed and che policies", "[caching]") {
-  // C++20 concepts: spec §5's HitRatioModel — anything with hit_ratio(capacity, popularity) -> double.
+  // C++20 concepts: spec §5's HitRatioModel — anything with hit_ratio(capacity, popularity) ->
+  // double.
   static_assert(simsys::caching::HitRatioModel<simsys::caching::FixedHitRatio>);
   static_assert(simsys::caching::HitRatioModel<simsys::caching::CheHitRatio>);
-  REQUIRE_THAT(simsys::caching::FixedHitRatio{0.8}.hit_ratio(10, Popularity::uniform(100)), WithinRel(0.8, 1e-12));
-  REQUIRE_THAT(simsys::caching::CheHitRatio{}.hit_ratio(50, Popularity::uniform(100)), WithinRel(0.5, 1e-9));
+  REQUIRE_THAT(simsys::caching::FixedHitRatio{0.8}.hit_ratio(10, Popularity::uniform(100)),
+               WithinRel(0.8, 1e-12));
+  REQUIRE_THAT(simsys::caching::CheHitRatio{}.hit_ratio(50, Popularity::uniform(100)),
+               WithinRel(0.5, 1e-9));
 }
