@@ -16,6 +16,7 @@ nodes:
       wave: {shape: sine, period: 24h, amplitude: 0.4, peak_at: 18:00}
       spikes: [{at: 09:00, for: 15m, factor: 20}]       # marketing blast
     ops: {notify: 1.0}
+    keys: {zipf: 0.8, space: 10M}             # the user notified (~10M push users); user_cache's hit ratio follows
     timeout: 5s
 
   lb: {type: load_balancer, policy: round_robin}

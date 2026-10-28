@@ -11,6 +11,9 @@
 - Heartbeat traffic dominating request counts (55% of all ops) while messages dominate bytes.
 - Group fan-out (1.4 avg recipients) and the 30% offline push fraction.
 - Write-heavy key-value store sized by per-node capacity, replication 3, quorum 2.
+- The API servers' `kv_cache` hit ratio, computed with the Che approximation from its 20M
+  keys and the users' key distribution (Zipf 0.8 over the 50M daily users: a mild skew, as
+  activity spreads over many users rather than a few hot keys).
 - Losing the whole gateway tier (`chat_servers`) for 1 minute at the 21:30 peak: a reconnect storm follows and the queue backs up.
 
 ## What it abstracts away

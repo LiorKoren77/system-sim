@@ -37,13 +37,12 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `service` | ops, steps, per-op `cost` |
 | `load_balancer` | every policy |
 | `rate_limiter` | every algorithm, with or without a counter `backend` |
-| `cache` | a **fixed** hit ratio, the four synchronous strategies (`cache_aside`, `read_through`, `write_through`, `write_around`), no `then` steps |
+| `cache` | a fixed or [`che`](#che-hit-ratios) hit ratio, the four synchronous strategies (`cache_aside`, `read_through`, `write_through`, `write_around`), no `then` steps |
 
 Everything else is refused before the first step, with exit code 1:
 
 | what | message | runs from |
 |---|---|---|
-| a cache with `hit_ratio: che` | `node 'c' has hit_ratio che (the Che approximation), which run/estimate do not support yet (phase 2b)` | 2b |
 | a cache with `strategy: write_back` | `node 'c' has strategy write_back (writes flushed later), which run/estimate do not support yet (phase 2b)` | 2b |
 | a cache with `then` steps | `node 'c' has then steps (fired per hit or miss), which run/estimate do not support yet (phase 2b)` | 2b |
 | `sql_db`, `cdn` | `node 'x' has type 'cdn', which run/estimate do not support yet (phase 2)` | 2b |
@@ -176,7 +175,7 @@ A **step** is `{to: <node id>, op: <op name>, on: always|miss|failure, mode: seq
 |---|---|---|---|
 | `to` | required | read | a declared node, **not the node itself** (a retry, the one reason to call yourself, is `client.retries`); *(graph)* not a client (clients only send) |
 | `op` | the incoming op | read | required in `then` steps, which have no incoming op to inherit |
-| `on` | `always` | read | `miss` applies to the flow a cache/CDN did not serve, `failure` to failed requests. In an op's step list, an `on: miss` step belongs to the nearest unconditional step before it, its lookup, which must ask a `cache` or `cdn` for a read, leave the miss to the application, and be waited for. *(graph)* `node 'web': an 'on: miss' step must follow a cache or cdn step`; `... cannot follow a write to cache 'c' (writes do not miss)`; `... cannot follow read_through cache 'c' (the cache already fetched the miss)`; `... and the cache step it follows must be sequential (the miss step waits for the cache's answer)`. A miss step is taken by the miss fraction `1 − h` of the requests (`h` the cache's or CDN's fixed hit ratio; a `che` one, or a CDN without a ratio, counts as `h = 0` until phase 2b, and `explain` marks the checks that rest on it). After a lookup of `factor: k` it sends `k(1 − h)` requests per request: every missed lookup is fetched. Several `on: miss` steps after one lookup form one block that a miss takes whole, one step after another: the response adds `1 − h` × the sum of their hops on average, with the hit/miss spread in the variance, and a miss is answered only if every fetch is. (For latency, a request's `k` lookups are assumed to hit or miss together.) `failure` steps never fire before phase 2c |
+| `on` | `always` | read | `miss` applies to the flow a cache/CDN did not serve, `failure` to failed requests. In an op's step list, an `on: miss` step belongs to the nearest unconditional step before it, its lookup, which must ask a `cache` or `cdn` for a read, leave the miss to the application, and be waited for. *(graph)* `node 'web': an 'on: miss' step must follow a cache or cdn step`; `... cannot follow a write to cache 'c' (writes do not miss)`; `... cannot follow read_through cache 'c' (the cache already fetched the miss)`; `... and the cache step it follows must be sequential (the miss step waits for the cache's answer)`. A miss step is taken by the miss fraction `1 − h` of the requests (`h` the cache's or CDN's hit ratio, stated or [resolved at build](#che-hit-ratios); a CDN without a ratio, or with `che` but no size in keys yet, counts as `h = 0`, and `explain` marks the checks that rest on it). After a lookup of `factor: k` it sends `k(1 − h)` requests per request: every missed lookup is fetched. Several `on: miss` steps after one lookup form one block that a miss takes whole, one step after another: the response adds `1 − h` × the sum of their hops on average, with the hit/miss spread in the variance, and a miss is answered only if every fetch is. (For latency, a request's `k` lookups are assumed to hit or miss together.) `failure` steps never fire before phase 2c |
 | `mode` | `sequential` | read | sequential steps add their latencies; **all parallel steps of an op form one group wherever they sit** among the sequential ones, and the group costs its slowest branch |
 | `factor` | 1 | read | finite, positive, at most `1e6`; multiplies the flow (fan-out: one post → 100 feed writes) |
 
@@ -188,12 +187,12 @@ target and, if that link lists `ops`, lists the step's op.
 
 | type | own keys | status |
 |---|---|---|
-| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `timeout` checked (a duration), not yet used; `keys`, `sizes`, `retries` ignored |
-| `cdn` | `ttl`, `hit_ratio` (`{fixed: h}` or `che`, optional), `origin` (node id) | `origin` checked (a declared node); `hit_ratio` read as a cache's and used by a service's `on: miss` step after the CDN; others ignored. Runs from phase 2b |
+| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `keys` read by the [`che` caches](#che-hit-ratios) downstream (`keys must be a map`, `keys needs zipf and space, or uniform`, `keys takes zipf+space or uniform, not both`, `keys.zipf must be non-negative`, `keys.space must be a positive count`, `keys.uniform must be a positive count`; `space` and `uniform` are [counts](#values): `100M`); `timeout` checked (a duration), not yet used; `sizes`, `retries` ignored |
+| `cdn` | `ttl`, `hit_ratio` (`{fixed: h}` or `che`, optional), `origin` (node id) | `origin` checked (a declared node); `hit_ratio` read as a cache's and used by a service's `on: miss` step after the CDN (a `che` CDN has no size in keys before the CDN task of phase 2b, so it counts as `h = 0` until then); others ignored. Runs from phase 2b |
 | `load_balancer` | `policy`, `vnodes` | read and run, see [`load_balancer`](#load_balancer) |
 | `rate_limiter` | `algorithm`, `limit`, `burst`, `window`, `backend` | read and run, see [`rate_limiter`](#rate_limiter) |
 | `service` | `ops`, `cost` | read and run |
-| `cache` | `hit_ratio`, `strategy`, `write_ops`, `backend`, `keys`, `eviction`, `ttl`, `then`, `cost` | read and run (fixed hit ratio), see [`cache`](#cache) |
+| `cache` | `hit_ratio`, `strategy`, `write_ops`, `backend`, `keys`, `eviction`, `ttl`, `then`, `cost` | read and run (fixed or `che` hit ratio), see [`cache`](#cache) |
 | `sql_db` | `replication_lag`, `shards` (int), `pool` (int connections) † | ignored; runs from phase 2b |
 | `kv_cluster` | `nodes` (int), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp` | ignored; phase 3 |
 | `message_queue` | `partitions`, `retention` † | ignored; phase 2c |
@@ -307,15 +306,16 @@ own (default 100k/s, 250 µs) that answers every request it receives, hit or mis
 
 | key | rule | message on violation |
 |---|---|---|
-| `hit_ratio` | required: `{fixed: h}` with `0 ≤ h ≤ 1`, or `che` (computed in phase 2b; `run`/`estimate` refuse it until then) | `cache needs a hit_ratio`, `hit_ratio must be che or {fixed: h}`, `hit_ratio.fixed must be between 0 and 1` (also for a quoted `"0.5"`) |
+| `hit_ratio` | required: `{fixed: h}` with `0 ≤ h ≤ 1`, or `che` (computed at build from `keys` and the clients' key distribution, see [`che` hit ratios](#che-hit-ratios)) | `cache needs a hit_ratio`, `hit_ratio must be che or {fixed: h}`, `hit_ratio.fixed must be between 0 and 1` (also for a quoted `"0.5"`) |
 | `strategy` | `cache_aside` (default), `read_through`, `write_through`, `write_around`, `write_back` | `strategy must be cache_aside, read_through, write_through, write_around or write_back` |
 | `backend` | a declared node; required by every strategy but `cache_aside`, and refused there (the application reads the store; the backend would never be called) | `strategy read_through needs a backend`, `backend is unused with strategy cache_aside`, `backend refers to unknown node 'x'`; *(graph)* `backend 'db' needs a link from the cache`, and the link must carry every op the cache passes on (`link c -> db does not carry op 'read' (ops: write)`); a store that calls back into the cache (`db.read -> c.read -> db.read`) is refused, since a fetch is always waited for: `node 'c': backend 'db' closes a call cycle` |
 | `write_ops` | a non-empty list of op names; default `[write]`. Every other op is a read | `write_ops must be a list of op names`, `write_ops must name at least one op` |
-| `keys` | a [count](#values) (`20M`), for the Che approximation | `keys must be a positive integer` |
+| `keys` | a [count](#values) (`20M`): the entries the cache holds, the Che approximation's cache size; required by `hit_ratio: che` | `keys must be a positive integer`; *(graph)* `node 'c': hit_ratio che needs keys (the cache's capacity in keys)` |
 | `eviction` | `lru`, `lfu`, `fifo`, `ttl` | `eviction must be lru, lfu, fifo or ttl` |
 | `ttl` | a positive duration | `ttl must be positive` |
 
-`keys`, `eviction` and `ttl` are read and printed by `explain`; phase 2b uses them. `explain`
+`keys`, `eviction` and `ttl` are read and printed by `explain`; `keys` sizes a `che` cache, and
+`eviction` and `ttl` wait for later refinements (the Che model is LRU's). `explain`
 prints `write_ops=write (never arrives)` when no op that reaches the cache is a write op: the
 write strategy then never acts (a note, not an error). Names: ch. 1 draws one pattern, the
 application reading the cache and fetching a miss itself, and calls it "read-through"; its
@@ -331,9 +331,25 @@ What each strategy passes to its `backend`, as the same op:
 | `write_around` | as `write_through` | as `write_through`: the same flow. The difference is what the cache holds afterwards, which shows in the hit ratio, and `h` is fixed here |
 | `write_back` | refused by `run`/`estimate` until phase 2b (a queue of dirty entries flushed later) | |
 
-Not modelled: key popularity (h is a number, not a function of the cache size and the key
-skew), TTL expiry, eviction order, a cold start, the thundering herd of a hot key's misses,
-invalidation traffic.
+Not modelled: TTL expiry, eviction orders other than LRU (a `che` cache is LRU's model whatever
+its `eviction`), temporal locality, a cold start, the thundering herd of a hot key's misses,
+invalidation traffic. A fixed `h` is a number, not a function of the cache size and the key
+skew; a `che` one is (below).
+
+#### `che` hit ratios
+
+`hit_ratio: che` asks the graph to compute `h` once, at build, with the Che approximation of an
+LRU cache (`src/caching/caching.cppm`): the cache holds `keys` entries, and the key popularity
+is the `keys` distribution of the clients whose demand reaches the cache, found by walking the
+demand edges upstream through every node in between (services, load balancers, rate limiters,
+caches passing on to their store). Exactly one distribution must reach it:
+
+- no client upstream with `keys`: *(graph)* `node 'c': hit_ratio che needs a client with keys upstream`;
+- two clients with different `keys`: *(graph)* `node 'c': hit_ratio che: clients 'a' and 'b' send different key distributions` (the first two in file order that disagree);
+- clients with equal `keys` share it.
+
+`explain` prints the number and where it came from: `hit_ratio=0.881 (che: zipf 1 over 100M keys
+from users)`. From then on a `che` cache runs exactly like a fixed one with that `h`.
 
 ## Rate curve (`client.rate`)
 

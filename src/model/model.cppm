@@ -267,9 +267,9 @@ inline constexpr auto cache_strategy_table = std::to_array<core::EnumName<CacheS
 }
 
 // A cache's `hit_ratio`: `{fixed: h}`, the share of reads the cache answers, given by the
-// scenario (0 <= h <= 1), or `che`: computed from the cache size (`keys`), the key
-// popularity and the eviction policy by the Che approximation (phase 2b; until then the
-// graph has no number for it and the engine refuses it). The loader sets exactly one of the
+// scenario (0 <= h <= 1), or `che`: computed from the cache size (`keys`) and the key
+// popularity of the clients upstream (their KeySpec) by the Che approximation of an LRU cache
+// (simsys.caching; the graph resolves it once, at build). The loader sets exactly one of the
 // two; a HitRatio{} built in code sets neither, which counts as no hit ratio at all.
 struct HitRatio {
   std::optional<double> fixed{};
@@ -321,10 +321,33 @@ struct Advanced {
 // now typed (spec §8): the deterministic curve (base or points, times wave, ramp and
 // spikes) in `curve`, and the seeded random multiplier in `noise`, kept apart because the
 // curve is a pure function of time while noise is a process with state the engine steps.
+// A client's request key distribution (plan 2b refinement 1, `keys:` on a client): how
+// popular each of the `space` keys it asks for is, under the independent reference model of
+// simsys.caching (every request picks a key independently, with a fixed probability).
+//  - `{zipf: s, space: N}`: Zipf over N keys with exponent s, `zipf` set — the key of rank i
+//    is asked with probability ∝ i^-s (book ch. 8: "a few short links get most of the
+//    clicks"; s ≈ 1 is the classic web skew);
+//  - `{uniform: N}`: every key equally likely, `zipf` empty.
+// `space` is a count of keys, a double because key spaces run to 1e9 and the Che sums are in
+// doubles anyway. A che cache reads the KeySpec of the clients upstream of it (graph's
+// key_source); the clients must agree on one.
+struct KeySpec {
+  std::optional<double> zipf{};
+  double space{};
+  // C++20 defaulted operator==: member-wise equality in one line, replacing a hand-written
+  // comparison of both members; it is how the graph tells "the same distribution" from two
+  // clients apart from "different ones".
+  bool operator==(const KeySpec&) const = default;
+};
+
 struct Workload {
   workload::RateCurve curve{};
   std::optional<workload::Noise> noise{};                   // absent: no noise, the curve exactly
   std::vector<std::pair<std::string, double>> op_shares{};  // sorted by op, shares sum to 1
+  // Declared right after op_shares so designated initializers can write
+  // `{.curve = ..., .op_shares = ..., .keys = ...}`. Absent: the client says nothing about
+  // which keys it asks for (fine unless a `che` cache downstream needs to know).
+  std::optional<KeySpec> keys{};
   std::optional<SimTime> timeout{};
 };
 
@@ -374,7 +397,7 @@ struct NodeSpec {
   // initializers): the hit ratio (required by the loader; a scenario built in code may
   // leave it empty, which the engine refuses), the strategy (default cache_aside, the
   // pattern ch. 1 draws and calls read-through), the ops that are writes (every other op is a
-  // read), and the sizing keys the Che approximation of phase 2b will use: `keys` (how many entries
+  // read), and the sizing keys the Che approximation reads: `keys` (how many entries
   // fit), `eviction` (lru, lfu, fifo or ttl) and `ttl`. A `backend` on a cache names the store the
   // cache itself calls (read_through, write_through, write_around, write_back); a CDN reads
   // `hit_ratio` too (its `on: miss` steps use it).

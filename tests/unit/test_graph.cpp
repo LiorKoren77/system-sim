@@ -822,15 +822,19 @@ TEST_CASE("a cdn's fixed hit ratio feeds its miss steps", "[graph]") {
   REQUIRE_THAT(hops[1].fraction, WithinRel(0.05, 1e-12));
 }
 
-// A `che` hit ratio is the Che approximation of an LRU cache (phase 2b): the graph builds (so
-// explain can print the scenario) but has no number for it yet.
-TEST_CASE("a che hit ratio builds a graph with no static hit ratio", "[graph]") {
-  auto node = cache("cache", 0.0, CacheStrategy::cache_aside);
-  node.hit_ratio = HitRatio{.fixed = std::nullopt, .che = true};
-  const auto built = Graph::build(cached_web(std::move(node), {Step{.to = "cache", .op = "read"}}));
+// A `che` CDN needs a size in keys for the Che approximation, which the scenario schema gives a
+// CDN only with phase 2b's CDN task: until then the graph builds (so explain can print the
+// scenario) but has no number for it, and its misses count as every read.
+TEST_CASE("a che cdn without a keys size builds a graph with no static hit ratio", "[graph]") {
+  NodeSpec cdn{.id = "cdn", .type = NodeType::cdn, .hit_ratio = HitRatio{.che = true}};
+  const auto built = Graph::build(
+      cached_web(std::move(cdn), {Step{.to = "cdn", .op = "read"},
+                                  Step{.to = "db", .op = "read", .on = StepCondition::miss}}));
   INFO((built ? "" : built.error().message));
   REQUIRE(built.has_value());
-  REQUIRE_FALSE(built->hit_ratio(*built->index_of("cache")).has_value());
+  REQUIRE_FALSE(built->hit_ratio(*built->index_of("cdn")).has_value());
+  REQUIRE_THAT(built->service_hops(*built->index_of("web"), "get")[1].fraction,
+               WithinRel(1.0, 1e-12));
 }
 
 // read_through: on a miss the cache itself fetches from its backend; write_through: it writes

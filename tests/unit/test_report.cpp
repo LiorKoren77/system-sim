@@ -677,15 +677,16 @@ Scenario browser_cached() {
              LinkSpec{.from = "browser_cache", .to = "lb"}, LinkSpec{.from = "lb", .to = "api"}};
   return s;
 }
-// Ch. 8's redirect path with a cache whose hit ratio is `che` (phase 2b): users(1k/s) -> web
-// -> url_cache, and web -> url_db for the misses.
+// Ch. 8's redirect path with a cache whose hit ratio is `che`: users(1k/s, Zipf 1 over 100M
+// links) -> web -> url_cache (20M keys), and web -> url_db for the misses.
 Scenario che_cached() {
   Scenario s{.name = "shortener", .version = 1, .duration = 1min};
   s.nodes = {
-      NodeSpec{
-          .id = "users",
-          .type = NodeType::client,
-          .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"redirect", 1.0}}}},
+      NodeSpec{.id = "users",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1000}},
+                                    .op_shares = {{"redirect", 1.0}},
+                                    .keys = KeySpec{.zipf = 1.0, .space = 100e6}}},
       NodeSpec{
           .id = "web",
           .type = NodeType::service,
@@ -696,7 +697,8 @@ Scenario che_cached() {
                         .to = "url_db", .op = "read", .on = simsys::model::StepCondition::miss}}}}},
       NodeSpec{.id = "url_cache",
                .type = NodeType::cache,
-               .hit_ratio = simsys::model::HitRatio{.fixed = std::nullopt, .che = true}},
+               .hit_ratio = simsys::model::HitRatio{.fixed = std::nullopt, .che = true},
+               .keys = 20'000'000},
       NodeSpec{.id = "url_db", .type = NodeType::service, .capacity = Rate{5000}}};
   s.links = {LinkSpec{.from = "users", .to = "web"}, LinkSpec{.from = "web", .to = "url_cache"},
              LinkSpec{.from = "web", .to = "url_db"}};
@@ -725,18 +727,28 @@ TEST_CASE("explain forwards a cache's then-steps: misses reach the next node", "
   REQUIRE(check_line(text, "api").contains("peak offered 600/s vs 5k/s"));
 }
 
-// With no number for h yet (`che`, phase 2b) the paper load counts every read as a miss: the
-// database behind the cache is checked against its worst case. The line says so, or a student
-// would read a red database as a real problem of the design.
+// With no number for h (a `che` CDN before the CDN gets a `keys` size) the paper load counts
+// every read as a miss: the database behind it is checked against its worst case. The line
+// says so, or a student would read a red database as a real problem of the design.
 TEST_CASE("explain annotates checks that count an unknown hit ratio as zero", "[report]") {
-  const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(che_cached()));
+  auto s = che_cached();
+  s.nodes[2].type = NodeType::cdn;
+  s.nodes[2].keys = std::nullopt;
+  const auto built = simsys::graph::Graph::build(s);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto text = simsys::report::render_explain(*built);
   CAPTURE(text);
   const auto db = check_line(text, "url_db");
   REQUIRE(db.contains("peak offered 1k/s"));
   REQUIRE(db.contains(" (hit ratio unknown: che counted as 0 — an upper bound)"));
-  // The cache's own load does not depend on its hit ratio: no note there.
+  // The CDN's own load does not depend on its hit ratio: no note there.
   REQUIRE(check_line(text, "url_cache").contains("peak offered 1k/s"));
   REQUIRE_FALSE(check_line(text, "url_cache").contains("unknown"));
+  // A resolved che cache has a number: no note anywhere.
+  const auto resolved = simsys::report::render_explain(*simsys::graph::Graph::build(che_cached()));
+  CAPTURE(resolved);
+  REQUIRE_FALSE(resolved.contains("hit ratio unknown"));
 }
 
 // A cache's write strategy acts on the ops in `write_ops` (default: `write`). When no op that
