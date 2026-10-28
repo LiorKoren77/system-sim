@@ -2,8 +2,8 @@
 // node capacities with provenance, link latencies and delay-line lengths, demand edges,
 // a topological order, routes of the nodes that split flow (clients, load balancers),
 // what each load balancer does to the replicas behind it, feedback edges for node cycles and
-// asynchronous hops for call cycles and write-back flushes. Cycles are found at two levels, for two
-// different questions:
+// asynchronous hops for call cycles, write-back flushes and blob store events. Cycles are found at
+// two levels, for two different questions:
 //  - Node level (Graph::order_nodes): which LINK closes a loop of boxes? Its flow goes
 //    through a delay line of at least one step, so the forward pass can run in
 //    topological order (spec §3.1: cycles use the previous step's value).
@@ -44,6 +44,10 @@
 // A CDN (plan 2b refinement 4) is the read_through shape of a cache: its `origin` becomes its
 // backend (Graph::connect_store), a demand edge carrying 1 - h of each read as the same op, no
 // write may reach it (Graph::check_reads_only), and no service `on: miss` step may follow it.
+// A blob store's `then` steps (plan 2c refinements 6-7) are its event notifications (S3 event
+// notifications, ch. 14 and 15): demand edges like a cache's unconditional steps, fired by every
+// request it serves, and asynchronous hops by design (detail::blob_store_events); a step on miss
+// is refused, since a blob store never misses (invalid_blob_store).
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -334,7 +338,8 @@ struct DemandEdge {
 
 // A hop the caller does not wait for (see Graph::is_async_hop): node `from`, handling `op`,
 // sends `target_op` to node `to`, and either following the calls from there leads back to
-// (from, op) (a call cycle), or the hop is a write_back cache's flush to its store.
+// (from, op) (a call cycle), or the hop is a write_back cache's flush to its store or a blob
+// store's event notification along a `then` step.
 struct AsyncHop {
   std::size_t from{};
   std::string op{};
@@ -418,8 +423,9 @@ class Graph {
   [[nodiscard]] double then_fraction(std::size_t node, const model::Step& step,
                                      std::string_view op) const;
   // Does node `from`, handling `op`, hand `target_op` off to node `to` without waiting?
-  // True exactly for the hops that close a call cycle (see detail::find_async_hops) and for a
-  // write_back cache's flushes to its store (detail::write_back_flushes).
+  // True exactly for the hops that close a call cycle (see detail::find_async_hops), for a
+  // write_back cache's flushes to its store (detail::write_back_flushes) and for a blob store's
+  // `then` steps, its event notifications (detail::blob_store_events).
   [[nodiscard]] bool is_async_hop(std::size_t from, std::string_view op, std::size_t to,
                                   std::string_view target_op) const;
   // Every asynchronous hop, sorted by (from, op, to, target_op).
@@ -674,13 +680,18 @@ namespace {
                      "'s write_ops"};
 }
 
-// Does the cache forward its own misses (a `then` step on miss)? Then nothing after it may fetch
-// them again (Graph::invalid_miss_step). (A CDN has no `then` steps: invalid_cdn.)
-[[nodiscard]] bool forwards_own_misses(const model::NodeSpec& spec) {
+// Has the node a `then` step on miss?
+[[nodiscard]] bool has_then_step_on_miss(const model::NodeSpec& spec) {
   // C++20 ranges algorithm: std::ranges::any_of takes the container itself instead of a
   // begin/end pair (and a projection if wanted), replacing std::any_of(v.begin(), v.end(), p).
   return std::ranges::any_of(
       spec.then, [](const model::Step& step) { return step.on == model::StepCondition::miss; });
+}
+
+// Does the cache forward its own misses (a `then` step on miss)? Then nothing after it may fetch
+// them again (Graph::invalid_miss_step). (A CDN has no `then` steps: invalid_cdn.)
+[[nodiscard]] bool forwards_own_misses(const model::NodeSpec& spec) {
+  return has_then_step_on_miss(spec);
 }
 
 // Would `step`, a `then` step of `cache`, send its store the very request its backend hop sends
@@ -882,6 +893,18 @@ void apply_database_keys(ResolvedNode& node) {
   return std::nullopt;
 }
 
+// A blob store's `then` steps are event notifications (plan 2c refinement 7; S3 event
+// notifications, book ch. 14's "transcoding starts when the upload completes"): each fires for
+// every request the store serves. A blob store never misses, so an `on: miss` step, which only a
+// cache can take (Graph::then_fraction), would never fire; the scenario means something else, and
+// is told what the steps do instead of being run without them.
+[[nodiscard]] std::optional<EngineError> invalid_blob_store(const model::NodeSpec& spec) {
+  if (!has_then_step_on_miss(spec)) return std::nullopt;
+  return EngineError{"node '" + spec.id +
+                     "': a blob store's then steps fire for every request it serves "
+                     "(on: miss needs a cache)"};
+}
+
 // Graph::build also takes clients written in code: their `keys` obey the loader's rules
 // (config's read_client_keys), which simsys.caching's Popularity factories also assume (they
 // throw on a negative exponent or an empty key space: programmer errors there).
@@ -1062,7 +1085,8 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
 // The hops that close a call cycle: the back edges of a depth-first search over (node, op)
 // vertices, with an edge (node, op) -> (step.to, step.op) for every hop that fires (an
 // unconditional step, or an `on: miss` step after a cache that misses; of the `then` steps
-// only a cache's, the other node types that have them do not run yet), an edge (lb, op) ->
+// only a cache's: a blob store's are no calls, nobody waits for them (blob_store_events), and the
+// other node types that have them do not run yet), an edge (lb, op) ->
 // (target, op) for every route of a load balancer that carries the op, and (cache, op) ->
 // (backend, op) for what a cache passes on synchronously (forwarder_steps). Same white/grey/black
 // classification as Graph::order_nodes, one level finer: there the vertices are boxes, here they
@@ -1134,13 +1158,35 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
   return flushes;
 }
 
-// The call-cycle hops and the write-back flushes, sorted and without duplicates, as
-// Graph::is_async_hop's binary search needs them.
+// The event notifications of every blob store (plan 2c refinements 6-7): (store, op) ->
+// (target, step.op) for each op that reaches it and each `then` step (Graph::build refuses an
+// `on: miss` one, invalid_blob_store). Asynchronous BY DESIGN, as a write-back flush is: S3 sends
+// the event once the object is stored (book ch. 14: transcoding starts when the upload completes),
+// and the uploader, answered by then, never waits for whoever receives it. Every op fires every
+// step, a read as much as an upload, since the model does not filter events by kind.
+[[nodiscard]] std::vector<AsyncHop> blob_store_events(const Graph& g) {
+  std::vector<AsyncHop> events;
+  for (std::size_t store = 0; store < g.nodes().size(); ++store) {
+    const auto& spec = g.nodes()[store].spec;
+    if (spec.type != model::NodeType::blob_store) continue;
+    for (const auto& op : g.arriving_ops(store)) {
+      for (const model::Step& step : spec.then) {
+        events.push_back({store, op, *g.index_of(step.to), step.op});  // connect_step resolved it
+      }
+    }
+  }
+  return events;
+}
+
+// The call-cycle hops, the write-back flushes and the blob stores' events, sorted and without
+// duplicates, as Graph::is_async_hop's binary search needs them.
 [[nodiscard]] std::vector<AsyncHop> async_hops(const Graph& g) {
   auto hops = find_async_hops(g);
   // (C++23's std::vector::append_range would say this in one call; GCC 14's library lacks it.)
   const auto flushes = write_back_flushes(g);
   hops.insert(hops.end(), flushes.begin(), flushes.end());
+  const auto events = blob_store_events(g);
+  hops.insert(hops.end(), events.begin(), events.end());
   std::ranges::sort(hops);
   const auto duplicates = std::ranges::unique(hops);
   hops.erase(duplicates.begin(), duplicates.end());
@@ -2059,6 +2105,9 @@ Graph::Result Graph::resolve_nodes() {
     }
     if (spec.type == model::NodeType::id_generator) {
       if (auto invalid = invalid_id_generator(spec)) return std::unexpected{std::move(*invalid)};
+    }
+    if (spec.type == model::NodeType::blob_store) {
+      if (auto invalid = invalid_blob_store(spec)) return std::unexpected{std::move(*invalid)};
     }
     // An id generator needs nothing more here: its algorithm's numbers are type defaults
     // (defaults::defaults_of), resolved below like any node's.

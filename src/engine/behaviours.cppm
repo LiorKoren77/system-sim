@@ -208,8 +208,9 @@ struct Branch {
 
 }  // namespace simsys::behaviours
 
-// Not exported: an implementation piece of ServiceBehaviour and CacheBehaviour below (module
-// linkage, for the reason given on detail::Forwarding further down).
+// Not exported: an implementation piece of ServiceBehaviour, CacheBehaviour and
+// BlobStoreBehaviour below (module linkage, for the reason given on detail::Forwarding further
+// down).
 namespace simsys::behaviours::detail {
 
 // One downstream call, resolved against the graph once at construction.
@@ -238,9 +239,10 @@ struct Block {
 
 // The blocks of hops a node makes for each incoming op, and the three things the engine asks
 // of them: the flow they forward, the latency they add and the share of requests they answer.
-// Pattern: Delegation (composition over inheritance) — ServiceBehaviour (its `ops` steps) and
-// CacheBehaviour (its store hop and its `then` steps) each hold one HopBlocks, as the
-// forwarding behaviours hold a Forwarding, instead of sharing the arithmetic through a base.
+// Pattern: Delegation (composition over inheritance) — ServiceBehaviour (its `ops` steps),
+// CacheBehaviour (its store hop and its `then` steps) and BlobStoreBehaviour (its events) each
+// hold one HopBlocks, as the forwarding behaviours hold a Forwarding, instead of sharing the
+// arithmetic through a base.
 class HopBlocks {
  public:
   // The blocks of `op`, created empty on first use: the owner fills them at construction.
@@ -320,6 +322,18 @@ class HopBlocks {
   // building a std::string for every lookup.
   std::map<std::string, std::vector<Block>, std::less<>> blocks_by_op_;
 };
+
+// One hop of node `self`, handling `incoming_op`, to `target`, sending `op` × `factor` per
+// request: asynchronous when the graph says so (graph::Graph::is_async_hop: a write-back flush,
+// a blob store's event notification, a hop that closes a call cycle).
+[[nodiscard]] Hop hop_to(const graph::Graph& g, std::size_t self, std::string_view incoming_op,
+                         std::size_t target, std::string op, double factor);
+
+// Adds to `hops` the blocks of node `self`'s `then` steps for incoming `op`, each taken by the
+// share graph::Graph::then_fraction gives (a cache's, CacheBehaviour; a blob store's events,
+// BlobStoreBehaviour).
+void add_then_blocks(const graph::Graph& g, std::size_t self, const std::string& op,
+                     HopBlocks& hops);
 
 }  // namespace simsys::behaviours::detail
 
@@ -907,9 +921,6 @@ class CacheBehaviour {
 
  private:
   void add_backend_block(const graph::Graph& g, const std::string& op);
-  void add_then_blocks(const graph::Graph& g, const std::string& op);
-  [[nodiscard]] detail::Hop hop_to(const graph::Graph& g, std::string_view incoming_op,
-                                   std::size_t target, std::string op, double factor) const;
 
   std::size_t self_;
   // Per op that can reach the cache (graph::Graph::arriving_ops): the store hop as a block
@@ -1128,7 +1139,8 @@ class CdnBehaviour {
 // Graph::request_bytes / 1 MB, a 50 MB upload 50 units, a 2 KB read 0.002), and its service time
 // s_MB is ONE megabyte's (default 40 ms: the book's "read 1 MB sequentially from disk", 30 ms,
 // plus "... from the network", 10 ms), so Little's law gives c = 500/s × 40 ms = 20 megabyte
-// slots. It forwards nothing: a leaf, as a database is.
+// slots. Nobody it calls is waited for: without `then` steps it is a leaf, as a database is, and
+// its `then` steps are event notifications nobody waits for (below).
 // The batch view: each request is a BATCH of megabytes that holds one slot for its whole
 // transfer, MB_o × s_MB (a 50 MB object 2 s). So the queue is M/M/c over objects, with c slots
 // and the rate-weighted mean object time (MegabyteService::mean_object_time_s), the honest
@@ -1157,28 +1169,39 @@ class CdnBehaviour {
 // Ignored: durability (replication across regions, erasure coding: the store never loses an
 // object and never fails), multipart and resumable uploads (an object is one request), lifecycle
 // rules (moving old objects to cold storage), the spread of object sizes (an M/G/c with mixed
-// sizes waits longer than the M/M/c at their mean: Kingman's (1 + cs²)/2 factor), and `then`
-// steps: they are event notifications (S3 event notifications, ch. 14's "transcoding starts when
-// the upload completes"), phase 2c Task 4; until then the engine refuses a store that has them.
+// sizes waits longer than the M/M/c at their mean: Kingman's (1 + cs²)/2 factor).
+// Event notifications (plan 2c refinements 6-7): its `then` steps are S3 event notifications, the
+// way the book's event-driven pipelines start: ch. 14's "transcoding starts when the upload
+// completes" (the original storage tells the transcoding queue), ch. 15's upload that notifies
+// the metadata service. Every request the store SERVED (not one it dropped: the engine routes
+// what the queue drained) fires every step, rate × factor of the step's op, reads included (the
+// model does not filter events by kind, as S3 can by prefix or event type). A same-op step keeps
+// the request's size, a renamed one carries its `size:` or none (plan 2c refinement 1). Nobody
+// waits for an event (graph::Graph::is_async_hop): the uploader's response and delivered share end
+// at the store, as a write_back cache's flush is not waited for, and what the notified node drops
+// counts in that node's drop rate, never in the uploader's answered rate. Ignored: event batching
+// and the delivery delay (S3 sends an event within seconds, the model at once), failed or
+// duplicated notifications (S3 delivers at least once and may retry), and filters by event type.
 class BlobStoreBehaviour {
  public:
   BlobStoreBehaviour(const graph::Graph& g, std::size_t self);
 
-  // Serves every incoming op and forwards nothing. `now` and `dt` are unused (a store holds no
-  // state between steps).
+  // Serves every incoming op and sends rate × factor of each `then` step's op for it (the class
+  // comment's events). `now` and `dt` are unused (a store holds no state between steps).
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
 
   // Capacity units one request of `op` uses (graph::op_cost): its megabytes, or 1 for a store
   // whose capacity the scenario states in requests (`capacity: 500/s`).
   [[nodiscard]] double cost(std::string_view op) const;
 
-  // Its own sojourn: a blob store calls nobody.
+  // Its own sojourn: a blob store waits for nobody (its events are asynchronous).
   [[nodiscard]] flow::LatencyEstimate response(std::string_view /*op*/, flow::LatencyEstimate own,
                                                ResponseLookup auto&& /*downstream*/) const {
     return own;
   }
 
-  // The share of the op's requests the store answers itself: no downstream to fail them.
+  // The share of the op's requests the store answers itself: an event the notified node loses
+  // fails nobody's request.
   [[nodiscard]] double delivered(std::string_view /*op*/, double own,
                                  FractionLookup auto&& /*downstream*/) const {
     return own;
@@ -1193,6 +1216,9 @@ class BlobStoreBehaviour {
  private:
   std::map<std::string, double, std::less<>> cost_by_op_;  // every op that reaches the store
   std::optional<MegabyteService> megabytes_;               // sized in bytes only
+  // Per op that can reach the store, one block per `then` step, every hop asynchronous
+  // (graph::Graph::is_async_hop): only HopBlocks::forward is ever asked of them.
+  detail::HopBlocks events_;
 };
 
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
@@ -1630,7 +1656,7 @@ CacheBehaviour::CacheBehaviour(const graph::Graph& g, std::size_t self)
     : self_{self}, cost_by_op_{g.nodes()[self].spec.cost.begin(), g.nodes()[self].spec.cost.end()} {
   for (const auto& op : g.arriving_ops(self)) {
     add_backend_block(g, op);
-    add_then_blocks(g, op);
+    detail::add_then_blocks(g, self_, op, hops_);
   }
 }
 
@@ -1639,12 +1665,10 @@ double CacheBehaviour::cost(std::string_view op) const {
   return found == cost_by_op_.end() ? 1.0 : found->second;
 }
 
-// One hop of this cache, handling `incoming_op`, to `target`: asynchronous when the graph says
-// so (a write-back flush, or a then-step that closes a call cycle).
-detail::Hop CacheBehaviour::hop_to(const graph::Graph& g, std::string_view incoming_op,
-                                   std::size_t target, std::string op, double factor) const {
-  const auto link = *g.demand_link(self_, target);  // Graph::build proved it exists
-  const bool asynchronous = g.is_async_hop(self_, incoming_op, target, op);
+detail::Hop detail::hop_to(const graph::Graph& g, std::size_t self, std::string_view incoming_op,
+                           std::size_t target, std::string op, double factor) {
+  const auto link = *g.demand_link(self, target);  // Graph::build proved it exists
+  const bool asynchronous = g.is_async_hop(self, incoming_op, target, op);
   return detail::Hop{.op = std::move(op),
                      .target = target,
                      .link = link,
@@ -1663,20 +1687,22 @@ void CacheBehaviour::add_backend_block(const graph::Graph& g, const std::string&
       detail::Block{.fraction = share,
                     .mode = model::StepMode::sequential,
                     .lookup = std::nullopt,
-                    .hops = {hop_to(g, op, *resolved.backend, op, 1.0)}});
+                    .hops = {detail::hop_to(g, self_, op, *resolved.backend, op, 1.0)}});
 }
 
 // Each `on: always` then-step is a block of its own, in its declared mode; the `on: miss` ones
 // share one sequential block, taken by the miss fraction graph::Graph::then_fraction gives
 // (1 − h of a read; 0 of a write, which adds no block). A step no request takes (`on:
-// failure` before phase 2c, a miss step on a write) is left out, as in ServiceBehaviour.
-void CacheBehaviour::add_then_blocks(const graph::Graph& g, const std::string& op) {
-  auto& blocks = hops_.blocks_for(op);
+// failure` before phase 2c, a miss step on a write) is left out, as in ServiceBehaviour. A blob
+// store's steps are all unconditional (graph::Graph refuses one on miss): a block each.
+void detail::add_then_blocks(const graph::Graph& g, std::size_t self, const std::string& op,
+                             HopBlocks& hops) {
+  auto& blocks = hops.blocks_for(op);
   std::optional<std::size_t> miss_block;  // position in `blocks` of the miss steps' block
-  for (const model::Step& step : g.nodes()[self_].spec.then) {
-    const double fraction = g.then_fraction(self_, step, op);
+  for (const model::Step& step : g.nodes()[self].spec.then) {
+    const double fraction = g.then_fraction(self, step, op);
     if (fraction <= 0.0) continue;
-    auto hop = hop_to(g, op, *g.index_of(step.to), step.op, step.factor);
+    auto hop = hop_to(g, self, op, *g.index_of(step.to), step.op, step.factor);
     if (step.on != model::StepCondition::miss) {
       blocks.push_back(detail::Block{.fraction = fraction,
                                      .mode = step.mode,
@@ -1801,17 +1827,23 @@ double CdnBehaviour::cost(std::string_view op) const {
 
 // ---- BlobStoreBehaviour ----
 
-// Graph::build resolved every arriving op's size (a byte-sized node refuses an unsized one).
+// Graph::build resolved every arriving op's size (a byte-sized node refuses an unsized one) and
+// the `then` steps' targets and links (refusing a step on miss).
 BlobStoreBehaviour::BlobStoreBehaviour(const graph::Graph& g, std::size_t self)
     : cost_by_op_{detail::arriving_op_costs(g, self)},
-      megabytes_{detail::megabytes_if_byte_sized(g, self)} {}
+      megabytes_{detail::megabytes_if_byte_sized(g, self)} {
+  for (const auto& op : g.arriving_ops(self)) detail::add_then_blocks(g, self, op, events_);
+}
 
 double BlobStoreBehaviour::cost(std::string_view op) const {
   return detail::cost_in(cost_by_op_, op);
 }
 
 Routed BlobStoreBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
-  return detail::serve_everything(in);
+  Routed routed = detail::serve_everything(in);
+  for (const auto& [op, rate] : routed.served.entries()) events_.forward(op, rate, routed.outgoing);
+  detail::sort_by_destination(routed.outgoing);
+  return routed;
 }
 
 }  // namespace simsys::behaviours

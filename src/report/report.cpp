@@ -1373,12 +1373,22 @@ void forward_cached(const graph::Graph& g, std::size_t from, std::vector<OpLoad>
   forward_then_steps(g, from, arriving, load, fed_back);
 }
 
+// What a blob store sends on: one event per request along each `then` step, rate × factor
+// (plan 2c refinements 6-7, as BlobStoreBehaviour::route does). On paper nothing is dropped, so
+// every request that arrives is served and notifies.
+void forward_events(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
+                    std::vector<OpLoad>& fed_back) {
+  const OpLoad arriving = load[from];  // a copy, as in forward_steps
+  forward_then_steps(g, from, arriving, load, fed_back);
+}
+
 // Forwards what reached node `from` along its resolved `ops` hops (rate × factor × the share
 // of requests that take the hop: 1, or a cache's miss fraction 1 − h for an `on: miss`
 // step, whose factor includes its lookup's, so every missed lookup is fetched;
 // graph::ServiceHop), as ServiceBehaviour::route does, or over a load balancer's or a
-// rate limiter's routes, or to a cache's store. Flow over a feedback link goes to `fed_back`:
-// its target came earlier in the order, so it counts in the next pass.
+// rate limiter's routes, or to a cache's store, or along a blob store's events. Flow over a
+// feedback link goes to `fed_back`: its target came earlier in the order, so it counts in the
+// next pass.
 void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_t from,
                    std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   const auto& spec = g.nodes()[from].spec;
@@ -1393,6 +1403,10 @@ void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_
   }
   if (graph::hits_or_misses(spec.type)) {
     forward_cached(g, from, load, fed_back);
+    return;
+  }
+  if (spec.type == model::NodeType::blob_store) {
+    forward_events(g, from, load, fed_back);
     return;
   }
   const OpLoad arriving = load[from];  // a copy: a step may target `from` itself
@@ -1562,22 +1576,22 @@ struct PaperLoad {
 //
 // The paper load (paper_pass, forward_steps) forwards from a client's routes, along a service's
 // (or any node's) `ops` steps, through load balancers and rate limiters over their links
-// (graph::forwards_by_link) and from caches and CDNs on their misses (graph::hits_or_misses).
-// It does not follow a blob store's or a worker pool's `then`, nor a message queue's
-// consumers (phase 2c; a worker pool's work comes from the queue it consumes, over a link, not
-// along a step), nor the `then` of a notification fan-out or a URL frontier (types without a
-// phase yet). A node fed through one of those misses that part of its load: with nothing else
-// it shows 0 offered load, a missing number, not a zero, and a verdict on it ("0%, green") would
-// read as "this tier is idle"; with some load from elsewhere its percentage is a lower bound,
-// and a green or yellow verdict on it would read as "this tier has room" (review of 3e23477, I1:
-// a node fed 1/s by a client and 10k/s through a blob store printed "(0.05%, green)"). Its check
-// line says so instead.
+// (graph::forwards_by_link), from caches and CDNs on their misses (graph::hits_or_misses) and
+// along a blob store's `then` steps, its event notifications (plan 2c Task 4).
+// It does not follow a worker pool's `then`, nor a message queue's consumers (phase 2c; a
+// worker pool's work comes from the queue it consumes, over a link, not along a step), nor the
+// `then` of a notification fan-out or a URL frontier (types without a phase yet). A node fed
+// through one of those misses that part of its load: with nothing else it shows 0 offered load, a
+// missing number, not a zero, and a verdict on it ("0%, green") would read as "this tier is idle";
+// with some load from elsewhere its percentage is a lower bound, and a green or yellow verdict on
+// it would read as "this tier has room" (review of 3e23477, I1: a node fed 1/s by a client and
+// 10k/s through a blob store printed "(0.05%, green)"). Its check line says so instead.
 
 // Until when the paper load leaves unfollowed what a node of `type` sends on: "phase 2c", "not
 // modelled yet", or nothing for a type it follows (or that sends nothing on).
 [[nodiscard]] std::optional<std::string_view> unfollowed_until(model::NodeType type) {
   using enum model::NodeType;  // C++20, as in provenance
-  if (type == blob_store || type == message_queue || type == worker_pool) return "phase 2c";
+  if (type == message_queue || type == worker_pool) return "phase 2c";
   if (type == notification_fanout || type == frontier) return "not modelled yet";
   return std::nullopt;
 }
@@ -1586,7 +1600,8 @@ struct PaperLoad {
 // of its `then` steps, the flow it would send; for one with none (a message queue, whose
 // consumers are only linked to it: `consumes` is checked by the loader but not kept), the nodes
 // its links carry demand to. For every other node: its demand edges (steps, client routes, a
-// balancer's links, a cache's backend), what the paper load follows from it.
+// balancer's links, a cache's backend, a blob store's events), what the paper load follows from
+// it.
 [[nodiscard]] std::vector<std::size_t> onward_targets(const graph::Graph& g, std::size_t from) {
   std::vector<std::size_t> targets;
   const auto& spec = g.nodes()[from].spec;
@@ -1616,8 +1631,8 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 }
 
 // Per node, the types on its way in whose onward flow the paper load does not follow, each once,
-// nearest first: transcode_q behind youtube's blob store has [blob_store]; metadata_db, also
-// written by the completion handler, [worker_pool, message_queue, blob_store]. Empty for a node
+// nearest first: youtube's transcoders, behind transcode_q, have [message_queue]; metadata_db,
+// also written by the completion handler, [worker_pool, message_queue]. Empty for a node
 // whose load the paper pass has in full. A node passes on its own type (if it is such a type)
 // and everything on its way, so the mark crosses ordinary nodes too (the web crawler's parser,
 // behind the downloader). A node in a loop through such a type has it on its way as well: the
@@ -1651,9 +1666,9 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   return join(items.first(items.size() - 1), ", ") + " and " + items.back();
 }
 
-// "load not propagated: blob_store is phase 2c)" or, with several types, grouped by how long
+// "load not propagated: message_queue is phase 2c)" or, with several types, grouped by how long
 // each stays unfollowed, in the order they come: "load not propagated: worker_pool is phase 2c,
-// frontier is not modelled yet)", "... worker_pool, message_queue and blob_store are phase 2c)".
+// frontier is not modelled yet)", "... worker_pool and message_queue are phase 2c)".
 [[nodiscard]] std::string unpropagated_mark(std::span<const model::NodeType> blocked) {
   std::vector<std::pair<std::string_view, std::vector<std::string>>> groups;
   for (const model::NodeType type : blocked) {
@@ -1805,7 +1820,7 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 
 // The check of a node whose paper load misses what comes through `blocked` (blocked_on_the_way):
 //  - nothing reached it: the head and the mark, no percentage and no zone,
-//    "(load not propagated: blob_store is phase 2c)";
+//    "(load not propagated: message_queue is phase 2c)";
 //  - some load reached it: that load's percentage as a lower bound, "(≥0.05%; load not
 //    propagated: ...)". No zone below red: the real load is higher, so green or yellow might not
 //    hold, but a red lower bound is red for certain, "(≥150%, red; ...)" (a database's at the

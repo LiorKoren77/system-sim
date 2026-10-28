@@ -75,7 +75,7 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `cache` | a fixed or [`che`](#che-hit-ratios) hit ratio, every strategy (`write_back` with an asynchronous flush), [`then` steps](#then-steps-on-a-cache) |
 | `sql_db` | a primary and read replicas, `shards`, `pool`, `replication_lag` and the `staleness` SLO, see [`sql_db`](#sql_db) |
 | `cdn` | a fixed or `che` hit ratio (or none: every read misses), misses fetched from its `origin`, see [`cdn`](#cdn); with a byte `capacity` it counts megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)) |
-| `blob_store` | every op, counting megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)): its queue waits for whole objects, a write (`write_ops`) is answered at its last byte, a read at its first megabyte; not with `then` steps |
+| `blob_store` | every op, counting megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)): its queue waits for whole objects, a write (`write_ops`) is answered at its last byte, a read at its first megabyte; `then` steps as asynchronous event notifications (see [Node types](#node-types)) |
 | `id_generator` | as a `service` whose capacity and service time its `algorithm` supplies, see [`id_generator`](#id_generator) |
 
 Everything else is refused before the first step, with exit code 1:
@@ -85,13 +85,12 @@ Everything else is refused before the first step, with exit code 1:
 | `message_queue`, `worker_pool`, `external_sink` | `node 'x' has type 'message_queue', which run/estimate do not support yet (phase 2)` | 2c |
 | `kv_cluster`, `ws_gateway`, `service_discovery` | the same message | 3 |
 | `search_index`, `notification_fanout`, `frontier` | the same message | not yet assigned to a phase |
-| a `blob_store` with `then` steps | `node 'x': a blob store's then steps are event notifications, which run/estimate do not support yet (phase 2c)` | 2c |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
 | `faults` | none: the list is accepted and nothing happens | 3 |
 
 The type message says "(phase 2)" for every type; the last column is the plan. The first
 node in file order that cannot run is the one named, and the type check comes before the CDN
-and blob store checks. Of the 14 shipped scenarios six run: `tutorial/hello`, `tutorial/chain`,
+check. Of the 14 shipped scenarios six run: `tutorial/hello`, `tutorial/chain`,
 `labs/rate-limiter`, `labs/consistent-hashing`, `labs/unique-id` (which fails its `drop_rate` SLO
 on purpose, exit 2) and `book/url-shortener`.
 
@@ -113,18 +112,19 @@ sawtooth`.
 
 **Load `explain` cannot follow yet.** The checks follow the load as the engine would: from
 the clients' routes, along `ops` steps, through load balancers and rate limiters, and on from
-caches and CDNs (their misses, their store, a cache's `then`). They do **not** follow yet a
-`blob_store`'s or a `worker_pool`'s `then`, nor a `message_queue`'s consumers (phase 2c), nor
+caches and CDNs (their misses, their store, a cache's `then`) and along a `blob_store`'s `then`
+(its event notifications, one per request it serves). They do **not** follow yet a
+`worker_pool`'s `then`, nor a `message_queue`'s consumers (phase 2c), nor
 the `then` of a `notification_fanout` or a `frontier`. A node whose load can only come through one of those
 gets 0 on paper: a number that is missing, not zero. Its check line therefore has no
 percentage and no zone, but a mark naming each such type on the way to it, nearest first:
-`transcode_q  peak offered 0/s vs 1M/s total capacity  (load not propagated: blob_store is
+`transcoders  peak offered 0/s vs 1k/s total capacity  (load not propagated: message_queue is
 phase 2c)`, or `dns ... (load not propagated: worker_pool is phase 2c, frontier is not modelled
 yet)`. The mark follows such a node's `then` steps (a message queue's links, which is all it
 has), not every link it has. A node that also receives load the checks do follow gets its
 percentage as a **lower bound**, with no zone unless even that is red (the real load is higher,
 so green or yellow might not hold, but red does): `metadata_db ... (≥0.559%; load not
-propagated: worker_pool, message_queue and blob_store are phase 2c)`, `(≥150%, red; ...)`. A check
+propagated: worker_pool and message_queue are phase 2c)`, `(≥150%, red; ...)`. A check
 that is already `not checked` (a `kv_cluster`'s) keeps that mark and adds the bound after it:
 `message_store ... (not checked: kv_cluster nodes, replication and quorums: phase 3)  (lower
 bound; load not propagated: worker_pool and message_queue are phase 2c)`.
@@ -209,7 +209,7 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 | `advanced` | map | all but `client` | read | see next table |
 | `ops` | map | `client`, `service`, `ws_gateway` | read (client, service); checked (ws_gateway) | client: op → share; otherwise op → step list (below) |
 | `cost` | map op → number | `service`, `cache`, `sql_db` | read | **new in v1.2**: the capacity units one request of that op consumes; an op not listed costs 1. Each value is a positive finite number (`cost 'write' must be a positive finite number`, also for a quoted `"3"`) of at most 1e6 (`cost 'write' must be at most 1e6`); anything but a map is `cost must be a map of op to units`, a bare `cost:` is `cost must not be empty (write {} for none)`. `capacity` is then a rate of units: demand is `Σ rate_op × cost_op`, and the node's demand, drops and backlog are reported in units. What it forwards stays requests (a drained `write` of cost 3 is one `write` downstream). A `sql_db` charges its write ops 5 unless `cost` lists them (see [`sql_db`](#sql_db)). A load balancer and a rate limiter charge 1 per request, and `cost` is not a key of theirs. A `worker_pool`'s `cost` is a different key (a duration per job, phase 2c) |
-| `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | read (cache); checked (others) | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step; a cache's `then` steps run (an unconditional one carries everything the cache answered, an `on: miss` one `1 − h` of the reads and none of the writes; see [`then` steps on a cache](#then-steps-on-a-cache)), and `explain`'s paper load follows them the same way |
+| `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | read (cache, blob_store); checked (others) | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step; a cache's `then` steps run (an unconditional one carries everything the cache answered, an `on: miss` one `1 − h` of the reads and none of the writes; see [`then` steps on a cache](#then-steps-on-a-cache)), and `explain`'s paper load follows them the same way; a `blob_store`'s run as asynchronous event notifications, one per request it serves (see [Node types](#node-types)) |
 
 A key outside its row is an error, e.g. `key 'capacity' is not valid for type 'client'`
 (a client is a traffic source with no service rate, service time or waiting room) or
@@ -272,7 +272,7 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `kv_cluster` | `nodes` (int), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp` | ignored; phase 3 |
 | `message_queue` | `partitions`, `retention` † | ignored; phase 2c |
 | `worker_pool` | `consumes` (queue node id), `workers`, `cost` (duration per job), `then` | `consumes` checked; others ignored; phase 2c |
-| `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store; `then` checked, refused by run/estimate until phase 2c's events |
+| `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every request the store serves (not one it drops) sends `factor` requests of the step's op to its target, reads included, and they are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. `on: miss` is refused (`node 'store': a blob store's then steps fire for every request it serves (on: miss needs a cache)`), and an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, delivery delay, failed notifications |
 | `search_index` | `build_interval` | ignored |
 | `ws_gateway` | `max_connections`, `heartbeat` (duration), `fanout` (avg recipients per message), `ops` | `ops` checked as step lists; others ignored; phase 3 |
 | `service_discovery` | `failover` (duration) | ignored; phase 3 |
