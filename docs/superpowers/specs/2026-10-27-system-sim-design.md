@@ -159,17 +159,20 @@ programmer should know" table.
 
 `simsys explain` prints every resolved number and where it came from.
 
+A SQL write uses 5 capacity units of the 5k/s read rate unless the scenario gives it a `cost`:
+the table's "5k reads / 1k writes" for one machine (§18 entry 7).
+
 ## 7. Node catalogue (as flow transfer functions)
 
 | Node | Transfer function and knobs | Chapters |
 |---|---|---|
 | `client` | emits the workload curve per op; receives replies, fits percentiles; `timeout` turns the slow fraction into a retry feedback flow (phase 3) | all |
-| `cdn` | (revised, phase 2b refinement 4) a read-only cache in front of its `origin`: the hit share `h` (`fixed` or `che` from `keys` and the clients' key skew; TTL not modelled) is answered at the edge, the misses `1 − h` go to the origin as the same op (the `read_through` shape of a cache), and writes are refused. Not the earlier draft's "a service's `on: miss` step reads the CDN's hit ratio": a miss step after a CDN is refused, since the CDN fetches its own misses. A byte capacity waits for phase 2c; per-DC instance | 1, 14, 15 |
+| `cdn` | (revised, see §18 entry 10) a read-only cache in front of a required `origin`, which fetches its own misses: the hit share `h` (`fixed`, `che` over the CDN's `keys` in objects and the clients' key distribution, or none: `h = 0`) is answered at the edge and the misses `1 − h` go to the origin as the same op (the `read_through` shape of a cache). The ops in `write_ops` (default `write`) are refused at build: content changes at the origin. A service's `on: miss` step after a CDN is refused, since it would fetch each miss twice. `ttl` accepted, not modelled; a byte capacity waits for phase 2c; one instance per `dc`, as the scenario writes it | 1, 14, 15 |
 | `load_balancer` | (revised, see §17) forwards every op over its links, split by link `weight`; the policy sets how the replicas *behind* it queue: `round_robin` / `weighted` independent copies, `least_connections` one pooled M/M/(c·N) queue, `consistent_hash` the hottest copy at `1 + 1/sqrt(vnodes)` × the average, queued apart from the cool ones | all |
 | `rate_limiter` | (revised, see §17) `token_bucket` (bucket level is fluid state, bursts pass until it empties), `leaky_bucket` (the node's own queue as one deterministic leak slot), `fixed_window`, `sliding_log`, `sliding_counter`, each stepped once per step; rejected flow is its own channel (`reject_rate`), never forwarded and not a drop; an optional counter `backend` sees every checked request | 4, 8, 10 |
 | `service` | per-op cost; downstream steps sequential (latencies add) or parallel (max); `replicas: N` | all |
-| `cache` | (revised, see §17) hit ratio from `fixed: h` (phase 2a) or `che` (LRU under Zipf, from `keys` and skew; phase 2b); `write_ops` name the writes, every other op is a read; strategy `cache_aside` (misses fetched by the service's `on: miss` step) / `read_through` / `write_through` / `write_around` (phase 2a) / `write_back` (buffered writes flushed at a rate; phase 2b) | 8, 11–14 |
-| `sql_db` | writes to primary, reads split over replicas, replication lag → staleness metric, connection pool as concurrency, sharding divides load | 8, 10–12, 15 |
+| `cache` | (revised, see §17 and §18) hit ratio from `fixed: h` (phase 2a) or `che` (LRU under the key distribution of the clients that reach it, filtered behind another cache, partitioned behind a hash ring; phase 2b); `write_ops` name the writes, every other op is a read; strategy `cache_aside` (misses fetched by the service's `on: miss` step) / `read_through` / `write_through` / `write_around` (phase 2a) / `write_back` (writes acknowledged from memory and flushed to the backend as an asynchronous hop; phase 2b); `then` steps, `always` or `on: miss` (phase 2b) | 8, 11–14 |
+| `sql_db` | (revised, see §18 entries 6–9) one primary and `replicas − 1` read replicas: writes to the primary, reads split over the replicas, every replica replaying the committed writes; a write costs 5 read units by default; `pool` sets `c` and caps the rate by Little's law; `shards` divides the load; staleness = primary sojourn + replication lag + replica sojourn, and a replica that misses committed writes fails the `staleness` SLO | 8, 10–12, 15 |
 | `kv_cluster` | hash ring with virtual nodes → load imbalance factor; replication N amplifies writes; quorum W/R → latency is the W-th (R-th) order statistic of replica latencies; partition → unavailable fraction (CP) or stale fraction (AP) | 6, 11–13 |
 | `message_queue` | backlog level, consumer drain rate, lag = backlog / drain, partitions bound parallelism | 10–12, 14, 15 |
 | `worker_pool` | capacity = workers / job cost; DAG stages chain | 9, 10, 14, 15 |
@@ -177,7 +180,7 @@ programmer should know" table.
 | `search_index` | read-mostly capacity; build-vs-serve split | 13 |
 | `ws_gateway` | connections as a level (connect − disconnect rates); fan-out multiplies message flow by session size | 12 |
 | `service_discovery` | adds lookup latency; failover time on `node_down` | 6, 12 |
-| `id_generator` | capacity in IDs/s; `snowflake` scales with workers, `ticket_server` is a single hot node | 7, 8, 12 |
+| `id_generator` | (revised, see §18 entry 12) a `service` whose capacity and service time its `algorithm` supplies: `snowflake` 4.096M IDs/s per replica, `ticket_server` one 1k/s database (exactly one replica), `uuid` unbounded | 7, 8, 12 |
 | `external_sink` | latency distribution + failure fraction + per-host politeness rate cap | 9, 10 |
 | `notification_fanout` | per-channel split, dedup fraction, retry feedback with DLQ | 10 |
 | `frontier` | URL backlog with politeness rate per host | 9 |
@@ -527,3 +530,193 @@ Refinements that came out of review while building:
 16. **`reject_rate` versus `drop_rate`.** A drop is a node failing (its waiting room was
     full); a rejection is a limiter's policy working (ch. 4's 429). Each is a per-node
     ratio of its node's demand, with its own SLO metric, table column and CSV column.
+
+## 18. Phase 2b refinements (2026-10-28)
+
+Building phase 2b (plan `docs/superpowers/plans/2026-10-28-phase2b-che-sql-cdn.md`) fixed the
+following points. The plan's header listed seven refinements; the review rounds of Tasks 2–7
+corrected several of them and added the rest, so each entry below is the rule as finally implemented.
+Where they conflict with an earlier section, this section wins; §7's `cdn`, `cache`, `sql_db`
+and `id_generator` rows are updated in place and §6 points at entry 7. The rules a scenario
+author meets are in `docs/scenario-schema.md` (v1.3).
+
+1. **Key distribution resolution.** A client states `keys: {zipf: s, space: N}` or
+   `{uniform: N}` (`zipf: 0` is stored as uniform, so the two compare equal). A cache or CDN
+   with `hit_ratio: che` takes its popularity from the clients whose **ops** reach it: the
+   graph follows each client's calls (a service's steps, miss steps included; a balancer's or
+   limiter's routes; a cache's backend fetch and `then` steps; a CDN's origin fetch), not the
+   boxes, and leaves out a limiter's `counter` request, which counts per user, not per key.
+   Exactly one distinct spec must arrive; no demand, a client without `keys`, or two clients
+   with different specs is a graph error naming them. *Why:* the plan walked demand edges box
+   to box, and the Task 2 review found that a writer sharing a service with the cache's
+   readers then imposed its keys on the cache, and that the limiter's counter hop counted as
+   client keys. *Ignores:* several distributions mixed by rate (phase 2c), a key space per op,
+   any correlation between a client's ops and its keys.
+2. **Che approximation** (Che, Tung & Wang 2002; Fricker, Robert & Roberts 2012 for why it
+   holds for LRU). With popularities `p_i` and a cache of `C` keys, the characteristic time
+   `t_c` solves `Σ_i (1 − e^{−p_i t_c}) = C` and the hit ratio is
+   `h = Σ_i p_i (1 − e^{−p_i t_c})`. A Zipf space of up to 1e9 keys is summed over at most 2000
+   log-spaced rank buckets (edges `⌊N^{k/2000}⌋`), measured at a relative error of at most
+   2e-6 for `s ≤ 3` (the plan's bound was 1e-3); `t_c` is found by 80 bisection steps on
+   `log t` from the bracket `t_c ≥ C` (from `1 − e^{−x} ≤ x`). The hit ratio is computed once,
+   at build, and from then on a `che` cache runs exactly like a fixed one. §5's
+   `HitRatioModel`, `hit_ratio(w, keys)`, became `hit_ratio(capacity) -> double`, each model
+   owning its inputs (`CheHitRatio{popularity}`, `FixedHitRatio{value}`), because a fixed
+   ratio has no popularity to be handed; the graph keeps the resolved inputs rather than the policy
+   variant, which GCC 14.2 cannot hold in `Graph` in a Release build. *Why:* a cache is usually
+   sized by hand with the 80/20 rule of thumb (an industry habit, not a figure from the book),
+   which describes an ideal cache holding exactly the hottest keys; Che derives the hit ratio
+   from the cache size and the key skew for the LRU cache that is really deployed (Zipf 1 over
+   1e8 keys, a cache of 20 % of them: 0.92 ideal, 0.88 LRU). *Ignores:* temporal
+   locality (the independent reference model), TTL expiry, a cold cache, and eviction other
+   than LRU: `eviction: fifo` or `lfu` uses the same model (FIFO is two to four points lower,
+   LFU better, up to the ideal hottest-keys share), which the schema and `caching.cppm` say.
+3. **Filtered popularity behind a cache** (review of Task 2). A cache whose reads arrive as
+   another `che` cache's misses (its `read_through` fetch, its `then` step on miss, a
+   service's miss step after it) sees the cold tail: key `i` misses with probability
+   `e^{−p_i t}`, so the second cache's popularity is `∝ p_i e^{−p_i t}` (Martina, Garetto &
+   Leonardi, INFOCOM 2014). Two 2M-key caches over Zipf 0.9 and 10M keys hit 0.747 and 0.257,
+   where the unfiltered popularity gave the second one 0.747 too. A fixed-ratio cache in
+   front says how many requests miss but not which, so the popularity passes unfiltered and
+   `explain` says so (refusing it would have broken `search-autocomplete`). A cache's reads
+   must all come one way (filtered by one cache, or unfiltered), and caches that are each
+   behind the next in a loop are refused. *Ignores:* that the misses of an LRU cache are not
+   independent requests again (the filter assumes they are).
+4. **Partitioned caches behind a hash ring** (review of Task 2). `keys` is per replica.
+   Behind a `consistent_hash` balancer each key lives on one replica, so the replicas
+   partition the key space; the hottest owns `a_hot = k/N` of it (`k = 1 + 1/√vnodes`, the
+   balancer's imbalance of §17 entry 5) and the others `(1 − k/N)/(N − 1)` each, and
+   `h = Σ_j a_j · Che(keys / a_j)`. The hit ratio is concave in the cache size, so uneven arcs
+   hit less than one cache of `keys × N`: the consistent-hashing lab's four 2M-key servers give
+   0.924 at `vnodes: 1`. Behind any other policy every replica caches the same hot keys, and
+   the size is `keys`. A partitioned cache also sent requests directly is refused (no single
+   popularity per replica). *Ignores:* a replica lost to a fault (the hit ratio is resolved
+   once; phase 3 re-evaluates it from the same inputs), the real spread of many arcs.
+5. **Cache `then` steps and `write_back`** (plan refinement 5, sharpened in review). An
+   unconditional `then` step carries everything the cache answered; an `on: miss` one `1 − h`
+   of the reads and none of the writes, and several miss steps form one sequential block that
+   a miss takes whole. Refused: a `then` step on miss on a `read_through` cache, a service's
+   miss step after a cache with a `then` step on miss (either way each miss would be fetched
+   twice), a parallel miss step (a miss waits for it), and a `then` step that duplicates the
+   backend hop. `write_back` acknowledges a write from memory (the client sees the cache's
+   own sojourn) and flushes it to the backend as an asynchronous hop at the same rate, marked
+   at build, so the store's load is unchanged. `write_ops` is optional in the model: absent
+   means the type's default (`[write]`; a database's `[write, insert, update, delete]`), a
+   stated list is exactly what it says. *Why:* ch. 1's CDN workflow and ch. 13's browser
+   cache put a cache in front of the next tier, which ch. 1's cache-aside cannot express.
+   *Ignores:* the dirty-entry queue and how far the store lags, writes lost when the cache
+   dies before a flush, coalescing of repeated writes to one key (the store's load is an
+   upper bound).
+6. **SQL database** (plan refinement 3, corrected by two reviews). `replicas: N` is one
+   primary and `N − 1` read replicas (ch. 1, "database replication"); writes go to the
+   primary, reads to the replicas when `N ≥ 2`, and `shards: S` makes `S` such sets, each
+   with `1/S` of the load. Each copy is its own queue of the node's capacity, its group
+   tagged with a `CopyRole` (`server`, `primary`, `replica`). Every replica replays the
+   writes its primary **committed**, `primary drained writes / S`, not the writes the
+   clients offered (review C2: a replica replays the log, which holds nothing the primary
+   dropped). The node reports the busier copy's `rho` and zone; its demand, drain, drops and
+   backlog are the clients' part, so the clients' totals balance while the replicas'
+   replication work shows in their `rho`, the reads' latency and the missed writes of entry
+   9 (review I4). The database driver, not a balancer, picks the copy, so no balancer imposes
+   a replica model on a database (review I1), and a database calls nobody (a link out of one
+   is refused). *Ignores:* failover, multi-primary set-ups and conflicts, transactions and
+   locks, hot shards and resharding, cross-shard queries, read-your-writes, a replica
+   applying its log on a thread of its own (a replicated write waits with the reads).
+7. **Write cost 5 by default** (review I3 of Task 4). A `sql_db`'s `capacity` is reads/s,
+   and a write op with no stated `cost` costs **5** units, on the primary and on every
+   replica that replays it: §6 gives one SQL machine 5k reads/s or 1k writes/s
+   (`defaults::sql_write_cost = 5000 / 1000`, priced in one place, `defaults::op_cost`, for
+   the engine and `explain` alike). `explain` prints each defaulted write op with its source,
+   `cost: write 5 (default: spec §6 5k reads/1k writes)`. *Why:* a default of 1 would let one
+   primary absorb the book's write load; with 5, url-shortener's database needs the book's
+   own sharding. *Ignores:* a write's longer service time (it uses more capacity, not a
+   longer sojourn) and the difference between a log append and a random update.
+8. **Connection pool** (review C3 of Task 4, re-review 3). The plan made `pool` sugar for
+   `advanced.concurrency`, which would let more connections serve faster than the disk. By
+   Little's law (queries in service = throughput × service time) a pool can only cap a copy:
+   `c = min(pool, implied c)` and `service rate = min(capacity, pool / service time)`, in
+   capacity units (a write at cost 5 holds its connection five service times). 5k/s copies
+   of 10 ms with `pool: 4` serve 400/s; 3000 reads/s on one copy drop about 2600/s. `explain`
+   prints `capacity=400/s (pool 4 / 10ms)` and `c=4 (pool)` when the pool binds. Both keys
+   set `c`, so stating both is refused ("pool sets c and caps the rate by Little's law; drop
+   advanced.concurrency"). *Ignores:* waiting for a free connection apart from the copy's
+   queue, connection set-up cost.
+9. **Staleness and missed writes per replica** (review C1 of Task 4, re-review 1, 2, 4). A
+   write reaches a reader after its sojourn at the primary, the `replication_lag` (a
+   constant) and its sojourn at a replica; the node's staleness is the sum, 0 without
+   replicas, and the `staleness` SLO compares its mean after warmup with `max`. A lag of 0 is
+   not a synchronous replica: the write still waits in both queues. A replica too busy to
+   replay every committed write **falls behind without bound** (MySQL's relay log and
+   Postgres's WAL never skip an entry; the replica is rebuilt once the primary's retention
+   runs out); the model drops the excess at `queue_limit`, so the staleness it reports is the
+   bounded-queue figure (finite: JSON has no infinity). It reports the writes **one** replica
+   misses per second beside the writes one shard's primary committed (summed over replicas,
+   the first figure exceeded the committed writes), and the `staleness` SLO fails on any
+   missed write with the note `each replica misses 88.89/s of 200/s committed writes
+   (44.4%)`. At exactly `rho = 1` a run keeps an empty queue empty and `estimate` takes it as
+   full (200 inserts/s on two 1k/s copies: 250 ms against 2.05 s); the docs size examples
+   off that edge. *Ignores:* the lag's own variation, semi-synchronous replication, the
+   growing lag itself.
+10. **CDN** (plan refinement 4, redesigned in Task 5). Until Task 5 a CDN was a cache whose
+    hit ratio a service's `on: miss` step read: the CDN forwarded nothing and its `origin`
+    saw load only if some service happened to fetch the misses. Ch. 1's CDN workflow has the
+    edge fetch a missing file from the origin itself, so a CDN is now a **read-only cache in
+    front of a required `origin`**, the `read_through` shape of a cache whose backend is the
+    origin: `1 − h` of each read goes to the origin as the same op, and the response is the
+    mixture `{h: own, 1 − h: own + hop}`. `CdnBehaviour` delegates to a `CacheBehaviour`
+    (Pattern: Delegation) instead of restating it. `hit_ratio` is fixed, `che` (over the
+    CDN's `keys` in objects) or absent (`h = 0`, which runs); an unsized `che` CDN explains as
+    an upper bound and does not run. The ops in `write_ops` (default `[write]`) are refused at
+    build, naming the op and its sender, since content changes at the origin (review I2: an
+    `upload` sent through a CDN was otherwise served from the edge); `explain` lists the ops
+    a CDN serves. Also refused: a service's miss step after a CDN, a CDN that is its own
+    origin, an origin that calls back into the CDN, and a byte `capacity` (phase 2c). A CDN
+    as another CDN's origin is a tiered CDN, whose second tier's `che` is filtered (entry 3).
+    *Ignores:* bytes and bandwidth, TTL expiry (`ttl` is accepted and printed), a cold edge,
+    purges, ch. 1's "CDN fallback" (phase 3's faults), the choice of the nearest PoP (the
+    client's links say which CDN it uses), the CDN's price.
+11. **Byte-derived capacities are not checked** (review I1 of Task 5). `simsys.defaults`
+    converts a byte rate (`capacity: 100GB/s`, a blob store's default 500 MB/s) into
+    requests at an assumed 1 MB per object, which no scenario states. The engine refuses to
+    run on such a number, and `explain` prints it tagged with where it came from and gives
+    its check the load but no percentage and no zone: `(not checked: capacity from 100GB/s at
+    1MB/object; byte flows: phase 2c)`. Labelled `(scenario)` with a zone, youtube's
+    `cdn_us` read 0.28 % green where its 50 MB streams make it about 14 %, and
+    `transcoded_store` 1.58 % green where it is about 79 %. *Ignores:* until phase 2c, every
+    byte figure.
+12. **ID generator as service sugar** (plan refinement 6; Pattern: sugar resolved at build).
+    `algorithm` is required; it supplies a `service`'s two numbers: `snowflake` 4.096M/s per
+    replica (12 sequence bits: 4096 ids per millisecond) and 10 µs (chosen), `ticket_server`
+    1k/s (§6's SQL write rate: an id is a write) and 1 ms, `uuid` 1G/s and 1 µs (nothing to
+    coordinate). A stated `capacity` or `latency` wins; `explain` tags the algorithm's
+    numbers `(algorithm)`. A ticket server must have `replicas: 1` (one database issues the
+    sequence), checked by the loader and, for scenarios built in code, by `Graph::build`.
+    *Ignores:* ch. 7's multi-master design, its several ticket servers kept in sync (the
+    remedy for the single point of failure), clock skew, and snowflake's 5-bit machine field
+    (at most 32 machines per datacenter).
+13. **Series and JSON columns** (plan refinement 7, decided). The node series gains
+    `demand_per_s,drain_per_s` after `node`, so the conservation law `Σ demand·dt = Σ (drain
+    + drops)·dt + backlog` can be checked from the file. What the clients see goes to a second
+    file rather than a second section of the first: `run --series-ops` writes
+    `t_s,client,op,offered_per_s,answered_per_s,mean_ms`, from an `OpSeriesWriter` that
+    observes the same step records as the summary and the node writer (Pattern: Observer).
+    `run` checks both paths before truncating either and refuses one file for both. JSON's
+    ops gain `answered_per_s`; its nodes `staleness_s`, `replication_dropped_per_s` and
+    `committed_writes_per_s` (`null` for nodes that are not databases); each SLO a `note`.
+14. **Answered = offered − lost** (review I2 of Task 7). The delivered fraction of §17 entry 8
+    took each node's `served / inflow` per step, so a request still waiting at the end of its
+    arrival step counted as lost and was never credited (a 3× spike into a deep queue
+    reported 583/s answered of 667/s with nothing dropped). A node's own share is now
+    `1 − (dropped + rejected) / inflow`, so answered is offered minus what a limiter refused or
+    a queue dropped, and a backlog is neutral; in a steady state the two agree, and no pinned
+    value moved. Transient runs move: the requests that waited out a surge now count, with
+    their wait (the rate-limiter lab's p99 30.5 ms, was 29.4 ms).
+15. **Explain marks load it cannot follow** (Task 7, review I1). The paper load does not yet
+    pass through a blob store's or worker pool's `then`, a message queue's consumers, or a
+    fan-out's or frontier's `then`. A node reached only that way prints no percentage and no
+    zone but `(load not propagated: blob_store is phase 2c)`, naming each blocking type once,
+    nearest first, grouped by phase. A node that also gets load the checks follow keeps its
+    percentage as a **lower bound**, `(≥0.559%; load not propagated: ...)`, with no zone
+    unless it is already red (a red lower bound is red for certain) and no per-copy figures;
+    a `not checked` line adds `(lower bound; ...)`. *Why:* "0 %, green" and "(0.05%, green)"
+    read as an idle tier when the number is missing. *Ignores:* how much load is missing.

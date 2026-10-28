@@ -1,10 +1,45 @@
-# Scenario schema v1.2 (phase 2a)
+# Scenario schema v1.3 (phase 2b)
 
 v1 was fitted to the 12 book and lab drafts plus the first tutorial; v1.1 wrote down the
-rules the phase 1 loader enforces. **v1.2** is the language as phase 2a reads it: the
-loader (`src/config/config.cpp`), the graph builder (`src/engine/graph.cppm`) and the
-node behaviours (`src/engine/behaviours.cppm`). All 14 files under `scenarios/` load
-under it.
+rules the phase 1 loader enforces; v1.2 added phase 2a's rate curves, balancers, limiters and
+fixed-ratio caches. **v1.3** is the language as phase 2b reads it: the loader
+(`src/config/config.cpp`), the graph builder (`src/engine/graph.cppm`), the node behaviours
+(`src/engine/behaviours.cppm`) and the reports (`src/report/report.cpp`). All 14 files under
+`scenarios/` load under it, and six of them run end to end ([below](#what-runs-in-phase-2b)).
+The design decisions behind the new rules, with what each ignores, are spec §18
+(`docs/superpowers/specs/2026-10-27-system-sim-design.md`).
+
+New in v1.3:
+
+- a client's [`keys`](#node-types) (`{zipf: s, space: N}` or `{uniform: N}`) and
+  [`hit_ratio: che`](#che-hit-ratios) on a cache or CDN: the hit ratio is computed at build with
+  the Che approximation from the cache's `keys` and the key distribution of the clients whose
+  ops reach it; behind another `che` cache the popularity is the front cache's misses (filtered
+  popularity), and behind a `consistent_hash` balancer the replicas split the key space over
+  uneven arcs;
+- a cache's [`then` steps](#then-steps-on-a-cache) (`on: always` and `on: miss`) and the
+  `write_back` strategy, whose flush to the store is an asynchronous hop;
+- [`sql_db`](#sql_db): a primary and `replicas − 1` read replicas, `shards`, a connection
+  `pool` that sets `c` and caps the rate by Little's law, `replication_lag`, `write_ops`, and a
+  `cost` whose write ops default to **5** (spec §6: 5k reads/s or 1k writes/s per machine);
+  replicas replay the writes the primary committed; the `staleness` SLO (primary sojourn + lag +
+  replica sojourn) fails when a replica misses committed writes;
+- [`cdn`](#cdn): a read-only cache in front of a required `origin`, which fetches its own misses
+  as the same op; `hit_ratio` fixed, `che` or none; `write_ops` names the ops it refuses;
+- [`id_generator`](#id_generator): `algorithm: snowflake | ticket_server | uuid`, a `service`
+  whose capacity and service time the algorithm supplies;
+- the CSV columns `demand_per_s` and `drain_per_s`, the second series file
+  [`run --series-ops`](#drops-and-rejections) (`offered_per_s`, `answered_per_s`, `mean_ms` per
+  client op), and JSON's `answered_per_s`, `staleness_s`, `replication_dropped_per_s`,
+  `committed_writes_per_s` and the SLO `note`; `answered` is offered minus what was lost
+  (dropped or rejected), so a request waiting in a growing queue still counts;
+- `explain`'s marks: a node whose load comes only through a type that does not propagate it yet
+  is marked `(load not propagated: ...)` with no percentage, a node that is partly fed so gets
+  its percentage as a lower bound `(≥p%; ...)` ([below](#what-runs-in-phase-2b)), and a check
+  whose capacity was converted from a byte rate is `not checked` (see `capacity` in
+  [Node (common keys)](#node-common-keys));
+- the runnable set: `tutorial/hello`, `tutorial/chain`, `labs/rate-limiter`,
+  `labs/consistent-hashing`, `labs/unique-id` and `book/url-shortener`.
 
 New in v1.2:
 
@@ -25,35 +60,39 @@ Two kinds of marks:
   **checked** means the loader validates it but nothing uses it yet; **ignored** means the
   key is accepted (a misspelt key is still an error) and its value is not looked at.
 
-## What runs in phase 2a
+## What runs in phase 2b
 
 `simsys validate` runs the loader only. `explain`, `estimate` and `run` also build the
 graph, which adds the checks marked *(graph)* below. `explain` works for every node type.
 `estimate` and `run` step these types:
 
-| type | runs in phase 2a |
+| type | runs in phase 2b |
 |---|---|
 | `client` | the whole rate curve, with its seeded noise |
 | `service` | ops, steps, per-op `cost` |
 | `load_balancer` | every policy |
 | `rate_limiter` | every algorithm, with or without a counter `backend` |
 | `cache` | a fixed or [`che`](#che-hit-ratios) hit ratio, every strategy (`write_back` with an asynchronous flush), [`then` steps](#then-steps-on-a-cache) |
-| `sql_db` | phase 2b: a primary and read replicas, `shards`, `pool`, `replication_lag` and the `staleness` SLO, see [`sql_db`](#sql_db) |
-| `cdn` | phase 2b: a fixed or `che` hit ratio (or none: every read misses), misses fetched from its `origin`, see [`cdn`](#cdn); not with a byte `capacity` (phase 2c) |
-| `id_generator` | phase 2b: as a `service` whose capacity and service time its `algorithm` supplies, see [`id_generator`](#id_generator) |
+| `sql_db` | a primary and read replicas, `shards`, `pool`, `replication_lag` and the `staleness` SLO, see [`sql_db`](#sql_db) |
+| `cdn` | a fixed or `che` hit ratio (or none: every read misses), misses fetched from its `origin`, see [`cdn`](#cdn); not with a byte `capacity` (phase 2c) |
+| `id_generator` | as a `service` whose capacity and service time its `algorithm` supplies, see [`id_generator`](#id_generator) |
 
 Everything else is refused before the first step, with exit code 1:
 
 | what | message | runs from |
 |---|---|---|
-| a `cdn` with a byte `capacity` | `node 'x': a cdn with a byte capacity needs byte flows (phase 2c)` | 2c |
-| a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | 2b, once it states `keys` |
-| `blob_store`, `message_queue`, `worker_pool`, `external_sink` | the same message | 2c |
+| `blob_store`, `message_queue`, `worker_pool`, `external_sink` | `node 'x' has type 'blob_store', which run/estimate do not support yet (phase 2)` | 2c |
 | `kv_cluster`, `ws_gateway`, `service_discovery` | the same message | 3 |
 | `search_index`, `notification_fanout`, `frontier` | the same message | not yet assigned to a phase |
+| a `cdn` with a byte `capacity` | `node 'x': a cdn with a byte capacity needs byte flows (phase 2c)` | 2c |
+| a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
 | `faults` | none: the list is accepted and nothing happens | 3 |
 
-The type message says "(phase 2)" for every type; the last column is the plan.
+The type message says "(phase 2)" for every type; the last column is the plan. The first
+node in file order that cannot run is the one named, and the type check comes before the two
+CDN checks. Of the 14 shipped scenarios six run: `tutorial/hello`, `tutorial/chain`,
+`labs/rate-limiter`, `labs/consistent-hashing`, `labs/unique-id` (which fails its `drop_rate` SLO
+on purpose, exit 2) and `book/url-shortener`.
 
 **`estimate` versus `explain`.** `estimate` evaluates the long-run state once, at
 t = 0 (00:00): the rate curve's value there, without noise. Its first line says so:
@@ -84,7 +123,13 @@ yet)`. The mark follows such a node's `then` steps (a message queue's links, whi
 has), not every link it has. A node that also receives load the checks do follow gets its
 percentage as a **lower bound**, with no zone unless even that is red (the real load is higher,
 so green or yellow might not hold, but red does): `metadata_db ... (≥0.559%; load not
-propagated: worker_pool, message_queue and blob_store are phase 2c)`, `(≥150%, red; ...)`.
+propagated: worker_pool, message_queue and blob_store are phase 2c)`, `(≥150%, red; ...)`. A check
+that is already `not checked` (its capacity came from a byte rate, see `capacity` in
+[Node (common keys)](#node-common-keys)) keeps that mark and adds the bound after it:
+`transcoded_store ... (not checked: capacity from 10GB/s at 1MB/object; byte flows: phase 2c)
+(lower bound; load not propagated: worker_pool, message_queue and blob_store are phase 2c)`.
+A lower-bound line has no per-copy figures (a database's primary/replica split, a ring's hottest
+copy): they would be lower bounds too.
 
 ## Values
 
@@ -158,7 +203,7 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 |---|---|---|---|---|
 | `type` | enum | all | read | one of the catalogue below |
 | `dc` | string | all | read | a declared datacenter; default as above. Decides whether a link without `latency` is intra- or cross-DC |
-| `replicas` | integer > 0 | all | read | N identical copies: each copy sees its share of the demand with the node's full capacity, concurrency and queue limit; backlog and drops are reported summed. How the demand is shared depends on a load balancer in front ([below](#load_balancer)); without one, `demand / N` each. No effect on a client |
+| `replicas` | integer > 0 | all | read | N identical copies: each copy sees its share of the demand with the node's full capacity, concurrency and queue limit; backlog and drops are reported summed. How the demand is shared depends on a load balancer in front ([below](#load_balancer)); without one, `demand / N` each. On a `sql_db` the copies are one primary and `N − 1` read replicas, split by op whatever stands in front (see [`sql_db`](#sql_db)); on a `ticket_server` id generator it must be 1. No effect on a client |
 | `capacity` | rate or byte rate | all but `client` | read | service rate **per replica**; default per type (§6 of the spec; 100k/s for `load_balancer`, `rate_limiter` and `cache`). A byte rate (`500MB/s`) is read as objects of 1 MB per second, an object size no scenario states, so `explain` tags such a capacity, `capacity=500/s (scenario: 500MB/s at 1MB/object; byte flows: phase 2c)` (a `blob_store`'s default, spec §6's 500 MB/s, likewise with `default:`), and gives its check the load but no percentage and no zone, `(not checked: capacity from 500MB/s at 1MB/object; byte flows: phase 2c)`, until phase 2c's byte flows take each op's own size. At most `1e15/s` (`1e15B/s` for a byte rate). An error on a `leaky_bucket` limiter |
 | `latency` | duration | all but `client` | read | service time of one request; default per type (50 µs for `load_balancer` and `rate_limiter`, 250 µs for `cache`: the spec's memory read). An error on a `leaky_bucket` limiter |
 | `advanced` | map | all but `client` | read | see next table |
@@ -409,6 +454,7 @@ model assumes every other hop between a client and the cache carries the client'
 - no client's ops reach the cache: *(graph)* `node 'c': hit_ratio che: no client's demand reaches it`;
 - a client whose ops reach it states no `keys`: *(graph)* `node 'c': hit_ratio che: client 'b' reaches it without keys`;
 - two clients with different `keys`: *(graph)* `node 'c': hit_ratio che: clients 'a' and 'b' send different key distributions` (the first two in file order that disagree);
+- `che` caches that are each behind the next in a loop, so no filter can be computed first: *(graph)* `node 'a': hit_ratio che: its keys loop back through itself (each cache of the loop is behind the next)`;
 - clients with equal `keys` share it. `{zipf: 0, space: N}` is `{uniform: N}` (the loader stores it so), and the two agree.
 
 **Caches behind caches.** Requests that reach the cache as the misses of another `che` cache (its
@@ -445,8 +491,9 @@ as unfiltered)`; behind a ring `hit_ratio=0.924 (che: zipf 0.9 over 10M keys fro
 x 4 partitioned, uneven arcs)`. A key space past `9999G` is written in digits. From then on a
 `che` cache runs exactly like a fixed one with that `h`.
 
-For spec §18: the code's `HitRatioModel` is `hit_ratio(capacity) -> double`, each model owning its
-inputs (`CheHitRatio{popularity}`), where spec §5 wrote `hit_ratio(capacity, popularity)`.
+The code's `HitRatioModel` concept is `hit_ratio(capacity) -> double`, each model owning its
+inputs (`CheHitRatio{popularity}`), where spec §5 wrote `hit_ratio(workload, keys)` (spec §18
+entry 2).
 
 ### `cdn`
 
@@ -640,7 +687,7 @@ rate:
 ```
 All keys are **read**: the loader types them, `explain` and `simsys curve` print them, and
 `run` offers the curve (with its noise) at every step. `estimate` evaluates it once, at t = 0, without noise
-(see [What runs](#what-runs-in-phase-2a)).
+(see [What runs](#what-runs-in-phase-2b)).
 
 Composition: `rate(t) = level(t) × wave(t) × Π active spike factors × noise(t)`, where
 `level` is the ramp's rate `from + (to − from) × min(t / over, 1)` when there is a ramp,
@@ -707,7 +754,7 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 | `reject_rate` | optional | not allowed | number in [0, 1] | **new in v1.2**: the node's rejected (a rate limiter's refusals, a leaky bucket's overflow included) / the requests sent to it, after warmup; without `node`, the worst node's |
 | `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup |
 | `queue_lag` | optional | not allowed | duration | reported `skipped` until `message_queue` runs (phase 2c) |
-| `staleness` | optional; name a `sql_db` | not allowed | duration | phase 2b: the named database's mean staleness after warmup, its write sojourn at the primary + `replication_lag` + its sojourn at a replica (see [`sql_db`](#sql_db)); fails whatever that mean when a replica misses committed writes (it falls behind without bound; the note says how many per replica, of how many committed); `skipped` without a `node` or on a node that keeps no replicated data |
+| `staleness` | optional; name a `sql_db` | not allowed | duration | phase 2b: the named database's mean staleness after warmup, its write sojourn at the primary + `replication_lag` + its sojourn at a replica (see [`sql_db`](#sql_db)); fails whatever that mean when a replica misses committed writes (it falls behind without bound; the note says how many per replica, of how many committed); `skipped` without a `node` or on a node that keeps no replicated data (any type but `sql_db`); a `sql_db` with `replicas: 1` reports 0 |
 
 The kind of `max` follows the metric, so `0.01` can never be read as 0.01 seconds
 (`slo: reject_rate max must be between 0 and 1`).

@@ -15,3 +15,20 @@ building it, and further reading. See §10 of the design spec for the planned li
 | [generator.md](generator.md) | coroutines, `co_yield`, `std::generator` (lazy single-pass ranges) | C++20 / C++23 | `workload::samples`, `curve_samples` and `print_samples` in `main.cpp` (`simsys curve`) |
 | [random.md](random.md) | `<random>` engines vs distributions, `std::mt19937_64`, seeding; the Ornstein–Uhlenbeck noise | C++11 | `workload::NoiseProcess`, `behaviours::client_seed`, `ClientBehaviour::tick` |
 | [numerics.md](numerics.md) | `expm1` / `log1p`, bisection vs Newton, sums kept in [0, 1], latency moments, fluid steps (floating point, not a language feature) | C++11 `<cmath>` | `caching.cppm` (`power_integral`, `characteristic_time`), `queueing.cppm` (`erlang_c`, `lognormal_quantile`), `flow.cppm`, `fluid.cppm` |
+
+## Where to look: design patterns
+
+Every design pattern is named where it is used, in a `Pattern:` comment, so
+`grep -rn 'Pattern:' src` lists them all. Phase 2b added four worth reading side by side:
+
+- `Pattern: Delegation` on `CdnBehaviour` (`src/engine/behaviours.cppm`): a CDN is the
+  read-through shape of a cache, so it holds a `CacheBehaviour` and forwards every call to it
+  instead of inheriting from it or copying it.
+- `Pattern: sugar resolved at build` on `defaults_of` (`src/defaults/defaults.cppm`): an id
+  generator is a `ServiceBehaviour` whose two numbers its `algorithm` supplies; no new class.
+- The `CopyRole` enum (`server`, `primary`, `replica`) on `CopyGroup` in
+  `src/engine/engine.cppm`, used by `make_database` under `Pattern: Strategy (data-driven)`: a
+  closed enum states what a database copy is instead of inferring it from its shares.
+- `Pattern: Observer` on `Summary`, `SeriesWriter` and `OpSeriesWriter`
+  (`src/report/report.cppm`), fanned out by one lambda in `run` (`src/cli/main.cpp`): each
+  observer sees every step record and none knows of another.
