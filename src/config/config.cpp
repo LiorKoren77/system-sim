@@ -140,7 +140,18 @@ CheckResult check_version(const std::string& file, const YAML::Node& root) {
   return {};
 }
 
+// An empty document is null, not a map: it falls through to the required-keys check, whose
+// "missing top-level key" message is the more useful one. Any other non-map root (a bare
+// scalar, a list) would make the key lookups below throw yaml-cpp's own error.
+CheckResult check_root_is_map(const std::string& file, const YAML::Node& root) {
+  if (root.IsDefined() && !root.IsNull() && !root.IsMap()) {
+    return std::unexpected(error_at(file, root, "scenario must be a map"));
+  }
+  return {};
+}
+
 CheckResult check_top_level(const std::string& file, const YAML::Node& root) {
+  if (auto checked = check_root_is_map(file, root); !checked) return checked;
   if (auto checked = check_required_top_level_keys(file, root); !checked) return checked;
   if (auto checked = check_version(file, root); !checked) return checked;
   for (const auto key : optional_top_level_durations) {
@@ -330,6 +341,8 @@ std::expected<std::vector<LinkDecl>, ConfigError> collect_links(const std::strin
 // pure check, the parsed value otherwise); the first error wins.
 std::expected<Scenario, ConfigError> validate(const std::string& file, const YAML::Node& root) {
   if (auto checked = check_top_level(file, root); !checked) return std::unexpected(checked.error());
+  auto name = scalar_value(file, root, "name");
+  if (!name) return std::unexpected(name.error());
   auto duration = parse_duration_key(file, root, "duration");
   if (!duration) return std::unexpected(duration.error());
   auto declared = collect_node_declarations(file, root["nodes"]);
@@ -339,7 +352,7 @@ std::expected<Scenario, ConfigError> validate(const std::string& file, const YAM
   }
   auto links = collect_links(file, root["links"], declared->ids);
   if (!links) return std::unexpected(links.error());
-  return Scenario{root["name"].Scalar(), root["version"].as<int>(), *duration,
+  return Scenario{std::move(*name), root["version"].as<int>(), *duration,
                   std::move(declared->nodes), std::move(*links)};
 }
 
