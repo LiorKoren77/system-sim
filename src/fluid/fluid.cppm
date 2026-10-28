@@ -55,8 +55,8 @@ struct Capacity {
 
 enum class Zone { green, yellow, red };
 
-// Pattern: Strategy-by-data — the thresholds live in Capacity, so each node can have its
-// own alerting levels without a subclass. >= red -> red, >= yellow -> yellow.
+// The thresholds live in Capacity, as data, so each node can have its own alerting levels
+// without a subclass. >= red -> red, >= yellow -> yellow.
 [[nodiscard]] Zone zone_of(double rho, const Capacity& c);
 
 // Everything one step produced, for metrics and for routing the drained flow onward.

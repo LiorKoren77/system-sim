@@ -36,6 +36,10 @@ TEST_CASE("the node type table is complete at compile time", "[model]") {
 }
 
 TEST_CASE("a default NodeSpec has one replica in datacenter main and no overrides", "[model]") {
+  // C++20 designated initializers: `.field = value` names each member it sets; every
+  // other member keeps its default, which is exactly what this test inspects. Replaces
+  // positional aggregate initialization, where the reader counts fields to see which
+  // value lands where.
   const simsys::model::NodeSpec n{.id = "x", .type = NodeType::service};
   REQUIRE(n.replicas == 1);
   REQUIRE(n.dc == "main");

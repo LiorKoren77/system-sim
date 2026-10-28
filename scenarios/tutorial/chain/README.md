@@ -22,7 +22,15 @@
   an `insert` cost more than a `select`).
 
 ## Things to try
-- Set `replicas: 1` on `api`: rho becomes 1.5, the node goes red and the read SLO fails.
-- Set `latency: 10ms` on `db`: a write pays it twice, so the write SLO fails first.
+- Set `replicas: 1` on `api`: `explain` reports it offered 150 % of its capacity
+  (1.5k/s against 1k/s), red. `run` shows a busy fraction of 100 % (it cannot be busier
+  than always busy), a backlog stuck at the 1000-request queue limit, a third of the
+  requests dropped and a p99 of about 1.1 s: all three SLOs fail. The database calms
+  down to 24 % because the saturated API passes on only 1k/s.
+- Raise `latency` on `db`: a write pays it twice, but its SLO is twice as loose, and two
+  calls in a row partly average out (the mean doubles, the spread grows only by about
+  √2), so a write's p99 is less than twice a read's. The read SLO fails first, between
+  3 and 4 ms (at 4 ms: read p99 23 ms vs 20 ms, write 31.9 ms vs 40 ms); the write SLO
+  follows between 5 and 6 ms, and at 10 ms both fail.
 - Set `queue_limit: 50` on `db` and raise the client rate: the database starts shedding
   load sooner, so latency stays bounded but `drop_rate` rises above zero.

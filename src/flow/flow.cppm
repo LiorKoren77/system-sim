@@ -2,7 +2,7 @@
 // crosses a node, in requests per second) and the composition rules for latency moments
 // (means and variances add along a path, the slowest branch dominates in parallel).
 //
-// Models: the "what travels along an edge" part of the fluid engine (spec §3.5-3.6). A
+// Models: the "what travels along an edge" part of the fluid engine (spec §3.2 and §3.5). A
 // flow is a rate per operation name ("read", "write", ...), like the request mix a load
 // balancer sees in System Design Interview ch. 1; latency travels the other way, as
 // moments, and is composed by the backward pass. Deliberately ignored: request sizes,
@@ -90,6 +90,9 @@ struct LatencyEstimate {
 // branches P(max <= x) = F(x)^n, so the exact quantile is
 //   quantile_max(p) = quantile_single(p^(1/n)).
 // A NaN in any branch makes that moment of the result NaN, whatever its position.
+// C++20 std::span<const T>: a non-owning read-only view of contiguous elements. Replaces
+// the pointer + length pair (or a `const std::vector&` that forces callers into a vector):
+// any array, vector or sub-range of branches can be passed without copying.
 [[nodiscard]] LatencyEstimate parallel_max(std::span<const LatencyEstimate> branches);
 
 // A flow: rate per op name, additive.
@@ -118,10 +121,9 @@ class Flow {
   // "No op ever seen" since construction or clear(), not "zero traffic": an op added
   // with Rate{0} still makes the flow non-empty. Ask total() for the traffic.
   [[nodiscard]] bool empty() const { return entries_.empty(); }
-  // C++20 std::span<const T>: a non-owning read-only view of contiguous elements. Callers
-  // iterate the entries without copying them and without seeing the vector type.
-  // The view is valid until the next non-const call on this Flow (add, scale, +=, clear
-  // may reallocate or reorder the vector).
+  // A span again: callers iterate the entries without copying them and without seeing
+  // the vector type. The view is valid until the next non-const call on this Flow (add,
+  // scale, +=, clear may reallocate or reorder the vector).
   [[nodiscard]] std::span<const Entry> entries() const& { return entries_; }
   // Deleted on rvalues: a view into a dying temporary is a bug, e.g.
   // `for (auto& e : make_flow().entries())` dangles (GCC 14 lacks the C++23 P2718

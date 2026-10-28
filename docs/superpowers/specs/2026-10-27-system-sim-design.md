@@ -302,8 +302,9 @@ Recorded in `CLAUDE.md` so every session follows them:
 ```
 simsys validate scenario.yaml
 simsys explain  scenario.yaml                               # resolved graph, defaults applied, sanity checks
-simsys estimate scenario.yaml [--at 12:00]                  # steady state, instant
+simsys estimate scenario.yaml [--at 12:00]                  # steady state, instant; --at: phase 2+
 simsys run      scenario.yaml [--seed 7] [--duration 24h] [--report table|json|csv] [--series out.csv]
+                                                            # --report csv: phase 2+
 simsys run      scenario.yaml --replications 50 [--jobs 8]  # phase 3
 simsys sweep    scenario.yaml --param nodes.users.rate.base=1k/s..100k/s:10 --metric users.p99
 ```
@@ -323,7 +324,8 @@ contract for the future GUI.
 - Scenario tests: every shipped YAML validates and runs in under 5 s; `fixed` variants
   pass their SLOs, `broken` variants fail them.
 - Determinism test: two runs with the same seed produce identical series.
-- CI: GCC 14 and Clang 18, `-Wall -Wextra -Werror`, ASan/UBSan job.
+- CI: GCC 14 debug and release builds with `-Wall -Wextra -Werror`, and a clang-format 18
+  check (Clang 18 cannot build the project, see `CLAUDE.md` §3). ASan/UBSan job: phase 5.
 
 ## 13. Phases and effort (assisted; unassisted in parentheses)
 
@@ -342,12 +344,15 @@ contract for the future GUI.
 ## 14. Repository layout
 
 ```
-CMakeLists.txt  cmake/  defaults/latency_numbers.yaml
-src/{core,model,policies,nodes,config,cli}/
+CMakeLists.txt  CMakePresets.json  cmake/
+src/{core,queueing,flow,fluid,model,defaults,config,engine,report,cli}/
 scenarios/{book,labs,tutorial}/
 tests/{unit,theory,scenario}/
-docs/{approaches.md, study/, superpowers/specs/}
+docs/{approaches.md, scenario-schema.md, study/, superpowers/{specs,plans}/}
 ```
+
+The defaults live in a `constexpr` C++ table in `src/defaults/`, not in a
+`defaults/latency_numbers.yaml` file (§16, refinement 3).
 
 ## 15. Deferred: discrete-event engine
 

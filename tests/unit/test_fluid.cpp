@@ -28,6 +28,10 @@ using simsys::fluid::Zone;
 
 namespace {
 // 1000 req/s, 1 ms service, one server, room for 1000 queued requests.
+// C++20 designated initializers: `.field = value` names each member it sets, in
+// declaration order, and the rest keep their defaults. Replaces positional aggregate
+// initialization, which could not skip `concurrency` here and where swapped numbers
+// compile silently.
 Capacity web() {
   return Capacity{.service_rate = Rate{1000}, .service_time_s = 0.001, .queue_limit = 1000};
 }
