@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -1649,6 +1650,16 @@ TEST_CASE("a che cdn without a keys size builds but the engine refuses to run it
 //   a write (an op in the store's write_ops)  at its LAST byte:  Wq + MB_o x s_MB
 //   a read or a stream                         at its FIRST MB:   Wq + s_MB
 // and a request under 1 MB still takes one megabyte's time either way (the small-object bound).
+//
+// The second fix round (review at 0248a47): a transfer of a fixed size at a fixed rate takes a
+// fixed time, so each object's own service is deterministic (SCV 0) and the spread of the service
+// times is the size mix's alone (I2). The queue's Allen-Cunneen factor is (c_a^2 + c_s^2) / 2 with
+// c_s^2 the mixture's SCV (I1):
+//   E[S]   = sum_o p_o s_o,   E[S^2] = sum_o p_o (1 + cs_o^2) s_o^2   (p_o = rate_o / sum rate)
+//   c_s^2  = E[S^2] / E[S]^2 - 1
+// so a single size with Poisson arrivals waits (1 + 0) / 2 = HALF the M/M/c wait (M/D/c), and the
+// answer adds no variance of its own: the response's variance is the wait's. And the stochastic
+// wait is bounded by the room (C1): never longer than queue_limit / capacity, the M/M/c/K bound.
 
 namespace {
 // u (`rate`/s of `op`, each `size` long) -> store, a zero-latency link, so the client's response
@@ -1686,12 +1697,14 @@ simsys::engine::StepRecord first_step(const Graph& g) {
 // 5 uploads/s of 50 MB into a default blob store that counts `upload` as a write:
 //   demand   = 5/s x 50 MB = 250 units/s of 1 MB, against 500 units/s: rho = 250 / 500 = 0.5;
 //   c        = 500 units/s x 40 ms per MB = 20 (Little's law);
-//   s_obj    = 50 MB x 40 ms = 2 s, the time one upload holds a slot;
-//   Erlang C(20, 0.5) = 0.0037311 (queueing::erlang_c), so the wait is
-//   Wq       = C x s_obj / (c (1 - rho)) = 0.0037311 x 2 s / (20 x 0.5) = 0.746 ms
-//   response = Wq + 50 MB x 40 ms = 2.000746 s: a write is answered at its last byte.
-// Before the review the wait was computed over 1 MB units (0.0149 ms) and the response was the
-// first megabyte's 40 ms: 50 times too short a wait and an upload acknowledged before its data.
+//   s_obj    = 50 MB x 40 ms = 2 s, the time one upload holds a slot, the same for every upload
+//              (a deterministic transfer: c_s^2 = 0);
+//   Erlang C(20, 0.5) = 0.0037311 (queueing::erlang_c), so the M/M/c wait would be
+//   C x s_obj / (c (1 - rho)) = 0.0037311 x 2 s / (20 x 0.5) = 0.746 ms, and M/D/c's is
+//   Wq       = (1 + 0) / 2 x 0.746 ms = 0.373 ms                (Allen-Cunneen, Poisson arrivals)
+//   response = Wq + 50 MB x 40 ms = 2.000373 s: a write is answered at its last byte.
+// Before the first review the wait was computed over 1 MB units (0.0149 ms) and the response was
+// the first megabyte's 40 ms: 50 times too short a wait and an upload acknowledged before its data.
 TEST_CASE("a default blob store fed 5 uploads of 50 MB per second runs at rho 0.5 with c 20",
           "[theory]") {
   const auto g =
@@ -1701,33 +1714,34 @@ TEST_CASE("a default blob store fed 5 uploads of 50 MB per second runs at rho 0.
   REQUIRE_THAT(store.demand_per_s, WithinRel(250.0, 1e-12));  // units (MB) per second
   REQUIRE_THAT(store.rho, WithinRel(0.5, 1e-12));
   REQUIRE(store.dropped_per_s == 0.0);
-  const auto wait = simsys::queueing::mmc_wait(20, 0.5, 2.0).mean_s;
-  REQUIRE_THAT(wait, WithinAbs(7.4623e-4, 1e-8));  // the napkin number: 0.746 ms
+  const auto wait = simsys::queueing::mmc_wait(20, 0.5, 2.0).mean_s / 2.0;  // M/D/c
+  REQUIRE_THAT(wait, WithinAbs(3.7311e-4, 1e-8));  // the napkin number: 0.373 ms
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(wait + 2.0, 1e-9));
-  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(2.000746, 1e-6));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(2.000373, 1e-6));
   // The node's own latency is its requests' sojourn: here every request is an upload.
   REQUIRE_THAT(store.latency.mean_s, WithinRel(wait + 2.0, 1e-9));
   REQUIRE_THAT(r.responses[0].answered.per_second, WithinRel(5.0, 1e-9));  // requests, not MB
 }
 
-// The same queue read instead of written: 5 reads/s of 50 MB wait the same whole-object 0.746 ms
+// The same queue read instead of written: 5 reads/s of 50 MB wait the same whole-object 0.373 ms
 // (the queue does not care which way the bytes go), but a read is answered when its first
-// megabyte arrives, Wq + 40 ms = 40.746 ms: the client reads the rest as it streams in.
+// megabyte arrives, Wq + 40 ms = 40.373 ms: the client reads the rest as it streams in.
 TEST_CASE("a 50 MB read waits behind whole objects and is answered at its first megabyte",
           "[theory]") {
   const auto g = *Graph::build(blob_store_chain("read", 5, simsys::Bytes{50e6}));
   const auto r = first_step(g);
   REQUIRE_THAT(r.nodes[*g.index_of("store")].rho, WithinRel(0.5, 1e-12));
-  const auto wait = simsys::queueing::mmc_wait(20, 0.5, 2.0).mean_s;
+  const auto wait = simsys::queueing::mmc_wait(20, 0.5, 2.0).mean_s / 2.0;  // M/D/c
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(wait + 0.040, 1e-9));
-  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.040746, 1e-6));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.040373, 1e-6));
 }
 
 // The review's example: 9 reads/s of 50 MB at a default store are 450 MB/s, rho 0.9. Over 1 MB
-// units the wait would be C(20, 0.9) x 40 ms / (20 x 0.1) = 0.5508 x 0.02 s = 11 ms; whole 50 MB
-// objects (s_obj = 2 s) wait C(20, 0.9) x 2 s / (20 x 0.1) = 0.5508 s, fifty times longer. The
-// read is answered 40 ms after that wait: 0.5908 s.
-TEST_CASE("at rho 0.9 a 50 MB object waits about half a second, not 11 ms", "[theory]") {
+// units the M/M/c wait would be C(20, 0.9) x 40 ms / (20 x 0.1) = 0.5508 x 0.02 s = 11 ms; whole
+// 50 MB objects (s_obj = 2 s) wait C(20, 0.9) x 2 s / (20 x 0.1) = 0.5508 s in M/M/c, fifty times
+// longer, and as transfers of one fixed time (M/D/c) half of that, 0.2754 s. The read is answered
+// 40 ms after that wait: 0.3154 s.
+TEST_CASE("at rho 0.9 a 50 MB object waits 0.28 s, half the M/M/c wait and not 11 ms", "[theory]") {
   const auto g = *Graph::build(blob_store_chain("read", 9, simsys::Bytes{50e6}));
   const auto r = first_step(g);
   REQUIRE_THAT(r.nodes[*g.index_of("store")].rho, WithinRel(0.9, 1e-12));
@@ -1735,26 +1749,51 @@ TEST_CASE("at rho 0.9 a 50 MB object waits about half a second, not 11 ms", "[th
   const auto per_object = simsys::queueing::mmc_wait(20, 0.9, 2.0).mean_s;
   REQUIRE_THAT(per_unit, WithinAbs(0.011015, 1e-6));
   REQUIRE_THAT(per_object, WithinAbs(0.550769, 1e-6));
-  REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(per_object + 0.040, 1e-9));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(per_object / 2.0 + 0.040, 1e-9));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.315385, 1e-6));
 }
 
 // Book ch. 14's 300 MB upload, counted as a write: 1 upload/s at a default store is 300 MB/s,
-// rho 0.6; s_obj = 300 MB x 40 ms = 12 s, so Wq = C(20, 0.6) x 12 s / (20 x 0.4) =
-// 0.024134 x 1.5 s = 36.2 ms, and the upload is acknowledged at its last byte, 12 s + 36.2 ms =
-// 12.0362 s. (A client `timeout: 10s` must therefore see it time out: plan Task 13.)
+// rho 0.6; s_obj = 300 MB x 40 ms = 12 s, so the M/M/c wait would be C(20, 0.6) x 12 s / (20 x 0.4)
+// = 0.024134 x 1.5 s = 36.2 ms and M/D/c's is half, Wq = 18.1 ms; the upload is acknowledged at its
+// last byte, 12 s + 18.1 ms = 12.0181 s.
 TEST_CASE("a 300 MB upload is answered at its last byte, 12 s after its wait", "[theory]") {
   const auto g =
       *Graph::build(blob_store_chain("upload", 1, simsys::Bytes{300e6}, store_writing("upload")));
   const auto r = first_step(g);
   REQUIRE_THAT(r.nodes[*g.index_of("store")].rho, WithinRel(0.6, 1e-12));
-  const auto wait = simsys::queueing::mmc_wait(20, 0.6, 12.0).mean_s;
-  REQUIRE_THAT(wait, WithinAbs(0.036202, 1e-6));
+  const auto wait = simsys::queueing::mmc_wait(20, 0.6, 12.0).mean_s / 2.0;  // M/D/c
+  REQUIRE_THAT(wait, WithinAbs(0.018101, 1e-6));
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(12.0 + wait, 1e-9));
-  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(12.0362, 1e-4));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(12.0181, 1e-4));
+}
+
+// The same upload's spread (second fix round, I2): the 12 s transfer is deterministic, so the
+// response's variance is the wait's alone, (1/2)^2 x Var(Wq of M/M/c) (the Allen-Cunneen factor
+// applied to the variance, the engine's heuristic) = 0.25 x P (2 - P) theta^2 with P = 0.024134
+// and theta = 12 s / (20 x 0.4) = 1.5 s: 0.026824 s^2, a standard deviation of 0.16 s. The
+// lognormal fit then puts the p99 at 12.40 s and the p1 at 11.64 s: every upload takes more than
+// 10 s, so youtube's `timeout: 10s` (plan Task 13) would time out all of them, not the ~42 % an
+// exponential transfer (CV 1: variance 144 s^2 more, a p99 of 58.9 s) suggested. Task 16 sizes that
+// timeout per the book (resumable uploads).
+TEST_CASE("a 300 MB upload's p99 is 12.4 s and its p1 is above 10 s: the transfer is deterministic",
+          "[theory]") {
+  const auto g =
+      *Graph::build(blob_store_chain("upload", 1, simsys::Bytes{300e6}, store_writing("upload")));
+  const auto response = first_step(g).responses[0].response;
+  const auto mmc = simsys::queueing::mmc_wait(20, 0.6, 12.0);
+  REQUIRE_THAT(response.variance_s2, WithinRel(mmc.variance_s2 / 4.0, 1e-9));
+  REQUIRE_THAT(response.variance_s2, WithinAbs(0.026824, 1e-6));
+  using simsys::queueing::lognormal_quantile;
+  using simsys::queueing::z_p99;
+  REQUIRE_THAT(lognormal_quantile(response.mean_s, response.variance_s2, z_p99),
+               WithinAbs(12.404, 1e-3));
+  REQUIRE(lognormal_quantile(response.mean_s, response.variance_s2, -z_p99) > 10.0);
 }
 
 // A 2 KB read costs 2e3 B / 1e6 B per unit = 0.002 units: 1000 reads/s are 2 units/s, rho =
-// 2 / 500 = 0.004; s_obj = 0.002 x 40 ms = 80 us and nothing waits (Erlang C(20, 0.004) = 4e-41),
+// 2 / 500 = 0.004; s_obj = 0.002 x 40 ms = 80 us and nothing waits (Erlang C(20, 0.004) = 4e-41;
+// M/D/c halves it),
 // and yet each read takes the whole 40 ms of one unit: the documented upper bound for small
 // objects (a request under 1 MB still pays one unit's time). Without the bound a 2 KB read would
 // be answered in 80 us.
@@ -1764,7 +1803,7 @@ TEST_CASE("a 2 KB read at a blob store costs 0.002 units and is answered in 40 m
   const auto& store = r.nodes[*g.index_of("store")];
   REQUIRE_THAT(store.demand_per_s, WithinRel(2.0, 1e-12));  // 1000/s x 0.002 units
   REQUIRE_THAT(store.rho, WithinRel(0.004, 1e-12));
-  const auto wait = simsys::queueing::mmc_wait(20, 0.004, 80e-6).mean_s;
+  const auto wait = simsys::queueing::mmc_wait(20, 0.004, 80e-6).mean_s / 2.0;
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(wait + 0.040, 1e-9));
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.040, 1e-9));
 }
@@ -1849,6 +1888,130 @@ TEST_CASE("an overloaded blob store answers the same share of large and small re
   REQUIRE_THAT(writes.response.mean_s - reads.response.mean_s, WithinAbs(1.96, 1e-9));
   REQUIRE_THAT(store.latency.mean_s,
                WithinRel((writes.response.mean_s + reads.response.mean_s) / 2.0, 1e-9));
+}
+
+// ---- The second fix round of Task 3 (review at 0248a47): the room bounds the wait (C1), the size
+// mix's spread enters Kingman (I1) ----
+
+namespace {
+// The last step of `steps` 100 ms steps of a fresh simulation of `g`.
+simsys::engine::StepRecord step_until(const Graph& g, int steps) {
+  auto sim = Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  simsys::engine::StepRecord last;
+  for (int i = 0; i < steps; ++i) last = sim->step(i * 100ms, 100ms);
+  return last;
+}
+}  // namespace
+
+// 12 writes/s of 50 MB are 600 MB/s against a default store's 500: past saturation. Erlang C at
+// the 0.99 clamp with 2 s objects would add C(20, 0.99) x 2 s / (20 x 0.01) x 1/2 = 4.74 s (9.48 s
+// with exponential service, what the first fix round reported: an 11.48 s response). But the
+// store's waiting room holds 1000 MB and drains at 500 MB/s, so nobody admitted waits more than
+// 1000 / 500 = 2 s (the M/M/c/K bound); the full room's fluid wait is exactly that. A write is then
+// answered at its last byte, 2 s later: 4 s. The excess, 100 MB/s, is dropped.
+TEST_CASE("twelve 50 MB writes per second wait at most the 2 s their room drains in: about 4 s",
+          "[theory]") {
+  const auto g = *Graph::build(blob_store_chain("write", 12, simsys::Bytes{50e6}));
+  const auto last = step_until(g, 300);  // 30 s: the room is full after 10 s
+  const auto& store = last.nodes[*g.index_of("store")];
+  REQUIRE_THAT(store.backlog, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(store.dropped_per_s, WithinRel(100.0, 1e-6));
+  REQUIRE(last.responses[0].response.mean_s - 2.0 <= 2.0 + 1e-9);  // the wait
+  REQUIRE_THAT(last.responses[0].response.mean_s, WithinRel(4.0, 1e-9));
+}
+
+// The review's stop transient: 24 requests/s, half 50 MB writes and half 10 MB reads, overload a
+// default store (720 MB/s against 500) for 20 s and then stop. From then on nothing arrives, and
+// the store's latency is what a read arriving now would see: the wait plus one megabyte (40 ms).
+// While the full room drains (1000 MB at 500 MB/s, 2 s), the wait is bounded by the room's drain
+// time, 2 s, where the first fix round held it at the clamp's 5.7 s; once the room is empty nothing
+// waits and the latency is the 40 ms of one megabyte. It never rises on the way down.
+TEST_CASE(
+    "after an overload stops a blob store's latency falls to one megabyte's time, never "
+    "above the room's drain time",
+    "[theory]") {
+  Scenario s = blob_store_chain("write", 24, simsys::Bytes{50e6});
+  auto& workload = *s.nodes[0].workload;
+  workload.curve.points =
+      simsys::workload::Points{.at = {{0s, Rate{24}}, {20s, Rate{24}}, {20s, Rate{0}}}};
+  workload.op_shares = {{"write", 0.5}, {"read", 0.5}};
+  workload.sizes = {{"write", simsys::Bytes{50e6}}, {"read", simsys::Bytes{10e6}}};
+  const auto g = *Graph::build(s);
+  auto sim = Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  const auto store = *g.index_of("store");
+  for (int i = 0; i < 200; ++i) (void)sim->step(i * 100ms, 100ms);  // 20 s of overload
+  double previous = std::numeric_limits<double>::infinity();
+  double latency = 0.0;
+  for (int i = 200; i < 250; ++i) {  // 5 s after the stop
+    latency = sim->step(i * 100ms, 100ms).nodes[store].latency.mean_s;
+    CAPTURE(i, latency);
+    REQUIRE(latency <= previous + 1e-12);
+    REQUIRE(latency <= 2.0 + 0.040 + 1e-9);
+    previous = latency;
+  }
+  REQUIRE_THAT(latency, WithinAbs(0.040, 1e-9));
+}
+
+namespace {
+// The review's probe (mix.yaml): 1008 requests/s into a default blob store, 99.21 % of them 2 KB
+// reads (1000/s) and 0.79 % 50 MB writes (7.9632/s). `variability` is the store's
+// advanced.service_variability, the per-object c_s^2, when given (default 0: a deterministic
+// transfer).
+Scenario small_reads_beside_large_writes(std::optional<double> variability = {}) {
+  Scenario s = blob_store_chain("write", 1008, simsys::Bytes{50e6},
+                                NodeSpec{.id = "store",
+                                         .type = NodeType::blob_store,
+                                         .advanced = {.service_variability = variability}});
+  auto& workload = *s.nodes[0].workload;
+  workload.op_shares = {{"read", 0.9921}, {"write", 0.0079}};
+  workload.sizes = {{"read", simsys::Bytes{2e3}}, {"write", simsys::Bytes{50e6}}};
+  return s;
+}
+
+// What a 50 MB write waits: its response less its 2 s transfer (zero-latency link).
+double write_wait(const Graph& g) {
+  return response_to(first_step(g), "write").response.mean_s - 2.0;
+}
+}  // namespace
+
+// The size mix's spread (second fix round, I1). The writes alone, 7.9632/s of 50 MB, are rho
+// 0.79632 of a default store and, every one holding a slot the same 2 s (c_s^2 = 0, M/D/c), wait
+//   (1 + 0) / 2 x C(20, 0.79632) x 2 s / (20 x 0.20368) = 60.9 ms.
+// Add 1000 reads/s of 2 KB (80 us of a slot each): rho rises to 0.80032. A mean object time alone
+// (E[S] = 0.9921 x 80 us + 0.0079 x 2 s = 15.88 ms) would cut the writes' wait to 1.02 ms (what the
+// first fix round did: the reads look like they make the store faster). The mixture's SCV says
+// how spread those times are:
+//   E[S^2] = 0.9921 x (80 us)^2 + 0.0079 x (2 s)^2 = 0.0316 s^2   (per-object c_s^2 = 0)
+//   c_s^2  = E[S^2] / E[S]^2 - 1 = 0.0316 / 0.01588^2 - 1 = 124.3
+//   Wq     = (1 + 124.3) / 2 x C(20, 0.80032) x 15.88 ms / (20 x 0.19968) = 62.66 x 1.021 ms
+//          = 64.0 ms
+// more than the writes alone: adding load never shortens the wait.
+TEST_CASE("small reads beside large writes lengthen the writes' wait: 64.0 ms against 60.9 ms",
+          "[theory]") {
+  const double alone =
+      write_wait(*Graph::build(blob_store_chain("write", 7.9632, simsys::Bytes{50e6})));
+  const double mixed = write_wait(*Graph::build(small_reads_beside_large_writes()));
+  REQUIRE_THAT(alone, WithinAbs(0.060868, 1e-6));
+  REQUIRE_THAT(mixed, WithinAbs(0.063980, 1e-6));
+  REQUIRE(mixed > alone);
+}
+
+// advanced.service_variability still overrides the per-object c_s^2: at 1 (each transfer
+// exponential, M/M/c's assumption) E[S^2] doubles, c_s^2 = 2 x 125.32 - 1 = 249.6, and the writes
+// wait (1 + 249.6) / 2 x 1.021 ms = 128.0 ms, the review's ~127 ms; alone they wait the M/M/c
+// 121.7 ms.
+TEST_CASE("a blob store with service_variability 1 waits as exponential transfers: 128.0 ms",
+          "[theory]") {
+  const double mixed = write_wait(*Graph::build(small_reads_beside_large_writes(1.0)));
+  REQUIRE_THAT(mixed, WithinAbs(0.127960, 1e-6));
+  const double alone = write_wait(*Graph::build(blob_store_chain(
+      "write", 7.9632, simsys::Bytes{50e6},
+      NodeSpec{
+          .id = "store", .type = NodeType::blob_store, .advanced = {.service_variability = 1.0}})));
+  REQUIRE_THAT(alone, WithinAbs(0.121736, 1e-6));
+  REQUIRE(mixed > alone);
 }
 
 namespace {
@@ -1980,15 +2143,21 @@ TEST_CASE("the engine runs a blob store that has then steps", "[theory]") {
 //   demand   = 2/s x 100 MB = 200 units (MB) per second against 500: rho = 200 / 500 = 0.4;
 //   c        = 500 units/s x 40 ms = 20 slots (Little's law);
 //   s_obj    = 100 MB x 40 ms = 4 s, the time one upload holds a slot;
-//   Erlang C(20, 0.4) = 0.00026495 (queueing::mmc_wait takes rho per server), so the wait is
-//   Wq       = C x s_obj / (c (1 - rho)) = 0.00026495 x 4 s / (20 x 0.6) = 0.0883 ms.
+//   Erlang C(20, 0.4) = 0.00026495 (queueing::mmc_wait takes rho per server), so the M/M/c wait
+//   would be C x s_obj / (c (1 - rho)) = 0.00026495 x 4 s / (20 x 0.6) = 0.0883 ms, and every
+//   upload holding a slot the same 4 s (a deterministic transfer, M/D/c) halves it:
+//   Wq       = (1 + 0) / 2 x 0.0883 ms = 0.0442 ms.
 // An op that is not in the store's `write_ops` is a read, answered at its first megabyte:
-//   response = Wq + 40 ms + 0.5 ms = 40.588 ms.
-// Listed in `write_ops`, the upload is answered at its last byte: Wq + 4 s + 0.5 ms = 4.000588 s.
+//   response = Wq + 40 ms + 0.5 ms = 40.544 ms.
+// Listed in `write_ops`, the upload is answered at its last byte: Wq + 4 s + 0.5 ms = 4.000544 s.
 // Either way `svc`, which takes 500 ms per notification, adds nothing to the client's response.
 
 namespace {
-constexpr double upload_wait_s = 8.8316e-5;  // Wq above, to the digits the derivation gives
+constexpr double upload_mmc_wait_s = 8.8316e-5;  // M/M/c's wait above, to the derivation's digits
+// M/D/c's wait, the store's: half of M/M/c's (the Allen-Cunneen factor (1 + 0) / 2).
+[[nodiscard]] double upload_wait_s() {
+  return simsys::queueing::mmc_wait(20, 0.4, 4.0).mean_s / 2.0;
+}
 
 // The service the store notifies: fast to the client's eyes if it counted (500 ms), so that a
 // response that waited for it would be unmistakable.
@@ -2027,21 +2196,21 @@ TEST_CASE("a blob store sends its then target one notification per upload it ser
   const auto& store = r.nodes[*g.index_of("store")];
   REQUIRE_THAT(store.demand_per_s, WithinRel(200.0, 1e-12));  // units (MB) per second
   REQUIRE_THAT(store.rho, WithinRel(0.4, 1e-12));
-  REQUIRE_THAT(simsys::queueing::mmc_wait(20, 0.4, 4.0).mean_s, WithinAbs(upload_wait_s, 1e-9));
+  REQUIRE_THAT(simsys::queueing::mmc_wait(20, 0.4, 4.0).mean_s, WithinAbs(upload_mmc_wait_s, 1e-9));
   // 2 uploads/s served, 2 notify/s sent: svc counts requests, not megabytes.
   REQUIRE_THAT(r.nodes[*g.index_of("svc")].demand_per_s, WithinRel(2.0, 1e-12));
 }
 
 // The upload is a read to this store (`write_ops` does not list it): answered at its first
-// megabyte, 0.0883 ms + 40 ms after the wait, plus the 0.5 ms round trip: 40.588 ms. The 500 ms
+// megabyte, 0.0442 ms + 40 ms after the wait, plus the 0.5 ms round trip: 40.544 ms. The 500 ms
 // svc is not in it: the hop to svc is asynchronous.
-TEST_CASE("a notified blob store answers a read-style upload in 40.59 ms, svc not included",
+TEST_CASE("a notified blob store answers a read-style upload in 40.54 ms, svc not included",
           "[theory]") {
   const auto g = *Graph::build(upload_with_events(notify_step));
   const auto r = first_step(g);
-  const double wait = simsys::queueing::mmc_wait(20, 0.4, 4.0).mean_s;
+  const double wait = upload_wait_s();
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(wait + 0.040 + 0.0005, 1e-9));
-  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.040588, 1e-6));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.040544, 1e-6));
   // The store's own sojourn is the response minus the link round trip.
   REQUIRE_THAT(r.nodes[*g.index_of("store")].latency.mean_s, WithinRel(wait + 0.040, 1e-9));
 }
@@ -2051,14 +2220,14 @@ TEST_CASE("a notified blob store answers a write-listed upload at its last byte,
           "[theory]") {
   const auto g = *Graph::build(upload_with_events(notify_step, std::vector<std::string>{"upload"}));
   const auto r = first_step(g);
-  const double wait = simsys::queueing::mmc_wait(20, 0.4, 4.0).mean_s;
+  const double wait = upload_wait_s();
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(wait + 4.0 + 0.0005, 1e-9));
-  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(4.000588, 1e-6));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(4.000544, 1e-6));
 }
 
 // svc is a 1/s service with a waiting room of 1, offered 2 notify/s: in the long run it drains
 // 1/s and drops the other 1/s, a drop rate of 1 / 2 = 0.5. The client never hears of it: its
-// uploads are answered at the store, 2/s of 2/s, at the same 40.588 ms.
+// uploads are answered at the store, 2/s of 2/s, at the same 40.544 ms.
 TEST_CASE(
     "an undersized notified service drops half its notifications and the uploader still "
     "gets every answer",
@@ -2079,7 +2248,7 @@ TEST_CASE(
   REQUIRE_THAT(svc.dropped_per_s / svc.demand_per_s, WithinRel(0.5, 1e-6));
   REQUIRE(e.nodes[*g.index_of("store")].dropped_per_s == 0.0);
   REQUIRE_THAT(e.responses[0].answered.per_second, WithinRel(2.0, 1e-9));
-  const double wait = simsys::queueing::mmc_wait(20, 0.4, 4.0).mean_s;
+  const double wait = upload_wait_s();
   REQUIRE_THAT(e.responses[0].response.mean_s, WithinRel(wait + 0.040 + 0.0005, 1e-9));
 }
 
@@ -2092,7 +2261,7 @@ TEST_CASE("a notification's factor multiplies the notifications sent: 4 per uplo
   REQUIRE_THAT(r.nodes[*g.index_of("svc")].demand_per_s, WithinRel(8.0, 1e-12));
   // The store is untouched by what it sends: same rho, same answer.
   REQUIRE_THAT(r.nodes[*g.index_of("store")].rho, WithinRel(0.4, 1e-12));
-  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.040588, 1e-6));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.040544, 1e-6));
 }
 
 // The size walk (plan 2c refinement 1) is how the graph resolves it, and the engine must accept

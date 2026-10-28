@@ -1515,20 +1515,25 @@ TEST_CASE("explain prints a byte-sized node's service time per megabyte", "[repo
 }
 
 // A byte-sized node's capacity units are megabytes, so its waiting room is too, and its c servers
-// are megabyte slots (Little's law: c = MB/s x the time of one MB; an object holds one slot for its
-// whole transfer, review of plan 2c Task 3, I1). explain labels both: `c=1000 MB slots (implied)`
-// on a 100 GB/s CDN at 10 ms per MB, `c=20 MB slots` on a default blob store (500 MB/s x 40 ms),
-// and `queue_limit=1000 MB (default)`, the generic waiting room of 1000 units read in MB. A node
-// that counts requests keeps its bare numbers.
-TEST_CASE("explain labels a byte-sized node's c and queue_limit in megabytes", "[report]") {
+// are slots that each hold one object for its whole transfer (Little's law: c = MB/s x the time of
+// one MB; review of plan 2c Task 3, I1, and of its fix round, M4). explain labels both:
+// `c=1000 slots (1 object each) (implied)` on a 100 GB/s CDN at 10 ms per MB, `c=20 slots (1 object
+// each)` on a default blob store (500 MB/s x 40 ms), and `queue_limit=1000 MB (default)`, the
+// generic waiting room of 1000 units read in MB. A transfer of a fixed size at a fixed rate is
+// deterministic (second fix round, I2), so the per-object variability is 0 there. A node that
+// counts requests keeps its bare numbers.
+TEST_CASE("explain labels a byte-sized node's c in object slots and queue_limit in megabytes",
+          "[report]") {
   auto s = cdn_reported("cdn_us", simsys::ByteRate{100e9});
   s.nodes[2] = NodeSpec{.id = "origin", .type = NodeType::blob_store};
   const auto text = explain_of(s);
   CAPTURE(text);
   REQUIRE(node_line(text, "cdn_us")
-              .contains("c=1000 MB slots (implied)  queue_limit=1000 MB (default)"));
-  REQUIRE(
-      node_line(text, "origin").contains("c=20 MB slots (implied)  queue_limit=1000 MB (default)"));
+              .contains("c=1000 slots (1 object each) (implied)  queue_limit=1000 MB (default)  "
+                        "variability=0"));
+  REQUIRE(node_line(text, "origin")
+              .contains("c=20 slots (1 object each) (implied)  queue_limit=1000 MB (default)  "
+                        "variability=0"));
   const auto counting = explain_of(cdn_reported());
   REQUIRE(node_line(counting, "cdn").contains("c=1000 (implied)  queue_limit=1000 (default)"));
 }
