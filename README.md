@@ -10,21 +10,73 @@ reproducible. Built to practise the systems in
 *System Design Interview* (Alex Xu, vol. 1) and, at the same time, to study and teach
 C++20/23: modules, concepts, ranges, coroutines, `std::expected` and friends.
 
-Status: phase 0 complete — the project builds with GCC 14 named modules, `simsys validate`
-checks scenario files, and drafts of all 8 book systems and 4 labs live under
-[`scenarios/`](scenarios/). The engine arrives in phase 1.
+Status: phase 1 — the fluid engine runs clients and services; `simsys validate`,
+`explain`, `estimate` and `run` work, and drafts of all 8 book systems and 4 labs live
+under [`scenarios/`](scenarios/).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
 
-## Planned CLI
+## Usage
 
 ```
-simsys validate scenario.yaml
-simsys explain  scenario.yaml
-simsys estimate scenario.yaml
-simsys run      scenario.yaml --seed 7 --report table --series out.csv
-simsys sweep    scenario.yaml --param nodes.users.rate.base=1k/s..100k/s:10 --metric users.p99
+simsys validate scenario.yaml        # types, references and units
+simsys explain  scenario.yaml        # every resolved number and where it came from
+simsys estimate scenario.yaml [--report table|json] [--no-color]
+simsys run      scenario.yaml [--duration 30s] [--seed N] [--report table|json]
+                              [--series out.csv] [--no-color]
 ```
+
+`estimate` evaluates the long-run (steady) state once; `run` steps through the scenario and,
+with `--series`, writes one CSV row per node per step (`t_s,node,rho,backlog,drops_per_s,latency_ms,zone`),
+the file a plot or GUI reads. Exit codes: 0 every SLO passed, 2 an SLO failed, 1 an error.
+Colour is on when stdout is a terminal; `--no-color` turns it off and JSON never has it.
+`--seed` is reserved for phase 2 workload noise and has no effect yet.
+
+`explain` on the [chain tutorial](scenarios/tutorial/chain/) (trimmed):
+
+```
+$ simsys explain scenarios/tutorial/chain/scenario.yaml
+scenario chain  version 1  duration 2m  step 100ms  warmup 10s  seed 1
+nodes:
+  users  client   dc=main  offered=1.5k/s  ops: read 80%, write 20%  (rate curve: base only in phase 1)
+  api    service  dc=main  replicas=2  capacity=1k/s (scenario)  service_time=500us (scenario)  c=1 (implied)  queue_limit=1000 (default)  ...
+  db     service  dc=main  replicas=1  capacity=5k/s (scenario)  service_time=2ms (scenario)  c=10 (implied)  queue_limit=500 (scenario)  ...
+links:
+  users -> api  inout  one_way=250us (intra_dc_rtt/2)  delay_steps=0
+  api -> db     inout  one_way=250us (intra_dc_rtt/2)  delay_steps=0
+order: users, api, db
+checks:
+  api  offered 1.5k/s vs 2k/s total capacity  (75%, yellow)
+  db   offered 1.8k/s vs 5k/s total capacity  (36%, green)
+```
+
+and `run`, whose utilizations agree with the static checks above:
+
+```
+$ simsys run scenarios/tutorial/chain/scenario.yaml
+scenario chain  1100 steps observed  drop rate 0%
+nodes
+  node   mean_rho  peak_rho  peak_backlog  dropped  red_s
+  users         -         -             -        -      -
+  api        0.75      0.75             0        0      0
+  db         0.36      0.36             0        0      0
+ops (percentiles estimated: lognormal fit to the response moments)
+  client.op    offered/s   mean     p50     p95     p99  (estimated)
+  users.read        1.2k    5ms  4.35ms  10.4ms  14.8ms
+  users.write        300  7.5ms  6.81ms    14ms  18.9ms
+slo
+  status  metric       node   op     observed  max
+  PASS    p99_latency  users  read   14.8ms    20ms
+  PASS    p99_latency  users  write  18.9ms    40ms
+  PASS    drop_rate    -      -      0         0
+```
+
+What phase 1 runs: clients (base rate only: the rate curve's waves, spikes and ramps are
+ignored) and services, with their queues, links, fan-out steps and feedback loops. Every
+other node type (load balancers, caches, databases, queues, CDNs, ...) already validates and
+appears in `explain` with its resolved numbers, but `estimate` and `run` stop with
+"which run/estimate do not support yet (phase 2)" and exit 1. A `sweep` command
+(`--param nodes.users.rate.base=1k/s..100k/s:10`) is planned.
 
 ## Toolchain
 
