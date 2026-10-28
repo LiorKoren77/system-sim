@@ -11,7 +11,7 @@
 - Heartbeat traffic dominating request counts (55% of all ops) while messages dominate bytes.
 - Group fan-out (1.4 avg recipients) and the 30% offline push fraction.
 - Write-heavy key-value store sized by per-node capacity, replication 3, quorum 2.
-- Losing chat-server capacity at the 21:30 peak: connections rebalance, the queue backs up.
+- Losing the whole gateway tier (`chat_servers`) for 1 minute at the 21:30 peak: a reconnect storm follows and the queue backs up.
 
 ## What it abstracts away
 - Connection state and reconnection storms (a scripted `traffic_spike` approximates one).

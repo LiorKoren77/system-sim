@@ -20,8 +20,8 @@ nodes:
     rate:
       base: 200/s
       wave: {shape: sine, period: 24h, amplitude: 0.6, peak_at: 21:00}
-    ops: {stream: 0.9, upload: 0.02, metadata: 0.08}
-    sizes: {stream: 50MB, upload: 300MB, metadata: 2KB}   # per request
+    ops: {stream: 0.88, upload: 0.02, upload_meta: 0.02, metadata: 0.08}
+    sizes: {stream: 50MB, upload: 300MB, upload_meta: 2KB, metadata: 2KB}   # per request
     keys: {zipf: 1.0, space: 10M}
     timeout: 10s
 
@@ -31,8 +31,8 @@ nodes:
     rate:
       base: 100/s
       wave: {shape: sine, period: 24h, amplitude: 0.6, peak_at: 21:00}
-    ops: {stream: 0.9, upload: 0.02, metadata: 0.08}
-    sizes: {stream: 50MB, upload: 300MB, metadata: 2KB}
+    ops: {stream: 0.88, upload: 0.02, upload_meta: 0.02, metadata: 0.08}
+    sizes: {stream: 50MB, upload: 300MB, upload_meta: 2KB, metadata: 2KB}
     keys: {zipf: 1.0, space: 10M}
     timeout: 10s
 
@@ -51,7 +51,7 @@ nodes:
       metadata:
         - {to: metadata_cache, op: read}
         - {to: metadata_db, op: read, on: miss}
-      upload:                                  # returns a presigned URL; bytes go to blob directly
+      upload_meta:                             # returns a presigned URL; bytes go to blob directly
         - {to: metadata_db, op: write}
 
   metadata_cache: {type: cache, dc: us-east, eviction: lru, keys: 5M, hit_ratio: che, strategy: cache_aside}
@@ -93,8 +93,8 @@ links:
   - {from: viewers_eu, to: cdn_eu, dir: inout, ops: [stream]}
   - {from: cdn_us, to: transcoded_store, dir: inout}
   - {from: cdn_eu, to: transcoded_store, dir: inout}          # cross-DC, 150 ms default
-  - {from: viewers_us, to: lb, dir: inout, ops: [metadata, upload]}
-  - {from: viewers_eu, to: lb, dir: inout, ops: [metadata, upload]}
+  - {from: viewers_us, to: lb, dir: inout, ops: [metadata, upload_meta]}
+  - {from: viewers_eu, to: lb, dir: inout, ops: [metadata, upload_meta]}
   - {from: lb, to: api, dir: inout}
   - {from: api, to: metadata_cache, dir: inout}
   - {from: api, to: metadata_db, dir: inout}

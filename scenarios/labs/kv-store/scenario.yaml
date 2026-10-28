@@ -10,8 +10,6 @@ warmup: 1m
 
 datacenters:
   dc-a: {}
-  dc-b: {}
-  latency: [{between: [dc-a, dc-b], rtt: 40ms}]
 
 nodes:
   clients:
@@ -56,4 +54,4 @@ slo:
 
 faults:
   - {at: 10m, kind: node_down, node: store, for: 3m}            # one of eight nodes
-  - {at: 20m, kind: partition, between: [dc-a, dc-b], for: 2m}
+  - {at: 20m, kind: partition, node: store, fraction: 0.5, for: 2m}   # split the ring in two halves that cannot see each other

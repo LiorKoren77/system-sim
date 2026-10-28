@@ -10,6 +10,7 @@
 ## What the model captures
 - The 300x write amplification of fan-out on write hitting `feed_cache` and `graph_db`.
 - Read path fan-out (20 posts hydrated per feed read) multiplying cache traffic.
+- Media reads (30% of requests, 200 KB each) go to the CDN and only misses reach `media_store`.
 - Queue lag at the evening peak as the fan-out workers fall behind.
 - A 30-second database outage at 15:00: writes back up in `fanout_q`; reads survive on caches.
 

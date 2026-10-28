@@ -48,6 +48,7 @@ nodes:
         - {to: message_store, op: write}
       heartbeat:
         - {to: presence, op: beat}
+      deliver: []                              # terminal: pushed to the recipient's open connection
 
   id_gen: {type: id_generator, algorithm: snowflake, replicas: 3}
 
@@ -107,4 +108,4 @@ slo:
   - {metric: drop_rate, max: 0.001}
 
 faults:
-  - {at: 21:30, kind: node_down, node: chat_servers, for: 1m}   # one replica's worth; see README
+  - {at: 21:30, kind: node_down, node: chat_servers, for: 1m}   # the whole gateway tier for 1 minute: a reconnect storm follows
