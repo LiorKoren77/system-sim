@@ -2758,8 +2758,17 @@ TEST_CASE("a rate limiter's algorithm, limit, burst, window and backend are type
                        limiter_scenario("algorithm: leaky_bucket, limit: 1k/s, burst: 500, " +
                                         std::string{extra}),
                        "node 'limiter': leaky_bucket takes limit and burst; capacity, latency, "
-                       "concurrency and queue_limit are not valid");
+                       "concurrency, queue_limit and service_variability are not valid");
     }
+  }
+  SECTION("a leaky bucket refuses service_variability") {
+    // The leak is regular by definition (SCV 0, graph::leaky_bucket_capacity): a scenario's
+    // own number would be overridden in silence, so it is refused like the queue's numbers.
+    require_rejected("simsys_limiter_leaky_variability.yaml",
+                     limiter_scenario("algorithm: leaky_bucket, limit: 1k/s, burst: 500, "
+                                      "advanced: {service_variability: 1.0}"),
+                     "node 'limiter': leaky_bucket takes limit and burst; capacity, latency, "
+                     "concurrency, queue_limit and service_variability are not valid");
   }
   SECTION("a limiter without a limit") {
     require_rejected("simsys_limiter_no_limit.yaml", limiter_scenario("algorithm: token_bucket"),
@@ -2869,9 +2878,10 @@ TEST_CASE(
         {"write_back", write_back}};
     for (const auto& [name, expected] : names) {
       CAPTURE(name);
-      const auto s = load_accepted(
-          "simsys_cache_strategy.yaml",
-          cache_scenario("hit_ratio: {fixed: 0.5}, backend: db, strategy: " + std::string{name}));
+      const auto s =
+          load_accepted("simsys_cache_strategy.yaml",
+                        cache_scenario("hit_ratio: {fixed: 0.5}, strategy: " + std::string{name} +
+                                       (expected == cache_aside ? "" : ", backend: db")));
       REQUIRE(s.nodes[0].strategy == expected);
     }
   }
@@ -2903,12 +2913,25 @@ TEST_CASE(
     REQUIRE(s.nodes[0].hit_ratio->che == true);
     REQUIRE_FALSE(s.nodes[0].hit_ratio->fixed.has_value());
   }
-  SECTION("a cache_aside cache with a backend loads: the backend is simply unused") {
-    const auto s = load_accepted(
-        "simsys_cache_aside_backend.yaml",
-        cache_scenario("hit_ratio: {fixed: 0.5}, strategy: cache_aside, backend: db"));
-    REQUIRE(s.nodes[0].strategy == cache_aside);
-    REQUIRE(s.nodes[0].backend == "db");
+  SECTION("a cache_aside cache with a backend is refused: the application reads the store") {
+    // Under cache_aside the service's `on: miss` step fetches the misses; a backend on the
+    // cache would never be called, and a reader would take it for a read_through cache.
+    for (const std::string_view strategy : {"strategy: cache_aside, ", ""}) {
+      CAPTURE(strategy);
+      require_rejected(
+          "simsys_cache_aside_backend.yaml",
+          cache_scenario("hit_ratio: {fixed: 0.5}, " + std::string{strategy} + "backend: db"),
+          "node 'c': backend is unused with strategy cache_aside");
+    }
+  }
+  SECTION("a cdn's hit ratio is read as a cache's is") {
+    const auto s =
+        load_accepted("simsys_cdn_hit_ratio.yaml",
+                      scenario_with("  edge: {type: cdn, hit_ratio: {fixed: 0.95}, origin: db}\n"
+                                    "  db: {type: sql_db}\n",
+                                    "links: [{from: edge, to: db, dir: inout}]\n"));
+    REQUIRE(s.nodes[0].hit_ratio.has_value());
+    REQUIRE(s.nodes[0].hit_ratio->fixed == 0.95);
   }
   SECTION("a cache without a hit ratio") {
     require_rejected("simsys_cache_no_hit_ratio.yaml", cache_scenario("strategy: cache_aside"),

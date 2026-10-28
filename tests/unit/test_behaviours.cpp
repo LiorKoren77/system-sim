@@ -842,6 +842,17 @@ Scenario aside_front(double hit) {
              LinkSpec{.from = "web", .to = "db", .latency = 10ms}};
   return s;
 }
+// u -> web -> {cache, db, db2} with web.get = [cache.read, db.read on miss, db2.read on miss]:
+// one lookup and the two fetches its miss needs. Every link has zero latency and the cache the
+// given fixed hit ratio. Node indices: u 0, web 1, cache 2, db 3, db2 4.
+Scenario aside_two_misses(double hit) {
+  Scenario s = aside_front(hit);
+  s.nodes[1].ops["get"].push_back(Step{.to = "db2", .op = "read", .on = StepCondition::miss});
+  s.nodes.push_back(NodeSpec{.id = "db2", .type = NodeType::service});
+  s.links.push_back(LinkSpec{.from = "web", .to = "db2", .latency = 0s});
+  for (auto& link : s.links) link.latency = 0s;
+  return s;
+}
 // The flow a routed result sends to `target`, empty when it sends none.
 Flow sent_to(const simsys::behaviours::Routed& routed, std::size_t target) {
   const auto it = std::ranges::find(routed.outgoing, target, &Outgoing::target);
@@ -849,9 +860,10 @@ Flow sent_to(const simsys::behaviours::Routed& routed, std::size_t target) {
 }
 }  // namespace
 
-// Ch. 1 cache-aside ("lazy loading"): the application, not the cache, goes to the database on
-// a miss. So the cache node itself only ever answers: it serves every request it is sent and
-// forwards nothing; the misses are the service's business (the on-miss tests below).
+// Cache-aside ("lazy loading"; the pattern ch. 1 draws and calls read-through): the
+// application, not the cache, goes to the database on a miss. So the cache node itself only
+// ever answers: it serves every request it is sent and forwards nothing; the misses are the
+// service's business (the on-miss tests below).
 TEST_CASE("a cache_aside cache serves every read itself and forwards nothing", "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(cached_front(CacheStrategy::cache_aside, 0.8, false));
   CacheBehaviour cache{g, *g.index_of("cache")};
@@ -870,7 +882,8 @@ TEST_CASE("a cache_aside cache serves every read itself and forwards nothing", "
   REQUIRE_THAT(delivered, WithinRel(0.9, 1e-12));
 }
 
-// Ch. 1 read-through: the cache itself fetches a missing value from the store and keeps it,
+// Read-through as this model names it (the cache-driven fetch of general practice, not ch. 1's
+// application-driven "read-through"): the cache itself fetches a missing value from the store,
 // so the caller sees one call. With a fixed hit ratio h the fluid model sends the miss
 // fraction 1 - h of the reads on to the backend, as the same op, and the cache answers every
 // request itself (`served` is all of the input, hits and misses alike).
@@ -921,11 +934,11 @@ TEST_CASE("a read_through cache delivers its hits plus its misses times the back
   REQUIRE_THAT(delivered, WithinRel(0.9 * (0.8 + 0.2 * 0.5), 1e-12));
 }
 
-// Ch. 1 write-through: every write goes to the cache AND the store, and the caller waits for
-// both. Write-around: writes go straight to the store, skipping the cache. A cache with a
-// fixed hit ratio does the same thing to the flow in both cases (every write reaches the
-// backend, synchronously); they differ in what the cache then holds, which a fixed ratio does
-// not model.
+// Write-through (general caching practice, not from ch. 1): every write goes to the cache AND
+// the store, and the caller waits for both. Write-around: writes go straight to the store,
+// skipping the cache. A cache with a fixed hit ratio does the same thing to the flow in both
+// cases (every write reaches the backend, synchronously); they differ in what the cache then
+// holds, which a fixed ratio does not model.
 TEST_CASE(
     "write_through forwards every write to the backend synchronously; write_around the same flow",
     "[behaviours]") {
@@ -997,9 +1010,10 @@ TEST_CASE("a cache's cost per op comes from its spec and defaults to one", "[beh
   REQUIRE(cache.cost("write") == 1.0);
 }
 
-// Cache-aside from the service's side (ch. 1): web asks the cache, and only for the share the
-// cache missed does it go on to the database. The step `{to: db, on: miss}` therefore carries
-// the miss fraction 1 - h of web's requests, while the cache step carries all of them.
+// Cache-aside from the service's side (ch. 1's pattern, which the book calls read-through):
+// web asks the cache, and only for the share the cache missed does it go on to the database. The
+// step `{to: db, on: miss}` therefore carries the miss fraction 1 - h of web's requests, while the
+// cache step carries all of them.
 TEST_CASE("a service forwards a miss step's op at the preceding cache's miss fraction",
           "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(aside_front(0.8));
@@ -1049,4 +1063,35 @@ TEST_CASE("a service's delivered fraction counts the db hop only for the share t
   const double delivered = web.delivered(
       "get", 1.0, [&](std::size_t node, std::string_view) { return node == cache ? 0.9 : 0.5; });
   REQUIRE_THAT(delivered, WithinRel(0.81, 1e-12));
+}
+
+// A miss needs every fetch after the lookup: [cache.read, db.read on miss, db2.read on miss] is
+// one block that 20 % of the requests take whole and 80 % skip whole. So the block is timed as
+// ONE conditional hop over the sum of its legs (here 20 ms + 30 ms = 50 ms):
+//   mean     = 0.2 x 50 ms                      = 10 ms
+//   variance = 0.2 x 0.8 x (50 ms)^2            = 4e-4   (the hops' own variances are 0)
+// and not as two independent coin flips (0.16 x (20 ms)^2 + 0.16 x (30 ms)^2 = 2.08e-4). A
+// miss is answered only if both fetches are, so the delivered fraction is
+//   (1 - 0.2) + 0.2 x 0.5 x 0.5 = 0.85            (not (0.8 + 0.2 x 0.5)^2 = 0.81).
+TEST_CASE(
+    "miss steps after one lookup fire together: a miss pays both hops and fails if either does",
+    "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(aside_two_misses(0.8));
+  const ServiceBehaviour web{g, *g.index_of("web")};
+  const auto cache = *g.index_of("cache");
+  const auto db = *g.index_of("db");
+  const auto r = web.response("get", LatencyEstimate{}, [&](std::size_t node, std::string_view) {
+    if (node == cache) return LatencyEstimate{};
+    return node == db ? LatencyEstimate{0.020, 0.0} : LatencyEstimate{0.030, 0.0};
+  });
+  REQUIRE_THAT(r.mean_s, WithinRel(0.010, 1e-12));
+  REQUIRE_THAT(r.variance_s2, WithinRel(0.2 * 0.8 * 0.05 * 0.05, 1e-9));
+  const double delivered = web.delivered(
+      "get", 1.0, [&](std::size_t node, std::string_view) { return node == cache ? 1.0 : 0.5; });
+  REQUIRE_THAT(delivered, WithinRel(0.85, 1e-12));
+  // Each fetch still carries the miss share of the flow.
+  const auto routed = web.route(flow_of("get", 100), 0s, 100ms);
+  REQUIRE_THAT(sent_to(routed, db).rate_of("read").per_second, WithinRel(20.0, 1e-12));
+  REQUIRE_THAT(sent_to(routed, *g.index_of("db2")).rate_of("read").per_second,
+               WithinRel(20.0, 1e-12));
 }
