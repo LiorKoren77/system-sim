@@ -631,6 +631,31 @@ In `core.cppm` (exported, near `SimTime`):
 [[nodiscard]] SimTime from_seconds(double s) {
   return std::chrono::round<SimTime>(std::chrono::duration<double>(s));
 }
+
+// Time literals for other modules. `simsys.core` is the only interface unit allowed to
+// include <chrono> (see CLAUDE.md §3: GCC 14.2 corrupts the BMI of an interface that
+// imports a module *and* includes <chrono>/<format>; verified again 2026-10-28 with a
+// three-file probe). Downstream interfaces write `250_us` instead of `250us`.
+// C++20 consteval: an immediate function — it can only run at compile time, so a
+// literal can never cost anything at run time and a bad literal is a compile error.
+inline namespace literals {
+consteval SimTime operator""_ns(unsigned long long v) { return SimTime{static_cast<std::int64_t>(v)}; }
+consteval SimTime operator""_us(unsigned long long v) { return SimTime{static_cast<std::int64_t>(v) * 1'000}; }
+consteval SimTime operator""_ms(unsigned long long v) { return SimTime{static_cast<std::int64_t>(v) * 1'000'000}; }
+consteval SimTime operator""_s(unsigned long long v) { return SimTime{static_cast<std::int64_t>(v) * 1'000'000'000}; }
+}  // namespace literals
+```
+
+Add to `test_units.cpp`:
+
+```cpp
+TEST_CASE("simsys time literals equal their std::chrono counterparts") {
+  using namespace simsys::literals;
+  static_assert(250_us == 250us);
+  static_assert(150_ms == 150ms);
+  static_assert(2_s == 2s);
+  REQUIRE(7_ns == 7ns);
+}
 ```
 
 `fluid.cppm`:
@@ -779,8 +804,7 @@ TEST_CASE("a default NodeSpec has one replica in datacenter main", "[model]") {
 // Module `simsys.model`: the typed scenario — what the YAML means once parsed. No
 // yaml-cpp here; `simsys.config` fills these structs and the engine reads them.
 module;
-#include <array>
-#include <chrono>      // only chrono_literals for defaults; this interface imports only simsys.core
+#include <array>       // NO <chrono> here: this interface imports simsys.core (GCC 14 rule, CLAUDE.md §3)
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -892,7 +916,7 @@ struct Scenario {
   int version{};
   int seed{1};
   SimTime duration{};
-  SimTime step{std::chrono::milliseconds{100}};
+  SimTime step{100_ms};   // simsys::literals, exported by simsys.core
   SimTime warmup{};
   std::vector<std::string> datacenters{"main"};
   std::vector<NodeSpec> nodes;
@@ -903,7 +927,7 @@ struct Scenario {
 }  // namespace simsys::model
 ```
 
-`<chrono>` here is only for the `100ms` default; because this interface imports only `simsys.core` (which already includes `<chrono>`) the GCC 14 bug does not trigger — the rule in `CLAUDE.md` §3 is about `<format>`-bearing headers. Verify by building; if the build reports "Bad file data", express the default as `SimTime{100'000'000}` with a comment and drop the include.
+Put `using namespace simsys::literals;` inside `namespace simsys::model` (not at global scope of the purview) so `100_ms` resolves. The interface must not include `<chrono>`: a three-file probe on 2026-10-28 confirmed that an interface which imports another module and includes `<chrono>` makes every `<format>`-using importer fail with "Bad file data", and that the literals-from-core variant builds cleanly.
 
 Then update `config.cppm`/`config.cpp`/tests/CLI: `load` fills `nodes` with `NodeSpec{.id, .type = *parse_node_type(text)}` (the unknown-type check already exists; map "unknown node type" onto `parse_node_type` returning nullopt) and `links` with `LinkSpec{.from, .to}`. Replace `known_types` uses by `model::node_type_names`. Tests referring to `simsys::config::Scenario`/`NodeDecl::type == "service"` become `simsys::model::Scenario` / `type == NodeType::service`.
 
@@ -1019,8 +1043,7 @@ TEST_CASE("link latency defaults to half the datacenter round trip, one way", "[
 // spec §6 derives from them. Each number says where it comes from; `simsys explain`
 // prints the resolved values with their Source.
 module;
-#include <chrono>
-#include <optional>
+#include <optional>   // NO <chrono>: see CLAUDE.md §3; time literals come from simsys.core
 
 export module simsys.defaults;
 
@@ -1030,7 +1053,7 @@ import simsys.model;
 
 export namespace simsys::defaults {
 
-using namespace std::chrono_literals;
+using namespace simsys::literals;  // 250_us, 150_ms ... (consteval literals from core.cppm)
 
 struct LatencyNumbers {
   SimTime memory_read_1mb, ssd_random_read, disk_seek, disk_read_1mb, network_read_1mb,
@@ -1130,7 +1153,7 @@ struct Resolved {
 }  // namespace simsys::defaults
 ```
 
-`<chrono>` in this interface's global fragment while importing other modules: allowed by the `CLAUDE.md` rule (only `<format>`-bearing headers break GCC 14; `<chrono>` includes `<format>` in libstdc++ 14 — **so this may trigger the bug**). If the build fails with "Bad file data", move everything that needs chrono literals into an implementation unit `src/defaults/defaults.cpp` and keep the interface to declarations plus the `LatencyNumbers` struct, with the constants defined as `SimTime{250'000}` etc. Record which variant worked in the commit message.
+Write every duration in the table with the `simsys::literals` suffixes (`250_us`, `10_ms`, `0_s`); `case client: return {Rate{0}, 0_s};`. Never add `<chrono>` to this interface (GCC 14 rule, verified by probe on 2026-10-28).
 
 - [ ] **Step 4: Run `[defaults]`, 7 pass. Step 5: Commit** `defaults: back-of-the-envelope table and resolution with provenance`
 
