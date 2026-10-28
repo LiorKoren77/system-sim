@@ -6,6 +6,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <optional>
@@ -18,6 +19,7 @@
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
+import simsys.caching;
 import simsys.core;
 import simsys.defaults;
 import simsys.graph;
@@ -32,6 +34,7 @@ using simsys::graph::ServiceHop;
 using simsys::model::CacheStrategy;
 using simsys::model::Direction;
 using simsys::model::HitRatio;
+using simsys::model::KeySpec;
 using simsys::model::LbPolicy;
 using simsys::model::LinkSpec;
 using simsys::model::NodeSpec;
@@ -885,4 +888,126 @@ TEST_CASE("a forwarding cache's backend needs a link from the cache", "[graph]")
   // C++23 std::string::contains: a substring test in one call, replacing
   // `find(...) != std::string::npos`; used where only part of the message is the point.
   REQUIRE(g.error().message.contains("node 'cache': backend 'db' needs a link"));
+}
+
+// ---- Che hit ratios resolved from the clients' key distributions (plan 2b, Task 2) ----
+
+// The Che approximation needs the cache size (the cache's `keys`) and how popular each key is,
+// and popularity is a property of the clients, not of the cache: the graph reads it off the
+// clients that reach the cache, walking back through the forwarders (load balancers, limiters,
+// services) between them.
+namespace {
+NodeSpec che_cache(std::optional<std::int64_t> keys = 1000) {
+  NodeSpec node{.id = "cache",
+                .type = NodeType::cache,
+                .hit_ratio = HitRatio{.che = true},
+                .strategy = CacheStrategy::cache_aside};
+  node.keys = keys;
+  return node;
+}
+NodeSpec keyed_client(std::string id, KeySpec keys) {
+  auto node = client(std::move(id), Rate{100}, {{"get", 1.0}});
+  node.workload->keys = keys;
+  return node;
+}
+// u (the given keys) -> web -> cache (che) and web -> db.
+Scenario che_web(NodeSpec cache_node, std::optional<KeySpec> keys) {
+  auto s = cached_web(std::move(cache_node), read_then_db_on_miss());
+  s.nodes[0].workload->keys = keys;
+  return s;
+}
+}  // namespace
+
+TEST_CASE("a che cache fed by one client resolves its hit ratio from that client's keys",
+          "[graph]") {
+  const auto s = che_web(che_cache(1000), KeySpec{.zipf = 1.0, .space = 10'000});
+  const auto built = Graph::build(s);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto& g = *built;
+  const auto cache_index = *g.index_of("cache");
+  REQUIRE(g.hit_ratio(cache_index).has_value());
+  REQUIRE_THAT(*g.hit_ratio(cache_index),
+               WithinRel(simsys::caching::che_hit_ratio(
+                             1000, simsys::caching::Popularity::zipf(1.0, 10'000)),
+                         1e-12));
+}
+
+TEST_CASE("a che cache behind a load balancer and a limiter still finds the client's keys",
+          "[graph]") {
+  Scenario s{.name = "che-chain", .version = 1, .duration = 1min};
+  s.nodes = {keyed_client("u", KeySpec{.zipf = 1.0, .space = 10'000}),
+             load_balancer("lb", LbPolicy::round_robin),
+             limiter_of(simsys::model::LimiterAlgorithm::token_bucket, std::nullopt),
+             service("web", {{"get", read_then_db_on_miss()}}),
+             che_cache(1000),
+             service("db")};
+  s.links = {LinkSpec{.from = "u", .to = "lb"}, LinkSpec{.from = "lb", .to = "limiter"},
+             LinkSpec{.from = "limiter", .to = "web"}, LinkSpec{.from = "web", .to = "cache"},
+             LinkSpec{.from = "web", .to = "db"}};
+  const auto built = Graph::build(s);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto& g = *built;
+  REQUIRE_THAT(*g.hit_ratio(*g.index_of("cache")),
+               WithinRel(simsys::caching::che_hit_ratio(
+                             1000, simsys::caching::Popularity::zipf(1.0, 10'000)),
+                         1e-12));
+}
+
+TEST_CASE("a che cache with no keyed client upstream is an error", "[graph]") {
+  const auto g = Graph::build(che_web(che_cache(1000), std::nullopt));
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message == "node 'cache': hit_ratio che needs a client with keys upstream");
+}
+
+namespace {
+// a and b -> web -> cache (che) and web -> db.
+Scenario two_clients_one_cache(KeySpec a, KeySpec b) {
+  Scenario s{.name = "two-clients", .version = 1, .duration = 1min};
+  s.nodes = {keyed_client("a", a), keyed_client("b", b),
+             service("web", {{"get", read_then_db_on_miss()}}), che_cache(1000), service("db")};
+  s.links = {LinkSpec{.from = "a", .to = "web"}, LinkSpec{.from = "b", .to = "web"},
+             LinkSpec{.from = "web", .to = "cache"}, LinkSpec{.from = "web", .to = "db"}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("two clients with different key distributions reaching one che cache is an error",
+          "[graph]") {
+  const auto g = Graph::build(two_clients_one_cache(KeySpec{.zipf = 1.0, .space = 10'000},
+                                                    KeySpec{.zipf = 0.5, .space = 10'000}));
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message ==
+          "node 'cache': hit_ratio che: clients 'a' and 'b' send different key distributions");
+}
+
+TEST_CASE("two clients with the same key distribution reaching one che cache agree", "[graph]") {
+  const auto built = Graph::build(two_clients_one_cache(KeySpec{.zipf = 1.0, .space = 10'000},
+                                                        KeySpec{.zipf = 1.0, .space = 10'000}));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto& g = *built;
+  REQUIRE_THAT(*g.hit_ratio(*g.index_of("cache")),
+               WithinRel(simsys::caching::che_hit_ratio(
+                             1000, simsys::caching::Popularity::zipf(1.0, 10'000)),
+                         1e-12));
+}
+
+TEST_CASE("a che cache needs a keys capacity", "[graph]") {
+  const auto g =
+      Graph::build(che_web(che_cache(std::nullopt), KeySpec{.zipf = 1.0, .space = 10'000}));
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message ==
+          "node 'cache': hit_ratio che needs keys (the cache's capacity in keys)");
+}
+
+// Uniform popularity is the cache's worst case: every key equally likely, so a cache holding a
+// quarter of the keys answers a quarter of the reads, whatever the eviction policy.
+TEST_CASE("a uniform key space gives the cache's share of the keys", "[graph]") {
+  const auto built =
+      Graph::build(che_web(che_cache(250), KeySpec{.zipf = std::nullopt, .space = 1000}));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE_THAT(*built->hit_ratio(*built->index_of("cache")), WithinRel(0.25, 1e-6));
 }

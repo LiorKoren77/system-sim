@@ -1021,25 +1021,12 @@ TEST_CASE("a cache hit ratio of 1 sends nothing to the database and adds none of
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(web.mean_s + cache.mean_s, 1e-9));
 }
 
-// The Che approximation (a hit ratio computed from the cache size, the key popularity and the
-// eviction policy) and the write_back strategy (acknowledge a write from the cache, flush it
-// to the store later: a queue of dirty entries) need machinery phase 2b brings. The graph builds,
-// so explain can print the scenario; running it is refused, naming the phase and the culprit.
-TEST_CASE("che hit ratios and write_back are refused until phase 2b", "[theory]") {
-  SECTION("a che hit ratio") {
-    auto s = cached_reads(0.8);
-    s.nodes[2].hit_ratio = HitRatio{.fixed = std::nullopt, .che = true};
-    const auto g = Graph::build(s);
-    REQUIRE(g.has_value());
-    const auto sim = Simulation::create(*g);
-    REQUIRE_FALSE(sim.has_value());
-    // C++23 std::string::contains and C++20 ends_with: a substring and a suffix test in
-    // one call each, replacing `find(...) != npos` and a compare() on the tail.
-    REQUIRE(sim.error().message.contains("phase 2b"));
-    REQUIRE(sim.error().message.contains("node 'cache'"));
-    REQUIRE(sim.error().message.contains("che"));
-    REQUIRE(sim.error().message.ends_with("(phase 2b)"));
-  }
+// The write_back strategy (acknowledge a write from the cache, flush it to the store later: a
+// queue of dirty entries) and a cache's then steps need machinery phase 2b brings. The graph
+// builds, so explain can print the scenario; running it is refused, naming the phase and the
+// culprit. (The Che hit ratio no longer belongs here: the graph resolves it at build, see the
+// url-shortener test below.)
+TEST_CASE("write_back and cache then steps are refused until phase 2b", "[theory]") {
   SECTION("the write_back strategy") {
     auto s = cached_reads(0.8);
     s.nodes[2].strategy = CacheStrategy::write_back;
@@ -1050,6 +1037,8 @@ TEST_CASE("che hit ratios and write_back are refused until phase 2b", "[theory]"
     REQUIRE(g.has_value());
     const auto sim = Simulation::create(*g);
     REQUIRE_FALSE(sim.has_value());
+    // C++23 std::string::contains and C++20 ends_with: a substring and a suffix test in
+    // one call each, replacing `find(...) != npos` and a compare() on the tail.
     REQUIRE(sim.error().message.contains("phase 2b"));
     REQUIRE(sim.error().message.contains("node 'cache'"));
     REQUIRE(sim.error().message.contains("write_back"));
@@ -1080,4 +1069,26 @@ TEST_CASE("a cache built in code with an empty hit ratio needs a hit_ratio", "[t
   const auto sim = Simulation::create(*g);
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message == "node 'cache': cache needs a hit_ratio");
+}
+
+// ch. 8's URL shortener: 100M short links, the few popular ones taking most of the clicks (Zipf
+// exponent 1), and a cache that holds 20M of them. The Che approximation turns "20M keys of
+// 100M under Zipf(1)" into a hit ratio before the first step, and the fluid engine then treats
+// it exactly like a stated one.
+TEST_CASE("url-shortener's url_cache resolves to a che hit ratio and the simulation accepts it",
+          "[theory]") {
+  auto s = cached_reads(0.8);
+  s.nodes[0].workload->keys = simsys::model::KeySpec{.zipf = 1.0, .space = 100e6};
+  s.nodes[2].hit_ratio = HitRatio{.che = true};
+  s.nodes[2].keys = 20'000'000;
+  const auto g = Graph::build(s);
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto h = g->hit_ratio(*g->index_of("cache"));
+  REQUIRE(h.has_value());
+  REQUIRE(*h > 0.5);
+  REQUIRE(*h < 1.0);
+  const auto sim = Simulation::create(*g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
 }
