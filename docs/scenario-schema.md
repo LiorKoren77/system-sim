@@ -246,6 +246,18 @@ An op with an empty step list (`deliver: []`) is terminal: the node serves it an
 nothing. *(graph)* Every step needs a link that carries demand from the node to its
 target and, if that link lists `ops`, lists the step's op.
 
+**Request sizes** *(graph, phase 2c)*. Each (node, op) gets one size at build, from the
+client's `sizes` or a step's `size`: a request keeps its size while it keeps its op name
+(through balancers, limiters, a cache's or CDN's forwarding to its store or origin, a message
+queue's links to its worker pools, and any step or `then` step that does not rename the op), and
+a step that renames the op without `size` sends an unsized request. Two different sizes for one
+(node, op) are an error at any node, `node 'store': op 'get' arrives with two sizes, 1MB from 'a'
+and 2MB from 'b'`, and so is an unsized op reaching a node that counts bytes (a `cdn` or
+`blob_store` whose capacity is a byte rate, or a `blob_store` with no `capacity`): `node 'store'
+counts bytes (capacity 500MB/s, default), but op 'fetch' from 'svc' has no size: add size: to the
+step or sizes: to the client`. A node that counts requests needs no size; `explain` prints a
+byte-sized node's sizes, `sizes: stream 50MB`.
+
 ## Node types
 
 | type | own keys | status |

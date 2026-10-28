@@ -447,6 +447,32 @@ export namespace simsys {
   return Bytes{*bytes};
 }
 
+// Bytes{5e7} -> "50MB": the inverse of parse_size, for messages and explain, so a size reads
+// back in the scenario's own grammar. The largest unit that keeps the number at least 1 (200B,
+// 2KB, 50MB, 1.5GB; 0B), the number in its shortest round-trip form in fixed notation, so a
+// petabyte prints "1000000GB" rather than "1e+06GB", which no author writes.
+[[nodiscard]] std::string format_size(Bytes size) {
+  const detail::Scale* unit = &detail::size_units.front();
+  for (const auto& candidate : detail::size_units) {
+    if (size.count >= candidate.factor) unit = &candidate;
+  }
+  const double number = size.count / unit->factor;
+  std::array<char, 64> buffer{};
+  auto written =
+      std::to_chars(buffer.data(), buffer.data() + buffer.size(), number, std::chars_format::fixed);
+  // Only a size far below a byte (1e-100 B) has too many fixed digits; it gets the exponent.
+  if (written.ec != std::errc{}) {
+    written = std::to_chars(buffer.data(), buffer.data() + buffer.size(), number);
+  }
+  return std::string{buffer.data(), written.ptr} + std::string{unit->suffix};
+}
+
+// ByteRate{5e8} -> "500MB/s": a byte rate in the grammar parse_byte_rate reads (its prefixes
+// are the size units' without the B), whether the scenario wrote it in bytes or in bits.
+[[nodiscard]] std::string format_byte_rate(ByteRate rate) {
+  return format_size(Bytes{rate.bytes_per_second}) + "/s";
+}
+
 }  // namespace simsys
 
 // ---- Enum <-> word tables -------------------------------------------------------------
