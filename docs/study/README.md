@@ -1,3 +1,14 @@
 # C++20/23 study notes
 
-One short note per language or library feature used in the simulator: what it is, where it is used in the code, and why it was the right tool. See §9 of the design spec for the planned list.
+One short note per language or library feature used in the simulator: what it is, the
+pre-C++20 way, where it is used in the code (file and function), a pitfall met while
+building it, and further reading. See §10 of the design spec for the planned list.
+
+| Note | Feature | Standard | Main uses in the code |
+|---|---|---|---|
+| [modules.md](modules.md) | named modules, interface vs implementation units, the global module fragment | C++20 | every `src/**/*.cppm`; `config.cppm` / `config.cpp` |
+| [expected.md](expected.md) | `std::expected`, monadic `and_then` / `transform` / `transform_error` | C++23 | `core.cppm` unit parsers, `config::load`, `Graph::build`, `main.cpp` |
+| [concepts.md](concepts.md) | concepts, requires-expressions, constrained `auto` parameters | C++20 | `NodeBehaviour`, `RequestSource`, `ResponseLookup` (`behaviours.cppm`), `StepObserver` (`engine.cppm`) |
+| [ranges.md](ranges.md) | range algorithms with projections, views; `contains`, `fold_left`, `to`, `zip`, `join_with` | C++20 / C++23 | `Flow::position_of`, `Graph::connect_steps`, the loader's table lookups, report renderers |
+| [variant-visit.md](variant-visit.md) | `std::variant`, `std::visit`, the `Overloaded` set, CTAD for aggregates | C++17 / C++20 | `behaviours::Behaviour`, `SloSpec::max`, `Simulation::forward_pass`, `limit_value` |
+| [format-print.md](format-print.md) | `std::format`, `std::print` / `std::println`, `std::to_chars`; two GCC 14.2 defects | C++20 / C++23 | loader messages, `main.cpp`, every number in `report.cpp` |

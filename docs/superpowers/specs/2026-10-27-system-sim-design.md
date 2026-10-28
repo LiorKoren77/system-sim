@@ -56,20 +56,30 @@ incoming edges.
 
 ### 3.3 What a node does each step
 
+Per replica (each of `replicas: N` copies sees `demand / N`), with `s` the service time
+and `c` the concurrency (revised, see §16):
+
 ```
 inflow     = Σ incoming flows                      (per op)
-demand     = Σ_op inflow_op × cost_op              (capacity units/s; cost from op table)
+demand     = Σ_op inflow_op × cost_op              (requests/s; cost_op = 1 until the phase 2 op table)
 drain      = min(capacity, demand + backlog/dt)    (serve what it can)
 backlog   += (demand − drain) × dt                 (grows past capacity, shrinks below)
 overflow   = max(0, backlog − queue_limit) / dt;  backlog = min(backlog, queue_limit)
-rho        = min(1, demand / capacity)             (utilization)
-wait_mean  = backlog / capacity                    (fluid backlog, Little's law)
-           + ErlangC(c, rho) × service_time / (c × (1 − rho))   (stochastic queueing, §9.1)
+rho        = drain / capacity                      (busy fraction; 1 when capacity is 0)
+k          = (burstiness + service_variability) / 2          (Allen–Cunneen / Kingman factor)
+rho'       = min(rho, 0.99)
+Wq         = k × ErlangC(c, rho') × s / (c × (1 − rho'))     (stochastic queueing, §9.1)
+wait_mean  = max(backlog / capacity, Wq)           (fluid drain time vs. stochastic wait: the larger)
+latency    = wait_mean + s
+variance   = k² × Var(Wq at rho') + service_variability × s²  (always the stochastic term)
 outflow    = drain, routed to downstream edges by the node's behaviour
 ```
 
-The analytic term uses `min(rho, 0.99)`: once a node is saturated the fluid backlog
-carries the wait, and the stochastic term must not double count it.
+The two waits are blended by `max`, not added: by Little's law the M/M/1 wait at
+rho 0.99 corresponds to about 99 queued requests, and once the fluid backlog is larger
+than that the stochastic queue *is* the backlog. The variance keeps the stochastic term
+even when the fluid term wins the mean, so percentiles keep rising as overload deepens.
+Applying `k²` to the variance is our own heuristic; Allen–Cunneen scales only the mean.
 
 Zones: green below `yellow` (default 0.70 utilization), yellow up to `red` (0.90), red
 above; drops are `overflow` plus anything the behaviour rejects (rate limiter, timeouts).
@@ -79,7 +89,7 @@ above; drops are `overflow` plus anything the behaviour rejects (rate limiter, t
 A link adds its latency to the flow's accumulated mean. If the link latency is shorter
 than `dt` that is all it does; if it is longer (cross-datacenter links at 150 ms with
 `dt` = 100 ms) the flow is also delayed through a ring-buffer delay line of
-`ceil(latency / dt)` steps. Bandwidth, when given, caps bytes/s and queues the excess like a node.
+`ceil(latency / dt)` steps (revised in phase 1 to `round(one_way / dt)`, see §16). Bandwidth, when given, caps bytes/s and queues the excess like a node.
 
 ### 3.5 End-to-end latency and percentiles
 
@@ -346,3 +356,80 @@ a request-level engine would add `handle(Message&)` next to `route(const Flow&)`
 behaviour and reuse everything else. It becomes worthwhile when the lesson is a mechanism
 rather than a consequence: retry storms from stochastic bunching, vector-clock conflict
 resolution, leader election timing. See `docs/approaches.md`.
+
+## 16. Phase 1 refinements (2026-10-28)
+
+Building phase 1 (plan `docs/superpowers/plans/2026-10-28-phase1-fluid-engine.md`)
+changed or sharpened the following points. Where they conflict with an earlier section,
+this section wins; §3.3 and §3.4 are already updated in place.
+
+1. **Latency is computed on the reply path.** Flows carry rates only (§3.2 had latency
+   inside the flow). Each step the engine runs a forward pass in topological order for
+   demand, drain and backlog, then a backward pass in reverse order that composes the
+   response time of every `(node, op)` from its own sojourn and its downstream hops. The
+   §3.5 numbers are unchanged, and fan-out factors can no longer distort latency.
+2. **Payload bytes are deferred to phase 2.** Nothing in phase 1 reads them; they arrive
+   with `blob_store` and link bandwidth.
+3. **Defaults are a `constexpr` C++ table** (`src/defaults/defaults.cppm`), not a YAML
+   file loaded at start-up as §6 planned. The table is the single source of truth, every
+   entry names its source (book, spec or chosen), `explain` prints each resolved number
+   with its provenance, and scenario values still win. A user-editable YAML layer can be
+   added later without changing the API.
+4. **`replicas: N`** is N independent copies behind an equal split, as round-robin gives:
+   each copy sees `demand / N` with the node's own capacity, concurrency and queue limit;
+   backlog and drops are reported summed over the copies.
+5. **Link `latency` is one way.** The table's datacenter numbers are round trips, so a
+   defaulted link uses half of one each way (250 µs inside a DC, 75 ms across), and a
+   request/reply pair adds a full round trip.
+6. **Feedback edges** (chat: `chat_servers → message_q → sync_workers → chat_servers`) are
+   the back edges of a depth-first search and always go through a delay line of at least
+   one step: that is what "cycles use the previous step's value" (§3.1) means in code.
+7. **`run` and `estimate` support only `client` and `service`** in phase 1; any other type
+   fails with a "phase 2" error, while `explain` works for every type. Rate-curve terms
+   other than `base` are accepted by the loader and ignored, and `explain` says so.
+8. **`advanced.burstiness`** (the squared coefficient of variation of inter-arrival times,
+   default 1 = Poisson) joins the schema. With `service_variability` it forms the
+   Allen–Cunneen factor `k = (burstiness + service_variability) / 2` of §9.1.
+9. **Wait blend: max, not sum.** The fluid wait (`backlog / capacity`) and the stochastic
+   wait (`k × Wq` at `min(rho, 0.99)`) describe the same queue once it is long, so adding
+   them counted it twice; summing overstated latency in early overload by 50–98 % at
+   100 ms steps. The mean takes the larger of the two. The plan first took the variance
+   from the winning term too; that made p99 *fall* as a backlog grew (the lognormal fit
+   lost its spread faster than the mean rose), so the variance always keeps the
+   stochastic term plus the service variance.
+10. **Utilization is the busy fraction `drain / capacity`**, not `demand / capacity`. The two
+    agree whenever the backlog is empty; a node working off a backlog at full speed is
+    busy all the time and is shown red, not green.
+11. **`parallel_max` is optimistic.** A parallel group costs the max of its branch means
+    and the max of their variances, but E[max] ≥ max E[Xᵢ], and a `factor: 100` step counts
+    as one branch, so the tail amplification of a wide fan-out (Dean and Barroso, *The
+    Tail at Scale*) is not modelled. The exact rule for n iid branches,
+    `quantile_max(p) = quantile_single(p^(1/n))`, needs an inverse normal CDF and is
+    recorded for a later phase. Reports therefore understate the latency of wide fan-outs.
+12. **Feedback hops are asynchronous, decided per call, not per box.** Two searches answer
+    two questions. The node-level DFS, rooted at the clients so the result does not
+    depend on YAML order, decides only which link gets a delay line. A second DFS over
+    `(node, op)` calls, following unconditional steps from the client routes, finds the
+    hops that close a cycle of calls: such a hop still forwards its flow (a step later)
+    but adds no latency to its caller, since a request cannot wait for itself. A hop over
+    a node-level back edge that closes no call cycle (A.x → B.y and B.z → A.w) is still
+    waited for, read one step stale. With several clients entering one loop, the first
+    client in file order decides where the loop is cut; no shipped scenario has that.
+
+Further rules fixed while building phase 1:
+
+- **Delay steps round to the nearest step** (§3.4): `delay = round(one_way / step)`, halves
+  rounded away from zero, computed on integer nanoseconds. `ceil` delayed every 101 ms hop
+  by two steps at 100 ms; rounding keeps the average arrival time honest. A hop shorter
+  than half a step only adds latency on the reply path. A link longer than a million
+  steps is rejected (its delay line would hold a million flows).
+- **Parallel steps form one group per op** wherever they sit among the sequential steps:
+  response = own sojourn + Σ sequential hops + slowest parallel hop.
+- **Implied concurrency.** Without `advanced.concurrency`, `c = max(1, ceil(capacity ×
+  service time))`: Little's law at full load, so that the fluid drain and the Erlang C
+  term describe the same machine (the old default `c = 1` contradicted every type
+  default and inflated the waits).
+- **Client routing.** A client op carried by several links is split by link weight; an
+  op whose every link has weight 0 is an error rather than a silent equal split.
+- **The schema is v1.1** (`docs/scenario-schema.md`): it lists every loader rule and,
+  for each key, whether phase 1 reads it, only checks it, or ignores it.
