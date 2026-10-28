@@ -328,7 +328,8 @@ TEST_CASE("book/news-feed's media store is checked against the cdn's 5 percent m
 // che hit ratio: valid scenario, explained, and its byte-sized nodes run (plan 2c Task 3), but
 // the engine still refuses it at its first queue, transcode_q: the queues and workers are
 // Tasks 6 and 7. The first refusal is the first node in the YAML whose type the engine does not
-// simulate (original_store, a blob store, is simulated now, though its `then` is Task 4's). What
+// simulate (original_store, a blob store whose `then` publishes each upload to transcode_q, is
+// simulated since Task 4: its steps are asynchronous event notifications). What
 // the cdn changed is pinned through explain (review of 4d539b0, M12): the two edges'
 // Che hit ratios (Zipf 1 over 10M videos, 100k and 50k of them at the edge: 0.642 and 0.594,
 // checked against an independent Python computation by the reviewer) and the miss flow they
@@ -371,6 +372,20 @@ TEST_CASE("book/youtube validates and explains, and the engine refuses it at tra
   // are all simulated; transcode_q, the next node in the file, is a message queue.
   REQUIRE(sim.error().message ==
           "node 'transcode_q' has type 'message_queue', which run/estimate do not support yet "
+          "(phase 2)");
+}
+
+// Ch. 15's Google Drive is refused where its first message queue comes, notify_q (the order of the
+// file: lb, api, block_servers, the two stores, the metadata tier, then notify_q). Its blob stores
+// have no `then` steps, so they were never what stopped it; the queue and its two consumer groups
+// are Tasks 6 and 7, and the pin stays until then.
+TEST_CASE("book/google-drive is refused at notify_q", "[scenario]") {
+  const auto g = build_or_fail(
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/google-drive/scenario.yaml"));
+  const auto sim = simsys::engine::Simulation::create(g);
+  REQUIRE_FALSE(sim.has_value());
+  REQUIRE(sim.error().message ==
+          "node 'notify_q' has type 'message_queue', which run/estimate do not support yet "
           "(phase 2)");
 }
 

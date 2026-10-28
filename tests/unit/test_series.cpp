@@ -108,9 +108,10 @@ Scenario spike_into_big_queue() {
 
 // Two clients feed `db` (a service of 2k/s): `reader` sends `read_rate` of `read` straight to it
 // over a client route, which the paper load follows; `uploader` sends 10k/s of `put` to `blobs`,
-// a blob store whose `then` writes each upload's metadata to db, which the paper load does not
-// follow yet (phase 2c). `blobs` also has a link to `audit` but no step along it: nothing flows
-// there. The probe of the review of 3e23477 (I1): db's paper load is only the reader's part.
+// a blob store whose `then` writes each upload's metadata to db (an event notification: the paper
+// load follows it since plan 2c Task 4; before, it did not and db's load was only the reader's
+// part: the probe of the review of 3e23477, I1). `blobs` also has a link to `audit` but no step
+// along it: nothing flows there.
 Scenario partly_behind_blob_store(double read_rate) {
   Scenario s{.name = "partial", .version = 1, .duration = 1s, .step = 100ms};
   s.nodes = {
@@ -608,30 +609,42 @@ TEST_CASE("the JSON's answered_per_s equals offered_per_s when nothing is droppe
 // The paper load (report.cpp: paper_pass / forward_steps) forwards load from a client's routes,
 // from a service or worker over its `ops` steps, through load balancers and rate limiters over
 // their links (graph::forwards_by_link) and from caches and CDNs on misses (hits_or_misses).
-// A blob store's `then`, a message queue's consumers and a worker pool's `then` are not
-// followed yet (phase 2c), so the nodes that only they feed show 0 offered load: before this
-// change, `0%, green`, a verdict on a number that is missing, not zero.
+// A message queue's consumers and a worker pool's `then` are not followed yet (phase 2c), so
+// the nodes that only they feed show 0 offered load: before this change, `0%, green`, a verdict
+// on a number that is missing, not zero. A blob store's `then` is followed since plan 2c Task 4
+// (its steps are event notifications that fire for every request it serves, and its capacity
+// counts megabytes): what it notifies has its load and its verdict.
 
-TEST_CASE("explain marks the youtube nodes behind the blob store and queues as not propagated",
-          "[series]") {
+TEST_CASE(
+    "explain follows youtube's blob store into transcode_q and marks what lies behind the "
+    "queues",
+    "[series]") {
   const auto text = explain_shipped("youtube");
   CAPTURE(text);
   // original_store (blob_store) receives the uploads from the clients directly, and its `then`
-  // publishes to transcode_q, which the paper load does not follow: transcode_q shows 0/s.
+  // publishes each served upload to transcode_q (no factor): the 9.6 uploads/s of the evening
+  // peak (the original_store line's own "(9.6/s)") are transcode_q's offered load, against its
+  // 1M/s, and its verdict is a plain green: the blob store is no longer a blocking type.
   const auto queue = check_line(text, "transcode_q");
   REQUIRE_FALSE(queue.empty());
-  REQUIRE(queue.contains("(load not propagated: blob_store is phase 2c)"));
-  REQUIRE_FALSE(queue.contains("green"));
-  REQUIRE_FALSE(queue.contains("%"));
-  // transcoders consume transcode_q, a message queue, which does not forward either; and
-  // completion_handler sits behind completion_q behind the transcoders. None has a verdict.
-  for (const auto* id : {"transcoders", "completion_q", "completion_handler"}) {
-    CAPTURE(id);
-    const auto line = check_line(text, id);
-    REQUIRE_FALSE(line.empty());
-    REQUIRE(line.contains("load not propagated"));
-    REQUIRE_FALSE(line.contains("green"));
-  }
+  REQUIRE(queue.contains("peak offered 9.6/s"));
+  REQUIRE(queue.contains("green"));
+  REQUIRE_FALSE(queue.contains("load not propagated"));
+  REQUIRE_FALSE(queue.contains("blob_store"));
+  // transcoders consume transcode_q, a message queue, which the paper load does not follow yet
+  // (Task 7); completion_handler sits behind completion_q behind the transcoders (worker pools,
+  // Task 7). None has a verdict, and none names the blob store any more: the mark lists the types
+  // whose onward flow is still missing, nearest first.
+  const auto transcoders = check_line(text, "transcoders");
+  REQUIRE(transcoders.contains("(load not propagated: message_queue is phase 2c)"));
+  REQUIRE_FALSE(transcoders.contains("green"));
+  const auto completion_q = check_line(text, "completion_q");
+  REQUIRE(
+      completion_q.contains("(load not propagated: worker_pool and message_queue are phase 2c)"));
+  REQUIRE_FALSE(completion_q.contains("green"));
+  const auto handler = check_line(text, "completion_handler");
+  REQUIRE(handler.contains("(load not propagated: message_queue and worker_pool are phase 2c)"));
+  REQUIRE_FALSE(handler.contains("green"));
 }
 
 TEST_CASE("explain marks the google-drive consumers of notify_q, and keeps notify_q's verdict",
@@ -684,28 +697,35 @@ TEST_CASE("nodes the paper load does reach keep their verdict and are not marked
 // I1): db below, fed 1/s by a client and 10k/s through a blob store's `then`, printed
 // "(0.05%, green)". Every node with a blocking predecessor, direct or further up, is now marked;
 // a reached one keeps its percentage as a lower bound ("≥"), with no zone below red. A red lower
-// bound is a true verdict (the real load is at least that), so it keeps its "red".
+// bound is a true verdict (the real load is at least that), so it keeps its "red". The blob store
+// stopped being a blocking type in plan 2c Task 4 (its `then` is followed), so the two db cases
+// below now show the complete number; the lower bound still marks what lies behind a worker pool
+// or a message queue (the youtube cases further down).
 
-TEST_CASE("a node fed partly through a blob store shows a lower bound and no green", "[series]") {
+TEST_CASE("a node fed partly through a blob store counts the store's notifications in full",
+          "[series]") {
   const auto text = explain_of(partly_behind_blob_store(1.0));
   CAPTURE(text);
   const auto line = check_line(text, "db");
-  // 1/s of reads against 2k/s: 0.05 %, a lower bound: the blob store's 10k/s of writes is
-  // missing from it.
-  REQUIRE(line.contains("(≥0.05%; load not propagated: blob_store is phase 2c)"));
-  REQUIRE_FALSE(line.contains("green"));
+  // 1/s of reads plus the blob store's 10k/s of writes (one per served upload, factor 1) is
+  // 10001/s against 2k/s: 500 %, red, a complete number: no lower bound and no mark (plan 2c
+  // Task 4: a blob store's then steps are followed).
+  REQUIRE(line.contains("(500%, red)"));
+  REQUIRE_FALSE(line.contains("load not propagated"));
+  REQUIRE_FALSE(line.contains("≥"));
 }
 
-TEST_CASE("a red lower bound stays red", "[series]") {
+TEST_CASE("a blob store's notifications add to the load a node gets from elsewhere", "[series]") {
   const auto text = explain_of(partly_behind_blob_store(3000.0));
   CAPTURE(text);
-  // 3000/s of reads alone against 2k/s: 150 %, so db is overloaded whatever else arrives.
-  REQUIRE(
-      check_line(text, "db").contains("(≥150%, red; load not propagated: blob_store is phase 2c)"));
+  // 3000/s of reads plus 10k/s of writes: 13000/s against 2k/s: 650 %.
+  const auto line = check_line(text, "db");
+  REQUIRE(line.contains("(650%, red)"));
+  REQUIRE_FALSE(line.contains("load not propagated"));
 }
 
-// The mark follows the blob store's `then` steps, not its bare links: audit is linked but sent
-// nothing, so its 0 % is a real 0 and keeps its verdict.
+// The paper load follows the blob store's `then` steps, not its bare links: audit is linked but
+// sent nothing, so its 0 % is a real 0 and keeps its verdict.
 TEST_CASE("a node linked from a blob store but sent no step keeps its verdict", "[series]") {
   const auto text = explain_of(partly_behind_blob_store(1.0));
   CAPTURE(text);
@@ -719,15 +739,15 @@ TEST_CASE("explain gives youtube's metadata_db a lower bound: the completion han
   const auto text = explain_shipped("youtube");
   CAPTURE(text);
   // api's metadata reads and upload_meta writes reach metadata_db on paper (50.28 units/s of
-  // 9k/s: 0.559 %); the completion handler's writes come through worker pools, message queues
-  // and the blob store, none of which the paper load follows yet. Each blocking type is named
-  // once, nearest first: completion_handler (worker_pool), completion_q (message_queue), ...
+  // 9k/s: 0.559 %); the completion handler's writes come through worker pools and message
+  // queues, which the paper load does not follow yet (the blob store in front of them is followed
+  // since plan 2c Task 4). Each blocking type is named once, nearest first: completion_handler
+  // (worker_pool), completion_q (message_queue).
   for (const auto* id : {"metadata_db", "metadata_cache"}) {
     CAPTURE(id);
     const auto line = check_line(text, id);
     REQUIRE(line.contains("(≥"));
-    REQUIRE(line.contains(
-        "; load not propagated: worker_pool, message_queue and blob_store are phase 2c)"));
+    REQUIRE(line.contains("; load not propagated: worker_pool and message_queue are phase 2c)"));
     REQUIRE_FALSE(line.contains("green"));
   }
   REQUIRE(check_line(text, "metadata_db").contains("(≥0.559%; load not propagated:"));

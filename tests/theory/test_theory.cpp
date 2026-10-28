@@ -1959,19 +1959,204 @@ TEST_CASE("the engine runs a blob store that has no then steps", "[theory]") {
   REQUIRE(sim.has_value());
 }
 
-// A blob store's `then` steps are event notifications (S3 event notifications; book ch. 14's
-// "transcoding starts when the upload completes"): asynchronous work, which arrives with phase 2c
-// Task 4. Until then a store with one is refused, and the message (pinned whole, as the schema's
-// table of refusals quotes it) says which node, what is pending and when it comes.
-TEST_CASE("the engine refuses a blob store with then steps until phase 2c's events", "[theory]") {
+TEST_CASE("the engine runs a blob store that has then steps", "[theory]") {
   const auto g = Graph::build(blob_store_with_event());
   INFO((g ? "" : g.error().message));
   REQUIRE(g.has_value());
   const auto sim = Simulation::create(*g);
-  REQUIRE_FALSE(sim.has_value());
-  REQUIRE(sim.error().message ==
-          "node 'store': a blob store's then steps are event notifications, which run/estimate "
-          "do not support yet (phase 2c)");
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+}
+
+// ---- A blob store's then steps are asynchronous event notifications (plan 2c refinements 6-7)
+// ----
+//
+// S3 event notifications (book ch. 14: "transcoding starts when the upload completes"): for every
+// request the store SERVED, each `then` step sends its op to its target, and nobody waits for it.
+// So the uploader's response and answered rate end at the store, and the target only receives load.
+//
+// The numbers below come from one picture: a client sends 2 uploads/s of 100 MB to a default blob
+// store (spec section 6: 500 MB/s, 40 ms per MB), over a 250 us link (0.5 ms round trip):
+//   demand   = 2/s x 100 MB = 200 units (MB) per second against 500: rho = 200 / 500 = 0.4;
+//   c        = 500 units/s x 40 ms = 20 slots (Little's law);
+//   s_obj    = 100 MB x 40 ms = 4 s, the time one upload holds a slot;
+//   Erlang C(20, 0.4) = 0.00026495 (queueing::mmc_wait takes rho per server), so the wait is
+//   Wq       = C x s_obj / (c (1 - rho)) = 0.00026495 x 4 s / (20 x 0.6) = 0.0883 ms.
+// An op that is not in the store's `write_ops` is a read, answered at its first megabyte:
+//   response = Wq + 40 ms + 0.5 ms = 40.588 ms.
+// Listed in `write_ops`, the upload is answered at its last byte: Wq + 4 s + 0.5 ms = 4.000588 s.
+// Either way `svc`, which takes 500 ms per notification, adds nothing to the client's response.
+
+namespace {
+constexpr double upload_wait_s = 8.8316e-5;  // Wq above, to the digits the derivation gives
+
+// The service the store notifies: fast to the client's eyes if it counted (500 ms), so that a
+// response that waited for it would be unmistakable.
+NodeSpec notified_service() {
+  return NodeSpec{.id = "svc", .type = NodeType::service, .capacity = Rate{1000}, .latency = 500ms};
+}
+
+// u (`rate` uploads/s of 100 MB, 250 us link) -> store (a default blob store) -> svc over a 1 ms
+// link, the store's `then` being `then`. `write_ops` is the store's, when given. Node indices:
+// u 0, store 1, svc 2.
+Scenario upload_with_events(std::vector<Step> then,
+                            std::optional<std::vector<std::string>> write_ops = {},
+                            NodeSpec svc = notified_service(), double rate = 2.0) {
+  Scenario s{.name = "blob-events", .version = 1, .duration = 10s};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{rate}},
+                                           .op_shares = {{"upload", 1.0}},
+                                           .sizes = {{"upload", simsys::Bytes{100e6}}}}},
+             NodeSpec{.id = "store",
+                      .type = NodeType::blob_store,
+                      .then = std::move(then),
+                      .write_ops = std::move(write_ops)},
+             std::move(svc)};
+  s.links = {LinkSpec{.from = "u", .to = "store", .latency = 250us},
+             LinkSpec{.from = "store", .to = "svc", .latency = 1ms}};
+  return s;
+}
+
+const std::vector<Step> notify_step{Step{.to = "svc", .op = "notify"}};
+}  // namespace
+
+TEST_CASE("a blob store sends its then target one notification per upload it served", "[theory]") {
+  const auto g = *Graph::build(upload_with_events(notify_step));
+  const auto r = first_step(g);
+  const auto& store = r.nodes[*g.index_of("store")];
+  REQUIRE_THAT(store.demand_per_s, WithinRel(200.0, 1e-12));  // units (MB) per second
+  REQUIRE_THAT(store.rho, WithinRel(0.4, 1e-12));
+  REQUIRE_THAT(simsys::queueing::mmc_wait(20, 0.4, 4.0).mean_s, WithinAbs(upload_wait_s, 1e-9));
+  // 2 uploads/s served, 2 notify/s sent: svc counts requests, not megabytes.
+  REQUIRE_THAT(r.nodes[*g.index_of("svc")].demand_per_s, WithinRel(2.0, 1e-12));
+}
+
+// The upload is a read to this store (`write_ops` does not list it): answered at its first
+// megabyte, 0.0883 ms + 40 ms after the wait, plus the 0.5 ms round trip: 40.588 ms. The 500 ms
+// svc is not in it: the hop to svc is asynchronous.
+TEST_CASE("a notified blob store answers a read-style upload in 40.59 ms, svc not included",
+          "[theory]") {
+  const auto g = *Graph::build(upload_with_events(notify_step));
+  const auto r = first_step(g);
+  const double wait = simsys::queueing::mmc_wait(20, 0.4, 4.0).mean_s;
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(wait + 0.040 + 0.0005, 1e-9));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.040588, 1e-6));
+  // The store's own sojourn is the response minus the link round trip.
+  REQUIRE_THAT(r.nodes[*g.index_of("store")].latency.mean_s, WithinRel(wait + 0.040, 1e-9));
+}
+
+// The same upload counted as a write is answered at its last byte: 4 s + Wq + 0.5 ms.
+TEST_CASE("a notified blob store answers a write-listed upload at its last byte, svc not included",
+          "[theory]") {
+  const auto g = *Graph::build(upload_with_events(notify_step, std::vector<std::string>{"upload"}));
+  const auto r = first_step(g);
+  const double wait = simsys::queueing::mmc_wait(20, 0.4, 4.0).mean_s;
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(wait + 4.0 + 0.0005, 1e-9));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(4.000588, 1e-6));
+}
+
+// svc is a 1/s service with a waiting room of 1, offered 2 notify/s: in the long run it drains
+// 1/s and drops the other 1/s, a drop rate of 1 / 2 = 0.5. The client never hears of it: its
+// uploads are answered at the store, 2/s of 2/s, at the same 40.588 ms.
+TEST_CASE(
+    "an undersized notified service drops half its notifications and the uploader still "
+    "gets every answer",
+    "[theory]") {
+  const auto undersized = NodeSpec{.id = "svc",
+                                   .type = NodeType::service,
+                                   .capacity = Rate{1},
+                                   .latency = 10ms,
+                                   .advanced = {.queue_limit = 1}};
+  const auto g = *Graph::build(upload_with_events(notify_step, {}, undersized));
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const auto e = sim->estimate();
+  const auto& svc = e.nodes[*g.index_of("svc")];
+  REQUIRE_THAT(svc.demand_per_s, WithinRel(2.0, 1e-9));
+  REQUIRE_THAT(svc.dropped_per_s, WithinRel(1.0, 1e-6));
+  REQUIRE_THAT(svc.dropped_per_s / svc.demand_per_s, WithinRel(0.5, 1e-6));
+  REQUIRE(e.nodes[*g.index_of("store")].dropped_per_s == 0.0);
+  REQUIRE_THAT(e.responses[0].answered.per_second, WithinRel(2.0, 1e-9));
+  const double wait = simsys::queueing::mmc_wait(20, 0.4, 4.0).mean_s;
+  REQUIRE_THAT(e.responses[0].response.mean_s, WithinRel(wait + 0.040 + 0.0005, 1e-9));
+}
+
+// `factor` multiplies a notification: one upload, four events (say four renditions to make).
+TEST_CASE("a notification's factor multiplies the notifications sent: 4 per upload is 8 per second",
+          "[theory]") {
+  const auto g =
+      *Graph::build(upload_with_events({Step{.to = "svc", .op = "notify", .factor = 4.0}}));
+  const auto r = first_step(g);
+  REQUIRE_THAT(r.nodes[*g.index_of("svc")].demand_per_s, WithinRel(8.0, 1e-12));
+  // The store is untouched by what it sends: same rho, same answer.
+  REQUIRE_THAT(r.nodes[*g.index_of("store")].rho, WithinRel(0.4, 1e-12));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.040588, 1e-6));
+}
+
+// The size walk (plan 2c refinement 1) is how the graph resolves it, and the engine must accept
+// all three shapes: a step that keeps the op name carries the upload's 100 MB (1e8 B), a renamed
+// step is unsized unless it states `size:`. svc counts requests, so it takes an unsized notify.
+TEST_CASE(
+    "a notification carries the upload's size when the op keeps its name and none when "
+    "renamed",
+    "[theory]") {
+  SECTION("same op: the incoming 100 MB") {
+    const auto g = *Graph::build(upload_with_events({Step{.to = "svc", .op = "upload"}}));
+    REQUIRE(Simulation::create(g).has_value());
+    REQUIRE_THAT(g.request_bytes(*g.index_of("svc"), "upload")->count, WithinRel(1e8, 1e-12));
+  }
+  SECTION("renamed, without size: unsized") {
+    const auto g = *Graph::build(upload_with_events(notify_step));
+    REQUIRE(Simulation::create(g).has_value());
+    REQUIRE_FALSE(g.request_bytes(*g.index_of("svc"), "notify").has_value());
+  }
+  SECTION("renamed, with size: the step's own 1 KB") {
+    const auto g = *Graph::build(
+        upload_with_events({Step{.to = "svc", .op = "notify", .size = simsys::Bytes{1e3}}}));
+    REQUIRE(Simulation::create(g).has_value());
+    REQUIRE_THAT(g.request_bytes(*g.index_of("svc"), "notify")->count, WithinRel(1e3, 1e-12));
+  }
+}
+
+// 10 uploads/s of 100 MB are 1000 MB/s against 500: the store serves half, 5 uploads/s, and the
+// other half is dropped. A notification fires for a request the store SERVED, so svc is sent 5/s,
+// not the 10/s offered.
+TEST_CASE("an overloaded blob store notifies only for the uploads it served", "[theory]") {
+  const auto g = *Graph::build(upload_with_events(notify_step, {}, notified_service(), 10.0));
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const auto e = sim->estimate();
+  const auto& store = e.nodes[*g.index_of("store")];
+  REQUIRE_THAT(store.demand_per_s, WithinRel(1000.0, 1e-12));
+  REQUIRE_THAT(store.drain_per_s, WithinRel(500.0, 1e-9));  // 5 uploads/s of 100 MB
+  REQUIRE_THAT(e.nodes[*g.index_of("svc")].demand_per_s, WithinRel(5.0, 1e-9));
+}
+
+// estimate is the long-run state of run: constant rates, so the last step of a run equals it.
+TEST_CASE("estimate and run agree on a blob store with a notification", "[theory]") {
+  const auto g =
+      *Graph::build(upload_with_events({Step{.to = "svc", .op = "notify", .factor = 4.0}}));
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  auto running = *Simulation::create(g);
+  simsys::engine::StepRecord last;
+  running.run({.duration = 2s, .step = 100ms},
+              [&](const simsys::engine::StepRecord& r) { last = r; });
+  const auto e = sim->estimate();
+  for (const auto* id : {"store", "svc"}) {
+    CAPTURE(id);
+    const auto node = *g.index_of(id);
+    REQUIRE_THAT(last.nodes[node].rho, WithinRel(e.nodes[node].rho, 1e-9));
+    REQUIRE_THAT(last.nodes[node].demand_per_s, WithinRel(e.nodes[node].demand_per_s, 1e-9));
+  }
+  REQUIRE_THAT(e.nodes[*g.index_of("svc")].demand_per_s, WithinRel(8.0, 1e-9));
+  REQUIRE_THAT(last.responses[0].response.mean_s, WithinRel(e.responses[0].response.mean_s, 1e-9));
+  REQUIRE_THAT(last.responses[0].answered.per_second,
+               WithinRel(e.responses[0].answered.per_second, 1e-9));
 }
 
 // ---- ID generator as service sugar (plan 2b refinement 6; book ch. 7) ----
