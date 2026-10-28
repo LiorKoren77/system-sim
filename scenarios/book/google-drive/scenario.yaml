@@ -94,7 +94,7 @@ links:
   - {from: notification_svc, to: long_poll}
   - {from: long_poll, to: clients}
   - {from: backup_workers, to: cold_storage}
-  - {from: api, to: long_poll, dir: inout, ops: [sync_poll]}
+  - {from: api, to: long_poll, dir: inout, ops: [poll]}
 
 slo:
   - {metric: p99_latency, node: clients, op: download, max: 2s}
