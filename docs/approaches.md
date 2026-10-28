@@ -1,8 +1,10 @@
 # Modelling Approaches for a System Design Simulator
 
 This document compares the ways one can model "traffic flowing through a graph of
-capacity-limited nodes". Decision: **A (discrete-event simulation) is the engine**,
-**B (analytical) becomes an `estimate` mode and a test oracle**, **C is rejected**.
+capacity-limited nodes". Decision (2026-10-28): **B, extended into a time-stepped fluid model with per-node
+analytic queueing, is the v1 engine**. **A (discrete-event) is deferred** to a later
+"deep dive" mode behind the same YAML. **C is rejected.** The original reasoning for A is
+kept below; the fluid extension that changed the decision is in the last section.
 
 Running example used throughout (from the news-feed chapter):
 
@@ -236,5 +238,29 @@ exercised in the `sweep` command (parallel independent runs with `std::jthread`)
 | implementation size | medium | small | medium |
 | teaching value | "why did it fall over" | "will it fall over" | "what does it feel like" |
 
-Final shape: **A as the engine, B as a mode and an oracle, coroutine façade on A for
-behaviour authoring, C's concurrency only for parallel sweeps.**
+## Why the decision moved to B (fluid model with time and randomness)
+
+B's weaknesses above assume a *static* model. Two extensions remove most of them:
+
+1. **Time stepping.** Make the input a curve λ(t) and give every node a backlog level
+   `q(t)`; each step `drain = min(capacity, inflow + q/dt)`, `q += (inflow − drain)·dt`,
+   drops when `q` exceeds the queue limit. Peaks, backlog growth, drain time after a
+   spike and message-queue lag all fall out of the arithmetic. Node and datacenter
+   failures are capacity and routing changes over time.
+2. **Analytic randomness per node.** Add the Erlang C wait for the node's current
+   utilization (the pointwise stationary fluid flow approximation), with Kingman /
+   Allen–Cunneen corrections for arrival burstiness and service variability. The latency
+   curve now bends up from ~70 % utilization — the yellow zone — and per-hop mean and
+   variance give end-to-end p95/p99 estimates. Workload noise, random spikes, random
+   faults and Monte Carlo replications add run-to-run variability with a seed.
+
+What remains out of reach is correlation between individual requests (thundering herd,
+synchronized retries). Those are offered as scripted faults, and the discrete-event
+engine stays available as a later mode for when the mechanism itself is the lesson.
+
+For a tool whose job is high-level design practice, this gets roughly 80 % of the
+teaching value for about a third of the engine effort, with instant feedback and no
+need for warm-up windows or multiple seeds to get a stable answer.
+
+Final shape: **B extended with time and analytic randomness as the v1 engine; A deferred;
+C's concurrency used only for parallel replications and sweeps.**
