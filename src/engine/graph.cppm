@@ -25,10 +25,12 @@
 // bandwidth limits and link failures (phase 2), and any per-request routing decision —
 // splits are fixed fractions, as round-robin or a weighted DNS record would give. A load
 // balancer's policy is resolved here too, as a property of the node BEHIND it (plan 2a
-// refinement 5, see mark_balanced_targets): whether its replicas queue apart, as one
-// pool, or with a hot spot. A rate limiter forwards like a balancer (per link, by weight)
-// whatever it admits, and its `backend` (the counter store) becomes a demand edge of its
-// own, carrying op `counter` (plan 2a refinement 6, see connect_backends).
+// refinement 5, see mark_balanced_targets): its ReplicaModel, whether its replicas queue
+// apart, as one pool, or with a hot spot. A drained route (link weight 0) carries nothing,
+// so it brings no op, closes no call cycle and imposes no replica model. A rate limiter
+// forwards like a balancer (per link, by weight) whatever it admits, and its `backend` (the
+// counter store) becomes a demand edge of its own, carrying op `counter` (plan 2a
+// refinement 6, see connect_backends).
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -36,6 +38,7 @@ module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this interface imports other modules
 // (GCC 14.2 'Bad file data' bug, CLAUDE.md §3). SimTime is compared through count().
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <compare>
 #include <cstddef>
@@ -69,9 +72,10 @@ inline constexpr int max_delay_steps = 1'000'000;
 
 // Why a scenario that loaded cleanly still cannot be simulated (a step with no link to
 // travel on, a client or load-balancer op that no link carries, demand sent into a client,
-// a load balancer with nowhere to send, a node behind load balancers of different policies,
-// a link longer than max_delay_steps, and, for scenarios built in code, a negative latency,
-// a bad weight, a non-positive vnodes or a non-positive step).
+// a load balancer with nowhere to send, a node behind load balancers whose policies give
+// its replicas different queueing models (ReplicaModel), a link longer than
+// max_delay_steps, and, for scenarios built in code, a negative latency, a bad weight, a
+// non-positive vnodes or a non-positive step).
 struct EngineError {
   std::string message;
 };
@@ -82,9 +86,10 @@ struct ResolvedNode {
   fluid::Capacity capacity{};  // meaningless for clients (sources); the engine never reads it
   defaults::Source service_rate_source{defaults::Source::type_default};
   defaults::Source service_time_source{defaults::Source::type_default};
-  // Set on a node that sits behind a load balancer (Graph::mark_balanced_targets): its
-  // replicas form one pooled queue (least_connections), and the hottest replica carries
-  // `imbalance` times the average share (consistent_hash; 1 = an even split).
+  // Set on a node that sits behind a load balancer (Graph::mark_balanced_targets), the
+  // ReplicaModel in numbers: its replicas form one pooled queue (`pooled`,
+  // least_connections), or the hottest replica carries `imbalance` times the average share
+  // (consistent_hash; 1 = an even split, the independent model).
   bool pooled{false};
   double imbalance{1.0};
   // A rate limiter's counter store (spec.backend) as a node index, and the link its
@@ -101,6 +106,47 @@ inline constexpr std::string_view counter_op = "counter";
 // than by per-op steps: load balancers and rate limiters (Graph::route_forwarder).
 [[nodiscard]] constexpr bool forwards_by_link(model::NodeType type) {
   return type == model::NodeType::load_balancer || type == model::NodeType::rate_limiter;
+}
+
+// How the replicas of a node behind a load balancer queue (plan 2a refinement 5): what the
+// balancer's policy does to them, which is all the fluid model can see of a policy.
+//  - independent: each replica is its own queue at an equal share (round_robin, weighted:
+//    requests are dealt out blindly);
+//  - pooled: the replicas are one queue of N × the servers (least_connections);
+//  - imbalanced: the hottest replica holds more than its share (consistent_hash).
+// Two balancers in front of one node must agree on THIS, not on the policy's name:
+// round_robin and weighted give the same independent copies.
+enum class ReplicaModel { independent, pooled, imbalanced };
+
+// Pattern: Table-driven method — the model names, printed in Graph::build's error from this
+// one table (as model::lb_policy_table does for the policies).
+// C++20 std::to_array: builds a std::array from a braced list and deduces its size, replacing
+// `std::array<EnumName<ReplicaModel>, 3>` whose count must be kept in sync by hand.
+inline constexpr auto replica_model_table = std::to_array<core::EnumName<ReplicaModel>>({
+    {ReplicaModel::independent, "independent"},
+    {ReplicaModel::pooled, "pooled"},
+    {ReplicaModel::imbalanced, "imbalanced"},
+});
+
+[[nodiscard]] constexpr std::string_view to_string(ReplicaModel m) {
+  return core::name_in(replica_model_table, m);
+}
+
+// The replica model a balancing policy gives the node behind it (see ReplicaModel).
+[[nodiscard]] constexpr ReplicaModel replica_model_of(model::LbPolicy policy) {
+  // C++20 `using enum`: the enumerators of LbPolicy in scope for this function only, so the
+  // cases read `weighted` rather than `model::LbPolicy::weighted`; nothing leaks outside.
+  using enum model::LbPolicy;
+  switch (policy) {
+    case least_connections:
+      return ReplicaModel::pooled;
+    case consistent_hash:
+      return ReplicaModel::imbalanced;
+    case round_robin:
+    case weighted:
+      break;
+  }
+  return ReplicaModel::independent;
 }
 
 // A scenario link with node indices instead of ids, and its resolved timing.
@@ -241,8 +287,7 @@ namespace {
 // A link carries demand from the node on its "sending" side: `from` for out/inout,
 // `to` for a link written from the receiver's side with `dir: in`.
 [[nodiscard]] bool carries_demand(const ResolvedLink& link, std::size_t from, std::size_t to) {
-  // C++20 `using enum`: the enumerators of Direction in scope, so the test below reads
-  // `in` rather than `model::Direction::in`.
+  // `using enum` (see replica_model_of): the test below reads `in`, not `model::Direction::in`.
   using enum model::Direction;
   if (link.dir == in) return link.from == to && link.to == from;
   return link.from == from && link.to == to;
@@ -378,8 +423,9 @@ struct Call {
 };
 
 // A load balancer or a rate limiter has no `ops` steps, yet each op it receives is a call
-// to the nodes behind it: (lb, op) -> (target, op) for every route that carries the op; a
-// limiter with a backend also calls (backend, counter) first.
+// to the nodes behind it: (lb, op) -> (target, op) for every route that carries the op with
+// a positive share (a drained route, weight 0, carries no request, so it makes no call and
+// can close no call cycle); a limiter with a backend also calls (backend, counter) first.
 // Pattern: Adapter — the forwarders' routes are re-expressed as the steps the search below
 // already walks, keyed by the call they belong to, so the search needs no second case.
 using ForwardedSteps = std::map<Call, std::vector<model::Step>>;
@@ -396,6 +442,7 @@ using ForwardedSteps = std::map<Call, std::vector<model::Step>>;
             model::Step{.to = g.nodes()[*resolved.backend].spec.id, .op = std::string{counter_op}});
       }
       for (const auto& route : g.routes_for(node, op)) {
+        if (route.share <= 0.0) continue;  // drained: no call
         steps.push_back(model::Step{.to = g.nodes()[route.target].spec.id, .op = op});
       }
     }
@@ -812,8 +859,9 @@ std::vector<Route> Graph::routes_for(std::size_t node, std::string_view op) cons
 // Which ops reach every node: a worklist over (node, op) pairs, seeded with the client
 // routes, the unconditional steps (the only ones that forward flow in phase 2a) and the
 // `counter` op of every limiter's backend, and grown through load balancers and rate
-// limiters, which pass each op they receive on to every route whose link carries it. Each
-// pair enters the list once, so a loop of balancers ends.
+// limiters, which pass each op they receive on to every route whose link carries it and is
+// not drained (weight 0: no flow takes it). Each pair enters the list once, so a loop of
+// balancers ends.
 void Graph::collect_arriving_ops() {
   std::vector<std::set<std::string>> arriving(nodes_.size());
   std::vector<std::pair<std::size_t, std::string>> work;
@@ -838,7 +886,7 @@ void Graph::collect_arriving_ops() {
     work.pop_back();
     if (!forwards_by_link(nodes_[node].spec.type)) continue;
     for (const auto& route : routes_[node]) {
-      if (carries_op(links_[route.link], op)) arrive(route.target, op);
+      if (route.share > 0.0 && carries_op(links_[route.link], op)) arrive(route.target, op);
     }
   }
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
@@ -873,42 +921,62 @@ Graph::Result Graph::check_forwarded_ops(std::size_t node) {
 }
 
 // A load balancer's policy changes how the replicas of the node BEHIND it queue (plan 2a
-// refinement 5), so it is stored on that node, where the engine builds its queue:
-//  - round_robin, weighted: requests are dealt out blindly, every replica is its own
-//    queue (N independent M/M/c); nothing to mark.
-//  - least_connections: a request goes to the replica with the fewest in flight, so no
-//    replica idles while another has a queue. Idealised as join-the-shortest-queue: the
-//    replicas behave as ONE pool of N × c servers (M/M/(c·N)), `pooled`.
-//  - consistent_hash with v virtual nodes per server: keys land on ring arcs of uneven
-//    length, so the hottest replica holds more than 1/N of the keys. Heuristic (chosen,
-//    not derived exactly): the arcs' relative spread shrinks like 1/sqrt(v) (each server's
-//    share is a sum of v arcs, the Dynamo/Chord argument), so the hottest carries
-//    imbalance = 1 + 1/sqrt(v) times the average (v = 100: 1.1; v = 1: 2), capped at N
-//    (a single replica is the average).
-// A node behind two balancers of different policies would need two queueing models at
-// once, so that is an error. Two consistent_hash rings with different vnodes keep the
-// larger imbalance (the hotter ring decides the hottest replica).
+// refinement 5), so its ReplicaModel is stored on that node, where the engine builds the
+// queues (engine::Simulation::make_server):
+//  - round_robin, weighted -> independent: requests are dealt out blindly, every replica is
+//    its own queue (N independent M/M/c); nothing to mark.
+//  - least_connections -> pooled: a request goes to the replica with the fewest in flight,
+//    so no replica idles while another has a queue. Idealised as join-the-shortest-queue:
+//    the replicas behave as ONE pool of N × c servers (M/M/(c·N)), `pooled`.
+//  - consistent_hash with v virtual nodes per server -> imbalanced: keys land on ring arcs
+//    of uneven length, so some replica holds more than 1/N of the keys (book ch. 5: the
+//    standard deviation of the load is about 10% of the mean at 100 vnodes, 5% at 200). The
+//    engine models the HOTTEST replica apart from the cooler ones, and needs its share:
+//      imbalance k = 1 + 1/sqrt(v)                 (v = 100: 1.1; v = 150: 1.082; v = 1: 2)
+//    capped at N (a single replica is the average). A heuristic, chosen, not derived: each
+//    server's share is a sum of v arcs, so its relative spread shrinks like 1/sqrt(v) (the
+//    Dynamo/Chord argument, and the book's 10% at v = 100), and k is "the mean plus one
+//    standard deviation". That is the hottest of a FEW servers; the hottest of N is an
+//    extreme value, which grows with N: for roughly normal shares it sits near
+//    sqrt(2 ln N) standard deviations above the mean, so for large N this k understates
+//    the hot spot. A possible refinement is the N-aware k = 1 + sqrt(2 ln N)/sqrt(v).
+// A drained route (weight 0) sends the target nothing and imposes no model. A node behind
+// two balancers whose policies give different models would need two queueing models at
+// once, so that is an error; the same model from different policies (round_robin and
+// weighted) is fine. Two consistent_hash rings with different vnodes keep the larger
+// imbalance (the hotter ring decides the hottest replica). A node reached both through a
+// balancer and directly (a client or a step sending to it) gets the balancer's model for
+// ALL its traffic: the model belongs to the replica group, not to one path into it.
 Graph::Result Graph::mark_balanced_targets() {
-  std::vector<std::optional<model::LbPolicy>> policy_of(nodes_.size());
+  struct Marked {
+    ReplicaModel model;
+    std::size_t balancer;
+  };
+  std::vector<std::optional<Marked>> marked(nodes_.size());
   for (std::size_t balancer = 0; balancer < nodes_.size(); ++balancer) {
     const auto& spec = nodes_[balancer].spec;
     if (spec.type != model::NodeType::load_balancer) continue;
     // A scenario built in code may leave the policy out (the loader always fills it in).
-    const auto policy = spec.policy.value_or(model::LbPolicy::round_robin);
+    const auto replica_model = replica_model_of(spec.policy.value_or(model::LbPolicy::round_robin));
     const int vnodes = spec.vnodes.value_or(model::default_vnodes);
     if (vnodes <= 0) {
       return std::unexpected{
           EngineError{"node '" + spec.id + "': vnodes must be a positive integer"}};
     }
     for (const auto& route : routes_[balancer]) {
+      if (route.share <= 0.0) continue;  // drained: sends nothing, imposes nothing
       auto& target = nodes_[route.target];
-      if (policy_of[route.target] && *policy_of[route.target] != policy) {
-        return std::unexpected{EngineError{"node '" + target.spec.id +
-                                           "' is behind load balancers with different policies"}};
+      auto& earlier = marked[route.target];
+      if (earlier && earlier->model != replica_model) {
+        return std::unexpected{EngineError{
+            "node '" + target.spec.id +
+            "' is behind load balancers with different replica models ('" +
+            nodes_[earlier->balancer].spec.id + "' " + std::string{to_string(earlier->model)} +
+            ", '" + spec.id + "' " + std::string{to_string(replica_model)} + ")"}};
       }
-      policy_of[route.target] = policy;
-      if (policy == model::LbPolicy::least_connections) target.pooled = true;
-      if (policy == model::LbPolicy::consistent_hash) {
+      if (!earlier) earlier = Marked{.model = replica_model, .balancer = balancer};
+      if (replica_model == ReplicaModel::pooled) target.pooled = true;
+      if (replica_model == ReplicaModel::imbalanced) {
         // Imbalance factor 1 + 1/sqrt(v) (see the function comment), at most N: the hottest
         // of N replicas cannot carry more than all of the demand, and one replica alone
         // carries exactly the average (factor 1).

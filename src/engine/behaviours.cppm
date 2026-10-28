@@ -55,12 +55,15 @@ struct Outgoing {
   flow::Flow flow{};
 };
 
-// What a behaviour does with one step's flow: what it forwards (one Outgoing per
-// (target, link), sorted by target then link so runs are deterministic), what it
-// serves itself (the load its own queue sees) and what it refuses (`rejected`: admission
-// control, plan 2a refinement 6; only a rate limiter fills it). Rejected flow is answered
-// at once ("429 Too Many Requests", ch. 4) and never forwarded; the engine counts it in the
-// node's `rejected_per_s`, which the drop rate adds to the queue's drops.
+// What a behaviour does with one step's flow: what it forwards (one Outgoing per (target,
+// link), sorted by target then link so runs are deterministic), what it accepted (`served`:
+// its input minus what it rejected; a service or a balancer accepts all of it, a rate
+// limiter what it admits) and what it refuses (`rejected`: admission control, plan 2a
+// refinement 6; only a rate limiter fills it). The node's own load is not here: the engine
+// runs the queue BEFORE route and reports it in NodeSample (engine::Simulation::serve).
+// Rejected flow is answered at once ("429 Too Many Requests", ch. 4) and never forwarded;
+// the engine counts it in the node's `rejected_per_s`, which the drop rate adds to the
+// queue's drops.
 struct Routed {
   std::vector<Outgoing> outgoing{};
   flow::Flow served{};
@@ -425,20 +428,21 @@ export namespace simsys::behaviours {
 // resolves and the engine applies:
 //   round_robin / weighted -> independent replicas, each an M/M/c at its share;
 //   least_connections      -> one pooled M/M/(c·N) queue (join-the-shortest-queue ideal);
-//   consistent_hash        -> the hottest replica carries 1 + 1/sqrt(vnodes) × the average.
+//   consistent_hash        -> the hottest replica carries 1 + 1/sqrt(vnodes) × the average
+//                             and is queued apart from the N - 1 cooler ones.
 // Ignored: health checks and failover (no failures yet), sticky sessions, the L4 vs L7
 // difference (both are one hop with a service time here), connection setup (TLS), and
 // per-key routing: a consistent-hash balancer here splits by link weight like the others;
-// only its imbalance factor reaches the downstream.
+// only its imbalance factor reaches the downstream (graph::Graph::mark_balanced_targets
+// explains the factor, engine::Simulation::make_server the hot and cool copies).
 class LoadBalancerBehaviour {
  public:
   LoadBalancerBehaviour(const graph::Graph& g, std::size_t self);
 
   // Every incoming op is split over the routes whose link carries it, at the shares
-  // graph::Graph::routes_for gives (link weights renormalised over those links). The
-  // balancer itself handles every request, so `served` is the whole inflow (its own queue
-  // sees all of it), though it answers none: the response comes from downstream. `dt` is
-  // unused: the balancer holds no state between steps (see NodeBehaviour).
+  // graph::Graph::routes_for gives (link weights renormalised over those links). A balancer
+  // rejects nothing, so `served`, the flow it accepted, is its whole input. `dt` is unused:
+  // the balancer holds no state between steps (see NodeBehaviour).
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime dt) const;
 
   // One capacity unit per request, whatever the op: forwarding costs the same for all.
@@ -551,8 +555,8 @@ class RateLimiterBehaviour {
 
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
 // std::visit; a std::variant instead of an abstract base keeps every behaviour a plain
-// value (no heap allocation, no virtual calls, copyable). Phase 2 appends alternatives
-// (cache, queue, ...).
+// value (no heap allocation, no virtual calls, copyable). Phase 2a appended the load
+// balancer and the rate limiter; later phases append the rest (cache, queue, ...).
 // C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
 // it holds) dispatched with std::visit. Closed: adding an alternative means editing this
 // line, and every std::visit that does not handle it then fails to compile.
