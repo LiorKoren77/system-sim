@@ -220,6 +220,60 @@ inline constexpr auto limiter_algorithm_table = std::to_array<core::EnumName<Lim
   return core::parse_in(limiter_algorithm_table, name);
 }
 
+// How a cache and the store behind it share reads and writes (System Design Interview
+// ch. 1 "Cache", and the caches of ch. 8 url shortener, ch. 11 news feed, ch. 12 chat, ch. 13
+// autocomplete, ch. 14 YouTube). In the fluid model (plan 2a refinement 7, see
+// behaviours::CacheBehaviour), with a fixed hit ratio h:
+//   cache_aside   -> "lazy loading": the APPLICATION asks the cache, and on a miss reads the
+//                    store itself (a service step `{to: db, on: miss}`, which carries the miss
+//                    fraction 1 - h); the cache only answers. Writes go to the store through
+//                    the service's own steps.
+//   read_through  -> the CACHE fetches a missing value from its `backend` (1 - h of the reads)
+//                    and the caller waits for that fetch on a miss.
+//   write_through -> every write goes to the cache AND, synchronously, to the backend.
+//   write_around  -> writes go to the backend and skip the cache; for the flow the same as
+//                    write_through (the difference, what the cache then holds, shows in the
+//                    hit ratio, which is fixed here).
+//   write_back    -> writes are acknowledged by the cache and flushed to the backend later
+//                    (a queue of dirty entries): phase 2b; the engine refuses it until then.
+enum class CacheStrategy { cache_aside, read_through, write_through, write_around, write_back };
+
+// Pattern: Table-driven method — the strategy names, read by the loader (`strategy:`) and
+// printed by explain from this one table.
+inline constexpr auto cache_strategy_table = std::to_array<core::EnumName<CacheStrategy>>({
+    {CacheStrategy::cache_aside, "cache_aside"},
+    {CacheStrategy::read_through, "read_through"},
+    {CacheStrategy::write_through, "write_through"},
+    {CacheStrategy::write_around, "write_around"},
+    {CacheStrategy::write_back, "write_back"},
+});
+
+[[nodiscard]] constexpr std::string_view to_string(CacheStrategy s) {
+  return core::name_in(cache_strategy_table, s);
+}
+[[nodiscard]] constexpr std::optional<CacheStrategy> parse_cache_strategy(std::string_view name) {
+  return core::parse_in(cache_strategy_table, name);
+}
+
+// The strategies in which the CACHE talks to the store, so it needs a `backend` (and a link
+// to it): all but cache_aside, where the application does.
+[[nodiscard]] constexpr bool needs_backend(CacheStrategy s) {
+  return s != CacheStrategy::cache_aside;
+}
+
+// A cache's `hit_ratio`: `{fixed: h}`, the share of reads the cache answers, given by the
+// scenario (0 <= h <= 1), or `che`: computed from the cache size (`keys`), the key
+// popularity and the eviction policy by the Che approximation (phase 2b; until then the
+// graph has no number for it and the engine refuses it). Exactly one of the two is set.
+struct HitRatio {
+  std::optional<double> fixed{};
+  bool che{false};
+};
+
+// The ops a cache treats as writes when the scenario gives no `write_ops`: one op called
+// `write`. Every other op is a read.
+inline constexpr std::string_view default_write_op = "write";
+
 // The window a windowed limiter counts over when the scenario gives none. Chosen: the
 // book's ch. 4 examples are all "N requests per second", i.e. a one-second window.
 inline constexpr SimTime default_limiter_window = 1_s;
@@ -308,6 +362,19 @@ struct NodeSpec {
   std::optional<int> burst{};
   std::optional<SimTime> window{};
   std::optional<std::string> backend{};
+  // Caches only (plan 2a refinement 7; declared after `backend`, for designated
+  // initializers): the hit ratio (required by the loader; a scenario built in code may
+  // leave it empty, which the engine refuses), the strategy (default cache_aside, the
+  // book's ch. 1 pattern), the ops that are writes (every other op is a read), and the
+  // sizing keys the Che approximation of phase 2b will use: `keys` (how many entries fit),
+  // `eviction` (lru, lfu, fifo or ttl) and `ttl`. A `backend` on a cache names the store
+  // the cache itself calls (read_through, write_through, write_around, write_back).
+  std::optional<HitRatio> hit_ratio{};
+  CacheStrategy strategy{CacheStrategy::cache_aside};
+  std::vector<std::string> write_ops{std::string{default_write_op}};
+  std::optional<std::int64_t> keys{};
+  std::optional<std::string> eviction{};
+  std::optional<SimTime> ttl{};
   std::optional<Workload> workload{};  // clients only
 };
 
@@ -436,3 +503,6 @@ static_assert(simsys::model::lb_policy_table.back().value ==
 static_assert(simsys::core::round_trips(simsys::model::limiter_algorithm_table));
 static_assert(simsys::model::limiter_algorithm_table.back().value ==
               simsys::model::LimiterAlgorithm::sliding_counter);
+static_assert(simsys::core::round_trips(simsys::model::cache_strategy_table));
+static_assert(simsys::model::cache_strategy_table.back().value ==
+              simsys::model::CacheStrategy::write_back);

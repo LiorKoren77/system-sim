@@ -307,7 +307,27 @@ struct Overloaded : Fs... {
   // C++20 `using enum`: the enumerators of NodeType in scope for this function only, so
   // the test reads `client` instead of `model::NodeType::client`.
   using enum model::NodeType;
-  return type == client || type == service || type == load_balancer || type == rate_limiter;
+  return type == client || type == service || type == load_balancer || type == rate_limiter ||
+         type == cache;
+}
+
+// Why a node of a simulated type still cannot run, if it cannot: a cache whose model needs
+// phase 2b (a `che` hit ratio, computed by the Che approximation; the write_back strategy, a
+// queue of dirty entries flushed later; `then` steps, which fire per hit or miss) or that a
+// scenario built in code left without a hit ratio (the loader requires one).
+[[nodiscard]] std::optional<std::string> not_runnable_yet(const model::NodeSpec& spec) {
+  if (spec.type != model::NodeType::cache) return std::nullopt;
+  const std::string node = "node '" + spec.id + "': ";
+  if (!spec.hit_ratio) return node + "cache needs a hit_ratio";
+  if (spec.hit_ratio->che || !spec.hit_ratio->fixed) {
+    return node + "hit_ratio che (the Che approximation) is computed from phase 2b on; " +
+           "run/estimate need {fixed: h} until then";
+  }
+  if (spec.strategy == model::CacheStrategy::write_back) {
+    return node + "strategy write_back (writes flushed later) runs from phase 2b on";
+  }
+  if (!spec.then.empty()) return node + "a cache's then steps run from phase 2b on";
+  return std::nullopt;
 }
 
 void add_once(std::vector<std::size_t>& links, std::size_t link) {
@@ -446,6 +466,11 @@ std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Gr
         "node '" + node.spec.id + "' has type '" + std::string{model::to_string(node.spec.type)} +
         "', which run/estimate do not support yet (phase 2)"}};
   }
+  for (const auto& node : g.nodes()) {
+    if (auto refused = not_runnable_yet(node.spec)) {
+      return std::unexpected{graph::EngineError{std::move(*refused)}};
+    }
+  }
   return Simulation{g};
 }
 
@@ -482,6 +507,10 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
     // `burst`), so the queue does the leaking.
     case model::NodeType::rate_limiter:
       return make_server(behaviours::RateLimiterBehaviour{g, index}, resolved);
+    // A cache's queue is the lookup itself (the type's 100k/s, 0.1 ms, or the scenario's
+    // numbers); the store behind it, if its strategy calls one, is a node of its own.
+    case model::NodeType::cache:
+      return make_server(behaviours::CacheBehaviour{g, index}, resolved);
     default:  // create() admitted only simulated types: the rest are services
       return make_server(behaviours::ServiceBehaviour{g, index}, resolved);
   }

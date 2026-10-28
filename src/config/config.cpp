@@ -9,6 +9,7 @@ module;
 #include <cmath>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <expected>
 #include <format>
@@ -103,7 +104,7 @@ constexpr std::array<OwnKeys, model::node_type_names.size()> own_keys_by_type{{
     {model::NodeType::load_balancer, "policy vnodes"},
     {model::NodeType::rate_limiter, "algorithm limit burst window backend"},
     {model::NodeType::service, "ops cost"},
-    {model::NodeType::cache, "eviction strategy keys hit_ratio backend ttl then cost"},
+    {model::NodeType::cache, "eviction strategy keys hit_ratio backend ttl then cost write_ops"},
     {model::NodeType::sql_db, "replication_lag shards pool"},
     {model::NodeType::kv_cluster, "nodes vnodes replication write_quorum read_quorum mode"},
     {model::NodeType::message_queue, "partitions retention"},
@@ -2034,6 +2035,135 @@ CheckResult read_limiter_keys(const Site& site, const YAML::Node& body, model::N
       .and_then([&] { return read_limiter_backend(this_node, body, node, declared); });
 }
 
+// ---- Cache keys (plan 2a refinement 7) -------------------------------------------------
+//
+// Read in the second pass, after read_node_routing has checked that a `backend` names a
+// declared node. Order matters: whether a backend is required depends on the strategy.
+
+// `hit_ratio: {fixed: 0.8}` or `hit_ratio: che`, required: a cache without one says nothing
+// about how much of the load it absorbs, which is the one thing a cache is in a design.
+// 0 (every read misses) and 1 (every read hits) are both valid.
+CheckResult read_hit_ratio(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  const auto value = body["hit_ratio"];
+  if (!value) return site.fail(body, "cache needs a hit_ratio");
+  if (value.IsScalar() && value.Scalar() == "che") {
+    node.hit_ratio = model::HitRatio{.fixed = std::nullopt, .che = true};
+    return {};
+  }
+  if (!value.IsMap() || value.size() != 1 || !value["fixed"]) {
+    return site.fail(value, "hit_ratio must be che or {fixed: h}");
+  }
+  const auto fixed = number_value(value["fixed"]);
+  if (!fixed || *fixed < 0.0 || *fixed > 1.0) {
+    return site.fail(value["fixed"], "hit_ratio.fixed must be between 0 and 1");
+  }
+  node.hit_ratio = model::HitRatio{.fixed = *fixed};
+  return {};
+}
+
+// `strategy: read_through`; absent keeps cache_aside (model::NodeSpec's default). Every
+// strategy but cache_aside has the cache call the store itself, so it needs a `backend`.
+CheckResult read_cache_strategy(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (auto read = read_optional_word(site, body, "strategy", model::parse_cache_strategy,
+                                     "strategy must be cache_aside, read_through, write_through, "
+                                     "write_around or write_back",
+                                     node.strategy);
+      !read) {
+    return read;
+  }
+  if (body["backend"]) node.backend = scalar_text(body["backend"]);
+  if (!model::needs_backend(node.strategy) || node.backend) return {};
+  const auto at = body["strategy"] ? body["strategy"] : body;
+  return site.fail(at, std::format("strategy {} needs a backend", model::to_string(node.strategy)));
+}
+
+// `write_ops: [write, delete]`: the ops that change data; every other op is a read. Absent
+// keeps model::default_write_op. An empty list would make every op a read, which a cache
+// that is written to never is, so it is refused rather than read as "no writes".
+CheckResult read_write_ops(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  const auto list = body["write_ops"];
+  if (!list) return {};
+  if (!list.IsSequence() && !list.IsNull()) {
+    return site.fail(list, "write_ops must be a list of op names");
+  }
+  if (list.IsNull() || list.size() == 0) {
+    return site.fail(list, "write_ops must name at least one op");
+  }
+  return collect_each(list,
+                      [&](const YAML::Node& op) { return read_op_name(site, op, "write_ops op"); })
+      .transform(store_in(node.write_ops));
+}
+
+// A count as the scenarios write cache sizes: a positive integer with an optional SI suffix
+// k, M or G (x 1e3, 1e6, 1e9; the same letters a rate uses, without "/s"): 500, 10k, 20M,
+// 10G. Nothing for anything else (a fraction, a sign, an overflow of 64 bits). A local
+// helper rather than parse_rate(text + "/s"): a rate may be fractional ("1.5k/s"), a count
+// of entries may not.
+std::optional<std::int64_t> parse_count(std::string_view text) {
+  constexpr std::array suffixes{std::pair{'k', std::int64_t{1'000}},
+                                std::pair{'M', std::int64_t{1'000'000}},
+                                std::pair{'G', std::int64_t{1'000'000'000}}};
+  std::int64_t scale = 1;
+  for (const auto& [letter, size] : suffixes) {
+    if (!text.empty() && text.back() == letter) {
+      scale = size;
+      text.remove_suffix(1);
+      break;
+    }
+  }
+  const auto count = parse_whole<std::int64_t>(text);
+  if (!count || *count <= 0 || *count > std::numeric_limits<std::int64_t>::max() / scale) {
+    return std::nullopt;
+  }
+  return *count * scale;
+}
+
+// `keys: 20M`: how many entries the cache holds (the Che approximation's cache size, 2b).
+CheckResult read_cache_size(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  const auto value = body["keys"];
+  if (!value) return {};
+  const auto count = parse_count(number_text(value));
+  if (!count) return site.fail(value, "keys must be a positive integer");
+  node.keys = *count;
+  return {};
+}
+
+// The eviction policies a cache may name (ch. 1 lists LRU, LFU and FIFO; `ttl` evicts by age
+// only). Phase 2b's Che approximation reads it; in 2a it is checked and printed.
+constexpr std::string_view eviction_policies = "lru lfu fifo ttl";
+
+CheckResult read_eviction(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  const auto value = body["eviction"];
+  if (!value) return {};
+  const auto word = scalar_text(value);
+  if (word.empty() || !lists_word(eviction_policies, word)) {
+    return site.fail(value, "eviction must be lru, lfu, fifo or ttl");
+  }
+  node.eviction = word;
+  return {};
+}
+
+// `ttl: 5m`: how long an entry lives. Zero would expire every entry at once.
+CheckResult read_cache_ttl(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (!body["ttl"]) return {};
+  auto ttl = parse_duration_key(site, body, "ttl");
+  if (!ttl) return std::unexpected(ttl.error());
+  if (ttl->count() <= 0) return site.fail(body["ttl"], "ttl must be positive");
+  node.ttl = *ttl;
+  return {};
+}
+
+CheckResult read_cache_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (node.type != model::NodeType::cache) return {};
+  const auto this_node = node_site(site, node.id);
+  return read_hit_ratio(this_node, body, node)
+      .and_then([&] { return read_cache_strategy(this_node, body, node); })
+      .and_then([&] { return read_write_ops(this_node, body, node); })
+      .and_then([&] { return read_cache_size(this_node, body, node); })
+      .and_then([&] { return read_eviction(this_node, body, node); })
+      .and_then([&] { return read_cache_ttl(this_node, body, node); });
+}
+
 // ---- Node bodies: the second pass -----------------------------------------------------
 
 // A client offers traffic (its `ops` are shares of its rate); every other node forwards
@@ -2077,6 +2207,7 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
       return read;
     }
     if (auto read = read_limiter_keys(site, entry.second, *node, declared); !read) return read;
+    if (auto read = read_cache_keys(site, entry.second, *node); !read) return read;
     ++node;
   }
   return {};
