@@ -1,10 +1,13 @@
 // Properties of the unit parsers that scenario files rely on.
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <chrono>
 #include <cmath>
 #include <string_view>
+#include <type_traits>
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
@@ -228,4 +231,94 @@ TEST_CASE("simsys minute and hour literals equal their std::chrono counterparts"
   static_assert(5_min == 5min);
   static_assert(24_h == 24h);
   SUCCEED();
+}
+
+// ---- Request sizes (phase 2c, Task 1) -------------------------------------------------------
+//
+// `Bytes` is a size in bytes, a strong type beside Rate and ByteRate (spec section 4): a size
+// cannot be passed where a rate is expected. `parse_size` reads the sizes a client's `sizes:`
+// and a step's `size:` state. Decimal units, as the byte-rate grammar: 1 KB = 1000 B.
+
+namespace {
+
+// Asserts that `parse_size(input)` failed, that the error carries the whole original text and
+// that its message states the grammar, so a scenario author who wrote `10` or `1KiB` learns
+// what to write. The wording around the grammar is the implementer's; the grammar is pinned.
+void require_size_grammar_error(std::string_view input) {
+  CAPTURE(input);
+  const auto parsed = simsys::parse_size(input);
+  REQUIRE_FALSE(parsed.has_value());
+  REQUIRE(parsed.error().input == input);
+  REQUIRE_THAT(parsed.error().message, Catch::Matchers::ContainsSubstring("B, KB, MB or GB"));
+}
+
+}  // namespace
+
+TEST_CASE("parse_size reads bytes, kilobytes, megabytes and gigabytes as decimal units") {
+  // 1 KB = 1000 B (decimal, as parse_byte_rate), so each value is the number times its power of
+  // ten: 200 B; 2 x 1e3; 50 x 1e6; 1.5 x 1e9.
+  REQUIRE_THAT(simsys::parse_size("200B").value().count, Catch::Matchers::WithinRel(200.0, 1e-12));
+  REQUIRE_THAT(simsys::parse_size("2KB").value().count, Catch::Matchers::WithinRel(2e3, 1e-12));
+  REQUIRE_THAT(simsys::parse_size("50MB").value().count, Catch::Matchers::WithinRel(5e7, 1e-12));
+  REQUIRE_THAT(simsys::parse_size("1.5GB").value().count, Catch::Matchers::WithinRel(1.5e9, 1e-12));
+}
+
+TEST_CASE("parse_size accepts a size up to 1e15 bytes, the same ceiling as a byte rate") {
+  REQUIRE_THAT(simsys::parse_size("1e15B").value().count, Catch::Matchers::WithinRel(1e15, 1e-12));
+}
+
+TEST_CASE("parse_size refuses a number with no unit and says which units exist") {
+  require_size_grammar_error("10");
+}
+
+TEST_CASE("parse_size refuses a wrong-case or binary unit and says which units exist") {
+  require_size_grammar_error("2kB");   // the kilo prefix is K, as in 500KB/s
+  require_size_grammar_error("1KiB");  // binary units are not part of the grammar
+}
+
+TEST_CASE("parse_size refuses a negative size and says which units exist") {
+  require_size_grammar_error("-1MB");
+}
+
+TEST_CASE("parse_size refuses a size above 1e15 bytes and names the limit") {
+  require_size_grammar_error("1e16B");  // 1e16 B is ten times the ceiling of 1e15 B
+  REQUIRE_THAT(simsys::parse_size("1e16B").error().message,
+               Catch::Matchers::ContainsSubstring("1e15"));
+}
+
+TEST_CASE("Bytes is a strong type: ordered by its size and not convertible from a rate") {
+  REQUIRE(simsys::Bytes{1.0} < simsys::Bytes{2.0});
+  REQUIRE(simsys::Bytes{3.0} == simsys::Bytes{3.0});
+  // A size is not a rate and not a byte rate: neither converts to Bytes, and a bare double
+  // does not either, so `sizes:` can never be fed a throughput by mistake.
+  static_assert(!std::is_convertible_v<simsys::Rate, simsys::Bytes>);
+  static_assert(!std::is_convertible_v<simsys::ByteRate, simsys::Bytes>);
+  static_assert(!std::is_convertible_v<double, simsys::Bytes>);
+  SUCCEED();
+}
+
+TEST_CASE("parse_byte_rate reads network bit rates and converts them to bytes per second") {
+  // A network is rated in bits: bytes per second = bits per second / 8.
+  //   1 Gbit/s   = 1e9   / 8 = 1.25e8 B/s
+  //   40 Gbit/s  = 4e10  / 8 = 5e9    B/s
+  //   100 Mbit/s = 1e8   / 8 = 1.25e7 B/s
+  REQUIRE_THAT(simsys::parse_byte_rate("1Gbit/s").value().bytes_per_second,
+               Catch::Matchers::WithinRel(1.25e8, 1e-12));
+  REQUIRE_THAT(simsys::parse_byte_rate("40Gbit/s").value().bytes_per_second,
+               Catch::Matchers::WithinRel(5e9, 1e-12));
+  REQUIRE_THAT(simsys::parse_byte_rate("100Mbit/s").value().bytes_per_second,
+               Catch::Matchers::WithinRel(1.25e7, 1e-12));
+}
+
+TEST_CASE("parse_byte_rate still reads 500MB/s as 5e8 bytes per second") {
+  // 500 x 1e6 = 5e8: the byte spelling is unchanged by the bit spelling.
+  REQUIRE_THAT(simsys::parse_byte_rate("500MB/s").value().bytes_per_second,
+               Catch::Matchers::WithinRel(5e8, 1e-12));
+}
+
+TEST_CASE("parse_byte_rate refuses a bit rate without its per-second denominator") {
+  const auto parsed = simsys::parse_byte_rate("1Gbit");
+  REQUIRE_FALSE(parsed.has_value());
+  REQUIRE(parsed.error().input == "1Gbit");
+  REQUIRE_THAT(parsed.error().message, Catch::Matchers::ContainsSubstring("must end with"));
 }
