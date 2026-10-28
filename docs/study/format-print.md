@@ -78,9 +78,9 @@ imports a module whose global module fragment includes `<format>`, directly or t
 | `{:>6}`, `{:6}` (width) | **throws** | works |
 | `{:.3f}`, `{:.15g}`, `{:.2}` (precision) | **throws** | works |
 
-The phase 1 plan's "Lessons" says that width specs work. The probe above shows they
-throw as well, so treat any number inside a spec as unsafe. The workaround is
-`std::to_chars` (C++17), which does not go through `<format>`:
+So any number inside a spec, width or precision, is unsafe; only `{}`, align without a
+width, sign and `#` survive. Columns are padded by hand (`padded` in `report.cpp`), and
+numbers go through `std::to_chars` (C++17), which does not use `<format>`:
 
 ```cpp
 // config.cpp, with_significant_digits: what "{:.15g}" was meant to do

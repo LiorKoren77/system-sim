@@ -30,6 +30,8 @@ std::vector<std::string> scenario_files() {
   for (const auto& entry : fs::recursive_directory_iterator(SIMSYS_SCENARIOS_DIR)) {
     if (entry.path().filename() == "scenario.yaml") files.push_back(entry.path().string());
   }
+  // C++20 std::ranges::sort: takes the container itself instead of a begin/end pair,
+  // and is constrained by concepts, so a non-sortable range fails with a short error.
   std::ranges::sort(files);
   return files;
 }
@@ -73,6 +75,8 @@ TEST_CASE("tutorial scenarios run in under five seconds and pass their SLOs", "[
     auto sim = *simsys::engine::Simulation::create(g);
     simsys::report::Summary summary{g, s.warmup};
     const auto started = std::chrono::steady_clock::now();
+    // C++20 designated initializers: the run options name the fields they set, so the
+    // call says which duration is which; replaces a positional {s.duration, s.step}.
     sim.run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
     REQUIRE(std::chrono::steady_clock::now() - started < 5s);
     const auto results = simsys::report::evaluate_slos(summary, s.slos);

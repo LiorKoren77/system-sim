@@ -301,6 +301,9 @@ struct Call {
     for (const auto& route : g.client_routes(node)) roots.push_back({route.target, route.op});
   }
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+    // C++20 range adaptors: `map | std::views::keys` is a lazy view of each entry's key
+    // (here the op name), composed with `|`. Replaces iterating the pairs and writing
+    // `.first`, and copies nothing.
     for (const auto& op : g.nodes()[node].spec.ops | std::views::keys) roots.push_back({node, op});
   }
   return roots;
@@ -467,9 +470,9 @@ Graph::Result Graph::resolve_links() {
 Graph::Result Graph::connect_steps() {
   for (std::size_t from = 0; from < nodes_.size(); ++from) {
     const auto& spec = nodes_[from].spec;
-    // C++20 views: `views::values` sees each map entry's vector of steps, `views::join`
-    // flattens those vectors into one lazy sequence of steps. Replaces two nested loops
-    // over the map and each vector; nothing is copied.
+    // `views::values` (like `views::keys` in call_roots, but each entry's vector of steps),
+    // then C++20 `views::join`, which flattens those vectors into one lazy sequence of
+    // steps. Replaces two nested loops over the map and each vector; nothing is copied.
     for (const model::Step& step : spec.ops | std::views::values | std::views::join) {
       if (auto connected = connect_step(from, step); !connected) return connected;
     }
@@ -511,7 +514,6 @@ Graph::Result Graph::route_clients() {
   for (std::size_t client = 0; client < nodes_.size(); ++client) {
     const auto& workload = nodes_[client].spec.workload;
     if (nodes_[client].spec.type != model::NodeType::client || !workload) continue;
-    // std::views::keys: like views::values above, but each pair's first member (the op).
     for (const auto& op : workload->op_shares | std::views::keys) {
       if (auto routed = route_client_op(client, op); !routed) return routed;
     }

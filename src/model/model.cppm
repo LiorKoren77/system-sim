@@ -104,6 +104,8 @@ inline constexpr auto node_type_table = std::to_array<NodeTypeName>({
 // std::to_underlying(type) is correct.
 [[nodiscard]] consteval bool table_follows_enum_order() {
   for (std::size_t i = 0; i < node_type_table.size(); ++i) {
+    // C++23 std::to_underlying: the enum's integer value without a static_cast that could
+    // silently accept the wrong type (it always yields exactly the underlying type).
     if (std::to_underlying(node_type_table[i].type) != i) return false;
   }
   return true;
@@ -117,8 +119,6 @@ inline constexpr auto node_type_names = [] {
   return names;
 }();
 
-// C++23 std::to_underlying: the enum's integer value without a static_cast that could
-// silently accept the wrong type (it always yields exactly the underlying type).
 // False for a value cast from an integer that names no enumerator.
 [[nodiscard]] constexpr bool is_cataloged(NodeType t) {
   return std::to_underlying(t) < node_type_table.size();

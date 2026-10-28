@@ -1,5 +1,4 @@
 // The link delay line: a ring buffer of flows, one slot per step of latency (spec §3.4).
-#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 // C++20 `import`: brings the module's exported names into this translation unit without

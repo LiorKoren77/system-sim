@@ -9,9 +9,12 @@
 | `simsys.config` | `src/config/config.cpp` | implementation unit (`module simsys.config;`) |
 | importers | `src/cli/main.cpp`, `tests/unit/test_units.cpp`, `tests/unit/test_config.cpp` | `import simsys.core;` / `import simsys.config;` |
 
-`config.cppm` itself imports `simsys.core` (line 31) for `SimTime`; `config.cpp` imports it again
-because an implementation unit implicitly imports its own interface, but the names the
-interface imported are not thereby visible to it.
+`config.cppm` itself imports `simsys.core` (line 29) and `simsys.model` (line 32). An
+implementation unit implicitly imports its own interface, and with it every module the
+interface imports ([module.import]/7), so `config.cpp` could use `SimTime` without an
+`import` of its own. It repeats the imports anyway, as `report.cpp` does, to say what the
+file uses. (Verified with GCC 14.2: an implementation unit `module b;` calls a function of
+module `a` that only its interface `b.cppm` imports, and it compiles, links and runs.)
 
 ## What
 
@@ -28,10 +31,10 @@ export namespace simsys::config { struct ConfigError { /* ... */ }; }
 - `import X;` brings in X's exported names. There is no text to re-parse: the compiler reads a
   compiled **BMI** (binary module interface; GCC calls it a `.gcm` file in `gcm.cache/`).
 - Names in the purview that are not exported still exist, but importers cannot name them.
-  `core.cppm` uses this on purpose: `namespace simsys::detail { ... }` (line 66) sits *between*
-  two `export namespace simsys { ... }` blocks, so `Scale`, `split_number`, `fail` ... are
-  invisible to importers. It cannot be nested inside an export block because everything
-  inside `export namespace` is exported.
+  `core.cppm` uses this on purpose: its two `namespace simsys::detail { ... }` blocks (lines
+  58 and 127) each sit *between* `export namespace simsys { ... }` blocks, so `Scale`,
+  `split_number`, `fail` ... are invisible to importers. A detail block cannot be nested
+  inside an export block because everything inside `export namespace` is exported.
 
 ## Why it replaces headers
 
@@ -49,8 +52,8 @@ export namespace simsys::config { struct ConfigError { /* ... */ }; }
 
 Everything between `module;` and `export module X;` is the *global module fragment*: only
 preprocessor directives are allowed, and the declarations that `#include`s bring in belong to the
-**global module**, not to X. `core.cppm` lines 8-26 explain why std headers go there: an
-`#include <vector>` inside the purview is legal but would attach `std::vector` to
+**global module**, not to X. The comment at `core.cppm` lines 8-11 explains why std headers
+go there: an `#include <vector>` inside the purview is legal but would attach `std::vector` to
 `simsys.core` (a distinct entity that no longer belongs to the shared global module), which is
 wrong for library types that every other translation unit also uses.
 
@@ -62,9 +65,12 @@ wrong for library types that every other translation unit also uses.
 | may `export` | yes | no |
 | importers depend on it | yes (BMI) | no |
 | sees the interface's own declarations | n/a | yes (implicit import of the interface) |
+| sees the modules the interface imports | n/a | yes (they come with that implicit import) |
 
-`config.cppm` declares `load(const std::string&)`; `config.cpp` defines it. The comment
-`// Pattern: Interface / implementation unit split` in `config.cppm` names this. Because
+`config.cppm` declares `load(const std::string&)`; `config.cpp` defines it. The header
+comment of `config.cppm` calls this split a *compilation firewall* ("interface declares,
+implementation unit defines") and says why it carries no `Pattern:` tag: it is a build
+technique, not a GoF design pattern. Because
 importers read only the BMI built from the interface, editing `config.cpp` (e.g. adding a
 validator) rebuilds that one file; `main.cpp` and the tests are untouched. `config.cpp` also owns
 the heavy includes (`<yaml-cpp/yaml.h>`, `<format>`), which the next section makes mandatory.
@@ -76,8 +82,9 @@ fragment, directly or via `<chrono>`, `<filesystem>` or `<print>`. Otherwise a c
 reads the BMI fails with `failed to read compiled module cluster ...: Bad file data` and
 `failed to load pendings for 'std::formatter'` (a GCC 14.2 bug). Rule: keep interface units
 lean; heavy headers go in the implementation unit. That is why `simsys::config::load` takes
-`const std::string&` and not `std::filesystem::path` (`main.cpp` still passes a `path`; it
-converts implicitly).
+`const std::string&` and not `std::filesystem::path` (`main.cpp` holds a `path` and passes
+`file.string()`; an implicit conversion would work only on POSIX, where a path's native
+string is `std::string`).
 
 Minimal reproduction (`g++-14 -std=c++23 -fmodules-ts -x c++ -c` for each file in order):
 

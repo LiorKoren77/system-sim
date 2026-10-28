@@ -354,6 +354,9 @@ flow::Flow DelayLine::pop() {
 std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Graph& g) {
   for (const auto& node : g.nodes()) {
     if (supported_in_phase_1(node.spec.type)) continue;
+    // C++23 std::unexpected<E>: wraps an error so it converts to the error side of a
+    // std::expected (a bare EngineError would be taken as a value, and fail to convert).
+    // Replaces throwing or returning a sentinel; the caller must look at the result.
     return std::unexpected{graph::EngineError{
         "node '" + node.spec.id + "' has type '" + std::string{model::to_string(node.spec.type)} +
         "', which run/estimate do not support yet (phase 2)"}};

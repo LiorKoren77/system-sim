@@ -58,14 +58,19 @@ Write for a reader who has read the book but has not studied queueing theory.
 - Scenario YAML files get a README explaining the design and the mechanisms the model
   abstracts away.
 - Commit messages explain *why*; the diff shows *what*.
-- Module interface units stay lean: no <chrono>/<filesystem>/<format>/<print> in the global
-  module fragment of an interface that imports another module (GCC 14.2 'Bad file data'
-  bug, verified 2026-10-28). Heavy headers go in the implementation unit.
+- First GCC 14.2 defect: module interface units stay lean: no
+  <chrono>/<filesystem>/<format>/<print> in the global module fragment of an interface
+  that imports another module ('Bad file data' bug, verified 2026-10-28). Heavy headers go
+  in the implementation unit.
 - Second GCC 14.2 defect (2026-10-28): in a TU that imports a module whose global module
-  fragment includes <format> (simsys.core does, through <chrono>), a std::format spec with a
-  precision such as `{:.15g}` throws std::format_error at run time. Use std::to_chars for
-  precise numbers; plain `{}`, width and fill specs are fine.
-- Third GCC 14.2 defect (2026-10-28), release builds only: a TU importing simsys.model
+  fragment includes <format> (simsys.core does, through <chrono>), a std::format spec with
+  any width or precision, such as `{:>6}` or `{:.15g}`, throws std::format_error at run
+  time. Only `{}`, align without a width (`{:<}`), sign (`{:+}`) and `#` are safe. Use
+  std::to_chars for numbers and pad by hand (docs/study/format-print.md has the table).
+- Third GCC 14.2 defect (2026-10-28), -O2/-O3 only: an internal compiler error in
+  `ipa_comdats` when `Graph::build` + `Simulation::create` + `step` are inlined into
+  `main()`. `simsys_warnings` adds `-fno-ipa-sra` to every target; do not remove it.
+- Fourth GCC 14.2 defect (2026-10-28), release builds only: a TU importing simsys.model
   calls compiler-generated special members of std templates over model types (e.g.
   `std::optional<Workload>`'s move constructor, the `NodeSpec::ops` map's destructor) out
   of line without emitting them, and at -O2/-O3 no module object file defines them either:
