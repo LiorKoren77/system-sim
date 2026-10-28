@@ -24,6 +24,7 @@ using namespace std::chrono_literals;
 using simsys::Rate;
 using simsys::fluid::Capacity;
 using simsys::fluid::FluidQueue;
+using simsys::fluid::ServiceMoments;
 using simsys::fluid::Zone;
 
 namespace {
@@ -225,15 +226,16 @@ TEST_CASE("a step reports the queueing wait apart from the service time", "[flui
   REQUIRE_THAT(s.latency.variance_s2, WithinRel(s.wait.variance_s2 + 1e-6, 1e-12));
 }
 
-// A byte-sized node's queue is fed the mean whole object's time each step (review of plan 2c
-// Task 3, I1) while its rate and c stay those of its megabytes, so rho does not move and the
-// wait scales with the time: a 20-slot store of 500 MB/s at 250 MB/s is at rho 0.5 whether one
-// slot is held 40 ms (one MB) or 2 s (a 50 MB object), and Erlang C's wait is
-// C(20, 0.5) × s / (20 × 0.5): 0.0149 ms against 0.746 ms.
-TEST_CASE("setting the service time changes the Erlang wait and leaves rho alone", "[fluid]") {
+// A byte-sized node's queue is fed the moments of its objects' service time each step (review of
+// plan 2c Task 3, I1, and of its fix round, I1) while its rate and c stay those of its megabytes,
+// so rho does not move and the wait scales with the mean time: a 20-slot store of 500 MB/s at
+// 250 MB/s is at rho 0.5 whether one slot is held 40 ms (one MB) or 2 s (a 50 MB object), and with
+// exponential service (SCV 1) Erlang C's wait is C(20, 0.5) x s / (20 x 0.5): 0.0149 ms against
+// 0.746 ms.
+TEST_CASE("setting the service moments changes the Erlang wait and leaves rho alone", "[fluid]") {
   FluidQueue q{Capacity{.service_rate = Rate{500}, .service_time_s = 0.040, .concurrency = 20}};
   const auto per_megabyte = q.advance(Rate{250}, 100ms);
-  q.set_service_time(2.0);
+  q.set_service(ServiceMoments{.mean_s = 2.0, .scv = 1.0});
   const auto per_object = q.advance(Rate{250}, 100ms);
   REQUIRE_THAT(per_megabyte.rho, WithinRel(0.5, 1e-12));
   REQUIRE_THAT(per_object.rho, WithinRel(0.5, 1e-12));
@@ -242,10 +244,66 @@ TEST_CASE("setting the service time changes the Erlang wait and leaves rho alone
   REQUIRE_THAT(per_object.latency.mean_s, WithinRel(per_object.wait.mean_s + 2.0, 1e-12));
 }
 
-TEST_CASE("a service time that is not positive is a programmer error", "[fluid]") {
+// The SCV the service moments carry is the c_s^2 of the Allen-Cunneen factor (c_a^2 + c_s^2) / 2:
+// a deterministic service (SCV 0, M/D/c) with Poisson arrivals waits (1 + 0) / 2 = half the M/M/c
+// wait, 0.373 ms where exponential service waits 0.746 ms; an SCV of 3 (a spread-out size mix)
+// waits (1 + 3) / 2 = twice as long, 1.49 ms.
+TEST_CASE("the service's squared coefficient of variation scales the stochastic wait", "[fluid]") {
+  const auto wait_with = [](double scv) {
+    FluidQueue q{Capacity{.service_rate = Rate{500}, .service_time_s = 0.040, .concurrency = 20}};
+    q.set_service(ServiceMoments{.mean_s = 2.0, .scv = scv});
+    return q.advance(Rate{250}, 100ms).wait.mean_s;
+  };
+  const double exponential = simsys::queueing::mmc_wait(20, 0.5, 2.0).mean_s;
+  REQUIRE_THAT(wait_with(1.0), WithinRel(exponential, 1e-12));
+  REQUIRE_THAT(wait_with(0.0), WithinRel(exponential / 2.0, 1e-12));
+  REQUIRE_THAT(wait_with(0.0), WithinAbs(3.7311e-4, 1e-8));
+  REQUIRE_THAT(wait_with(3.0), WithinRel(exponential * 2.0, 1e-12));
+}
+
+TEST_CASE(
+    "service moments with a mean that is not positive or a negative scv are a programmer error",
+    "[fluid]") {
   FluidQueue q{web()};
-  REQUIRE_THROWS_AS(q.set_service_time(0.0), std::invalid_argument);
-  REQUIRE_THROWS_AS(q.set_service_time(-1.0), std::invalid_argument);
-  REQUIRE_THROWS_AS(q.set_service_time(std::numeric_limits<double>::quiet_NaN()),
+  constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+  REQUIRE_THROWS_AS(q.set_service(ServiceMoments{.mean_s = 0.0, .scv = 1.0}),
                     std::invalid_argument);
+  REQUIRE_THROWS_AS(q.set_service(ServiceMoments{.mean_s = -1.0, .scv = 1.0}),
+                    std::invalid_argument);
+  REQUIRE_THROWS_AS(q.set_service(ServiceMoments{.mean_s = nan, .scv = 1.0}),
+                    std::invalid_argument);
+  REQUIRE_THROWS_AS(q.set_service(ServiceMoments{.mean_s = 1.0, .scv = -0.5}),
+                    std::invalid_argument);
+  REQUIRE_THROWS_AS(q.set_service(ServiceMoments{.mean_s = 1.0, .scv = nan}),
+                    std::invalid_argument);
+}
+
+// The M/M/c/K bound (review of plan 2c Task 3's fix round, C1): a request admitted to a waiting
+// room of K units cannot wait longer than the room takes to drain, K / service_rate, so the
+// stochastic term is min(Kingman wait, K / rate). A 500 MB/s store with a 1000 MB room fed 600 MB/s
+// of 2 s objects is past saturation: Erlang C at the 0.99 clamp would say C(20, 0.99) x 2 s /
+// (20 x 0.01) = 9.48 s, but the room drains in 1000 / 500 = 2 s, and that is the wait. Its spread
+// is bounded the same way: a wait in [0, T] has a variance of at most T^2 / 4 (Popoviciu's
+// inequality), here 1 s^2, where the clamp's variance is 99.7 s^2.
+TEST_CASE("a queue's stochastic wait is bounded by the time its waiting room takes to drain",
+          "[fluid]") {
+  FluidQueue q{Capacity{
+      .service_rate = Rate{500}, .service_time_s = 0.040, .concurrency = 20, .queue_limit = 1000}};
+  q.set_service(ServiceMoments{.mean_s = 2.0, .scv = 1.0});
+  const auto s = q.advance(Rate{600}, 100ms);  // backlog 10 MB: a fluid wait of 20 ms only
+  REQUIRE_THAT(simsys::queueing::mmc_wait(20, 0.99, 2.0).mean_s, WithinAbs(9.4787, 1e-4));
+  REQUIRE_THAT(s.wait.mean_s, WithinRel(2.0, 1e-12));
+  REQUIRE(s.wait.variance_s2 <= 1.0);
+  REQUIRE_THAT(s.latency.mean_s, WithinRel(4.0, 1e-12));
+}
+
+// With the default room the bound never binds at a node that counts requests: the room holds
+// 1000 requests, ten times the ~100 that Erlang C's queue holds at the 0.99 clamp (Lq =
+// rho^2 / (1 - rho) = 98 at one server). The web node above still waits its 99 ms there, against a
+// room that drains in 1000 / 1000/s = 1 s.
+TEST_CASE("the room bound does not bind at a request-sized node with the default room", "[fluid]") {
+  FluidQueue q{web()};
+  const auto s = q.advance(Rate{2000}, 1ms);  // backlog 1: a fluid wait of 1 ms
+  REQUIRE_THAT(s.wait.mean_s, WithinRel(0.099, 1e-9));
+  REQUIRE_THAT(s.wait.variance_s2, WithinRel(0.009999, 1e-9));
 }

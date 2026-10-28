@@ -224,6 +224,27 @@ TEST_CASE("a node whose capacity counts requests is not byte-sized", "[defaults]
   }
 }
 
+// A byte-sized node moves a fixed number of megabytes at a fixed rate per slot, so one object's
+// service time is deterministic: its squared coefficient of variation defaults to 0 (review of
+// plan 2c Task 3's fix round, I2), and the spread of service times at the node is its size mix's
+// alone. advanced.service_variability still overrides it. A blob store sized in requests keeps
+// the type's exponential service (1).
+TEST_CASE("a byte-sized node's transfers are deterministic: service variability 0 unless stated",
+          "[defaults]") {
+  REQUIRE(simsys::defaults::resolve_capacity(NodeSpec{.id = "blobs", .type = NodeType::blob_store})
+              .service_variability == 0.0);
+  NodeSpec cdn{.id = "cdn", .type = NodeType::cdn};
+  cdn.byte_capacity = simsys::ByteRate{100e9};
+  REQUIRE(simsys::defaults::resolve_capacity(cdn).service_variability == 0.0);
+  REQUIRE(simsys::defaults::resolve_capacity(
+              NodeSpec{.id = "blobs", .type = NodeType::blob_store, .capacity = Rate{500}})
+              .service_variability == 1.0);
+  REQUIRE(simsys::defaults::resolve_capacity(NodeSpec{.id = "blobs",
+                                                      .type = NodeType::blob_store,
+                                                      .advanced = {.service_variability = 1.0}})
+              .service_variability == 1.0);
+}
+
 // The unit of a byte-sized node's capacity is one megabyte (decimal, as every size in the
 // project): 500 MB/s is 500 units/s, and a 50 MB stream costs 50 units.
 TEST_CASE("a byte-sized node counts megabytes: the byte unit is 1e6 bytes", "[defaults]") {

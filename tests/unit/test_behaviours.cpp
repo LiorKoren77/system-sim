@@ -1570,6 +1570,45 @@ TEST_CASE("a byte-sized blob store charges a request its size in megabytes", "[b
   REQUIRE_THAT(store.cost("read"), WithinRel(0.002, 1e-12));   // 2e3 B / 1e6 B per unit
 }
 
+// What a byte-sized store hands its queue each step (review of plan 2c Task 3's fix round, I1 and
+// I2): the moments of the time one arriving object holds a slot, a mixture over the ops by their
+// request rates. Each object's own time is deterministic (size x 40 ms per MB, c_s^2 = 0), so:
+//   E[S]  = (5 x 2 s + 1000 x 80 us) / 1005 = 10.08 / 1005 s
+//   E[S^2] = (5 x (2 s)^2 + 1000 x (80 us)^2) / 1005
+//   c_s^2 = E[S^2] / E[S]^2 - 1 = 196.8: the few large uploads among many small reads
+// One size alone has no spread (c_s^2 = 0), and no arrivals have no mix (nothing).
+TEST_CASE("a byte-sized store's service moments are its size mix's mean and squared CV",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(sized_blob_front());
+  const BlobStoreBehaviour store{g, *g.index_of("store")};
+  REQUIRE(store.megabyte_service() != nullptr);
+  Flow in;
+  in.add("upload", Rate{5});
+  in.add("read", Rate{1000});
+  const auto mixed = store.megabyte_service()->object_time_moments(in);
+  REQUIRE(mixed.has_value());
+  const double mean = (5 * 2.0 + 1000 * 80e-6) / 1005;
+  const double second = (5 * 4.0 + 1000 * 80e-6 * 80e-6) / 1005;
+  REQUIRE_THAT(mixed->mean_s, WithinRel(mean, 1e-12));
+  REQUIRE_THAT(mixed->scv, WithinRel(second / (mean * mean) - 1.0, 1e-9));
+  REQUIRE_THAT(mixed->scv, WithinAbs(196.82, 0.01));
+  const auto uploads = store.megabyte_service()->object_time_moments(flow_of("upload", 5));
+  REQUIRE(uploads.has_value());
+  REQUIRE_THAT(uploads->mean_s, WithinRel(2.0, 1e-12));
+  REQUIRE_THAT(uploads->scv, WithinAbs(0.0, 1e-12));
+  REQUIRE_FALSE(store.megabyte_service()->object_time_moments(Flow{}).has_value());
+}
+
+// A blob store whose capacity counts requests (`capacity: 500/s`) times requests like any server:
+// it has no megabyte service.
+TEST_CASE("a blob store sized in requests has no megabyte service", "[behaviours]") {
+  auto s = sized_blob_front();
+  s.nodes[1].capacity = Rate{500};
+  const auto g = *simsys::graph::Graph::build(s);
+  const BlobStoreBehaviour store{g, *g.index_of("store")};
+  REQUIRE(store.megabyte_service() == nullptr);
+}
+
 // A blob store without `then` steps is a leaf (book ch. 14's S3-like store): it answers every
 // request itself and calls nobody, as a database does.
 TEST_CASE("a blob store serves every op and forwards nothing", "[behaviours]") {
