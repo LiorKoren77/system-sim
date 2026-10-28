@@ -34,6 +34,42 @@ inline constexpr std::string_view version = "0.0.1";
 // (a double would drift after millions of additions).
 using SimTime = std::chrono::duration<std::int64_t, std::nano>;
 
+// Conversions to/from seconds as double, for arithmetic in the engine. All other code
+// stores time as SimTime; doubles appear only inside formulas.
+[[nodiscard]] constexpr double seconds(SimTime t) {
+  return std::chrono::duration<double>(t).count();
+}
+// Rounds to the nearest nanosecond (std::chrono::round, C++17), the same resolution
+// parse_duration uses; a plain duration_cast would truncate and bias every step low.
+[[nodiscard]] SimTime from_seconds(double s) {
+  return std::chrono::round<SimTime>(std::chrono::duration<double>(s));
+}
+
+// Time literals for other modules. `simsys.core` is the only interface unit allowed to
+// include <chrono> (CLAUDE.md §3: GCC 14.2 corrupts the BMI of an interface that imports
+// a module *and* includes <chrono>/<format>; verified 2026-10-28 with a three-file probe).
+// Downstream interfaces write `250_us` instead of `250us`.
+// C++20 consteval: an immediate function. It can only run at compile time, so a literal
+// never costs anything at run time, and a malformed one (here: an int64 overflow in the
+// multiplication) is a compile error instead of silent wrap-around. Replaces constexpr,
+// which allows but does not force compile-time evaluation.
+// (C++11 user-defined literals; the inline namespace lets users opt in with one
+// `using namespace simsys::literals;`, like std::chrono_literals.)
+inline namespace literals {
+consteval SimTime operator""_ns(unsigned long long v) {
+  return SimTime{static_cast<std::int64_t>(v)};
+}
+consteval SimTime operator""_us(unsigned long long v) {
+  return SimTime{static_cast<std::int64_t>(v) * 1'000};
+}
+consteval SimTime operator""_ms(unsigned long long v) {
+  return SimTime{static_cast<std::int64_t>(v) * 1'000'000};
+}
+consteval SimTime operator""_s(unsigned long long v) {
+  return SimTime{static_cast<std::int64_t>(v) * 1'000'000'000};
+}
+}  // namespace literals
+
 // Requests (or messages, operations...) per second. A struct, not a bare double, so a
 // rate cannot be passed where a latency is expected. Byte throughput has its own type,
 // ByteRate, so "10k requests/s" can never be wired into a link's bandwidth.
