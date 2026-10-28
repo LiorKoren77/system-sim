@@ -6,6 +6,8 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -21,6 +23,7 @@
 import simsys.config;
 import simsys.core;
 import simsys.model;
+import simsys.workload;
 
 using namespace std::chrono_literals;
 
@@ -935,7 +938,7 @@ links: []
   REQUIRE(s->nodes.size() == 1);
   const auto& workload = s->nodes[0].workload;
   REQUIRE(workload.has_value());
-  CHECK(workload->base == simsys::Rate{12800});
+  CHECK(workload->curve.base == simsys::Rate{12800});
   REQUIRE(workload->op_shares.size() == 2);
   CHECK(workload->op_shares[0].first == "redirect");
   CHECK(workload->op_shares[0].second == Catch::Approx(0.91));
@@ -955,7 +958,7 @@ links: []
                    "node 'u': op shares sum to 0.9, expected 1");
 }
 
-TEST_CASE("a client needs rate.base") {
+TEST_CASE("a client with no rate at all needs rate.base or rate.points") {
   require_rejected("simsys_client_no_rate.yaml", R"(
 version: 1
 name: t
@@ -964,7 +967,173 @@ nodes:
   u: {type: client, ops: {a: 1}}
 links: []
 )",
-                   "node 'u': client needs rate.base");
+                   "node 'u': client needs rate.base or rate.points");
+}
+
+namespace {
+
+// A one-client scenario whose rate is the flow-style mapping `rate_flow` (e.g.
+// "{base: 1/s, wave: {...}}"), so each rejection case below states only the rate under test.
+std::string client_with_rate(std::string_view rate_flow) {
+  return "version: 1\nname: t\nduration: 1m\nnodes:\n  u: {type: client, rate: " +
+         std::string{rate_flow} + ", ops: {a: 1}}\nlinks: []\n";
+}
+
+// A valid wave, reused where another part of the rate is the one under test.
+constexpr std::string_view valid_wave = "{shape: sine, period: 1h, amplitude: 0.5, peak_at: 0s}";
+
+// A (rate mapping, expected message) pair for the table-driven rejection cases.
+struct RateRejection {
+  std::string_view rate_flow;
+  std::string_view message;
+};
+
+void require_all_rejected(std::string_view file_name, std::span<const RateRejection> cases) {
+  for (const auto& c : cases) {
+    INFO("rate: " << c.rate_flow);
+    require_rejected(file_name, client_with_rate(c.rate_flow), c.message);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("a client's rate curve is typed: wave, ramp, spikes, points, noise") {
+  const auto path = write_temp("simsys_typed_curve.yaml", R"(
+version: 1
+name: t
+duration: 24h
+nodes:
+  u:
+    type: client
+    rate:
+      base: 10k/s
+      wave: {shape: sine, period: 24h, amplitude: 0.6, peak_at: "20:00"}
+      ramp: {from: 0/s, to: 10k/s, over: 5m}
+      spikes: [{at: 12:00, for: 10m, factor: 3}, {at: 5m, for: 30s, factor: 2}]
+      noise: {sigma: 0.15, correlation: 5m}
+    ops: {a: 1.0}
+links: []
+)");
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->nodes.size() == 1);
+  const auto& workload = s->nodes[0].workload;
+  REQUIRE(workload.has_value());
+  CHECK(workload->curve.base == simsys::Rate{10000});
+  CHECK_FALSE(workload->curve.points.has_value());
+
+  REQUIRE(workload->curve.wave.has_value());
+  CHECK(workload->curve.wave->shape == simsys::workload::WaveShape::sine);
+  CHECK(workload->curve.wave->period == 24h);
+  CHECK(workload->curve.wave->amplitude == 0.6);
+  CHECK(workload->curve.wave->peak_at == 20h);
+
+  REQUIRE(workload->curve.ramp.has_value());
+  CHECK(workload->curve.ramp->from == simsys::Rate{0});
+  CHECK(workload->curve.ramp->to == simsys::Rate{10000});
+  CHECK(workload->curve.ramp->over == 5min);
+
+  REQUIRE(workload->curve.spikes.size() == 2);
+  CHECK(workload->curve.spikes[0].at == 12h);
+  CHECK(workload->curve.spikes[0].duration == 10min);
+  CHECK(workload->curve.spikes[0].factor == 3.0);
+  CHECK(workload->curve.spikes[1].at == 5min);
+
+  REQUIRE(workload->noise.has_value());
+  CHECK(workload->noise->sigma == 0.15);
+  CHECK(workload->noise->correlation == 5min);
+}
+
+TEST_CASE("points replace base and must be sorted, non-empty, with non-negative rates") {
+  SECTION("a sorted trace loads and leaves base at zero") {
+    const auto path =
+        write_temp("simsys_points.yaml", client_with_rate("{points: [[0s, 1k/s], [1h, 5k/s]]}"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    const auto& workload = s->nodes[0].workload;
+    REQUIRE(workload.has_value());
+    REQUIRE(workload->curve.points.has_value());
+    REQUIRE(workload->curve.points->at.size() == 2);
+    CHECK(workload->curve.points->at[1].first == 1h);
+    CHECK(workload->curve.points->at[1].second == simsys::Rate{5000});
+    CHECK(workload->curve.base == simsys::Rate{0});
+  }
+  SECTION("malformed traces are rejected") {
+    const RateRejection cases[] = {
+        {"{points: [[1h, 1k/s], [0s, 2k/s]]}", "node 'u': rate.points must be sorted by time"},
+        {"{points: []}", "node 'u': rate.points must have at least one entry"},
+        {"{points: [[0s]]}", "node 'u': rate.points entries are [time, rate] pairs"},
+    };
+    require_all_rejected("simsys_bad_points.yaml", cases);
+  }
+}
+
+TEST_CASE("a client needs rate.base or rate.points") {
+  const std::string wave_only = "{wave: " + std::string{valid_wave} + "}";
+  const RateRejection cases[] = {
+      {wave_only, "node 'u': client needs rate.base or rate.points"},
+      {"{base: 1/s, points: [[0s, 1/s]]}", "node 'u': rate.base and rate.points are alternatives"},
+  };
+  require_all_rejected("simsys_base_or_points.yaml", cases);
+}
+
+TEST_CASE("rate curve values are range-checked") {
+  SECTION("wave") {
+    const RateRejection cases[] = {
+        {"{base: 1/s, wave: {shape: sine, period: 1h, amplitude: 1.5, peak_at: 0s}}",
+         "node 'u': rate.wave.amplitude must be between 0 and 1"},
+        {"{base: 1/s, wave: {shape: sine, period: 0s, amplitude: 0.5, peak_at: 0s}}",
+         "node 'u': rate.wave.period must be positive"},
+        {"{base: 1/s, wave: {shape: triangle, period: 1h, amplitude: 0.5, peak_at: 0s}}",
+         "node 'u': rate.wave.shape must be sine, square or diurnal"},
+        {"{base: 1/s, wave: {shape: sine}}",
+         "node 'u': rate.wave needs shape, period, amplitude and peak_at"},
+        {"{base: 1/s, wave: {shape: sine, period: 1h, amplitude: 0.5, peak_at: \"25:00\"}}",
+         "node 'u': rate.wave.peak_at: expected HH:MM or a duration"},
+    };
+    require_all_rejected("simsys_bad_wave.yaml", cases);
+  }
+  SECTION("spikes, with a 1-based index naming the offending spike") {
+    const RateRejection cases[] = {
+        {"{base: 1/s, spikes: [{at: 0s, for: 1s, factor: 2}, {at: 5s, for: 1s, factor: 0}]}",
+         "node 'u': rate.spikes[2].factor must be positive"},
+        {"{base: 1/s, spikes: [{at: 0s, for: 0s, factor: 2}]}",
+         "node 'u': rate.spikes[1].for must be positive"},
+    };
+    require_all_rejected("simsys_bad_spikes.yaml", cases);
+  }
+  SECTION("ramp") {
+    const RateRejection cases[] = {
+        {"{base: 1/s, ramp: {from: 0/s}}", "node 'u': rate.ramp needs from, to and over"},
+        {"{base: 1/s, ramp: {from: 0/s, to: 1/s, over: 0s}}",
+         "node 'u': rate.ramp.over must be positive"},
+        {"{points: [[0s, 1/s]], ramp: {from: 0/s, to: 1/s, over: 1m}}",
+         "node 'u': rate.ramp needs rate.base"},
+    };
+    require_all_rejected("simsys_bad_ramp.yaml", cases);
+  }
+  SECTION("noise") {
+    const RateRejection cases[] = {
+        {"{base: 1/s, noise: {sigma: -1, correlation: 5m}}",
+         "node 'u': rate.noise.sigma must be non-negative"},
+        {"{base: 1/s, noise: {sigma: 0.1, correlation: 0s}}",
+         "node 'u': rate.noise.correlation must be positive"},
+        {"{base: 1/s, noise: {sigma: 0.1}}", "node 'u': rate.noise needs sigma and correlation"},
+    };
+    require_all_rejected("simsys_bad_noise.yaml", cases);
+  }
+}
+
+TEST_CASE("unknown keys inside wave, ramp, a spike or noise are rejected") {
+  const RateRejection cases[] = {
+      {"{base: 1/s, wave: {shape: sine, period: 1h, amplitude: 0.5, peak_at: 0s, colour: red}}",
+       "node 'u': unknown rate.wave key 'colour'"},
+      {"{base: 1/s, spikes: [{at: 0s, for: 1s, factor: 2, why: x}]}",
+       "node 'u': unknown rate.spikes[1] key 'why'"},
+  };
+  require_all_rejected("simsys_unknown_curve_key.yaml", cases);
 }
 
 TEST_CASE("a client op share must be a number above zero and at most one") {
