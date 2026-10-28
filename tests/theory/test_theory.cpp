@@ -18,6 +18,7 @@
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
 import simsys.behaviours; // client_seed: the noise seed the engine gives each client
+import simsys.caching;
 import simsys.core;
 import simsys.engine;
 import simsys.fluid;
@@ -33,6 +34,7 @@ import simsys.workload;
 // WithinRel, which apply only the tolerance you give them.
 using namespace std::chrono_literals;
 using Catch::Approx;
+using Catch::Matchers::WithinAbs;
 using Catch::Matchers::WithinRel;
 using simsys::Rate;
 using simsys::engine::Simulation;
@@ -1056,13 +1058,13 @@ TEST_CASE("write_back caches and cache then steps run in phase 2b", "[theory]") 
 // 1000 x (1 - 0.4) = 600/s, and a client waits for the cache's own sojourn plus, for the 60 %
 // that miss, the lb and service path (zero-latency links), a hit/miss mixture whose mean is
 //   cache + 0.6 x (lb + svc).
-TEST_CASE("a browser cache in front of a load balancer lets only its misses through",
-          "[theory]") {
+TEST_CASE("a browser cache in front of a load balancer lets only its misses through", "[theory]") {
   Scenario s{.name = "browser", .version = 1, .duration = 10s};
   s.nodes = {
-      NodeSpec{.id = "u",
-               .type = NodeType::client,
-               .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"suggest", 1.0}}}},
+      NodeSpec{
+          .id = "u",
+          .type = NodeType::client,
+          .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"suggest", 1.0}}}},
       NodeSpec{.id = "browser_cache",
                .type = NodeType::cache,
                .capacity = Rate{100'000},
@@ -1097,9 +1099,10 @@ TEST_CASE("a browser cache in front of a load balancer lets only its misses thro
 // later. The store still has to absorb every write (its demand is the full 100/s: an upper
 // bound, no coalescing), but the client's write latency is the cache's own sojourn: the slow
 // flush is asynchronous and nobody waits for it.
-TEST_CASE("a write_back cache keeps the client's write latency to the cache's own sojourn while "
-          "the backend still sees the writes",
-          "[theory]") {
+TEST_CASE(
+    "a write_back cache keeps the client's write latency to the cache's own sojourn while "
+    "the backend still sees the writes",
+    "[theory]") {
   Scenario s{.name = "write-back", .version = 1, .duration = 10s};
   s.nodes = {
       NodeSpec{.id = "u",
@@ -1155,9 +1158,44 @@ TEST_CASE("url-shortener's url_cache resolves to a che hit ratio and the simulat
   REQUIRE(g.has_value());
   const auto h = g->hit_ratio(*g->index_of("cache"));
   REQUIRE(h.has_value());
-  REQUIRE(*h > 0.5);
-  REQUIRE(*h < 1.0);
+  // Pinned to the dense reference: Che summed over all 100M ranks one by one gives 0.880624
+  // (the bucketed sum is within 2e-6 of it, caching.cppm).
+  REQUIRE_THAT(*h, WithinAbs(0.880624, 1e-5));
   const auto sim = Simulation::create(*g);
   INFO((sim ? "" : sim.error().message));
   REQUIRE(sim.has_value());
+}
+
+// The consistent-hashing lab (zipf 0.9 over 10M keys, four 2M-key cache servers behind a ring).
+// With perfectly even arcs the four would act as one 8M-key cache: 0.962834 by the dense
+// reference. With the lab's `vnodes: 1` the hottest server owns half the keys (k = 2) and the
+// three others a sixth each, so the hot server is a 4M-key cache over the whole space and the
+// cool ones hold their every key: h = 0.5 × 0.848235 + 0.5 × 1 = 0.924118.
+TEST_CASE("the consistent-hashing lab's cache hits 0.963 on even arcs and 0.924 on one vnode",
+          "[theory]") {
+  REQUIRE_THAT(simsys::caching::che_hit_ratio(8e6, simsys::caching::Popularity::zipf(0.9, 10e6)),
+               WithinAbs(0.962834, 1e-5));
+  Scenario s{.name = "ring", .version = 1, .duration = 10s};
+  NodeSpec cache{.id = "cache",
+                 .type = NodeType::cache,
+                 .replicas = 4,
+                 .hit_ratio = HitRatio{.che = true},
+                 .strategy = CacheStrategy::cache_aside};
+  cache.keys = 2'000'000;
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1000}},
+                                    .op_shares = {{"get", 1.0}},
+                                    .keys = simsys::model::KeySpec{.zipf = 0.9, .space = 10e6}}},
+      NodeSpec{.id = "ring",
+               .type = NodeType::load_balancer,
+               .policy = LbPolicy::consistent_hash,
+               .vnodes = 1},
+      std::move(cache)};
+  s.links = {LinkSpec{.from = "u", .to = "ring"}, LinkSpec{.from = "ring", .to = "cache"}};
+  const auto g = Graph::build(s);
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE_THAT(*g->hit_ratio(*g->index_of("cache")), WithinAbs(0.924118, 1e-5));
 }

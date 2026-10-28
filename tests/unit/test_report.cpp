@@ -798,3 +798,97 @@ TEST_CASE("explain prints a che hit ratio with its provenance", "[report]") {
   const auto number = text.substr(number_at + 10, provenance_at - (number_at + 10));
   REQUIRE(std::ranges::all_of(number, [](char c) { return c == '.' || (c >= '0' && c <= '9'); }));
 }
+
+// ---- Che provenance: partitions, caches behind caches, large key spaces ----
+
+namespace {
+// u (the given keys) -> lb (`policy`) -> cache (che, 10k keys, 4 replicas).
+Scenario replicated_che(simsys::model::LbPolicy policy) {
+  Scenario s{.name = "replicated", .version = 1, .duration = 1min};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{100}},
+                                           .op_shares = {{"get", 1.0}},
+                                           .keys = KeySpec{.zipf = 1.0, .space = 100'000}}},
+             NodeSpec{.id = "lb", .type = NodeType::load_balancer, .policy = policy},
+             NodeSpec{.id = "cache",
+                      .type = NodeType::cache,
+                      .replicas = 4,
+                      .hit_ratio = simsys::model::HitRatio{.che = true},
+                      .strategy = simsys::model::CacheStrategy::cache_aside,
+                      .keys = 10'000}};
+  s.links = {LinkSpec{.from = "u", .to = "lb"}, LinkSpec{.from = "lb", .to = "cache"}};
+  return s;
+}
+// u (zipf 0.9 over 10M) -> l1 (`l1_ratio`, read_through) -> l2 (che, read_through) -> db.
+Scenario cache_behind_cache(simsys::model::HitRatio l1_ratio) {
+  Scenario s{.name = "c2c", .version = 1, .duration = 1min};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{100}},
+                                           .op_shares = {{"get", 1.0}},
+                                           .keys = KeySpec{.zipf = 0.9, .space = 10e6}}},
+             NodeSpec{.id = "l1",
+                      .type = NodeType::cache,
+                      .backend = "l2",
+                      .hit_ratio = l1_ratio,
+                      .strategy = simsys::model::CacheStrategy::read_through,
+                      .keys = 2'000'000},
+             NodeSpec{.id = "l2",
+                      .type = NodeType::cache,
+                      .backend = "db",
+                      .hit_ratio = simsys::model::HitRatio{.che = true},
+                      .strategy = simsys::model::CacheStrategy::read_through,
+                      .keys = 2'000'000},
+             NodeSpec{.id = "db", .type = NodeType::service}};
+  s.links = {LinkSpec{.from = "u", .to = "l1"}, LinkSpec{.from = "l1", .to = "l2"},
+             LinkSpec{.from = "l2", .to = "db"}};
+  return s;
+}
+std::string explain_of(const Scenario& s) {
+  const auto built = simsys::graph::Graph::build(s);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  return simsys::report::render_explain(*built);
+}
+}  // namespace
+
+// The provenance names the capacity the ring multiplied, and that its arcs are uneven, so a
+// reader can see why the number differs from what the cache's own `keys` suggests.
+TEST_CASE(
+    "explain shows a ring-partitioned che cache's capacity as keys × replicas over uneven arcs",
+    "[report]") {
+  const auto ring_text = explain_of(replicated_che(simsys::model::LbPolicy::consistent_hash));
+  CAPTURE(ring_text);
+  REQUIRE(
+      ring_text.contains(" (che: zipf 1 over 100k keys from u; 10k keys x 4 partitioned, "
+                         "uneven arcs)"));
+  const auto round_robin_text = explain_of(replicated_che(simsys::model::LbPolicy::round_robin));
+  CAPTURE(round_robin_text);
+  REQUIRE(round_robin_text.contains(" (che: zipf 1 over 100k keys from u)"));
+}
+
+TEST_CASE("explain names the cache whose misses a che cache's keys are", "[report]") {
+  const auto text = explain_of(cache_behind_cache(simsys::model::HitRatio{.che = true}));
+  CAPTURE(text);
+  REQUIRE(text.contains(" (che: zipf 0.9 over 10M keys from u, filtered by l1)"));
+}
+
+TEST_CASE("explain says a che cache behind a fixed-ratio cache uses the unfiltered keys",
+          "[report]") {
+  const auto text = explain_of(cache_behind_cache(simsys::model::HitRatio{.fixed = 0.5}));
+  CAPTURE(text);
+  REQUIRE(
+      text.contains(" (che: zipf 0.9 over 10M keys from u; fed through fixed-ratio cache "
+                    "'l1': treated as unfiltered)"));
+}
+
+// The scenario grammar's largest count suffix is G; a key space past 9999G is written out in
+// digits, as a count a reader can compare, rather than in scientific notation.
+TEST_CASE("explain writes a key space beyond the G prefix in plain digits", "[report]") {
+  auto s = replicated_che(simsys::model::LbPolicy::round_robin);
+  s.nodes[0].workload->keys = KeySpec{.zipf = std::nullopt, .space = 2e13};
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  REQUIRE(text.contains(" (che: uniform over 20000000000000 keys from u)"));
+}

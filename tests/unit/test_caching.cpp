@@ -171,3 +171,130 @@ concept views_buckets_of_temporary = requires { std::declval<P>().buckets(); };
 TEST_CASE("buckets cannot be viewed on a temporary popularity", "[caching]") {
   STATIC_CHECK_FALSE(views_buckets_of_temporary<Popularity>);
 }
+
+// ---- Caches behind caches: the miss stream (Martina, Garetto & Leonardi 2014) ----
+
+namespace {
+// Dense reference for a second LRU cache fed by the misses of a first: solve Che for the first
+// cache (capacity c1) over p_i = i^-s / H, filter q_i ∝ p_i e^{-p_i t1} (key i misses with
+// probability e^{-p_i t1}), and solve Che again for the second cache (capacity c2) over q.
+// The same bisection as dense_che_hit_ratio, written for any probability vector.
+struct DenseChe {
+  double hit_ratio;
+  double characteristic_time;
+};
+DenseChe dense_che(const std::vector<double>& p, double capacity) {
+  auto keys_in_cache = [&](double t) {
+    double keys = 0;
+    for (const double x : p) keys += -std::expm1(-x * t);
+    return keys;
+  };
+  double lo = std::log(capacity);
+  double hi = std::log(1e300);
+  for (int k = 0; k < 100; ++k) {
+    const double mid = (lo + hi) / 2;
+    (keys_in_cache(std::exp(mid)) < capacity ? lo : hi) = mid;
+  }
+  const double t = std::exp(lo);
+  double h = 0;
+  for (const double x : p) h += x * -std::expm1(-x * t);
+  return {.hit_ratio = h, .characteristic_time = t};
+}
+std::vector<double> dense_zipf(double s, std::size_t n) {
+  std::vector<double> p(n);
+  double norm = 0;
+  for (std::size_t i = n; i >= 1; --i) norm += p[i - 1] = std::pow(static_cast<double>(i), -s);
+  for (auto& x : p) x /= norm;
+  return p;
+}
+double dense_filtered_hit_ratio(double s, std::size_t n, double first, double second) {
+  const auto p = dense_zipf(s, n);
+  const double t1 = dense_che(p, first).characteristic_time;
+  std::vector<double> q(n);
+  double norm = 0;
+  for (std::size_t i = 0; i < n; ++i) norm += q[i] = p[i] * std::exp(-p[i] * t1);
+  for (auto& x : q) x /= norm;
+  return dense_che(q, second).hit_ratio;
+}
+}  // namespace
+
+TEST_CASE("the characteristic time of a uniform cache solves N(1 - e^(-t/N)) = C", "[caching]") {
+  // p_i = 1/N: the Che equation N(1 − e^{−t/N}) = C gives t = −N ln(1 − C/N); half of 1000
+  // keys is t = 1000 ln 2.
+  REQUIRE_THAT(simsys::caching::che_characteristic_time(500, Popularity::uniform(1000)),
+               WithinRel(1000 * std::log(2.0), 1e-9));
+  // An empty cache forgets at once; a cache that holds every key never does.
+  REQUIRE(simsys::caching::che_characteristic_time(0, Popularity::uniform(1000)) == 0.0);
+  REQUIRE(simsys::caching::che_characteristic_time(1000, Popularity::uniform(1000)) == infinity);
+}
+
+TEST_CASE("the characteristic time matches the dense reference", "[caching]") {
+  const auto dense = dense_che(dense_zipf(0.9, 100'000), 20'000);
+  REQUIRE_THAT(simsys::caching::che_characteristic_time(20'000, Popularity::zipf(0.9, 100'000)),
+               WithinRel(dense.characteristic_time, 1e-4));
+}
+
+// The misses of an LRU cache are not a sample of the clients' keys: the hot keys hit, so what
+// goes on to the next tier is the cold tail. Filtering by e^{-p t} is that tail's popularity.
+TEST_CASE("a popularity filtered by a cache's characteristic time matches the dense filtered sum",
+          "[caching]") {
+  const auto clients = Popularity::zipf(0.9, 100'000);
+  const double t1 = simsys::caching::che_characteristic_time(20'000, clients);
+  const auto misses = clients.filtered_by(t1);
+  REQUIRE(misses.key_count() == clients.key_count());  // the same keys, different popularity
+  for (const double second : {5'000.0, 20'000.0, 80'000.0}) {
+    CAPTURE(second);
+    REQUIRE_THAT(che_hit_ratio(second, misses),
+                 WithinAbs(dense_filtered_hit_ratio(0.9, 100'000, 20'000, second), 1e-3));
+  }
+}
+
+TEST_CASE("the second cache of two hits far less than its own size suggests", "[caching]") {
+  // The review's chain at scale: zipf 0.9 over 10M keys, a 2M-key first cache. A second cache
+  // of 2M keys over the RAW popularity would hit 0.747; over the first cache's misses it hits
+  // 0.257, and 8M keys give 0.870 instead of 0.963. Reference values from the dense sum (the
+  // helper above, run over all 10M keys once: too slow to repeat here in a Debug build).
+  const auto clients = Popularity::zipf(0.9, 10e6);
+  const auto misses = clients.filtered_by(simsys::caching::che_characteristic_time(2e6, clients));
+  REQUIRE_THAT(che_hit_ratio(2e6, misses), WithinAbs(0.256607, 1e-3));
+  REQUIRE_THAT(che_hit_ratio(8e6, misses), WithinAbs(0.870337, 1e-3));
+}
+
+TEST_CASE("filtering a uniform popularity leaves it uniform", "[caching]") {
+  // Every key misses with the same probability e^{-t/N}, so the misses are uniform too.
+  const auto misses = Popularity::uniform(1000).filtered_by(300.0);
+  REQUIRE_THAT(che_hit_ratio(250, misses), WithinRel(0.25, 1e-9));
+}
+
+TEST_CASE("equal shards filter like one cache with their characteristic time", "[caching]") {
+  // A key space split over caches (the arcs of a ring): key i misses in the cache that owns it.
+  // Two halves with the same t filter exactly as one cache with that t.
+  const auto clients = Popularity::zipf(1.0, 10'000);
+  const std::vector<simsys::caching::CacheShard> halves{
+      {.key_share = 0.5, .characteristic_time = 2000.0},
+      {.key_share = 0.5, .characteristic_time = 2000.0}};
+  REQUIRE_THAT(che_hit_ratio(1000, clients.filtered_by(halves)),
+               WithinRel(che_hit_ratio(1000, clients.filtered_by(2000.0)), 1e-12));
+}
+
+TEST_CASE("the misses of a cache holding every key still form a popularity", "[caching]") {
+  // t = infinity: no key ever misses. The limit of p e^{-p t}, renormalised, puts all the weight
+  // on the coldest keys; it must stay a probability distribution, not 0/0.
+  const auto misses = Popularity::zipf(1.0, 1000).filtered_by(infinity);
+  double total = 0;
+  for (const auto& bucket : misses.buckets()) {
+    REQUIRE(std::isfinite(bucket.key_probability));
+    total += bucket.count * bucket.key_probability;
+  }
+  REQUIRE_THAT(total, WithinRel(1.0, 1e-12));
+  const double h = che_hit_ratio(10, misses);
+  REQUIRE(h >= 0.0);
+  REQUIRE(h <= 1.0);
+}
+
+TEST_CASE("the fixed policy ignores the capacity it is asked about", "[caching]") {
+  // A stated ratio is the author's estimate for THIS cache; resizing it (a replica lost to a
+  // fault, phase 3) cannot change what the author wrote.
+  REQUIRE_THAT(FixedHitRatio{0.8}.hit_ratio(1), WithinRel(0.8, 1e-12));
+  REQUIRE_THAT(FixedHitRatio{0.8}.hit_ratio(1e9), WithinRel(0.8, 1e-12));
+}

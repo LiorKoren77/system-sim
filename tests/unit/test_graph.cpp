@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -27,6 +28,7 @@ import simsys.model;
 import simsys.report;
 
 using namespace std::chrono_literals;
+using Catch::Matchers::WithinAbs;
 using Catch::Matchers::WithinRel;
 using simsys::Rate;
 using simsys::graph::DemandEdge;
@@ -960,10 +962,10 @@ TEST_CASE("a che cache behind a load balancer and a limiter still finds the clie
                          1e-12));
 }
 
-TEST_CASE("a che cache with no keyed client upstream is an error", "[graph]") {
+TEST_CASE("a che cache reached by a client without keys is an error", "[graph]") {
   const auto g = Graph::build(che_web(che_cache(1000), std::nullopt));
   REQUIRE_FALSE(g.has_value());
-  REQUIRE(g.error().message == "node 'cache': hit_ratio che needs a client with keys upstream");
+  REQUIRE(g.error().message == "node 'cache': hit_ratio che: client 'u' reaches it without keys");
 }
 
 namespace {
@@ -1039,35 +1041,28 @@ double che_over_100k_zipf1_keys(double capacity) {
 }
 }  // namespace
 
-TEST_CASE("a cache partitioned by a consistent-hash ring has keys × replicas effective capacity",
+// The ring's arcs are uneven (ResolvedNode::imbalance k, 1 + 1/sqrt(vnodes)): the hottest
+// replica owns k/N of the keys and the others share the rest. Each replica is an LRU cache of
+// `keys` over its own arc, which for Che is one cache of keys / a over the whole space (a the
+// arc's share), and it serves a of the requests: h = Σ_j a_j · Che(keys / a_j).
+TEST_CASE("a cache partitioned by a consistent-hash ring sums Che over its uneven arcs",
           "[graph]") {
   const auto ring = Graph::build(replicated_che_cache(LbPolicy::consistent_hash));
   INFO((ring ? "" : ring.error().message));
   REQUIRE(ring.has_value());
+  const double k = 1.0 + 1.0 / std::sqrt(150.0);  // default vnodes
+  const double hot = k / 4;
+  const double cool = (1 - hot) / 3;
   REQUIRE_THAT(*ring->hit_ratio(*ring->index_of("cache")),
-               WithinRel(che_over_100k_zipf1_keys(40'000), 1e-12));
+               WithinRel(hot * che_over_100k_zipf1_keys(10'000 / hot) +
+                             3 * cool * che_over_100k_zipf1_keys(10'000 / cool),
+                         1e-12));
 
   const auto round_robin = Graph::build(replicated_che_cache(LbPolicy::round_robin));
   INFO((round_robin ? "" : round_robin.error().message));
   REQUIRE(round_robin.has_value());
   REQUIRE_THAT(*round_robin->hit_ratio(*round_robin->index_of("cache")),
                WithinRel(che_over_100k_zipf1_keys(10'000), 1e-12));
-}
-
-// explain's view of the same fact: the provenance names the capacity the ring multiplied, so a
-// reader can see why the number is higher than the cache's own `keys` suggests.
-TEST_CASE("explain shows a ring-partitioned che cache's capacity as keys × replicas", "[graph]") {
-  const auto ring = Graph::build(replicated_che_cache(LbPolicy::consistent_hash));
-  REQUIRE(ring.has_value());
-  const auto ring_text = simsys::report::render_explain(*ring);
-  CAPTURE(ring_text);
-  REQUIRE(ring_text.contains(" (che: zipf 1 over 100k keys from u; 10k keys x 4 partitioned)"));
-
-  const auto round_robin = Graph::build(replicated_che_cache(LbPolicy::round_robin));
-  REQUIRE(round_robin.has_value());
-  const auto round_robin_text = simsys::report::render_explain(*round_robin);
-  CAPTURE(round_robin_text);
-  REQUIRE(round_robin_text.contains(" (che: zipf 1 over 100k keys from u)"));
 }
 
 // ---- Cache then-steps and write_back (plan 2b, Task 3) ----
@@ -1139,11 +1134,9 @@ TEST_CASE("a write_back cache needs a backend and a link, and its flush hop is a
     const auto c = *built->index_of("cache");
     const auto db = *built->index_of("db");
     REQUIRE(built->is_async_hop(c, "write", db, "write"));
-    REQUIRE(std::ranges::contains(built->async_hops(),
-                                  simsys::graph::AsyncHop{.from = c,
-                                                          .op = "write",
-                                                          .to = db,
-                                                          .target_op = "write"}));
+    REQUIRE(std::ranges::contains(
+        built->async_hops(),
+        simsys::graph::AsyncHop{.from = c, .op = "write", .to = db, .target_op = "write"}));
   }
   SECTION("without a backend it is refused") {
     const auto built =
@@ -1157,4 +1150,245 @@ TEST_CASE("a write_back cache needs a backend and a link, and its flush hop is a
     REQUIRE_FALSE(built.has_value());
     REQUIRE(built.error().message.contains("node 'cache': backend 'db' needs a link"));
   }
+}
+
+// ---- Which keys reach a che cache: the op-aware walk (plan 2b refinement 1, revised) ----
+//
+// A client's keys reach a cache only along the calls its ops make: an op that never calls the
+// cache brings none of its keys there, even when the same service sits in front of both.
+
+namespace {
+// readers (read, zipf 1 over 1M) and writers (write, the given keys) -> web;
+// web.read = [cache.read, db.read on miss], web.write = [db.write]; cache: che, 100k keys.
+Scenario readers_and_writers(std::optional<KeySpec> reader_keys,
+                             std::optional<KeySpec> writer_keys) {
+  Scenario s{.name = "ops", .version = 1, .duration = 1min};
+  auto readers = client("readers", Rate{10'000}, {{"read", 1.0}});
+  readers.workload->keys = reader_keys;
+  auto writers = client("writers", Rate{1000}, {{"write", 1.0}});
+  writers.workload->keys = writer_keys;
+  s.nodes = {std::move(readers), std::move(writers),
+             service("web", {{"read",
+                              {Step{.to = "cache", .op = "read"},
+                               Step{.to = "db", .op = "read", .on = StepCondition::miss}}},
+                             {"write", {Step{.to = "db", .op = "write"}}}}),
+             che_cache(100'000), service("db")};
+  s.links = {LinkSpec{.from = "readers", .to = "web"}, LinkSpec{.from = "writers", .to = "web"},
+             LinkSpec{.from = "web", .to = "cache"}, LinkSpec{.from = "web", .to = "db"}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("a client whose ops never call the cache does not bring its keys to it", "[graph]") {
+  const auto built = Graph::build(readers_and_writers(
+      KeySpec{.zipf = 1.0, .space = 1e6}, KeySpec{.zipf = std::nullopt, .space = 50e6}));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto cache_index = *built->index_of("cache");
+  REQUIRE_THAT(*built->hit_ratio(cache_index),
+               WithinRel(simsys::caching::che_hit_ratio(
+                             100'000, simsys::caching::Popularity::zipf(1.0, 1e6)),
+                         1e-12));
+  const auto& resolved = *built->nodes()[cache_index].hit_ratio;
+  REQUIRE(resolved.key_clients == std::vector<std::size_t>{*built->index_of("readers")});
+}
+
+TEST_CASE("a client without keys whose ops never call the cache is no error", "[graph]") {
+  const auto built =
+      Graph::build(readers_and_writers(KeySpec{.zipf = 1.0, .space = 1e6}, std::nullopt));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+}
+
+TEST_CASE("a client without keys whose ops call the cache is an error naming it", "[graph]") {
+  const auto built =
+      Graph::build(readers_and_writers(std::nullopt, KeySpec{.zipf = std::nullopt, .space = 50e6}));
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'cache': hit_ratio che: client 'readers' reaches it without keys");
+}
+
+TEST_CASE("a che cache no client's demand reaches is an error", "[graph]") {
+  Scenario s{.name = "orphan", .version = 1, .duration = 1min};
+  s.nodes = {keyed_client("u", KeySpec{.zipf = std::nullopt, .space = 10}), service("s"),
+             che_cache(3)};
+  s.links = {LinkSpec{.from = "u", .to = "s"}};
+  const auto built = Graph::build(s);
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message == "node 'cache': hit_ratio che: no client's demand reaches it");
+}
+
+// A rate limiter asks its counter store "how many requests has THIS user made?": the store is
+// keyed per user (or per rule), not by the keys the client's requests are about, so the
+// counter op brings no client keys to it.
+TEST_CASE("a limiter's counter requests bring no client keys to its store", "[graph]") {
+  Scenario s{.name = "lim", .version = 1, .duration = 1min};
+  auto limiter = limiter_of(simsys::model::LimiterAlgorithm::token_bucket, std::nullopt);
+  limiter.backend = "cache";
+  s.nodes = {keyed_client("u", KeySpec{.zipf = 1.0, .space = 100e6}), std::move(limiter),
+             che_cache(10'000), service("web")};
+  s.links = {LinkSpec{.from = "u", .to = "limiter"}, LinkSpec{.from = "limiter", .to = "cache"},
+             LinkSpec{.from = "limiter", .to = "web"}};
+  const auto built = Graph::build(s);
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message == "node 'cache': hit_ratio che: no client's demand reaches it");
+}
+
+// `zipf: 0` IS the uniform distribution (p_i ∝ i^0 = 1): two clients writing it the two ways
+// send the same keys and must agree.
+TEST_CASE("zipf 0 and uniform over the same space are the same key distribution", "[graph]") {
+  const auto built = Graph::build(two_clients_one_cache(
+      KeySpec{.zipf = 0.0, .space = 10'000}, KeySpec{.zipf = std::nullopt, .space = 10'000}));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE_THAT(*built->hit_ratio(*built->index_of("cache")), WithinRel(0.1, 1e-6));
+}
+
+// ---- Caches behind caches: filtered popularity (Martina, Garetto & Leonardi 2014) ----
+//
+// The second cache of a chain sees only the FIRST cache's misses: the hot keys stopped at the
+// first cache, so the second one gets the cold tail, where caching works much worse. Its key
+// popularity is the clients' filtered by the first cache: p_i e^{-p_i t1}, renormalised.
+
+namespace {
+// u (zipf 0.9 over 10M, get) -> l1 -> l2 -> db; both caches read_through, l1 the given hit
+// ratio (2M keys), l2 che with `l2_keys`.
+Scenario two_caches(HitRatio l1_ratio, std::int64_t l2_keys) {
+  Scenario s{.name = "c2c", .version = 1, .duration = 1min};
+  NodeSpec l1{.id = "l1",
+              .type = NodeType::cache,
+              .hit_ratio = l1_ratio,
+              .strategy = CacheStrategy::read_through};
+  l1.backend = "l2";
+  l1.keys = 2'000'000;
+  NodeSpec l2{.id = "l2",
+              .type = NodeType::cache,
+              .hit_ratio = HitRatio{.che = true},
+              .strategy = CacheStrategy::read_through};
+  l2.backend = "db";
+  l2.keys = l2_keys;
+  s.nodes = {keyed_client("u", KeySpec{.zipf = 0.9, .space = 10e6}), std::move(l1), std::move(l2),
+             service("db")};
+  s.links = {LinkSpec{.from = "u", .to = "l1", .dir = Direction::inout},
+             LinkSpec{.from = "l1", .to = "l2", .dir = Direction::inout},
+             LinkSpec{.from = "l2", .to = "db", .dir = Direction::inout}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("a che cache behind a che cache sees the first cache's misses", "[graph]") {
+  // Dense reference (zipf 0.9 over all 10M keys, see test_caching): l2 at 2M keys hits 0.257,
+  // at 8M 0.870; over the raw popularity it would claim 0.747 and 0.963.
+  for (const auto& [l2_keys, expected] : {std::pair{std::int64_t{2'000'000}, 0.256607},
+                                          std::pair{std::int64_t{8'000'000}, 0.870337}}) {
+    const auto built = Graph::build(two_caches(HitRatio{.che = true}, l2_keys));
+    INFO((built ? "" : built.error().message));
+    REQUIRE(built.has_value());
+    REQUIRE_THAT(*built->hit_ratio(*built->index_of("l1")), WithinAbs(0.747110, 1e-4));
+    REQUIRE_THAT(*built->hit_ratio(*built->index_of("l2")), WithinAbs(expected, 1e-3));
+    const auto& resolved = *built->nodes()[*built->index_of("l2")].hit_ratio;
+    REQUIRE(resolved.filtered_by == built->index_of("l1"));
+  }
+}
+
+// A fixed ratio says nothing about WHICH keys hit, so there is no characteristic time to filter
+// by: the downstream che cache uses the clients' popularity as it is, and says so in explain.
+TEST_CASE("a che cache behind a fixed-ratio cache uses the unfiltered popularity", "[graph]") {
+  const auto built = Graph::build(two_caches(HitRatio{.fixed = 0.5}, 2'000'000));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE_THAT(
+      *built->hit_ratio(*built->index_of("l2")),
+      WithinRel(simsys::caching::che_hit_ratio(2e6, simsys::caching::Popularity::zipf(0.9, 10e6)),
+                1e-12));
+  const auto& resolved = *built->nodes()[*built->index_of("l2")].hit_ratio;
+  REQUIRE_FALSE(resolved.filtered_by.has_value());
+  REQUIRE(resolved.unfiltered_through == built->index_of("l1"));
+}
+
+// A cache's `then` step on miss carries its misses too (search autocomplete's browser cache).
+TEST_CASE("a cache's then step on miss filters the keys it passes on", "[graph]") {
+  Scenario s{.name = "then", .version = 1, .duration = 1min};
+  NodeSpec front{.id = "front",
+                 .type = NodeType::cache,
+                 .hit_ratio = HitRatio{.che = true},
+                 .strategy = CacheStrategy::cache_aside};
+  front.keys = 1000;
+  front.then = {Step{.to = "cache", .op = "get", .on = StepCondition::miss}};
+  s.nodes = {keyed_client("u", KeySpec{.zipf = 1.0, .space = 100'000}), std::move(front),
+             che_cache(1000)};
+  s.links = {LinkSpec{.from = "u", .to = "front"}, LinkSpec{.from = "front", .to = "cache"}};
+  const auto built = Graph::build(s);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto clients = simsys::caching::Popularity::zipf(1.0, 100'000);
+  const auto misses = clients.filtered_by(simsys::caching::che_characteristic_time(1000, clients));
+  REQUIRE_THAT(*built->hit_ratio(*built->index_of("cache")),
+               WithinRel(simsys::caching::che_hit_ratio(1000, misses), 1e-12));
+}
+
+// One popularity per cache: reads that arrive as l1's misses and reads that skipped l1 have
+// different popularities, and mixing them by rate is phase 2c's.
+TEST_CASE("a che cache receiving both filtered and unfiltered reads is an error", "[graph]") {
+  auto s = two_caches(HitRatio{.che = true}, 2'000'000);
+  s.nodes[0].workload->op_shares = {{"get", 0.5}, {"peek", 0.5}};
+  s.links[0].ops = {"get"};
+  s.links.push_back(LinkSpec{.from = "u", .to = "l2", .dir = Direction::inout, .ops = {"peek"}});
+  const auto built = Graph::build(s);
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'l2': hit_ratio che: it receives both the misses of cache 'l1' and requests no "
+          "cache filtered");
+}
+
+// ---- Ring-partitioned caches: uneven arcs (plan 2b refinement 2, revised) ----
+
+namespace {
+// u (zipf 0.9 over 10M) -> ring (consistent_hash, `vnodes`) -> c (4 replicas, 2M keys each,
+// che, read_through) -> db: the consistent-hashing lab.
+Scenario ring_lab(int vnodes) {
+  Scenario s{.name = "ring", .version = 1, .duration = 1min};
+  auto ring = load_balancer("ring", LbPolicy::consistent_hash);
+  ring.vnodes = vnodes;
+  NodeSpec c{.id = "c",
+             .type = NodeType::cache,
+             .replicas = 4,
+             .hit_ratio = HitRatio{.che = true},
+             .strategy = CacheStrategy::read_through};
+  c.backend = "db";
+  c.keys = 2'000'000;
+  s.nodes = {keyed_client("u", KeySpec{.zipf = 0.9, .space = 10e6}), std::move(ring), std::move(c),
+             service("db")};
+  s.links = {LinkSpec{.from = "u", .to = "ring", .dir = Direction::inout},
+             LinkSpec{.from = "ring", .to = "c", .dir = Direction::inout},
+             LinkSpec{.from = "c", .to = "db", .dir = Direction::inout}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("one vnode per server over four servers: the hot arc halves the ring's hit ratio gain",
+          "[graph]") {
+  // vnodes 1: k = 2, so the hot replica owns 2/4 of the keys (Che of 2M / 0.5 = 4M keys: 0.848)
+  // and each cool one 1/6 (12M > 10M keys: every key fits, 1). h = 0.5 × 0.848 + 0.5 × 1 = 0.924,
+  // below the 0.963 an even split (one 8M-key cache) would give.
+  const auto built = Graph::build(ring_lab(1));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto zipf = simsys::caching::Popularity::zipf(0.9, 10e6);
+  REQUIRE_THAT(*built->hit_ratio(*built->index_of("c")),
+               WithinRel(0.5 * simsys::caching::che_hit_ratio(4e6, zipf) + 0.5, 1e-12));
+  REQUIRE_THAT(*built->hit_ratio(*built->index_of("c")), WithinAbs(0.924118, 1e-4));
+}
+
+TEST_CASE("a ring-partitioned cache that is also sent to directly is an error", "[graph]") {
+  auto s = ring_lab(150);
+  s.nodes[0].workload->op_shares = {{"get", 0.5}, {"peek", 0.5}};
+  s.nodes.push_back(service("web", {{"peek", {Step{.to = "c", .op = "get"}}}}));
+  s.links[0].ops = {"get"};
+  s.links.push_back(LinkSpec{.from = "u", .to = "web", .dir = Direction::inout, .ops = {"peek"}});
+  s.links.push_back(LinkSpec{.from = "web", .to = "c", .dir = Direction::inout});
+  const auto built = Graph::build(s);
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'c': keys are partitioned by ring 'ring' but 'web' also sends to it directly");
 }

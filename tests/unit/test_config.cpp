@@ -981,6 +981,18 @@ TEST_CASE("a client's keys are typed: zipf with a space, or uniform") {
     CHECK_FALSE(workload->keys->zipf.has_value());
     CHECK(workload->keys->space == 10e6);
   }
+  SECTION("zipf 0 is uniform, and is stored as uniform") {
+    // p_i ∝ i^0 = 1: one distribution, one canonical form, so two clients that write it the two
+    // ways compare equal (graph's key_source compares KeySpecs with ==).
+    const auto path =
+        write_temp("simsys_keys_zipf0.yaml", client_with("keys: {zipf: 0, space: 10k}"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    const auto& keys = s->nodes[0].workload->keys;
+    REQUIRE(keys.has_value());
+    CHECK(*keys == simsys::model::KeySpec{.zipf = std::nullopt, .space = 10e3});
+  }
   SECTION("a client without keys has none") {
     const auto path = write_temp("simsys_keys_absent.yaml", client_with("timeout: 1s"));
     const auto s = simsys::config::load(path.string());
@@ -993,7 +1005,11 @@ TEST_CASE("a client's keys block is validated") {
   require_rejected("simsys_keys_no_space.yaml", client_with("keys: {zipf: 1.0}"),
                    "node 'u': keys needs zipf and space, or uniform");
   require_rejected("simsys_keys_negative.yaml", client_with("keys: {zipf: -1, space: 10}"),
-                   "node 'u': keys.zipf must be non-negative");
+                   "node 'u': keys.zipf must be a finite non-negative number");
+  require_rejected("simsys_keys_infinite.yaml", client_with("keys: {zipf: .inf, space: 10}"),
+                   "node 'u': keys.zipf must be a finite non-negative number");
+  require_rejected("simsys_keys_word.yaml", client_with("keys: {zipf: hot, space: 10}"),
+                   "node 'u': keys.zipf must be a finite non-negative number");
   require_rejected("simsys_keys_zero_space.yaml", client_with("keys: {zipf: 1, space: 0}"),
                    "node 'u': keys.space must be a positive count");
   require_rejected("simsys_keys_both.yaml", client_with("keys: {zipf: 1, space: 10, uniform: 5}"),
