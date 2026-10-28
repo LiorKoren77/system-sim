@@ -1,0 +1,59 @@
+# Lab: System Design Interview vol. 1, ch. 6 — Key-value store (Dynamo-style).
+# N=3 replicas, W=2, R=2 quorum, consistent hashing with virtual nodes, hinted handoff,
+# vector clocks, gossip failure detection. Two faults: a node failure and a partition.
+version: 1
+name: lab-kv-store
+seed: 1
+duration: 30m
+step: 100ms
+warmup: 1m
+
+datacenters:
+  dc-a: {}
+  dc-b: {}
+  latency: [{between: [dc-a, dc-b], rtt: 40ms}]
+
+nodes:
+  clients:
+    type: client
+    dc: dc-a
+    rate: {base: 30k/s}
+    ops: {get: 0.7, put: 0.3}
+    keys: {zipf: 0.9, space: 100M}
+    sizes: {put: 1KB}
+    timeout: 100ms
+
+  coordinator:
+    type: service
+    dc: dc-a
+    replicas: 4
+    capacity: 15k/s
+    latency: 0.2ms
+    ops:
+      get: [{to: store, op: read}]
+      put: [{to: store, op: write}]
+
+  store:
+    type: kv_cluster
+    dc: dc-a
+    nodes: 8
+    vnodes: 150
+    replication: 3
+    write_quorum: 2
+    read_quorum: 2
+    mode: ap                                    # try cp
+    capacity: 10k/s                             # per node
+    latency: 0.3ms
+
+links:
+  - {from: clients, to: coordinator, dir: inout}
+  - {from: coordinator, to: store, dir: inout}
+
+slo:
+  - {metric: p99_latency, node: clients, op: put, max: 20ms}
+  - {metric: utilization, node: store, max: 0.8}
+  - {metric: drop_rate, max: 0.01}
+
+faults:
+  - {at: 10m, kind: node_down, node: store, for: 3m}            # one of eight nodes
+  - {at: 20m, kind: partition, between: [dc-a, dc-b], for: 2m}
