@@ -520,8 +520,8 @@ TEST_CASE("a limiter that refuses half of the requests shows answered = offered 
 // account_rejections): only a drop or a refusal makes a request unanswered, and a backlog that
 // grows and drains again is neutral. Before (review of 3e23477, I2) it was served / inflow capped
 // at 1, which counted every request still waiting at the end of its arrival step as unanswered
-// and never credited it later: this probe reported 583/s answered of 667/s offered with nothing
-// dropped.
+// and never credited it later: the review's probe, this spike over a 2-minute run, reported
+// 583/s answered of 667/s offered with nothing dropped.
 
 TEST_CASE("a backlog that grows and drains without drops leaves answered equal to offered",
           "[series]") {
@@ -698,8 +698,8 @@ TEST_CASE("a red lower bound stays red", "[series]") {
   const auto text = explain_of(partly_behind_blob_store(3000.0));
   CAPTURE(text);
   // 3000/s of reads alone against 2k/s: 150 %, so db is overloaded whatever else arrives.
-  REQUIRE(check_line(text, "db")
-              .contains("(≥150%, red; load not propagated: blob_store is phase 2c)"));
+  REQUIRE(
+      check_line(text, "db").contains("(≥150%, red; load not propagated: blob_store is phase 2c)"));
 }
 
 // The mark follows the blob store's `then` steps, not its bare links: audit is linked but sent

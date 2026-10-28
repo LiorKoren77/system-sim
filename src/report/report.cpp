@@ -12,6 +12,7 @@ module;
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <map>
@@ -624,6 +625,16 @@ template <class T, class F>
   std::unreachable();
 }
 
+// The tag of a node's own number (its capacity, its service time): provenance's, except that an
+// id generator's defaults are its algorithm's (defaults::defaults_of), not its type's:
+// "(algorithm)", where "(default)" would read as the same number for every id generator.
+[[nodiscard]] std::string_view node_provenance(defaults::Source source,
+                                               const model::NodeSpec& spec) {
+  const bool from_algorithm = source == defaults::Source::type_default &&
+                              spec.type == model::NodeType::id_generator && spec.id_algorithm;
+  return from_algorithm ? "(algorithm)" : provenance(source);
+}
+
 [[nodiscard]] std::string explain_header(const model::Scenario& s) {
   return "scenario " + s.name + "  version " + std::to_string(s.version) + "  duration " +
          fmt_duration(s.duration) + "  step " + fmt_duration(s.step) + "  warmup " +
@@ -808,17 +819,21 @@ template <class T>
 // the node has the capacity it has: `algorithm=snowflake (4.096M/s per replica by design)`,
 // `algorithm=ticket_server (one database: 1k/s, spec §6 writes)`, `algorithm=uuid (unbounded:
 // 1G/s)`. The algorithm's number even when the scenario states its own `capacity`, which the
-// node line then shows tagged `(scenario)`: the reader sees the design's figure and the override.
-[[nodiscard]] std::string id_algorithm_meaning(model::IdAlgorithm algorithm) {
+// node line then shows tagged `(scenario)`: the reader sees the design's figure and the
+// override, and the figure is then called the default it is, so that it does not read as a
+// second capacity: `algorithm=ticket_server (one database; default 1k/s, spec §6 writes)`.
+[[nodiscard]] std::string id_algorithm_meaning(model::IdAlgorithm algorithm, bool capacity_stated) {
   const std::string rate = fmt_rate(defaults::for_id_algorithm(algorithm).service_rate.per_second);
+  const std::string figure = capacity_stated ? "default " + rate : rate;
+  const std::string_view before_figure = capacity_stated ? "; " : ": ";
   using enum model::IdAlgorithm;  // C++20, as in provenance
   switch (algorithm) {
     case snowflake:
-      return rate + " per replica by design";
+      return figure + " per replica by design";
     case ticket_server:
-      return "one database: " + rate + ", spec §6 writes";
+      return "one database" + std::string{before_figure} + figure + ", spec §6 writes";
     case uuid:
-      return "unbounded: " + rate;
+      return "unbounded" + std::string{before_figure} + figure;
   }
   std::unreachable();
 }
@@ -826,7 +841,7 @@ template <class T>
 [[nodiscard]] std::string id_generator_summary(const model::NodeSpec& spec) {
   if (spec.type != model::NodeType::id_generator || !spec.id_algorithm) return {};
   return "  algorithm=" + std::string{model::to_string(*spec.id_algorithm)} + " (" +
-         id_algorithm_meaning(*spec.id_algorithm) + ")";
+         id_algorithm_meaning(*spec.id_algorithm, spec.capacity.has_value()) + ")";
 }
 
 // "write_ops=write", plus a note when no op that reaches the cache is one of them: its write
@@ -1036,7 +1051,7 @@ struct QueueProvenance {
 // 1MB/object; byte flows: phase 2c)": the number is not the scenario's, only the byte rate is.
 [[nodiscard]] std::string capacity_provenance(const graph::ResolvedNode& node) {
   const auto bytes = defaults::byte_rate_behind(node.spec);
-  if (!bytes) return std::string{provenance(node.service_rate_source)};
+  if (!bytes) return std::string{node_provenance(node.service_rate_source, node.spec)};
   const std::string source = bytes->source == defaults::Source::scenario ? "scenario" : "default";
   return "(" + source + ": " + byte_conversion(*bytes) + ")";
 }
@@ -1054,8 +1069,8 @@ struct QueueProvenance {
   // a database's `pool` at or above that c binds nothing (graph::apply_database_keys).
   const std::string_view concurrency_source =
       spec.advanced.concurrency ? "(scenario)" : "(implied)";
-  return {capacity_provenance(node), provenance(node.service_time_source), concurrency_source,
-          provenance(queue_source)};
+  return {capacity_provenance(node), node_provenance(node.service_time_source, spec),
+          concurrency_source, provenance(queue_source)};
 }
 
 [[nodiscard]] std::string server_details(const graph::ResolvedNode& node) {
@@ -1508,9 +1523,12 @@ struct PaperLoad {
 // It does not follow a blob store's or a worker pool's `then`, nor a message queue's
 // consumers (phase 2c; a worker pool's work comes from the queue it consumes, over a link, not
 // along a step), nor the `then` of a notification fan-out or a URL frontier (types without a
-// phase yet). A node fed only through one of those shows 0 offered load: a missing number, not
-// a zero, and a verdict on it ("0%, green") would read as "this tier is idle". Its check line
-// says so instead.
+// phase yet). A node fed through one of those misses that part of its load: with nothing else
+// it shows 0 offered load, a missing number, not a zero, and a verdict on it ("0%, green") would
+// read as "this tier is idle"; with some load from elsewhere its percentage is a lower bound,
+// and a green or yellow verdict on it would read as "this tier has room" (review of 3e23477, I1:
+// a node fed 1/s by a client and 10k/s through a blob store printed "(0.05%, green)"). Its check
+// line says so instead.
 
 // Until when the paper load leaves unfollowed what a node of `type` sends on: "phase 2c", "not
 // modelled yet", or nothing for a type it follows (or that sends nothing on).
@@ -1521,43 +1539,93 @@ struct PaperLoad {
   return std::nullopt;
 }
 
-// Per node, the node whose onward flow the paper load does not follow and that this node's load
-// would come through: its nearest such predecessor over a demand link, directly (transcode_q
-// behind youtube's blob store) or through nodes that are themselves unreached (a service fed only
-// by a queue's consumers). Only for a node the paper load gave nothing at all: a node with some
-// load keeps its verdict (an underestimate when part of its load is missing; youtube's
-// metadata_db and metadata_cache also take the completion handler's writes). Solved by repeated
-// sweeps, so the file's node order does not matter; each sweep marks at least one node or ends.
-[[nodiscard]] std::vector<std::optional<std::size_t>> unpropagated_through(
-    const graph::Graph& g, std::span<const double> totals) {
-  const auto count = g.nodes().size();
-  std::vector<std::optional<std::size_t>> through(count);
-  const auto blocker = [&](std::size_t from) -> std::optional<std::size_t> {
-    if (unfollowed_until(g.nodes()[from].spec.type)) return from;
-    return through[from];
-  };
-  for (bool marked = true; marked;) {
-    marked = false;
-    for (std::size_t node = 0; node < count; ++node) {
-      const bool reached = totals[node] > 0.0 || !std::isfinite(totals[node]);
-      if (through[node] || reached || g.nodes()[node].spec.type == model::NodeType::client) {
-        continue;
-      }
-      for (std::size_t from = 0; from < count && !through[node]; ++from) {
-        if (from == node || !g.demand_link(from, node)) continue;
-        through[node] = blocker(from);
-      }
-      marked = marked || through[node].has_value();
+// Where `from` sends on what it receives. For a type the paper load does not follow: the targets
+// of its `then` steps, the flow it would send; for one with none (a message queue, whose
+// consumers are only linked to it: `consumes` is checked by the loader but not kept), the nodes
+// its links carry demand to. For every other node: its demand edges (steps, client routes, a
+// balancer's links, a cache's backend), what the paper load follows from it.
+[[nodiscard]] std::vector<std::size_t> onward_targets(const graph::Graph& g, std::size_t from) {
+  std::vector<std::size_t> targets;
+  const auto& spec = g.nodes()[from].spec;
+  if (!unfollowed_until(spec.type)) {
+    for (const graph::DemandEdge& edge : g.edges()) {
+      if (edge.from == from) targets.push_back(edge.to);
     }
+    return targets;
   }
-  return through;
+  for (const model::Step& step : spec.then) targets.push_back(*g.index_of(step.to));
+  if (!targets.empty()) return targets;
+  for (std::size_t to = 0; to < g.nodes().size(); ++to) {
+    if (to != from && g.demand_link(from, to)) targets.push_back(to);
+  }
+  return targets;
 }
 
-// "(load not propagated: blob_store is phase 2c)": what stands in for a percentage and a zone.
-[[nodiscard]] std::string unpropagated_mark(const graph::Graph& g, std::size_t through) {
-  const auto type = g.nodes()[through].spec.type;
-  return "(load not propagated: " + std::string{model::to_string(type)} + " is " +
-         std::string{*unfollowed_until(type)} + ")";
+// Adds each of `types` that `into` does not hold yet, in order; true when one was added.
+bool add_missing(std::vector<model::NodeType>& into, std::span<const model::NodeType> types) {
+  bool added = false;
+  for (const model::NodeType type : types) {
+    if (std::ranges::contains(into, type)) continue;
+    into.push_back(type);
+    added = true;
+  }
+  return added;
+}
+
+// Per node, the types on its way in whose onward flow the paper load does not follow, each once,
+// nearest first: transcode_q behind youtube's blob store has [blob_store]; metadata_db, also
+// written by the completion handler, [worker_pool, message_queue, blob_store]. Empty for a node
+// whose load the paper pass has in full. A node passes on its own type (if it is such a type)
+// and everything on its way, so the mark crosses ordinary nodes too (the web crawler's parser,
+// behind the downloader). A node in a loop through such a type has it on its way as well: the
+// load that comes round is missing too. Breadth-first from every such node at once, which puts
+// the nearest types first; a node is visited again only when its list grows, which happens at
+// most once per type, so a loop ends.
+[[nodiscard]] std::vector<std::vector<model::NodeType>> blocked_on_the_way(const graph::Graph& g) {
+  const auto count = g.nodes().size();
+  std::vector<std::vector<model::NodeType>> blocked(count);
+  std::deque<std::size_t> work;
+  for (std::size_t node = 0; node < count; ++node) {
+    if (unfollowed_until(g.nodes()[node].spec.type)) work.push_back(node);
+  }
+  while (!work.empty()) {
+    const auto from = work.front();
+    work.pop_front();
+    std::vector<model::NodeType> passed_on;
+    const auto type = g.nodes()[from].spec.type;
+    if (unfollowed_until(type)) passed_on.push_back(type);
+    add_missing(passed_on, blocked[from]);
+    for (const std::size_t to : onward_targets(g, from)) {
+      if (add_missing(blocked[to], passed_on)) work.push_back(to);
+    }
+  }
+  return blocked;
+}
+
+// "a", "a and b", "a, b and c".
+[[nodiscard]] std::string spoken_list(std::span<const std::string> items) {
+  if (items.size() <= 1) return items.empty() ? std::string{} : items.front();
+  return join(items.first(items.size() - 1), ", ") + " and " + items.back();
+}
+
+// "load not propagated: blob_store is phase 2c)" or, with several types, grouped by how long
+// each stays unfollowed, in the order they come: "load not propagated: worker_pool is phase 2c,
+// frontier is not modelled yet)", "... worker_pool, message_queue and blob_store are phase 2c)".
+[[nodiscard]] std::string unpropagated_mark(std::span<const model::NodeType> blocked) {
+  std::vector<std::pair<std::string_view, std::vector<std::string>>> groups;
+  for (const model::NodeType type : blocked) {
+    const auto until = *unfollowed_until(type);
+    auto group = std::ranges::find(groups, until, [](const auto& g) { return g.first; });
+    if (group == groups.end())
+      group = groups.emplace(groups.end(), until, std::vector<std::string>{});
+    group->second.emplace_back(model::to_string(type));
+  }
+  std::vector<std::string> reasons;
+  for (const auto& [until, types] : groups) {
+    reasons.push_back(spoken_list(types) + (types.size() == 1 ? " is " : " are ") +
+                      std::string{until});
+  }
+  return "load not propagated: " + join(reasons, ", ") + ")";
 }
 
 // Behind a hash ring (imbalance k > 1) the group's average hides the copy that breaks
@@ -1641,39 +1709,73 @@ struct PaperLoad {
 // and no zone: "(not checked: capacity from 100GB/s at 1MB/object; byte flows: phase 2c)". The
 // object size is an assumption no scenario states (youtube streams 50 MB), so a verdict on it
 // would be one on an invented number; the engine refuses to run a CDN sized so for that reason.
+// Capacity per replica × replicas, × shards for a sharded database (every shard is a full set
+// of copies), in capacity units per second.
+[[nodiscard]] double total_capacity(const graph::ResolvedNode& node) {
+  const double copies = node.spec.replicas * node.spec.shards.value_or(1);
+  return node.capacity.service_rate.per_second * copies;
+}
+
 // "peak offered 1.5k/s vs 2k/s total capacity  ": what every check line opens with.
 [[nodiscard]] std::string check_head(const graph::ResolvedNode& node, double offered) {
-  const double copies = node.spec.replicas * node.spec.shards.value_or(1);
-  const double total_capacity = node.capacity.service_rate.per_second * copies;
   const std::string offered_text = node.spec.type == model::NodeType::sql_db
                                        ? with_si_prefix(offered) + " units/s"
                                        : fmt_rate(offered);
-  return "peak offered " + offered_text + " vs " + fmt_rate(total_capacity) + " total capacity  ";
+  return "peak offered " + offered_text + " vs " + fmt_rate(total_capacity(node)) +
+         " total capacity  ";
 }
 
 [[nodiscard]] std::string check_details(const graph::ResolvedNode& node, double offered,
                                         const std::optional<graph::DatabaseCopyLoads>& loads) {
-  const double copies = node.spec.replicas * node.spec.shards.value_or(1);
-  const double total_capacity = node.capacity.service_rate.per_second * copies;
+  const double capacity = total_capacity(node);
   const std::string head = check_head(node, offered);
   if (const auto bytes = defaults::byte_rate_behind(node.spec)) {
     return head + "(not checked: capacity from " + byte_conversion(*bytes) + ")";
   }
-  if (total_capacity <= 0.0) return head + "(no capacity, red)" + hottest_copy_check(node, offered);
-  const double rho = offered / total_capacity;
+  if (capacity <= 0.0) return head + "(no capacity, red)" + hottest_copy_check(node, offered);
+  const double rho = offered / capacity;
   return head + "(" + percent(rho) + ", " + headline_zone(node, rho, loads) + ")" +
          hottest_copy_check(node, offered);
 }
 
-// One node's check line: the head and its verdict, or, for a node the paper load could not reach
-// (unpropagated_through), the head and the mark instead of any verdict, per copy neither.
+// The check of a node whose paper load misses what comes through `blocked` (blocked_on_the_way):
+//  - nothing reached it: the head and the mark, no percentage and no zone,
+//    "(load not propagated: blob_store is phase 2c)";
+//  - some load reached it: that load's percentage as a lower bound, "(≥0.05%; load not
+//    propagated: ...)". No zone below red: the real load is higher, so green or yellow might not
+//    hold, but a red lower bound is red for certain, "(≥150%, red; ...)" (a database's at the
+//    busiest copy, headline_zone);
+//  - a capacity converted from bytes: its own "not checked" note (check_details), then the mark.
+// No per-copy checks: each would be a verdict on the same partial number.
+[[nodiscard]] std::string partial_check(const graph::ResolvedNode& node, double offered,
+                                        const OpLoad& arriving,
+                                        std::span<const model::NodeType> blocked) {
+  const std::string head = check_head(node, offered);
+  const std::string mark = unpropagated_mark(blocked);
+  const bool reached = offered > 0.0 || !std::isfinite(offered);
+  if (!reached) return head + "(" + mark;
+  if (defaults::byte_rate_behind(node.spec)) {
+    return check_details(node, offered, std::nullopt) + "  (lower bound; " + mark;
+  }
+  const double capacity = total_capacity(node);
+  if (capacity <= 0.0) return head + "(no capacity, red; " + mark;
+  const double rho = offered / capacity;
+  const std::string zone = headline_zone(node, rho, database_loads(node, arriving));
+  // C++20 std::string::starts_with: a prefix test in one call, replacing
+  // `compare(0, prefix.size(), prefix) == 0` or `rfind(prefix, 0) == 0`.
+  const std::string red = zone.starts_with("red") ? ", " + zone : "";
+  return head + "(≥" + percent(rho) + red + "; " + mark;
+}
+
+// One node's check line: the head and its verdict, or, for a node part or all of whose load the
+// paper load could not follow (blocked_on_the_way), partial_check's lower bound or mark.
 [[nodiscard]] std::string check_line(const graph::Graph& g, std::size_t i, const PaperLoad& load,
                                      const std::vector<bool>& upper_bound,
-                                     std::optional<std::size_t> unpropagated) {
+                                     std::span<const model::NodeType> blocked) {
   const auto& node = g.nodes()[i];
-  if (unpropagated) return check_head(node, load.totals[i]) + unpropagated_mark(g, *unpropagated);
   const std::string note =
       upper_bound[i] ? " (hit ratio unknown: counted as 0 — an upper bound)" : "";
+  if (!blocked.empty()) return partial_check(node, load.totals[i], load.by_op[i], blocked) + note;
   // A capacity converted from bytes gets no verdict (check_details), per copy neither.
   const auto loads =
       defaults::byte_rate_behind(node.spec) ? std::nullopt : database_loads(node, load.by_op[i]);
@@ -1683,12 +1785,12 @@ struct PaperLoad {
 [[nodiscard]] std::string explain_checks(const graph::Graph& g) {
   const auto load = paper_load(g);
   const auto upper_bound = counts_unknown_hit_ratio(g);
-  const auto unpropagated = unpropagated_through(g, load.totals);
+  const auto blocked = blocked_on_the_way(g);
   std::vector<Row> rows;
   for (std::size_t i = 0; i < g.nodes().size(); ++i) {
     const auto& node = g.nodes()[i];
     if (node.spec.type == model::NodeType::client) continue;  // a source: see its offered=
-    rows.push_back({{node.spec.id}, {check_line(g, i, load, upper_bound, unpropagated[i])}});
+    rows.push_back({{node.spec.id}, {check_line(g, i, load, upper_bound, blocked[i])}});
   }
   const std::string note = load.converged ? "" : "  (no steady state: a loop of gain >= 1)\n";
   const std::string header = "checks (peak offered load over the first " +
@@ -2043,9 +2145,11 @@ OpSeriesWriter::OpSeriesWriter(std::ostream& out, const graph::Graph& g) : out_{
 // One row per response sample, in the record's order (clients by node index, ops by name), with
 // the node series' conventions (SeriesWriter::observe): `t_s` in its shortest form, 6
 // significant digits, `inf` for a mean of a path that never answers. answered = offered × the
-// fraction the path delivered (engine::ResponseSample): below offered when a limiter refused or
-// a queue dropped some of the requests, never above. A sample whose client is not a node of the
-// writer's graph is a programmer error (a record of another simulation): `at` throws.
+// fraction the path delivered (engine::ResponseSample): offered minus what a limiter refused or
+// a queue dropped on the way this step, never above offered; a request still waiting in a
+// growing queue is not lost, so a backlog alone leaves answered = offered. A sample whose client is
+// not a node of the writer's graph is a programmer error (a record of another simulation): `at`
+// throws.
 void OpSeriesWriter::observe(const engine::StepRecord& record) {
   const auto t_s = shortest(seconds(record.t));
   for (const auto& sample : record.responses) {

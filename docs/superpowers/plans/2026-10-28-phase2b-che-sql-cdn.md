@@ -183,6 +183,16 @@ Correct and pinned by the reviewer: the plan numbers (replica 600/s, reads 3.0 m
 **Files:** report, tests. CSV header `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`; op rows (a second CSV section? keep one file: node rows only; add `--series-ops out.csv` with `t_s,client,op,offered_per_s,answered_per_s,mean_ms`) — decide: two files is cleaner; `main.cpp` gains `--series-ops`. JSON ops gain `answered_per_s`. Explain: nodes reached only through types that do not yet propagate load get `(load not propagated: <type> is phase 2c/3)` instead of a green 0 %.
 - [x] Commit `report: demand/drain/offered/answered columns; explain marks unpropagated load`
 
+**Review of 3adc555 + 3e23477 (adversarial, REQUEST_CHANGES, no critical) — fix round.** Verified by the reviewer: snowflake 2^12 × 1000 per machine, ticket server = spec §6 write rate, uuid at c = 1000 stable in `erlang_c`; the lab's 0.3391 by hand and every README row; estimate vs run; CSV conservation exact on four scenarios incl. leaky-bucket/fixed-window variants; op series rows and JSON `answered_per_s` against CSV averages; explain marks on seven book scenarios; first-use comments, `Pattern:` labels, test names.
+
+- [x] **I1 Partial load still gets a green verdict.** `unpropagated_through` only marks nodes whose paper load is exactly 0; a node fed 1/s through a forwarding path and 10k/s through a blob store's `then` prints `(0.05%, green)` (youtube's `metadata_db` likewise undercounts). Fix: mark every node with a blocked predecessor; for a reached one keep the percentage as a lower bound with no green zone: `(≥0.05%; load not propagated: blob_store is phase 2c)`; a red lower bound stays red. Test on the probe.
+- [x] **I2 `answered` undercounts while a backlog grows.** The engine's `passed` share is served/inflow per step (`account_rejections`), so a request that waits in a growing queue counts as unanswered in its arrival step and is never credited: a 3× spike into a 1k/s service with a huge queue, nothing dropped, reports answered 583/s of 667/s. Fix: define delivered per step as 1 − (dropped + rejected)/inflow at each queue, so answered = offered − lost every step and the backlog is neutral (equals the old value in steady state); re-derive any pinned delivered values that change; the README, schema (~749), `report.cppm` (~70) and `report.cpp` (~2045) texts then hold; test pinning answered = offered on the spike probe.
+- [x] **I3 The unique-id lab bypasses the feature.** The shipped snowflake states `capacity: 4M/s` and `latency: 0.01ms`; the README's uuid claim ("unbounded 1G/s") and its 501/503 µs row only hold after deleting both. Delete them from the YAML; update the snowflake row (rho 0.00074, 16.38M/s total; 510/534 µs), README line ~16, the "Delete the snowflake's capacity" item and the stale "try: replicas 1" comment (M10).
+- [x] Minor: M1 `--series` file is truncated before `--series-ops` fails to open (check both paths first); M2 identical paths for the two series files refused; M3 the loader also refuses a ticket server with `replicas != 1` (keep the graph check for code-built specs); M4 the mark lists each distinct blocking type on the way (`worker_pool is phase 2c, frontier is not modelled yet`) and follows `then` steps rather than bare links where it can; M5 wording beside a stated capacity (`(one database; default 1k/s, spec §6 writes)`), `(default)` tag → `(algorithm)`; M6 model text: several ticket servers are the book's SPOF remedy at a synchronisation cost (the model has no such mode); UUID v4 has 122 random bits; the 5-bit machine field caps snowflake at 32 machines per datacenter, note it in the ignored list; M7 comment in `defaults.cppm` that 10 µs implies c = 41 for one sequence counter (244 ns would give c = 1; latency negligible either way); M8 `++ran` counts skipped scenarios, the url-shortener exemption names Task 8 (Task 8 removes it); M9 test "every op in the JSON …" checks only the first op.
+- [x] Commit `nodes,report: answered counts only losses; partial load marked as a lower bound; unique-id lab uses the algorithm's numbers`
+
+Fix-round notes: no pinned test value moved under I2 (every pinned delivered/answered value is a steady state); the shipped and README runs that move are the transient ones, where requests that waited out a surge now count as answered and bring their wait into the answered-weighted latency: rate-limiter lab p99 29.4 → 30.5 ms (README, root README) and every row of its burst-500 table (token bucket 62.1 → 67.3 ms, fixed window 182 → 228 ms, ...), verdicts unchanged; url-shortener variants and the tutorials unchanged at printed precision. I1's mark groups the blocking types by how long each stays unfollowed ("worker_pool, message_queue and blob_store are phase 2c"), lists a node's own type when the node sits in a loop through it, and gives a lower-bound line no per-copy checks.
+
 ---
 
 ### Task 8: The first book system runs
@@ -198,6 +208,14 @@ Correct and pinned by the reviewer: the plan numbers (replica 600/s, reads 3.0 m
 Schema v1.3 (keys, sql, cdn, id keys; che resolution; staleness; columns; runnable set), spec §18 (refinements 1–7), `docs/study/numerics.md`, README. Commit `docs: schema v1.3, spec §18, numerics note`.
 
 ---
+
+## Phase 2c backlog (found in 2b)
+
+- **Op steps are independent of each other's failures:** with the ticket server dropping 23 % of `next_id`, `url_db` still receives every `shorten` write (Task 8). A sequential step after a failed one should not run; a parallel group's failure should fail the op.
+- **Client `timeout` has no effect** on reported latency or delivered fraction (url-shortener's `shorten` p99 of 2.42 s under the ticket server is still counted).
+- **SLOs miss red tiers:** the fluid queue drops only above 100 %, and a whole-day p99 hides the peak hours; a per-window SLO (`over: 5m`) or a zone SLO (`metric: zone, max: yellow`) would catch what explain's zones show (Task 8).
+- **Spikes vs step size:** a 2,000-token burst empties within one step at `step: 1s`; document the rule of thumb (step ≤ burst / rate) in `docs/study/numerics.md` or the schema.
+- Byte flows (CDN/blob byte capacities, `sizes`, link `bandwidth`), queues + workers, external sinks, `--sweep` (from the original 2b plan).
 
 ## Self-review
 

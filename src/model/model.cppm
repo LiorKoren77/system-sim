@@ -231,11 +231,22 @@ inline constexpr auto limiter_algorithm_table = std::to_array<core::EnumName<Lim
 //                     coordination, so replicas add capacity.
 //   ticket_server  -> Flickr's single auto-increment database: every id is a write on one SQL
 //                     machine; a single point of failure, so exactly one replica.
-//   uuid           -> 128 random bits generated locally: nothing to coordinate and nothing to
-//                     wait for, unbounded in practice.
+//   uuid           -> a 128-bit version-4 UUID, 122 of its bits random (the other 6 name the
+//                     version and the variant), generated locally: nothing to coordinate and
+//                     nothing to wait for, unbounded in practice.
 // Ignored: what the chapter weighs besides throughput (64 bits versus 128, sortable by time,
-// clock skew and NTP); multi-master replication, the chapter's fourth design, is not modelled.
+// clock skew and NTP); snowflake's 5-bit machine field, which caps a datacenter at 2^5 = 32
+// machines (replicas beyond 32 add capacity here that the id layout could not number); the
+// chapter's remedy for the ticket server's single point of failure, several ticket servers,
+// which costs keeping them in sync (the model has no such mode: replicas must be 1); and
+// multi-master replication, the chapter's fourth design.
 enum class IdAlgorithm { snowflake, ticket_server, uuid };
+
+// Why an id generator of algorithm ticket_server takes no second replica, for the loader (config's
+// read_id_generator_keys) and Graph::build (scenarios built in code) alike: one text, two checks.
+inline constexpr std::string_view ticket_server_replicas_rule =
+    "a ticket server is one auto-increment database: replicas must be 1 (ch. 7; for more ids "
+    "per second use snowflake)";
 
 // Pattern: Table-driven method — the algorithm names, read by the loader (`algorithm:` on an
 // id_generator) and printed by explain from this one table.

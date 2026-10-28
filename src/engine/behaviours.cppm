@@ -110,8 +110,9 @@ concept FractionLookup =
 // dt, finds its window from `now`, and must change itself. Requiring it on `B&` admits both;
 // `cost`, `response` and `delivered` stay const.
 // `delivered(op, own, lookup)` is the fraction of the requests of `op` sent to this node
-// that come back answered (plan 2a refinement 8): `own` is the share the node itself passes
-// on this step (the engine's served / inflow), times what its downstream calls deliver.
+// that come back answered (plan 2a refinement 8): `own` is the share the node itself does not
+// lose on this step (the engine's 1 − (dropped + rejected) / inflow), times what its downstream
+// calls deliver.
 template <class B>
 concept NodeBehaviour = requires(const B b, B& node, const flow::Flow& in, SimTime now, SimTime dt,
                                  flow::LatencyEstimate own) {
@@ -199,10 +200,11 @@ struct Branch {
 // service's parallel calls (it needs every reply). Over a SPLIT (a client's routes, a load
 // balancer's links) a request takes one branch, so the fraction is the share-weighted mean
 // Σ s_i d_i. Assumes the parts fail independently of one another, as the fluid's per-node
-// fractions do. Where the fraction comes from at each node: a service or balancer passes on
-// what its queue drains (drain / demand), a token-family limiter what it admits
-// (admitted / offered), a leaky bucket what leaks (drain / demand); engine::Simulation's
-// backward pass composes them, one step stale over a feedback hop as latency is.
+// fractions do. Where the fraction comes from at each node: what it does not lose, 1 − (dropped
+// + rejected) / inflow (engine::Simulation::account_rejections): a service or balancer loses
+// what its full queue drops, a token-family limiter what it refuses, a leaky bucket what
+// overflows; a request still waiting is not lost. engine::Simulation's backward pass composes
+// them, one step stale over a feedback hop as latency is.
 
 }  // namespace simsys::behaviours
 
@@ -734,8 +736,9 @@ class RateLimiterBehaviour {
     return total + forwarding_.response(op, downstream);
   }
 
-  // own (the admitted share: admitted / offered, or for a leaky bucket drain / demand) × the
-  // counter check's delivered fraction (a lost check answers nothing) × the routes' mixture.
+  // own (the share not refused: 1 − refused / offered, or for a leaky bucket 1 − overflow /
+  // demand) × the counter check's delivered fraction (a lost check answers nothing) × the
+  // routes' mixture.
   [[nodiscard]] double delivered(std::string_view op, double own,
                                  FractionLookup auto&& downstream) const {
     const double check = backend_ ? downstream(backend_->target, graph::counter_op) : 1.0;
