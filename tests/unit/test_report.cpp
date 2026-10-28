@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -27,13 +28,19 @@ using simsys::model::Workload;
 using simsys::report::Summary;
 
 namespace {
-Scenario mm1(double demand, double queue_limit = 1000) {
+// queue_limit is set only when given, so explain's provenance test sees "(default)".
+Scenario mm1(double demand, std::optional<double> queue_limit = std::nullopt) {
   Scenario s{.name = "mm1", .version = 1, .duration = 2s, .warmup = 500ms};
-  s.nodes = {NodeSpec{.id = "c", .type = NodeType::client,
+  s.nodes = {NodeSpec{.id = "c",
+                      .type = NodeType::client,
                       .workload = Workload{.base = Rate{demand}, .op_shares = {{"op", 1.0}}}},
-             NodeSpec{.id = "s", .type = NodeType::service, .capacity = Rate{1000}, .latency = 1ms,
+             NodeSpec{.id = "s",
+                      .type = NodeType::service,
+                      .capacity = Rate{1000},
+                      .latency = 1ms,
                       .advanced = {.queue_limit = queue_limit}}};
-  s.links = {simsys::model::LinkSpec{.from = "c", .to = "s", .dir = simsys::model::Direction::inout, .latency = 0s}};
+  s.links = {simsys::model::LinkSpec{
+      .from = "c", .to = "s", .dir = simsys::model::Direction::inout, .latency = 0s}};
   return s;
 }
 Summary summarize(const Scenario& s, const simsys::graph::Graph& g) {
@@ -44,7 +51,8 @@ Summary summarize(const Scenario& s, const simsys::graph::Graph& g) {
 }
 }  // namespace
 
-TEST_CASE("node summaries carry mean and peak utilization, peak backlog, drops and red time", "[report]") {
+TEST_CASE("node summaries carry mean and peak utilization, peak backlog, drops and red time",
+          "[report]") {
   const auto s = mm1(1500, 100);
   const auto g = *simsys::graph::Graph::build(s);
   const auto summary = summarize(s, g);
@@ -82,15 +90,22 @@ TEST_CASE("the drop rate is total dropped over total offered after warmup", "[re
   const auto s = mm1(1500, 100);
   const auto g = *simsys::graph::Graph::build(s);
   const auto summary = summarize(s, g);
-  REQUIRE(summary.drop_rate() == Approx(500.0 / 1500.0).epsilon(1e-3));  // queue full well before warmup ends
+  REQUIRE(summary.drop_rate() ==
+          Approx(500.0 / 1500.0).epsilon(1e-3));  // queue full well before warmup ends
 }
 
 TEST_CASE("SLOs pass, fail or are skipped when the metric is not available", "[report]") {
   auto s = mm1(500);
-  s.slos = {simsys::model::SloSpec{.metric = simsys::model::SloMetric::p99_latency, .node = "c", .op = "op", .max = simsys::SimTime{50ms}},
-            simsys::model::SloSpec{.metric = simsys::model::SloMetric::drop_rate, .max = 0.0},
-            simsys::model::SloSpec{.metric = simsys::model::SloMetric::utilization, .node = "s", .max = 0.3},
-            simsys::model::SloSpec{.metric = simsys::model::SloMetric::queue_lag, .node = "s", .max = simsys::SimTime{1s}}};
+  s.slos = {
+      simsys::model::SloSpec{.metric = simsys::model::SloMetric::p99_latency,
+                             .node = "c",
+                             .op = "op",
+                             .max = simsys::SimTime{50ms}},
+      simsys::model::SloSpec{.metric = simsys::model::SloMetric::drop_rate, .max = 0.0},
+      simsys::model::SloSpec{
+          .metric = simsys::model::SloMetric::utilization, .node = "s", .max = 0.3},
+      simsys::model::SloSpec{
+          .metric = simsys::model::SloMetric::queue_lag, .node = "s", .max = simsys::SimTime{1s}}};
   const auto g = *simsys::graph::Graph::build(s);
   const auto results = simsys::report::evaluate_slos(summarize(s, g), s.slos);
   using simsys::report::SloStatus;
@@ -106,7 +121,8 @@ TEST_CASE("SLOs pass, fail or are skipped when the metric is not available", "[r
 TEST_CASE("a latency SLO without an op applies to every op of the client", "[report]") {
   auto s = mm1(500);
   s.nodes[0].workload->op_shares = {{"a", 0.5}, {"b", 0.5}};
-  s.slos = {simsys::model::SloSpec{.metric = simsys::model::SloMetric::p99_latency, .node = "c", .max = simsys::SimTime{1us}}};
+  s.slos = {simsys::model::SloSpec{
+      .metric = simsys::model::SloMetric::p99_latency, .node = "c", .max = simsys::SimTime{1us}}};
   const auto g = *simsys::graph::Graph::build(s);
   const auto results = simsys::report::evaluate_slos(summarize(s, g), s.slos);
   REQUIRE(results.size() == 1);
@@ -121,7 +137,8 @@ TEST_CASE("the text table names every node and op and marks percentiles as estim
   REQUIRE(text.find("p99") != std::string::npos);
   REQUIRE(text.find("estimated") != std::string::npos);
   REQUIRE(text.find("\x1b[") == std::string::npos);
-  REQUIRE(simsys::report::render_table(summarize(s, g), {}, /*color=*/true).find("\x1b[") != std::string::npos);
+  REQUIRE(simsys::report::render_table(summarize(s, g), {}, /*color=*/true).find("\x1b[") !=
+          std::string::npos);
 }
 
 TEST_CASE("the JSON report carries the scenario name, nodes, ops and slo results", "[report]") {
@@ -129,7 +146,8 @@ TEST_CASE("the JSON report carries the scenario name, nodes, ops and slo results
   s.slos = {simsys::model::SloSpec{.metric = simsys::model::SloMetric::drop_rate, .max = 0.0}};
   const auto g = *simsys::graph::Graph::build(s);
   const auto summary = summarize(s, g);
-  const auto json = simsys::report::render_json(summary, simsys::report::evaluate_slos(summary, s.slos));
+  const auto json =
+      simsys::report::render_json(summary, simsys::report::evaluate_slos(summary, s.slos));
   REQUIRE(json.front() == '{');
   REQUIRE(json.back() == '}');
   REQUIRE(json.find("\"scenario\": \"mm1\"") != std::string::npos);

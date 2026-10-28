@@ -568,14 +568,11 @@ template <class T, class F>
 [[nodiscard]] std::string server_details(const graph::ResolvedNode& node) {
   const auto& spec = node.spec;
   const auto& cap = node.capacity;
-  // The graph keeps no provenance for queue_limit, so it is read off the spec. A scenario
-  // value equal to the default (fluid::Capacity's 1000, chosen) reads as the default: the
-  // number the engine uses is the same either way.
-  constexpr fluid::Capacity defaults_only{};
-  const bool own_queue_limit =
-      spec.advanced.queue_limit.value_or(defaults_only.queue_limit) != defaults_only.queue_limit;
+  // The graph keeps no provenance for queue_limit, so it is read off the spec: provenance
+  // is about presence, not value. A scenario that writes the default (fluid::Capacity's
+  // 1000) still wrote it, and explain says so.
   const auto queue_source =
-      own_queue_limit ? defaults::Source::scenario : defaults::Source::type_default;
+      spec.advanced.queue_limit ? defaults::Source::scenario : defaults::Source::type_default;
   // c is derived by Little's law unless the scenario sets it (defaults::implied_concurrency).
   const std::string_view concurrency_source =
       spec.advanced.concurrency ? "(scenario)" : "(implied)";
