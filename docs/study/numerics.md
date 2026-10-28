@@ -150,6 +150,88 @@ The invariant at `fluid.cppm:33-40` is a modelling one: `service_rate`, `concurr
 `service_time_s` describe one machine only if rate = concurrency / time. The drain uses the
 rate and the Erlang term uses the other two, so a mismatch makes them two machines.
 
+### Choosing the step
+
+The step is the one knob that is not a property of the system but of the model, so it
+needs a rule. Two things in the tree set it: a token bucket and a queue.
+
+**A token bucket's burst.** The bucket (`admit_token_bucket`,
+`src/engine/behaviours.cppm:1455-1458`; the formula block is at lines 662-667) holds up to
+`B` tokens (`burst`) and refills at the limit `L`. Under an offered rate `λ` above `L` it
+loses tokens at `λ - L` per second, so it empties in
+
+    t_empty = B / (λ - L)        (B tokens, λ and L in requests per second)
+
+A step of `dt` does this in one move: `admitted = min(λ, L + tokens/dt)`, so a full bucket
+lets `L + B/dt` per second through in the first step and exactly `L` after. If
+`dt > t_empty` the whole burst passes inside the first step and the step reports its
+average: the bucket's shape (a short fast stretch, then the limit) is gone. The
+url-shortener's limiter (`scenarios/book/url-shortener/scenario.yaml:31-32`: `limit: 20k/s`,
+`burst: 2000`, `step: 1s` at line 13) empties its bucket in under a second under any flood
+more than 2,000 requests per second above the limit, so at that step it cannot show the
+burst at all. The shipped scenario never floods it (the peak is 19.2k/s), which is why the
+choice costs nothing there.
+
+**The rule.** Take the highest offered rate the scenario reaches, `λ_peak`, and set
+
+    step <= B / (λ_peak - L)                      for a bucket
+    step <= (shortest spike) / 10                 for a queue
+
+The first is the line above. The second is a rule of thumb, not a derivation: a spike
+shorter than the step is smeared or missed (section 6, above), and ten steps across it
+resolve its height and length to about a tenth.
+
+**What the step does not lose.** The fluid step is exact for demand that is constant inside
+it (the `FluidQueue::advance` comment, `src/fluid/fluid.cppm:149-167`), and the bucket's
+total over a step is too: `L·dt + B` tokens pass whether the bucket empties at the start of
+the step or at its end. So a coarse step does not miscount the burst. It loses only what is
+shorter than the step: where in the step the burst fell, and anything the offered rate does
+inside it. A client samples its rate once, at the start of the step
+(`ClientBehaviour::rate`, `src/engine/behaviours.cppm:1339-1340`), so a spike that does not
+fill whole steps is rounded to whole steps.
+
+**Measured on the rate-limiter lab** (`scenarios/labs/rate-limiter/scenario.yaml`: `limit: 1k/s`
+and `burst: 100` at lines 32-33; the api behind it has `replicas: 2` and `capacity: 600/s`,
+so 1,200/s). The spikes are 5x of 800/s = 4,000/s, 2x = 1,600/s and 20x = 16,000/s:
+
+| spike | `λ` | `B / (λ - L)` |
+|---|---|---|
+| 5x, 30 s | 4,000/s | 33 ms |
+| 2x, 2 min | 1,600/s | 167 ms |
+| 20x, 5 s | 16,000/s | 6.7 ms |
+
+`λ_peak` is 16,000/s, so the rule asks for `step <= 6.7 ms`. The shipped `100ms` is above
+it (and above the 5x spike's 33 ms): the lab already runs in the coarse regime, which is why
+the api's `peak_backlog` below is 80 at 100 ms and 98 at 5 ms. The first step of a spike
+sends the api `L + B/dt` per second: at 100 ms that is 2,000/s against 1,200/s, a backlog
+of (2000 - 1200) × 0.1 = 80, which is the number the run prints. At 500 ms it is 1,200/s
+and the backlog is 0; at 1 s it is 1,100/s, under the api's capacity, and the backlog is 0 too.
+
+    $ build/gcc14-release/simsys run scenarios/labs/rate-limiter/scenario.yaml      # step: 100ms
+    $ sed 's/^step: 100ms/step: 5ms/' scenarios/labs/rate-limiter/scenario.yaml > /tmp/rl-5ms.yaml
+    $ sed 's/^step: 100ms/step: 1s/'  scenarios/labs/rate-limiter/scenario.yaml > /tmp/rl-1s.yaml
+    $ build/gcc14-release/simsys run /tmp/rl-5ms.yaml     # and /tmp/rl-1s.yaml
+
+The summary lines that differ (the `scenario` line and the `limiter` row are identical in
+all three runs: `reject rate 14.3%`, `rejected 236.7k`; `red_s`, which adds a whole `dt`
+per red step, is left out):
+
+    step     node  peak_rho  peak_backlog   op            mean    p50     p95    p99
+    5ms      api          1            98   clients.call  5.79ms  3.93ms  16.7ms 30.5ms
+    100ms    api          1            80   clients.call  5.79ms  3.93ms  16.7ms 30.5ms
+    1s       api     0.9167             0   clients.call  5.69ms  4.69ms  13ms   19.9ms
+
+The limiter admits the same total at every step, as the paragraph above says. What a coarse
+step erases is the burst's effect downstream: at 1 s the api sees 1,100/s, never overloads,
+and the p99 falls from 30.5 ms to 19.9 ms. A step shorter than the 5 s spike but not a
+divisor of it shows the other loss. At `step: 2s` the 5 s spike at 25 min is sampled at
+t = 25:00, 25:02 and 25:04, so it is offered for 6 s: the limiter then prints
+`reject rate 15%` and `rejected 251.7k`, 15,000 more, which is the 1 s of extra spike times
+its excess over the limit (16,000 - 1,000 = 15,000/s). With the queue rule the step would be
+at most 0.5 s for that spike, and at `500ms` the run gives back 236.7k.
+
+(Numbers from a Release build of this tree; the run is deterministic, `seed: 1`.)
+
 ## 7. Try it
 
 1. **Weaken the Che bisection.** In `characteristic_time` change `step < 80`
@@ -168,3 +250,11 @@ rate and the Erlang term uses the other two, so a mismatch makes them two machin
    ten seconds or missed, and the drop count and the p99 move. Conservation is not what
    breaks: in `tests/unit/test_fluid.cpp:140` widen `dts` to include `10s` and the
    residual check still passes (section 6). What coarse steps lose is fidelity, not balance.
+4. **Find the step where the burst disappears.** Run the rate-limiter lab at `step: 5ms`,
+   `100ms`, `500ms` and `1s` (the commands are in "Choosing the step", section 6) and watch
+   the api row's `peak_backlog` (98, 80, 0, 0) and the p99 (30.5 ms until the step reaches
+   1 s, then 19.9 ms). Then set the limiter's `burst: 1000`, which moves the ceiling to
+   1000 / 15000 = 67 ms. The burst now overfills the api's queue at every step, so the step
+   hardly matters: the api's `dropped` is 1.385k at 5 ms, 1.36k at 100 ms and 1.2k at
+   500 ms. Why? (The api's waiting room, `queue_limit`, caps the backlog the same way at
+   every step.)
