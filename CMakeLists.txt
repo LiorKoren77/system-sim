@@ -22,7 +22,10 @@ target_compile_options(simsys_warnings INTERFACE -Wall -Wextra -Wpedantic -Wconv
 add_library(simsys)
 target_sources(simsys
   PUBLIC FILE_SET CXX_MODULES FILES     # FILE_SET CXX_MODULES is how CMake 3.28 declares module interface units
-    src/core/core.cppm)
+    src/core/core.cppm
+    src/config/config.cppm
+  PRIVATE                               # module implementation units are ordinary sources
+    src/config/config.cpp)
 target_link_libraries(simsys PUBLIC yaml-cpp::yaml-cpp PRIVATE simsys_warnings)
 
 # --- executable --------------------------------------------------------------
