@@ -558,3 +558,40 @@ links: []
   REQUIRE(s.has_value());
   REQUIRE(s->nodes.size() == 2);
 }
+
+TEST_CASE("a document whose root is not a map is rejected with the loader's own message") {
+  SECTION("a bare scalar") {
+    require_rejected("simsys_root_scalar.yaml", "hello", "scenario must be a map");
+  }
+  SECTION("a list") {
+    require_rejected("simsys_root_list.yaml", "- a\n- b", "scenario must be a map");
+  }
+  SECTION("an empty file still reports the first missing key") {
+    require_rejected("simsys_root_empty.yaml", "", "missing top-level key 'version'");
+  }
+}
+
+TEST_CASE("name must be a scalar") {
+  SECTION("a list") {
+    require_rejected("simsys_name_list.yaml", R"(
+version: 1
+name: [x]
+duration: 1m
+nodes:
+  api: {type: service, capacity: 1k/s}
+links: []
+)",
+                     "name must be a scalar");
+  }
+  SECTION("a map") {
+    require_rejected("simsys_name_map.yaml", R"(
+version: 1
+name: {a: 1}
+duration: 1m
+nodes:
+  api: {type: service, capacity: 1k/s}
+links: []
+)",
+                     "name must be a scalar");
+  }
+}
