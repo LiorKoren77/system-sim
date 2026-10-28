@@ -1602,6 +1602,110 @@ TEST_CASE("a blob store's response is its own sojourn and asks nobody downstream
                WithinRel(0.9, 1e-12));
 }
 
+// ---- A blob store's then steps are asynchronous event notifications (plan 2c refinements 6-7)
+// ----
+//
+// S3 event notifications (book ch. 14: "transcoding starts when the upload completes"): every
+// request the store serves fires its `then` steps, and nobody waits for them. So the store
+// forwards what it serves (times `factor`), its response is its own sojourn, and its delivered
+// share is its own; losses at the notified nodes are those nodes' drops, not the uploader's.
+
+namespace {
+// u (uploads of 50 MB, reads of 1 MB) -> store (a default blob store whose `then` is `then`) ->
+// {svc, audit}, over zero-latency links. Node indices: u 0, store 1, svc 2, audit 3.
+Scenario notifying_store(std::vector<Step> then) {
+  Scenario s{.name = "blob-events", .version = 1, .duration = 1min};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{100}},
+                                           .op_shares = {{"read", 0.5}, {"upload", 0.5}},
+                                           .sizes = {{"upload", simsys::Bytes{50e6}},
+                                                     {"read", simsys::Bytes{1e6}}}}},
+             NodeSpec{.id = "store", .type = NodeType::blob_store, .then = std::move(then)},
+             NodeSpec{.id = "svc", .type = NodeType::service},
+             NodeSpec{.id = "audit", .type = NodeType::service}};
+  s.links = {LinkSpec{.from = "u", .to = "store", .latency = 0s},
+             LinkSpec{.from = "store", .to = "svc", .latency = 0s},
+             LinkSpec{.from = "store", .to = "audit", .latency = 0s}};
+  return s;
+}
+}  // namespace
+
+// 2 uploads/s served, 2 notify/s sent: one notification per request, under the step's op name.
+// The store still serves its own requests (`served` is the whole input).
+TEST_CASE("a blob store forwards one notification per request it serves", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(notifying_store({Step{.to = "svc", .op = "notify"}}));
+  const BlobStoreBehaviour store{g, *g.index_of("store")};
+  const auto routed = store.route(flow_of("upload", 2), 0s, 100ms);
+  REQUIRE(routed.outgoing.size() == 1);
+  REQUIRE(routed.outgoing[0].target == *g.index_of("svc"));
+  REQUIRE_THAT(routed.outgoing[0].flow.rate_of("notify").per_second, WithinRel(2.0, 1e-12));
+  REQUIRE_THAT(routed.outgoing[0].flow.total().per_second, WithinRel(2.0, 1e-12));
+  REQUIRE_THAT(routed.served.rate_of("upload").per_second, WithinRel(2.0, 1e-12));
+  REQUIRE(routed.rejected.empty());
+}
+
+// `factor` multiplies: 2 uploads/s with factor 4 send 8 notify/s.
+TEST_CASE("a blob store's notification factor multiplies what it forwards", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(
+      notifying_store({Step{.to = "svc", .op = "notify", .factor = 4.0}}));
+  const BlobStoreBehaviour store{g, *g.index_of("store")};
+  const auto routed = store.route(flow_of("upload", 2), 0s, 100ms);
+  REQUIRE_THAT(sent_to(routed, *g.index_of("svc")).rate_of("notify").per_second,
+               WithinRel(8.0, 1e-12));
+  REQUIRE_THAT(routed.served.rate_of("upload").per_second, WithinRel(2.0, 1e-12));
+}
+
+// Every op the store serves fires every step: 3 reads/s and 2 uploads/s are 5 requests/s, so
+// svc is sent 5 x 4 = 20 notify/s and audit 5 log/s, each step under its own op name.
+TEST_CASE("a blob store's steps fire for every op it serves, reads included", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(notifying_store(
+      {Step{.to = "svc", .op = "notify", .factor = 4.0}, Step{.to = "audit", .op = "log"}}));
+  const BlobStoreBehaviour store{g, *g.index_of("store")};
+  Flow in;
+  in.add("read", Rate{3});
+  in.add("upload", Rate{2});
+  const auto routed = store.route(in, 0s, 100ms);
+  REQUIRE(routed.outgoing.size() == 2);
+  const auto to_svc = sent_to(routed, *g.index_of("svc"));
+  REQUIRE_THAT(to_svc.rate_of("notify").per_second, WithinRel(20.0, 1e-12));
+  REQUIRE_THAT(to_svc.total().per_second, WithinRel(20.0, 1e-12));
+  const auto to_audit = sent_to(routed, *g.index_of("audit"));
+  REQUIRE_THAT(to_audit.rate_of("log").per_second, WithinRel(5.0, 1e-12));
+  REQUIRE_THAT(to_audit.total().per_second, WithinRel(5.0, 1e-12));
+}
+
+// The notified node's sojourn and failures are not the uploader's: the response is the store's own
+// (nobody downstream is asked) and the delivered share is the store's own, whatever the targets
+// deliver (mirroring the write_back cache's flush).
+TEST_CASE("a blob store's response and delivered share ignore the notified nodes", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(notifying_store({Step{.to = "svc", .op = "notify"}}));
+  const BlobStoreBehaviour store{g, *g.index_of("store")};
+  const LatencyEstimate own{0.040015, 2e-7};
+  bool asked = false;
+  const auto r = store.response("upload", own, [&](std::size_t, std::string_view) {
+    asked = true;
+    return LatencyEstimate{99.0, 99.0};
+  });
+  REQUIRE(r == own);
+  REQUIRE_FALSE(asked);
+  bool asked_for_delivery = false;
+  const double delivered = store.delivered("upload", 0.9, [&](std::size_t, std::string_view) {
+    asked_for_delivery = true;
+    return 0.0;
+  });
+  REQUIRE_THAT(delivered, WithinRel(0.9, 1e-12));
+  REQUIRE_FALSE(asked_for_delivery);
+}
+
+// No request served, no notification: an idle store sends nothing.
+TEST_CASE("a blob store with no requests sends no notifications", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(notifying_store({Step{.to = "svc", .op = "notify"}}));
+  const BlobStoreBehaviour store{g, *g.index_of("store")};
+  const auto routed = store.route(Flow{}, 0s, 100ms);
+  REQUIRE(sent_to(routed, *g.index_of("svc")).total().per_second == 0.0);
+}
+
 TEST_CASE("a byte-sized cdn charges a request its size in megabytes", "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(stream_cdn_front(simsys::ByteRate{100e9}));
   const CdnBehaviour cdn{g, *g.index_of("cdn")};
