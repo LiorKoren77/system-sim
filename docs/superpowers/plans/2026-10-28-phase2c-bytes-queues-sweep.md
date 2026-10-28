@@ -232,6 +232,16 @@ Schema v1.4, spec §19, study notes, README. Commit `docs: schema v1.4, spec §1
 - [ ] An adversarial reviewer (fresh context, own worktree, both presets) checks: warning-free Debug and Release builds and the whole suite; clang-format as CI runs it; conservation from `--series` on every runnable scenario, link rows included; answered ≤ offered everywhere; `estimate` = `run` on steady probes through queues, pools, pipes, sinks and kv clusters; every README number of the four newly runnable scenarios and of url-shortener; `sweep` byte-identical across `--jobs`; first-use comments (CLAUDE.md §1) for every new C++20/23 construct; `Pattern:` labels where a named pattern is used (Strategy for the new variant alternatives, Delegation where a behaviour reuses another); test names free of `[`/`]` and named after properties; no function over ~50 lines added; the four GCC workarounds in place.
 - [ ] Fix round recorded here as "Comprehensive 2c review at <sha>" with each finding and its resolution; commit; push to `origin/main`.
 
+## After 2c: whole-of-phase-2 review, then phase 3
+
+User instruction (2026-10-28): "when you are done with phase 2 do another comprehensive code review.
+after that continue with phase 3 the same way (test driven development, small tasks, clean code, study
+notes etc.)". So after the 2c review and push above: one more comprehensive review of phase 2 as a whole
+(2a + 2b + 2c: cross-cutting clean code, module boundaries, every study note up to date, the eight book
+scenarios' READMEs against the binary), a fix round, push, CI; then the phase 3 plan (faults, kv_cluster
+partitions, ws_gateway, notification_fanout, frontier, request/reply over queues, the backlog below) and
+its execution with the same loop.
+
 ## Phase 3 backlog (left out of 2c)
 
 - **Types:** `ws_gateway` (connections as a level, session fan-out: chat-system, google-drive), `service_discovery` (lookup latency, failover: chat-system), `notification_fanout` (channels, dedup, retries with a dead-letter queue: notification-system), `frontier` and an external sink's `politeness` (per-host state: web-crawler).
