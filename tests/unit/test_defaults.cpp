@@ -148,13 +148,46 @@ TEST_CASE("a cross-datacenter link defaults to half the cross-DC round trip, fro
   REQUIRE(x.source == Source::dc_default);
 }
 
-TEST_CASE("a byte capacity resolves to objects per second and counts as a scenario value",
+// Plan 2c refinement 2: a byte-sized node's capacity unit is one megabyte (defaults::byte_unit),
+// so a stated byte rate is that many MB per second whatever the type, and it is still the
+// scenario's own number: 200 MB/s = 200e6 B/s / 1e6 B per unit = 200 units/s.
+TEST_CASE("a byte capacity resolves to megabytes per second and counts as a scenario value",
           "[defaults]") {
   NodeSpec n{.id = "blobs", .type = NodeType::blob_store};
   n.byte_capacity = simsys::ByteRate{200e6};
   const auto r = simsys::defaults::resolve_service_rate(n);
   REQUIRE(r.source == Source::scenario);
-  REQUIRE(r.value.per_second == Approx(200e6 / simsys::defaults::blob_object_bytes));
+  REQUIRE(r.value.per_second == Approx(200.0));
+}
+
+// Spec section 6: "blob 500 MB/s" is 500 units/s of 1 MB, and its per-MB service time is the
+// disk read (30 ms) plus the network transfer (10 ms) of the book's latency table: 40 ms per MB.
+// Little's law (c = units/s x s) then gives c = 500 x 0.04 = 20 transfers in flight at once.
+TEST_CASE("a blob store's default capacity is 500 MB per second at 40 ms per MB", "[defaults]") {
+  const NodeSpec store{.id = "store", .type = NodeType::blob_store};
+  REQUIRE(simsys::defaults::resolve_service_rate(store).value.per_second == Approx(500.0));
+  REQUIRE(simsys::defaults::resolve_service_rate(store).source == Source::type_default);
+  REQUIRE(simsys::defaults::resolve_service_time(store).value == 40ms);
+  REQUIRE(simsys::defaults::resolve_capacity(store).concurrency == 20);
+}
+
+// A stated 5GB/s on a blob store (youtube's original_store) is 5000 MB/s at the same 40 ms per
+// MB: c = 5000 x 0.04 = 200. A stated 100GB/s on a CDN is 100k MB/s at the CDN's 10 ms per MB
+// (book: "read 1 MB sequentially from the network"): c = 100000 x 0.01 = 1000.
+TEST_CASE("a stated byte capacity keeps the type's per-megabyte service time", "[defaults]") {
+  NodeSpec store{.id = "original_store", .type = NodeType::blob_store};
+  store.byte_capacity = simsys::ByteRate{5e9};
+  const auto stored = simsys::defaults::resolve_capacity(store);
+  REQUIRE(stored.service_rate.per_second == Approx(5000.0));
+  REQUIRE(stored.service_time_s == Approx(0.040));
+  REQUIRE(stored.concurrency == 200);
+
+  NodeSpec cdn{.id = "cdn_us", .type = NodeType::cdn};
+  cdn.byte_capacity = simsys::ByteRate{100e9};
+  const auto edge = simsys::defaults::resolve_capacity(cdn);
+  REQUIRE(edge.service_rate.per_second == Approx(100'000.0));
+  REQUIRE(edge.service_time_s == Approx(0.010));
+  REQUIRE(edge.concurrency == 1000);
 }
 
 // Plan 2c refinement 2: a node is byte-sized when its capacity is a byte rate, and then counts

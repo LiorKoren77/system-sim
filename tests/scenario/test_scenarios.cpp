@@ -282,6 +282,25 @@ double peak_offered_per_s(const std::string& explain_text, const std::string& id
   if (suffix == 'M') value *= 1e6;
   return value;
 }
+
+// The request rate in parentheses on the check line of a byte-sized node (plan 2c refinement 2):
+// "  media_store  peak offered 64.86 MB/s (324.3/s) vs 1k MB/s ...", where the number before the
+// parentheses is megabytes per second. Same k/M suffixes as peak_offered_per_s.
+double peak_offered_requests_per_s(const std::string& explain_text, const std::string& id) {
+  const auto checks = explain_text.find("checks (");
+  REQUIRE(checks != std::string::npos);
+  const auto line = explain_text.find("\n  " + id + " ", checks);
+  REQUIRE(line != std::string::npos);
+  const auto key = explain_text.find("MB/s (", explain_text.find("peak offered ", line));
+  REQUIRE(key != std::string::npos);  // a byte-sized node's line: "<n> MB/s (<requests>/s)"
+  const auto open = key + 5;
+  std::size_t used = 0;
+  double value = std::stod(explain_text.substr(open + 1), &used);
+  const char suffix = explain_text[open + 1 + used];
+  if (suffix == 'k') value *= 1e3;
+  if (suffix == 'M') value *= 1e6;
+  return value;
+}
 }  // namespace
 
 // Ch. 11's news feed serves media through a CDN with a fixed hit ratio of 0.95 in front of the
@@ -297,22 +316,25 @@ TEST_CASE("book/news-feed's media store is checked against the cdn's 5 percent m
   const auto text = simsys::report::render_explain(*g);
   CAPTURE(text);
   const double at_cdn = peak_offered_per_s(text, "cdn");
-  const double at_origin = peak_offered_per_s(text, "media_store");
+  // media_store counts megabytes, so its line leads with MB/s and gives the request rate in
+  // parentheses: the misses, 5 % of the cdn's reads.
+  const double at_origin = peak_offered_requests_per_s(text, "media_store");
   REQUIRE(at_cdn > 0.0);
   // explain prints four significant digits ("6.486k/s"), so the ratio holds to 1e-3.
   REQUIRE_THAT(at_origin, Catch::Matchers::WithinRel(0.05 * at_cdn, 1e-3));
 }
 
 // Ch. 14's YouTube sizes its two CDNs in bytes (`capacity: 100GB/s`, `50GB/s`) and gives them a
-// che hit ratio: valid scenario, explained, but not runnable before phase 2c's byte flows.
-// The engine's FIRST refusal is the node types it does not simulate at all (blob_store, queues
-// and workers: "... (phase 2)"), which comes before the cdn's own byte-capacity refusal
-// (see the theory test for that message), so only "phase 2" is asserted about the run. What
-// the cdn changed is pinned through explain instead (review of 4d539b0, M12): the two edges'
+// che hit ratio: valid scenario, explained, and its byte-sized nodes run (plan 2c Task 3), but
+// the engine still refuses it at its first queue, transcode_q: the queues and workers are
+// Tasks 6 and 7. The first refusal is the first node in the YAML whose type the engine does not
+// simulate (original_store, a blob store, is simulated now, though its `then` is Task 4's). What
+// the cdn changed is pinned through explain (review of 4d539b0, M12): the two edges'
 // Che hit ratios (Zipf 1 over 10M videos, 100k and 50k of them at the edge: 0.642 and 0.594,
 // checked against an independent Python computation by the reviewer) and the miss flow they
 // send transcoded_store, which an explain that ignored the origin edge would leave at zero.
-TEST_CASE("book/youtube validates and explains, and the engine does not run it yet", "[scenario]") {
+TEST_CASE("book/youtube validates and explains, and the engine refuses it at transcode_q",
+          "[scenario]") {
   const auto s =
       simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml");
   if (!s) FAIL(s.error().file << ":" << s.error().line << ": " << s.error().message);
@@ -332,12 +354,32 @@ TEST_CASE("book/youtube validates and explains, and the engine does not run it y
   CAPTURE(text);
   // The edges' misses at the evening peak, (1 − h_us) × 281.6/s + (1 − h_eu) × 140.8/s (each
   // client's base × 1.6 × 88 % streams) = 157.8/s; the transcoders' writes add nothing on paper
-  // yet (a worker pool's load is phase 2c's).
-  REQUIRE_THAT(peak_offered_per_s(text, "transcoded_store"),
+  // yet (a worker pool's load is phase 2c's). The store counts megabytes, so its line leads with
+  // MB/s (157.8/s × 50 MB = 7.89k MB/s) and gives the requests in parentheses.
+  REQUIRE_THAT(peak_offered_requests_per_s(text, "transcoded_store"),
                Catch::Matchers::WithinRel(157.8, 1e-3));
+  REQUIRE_THAT(peak_offered_per_s(text, "transcoded_store"),
+               Catch::Matchers::WithinRel(7890.0, 1e-3));
   const auto sim = simsys::engine::Simulation::create(*g);
   REQUIRE_FALSE(sim.has_value());
-  REQUIRE(sim.error().message.find("phase 2") != std::string::npos);
+  // viewers_us, viewers_eu, cdn_us, cdn_eu, lb, api, metadata_cache, metadata_db, original_store
+  // are all simulated; transcode_q, the next node in the file, is a message queue.
+  REQUIRE(sim.error().message ==
+          "node 'transcode_q' has type 'message_queue', which run/estimate do not support yet "
+          "(phase 2)");
+}
+
+// Ch. 11's news feed gets as far as its fan-out queue: the cdn and the media store (a blob store
+// counting megabytes) are simulated now, so the first node the engine cannot run is fanout_q, a
+// message queue (the second node of the media path used to be the one refused).
+TEST_CASE("book/news-feed is refused at fanout_q, no longer at media_store", "[scenario]") {
+  const auto g = build_or_fail(
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml"));
+  const auto sim = simsys::engine::Simulation::create(g);
+  REQUIRE_FALSE(sim.has_value());
+  REQUIRE(sim.error().message ==
+          "node 'fanout_q' has type 'message_queue', which run/estimate do not support yet "
+          "(phase 2)");
 }
 
 namespace {
@@ -349,27 +391,57 @@ std::string check_line_of(const std::string& explain_text, const std::string& id
 }
 }  // namespace
 
-// Every byte capacity in the two book scenarios becomes requests at an assumed 1 MB per object,
-// where youtube's streams are 50 MB and news-feed's media 200 KB: a green percentage there would
-// be a verdict on an invented number (cdn_us 0.28 % where the bytes give about 14 %). So explain
-// gives those checks no zone and says why (review of 4d539b0, I1). The READMEs say the same.
-TEST_CASE("book scenarios give no verdict on capacities converted from bytes", "[scenario]") {
-  const std::vector<std::pair<std::string, std::vector<std::string>>> byte_sized{
-      {"/book/youtube/scenario.yaml", {"cdn_us", "cdn_eu", "original_store", "transcoded_store"}},
-      {"/book/news-feed/scenario.yaml", {"media_store"}}};
-  for (const auto& [file, ids] : byte_sized) {
-    const auto s = simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + file);
-    if (!s) FAIL(s.error().file << ":" << s.error().line << ": " << s.error().message);
-    const auto g = simsys::graph::Graph::build(*s);
-    if (!g) FAIL(g.error().message);
-    const auto text = simsys::report::render_explain(*g);
-    for (const auto& id : ids) {
-      const auto line = check_line_of(text, id);
-      CAPTURE(file, line);
-      REQUIRE(line.contains("(not checked: capacity from "));
-      REQUIRE(line.contains("at 1MB/object; byte flows: phase 2c)"));
-      REQUIRE_FALSE(line.contains("green"));
-    }
+// Plan 2c refinement 2: byte-sized nodes count megabytes, so the capacities the 2b scenarios gave
+// no verdict (converted from bytes at an assumed 1 MB per object: cdn_us 0.28 % where the bytes
+// give about 14 %) are checked in MB/s, with the numbers the books' sizes give: youtube's 50 MB
+// streams and 300 MB uploads at the 21:00 peak (the load the che hit ratios leave at each store),
+// news-feed's 200 KB media. The lines read "peak offered <MB/s> (<requests/s>) vs <capacity>".
+TEST_CASE("byte-sized capacities are checked in MB per second", "[scenario]") {
+  const auto youtube = build_or_fail(
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml"));
+  const auto youtube_text = simsys::report::render_explain(youtube);
+  CAPTURE(youtube_text);
+  // cdn_us: 281.6 streams/s x 50 MB = 14.08k MB/s of 100GB/s = 100k MB/s: 14.08 %.
+  const auto us = check_line_of(youtube_text, "cdn_us");
+  REQUIRE(us.contains("peak offered 14.08k MB/s (281.6/s) vs 100k MB/s"));
+  REQUIRE(us.contains("(14.1%, green)"));
+  // cdn_eu: 140.8 streams/s x 50 MB = 7.04k MB/s of 50GB/s = 50k MB/s: 14.08 %.
+  const auto eu = check_line_of(youtube_text, "cdn_eu");
+  REQUIRE(eu.contains("peak offered 7.04k MB/s (140.8/s) vs 50k MB/s"));
+  REQUIRE(eu.contains("(14.1%, green)"));
+  // original_store: 9.6 uploads/s x 300 MB = 2.88k MB/s of 5GB/s = 5k MB/s: 57.6 %.
+  const auto original = check_line_of(youtube_text, "original_store");
+  REQUIRE(original.contains("peak offered 2.88k MB/s"));
+  REQUIRE(original.contains("vs 5k MB/s"));
+  REQUIRE(original.contains("(57.6%, green)"));
+  // transcoded_store: only the cdns' misses reach it on paper, 157.8 streams/s x 50 MB = 7.89k
+  // MB/s of 10GB/s = 10k MB/s: at least 78.9 %, a lower bound (the transcoders' writes come
+  // through queues the paper load does not follow yet).
+  const auto transcoded = check_line_of(youtube_text, "transcoded_store");
+  REQUIRE(transcoded.contains("peak offered 7.89k MB/s (157.8/s) vs 10k MB/s"));
+  REQUIRE(transcoded.contains("(≥78.9%; load not propagated:"));
+
+  const auto news = build_or_fail(
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml"));
+  const auto news_text = simsys::report::render_explain(news);
+  CAPTURE(news_text);
+  // media_store: the cdn's 5 % misses, 324.3 reads/s x 200 KB = 64.86 MB/s of 1GB/s = 1k MB/s.
+  REQUIRE(check_line_of(news_text, "media_store")
+              .contains("peak offered 64.86 MB/s (324.3/s) vs 1k MB/s total capacity  "
+                        "(6.49%, green)"));
+}
+
+// The 2b "not checked" note for capacities converted from bytes is gone from every shipped
+// scenario, and so is the object-size assumption it rested on. (A kv_cluster's capacity still has
+// its own "not checked" note until the ring is modelled, plan 2c Task 10: that one is a different
+// reason and stays.)
+TEST_CASE("no shipped scenario's explain says a byte capacity is not checked", "[scenario]") {
+  for (const auto& file : scenario_files()) {
+    CAPTURE(file);
+    const auto text = simsys::report::render_explain(build_or_fail(load_or_fail(file)));
+    REQUIRE_FALSE(text.contains("not checked: capacity from"));
+    REQUIRE_FALSE(text.contains("at 1MB/object"));
+    REQUIRE_FALSE(text.contains("byte flows: phase 2c"));
   }
 }
 

@@ -1617,25 +1617,6 @@ TEST_CASE("a cdn without a hit ratio runs and passes every read on to its origin
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(cdn + (2 * 0.010 + origin), 1e-9));
 }
 
-// A CDN sized in bytes per second needs the byte flows of phase 2c (what each request weighs, a
-// link's bandwidth). Until then the graph builds it (explain shows it) and the engine refuses it,
-// as it refuses a cache without a hit ratio. The node is called cdn_us as in book/youtube.
-TEST_CASE("a cdn with a byte capacity builds but the engine refuses to run it until phase 2c",
-          "[theory]") {
-  auto s = cdn_origin_chain(1000, 0.95);
-  s.nodes[1].id = "cdn_us";
-  s.nodes[1].byte_capacity = simsys::ByteRate{100e9};
-  s.links = {LinkSpec{.from = "u", .to = "cdn_us", .latency = 0s},
-             LinkSpec{.from = "cdn_us", .to = "origin", .latency = 10ms}};
-  const auto g = Graph::build(std::move(s));
-  INFO((g ? "" : g.error().message));
-  REQUIRE(g.has_value());
-  const auto sim = Simulation::create(*g);
-  REQUIRE_FALSE(sim.has_value());
-  REQUIRE(sim.error().message ==
-          "node 'cdn_us': a cdn with a byte capacity needs byte flows (phase 2c)");
-}
-
 // A `che` CDN without a `keys` size has no number for h: explain shows the paper load as an upper
 // bound (every read a miss), but a run would silently replace the Che approximation the scenario
 // asked for by h = 0, so the engine refuses it and says what is missing.
@@ -1649,6 +1630,220 @@ TEST_CASE("a che cdn without a keys size builds but the engine refuses to run it
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
           "node 'cdn': hit_ratio che needs keys (the cdn's size in objects)");
+}
+
+// ---- Byte-sized nodes count megabytes (plan 2c refinement 2, Task 3) ----
+//
+// Spec section 6: a blob store does 500 MB/s and a CDN's per-MB transfer takes 10 ms; the book's
+// latency table gives a megabyte 30 ms from disk and 10 ms over the network. A node whose
+// capacity is a byte rate therefore counts MEGABYTES: capacity = bytes/s / 1e6 units/s, a request
+// of op o costs request_bytes(o) / 1e6 units, and its service time is the time of ONE megabyte
+// (time to first byte): the implied concurrency is Little's law again, c = units/s x s. A
+// request's sojourn is its wait plus that one unit's time, as a SQL write that costs 5 units uses
+// more capacity but does not last five service times.
+
+namespace {
+// u (`rate`/s of `op`, each `size` long) -> store, a zero-latency link, so the client's response
+// is the store's sojourn alone. Node indices: u 0, store 1. The store is a blob store with its
+// type's defaults (spec section 6: 500 MB/s, 40 ms per MB) unless one is passed.
+Scenario blob_store_chain(const std::string& op, double rate, simsys::Bytes size,
+                          NodeSpec store = NodeSpec{.id = "store", .type = NodeType::blob_store}) {
+  Scenario s{.name = "blob-chain", .version = 1, .duration = 10s};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{rate}},
+                                           .op_shares = {{op, 1.0}},
+                                           .sizes = {{op, size}}}},
+             std::move(store)};
+  s.links = {LinkSpec{.from = "u", .to = "store", .latency = 0s}};
+  return s;
+}
+
+// The first step of a fresh simulation of `g`, failing the test with the engine's message when it
+// refuses the scenario (instead of dereferencing the refusal).
+simsys::engine::StepRecord first_step(const Graph& g) {
+  auto sim = Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  return sim->step(0s, 100ms);
+}
+}  // namespace
+
+// 5 uploads/s of 50 MB into a default blob store:
+//   demand   = 5/s x 50 MB = 250 units/s of 1 MB, against 500 units/s: rho = 250 / 500 = 0.5;
+//   c        = 500 units/s x 40 ms per MB = 20 (Little's law);
+//   Erlang C(20, 0.5) = 0.003731 (queueing::erlang_c), so the wait is
+//   Wq       = C x s / (c (1 - rho)) = 0.003731 x 40 ms / (20 x 0.5) = 0.0149 ms
+//   sojourn  = Wq + 1 MB's 40 ms = 40.0149 ms (time to first byte; the other 49 MB are not timed).
+// The request costs 50 units but lasts one unit's time: a cost is capacity, not duration.
+TEST_CASE("a default blob store fed 5 uploads of 50 MB per second runs at rho 0.5 with c 20",
+          "[theory]") {
+  const auto g = *Graph::build(blob_store_chain("upload", 5, simsys::Bytes{50e6}));
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const auto r = first_step(g);
+  const auto& store = r.nodes[*g.index_of("store")];
+  REQUIRE_THAT(store.demand_per_s, WithinRel(250.0, 1e-12));  // units (MB) per second
+  REQUIRE_THAT(store.rho, WithinRel(0.5, 1e-12));
+  REQUIRE(store.dropped_per_s == 0.0);
+  const auto wait = simsys::queueing::mmc_wait(20, 0.5, 0.040).mean_s;
+  REQUIRE_THAT(wait, WithinAbs(1.4925e-5, 1e-9));  // the napkin number: 0.0149 ms
+  REQUIRE_THAT(store.latency.mean_s, WithinRel(wait + 0.040, 1e-9));
+  REQUIRE_THAT(store.latency.mean_s, WithinAbs(0.040015, 1e-7));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(wait + 0.040, 1e-9));
+  REQUIRE_THAT(r.responses[0].answered.per_second, WithinRel(5.0, 1e-9));  // requests, not MB
+}
+
+// A 2 KB read costs 2e3 B / 1e6 B per unit = 0.002 units: 1000 reads/s are 2 units/s, rho =
+// 2 / 500 = 0.004, nothing waits (Erlang C(20, 0.004) = 4e-41), and yet each read takes the
+// whole 40 ms of one unit: the documented upper bound for small objects (a request under 1 MB
+// still pays one unit's time). Without the bound a 2 KB read would be answered in 160 ns.
+TEST_CASE("a 2 KB read at a blob store costs 0.002 units and is answered in 40 ms", "[theory]") {
+  const auto g = *Graph::build(blob_store_chain("read", 1000, simsys::Bytes{2e3}));
+  const auto r = first_step(g);
+  const auto& store = r.nodes[*g.index_of("store")];
+  REQUIRE_THAT(store.demand_per_s, WithinRel(2.0, 1e-12));  // 1000/s x 0.002 units
+  REQUIRE_THAT(store.rho, WithinRel(0.004, 1e-12));
+  const auto wait = simsys::queueing::mmc_wait(20, 0.004, 0.040).mean_s;
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(wait + 0.040, 1e-9));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.040, 1e-9));
+}
+
+// The size is the client's: the same store fed the same 5/s at 100 MB doubles demand to 500
+// units/s (rho 1.0), where 50 MB gave 250. Sizes scale the load, never the number of requests.
+TEST_CASE("doubling the request size doubles a byte-sized node's demand and keeps the request rate",
+          "[theory]") {
+  const auto g = *Graph::build(blob_store_chain("upload", 5, simsys::Bytes{100e6}));
+  const auto r = first_step(g);
+  REQUIRE_THAT(r.nodes[*g.index_of("store")].demand_per_s, WithinRel(500.0, 1e-12));
+  REQUIRE_THAT(r.nodes[*g.index_of("store")].rho, WithinRel(1.0, 1e-12));
+}
+
+namespace {
+// u (`streams`/s of `stream`, each 50 MB) -> cdn_us (byte capacity `bytes`, every stream a hit so
+// the origin sees nothing: fixed hit ratio 1) -> origin (a service). Zero-latency links. Node
+// indices: u 0, cdn_us 1, origin 2.
+Scenario byte_cdn_chain(double streams, simsys::ByteRate bytes) {
+  Scenario s{.name = "byte-cdn", .version = 1, .duration = 10s};
+  NodeSpec cdn{.id = "cdn_us",
+               .type = NodeType::cdn,
+               .byte_capacity = bytes,
+               .hit_ratio = HitRatio{.fixed = 1.0}};
+  cdn.origin = "origin";
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{streams}},
+                                           .op_shares = {{"stream", 1.0}},
+                                           .sizes = {{"stream", simsys::Bytes{50e6}}}}},
+             std::move(cdn),
+             NodeSpec{.id = "origin", .type = NodeType::service, .capacity = Rate{1000}}};
+  s.links = {LinkSpec{.from = "u", .to = "cdn_us", .latency = 0s},
+             LinkSpec{.from = "cdn_us", .to = "origin", .latency = 0s}};
+  return s;
+}
+}  // namespace
+
+// A CDN sized in bytes per second (`capacity: 100GB/s`) is a byte-sized node (plan 2c refinement
+// 2): it counts megabytes, every op that reaches it has a size (Graph::request_bytes), and the
+// engine runs it. The numbers it runs on are pinned by the byte-sized tests below. Only the che
+// hit ratio without `keys` (next test) still keeps a CDN from running. The node is called cdn_us
+// as in book/youtube; its streams are sized as there.
+TEST_CASE("a cdn with a byte capacity builds and the engine runs it", "[theory]") {
+  const auto g = Graph::build(byte_cdn_chain(1000, simsys::ByteRate{100e9}));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto sim = Simulation::create(*g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+}
+
+// A 100 GB/s CDN is 100e9 / 1e6 = 100k units/s, and its 10 ms per MB (book: "read 1 MB
+// sequentially from the network") make c = 100k/s x 10 ms = 1000 transfers in flight. 1k streams/s
+// of 50 MB are 50k units/s: rho = 50k / 100k = 0.5. Erlang C(1000, 0.5) = 3e-86 (nothing waits),
+// so a stream's response is one megabyte's 10 ms.
+TEST_CASE("a 100 GB per second cdn at 1k streams of 50 MB per second is at rho 0.5", "[theory]") {
+  const auto g = *Graph::build(byte_cdn_chain(1000, simsys::ByteRate{100e9}));
+  const auto r = first_step(g);
+  const auto& cdn = r.nodes[*g.index_of("cdn_us")];
+  REQUIRE_THAT(cdn.demand_per_s, WithinRel(50'000.0, 1e-12));
+  REQUIRE_THAT(cdn.rho, WithinRel(0.5, 1e-12));
+  REQUIRE(cdn.dropped_per_s == 0.0);
+  const auto wait = simsys::queueing::mmc_wait(1000, 0.5, 0.010).mean_s;
+  REQUIRE_THAT(cdn.latency.mean_s, WithinRel(wait + 0.010, 1e-9));
+  REQUIRE_THAT(cdn.latency.mean_s, WithinAbs(0.010, 1e-9));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.010, 1e-9));
+}
+
+// 2k streams/s x 50 MB = 100 GB/s: the cdn's whole capacity, 100k units/s, rho = 1.0, the
+// saturation point of the napkin (100e9 / 50e6 = 2k streams/s). Beyond it the node sheds: at
+// 2.2k streams/s demand is 110k units/s against a capacity of 100k (an offered rho of 1.1); the
+// node drains 100k and, once its 1000-unit queue (the generic default) is full, drops the excess,
+// 110k - 100k = 10k units/s, at every step (per step: demand dt = (drain + dropped) dt + change in
+// backlog).
+TEST_CASE("a 100 GB per second cdn saturates at 2k streams of 50 MB per second", "[theory]") {
+  SECTION("2k streams per second is exactly full") {
+    const auto g = *Graph::build(byte_cdn_chain(2000, simsys::ByteRate{100e9}));
+    const auto r = first_step(g);
+    const auto& cdn = r.nodes[*g.index_of("cdn_us")];
+    REQUIRE_THAT(cdn.demand_per_s, WithinRel(100'000.0, 1e-12));
+    REQUIRE_THAT(cdn.rho, WithinRel(1.0, 1e-12));
+  }
+  SECTION("2.2k streams per second drops the excess once the queue is full") {
+    const auto g = *Graph::build(byte_cdn_chain(2200, simsys::ByteRate{100e9}));
+    auto sim = Simulation::create(g);
+    if (!sim) FAIL(sim.error().message);
+    simsys::engine::StepRecord last;
+    for (int i = 0; i < 20; ++i) last = sim->step(i * 100ms, 100ms);
+    const auto& cdn = last.nodes[*g.index_of("cdn_us")];
+    REQUIRE_THAT(cdn.demand_per_s, WithinRel(110'000.0, 1e-12));  // 2.2k/s x 50 MB
+    REQUIRE_THAT(cdn.drain_per_s, WithinRel(100'000.0, 1e-9));    // the whole capacity, no more
+    REQUIRE_THAT(cdn.dropped_per_s, WithinRel(10'000.0, 1e-6));
+  }
+}
+
+// ---- Which byte-sized nodes the engine runs ----
+
+namespace {
+// u -> store (a blob store, 50 MB uploads at 1/s) -> svc, with the store's `then` step notifying
+// svc: the shape Task 4 turns into an asynchronous event. Node indices: u 0, store 1, svc 2.
+Scenario blob_store_with_event() {
+  auto s = blob_store_chain("upload", 1, simsys::Bytes{50e6},
+                            NodeSpec{.id = "store",
+                                     .type = NodeType::blob_store,
+                                     .then = {Step{.to = "svc", .op = "notify"}}});
+  s.nodes.push_back(NodeSpec{.id = "svc", .type = NodeType::service});
+  s.links.push_back(LinkSpec{.from = "store", .to = "svc", .latency = 0s});
+  return s;
+}
+}  // namespace
+
+TEST_CASE("the engine runs a blob store that has no then steps", "[theory]") {
+  const auto g = Graph::build(blob_store_chain("upload", 5, simsys::Bytes{50e6}));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto sim = Simulation::create(*g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+}
+
+// A blob store's `then` steps are event notifications (S3 event notifications; book ch. 14's
+// "transcoding starts when the upload completes"): asynchronous work, which arrives with phase 2c
+// Task 4. Until then a store with one is refused, and the message says what is pending.
+TEST_CASE("the engine refuses a blob store with then steps until phase 2c's events", "[theory]") {
+  const auto g = Graph::build(blob_store_with_event());
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto sim = Simulation::create(*g);
+  REQUIRE_FALSE(sim.has_value());
+  const auto& message = sim.error().message;
+  CAPTURE(message);
+  // C++23 std::string::contains: a substring test in one call, replacing
+  // `find(...) != std::string::npos`, so the assertion reads as what it checks. The message's
+  // exact wording is the implementer's; what a student needs from it is these four facts.
+  REQUIRE(message.contains("node 'store'"));
+  REQUIRE(message.contains("then"));
+  REQUIRE(message.contains("event"));
+  REQUIRE(message.contains("phase 2c"));
 }
 
 // ---- ID generator as service sugar (plan 2b refinement 6; book ch. 7) ----

@@ -1217,8 +1217,9 @@ TEST_CASE("explain prints a sql database as primary plus replicas with shards, l
 namespace {
 // u(1k/s, the given ops: `read` by default) -> `cdn_id` (a CDN, fixed hit ratio 0.95, origin
 // `origin`) -> origin (a service of 5k/s). The CDN has the given byte capacity when one is passed.
-// Every op is 1 MB, the object size 2b assumes (defaults::blob_object_bytes): a byte-sized node
-// refuses an unsized request (plan 2c refinement 1), and at that size the numbers below hold.
+// Every op is 1 MB, the object size 2b assumed: a byte-sized node refuses an unsized request
+// (plan 2c refinement 1), and at that size one request is one unit of a node counting megabytes
+// (plan 2c refinement 2), so the numbers below read the same in requests and in MB.
 Scenario cdn_reported(std::string cdn_id = "cdn", std::optional<simsys::ByteRate> bytes = {},
                       std::vector<std::pair<std::string, double>> ops = {{"read", 1.0}}) {
   Scenario s{.name = "cdn-report", .version = 1, .duration = 1min};
@@ -1275,13 +1276,6 @@ TEST_CASE("explain still renders a cdn that has a byte capacity", "[report]") {
   REQUIRE(text.contains("misses → origin"));
 }
 
-// A capacity stated in bytes (`capacity: 100GB/s`) becomes requests only at an assumed object
-// size, 1 MB (defaults::blob_object_bytes), a number the scenario never gave: book/youtube's 50 MB
-// streams make the same 100GB/s 2k streams/s, not 100k. The engine refuses to run such a CDN for
-// that reason, so explain must not give the converted number a verdict either: the capacity says
-// where it came from, and the check line gives the load but no percentage and no zone (review of
-// 4d539b0, I1). Every capacity converted from bytes is treated so, a blob store's too, the type's
-// default (spec §6 "blob 500 MB/s") included.
 // A kv_cluster's `nodes`, `replication` and quorums are read and ignored until phase 3: its
 // capacity is that of one box (per replica, `replicas` 1), while the lab's `capacity: 10k/s` is
 // per node of eight, each write landing on N = 3 of them. A percentage against the one box would
@@ -1306,39 +1300,44 @@ TEST_CASE("explain gives no verdict on a kv_cluster, whose nodes are not modelle
   REQUIRE_FALSE(line.contains("%"));
 }
 
-TEST_CASE("explain gives no verdict on a capacity converted from bytes", "[report]") {
+// Plan 2c refinement 2: a capacity stated in bytes is checked in bytes. The node counts
+// megabytes, so its load is the requests' size summed, and the check line prints it in MB/s with
+// the request rate beside it: 1k reads/s of 1 MB at a 100 GB/s cdn are 1k MB/s (1k/s) against
+// 100k MB/s, 1 %; its 5 % misses, 50/s of 1 MB, are 50 MB/s at a blob store's default 500 MB/s
+// (spec section 6), 10 %. The verdict is a real one (a zone), and nothing says "not checked".
+TEST_CASE("explain checks a capacity stated in bytes in MB per second", "[report]") {
   SECTION("a cdn sized in bytes") {
     const auto text = explain_of(cdn_reported("cdn_us", simsys::ByteRate{100e9}));
     CAPTURE(text);
-    REQUIRE(
-        text.contains("capacity=100k/s (scenario: 100GB/s at 1MB/object; byte flows: phase 2c)"));
     const auto line = check_line(text, "cdn_us");
-    REQUIRE(line.contains("peak offered 1k/s vs 100k/s total capacity"));
-    REQUIRE(
-        line.contains("(not checked: capacity from 100GB/s at 1MB/object; byte flows: phase 2c)"));
-    REQUIRE_FALSE(line.contains("green"));
-    REQUIRE_FALSE(line.contains("%"));
+    REQUIRE(line.contains("peak offered 1k MB/s (1k/s) vs 100k MB/s total capacity  (1%, green)"));
+    REQUIRE_FALSE(line.contains("not checked"));
   }
-  SECTION("a blob store origin, sized in bytes or by its type's default") {
+  SECTION("a blob store origin with its type's default capacity") {
+    auto s = cdn_reported();
+    s.nodes[2] = NodeSpec{.id = "origin", .type = NodeType::blob_store};
+    const auto text = explain_of(s);
+    CAPTURE(text);
+    const auto line = check_line(text, "origin");
+    REQUIRE(line.contains("peak offered 50 MB/s (50/s) vs 500 MB/s total capacity  (10%, green)"));
+    REQUIRE_FALSE(line.contains("not checked"));
+  }
+  SECTION("a blob store origin sized in bytes") {
     auto s = cdn_reported();
     s.nodes[2] = NodeSpec{
         .id = "origin", .type = NodeType::blob_store, .byte_capacity = simsys::ByteRate{1e9}};
-    const auto stated = explain_of(s);
-    CAPTURE(stated);
-    REQUIRE(
-        check_line(stated, "origin")
-            .contains("(not checked: capacity from 1GB/s at 1MB/object; byte flows: phase 2c)"));
-    s.nodes[2].byte_capacity = std::nullopt;
-    const auto defaulted = explain_of(s);
-    CAPTURE(defaulted);
-    REQUIRE(defaulted.contains(
-        "capacity=500/s (default: 500MB/s at 1MB/object; byte flows: phase 2c)"));
-    REQUIRE_FALSE(check_line(defaulted, "origin").contains("green"));
+    const auto text = explain_of(s);
+    CAPTURE(text);
+    // 50 MB/s of 1000 MB/s: 5 %.
+    REQUIRE(check_line(text, "origin")
+                .contains("peak offered 50 MB/s (50/s) vs 1k MB/s total capacity  (5%, green)"));
   }
-  SECTION("a capacity stated in requests is still checked") {
+  SECTION("a capacity stated in requests is still checked in requests") {
     const auto text = explain_of(cdn_reported());
     CAPTURE(text);
-    REQUIRE(check_line(text, "cdn").contains("(1%, green)"));
+    const auto line = check_line(text, "cdn");
+    REQUIRE(line.contains("(1%, green)"));
+    REQUIRE_FALSE(line.contains("MB/s"));
   }
 }
 
@@ -1497,4 +1496,19 @@ TEST_CASE("explain prints no sizes on a node that counts requests", "[report]") 
     REQUIRE_FALSE(node_line(text, "origin").empty());
     REQUIRE_FALSE(node_line(text, "origin").contains("sizes:"));
   }
+}
+
+// A byte-sized node's `service_time` is the time of one megabyte (plan 2c refinement 2), so
+// explain says "per MB": the CDN's 10 ms is the book's "read 1 MB sequentially from the network",
+// the blob store's 40 ms the disk read (30 ms) plus the transfer (10 ms). A node that counts
+// requests has a time per request, with no unit after it.
+TEST_CASE("explain prints a byte-sized node's service time per megabyte", "[report]") {
+  auto s = cdn_reported("cdn_us", simsys::ByteRate{100e9});
+  s.nodes[2] = NodeSpec{.id = "origin", .type = NodeType::blob_store};
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  REQUIRE(node_line(text, "cdn_us").contains("service_time=10ms per MB (default)"));
+  REQUIRE(node_line(text, "origin").contains("service_time=40ms per MB (default)"));
+  const auto counting = explain_of(cdn_reported());
+  REQUIRE_FALSE(node_line(counting, "cdn").contains("per MB"));
 }
