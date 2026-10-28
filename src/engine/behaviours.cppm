@@ -80,10 +80,12 @@ concept ResponseLookup = std::invocable<F, std::size_t, std::string_view> &&
 // written in code instead of in a comment on an abstract base class. The lambda is a
 // stand-in ResponseLookup (C++20 allows lambdas in unevaluated operands such as this).
 // It checks that the calls compile and return the right types; what they compute is
-// the tests' job.
+// the tests' job. `cost(op)` is the capacity units one request of `op` uses (plan 2a
+// refinement 4): the engine charges the node's queue in units, not requests.
 template <class B>
 concept NodeBehaviour = requires(const B b, const flow::Flow& in, flow::LatencyEstimate own) {
   { b.route(in) } -> std::same_as<Routed>;
+  { b.cost(std::string_view{}) } -> std::same_as<double>;
   {
     b.response(std::string_view{}, own,
                [](std::size_t, std::string_view) { return flow::LatencyEstimate{}; })
@@ -120,9 +122,12 @@ concept RequestSource = requires(const S s, S& source, SimTime now, SimTime dt) 
 // server of the later designs (ch. 11 news feed fan-out service, ch. 12 chat servers).
 // Captured: for each incoming op, the downstream calls it makes (`ops` steps), the
 // fan-out of each call (`factor`: one post becomes 100 feed writes), and how the call
-// latencies compose — sequential calls add, parallel calls wait for the slowest.
-// Ignored: per-op CPU cost (every op costs the node's one service time; phase 2 adds a
-// cost table), retries and timeouts, and conditional steps (`on: miss` / `on: failure`):
+// latencies compose — sequential calls add, parallel calls wait for the slowest — and
+// how much of the node's capacity each op uses (`cost`, in capacity units: a `write` of
+// cost 3 is three `read`s of cost 1, the way an expensive endpoint is weighed when sizing
+// a tier in ch. 2). Ignored: per-op service TIME (a costly op uses more capacity, but its
+// own sojourn is the node's one service time: the queue is not a multi-class one),
+// retries and timeouts, and conditional steps (`on: miss` / `on: failure`):
 // a service has no cache to miss and phase 1 models no failures, so those steps never
 // fire here. A service has no `then` steps either (the loader rejects them for this
 // type): everything it sends is per op. Hops that close a call cycle are asynchronous
@@ -136,6 +141,10 @@ class ServiceBehaviour {
   // Returns a fresh Routed every call; if profiling shows the per-step allocations
   // matter, the engine can pass a scratch `Routed&` to be cleared and refilled instead.
   [[nodiscard]] Routed route(const flow::Flow& in) const;
+
+  // Capacity units one request of `op` consumes: the spec's `cost` entry, 1 when the op
+  // is not listed (every op of a phase-1 node costs one unit).
+  [[nodiscard]] double cost(std::string_view op) const;
 
   // Response time of `op`: own sojourn + Σ sequential hops + slowest parallel hop, where
   // a hop is two link legs plus the downstream node's response. Asynchronous hops are
@@ -197,6 +206,7 @@ class ServiceBehaviour {
   // std::less<> (C++14 transparent comparator) lets find() take a string_view without
   // building a std::string for every lookup.
   std::map<std::string, std::vector<Hop>, std::less<>> hops_by_op_;
+  std::map<std::string, double, std::less<>> cost_by_op_;  // only the ops listed in `cost`
 };
 
 // The seed of client `index`'s noise process (spec phase 2a refinement 3): one
@@ -378,8 +388,14 @@ void sort_by_destination(std::vector<Outgoing>& outgoing) {
 // ---- ServiceBehaviour ----
 
 // Only `ops` steps: a service has no `then` (loader-enforced, see the class comment).
-ServiceBehaviour::ServiceBehaviour(const graph::Graph& g, std::size_t self) : self_{self} {
+ServiceBehaviour::ServiceBehaviour(const graph::Graph& g, std::size_t self)
+    : self_{self}, cost_by_op_{g.nodes()[self].spec.cost.begin(), g.nodes()[self].spec.cost.end()} {
   for (const auto& [op, steps] : g.nodes()[self].spec.ops) add_hops(g, op, steps);
+}
+
+double ServiceBehaviour::cost(std::string_view op) const {
+  const auto found = cost_by_op_.find(op);
+  return found == cost_by_op_.end() ? 1.0 : found->second;
 }
 
 void ServiceBehaviour::add_hops(const graph::Graph& g, const std::string& op,

@@ -94,6 +94,7 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 | `latency` | duration | all but `client` | read | service time of one request; default per type |
 | `advanced` | map | all but `client` | read | see next table |
 | `ops` | map | `client`, `service`, `ws_gateway` | read (client, service); checked (ws_gateway) | client: op → share; otherwise op → step list (below) |
+| `cost` | map op → number | `service`, `cache` | read (service); checked (cache) | **new in phase 2a**: the capacity units one request of that op consumes; an op not listed costs 1. Each value is a positive finite number (`cost 'x' must be a positive finite number`); anything but a map is `cost must be a map of op to units`. `capacity` is then a rate of units: demand is `Σ rate_op × cost_op`, and the node's demand, drops and backlog are reported in units. What it forwards stays requests (a drained `write` of cost 3 is one `write` downstream). A `worker_pool`'s `cost` is a different key (a duration per job, below) |
 | `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | checked | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step and drawn by `explain`; simulated with these types from phase 2 |
 
 A key outside its row is an error, e.g. `key 'capacity' is not valid for type 'client'`
@@ -138,8 +139,8 @@ target and, if that link lists `ops`, lists the step's op.
 | `cdn` | `ttl`, `hit_ratio` (`fixed: h` or `model` †), `origin` (node id) | `origin` checked (a declared node); others ignored |
 | `load_balancer` | `policy` `round_robin|least_connections|weighted|consistent_hash`, `vnodes` (int, consistent_hash) | ignored |
 | `rate_limiter` | `algorithm` `token_bucket|leaky_bucket|fixed_window|sliding_log|sliding_counter`, `limit` (rate), `burst` (int), `backend` (node id of a cache holding counters) | `backend` checked; others ignored |
-| `service` | `ops` | read |
-| `cache` | `eviction` `lru|lfu|fifo|ttl`, `strategy` `cache_aside|read_through|write_through|write_around|write_back`, `keys` (int capacity), `hit_ratio` (`fixed: h` or `che`), `backend` (node id for read/write-through), `ttl`, `then` | `backend` checked; others ignored |
+| `service` | `ops`, `cost` | read |
+| `cache` | `eviction` `lru|lfu|fifo|ttl`, `strategy` `cache_aside|read_through|write_through|write_around|write_back`, `keys` (int capacity), `hit_ratio` (`fixed: h` or `che`), `backend` (node id for read/write-through), `ttl`, `then`, `cost` | `backend` checked; `cost` read (simulated with the cache in phase 2a); others ignored |
 | `sql_db` | `replication_lag`, `shards` (int), `pool` (int connections) † | ignored |
 | `kv_cluster` | `nodes` (int), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp` | ignored |
 | `message_queue` | `partitions`, `retention` † | ignored |
