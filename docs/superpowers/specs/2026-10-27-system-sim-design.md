@@ -275,6 +275,18 @@ retries). These are provided as scripted faults (`cache_flush`, `timeout_storm`)
 
 Not used on purpose: raw `new`, macros, exceptions for control flow.
 
+## 10a. Educational conventions
+
+Recorded in `CLAUDE.md` so every session follows them:
+
+1. The first use of any C++20/23 construct in a file gets an inline comment: what it is,
+   which standard, what it replaces, why it fits here. Longer notes in `docs/study/`.
+2. Every node type, policy and formula that models something from the book or from
+   queueing theory carries explanatory documentation: what it models, the chapter, what
+   it captures, what it ignores, the formula's name and assumptions, and the source of
+   every default number.
+3. Tests are named after the property they prove; scenario folders carry a README.
+
 ## 11. CLI
 
 ```
