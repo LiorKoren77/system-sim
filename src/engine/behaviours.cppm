@@ -26,6 +26,7 @@ module;
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -41,6 +42,7 @@ import simsys.core;
 import simsys.flow;
 import simsys.graph;
 import simsys.model;
+import simsys.workload;
 
 export namespace simsys::behaviours {
 
@@ -94,8 +96,17 @@ concept NodeBehaviour = requires(const B b, const flow::Flow& in, flow::LatencyE
 // C++20 std::span<const std::string>: a non-owning view (pointer + size) of the op names,
 // replacing `const std::vector<std::string>&`; a source may store its ops in any
 // contiguous container and callers can read but not modify them.
+//
+// Who owns what: the engine owns the clock, the source owns its random state. `tick(now,
+// dt)` is the one call that changes a source: the engine makes it once per real step,
+// before `offer`, to advance the source's noise by dt. `offer(now)` is const, a pure
+// function of `now` and the last tick, so asking twice gives the same flow, and an engine
+// that never ticks (estimate, which evaluates the curve at t = 0) sees the curve exactly,
+// without noise, with no special case. `tick` needs a non-const S, hence the second
+// parameter `S& source` next to the const `s`.
 template <class S>
-concept RequestSource = requires(const S s, SimTime now) {
+concept RequestSource = requires(const S s, S& source, SimTime now, SimTime dt) {
+  { source.tick(now, dt) };
   { s.offer(now) } -> std::same_as<Routed>;
   {
     s.response(std::string_view{},
@@ -194,8 +205,8 @@ class ServiceBehaviour {
 // the increment of the splitmix64 generator: the multiplication (mod 2^64) spreads
 // consecutive seeds across all 64 bits, so seeds 1 and 2 start unrelated streams instead
 // of engines whose states differ in one low bit. XOR with the node index then separates
-// the clients of one scenario. The engine (Task 6) and `simsys curve --noise` both call
-// this, so the curve command prints exactly the noise a run will use.
+// the clients of one scenario. The engine (Simulation::make_node) and `simsys curve
+// --noise` both call this, so the curve command prints exactly the noise a run will use.
 inline constexpr std::uint64_t golden_ratio_increment = 0x9E3779B97F4A7C15;
 
 [[nodiscard]] constexpr std::uint64_t client_seed(int seed, std::size_t index) {
@@ -204,16 +215,40 @@ inline constexpr std::uint64_t golden_ratio_increment = 0x9E3779B97F4A7C15;
 
 // Models: the "User" box at the top of every System Design Interview diagram — web and
 // mobile clients as one aggregate source of load (ch. 1; the ch. 2 back-of-the-envelope
-// estimates give its rate, e.g. 300M DAU -> QPS). Captured: a base request rate split
+// estimates give its rate, e.g. 300M DAU -> QPS). Captured: a request rate that follows
+// the scenario's rate curve over time (daily waves, ramps, spikes, replayed traces:
+// workload::RateCurve) times a seeded random multiplier (workload::NoiseProcess), split
 // into ops by fixed shares, each op split over the links that carry it by link weight
-// (DNS round-robin, CDN vs origin). Ignored in phase 1: time-varying load (`now` is
-// unused; phase 2 plugs rate curves and spikes in here), think time and closed-loop
-// clients (offered load never reacts to latency), and client-side timeouts.
+// (DNS round-robin, CDN vs origin). Ignored: think time and closed-loop clients (offered
+// load never reacts to latency: a slow site does not make these users wait or leave),
+// and client-side timeouts.
 class ClientBehaviour {
  public:
-  ClientBehaviour(const graph::Graph& g, std::size_t self);
+  // `seed` seeds this client's noise process; the engine passes client_seed(scenario
+  // seed, node index). It defaults to 0 for clients built without noise (tests): a client
+  // whose workload has no noise never draws a random number, so its seed is unused.
+  ClientBehaviour(const graph::Graph& g, std::size_t self, std::uint64_t seed = 0);
 
-  // Load offered at `now`: base × op share × route share on each route. A client is a
+  // Advances the noise by one step of length `dt` (Ornstein-Uhlenbeck, see
+  // workload::NoiseProcess) and keeps the multiplier for the following `offer`s. A no-op
+  // for a client without noise. `now` is unused: the noise depends on dt only, but the
+  // engine hands every source the step's time (see RequestSource).
+  void tick(SimTime now, SimTime dt);
+
+  // Back to the state before the first tick: multiplier 1 and the noise process restarted
+  // from its seed. Simulation::estimate calls it on its scratch copy, so the long-run
+  // estimate is the same before and after a run.
+  void reset_noise();
+
+  // The total rate offered at `now`: curve.rate_at(now) × the multiplier of the last tick
+  // (1 before any tick, and always 1 without noise).
+  [[nodiscard]] Rate rate(SimTime now) const;
+
+  // The rate offered per op at `now`, rate(now) × op share, sorted by op name: what the
+  // client sends this step, which reports weight latencies by.
+  [[nodiscard]] std::vector<std::pair<std::string, Rate>> offered(SimTime now) const;
+
+  // Load offered at `now`: rate(now) × op share × route share on each route. A client is a
   // source, so `served` stays empty. Like ServiceBehaviour::route, a fresh Routed per
   // call; the engine may later pass a scratch `Routed&` instead.
   [[nodiscard]] Routed offer(SimTime now) const;
@@ -282,11 +317,20 @@ class ClientBehaviour {
     std::size_t target;
     std::size_t link;
     double route_share;    // fraction of this op's requests taking this link
-    double share_of_base;  // op share × route share: fraction of the base rate
+    double share_of_rate;  // op share × route share: fraction of the client's rate
     double link_leg_s;     // one-way link latency in seconds
   };
 
-  Rate base_{};
+  // The curve is kept by value: a behaviour must not hold a reference into the Graph,
+  // which the Simulation does not outlive (see Simulation's constructor).
+  workload::RateCurve curve_{};
+  std::optional<workload::Noise> noise_spec_{};  // absent: no noise
+  std::uint64_t seed_{};
+  // No noise means no process at all rather than a sigma-0 one: an absent noise costs
+  // nothing per step and owns no random engine.
+  std::optional<workload::NoiseProcess> noise_{};
+  double noise_multiplier_{1.0};  // max(0, 1 + x) from the last tick; 1 until the first
+  std::vector<std::pair<std::string, double>> op_shares_;  // sorted by op
   std::vector<RouteLeg> legs_;
   std::vector<std::string> ops_;
 };
@@ -381,12 +425,16 @@ Routed ServiceBehaviour::route(const flow::Flow& in) const {
 
 // ---- ClientBehaviour ----
 
-ClientBehaviour::ClientBehaviour(const graph::Graph& g, std::size_t self) {
+ClientBehaviour::ClientBehaviour(const graph::Graph& g, std::size_t self, std::uint64_t seed)
+    : seed_{seed} {
   const auto& workload = g.nodes()[self].spec.workload;
   if (!workload) return;  // a client without a workload offers nothing
-  base_ = workload->curve.base;
-  for (const auto& [op, share] : workload->op_shares) ops_.push_back(op);
-  std::ranges::sort(ops_);
+  curve_ = workload->curve;
+  noise_spec_ = workload->noise;
+  reset_noise();
+  op_shares_ = workload->op_shares;
+  std::ranges::sort(op_shares_, {}, &std::pair<std::string, double>::first);
+  for (const auto& [op, share] : op_shares_) ops_.push_back(op);
   for (const auto& route : g.client_routes(self)) {
     const auto op_share =
         std::ranges::find(workload->op_shares, route.op, &std::pair<std::string, double>::first);
@@ -394,17 +442,38 @@ ClientBehaviour::ClientBehaviour(const graph::Graph& g, std::size_t self) {
                              .target = route.target,
                              .link = route.link,
                              .route_share = route.share,
-                             .share_of_base = op_share->second * route.share,
+                             .share_of_rate = op_share->second * route.share,
                              .link_leg_s = seconds(g.links()[route.link].one_way)});
   }
 }
 
-Routed ClientBehaviour::offer(SimTime /*now*/) const {
+void ClientBehaviour::tick(SimTime /*now*/, SimTime dt) {
+  if (noise_) noise_multiplier_ = noise_->next(dt);
+}
+
+void ClientBehaviour::reset_noise() {
+  noise_multiplier_ = 1.0;
+  if (noise_spec_) noise_.emplace(*noise_spec_, seed_);
+}
+
+Rate ClientBehaviour::rate(SimTime now) const {
+  return Rate{curve_.rate_at(now).per_second * noise_multiplier_};
+}
+
+std::vector<std::pair<std::string, Rate>> ClientBehaviour::offered(SimTime now) const {
+  const double total = rate(now).per_second;
+  std::vector<std::pair<std::string, Rate>> per_op;
+  for (const auto& [op, share] : op_shares_) per_op.emplace_back(op, Rate{total * share});
+  return per_op;  // sorted by op, as op_shares_ is
+}
+
+Routed ClientBehaviour::offer(SimTime now) const {
   Routed routed;
+  const double total = rate(now).per_second;
   for (const RouteLeg& leg : legs_) {
-    const double rate = base_.per_second * leg.share_of_base;
-    if (rate <= 0.0) continue;  // no empty branches (see ServiceBehaviour::route)
-    detail::flow_towards(routed.outgoing, leg.target, leg.link).add(leg.op, Rate{rate});
+    const double leg_rate = total * leg.share_of_rate;
+    if (leg_rate <= 0.0) continue;  // no empty branches (see ServiceBehaviour::route)
+    detail::flow_towards(routed.outgoing, leg.target, leg.link).add(leg.op, Rate{leg_rate});
   }
   detail::sort_by_destination(routed.outgoing);
   return routed;

@@ -1,8 +1,10 @@
 // Module `simsys.engine`: the step loop (spec §3). One step = a forward pass in
 // topological order moving demand through delay lines and fluid queues, then a backward
 // pass composing response latency per (node, op). `estimate` repeats the same evaluation
-// in settle mode until it stops changing: the long-run state. No randomness in phase 1, so
-// runs are byte-identical by construction.
+// in settle mode until it stops changing: the long-run state. The only randomness is the
+// clients' workload noise, and each client draws it from its own engine seeded from the
+// scenario's `seed` (behaviours::client_seed), so runs with the same seed are
+// byte-identical by construction.
 //
 // Models: a whole System Design Interview (Alex Xu, vol. 1) diagram set in motion. The
 // users box offers load (ch. 2 back-of-the-envelope QPS), every arrow carries it to the
@@ -125,6 +127,8 @@ class Simulation {
   // C++23 std::expected<T, E>: a runnable Simulation or the reason the graph cannot be
   // run yet. Replaces a throwing constructor: an unsupported node type is user input
   // (a valid scenario for `explain`), not a programmer error.
+  // Each client's noise is seeded with client_seed(scenario.seed, node index) (see
+  // make_node), so the same scenario and seed give the same run, bit for bit.
   // Pattern: Static factory (named constructor) — `create` validates first, then calls
   // the private constructor, so a Simulation over an unsupported graph cannot exist.
   [[nodiscard]] static std::expected<Simulation, graph::EngineError> create(const graph::Graph& g);
@@ -137,8 +141,9 @@ class Simulation {
 
   // The long-run state at the scenario's step, without disturbing this simulation and
   // independent of what it ran before: settle passes from a clean state until nothing
-  // changes (see the definition). Record time is 0; `converged` says whether a steady
-  // state was found.
+  // changes (see the definition). Clients offer their rate curve at t = 0 without noise
+  // (estimating at another time, `--at`, is phase 2c). Record time is 0; `converged` says
+  // whether a steady state was found.
   [[nodiscard]] StepRecord estimate() const;
 
   // Steps from t = 0 while t < duration and hands every record to `observer`: that is
@@ -178,10 +183,9 @@ class Simulation {
     behaviours::Behaviour behaviour;
     std::optional<fluid::FluidQueue> queue{};  // services only; a client is a source
     double replicas{1};
-    std::vector<std::pair<std::string, Rate>> offered{};  // clients: base × share per op
-    std::vector<std::size_t> incoming_links{};            // links delivering demand here
-    std::vector<std::size_t> outgoing_links{};            // links this node sends demand on
-    flow::Flow inflow{};                                  // this step's arrivals
+    std::vector<std::size_t> incoming_links{};  // links delivering demand here
+    std::vector<std::size_t> outgoing_links{};  // links this node sends demand on
+    flow::Flow inflow{};                        // this step's arrivals
     // Services: what one copy's queue holds, per op, in requests (not per second; Flow
     // is reused as "a number per op"). Its total agrees with the queue's backlog to
     // rounding. See serve().
@@ -214,7 +218,7 @@ class Simulation {
                                                const fluid::FluidStep& copy_step);
   void send(std::size_t index, const behaviours::Routed& routed, Mode mode);
   void backward_pass(const std::vector<NodeSample>& samples);
-  [[nodiscard]] std::vector<ResponseSample> client_responses() const;
+  [[nodiscard]] std::vector<ResponseSample> client_responses(SimTime now) const;
   [[nodiscard]] flow::LatencyEstimate response_of(std::size_t node, std::string_view op) const;
 
   std::vector<Node> nodes_;
@@ -242,22 +246,6 @@ struct Overloaded : Fs... {
 
 [[nodiscard]] bool supported_in_phase_1(model::NodeType type) {
   return type == model::NodeType::client || type == model::NodeType::service;
-}
-
-// Offered rate per op of a client: base × op share, sorted by op (reports list ops in
-// name order).
-[[nodiscard]] std::vector<std::pair<std::string, Rate>> offered_rates(const model::NodeSpec& spec) {
-  std::vector<std::pair<std::string, Rate>> offered;
-  if (!spec.workload) return offered;
-  for (const auto& [op, share] : spec.workload->op_shares) {
-    offered.emplace_back(op, Rate{spec.workload->curve.base.per_second * share});
-  }
-  // C++20 ranges algorithm with a projection: std::ranges::sort takes the container
-  // itself (no begin/end pair to mismatch), `{}` is the default comparison (std::less),
-  // and the projection `&pair::first` says "compare by op name", replacing a hand-written
-  // lambda that repeats `a.first < b.first`.
-  std::ranges::sort(offered, {}, &std::pair<std::string, Rate>::first);
-  return offered;
 }
 
 void add_once(std::vector<std::size_t>& links, std::size_t link) {
@@ -376,11 +364,14 @@ Simulation::Simulation(const graph::Graph& g)
 
 // Pattern: Strategy — each node gets the behaviour of its type, held by value in the
 // behaviours::Behaviour variant and dispatched with std::visit in the forward pass.
+// A client's noise seed is client_seed(scenario seed, node index): one random engine per
+// client, so adding a client never changes another client's noise (spec phase 2a
+// refinement 3), and `simsys curve --noise` derives the same seed.
 Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index) {
   const auto& resolved = g.nodes()[index];
   if (resolved.spec.type == model::NodeType::client) {
-    return Node{.behaviour = behaviours::ClientBehaviour{g, index},
-                .offered = offered_rates(resolved.spec)};
+    return Node{.behaviour = behaviours::ClientBehaviour{
+                    g, index, behaviours::client_seed(g.scenario().seed, index)}};
   }
   return Node{.behaviour = behaviours::ServiceBehaviour{g, index},
               .queue = fluid::FluidQueue{resolved.capacity},
@@ -487,7 +478,8 @@ StepRecord Simulation::estimate() const {
 
 // A copy that remembers nothing of the steps this simulation ran, so estimate() gives
 // the same answer before and after a run: no flow on any link, no queue content, no
-// response yet (the response tables keep their ops, see register_reachable_ops). Delay
+// response yet (the response tables keep their ops, see register_reachable_ops), and
+// every client's noise back at multiplier 1 (settle mode never ticks it again). Delay
 // lines are not copied: settle mode reads `sent` directly, so each link gets an empty
 // one-slot line (a million-step link would otherwise copy a million Flows). The queues
 // need no reset either: settle mode sets each backlog from the demand (FluidQueue::settle).
@@ -500,6 +492,9 @@ Simulation Simulation::settling_copy() const {
     node.inflow.clear();
     node.waiting.clear();
     for (auto& [op, response] : node.responses) response = flow::LatencyEstimate{};
+    if (auto* client = std::get_if<behaviours::ClientBehaviour>(&node.behaviour)) {
+      client->reset_noise();
+    }
   }
   scratch.links_.assign(links_.size(), Link{.line = DelayLine{0}});
   return scratch;
@@ -509,14 +504,16 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
   StepRecord record{.t = now, .nodes = std::vector<NodeSample>(nodes_.size())};
   forward_pass(now, dt, mode, record.nodes);
   backward_pass(record.nodes);
-  record.responses = client_responses();
+  record.responses = client_responses(now);
   return record;
 }
 
 // Forward pass (spec §3.2-3.4), nodes in topological order. For each node:
 //   1. receive: pop every incoming link into the node's inflow;
-//   2. a client offers its load; a service runs its fluid queue on the inflow and routes
-//      the part it drained (backlog included, with the queue's op mix: see serve);
+//   2. a client offers its load (in advance mode it first ticks its noise by dt; settle
+//      mode never ticks, so estimate sees the curve without noise at the time it passes,
+//      t = 0); a service runs its fluid queue on the inflow and routes the part it drained
+//      (backlog included, with the queue's op mix: see serve);
 //   3. send: accumulate the routed flow per link and push it into each link's delay line.
 // Why this order is right: a forward link's target comes later in the order, so it pops
 // after this step's push (a zero-step link delivers in the same step). A feedback link's
@@ -528,12 +525,15 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode,
   for (const std::size_t index : order_) {
     receive(index, mode);
     // A client's sample stays all zeros, green: a source has no queue.
-    const behaviours::Routed routed = std::visit(
-        Overloaded{[&](const behaviours::ClientBehaviour& client) { return client.offer(now); },
-                   [&](const behaviours::ServiceBehaviour& service) {
-                     return serve(index, service, dt, mode, samples[index]);
-                   }},
-        nodes_[index].behaviour);
+    const behaviours::Routed routed =
+        std::visit(Overloaded{[&](behaviours::ClientBehaviour& client) {
+                                if (mode == Mode::advance) client.tick(now, dt);
+                                return client.offer(now);
+                              },
+                              [&](const behaviours::ServiceBehaviour& service) {
+                                return serve(index, service, dt, mode, samples[index]);
+                              }},
+                   nodes_[index].behaviour);
     send(index, routed, mode);
   }
 }
@@ -646,7 +646,9 @@ void Simulation::backward_pass(const std::vector<NodeSample>& samples) {
 
 // Every client op in node order then op order, after the backward pass filled every
 // service's table: a client's response is the share-weighted mixture over its routes.
-std::vector<ResponseSample> Simulation::client_responses() const {
+// `offered` is what the client sent this step (curve × noise × op share), so reports
+// weight each step's latency by the load that actually saw it.
+std::vector<ResponseSample> Simulation::client_responses(SimTime now) const {
   const auto lookup = [this](std::size_t target, std::string_view op) -> flow::LatencyEstimate {
     return response_of(target, op);
   };
@@ -654,7 +656,7 @@ std::vector<ResponseSample> Simulation::client_responses() const {
   for (std::size_t index = 0; index < nodes_.size(); ++index) {
     const auto* client = std::get_if<behaviours::ClientBehaviour>(&nodes_[index].behaviour);
     if (client == nullptr) continue;
-    for (const auto& [op, offered] : nodes_[index].offered) {
+    for (const auto& [op, offered] : client->offered(now)) {
       responses.push_back(ResponseSample{
           .client = index, .op = op, .offered = offered, .response = client->response(op, lookup)});
     }

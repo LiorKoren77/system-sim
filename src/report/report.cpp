@@ -699,17 +699,20 @@ template <class T, class F>
 // Offered rate per op arriving at each node, requests per second.
 using OpLoad = std::map<std::string, double, std::less<>>;
 
-// What the clients send, at base rates: base × op share × route share on each route.
+// What the clients send at t = 0, the time `estimate` evaluates: the curve's rate there
+// (rate_at, so a points-only client counts too; no noise) × op share × route share on
+// each route.
 [[nodiscard]] std::vector<OpLoad> client_load(const graph::Graph& g) {
   std::vector<OpLoad> load(g.nodes().size());
   for (std::size_t client = 0; client < g.nodes().size(); ++client) {
     const auto& workload = g.nodes()[client].spec.workload;
     if (!workload) continue;
+    const double rate_at_zero = workload->curve.rate_at(SimTime{0}).per_second;
     for (const auto& route : g.client_routes(client)) {
       const auto share =
           std::ranges::find(workload->op_shares, route.op, &std::pair<std::string, double>::first);
       if (share == workload->op_shares.end()) continue;
-      load[route.target][route.op] += workload->curve.base.per_second * share->second * route.share;
+      load[route.target][route.op] += rate_at_zero * share->second * route.share;
     }
   }
   return load;

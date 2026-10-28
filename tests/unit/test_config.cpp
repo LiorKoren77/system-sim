@@ -1132,6 +1132,27 @@ TEST_CASE("rate curve values are range-checked") {
   }
 }
 
+TEST_CASE("noise sigma is capped at ten") {
+  SECTION("ten itself loads") {
+    const auto path =
+        write_temp("simsys_sigma_ten.yaml",
+                   client_with_rate("{base: 1/s, noise: {sigma: 10, correlation: 5m}}"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    CHECK(s->nodes[0].workload->noise->sigma == 10.0);
+  }
+  SECTION("anything above ten is rejected") {
+    const RateRejection cases[] = {
+        {"{base: 1/s, noise: {sigma: 10.5, correlation: 5m}}",
+         "node 'u': rate.noise.sigma must be at most 10"},
+        {"{base: 1/s, noise: {sigma: 1e300, correlation: 5m}}",
+         "node 'u': rate.noise.sigma must be at most 10"},
+    };
+    require_all_rejected("simsys_sigma_above_ten.yaml", cases);
+  }
+}
+
 TEST_CASE("unknown keys inside wave, ramp, a spike or noise are rejected") {
   const RateRejection cases[] = {
       {"{base: 1/s, wave: {shape: sine, period: 1h, amplitude: 0.5, peak_at: 0s, colour: red}}",

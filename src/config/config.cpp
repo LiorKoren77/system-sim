@@ -1676,6 +1676,23 @@ std::expected<workload::RateCurve, ConfigError> read_rate_curve(const Site& site
   });
 }
 
+// The largest noise `sigma` a scenario may ask for. Chosen, not from the book: the noise
+// multiplier is max(0, 1 + x) with x ~ N(0, sigma^2), so at sigma = 10 the client is already
+// silent almost half the time (P(x < -1) = 46 %) and bursts to around 10x its curve, at
+// times 20x, the rest: no longer "noise around a curve", and no real workload needs more. The cap
+// also keeps a noisy rate inside the engine's arithmetic (max_rate_per_second x a multiplier of a
+// few tens is still finite) and turns a typo such as `sigma: 15` for 15 % into an error instead of
+// a strange run.
+inline constexpr double max_noise_sigma = 10.0;
+
+// `sigma` as read: non-negative (0 means no noise) and at most max_noise_sigma.
+CheckResult check_sigma_capped(const Site& site, const YAML::Node& noise, std::string_view label,
+                               double sigma) {
+  if (sigma <= max_noise_sigma) return {};
+  return site.fail(shape_site(noise, "sigma"),
+                   std::format("{}.sigma must be at most {}", label, max_noise_sigma));
+}
+
 // The Ornstein-Uhlenbeck noise of spec §9.2: `sigma` is its stationary standard deviation
 // (0 is allowed: no noise), `correlation` (tau) roughly how long a burst lasts.
 std::expected<workload::Noise, ConfigError> read_noise(const Site& site, const YAML::Node& noise) {
@@ -1688,6 +1705,9 @@ std::expected<workload::Noise, ConfigError> read_noise(const Site& site, const Y
                        .transform(store_in(read.sigma));
       !sigma) {
     return std::unexpected(sigma.error());
+  }
+  if (auto capped = check_sigma_capped(site, noise, label, read.sigma); !capped) {
+    return std::unexpected(capped.error());
   }
   return read_positive_duration(site, noise, label, "correlation").transform([&](SimTime tau) {
     read.correlation = tau;
