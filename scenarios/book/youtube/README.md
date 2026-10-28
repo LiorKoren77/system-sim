@@ -15,8 +15,9 @@
   API).
 - The CDNs and the two blob stores count megabytes (phase 2c): a 50 MB stream costs 50 units of
   1 MB, the service time is one megabyte's (10 ms at a CDN, 40 ms at a blob store, the book's
-  per-MB rows), so `cdn_us` at 100GB/s holds 1000 transfers at once and saturates at 2k
-  streams/s. `explain` checks them in MB/s with the requests beside (the evening peak, 21:00):
+  per-MB rows), so `cdn_us` at 100GB/s has 1000 megabyte slots (`c=1000 MB slots`) and
+  saturates at 2k streams/s. `explain` checks them in MB/s with the requests beside (the evening
+  peak, 21:00):
 
   ```
   cdn_us              peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)
@@ -26,9 +27,17 @@
   ```
 
   `transcoded_store`'s figure is the CDNs' misses alone, a lower bound: the transcoders' writes
-  come through a queue and a worker pool the paper load does not follow yet. A request's response
-  is its time to first byte (its wait plus one megabyte): the rest of a 50 MB stream is read as it
-  arrives, and the transfer time of a 300 MB upload is not in any percentile.
+  come through a queue and a worker pool the paper load does not follow yet.
+- Each request is a batch of megabytes that holds one slot for its whole transfer (a stream
+  0.5 s at a CDN, an upload 300 MB × 40 ms = 12 s at `original_store`), so the queues wait for
+  whole objects: Erlang C is fed the mean object's time, with the slots as servers (rho is the
+  same as in MB/s, by Little's law). It matters near saturation: at rho 0.9, 50 MB objects at a
+  default blob store (20 slots) wait 0.55 s, where 1 MB units would say 11 ms. When a request is
+  answered depends on its direction: a stream is a read, answered at its first megabyte (its
+  wait plus 10 ms; the rest is read as it arrives), and an upload is a write
+  (`original_store` lists `write_ops: [upload]`), acknowledged at its last byte, 12 s after its
+  wait. The clients' `timeout: 10s` is read but not applied yet (plan 2c Task 13); applied to a
+  12 s upload it will cut a large share of them.
 - Two regions with a cross-DC origin fetch (150 ms) for European misses. Each CDN is a
   read-only cache in front of `transcoded_store`: its hit ratio comes from the Che approximation
   over the viewers' Zipf(1) popularity of 10M videos and the edge's size in videos (`keys: 100k`
@@ -42,6 +51,9 @@
 
 ## What it abstracts away
 - Adaptive bitrate selection, chunked upload resume, DRM.
+- The spread of object sizes in one queue (each queue waits as M/M/c at the mean object's time;
+  mixed sizes wait longer), and a large read needed whole (a stream answers at its first
+  megabyte, which understates a download that must finish before it is used).
 - Error handling in the DAG (retry per stage).
 
 ## Things to try

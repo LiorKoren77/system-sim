@@ -66,6 +66,10 @@ nodes:
     type: blob_store
     dc: us-east
     capacity: 5GB/s
+    # `upload` is a write: the store acknowledges it at its last byte (300 MB at 40 ms per MB:
+    # 12 s after its wait), where a read is answered at its first megabyte. The default write op
+    # is `write`, so the name is listed.
+    write_ops: [upload]
     then: [{to: transcode_q, op: publish}]
 
   transcode_q: {type: message_queue, dc: us-east, partitions: 32}

@@ -109,7 +109,7 @@ constexpr std::array<OwnKeys, model::node_type_names.size()> own_keys_by_type{{
     {model::NodeType::kv_cluster, "nodes vnodes replication write_quorum read_quorum mode"},
     {model::NodeType::message_queue, "partitions retention"},
     {model::NodeType::worker_pool, "consumes workers cost then"},
-    {model::NodeType::blob_store, "then"},
+    {model::NodeType::blob_store, "then write_ops"},
     {model::NodeType::search_index, "build_interval"},
     {model::NodeType::ws_gateway, "max_connections heartbeat fanout ops"},
     {model::NodeType::service_discovery, "failover"},
@@ -2299,7 +2299,8 @@ CheckResult read_cache_strategy(const Site& site, const YAML::Node& body, model:
 // cache's or a CDN's `write` or a database's four SQL writes). An empty list would make every op
 // a read, which a cache or a database that is written to never is, so it is refused rather than
 // read as "no writes". On a CDN the list names the ops it refuses (it has no write path, so the
-// graph refuses a write op that reaches it) instead of caching them as reads.
+// graph refuses a write op that reaches it) instead of caching them as reads; on a blob store, the
+// ops it acknowledges at their last byte rather than at their first megabyte.
 CheckResult read_write_ops(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   const auto list = body["write_ops"];
   if (!list) return {};
@@ -2451,6 +2452,16 @@ CheckResult read_cdn_keys(const Site& site, const YAML::Node& body, model::NodeS
       .and_then([&] { return read_write_ops(this_node, body, node); });
 }
 
+// ---- Blob store keys (plan 2c refinement 2; review of Task 3 at a8b6cb4, I2) ----
+//
+// `write_ops: [upload]`: the ops a blob store acknowledges at their last byte (a PUT is answered
+// once the object is stored); every other op is a read, answered at its first megabyte
+// (behaviours::MegabyteService). Read as a cache's are (read_write_ops); default `write`.
+CheckResult read_blob_store_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (node.type != model::NodeType::blob_store) return {};
+  return read_write_ops(node_site(site, node.id), body, node);
+}
+
 // ---- Node bodies: the second pass -----------------------------------------------------
 
 // A client offers traffic (its `ops` are shares of its rate); every other node forwards
@@ -2497,6 +2508,7 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
     if (auto read = read_cache_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_sql_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_cdn_keys(site, entry.second, *node, declared); !read) return read;
+    if (auto read = read_blob_store_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_id_generator_keys(site, entry.second, *node); !read) return read;
     ++node;
   }

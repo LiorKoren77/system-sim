@@ -60,14 +60,15 @@ inline constexpr LatencyNumbers latency_numbers{
 // per MB ("read 1 MB sequentially from the network": 10 ms), which makes one unit's service
 // time a row of that table: a byte-sized node's service time is the time of ONE megabyte, and
 // Little's law gives its concurrency as for any node, c = units/s × s (a 100 GB/s CDN at 10 ms
-// per MB: 100k/s × 10 ms = 1000 transfers at once). The size is each op's own, resolved by the
+// per MB: 100k/s × 10 ms = 1000 megabyte slots). The size is each op's own, resolved by the
 // graph (graph::Graph::request_bytes), never an assumed object.
 inline constexpr double byte_unit = 1e6;
 
 // Capacity units one request of `size` bytes uses at a byte-sized node: its megabytes, a 50 MB
-// stream 50, a 2 KB read 0.002. A cost is capacity, not duration (as a SQL write's 5 units are,
-// sql_write_cost): the request still waits and is served like one unit, so its sojourn is its
-// wait plus ONE megabyte's service time, its time to first byte.
+// stream 50, a 2 KB read 0.002. Unlike a SQL write's 5 units (sql_write_cost), which are capacity
+// only, these are also time: the request holds one megabyte slot for its whole transfer, size ×
+// the time of one MB, so the queue waits for whole objects, and a write is answered at its last
+// byte, a read at its first megabyte (behaviours::MegabyteService; review of plan 2c Task 3).
 [[nodiscard]] constexpr double byte_cost(Bytes size) {
   return size.count / byte_unit;
 }
@@ -133,9 +134,12 @@ struct TypeDefaults {
       return {Rate{1'000}, 2_ms};  // chosen: a 2 ms background job
     case blob_store:
       // rate spec "blob 500 MB/s" in units of 1 MB (byte_unit) = 500 units/s; time spec §6
-      // "blob store per-MB cost" (disk) + "per-MB transfer" (network) = 30 + 10 = 40 ms per
-      // MB, so c = 500/s × 40 ms = 20 transfers at once (Little's law). Summed via count():
-      // see resolve_link_latency for why chrono's operator+ is not visible here.
+      // "blob store per-MB cost" (disk, 30 ms) + "per-MB transfer" (network, 10 ms) = 40 ms per
+      // MB. Spec §6 lists the two separately; adding them is chosen: the store reads a
+      // megabyte, then sends it, serially, with no pipelining of the next megabyte's disk read
+      // under this one's transfer (with it, a MB would take max(30, 10) = 30 ms). So c = 500/s ×
+      // 40 ms = 20 megabyte slots (Little's law). Summed via count(): see resolve_link_latency
+      // for why chrono's operator+ is not visible here.
       return {Rate{blob_store_byte_rate.bytes_per_second / byte_unit},
               SimTime{t.disk_read_1mb.count() + t.network_read_1mb.count()}};
     case search_index:

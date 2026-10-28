@@ -75,7 +75,7 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `cache` | a fixed or [`che`](#che-hit-ratios) hit ratio, every strategy (`write_back` with an asynchronous flush), [`then` steps](#then-steps-on-a-cache) |
 | `sql_db` | a primary and read replicas, `shards`, `pool`, `replication_lag` and the `staleness` SLO, see [`sql_db`](#sql_db) |
 | `cdn` | a fixed or `che` hit ratio (or none: every read misses), misses fetched from its `origin`, see [`cdn`](#cdn); with a byte `capacity` it counts megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)) |
-| `blob_store` | every op, counting megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)); not with `then` steps |
+| `blob_store` | every op, counting megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)): its queue waits for whole objects, a write (`write_ops`) is answered at its last byte, a read at its first megabyte; not with `then` steps |
 | `id_generator` | as a `service` whose capacity and service time its `algorithm` supplies, see [`id_generator`](#id_generator) |
 
 Everything else is refused before the first step, with exit code 1:
@@ -204,7 +204,7 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 | `type` | enum | all | read | one of the catalogue below |
 | `dc` | string | all | read | a declared datacenter; default as above. Decides whether a link without `latency` is intra- or cross-DC |
 | `replicas` | integer > 0 | all | read | N identical copies: each copy sees its share of the demand with the node's full capacity, concurrency and queue limit; backlog and drops are reported summed. How the demand is shared depends on a load balancer in front ([below](#load_balancer)); without one, `demand / N` each. On a `sql_db` the copies are one primary and `N − 1` read replicas, split by op whatever stands in front (see [`sql_db`](#sql_db)); on a `ticket_server` id generator it must be 1. No effect on a client |
-| `capacity` | rate or byte rate | all but `client` | read | service rate **per replica**; default per type (§6 of the spec; 100k/s for `load_balancer`, `rate_limiter` and `cache`). A byte rate (`100GB/s`, or in bits as a network is rated: `40Gbit/s` = 5 GB/s, printed `5GB/s`) on a `cdn` or `blob_store`, and a `blob_store`'s default (spec §6's 500 MB/s), makes the node count **megabytes**: its capacity is that many MB/s, a request costs its size in MB (the client's `sizes:` or the step's `size:`), and its service time is one megabyte's (10 ms at a CDN, 40 ms at a blob store), so a request's response is its wait plus that one megabyte, its time to first byte: `capacity=100k MB/s (scenario)  service_time=10ms per MB (default)`. `explain` checks it in MB/s with the requests beside: `cdn_us  peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)`. A byte rate on any other type is an error, since those types count requests: `a service counts requests; a byte capacity belongs on a cdn or blob_store`. At most `1e15/s` (`1e15B/s` for a byte rate). An error on a `leaky_bucket` limiter |
+| `capacity` | rate or byte rate | all but `client` | read | service rate **per replica**; default per type (§6 of the spec; 100k/s for `load_balancer`, `rate_limiter` and `cache`). A byte rate (`100GB/s`, or in bits as a network is rated: `40Gbit/s` = 5 GB/s, printed `5GB/s`) on a `cdn` or `blob_store`, and a `blob_store`'s default (spec §6's 500 MB/s), makes the node count **megabytes**: its capacity is that many MB/s, a request costs its size in MB (the client's `sizes:` or the step's `size:`), and its service time is one megabyte's (10 ms at a CDN, 40 ms at a blob store), so by Little's law it has `c = MB/s × that time` megabyte slots: `capacity=100k MB/s (scenario)  service_time=10ms per MB (default)  c=1000 MB slots (implied)  queue_limit=1000 MB (default)`. Each request is a **batch** of megabytes that holds one slot for its whole transfer (size × the time of one MB: a 50 MB object 2 s at a blob store), so the node's queue waits for whole objects: Erlang C (M/M/c) is fed the rate-weighted mean object time `s_obj = Σ rate_op × MB_op × time per MB / Σ rate_op` (recomputed every step from the arrivals) with the same `c`, which leaves `rho` as in MB/s and makes the wait a whole object's. At `rho` 0.9, 50 MB objects at a default blob store (20 slots) wait `C(20, 0.9) × 2 s / (20 × 0.1)` = 0.55 s, where 1 MB units would say 11 ms. A request is then answered after that wait at its **last byte** if it is a write (an op in a blob store's `write_ops`, default `write`): its whole transfer, a 300 MB upload at 40 ms per MB 12 s; and at its **first megabyte** otherwise (a read or a stream, which the client consumes as it arrives; this understates a large read needed whole before use). Either way a request under 1 MB takes one megabyte's time (an upper bound for small objects). Ignored: the spread of object sizes in one queue (M/M/c at their mean; mixed sizes wait longer). `explain` checks it in MB/s with the requests beside: `cdn_us  peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)`. A byte rate on any other type is an error, since those types count requests: `a service counts requests; a byte capacity belongs on a cdn or blob_store`. At most `1e15/s` (`1e15B/s` for a byte rate). An error on a `leaky_bucket` limiter |
 | `latency` | duration | all but `client` | read | service time of one request; default per type (50 µs for `load_balancer` and `rate_limiter`, 250 µs for `cache`: the spec's memory read). An error on a `leaky_bucket` limiter |
 | `advanced` | map | all but `client` | read | see next table |
 | `ops` | map | `client`, `service`, `ws_gateway` | read (client, service); checked (ws_gateway) | client: op → share; otherwise op → step list (below) |
@@ -219,7 +219,7 @@ A key outside its row is an error, e.g. `key 'capacity' is not valid for type 'c
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `queue_limit` | integer > 0 | 1000 (chosen) | units of work that may wait per replica (requests when every cost is 1; a request of `cost` 3 takes three); beyond it the excess is dropped. An error on a `leaky_bucket` limiter, whose `burst` is its waiting room |
+| `queue_limit` | integer > 0 | 1000 (chosen) | units of work that may wait per replica (requests when every cost is 1; a request of `cost` 3 takes three); beyond it the excess is dropped. On a node that counts megabytes (a byte `capacity`, see [Node (common keys)](#node-common-keys)) the units are MB: the default waiting room there is 1000 MB (chosen: the generic default read in the node's unit, twenty 50 MB streams), printed `queue_limit=1000 MB`. An error on a `leaky_bucket` limiter, whose `burst` is its waiting room |
 | `concurrency` | integer in [1, 100000] | implied: `max(1, ceil(capacity × latency))`, capped at 100000 | servers per replica, the c of M/M/c. The cap exists because the Erlang C term costs O(c) per node per step. The default is Little's law at full load (busy servers = throughput × time in service), which keeps the rate and the Erlang C term describing one machine. An error on a `leaky_bucket` limiter (one leak slot) |
 | `service_variability` | number ≥ 0 | 1.0 (2.0 for `external_sink`) | squared coefficient of variation (SCV) of service time; 1 = exponential. An error on a `leaky_bucket` limiter (the leak is deterministic: SCV 0) |
 | `burstiness` | number ≥ 0 | 1.0 | SCV of inter-arrival times; 1 = Poisson. With `service_variability` it forms the Allen–Cunneen factor `(burstiness + service_variability) / 2` that scales the queueing wait (Kingman's correction) |
@@ -272,7 +272,7 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `kv_cluster` | `nodes` (int), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp` | ignored; phase 3 |
 | `message_queue` | `partitions`, `retention` † | ignored; phase 2c |
 | `worker_pool` | `consumes` (queue node id), `workers`, `cost` (duration per job), `then` | `consumes` checked; others ignored; phase 2c |
-| `blob_store` | `then` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `then` checked, refused by run/estimate until phase 2c's events |
+| `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store; `then` checked, refused by run/estimate until phase 2c's events |
 | `search_index` | `build_interval` | ignored |
 | `ws_gateway` | `max_connections`, `heartbeat` (duration), `fanout` (avg recipients per message), `ops` | `ops` checked as step lists; others ignored; phase 3 |
 | `service_discovery` | `failover` (duration) | ignored; phase 3 |
@@ -564,8 +564,9 @@ A `che` CDN is the Che approximation over its `keys` objects: LRU eviction and i
 requests from the clients' key popularity, as for a cache.
 
 A CDN with a byte `capacity` counts megabytes (see `capacity` in
-[Node (common keys)](#node-common-keys)): a 100 GB/s edge at 10 ms per MB holds 1000 transfers
-at once and saturates at 2k streams/s of 50 MB.
+[Node (common keys)](#node-common-keys)): a 100 GB/s edge at 10 ms per MB has 1000 megabyte slots
+and saturates at 2k streams/s of 50 MB; its queue waits for whole streams (one holds a slot
+0.5 s) and a stream, a read, is answered at its first megabyte.
 
 Not modelled: link bandwidth (phase 2c), the transfer time of a stream beyond its first megabyte,
 TTL expiry and the stale content it serves, a cold
@@ -788,7 +789,7 @@ Two different promises, kept apart on purpose:
 
 - a **drop** is a node **failing**: its waiting room was full, so the excess is shed.
   `drop_rate` = Σ dropped / Σ demand **of that node** (in capacity units when the node has
-  a `cost`), so it stays in [0, 1] even when fan-out multiplies the clients' requests
+  a `cost` or counts megabytes), so it stays in [0, 1] even when fan-out multiplies the clients' requests
   before they reach it (one post → 100 feed writes would make "dropped anywhere / offered
   by clients" 90). Without `node` it is the worst node's, since every node must keep the
   bound.
@@ -817,11 +818,18 @@ some node refused anything; the node table has `dropped` and `rejected` columns;
 `committed_writes_per_s`, the writes one shard's primary committed per second, all three `null`
 for other nodes. Each SLO object has a `note`: `null`, or why the verdict is not `observed`
 against `max` alone (a replica that falls behind without bound).
+At a node that counts megabytes (a byte `capacity`, see [Node (common keys)](#node-common-keys))
+the node's own numbers are in MB: the table's `dropped`, JSON's `dropped`, and the series'
+`demand_per_s`, `drain_per_s`, `drops_per_s` (MB/s) and `backlog` (MB), as its capacity and
+`queue_limit` are; what the clients offered and got answered (`offered_per_s`,
+`answered_per_s`) stays requests. Its `latency_ms` is its requests' own sojourns mixed by their
+rates, each answered at its last byte (a write) or its first megabyte (a read).
 
 `run --series` writes one CSV row per node per step:
 `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`
 (`rejected_per_s` new in v1.2, `demand_per_s` and `drain_per_s` in phase 2b; demand, drain,
-drops and backlog in capacity units; a client row has zeros and zone `none`).
+drops and backlog in capacity units, megabytes at a byte-sized node; a client row has zeros and
+zone `none`).
 `run --series-ops` writes one CSV row per client op per step (phase 2b):
 `t_s,client,op,offered_per_s,answered_per_s,mean_ms`, where `answered_per_s` is the part of
 the offered rate that came back answered (offered × the fraction the path delivered: offered

@@ -7,8 +7,9 @@
 // serve `service_rate` requests per second, with a bounded waiting room. Requests are a
 // continuous fluid, not individuals. Captured: saturation (backlog grows past capacity),
 // load shedding (drops once the waiting room is full), and the stochastic delay a real
-// node shows below saturation (bunching of random arrivals). Ignored: request sizes,
-// priorities, retries, and any per-request identity.
+// node shows below saturation (bunching of random arrivals). Ignored: request sizes (the
+// engine prices them as capacity units and, at a byte-sized node, sets the mean object's
+// service time: set_service_time), priorities, retries, and any per-request identity.
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation). Note CLAUDE.md §3: no <chrono> here; time helpers come from simsys.core.
@@ -38,6 +39,12 @@ export namespace simsys::fluid {
 // machines. Example: rate 2000/s,
 // s = 1 ms, c = 1 at 1500/s gives an Erlang wait computed at rho 0.75 (3 ms) while a
 // consistent 2000/s server (s = 0.5 ms) would wait 1.5 ms. `service_rate` must be >= 0.
+// One planned exception, a byte-sized node (plan 2c refinement 2): `service_rate` counts
+// megabytes (MB/s) and c = MB/s × the time of one MB, but `service_time_s` is the mean time one
+// OBJECT holds a server (FluidQueue::set_service_time, from the engine each step), so the rate is
+// MB/s and c / service_time_s is objects/s. The invariant then holds where it matters, in rho:
+// objects/s × s_obj / c = MB/s × s_MB / c = MB/s / service_rate (Little's law), so the fluid
+// drain and Erlang C see the same utilization and the wait is a whole object's.
 struct Capacity {
   Rate service_rate;        // requests per second one replica can drain
   double service_time_s{};  // seconds one request occupies a server
@@ -69,6 +76,10 @@ struct FluidStep {
   double backlog{};               // requests waiting after this step
   double rho{};                   // utilization = busy fraction drain/capacity, in [0, 1]
   flow::LatencyEstimate latency;  // sojourn = queueing wait + service time
+  // The queueing wait alone (the latency above without its service time): what a byte-sized
+  // node adds each op's own service to, a write's whole transfer or a read's first megabyte
+  // (engine::Simulation::own_sojourn).
+  flow::LatencyEstimate wait;
   Zone zone{Zone::green};
 };
 
@@ -89,6 +100,13 @@ class FluidQueue {
   // empty (drain = demand = capacity), settle() fills it (the >= below).
   void settle(Rate demand);
 
+  // Replaces the time one request occupies a server, which feeds the Erlang C wait and the
+  // sojourn's service term; the rate, c and the backlog stay. For a node whose mean service time
+  // moves with its op mix: a byte-sized node's objects are as long as their sizes (the engine
+  // sets their rate-weighted mean every step; see Capacity's invariant). Throws
+  // std::invalid_argument unless `service_time_s` > 0 (a programmer error).
+  void set_service_time(double service_time_s);
+
   [[nodiscard]] double backlog() const { return backlog_; }
   [[nodiscard]] const Capacity& capacity() const { return capacity_; }
 
@@ -99,7 +117,8 @@ class FluidQueue {
   [[nodiscard]] double spill_overflow(double dt_s);
   [[nodiscard]] double utilization(double drain_per_s) const;
   [[nodiscard]] double backlog_wait_s() const;
-  [[nodiscard]] flow::LatencyEstimate sojourn(double rho) const;
+  [[nodiscard]] flow::LatencyEstimate wait(double rho) const;
+  [[nodiscard]] flow::LatencyEstimate sojourn(const flow::LatencyEstimate& waited) const;
   static void require_positive_step(SimTime dt);
 
   Capacity capacity_;
@@ -154,6 +173,7 @@ FluidStep FluidQueue::advance(Rate demand, SimTime dt) {
   grow_backlog(demand_per_s, drain_per_s, dt_s);
   const double dropped_per_s = spill_overflow(dt_s);
   const double rho = utilization(drain_per_s);
+  const flow::LatencyEstimate waited = wait(rho);
   // C++20 designated initializers: name the fields at the construction site. Replaces
   // positional aggregate init, which silently swaps same-typed doubles when the struct
   // is reordered; FluidStep has five doubles in a row, so the names earn their keep.
@@ -162,12 +182,21 @@ FluidStep FluidQueue::advance(Rate demand, SimTime dt) {
                    .dropped_per_s = dropped_per_s,
                    .backlog = backlog_,
                    .rho = rho,
-                   .latency = sojourn(rho),
+                   .latency = sojourn(waited),
+                   .wait = waited,
                    .zone = zone_of(rho, capacity_)};
 }
 
 void FluidQueue::settle(Rate demand) {
   backlog_ = demand.per_second >= capacity_.service_rate.per_second ? capacity_.queue_limit : 0.0;
+}
+
+// `!(s > 0)` rather than `s <= 0` so that a NaN is refused too.
+void FluidQueue::set_service_time(double service_time_s) {
+  if (!(service_time_s > 0.0)) {
+    throw std::invalid_argument{"FluidQueue::set_service_time: the time must be > 0"};
+  }
+  capacity_.service_time_s = service_time_s;
 }
 
 // `dt.count() <= 0`, not `dt <= SimTime::zero()`: SimTime::zero() is a static member and
@@ -229,8 +258,9 @@ double FluidQueue::backlog_wait_s() const {
   return backlog_ / cap;
 }
 
-// Sojourn time (what the book calls latency) = queueing wait + service time, where the
-// queueing wait is the LARGER of two estimates (our heuristic, not a published result):
+// Sojourn time (what the book calls latency) = queueing wait (wait()) + service time
+// (sojourn()), where the queueing wait is the LARGER of two estimates (our heuristic, not a
+// published result):
 //
 //   fluid  backlog_/cap: the deterministic drain time of the backlog (backlog_wait_s()).
 //   stoch  k * M/M/c Wq at min(rho, 0.99): the random bunching of arrivals that a node
@@ -251,17 +281,24 @@ double FluidQueue::backlog_wait_s() const {
 // deepens: dropping it (a "deterministic drain" has no spread) made the estimated p99
 // FALL the moment the backlog wait overtook the Erlang wait, because the lognormal fit
 // lost its spread faster than the mean grew. Also our heuristic, not a published result.
-flow::LatencyEstimate FluidQueue::sojourn(double rho) const {
-  const double s = capacity_.service_time_s;
+flow::LatencyEstimate FluidQueue::wait(double rho) const {
   const double k =
       queueing::variability_factor(capacity_.burstiness, capacity_.service_variability);
-  const auto wait = queueing::mmc_wait(capacity_.concurrency, std::min(rho, max_stochastic_rho), s);
+  const auto erlang = queueing::mmc_wait(capacity_.concurrency, std::min(rho, max_stochastic_rho),
+                                         capacity_.service_time_s);
   const double fluid_wait_s = backlog_wait_s();
-  const double stochastic_wait_s = k * wait.mean_s;
-  const double service_variance_s2 = capacity_.service_variability * s * s;
+  const double stochastic_wait_s = k * erlang.mean_s;
   // std::max(stochastic, fluid): the stochastic term first, so a NaN in it propagates.
-  return flow::LatencyEstimate{.mean_s = std::max(stochastic_wait_s, fluid_wait_s) + s,
-                               .variance_s2 = k * k * wait.variance_s2 + service_variance_s2};
+  return flow::LatencyEstimate{.mean_s = std::max(stochastic_wait_s, fluid_wait_s),
+                               .variance_s2 = k * k * erlang.variance_s2};
+}
+
+// The wait plus one service time s, its variance cs^2 × s^2 (independent of the wait).
+flow::LatencyEstimate FluidQueue::sojourn(const flow::LatencyEstimate& waited) const {
+  const double s = capacity_.service_time_s;
+  return flow::LatencyEstimate{
+      .mean_s = waited.mean_s + s,
+      .variance_s2 = waited.variance_s2 + capacity_.service_variability * s * s};
 }
 
 }  // namespace simsys::fluid
