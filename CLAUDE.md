@@ -56,3 +56,15 @@ Write for a reader who has read the book but has not studied queueing theory.
 - Scenario YAML files get a README explaining the design and the mechanisms the model
   abstracts away.
 - Commit messages explain *why*; the diff shows *what*.
+
+## 4. Clean code, named patterns, TDD
+
+- **Clean code**: self-explanatory names; short functions that do one thing and delegate
+  the next thing to another well-named function; no clever tricks without a comment.
+- **Name every design pattern** where it is used (Factory, Registry, Strategy/Policy,
+  Adapter, Decorator, Visitor, Builder, Type erasure, ...) in a comment at the point of use:
+  `// Pattern: Strategy — the eviction policy is a compile-time parameter ...`. Students
+  should be able to grep for `Pattern:`.
+- **Test-driven**: tests are written before the implementation, in small batches; the
+  implementation is the minimum that makes them pass; then refactor. Integration-level
+  tests are added once the units they combine exist.
