@@ -18,8 +18,11 @@ one of two generators by the links' `weight`:
 
 SLOs: p99 of `next_id` at most 10 ms, and no drops anywhere.
 
-The shipped file **fails on purpose**: the ticket server is the design ch. 7 rejects, and the
-lab shows why. `tests/scenario/test_scenarios.cpp` pins both halves: the shipped run fails
+The shipped file **fails on purpose**: the ticket server is the design ch. 7 rejects. The
+book's objection is its single point of failure (one database: when it is down, nobody gets an
+id), which the model cannot show before failures arrive in phase 3; what the lab shows is the
+same design's other limit, one database's throughput below the 10k/s requirement.
+`tests/scenario/test_scenarios.cpp` pins both halves: the shipped run fails
 `drop_rate` at 0.339, and the switched run (below) passes every SLO.
 
 ## What the model captures

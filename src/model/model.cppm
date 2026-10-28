@@ -378,8 +378,8 @@ struct Advanced {
 // popular each of the `space` keys it asks for is, under the independent reference model of
 // simsys.caching (every request picks a key independently, with a fixed probability).
 //  - `{zipf: s, space: N}`: Zipf over N keys with exponent s, `zipf` set — the key of rank i
-//    is asked with probability ∝ i^-s (book ch. 8: "a few short links get most of the
-//    clicks"; s ≈ 1 is the classic web skew);
+//    is asked with probability ∝ i^-s (as in book ch. 8's URL shortener, where a few short
+//    links get most of the clicks: our paraphrase; s ≈ 1 is the classic web skew);
 //  - `{uniform: N}`: every key equally likely, `zipf` empty.
 // `space` is a count of keys, a double because key spaces run to 1e9 and the Che sums are in
 // doubles anyway. A che cache reads the KeySpec of the clients whose ops reach it (graph's

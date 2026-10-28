@@ -33,7 +33,9 @@ nodes:
     burst: 100
     backend: counters
 
-  counters: {type: cache, eviction: ttl, ttl: 1m, keys: 1M, hit_ratio: {fixed: 1.0}, capacity: 100k/s, latency: 0.2ms}
+  # The limiter's `counter` is ch. 4's Redis INCR, a write: the store must say so, or the graph
+  # refuses it (a store would serve the increment as a read).
+  counters: {type: cache, eviction: ttl, ttl: 1m, keys: 1M, hit_ratio: {fixed: 1.0}, write_ops: [counter], capacity: 100k/s, latency: 0.2ms}
 
   api:
     type: service

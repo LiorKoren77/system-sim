@@ -1951,7 +1951,11 @@ constexpr std::string_view client_keys_keys = "zipf space uniform";
 std::expected<double, ConfigError> read_key_space(const Site& site, const YAML::Node& value,
                                                   std::string_view key) {
   const auto count = parse_count(number_text(value));
-  if (!count) return site.fail(value, std::format("keys.{} must be a positive count", key));
+  if (!count) {
+    return site.fail(value, std::format("keys.{} must be a positive count (a whole number, "
+                                        "optionally with k, M or G: 500, 10k, 100M)",
+                                        key));
+  }
   return static_cast<double>(*count);
 }
 

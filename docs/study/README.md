@@ -19,16 +19,20 @@ building it, and further reading. See §10 of the design spec for the planned li
 ## Where to look: design patterns
 
 Every design pattern is named where it is used, in a `Pattern:` comment, so
-`grep -rn 'Pattern:' src` lists them all. Phase 2b added four worth reading side by side:
+`grep -rn 'Pattern:' src` lists them all. Phase 2b added three worth reading side by side:
 
 - `Pattern: Delegation` on `CdnBehaviour` (`src/engine/behaviours.cppm`): a CDN is the
   read-through shape of a cache, so it holds a `CacheBehaviour` and forwards every call to it
   instead of inheriting from it or copying it.
-- `Pattern: sugar resolved at build` on `defaults_of` (`src/defaults/defaults.cppm`): an id
-  generator is a `ServiceBehaviour` whose two numbers its `algorithm` supplies; no new class.
 - The `CopyRole` enum (`server`, `primary`, `replica`) on `CopyGroup` in
   `src/engine/engine.cppm`, used by `make_database` under `Pattern: Strategy (data-driven)`: a
   closed enum states what a database copy is instead of inferring it from its shares.
 - `Pattern: Observer` on `Summary`, `SeriesWriter` and `OpSeriesWriter`
   (`src/report/report.cppm`), fanned out by one lambda in `run` (`src/cli/main.cpp`): each
   observer sees every step record and none knows of another.
+
+Not every reuse is a named pattern, and none is claimed where none applies: `defaults_of`
+(`src/defaults/defaults.cppm`) makes an id generator a `ServiceBehaviour` whose two numbers its
+`algorithm` supplies, with no new class; and a cache's `strategy` (`sends_to_store` in
+`src/engine/graph.cppm`) is caching practice's word for a closed enum tested in one place, not
+the GoF Strategy pattern.

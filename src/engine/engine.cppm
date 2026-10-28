@@ -379,6 +379,10 @@ class Simulation {
                                             const behaviours::Behaviour& behaviour);
   [[nodiscard]] static flow::Flow dropped_part(const flow::Flow& content,
                                                const fluid::FluidStep& copy_step, double copies);
+  // C++20 std::span<const T>: a non-owning view of contiguous elements (a whole array or
+  // vector, or the front of one), replacing a (pointer, count) pair or a `const std::vector&`
+  // that would force the caller to own a vector. The sojourns live in a fixed-size array of
+  // which only the groups in use are passed (see the caller).
   static void record_sojourns(Node& node, std::span<const flow::LatencyEstimate> sojourns,
                               NodeSample& sample);
   [[nodiscard]] static flow::LatencyEstimate request_weighted_sojourn(const Node& node);
@@ -1128,9 +1132,9 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSampl
     dropped += clients_part(group, std::move(step.dropped), node.behaviour);
   }
   node.dropped = in_requests(dropped, node.behaviour);
-  // C++20 std::span with C++17 class template argument deduction: `std::span{sojourns}`
-  // deduces std::span<LatencyEstimate, max_copy_groups> from the array without spelling the
-  // type, and first(n) views only the n groups in use, replacing a (pointer, count) pair.
+  // std::span with C++17 class template argument deduction: `std::span{sojourns}` deduces
+  // std::span<LatencyEstimate, max_copy_groups> from the array without spelling the type, and
+  // first(n) views only the n groups in use.
   const auto in_use = std::span{sojourns}.first(node.copy_groups.size());
   record_sojourns(node, in_use, sample);
   if (node.replication) record_replication(node, in_use, replication, sample);

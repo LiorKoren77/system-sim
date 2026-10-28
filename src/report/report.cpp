@@ -727,6 +727,9 @@ template <class T, class F>
   std::vector<std::string> parts;
   if (spec.type != model::NodeType::sql_db) return parts;
   for (const auto& op : g.arriving_ops(node)) {
+    // C++20 std::map::contains: "is this key in the map?" in one call, replacing
+    // `cost.find(op) != cost.end()` or `cost.count(op) != 0`; here: did the scenario state
+    // this op's cost?
     if (!graph::is_write(spec, op) || spec.cost.contains(op)) continue;
     parts.push_back(op + " " + num(defaults::op_cost(spec, op), 6));
   }
@@ -1725,12 +1728,29 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
          " total capacity  ";
 }
 
+// Why a node's capacity gets no verdict, or nothing when it gets one:
+//  - a capacity converted from bytes (see above): "capacity from 100GB/s at 1MB/object; byte
+//    flows: phase 2c";
+//  - a kv_cluster: its `nodes`, `replication` and quorums are read and ignored until phase 3
+//    (schema), so its capacity is ONE box's (`capacity: 10k/s` is per node in labs/kv-store, of
+//    eight, each write landing on N = 3 of them). A percentage against it would be a verdict on
+//    a model the simulator does not have: labs/kv-store printed 300 %, red.
+[[nodiscard]] std::optional<std::string> unchecked_capacity(const graph::ResolvedNode& node) {
+  if (const auto bytes = defaults::byte_rate_behind(node.spec)) {
+    return "capacity from " + byte_conversion(*bytes);
+  }
+  if (node.spec.type == model::NodeType::kv_cluster) {
+    return std::string{"kv_cluster nodes, replication and quorums: phase 3"};
+  }
+  return std::nullopt;
+}
+
 [[nodiscard]] std::string check_details(const graph::ResolvedNode& node, double offered,
                                         const std::optional<graph::DatabaseCopyLoads>& loads) {
   const double capacity = total_capacity(node);
   const std::string head = check_head(node, offered);
-  if (const auto bytes = defaults::byte_rate_behind(node.spec)) {
-    return head + "(not checked: capacity from " + byte_conversion(*bytes) + ")";
+  if (const auto unchecked = unchecked_capacity(node)) {
+    return head + "(not checked: " + *unchecked + ")";
   }
   if (capacity <= 0.0) return head + "(no capacity, red)" + hottest_copy_check(node, offered);
   const double rho = offered / capacity;
@@ -1745,7 +1765,8 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 //    propagated: ...)". No zone below red: the real load is higher, so green or yellow might not
 //    hold, but a red lower bound is red for certain, "(≥150%, red; ...)" (a database's at the
 //    busiest copy, headline_zone);
-//  - a capacity converted from bytes: its own "not checked" note (check_details), then the mark.
+//  - a capacity with no verdict (unchecked_capacity): its own "not checked" note
+//    (check_details), then the mark.
 // No per-copy checks: each would be a verdict on the same partial number.
 [[nodiscard]] std::string partial_check(const graph::ResolvedNode& node, double offered,
                                         const OpLoad& arriving,
@@ -1754,7 +1775,7 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   const std::string mark = unpropagated_mark(blocked);
   const bool reached = offered > 0.0 || !std::isfinite(offered);
   if (!reached) return head + "(" + mark;
-  if (defaults::byte_rate_behind(node.spec)) {
+  if (unchecked_capacity(node)) {
     return check_details(node, offered, std::nullopt) + "  (lower bound; " + mark;
   }
   const double capacity = total_capacity(node);
@@ -1776,9 +1797,8 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   const std::string note =
       upper_bound[i] ? " (hit ratio unknown: counted as 0 — an upper bound)" : "";
   if (!blocked.empty()) return partial_check(node, load.totals[i], load.by_op[i], blocked) + note;
-  // A capacity converted from bytes gets no verdict (check_details), per copy neither.
-  const auto loads =
-      defaults::byte_rate_behind(node.spec) ? std::nullopt : database_loads(node, load.by_op[i]);
+  // A capacity with no verdict (unchecked_capacity) gets none per copy either.
+  const auto loads = unchecked_capacity(node) ? std::nullopt : database_loads(node, load.by_op[i]);
   return check_details(node, load.totals[i], loads) + database_check(node, loads) + note;
 }
 

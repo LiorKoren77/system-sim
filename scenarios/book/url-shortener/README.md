@@ -81,9 +81,12 @@ warmup).
   14:00, for: 5m, factor: 5}]` under `users.rate` (96k/s for 5 minutes): the limiter rejects
   22.8M requests (76k/s × 300 s), what passes is 20k/s plus the 2000-token burst, the web
   tier touches red for 1 s (0.5 s at 100 ms steps) and nothing drops: both SLOs still pass
-  (p99 7.52 ms). Without the limiter (users → lb directly) the same spike hits the web tier
-  head-on: red for 302 s, 21.59M dropped, drop rate 0.01914 and redirect p99 66.3 ms: both
-  SLOs fail.
+  (p99 7.52 ms). The limiter itself and its `rules_cache` are not spared: every request of the
+  spike reaches both, 96k/s against their 100k/s default capacity, so each runs at rho 0.96,
+  red for the 300 s (`red_s 300`) without dropping. A limiter is sized for the flood it
+  refuses, not for the traffic it lets through. Without the limiter (users → lb directly) the
+  same spike hits the web tier head-on: red for 302 s, 21.59M dropped, drop rate 0.01914 and
+  redirect p99 66.4 ms: both SLOs fail.
 
 ## What it abstracts away
 - Base-62 encoding, 301 vs 302 semantics, collision handling.

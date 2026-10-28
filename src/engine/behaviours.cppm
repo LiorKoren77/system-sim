@@ -861,9 +861,10 @@ class RateLimiterBehaviour {
 //   Neither may send the store the op the store hop sends it (graph::Graph refuses a then step
 //   that duplicates the backend hop).
 // The share of each op a then-step carries is graph::Graph::then_fraction, as the paper load's.
-// Pattern: Strategy (enum-dispatched) — the strategy is a closed enum, not a class per
-// strategy: graph::Graph::backend_fraction switches on it once per op at construction, and
-// this behaviour only reads the resulting shares.
+// The cache strategy (caching practice's word, not the GoF Strategy pattern) is a closed enum,
+// not a class per strategy: graph::Graph::backend_fraction tests it (through
+// graph's sends_to_store) once per op at construction, and this behaviour only reads the
+// resulting shares.
 // Ignored: which keys are popular (h is a number here; graph::Graph turns a `che` hit ratio into
 // one at build), entries expiring by TTL and the
 // eviction order (`ttl`, `eviction` are read and printed only), a cold cache filling up

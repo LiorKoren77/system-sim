@@ -106,7 +106,9 @@ NodeSpec limiter_spec(LimiterAlgorithm algorithm, double limit_per_s,
                   .window = window,
                   .backend = std::move(backend)};
 }
-// u -> limiter -> api, and, when the limiter names a backend, limiter -> counters (a cache).
+// u -> limiter -> api, and, when the limiter names a backend, limiter -> counters (a cache, whose
+// write_ops name `counter`: an INCR is a write, and Graph::build refuses a store that counts it
+// as a read).
 // Node indices: u 0, limiter 1, api 2, counters 3. The links to the limiter and the api
 // have zero latency unless a leg is given; plain links (no `ops` filter), as in the lab.
 Scenario limiter_front(NodeSpec limiter,
@@ -122,7 +124,9 @@ Scenario limiter_front(NodeSpec limiter,
   s.links = {LinkSpec{.from = "u", .to = "limiter", .latency = 0s},
              LinkSpec{.from = "limiter", .to = "api", .latency = api_leg}};
   if (with_backend) {
-    s.nodes.push_back(NodeSpec{.id = "counters", .type = NodeType::cache});
+    s.nodes.push_back(NodeSpec{.id = "counters",
+                               .type = NodeType::cache,
+                               .write_ops = std::vector<std::string>{"counter"}});
     s.links.push_back(LinkSpec{.from = "limiter", .to = "counters", .latency = backend_leg});
   }
   return s;

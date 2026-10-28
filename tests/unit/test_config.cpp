@@ -992,6 +992,9 @@ TEST_CASE("a client's keys are typed: zipf with a space, or uniform") {
     REQUIRE(s.has_value());
     const auto& keys = s->nodes[0].workload->keys;
     REQUIRE(keys.has_value());
+    // C++20 designated initializers: `KeySpec{.zipf = ..., .space = ...}` names each member,
+    // replacing positional `KeySpec{std::nullopt, 10e3}`, where the reader must know the order
+    // of the members; here the expected value reads as the canonical form it states.
     CHECK(*keys == simsys::model::KeySpec{.zipf = std::nullopt, .space = 10e3});
   }
   SECTION("a client without keys has none") {
@@ -1011,8 +1014,14 @@ TEST_CASE("a client's keys block is validated") {
                    "node 'u': keys.zipf must be a finite non-negative number");
   require_rejected("simsys_keys_word.yaml", client_with("keys: {zipf: hot, space: 10}"),
                    "node 'u': keys.zipf must be a finite non-negative number");
+  // A count's message lists the forms it accepts, so a student who wrote `1.5M` or `-10` sees
+  // what to write instead (review of c9d5f8c).
   require_rejected("simsys_keys_zero_space.yaml", client_with("keys: {zipf: 1, space: 0}"),
-                   "node 'u': keys.space must be a positive count");
+                   "node 'u': keys.space must be a positive count (a whole number, optionally "
+                   "with k, M or G: 500, 10k, 100M)");
+  require_rejected("simsys_keys_fraction_uniform.yaml", client_with("keys: {uniform: 1.5M}"),
+                   "node 'u': keys.uniform must be a positive count (a whole number, optionally "
+                   "with k, M or G: 500, 10k, 100M)");
   require_rejected("simsys_keys_both.yaml", client_with("keys: {zipf: 1, space: 10, uniform: 5}"),
                    "node 'u': keys takes zipf+space or uniform, not both");
   require_rejected("simsys_keys_scalar.yaml", client_with("keys: 5"),
@@ -3107,6 +3116,9 @@ TEST_CASE("a sql database's shards, pool, replication lag and write ops are type
     const auto s = load_accepted("simsys_sql_write_ops_default.yaml", db_scenario("replicas: 2"));
     REQUIRE_FALSE(s.nodes[0].write_ops.has_value());  // absent: the type's default applies
     auto write_ops = simsys::model::write_ops_of(s.nodes[0]);
+    // C++20 std::ranges::sort: takes the container itself instead of a begin/end pair, and is
+    // constrained by concepts (a short error for a range that cannot be sorted); replaces
+    // std::sort(v.begin(), v.end()).
     std::ranges::sort(write_ops);
     REQUIRE(write_ops == std::vector<std::string>{"delete", "insert", "update", "write"});
   }

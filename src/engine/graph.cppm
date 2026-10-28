@@ -613,8 +613,9 @@ namespace {
   return spec.type == model::NodeType::cache;
 }
 
-// Pattern: Strategy (enum-dispatched) — the cache strategy is a closed enum and this is the one
-// place that says which ops each strategy sends to the store (its backend hop, as the same op):
+// The cache strategy (caching practice's word, not the GoF Strategy pattern: a closed
+// enum tested here, no class per strategy) is read in this one place, which says which ops each
+// strategy sends to the store (its backend hop, as the same op):
 // a read under read_through (its misses), a write under write_through, write_around and
 // write_back (every one; write_back's later and asynchronously), nothing else. Graph::
 // backend_fraction (how much), the key walk (detail::add_backend_hop) and the then-step check
@@ -627,6 +628,26 @@ namespace {
   if (!is_write(cache, op)) return fetches_read_misses(cache);
   return cache.strategy == write_through || cache.strategy == write_around ||
          cache.strategy == write_back;
+}
+
+// A write reaches the store under the sender's op name (a cache's backend hop passes its op on
+// unchanged, a limiter's counter is `counter`), and the store decides alone whether that op is a
+// write (model::write_ops_of). A store that counted the sender's write as a read would serve it
+// as one: a SQL database from any replica at cost 1, its primary never told (book ch. 1,
+// "database replication": every write goes to the primary); a cache from its hit ratio. So a SQL
+// database or a cache in the store's place must list the op among its writes; the message names
+// the list to fix: "node 'cache_servers': sends write 'set' to 'db', which counts 'set' as a
+// read; add it to db's write_ops". The other node types do not tell reads from writes, so they
+// cannot disagree (and a CDN refuses every write: Graph::check_reads_only).
+[[nodiscard]] std::optional<EngineError> write_counted_as_read(const model::NodeSpec& sender,
+                                                               std::string_view op,
+                                                               const model::NodeSpec& store) {
+  const bool tells_writes = store.type == model::NodeType::sql_db || is_cache(store);
+  if (!tells_writes || is_write(store, op)) return std::nullopt;
+  const std::string quoted = "'" + std::string{op} + "'";
+  return EngineError{"node '" + sender.id + "': sends write " + quoted + " to '" + store.id +
+                     "', which counts " + quoted + " as a read; add it to " + store.id +
+                     "'s write_ops"};
 }
 
 // Does the cache forward its own misses (a `then` step on miss)? Then nothing after it may fetch
@@ -869,6 +890,10 @@ DatabaseShares database_shares(const model::NodeSpec& spec) {
   const double copies_per_shard = spec.replicas;
   const double shards = spec.shards.value_or(1);
   if (copies_per_shard < 2.0) {
+    // C++20 designated initializers: `.primaries = shards` names the member it sets (in
+    // declaration order; an omitted one keeps its default), replacing positional
+    // `DatabaseShares{shards, 0.0, ...}`, where a reader must count commas against the struct to
+    // know which share is which: here six numbers of the same type.
     return DatabaseShares{.primaries = shards,
                           .replicas = 0.0,
                           .primary_reads = 1.0 / shards,
@@ -1324,6 +1349,23 @@ struct KeySource {
   return "the misses of " + std::string{model::to_string(filter.type)} + " '" + filter.id + "'";
 }
 
+// A che cache that is a rate limiter's counter store, and that no client's keys reach otherwise:
+// the counter requests carry none (the key walk leaves them out, see the section comment above),
+// so there is no popularity to solve Che over. Named for what it is, rather than agreed_keys'
+// "no client's demand reaches it", which the limiter's traffic contradicts.
+[[nodiscard]] std::optional<EngineError> keyless_counter_store(
+    std::span<const ResolvedNode> nodes, const std::string& store, const std::string& name,
+    std::span<const KeyArrival> arrivals) {
+  if (!arrivals.empty()) return std::nullopt;
+  for (const auto& node : nodes) {
+    if (node.spec.type != model::NodeType::rate_limiter || node.spec.backend != store) continue;
+    return EngineError{name + ": the counter requests of rate limiter '" + node.spec.id +
+                       "' carry no client keys (a counter is keyed by user or rule), and no "
+                       "client's keys reach it otherwise; give it hit_ratio: {fixed: ...}"};
+  }
+  return std::nullopt;
+}
+
 // The clients' one key distribution (plan 2b refinement 1): every client whose ops reach the
 // cache must state its keys, and all must agree (KeySpec's defaulted ==, on the canonical form:
 // zipf 0 is uniform). Phase 2c may mix several distributions by their rates.
@@ -1331,6 +1373,10 @@ struct KeySource {
     std::span<const ResolvedNode> nodes, const std::string& name,
     std::span<const KeyArrival> arrivals) {
   if (arrivals.empty()) {
+    // C++23 std::unexpected<E>: wraps an error so it converts to the error side of any
+    // std::expected<T, E> (here the KeySource one), replacing a thrown exception or a
+    // (bool, out-parameter) pair; `return KeySource{...}` is the value side. Every fallible step
+    // of the build returns its error this way (see Graph::build).
     return std::unexpected{EngineError{name + ": no client's demand reaches it"}};
   }
   std::optional<KeySource> source;
@@ -1364,8 +1410,7 @@ struct KeySource {
                                                                const std::string& name,
                                                                std::span<const KeyArrival> arrivals,
                                                                KeySource& source) {
-  // The reads among the arrivals. (A plain loop, not a std::views::filter: a lambda calling
-  // is_write, which has internal linkage, cannot appear in this module-linkage function.)
+  // The reads among the arrivals, as pointers into `arrivals`, which both passes below read.
   std::vector<const KeyArrival*> reads;
   for (const auto& arrival : arrivals) {
     if (!is_write(nodes[cache].spec, arrival.op)) reads.push_back(&arrival);
@@ -1478,6 +1523,9 @@ struct HitRatioInputs {
   }
   if (*spec.keys <= 0) {  // the loader's rule (config's read_cache_size), for code
     return std::unexpected{EngineError{"node '" + spec.id + "': keys must be a positive integer"}};
+  }
+  if (auto counter_only = keyless_counter_store(inputs.nodes, spec.id, name, inputs.arrivals)) {
+    return std::unexpected{std::move(*counter_only)};
   }
   auto source = agreed_keys(inputs.nodes, name, inputs.arrivals);
   if (!source) return std::unexpected{std::move(source.error())};
@@ -1670,10 +1718,7 @@ Graph::Result Graph::resolve_nodes() {
   for (const auto& spec : scenario_.nodes) {
     if (spec.type == model::NodeType::client) {
       if (auto invalid = invalid_client_keys(spec)) return std::unexpected{std::move(*invalid)};
-      // C++20 designated initializers: `.spec = spec` names the member it sets and leaves
-      // the others at their defaults, replacing positional `ResolvedNode{spec, {}, ...}`
-      // where a reader must count commas against the struct definition.
-      nodes_.push_back(ResolvedNode{.spec = spec});
+      nodes_.push_back(ResolvedNode{.spec = spec});  // the other members at their defaults
       continue;
     }
     if (spec.type == model::NodeType::rate_limiter) {
@@ -2100,16 +2145,26 @@ std::string Graph::sender_of(std::size_t node, std::string_view op) const {
 }
 
 // Every op a cache passes on to its backend must be one the link carries, or the cache
-// would send flow the link refuses: the same rule and message as a step's (connect_step).
+// would send flow the link refuses: the same rule and message as a step's (connect_step). And
+// every write it passes on must be a write at the store too (write_counted_as_read): the
+// consistent-hashing lab under write_through would otherwise show its database's primary idle
+// while every `set` lands on it (review of c9d5f8c).
 Graph::Result Graph::check_cache_backend_ops(std::size_t cache) {
   const auto& resolved = nodes_[cache];
   if (!resolved.backend) return {};
   const auto& link = links_[*resolved.backend_link];
+  const auto& store = nodes_[*resolved.backend].spec;
   for (const auto& op : arriving_ops_[cache]) {
-    if (backend_fraction(cache, op) <= 0.0 || carries_op(link, op)) continue;
-    return std::unexpected{EngineError{"link " + resolved.spec.id + " -> " +
-                                       nodes_[*resolved.backend].spec.id + " does not carry op '" +
-                                       op + "' (ops: " + joined(link.ops, ", ") + ")"}};
+    if (backend_fraction(cache, op) <= 0.0) continue;
+    if (!carries_op(link, op)) {
+      return std::unexpected{EngineError{"link " + resolved.spec.id + " -> " + store.id +
+                                         " does not carry op '" + op +
+                                         "' (ops: " + joined(link.ops, ", ") + ")"}};
+    }
+    if (!is_write(resolved.spec, op)) continue;
+    if (auto disagreement = write_counted_as_read(resolved.spec, op, store)) {
+      return std::unexpected{std::move(*disagreement)};
+    }
   }
   return {};
 }
@@ -2154,6 +2209,10 @@ Graph::Result Graph::connect_backend(std::size_t limiter) {
     return std::unexpected{
         EngineError{"link " + spec.id + " -> " + *spec.backend +
                     " does not carry op 'counter' (ops: " + joined(links_[*link].ops, ", ") + ")"}};
+  }
+  // `counter` is an INCR, a write: the store must count it as one (write_counted_as_read).
+  if (auto disagreement = write_counted_as_read(spec, counter_op, nodes_[*backend].spec)) {
+    return std::unexpected{std::move(*disagreement)};
   }
   nodes_[limiter].backend = *backend;
   nodes_[limiter].backend_link = *link;
