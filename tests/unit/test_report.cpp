@@ -972,16 +972,20 @@ TEST_CASE("the staleness SLO compares the replication lag plus write sojourn wit
     const double replica = 0.6 / 0.4 * 0.001 + 0.001;
     REQUIRE_THAT(json_value(json, "staleness_s"), WithinRel(0.050 + primary + replica, 1e-9));
     REQUIRE(json_value(json, "replication_dropped_per_s") == 0.0);
+    // The primary commits all 100 writes/s; each replica replays them.
+    REQUIRE_THAT(json_value(json, "committed_writes_per_s"), WithinRel(100.0, 1e-9));
   }
 }
 
-// A replica that cannot keep up with the writes it replays drops some of them, and from then on
-// it never holds what the primary holds: no staleness bound means anything (review of 48d4d0b,
-// C1). 2 copies, 800 reads/s + 400 writes/s at 1000/s per copy: the replica is sent 1200/s,
-// fills its queue by 5 s and then drops 200/s in its queue's mix, a third of it (66.7/s)
-// replicated writes. The staleness SLO fails on them whatever the mean staleness (here within
-// its 10 s bound), and says why;
-// the table and the JSON carry the number.
+// A replica that cannot keep up with the writes it replays falls behind without bound: a real
+// one keeps the excess in its relay log (MySQL) or WAL (Postgres) and its lag grows until it is
+// rebuilt; the model drops the excess at queue_limit, so its staleness stays finite. No staleness
+// bound holds either way (review of 48d4d0b, C1; re-review of 96848f0). 2 copies, 800 reads/s +
+// 400 writes/s at 1000/s per copy: the primary commits all 400 writes (rho 0.4); the replica is
+// sent 1200/s, fills its queue by 5 s and then drops 200/s in its queue's mix, a third of it
+// (66.67/s) replicated writes, 66.67 / 400 = 16.7 % of the committed writes. The staleness SLO
+// fails on them whatever the mean staleness (here within its 10 s bound), and says why; the
+// table and the JSON carry both numbers.
 TEST_CASE("the staleness SLO fails when a replica drops replicated writes", "[report]") {
   auto s = replicated_db();
   s.duration = 10s;
@@ -998,16 +1002,50 @@ TEST_CASE("the staleness SLO fails when a replica drops replicated writes", "[re
   REQUIRE(*summary.nodes()[1].mean_staleness_s < 10.0);
   REQUIRE_THAT(summary.nodes()[1].mean_replication_dropped_per_s.value(),
                WithinRel(200.0 * 400.0 / 1200.0, 1e-6));
+  REQUIRE_THAT(summary.nodes()[1].mean_committed_writes_per_s.value(), WithinRel(400.0, 1e-6));
   const auto results = simsys::report::evaluate_slos(summary, s.slos);
   REQUIRE(results[0].status == simsys::report::SloStatus::fail);
-  REQUIRE(results[0].note == "replica diverges: drops 66.67/s replicated writes");
+  const std::string note = "each replica misses 66.67/s of 400/s committed writes (16.7%)";
+  REQUIRE(results[0].note == note);
   const auto table = simsys::report::render_table(summary, results, false);
   CAPTURE(table);
-  REQUIRE(table.contains("replica diverges: drops 66.67/s replicated writes"));
+  REQUIRE(table.contains(note));
   const auto json = simsys::report::render_json(summary, results);
   CAPTURE(json);
   REQUIRE_THAT(json_value(json, "replication_dropped_per_s"), WithinRel(200.0 / 3.0, 1e-6));
-  REQUIRE(json.contains("\"note\": \"replica diverges: drops 66.67/s replicated writes\""));
+  REQUIRE_THAT(json_value(json, "committed_writes_per_s"), WithinRel(400.0, 1e-6));
+  REQUIRE(json.contains("\"note\": \"" + note + "\""));
+}
+
+// The missed writes are ONE replica's, against the writes ONE replica must replay (re-review of
+// 96848f0): summed over replicas they exceeded the writes committed (2131/s "dropped" of 900/s).
+// 6 copies (a primary and 5 replicas), 5000 reads/s + 900 writes/s at cost 1, 1000/s per copy:
+// the primary commits all 900 writes (rho 0.9); each replica is sent 5000 / 5 = 1000 reads + 900
+// replayed writes = 1900/s against 1000/s and drops 900/s in its queue's mix, 900 × 900/1900 =
+// 426.3/s of them replicated writes: 47.4 % of the 900/s committed. (The five together: 2132/s.)
+// The replication section shows both numbers per replica and per shard.
+TEST_CASE("the staleness note counts one replica's missed writes against the committed writes",
+          "[report]") {
+  auto s = replicated_db();
+  s.duration = 10s;
+  s.warmup = 6s;  // the replicas' queues are full after about 1.1 s
+  s.nodes[0].workload =
+      Workload{.curve = {.base = Rate{5900}},
+               .op_shares = {{"read", 5000.0 / 5900.0}, {"write", 900.0 / 5900.0}}};
+  s.nodes[1].replicas = 6;
+  s.slos = {simsys::model::SloSpec{
+      .metric = simsys::model::SloMetric::staleness, .node = "db", .max = 100ms}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  REQUIRE_THAT(summary.nodes()[1].mean_replication_dropped_per_s.value(),
+               WithinRel(900.0 * 900.0 / 1900.0, 1e-6));
+  const auto results = simsys::report::evaluate_slos(summary, s.slos);
+  REQUIRE(results[0].status == simsys::report::SloStatus::fail);
+  REQUIRE(results[0].note == "each replica misses 426.3/s of 900/s committed writes (47.4%)");
+  const auto table = simsys::report::render_table(summary, results, false);
+  CAPTURE(table);
+  REQUIRE(table.contains("committed writes/s per shard"));
+  REQUIRE(table.contains("missed writes/s per replica"));
 }
 
 // Shards × replicas (review of 48d4d0b): explain's total counts N × S copies, 3 × 2 of 1k/s, and
@@ -1020,7 +1058,8 @@ TEST_CASE("explain counts every copy of every shard and splits the load per copy
   CAPTURE(text);
   REQUIRE(text.contains("vs 6k/s total capacity"));
   REQUIRE(
-      text.contains("primary 50/s vs 1k/s (5%, green), each replica 300/s vs 1k/s (30%, green)"));
+      text.contains("primary 50 units/s vs 1k/s (5%, green), each replica 300 units/s vs 1k/s "
+                    "(30%, green)"));
 }
 
 // The database driver, not the balancer, decides where a query goes (writes to the primary,
@@ -1037,7 +1076,7 @@ TEST_CASE("a hash ring in front of a database leaves its copies even in explain"
   const auto text = explain_of(s);
   CAPTURE(text);
   REQUIRE_FALSE(text.contains("hottest copy"));
-  REQUIRE(text.contains("each replica 600/s vs 1k/s (60%, green)"));
+  REQUIRE(text.contains("each replica 600 units/s vs 1k/s (60%, green)"));
 }
 
 // A database's total capacity counts primaries that serve no reads, so its average can look
@@ -1050,7 +1089,7 @@ TEST_CASE("explain gives a database the zone of its busiest copy", "[report]") {
   const auto text = explain_of(s);
   CAPTURE(text);
   REQUIRE(text.contains("vs 2k/s total capacity  (55%, red at the busiest copy)"));
-  REQUIRE(text.contains("each replica 1.1k/s vs 1k/s (110%, red)"));
+  REQUIRE(text.contains("each replica 1.1k units/s vs 1k/s (110%, red)"));
 }
 
 // `replication_lag` describes how far replicas run behind; with `replicas: 1` there is none, so
@@ -1085,6 +1124,39 @@ TEST_CASE("explain shows the throughput a small pool allows", "[report]") {
     REQUIRE(text.contains("capacity=1k/s (scenario)"));
     REQUIRE(text.contains("c=1 (implied)"));
     REQUIRE(text.contains("pool=32"));
+  }
+}
+
+// A database's write op costs 5 capacity units unless `cost` lists it (spec §6: one SQL machine
+// does "5k reads" or "1k writes" per second), and a default that changes the load fivefold must be
+// visible: explain prints each defaulted write op that reaches the database with its cost and
+// where the 5 comes from, beside the costs the scenario states (re-review of 96848f0). The
+// check's per-copy numbers are then capacity units, not requests, and say so: 1000 reads/s and
+// 100 writes/s × 5 = 500 units/s; the primary carries 500, each of the 2 replicas
+// 1000 / 2 + 500 = 1000 units/s against 1k/s.
+TEST_CASE("explain prints a database's defaulted write cost and labels its checks in units",
+          "[report]") {
+  auto s = replicated_db();
+  s.nodes[1].cost = {};
+  SECTION("only the default") {
+    const auto text = explain_of(s);
+    CAPTURE(text);
+    REQUIRE(text.contains("  cost: write 5 (default: spec §6 5k reads/1k writes)"));
+    REQUIRE(text.contains(
+        "primary 500 units/s vs 1k/s (50%, green), each replica 1k units/s vs 1k/s (100%, red)"));
+  }
+  SECTION("beside a stated cost") {
+    s.nodes[1].cost = {{"read", 2.0}};
+    const auto text = explain_of(s);
+    CAPTURE(text);
+    REQUIRE(text.contains("  cost: read 2, write 5 (default: spec §6 5k reads/1k writes)"));
+  }
+  SECTION("a stated write cost is not a default") {
+    s.nodes[1].cost = {{"write", 1.0}};
+    const auto text = explain_of(s);
+    CAPTURE(text);
+    REQUIRE(text.contains("  cost: write 1"));
+    REQUIRE_FALSE(text.contains("(default: spec §6"));
   }
 }
 

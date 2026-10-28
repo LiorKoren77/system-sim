@@ -1403,6 +1403,8 @@ TEST_CASE("replicas replay only the writes the primary committed", "[theory]") {
   REQUIRE_THAT(r.nodes[1].dropped_per_s, WithinRel(500.0 + 100.0 * 100.0 / 1100.0, 1e-6));
   REQUIRE(r.nodes[1].replication_dropped_per_s.has_value());
   REQUIRE_THAT(*r.nodes[1].replication_dropped_per_s, WithinRel(100.0 * 1000.0 / 1100.0, 1e-6));
+  // What the replica must replay is what the primary committed, 1000/s, not the 1500/s offered.
+  REQUIRE_THAT(r.nodes[1].committed_writes_per_s.value_or(-1.0), WithinRel(1000.0, 1e-6));
 }
 
 // The balance demand·dt = (drain + dropped)·dt + Δbacklog holds for the CLIENTS' queries even
@@ -1419,7 +1421,11 @@ TEST_CASE("a database's client totals balance while a replica drops replicated w
   double out = 0.0;
   double backlog = 0.0;
   for (int k = 0; k < 200; ++k) {
-    const auto record = sim.step(k * 100ms, 100ms);  // kept: `db` refers into it
+    // Kept in a variable of its own: `db` refers into it. Binding `db` to
+    // `sim.step(...).nodes[1]` directly would dangle (the temporary StepRecord dies at the end
+    // of that full-expression): GCC's -Wdangling-reference warns about it there, and rightly so,
+    // the reference is real, not a false positive.
+    const auto record = sim.step(k * 100ms, 100ms);
     const auto& db = record.nodes[1];
     in += db.demand_per_s * 0.1;
     out += (db.drain_per_s + db.dropped_per_s) * 0.1;
@@ -1433,17 +1439,37 @@ TEST_CASE("a database's client totals balance while a replica drops replicated w
 }
 
 // Replicated writes a replica dropped are a database's number: 0 while every replica keeps up,
-// empty for a node that keeps no replicated data.
+// empty for a node that keeps no replicated data; the same for the committed writes a replica
+// must replay (all 100/s here: the primary keeps up).
 TEST_CASE("only a database reports replication drops", "[theory]") {
   SECTION("a database whose replicas keep up drops none") {
     const auto r =
         (*Simulation::create(*Graph::build(sql_front(3, std::nullopt, 1000, 100)))).estimate();
     REQUIRE(r.nodes[1].replication_dropped_per_s.value_or(-1.0) == 0.0);
+    REQUIRE_THAT(r.nodes[1].committed_writes_per_s.value_or(-1.0), WithinRel(100.0, 1e-9));
   }
   SECTION("a service has none to report") {
     const auto r = (*Simulation::create(*Graph::build(mm1(500)))).estimate();
     REQUIRE_FALSE(r.nodes[1].replication_dropped_per_s.has_value());
+    REQUIRE_FALSE(r.nodes[1].committed_writes_per_s.has_value());
   }
+}
+
+// The replication drops are ONE replica's, beside the writes ONE replica must replay (re-review
+// of 96848f0): summed over the replicas they could exceed the writes committed, which reads as
+// nonsense ("2131/s dropped of 900/s"). 3 copies × 2 shards, 3200 reads/s + 600 writes/s, 1000/s
+// per copy, settled. Each shard's primary is sent 600 / 2 = 300 writes/s (rho 0.3) and commits
+// them all: committed per shard = 300/s. Each of the (3 − 1) × 2 = 4 replicas is sent
+// 3200 / 4 = 800 reads + its shard's 300 committed writes = 1100/s against 1000/s, so it drops
+// 100/s in its queue's mix, 100 × 300/1100 = 27.27/s of them replicated writes. That is the
+// per-replica figure; the four replicas together drop 4 × 27.27 = 109.1/s, which is not reported.
+TEST_CASE("replication drops are one replica's, beside the committed writes per shard",
+          "[theory]") {
+  const auto r = (*Simulation::create(*Graph::build(sql_front(3, 2, 3200, 600)))).estimate();
+  REQUIRE(r.converged);
+  REQUIRE_THAT(r.nodes[1].committed_writes_per_s.value_or(-1.0), WithinRel(300.0, 1e-6));
+  REQUIRE_THAT(r.nodes[1].replication_dropped_per_s.value_or(-1.0),
+               WithinRel(100.0 * 300.0 / 1100.0, 1e-6));
 }
 
 // `pool` is the connection pool: how many queries one copy has in service at once, the c of its
