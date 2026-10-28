@@ -308,6 +308,8 @@ struct Overloaded : Fs... {
       return worst_latency(ops, slo, &OpSummary::p99_s);
     case drop_rate:  // the named node's, else the worst node's
       return slo.node ? summary.drop_rate(*slo.node) : summary.drop_rate();
+    case reject_rate:  // the same for a rate limiter's refusals
+      return slo.node ? summary.reject_rate(*slo.node) : summary.reject_rate();
     case utilization:
       return mean_utilization(nodes, slo);
     case queue_lag:  // consumer lag of a message queue: phase 2
@@ -351,14 +353,21 @@ struct Overloaded : Fs... {
                     max);
 }
 
-// The drop rate shown is the worst node's, named when some node dropped anything.
+// The drop rate shown is the worst node's, named when some node dropped anything; the
+// reject rate (the worst node's too) only when some rate limiter refused anything.
 [[nodiscard]] std::string table_header(const Summary& summary) {
   const std::string head = "scenario " + std::string{summary.scenario_name()} + "  ";
   if (summary.observed_steps() == 0) return head + "0 steps observed: nothing to evaluate\n";
   const auto worst = summary.worst_drop_node();
+  const auto worst_rejecting = summary.worst_reject_node();
+  const std::string rejections = worst_rejecting.empty()
+                                     ? std::string{}
+                                     : "  reject rate " + percent(summary.reject_rate()) +
+                                           " (worst: " + std::string{worst_rejecting} + ")";
   return head + std::to_string(summary.observed_steps()) + " steps observed  drop rate " +
          percent(summary.drop_rate()) +
-         (worst.empty() ? std::string{} : " (worst: " + std::string{worst} + ")") + "\n";
+         (worst.empty() ? std::string{} : " (worst: " + std::string{worst} + ")") + rejections +
+         "\n";
 }
 
 // Clients are sources with no queue: their queue columns show "-". The rho cells are
@@ -666,15 +675,15 @@ template <class T, class F>
 }
 
 // A rate limiter's algorithm and its numbers with the defaults applied (plan 2a refinement
-// 6): `algorithm=token_bucket limit=1k/s burst=500 window=1s backend=counters`. The window
-// is printed for every algorithm because it sets the default burst of all of them.
+// 6): `algorithm=token_bucket limit=1k/s burst=500 backend=counters`. A bucket shows its
+// burst, a windowed algorithm its window (the one number that sizes each).
 [[nodiscard]] std::string limiter_summary(const model::NodeSpec& spec) {
   if (spec.type != model::NodeType::rate_limiter || !spec.limit) return {};
   const auto algorithm = spec.algorithm.value_or(model::LimiterAlgorithm::token_bucket);
   std::string text = "  algorithm=" + std::string{model::to_string(algorithm)} +
-                     " limit=" + fmt_rate(spec.limit->per_second) +
-                     " burst=" + num(model::limiter_burst(spec), 10) +
-                     " window=" + fmt_duration(model::limiter_window(spec));
+                     " limit=" + fmt_rate(spec.limit->per_second);
+  text += model::is_windowed(algorithm) ? " window=" + fmt_duration(model::limiter_window(spec))
+                                        : " burst=" + num(model::limiter_burst(spec), 10);
   if (spec.backend) text += " backend=" + *spec.backend;
   return text;
 }
@@ -877,9 +886,10 @@ void forward_balanced(const graph::Graph& g, const ForwardRoutes& table, std::si
 
 // Forwards what a rate limiter admits in the long run, min(arriving, limit), the same
 // fraction of every op, over its routes as a balancer would, plus one `counter` request
-// per admitted request to its backend. On paper the burst is spent (a peak lasts longer
-// than a bucket), and a leaky bucket's queue also leaks at `limit`, so one rule covers
-// every algorithm.
+// per CHECKED request (all that arrive) to its backend. On paper the burst is spent (a peak
+// lasts longer than a bucket), a window admits limit x window per window, and a leaky
+// bucket's queue leaks at `limit`, so one rule covers every algorithm (the sliding
+// counter's shortfall under a flood is a step-level effect only `run` shows).
 void forward_limited(const graph::Graph& g, const ForwardRoutes& table, std::size_t from,
                      std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   const auto& node = g.nodes()[from];
@@ -897,7 +907,7 @@ void forward_limited(const graph::Graph& g, const ForwardRoutes& table, std::siz
   }
   if (node.backend) {
     auto& destination = g.links()[*node.backend_link].feedback ? fed_back : load;
-    destination[*node.backend][std::string{graph::counter_op}] += admitted;
+    destination[*node.backend][std::string{graph::counter_op}] += offered;
   }
 }
 
@@ -1064,6 +1074,7 @@ struct PaperLoad {
                           num(n.rho, 6),
                           num(n.backlog, 6),
                           num(n.dropped_per_s, 6),
+                          num(n.rejected_per_s, 6),
                           num(n.latency.mean_s * 1000.0, 6),
                           std::string{zone_name(n.zone)}};
   return join(fields, ",") + "\n";
@@ -1071,7 +1082,7 @@ struct PaperLoad {
 
 // A client is a source: no queue, so zeros where a server has numbers and zone `none`.
 [[nodiscard]] std::string csv_client_row(const std::string& t_s, const std::string& id) {
-  return t_s + "," + id + ",0,0,0,0,none\n";
+  return t_s + "," + id + ",0,0,0,0,0,none\n";
 }
 
 }  // namespace
@@ -1079,7 +1090,7 @@ struct PaperLoad {
 // ---- Summary ----
 
 // Weighted moments of a mixture: each step contributes its mean m and variance v with
-// weight w (requests offered in that step), so E[X] = Σ w·m / Σ w and
+// weight w (requests answered in that step), so E[X] = Σ w·m / Σ w and
 // E[X²] = Σ w·(v + m²) / Σ w (E[X²] of one component is its variance plus its squared mean).
 void Summary::Moments::add(double w, double mean_s, double variance_s2) {
   weight += w;
@@ -1112,10 +1123,10 @@ void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
     unavailable = true;
     return;
   }
-  // Weighted by the requests OFFERED, dropped ones included: a request a full queue shed
-  // never saw this latency, but the engine reports no per-op rejection yet. Once the
-  // rejection channel lands (Task 9) the weight becomes the requests actually answered.
-  by_offered.add(sample.offered.per_second * dt_s, response.mean_s, response.variance_s2);
+  // Weighted by the requests ANSWERED (plan 2a refinement 8): a request a limiter refused
+  // or a full queue dropped never saw this latency, so it must not weigh it. In a step where
+  // a limiter refuses 3 of 4 requests, only the admitted quarter counts.
+  by_answered.add(sample.answered.per_second * dt_s, response.mean_s, response.variance_s2);
   by_time.add(dt_s, response.mean_s, response.variance_s2);
 }
 
@@ -1187,13 +1198,13 @@ std::vector<OpSummary> Summary::ops() const {
     OpSummary op{.client = graph_->nodes()[t.client].spec.id,
                  .op = t.op,
                  .offered_per_s = observed_s_ > 0.0 ? t.offered / observed_s_ : 0.0};
-    const Moments& m = t.by_offered.weight > 0.0 ? t.by_offered : t.by_time;
+    const Moments& m = t.by_answered.weight > 0.0 ? t.by_answered : t.by_time;
     if (t.unavailable) {
       op.mean_s = op.p50_s = op.p95_s = op.p99_s = infinity;
     } else if (m.weight > 0.0) {
       // Law of total variance over the steps: Var X = E[X²] − (E[X])², where E[X²] already
       // holds each step's own spread (v) and the spread between step means (m²). Assumes a
-      // request's step is chosen in proportion to the traffic offered in it.
+      // request's step is chosen in proportion to the requests answered in it.
       op.mean_s = m.weighted_mean / m.weight;
       const double variance = m.weighted_square / m.weight - op.mean_s * op.mean_s;
       // Lognormal moment fit (Fenton-Wilkinson, see queueing::lognormal_quantile): an
@@ -1210,34 +1221,57 @@ std::vector<OpSummary> Summary::ops() const {
 // Per node, not per scenario: a node's drops are a fraction of what it was sent, so the
 // ratio stays in [0, 1] even when fan-out (ch. 11) multiplies the client's requests 100
 // times before they reach it. Dividing by what the clients offered would not be a ratio.
-// Plan 2a refinement 8: a rejected request failed as surely as a dropped one. Both are
-// parts of the demand (a limiter rejects what its queue drained), so the ratio stays <= 1.
+// Drops only: a rate limiter's refusals are its policy, not a failure (reject_rate).
 double Summary::NodeTotals::drop_rate() const {
-  return demand > 0.0 ? (dropped + rejected) / demand : 0.0;
+  return demand > 0.0 ? dropped / demand : 0.0;
+}
+
+// The same ratio for refusals. Rejections are part of the demand (a token-family limiter
+// rejects what its queue drained, a leaky bucket what overflowed), so it stays <= 1 too.
+double Summary::NodeTotals::reject_rate() const {
+  return demand > 0.0 ? rejected / demand : 0.0;
 }
 
 // The first of equal maxima (std::ranges::max_element keeps it), so ties name the
-// earliest node. A projection through a member function: std::invoke calls drop_rate().
-std::size_t Summary::worst_drop_index() const {
-  const auto worst = std::ranges::max_element(nodes_, std::less<>{}, &NodeTotals::drop_rate);
+// earliest node. A projection through a pointer to member function: std::invoke calls
+// (totals.*rate)().
+std::size_t Summary::worst_index(double (NodeTotals::*rate)() const) const {
+  const auto worst = std::ranges::max_element(nodes_, std::less<>{}, rate);
   return static_cast<std::size_t>(worst - nodes_.begin());
 }
 
-double Summary::drop_rate(std::string_view node) const {
+double Summary::node_rate(std::string_view node, double (NodeTotals::*rate)() const) const {
   const auto index = graph_->index_of(node);
   if (!index) {
-    throw std::invalid_argument{"Summary::drop_rate: unknown node '" + std::string{node} + "'"};
+    throw std::invalid_argument{"Summary: unknown node '" + std::string{node} + "'"};
   }
-  return nodes_[*index].drop_rate();
+  return (nodes_[*index].*rate)();
+}
+
+double Summary::drop_rate(std::string_view node) const {
+  return node_rate(node, &NodeTotals::drop_rate);
 }
 
 double Summary::drop_rate() const {
-  return nodes_.empty() ? 0.0 : nodes_[worst_drop_index()].drop_rate();
+  return nodes_.empty() ? 0.0 : nodes_[worst_index(&NodeTotals::drop_rate)].drop_rate();
 }
 
 std::string_view Summary::worst_drop_node() const {
   if (drop_rate() <= 0.0) return {};
-  return graph_->nodes()[worst_drop_index()].spec.id;
+  return graph_->nodes()[worst_index(&NodeTotals::drop_rate)].spec.id;
+}
+
+double Summary::reject_rate(std::string_view node) const {
+  return node_rate(node, &NodeTotals::reject_rate);
+}
+
+double Summary::reject_rate() const {
+  return nodes_.empty() ? 0.0 : nodes_[worst_index(&NodeTotals::reject_rate)].reject_rate();
+}
+
+std::string_view Summary::worst_reject_node() const {
+  if (reject_rate() <= 0.0) return {};
+  return graph_->nodes()[worst_index(&NodeTotals::reject_rate)].spec.id;
 }
 
 std::string_view Summary::scenario_name() const {
@@ -1269,17 +1303,21 @@ std::string render_table(const Summary& summary, std::span<const SloResult> slos
          slo_table(slos, color);
 }
 
-// With no observed step the drop rate is null: there is no data, not a rate of 0.
+// With no observed step the drop and reject rates are null: there is no data, not a rate of 0.
 std::string render_json(const Summary& summary, std::span<const SloResult> slos) {
   const auto nodes = summary.nodes();
   const auto ops = summary.ops();
   const bool observed = summary.observed_steps() > 0;
   const auto worst = summary.worst_drop_node();
+  const auto worst_rejecting = summary.worst_reject_node();
   const std::array lines{
       "  " + json_field("scenario", json_string(summary.scenario_name())),
       "  " + json_field("steps", std::to_string(summary.observed_steps())),
       "  " + json_field("drop_rate", observed ? json_number(summary.drop_rate()) : "null"),
       "  " + json_field("worst_drop_node", worst.empty() ? "null" : json_string(worst)),
+      "  " + json_field("reject_rate", observed ? json_number(summary.reject_rate()) : "null"),
+      "  " + json_field("worst_reject_node",
+                        worst_rejecting.empty() ? "null" : json_string(worst_rejecting)),
       json_array("nodes", map_to_strings(std::span<const NodeSummary>{nodes}, json_node)),
       json_array("ops", map_to_strings(std::span<const OpSummary>{ops}, json_op)),
       json_array("slo", map_to_strings(slos, json_slo))};
@@ -1302,14 +1340,14 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
     ids_.push_back(node.spec.id);
     is_client_.push_back(node.spec.type == model::NodeType::client);
   }
-  *out_ << "t_s,node,rho,backlog,drops_per_s,latency_ms,zone\n";
+  *out_ << "t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone\n";
 }
 
 // CSV is for machines, so every numeric column always holds a number:
 // - `t_s` is the shortest form that reads back to the same double (0.1, 2, 0.35), not a
 //   fixed number of decimals that would round a fine step away;
-// - a client row writes 0 in rho, backlog, drops_per_s and latency_ms (a source has no
-//   queue) and `none` as its zone, so a plot can filter clients out by zone;
+// - a client row writes 0 in rho, backlog, drops_per_s, rejected_per_s and latency_ms (a
+//   source has no queue) and `none` as its zone, so a plot can filter clients out by zone;
 // - an infinite latency is written as `inf` (which spreadsheet and plotting tools parse),
 //   unlike the table ("unavailable") and JSON (null), read by people or by parsers
 //   without an infinity.

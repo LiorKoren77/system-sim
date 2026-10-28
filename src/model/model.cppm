@@ -175,14 +175,17 @@ inline constexpr auto lb_policy_table = std::to_array<core::EnumName<LbPolicy>>(
 // How a rate limiter decides which requests to turn away (System Design Interview ch. 4
 // "Design a rate limiter", the five algorithms of its "Algorithms for rate limiting"
 // section). In the fluid model (plan 2a refinement 6, see behaviours::RateLimiterBehaviour)
-// they reduce to two mechanisms:
-//   token_bucket                 -> a bucket of `burst` tokens refilled at `limit`;
-//   fixed_window, sliding_log,
-//   sliding_counter              -> the same bucket with burst = limit x window: the three
-//                                   differ in how exactly they count the last window,
-//                                   which a fluid (no individual requests) cannot see;
-//   leaky_bucket                 -> a FIFO queue drained at `limit` with room for `burst`:
-//                                   excess requests wait instead of being rejected.
+// each keeps the state ch. 4 describes, stepped every dt:
+//   token_bucket     -> a bucket of `burst` tokens refilled at `limit`;
+//   leaky_bucket     -> a FIFO bucket of room `burst` leaking one request every 1/limit:
+//                       excess requests wait, a full bucket refuses;
+//   fixed_window     -> a counter per calendar window of length `window`, reset at each
+//                       boundary: at most limit x window per window;
+//   sliding_log      -> the admitted counts of the last `window` seconds, step by step:
+//                       at most limit x window in ANY window;
+//   sliding_counter  -> this window's count plus the previous one's, weighted by the
+//                       overlap of the trailing window with it.
+// `burst` sizes the two buckets only; the windowed three are sized by `window`.
 enum class LimiterAlgorithm {
   token_bucket,
   leaky_bucket,
@@ -200,6 +203,14 @@ inline constexpr auto limiter_algorithm_table = std::to_array<core::EnumName<Lim
     {LimiterAlgorithm::sliding_log, "sliding_log"},
     {LimiterAlgorithm::sliding_counter, "sliding_counter"},
 });
+
+// The three algorithms that count requests per window rather than hold a bucket: they take
+// `window`, and a `burst` on them is an error (config's read_limiter_burst, graph's
+// invalid_limiter).
+[[nodiscard]] constexpr bool is_windowed(LimiterAlgorithm a) {
+  return a == LimiterAlgorithm::fixed_window || a == LimiterAlgorithm::sliding_log ||
+         a == LimiterAlgorithm::sliding_counter;
+}
 
 [[nodiscard]] constexpr std::string_view to_string(LimiterAlgorithm a) {
   return core::name_in(limiter_algorithm_table, a);
@@ -284,12 +295,14 @@ struct NodeSpec {
   std::optional<int> vnodes{};
   // Rate limiters only (plan 2a refinement 6; declared after the LB keys, for designated
   // initializers): the algorithm (the loader fills in token_bucket when absent), the limit
-  // (required: a limiter without one limits nothing), the burst (requests the limiter lets
-  // through above the limit at once; the loader fills in limit x window), the window of the
-  // windowed algorithms (the loader fills in default_limiter_window) and the node holding
-  // the counters (`backend`, a cache), which every admitted request consults once. A
-  // scenario built in code may leave algorithm, burst and window empty: the behaviour and
-  // the graph apply the same defaults.
+  // (required: a limiter without one limits nothing), the burst of the two buckets (requests
+  // a token bucket lets through above the limit at once, the room of a leaky bucket; the
+  // loader fills in limit x window for them and leaves it empty for the windowed algorithms,
+  // which reject one), the window of the windowed algorithms (the loader fills in
+  // default_limiter_window) and the node holding the counters (`backend`, a cache), which
+  // the limiter consults once for every request it checks. A scenario built in code may
+  // leave algorithm, burst and window empty: the behaviour and the graph apply the same
+  // defaults.
   std::optional<LimiterAlgorithm> algorithm{};
   std::optional<Rate> limit{};
   std::optional<int> burst{};
@@ -300,9 +313,10 @@ struct NodeSpec {
 
 // The window and the burst a rate limiter works with, defaults applied. The loader fills
 // both in, but a scenario built in code may leave them empty, and the behaviour, the graph
-// and explain must agree on one number. Default burst: limit x window, rounded up to a
-// whole request and at least one (see config's read_limiter_burst for why); 0 without a
-// limit (Graph::build rejects such a limiter before anything asks).
+// and explain must agree on one number. Default burst (token and leaky bucket; the windowed
+// algorithms have none): limit x window, rounded up to a whole request and at least one (see
+// config's read_limiter_burst for why); 0 without a limit (Graph::build rejects such a
+// limiter before anything asks).
 [[nodiscard]] constexpr SimTime limiter_window(const NodeSpec& spec) {
   return spec.window.value_or(default_limiter_window);
 }
@@ -338,11 +352,16 @@ struct LinkSpec {
   double weight{1.0};                // share when several links carry the same op
 };
 
+// drop_rate and reject_rate are two different promises: a drop is a node FAILING (its
+// waiting room was full), a rejection is a rate limiter's POLICY working (ch. 4's 429).
+// A design wants few drops anywhere and as many rejections as its limits call for, so
+// each has its own target (report::Summary::drop_rate / reject_rate).
 enum class SloMetric {
   p50_latency,
   p95_latency,
   p99_latency,
   drop_rate,
+  reject_rate,
   utilization,
   queue_lag,
   staleness
@@ -355,6 +374,7 @@ inline constexpr auto slo_metric_table = std::to_array<core::EnumName<SloMetric>
     {SloMetric::p95_latency, "p95_latency"},
     {SloMetric::p99_latency, "p99_latency"},
     {SloMetric::drop_rate, "drop_rate"},
+    {SloMetric::reject_rate, "reject_rate"},
     {SloMetric::utilization, "utilization"},
     {SloMetric::queue_lag, "queue_lag"},
     {SloMetric::staleness, "staleness"},

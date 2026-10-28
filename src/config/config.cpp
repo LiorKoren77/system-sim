@@ -1968,15 +1968,21 @@ CheckResult read_limiter_window(const Site& site, const YAML::Node& body, model:
   return {};
 }
 
-// `burst: 500`, a whole number of requests. Default limit x window, rounded up: a windowed
-// algorithm lets at most one window's worth through at once, so that IS its burst; a token
-// bucket has no window of its own, and one window's worth (one second's, by default) is
-// the conventional sizing of its bucket for want of a better number.
+// `burst: 500`, a whole number of requests, for the two buckets only: a windowed algorithm
+// counts limit x window per window and has no bucket for a burst to size, so a burst on one
+// is an error (it would otherwise be silently ignored). Default for a bucket: limit x window
+// rounded up, one window's worth (one second's, by default), the conventional sizing of a
+// token bucket for want of a better number; the windowed algorithms get none.
 CheckResult read_limiter_burst(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  const bool windowed = model::is_windowed(*node.algorithm);
   if (body["burst"]) {
+    if (windowed) {
+      return site.fail(body["burst"], "burst applies only to token_bucket and leaky_bucket");
+    }
     if (auto checked = check_not_null(site, body, "burst", "burst"); !checked) return checked;
     return read_positive_int(site, body["burst"], "burst").transform(store_in(node.burst));
   }
+  if (windowed) return {};
   const double per_window = model::limiter_burst(node);  // limit x window, rounded up
   if (per_window > std::numeric_limits<int>::max()) {
     return site.fail(body, "limit x window is too large for a burst; give burst explicitly");
@@ -1985,7 +1991,23 @@ CheckResult read_limiter_burst(const Site& site, const YAML::Node& body, model::
   return {};
 }
 
-// `backend: counters`: the counter store every admitted request consults (ch. 4 keeps the
+// A leaky bucket's queue IS the bucket: one slot leaking a request every 1/limit, with room
+// for `burst` (graph::leaky_bucket_capacity). A `capacity`, `latency`, `advanced.concurrency`
+// or `advanced.queue_limit` would be a second statement of the limit or the burst that the
+// bucket would have to override, so each is refused. Read in the first pass with the keys
+// every node shares; checked here, where the algorithm is known.
+CheckResult check_leaky_bucket_keys(const Site& site, const YAML::Node& body,
+                                    const model::NodeSpec& node) {
+  if (node.algorithm != model::LimiterAlgorithm::leaky_bucket) return {};
+  const bool restated =
+      node.capacity || node.latency || node.advanced.queue_limit || node.advanced.concurrency;
+  if (!restated) return {};
+  return site.fail(body,
+                   "leaky_bucket takes limit and burst; capacity, latency, concurrency and "
+                   "queue_limit are not valid");
+}
+
+// `backend: counters`: the counter store every checked request consults (ch. 4 keeps the
 // counters in Redis). read_node_routing has already checked that the node exists; here it
 // must also be a cache, the only type that models an in-memory key-value store in 2a.
 CheckResult read_limiter_backend(const Site& site, const YAML::Node& body, model::NodeSpec& node,
@@ -2008,6 +2030,7 @@ CheckResult read_limiter_keys(const Site& site, const YAML::Node& body, model::N
       .and_then([&] { return read_limiter_limit(this_node, body, node); })
       .and_then([&] { return read_limiter_window(this_node, body, node); })
       .and_then([&] { return read_limiter_burst(this_node, body, node); })
+      .and_then([&] { return check_leaky_bucket_keys(this_node, body, node); })
       .and_then([&] { return read_limiter_backend(this_node, body, node, declared); });
 }
 
