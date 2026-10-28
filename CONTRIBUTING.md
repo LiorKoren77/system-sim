@@ -58,6 +58,9 @@ Write for a reader who has read the book but has not studied queueing theory.
 - Scenario YAML files get a README explaining the design and the mechanisms the model
   abstracts away.
 - Commit messages explain *why*; the diff shows *what*.
+- Module interface units stay lean: no <chrono>/<filesystem>/<format>/<print> in the global
+  module fragment of an interface that imports another module (GCC 14.2 'Bad file data'
+  bug, verified 2026-10-28). Heavy headers go in the implementation unit.
 
 ## 4. Clean code, named patterns, TDD
 
