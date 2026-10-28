@@ -21,7 +21,8 @@ export namespace simsys::queueing {
 // to wait, in an M/M/c queue (Poisson arrivals, exponential service, c servers).
 // `rho` is the utilization lambda / (c * mu) in [0, 1).
 // At or beyond rho = 1 every arrival waits, so we return 1 (the fluid backlog carries
-// the actual delay then, see fluid.cppm).
+// the actual delay then, see fluid.cppm). A rho <= 0, including a negative one, is
+// treated as no load and returns 0.
 //
 // Preconditions (programmer errors, not user input): `servers >= 1`, enforced by an
 // exception because CLAUDE.md allows exceptions for programmer errors and scenario
@@ -53,10 +54,16 @@ struct WaitMoments {
 };
 
 // Mean and variance of the time spent waiting in queue (not being served) in M/M/c.
-// The wait is 0 with probability 1 - P_wait; otherwise, because all c servers are busy
-// and exponential service is memoryless, completions arrive as a Poisson process of
-// rate c*mu and the wait for the first one is exponential with mean
-//   theta = s / (c (1 - rho)).            (mean of Exp(c mu - lambda), s = 1/mu)
+// The wait is 0 with probability 1 - P_wait. Otherwise the arrival finds all c servers
+// busy and N requests already queued ahead of it, where N is geometric:
+//   P(N = n | wait) = (1 - rho) rho^n,   n = 0, 1, 2, ...
+// It must wait for N + 1 completions (one per request ahead, plus one to free a server
+// for itself). While all c servers are busy, completions form a Poisson process of rate
+// c*mu (exponential service is memoryless), so each gap is Exp(c mu). A geometric
+// number of Exp(c mu) gaps sums to an exponential again:
+//   Wq | wait ~ Exp(c mu (1 - rho)) = Exp(c mu - lambda),
+//   theta = E[Wq | wait] = s / (c (1 - rho)),             (s = 1/mu, the service time)
+// so, conditioned on waiting, Wq is exponential with mean theta, and:
 //   E[Wq]   = P_wait * theta                               (law of total expectation)
 //   Var[Wq] = E[Wq^2] - E[Wq]^2 = P*2 theta^2 - P^2 theta^2 = P (2 - P) theta^2
 //                                                          (Exp's second moment is 2 theta^2)
@@ -99,7 +106,7 @@ inline constexpr double z_p50 = 0.0;
 inline constexpr double z_p95 = 1.6448536269514722;
 inline constexpr double z_p99 = 2.3263478740408408;
 
-// Lognormal fit by moments (Fenton-Wilkinson moment matching). Latency along a path is a
+// Lognormal fit by moment matching, as in Fenton-Wilkinson. Latency along a path is a
 // sum of positive, right-skewed terms; a lognormal with the same mean m and variance v
 // is the usual engineering fit:
 //   sigma^2 = ln(1 + v/m^2),  mu = ln m - sigma^2/2,  quantile(z) = exp(mu + sigma z)
@@ -108,6 +115,9 @@ inline constexpr double z_p99 = 2.3263478740408408;
 // 1 - P_wait); the engine applies it to the full sojourn time, whose mean is >= s.
 // `variance <= 0` returns the mean on purpose: it also clamps the small negative
 // variances that rounding can produce when moments are composed by subtraction.
+// Overflow: the result is NaN only when v/m^2 itself exceeds the double range
+// (~1.8e308): sigma^2 = log1p(inf) = inf, and mu + sigma z becomes -inf + inf (or
+// inf * 0 at z = 0). No real latency has that spread, so it is documented, not guarded.
 [[nodiscard]] double lognormal_quantile(double mean, double variance, double z_score) {
   if (mean <= 0.0) return 0.0;
   if (variance <= 0.0) return mean;
