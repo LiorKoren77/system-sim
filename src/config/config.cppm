@@ -4,9 +4,9 @@
 // engine exists; behaviour parameters (eviction policy, quorum sizes, ...) are left to
 // the engine. The checks themselves live in the implementation unit, config.cpp.
 //
-// Pattern: Interface / implementation unit split — the interface declares, the
-// implementation unit (config.cpp) defines; importers never recompile when only the
-// implementation changes.
+// Compilation firewall: interface declares, implementation unit defines; importers never
+// recompile when only config.cpp changes. This is a build technique, not a GoF design
+// pattern, hence no `Pattern:` tag.
 //
 // Why this interface is lean (verified 2026-10-28 with GCC 14.2): a module interface unit
 // that `import`s another module must not include, in its global module fragment, any
@@ -36,8 +36,8 @@ export namespace simsys::config {
 // jump to it: file:line:column, both 1-based.
 struct ConfigError {
   std::string file;
-  int line;  // int, like yaml-cpp's Mark; 0 when the location is unknown
-  int column;
+  int line{};  // int, like yaml-cpp's Mark; 0 when the location is unknown
+  int column{};
   std::string message;
 };
 
@@ -54,8 +54,8 @@ struct LinkDecl {
 // The structural skeleton of a scenario. Nodes and links keep their document order.
 struct Scenario {
   std::string name;
-  int version;
-  SimTime duration;
+  int version{};
+  SimTime duration{};
   std::vector<NodeDecl> nodes;
   std::vector<LinkDecl> links;
 };
@@ -83,8 +83,10 @@ inline constexpr std::array<std::string_view, 18> known_types{"client",
 
 // Reads and validates a scenario file. Every problem, including YAML syntax errors and a
 // missing file, comes back as a ConfigError; nothing throws. The path is a std::string,
-// not a std::filesystem::path (which converts to it implicitly), because <filesystem>
-// may not appear in this interface (see the GCC 14.2 note at the top of the file).
+// not a std::filesystem::path, because <filesystem> may not appear in this interface (see
+// the GCC 14.2 note at the top of the file). A path converts to std::string implicitly
+// only on POSIX, where its native string type is std::string; on Windows it is
+// std::wstring, so portable callers pass path.string().
 // C++23 std::expected<T, E>: a value-or-error return type. It replaces the choice between
 // exceptions and out-parameters; the caller must inspect it, and the error carries
 // structured data (file, line, column, message) instead of a bare code.

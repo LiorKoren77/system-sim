@@ -7,7 +7,8 @@ module;
 #include <array>
 #include <expected>
 #include <format>
-#include <span>
+#include <functional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -27,8 +28,22 @@ namespace simsys::config::detail {
 // out-parameter for the error; an empty `{}` means the check passed.
 using CheckResult = std::expected<void, ConfigError>;
 
+// The declared node ids. A set, not a scan of the declarations: every reference is looked
+// up, and a linear scan per lookup made validation quadratic (60k nodes took 147 s).
+// std::less<> (C++14 transparent comparator) lets the set be searched with a
+// std::string_view directly, without building a temporary std::string per lookup.
+using NodeIds = std::set<std::string, std::less<>>;
+
+// What the first pass over `nodes` produces: the declarations in document order (for the
+// Scenario) and their ids as a set (for the duplicate and reference checks).
+struct Declarations {
+  std::vector<NodeDecl> nodes;
+  NodeIds ids;
+};
+
 constexpr std::array<std::string_view, 5> required_top_level_keys{"version", "name", "duration",
                                                                   "nodes", "links"};
+constexpr std::array<std::string_view, 2> optional_top_level_durations{"step", "warmup"};
 // Node attributes whose value is the id of another node.
 constexpr std::array<std::string_view, 3> reference_keys{"consumes", "backend", "origin"};
 
@@ -53,10 +68,10 @@ bool is_known_type(std::string_view type) {
   return std::ranges::find(known_types, type) != known_types.end();
 }
 
-// C++20 std::span<const T>: a non-owning view of contiguous elements; callers can pass a
-// std::vector (or an array) without copying it and without a pointer+size pair.
-bool is_declared(std::span<const NodeDecl> nodes, std::string_view id) {
-  return std::ranges::any_of(nodes, [id](const NodeDecl& node) { return node.id == id; });
+bool is_declared(const NodeIds& ids, std::string_view id) {
+  // C++20 contains(): "is this key in the set?" in one call, replacing the
+  // `find(key) != end()` comparison.
+  return ids.contains(id);
 }
 
 // IsDefined() first: asking a missing key's node for its type throws.
@@ -70,6 +85,43 @@ ConfigError unit_error(const std::string& file, const YAML::Node& value, std::st
   // C++20 std::format: type-checked (at compile time) formatting that returns a
   // std::string, replacing std::ostringstream chains and snprintf buffers.
   return error_at(file, value, std::format("{}: {}", key, error.message));
+}
+
+// The text of `parent[key]`, which the caller has checked is present. yaml-cpp's Scalar()
+// silently returns "" for a list or a map, so that shape is rejected here, for every key.
+std::expected<std::string, ConfigError> scalar_value(const std::string& file,
+                                                     const YAML::Node& parent,
+                                                     std::string_view key) {
+  const auto value = parent[std::string{key}];
+  if (value.IsSequence() || value.IsMap()) {
+    return std::unexpected(error_at(file, value, std::format("{} must be a scalar", key)));
+  }
+  return value.Scalar();
+}
+
+std::expected<SimTime, ConfigError> parse_duration_key(const std::string& file,
+                                                       const YAML::Node& parent,
+                                                       std::string_view key) {
+  const auto value = parent[std::string{key}];
+  // C++23 std::expected::and_then: runs the next fallible step only if the previous one
+  // produced a value, passing an error through untouched; it chains steps without an
+  // `if (!x) return std::unexpected(x.error());` between them.
+  // C++23 std::expected::transform_error: converts the error (ParseError -> ConfigError)
+  // and passes a value through untouched.
+  return scalar_value(file, parent, key).and_then([&](const std::string& text) {
+    return parse_duration(text).transform_error(
+        [&](const ParseError& error) { return unit_error(file, value, key, error); });
+  });
+}
+
+// For durations a scenario may omit (step, warmup, latency): absent is fine, present must
+// parse.
+CheckResult check_optional_duration(const std::string& file, const YAML::Node& parent,
+                                    std::string_view key) {
+  if (!parent[std::string{key}]) return {};
+  // C++23 std::expected::transform with a lambda that drops the value: only "valid or
+  // not" matters here, so the result becomes std::expected<void, ConfigError>.
+  return parse_duration_key(file, parent, key).transform([](SimTime) {});
 }
 
 CheckResult check_required_top_level_keys(const std::string& file, const YAML::Node& root) {
@@ -88,170 +140,207 @@ CheckResult check_version(const std::string& file, const YAML::Node& root) {
   return {};
 }
 
-std::expected<SimTime, ConfigError> parse_duration_key(const std::string& file,
-                                                       const YAML::Node& parent,
-                                                       std::string_view key) {
-  const auto value = parent[std::string{key}];
-  // C++23 std::expected::transform_error: converts the error (ParseError -> ConfigError)
-  // and passes a value through untouched, replacing an `if (!parsed) return ...` block.
-  return parse_duration(value.Scalar()).transform_error([&](const ParseError& error) {
-    return unit_error(file, value, key, error);
-  });
+CheckResult check_top_level(const std::string& file, const YAML::Node& root) {
+  if (auto checked = check_required_top_level_keys(file, root); !checked) return checked;
+  if (auto checked = check_version(file, root); !checked) return checked;
+  for (const auto key : optional_top_level_durations) {
+    if (auto checked = check_optional_duration(file, root, key); !checked) return checked;
+  }
+  return {};
 }
 
-// Capacity counts requests for most node types and bytes for storage ("500MB/s").
-std::expected<void, ParseError> parse_capacity(std::string_view text) {
+// Capacity counts requests for most node types and bytes for storage ("500MB/s"). Only
+// "valid or not" matters, so both parsers' values are dropped.
+std::expected<void, ParseError> check_capacity_text(std::string_view text) {
   // C++20 std::string_view::ends_with: a suffix test without size arithmetic.
-  // C++23 std::expected::transform with a lambda that drops the value: only "valid or
-  // not" matters here, so both parsers' results become std::expected<void, ParseError>.
   if (text.ends_with("B/s")) return parse_byte_rate(text).transform([](ByteRate) {});
   return parse_rate(text).transform([](Rate) {});
 }
 
-CheckResult check_capacity(const std::string& file, const YAML::Node& node) {
-  const auto capacity = node["capacity"];
+CheckResult check_capacity(const std::string& file, const YAML::Node& body) {
+  const auto capacity = body["capacity"];
   if (!capacity) return {};
-  return parse_capacity(capacity.Scalar()).transform_error([&](const ParseError& error) {
-    return unit_error(file, capacity, "capacity", error);
+  return scalar_value(file, body, "capacity").and_then([&](const std::string& text) {
+    return check_capacity_text(text).transform_error(
+        [&](const ParseError& error) { return unit_error(file, capacity, "capacity", error); });
   });
 }
 
 std::expected<NodeDecl, ConfigError> read_node_declaration(const std::string& file,
                                                            const YAML::Node& id,
                                                            const YAML::Node& body) {
-  const auto type = body["type"];
-  if (!type) {
+  if (!body.IsMap()) {
+    return std::unexpected(
+        error_at(file, body, std::format("node '{}' must be a map", id.Scalar())));
+  }
+  if (!body["type"]) {
     return std::unexpected(error_at(file, id, std::format("node '{}' needs a type", id.Scalar())));
   }
-  if (!is_known_type(type.Scalar())) {
+  auto type = scalar_value(file, body, "type");
+  if (!type) return std::unexpected(type.error());
+  if (!is_known_type(*type)) {
     return std::unexpected(
-        error_at(file, type, std::format("unknown node type '{}'", type.Scalar())));
+        error_at(file, body["type"], std::format("unknown node type '{}'", *type)));
   }
-  return NodeDecl{id.Scalar(), type.Scalar()};
+  return NodeDecl{id.Scalar(), std::move(*type)};
 }
 
-// yaml-cpp iterates a map in document order, so the declarations keep that order.
-std::expected<std::vector<NodeDecl>, ConfigError> collect_node_declarations(
-    const std::string& file, const YAML::Node& nodes) {
-  std::vector<NodeDecl> declarations;
+// The id goes into the set first, so a repeated id is reported before its body is read.
+CheckResult add_node_declaration(const std::string& file, const YAML::Node& id,
+                                 const YAML::Node& body, Declarations& declared) {
+  // set::insert returns {iterator, inserted}; `inserted` is false when the id was there.
+  if (!declared.ids.insert(id.Scalar()).second) {
+    return std::unexpected(error_at(file, id, std::format("duplicate node id '{}'", id.Scalar())));
+  }
+  auto declaration = read_node_declaration(file, id, body);
+  if (!declaration) return std::unexpected(declaration.error());
+  declared.nodes.push_back(std::move(*declaration));
+  return {};
+}
+
+// yaml-cpp iterates a map in document order, so the declarations keep that order. It also
+// keeps both entries of a repeated key, which is what lets duplicates be detected here.
+std::expected<Declarations, ConfigError> collect_node_declarations(const std::string& file,
+                                                                   const YAML::Node& nodes) {
+  if (!nodes.IsMap() || nodes.size() == 0) {
+    return std::unexpected(error_at(file, nodes, "nodes must be a non-empty map"));
+  }
+  Declarations declared;
   for (const auto& entry : nodes) {
-    auto declaration = read_node_declaration(file, entry.first, entry.second);
-    if (!declaration) return std::unexpected(declaration.error());
-    declarations.push_back(std::move(*declaration));
+    if (auto added = add_node_declaration(file, entry.first, entry.second, declared); !added) {
+      return std::unexpected(added.error());
+    }
   }
-  return declarations;
+  return declared;
 }
 
-// `what` names the referring construct in the message: "step", "link", "backend", ...
-CheckResult check_reference(const std::string& file, const YAML::Node& reference,
-                            std::string_view what, std::span<const NodeDecl> nodes) {
-  if (is_declared(nodes, reference.Scalar())) return {};
-  return std::unexpected(error_at(
-      file, reference, std::format("{} refers to unknown node '{}'", what, reference.Scalar())));
+// `parent[key]` (present) must name a declared node. `what` names the referring construct
+// in the message: "step", "link", "backend", ...
+CheckResult check_reference(const std::string& file, const YAML::Node& parent, std::string_view key,
+                            std::string_view what, const NodeIds& ids) {
+  const auto reference = parent[std::string{key}];
+  return scalar_value(file, parent, key).and_then([&](const std::string& id) -> CheckResult {
+    if (is_declared(ids, id)) return {};
+    return std::unexpected(
+        error_at(file, reference, std::format("{} refers to unknown node '{}'", what, id)));
+  });
 }
 
-CheckResult check_step(const std::string& file, const YAML::Node& step,
-                       std::span<const NodeDecl> nodes) {
-  const auto to = step["to"];
-  if (!to) return std::unexpected(error_at(file, step, "step needs a 'to'"));
-  return check_reference(file, to, "step", nodes);
+CheckResult check_step(const std::string& file, const YAML::Node& step, const NodeIds& ids) {
+  if (!step.IsMap()) return std::unexpected(error_at(file, step, "step must be a map"));
+  if (!step["to"]) return std::unexpected(error_at(file, step, "step needs a 'to'"));
+  return check_reference(file, step, "to", "step", ids);
 }
 
-CheckResult check_step_list(const std::string& file, const YAML::Node& steps,
-                            std::span<const NodeDecl> nodes) {
+CheckResult check_step_list(const std::string& file, const YAML::Node& steps, const NodeIds& ids) {
   for (const auto& step : steps) {
-    if (auto checked = check_step(file, step, nodes); !checked) return checked;
+    if (auto checked = check_step(file, step, ids); !checked) return checked;
   }
   return {};
 }
 
 // A service's ops map each op to a step list; a client's ops map each op to a traffic
 // share (a number), which names no node and is skipped.
-CheckResult check_op_steps(const std::string& file, const YAML::Node& ops,
-                           std::span<const NodeDecl> nodes) {
+CheckResult check_op_steps(const std::string& file, const YAML::Node& ops, const NodeIds& ids) {
   for (const auto& op : ops) {
     if (!is_sequence(op.second)) continue;
-    if (auto checked = check_step_list(file, op.second, nodes); !checked) return checked;
+    if (auto checked = check_step_list(file, op.second, ids); !checked) return checked;
   }
   return {};
+}
+
+// `then` (a worker pool's follow-up steps) is optional, but when present it is a step list.
+CheckResult check_then(const std::string& file, const YAML::Node& body, const NodeIds& ids) {
+  const auto then = body["then"];
+  if (!then) return {};
+  if (!then.IsSequence()) return std::unexpected(error_at(file, then, "then must be a list"));
+  return check_step_list(file, then, ids);
 }
 
 CheckResult check_reference_key(const std::string& file, const YAML::Node& body,
-                                std::string_view key, std::span<const NodeDecl> nodes) {
-  const auto reference = body[std::string{key}];
-  if (!reference) return {};
-  return check_reference(file, reference, key, nodes);
+                                std::string_view key, const NodeIds& ids) {
+  if (!body[std::string{key}]) return {};
+  return check_reference(file, body, key, key, ids);
 }
 
 CheckResult check_node_references(const std::string& file, const YAML::Node& body,
-                                  std::span<const NodeDecl> nodes) {
-  if (auto checked = check_op_steps(file, body["ops"], nodes); !checked) return checked;
-  if (auto checked = check_step_list(file, body["then"], nodes); !checked) return checked;
+                                  const NodeIds& ids) {
+  if (auto checked = check_op_steps(file, body["ops"], ids); !checked) return checked;
+  if (auto checked = check_then(file, body, ids); !checked) return checked;
   for (const auto key : reference_keys) {
-    if (auto checked = check_reference_key(file, body, key, nodes); !checked) return checked;
+    if (auto checked = check_reference_key(file, body, key, ids); !checked) return checked;
   }
   return {};
+}
+
+// The body is known to be a map: the declaration pass checked it.
+CheckResult check_node_body(const std::string& file, const YAML::Node& body, const NodeIds& ids) {
+  if (auto checked = check_capacity(file, body); !checked) return checked;
+  if (auto checked = check_optional_duration(file, body, "latency"); !checked) return checked;
+  return check_node_references(file, body, ids);
 }
 
 // A second pass over the node bodies, after all ids are known, so a node may refer to
 // one declared further down the file.
-CheckResult check_node_bodies(const std::string& file, const YAML::Node& nodes_yaml,
-                              std::span<const NodeDecl> nodes) {
-  for (const auto& entry : nodes_yaml) {
-    if (auto checked = check_capacity(file, entry.second); !checked) return checked;
-    if (auto checked = check_node_references(file, entry.second, nodes); !checked) return checked;
+CheckResult check_node_bodies(const std::string& file, const YAML::Node& nodes,
+                              const NodeIds& ids) {
+  for (const auto& entry : nodes) {
+    if (auto checked = check_node_body(file, entry.second, ids); !checked) return checked;
   }
   return {};
 }
 
 CheckResult check_link_end(const std::string& file, const YAML::Node& link, std::string_view end,
-                           std::span<const NodeDecl> nodes) {
-  const auto reference = link[std::string{end}];
-  if (!reference) {
-    return std::unexpected(error_at(file, link, std::format("link needs a '{}'", end)));
+                           const NodeIds& ids) {
+  if (!link[std::string{end}]) {
+    return std::unexpected(error_at(file, link, std::format("link needs '{}'", end)));
   }
-  return check_reference(file, reference, "link", nodes);
+  return check_reference(file, link, end, "link", ids);
 }
 
 std::expected<LinkDecl, ConfigError> read_link(const std::string& file, const YAML::Node& link,
-                                               std::span<const NodeDecl> nodes) {
-  if (auto from = check_link_end(file, link, "from", nodes); !from) {
+                                               const NodeIds& ids) {
+  if (!link.IsMap()) return std::unexpected(error_at(file, link, "link must be a map"));
+  if (auto from = check_link_end(file, link, "from", ids); !from) {
     return std::unexpected(from.error());
   }
-  if (auto to = check_link_end(file, link, "to", nodes); !to) return std::unexpected(to.error());
+  if (auto to = check_link_end(file, link, "to", ids); !to) return std::unexpected(to.error());
+  if (auto latency = check_optional_duration(file, link, "latency"); !latency) {
+    return std::unexpected(latency.error());
+  }
   return LinkDecl{link["from"].Scalar(), link["to"].Scalar()};
 }
 
 std::expected<std::vector<LinkDecl>, ConfigError> collect_links(const std::string& file,
                                                                 const YAML::Node& links,
-                                                                std::span<const NodeDecl> nodes) {
+                                                                const NodeIds& ids) {
+  // A bare `links:` parses as null, which is not a list either.
+  if (!links.IsSequence()) return std::unexpected(error_at(file, links, "links must be a list"));
   std::vector<LinkDecl> collected;
   for (const auto& link : links) {
-    auto read = read_link(file, link, nodes);
+    auto read = read_link(file, link, ids);
     if (!read) return std::unexpected(read.error());
     collected.push_back(std::move(*read));
   }
   return collected;
 }
 
-// Pattern: Validator pipeline — each check is a pure function (file, node) ->
-// expected<..., ConfigError>, run in sequence; the first failure wins and is returned.
+// Pattern: Chain of validators (fail-fast)
+// Fail-fast sequence of checks: each returns std::expected<T, ConfigError> (T is void for a
+// pure check, the parsed value otherwise); the first error wins.
 std::expected<Scenario, ConfigError> validate(const std::string& file, const YAML::Node& root) {
-  if (auto checked = check_required_top_level_keys(file, root); !checked) {
-    return std::unexpected(checked.error());
-  }
-  if (auto checked = check_version(file, root); !checked) return std::unexpected(checked.error());
+  if (auto checked = check_top_level(file, root); !checked) return std::unexpected(checked.error());
   auto duration = parse_duration_key(file, root, "duration");
   if (!duration) return std::unexpected(duration.error());
-  auto nodes = collect_node_declarations(file, root["nodes"]);
-  if (!nodes) return std::unexpected(nodes.error());
-  if (auto checked = check_node_bodies(file, root["nodes"], *nodes); !checked) {
+  auto declared = collect_node_declarations(file, root["nodes"]);
+  if (!declared) return std::unexpected(declared.error());
+  if (auto checked = check_node_bodies(file, root["nodes"], declared->ids); !checked) {
     return std::unexpected(checked.error());
   }
-  auto links = collect_links(file, root["links"], *nodes);
+  auto links = collect_links(file, root["links"], declared->ids);
   if (!links) return std::unexpected(links.error());
-  return Scenario{root["name"].Scalar(), root["version"].as<int>(), *duration, std::move(*nodes),
-                  std::move(*links)};
+  return Scenario{root["name"].Scalar(), root["version"].as<int>(), *duration,
+                  std::move(declared->nodes), std::move(*links)};
 }
 
 }  // namespace simsys::config::detail
@@ -259,9 +348,10 @@ std::expected<Scenario, ConfigError> validate(const std::string& file, const YAM
 namespace simsys::config {
 
 std::expected<Scenario, ConfigError> load(const std::string& file) {
-  // The only exception boundary: yaml-cpp reports syntax errors (LoadFile) and shape
-  // errors (subscripting a scalar, reading a missing node) by throwing; we return
-  // std::expected, so callers never need a try/catch.
+  // The only exception boundary: yaml-cpp reports syntax errors (LoadFile) by throwing,
+  // and so does any shape mistake the checks above do not pre-empt (subscripting a
+  // scalar, reading a missing node); we return std::expected, so callers never need a
+  // try/catch.
   try {
     return detail::validate(file, YAML::LoadFile(file));
   } catch (const YAML::Exception& e) {
