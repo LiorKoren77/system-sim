@@ -11,6 +11,7 @@ module;
 #include <expected>
 #include <format>
 #include <functional>
+#include <map>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -18,6 +19,7 @@ module;
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
 // C++20 module implementation unit: `module simsys.config;` (no `export`) makes this file
@@ -201,11 +203,6 @@ std::optional<T> parse_whole(std::string_view text) {
   const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
   if (error != std::errc{} || end != text.data() + text.size()) return std::nullopt;
   return value;
-}
-
-// True when the whole text is a number ("1", "0.5"): a traffic share.
-bool is_number(std::string_view text) {
-  return parse_whole<double>(text).has_value();
 }
 
 // A unit parser's error, attributed to the offending value and prefixed with its key.
@@ -477,8 +474,8 @@ CheckResult read_advanced(const std::string& file, const YAML::Node& body, model
   return check_thresholds_ordered(file, advanced, node);
 }
 
-// The keys every node type shares. Node references (ops, then, backend, ...) are checked
-// in the second pass, once every id is known.
+// The keys every node type shares. `ops`, `then` and the node references (backend, ...)
+// are read in the second pass, once every id is known.
 CheckResult read_common_keys(const std::string& file, const YAML::Node& body, model::NodeSpec& node,
                              const Datacenters& datacenters) {
   if (auto read = check_allowed_keys(file, body, node); !read) return read;
@@ -514,7 +511,8 @@ std::expected<model::NodeSpec, ConfigError> read_node_declaration(const std::str
   const auto type = read_node_type(file, id, body);
   if (!type) return std::unexpected(type.error());
   // Members the common keys leave unset keep the schema defaults declared in simsys.model;
-  // ops, then and the type's own keys are typed in later steps.
+  // ops, then and the client workload are read in the second pass (read_node_bodies), the
+  // other types' own keys in a later step.
   model::NodeSpec node{.id = id.Scalar(), .type = *type};
   if (auto read = read_common_keys(file, body, node, datacenters); !read) {
     return std::unexpected(read.error());
@@ -569,45 +567,296 @@ CheckResult check_reference(const std::string& file, const YAML::Node& parent, s
   });
 }
 
-CheckResult check_step(const std::string& file, const YAML::Node& step, const NodeIds& ids) {
+// The context of a nested reader: the file, and the prefix naming the enclosing construct
+// in its messages ("node 'a'", "link a -> b", "slo"), so a message says where to look.
+struct Site {
+  const std::string& file;
+  std::string where;
+
+  ConfigError error(const YAML::Node& at, std::string_view what) const {
+    return error_at(file, at, std::format("{}: {}", where, what));
+  }
+};
+
+// A misspelt key would otherwise be ignored. `kind` names the key in the message:
+// "unknown step key 'x'", "unknown key 'x'".
+CheckResult check_known_keys(const Site& site, const YAML::Node& map, std::string_view allowed,
+                             std::string_view kind) {
+  for (const auto& entry : map) {
+    const auto key = entry.first.Scalar();
+    if (lists_word(allowed, key)) continue;
+    return std::unexpected(site.error(entry.first, std::format("unknown {} '{}'", kind, key)));
+  }
+  return {};
+}
+
+// One word of a word-valued key (`on: miss`, `dir: inout`) and the enumerator it means.
+template <typename E>
+struct NamedValue {
+  std::string_view name;
+  E value;
+};
+
+// Pattern: Table-driven method — each enum the schema spells as a word is a table of
+// {word, enumerator}; one lookup in each direction serves them all.
+constexpr std::array<NamedValue<model::StepCondition>, 3> step_conditions{{
+    {"always", model::StepCondition::always},
+    {"miss", model::StepCondition::miss},
+    {"failure", model::StepCondition::failure},
+}};
+constexpr std::array<NamedValue<model::StepMode>, 2> step_modes{{
+    {"sequential", model::StepMode::sequential},
+    {"parallel", model::StepMode::parallel},
+}};
+constexpr std::array<NamedValue<model::Direction>, 3> directions{{
+    {"in", model::Direction::in},
+    {"out", model::Direction::out},
+    {"inout", model::Direction::inout},
+}};
+constexpr std::array<NamedValue<model::SloMetric>, 7> slo_metrics{{
+    {"p50_latency", model::SloMetric::p50_latency},
+    {"p95_latency", model::SloMetric::p95_latency},
+    {"p99_latency", model::SloMetric::p99_latency},
+    {"drop_rate", model::SloMetric::drop_rate},
+    {"utilization", model::SloMetric::utilization},
+    {"queue_lag", model::SloMetric::queue_lag},
+    {"staleness", model::SloMetric::staleness},
+}};
+
+template <typename E, std::size_t N>
+std::optional<E> find_named(const std::array<NamedValue<E>, N>& table, std::string_view name) {
+  const auto row = std::ranges::find(table, name, &NamedValue<E>::name);
+  if (row == table.end()) return std::nullopt;
+  return row->value;
+}
+
+// The inverse lookup; every enumerator has a row, so the result is always a table word.
+template <typename E, std::size_t N>
+std::string_view name_of(const std::array<NamedValue<E>, N>& table, E value) {
+  return std::ranges::find(table, value, &NamedValue<E>::value)->name;
+}
+
+// An optional word-valued key: absent keeps `target`'s default; present must be a word of
+// `table`, otherwise `requirement` ("dir must be in, out or inout") is the message.
+template <typename E, std::size_t N>
+CheckResult read_optional_word(const Site& site, const YAML::Node& parent, std::string_view key,
+                               const std::array<NamedValue<E>, N>& table,
+                               std::string_view requirement, E& target) {
+  const auto value = parent[std::string{key}];
+  if (!value) return {};
+  const auto word = find_named(table, scalar_text(value));
+  if (!word) return std::unexpected(site.error(value, requirement));
+  target = *word;
+  return {};
+}
+
+// An optional numeric key: absent keeps `target`'s default; present must be a number that
+// passes `in_range`, otherwise `requirement` ("step factor must be positive") is the message.
+CheckResult read_optional_number(const Site& site, const YAML::Node& parent, std::string_view key,
+                                 bool (*in_range)(double), std::string_view requirement,
+                                 double& target) {
+  const auto value = parent[std::string{key}];
+  if (!value) return {};
+  const auto number = parse_whole<double>(scalar_text(value));
+  if (!number || !in_range(*number)) return std::unexpected(site.error(value, requirement));
+  target = *number;
+  return {};
+}
+
+// ---- Steps: how a node forwards an op (docs/scenario-schema.md, "step") ----------------
+
+constexpr std::string_view step_keys = "to op on mode factor";
+
+// The structural messages ("step must be a map", ...) predate the typed step and name no
+// node; the reference check is the one every step key shares with links and backends.
+CheckResult check_step_target(const std::string& file, const YAML::Node& step, const NodeIds& ids) {
   if (!step.IsMap()) return std::unexpected(error_at(file, step, "step must be a map"));
   if (!step["to"]) return std::unexpected(error_at(file, step, "step needs a 'to'"));
   return check_reference(file, step, "to", "step", ids);
 }
 
-CheckResult check_step_list(const std::string& file, const YAML::Node& steps, const NodeIds& ids) {
-  for (const auto& step : steps) {
-    if (auto checked = check_step(file, step, ids); !checked) return checked;
+// The op a step forwards: its own `op`, else the op that came in (a service's `read` goes on
+// as `read`). A `then` step follows processing, not one named op, so it has nothing to
+// inherit: `incoming_op` is empty and `op` is required.
+std::expected<std::string, ConfigError> read_step_op(const Site& site, const YAML::Node& step,
+                                                     std::optional<std::string_view> incoming_op) {
+  if (step["op"]) return scalar_value(site.file, step, "op");
+  if (incoming_op) return std::string{*incoming_op};
+  return std::unexpected(site.error(step, "then step needs an 'op'"));
+}
+
+// `on` gates the flow (a cache's `miss` steps see only what it did not serve, ch. 1),
+// `mode` decides whether latencies add (sequential) or overlap (parallel: the max counts),
+// `factor` multiplies the flow (fan-out on write: one post -> 100 feed writes, ch. 11).
+CheckResult read_step_attributes(const Site& site, const YAML::Node& yaml, model::Step& step) {
+  if (auto read = read_optional_word(site, yaml, "on", step_conditions,
+                                     "step condition must be always, miss or failure", step.on);
+      !read) {
+    return read;
   }
-  return {};
+  if (auto read = read_optional_word(site, yaml, "mode", step_modes,
+                                     "step mode must be sequential or parallel", step.mode);
+      !read) {
+    return read;
+  }
+  return read_optional_number(site, yaml, "factor", is_positive, "step factor must be positive",
+                              step.factor);
 }
 
-// An op is a step list (a service's op) or a share (a client's op, a number); a share names
-// no node. Anything else, such as a map or a word, is neither and would silently do nothing.
-CheckResult check_op(const std::string& file, const YAML::Node& name, const YAML::Node& value,
-                     const NodeIds& ids) {
-  if (is_sequence(value)) return check_step_list(file, value, ids);
-  if (value.IsScalar() && is_number(value.Scalar())) return {};
-  return std::unexpected(
-      error_at(file, value, std::format("op '{}' must be a step list or a share", name.Scalar())));
+std::expected<model::Step, ConfigError> read_step(const Site& site, const YAML::Node& yaml,
+                                                  std::optional<std::string_view> incoming_op,
+                                                  const NodeIds& ids) {
+  if (auto checked = check_step_target(site.file, yaml, ids); !checked) {
+    return std::unexpected(checked.error());
+  }
+  if (auto checked = check_known_keys(site, yaml, step_keys, "step key"); !checked) {
+    return std::unexpected(checked.error());
+  }
+  auto op = read_step_op(site, yaml, incoming_op);
+  if (!op) return std::unexpected(op.error());
+  model::Step step{.to = yaml["to"].Scalar(), .op = std::move(*op)};
+  if (auto read = read_step_attributes(site, yaml, step); !read) {
+    return std::unexpected(read.error());
+  }
+  return step;
 }
 
-// `ops` is optional; when present it is a map from op name to step list or share.
-CheckResult check_op_steps(const std::string& file, const YAML::Node& ops, const NodeIds& ids) {
+std::expected<std::vector<model::Step>, ConfigError> read_step_list(
+    const Site& site, const YAML::Node& list, std::optional<std::string_view> incoming_op,
+    const NodeIds& ids) {
+  std::vector<model::Step> steps;
+  for (const auto& yaml : list) {
+    auto step = read_step(site, yaml, incoming_op, ids);
+    if (!step) return std::unexpected(step.error());
+    steps.push_back(std::move(*step));
+  }
+  return steps;
+}
+
+// A forwarding node's `ops`: incoming op name -> the steps it triggers. An empty list
+// (`deliver: []`) is a terminal op: the node handles it and forwards nothing.
+CheckResult read_op_steps(const Site& site, const YAML::Node& ops, model::NodeSpec& node,
+                          const NodeIds& ids) {
   if (!ops) return {};
-  if (!ops.IsMap()) return std::unexpected(error_at(file, ops, "ops must be a map"));
-  for (const auto& op : ops) {
-    if (auto checked = check_op(file, op.first, op.second, ids); !checked) return checked;
+  if (!ops.IsMap()) return std::unexpected(error_at(site.file, ops, "ops must be a map"));
+  for (const auto& entry : ops) {
+    const auto name = entry.first.Scalar();
+    if (!is_sequence(entry.second)) {
+      return std::unexpected(
+          error_at(site.file, entry.second, std::format("op '{}' must be a step list", name)));
+    }
+    auto steps = read_step_list(site, entry.second, name, ids);
+    if (!steps) return std::unexpected(steps.error());
+    node.ops[name] = std::move(*steps);
   }
   return {};
 }
 
-// `then` (a worker pool's follow-up steps) is optional, but when present it is a step list.
-CheckResult check_then(const std::string& file, const YAML::Node& body, const NodeIds& ids) {
+// `then`: the steps after a node has processed its work (a worker's follow-up writes, a
+// cache's misses going on to the database).
+CheckResult read_then(const Site& site, const YAML::Node& body, model::NodeSpec& node,
+                      const NodeIds& ids) {
   const auto then = body["then"];
   if (!then) return {};
-  if (!then.IsSequence()) return std::unexpected(error_at(file, then, "then must be a list"));
-  return check_step_list(file, then, ids);
+  if (!then.IsSequence()) return std::unexpected(error_at(site.file, then, "then must be a list"));
+  return read_step_list(site, then, std::nullopt, ids).transform(store_in(node.then));
+}
+
+// ---- Client workload: the traffic a client offers -------------------------------------
+//
+// Models the user population of the book's back-of-the-envelope estimates (ch. 2): a
+// request rate (DAU x requests per user / 86 400 s) and the mix of operations those
+// requests are (the read/write ratio, e.g. 10:1 for the URL shortener, ch. 8). Phase 1
+// keeps only the constant `rate.base`; the curve terms (wave, spikes, ramp, points, noise)
+// are accepted and ignored until phase 2 models time-varying load.
+
+constexpr std::string_view rate_keys = "base wave spikes ramp points noise";
+
+// The tolerance of "the shares sum to 1": decimal shares are not exact in binary floating
+// point (0.1 + 0.2 != 0.3), so the sum is compared within 1e-6.
+constexpr double share_sum_tolerance = 1e-6;
+
+using OpShares = std::vector<std::pair<std::string, double>>;
+
+std::expected<Rate, ConfigError> read_rate_base(const Site& site, const YAML::Node& body) {
+  const auto rate = body["rate"];
+  if (!rate || !rate.IsMap() || !rate["base"]) {
+    return std::unexpected(site.error(rate ? rate : body, "client needs rate.base"));
+  }
+  if (auto checked = check_known_keys(site, rate, rate_keys, "rate key"); !checked) {
+    return std::unexpected(checked.error());
+  }
+  return scalar_value(site.file, rate, "base").and_then([&](const std::string& text) {
+    return parse_rate(text).transform_error([&](const ParseError& error) {
+      return unit_error(site.file, rate["base"], "rate.base", error);
+    });
+  });
+}
+
+// A share is the probability that a request is this op: above 0 (a zero share is an op
+// that never happens; leave it out) and at most 1.
+std::expected<double, ConfigError> read_op_share(const Site& site, const YAML::Node& name,
+                                                 const YAML::Node& value) {
+  const auto share = parse_whole<double>(scalar_text(value));
+  if (share && is_unit_fraction(*share)) return *share;
+  return std::unexpected(
+      site.error(value, std::format("op share '{}' must be in (0, 1]", name.Scalar())));
+}
+
+// Every request is exactly one op, so the shares are a probability distribution.
+CheckResult check_shares_sum_to_one(const Site& site, const YAML::Node& ops,
+                                    const OpShares& shares) {
+  // C++23 std::ranges::fold_left: a left fold over a range, replacing std::accumulate's
+  // iterator pair (and its trap of an int initial value truncating doubles: here 0.0).
+  // C++20 std::views::values: a view of each pair's second member, without a copy.
+  const double sum = std::ranges::fold_left(shares | std::views::values, 0.0, std::plus<>{});
+  if (std::abs(sum - 1.0) <= share_sum_tolerance) return {};
+  return std::unexpected(site.error(ops, std::format("op shares sum to {:g}, expected 1", sum)));
+}
+
+// Sorted by op name, so the same mix listed in another order loads as the same Workload.
+std::expected<OpShares, ConfigError> read_op_shares(const Site& site, const YAML::Node& body) {
+  const auto ops = body["ops"];
+  if (!ops) return std::unexpected(site.error(body, "client needs ops"));
+  if (!ops.IsMap()) return std::unexpected(error_at(site.file, ops, "ops must be a map"));
+  OpShares shares;
+  for (const auto& entry : ops) {
+    auto share = read_op_share(site, entry.first, entry.second);
+    if (!share) return std::unexpected(share.error());
+    shares.emplace_back(entry.first.Scalar(), *share);
+  }
+  std::ranges::sort(shares);  // pairs compare by their first member (the op) first
+  if (auto checked = check_shares_sum_to_one(site, ops, shares); !checked) {
+    return std::unexpected(checked.error());
+  }
+  return shares;
+}
+
+std::expected<model::Workload, ConfigError> read_workload(const Site& site,
+                                                          const YAML::Node& body) {
+  model::Workload workload;
+  if (auto read = read_rate_base(site, body).transform(store_in(workload.base)); !read) {
+    return std::unexpected(read.error());
+  }
+  if (auto read = read_op_shares(site, body).transform(store_in(workload.op_shares)); !read) {
+    return std::unexpected(read.error());
+  }
+  if (auto read = read_optional_duration(site.file, body, "timeout", workload.timeout); !read) {
+    return std::unexpected(read.error());
+  }
+  return workload;
+}
+
+// ---- The second pass over a node ------------------------------------------------------
+
+// A client offers traffic (its `ops` are shares of its rate); every other node forwards
+// what it receives (its `ops` are step lists).
+CheckResult read_traffic(const Site& site, const YAML::Node& body, model::NodeSpec& node,
+                         const NodeIds& ids) {
+  if (node.type == model::NodeType::client) {
+    return read_workload(site, body).transform(store_in(node.workload));
+  }
+  return read_op_steps(site, body["ops"], node, ids);
 }
 
 CheckResult check_reference_key(const std::string& file, const YAML::Node& body,
@@ -616,11 +865,13 @@ CheckResult check_reference_key(const std::string& file, const YAML::Node& body,
   return check_reference(file, body, key, key, ids);
 }
 
-// The body is known to be a map: the declaration pass checked it.
-CheckResult check_node_references(const std::string& file, const YAML::Node& body,
-                                  const NodeIds& ids) {
-  if (auto checked = check_op_steps(file, body["ops"], ids); !checked) return checked;
-  if (auto checked = check_then(file, body, ids); !checked) return checked;
+// Everything in a node body that names other nodes or describes its traffic. The body is
+// known to be a map: the declaration pass checked it.
+CheckResult read_node_routing(const std::string& file, const YAML::Node& body,
+                              model::NodeSpec& node, const NodeIds& ids) {
+  const Site site{.file = file, .where = std::format("node '{}'", node.id)};
+  if (auto read = read_traffic(site, body, node, ids); !read) return read;
+  if (auto read = read_then(site, body, node, ids); !read) return read;
   for (const auto key : reference_keys) {
     if (auto checked = check_reference_key(file, body, key, ids); !checked) return checked;
   }
@@ -628,14 +879,23 @@ CheckResult check_node_references(const std::string& file, const YAML::Node& bod
 }
 
 // A second pass over the node bodies, after all ids are known, so a node may refer to
-// one declared further down the file.
-CheckResult check_node_bodies(const std::string& file, const YAML::Node& nodes,
-                              const NodeIds& ids) {
+// one declared further down the file. The declarations are in document order, the same
+// order yaml-cpp iterates the map, so the two walk side by side.
+CheckResult read_node_bodies(const std::string& file, const YAML::Node& nodes,
+                             Declarations& declared) {
+  auto node = declared.nodes.begin();
   for (const auto& entry : nodes) {
-    if (auto checked = check_node_references(file, entry.second, ids); !checked) return checked;
+    if (auto read = read_node_routing(file, entry.second, *node++, declared.ids); !read) {
+      return read;
+    }
   }
   return {};
 }
+
+// ---- Links ----------------------------------------------------------------------------
+
+// `bandwidth` † is accepted and ignored until phase 2 models byte flows.
+constexpr std::string_view link_keys = "from to dir ops latency bandwidth weight";
 
 CheckResult check_link_end(const std::string& file, const YAML::Node& link, std::string_view end,
                            const NodeIds& ids) {
@@ -643,6 +903,36 @@ CheckResult check_link_end(const std::string& file, const YAML::Node& link, std:
     return std::unexpected(error_at(file, link, std::format("link needs '{}'", end)));
   }
   return check_reference(file, link, end, "link", ids);
+}
+
+// The ops a link carries; absent means all of them.
+CheckResult read_link_ops(const Site& site, const YAML::Node& link, std::vector<std::string>& ops) {
+  const auto list = link["ops"];
+  if (!list) return {};
+  constexpr std::string_view requirement = "ops must be a list of op names";
+  if (!list.IsSequence()) return std::unexpected(site.error(list, requirement));
+  for (const auto& op : list) {
+    if (!op.IsScalar()) return std::unexpected(site.error(op, requirement));
+    ops.push_back(op.Scalar());
+  }
+  return {};
+}
+
+// `weight` is the link's share when several links carry the same op (a weighted load
+// balancer, ch. 1); 0 is allowed: a drained backend that receives nothing.
+CheckResult read_link_attributes(const Site& site, const YAML::Node& link, model::LinkSpec& spec) {
+  if (auto checked = check_known_keys(site, link, link_keys, "key"); !checked) return checked;
+  if (auto read = read_optional_word(site, link, "dir", directions, "dir must be in, out or inout",
+                                     spec.dir);
+      !read) {
+    return read;
+  }
+  if (auto read = read_link_ops(site, link, spec.ops); !read) return read;
+  if (auto read = read_optional_duration(site.file, link, "latency", spec.latency); !read) {
+    return read;
+  }
+  return read_optional_number(site, link, "weight", is_non_negative, "weight must be non-negative",
+                              spec.weight);
 }
 
 std::expected<model::LinkSpec, ConfigError> read_link(const std::string& file,
@@ -653,8 +943,9 @@ std::expected<model::LinkSpec, ConfigError> read_link(const std::string& file,
   }
   if (auto to = check_link_end(file, link, "to", ids); !to) return std::unexpected(to.error());
   model::LinkSpec spec{.from = link["from"].Scalar(), .to = link["to"].Scalar()};
-  if (auto latency = read_optional_duration(file, link, "latency", spec.latency); !latency) {
-    return std::unexpected(latency.error());
+  const Site site{.file = file, .where = std::format("link {} -> {}", spec.from, spec.to)};
+  if (auto read = read_link_attributes(site, link, spec); !read) {
+    return std::unexpected(read.error());
   }
   return spec;
 }
@@ -673,9 +964,123 @@ std::expected<std::vector<model::LinkSpec>, ConfigError> collect_links(const std
   return collected;
 }
 
+// ---- SLOs -----------------------------------------------------------------------------
+//
+// An SLO is a service-level objective, the "non-functional requirements" step of the
+// book's framework (ch. 3): a bound a design must keep, checked against the simulated run.
+// Latency percentiles are measured end to end for one client (`node`), optionally for one
+// op; drop rate and utilization are ratios; queue lag (how far consumers trail producers)
+// and staleness (the age of the data served) are times.
+
+constexpr std::string_view slo_keys = "metric node op max";
+
+using SloMaximum = decltype(model::SloSpec::max);
+
+bool is_latency_percentile(model::SloMetric metric) {
+  return metric == model::SloMetric::p50_latency || metric == model::SloMetric::p95_latency ||
+         metric == model::SloMetric::p99_latency;
+}
+
+bool is_time_metric(model::SloMetric metric) {
+  return is_latency_percentile(metric) || metric == model::SloMetric::queue_lag ||
+         metric == model::SloMetric::staleness;
+}
+
+std::expected<model::SloMetric, ConfigError> read_slo_metric(const Site& site,
+                                                             const YAML::Node& entry) {
+  const auto value = entry["metric"];
+  if (!value) return std::unexpected(site.error(entry, "entry needs a metric"));
+  const auto name = scalar_text(value);
+  if (const auto metric = find_named(slo_metrics, name)) return *metric;
+  return std::unexpected(site.error(value, std::format("unknown metric '{}'", name)));
+}
+
+CheckResult read_slo_node(const Site& site, const YAML::Node& entry, const NodeIds& ids,
+                          std::optional<std::string>& node) {
+  const auto value = entry["node"];
+  if (!value) return {};
+  auto id = scalar_text(value);
+  if (!is_declared(ids, id)) {
+    return std::unexpected(site.error(value, std::format("unknown node '{}'", id)));
+  }
+  node = std::move(id);
+  return {};
+}
+
+CheckResult read_slo_op(const Site& site, const YAML::Node& entry, std::optional<std::string>& op) {
+  if (!entry["op"]) return {};
+  return scalar_value(site.file, entry, "op").transform(store_in(op));
+}
+
+// The variant's alternative follows the metric: a SimTime for the time metrics, a double
+// for the ratios, so "0.01" can never be read as 0.01 seconds.
+std::expected<SloMaximum, ConfigError> read_slo_max(const Site& site, const YAML::Node& entry,
+                                                    model::SloMetric metric) {
+  const auto name = name_of(slo_metrics, metric);
+  const auto value = entry["max"];
+  if (!value) return std::unexpected(site.error(entry, std::format("{} needs a max", name)));
+  const auto text = scalar_text(value);
+  if (is_time_metric(metric)) {
+    if (const auto time = parse_duration(text)) return SloMaximum{*time};
+    return std::unexpected(site.error(value, std::format("{} max must be a duration", name)));
+  }
+  const auto number = parse_whole<double>(text);
+  if (number && is_non_negative(*number)) return SloMaximum{*number};
+  return std::unexpected(
+      site.error(value, std::format("{} max must be a non-negative number", name)));
+}
+
+// A latency is measured per request, and requests start at a client: without a node the
+// percentile has no population.
+CheckResult check_latency_has_node(const Site& site, const YAML::Node& entry,
+                                   const model::SloSpec& slo) {
+  if (!is_latency_percentile(slo.metric) || slo.node) return {};
+  return std::unexpected(
+      site.error(entry, std::format("{} needs a node", name_of(slo_metrics, slo.metric))));
+}
+
+std::expected<model::SloSpec, ConfigError> read_slo(const Site& site, const YAML::Node& entry,
+                                                    const NodeIds& ids) {
+  if (!entry.IsMap()) return std::unexpected(site.error(entry, "entry must be a map"));
+  if (auto checked = check_known_keys(site, entry, slo_keys, "key"); !checked) {
+    return std::unexpected(checked.error());
+  }
+  auto metric = read_slo_metric(site, entry);
+  if (!metric) return std::unexpected(metric.error());
+  model::SloSpec slo{.metric = *metric};
+  if (auto read = read_slo_node(site, entry, ids, slo.node); !read) {
+    return std::unexpected(read.error());
+  }
+  if (auto read = read_slo_op(site, entry, slo.op); !read) return std::unexpected(read.error());
+  if (auto read = read_slo_max(site, entry, slo.metric).transform(store_in(slo.max)); !read) {
+    return std::unexpected(read.error());
+  }
+  if (auto checked = check_latency_has_node(site, entry, slo); !checked) {
+    return std::unexpected(checked.error());
+  }
+  return slo;
+}
+
+std::expected<std::vector<model::SloSpec>, ConfigError> collect_slos(const std::string& file,
+                                                                     const YAML::Node& root,
+                                                                     const NodeIds& ids) {
+  const auto list = root["slo"];
+  if (!list) return std::vector<model::SloSpec>{};
+  if (!list.IsSequence()) return std::unexpected(error_at(file, list, "slo must be a list"));
+  const Site site{.file = file, .where = "slo"};
+  std::vector<model::SloSpec> collected;
+  for (const auto& entry : list) {
+    auto read = read_slo(site, entry, ids);
+    if (!read) return std::unexpected(read.error());
+    collected.push_back(std::move(*read));
+  }
+  return collected;
+}
+
 // Pattern: Validation pipeline — a sequence of independent checks run in order; the first
 // error stops the run so the user sees one precise message. Each check returns
 // std::expected<T, ConfigError> (T is void for a pure check, the parsed value otherwise).
+// `faults` is accepted as written; it is typed in phase 3.
 std::expected<model::Scenario, ConfigError> validate(const std::string& file,
                                                      const YAML::Node& root) {
   if (auto checked = check_top_level(file, root); !checked) return std::unexpected(checked.error());
@@ -686,13 +1091,16 @@ std::expected<model::Scenario, ConfigError> validate(const std::string& file,
   }
   auto declared = collect_node_declarations(file, root["nodes"], scenario.datacenters);
   if (!declared) return std::unexpected(declared.error());
-  if (auto checked = check_node_bodies(file, root["nodes"], declared->ids); !checked) {
-    return std::unexpected(checked.error());
+  if (auto read = read_node_bodies(file, root["nodes"], *declared); !read) {
+    return std::unexpected(read.error());
   }
   auto links = collect_links(file, root["links"], declared->ids);
   if (!links) return std::unexpected(links.error());
+  auto slos = collect_slos(file, root, declared->ids);
+  if (!slos) return std::unexpected(slos.error());
   scenario.nodes = std::move(declared->nodes);
   scenario.links = std::move(*links);
+  scenario.slos = std::move(*slos);
   return scenario;
 }
 
