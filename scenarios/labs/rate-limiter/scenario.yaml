@@ -29,7 +29,7 @@ nodes:
     type: rate_limiter
     algorithm: token_bucket
     limit: 1k/s
-    burst: 500
+    burst: 100
     backend: counters
 
   counters: {type: cache, eviction: ttl, ttl: 1m, keys: 1M, hit_ratio: {fixed: 1.0}, capacity: 100k/s, latency: 0.2ms}
