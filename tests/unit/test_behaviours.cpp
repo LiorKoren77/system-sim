@@ -138,7 +138,7 @@ static_assert(simsys::behaviours::NodeBehaviour<RateLimiterBehaviour>);
 // And the negative: a type that routes flow but cannot answer for its latency is not a
 // NodeBehaviour, so the engine refuses it at compile time instead of misbehaving at run time.
 struct NoResponse {
-  simsys::behaviours::Routed route(const Flow&, simsys::SimTime) const;
+  simsys::behaviours::Routed route(const Flow&, simsys::SimTime, simsys::SimTime) const;
 };
 static_assert(!simsys::behaviours::NodeBehaviour<NoResponse>);
 
@@ -159,7 +159,7 @@ TEST_CASE("a service forwards each step's op scaled by its factor and serves eve
   Flow in;
   in.add("get", Rate{50});
   in.add("put", Rate{5});  // no steps: terminal op, served locally
-  const auto routed = web.route(in, 100ms);
+  const auto routed = web.route(in, 0s, 100ms);
   REQUIRE(routed.outgoing.size() == 2);
   // C++20 ranges algorithm with a projection: `&Outgoing::target` is applied to each
   // element before comparing with the db's index, replacing a lambda passed to std::find_if.
@@ -174,7 +174,7 @@ TEST_CASE("a service forwards each step's op scaled by its factor and serves eve
 TEST_CASE("a service with no incoming flow forwards nothing", "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(two_hop(StepMode::sequential));
   const ServiceBehaviour web{g, *g.index_of("web")};
-  const auto routed = web.route(Flow{}, 100ms);
+  const auto routed = web.route(Flow{}, 0s, 100ms);
   REQUIRE(routed.outgoing.empty());
   REQUIRE(routed.served.empty());
 }
@@ -268,7 +268,7 @@ TEST_CASE("two steps to the same target merge into one outgoing flow carrying bo
   const auto g = *simsys::graph::Graph::build(s);
   Flow in;
   in.add("get", Rate{10});
-  const auto routed = ServiceBehaviour{g, *g.index_of("web")}.route(in, 100ms);
+  const auto routed = ServiceBehaviour{g, *g.index_of("web")}.route(in, 0s, 100ms);
   REQUIRE(routed.outgoing.size() == 1);
   REQUIRE_THAT(routed.outgoing[0].flow.rate_of("select").per_second, WithinRel(10.0, 1e-12));
   REQUIRE_THAT(routed.outgoing[0].flow.rate_of("count").per_second, WithinRel(5.0, 1e-12));
@@ -310,7 +310,7 @@ TEST_CASE("the hop that closes a call cycle forwards flow but adds no latency to
   const ServiceBehaviour sync{g, *g.index_of("sync")};
   Flow in;
   in.add("job", Rate{3});
-  REQUIRE(sync.route(in, 100ms).outgoing.size() == 1);  // flow still goes round
+  REQUIRE(sync.route(in, 0s, 100ms).outgoing.size() == 1);  // flow still goes round
   const auto r =
       sync.response("job", LatencyEstimate{0.002, 0.0},
                     [](std::size_t, std::string_view) { return LatencyEstimate{99.0, 99.0}; });
@@ -413,7 +413,7 @@ TEST_CASE(
   LoadBalancerBehaviour lb{g, *g.index_of("lb")};
   Flow in;
   in.add("get", Rate{100});
-  const auto routed = lb.route(in, 100ms);
+  const auto routed = lb.route(in, 0s, 100ms);
   REQUIRE(routed.outgoing.size() == 2);
   const auto to_a = std::ranges::find(routed.outgoing, *g.index_of("a"), &Outgoing::target);
   const auto to_b = std::ranges::find(routed.outgoing, *g.index_of("b"), &Outgoing::target);
@@ -454,7 +454,7 @@ TEST_CASE("a token bucket admits the limit plus what the bucket holds and reject
   RateLimiterBehaviour lim{g, *g.index_of("limiter")};
   const Flow in = flow_of("call", 800);
   for (int i = 0; i < 100; ++i) {
-    const auto steady = lim.route(in, 100ms);
+    const auto steady = lim.route(in, 0s, 100ms);
     REQUIRE_THAT(steady.served.total().per_second, WithinRel(800.0, 1e-12));  // all admitted
     REQUIRE(steady.rejected.total().per_second == 0.0);
   }
@@ -462,16 +462,16 @@ TEST_CASE("a token bucket admits the limit plus what the bucket holds and reject
   // bucket drops by (4000 - 1000) x 0.1 = 300 to 200; step 2 admits 1000 + 200/0.1 = 3000 and
   // empties it; from step 3 on only the limit, 1000/s, gets through.
   const Flow burst = flow_of("call", 4000);
-  const auto r1 = lim.route(burst, 100ms);
+  const auto r1 = lim.route(burst, 0s, 100ms);
   REQUIRE_THAT(r1.served.total().per_second, WithinRel(4000.0, 1e-12));
   REQUIRE(r1.rejected.empty());
-  const auto r2 = lim.route(burst, 100ms);
+  const auto r2 = lim.route(burst, 0s, 100ms);
   REQUIRE_THAT(r2.served.total().per_second, WithinRel(3000.0, 1e-12));
   REQUIRE_THAT(r2.rejected.total().per_second, WithinRel(1000.0, 1e-12));
-  const auto r3 = lim.route(burst, 100ms);
+  const auto r3 = lim.route(burst, 0s, 100ms);
   REQUIRE_THAT(r3.served.total().per_second, WithinRel(1000.0, 1e-12));
   REQUIRE_THAT(r3.rejected.total().per_second, WithinRel(3000.0, 1e-12));
-  const auto r4 = lim.route(burst, 100ms);
+  const auto r4 = lim.route(burst, 0s, 100ms);
   REQUIRE_THAT(r4.served.total().per_second, WithinRel(1000.0, 1e-12));  // and it stays there
   REQUIRE_THAT(r4.rejected.total().per_second, WithinRel(3000.0, 1e-12));
 }
@@ -485,9 +485,9 @@ TEST_CASE("a token bucket refills while idle: a quiet step restores what a burst
       limiter_front(limiter_spec(LimiterAlgorithm::token_bucket, 1000, 500)));
   RateLimiterBehaviour lim{g, *g.index_of("limiter")};
   const Flow burst = flow_of("call", 4000);
-  for (int i = 0; i < 102; ++i) (void)lim.route(i < 100 ? flow_of("call", 800) : burst, 100ms);
-  for (int i = 0; i < 3; ++i) (void)lim.route(Flow{}, 100ms);
-  const auto after_idle = lim.route(burst, 100ms);
+  for (int i = 0; i < 102; ++i) (void)lim.route(i < 100 ? flow_of("call", 800) : burst, 0s, 100ms);
+  for (int i = 0; i < 3; ++i) (void)lim.route(Flow{}, 0s, 100ms);
+  const auto after_idle = lim.route(burst, 0s, 100ms);
   REQUIRE_THAT(after_idle.served.total().per_second, WithinRel(4000.0, 1e-9));
   REQUIRE(after_idle.rejected.total().per_second < 1e-6);
 }
@@ -496,7 +496,7 @@ TEST_CASE("a limiter with no incoming flow admits and rejects nothing", "[behavi
   const auto g = *simsys::graph::Graph::build(
       limiter_front(limiter_spec(LimiterAlgorithm::token_bucket, 1000, 500)));
   RateLimiterBehaviour lim{g, *g.index_of("limiter")};
-  const auto routed = lim.route(Flow{}, 100ms);
+  const auto routed = lim.route(Flow{}, 0s, 100ms);
   REQUIRE(routed.outgoing.empty());
   REQUIRE(routed.served.empty());
   REQUIRE(routed.rejected.empty());
@@ -509,13 +509,13 @@ TEST_CASE("admitted flow is forwarded downstream op by op; rejected flow is not"
   Flow idle;
   idle.add("a", Rate{400});
   idle.add("b", Rate{400});
-  for (int i = 0; i < 100; ++i) (void)lim.route(idle, 100ms);  // bucket full
+  for (int i = 0; i < 100; ++i) (void)lim.route(idle, 0s, 100ms);  // bucket full
   Flow burst;
   burst.add("a", Rate{2000});
-  burst.add("b", Rate{2000});                   // 4000/s in all, split 50/50
-  (void)lim.route(burst, 100ms);                // admits 4000, bucket 500 -> 200
-  (void)lim.route(burst, 100ms);                // admits 3000, bucket -> 0
-  const auto routed = lim.route(burst, 100ms);  // admits the limit only: 1000 of 4000
+  burst.add("b", Rate{2000});                       // 4000/s in all, split 50/50
+  (void)lim.route(burst, 0s, 100ms);                // admits 4000, bucket 500 -> 200
+  (void)lim.route(burst, 0s, 100ms);                // admits 3000, bucket -> 0
+  const auto routed = lim.route(burst, 0s, 100ms);  // admits the limit only: 1000 of 4000
   // The admitted 1000/s keeps the op mix: 500 of each op goes on to the api, in one flow.
   REQUIRE(routed.outgoing.size() == 1);
   const auto to_api = std::ranges::find(routed.outgoing, *g.index_of("api"), &Outgoing::target);
@@ -531,52 +531,113 @@ TEST_CASE("admitted flow is forwarded downstream op by op; rejected flow is not"
                WithinRel(4000.0, 1e-12));
 }
 
-// Fixed window, sliding log and sliding counter (ch. 4) differ in how exactly they count the
-// last `window` seconds, not in how much they let through in a burst: at most limit x window
-// requests per window. A fluid model keeps that one number: a token bucket of burst
-// limit x window (plan 2a refinement 6). Here limit 1000/s and window 1 s: burst 1000, twice
-// the 500 of the token-bucket test above, so the same 4000/s burst lasts a step longer.
-TEST_CASE("a windowed algorithm is a token bucket whose burst is limit times window",
-          "[behaviours]") {
+// The three windowed algorithms of ch. 4 allow at most limit x window requests per window;
+// they differ in WHICH window they count, and in a fluid stepped every dt that difference is
+// visible at the step level (plan 2a refinement 6). The tests below flood a 1000/s limit with
+// 16k/s (the lab's 20x spike on 800/s) at 100 ms steps, window 1 s: W = limit x window = 1000
+// requests per window, and one step at 16k/s brings 1600, more than a whole window's worth.
+// The step's start `now` is passed in, so window boundaries fall where the clock puts them.
+namespace {
+// Admitted rate of each of `steps` steps of length dt from t = 0, inflow `demand(k)` at step k.
+template <class Demand>
+std::vector<double> admitted_per_step(RateLimiterBehaviour& lim, std::size_t steps, Demand demand) {
+  std::vector<double> admitted;
+  for (std::size_t k = 0; k < steps; ++k) {
+    const auto now = static_cast<long>(k) * 100ms;
+    const auto routed = lim.route(flow_of("call", demand(k)), now, 100ms);
+    admitted.push_back(routed.served.total().per_second);
+  }
+  return admitted;
+}
+RateLimiterBehaviour windowed(const simsys::graph::Graph& g) {
+  return RateLimiterBehaviour{g, *g.index_of("limiter")};
+}
+}  // namespace
+
+// Fixed window: a counter per calendar window [k·window, (k+1)·window) that resets at each
+// boundary. Under a flood the first step of a window takes the whole budget (1000 requests
+// in 100 ms = 10000/s) and the other nine get nothing: the fluid version of ch. 4's "the
+// window's quota is gone in its first moments".
+TEST_CASE(
+    "a fixed window admits a whole window at its start under a flood and nothing until the next",
+    "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(limiter_front(
       limiter_spec(LimiterAlgorithm::fixed_window, 1000, std::nullopt, std::nullopt, 1s)));
-  RateLimiterBehaviour lim{g, *g.index_of("limiter")};
-  const Flow idle = flow_of("call", 800);
-  for (int i = 0; i < 100; ++i) (void)lim.route(idle, 100ms);  // window budget full: 1000
-  const Flow burst = flow_of("call", 4000);
-  // Budget (tokens) before each 4000/s step: 1000, 700, 400, 100, 0. A step admits
-  // min(4000, 1000 + budget/0.1) and spends (admitted - 1000) x 0.1: steps 1-3 admit all
-  // 4000 (1000 + 1000/0.1 = 11000, 8000, 5000 all exceed 4000), step 4 admits
-  // 1000 + 100/0.1 = 2000, step 5 only the limit. A 500-token bucket would stop at step 3.
-  for (int i = 0; i < 2; ++i) {
-    const auto r = lim.route(burst, 100ms);
-    REQUIRE_THAT(r.served.total().per_second, WithinRel(4000.0, 1e-9));
+  auto lim = windowed(g);
+  const auto admitted = admitted_per_step(lim, 30, [](std::size_t) { return 16'000.0; });
+  for (std::size_t k = 0; k < 30; ++k) {
+    CAPTURE(k);
+    if (k % 10 == 0) {
+      REQUIRE_THAT(admitted[k], WithinRel(10'000.0, 1e-12));
+    } else {
+      REQUIRE(admitted[k] == 0.0);
+    }
   }
-  const auto r3 = lim.route(burst, 100ms);  // 400 left: 1000 + 400/0.1 = 5000 >= 4000
-  REQUIRE_THAT(r3.served.total().per_second, WithinRel(4000.0, 1e-9));
-  REQUIRE(r3.rejected.total().per_second < 1e-6);
-  const auto r4 = lim.route(burst, 100ms);  // 100 left: 1000 + 100/0.1 = 2000
-  REQUIRE_THAT(r4.served.total().per_second, WithinRel(2000.0, 1e-9));
-  REQUIRE_THAT(r4.rejected.total().per_second, WithinRel(2000.0, 1e-9));
-  const auto r5 = lim.route(burst, 100ms);  // empty: the limit only
-  REQUIRE_THAT(r5.served.total().per_second, WithinRel(1000.0, 1e-9));
-  REQUIRE_THAT(r5.rejected.total().per_second, WithinRel(3000.0, 1e-9));
 }
 
-TEST_CASE("every windowed algorithm gives the same fluid behaviour at the same window",
-          "[behaviours]") {
-  // Window 500 ms: burst = 1000 x 0.5 = 500, the token bucket of the first test. From full,
-  // two 4000/s steps admit 4000 then 3000, the third only the limit.
+// Ch. 4's flaw of the fixed window: a burst that straddles a boundary gets the end of one
+// window AND the start of the next. Idle until t = 0.5 s, then a flood: step 5 takes window
+// 0's whole budget, step 10 (t = 1 s) window 1's, so the second [0.5 s, 1.5 s) lets 2000
+// requests through, twice limit x window.
+TEST_CASE("a fixed window lets twice the limit through across a window boundary", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(limiter_front(
+      limiter_spec(LimiterAlgorithm::fixed_window, 1000, std::nullopt, std::nullopt, 1s)));
+  auto lim = windowed(g);
+  const auto admitted =
+      admitted_per_step(lim, 15, [](std::size_t k) { return k < 5 ? 0.0 : 16'000.0; });
+  double in_straddling_second = 0.0;
+  for (std::size_t k = 5; k < 15; ++k) in_straddling_second += admitted[k] * 0.1;
+  REQUIRE_THAT(in_straddling_second, WithinRel(2000.0, 1e-12));
+}
+
+// Sliding log: every admitted request's timestamp is kept and the log of the last `window`
+// seconds is counted. In the fluid the log is a ring of the last ceil(window/dt) steps'
+// admitted counts; a step admits what fits under W beside the previous ten-minus-one steps.
+// So NO window of ten consecutive steps ever holds more than W, wherever the flood starts.
+TEST_CASE("a sliding log never admits more than limit x window in any window", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(limiter_front(
+      limiter_spec(LimiterAlgorithm::sliding_log, 1000, std::nullopt, std::nullopt, 1s)));
+  for (const std::size_t flood_from : {std::size_t{0}, std::size_t{5}}) {
+    CAPTURE(flood_from);
+    auto lim = windowed(g);
+    const auto admitted =
+        admitted_per_step(lim, 40, [&](std::size_t k) { return k < flood_from ? 0.0 : 16'000.0; });
+    REQUIRE_THAT(admitted[flood_from], WithinRel(10'000.0, 1e-12));  // the whole budget at once
+    for (std::size_t first = 0; first + 10 <= 40; ++first) {
+      double in_window = 0.0;
+      for (std::size_t k = first; k < first + 10; ++k) in_window += admitted[k] * 0.1;
+      CAPTURE(first);
+      REQUIRE(in_window <= 1000.0 + 1e-9);
+    }
+  }
+}
+
+// Sliding counter: the current window's count plus the previous window's, weighted by how
+// much of the previous window the trailing `window` still overlaps:
+//   estimate = prev · (1 − f) + cur,   f = (now mod window) / window
+// A request is admitted while estimate < W. Under a flood the previous window's full count
+// keeps the estimate high early in each window, so the long-run admitted rate settles below
+// the limit: 10/11 of it with ten steps per window (windows.py of the review reproduces it).
+TEST_CASE("a sliding counter smooths to about 0.9 of the limit under a flood", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(limiter_front(
+      limiter_spec(LimiterAlgorithm::sliding_counter, 1000, std::nullopt, std::nullopt, 1s)));
+  auto lim = windowed(g);
+  const auto admitted = admitted_per_step(lim, 2000, [](std::size_t) { return 16'000.0; });
+  double sum = 0.0;
+  for (std::size_t k = 1000; k < 2000; ++k) sum += admitted[k];
+  REQUIRE_THAT(sum / 1000.0, WithinRel(1000.0 * 10.0 / 11.0, 1e-3));
+}
+
+TEST_CASE("below its limit every windowed algorithm admits everything", "[behaviours]") {
   for (const auto algorithm : {LimiterAlgorithm::fixed_window, LimiterAlgorithm::sliding_log,
                                LimiterAlgorithm::sliding_counter}) {
+    CAPTURE(algorithm);
     const auto g = *simsys::graph::Graph::build(
-        limiter_front(limiter_spec(algorithm, 1000, std::nullopt, std::nullopt, 500ms)));
-    RateLimiterBehaviour lim{g, *g.index_of("limiter")};
-    for (int i = 0; i < 100; ++i) (void)lim.route(flow_of("call", 800), 100ms);
-    const Flow burst = flow_of("call", 4000);
-    REQUIRE_THAT(lim.route(burst, 100ms).served.total().per_second, WithinRel(4000.0, 1e-9));
-    REQUIRE_THAT(lim.route(burst, 100ms).served.total().per_second, WithinRel(3000.0, 1e-9));
-    REQUIRE_THAT(lim.route(burst, 100ms).served.total().per_second, WithinRel(1000.0, 1e-9));
+        limiter_front(limiter_spec(algorithm, 1000, std::nullopt, std::nullopt, 1s)));
+    auto lim = windowed(g);
+    for (const double a : admitted_per_step(lim, 50, [](std::size_t) { return 800.0; })) {
+      REQUIRE_THAT(a, WithinRel(800.0, 1e-12));
+    }
   }
 }
 
@@ -590,7 +651,7 @@ TEST_CASE("a leaky bucket queues the excess instead of rejecting it", "[behaviou
   RateLimiterBehaviour lim{g, *g.index_of("limiter")};
   const Flow in = flow_of("call", 1500);
   for (int i = 0; i < 20; ++i) {  // past the point where a 500-request queue would be full
-    const auto routed = lim.route(in, 100ms);
+    const auto routed = lim.route(in, 0s, 100ms);
     REQUIRE(routed.rejected.empty());
     REQUIRE_THAT(routed.served.total().per_second, WithinRel(1500.0, 1e-12));
     REQUIRE(routed.outgoing.size() == 1);
@@ -598,14 +659,18 @@ TEST_CASE("a leaky bucket queues the excess instead of rejecting it", "[behaviou
   }
 }
 
-TEST_CASE("a limiter with a backend sends one counter op per admitted request", "[behaviours]") {
+// Ch. 4: the limiter reads (and bumps) the client's counter for EVERY request, because that
+// read is how it decides; a request it then refuses was checked as surely as one it admits.
+// So the counter store sees the limiter's whole inflow, not just the admitted part.
+TEST_CASE("a limiter with a backend asks the counter store about every request it checks",
+          "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(
       limiter_front(limiter_spec(LimiterAlgorithm::token_bucket, 1000, 500, "counters")));
   RateLimiterBehaviour lim{g, *g.index_of("limiter")};
   const auto counters = *g.index_of("counters");
   const auto api = *g.index_of("api");
-  for (int i = 0; i < 100; ++i) (void)lim.route(flow_of("call", 800), 100ms);
-  const auto steady = lim.route(flow_of("call", 800), 100ms);
+  for (int i = 0; i < 100; ++i) (void)lim.route(flow_of("call", 800), 0s, 100ms);
+  const auto steady = lim.route(flow_of("call", 800), 0s, 100ms);
   REQUIRE(steady.outgoing.size() == 2);
   const auto to_counters = std::ranges::find(steady.outgoing, counters, &Outgoing::target);
   const auto to_api = std::ranges::find(steady.outgoing, api, &Outgoing::target);
@@ -617,17 +682,16 @@ TEST_CASE("a limiter with a backend sends one counter op per admitted request", 
   REQUIRE(to_api->flow.rate_of("counter").per_second == 0.0);
 
   // Drain the bucket with 4000/s bursts; once only the limit gets through, the counter store
-  // is asked 1000 times a second, for the admitted requests alone, not for the 4000 offered
-  // and not for the 3000 rejected.
+  // is still asked 4000 times a second: 1000 checks that admitted and 3000 that refused.
   const Flow burst = flow_of("call", 4000);
-  (void)lim.route(burst, 100ms);
-  (void)lim.route(burst, 100ms);
-  const auto limited = lim.route(burst, 100ms);
+  (void)lim.route(burst, 0s, 100ms);
+  (void)lim.route(burst, 0s, 100ms);
+  const auto limited = lim.route(burst, 0s, 100ms);
   const auto limited_counters = std::ranges::find(limited.outgoing, counters, &Outgoing::target);
   const auto limited_api = std::ranges::find(limited.outgoing, api, &Outgoing::target);
   REQUIRE(limited_counters != limited.outgoing.end());
   REQUIRE(limited_api != limited.outgoing.end());
-  REQUIRE_THAT(limited_counters->flow.rate_of("counter").per_second, WithinRel(1000.0, 1e-12));
+  REQUIRE_THAT(limited_counters->flow.rate_of("counter").per_second, WithinRel(4000.0, 1e-12));
   REQUIRE_THAT(limited_api->flow.rate_of("call").per_second, WithinRel(1000.0, 1e-12));
   REQUIRE_THAT(limited.rejected.total().per_second, WithinRel(3000.0, 1e-12));
 }
@@ -667,4 +731,51 @@ TEST_CASE("a limiter without a backend adds only the api hop to its own sojourn"
                    [](std::size_t, std::string_view) { return LatencyEstimate{0.004, 1e-6}; });
   REQUIRE_THAT(r.mean_s, WithinRel(0.001 + 0.006 + 0.004, 1e-12));
   REQUIRE_THAT(r.variance_s2, WithinRel(1e-6, 1e-9));
+}
+
+// A step of zero length would divide the bucket's tokens by zero (limit + tokens / dt): the
+// engine never takes one (FluidQueue::advance refuses it too), so it is a programmer error.
+TEST_CASE("a limiter refuses a step of zero length", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(
+      limiter_front(limiter_spec(LimiterAlgorithm::token_bucket, 1000, 500)));
+  RateLimiterBehaviour lim{g, *g.index_of("limiter")};
+  REQUIRE_THROWS_AS(lim.route(flow_of("call", 5000), 0s, 0s), std::invalid_argument);
+}
+
+// Plan 2a refinement 8: only ANSWERED requests reach the client's latency, so the backward
+// pass carries, next to each (node, op)'s latency, the fraction of its requests that come
+// back answered. Sequential parts multiply (a request must pass the limiter AND the counter
+// check AND the api); a split is the share-weighted mixture of its routes.
+TEST_CASE("a limiter delivers its own fraction times the counter check's times its routes'",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(
+      limiter_front(limiter_spec(LimiterAlgorithm::token_bucket, 1000, 500, "counters")));
+  const RateLimiterBehaviour lim{g, *g.index_of("limiter")};
+  const auto counters = *g.index_of("counters");
+  const double delivered = lim.delivered("call", 0.25, [&](std::size_t node, std::string_view) {
+    return node == counters ? 0.9 : 0.8;
+  });
+  REQUIRE_THAT(delivered, WithinRel(0.25 * 0.9 * 0.8, 1e-12));
+}
+
+TEST_CASE("a service delivers its own fraction times every hop it waits for", "[behaviours]") {
+  // web.get calls cache.read and db.select; web.put calls nothing.
+  const auto g = *simsys::graph::Graph::build(two_hop(StepMode::parallel));
+  const ServiceBehaviour web{g, *g.index_of("web")};
+  const auto cache = *g.index_of("cache");
+  const auto lookup = [&](std::size_t node, std::string_view) { return node == cache ? 0.5 : 0.9; };
+  REQUIRE_THAT(web.delivered("get", 0.8, lookup), WithinRel(0.8 * 0.5 * 0.9, 1e-12));
+  REQUIRE_THAT(web.delivered("put", 0.8, lookup), WithinRel(0.8, 1e-12));
+}
+
+TEST_CASE("a load balancer's and a client's delivered fraction mix their routes by share",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(weighted_lb());
+  const LoadBalancerBehaviour lb{g, *g.index_of("lb")};
+  const auto a = *g.index_of("a");
+  const auto lookup = [&](std::size_t node, std::string_view) { return node == a ? 1.0 : 0.2; };
+  REQUIRE_THAT(lb.delivered("get", 0.5, lookup), WithinRel(0.5 * (0.75 * 1.0 + 0.25 * 0.2), 1e-12));
+  const ClientBehaviour users{g, *g.index_of("u")};
+  REQUIRE_THAT(users.delivered("get", [](std::size_t, std::string_view) { return 0.4; }),
+               WithinRel(0.4, 1e-12));
 }
