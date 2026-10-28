@@ -249,6 +249,19 @@ TEST_CASE("over a long run the multiplier averages one with standard deviation s
   REQUIRE_THAT(std::sqrt(var), WithinAbs(0.1, 0.01));
 }
 
+// The multiplier is max(0, 1 + x) with x ~ N(0, sigma^2), so its mean is not 1 but
+//   E[max(0, 1 + sigma Z)] = Phi(1/sigma) + sigma phi(1/sigma)
+// (Phi, phi: the standard normal CDF and density): cutting off the negative tail adds back
+// what it would have subtracted. 1.004 at sigma 0.5, 1.083 at sigma 1, 1.40 at 2, 4.5 at 10.
+TEST_CASE("the noise floor lifts the mean multiplier: about 1.08 at sigma one", "[workload]") {
+  NoiseProcess n{Noise{.sigma = 1.0, .correlation = 1s}, 7};
+  double sum = 0;
+  const int samples = 200'000;  // at dt = tau consecutive samples correlate by e^-1 only
+  for (int i = 0; i < samples; ++i) sum += n.next(1s);
+  const double floor_mean = 0.8413447460685429 + 0.24197072451914337;  // Phi(1) + 1 phi(1)
+  REQUIRE_THAT(sum / samples, WithinAbs(floor_mean, 0.02));
+}
+
 TEST_CASE("consecutive samples are correlated over the correlation time", "[workload]") {
   NoiseProcess n{Noise{.sigma = 0.3, .correlation = 10s}, 3};
   double prev = n.next(100ms), cov = 0, var = 0;

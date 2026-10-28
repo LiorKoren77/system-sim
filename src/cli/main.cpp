@@ -7,6 +7,7 @@
 #include <unistd.h>  // isatty, STDOUT_FILENO: POSIX, which is fine for this project
 #include <CLI/CLI.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -161,6 +162,23 @@ int run_explain(const std::filesystem::path& file) {
 constexpr std::string_view estimate_header =
     "estimate at t = 0 (00:00): the curve without noise; explain's checks use the peak";
 
+// estimate admits min(in, limit) at a rate limiter: the long-run rate of a bucket, but not
+// of the sliding counter (about 10/11 of the limit under a flood), and blind to the fixed
+// window's sawtooth inside each window. When a windowed limiter is present, the header says so.
+constexpr std::string_view windowed_limiter_caveat =
+    "; windowed limiters are evaluated at min(in, limit) — run them to see the sawtooth";
+
+// C++20 std::ranges::any_of: takes the range itself instead of a begin/end iterator pair
+// (std::any_of), so the span cannot be paired with another container's end by mistake.
+[[nodiscard]] bool has_windowed_limiter(const graph::Graph& g) {
+  return std::ranges::any_of(g.nodes(), [](const graph::ResolvedNode& node) {
+    const auto& spec = node.spec;
+    return spec.type == simsys::model::NodeType::rate_limiter &&
+           simsys::model::is_windowed(
+               spec.algorithm.value_or(simsys::model::LimiterAlgorithm::token_bucket));
+  });
+}
+
 // `simsys estimate <file>`: one steady-state evaluation, summarised as a run of one step.
 int run_estimate(const std::filesystem::path& file, const ReportOptions& options) {
   const auto g = load_graph(file);
@@ -179,28 +197,13 @@ int run_estimate(const std::filesystem::path& file, const ReportOptions& options
                 ": warning: no steady state (a loop of gain >= 1); "
                 "the numbers below are the last settle pass");
   }
-  if (options.format == "table") std::println("{}", estimate_header);
+  if (options.format == "table") {
+    std::println("{}{}", estimate_header,
+                 has_windowed_limiter(*g) ? windowed_limiter_caveat : std::string_view{});
+  }
   report::Summary summary{*g, simsys::SimTime{0}};
   summary.observe(record);
   return print_report(summary, options);
-}
-
-// A duration in the largest unit that divides it exactly, so it reads as a scenario writes
-// it: 10s, 2m, 1500ms. Integer arithmetic on the tick count (nanoseconds) only: this unit
-// never formats doubles (see the note at the top).
-std::string describe_duration(simsys::SimTime t) {
-  struct Unit {
-    std::string_view name;
-    long long ns;
-  };
-  constexpr std::array units{
-      Unit{"h", 3'600'000'000'000}, Unit{"m", 60'000'000'000}, Unit{"s", 1'000'000'000},
-      Unit{"ms", 1'000'000},        Unit{"us", 1'000},         Unit{"ns", 1}};
-  const long long ticks = t.count();
-  for (const auto& unit : units) {
-    if (ticks != 0 && ticks % unit.ns == 0) return std::format("{}{}", ticks / unit.ns, unit.name);
-  }
-  return "0s";
 }
 
 // `--duration` overrides the scenario's; like the scenario's own, it must leave a non-empty
@@ -217,7 +220,8 @@ std::expected<simsys::SimTime, std::string> run_duration(const std::filesystem::
   }
   if (parsed->count() <= scenario.warmup.count()) {
     return std::unexpected(std::format("{}: error: --duration {} is not longer than the warmup {}",
-                                       file.string(), *text, describe_duration(scenario.warmup)));
+                                       file.string(), *text,
+                                       simsys::describe_duration(scenario.warmup)));
   }
   return *parsed;
 }
@@ -342,7 +346,7 @@ std::expected<simsys::SimTime, std::string> check_noise_step(
     const CurveArgs& args, simsys::SimTime step) {
   if (!args.noise || step.count() % scenario.step.count() == 0) return step;
   return std::unexpected(std::format("{}: error: --step must be a multiple of the scenario step {}",
-                                     file.string(), describe_duration(scenario.step)));
+                                     file.string(), simsys::describe_duration(scenario.step)));
 }
 
 std::expected<CurveGrid, std::string> curve_grid(const std::filesystem::path& file,
@@ -356,6 +360,9 @@ std::expected<CurveGrid, std::string> curve_grid(const std::filesystem::path& fi
   step = check_noise_step(file, scenario, args, *step);
   if (!step) return std::unexpected(step.error());
   if (!args.until) return CurveGrid{.step = *step, .until = scenario.duration};
+  // C++23 std::expected::transform: maps the value (here a duration to a CurveGrid) and
+  // passes an error through untouched, replacing `if (!r) return unexpected(r.error());`
+  // followed by building the result by hand; unlike and_then, the lambda cannot fail.
   return curve_duration(file, "--until", *args.until).transform([&](simsys::SimTime until) {
     return CurveGrid{.step = *step, .until = until};
   });
