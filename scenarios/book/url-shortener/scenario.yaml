@@ -1,0 +1,68 @@
+# System Design Interview vol. 1, ch. 8 — URL shortener.
+# Book numbers: 100M URLs/day written (~1,160/s), read:write 10:1 (~11,600/s reads),
+# 365B records over 10 years, 7-char base-62 short URLs.
+version: 1
+name: url-shortener
+seed: 1
+duration: 24h
+step: 100ms
+warmup: 2m
+
+nodes:
+  users:
+    type: client
+    rate:
+      base: 12.8k/s                          # 11.6k reads + 1.16k writes
+      wave: {shape: sine, period: 24h, amplitude: 0.5, peak_at: 14:00}
+    ops: {redirect: 0.91, shorten: 0.09}
+    keys: {zipf: 1.0, space: 100M}           # a few short links get most of the clicks
+    timeout: 1s
+
+  limiter:
+    type: rate_limiter
+    algorithm: token_bucket
+    limit: 20k/s
+    burst: 2000
+    backend: rules_cache
+
+  rules_cache: {type: cache, eviction: lru, keys: 10k, strategy: cache_aside}
+
+  lb: {type: load_balancer, policy: round_robin}
+
+  web:
+    type: service
+    replicas: 6
+    capacity: 3k/s
+    latency: 0.3ms
+    ops:
+      redirect: [{to: url_cache, op: read}, {to: url_db, op: read, on: miss}]
+      shorten:  [{to: id_gen, op: next_id}, {to: url_db, op: write}]
+
+  id_gen: {type: id_generator, algorithm: snowflake, replicas: 2}
+
+  url_cache:
+    type: cache
+    eviction: lru
+    strategy: cache_aside
+    keys: 20M                                # ~20% of the hot key space
+    hit_ratio: che
+
+  url_db:
+    type: sql_db
+    replicas: 3                              # 1 primary + 2 read replicas
+    capacity: 5k/s
+    replication_lag: 50ms
+    advanced: {queue_limit: 1000}
+
+links:
+  - {from: users, to: limiter, dir: inout}
+  - {from: limiter, to: rules_cache, dir: inout}
+  - {from: limiter, to: lb, dir: inout}
+  - {from: lb, to: web, dir: inout}
+  - {from: web, to: url_cache, dir: inout}
+  - {from: web, to: url_db, dir: inout}
+  - {from: web, to: id_gen, dir: inout}
+
+slo:
+  - {metric: p99_latency, node: users, op: redirect, max: 50ms}
+  - {metric: drop_rate, max: 0.001}
