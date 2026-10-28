@@ -71,16 +71,21 @@ void print_error(const std::string& message) {
   std::println(stderr, "{}", message);
 }
 
-// Scenario file -> resolved graph, or the message to print.
+// Scenario file -> resolved graph, or the message to print. `seed`, when given (`run
+// --seed`), replaces the scenario's own before the graph is built: the engine seeds every
+// client's noise from Graph::scenario().seed (behaviours::client_seed), so overriding it
+// any later would not reach the clients.
 // C++23 std::expected<T, E>: a value-or-error return type; the error here is the finished
 // message, so every command prints it the same way. C++23 monadic operations chain the
 // two fallible stages without an `if` per stage: transform_error rewrites only an error
 // (ConfigError or EngineError -> text), and_then runs the next stage only on a value and
 // passes an error straight through. The pre-C++23 way is an early return after each step.
-std::expected<graph::Graph, std::string> load_graph(const std::filesystem::path& file) {
+std::expected<graph::Graph, std::string> load_graph(const std::filesystem::path& file,
+                                                    std::optional<int> seed = std::nullopt) {
   return simsys::config::load(file.string())
       .transform_error(describe)
       .and_then([&](simsys::model::Scenario scenario) {
+        if (seed) scenario.seed = *seed;
         return graph::Graph::build(std::move(scenario))
             .transform_error([&](const graph::EngineError& error) {
               return std::format("{}: error: {}", file.string(), error.message);
@@ -149,6 +154,13 @@ int run_explain(const std::filesystem::path& file) {
   return 0;
 }
 
+// What `estimate` evaluates, stated above its table: the steady state of the curve's value
+// at t = 0 (00:00), noise left out (Simulation::estimate). A daily wave's trough or peak
+// is not that value, so the line also says where the peak IS checked: explain's static
+// load check. Table only: a line of prose before the JSON would break its parsers.
+constexpr std::string_view estimate_header =
+    "estimate at t = 0 (00:00): the curve without noise; explain's checks use the peak";
+
 // `simsys estimate <file>`: one steady-state evaluation, summarised as a run of one step.
 int run_estimate(const std::filesystem::path& file, const ReportOptions& options) {
   const auto g = load_graph(file);
@@ -167,6 +179,7 @@ int run_estimate(const std::filesystem::path& file, const ReportOptions& options
                 ": warning: no steady state (a loop of gain >= 1); "
                 "the numbers below are the last settle pass");
   }
+  if (options.format == "table") std::println("{}", estimate_header);
   report::Summary summary{*g, simsys::SimTime{0}};
   summary.observe(record);
   return print_report(summary, options);
@@ -213,13 +226,18 @@ std::expected<simsys::SimTime, std::string> run_duration(const std::filesystem::
 struct RunArgs {
   std::optional<std::string> duration{};  // overrides the scenario's
   std::optional<std::string> series{};    // CSV output path
+  std::optional<int> seed{};              // overrides the scenario's (see load_graph)
 };
 
 // `simsys run <file>`: steps through the scenario, feeding every record to the summary
 // and, when asked, to the CSV series (the contract a GUI plots from).
+// `--seed` reaches the engine through the scenario (load_graph); a process-level test of
+// that would need to spawn simsys, so it is checked by hand (two seeds, two outputs) and
+// the engine half is pinned in tests/theory ("two runs with the same seed are identical
+// and a different seed is not").
 int run_scenario(const std::filesystem::path& file, const RunArgs& args,
                  const ReportOptions& options) {
-  const auto g = load_graph(file);
+  const auto g = load_graph(file, args.seed);
   if (!g) {
     print_error(g.error());
     return 1;
@@ -422,7 +440,6 @@ int main(int argc, char** argv) {
   std::filesystem::path scenario_file;
   ReportOptions report_options;
   RunArgs run_args;
-  int seed{};
 
   auto* validate = app.add_subcommand("validate", "check a scenario's types, references and units");
   auto* explain = app.add_subcommand(
@@ -451,7 +468,7 @@ int main(int argc, char** argv) {
   add_report_options(*run, report_options);
   run->add_option("--duration", run_args.duration,
                   "simulated time, e.g. 30s (default: scenario's)");
-  run->add_option("--seed", seed, "random seed (reserved for phase 2 workload noise; unused)");
+  run->add_option("--seed", run_args.seed, "seed of the clients' rate noise (default: scenario's)");
   run->add_option("--series", run_args.series, "write one CSV row per node per step to this file");
 
   try {

@@ -5,7 +5,7 @@
 | Construct | Where (file: function) |
 |---|---|
 | `ranges::lower_bound` + member projection | `src/flow/flow.cppm`: `Flow::position_of` |
-| `ranges::find` + member projection | `src/config/config.cpp`: `find_advanced_number`, `find_named`, `name_of`; `src/report/report.cpp`: `mean_utilization`; `src/engine/behaviours.cppm`: `ClientBehaviour` constructor |
+| `ranges::find` + member projection | `src/config/config.cpp`: `find_advanced_number`, `name_of`; `src/report/report.cpp`: `mean_utilization`; `src/engine/behaviours.cppm`: `ClientBehaviour` constructor |
 | `ranges::find` + lambda projection | `src/engine/graph.cppm`: `Graph::index_of` |
 | `ranges::sort` (+ projection) | `graph.cppm`: `detail::find_async_hops`; `behaviours.cppm`: `detail::sort_by_destination`; `engine.cppm`: `offered_rates`; `config.cpp`: `read_op_shares` |
 | `ranges::unique`, `ranges::binary_search` | `graph.cppm`: `find_async_hops`, `Graph::is_async_hop`; `behaviours.cppm`: `ClientBehaviour::response` |

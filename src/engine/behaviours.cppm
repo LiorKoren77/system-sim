@@ -126,10 +126,12 @@ concept RequestSource = requires(const S s, S& source, SimTime now, SimTime dt) 
 // how much of the node's capacity each op uses (`cost`, in capacity units: a `write` of
 // cost 3 is three `read`s of cost 1, the way an expensive endpoint is weighed when sizing
 // a tier in ch. 2). Ignored: per-op service TIME (a costly op uses more capacity, but its
-// own sojourn is the node's one service time: the queue is not a multi-class one),
-// retries and timeouts, and conditional steps (`on: miss` / `on: failure`):
-// a service has no cache to miss and phase 1 models no failures, so those steps never
-// fire here. A service has no `then` steps either (the loader rejects them for this
+// own sojourn is the node's one service time: the queue is not a multi-class one), the
+// burstiness a cost adds (a cost-c request arrives as a batch of c units at once, so
+// Kingman's `burstiness`, the SCV of arrivals taken unit by unit, understates its arrival
+// variability and the queueing wait with it), retries and timeouts, and conditional steps (`on:
+// miss` / `on: failure`): a service has no cache to miss and phase 1 models no failures, so those
+// steps never fire here. A service has no `then` steps either (the loader rejects them for this
 // type): everything it sends is per op. Hops that close a call cycle are asynchronous
 // hand-offs (see `response`).
 class ServiceBehaviour {
@@ -211,11 +213,16 @@ class ServiceBehaviour {
 
 // The seed of client `index`'s noise process (spec phase 2a refinement 3): one
 // std::mt19937_64 per client, so adding a client never changes another client's noise.
-// The scenario seed is multiplied by 0x9E3779B97F4A7C15, 2^64 divided by the golden ratio,
-// the increment of the splitmix64 generator: the multiplication (mod 2^64) spreads
-// consecutive seeds across all 64 bits, so seeds 1 and 2 start unrelated streams instead
-// of engines whose states differ in one low bit. XOR with the node index then separates
-// the clients of one scenario. The engine (Simulation::make_node) and `simsys curve
+// Formula: (seed × 0x9E3779B97F4A7C15) XOR index, all mod 2^64. The constant is 2^64
+// divided by the golden ratio (splitmix64's increment); what matters is that it is odd and
+// large. The multiply is there to keep (seed, index) pairs apart, not to decorrelate
+// neighbouring seeds (std::mt19937_64's own seeding already does that): a plain
+// seed XOR index collides, 1^0 == 0^1, while seed × K moves each seed's block of indices
+// far into the high bits, so for the seeds and client counts a scenario uses no two pairs
+// share an engine seed (tests/unit/test_behaviours.cpp checks seeds -100..100 × 64
+// clients). A negative seed converts to std::uint64_t modulo 2^64 (well defined since
+// C++20's two's-complement rule), so it is as deterministic as a positive one. The engine
+// (Simulation::make_node) and `simsys curve
 // --noise` both call this, so the curve command prints exactly the noise a run will use.
 inline constexpr std::uint64_t golden_ratio_increment = 0x9E3779B97F4A7C15;
 
@@ -245,9 +252,10 @@ class ClientBehaviour {
   // engine hands every source the step's time (see RequestSource).
   void tick(SimTime now, SimTime dt);
 
-  // Back to the state before the first tick: multiplier 1 and the noise process restarted
-  // from its seed. Simulation::estimate calls it on its scratch copy, so the long-run
-  // estimate is the same before and after a run.
+  // Multiplier back to 1, and the noise process re-created from its seed as a fresh client
+  // holds it. Simulation::estimate calls it on its scratch copy, where only the multiplier
+  // matters: settle mode never ticks, so the estimate sees the curve without noise however
+  // far a run has got. The running simulation's client is a separate object, untouched.
   void reset_noise();
 
   // The total rate offered at `now`: curve.rate_at(now) × the multiplier of the last tick

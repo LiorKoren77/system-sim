@@ -39,10 +39,12 @@ export namespace simsys::fluid {
 // s = 1 ms, c = 1 at 1500/s gives an Erlang wait computed at rho 0.75 (3 ms) while a
 // consistent 2000/s server (s = 0.5 ms) would wait 1.5 ms. `service_rate` must be >= 0.
 struct Capacity {
-  Rate service_rate;         // requests per second one replica can drain
-  double service_time_s{};   // seconds one request occupies a server
-  int concurrency{1};        // servers per replica: the c in M/M/c
-  double queue_limit{1000};  // requests that may wait; beyond this the fluid is dropped
+  Rate service_rate;        // requests per second one replica can drain
+  double service_time_s{};  // seconds one request occupies a server
+  int concurrency{1};       // servers per replica: the c in M/M/c
+  // Units of work that may wait per replica (requests when every cost is 1: the engine
+  // feeds the queue capacity units, see engine::NodeSample); beyond this the fluid is dropped.
+  double queue_limit{1000};
   // The yellow/red thresholds follow the common operations rule of thumb that latency
   // starts to climb steeply above ~70% utilization and a node is at risk above ~90%
   // (queueing theory: the M/M/1 wait grows like 1/(1-rho)).
