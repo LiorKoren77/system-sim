@@ -2,6 +2,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cmath>
+#include <string_view>
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
@@ -16,6 +18,7 @@ namespace {
 // whole original text so a scenario author can find the offending value.
 template <typename Result>
 void require_rejected(const Result& result, std::string_view input, std::string_view message) {
+  CAPTURE(input);  // a failing assertion below then names the offending input
   REQUIRE_FALSE(result.has_value());
   REQUIRE(result.error().message == message);
   REQUIRE(result.error().input == input);
@@ -82,11 +85,12 @@ TEST_CASE("parse_rate rejects negative, NaN and infinite values") {
 
 TEST_CASE("parse_rate requires the /s denominator and a known suffix") {
   require_rejected(simsys::parse_rate("10k"), "10k", "rate must end with '/s'");
-  require_rejected(simsys::parse_rate("5x/s"), "5x/s", "unknown rate suffix 'x'");
+  require_rejected(simsys::parse_rate("5x/s"), "5x/s", "unknown prefix 'x' (expected k, M, G)");
 }
 
 TEST_CASE("parse_rate does not accept byte units; those belong to parse_byte_rate") {
-  require_rejected(simsys::parse_rate("500MB/s"), "500MB/s", "unknown rate suffix 'MB'");
+  require_rejected(simsys::parse_rate("500MB/s"), "500MB/s",
+                   "unknown prefix 'MB' (expected k, M, G)");
 }
 
 TEST_CASE("parse_rate reports a missing number against the full original text") {
@@ -113,11 +117,43 @@ TEST_CASE("parse_byte_rate requires the B/s ending so request rates cannot be mi
 }
 
 TEST_CASE("parse_byte_rate rejects unknown prefixes and negative values") {
-  require_rejected(simsys::parse_byte_rate("5xB/s"), "5xB/s", "unknown rate suffix 'x'");
+  require_rejected(simsys::parse_byte_rate("5xB/s"), "5xB/s",
+                   "unknown prefix 'x' (expected K, M, G)");
   require_rejected(simsys::parse_byte_rate("-1MB/s"), "-1MB/s",
                    "expected a non-negative finite number");
 }
 
 TEST_CASE("ByteRate is comparable so link capacities can be ordered in reports") {
   REQUIRE(simsys::ByteRate{1.0} < simsys::ByteRate{2.0});
+}
+
+TEST_CASE("parse_duration rounds half away from zero at the nanosecond boundary") {
+  REQUIRE(simsys::parse_duration("0.5ns").value() == 1ns);
+}
+
+TEST_CASE("parse_duration accepts a value just inside the int64 nanosecond range") {
+  REQUIRE(simsys::parse_duration("1e18ns").value() == simsys::SimTime{1'000'000'000'000'000'000});
+}
+
+TEST_CASE("parse_rate and parse_byte_rate reject values that overflow to infinity after scaling") {
+  require_rejected(simsys::parse_rate("1e308G/s"), "1e308G/s", "rate out of range");
+  require_rejected(simsys::parse_byte_rate("1e308GB/s"), "1e308GB/s", "rate out of range");
+}
+
+TEST_CASE("parse_rate normalises negative zero so a zero rate never carries a sign bit") {
+  const auto rate = simsys::parse_rate("-0/s").value().per_second;
+  REQUIRE(rate == 0.0);
+  REQUIRE_FALSE(std::signbit(rate));
+}
+
+TEST_CASE("parse_rate and parse_byte_rate accept zero") {
+  REQUIRE(simsys::parse_rate("0/s").value().per_second == 0.0);
+  REQUIRE(simsys::parse_byte_rate("0B/s").value().bytes_per_second == 0.0);
+}
+
+TEST_CASE("prefix errors list the prefixes valid for that unit, so k versus K is discoverable") {
+  require_rejected(simsys::parse_byte_rate("1kB/s"), "1kB/s",
+                   "unknown prefix 'k' (expected K, M, G)");
+  require_rejected(simsys::parse_rate("10K/s"), "10K/s", "unknown prefix 'K' (expected k, M, G)");
+  require_rejected(simsys::parse_byte_rate("B/s"), "B/s", "expected a number");
 }
