@@ -3,6 +3,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
 #include <limits>
 
 // C++20 `import`: brings the module's exported names into this translation unit without
@@ -51,6 +52,9 @@ TEST_CASE("mmc_wait is infinite at or beyond saturation", "[queueing]") {
   const auto w = mmc_wait(1, 1.0, 0.001);
   REQUIRE(w.mean_s == std::numeric_limits<double>::infinity());
   REQUIRE(w.variance_s2 == std::numeric_limits<double>::infinity());
+  const auto beyond = mmc_wait(1, 1.7, 0.001);
+  REQUIRE(beyond.mean_s == std::numeric_limits<double>::infinity());
+  REQUIRE(beyond.variance_s2 == std::numeric_limits<double>::infinity());
 }
 
 TEST_CASE("variability_factor is 1 for Poisson arrivals and exponential service", "[queueing]") {
@@ -75,9 +79,53 @@ TEST_CASE("lognormal_quantile median lies below the mean (right skew)", "[queuei
 TEST_CASE("lognormal_quantile p99 matches a hand-computed value", "[queueing]") {
   // sigma^2 = ln(1.25) = 0.22314, mu = ln(0.01) - sigma^2/2 = -4.71674,
   // q99 = exp(mu + 0.47238 * 2.32635) = exp(-3.6178) = 0.02684
-  REQUIRE(lognormal_quantile(0.010, 25e-6, z_p99) == Approx(0.02684).margin(2e-5));
+  REQUIRE(lognormal_quantile(0.010, 25e-6, z_p99) == Approx(0.02684112509).margin(1e-9));
+}
+
+TEST_CASE("lognormal_quantile p95 matches a hand-computed value", "[queueing]") {
+  // Same fit as the p99 case (mean 10 ms, variance 25e-6 -> v/m^2 = 0.25):
+  //   sigma^2 = ln(1.25)                      = 0.22314355131420976
+  //   sigma   = sqrt(sigma^2)                 = 0.47238072707743883
+  //   mu      = ln(0.01) - sigma^2/2          = -4.605170185988092 - 0.11157177565710488
+  //                                           = -4.716741961645196
+  //   q95     = exp(mu + sigma * 1.6448536269514722)
+  //           = exp(-4.716741961645196 + 0.47238072707743883 * 1.6448536269514722)
+  //           = exp(-4.716741961645196 + 0.77699715223) = exp(-3.93974480941) = 0.019453178380
+  REQUIRE(lognormal_quantile(0.010, 25e-6, z_p95) == Approx(0.019453178380).margin(1e-9));
 }
 
 TEST_CASE("lognormal_quantile of a zero mean is zero", "[queueing]") {
   REQUIRE(lognormal_quantile(0.0, 0.0, z_p95) == 0.0);
+}
+
+TEST_CASE("erlang_c stays finite for a thousand servers near saturation", "[queueing]") {
+  // a = 990 Erlangs: a^c/c! is ~e^990, beyond a double; the Erlang B recurrence never leaves [0,
+  // 1].
+  REQUIRE(erlang_c(1000, 0.99) == Approx(0.6590804218808545).margin(1e-12));
+}
+
+TEST_CASE("mmc_wait variance uses Erlang C, not utilization, for several servers", "[queueing]") {
+  // c = 2, rho = 0.5: P_wait = 1/3, theta = 1 ms / (2 * 0.5) = 1 ms; Var = (1/3)(5/3) theta^2.
+  const auto w = mmc_wait(2, 0.5, 0.001);
+  REQUIRE(w.variance_s2 == Approx(5.0 / 9.0 * 1e-6).margin(1e-15));
+}
+
+TEST_CASE("z constants are the standard-normal 50th, 95th and 99th percentiles", "[queueing]") {
+  const auto phi = [](double z) { return 0.5 * std::erfc(-z / std::sqrt(2.0)); };
+  REQUIRE(phi(z_p50) == Approx(0.50).margin(1e-8));
+  REQUIRE(phi(z_p95) == Approx(0.95).margin(1e-8));
+  REQUIRE(phi(z_p99) == Approx(0.99).margin(1e-8));
+}
+
+TEST_CASE("pooling servers lowers the chance of waiting at equal utilization", "[queueing]") {
+  // The book's "add replicas behind a load balancer" lesson in one line: at rho 0.9,
+  // sixteen pooled servers make an arrival wait far less often than one.
+  REQUIRE(erlang_c(16, 0.9) < erlang_c(4, 0.9));
+  REQUIRE(erlang_c(4, 0.9) < erlang_c(1, 0.9));
+}
+
+TEST_CASE("lognormal_quantile survives means whose square underflows a double", "[queueing]") {
+  const auto q = lognormal_quantile(1.38e-162, 1.20e-166, z_p95);
+  REQUIRE(std::isfinite(q));
+  REQUIRE(q > 0.0);
 }
