@@ -2440,3 +2440,18 @@ The `checks` block is a static pass: offered load per node at base rates, propag
 - §5 concepts: `NodeBehaviour`, `RequestSource`, `ResponseLookup`, `StepObserver` → Tasks 10, 12. `HitRatioModel`/`SplitPolicy`/`AdmissionModel`/`ReplicationModel` belong to phase 2/3 node types.
 - §6 defaults with provenance and `explain` → Tasks 6, 14. §9.1 analytic layer → Tasks 1, 2, 4. §11 CLI → Task 14 (`sweep` and `--replications` are phase 2/3; `--seed` is accepted and unused until phase 2 — add it to `run` so scripts written now keep working). §12 testing: theory, conservation, scenario (<5 s, SLOs), determinism → Tasks 12, 14. ASan/UBSan CI job is deferred to phase 5 with the rest of CI hardening.
 - Type consistency: `Graph::build(model::Scenario)`, `Simulation::create(const Graph&)`, `Summary{graph, warmup}`, `RunOptions{duration, step}`, `StepRecord{t, nodes, responses}`, `ResponseSample{client, op, offered, response}`, `ClientRoute{op, target, link, share}`, `Outgoing{target, link, flow}` are used with the same names in Tasks 9–14.
+
+---
+
+## Phase 2 backlog (from the comprehensive phase 0–1 review, 2026-10-28)
+
+Deferred on purpose; pick these up in the phase 2 plan.
+
+- **Duplicated helpers**: two `Overloaded` sets (engine, report), two number formatters (config, report), two join helpers (graph, report), metric/direction name tables in both config and report, two duration-unit tables. Export the names next to their enums in `simsys.model`/`simsys.core`.
+- **Long functions** (> 25 lines): `run_scenario`, `find_async_hops`, `main`, `ClientBehaviour::response`, `order_nodes`, `route_client_op`, `resolve_links`. Split `config.cpp` (~1.8k lines) by section (header, nodes, links, slo).
+- **`estimate` output**: give it its own table (it currently prints "1 steps", a dropped count and red seconds for a steady state).
+- **Performance**: make `erlang_c` cheaper for large c (closed-form/asymptotic above a threshold); intern op names to integer ids; reuse `Routed` scratch buffers per step.
+- **CI**: ASan/UBSan job (`-fsanitize=address,undefined,float-cast-overflow`); CLI exit-code tests through a process; move `-fno-ipa-sra` off `simsys_warnings` onto its own workaround target.
+- **Tests**: replicas > 1 in conservation and series tests; `Graph::build` validation of `replicas` for scenarios built in code; a run whose warmup exceeds the duration (now an error).
+- **CLI/report**: `explain` lists the SLOs; reword the estimate warning (it assumes "gain ≥ 1"); JSON `red_s` prints 2.0000000000000004 (shortest round-trip of an accumulated sum; round to the step).
+- **Model**: `parallel_max` exact quantile for n iid branches (p^(1/n)); the zero-arrival backlog drain test once rate curves exist; `client.timeout` is parsed but unused until retries (phase 3).
