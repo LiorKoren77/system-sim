@@ -1993,19 +1993,20 @@ CheckResult read_limiter_burst(const Site& site, const YAML::Node& body, model::
 }
 
 // A leaky bucket's queue IS the bucket: one slot leaking a request every 1/limit, with room
-// for `burst` (graph::leaky_bucket_capacity). A `capacity`, `latency`, `advanced.concurrency`
-// or `advanced.queue_limit` would be a second statement of the limit or the burst that the
-// bucket would have to override, so each is refused. Read in the first pass with the keys
-// every node shares; checked here, where the algorithm is known.
+// for `burst` (graph::leaky_bucket_capacity). A `capacity`, `latency`, `advanced.concurrency`,
+// `advanced.queue_limit` or `advanced.service_variability` would be a second statement of the
+// limit, the burst or the regular leak (variability 0) that the bucket would have to override,
+// so each is refused. Read in the first pass with the keys every node shares; checked here,
+// where the algorithm is known.
 CheckResult check_leaky_bucket_keys(const Site& site, const YAML::Node& body,
                                     const model::NodeSpec& node) {
   if (node.algorithm != model::LimiterAlgorithm::leaky_bucket) return {};
-  const bool restated =
-      node.capacity || node.latency || node.advanced.queue_limit || node.advanced.concurrency;
+  const bool restated = node.capacity || node.latency || node.advanced.queue_limit ||
+                        node.advanced.concurrency || node.advanced.service_variability;
   if (!restated) return {};
   return site.fail(body,
-                   "leaky_bucket takes limit and burst; capacity, latency, concurrency and "
-                   "queue_limit are not valid");
+                   "leaky_bucket takes limit and burst; capacity, latency, concurrency, "
+                   "queue_limit and service_variability are not valid");
 }
 
 // `backend: counters`: the counter store every checked request consults (ch. 4 keeps the
@@ -2062,7 +2063,9 @@ CheckResult read_hit_ratio(const Site& site, const YAML::Node& body, model::Node
 }
 
 // `strategy: read_through`; absent keeps cache_aside (model::NodeSpec's default). Every
-// strategy but cache_aside has the cache call the store itself, so it needs a `backend`.
+// strategy but cache_aside has the cache call the store itself, so it needs a `backend`;
+// under cache_aside the application reads the store (a service's `on: miss` step), so a
+// `backend` would never be called and is refused rather than silently ignored.
 CheckResult read_cache_strategy(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   if (auto read = read_optional_word(site, body, "strategy", model::parse_cache_strategy,
                                      "strategy must be cache_aside, read_through, write_through, "
@@ -2072,9 +2075,13 @@ CheckResult read_cache_strategy(const Site& site, const YAML::Node& body, model:
     return read;
   }
   if (body["backend"]) node.backend = scalar_text(body["backend"]);
+  const auto strategy = model::to_string(node.strategy);
+  if (!model::needs_backend(node.strategy) && node.backend) {
+    return site.fail(body["backend"], std::format("backend is unused with strategy {}", strategy));
+  }
   if (!model::needs_backend(node.strategy) || node.backend) return {};
   const auto at = body["strategy"] ? body["strategy"] : body;
-  return site.fail(at, std::format("strategy {} needs a backend", model::to_string(node.strategy)));
+  return site.fail(at, std::format("strategy {} needs a backend", strategy));
 }
 
 // `write_ops: [write, delete]`: the ops that change data; every other op is a read. Absent
@@ -2164,6 +2171,14 @@ CheckResult read_cache_keys(const Site& site, const YAML::Node& body, model::Nod
       .and_then([&] { return read_cache_ttl(this_node, body, node); });
 }
 
+// A CDN (ch. 1: a cache at the network's edge) may state its hit ratio in the cache's own
+// grammar, `{fixed: h}` or `che`; a service's `on: miss` step after it uses the number
+// (graph::Graph::hit_ratio). Optional: a CDN without one counts as missing every time.
+CheckResult read_cdn_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (node.type != model::NodeType::cdn || !body["hit_ratio"]) return {};
+  return read_hit_ratio(node_site(site, node.id), body, node);
+}
+
 // ---- Node bodies: the second pass -----------------------------------------------------
 
 // A client offers traffic (its `ops` are shares of its rate); every other node forwards
@@ -2208,6 +2223,7 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
     }
     if (auto read = read_limiter_keys(site, entry.second, *node, declared); !read) return read;
     if (auto read = read_cache_keys(site, entry.second, *node); !read) return read;
+    if (auto read = read_cdn_keys(site, entry.second, *node); !read) return read;
     ++node;
   }
   return {};

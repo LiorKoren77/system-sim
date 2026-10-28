@@ -38,6 +38,7 @@ nodes:
     ttl: 1h
     keys: 10M
     hit_ratio: {fixed: 0.95}
+    strategy: read_through                    # the resolver itself asks upstream on a miss
     backend: dns_upstream
   dns_upstream: {type: external_sink, latency: 20ms, failure_rate: 0.01}
 

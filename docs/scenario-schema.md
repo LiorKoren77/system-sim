@@ -141,7 +141,7 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 | `advanced` | map | all but `client` | read | see next table |
 | `ops` | map | `client`, `service`, `ws_gateway` | read (client, service); checked (ws_gateway) | client: op → share; otherwise op → step list (below) |
 | `cost` | map op → number | `service`, `cache` | read | **new in v1.2**: the capacity units one request of that op consumes; an op not listed costs 1. Each value is a positive finite number (`cost 'write' must be a positive finite number`, also for a quoted `"3"`) of at most 1e6 (`cost 'write' must be at most 1e6`); anything but a map is `cost must be a map of op to units`, a bare `cost:` is `cost must not be empty (write {} for none)`. `capacity` is then a rate of units: demand is `Σ rate_op × cost_op`, and the node's demand, drops and backlog are reported in units. What it forwards stays requests (a drained `write` of cost 3 is one `write` downstream). A load balancer and a rate limiter charge 1 per request, and `cost` is not a key of theirs. A `worker_pool`'s `cost` is a different key (a duration per job, phase 2c) |
-| `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | checked | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step and drawn by `explain`; `run`/`estimate` refuse a cache's `then` until phase 2b |
+| `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | checked | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step; `explain`'s paper load follows a cache's `then` steps (an unconditional one carries everything the cache answered, an `on: miss` one `1 − h` of the reads and none of the writes); `run`/`estimate` refuse a cache's `then` until phase 2b |
 
 A key outside its row is an error, e.g. `key 'capacity' is not valid for type 'client'`
 (a client is a traffic source with no service rate, service time or waiting room) or
@@ -153,7 +153,7 @@ A key outside its row is an error, e.g. `key 'capacity' is not valid for type 'c
 |---|---|---|---|
 | `queue_limit` | integer > 0 | 1000 (chosen) | units of work that may wait per replica (requests when every cost is 1; a request of `cost` 3 takes three); beyond it the excess is dropped. An error on a `leaky_bucket` limiter, whose `burst` is its waiting room |
 | `concurrency` | integer in [1, 100000] | implied: `max(1, ceil(capacity × latency))`, capped at 100000 | servers per replica, the c of M/M/c. The cap exists because the Erlang C term costs O(c) per node per step. The default is Little's law at full load (busy servers = throughput × time in service), which keeps the rate and the Erlang C term describing one machine. An error on a `leaky_bucket` limiter (one leak slot) |
-| `service_variability` | number ≥ 0 | 1.0 (2.0 for `external_sink`) | squared coefficient of variation (SCV) of service time; 1 = exponential. On a `leaky_bucket` limiter it is accepted and replaced by 0 (the leak is deterministic) |
+| `service_variability` | number ≥ 0 | 1.0 (2.0 for `external_sink`) | squared coefficient of variation (SCV) of service time; 1 = exponential. An error on a `leaky_bucket` limiter (the leak is deterministic: SCV 0) |
 | `burstiness` | number ≥ 0 | 1.0 | SCV of inter-arrival times; 1 = Poisson. With `service_variability` it forms the Allen–Cunneen factor `(burstiness + service_variability) / 2` that scales the queueing wait (Kingman's correction) |
 | `yellow` | number in (0, 1] | 0.70 | utilization where the node turns yellow |
 | `red` | number in (0, 1] | 0.90 | ... and red. `yellow` must be below `red`; a lone one is compared with the other's default |
@@ -169,7 +169,7 @@ A **step** is `{to: <node id>, op: <op name>, on: always|miss|failure, mode: seq
 |---|---|---|---|
 | `to` | required | read | a declared node, **not the node itself** (a retry, the one reason to call yourself, is `client.retries`); *(graph)* not a client (clients only send) |
 | `op` | the incoming op | read | required in `then` steps, which have no incoming op to inherit |
-| `on` | `always` | read | `miss` applies to the flow a cache/CDN did not serve, `failure` to failed requests. In an op's step list, an `on: miss` step belongs to the nearest unconditional step before it, which must target a `cache` or `cdn` (*(graph)* `node 'web': an 'on: miss' step must follow a cache or cdn step`); it carries the miss fraction `1 − h` of the requests (`h` the cache's fixed hit ratio; a `che` cache or a CDN counts as `h = 0` in `explain` until phase 2b), and costs the response `1 − h` × its hop on average, with the hit/miss spread in the variance. Several `on: miss` steps in a row all belong to the same lookup. A cache step with `factor: k` before a miss step still fires that step for `1 − h` of the requests (a request's lookups are assumed to hit or miss together). `failure` steps never fire before phase 2c |
+| `on` | `always` | read | `miss` applies to the flow a cache/CDN did not serve, `failure` to failed requests. In an op's step list, an `on: miss` step belongs to the nearest unconditional step before it, its lookup, which must ask a `cache` or `cdn` for a read, leave the miss to the application, and be waited for. *(graph)* `node 'web': an 'on: miss' step must follow a cache or cdn step`; `... cannot follow a write to cache 'c' (writes do not miss)`; `... cannot follow read_through cache 'c' (the cache already fetched the miss)`; `... and the cache step it follows must be sequential (the miss step waits for the cache's answer)`. A miss step is taken by the miss fraction `1 − h` of the requests (`h` the cache's or CDN's fixed hit ratio; a `che` one, or a CDN without a ratio, counts as `h = 0` until phase 2b, and `explain` marks the checks that rest on it). After a lookup of `factor: k` it sends `k(1 − h)` requests per request: every missed lookup is fetched. Several `on: miss` steps after one lookup form one block that a miss takes whole, one step after another: the response adds `1 − h` × the sum of their hops on average, with the hit/miss spread in the variance, and a miss is answered only if every fetch is. (For latency, a request's `k` lookups are assumed to hit or miss together.) `failure` steps never fire before phase 2c |
 | `mode` | `sequential` | read | sequential steps add their latencies; **all parallel steps of an op form one group wherever they sit** among the sequential ones, and the group costs its slowest branch |
 | `factor` | 1 | read | finite, positive, at most `1e6`; multiplies the flow (fan-out: one post → 100 feed writes) |
 
@@ -182,7 +182,7 @@ target and, if that link lists `ops`, lists the step's op.
 | type | own keys | status |
 |---|---|---|
 | `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `timeout` checked (a duration), not yet used; `keys`, `sizes`, `retries` ignored |
-| `cdn` | `ttl`, `hit_ratio` (`fixed: h` or `model` †), `origin` (node id) | `origin` checked (a declared node); others ignored. Runs from phase 2b |
+| `cdn` | `ttl`, `hit_ratio` (`{fixed: h}` or `che`, optional), `origin` (node id) | `origin` checked (a declared node); `hit_ratio` read as a cache's and used by a service's `on: miss` step after the CDN; others ignored. Runs from phase 2b |
 | `load_balancer` | `policy`, `vnodes` | read and run, see [`load_balancer`](#load_balancer) |
 | `rate_limiter` | `algorithm`, `limit`, `burst`, `window`, `backend` | read and run, see [`rate_limiter`](#rate_limiter) |
 | `service` | `ops`, `cost` | read and run |
@@ -261,10 +261,10 @@ drops ([below](#drops-and-rejections)).
 | `burst` | a positive integer, **buckets only**; default `limit × window` rounded up (one window's worth) | `burst must be a positive integer`, `burst applies only to token_bucket and leaky_bucket`, `limit x window is too large for a burst; give burst explicitly` |
 | `backend` | a declared node of type `cache`: the counter store | `backend refers to unknown node 'x'`, `backend must be a cache` |
 
-A `leaky_bucket` refuses `capacity`, `latency`, `advanced.queue_limit` and
-`advanced.concurrency`: `leaky_bucket takes limit and burst; capacity, latency, concurrency
-and queue_limit are not valid`. Its `advanced.service_variability` is accepted and replaced
-by 0.
+A `leaky_bucket` refuses `capacity`, `latency`, `advanced.queue_limit`,
+`advanced.concurrency` and `advanced.service_variability` (the leak is deterministic):
+`leaky_bucket takes limit and burst; capacity, latency, concurrency, queue_limit and
+service_variability are not valid`.
 
 Each algorithm keeps the state ch. 4 describes, stepped once per step `[t, t + dt)`, with
 W = `limit × window` and `in` the inflow in requests per second:
@@ -302,13 +302,18 @@ own (default 100k/s, 250 µs) that answers every request it receives, hit or mis
 |---|---|---|
 | `hit_ratio` | required: `{fixed: h}` with `0 ≤ h ≤ 1`, or `che` (computed in phase 2b; `run`/`estimate` refuse it until then) | `cache needs a hit_ratio`, `hit_ratio must be che or {fixed: h}`, `hit_ratio.fixed must be between 0 and 1` (also for a quoted `"0.5"`) |
 | `strategy` | `cache_aside` (default), `read_through`, `write_through`, `write_around`, `write_back` | `strategy must be cache_aside, read_through, write_through, write_around or write_back` |
-| `backend` | a declared node; required by every strategy but `cache_aside` (allowed and unused there) | `strategy read_through needs a backend`, `backend refers to unknown node 'x'`; *(graph)* `backend 'db' needs a link from the cache`, and the link must carry every op the cache passes on (`link c -> db does not carry op 'read' (ops: write)`) |
+| `backend` | a declared node; required by every strategy but `cache_aside`, and refused there (the application reads the store; the backend would never be called) | `strategy read_through needs a backend`, `backend is unused with strategy cache_aside`, `backend refers to unknown node 'x'`; *(graph)* `backend 'db' needs a link from the cache`, and the link must carry every op the cache passes on (`link c -> db does not carry op 'read' (ops: write)`); a store that calls back into the cache (`db.read -> c.read -> db.read`) is refused, since a fetch is always waited for: `node 'c': backend 'db' closes a call cycle` |
 | `write_ops` | a non-empty list of op names; default `[write]`. Every other op is a read | `write_ops must be a list of op names`, `write_ops must name at least one op` |
 | `keys` | a [count](#values) (`20M`), for the Che approximation | `keys must be a positive integer` |
 | `eviction` | `lru`, `lfu`, `fifo`, `ttl` | `eviction must be lru, lfu, fifo or ttl` |
 | `ttl` | a positive duration | `ttl must be positive` |
 
-`keys`, `eviction` and `ttl` are read and printed by `explain`; phase 2b uses them.
+`keys`, `eviction` and `ttl` are read and printed by `explain`; phase 2b uses them. `explain`
+prints `write_ops=write (never arrives)` when no op that reaches the cache is a write op: the
+write strategy then never acts (a note, not an error). Names: ch. 1 draws one pattern, the
+application reading the cache and fetching a miss itself, and calls it "read-through"; its
+industry name is cache-aside, which is ours. Our `read_through` is the cache-driven fetch; the
+write strategies are general caching practice, not the book's.
 What each strategy passes to its `backend`, as the same op:
 
 | strategy | reads | writes |

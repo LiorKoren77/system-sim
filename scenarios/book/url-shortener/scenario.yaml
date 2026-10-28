@@ -25,7 +25,8 @@ nodes:
     burst: 2000
     backend: rules_cache
 
-  rules_cache: {type: cache, eviction: lru, keys: 10k, hit_ratio: che, strategy: cache_aside}
+  # The limiter's rules and counters: 10k keys fit in memory whole, so every lookup hits.
+  rules_cache: {type: cache, eviction: lru, keys: 10k, hit_ratio: {fixed: 1.0}, strategy: cache_aside}
 
   lb: {type: load_balancer, policy: round_robin}
 

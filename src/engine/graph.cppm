@@ -31,10 +31,11 @@
 // forwards like a balancer (per link, by weight) whatever it admits, and its `backend` (the
 // counter store) becomes a demand edge of its own, carrying op `counter` (plan 2a
 // refinement 6, see connect_backends). A cache (plan 2a refinement 7) contributes two
-// things: its fixed hit ratio h (Graph::hit_ratio), which turns a service's `on: miss` step
-// after it into a hop taken by the miss fraction 1 - h of the requests (Graph::service_hops),
-// and, for the strategies in which the cache itself talks to the store, a demand edge to its
-// `backend` (Graph::backend_fraction says which share of each op takes it).
+// things: its fixed hit ratio h (Graph::hit_ratio; a CDN's too), which turns a service's
+// `on: miss` step after it into a hop taken by the miss fraction 1 - h of the requests
+// (Graph::service_hops), and, for the strategies in which the cache itself talks to the store,
+// a demand edge to its `backend` (Graph::backend_fraction says which share of each op takes
+// it).
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -155,26 +156,35 @@ inline constexpr auto replica_model_table = std::to_array<core::EnumName<Replica
 }
 
 // One step of a node's op, resolved (Graph::service_hops): the node it calls, the op it
-// sends, the fan-out `factor` (downstream requests per request that takes the hop), how it
-// combines with the other hops (`mode`), and `fraction`, the share of the node's requests
-// that take the hop at all, a probability:
+// sends, how it combines with the other hops (`mode`), and two numbers whose product is the
+// hop's flow per request (flow = rate × factor × fraction):
+//   `fraction`, the share of the node's requests that take the hop at all, a probability:
 //   - 1 for an unconditional step;
 //   - 1 - h for an `on: miss` step, h the hit ratio of the cache (or CDN) the nearest
-//     preceding unconditional step asked (ch. 1 cache-aside: only the misses go on to the
-//     database). A cache with no number yet (`che`, phase 2b; a CDN, phase 2b) counts as
+//     preceding unconditional step, its `lookup`, asked (ch. 1's cache, which the book calls
+//     read-through and the industry cache-aside: only the misses go on to the database). A
+//     cache with no number yet (`che`, phase 2b; a CDN without a fixed ratio) counts as
 //     missing every time, the safe side for a capacity check on paper;
-//   - 0 for an `on: failure` step until external sinks fail (phase 2c).
+//   - 0 for an `on: failure` step until external sinks fail (phase 2c);
+//   `factor`, the requests the hop sends per request that takes it: the step's own fan-out
+//   (one post -> 100 feed writes), times the lookup's for an `on: miss` step. A request
+//   that looks up k keys misses k(1 - h) of them on average (linearity of expectation, true
+//   however its hits are correlated) and fetches each, so the miss step's flow is
+//   rate × k × (1 - h).
 // A hop of fraction f costs its caller f × the hop on average: with probability f the
-// request takes it, otherwise not (behaviours::conditional_hop).
-// Assumed: a request's lookups hit or miss together. A cache step of factor k (k lookups per
-// request) followed by a miss step fires that step for 1 - h of the REQUESTS, not k(1 - h)
-// times per request.
+// request takes it, otherwise not (behaviours::conditional_hop). The miss steps after one
+// lookup (same `lookup`) are taken together: a miss pays every one of them in turn
+// (behaviours::ServiceBehaviour's blocks). Assumed for latency: a request's k lookups hit or
+// miss together, so a request waits for its fetches with probability 1 - h, not 1 - h^k.
 struct ServiceHop {
   std::size_t target{};
   std::string op{};
   double fraction{1.0};
   model::StepMode mode{model::StepMode::sequential};
   double factor{1.0};
+  // For an `on: miss` step, the position in the op's hops of the lookup it follows; empty for
+  // every other step.
+  std::optional<std::size_t> lookup{};
 };
 
 // A scenario link with node indices instead of ids, and its resolved timing.
@@ -268,8 +278,8 @@ class Graph {
   [[nodiscard]] std::span<const std::string> arriving_ops(std::size_t node) const {
     return arriving_ops_.at(node);
   }
-  // A cache's fixed hit ratio; nothing for any other node, and for a cache whose ratio is
-  // `che` (computed in phase 2b) or that a scenario built in code left without one.
+  // A cache's or a CDN's fixed hit ratio; nothing for any other node, and for one whose ratio
+  // is `che` (computed in phase 2b) or that the scenario left without one.
   [[nodiscard]] std::optional<double> hit_ratio(std::size_t node) const;
   // The hops `node` makes for incoming `op`, one per step in declaration order, each with
   // the share of requests that take it (ServiceHop). Empty for an op the node does not list
@@ -287,6 +297,12 @@ class Graph {
   // 0 for any node that is not a cache with a backend edge. An unknown hit ratio counts as
   // h = 0 (every read misses), as in service_hops.
   [[nodiscard]] double backend_fraction(std::size_t node, std::string_view op) const;
+  // The share of the requests of `op` that node `node` has handled which go on to its `then`
+  // step `step`: 1 for an unconditional step; for an `on: miss` step after a cache or CDN,
+  // 1 - h of a read (an unknown h counts as 0, as in service_hops) and 0 of a write (writes do
+  // not miss); 0 for an `on: failure` step (phase 2c) and for a miss step anywhere else.
+  [[nodiscard]] double then_fraction(std::size_t node, const model::Step& step,
+                                     std::string_view op) const;
   // Does node `from`, handling `op`, hand `target_op` off to node `to` without waiting?
   // True exactly for the hops that close a call cycle (see detail::find_async_hops).
   [[nodiscard]] bool is_async_hop(std::size_t from, std::string_view op, std::size_t to,
@@ -304,16 +320,23 @@ class Graph {
   Result connect_steps();
   Result connect_step(std::size_t from, const model::Step& step);
   Result resolve_service_hops(std::size_t node);
+  [[nodiscard]] std::optional<EngineError> invalid_miss_step(std::size_t node,
+                                                             const model::Step& step,
+                                                             const ServiceHop* lookup) const;
+  [[nodiscard]] double hop_fraction(const model::Step& step,
+                                    std::optional<std::size_t> looked_up) const;
   [[nodiscard]] double miss_fraction(std::size_t cache) const;
   Result connect_backends();
   Result connect_backend(std::size_t limiter);
   Result connect_cache_backend(std::size_t cache);
   Result check_cache_backend_ops(std::size_t cache);
+  Result check_cache_backend_calls() const;
   Result route_splitters();
   Result route_clients();
   Result route_client_op(std::size_t client, const std::string& op);
   Result route_forwarder(std::size_t node);
   void collect_arriving_ops();
+  [[nodiscard]] bool carries_flow(std::size_t node, const model::Step& step) const;
   Result check_forwarded_ops(std::size_t node);
   Result mark_balanced_targets();
   void order_nodes();
@@ -425,7 +448,7 @@ namespace {
 // Graph::build also takes rate limiters written in code, which the loader never checked:
 // the same rules as config's read_limiter_* and check_leaky_bucket_keys (a limit, positive;
 // burst and window positive; a burst only on a bucket; a leaky bucket states nothing but
-// limit and burst).
+// limit and burst, not a queue's own numbers).
 [[nodiscard]] std::optional<EngineError> invalid_limiter(const model::NodeSpec& spec) {
   const std::string name = "node '" + spec.id + "': ";
   if (!spec.limit) return EngineError{name + "rate_limiter needs a limit"};
@@ -439,19 +462,20 @@ namespace {
   if (spec.burst && model::is_windowed(algorithm)) {
     return EngineError{name + "burst applies only to token_bucket and leaky_bucket"};
   }
-  const bool restates_queue =
-      spec.capacity || spec.latency || spec.advanced.queue_limit || spec.advanced.concurrency;
+  const bool restates_queue = spec.capacity || spec.latency || spec.advanced.queue_limit ||
+                              spec.advanced.concurrency || spec.advanced.service_variability;
   if (algorithm == model::LimiterAlgorithm::leaky_bucket && restates_queue) {
     return EngineError{name +
-                       "leaky_bucket takes limit and burst; capacity, latency, concurrency and "
-                       "queue_limit are not valid"};
+                       "leaky_bucket takes limit and burst; capacity, latency, concurrency, "
+                       "queue_limit and service_variability are not valid"};
   }
   return std::nullopt;
 }
 
 // Graph::build also takes caches written in code, which the loader never checked: a fixed
-// hit ratio is a probability, and a strategy in which the cache calls the store needs to
-// know which node that is (config's read_hit_ratio and read_cache_strategy). A cache with no
+// hit ratio is a probability, a strategy in which the cache calls the store needs to know
+// which node that is, and one in which it does not (cache_aside) must not name one: it would
+// never be called (config's read_hit_ratio and read_cache_strategy). A cache with no
 // hit ratio at all builds (explain can show it); the engine refuses to run it.
 [[nodiscard]] std::optional<EngineError> invalid_cache(const model::NodeSpec& spec) {
   const std::string name = "node '" + spec.id + "': ";
@@ -463,6 +487,10 @@ namespace {
   if (model::needs_backend(spec.strategy) && !spec.backend) {
     return EngineError{name + "strategy " + std::string{model::to_string(spec.strategy)} +
                        " needs a backend"};
+  }
+  if (!model::needs_backend(spec.strategy) && spec.backend) {
+    return EngineError{name + "backend is unused with strategy " +
+                       std::string{model::to_string(spec.strategy)}};
   }
   return std::nullopt;
 }
@@ -494,9 +522,9 @@ namespace {
 // bucket's policy, not as a drop). `limit` and `burst` are the limiter's TOTALS, so with N
 // replicas each copy is one slot of limit/N with room burst/N (the engine models one copy,
 // see engine::Simulation::make_server). The loader and invalid_limiter refuse a `capacity`,
-// `latency`, concurrency or queue limit on a leaky bucket: they would restate the bucket.
-// `advanced.service_variability` is overridden to 0 (the leak is regular by definition); the
-// variability of ARRIVALS (`advanced.burstiness`) is still the scenario's to set.
+// `latency`, concurrency, queue limit or service variability on a leaky bucket: they would
+// restate the bucket (the leak is regular by definition: variability 0). The variability of
+// ARRIVALS (`advanced.burstiness`) is still the scenario's to set.
 [[nodiscard]] fluid::Capacity leaky_bucket_capacity(const model::NodeSpec& spec,
                                                     fluid::Capacity capacity) {
   const double replicas = spec.replicas;
@@ -542,6 +570,9 @@ struct Call {
 using ForwardedSteps = std::map<Call, std::vector<model::Step>>;
 
 void add_hop_steps(const Graph& g, std::size_t node, ForwardedSteps& calls) {
+  // C++20 range adaptors: `map | std::views::keys` is a lazy view of each entry's key (here
+  // the op name), composed with `|`. Replaces iterating the pairs and writing `.first`, and
+  // copies nothing.
   for (const auto& op : g.nodes()[node].spec.ops | std::views::keys) {
     auto& steps = calls[Call{node, op}];
     for (const ServiceHop& hop : g.service_hops(node, op)) {
@@ -602,9 +633,6 @@ void add_backend_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls)
     for (const auto& route : g.client_routes(node)) roots.push_back({route.target, route.op});
   }
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
-    // C++20 range adaptors: `map | std::views::keys` is a lazy view of each entry's key
-    // (here the op name), composed with `|`. Replaces iterating the pairs and writing
-    // `.first`, and copies nothing.
     for (const auto& op : g.nodes()[node].spec.ops | std::views::keys) roots.push_back({node, op});
   }
   return roots;
@@ -686,6 +714,9 @@ std::expected<Graph, EngineError> Graph::build(model::Scenario scenario) {
   if (!built) return std::unexpected{built.error()};
   graph.order_nodes();
   graph.async_hops_ = detail::find_async_hops(graph);
+  if (auto checked = graph.check_cache_backend_calls(); !checked) {
+    return std::unexpected{checked.error()};
+  }
   return graph;
 }
 
@@ -792,8 +823,8 @@ Graph::Result Graph::resolve_links() {
 Graph::Result Graph::connect_steps() {
   for (std::size_t from = 0; from < nodes_.size(); ++from) {
     const auto& spec = nodes_[from].spec;
-    // `views::values` (like `views::keys` in call_roots, but each entry's vector of steps),
-    // then C++20 `views::join`, which flattens those vectors into one lazy sequence of
+    // `views::values` (like `views::keys` in detail::add_hop_steps, but each entry's vector of
+    // steps), then C++20 `views::join`, which flattens those vectors into one lazy sequence of
     // steps. Replaces two nested loops over the map and each vector; nothing is copied.
     for (const model::Step& step : spec.ops | std::views::values | std::views::join) {
       if (auto connected = connect_step(from, step); !connected) return connected;
@@ -806,40 +837,90 @@ Graph::Result Graph::connect_steps() {
   return {};
 }
 
-// The miss fraction 1 - h of a cache (ServiceHop's comment): 1 when there is no number for
-// h yet (`che`, a CDN, a cache built in code without one), the safe side on paper.
+// The miss fraction 1 - h of a cache or CDN (ServiceHop's comment): 1 when there is no number
+// for h yet (`che`, a CDN without a fixed ratio, a cache built in code without one), the safe
+// side on paper.
 double Graph::miss_fraction(std::size_t cache) const {
   return 1.0 - hit_ratio(cache).value_or(0.0);
 }
 
-// Each op's steps in order, with the share of requests that take each (ServiceHop). An `on:
-// miss` step belongs to the nearest unconditional step before it, which must ask a cache
-// or a CDN (something that can miss): [cache.get, db.read on miss, cache.set on miss] is
-// one lookup and what follows its miss. connect_step has already resolved every target.
+// The share of requests that take `step` (ServiceHop's `fraction`): every request for an
+// unconditional step, none for an `on: failure` step (nothing fails before phase 2c's external
+// sinks), the miss fraction of `looked_up`, the cache the step's lookup asked, for an `on:
+// miss` step (invalid_miss_step has made sure there is one).
+double Graph::hop_fraction(const model::Step& step, std::optional<std::size_t> looked_up) const {
+  // `using enum` (see replica_model_of): the conditions by their short names.
+  using enum model::StepCondition;
+  switch (step.on) {
+    case always:
+      return 1.0;
+    case failure:
+      return 0.0;
+    case miss:
+      return miss_fraction(*looked_up);
+  }
+  // C++23 std::unreachable(): tells the compiler control never gets here (every enumerator
+  // returned above), replacing a dummy `return 0.0;` that would hide a missing case or
+  // compiler-specific __builtin_unreachable(); reaching it is undefined behaviour.
+  std::unreachable();
+}
+
+// Why an `on: miss` step cannot follow `lookup` (the nearest unconditional step before it, or
+// nothing), if it cannot. A miss step needs something that can miss (a cache or a CDN), asked
+// a read (a write updates or invalidates an entry: it has no miss to report), which leaves the
+// miss to the application (a read_through cache has already fetched it from its backend, so a
+// miss step would fetch it twice), and it must wait for the answer: neither it nor the lookup
+// can be a parallel branch, or the response would time the fetch alongside the lookup instead
+// of after it.
+std::optional<EngineError> Graph::invalid_miss_step(std::size_t node, const model::Step& step,
+                                                    const ServiceHop* lookup) const {
+  const std::string name = "node '" + nodes_[node].spec.id + "': an 'on: miss' step ";
+  if (!lookup || !hits_or_misses(nodes_[lookup->target].spec.type)) {
+    return EngineError{name + "must follow a cache or cdn step"};
+  }
+  const auto& cache = nodes_[lookup->target].spec;
+  if (is_write(cache, lookup->op)) {
+    return EngineError{name + "cannot follow a write to " +
+                       std::string{model::to_string(cache.type)} + " '" + cache.id +
+                       "' (writes do not miss)"};
+  }
+  if (is_cache(cache) && cache.strategy == model::CacheStrategy::read_through) {
+    return EngineError{name + "cannot follow read_through cache '" + cache.id +
+                       "' (the cache already fetched the miss)"};
+  }
+  if (step.mode == model::StepMode::parallel || lookup->mode == model::StepMode::parallel) {
+    return EngineError{name +
+                       "and the cache step it follows must be sequential (the miss step waits for "
+                       "the cache's answer)"};
+  }
+  return std::nullopt;
+}
+
+// Each op's steps in order, with the share of requests that take each and the requests each
+// sends (ServiceHop). An `on: miss` step belongs to the nearest unconditional step before it,
+// its lookup, which must ask a cache or a CDN for a read (invalid_miss_step):
+// [cache.get, db.read on miss, cache.set on miss] is one lookup and what follows its miss.
+// connect_step has already resolved every target.
 Graph::Result Graph::resolve_service_hops(std::size_t node) {
   for (const auto& [op, steps] : nodes_[node].spec.ops) {
     auto& hops = service_hops_[node][op];
-    std::optional<std::size_t> looked_up;  // the target of the last unconditional step
+    std::optional<std::size_t> lookup;  // position in `hops` of the last unconditional step
     for (const model::Step& step : steps) {
-      const auto target = *index_of(step.to);
-      double fraction = 1.0;
-      if (step.on == model::StepCondition::always) {
-        looked_up = target;
-      } else if (step.on == model::StepCondition::failure) {
-        fraction = 0.0;  // nothing fails before phase 2c's external sinks
-      } else {
-        if (!looked_up || !hits_or_misses(nodes_[*looked_up].spec.type)) {
-          return std::unexpected{EngineError{"node '" + nodes_[node].spec.id +
-                                             "': an 'on: miss' step must follow a cache or cdn "
-                                             "step"}};
+      ServiceHop hop{
+          .target = *index_of(step.to), .op = step.op, .mode = step.mode, .factor = step.factor};
+      std::optional<std::size_t> looked_up;  // the cache a miss step's lookup asked
+      if (step.on == model::StepCondition::miss) {
+        const ServiceHop* asked = lookup ? &hops[*lookup] : nullptr;
+        if (auto invalid = invalid_miss_step(node, step, asked)) {
+          return std::unexpected{std::move(*invalid)};
         }
-        fraction = miss_fraction(*looked_up);
+        looked_up = asked->target;
+        hop.factor *= asked->factor;  // every missed lookup is fetched (ServiceHop)
+        hop.lookup = lookup;
       }
-      hops.push_back(ServiceHop{.target = target,
-                                .op = step.op,
-                                .fraction = fraction,
-                                .mode = step.mode,
-                                .factor = step.factor});
+      hop.fraction = hop_fraction(step, looked_up);
+      if (step.on == model::StepCondition::always) lookup = hops.size();
+      hops.push_back(std::move(hop));
     }
   }
   return {};
@@ -847,7 +928,7 @@ Graph::Result Graph::resolve_service_hops(std::size_t node) {
 
 std::optional<double> Graph::hit_ratio(std::size_t node) const {
   const auto& spec = nodes_.at(node).spec;
-  if (!is_cache(spec) || !spec.hit_ratio || spec.hit_ratio->che) return std::nullopt;
+  if (!hits_or_misses(spec.type) || !spec.hit_ratio || spec.hit_ratio->che) return std::nullopt;
   return spec.hit_ratio->fixed;
 }
 
@@ -858,6 +939,9 @@ std::span<const ServiceHop> Graph::service_hops(std::size_t node, std::string_vi
   return found->second;
 }
 
+// Pattern: Strategy (enum-dispatched) — the cache strategy is a closed enum and this switch
+// over it is the one place that says what each strategy sends to the store; CacheBehaviour,
+// the paper load and the call-cycle search all read this answer.
 double Graph::backend_fraction(std::size_t node, std::string_view op) const {
   const auto& resolved = nodes_.at(node);
   if (!is_cache(resolved.spec) || !resolved.backend) return 0.0;
@@ -868,6 +952,21 @@ double Graph::backend_fraction(std::size_t node, std::string_view op) const {
   const bool writes_to_store =
       strategy == write_through || strategy == write_around || strategy == write_back;
   return writes_to_store ? 1.0 : 0.0;
+}
+
+double Graph::then_fraction(std::size_t node, const model::Step& step, std::string_view op) const {
+  const auto& spec = nodes_.at(node).spec;
+  using enum model::StepCondition;  // see hop_fraction
+  switch (step.on) {
+    case always:
+      return 1.0;
+    case failure:
+      return 0.0;
+    case miss:
+      if (!hits_or_misses(spec.type) || is_write(spec, op)) return 0.0;
+      return miss_fraction(node);
+  }
+  std::unreachable();
 }
 
 Graph::Result Graph::connect_step(std::size_t from, const model::Step& step) {
@@ -902,8 +1001,8 @@ Graph::Result Graph::connect_step(std::size_t from, const model::Step& step) {
 // link that carries demand between them. The loader checked that the backend exists and
 // is a cache; a scenario built in code is checked for existence here.
 // A cache whose strategy has it call the store (model::needs_backend) gets a demand edge to
-// its backend in the same way (connect_cache_backend); a cache_aside cache's backend is
-// only documentation (the service's `on: miss` step does the store read), so it gets none.
+// its backend in the same way (connect_cache_backend); a cache_aside cache has none (the
+// service's `on: miss` step does the store read, and invalid_cache refuses a backend on it).
 Graph::Result Graph::connect_backends() {
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
     const auto& spec = nodes_[node].spec;
@@ -918,7 +1017,8 @@ Graph::Result Graph::connect_backends() {
 }
 
 // Which ops travel on the edge is known only once every node's arriving ops are
-// (check_cache_backend_ops).
+// (check_cache_backend_ops), and whether a request can wait for the hop only once the call
+// cycles are (check_cache_backend_calls).
 Graph::Result Graph::connect_cache_backend(std::size_t cache) {
   const auto& spec = nodes_[cache].spec;
   const auto backend = index_of(*spec.backend);
@@ -952,6 +1052,27 @@ Graph::Result Graph::check_cache_backend_ops(std::size_t cache) {
     return std::unexpected{EngineError{"link " + resolved.spec.id + " -> " +
                                        nodes_[*resolved.backend].spec.id + " does not carry op '" +
                                        op + "' (ops: " + joined(link.ops, ", ") + ")"}};
+  }
+  return {};
+}
+
+// A cache's fetch from its store is always waited for: a read_through miss is answered with
+// what the store returns, a write_through write once the store has it. So the hop cannot be
+// the one the call-cycle search cuts (detail::find_async_hops): a store that calls back into
+// the cache in front of it (db.read -> cache.read -> db.read) asks a request to wait for
+// itself, and the scenario is refused. (write_back's flush is not a call: nobody waits.)
+Graph::Result Graph::check_cache_backend_calls() const {
+  for (std::size_t cache = 0; cache < nodes_.size(); ++cache) {
+    const auto& resolved = nodes_[cache];
+    if (!is_cache(resolved.spec) || !resolved.backend) continue;
+    if (resolved.spec.strategy == model::CacheStrategy::write_back) continue;
+    for (const auto& op : arriving_ops_[cache]) {
+      if (backend_fraction(cache, op) <= 0.0) continue;
+      if (!is_async_hop(cache, op, *resolved.backend, op)) continue;
+      return std::unexpected{EngineError{"node '" + resolved.spec.id + "': backend '" +
+                                         nodes_[*resolved.backend].spec.id +
+                                         "' closes a call cycle"}};
+    }
   }
   return {};
 }
@@ -1107,8 +1228,9 @@ std::vector<Route> Graph::routes_for(std::size_t node, std::string_view op) cons
 }
 
 // Which ops reach every node: a worklist over (node, op) pairs, seeded with the client
-// routes, the steps that carry flow (unconditional `then` steps, and every resolved hop of
-// positive fraction: an `on: miss` step after a cache that misses) and the `counter` op of
+// routes, the steps that carry flow (unconditional `then` steps, `on: miss` `then` steps of a
+// cache or CDN that misses, and every resolved hop of positive fraction: an `on: miss` step
+// after a cache that misses) and the `counter` op of
 // every limiter's backend, and grown through load balancers and rate limiters, which pass
 // each op they receive on to every route whose link carries it and is not drained (weight 0:
 // no flow takes it), and through caches, which pass an op on to their backend when some of
@@ -1130,7 +1252,7 @@ void Graph::collect_arriving_ops() {
       }
     }
     for (const model::Step& step : spec.then) {
-      if (step.on == model::StepCondition::always) arrive(*index_of(step.to), step.op);
+      if (carries_flow(node, step)) arrive(*index_of(step.to), step.op);
     }
     if (spec.type == model::NodeType::rate_limiter && nodes_[node].backend) {
       arrive(*nodes_[node].backend, std::string{counter_op});
@@ -1151,6 +1273,15 @@ void Graph::collect_arriving_ops() {
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
     arriving_ops_[node].assign(arriving[node].begin(), arriving[node].end());  // sorted: a set
   }
+}
+
+// Can a `then` step of `node` carry flow at all? An unconditional one always; an `on: miss` one
+// when the node can miss (a cache or CDN with a hit ratio below 1, or none known yet); an
+// `on: failure` one not before phase 2c. Which ops it carries is then_fraction's business.
+bool Graph::carries_flow(std::size_t node, const model::Step& step) const {
+  if (step.on == model::StepCondition::always) return true;
+  return step.on == model::StepCondition::miss && hits_or_misses(nodes_[node].spec.type) &&
+         miss_fraction(node) > 0.0;
 }
 
 // Every op that reaches a load balancer must be able to leave it, or the balancer would

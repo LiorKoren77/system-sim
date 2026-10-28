@@ -688,10 +688,25 @@ template <class T, class F>
   return text;
 }
 
+// "write_ops=write", plus a note when no op that reaches the cache is one of them: its write
+// strategy then never acts. A note, not an error: a read-only cache is legitimate, but a write
+// op named differently in the steps (`set`, `put`) is a common slip.
+[[nodiscard]] std::string write_ops_summary(const graph::Graph& g, std::size_t cache) {
+  const auto& write_ops = g.nodes()[cache].spec.write_ops;
+  // C++20 std::ranges::none_of takes the range itself instead of a begin/end pair; C++23
+  // std::ranges::contains asks "is this value in the range?" in one call, replacing
+  // `std::find(begin, end, value) != end`.
+  const bool none_arrive = std::ranges::none_of(g.arriving_ops(cache), [&](const std::string& op) {
+    return std::ranges::contains(write_ops, op);
+  });
+  return " write_ops=" + join(write_ops, ",") + (none_arrive ? " (never arrives)" : "");
+}
+
 // A cache's model (plan 2a refinement 7): `hit_ratio=0.8 (fixed) strategy=cache_aside
 // write_ops=write backend=db keys=20M eviction=lru ttl=5m`, the keys the scenario left out
 // omitted (strategy and write_ops always have a value: their defaults).
-[[nodiscard]] std::string cache_summary(const model::NodeSpec& spec) {
+[[nodiscard]] std::string cache_summary(const graph::Graph& g, std::size_t cache) {
+  const auto& spec = g.nodes()[cache].spec;
   if (spec.type != model::NodeType::cache) return {};
   std::string text = "  hit_ratio=";
   if (!spec.hit_ratio) {
@@ -701,8 +716,7 @@ template <class T, class F>
   } else {
     text += num(spec.hit_ratio->fixed.value_or(0.0), 6) + " (fixed)";
   }
-  text += " strategy=" + std::string{model::to_string(spec.strategy)} +
-          " write_ops=" + join(spec.write_ops, ",");
+  text += " strategy=" + std::string{model::to_string(spec.strategy)} + write_ops_summary(g, cache);
   if (spec.backend) text += " backend=" + *spec.backend;
   if (spec.keys) text += " keys=" + with_si_prefix(static_cast<double>(*spec.keys));
   if (spec.eviction) text += " eviction=" + *spec.eviction;
@@ -744,7 +758,7 @@ template <class T, class F>
                     {std::string{model::to_string(node.spec.type)}},
                     {client ? client_details(node.spec)
                             : server_details(node) + balancing_summary(g, i) +
-                                  limiter_summary(node.spec) + cache_summary(node.spec)}});
+                                  limiter_summary(node.spec) + cache_summary(g, i)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }
@@ -935,21 +949,47 @@ void forward_limited(const graph::Graph& g, const ForwardRoutes& table, std::siz
 
 // Forwards what a cache passes on to its store: rate × Graph::backend_fraction (1 − h of a
 // read under read_through, every write under write_through and write_around), as
-// CacheBehaviour::route does. The hits stop here.
-void forward_cached(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
-                    std::vector<OpLoad>& fed_back) {
+// CacheBehaviour::route does. A cache_aside cache has no backend: the service's on-miss step
+// carries its misses.
+void forward_to_backend(const graph::Graph& g, std::size_t from, const OpLoad& arriving,
+                        std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   const auto& node = g.nodes()[from];
-  if (!node.backend) return;           // cache_aside: the service's on-miss step carries the misses
-  const OpLoad arriving = load[from];  // a copy, as in forward_steps
+  if (!node.backend) return;
   auto& destination = g.links()[*node.backend_link].feedback ? fed_back : load;
   for (const auto& [op, rate] : arriving) {
     destination[*node.backend][op] += rate * g.backend_fraction(from, op);
   }
 }
 
+// Forwards along a cache's `then` steps (what happens after it answers: ch. 13's browser
+// cache sends its misses on to the servers): rate × factor × Graph::then_fraction, the whole
+// flow for an unconditional step and the misses (1 − h of a read) for an `on: miss` one.
+// The engine runs these from phase 2b on; on paper they are plain multiplications.
+void forward_then_steps(const graph::Graph& g, std::size_t from, const OpLoad& arriving,
+                        std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
+  for (const model::Step& step : g.nodes()[from].spec.then) {
+    const auto target = g.index_of(step.to);
+    const auto link = target ? g.demand_link(from, *target) : std::nullopt;
+    if (!link) continue;  // Graph::build proved it exists; skip defensively
+    auto& destination = g.links()[*link].feedback ? fed_back : load;
+    for (const auto& [op, rate] : arriving) {
+      destination[*target][step.op] += rate * step.factor * g.then_fraction(from, step, op);
+    }
+  }
+}
+
+// What a cache passes on: to its store, and along its `then` steps. The hits stop here.
+void forward_cached(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
+                    std::vector<OpLoad>& fed_back) {
+  const OpLoad arriving = load[from];  // a copy, as in forward_steps
+  forward_to_backend(g, from, arriving, load, fed_back);
+  forward_then_steps(g, from, arriving, load, fed_back);
+}
+
 // Forwards what reached node `from` along its resolved `ops` hops (rate × factor × the share
 // of requests that take the hop: 1, or a cache's miss fraction 1 − h for an `on: miss`
-// step; graph::ServiceHop), as ServiceBehaviour::route does, or over a load balancer's or a
+// step, whose factor includes its lookup's, so every missed lookup is fetched;
+// graph::ServiceHop), as ServiceBehaviour::route does, or over a load balancer's or a
 // rate limiter's routes, or to a cache's store. Flow over a feedback link goes to `fed_back`:
 // its target came earlier in the order, so it counts in the next pass.
 void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_t from,
@@ -1059,6 +1099,65 @@ struct PaperLoad {
   return {.totals = std::move(totals), .converged = false};
 }
 
+// ---- loads that rest on an unknown hit ratio ----
+//
+// A cache or CDN with no number for h yet (`che`: the Che approximation of phase 2b; a CDN
+// without a fixed ratio) counts every read as a miss on paper (Graph::service_hops): the
+// nodes behind its misses are checked against their worst case, an upper bound. Their check
+// lines say so, or a student would read a red database as a flaw of the design.
+
+// Does `node` miss at a rate nobody knows yet?
+[[nodiscard]] bool unknown_misses(const graph::Graph& g, std::size_t node) {
+  const auto type = g.nodes()[node].spec.type;
+  const bool can_miss = type == model::NodeType::cache || type == model::NodeType::cdn;
+  return can_miss && !g.hit_ratio(node).has_value();
+}
+
+// The nodes that receive miss flow of such a cache directly: the targets of a service's
+// `on: miss` steps after it (ServiceHop::lookup), its read_through backend, and the targets of
+// its own `on: miss` then-steps.
+[[nodiscard]] std::vector<std::size_t> unknown_miss_targets(const graph::Graph& g) {
+  std::vector<std::size_t> targets;
+  for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+    const auto& spec = g.nodes()[node].spec;
+    // C++20 `std::views::keys`: a lazy view of each map entry's key (the op name), replacing a
+    // loop over the pairs that ignores `.second`; nothing is copied.
+    for (const auto& op : spec.ops | std::views::keys) {
+      const auto hops = g.service_hops(node, op);
+      for (const graph::ServiceHop& hop : hops) {
+        if (hop.lookup && unknown_misses(g, hops[*hop.lookup].target))
+          targets.push_back(hop.target);
+      }
+    }
+    if (!unknown_misses(g, node)) continue;
+    const auto& backend = g.nodes()[node].backend;
+    if (backend && spec.strategy == model::CacheStrategy::read_through) targets.push_back(*backend);
+    for (const model::Step& step : spec.then) {
+      if (step.on == model::StepCondition::miss) targets.push_back(*g.index_of(step.to));
+    }
+  }
+  return targets;
+}
+
+// Every node whose paper load contains such miss flow: the direct targets and everything their
+// demand edges reach (a node's load counts what flows into it, so the bound travels on). Over
+// the edges, not per op: it can flag a node that only an unrelated op of a flagged node
+// reaches, the safe side for a caveat.
+[[nodiscard]] std::vector<bool> counts_unknown_hit_ratio(const graph::Graph& g) {
+  std::vector<bool> flagged(g.nodes().size(), false);
+  std::vector<std::size_t> work = unknown_miss_targets(g);
+  while (!work.empty()) {
+    const auto node = work.back();
+    work.pop_back();
+    if (flagged[node]) continue;
+    flagged[node] = true;
+    for (const auto& edge : g.edges()) {
+      if (edge.from == node) work.push_back(edge.to);
+    }
+  }
+  return flagged;
+}
+
 // Behind a hash ring (imbalance k > 1) the group's average hides the copy that breaks
 // first: the hottest of N copies is sent k / N of the offered load against ONE copy's
 // capacity (engine::Simulation::make_server models it apart). The lab's 40k/s on 4 copies
@@ -1091,11 +1190,14 @@ struct PaperLoad {
 
 [[nodiscard]] std::string explain_checks(const graph::Graph& g) {
   const auto load = paper_load(g);
+  const auto upper_bound = counts_unknown_hit_ratio(g);
   std::vector<Row> rows;
   for (std::size_t i = 0; i < g.nodes().size(); ++i) {
     const auto& node = g.nodes()[i];
     if (node.spec.type == model::NodeType::client) continue;  // a source: see its offered=
-    rows.push_back({{node.spec.id}, {check_details(node, load.totals[i])}});
+    const std::string note =
+        upper_bound[i] ? " (hit ratio unknown: che counted as 0 — an upper bound)" : "";
+    rows.push_back({{node.spec.id}, {check_details(node, load.totals[i]) + note}});
   }
   const std::string note = load.converged ? "" : "  (no steady state: a loop of gain >= 1)\n";
   const std::string header = "checks (peak offered load over the first " +
@@ -1327,7 +1429,6 @@ std::vector<SloResult> evaluate_slos(const Summary& summary, std::span<const mod
 }
 
 bool all_pass(std::span<const SloResult> results) {
-  // C++20 std::ranges::none_of: takes the range itself instead of a begin/end pair.
   return std::ranges::none_of(results,
                               [](const SloResult& r) { return r.status == SloStatus::fail; });
 }
