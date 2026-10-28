@@ -628,7 +628,8 @@ template <class T, class F>
 }
 
 // The vnodes of the consistent-hash balancer in front of `target` (the one whose ring
-// gives the largest imbalance, as Graph::mark_balanced_targets keeps), for explain.
+// gives the largest imbalance, as Graph::mark_balanced_targets keeps), for explain. A
+// drained route (weight 0) sends nothing, so its ring does not count (as there).
 [[nodiscard]] int ring_vnodes(const graph::Graph& g, std::size_t target) {
   int fewest = 0;  // fewest vnodes = largest imbalance 1 + 1/sqrt(v)
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
@@ -636,7 +637,8 @@ template <class T, class F>
     if (spec.policy != model::LbPolicy::consistent_hash) continue;
     const int vnodes = spec.vnodes.value_or(model::default_vnodes);
     for (const auto& route : g.routes(node)) {
-      if (route.target == target && (fewest == 0 || vnodes < fewest)) fewest = vnodes;
+      if (route.share <= 0.0 || route.target != target) continue;
+      if (fewest == 0 || vnodes < fewest) fewest = vnodes;
     }
   }
   return fewest;
@@ -831,13 +833,42 @@ constexpr SimTime peak_sample_step = 1_min;
   return found == spec.cost.end() ? 1.0 : found->second;
 }
 
+// Each forwarding node's (load balancer's, rate limiter's) routes per op that can reach
+// it, as Graph::routes_for gives them, drained routes (share 0) left out: they carry
+// nothing. routes_for builds a fresh vector per call, so the table is built once per
+// paper_load rather than once per op, node and pass.
+using RoutesByOp = std::map<std::string, std::vector<graph::Route>, std::less<>>;
+using ForwardRoutes = std::vector<RoutesByOp>;  // per node index; empty for non-forwarders
+
+[[nodiscard]] ForwardRoutes forward_routes(const graph::Graph& g) {
+  ForwardRoutes table(g.nodes().size());
+  for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+    if (!graph::forwards_by_link(g.nodes()[node].spec.type)) continue;
+    for (const auto& op : g.arriving_ops(node)) {
+      auto& routes = table[node][op];
+      for (const auto& route : g.routes_for(node, op)) {
+        if (route.share > 0.0) routes.push_back(route);
+      }
+    }
+  }
+  return table;
+}
+
+// The routes `op` takes out of forwarding node `from`; none for an op that cannot reach it.
+[[nodiscard]] std::span<const graph::Route> routes_of(const ForwardRoutes& table, std::size_t from,
+                                                      std::string_view op) {
+  const auto found = table[from].find(op);
+  if (found == table[from].end()) return {};
+  return found->second;
+}
+
 // Forwards what reached load balancer `from` over its routes, each op split by the
 // shares Graph::routes_for gives (as LoadBalancerBehaviour::route does).
-void forward_balanced(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
-                      std::vector<OpLoad>& fed_back) {
+void forward_balanced(const graph::Graph& g, const ForwardRoutes& table, std::size_t from,
+                      std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   const OpLoad arriving = load[from];  // a copy, as in forward_steps
   for (const auto& [op, rate] : arriving) {
-    for (const auto& route : g.routes_for(from, op)) {
+    for (const auto& route : routes_of(table, from, op)) {
       auto& destination = g.links()[route.link].feedback ? fed_back : load;
       destination[route.target][op] += rate * route.share;
     }
@@ -849,8 +880,8 @@ void forward_balanced(const graph::Graph& g, std::size_t from, std::vector<OpLoa
 // per admitted request to its backend. On paper the burst is spent (a peak lasts longer
 // than a bucket), and a leaky bucket's queue also leaks at `limit`, so one rule covers
 // every algorithm.
-void forward_limited(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
-                     std::vector<OpLoad>& fed_back) {
+void forward_limited(const graph::Graph& g, const ForwardRoutes& table, std::size_t from,
+                     std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   const auto& node = g.nodes()[from];
   const OpLoad arriving = load[from];  // a copy, as in forward_steps
   // C++23 std::ranges::fold_left: a left fold over a range, without a hand-written loop
@@ -859,7 +890,7 @@ void forward_limited(const graph::Graph& g, std::size_t from, std::vector<OpLoad
   const double admitted = std::min(offered, node.spec.limit->per_second);
   const double fraction = offered > 0.0 ? admitted / offered : 0.0;
   for (const auto& [op, rate] : arriving) {
-    for (const auto& route : g.routes_for(from, op)) {
+    for (const auto& route : routes_of(table, from, op)) {
       auto& destination = g.links()[route.link].feedback ? fed_back : load;
       destination[route.target][op] += rate * fraction * route.share;
     }
@@ -874,16 +905,16 @@ void forward_limited(const graph::Graph& g, std::size_t from, std::vector<OpLoad
 // as ServiceBehaviour::route does, or over a load balancer's or a rate limiter's routes. Flow over
 // a feedback link goes to `fed_back`: its target came earlier in the order, so it counts in the
 // next pass.
-void forward_steps(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
-                   std::vector<OpLoad>& fed_back) {
+void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_t from,
+                   std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   const auto& spec = g.nodes()[from].spec;
   if (spec.type == model::NodeType::client) return;  // client routes are in client_load
   if (spec.type == model::NodeType::load_balancer) {
-    forward_balanced(g, from, load, fed_back);
+    forward_balanced(g, table, from, load, fed_back);
     return;
   }
   if (spec.type == model::NodeType::rate_limiter) {
-    forward_limited(g, from, load, fed_back);
+    forward_limited(g, table, from, load, fed_back);
     return;
   }
   const OpLoad arriving = load[from];  // a copy: a step may target `from` itself
@@ -919,7 +950,7 @@ struct PaperLoad {
 // order. Returns the total offered load per node in capacity units (Σ rate_op × cost_op,
 // plan 2a refinement 4), the quantity the node's capacity is a rate of. Forwarding stays
 // in requests: a cost prices work at one node, it does not multiply requests.
-[[nodiscard]] std::vector<double> paper_pass(const graph::Graph& g,
+[[nodiscard]] std::vector<double> paper_pass(const graph::Graph& g, const ForwardRoutes& table,
                                              const std::vector<OpLoad>& offered,
                                              std::vector<OpLoad>& fed_back) {
   auto load = offered;
@@ -927,7 +958,9 @@ struct PaperLoad {
     for (const auto& [op, rate] : fed_back[i]) load[i][op] += rate;
   }
   std::vector<OpLoad> next_fed_back(g.nodes().size());
-  for (const auto index : g.topological_order()) forward_steps(g, index, load, next_fed_back);
+  for (const auto index : g.topological_order()) {
+    forward_steps(g, table, index, load, next_fed_back);
+  }
   fed_back = std::move(next_fed_back);
   std::vector<double> totals;
   for (std::size_t i = 0; i < load.size(); ++i) {
@@ -966,10 +999,11 @@ struct PaperLoad {
 // pass is returned, unconverged. Unlike estimate, nothing caps a node at its capacity here.
 [[nodiscard]] PaperLoad paper_load(const graph::Graph& g) {
   const auto offered = client_load(g);
+  const auto table = forward_routes(g);
   std::vector<OpLoad> fed_back(g.nodes().size());
-  auto totals = paper_pass(g, offered, fed_back);
+  auto totals = paper_pass(g, table, offered, fed_back);
   for (int pass = 1; pass < max_paper_passes; ++pass) {
-    auto next = paper_pass(g, offered, fed_back);
+    auto next = paper_pass(g, table, offered, fed_back);
     if (!all_finite(next)) return {.totals = std::move(totals), .converged = false};
     if (settled(totals, next)) return {.totals = std::move(next), .converged = true};
     totals = std::move(next);
@@ -977,16 +1011,34 @@ struct PaperLoad {
   return {.totals = std::move(totals), .converged = false};
 }
 
+// Behind a hash ring (imbalance k > 1) the group's average hides the copy that breaks
+// first: the hottest of N copies is sent k / N of the offered load against ONE copy's
+// capacity (engine::Simulation::make_server models it apart). The lab's 40k/s on 4 copies
+// of 12k/s with vnodes 1 (k = 2): 83% on average, but 20k/s vs 12k/s, 167%, on the hottest.
+[[nodiscard]] std::string hottest_copy_check(const graph::ResolvedNode& node, double offered) {
+  if (node.imbalance <= 1.0) return {};
+  const double hot = offered * node.imbalance / node.spec.replicas;
+  const double copy_capacity = node.capacity.service_rate.per_second;
+  const std::string head = "  hottest copy " + fmt_rate(hot) + " vs " + fmt_rate(copy_capacity);
+  const std::string imbalance = "imbalance " + num(node.imbalance, 3) + ")";
+  if (copy_capacity <= 0.0) return head + " (no capacity, red; " + imbalance;
+  const double rho = hot / copy_capacity;
+  return head + " (" + percent(rho) + ", " +
+         std::string{zone_name(fluid::zone_of(rho, node.capacity))} + "; " + imbalance;
+}
+
 // Utilization at the paper load: peak offered / (capacity per replica × replicas), with
-// the node's own zone thresholds. Both are in capacity units (requests when every cost is 1).
+// the node's own zone thresholds, and the hottest copy's behind a hash ring. Both are in
+// capacity units (requests when every cost is 1).
 [[nodiscard]] std::string check_details(const graph::ResolvedNode& node, double offered) {
   const double total_capacity = node.capacity.service_rate.per_second * node.spec.replicas;
   const std::string head =
       "peak offered " + fmt_rate(offered) + " vs " + fmt_rate(total_capacity) + " total capacity  ";
-  if (total_capacity <= 0.0) return head + "(no capacity, red)";
+  if (total_capacity <= 0.0) return head + "(no capacity, red)" + hottest_copy_check(node, offered);
   const double rho = offered / total_capacity;
   return head + "(" + percent(rho) + ", " +
-         std::string{zone_name(fluid::zone_of(rho, node.capacity))} + ")";
+         std::string{zone_name(fluid::zone_of(rho, node.capacity))} + ")" +
+         hottest_copy_check(node, offered);
 }
 
 [[nodiscard]] std::string explain_checks(const graph::Graph& g) {

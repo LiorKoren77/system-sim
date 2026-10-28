@@ -214,8 +214,9 @@ inline constexpr auto limiter_algorithm_table = std::to_array<core::EnumName<Lim
 inline constexpr SimTime default_limiter_window = 1_s;
 
 // Virtual nodes per server on a consistent-hash ring when the scenario gives none.
-// Chosen: 150 is the per-server token count of Amazon Dynamo's evaluation and of the
-// Cassandra/Riak-style rings the book's ch. 5 describes ("vnodes: 150" in the lab).
+// Chosen: the book's ch. 5 reports the standard deviation of a server's load at about 10%
+// of the mean with 100 virtual nodes and 5% with 200; 150 sits between the two (the lab's
+// "try 150"). graph::Graph::mark_balanced_targets turns it into the imbalance factor.
 inline constexpr int default_vnodes = 150;
 
 // One thing a node does with an incoming op: forward (a multiple of) it to `to` as `op`.

@@ -24,6 +24,7 @@ module;
 // on, this one imports a deep module chain and needs -flarge-source-files (set for the
 // simsys library in the top-level CMakeLists.txt, which explains why).
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <concepts>
 #include <cstddef>
@@ -77,8 +78,10 @@ class DelayLine {
 };
 
 // One node's numbers for one step. Rates and backlog are summed over replicas (plan
-// refinement 4); rho, latency and zone are per copy, which all copies share — or, behind
-// a consistent-hash balancer, those of the hottest copy (see Simulation::make_node).
+// refinement 4); rho and zone are per copy, which all copies share — or, behind a
+// consistent-hash balancer, those of the hottest copy, the one that breaks an SLO first —
+// and latency is the sojourn a request sees: one copy's, or behind a hash ring the
+// share-weighted mixture of the hot and the cool copies' (see Simulation::make_server).
 // Demand, drain, drops and backlog are in CAPACITY UNITS (per second for the rates), the
 // unit `capacity` is a rate of (phase 2a refinement 4): a request of an op with `cost` 3
 // counts three times. With every cost at its default of 1, units are requests, as in
@@ -190,21 +193,30 @@ class Simulation {
   // previous step's entry. std::less<> (transparent) lets find() take a string_view.
   using ResponseTable = std::map<std::string, flow::LatencyEstimate, std::less<>>;
 
+  // Identical replica copies modelled by ONE queue (make_server): each copy is sent
+  // `demand_share` of the group's arrivals, there are `copies` of them, and a request of the
+  // group reaches one of them with probability `request_share` (= demand_share × copies,
+  // stored rather than recomputed so that the independent case is exactly 1). Group totals
+  // are the queue's totals × copies.
+  struct CopyGroup {
+    fluid::FluidQueue queue;
+    double demand_share{1};
+    double copies{1};
+    double request_share{1};
+    // What one copy's queue holds, per op, in capacity units (not per second; Flow is
+    // reused as "a number per op"). Its total agrees with the queue's backlog to rounding.
+    // See serve().
+    flow::Flow waiting{};
+  };
+
   struct Node {
     behaviours::Behaviour behaviour;
-    std::optional<fluid::FluidQueue> queue{};  // every node but a client (a source)
-    // How many copies of the modelled queue make up the group: group totals = the queue's
-    // totals × group_scale, and the queue sees the group's arrivals / group_scale. It is
-    // `replicas` for independent copies, 1 for a pooled group (the one queue IS the
-    // group), and replicas / imbalance behind a consistent-hash ring (see make_node).
-    double group_scale{1};
+    // Every node but a client (a source) has one group (independent or pooled replicas) or
+    // two (behind a hash ring: the hottest copy first, then the cool ones). See make_server.
+    std::vector<CopyGroup> copy_groups{};
     std::vector<std::size_t> incoming_links{};  // links delivering demand here
     std::vector<std::size_t> outgoing_links{};  // links this node sends demand on
     flow::Flow inflow{};                        // this step's arrivals
-    // Services: what one copy's queue holds, per op, in capacity units (not per second;
-    // Flow is reused as "a number per op"). Its total agrees with the queue's backlog to
-    // rounding. See serve().
-    flow::Flow waiting{};
     ResponseTable responses{};
   };
 
@@ -223,6 +235,10 @@ class Simulation {
   [[nodiscard]] static Node make_node(const graph::Graph& g, std::size_t index);
   [[nodiscard]] static Node make_server(behaviours::Behaviour behaviour,
                                         const graph::ResolvedNode& resolved);
+  [[nodiscard]] static CopyGroup independent_copies(const graph::ResolvedNode& resolved);
+  [[nodiscard]] static CopyGroup pooled_copies(const graph::ResolvedNode& resolved);
+  static void add_hot_and_cool_copies(const graph::ResolvedNode& resolved,
+                                      std::vector<CopyGroup>& groups);
   [[nodiscard]] static int line_steps(const graph::ResolvedLink& link);
   void connect(const graph::Graph& g);
   void register_reachable_ops(const graph::Graph& g);
@@ -231,10 +247,12 @@ class Simulation {
   [[nodiscard]] StepRecord evaluate(SimTime now, SimTime dt, Mode mode);
   void forward_pass(SimTime now, SimTime dt, Mode mode, std::vector<NodeSample>& samples);
   void receive(std::size_t index, Mode mode);
-  // Any queueing node (service, load balancer): runs its queue and returns what it
-  // drained, in requests per second, for the behaviour to route.
+  // Any queueing node (service, load balancer, rate limiter): runs its queues and returns
+  // what they drained, in requests per second, for the behaviour to route.
   [[nodiscard]] flow::Flow serve(std::size_t index, SimTime dt, Mode mode, NodeSample& sample);
-  [[nodiscard]] static flow::Flow take_drained(Node& node, const flow::Flow& content,
+  [[nodiscard]] static fluid::FluidStep serve_copies(CopyGroup& group, const flow::Flow& units,
+                                                     SimTime dt, Mode mode, flow::Flow& drained);
+  [[nodiscard]] static flow::Flow take_drained(CopyGroup& group, const flow::Flow& content,
                                                const fluid::FluidStep& copy_step);
   void send(std::size_t index, const behaviours::Routed& routed, Mode mode);
   void backward_pass(const std::vector<NodeSample>& samples);
@@ -326,22 +344,20 @@ void add_once(std::vector<std::size_t>& links, std::size_t link) {
   return requests;
 }
 
-// A replica group of `replicas` identical copies behind an equal split (plan refinement
-// 4): each copy saw demand / replicas, so the group's rates and backlog are the copy's
-// times `replicas`; utilization, latency and zone are the same for every copy. In general
-// the factor is the node's group_scale (Simulation::Node), which also covers a pooled
-// group (1) and a hash ring's hottest copy (replicas / imbalance).
-[[nodiscard]] NodeSample group_sample(const fluid::FluidStep& step, double group_scale) {
-  // C++20 designated initializers: name each field at the construction site, so the
-  // doubles in a row cannot be swapped silently. `rejected_per_s` stays 0: a queue never
-  // rejects; the forward pass fills it from the behaviour's Routed.
-  return NodeSample{.demand_per_s = step.demand_per_s * group_scale,
-                    .drain_per_s = step.drain_per_s * group_scale,
-                    .dropped_per_s = step.dropped_per_s * group_scale,
-                    .backlog = step.backlog * group_scale,
-                    .rho = step.rho,
-                    .latency = step.latency,
-                    .zone = step.zone};
+// The most copy groups a node has: the hot and the cool copies behind a hash ring (see
+// Simulation::make_server); every other node has one.
+inline constexpr std::size_t max_copy_groups = 2;
+
+// Adds `copies` identical copies, each of which took `copy_step`, to the group's totals
+// (plan refinement 4): N copies behind an equal split each saw demand / N, so the group's
+// rates and backlog are the copy's times N. A pooled group is one copy (its queue IS the
+// group); a hash ring adds its hot copy (1) and its cool ones (N - 1). `rejected_per_s`
+// stays 0: a queue never rejects; the forward pass fills it from the behaviour's Routed.
+void add_copies(NodeSample& sample, const fluid::FluidStep& copy_step, double copies) {
+  sample.demand_per_s += copy_step.demand_per_s * copies;
+  sample.drain_per_s += copy_step.drain_per_s * copies;
+  sample.dropped_per_s += copy_step.dropped_per_s * copies;
+  sample.backlog += copy_step.backlog * copies;
 }
 
 // estimate()'s stopping rule: a pass changed nothing that matters when every node's
@@ -415,6 +431,9 @@ std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Gr
 Simulation::Simulation(const graph::Graph& g)
     : order_{g.topological_order().begin(), g.topological_order().end()}, step_{g.scenario().step} {
   for (std::size_t i = 0; i < g.nodes().size(); ++i) nodes_.push_back(make_node(g, i));
+  // C++20 designated initializers: `Link{.line = ...}` names the member it sets and leaves
+  // the others at their defaults, replacing positional braces where a reader must count
+  // members against the struct (and same-typed doubles, as in CopyGroup, could swap silently).
   for (const auto& link : g.links()) links_.push_back(Link{.line = DelayLine{line_steps(link)}});
   connect(g);
   register_reachable_ops(g);
@@ -444,38 +463,84 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
   }
 }
 
-// The queue of a node that serves (plan 2a refinement 5: what the balancer in front, if
-// any, does to the replica group; graph::Graph::mark_balanced_targets sets the flags).
-//  - Independent copies (no balancer, round_robin, weighted): one queue models one copy,
-//    which sees demand / N; the group is N of it (group_scale = N).
-//  - Pooled (least_connections): ONE queue for the whole group with N × the service rate,
-//    N × the servers and N × the waiting room, i.e. M/M/(c·N). It sees the whole demand
-//    and its numbers are the group's (group_scale = 1). Assumes join-the-shortest-queue
-//    is perfect: no request ever waits while some replica is idle.
-//  - Imbalanced (consistent_hash, factor k = 1 + 1/sqrt(vnodes)): the queue models the
-//    HOTTEST copy, which sees k × demand / N, so its rho and latency are the hot copy's
-//    (the ones that break an SLO first). group_scale = N / k turns its drain, drops and
-//    backlog back into group totals: below saturation the hot copy drains all it is sent,
-//    so the group drains all of the demand. Assumption: the other copies are cooler and
-//    never the bottleneck; scaling the hot copy's fate to the group is pessimistic once it
-//    saturates (it sheds a share the cooler copies would have served).
+// The queues of a node that serves (plan 2a refinement 5: what the balancer in front, if
+// any, does to the replica group; graph::Graph::mark_balanced_targets sets the flags and
+// documents the models). A node reached both through a balancer and directly gets the
+// balancer's model for all its traffic: the model belongs to the group, not to one path.
+// Pattern: Strategy (data-driven) — the three replica models differ only in the copy
+// groups built here; serve() runs any list of groups the same way.
+//  - Independent copies (no balancer, round_robin, weighted): independent_copies.
+//  - Pooled (least_connections): pooled_copies.
+//  - Imbalanced (consistent_hash, imbalance k > 1): add_hot_and_cool_copies.
 Simulation::Node Simulation::make_server(behaviours::Behaviour behaviour,
                                          const graph::ResolvedNode& resolved) {
-  const double replicas = resolved.spec.replicas;
-  if (!resolved.pooled) {
-    return Node{.behaviour = std::move(behaviour),
-                .queue = fluid::FluidQueue{resolved.capacity},
-                .group_scale = replicas / resolved.imbalance};
+  Node node{.behaviour = std::move(behaviour)};
+  if (resolved.pooled) {
+    node.copy_groups.push_back(pooled_copies(resolved));
+  } else if (resolved.imbalance > 1.0) {
+    add_hot_and_cool_copies(resolved, node.copy_groups);
+  } else {
+    node.copy_groups.push_back(independent_copies(resolved));
   }
+  return node;
+}
+
+// One queue models one copy, which sees demand / N; the group is N of it.
+Simulation::CopyGroup Simulation::independent_copies(const graph::ResolvedNode& resolved) {
+  const double replicas = resolved.spec.replicas;
+  return CopyGroup{.queue = fluid::FluidQueue{resolved.capacity},
+                   .demand_share = 1.0 / replicas,
+                   .copies = replicas,
+                   .request_share = 1.0};
+}
+
+// ONE queue for the whole group with N × the service rate, N × the servers and N × the
+// waiting room, i.e. M/M/(c·N). It sees the whole demand and its numbers are the group's.
+// Assumes join-the-shortest-queue is perfect: no request ever waits while some replica is
+// idle. The servers are capped like any concurrency (defaults::max_concurrency: Erlang C
+// costs O(c) per step) but the service rate is not: the rate is what the group DRAINS, and
+// capping it would shed flow the real pool serves. The cap reaches only the Erlang C wait,
+// and errs on the pessimistic side (fewer servers wait longer); at 100k servers that wait is
+// negligible below the rho 0.99 the stochastic term is evaluated at anyway.
+Simulation::CopyGroup Simulation::pooled_copies(const graph::ResolvedNode& resolved) {
+  const double replicas = resolved.spec.replicas;
   fluid::Capacity pool = resolved.capacity;
   pool.service_rate = Rate{pool.service_rate.per_second * replicas};
-  // c·N servers, capped like any concurrency (defaults::max_concurrency: Erlang C costs
-  // O(c) per step); computed in double so a large N × c cannot overflow an int.
+  // Computed in double so a large N × c cannot overflow an int.
   pool.concurrency = static_cast<int>(std::min(static_cast<double>(pool.concurrency) * replicas,
                                                static_cast<double>(defaults::max_concurrency)));
   pool.queue_limit *= replicas;
-  return Node{
-      .behaviour = std::move(behaviour), .queue = fluid::FluidQueue{pool}, .group_scale = 1};
+  return CopyGroup{.queue = fluid::FluidQueue{pool}};
+}
+
+// Behind a hash ring the hottest of N copies holds k times the average share (k = the
+// node's imbalance, graph::Graph::mark_balanced_targets) and the N - 1 others split the rest
+// evenly, so the group is TWO kinds of copy:
+//                 copies   demand share of ONE copy    request share (all copies)
+//   hot copy        1        k / N                       k / N
+//   cool copies     N - 1    (N - k) / (N (N - 1))       (N - k) / N
+// The shares add up to the whole demand: k/N + (N - 1)(N - k)/(N (N - 1)) = 1. Each kind is
+// its own queue, so the group drains, drops and holds hot + (N - 1) × cool: a saturated hot
+// copy sheds only its own excess, while the cool copies serve their share. The node reports
+// the hot copy's rho and zone (the copy that breaks an SLO first) and, as its latency, the
+// mixture a request sees: the hot copy's sojourn with probability k / N, a cool copy's
+// otherwise (serve). With k = N (2 copies on a 1-vnode ring) the cool copies get nothing
+// and are left out. Ignored: WHICH keys are hot (the hottest arc is a fixed share, not a
+// popular key: a Zipf hot key is the cache's business), and the spread among the cool
+// copies (they are taken as equal, so only the hottest copy is singled out).
+void Simulation::add_hot_and_cool_copies(const graph::ResolvedNode& resolved,
+                                         std::vector<CopyGroup>& groups) {
+  const double replicas = resolved.spec.replicas;
+  const double k = resolved.imbalance;  // in (1, N]: mark_balanced_targets caps it at N
+  groups.push_back(CopyGroup{.queue = fluid::FluidQueue{resolved.capacity},
+                             .demand_share = k / replicas,
+                             .copies = 1,
+                             .request_share = k / replicas});
+  if (k >= replicas) return;  // the hot copy takes everything
+  groups.push_back(CopyGroup{.queue = fluid::FluidQueue{resolved.capacity},
+                             .demand_share = (replicas - k) / (replicas * (replicas - 1)),
+                             .copies = replicas - 1,
+                             .request_share = (replicas - k) / replicas});
 }
 
 // How many steps the DelayLine itself must hold. A forward link's source runs before
@@ -581,7 +646,7 @@ Simulation Simulation::settling_copy() const {
   scratch.nodes_ = nodes_;
   for (auto& node : scratch.nodes_) {
     node.inflow.clear();
-    node.waiting.clear();
+    for (auto& group : node.copy_groups) group.waiting.clear();
     for (auto& [op, response] : node.responses) response = flow::LatencyEstimate{};
     if (auto* client = std::get_if<behaviours::ClientBehaviour>(&node.behaviour)) {
       client->reset_noise();
@@ -634,6 +699,9 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode,
             // lambda for a client, so this one sees only servers.
             [&](auto& server) { return server.route(serve(index, dt, mode, samples[index]), dt); }},
         nodes_[index].behaviour);
+    // `routed.served` (the flow the behaviour accepted: its input minus what it rejected) is
+    // not read here: a node's numbers come from its queues (NodeSample). It is still built
+    // per step; reusing a scratch Routed across steps would save that allocation (backlog).
     samples[index].rejected_per_s = routed.rejected.total().per_second;
     send(index, routed, mode);
   }
@@ -653,20 +721,23 @@ void Simulation::receive(std::size_t index, Mode mode) {
   }
 }
 
-// One step of a queueing node (service or load balancer): the group's arrivals priced in
-// capacity units and divided over the modelled queue (group_scale: one copy, the pool or
-// the hottest copy, see make_server), the §3.3 fluid step (settled first when
-// estimating); what the queue drained goes back, converted to requests, for the node's
-// behaviour to route downstream (forward_pass).
+// One step of a queueing node (service, load balancer, rate limiter): the group's arrivals
+// priced in capacity units, and for each copy group (one copy of N, the pool, or the hot and
+// the cool copies, see make_server) its share of them through the §3.3 fluid step (settled
+// first when estimating). What the groups drained goes back, summed and converted to
+// requests, for the node's behaviour to route downstream (forward_pass). The sample adds
+// the groups' totals; its rho and zone are the first group's (the hottest copy behind a
+// ring); its latency is the request-share-weighted mixture of the groups' sojourns
+// (behaviours::mixture), which with one group is that group's sojourn.
 //
 // Capacity units (plan 2a refinement 4): the queue holds WORK, not requests. An op of
 // cost c_op arriving at r_op req/s brings r_op × c_op units/s (in_units), the
 // FluidQueue serves `capacity` units/s, and everything below is in units. Only on the
 // way out does a drained op become requests again: forwarded units / c_op (in_requests).
 //
-// The FluidQueue knows only totals (one backlog number); `node.waiting` adds which ops
-// are queued. Model: the queue is well-mixed (random-order) fluid, not FIFO, and drops
-// are taken proportionally, not from the tail. Every unit of work in it, whether it
+// The FluidQueue knows only totals (one backlog number); each copy group's `waiting` adds
+// which ops are queued. Model: the queue is well-mixed (random-order) fluid, not FIFO, and
+// drops are taken proportionally, not from the tail. Every unit of work in it, whether it
 // waited from an earlier step or arrived in this one, is equally likely to be among the
 // drained, the dropped or the still waiting, so each part has the content's op mix in
 // units:
@@ -694,36 +765,58 @@ void Simulation::receive(std::size_t index, Mode mode) {
 // sojourn: see ServiceBehaviour).
 flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSample& sample) {
   auto& node = nodes_[index];
-  auto& queue = *node.queue;  // every server has a queue (make_server)
-  // Replicas (plan refinement 4): `waiting` and the queue describe the modelled queue,
-  // which sees 1/group_scale of the arrivals; take_drained scales the forwarded flow back
-  // to the group.
-  const flow::Flow arrivals = in_units(node.inflow, node.behaviour).scaled(1.0 / node.group_scale);
-  const Rate per_replica = arrivals.total();
-  if (mode == Mode::settle) {
-    queue.settle(per_replica);
-    node.waiting = settled_waiting(arrivals, queue.backlog());
+  const flow::Flow units = in_units(node.inflow, node.behaviour);
+  flow::Flow drained;
+  sample = NodeSample{};
+  // At most two groups (max_copy_groups): a fixed array, no allocation per step.
+  std::array<behaviours::Branch, max_copy_groups> sojourns{};
+  for (std::size_t i = 0; i < node.copy_groups.size(); ++i) {
+    auto& group = node.copy_groups[i];
+    const fluid::FluidStep copy_step = serve_copies(group, units, dt, mode, drained);
+    add_copies(sample, copy_step, group.copies);
+    if (i == 0) {  // the hottest copy (or the only kind) speaks for the node's load
+      sample.rho = copy_step.rho;
+      sample.zone = copy_step.zone;
+    }
+    sojourns[i] = {.share = group.request_share, .latency = copy_step.latency};
   }
-  const flow::Flow content = queue_content(node.waiting, arrivals, dt);
-  const fluid::FluidStep copy_step = queue.advance(per_replica, dt);
-  sample = group_sample(copy_step, node.group_scale);
-  return in_requests(take_drained(node, content, copy_step), node.behaviour);
+  sample.latency = node.copy_groups.size() == 1
+                       ? sojourns[0].latency
+                       : behaviours::mixture(std::span{sojourns}.first(node.copy_groups.size()));
+  return in_requests(drained, node.behaviour);
+}
+
+// One copy group's step (replicas, plan refinement 4): `waiting` and the queue describe one
+// copy, which sees demand_share of the group's arrivals; take_drained adds what all the
+// group's copies forward to `drained`. Returns one copy's fluid step.
+fluid::FluidStep Simulation::serve_copies(CopyGroup& group, const flow::Flow& units, SimTime dt,
+                                          Mode mode, flow::Flow& drained) {
+  const flow::Flow arrivals = units.scaled(group.demand_share);
+  const Rate per_copy = arrivals.total();
+  if (mode == Mode::settle) {
+    group.queue.settle(per_copy);
+    group.waiting = settled_waiting(arrivals, group.queue.backlog());
+  }
+  const flow::Flow content = queue_content(group.waiting, arrivals, dt);
+  const fluid::FluidStep copy_step = group.queue.advance(per_copy, dt);
+  drained += take_drained(group, content, copy_step);
+  return copy_step;
 }
 
 // Splits one copy's content (see serve) by the totals of its fluid step: keeps the
-// still-waiting part in `node.waiting` and returns the drained part as the group's
-// forwarded rate per op in units, content × (drain_per_s × group_scale) / content_total:
-// the drained units per copy (drain × dt) over dt, times the copies. An empty queue with
-// no arrivals has nothing to split.
-flow::Flow Simulation::take_drained(Node& node, const flow::Flow& content,
+// still-waiting part in `group.waiting` and returns the drained part as the group's
+// forwarded rate per op in units, content × (drain_per_s × copies) / content_total: the
+// drained units per copy (drain × dt) over dt, times the copies. An empty queue with no
+// arrivals has nothing to split.
+flow::Flow Simulation::take_drained(CopyGroup& group, const flow::Flow& content,
                                     const fluid::FluidStep& copy_step) {
-  const double content_total = content.total().per_second;  // units, see Node::waiting
+  const double content_total = content.total().per_second;  // units, see CopyGroup::waiting
   if (content_total <= 0.0) {
-    node.waiting.clear();
+    group.waiting.clear();
     return flow::Flow{};
   }
-  node.waiting = content.scaled(copy_step.backlog / content_total);
-  return content.scaled(copy_step.drain_per_s * node.group_scale / content_total);
+  group.waiting = content.scaled(copy_step.backlog / content_total);
+  return content.scaled(copy_step.drain_per_s * group.copies / content_total);
 }
 
 void Simulation::send(std::size_t index, const behaviours::Routed& routed, Mode mode) {
