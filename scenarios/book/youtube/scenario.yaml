@@ -1,0 +1,114 @@
+# System Design Interview vol. 1, ch. 14 — Video streaming (YouTube).
+# Book numbers: 5M DAU, 5 videos watched/user/day, 10% upload one video/day, 300 MB
+# average upload → ~290 streams/s, ~6 uploads/s, 150 TB/day of uploads. CDN serves
+# streams; uploads go straight to blob storage via presigned URLs; transcoding is a DAG.
+version: 1
+name: youtube
+seed: 1
+duration: 24h
+step: 100ms
+warmup: 5m
+
+datacenters:
+  us-east: {}
+  eu-west: {}
+
+nodes:
+  viewers_us:
+    type: client
+    dc: us-east
+    rate:
+      base: 200/s
+      wave: {shape: sine, period: 24h, amplitude: 0.6, peak_at: 21:00}
+    ops: {stream: 0.9, upload: 0.02, metadata: 0.08}
+    sizes: {stream: 50MB, upload: 300MB, metadata: 2KB}   # per request
+    keys: {zipf: 1.0, space: 10M}
+    timeout: 10s
+
+  viewers_eu:
+    type: client
+    dc: eu-west
+    rate:
+      base: 100/s
+      wave: {shape: sine, period: 24h, amplitude: 0.6, peak_at: 21:00}
+    ops: {stream: 0.9, upload: 0.02, metadata: 0.08}
+    sizes: {stream: 50MB, upload: 300MB, metadata: 2KB}
+    keys: {zipf: 1.0, space: 10M}
+    timeout: 10s
+
+  cdn_us: {type: cdn, dc: us-east, ttl: 24h, hit_ratio: che, origin: transcoded_store, capacity: 100GB/s}
+  cdn_eu: {type: cdn, dc: eu-west, ttl: 24h, hit_ratio: che, origin: transcoded_store, capacity: 50GB/s}
+
+  lb: {type: load_balancer, dc: us-east, policy: round_robin}
+
+  api:
+    type: service
+    dc: us-east
+    replicas: 6
+    capacity: 2k/s
+    latency: 1ms
+    ops:
+      metadata:
+        - {to: metadata_cache, op: read}
+        - {to: metadata_db, op: read, on: miss}
+      upload:                                  # returns a presigned URL; bytes go to blob directly
+        - {to: metadata_db, op: write}
+
+  metadata_cache: {type: cache, dc: us-east, eviction: lru, keys: 5M, hit_ratio: che, strategy: cache_aside}
+  metadata_db: {type: sql_db, dc: us-east, replicas: 3, capacity: 3k/s}
+
+  original_store:                              # raw uploads (S3-like)
+    type: blob_store
+    dc: us-east
+    capacity: 5GB/s
+    then: [{to: transcode_q, op: publish}]
+
+  transcode_q: {type: message_queue, dc: us-east, partitions: 32}
+
+  transcoders:                                 # DAG: inspect → encode (several resolutions) → thumbnails → watermark
+    type: worker_pool
+    dc: us-east
+    consumes: transcode_q
+    workers: 400
+    cost: 60s                                  # per 300 MB video
+    then:
+      - {to: transcoded_store, op: write, factor: 4}     # 4 output resolutions
+      - {to: completion_q, op: publish}
+
+  transcoded_store: {type: blob_store, dc: us-east, capacity: 10GB/s}
+
+  completion_q: {type: message_queue, dc: us-east, partitions: 4}
+  completion_handler:
+    type: worker_pool
+    dc: us-east
+    consumes: completion_q
+    workers: 4
+    cost: 5ms
+    then:
+      - {to: metadata_db, op: write}
+      - {to: metadata_cache, op: write}
+
+links:
+  - {from: viewers_us, to: cdn_us, dir: inout, ops: [stream]}
+  - {from: viewers_eu, to: cdn_eu, dir: inout, ops: [stream]}
+  - {from: cdn_us, to: transcoded_store, dir: inout}
+  - {from: cdn_eu, to: transcoded_store, dir: inout}          # cross-DC, 150 ms default
+  - {from: viewers_us, to: lb, dir: inout, ops: [metadata, upload]}
+  - {from: viewers_eu, to: lb, dir: inout, ops: [metadata, upload]}
+  - {from: lb, to: api, dir: inout}
+  - {from: api, to: metadata_cache, dir: inout}
+  - {from: api, to: metadata_db, dir: inout}
+  - {from: viewers_us, to: original_store, ops: [upload]}     # presigned direct upload
+  - {from: viewers_eu, to: original_store, ops: [upload]}
+  - {from: original_store, to: transcode_q}
+  - {from: transcode_q, to: transcoders}
+  - {from: transcoders, to: transcoded_store}
+  - {from: transcoders, to: completion_q}
+  - {from: completion_q, to: completion_handler}
+  - {from: completion_handler, to: metadata_db}
+  - {from: completion_handler, to: metadata_cache}
+
+slo:
+  - {metric: p99_latency, node: viewers_eu, op: stream, max: 2s}
+  - {metric: queue_lag, node: transcode_q, max: 30m}
+  - {metric: utilization, node: cdn_us, max: 0.8}
