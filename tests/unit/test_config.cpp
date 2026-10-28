@@ -2939,12 +2939,15 @@ TEST_CASE(
     REQUIRE(c.eviction == "lru");
     REQUIRE(c.ttl == 5min);
   }
-  SECTION("a cache with only a hit ratio gets cache_aside and write as its only write op") {
+  // The loader leaves an absent write_ops absent; model::write_ops_of applies the type's default
+  // (a cache's: write), so explain, the graph and the behaviours agree on one list.
+  SECTION("a cache with only a hit ratio gets cache_aside and the default write op, write") {
     const auto s =
         load_accepted("simsys_cache_defaults.yaml", cache_scenario("hit_ratio: {fixed: 0.5}"));
     const auto& c = s.nodes[0];
     REQUIRE(c.strategy == cache_aside);
-    REQUIRE(c.write_ops == std::vector<std::string>{"write"});
+    REQUIRE_FALSE(c.write_ops.has_value());
+    REQUIRE(simsys::model::write_ops_of(c) == std::vector<std::string>{"write"});
     REQUIRE_FALSE(c.backend.has_value());
     REQUIRE_FALSE(c.keys.has_value());
     REQUIRE_FALSE(c.eviction.has_value());
@@ -3101,9 +3104,18 @@ TEST_CASE("a sql database's shards, pool, replication lag and write ops are type
   // order of a default is not part of the contract.
   SECTION("the default write ops are write, insert, update and delete") {
     const auto s = load_accepted("simsys_sql_write_ops_default.yaml", db_scenario("replicas: 2"));
-    auto write_ops = s.nodes[0].write_ops;
+    REQUIRE_FALSE(s.nodes[0].write_ops.has_value());  // absent: the type's default applies
+    auto write_ops = simsys::model::write_ops_of(s.nodes[0]);
     std::ranges::sort(write_ops);
     REQUIRE(write_ops == std::vector<std::string>{"delete", "insert", "update", "write"});
+  }
+  // A stated list replaces the default, even when it is the cache's default `[write]`: the
+  // loader stores exactly what the scenario wrote, so `insert` is then a read.
+  SECTION("an explicit write_ops of just write on a sql database means exactly that") {
+    const auto s = load_accepted("simsys_sql_write_ops_write.yaml",
+                                 db_scenario("replicas: 2, write_ops: [write]"));
+    REQUIRE(s.nodes[0].write_ops == std::vector<std::string>{"write"});
+    REQUIRE(simsys::model::write_ops_of(s.nodes[0]) == std::vector<std::string>{"write"});
   }
   SECTION("shards of zero") {
     require_rejected("simsys_sql_shards_zero.yaml", db_scenario("shards: 0"),

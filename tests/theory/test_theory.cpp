@@ -1025,10 +1025,9 @@ TEST_CASE("a cache hit ratio of 1 sends nothing to the database and adds none of
 }
 
 // The write_back strategy (acknowledge a write from the cache, flush it to the store later: a
-// queue of dirty entries) and a cache's then steps ran only in the graph until phase 2b; now
-// the engine runs both, so a scenario that uses them is accepted. (What they do to the flow and
-// the latency is checked by the two cases below.)
-TEST_CASE("write_back caches and cache then steps run in phase 2b", "[theory]") {
+// queue of dirty entries) and a cache's then steps are run by the engine, so a scenario that uses
+// them is accepted. (What they do to the flow and the latency is checked by the cases below.)
+TEST_CASE("a scenario with a write_back cache or cache then steps is runnable", "[theory]") {
   SECTION("the write_back strategy") {
     auto s = cached_reads(0.8);
     s.nodes[2].strategy = CacheStrategy::write_back;
@@ -1041,8 +1040,11 @@ TEST_CASE("write_back caches and cache then steps run in phase 2b", "[theory]") 
     INFO((sim ? "" : sim.error().message));
     REQUIRE(sim.has_value());
   }
+  // The cache forwards its own misses, so web no longer fetches them (both would be a double
+  // fetch, which the graph refuses).
   SECTION("a cache's then steps") {
     auto s = cached_reads(0.8);
+    s.nodes[1].ops["read"].pop_back();  // web.read = [cache.read]
     s.nodes[2].then = {Step{.to = "db", .op = "read", .on = StepCondition::miss}};
     s.links.push_back(LinkSpec{.from = "cache", .to = "db", .latency = 0s});
     const auto g = Graph::build(s);
@@ -1052,6 +1054,59 @@ TEST_CASE("write_back caches and cache then steps run in phase 2b", "[theory]") 
     INFO((sim ? "" : sim.error().message));
     REQUIRE(sim.has_value());
   }
+}
+
+// Conservation through a saturated cache with then steps. 2000 requests/s (get 80 %, write
+// 20 %) reach a cache of 1000 capacity units/s where a write costs 2 units: demand 1600 + 2 x 400
+// = 2400 units/s, so once its waiting room (100 units) is full it drains f = 1000/2400 of what it
+// is sent and drops the rest. What it forwards is what it DRAINS, op for op, in requests:
+//   svc   (miss step, factor 2, h = 0.4): 1600 f x 0.6 x 2 = 800/s
+//   audit (always step):                   2000 f           = 833.3/s
+//   db    (write_back flush of the writes): 400 f           = 166.7/s
+// and the cache's own balance holds every step: backlog + demand dt = (drain + dropped) dt +
+// backlog after.
+TEST_CASE("a saturated cache forwards along its then steps only what it drains", "[theory]") {
+  Scenario s{.name = "saturated-cache", .version = 1, .duration = 10s};
+  NodeSpec cache{.id = "cache",
+                 .type = NodeType::cache,
+                 .capacity = Rate{1000},
+                 .latency = 1ms,
+                 .then = {Step{.to = "svc", .op = "q", .on = StepCondition::miss, .factor = 2.0},
+                          Step{.to = "audit", .op = "log"}},
+                 .cost = {{"write", 2.0}},
+                 .backend = "db",
+                 .hit_ratio = HitRatio{.fixed = 0.4},
+                 .strategy = CacheStrategy::write_back};
+  cache.advanced.queue_limit = 100;
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{2000}},
+                                           .op_shares = {{"get", 0.8}, {"write", 0.2}}}},
+             std::move(cache),
+             NodeSpec{.id = "svc", .type = NodeType::service, .capacity = Rate{10'000}},
+             NodeSpec{.id = "audit", .type = NodeType::service, .capacity = Rate{10'000}},
+             NodeSpec{.id = "db", .type = NodeType::service, .capacity = Rate{10'000}}};
+  s.links = {LinkSpec{.from = "u", .to = "cache", .latency = 0s},
+             LinkSpec{.from = "cache", .to = "svc", .latency = 0s},
+             LinkSpec{.from = "cache", .to = "audit", .latency = 0s},
+             LinkSpec{.from = "cache", .to = "db", .latency = 0s}};
+  const auto g = *Graph::build(s);
+  auto sim = *Simulation::create(g);
+  const auto cache_index = *g.index_of("cache");
+  double backlog = 0.0;
+  simsys::engine::StepRecord last;
+  sim.run({.duration = 2s, .step = 100ms}, [&](const auto& r) {
+    require_conserved(backlog, r.nodes[cache_index], 0.1);
+    backlog = r.nodes[cache_index].backlog;
+    last = r;
+  });
+  const auto& c = last.nodes[cache_index];
+  REQUIRE_THAT(c.demand_per_s, WithinRel(2400.0, 1e-9));
+  REQUIRE_THAT(c.drain_per_s, WithinRel(1000.0, 1e-9));
+  const double f = 1000.0 / 2400.0;
+  REQUIRE_THAT(last.nodes[*g.index_of("svc")].demand_per_s, WithinRel(1600 * f * 0.6 * 2, 1e-9));
+  REQUIRE_THAT(last.nodes[*g.index_of("audit")].demand_per_s, WithinRel(2000 * f, 1e-9));
+  REQUIRE_THAT(last.nodes[*g.index_of("db")].demand_per_s, WithinRel(400 * f, 1e-9));
 }
 
 // Search autocomplete (ch. 13): 1000 suggestions/s hit the browser cache, which answers 40 %

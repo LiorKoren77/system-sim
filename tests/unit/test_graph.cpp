@@ -1120,6 +1120,94 @@ TEST_CASE("a then step on miss and a read_through backend both fetching the miss
           "node 'c': a then step on miss and a read_through backend both fetch the miss");
 }
 
+// The same double fetch with the roles swapped: the cache forwards its own misses (`then` on
+// miss), so a service that also fetches each miss after asking it (`on: miss` after the cache
+// step) would send every miss to the store twice. Whatever the strategy: under the write
+// strategies a read miss is still the application's to fetch, as under cache_aside.
+TEST_CASE("a service miss step after a cache whose own then step fetches the miss is an error",
+          "[graph]") {
+  for (const auto strategy : {CacheStrategy::cache_aside, CacheStrategy::write_through,
+                              CacheStrategy::write_around, CacheStrategy::write_back}) {
+    CAPTURE(static_cast<int>(strategy));
+    auto c = cache("c", 0.75, strategy, strategy == CacheStrategy::cache_aside ? "" : "db");
+    c.then = {Step{.to = "db", .op = "read", .on = StepCondition::miss}};
+    auto s = cached_web(std::move(c), {Step{.to = "c", .op = "read"},
+                                       Step{.to = "db", .op = "read", .on = StepCondition::miss}});
+    if (strategy == CacheStrategy::cache_aside) {
+      s.links.push_back(LinkSpec{.from = "c", .to = "db", .dir = Direction::inout});
+    }
+    const auto built = Graph::build(s);
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message ==
+            "node 'web': an 'on: miss' step cannot follow cache 'c', whose own then step on miss "
+            "already fetches the miss");
+  }
+}
+
+// A miss waits for what its miss steps fetch: the cache answers a miss only after the next
+// tier has. A parallel miss step would be timed beside the lookup instead of after it, the
+// reason a service's miss step must be sequential too, so it is refused.
+TEST_CASE("a parallel miss then step is refused", "[graph]") {
+  auto browser_cache = cache("c", 0.4, CacheStrategy::cache_aside);
+  browser_cache.id = "browser_cache";
+  browser_cache.then = {
+      Step{.to = "lb", .op = "suggest", .on = StepCondition::miss, .mode = StepMode::parallel}};
+  const auto built = Graph::build(browser_front(std::move(browser_cache)));
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'browser_cache': a then step on miss must be sequential (a miss waits for it)");
+}
+
+// A cache whose strategy writes to its store already sends every write there (its backend hop).
+// A `then` step that sends the same op to the same node would send each write a second time, and
+// under write_back it would also be mistaken for the asynchronous flush. Refused; a then step to
+// the store with another op (an audit record, say) is a different call and builds.
+TEST_CASE("a then step that duplicates the cache's backend hop is refused", "[graph]") {
+  const std::vector<Step> to_cache{Step{.to = "c", .op = "write"}};
+  const auto writing_strategies = {CacheStrategy::write_through, CacheStrategy::write_back};
+  SECTION("the same op to the backend") {
+    for (const auto strategy : writing_strategies) {
+      CAPTURE(static_cast<int>(strategy));
+      auto c = cache("c", 0.5, strategy, "db");
+      c.then = {Step{.to = "db", .op = "write"}};
+      const auto built = Graph::build(cached_web(std::move(c), to_cache));
+      REQUIRE_FALSE(built.has_value());
+      REQUIRE(built.error().message == "node 'c': then step to 'db' duplicates its backend hop");
+    }
+  }
+  SECTION("another op to the backend is a call of its own, waited for") {
+    for (const auto strategy : writing_strategies) {
+      CAPTURE(static_cast<int>(strategy));
+      auto c = cache("c", 0.5, strategy, "db");
+      c.then = {Step{.to = "db", .op = "audit"}};
+      const auto built = Graph::build(cached_web(std::move(c), to_cache));
+      INFO((built ? "" : built.error().message));
+      REQUIRE(built.has_value());
+      REQUIRE_FALSE(
+          built->is_async_hop(*built->index_of("c"), "write", *built->index_of("db"), "audit"));
+    }
+  }
+}
+
+// A then step on miss carries the misses of the READS only (Graph::then_fraction). A cache that
+// only ever receives writes therefore sends nothing along it, and the op it would send arrives
+// nowhere: a load balancer behind it whose links do not carry that op is no error.
+TEST_CASE("a miss then step on a cache that only receives writes is not a false refusal",
+          "[graph]") {
+  auto c = cache("c", 0.5, CacheStrategy::cache_aside);
+  c.then = {Step{.to = "lb", .op = "other", .on = StepCondition::miss}};
+  Scenario s{.name = "writes-only", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"write", 1.0}}), std::move(c),
+             load_balancer("lb", LbPolicy::round_robin), service("s")};
+  s.links = {LinkSpec{.from = "u", .to = "c", .dir = Direction::inout},
+             LinkSpec{.from = "c", .to = "lb", .dir = Direction::inout},
+             LinkSpec{.from = "lb", .to = "s", .dir = Direction::inout, .ops = {"write"}}};
+  const auto built = Graph::build(s);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE(built->arriving_ops(*built->index_of("lb")).empty());
+}
+
 // Write-back (general caching practice): the cache acknowledges a write itself and flushes it
 // to the store later. Nobody waits for the flush, so the hop from the cache to the backend is
 // asynchronous: it forwards flow but adds no latency to the caller.
@@ -1142,6 +1230,7 @@ TEST_CASE("a write_back cache needs a backend and a link, and its flush hop is a
     const auto built =
         Graph::build(cached_web(cache("cache", 0.8, CacheStrategy::write_back), to_cache));
     REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message == "node 'cache': strategy write_back needs a backend");
   }
   SECTION("with a backend but no link from the cache it is refused") {
     auto s = cached_web(cache("cache", 0.8, CacheStrategy::write_back, "db"), to_cache);
