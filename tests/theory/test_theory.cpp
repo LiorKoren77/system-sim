@@ -19,6 +19,7 @@ import simsys.engine;
 import simsys.fluid;
 import simsys.graph;
 import simsys.model;
+import simsys.workload;
 
 // A note for test authors: `Approx(x).margin(m)` passes when the value is within the
 // absolute margin m OR within Approx's default relative epsilon (about 1.19e-5), so a
@@ -439,4 +440,53 @@ TEST_CASE("run emits ceil(duration / step) records", "[theory]") {
   n = 0;
   sim2.run({.duration = 1s, .step = 300ms}, [&](const auto&) { ++n; });
   REQUIRE(n == 4);  // 0, 300, 600, 900 ms: the last step runs past the duration
+}
+
+TEST_CASE("demand follows a sine wave through the engine", "[theory]") {
+  Scenario s = mm1(500);
+  s.nodes[0].workload->curve.wave = simsys::workload::Wave{
+      .shape = simsys::workload::WaveShape::sine, .period = 1s, .amplitude = 0.5, .peak_at = 0s};
+  auto sim = *Simulation::create(*Graph::build(s));
+  REQUIRE_THAT(sim.step(0s, 100ms).nodes[1].demand_per_s, WithinRel(750.0, 1e-9));
+  for (int i = 1; i < 5; ++i) (void)sim.step(i * 100ms, 100ms);
+  REQUIRE_THAT(sim.step(500ms, 100ms).nodes[1].demand_per_s, WithinRel(250.0, 1e-9));
+}
+
+TEST_CASE("two runs with the same seed are identical and a different seed is not", "[theory]") {
+  Scenario s = mm1(500);
+  s.nodes[0].workload->noise = simsys::workload::Noise{.sigma = 0.2, .correlation = 1s};
+  const auto collect = [&](int seed) {
+    s.seed = seed;
+    std::vector<double> d;
+    (*Simulation::create(*Graph::build(s))).run({.duration = 2s, .step = 100ms},
+                                                [&](const auto& r) { d.push_back(r.nodes[1].demand_per_s); });
+    return d;
+  };
+  REQUIRE(collect(1) == collect(1));
+  REQUIRE(collect(1) != collect(2));
+}
+
+TEST_CASE("estimate ignores noise and evaluates the curve at time zero", "[theory]") {
+  Scenario s = mm1(500);
+  s.nodes[0].workload->noise = simsys::workload::Noise{.sigma = 0.5, .correlation = 1s};
+  s.nodes[0].workload->curve.spikes = {simsys::workload::Spike{.at = 0s, .duration = 1s, .factor = 2}};
+  const auto e = (*Simulation::create(*Graph::build(s))).estimate();
+  REQUIRE_THAT(e.nodes[1].demand_per_s, WithinRel(1000.0, 1e-12));
+}
+
+TEST_CASE("a points-only client offers the interpolated rate", "[theory]") {
+  Scenario s = mm1(0);
+  s.nodes[0].workload->curve.points = simsys::workload::Points{.at = {{0s, Rate{100}}, {1s, Rate{300}}}};
+  auto sim = *Simulation::create(*Graph::build(s));
+  REQUIRE_THAT(sim.step(0s, 100ms).nodes[1].demand_per_s, WithinRel(100.0, 1e-12));
+  for (int i = 1; i < 5; ++i) (void)sim.step(i * 100ms, 100ms);
+  REQUIRE_THAT(sim.step(500ms, 100ms).nodes[1].demand_per_s, WithinRel(200.0, 1e-12));
+}
+
+TEST_CASE("noise never produces a negative demand", "[theory]") {
+  Scenario s = mm1(500);
+  s.nodes[0].workload->noise = simsys::workload::Noise{.sigma = 3.0, .correlation = 100ms};
+  (*Simulation::create(*Graph::build(s))).run({.duration = 10s, .step = 100ms}, [&](const auto& r) {
+    REQUIRE(r.nodes[1].demand_per_s >= 0.0);
+  });
 }
