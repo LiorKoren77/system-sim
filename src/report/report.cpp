@@ -847,9 +847,10 @@ template <class T>
          id_algorithm_meaning(*spec.id_algorithm, spec.capacity.has_value()) + ")";
 }
 
-// "write_ops=write", plus a note when no op that reaches the cache is one of them: its write
-// strategy then never acts. A note, not an error: a read-only cache is legitimate, but a write
-// op named differently in the steps (`set`, `put`) is a common slip.
+// "write_ops=write", plus a note when no op that reaches the cache (or blob store) is one of
+// them: a cache's write strategy then never acts, a blob store answers everything at its first
+// megabyte. A note, not an error: a read-only cache or store is legitimate, but a write op named
+// differently in the steps (`set`, `put`, `upload`) is a common slip.
 [[nodiscard]] std::string write_ops_summary(const graph::Graph& g, std::size_t cache) {
   const auto write_ops = model::write_ops_of(g.nodes()[cache].spec);
   // C++20 std::ranges::none_of takes the range itself instead of a begin/end pair; C++23
@@ -1056,6 +1057,20 @@ struct QueueProvenance {
   return defaults::is_byte_sized(spec) ? " per MB" : "";
 }
 
+// " MB slots" after a byte-sized node's c: each of its servers moves one megabyte at a time
+// (c = MB/s × the time of one MB, Little's law), and an object holds one for its whole transfer
+// (behaviours::MegabyteService). Nothing after a count of servers.
+[[nodiscard]] std::string_view per_slot(const model::NodeSpec& spec) {
+  return defaults::is_byte_sized(spec) ? " MB slots" : "";
+}
+
+// " MB" after a byte-sized node's queue_limit: its waiting room holds capacity units, here
+// megabytes (the generic default of 1000 units is 1000 MB there, chosen). Nothing after a count
+// of units that are requests (or cost-weighted requests).
+[[nodiscard]] std::string_view queued_unit(const model::NodeSpec& spec) {
+  return defaults::is_byte_sized(spec) ? " MB" : "";
+}
+
 [[nodiscard]] QueueProvenance queue_provenance(const graph::ResolvedNode& node) {
   if (is_leaky_bucket(node.spec)) return {"(limit)", "(limit)", "(leak slot)", "(burst)"};
   if (graph::pool_binds(node)) return pool_provenance(node);
@@ -1084,8 +1099,10 @@ struct QueueProvenance {
       "capacity=" + fmt_units(spec, cap.service_rate.per_second) + " " + source.capacity,
       "service_time=" + fmt_duration(cap.service_time_s) + std::string{per_unit(spec)} + " " +
           std::string{source.service_time},
-      "c=" + std::to_string(cap.concurrency) + " " + std::string{source.concurrency},
-      "queue_limit=" + num(cap.queue_limit, 6) + " " + std::string{source.queue_limit},
+      "c=" + std::to_string(cap.concurrency) + std::string{per_slot(spec)} + " " +
+          std::string{source.concurrency},
+      "queue_limit=" + num(cap.queue_limit, 6) + std::string{queued_unit(spec)} + " " +
+          std::string{source.queue_limit},
       "variability=" + num(cap.service_variability, 3),
       "burstiness=" + num(cap.burstiness, 3)};
   return join(parts, "  ");
@@ -1106,18 +1123,27 @@ struct QueueProvenance {
   return "  sizes: " + join(sizes, ", ");
 }
 
+// "  write_ops=upload" on a blob store: the ops it answers at their last byte, every other op at
+// its first megabyte (behaviours::MegabyteService), with write_ops_summary's note when none of
+// them reaches it. Nothing on any other type (a cache shows its own in cache_summary).
+[[nodiscard]] std::string blob_store_summary(const graph::Graph& g, std::size_t node) {
+  if (g.nodes()[node].spec.type != model::NodeType::blob_store) return {};
+  return " " + write_ops_summary(g, node);
+}
+
 [[nodiscard]] std::string explain_nodes(const graph::Graph& g) {
   std::vector<Row> rows;
   for (std::size_t i = 0; i < g.nodes().size(); ++i) {
     const auto& node = g.nodes()[i];
     const bool client = node.spec.type == model::NodeType::client;
-    rows.push_back({{node.spec.id},
-                    {std::string{model::to_string(node.spec.type)}},
-                    {client ? client_details(node.spec)
-                            : server_details(node) + cost_summary(g, i) + size_summary(g, i) +
-                                  balancing_summary(g, i) + limiter_summary(node.spec) +
-                                  cache_summary(g, i) + cdn_summary(g, i) + database_summary(node) +
-                                  id_generator_summary(node.spec)}});
+    rows.push_back(
+        {{node.spec.id},
+         {std::string{model::to_string(node.spec.type)}},
+         {client ? client_details(node.spec)
+                 : server_details(node) + cost_summary(g, i) + size_summary(g, i) +
+                       blob_store_summary(g, i) + balancing_summary(g, i) +
+                       limiter_summary(node.spec) + cache_summary(g, i) + cdn_summary(g, i) +
+                       database_summary(node) + id_generator_summary(node.spec)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }

@@ -478,7 +478,8 @@ struct NodeSpec {
   // fit), `eviction` (lru, lfu, fifo or ttl) and `ttl`. A `backend` on a cache names the store the
   // cache itself calls (read_through, write_through, write_around, write_back); a CDN reads
   // `hit_ratio`, `keys`, `ttl` and `write_ops` too (see `origin` below).
-  // `write_ops` (caches, CDNs and SQL databases): absent means the TYPE's default, present means
+  // `write_ops` (caches, CDNs, SQL databases and blob stores, which answer a write at its last
+  // byte and a read at its first megabyte): absent means the TYPE's default, present means
   // exactly the list the scenario wrote; the loader stores it as written and every reader asks
   // write_ops_of. An optional rather than a vector pre-filled with a default, because the two
   // types' defaults differ and a pre-filled `[write]` could not be told from a database's

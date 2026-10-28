@@ -21,8 +21,8 @@ that fetch their misses from an origin, and id generators (snowflake, ticket ser
 Refused requests are counted apart from dropped ones (`reject_rate`), and a request counts
 as answered unless it was refused or dropped. Six scenarios run end to end, the
 [URL shortener](scenarios/book/url-shortener/) of ch. 8 among them (list below); the other
-7 book systems and the kv-store lab validate and `explain`, waiting for phases 2c (blob
-store, queues, workers, external sinks, byte flows, `sweep`) and 3. The scenario language is
+7 book systems and the kv-store lab validate and `explain`, waiting for phases 2c (blob-store
+events, queues, workers, external sinks, link bandwidth, `sweep`) and 3. The scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.3).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
@@ -179,7 +179,8 @@ $ simsys explain scenarios/book/youtube/scenario.yaml
 
 What runs today: clients, services, load balancers, rate limiters, caches (a fixed or a
 Che hit ratio), SQL databases (primary, read replicas, shards), CDNs and blob stores (sized in
-bytes, they count megabytes; a blob store's `then` events wait for phase 2c) and id generators.
+bytes, they count megabytes, wait for whole objects and answer a write at its last byte, a read
+at its first megabyte; a blob store's `then` events wait for phase 2c) and id generators.
 These six scenarios run end to end:
 
 - [`tutorial/hello`](scenarios/tutorial/hello/), [`tutorial/chain`](scenarios/tutorial/chain/):
@@ -193,7 +194,7 @@ These six scenarios run end to end:
   (peak 19.2k/s): limiter, 8 stateless web servers, a Che cache (h = 0.881), snowflake ids
   and a SQL database in 3 shards; both SLOs pass (redirect p99 7.49 ms, nothing dropped).
 
-Every other node type (queues, workers, blob stores, ...) already validates and appears in
+Every other node type (queues, workers, external sinks, ...) already validates and appears in
 `explain` with its resolved numbers, but `estimate` and `run` stop with "which run/estimate do
 not support yet (phase 2)" and exit 1. A `sweep` command
 (`--param nodes.users.rate.base=1k/s..100k/s:10`) is planned for phase 2c.

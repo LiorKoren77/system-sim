@@ -997,6 +997,51 @@ class SqlDbBehaviour {
   std::map<std::string, double, std::less<>> cost_by_op_;
 };
 
+// How a byte-sized node (defaults::is_byte_sized: a blob store, a CDN sized in bytes) spends its
+// time on one request (plan 2c refinement 2; review of Task 3 at a8b6cb4, I1 and I2; the model
+// and its bounds are in BlobStoreBehaviour's header). Per op that reaches the node, resolved once
+// at build from its size in megabytes MB_o (graph::op_cost) and the node's service time s_MB, the
+// time of ONE megabyte:
+//   object time  MB_o × s_MB                     how long one request holds one of the c slots:
+//                                                its whole transfer
+//   answer time  max(MB_o, 1) × s_MB for a write  when its client has the answer once it is in
+//                s_MB for every other op          service: a write's last byte, a read's first
+//                                                megabyte (never under one megabyte's time)
+// A CDN takes no writes (graph::Graph::build refuses them), so all its answers are first
+// megabytes.
+class MegabyteService {
+ public:
+  MegabyteService(const graph::Graph& g, std::size_t self);
+
+  // The rate-weighted mean object time, what Erlang C is fed as the service time:
+  //   s_obj = Σ_op rate_op × MB_op × s_MB / Σ_op rate_op
+  // over `requests` (requests per second per op, the step's arrivals). Empty when nothing
+  // arrives: there is no mix to weigh.
+  [[nodiscard]] std::optional<double> mean_object_time_s(const flow::Flow& requests) const;
+
+  // The node's own sojourn for `op`: the queue's `wait` plus the op's answer time, whose
+  // variance is cs² × answer² (the node's service variability; exponential when cs² = 1),
+  // independent of the wait. An op that never reaches the node is answered like a read.
+  [[nodiscard]] flow::LatencyEstimate sojourn(std::string_view op,
+                                              const flow::LatencyEstimate& wait) const;
+
+  // A read's sojourn whatever its op: the wait plus one megabyte's time.
+  [[nodiscard]] flow::LatencyEstimate first_megabyte(const flow::LatencyEstimate& wait) const;
+
+ private:
+  struct Times {
+    double object_s{};
+    double answer_s{};
+  };
+  [[nodiscard]] Times times_of(std::string_view op) const;
+  [[nodiscard]] flow::LatencyEstimate answered_after(const flow::LatencyEstimate& wait,
+                                                     double answer_s) const;
+
+  double megabyte_s_{};                                    // s_MB
+  double service_variability_{};                           // cs²
+  std::map<std::string, Times, std::less<>> times_by_op_;  // every op that reaches the node
+};
+
 // Models: the CDN of System Design Interview (Alex Xu, vol. 1) ch. 1 ("Content delivery network":
 // geographically dispersed servers that keep static files close to the user) and ch. 14 (the
 // CDN that streams YouTube's videos); ch. 13's browser cache sits in the same place, one hop
@@ -1022,10 +1067,11 @@ class SqlDbBehaviour {
 // Bytes (plan 2c refinement 2): a CDN sized in bytes (`capacity: 100GB/s`) counts megabytes, as a
 // blob store does (BlobStoreBehaviour has the model and its bounds): 100k units/s of 1 MB, a
 // 50 MB stream costs 50 of them, the 10 ms service time is one megabyte's, so c = 100k/s × 10 ms
-// = 1000 streams in flight and the CDN saturates at 100e9 / 50e6 = 2k streams/s. What it forwards
-// to the origin is still the miss share of the REQUESTS: a cost prices work here, it does not
-// multiply requests. A CDN sized in requests (the default 100k/s) charges 1 per request whatever
-// its size.
+// = 1000 megabyte slots and the CDN saturates at 100e9 / 50e6 = 2k streams/s. Its queue waits
+// for whole streams (a 50 MB stream holds a slot 0.5 s: MegabyteService) and a stream, a read,
+// is answered at its first megabyte. What it forwards to the origin is still the miss share of
+// the REQUESTS: a cost prices work here, it does not multiply requests. A CDN sized in requests
+// (the default 100k/s) charges 1 per request whatever its size.
 // Ignored: the TTL and the stale content it serves (`ttl` is accepted and not modelled), a cold
 // edge warming up, invalidation, ch. 1's "CDN fallback" (the clients going to the origin while
 // the CDN is down: phase 3's faults), the choice of the nearest PoP (a client's links say which
@@ -1035,7 +1081,7 @@ class SqlDbBehaviour {
 // cache, so CdnBehaviour holds a CacheBehaviour and forwards route/response/delivered to it
 // rather than restating them. graph::Graph resolves the origin as the cache's backend
 // (ResolvedNode::backend) with the read_through share, which is all CacheBehaviour reads. Only
-// cost() is its own: a cache counts requests, a CDN may count megabytes.
+// cost() and megabytes() are its own: a cache counts requests, a CDN may count megabytes.
 class CdnBehaviour {
  public:
   CdnBehaviour(const graph::Graph& g, std::size_t self);
@@ -1061,36 +1107,59 @@ class CdnBehaviour {
     return cache_.delivered(op, own, downstream);
   }
 
+  // How the CDN times a stream when it counts megabytes; null when it counts requests.
+  [[nodiscard]] const MegabyteService* megabytes() const {
+    return megabytes_ ? &*megabytes_ : nullptr;
+  }
+
  private:
   CacheBehaviour cache_;
   std::map<std::string, double, std::less<>> cost_by_op_;  // every op that reaches the CDN
+  std::optional<MegabyteService> megabytes_;               // sized in bytes only
 };
 
 // Models: the blob storage of System Design Interview (Alex Xu, vol. 1) ch. 14 ("Design YouTube":
 // the original storage that keeps the uploaded videos and the transcoded storage the CDN fetches
 // from) and ch. 15 ("Design Google Drive": the cloud storage, S3 in the book, that keeps the
-// file blocks, and its cold storage). Plan 2c refinement 2. Captured: a store whose capacity is
-// a byte rate counts MEGABYTES (defaults::byte_unit). Its capacity is bytes/s ÷ 1 MB units/s
-// (spec §6's default "blob 500 MB/s" is 500 units/s), a request costs its size in megabytes
-// (graph::op_cost: Graph::request_bytes / 1 MB, a 50 MB upload 50 units, a 2 KB read 0.002), and
-// its service time is ONE megabyte's (default 40 ms: the book's "read 1 MB sequentially from
-// disk", 30 ms, plus "... from the network", 10 ms), so Little's law gives c = 500/s × 40 ms = 20
-// transfers at once. It serves every op the same way (a byte is a byte, read or written) and
-// forwards nothing: a leaf, as a database is.
-//   demand   = Σ_op rate_op × size_op / 1 MB   units/s; rho = demand / capacity
-//   response = Wq + one megabyte's service time (M/M/c's wait, Erlang C, over the units)
-// The response is the time to FIRST BYTE, the small-object bound. A 2 KB read costs 0.002 units
-// but is answered in the whole 40 ms of one unit (an upper bound for small objects: a real store
-// answers it in about a disk seek), and a 50 MB object's other 49 MB are not added: the client
-// reads the rest as it streams in, overlapping the transfer, and the model's response time is
-// when the answer starts (a 300 MB upload at 25 MB/s takes 12 s, which no reported percentile
-// shows). The capacity does count every megabyte, so large objects queue everyone behind them.
+// file blocks, and its cold storage). Plan 2c refinement 2, with the review of Task 3 at a8b6cb4
+// (I1, I2). Captured: a store whose capacity is a byte rate counts MEGABYTES
+// (defaults::byte_unit). Its capacity is bytes/s ÷ 1 MB units/s (spec §6's default "blob
+// 500 MB/s" is 500 units/s), a request costs its size in megabytes (graph::op_cost:
+// Graph::request_bytes / 1 MB, a 50 MB upload 50 units, a 2 KB read 0.002), and its service time
+// s_MB is ONE megabyte's (default 40 ms: the book's "read 1 MB sequentially from disk", 30 ms,
+// plus "... from the network", 10 ms), so Little's law gives c = 500/s × 40 ms = 20 megabyte
+// slots. It forwards nothing: a leaf, as a database is.
+// The batch view: each request is a BATCH of megabytes that holds one slot for its whole
+// transfer, MB_o × s_MB (a 50 MB object 2 s). So the queue is M/M/c over objects, with c slots
+// and the rate-weighted mean object time (MegabyteService::mean_object_time_s), the honest
+// first-order model of a store whose requests differ in size:
+//   demand   = Σ_op rate_op × MB_op           units (MB) per second; rho = demand / capacity
+//   s_obj    = Σ_op rate_op × MB_op × s_MB / Σ_op rate_op      the mean time one object holds
+//   rho      = (Σ rate) × s_obj / c = demand / capacity         a slot (Little's law: the same
+//                                                               rho as in megabytes)
+//   Wq       = Erlang C(c, rho) × s_obj / (c (1 − rho))         M/M/c's mean wait (Erlang C)
+// Feeding Erlang C one megabyte's time instead would understate a whole object's wait by its size
+// in MB: at rho 0.9, 50 MB objects at a default store wait C(20, 0.9) × 2 s / (20 × 0.1) =
+// 0.55 s, where 1 MB units would say 0.5508 × 40 ms / 2 = 11 ms.
+// When a request is answered depends on its direction (MegabyteService::sojourn):
+//   a write (an op in `write_ops`, default `write`)   response = Wq + MB_o × s_MB, its LAST
+//                                                     byte: a PUT is acknowledged once stored (a
+//                                                     300 MB upload at 40 ms per MB: 12 s + Wq)
+//   a read (every other op)                           response = Wq + s_MB, its FIRST megabyte:
+//                                                     the client reads the rest as it streams in,
+//                                                     overlapping the transfer
+// Both are at least one megabyte's time: a 2 KB request costs 0.002 units but is answered in the
+// whole 40 ms of one unit (an upper bound for small objects: a real store answers it in about a
+// disk seek). The overlap argument holds for reads and streams only, and it understates a large
+// read that the client needs whole before it can act (a 1 GB file downloaded to be opened takes
+// 40 s, not 40 ms). The capacity counts every megabyte, so large objects queue everyone behind
+// them.
 // Ignored: durability (replication across regions, erasure coding: the store never loses an
 // object and never fails), multipart and resumable uploads (an object is one request), lifecycle
-// rules (moving old objects to cold storage), that a request's megabytes arrive together (an M^X
-// batch, which waits longer than the Poisson units the queue assumes), and `then` steps: they
-// are event notifications (S3 event notifications, ch. 14's "transcoding starts when the upload
-// completes"), phase 2c Task 4; until then the engine refuses a store that has them.
+// rules (moving old objects to cold storage), the spread of object sizes (an M/G/c with mixed
+// sizes waits longer than the M/M/c at their mean: Kingman's (1 + cs²)/2 factor), and `then`
+// steps: they are event notifications (S3 event notifications, ch. 14's "transcoding starts when
+// the upload completes"), phase 2c Task 4; until then the engine refuses a store that has them.
 class BlobStoreBehaviour {
  public:
   BlobStoreBehaviour(const graph::Graph& g, std::size_t self);
@@ -1115,8 +1184,15 @@ class BlobStoreBehaviour {
     return own;
   }
 
+  // How the store times an object (the class comment); null for a store whose capacity the
+  // scenario states in requests, which counts and times requests like any server.
+  [[nodiscard]] const MegabyteService* megabytes() const {
+    return megabytes_ ? &*megabytes_ : nullptr;
+  }
+
  private:
   std::map<std::string, double, std::less<>> cost_by_op_;  // every op that reaches the store
+  std::optional<MegabyteService> megabytes_;               // sized in bytes only
 };
 
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
@@ -1654,10 +1730,70 @@ Routed SqlDbBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt
   return detail::serve_everything(in);
 }
 
+// ---- MegabyteService ----
+
+MegabyteService::MegabyteService(const graph::Graph& g, std::size_t self)
+    : megabyte_s_{g.nodes()[self].capacity.service_time_s},
+      service_variability_{g.nodes()[self].capacity.service_variability} {
+  const auto write_ops = model::write_ops_of(g.nodes()[self].spec);
+  for (const auto& op : g.arriving_ops(self)) {
+    const double megabytes = graph::op_cost(g, self, op);
+    const bool write = std::ranges::contains(write_ops, op);
+    times_by_op_.emplace(
+        op, Times{.object_s = megabytes * megabyte_s_,
+                  .answer_s = write ? std::max(megabytes, 1.0) * megabyte_s_ : megabyte_s_});
+  }
+}
+
+std::optional<double> MegabyteService::mean_object_time_s(const flow::Flow& requests) const {
+  double rate_per_s = 0.0;
+  double busy = 0.0;  // Σ rate × object time: slots busy per second of arrivals
+  for (const auto& [op, rate] : requests.entries()) {
+    rate_per_s += rate.per_second;
+    busy += rate.per_second * times_of(op).object_s;
+  }
+  if (rate_per_s <= 0.0) return std::nullopt;
+  return busy / rate_per_s;
+}
+
+flow::LatencyEstimate MegabyteService::sojourn(std::string_view op,
+                                               const flow::LatencyEstimate& wait) const {
+  return answered_after(wait, times_of(op).answer_s);
+}
+
+flow::LatencyEstimate MegabyteService::first_megabyte(const flow::LatencyEstimate& wait) const {
+  return answered_after(wait, megabyte_s_);
+}
+
+// The wait plus a service of mean `answer_s` and variance cs² × answer_s², independent of it.
+flow::LatencyEstimate MegabyteService::answered_after(const flow::LatencyEstimate& wait,
+                                                      double answer_s) const {
+  return flow::LatencyEstimate{
+      .mean_s = wait.mean_s + answer_s,
+      .variance_s2 = wait.variance_s2 + service_variability_ * answer_s * answer_s};
+}
+
+MegabyteService::Times MegabyteService::times_of(std::string_view op) const {
+  const auto found = times_by_op_.find(op);
+  if (found == times_by_op_.end()) return Times{.object_s = megabyte_s_, .answer_s = megabyte_s_};
+  return found->second;
+}
+
+namespace detail {
+// The megabyte timing only when the node counts megabytes (defaults::is_byte_sized).
+[[nodiscard]] std::optional<MegabyteService> megabytes_if_byte_sized(const graph::Graph& g,
+                                                                     std::size_t self) {
+  if (!defaults::is_byte_sized(g.nodes()[self].spec)) return std::nullopt;
+  return MegabyteService{g, self};
+}
+}  // namespace detail
+
 // ---- CdnBehaviour ----
 
 CdnBehaviour::CdnBehaviour(const graph::Graph& g, std::size_t self)
-    : cache_{g, self}, cost_by_op_{detail::arriving_op_costs(g, self)} {}
+    : cache_{g, self},
+      cost_by_op_{detail::arriving_op_costs(g, self)},
+      megabytes_{detail::megabytes_if_byte_sized(g, self)} {}
 
 double CdnBehaviour::cost(std::string_view op) const {
   return detail::cost_in(cost_by_op_, op);
@@ -1667,7 +1803,8 @@ double CdnBehaviour::cost(std::string_view op) const {
 
 // Graph::build resolved every arriving op's size (a byte-sized node refuses an unsized one).
 BlobStoreBehaviour::BlobStoreBehaviour(const graph::Graph& g, std::size_t self)
-    : cost_by_op_{detail::arriving_op_costs(g, self)} {}
+    : cost_by_op_{detail::arriving_op_costs(g, self)},
+      megabytes_{detail::megabytes_if_byte_sized(g, self)} {}
 
 double BlobStoreBehaviour::cost(std::string_view op) const {
   return detail::cost_in(cost_by_op_, op);

@@ -211,3 +211,41 @@ TEST_CASE("a NaN demand propagates instead of being served", "[fluid]") {
   const auto s = q.advance(Rate{std::numeric_limits<double>::quiet_NaN()}, 100ms);
   REQUIRE(std::isnan(s.drain_per_s));
 }
+
+// The step reports its queueing wait apart from the sojourn: the M/M/1 node above at rho 0.5
+// waits Wq = 1 ms (variance 3e-6 s²), and its sojourn adds one service time of 1 ms (variance
+// cs² × S² = 1e-6 s²). A byte-sized node adds each op's own service to the wait instead
+// (engine::Simulation::own_sojourn).
+TEST_CASE("a step reports the queueing wait apart from the service time", "[fluid]") {
+  FluidQueue q{web()};
+  const auto s = q.advance(Rate{500}, 100ms);
+  REQUIRE_THAT(s.wait.mean_s, WithinRel(0.001, 1e-12));
+  REQUIRE_THAT(s.wait.variance_s2, WithinRel(3e-6, 1e-12));
+  REQUIRE_THAT(s.latency.mean_s, WithinRel(s.wait.mean_s + 0.001, 1e-12));
+  REQUIRE_THAT(s.latency.variance_s2, WithinRel(s.wait.variance_s2 + 1e-6, 1e-12));
+}
+
+// A byte-sized node's queue is fed the mean whole object's time each step (review of plan 2c
+// Task 3, I1) while its rate and c stay those of its megabytes, so rho does not move and the
+// wait scales with the time: a 20-slot store of 500 MB/s at 250 MB/s is at rho 0.5 whether one
+// slot is held 40 ms (one MB) or 2 s (a 50 MB object), and Erlang C's wait is
+// C(20, 0.5) × s / (20 × 0.5): 0.0149 ms against 0.746 ms.
+TEST_CASE("setting the service time changes the Erlang wait and leaves rho alone", "[fluid]") {
+  FluidQueue q{Capacity{.service_rate = Rate{500}, .service_time_s = 0.040, .concurrency = 20}};
+  const auto per_megabyte = q.advance(Rate{250}, 100ms);
+  q.set_service_time(2.0);
+  const auto per_object = q.advance(Rate{250}, 100ms);
+  REQUIRE_THAT(per_megabyte.rho, WithinRel(0.5, 1e-12));
+  REQUIRE_THAT(per_object.rho, WithinRel(0.5, 1e-12));
+  REQUIRE_THAT(per_megabyte.wait.mean_s, WithinAbs(1.4925e-5, 1e-9));
+  REQUIRE_THAT(per_object.wait.mean_s, WithinAbs(7.4623e-4, 1e-8));
+  REQUIRE_THAT(per_object.latency.mean_s, WithinRel(per_object.wait.mean_s + 2.0, 1e-12));
+}
+
+TEST_CASE("a service time that is not positive is a programmer error", "[fluid]") {
+  FluidQueue q{web()};
+  REQUIRE_THROWS_AS(q.set_service_time(0.0), std::invalid_argument);
+  REQUIRE_THROWS_AS(q.set_service_time(-1.0), std::invalid_argument);
+  REQUIRE_THROWS_AS(q.set_service_time(std::numeric_limits<double>::quiet_NaN()),
+                    std::invalid_argument);
+}
