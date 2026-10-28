@@ -21,7 +21,10 @@ nodes:
       base: 200/s
       wave: {shape: sine, period: 24h, amplitude: 0.6, peak_at: 21:00}
     ops: {stream: 0.88, upload: 0.02, upload_meta: 0.02, metadata: 0.08}
-    sizes: {stream: 50MB, upload: 300MB, upload_meta: 2KB, metadata: 2KB}   # per request
+    # Per request: 300 MB is the book's average upload (ch. 14). The book sizes no stream; 50 MB is
+    # this scenario's choice (one rendition watched, smaller than the original), and so are the
+    # 2 KB metadata requests.
+    sizes: {stream: 50MB, upload: 300MB, upload_meta: 2KB, metadata: 2KB}
     keys: {zipf: 1.0, space: 10M}
     timeout: 10s
 

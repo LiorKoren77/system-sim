@@ -358,9 +358,11 @@ struct Step {
   StepMode mode{StepMode::sequential};
   double factor{1.0};  // fan-out: one post -> 100 feed writes (ch. 11 news feed)
   // The payload this step's request carries (plan 2c refinement 1), when the step states one:
-  // a worker or service that sends bytes of its own, such as ch. 14's transcoders writing a
-  // 50 MB rendition to the blob store. Absent: the request keeps its incoming size while it
-  // keeps its op name, and a renamed op is unsized (the graph resolves this in phase 2c).
+  // a worker or service that sends bytes of its own, such as the youtube scenario's transcoders
+  // writing a 50 MB rendition (its choice; ch. 14 sizes no rendition) to the blob store. Positive
+  // (the loader refuses 0B: a request of no bytes costs a byte-sized node nothing). Absent: the
+  // request keeps its incoming size while it keeps its op name, and a renamed op is unsized (the
+  // graph resolves this in phase 2c).
   std::optional<Bytes> size{};
 };
 
@@ -417,11 +419,12 @@ struct Workload {
   std::optional<KeySpec> keys{};
   std::optional<SimTime> timeout{};
   // The size of one request of each op the client sends, for the ops that carry bytes (plan
-  // 2c refinement 1, `sizes:` on a client): ch. 14 YouTube's 50 MB stream and 300 MB upload,
-  // ch. 15 Google Drive's 500 KB average file. An op not listed is unsized, which only a
-  // byte-sized node or a bandwidth link minds; a request-counting node never needs a size.
-  // Each size is the op's mean: the model ignores a size distribution, headers and protocol
-  // overhead, and compression. Sorted by op, like op_shares.
+  // 2c refinement 1, `sizes:` on a client): ch. 14 YouTube's 300 MB average upload, ch. 15
+  // Google Drive's 500 KB average file (the youtube scenario's 50 MB stream is its own choice:
+  // the book sizes no stream). Each is positive (the loader refuses 0B). An op not listed is
+  // unsized, which only a byte-sized node or a bandwidth link minds; a request-counting node
+  // never needs a size. Each size is the op's mean: the model ignores a size distribution,
+  // headers and protocol overhead, and compression. Sorted by op, like op_shares.
   std::map<std::string, Bytes> sizes{};
 };
 
