@@ -45,7 +45,7 @@ nodes:
     type: cache
     eviction: lru
     strategy: cache_aside
-    keys: 20M                                # ~20% of the hot key space
+    keys: 20M                                # 20 % of the key space; Che/LRU gives h ≈ 0.88
     hit_ratio: che
 
   url_db:

@@ -1953,22 +1953,25 @@ std::expected<double, ConfigError> read_key_space(const Site& site, const YAML::
   return static_cast<double>(*count);
 }
 
-// `keys: {zipf: 1.0, space: 100M}`: Zipf with exponent s >= 0 over N keys (s = 0 is uniform).
+// `keys: {zipf: 1.0, space: 100M}`: Zipf with exponent s >= 0 over N keys (s = 0 is uniform,
+// and stored as such).
 std::expected<model::KeySpec, ConfigError> read_zipf_keys(const Site& site,
                                                           const YAML::Node& keys) {
   if (!keys["zipf"] || !keys["space"]) {
     return site.fail(keys, "keys needs zipf and space, or uniform");
   }
+  // number_value already refuses .inf/.nan and words (parse_yaml_double): one message for all.
   const auto exponent = number_value(keys["zipf"]);
   if (!exponent || *exponent < 0.0)
-    return site.fail(keys["zipf"], "keys.zipf must be non-negative");
+    return site.fail(keys["zipf"], "keys.zipf must be a finite non-negative number");
+  // Canonical form (model::canonical): `zipf: 0` is stored as uniform.
   return read_key_space(site, keys["space"], "space").transform([&](double space) {
-    return model::KeySpec{.zipf = *exponent, .space = space};
+    return model::canonical(model::KeySpec{.zipf = *exponent, .space = space});
   });
 }
 
 // A client's `keys`: which keys it asks for, and how popular each is (model::KeySpec). Read
-// only for the `che` caches downstream (graph's key_source), but checked on every client: a
+// only for the `che` caches downstream (graph's agreed_keys), but checked on every client: a
 // misspelt block would otherwise surface only when a che cache is added.
 CheckResult read_client_keys(const Site& site, const YAML::Node& body, model::Workload& workload) {
   const auto keys = body["keys"];

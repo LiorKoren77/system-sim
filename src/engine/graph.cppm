@@ -34,8 +34,8 @@
 // refinement 6, see connect_backends). A cache (plan 2a refinement 7) contributes two
 // things: its hit ratio h (Graph::hit_ratio; a CDN's too), stated (`{fixed: h}`) or computed
 // once here by the Che approximation from the cache size and the key distribution of the
-// clients upstream (plan 2b refinements 1-2, see resolve_hit_ratios), which turns a service's
-// `on: miss` step after it into a hop taken by the miss fraction 1 - h of the requests
+// clients whose ops reach it (plan 2b refinements 1-2, see resolve_hit_ratios), which turns a
+// service's `on: miss` step after it into a hop taken by the miss fraction 1 - h of the requests
 // (Graph::service_hops), and, for the strategies in which the cache itself talks to the store,
 // a demand edge to its `backend` (Graph::backend_fraction says which share of each op takes
 // it; a write_back cache's flush over it is asynchronous by design, detail::write_back_flushes),
@@ -73,6 +73,12 @@ import simsys.defaults;
 import simsys.fluid;
 import simsys.model;
 
+// What resolving one cache's hit ratio reads (defined with the hit-ratio code below); declared
+// here for Graph::resolve_hit_ratio. Not exported: module linkage, like everything in detail.
+namespace simsys::graph::detail {
+struct HitRatioInputs;
+}  // namespace simsys::graph::detail
+
 export namespace simsys::graph {
 
 // The longest delay line a link may need, in steps. A delay line holds one Flow per step
@@ -94,17 +100,25 @@ struct EngineError {
 
 // A cache's or CDN's hit ratio h as the graph resolved it (plan 2b refinements 1-2):
 // `value`, and for `che` the inputs explain prints as its provenance: the key distribution
-// the clients upstream send (`keys`), those clients (`key_clients`, node indices in
-// scenario order), and the cache size the approximation used (`capacity`, in keys): the
-// cache's `keys`, times its replicas when a consistent-hash ring partitions the key space
-// over them (`partitions`, the replica count then, 1 otherwise; see
-// detail::effective_capacity). A fixed ratio has none of these.
+// the clients send (`keys`), those clients (`key_clients`, node indices in scenario order),
+// and the cache size the approximation used (`capacity`, in keys): the cache's `keys`, times
+// its replicas when a consistent-hash ring partitions the key space over them (`partitions`,
+// the replica count then, 1 otherwise; the arcs are uneven, see detail::ring_arcs). When the
+// keys arrive as the misses of another che cache, `filtered_by` names it (the popularity is
+// that cache's, filtered: caching::Popularity::filtered_by); when they pass a cache with no
+// characteristic time to filter by (a fixed ratio), `unfiltered_through` names it and the
+// popularity is used unfiltered. `shards` is what a cache behind THIS one filters by: each
+// arc's key share and characteristic time (one shard of share 1 for an unpartitioned cache).
+// A fixed ratio has none of these.
 struct ResolvedHitRatio {
   double value{};
   std::optional<model::KeySpec> keys{};
   std::vector<std::size_t> key_clients{};
   double capacity{};
   int partitions{1};
+  std::optional<std::size_t> filtered_by{};
+  std::optional<std::size_t> unfiltered_through{};
+  std::vector<caching::CacheShard> shards{};
 };
 
 // A scenario node plus the numbers the engine needs, each with the layer it came from.
@@ -118,8 +132,8 @@ struct ResolvedNode {
   // least_connections), or the hottest replica carries `imbalance` times the average share
   // (consistent_hash; 1 = an even split, the independent model). `keys_partitioned` is set
   // with the imbalance: a ring sends each key to one replica only, so the replicas split the
-  // key space between them (a cache's replicas then hold different keys, see
-  // detail::effective_capacity).
+  // key space between them (a cache's replicas then hold different keys over uneven arcs,
+  // see detail::ring_arcs).
   bool pooled{false};
   double imbalance{1.0};
   bool keys_partitioned{false};
@@ -366,6 +380,8 @@ class Graph {
   Result check_cache_backend_calls() const;
   Result route_splitters();
   Result resolve_hit_ratios();
+  Result resolve_hit_ratio(std::size_t cache, const model::HitRatio& stated,
+                           const detail::HitRatioInputs& inputs);
   Result resolve_hops();
   Result check_routed_ops();
   Result route_clients();
@@ -613,7 +629,7 @@ namespace {
   const auto& keys = *spec.workload->keys;
   const std::string name = "node '" + spec.id + "': ";
   if (keys.zipf && !(*keys.zipf >= 0.0 && std::isfinite(*keys.zipf))) {
-    return EngineError{name + "keys.zipf must be non-negative"};
+    return EngineError{name + "keys.zipf must be a finite non-negative number"};
   }
   if (!(keys.space >= 1.0 && std::isfinite(keys.space))) {
     return EngineError{name + "keys.space must be a positive count"};
@@ -825,152 +841,8 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
 // ---- Hit ratios (plan 2b refinements 1-2) ----
 //
 // In `detail` (module linkage) rather than the anonymous namespace, for the reason given on
-// the call-graph search above: KeySource holds a std::vector.
+// the call-graph search above: these types hold std::vectors and std::sets.
 namespace detail {
-
-// For every node, the clients whose demand reaches it over some chain of demand edges
-// (services, balancers, limiters, caches passing on to their store, ...), in index order.
-// One walk downstream from each client, so the map costs O(clients × edges) and is built once
-// per graph, however many che caches ask it (Graph::resolve_hit_ratios).
-[[nodiscard]] std::vector<std::vector<std::size_t>> clients_upstream(
-    std::span<const ResolvedNode> nodes, std::span<const DemandEdge> edges) {
-  std::vector<std::vector<std::size_t>> downstream(nodes.size());
-  for (const auto& edge : edges) downstream[edge.from].push_back(edge.to);
-  std::vector<std::vector<std::size_t>> upstream(nodes.size());
-  for (std::size_t client = 0; client < nodes.size(); ++client) {
-    if (nodes[client].spec.type != model::NodeType::client) continue;
-    std::vector<bool> reached(nodes.size(), false);
-    std::vector<std::size_t> work{client};
-    reached[client] = true;
-    while (!work.empty()) {
-      const auto node = work.back();
-      work.pop_back();
-      for (const auto next : downstream[node]) {
-        if (reached[next]) continue;
-        reached[next] = true;
-        upstream[next].push_back(client);
-        work.push_back(next);
-      }
-    }
-  }
-  return upstream;
-}
-
-// The key distribution a che cache sees, and the clients that send it.
-struct KeySource {
-  model::KeySpec keys;
-  std::vector<std::size_t> clients;
-};
-
-// The one key distribution the keyed clients upstream of `cache` agree on (plan 2b refinement
-// 1). Clients without `keys` say nothing and are skipped; none at all, or two that disagree,
-// leave the Che approximation without its popularity, an error naming the first two clients
-// that disagree. (Phase 2c may mix several distributions by their rates.)
-[[nodiscard]] std::expected<KeySource, EngineError> key_source(
-    std::span<const ResolvedNode> nodes, std::size_t cache, std::span<const std::size_t> clients) {
-  const std::string name = "node '" + nodes[cache].spec.id + "': hit_ratio che";
-  std::optional<KeySource> source;
-  for (const auto client : clients) {
-    const auto& workload = nodes[client].spec.workload;
-    if (!workload || !workload->keys) continue;
-    if (!source) {
-      source = KeySource{.keys = *workload->keys, .clients = {client}};
-    } else if (*workload->keys != source->keys) {  // KeySpec's defaulted ==
-      return std::unexpected{
-          EngineError{name + ": clients '" + nodes[source->clients.front()].spec.id + "' and '" +
-                      nodes[client].spec.id + "' send different key distributions"}};
-    } else {
-      source->clients.push_back(client);
-    }
-  }
-  if (!source) return std::unexpected{EngineError{name + " needs a client with keys upstream"}};
-  return *source;
-}
-
-// The scenario's key distribution as simsys.caching's popularity: Zipf(s) over N keys, or
-// uniform over N.
-[[nodiscard]] caching::Popularity popularity_of(const model::KeySpec& keys) {
-  if (keys.zipf) return caching::Popularity::zipf(*keys.zipf, keys.space);
-  return caching::Popularity::uniform(keys.space);
-}
-
-// Pattern: Strategy/Policy — the hit-ratio model is a compile-time policy selected at build:
-// each cache's `hit_ratio` picks one of simsys.caching's HitRatioModel types, held in a
-// std::variant and visited once (Graph::resolve_hit_ratios); adding a model (an LFU one, say)
-// is one more alternative and one more function that builds it from the scenario.
-using HitRatioPolicy = std::variant<caching::FixedHitRatio, caching::CheHitRatio>;
-
-// The inputs resolving a hit ratio may read: the graph's nodes, which one is the cache, and
-// who is upstream of it.
-struct HitRatioInputs {
-  std::span<const ResolvedNode> nodes;
-  std::size_t cache;
-  std::span<const std::size_t> clients_upstream;
-};
-
-// The cache size the Che approximation sees, in keys, and over how many replicas it is
-// partitioned. A cache with N replicas holds `keys` entries per replica; what they hold
-// together depends on how keys reach them:
-//  - round robin, weighted, least connections: any request can reach any replica, so every
-//    replica sees the whole key popularity and fills itself with the same hot keys. Each is
-//    a full copy of `keys` entries, and the hit ratio is that of ONE cache of `keys`.
-//  - consistent hash (ch. 5): each key hashes to exactly one replica, so the replicas hold
-//    disjoint parts of the key space, `keys × N` distinct keys together. Each replica is an
-//    LRU cache over a random 1/N of the keys, seeing 1/N of the requests. Counted in the
-//    requests of the whole system, its Che equation is Σ_{i in its part} (1 − e^{−p_i t}) =
-//    keys; each part holds about 1/N of every popularity level, so one t solves all N of
-//    them, and adding the N equations gives Σ_i (1 − e^{−p_i t}) = keys × N: the equation of
-//    one cache of `keys × N` over the whole space, whose hit ratio is the replicas' total.
-// Assumes a random partition: the ring's uneven arcs (ResolvedNode::imbalance) change how
-// many keys each replica owns, which this capacity ignores. A replica lost to a fault is not
-// subtracted either: the hit ratio is resolved once, at build.
-struct EffectiveCapacity {
-  double keys;
-  int partitions;
-};
-[[nodiscard]] EffectiveCapacity effective_capacity(const ResolvedNode& cache) {
-  const int partitions = cache.keys_partitioned ? cache.spec.replicas : 1;
-  return {.keys = static_cast<double>(*cache.spec.keys) * partitions, .partitions = partitions};
-}
-
-// What a `che` hit ratio rests on, checked: the cache size C (effective_capacity) and the key
-// distribution of the clients upstream (key_source). This is also its provenance in explain.
-[[nodiscard]] std::expected<ResolvedHitRatio, EngineError> che_inputs(
-    const HitRatioInputs& inputs) {
-  const auto& cache = inputs.nodes[inputs.cache];
-  const auto& spec = cache.spec;
-  if (!spec.keys) {
-    return std::unexpected{EngineError{
-        "node '" + spec.id + "': hit_ratio che needs keys (the cache's capacity in keys)"}};
-  }
-  if (*spec.keys <= 0) {  // the loader's rule (config's read_cache_size), for code
-    return std::unexpected{EngineError{"node '" + spec.id + "': keys must be a positive integer"}};
-  }
-  const auto source = key_source(inputs.nodes, inputs.cache, inputs.clients_upstream);
-  if (!source) return std::unexpected{source.error()};
-  const auto capacity = effective_capacity(cache);
-  return ResolvedHitRatio{.keys = source->keys,
-                          .key_clients = source->clients,
-                          .capacity = capacity.keys,
-                          .partitions = capacity.partitions};
-}
-
-// What a cache's hit ratio rests on: for `che` its checked inputs (che_inputs); for
-// `{fixed: h}` nothing, as it is the scenario author's own estimate (and a fixed cache need
-// not have keyed clients upstream). Only called with `fixed` or `che` set.
-[[nodiscard]] std::expected<ResolvedHitRatio, EngineError> hit_ratio_inputs(
-    const model::HitRatio& stated, const HitRatioInputs& inputs) {
-  if (stated.che) return che_inputs(inputs);
-  return ResolvedHitRatio{};
-}
-
-// The model a cache's `hit_ratio` names, built from what it rests on: FixedHitRatio{h}, or
-// CheHitRatio over the popularity of the keys the clients upstream ask for.
-[[nodiscard]] HitRatioPolicy hit_ratio_model(const model::HitRatio& stated,
-                                             const ResolvedHitRatio& inputs) {
-  if (stated.che) return caching::CheHitRatio{.popularity = popularity_of(*inputs.keys)};
-  return caching::FixedHitRatio{.value = *stated.fixed};
-}
 
 // Does `node` have a hit ratio the graph can resolve now? A cache or CDN with `{fixed: h}` or
 // `che`; not a HitRatio{} built in code (neither set: no hit ratio at all), and not a `che`
@@ -980,6 +852,500 @@ struct EffectiveCapacity {
   if (!hits_or_misses(spec.type) || !spec.hit_ratio) return false;
   if (!spec.hit_ratio->che) return spec.hit_ratio->fixed.has_value();
   return spec.type == model::NodeType::cache || spec.keys.has_value();
+}
+
+// A cache whose misses have a Che popularity to pass on: a resolvable `che` one. Any other
+// cache (a fixed ratio, an unsized che CDN) says how MANY requests miss but not WHICH keys.
+[[nodiscard]] bool filters_by_che(const model::NodeSpec& spec) {
+  return has_resolvable_hit_ratio(spec) && spec.hit_ratio->che;
+}
+
+// ---- Which keys reach which node: the op-aware walk (plan 2b refinement 1, revised) ----
+//
+// A che cache's popularity is the popularity of the keys that reach it, and keys travel with
+// requests: a client's keys reach a cache only along the CALLS its ops make. Walking demand
+// edges (box to box) instead would let a writer whose ops never touch the cache, but pass the
+// same service, impose its key distribution on it. So the walk is over (node, op) vertices,
+// like the call-cycle search (detail::find_async_hops), and runs per client.
+//
+// Its hops cannot come from forwarder_steps: those read the resolved hops' fractions, which
+// need the very hit ratios being resolved here. key_hops below says, without any hit ratio,
+// which (node, op) a call may lead to — every hop that carries flow for SOME hit ratio below 1
+// (an `on: miss` step is reachable whatever h turns out to be) — and whose misses it carries.
+//
+// Assumed: every hop between a client and a cache carries the client's key (a service asked
+// for short link k asks its cache for k). One kind of hop does not, and is left out: a rate
+// limiter's `counter` request to its store, which counts requests per USER (or per rule), not
+// per key the request is about (book ch. 4: the Redis counter is keyed by user id or IP).
+
+// A call (node, op) may lead to: `to` receives `op`. `misses_of` is set when the hop carries
+// only the misses of a cache (that cache): a read_through cache's fetch from its backend, a
+// cache's `then` step on miss, a service's `on: miss` step after its lookup at a cache.
+struct KeyHop {
+  std::size_t to{};
+  std::string op{};
+  std::optional<std::size_t> misses_of{};
+};
+
+// A service's (or any node's) `ops` steps for `op`: every step but `on: failure` (nothing fails
+// before phase 2c). An `on: miss` step carries the misses of its lookup, the nearest
+// unconditional step before it (as Graph::resolve_service_hops pairs them; a miss step after
+// something that is no cache is refused there, and inherits here).
+void add_op_step_hops(const Graph& g, const model::NodeSpec& spec, std::string_view op,
+                      std::vector<KeyHop>& hops) {
+  const auto steps = spec.ops.find(std::string{op});
+  if (steps == spec.ops.end()) return;
+  std::optional<std::size_t> lookup;  // the cache the last unconditional step asked
+  for (const model::Step& step : steps->second) {
+    const auto target = *g.index_of(step.to);  // connect_step resolved every target
+    switch (step.on) {
+      case model::StepCondition::failure:
+        continue;
+      case model::StepCondition::always:
+        lookup = hits_or_misses(g.nodes()[target].spec.type) ? std::optional{target} : std::nullopt;
+        hops.push_back({.to = target, .op = step.op});
+        break;
+      case model::StepCondition::miss:
+        hops.push_back({.to = target, .op = step.op, .misses_of = lookup});
+        break;
+    }
+  }
+}
+
+// A cache's fetch from its backend (Graph::backend_fraction, whatever h is): a read under
+// read_through carries the cache's misses; a write under a write strategy carries every write.
+void add_backend_hop(const ResolvedNode& cache, std::size_t node, std::string_view op,
+                     std::vector<KeyHop>& hops) {
+  if (!is_cache(cache.spec) || !cache.backend) return;
+  using enum model::CacheStrategy;  // see replica_model_of
+  const auto strategy = cache.spec.strategy;
+  if (!is_write(cache.spec, op)) {
+    if (strategy == read_through) {
+      hops.push_back({.to = *cache.backend, .op = std::string{op}, .misses_of = node});
+    }
+    return;
+  }
+  if (strategy == write_through || strategy == write_around || strategy == write_back) {
+    hops.push_back({.to = *cache.backend, .op = std::string{op}});
+  }
+}
+
+// `then` steps (Graph::then_fraction): an unconditional one carries everything, an `on: miss`
+// one the read misses of a cache or CDN (and nothing of a write, or of any other node).
+void add_then_hops(const Graph& g, const model::NodeSpec& spec, std::size_t node,
+                   std::string_view op, std::vector<KeyHop>& hops) {
+  for (const model::Step& step : spec.then) {
+    const auto target = *g.index_of(step.to);
+    if (step.on == model::StepCondition::always) {
+      hops.push_back({.to = target, .op = step.op});
+    } else if (step.on == model::StepCondition::miss && hits_or_misses(spec.type) &&
+               !is_write(spec, op)) {
+      hops.push_back({.to = target, .op = step.op, .misses_of = node});
+    }
+  }
+}
+
+// Every hop a request for `op` at `node` may take (see the section comment). A load balancer
+// or a limiter passes the op on along its routes that carry it (not along a drained one); a
+// limiter's backend (`counter`) is left out on purpose.
+[[nodiscard]] std::vector<KeyHop> key_hops(const Graph& g, std::size_t node, std::string_view op) {
+  const auto& resolved = g.nodes()[node];
+  std::vector<KeyHop> hops;
+  if (forwards_by_link(resolved.spec.type)) {
+    for (const auto& route : g.routes_for(node, op)) {
+      if (route.share > 0.0) hops.push_back({.to = route.target, .op = std::string{op}});
+    }
+  }
+  add_op_step_hops(g, resolved.spec, op, hops);
+  add_backend_hop(resolved, node, op, hops);
+  add_then_hops(g, resolved.spec, node, op, hops);
+  return hops;
+}
+
+// One way a client's keys arrive at a node: from `client`, sent on by `sender`, as `op`.
+// `filtered_by` is the nearest che cache upstream whose MISSES these requests are (empty: no
+// che cache filtered them); `unfiltered_through` the nearest cache since then that missed too
+// but has no Che popularity to filter by (a fixed ratio), whose filtering is therefore ignored.
+struct KeyArrival {
+  std::size_t client{};
+  std::size_t sender{};
+  std::string op{};
+  std::optional<std::size_t> filtered_by{};
+  std::optional<std::size_t> unfiltered_through{};
+  auto operator<=>(const KeyArrival&) const = default;  // a std::set key (see AsyncHop)
+};
+
+// Per node, every way keys arrive at it, sorted (by client first: error messages name the
+// clients in scenario order) and without duplicates.
+using KeyArrivals = std::vector<std::vector<KeyArrival>>;
+
+// A vertex of the walk: `op` at `node`, with the filters its keys went through so far.
+struct KeyStream {
+  std::size_t node{};
+  std::string op{};
+  std::optional<std::size_t> filtered_by{};
+  std::optional<std::size_t> unfiltered_through{};
+  auto operator<=>(const KeyStream&) const = default;
+};
+
+// The filters of a hop's requests: those of the stream it leaves, unless it carries the misses
+// of a cache — a che cache becomes the filter (and resets the caveat, which that cache's own
+// provenance reports), any other cache becomes the caveat.
+[[nodiscard]] KeyStream next_stream(const Graph& g, const KeyStream& from, const KeyHop& hop) {
+  KeyStream next{.node = hop.to,
+                 .op = hop.op,
+                 .filtered_by = from.filtered_by,
+                 .unfiltered_through = from.unfiltered_through};
+  if (!hop.misses_of) return next;
+  if (filters_by_che(g.nodes()[*hop.misses_of].spec)) {
+    next.filtered_by = hop.misses_of;
+    next.unfiltered_through.reset();
+  } else {
+    next.unfiltered_through = hop.misses_of;
+  }
+  return next;
+}
+
+// One client's walk: depth-first over KeyStream vertices from its routes (a drained route,
+// share 0, carries nothing), recording every arrival. Each vertex is expanded once, so a call
+// cycle ends the walk instead of looping.
+void walk_client_keys(const Graph& g, std::size_t client,
+                      std::vector<std::set<KeyArrival>>& arrivals) {
+  std::set<KeyStream> seen;
+  std::vector<KeyStream> work;
+  const auto arrive = [&](std::size_t sender, KeyStream stream) {
+    arrivals[stream.node].insert(KeyArrival{.client = client,
+                                            .sender = sender,
+                                            .op = stream.op,
+                                            .filtered_by = stream.filtered_by,
+                                            .unfiltered_through = stream.unfiltered_through});
+    if (seen.insert(stream).second) work.push_back(std::move(stream));
+  };
+  for (const auto& route : g.client_routes(client)) {
+    if (route.share > 0.0) arrive(client, KeyStream{.node = route.target, .op = route.op});
+  }
+  while (!work.empty()) {
+    const KeyStream stream = std::move(work.back());
+    work.pop_back();
+    for (const KeyHop& hop : key_hops(g, stream.node, stream.op)) {
+      arrive(stream.node, next_stream(g, stream, hop));
+    }
+  }
+}
+
+// Every client's walk (walk_client_keys), as KeyArrivals. O(clients × (node, op, filter)
+// vertices × hops), once per graph however many che caches read it.
+[[nodiscard]] KeyArrivals key_arrivals(const Graph& g) {
+  std::vector<std::set<KeyArrival>> arrivals(g.nodes().size());
+  for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+    if (g.nodes()[node].spec.type == model::NodeType::client) walk_client_keys(g, node, arrivals);
+  }
+  KeyArrivals sorted(arrivals.size());
+  for (std::size_t node = 0; node < arrivals.size(); ++node) {
+    sorted[node].assign(arrivals[node].begin(), arrivals[node].end());
+  }
+  return sorted;
+}
+
+// ---- What a che cache's keys are ----
+
+// The key distribution a che cache sees, the clients that send it, and the filters it went
+// through (KeyArrival).
+struct KeySource {
+  model::KeySpec keys{};
+  std::vector<std::size_t> clients{};
+  std::optional<std::size_t> filtered_by{};
+  std::optional<std::size_t> unfiltered_through{};
+};
+
+// "the misses of cache 'l1'", or "requests no cache filtered": one key stream, for messages.
+[[nodiscard]] std::string stream_name(std::span<const ResolvedNode> nodes,
+                                      std::optional<std::size_t> filtered_by) {
+  if (!filtered_by) return "requests no cache filtered";
+  return "the misses of cache '" + nodes[*filtered_by].spec.id + "'";
+}
+
+// The clients' one key distribution (plan 2b refinement 1): every client whose ops reach the
+// cache must state its keys, and all must agree (KeySpec's defaulted ==, on the canonical form:
+// zipf 0 is uniform). Phase 2c may mix several distributions by their rates.
+[[nodiscard]] std::expected<KeySource, EngineError> agreed_keys(
+    std::span<const ResolvedNode> nodes, const std::string& name,
+    std::span<const KeyArrival> arrivals) {
+  if (arrivals.empty()) {
+    return std::unexpected{EngineError{name + ": no client's demand reaches it"}};
+  }
+  std::optional<KeySource> source;
+  for (const auto& arrival : arrivals) {
+    const auto& client = nodes[arrival.client].spec;
+    if (!client.workload || !client.workload->keys) {
+      return std::unexpected{
+          EngineError{name + ": client '" + client.id + "' reaches it without keys"}};
+    }
+    const auto keys = model::canonical(*client.workload->keys);
+    if (!source) {
+      source = KeySource{.keys = keys, .clients = {arrival.client}};
+    } else if (keys != source->keys) {
+      return std::unexpected{EngineError{name + ": clients '" +
+                                         nodes[source->clients.front()].spec.id + "' and '" +
+                                         client.id + "' send different key distributions"}};
+    } else if (source->clients.back() != arrival.client) {  // sorted by client: one entry each
+      source->clients.push_back(arrival.client);
+    }
+  }
+  return *source;
+}
+
+// Which filter the cache's READS went through: one, for one popularity. A write is not a
+// lookup (it neither hits nor misses), so the writes' path does not shape what Che sees: a
+// write_through cache in front passes every write on but only its read misses. A cache
+// passed since that filter whose misses could not be filtered (KeyArrival::unfiltered_through)
+// is kept for explain's caveat.
+[[nodiscard]] std::expected<void, EngineError> agree_on_filter(std::span<const ResolvedNode> nodes,
+                                                               std::size_t cache,
+                                                               const std::string& name,
+                                                               std::span<const KeyArrival> arrivals,
+                                                               KeySource& source) {
+  // The reads among the arrivals. (A plain loop, not a std::views::filter: a lambda calling
+  // is_write, which has internal linkage, cannot appear in this module-linkage function.)
+  std::vector<const KeyArrival*> reads;
+  for (const auto& arrival : arrivals) {
+    if (!is_write(nodes[cache].spec, arrival.op)) reads.push_back(&arrival);
+  }
+  std::set<std::optional<std::size_t>> filters;
+  for (const KeyArrival* read : reads) filters.insert(read->filtered_by);
+  if (filters.size() > 1) {
+    // Name the filtered streams first: an empty optional (no filter) sorts first in the set.
+    std::vector<std::optional<std::size_t>> named(filters.begin(), filters.end());
+    if (!named.front()) std::ranges::rotate(named, std::next(named.begin()));
+    return std::unexpected{EngineError{name + ": it receives both " + stream_name(nodes, named[0]) +
+                                       " and " + stream_name(nodes, named[1])}};
+  }
+  if (filters.empty()) return {};  // only writes arrive: the clients' keys as they are
+  source.filtered_by = *filters.begin();
+  for (const KeyArrival* read : reads) {
+    if (!read->unfiltered_through) continue;
+    source.unfiltered_through = read->unfiltered_through;
+    break;
+  }
+  return {};
+}
+
+// A ring partitions the cache's keys only if every request reaches it through a ring: a
+// request sent to it any other way could land on any replica, which holds a different part
+// of the keys. Mixed feeding has no single popularity per replica, so it is refused.
+[[nodiscard]] std::expected<void, EngineError> check_ring_only(
+    std::span<const ResolvedNode> nodes, std::size_t cache, std::span<const KeyArrival> arrivals) {
+  if (!nodes[cache].keys_partitioned) return {};
+  const auto is_ring = [&](std::size_t sender) {
+    return nodes[sender].spec.type == model::NodeType::load_balancer &&
+           nodes[sender].spec.policy == model::LbPolicy::consistent_hash;
+  };
+  // C++20 ranges algorithm with a projection: find_if over the arrivals, testing each one's
+  // `sender` (the projection, a pointer to member) rather than the whole arrival.
+  const auto ring = std::ranges::find_if(arrivals, is_ring, &KeyArrival::sender);
+  const auto direct = std::ranges::find_if_not(arrivals, is_ring, &KeyArrival::sender);
+  if (ring == arrivals.end() || direct == arrivals.end()) return {};
+  return std::unexpected{
+      EngineError{"node '" + nodes[cache].spec.id + "': keys are partitioned by ring '" +
+                  nodes[ring->sender].spec.id + "' but '" + nodes[direct->sender].spec.id +
+                  "' also sends to it directly"}};
+}
+
+// Pattern: Strategy/Policy — a cache's hit-ratio model is one of a closed set of policies
+// (simsys.caching's HitRatioModel types), chosen once when the graph is built from the
+// scenario's `hit_ratio` and dispatched with std::visit. Adding a model (an LFU one, say) is
+// one more alternative and one more branch in Graph::resolve_hit_ratio that builds it.
+// The policy is not kept after build: a Graph holding a caching::Popularity (in a policy on
+// ResolvedNode, in a vector of policies or of CheHitRatio, or returned by an accessor) crashed
+// GCC 14.2 (internal compiler error in stl_vector.h compiling simsys.behaviours, Release;
+// verified 2026-10-28; see also Graph::resolve_hit_ratio). What rebuilds it is kept instead:
+// ResolvedHitRatio's keys, filtered_by and the upstream shards (che_popularity), so phase 3's
+// node_down can ask hit_ratio(the smaller capacity) of the same model again.
+// C++17 std::variant: a type-safe union that holds exactly one of its alternatives; std::visit
+// calls the overload for whichever it holds. Replaces a base class with a virtual hit_ratio
+// and a heap-allocated derived object per cache.
+using HitRatioPolicy = std::variant<caching::FixedHitRatio, caching::CheHitRatio>;
+
+// The scenario's key distribution as simsys.caching's popularity: Zipf(s) over N keys, or
+// uniform over N.
+[[nodiscard]] caching::Popularity popularity_of(const model::KeySpec& keys) {
+  if (keys.zipf) return caching::Popularity::zipf(*keys.zipf, keys.space);
+  return caching::Popularity::uniform(keys.space);
+}
+
+// The inputs resolving a hit ratio may read: the graph's nodes (with the hit ratios of the
+// che caches this one is behind already resolved, with their policies: Graph::resolve_hit_ratios'
+// order), which one is the cache, and how keys arrive at it.
+struct HitRatioInputs {
+  std::span<const ResolvedNode> nodes;
+  std::size_t cache;
+  std::span<const KeyArrival> arrivals;
+};
+
+// The popularity the cache sees: the clients' keys, or, behind a che cache, that cache's
+// popularity filtered by its shards' characteristic times (caching::Popularity::filtered_by;
+// Martina, Garetto & Leonardi 2014). Rebuilt from what each resolved hit ratio keeps (the keys,
+// the cache it is behind, that cache's shards), one filter per cache of the chain: the upstream
+// cache's own popularity is already filtered by whatever is in front of IT. Needs every cache
+// of the chain resolved first (Graph::resolve_hit_ratios' order).
+[[nodiscard]] caching::Popularity che_popularity(std::span<const ResolvedNode> nodes,
+                                                 const ResolvedHitRatio& resolved) {
+  if (!resolved.filtered_by) return popularity_of(*resolved.keys);
+  const auto& upstream = *nodes[*resolved.filtered_by].hit_ratio;
+  return che_popularity(nodes, upstream).filtered_by(upstream.shards);
+}
+
+// What a `che` hit ratio rests on, checked: the cache size (`keys`), the key distribution of
+// the clients that reach it and the filters it went through (agreed_keys, agree_on_filter),
+// that a ring partitioning it is its only way in (check_ring_only), and over how many replicas
+// the keys are partitioned. This is also its provenance in explain.
+// A cache with N replicas holds `keys` entries per replica; what they hold together depends on
+// how keys reach them:
+//  - round robin, weighted, least connections: any request can reach any replica, so every
+//    replica sees the whole key popularity and fills itself with the same hot keys. Each is
+//    a full copy of `keys` entries, and the hit ratio is that of ONE cache of `keys`.
+//  - consistent hash (ch. 5): each key hashes to exactly one replica, so the replicas hold
+//    disjoint parts of the key space, `keys × N` distinct keys together, each over its own arc
+//    of the ring (detail::ring_arcs).
+// A replica lost to a fault is not subtracted: the hit ratio is resolved once, at build (phase
+// 3 rebuilds the policy from the resolved inputs, see detail::HitRatioPolicy).
+[[nodiscard]] std::expected<ResolvedHitRatio, EngineError> che_inputs(
+    const HitRatioInputs& inputs) {
+  const auto& cache = inputs.nodes[inputs.cache];
+  const auto& spec = cache.spec;
+  const std::string name = "node '" + spec.id + "': hit_ratio che";
+  if (!spec.keys) {
+    return std::unexpected{EngineError{name + " needs keys (the cache's capacity in keys)"}};
+  }
+  if (*spec.keys <= 0) {  // the loader's rule (config's read_cache_size), for code
+    return std::unexpected{EngineError{"node '" + spec.id + "': keys must be a positive integer"}};
+  }
+  auto source = agreed_keys(inputs.nodes, name, inputs.arrivals);
+  if (!source) return std::unexpected{std::move(source.error())};
+  if (auto agreed = agree_on_filter(inputs.nodes, inputs.cache, name, inputs.arrivals, *source);
+      !agreed) {
+    return std::unexpected{std::move(agreed.error())};
+  }
+  if (auto ring_only = check_ring_only(inputs.nodes, inputs.cache, inputs.arrivals); !ring_only) {
+    return std::unexpected{std::move(ring_only.error())};
+  }
+  const int partitions = cache.keys_partitioned ? spec.replicas : 1;
+  return ResolvedHitRatio{.keys = source->keys,
+                          .key_clients = std::move(source->clients),
+                          .capacity = static_cast<double>(*spec.keys) * partitions,
+                          .partitions = partitions,
+                          .filtered_by = source->filtered_by,
+                          .unfiltered_through = source->unfiltered_through};
+}
+
+// `replicas` replicas that each own a share `replica_share` of the key space (ring_arcs).
+struct ArcGroup {
+  double replica_share;
+  double replicas;
+};
+
+// How a consistent-hash ring splits the key space over N replicas, from its imbalance k (the
+// hottest replica's load over the average, Graph::mark_balanced_targets: 1 + 1/sqrt(vnodes)):
+// the hottest replica owns a_hot = k/N of the keys, the N − 1 others share the rest evenly,
+// a_cool = (1 − k/N)/(N − 1). Two groups, not N arcs: the cool replicas are interchangeable,
+// and one Che solve per group keeps a 1000-replica cache as cheap as a 4-replica one. Like k
+// itself a heuristic: "one replica one standard deviation hot, the others even". One group of
+// share 1 for an unpartitioned cache.
+[[nodiscard]] std::vector<ArcGroup> ring_arcs(int partitions, double imbalance) {
+  if (partitions <= 1) return {{.replica_share = 1.0, .replicas = 1.0}};
+  const double n = partitions;
+  const double hot = imbalance / n;
+  return {{.replica_share = hot, .replicas = 1.0},
+          {.replica_share = (1.0 - hot) / (n - 1.0), .replicas = n - 1.0}};
+}
+
+// The hit ratio of a cache whose replicas own the arcs `arcs`, `replica_keys` entries each:
+//   h = Σ_j a_j · h_model(keys / a_j)
+// A replica owning a share a_j of the keys (a random part of every popularity level) sees a_j
+// of the requests, and its Che equation over its own part, Σ_{i in part} (1 − e^{−p_i t}) =
+// keys, is a_j · Σ_i (1 − e^{−p_i t}) = keys: the equation of ONE cache of keys / a_j over the
+// whole space, whose hit ratio is the replica's own. Weighting each replica by its share of
+// the requests gives the total. Even arcs (a_j = 1/N) make every term Che(keys × N), the
+// "one cache of keys × N" of the even split; uneven ones give less, because the hit ratio is
+// concave in the cache size: what the hot replica loses by holding a big arc in the same
+// `keys` is more than what the cool ones gain from holding small ones (book ch. 5's hotspot
+// problem, seen from the cache: k = 2 over N = 4 gives 0.924 where the even split gives 0.963
+// in the consistent-hashing lab). A share of 0 owns nothing and serves nothing.
+[[nodiscard]] double hit_ratio_over_arcs(const HitRatioPolicy& policy, double replica_keys,
+                                         std::span<const ArcGroup> arcs) {
+  double hits = 0.0;
+  for (const auto& arc : arcs) {
+    if (arc.replica_share <= 0.0) continue;
+    // C++20 constrained generic lambda (`const caching::HitRatioModel auto& m`): an `auto`
+    // parameter with a concept in front makes the lambda a template whose argument must
+    // satisfy the concept. std::visit instantiates it for each alternative of the variant. The
+    // call `m.hit_ratio(...)` would fail to compile for a model without one anyway; the concept
+    // says up front what every model must provide, and an alternative that is no
+    // HitRatioModel fails here naming the concept rather than deep inside std::visit.
+    const double replica_hit_ratio = std::visit(
+        [&](const caching::HitRatioModel auto& m) {
+          return m.hit_ratio(replica_keys / arc.replica_share);
+        },
+        policy);
+    hits += arc.replicas * arc.replica_share * replica_hit_ratio;
+  }
+  return hits;
+}
+
+// Each arc group's key share and characteristic time: what a cache behind this one filters by
+// (caching::Popularity::filtered_by). A group's share is all its replicas' together.
+[[nodiscard]] std::vector<caching::CacheShard> che_shards(const caching::CheHitRatio& che,
+                                                          double replica_keys,
+                                                          std::span<const ArcGroup> arcs) {
+  std::vector<caching::CacheShard> shards;
+  for (const auto& arc : arcs) {
+    if (arc.replica_share <= 0.0) continue;
+    shards.push_back({.key_share = arc.replicas * arc.replica_share,
+                      .characteristic_time = caching::che_characteristic_time(
+                          replica_keys / arc.replica_share, che.popularity)});
+  }
+  return shards;
+}
+
+// The order the hit ratios are resolved in: every cache after the che caches whose misses it
+// receives (it filters their popularity), found by depth-first search over "is behind" edges;
+// a loop of caches each behind the next has no first one and is refused. Caches no other che
+// cache feeds come in scenario order.
+[[nodiscard]] std::expected<std::vector<std::size_t>, EngineError> hit_ratio_order(
+    std::span<const ResolvedNode> nodes, const KeyArrivals& arrivals) {
+  enum class Mark { unvisited, active, done };
+  std::vector<Mark> marks(nodes.size(), Mark::unvisited);
+  std::vector<std::size_t> order;
+  // A function object rather than a lambda because it calls itself: one level of recursion
+  // per cache in a chain, so a handful at most.
+  struct Visit {
+    std::span<const ResolvedNode> nodes;
+    const KeyArrivals& arrivals;
+    std::vector<Mark>& marks;
+    std::vector<std::size_t>& order;
+    std::expected<void, EngineError> operator()(std::size_t cache) const {
+      if (marks[cache] == Mark::done) return {};
+      if (marks[cache] == Mark::active) {
+        return std::unexpected{EngineError{"node '" + nodes[cache].spec.id +
+                                           "': hit_ratio che: its keys loop back through itself "
+                                           "(each cache of the loop is behind the next)"}};
+      }
+      marks[cache] = Mark::active;
+      for (const auto& arrival : arrivals[cache]) {
+        if (!arrival.filtered_by) continue;
+        if (auto visited = (*this)(*arrival.filtered_by); !visited) return visited;
+      }
+      marks[cache] = Mark::done;
+      order.push_back(cache);
+      return {};
+    }
+  };
+  const Visit visit{nodes, arrivals, marks, order};
+  for (std::size_t node = 0; node < nodes.size(); ++node) {
+    if (!has_resolvable_hit_ratio(nodes[node].spec)) continue;
+    if (auto visited = visit(node); !visited) return std::unexpected{std::move(visited.error())};
+  }
+  return order;
 }
 
 }  // namespace detail
@@ -1231,40 +1597,53 @@ Graph::Result Graph::resolve_service_hops(std::size_t node) {
 
 // Every cache's and CDN's hit ratio, once, before anything reads one (resolve_hops' miss
 // fractions, the backend shares, the arriving ops): the stated number, or the Che
-// approximation over the clients' key distribution (detail::hit_ratio_inputs and
-// detail::hit_ratio_model). Runs after the last demand edge exists, since a che cache walks
-// them upstream to its clients, and after mark_balanced_targets, since a ring in front
-// partitions the cache's keys; the upstream map is built on the first che cache that needs
-// it and shared by the rest. The model is built apart from its inputs rather than returned
-// with them in one std::expected: a std::expected of a struct holding the HitRatioPolicy
-// variant crashed GCC 14.2 (internal compiler error compiling simsys.behaviours, Release;
-// verified 2026-10-28).
+// approximation over the popularity of the keys that reach the cache (resolve_hit_ratio).
+// Runs after the last route exists, since the key walk follows them (detail::key_arrivals),
+// and after mark_balanced_targets, since a ring in front partitions the cache's keys. The walk
+// runs only when some che cache needs it, and the caches resolve in detail::hit_ratio_order:
+// a cache behind another che cache filters that cache's popularity, so that one comes first.
 Graph::Result Graph::resolve_hit_ratios() {
-  std::optional<std::vector<std::vector<std::size_t>>> upstream;
-  for (std::size_t node = 0; node < nodes_.size(); ++node) {
-    const auto& spec = nodes_[node].spec;
-    if (!detail::has_resolvable_hit_ratio(spec)) continue;
-    if (spec.hit_ratio->che && !upstream) upstream = detail::clients_upstream(nodes_, edges_);
+  const bool any_che = std::ranges::any_of(
+      nodes_, [](const ResolvedNode& node) { return detail::filters_by_che(node.spec); });
+  const auto arrivals = any_che ? detail::key_arrivals(*this) : detail::KeyArrivals(nodes_.size());
+  const auto order = detail::hit_ratio_order(nodes_, arrivals);
+  if (!order) return std::unexpected{order.error()};
+  for (const auto cache : *order) {
     const detail::HitRatioInputs inputs{
-        .nodes = nodes_,
-        .cache = node,
-        .clients_upstream = upstream ? std::span<const std::size_t>{(*upstream)[node]}
-                                     : std::span<const std::size_t>{}};
-    auto resolved = detail::hit_ratio_inputs(*spec.hit_ratio, inputs);
-    if (!resolved) return std::unexpected{std::move(resolved.error())};
-    const auto model = detail::hit_ratio_model(*spec.hit_ratio, *resolved);
-    // C++20 constrained generic lambda (`const caching::HitRatioModel auto& m`): a generic
-    // `auto` parameter with a concept in front, which makes the lambda a template whose
-    // argument must satisfy the concept. std::visit instantiates it for every alternative of
-    // the variant, so the concept does real work: it is what guarantees `m.hit_ratio(C)`
-    // exists and returns a double for each model, and an alternative that is no
-    // HitRatioModel fails to compile here with the concept's name in the message, instead of
-    // an error deep inside std::visit.
-    resolved->value = std::visit(
-        [&](const caching::HitRatioModel auto& m) { return m.hit_ratio(resolved->capacity); },
-        model);
-    nodes_[node].hit_ratio = std::move(*resolved);
+        .nodes = nodes_, .cache = cache, .arrivals = arrivals[cache]};
+    if (auto resolved = resolve_hit_ratio(cache, *nodes_[cache].spec.hit_ratio, inputs);
+        !resolved) {
+      return resolved;
+    }
   }
+  return {};
+}
+
+// One cache's hit ratio, with one branch on what the scenario states: the policy its
+// `hit_ratio` names (FixedHitRatio{h}, or CheHitRatio over the popularity of its keys:
+// detail::che_inputs and detail::che_popularity), evaluated over the ring's arcs
+// (detail::hit_ratio_over_arcs; one arc of share 1 for a cache no ring partitions, and for
+// every fixed one), plus the shards a che cache behind this one filters by. The numbers are
+// stored on the node rather than returned in a std::expected, and the policy is dropped once
+// evaluated: a std::expected of a struct holding the variant, like a Graph holding the
+// policy, crashed GCC 14.2 (see detail::HitRatioPolicy).
+Graph::Result Graph::resolve_hit_ratio(std::size_t cache, const model::HitRatio& stated,
+                                       const detail::HitRatioInputs& inputs) {
+  ResolvedHitRatio resolved;
+  detail::HitRatioPolicy policy = caching::FixedHitRatio{.value = stated.fixed.value_or(0.0)};
+  if (stated.che) {
+    auto checked = detail::che_inputs(inputs);
+    if (!checked) return std::unexpected{std::move(checked.error())};
+    resolved = std::move(*checked);
+    policy = caching::CheHitRatio{.popularity = detail::che_popularity(nodes_, resolved)};
+  }
+  const auto arcs = detail::ring_arcs(resolved.partitions, nodes_[cache].imbalance);
+  const double replica_keys = static_cast<double>(nodes_[cache].spec.keys.value_or(0));
+  resolved.value = detail::hit_ratio_over_arcs(policy, replica_keys, arcs);
+  if (const auto* che = std::get_if<caching::CheHitRatio>(&policy)) {
+    resolved.shards = detail::che_shards(*che, replica_keys, arcs);
+  }
+  nodes_[cache].hit_ratio = std::move(resolved);
   return {};
 }
 
