@@ -3140,12 +3140,14 @@ TEST_CASE("a sql database's shards, pool, replication lag and write ops are type
     require_rejected("simsys_sql_lag_negative.yaml", db_scenario("replication_lag: -1ms"),
                      "node 'db': replication_lag: expected a non-negative finite number");
   }
-  // `pool` is sugar for `advanced.concurrency` (the connection pool is the number of
-  // requests the database serves at once): stating both is a contradiction waiting to happen.
+  // `pool` is no longer sugar for `advanced.concurrency`: it sets c AND caps the copy's rate at
+  // pool / service time (Little's law, graph::apply_database_keys), which a bare concurrency
+  // never does. Two settings for one c would still contradict each other, so stating both is
+  // refused, and the message says which one to keep and why (re-review of 96848f0).
   SECTION("pool together with advanced.concurrency") {
-    require_rejected("simsys_sql_pool_and_concurrency.yaml",
-                     db_scenario("pool: 8, advanced: {concurrency: 8}"),
-                     "node 'db': pool and advanced.concurrency are the same setting");
+    require_rejected(
+        "simsys_sql_pool_and_concurrency.yaml", db_scenario("pool: 8, advanced: {concurrency: 8}"),
+        "node 'db': pool sets c and caps the rate by Little's law; drop advanced.concurrency");
   }
 }
 

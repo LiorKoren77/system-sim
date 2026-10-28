@@ -1540,6 +1540,24 @@ TEST_CASE("a hash ring imposes no hot copy on a database", "[graph]") {
   REQUIRE(g->nodes()[*g->index_of("db")].imbalance == 1.0);
 }
 
+// Two balancers whose policies give different replica models may both front a database: neither
+// model applies to it (its driver picks the copy), so there is no conflict to refuse. A hash ring
+// (imbalanced) and a least_connections balancer (pooled) both linked to `db` build, and `db`
+// keeps even, unpooled copies (re-review of 96848f0).
+TEST_CASE("balancers of different replica models may both front a database", "[graph]") {
+  auto s = database_behind_ring(true);
+  s.nodes.push_back(NodeSpec{
+      .id = "least", .type = NodeType::load_balancer, .policy = LbPolicy::least_connections});
+  s.links.push_back(LinkSpec{.from = "u", .to = "least"});
+  s.links.push_back(LinkSpec{.from = "least", .to = "db"});
+  const auto g = Graph::build(s);
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto& db = g->nodes()[*g->index_of("db")];
+  REQUIRE(db.imbalance == 1.0);
+  REQUIRE_FALSE(db.pooled);
+}
+
 // A database is a leaf: it answers every query itself (behaviours::SqlDbBehaviour), so a link
 // that would carry demand out of it would carry nothing. Graph::build refuses one in a scenario
 // built in code with the loader's message, whichever end writes it.
