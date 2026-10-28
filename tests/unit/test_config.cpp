@@ -9,6 +9,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include <unistd.h>  // getpid
 
@@ -16,6 +17,7 @@
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
 import simsys.config;
+import simsys.core;
 import simsys.model;
 
 using namespace std::chrono_literals;
@@ -687,5 +689,203 @@ nodes:
 links: []
 )",
                      "node id must not be empty");
+  }
+}
+
+TEST_CASE("common node keys are typed: dc, replicas, capacity, latency, advanced") {
+  const auto path = write_temp("simsys_typed_node_keys.yaml", R"(
+version: 1
+name: typed
+duration: 1m
+datacenters: {eu: {}, us: {}}
+nodes:
+  users: {type: client, dc: eu, rate: {base: 10/s}, ops: {ping: 1.0}}
+  api:
+    type: service
+    dc: us
+    replicas: 4
+    capacity: 3k/s
+    latency: 0.3ms
+    advanced: {queue_limit: 50, concurrency: 8, service_variability: 1.5, burstiness: 2, yellow: 0.6, red: 0.8}
+links:
+  - {from: users, to: api, dir: inout}
+)");
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->datacenters == std::vector<std::string>{"eu", "us"});
+  REQUIRE(s->nodes.size() == 2);
+  const auto& api = s->nodes[1];
+  REQUIRE(api.id == "api");
+  CHECK(api.dc == "us");
+  CHECK(api.replicas == 4);
+  CHECK(api.capacity == simsys::Rate{3000});
+  CHECK(api.latency == 300us);
+  CHECK(api.advanced.queue_limit == 50.0);
+  CHECK(api.advanced.concurrency == 8);
+  CHECK(api.advanced.service_variability == 1.5);
+  CHECK(api.advanced.burstiness == 2.0);
+  CHECK(api.advanced.yellow == 0.6);
+  CHECK(api.advanced.red == 0.8);
+}
+
+TEST_CASE("top-level seed, step and warmup are typed with defaults") {
+  SECTION("explicit values") {
+    const auto path = write_temp("simsys_header_options.yaml", R"(
+version: 1
+name: t
+duration: 2h
+seed: 7
+step: 50ms
+warmup: 1m
+nodes: {a: {type: service}}
+links: []
+)");
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    CHECK(s->seed == 7);
+    CHECK(s->step == 50ms);
+    CHECK(s->warmup == 1min);
+  }
+  SECTION("absent keys take the schema defaults") {
+    const auto path = write_temp("simsys_header_defaults.yaml", R"(
+version: 1
+name: t
+duration: 2h
+nodes: {a: {type: service}}
+links: []
+)");
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    CHECK(s->seed == 1);
+    CHECK(s->step == 100ms);
+    CHECK(s->warmup == 0s);
+    CHECK(s->datacenters == std::vector<std::string>{"main"});
+  }
+}
+
+TEST_CASE("a node's dc must be a declared datacenter") {
+  require_rejected("simsys_unknown_dc.yaml", R"(
+version: 1
+name: t
+duration: 1m
+datacenters: {eu: {}}
+nodes:
+  a: {type: service, dc: mars}
+links: []
+)",
+                   "node 'a': unknown datacenter 'mars'");
+}
+
+TEST_CASE("replicas must be a positive integer") {
+  require_rejected("simsys_bad_replicas.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a: {type: service, replicas: 0}
+links: []
+)",
+                   "node 'a': replicas must be a positive integer");
+}
+
+TEST_CASE("advanced thresholds must satisfy 0 < yellow < red <= 1") {
+  require_rejected("simsys_bad_thresholds.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a:
+    type: service
+    advanced: {yellow: 0.9, red: 0.8}
+links: []
+)",
+                   "node 'a': advanced.yellow must be below advanced.red");
+}
+
+TEST_CASE("unknown keys are rejected at the top level and inside a node") {
+  SECTION("top level") {
+    require_rejected("simsys_unknown_top_key.yaml", R"(
+version: 1
+name: t
+duration: 1m
+colour: blue
+nodes:
+  a: {type: service}
+links: []
+)",
+                     "unknown top-level key 'colour'");
+  }
+  SECTION("inside a node") {
+    require_rejected("simsys_unknown_node_key.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a: {type: service, ttl: 5s}
+links: []
+)",
+                     "node 'a': key 'ttl' is not valid for type 'service'");
+  }
+}
+
+TEST_CASE("a byte-rate capacity is stored separately from a request-rate capacity") {
+  const auto path = write_temp("simsys_byte_capacity_field.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  b: {type: blob_store, capacity: 500MB/s}
+links: []
+)");
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->nodes.size() == 1);
+  CHECK_FALSE(s->nodes[0].capacity.has_value());
+  CHECK(s->nodes[0].byte_capacity == simsys::ByteRate{500e6});
+}
+
+TEST_CASE("advanced numeric keys are range-checked") {
+  SECTION("concurrency of zero") {
+    require_rejected("simsys_bad_concurrency.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a:
+    type: service
+    advanced: {concurrency: 0}
+links: []
+)",
+                     "node 'a': advanced.concurrency must be a positive integer");
+  }
+  SECTION("negative queue_limit") {
+    require_rejected("simsys_bad_queue_limit.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a:
+    type: service
+    advanced: {queue_limit: -5}
+links: []
+)",
+                     "node 'a': advanced.queue_limit must be positive");
+  }
+  SECTION("negative burstiness") {
+    require_rejected("simsys_bad_burstiness.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a:
+    type: service
+    advanced: {burstiness: -1}
+links: []
+)",
+                     "node 'a': advanced.burstiness must be non-negative");
   }
 }
