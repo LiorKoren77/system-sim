@@ -1691,7 +1691,8 @@ TEST_CASE("ops and then are accepted only on the types the schema gives them") {
   }
 }
 
-TEST_CASE("latency SLOs must name a client and one of its ops; ratio maxima lie in [0, 1]") {
+// (No square brackets in a test name: Catch2's ctest discovery reads them as tags.)
+TEST_CASE("latency SLOs must name a client and one of its ops; ratio maxima lie between 0 and 1") {
   const auto with_slo = [](std::string_view entry) {
     return scenario_with(
         "  u: {type: client, rate: {base: 1/s}, ops: {a: 1}}\n"
@@ -3214,7 +3215,7 @@ simsys::model::Scenario load_cdn(std::string_view file_name, std::string_view bo
 }  // namespace
 
 // NodeSpec::origin is the name of the node the CDN fetches its misses from; the graph turns it
-// into a demand edge cdn -> origin. (The name `origin` for the field is this test's proposal.)
+// into a demand edge cdn -> origin.
 TEST_CASE("a cdn's origin is stored on the node") {
   const auto s = load_cdn("simsys_cdn_origin.yaml", "hit_ratio: {fixed: 0.95}, origin: origin");
   const auto& cdn = s.nodes[1];
@@ -3229,11 +3230,34 @@ TEST_CASE("a cdn without an origin is refused: its misses would have nowhere to 
 }
 
 // The origin is a server the CDN calls. A client offers traffic and receives none, so a CDN
-// whose "origin" is a client could never forward a miss to it. (The message is this test's
-// proposal; the implementer may reword it, and then this expectation moves with it.)
+// whose "origin" is a client could never forward a miss to it. The words are the graph's for
+// any call to a client ("clients only send"), so the loader and the graph say it the same way.
 TEST_CASE("a cdn whose origin is a client is refused") {
   require_rejected("simsys_cdn_origin_client.yaml", cdn_scenario("origin: u"),
-                   "node 'cdn': origin must not be a client");
+                   "node 'cdn': origin 'u' is a client; clients only send");
+}
+
+// A CDN that is its own origin would ask itself for every miss: nothing could ever answer it
+// (review of 4d539b0, M6).
+TEST_CASE("a cdn that is its own origin is refused") {
+  require_rejected("simsys_cdn_origin_self.yaml", cdn_scenario("origin: cdn"),
+                   "node 'cdn': a cdn cannot be its own origin");
+}
+
+// A CDN caches every op that reaches it unless the op is one of its write ops (`write` by
+// default): a client's `upload` sent through the CDN would be "served at the edge" for the hit
+// share of it. `write_ops` on a cdn names the ops that are writes, as on a cache, so the graph
+// refuses them on their way in (a cdn does not take writes) instead of caching them (review of
+// 4d539b0, I2).
+TEST_CASE("a cdn reads write_ops, the ops it refuses rather than caches") {
+  const auto s = load_cdn("simsys_cdn_write_ops.yaml",
+                          "hit_ratio: {fixed: 0.9}, write_ops: [upload], origin: origin");
+  REQUIRE(s.nodes[1].write_ops == std::vector<std::string>{"upload"});
+  SECTION("an empty list is refused, as on a cache") {
+    require_rejected("simsys_cdn_write_ops_empty.yaml",
+                     cdn_scenario("write_ops: [], origin: origin"),
+                     "node 'cdn': write_ops must name at least one op");
+  }
 }
 
 TEST_CASE("a cdn's hit ratio is fixed or che, and its ttl is accepted") {
@@ -3242,6 +3266,7 @@ TEST_CASE("a cdn's hit ratio is fixed or che, and its ttl is accepted") {
         load_cdn("simsys_cdn_fixed.yaml", "ttl: 1h, hit_ratio: {fixed: 0.95}, origin: origin");
     REQUIRE(s.nodes[1].hit_ratio.has_value());
     REQUIRE(s.nodes[1].hit_ratio->fixed == 0.95);
+    REQUIRE(s.nodes[1].ttl == std::chrono::hours{1});  // stored for explain, not modelled
   }
   SECTION("che") {
     const auto s = load_cdn("simsys_cdn_che.yaml", "ttl: 24h, hit_ratio: che, origin: origin");

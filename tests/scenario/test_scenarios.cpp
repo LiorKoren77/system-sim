@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <string>
+#include <utility>
 #include <vector>
 
 // C++20 `import`: brings the module's exported names into this translation unit without
@@ -245,7 +246,11 @@ TEST_CASE("book/news-feed's media store is checked against the cdn's 5 percent m
 // che hit ratio: valid scenario, explained, but not runnable before phase 2c's byte flows.
 // The engine's FIRST refusal is the node types it does not simulate at all (blob_store, queues
 // and workers: "... (phase 2)"), which comes before the cdn's own byte-capacity refusal
-// (see the theory test for that message), so only "phase 2" is asserted here.
+// (see the theory test for that message), so only "phase 2" is asserted about the run. What
+// the cdn changed is pinned through explain instead (review of 4d539b0, M12): the two edges'
+// Che hit ratios (Zipf 1 over 10M videos, 100k and 50k of them at the edge: 0.642 and 0.594,
+// checked against an independent Python computation by the reviewer) and the miss flow they
+// send transcoded_store, which an explain that ignored the origin edge would leave at zero.
 TEST_CASE("book/youtube validates and explains, and the engine does not run it yet", "[scenario]") {
   const auto s =
       simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml");
@@ -260,8 +265,51 @@ TEST_CASE("book/youtube validates and explains, and the engine does not run it y
   REQUIRE(cdn_us->hit_ratio->che);
   const auto g = simsys::graph::Graph::build(*s);
   if (!g) FAIL(g.error().message);
-  REQUIRE_FALSE(simsys::report::render_explain(*g).empty());
+  REQUIRE_THAT(*g->hit_ratio(*g->index_of("cdn_us")), Catch::Matchers::WithinAbs(0.642, 5e-4));
+  REQUIRE_THAT(*g->hit_ratio(*g->index_of("cdn_eu")), Catch::Matchers::WithinAbs(0.594, 5e-4));
+  const auto text = simsys::report::render_explain(*g);
+  CAPTURE(text);
+  // The edges' misses at the evening peak, (1 − h_us) × 281.6/s + (1 − h_eu) × 140.8/s (each
+  // client's base × 1.6 × 88 % streams) = 157.8/s; the transcoders' writes add nothing on paper
+  // yet (a worker pool's load is phase 2c's).
+  REQUIRE_THAT(peak_offered_per_s(text, "transcoded_store"),
+               Catch::Matchers::WithinRel(157.8, 1e-3));
   const auto sim = simsys::engine::Simulation::create(*g);
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message.find("phase 2") != std::string::npos);
+}
+
+namespace {
+// The check line of node `id` in explain's checks block.
+std::string check_line_of(const std::string& explain_text, const std::string& id) {
+  const auto at = explain_text.find("\n  " + id + " ", explain_text.find("checks ("));
+  REQUIRE(at != std::string::npos);
+  return explain_text.substr(at + 1, explain_text.find('\n', at + 1) - at - 1);
+}
+}  // namespace
+
+// Every byte capacity in the two book scenarios becomes requests at an assumed 1 MB per object,
+// where youtube's streams are 50 MB and news-feed's media 200 KB: a green percentage there would
+// be a verdict on an invented number (cdn_us 0.28 % where the bytes give about 14 %). So explain
+// gives those checks no zone and says why (review of 4d539b0, I1). The READMEs say the same.
+TEST_CASE("book scenarios give no verdict on capacities converted from bytes", "[scenario]") {
+  const std::vector<std::pair<std::string, std::vector<std::string>>> byte_sized{
+      {"/book/youtube/scenario.yaml", {"cdn_us", "cdn_eu", "original_store", "transcoded_store"}},
+      {"/book/news-feed/scenario.yaml", {"media_store"}}};
+  for (const auto& [file, ids] : byte_sized) {
+    const auto s = simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + file);
+    if (!s) FAIL(s.error().file << ":" << s.error().line << ": " << s.error().message);
+    const auto g = simsys::graph::Graph::build(*s);
+    if (!g) FAIL(g.error().message);
+    const auto text = simsys::report::render_explain(*g);
+    for (const auto& id : ids) {
+      const auto line = check_line_of(text, id);
+      CAPTURE(file, line);
+      // C++23 std::string::contains: a substring test in one call, replacing
+      // `find(...) != std::string::npos`.
+      REQUIRE(line.contains("(not checked: capacity from "));
+      REQUIRE(line.contains("at 1MB/object; byte flows: phase 2c)"));
+      REQUIRE_FALSE(line.contains("green"));
+    }
+  }
 }
