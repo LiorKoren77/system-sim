@@ -1310,9 +1310,20 @@ CheckResult read_optional_number(const Site& site, const YAML::Node& parent, std
   return {};
 }
 
+// ---- Sizes (plan 2c refinement 1) ------------------------------------------------------
+
+// One size, as a client's `sizes` entry or a step's `size` writes it (parse_size: `50MB`).
+// The message replaces the parser's: whatever was wrong, the author needs the grammar.
+// `label` names the value: "sizes 'stream'", "step size".
+std::expected<Bytes, ConfigError> read_size(const Site& site, const YAML::Node& value,
+                                            std::string_view label) {
+  if (const auto size = parse_size(scalar_text(value))) return *size;
+  return site.fail(value, std::format("{} must be a size (B, KB, MB or GB: 50MB)", label));
+}
+
 // ---- Steps: how a node forwards an op (docs/scenario-schema.md, "step") ----------------
 
-constexpr std::string_view step_keys = "to op on mode factor";
+constexpr std::string_view step_keys = "to op on mode factor size";
 
 // Pattern: Parameter Object — what every step of one node is read against: the node's
 // site (for messages), its id (a step may not target it) and the declared ids.
@@ -1342,8 +1353,17 @@ std::expected<std::string, ConfigError> read_step_op(const Site& site, const YAM
   return site.fail(step, "then step needs an 'op'");
 }
 
+// `size: 50MB`, optional: the payload the step's request carries (model::Step::size).
+CheckResult read_step_size(const Site& site, const YAML::Node& yaml, model::Step& step) {
+  if (!yaml["size"]) return {};
+  return check_not_null(site, yaml, "size", "step size").and_then([&] {
+    return read_size(site, yaml["size"], "step size").transform(store_in(step.size));
+  });
+}
+
 // `on` gates the flow (a cache's `miss` steps see only what it did not serve, ch. 1),
 // `mode` decides whether latencies add (sequential) or overlap (parallel: the max counts),
+// `size` is the payload the request carries (plan 2c refinement 1),
 // `factor` multiplies the flow (fan-out on write: one post -> 100 feed writes, ch. 11).
 CheckResult read_step_attributes(const Site& site, const YAML::Node& yaml, model::Step& step) {
   if (auto read = read_optional_word(site, yaml, "on", model::parse_step_condition,
@@ -1356,6 +1376,7 @@ CheckResult read_step_attributes(const Site& site, const YAML::Node& yaml, model
       !read) {
     return read;
   }
+  if (auto read = read_step_size(site, yaml, step); !read) return read;
   if (auto read = read_optional_number(site, yaml, "factor", is_positive,
                                        "step factor must be a finite positive number", step.factor);
       !read) {
@@ -1996,6 +2017,47 @@ CheckResult read_client_keys(const Site& site, const YAML::Node& body, model::Wo
   });
 }
 
+// True when the client sends `op`, i.e. it has a share in the client's op mix.
+bool sends_op(const model::Workload& workload, std::string_view op) {
+  // C++20 std::views::keys: a view of each pair's first member (the op name).
+  return std::ranges::contains(workload.op_shares | std::views::keys, op);
+}
+
+// One entry of `sizes: {stream: 50MB}`: an op the client sends, and its size.
+std::expected<std::pair<std::string, Bytes>, ConfigError> read_op_size(
+    const Site& site, const YamlElement& entry, const model::Workload& workload) {
+  auto op = read_op_name(site, entry.first, "op name");
+  if (!op) return std::unexpected(op.error());
+  if (!sends_op(workload, *op)) {
+    return site.fail(entry.first,
+                     std::format("sizes names op '{}', which the client does not send", *op));
+  }
+  const auto label = std::format("sizes '{}'", *op);
+  return check_entry_not_null(site, entry, label).and_then([&] {
+    return read_size(site, entry.second, label).transform([&](Bytes size) {
+      return std::pair{std::move(*op), size};
+    });
+  });
+}
+
+// `sizes: {stream: 50MB, upload: 300MB}` (model::Workload::sizes), optional; read after the
+// op shares, since every op it sizes must be one the client sends.
+CheckResult read_client_sizes(const Site& site, const YAML::Node& body, model::Workload& workload) {
+  const auto sizes = body["sizes"];
+  if (!sizes) return {};
+  if (auto checked = check_not_null(site, body, "sizes", "sizes", empty_map); !checked) {
+    return checked;
+  }
+  if (!sizes.IsMap()) return site.fail(sizes, "sizes must be a map");
+  // C++23 std::ranges::to: collects a range into a container in one call, replacing a loop
+  // of inserts (or the iterator-pair constructor) into a map declared beforehand.
+  return collect_each(sizes,
+                      [&](const YamlElement& entry) { return read_op_size(site, entry, workload); })
+      .transform([&](const auto& entries) {
+        workload.sizes = std::ranges::to<std::map<std::string, Bytes>>(entries);
+      });
+}
+
 std::expected<model::Workload, ConfigError> read_workload(const Site& site,
                                                           const YAML::Node& body) {
   model::Workload workload;
@@ -2004,6 +2066,9 @@ std::expected<model::Workload, ConfigError> read_workload(const Site& site,
     return std::unexpected(read.error());
   }
   if (auto read = read_client_keys(site, body, workload); !read) {
+    return std::unexpected(read.error());
+  }
+  if (auto read = read_client_sizes(site, body, workload); !read) {
     return std::unexpected(read.error());
   }
   if (auto read = read_optional_duration(site, body, "timeout", workload.timeout); !read) {
@@ -2407,7 +2472,6 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
 
 // ---- Links ----------------------------------------------------------------------------
 
-// `bandwidth` † is accepted and ignored until phase 2 models byte flows.
 constexpr std::string_view link_keys = "from to dir ops latency bandwidth weight";
 
 // A link is named by its ends before they are checked: "link a -> b" in every message.
@@ -2485,6 +2549,26 @@ CheckResult read_link_weight(const Site& site, const YAML::Node& link, double& w
   return site.fail(link["weight"], "weight must be at most 1e9");
 }
 
+// `bandwidth: 40Gbit/s` (model::LinkSpec::bandwidth), optional: a byte rate, in bytes or, as a
+// network is rated, in bits (parse_byte_rate). The message replaces the parser's: a request
+// rate (`10k/s`) is the likely mistake, and the author needs the byte forms. Positive: a pipe
+// of zero capacity carries nothing.
+CheckResult read_link_bandwidth(const Site& site, const YAML::Node& link,
+                                std::optional<ByteRate>& bandwidth) {
+  const auto value = link["bandwidth"];
+  if (!value) return {};
+  if (auto checked = check_not_null(site, link, "bandwidth", "bandwidth"); !checked) {
+    return checked;
+  }
+  const auto rate = parse_byte_rate(scalar_text(value));
+  if (!rate) {
+    return site.fail(value, "bandwidth is a byte rate (B/s, or bit/s for a network: 40Gbit/s)");
+  }
+  if (!is_positive(rate->bytes_per_second)) return site.fail(value, "bandwidth must be positive");
+  bandwidth = *rate;
+  return {};
+}
+
 CheckResult read_link_attributes(const Site& site, const YAML::Node& link, model::LinkSpec& spec) {
   if (auto checked = check_known_keys(site, link, link_keys, "key"); !checked) return checked;
   if (auto read = read_optional_word(site, link, "dir", model::parse_direction,
@@ -2494,6 +2578,7 @@ CheckResult read_link_attributes(const Site& site, const YAML::Node& link, model
   }
   if (auto read = read_link_ops(site, link, spec.ops); !read) return read;
   if (auto read = read_optional_duration(site, link, "latency", spec.latency); !read) return read;
+  if (auto read = read_link_bandwidth(site, link, spec.bandwidth); !read) return read;
   return read_link_weight(site, link, spec.weight);
 }
 
@@ -2635,9 +2720,7 @@ std::expected<SloMaximum, ConfigError> read_slo_max(const Site& site, const YAML
 }
 
 bool offers_op(const model::NodeSpec& client, std::string_view op) {
-  // C++20 std::views::keys: a view of each pair's first member (the op name).
-  return client.workload &&
-         std::ranges::contains(client.workload->op_shares | std::views::keys, op);
+  return client.workload && sends_op(*client.workload, op);
 }
 
 // A latency percentile is measured over requests, and requests start at a client: only a
