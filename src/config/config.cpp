@@ -12,6 +12,7 @@ module;
 #include <expected>
 #include <format>
 #include <functional>
+#include <limits>
 #include <map>
 #include <optional>
 #include <ranges>
@@ -138,9 +139,10 @@ bool is_positive(double v) {
 bool is_non_negative(double v) {
   return std::isfinite(v) && v >= 0;
 }
-// A count held in a double (the model stores queue_limit as one): positive and whole.
-bool is_positive_whole(double v) {
-  return is_positive(v) && std::trunc(v) == v;
+// Non-negative, infinity included (NaN fails): for a key whose upper bound is a separate
+// rule with its own message, such as a link weight.
+bool is_zero_or_more(double v) {
+  return v >= 0;
 }
 // A utilization fraction: above 0 (a zero threshold would colour an idle node) and at most
 // 1 (utilization cannot exceed 100%).
@@ -165,16 +167,24 @@ struct AdvancedNumber {
 };
 
 // Pattern: Table-driven method — each numeric advanced key is one row, so the reading and
-// range-checking code is written once. `concurrency` is an int in the model and is read
-// separately; `queue_limit` is an int in the schema but a double in the model, so it is
-// read as a number and must be whole.
-constexpr std::array<AdvancedNumber, 5> advanced_numbers{{
-    {"queue_limit", is_positive_whole, "a positive integer", &model::Advanced::queue_limit},
+// range-checking code is written once. The integer keys are not rows: they are read like
+// `replicas` (see advanced_integer_keys).
+constexpr std::array<AdvancedNumber, 4> advanced_numbers{{
     {"service_variability", is_non_negative, "non-negative", &model::Advanced::service_variability},
     {"burstiness", is_non_negative, "non-negative", &model::Advanced::burstiness},
     {"yellow", is_unit_fraction, "in (0, 1]", &model::Advanced::yellow},
     {"red", is_unit_fraction, "in (0, 1]", &model::Advanced::red},
 }};
+
+// The advanced keys the schema types as int, read by the integer rule of `replicas` (a plain
+// whole number: no "3.0", no "1e3"). `queue_limit` is a double in the model, as the queueing
+// formulas take it, but a waiting room holds whole requests.
+constexpr std::string_view advanced_integer_keys = "concurrency queue_limit";
+
+// How a scenario writes an empty list or map, for the messages about a key left without a
+// value where an empty one is valid (`links:` -> "write [] for none").
+constexpr std::string_view empty_list = "[]";
+constexpr std::string_view empty_map = "{}";
 
 // yaml-cpp counts lines and columns from 0; editors and compilers count from 1.
 ConfigError error_at_mark(const std::string& file, const YAML::Mark& mark, std::string message) {
@@ -249,6 +259,11 @@ bool is_sequence(const YAML::Node& node) {
   return node.IsDefined() && node.IsSequence();
 }
 
+// True for a key written with nothing after it; false for a missing key, too.
+bool is_null(const YAML::Node& node) {
+  return node.IsDefined() && node.IsNull();
+}
+
 // The text of a scalar, "" for a list, a map or null; used where the caller's own message
 // ("must be always, miss or failure", ...) covers those shapes too.
 std::string scalar_text(const YAML::Node& node) {
@@ -274,6 +289,35 @@ std::optional<T> parse_whole(std::string_view text) {
   return value;
 }
 
+// YAML 1.2's spellings of infinity and not-a-number; from_chars knows only "inf" and "nan".
+constexpr std::array<std::string_view, 3> yaml_infinity{".inf", ".Inf", ".INF"};
+constexpr std::array<std::string_view, 3> yaml_not_a_number{".nan", ".NaN", ".NAN"};
+
+// A number as YAML writes it: a decimal or exponent form through parse_whole, or one of
+// YAML's own `.inf`, `-.inf`, `.nan`. Reading those as the values they mean lets each range
+// rule reject them with its own message ("weight must be at most 1e9") instead of "no number".
+std::optional<double> parse_yaml_double(std::string_view text) {
+  // C++20 std::string_view::starts_with (and its twin ends_with): a prefix test in one call,
+  // replacing `!text.empty() && text[0] == '-'` or compare(0, n, prefix) arithmetic.
+  const bool negative = text.starts_with('-');
+  const auto magnitude = negative || text.starts_with('+') ? text.substr(1) : text;
+  // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
+  // `std::find(begin, end, value) != end`.
+  if (std::ranges::contains(yaml_infinity, magnitude)) {
+    return negative ? -std::numeric_limits<double>::infinity()
+                    : std::numeric_limits<double>::infinity();
+  }
+  if (std::ranges::contains(yaml_not_a_number, text)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  return parse_whole<double>(text);
+}
+
+// The value of a numeric key, or nothing when it is no number (see number_text).
+std::optional<double> number_value(const YAML::Node& node) {
+  return parse_yaml_double(number_text(node));
+}
+
 // The key node of `parent[key]`, for messages about the key itself. yaml-cpp's lookup
 // returns only the value.
 YAML::Node key_node(const YAML::Node& parent, std::string_view key) {
@@ -283,13 +327,42 @@ YAML::Node key_node(const YAML::Node& parent, std::string_view key) {
   return parent;
 }
 
-// A key written with nothing after it (`capacity:`) holds null. yaml-cpp places a null
-// value where the next token starts, usually the next line, so the error points at the key.
-// `label` names the key in the message ("capacity", "rate.base").
+// The node an error about the value of `parent[key]` points at. A key written with nothing
+// after it (`capacity:`, `ops:`) holds null, and yaml-cpp places a null value where the next
+// token starts, usually the next line: for a null the key is where the reader must look.
+// Any other value is its own best location.
+YAML::Node shape_site(const YAML::Node& parent, std::string_view key) {
+  const auto value = parent[std::string{key}];
+  return is_null(value) ? key_node(parent, key) : value;
+}
+
+// The same for one entry of a map being iterated, whose key node is at hand.
+YAML::Node shape_site(const YamlElement& entry) {
+  return entry.second.IsNull() ? entry.first : entry.second;
+}
+
+// "<label> must not be empty". Where an empty list or map is valid, `none` ("[]", "{}") says
+// how to write one, so the message does not contradict `links: []` loading fine.
+std::string empty_message(std::string_view label, std::string_view none) {
+  if (none.empty()) return std::format("{} must not be empty", label);
+  return std::format("{} must not be empty (write {} for none)", label, none);
+}
+
+// A key holding null is reported as empty, at the key (shape_site), whatever the value's
+// type: a scalar, a list or a map. Every reader runs this before its own shape check, so no
+// "must be a map" ever points at the line after a bare key. `label` names the key in the
+// message ("capacity", "rate.base", "op share 'ping'").
 CheckResult check_not_null(const Site& site, const YAML::Node& parent, std::string_view key,
-                           std::string_view label) {
-  if (!parent[std::string{key}].IsNull()) return {};
-  return site.fail(key_node(parent, key), std::format("{} must not be empty", label));
+                           std::string_view label, std::string_view none = {}) {
+  if (!is_null(parent[std::string{key}])) return {};
+  return site.fail(shape_site(parent, key), empty_message(label, none));
+}
+
+// The same for one entry of a map being iterated (an op share, an advanced key, a datacenter).
+CheckResult check_entry_not_null(const Site& site, const YamlElement& entry, std::string_view label,
+                                 std::string_view none = {}) {
+  if (!entry.second.IsNull()) return {};
+  return site.fail(shape_site(entry), empty_message(label, none));
 }
 
 // The text of `parent[key]`, which the caller has checked is present. yaml-cpp's Scalar()
@@ -390,17 +463,53 @@ CheckResult check_map_keys_unique(const Site& site, const YAML::Node& map, std::
   return {};
 }
 
-// Every map of the document, at any depth: a depth-first walk through maps and lists.
-CheckResult check_unique_keys(const Site& site, const YAML::Node& node) {
+// YAML aliases: `&name` anchors a node and `*name` refers back to it. yaml-cpp resolves an
+// alias to the anchored node itself, shared, not to a copy. A walk that follows every
+// reference therefore meets a shared node once per path to it, and nested aliases multiply
+// the paths: 8 nested lists that each repeat the level below 10 times reach the innermost
+// map 10^8 times from a few hundred bytes of text (the "billion laughs" pattern), and the
+// loader would run for minutes. The walk below visits each map and list once, so it is
+// linear in the size of the document (times a log for the set). Checking a shared node once
+// is also the right meaning: its keys are the same wherever it is referenced.
+//
+// Pattern: Visited set — the guard of a graph traversal. A tree whose aliases share subtrees
+// is a directed acyclic graph, and the set makes a depth-first walk visit each vertex once.
+//
+// yaml-cpp gives a node no address or id; its only identity test is `a.is(b)`. An alias
+// reports its anchor's Mark (line, column), so a shared node is filed under one position.
+// The set files nodes by Mark and compares with is() only within one position: distinct
+// maps and lists start at distinct positions (verified 2026-10-28 with yaml-cpp on every
+// scenario and on nested flow and block collections), so a bucket holds one node, a visit
+// costs O(log n) and the walk O(n log n). The is() test keeps it correct even if two
+// containers did share a position.
+class VisitedNodes {
+ public:
+  // True the first time `node` is offered, false every time after.
+  bool first_visit(const YAML::Node& node) {
+    auto& bucket = by_position_[{node.Mark().line, node.Mark().column}];
+    const auto same_node = [&node](const YAML::Node& seen) { return seen.is(node); };
+    if (std::ranges::any_of(bucket, same_node)) return false;
+    bucket.push_back(node);
+    return true;
+  }
+
+ private:
+  std::map<std::pair<int, int>, std::vector<YAML::Node>> by_position_;
+};
+
+// Every map of the document, at any depth: a depth-first walk through maps and lists that
+// visits each of them once, however many aliases refer to it.
+CheckResult check_unique_keys(const Site& site, const YAML::Node& node, VisitedNodes& visited) {
+  if (!node.IsMap() && !node.IsSequence()) return {};
+  if (!visited.first_visit(node)) return {};
   if (node.IsMap()) {
     if (auto checked = check_map_keys_unique(site, node, "key"); !checked) return checked;
   }
-  if (!node.IsMap() && !node.IsSequence()) return {};
   for (const auto& element : node) {
     // A map entry's child is its value; a list element is itself the child (a YamlElement
     // is a Node too, hence the cast to pick that view of it).
     const auto& child = node.IsMap() ? element.second : static_cast<const YAML::Node&>(element);
-    if (auto checked = check_unique_keys(site, child); !checked) return checked;
+    if (auto checked = check_unique_keys(site, child, visited); !checked) return checked;
   }
   return {};
 }
@@ -412,7 +521,8 @@ CheckResult check_no_repeated_keys(const Site& site, const YAML::Node& root) {
   if (const auto nodes = root["nodes"]; nodes.IsMap()) {
     if (auto checked = check_map_keys_unique(site, nodes, "node id"); !checked) return checked;
   }
-  return check_unique_keys(site, root);
+  VisitedNodes visited;
+  return check_unique_keys(site, root, visited);
 }
 
 // ---- Top level ------------------------------------------------------------------------
@@ -453,11 +563,38 @@ CheckResult check_faults_is_list(const Site& site, const YAML::Node& root) {
   return site.fail(faults, "faults must be a list");
 }
 
+// A top-level key whose value is a list or map, and how it is written empty when that is
+// valid ("" when it is not: a scenario needs nodes, and `datacenters` declares at least one).
+struct Section {
+  std::string_view key;
+  std::string_view none;
+};
+
+constexpr std::array<Section, 5> sections{{
+    {"datacenters", ""},
+    {"nodes", ""},
+    {"links", empty_list},
+    {"slo", empty_list},
+    {"faults", empty_list},
+}};
+
+// A bare `links:` is reported here, at its key, before any reader asks for a list.
+CheckResult check_sections_not_null(const Site& site, const YAML::Node& root) {
+  for (const auto& section : sections) {
+    if (auto checked = check_not_null(site, root, section.key, section.key, section.none);
+        !checked) {
+      return checked;
+    }
+  }
+  return {};
+}
+
 CheckResult check_top_level(const Site& site, const YAML::Node& root) {
   if (auto checked = check_root_is_map(site, root); !checked) return checked;
   if (auto checked = check_no_repeated_keys(site, root); !checked) return checked;
   if (auto checked = check_required_top_level_keys(site, root); !checked) return checked;
   if (auto checked = check_known_top_level_keys(site, root); !checked) return checked;
+  if (auto checked = check_sections_not_null(site, root); !checked) return checked;
   return check_faults_is_list(site, root);
 }
 
@@ -515,22 +652,46 @@ CheckResult read_header(const Site& site, const YAML::Node& root, model::Scenari
 
 // ---- Datacenters ----------------------------------------------------------------------
 
-// One datacenter: a non-empty name whose value is its settings map (`{}` today).
-CheckResult read_datacenter(const Site& site, const YamlElement& entry, Datacenters& names) {
-  const auto& name = entry.first.Scalar();
-  if (name.empty()) return site.fail(entry.first, "name must not be empty");
-  if (!entry.second.IsMap())
-    return site.fail(entry.second, std::format("'{}' must be a map", name));
-  names.push_back(name);
+// A key under `datacenters` is a name: a non-empty scalar. A list or map is valid YAML as a
+// key but names nothing.
+CheckResult check_datacenter_name(const Site& site, const YAML::Node& name) {
+  if (name.IsMap() || name.IsSequence()) return site.fail(name, "name must be a scalar");
+  if (scalar_text(name).empty()) return site.fail(name, "name must not be empty");
   return {};
 }
 
-// `latency` is not a datacenter: the schema reserves it for the list of cross-DC
-// round-trip overrides, which a later step reads; only its shape is checked now.
-CheckResult read_datacenter_entry(const Site& site, const YamlElement& entry, Datacenters& names) {
-  if (entry.first.Scalar() != "latency") return read_datacenter(site, entry, names);
+// A datacenter's value is its settings map. The schema reserves the map for later keys and
+// defines none yet, so it must be `{}`: any key in it is unknown.
+CheckResult check_datacenter_settings(const Site& site, const YamlElement& entry) {
+  const auto label = std::format("'{}'", entry.first.Scalar());
+  if (auto checked = check_entry_not_null(site, entry, label, empty_map); !checked) return checked;
+  if (!entry.second.IsMap()) return site.fail(entry.second, std::format("{} must be a map", label));
+  if (entry.second.size() == 0) return {};
+  const auto key = (*entry.second.begin()).first;
+  return site.fail(key, std::format("{} has unknown key '{}'", label, scalar_text(key)));
+}
+
+CheckResult read_datacenter(const Site& site, const YamlElement& entry, Datacenters& names) {
+  if (auto checked = check_datacenter_settings(site, entry); !checked) return checked;
+  names.push_back(entry.first.Scalar());
+  return {};
+}
+
+// `latency` is not a datacenter: the schema reserves it, the only such key under
+// `datacenters`, for the list of cross-DC round-trip overrides, which a later step reads;
+// only its shape is checked now.
+CheckResult check_latency_overrides(const Site& site, const YamlElement& entry) {
+  if (auto checked = check_entry_not_null(site, entry, "latency", empty_list); !checked) {
+    return checked;
+  }
   if (entry.second.IsSequence()) return {};
   return site.fail(entry.second, "latency must be a list");
+}
+
+CheckResult read_datacenter_entry(const Site& site, const YamlElement& entry, Datacenters& names) {
+  if (auto checked = check_datacenter_name(site, entry.first); !checked) return checked;
+  if (entry.first.Scalar() == "latency") return check_latency_overrides(site, entry);
+  return read_datacenter(site, entry, names);
 }
 
 // `datacenters` maps each name to its settings; only the names, in file order, matter yet.
@@ -579,8 +740,6 @@ CheckResult read_dc(const Site& site, const YAML::Node& body, model::NodeSpec& n
   }
   auto name = scalar_value(site, body, "dc");
   if (!name) return std::unexpected(name.error());
-  // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
-  // `std::find(begin, end, value) != end`.
   if (!std::ranges::contains(datacenters, *name)) {
     return site.fail(body["dc"], std::format("unknown datacenter '{}'", *name));
   }
@@ -606,7 +765,6 @@ CheckResult read_replicas(const Site& site, const YAML::Node& body, model::NodeS
 // "B/s" suffix decides which parser reads it and which field receives it, so a text that
 // neither parser accepts gets the message of the parser its suffix selects.
 std::expected<void, ParseError> read_capacity_text(std::string_view text, model::NodeSpec& node) {
-  // C++20 std::string_view::ends_with: a suffix test without size arithmetic.
   if (text.ends_with("B/s")) return parse_byte_rate(text).transform(store_in(node.byte_capacity));
   return parse_rate(text).transform(store_in(node.capacity));
 }
@@ -630,21 +788,43 @@ const AdvancedNumber* find_advanced_number(std::string_view key) {
 
 std::expected<double, ConfigError> read_advanced_number(const Site& site, const YAML::Node& value,
                                                         const AdvancedNumber& rule) {
-  const auto number = parse_whole<double>(number_text(value));
+  const auto number = number_value(value);
   if (number && rule.in_range(*number)) return *number;
   return site.fail(value, std::format("advanced.{} must be {}", rule.key, rule.requirement));
 }
 
-CheckResult read_advanced_entry(const Site& site, const YamlElement& entry, model::NodeSpec& node) {
+bool is_advanced_key(std::string_view name) {
+  return lists_word(advanced_integer_keys, name) || find_advanced_number(name) != nullptr;
+}
+
+// One known, non-null advanced value into its field. store_in also assigns the int that
+// read_positive_int produces to queue_limit's std::optional<double>.
+CheckResult read_advanced_value(const Site& site, const YamlElement& entry, model::NodeSpec& node) {
   const auto name = entry.first.Scalar();
+  const auto label = std::format("advanced.{}", name);
   if (name == "concurrency") {
-    return read_positive_int(site, entry.second, "advanced.concurrency")
+    return read_positive_int(site, entry.second, label)
         .transform(store_in(node.advanced.concurrency));
   }
-  const auto* rule = find_advanced_number(name);
-  if (!rule) return site.fail(entry.first, std::format("unknown advanced key '{}'", name));
-  return read_advanced_number(site, entry.second, *rule)
-      .transform(store_in(node.advanced.*(rule->target)));
+  if (name == "queue_limit") {
+    return read_positive_int(site, entry.second, label)
+        .transform(store_in(node.advanced.queue_limit));
+  }
+  const auto& rule = *find_advanced_number(name);
+  return read_advanced_number(site, entry.second, rule)
+      .transform(store_in(node.advanced.*(rule.target)));
+}
+
+CheckResult read_advanced_entry(const Site& site, const YamlElement& entry, model::NodeSpec& node) {
+  const auto name = entry.first.Scalar();
+  if (!is_advanced_key(name)) {
+    return site.fail(entry.first, std::format("unknown advanced key '{}'", name));
+  }
+  if (auto checked = check_entry_not_null(site, entry, std::format("advanced.{}", name));
+      !checked) {
+    return checked;
+  }
+  return read_advanced_value(site, entry, node);
 }
 
 // "advanced.yellow", or "advanced.yellow (default 0.7)" when the scenario left it out, so
@@ -669,6 +849,9 @@ CheckResult check_thresholds_ordered(const Site& site, const YAML::Node& advance
 CheckResult read_advanced(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   const auto advanced = body["advanced"];
   if (!advanced) return {};
+  if (auto checked = check_not_null(site, body, "advanced", "advanced", empty_map); !checked) {
+    return checked;
+  }
   if (!advanced.IsMap()) return site.fail(advanced, "advanced must be a map");
   for (const auto& entry : advanced) {
     if (auto read = read_advanced_entry(site, entry, node); !read) return read;
@@ -692,6 +875,10 @@ CheckResult read_common_keys(const Site& site, const YAML::Node& body, model::No
 // be a map"), as they are about the node as a whole.
 std::expected<model::NodeType, ConfigError> read_node_type(const Site& site, const YAML::Node& id,
                                                            const YAML::Node& body) {
+  if (body.IsNull()) {
+    return std::unexpected(
+        error_at(site.file, id, std::format("node '{}' must not be empty", id.Scalar())));
+  }
   if (!body.IsMap()) {
     return std::unexpected(
         error_at(site.file, body, std::format("node '{}' must be a map", id.Scalar())));
@@ -748,14 +935,21 @@ std::expected<Declarations, ConfigError> collect_node_declarations(const Site& s
   return Declarations{.nodes = std::move(*declared), .ids = std::move(ids)};
 }
 
+// "step refers to unknown node 'x'"; without `what` (when the site already names the
+// referring construct, as "link 1" does) just "refers to unknown node 'x'".
+std::string unknown_node_message(std::string_view what, std::string_view id) {
+  if (what.empty()) return std::format("refers to unknown node '{}'", id);
+  return std::format("{} refers to unknown node '{}'", what, id);
+}
+
 // `parent[key]` (present) must name a declared node. `what` names the referring construct
-// in the message: "step", "link", "backend", ...
+// in the message: "step", "backend", ...
 CheckResult check_reference(const Site& site, const YAML::Node& parent, std::string_view key,
                             std::string_view what, const NodeIndex& ids) {
   const auto reference = parent[std::string{key}];
   return scalar_value(site, parent, key).and_then([&](const std::string& id) -> CheckResult {
     if (is_declared(ids, id)) return {};
-    return site.fail(reference, std::format("{} refers to unknown node '{}'", what, id));
+    return site.fail(reference, unknown_node_message(what, id));
   });
 }
 
@@ -840,7 +1034,7 @@ CheckResult read_optional_number(const Site& site, const YAML::Node& parent, std
   const auto value = parent[std::string{key}];
   if (!value) return {};
   if (auto checked = check_not_null(site, parent, key, key); !checked) return checked;
-  const auto number = parse_whole<double>(number_text(value));
+  const auto number = number_value(value);
   if (!number || !in_range(*number)) return site.fail(value, requirement);
   target = *number;
   return {};
@@ -869,7 +1063,11 @@ CheckResult check_step_target(const StepScope& scope, const YAML::Node& step) {
 // inherit: `incoming_op` is empty and `op` is required.
 std::expected<std::string, ConfigError> read_step_op(const Site& site, const YAML::Node& step,
                                                      std::optional<std::string_view> incoming_op) {
-  if (step["op"]) return read_op_name(site, step["op"], "step op");
+  if (step["op"]) {
+    return check_not_null(site, step, "op", "step op").and_then([&] {
+      return read_op_name(site, step["op"], "step op");
+    });
+  }
   if (incoming_op) return std::string{*incoming_op};
   return site.fail(step, "then step needs an 'op'");
 }
@@ -930,6 +1128,10 @@ std::expected<std::vector<model::Step>, ConfigError> read_step_list(
 CheckResult read_op_entry(const StepScope& scope, const YamlElement& entry, model::NodeSpec& node) {
   auto name = read_op_name(scope.site, entry.first, "op name");
   if (!name) return std::unexpected(name.error());
+  const auto label = std::format("op '{}'", *name);
+  if (auto checked = check_entry_not_null(scope.site, entry, label, empty_list); !checked) {
+    return checked;
+  }
   if (!is_sequence(entry.second)) {
     return scope.site.fail(entry.second, std::format("op '{}' must be a step list", *name));
   }
@@ -939,8 +1141,12 @@ CheckResult read_op_entry(const StepScope& scope, const YamlElement& entry, mode
 }
 
 // A forwarding node's `ops`: incoming op name -> the steps it triggers.
-CheckResult read_op_steps(const StepScope& scope, const YAML::Node& ops, model::NodeSpec& node) {
+CheckResult read_op_steps(const StepScope& scope, const YAML::Node& body, model::NodeSpec& node) {
+  const auto ops = body["ops"];
   if (!ops) return {};
+  if (auto checked = check_not_null(scope.site, body, "ops", "ops", empty_map); !checked) {
+    return checked;
+  }
   if (!ops.IsMap()) return scope.site.fail(ops, "ops must be a map");
   for (const auto& entry : ops) {
     if (auto read = read_op_entry(scope, entry, node); !read) return read;
@@ -953,6 +1159,9 @@ CheckResult read_op_steps(const StepScope& scope, const YAML::Node& ops, model::
 CheckResult read_then(const StepScope& scope, const YAML::Node& body, model::NodeSpec& node) {
   const auto then = body["then"];
   if (!then) return {};
+  if (auto checked = check_not_null(scope.site, body, "then", "then", empty_list); !checked) {
+    return checked;
+  }
   if (!then.IsSequence()) return scope.site.fail(then, "then must be a list");
   return read_step_list(scope, then, std::nullopt).transform(store_in(node.then));
 }
@@ -976,6 +1185,9 @@ using OpShares = std::vector<OpShare>;
 
 std::expected<Rate, ConfigError> read_rate_base(const Site& site, const YAML::Node& body) {
   const auto rate = body["rate"];
+  if (auto checked = check_not_null(site, body, "rate", "rate"); !checked) {
+    return std::unexpected(checked.error());
+  }
   if (!rate || !rate.IsMap() || !rate["base"]) {
     return site.fail(rate ? rate : body, "client needs rate.base");
   }
@@ -994,7 +1206,11 @@ std::expected<Rate, ConfigError> read_rate_base(const Site& site, const YAML::No
 std::expected<OpShare, ConfigError> read_op_share(const Site& site, const YamlElement& entry) {
   auto name = read_op_name(site, entry.first, "op name");
   if (!name) return std::unexpected(name.error());
-  const auto share = parse_whole<double>(number_text(entry.second));
+  const auto label = std::format("op share '{}'", *name);
+  if (auto checked = check_entry_not_null(site, entry, label); !checked) {
+    return std::unexpected(checked.error());
+  }
+  const auto share = number_value(entry.second);
   if (share && is_unit_fraction(*share)) return OpShare{std::move(*name), *share};
   return site.fail(entry.second, std::format("op share '{}' must be in (0, 1]", *name));
 }
@@ -1004,8 +1220,9 @@ std::expected<OpShare, ConfigError> read_op_share(const Site& site, const YamlEl
 // 0.500002 is 1.0000019999999998) sits in the 16th and 17th and is not shown.
 // std::to_chars, not std::format("{:.15g}"): with GCC 14.2, a precision in a format spec
 // throws std::format_error at run time in a module unit that imports a module whose global
-// module fragment includes <format>, as simsys.core's does (verified 2026-10-28 with a
-// three-file probe). Plain "{}" is unaffected.
+// module fragment includes <chrono>, as simsys.core's does: <chrono> pulls in <format>
+// (verified 2026-10-28 with a three-file probe; the same GCC 14.2 module defect behind the
+// lean-interface rule of CLAUDE.md section 3). Plain "{}" is unaffected.
 std::string with_significant_digits(double value) {
   std::array<char, 32> buffer{};  // 15 digits, sign, point and exponent fit with room to spare
   const auto written = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value,
@@ -1029,6 +1246,10 @@ CheckResult check_shares_sum_to_one(const Site& site, const YAML::Node& ops,
 std::expected<OpShares, ConfigError> read_op_shares(const Site& site, const YAML::Node& body) {
   const auto ops = body["ops"];
   if (!ops) return site.fail(body, "client needs ops");
+  // No `{}` hint: a client needs at least one op.
+  if (auto checked = check_not_null(site, body, "ops", "ops"); !checked) {
+    return std::unexpected(checked.error());
+  }
   if (!ops.IsMap()) return site.fail(ops, "ops must be a map");
   if (ops.size() == 0) return site.fail(ops, "client needs at least one op");
   auto shares =
@@ -1061,7 +1282,7 @@ CheckResult read_traffic(const StepScope& scope, const YAML::Node& body, model::
   if (node.type == model::NodeType::client) {
     return read_workload(scope.site, body).transform(store_in(node.workload));
   }
-  return read_op_steps(scope, body["ops"], node);
+  return read_op_steps(scope, body, node);
 }
 
 CheckResult check_reference_key(const Site& site, const YAML::Node& body, std::string_view key,
@@ -1109,10 +1330,16 @@ Site link_site(const Site& site, std::string_view from, std::string_view to) {
   return site.within(std::format("link {} -> {}", from, to));
 }
 
+// Until both ends are read the link has no name, so its site names it by its position in
+// the list ("link 1"), counted from 1 like line numbers.
+Site link_index_site(const Site& site, std::size_t index) {
+  return site.within(std::format("link {}", index));
+}
+
 CheckResult check_link_end(const Site& site, const YAML::Node& link, std::string_view end,
                            const NodeIndex& ids) {
-  if (!link[std::string{end}]) return site.fail(link, std::format("link needs '{}'", end));
-  return check_reference(site, link, end, "link", ids);
+  if (!link[std::string{end}]) return site.fail(link, std::format("needs '{}'", end));
+  return check_reference(site, link, end, "", ids);
 }
 
 // A link joins two nodes over a network hop; a node does not call itself over the network.
@@ -1127,21 +1354,52 @@ std::expected<std::string, ConfigError> read_link_op(const Site& site, const YAM
   return read_op_name(site, op, "op name");
 }
 
+// The filter is a set of ops: one listed twice is a typo or a leftover edit. Runs after
+// read_link_op has checked that every element is a scalar.
+CheckResult check_link_ops_unique(const Site& site, const YAML::Node& list) {
+  std::set<std::string_view> seen;  // views into the document's own text, as in the key check
+  for (const auto& op : list) {
+    if (seen.insert(op.Scalar()).second) continue;
+    return site.fail(op, std::format("duplicate op '{}'", op.Scalar()));
+  }
+  return {};
+}
+
 // The ops a link carries; absent means all of them. An empty list is rejected: it would
 // load as "all", the opposite of what it says.
 CheckResult read_link_ops(const Site& site, const YAML::Node& link, std::vector<std::string>& ops) {
   const auto list = link["ops"];
   if (!list) return {};
+  if (auto checked = check_not_null(site, link, "ops", "ops"); !checked) return checked;
   if (!list.IsSequence()) return site.fail(list, "ops must be a list of op names");
   if (list.size() == 0) {
     return site.fail(list, "ops must name at least one op (omit it to carry all)");
   }
   return collect_each(list, [&](const YAML::Node& op) { return read_link_op(site, op); })
-      .transform(store_in(ops));
+      .and_then([&](std::vector<std::string> names) {
+        return check_link_ops_unique(site, list).transform([&] { ops = std::move(names); });
+      });
 }
+
+// The largest link weight. Weights matter only relative to each other: the graph splits an
+// op over its links as share_i = weight_i / (sum of the weights), so 1e9 leaves any real
+// ratio expressible (a billion to one) while every sum of weights stays finite. Without a
+// bound, 1e308 + 1e308 overflows to inf and inf / inf is NaN, a share that poisons every
+// rate downstream; `.inf` does the same directly.
+inline constexpr double max_link_weight = 1e9;
 
 // `weight` is the link's share when several links carry the same op (a weighted load
 // balancer, ch. 1); 0 is allowed: a drained backend that receives nothing.
+CheckResult read_link_weight(const Site& site, const YAML::Node& link, double& weight) {
+  if (auto read = read_optional_number(site, link, "weight", is_zero_or_more,
+                                       "weight must be non-negative", weight);
+      !read) {
+    return read;
+  }
+  if (weight <= max_link_weight) return {};
+  return site.fail(link["weight"], "weight must be at most 1e9");
+}
+
 CheckResult read_link_attributes(const Site& site, const YAML::Node& link, model::LinkSpec& spec) {
   if (auto checked = check_known_keys(site, link, link_keys, "key"); !checked) return checked;
   if (auto read = read_optional_word(site, link, "dir", directions, "dir must be in, out or inout",
@@ -1151,13 +1409,13 @@ CheckResult read_link_attributes(const Site& site, const YAML::Node& link, model
   }
   if (auto read = read_link_ops(site, link, spec.ops); !read) return read;
   if (auto read = read_optional_duration(site, link, "latency", spec.latency); !read) return read;
-  return read_optional_number(site, link, "weight", is_non_negative, "weight must be non-negative",
-                              spec.weight);
+  return read_link_weight(site, link, spec.weight);
 }
 
+// `site` names the link by its index (link_index_site) until its ends are known.
 std::expected<model::LinkSpec, ConfigError> read_link(const Site& site, const YAML::Node& link,
                                                       const NodeIndex& ids) {
-  if (!link.IsMap()) return site.fail(link, "link must be a map");
+  if (!link.IsMap()) return site.fail(link, "must be a map");
   if (auto from = check_link_end(site, link, "from", ids); !from) {
     return std::unexpected(from.error());
   }
@@ -1199,11 +1457,13 @@ std::expected<model::LinkSpec, ConfigError> read_unique_link(const Site& site,
 std::expected<std::vector<model::LinkSpec>, ConfigError> collect_links(const Site& site,
                                                                        const YAML::Node& links,
                                                                        const NodeIndex& ids) {
-  // A bare `links:` parses as null, which is not a list either.
+  // A bare `links:` (null) was reported at its key by check_sections_not_null.
   if (!links.IsSequence()) return site.fail(links, "links must be a list");
   std::set<DemandPair> seen;
-  return collect_each(
-      links, [&](const YAML::Node& link) { return read_unique_link(site, link, ids, seen); });
+  std::size_t index = 0;
+  return collect_each(links, [&](const YAML::Node& link) {
+    return read_unique_link(link_index_site(site, ++index), link, ids, seen);
+  });
 }
 
 // ---- SLOs -----------------------------------------------------------------------------
@@ -1232,6 +1492,9 @@ std::expected<model::SloMetric, ConfigError> read_slo_metric(const Site& site,
                                                              const YAML::Node& entry) {
   const auto value = entry["metric"];
   if (!value) return site.fail(entry, "entry needs a metric");
+  if (auto checked = check_not_null(site, entry, "metric", "metric"); !checked) {
+    return std::unexpected(checked.error());
+  }
   const auto name = scalar_text(value);
   if (const auto metric = find_named(slo_metrics, name)) return *metric;
   return site.fail(value, std::format("unknown metric '{}'", name));
@@ -1250,6 +1513,7 @@ CheckResult read_slo_node(const Site& site, const YAML::Node& entry, const NodeI
 
 CheckResult read_slo_op(const Site& site, const YAML::Node& entry, std::optional<std::string>& op) {
   if (!entry["op"]) return {};
+  if (auto checked = check_not_null(site, entry, "op", "op name"); !checked) return checked;
   return read_op_name(site, entry["op"], "op name").transform(store_in(op));
 }
 
@@ -1260,11 +1524,14 @@ std::expected<SloMaximum, ConfigError> read_slo_max(const Site& site, const YAML
   const auto name = name_of(slo_metrics, metric);
   const auto value = entry["max"];
   if (!value) return site.fail(entry, std::format("{} needs a max", name));
+  if (auto checked = check_not_null(site, entry, "max", "max"); !checked) {
+    return std::unexpected(checked.error());
+  }
   if (is_time_metric(metric)) {
     if (const auto time = parse_duration(scalar_text(value))) return SloMaximum{*time};
     return site.fail(value, std::format("{} max must be a duration", name));
   }
-  const auto number = parse_whole<double>(number_text(value));
+  const auto number = number_value(value);
   if (number && is_ratio(*number)) return SloMaximum{*number};
   return site.fail(value, std::format("{} max must be between 0 and 1", name));
 }
