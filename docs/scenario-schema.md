@@ -36,7 +36,7 @@ Intra-DC links default to `intra_dc_rtt` (0.5 ms).
 | `capacity` | rate | service rate per replica; default per type from the back-of-the-envelope table |
 | `latency` | duration | service time per op; default per type |
 | `ops` | map op → list of step | what the node does with each incoming op (`service`, `client` use it) |
-| `then` | list of step | steps after processing (used by `worker_pool`, `notification_fanout`) |
+| `then` | list of step | steps after processing (used by `worker_pool`, `notification_fanout`, `frontier`, `cache`, `blob_store`); on a `cache`, steps with `on: miss` receive the flow the cache did not serve, which may re-enter an upstream node (a feedback edge) |
 | `advanced` | map | `queue_limit` (int), `concurrency` (int), `yellow` (0–1), `red` (0–1), `service_variability` (SCV), `drop_policy` |
 
 A **step** is `{to: <node id>, op: <op name>, on: always|miss|failure, mode: sequential|parallel, factor: <number>}`.
@@ -52,19 +52,19 @@ flow a cache/CDN did not serve. `mode: parallel` steps add the max of their late
 | `load_balancer` | `policy` `round_robin|least_connections|weighted|consistent_hash`, `vnodes` (int, consistent_hash) |
 | `rate_limiter` | `algorithm` `token_bucket|leaky_bucket|fixed_window|sliding_log|sliding_counter`, `limit` (rate), `burst` (int), `backend` (node id of a cache holding counters) |
 | `service` | — (uses `ops`) |
-| `cache` | `eviction` `lru|lfu|fifo|ttl`, `strategy` `cache_aside|read_through|write_through|write_around|write_back`, `keys` (int capacity), `hit_ratio` (`fixed: h` or `che`), `backend` (node id for read/write-through), `ttl` |
+| `cache` | `eviction` `lru|lfu|fifo|ttl`, `strategy` `cache_aside|read_through|write_through|write_around|write_back`, `keys` (int capacity), `hit_ratio` (`fixed: h` or `che`), `backend` (node id for read/write-through), `ttl`, `then` |
 | `sql_db` | `replication_lag`, `shards` (int), `pool` (int connections) |
 | `kv_cluster` | `nodes` (int), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp` |
 | `message_queue` | `partitions`, `retention` |
 | `worker_pool` | `consumes` (queue node id), `workers`, `cost` (duration per job), `then` |
-| `blob_store` | `capacity` in bytes/s (e.g. `500MB/s`) |
+| `blob_store` | `capacity` in bytes/s (e.g. `500MB/s`), `then` |
 | `search_index` | `build_interval` |
 | `ws_gateway` | `max_connections`, `heartbeat` (duration), `fanout` (avg recipients per message) |
 | `service_discovery` | `failover` (duration) |
 | `id_generator` | `algorithm` `snowflake|ticket_server|uuid` |
 | `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) |
 | `notification_fanout` | `channels` (map name → node id), `dedup` (0–1) |
-| `frontier` | `politeness` (rate per host), `hosts` (int) |
+| `frontier` | `politeness` (rate per host), `hosts` (int), `then` |
 
 ## Rate curve (`client.rate`)
 

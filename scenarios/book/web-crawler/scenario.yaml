@@ -1,0 +1,109 @@
+# System Design Interview vol. 1, ch. 9 — Web crawler.
+# Book numbers: 1B pages/month (~400 pages/s average, 800/s peak), 500 KB per page,
+# 30% duplicate content, 10M+ hosts, politeness: one request per host at a time.
+version: 1
+name: web-crawler
+seed: 1
+duration: 6h
+step: 1s
+warmup: 10m
+
+nodes:
+  seeds:                                      # seed URLs injected by the scheduler
+    type: client
+    rate: {base: 50/s}
+    ops: {crawl: 1.0}
+    sizes: {crawl: 200B}
+
+  frontier:                                   # URL frontier: prioritiser + politeness queues
+    type: frontier
+    politeness: 1/s                           # per host
+    hosts: 10M
+    capacity: 5k/s
+    then: [{to: downloader, op: fetch}]
+
+  downloader:
+    type: worker_pool
+    consumes: frontier
+    workers: 1000
+    cost: 500ms                               # dominated by the remote site, see internet
+    then:
+      - {to: dns, op: resolve}
+      - {to: internet, op: get}
+      - {to: parser, op: parse, on: always}
+
+  dns:
+    type: cache
+    eviction: ttl
+    ttl: 1h
+    keys: 10M
+    hit_ratio: {fixed: 0.95}
+    backend: dns_upstream
+  dns_upstream: {type: external_sink, latency: 20ms, failure_rate: 0.01}
+
+  internet:
+    type: external_sink
+    latency: 300ms
+    failure_rate: 0.05
+    politeness: 1/s                           # per host
+
+  parser:
+    type: service
+    replicas: 20
+    capacity: 100/s
+    latency: 8ms
+    ops:
+      parse:
+        - {to: content_seen, op: check}
+        - {to: content_store, op: write, on: miss}      # only new content is stored
+        - {to: link_extractor, op: extract, on: miss}
+
+  content_seen:                               # "content seen?" — hash lookup, ~30% duplicates
+    type: cache
+    eviction: lru
+    keys: 1G
+    hit_ratio: {fixed: 0.30}
+
+  content_store: {type: blob_store, capacity: 400MB/s}
+
+  link_extractor:
+    type: service
+    replicas: 10
+    capacity: 200/s
+    latency: 2ms
+    ops:
+      extract:
+        - {to: url_filter, op: filter, factor: 50}       # ~50 links per page
+
+  url_filter:
+    type: service
+    replicas: 10
+    capacity: 20k/s
+    latency: 0.1ms
+    ops:
+      filter: [{to: url_seen, op: check}]
+
+  url_seen:                                   # bloom filter / hash table, ~90% already seen
+    type: cache
+    eviction: lru
+    keys: 10G
+    hit_ratio: {fixed: 0.90}
+    then: [{to: frontier, op: crawl, on: miss}]          # feedback edge: new URLs re-enter
+
+links:
+  - {from: seeds, to: frontier}
+  - {from: frontier, to: downloader}
+  - {from: downloader, to: dns, dir: inout}
+  - {from: dns, to: dns_upstream, dir: inout}
+  - {from: downloader, to: internet, dir: inout}
+  - {from: downloader, to: parser}
+  - {from: parser, to: content_seen, dir: inout}
+  - {from: parser, to: content_store}
+  - {from: parser, to: link_extractor}
+  - {from: link_extractor, to: url_filter}
+  - {from: url_filter, to: url_seen, dir: inout}
+  - {from: url_seen, to: frontier}
+
+slo:
+  - {metric: utilization, node: downloader, max: 0.85}
+  - {metric: queue_lag, node: frontier, max: 30m}
