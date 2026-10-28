@@ -5,15 +5,72 @@
   auto-increment DB — single point of failure), Twitter snowflake (timestamp | datacenter |
   machine | sequence; 4,096 IDs per ms per machine, sortable by time).
 - Snowflake chosen: no coordination, time-sortable, scales with machines; needs clock sync (NTP).
+- Requirement: 10,000 IDs per second.
+
+## The scenario
+10k/s of `next_id` from the services, with a 3x spike (30k/s) for one minute at 5 m, sent to
+one of two generators by the links' `weight`:
+
+- `ticket_server`: `algorithm: ticket_server`, one replica, `capacity: 8k/s`, `latency: 1ms`,
+  a waiting room of 1000. Shipped with weight 1: it carries all the load.
+- `snowflake`: `algorithm: snowflake`, four replicas of `capacity: 4M/s`, `latency: 0.01ms`.
+  Shipped with weight 0: idle.
+
+SLOs: p99 of `next_id` at most 10 ms, and no drops anywhere.
+
+The shipped file **fails on purpose**: the ticket server is the design ch. 7 rejects, and the
+lab shows why. `tests/scenario/test_scenarios.cpp` pins both halves: the shipped run fails
+`drop_rate` at 0.339, and the switched run (below) passes every SLO.
 
 ## What the model captures
-- The ticket server as one capacity-limited node (8k/s) facing 10k/s with a 3x spike:
-  queue, latency, then drops.
-- Snowflake as four independent generators whose capacity is effectively unlimited.
-- Link `weight` as the switch between the two designs (phase 2 supports `sweep` over it).
+- An `id_generator` is a service whose capacity and service time come from its `algorithm`
+  (plan 2b refinement 6, `defaults::for_id_algorithm`), unless the scenario states its own
+  `capacity` or `latency`, as this lab does:
+  - `snowflake`: 2^12 = 4096 ids per millisecond per machine (the 12 sequence bits), so
+    4.096M/s per replica, 10 us each; replicas add capacity (no coordination);
+  - `ticket_server`: one auto-increment database, where each id is a write: spec §6's 1k
+    writes/s, 1 ms each. `replicas` must be 1 (`Graph::build` refuses more: a second copy would
+    issue the same ids, and splitting the sequence is the multi-master design);
+  - `uuid`: generated locally, unbounded in practice: 1G/s, 1 us.
+  `explain` prints it: `algorithm=snowflake (4.096M/s per replica by design)`,
+  `algorithm=ticket_server (one database: 1k/s, spec §6 writes)`.
+- The ticket server as one capacity-limited queue facing more than it can serve: its waiting
+  room fills, the wait grows to queue / rate (1000 / 8k/s = 125 ms), and the excess is dropped.
+- Link `weight` as the switch between the two designs (`sweep` over it is planned for phase 2c).
 
 ## What it abstracts away
-- Clock skew and NTP, ID layout, section length tuning.
+- Clock skew and NTP, the bit layout, datacenter and machine ids, the sequence's reset each
+  millisecond (a fluid rate cannot burst 4096 ids into the first microsecond of a millisecond).
+- Ids being unique and sortable at all: the model counts how many are issued and how fast, not
+  their values. 64 bits versus UUID's 128 is not modelled.
+- The ticket server's single point of failure: failures are phase 3 (`faults`).
+- The client's `timeout: 50ms` is read but not used yet.
+
+## Results (`simsys run`, 10 min, after the 30 s warmup)
+
+| setting | generator rho | dropped | drop rate | next_id mean / p99 (est.) | SLOs |
+|---|---|---|---|---|---|
+| shipped: ticket server at 8k/s | 1 (red for all 570 s) | 2.34M | 0.339 | 127 ms / 158 ms | both FAIL (exit 2) |
+| ticket server at its default 1k/s (delete `capacity`) | 1 | 6.33M | 0.917 | 1 s / 1.26 s | both FAIL |
+| snowflake, 4 x 4M/s (weights switched) | 0.00076 | 0 | 0 | 510 us / 534 us | PASS (exit 0) |
+| uuid (weights switched, `algorithm: uuid`) | ~0 | 0 | 0 | 501 us / 503 us | PASS |
+
+- **Ticket server**: 10k/s against 8k/s, 30k/s in the spike. Demand over the observed 570 s is
+  10k x 510 s + 30k x 60 s = 6.9M ids; it issues at most 8k x 570 s = 4.56M, so at least 2.34M
+  are dropped, a drop rate of 2.34M / 6.9M = **0.339**. The queue is full all the time, so every
+  answered request waits about 125 ms. Even without the spike it would drop 2k of every 10k.
+- **Snowflake**: 12.1k/s on average against 16M/s: each machine is 0.08 % busy and nobody waits.
+  The response is the two link hops (250 us each way) plus the 10 us service time.
 
 ## Things to try
-- Swap the weights to route to `snowflake`: the SLO passes with p99 ≈ link latency.
+- Switch the design: set the `ticket_server` link's `weight` to 0 and the `snowflake` link's to
+  1. Every SLO passes (the table's third row).
+- Delete the ticket server's `capacity: 8k/s`: it falls back to its algorithm's default, one
+  SQL machine's 1k writes/s, and drops 92 % of the ids. 8k/s is a generous single MySQL.
+- Give the ticket server `replicas: 2`: `explain` and `run` refuse it (`replicas must be 1`);
+  the chapter's answer to "one database is not enough" is another algorithm, not a copy.
+- Delete the snowflake's `capacity` and `latency`: `explain` shows `capacity=4.096M/s
+  (default)  service_time=10us (default)`, the numbers the id layout sets by design, and
+  `peak offered 0/s vs 16.38M/s total capacity` for the four machines.
+- Try `algorithm: uuid` on the second generator: unbounded (1G/s per replica), the same pass;
+  what it costs (128 bits, not sortable by time) is outside the model.

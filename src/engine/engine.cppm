@@ -419,7 +419,7 @@ struct Overloaded : Fs... {
   // the test reads `client` instead of `model::NodeType::client`.
   using enum model::NodeType;
   return type == client || type == service || type == load_balancer || type == rate_limiter ||
-         type == cache || type == sql_db || type == cdn;
+         type == cache || type == sql_db || type == cdn || type == id_generator;
 }
 
 // Why a cache cannot run, if it cannot: a scenario built in code left it without a number or
@@ -693,6 +693,9 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
     // balancer in front of it does.
     case model::NodeType::sql_db:
       return make_database(behaviours::SqlDbBehaviour{g, index}, resolved);
+    // An id generator (plan 2b refinement 6) is a service whose capacity and service time its
+    // algorithm supplied at build (defaults::defaults_of): no behaviour of its own.
+    case model::NodeType::id_generator:
     default:  // create() admitted only simulated types: the rest are services
       return make_server(behaviours::ServiceBehaviour{g, index}, resolved);
   }
