@@ -16,8 +16,10 @@ module;
 #include <cmath>
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -39,34 +41,57 @@ using SimTime = std::chrono::duration<std::int64_t, std::nano>;
 [[nodiscard]] constexpr double seconds(SimTime t) {
   return std::chrono::duration<double>(t).count();
 }
-// Rounds to the nearest nanosecond (std::chrono::round, C++17), the same resolution
-// parse_duration uses; a plain duration_cast would truncate and bias every step low.
-[[nodiscard]] SimTime from_seconds(double s) {
+// Rounds to the nearest nanosecond (std::chrono::round, C++17, constexpr), the same
+// resolution parse_duration uses; a plain duration_cast would truncate and bias every
+// step low. Ties go to EVEN (2.5ns -> 2ns), unlike parse_duration's half away from zero
+// (std::llround: "2.5ns" -> 3ns). NaN, infinite or out-of-int64-range input is undefined
+// behaviour (the double -> int64 conversion overflows); callers pass engine-computed,
+// finite step lengths.
+[[nodiscard]] constexpr SimTime from_seconds(double s) {
   return std::chrono::round<SimTime>(std::chrono::duration<double>(s));
 }
+
+}  // namespace simsys
+
+// Not exported (same reason as the detail block below): the literals call it, but
+// importers cannot name it.
+namespace simsys::detail {
+// Converts `v` units of `ns_per_unit` nanoseconds to SimTime. Rejects any value whose
+// nanosecond count exceeds int64 max (for _ns: v itself; otherwise the product), so
+// `9223372036854775808_ns` or `9223372037_s` fails to compile instead of wrapping.
+consteval SimTime checked_literal(unsigned long long v, std::int64_t ns_per_unit) {
+  constexpr auto max_ns = static_cast<unsigned long long>(std::numeric_limits<std::int64_t>::max());
+  if (v > max_ns / static_cast<unsigned long long>(ns_per_unit)) {
+    throw std::overflow_error{"time literal out of range"};
+  }
+  return SimTime{static_cast<std::int64_t>(v) * ns_per_unit};
+}
+}  // namespace simsys::detail
+
+export namespace simsys {
 
 // Time literals for other modules. `simsys.core` is the only interface unit allowed to
 // include <chrono> (CLAUDE.md §3: GCC 14.2 corrupts the BMI of an interface that imports
 // a module *and* includes <chrono>/<format>; verified 2026-10-28 with a three-file probe).
 // Downstream interfaces write `250_us` instead of `250us`.
 // C++20 consteval: an immediate function. It can only run at compile time, so a literal
-// never costs anything at run time, and a malformed one (here: an int64 overflow in the
-// multiplication) is a compile error instead of silent wrap-around. Replaces constexpr,
-// which allows but does not force compile-time evaluation.
+// never costs anything at run time, and a `throw` reached inside it is a compile error.
+// Replaces constexpr, which allows but does not force compile-time evaluation (a
+// constexpr literal evaluated at run time would overflow int64 without a diagnostic).
 // (C++11 user-defined literals; the inline namespace lets users opt in with one
 // `using namespace simsys::literals;`, like std::chrono_literals.)
 inline namespace literals {
 consteval SimTime operator""_ns(unsigned long long v) {
-  return SimTime{static_cast<std::int64_t>(v)};
+  return detail::checked_literal(v, 1);
 }
 consteval SimTime operator""_us(unsigned long long v) {
-  return SimTime{static_cast<std::int64_t>(v) * 1'000};
+  return detail::checked_literal(v, 1'000);
 }
 consteval SimTime operator""_ms(unsigned long long v) {
-  return SimTime{static_cast<std::int64_t>(v) * 1'000'000};
+  return detail::checked_literal(v, 1'000'000);
 }
 consteval SimTime operator""_s(unsigned long long v) {
-  return SimTime{static_cast<std::int64_t>(v) * 1'000'000'000};
+  return detail::checked_literal(v, 1'000'000'000);
 }
 }  // namespace literals
 

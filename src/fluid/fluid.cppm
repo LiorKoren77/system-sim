@@ -15,6 +15,7 @@
 module;
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 
 export module simsys.fluid;
 
@@ -28,6 +29,12 @@ export namespace simsys::fluid {
 // separate back-of-the-envelope numbers, so we keep both: `service_rate` bounds the
 // fluid drain, `service_time_s` is how long one request occupies one of the
 // `concurrency` servers and feeds the Erlang C term.
+//
+// Invariant the defaults do not enforce (scenarios own it): `service_rate` should equal
+// `concurrency / service_time_s`. The fluid drain uses the former, the Erlang C term the
+// latter, so a mismatch makes them describe two different machines. Example: rate 2000/s,
+// s = 1 ms, c = 1 at 1500/s gives an Erlang wait computed at rho 0.75 (3 ms) while a
+// consistent 2000/s server (s = 0.5 ms) would wait 1.5 ms. `service_rate` must be >= 0.
 struct Capacity {
   Rate service_rate;         // requests per second one replica can drain
   double service_time_s{};   // seconds one request occupies a server
@@ -55,7 +62,7 @@ struct FluidStep {
   double drain_per_s{};
   double dropped_per_s{};
   double backlog{};               // requests waiting after this step
-  double rho{};                   // utilization, capped at 1
+  double rho{};                   // utilization = busy fraction drain/capacity, in [0, 1]
   flow::LatencyEstimate latency;  // sojourn = queueing wait + service time
   Zone zone{Zone::green};
 };
@@ -66,10 +73,15 @@ class FluidQueue {
  public:
   explicit FluidQueue(Capacity capacity) : capacity_{capacity} {}
 
-  // Advances the node by `dt` (must be > 0) under a constant `demand`.
-  // Not [[nodiscard]]: callers that only care about the new backlog may drop the report.
-  FluidStep advance(Rate demand, SimTime dt);
+  // Advances the node by `dt` under a constant `demand`. Throws std::invalid_argument
+  // if dt <= 0 (a programmer error: the engine never takes an empty or backward step).
+  // C++20 [[nodiscard("reason")]]: the attribute (C++17) now carries a message that the
+  // compiler prints in the warning, so a caller learns *why* dropping the value is a bug.
+  [[nodiscard("the drained flow must be routed downstream")]] FluidStep advance(Rate demand,
+                                                                                SimTime dt);
   // Jumps to the long-run state: empty below capacity, full (queue_limit) at/above.
+  // At exactly rho = 1 the two disagree, per spec: advance() keeps an empty backlog
+  // empty (drain = demand = capacity), settle() fills it (the >= below).
   void settle(Rate demand);
 
   [[nodiscard]] double backlog() const { return backlog_; }
@@ -80,9 +92,10 @@ class FluidQueue {
   [[nodiscard]] double drain_for(double demand_per_s, double dt_s) const;
   void grow_backlog(double demand_per_s, double drain_per_s, double dt_s);
   [[nodiscard]] double spill_overflow(double dt_s);
-  [[nodiscard]] double utilization(double demand_per_s) const;
+  [[nodiscard]] double utilization(double drain_per_s) const;
   [[nodiscard]] double backlog_wait_s() const;
   [[nodiscard]] flow::LatencyEstimate sojourn(double rho) const;
+  static void require_positive_step(SimTime dt);
 
   Capacity capacity_;
   double backlog_{};
@@ -93,8 +106,7 @@ class FluidQueue {
 namespace simsys::fluid {
 
 // Highest utilization fed to the Erlang C term. The M/M/c wait diverges as rho -> 1;
-// the backlog already carries the delay of a saturated node, so counting an infinite
-// stochastic wait on top would count the same overload twice.
+// a saturated node's delay is carried by the backlog instead (see sojourn()).
 constexpr double max_stochastic_rho = 0.99;
 
 Zone zone_of(double rho, const Capacity& c) {
@@ -110,20 +122,20 @@ Zone zone_of(double rho, const Capacity& c) {
 // The §3.3 step, one named helper per line:
 //
 //   dt_s   = seconds(dt);  cap = service_rate.per_second;  demand = demand.per_second
-//   drain  = min(cap, demand + backlog_/dt_s)              serve what we can: new demand
+//   drain  = min(demand + backlog_/dt_s, cap)              serve what we can: new demand
 //                                                          plus everything that waited
 //   backlog_ += (demand - drain) * dt_s                    grows past capacity, shrinks below
 //   overflow = max(0, backlog_ - queue_limit) / dt_s;  backlog_ = min(backlog_, queue_limit)
 //                                                          the waiting room is finite: the
 //                                                          excess is dropped (load shedding)
-//   rho    = cap > 0 ? min(1, demand/cap) : 1              utilization, a saturated node is 1
-//   latency.mean = backlog_/cap                            Little's law on the deterministic
-//                                                          backlog (it carries no variance)
-//                + k * mmc_wait(c, min(rho, 0.99), s).mean stochastic bunching of arrivals;
-//                                                          capped at 0.99, see max_stochastic_rho
-//                + s                                       the service itself
-//   latency.var  = k^2 * mmc_wait(...).variance + service_variability * s^2
+//   rho    = cap > 0 ? drain/cap : 1                       busy fraction; a node with no
+//                                                          capacity counts as saturated
 //   k      = variability_factor(burstiness, service_variability)
+//   fluid  = backlog_/cap                                  deterministic drain time
+//   stoch  = k * mmc_wait(c, min(rho, 0.99), s).mean       random bunching of arrivals
+//   latency.mean = max(fluid, stoch) + s                   OUR HEURISTIC blend, see sojourn()
+//   latency.var  = (stoch wins ? k^2 * mmc_wait(...).variance : 0)
+//                + service_variability * s^2
 //                  Allen–Cunneen scales the MEAN wait by k. Applying k^2 to the variance is
 //                  OUR OWN HEURISTIC (a scaled random variable has k^2 times the variance);
 //                  no published result is claimed for it.
@@ -131,12 +143,13 @@ Zone zone_of(double rho, const Capacity& c) {
 //
 // Conservation: demand*dt = (drain + dropped)*dt + (backlog_after - backlog_before).
 FluidStep FluidQueue::advance(Rate demand, SimTime dt) {
+  require_positive_step(dt);
   const double dt_s = simsys::seconds(dt);
   const double demand_per_s = demand.per_second;
   const double drain_per_s = drain_for(demand_per_s, dt_s);
   grow_backlog(demand_per_s, drain_per_s, dt_s);
   const double dropped_per_s = spill_overflow(dt_s);
-  const double rho = utilization(demand_per_s);
+  const double rho = utilization(drain_per_s);
   // C++20 designated initializers: name the fields at the construction site. Replaces
   // positional aggregate init, which silently swaps same-typed doubles when the struct
   // is reordered; FluidStep has five doubles in a row, so the names earn their keep.
@@ -153,18 +166,26 @@ void FluidQueue::settle(Rate demand) {
   backlog_ = demand.per_second >= capacity_.service_rate.per_second ? capacity_.queue_limit : 0.0;
 }
 
-// A node with no capacity (cap <= 0) is treated as saturated: it drains nothing, so
-// all demand piles up and (below) rho is 1.
+// `dt.count() <= 0`, not `dt <= SimTime::zero()`: duration's comparison operators and
+// zero() are declared in <chrono>, which this interface must not include (CLAUDE.md §3,
+// GCC 14 BMI bug), so we compare the raw tick count. SimTime is integer nanoseconds,
+// so this is exact.
+void FluidQueue::require_positive_step(SimTime dt) {
+  if (dt.count() <= 0) throw std::invalid_argument{"FluidQueue::advance: dt must be > 0"};
+}
+
+// The demand term comes first in std::min so a NaN demand propagates (std::min returns
+// its first argument when the comparison is false) instead of being "served" at full
+// capacity. With cap = 0 the node drains nothing and all demand piles up.
 double FluidQueue::drain_for(double demand_per_s, double dt_s) const {
-  const double cap = capacity_.service_rate.per_second;
-  if (cap <= 0.0) return 0.0;
-  return std::min(cap, demand_per_s + backlog_ / dt_s);
+  return std::min(demand_per_s + backlog_ / dt_s, capacity_.service_rate.per_second);
 }
 
 // The max(.., 0.0) only removes floating-point residue when a backlog drains exactly to
-// empty (e.g. -1e-17). The value being clamped comes first so a NaN would propagate
-// instead of being replaced by 0 (std::max/std::min return their first argument when the
-// comparison is false). std::fmin/fmax are avoided for the same reason: they hide NaNs.
+// empty: rounding of order ulp(demand*dt), up to ~1e-4 requests at 1e9/s. The value
+// being clamped comes first so a NaN would propagate instead of being replaced by 0
+// (std::max/std::min return their first argument when the comparison is false).
+// std::fmin/fmax are avoided for the same reason: they hide NaNs.
 void FluidQueue::grow_backlog(double demand_per_s, double drain_per_s, double dt_s) {
   backlog_ = std::max(backlog_ + (demand_per_s - drain_per_s) * dt_s, 0.0);
 }
@@ -176,40 +197,62 @@ double FluidQueue::spill_overflow(double dt_s) {
   return overflow;
 }
 
-// Utilization rho = lambda / mu: offered load over capacity, capped at 1 (beyond that the
-// excess is backlog and drops, not "more than 100% busy"). Assumes nothing about arrival
-// randomness. The ratio comes first in std::min so a NaN demand propagates.
-double FluidQueue::utilization(double demand_per_s) const {
+// Utilization rho = drain / cap: the fraction of time the servers are busy. Whenever the
+// backlog is empty this equals the textbook lambda/mu capped at 1 (drain = min(demand,
+// cap)); the difference is a node working off a backlog: demand may be 50% of capacity
+// but every server is busy, so it is red, not green. Never exceeds 1 because drain <= cap.
+// A NaN drain propagates (division keeps NaN).
+double FluidQueue::utilization(double drain_per_s) const {
   const double cap = capacity_.service_rate.per_second;
   if (cap <= 0.0) return 1.0;
-  return std::min(demand_per_s / cap, 1.0);
+  return drain_per_s / cap;
 }
 
-// Little's law, L = lambda * W, applied to the deterministic backlog: draining `backlog_`
-// requests at `cap` per second takes backlog_/cap seconds. Assumes the backlog drains
-// at full capacity. With no capacity the wait never ends.
+// Fluid (virtual) waiting time: a request joining behind `backlog_` requests at a server
+// draining `cap`/s waits backlog_/cap. Agrees with Little's law W = L/lambda only when
+// saturated (lambda = cap); it is a deterministic drain time, not a long-run average.
+// Uses the end-of-step backlog, so it is pessimistic by up to half a step's growth.
+//
+// With no capacity the wait never ends: +inf. Engine contract: never multiply a latency
+// by a zero weight (inf * 0 = NaN), skip branches that carry no flow, and the report
+// layer prints inf as "unavailable".
 double FluidQueue::backlog_wait_s() const {
   const double cap = capacity_.service_rate.per_second;
   if (cap <= 0.0) return std::numeric_limits<double>::infinity();
   return backlog_ / cap;
 }
 
-// Sojourn time (what the book calls latency) = deterministic backlog wait
-//                                            + stochastic queueing wait
-//                                            + service time.
-// The stochastic part is the M/M/c wait scaled by the Allen–Cunneen factor k (see the
-// formula block above advance()). Assumes the node is in steady state at the capped rho.
+// Sojourn time (what the book calls latency) = queueing wait + service time, where the
+// queueing wait is the LARGER of two estimates (our heuristic, not a published result):
+//
+//   fluid  backlog_/cap: the deterministic drain time of the backlog (backlog_wait_s()).
+//   stoch  k * M/M/c Wq at min(rho, 0.99): the random bunching of arrivals that a node
+//          shows below saturation; k is the Allen–Cunneen factor (formula block above
+//          advance()). Assumes steady state at that rho.
+//
+// Why max and not the sum: by Little's law (L = lambda * W) the M/M/1 wait at rho 0.99
+// corresponds to a stochastic queue of ~99 requests (Lq = rho^2/(1 - rho) = 98). Once the fluid
+// backlog exceeds that, the stochastic queue IS the backlog, so adding both counts it twice
+// (measured +50-98% overstatement in early overload with 100 ms steps). The max equals the old
+// formula below saturation (backlog 0), is continuous, and becomes fluid-only deep in overload.
+//
+// Variance: k^2 * Var(Wq) when the stochastic term wins, 0 when the fluid term wins (a
+// deterministic drain), plus the service variance cs^2 * s^2 in both cases; for
+// exponential service (cs^2 = 1) that is s^2. Wait and service are assumed independent,
+// so their variances add.
 flow::LatencyEstimate FluidQueue::sojourn(double rho) const {
   const double s = capacity_.service_time_s;
   const double k =
       queueing::variability_factor(capacity_.burstiness, capacity_.service_variability);
   const auto wait = queueing::mmc_wait(capacity_.concurrency, std::min(rho, max_stochastic_rho), s);
-  return flow::LatencyEstimate{
-      .mean_s = backlog_wait_s() + k * wait.mean_s + s,
-      // Var(Wq) scaled by k^2 (our heuristic) plus the service variance cs^2 * s^2; for
-      // exponential service (cs^2 = 1) that is s^2. Independence of wait and service is
-      // assumed, so the variances add.
-      .variance_s2 = k * k * wait.variance_s2 + capacity_.service_variability * s * s};
+  const double fluid_wait_s = backlog_wait_s();
+  const double stochastic_wait_s = k * wait.mean_s;
+  const double service_variance_s2 = capacity_.service_variability * s * s;
+  if (fluid_wait_s > stochastic_wait_s) {
+    return flow::LatencyEstimate{.mean_s = fluid_wait_s + s, .variance_s2 = service_variance_s2};
+  }
+  return flow::LatencyEstimate{.mean_s = stochastic_wait_s + s,
+                               .variance_s2 = k * k * wait.variance_s2 + service_variance_s2};
 }
 
 }  // namespace simsys::fluid
