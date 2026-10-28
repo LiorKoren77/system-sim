@@ -1,0 +1,41 @@
+# Lab: System Design Interview vol. 1, ch. 7 — Unique ID generator in distributed systems.
+# Compare a single ticket server (auto-increment DB) with Twitter snowflake generators.
+# Book requirement: 10,000 IDs/s, 64-bit, sortable by time.
+version: 1
+name: lab-unique-id
+seed: 1
+duration: 10m
+step: 100ms
+warmup: 30s
+
+nodes:
+  services:
+    type: client
+    rate:
+      base: 10k/s
+      spikes: [{at: 5m, for: 1m, factor: 3}]
+    ops: {next_id: 1.0}
+    timeout: 50ms
+
+  ticket_server:                               # try: replicas 1, capacity 8k/s (a single MySQL)
+    type: id_generator
+    algorithm: ticket_server
+    replicas: 1
+    capacity: 8k/s
+    latency: 1ms
+    advanced: {queue_limit: 1000}
+
+  snowflake:                                   # 4 generators, each 4,096 IDs per ms by design
+    type: id_generator
+    algorithm: snowflake
+    replicas: 4
+    capacity: 4M/s
+    latency: 0.01ms
+
+links:
+  - {from: services, to: ticket_server, dir: inout, weight: 1}
+  - {from: services, to: snowflake, dir: inout, weight: 0}       # set to 1 and ticket_server to 0 to switch
+
+slo:
+  - {metric: p99_latency, node: services, op: next_id, max: 10ms}
+  - {metric: drop_rate, max: 0}
