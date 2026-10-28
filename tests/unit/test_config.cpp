@@ -213,7 +213,7 @@ version: 1
 name: t
 duration: 1m
 nodes:
-  api: {type: service, capacity: fast}
+  api: {type: service, capacity: fast/s}
 links: []
 )",
                    "capacity: expected a number");
