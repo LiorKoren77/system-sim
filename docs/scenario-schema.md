@@ -308,7 +308,7 @@ own (default 100k/s, 250 µs) that answers every request it receives, hit or mis
 | `hit_ratio` | required: `{fixed: h}` with `0 ≤ h ≤ 1`, or `che` (computed at build from `keys` and the clients' key distribution, see [`che` hit ratios](#che-hit-ratios)) | `cache needs a hit_ratio`, `hit_ratio must be che or {fixed: h}`, `hit_ratio.fixed must be between 0 and 1` (also for a quoted `"0.5"`) |
 | `strategy` | `cache_aside` (default), `read_through`, `write_through`, `write_around`, `write_back` | `strategy must be cache_aside, read_through, write_through, write_around or write_back` |
 | `backend` | a declared node; required by every strategy but `cache_aside`, and refused there (the application reads the store; the backend would never be called) | `strategy read_through needs a backend`, `backend is unused with strategy cache_aside`, `backend refers to unknown node 'x'`; *(graph)* `backend 'db' needs a link from the cache`, and the link must carry every op the cache passes on (`link c -> db does not carry op 'read' (ops: write)`); a store that calls back into the cache (`db.read -> c.read -> db.read`) is refused, since a fetch is always waited for: `node 'c': backend 'db' closes a call cycle` |
-| `write_ops` | a non-empty list of op names; default `[write]`. Every other op is a read | `write_ops must be a list of op names`, `write_ops must name at least one op` |
+| `write_ops` | a non-empty list of op names; default `[write]`. Every other op is a read. A stated list is taken exactly as written (it replaces the default) | `write_ops must be a list of op names`, `write_ops must name at least one op` |
 | `keys` | a [count](#values) (`20M`): the entries the cache holds, the Che approximation's cache size; required by `hit_ratio: che` | `keys must be a positive integer`; *(graph)* `node 'c': hit_ratio che needs keys (the cache's capacity in keys)` |
 | `eviction` | `lru`, `lfu`, `fifo`, `ttl` | `eviction must be lru, lfu, fifo or ttl` |
 | `ttl` | a positive duration | `ttl must be positive` |
@@ -337,19 +337,38 @@ hop at build. It needs a `backend` and a link to it like every other strategy bu
 #### `then` steps on a cache
 
 A cache's `then` steps say what happens after it answers, when the cache sits **in front of** the
-next tier instead of beside the application: ch. 1's read path draws the arrow "on a miss, go on
-to the next tier", and ch. 13's browser cache is one (`then: [{to: lb, op: suggest, on: miss}]`:
-a hit is answered in the browser, a miss goes on to the load balancer).
+next tier instead of beside the application: the inline placement, in which the cache forwards
+its own misses (read-through in spirit). That is **not** ch. 1's cache-aside, where the web server
+queries the database itself and the cache forwards nothing (a service's `on: miss` step). The
+book's caches in front: ch. 1's CDN workflow (a CDN without the file fetches it from the origin)
+and ch. 13's "Browser caching" (suggestions kept in the browser cache for an hour, hence the
+scenario's `ttl: 1h`; `then: [{to: lb, op: suggest, on: miss}]`: a hit is answered in the
+browser, a miss goes on to the load balancer).
 
 | `on` | flow (per request the cache handles) | response | delivered |
 |---|---|---|---|
-| `always` (default) | every op, `× factor`, as `step.op` | own + the hop (two link legs + the target's response) for every request | × the target's delivered fraction |
-| `miss` | `(1 − h) × factor` of each **read**; writes do not miss and send nothing | the mixture `{h: own, 1 − h: own + hop}`; several miss steps form one block that a miss takes in turn | `(1 − f) + f × Π d` over the block, `f = 1 − h` |
+| `always` (default) | every op, `× factor`, as `step.op` | own + the hop (two link legs + the target's response) for every request; the `mode: parallel` ones form **one group**, the slowest of which is waited for after the store hop and the sequential steps (they overlap one another, never the store hop) | × the target's delivered fraction |
+| `miss` | `(1 − h) × factor` of each **read**; writes do not miss and send nothing | the mixture `{h: own, 1 − h: own + hop}`; several miss steps form one block that a miss takes in turn, so each must be sequential | `(1 − f) + f × Π d` over the block, `f = 1 − h` |
 | `failure` | nothing before phase 2c | — | — |
 
-A `read_through` cache already fetches its misses from its `backend`, so a `then` step on miss
-would fetch each miss twice: *(graph)* `node 'c': a then step on miss and a read_through backend
-both fetch the miss`. A `then` step must be carried by a link like any step.
+Refused at build *(graph)*:
+
+- a `then` step on miss on a `read_through` cache, which already fetches its misses from its
+  `backend` (each miss would be fetched twice): `node 'c': a then step on miss and a read_through
+  backend both fetch the miss`;
+- a service's `on: miss` step after a cache (or CDN) that has a `then` step on miss, the same
+  double fetch from the other side: `node 'api': an 'on: miss' step cannot follow cache 'c',
+  whose own then step on miss already fetches the miss`;
+- a parallel `then` step on miss (a miss waits for it): `node 'c': a then step on miss must be
+  sequential (a miss waits for it)`;
+- a `then` step that sends the `backend` the op the store hop already sends it (a write under
+  `write_through`, `write_around` or `write_back`, a read under `read_through`), which would
+  reach the store twice: `node 'c': then step to 'db' duplicates its backend hop`. Another op to
+  the same node (`{to: db, op: audit}`) is a call of its own.
+
+A `then` step must be carried by a link like any step. A `then` step on miss carries only the
+ops that miss, so a cache that receives only writes sends nothing along it, and its op need not be
+carried past the next node.
 
 Not modelled: TTL expiry, eviction orders other than LRU (a `che` cache is LRU's model whatever
 its `eviction`), temporal locality, a cold start, the thundering herd of a hot key's misses,
@@ -424,9 +443,10 @@ the later designs. `replicas: N` is one **primary** and `N − 1` **read replica
 | `replication_lag` | a non-negative duration; default 0 (a synchronous replica) | the duration parser's (`replication_lag: expected a non-negative finite number`) |
 | `write_ops` | as a cache's; default `[write, insert, update, delete]`. These ops go to the primary; every other op is a read | as a cache's |
 
-A database built in code whose `write_ops` is left at the model's default (`[write]`) gets the
-database default too: the graph cannot tell it from a scenario's explicit `write_ops: [write]`,
-which therefore also counts `insert`, `update` and `delete` as writes.
+An absent `write_ops` is the database default; a stated one is exactly what it says, so
+`write_ops: [write]` makes `write` the only write op (`insert` is then a read). The model keeps
+"absent" apart from any list, so a database built in code without `write_ops` gets the database
+default too.
 
 How the load is split, with `S` shards (each copy its own queue of the node's capacity):
 

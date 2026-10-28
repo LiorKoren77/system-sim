@@ -2161,9 +2161,11 @@ CheckResult read_cache_strategy(const Site& site, const YAML::Node& body, model:
   return site.fail(at, std::format("strategy {} needs a backend", strategy));
 }
 
-// `write_ops: [write, delete]`: the ops that change data; every other op is a read. Absent
-// keeps model::default_write_op. An empty list would make every op a read, which a cache
-// that is written to never is, so it is refused rather than read as "no writes".
+// `write_ops: [write, delete]`: the ops that change data; every other op is a read. Stored
+// exactly as written; absent stays absent (model::write_ops_of applies the type's default, a
+// cache's `write` or a database's four SQL writes). An empty list would make every op a read,
+// which a cache or a database that is written to never is, so it is refused rather than read as
+// "no writes".
 CheckResult read_write_ops(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   const auto list = body["write_ops"];
   if (!list) return {};
@@ -2253,13 +2255,6 @@ CheckResult read_pool(const Site& site, const YAML::Node& body, model::NodeSpec&
   return {};
 }
 
-// A database's write ops: the scenario's list (read_write_ops), else default_sql_write_ops.
-CheckResult read_sql_write_ops(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
-  if (body["write_ops"]) return read_write_ops(site, body, node);
-  node.write_ops.assign(model::default_sql_write_ops.begin(), model::default_sql_write_ops.end());
-  return {};
-}
-
 // `replication_lag: 50ms`: a constant, any non-negative duration (the parser refuses a negative
 // one). Zero is a synchronous replica.
 CheckResult read_sql_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
@@ -2270,7 +2265,7 @@ CheckResult read_sql_keys(const Site& site, const YAML::Node& body, model::NodeS
       .and_then([&] {
         return read_optional_duration(this_node, body, "replication_lag", node.replication_lag);
       })
-      .and_then([&] { return read_sql_write_ops(this_node, body, node); });
+      .and_then([&] { return read_write_ops(this_node, body, node); });
 }
 
 // A CDN (ch. 1: a cache at the network's edge) may state its hit ratio in the cache's own

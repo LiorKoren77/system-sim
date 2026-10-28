@@ -279,15 +279,14 @@ struct HitRatio {
   bool che{false};
 };
 
-// The ops a cache treats as writes when the scenario gives no `write_ops`: one op called
-// `write`. Every other op is a read.
+// The ops a cache (and every other node type but a database) treats as writes when the scenario
+// gives no `write_ops`: one op called `write`. Every other op is a read. Applied by write_ops_of.
 inline constexpr std::string_view default_write_op = "write";
 
 // The ops a SQL database sends to its primary when the scenario gives no `write_ops` (plan 2b
 // refinement 3): the three SQL statements that change rows, plus the generic `write` the other
 // node types use. Every other op (select, read, get, ...) is a read a replica may answer.
-// Sorted, so the loader's default and the graph's (for a database built in code, see
-// graph::Graph::resolve_nodes) are the same list.
+// Sorted. Applied by write_ops_of.
 inline constexpr std::array<std::string_view, 4> default_sql_write_ops{"delete", "insert", "update",
                                                                        "write"};
 
@@ -421,9 +420,14 @@ struct NodeSpec {
   // fit), `eviction` (lru, lfu, fifo or ttl) and `ttl`. A `backend` on a cache names the store the
   // cache itself calls (read_through, write_through, write_around, write_back); a CDN reads
   // `hit_ratio` too (its `on: miss` steps use it).
+  // `write_ops` (caches and SQL databases): absent means the TYPE's default, present means
+  // exactly the list the scenario wrote; the loader stores it as written and every reader asks
+  // write_ops_of. An optional rather than a vector pre-filled with a default, because the two
+  // types' defaults differ and a pre-filled `[write]` could not be told from a database's
+  // explicit `write_ops: [write]`.
   std::optional<HitRatio> hit_ratio{};
   CacheStrategy strategy{CacheStrategy::cache_aside};
-  std::vector<std::string> write_ops{std::string{default_write_op}};
+  std::optional<std::vector<std::string>> write_ops{};
   std::optional<std::int64_t> keys{};
   std::optional<std::string> eviction{};
   std::optional<SimTime> ttl{};
@@ -434,7 +438,7 @@ struct NodeSpec {
   // once (sugar for advanced.concurrency; absent: the implied concurrency); `replication_lag`
   // how far behind the primary a replica applies a write (absent: none). The loader leaves an
   // absent one absent, so explain can tell stated from default. `write_ops` (above) says which
-  // ops go to the primary; a database's default is default_sql_write_ops.
+  // ops go to the primary; a database's default is default_sql_write_ops (write_ops_of).
   std::optional<int> shards{};
   std::optional<int> pool{};
   std::optional<SimTime> replication_lag{};
@@ -454,6 +458,17 @@ struct NodeSpec {
   if (spec.burst) return *spec.burst;
   if (!spec.limit) return 0.0;
   return std::max(std::ceil(spec.limit->per_second * seconds(limiter_window(spec))), 1.0);
+}
+
+// The ops `spec` treats as writes: the scenario's `write_ops` exactly as written, else the
+// type's default (default_sql_write_ops for a SQL database, default_write_op for every other
+// node). The one place the default is applied, so the graph, the behaviours and explain agree.
+[[nodiscard]] inline std::vector<std::string> write_ops_of(const NodeSpec& spec) {
+  if (spec.write_ops) return *spec.write_ops;
+  if (spec.type == NodeType::sql_db) {
+    return {default_sql_write_ops.begin(), default_sql_write_ops.end()};
+  }
+  return {std::string{default_write_op}};
 }
 
 enum class Direction { in, out, inout };

@@ -725,7 +725,7 @@ template <class T>
 // strategy then never acts. A note, not an error: a read-only cache is legitimate, but a write
 // op named differently in the steps (`set`, `put`) is a common slip.
 [[nodiscard]] std::string write_ops_summary(const graph::Graph& g, std::size_t cache) {
-  const auto& write_ops = g.nodes()[cache].spec.write_ops;
+  const auto write_ops = model::write_ops_of(g.nodes()[cache].spec);
   // C++20 std::ranges::none_of takes the range itself instead of a begin/end pair; C++23
   // std::ranges::contains asks "is this value in the range?" in one call, replacing
   // `std::find(begin, end, value) != end`.
@@ -840,7 +840,7 @@ template <class T>
                      "  lag=" + fmt_duration(spec.replication_lag.value_or(SimTime{0})) +
                      if_defaulted(spec.replication_lag);
   if (spec.pool) text += "  pool=" + std::to_string(*spec.pool);
-  return text + "  write_ops=" + join(spec.write_ops, ",");
+  return text + "  write_ops=" + join(model::write_ops_of(spec), ",");
 }
 
 // Where each of a queue's four numbers came from, as explain prints it.
@@ -1349,11 +1349,11 @@ struct PaperLoad {
 // yellow)"; without replicas, the primary alone with everything / S. In capacity units.
 [[nodiscard]] std::string database_check(const graph::ResolvedNode& node, const OpLoad& arriving) {
   if (node.spec.type != model::NodeType::sql_db) return {};
+  const auto write_ops = model::write_ops_of(node.spec);
   double reads = 0.0;
   double writes = 0.0;
   for (const auto& [op, rate] : arriving) {
-    (std::ranges::contains(node.spec.write_ops, op) ? writes : reads) +=
-        rate * cost_of(node.spec, op);
+    (std::ranges::contains(write_ops, op) ? writes : reads) += rate * cost_of(node.spec, op);
   }
   const double shards = node.spec.shards.value_or(1);
   const double copies_per_shard = node.spec.replicas;
