@@ -14,6 +14,7 @@
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
+import simsys.behaviours; // client_seed: the noise seed the engine gives each client
 import simsys.core;
 import simsys.engine;
 import simsys.fluid;
@@ -458,8 +459,9 @@ TEST_CASE("two runs with the same seed are identical and a different seed is not
   const auto collect = [&](int seed) {
     s.seed = seed;
     std::vector<double> d;
-    (*Simulation::create(*Graph::build(s))).run({.duration = 2s, .step = 100ms},
-                                                [&](const auto& r) { d.push_back(r.nodes[1].demand_per_s); });
+    (*Simulation::create(*Graph::build(s)))
+        .run({.duration = 2s, .step = 100ms},
+             [&](const auto& r) { d.push_back(r.nodes[1].demand_per_s); });
     return d;
   };
   REQUIRE(collect(1) == collect(1));
@@ -469,14 +471,16 @@ TEST_CASE("two runs with the same seed are identical and a different seed is not
 TEST_CASE("estimate ignores noise and evaluates the curve at time zero", "[theory]") {
   Scenario s = mm1(500);
   s.nodes[0].workload->noise = simsys::workload::Noise{.sigma = 0.5, .correlation = 1s};
-  s.nodes[0].workload->curve.spikes = {simsys::workload::Spike{.at = 0s, .duration = 1s, .factor = 2}};
+  s.nodes[0].workload->curve.spikes = {
+      simsys::workload::Spike{.at = 0s, .duration = 1s, .factor = 2}};
   const auto e = (*Simulation::create(*Graph::build(s))).estimate();
   REQUIRE_THAT(e.nodes[1].demand_per_s, WithinRel(1000.0, 1e-12));
 }
 
 TEST_CASE("a points-only client offers the interpolated rate", "[theory]") {
   Scenario s = mm1(0);
-  s.nodes[0].workload->curve.points = simsys::workload::Points{.at = {{0s, Rate{100}}, {1s, Rate{300}}}};
+  s.nodes[0].workload->curve.points =
+      simsys::workload::Points{.at = {{0s, Rate{100}}, {1s, Rate{300}}}};
   auto sim = *Simulation::create(*Graph::build(s));
   REQUIRE_THAT(sim.step(0s, 100ms).nodes[1].demand_per_s, WithinRel(100.0, 1e-12));
   for (int i = 1; i < 5; ++i) (void)sim.step(i * 100ms, 100ms);
@@ -502,16 +506,17 @@ TEST_CASE("an op with cost 3 consumes three times the capacity of a cost-1 op", 
 TEST_CASE("costs do not change the number of requests forwarded", "[theory]") {
   // c -> a (cost 2 on op) -> b: b still receives one request per request a drained.
   Scenario s{.name = "cost", .version = 1, .duration = 1s};
-  s.nodes = {NodeSpec{.id = "c",
-                      .type = NodeType::client,
-                      .workload = Workload{.curve = {.base = Rate{300}}, .op_shares = {{"op", 1.0}}}},
-             NodeSpec{.id = "a",
-                      .type = NodeType::service,
-                      .capacity = Rate{1000},
-                      .latency = 1ms,
-                      .ops = {{"op", {Step{.to = "b", .op = "op"}}}},
-                      .cost = {{"op", 2.0}}},
-             NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{10000}, .latency = 100us}};
+  s.nodes = {
+      NodeSpec{.id = "c",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{300}}, .op_shares = {{"op", 1.0}}}},
+      NodeSpec{.id = "a",
+               .type = NodeType::service,
+               .capacity = Rate{1000},
+               .latency = 1ms,
+               .ops = {{"op", {Step{.to = "b", .op = "op"}}}},
+               .cost = {{"op", 2.0}}},
+      NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{10000}, .latency = 100us}};
   s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s},
              LinkSpec{.from = "a", .to = "b", .latency = 0s}};
   const auto r = (*Simulation::create(*Graph::build(s))).step(0s, 100ms);
@@ -519,24 +524,25 @@ TEST_CASE("costs do not change the number of requests forwarded", "[theory]") {
   REQUIRE_THAT(r.nodes[2].demand_per_s, WithinRel(300.0, 1e-12));  // requests (b's cost is 1)
 }
 
-TEST_CASE("an overloaded node with mixed costs drains units and forwards the right request mix",
+TEST_CASE("an overloaded node with mixed costs drains units and forwards the right total",
           "[theory]") {
   // ops x (cost 1) and y (cost 4), 50/50 by rate, into a 1000 units/s node with queue 100:
   // demand 500 + 2000 = 2500 units/s; drained 1000 units/s; the queue is well mixed in units,
   // so the forwarded request mix equals the unit mix of the content: x:y units = 1:4.
   Scenario s{.name = "mix", .version = 1, .duration = 1s};
-  s.nodes = {NodeSpec{.id = "c",
-                      .type = NodeType::client,
-                      .workload = Workload{.curve = {.base = Rate{1000}},
-                                           .op_shares = {{"x", 0.5}, {"y", 0.5}}}},
-             NodeSpec{.id = "a",
-                      .type = NodeType::service,
-                      .capacity = Rate{1000},
-                      .latency = 1ms,
-                      .advanced = {.queue_limit = 100},
-                      .ops = {{"x", {Step{.to = "b", .op = "x"}}}, {"y", {Step{.to = "b", .op = "y"}}}},
-                      .cost = {{"y", 4.0}}},
-             NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{100000}, .latency = 10us}};
+  s.nodes = {
+      NodeSpec{.id = "c",
+               .type = NodeType::client,
+               .workload =
+                   Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"x", 0.5}, {"y", 0.5}}}},
+      NodeSpec{.id = "a",
+               .type = NodeType::service,
+               .capacity = Rate{1000},
+               .latency = 1ms,
+               .advanced = {.queue_limit = 100},
+               .ops = {{"x", {Step{.to = "b", .op = "x"}}}, {"y", {Step{.to = "b", .op = "y"}}}},
+               .cost = {{"y", 4.0}}},
+      NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{100000}, .latency = 10us}};
   s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s},
              LinkSpec{.from = "a", .to = "b", .latency = 0s}};
   auto sim = *Simulation::create(*Graph::build(s));
@@ -556,4 +562,68 @@ TEST_CASE("estimate after a noisy run equals estimate before it", "[theory]") {
   const auto after = sim.estimate();
   REQUIRE(before.nodes[1].demand_per_s == after.nodes[1].demand_per_s);
   REQUIRE(before.responses[0].response == after.responses[0].response);
+}
+
+TEST_CASE("replicas, costs and a delay line: the next node receives the unit mix as requests",
+          "[theory]") {
+  Scenario s{.name = "rc", .version = 1, .duration = 10s};
+  s.nodes = {
+      NodeSpec{.id = "c",
+               .type = NodeType::client,
+               .workload =
+                   Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"x", 0.5}, {"y", 0.5}}}},
+      NodeSpec{.id = "a",
+               .type = NodeType::service,
+               .replicas = 3,
+               .capacity = Rate{400},
+               .latency = 1ms,
+               .advanced = {.queue_limit = 50},
+               .ops = {{"x", {Step{.to = "b", .op = "x"}}}, {"y", {Step{.to = "b", .op = "y"}}}},
+               .cost = {{"y", 4.0}}},
+      NodeSpec{.id = "b",
+               .type = NodeType::service,
+               .capacity = Rate{1e6},
+               .latency = 10us,
+               .cost = {{"y", 10.0}}}};
+  s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s},
+             LinkSpec{.from = "a", .to = "b", .latency = 150ms}};
+  auto sim = *Simulation::create(*Graph::build(s));
+  simsys::engine::StepRecord r;
+  for (int k = 0; k < 50; ++k) r = sim.step(k * 100ms, 100ms);
+  REQUIRE_THAT(r.nodes[1].demand_per_s, WithinRel(2500.0, 1e-12));  // 500 + 4·500 units
+  REQUIRE_THAT(r.nodes[1].drain_per_s, WithinRel(1200.0, 1e-12));   // 3 × 400
+  REQUIRE_THAT(r.nodes[1].backlog, WithinRel(150.0, 1e-12));        // 3 × 50 units
+  REQUIRE_THAT(r.nodes[2].demand_per_s,
+               WithinRel(240.0 + 2400.0, 1e-12));  // 240 x + 240 y requests priced 1 and 10
+}
+
+TEST_CASE("estimate in the middle of a noisy run leaves the run's next step unchanged",
+          "[theory]") {
+  Scenario s = mm1(500);
+  s.nodes[0].workload->noise = simsys::workload::Noise{.sigma = 0.3, .correlation = 1s};
+  const auto g = *Graph::build(s);
+  auto a = *Simulation::create(g);
+  auto b = *Simulation::create(g);
+  for (int k = 0; k < 7; ++k) {
+    (void)a.step(k * 100ms, 100ms);
+    (void)b.step(k * 100ms, 100ms);
+  }
+  (void)a.estimate();
+  const auto ra = a.step(700ms, 100ms), rb = b.step(700ms, 100ms);
+  REQUIRE(ra.nodes[1].demand_per_s == rb.nodes[1].demand_per_s);
+  REQUIRE(ra.responses[0].offered == rb.responses[0].offered);
+}
+
+TEST_CASE("the curve command's noisy samples at the scenario step are the run's offered rate",
+          "[theory]") {
+  Scenario s = mm1(500);
+  const simsys::workload::Noise noise{.sigma = 0.3, .correlation = 1s};
+  s.nodes[0].workload->noise = noise;
+  const auto g = *Graph::build(s);
+  auto sim = *Simulation::create(g);
+  auto samples = simsys::workload::samples(s.nodes[0].workload->curve, 100ms, 2s, noise,
+                                           simsys::behaviours::client_seed(s.seed, 0));
+  int k = 0;
+  for (const auto& sample : samples)
+    REQUIRE(sim.step(k++ * 100ms, 100ms).responses[0].offered.per_second == sample.rate.per_second);
 }
