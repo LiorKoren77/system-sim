@@ -36,6 +36,7 @@ using simsys::behaviours::LoadBalancerBehaviour;
 using simsys::behaviours::Outgoing;
 using simsys::behaviours::RateLimiterBehaviour;
 using simsys::behaviours::ServiceBehaviour;
+using simsys::behaviours::SqlDbBehaviour;
 using simsys::flow::Flow;
 using simsys::flow::LatencyEstimate;
 using simsys::model::CacheStrategy;
@@ -1221,4 +1222,83 @@ TEST_CASE("a write_back cache serves writes itself and flushes them asynchronous
   const double delivered =
       cache.delivered("write", 1.0, [](std::size_t, std::string_view) { return 0.0; });
   REQUIRE_THAT(delivered, WithinRel(1.0, 1e-12));
+}
+
+// ---- SqlDbBehaviour (plan 2b, Task 4) ----
+
+namespace {
+// u -> db, zero-latency link; the client sends reads (90 %) and writes (10 %) to the database
+// op for op. Node indices: u 0, db 1. The engine, not the behaviour, splits the load between
+// primary and replicas (it holds the two queues), so the behaviour sees one flow.
+Scenario sql_front(int replicas = 3) {
+  Scenario s{.name = "sql", .version = 1, .duration = 1min};
+  NodeSpec db{.id = "db", .type = NodeType::sql_db};
+  db.replicas = replicas;
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{100}},
+                                           .op_shares = {{"read", 0.9}, {"write", 0.1}}}},
+             std::move(db)};
+  s.links = {LinkSpec{.from = "u", .to = "db", .latency = 0s}};
+  return s;
+}
+}  // namespace
+
+// C++20 concepts checked at compile time, as for the other behaviours above.
+static_assert(simsys::behaviours::NodeBehaviour<SqlDbBehaviour>);
+
+// A database is a leaf (book ch. 1): it answers every query itself and calls nobody. How the
+// primary and the replicas share the work is the engine's business (two queues), not a
+// forwarding decision.
+TEST_CASE("a sql database serves reads and writes and forwards nothing", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(sql_front());
+  SqlDbBehaviour db{g, *g.index_of("db")};
+  Flow in;
+  in.add("read", Rate{100});
+  in.add("write", Rate{10});
+  const auto routed = db.route(in, 0s, 100ms);
+  REQUIRE(routed.outgoing.empty());
+  REQUIRE(routed.rejected.empty());
+  REQUIRE_THAT(routed.served.rate_of("read").per_second, WithinRel(100.0, 1e-12));
+  REQUIRE_THAT(routed.served.rate_of("write").per_second, WithinRel(10.0, 1e-12));
+  REQUIRE_THAT(routed.served.total().per_second, WithinRel(110.0, 1e-12));
+}
+
+// `write_ops` (default write, insert, update, delete) says which ops go to the primary; every
+// other op is a read the replicas can answer.
+TEST_CASE("reads and writes are classified by write_ops", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(sql_front());
+  const SqlDbBehaviour db{g, *g.index_of("db")};
+  REQUIRE(db.is_write("insert"));
+  REQUIRE(db.is_write("write"));
+  REQUIRE_FALSE(db.is_write("select"));
+  REQUIRE_FALSE(db.is_write("read"));
+  SECTION("a spec that lists only insert makes write a read") {
+    auto s = sql_front();
+    s.nodes[1].write_ops = {"insert"};
+    const auto custom = *simsys::graph::Graph::build(s);
+    const SqlDbBehaviour narrow{custom, *custom.index_of("db")};
+    REQUIRE(narrow.is_write("insert"));
+    REQUIRE_FALSE(narrow.is_write("write"));
+  }
+}
+
+// The engine holds the primary's and the replicas' queues and hands the behaviour the sojourn
+// of the one an op uses (writes: primary; reads: a replica copy); the database composes
+// nothing else, so its response is that `own`, and it asks nobody downstream.
+TEST_CASE("a sql database's response is the sojourn the engine chose, with no downstream steps",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(sql_front());
+  const SqlDbBehaviour db{g, *g.index_of("db")};
+  const LatencyEstimate own{0.0042, 1.5e-6};
+  bool asked = false;
+  const auto lookup = [&](std::size_t, std::string_view) {
+    asked = true;
+    return LatencyEstimate{99.0, 99.0};
+  };
+  REQUIRE(db.response("read", own, lookup) == own);
+  REQUIRE(db.response("write", own, lookup) == own);
+  REQUIRE_FALSE(asked);
+  REQUIRE_THAT(db.delivered("read", 0.9, [](std::size_t, std::string_view) { return 0.1; }),
+               WithinRel(0.9, 1e-12));
 }

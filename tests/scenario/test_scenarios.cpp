@@ -123,6 +123,29 @@ TEST_CASE("labs/rate-limiter runs in phase 2a", "[scenario]") {
   REQUIRE(steps == 10);
 }
 
+// Phase 2b, Task 4: the consistent-hashing lab (clients with Zipf keys -> a hash ring -> four che
+// caches -> a SQL database with a primary and a read replica) runs end to end and meets its own
+// SLOs (cache utilization <= 0.85, database utilization <= 0.7). If an SLO fails the CAPTUREd
+// numbers say by how much, so the implementer can judge whether the model or the lab's numbers
+// are off; the test must not be weakened to hide it.
+TEST_CASE("labs/consistent-hashing runs and passes its SLOs", "[scenario]") {
+  const auto s = simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} +
+                                      "/labs/consistent-hashing/scenario.yaml");
+  if (!s) FAIL(s.error().file << ":" << s.error().line << ": " << s.error().message);
+  const auto g = simsys::graph::Graph::build(*s);
+  if (!g) FAIL(g.error().message);
+  auto sim = simsys::engine::Simulation::create(*g);
+  if (!sim) FAIL(sim.error().message);
+  simsys::report::Summary summary{*g, s->warmup};
+  sim->run({.duration = s->duration, .step = s->step}, [&](const auto& r) { summary.observe(r); });
+  const auto results = simsys::report::evaluate_slos(summary, s->slos);
+  REQUIRE(results.size() == s->slos.size());
+  for (const auto& r : results) {
+    CAPTURE(r.slo.node, static_cast<int>(r.slo.metric), r.observed.value_or(-1.0));
+    REQUIRE(r.status != simsys::report::SloStatus::fail);
+  }
+}
+
 TEST_CASE("book scenarios are refused by run until their node types exist", "[scenario]") {
   // Phase 1 runs only client and service nodes; every book scenario uses more. The message
   // must name the node and the phase so a student knows what is missing, not that the file is
@@ -135,12 +158,15 @@ TEST_CASE("book scenarios are refused by run until their node types exist", "[sc
   REQUIRE(sim.error().message.find("phase 2") != std::string::npos);
 }
 
-// Phase 2a runs the nodes up to the cache: the two tutorials and the rate-limiter lab use only
-// those. Every other lab and every book scenario still needs a later phase's node types, so
-// the set of runnable scenarios is pinned by name: a node type added in a later phase makes
-// this fail and forces whoever adds it to update the list on purpose.
-TEST_CASE("labs and tutorials that run under phase 2a are: hello, chain, rate-limiter",
-          "[scenario]") {
+// Phase 2b runs the nodes up to the SQL database: the two tutorials, the rate-limiter lab and
+// the consistent-hashing lab (client, load balancer, che cache, sql_db) use only those. Every
+// other lab and every book scenario still needs a later task's node types, so the set of
+// runnable scenarios is pinned by name: a node type added later makes this fail and forces
+// whoever adds it to update the list on purpose.
+TEST_CASE(
+    "labs and tutorials that run under phase 2b are: chain, hello, consistent-hashing, "
+    "rate-limiter",
+    "[scenario]") {
   std::vector<std::string> runnable;
   for (const auto& file : scenario_files()) {
     CAPTURE(file);
@@ -151,7 +177,8 @@ TEST_CASE("labs and tutorials that run under phase 2a are: hello, chain, rate-li
     if (simsys::engine::Simulation::create(g)) runnable.push_back(s.name);
   }
   std::ranges::sort(runnable);
-  REQUIRE(runnable == std::vector<std::string>{"chain", "hello", "lab-rate-limiter"});
+  REQUIRE(runnable ==
+          std::vector<std::string>{"chain", "hello", "lab-consistent-hashing", "lab-rate-limiter"});
 }
 
 TEST_CASE("a refused scenario's message names the first unsupported node and the phase",

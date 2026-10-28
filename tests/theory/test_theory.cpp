@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // C++20 `import`: brings the module's exported names into this translation unit without
@@ -1198,4 +1199,120 @@ TEST_CASE("the consistent-hashing lab's cache hits 0.963 on even arcs and 0.924 
   INFO((g ? "" : g.error().message));
   REQUIRE(g.has_value());
   REQUIRE_THAT(*g->hit_ratio(*g->index_of("cache")), WithinAbs(0.924118, 1e-5));
+}
+
+// ---- SQL database: a primary and read replicas (plan 2b refinement 3, book ch. 1) ----
+
+namespace {
+// u(reads + writes per second) -> db, a SQL database of `replicas` copies (one primary plus
+// replicas - 1 read replicas) in `shards` shards. Every copy has capacity 1000/s and a 1 ms
+// service time, the link has zero latency, so a response is the database's own sojourn.
+// Node indices: u 0, db 1. An op with no load is left out of the client's mix.
+// `pool` and `replication_lag` are set only when given.
+Scenario sql_front(int replicas, std::optional<int> shards, double reads, double writes,
+                   std::optional<int> pool = std::nullopt,
+                   std::optional<simsys::SimTime> replication_lag = std::nullopt) {
+  Scenario s{.name = "sql-front", .version = 1, .duration = 10s};
+  std::vector<std::pair<std::string, double>> shares;
+  if (reads > 0) shares.emplace_back("read", reads / (reads + writes));
+  if (writes > 0) shares.emplace_back("write", writes / (reads + writes));
+  NodeSpec db{.id = "db",
+              .type = NodeType::sql_db,
+              .replicas = replicas,
+              .capacity = Rate{1000},
+              .latency = 1ms};
+  db.shards = shards;
+  db.pool = pool;
+  db.replication_lag = replication_lag;
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{reads + writes}},
+                                           .op_shares = std::move(shares)}},
+             std::move(db)};
+  s.links = {LinkSpec{.from = "u", .to = "db", .latency = 0s}};
+  return s;
+}
+// The mean response the client sees for `op` in a one-step run of `s`.
+double client_mean_s(const simsys::engine::StepRecord& r, std::string_view op) {
+  const auto it = std::ranges::find(r.responses, op, &simsys::engine::ResponseSample::op);
+  REQUIRE(it != r.responses.end());
+  return it->response.mean_s;
+}
+}  // namespace
+
+// Book ch. 1 (database replication): writes go to the primary, reads to the replicas, and each
+// replica also applies every write it is sent by the primary. With 3 copies that is 1 primary
+// (100 writes/s: rho 0.1) and 2 replicas, each with 1000 / 2 reads + 100 replicated writes =
+// 600 units/s (rho 0.6); both are independent M/M/1 queues (M/M/c with c = 1, `mmc_wait`).
+// The node reports the busier queue's rho, and each op sees the sojourn of its own queue.
+TEST_CASE(
+    "writes go to the primary and reads to the replicas, each replica also applying every write",
+    "[theory]") {
+  const auto r =
+      (*Simulation::create(*Graph::build(sql_front(3, std::nullopt, 1000, 100)))).step(0s, 100ms);
+  const auto& db = r.nodes[1];
+  REQUIRE_THAT(db.demand_per_s, WithinRel(1100.0, 1e-9));
+  REQUIRE_THAT(db.rho, WithinRel(0.6, 1e-9));  // max(primary 0.1, replica 0.6)
+  const auto replica = simsys::queueing::mmc_wait(1, 0.6, 0.001);
+  const auto primary = simsys::queueing::mmc_wait(1, 0.1, 0.001);
+  REQUIRE_THAT(client_mean_s(r, "read"), WithinRel(replica.mean_s + 0.001, 1e-9));
+  REQUIRE_THAT(client_mean_s(r, "write"), WithinRel(primary.mean_s + 0.001, 1e-9));
+}
+
+// With one copy there are no replicas: the primary serves reads and writes alike, one M/M/1
+// queue at (500 + 100) / 1000 = 0.6, and both ops see its sojourn.
+TEST_CASE("with one replica everything is on the primary", "[theory]") {
+  const auto r =
+      (*Simulation::create(*Graph::build(sql_front(1, std::nullopt, 500, 100)))).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[1].rho, WithinRel(0.6, 1e-9));
+  const auto shared = simsys::queueing::mmc_wait(1, 0.6, 0.001);
+  REQUIRE_THAT(client_mean_s(r, "read"), WithinRel(shared.mean_s + 0.001, 1e-9));
+  REQUIRE_THAT(client_mean_s(r, "write"), WithinRel(shared.mean_s + 0.001, 1e-9));
+}
+
+// Sharding (book ch. 1, horizontal scaling): the data is split over S independent sets of the
+// same shape, so each shard's primary and replicas see 1/S of the load. Here each replica sees
+// (1000 / 2 + 100) / 2 = 300 units/s per shard: rho 0.3 (the primary: 100 / 2 / 1000 = 0.05).
+TEST_CASE("shards divide both loads", "[theory]") {
+  const auto r = (*Simulation::create(*Graph::build(sql_front(3, 2, 1000, 100)))).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[1].rho, WithinRel(0.3, 1e-9));
+  const auto replica = simsys::queueing::mmc_wait(1, 0.3, 0.001);
+  const auto primary = simsys::queueing::mmc_wait(1, 0.05, 0.001);
+  REQUIRE_THAT(client_mean_s(r, "read"), WithinRel(replica.mean_s + 0.001, 1e-9));
+  REQUIRE_THAT(client_mean_s(r, "write"), WithinRel(primary.mean_s + 0.001, 1e-9));
+}
+
+// A replica applies a write `replication_lag` after the primary has finished it, so data a
+// replica serves can be as old as: the lag + the time the primary took over the write (its
+// sojourn: wait + service). With no replica nothing is stale.
+TEST_CASE("staleness is the replication lag plus the primary's write sojourn", "[theory]") {
+  SECTION("three copies: 50 ms lag, writes at rho 0.1") {
+    const auto r = (*Simulation::create(
+                        *Graph::build(sql_front(3, std::nullopt, 1000, 100, std::nullopt, 50ms))))
+                       .step(0s, 100ms);
+    REQUIRE(r.nodes[1].staleness_s.has_value());
+    const auto primary = simsys::queueing::mmc_wait(1, 0.1, 0.001);
+    REQUIRE_THAT(*r.nodes[1].staleness_s, WithinRel(0.050 + primary.mean_s + 0.001, 1e-9));
+  }
+  SECTION("one copy: nothing is stale") {
+    const auto r = (*Simulation::create(
+                        *Graph::build(sql_front(1, std::nullopt, 500, 100, std::nullopt, 50ms))))
+                       .step(0s, 100ms);
+    REQUIRE(r.nodes[1].staleness_s.value_or(0.0) == 0.0);
+  }
+  SECTION("a node that is not a database has no staleness") {
+    const auto r = (*Simulation::create(*Graph::build(mm1(500)))).step(0s, 100ms);
+    REQUIRE_FALSE(r.nodes[1].staleness_s.has_value());
+  }
+}
+
+// `pool` is the connection pool: the number of requests each queue serves at once, so each is
+// an M/M/c queue with c = pool instead of M/M/1. Reads only, 3 copies: each of the 2 replicas
+// sees 500/s (rho 0.5), and the response is Erlang C's wait for c = 4 plus the service time.
+TEST_CASE("pool sets the concurrency of both queues", "[theory]") {
+  const auto r =
+      (*Simulation::create(*Graph::build(sql_front(3, std::nullopt, 1000, 0, 4)))).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[1].rho, WithinRel(0.5, 1e-9));
+  const auto pooled = simsys::queueing::mmc_wait(4, 0.5, 0.001);
+  REQUIRE_THAT(client_mean_s(r, "read"), WithinRel(pooled.mean_s + 0.001, 1e-9));
 }
