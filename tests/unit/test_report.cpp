@@ -1,6 +1,7 @@
 // Summaries over a run, SLO evaluation and the three output formats.
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -20,16 +21,22 @@ import simsys.report;
 
 using namespace std::chrono_literals;
 using Catch::Approx;
+using Catch::Matchers::WithinRel;
 using simsys::Rate;
+using simsys::model::LinkSpec;
 using simsys::model::NodeSpec;
 using simsys::model::NodeType;
 using simsys::model::Scenario;
+using simsys::model::Step;
 using simsys::model::Workload;
 using simsys::report::Summary;
 
 namespace {
 // queue_limit is set only when given, so explain's provenance test sees "(default)".
 Scenario mm1(double demand, std::optional<double> queue_limit = std::nullopt) {
+  // C++20 designated initializers: `.name = ...` names each member being set, in
+  // declaration order, and leaves the rest at their defaults. Replaces positional braces,
+  // which break silently when members are reordered; a scenario reads like its YAML.
   Scenario s{.name = "mm1", .version = 1, .duration = 2s, .warmup = 500ms};
   s.nodes = {NodeSpec{.id = "c",
                       .type = NodeType::client,
@@ -43,6 +50,46 @@ Scenario mm1(double demand, std::optional<double> queue_limit = std::nullopt) {
       .from = "c", .to = "s", .dir = simsys::model::Direction::inout, .latency = 0s}};
   return s;
 }
+// Ch. 11's fan-out on write: every post to `api` becomes 100 writes to `feed`, so 100
+// posts/s offer feed 10k writes/s against a capacity of 1k/s. Feed drops about 90% of
+// what it is sent, while the client offers only 100 requests/s: a drop rate of "dropped
+// anywhere / offered by clients" would be 90, not a ratio.
+Scenario fan_out() {
+  Scenario s{.name = "fanout", .version = 1, .duration = 5s};
+  s.nodes = {
+      NodeSpec{.id = "users",
+               .type = NodeType::client,
+               .workload = Workload{.base = Rate{100}, .op_shares = {{"post", 1.0}}}},
+      NodeSpec{.id = "api",
+               .type = NodeType::service,
+               .capacity = Rate{10'000},
+               .ops = {{"post", {Step{.to = "feed", .op = "write", .factor = 100}}}}},
+      NodeSpec{.id = "feed", .type = NodeType::service, .capacity = Rate{1000}, .latency = 1ms}};
+  s.links = {LinkSpec{.from = "users", .to = "api", .dir = simsys::model::Direction::inout},
+             LinkSpec{.from = "api", .to = "feed"}};
+  return s;
+}
+
+// Two services in a loop: `a` sends half of its `msg` flow to `b` as `job`, `b` sends every
+// job back to `a`. A loop of gain `gain`: a's offered load is 100 / (1 - gain).
+Scenario loop(double gain) {
+  Scenario s{.name = "loop", .version = 1, .duration = 10s};
+  s.nodes = {NodeSpec{.id = "users",
+                      .type = NodeType::client,
+                      .workload = Workload{.base = Rate{100}, .op_shares = {{"msg", 1.0}}}},
+             NodeSpec{.id = "a",
+                      .type = NodeType::service,
+                      .capacity = Rate{10'000},
+                      .ops = {{"msg", {Step{.to = "b", .op = "job", .factor = gain}}}}},
+             NodeSpec{.id = "b",
+                      .type = NodeType::service,
+                      .capacity = Rate{10'000},
+                      .ops = {{"job", {Step{.to = "a", .op = "msg"}}}}}};
+  s.links = {LinkSpec{.from = "users", .to = "a", .dir = simsys::model::Direction::inout},
+             LinkSpec{.from = "a", .to = "b"}, LinkSpec{.from = "b", .to = "a"}};
+  return s;
+}
+
 Summary summarize(const Scenario& s, const simsys::graph::Graph& g) {
   Summary summary{g, s.warmup};
   auto sim = *simsys::engine::Simulation::create(g);
@@ -92,6 +139,75 @@ TEST_CASE("the drop rate is total dropped over total offered after warmup", "[re
   const auto summary = summarize(s, g);
   REQUIRE(summary.drop_rate() ==
           Approx(500.0 / 1500.0).epsilon(1e-3));  // queue full well before warmup ends
+}
+
+TEST_CASE("the drop rate is per node: its dropped over its own demand, the worst node by default",
+          "[report]") {
+  const auto s = fan_out();
+  const auto g = *simsys::graph::Graph::build(s);
+  // The feed's own ratio, summed independently of Summary from the same records.
+  const auto feed = *g.index_of("feed");
+  double feed_dropped = 0.0;
+  double feed_demand = 0.0;
+  Summary summary{g, s.warmup};
+  auto sim = *simsys::engine::Simulation::create(g);
+  sim.run({.duration = s.duration, .step = s.step}, [&](const simsys::engine::StepRecord& r) {
+    summary.observe(r);
+    feed_dropped += r.nodes[feed].dropped_per_s * 0.1;  // 100 ms steps
+    feed_demand += r.nodes[feed].demand_per_s * 0.1;
+  });
+  REQUIRE(feed_demand > 0.0);
+  REQUIRE_THAT(summary.drop_rate("feed"), WithinRel(feed_dropped / feed_demand, 1e-12));
+  REQUIRE(summary.drop_rate("api") == 0.0);
+  REQUIRE(summary.drop_rate("users") == 0.0);  // a client offers; it never drops
+  REQUIRE(summary.drop_rate() == summary.drop_rate("feed"));
+  REQUIRE(summary.drop_rate() > 0.8);
+  REQUIRE(summary.drop_rate() <= 1.0);
+  REQUIRE(summary.worst_drop_node() == "feed");
+
+  const std::vector<simsys::model::SloSpec> slos{
+      {.metric = simsys::model::SloMetric::drop_rate, .max = 1.0},
+      {.metric = simsys::model::SloMetric::drop_rate, .node = "api", .max = 0.0}};
+  const auto results = simsys::report::evaluate_slos(summary, slos);
+  REQUIRE(results[0].observed == summary.drop_rate("feed"));
+  REQUIRE(results[1].observed == 0.0);
+  REQUIRE(simsys::report::all_pass(results));
+
+  const auto text = simsys::report::render_table(summary, results, /*color=*/false);
+  const auto header = text.substr(0, text.find('\n'));
+  REQUIRE(header.find("drop rate") != std::string::npos);
+  REQUIRE(header.find("feed") != std::string::npos);
+}
+
+// No data is an error, not a pass: a window with no observed step evaluates nothing, so
+// every SLO is skipped with no observed value. all_pass of all-skipped stays true (a
+// skipped SLO never fails); `simsys run` exits 1 when zero steps were observed. That exit
+// code needs a process to test, so the library half of the contract is pinned here.
+TEST_CASE("an empty observation window evaluates nothing: every SLO is skipped, none observed",
+          "[report]") {
+  auto s = mm1(500);
+  s.warmup = s.duration;  // the loader refuses this; the library must still not pass it
+  s.slos = {simsys::model::SloSpec{.metric = simsys::model::SloMetric::p99_latency,
+                                   .node = "c",
+                                   .max = simsys::SimTime{50ms}},
+            simsys::model::SloSpec{.metric = simsys::model::SloMetric::drop_rate, .max = 0.0},
+            simsys::model::SloSpec{
+                .metric = simsys::model::SloMetric::utilization, .node = "s", .max = 0.9}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  REQUIRE(summary.observed_steps() == 0);
+  const auto results = simsys::report::evaluate_slos(summary, s.slos);
+  REQUIRE(results.size() == 3);
+  for (const auto& r : results) {
+    REQUIRE(r.status == simsys::report::SloStatus::skipped);
+    REQUIRE_FALSE(r.observed.has_value());
+  }
+  REQUIRE(simsys::report::all_pass(results));
+  const auto text = simsys::report::render_table(summary, results, /*color=*/false);
+  REQUIRE(text.find("0 steps observed: nothing to evaluate") != std::string::npos);
+  const auto json = simsys::report::render_json(summary, results);
+  REQUIRE(json.find("\"steps\": 0") != std::string::npos);
+  REQUIRE(json.find("\"status\": \"pass\"") == std::string::npos);
 }
 
 TEST_CASE("SLOs pass, fail or are skipped when the metric is not available", "[report]") {
@@ -170,7 +286,8 @@ TEST_CASE("infinite latency is reported as unavailable, not as a number", "[repo
   REQUIRE(json.find("null") != std::string::npos);
 }
 
-TEST_CASE("the series writer emits a header and one row per node per step", "[report]") {
+TEST_CASE("the series writer emits a header and one row per node per step; clients have no zone",
+          "[report]") {
   const auto s = mm1(500);
   const auto g = *simsys::graph::Graph::build(s);
   std::ostringstream out;
@@ -178,9 +295,16 @@ TEST_CASE("the series writer emits a header and one row per node per step", "[re
   auto sim = *simsys::engine::Simulation::create(g);
   sim.run({.duration = 300ms, .step = 100ms}, [&](const auto& r) { writer.observe(r); });
   const auto text = out.str();
+  // C++20 std::string::starts_with (and its twin ends_with): a prefix test in one call,
+  // replacing `compare(0, prefix.size(), prefix) == 0` and its length bookkeeping.
   REQUIRE(text.starts_with("t_s,node,rho,backlog,drops_per_s,latency_ms,zone\n"));
+  // C++20 std::ranges::count: counts the matches in a whole range (here the characters of
+  // the string), replacing std::count(text.begin(), text.end(), '\n').
   REQUIRE(std::ranges::count(text, '\n') == 1 + 3 * 2);
-  REQUIRE(text.find("0.100,s,") != std::string::npos);
+  REQUIRE(text.find("\n0.1,s,") != std::string::npos);  // shortest round-trip form of 0.1 s
+  // A client is a source: its numeric columns are 0 (machines keep a number) and its zone
+  // is `none` (it has no queue to colour).
+  REQUIRE(text.find("\n0,c,0,0,0,0,none\n") != std::string::npos);
 }
 
 TEST_CASE("render_explain lists every node with its resolved numbers and provenance", "[report]") {
@@ -194,4 +318,22 @@ TEST_CASE("render_explain lists every node with its resolved numbers and provena
   REQUIRE(text.find("c -> s") != std::string::npos);
   REQUIRE(text.find("order: c, s") != std::string::npos);
   REQUIRE(text.find("offered 500/s") != std::string::npos);  // the static checks block
+}
+
+TEST_CASE("explain's paper load follows a loop to its fixed point: gain 0.5 doubles the entry",
+          "[report]") {
+  const auto g = *simsys::graph::Graph::build(loop(0.5));
+  const auto text = simsys::report::render_explain(g);
+  CAPTURE(text);
+  // a = 100 + 0.5 a, so a = 200/s (2% of 10k/s); b = 0.5 a = 100/s.
+  REQUIRE(text.find("offered 200/s vs 10k/s total capacity  (2%, green)") != std::string::npos);
+  REQUIRE(text.find("offered 100/s vs 10k/s total capacity  (1%, green)") != std::string::npos);
+  REQUIRE(text.find("no steady state") == std::string::npos);
+}
+
+TEST_CASE("explain says when a loop of gain >= 1 has no steady state", "[report]") {
+  const auto g = *simsys::graph::Graph::build(loop(2.0));
+  const auto text = simsys::report::render_explain(g);
+  CAPTURE(text);
+  REQUIRE(text.ends_with("  (no steady state: a loop of gain >= 1)\n"));
 }
