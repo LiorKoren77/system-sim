@@ -17,7 +17,7 @@ nodes:
     ops: {next_id: 1.0}
     timeout: 50ms
 
-  ticket_server:                               # try: replicas 1, capacity 8k/s (a single MySQL)
+  ticket_server:                               # one auto-increment MySQL, sized generously
     type: id_generator
     algorithm: ticket_server
     replicas: 1
@@ -27,10 +27,8 @@ nodes:
 
   snowflake:                                   # 4 generators, each 4,096 IDs per ms by design
     type: id_generator
-    algorithm: snowflake
+    algorithm: snowflake                       # supplies 4.096M/s and 10 us per replica
     replicas: 4
-    capacity: 4M/s
-    latency: 0.01ms
 
 links:
   - {from: services, to: ticket_server, dir: inout, weight: 1}

@@ -22,6 +22,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -241,6 +242,40 @@ bool open_series(const std::string& path, std::ofstream& file) {
   return static_cast<bool>(file);
 }
 
+// Can `path` be opened for writing? Probed in append mode, which never truncates, and a file the
+// probe created is removed again: a run refused for the OTHER series file leaves this one as it
+// found it (review of 3e23477, M1: `--series` was truncated before `--series-ops` failed).
+bool writable(const std::string& path) {
+  std::error_code ignored;  // the non-throwing overloads: a probe answers, it does not throw
+  const bool existed = std::filesystem::exists(path, ignored);
+  const bool opened = std::ofstream{path, std::ios::app}.is_open();
+  if (opened && !existed) std::filesystem::remove(path, ignored);
+  return opened;
+}
+
+// `path` as the file system resolves it: absolute, `.` and `..` and the symbolic links of the
+// parts that exist resolved (std::filesystem::weakly_canonical), so `a.csv`, `./a.csv` and a link
+// to it compare equal; its plain normal form if even that fails.
+std::filesystem::path resolved(const std::string& path) {
+  std::error_code error;
+  auto canonical = std::filesystem::weakly_canonical(path, error);
+  return error ? std::filesystem::path{path}.lexically_normal() : canonical;
+}
+
+// Why the series files cannot be written, before either is opened (opening truncates), or
+// nothing: two names for one file (both writers would truncate it and interleave their rows,
+// M2), or a path that cannot be opened for writing.
+std::optional<std::string> series_paths_refused(const std::optional<std::string>& series,
+                                                const std::optional<std::string>& series_ops) {
+  if (series && series_ops && resolved(*series) == resolved(*series_ops)) {
+    return *series_ops + ": error: --series and --series-ops name the same file";
+  }
+  for (const auto& path : {series, series_ops}) {
+    if (path && !writable(*path)) return *path + ": error: cannot open for writing";
+  }
+  return std::nullopt;
+}
+
 // `simsys run <file>`: steps through the scenario, feeding every record to the summary
 // and, when asked, to the CSV series (the contract a GUI plots from).
 // `--seed` reaches the engine through the scenario (load_graph); a process-level test of
@@ -266,7 +301,12 @@ int run_scenario(const std::filesystem::path& file, const RunArgs& args,
     return 1;
   }
 
-  // Both files open before the run, so a bad path stops it before any step.
+  // Both paths are checked, then both files open, before the run: a bad path stops it before
+  // any step and before either file is truncated.
+  if (const auto refused = series_paths_refused(args.series, args.series_ops)) {
+    print_error(*refused);
+    return 1;
+  }
   std::ofstream series_file;
   std::ofstream series_ops_file;
   if (args.series && !open_series(*args.series, series_file)) return 1;

@@ -193,7 +193,11 @@ inline constexpr int snowflake_sequence_bits = 12;
 // per algorithm (model::IdAlgorithm says what each design is):
 //  - snowflake: 2^12 ids per millisecond × 1000 ms = 4.096M ids/s per machine, the ceiling the
 //    id layout sets by design; 10 us chosen: a clock read, a counter increment and a few
-//    shifts, the same order as the book's "compress 1 KB" row.
+//    shifts, the same order as the book's "compress 1 KB" row. With both numbers, Little's law
+//    gives the implied concurrency c = ceil(4.096M/s × 10 us) = ceil(40.96) = 41 ids in service
+//    at once, where one sequence counter issues them one after another: one id per 244 ns
+//    (1 / 4.096M/s) would give c = 1. Either way the service time is negligible beside the
+//    round trip to the generator (hundreds of us), so the model keeps the round 10 us.
 //  - ticket_server: one auto-increment database, and handing out an id IS a write (REPLACE
 //    INTO + LAST_INSERT_ID in Flickr's design): spec §6's "SQL 1k writes" per second,
 //    sql_write_rate; 1 ms chosen: a single-row commit on one machine.

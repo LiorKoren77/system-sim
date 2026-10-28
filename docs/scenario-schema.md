@@ -77,10 +77,14 @@ caches and CDNs (their misses, their store, a cache's `then`). They do **not** f
 `blob_store`'s or a `worker_pool`'s `then`, nor a `message_queue`'s consumers (phase 2c), nor
 the `then` of a `notification_fanout` or a `frontier`. A node whose load can only come through one of those
 gets 0 on paper: a number that is missing, not zero. Its check line therefore has no
-percentage and no zone, but a mark naming the nearest such node's type on the way to it:
+percentage and no zone, but a mark naming each such type on the way to it, nearest first:
 `transcode_q  peak offered 0/s vs 1M/s total capacity  (load not propagated: blob_store is
-phase 2c)`, or `... (load not propagated: frontier is not modelled yet)`. A node that receives
-some load the checks do follow keeps its verdict, which then leaves out the unpropagated part.
+phase 2c)`, or `dns ... (load not propagated: worker_pool is phase 2c, frontier is not modelled
+yet)`. The mark follows such a node's `then` steps (a message queue's links, which is all it
+has), not every link it has. A node that also receives load the checks do follow gets its
+percentage as a **lower bound**, with no zone unless even that is red (the real load is higher,
+so green or yellow might not hold, but red does): `metadata_db ... (≥0.559%; load not
+propagated: worker_pool, message_queue and blob_store are phase 2c)`, `(≥150%, red; ...)`.
 
 ## Values
 
@@ -612,11 +616,14 @@ on a service.
 | key | rule | message |
 |---|---|---|
 | `algorithm` | required, one of the three words (`multi_master`, the chapter's fourth design, is not modelled) | `node 'ids': id_generator needs algorithm: snowflake, ticket_server or uuid` (missing or unknown) |
-| `replicas` | *(graph)* exactly 1 on a `ticket_server`: one database issues the sequence; a second copy would repeat it | `node 'ids': a ticket server is one auto-increment database: replicas must be 1 (ch. 7; for more ids per second use snowflake)` |
+| `replicas` | exactly 1 on a `ticket_server`: one database issues the sequence; a second copy would repeat it (the chapter's remedy for its single point of failure, several ticket servers kept in sync, is not a mode of the model). Checked by the loader, and by `Graph::build` for scenarios built in code | `node 'ids': a ticket server is one auto-increment database: replicas must be 1 (ch. 7; for more ids per second use snowflake)` |
 
 `explain` says what the algorithm stands for, `algorithm=snowflake (4.096M/s per replica by
 design)`, `algorithm=ticket_server (one database: 1k/s, spec §6 writes)`, `algorithm=uuid
-(unbounded: 1G/s)`, and checks the peak load against replicas × capacity (`vs 12.29M/s total
+(unbounded: 1G/s)`, tags the numbers the algorithm supplied `(algorithm)` (`capacity=4.096M/s
+(algorithm)`), calls the algorithm's figure a default beside a capacity the scenario states
+(`capacity=8k/s (scenario) ... algorithm=ticket_server (one database; default 1k/s, spec §6
+writes)`), and checks the peak load against replicas × capacity (`vs 12.29M/s total
 capacity` for three snowflake machines). The [unique-id lab](../scenarios/labs/unique-id/)
 compares the ticket server with snowflake.
 
@@ -731,8 +738,10 @@ identity can be checked from the file: summed over a run that starts empty,
 
 Neither kind of request is answered, so neither contributes latency: each step's response
 is weighted by the client's offered rate times the fraction its path **delivers** (a
-node's own served / inflow, times its downstream's: sequential parts multiply, splits mix
-by share). `run`'s table header shows `drop rate`, and `reject rate X% (worst: node)` once
+node's own share of the step's arrivals it did not lose, 1 − (dropped + rejected) / inflow,
+times its downstream's: sequential parts multiply, splits mix by share). A request that waits
+in a growing queue is not lost: it is answered later, so a backlog alone leaves the delivered
+fraction at 1. `run`'s table header shows `drop rate`, and `reject rate X% (worst: node)` once
 some node refused anything; the node table has `dropped` and `rejected` columns; JSON has
 `drop_rate`, `worst_drop_node`, `reject_rate`, `worst_reject_node` and per node `dropped`,
 `rejected` and (phase 2b) `staleness_s`, a database's mean staleness in seconds,
@@ -747,8 +756,9 @@ against `max` alone (a replica that falls behind without bound).
 drops and backlog in capacity units; a client row has zeros and zone `none`).
 `run --series-ops` writes one CSV row per client op per step (phase 2b):
 `t_s,client,op,offered_per_s,answered_per_s,mean_ms`, where `answered_per_s` is the part of
-the offered rate that came back answered (offered × the fraction the path delivered: below it
-when a limiter refuses or a queue drops, never above) and `mean_ms` the mean response of an
+the offered rate that came back answered (offered × the fraction the path delivered: offered
+minus what a limiter refused or a queue dropped on the way, never above offered; requests
+still waiting in a queue count as answered, later) and `mean_ms` the mean response of an
 answered request (`inf` when the path never answers). Numbers have 6 significant digits, `t_s`
 its shortest exact form. JSON's op entries carry `answered_per_s` beside `offered_per_s`.
 When no step was observed every SLO is `skipped` and `run` exits 1: no data is an error,

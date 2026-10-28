@@ -147,8 +147,9 @@ struct NodeSample {
 // answered, and the response time an answered request gets. `answered` = offered × the
 // delivered fraction the backward pass composes along the op's path (plan 2a refinement 8,
 // behaviours::NodeBehaviour::delivered): a request a limiter refused or a full queue dropped
-// is not answered, and reports weigh latency by `answered` so that those requests, which
-// never saw the path's latency, do not dilute it.
+// is not answered (one still waiting in a queue is: later, see Simulation::account_rejections),
+// and reports weigh latency by `answered` so that those requests, which never saw the path's
+// latency, do not dilute it.
 struct ResponseSample {
   std::size_t client{};
   std::string op{};
@@ -282,8 +283,8 @@ class Simulation {
   };
 
   // What one copy group's step produced (serve_copies): one copy's fluid step, and what all the
-  // group's copies drained and (only at a replica, which needs it) dropped, per op, in capacity
-  // units per second: the group's totals, the clients' work and a replica's replayed writes alike.
+  // group's copies drained and dropped, per op, in capacity units per second: the group's
+  // totals, the clients' work and a replica's replayed writes alike.
   struct GroupStep {
     fluid::FluidStep copy{};
     flow::Flow drained{};
@@ -313,9 +314,13 @@ class Simulation {
     std::vector<std::size_t> incoming_links{};  // links delivering demand here
     std::vector<std::size_t> outgoing_links{};  // links this node sends demand on
     flow::Flow inflow{};                        // this step's arrivals
-    // The share of this step's arrivals the node passes on (served / inflow, at most 1): the
-    // node's own factor in its delivered fraction (see forward_pass). A database keeps its
-    // writes' share apart (`passed_writes`): its primary and its replicas fill up separately.
+    // What the node's queues dropped this step, per op, in requests: the clients' part only (a
+    // replica's replayed writes answer no client). Filled by serve, read by account_rejections.
+    flow::Flow dropped{};
+    // The share of this step's arrivals the node does not lose, 1 − (dropped + rejected) /
+    // inflow: the node's own factor in its delivered fraction (see account_rejections). A
+    // database keeps its writes' share apart (`passed_writes`): its primary and its replicas
+    // fill up separately.
     double passed{1.0};
     double passed_writes{1.0};
     // This step's own sojourn of a read and of a write (serve): a database's writes wait at its
@@ -566,11 +571,12 @@ void add_copies(NodeSample& sample, const fluid::FluidStep& copy_step, double co
   sample.backlog += copy_step.backlog * copies * content_share;
 }
 
-// The served share of the requests that arrived, capped at 1 (see account_rejections); 1 when
-// nothing arrived: nothing was lost.
-[[nodiscard]] double passed_share(const flow::Flow& served, const flow::Flow& arrived) {
+// The share of the requests that arrived and were not lost, 1 − lost / arrived, kept in [0, 1]
+// (see account_rejections); 1 when nothing arrived: nothing was lost.
+[[nodiscard]] double kept_share(const flow::Flow& lost, const flow::Flow& arrived) {
   const double arrived_per_s = arrived.total().per_second;
-  return arrived_per_s > 0.0 ? std::min(served.total().per_second / arrived_per_s, 1.0) : 1.0;
+  if (arrived_per_s <= 0.0) return 1.0;
+  return std::clamp(1.0 - lost.total().per_second / arrived_per_s, 0.0, 1.0);
 }
 
 // estimate()'s stopping rule: a pass changed nothing that matters when every node's
@@ -941,6 +947,7 @@ Simulation Simulation::settling_copy() const {
     node.inflow.clear();
     for (auto& group : node.copy_groups) group.waiting.clear();
     for (auto& [op, answer] : node.responses) answer = Answer{};
+    node.dropped.clear();
     node.passed = 1.0;
     node.passed_writes = 1.0;
     if (auto* client = std::get_if<behaviours::ClientBehaviour>(&node.behaviour)) {
@@ -1005,12 +1012,17 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode,
 //  - `rejected_per_s` is what the behaviour refused; for a leaky bucket, whose behaviour
 //    refuses nothing, it is the bucket's overflow, moved out of `dropped_per_s` (the queue
 //    reports it as a drop, but "bucket full, 429" is the policy, not a failure);
-//  - `passed` = served / inflow (requests), the node's own factor in its delivered
-//    fraction: a token-family limiter's admitted / offered, a queue's drain / demand. A
-//    step that works off a backlog serves more than it receives; the excess answers
-//    requests of earlier steps, which the per-step pairing cannot credit to them, so the
-//    factor is capped at 1. No arrivals: 1 (nothing was lost). A database's reads and writes
-//    queue at different copies (make_database), so it keeps one factor for each.
+//  - `passed` = 1 − (dropped + rejected) / inflow, in requests: the node's own factor in its
+//    delivered fraction. Only a loss makes a request unanswered: one that waits in a growing
+//    queue is answered later, so a backlog is neutral (answered = offered − lost, every step).
+//    The pairing is per step: this step's drops are set against this step's arrivals, though
+//    the well-mixed queue (see serve) drops older requests too. In a steady state it equals
+//    served / inflow, the share used before: with the backlog still, drain + drops = inflow,
+//    and served = drain − rejected. Out of one, served / inflow (review of 3e23477, I2) counted
+//    every request still waiting at the end of its arrival step as lost and never credited it
+//    later: a 3x spike into a deep queue, nothing dropped, reported 583/s answered of 667/s.
+//    No arrivals: 1 (nothing was lost). A database's reads and writes queue at different
+//    copies (make_database), so it keeps one factor for each.
 void Simulation::account_rejections(std::size_t index, const behaviours::Routed& routed,
                                     NodeSample& sample) {
   auto& node = nodes_[index];
@@ -1019,14 +1031,18 @@ void Simulation::account_rejections(std::size_t index, const behaviours::Routed&
   if (limiter != nullptr && limiter->refuses_on_overflow()) {
     sample.rejected_per_s += std::exchange(sample.dropped_per_s, 0.0);
   }
+  // A leaky bucket's overflow is in `dropped` (its queue's) and not in `rejected` (its
+  // behaviour refuses nothing): the sum counts it once.
+  flow::Flow lost = node.dropped;
+  lost += routed.rejected;
   if (!node.replication) {
-    node.passed = passed_share(routed.served, node.inflow);
+    node.passed = kept_share(lost, node.inflow);
     return;
   }
-  const auto [served_reads, served_writes] = split_writes(routed.served, node.behaviour);
+  const auto [lost_reads, lost_writes] = split_writes(lost, node.behaviour);
   const auto [arrived_reads, arrived_writes] = split_writes(node.inflow, node.behaviour);
-  node.passed = passed_share(served_reads, arrived_reads);
-  node.passed_writes = passed_share(served_writes, arrived_writes);
+  node.passed = kept_share(lost_reads, arrived_reads);
+  node.passed_writes = kept_share(lost_writes, arrived_writes);
 }
 
 // In settle mode the links have no delay: in the long run a link delivers exactly what
@@ -1091,6 +1107,7 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSampl
   // Not const: `writes` becomes the primaries' committed writes below.
   auto [reads, writes] = split_writes(in_units(node.inflow, node.behaviour), node.behaviour);
   flow::Flow drained;
+  flow::Flow dropped;            // units, the clients' part (account_rejections reads it)
   ReplicationTally replication;  // a database's committed and missed writes (replay_committed)
   sample = NodeSample{};
   // At most two groups (max_copy_groups): a fixed array, no allocation per step.
@@ -1108,7 +1125,9 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSampl
     sojourns[i] = step.copy.latency;
     replay_committed(group, step, node.behaviour, writes, replication);
     drained += clients_part(group, std::move(step.drained), node.behaviour);
+    dropped += clients_part(group, std::move(step.dropped), node.behaviour);
   }
+  node.dropped = in_requests(dropped, node.behaviour);
   // C++20 std::span with C++17 class template argument deduction: `std::span{sojourns}`
   // deduces std::span<LatencyEstimate, max_copy_groups> from the array without spelling the
   // type, and first(n) views only the n groups in use, replacing a (pointer, count) pair.
@@ -1260,8 +1279,9 @@ Simulation::GroupStep Simulation::serve_copies(CopyGroup& group, const flow::Flo
   const flow::Flow content = queue_content(group.waiting, arrivals, dt);
   GroupStep step{.copy = group.queue.advance(per_copy, dt)};
   step.drained = take_drained(group, content, step.copy);
-  if (group.role == CopyRole::replica)
-    step.dropped = dropped_part(content, step.copy, group.copies);
+  // Every group's drops, per op: a replica's replayed writes it missed (replay_committed) and,
+  // on every node, the requests lost (account_rejections).
+  step.dropped = dropped_part(content, step.copy, group.copies);
   // The queue is well-mixed (see serve): what it drains, drops and holds has the content's op
   // mix, so the clients' share of the content is their share of each of those.
   add_copies(sample, step.copy, group.copies, clients_share(group, arrivals, behaviour),

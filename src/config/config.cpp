@@ -2121,6 +2121,9 @@ CheckResult read_limiter_keys(const Site& site, const YAML::Node& body, model::N
 // time (defaults::for_id_algorithm), so a generator without one would run on a made-up number.
 // One message for a missing and an unknown word, naming the three, so the fix is in the error.
 // The same key on a rate limiter is the limiter's (read_limiter_algorithm), typed apart.
+// A ticket server is one auto-increment database (book ch. 7): `replicas` other than 1 is
+// refused here, at its line, with Graph::build's message (model::ticket_server_replicas_rule),
+// so `validate` catches it too; `replicas` was read in the first pass.
 CheckResult read_id_generator_keys(const Site& site, const YAML::Node& body,
                                    model::NodeSpec& node) {
   if (node.type != model::NodeType::id_generator) return {};
@@ -2135,6 +2138,9 @@ CheckResult read_id_generator_keys(const Site& site, const YAML::Node& body,
     return read;
   }
   node.id_algorithm = algorithm;
+  if (algorithm == model::IdAlgorithm::ticket_server && node.replicas != 1) {
+    return this_node.fail(body["replicas"], model::ticket_server_replicas_rule);
+  }
   return {};
 }
 

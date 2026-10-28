@@ -66,8 +66,10 @@ struct NodeSummary {
 // One (client, op) over the observed part of a run. Percentiles are a lognormal fit to
 // the latency moments averaged over the ANSWERED requests (plan 2a refinement 8: a refused
 // or dropped request saw no latency); `offered_per_s` still counts every request sent, and
-// `answered_per_s` the part of them that came back answered (plan 2b refinement 7), so
-// answered / offered is the fraction the path delivered. An infinite mean makes every latency
+// `answered_per_s` the part of them that came back answered (plan 2b refinement 7): offered
+// minus what was refused or dropped on the way (a request still waiting in a queue is answered
+// later, not lost), so answered / offered is the fraction the path delivered. An infinite mean
+// makes every latency
 // infinite, which the renderers print as "unavailable" (table) or null (JSON).
 struct OpSummary {
   std::string client{};

@@ -44,7 +44,8 @@ conservation law, Σ demand·dt = Σ (drain + drops)·dt + backlog, can be check
 token bucket's or a window's refusals are inside drain; a leaky bucket's overflow is in
 `rejected_per_s`, in the drops' place). With `--series-ops`, it writes one CSV row per client op
 per step (`t_s,client,op,offered_per_s,answered_per_s,mean_ms`): what each client sent, the part
-of it that came back answered (a limiter's refusals and a queue's drops are not), and the mean
+of it that came back answered (a limiter's refusals and a queue's drops are not; a request
+waiting in a queue is answered later), and the mean
 response in milliseconds (`inf` when the path never answers). The JSON report's ops carry
 `answered_per_s` beside `offered_per_s` too.
 Exit codes: 0 every SLO passed, 2 an SLO failed, 1 an error.
@@ -131,17 +132,18 @@ nodes
   counters   0.00954      0.16             0        0         0      0
   api         0.6817         1            80        0         0    1.5
 ops (percentiles estimated: lognormal fit to the response moments)
-  client.op     offered/s    mean  p50     p95     p99  (estimated)
-  clients.call        954  5.78ms  4ms  16.4ms  29.4ms
+  client.op     offered/s    mean     p50     p95     p99  (estimated)
+  clients.call        954  5.79ms  3.93ms  16.7ms  30.5ms
 slo
   status  metric       node     op    observed  max
   PASS    utilization  api      -     0.6817    0.9
-  PASS    p99_latency  clients  call  29.4ms    50ms
+  PASS    p99_latency  clients  call  30.5ms    50ms
 ```
 
 At the start of each spike the full bucket lets its 100 tokens through on top of the
 refill, the api's queue absorbs them (backlog 80, 1.5 s red in 29 minutes), and from then
-on exactly 1k/s passes. Latency counts only the requests that were answered. The lab's
+on exactly 1k/s passes. Latency counts only the requests that were answered (the 80 that
+waited in the api's queue were, late). The lab's
 README compares the five algorithms at `burst: 500`, where the same surge overflows the
 api's queue and the p99 SLO fails.
 
