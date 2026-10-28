@@ -348,8 +348,20 @@ caches passing on to their store). Exactly one distribution must reach it:
 - two clients with different `keys`: *(graph)* `node 'c': hit_ratio che: clients 'a' and 'b' send different key distributions` (the first two in file order that disagree);
 - clients with equal `keys` share it.
 
+**Effective capacity.** `keys` is per replica. Behind a `consistent_hash` load balancer each key
+hashes to one replica, so the replicas hold disjoint parts of the key space and the Che
+approximation uses `keys × replicas` as the cache size (the replicas behave as one LRU cache of
+that size). Behind any other policy, or with no balancer, every replica can see every key and
+fills itself with the same hot keys, so the cache size is `keys`. The ring's uneven arcs and a
+replica lost to a `node_down` fault do not change it (the hit ratio is resolved once, at build).
+
 `explain` prints the number and where it came from: `hit_ratio=0.881 (che: zipf 1 over 100M keys
-from users)`. From then on a `che` cache runs exactly like a fixed one with that `h`.
+from users)`, and for a cache behind a ring `hit_ratio=0.963 (che: zipf 0.9 over 10M keys from
+clients; 2M keys x 4 partitioned)`. From then on a `che` cache runs exactly like a fixed one with
+that `h`.
+
+For spec §18: the code's `HitRatioModel` is `hit_ratio(capacity) -> double`, each model owning its
+inputs (`CheHitRatio{popularity}`), where spec §5 wrote `hit_ratio(capacity, popularity)`.
 
 ## Rate curve (`client.rate`)
 

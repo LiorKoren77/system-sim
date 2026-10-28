@@ -91,12 +91,17 @@ struct EngineError {
 
 // A cache's or CDN's hit ratio h as the graph resolved it (plan 2b refinements 1-2):
 // `value`, and for `che` the inputs explain prints as its provenance: the key distribution
-// the clients upstream send (`keys`) and those clients (`key_clients`, node indices in
-// scenario order). A fixed ratio has neither.
+// the clients upstream send (`keys`), those clients (`key_clients`, node indices in
+// scenario order), and the cache size the approximation used (`capacity`, in keys): the
+// cache's `keys`, times its replicas when a consistent-hash ring partitions the key space
+// over them (`partitions`, the replica count then, 1 otherwise; see
+// detail::effective_capacity). A fixed ratio has none of these.
 struct ResolvedHitRatio {
   double value{};
   std::optional<model::KeySpec> keys{};
   std::vector<std::size_t> key_clients{};
+  double capacity{};
+  int partitions{1};
 };
 
 // A scenario node plus the numbers the engine needs, each with the layer it came from.
@@ -108,9 +113,13 @@ struct ResolvedNode {
   // Set on a node that sits behind a load balancer (Graph::mark_balanced_targets), the
   // ReplicaModel in numbers: its replicas form one pooled queue (`pooled`,
   // least_connections), or the hottest replica carries `imbalance` times the average share
-  // (consistent_hash; 1 = an even split, the independent model).
+  // (consistent_hash; 1 = an even split, the independent model). `keys_partitioned` is set
+  // with the imbalance: a ring sends each key to one replica only, so the replicas split the
+  // key space between them (a cache's replicas then hold different keys, see
+  // detail::effective_capacity).
   bool pooled{false};
   double imbalance{1.0};
+  bool keys_partitioned{false};
   // A rate limiter's counter store, or the store behind a cache whose strategy calls it
   // (model::needs_backend), as a node index, and the link its requests travel on
   // (Graph::connect_backends); empty for every other node, a cache_aside cache included.
@@ -829,37 +838,48 @@ struct KeySource {
 // Pattern: Strategy/Policy — the hit-ratio model is a compile-time policy selected at build:
 // each cache's `hit_ratio` picks one of simsys.caching's HitRatioModel types, held in a
 // std::variant and visited once (Graph::resolve_hit_ratios); adding a model (an LFU one, say)
-// is one more alternative and one more resolve_with overload.
+// is one more alternative and one more function that builds it from the scenario.
 using HitRatioPolicy = std::variant<caching::FixedHitRatio, caching::CheHitRatio>;
 
-// `{fixed: h}` -> FixedHitRatio{h}; `che` -> CheHitRatio. Only called with one of the two set.
-[[nodiscard]] HitRatioPolicy hit_ratio_policy(const model::HitRatio& stated) {
-  if (stated.che) return caching::CheHitRatio{};
-  return caching::FixedHitRatio{.value = *stated.fixed};
-}
-
-// The inputs a policy may read: the graph's nodes, which one is the cache, and who is upstream.
+// The inputs resolving a hit ratio may read: the graph's nodes, which one is the cache, and
+// who is upstream of it.
 struct HitRatioInputs {
   std::span<const ResolvedNode> nodes;
   std::size_t cache;
   std::span<const std::size_t> clients_upstream;
 };
 
-// A stated ratio needs no inputs: it is the scenario author's own estimate. (FixedHitRatio's
-// hit_ratio(capacity, popularity) ignores both, but simsys.caching has no "unknown popularity"
-// to pass it, and a fixed cache need not have keyed clients upstream, so the value is read
-// directly.)
-[[nodiscard]] std::expected<ResolvedHitRatio, EngineError> resolve_with(
-    const caching::FixedHitRatio& fixed, const HitRatioInputs& /*inputs*/) {
-  return ResolvedHitRatio{.value = fixed.value};
+// The cache size the Che approximation sees, in keys, and over how many replicas it is
+// partitioned. A cache with N replicas holds `keys` entries per replica; what they hold
+// together depends on how keys reach them:
+//  - round robin, weighted, least connections: any request can reach any replica, so every
+//    replica sees the whole key popularity and fills itself with the same hot keys. Each is
+//    a full copy of `keys` entries, and the hit ratio is that of ONE cache of `keys`.
+//  - consistent hash (ch. 5): each key hashes to exactly one replica, so the replicas hold
+//    disjoint parts of the key space, `keys × N` distinct keys together. Each replica is an
+//    LRU cache over a random 1/N of the keys, seeing 1/N of the requests. Counted in the
+//    requests of the whole system, its Che equation is Σ_{i in its part} (1 − e^{−p_i t}) =
+//    keys; each part holds about 1/N of every popularity level, so one t solves all N of
+//    them, and adding the N equations gives Σ_i (1 − e^{−p_i t}) = keys × N: the equation of
+//    one cache of `keys × N` over the whole space, whose hit ratio is the replicas' total.
+// Assumes a random partition: the ring's uneven arcs (ResolvedNode::imbalance) change how
+// many keys each replica owns, which this capacity ignores. A replica lost to a fault is not
+// subtracted either: the hit ratio is resolved once, at build.
+struct EffectiveCapacity {
+  double keys;
+  int partitions;
+};
+[[nodiscard]] EffectiveCapacity effective_capacity(const ResolvedNode& cache) {
+  const int partitions = cache.keys_partitioned ? cache.spec.replicas : 1;
+  return {.keys = static_cast<double>(*cache.spec.keys) * partitions, .partitions = partitions};
 }
 
-// The Che approximation needs the cache size C (the cache's `keys`) and the popularity of the
-// keys the clients upstream ask for (key_source); h = che_hit_ratio(C, popularity), computed
-// here once (about half a millisecond for a 1e8-key Zipf space).
-[[nodiscard]] std::expected<ResolvedHitRatio, EngineError> resolve_with(
-    const caching::CheHitRatio& che, const HitRatioInputs& inputs) {
-  const auto& spec = inputs.nodes[inputs.cache].spec;
+// What a `che` hit ratio rests on, checked: the cache size C (effective_capacity) and the key
+// distribution of the clients upstream (key_source). This is also its provenance in explain.
+[[nodiscard]] std::expected<ResolvedHitRatio, EngineError> che_inputs(
+    const HitRatioInputs& inputs) {
+  const auto& cache = inputs.nodes[inputs.cache];
+  const auto& spec = cache.spec;
   if (!spec.keys) {
     return std::unexpected{EngineError{
         "node '" + spec.id + "': hit_ratio che needs keys (the cache's capacity in keys)"}};
@@ -869,10 +889,28 @@ struct HitRatioInputs {
   }
   const auto source = key_source(inputs.nodes, inputs.cache, inputs.clients_upstream);
   if (!source) return std::unexpected{source.error()};
-  const double capacity = static_cast<double>(*spec.keys);
-  return ResolvedHitRatio{.value = che.hit_ratio(capacity, popularity_of(source->keys)),
-                          .keys = source->keys,
-                          .key_clients = source->clients};
+  const auto capacity = effective_capacity(cache);
+  return ResolvedHitRatio{.keys = source->keys,
+                          .key_clients = source->clients,
+                          .capacity = capacity.keys,
+                          .partitions = capacity.partitions};
+}
+
+// What a cache's hit ratio rests on: for `che` its checked inputs (che_inputs); for
+// `{fixed: h}` nothing, as it is the scenario author's own estimate (and a fixed cache need
+// not have keyed clients upstream). Only called with `fixed` or `che` set.
+[[nodiscard]] std::expected<ResolvedHitRatio, EngineError> hit_ratio_inputs(
+    const model::HitRatio& stated, const HitRatioInputs& inputs) {
+  if (stated.che) return che_inputs(inputs);
+  return ResolvedHitRatio{};
+}
+
+// The model a cache's `hit_ratio` names, built from what it rests on: FixedHitRatio{h}, or
+// CheHitRatio over the popularity of the keys the clients upstream ask for.
+[[nodiscard]] HitRatioPolicy hit_ratio_model(const model::HitRatio& stated,
+                                             const ResolvedHitRatio& inputs) {
+  if (stated.che) return caching::CheHitRatio{.popularity = popularity_of(*inputs.keys)};
+  return caching::FixedHitRatio{.value = *stated.fixed};
 }
 
 // Does `node` have a hit ratio the graph can resolve now? A cache or CDN with `{fixed: h}` or
@@ -902,6 +940,7 @@ std::expected<Graph, EngineError> Graph::build(model::Scenario scenario) {
                          .and_then([&] { return graph.connect_steps(); })
                          .and_then([&] { return graph.connect_backends(); })
                          .and_then([&] { return graph.route_splitters(); })
+                         .and_then([&] { return graph.mark_balanced_targets(); })
                          .and_then([&] { return graph.resolve_hit_ratios(); })
                          .and_then([&] { return graph.resolve_hops(); })
                          .and_then([&] { return graph.check_routed_ops(); });
@@ -1133,9 +1172,14 @@ Graph::Result Graph::resolve_service_hops(std::size_t node) {
 
 // Every cache's and CDN's hit ratio, once, before anything reads one (resolve_hops' miss
 // fractions, the backend shares, the arriving ops): the stated number, or the Che
-// approximation over the clients' key distribution (detail::resolve_with). Runs after the
-// last demand edge exists, since a che cache walks them upstream to its clients; the
-// upstream map is built on the first che cache that needs it and shared by the rest.
+// approximation over the clients' key distribution (detail::hit_ratio_inputs and
+// detail::hit_ratio_model). Runs after the last demand edge exists, since a che cache walks
+// them upstream to its clients, and after mark_balanced_targets, since a ring in front
+// partitions the cache's keys; the upstream map is built on the first che cache that needs
+// it and shared by the rest. The model is built apart from its inputs rather than returned
+// with them in one std::expected: a std::expected of a struct holding the HitRatioPolicy
+// variant crashed GCC 14.2 (internal compiler error compiling simsys.behaviours, Release;
+// verified 2026-10-28).
 Graph::Result Graph::resolve_hit_ratios() {
   std::optional<std::vector<std::vector<std::size_t>>> upstream;
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
@@ -1147,15 +1191,19 @@ Graph::Result Graph::resolve_hit_ratios() {
         .cache = node,
         .clients_upstream = upstream ? std::span<const std::size_t>{(*upstream)[node]}
                                      : std::span<const std::size_t>{}};
-    // C++20 template lambda with a constrained parameter (`<caching::HitRatioModel Model>`):
-    // the lambda is a template like a generic `auto` one, but the concept is checked for
-    // every alternative std::visit instantiates it with, so a variant member that is no
-    // hit-ratio model fails to compile here, with the concept's name in the message.
-    auto resolved =
-        std::visit([&]<caching::HitRatioModel Model>(
-                       const Model& model) { return detail::resolve_with(model, inputs); },
-                   detail::hit_ratio_policy(*spec.hit_ratio));
+    auto resolved = detail::hit_ratio_inputs(*spec.hit_ratio, inputs);
     if (!resolved) return std::unexpected{std::move(resolved.error())};
+    const auto model = detail::hit_ratio_model(*spec.hit_ratio, *resolved);
+    // C++20 constrained generic lambda (`const caching::HitRatioModel auto& m`): a generic
+    // `auto` parameter with a concept in front, which makes the lambda a template whose
+    // argument must satisfy the concept. std::visit instantiates it for every alternative of
+    // the variant, so the concept does real work: it is what guarantees `m.hit_ratio(C)`
+    // exists and returns a double for each model, and an alternative that is no
+    // HitRatioModel fails to compile here with the concept's name in the message, instead of
+    // an error deep inside std::visit.
+    resolved->value = std::visit(
+        [&](const caching::HitRatioModel auto& m) { return m.hit_ratio(resolved->capacity); },
+        model);
     nodes_[node].hit_ratio = std::move(*resolved);
   }
   return {};
@@ -1347,8 +1395,9 @@ Graph::Result Graph::route_splitters() {
 }
 
 // What follows from the splits and the resolved hops: which ops reach each node (through any
-// chain of balancers and limiters), whether every op reaching one can leave it, and what each
-// balancer's policy does to the replicas behind it.
+// chain of balancers and limiters), and whether every op reaching one can leave it. (What
+// each balancer's policy does to the replicas behind it is marked earlier, right after the
+// splits, because a che cache's capacity depends on it: mark_balanced_targets.)
 Graph::Result Graph::check_routed_ops() {
   collect_arriving_ops();
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
@@ -1358,7 +1407,7 @@ Graph::Result Graph::check_routed_ops() {
     if (!forwards_by_link(nodes_[node].spec.type)) continue;
     if (auto checked = check_forwarded_ops(node); !checked) return checked;
   }
-  return mark_balanced_targets();
+  return {};
 }
 
 Graph::Result Graph::route_clients() {
@@ -1607,6 +1656,7 @@ Graph::Result Graph::mark_balanced_targets() {
       if (!earlier) earlier = Marked{.model = replica_model, .balancer = balancer};
       if (replica_model == ReplicaModel::pooled) target.pooled = true;
       if (replica_model == ReplicaModel::imbalanced) {
+        target.keys_partitioned = true;  // each key hashes to one replica
         // Imbalance factor 1 + 1/sqrt(v) (see the function comment), at most N: the hottest
         // of N replicas cannot carry more than all of the demand, and one replica alone
         // carries exactly the average (factor 1).

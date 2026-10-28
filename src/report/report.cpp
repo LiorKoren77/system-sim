@@ -728,12 +728,23 @@ template <class T>
 // The hit ratio and where it comes from: `0.8 (fixed)`, stated by the scenario; `0.732 (che:
 // zipf 1 over 100M keys from users)`, computed by the graph with the Che approximation from the
 // cache's `keys` and the key distribution of the clients upstream (named, so a reader can find
-// the numbers it rests on); `che` alone for one the graph left without a number; `none`.
+// the numbers it rests on), plus `; 2M keys x 4 partitioned` when a hash ring multiplied the
+// size (partition_summary); `che` alone for one the graph left without a number; `none`.
 [[nodiscard]] std::string hit_ratio_summary(const graph::ResolvedNode& node) {
   const auto& stated = node.spec.hit_ratio;
   if (!stated) return "none";
   if (!node.hit_ratio) return stated->che ? "che" : "none";
   return num(node.hit_ratio->value, stated->che ? 3 : 6);
+}
+
+// "; 10k keys x 4 partitioned" for a che cache behind a consistent-hash ring: its replicas
+// split the key space, so the Che approximation used `keys × replicas` as the cache size
+// (graph's detail::effective_capacity); nothing for any other cache.
+[[nodiscard]] std::string partition_summary(const graph::ResolvedNode& node) {
+  const int partitions = node.hit_ratio->partitions;
+  if (partitions <= 1) return {};
+  return "; " + with_si_prefix(static_cast<double>(*node.spec.keys)) + " keys x " +
+         std::to_string(partitions) + " partitioned";
 }
 
 // A cache's model (plan 2a refinement 7): `hit_ratio=0.8 (fixed) strategy=cache_aside
@@ -747,7 +758,7 @@ template <class T>
   std::string text = "  hit_ratio=" + hit_ratio_summary(node);
   if (node.hit_ratio && node.hit_ratio->keys) {
     text += " (che: " + key_distribution(*node.hit_ratio->keys) + " from " +
-            client_ids(g, node.hit_ratio->key_clients) + ")";
+            client_ids(g, node.hit_ratio->key_clients) + partition_summary(node) + ")";
   } else if (node.hit_ratio) {
     text += " (fixed)";
   }
