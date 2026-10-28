@@ -16,6 +16,7 @@
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
 import simsys.config;
+import simsys.model;
 
 using namespace std::chrono_literals;
 
@@ -86,7 +87,7 @@ links:
   REQUIRE(s->duration == 1min);
   REQUIRE(s->nodes.size() == 2);
   REQUIRE(s->nodes[0].id == "users");
-  REQUIRE(s->nodes[1].type == "service");
+  REQUIRE(s->nodes[1].type == simsys::model::NodeType::service);
   REQUIRE(s->links.size() == 1);
   REQUIRE(s->links[0].from == "users");
 }
