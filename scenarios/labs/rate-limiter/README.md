@@ -33,7 +33,8 @@ client's p99 at most 50 ms.
 ## Results (`simsys run`, 30 min, after the 1 min warmup)
 Same file, one algorithm each: `leaky_bucket` keeps `burst: 500`; `fixed_window` and
 `sliding_counter` take `window: 1s` instead of `burst` (the windowed algorithms refuse a
-burst). The default file is the token bucket.
+burst). The default file is the token bucket with `burst: 100`, which meets both SLOs; the
+table below is the comparison at `burst: 500`, the setting the "things to try" section starts from.
 
 | algorithm | rejected | api mean rho | api peak backlog | api drops | client mean | client p99 (est.) | SLOs |
 |---|---|---|---|---|---|---|---|
@@ -67,7 +68,9 @@ bucket's 62 ms comes from about 7 s of saturation in 29 minutes.
 ## Things to try
 - `burst: 5000`: each spike gets through for longer: 11.7k drops at the api, 16.5 s red,
   p99 109 ms.
-- `burst: 100`: the first-step surge shrinks to 200 requests: api backlog 80, no drops,
-  p99 29.4 ms, both SLOs met. The bucket's size is the burst the api must absorb.
+- `burst: 500` (the table above): the first-step surge of 600 requests overflows the api's
+  queue; p99 62.1 ms and the SLO fails. With the default `burst: 100` the surge shrinks to
+  200 requests: api backlog 80, no drops, p99 29.4 ms, both SLOs met. The bucket's size is
+  the burst the api must absorb.
 - `algorithm: sliding_log` with `window: 1s`: never more than 1000 in any second.
 - `simsys sweep --param nodes.limiter.algorithm=... --metric api.utilization` (phase 2c).
