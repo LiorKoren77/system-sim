@@ -33,6 +33,7 @@ module;
 #include <iterator>
 #include <numbers>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -99,6 +100,45 @@ struct RateCurve {
 // Throws std::invalid_argument if `w.period` is not positive (a programmer error: the
 // loader rejects such a scenario).
 [[nodiscard]] double wave_multiplier(const Wave& w, SimTime t);
+
+// Spec §9.2 workload noise: a multiplier 1 + x on the rate, where x is an Ornstein-Uhlenbeck
+// process — Gaussian noise that reverts to zero over `correlation` (tau) and has stationary
+// standard deviation `sigma`. Exact discretisation for a step dt:
+//   x_{k+1} = x_k e^{-dt/tau} + sigma sqrt(1 - e^{-2 dt/tau}) xi,   xi ~ N(0, 1)
+// Models bursts that last about tau (a trending topic, a push notification wave) rather than
+// per-request randomness, which the fluid model does not represent (spec §9, last paragraph).
+struct Noise {
+  double sigma{};         // stationary standard deviation of x; 0.1 means "typically within 10 %"
+  SimTime correlation{};  // tau: how long a burst lasts, roughly; must be positive
+};
+
+// The seeded noise state of ONE client: call next(dt) once per simulation step.
+//
+// Determinism contract: the same Noise and the same seed give the same path, bit for bit.
+// Use one process per client (they must not share an engine, or adding a client would
+// change every other client's noise); the engine derives each client's seed from the
+// scenario seed and the client's index (Task 6), so runs are reproducible and clients are
+// independent.
+class NoiseProcess {
+ public:
+  // Throws std::invalid_argument for sigma < 0 or correlation <= 0 (programmer errors: the
+  // loader rejects such a scenario).
+  NoiseProcess(Noise spec, std::uint64_t seed);
+
+  // Advances the process by `dt` and returns the multiplier max(0, 1 + x). The floor keeps
+  // the rate non-negative when sigma is large. Throws std::invalid_argument if `dt` is not
+  // positive. With sigma == 0 returns exactly 1.0 without touching the random engine.
+  [[nodiscard]] double next(SimTime dt);
+
+ private:
+  Noise spec_;
+  double x_{};  // the Ornstein-Uhlenbeck state; starts at 0, the long-run mean
+  // The engine and the distribution travel together on purpose: libstdc++'s
+  // normal_distribution (Box-Muller/polar method) produces values in pairs and caches the
+  // second one, so the distribution carries hidden state that belongs to this path.
+  std::mt19937_64 engine_;
+  std::normal_distribution<double> normal_{0.0, 1.0};  // xi ~ N(0, 1)
+};
 
 }  // namespace simsys::workload
 
@@ -260,6 +300,34 @@ double wave_multiplier(const Wave& w, SimTime t) {
   // hide a missing case. Reaching it would be undefined behaviour, so -Wswitch (which warns
   // when an enumerator is added without a case) is the guard.
   std::unreachable();
+}
+
+// C++11 <random>, explained here because this is the module's first use. std::mt19937_64
+// is the Mersenne Twister engine: the standard fixes its algorithm, so a given seed yields
+// the same sequence on every platform and compiler (unlike std::rand or
+// std::default_random_engine, whose algorithm is implementation-defined). That is what
+// makes "same scenario + same seed = byte-identical run" possible.
+NoiseProcess::NoiseProcess(Noise spec, std::uint64_t seed) : spec_{spec}, engine_{seed} {
+  if (spec.sigma < 0.0) throw std::invalid_argument{"noise sigma must not be negative"};
+  if (spec.correlation.count() <= 0) {
+    throw std::invalid_argument{"noise correlation time must be positive"};
+  }
+}
+
+double NoiseProcess::next(SimTime dt) {
+  if (dt.count() <= 0) throw std::invalid_argument{"noise step dt must be positive"};
+  // sigma == 0: no noise. Return before drawing so the engine stays untouched and a
+  // sigma-0 client is byte-identical to a client without noise.
+  if (spec_.sigma == 0.0) return 1.0;
+  // Exact Ornstein-Uhlenbeck step (valid for any dt, not just small ones):
+  //   decay = e^{-dt/tau}   the fraction of the old deviation x that survives the step
+  //   x'    = x decay + sigma sqrt(1 - decay^2) xi
+  // The second term is the fresh randomness; sqrt(1 - decay^2) scales it so the variance
+  // stays at sigma^2 whatever dt is. Assumes Gaussian, stationary noise, with a single
+  // correlation time.
+  const double decay = std::exp(-seconds(dt) / seconds(spec_.correlation));
+  x_ = x_ * decay + spec_.sigma * std::sqrt(1.0 - decay * decay) * normal_(engine_);
+  return std::max(0.0, 1.0 + x_);
 }
 
 Rate RateCurve::rate_at(SimTime t) const {
