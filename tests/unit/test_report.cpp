@@ -322,14 +322,14 @@ TEST_CASE("the series writer emits a header and one row per node per step; clien
   const auto text = out.str();
   // C++20 std::string::starts_with (and its twin ends_with): a prefix test in one call,
   // replacing `compare(0, prefix.size(), prefix) == 0` and its length bookkeeping.
-  REQUIRE(text.starts_with("t_s,node,rho,backlog,drops_per_s,latency_ms,zone\n"));
+  REQUIRE(text.starts_with("t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone\n"));
   // C++20 std::ranges::count: counts the matches in a whole range (here the characters of
   // the string), replacing std::count(text.begin(), text.end(), '\n').
   REQUIRE(std::ranges::count(text, '\n') == 1 + 3 * 2);
   REQUIRE(text.find("\n0.1,s,") != std::string::npos);  // shortest round-trip form of 0.1 s
   // A client is a source: its numeric columns are 0 (machines keep a number) and its zone
   // is `none` (it has no queue to colour).
-  REQUIRE(text.find("\n0,c,0,0,0,0,none\n") != std::string::npos);
+  REQUIRE(text.find("\n0,c,0,0,0,0,0,none\n") != std::string::npos);
 }
 
 TEST_CASE("render_explain lists every node with its resolved numbers and provenance", "[report]") {
@@ -392,9 +392,10 @@ TEST_CASE("explain summarises the client's curve and checks the peak offered loa
 }
 
 // A limiter refuses requests without dropping them from a queue, so the report needs a column
-// of its own for them, and the drop rate (dropped + rejected) / demand must count them or a
-// limiter that sheds 75% of its input would read as a node with no drops at all.
-TEST_CASE("the table and JSON report a rejected column and the drop rate counts rejections",
+// of its own for them and a reject rate apart from the drop rate (D5 of the rate-limiter
+// review): a refusal is the policy working, a drop is a node failing. A limiter that sheds 75%
+// of its input by policy has a reject rate of 0.75 and a drop rate of 0.
+TEST_CASE("the table and JSON report a rejected column and a reject rate apart from the drop rate",
           "[report]") {
   const auto s = limited();
   const auto g = *simsys::graph::Graph::build(s);
@@ -402,10 +403,80 @@ TEST_CASE("the table and JSON report a rejected column and the drop rate counts 
   const auto text = simsys::report::render_table(summary, {}, /*color=*/false);
   CAPTURE(text);
   REQUIRE(text.find("rejected") != std::string::npos);
+  REQUIRE(text.find("reject rate 75% (worst: limiter)") != std::string::npos);
   const auto json = simsys::report::render_json(summary, {});
   CAPTURE(json);
   REQUIRE(json.find("\"rejected\"") != std::string::npos);
-  REQUIRE_THAT(summary.drop_rate("limiter"), WithinRel(0.75, 1e-9));  // 3000 refused of 4000
+  REQUIRE(json.find("\"reject_rate\": 0.7") != std::string::npos);
+  REQUIRE(json.find("\"worst_reject_node\": \"limiter\"") != std::string::npos);
+  REQUIRE_THAT(summary.reject_rate("limiter"), WithinRel(0.75, 1e-9));  // 3000 refused of 4000
+  REQUIRE(summary.drop_rate("limiter") == 0.0);
   REQUIRE(summary.drop_rate("api") == 0.0);
-  REQUIRE(summary.worst_drop_node() == "limiter");
+  REQUIRE(summary.worst_reject_node() == "limiter");
+  REQUIRE(summary.worst_drop_node().empty());
+}
+
+TEST_CASE("reject_rate is a separate SLO metric", "[report]") {
+  const auto s = limited();
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  using simsys::model::SloMetric;
+  const std::vector<simsys::model::SloSpec> slos{
+      {.metric = SloMetric::reject_rate, .node = "limiter", .max = 0.5},
+      {.metric = SloMetric::reject_rate, .max = 0.8},  // the worst node's: the limiter's 0.75
+      {.metric = SloMetric::drop_rate, .node = "limiter", .max = 0.0}};
+  const auto results = simsys::report::evaluate_slos(summary, slos);
+  REQUIRE(results[0].status == simsys::report::SloStatus::fail);
+  REQUIRE_THAT(*results[0].observed, WithinRel(0.75, 1e-9));
+  REQUIRE(results[1].status == simsys::report::SloStatus::pass);
+  REQUIRE(results[2].status == simsys::report::SloStatus::pass);  // refusals are not drops
+}
+
+TEST_CASE("the series writer emits rejected_per_s", "[report]") {
+  const auto s = limited();
+  const auto g = *simsys::graph::Graph::build(s);
+  std::ostringstream out;
+  simsys::report::SeriesWriter writer{out, g};
+  auto sim = *simsys::engine::Simulation::create(g);
+  sim.run({.duration = s.duration, .step = s.step}, [&](const auto& r) { writer.observe(r); });
+  const auto text = out.str();
+  CAPTURE(text);
+  // The limiter's row at t = 0.9 s: its queue drops nothing, its policy refuses 3000/s.
+  const auto row = text.find("\n0.9,limiter,");
+  REQUIRE(row != std::string::npos);
+  const auto line = text.substr(row + 1, text.find('\n', row + 1) - row - 1);
+  std::vector<std::string> fields;
+  std::string field;
+  std::istringstream cells{line};
+  while (std::getline(cells, field, ',')) fields.push_back(field);
+  REQUIRE(fields.size() == 8);
+  REQUIRE(fields[4] == "0");     // drops_per_s
+  REQUIRE(fields[5] == "3000");  // rejected_per_s
+}
+
+// Plan 2a refinement 8: a request that was rejected or dropped is not answered and sees no
+// latency, so the client's latency moments are weighted by the requests ANSWERED in each
+// step, not by those offered. Two steps of 100 offered: the first answers all of them in
+// 1 ms, the second none (a 100 ms latency nobody experienced); the mean is 1 ms, where an
+// offered-weighted mean would report (1 + 100) / 2 = 50.5 ms.
+TEST_CASE("op latency is weighted by the requests answered, not offered", "[report]") {
+  const auto s = mm1(500);
+  const auto g = *simsys::graph::Graph::build(s);
+  Summary summary{g, simsys::SimTime{0}};
+  const auto record = [](simsys::SimTime t, double answered, double latency_s) {
+    return simsys::engine::StepRecord{
+        .t = t,
+        .nodes = std::vector<simsys::engine::NodeSample>(2),
+        .responses = {simsys::engine::ResponseSample{.client = 0,
+                                                     .op = "op",
+                                                     .offered = Rate{100},
+                                                     .answered = Rate{answered},
+                                                     .response = {latency_s, 0.0}}}};
+  };
+  summary.observe(record(simsys::SimTime{0}, 100, 0.001));
+  summary.observe(record(simsys::SimTime{100ms}, 0, 0.1));
+  const auto ops = summary.ops();
+  REQUIRE(ops.size() == 1);
+  REQUIRE_THAT(ops[0].mean_s, WithinRel(0.001, 1e-12));
+  REQUIRE_THAT(ops[0].offered_per_s, WithinRel(100.0, 1e-12));  // offered still counts all
 }

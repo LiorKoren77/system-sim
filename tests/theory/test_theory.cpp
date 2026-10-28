@@ -822,10 +822,10 @@ TEST_CASE("a load balancer in the chain costs its own service time and nothing e
 
 // The rate limiter of ch. 4 turns excess requests away instead of queueing them. The client is
 // not told: the limiter's own queue is empty and it drops nothing; what it refuses is counted
-// in a separate channel (`rejected_per_s`) that the drop rate adds to the drops, and none of it
-// is forwarded, so the service behind sees the admitted rate only.
-TEST_CASE("rejected requests count as drops at the limiter and never reach the service",
-          "[theory]") {
+// in a separate channel (`rejected_per_s`), apart from the drops, and none of it is forwarded,
+// so the service behind sees the admitted rate only. The client's `answered` rate is what got
+// through: 1000 of the 4000 it offers (plan 2a refinement 8).
+TEST_CASE("rejected requests are counted at the limiter and never reach the service", "[theory]") {
   const auto g = *Graph::build(limited(LimiterAlgorithm::token_bucket, 1000, 100, 4000));
   auto sim = *Simulation::create(g);
   simsys::engine::StepRecord last;
@@ -841,12 +841,14 @@ TEST_CASE("rejected requests count as drops at the limiter and never reach the s
   REQUIRE(api.rejected_per_s == 0.0);
   REQUIRE(last.responses.size() == 1);
   REQUIRE(last.responses[0].offered == Rate{4000});  // the client still offers all of it
+  REQUIRE_THAT(last.responses[0].answered.per_second, WithinRel(1000.0, 1e-9));
 }
 
-// Leaky bucket = a queue with service rate `limit` and waiting room `burst`: 1500/s in
-// against 1000/s out fills it by (1500 - 1000) x 0.1 s = 50 requests per step, so a 500-request
-// room is full after ten steps, after which the excess 500/s overflows (the queue drops it).
-// Nothing is `rejected` by the policy: the loss is the queue's ordinary overflow.
+// Leaky bucket = ONE slot that leaks a request every 1/limit (deterministic) with a waiting
+// room of `burst`: 1500/s in against 1000/s out fills it by (1500 - 1000) x 0.1 s = 50 requests
+// per step, so a 500-request room is full after ten steps, after which the excess 500/s
+// overflows. The policy is "full bucket -> refuse" (ch. 4), so the overflow is REJECTED, not
+// dropped: a leaky bucket that turns requests away is doing its job, not failing.
 TEST_CASE("a leaky bucket is a queue with capacity limit and room burst", "[theory]") {
   const auto g = *Graph::build(limited(LimiterAlgorithm::leaky_bucket, 1000, 500, 1500));
   auto sim = *Simulation::create(g);
@@ -855,26 +857,40 @@ TEST_CASE("a leaky bucket is a queue with capacity limit and room burst", "[theo
   sim.run({.duration = 2s, .step = 100ms}, [&](const auto& r) {
     const auto& node = r.nodes[limiter];
     CAPTURE(step);
-    REQUIRE(node.rejected_per_s == 0.0);
+    REQUIRE(node.dropped_per_s == 0.0);
     REQUIRE_THAT(node.demand_per_s, WithinRel(1500.0, 1e-9));
     REQUIRE_THAT(node.drain_per_s, WithinRel(1000.0, 1e-9));  // the fixed leak rate
     REQUIRE_THAT(r.nodes[*g.index_of("api")].demand_per_s, WithinRel(1000.0, 1e-9));
     if (step < 9) {  // 50 more waiting each step: 50, 100, ... 450
       REQUIRE_THAT(node.backlog, WithinRel(50.0 * (step + 1), 1e-9));
-      REQUIRE(node.dropped_per_s == 0.0);
-    } else if (step > 10) {  // the room (500) is full: the excess 500/s is lost
+      REQUIRE(node.rejected_per_s == 0.0);
+    } else if (step > 10) {  // the room (500) is full: the excess 500/s is refused
       REQUIRE_THAT(node.backlog, WithinRel(500.0, 1e-9));
-      REQUIRE_THAT(node.dropped_per_s, WithinRel(500.0, 1e-9));
+      REQUIRE_THAT(node.rejected_per_s, WithinRel(500.0, 1e-9));
     }
     ++step;
   });
   REQUIRE(step == 20);
 }
 
-// Every shed request is a failed request from the client's side, whether a full queue dropped
-// it or the limiter refused it, so the node's drop rate = (dropped + rejected) / demand.
-// Here the limiter refuses 3000 of the 4000 it is offered each second: 3000 / 4000 = 0.75.
-TEST_CASE("the client's drop rate includes rejections", "[theory]") {
+// Below its limit a leaky bucket still makes requests wait: arrivals are random (Poisson)
+// but the leak is regular, an M/D/1 queue. Its wait is the Pollaczek-Khinchine mean, which
+// is the M/M/1 wait times the Allen-Cunneen factor (ca² + cs²)/2 = (1 + 0)/2 = 1/2 (exact for
+// M/G/1), plus the leak interval itself, 1/limit = 1 ms. At 800/s on 1000/s, rho = 0.8.
+TEST_CASE("a leaky bucket's wait below the limit is M/D/1", "[theory]") {
+  const auto g = *Graph::build(limited(LimiterAlgorithm::leaky_bucket, 1000, 500, 800));
+  const auto r = (*Simulation::create(g)).step(0s, 100ms);
+  const double wait = simsys::queueing::mmc_wait(1, 0.8, 0.001).mean_s *
+                      simsys::queueing::variability_factor(1.0, 0.0);
+  REQUIRE_THAT(r.nodes[*g.index_of("limiter")].latency.mean_s, WithinRel(wait + 0.001, 1e-9));
+}
+
+// Rejections are policy, drops are failures (D5 of the rate-limiter review): a limiter that
+// refuses 3000 of the 4000 requests it is offered each second has a reject rate of 0.75 and
+// a drop rate of 0, and the api it protects drops nothing either. Both rates are per node
+// (Σ rejected / Σ demand, Σ dropped / Σ demand); without a node, the worst node's.
+TEST_CASE("a limiter's reject rate counts its refusals; the nodes it protects drop nothing",
+          "[theory]") {
   const auto s = limited(LimiterAlgorithm::token_bucket, 1000, 100, 4000);
   const auto g = *Graph::build(s);
   // A warmup of 1 s keeps the first step, where the bucket may still hold a few tokens, out
@@ -883,9 +899,37 @@ TEST_CASE("the client's drop rate includes rejections", "[theory]") {
   (*Simulation::create(g)).run({.duration = s.duration, .step = s.step}, [&](const auto& r) {
     summary.observe(r);
   });
-  REQUIRE_THAT(summary.drop_rate("limiter"), WithinRel(0.75, 1e-9));
+  REQUIRE_THAT(summary.reject_rate("limiter"), WithinRel(0.75, 1e-9));
+  REQUIRE(summary.drop_rate("limiter") == 0.0);
   REQUIRE(summary.drop_rate("api") == 0.0);
+  REQUIRE(summary.reject_rate("api") == 0.0);
   REQUIRE(summary.drop_rate("u") == 0.0);
-  REQUIRE_THAT(summary.drop_rate(), WithinRel(0.75, 1e-9));  // the worst node is the limiter
-  REQUIRE(summary.worst_drop_node() == "limiter");
+  REQUIRE(summary.drop_rate() == 0.0);
+  REQUIRE_THAT(summary.reject_rate(), WithinRel(0.75, 1e-9));  // the worst node is the limiter
+  REQUIRE(summary.worst_reject_node() == "limiter");
+  REQUIRE(summary.worst_drop_node().empty());
+}
+
+// The client's latency summary averages over the requests ANSWERED (plan 2a refinement 8): a
+// rejected request never sees the api's queue, so it must not weigh the api's latency. Here
+// the counter check makes every answered request pay the counter store's hop, and the
+// client's `answered` rate is the admitted 1000/s; the 3000/s refused are not in it.
+TEST_CASE(
+    "the counter store sees every request a limiter checks; the client is answered only the "
+    "admitted",
+    "[theory]") {
+  auto s = limited(LimiterAlgorithm::token_bucket, 1000, 100, 4000);
+  // A service stands in for the counter store: caches are not simulated yet, and the
+  // graph (unlike the loader) takes any node as a backend.
+  s.nodes.push_back(NodeSpec{.id = "counters", .type = NodeType::service, .capacity = Rate{1e6}});
+  s.nodes[1].backend = "counters";
+  s.links.push_back(LinkSpec{.from = "limiter", .to = "counters", .latency = 0s});
+  const auto g = *Graph::build(s);
+  simsys::engine::StepRecord last;
+  (*Simulation::create(g)).run({.duration = 1s, .step = 100ms}, [&](const auto& r) { last = r; });
+  REQUIRE_THAT(last.nodes[*g.index_of("counters")].demand_per_s, WithinRel(4000.0, 1e-9));
+  REQUIRE_THAT(last.responses[0].answered.per_second, WithinRel(1000.0, 1e-9));
+  const auto settled = (*Simulation::create(g)).estimate();
+  REQUIRE_THAT(settled.nodes[*g.index_of("counters")].demand_per_s, WithinRel(4000.0, 1e-9));
+  REQUIRE_THAT(settled.responses[0].answered.per_second, WithinRel(1000.0, 1e-9));
 }

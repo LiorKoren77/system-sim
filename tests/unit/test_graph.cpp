@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <limits>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -486,4 +487,84 @@ TEST_CASE("a load balancer needs at least one outgoing link", "[graph]") {
   const auto g = Graph::build(s);
   REQUIRE_FALSE(g.has_value());
   REQUIRE(g.error().message == "node 'lb': a load balancer needs an outgoing link");
+}
+
+namespace {
+// u -> limiter -> api; the limiter as given.
+Scenario behind_limiter(NodeSpec limiter) {
+  Scenario s{.name = "limiter", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"call", 1.0}}), std::move(limiter), service("api")};
+  s.links = {LinkSpec{.from = "u", .to = "limiter"}, LinkSpec{.from = "limiter", .to = "api"}};
+  return s;
+}
+NodeSpec limiter_of(simsys::model::LimiterAlgorithm algorithm, std::optional<int> burst) {
+  return NodeSpec{.id = "limiter",
+                  .type = NodeType::rate_limiter,
+                  .algorithm = algorithm,
+                  .limit = Rate{1000},
+                  .burst = burst};
+}
+}  // namespace
+
+// A windowed algorithm counts limit x window per window; it has no bucket for `burst` to
+// size, so a burst on one is a mistake the graph names, as the loader does for YAML.
+TEST_CASE("a burst on a windowed limiter written in code is rejected", "[graph]") {
+  using enum simsys::model::LimiterAlgorithm;
+  for (const auto algorithm : {fixed_window, sliding_log, sliding_counter}) {
+    const auto g = Graph::build(behind_limiter(limiter_of(algorithm, 50)));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message ==
+            "node 'limiter': burst applies only to token_bucket and leaky_bucket");
+  }
+  REQUIRE(Graph::build(behind_limiter(limiter_of(token_bucket, 50))).has_value());
+  REQUIRE(Graph::build(behind_limiter(limiter_of(leaky_bucket, 50))).has_value());
+}
+
+// A leaky bucket's queue IS the bucket (D/1: one slot leaking a request every 1/limit), so a
+// capacity, latency, concurrency or queue limit would be a second, contradicting statement of
+// `limit` and `burst`.
+TEST_CASE("a leaky bucket written in code takes only limit and burst", "[graph]") {
+  const auto rejected = [](NodeSpec limiter) {
+    const auto g = Graph::build(behind_limiter(std::move(limiter)));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message ==
+            "node 'limiter': leaky_bucket takes limit and burst; capacity, latency, "
+            "concurrency and queue_limit are not valid");
+  };
+  auto with_capacity = limiter_of(simsys::model::LimiterAlgorithm::leaky_bucket, 500);
+  with_capacity.capacity = Rate{5000};
+  rejected(with_capacity);
+  auto with_latency = limiter_of(simsys::model::LimiterAlgorithm::leaky_bucket, 500);
+  with_latency.latency = 1ms;
+  rejected(with_latency);
+  auto with_queue = limiter_of(simsys::model::LimiterAlgorithm::leaky_bucket, 500);
+  with_queue.advanced.queue_limit = 10;
+  rejected(with_queue);
+  auto with_servers = limiter_of(simsys::model::LimiterAlgorithm::leaky_bucket, 500);
+  with_servers.advanced.concurrency = 4;
+  rejected(with_servers);
+}
+
+// Ch. 4's leaky bucket leaks requests at a FIXED rate: one slot that takes exactly 1/limit
+// per request, so the bucket queues like M/D/1 (deterministic service, SCV 0). With N
+// replicas each copy is one slot of limit/N and room burst/N.
+TEST_CASE("a leaky bucket's queue is one deterministic slot of rate limit with room burst",
+          "[graph]") {
+  auto spec = limiter_of(simsys::model::LimiterAlgorithm::leaky_bucket, 500);
+  const auto one = Graph::build(behind_limiter(spec));
+  REQUIRE(one.has_value());
+  const auto& cap = one->nodes()[1].capacity;
+  REQUIRE(cap.service_rate == Rate{1000});
+  REQUIRE_THAT(cap.service_time_s, WithinRel(0.001, 1e-12));
+  REQUIRE(cap.concurrency == 1);
+  REQUIRE(cap.service_variability == 0.0);
+  REQUIRE(cap.queue_limit == 500.0);
+  spec.replicas = 2;
+  const auto two = Graph::build(behind_limiter(spec));
+  REQUIRE(two.has_value());
+  const auto& per_copy = two->nodes()[1].capacity;
+  REQUIRE(per_copy.service_rate == Rate{500});
+  REQUIRE_THAT(per_copy.service_time_s, WithinRel(0.002, 1e-12));
+  REQUIRE(per_copy.concurrency == 1);
+  REQUIRE(per_copy.queue_limit == 250.0);
 }

@@ -2730,6 +2730,36 @@ TEST_CASE("a rate limiter's algorithm, limit, burst, window and backend are type
     REQUIRE(limiter.burst == 1000);  // limit 1000/s x window 1 s
     REQUIRE_FALSE(limiter.backend.has_value());
   }
+  SECTION("a windowed algorithm gets no default burst: it counts limit x window per window") {
+    const auto path = write_temp("simsys_limiter_window_default.yaml",
+                                 limiter_scenario("algorithm: sliding_log, limit: 1k/s"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    REQUIRE_FALSE(s->nodes[0].burst.has_value());
+    REQUIRE(s->nodes[0].window == 1s);
+  }
+  SECTION("a burst on a windowed algorithm") {
+    for (const std::string_view algorithm : {"fixed_window", "sliding_log", "sliding_counter"}) {
+      CAPTURE(algorithm);
+      require_rejected(
+          "simsys_limiter_window_burst.yaml",
+          limiter_scenario("algorithm: " + std::string{algorithm} + ", limit: 1k/s, burst: 50"),
+          "node 'limiter': burst applies only to token_bucket and leaky_bucket");
+    }
+  }
+  SECTION("a leaky bucket takes limit and burst, not a queue's own numbers") {
+    for (const std::string_view extra :
+         {"capacity: 5k/s", "latency: 1ms", "advanced: {queue_limit: 10}",
+          "advanced: {concurrency: 4}"}) {
+      CAPTURE(extra);
+      require_rejected("simsys_limiter_leaky_extra.yaml",
+                       limiter_scenario("algorithm: leaky_bucket, limit: 1k/s, burst: 500, " +
+                                        std::string{extra}),
+                       "node 'limiter': leaky_bucket takes limit and burst; capacity, latency, "
+                       "concurrency and queue_limit are not valid");
+    }
+  }
   SECTION("a limiter without a limit") {
     require_rejected("simsys_limiter_no_limit.yaml", limiter_scenario("algorithm: token_bucket"),
                      "node 'limiter': rate_limiter needs a limit");
@@ -2760,4 +2790,20 @@ TEST_CASE("a rate limiter's algorithm, limit, burst, window and backend are type
                                    "links: [{from: limiter, to: api}]\n"),
                      "node 'limiter': backend must be a cache");
   }
+}
+
+// Plan 2a, D5 of the rate-limiter review: a limiter's refusals are policy, not failures, so
+// they have an SLO metric of their own, a ratio like drop_rate.
+TEST_CASE("reject_rate loads as an SLO metric with a ratio max") {
+  const auto path = write_temp(
+      "simsys_slo_reject_rate.yaml",
+      scenario_with("  limiter: {type: rate_limiter, limit: 1k/s}\n",
+                    "links: []\nslo: [{metric: reject_rate, node: limiter, max: 0.5}]\n"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->slos.size() == 1);
+  REQUIRE(s->slos[0].metric == simsys::model::SloMetric::reject_rate);
+  REQUIRE(s->slos[0].node == "limiter");
+  REQUIRE(std::get<double>(s->slos[0].max) == 0.5);
 }
