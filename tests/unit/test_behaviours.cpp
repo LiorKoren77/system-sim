@@ -32,7 +32,7 @@ using Catch::Matchers::WithinAbs;
 using Catch::Matchers::WithinRel;
 using simsys::Rate;
 using simsys::behaviours::CacheBehaviour;
-using simsys::behaviours::CdnBehaviour;  // the name is this test file's proposal (plan Task 5)
+using simsys::behaviours::CdnBehaviour;
 using simsys::behaviours::ClientBehaviour;
 using simsys::behaviours::LoadBalancerBehaviour;
 using simsys::behaviours::Outgoing;
@@ -1431,9 +1431,7 @@ TEST_CASE("a sql database's response is the sojourn the engine chose, with no do
 //
 // A CDN (book ch. 1: a cache at the network's edge) answers the share h of the reads it is sent
 // from its own store and fetches the rest, 1 - h, from its origin as the SAME op: the shape of a
-// read_through cache, without a write path (the graph refuses a write that reaches a CDN). The
-// behaviour's name, CdnBehaviour, is this test file's proposal; the implementer may pick another
-// and rename it here.
+// read_through cache, without a write path (the graph refuses a write that reaches a CDN).
 
 namespace {
 // u -> cdn -> origin. Node indices: u 0, cdn 1, origin 2. The cdn has the given fixed hit ratio
@@ -1481,8 +1479,8 @@ TEST_CASE("a cdn that always hits sends nothing to its origin", "[behaviours]") 
 // mean 1 ms, variance 4e-8. Miss (5 %): own + the hop to the origin, 2 legs of 1 ms + the
 // origin's response (5 ms, variance 1e-6): mean 8 ms, variance 4e-8 + 1e-6 = 1.04e-6.
 // A mixture (law of total variance, as for a client's split routes):
-//   mean     = 0.95 x 1 ms + 0.05 x 8 ms                          = 1.35 ms  (= own + 0.05 x hop of
-//   7 ms) variance = Σ s_i v_i + Σ s_i (m_i - mean)²
+//   mean     = 0.95 x 1 ms + 0.05 x 8 ms = 1.35 ms   (= own + 0.05 x the 7 ms hop)
+//   variance = Σ s_i v_i + Σ s_i (m_i - mean)²
 //            = (0.95 x 4e-8 + 0.05 x 1.04e-6) + (0.95 x (0.35 ms)² + 0.05 x (6.65 ms)²)
 //            = 9.0e-8 + (1.16375e-7 + 2.211125e-6) = 2.4175e-6
 TEST_CASE("a cdn's response is its own sojourn plus the miss share of the origin hop",

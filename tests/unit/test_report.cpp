@@ -731,7 +731,8 @@ TEST_CASE("explain forwards a cache's then-steps: misses reach the next node", "
 // With no number for h (a `che` CDN without a `keys` size) the paper load counts every read as
 // a miss: the origin behind it is checked against its worst case. The line says so, or a student
 // would read a red database as a real problem of the design. (The shortener's cache becomes a
-// CDN in front of url_db, which it fetches its own misses from.)
+// CDN in front of url_db, which it fetches its own misses from.) The note does not say "che":
+// a cache built in code with no hit ratio at all gets it too (below).
 TEST_CASE("explain annotates checks that count an unknown hit ratio as zero", "[report]") {
   auto s = che_cached();
   s.nodes[1].ops["redirect"] = {Step{.to = "url_cache", .op = "read"}};
@@ -746,7 +747,7 @@ TEST_CASE("explain annotates checks that count an unknown hit ratio as zero", "[
   CAPTURE(text);
   const auto db = check_line(text, "url_db");
   REQUIRE(db.contains("peak offered 1k/s"));
-  REQUIRE(db.contains(" (hit ratio unknown: che counted as 0 — an upper bound)"));
+  REQUIRE(db.contains(" (hit ratio unknown: counted as 0 — an upper bound)"));
   // The CDN's own load does not depend on its hit ratio: no note there.
   REQUIRE(check_line(text, "url_cache").contains("peak offered 1k/s"));
   REQUIRE_FALSE(check_line(text, "url_cache").contains("unknown"));
@@ -754,6 +755,24 @@ TEST_CASE("explain annotates checks that count an unknown hit ratio as zero", "[
   const auto resolved = simsys::report::render_explain(*simsys::graph::Graph::build(che_cached()));
   CAPTURE(resolved);
   REQUIRE_FALSE(resolved.contains("hit ratio unknown"));
+}
+
+// The other road to an unknown h: a cache built in code with no hit ratio (the loader requires
+// one; the engine refuses to run it). A service's `on: miss` step after it is taken by every
+// request on paper, so the database behind the step is an upper bound too, and says so (review
+// of 4d539b0, M5: the CDN case above goes through the origin edge, not a service's miss step).
+TEST_CASE("explain marks the target of a miss step after a cache with no hit ratio", "[report]") {
+  auto s = che_cached();
+  s.nodes[2].hit_ratio = std::nullopt;
+  s.nodes[2].keys = std::nullopt;
+  const auto built = simsys::graph::Graph::build(s);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto text = simsys::report::render_explain(*built);
+  CAPTURE(text);
+  const auto db = check_line(text, "url_db");
+  REQUIRE(db.contains("peak offered 1k/s"));
+  REQUIRE(db.contains(" (hit ratio unknown: counted as 0 — an upper bound)"));
 }
 
 // A cache's write strategy acts on the ops in `write_ops` (default: `write`). When no op that
@@ -1144,12 +1163,23 @@ TEST_CASE("explain prints a database's defaulted write cost and labels its check
     REQUIRE(text.contains("  cost: write 5 (default: spec §6 5k reads/1k writes)"));
     REQUIRE(text.contains(
         "primary 500 units/s vs 1k/s (50%, green), each replica 1k units/s vs 1k/s (100%, red)"));
+    // The headline is in units too (1000 reads + 100 writes × 5), labelled as the copies are.
+    REQUIRE(text.contains("peak offered 1.5k units/s vs 3k/s total capacity"));
+  }
+  SECTION("several defaulted write ops name the source once") {
+    s.nodes[0].workload->op_shares = {
+        {"read", 1000.0 / 1100.0}, {"insert", 50.0 / 1100.0}, {"update", 50.0 / 1100.0}};
+    const auto text = explain_of(s);
+    CAPTURE(text);
+    REQUIRE(text.contains("  cost: insert 5, update 5 (defaults: spec §6 5k reads/1k writes)"));
   }
   SECTION("beside a stated cost") {
+    // The stated costs first, then the defaulted ones with their source: the source belongs to
+    // the group after the semicolon only.
     s.nodes[1].cost = {{"read", 2.0}};
     const auto text = explain_of(s);
     CAPTURE(text);
-    REQUIRE(text.contains("  cost: read 2, write 5 (default: spec §6 5k reads/1k writes)"));
+    REQUIRE(text.contains("  cost: read 2; write 5 (default: spec §6 5k reads/1k writes)"));
   }
   SECTION("a stated write cost is not a default") {
     s.nodes[1].cost = {{"write", 1.0}};
@@ -1179,9 +1209,10 @@ TEST_CASE("explain prints a sql database as primary plus replicas with shards, l
 // ---- Request-based CDN (plan 2b refinement 4, Task 5) ----
 
 namespace {
-// u(1k/s read) -> `cdn_id` (a CDN, fixed hit ratio 0.95, origin `origin`) -> origin (a service of
-// 5k/s). The CDN has the given byte capacity when one is passed.
-Scenario cdn_reported(std::string cdn_id = "cdn", std::optional<simsys::ByteRate> bytes = {}) {
+// u(1k/s, the given ops: `read` by default) -> `cdn_id` (a CDN, fixed hit ratio 0.95, origin
+// `origin`) -> origin (a service of 5k/s). The CDN has the given byte capacity when one is passed.
+Scenario cdn_reported(std::string cdn_id = "cdn", std::optional<simsys::ByteRate> bytes = {},
+                      std::vector<std::pair<std::string, double>> ops = {{"read", 1.0}}) {
   Scenario s{.name = "cdn-report", .version = 1, .duration = 1min};
   NodeSpec cdn{.id = cdn_id,
                .type = NodeType::cdn,
@@ -1191,7 +1222,7 @@ Scenario cdn_reported(std::string cdn_id = "cdn", std::optional<simsys::ByteRate
   s.nodes = {
       NodeSpec{.id = "u",
                .type = NodeType::client,
-               .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"read", 1.0}}}},
+               .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = std::move(ops)}},
       std::move(cdn), NodeSpec{.id = "origin", .type = NodeType::service, .capacity = Rate{5000}}};
   s.links = {LinkSpec{.from = "u", .to = cdn_id}, LinkSpec{.from = cdn_id, .to = "origin"}};
   return s;
@@ -1199,9 +1230,7 @@ Scenario cdn_reported(std::string cdn_id = "cdn", std::optional<simsys::ByteRate
 }  // namespace
 
 // Explain shows a CDN as it shows a cache: the hit ratio and where it comes from, and, because
-// a CDN forwards its own misses, where they go. The exact wording ("misses → origin", after the
-// hit ratio and before the ttl) is this test's proposal; the implementer may adjust it and move
-// these expectations with it.
+// a CDN forwards its own misses, where they go ("misses → origin").
 TEST_CASE("explain shows a cdn's hit ratio and where its misses go", "[report]") {
   const auto built = simsys::graph::Graph::build(cdn_reported());
   INFO((built ? "" : built.error().message));
@@ -1232,4 +1261,71 @@ TEST_CASE("explain still renders a cdn that has a byte capacity", "[report]") {
   REQUIRE(text.contains("cdn_us"));
   REQUIRE(text.contains("hit_ratio=0.95 (fixed)"));
   REQUIRE(text.contains("misses → origin"));
+}
+
+// A capacity stated in bytes (`capacity: 100GB/s`) becomes requests only at an assumed object
+// size, 1 MB (defaults::blob_object_bytes), a number the scenario never gave: book/youtube's 50 MB
+// streams make the same 100GB/s 2k streams/s, not 100k. The engine refuses to run such a CDN for
+// that reason, so explain must not give the converted number a verdict either: the capacity says
+// where it came from, and the check line gives the load but no percentage and no zone (review of
+// 4d539b0, I1). Every capacity converted from bytes is treated so, a blob store's too, the type's
+// default (spec §6 "blob 500 MB/s") included.
+TEST_CASE("explain gives no verdict on a capacity converted from bytes", "[report]") {
+  SECTION("a cdn sized in bytes") {
+    const auto text = explain_of(cdn_reported("cdn_us", simsys::ByteRate{100e9}));
+    CAPTURE(text);
+    REQUIRE(
+        text.contains("capacity=100k/s (scenario: 100GB/s at 1MB/object; byte flows: phase 2c)"));
+    const auto line = check_line(text, "cdn_us");
+    REQUIRE(line.contains("peak offered 1k/s vs 100k/s total capacity"));
+    REQUIRE(
+        line.contains("(not checked: capacity from 100GB/s at 1MB/object; byte flows: phase 2c)"));
+    REQUIRE_FALSE(line.contains("green"));
+    REQUIRE_FALSE(line.contains("%"));
+  }
+  SECTION("a blob store origin, sized in bytes or by its type's default") {
+    auto s = cdn_reported();
+    s.nodes[2] = NodeSpec{
+        .id = "origin", .type = NodeType::blob_store, .byte_capacity = simsys::ByteRate{1e9}};
+    const auto stated = explain_of(s);
+    CAPTURE(stated);
+    REQUIRE(
+        check_line(stated, "origin")
+            .contains("(not checked: capacity from 1GB/s at 1MB/object; byte flows: phase 2c)"));
+    s.nodes[2].byte_capacity = std::nullopt;
+    const auto defaulted = explain_of(s);
+    CAPTURE(defaulted);
+    REQUIRE(defaulted.contains(
+        "capacity=500/s (default: 500MB/s at 1MB/object; byte flows: phase 2c)"));
+    REQUIRE_FALSE(check_line(defaulted, "origin").contains("green"));
+  }
+  SECTION("a capacity stated in requests is still checked") {
+    const auto text = explain_of(cdn_reported());
+    CAPTURE(text);
+    REQUIRE(check_line(text, "cdn").contains("(1%, green)"));
+  }
+}
+
+// A CDN caches every op that reaches it and is not one of its write ops (model::write_ops_of:
+// `write` unless the scenario lists its own `write_ops`). An `upload` a scenario forgot to declare
+// a write would be answered from the edge for the hit share of it, so explain lists the ops the
+// CDN serves from its cache: the slip is in plain sight (review of 4d539b0, I2).
+TEST_CASE("explain lists the ops a cdn serves from its cache", "[report]") {
+  const auto text = explain_of(cdn_reported("cdn", {}, {{"read", 0.8}, {"upload", 0.2}}));
+  CAPTURE(text);
+  REQUIRE(text.contains("serves: read, upload"));
+}
+
+// A CDN the scenario gave no hit ratio misses every read, and that is what runs (h = 0 is the
+// scenario's statement, not a number nobody knows): its line says so, and the origin's check is
+// a plain check, not an upper bound (review of 4d539b0, M4).
+TEST_CASE("a cdn without a hit ratio is explained as h = 0, not as unknown", "[report]") {
+  auto s = cdn_reported();
+  s.nodes[1].hit_ratio = std::nullopt;
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  REQUIRE(text.contains("hit_ratio=none (every read misses: h = 0)"));
+  const auto origin = check_line(text, "origin");
+  REQUIRE(origin.contains("peak offered 1k/s"));
+  REQUIRE_FALSE(origin.contains("unknown"));
 }

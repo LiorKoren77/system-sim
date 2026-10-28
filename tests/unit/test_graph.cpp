@@ -717,8 +717,11 @@ TEST_CASE("a cache that always hits sends nothing on to the miss step", "[graph]
   REQUIRE_THAT(hops[1].fraction, WithinRel(0.0, 1e-12));
 }
 
-TEST_CASE("an on-miss step must follow a cache or cdn step", "[graph]") {
-  const std::string expected = "node 'web': an 'on: miss' step must follow a cache or cdn step";
+// A miss step needs a cache in front of it. A CDN can miss too, but it fetches its own misses
+// from its origin, so a miss step after one is refused with a message of its own (below): the
+// message here names the one kind of node a miss step may follow (review of 4d539b0, M3).
+TEST_CASE("an on-miss step must follow a cache step", "[graph]") {
+  const std::string expected = "node 'web': an 'on: miss' step must follow a cache step";
   SECTION("as the first step") {
     const auto g =
         Graph::build(cached_web(cache("cache", 0.8, CacheStrategy::cache_aside),
@@ -1650,8 +1653,7 @@ TEST_CASE("a cdn with a fixed hit ratio sends the misses to its origin as the sa
   REQUIRE(link.has_value());
   REQUIRE(std::ranges::contains(g.edges(), DemandEdge{.from = cdn, .to = origin, .link = *link}));
   // The edge carries the miss share of the read op: 1 - 0.95 = 0.05 of every `read` the cdn is
-  // asked. This test proposes that Graph::backend_fraction (today a cache's read_through share)
-  // also answers for a cdn's origin; the implementer may name another accessor and move this line.
+  // asked, the share Graph::backend_fraction gives a read_through cache's backend hop too.
   REQUIRE_THAT(g.backend_fraction(cdn, "read"), WithinRel(0.05, 1e-12));
   // Same op name on both sides: the origin is asked for `read`, not for a renamed op.
   // C++20 std::ranges::equal: element-wise equality of two ranges (here a span and a vector),
@@ -1675,21 +1677,21 @@ TEST_CASE("a cdn without a hit ratio misses every read and still builds", "[grap
 // A CDN serves static files from the edge and has no write path: there is nothing in its model
 // that a write could update, so a write that reaches it is a mistake in the scenario. "A write"
 // is whatever model::write_ops_of says for the node: a CDN's default is the op `write`, and a
-// scenario's `write_ops` replaces it, exactly as for a cache.
+// scenario's `write_ops` replaces it, exactly as for a cache. The message names the op and a
+// node that sends it, so a student finds the arrow to remove (review of 4d539b0, M7).
 TEST_CASE("a write op reaching a cdn is refused", "[graph]") {
-  const std::string expected = "node 'cdn': a cdn does not take writes";
   SECTION("the default write op, sent by a client") {
     const auto g =
         Graph::build(cdn_front(cdn_node(HitRatio{.fixed = 0.95}), {{"read", 0.9}, {"write", 0.1}}));
     REQUIRE_FALSE(g.has_value());
-    REQUIRE(g.error().message == expected);
+    REQUIRE(g.error().message == "node 'cdn': a cdn does not take writes ('write' from 'u')");
   }
   SECTION("an op the scenario lists in write_ops, sent by a client") {
     auto cdn = cdn_node(HitRatio{.fixed = 0.95});
     cdn.write_ops = std::vector<std::string>{"purge"};
     const auto g = Graph::build(cdn_front(std::move(cdn), {{"read", 0.9}, {"purge", 0.1}}));
     REQUIRE_FALSE(g.has_value());
-    REQUIRE(g.error().message == expected);
+    REQUIRE(g.error().message == "node 'cdn': a cdn does not take writes ('purge' from 'u')");
   }
   SECTION("an op that is not in write_ops is a read, even if it is called write") {
     auto cdn = cdn_node(HitRatio{.fixed = 0.95});
@@ -1708,7 +1710,7 @@ TEST_CASE("a write op reaching a cdn is refused", "[graph]") {
                LinkSpec{.from = "cdn", .to = "origin", .dir = Direction::inout}};
     const auto g = Graph::build(std::move(s));
     REQUIRE_FALSE(g.has_value());
-    REQUIRE(g.error().message == expected);
+    REQUIRE(g.error().message == "node 'cdn': a cdn does not take writes ('write' from 'web')");
   }
 }
 
@@ -1720,9 +1722,8 @@ TEST_CASE("a cdn built in code without an origin is refused", "[graph]") {
   REQUIRE(g.error().message == "node 'cdn': a cdn needs an origin");
 }
 
-// Che for a cdn resolves as for a cache: the size in keys (`keys` on the node, set in code here;
-// config.cpp's own_keys_by_type row for cdn does not list `keys` yet, see the report) and the key
-// distribution of the clients that reach it, found by walking the demand edges back upstream.
+// Che for a cdn resolves as for a cache: the size in keys (`keys` on the node, in objects) and the
+// key distribution of the clients that reach it, found by walking the calls back upstream.
 TEST_CASE("a che cdn resolves its hit ratio from the keys of the clients upstream", "[graph]") {
   auto cdn = cdn_node(HitRatio{.che = true});
   cdn.keys = 1000;
@@ -1749,7 +1750,7 @@ TEST_CASE("a cdn built in code needs an origin it can call", "[graph]") {
   SECTION("not a client") {
     const auto g = Graph::build(cdn_front(cdn_node(HitRatio{.fixed = 0.95}, "u")));
     REQUIRE_FALSE(g.has_value());
-    REQUIRE(g.error().message == "node 'cdn': origin must not be a client");
+    REQUIRE(g.error().message == "node 'cdn': origin 'u' is a client; clients only send");
   }
   SECTION("a node that exists") {
     const auto g = Graph::build(cdn_front(cdn_node(HitRatio{.fixed = 0.95}, "ghost")));
@@ -1774,4 +1775,70 @@ TEST_CASE("a cdn built in code with then steps is refused", "[graph]") {
   REQUIRE_FALSE(g.has_value());
   REQUIRE(g.error().message ==
           "node 'cdn': a cdn has no then steps (it fetches its misses from its origin)");
+}
+
+// A CDN that names itself as its origin would fetch its own misses from itself: a miss that can
+// never be answered. The loader refuses it (config tests), and so does the graph for a scenario
+// built in code, before it looks for the link (review of 4d539b0, M6).
+TEST_CASE("a cdn built in code that is its own origin is refused", "[graph]") {
+  const auto g = Graph::build(cdn_front(cdn_node(HitRatio{.fixed = 0.95}, "cdn")));
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message == "node 'cdn': a cdn cannot be its own origin");
+}
+
+// A CDN is read_through towards its origin by definition; the cache's `strategy` and `backend`
+// keys are not its keys (the loader has no such key on a cdn). Written in code they would
+// contradict the model: a write_back strategy, for one, would excuse the origin hop from the
+// call-cycle check, although a miss always waits for the origin (review of 4d539b0, M9).
+TEST_CASE("a cdn built in code with a cache strategy or a backend is refused", "[graph]") {
+  SECTION("a strategy other than the default") {
+    auto cdn = cdn_node(HitRatio{.fixed = 0.95});
+    cdn.strategy = CacheStrategy::write_back;
+    const auto g = Graph::build(cdn_front(std::move(cdn)));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message ==
+            "node 'cdn': a cdn has no strategy (it reads through to its origin)");
+  }
+  SECTION("a backend") {
+    auto cdn = cdn_node(HitRatio{.fixed = 0.95});
+    cdn.backend = "origin";
+    const auto g = Graph::build(cdn_front(std::move(cdn)));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message ==
+            "node 'cdn': a cdn has no backend (its origin is the store behind it)");
+  }
+}
+
+// An origin that calls back into the CDN in front of it (origin.read -> cdn.read -> origin.read)
+// makes the CDN's miss fetch a call that waits for itself, as for a read_through cache's backend
+// (above): refused, and the message calls the node the CDN's origin.
+TEST_CASE("a cdn whose origin hop closes a call cycle is refused", "[graph]") {
+  Scenario s{.name = "cdn-loop", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"read", 1.0}}),
+             service("origin", {{"read", {Step{.to = "cdn", .op = "read"}}}}),
+             cdn_node(HitRatio{.fixed = 0.95})};
+  s.links = {LinkSpec{.from = "u", .to = "origin", .dir = Direction::inout},
+             LinkSpec{.from = "origin", .to = "cdn", .dir = Direction::inout},
+             LinkSpec{.from = "cdn", .to = "origin", .dir = Direction::inout}};
+  const auto g = Graph::build(s);
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message == "node 'cdn': origin 'origin' closes a call cycle");
+}
+
+// Che's "filtered" popularity names the node whose misses a che cache receives, by its type: a
+// CDN's misses are a CDN's, not a cache's (review of 4d539b0, M7).
+TEST_CASE("a che cache receiving a cdn's misses and unfiltered reads names the cdn", "[graph]") {
+  auto s = two_caches(HitRatio{.che = true}, 2'000'000);
+  NodeSpec l1 = cdn_node(HitRatio{.che = true}, "l2");
+  l1.id = "l1";
+  l1.keys = 2'000'000;
+  s.nodes[1] = std::move(l1);
+  s.nodes[0].workload->op_shares = {{"get", 0.5}, {"peek", 0.5}};
+  s.links[0].ops = {"get"};
+  s.links.push_back(LinkSpec{.from = "u", .to = "l2", .dir = Direction::inout, .ops = {"peek"}});
+  const auto built = Graph::build(s);
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'l2': hit_ratio che: it receives both the misses of cdn 'l1' and requests no "
+          "cache filtered");
 }
