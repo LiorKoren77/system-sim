@@ -1842,3 +1842,139 @@ TEST_CASE("a che cache receiving a cdn's misses and unfiltered reads names the c
           "node 'l2': hit_ratio che: it receives both the misses of cdn 'l1' and requests no "
           "cache filtered");
 }
+
+// ---- ID generator as service sugar (plan 2b refinement 6; book ch. 7) ----
+//
+// An id_generator is not a new kind of behaviour: Graph::build turns its `algorithm` into the
+// capacity and service time a service of that design would have, and the node then runs as a
+// service. The numbers come from the chapter: a snowflake id has 12 sequence bits, so one machine
+// issues 4096 ids per millisecond (4096 x 1000 = 4.096M/s); a ticket server is one auto-increment
+// database, a write on a SQL box that does 1k writes/s (spec §6); a UUID needs no coordination at
+// all, so nothing bounds it in practice.
+
+namespace {
+using simsys::model::IdAlgorithm;
+
+// u (10/s of `next_id`) -> ids: an id_generator of the given algorithm and replicas, with the
+// capacity and latency only when the scenario states them. Node indices: u 0, ids 1.
+Scenario id_front(IdAlgorithm algorithm, int replicas = 1, std::optional<Rate> capacity = {},
+                  std::optional<simsys::SimTime> latency = {}) {
+  Scenario s{.name = "id-front", .version = 1, .duration = 1min};
+  NodeSpec ids{.id = "ids",
+               .type = NodeType::id_generator,
+               .replicas = replicas,
+               .capacity = capacity,
+               .latency = latency};
+  ids.id_algorithm = algorithm;
+  s.nodes = {client("u", Rate{10}, {{"next_id", 1.0}}), std::move(ids)};
+  s.links = {LinkSpec{.from = "u", .to = "ids", .dir = Direction::inout}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("a snowflake gets 4096 ids per millisecond per replica and 10 us from its algorithm",
+          "[graph]") {
+  const auto g = Graph::build(id_front(IdAlgorithm::snowflake));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto& ids = g->nodes()[1];
+  // 12 sequence bits = 4096 ids per ms per machine; x 1000 ms = 4'096'000 ids/s.
+  REQUIRE(ids.capacity.service_rate == Rate{4'096'000});
+  REQUIRE_THAT(ids.capacity.service_time_s, WithinRel(10e-6, 1e-12));
+  // Not the scenario's numbers: explain must not tag them "(scenario)".
+  REQUIRE(ids.service_rate_source != simsys::defaults::Source::scenario);
+  REQUIRE(ids.service_time_source != simsys::defaults::Source::scenario);
+}
+
+TEST_CASE("a ticket server gets one database's 1k writes per second and 1 ms", "[graph]") {
+  const auto g = Graph::build(id_front(IdAlgorithm::ticket_server));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto& ids = g->nodes()[1];
+  // Spec §6: one SQL machine does 1k writes/s, and an auto-increment is a write.
+  REQUIRE(ids.capacity.service_rate == Rate{1000});
+  REQUIRE_THAT(ids.capacity.service_time_s, WithinRel(1e-3, 1e-12));
+  REQUIRE(ids.service_rate_source != simsys::defaults::Source::scenario);
+}
+
+TEST_CASE("a uuid generator is unbounded in practice: 1e9 ids per second and 1 us", "[graph]") {
+  const auto g = Graph::build(id_front(IdAlgorithm::uuid));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto& ids = g->nodes()[1];
+  REQUIRE(ids.capacity.service_rate == Rate{1e9});
+  REQUIRE_THAT(ids.capacity.service_time_s, WithinRel(1e-6, 1e-12));
+}
+
+// `capacity` on a resolved node is per replica (a service's 2000/s is each copy's); the node's
+// total is that times its replicas. Three snowflake machines issue 3 x 4.096M = 12.288M ids/s.
+TEST_CASE("a snowflake's capacity is per replica and the node's total is replicas times it",
+          "[graph]") {
+  const auto g = Graph::build(id_front(IdAlgorithm::snowflake, 3));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto& ids = g->nodes()[1];
+  REQUIRE(ids.capacity.service_rate == Rate{4'096'000});
+  REQUIRE_THAT(ids.capacity.service_rate.per_second * ids.spec.replicas,
+               WithinRel(12'288'000.0, 1e-12));
+}
+
+TEST_CASE("a capacity or latency the scenario states wins over the algorithm's", "[graph]") {
+  SECTION("both stated: a snowflake given 4M/s and 20 us") {
+    const auto g =
+        Graph::build(id_front(IdAlgorithm::snowflake, 1, Rate{4'000'000}, simsys::SimTime{20us}));
+    REQUIRE(g.has_value());
+    const auto& ids = g->nodes()[1];
+    REQUIRE(ids.capacity.service_rate == Rate{4'000'000});
+    REQUIRE_THAT(ids.capacity.service_time_s, WithinRel(20e-6, 1e-12));
+    REQUIRE(ids.service_rate_source == simsys::defaults::Source::scenario);
+    REQUIRE(ids.service_time_source == simsys::defaults::Source::scenario);
+  }
+  SECTION("only the capacity stated: the algorithm still supplies the service time") {
+    const auto g = Graph::build(id_front(IdAlgorithm::ticket_server, 1, Rate{8000}));
+    REQUIRE(g.has_value());
+    REQUIRE(g->nodes()[1].capacity.service_rate == Rate{8000});
+    REQUIRE_THAT(g->nodes()[1].capacity.service_time_s, WithinRel(1e-3, 1e-12));
+    REQUIRE(g->nodes()[1].service_rate_source == simsys::defaults::Source::scenario);
+    REQUIRE(g->nodes()[1].service_time_source != simsys::defaults::Source::scenario);
+  }
+  SECTION("only the latency stated: the algorithm still supplies the capacity") {
+    const auto g =
+        Graph::build(id_front(IdAlgorithm::snowflake, 1, std::nullopt, simsys::SimTime{50us}));
+    REQUIRE(g.has_value());
+    REQUIRE(g->nodes()[1].capacity.service_rate == Rate{4'096'000});
+    REQUIRE_THAT(g->nodes()[1].capacity.service_time_s, WithinRel(50e-6, 1e-12));
+    REQUIRE(g->nodes()[1].service_time_source == simsys::defaults::Source::scenario);
+  }
+}
+
+// Ch. 7's ticket server is ONE auto-increment database: a second copy would hand out the same
+// ids unless the two were split (odd/even), and the chapter dismisses that for not scaling and
+// not surviving a server added or removed. So the model refuses replicas, and the message says
+// what to do instead.
+TEST_CASE("a ticket server with more than one replica is refused", "[graph]") {
+  const auto g = Graph::build(id_front(IdAlgorithm::ticket_server, 2));
+  REQUIRE_FALSE(g.has_value());
+  CAPTURE(g.error().message);
+  REQUIRE(g.error().message.starts_with("node 'ids': "));
+  REQUIRE(g.error().message.contains("replicas must be 1"));
+}
+
+TEST_CASE("a ticket server with one replica and snowflake or uuid with many are accepted",
+          "[graph]") {
+  REQUIRE(Graph::build(id_front(IdAlgorithm::ticket_server, 1)).has_value());
+  REQUIRE(Graph::build(id_front(IdAlgorithm::snowflake, 4)).has_value());
+  REQUIRE(Graph::build(id_front(IdAlgorithm::uuid, 4)).has_value());
+}
+
+// The loader refuses an id_generator without an algorithm (config tests); a scenario built in code
+// skips the loader, so the graph repeats the rule, as it does for a limiter without a limit and a
+// cdn without an origin.
+TEST_CASE("an id generator built in code without an algorithm is refused", "[graph]") {
+  auto s = id_front(IdAlgorithm::snowflake);
+  s.nodes[1].id_algorithm = std::nullopt;
+  const auto g = Graph::build(std::move(s));
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message ==
+          "node 'ids': id_generator needs algorithm: snowflake, ticket_server or uuid");
+}
