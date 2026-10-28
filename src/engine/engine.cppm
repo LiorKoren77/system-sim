@@ -318,10 +318,11 @@ struct Overloaded : Fs... {
 
 // Why a node of a simulated type still cannot run, if it cannot: a cache that a scenario built
 // in code left without a number or `che` for its hit ratio (the loader requires one: the same
-// message), or whose model needs phase 2b (a `che` hit ratio, computed by the Che
-// approximation; the write_back strategy, a queue of dirty entries flushed later; `then`
-// steps, which fire per hit or miss). The phase-2b refusals end like an unsupported type's,
-// "which run/estimate do not support yet (phase 2b)", so every "not yet" reads the same.
+// message), or whose model needs the rest of phase 2b (the write_back strategy, a queue of
+// dirty entries flushed later; `then` steps, which fire per hit or miss). A `che` hit ratio
+// runs: Graph::build has already turned it into a number (Graph::resolve_hit_ratios). The
+// phase-2b refusals end like an unsupported type's, "which run/estimate do not support yet
+// (phase 2b)", so every "not yet" reads the same.
 [[nodiscard]] std::optional<std::string> not_runnable_yet(const model::NodeSpec& spec) {
   if (spec.type != model::NodeType::cache) return std::nullopt;
   const std::string node = "node '" + spec.id + "'";
@@ -329,7 +330,6 @@ struct Overloaded : Fs... {
   const bool is_che = spec.hit_ratio && spec.hit_ratio->che;
   if (!has_number && !is_che) return node + ": cache needs a hit_ratio";
   const std::string not_yet = ", which run/estimate do not support yet (phase 2b)";
-  if (is_che) return node + " has hit_ratio che (the Che approximation)" + not_yet;
   if (spec.strategy == model::CacheStrategy::write_back) {
     return node + " has strategy write_back (writes flushed later)" + not_yet;
   }

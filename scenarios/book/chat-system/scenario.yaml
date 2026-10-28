@@ -15,6 +15,7 @@ nodes:
       base: 60k/s                              # messages + heartbeats + API calls
       wave: {shape: sine, period: 24h, amplitude: 0.5, peak_at: 21:00}
     ops: {send: 0.35, heartbeat: 0.55, api: 0.10}
+    keys: {zipf: 0.8, space: 50M}             # one key per user (50M DAU); kv_cache's hit ratio follows from it
     sizes: {send: 1KB}
     timeout: 2s
 

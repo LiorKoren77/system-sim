@@ -711,19 +711,45 @@ template <class T>
   return " write_ops=" + join(write_ops, ",") + (none_arrive ? " (never arrives)" : "");
 }
 
+// A client key distribution as a reader says it: "zipf 1 over 100M keys", "uniform over 10k
+// keys" (the scenario's `{zipf: 1.0, space: 100M}` and `{uniform: 10k}`).
+[[nodiscard]] std::string key_distribution(const model::KeySpec& keys) {
+  const std::string shape = keys.zipf ? "zipf " + num(*keys.zipf) : "uniform";
+  return shape + " over " + with_si_prefix(keys.space) + " keys";
+}
+
+// "u", "a, b": the clients a che hit ratio took its key distribution from.
+[[nodiscard]] std::string client_ids(const graph::Graph& g, std::span<const std::size_t> clients) {
+  std::vector<std::string> ids;
+  for (const auto client : clients) ids.push_back(g.nodes()[client].spec.id);
+  return join(ids, ", ");
+}
+
+// The hit ratio and where it comes from: `0.8 (fixed)`, stated by the scenario; `0.732 (che:
+// zipf 1 over 100M keys from users)`, computed by the graph with the Che approximation from the
+// cache's `keys` and the key distribution of the clients upstream (named, so a reader can find
+// the numbers it rests on); `che` alone for one the graph left without a number; `none`.
+[[nodiscard]] std::string hit_ratio_summary(const graph::ResolvedNode& node) {
+  const auto& stated = node.spec.hit_ratio;
+  if (!stated) return "none";
+  if (!node.hit_ratio) return stated->che ? "che" : "none";
+  return num(node.hit_ratio->value, stated->che ? 3 : 6);
+}
+
 // A cache's model (plan 2a refinement 7): `hit_ratio=0.8 (fixed) strategy=cache_aside
 // write_ops=write backend=db keys=20M eviction=lru ttl=5m`, the keys the scenario left out
-// omitted (strategy and write_ops always have a value: their defaults).
+// omitted (strategy and write_ops always have a value: their defaults). A che hit ratio shows
+// its provenance instead of `(fixed)` (hit_ratio_summary).
 [[nodiscard]] std::string cache_summary(const graph::Graph& g, std::size_t cache) {
-  const auto& spec = g.nodes()[cache].spec;
+  const auto& node = g.nodes()[cache];
+  const auto& spec = node.spec;
   if (spec.type != model::NodeType::cache) return {};
-  std::string text = "  hit_ratio=";
-  if (!spec.hit_ratio) {
-    text += "none";
-  } else if (spec.hit_ratio->che) {
-    text += "che";
-  } else {
-    text += num(spec.hit_ratio->fixed.value_or(0.0), 6) + " (fixed)";
+  std::string text = "  hit_ratio=" + hit_ratio_summary(node);
+  if (node.hit_ratio && node.hit_ratio->keys) {
+    text += " (che: " + key_distribution(*node.hit_ratio->keys) + " from " +
+            client_ids(g, node.hit_ratio->key_clients) + ")";
+  } else if (node.hit_ratio) {
+    text += " (fixed)";
   }
   text += " strategy=" + std::string{model::to_string(spec.strategy)} + write_ops_summary(g, cache);
   if (spec.backend) text += " backend=" + *spec.backend;
@@ -1130,8 +1156,9 @@ struct PaperLoad {
 
 // ---- loads that rest on an unknown hit ratio ----
 //
-// A cache or CDN with no number for h yet (`che`: the Che approximation of phase 2b; a CDN
-// without a fixed ratio) counts every read as a miss on paper (Graph::service_hops): the
+// A cache or CDN with no number for h (a CDN without a hit ratio, or with `che` but no `keys`
+// size before phase 2b's Task 5; a cache built in code without one: Graph::build resolves every
+// other `che` to a number) counts every read as a miss on paper (Graph::service_hops): the
 // nodes behind its misses are checked against their worst case, an upper bound. Their check
 // lines say so, or a student would read a red database as a flaw of the design.
 

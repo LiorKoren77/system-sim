@@ -13,6 +13,9 @@
 - Third-party latency and failure rates as the real bottleneck (20 ms worker cost vs 150–500 ms
   round trips).
 - Dedup (2%) and the fan-out ratio: one notification → 1.25 channel messages on average.
+- The `user_cache` hit ratio (devices and preferences), computed with the Che approximation
+  from its 5M keys and the notified users' distribution (Zipf 0.8 over the ~10M users the
+  book's daily push volume reaches: some users get far more notifications than others).
 
 ## What it abstracts away
 - Retry policy and dead-letter queues (phase 3 adds retry feedback).

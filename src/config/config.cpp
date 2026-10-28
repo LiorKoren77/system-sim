@@ -1917,11 +1917,84 @@ std::expected<OpShares, ConfigError> read_op_shares(const Site& site, const YAML
   return check_shares_sum_to_one(site, ops, *shares).transform([&] { return std::move(*shares); });
 }
 
+// A count as the scenarios write cache sizes and key spaces: a positive integer with an optional SI
+// suffix k, M or G (x 1e3, 1e6, 1e9; the same letters a rate uses, without "/s"): 500, 10k, 20M,
+// 10G. Nothing for anything else (a fraction, a sign, an overflow of 64 bits). A local
+// helper rather than parse_rate(text + "/s"): a rate may be fractional ("1.5k/s"), a count
+// of entries may not.
+std::optional<std::int64_t> parse_count(std::string_view text) {
+  constexpr std::array suffixes{std::pair{'k', std::int64_t{1'000}},
+                                std::pair{'M', std::int64_t{1'000'000}},
+                                std::pair{'G', std::int64_t{1'000'000'000}}};
+  std::int64_t scale = 1;
+  for (const auto& [letter, size] : suffixes) {
+    if (!text.empty() && text.back() == letter) {
+      scale = size;
+      text.remove_suffix(1);
+      break;
+    }
+  }
+  const auto count = parse_whole<std::int64_t>(text);
+  if (!count || *count <= 0 || *count > std::numeric_limits<std::int64_t>::max() / scale) {
+    return std::nullopt;
+  }
+  return *count * scale;
+}
+
+// ---- Client keys (plan 2b refinement 1) ----
+
+constexpr std::string_view client_keys_keys = "zipf space uniform";
+
+// `keys.space: 100M`, `keys.uniform: 10M`: a key-space size, a count like a cache's `keys`.
+std::expected<double, ConfigError> read_key_space(const Site& site, const YAML::Node& value,
+                                                  std::string_view key) {
+  const auto count = parse_count(number_text(value));
+  if (!count) return site.fail(value, std::format("keys.{} must be a positive count", key));
+  return static_cast<double>(*count);
+}
+
+// `keys: {zipf: 1.0, space: 100M}`: Zipf with exponent s >= 0 over N keys (s = 0 is uniform).
+std::expected<model::KeySpec, ConfigError> read_zipf_keys(const Site& site,
+                                                          const YAML::Node& keys) {
+  if (!keys["zipf"] || !keys["space"]) {
+    return site.fail(keys, "keys needs zipf and space, or uniform");
+  }
+  const auto exponent = number_value(keys["zipf"]);
+  if (!exponent || *exponent < 0.0)
+    return site.fail(keys["zipf"], "keys.zipf must be non-negative");
+  return read_key_space(site, keys["space"], "space").transform([&](double space) {
+    return model::KeySpec{.zipf = *exponent, .space = space};
+  });
+}
+
+// A client's `keys`: which keys it asks for, and how popular each is (model::KeySpec). Read
+// only for the `che` caches downstream (graph's key_source), but checked on every client: a
+// misspelt block would otherwise surface only when a che cache is added.
+CheckResult read_client_keys(const Site& site, const YAML::Node& body, model::Workload& workload) {
+  const auto keys = body["keys"];
+  if (!keys) return {};
+  if (!keys.IsMap()) return site.fail(keys, "keys must be a map");
+  if (auto checked = check_known_keys(site, keys, client_keys_keys, "keys entry"); !checked) {
+    return checked;
+  }
+  const bool zipf_form = keys["zipf"] || keys["space"];
+  if (zipf_form && keys["uniform"]) {
+    return site.fail(keys, "keys takes zipf+space or uniform, not both");
+  }
+  if (!keys["uniform"]) return read_zipf_keys(site, keys).transform(store_in(workload.keys));
+  return read_key_space(site, keys["uniform"], "uniform").transform([&](double space) {
+    workload.keys = model::KeySpec{.zipf = std::nullopt, .space = space};
+  });
+}
+
 std::expected<model::Workload, ConfigError> read_workload(const Site& site,
                                                           const YAML::Node& body) {
   model::Workload workload;
   if (auto read = read_rate(site, body, workload); !read) return std::unexpected(read.error());
   if (auto read = read_op_shares(site, body).transform(store_in(workload.op_shares)); !read) {
+    return std::unexpected(read.error());
+  }
+  if (auto read = read_client_keys(site, body, workload); !read) {
     return std::unexpected(read.error());
   }
   if (auto read = read_optional_duration(site, body, "timeout", workload.timeout); !read) {
@@ -2100,30 +2173,6 @@ CheckResult read_write_ops(const Site& site, const YAML::Node& body, model::Node
   return collect_each(list,
                       [&](const YAML::Node& op) { return read_op_name(site, op, "write_ops op"); })
       .transform(store_in(node.write_ops));
-}
-
-// A count as the scenarios write cache sizes: a positive integer with an optional SI suffix
-// k, M or G (x 1e3, 1e6, 1e9; the same letters a rate uses, without "/s"): 500, 10k, 20M,
-// 10G. Nothing for anything else (a fraction, a sign, an overflow of 64 bits). A local
-// helper rather than parse_rate(text + "/s"): a rate may be fractional ("1.5k/s"), a count
-// of entries may not.
-std::optional<std::int64_t> parse_count(std::string_view text) {
-  constexpr std::array suffixes{std::pair{'k', std::int64_t{1'000}},
-                                std::pair{'M', std::int64_t{1'000'000}},
-                                std::pair{'G', std::int64_t{1'000'000'000}}};
-  std::int64_t scale = 1;
-  for (const auto& [letter, size] : suffixes) {
-    if (!text.empty() && text.back() == letter) {
-      scale = size;
-      text.remove_suffix(1);
-      break;
-    }
-  }
-  const auto count = parse_whole<std::int64_t>(text);
-  if (!count || *count <= 0 || *count > std::numeric_limits<std::int64_t>::max() / scale) {
-    return std::nullopt;
-  }
-  return *count * scale;
 }
 
 // `keys: 20M`: how many entries the cache holds (the Che approximation's cache size, 2b).

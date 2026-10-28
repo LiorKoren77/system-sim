@@ -31,7 +31,9 @@
 // forwards like a balancer (per link, by weight) whatever it admits, and its `backend` (the
 // counter store) becomes a demand edge of its own, carrying op `counter` (plan 2a
 // refinement 6, see connect_backends). A cache (plan 2a refinement 7) contributes two
-// things: its fixed hit ratio h (Graph::hit_ratio; a CDN's too), which turns a service's
+// things: its hit ratio h (Graph::hit_ratio; a CDN's too), stated (`{fixed: h}`) or computed
+// once here by the Che approximation from the cache size and the key distribution of the
+// clients upstream (plan 2b refinements 1-2, see resolve_hit_ratios), which turns a service's
 // `on: miss` step after it into a hop taken by the miss fraction 1 - h of the requests
 // (Graph::service_hops), and, for the strategies in which the cache itself talks to the store,
 // a demand edge to its `backend` (Graph::backend_fraction says which share of each op takes
@@ -57,10 +59,12 @@ module;
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 export module simsys.graph;
 
+import simsys.caching;
 import simsys.core;
 import simsys.defaults;
 import simsys.fluid;
@@ -85,6 +89,16 @@ struct EngineError {
   std::string message;
 };
 
+// A cache's or CDN's hit ratio h as the graph resolved it (plan 2b refinements 1-2):
+// `value`, and for `che` the inputs explain prints as its provenance: the key distribution
+// the clients upstream send (`keys`) and those clients (`key_clients`, node indices in
+// scenario order). A fixed ratio has neither.
+struct ResolvedHitRatio {
+  double value{};
+  std::optional<model::KeySpec> keys{};
+  std::vector<std::size_t> key_clients{};
+};
+
 // A scenario node plus the numbers the engine needs, each with the layer it came from.
 struct ResolvedNode {
   model::NodeSpec spec{};
@@ -102,6 +116,11 @@ struct ResolvedNode {
   // (Graph::connect_backends); empty for every other node, a cache_aside cache included.
   std::optional<std::size_t> backend{};
   std::optional<std::size_t> backend_link{};
+  // A cache's or CDN's hit ratio, resolved once at build (Graph::resolve_hit_ratios), so every
+  // later reader (miss steps, backend shares, behaviours, explain) looks it up. Empty for every
+  // other node, for one the scenario left without a hit ratio, and for a `che` CDN without a
+  // `keys` size (phase 2b Task 5 gives the CDN one).
+  std::optional<ResolvedHitRatio> hit_ratio{};
 };
 
 // The op a rate limiter sends its counter store once per request it checks (plan 2a
@@ -163,8 +182,8 @@ inline constexpr auto replica_model_table = std::to_array<core::EnumName<Replica
 //   - 1 - h for an `on: miss` step, h the hit ratio of the cache (or CDN) the nearest
 //     preceding unconditional step, its `lookup`, asked (ch. 1's cache, which the book calls
 //     read-through and the industry cache-aside: only the misses go on to the database). A
-//     cache with no number yet (`che`, phase 2b; a CDN without a fixed ratio) counts as
-//     missing every time, the safe side for a capacity check on paper;
+//     cache or CDN with no number (a CDN without a hit ratio, or with `che` but no `keys`
+//     size yet) counts as missing every time, the safe side for a capacity check on paper;
 //   - 0 for an `on: failure` step until external sinks fail (phase 2c);
 //   `factor`, the requests the hop sends per request that takes it: the step's own fan-out
 //   (one post -> 100 feed writes), times the lookup's for an `on: miss` step. A request
@@ -278,8 +297,8 @@ class Graph {
   [[nodiscard]] std::span<const std::string> arriving_ops(std::size_t node) const {
     return arriving_ops_.at(node);
   }
-  // A cache's or a CDN's fixed hit ratio; nothing for any other node, and for one whose ratio
-  // is `che` (computed in phase 2b) or that the scenario left without one.
+  // A cache's or a CDN's hit ratio, stated or computed at build (ResolvedNode::hit_ratio);
+  // nothing for any other node, and for one that has no number (see ResolvedNode::hit_ratio).
   [[nodiscard]] std::optional<double> hit_ratio(std::size_t node) const;
   // The hops `node` makes for incoming `op`, one per step in declaration order, each with
   // the share of requests that take it (ServiceHop). Empty for an op the node does not list
@@ -332,6 +351,9 @@ class Graph {
   Result check_cache_backend_ops(std::size_t cache);
   Result check_cache_backend_calls() const;
   Result route_splitters();
+  Result resolve_hit_ratios();
+  Result resolve_hops();
+  Result check_routed_ops();
   Result route_clients();
   Result route_client_op(std::size_t client, const std::string& op);
   Result route_forwarder(std::size_t node);
@@ -562,6 +584,22 @@ namespace {
          spec.algorithm == model::LimiterAlgorithm::leaky_bucket;
 }
 
+// Graph::build also takes clients written in code: their `keys` obey the loader's rules
+// (config's read_client_keys), which simsys.caching's Popularity factories also assume (they
+// throw on a negative exponent or an empty key space: programmer errors there).
+[[nodiscard]] std::optional<EngineError> invalid_client_keys(const model::NodeSpec& spec) {
+  if (!spec.workload || !spec.workload->keys) return std::nullopt;
+  const auto& keys = *spec.workload->keys;
+  const std::string name = "node '" + spec.id + "': ";
+  if (keys.zipf && !(*keys.zipf >= 0.0 && std::isfinite(*keys.zipf))) {
+    return EngineError{name + "keys.zipf must be non-negative"};
+  }
+  if (!(keys.space >= 1.0 && std::isfinite(keys.space))) {
+    return EngineError{name + "keys.space must be a positive count"};
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 // The call-graph search lives in a named, unexported namespace (module linkage) rather
@@ -716,6 +754,139 @@ void add_backend_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls)
 
 }  // namespace detail
 
+// ---- Hit ratios (plan 2b refinements 1-2) ----
+//
+// In `detail` (module linkage) rather than the anonymous namespace, for the reason given on
+// the call-graph search above: KeySource holds a std::vector.
+namespace detail {
+
+// For every node, the clients whose demand reaches it over some chain of demand edges
+// (services, balancers, limiters, caches passing on to their store, ...), in index order.
+// One walk downstream from each client, so the map costs O(clients × edges) and is built once
+// per graph, however many che caches ask it (Graph::resolve_hit_ratios).
+[[nodiscard]] std::vector<std::vector<std::size_t>> clients_upstream(
+    std::span<const ResolvedNode> nodes, std::span<const DemandEdge> edges) {
+  std::vector<std::vector<std::size_t>> downstream(nodes.size());
+  for (const auto& edge : edges) downstream[edge.from].push_back(edge.to);
+  std::vector<std::vector<std::size_t>> upstream(nodes.size());
+  for (std::size_t client = 0; client < nodes.size(); ++client) {
+    if (nodes[client].spec.type != model::NodeType::client) continue;
+    std::vector<bool> reached(nodes.size(), false);
+    std::vector<std::size_t> work{client};
+    reached[client] = true;
+    while (!work.empty()) {
+      const auto node = work.back();
+      work.pop_back();
+      for (const auto next : downstream[node]) {
+        if (reached[next]) continue;
+        reached[next] = true;
+        upstream[next].push_back(client);
+        work.push_back(next);
+      }
+    }
+  }
+  return upstream;
+}
+
+// The key distribution a che cache sees, and the clients that send it.
+struct KeySource {
+  model::KeySpec keys;
+  std::vector<std::size_t> clients;
+};
+
+// The one key distribution the keyed clients upstream of `cache` agree on (plan 2b refinement
+// 1). Clients without `keys` say nothing and are skipped; none at all, or two that disagree,
+// leave the Che approximation without its popularity, an error naming the first two clients
+// that disagree. (Phase 2c may mix several distributions by their rates.)
+[[nodiscard]] std::expected<KeySource, EngineError> key_source(
+    std::span<const ResolvedNode> nodes, std::size_t cache, std::span<const std::size_t> clients) {
+  const std::string name = "node '" + nodes[cache].spec.id + "': hit_ratio che";
+  std::optional<KeySource> source;
+  for (const auto client : clients) {
+    const auto& workload = nodes[client].spec.workload;
+    if (!workload || !workload->keys) continue;
+    if (!source) {
+      source = KeySource{.keys = *workload->keys, .clients = {client}};
+    } else if (*workload->keys != source->keys) {  // KeySpec's defaulted ==
+      return std::unexpected{
+          EngineError{name + ": clients '" + nodes[source->clients.front()].spec.id + "' and '" +
+                      nodes[client].spec.id + "' send different key distributions"}};
+    } else {
+      source->clients.push_back(client);
+    }
+  }
+  if (!source) return std::unexpected{EngineError{name + " needs a client with keys upstream"}};
+  return *source;
+}
+
+// The scenario's key distribution as simsys.caching's popularity: Zipf(s) over N keys, or
+// uniform over N.
+[[nodiscard]] caching::Popularity popularity_of(const model::KeySpec& keys) {
+  if (keys.zipf) return caching::Popularity::zipf(*keys.zipf, keys.space);
+  return caching::Popularity::uniform(keys.space);
+}
+
+// Pattern: Strategy/Policy — the hit-ratio model is a compile-time policy selected at build:
+// each cache's `hit_ratio` picks one of simsys.caching's HitRatioModel types, held in a
+// std::variant and visited once (Graph::resolve_hit_ratios); adding a model (an LFU one, say)
+// is one more alternative and one more resolve_with overload.
+using HitRatioPolicy = std::variant<caching::FixedHitRatio, caching::CheHitRatio>;
+
+// `{fixed: h}` -> FixedHitRatio{h}; `che` -> CheHitRatio. Only called with one of the two set.
+[[nodiscard]] HitRatioPolicy hit_ratio_policy(const model::HitRatio& stated) {
+  if (stated.che) return caching::CheHitRatio{};
+  return caching::FixedHitRatio{.value = *stated.fixed};
+}
+
+// The inputs a policy may read: the graph's nodes, which one is the cache, and who is upstream.
+struct HitRatioInputs {
+  std::span<const ResolvedNode> nodes;
+  std::size_t cache;
+  std::span<const std::size_t> clients_upstream;
+};
+
+// A stated ratio needs no inputs: it is the scenario author's own estimate. (FixedHitRatio's
+// hit_ratio(capacity, popularity) ignores both, but simsys.caching has no "unknown popularity"
+// to pass it, and a fixed cache need not have keyed clients upstream, so the value is read
+// directly.)
+[[nodiscard]] std::expected<ResolvedHitRatio, EngineError> resolve_with(
+    const caching::FixedHitRatio& fixed, const HitRatioInputs& /*inputs*/) {
+  return ResolvedHitRatio{.value = fixed.value};
+}
+
+// The Che approximation needs the cache size C (the cache's `keys`) and the popularity of the
+// keys the clients upstream ask for (key_source); h = che_hit_ratio(C, popularity), computed
+// here once (about half a millisecond for a 1e8-key Zipf space).
+[[nodiscard]] std::expected<ResolvedHitRatio, EngineError> resolve_with(
+    const caching::CheHitRatio& che, const HitRatioInputs& inputs) {
+  const auto& spec = inputs.nodes[inputs.cache].spec;
+  if (!spec.keys) {
+    return std::unexpected{EngineError{
+        "node '" + spec.id + "': hit_ratio che needs keys (the cache's capacity in keys)"}};
+  }
+  if (*spec.keys <= 0) {  // the loader's rule (config's read_cache_size), for code
+    return std::unexpected{EngineError{"node '" + spec.id + "': keys must be a positive integer"}};
+  }
+  const auto source = key_source(inputs.nodes, inputs.cache, inputs.clients_upstream);
+  if (!source) return std::unexpected{source.error()};
+  const double capacity = static_cast<double>(*spec.keys);
+  return ResolvedHitRatio{.value = che.hit_ratio(capacity, popularity_of(source->keys)),
+                          .keys = source->keys,
+                          .key_clients = source->clients};
+}
+
+// Does `node` have a hit ratio the graph can resolve now? A cache or CDN with `{fixed: h}` or
+// `che`; not a HitRatio{} built in code (neither set: no hit ratio at all), and not a `che`
+// CDN without a `keys` size, which the scenario schema cannot give a CDN before phase 2b's
+// Task 5 (it stays without a number and misses every time on paper, as before).
+[[nodiscard]] bool has_resolvable_hit_ratio(const model::NodeSpec& spec) {
+  if (!hits_or_misses(spec.type) || !spec.hit_ratio) return false;
+  if (!spec.hit_ratio->che) return spec.hit_ratio->fixed.has_value();
+  return spec.type == model::NodeType::cache || spec.keys.has_value();
+}
+
+}  // namespace detail
+
 // Pattern: Static factory (named constructor) with fallible staged construction — the
 // static `build` runs a sequence of named construction steps, each of which may fail
 // with an EngineError, and hands out a Graph only when all succeeded. The private
@@ -730,7 +901,10 @@ std::expected<Graph, EngineError> Graph::build(model::Scenario scenario) {
                          .and_then([&] { return graph.resolve_links(); })
                          .and_then([&] { return graph.connect_steps(); })
                          .and_then([&] { return graph.connect_backends(); })
-                         .and_then([&] { return graph.route_splitters(); });
+                         .and_then([&] { return graph.route_splitters(); })
+                         .and_then([&] { return graph.resolve_hit_ratios(); })
+                         .and_then([&] { return graph.resolve_hops(); })
+                         .and_then([&] { return graph.check_routed_ops(); });
   if (!built) return std::unexpected{built.error()};
   graph.order_nodes();
   graph.async_hops_ = detail::find_async_hops(graph);
@@ -772,6 +946,7 @@ Graph::Result Graph::resolve_nodes() {
   nodes_.reserve(scenario_.nodes.size());
   for (const auto& spec : scenario_.nodes) {
     if (spec.type == model::NodeType::client) {
+      if (auto invalid = invalid_client_keys(spec)) return std::unexpected{std::move(*invalid)};
       // C++20 designated initializers: `.spec = spec` names the member it sets and leaves
       // the others at their defaults, replacing positional `ResolvedNode{spec, {}, ...}`
       // where a reader must count commas against the struct definition.
@@ -838,10 +1013,11 @@ Graph::Result Graph::resolve_links() {
   return {};
 }
 
-// Every step of every node becomes a demand edge, over the link that carries it, and each
-// op's steps become its resolved hops (resolve_service_hops). Steps come from `ops` (per
-// incoming op: services, gateways) and `then` (after processing: workers, caches...); the
-// loader never gives a service `then` steps.
+// Every step of every node becomes a demand edge, over the link that carries it. Steps come
+// from `ops` (per incoming op: services, gateways) and `then` (after processing: workers,
+// caches...); the loader never gives a service `then` steps. The steps become resolved hops
+// later (resolve_hops), once the hit ratios their miss fractions need are known, and those
+// need every demand edge (resolve_hit_ratios walks them upstream to the clients).
 Graph::Result Graph::connect_steps() {
   for (std::size_t from = 0; from < nodes_.size(); ++from) {
     const auto& spec = nodes_[from].spec;
@@ -854,14 +1030,21 @@ Graph::Result Graph::connect_steps() {
     for (const model::Step& step : spec.then) {
       if (auto connected = connect_step(from, step); !connected) return connected;
     }
-    if (auto resolved = resolve_service_hops(from); !resolved) return resolved;
+  }
+  return {};
+}
+
+// Each node's op steps as resolved hops (resolve_service_hops), after resolve_hit_ratios.
+Graph::Result Graph::resolve_hops() {
+  for (std::size_t node = 0; node < nodes_.size(); ++node) {
+    if (auto resolved = resolve_service_hops(node); !resolved) return resolved;
   }
   return {};
 }
 
 // The miss fraction 1 - h of a cache or CDN (ServiceHop's comment): 1 when there is no number
-// for h yet (`che`, a CDN without a fixed ratio, a cache built in code without one), the safe
-// side on paper.
+// for h (a CDN without a hit ratio or with an unsized `che`, a cache built in code without
+// one), the safe side on paper.
 double Graph::miss_fraction(std::size_t cache) const {
   return 1.0 - hit_ratio(cache).value_or(0.0);
 }
@@ -948,10 +1131,40 @@ Graph::Result Graph::resolve_service_hops(std::size_t node) {
   return {};
 }
 
+// Every cache's and CDN's hit ratio, once, before anything reads one (resolve_hops' miss
+// fractions, the backend shares, the arriving ops): the stated number, or the Che
+// approximation over the clients' key distribution (detail::resolve_with). Runs after the
+// last demand edge exists, since a che cache walks them upstream to its clients; the
+// upstream map is built on the first che cache that needs it and shared by the rest.
+Graph::Result Graph::resolve_hit_ratios() {
+  std::optional<std::vector<std::vector<std::size_t>>> upstream;
+  for (std::size_t node = 0; node < nodes_.size(); ++node) {
+    const auto& spec = nodes_[node].spec;
+    if (!detail::has_resolvable_hit_ratio(spec)) continue;
+    if (spec.hit_ratio->che && !upstream) upstream = detail::clients_upstream(nodes_, edges_);
+    const detail::HitRatioInputs inputs{
+        .nodes = nodes_,
+        .cache = node,
+        .clients_upstream = upstream ? std::span<const std::size_t>{(*upstream)[node]}
+                                     : std::span<const std::size_t>{}};
+    // C++20 template lambda with a constrained parameter (`<caching::HitRatioModel Model>`):
+    // the lambda is a template like a generic `auto` one, but the concept is checked for
+    // every alternative std::visit instantiates it with, so a variant member that is no
+    // hit-ratio model fails to compile here, with the concept's name in the message.
+    auto resolved =
+        std::visit([&]<caching::HitRatioModel Model>(
+                       const Model& model) { return detail::resolve_with(model, inputs); },
+                   detail::hit_ratio_policy(*spec.hit_ratio));
+    if (!resolved) return std::unexpected{std::move(resolved.error())};
+    nodes_[node].hit_ratio = std::move(*resolved);
+  }
+  return {};
+}
+
 std::optional<double> Graph::hit_ratio(std::size_t node) const {
-  const auto& spec = nodes_.at(node).spec;
-  if (!hits_or_misses(spec.type) || !spec.hit_ratio || spec.hit_ratio->che) return std::nullopt;
-  return spec.hit_ratio->fixed;
+  const auto& resolved = nodes_.at(node).hit_ratio;
+  if (!resolved) return std::nullopt;
+  return resolved->value;
 }
 
 std::span<const ServiceHop> Graph::service_hops(std::size_t node, std::string_view op) const {
@@ -1122,16 +1335,21 @@ Graph::Result Graph::connect_backend(std::size_t limiter) {
   return {};
 }
 
-// The nodes that split flow over their outgoing links, then what follows from those
-// splits: which ops reach each node (through any chain of balancers and limiters), whether
-// every op reaching one can leave it, and what each balancer's policy does to the replicas
-// behind it.
+// The nodes that split flow over their outgoing links: their routes, and the demand edges
+// those routes add (the last ones the graph has).
 Graph::Result Graph::route_splitters() {
   if (auto routed = route_clients(); !routed) return routed;
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
     if (!forwards_by_link(nodes_[node].spec.type)) continue;
     if (auto routed = route_forwarder(node); !routed) return routed;
   }
+  return {};
+}
+
+// What follows from the splits and the resolved hops: which ops reach each node (through any
+// chain of balancers and limiters), whether every op reaching one can leave it, and what each
+// balancer's policy does to the replicas behind it.
+Graph::Result Graph::check_routed_ops() {
   collect_arriving_ops();
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
     if (is_cache(nodes_[node].spec)) {
