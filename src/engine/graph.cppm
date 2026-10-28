@@ -480,6 +480,14 @@ class Graph {
   std::vector<std::map<std::string, Bytes, std::less<>>> request_bytes_;
 };
 
+// Capacity units one request of `op` uses at `node`, the one rule the behaviours' cost() and
+// explain's paper load share: at a byte-sized node (defaults::is_byte_sized) the request's
+// megabytes, Graph::request_bytes / 1 MB (plan 2c refinement 2: a 50 MB stream costs 50); at
+// any other node defaults::op_cost (its `cost` entry, a database write's 5, else 1). An op that
+// never reaches a byte-sized node has no size and is priced as at a request-counting one: no
+// flow of it is ever charged there (Graph::build refuses an unsized op that does arrive).
+[[nodiscard]] double op_cost(const Graph& g, std::size_t node, std::string_view op);
+
 }  // namespace simsys::graph
 
 namespace simsys::graph {
@@ -1514,12 +1522,12 @@ using SizeArrivals = std::vector<std::vector<SizeArrival>>;
   return std::nullopt;
 }
 
-// "capacity 500MB/s, default": the byte rate that makes a node byte-sized, and where it came from.
+// "capacity 500MB/s, default": the byte rate that makes a node byte-sized, and where it came from:
+// the scenario's `capacity: 100GB/s`, else a blob store's spec §6 default
+// (defaults::is_byte_sized).
 [[nodiscard]] std::string byte_capacity_text(const model::NodeSpec& spec) {
-  const auto bytes = *defaults::byte_rate_behind(spec);  // the node is byte-sized
-  const std::string_view source =
-      bytes.source == defaults::Source::scenario ? "scenario" : "default";
-  return "capacity " + format_byte_rate(bytes.value) + ", " + std::string{source};
+  if (spec.byte_capacity) return "capacity " + format_byte_rate(*spec.byte_capacity) + ", scenario";
+  return "capacity " + format_byte_rate(defaults::blob_store_byte_rate) + ", default";
 }
 
 // A byte-sized node's error for an op one of whose arrivals (sorted by sender) has no size,
@@ -2230,6 +2238,13 @@ std::optional<Bytes> Graph::request_bytes(std::size_t node, std::string_view op)
   const auto found = by_op.find(op);
   if (found == by_op.end()) return std::nullopt;
   return found->second;
+}
+
+double op_cost(const Graph& g, std::size_t node, std::string_view op) {
+  const auto size = g.request_bytes(node, op);  // first: it checks `node` (vector::at)
+  const auto& spec = g.nodes()[node].spec;
+  if (defaults::is_byte_sized(spec) && size) return defaults::byte_cost(*size);
+  return defaults::op_cost(spec, op);
 }
 
 std::span<const ServiceHop> Graph::service_hops(std::size_t node, std::string_view op) const {

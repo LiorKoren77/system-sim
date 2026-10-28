@@ -1042,21 +1042,18 @@ struct QueueProvenance {
           provenance(node.service_time_source), "(pool)", provenance(queue_source)};
 }
 
-// "100GB/s at 1MB/object; byte flows: phase 2c": where a capacity converted from bytes came
-// from (defaults::byte_rate_behind), the byte rate in the scenario's grammar and the object size
-// assumed to turn it into requests.
-[[nodiscard]] std::string byte_conversion(const defaults::Resolved<ByteRate>& bytes) {
-  return with_si_prefix(bytes.value.bytes_per_second) + "B/s at " +
-         with_si_prefix(defaults::blob_object_bytes) + "B/object; byte flows: phase 2c";
+// A rate in a node's capacity units: "1.5k/s" (requests) for most nodes, "100k MB/s" for a node
+// that counts megabytes (defaults::is_byte_sized, plan 2c refinement 2), whose capacity, load
+// and checks are all in MB.
+[[nodiscard]] std::string fmt_units(const model::NodeSpec& spec, double per_second) {
+  if (defaults::is_byte_sized(spec)) return with_si_prefix(per_second) + " MB/s";
+  return fmt_rate(per_second);
 }
 
-// "(scenario)" or "(default)", or for a capacity converted from bytes "(scenario: 100GB/s at
-// 1MB/object; byte flows: phase 2c)": the number is not the scenario's, only the byte rate is.
-[[nodiscard]] std::string capacity_provenance(const graph::ResolvedNode& node) {
-  const auto bytes = defaults::byte_rate_behind(node.spec);
-  if (!bytes) return std::string{node_provenance(node.service_rate_source, node.spec)};
-  const std::string source = bytes->source == defaults::Source::scenario ? "scenario" : "default";
-  return "(" + source + ": " + byte_conversion(*bytes) + ")";
+// " per MB" after a byte-sized node's service time, the time of one megabyte (its unit); nothing
+// after a time per request.
+[[nodiscard]] std::string_view per_unit(const model::NodeSpec& spec) {
+  return defaults::is_byte_sized(spec) ? " per MB" : "";
 }
 
 [[nodiscard]] QueueProvenance queue_provenance(const graph::ResolvedNode& node) {
@@ -1072,8 +1069,9 @@ struct QueueProvenance {
   // a database's `pool` at or above that c binds nothing (graph::apply_database_keys).
   const std::string_view concurrency_source =
       spec.advanced.concurrency ? "(scenario)" : "(implied)";
-  return {capacity_provenance(node), node_provenance(node.service_time_source, spec),
-          concurrency_source, provenance(queue_source)};
+  return {std::string{node_provenance(node.service_rate_source, spec)},
+          node_provenance(node.service_time_source, spec), concurrency_source,
+          provenance(queue_source)};
 }
 
 [[nodiscard]] std::string server_details(const graph::ResolvedNode& node) {
@@ -1083,8 +1081,9 @@ struct QueueProvenance {
   const std::array parts{
       "dc=" + spec.dc,
       "replicas=" + std::to_string(spec.replicas),
-      "capacity=" + fmt_rate(cap.service_rate.per_second) + " " + source.capacity,
-      "service_time=" + fmt_duration(cap.service_time_s) + " " + std::string{source.service_time},
+      "capacity=" + fmt_units(spec, cap.service_rate.per_second) + " " + source.capacity,
+      "service_time=" + fmt_duration(cap.service_time_s) + std::string{per_unit(spec)} + " " +
+          std::string{source.service_time},
       "c=" + std::to_string(cap.concurrency) + " " + std::string{source.concurrency},
       "queue_limit=" + num(cap.queue_limit, 6) + " " + std::string{source.queue_limit},
       "variability=" + num(cap.service_variability, 3),
@@ -1230,11 +1229,12 @@ constexpr SimTime peak_sample_step = 1_min;
   return load;
 }
 
-// Capacity units one request of `op` uses at a node: its `cost` entry, else 5 for a database's
-// write, else 1 (defaults::op_cost, the rule the behaviours' cost() follow), read off the spec
-// because explain runs on any graph, including types the engine does not simulate yet.
-[[nodiscard]] double cost_of(const model::NodeSpec& spec, const std::string& op) {
-  return defaults::op_cost(spec, op);
+// Capacity units one request of `op` uses at node `i`: its megabytes at a byte-sized node, else
+// its `cost` entry, else 5 for a database's write, else 1 (graph::op_cost, the rule the
+// behaviours' cost() follow), so explain prices every op as a run does, on any graph, including
+// types the engine does not simulate yet.
+[[nodiscard]] double cost_of(const graph::Graph& g, std::size_t i, const std::string& op) {
+  return graph::op_cost(g, i, op);
 }
 
 // Each forwarding node's (load balancer's, rate limiter's) routes per op that can reach
@@ -1416,10 +1416,9 @@ struct PaperLoad {
   fed_back = std::move(next_fed_back);
   std::vector<double> totals;
   for (std::size_t i = 0; i < load.size(); ++i) {
-    const auto& spec = g.nodes()[i].spec;
     // std::ranges::fold_left (see forward_limited), each op weighed by its cost.
     totals.push_back(std::ranges::fold_left(load[i], 0.0, [&](double sum, const auto& entry) {
-      return sum + entry.second * cost_of(spec, entry.first);
+      return sum + entry.second * cost_of(g, i, entry.first);
     }));
   }
   return totals;
@@ -1655,7 +1654,8 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   if (node.imbalance <= 1.0) return {};
   const double hot = offered * node.imbalance / node.spec.replicas;
   const double copy_capacity = node.capacity.service_rate.per_second;
-  const std::string head = "  hottest copy " + fmt_rate(hot) + " vs " + fmt_rate(copy_capacity);
+  const std::string head =
+      "  hottest copy " + fmt_units(node.spec, hot) + " vs " + fmt_units(node.spec, copy_capacity);
   const std::string imbalance = "imbalance " + num(node.imbalance, 3) + ")";
   if (copy_capacity <= 0.0) return head + " (no capacity, red; " + imbalance;
   const double rho = hot / copy_capacity;
@@ -1685,7 +1685,7 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   double reads = 0.0;
   double writes = 0.0;
   for (const auto& [op, rate] : arriving) {
-    (graph::is_write(node.spec, op) ? writes : reads) += rate * cost_of(node.spec, op);
+    (graph::is_write(node.spec, op) ? writes : reads) += rate * defaults::op_cost(node.spec, op);
   }
   return graph::database_copy_loads(node.spec, reads, writes);
 }
@@ -1722,11 +1722,10 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 // for a sharded database: every shard is a full set of copies), with the node's own zone
 // thresholds (a database's busiest copy's, headline_zone), and the hottest copy's behind a hash
 // ring. Both are in capacity units (requests when every cost is 1); a database's are labelled
-// so, "peak offered 1.5k units/s", as its per-copy checks are (a write costs 5 of them).
-// A capacity converted from bytes (defaults::byte_rate_behind) gets the load but no percentage
-// and no zone: "(not checked: capacity from 100GB/s at 1MB/object; byte flows: phase 2c)". The
-// object size is an assumption no scenario states (youtube streams 50 MB), so a verdict on it
-// would be one on an invented number; the engine refuses to run a CDN sized so for that reason.
+// so, "peak offered 1.5k units/s", as its per-copy checks are (a write costs 5 of them), and a
+// byte-sized node's are megabytes, "peak offered 14.08k MB/s (281.6/s)", the requests beside
+// them (plan 2c refinement 2: the request's own size in MB, Graph::request_bytes, so the
+// percentage is the bytes' and youtube's cdn_us is at 14.1 %).
 // Capacity per replica × replicas, × shards for a sharded database (every shard is a full set
 // of copies), in capacity units per second.
 [[nodiscard]] double total_capacity(const graph::ResolvedNode& node) {
@@ -1734,26 +1733,30 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   return node.capacity.service_rate.per_second * copies;
 }
 
-// "peak offered 1.5k/s vs 2k/s total capacity  ": what every check line opens with.
-[[nodiscard]] std::string check_head(const graph::ResolvedNode& node, double offered) {
-  const std::string offered_text = node.spec.type == model::NodeType::sql_db
-                                       ? with_si_prefix(offered) + " units/s"
-                                       : fmt_rate(offered);
-  return "peak offered " + offered_text + " vs " + fmt_rate(total_capacity(node)) +
-         " total capacity  ";
+// The offered load as a check line prints it: "1.5k/s" (requests), "1.5k units/s" (a database,
+// whose writes cost 5), or "64.86 MB/s (324.3/s)" (a byte-sized node: its megabytes, then the
+// requests `arriving` that carry them).
+[[nodiscard]] std::string offered_text(const graph::ResolvedNode& node, double offered,
+                                       const OpLoad& arriving) {
+  if (node.spec.type == model::NodeType::sql_db) return with_si_prefix(offered) + " units/s";
+  if (!defaults::is_byte_sized(node.spec)) return fmt_rate(offered);
+  const double requests = std::ranges::fold_left(arriving | std::views::values, 0.0, std::plus<>{});
+  return fmt_units(node.spec, offered) + " (" + fmt_rate(requests) + ")";
 }
 
-// Why a node's capacity gets no verdict, or nothing when it gets one:
-//  - a capacity converted from bytes (see above): "capacity from 100GB/s at 1MB/object; byte
-//    flows: phase 2c";
-//  - a kv_cluster: its `nodes`, `replication` and quorums are read and ignored until phase 3
-//    (schema), so its capacity is ONE box's (`capacity: 10k/s` is per node in labs/kv-store, of
-//    eight, each write landing on N = 3 of them). A percentage against it would be a verdict on
-//    a model the simulator does not have: labs/kv-store printed 300 %, red.
+// "peak offered 1.5k/s vs 2k/s total capacity  ": what every check line opens with.
+[[nodiscard]] std::string check_head(const graph::ResolvedNode& node, double offered,
+                                     const OpLoad& arriving) {
+  return "peak offered " + offered_text(node, offered, arriving) + " vs " +
+         fmt_units(node.spec, total_capacity(node)) + " total capacity  ";
+}
+
+// Why a node's capacity gets no verdict, or nothing when it gets one: a kv_cluster's `nodes`,
+// `replication` and quorums are read and ignored until plan 2c Task 10 (schema), so its capacity
+// is ONE box's (`capacity: 10k/s` is per node in labs/kv-store, of eight, each write landing on
+// N = 3 of them). A percentage against it would be a verdict on a model the simulator does not
+// have: labs/kv-store printed 300 %, red.
 [[nodiscard]] std::optional<std::string> unchecked_capacity(const graph::ResolvedNode& node) {
-  if (const auto bytes = defaults::byte_rate_behind(node.spec)) {
-    return "capacity from " + byte_conversion(*bytes);
-  }
   if (node.spec.type == model::NodeType::kv_cluster) {
     return std::string{"kv_cluster nodes, replication and quorums: phase 3"};
   }
@@ -1761,9 +1764,10 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 }
 
 [[nodiscard]] std::string check_details(const graph::ResolvedNode& node, double offered,
+                                        const OpLoad& arriving,
                                         const std::optional<graph::DatabaseCopyLoads>& loads) {
   const double capacity = total_capacity(node);
-  const std::string head = check_head(node, offered);
+  const std::string head = check_head(node, offered, arriving);
   if (const auto unchecked = unchecked_capacity(node)) {
     return head + "(not checked: " + *unchecked + ")";
   }
@@ -1786,12 +1790,12 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 [[nodiscard]] std::string partial_check(const graph::ResolvedNode& node, double offered,
                                         const OpLoad& arriving,
                                         std::span<const model::NodeType> blocked) {
-  const std::string head = check_head(node, offered);
+  const std::string head = check_head(node, offered, arriving);
   const std::string mark = unpropagated_mark(blocked);
   const bool reached = offered > 0.0 || !std::isfinite(offered);
   if (!reached) return head + "(" + mark;
   if (unchecked_capacity(node)) {
-    return check_details(node, offered, std::nullopt) + "  (lower bound; " + mark;
+    return check_details(node, offered, arriving, std::nullopt) + "  (lower bound; " + mark;
   }
   const double capacity = total_capacity(node);
   if (capacity <= 0.0) return head + "(no capacity, red; " + mark;
@@ -1814,7 +1818,8 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   if (!blocked.empty()) return partial_check(node, load.totals[i], load.by_op[i], blocked) + note;
   // A capacity with no verdict (unchecked_capacity) gets none per copy either.
   const auto loads = unchecked_capacity(node) ? std::nullopt : database_loads(node, load.by_op[i]);
-  return check_details(node, load.totals[i], loads) + database_check(node, loads) + note;
+  return check_details(node, load.totals[i], load.by_op[i], loads) + database_check(node, loads) +
+         note;
 }
 
 [[nodiscard]] std::string explain_checks(const graph::Graph& g) {

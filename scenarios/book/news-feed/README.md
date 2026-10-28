@@ -11,10 +11,12 @@
 - The 300x write amplification of fan-out on write hitting `feed_cache` and `graph_db`.
 - Read path fan-out (20 posts hydrated per feed read) multiplying cache traffic.
 - Media reads (30% of requests, 200 KB each) go to the CDN and only misses reach `media_store`.
-  `media_store` is sized in bytes (`capacity: 1GB/s`), so `explain` shows its 324.3 misses/s at
-  the peak but does not check them (`not checked: capacity from 1GB/s at 1MB/object; byte flows:
-  phase 2c`): at an assumed 1 MB per object the store would be 32.4 % busy, at the scenario's
-  200 KB per read it is 65 MB/s of 1GB/s, about 6.5 %. Phase 2c's byte flows will check it.
+  `media_store` is sized in bytes (`capacity: 1GB/s`), so it counts megabytes (phase 2c): each
+  200 KB read costs 0.2 units of 1 MB, and `explain` checks its 324.3 misses/s at the peak in
+  MB/s, `media_store  peak offered 64.86 MB/s (324.3/s) vs 1k MB/s total capacity  (6.49%,
+  green)`. A read is answered in one megabyte's 40 ms (an upper bound for a 200 KB object: the
+  model charges every request at least one unit's service time). `run` stops at `fanout_q`, a
+  message queue (later in phase 2c).
 - Queue lag at the evening peak as the fan-out workers fall behind.
 - A 30-second database outage at 15:00: writes back up in `fanout_q`; reads survive on caches.
 

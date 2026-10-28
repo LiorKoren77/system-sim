@@ -14,7 +14,6 @@ module;
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -55,21 +54,23 @@ inline constexpr LatencyNumbers latency_numbers{
     .third_party_api = 100_ms,  // spec §6: external APIs, with variability 2.0
 };
 
-// Chosen, not from the book or spec: a blob store counts objects of 1 MB, so the spec's
-// "blob 500 MB/s" means 500 objects/s, and one object costs one per-MB disk read plus
-// one per-MB network transfer. A scenario's byte_capacity is converted with it too. The size is
-// an assumption no scenario states (youtube streams 50 MB, news-feed's media is 200 KB), so a
-// capacity converted with it is not checked by explain (byte_rate_behind) and a CDN sized in
-// bytes does not run: both wait for phase 2c's byte flows, which take each op's own size.
-inline constexpr double blob_object_bytes = 1e6;
-
 // The capacity unit of a byte-sized node (is_byte_sized below), plan 2c refinement 2: one
 // megabyte, decimal like every size in the project, so 500 MB/s is 500 units/s and a 50 MB
-// stream costs 50 units. Chosen because the book's latency table prices transfers per MB
-// ("read 1 MB sequentially from the network": 10 ms), which makes one unit's service time a
-// row of that table. From phase 2c Task 3 on it replaces blob_object_bytes above: the size
-// stops being an assumed object and becomes each op's own (graph::Graph::request_bytes).
+// stream costs 50 units (byte_cost). Chosen because the book's latency table prices transfers
+// per MB ("read 1 MB sequentially from the network": 10 ms), which makes one unit's service
+// time a row of that table: a byte-sized node's service time is the time of ONE megabyte, and
+// Little's law gives its concurrency as for any node, c = units/s × s (a 100 GB/s CDN at 10 ms
+// per MB: 100k/s × 10 ms = 1000 transfers at once). The size is each op's own, resolved by the
+// graph (graph::Graph::request_bytes), never an assumed object.
 inline constexpr double byte_unit = 1e6;
+
+// Capacity units one request of `size` bytes uses at a byte-sized node: its megabytes, a 50 MB
+// stream 50, a 2 KB read 0.002. A cost is capacity, not duration (as a SQL write's 5 units are,
+// sql_write_cost): the request still waits and is served like one unit, so its sojourn is its
+// wait plus ONE megabyte's service time, its time to first byte.
+[[nodiscard]] constexpr double byte_cost(Bytes size) {
+  return size.count / byte_unit;
+}
 
 // Spec §6's QPS line: "blob 500 MB/s", one blob store machine's throughput.
 inline constexpr ByteRate blob_store_byte_rate{500e6};
@@ -108,7 +109,8 @@ struct TypeDefaults {
     case cdn:
       // rate chosen (the spec has no CDN figure); time spec §6 "CDN / blob per-MB
       // transfer": an edge serves a cached ~1 MB object over the network. The memory
-      // read (250 us) is only the lookup; the transfer dominates.
+      // read (250 us) is only the lookup; the transfer dominates. A CDN sized in bytes
+      // (`capacity: 100GB/s`, is_byte_sized) keeps the time as the time of one MB, its unit.
       return {Rate{100'000}, t.network_read_1mb};
     case load_balancer:
       return {Rate{100'000}, 50_us};  // chosen: an L7 proxy hop
@@ -130,10 +132,11 @@ struct TypeDefaults {
     case worker_pool:
       return {Rate{1'000}, 2_ms};  // chosen: a 2 ms background job
     case blob_store:
-      // rate spec "blob 500 MB/s" / 1 MB objects = 500/s; time spec §6 "blob store
-      // per-MB cost" (disk) + "per-MB transfer" (network) = 30 + 10 = 40 ms. Summed via
-      // count(): see resolve_link_latency for why chrono's operator+ is not visible here.
-      return {Rate{blob_store_byte_rate.bytes_per_second / blob_object_bytes},
+      // rate spec "blob 500 MB/s" in units of 1 MB (byte_unit) = 500 units/s; time spec §6
+      // "blob store per-MB cost" (disk) + "per-MB transfer" (network) = 30 + 10 = 40 ms per
+      // MB, so c = 500/s × 40 ms = 20 transfers at once (Little's law). Summed via count():
+      // see resolve_link_latency for why chrono's operator+ is not visible here.
+      return {Rate{blob_store_byte_rate.bytes_per_second / byte_unit},
               SimTime{t.disk_read_1mb.count() + t.network_read_1mb.count()}};
     case search_index:
       return {Rate{5'000}, 5_ms};  // chosen: an inverted-index query
@@ -252,37 +255,26 @@ struct Resolved {
 
 // Pattern: Layered configuration (override over default, like a CSS cascade);
 // Resolved<T> records which layer answered.
-// A blob store may state its capacity in bytes; that is still the scenario's value,
-// converted to objects per second with blob_object_bytes.
+// A capacity stated in bytes is still the scenario's value, read in megabytes per second
+// (byte_unit): `capacity: 100GB/s` is 100k units/s.
 [[nodiscard]] Resolved<Rate> resolve_service_rate(const model::NodeSpec& n) {
   if (n.capacity) return {*n.capacity, Source::scenario};
   if (n.byte_capacity) {
-    return {Rate{n.byte_capacity->bytes_per_second / blob_object_bytes}, Source::scenario};
+    return {Rate{n.byte_capacity->bytes_per_second / byte_unit}, Source::scenario};
   }
   return {defaults_of(n).service_rate, Source::type_default};
 }
 
-// The byte rate a node's request capacity was converted from at blob_object_bytes, if it was
-// converted: the scenario's `capacity: 100GB/s` (Source::scenario), or a blob store's type
-// default, spec §6's 500 MB/s (Source::type_default). Empty for a capacity in requests, stated
-// or defaulted. Explain tags such a capacity and gives its check no zone: the object size is
-// assumed, so the verdict would be too.
-[[nodiscard]] std::optional<Resolved<ByteRate>> byte_rate_behind(const model::NodeSpec& n) {
-  if (n.capacity) return std::nullopt;
-  if (n.byte_capacity) return Resolved<ByteRate>{*n.byte_capacity, Source::scenario};
-  if (n.type == model::NodeType::blob_store) {
-    return Resolved<ByteRate>{blob_store_byte_rate, Source::type_default};
-  }
-  return std::nullopt;
-}
-
 // Does the node count bytes rather than requests (plan 2c refinement 2)? Exactly when its
-// capacity is a byte rate (byte_rate_behind): a stated `capacity: 100GB/s` on a CDN or blob
-// store, or a blob store's type default, spec §6's 500 MB/s. A capacity stated in requests is
-// a request count on any type, and so is every type whose default is a request rate. Such a
-// node needs the size of every request it serves (graph::Graph::request_bytes).
+// capacity is a byte rate on a type that serves bytes: a stated `capacity: 100GB/s` on a CDN or
+// a blob store, or a blob store's type default, spec §6's 500 MB/s. A capacity stated in
+// requests is a request count on any type, and so is every type whose default is a request
+// rate. Such a node counts megabytes (byte_unit) and needs the size of every request it serves
+// (graph::Graph::request_bytes).
 [[nodiscard]] bool is_byte_sized(const model::NodeSpec& n) {
-  return byte_rate_behind(n).has_value();
+  if (n.capacity) return false;
+  if (n.type == model::NodeType::blob_store) return true;
+  return n.type == model::NodeType::cdn && n.byte_capacity.has_value();
 }
 
 [[nodiscard]] Resolved<SimTime> resolve_service_time(const model::NodeSpec& n) {
@@ -376,6 +368,10 @@ static_assert(
     simsys::defaults::for_type(simsys::model::NodeType::service).service_rate.per_second == 2000);
 static_assert(every_non_client_type_has_positive_defaults());
 static_assert(simsys::defaults::sql_write_cost == 5.0);  // spec §6: 5k reads/s vs 1k writes/s
+// spec §6: "blob 500 MB/s" is 500 units of 1 MB per second; a 50 MB stream costs 50 of them.
+static_assert(
+    simsys::defaults::for_type(simsys::model::NodeType::blob_store).service_rate.per_second == 500);
+static_assert(simsys::defaults::byte_cost(simsys::Bytes{50e6}) == 50.0);
 // ch. 7: 12 sequence bits per millisecond per machine.
 static_assert(simsys::defaults::for_id_algorithm(simsys::model::IdAlgorithm::snowflake)
                   .service_rate.per_second == 4'096'000);

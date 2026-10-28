@@ -428,7 +428,8 @@ struct Overloaded : Fs... {
   // the test reads `client` instead of `model::NodeType::client`.
   using enum model::NodeType;
   return type == client || type == service || type == load_balancer || type == rate_limiter ||
-         type == cache || type == sql_db || type == cdn || type == id_generator;
+         type == cache || type == sql_db || type == cdn || type == id_generator ||
+         type == blob_store;
 }
 
 // Why a cache cannot run, if it cannot: a scenario built in code left it without a number or
@@ -444,30 +445,35 @@ struct Overloaded : Fs... {
   return std::nullopt;
 }
 
-// Why a CDN cannot run, if it cannot (plan 2b refinement 4):
-//  - a byte capacity (`capacity: 100GB/s`): what a CDN's bandwidth limits is bytes, and the
-//    engine moves requests until phase 2c's byte flows (each op's size, a link's bandwidth).
-//    simsys.defaults converts the bytes at an assumed object size (blob_object_bytes, 1 MB) so
-//    that explain can print a number, but that number is the assumption's, not the scenario's:
-//    explain tags it and gives it no verdict (defaults::byte_rate_behind), and the engine does
-//    not run on it (youtube's 50 MB streams would make 100GB/s 2k/s, not 100k/s);
-//  - a `che` hit ratio without a `keys` size: Graph::build leaves it without a number, and
-//    running it as h = 0 would silently replace the scenario's Che approximation by "every read
-//    misses" (explain shows that bound and says so; a run could not).
-// A CDN with no hit ratio at all runs: it misses every read, as the scenario says.
+// Why a CDN cannot run, if it cannot (plan 2b refinement 4): a `che` hit ratio without a `keys`
+// size. Graph::build leaves it without a number, and running it as h = 0 would silently replace
+// the scenario's Che approximation by "every read misses" (explain shows that bound and says so;
+// a run could not). A CDN with no hit ratio at all runs: it misses every read, as the scenario
+// says. A CDN sized in bytes runs too, counting megabytes (plan 2c refinement 2,
+// behaviours::CdnBehaviour).
 [[nodiscard]] std::optional<std::string> cdn_not_runnable(const model::NodeSpec& spec) {
-  const std::string name = "node '" + spec.id + "': ";
-  if (spec.byte_capacity) return name + "a cdn with a byte capacity needs byte flows (phase 2c)";
   if (spec.hit_ratio && spec.hit_ratio->che && !spec.keys) {
-    return name + "hit_ratio che needs keys (the cdn's size in objects)";
+    return "node '" + spec.id + "': hit_ratio che needs keys (the cdn's size in objects)";
   }
   return std::nullopt;
 }
 
-// Why a node of a simulated type still cannot run, if it cannot (the two cases above).
+// Why a blob store cannot run, if it cannot: `then` steps. They are event notifications (S3 event
+// notifications; book ch. 14's "transcoding starts when the upload completes"), asynchronous work
+// that arrives with plan 2c Task 4. A store without them is a leaf and runs
+// (behaviours::BlobStoreBehaviour).
+[[nodiscard]] std::optional<std::string> blob_store_not_runnable(const model::NodeSpec& spec) {
+  if (spec.then.empty()) return std::nullopt;
+  return "node '" + spec.id +
+         "': a blob store's then steps are event notifications, which run/estimate do not "
+         "support yet (phase 2c)";
+}
+
+// Why a node of a simulated type still cannot run, if it cannot (the cases above).
 [[nodiscard]] std::optional<std::string> not_runnable_yet(const model::NodeSpec& spec) {
   if (spec.type == model::NodeType::cache) return cache_not_runnable(spec);
   if (spec.type == model::NodeType::cdn) return cdn_not_runnable(spec);
+  if (spec.type == model::NodeType::blob_store) return blob_store_not_runnable(spec);
   return std::nullopt;
 }
 
@@ -699,6 +705,10 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
     // numbers); its origin is a node of its own, reached on a miss.
     case model::NodeType::cdn:
       return make_server(behaviours::CdnBehaviour{g, index}, resolved);
+    // A blob store's queue is the store moving megabytes (spec §6's 500 MB/s at 40 ms per MB, or
+    // the scenario's numbers); a request is charged its size (behaviours::BlobStoreBehaviour).
+    case model::NodeType::blob_store:
+      return make_server(behaviours::BlobStoreBehaviour{g, index}, resolved);
     // A database's queues are its primaries and its replicas (make_database), whatever a
     // balancer in front of it does.
     case model::NodeType::sql_db:

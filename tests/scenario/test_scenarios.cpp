@@ -355,7 +355,7 @@ TEST_CASE("book/youtube validates and explains, and the engine refuses it at tra
   // The edges' misses at the evening peak, (1 − h_us) × 281.6/s + (1 − h_eu) × 140.8/s (each
   // client's base × 1.6 × 88 % streams) = 157.8/s; the transcoders' writes add nothing on paper
   // yet (a worker pool's load is phase 2c's). The store counts megabytes, so its line leads with
-  // MB/s (157.8/s × 50 MB = 7.89k MB/s) and gives the requests in parentheses.
+  // MB/s (157.82/s × 50 MB = 7.891k MB/s) and gives the requests in parentheses.
   REQUIRE_THAT(peak_offered_requests_per_s(text, "transcoded_store"),
                Catch::Matchers::WithinRel(157.8, 1e-3));
   REQUIRE_THAT(peak_offered_per_s(text, "transcoded_store"),
@@ -414,11 +414,11 @@ TEST_CASE("byte-sized capacities are checked in MB per second", "[scenario]") {
   REQUIRE(original.contains("peak offered 2.88k MB/s"));
   REQUIRE(original.contains("vs 5k MB/s"));
   REQUIRE(original.contains("(57.6%, green)"));
-  // transcoded_store: only the cdns' misses reach it on paper, 157.8 streams/s x 50 MB = 7.89k
-  // MB/s of 10GB/s = 10k MB/s: at least 78.9 %, a lower bound (the transcoders' writes come
-  // through queues the paper load does not follow yet).
+  // transcoded_store: only the cdns' misses reach it on paper, 157.82 streams/s (printed to four
+  // digits, 157.8) x 50 MB = 7.891k MB/s of 10GB/s = 10k MB/s: at least 78.9 %, a lower bound
+  // (the transcoders' writes come through queues the paper load does not follow yet).
   const auto transcoded = check_line_of(youtube_text, "transcoded_store");
-  REQUIRE(transcoded.contains("peak offered 7.89k MB/s (157.8/s) vs 10k MB/s"));
+  REQUIRE(transcoded.contains("peak offered 7.891k MB/s (157.8/s) vs 10k MB/s"));
   REQUIRE(transcoded.contains("(≥78.9%; load not propagated:"));
 
   const auto news = build_or_fail(
