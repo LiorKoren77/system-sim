@@ -728,13 +728,17 @@ TEST_CASE("explain forwards a cache's then-steps: misses reach the next node", "
   REQUIRE(check_line(text, "api").contains("peak offered 600/s vs 5k/s"));
 }
 
-// With no number for h (a `che` CDN before the CDN gets a `keys` size) the paper load counts
-// every read as a miss: the database behind it is checked against its worst case. The line
-// says so, or a student would read a red database as a real problem of the design.
+// With no number for h (a `che` CDN without a `keys` size) the paper load counts every read as
+// a miss: the origin behind it is checked against its worst case. The line says so, or a student
+// would read a red database as a real problem of the design. (The shortener's cache becomes a
+// CDN in front of url_db, which it fetches its own misses from.)
 TEST_CASE("explain annotates checks that count an unknown hit ratio as zero", "[report]") {
   auto s = che_cached();
+  s.nodes[1].ops["redirect"] = {Step{.to = "url_cache", .op = "read"}};
   s.nodes[2].type = NodeType::cdn;
   s.nodes[2].keys = std::nullopt;
+  s.nodes[2].origin = "url_db";
+  s.links.push_back(LinkSpec{.from = "url_cache", .to = "url_db"});
   const auto built = simsys::graph::Graph::build(s);
   INFO((built ? "" : built.error().message));
   REQUIRE(built.has_value());

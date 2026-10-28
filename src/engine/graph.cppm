@@ -41,6 +41,9 @@
 // it; a write_back cache's flush over it is asynchronous by design, detail::write_back_flushes),
 // and its `then` steps, demand edges like a service's steps whose share of each op is
 // Graph::then_fraction (plan 2b refinement 5: what goes on to the next tier after the cache).
+// A CDN (plan 2b refinement 4) is the read_through shape of a cache: its `origin` becomes its
+// backend (Graph::connect_origin), a demand edge carrying 1 - h of each read as the same op, no
+// write may reach it (Graph::check_reads_only), and no service `on: miss` step may follow it.
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -137,15 +140,16 @@ struct ResolvedNode {
   bool pooled{false};
   double imbalance{1.0};
   bool keys_partitioned{false};
-  // A rate limiter's counter store, or the store behind a cache whose strategy calls it
-  // (model::needs_backend), as a node index, and the link its requests travel on
-  // (Graph::connect_backends); empty for every other node, a cache_aside cache included.
+  // A rate limiter's counter store, the store behind a cache whose strategy calls it
+  // (model::needs_backend), or a CDN's origin (plan 2b refinement 4: the CDN is the read_through
+  // shape of a cache, its origin the backend), as a node index, and the link its requests travel
+  // on (Graph::connect_backends); empty for every other node, a cache_aside cache included.
   std::optional<std::size_t> backend{};
   std::optional<std::size_t> backend_link{};
   // A cache's or CDN's hit ratio, resolved once at build (Graph::resolve_hit_ratios), so every
   // later reader (miss steps, backend shares, behaviours, explain) looks it up. Empty for every
   // other node, for one the scenario left without a hit ratio, and for a `che` CDN without a
-  // `keys` size (phase 2b Task 5 gives the CDN one).
+  // `keys` size (explain shows it as unknown; the engine refuses to run it).
   std::optional<ResolvedHitRatio> hit_ratio{};
 };
 
@@ -153,6 +157,13 @@ struct ResolvedNode {
 // model::write_ops_of: a cache's `[write]`, a database's SQL statements, or the scenario's list);
 // every other op is a read. One rule for the graph, the engine's database split and explain.
 [[nodiscard]] bool is_write(const model::NodeSpec& spec, std::string_view op);
+
+// Does the cache or CDN `spec` fetch its own read misses from the node behind it
+// (ResolvedNode::backend), as the same op? A read_through cache does (from its `backend`), and so
+// does every CDN (from its `origin`, plan 2b refinement 4). Then nothing after it may fetch them
+// again (Graph::invalid_miss_step), and a read's miss share goes on to that node
+// (Graph::backend_fraction). False for every other node.
+[[nodiscard]] bool fetches_read_misses(const model::NodeSpec& spec);
 
 // How a SQL database spreads its load over its copies (plan 2b refinement 3; book ch. 1,
 // "database replication" and "sharding"): N = replicas copies per shard, one primary and N − 1
@@ -245,11 +256,12 @@ inline constexpr auto replica_model_table = std::to_array<core::EnumName<Replica
 // hop's flow per request (flow = rate × factor × fraction):
 //   `fraction`, the share of the node's requests that take the hop at all, a probability:
 //   - 1 for an unconditional step;
-//   - 1 - h for an `on: miss` step, h the hit ratio of the cache (or CDN) the nearest
-//     preceding unconditional step, its `lookup`, asked (ch. 1's cache, which the book calls
+//   - 1 - h for an `on: miss` step, h the hit ratio of the cache the nearest preceding
+//     unconditional step, its `lookup`, asked (ch. 1's cache, which the book calls
 //     read-through and the industry cache-aside: only the misses go on to the database). A
-//     cache or CDN with no number (a CDN without a hit ratio, or with `che` but no `keys`
-//     size yet) counts as missing every time, the safe side for a capacity check on paper;
+//     cache with no number (one built in code without a hit ratio) counts as missing every
+//     time, the safe side for a capacity check on paper. (A CDN fetches its own misses from its
+//     origin, so no miss step may follow one: Graph::invalid_miss_step.)
 //   - 0 for an `on: failure` step until external sinks fail (phase 2c);
 //   `factor`, the requests the hop sends per request that takes it: the step's own fan-out
 //   (one post -> 100 feed writes), times the lookup's for an `on: miss` step. A request
@@ -372,7 +384,8 @@ class Graph {
   [[nodiscard]] std::span<const ServiceHop> service_hops(std::size_t node,
                                                          std::string_view op) const;
   // The share of the requests of `op` arriving at cache `node` that the cache passes on to
-  // its backend (plan 2a refinement 7), as the same op:
+  // its backend (plan 2a refinement 7), as the same op (for a CDN: 1 - h of a read, to its
+  // origin, plan 2b refinement 4; it takes no writes):
   //   reads (ops not in write_ops): 1 - h under read_through, else 0 (cache_aside leaves the
   //     misses to the service's `on: miss` step; under the write strategies a read miss is
   //     the application's business too);
@@ -380,8 +393,8 @@ class Graph {
   //     (every write is flushed eventually: an upper bound, no coalescing; the flush is an
   //     asynchronous hop, detail::write_back_flushes), else 0 (cache_aside and read_through:
   //     the service writes the store itself).
-  // 0 for any node that is not a cache with a backend edge. An unknown hit ratio counts as
-  // h = 0 (every read misses), as in service_hops.
+  // 0 for any node that is not a cache with a backend edge or a CDN. An unknown hit ratio counts
+  // as h = 0 (every read misses), as in service_hops.
   [[nodiscard]] double backend_fraction(std::size_t node, std::string_view op) const;
   // The share of the requests of `op` that node `node` has handled which go on to its `then`
   // step `step`: 1 for an unconditional step; for an `on: miss` step after a cache or CDN,
@@ -416,6 +429,9 @@ class Graph {
   Result connect_backends();
   Result connect_backend(std::size_t limiter);
   Result connect_cache_backend(std::size_t cache);
+  Result connect_origin(std::size_t cdn);
+  void attach_store(std::size_t node, std::size_t store, std::size_t link);
+  Result check_reads_only(std::size_t cdn) const;
   Result check_cache_backend_ops(std::size_t cache);
   Result check_cache_backend_calls() const;
   Result route_splitters();
@@ -600,10 +616,12 @@ namespace {
 // write_back (every one; write_back's later and asynchronously), nothing else. Graph::
 // backend_fraction (how much), the key walk (detail::add_backend_hop) and the then-step check
 // below (invalid_then_steps) all ask it.
+// A CDN behaves as a read_through cache here (fetches_read_misses), and no write reaches it
+// (Graph::check_reads_only).
 [[nodiscard]] bool sends_to_store(const model::NodeSpec& cache, std::string_view op) {
   // `using enum` (see replica_model_of): the strategies by their short names.
   using enum model::CacheStrategy;
-  if (!is_write(cache, op)) return cache.strategy == read_through;
+  if (!is_write(cache, op)) return fetches_read_misses(cache);
   return cache.strategy == write_through || cache.strategy == write_around ||
          cache.strategy == write_back;
 }
@@ -634,7 +652,7 @@ namespace {
   const std::string name = "node '" + spec.id + "': ";
   for (const model::Step& step : spec.then) {
     const bool on_miss = step.on == model::StepCondition::miss;
-    if (on_miss && spec.strategy == model::CacheStrategy::read_through) {
+    if (on_miss && fetches_read_misses(spec)) {
       return EngineError{name +
                          "a then step on miss and a read_through backend both fetch the miss"};
     }
@@ -648,6 +666,14 @@ namespace {
   return std::nullopt;
 }
 
+// A fixed hit ratio is a probability (config's read_hit_ratio), for a cache and a CDN alike.
+[[nodiscard]] std::optional<EngineError> invalid_fixed_hit_ratio(const model::NodeSpec& spec) {
+  if (!spec.hit_ratio || !spec.hit_ratio->fixed) return std::nullopt;
+  const double h = *spec.hit_ratio->fixed;
+  if (h >= 0.0 && h <= 1.0) return std::nullopt;
+  return EngineError{"node '" + spec.id + "': hit_ratio.fixed must be between 0 and 1"};
+}
+
 // Graph::build also takes caches written in code, which the loader never checked: a fixed
 // hit ratio is a probability, a strategy in which the cache calls the store needs to know
 // which node that is, and one in which it does not (cache_aside) must not name one: it would
@@ -656,11 +682,7 @@ namespace {
 // must agree with its strategy and its backend (invalid_then_steps).
 [[nodiscard]] std::optional<EngineError> invalid_cache(const model::NodeSpec& spec) {
   const std::string name = "node '" + spec.id + "': ";
-  if (spec.hit_ratio && spec.hit_ratio->fixed) {
-    const double h = *spec.hit_ratio->fixed;
-    if (!(h >= 0.0 && h <= 1.0))
-      return EngineError{name + "hit_ratio.fixed must be between 0 and 1"};
-  }
+  if (auto invalid = invalid_fixed_hit_ratio(spec)) return invalid;
   if (model::needs_backend(spec.strategy) && !spec.backend) {
     return EngineError{name + "strategy " + std::string{model::to_string(spec.strategy)} +
                        " needs a backend"};
@@ -670,6 +692,21 @@ namespace {
                        std::string{model::to_string(spec.strategy)}};
   }
   return invalid_then_steps(spec);
+}
+
+// Graph::build also takes CDNs written in code, which the loader never checked (config's
+// read_cdn_keys): a fixed hit ratio is a probability, and a CDN needs an origin to send its
+// misses to (whether that is a server is connect_origin's check). The loader gives a CDN no
+// `then` steps, and none may be written in code: the CDN fetches its own misses, so a then step
+// on miss would fetch them twice, and an unconditional one has no place in an edge cache's model.
+[[nodiscard]] std::optional<EngineError> invalid_cdn(const model::NodeSpec& spec) {
+  const std::string name = "node '" + spec.id + "': ";
+  if (auto invalid = invalid_fixed_hit_ratio(spec)) return invalid;
+  if (!spec.origin) return EngineError{name + "a cdn needs an origin"};
+  if (!spec.then.empty()) {
+    return EngineError{name + "a cdn has no then steps (it fetches its misses from its origin)"};
+  }
+  return std::nullopt;
 }
 
 // A database answers every query itself and calls nobody (behaviours::SqlDbBehaviour), so a link
@@ -783,6 +820,11 @@ bool is_write(const model::NodeSpec& spec, std::string_view op) {
   return std::ranges::contains(model::write_ops_of(spec), op);
 }
 
+bool fetches_read_misses(const model::NodeSpec& spec) {
+  if (spec.type == model::NodeType::cdn) return true;
+  return is_cache(spec) && spec.strategy == model::CacheStrategy::read_through;
+}
+
 // The table at DatabaseShares. Without replicas the S primaries share reads and writes alike.
 DatabaseShares database_shares(const model::NodeSpec& spec) {
   const double copies_per_shard = spec.replicas;
@@ -885,7 +927,7 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
     const auto& resolved = g.nodes()[node];
     add_hop_steps(g, node, forwarded);
-    if (is_cache(resolved.spec)) {
+    if (hits_or_misses(resolved.spec.type)) {
       add_backend_steps(g, node, forwarded);
       add_then_steps(g, node, forwarded);
     }
@@ -1027,8 +1069,8 @@ namespace detail {
 
 // Does `node` have a hit ratio the graph can resolve now? A cache or CDN with `{fixed: h}` or
 // `che`; not a HitRatio{} built in code (neither set: no hit ratio at all), and not a `che`
-// CDN without a `keys` size, which the scenario schema cannot give a CDN before phase 2b's
-// Task 5 (it stays without a number and misses every time on paper, as before).
+// CDN without a `keys` size: it stays without a number and misses every time on paper (explain
+// says the load behind it is an upper bound), and the engine refuses to run it.
 [[nodiscard]] bool has_resolvable_hit_ratio(const model::NodeSpec& spec) {
   if (!hits_or_misses(spec.type) || !spec.hit_ratio) return false;
   if (!spec.hit_ratio->che) return spec.hit_ratio->fixed.has_value();
@@ -1094,10 +1136,13 @@ void add_op_step_hops(const Graph& g, const model::NodeSpec& spec, std::string_v
 }
 
 // A cache's fetch from its backend (Graph::backend_fraction, whatever h is): a read under
-// read_through carries the cache's misses; a write under a write strategy carries every write.
+// read_through, or at a CDN (from its origin), carries the misses; a write under a write strategy
+// carries every write.
 void add_backend_hop(const ResolvedNode& cache, std::size_t node, std::string_view op,
                      std::vector<KeyHop>& hops) {
-  if (!is_cache(cache.spec) || !cache.backend || !sends_to_store(cache.spec, op)) return;
+  if (!hits_or_misses(cache.spec.type) || !cache.backend || !sends_to_store(cache.spec, op)) {
+    return;
+  }
   const auto misses_of = is_write(cache.spec, op) ? std::nullopt : std::optional{node};
   hops.push_back({.to = *cache.backend, .op = std::string{op}, .misses_of = misses_of});
 }
@@ -1596,6 +1641,9 @@ Graph::Result Graph::resolve_nodes() {
     if (is_cache(spec)) {
       if (auto invalid = invalid_cache(spec)) return std::unexpected{std::move(*invalid)};
     }
+    if (spec.type == model::NodeType::cdn) {
+      if (auto invalid = invalid_cdn(spec)) return std::unexpected{std::move(*invalid)};
+    }
     if (spec.type == model::NodeType::sql_db) {
       if (auto invalid = invalid_database(spec)) return std::unexpected{std::move(*invalid)};
     }
@@ -1716,10 +1764,10 @@ double Graph::hop_fraction(const model::Step& step, std::optional<std::size_t> l
 // Why an `on: miss` step cannot follow `lookup` (the nearest unconditional step before it, or
 // nothing), if it cannot. A miss step needs something that can miss (a cache or a CDN), asked
 // a read (a write updates or invalidates an entry: it has no miss to report), which leaves the
-// miss to the application (a read_through cache has already fetched it from its backend, and a
-// cache or CDN with a `then` step on miss forwards it itself: either way a miss step would fetch
-// it twice), and it must wait for the answer: neither it nor the lookup can be a parallel
-// branch, or the response would time the fetch alongside the lookup instead of after it.
+// miss to the application (a read_through cache has already fetched it from its backend, a CDN
+// from its origin, and a cache with a `then` step on miss forwards it itself: either way a miss
+// step would fetch it twice), and it must wait for the answer: neither it nor the lookup can be a
+// parallel branch, or the response would time the fetch alongside the lookup instead of after it.
 std::optional<EngineError> Graph::invalid_miss_step(std::size_t node, const model::Step& step,
                                                     const ServiceHop* lookup) const {
   const std::string name = "node '" + nodes_[node].spec.id + "': an 'on: miss' step ";
@@ -1732,7 +1780,11 @@ std::optional<EngineError> Graph::invalid_miss_step(std::size_t node, const mode
                        std::string{model::to_string(cache.type)} + " '" + cache.id +
                        "' (writes do not miss)"};
   }
-  if (is_cache(cache) && cache.strategy == model::CacheStrategy::read_through) {
+  if (cache.type == model::NodeType::cdn) {
+    return EngineError{name + "cannot follow cdn '" + cache.id +
+                       "' (the cdn already fetched the miss from its origin)"};
+  }
+  if (fetches_read_misses(cache)) {
     return EngineError{name + "cannot follow read_through cache '" + cache.id +
                        "' (the cache already fetched the miss)"};
   }
@@ -1843,12 +1895,13 @@ std::span<const ServiceHop> Graph::service_hops(std::size_t node, std::string_vi
   return found->second;
 }
 
-// Which ops go to the store is sends_to_store's answer (the strategy dispatch); this adds how
-// many: every write that goes, the misses of a read that goes. CacheBehaviour, the paper load
-// and the call-cycle search all read this share.
+// Which ops go to the store is sends_to_store's answer (the strategy dispatch; a CDN is
+// read_through towards its origin); this adds how many: every write that goes, the misses of a
+// read that goes. CacheBehaviour (and so CdnBehaviour), the paper load and the call-cycle search
+// all read this share.
 double Graph::backend_fraction(std::size_t node, std::string_view op) const {
   const auto& resolved = nodes_.at(node);
-  if (!is_cache(resolved.spec) || !resolved.backend) return 0.0;
+  if (!hits_or_misses(resolved.spec.type) || !resolved.backend) return 0.0;
   if (!sends_to_store(resolved.spec, op)) return 0.0;
   return is_write(resolved.spec, op) ? 1.0 : miss_fraction(node);
 }
@@ -1902,9 +1955,14 @@ Graph::Result Graph::connect_step(std::size_t from, const model::Step& step) {
 // A cache whose strategy has it call the store (model::needs_backend) gets a demand edge to
 // its backend in the same way (connect_cache_backend); a cache_aside cache has none (the
 // service's `on: miss` step does the store read, and invalid_cache refuses a backend on it).
+// A CDN gets one to its origin (connect_origin), which carries its read misses.
 Graph::Result Graph::connect_backends() {
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
     const auto& spec = nodes_[node].spec;
+    if (spec.type == model::NodeType::cdn) {
+      if (auto connected = connect_origin(node); !connected) return connected;
+      continue;
+    }
     if (!spec.backend) continue;
     if (spec.type == model::NodeType::rate_limiter) {
       if (auto connected = connect_backend(node); !connected) return connected;
@@ -1934,9 +1992,49 @@ Graph::Result Graph::connect_cache_backend(std::size_t cache) {
     return std::unexpected{EngineError{"node '" + spec.id + "': backend '" + *spec.backend +
                                        "' needs a link from the cache"}};
   }
-  nodes_[cache].backend = *backend;
-  nodes_[cache].backend_link = *link;
-  add_edge(DemandEdge{.from = cache, .to = *backend, .link = *link});
+  attach_store(cache, *backend, *link);
+  return {};
+}
+
+// A CDN's origin (plan 2b refinement 4) becomes its backend: the read_through hop of a cache,
+// with the same checks and the CDN's own wording (invalid_cdn proved there is an origin; the
+// loader checks the same, config's read_cdn_origin).
+Graph::Result Graph::connect_origin(std::size_t cdn) {
+  const auto& spec = nodes_[cdn].spec;
+  const std::string name = "node '" + spec.id + "': ";
+  const auto origin = index_of(*spec.origin);
+  if (!origin) {
+    return std::unexpected{
+        EngineError{name + "origin refers to unknown node '" + *spec.origin + "'"}};
+  }
+  if (nodes_[*origin].spec.type == model::NodeType::client) {  // see connect_step
+    return std::unexpected{EngineError{name + "origin must not be a client"}};
+  }
+  const auto link = demand_link(cdn, *origin);
+  if (!link) {
+    return std::unexpected{
+        EngineError{name + "origin '" + *spec.origin + "' needs a link from the cdn"}};
+  }
+  attach_store(cdn, *origin, *link);
+  return {};
+}
+
+// The node behind a cache or a CDN, and the demand edge to it.
+void Graph::attach_store(std::size_t node, std::size_t store, std::size_t link) {
+  nodes_[node].backend = store;
+  nodes_[node].backend_link = link;
+  add_edge(DemandEdge{.from = node, .to = store, .link = link});
+}
+
+// A CDN serves static content from the edge and has no write path (book ch. 1: the origin is
+// where content changes), so a write op (model::write_ops_of: `write` unless the node lists its
+// own) that reaches one is a mistake in the scenario, whoever sends it.
+Graph::Result Graph::check_reads_only(std::size_t cdn) const {
+  const auto& spec = nodes_[cdn].spec;
+  for (const auto& op : arriving_ops_[cdn]) {
+    if (!is_write(spec, op)) continue;
+    return std::unexpected{EngineError{"node '" + spec.id + "': a cdn does not take writes"}};
+  }
   return {};
 }
 
@@ -1963,12 +2061,13 @@ Graph::Result Graph::check_cache_backend_ops(std::size_t cache) {
 Graph::Result Graph::check_cache_backend_calls() const {
   for (std::size_t cache = 0; cache < nodes_.size(); ++cache) {
     const auto& resolved = nodes_[cache];
-    if (!is_cache(resolved.spec) || !resolved.backend) continue;
+    if (!hits_or_misses(resolved.spec.type) || !resolved.backend) continue;
     if (resolved.spec.strategy == model::CacheStrategy::write_back) continue;
+    const std::string role = resolved.spec.type == model::NodeType::cdn ? "origin" : "backend";
     for (const auto& op : arriving_ops_[cache]) {
       if (backend_fraction(cache, op) <= 0.0) continue;
       if (!is_async_hop(cache, op, *resolved.backend, op)) continue;
-      return std::unexpected{EngineError{"node '" + resolved.spec.id + "': backend '" +
+      return std::unexpected{EngineError{"node '" + resolved.spec.id + "': " + role + " '" +
                                          nodes_[*resolved.backend].spec.id +
                                          "' closes a call cycle"}};
     }
@@ -2011,14 +2110,18 @@ Graph::Result Graph::route_splitters() {
 }
 
 // What follows from the splits and the resolved hops: which ops reach each node (through any
-// chain of balancers and limiters), and whether every op reaching one can leave it. (What
-// each balancer's policy does to the replicas behind it is marked earlier, right after the
-// splits, because a che cache's capacity depends on it: mark_balanced_targets.)
+// chain of balancers and limiters), whether every op reaching one can leave it, and that no
+// write reaches a CDN. (What each balancer's policy does to the replicas behind it is marked
+// earlier, right after the splits, because a che cache's capacity depends on it:
+// mark_balanced_targets.)
 Graph::Result Graph::check_routed_ops() {
   collect_arriving_ops();
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
-    if (is_cache(nodes_[node].spec)) {
+    if (hits_or_misses(nodes_[node].spec.type)) {
       if (auto checked = check_cache_backend_ops(node); !checked) return checked;
+    }
+    if (nodes_[node].spec.type == model::NodeType::cdn) {
+      if (auto checked = check_reads_only(node); !checked) return checked;
     }
     if (!forwards_by_link(nodes_[node].spec.type)) continue;
     if (auto checked = check_forwarded_ops(node); !checked) return checked;
@@ -2140,8 +2243,8 @@ std::vector<Route> Graph::routes_for(std::size_t node, std::string_view op) cons
 // is not drained (weight 0: no flow takes it), through caches and CDNs, which pass each op they
 // receive on along every `then` step that carries some of THAT op (carries_flow: an `on: miss`
 // step carries the read misses, so a cache that only ever receives writes sends nothing along
-// it), and through caches, which pass an op on to their backend when some of it goes there
-// (backend_fraction). Each pair enters the list once, so a loop ends.
+// it), and through caches and CDNs, which pass an op on to their backend (a CDN's origin) when
+// some of it goes there (backend_fraction). Each pair enters the list once, so a loop ends.
 void Graph::collect_arriving_ops() {
   std::vector<std::set<std::string>> arriving(nodes_.size());
   std::vector<std::pair<std::size_t, std::string>> work;
@@ -2178,7 +2281,7 @@ void Graph::collect_arriving_ops() {
         if (carries_flow(node, step, op)) arrive(*index_of(step.to), step.op);
       }
     }
-    if (is_cache(nodes_[node].spec)) {
+    if (hits_or_misses(nodes_[node].spec.type)) {
       if (backend_fraction(node, op) > 0.0) arrive(*nodes_[node].backend, op);
       continue;
     }

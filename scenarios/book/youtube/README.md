@@ -12,7 +12,11 @@
 - Bytes, not just requests: 50 MB streams and 300 MB uploads against GB/s capacities.
   An upload is split into `upload` (the bytes, straight to `original_store`) and `upload_meta`
   (the presigned-URL request and metadata write, through the API).
-- Two regions with a cross-DC origin fetch (150 ms) for European misses.
+- Two regions with a cross-DC origin fetch (150 ms) for European misses. Each CDN is a
+  read-only cache in front of `transcoded_store`: its hit ratio comes from the Che approximation
+  over the viewers' Zipf(1) popularity of 10M videos and the edge's size in videos (`keys: 100k`
+  in the US, `50k` in the EU), and only the misses reach the origin. The CDNs are sized in bytes
+  (`capacity: 100GB/s`), so the scenario explains but does not run before phase 2c's byte flows.
 - Transcoding as a long-running worker pool (60 s per video, 400 workers → 6.7 videos/s
   ceiling) and the backlog it builds during the evening upload peak.
 - Fan-out of one upload into four output renditions.

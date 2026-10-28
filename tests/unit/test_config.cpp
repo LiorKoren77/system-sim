@@ -3252,3 +3252,12 @@ TEST_CASE("a cdn's hit ratio is fixed or che, and its ttl is accepted") {
     REQUIRE_FALSE(s.nodes[1].hit_ratio.has_value());
   }
 }
+
+// A che hit ratio needs the CDN's size, as a cache's does: `keys` on a cdn is how many objects
+// its edge holds (not bytes: byte flows are phase 2c), the Che approximation's cache size.
+TEST_CASE("a cdn states its size in keys for a che hit ratio") {
+  const auto s =
+      load_cdn("simsys_cdn_keys.yaml", "hit_ratio: che, keys: 100k, ttl: 24h, origin: origin");
+  REQUIRE(s.nodes[1].keys == 100'000);
+  REQUIRE(s.nodes[1].ttl == std::chrono::hours{24});  // read as a cache's ttl, not modelled
+}

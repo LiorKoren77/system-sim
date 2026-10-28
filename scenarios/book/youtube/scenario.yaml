@@ -36,8 +36,10 @@ nodes:
     keys: {zipf: 1.0, space: 10M}
     timeout: 10s
 
-  cdn_us: {type: cdn, dc: us-east, ttl: 24h, hit_ratio: che, origin: transcoded_store, capacity: 100GB/s}
-  cdn_eu: {type: cdn, dc: eu-west, ttl: 24h, hit_ratio: che, origin: transcoded_store, capacity: 50GB/s}
+  # keys = videos held at the edge, objects not bytes (byte flows are phase 2c): 100k × 50 MB ≈ 5 TB
+  # of edge disk in the US, half that in the EU, in proportion to the two capacities.
+  cdn_us: {type: cdn, dc: us-east, ttl: 24h, hit_ratio: che, keys: 100k, origin: transcoded_store, capacity: 100GB/s}
+  cdn_eu: {type: cdn, dc: eu-west, ttl: 24h, hit_ratio: che, keys: 50k, origin: transcoded_store, capacity: 50GB/s}
 
   lb: {type: load_balancer, dc: us-east, policy: round_robin}
 

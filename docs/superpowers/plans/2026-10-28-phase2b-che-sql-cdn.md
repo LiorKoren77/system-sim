@@ -150,7 +150,7 @@ Correct and pinned by the reviewer: the plan numbers (replica 600/s, reads 3.0 m
 ### Task 5: CDN (request-based)
 
 **Files:** model (`origin`), config, graph (origin edge; che via upstream clients; byte capacity → refusal "needs byte flows (phase 2c)"), behaviours (`CdnBehaviour` = a cache with `read_through`-like miss forwarding to `origin`, no write path: writes are an error at build `node 'cdn': a cdn does not take writes`), engine, report, tests. `news-feed`'s `cdn` (fixed 0.95, origin media_store) must explain and the miss flow must reach `media_store` in the paper load.
-- [ ] Commit `nodes: request-based cdn with an origin`
+- [x] Commit `nodes: request-based cdn with an origin`
 
 ---
 

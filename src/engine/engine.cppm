@@ -392,20 +392,44 @@ struct Overloaded : Fs... {
   // the test reads `client` instead of `model::NodeType::client`.
   using enum model::NodeType;
   return type == client || type == service || type == load_balancer || type == rate_limiter ||
-         type == cache || type == sql_db;
+         type == cache || type == sql_db || type == cdn;
 }
 
-// Why a node of a simulated type still cannot run, if it cannot: a cache that a scenario built
-// in code left without a number or `che` for its hit ratio (the loader requires one: the same
-// message). Everything else a cache can say runs: a `che` hit ratio (Graph::build has already
-// turned it into a number, Graph::resolve_hit_ratios), every strategy including write_back (its
-// flush is an asynchronous hop, graph::Graph::is_async_hop) and `then` steps (plan 2b
-// refinement 5, behaviours::CacheBehaviour).
-[[nodiscard]] std::optional<std::string> not_runnable_yet(const model::NodeSpec& spec) {
-  if (spec.type != model::NodeType::cache) return std::nullopt;
+// Why a cache cannot run, if it cannot: a scenario built in code left it without a number or
+// `che` for its hit ratio (the loader requires one: the same message). Everything else a cache
+// can say runs: a `che` hit ratio (Graph::build has already turned it into a number,
+// Graph::resolve_hit_ratios), every strategy including write_back (its flush is an asynchronous
+// hop, graph::Graph::is_async_hop) and `then` steps (plan 2b refinement 5,
+// behaviours::CacheBehaviour).
+[[nodiscard]] std::optional<std::string> cache_not_runnable(const model::NodeSpec& spec) {
   const bool has_number = spec.hit_ratio && spec.hit_ratio->fixed;
   const bool is_che = spec.hit_ratio && spec.hit_ratio->che;
   if (!has_number && !is_che) return "node '" + spec.id + "': cache needs a hit_ratio";
+  return std::nullopt;
+}
+
+// Why a CDN cannot run, if it cannot (plan 2b refinement 4):
+//  - a byte capacity (`capacity: 100GB/s`): what a CDN's bandwidth limits is bytes, and the
+//    engine moves requests until phase 2c's byte flows (each op's size, a link's bandwidth);
+//    turning the bytes into requests at an assumed object size would invent the very number the
+//    scenario is about;
+//  - a `che` hit ratio without a `keys` size: Graph::build leaves it without a number, and
+//    running it as h = 0 would silently replace the scenario's Che approximation by "every read
+//    misses" (explain shows that bound and says so; a run could not).
+// A CDN with no hit ratio at all runs: it misses every read, as the scenario says.
+[[nodiscard]] std::optional<std::string> cdn_not_runnable(const model::NodeSpec& spec) {
+  const std::string name = "node '" + spec.id + "': ";
+  if (spec.byte_capacity) return name + "a cdn with a byte capacity needs byte flows (phase 2c)";
+  if (spec.hit_ratio && spec.hit_ratio->che && !spec.keys) {
+    return name + "hit_ratio che needs keys (the cdn's size in objects)";
+  }
+  return std::nullopt;
+}
+
+// Why a node of a simulated type still cannot run, if it cannot (the two cases above).
+[[nodiscard]] std::optional<std::string> not_runnable_yet(const model::NodeSpec& spec) {
+  if (spec.type == model::NodeType::cache) return cache_not_runnable(spec);
+  if (spec.type == model::NodeType::cdn) return cdn_not_runnable(spec);
   return std::nullopt;
 }
 
@@ -632,6 +656,10 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
     // numbers); the store behind it, if its strategy calls one, is a node of its own.
     case model::NodeType::cache:
       return make_server(behaviours::CacheBehaviour{g, index}, resolved);
+    // A CDN's queue is the edge serving an object (the type's 100k/s, 10 ms, or the scenario's
+    // numbers); its origin is a node of its own, reached on a miss.
+    case model::NodeType::cdn:
+      return make_server(behaviours::CdnBehaviour{g, index}, resolved);
     // A database's queues are its primaries and its replicas (make_database), whatever a
     // balancer in front of it does.
     case model::NodeType::sql_db:

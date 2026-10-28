@@ -100,7 +100,7 @@ struct OwnKeys {
 // `then` (steps after processing) to the five types the schema lists for it.
 constexpr std::array<OwnKeys, model::node_type_names.size()> own_keys_by_type{{
     {model::NodeType::client, "rate ops keys sizes timeout retries"},
-    {model::NodeType::cdn, "ttl hit_ratio origin"},
+    {model::NodeType::cdn, "ttl hit_ratio origin keys"},
     {model::NodeType::load_balancer, "policy vnodes"},
     {model::NodeType::rate_limiter, "algorithm limit burst window backend"},
     {model::NodeType::service, "ops cost"},
@@ -2270,12 +2270,41 @@ CheckResult read_sql_keys(const Site& site, const YAML::Node& body, model::NodeS
       .and_then([&] { return read_write_ops(this_node, body, node); });
 }
 
-// A CDN (ch. 1: a cache at the network's edge) may state its hit ratio in the cache's own
-// grammar, `{fixed: h}` or `che`; a service's `on: miss` step after it uses the number
-// (graph::Graph::hit_ratio). Optional: a CDN without one counts as missing every time.
-CheckResult read_cdn_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
-  if (node.type != model::NodeType::cdn || !body["hit_ratio"]) return {};
-  return read_hit_ratio(node_site(site, node.id), body, node);
+// ---- CDN keys (plan 2b refinement 4) ----
+//
+// A CDN (ch. 1: a cache at the network's edge) is a read-only cache in front of its `origin`:
+// it answers the hits and fetches the misses from the origin as the same op.
+
+// `origin: media_store`, required: the node the CDN fetches its misses from. read_node_routing
+// has already checked that it exists; it must also be a server, since a client only sends.
+CheckResult read_cdn_origin(const Site& site, const YAML::Node& body, model::NodeSpec& node,
+                            const Declarations& declared) {
+  const auto value = body["origin"];
+  if (!value) return site.fail(body, "a cdn needs an origin");
+  const auto id = scalar_text(value);
+  const auto& target = declared.nodes[declared.ids.find(id)->second];
+  if (target.type == model::NodeType::client) {
+    return site.fail(value, "origin must not be a client");
+  }
+  node.origin = id;
+  return {};
+}
+
+// The hit ratio in the cache's own grammar, `{fixed: h}` or `che`; optional: a CDN without
+// one misses every read (h = 0, graph::Graph::backend_fraction). `keys: 100k` is its size in
+// objects, which a `che` hit ratio needs (read_cache_size). `ttl` is read as a cache's is
+// (positive), printed by explain and not modelled.
+CheckResult read_cdn_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node,
+                          const Declarations& declared) {
+  if (node.type != model::NodeType::cdn) return {};
+  const auto this_node = node_site(site, node.id);
+  return read_cdn_origin(this_node, body, node, declared)
+      .and_then([&]() -> CheckResult {
+        if (!body["hit_ratio"]) return {};
+        return read_hit_ratio(this_node, body, node);
+      })
+      .and_then([&] { return read_cache_size(this_node, body, node); })
+      .and_then([&] { return read_cache_ttl(this_node, body, node); });
 }
 
 // ---- Node bodies: the second pass -----------------------------------------------------
@@ -2323,7 +2352,7 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
     if (auto read = read_limiter_keys(site, entry.second, *node, declared); !read) return read;
     if (auto read = read_cache_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_sql_keys(site, entry.second, *node); !read) return read;
-    if (auto read = read_cdn_keys(site, entry.second, *node); !read) return read;
+    if (auto read = read_cdn_keys(site, entry.second, *node, declared); !read) return read;
     ++node;
   }
   return {};

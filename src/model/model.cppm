@@ -378,7 +378,7 @@ struct NodeSpec {
   std::string dc{"main"};
   int replicas{1};
   std::optional<Rate> capacity{};           // per replica; absent -> type default
-  std::optional<ByteRate> byte_capacity{};  // blob stores (phase 2 uses it)
+  std::optional<ByteRate> byte_capacity{};  // blob stores, CDNs (byte flows: phase 2c)
   std::optional<SimTime> latency{};         // service time; absent -> type default
   Advanced advanced{};
   std::map<std::string, std::vector<Step>> ops{};  // incoming op -> steps (service, ws_gateway)
@@ -419,7 +419,7 @@ struct NodeSpec {
   // read), and the sizing keys the Che approximation reads: `keys` (how many entries
   // fit), `eviction` (lru, lfu, fifo or ttl) and `ttl`. A `backend` on a cache names the store the
   // cache itself calls (read_through, write_through, write_around, write_back); a CDN reads
-  // `hit_ratio` too (its `on: miss` steps use it).
+  // `hit_ratio`, `keys` and `ttl` too, and `write_ops` when built in code (see `origin` below).
   // `write_ops` (caches and SQL databases): absent means the TYPE's default, present means
   // exactly the list the scenario wrote; the loader stores it as written and every reader asks
   // write_ops_of. An optional rather than a vector pre-filled with a default, because the two
@@ -431,6 +431,11 @@ struct NodeSpec {
   std::optional<std::int64_t> keys{};
   std::optional<std::string> eviction{};
   std::optional<SimTime> ttl{};
+  // CDNs only (plan 2b refinement 4; declared after the cache keys, for designated
+  // initializers): the node a CDN fetches its misses from, as the same op (book ch. 1: an edge
+  // that does not have a file asks the origin server for it). Required: the loader and
+  // graph::Graph::build refuse a CDN without one, and one that names a client.
+  std::optional<std::string> origin{};
   // SQL databases only (plan 2b refinement 3; declared after the cache keys, for designated
   // initializers). `replicas` is the primary plus `replicas - 1` read replicas (book ch. 1,
   // "database replication"); `shards` splits the data over that many such sets (ch. 1,
