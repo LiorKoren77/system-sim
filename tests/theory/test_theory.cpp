@@ -84,7 +84,7 @@ TEST_CASE("dropped flow does not propagate downstream", "[theory]") {
              NodeSpec{.id = "a", .type = NodeType::service, .capacity = Rate{1000}, .latency = 1ms,
                       .advanced = {.queue_limit = 1e-9},
                       .ops = {{"op", {simsys::model::Step{.to = "b", .op = "op"}}}}},
-             NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{10000}, .latency = 0.1ms}};
+             NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{10000}, .latency = 100us}};
   s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s}, LinkSpec{.from = "a", .to = "b", .latency = 0s}};
   const auto g = *simsys::graph::Graph::build(s);
   const auto r = (*Simulation::create(g)).step(0s, 100ms);
