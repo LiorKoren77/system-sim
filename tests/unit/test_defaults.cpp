@@ -50,6 +50,9 @@ TEST_CASE("the web tier default is 2k/s with 1 ms service (spec table)", "[defau
 }
 
 TEST_CASE("a scenario capacity wins over the type default and says so", "[defaults]") {
+  // C++20 designated initializers: `.id = ...` names each member being set, in declaration
+  // order, and leaves the rest at their defaults. Replaces positional braces, which break
+  // silently when members are reordered, and setting field after field on a default object.
   const NodeSpec n{.id = "db", .type = NodeType::sql_db, .capacity = Rate{8000}};
   const auto r = simsys::defaults::resolve_service_rate(n);
   REQUIRE(r.value == Rate{8000});
@@ -103,6 +106,18 @@ TEST_CASE("a defaulted node is one consistent machine: concurrency = service rat
     REQUIRE(c.concurrency ==
             std::max(1, static_cast<int>(std::ceil(c.service_rate.per_second * c.service_time_s))));
   }
+}
+
+// Erlang C costs O(c) per node per step, so c is capped: a node of 100M/s with 1 h service
+// time would otherwise imply 3.6e11 servers, a number no int holds (casting it is UB).
+TEST_CASE("implied concurrency is capped at max_concurrency before it becomes an int",
+          "[defaults]") {
+  STATIC_REQUIRE(simsys::defaults::max_concurrency == 100'000);
+  REQUIRE(simsys::defaults::implied_concurrency(Rate{100e6}, 1h) == 100'000);
+  const auto c = simsys::defaults::resolve_capacity(
+      NodeSpec{.id = "n", .type = NodeType::service, .capacity = Rate{100e6}, .latency = 1h});
+  REQUIRE(c.concurrency == simsys::defaults::max_concurrency);
+  REQUIRE(simsys::defaults::implied_concurrency(Rate{1000}, 1ms) == 1);  // below the cap: unchanged
 }
 
 TEST_CASE("external sinks default to the third-party API latency with variability 2",

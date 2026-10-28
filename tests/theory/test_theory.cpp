@@ -86,12 +86,27 @@ TEST_CASE("one step of an M/M/1 node reproduces rho/(mu - lambda) + service time
   const auto& node = r.nodes[*g.index_of("s")];
   REQUIRE(node.demand_per_s == Approx(500));
   REQUIRE(node.rho == Approx(0.5));
-  REQUIRE(node.latency.mean_s == Approx(0.002));
+  REQUIRE_THAT(node.latency.mean_s, WithinRel(0.002, 1e-12));
   REQUIRE(r.responses.size() == 1);
   REQUIRE(r.responses[0].client == *g.index_of("c"));
   REQUIRE(r.responses[0].op == "op");
   REQUIRE(r.responses[0].offered == Rate{500});
-  REQUIRE(r.responses[0].response.mean_s == Approx(0.002));  // zero-latency link
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(0.002, 1e-12));  // zero-latency link
+}
+
+// Little's law, L = lambda * W: the mean number of requests in a stable system equals the
+// arrival rate times the mean time each spends in it, whatever the distributions. For an
+// M/M/1 queue (Poisson arrivals, exponential service, one server) the mean number in
+// system is L = rho / (1 - rho), which is 1 at rho = 0.5. The engine's sojourn time W
+// (latency.mean_s, wait plus service) times the demand lambda must therefore give 1. The
+// fluid backlog is not L: below capacity it is 0, the stochastic queue lives in W alone.
+TEST_CASE("Little's law holds for the stochastic term: demand x mean latency = rho / (1 - rho)",
+          "[theory]") {
+  const auto g = *simsys::graph::Graph::build(mm1(500));  // rho = 500 / 1000 = 0.5
+  const auto r = (*Simulation::create(g)).step(0s, 100ms);
+  const auto& node = r.nodes[*g.index_of("s")];
+  const double rho = 0.5;
+  REQUIRE_THAT(node.demand_per_s * node.latency.mean_s, WithinRel(rho / (1.0 - rho), 1e-9));
 }
 
 TEST_CASE("a client's node sample is a source: no demand, no queue, green", "[theory]") {
@@ -261,8 +276,9 @@ TEST_CASE("replicas split the demand: four copies at 1k/s each see rho 0.5 from 
   s.nodes[1].replicas = 4;
   const auto r = (*Simulation::create(*simsys::graph::Graph::build(s))).step(0s, 100ms);
   REQUIRE(r.nodes[1].rho == Approx(0.5));
-  REQUIRE(r.nodes[1].drain_per_s == Approx(2000));      // summed over copies
-  REQUIRE(r.nodes[1].latency.mean_s == Approx(0.002));  // each copy is the M/M/1 at rho 0.5
+  REQUIRE(r.nodes[1].drain_per_s == Approx(2000));  // summed over copies
+  // Each copy is the M/M/1 at rho 0.5: 1 ms service plus rho / (mu - lambda) = 1 ms wait.
+  REQUIRE_THAT(r.nodes[1].latency.mean_s, WithinRel(0.002, 1e-12));
 }
 
 TEST_CASE("a cross-datacenter link delays demand by its delay steps", "[theory]") {

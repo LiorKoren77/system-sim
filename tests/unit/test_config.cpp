@@ -388,7 +388,7 @@ version: 1
 name: t
 duration: 1m
 step: 100ms
-warmup: 2m
+warmup: 30s
 nodes:
   users: {type: client, rate: {base: 1/s}, ops: {x: 1}}
   api: {type: service, capacity: 1k/s, latency: 0.5ms}
@@ -398,6 +398,34 @@ links:
   const auto s = simsys::config::load(path.string());
   INFO((s ? "" : s.error().message));
   REQUIRE(s.has_value());
+}
+
+// A run reports only the steps after warmup. With nothing left to observe, every SLO would
+// "pass" on no data, so the loader refuses such a window before anything runs.
+TEST_CASE("the observation window is never empty: duration positive, warmup shorter") {
+  SECTION("a zero duration") {
+    require_rejected("simsys_zero_duration.yaml", R"(
+version: 1
+name: t
+duration: 0s
+nodes:
+  api: {type: service, capacity: 1k/s}
+links: []
+)",
+                     "duration must be positive");
+  }
+  SECTION("a warmup as long as the duration") {
+    require_rejected("simsys_warmup_too_long.yaml", R"(
+version: 1
+name: t
+duration: 1m
+warmup: 60s
+nodes:
+  api: {type: service, capacity: 1k/s}
+links: []
+)",
+                     "warmup must be shorter than duration");
+  }
 }
 
 TEST_CASE("a node id declared twice is rejected") {
@@ -2156,4 +2184,85 @@ nodes:
 links: []
 )",
                       "datacenters must not be empty", 5);
+}
+
+TEST_CASE("utilization needs a server node, and op is only for latency metrics") {
+  const auto with_slo = [](std::string_view entry) {
+    return scenario_with(
+        "  u: {type: client, rate: {base: 1/s}, ops: {a: 1}}\n"
+        "  s: {type: service}\n",
+        "links: []\nslo: [" + std::string{entry} + "]\n");
+  };
+  SECTION("utilization without a node: whose busy fraction?") {
+    require_rejected("simsys_slo_utilization_no_node.yaml",
+                     with_slo("{metric: utilization, max: 0.5}"), "slo: utilization needs a node");
+  }
+  SECTION("utilization of a client, a source that is never busy") {
+    require_rejected("simsys_slo_utilization_client.yaml",
+                     with_slo("{metric: utilization, node: u, max: 0.5}"),
+                     "slo: utilization needs a server node, 'u' is a client");
+  }
+  SECTION("op on utilization") {
+    require_rejected("simsys_slo_utilization_op.yaml",
+                     with_slo("{metric: utilization, node: s, op: a, max: 0.5}"),
+                     "slo: op is only valid for latency metrics");
+  }
+  SECTION("op on drop_rate") {
+    require_rejected("simsys_slo_drop_rate_op.yaml",
+                     with_slo("{metric: drop_rate, node: s, op: a, max: 0.1}"),
+                     "slo: op is only valid for latency metrics");
+  }
+  SECTION("drop_rate of one node, utilization of a server") {
+    require_loaded("simsys_slo_node_ratios.yaml",
+                   with_slo("{metric: drop_rate, node: s, max: 0.1}, "
+                            "{metric: utilization, node: s, max: 0.5}"));
+  }
+}
+
+// Every bound keeps user input inside what the engine's arithmetic handles: past them a
+// rate overflows to infinity, which the engine treats as a programmer error and aborts on.
+TEST_CASE("concurrency, step factors, rates and capacities have upper bounds") {
+  SECTION("concurrency above 100000: Erlang C costs O(c) per node per step") {
+    require_rejected("simsys_concurrency_too_big.yaml",
+                     scenario_with("  a: {type: service, advanced: {concurrency: 100001}}\n"),
+                     "node 'a': advanced.concurrency must be at most 100000");
+  }
+  SECTION("concurrency of exactly 100000") {
+    require_loaded("simsys_concurrency_max.yaml",
+                   scenario_with("  a: {type: service, advanced: {concurrency: 100000}}\n"));
+  }
+  SECTION("a step factor above 1e6") {
+    require_rejected("simsys_step_factor_too_big.yaml",
+                     scenario_with("  a: {type: service, ops: {x: [{to: b, factor: 1e7}]}}\n"
+                                   "  b: {type: service}\n"),
+                     "node 'a': step factor must be at most 1e6");
+  }
+  SECTION("a step factor of 1e307, which would overflow the first rate it multiplies") {
+    require_rejected("simsys_step_factor_huge.yaml",
+                     scenario_with("  a: {type: service, ops: {x: [{to: b, factor: 1e307}]}}\n"
+                                   "  b: {type: service}\n"),
+                     "node 'a': step factor must be at most 1e6");
+  }
+  SECTION("a capacity above 1e15/s") {
+    require_rejected("simsys_capacity_too_big.yaml",
+                     scenario_with("  a: {type: service, capacity: 2e15/s}\n"),
+                     "node 'a': capacity must be at most 1e15/s");
+  }
+  SECTION("a byte capacity above 1e15B/s") {
+    require_rejected("simsys_byte_capacity_too_big.yaml",
+                     scenario_with("  b: {type: blob_store, capacity: 2e15B/s}\n"),
+                     "node 'b': capacity must be at most 1e15B/s");
+  }
+  SECTION("a client rate above 1e15/s") {
+    require_rejected("simsys_rate_too_big.yaml",
+                     scenario_with("  u: {type: client, rate: {base: 2e15/s}, ops: {a: 1}}\n"),
+                     "node 'u': rate.base must be at most 1e15/s");
+  }
+  SECTION("the bounds themselves load") {
+    require_loaded("simsys_bounds_max.yaml",
+                   scenario_with("  u: {type: client, rate: {base: 1e15/s}, ops: {a: 1}}\n"
+                                 "  a: {type: service, capacity: 1e15/s, "
+                                 "ops: {x: [{to: b, factor: 1e6}]}}\n"
+                                 "  b: {type: blob_store, capacity: 1e15B/s}\n"));
+  }
 }
