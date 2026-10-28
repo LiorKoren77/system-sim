@@ -20,6 +20,17 @@
 6. **Feedback edges** (chat: `chat_servers → message_q → sync_workers → chat_servers`; crawler: `frontier → ... → url_seen → frontier`) are detected as DFS back edges and always go through a delay line of at least one step, i.e. "cycles use the previous step's value" (§3.1).
 7. **`run` and `estimate` support only `client` and `service` nodes in Phase 1**; `explain` works for every type. Running a scenario with another type fails with a clear "not supported until phase 2" error. Rate curves other than `base` (`wave`, `spikes`, `ramp`, `points`, `noise`) are accepted by the loader and ignored by the Phase 1 workload; `explain` says so.
 8. Added node key `advanced.burstiness` (arrival SCV for Kingman, default 1.0) to the schema.
+9. **Wait blend (from the fluid review):** `wait = max(backlog/cap, k·Wq(c, min(rho, 0.99), s))`, not the sum. By Little's law the M/M/1 wait at rho 0.99 corresponds to ~99 queued requests; once the fluid backlog exceeds that, the stochastic queue *is* the backlog. Summing overstated early-overload latency by 50–98 % at 100 ms steps. Variance comes from whichever term wins (0 for the deterministic fluid term) plus the service variance.
+10. **Utilization is the busy fraction `drain/cap`**, not `demand/cap`: equal whenever the backlog is empty, and a node draining a backlog at full speed is red, not green.
+11. **`parallel_max` is optimistic**, not pessimistic: E[max] ≥ max E[Xᵢ], and a `factor: 100` step counts as one branch (no tail amplification, cf. Dean & Barroso, *The Tail at Scale*). The exact alternative for n iid branches, quantile_max(p) = quantile_single(p^(1/n)), is recorded for a later phase (it needs an inverse normal CDF).
+
+**Lessons for implementers (found in Part A reviews):**
+- Catch2 `Approx(x).margin(m)` never tightens below the default relative epsilon (~1.19e-5); tight checks use `REQUIRE_THAT(v, WithinRel(e, 1e-12))` / `WithinAbs`.
+- `std::chrono` operators (`/`, `<=`, `zero()`) are not reachable from an interface that does not include `<chrono>` (GMF declarations are only reachable when the interface used them); write `rtt.count() / 2`, `dt.count() <= 0`.
+- A translation unit iterating `Flow::entries()` must `#include <span>` itself on GCC 14.
+- `Flow::add`/`scale` throw `std::invalid_argument` on negative or non-finite values; `FluidQueue::advance` throws on `dt <= 0`; `erlang_c`/`mmc_wait` throw on `servers < 1`. These are programmer errors; config validation keeps user input out.
+- `FluidQueue` reports `inf` latency for a zero-capacity node: the engine must never multiply a latency by a zero weight (skip zero-flow branches), and reports print `inf` as "unavailable".
+- Later optimisation, not now: intern op names to an integer `OpId` at load time and index flows by it.
 
 ---
 
