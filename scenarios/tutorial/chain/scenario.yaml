@@ -1,0 +1,24 @@
+# Tutorial 2: a request that fans out. Clients call an API tier, which calls a database
+# once for every read and twice for every write (sequential steps: the latencies add).
+version: 1
+name: chain
+duration: 2m
+warmup: 10s
+nodes:
+  users: {type: client, rate: {base: 1.5k/s}, ops: {read: 0.8, write: 0.2}, timeout: 1s}
+  api:
+    type: service
+    replicas: 2
+    capacity: 1k/s
+    latency: 0.5ms
+    ops:
+      read:  [{to: db, op: select}]
+      write: [{to: db, op: select}, {to: db, op: insert}]
+  db: {type: service, capacity: 5k/s, latency: 2ms, advanced: {queue_limit: 500}}
+links:
+  - {from: users, to: api, dir: inout}
+  - {from: api, to: db, dir: inout}
+slo:
+  - {metric: p99_latency, node: users, op: read, max: 20ms}
+  - {metric: p99_latency, node: users, op: write, max: 40ms}
+  - {metric: drop_rate, max: 0}
