@@ -18,6 +18,7 @@ module;
 #include <ostream>
 #include <ranges>
 #include <span>  // GCC 14: this unit iterates Graph's spans itself
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -328,8 +329,8 @@ struct Overloaded : Fs... {
       return worst_latency(ops, slo, &OpSummary::p95_s);
     case p99_latency:
       return worst_latency(ops, slo, &OpSummary::p99_s);
-    case drop_rate:
-      return summary.drop_rate();
+    case drop_rate:  // the named node's, else the worst node's
+      return slo.node ? summary.drop_rate(*slo.node) : summary.drop_rate();
     case utilization:
       return mean_utilization(nodes, slo);
     case queue_lag:  // consumer lag of a message queue: phase 2
@@ -339,13 +340,22 @@ struct Overloaded : Fs... {
   std::unreachable();
 }
 
+// An SLO with nothing observed: phase 1 does not model the metric, or no step was observed.
+[[nodiscard]] SloResult skipped(const model::SloSpec& slo) {
+  // C++20 designated initializers: name the fields being set, so `observed` and `status`
+  // cannot be swapped unnoticed; a field left out keeps its default member initializer.
+  // Replaces positional braces, which say nothing about which value is which.
+  return SloResult{.slo = slo, .observed = std::nullopt, .status = SloStatus::skipped};
+}
+
 // A metric passes when it is at most its limit. An infinite latency (a node that never
-// answers) and NaN both fail.
+// answers) and NaN both fail. No data is an error, not a pass: with no observed step every
+// average would be a 0 that passes any limit, so nothing is evaluated (the CLI exits 1).
 [[nodiscard]] SloResult evaluate_slo(const Summary& summary, std::span<const NodeSummary> nodes,
                                      std::span<const OpSummary> ops, const model::SloSpec& slo) {
+  if (summary.observed_steps() == 0) return skipped(slo);
   const auto observed = observe_metric(summary, nodes, ops, slo);
-  if (!observed)
-    return SloResult{.slo = slo, .observed = std::nullopt, .status = SloStatus::skipped};
+  if (!observed) return skipped(slo);
   const bool within = *observed <= limit_value(slo.max);
   return SloResult{
       .slo = slo, .observed = observed, .status = within ? SloStatus::pass : SloStatus::fail};
@@ -364,10 +374,14 @@ struct Overloaded : Fs... {
                     max);
 }
 
+// The drop rate shown is the worst node's, named when some node dropped anything.
 [[nodiscard]] std::string table_header(const Summary& summary) {
-  return "scenario " + std::string{summary.scenario_name()} + "  " +
-         std::to_string(summary.observed_steps()) + " steps observed  drop rate " +
-         percent(summary.drop_rate()) + "\n";
+  const std::string head = "scenario " + std::string{summary.scenario_name()} + "  ";
+  if (summary.observed_steps() == 0) return head + "0 steps observed: nothing to evaluate\n";
+  const auto worst = summary.worst_drop_node();
+  return head + std::to_string(summary.observed_steps()) + " steps observed  drop rate " +
+         percent(summary.drop_rate()) +
+         (worst.empty() ? std::string{} : " (worst: " + std::string{worst} + ")") + "\n";
 }
 
 // Clients are sources with no queue: their queue columns show "-". The rho cells are
@@ -687,27 +701,32 @@ void forward_steps(const graph::Graph& g, std::size_t from, std::vector<OpLoad>&
   }
 }
 
-// The paper calculation (System Design Interview ch. 2, back-of-the-envelope QPS): the
-// offered load at every node, propagated from the clients through route shares and step
-// factors in topological order. No queueing, no drops, no delays: it is what a student
-// would do by hand, and what the long-run estimate shows below saturation. Feedback flow
-// needs one more pass per feedback link, as engine::Simulation::estimate does.
-[[nodiscard]] std::vector<double> paper_load(const graph::Graph& g) {
-  const auto offered = client_load(g);
-  // C++20 std::ranges::count_if with a member pointer as the predicate: std::invoke
-  // reads the `feedback` flag of each link, no lambda needed.
-  const auto passes = 1 + std::ranges::count_if(g.links(), &graph::ResolvedLink::feedback);
-  std::vector<OpLoad> fed_back(g.nodes().size());
-  std::vector<OpLoad> load;
-  for (std::ptrdiff_t pass = 0; pass < passes; ++pass) {
-    load = offered;
-    for (std::size_t i = 0; i < load.size(); ++i) {
-      for (const auto& [op, rate] : fed_back[i]) load[i][op] += rate;
-    }
-    std::vector<OpLoad> next_fed_back(g.nodes().size());
-    for (const auto index : g.topological_order()) forward_steps(g, index, load, next_fed_back);
-    fed_back = std::move(next_fed_back);
+// The paper load's stopping rule, the same as engine::Simulation::estimate's (whose
+// constants are internal to the engine, so the numbers are restated here): stop when no
+// node's total moved by more than 1e-12 of its value (a few thousand ulps of a double, as
+// close to "equal" as rounding allows), or give up after 100'000 passes.
+constexpr double paper_tolerance = 1e-12;
+constexpr int max_paper_passes = 100'000;
+
+// The offered load at every node, and whether the passes reached a fixed point.
+struct PaperLoad {
+  std::vector<double> totals;
+  bool converged{};
+};
+
+// One pass: what the clients send plus what the feedback links carried in the previous
+// pass (`fed_back`, replaced by this pass's), pushed through every node in topological
+// order. Returns the total offered rate per node.
+[[nodiscard]] std::vector<double> paper_pass(const graph::Graph& g,
+                                             const std::vector<OpLoad>& offered,
+                                             std::vector<OpLoad>& fed_back) {
+  auto load = offered;
+  for (std::size_t i = 0; i < load.size(); ++i) {
+    for (const auto& [op, rate] : fed_back[i]) load[i][op] += rate;
   }
+  std::vector<OpLoad> next_fed_back(g.nodes().size());
+  for (const auto index : g.topological_order()) forward_steps(g, index, load, next_fed_back);
+  fed_back = std::move(next_fed_back);
   std::vector<double> totals;
   for (const auto& ops : load) {
     // C++23 std::ranges::fold_left over C++20 std::views::values: sum the rates of a map
@@ -715,6 +734,41 @@ void forward_steps(const graph::Graph& g, std::size_t from, std::vector<OpLoad>&
     totals.push_back(std::ranges::fold_left(ops | std::views::values, 0.0, std::plus<>{}));
   }
   return totals;
+}
+
+// No total moved by more than the tolerance (NaN never counts as unchanged).
+[[nodiscard]] bool settled(std::span<const double> before, std::span<const double> after) {
+  return std::ranges::all_of(std::views::zip(before, after), [](const auto& pair) {
+    const auto [b, a] = pair;
+    return a == b || std::abs(a - b) <= paper_tolerance * std::abs(a);
+  });
+}
+
+[[nodiscard]] bool all_finite(std::span<const double> totals) {
+  return std::ranges::all_of(totals, [](double t) { return std::isfinite(t); });
+}
+
+// The paper calculation (System Design Interview ch. 2, back-of-the-envelope QPS): the
+// offered load at every node, propagated from the clients through route shares and step
+// factors in topological order. No queueing, no drops, no delays: it is what a student
+// would do by hand, and what the long-run estimate shows below saturation.
+// A feedback loop is solved by fixed-point iteration: each pass carries the loop's flow
+// one lap further, so a loop of gain g (the fraction of its flow it sends round again)
+// approaches input / (1 - g), the geometric series' sum, after about
+// log(tolerance) / log(g) passes (40 for g = 0.5). A loop of gain >= 1 has no fixed point:
+// its totals grow until the pass cap or until they overflow; either way the last finite
+// pass is returned, unconverged. Unlike estimate, nothing caps a node at its capacity here.
+[[nodiscard]] PaperLoad paper_load(const graph::Graph& g) {
+  const auto offered = client_load(g);
+  std::vector<OpLoad> fed_back(g.nodes().size());
+  auto totals = paper_pass(g, offered, fed_back);
+  for (int pass = 1; pass < max_paper_passes; ++pass) {
+    auto next = paper_pass(g, offered, fed_back);
+    if (!all_finite(next)) return {.totals = std::move(totals), .converged = false};
+    if (settled(totals, next)) return {.totals = std::move(next), .converged = true};
+    totals = std::move(next);
+  }
+  return {.totals = std::move(totals), .converged = false};
 }
 
 // Utilization at the paper load: offered / (capacity per replica × replicas), with the
@@ -735,15 +789,17 @@ void forward_steps(const graph::Graph& g, std::size_t from, std::vector<OpLoad>&
   for (std::size_t i = 0; i < g.nodes().size(); ++i) {
     const auto& node = g.nodes()[i];
     if (node.spec.type == model::NodeType::client) continue;  // a source: see its offered=
-    rows.push_back({{node.spec.id}, {check_details(node, load[i])}});
+    rows.push_back({{node.spec.id}, {check_details(node, load.totals[i])}});
   }
-  return "checks:\n" + aligned(rows, Align::all_left);
+  const std::string note = load.converged ? "" : "  (no steady state: a loop of gain >= 1)\n";
+  return "checks:\n" + aligned(rows, Align::all_left) + note;
 }
 
 // ---- CSV ----
 
-[[nodiscard]] std::string csv_row(double t_s, const std::string& id, const engine::NodeSample& n) {
-  const std::array fields{to_text(t_s, std::chars_format::fixed, 3),
+[[nodiscard]] std::string csv_server_row(const std::string& t_s, const std::string& id,
+                                         const engine::NodeSample& n) {
+  const std::array fields{t_s,
                           id,
                           num(n.rho, 6),
                           num(n.backlog, 6),
@@ -751,6 +807,11 @@ void forward_steps(const graph::Graph& g, std::size_t from, std::vector<OpLoad>&
                           num(n.latency.mean_s * 1000.0, 6),
                           std::string{zone_name(n.zone)}};
   return join(fields, ",") + "\n";
+}
+
+// A client is a source: no queue, so zeros where a server has numbers and zone `none`.
+[[nodiscard]] std::string csv_client_row(const std::string& t_s, const std::string& id) {
+  return t_s + "," + id + ",0,0,0,0,none\n";
 }
 
 }  // namespace
@@ -768,6 +829,7 @@ void Summary::Moments::add(double w, double mean_s, double variance_s2) {
 
 void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
   rho_time += sample.rho * dt_s;
+  demand += sample.demand_per_s * dt_s;
   peak_rho = std::max(peak_rho, sample.rho);
   peak_backlog = std::max(peak_backlog, sample.backlog);
   dropped += sample.dropped_per_s * dt_s;
@@ -798,8 +860,6 @@ Summary::Summary(const graph::Graph& g, SimTime warmup)
     std::vector<std::string> ops;
     for (const auto& [op, share] : workload->op_shares) ops.push_back(op);
     std::ranges::sort(ops);
-    // C++20 designated initializers: name the fields being set; the rest keep their
-    // default member initializers.
     for (auto& op : ops) ops_.push_back(OpTotals{.client = client, .op = std::move(op)});
   }
 }
@@ -832,14 +892,10 @@ void Summary::observe(const engine::StepRecord& record) {
   observed_s_ += dt_s;
   // C++23 std::views::zip: walks two ranges in lockstep and yields pairs of references,
   // replacing an index loop over both vectors (and stops at the shorter one).
-  for (auto [totals, sample] : std::views::zip(nodes_, record.nodes)) {
-    totals.add(sample, dt_s);
-    dropped_requests_ += sample.dropped_per_s * dt_s;
-  }
+  for (auto [totals, sample] : std::views::zip(nodes_, record.nodes)) totals.add(sample, dt_s);
   for (std::size_t k = 0; k < record.responses.size(); ++k) {
     const auto& sample = record.responses[k];
     totals_for(sample, k).add(sample, dt_s);
-    offered_requests_ += sample.offered.per_second * dt_s;
   }
 }
 
@@ -884,8 +940,35 @@ std::vector<OpSummary> Summary::ops() const {
   return out;
 }
 
+// Per node, not per scenario: a node's drops are a fraction of what it was sent, so the
+// ratio stays in [0, 1] even when fan-out (ch. 11) multiplies the client's requests 100
+// times before they reach it. Dividing by what the clients offered would not be a ratio.
+double Summary::NodeTotals::drop_rate() const {
+  return demand > 0.0 ? dropped / demand : 0.0;
+}
+
+// The first of equal maxima (std::ranges::max_element keeps it), so ties name the
+// earliest node. A projection through a member function: std::invoke calls drop_rate().
+std::size_t Summary::worst_drop_index() const {
+  const auto worst = std::ranges::max_element(nodes_, std::less<>{}, &NodeTotals::drop_rate);
+  return static_cast<std::size_t>(worst - nodes_.begin());
+}
+
+double Summary::drop_rate(std::string_view node) const {
+  const auto index = graph_->index_of(node);
+  if (!index) {
+    throw std::invalid_argument{"Summary::drop_rate: unknown node '" + std::string{node} + "'"};
+  }
+  return nodes_[*index].drop_rate();
+}
+
 double Summary::drop_rate() const {
-  return offered_requests_ > 0.0 ? dropped_requests_ / offered_requests_ : 0.0;
+  return nodes_.empty() ? 0.0 : nodes_[worst_drop_index()].drop_rate();
+}
+
+std::string_view Summary::worst_drop_node() const {
+  if (drop_rate() <= 0.0) return {};
+  return graph_->nodes()[worst_drop_index()].spec.id;
 }
 
 std::string_view Summary::scenario_name() const {
@@ -910,18 +993,24 @@ bool all_pass(std::span<const SloResult> results) {
 
 // ---- renderers ----
 
+// With no observed step there are no node or op figures to show, only the skipped SLOs.
 std::string render_table(const Summary& summary, std::span<const SloResult> slos, bool color) {
+  if (summary.observed_steps() == 0) return table_header(summary) + slo_table(slos, color);
   return table_header(summary) + node_table(summary, color) + op_table(summary) +
          slo_table(slos, color);
 }
 
+// With no observed step the drop rate is null: there is no data, not a rate of 0.
 std::string render_json(const Summary& summary, std::span<const SloResult> slos) {
   const auto nodes = summary.nodes();
   const auto ops = summary.ops();
+  const bool observed = summary.observed_steps() > 0;
+  const auto worst = summary.worst_drop_node();
   const std::array lines{
       "  " + json_field("scenario", json_string(summary.scenario_name())),
       "  " + json_field("steps", std::to_string(summary.observed_steps())),
-      "  " + json_field("drop_rate", json_number(summary.drop_rate())),
+      "  " + json_field("drop_rate", observed ? json_number(summary.drop_rate()) : "null"),
+      "  " + json_field("worst_drop_node", worst.empty() ? "null" : json_string(worst)),
       json_array("nodes", map_to_strings(std::span<const NodeSummary>{nodes}, json_node)),
       json_array("ops", map_to_strings(std::span<const OpSummary>{ops}, json_op)),
       json_array("slo", map_to_strings(slos, json_slo))};
@@ -936,16 +1025,27 @@ std::string render_explain(const graph::Graph& g) {
 // ---- SeriesWriter ----
 
 SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out} {
-  for (const auto& node : g.nodes()) ids_.push_back(node.spec.id);
+  for (const auto& node : g.nodes()) {
+    ids_.push_back(node.spec.id);
+    is_client_.push_back(node.spec.type == model::NodeType::client);
+  }
   *out_ << "t_s,node,rho,backlog,drops_per_s,latency_ms,zone\n";
 }
 
-// CSV is for machines: an infinite latency is written as `inf` (which spreadsheet and
-// plotting tools parse), unlike the table ("unavailable") and JSON (null), which are read
-// by people or by parsers without an infinity.
+// CSV is for machines, so every numeric column always holds a number:
+// - `t_s` is the shortest form that reads back to the same double (0.1, 2, 0.35), not a
+//   fixed number of decimals that would round a fine step away;
+// - a client row writes 0 in rho, backlog, drops_per_s and latency_ms (a source has no
+//   queue) and `none` as its zone, so a plot can filter clients out by zone;
+// - an infinite latency is written as `inf` (which spreadsheet and plotting tools parse),
+//   unlike the table ("unavailable") and JSON (null), read by people or by parsers
+//   without an infinity.
 void SeriesWriter::observe(const engine::StepRecord& record) {
-  const double t_s = seconds(record.t);
-  for (auto [id, sample] : std::views::zip(ids_, record.nodes)) *out_ << csv_row(t_s, id, sample);
+  const auto t_s = shortest(seconds(record.t));
+  for (std::size_t i = 0; i < ids_.size() && i < record.nodes.size(); ++i) {
+    *out_ << (is_client_[i] ? csv_client_row(t_s, ids_[i])
+                            : csv_server_row(t_s, ids_[i], record.nodes[i]));
+  }
 }
 
 }  // namespace simsys::report

@@ -33,6 +33,9 @@ module;
 module simsys.config;
 
 import simsys.core;
+// Only for defaults::max_concurrency: the cap the engine's defaults apply is the cap the
+// loader enforces, one number in one place.
+import simsys.defaults;
 // Only for fluid::Capacity's default zone thresholds: one source of truth for 0.7 / 0.9.
 import simsys.fluid;
 import simsys.model;
@@ -158,6 +161,17 @@ bool is_unit_fraction(double v) {
 bool is_ratio(double v) {
   return v >= 0 && v <= 1;
 }
+
+// Upper bounds that keep user input inside the engine's arithmetic. Past them a rate
+// overflows to infinity somewhere downstream, and the engine treats a non-finite rate as a
+// programmer error (it throws), so the loader must reject the input first. Chosen, not
+// from the book: 1e15 requests/s is ten orders of magnitude above the book's estimates
+// (search autocomplete's ~24k QPS, ch. 13, for instance), and a factor of 1e6 is fan-out on
+// write to a million followers (ch. 11's celebrity problem), so no design comes near either; 1e15 x
+// 1e6 = 1e21 is still far from the double's limit (~1.8e308), leaving room for long chains of
+// factors.
+inline constexpr double max_rate_per_second = 1e15;
+inline constexpr double max_step_factor = 1e6;
 
 // One numeric `advanced` key: its range rule, the message completing "advanced.<key> must
 // be ...", and the Advanced member that receives it. `std::optional<double>
@@ -751,16 +765,34 @@ CheckResult read_time_step(const Site& site, const YAML::Node& root, SimTime& st
   return site.fail(root["step"], "step must be positive");
 }
 
+// A run of zero length has no step to report.
+CheckResult read_run_duration(const Site& site, const YAML::Node& root, SimTime& duration) {
+  auto read = parse_duration_key(site, root, "duration");
+  if (!read) return std::unexpected(read.error());
+  if (read->count() <= 0) return site.fail(root["duration"], "duration must be positive");
+  duration = *read;
+  return {};
+}
+
+// The report covers the steps from `warmup` to `duration`. A warmup that is not shorter
+// leaves that window empty, and an SLO checked against no data would pass on nothing.
+// Compared by tick count (nanoseconds), as read_time_step does.
+CheckResult read_warmup(const Site& site, const YAML::Node& root, model::Scenario& scenario) {
+  if (auto read = read_optional_duration(site, root, "warmup", scenario.warmup); !read) {
+    return read;
+  }
+  if (scenario.warmup.count() < scenario.duration.count()) return {};
+  return site.fail(root["warmup"], "warmup must be shorter than duration");
+}
+
 // The scalar header fields; an absent optional one keeps the Scenario's default.
 CheckResult read_header(const Site& site, const YAML::Node& root, model::Scenario& scenario) {
   if (auto read = read_version(site, root, scenario.version); !read) return read;
   if (auto read = read_name(site, root, scenario.name); !read) return read;
   if (auto read = read_seed(site, root, scenario.seed); !read) return read;
-  auto duration = parse_duration_key(site, root, "duration");
-  if (!duration) return std::unexpected(duration.error());
-  scenario.duration = *duration;
+  if (auto read = read_run_duration(site, root, scenario.duration); !read) return read;
   if (auto read = read_time_step(site, root, scenario.step); !read) return read;
-  return read_optional_duration(site, root, "warmup", scenario.warmup);
+  return read_warmup(site, root, scenario);
 }
 
 // ---- Datacenters ----------------------------------------------------------------------
@@ -894,14 +926,29 @@ std::expected<void, ParseError> read_capacity_text(std::string_view text, model:
   return parse_rate(text).transform(store_in(node.capacity));
 }
 
+// A byte capacity is bounded by the same number, in bytes: 1e15 B/s is 1e9 objects of 1 MB
+// per second, far below the request-rate bound.
+CheckResult check_capacity_bounded(const Site& site, const YAML::Node& capacity,
+                                   const model::NodeSpec& node) {
+  if (node.capacity && node.capacity->per_second > max_rate_per_second) {
+    return site.fail(capacity, "capacity must be at most 1e15/s");
+  }
+  if (node.byte_capacity && node.byte_capacity->bytes_per_second > max_rate_per_second) {
+    return site.fail(capacity, "capacity must be at most 1e15B/s");
+  }
+  return {};
+}
+
 CheckResult read_capacity(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   const auto capacity = body["capacity"];
   if (!capacity) return {};
-  return scalar_value(site, body, "capacity").and_then([&](const std::string& text) {
-    return read_capacity_text(text, node).transform_error([&](const ParseError& error) {
-      return unit_error(site, capacity, "capacity", error);
-    });
-  });
+  return scalar_value(site, body, "capacity")
+      .and_then([&](const std::string& text) {
+        return read_capacity_text(text, node).transform_error([&](const ParseError& error) {
+          return unit_error(site, capacity, "capacity", error);
+        });
+      })
+      .and_then([&] { return check_capacity_bounded(site, capacity, node); });
 }
 
 const AdvancedNumber* find_advanced_number(std::string_view key) {
@@ -922,15 +969,25 @@ bool is_advanced_key(std::string_view name) {
   return lists_word(advanced_integer_keys, name) || find_advanced_number(name) != nullptr;
 }
 
+// The c of M/M/c, at most defaults::max_concurrency: the Erlang C term costs O(c) per node
+// per step, so an unbounded c would let one scenario line stall every step of a run.
+CheckResult read_concurrency(const Site& site, const YAML::Node& value, const std::string& label,
+                             model::NodeSpec& node) {
+  auto servers = read_positive_int(site, value, label);
+  if (!servers) return std::unexpected(servers.error());
+  if (*servers > defaults::max_concurrency) {
+    return site.fail(value, std::format("{} must be at most {}", label, defaults::max_concurrency));
+  }
+  node.advanced.concurrency = *servers;
+  return {};
+}
+
 // One known, non-null advanced value into its field. store_in also assigns the int that
 // read_positive_int produces to queue_limit's std::optional<double>.
 CheckResult read_advanced_value(const Site& site, const YamlElement& entry, std::string_view name,
                                 model::NodeSpec& node) {
   const auto label = std::format("advanced.{}", name);
-  if (name == "concurrency") {
-    return read_positive_int(site, entry.second, label)
-        .transform(store_in(node.advanced.concurrency));
-  }
+  if (name == "concurrency") return read_concurrency(site, entry.second, label, node);
   if (name == "queue_limit") {
     return read_positive_int(site, entry.second, label)
         .transform(store_in(node.advanced.queue_limit));
@@ -1215,8 +1272,13 @@ CheckResult read_step_attributes(const Site& site, const YAML::Node& yaml, model
       !read) {
     return read;
   }
-  return read_optional_number(site, yaml, "factor", is_positive,
-                              "step factor must be a finite positive number", step.factor);
+  if (auto read = read_optional_number(site, yaml, "factor", is_positive,
+                                       "step factor must be a finite positive number", step.factor);
+      !read) {
+    return read;
+  }
+  if (step.factor <= max_step_factor) return {};
+  return site.fail(yaml["factor"], "step factor must be at most 1e6");
 }
 
 // A step back to its own node would re-inject its whole flow every time step: the fluid
@@ -1323,11 +1385,16 @@ std::expected<Rate, ConfigError> read_rate_base(const Site& site, const YAML::No
   if (auto checked = check_known_keys(site, rate, rate_keys, "rate key"); !checked) {
     return std::unexpected(checked.error());
   }
-  return scalar_value(site, rate, "base", "rate.base").and_then([&](const std::string& text) {
-    return parse_rate(text).transform_error([&](const ParseError& error) {
-      return unit_error(site, rate["base"], "rate.base", error);
-    });
-  });
+  return scalar_value(site, rate, "base", "rate.base")
+      .and_then([&](const std::string& text) {
+        return parse_rate(text).transform_error([&](const ParseError& error) {
+          return unit_error(site, rate["base"], "rate.base", error);
+        });
+      })
+      .and_then([&](Rate base) -> std::expected<Rate, ConfigError> {
+        if (base.per_second <= max_rate_per_second) return base;
+        return site.fail(rate["base"], "rate.base must be at most 1e15/s");
+      });
 }
 
 // A share is the probability that a request is this op: above 0 (a zero share is an op
@@ -1688,6 +1755,36 @@ CheckResult check_latency_target(const Site& site, const YAML::Node& entry,
   return site.fail(entry["op"], std::format("client '{}' has no op '{}'", node.id, *slo.op));
 }
 
+// Utilization is a server's busy fraction: it needs a node to name, and a client, a pure
+// source with no service rate, is never busy, so the SLO could never fail on one.
+CheckResult check_utilization_target(const Site& site, const YAML::Node& entry,
+                                     const model::SloSpec& slo, const Declarations& declared) {
+  if (slo.metric != model::SloMetric::utilization) return {};
+  if (!slo.node) return site.fail(entry, "utilization needs a node");
+  const auto& node = declared.nodes[declared.ids.find(*slo.node)->second];
+  if (node.type != model::NodeType::client) return {};
+  return site.fail(entry["node"],
+                   std::format("utilization needs a server node, '{}' is a client", node.id));
+}
+
+// Only latency is measured per op (a client's response time for each op it sends); every
+// other metric is node-wide, so an `op` on it would be silently ignored.
+CheckResult check_op_is_for_latency(const Site& site, const YAML::Node& entry,
+                                    const model::SloSpec& slo) {
+  if (!slo.op || is_latency_percentile(slo.metric)) return {};
+  return site.fail(entry["op"], "op is only valid for latency metrics");
+}
+
+// What each metric's `node` and `op` may be, checked once the whole entry is read.
+CheckResult check_slo_shape(const Site& site, const YAML::Node& entry, const model::SloSpec& slo,
+                            const Declarations& declared) {
+  if (auto checked = check_latency_target(site, entry, slo, declared); !checked) return checked;
+  if (auto checked = check_utilization_target(site, entry, slo, declared); !checked) {
+    return checked;
+  }
+  return check_op_is_for_latency(site, entry, slo);
+}
+
 std::expected<model::SloSpec, ConfigError> read_slo(const Site& site, const YAML::Node& entry,
                                                     const Declarations& declared) {
   if (!entry.IsMap()) return site.fail(entry, "entry must be a map");
@@ -1704,7 +1801,7 @@ std::expected<model::SloSpec, ConfigError> read_slo(const Site& site, const YAML
   if (auto read = read_slo_max(site, entry, slo.metric).transform(store_in(slo.max)); !read) {
     return std::unexpected(read.error());
   }
-  return check_latency_target(site, entry, slo, declared).transform([&] { return std::move(slo); });
+  return check_slo_shape(site, entry, slo, declared).transform([&] { return std::move(slo); });
 }
 
 std::expected<std::vector<model::SloSpec>, ConfigError> collect_slos(const Site& site,
