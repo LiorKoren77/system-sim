@@ -483,13 +483,15 @@ say which CDN it uses), and the CDN's price.
 
 Models the relational database of ch. 1 ("database replication", "sharding") and the DB box of
 the later designs. `replicas: N` is one **primary** and `N − 1` **read replicas**; `capacity`,
-`latency` and `advanced` describe one copy (default 5k/s, 150 µs: an SSD random read).
+`latency` and `advanced` describe one copy (default 5k/s, 150 µs: an SSD random read). A
+`sql_db`'s `capacity` is **reads/s**: a read costs 1 unit of it and a write 5 by default (see
+`cost` below), so a copy of 5k/s does 5k reads/s or 1k writes/s.
 
 | key | rule | message on violation |
 |---|---|---|
 | `shards` | a positive integer; default 1. The data is split over that many independent sets of `N` copies each | `shards must be a positive integer` |
-| `pool` | a positive integer of at most 100000: the connection pool, the queries one copy has in service at once. By Little's law (queries in service = throughput × service time) a copy then serves at most `pool / latency`: below the `c` its capacity implies (`capacity × latency`, rounded up), the pool is the copy's `c` and its rate becomes `pool / latency` (4 connections of 10 ms queries: 400/s, whatever the disk's 5k/s); at or above it, it changes nothing (more connections never make the disk faster). It **is** `advanced.concurrency` under the database's name, so stating both is refused | `pool must be a positive integer`, `pool must be at most 100000`, `pool and advanced.concurrency are the same setting` |
-| `replication_lag` | a non-negative duration; default 0 (a synchronous replica). Accepted with `replicas: 1`, where nothing replicates (`explain` marks it `(unused: no replicas)`) | the duration parser's (`replication_lag: expected a non-negative finite number`) |
+| `pool` | a positive integer of at most 100000: the connection pool, the queries one copy has in service at once. By Little's law (queries in service = throughput × service time) a copy then serves at most `pool / latency` **capacity units** per second: below the `c` its capacity implies (`capacity × latency`, rounded up), the pool is the copy's `c` and its rate becomes `pool / latency` (4 connections of 10 ms queries: 400 units/s, whatever the disk's 5k/s); at or above it, it changes nothing (more connections never make the disk faster). A write at the default cost of 5 holds its connection 5 × the service time, so it uses five of those units. Unlike `advanced.concurrency`, which only sets `c`, the pool also caps the rate; both set `c`, so stating both is refused | `pool must be a positive integer`, `pool must be at most 100000`, `pool sets c and caps the rate by Little's law; drop advanced.concurrency` |
+| `replication_lag` | a non-negative duration; default 0: shipping takes no time; the write still waits in both queues (the primary's and a replica's, so the staleness is not 0). Accepted with `replicas: 1`, where nothing replicates (`explain` marks it `(unused: no replicas)`) | the duration parser's (`replication_lag: expected a non-negative finite number`) |
 | `write_ops` | as a cache's; default `[write, insert, update, delete]`. These ops go to the primary; every other op is a read | as a cache's |
 | `cost` | as a service's; a write op it does not list costs **5**: spec §6 gives one SQL machine "5k reads" or "1k writes" per second, so a write takes five reads' capacity (on the primary and on every replica that replays it). Reads cost 1 | as a service's |
 
@@ -509,9 +511,11 @@ How the load is split, with `S` shards (each copy its own queue of the node's ca
 | replica | `(N − 1) S` | reads / `((N − 1) S)` **+ committed writes / `S`** | the reads |
 
 Every replica replays every write its primary **committed** (the primary's log holds nothing it
-dropped), so replicas scale reads, not writes: with `N = 3`, 1000 reads/s and 100 writes/s at the
-default write cost of 5 (500 units/s), the primary runs at 500 units/s and each replica at
-500 + 500 = 1000 units/s. With `N = 1` the `S` primaries take reads and writes alike. A write's
+dropped), so replicas scale reads, not writes: with `N = 3`, 1000 reads/s and 60 writes/s at the
+default write cost of 5 (300 units/s) on copies of 1k/s, the primary runs at 300 units/s (30 %)
+and each replica at 500 + 300 = 800 units/s (80 %): under 6 % of the requests are writes, but
+they are three eighths of each replica's work. With `N = 1` the `S` primaries take reads and
+writes alike. A write's
 response is the primary's sojourn, a read's a replica's. The node reports the busier kind's
 `rho` and zone. Its demand, drain, drops and backlog are **the clients' part**: the replicas'
 replication work shows in their `rho`, in the reads' latency and in the replicated writes they
@@ -525,24 +529,43 @@ database driver, not a balancer, sends writes to the primary and reads to a repl
 is committed), the `replication_lag` (shipping it) and its sojourn at a replica (waiting behind
 the reads and the other replicated writes, then applied). Their sum is the node's staleness, 0
 without replicas; the `staleness` SLO compares its mean over the run with `max`, and JSON reports
-it per node as `staleness_s` (`null` for every other node). A replica too busy to replay every
-write drops some, and from then on it never holds what the primary holds: it **diverges**. The
-node reports those writes per second as `replication_dropped_per_s` in JSON (`0` while the
-replicas keep up, `null` for every other node), and the `staleness` SLO **fails** on any of them,
-whatever the mean staleness, with the reason after the limit:
-`FAIL staleness db - 2.05s 100ms replica diverges: drops 88.89/s replicated writes` (JSON: the
-SLO's `note`). The text output prints both numbers in a `replication` section after the node
-table (`database  staleness  replicated writes dropped/s`).
+it per node as `staleness_s` (`null` for every other node). In the example above with
+`replication_lag: 50ms` and 1 ms queries, `run` reports 56.4 ms.
+
+A replica too busy to replay every committed write **falls behind without bound** (the model
+drops the excess at `queue_limit`; a real replica keeps it in its relay log/WAL until it is
+rebuilt): MySQL's relay log and Postgres's WAL never skip an entry, so a real replica's lag grows
+linearly for as long as the overload lasts, and it is rebuilt from a fresh copy once the primary's
+log retention runs out. The staleness reported is the **bounded-queue figure** (finite: JSON has no
+infinity), not that growing lag. The node reports the writes ONE replica misses per second as
+`replication_dropped_per_s` and the writes one shard's primary committed per second, which each of
+its replicas must replay, as `committed_writes_per_s` (JSON; `0` missed while the replicas keep
+up, both `null` for every other node). The `staleness` SLO **fails** on any missed write,
+whatever the mean staleness, with the reason after the limit. 2 copies, 800 reads/s + 400
+inserts/s (2000 units/s, at cost 5) on copies of 1k/s: the primary commits 200 inserts/s, and the
+replica, sent 800 + 1000 units/s, misses 88.89 of them:
+`FAIL staleness db - 2.05s 100ms each replica misses 88.89/s of 200/s committed writes (44.4%)`
+(JSON: the SLO's `note`). The text output prints the numbers in a `replication` section after the
+node table (`database  staleness  committed writes/s per shard  missed writes/s per replica`).
+
+A copy at **exactly** rho = 1 (its load equal to its capacity) is a knife edge where `run` and
+`estimate` disagree: a run keeps an empty queue empty (drain = demand) and reports the stochastic
+wait, capped at rho 0.99, while the steady-state estimate takes the queue as full
+(`FluidQueue::settle`). 200 inserts/s on 2 copies of 1k/s puts both the primary and the replica at
+exactly 1: `estimate` reports a staleness of 2.05 s (two full queues of 1 s, + 50 ms), `run` 250 ms.
+Size a database off rho = 1, as the examples here are.
 
 `explain` prints the model, `primary+2 replicas  shards=4  lag=50ms  pool=32
 write_ops=write,insert` (`(default)` after a shard count or lag the scenario left out, `(unused:
 no replicas)` after a lag with `replicas: 1`; `pool` only when stated, and in the queue numbers
-`capacity=400/s (pool 4 / 10ms)  ...  c=4 (pool)` when it binds), and its check splits the paper
-load in capacity units, here 1000 reads/s and 100 writes/s at `cost: {write: 1}` on copies of
-1k/s: `primary 100/s vs 1k/s (10%, green), each replica 600/s vs 1k/s (60%, green)`. The total
-capacity counts primaries that serve no reads, so when its average's zone is milder than the
-busiest copy's, the headline gives the busiest copy's: `peak offered 1.1k/s vs 2k/s total capacity
-(55%, red at the busiest copy)`.
+`capacity=400/s (pool 4 / 10ms)  ...  c=4 (pool)` when it binds). Every write op that reaches the
+database with no stated cost is printed with its default and where it comes from, `cost: insert 5
+(default: spec §6 5k reads/1k writes)`, beside the costs the scenario states. Its check splits the
+paper load in capacity units, and says so; for the example above (1000 selects/s and 60 inserts/s
+on copies of 1k/s): `primary 300 units/s vs 1k/s (30%, green), each replica 800 units/s vs 1k/s
+(80%, yellow)`. The total capacity counts primaries that serve no reads, so when its average's
+zone is milder than the busiest copy's, the headline gives the busiest copy's: `peak offered
+1.3k/s vs 3k/s total capacity  (43.3%, yellow at the busiest copy)`.
 
 Not modelled: replication conflicts and multi-primary set-ups, failover, transactions and
 locks, waiting for a free connection beyond the pool's queue, cross-shard queries, hot shards
@@ -630,7 +653,7 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 | `reject_rate` | optional | not allowed | number in [0, 1] | **new in v1.2**: the node's rejected (a rate limiter's refusals, a leaky bucket's overflow included) / the requests sent to it, after warmup; without `node`, the worst node's |
 | `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup |
 | `queue_lag` | optional | not allowed | duration | reported `skipped` until `message_queue` runs (phase 2c) |
-| `staleness` | optional; name a `sql_db` | not allowed | duration | phase 2b: the named database's mean staleness after warmup, its write sojourn at the primary + `replication_lag` + its sojourn at a replica (see [`sql_db`](#sql_db)); fails whatever that mean when a replica drops replicated writes (it diverges); `skipped` without a `node` or on a node that keeps no replicated data |
+| `staleness` | optional; name a `sql_db` | not allowed | duration | phase 2b: the named database's mean staleness after warmup, its write sojourn at the primary + `replication_lag` + its sojourn at a replica (see [`sql_db`](#sql_db)); fails whatever that mean when a replica misses committed writes (it falls behind without bound; the note says how many per replica, of how many committed); `skipped` without a `node` or on a node that keeps no replicated data |
 
 The kind of `max` follows the metric, so `0.01` can never be read as 0.01 seconds
 (`slo: reject_rate max must be between 0 and 1`).
@@ -664,10 +687,11 @@ node's own served / inflow, times its downstream's: sequential parts multiply, s
 by share). `run`'s table header shows `drop rate`, and `reject rate X% (worst: node)` once
 some node refused anything; the node table has `dropped` and `rejected` columns; JSON has
 `drop_rate`, `worst_drop_node`, `reject_rate`, `worst_reject_node` and per node `dropped`,
-`rejected` and (phase 2b) `staleness_s`, a database's mean staleness in seconds, and
-`replication_dropped_per_s`, the replicated writes its replicas dropped per second, both `null`
+`rejected` and (phase 2b) `staleness_s`, a database's mean staleness in seconds,
+`replication_dropped_per_s`, the committed writes one replica missed per second, and
+`committed_writes_per_s`, the writes one shard's primary committed per second, all three `null`
 for other nodes. Each SLO object has a `note`: `null`, or why the verdict is not `observed`
-against `max` alone (a diverging replica).
+against `max` alone (a replica that falls behind without bound).
 
 `run --series` writes one CSV row per node per step:
 `t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone` (`rejected_per_s` new in

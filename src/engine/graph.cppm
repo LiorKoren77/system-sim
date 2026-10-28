@@ -731,7 +731,8 @@ namespace {
     return EngineError{name + "pool must be at most " + std::to_string(defaults::max_concurrency)};
   }
   if (spec.pool && spec.advanced.concurrency) {
-    return EngineError{name + "pool and advanced.concurrency are the same setting"};
+    return EngineError{name +
+                       "pool sets c and caps the rate by Little's law; drop advanced.concurrency"};
   }
   if (spec.replication_lag && spec.replication_lag->count() < 0) {
     return EngineError{name + "replication_lag must not be negative"};
@@ -741,6 +742,9 @@ namespace {
 
 // What a database's own keys do to its resolved numbers (plan 2b refinement 3): `pool` is the
 // connection pool, how many queries one copy (primary or replica alike) has in service at once.
+// The rates below are capacity units, like `capacity`: a query holds its connection for its
+// cost × the service time, so a write at the default cost of 5 holds one five times as long as a
+// read, and the pool caps units per second, not requests.
 // A copy already has a concurrency, the c Little's law implies from its capacity × service time
 // (defaults::implied_concurrency: 5k/s × 10 ms keeps 50 queries in service). A pool below it
 // leaves connections, not the disk, as the limit:
@@ -2352,8 +2356,9 @@ Graph::Result Graph::check_forwarded_ops(std::size_t node) {
 // A drained route (weight 0) sends the target nothing and imposes no model. A node behind
 // two balancers whose policies give different models would need two queueing models at
 // once, so that is an error; the same model from different policies (round_robin and
-// weighted) is fine. Two consistent_hash rings with different vnodes keep the larger
-// imbalance (the hotter ring decides the hottest replica). A node reached both through a
+// weighted) is fine. A SQL database takes no model from any balancer (its driver picks the
+// copy), so any balancers may front one. Two consistent_hash rings with different vnodes keep the
+// larger imbalance (the hotter ring decides the hottest replica). A node reached both through a
 // balancer and directly (a client or a step sending to it) gets the balancer's model for
 // ALL its traffic: the model belongs to the replica group, not to one path into it.
 Graph::Result Graph::mark_balanced_targets() {
@@ -2375,6 +2380,11 @@ Graph::Result Graph::mark_balanced_targets() {
     for (const auto& route : routes_[balancer]) {
       if (route.share <= 0.0) continue;  // drained: sends nothing, imposes nothing
       auto& target = nodes_[route.target];
+      // A database's driver, not the balancer, picks its copy: writes go to the primary, reads
+      // to a replica, and a sharding key spreads the shards evenly. So no balancer's model
+      // applies to it (engine::Simulation::make_database): it imposes neither a pool nor a hot
+      // copy, and two balancers of different models in front of one database do not conflict.
+      if (target.spec.type == model::NodeType::sql_db) continue;
       auto& earlier = marked[route.target];
       if (earlier && earlier->model != replica_model) {
         return std::unexpected{EngineError{
@@ -2384,10 +2394,6 @@ Graph::Result Graph::mark_balanced_targets() {
             ", '" + spec.id + "' " + std::string{to_string(replica_model)} + ")"}};
       }
       if (!earlier) earlier = Marked{.model = replica_model, .balancer = balancer};
-      // A database's driver, not the balancer, picks its copy: writes go to the primary, reads
-      // to a replica, and a sharding key spreads the shards evenly. So a balancer's model
-      // imposes neither a pool nor a hot copy on it (engine::Simulation::make_database).
-      if (target.spec.type == model::NodeType::sql_db) continue;
       if (replica_model == ReplicaModel::pooled) target.pooled = true;
       if (replica_model == ReplicaModel::imbalanced) {
         target.keys_partitioned = true;  // each key hashes to one replica
