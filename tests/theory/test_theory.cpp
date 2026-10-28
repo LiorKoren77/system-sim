@@ -38,9 +38,11 @@ namespace {
 // One client, one M/M/1 server: 1000/s capacity, 1 ms service, zero-latency link.
 Scenario mm1(double demand) {
   Scenario s{.name = "mm1", .version = 1, .duration = 10s};
-  s.nodes = {NodeSpec{.id = "c", .type = NodeType::client,
-                      .workload = Workload{.base = Rate{demand}, .op_shares = {{"op", 1.0}}}},
-             NodeSpec{.id = "s", .type = NodeType::service, .capacity = Rate{1000}, .latency = 1ms}};
+  s.nodes = {
+      NodeSpec{.id = "c",
+               .type = NodeType::client,
+               .workload = Workload{.base = Rate{demand}, .op_shares = {{"op", 1.0}}}},
+      NodeSpec{.id = "s", .type = NodeType::service, .capacity = Rate{1000}, .latency = 1ms}};
   s.links = {LinkSpec{.from = "c", .to = "s", .dir = Direction::inout, .latency = 0s}};
   return s;
 }
@@ -71,7 +73,8 @@ TEST_CASE("a client's node sample is a source: no demand, no queue, green", "[th
   REQUIRE(client.zone == simsys::fluid::Zone::green);
 }
 
-TEST_CASE("estimate reports the long-run state: empty queue below capacity, full above", "[theory]") {
+TEST_CASE("estimate reports the long-run state: empty queue below capacity, full above",
+          "[theory]") {
   const auto under = *simsys::graph::Graph::build(mm1(500));
   REQUIRE((*Simulation::create(under)).estimate().nodes[1].backlog == 0.0);
   const auto over = *simsys::graph::Graph::build(mm1(1500));
@@ -85,13 +88,19 @@ TEST_CASE("estimate reports the long-run state: empty queue below capacity, full
 TEST_CASE("dropped flow does not propagate downstream", "[theory]") {
   // c -> a (overloaded, queue 0) -> b : b must see only what a drained.
   Scenario s{.name = "drop", .version = 1, .duration = 1s};
-  s.nodes = {NodeSpec{.id = "c", .type = NodeType::client,
-                      .workload = Workload{.base = Rate{3000}, .op_shares = {{"op", 1.0}}}},
-             NodeSpec{.id = "a", .type = NodeType::service, .capacity = Rate{1000}, .latency = 1ms,
-                      .advanced = {.queue_limit = 1e-9},
-                      .ops = {{"op", {simsys::model::Step{.to = "b", .op = "op"}}}}},
-             NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{10000}, .latency = 100us}};
-  s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s}, LinkSpec{.from = "a", .to = "b", .latency = 0s}};
+  s.nodes = {
+      NodeSpec{.id = "c",
+               .type = NodeType::client,
+               .workload = Workload{.base = Rate{3000}, .op_shares = {{"op", 1.0}}}},
+      NodeSpec{.id = "a",
+               .type = NodeType::service,
+               .capacity = Rate{1000},
+               .latency = 1ms,
+               .advanced = {.queue_limit = 1e-9},
+               .ops = {{"op", {simsys::model::Step{.to = "b", .op = "op"}}}}},
+      NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{10000}, .latency = 100us}};
+  s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s},
+             LinkSpec{.from = "a", .to = "b", .latency = 0s}};
   const auto g = *simsys::graph::Graph::build(s);
   const auto r = (*Simulation::create(g)).step(0s, 100ms);
   REQUIRE(r.nodes[1].dropped_per_s == Approx(2000).epsilon(1e-6));
@@ -104,7 +113,8 @@ TEST_CASE("a simulation refuses node types the phase does not support yet", "[th
   const auto g = *simsys::graph::Graph::build(s);
   const auto sim = Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
-  REQUIRE(sim.error().message == "node 's' has type 'cache', which run/estimate do not support yet (phase 2)");
+  REQUIRE(sim.error().message ==
+          "node 's' has type 'cache', which run/estimate do not support yet (phase 2)");
 }
 
 TEST_CASE("run emits one record per step from 0 to duration, exclusive", "[theory]") {
@@ -121,11 +131,21 @@ TEST_CASE("run emits one record per step from 0 to duration, exclusive", "[theor
 TEST_CASE("flow is conserved at every node in every step of an overloaded chain", "[theory]") {
   // c -> a (fast) -> b (slow, overloaded): in = out + drops + delta backlog, per node, per step.
   Scenario s{.name = "chain", .version = 1, .duration = 5s};
-  s.nodes = {NodeSpec{.id = "c", .type = NodeType::client, .workload = Workload{.base = Rate{3000}, .op_shares = {{"op", 1.0}}}},
-             NodeSpec{.id = "a", .type = NodeType::service, .capacity = Rate{10000}, .latency = 100us,
+  s.nodes = {NodeSpec{.id = "c",
+                      .type = NodeType::client,
+                      .workload = Workload{.base = Rate{3000}, .op_shares = {{"op", 1.0}}}},
+             NodeSpec{.id = "a",
+                      .type = NodeType::service,
+                      .capacity = Rate{10000},
+                      .latency = 100us,
                       .ops = {{"op", {simsys::model::Step{.to = "b", .op = "op"}}}}},
-             NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{1000}, .latency = 1ms, .advanced = {.queue_limit = 200}}};
-  s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s}, LinkSpec{.from = "a", .to = "b", .latency = 0s}};
+             NodeSpec{.id = "b",
+                      .type = NodeType::service,
+                      .capacity = Rate{1000},
+                      .latency = 1ms,
+                      .advanced = {.queue_limit = 200}}};
+  s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s},
+             LinkSpec{.from = "a", .to = "b", .latency = 0s}};
   const auto g = *simsys::graph::Graph::build(s);
   auto sim = *Simulation::create(g);
   std::vector<double> previous_backlog(3, 0.0);
@@ -145,11 +165,18 @@ TEST_CASE("what a node drains is what the next node receives", "[theory]") {
   // of 500 and drains at its capacity, 1000/s. Whatever a drains, b must receive in the same
   // step: queued requests do not vanish and are not invented.
   Scenario s{.name = "drain", .version = 1, .duration = 2s};
-  s.nodes = {NodeSpec{.id = "c", .type = NodeType::client, .workload = Workload{.base = Rate{1500}, .op_shares = {{"op", 1.0}}}},
-             NodeSpec{.id = "a", .type = NodeType::service, .capacity = Rate{1000}, .latency = 1ms,
-                      .ops = {{"op", {simsys::model::Step{.to = "b", .op = "op"}}}}},
-             NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{10000}, .latency = 100us}};
-  s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s}, LinkSpec{.from = "a", .to = "b", .latency = 0s}};
+  s.nodes = {
+      NodeSpec{.id = "c",
+               .type = NodeType::client,
+               .workload = Workload{.base = Rate{1500}, .op_shares = {{"op", 1.0}}}},
+      NodeSpec{.id = "a",
+               .type = NodeType::service,
+               .capacity = Rate{1000},
+               .latency = 1ms,
+               .ops = {{"op", {simsys::model::Step{.to = "b", .op = "op"}}}}},
+      NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{10000}, .latency = 100us}};
+  s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s},
+             LinkSpec{.from = "a", .to = "b", .latency = 0s}};
   const auto g = *simsys::graph::Graph::build(s);
   auto sim = *Simulation::create(g);
   for (int i = 0; i < 10; ++i) (void)sim.step(i * 100ms, 100ms);
@@ -158,6 +185,33 @@ TEST_CASE("what a node drains is what the next node receives", "[theory]") {
     REQUIRE(r.nodes[1].drain_per_s > 0.0);
     REQUIRE_THAT(r.nodes[2].demand_per_s, Catch::Matchers::WithinRel(r.nodes[1].drain_per_s, 1e-9));
   }
+}
+
+TEST_CASE("the drained flow keeps the queue's op mix", "[theory]") {
+  // c sends x and y half and half at 3000/s into a (1000/s, queue 200): a is saturated,
+  // its queue holds both ops half and half, and only x goes on to b (y ends at a). After
+  // 10 steps b must see exactly the x half of what a drains, backlog included.
+  Scenario s{.name = "mix", .version = 1, .duration = 2s};
+  s.nodes = {
+      NodeSpec{.id = "c",
+               .type = NodeType::client,
+               .workload = Workload{.base = Rate{3000}, .op_shares = {{"x", 0.5}, {"y", 0.5}}}},
+      NodeSpec{.id = "a",
+               .type = NodeType::service,
+               .capacity = Rate{1000},
+               .latency = 1ms,
+               .advanced = {.queue_limit = 200},
+               .ops = {{"x", {simsys::model::Step{.to = "b", .op = "x"}}}}},
+      NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{10000}, .latency = 100us}};
+  s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s},
+             LinkSpec{.from = "a", .to = "b", .latency = 0s}};
+  const auto g = *simsys::graph::Graph::build(s);
+  auto sim = *Simulation::create(g);
+  for (int i = 0; i < 9; ++i) (void)sim.step(i * 100ms, 100ms);
+  const auto r = sim.step(900ms, 100ms);
+  REQUIRE(r.nodes[1].drain_per_s > 0.0);
+  REQUIRE_THAT(r.nodes[2].demand_per_s,
+               Catch::Matchers::WithinRel(0.5 * r.nodes[1].drain_per_s, 1e-9));
 }
 
 TEST_CASE("a constant-rate run converges to estimate when no node is saturated", "[theory]") {
@@ -176,7 +230,7 @@ TEST_CASE("replicas split the demand: four copies at 1k/s each see rho 0.5 from 
   s.nodes[1].replicas = 4;
   const auto r = (*Simulation::create(*simsys::graph::Graph::build(s))).step(0s, 100ms);
   REQUIRE(r.nodes[1].rho == Approx(0.5));
-  REQUIRE(r.nodes[1].drain_per_s == Approx(2000));  // summed over copies
+  REQUIRE(r.nodes[1].drain_per_s == Approx(2000));      // summed over copies
   REQUIRE(r.nodes[1].latency.mean_s == Approx(0.002));  // each copy is the M/M/1 at rho 0.5
 }
 
@@ -190,17 +244,31 @@ TEST_CASE("a cross-datacenter link delays demand by its delay steps", "[theory]"
 }
 
 TEST_CASE("a feedback loop re-injects flow one step later and settles under estimate", "[theory]") {
-  // u -> chat -> q -> sync -> chat (push, terminal). Flow round the loop appears at chat one step late.
+  // u -> chat -> q -> sync -> chat (push, terminal). Flow round the loop appears at chat one step
+  // late.
   Scenario s{.name = "loop", .version = 1, .duration = 1s};
-  s.nodes = {NodeSpec{.id = "u", .type = NodeType::client, .workload = Workload{.base = Rate{100}, .op_shares = {{"msg", 1.0}}}},
-             NodeSpec{.id = "chat", .type = NodeType::service, .capacity = Rate{10000}, .latency = 100us,
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.base = Rate{100}, .op_shares = {{"msg", 1.0}}}},
+             NodeSpec{.id = "chat",
+                      .type = NodeType::service,
+                      .capacity = Rate{10000},
+                      .latency = 100us,
                       .ops = {{"msg", {simsys::model::Step{.to = "q", .op = "publish"}}}}},
-             NodeSpec{.id = "q", .type = NodeType::service, .capacity = Rate{10000}, .latency = 100us,
+             NodeSpec{.id = "q",
+                      .type = NodeType::service,
+                      .capacity = Rate{10000},
+                      .latency = 100us,
                       .ops = {{"publish", {simsys::model::Step{.to = "sync", .op = "job"}}}}},
-             NodeSpec{.id = "sync", .type = NodeType::service, .capacity = Rate{10000}, .latency = 100us,
+             NodeSpec{.id = "sync",
+                      .type = NodeType::service,
+                      .capacity = Rate{10000},
+                      .latency = 100us,
                       .ops = {{"job", {simsys::model::Step{.to = "chat", .op = "push"}}}}}};
-  s.links = {LinkSpec{.from = "u", .to = "chat", .latency = 0s}, LinkSpec{.from = "chat", .to = "q", .latency = 0s},
-             LinkSpec{.from = "q", .to = "sync", .latency = 0s}, LinkSpec{.from = "sync", .to = "chat", .latency = 0s}};
+  s.links = {LinkSpec{.from = "u", .to = "chat", .latency = 0s},
+             LinkSpec{.from = "chat", .to = "q", .latency = 0s},
+             LinkSpec{.from = "q", .to = "sync", .latency = 0s},
+             LinkSpec{.from = "sync", .to = "chat", .latency = 0s}};
   const auto g = *simsys::graph::Graph::build(s);
   auto sim = *Simulation::create(g);
   const auto first = sim.step(0s, 100ms);
@@ -215,7 +283,9 @@ TEST_CASE("two runs of the same scenario produce identical records", "[theory]")
   const auto g = *simsys::graph::Graph::build(mm1(900));
   auto collect = [&] {
     std::vector<simsys::engine::StepRecord> out;
-    (*Simulation::create(g)).run({.duration = 1s, .step = 100ms}, [&](const auto& r) { out.push_back(r); });
+    (*Simulation::create(g)).run({.duration = 1s, .step = 100ms}, [&](const auto& r) {
+      out.push_back(r);
+    });
     return out;
   };
   const auto a = collect();
