@@ -93,6 +93,12 @@ consteval SimTime operator""_ms(unsigned long long v) {
 consteval SimTime operator""_s(unsigned long long v) {
   return detail::checked_literal(v, 1'000'000'000);
 }
+consteval SimTime operator""_min(unsigned long long v) {
+  return detail::checked_literal(v, 60'000'000'000);
+}
+consteval SimTime operator""_h(unsigned long long v) {
+  return detail::checked_literal(v, 3'600'000'000'000);
+}
 }  // namespace literals
 
 // Requests (or messages, operations...) per second. A struct, not a bare double, so a
@@ -261,6 +267,18 @@ split_non_negative_number(std::string_view text, std::string_view input) {
   return scaled + 0.0;
 }
 
+// "09" -> 9. Exactly two ASCII digits, nothing else. std::from_chars alone would also
+// accept "-5" (a sign), so the digit check comes first; from_chars then does the
+// conversion without locale lookups or allocation.
+[[nodiscard]] std::optional<int> parse_two_digits(std::string_view pair) {
+  const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+  if (pair.size() != 2 || !is_digit(pair[0]) || !is_digit(pair[1])) return std::nullopt;
+  int value{};
+  const auto [ptr, ec] = std::from_chars(pair.data(), pair.data() + pair.size(), value);
+  if (ec != std::errc{}) return std::nullopt;
+  return value;
+}
+
 }  // namespace simsys::detail
 
 export namespace simsys {
@@ -275,6 +293,36 @@ export namespace simsys {
   auto scale = detail::nanoseconds_per(unit, text);
   if (!scale) return std::unexpected(scale.error());
   return detail::to_sim_time(value * *scale, text);
+}
+
+// "20:00" -> 20h. Exactly HH:MM, two digits each side of a colon. Simulated time starts at
+// midnight (phase 2a refinement 1: t = 0 is 00:00), so a wall-clock time is simply an
+// offset from the start of the run; scenario keys such as `at:` and `peak_at:` use it.
+// std::chrono::hh_mm_ss exists for the opposite direction (splitting a duration into
+// hours, minutes and seconds for display). std::chrono::parse("%H:%M") does exist in
+// GCC 14's libstdc++ (verified with g++-14 -std=c++23), but it reads from a std::istream,
+// which pulls in <sstream> and locale machinery, and its failure is a bare stream state
+// bit, whereas the scenario author needs the exact messages below.
+[[nodiscard]] std::expected<SimTime, ParseError> parse_clock_time(std::string_view text) {
+  if (text.size() != 5 || text[2] != ':') return detail::fail(text, "expected HH:MM");
+  const auto hours = detail::parse_two_digits(text.substr(0, 2));
+  const auto minutes = detail::parse_two_digits(text.substr(3, 2));
+  if (!hours || !minutes) return detail::fail(text, "expected HH:MM");
+  if (*hours > 23) return detail::fail(text, "hour must be 00-23");
+  if (*minutes > 59) return detail::fail(text, "minute must be 00-59");
+  return *hours * 1_h + *minutes * 1_min;
+}
+
+// A point on the simulated timeline, in either of the two spellings scenario authors use:
+// a clock time ("20:00") or a duration from the start ("90m"). Both are offsets from
+// t = 0. One combined message on failure, so an author who wrote the wrong form learns
+// about both.
+[[nodiscard]] std::expected<SimTime, ParseError> parse_time_point(std::string_view text) {
+  // C++23 std::string_view::contains: replaces `find(c) != npos`, which reads as
+  // arithmetic on an index when all we want is a yes/no question.
+  auto parsed = text.contains(':') ? parse_clock_time(text) : parse_duration(text);
+  if (!parsed) return detail::fail(text, "expected HH:MM or a duration");
+  return parsed;
 }
 
 // "10k/s" -> Rate{10000}. Accepts only the SI prefixes "", k, M, G.
