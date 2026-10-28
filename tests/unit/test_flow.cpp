@@ -3,6 +3,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cmath>
+#include <initializer_list>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -83,6 +85,17 @@ TEST_CASE("Parallel branches take the largest mean and the largest variance", "[
   REQUIRE(m.mean_s == Approx(0.005));
   REQUIRE(m.variance_s2 == Approx(9e-6));
   REQUIRE(simsys::flow::parallel_max({}) == LatencyEstimate{});
+}
+
+TEST_CASE("A NaN branch makes the parallel maximum NaN, in either position", "[flow]") {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const std::array nan_first{LatencyEstimate{nan, nan}, LatencyEstimate{0.005, 1e-6}};
+  const std::array nan_last{LatencyEstimate{0.005, 1e-6}, LatencyEstimate{nan, nan}};
+  for (const auto& branches : {nan_first, nan_last}) {
+    const auto m = simsys::flow::parallel_max(branches);
+    REQUIRE(std::isnan(m.mean_s));
+    REQUIRE(std::isnan(m.variance_s2));
+  }
 }
 
 TEST_CASE("Adding a flow to itself doubles every rate", "[flow]") {

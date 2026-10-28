@@ -173,8 +173,10 @@ TEST_CASE("a client op split across two links mixes the responses by share", "[b
     return node == *g.index_of("fast") ? LatencyEstimate{0.001, 0.0} : LatencyEstimate{0.005, 0.0};
   });
   // Mixture: mean = 0.75 * 1 ms + 0.25 * 5 ms = 2 ms;
-  // variance = E[X^2] - mean^2 = (0.75 * 1e-6 + 0.25 * 25e-6) - 4e-6 = 3e-6 (law of total
-  // variance).
+  // variance = Σ s_i v_i + Σ s_i (m_i − mean)² = 0 + (0.75 * (1 ms − 2 ms)² + 0.25 * (5 ms −
+  // 2 ms)²) = 0.75e-6 + 2.25e-6 = 3e-6 (law of total variance: the expected conditional
+  // variance plus the variance of the conditional means; both routes are deterministic
+  // here, so all of it is the spread between routes).
   REQUIRE_THAT(r.mean_s, WithinRel(0.002, 1e-12));
   REQUIRE_THAT(r.variance_s2, WithinRel(3e-6, 1e-12));
 }
@@ -216,8 +218,10 @@ TEST_CASE("an unavailable entry node makes the client's latency infinite, never 
   REQUIRE(std::isinf(r.variance_s2));
 }
 
-TEST_CASE("a feedback hop forwards flow but adds no latency to the caller", "[behaviours]") {
-  Scenario s{.name = "loop", .version = 1, .duration = 1min};
+TEST_CASE("the hop that closes a call cycle forwards flow but adds no latency to the caller",
+          "[behaviours]") {
+  // chat.msg -> q.publish -> sync.job -> chat.msg: a true call cycle; sync -> chat closes it.
+  Scenario s{.name = "loop2", .version = 1, .duration = 1min};
   s.nodes = {NodeSpec{.id = "u",
                       .type = NodeType::client,
                       .workload = Workload{.base = Rate{1}, .op_shares = {{"msg", 1.0}}}},
@@ -229,7 +233,7 @@ TEST_CASE("a feedback hop forwards flow but adds no latency to the caller", "[be
                       .ops = {{"publish", {Step{.to = "sync", .op = "job"}}}}},
              NodeSpec{.id = "sync",
                       .type = NodeType::service,
-                      .ops = {{"job", {Step{.to = "chat", .op = "push"}}}}}};
+                      .ops = {{"job", {Step{.to = "chat", .op = "msg", .factor = 0.5}}}}}};
   s.links = {LinkSpec{.from = "u", .to = "chat", .latency = 0s},
              LinkSpec{.from = "chat", .to = "q", .latency = 0s},
              LinkSpec{.from = "q", .to = "sync", .latency = 0s},
@@ -243,6 +247,28 @@ TEST_CASE("a feedback hop forwards flow but adds no latency to the caller", "[be
       sync.response("job", LatencyEstimate{0.002, 0.0},
                     [](std::size_t, std::string_view) { return LatencyEstimate{99.0, 99.0}; });
   REQUIRE(r == LatencyEstimate{0.002, 0.0});  // the hop back to chat is asynchronous
+}
+
+TEST_CASE("a node-level back edge that is not a call cycle still adds its latency",
+          "[behaviours]") {
+  // A.x -> B.y and B.z -> A.w: B -> A closes the node cycle, but B.z really waits for A.w.
+  Scenario s{.name = "xcycle", .version = 1, .duration = 1min};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.base = Rate{10}, .op_shares = {{"x", 0.5}, {"z", 0.5}}}},
+      NodeSpec{.id = "A", .type = NodeType::service, .ops = {{"x", {Step{.to = "B", .op = "y"}}}}},
+      NodeSpec{.id = "B", .type = NodeType::service, .ops = {{"z", {Step{.to = "A", .op = "w"}}}}}};
+  s.links = {LinkSpec{.from = "u", .to = "A", .ops = {"x"}, .latency = 0s},
+             LinkSpec{.from = "u", .to = "B", .ops = {"z"}, .latency = 0s},
+             LinkSpec{.from = "A", .to = "B", .latency = 0s},
+             LinkSpec{.from = "B", .to = "A", .latency = 0s}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const ServiceBehaviour b{g, *g.index_of("B")};
+  const auto r = b.response("z", LatencyEstimate{0.001, 0.0}, [](std::size_t, std::string_view) {
+    return LatencyEstimate{0.5, 0.0};
+  });
+  REQUIRE_THAT(r.mean_s, WithinRel(0.001 + 0.0 + 0.5 + 0.0, 1e-12));  // own + two zero legs + A.w
 }
 
 TEST_CASE("a client with a zero base rate offers nothing", "[behaviours]") {
