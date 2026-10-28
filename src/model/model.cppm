@@ -239,7 +239,10 @@ inline constexpr auto limiter_algorithm_table = std::to_array<core::EnumName<Lim
 //                    write_through (the difference, what the cache then holds, shows in the
 //                    hit ratio, which is fixed here).
 //   write_back    -> writes are acknowledged by the cache and flushed to the backend later
-//                    (a queue of dirty entries): phase 2b; the engine refuses it until then.
+//                    (a queue of dirty entries): every write still reaches the backend, at
+//                    the same rate (an upper bound: no coalescing), but over an asynchronous
+//                    hop, so the writer waits for the cache alone (plan 2b refinement 5;
+//                    graph's write_back_flushes).
 enum class CacheStrategy { cache_aside, read_through, write_through, write_around, write_back };
 
 // Pattern: Table-driven method — the strategy names, read by the loader (`strategy:`) and
@@ -268,8 +271,8 @@ inline constexpr auto cache_strategy_table = std::to_array<core::EnumName<CacheS
 
 // A cache's `hit_ratio`: `{fixed: h}`, the share of reads the cache answers, given by the
 // scenario (0 <= h <= 1), or `che`: computed from the cache size (`keys`) and the key
-// popularity of the clients upstream (their KeySpec) by the Che approximation of an LRU cache
-// (simsys.caching; the graph resolves it once, at build). The loader sets exactly one of the
+// popularity of the clients whose ops reach it (their KeySpec) by the Che approximation of an LRU
+// cache (simsys.caching; the graph resolves it once, at build). The loader sets exactly one of the
 // two; a HitRatio{} built in code sets neither, which counts as no hit ratio at all.
 struct HitRatio {
   std::optional<double> fixed{};
@@ -329,16 +332,25 @@ struct Advanced {
 //    clicks"; s ≈ 1 is the classic web skew);
 //  - `{uniform: N}`: every key equally likely, `zipf` empty.
 // `space` is a count of keys, a double because key spaces run to 1e9 and the Che sums are in
-// doubles anyway. A che cache reads the KeySpec of the clients upstream of it (graph's
-// key_source); the clients must agree on one.
+// doubles anyway. A che cache reads the KeySpec of the clients whose ops reach it (graph's
+// agreed_keys); the clients must agree on one. Canonical form (canonical below): Zipf with
+// exponent 0 IS the uniform distribution (i^0 = 1 for every rank), and is stored as uniform,
+// `zipf` empty, so that == compares distributions rather than spellings.
 struct KeySpec {
   std::optional<double> zipf{};
   double space{};
   // C++20 defaulted operator==: member-wise equality in one line, replacing a hand-written
   // comparison of both members; it is how the graph tells "the same distribution" from two
-  // clients apart from "different ones".
+  // clients apart from "different ones" (on the canonical form).
   bool operator==(const KeySpec&) const = default;
 };
+
+// `keys` in canonical form: `{zipf: 0, space: N}` becomes `{uniform: N}`. The loader stores
+// every client's keys this way; the graph applies it again for scenarios built in code.
+[[nodiscard]] constexpr KeySpec canonical(KeySpec keys) {
+  if (keys.zipf == 0.0) keys.zipf.reset();
+  return keys;
+}
 
 struct Workload {
   workload::RateCurve curve{};

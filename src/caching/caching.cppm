@@ -13,14 +13,15 @@
 //      LRU (Che)      0.39   0.49   0.62   0.76   0.88   0.99   this module
 // so "80/20" holds at about s ≈ 0.88 for the ideal cache and s ≈ 0.93 for LRU.
 // Captured: how the hit ratio grows with the cache size and with the skew of the key
-// popularity. Ignored: temporal locality (a key requested now is no likelier to be
-// requested again soon — the independent reference model below), TTL expiry, cold start
-// (the estimate is the steady state), and eviction policies other than LRU. FIFO (and
-// random eviction) has a Che-like closed form too, Martina, Garetto & Leonardi, "A unified
-// approach to the performance analysis of caching systems", IEEE INFOCOM 2014: a key is
-// cached with probability p·t / (1 + p·t) instead of 1 − e^{−p·t}. Not implemented; in the
-// table's setting it gives 0.36 / 0.73 / 0.86 at s = 0.6 / 0.9 / 1.0, two to four points
-// below LRU. LFU does better than LRU, up to the ideal row above.
+// popularity, and what a cache passes on: its misses are the cold tail of the popularity,
+// which is all a second cache behind it ever sees (Popularity::filtered_by). Ignored: temporal
+// locality (a key requested now is no likelier to be requested again soon — the independent
+// reference model below), TTL expiry, cold start (the estimate is the steady state), and eviction
+// policies other than LRU. FIFO (and random eviction) has a Che-like closed form too, Martina,
+// Garetto & Leonardi, "A unified approach to the performance analysis of caching systems", IEEE
+// INFOCOM 2014: a key is cached with probability p·t / (1 + p·t) instead of 1 − e^{−p·t}. Not
+// implemented; in the table's setting it gives 0.36 / 0.73 / 0.86 at s = 0.6 / 0.9 / 1.0, two to
+// four points below LRU. LFU does better than LRU, up to the ideal row above.
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer explanation).
 // This interface imports no other module, and needs no heavy header anyway.
@@ -29,6 +30,8 @@ module;
 #include <cmath>
 // C++20 <concepts>: the standard concept library (std::same_as, ...) used below.
 #include <concepts>
+#include <cstddef>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -44,6 +47,14 @@ export namespace simsys::caching {
 struct Bucket {
   double count;
   double key_probability;
+};
+
+// One cache of several that split a key space between them (the replicas of a cache behind
+// a consistent-hash ring): the share of the keys it owns — under a random partition also its
+// share of the requests — and its characteristic time (che_characteristic_time).
+struct CacheShard {
+  double key_share;
+  double characteristic_time;
 };
 
 // Request popularity over a key space, under the *independent reference model* (IRM):
@@ -81,6 +92,27 @@ class Popularity {
   // N, the number of keys (Σ count over the buckets).
   [[nodiscard]] double key_count() const { return key_count_; }
 
+  // The popularity of the MISSES of an LRU cache with characteristic time `t` that sees this
+  // popularity: what a second cache behind it (its backend, or the target of its `then` step
+  // on miss) is asked for. V. Martina, M. Garetto & E. Leonardi, "A unified approach to the
+  // performance analysis of caching systems", IEEE INFOCOM 2014, §IV (networks of caches):
+  // under the Che approximation key i misses with probability e^{−p_i t} (no request for it
+  // within the last t), so the miss stream asks for key i with probability
+  //   p'_i = p_i e^{−p_i t} / Σ_j p_j e^{−p_j t}       (renormalised over the misses).
+  // The hot keys (p_i t ≫ 1) all but vanish from it: what is left is the cold tail, which is
+  // why a second cache behind a first one hits far less than its size suggests. The same keys,
+  // the same buckets, different probabilities. Assumes the misses are again IRM (each miss
+  // independent of the others); real miss streams are slightly burstier.
+  // `t` = +infinity (a cache that holds every key: it never misses) gives the limit of the
+  // formula, all the weight on the coldest bucket, so the result is always a distribution.
+  [[nodiscard]] Popularity filtered_by(double characteristic_time) const;
+
+  // The same for a key space split between several LRU caches, each owning a share of the keys
+  // (the arcs of a consistent-hash ring): key i misses in the one cache that owns it, so
+  //   p'_i ∝ p_i Σ_j a_j e^{−p_i t_j}     (a_j the cache's key share, t_j its characteristic
+  // time; a random partition puts a share a_j of every popularity level in cache j).
+  [[nodiscard]] Popularity filtered_by(std::span<const CacheShard> shards) const;
+
  private:
   explicit Popularity(std::vector<Bucket> buckets);
 
@@ -113,6 +145,12 @@ class Popularity {
 // about half a millisecond (Release), once per cache when the graph is built.
 [[nodiscard]] double che_hit_ratio(double capacity, const Popularity& popularity);
 
+// The characteristic time t_c of the same cache: how many requests a key survives in it
+// unrequested (see above), the number a cache behind it needs to know which keys this one
+// misses (Popularity::filtered_by). +infinity when `capacity >= N` (nothing is ever evicted),
+// 0 when `capacity == 0`; the same errors as che_hit_ratio.
+[[nodiscard]] double che_characteristic_time(double capacity, const Popularity& popularity);
+
 // C++20 concepts and `requires` expressions: a concept is a named compile-time predicate
 // on a type. Replaces SFINAE and enable_if tricks (and "read the docs and hope" duck
 // typing), so a type that lacks hit_ratio fails with a short "constraint not satisfied"
@@ -126,11 +164,13 @@ concept HitRatioModel = requires(const M& model, double capacity) {
   { model.hit_ratio(capacity) } -> std::same_as<double>;
 };
 
-// Pattern: Strategy/Policy — each cache's hit-ratio model is one of these, chosen at
-// build time from the scenario's `hit_ratio: {fixed: 0.8}` or `hit_ratio: che` (spec §5).
+// Pattern: Strategy/Policy — each cache's hit-ratio model is one of these, chosen when the
+// graph is built from the scenario's `hit_ratio: {fixed: 0.8}` or `hit_ratio: che` (spec §5).
 
 // `hit_ratio: {fixed: h}`: the scenario author's own estimate, used as given (phase 2a),
-// whatever the capacity.
+// whatever the capacity: the argument is ignored on purpose. A stated ratio describes the
+// cache as the author sized it, and nothing says how it would scale, so a cache that loses a
+// replica (phase 3's node_down, which asks hit_ratio again with the smaller capacity) keeps it.
 struct FixedHitRatio {
   double value;
   [[nodiscard]] double hit_ratio(double /*capacity*/) const { return value; }
@@ -258,6 +298,51 @@ void normalise(std::vector<Bucket>& buckets) {
   return hits;
 }
 
+// The weight of each bucket's keys in a miss stream, as a logarithm: log Σ_j a_j p e^{−p t_j}
+// (Popularity::filtered_by), unnormalised. In log space because p·t can reach hundreds or
+// more for the hot keys of a big cache: e^{−p t} would underflow to 0 for every bucket, and
+// 0/0 is no distribution. For each bucket the largest term is factored out (log-sum-exp):
+//   log Σ_j a_j e^{−p t_j} = m + log Σ_j a_j e^{−p t_j − m},  m = max_j (−p t_j over a_j > 0).
+// t_j = +infinity (a shard that never misses) contributes nothing; if every shard is one,
+// the limit of the formula as t → ∞ is taken: the weight −p·(the largest double), next to
+// which log p no longer counts, keeps only the least popular bucket after normalising, which
+// is where the last misses would be.
+[[nodiscard]] std::vector<double> log_miss_weights(std::span<const Bucket> buckets,
+                                                   std::span<const CacheShard> shards) {
+  // C++20 ranges algorithms (std::ranges::all_of here, std::ranges::max in filtered_by) take
+  // the range itself instead of a begin/end iterator pair, so the two ends cannot come from
+  // different containers; ranges::max also returns the largest VALUE of a whole range, where
+  // std::max compares two arguments and std::max_element returns an iterator.
+  const bool never_misses = std::ranges::all_of(shards, [](const CacheShard& shard) {
+    return shard.key_share <= 0.0 || std::isinf(shard.characteristic_time);
+  });
+  std::vector<double> weights;
+  weights.reserve(buckets.size());
+  for (const auto& bucket : buckets) {
+    const double p = bucket.key_probability;
+    if (p <= 0.0) {  // a key nobody asks for is never missed either
+      weights.push_back(-std::numeric_limits<double>::infinity());
+      continue;
+    }
+    if (never_misses) {  // the limit: only the coldest keys keep any weight
+      weights.push_back(-p * std::numeric_limits<double>::max());
+      continue;
+    }
+    double exponent_max = -std::numeric_limits<double>::infinity();
+    for (const auto& shard : shards) {
+      if (shard.key_share <= 0.0 || std::isinf(shard.characteristic_time)) continue;
+      exponent_max = std::max(exponent_max, -p * shard.characteristic_time);
+    }
+    double sum = 0.0;
+    for (const auto& shard : shards) {
+      if (shard.key_share <= 0.0 || std::isinf(shard.characteristic_time)) continue;
+      sum += shard.key_share * std::exp(-p * shard.characteristic_time - exponent_max);
+    }
+    weights.push_back(std::log(p) + exponent_max + std::log(sum));
+  }
+  return weights;
+}
+
 // N, the number of whole keys in a key space of `space`: rounded down, after rejecting a
 // space that is NaN, infinite or below one key. This check and the others below are written
 // `!(x >= bound)` rather than `x < bound`: every comparison with a NaN is false, so
@@ -289,12 +374,37 @@ Popularity Popularity::uniform(double space) {
   return Popularity{{{.count = keys, .key_probability = 1.0 / keys}}};
 }
 
-double che_hit_ratio(double capacity, const Popularity& popularity) {
+double che_characteristic_time(double capacity, const Popularity& popularity) {
   if (!(capacity >= 0.0)) throw std::invalid_argument{"cache capacity must be >= 0"};
-  if (capacity >= popularity.key_count()) return 1.0;  // every key fits: no steady-state miss
+  // Every key fits: nothing is ever evicted, a key stays however long it goes unrequested.
+  if (capacity >= popularity.key_count()) return std::numeric_limits<double>::infinity();
   if (capacity == 0.0) return 0.0;
-  const auto buckets = popularity.buckets();
-  return hit_ratio_at(buckets, characteristic_time(buckets, capacity));
+  return characteristic_time(popularity.buckets(), capacity);
+}
+
+double che_hit_ratio(double capacity, const Popularity& popularity) {
+  const double t = che_characteristic_time(capacity, popularity);
+  if (std::isinf(t)) return 1.0;  // every key fits: no steady-state miss
+  if (t == 0.0) return 0.0;
+  return hit_ratio_at(popularity.buckets(), t);
+}
+
+Popularity Popularity::filtered_by(double characteristic_time) const {
+  const CacheShard whole{.key_share = 1.0, .characteristic_time = characteristic_time};
+  return filtered_by(std::span{&whole, 1});
+}
+
+Popularity Popularity::filtered_by(std::span<const CacheShard> shards) const {
+  std::vector<Bucket> misses = buckets_;
+  const auto weights = log_miss_weights(buckets_, shards);
+  // Divide by the largest weight before leaving log space: e^{log w − max} is at most 1 and at
+  // least one bucket gets exactly 1, so neither overflow nor an all-zero underflow can happen.
+  const double largest = std::ranges::max(weights);
+  for (std::size_t i = 0; i < misses.size(); ++i) {
+    misses[i].key_probability = std::exp(weights[i] - largest);
+  }
+  normalise(misses);
+  return Popularity{std::move(misses)};
 }
 
 }  // namespace simsys::caching

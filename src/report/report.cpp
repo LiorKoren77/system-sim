@@ -124,6 +124,15 @@ constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
   return num(value);
 }
 
+// A count of things (keys) with an SI prefix, as with_si_prefix — 500, 1.5k, 2M, 9999G — but
+// past the largest prefix in plain digits (20000000000000) rather than scientific notation: a
+// count, unlike a rate, is a whole number a reader compares digit by digit, and the scenario
+// grammar writes counts with k/M/G or digits only (config's parse_count).
+[[nodiscard]] std::string fmt_count(double value) {
+  if (!std::isfinite(value) || std::abs(value) < beyond_prefixes) return with_si_prefix(value);
+  return to_text(value, std::chars_format::fixed, 0);  // no std::format precision: see the top
+}
+
 [[nodiscard]] std::string fmt_rate(double per_second) {
   return with_si_prefix(per_second) + "/s";
 }
@@ -715,7 +724,7 @@ template <class T>
 // keys" (the scenario's `{zipf: 1.0, space: 100M}` and `{uniform: 10k}`).
 [[nodiscard]] std::string key_distribution(const model::KeySpec& keys) {
   const std::string shape = keys.zipf ? "zipf " + num(*keys.zipf) : "uniform";
-  return shape + " over " + with_si_prefix(keys.space) + " keys";
+  return shape + " over " + fmt_count(keys.space) + " keys";
 }
 
 // "u", "a, b": the clients a che hit ratio took its key distribution from.
@@ -727,9 +736,9 @@ template <class T>
 
 // The hit ratio and where it comes from: `0.8 (fixed)`, stated by the scenario; `0.732 (che:
 // zipf 1 over 100M keys from users)`, computed by the graph with the Che approximation from the
-// cache's `keys` and the key distribution of the clients upstream (named, so a reader can find
-// the numbers it rests on), plus `; 2M keys x 4 partitioned` when a hash ring multiplied the
-// size (partition_summary); `che` alone for one the graph left without a number; `none`.
+// cache's `keys` and the key distribution of the clients that reach it (named, so a reader can
+// find the numbers it rests on; che_provenance); `che` alone for one the graph left without a
+// number; `none`.
 [[nodiscard]] std::string hit_ratio_summary(const graph::ResolvedNode& node) {
   const auto& stated = node.spec.hit_ratio;
   if (!stated) return "none";
@@ -737,14 +746,41 @@ template <class T>
   return num(node.hit_ratio->value, stated->che ? 3 : 6);
 }
 
-// "; 10k keys x 4 partitioned" for a che cache behind a consistent-hash ring: its replicas
-// split the key space, so the Che approximation used `keys × replicas` as the cache size
-// (graph's detail::effective_capacity); nothing for any other cache.
+// "; 10k keys x 4 partitioned, uneven arcs" for a che cache behind a consistent-hash ring: its
+// replicas split the key space, so together they hold `keys × replicas` keys, each replica over
+// its own arc of the ring, and the arcs are uneven (the ring's imbalance; graph's
+// detail::ring_arcs). Nothing for any other cache.
 [[nodiscard]] std::string partition_summary(const graph::ResolvedNode& node) {
   const int partitions = node.hit_ratio->partitions;
   if (partitions <= 1) return {};
-  return "; " + with_si_prefix(static_cast<double>(*node.spec.keys)) + " keys x " +
-         std::to_string(partitions) + " partitioned";
+  return "; " + fmt_count(static_cast<double>(*node.spec.keys)) + " keys x " +
+         std::to_string(partitions) + " partitioned" +
+         (node.imbalance > 1.0 ? ", uneven arcs" : "");
+}
+
+// "; fed through fixed-ratio cache 'browser_cache': treated as unfiltered" when the keys passed
+// a cache that says how many requests miss but not which (graph's ResolvedHitRatio::
+// unfiltered_through): the Che popularity is then the one in front of it, an approximation
+// worth flagging. Nothing otherwise.
+[[nodiscard]] std::string unfiltered_caveat(const graph::Graph& g,
+                                            const graph::ResolvedHitRatio& resolved) {
+  if (!resolved.unfiltered_through) return {};
+  const auto& through = g.nodes()[*resolved.unfiltered_through];
+  const std::string kind = through.hit_ratio ? "fixed-ratio " : "";
+  const std::string unknown = through.hit_ratio ? "" : " with no hit ratio";
+  return "; fed through " + kind + std::string{model::to_string(through.spec.type)} + " '" +
+         through.spec.id + "'" + unknown + ": treated as unfiltered";
+}
+
+// What a che hit ratio rests on: ` (che: zipf 0.9 over 10M keys from u, filtered by l1; 2M keys
+// x 4 partitioned, uneven arcs)`. "filtered by l1": the keys are cache l1's misses, whose
+// popularity is the clients' with l1's hits taken out (graph's ResolvedHitRatio::filtered_by).
+[[nodiscard]] std::string che_provenance(const graph::Graph& g, const graph::ResolvedNode& node) {
+  const auto& resolved = *node.hit_ratio;
+  std::string text =
+      " (che: " + key_distribution(*resolved.keys) + " from " + client_ids(g, resolved.key_clients);
+  if (resolved.filtered_by) text += ", filtered by " + g.nodes()[*resolved.filtered_by].spec.id;
+  return text + partition_summary(node) + unfiltered_caveat(g, resolved) + ")";
 }
 
 // A cache's model (plan 2a refinement 7): `hit_ratio=0.8 (fixed) strategy=cache_aside
@@ -757,14 +793,13 @@ template <class T>
   if (spec.type != model::NodeType::cache) return {};
   std::string text = "  hit_ratio=" + hit_ratio_summary(node);
   if (node.hit_ratio && node.hit_ratio->keys) {
-    text += " (che: " + key_distribution(*node.hit_ratio->keys) + " from " +
-            client_ids(g, node.hit_ratio->key_clients) + partition_summary(node) + ")";
+    text += che_provenance(g, node);
   } else if (node.hit_ratio) {
     text += " (fixed)";
   }
   text += " strategy=" + std::string{model::to_string(spec.strategy)} + write_ops_summary(g, cache);
   if (spec.backend) text += " backend=" + *spec.backend;
-  if (spec.keys) text += " keys=" + with_si_prefix(static_cast<double>(*spec.keys));
+  if (spec.keys) text += " keys=" + fmt_count(static_cast<double>(*spec.keys));
   if (spec.eviction) text += " eviction=" + *spec.eviction;
   if (spec.ttl) text += " ttl=" + fmt_duration(*spec.ttl);
   return text;

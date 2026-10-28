@@ -185,7 +185,7 @@ target and, if that link lists `ops`, lists the step's op.
 
 | type | own keys | status |
 |---|---|---|
-| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `keys` read by the [`che` caches](#che-hit-ratios) downstream (`keys must be a map`, `keys needs zipf and space, or uniform`, `keys takes zipf+space or uniform, not both`, `keys.zipf must be non-negative`, `keys.space must be a positive count`, `keys.uniform must be a positive count`; `space` and `uniform` are [counts](#values): `100M`); `timeout` checked (a duration), not yet used; `sizes`, `retries` ignored |
+| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `keys` read by the [`che` caches](#che-hit-ratios) downstream (`keys must be a map`, `keys needs zipf and space, or uniform`, `keys takes zipf+space or uniform, not both`, `keys.zipf must be a finite non-negative number`, `keys.space must be a positive count`, `keys.uniform must be a positive count`; `space` and `uniform` are [counts](#values): `100M`); `timeout` checked (a duration), not yet used; `sizes`, `retries` ignored |
 | `cdn` | `ttl`, `hit_ratio` (`{fixed: h}` or `che`, optional), `origin` (node id) | `origin` checked (a declared node); `hit_ratio` read as a cache's and used by a service's `on: miss` step after the CDN (a `che` CDN has no size in keys before the CDN task of phase 2b, so it counts as `h = 0` until then); others ignored. Runs from phase 2b |
 | `load_balancer` | `policy`, `vnodes` | read and run, see [`load_balancer`](#load_balancer) |
 | `rate_limiter` | `algorithm`, `limit`, `burst`, `window`, `backend` | read and run, see [`rate_limiter`](#rate_limiter) |
@@ -359,25 +359,53 @@ skew; a `che` one is (below).
 
 `hit_ratio: che` asks the graph to compute `h` once, at build, with the Che approximation of an
 LRU cache (`src/caching/caching.cppm`): the cache holds `keys` entries, and the key popularity
-is the `keys` distribution of the clients whose demand reaches the cache, found by walking the
-demand edges upstream through every node in between (services, load balancers, rate limiters,
-caches passing on to their store). Exactly one distribution must reach it:
+is the `keys` distribution of the clients whose requests reach the cache. Keys travel with
+calls, so the graph follows each client's **ops**, not the boxes: from the client's routes along
+every call an op makes (a service's steps, `on: miss` ones included whatever `h` turns out to be;
+a load balancer's or rate limiter's routes; a cache's fetch from its `backend` and its `then`
+steps). A client whose ops never call the cache brings none of its keys there, even through a
+service it shares with the cache's readers. One hop is left out: a rate limiter's `counter`
+request to its store, which counts per user (or rule), not per key the request is about. The
+model assumes every other hop between a client and the cache carries the client's key.
 
-- no client upstream with `keys`: *(graph)* `node 'c': hit_ratio che needs a client with keys upstream`;
+- no client's ops reach the cache: *(graph)* `node 'c': hit_ratio che: no client's demand reaches it`;
+- a client whose ops reach it states no `keys`: *(graph)* `node 'c': hit_ratio che: client 'b' reaches it without keys`;
 - two clients with different `keys`: *(graph)* `node 'c': hit_ratio che: clients 'a' and 'b' send different key distributions` (the first two in file order that disagree);
-- clients with equal `keys` share it.
+- clients with equal `keys` share it. `{zipf: 0, space: N}` is `{uniform: N}` (the loader stores it so), and the two agree.
+
+**Caches behind caches.** Requests that reach the cache as the misses of another `che` cache (its
+`read_through` fetch from its backend, its `then` step on miss, or a service's `on: miss` step
+after a lookup at it) are the cold tail of the popularity: the hot keys hit in front. Their
+popularity is the front cache's filtered by its characteristic time `t`: key `i` misses with
+probability `e^{−p_i t}`, so the misses ask for `i` with probability `∝ p_i e^{−p_i t}`
+(Martina, Garetto & Leonardi, INFOCOM 2014). Two 2M-key caches in a row over zipf 0.9 and 10M keys:
+the first hits 0.747, the second 0.257, not 0.747. A chain filters once per cache. The cache's
+reads must all come one way (`node 'l2': hit_ratio che: it receives both the misses of cache 'l1'
+and requests no cache filtered`); writes do not count, as they neither hit nor miss. A front
+cache with a **fixed** ratio says how many requests miss but not which: the popularity is used
+unfiltered, and `explain` says so.
 
 **Effective capacity.** `keys` is per replica. Behind a `consistent_hash` load balancer each key
-hashes to one replica, so the replicas hold disjoint parts of the key space and the Che
-approximation uses `keys × replicas` as the cache size (the replicas behave as one LRU cache of
-that size). Behind any other policy, or with no balancer, every replica can see every key and
-fills itself with the same hot keys, so the cache size is `keys`. The ring's uneven arcs and a
-replica lost to a `node_down` fault do not change it (the hit ratio is resolved once, at build).
+hashes to one replica, so the replicas hold disjoint parts of the key space, `keys × replicas`
+together. The ring's arcs are uneven: with imbalance `k = 1 + 1/√vnodes` (the load balancer's
+model) the hottest of `N` replicas owns `a_hot = k/N` of the keys and the others
+`a_cool = (1 − k/N)/(N − 1)` each. A replica owning a share `a` of a random partition is, for
+Che, one cache of `keys / a` over the whole space, and serves `a` of the requests, so
+`h = Σ_j a_j · Che(keys / a_j)`. The hit ratio is concave in the cache size, so uneven arcs hit
+less than one cache of `keys × N`: the consistent-hashing lab's four 2M-key servers with
+`vnodes: 1` (`k = 2`) give 0.924, where even arcs would give 0.963. A cache the ring partitions
+must be reached through rings only: *(graph)* `node 'c': keys are partitioned by ring 'lb' but
+'web' also sends to it directly`. Behind any other policy, or with no balancer, every replica can
+see every key and fills itself with the same hot keys, so the cache size is `keys`. A replica
+lost to a `node_down` fault does not change the hit ratio before phase 3 (it is resolved once,
+at build; phase 3 will re-evaluate it from the same inputs).
 
 `explain` prints the number and where it came from: `hit_ratio=0.881 (che: zipf 1 over 100M keys
-from users)`, and for a cache behind a ring `hit_ratio=0.963 (che: zipf 0.9 over 10M keys from
-clients; 2M keys x 4 partitioned)`. From then on a `che` cache runs exactly like a fixed one with
-that `h`.
+from users)`; behind another che cache `(che: zipf 0.9 over 10M keys from u, filtered by l1)`;
+behind a fixed one `(che: ... from users; fed through fixed-ratio cache 'browser_cache': treated
+as unfiltered)`; behind a ring `hit_ratio=0.924 (che: zipf 0.9 over 10M keys from clients; 2M keys
+x 4 partitioned, uneven arcs)`. A key space past `9999G` is written in digits. From then on a
+`che` cache runs exactly like a fixed one with that `h`.
 
 For spec §18: the code's `HitRatioModel` is `hit_ratio(capacity) -> double`, each model owning its
 inputs (`CheHitRatio{popularity}`), where spec §5 wrote `hit_ratio(capacity, popularity)`.
