@@ -3,9 +3,11 @@
 // CMake as SIMSYS_SCENARIOS_DIR: a compile definition is the one macro we accept, because
 // it carries a build-time path that no language feature can.
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -15,6 +17,7 @@
 // when a std header is included after importing a module that included it in its
 // global module fragment.
 import simsys.config;
+import simsys.core;
 import simsys.engine;
 import simsys.graph;
 import simsys.model;
@@ -195,4 +198,70 @@ TEST_CASE("a refused scenario's message names the first unsupported node and the
   const auto names_a_node = std::ranges::any_of(
       s.nodes, [&](const auto& node) { return message.find(node.id) != std::string::npos; });
   REQUIRE(names_a_node);
+}
+
+// ---- Request-based CDN (plan 2b refinement 4, Task 5) ----
+
+namespace {
+// The peak offered load explain's check line gives node `id`, in requests per second: the number
+// after "peak offered " in "  media_store  peak offered 324.3/s vs ...", with its k/M suffix
+// applied. explain prints a few significant digits, so a caller compares with a tolerance.
+double peak_offered_per_s(const std::string& explain_text, const std::string& id) {
+  const auto checks = explain_text.find("checks (");
+  REQUIRE(checks != std::string::npos);
+  const auto line = explain_text.find("\n  " + id + " ", checks);
+  REQUIRE(line != std::string::npos);
+  const auto key = std::string{"peak offered "};
+  const auto number_at = explain_text.find(key, line) + key.size();
+  std::size_t used = 0;
+  double value = std::stod(explain_text.substr(number_at), &used);
+  const char suffix = explain_text[number_at + used];
+  if (suffix == 'k') value *= 1e3;
+  if (suffix == 'M') value *= 1e6;
+  return value;
+}
+}  // namespace
+
+// Ch. 11's news feed serves media through a CDN with a fixed hit ratio of 0.95 in front of the
+// media store. The paper load must follow the miss edge cdn -> media_store: 1 - 0.95 = 5 % of the
+// reads that reach the CDN, where it used to be nothing (the edge did not exist).
+TEST_CASE("book/news-feed's media store is checked against the cdn's 5 percent miss share",
+          "[scenario]") {
+  const auto s =
+      simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml");
+  if (!s) FAIL(s.error().file << ":" << s.error().line << ": " << s.error().message);
+  const auto g = simsys::graph::Graph::build(*s);
+  if (!g) FAIL(g.error().message);
+  const auto text = simsys::report::render_explain(*g);
+  CAPTURE(text);
+  const double at_cdn = peak_offered_per_s(text, "cdn");
+  const double at_origin = peak_offered_per_s(text, "media_store");
+  REQUIRE(at_cdn > 0.0);
+  // explain prints four significant digits ("6.486k/s"), so the ratio holds to 1e-3.
+  REQUIRE_THAT(at_origin, Catch::Matchers::WithinRel(0.05 * at_cdn, 1e-3));
+}
+
+// Ch. 14's YouTube sizes its two CDNs in bytes (`capacity: 100GB/s`, `50GB/s`) and gives them a
+// che hit ratio: valid scenario, explained, but not runnable before phase 2c's byte flows.
+// The engine's FIRST refusal is the node types it does not simulate at all (blob_store, queues
+// and workers: "... (phase 2)"), which comes before the cdn's own byte-capacity refusal
+// (see the theory test for that message), so only "phase 2" is asserted here.
+TEST_CASE("book/youtube validates and explains, and the engine does not run it yet", "[scenario]") {
+  const auto s =
+      simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml");
+  if (!s) FAIL(s.error().file << ":" << s.error().line << ": " << s.error().message);
+  // C++20 ranges algorithm with a projection: find the node whose `id` member equals "cdn_us",
+  // replacing `std::find_if(begin, end, [](const auto& n) { return n.id == "cdn_us"; })`.
+  const auto cdn_us = std::ranges::find(s->nodes, "cdn_us", &simsys::model::NodeSpec::id);
+  REQUIRE(cdn_us != s->nodes.end());
+  REQUIRE(cdn_us->origin == "transcoded_store");
+  REQUIRE(cdn_us->byte_capacity == simsys::ByteRate{100e9});
+  REQUIRE(cdn_us->hit_ratio.has_value());
+  REQUIRE(cdn_us->hit_ratio->che);
+  const auto g = simsys::graph::Graph::build(*s);
+  if (!g) FAIL(g.error().message);
+  REQUIRE_FALSE(simsys::report::render_explain(*g).empty());
+  const auto sim = simsys::engine::Simulation::create(*g);
+  REQUIRE_FALSE(sim.has_value());
+  REQUIRE(sim.error().message.find("phase 2") != std::string::npos);
 }
