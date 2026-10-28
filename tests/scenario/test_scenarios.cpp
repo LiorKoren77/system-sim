@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -514,4 +515,90 @@ TEST_CASE("book/url-shortener runs its 24 hours and meets both SLOs with a 0.881
   REQUIRE(p99.observed.has_value());
   REQUIRE_THAT(*p99.observed, Catch::Matchers::WithinRel(7.49e-3, 0.02));
   REQUIRE(drops.observed == 0.0);
+}
+
+// ---- Request sizes and link bandwidth in the shipped scenarios (phase 2c, Task 1) --------------
+//
+// `sizes:` and `bandwidth:` used to be read and ignored; the loader now types them, so a shipped
+// scenario that names an op its client does not send (or writes a size the grammar refuses) would
+// stop loading. The sizes below are each scenario's own, with the arithmetic of its unit.
+
+namespace {
+
+// The size `scenario` states for `op` at the client `client_id`, in bytes; the test fails when the
+// client or the op's size is missing.
+double stated_size_of(const simsys::model::Scenario& scenario, std::string_view client_id,
+                      std::string_view op) {
+  const auto client = std::ranges::find(scenario.nodes, client_id, &simsys::model::NodeSpec::id);
+  REQUIRE(client != scenario.nodes.end());
+  REQUIRE(client->workload.has_value());
+  const auto found = std::ranges::find_if(client->workload->sizes,
+                                          [&](const auto& entry) { return entry.first == op; });
+  REQUIRE(found != client->workload->sizes.end());
+  return found->second.count;
+}
+
+}  // namespace
+
+TEST_CASE("book/youtube's clients state the sizes of a stream and an upload in bytes",
+          "[scenario]") {
+  const auto s = load_scenario("/book/youtube/scenario.yaml");
+  for (const auto* client : {"viewers_us", "viewers_eu"}) {
+    CAPTURE(client);
+    // 50 MB = 5e7 B; 300 MB = 3e8 B; 2 KB = 2e3 B.
+    CHECK_THAT(stated_size_of(s, client, "stream"), Catch::Matchers::WithinRel(5e7, 1e-12));
+    CHECK_THAT(stated_size_of(s, client, "upload"), Catch::Matchers::WithinRel(3e8, 1e-12));
+    CHECK_THAT(stated_size_of(s, client, "upload_meta"), Catch::Matchers::WithinRel(2e3, 1e-12));
+    CHECK_THAT(stated_size_of(s, client, "metadata"), Catch::Matchers::WithinRel(2e3, 1e-12));
+  }
+}
+
+TEST_CASE("book scenarios and the kv-store lab state their request sizes in bytes", "[scenario]") {
+  // news-feed: 2 KB = 2e3 B, 200 KB = 2e5 B.
+  const auto news = load_scenario("/book/news-feed/scenario.yaml");
+  CHECK_THAT(stated_size_of(news, "users", "post"), Catch::Matchers::WithinRel(2e3, 1e-12));
+  CHECK_THAT(stated_size_of(news, "users", "read_media"), Catch::Matchers::WithinRel(2e5, 1e-12));
+  // google-drive: 500 KB = 5e5 B (the book's average file), 1 KB = 1e3 B.
+  const auto drive = load_scenario("/book/google-drive/scenario.yaml");
+  CHECK_THAT(stated_size_of(drive, "clients", "download"), Catch::Matchers::WithinRel(5e5, 1e-12));
+  CHECK_THAT(stated_size_of(drive, "clients", "upload"), Catch::Matchers::WithinRel(5e5, 1e-12));
+  CHECK_THAT(stated_size_of(drive, "clients", "metadata"), Catch::Matchers::WithinRel(1e3, 1e-12));
+  // chat-system: 1 KB = 1e3 B.
+  const auto chat = load_scenario("/book/chat-system/scenario.yaml");
+  CHECK_THAT(stated_size_of(chat, "users", "send"), Catch::Matchers::WithinRel(1e3, 1e-12));
+  // web-crawler: 200 B.
+  const auto crawler = load_scenario("/book/web-crawler/scenario.yaml");
+  CHECK_THAT(stated_size_of(crawler, "seeds", "crawl"), Catch::Matchers::WithinRel(200.0, 1e-12));
+  // kv-store lab: 1 KB = 1e3 B.
+  const auto kv = load_scenario("/labs/kv-store/scenario.yaml");
+  CHECK_THAT(stated_size_of(kv, "clients", "put"), Catch::Matchers::WithinRel(1e3, 1e-12));
+}
+
+TEST_CASE("every size a shipped scenario states names an op its client sends", "[scenario]") {
+  for (const auto& file : scenario_files()) {
+    CAPTURE(file);
+    const auto s = load_or_fail(file);
+    for (const auto& node : s.nodes) {
+      if (!node.workload) continue;
+      for (const auto& [op, size] : node.workload->sizes) {
+        CAPTURE(node.id, op);
+        const auto sends = std::ranges::any_of(
+            node.workload->op_shares, [&](const auto& share) { return share.first == op; });
+        CHECK(sends);
+        CHECK(size.count > 0.0);
+      }
+    }
+  }
+}
+
+TEST_CASE("every link bandwidth a shipped scenario states is a positive byte rate", "[scenario]") {
+  for (const auto& file : scenario_files()) {
+    CAPTURE(file);
+    const auto s = load_or_fail(file);
+    for (const auto& link : s.links) {
+      if (!link.bandwidth) continue;
+      CAPTURE(link.from, link.to);
+      CHECK(link.bandwidth->bytes_per_second > 0.0);
+    }
+  }
 }

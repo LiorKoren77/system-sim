@@ -175,3 +175,23 @@ TEST_CASE("a default NodeSpec has no id algorithm", "[model]") {
   const simsys::model::NodeSpec n{.id = "x", .type = NodeType::id_generator};
   REQUIRE_FALSE(n.id_algorithm.has_value());
 }
+
+// Request sizes and link bandwidth are optional in the scenario (phase 2c, Task 1): a client
+// states `sizes:` only for ops that carry bytes, a step `size:` only when it carries its own
+// payload, a link `bandwidth:` only when the pipe is a constraint. Absent means "not stated",
+// never zero, so the graph can tell an unsized op (an error at a byte-sized node) from a
+// zero-byte one.
+TEST_CASE("a default Workload states no request sizes", "[model]") {
+  const simsys::model::Workload w{};
+  REQUIRE(w.sizes.empty());
+}
+
+TEST_CASE("a default Step states no size of its own", "[model]") {
+  const simsys::model::Step st{.to = "db"};
+  REQUIRE_FALSE(st.size.has_value());
+}
+
+TEST_CASE("a default LinkSpec states no bandwidth", "[model]") {
+  const simsys::model::LinkSpec l{.from = "a", .to = "b"};
+  REQUIRE_FALSE(l.bandwidth.has_value());
+}

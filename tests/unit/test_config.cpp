@@ -2,6 +2,7 @@
 // mistake in a scenario file is reported (message, file and line).
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -3389,4 +3390,195 @@ TEST_CASE("the algorithm key stays the limiter's on a rate limiter and invalid e
                      "node 'limiter': algorithm must be token_bucket, leaky_bucket, "
                      "fixed_window, sliding_log or sliding_counter");
   }
+}
+
+// ---- Request sizes, step sizes and link bandwidth (phase 2c, Task 1) ---------------------------
+//
+// Until now `sizes` (on a client) and `bandwidth` (on a link) were accepted and ignored; now they
+// are typed into the model (Workload::sizes, LinkSpec::bandwidth) and a step may state `size`
+// (Step::size). Sizes are decimal bytes (1 KB = 1000 B) and a bandwidth is a byte rate that may
+// also be written in bits, as a network is (40Gbit/s = 5e9 B/s).
+
+namespace {
+
+// A scenario with one client `u` that sends the ops `stream` and `upload`, plus `sizes_value`
+// as the text after `sizes: ` (e.g. `{stream: 50MB}`).
+std::string client_with_sizes(std::string_view sizes_value) {
+  return scenario_with(
+      "  u: {type: client, rate: {base: 10/s}, ops: {stream: 0.9, upload: 0.1}, "
+      "sizes: " +
+      std::string{sizes_value} + "}\n");
+}
+
+// The size the workload states for `op`, in bytes, or nullopt when it states none.
+std::optional<double> stated_size(const simsys::model::Workload& workload, std::string_view op) {
+  const auto found =
+      std::ranges::find_if(workload.sizes, [&](const auto& entry) { return entry.first == op; });
+  if (found == workload.sizes.end()) return std::nullopt;
+  return found->second.count;
+}
+
+// A scenario with two services `a` and `b` and one link whose attributes are `attributes`.
+std::string link_with(std::string_view attributes) {
+  return scenario_with("  a: {type: service}\n  b: {type: service}\n",
+                       "links: [{from: a, to: b, " + std::string{attributes} + "}]\n");
+}
+
+// A service `a` whose op `x` has one step, to the service `b`, with the attributes
+// `step_attributes` (a step may not target its own node).
+std::string step_with(std::string_view step_attributes) {
+  return scenario_with("  a: {type: service, ops: {x: [{to: b, " + std::string{step_attributes} +
+                       "}]}}\n  b: {type: service}\n");
+}
+
+}  // namespace
+
+TEST_CASE("a client's sizes are typed into its workload in bytes") {
+  const auto path =
+      write_temp("simsys_sizes_typed.yaml", client_with_sizes("{stream: 50MB, upload: 300MB}"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  const auto& workload = s->nodes[0].workload;
+  REQUIRE(workload.has_value());
+  REQUIRE(workload->sizes.size() == 2);
+  // 50 MB = 50 x 1e6 B; 300 MB = 300 x 1e6 B.
+  REQUIRE(stated_size(*workload, "stream").has_value());
+  REQUIRE(stated_size(*workload, "upload").has_value());
+  CHECK_THAT(*stated_size(*workload, "stream"), Catch::Matchers::WithinRel(5e7, 1e-12));
+  CHECK_THAT(*stated_size(*workload, "upload"), Catch::Matchers::WithinRel(3e8, 1e-12));
+}
+
+TEST_CASE("a client may size only some of its ops and an unsized op has no size") {
+  const auto path = write_temp("simsys_sizes_partial.yaml", client_with_sizes("{upload: 2KB}"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  const auto& workload = *s->nodes[0].workload;
+  REQUIRE(workload.sizes.size() == 1);
+  CHECK_FALSE(stated_size(workload, "stream").has_value());
+  REQUIRE(stated_size(workload, "upload").has_value());
+  CHECK_THAT(*stated_size(workload, "upload"), Catch::Matchers::WithinRel(2e3, 1e-12));  // 2 x 1e3
+}
+
+TEST_CASE("a client with no sizes states none") {
+  const auto path = write_temp("simsys_sizes_absent.yaml", client_with("timeout: 1s"));
+  const auto s = simsys::config::load(path.string());
+  REQUIRE(s.has_value());
+  CHECK(s->nodes[0].workload->sizes.empty());
+}
+
+TEST_CASE("sizes may not name an op the client does not send") {
+  require_rejected("simsys_sizes_unsent_op.yaml", client_with_sizes("{x: 1MB}"),
+                   "node 'u': sizes names op 'x', which the client does not send");
+}
+
+TEST_CASE("a size without a unit is refused and the message shows the grammar") {
+  require_rejected("simsys_sizes_no_unit.yaml", client_with_sizes("{stream: 50}"),
+                   "node 'u': sizes 'stream' must be a size (B, KB, MB or GB: 50MB)");
+}
+
+TEST_CASE("a step's size is typed into the step in bytes") {
+  const auto path = write_temp("simsys_step_size.yaml", step_with("op: write, size: 50MB"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  const auto& steps = s->nodes[0].ops.at("x");
+  REQUIRE(steps.size() == 1);
+  REQUIRE(steps[0].size.has_value());
+  CHECK_THAT(steps[0].size->count, Catch::Matchers::WithinRel(5e7, 1e-12));  // 50 x 1e6 B
+}
+
+TEST_CASE("a step that states no size has none") {
+  const auto path = write_temp("simsys_step_no_size.yaml", step_with("op: write"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  CHECK_FALSE(s->nodes[0].ops.at("x")[0].size.has_value());
+}
+
+TEST_CASE("a step's size that is not a size is refused with the same grammar") {
+  require_rejected("simsys_step_size_word.yaml", step_with("op: write, size: fast"),
+                   "node 'a': step size must be a size (B, KB, MB or GB: 50MB)");
+}
+
+TEST_CASE("a link's bandwidth in bits is typed into the link as bytes per second") {
+  const auto path = write_temp("simsys_link_bandwidth.yaml", link_with("bandwidth: 40Gbit/s"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->links[0].bandwidth.has_value());
+  // 40 Gbit/s / 8 = 5e9 B/s.
+  CHECK_THAT(s->links[0].bandwidth->bytes_per_second, Catch::Matchers::WithinRel(5e9, 1e-12));
+}
+
+TEST_CASE("a link's bandwidth in bytes is typed as stated and a link without one has none") {
+  const auto with = write_temp("simsys_link_bandwidth_bytes.yaml", link_with("bandwidth: 500MB/s"));
+  const auto loaded = simsys::config::load(with.string());
+  INFO((loaded ? "" : loaded.error().message));
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->links[0].bandwidth.has_value());
+  // 500 x 1e6 = 5e8 B/s.
+  CHECK_THAT(loaded->links[0].bandwidth->bytes_per_second, Catch::Matchers::WithinRel(5e8, 1e-12));
+
+  const auto without = write_temp("simsys_link_no_bandwidth.yaml", link_with("latency: 1ms"));
+  const auto bare = simsys::config::load(without.string());
+  REQUIRE(bare.has_value());
+  CHECK_FALSE(bare->links[0].bandwidth.has_value());
+}
+
+TEST_CASE("a link's bandwidth must be positive") {
+  // A pipe of zero capacity can carry nothing: the message says what is wrong, not "invalid".
+  require_rejected("simsys_link_bandwidth_zero.yaml", link_with("bandwidth: 0B/s"),
+                   "link a -> b: bandwidth must be positive");
+}
+
+TEST_CASE("a link's bandwidth that is a request rate is refused and the message shows byte forms") {
+  require_rejected("simsys_link_bandwidth_rate.yaml", link_with("bandwidth: 10k/s"),
+                   "link a -> b: bandwidth is a byte rate (B/s, or bit/s for a network: "
+                   "40Gbit/s)");
+}
+
+// A shipped-style scenario in miniature: ch. 14's YouTube sends four ops with sizes, a
+// transcoder renames the uploaded video's op and says how big one rendition is, and the
+// uploader's link is a 1 Gbit/s pipe. Everything arrives typed in the model.
+TEST_CASE("sizes, a step's size and a link's bandwidth round-trip into the model together") {
+  const auto path = write_temp("simsys_bytes_round_trip.yaml", R"(
+version: 1
+name: bytes
+duration: 1m
+nodes:
+  viewers:
+    type: client
+    rate: {base: 100/s}
+    ops: {stream: 0.88, upload: 0.02, upload_meta: 0.02, metadata: 0.08}
+    sizes: {stream: 50MB, upload: 300MB, upload_meta: 2KB, metadata: 2KB}
+  transcoders:
+    type: service
+    ops:
+      upload: [{to: store, op: write, size: 50MB}, {to: store, op: log}]
+  store:
+    type: blob_store
+links:
+  - {from: viewers, to: transcoders, dir: inout, ops: [upload], bandwidth: 1Gbit/s}
+  - {from: transcoders, to: store}
+)");
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  const auto& viewers = *s->nodes[0].workload;
+  REQUIRE(viewers.sizes.size() == 4);
+  CHECK_THAT(*stated_size(viewers, "stream"), Catch::Matchers::WithinRel(5e7, 1e-12));
+  CHECK_THAT(*stated_size(viewers, "upload"), Catch::Matchers::WithinRel(3e8, 1e-12));
+  CHECK_THAT(*stated_size(viewers, "upload_meta"), Catch::Matchers::WithinRel(2e3, 1e-12));
+  CHECK_THAT(*stated_size(viewers, "metadata"), Catch::Matchers::WithinRel(2e3, 1e-12));
+  const auto& steps = s->nodes[1].ops.at("upload");
+  REQUIRE(steps.size() == 2);
+  REQUIRE(steps[0].size.has_value());
+  CHECK_THAT(steps[0].size->count, Catch::Matchers::WithinRel(5e7, 1e-12));
+  CHECK_FALSE(steps[1].size.has_value());
+  REQUIRE(s->links[0].bandwidth.has_value());
+  // 1 Gbit/s / 8 = 1.25e8 B/s.
+  CHECK_THAT(s->links[0].bandwidth->bytes_per_second, Catch::Matchers::WithinRel(1.25e8, 1e-12));
+  CHECK_FALSE(s->links[1].bandwidth.has_value());
 }
