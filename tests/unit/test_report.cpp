@@ -24,6 +24,7 @@ using namespace std::chrono_literals;
 using Catch::Approx;
 using Catch::Matchers::WithinRel;
 using simsys::Rate;
+using simsys::model::KeySpec;
 using simsys::model::LimiterAlgorithm;
 using simsys::model::LinkSpec;
 using simsys::model::NodeSpec;
@@ -751,4 +752,37 @@ TEST_CASE("explain notes write_ops that never arrive at the cache", "[report]") 
   CAPTURE(written);
   REQUIRE(written.contains("write_ops=suggest"));
   REQUIRE_FALSE(written.contains("never arrives"));
+}
+
+// A che hit ratio is computed, not stated, so explain shows where its inputs came from: the
+// key distribution, and which client sent it.
+TEST_CASE("explain prints a che hit ratio with its provenance", "[report]") {
+  Scenario s{.name = "che", .version = 1, .duration = 1s};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{100}},
+                                           .op_shares = {{"get", 1.0}},
+                                           .keys = KeySpec{.zipf = 1.0, .space = 10'000}}},
+             NodeSpec{.id = "web",
+                      .type = NodeType::service,
+                      .ops = {{"get", {Step{.to = "cache", .op = "read"}}}}},
+             NodeSpec{.id = "cache",
+                      .type = NodeType::cache,
+                      .hit_ratio = simsys::model::HitRatio{.che = true},
+                      .strategy = simsys::model::CacheStrategy::cache_aside,
+                      .keys = 1000}};
+  s.links = {LinkSpec{.from = "u", .to = "web"}, LinkSpec{.from = "web", .to = "cache"}};
+  const auto built = simsys::graph::Graph::build(s);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto text = simsys::report::render_explain(*built);
+  CAPTURE(text);
+  const auto number_at = text.find("hit_ratio=0.");
+  const auto provenance_at = text.find(" (che: zipf 1 over 10k keys from u)");
+  REQUIRE(number_at != std::string::npos);
+  REQUIRE(provenance_at != std::string::npos);
+  REQUIRE(provenance_at > number_at);
+  // Between "hit_ratio=" and the provenance there is only the number: "0." and digits.
+  const auto number = text.substr(number_at + 10, provenance_at - (number_at + 10));
+  REQUIRE(std::ranges::all_of(number, [](char c) { return c == '.' || (c >= '0' && c <= '9'); }));
 }

@@ -947,6 +947,61 @@ links: []
   CHECK(workload->timeout == 1s);
 }
 
+namespace {
+// A scenario with one client `u` whose body after `ops` is `extra` (e.g. `keys: 5`).
+std::string client_with(std::string_view extra) {
+  return "version: 1\nname: t\nduration: 1m\nnodes:\n  u: {type: client, rate: {base: 10/s}, "
+         "ops: {a: 1}, " +
+         std::string{extra} + "}\nlinks: []\n";
+}
+}  // namespace
+
+TEST_CASE("a client's keys are typed: zipf with a space, or uniform") {
+  SECTION("zipf with a space") {
+    const auto path =
+        write_temp("simsys_keys_zipf.yaml", client_with("keys: {zipf: 1.0, space: 100M}"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    const auto& workload = s->nodes[0].workload;
+    REQUIRE(workload.has_value());
+    REQUIRE(workload->keys.has_value());
+    REQUIRE(workload->keys->zipf.has_value());
+    CHECK(*workload->keys->zipf == 1.0);
+    CHECK(workload->keys->space == 100e6);
+  }
+  SECTION("uniform over a space") {
+    const auto path = write_temp("simsys_keys_uniform.yaml", client_with("keys: {uniform: 10M}"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    const auto& workload = s->nodes[0].workload;
+    REQUIRE(workload.has_value());
+    REQUIRE(workload->keys.has_value());
+    CHECK_FALSE(workload->keys->zipf.has_value());
+    CHECK(workload->keys->space == 10e6);
+  }
+  SECTION("a client without keys has none") {
+    const auto path = write_temp("simsys_keys_absent.yaml", client_with("timeout: 1s"));
+    const auto s = simsys::config::load(path.string());
+    REQUIRE(s.has_value());
+    CHECK_FALSE(s->nodes[0].workload->keys.has_value());
+  }
+}
+
+TEST_CASE("a client's keys block is validated") {
+  require_rejected("simsys_keys_no_space.yaml", client_with("keys: {zipf: 1.0}"),
+                   "node 'u': keys needs zipf and space, or uniform");
+  require_rejected("simsys_keys_negative.yaml", client_with("keys: {zipf: -1, space: 10}"),
+                   "node 'u': keys.zipf must be non-negative");
+  require_rejected("simsys_keys_zero_space.yaml", client_with("keys: {zipf: 1, space: 0}"),
+                   "node 'u': keys.space must be a positive count");
+  require_rejected("simsys_keys_both.yaml", client_with("keys: {zipf: 1, space: 10, uniform: 5}"),
+                   "node 'u': keys takes zipf+space or uniform, not both");
+  require_rejected("simsys_keys_scalar.yaml", client_with("keys: 5"),
+                   "node 'u': keys must be a map");
+}
+
 TEST_CASE("client op shares must sum to one") {
   require_rejected("simsys_shares_sum.yaml", R"(
 version: 1
