@@ -1,8 +1,9 @@
 // Module `simsys.config`, interface unit: what a scenario file declares (nodes, links,
-// duration) and `load`, which reads one and checks it structurally: node types, node
-// references and unit strings. That is enough to machine-check scenario drafts before the
-// engine exists; behaviour parameters (eviction policy, quorum sizes, ...) are left to
-// the engine. The checks themselves live in the implementation unit, config.cpp.
+// duration) and `load`, which reads one and checks it structurally: document shape,
+// required keys, node types, duplicate or empty ids, node references and unit strings.
+// That is enough to machine-check scenario drafts before the engine exists; behaviour
+// parameters (eviction policy, quorum sizes, ...) are left to the engine. The checks
+// themselves live in the implementation unit, config.cpp.
 //
 // Compilation firewall: interface declares, implementation unit defines; importers never
 // recompile when only config.cpp changes. This is a build technique, not a GoF design
