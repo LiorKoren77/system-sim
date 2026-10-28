@@ -31,6 +31,7 @@ target_sources(simsys
     src/defaults/defaults.cppm
     src/engine/graph.cppm
     src/engine/behaviours.cppm
+    src/engine/engine.cppm
   PRIVATE                               # module implementation units are ordinary sources
     src/config/config.cpp)
 target_link_libraries(simsys PUBLIC yaml-cpp::yaml-cpp PRIVATE simsys_warnings)
