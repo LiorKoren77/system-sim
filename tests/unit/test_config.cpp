@@ -1,5 +1,6 @@
 // Properties of the scenario loader: what a valid file produces and how every kind of
 // mistake in a scenario file is reported (message, file and line).
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -9,6 +10,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <unistd.h>  // getpid
@@ -887,5 +889,235 @@ nodes:
 links: []
 )",
                      "node 'a': advanced.burstiness must be non-negative");
+  }
+}
+
+TEST_CASE("a client's rate.base, op shares and timeout are typed") {
+  const auto path = write_temp("simsys_client_workload.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  u: {type: client, rate: {base: 12.8k/s}, ops: {redirect: 0.91, shorten: 0.09}, timeout: 1s}
+links: []
+)");
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->nodes.size() == 1);
+  const auto& workload = s->nodes[0].workload;
+  REQUIRE(workload.has_value());
+  CHECK(workload->base == simsys::Rate{12800});
+  REQUIRE(workload->op_shares.size() == 2);
+  CHECK(workload->op_shares[0].first == "redirect");
+  CHECK(workload->op_shares[0].second == Catch::Approx(0.91));
+  CHECK(workload->op_shares[1].first == "shorten");
+  CHECK(workload->timeout == 1s);
+}
+
+TEST_CASE("client op shares must sum to one") {
+  require_rejected("simsys_shares_sum.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  u: {type: client, rate: {base: 10/s}, ops: {a: 0.5, b: 0.4}}
+links: []
+)",
+                   "node 'u': op shares sum to 0.9, expected 1");
+}
+
+TEST_CASE("a client needs rate.base") {
+  require_rejected("simsys_client_no_rate.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  u: {type: client, ops: {a: 1}}
+links: []
+)",
+                   "node 'u': client needs rate.base");
+}
+
+TEST_CASE("a client op share must be a number in (0, 1]") {
+  require_rejected("simsys_share_zero.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  u: {type: client, rate: {base: 10/s}, ops: {a: 0, b: 1}}
+links: []
+)",
+                   "node 'u': op share 'a' must be in (0, 1]");
+}
+
+TEST_CASE("service steps are typed with their defaults") {
+  const auto path = write_temp("simsys_typed_steps.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  web:
+    type: service
+    ops:
+      read:
+        - {to: cache}
+        - {to: db, op: select, on: miss, mode: parallel, factor: 3}
+  cache: {type: cache}
+  db: {type: sql_db}
+links:
+  - {from: web, to: cache}
+  - {from: web, to: db}
+)");
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->nodes.size() == 3);
+  const auto& steps = s->nodes[0].ops.at("read");
+  REQUIRE(steps.size() == 2);
+  CHECK(steps[0].to == "cache");
+  CHECK(steps[0].op == "read");  // defaults to the incoming op
+  CHECK(steps[0].on == simsys::model::StepCondition::always);
+  CHECK(steps[0].mode == simsys::model::StepMode::sequential);
+  CHECK(steps[0].factor == 1.0);
+  CHECK(steps[1].to == "db");
+  CHECK(steps[1].op == "select");
+  CHECK(steps[1].on == simsys::model::StepCondition::miss);
+  CHECK(steps[1].mode == simsys::model::StepMode::parallel);
+  CHECK(steps[1].factor == 3.0);
+}
+
+TEST_CASE("then steps are typed on nodes that have them") {
+  const auto path = write_temp("simsys_typed_then.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  w: {type: worker_pool, consumes: q, then: [{to: c, op: write, factor: 100}]}
+  q: {type: message_queue}
+  c: {type: cache}
+links:
+  - {from: q, to: w}
+  - {from: w, to: c}
+)");
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->nodes.size() == 3);
+  const auto& then = s->nodes[0].then;
+  REQUIRE(then.size() == 1);
+  CHECK(then[0].op == "write");
+  CHECK(then[0].factor == 100.0);
+}
+
+TEST_CASE("step factor must be positive and on/mode must be known words") {
+  const auto with_step = [](std::string_view step) {
+    return "version: 1\nname: t\nduration: 1m\nnodes:\n  a: {type: service, ops: {x: [" +
+           std::string{step} + "]}}\nlinks: []\n";
+  };
+  SECTION("a zero factor") {
+    require_rejected("simsys_step_factor_zero.yaml", with_step("{to: a, factor: 0}"),
+                     "node 'a': step factor must be positive");
+  }
+  SECTION("an unknown mode") {
+    require_rejected("simsys_step_bad_mode.yaml", with_step("{to: a, mode: sideways}"),
+                     "node 'a': step mode must be sequential or parallel");
+  }
+  SECTION("an unknown condition") {
+    require_rejected("simsys_step_bad_on.yaml", with_step("{to: a, on: sometimes}"),
+                     "node 'a': step condition must be always, miss or failure");
+  }
+}
+
+TEST_CASE("links are typed: direction, ops filter, latency, weight") {
+  const auto path = write_temp("simsys_typed_links.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a: {type: service}
+  b: {type: service}
+links:
+  - {from: a, to: b, dir: inout, ops: [read, write], latency: 2ms, weight: 0.5}
+  - {from: b, to: a}
+)");
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->links.size() == 2);
+  CHECK(s->links[0].dir == simsys::model::Direction::inout);
+  CHECK(s->links[0].ops == std::vector<std::string>{"read", "write"});
+  CHECK(s->links[0].latency == 2ms);
+  CHECK(s->links[0].weight == 0.5);
+  CHECK(s->links[1].dir == simsys::model::Direction::out);
+  CHECK(s->links[1].ops.empty());
+  CHECK_FALSE(s->links[1].latency.has_value());
+}
+
+TEST_CASE("a link's direction must be in, out or inout and its weight non-negative") {
+  const auto with_link = [](std::string_view link) {
+    return "version: 1\nname: t\nduration: 1m\nnodes:\n  a: {type: service}\n"
+           "  b: {type: service}\nlinks:\n  - " +
+           std::string{link} + "\n";
+  };
+  SECTION("an unknown direction") {
+    require_rejected("simsys_link_bad_dir.yaml", with_link("{from: a, to: b, dir: sideways}"),
+                     "link a -> b: dir must be in, out or inout");
+  }
+  SECTION("a negative weight") {
+    require_rejected("simsys_link_bad_weight.yaml", with_link("{from: a, to: b, weight: -1}"),
+                     "link a -> b: weight must be non-negative");
+  }
+}
+
+TEST_CASE("slo entries are typed; latency maxima are durations, ratios are numbers") {
+  const auto path = write_temp("simsys_typed_slo.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  u: {type: client, rate: {base: 10/s}, ops: {a: 1}}
+links: []
+slo:
+  - {metric: p99_latency, node: u, op: a, max: 50ms}
+  - {metric: drop_rate, max: 0.001}
+)");
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->slos.size() == 2);
+  CHECK(s->slos[0].metric == simsys::model::SloMetric::p99_latency);
+  CHECK(s->slos[0].node == "u");
+  CHECK(s->slos[0].op == "a");
+  // C++17 std::get<T>: reads the variant alternative T, throwing std::bad_variant_access
+  // when it holds another one; here it proves a latency maximum is held as a duration.
+  CHECK(std::get<simsys::SimTime>(s->slos[0].max) == 50ms);
+  CHECK(s->slos[1].metric == simsys::model::SloMetric::drop_rate);
+  CHECK_FALSE(s->slos[1].node.has_value());
+  CHECK(std::get<double>(s->slos[1].max) == 0.001);
+}
+
+TEST_CASE("an unknown slo metric or a bad max is rejected") {
+  const auto with_slo = [](std::string_view entry) {
+    return "version: 1\nname: t\nduration: 1m\nnodes:\n  api: {type: service}\nlinks: []\n"
+           "slo: [" +
+           std::string{entry} + "]\n";
+  };
+  SECTION("an unknown metric") {
+    require_rejected("simsys_slo_bad_metric.yaml", with_slo("{metric: happiness, max: 1}"),
+                     "slo: unknown metric 'happiness'");
+  }
+  SECTION("a latency maximum that is not a duration") {
+    require_rejected("simsys_slo_bad_max.yaml", with_slo("{metric: p99_latency, max: 0.5}"),
+                     "slo: p99_latency max must be a duration");
+  }
+  SECTION("a node that does not exist") {
+    require_rejected("simsys_slo_bad_node.yaml",
+                     with_slo("{metric: drop_rate, node: nobody, max: 0}"),
+                     "slo: unknown node 'nobody'");
+  }
+  SECTION("a latency percentile without a node") {
+    require_rejected("simsys_slo_no_node.yaml", with_slo("{metric: p50_latency, max: 1s}"),
+                     "slo: p50_latency needs a node");
   }
 }
