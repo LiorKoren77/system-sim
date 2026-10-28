@@ -135,7 +135,9 @@ struct TypeDefaults {
       // rate chosen; time book "round trip within the same datacenter" (one lookup)
       return {Rate{10'000}, t.intra_dc_rtt};
     case id_generator:
-      return {Rate{10'000}, 100_us};  // chosen; snowflake scenarios override it
+      // chosen, and never what a generator runs on: its `algorithm` (required by the loader
+      // and Graph::build) supplies the numbers instead, for_id_algorithm below.
+      return {Rate{10'000}, 100_us};
     case external_sink:
       // rate chosen; time and variability spec §6: third-party APIs are slow and erratic
       // (variability 2.0, i.e. more irregular than exponential).
@@ -180,6 +182,52 @@ inline constexpr double sql_write_cost =
   return database_write ? sql_write_cost : 1.0;
 }
 
+// ---- Id generators (plan 2b refinement 6; book ch. 7) ----
+
+// Snowflake's sequence field: 12 bits, the ids one machine may issue within one millisecond
+// (book ch. 7, "Twitter snowflake approach": "it can support a maximum of 4096 new IDs per
+// millisecond"). The next millisecond's timestamp resets it.
+inline constexpr int snowflake_sequence_bits = 12;
+
+// What one replica of an id generator does when the scenario states no capacity or latency,
+// per algorithm (model::IdAlgorithm says what each design is):
+//  - snowflake: 2^12 ids per millisecond × 1000 ms = 4.096M ids/s per machine, the ceiling the
+//    id layout sets by design; 10 us chosen: a clock read, a counter increment and a few
+//    shifts, the same order as the book's "compress 1 KB" row.
+//  - ticket_server: one auto-increment database, and handing out an id IS a write (REPLACE
+//    INTO + LAST_INSERT_ID in Flickr's design): spec §6's "SQL 1k writes" per second,
+//    sql_write_rate; 1 ms chosen: a single-row commit on one machine.
+//  - uuid: generated locally from random bits, with nothing shared to wait for, so nothing
+//    bounds it in practice: 1e9/s chosen as "unbounded" (any finite number the fluid queue can
+//    divide by; a run never comes near it), and 1 us chosen: drawing 122 random bits.
+// Variability stays 1 (exponential, as for every type but external sinks): the sugar is a
+// service with these two numbers, nothing more.
+[[nodiscard]] constexpr TypeDefaults for_id_algorithm(model::IdAlgorithm algorithm) {
+  using enum model::IdAlgorithm;  // C++20, see for_type
+  switch (algorithm) {
+    case snowflake:
+      return {Rate{(1 << snowflake_sequence_bits) * 1000.0}, 10_us};
+    case ticket_server:
+      return {sql_write_rate, 1_ms};  // spec §6 "SQL 1k writes"
+    case uuid:
+      return {Rate{1e9}, 1_us};
+  }
+  std::unreachable();  // C++23, see for_type: -Wswitch proves every enumerator returns
+}
+
+// The defaults a node falls back to: its type's (for_type), or, for an id generator, its
+// algorithm's.
+// Pattern: sugar resolved at build — an id generator is a ServiceBehaviour with chapter-7
+// defaults, no new behaviour class: the only thing its algorithm changes is the two numbers
+// returned here, which resolve_service_rate and resolve_service_time (and so resolve_capacity)
+// read like any type default. A scenario's `capacity` or `latency` still wins over them.
+[[nodiscard]] constexpr TypeDefaults defaults_of(const model::NodeSpec& n) {
+  if (n.type == model::NodeType::id_generator && n.id_algorithm) {
+    return for_id_algorithm(*n.id_algorithm);
+  }
+  return for_type(n.type);
+}
+
 // Where a resolved number came from, for `simsys explain`.
 enum class Source { scenario, type_default, dc_default };
 
@@ -199,7 +247,7 @@ struct Resolved {
   if (n.byte_capacity) {
     return {Rate{n.byte_capacity->bytes_per_second / blob_object_bytes}, Source::scenario};
   }
-  return {for_type(n.type).service_rate, Source::type_default};
+  return {defaults_of(n).service_rate, Source::type_default};
 }
 
 // The byte rate a node's request capacity was converted from at blob_object_bytes, if it was
@@ -218,7 +266,7 @@ struct Resolved {
 
 [[nodiscard]] Resolved<SimTime> resolve_service_time(const model::NodeSpec& n) {
   if (n.latency) return {*n.latency, Source::scenario};
-  return {for_type(n.type).service_time, Source::type_default};
+  return {defaults_of(n).service_time, Source::type_default};
 }
 
 // The most servers c one replica may have, implied or written as advanced.concurrency
@@ -266,7 +314,7 @@ inline constexpr int max_concurrency = 100'000;
       .queue_limit = a.queue_limit.value_or(base.queue_limit),
       .yellow = a.yellow.value_or(base.yellow),
       .red = a.red.value_or(base.red),
-      .service_variability = a.service_variability.value_or(for_type(n.type).service_variability),
+      .service_variability = a.service_variability.value_or(defaults_of(n).service_variability),
       .burstiness = a.burstiness.value_or(base.burstiness),
   };
 }
@@ -307,3 +355,6 @@ static_assert(
     simsys::defaults::for_type(simsys::model::NodeType::service).service_rate.per_second == 2000);
 static_assert(every_non_client_type_has_positive_defaults());
 static_assert(simsys::defaults::sql_write_cost == 5.0);  // spec §6: 5k reads/s vs 1k writes/s
+// ch. 7: 12 sequence bits per millisecond per machine.
+static_assert(simsys::defaults::for_id_algorithm(simsys::model::IdAlgorithm::snowflake)
+                  .service_rate.per_second == 4'096'000);

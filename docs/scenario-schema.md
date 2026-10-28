@@ -40,6 +40,7 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `cache` | a fixed or [`che`](#che-hit-ratios) hit ratio, every strategy (`write_back` with an asynchronous flush), [`then` steps](#then-steps-on-a-cache) |
 | `sql_db` | phase 2b: a primary and read replicas, `shards`, `pool`, `replication_lag` and the `staleness` SLO, see [`sql_db`](#sql_db) |
 | `cdn` | phase 2b: a fixed or `che` hit ratio (or none: every read misses), misses fetched from its `origin`, see [`cdn`](#cdn); not with a byte `capacity` (phase 2c) |
+| `id_generator` | phase 2b: as a `service` whose capacity and service time its `algorithm` supplies, see [`id_generator`](#id_generator) |
 
 Everything else is refused before the first step, with exit code 1:
 
@@ -49,7 +50,7 @@ Everything else is refused before the first step, with exit code 1:
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | 2b, once it states `keys` |
 | `blob_store`, `message_queue`, `worker_pool`, `external_sink` | the same message | 2c |
 | `kv_cluster`, `ws_gateway`, `service_discovery` | the same message | 3 |
-| `search_index`, `id_generator`, `notification_fanout`, `frontier` | the same message | not yet assigned to a phase |
+| `search_index`, `notification_fanout`, `frontier` | the same message | not yet assigned to a phase |
 | `faults` | none: the list is accepted and nothing happens | 3 |
 
 The type message says "(phase 2)" for every type; the last column is the plan.
@@ -202,7 +203,7 @@ target and, if that link lists `ops`, lists the step's op.
 | `search_index` | `build_interval` | ignored |
 | `ws_gateway` | `max_connections`, `heartbeat` (duration), `fanout` (avg recipients per message), `ops` | `ops` checked as step lists; others ignored; phase 3 |
 | `service_discovery` | `failover` (duration) | ignored; phase 3 |
-| `id_generator` | `algorithm` `snowflake|ticket_server|uuid` | ignored |
+| `id_generator` | `algorithm` `snowflake|ticket_server|uuid` (required) | read and run (phase 2b), see [`id_generator`](#id_generator) |
 | `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) | ignored; phase 2c |
 | `notification_fanout` | `channels` (map name → node id), `dedup` (0–1), `then` | ignored |
 | `frontier` | `politeness` (rate per host), `hosts` (int), `then` | ignored |
@@ -582,6 +583,31 @@ locks, waiting for a free connection beyond the pool's queue, cross-shard querie
 (the sharding key is perfect), resharding, per-op service times (a write uses more capacity, 5
 units by default, not a longer service time), the replica applying its log on a thread of its
 own (a replicated write waits in the same queue as the reads), read-your-writes.
+
+### `id_generator`
+
+Book ch. 7, "Design a unique ID generator in distributed systems" (plan 2b refinement 6). An id
+generator is **sugar for a `service`**: no behaviour of its own, only the capacity and service
+time of the design its `algorithm` names, resolved at build. A `capacity` or `latency` the
+scenario states wins, as on any node; `replicas`, `advanced` and the other common keys work as
+on a service.
+
+| `algorithm` | capacity per replica | service time | where the number comes from |
+|---|---|---|---|
+| `snowflake` | 4.096M/s | 10us | 12 sequence bits: 4096 ids per millisecond per machine, × 1000; the time is chosen (a clock read and a counter) |
+| `ticket_server` | 1k/s | 1ms | one auto-increment database, and an id is a write: spec §6's "SQL 1k writes"; the time is chosen (a one-row commit) |
+| `uuid` | 1G/s | 1us | generated locally, nothing to coordinate: unbounded in practice; both chosen |
+
+| key | rule | message |
+|---|---|---|
+| `algorithm` | required, one of the three words (`multi_master`, the chapter's fourth design, is not modelled) | `node 'ids': id_generator needs algorithm: snowflake, ticket_server or uuid` (missing or unknown) |
+| `replicas` | *(graph)* exactly 1 on a `ticket_server`: one database issues the sequence; a second copy would repeat it | `node 'ids': a ticket server is one auto-increment database: replicas must be 1 (ch. 7; for more ids per second use snowflake)` |
+
+`explain` says what the algorithm stands for, `algorithm=snowflake (4.096M/s per replica by
+design)`, `algorithm=ticket_server (one database: 1k/s, spec §6 writes)`, `algorithm=uuid
+(unbounded: 1G/s)`, and checks the peak load against replicas × capacity (`vs 12.29M/s total
+capacity` for three snowflake machines). The [unique-id lab](../scenarios/labs/unique-id/)
+compares the ticket server with snowflake.
 
 ## Rate curve (`client.rate`)
 

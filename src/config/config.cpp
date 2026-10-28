@@ -2115,6 +2115,29 @@ CheckResult read_limiter_keys(const Site& site, const YAML::Node& body, model::N
       .and_then([&] { return read_limiter_backend(this_node, body, node, declared); });
 }
 
+// ---- Id generator keys (plan 2b refinement 6; book ch. 7) ------------------------------
+
+// `algorithm: snowflake`, required: the algorithm decides the generator's capacity and service
+// time (defaults::for_id_algorithm), so a generator without one would run on a made-up number.
+// One message for a missing and an unknown word, naming the three, so the fix is in the error.
+// The same key on a rate limiter is the limiter's (read_limiter_algorithm), typed apart.
+CheckResult read_id_generator_keys(const Site& site, const YAML::Node& body,
+                                   model::NodeSpec& node) {
+  if (node.type != model::NodeType::id_generator) return {};
+  const auto this_node = node_site(site, node.id);
+  constexpr std::string_view requirement =
+      "id_generator needs algorithm: snowflake, ticket_server or uuid";
+  if (!body["algorithm"]) return this_node.fail(body, requirement);
+  model::IdAlgorithm algorithm{};
+  if (auto read = read_optional_word(this_node, body, "algorithm", model::parse_id_algorithm,
+                                     requirement, algorithm);
+      !read) {
+    return read;
+  }
+  node.id_algorithm = algorithm;
+  return {};
+}
+
 // ---- Cache keys (plan 2a refinement 7) -------------------------------------------------
 //
 // Read in the second pass, after read_node_routing has checked that a `backend` names a
@@ -2366,6 +2389,7 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
     if (auto read = read_cache_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_sql_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_cdn_keys(site, entry.second, *node, declared); !read) return read;
+    if (auto read = read_id_generator_keys(site, entry.second, *node); !read) return read;
     ++node;
   }
   return {};

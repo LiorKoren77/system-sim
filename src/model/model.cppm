@@ -220,6 +220,38 @@ inline constexpr auto limiter_algorithm_table = std::to_array<core::EnumName<Lim
   return core::parse_in(limiter_algorithm_table, name);
 }
 
+// How an id generator issues unique ids (System Design Interview ch. 7 "Design a unique ID
+// generator in distributed systems"): three of the designs the chapter compares. The model has
+// no behaviour of its own for any of them (plan 2b refinement 6): Graph::build turns the
+// algorithm into the capacity and service time of an ordinary service (defaults::
+// for_id_algorithm), so each design differs only in how many ids per second one replica can
+// issue and how long one takes:
+//   snowflake      -> Twitter's 64-bit layout: timestamp | datacenter | machine | 12 sequence
+//                     bits. A machine issues at most 2^12 = 4096 ids per millisecond, with no
+//                     coordination, so replicas add capacity.
+//   ticket_server  -> Flickr's single auto-increment database: every id is a write on one SQL
+//                     machine; a single point of failure, so exactly one replica.
+//   uuid           -> 128 random bits generated locally: nothing to coordinate and nothing to
+//                     wait for, unbounded in practice.
+// Ignored: what the chapter weighs besides throughput (64 bits versus 128, sortable by time,
+// clock skew and NTP); multi-master replication, the chapter's fourth design, is not modelled.
+enum class IdAlgorithm { snowflake, ticket_server, uuid };
+
+// Pattern: Table-driven method — the algorithm names, read by the loader (`algorithm:` on an
+// id_generator) and printed by explain from this one table.
+inline constexpr auto id_algorithm_table = std::to_array<core::EnumName<IdAlgorithm>>({
+    {IdAlgorithm::snowflake, "snowflake"},
+    {IdAlgorithm::ticket_server, "ticket_server"},
+    {IdAlgorithm::uuid, "uuid"},
+});
+
+[[nodiscard]] constexpr std::string_view to_string(IdAlgorithm a) {
+  return core::name_in(id_algorithm_table, a);
+}
+[[nodiscard]] constexpr std::optional<IdAlgorithm> parse_id_algorithm(std::string_view name) {
+  return core::parse_in(id_algorithm_table, name);
+}
+
 // How a cache and the store behind it share reads and writes (System Design Interview
 // ch. 1 "Cache", and the caches of ch. 8 url shortener, ch. 11 news feed, ch. 12 chat, ch. 13
 // autocomplete, ch. 14 YouTube). Names: ch. 1 draws one pattern, the application reading the
@@ -450,6 +482,12 @@ struct NodeSpec {
   std::optional<int> shards{};
   std::optional<int> pool{};
   std::optional<SimTime> replication_lag{};
+  // Id generators only (plan 2b refinement 6; declared after the database keys, for designated
+  // initializers): which of ch. 7's designs the node is, and so its default capacity and service
+  // time (defaults::for_id_algorithm). Required: the loader and Graph::build refuse an
+  // id_generator without one. A separate member from the rate limiter's `algorithm`, although
+  // both are spelled `algorithm:` in a scenario: the two name different things.
+  std::optional<IdAlgorithm> id_algorithm{};
   std::optional<Workload> workload{};  // clients only
 };
 
@@ -592,3 +630,5 @@ static_assert(simsys::model::limiter_algorithm_table.back().value ==
 static_assert(simsys::core::round_trips(simsys::model::cache_strategy_table));
 static_assert(simsys::model::cache_strategy_table.back().value ==
               simsys::model::CacheStrategy::write_back);
+static_assert(simsys::core::round_trips(simsys::model::id_algorithm_table));
+static_assert(simsys::model::id_algorithm_table.back().value == simsys::model::IdAlgorithm::uuid);

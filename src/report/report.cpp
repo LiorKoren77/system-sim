@@ -802,6 +802,32 @@ template <class T>
   return text;
 }
 
+// What an id generator's algorithm stands for (plan 2b refinement 6; book ch. 7), with the
+// numbers the algorithm gives one replica (defaults::for_id_algorithm), so a student sees WHY
+// the node has the capacity it has: `algorithm=snowflake (4.096M/s per replica by design)`,
+// `algorithm=ticket_server (one database: 1k/s, spec §6 writes)`, `algorithm=uuid (unbounded:
+// 1G/s)`. The algorithm's number even when the scenario states its own `capacity`, which the
+// node line then shows tagged `(scenario)`: the reader sees the design's figure and the override.
+[[nodiscard]] std::string id_algorithm_meaning(model::IdAlgorithm algorithm) {
+  const std::string rate = fmt_rate(defaults::for_id_algorithm(algorithm).service_rate.per_second);
+  using enum model::IdAlgorithm;  // C++20, as in provenance
+  switch (algorithm) {
+    case snowflake:
+      return rate + " per replica by design";
+    case ticket_server:
+      return "one database: " + rate + ", spec §6 writes";
+    case uuid:
+      return "unbounded: " + rate;
+  }
+  std::unreachable();
+}
+
+[[nodiscard]] std::string id_generator_summary(const model::NodeSpec& spec) {
+  if (spec.type != model::NodeType::id_generator || !spec.id_algorithm) return {};
+  return "  algorithm=" + std::string{model::to_string(*spec.id_algorithm)} + " (" +
+         id_algorithm_meaning(*spec.id_algorithm) + ")";
+}
+
 // "write_ops=write", plus a note when no op that reaches the cache is one of them: its write
 // strategy then never acts. A note, not an error: a read-only cache is legitimate, but a write
 // op named differently in the steps (`set`, `put`) is a common slip.
@@ -1052,12 +1078,13 @@ struct QueueProvenance {
   for (std::size_t i = 0; i < g.nodes().size(); ++i) {
     const auto& node = g.nodes()[i];
     const bool client = node.spec.type == model::NodeType::client;
-    rows.push_back({{node.spec.id},
-                    {std::string{model::to_string(node.spec.type)}},
-                    {client ? client_details(node.spec)
-                            : server_details(node) + cost_summary(g, i) + balancing_summary(g, i) +
-                                  limiter_summary(node.spec) + cache_summary(g, i) +
-                                  cdn_summary(g, i) + database_summary(node)}});
+    rows.push_back(
+        {{node.spec.id},
+         {std::string{model::to_string(node.spec.type)}},
+         {client ? client_details(node.spec)
+                 : server_details(node) + cost_summary(g, i) + balancing_summary(g, i) +
+                       limiter_summary(node.spec) + cache_summary(g, i) + cdn_summary(g, i) +
+                       database_summary(node) + id_generator_summary(node.spec)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }

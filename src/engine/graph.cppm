@@ -816,6 +816,26 @@ void apply_database_keys(ResolvedNode& node) {
          spec.algorithm == model::LimiterAlgorithm::leaky_bucket;
 }
 
+// Graph::build also takes id generators written in code, which the loader never checked (config's
+// read_id_generator_keys): an algorithm is required, with the loader's message. And ch. 7's
+// ticket server is ONE auto-increment database: a second copy would hand out the same ids, and
+// splitting the sequence between copies (odd/even) is the chapter's multi-master design, which it
+// rejects for not scaling and not surviving a server added or removed. One machine is also the
+// design's flaw the chapter names, a single point of failure and a bottleneck at one database's
+// write rate; the remedy it gives is another algorithm (snowflake), not more copies.
+[[nodiscard]] std::optional<EngineError> invalid_id_generator(const model::NodeSpec& spec) {
+  const std::string name = "node '" + spec.id + "': ";
+  if (!spec.id_algorithm) {
+    return EngineError{name + "id_generator needs algorithm: snowflake, ticket_server or uuid"};
+  }
+  if (*spec.id_algorithm == model::IdAlgorithm::ticket_server && spec.replicas != 1) {
+    return EngineError{name +
+                       "a ticket server is one auto-increment database: replicas must be 1 "
+                       "(ch. 7; for more ids per second use snowflake)"};
+  }
+  return std::nullopt;
+}
+
 // Graph::build also takes clients written in code: their `keys` obey the loader's rules
 // (config's read_client_keys), which simsys.caching's Popularity factories also assume (they
 // throw on a negative exponent or an empty key space: programmer errors there).
@@ -1668,6 +1688,11 @@ Graph::Result Graph::resolve_nodes() {
     if (spec.type == model::NodeType::sql_db) {
       if (auto invalid = invalid_database(spec)) return std::unexpected{std::move(*invalid)};
     }
+    if (spec.type == model::NodeType::id_generator) {
+      if (auto invalid = invalid_id_generator(spec)) return std::unexpected{std::move(*invalid)};
+    }
+    // An id generator needs nothing more here: its algorithm's numbers are type defaults
+    // (defaults::defaults_of), resolved below like any node's.
     ResolvedNode node{
         .spec = spec,
         .capacity = defaults::resolve_capacity(spec),
