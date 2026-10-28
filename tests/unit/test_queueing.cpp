@@ -2,9 +2,11 @@
 // textbook formulas (Kleinrock vol. 1, ch. 3) worked by hand in the comments.
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
@@ -12,7 +14,16 @@
 import simsys.queueing;
 
 using Catch::Approx;
+using Catch::Matchers::WithinAbs;
+using Catch::Matchers::WithinRel;
 using namespace simsys::queueing;
+
+// A note for test authors: `Approx(x).margin(m)` passes when the value is within the
+// absolute margin m OR within Approx's default relative epsilon (about 1.19e-5, i.e. 100
+// float epsilons). So `.margin(1e-12)` does not tighten anything; a value 1e-6 off still
+// passes. For a tight check use a matcher that applies only the tolerance you give it:
+//   REQUIRE_THAT(v, WithinRel(expected, 1e-12));   // relative error <= 1e-12
+//   REQUIRE_THAT(v, WithinAbs(expected, 1e-15));   // absolute error <= 1e-15
 
 TEST_CASE("erlang_c for one server equals the utilization", "[queueing]") {
   // M/M/1: an arrival waits iff the server is busy, P(busy) = rho.
@@ -26,6 +37,11 @@ TEST_CASE("erlang_c matches hand-computed multi-server values", "[queueing]") {
   REQUIRE(erlang_c(2, 0.5) == Approx(1.0 / 3.0));
   // c = 3, rho = 0.8: a = 2.4; sum = 1 + 2.4 + 2.88 = 6.28; last = 2.304/0.2 = 11.52.
   REQUIRE(erlang_c(3, 0.8) == Approx(11.52 / (6.28 + 11.52)).margin(1e-6));
+}
+
+TEST_CASE("fewer than one server is a programmer error", "[queueing]") {
+  REQUIRE_THROWS_AS(erlang_c(0, 0.5), std::invalid_argument);
+  REQUIRE_THROWS_AS(mmc_wait(0, 0.5, 0.001), std::invalid_argument);
 }
 
 TEST_CASE("erlang_c is 0 with no load and 1 when saturated", "[queueing]") {
@@ -79,7 +95,8 @@ TEST_CASE("lognormal_quantile median lies below the mean (right skew)", "[queuei
 TEST_CASE("lognormal_quantile p99 matches a hand-computed value", "[queueing]") {
   // sigma^2 = ln(1.25) = 0.22314, mu = ln(0.01) - sigma^2/2 = -4.71674,
   // q99 = exp(mu + 0.47238 * 2.32635) = exp(-3.6178) = 0.02684
-  REQUIRE(lognormal_quantile(0.010, 25e-6, z_p99) == Approx(0.02684112509).margin(1e-9));
+  // Full precision (z_p99 = 2.3263478740408408): 0.0268411247647154.
+  REQUIRE_THAT(lognormal_quantile(0.010, 25e-6, z_p99), WithinRel(0.0268411247647154, 1e-12));
 }
 
 TEST_CASE("lognormal_quantile p95 matches a hand-computed value", "[queueing]") {
@@ -90,8 +107,9 @@ TEST_CASE("lognormal_quantile p95 matches a hand-computed value", "[queueing]") 
   //                                           = -4.716741961645196
   //   q95     = exp(mu + sigma * 1.6448536269514722)
   //           = exp(-4.716741961645196 + 0.47238072707743883 * 1.6448536269514722)
-  //           = exp(-4.716741961645196 + 0.77699715223) = exp(-3.93974480941) = 0.019453178380
-  REQUIRE(lognormal_quantile(0.010, 25e-6, z_p95) == Approx(0.019453178380).margin(1e-9));
+  //           = exp(-4.716741961645196 + 0.77699715223) = exp(-3.93974480941)
+  //           = 0.019453178380092202
+  REQUIRE_THAT(lognormal_quantile(0.010, 25e-6, z_p95), WithinRel(0.019453178380092202, 1e-12));
 }
 
 TEST_CASE("lognormal_quantile of a zero mean is zero", "[queueing]") {
@@ -99,9 +117,9 @@ TEST_CASE("lognormal_quantile of a zero mean is zero", "[queueing]") {
 }
 
 TEST_CASE("erlang_c stays finite for a thousand servers near saturation", "[queueing]") {
-  // a = 990 Erlangs: a^c/c! is ~e^990, beyond a double; the Erlang B recurrence never leaves [0,
-  // 1].
-  REQUIRE(erlang_c(1000, 0.99) == Approx(0.6590804218808545).margin(1e-12));
+  // a = 990 Erlangs: a^c/c! is ~e^986 (ln = 1000 ln 990 - ln 1000!), beyond a double;
+  // the Erlang B recurrence never leaves [0, 1].
+  REQUIRE_THAT(erlang_c(1000, 0.99), WithinRel(0.6590804218808545, 1e-12));
 }
 
 TEST_CASE("mmc_wait variance uses Erlang C, not utilization, for several servers", "[queueing]") {
@@ -112,9 +130,12 @@ TEST_CASE("mmc_wait variance uses Erlang C, not utilization, for several servers
 
 TEST_CASE("z constants are the standard-normal 50th, 95th and 99th percentiles", "[queueing]") {
   const auto phi = [](double z) { return 0.5 * std::erfc(-z / std::sqrt(2.0)); };
-  REQUIRE(phi(z_p50) == Approx(0.50).margin(1e-8));
-  REQUIRE(phi(z_p95) == Approx(0.95).margin(1e-8));
-  REQUIRE(phi(z_p99) == Approx(0.99).margin(1e-8));
+  // Within 1e-15, about ten ulps of a double near 1. A 1e-8 margin would not catch
+  // 8-digit constants: 1.6448536 and 2.3263479 are off by 2.8e-9 and 6.9e-10 in
+  // probability.
+  REQUIRE_THAT(phi(z_p50), WithinAbs(0.50, 1e-15));
+  REQUIRE_THAT(phi(z_p95), WithinAbs(0.95, 1e-15));
+  REQUIRE_THAT(phi(z_p99), WithinAbs(0.99, 1e-15));
 }
 
 TEST_CASE("pooling servers lowers the chance of waiting at equal utilization", "[queueing]") {
