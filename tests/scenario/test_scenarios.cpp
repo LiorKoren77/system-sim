@@ -76,7 +76,9 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
   int ran = 0;
   for (const auto& file : scenario_files()) {
     CAPTURE(file);
-    const auto s = *simsys::config::load(file);
+    const auto loaded = simsys::config::load(file);
+    if (!loaded) FAIL(loaded.error().message);  // a broken file must fail here, not crash below
+    const auto& s = *loaded;
     const auto g = *simsys::graph::Graph::build(s);
     auto created = simsys::engine::Simulation::create(g);
     if (!created) {
@@ -142,7 +144,9 @@ TEST_CASE("labs and tutorials that run under phase 2a are: hello, chain, rate-li
   std::vector<std::string> runnable;
   for (const auto& file : scenario_files()) {
     CAPTURE(file);
-    const auto s = *simsys::config::load(file);
+    const auto loaded = simsys::config::load(file);
+    if (!loaded) FAIL(loaded.error().message);  // a broken file must fail here, not crash below
+    const auto& s = *loaded;
     const auto g = *simsys::graph::Graph::build(s);
     if (simsys::engine::Simulation::create(g)) runnable.push_back(s.name);
   }
