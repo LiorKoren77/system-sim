@@ -87,9 +87,10 @@ TEST_CASE("tutorial scenarios run in under five seconds and pass their SLOs", "[
 
 TEST_CASE("book scenarios are refused by run until their node types exist", "[scenario]") {
   // Phase 1 runs only client and service nodes; every book scenario uses more. The message
-  // must name the node and the phase so a student knows what is missing, not that the file is wrong.
-  const auto s =
-      *simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/url-shortener/scenario.yaml");
+  // must name the node and the phase so a student knows what is missing, not that the file is
+  // wrong.
+  const auto s = *simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} +
+                                       "/book/url-shortener/scenario.yaml");
   const auto g = *simsys::graph::Graph::build(s);
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
