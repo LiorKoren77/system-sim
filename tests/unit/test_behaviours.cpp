@@ -406,8 +406,9 @@ TEST_CASE("a service's cost per op comes from its spec and defaults to one", "[b
   REQUIRE(web.cost("put") == 1.0);
 }
 
-TEST_CASE("a load balancer forwards every incoming op across its routes and serves nothing itself",
-          "[behaviours]") {
+TEST_CASE(
+    "a load balancer splits each op by the renormalised link weights and accepts every request",
+    "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(weighted_lb());
   LoadBalancerBehaviour lb{g, *g.index_of("lb")};
   Flow in;
@@ -420,7 +421,7 @@ TEST_CASE("a load balancer forwards every incoming op across its routes and serv
   REQUIRE(to_b != routed.outgoing.end());
   REQUIRE_THAT(to_a->flow.rate_of("get").per_second, WithinRel(75.0, 1e-12));
   REQUIRE_THAT(to_b->flow.rate_of("get").per_second, WithinRel(25.0, 1e-12));
-  // It handled every request (its own tiny service time), though it answers none itself.
+  // `served` is what the behaviour accepted: a balancer rejects nothing, so all of its input.
   REQUIRE_THAT(routed.served.total().per_second, WithinRel(100.0, 1e-12));
 }
 

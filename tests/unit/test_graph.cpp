@@ -411,6 +411,74 @@ TEST_CASE("consistent_hash gives its downstream an imbalance of one plus one ove
   REQUIRE_FALSE(g.nodes()[*g.index_of("a")].pooled);
 }
 
+// A weight-0 link is a drained backend: nothing travels on it, so it cannot close a loop of
+// calls either. Here x reaches A through lb (B's link is drained) and y reaches A directly;
+// A.y calls lb.x. Only through the drained link would lb.x -> B.x -> A.y -> lb.x be a cycle,
+// and a hop marked asynchronous for it would wrongly drop A.y's wait for lb.x from latency.
+TEST_CASE("a drained (weight 0) balancer route closes no call cycle", "[graph]") {
+  Scenario s{.name = "drained", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"x", 0.5}, {"y", 0.5}}),
+             load_balancer("lb", LbPolicy::weighted),
+             service("A", {{"x", {}}, {"y", {Step{.to = "lb", .op = "x"}}}}),
+             service("B", {{"x", {Step{.to = "A", .op = "y"}}}})};
+  s.links = {LinkSpec{.from = "u", .to = "lb", .ops = {"x"}},
+             LinkSpec{.from = "u", .to = "A", .ops = {"y"}},
+             LinkSpec{.from = "lb", .to = "A", .weight = 1},
+             LinkSpec{.from = "lb", .to = "B", .weight = 0},
+             LinkSpec{.from = "B", .to = "A"},
+             LinkSpec{.from = "A", .to = "lb"}};
+  const auto g = *Graph::build(s);
+  REQUIRE(g.async_hops().empty());
+  REQUIRE_FALSE(g.is_async_hop(*g.index_of("A"), "y", *g.index_of("lb"), "x"));
+  REQUIRE(g.arriving_ops(*g.index_of("B")).empty());  // no flow can bring x to B
+}
+
+// A drained route sends the node behind it nothing, so the balancer's policy says nothing
+// about how that node's replicas queue: l2 (least_connections) drains its link to `a`, and
+// `a` keeps l1's independent copies.
+TEST_CASE("a drained (weight 0) balancer route imposes no replica model on its target", "[graph]") {
+  Scenario s{.name = "drained", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"op", 1.0}}), load_balancer("l1", LbPolicy::round_robin),
+             load_balancer("l2", LbPolicy::least_connections), service("a"), service("b")};
+  s.nodes[3].replicas = 2;
+  s.links = {LinkSpec{.from = "u", .to = "l1"}, LinkSpec{.from = "u", .to = "l2"},
+             LinkSpec{.from = "l1", .to = "a"}, LinkSpec{.from = "l2", .to = "a", .weight = 0},
+             LinkSpec{.from = "l2", .to = "b", .weight = 1}};
+  const auto g = Graph::build(s);
+  REQUIRE(g.has_value());
+  REQUIRE_FALSE(g->nodes()[*g->index_of("a")].pooled);
+  REQUIRE(g->nodes()[*g->index_of("b")].pooled);
+}
+
+// What must agree between two balancers in front of one node is the queueing model they give
+// its replicas, not the policy's name: round_robin and weighted both deal requests out blindly
+// (independent copies), so they may share a node; round_robin and least_connections (pooled)
+// may not, and the error names both balancers and their models.
+TEST_CASE("balancers whose policies give the same replica model may front one node", "[graph]") {
+  const auto two = [](LbPolicy first, LbPolicy second) {
+    Scenario s{.name = "two", .version = 1, .duration = 1min};
+    s.nodes = {client("u", Rate{100}, {{"op", 1.0}}), load_balancer("l1", first),
+               load_balancer("l2", second), service("a")};
+    s.nodes[3].replicas = 2;
+    s.links = {LinkSpec{.from = "u", .to = "l1"}, LinkSpec{.from = "u", .to = "l2"},
+               LinkSpec{.from = "l1", .to = "a"}, LinkSpec{.from = "l2", .to = "a"}};
+    return Graph::build(s);
+  };
+  REQUIRE(two(LbPolicy::round_robin, LbPolicy::weighted).has_value());
+  REQUIRE(two(LbPolicy::weighted, LbPolicy::round_robin).has_value());
+  REQUIRE(two(LbPolicy::consistent_hash, LbPolicy::consistent_hash).has_value());
+  const auto mixed = two(LbPolicy::round_robin, LbPolicy::least_connections);
+  REQUIRE_FALSE(mixed.has_value());
+  REQUIRE(mixed.error().message ==
+          "node 'a' is behind load balancers with different replica models ('l1' independent, "
+          "'l2' pooled)");
+  const auto hashed = two(LbPolicy::least_connections, LbPolicy::consistent_hash);
+  REQUIRE_FALSE(hashed.has_value());
+  REQUIRE(hashed.error().message ==
+          "node 'a' is behind load balancers with different replica models ('l1' pooled, "
+          "'l2' imbalanced)");
+}
+
 TEST_CASE("a load balancer needs at least one outgoing link", "[graph]") {
   Scenario s{.name = "lb", .version = 1, .duration = 1min};
   s.nodes = {client("u", Rate{100}, {{"get", 1.0}}), load_balancer("lb", LbPolicy::round_robin)};
