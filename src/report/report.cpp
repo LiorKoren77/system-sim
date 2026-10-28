@@ -1092,18 +1092,33 @@ struct QueueProvenance {
   return join(parts, "  ");
 }
 
+// "  sizes: stream 50MB, upload 300MB": on a byte-sized node (defaults::is_byte_sized), the size
+// of one request of each op it serves (graph::Graph::request_bytes), ops in name order, in the
+// scenario's own size grammar (format_size). It is the number behind the node's capacity: a
+// node that counts megabytes serves capacity / size requests of the op a second. Nothing on a
+// node that counts requests, where a size would be a number the node never uses.
+[[nodiscard]] std::string size_summary(const graph::Graph& g, std::size_t node) {
+  if (!defaults::is_byte_sized(g.nodes()[node].spec)) return {};
+  std::vector<std::string> sizes;
+  for (const auto& op : g.arriving_ops(node)) {
+    if (const auto size = g.request_bytes(node, op)) sizes.push_back(op + " " + format_size(*size));
+  }
+  if (sizes.empty()) return {};
+  return "  sizes: " + join(sizes, ", ");
+}
+
 [[nodiscard]] std::string explain_nodes(const graph::Graph& g) {
   std::vector<Row> rows;
   for (std::size_t i = 0; i < g.nodes().size(); ++i) {
     const auto& node = g.nodes()[i];
     const bool client = node.spec.type == model::NodeType::client;
-    rows.push_back(
-        {{node.spec.id},
-         {std::string{model::to_string(node.spec.type)}},
-         {client ? client_details(node.spec)
-                 : server_details(node) + cost_summary(g, i) + balancing_summary(g, i) +
-                       limiter_summary(node.spec) + cache_summary(g, i) + cdn_summary(g, i) +
-                       database_summary(node) + id_generator_summary(node.spec)}});
+    rows.push_back({{node.spec.id},
+                    {std::string{model::to_string(node.spec.type)}},
+                    {client ? client_details(node.spec)
+                            : server_details(node) + cost_summary(g, i) + size_summary(g, i) +
+                                  balancing_summary(g, i) + limiter_summary(node.spec) +
+                                  cache_summary(g, i) + cdn_summary(g, i) + database_summary(node) +
+                                  id_generator_summary(node.spec)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -1216,19 +1217,25 @@ TEST_CASE("explain prints a sql database as primary plus replicas with shards, l
 namespace {
 // u(1k/s, the given ops: `read` by default) -> `cdn_id` (a CDN, fixed hit ratio 0.95, origin
 // `origin`) -> origin (a service of 5k/s). The CDN has the given byte capacity when one is passed.
+// Every op is 1 MB, the object size 2b assumes (defaults::blob_object_bytes): a byte-sized node
+// refuses an unsized request (plan 2c refinement 1), and at that size the numbers below hold.
 Scenario cdn_reported(std::string cdn_id = "cdn", std::optional<simsys::ByteRate> bytes = {},
                       std::vector<std::pair<std::string, double>> ops = {{"read", 1.0}}) {
   Scenario s{.name = "cdn-report", .version = 1, .duration = 1min};
+  std::map<std::string, simsys::Bytes> sizes;
+  for (const auto& op_share : ops) sizes.emplace(op_share.first, simsys::Bytes{1e6});
   NodeSpec cdn{.id = cdn_id,
                .type = NodeType::cdn,
                .byte_capacity = bytes,
                .hit_ratio = simsys::model::HitRatio{.fixed = 0.95}};
   cdn.origin = "origin";
-  s.nodes = {
-      NodeSpec{.id = "u",
-               .type = NodeType::client,
-               .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = std::move(ops)}},
-      std::move(cdn), NodeSpec{.id = "origin", .type = NodeType::service, .capacity = Rate{5000}}};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{1000}},
+                                           .op_shares = std::move(ops),
+                                           .sizes = std::move(sizes)}},
+             std::move(cdn),
+             NodeSpec{.id = "origin", .type = NodeType::service, .capacity = Rate{5000}}};
   s.links = {LinkSpec{.from = "u", .to = cdn_id}, LinkSpec{.from = cdn_id, .to = "origin"}};
   return s;
 }

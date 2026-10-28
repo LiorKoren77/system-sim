@@ -63,6 +63,14 @@ inline constexpr LatencyNumbers latency_numbers{
 // bytes does not run: both wait for phase 2c's byte flows, which take each op's own size.
 inline constexpr double blob_object_bytes = 1e6;
 
+// The capacity unit of a byte-sized node (is_byte_sized below), plan 2c refinement 2: one
+// megabyte, decimal like every size in the project, so 500 MB/s is 500 units/s and a 50 MB
+// stream costs 50 units. Chosen because the book's latency table prices transfers per MB
+// ("read 1 MB sequentially from the network": 10 ms), which makes one unit's service time a
+// row of that table. From phase 2c Task 3 on it replaces blob_object_bytes above: the size
+// stops being an assumed object and becomes each op's own (graph::Graph::request_bytes).
+inline constexpr double byte_unit = 1e6;
+
 // Spec §6's QPS line: "blob 500 MB/s", one blob store machine's throughput.
 inline constexpr ByteRate blob_store_byte_rate{500e6};
 
@@ -266,6 +274,15 @@ struct Resolved {
     return Resolved<ByteRate>{blob_store_byte_rate, Source::type_default};
   }
   return std::nullopt;
+}
+
+// Does the node count bytes rather than requests (plan 2c refinement 2)? Exactly when its
+// capacity is a byte rate (byte_rate_behind): a stated `capacity: 100GB/s` on a CDN or blob
+// store, or a blob store's type default, spec §6's 500 MB/s. A capacity stated in requests is
+// a request count on any type, and so is every type whose default is a request rate. Such a
+// node needs the size of every request it serves (graph::Graph::request_bytes).
+[[nodiscard]] bool is_byte_sized(const model::NodeSpec& n) {
+  return byte_rate_behind(n).has_value();
 }
 
 [[nodiscard]] Resolved<SimTime> resolve_service_time(const model::NodeSpec& n) {
