@@ -133,9 +133,10 @@ Scenario limited(LimiterAlgorithm algorithm, double limit, int burst, double dem
 }
 
 // u(1000/s of `read`) -> web -> [cache.read, db.read on miss], all links with zero latency:
-// the cache-aside read path of ch. 1. web (10k/s, 0.5 ms) and the cache (100k/s, 0.1 ms) are
-// nowhere near saturation; the db (1000/s, 5 ms: five servers) at the full 1000/s would be.
-// Each node has capacity enough that what the results show comes from the hit ratio alone.
+// the read path of ch. 1's cache (cache-aside; the book calls it read-through). web (10k/s,
+// 0.5 ms) and the cache (100k/s, 0.1 ms) are nowhere near saturation; the db (1000/s, 5 ms:
+// five servers) at the full 1000/s would be. Each node has capacity enough that what the results
+// show comes from the hit ratio alone.
 Scenario cached_reads(double hit) {
   Scenario s{.name = "cached-reads", .version = 1, .duration = 10s};
   s.nodes = {
@@ -1035,6 +1036,7 @@ TEST_CASE("che hit ratios and write_back are refused until phase 2b", "[theory]"
     REQUIRE(sim.error().message.contains("phase 2b"));
     REQUIRE(sim.error().message.contains("node 'cache'"));
     REQUIRE(sim.error().message.contains("che"));
+    REQUIRE(sim.error().message.ends_with("(phase 2b)"));
   }
   SECTION("the write_back strategy") {
     auto s = cached_reads(0.8);
@@ -1049,5 +1051,31 @@ TEST_CASE("che hit ratios and write_back are refused until phase 2b", "[theory]"
     REQUIRE(sim.error().message.contains("phase 2b"));
     REQUIRE(sim.error().message.contains("node 'cache'"));
     REQUIRE(sim.error().message.contains("write_back"));
+    REQUIRE(sim.error().message.ends_with("(phase 2b)"));
   }
+  SECTION("a cache's then steps") {
+    auto s = cached_reads(0.8);
+    s.nodes[2].then = {Step{.to = "db", .op = "read", .on = StepCondition::miss}};
+    s.links.push_back(LinkSpec{.from = "cache", .to = "db", .latency = 0s});
+    const auto g = Graph::build(s);
+    INFO((g ? "" : g.error().message));
+    REQUIRE(g.has_value());
+    const auto sim = Simulation::create(*g);
+    REQUIRE_FALSE(sim.has_value());
+    REQUIRE(sim.error().message.contains("node 'cache'"));
+    REQUIRE(sim.error().message.contains("then"));
+    REQUIRE(sim.error().message.ends_with("(phase 2b)"));
+  }
+}
+
+// A scenario built in code may hand a cache an empty HitRatio{} (neither a number nor `che`):
+// that is a missing hit ratio, the loader's "cache needs a hit_ratio", not a che one.
+TEST_CASE("a cache built in code with an empty hit ratio needs a hit_ratio", "[theory]") {
+  auto s = cached_reads(0.8);
+  s.nodes[2].hit_ratio = HitRatio{};
+  const auto g = Graph::build(s);
+  REQUIRE(g.has_value());
+  const auto sim = Simulation::create(*g);
+  REQUIRE_FALSE(sim.has_value());
+  REQUIRE(sim.error().message == "node 'cache': cache needs a hit_ratio");
 }

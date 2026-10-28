@@ -528,15 +528,15 @@ TEST_CASE("a burst on a windowed limiter written in code is rejected", "[graph]"
 }
 
 // A leaky bucket's queue IS the bucket (D/1: one slot leaking a request every 1/limit), so a
-// capacity, latency, concurrency or queue limit would be a second, contradicting statement of
-// `limit` and `burst`.
+// capacity, latency, concurrency, queue limit or service variability would be a second,
+// contradicting statement of `limit`, `burst` and the regular leak.
 TEST_CASE("a leaky bucket written in code takes only limit and burst", "[graph]") {
   const auto rejected = [](NodeSpec limiter) {
     const auto g = Graph::build(behind_limiter(std::move(limiter)));
     REQUIRE_FALSE(g.has_value());
     REQUIRE(g.error().message ==
             "node 'limiter': leaky_bucket takes limit and burst; capacity, latency, "
-            "concurrency and queue_limit are not valid");
+            "concurrency, queue_limit and service_variability are not valid");
   };
   auto with_capacity = limiter_of(simsys::model::LimiterAlgorithm::leaky_bucket, 500);
   with_capacity.capacity = Rate{5000};
@@ -550,6 +550,11 @@ TEST_CASE("a leaky bucket written in code takes only limit and burst", "[graph]"
   auto with_servers = limiter_of(simsys::model::LimiterAlgorithm::leaky_bucket, 500);
   with_servers.advanced.concurrency = 4;
   rejected(with_servers);
+  // The leak is regular by definition (service variability 0): a scenario's own number would be
+  // silently overridden, so it is refused like the others.
+  auto with_variability = limiter_of(simsys::model::LimiterAlgorithm::leaky_bucket, 500);
+  with_variability.advanced.service_variability = 1.0;
+  rejected(with_variability);
 }
 
 // Ch. 4's leaky bucket leaks requests at a FIXED rate: one slot that takes exactly 1/limit
@@ -579,12 +584,14 @@ TEST_CASE("a leaky bucket's queue is one deterministic slot of rate limit with r
 // ---- Caches (plan 2a refinement 7, Task 10) ----
 
 // The shape of one resolved service hop, as Graph::service_hops exports it: the node it calls,
-// the op it sends, the share of the service's requests that take the hop (the step's factor
-// times, for an `on: miss` step, the preceding cache's miss fraction) and how it combines with
-// the other hops.
+// the op it sends, `fraction`, the share of the service's requests that take the hop at all (a
+// probability: 1, or for an `on: miss` step the preceding cache's miss fraction 1 - h),
+// `factor`, the requests it sends per request that takes it (the step's own factor, times the
+// lookup's for an `on: miss` step), and how it combines with the other hops.
 static_assert(std::is_same_v<decltype(ServiceHop::target), std::size_t>);
 static_assert(std::is_same_v<decltype(ServiceHop::op), std::string>);
 static_assert(std::is_same_v<decltype(ServiceHop::fraction), double>);
+static_assert(std::is_same_v<decltype(ServiceHop::factor), double>);
 static_assert(std::is_same_v<decltype(ServiceHop::mode), StepMode>);
 
 namespace {
@@ -615,16 +622,18 @@ Scenario cached_web(NodeSpec cache_node, std::vector<Step> steps) {
   }
   return s;
 }
-// web.get = [cache.read, db.read on miss]: the cache-aside read path of ch. 1.
+// web.get = [cache.read, db.read on miss]: the read path of ch. 1's cache, which the book calls
+// read-through and the industry cache-aside (the application fetches the miss).
 std::vector<Step> read_then_db_on_miss() {
   return {Step{.to = "cache", .op = "read"},
           Step{.to = "db", .op = "read", .on = StepCondition::miss}};
 }
 }  // namespace
 
-// Ch. 1, cache-aside: the web tier asks the cache first and goes to the database only for
-// what the cache did not have. In the fluid model the share of requests that miss is
-// 1 - hit ratio, so a conditional `on: miss` step carries that fraction of the flow.
+// Ch. 1's cache (the book's "read-through", the industry's cache-aside): the web tier asks the
+// cache first and goes to the database only for what the cache did not have. In the fluid
+// model the share of requests that miss is 1 - hit ratio, so a conditional `on: miss` step
+// carries that fraction of the flow.
 TEST_CASE("a service step after a cache step fires on miss for the cache's miss fraction",
           "[graph]") {
   const auto s =
@@ -679,6 +688,95 @@ TEST_CASE("an on-miss step must follow a cache or cdn step", "[graph]") {
   }
 }
 
+// Read-through as this model names it (the cache-driven fetch): on a miss the CACHE fetches the
+// value from its backend and answers with it, so the application never sees a miss to act on.
+// A miss step after it would fetch every miss a second time.
+TEST_CASE(
+    "an on-miss step after a read_through cache is refused: the cache already fetched the miss",
+    "[graph]") {
+  const auto g = Graph::build(
+      cached_web(cache("cache", 0.8, CacheStrategy::read_through, "db"), read_then_db_on_miss()));
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message ==
+          "node 'web': an 'on: miss' step cannot follow read_through cache 'cache' (the cache "
+          "already fetched the miss)");
+}
+
+// A miss step runs only once the cache has answered "miss", so it cannot be sent alongside the
+// lookup; and a lookup sent in parallel with other calls would let the miss step start before
+// the answer arrives. Either way the step would be timed as a branch of a parallel max, not
+// after the lookup, so both are refused.
+TEST_CASE("an on-miss step cannot be parallel: it waits for the cache's answer", "[graph]") {
+  const std::string expected =
+      "node 'web': an 'on: miss' step and the cache step it follows must be sequential (the "
+      "miss step waits for the cache's answer)";
+  SECTION("the miss step is parallel") {
+    const auto g = Graph::build(cached_web(
+        cache("cache", 0.8, CacheStrategy::cache_aside),
+        {Step{.to = "cache", .op = "read"},
+         Step{.to = "db", .op = "read", .on = StepCondition::miss, .mode = StepMode::parallel}}));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == expected);
+  }
+  SECTION("the lookup it follows is parallel") {
+    const auto g =
+        Graph::build(cached_web(cache("cache", 0.8, CacheStrategy::cache_aside),
+                                {Step{.to = "cache", .op = "read", .mode = StepMode::parallel},
+                                 Step{.to = "db", .op = "read", .on = StepCondition::miss}}));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == expected);
+  }
+}
+
+// A request that looks up k keys (factor k on the cache step) misses k(1 - h) of them on
+// average, and the application fetches every key it missed, so the miss step sends
+// rate x k x (1 - h) requests (linearity of expectation: true however the lookups' hits are
+// correlated). The probability that the request takes the miss step stays 1 - h: the latency
+// model still treats a request's lookups as hitting or missing together.
+TEST_CASE(
+    "a miss step after a lookup of factor k fetches every missed lookup: k(1 - h) per request",
+    "[graph]") {
+  const auto built =
+      Graph::build(cached_web(cache("cache", 0.8, CacheStrategy::cache_aside),
+                              {Step{.to = "cache", .op = "read", .factor = 20},
+                               Step{.to = "db", .op = "read", .on = StepCondition::miss}}));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto hops = built->service_hops(*built->index_of("web"), "get");
+  REQUIRE(hops.size() == 2);
+  REQUIRE_THAT(hops[1].fraction * hops[1].factor, WithinRel(20 * 0.2, 1e-12));
+  REQUIRE_THAT(hops[1].fraction, WithinRel(0.2, 1e-12));  // still a probability
+}
+
+// Only reads hit or miss: a write to a cache (an op in its write_ops) updates or invalidates
+// the entry and has no "miss" to report, so a miss step after it would never mean anything.
+TEST_CASE("a miss step after a write lookup is refused", "[graph]") {
+  const auto g =
+      Graph::build(cached_web(cache("cache", 0.8, CacheStrategy::cache_aside),
+                              {Step{.to = "cache", .op = "write"},
+                               Step{.to = "db", .op = "write", .on = StepCondition::miss}}));
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message ==
+          "node 'web': an 'on: miss' step cannot follow a write to cache 'cache' (writes do not "
+          "miss)");
+}
+
+// A CDN is a cache at the network's edge (ch. 1): a fixed hit ratio on it means what it means
+// on a cache, so a service's miss step after a CDN lookup is taken by 1 - h of the requests.
+TEST_CASE("a cdn's fixed hit ratio feeds its miss steps", "[graph]") {
+  NodeSpec cdn{.id = "cdn", .type = NodeType::cdn, .hit_ratio = HitRatio{.fixed = 0.95}};
+  const auto built = Graph::build(
+      cached_web(std::move(cdn), {Step{.to = "cdn", .op = "read"},
+                                  Step{.to = "db", .op = "read", .on = StepCondition::miss}}));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE(built->hit_ratio(*built->index_of("cdn")).has_value());
+  REQUIRE_THAT(*built->hit_ratio(*built->index_of("cdn")), WithinRel(0.95, 1e-12));
+  const auto hops = built->service_hops(*built->index_of("web"), "get");
+  REQUIRE(hops.size() == 2);
+  REQUIRE_THAT(hops[1].fraction, WithinRel(0.05, 1e-12));
+}
+
 // A `che` hit ratio is the Che approximation of an LRU cache (phase 2b): the graph builds (so
 // explain can print the scenario) but has no number for it yet.
 TEST_CASE("a che hit ratio builds a graph with no static hit ratio", "[graph]") {
@@ -711,17 +809,29 @@ TEST_CASE("read_through and write_through caches get a demand edge to their back
   }
 }
 
-TEST_CASE("a cache_aside cache's backend is unused: it gets no demand edge", "[graph]") {
+TEST_CASE("a backend on a cache_aside cache is refused: the application reads the store itself",
+          "[graph]") {
   const auto built = Graph::build(
       cached_web(cache("cache", 0.8, CacheStrategy::cache_aside, "db"), read_then_db_on_miss()));
-  INFO((built ? "" : built.error().message));
-  REQUIRE(built.has_value());
-  const auto cache_index = *built->index_of("cache");
-  const auto db_index = *built->index_of("db");
-  REQUIRE_FALSE(std::ranges::contains(
-      built->edges(), DemandEdge{.from = cache_index,
-                                 .to = db_index,
-                                 .link = *built->demand_link(cache_index, db_index)}));
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message == "node 'cache': backend is unused with strategy cache_aside");
+}
+
+// A store that calls back into the cache in front of it (db.read -> cache.read -> db.read)
+// makes the cache's fetch a call that waits for itself. The call-cycle search would make that
+// hop asynchronous, but a read_through miss is answered only after the fetch: the cache cannot
+// hand it off, so the scenario is refused.
+TEST_CASE("a cache whose backend hop closes a call cycle is refused", "[graph]") {
+  Scenario s{.name = "loop", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"read", 1.0}}),
+             service("db", {{"read", {Step{.to = "cache", .op = "read"}}}}),
+             cache("cache", 0.8, CacheStrategy::read_through, "db")};
+  s.links = {LinkSpec{.from = "u", .to = "db", .dir = Direction::inout},
+             LinkSpec{.from = "db", .to = "cache", .dir = Direction::inout},
+             LinkSpec{.from = "cache", .to = "db", .dir = Direction::inout}};
+  const auto g = Graph::build(s);
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message == "node 'cache': backend 'db' closes a call cycle");
 }
 
 TEST_CASE("a forwarding cache's backend needs a link from the cache", "[graph]") {

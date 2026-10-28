@@ -601,3 +601,98 @@ TEST_CASE("the CSV series has the rejected_per_s column right after drops_per_s"
   REQUIRE(text.substr(0, text.find('\n') + 1) ==
           "t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone\n");
 }
+
+namespace {
+// Ch. 13's autocomplete: the browser caches suggestions and only its misses reach the servers.
+// users(1k/s suggest) -> browser_cache (fixed 0.4, then: lb.suggest on miss) -> lb -> api.
+Scenario browser_cached() {
+  Scenario s{.name = "autocomplete", .version = 1, .duration = 1min};
+  s.nodes = {NodeSpec{.id = "users",
+                      .type = NodeType::client,
+                      .workload =
+                          Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"suggest", 1.0}}}},
+             NodeSpec{.id = "browser_cache",
+                      .type = NodeType::cache,
+                      .then = {Step{
+                          .to = "lb", .op = "suggest", .on = simsys::model::StepCondition::miss}},
+                      .hit_ratio = simsys::model::HitRatio{.fixed = 0.4}},
+             NodeSpec{.id = "lb", .type = NodeType::load_balancer},
+             NodeSpec{.id = "api", .type = NodeType::service, .capacity = Rate{5000}}};
+  s.links = {LinkSpec{.from = "users", .to = "browser_cache"},
+             LinkSpec{.from = "browser_cache", .to = "lb"}, LinkSpec{.from = "lb", .to = "api"}};
+  return s;
+}
+// Ch. 8's redirect path with a cache whose hit ratio is `che` (phase 2b): users(1k/s) -> web
+// -> url_cache, and web -> url_db for the misses.
+Scenario che_cached() {
+  Scenario s{.name = "shortener", .version = 1, .duration = 1min};
+  s.nodes = {
+      NodeSpec{
+          .id = "users",
+          .type = NodeType::client,
+          .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"redirect", 1.0}}}},
+      NodeSpec{
+          .id = "web",
+          .type = NodeType::service,
+          .capacity = Rate{10'000},
+          .ops = {{"redirect",
+                   {Step{.to = "url_cache", .op = "read"},
+                    Step{
+                        .to = "url_db", .op = "read", .on = simsys::model::StepCondition::miss}}}}},
+      NodeSpec{.id = "url_cache",
+               .type = NodeType::cache,
+               .hit_ratio = simsys::model::HitRatio{.fixed = std::nullopt, .che = true}},
+      NodeSpec{.id = "url_db", .type = NodeType::service, .capacity = Rate{5000}}};
+  s.links = {LinkSpec{.from = "users", .to = "web"}, LinkSpec{.from = "web", .to = "url_cache"},
+             LinkSpec{.from = "web", .to = "url_db"}};
+  return s;
+}
+// The line of explain's checks block (after "checks (") that starts, after its indent, with
+// `id` and a space; empty when there is none.
+std::string check_line(const std::string& text, const std::string& id) {
+  const auto at = text.find("\n  " + id + " ", text.find("checks ("));
+  if (at == std::string::npos) return {};
+  const auto end = text.find('\n', at + 1);
+  return text.substr(at + 1, end - at - 1);
+}
+}  // namespace
+
+// A cache's `then` steps are what happens after it answers: `on: miss` ones carry the share it
+// missed (1 - h), unconditional ones everything. The paper load must follow them, or every
+// node behind a browser cache would look idle.
+TEST_CASE("explain forwards a cache's then-steps: misses reach the next node", "[report]") {
+  const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(browser_cached()));
+  CAPTURE(text);
+  // 60 % of 1k/s: the misses of a 0.4 hit ratio.
+  REQUIRE(check_line(text, "lb").contains("peak offered 600/s vs 100k/s"));
+  REQUIRE(check_line(text, "api").contains("peak offered 600/s vs 5k/s"));
+}
+
+// With no number for h yet (`che`, phase 2b) the paper load counts every read as a miss: the
+// database behind the cache is checked against its worst case. The line says so, or a student
+// would read a red database as a real problem of the design.
+TEST_CASE("explain annotates checks that count an unknown hit ratio as zero", "[report]") {
+  const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(che_cached()));
+  CAPTURE(text);
+  const auto db = check_line(text, "url_db");
+  REQUIRE(db.contains("peak offered 1k/s"));
+  REQUIRE(db.contains(" (hit ratio unknown: che counted as 0 — an upper bound)"));
+  // The cache's own load does not depend on its hit ratio: no note there.
+  REQUIRE(check_line(text, "url_cache").contains("peak offered 1k/s"));
+  REQUIRE_FALSE(check_line(text, "url_cache").contains("unknown"));
+}
+
+// A cache's write strategy acts on the ops in `write_ops` (default: `write`). When no op that
+// reaches the cache is one of them, the strategy never acts on anything: a note, not an error
+// (a read-only cache is legitimate, but a misnamed op is a common slip).
+TEST_CASE("explain notes write_ops that never arrive at the cache", "[report]") {
+  const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(che_cached()));
+  CAPTURE(text);
+  REQUIRE(text.contains("write_ops=write (never arrives)"));
+  auto suggestions = browser_cached();
+  suggestions.nodes[1].write_ops = {"suggest"};  // an op that does arrive
+  const auto written = simsys::report::render_explain(*simsys::graph::Graph::build(suggestions));
+  CAPTURE(written);
+  REQUIRE(written.contains("write_ops=suggest"));
+  REQUIRE_FALSE(written.contains("never arrives"));
+}
