@@ -1,0 +1,94 @@
+# System Design Interview vol. 1, ch. 11 — News feed.
+# Book design: fan-out on write for ordinary users (pre-compute feeds into a cache),
+# fan-out on read for celebrities. 10M DAU, each user posts a few times a day and reads
+# the feed many times. Average 300 friends → each post fans out to ~300 feed caches.
+version: 1
+name: news-feed
+seed: 1
+duration: 24h
+step: 100ms
+warmup: 5m
+
+datacenters:
+  us-east: {}
+
+nodes:
+  users:
+    type: client
+    dc: us-east
+    rate:
+      base: 10k/s
+      wave: {shape: sine, period: 24h, amplitude: 0.6, peak_at: 20:00}
+      spikes: [{at: 12:00, for: 10m, factor: 3}]
+    ops: {read_feed: 0.9, post: 0.1}
+    keys: {zipf: 1.1, space: 50M}
+    sizes: {post: 2KB}
+    timeout: 500ms
+
+  cdn: {type: cdn, dc: us-east, ttl: 1h, hit_ratio: {fixed: 0.95}, origin: media_store}
+  media_store: {type: blob_store, capacity: 1GB/s}
+
+  lb: {type: load_balancer, dc: us-east, policy: least_connections}
+
+  web:
+    type: service
+    dc: us-east
+    replicas: 8
+    capacity: 2k/s
+    latency: 0.5ms
+    ops:
+      read_feed:
+        - {to: feed_cache, op: read}                    # list of post ids for this user
+        - {to: post_cache, op: read, factor: 20}        # hydrate ~20 posts
+        - {to: post_db, op: read, on: miss}
+        - {to: user_cache, op: read, factor: 20}
+      post:
+        - {to: post_db, op: write}
+        - {to: post_cache, op: write}
+        - {to: fanout_q, op: publish}
+
+  feed_cache: {type: cache, eviction: lru, keys: 10M, hit_ratio: che, strategy: cache_aside}
+  post_cache: {type: cache, eviction: lru, keys: 50M, hit_ratio: che, strategy: cache_aside}
+  user_cache: {type: cache, eviction: lru, keys: 10M, hit_ratio: {fixed: 0.98}, strategy: cache_aside}
+
+  post_db:
+    type: sql_db
+    replicas: 3
+    replication_lag: 50ms
+    capacity: 5k/s
+    advanced: {queue_limit: 500, service_variability: 1.5}
+
+  fanout_q: {type: message_queue, partitions: 16}
+
+  fanout:
+    type: worker_pool
+    consumes: fanout_q
+    workers: 32
+    cost: 5ms
+    then:
+      - {to: graph_db, op: read}                        # friend list
+      - {to: feed_cache, op: write, factor: 300}        # one write per friend
+
+  graph_db: {type: kv_cluster, nodes: 6, replication: 3, write_quorum: 2, read_quorum: 2, capacity: 30k/s}
+
+links:
+  - {from: users, to: cdn, dir: inout, ops: [read_media]}
+  - {from: cdn, to: media_store, dir: inout}
+  - {from: users, to: lb, dir: inout, ops: [read_feed, post]}
+  - {from: lb, to: web, dir: inout}
+  - {from: web, to: feed_cache, dir: inout, latency: 0.3ms}
+  - {from: web, to: post_cache, dir: inout, latency: 0.3ms}
+  - {from: web, to: user_cache, dir: inout, latency: 0.3ms}
+  - {from: web, to: post_db, dir: inout}
+  - {from: web, to: fanout_q}
+  - {from: fanout_q, to: fanout}
+  - {from: fanout, to: graph_db, dir: inout}
+  - {from: fanout, to: feed_cache}
+
+slo:
+  - {metric: p99_latency, node: users, op: read_feed, max: 200ms}
+  - {metric: drop_rate, max: 0.001}
+  - {metric: queue_lag, node: fanout_q, max: 2m}
+
+faults:
+  - {at: 15:00, kind: node_down, node: post_db, for: 30s}
