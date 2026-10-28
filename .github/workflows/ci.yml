@@ -1,0 +1,25 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14 and Ninja
+        run: sudo apt-get update && sudo apt-get install -y gcc-14 g++-14 ninja-build
+      - name: Configure
+        run: cmake --preset gcc14-debug
+      - name: Build
+        run: cmake --build --preset gcc14-debug
+      - name: Test
+        run: ctest --preset gcc14-debug
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format 18
+        run: sudo apt-get update && sudo apt-get install -y clang-format-18
+      - name: Check formatting
+        run: find src tests \( -name '*.cpp' -o -name '*.cppm' \) -print0 | xargs -0 clang-format-18 --dry-run -Werror

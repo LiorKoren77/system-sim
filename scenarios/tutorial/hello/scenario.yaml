@@ -1,0 +1,10 @@
+# The smallest useful scenario: one client, one service. Used by the tutorial and as
+# the smoke test for the loader.
+version: 1
+name: hello
+duration: 1m
+nodes:
+  users: {type: client, rate: {base: 100/s}, ops: {ping: 1.0}}
+  api:   {type: service, capacity: 1k/s, latency: 1ms}
+links:
+  - {from: users, to: api, dir: inout}
