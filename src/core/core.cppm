@@ -141,11 +141,12 @@ struct ByteRate {
   auto operator<=>(const ByteRate&) const = default;
 };
 
-// A size in bytes: one request's payload (ch. 14 YouTube's 50 MB stream and 300 MB upload,
-// ch. 15 Google Drive's 500 KB average file). A third strong type beside Rate and ByteRate, so
-// a size cannot be passed where a throughput is expected, nor a throughput where a size is:
-// sizes divide byte rates into request rates (2k streams/s of 50 MB fill 100 GB/s), and mixing
-// the two would be a silent unit error. A double, as the byte rates it is divided into.
+// A size in bytes: one request's payload (ch. 14 YouTube's 300 MB average upload, ch. 15
+// Google Drive's 500 KB average file; the youtube scenario's 50 MB stream is its own choice,
+// the book sizes no stream). A third strong type beside Rate and ByteRate, so a size cannot be
+// passed where a throughput is expected, nor a throughput where a size is: sizes divide byte
+// rates into request rates (2k streams/s of 50 MB fill 100 GB/s), and mixing the two would be a
+// silent unit error. A double, as the byte rates it is divided into.
 struct Bytes {
   double count;
   auto operator<=>(const Bytes&) const = default;
@@ -324,10 +325,14 @@ split_non_negative_number(std::string_view text, std::string_view input) {
   return listed;
 }
 
-// Every parse_size error ends with the grammar, so an author who wrote `10` or `1KiB` learns
-// what to write instead.
+// The sentence every parse_size error ends with: "; a size is a number and B, KB, MB or GB
+// (50MB)", so an author who wrote `10` or `1KiB` learns what to write instead.
+[[nodiscard]] std::string size_grammar() {
+  return "; a size is a number and " + list_units(size_units) + " (50MB)";
+}
+
 [[nodiscard]] ParseError with_size_grammar(ParseError error) {
-  error.message += "; a size is a number and " + list_units(size_units) + " (50MB)";
+  error.message += size_grammar();
   return error;
 }
 
@@ -447,23 +452,30 @@ export namespace simsys {
   return Bytes{*bytes};
 }
 
+// A parse_size error's reason without the grammar sentence it ends with ("size must be at most
+// 1e15B", "missing size unit"), for a caller that states the grammar in its own words (the
+// loader's "sizes 'stream' must be a size (B, KB, MB or GB: 50MB): missing size unit").
+[[nodiscard]] std::string size_error_reason(const ParseError& error) {
+  const auto grammar = detail::size_grammar();
+  if (!error.message.ends_with(grammar)) return error.message;
+  return error.message.substr(0, error.message.size() - grammar.size());
+}
+
 // Bytes{5e7} -> "50MB": the inverse of parse_size, for messages and explain, so a size reads
 // back in the scenario's own grammar. The largest unit that keeps the number at least 1 (200B,
 // 2KB, 50MB, 1.5GB; 0B), the number in its shortest round-trip form in fixed notation, so a
-// petabyte prints "1000000GB" rather than "1e+06GB", which no author writes.
+// petabyte prints "1000000GB" rather than "1e+06GB", which no author writes. Never an exponent:
+// the buffer holds any finite double in fixed notation (at most 309 digits before the point,
+// 1.8e308; at most 327 characters for the smallest subnormal, 5e-324 = "0.000...5").
 [[nodiscard]] std::string format_size(Bytes size) {
   const detail::Scale* unit = &detail::size_units.front();
   for (const auto& candidate : detail::size_units) {
     if (size.count >= candidate.factor) unit = &candidate;
   }
   const double number = size.count / unit->factor;
-  std::array<char, 64> buffer{};
-  auto written =
+  std::array<char, 512> buffer{};
+  const auto written =
       std::to_chars(buffer.data(), buffer.data() + buffer.size(), number, std::chars_format::fixed);
-  // Only a size far below a byte (1e-100 B) has too many fixed digits; it gets the exponent.
-  if (written.ec != std::errc{}) {
-    written = std::to_chars(buffer.data(), buffer.data() + buffer.size(), number);
-  }
   return std::string{buffer.data(), written.ptr} + std::string{unit->suffix};
 }
 

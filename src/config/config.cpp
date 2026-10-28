@@ -942,14 +942,38 @@ CheckResult read_replicas(const Site& site, const YAML::Node& body, model::NodeS
   return read_positive_int(site, body["replicas"], "replicas").transform(store_in(node.replicas));
 }
 
-// Capacity counts requests for most node types and bytes for storage ("500MB/s"). The
-// "B/s" suffix decides which parser reads it and which field receives it, so a text that
-// neither parser accepts gets the message of the parser its suffix selects.
+// Capacity counts requests for most node types and bytes for storage ("500MB/s", or in bits as
+// a network is rated: "40Gbit/s"). The "B/s" or "bit/s" suffix decides which parser reads it and
+// which field receives it, so a text that neither parser accepts gets the message of the parser
+// its suffix selects.
 std::expected<void, ParseError> read_capacity_text(std::string_view text, model::NodeSpec& node) {
   // C++20 std::string_view::ends_with (and its twin starts_with): a suffix test in one call,
   // replacing compare(size() - n, n, suffix) and its length arithmetic.
-  if (text.ends_with("B/s")) return parse_byte_rate(text).transform(store_in(node.byte_capacity));
+  if (text.ends_with("B/s") || text.ends_with("bit/s")) {
+    return parse_byte_rate(text).transform(store_in(node.byte_capacity));
+  }
   return parse_rate(text).transform(store_in(node.capacity));
+}
+
+// "a service", "an external_sink": a node type with its article, for messages.
+std::string type_with_article(model::NodeType type) {
+  const auto name = model::to_string(type);
+  // C++23 std::string_view::contains (the map's C++20 contains, for text): "is this character
+  // among those?" in one call, replacing `find(c) != npos`.
+  const bool vowel = std::string_view{"aeiou"}.contains(name.front());
+  return std::format("{} {}", vowel ? "an" : "a", name);
+}
+
+// Only the types that serve bytes may count them (plan 2c refinement 2, defaults::is_byte_sized):
+// a CDN and a blob store. Every other type counts requests, and a byte rate there would have to
+// be read as some number of requests, which no author means.
+CheckResult check_byte_capacity_type(const Site& site, const YAML::Node& capacity,
+                                     const model::NodeSpec& node) {
+  if (!node.byte_capacity) return {};
+  if (node.type == model::NodeType::cdn || node.type == model::NodeType::blob_store) return {};
+  return site.fail(capacity, std::format("{} counts requests; a byte capacity belongs on a cdn or "
+                                         "blob_store",
+                                         type_with_article(node.type)));
 }
 
 // A byte capacity is bounded by the same number, in bytes: 1e15 B/s is 1e9 megabytes
@@ -974,7 +998,8 @@ CheckResult read_capacity(const Site& site, const YAML::Node& body, model::NodeS
           return unit_error(site, capacity, "capacity", error);
         });
       })
-      .and_then([&] { return check_capacity_bounded(site, capacity, node); });
+      .and_then([&] { return check_capacity_bounded(site, capacity, node); })
+      .and_then([&] { return check_byte_capacity_type(site, capacity, node); });
 }
 
 const AdvancedNumber* find_advanced_number(std::string_view key) {
@@ -1312,13 +1337,21 @@ CheckResult read_optional_number(const Site& site, const YAML::Node& parent, std
 
 // ---- Sizes (plan 2c refinement 1) ------------------------------------------------------
 
-// One size, as a client's `sizes` entry or a step's `size` writes it (parse_size: `50MB`).
-// The message replaces the parser's: whatever was wrong, the author needs the grammar.
-// `label` names the value: "sizes 'stream'", "step size".
+// One request's size, as a client's `sizes` entry or a step's `size` writes it (parse_size:
+// `50MB`). The message states the grammar, then the parser's reason ("missing size unit", "size
+// must be at most 1e15B"), since the grammar alone does not say what is wrong with `2e15B`.
+// `label` names the value: "sizes 'stream'", "step size". A request size must be positive:
+// parse_size reads `0B` (a size), but a request of no bytes costs a byte-sized node 0 MB, so
+// the node could serve infinitely many of them (its demand in requests divides by the size).
 std::expected<Bytes, ConfigError> read_size(const Site& site, const YAML::Node& value,
                                             std::string_view label) {
-  if (const auto size = parse_size(scalar_text(value))) return *size;
-  return site.fail(value, std::format("{} must be a size (B, KB, MB or GB: 50MB)", label));
+  const auto size = parse_size(scalar_text(value));
+  if (!size) {
+    return site.fail(value, std::format("{} must be a size (B, KB, MB or GB: 50MB): {}", label,
+                                        size_error_reason(size.error())));
+  }
+  if (!is_positive(size->count)) return site.fail(value, std::format("{} must be positive", label));
+  return *size;
 }
 
 // ---- Steps: how a node forwards an op (docs/scenario-schema.md, "step") ----------------
@@ -2552,7 +2585,8 @@ CheckResult read_link_weight(const Site& site, const YAML::Node& link, double& w
 // `bandwidth: 40Gbit/s` (model::LinkSpec::bandwidth), optional: a byte rate, in bytes or, as a
 // network is rated, in bits (parse_byte_rate). The message replaces the parser's: a request
 // rate (`10k/s`) is the likely mistake, and the author needs the byte forms. Positive: a pipe
-// of zero capacity carries nothing.
+// of zero capacity carries nothing. At most 1e15 B/s, a byte capacity's ceiling
+// (max_rate_per_second read in bytes: a million GB/s, far above any network).
 CheckResult read_link_bandwidth(const Site& site, const YAML::Node& link,
                                 std::optional<ByteRate>& bandwidth) {
   const auto value = link["bandwidth"];
@@ -2565,6 +2599,9 @@ CheckResult read_link_bandwidth(const Site& site, const YAML::Node& link,
     return site.fail(value, "bandwidth is a byte rate (B/s, or bit/s for a network: 40Gbit/s)");
   }
   if (!is_positive(rate->bytes_per_second)) return site.fail(value, "bandwidth must be positive");
+  if (rate->bytes_per_second > max_rate_per_second) {
+    return site.fail(value, "bandwidth must be at most 1e15B/s");
+  }
   bandwidth = *rate;
   return {};
 }

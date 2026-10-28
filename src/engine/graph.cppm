@@ -62,6 +62,7 @@ module;
 #include <ranges>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -375,10 +376,11 @@ class Graph {
   // op: a client's routes for the op as they are; a load balancer's routes whose link
   // carries the op, their shares renormalised to sum to 1 over those links.
   [[nodiscard]] std::vector<Route> routes_for(std::size_t node, std::string_view op) const;
-  // Every op some flow can bring to `node`, sorted: client routes and the steps targeting
-  // it that carry flow (unconditional ones, and `on: miss` ones after a cache that misses),
-  // whatever a load balancer or rate limiter in front passes on, what a cache passes on to
-  // its backend, and `counter` on a limiter's backend. Empty for a client.
+  // Every op some flow can bring to `node`, sorted: client routes that carry flow (not a
+  // drained one, weight 0) and the steps targeting it that carry flow (unconditional ones, and
+  // `on: miss` ones after a cache that misses), whatever a load balancer or rate limiter in
+  // front passes on, what a cache passes on to its backend, and `counter` on a limiter's
+  // backend. Empty for a client.
   [[nodiscard]] std::span<const std::string> arriving_ops(std::size_t node) const {
     return arriving_ops_.at(node);
   }
@@ -458,6 +460,7 @@ class Graph {
   Result route_forwarder(std::size_t node);
   void collect_arriving_ops();
   Result resolve_request_sizes();
+  Result check_sized_arrivals(std::size_t node) const;
   [[nodiscard]] bool carries_flow(std::size_t node, const model::Step& step,
                                   std::string_view op) const;
   Result check_forwarded_ops(std::size_t node);
@@ -473,6 +476,9 @@ class Graph {
   std::vector<std::size_t> order_;
   std::vector<std::vector<Route>> routes_;              // per node index; empty for non-splitters
   std::vector<std::vector<std::string>> arriving_ops_;  // per node index, sorted
+  // Per node index: arriving op -> the first node collect_arriving_ops saw send it, for the
+  // message about an op that reaches a byte-sized node by a path the size walk does not take.
+  std::vector<std::map<std::string, std::size_t, std::less<>>> first_sender_;
   // Per node index: incoming op -> its resolved hops (ServiceHop).
   std::vector<std::map<std::string, std::vector<ServiceHop>, std::less<>>> service_hops_;
   std::vector<AsyncHop> async_hops_;  // sorted, no duplicates
@@ -485,7 +491,9 @@ class Graph {
 // megabytes, Graph::request_bytes / 1 MB (plan 2c refinement 2: a 50 MB stream costs 50); at
 // any other node defaults::op_cost (its `cost` entry, a database write's 5, else 1). An op that
 // never reaches a byte-sized node has no size and is priced as at a request-counting one: no
-// flow of it is ever charged there (Graph::build refuses an unsized op that does arrive).
+// flow of it is ever charged there. An op that does arrive there unsized cannot exist
+// (Graph::build refuses it, Graph::resolve_request_sizes): asked for one, op_cost throws
+// std::logic_error, a programmer error, rather than charge it one unit whatever its bytes.
 [[nodiscard]] double op_cost(const Graph& g, std::size_t node, std::string_view op);
 
 }  // namespace simsys::graph
@@ -1387,31 +1395,41 @@ void walk_client_keys(const Graph& g, std::size_t client,
 // size while it keeps its op name (a balancer's or limiter's route, a cache's or CDN's miss or
 // write forwarded to its store or origin, a step or `then` step whose op is the incoming op), a
 // step that states `size:` sends that size, and a step that renames the op without one sends an
-// unsized request. Seeded with each client's routes, sized by its `sizes:`.
+// unsized request. Seeded with each client's routes that carry flow, sized by its `sizes:`, and
+// with every step that states its size: such a step sends that size wherever it fires, even at a
+// node the walk never reaches from a client (a worker pool's `then` steps fire for whatever the
+// pool receives, and collect_arriving_ops counts them as arriving whether or not a queue feeds
+// the pool). Each request also carries its ORIGIN, the client or step that set its size (or, for
+// an unsized one, the client that stated none or the step that renamed the op), so a message
+// names where a size came from rather than the balancer every request passed through.
 //
 // Two hops the key walk leaves out are followed here, so that every op collect_arriving_ops
 // brings to a node is walked: a rate limiter's `counter` request to its store (unsized: it is
 // the limiter's own request, not the client's), and a message queue's links to the worker pools
 // behind it (each message keeps its op name through the queue, and the pool's `then` steps carry
 // it on). Like the key walk, it takes every hop that carries flow for SOME hit ratio, so a size
-// is needed on an `on: miss` path even if the cache in front never misses.
+// is needed on an `on: miss` path even if the cache in front never misses. What the walk still
+// cannot reach (a pool's unsized `then` step with no queue in front) Graph::resolve_request_sizes
+// catches from arriving_ops.
 //
 // Assumed: one size per (node, op) (refinement 1: each op's size is its mean; a flow that
 // carries bytes per op is phase 3).
 
-// A vertex of the size walk: `op` at `node`, `size` bytes long (unsized when empty).
+// A vertex of the size walk: `op` at `node`, `size` bytes long (unsized when empty), its size
+// set (or left unset) by `origin`, a client or the node of a step.
 struct SizeStream {
   std::size_t node{};
   std::string op{};
   std::optional<Bytes> size{};
+  std::size_t origin{};
   auto operator<=>(const SizeStream&) const = default;  // a std::set key (see AsyncHop)
 };
 
-// One way a request arrives at a node: as `op`, from `sender`, `size` bytes long. Sorted by op,
-// then sender (messages name the senders in scenario order).
+// One way a request arrives at a node: as `op`, `size` bytes long, as `origin` set it. Sorted by
+// op, then origin (messages name the origins in scenario order).
 struct SizeArrival {
   std::string op{};
-  std::size_t sender{};
+  std::size_t origin{};
   std::optional<Bytes> size{};
   auto operator<=>(const SizeArrival&) const = default;
 };
@@ -1424,12 +1442,14 @@ struct SizeArrival {
   return a.op == b.op;
 }
 
-// The size of a hop's requests: the step's own, else the incoming one if the op keeps its name,
-// else none.
-[[nodiscard]] std::optional<Bytes> hop_size(const SizeStream& from, const CallHop& hop) {
-  if (hop.size) return hop.size;
-  if (hop.op == from.op) return from.size;
-  return std::nullopt;
+// Where a hop leads in the size walk: its step's own size (set at `from`'s node), else the
+// incoming size and origin if the op keeps its name, else unsized, renamed at `from`'s node.
+[[nodiscard]] SizeStream next_size(const SizeStream& from, const CallHop& hop) {
+  if (hop.size) return {.node = hop.to, .op = hop.op, .size = hop.size, .origin = from.node};
+  if (hop.op == from.op) {
+    return {.node = hop.to, .op = hop.op, .size = from.size, .origin = from.origin};
+  }
+  return {.node = hop.to, .op = hop.op, .origin = from.node};
 }
 
 // The hops of the size walk that the key walk leaves out (see the section comment): a limiter's
@@ -1450,14 +1470,12 @@ void add_size_only_hops(const Graph& g, std::size_t node, std::string_view op,
   }
 }
 
-// Where a SizeStream leads: every call hop and size-only hop, each with its size (hop_size).
+// Where a SizeStream leads: every call hop and size-only hop, each with its size (next_size).
 [[nodiscard]] std::vector<SizeStream> next_sizes(const Graph& g, const SizeStream& stream) {
   auto hops = call_hops(g, stream.node, stream.op);
   add_size_only_hops(g, stream.node, stream.op, hops);
   std::vector<SizeStream> following;
-  for (const CallHop& hop : hops) {
-    following.push_back({.node = hop.to, .op = hop.op, .size = hop_size(stream, hop)});
-  }
+  for (const CallHop& hop : hops) following.push_back(next_size(stream, hop));
   return following;
 }
 
@@ -1473,25 +1491,54 @@ using SizeArrivals = std::vector<std::vector<SizeArrival>>;
   return stated->second;
 }
 
-// The size walk from every client's routes at once (a drained route carries nothing): a size
-// depends on the path a request took, not on which client sent it.
-[[nodiscard]] SizeArrivals size_arrivals(const Graph& g) {
-  std::vector<Seed<SizeStream>> seeds;
-  for (std::size_t client = 0; client < g.nodes().size(); ++client) {
-    const auto& spec = g.nodes()[client].spec;
-    if (spec.type != model::NodeType::client) continue;
-    for (const auto& route : g.client_routes(client)) {
-      if (route.share <= 0.0) continue;
-      const SizeStream stream{
-          .node = route.target, .op = route.op, .size = stated_size(spec, route.op)};
-      seeds.push_back({.sender = client, .vertex = stream});
-    }
+// The walk's seeds from a client: its routes that carry flow (a drained one, share 0, carries
+// nothing), each sized by the client's `sizes:`.
+void add_client_seeds(const Graph& g, std::size_t client, std::vector<Seed<SizeStream>>& seeds) {
+  const auto& spec = g.nodes()[client].spec;
+  for (const auto& route : g.client_routes(client)) {
+    if (route.share <= 0.0) continue;
+    const SizeStream stream{.node = route.target,
+                            .op = route.op,
+                            .size = stated_size(spec, route.op),
+                            .origin = client};
+    seeds.push_back({.sender = client, .vertex = stream});
   }
+}
+
+// The walk's seed from a step of `node` that states its size, if it does (see the section
+// comment): the size holds wherever the step fires.
+void add_sized_step_seed(const Graph& g, std::size_t node, const model::Step& step,
+                         std::vector<Seed<SizeStream>>& seeds) {
+  if (!step.size || step.on == model::StepCondition::failure) return;
+  const SizeStream stream{
+      .node = *g.index_of(step.to), .op = step.op, .size = step.size, .origin = node};
+  seeds.push_back({.sender = node, .vertex = stream});
+}
+
+// Every seed of the size walk: each client's routes, and each step of an `ops` list or a `then`
+// list that states its size.
+[[nodiscard]] std::vector<Seed<SizeStream>> size_seeds(const Graph& g) {
+  std::vector<Seed<SizeStream>> seeds;
+  for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+    const auto& spec = g.nodes()[node].spec;
+    if (spec.type == model::NodeType::client) add_client_seeds(g, node, seeds);
+    for (const auto& steps : spec.ops | std::views::values) {
+      for (const model::Step& step : steps) add_sized_step_seed(g, node, step, seeds);
+    }
+    for (const model::Step& step : spec.then) add_sized_step_seed(g, node, step, seeds);
+  }
+  return seeds;
+}
+
+// The size walk from every seed at once: a size depends on the path a request took, not on
+// which client sent it.
+[[nodiscard]] SizeArrivals size_arrivals(const Graph& g) {
   std::vector<std::set<SizeArrival>> arrivals(g.nodes().size());
   const auto next = [&](const SizeStream& stream) { return next_sizes(g, stream); };
-  const auto record = [&](std::size_t sender, const SizeStream& stream) {
-    arrivals[stream.node].insert({.op = stream.op, .sender = sender, .size = stream.size});
+  const auto record = [&](std::size_t /*sender*/, const SizeStream& stream) {
+    arrivals[stream.node].insert({.op = stream.op, .origin = stream.origin, .size = stream.size});
   };
+  auto seeds = size_seeds(g);
   walk_calls(std::move(seeds), next, record);
   SizeArrivals sorted(arrivals.size());
   for (std::size_t node = 0; node < arrivals.size(); ++node) {
@@ -1501,9 +1548,10 @@ using SizeArrivals = std::vector<std::vector<SizeArrival>>;
 }
 
 // "op 'get' arrives with two sizes, 1MB from 'a' and 2MB from 'b'", if two of the arrivals of one
-// op (sorted by sender) state different sizes: the first sized one and the first that disagrees
-// with it. At any node, byte-sized or not, so that one size per (node, op) holds wherever the
-// walk goes (a service that forwards the op unchanged would otherwise pass both on).
+// op (sorted by origin) state different sizes: the first sized one and the first that disagrees
+// with it, each named by its origin (the client or step that set it). At any node, byte-sized or
+// not, so that one size per (node, op) holds wherever the walk goes (a service that forwards the
+// op unchanged would otherwise pass both on).
 [[nodiscard]] std::optional<EngineError> two_sizes(std::span<const ResolvedNode> nodes,
                                                    std::size_t node,
                                                    std::span<const SizeArrival> arrivals) {
@@ -1515,8 +1563,8 @@ using SizeArrivals = std::vector<std::vector<SizeArrival>>;
     } else if (*arrival.size != *first->size) {
       return EngineError{"node '" + nodes[node].spec.id + "': op '" + first->op +
                          "' arrives with two sizes, " + format_size(*first->size) + " from '" +
-                         nodes[first->sender].spec.id + "' and " + format_size(*arrival.size) +
-                         " from '" + nodes[arrival.sender].spec.id + "'"};
+                         nodes[first->origin].spec.id + "' and " + format_size(*arrival.size) +
+                         " from '" + nodes[arrival.origin].spec.id + "'"};
     }
   }
   return std::nullopt;
@@ -1530,8 +1578,28 @@ using SizeArrivals = std::vector<std::vector<SizeArrival>>;
   return "capacity " + format_byte_rate(defaults::blob_store_byte_rate) + ", default";
 }
 
-// A byte-sized node's error for an op one of whose arrivals (sorted by sender) has no size,
-// naming the first such sender and what to add.
+// "node 'store' counts bytes (capacity 500MB/s, default), but op 'fetch' from 'svc' has no size:
+// ...": a byte-sized node's error for an unsized op, naming where to add the size.
+[[nodiscard]] EngineError no_size_error(std::span<const ResolvedNode> nodes, std::size_t node,
+                                        std::string_view op, std::size_t from) {
+  const auto& spec = nodes[node].spec;
+  return EngineError{"node '" + spec.id + "' counts bytes (" + byte_capacity_text(spec) +
+                     "), but op '" + std::string{op} + "' from '" + nodes[from].spec.id +
+                     "' has no size: add size: to the step or sizes: to the client"};
+}
+
+// Is the arrival a rate limiter's `counter` request to `node`, its backend (plan 2a refinement
+// 6)? Its origin is the limiter itself: the counter is the limiter's request, not a client's.
+[[nodiscard]] bool is_limiter_counter(std::span<const ResolvedNode> nodes, std::size_t node,
+                                      const SizeArrival& arrival) {
+  const auto& origin = nodes[arrival.origin];
+  return arrival.op == counter_op && origin.spec.type == model::NodeType::rate_limiter &&
+         origin.backend == node;
+}
+
+// A byte-sized node's error for an op one of whose arrivals (sorted by origin) has no size,
+// naming the first such origin and what to add; a limiter's counter, which no size can fix, gets
+// its own message.
 [[nodiscard]] std::optional<EngineError> unsized_bytes(std::span<const ResolvedNode> nodes,
                                                        std::size_t node,
                                                        std::span<const SizeArrival> arrivals) {
@@ -1539,21 +1607,44 @@ using SizeArrivals = std::vector<std::vector<SizeArrival>>;
   if (!defaults::is_byte_sized(spec)) return std::nullopt;
   for (const SizeArrival& arrival : arrivals) {
     if (arrival.size) continue;
-    return EngineError{"node '" + spec.id + "' counts bytes (" + byte_capacity_text(spec) +
-                       "), but op '" + arrival.op + "' from '" + nodes[arrival.sender].spec.id +
-                       "' has no size: add size: to the step or sizes: to the client"};
+    if (is_limiter_counter(nodes, node, arrival)) {
+      return EngineError{"node '" + spec.id + "' counts bytes (" + byte_capacity_text(spec) +
+                         "), but '" + nodes[arrival.origin].spec.id +
+                         "' sends it its counter: a limiter's counter carries no size; its "
+                         "backend must count requests"};
+    }
+    return no_size_error(nodes, node, arrival.op, arrival.origin);
   }
   return std::nullopt;
 }
 
-// The one size of an op at a node, from its arrivals (sorted by sender): two sizes are an error
-// (two_sizes), and so is an unsized arrival at a byte-sized node (unsized_bytes). A
-// request-counting node with sized and unsized arrivals resolves to unsized: it needs no size,
-// and a byte-sized node further on then reports the unsized path rather than inherit a size that
-// only some of the requests have.
+// A byte-sized node's error for a request of 0 bytes: it would cost 0 MB, so the node could serve
+// infinitely many (its demand in requests divides by the size). The loader refuses `0B` as a
+// request size; this guards a scenario built in code.
+[[nodiscard]] std::optional<EngineError> zero_bytes(std::span<const ResolvedNode> nodes,
+                                                    std::size_t node,
+                                                    std::span<const SizeArrival> arrivals) {
+  const auto& spec = nodes[node].spec;
+  if (!defaults::is_byte_sized(spec)) return std::nullopt;
+  for (const SizeArrival& arrival : arrivals) {
+    if (!arrival.size || arrival.size->count > 0.0) continue;
+    return EngineError{"node '" + spec.id + "' counts bytes (" + byte_capacity_text(spec) +
+                       "), but op '" + arrival.op + "' from '" + nodes[arrival.origin].spec.id +
+                       "' has size " + format_size(*arrival.size) +
+                       ": a request's size must be positive"};
+  }
+  return std::nullopt;
+}
+
+// The one size of an op at a node, from its arrivals (sorted by origin): two sizes are an error
+// (two_sizes), and so are a zero size and an unsized arrival at a byte-sized node (zero_bytes,
+// unsized_bytes). A request-counting node with sized and unsized arrivals resolves to unsized: it
+// needs no size, and a byte-sized node further on then reports the unsized path rather than
+// inherit a size that only some of the requests have.
 [[nodiscard]] std::expected<std::optional<Bytes>, EngineError> resolved_size(
     std::span<const ResolvedNode> nodes, std::size_t node, std::span<const SizeArrival> arrivals) {
   if (auto conflict = two_sizes(nodes, node, arrivals)) return std::unexpected{*conflict};
+  if (auto zero = zero_bytes(nodes, node, arrivals)) return std::unexpected{*zero};
   if (auto unsized = unsized_bytes(nodes, node, arrivals)) return std::unexpected{*unsized};
   const auto has_no_size = [](const SizeArrival& arrival) { return !arrival.size; };
   if (std::ranges::any_of(arrivals, has_no_size)) return std::nullopt;
@@ -1988,6 +2079,7 @@ Graph::Result Graph::resolve_nodes() {
   }
   routes_.resize(nodes_.size());
   arriving_ops_.resize(nodes_.size());
+  first_sender_.resize(nodes_.size());
   service_hops_.resize(nodes_.size());
   request_bytes_.resize(nodes_.size());
   return {};
@@ -2216,10 +2308,12 @@ std::optional<double> Graph::hit_ratio(std::size_t node) const {
 }
 
 // Every (node, op)'s one size, from the size walk (detail::size_arrivals), after every route,
-// step and backend exists: nodes in scenario order, each node's ops in name order, so the first
-// error is the same on every run. C++23 views::chunk_by splits a node's arrivals (sorted by op)
-// into runs of one op each, replacing a hand-written loop that tracks where each run starts;
-// each run is contiguous, so it is passed on as a span.
+// step and backend exists and after collect_arriving_ops: nodes in scenario order, each node's
+// ops in name order, so the first error is the same on every run. C++23 views::chunk_by splits a
+// node's arrivals (sorted by op) into runs of one op each, replacing a hand-written loop that
+// tracks where each run starts; each run is contiguous, so it is passed on as a span. Then
+// every op that arrives at a byte-sized node must have a size, however it arrived
+// (check_sized_arrivals).
 Graph::Result Graph::resolve_request_sizes() {
   const auto arrivals = detail::size_arrivals(*this);
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
@@ -2229,6 +2323,21 @@ Graph::Result Graph::resolve_request_sizes() {
       if (!size) return std::unexpected{std::move(size.error())};
       if (*size) request_bytes_[node].emplace(one_op.front().op, **size);
     }
+    if (auto checked = check_sized_arrivals(node); !checked) return checked;
+  }
+  return {};
+}
+
+// Every op that arrives at a byte-sized node has a size. The size walk refuses an unsized
+// arrival it finds (detail::unsized_bytes); this catches one it cannot find, because
+// collect_arriving_ops brings it by a path the walk does not take from a client (a worker
+// pool's unsized `then` step with no queue feeding the pool: the step fires for whatever the
+// pool receives). The message names the first node collect_arriving_ops saw send it.
+Graph::Result Graph::check_sized_arrivals(std::size_t node) const {
+  if (!defaults::is_byte_sized(nodes_[node].spec)) return {};
+  for (const auto& op : arriving_ops_[node]) {
+    if (request_bytes_[node].contains(op)) continue;
+    return std::unexpected{detail::no_size_error(nodes_, node, op, first_sender_[node].at(op))};
   }
   return {};
 }
@@ -2243,8 +2352,14 @@ std::optional<Bytes> Graph::request_bytes(std::size_t node, std::string_view op)
 double op_cost(const Graph& g, std::size_t node, std::string_view op) {
   const auto size = g.request_bytes(node, op);  // first: it checks `node` (vector::at)
   const auto& spec = g.nodes()[node].spec;
-  if (defaults::is_byte_sized(spec) && size) return defaults::byte_cost(*size);
-  return defaults::op_cost(spec, op);
+  if (!defaults::is_byte_sized(spec)) return defaults::op_cost(spec, op);
+  if (size) return defaults::byte_cost(*size);
+  // Unreachable from a built Graph: check_sized_arrivals refused every unsized arriving op.
+  if (std::ranges::binary_search(g.arriving_ops(node), op)) {
+    throw std::logic_error{"op_cost: op '" + std::string{op} + "' arrives at byte-sized node '" +
+                           spec.id + "' without a size"};
+  }
+  return defaults::op_cost(spec, op);  // never arrives: no flow of it is charged here
 }
 
 std::span<const ServiceHop> Graph::service_hops(std::size_t node, std::string_view op) const {
@@ -2623,25 +2738,32 @@ std::vector<Route> Graph::routes_for(std::size_t node, std::string_view op) cons
 }
 
 // Which ops reach every node: a worklist over (node, op) pairs, seeded with the client
-// routes, the steps that carry flow (the unconditional `then` steps of the node types that do
-// not hit or miss, and every resolved hop of positive fraction: an `on: miss` step after a cache
-// that misses) and the `counter` op of every limiter's backend, and grown through load balancers
+// routes that carry flow (not a drained one: the size walk skips it too), the steps that carry
+// flow (the unconditional `then` steps of the node types that do not hit or miss, and every
+// resolved hop of positive fraction: an `on: miss` step after a cache that misses) and the
+// `counter` op of every limiter's backend, and grown through load balancers
 // and rate limiters, which pass each op they receive on to every route whose link carries it and
 // is not drained (weight 0: no flow takes it), through caches, which pass each op they receive
 // on along every `then` step that carries some of THAT op (carries_flow: an `on: miss` step
 // carries the read misses, so a cache that only ever receives writes sends nothing along it),
 // and through caches and CDNs, which pass an op on to their backend (a CDN's origin) when some
-// of it goes there (backend_fraction). Each pair enters the list once, so a loop ends.
+// of it goes there (backend_fraction). Each pair enters the list once, so a loop ends; the
+// first node seen sending it is kept for messages (first_sender_).
 void Graph::collect_arriving_ops() {
-  std::vector<std::set<std::string>> arriving(nodes_.size());
+  std::vector<std::map<std::string, std::size_t, std::less<>>> arriving(nodes_.size());
   std::vector<std::pair<std::size_t, std::string>> work;
-  const auto arrive = [&](std::size_t node, const std::string& op) {
-    if (arriving[node].insert(op).second) work.emplace_back(node, op);
+  const auto arrive_from = [&](std::size_t sender, std::size_t node, const std::string& op) {
+    if (arriving[node].try_emplace(op, sender).second) work.emplace_back(node, op);
   };
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
     const auto& spec = nodes_[node].spec;
+    const auto arrive = [&](std::size_t target, const std::string& op) {
+      arrive_from(node, target, op);
+    };
     if (spec.type == model::NodeType::client) {
-      for (const auto& route : routes_[node]) arrive(route.target, route.op);
+      for (const auto& route : routes_[node]) {
+        if (route.share > 0.0) arrive(route.target, route.op);
+      }
     }
     for (const auto& hops : service_hops_[node] | std::views::values) {
       for (const ServiceHop& hop : hops) {
@@ -2663,6 +2785,9 @@ void Graph::collect_arriving_ops() {
   while (!work.empty()) {
     const auto [node, op] = std::move(work.back());
     work.pop_back();
+    const auto arrive = [&](std::size_t target, const std::string& sent) {
+      arrive_from(node, target, sent);
+    };
     if (hits_or_misses(nodes_[node].spec.type)) {
       for (const model::Step& step : nodes_[node].spec.then) {
         if (carries_flow(node, step, op)) arrive(*index_of(step.to), step.op);
@@ -2678,7 +2803,9 @@ void Graph::collect_arriving_ops() {
     }
   }
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
-    arriving_ops_[node].assign(arriving[node].begin(), arriving[node].end());  // sorted: a set
+    const auto ops = arriving[node] | std::views::keys;  // sorted: a map
+    arriving_ops_[node].assign(ops.begin(), ops.end());
+    first_sender_[node] = std::move(arriving[node]);
   }
 }
 
