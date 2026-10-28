@@ -7,6 +7,8 @@
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <utility>
 
 #include <unistd.h>  // getpid
 
@@ -19,16 +21,31 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// Writes `yaml` to a file in the system temp directory and returns its path, so the
-// loader is exercised through its real entry point (a file path), not a string shortcut.
-// The process id is part of the file name so two test processes running at the same time
-// (e.g. ctest -j) never overwrite each other's scenario files.
-std::filesystem::path write_temp(std::string_view name, std::string_view yaml) {
+// A scenario file in the system temp directory that removes itself when the test ends
+// (RAII: the destructor runs even when a REQUIRE fails and unwinds the test), so test runs
+// leave nothing behind. `string()` gives the form `load` takes: passing a std::filesystem::path
+// directly only compiles on POSIX, where its native string type is std::string.
+struct TempFile {
+  std::filesystem::path path;
+  TempFile(std::filesystem::path p) : path(std::move(p)) {}
+  TempFile(const TempFile&) = delete;
+  TempFile& operator=(const TempFile&) = delete;
+  ~TempFile() {
+    std::error_code ignored;  // the non-throwing overload: a destructor must not throw
+    std::filesystem::remove(path, ignored);
+  }
+  std::string string() const { return path.string(); }
+};
+
+// Writes `yaml` to a file in the system temp directory, so the loader is exercised through
+// its real entry point (a file path), not a string shortcut. The process id is part of the
+// file name so two test processes running at the same time (e.g. ctest -j) never overwrite
+// each other's scenario files.
+TempFile write_temp(std::string_view name, std::string_view yaml) {
   const auto unique_name = std::to_string(::getpid()) + "_" + std::string{name};
   const auto path = std::filesystem::temp_directory_path() / unique_name;
-  std::ofstream out(path);
-  out << yaml;
-  return path;
+  std::ofstream(path) << yaml;
+  return TempFile{path};  // a prvalue: guaranteed copy elision (C++17), no copy or move needed
 }
 
 // Loads `yaml` and asserts it is rejected with exactly `message`, attributed to the file.
@@ -37,7 +54,7 @@ std::filesystem::path write_temp(std::string_view name, std::string_view yaml) {
 void require_rejected(std::string_view file_name, std::string_view yaml, std::string_view message) {
   CAPTURE(yaml);  // a failing assertion below then shows the offending scenario
   const auto path = write_temp(file_name, yaml);
-  const auto s = simsys::config::load(path);
+  const auto s = simsys::config::load(path.string());
   REQUIRE_FALSE(s.has_value());
   REQUIRE(s.error().message == message);
   REQUIRE(s.error().file == path.string());
@@ -62,7 +79,8 @@ nodes:
 links:
   - {from: users, to: api, dir: inout}
 )");
-  const auto s = simsys::config::load(path);
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
   REQUIRE(s.has_value());
   REQUIRE(s->name == "minimal");
   REQUIRE(s->duration == 1min);
@@ -84,7 +102,9 @@ nodes:
     capacity: 500MB/s
 links: []
 )");
-  REQUIRE(simsys::config::load(path).has_value());
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
 }
 
 TEST_CASE("a link to an undeclared node is reported with its line") {
@@ -102,7 +122,7 @@ nodes:
 links:
   - {from: users, to: apii}
 )");
-  const auto s = simsys::config::load(path);
+  const auto s = simsys::config::load(path.string());
   REQUIRE_FALSE(s.has_value());
   REQUIRE(s.error().message == "link refers to unknown node 'apii'");
   REQUIRE(s.error().file == path.string());
@@ -252,7 +272,7 @@ links: []
 
 TEST_CASE("invalid YAML syntax is reported as a config error, not an exception") {
   const auto path = write_temp("simsys_broken.yaml", "nodes: [unclosed");
-  const auto s = simsys::config::load(path);
+  const auto s = simsys::config::load(path.string());
   REQUIRE_FALSE(s.has_value());
   REQUIRE(s.error().file == path.string());
   CHECK(s.error().line >= 1);  // yaml-cpp's syntax-error position is reported, not dropped
@@ -370,7 +390,8 @@ nodes:
 links:
   - {from: users, to: api, latency: 0.3ms}
 )");
-  const auto s = simsys::config::load(path);
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
   REQUIRE(s.has_value());
 }
 
@@ -493,7 +514,8 @@ nodes:
   db: {type: service, capacity: 1k/s}
 links: []
 )");
-  const auto s = simsys::config::load(path);
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
   REQUIRE(s.has_value());
   REQUIRE(s->nodes.size() == 2);
 }
@@ -539,7 +561,7 @@ links:
   }
 }
 
-TEST_CASE("ops values that are not step lists are skipped, for clients and services alike") {
+TEST_CASE("a client's and a service's numeric op shares load") {
   const auto path = write_temp("simsys_numeric_ops.yaml", R"(
 version: 1
 name: t
@@ -554,7 +576,8 @@ nodes:
     ops: {ping: 0.5}
 links: []
 )");
-  const auto s = simsys::config::load(path);
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
   REQUIRE(s.has_value());
   REQUIRE(s->nodes.size() == 2);
 }
@@ -593,5 +616,75 @@ nodes:
 links: []
 )",
                      "name must be a scalar");
+  }
+}
+
+TEST_CASE("an op value must be a step list or a share") {
+  const auto service_ops = [](std::string_view ops) {
+    return "version: 1\nname: t\nduration: 1m\nnodes:\n  api:\n    type: service\n"
+           "    capacity: 1k/s\n    ops: " +
+           std::string{ops} + "\nlinks: []\n";
+  };
+  SECTION("a map value that is neither a list nor a number") {
+    require_rejected("simsys_op_map.yaml", service_ops("{read: {to: ghost}}"),
+                     "op 'read' must be a step list or a share");
+  }
+  SECTION("a text value that is not a number") {
+    require_rejected("simsys_op_text.yaml", service_ops("{read: fast}"),
+                     "op 'read' must be a step list or a share");
+  }
+  SECTION("ops given as a scalar") {
+    require_rejected("simsys_ops_scalar.yaml", service_ops("hello"), "ops must be a map");
+  }
+  SECTION("ops given as a list") {
+    require_rejected("simsys_ops_list.yaml", service_ops("[ghost]"), "ops must be a map");
+  }
+  SECTION("a service op that is a share still loads") {
+    const auto path = write_temp("simsys_op_share.yaml", service_ops("{ping: 0.5}"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+  }
+  SECTION("an empty step list is a valid terminal op") {
+    const auto path = write_temp("simsys_op_empty_list.yaml", service_ops("{read: []}"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+  }
+}
+
+TEST_CASE("name and node ids must not be empty") {
+  SECTION("an empty quoted name") {
+    require_rejected("simsys_name_empty.yaml", R"(
+version: 1
+name: ''
+duration: 1m
+nodes:
+  api: {type: service, capacity: 1k/s}
+links: []
+)",
+                     "name must not be empty");
+  }
+  SECTION("a null name") {
+    require_rejected("simsys_name_null.yaml", R"(
+version: 1
+name:
+duration: 1m
+nodes:
+  api: {type: service, capacity: 1k/s}
+links: []
+)",
+                     "name must not be empty");
+  }
+  SECTION("an empty node id") {
+    require_rejected("simsys_node_id_empty.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  '': {type: service}
+links: []
+)",
+                     "node id must not be empty");
   }
 }
