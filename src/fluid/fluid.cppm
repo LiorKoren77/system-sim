@@ -30,9 +30,12 @@ export namespace simsys::fluid {
 // fluid drain, `service_time_s` is how long one request occupies one of the
 // `concurrency` servers and feeds the Erlang C term.
 //
-// Invariant the defaults do not enforce (scenarios own it): `service_rate` should equal
-// `concurrency / service_time_s`. The fluid drain uses the former, the Erlang C term the
-// latter, so a mismatch makes them describe two different machines. Example: rate 2000/s,
+// Invariant: `service_rate` should equal `concurrency / service_time_s`. The defaults
+// keep it, up to rounding c up to a whole server, by deriving c
+// (defaults::implied_concurrency, Little's law); a scenario that sets
+// advanced.concurrency owns it. The fluid drain uses `service_rate`, the Erlang C term
+// `concurrency` and `service_time_s`, so a mismatch makes them describe two different
+// machines. Example: rate 2000/s,
 // s = 1 ms, c = 1 at 1500/s gives an Erlang wait computed at rho 0.75 (3 ms) while a
 // consistent 2000/s server (s = 0.5 ms) would wait 1.5 ms. `service_rate` must be >= 0.
 struct Capacity {
@@ -134,8 +137,7 @@ Zone zone_of(double rho, const Capacity& c) {
 //   fluid  = backlog_/cap                                  deterministic drain time
 //   stoch  = k * mmc_wait(c, min(rho, 0.99), s).mean       random bunching of arrivals
 //   latency.mean = max(fluid, stoch) + s                   OUR HEURISTIC blend, see sojourn()
-//   latency.var  = (stoch wins ? k^2 * mmc_wait(...).variance : 0)
-//                + service_variability * s^2
+//   latency.var  = k^2 * mmc_wait(...).variance + service_variability * s^2   (always)
 //                  Allen–Cunneen scales the MEAN wait by k. Applying k^2 to the variance is
 //                  OUR OWN HEURISTIC (a scaled random variable has k^2 times the variance);
 //                  no published result is claimed for it.
@@ -166,10 +168,13 @@ void FluidQueue::settle(Rate demand) {
   backlog_ = demand.per_second >= capacity_.service_rate.per_second ? capacity_.queue_limit : 0.0;
 }
 
-// `dt.count() <= 0`, not `dt <= SimTime::zero()`: duration's comparison operators and
-// zero() are declared in <chrono>, which this interface must not include (CLAUDE.md §3,
-// GCC 14 BMI bug), so we compare the raw tick count. SimTime is integer nanoseconds,
-// so this is exact.
+// `dt.count() <= 0`, not `dt <= SimTime::zero()`: SimTime::zero() is a static member and
+// visible here, but duration's comparison operators are non-member templates declared
+// in <chrono>, which this interface must not include (CLAUDE.md §3, GCC 14 BMI bug);
+// importing simsys.core does not bring them into scope, because simsys.core includes
+// <chrono> in its global module fragment and never exports those operators (and
+// argument-dependent lookup does not reach them either, [basic.lookup.argdep]/4.3).
+// So we compare the raw tick count; SimTime is integer nanoseconds, so this is exact.
 void FluidQueue::require_positive_step(SimTime dt) {
   if (dt.count() <= 0) throw std::invalid_argument{"FluidQueue::advance: dt must be > 0"};
 }
@@ -234,12 +239,16 @@ double FluidQueue::backlog_wait_s() const {
 // corresponds to a stochastic queue of ~99 requests (Lq = rho^2/(1 - rho) = 98). Once the fluid
 // backlog exceeds that, the stochastic queue IS the backlog, so adding both counts it twice
 // (measured +50-98% overstatement in early overload with 100 ms steps). The max equals the old
-// formula below saturation (backlog 0), is continuous, and becomes fluid-only deep in overload.
+// formula below saturation (backlog 0), is continuous in the mean, and becomes fluid-only
+// deep in overload.
 //
-// Variance: k^2 * Var(Wq) when the stochastic term wins, 0 when the fluid term wins (a
-// deterministic drain), plus the service variance cs^2 * s^2 in both cases; for
-// exponential service (cs^2 = 1) that is s^2. Wait and service are assumed independent,
-// so their variances add.
+// Variance: k^2 * Var(Wq at min(rho, 0.99)) + cs^2 * s^2, ALWAYS, whichever term wins
+// the mean; for exponential service (cs^2 = 1) the second term is s^2. Wait and service
+// are assumed independent, so their variances add. The stochastic variance is kept even
+// when the fluid drain carries the mean, so percentiles stay monotone as overload
+// deepens: dropping it (a "deterministic drain" has no spread) made the estimated p99
+// FALL the moment the backlog wait overtook the Erlang wait, because the lognormal fit
+// lost its spread faster than the mean grew. Also our heuristic, not a published result.
 flow::LatencyEstimate FluidQueue::sojourn(double rho) const {
   const double s = capacity_.service_time_s;
   const double k =
@@ -248,10 +257,8 @@ flow::LatencyEstimate FluidQueue::sojourn(double rho) const {
   const double fluid_wait_s = backlog_wait_s();
   const double stochastic_wait_s = k * wait.mean_s;
   const double service_variance_s2 = capacity_.service_variability * s * s;
-  if (fluid_wait_s > stochastic_wait_s) {
-    return flow::LatencyEstimate{.mean_s = fluid_wait_s + s, .variance_s2 = service_variance_s2};
-  }
-  return flow::LatencyEstimate{.mean_s = stochastic_wait_s + s,
+  // std::max(stochastic, fluid): the stochastic term first, so a NaN in it propagates.
+  return flow::LatencyEstimate{.mean_s = std::max(stochastic_wait_s, fluid_wait_s) + s,
                                .variance_s2 = k * k * wait.variance_s2 + service_variance_s2};
 }
 
