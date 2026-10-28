@@ -11,6 +11,7 @@
 module;
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 
 export module simsys.queueing;
 
@@ -19,21 +20,31 @@ export namespace simsys::queueing {
 // Erlang C: the probability that an arriving request finds all `servers` busy and has
 // to wait, in an M/M/c queue (Poisson arrivals, exponential service, c servers).
 // `rho` is the utilization lambda / (c * mu) in [0, 1).
-//   P_wait = [a^c/c! * 1/(1-rho)] / [sum_{k<c} a^k/k! + a^c/c! * 1/(1-rho)],  a = c*rho
 // At or beyond rho = 1 every arrival waits, so we return 1 (the fluid backlog carries
 // the actual delay then, see fluid.cppm).
+//
+// Preconditions (programmer errors, not user input): `servers >= 1`, enforced by an
+// exception because CLAUDE.md allows exceptions for programmer errors and scenario
+// validation keeps user input from ever reaching this function. Not guarded, only
+// documented: a NaN `rho` propagates to a NaN result (both comparisons below are false),
+// which is the desired loud failure. The engine must therefore not cap rho at 0.99 with
+// `std::fmin`, which returns the non-NaN argument and would hide the NaN.
 [[nodiscard]] double erlang_c(int servers, double rho) {
+  if (servers < 1) throw std::invalid_argument{"servers must be >= 1"};
   if (rho <= 0.0) return 0.0;
   if (rho >= 1.0) return 1.0;
   const double offered_load = servers * rho;  // "a", in Erlangs
-  double term = 1.0;                          // a^k / k!, built iteratively (no factorials)
-  double sum_below_c = 0.0;
-  for (int k = 0; k < servers; ++k) {
-    sum_below_c += term;
-    term *= offered_load / (k + 1);
-  }
-  const double last = term / (1.0 - rho);  // a^c / c! * 1/(1-rho)
-  return last / (sum_below_c + last);
+  // Erlang B is the *loss* formula: the probability that a request is lost (turned away)
+  // in a system with c servers and no waiting room, i.e. that all c servers are busy.
+  // Its recurrence is B(0) = 1, B(k) = a B(k-1) / (k + a B(k-1)). Every intermediate
+  // stays in [0, 1], unlike the textbook a^k/k!, which overflows a double once a > ~712
+  // (a thousand pooled connections at rho 0.99 is a realistic input).
+  double blocking = 1.0;
+  for (int k = 1; k <= servers; ++k)
+    blocking = offered_load * blocking / (k + offered_load * blocking);
+  // Erlang C from Erlang B: P_wait = B / (1 - rho (1 - B)). It is larger than B because
+  // a queue lets blocked requests wait instead of leaving.
+  return blocking / (1.0 - rho * (1.0 - blocking));
 }
 
 struct WaitMoments {
@@ -42,29 +53,42 @@ struct WaitMoments {
 };
 
 // Mean and variance of the time spent waiting in queue (not being served) in M/M/c.
-// The wait is 0 with probability 1 - P_wait, otherwise exponential with mean
-// s / (c * (1 - rho)) where s is the service time, so
-//   E[Wq]   = P_wait * s / (c (1 - rho))               (Little's law applied to the queue)
-//   Var[Wq] = P_wait (2 - P_wait) * (s / (c (1 - rho)))^2
+// The wait is 0 with probability 1 - P_wait; otherwise, because all c servers are busy
+// and exponential service is memoryless, completions arrive as a Poisson process of
+// rate c*mu and the wait for the first one is exponential with mean
+//   theta = s / (c (1 - rho)).            (mean of Exp(c mu - lambda), s = 1/mu)
+//   E[Wq]   = P_wait * theta                               (law of total expectation)
+//   Var[Wq] = E[Wq^2] - E[Wq]^2 = P*2 theta^2 - P^2 theta^2 = P (2 - P) theta^2
+//                                                          (Exp's second moment is 2 theta^2)
 // Infinite at saturation: a queue with rho >= 1 has no steady state.
+// Same preconditions as erlang_c: `servers >= 1` (throws), NaN rho propagates, and a
+// negative service time simply yields negative waits (not guarded).
 [[nodiscard]] WaitMoments mmc_wait(int servers, double rho, double service_time_s) {
+  if (servers < 1) throw std::invalid_argument{"servers must be >= 1"};
   if (rho >= 1.0) {
     constexpr double inf = std::numeric_limits<double>::infinity();
-    return {inf, inf};
+    // C++20 designated initializers: name the fields at the construction site. Replaces
+    // positional `{a, b}`, which silently swaps two doubles of the same type when the
+    // struct is reordered; here mean and variance cannot be confused.
+    return {.mean_s = inf, .variance_s2 = inf};
   }
   const double p_wait = erlang_c(servers, rho);
-  const double scale = service_time_s / (servers * (1.0 - rho));
-  // C++20 designated initializers: name the fields at the construction site. Replaces
-  // positional `{a, b}`, which silently swaps two doubles of the same type when the
-  // struct is reordered; here mean and variance cannot be confused.
-  return {.mean_s = p_wait * scale, .variance_s2 = p_wait * (2.0 - p_wait) * scale * scale};
+  const double theta = service_time_s / (servers * (1.0 - rho));
+  return {.mean_s = p_wait * theta, .variance_s2 = p_wait * (2.0 - p_wait) * theta * theta};
 }
 
-// Kingman / Allen–Cunneen approximation: a G/G/c queue waits about
-//   (c_a^2 + c_s^2) / 2  times as long as the M/M/c queue with the same rho,
-// where c_a^2 is the squared coefficient of variation (variance / mean^2) of
-// inter-arrival times ("burstiness") and c_s^2 that of service times
-// ("service_variability"). Exact for M/M/c (1, 1 -> 1); a heuristic otherwise.
+// Kingman's formula is the G/G/1 approximation
+//   E[Wq] ~ (rho / (1 - rho)) * ((c_a^2 + c_s^2) / 2) * s;
+// its multi-server extension is Allen-Cunneen, which is what this factor implements: a
+// G/G/c queue waits about (c_a^2 + c_s^2) / 2 times as long as the M/M/c queue with the
+// same rho. Here c_a^2 is the squared coefficient of variation (variance / mean^2) of
+// inter-arrival times ("burstiness") and c_s^2 that of service times ("service_variability").
+// Assumptions and limits:
+//  - the factor scales the *mean* wait only; using it on the variance is a separate
+//    heuristic and must be flagged where it is done;
+//  - inter-arrival times are assumed renewal (independent of each other);
+//  - exact for M/M/c (1, 1 -> 1) and for M/G/1 (Pollaczek-Khinchine);
+//  - most accurate as rho -> 1, a heuristic at light load.
 [[nodiscard]] double variability_factor(double arrival_scv, double service_scv) {
   return (arrival_scv + service_scv) / 2.0;
 }
@@ -72,17 +96,24 @@ struct WaitMoments {
 // Standard-normal quantiles for the three percentiles reports show. Constants rather
 // than an inverse-error-function implementation: three values is all we need.
 inline constexpr double z_p50 = 0.0;
-inline constexpr double z_p95 = 1.6448536;
-inline constexpr double z_p99 = 2.3263479;
+inline constexpr double z_p95 = 1.6448536269514722;
+inline constexpr double z_p99 = 2.3263478740408408;
 
-// Lognormal fit by moments. Latency along a path is a sum of positive, right-skewed
-// terms; a lognormal with the same mean m and variance v is the usual engineering fit:
+// Lognormal fit by moments (Fenton-Wilkinson moment matching). Latency along a path is a
+// sum of positive, right-skewed terms; a lognormal with the same mean m and variance v
+// is the usual engineering fit:
 //   sigma^2 = ln(1 + v/m^2),  mu = ln m - sigma^2/2,  quantile(z) = exp(mu + sigma z)
-// Reports label the result "estimated": it is a fit, not a measurement.
+// Reports label the result "estimated": it is a fit, not a measurement. The fit is poor
+// for a distribution with an atom at 0, such as Wq alone (zero with probability
+// 1 - P_wait); the engine applies it to the full sojourn time, whose mean is >= s.
+// `variance <= 0` returns the mean on purpose: it also clamps the small negative
+// variances that rounding can produce when moments are composed by subtraction.
 [[nodiscard]] double lognormal_quantile(double mean, double variance, double z_score) {
   if (mean <= 0.0) return 0.0;
   if (variance <= 0.0) return mean;
-  const double sigma_sq = std::log1p(variance / (mean * mean));
+  // (variance / mean) / mean instead of variance / (mean * mean): mean * mean underflows
+  // to 0 for means below ~1e-162, which would make sigma^2 infinite.
+  const double sigma_sq = std::log1p((variance / mean) / mean);
   const double mu = std::log(mean) - sigma_sq / 2.0;
   return std::exp(mu + std::sqrt(sigma_sq) * z_score);
 }
