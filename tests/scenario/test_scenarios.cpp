@@ -89,12 +89,13 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
       REQUIRE(created.error().message.find("phase 2") != std::string::npos);
       continue;  // a node type of a later phase: nothing to run yet
     }
-    // Two runnable scenarios are not "must pass" cases, each for a stated reason:
+    // Two runnable scenarios are checked by their own tests below instead, each for a stated
+    // reason:
     //  - lab-unique-id ships with the ticket server carrying the load, to FAIL its drop_rate SLO
-    //    (8k/s of capacity against 10k/s offered): the lesson. Its own test below pins that.
-    //  - url-shortener is 24 h at 100 ms = 863k steps (about a minute in a Debug build, far over
-    //    the five seconds below), and its web tier (107 %) and database primary (173 %) are red
-    //    in explain as shipped: running it end to end is a scenario-tuning task of its own.
+    //    (8k/s of capacity against 10k/s offered): the lesson. Its own test pins that.
+    //  - url-shortener passes its SLOs, but 24 h at 1 s is 86.4k steps: 0.4 s in Release, 6.1 to
+    //    6.6 s in a Debug build (measured 2026-10-28), over the five seconds below. Its own test
+    //    runs it end to end with no time limit and pins its SLO results.
     if (s.name == "lab-unique-id" || s.name == "url-shortener") {
       ++ran;
       continue;
@@ -419,4 +420,38 @@ TEST_CASE("book scenarios with a snowflake id generator validate and explain the
     const auto line = text.substr(at + 1, text.find('\n', at + 1) - at - 1);
     REQUIRE(line.contains(total));
   }
+}
+
+// ---- The first book system end to end (plan 2b, Task 8; book ch. 8) ----
+
+// book/url-shortener, sized with the book's figures (100M writes/day, 10:1 reads; a stateless web
+// tier scaled out, a cache absorbing the reads, the database sharded), runs its 24 hours and
+// meets both of its SLOs at the 14:00 peak. Two headline numbers are pinned:
+//  - the url_cache hit ratio explain resolves by Che's approximation (LRU, 20M slots over the
+//    clients' Zipf(1.0) space of 100M keys): 0.881, as explain prints it (an independent Python
+//    computation of Che's fixed point gives 0.8806);
+//  - the redirect p99, 7.49 ms in the run (simsys run, at step 1s and at 100ms alike). Its mean,
+//    4.10 ms, is mostly wire: five round trips of 2 x 250 us (users -> limiter, limiter ->
+//    rules_cache, limiter -> lb, lb -> web, web -> url_cache) = 2.5 ms, plus the service times
+//    (50 + 250 + 50 + 300 + 250 us) and the web tier's queueing (rho 0.8 at the peak), plus the
+//    11.9 % of misses that go on to a database replica. The p99 is the lognormal fitted to the
+//    response's mean and variance; 2 % of tolerance, so a change to the model that moves it is
+//    seen and the README's numbers are re-checked.
+// And nothing is dropped: no node is red at the peak (web 80 %, the busiest database copy 65 %).
+TEST_CASE("book/url-shortener runs its 24 hours and meets both SLOs with a 0.881 che hit ratio",
+          "[scenario]") {
+  const auto s = load_scenario("/book/url-shortener/scenario.yaml");
+  const auto g = simsys::graph::Graph::build(s);
+  if (!g) FAIL(g.error().message);
+  REQUIRE_THAT(*g->hit_ratio(*g->index_of("url_cache")), Catch::Matchers::WithinAbs(0.881, 5e-4));
+  const auto results = run_slos(s);
+  REQUIRE(results.size() == 2);
+  const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
+  const auto& drops = slo_of(results, simsys::model::SloMetric::drop_rate);
+  CAPTURE(p99.observed.value_or(-1.0), drops.observed.value_or(-1.0));
+  REQUIRE(p99.status == simsys::report::SloStatus::pass);
+  REQUIRE(drops.status == simsys::report::SloStatus::pass);
+  REQUIRE(p99.observed.has_value());
+  REQUIRE_THAT(*p99.observed, Catch::Matchers::WithinRel(7.49e-3, 0.02));
+  REQUIRE(drops.observed == 0.0);
 }

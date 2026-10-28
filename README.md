@@ -145,11 +145,24 @@ on exactly 1k/s passes. Latency counts only the requests that were answered. The
 README compares the five algorithms at `burst: 500`, where the same surge overflows the
 api's queue and the p99 SLO fails.
 
-What runs today: clients, services, load balancers, rate limiters and caches with a fixed
-hit ratio. Every other node type (databases, queues, CDNs, ...) already validates and
-appears in `explain` with its resolved numbers, but `estimate` and `run` stop with
-"which run/estimate do not support yet (phase 2)" and exit 1; so does a cache with
-`hit_ratio: che`, `strategy: write_back` or `then` steps (phase 2b). A `sweep` command
+What runs today: clients, services, load balancers, rate limiters, caches (a fixed or a
+Che hit ratio), SQL databases (primary, read replicas, shards), request-sized CDNs and id
+generators. These scenarios run end to end:
+
+- [`tutorial/hello`](scenarios/tutorial/hello/), [`tutorial/chain`](scenarios/tutorial/chain/):
+  one service, then two in a chain: the queueing basics.
+- [`labs/rate-limiter`](scenarios/labs/rate-limiter/): ch. 4's five algorithms against spikes.
+- [`labs/consistent-hashing`](scenarios/labs/consistent-hashing/): ch. 5's hash ring over four
+  Che caches in front of a SQL database.
+- [`labs/unique-id`](scenarios/labs/unique-id/): ch. 7's ticket server vs snowflake; fails its
+  drop-rate SLO on purpose (exit 2).
+- [`book/url-shortener`](scenarios/book/url-shortener/): ch. 8 over 24 hours at 12.8k/s
+  (peak 19.2k/s): limiter, 8 stateless web servers, a Che cache (h = 0.881), snowflake ids
+  and a SQL database in 3 shards; both SLOs pass (redirect p99 7.49 ms, nothing dropped).
+
+Every other node type (queues, workers, blob stores, ...) already validates and appears in
+`explain` with its resolved numbers, but `estimate` and `run` stop with "which run/estimate do
+not support yet (phase 2)" and exit 1. A `sweep` command
 (`--param nodes.users.rate.base=1k/s..100k/s:10`) is planned for phase 2c.
 
 ## Toolchain
