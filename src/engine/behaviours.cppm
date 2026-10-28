@@ -5,7 +5,9 @@
 // Latency composes on the reply path. A hop to a downstream node costs two link legs
 // (request out, reply back) plus that node's own response; sequential hops add, parallel
 // hops cost the slowest branch, and a client op split over several links is a
-// share-weighted mixture of its routes.
+// share-weighted mixture of its routes. A hop over a feedback link (one that closes a
+// cycle, graph::Graph::mark_feedback) is asynchronous: its flow goes round, a step later,
+// but the sender does not wait for it, so it adds nothing to the response.
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -13,10 +15,14 @@ module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this interface imports other modules
 // (GCC 14.2 'Bad file data' bug, CLAUDE.md §3). Link legs go through simsys::seconds().
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <concepts>
 #include <cstddef>
+#include <limits>
 #include <map>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -53,16 +59,21 @@ struct Routed {
 // constrained parameter that does not fit fails at the call with the concept's name.
 // Here: anything that answers "how long does node `n` take to respond to op `o`?" —
 // the engine passes a lambda over its latest per-node estimates; tests pass stubs.
-// (std::invocable and std::same_as are C++20 standard concepts from <concepts>.)
+// (std::invocable and std::convertible_to are C++20 standard concepts from <concepts>;
+// convertible_to rather than same_as so a lookup returning `const LatencyEstimate&`
+// fits too.) Like every concept here it checks signatures, not behaviour: a lookup
+// that returns nonsense still satisfies it.
 template <class F>
-concept ResponseLookup =
-    std::invocable<F, std::size_t, std::string_view> &&
-    std::same_as<std::invoke_result_t<F, std::size_t, std::string_view>, flow::LatencyEstimate>;
+concept ResponseLookup = std::invocable<F, std::size_t, std::string_view> &&
+                         std::convertible_to<std::invoke_result_t<F, std::size_t, std::string_view>,
+                                             flow::LatencyEstimate>;
 
 // C++20 requires-expression: lists the operations a type must support, checked at
 // compile time (spec §5). This is the engine's whole requirement on a node behaviour,
 // written in code instead of in a comment on an abstract base class. The lambda is a
 // stand-in ResponseLookup (C++20 allows lambdas in unevaluated operands such as this).
+// It checks that the calls compile and return the right types; what they compute is
+// the tests' job.
 template <class B>
 concept NodeBehaviour = requires(const B b, const flow::Flow& in, flow::LatencyEstimate own) {
   { b.route(in) } -> std::same_as<Routed>;
@@ -73,10 +84,16 @@ concept NodeBehaviour = requires(const B b, const flow::Flow& in, flow::LatencyE
 };
 
 // A source of requests: it offers load at simulated time `now` instead of routing an
-// incoming flow.
+// incoming flow, lists the ops it sends (one latency report each), and composes the
+// response time it sees for each of them. Signatures only, as for NodeBehaviour.
 template <class S>
 concept RequestSource = requires(const S s, SimTime now) {
   { s.offer(now) } -> std::same_as<Routed>;
+  {
+    s.response(std::string_view{},
+               [](std::size_t, std::string_view) { return flow::LatencyEstimate{}; })
+  } -> std::same_as<flow::LatencyEstimate>;
+  { s.ops() } -> std::convertible_to<std::span<const std::string>>;
 };
 
 // Models: a `service` box of System Design Interview (Alex Xu, vol. 1) — the stateless
@@ -88,17 +105,24 @@ concept RequestSource = requires(const S s, SimTime now) {
 // Ignored: per-op CPU cost (every op costs the node's one service time; phase 2 adds a
 // cost table), retries and timeouts, and conditional steps (`on: miss` / `on: failure`):
 // a service has no cache to miss and phase 1 models no failures, so those steps never
-// fire here.
+// fire here. A service has no `then` steps either (the loader rejects them for this
+// type): everything it sends is per op. Hops over feedback links are asynchronous
+// hand-offs (see `response`).
 class ServiceBehaviour {
  public:
   ServiceBehaviour(const graph::Graph& g, std::size_t self);
 
-  // Serves every incoming op and forwards rate × factor along each of the op's steps.
+  // Serves every incoming op and forwards rate × factor along each of the op's steps,
+  // feedback hops included (their flow arrives at the target a step later).
+  // Returns a fresh Routed every call; if profiling shows the per-step allocations
+  // matter, the engine can pass a scratch `Routed&` to be cleared and refilled instead.
   [[nodiscard]] Routed route(const flow::Flow& in) const;
 
   // Response time of `op`: own sojourn + Σ sequential hops + slowest parallel hop, where
-  // a hop is two link legs plus the downstream node's response. Defined here because it
-  // is a template (the constrained `auto` parameter makes it one).
+  // a hop is two link legs plus the downstream node's response. Feedback hops are
+  // skipped: closing a cycle, they are a fire-and-forget hand-off of work the caller
+  // does not wait for (graph::Graph::mark_feedback). Defined here because it is a
+  // template (the constrained `auto` parameter makes it one).
   //
   // C++20 abbreviated function template with a constrained placeholder:
   // `ResponseLookup auto&&` means "any type satisfying ResponseLookup", replacing
@@ -107,16 +131,19 @@ class ServiceBehaviour {
   [[nodiscard]] flow::LatencyEstimate response(std::string_view op, flow::LatencyEstimate own,
                                                ResponseLookup auto&& downstream) const {
     flow::LatencyEstimate total = own;
-    std::vector<flow::LatencyEstimate> parallel;
+    flow::LatencyEstimate slowest_parallel{};  // running max: no buffer of branches
     for (const Hop& hop : hops_of(op)) {
+      if (hop.feedback) continue;  // asynchronous: adds no latency to the caller
       const auto leg = round_trip(hop.link_leg_s) + downstream(hop.target, hop.op);
       if (hop.mode == model::StepMode::sequential) {
         total += leg;
       } else {
-        parallel.push_back(leg);
+        // flow::parallel_max over (max so far, this branch) is the max over all branches,
+        // and keeps the approximation's definition in one place.
+        slowest_parallel = flow::parallel_max(std::array{slowest_parallel, leg});
       }
     }
-    return total + flow::parallel_max(parallel);
+    return total + slowest_parallel;
   }
 
  private:
@@ -128,13 +155,20 @@ class ServiceBehaviour {
     double factor;       // downstream requests per incoming request
     model::StepMode mode;
     double link_leg_s;  // one-way link latency in seconds
+    bool feedback;      // over a cycle-closing link: asynchronous, see `response`
   };
 
   // Fixed propagation delay out and back: it has a mean but no variance.
+  // C++20 designated initializers: `{.mean_s = ..., .variance_s2 = ...}` names each member
+  // it sets, replacing positional `{2.0 * leg, 0.0}` where a reader must remember which
+  // number is the mean; names must follow declaration order.
   [[nodiscard]] static flow::LatencyEstimate round_trip(double link_leg_s) {
     return {.mean_s = 2.0 * link_leg_s, .variance_s2 = 0.0};
   }
 
+  // C++20 std::span<const Hop>: a non-owning view (pointer + size) of the hops stored in
+  // the map, replacing `const std::vector<Hop>&` (which could not express "no hops"
+  // without a static empty vector) or a pointer/length pair.
   [[nodiscard]] std::span<const Hop> hops_of(std::string_view op) const;
   void add_hops(const graph::Graph& g, const std::string& op,
                 const std::vector<model::Step>& steps);
@@ -157,33 +191,59 @@ class ClientBehaviour {
   ClientBehaviour(const graph::Graph& g, std::size_t self);
 
   // Load offered at `now`: base × op share × route share on each route. A client is a
-  // source, so `served` stays empty.
+  // source, so `served` stays empty. Like ServiceBehaviour::route, a fresh Routed per
+  // call; the engine may later pass a scratch `Routed&` instead.
   [[nodiscard]] Routed offer(SimTime now) const;
 
   // Response time the client sees for `op`: over the routes that carry it, a
   // share-weighted mixture of (two link legs + the entry node's response).
   //
-  // Mixture of distributions (a request takes route i with probability s_i):
+  // Mixture of distributions (a request takes route i with probability s_i, and route i
+  // has latency mean m_i and variance v_i):
   //   mean      = Σ s_i m_i
-  //   variance  = Σ s_i (v_i + m_i²) − mean²      (law of total variance:
-  //               Var X = E[Var(X | route)] + Var(E[X | route]), rearranged as E[X²] − E[X]²)
+  //   variance  = Σ s_i v_i  +  Σ s_i (m_i − mean)²
+  //               (law of total variance: Var X = E[Var(X | route)] + Var(E[X | route]),
+  //               "the spread within routes plus the spread between them")
   // Assumes the route choice is independent of the latency on that route (fixed
-  // fractions, as weighted DNS would give). Zero-share routes are skipped: their
-  // latency may be inf (a zero-capacity node) and inf × 0 is NaN.
+  // fractions, as weighted DNS would give). Written as a sum of non-negative terms, the
+  // variance cannot come out negative, unlike the textbook E[X²] − mean², which loses
+  // precision when the two terms nearly cancel and so needs a clamp at zero.
+  // An op the client does not send is a programmer error (std::invalid_argument): the
+  // graph guarantees a route for every op of the workload.
   [[nodiscard]] flow::LatencyEstimate response(std::string_view op,
                                                ResponseLookup auto&& downstream) const {
-    double mean = 0.0;
-    double second_moment = 0.0;  // E[X²]
-    for (const RouteLeg& leg : legs_) {
-      if (leg.op != op || leg.route_share <= 0.0) continue;
-      const auto latency =
-          flow::LatencyEstimate{.mean_s = 2.0 * leg.link_leg_s, .variance_s2 = 0.0} +
-          downstream(leg.target, leg.op);
-      mean += leg.route_share * latency.mean_s;
-      second_moment += leg.route_share * (latency.variance_s2 + latency.mean_s * latency.mean_s);
+    if (!std::ranges::binary_search(ops_, op)) {
+      throw std::invalid_argument{"ClientBehaviour::response: the client does not send op '" +
+                                  std::string{op} + "'"};
     }
-    // E[X²] − E[X]² can dip a few ulps below zero when every route has the same latency.
-    return {.mean_s = mean, .variance_s2 = std::max(0.0, second_moment - mean * mean)};
+    const auto latency_of = [&](const RouteLeg& leg) -> flow::LatencyEstimate {
+      return flow::LatencyEstimate{.mean_s = 2.0 * leg.link_leg_s, .variance_s2 = 0.0} +
+             downstream(leg.target, leg.op);
+    };
+    // Zero-share routes are skipped before their latency is looked up: it may be inf (a
+    // zero-capacity node) and inf × 0 is NaN.
+    const auto carries = [&](const RouteLeg& leg) { return leg.op == op && leg.route_share > 0.0; };
+    double mean = 0.0;
+    double within = 0.0;  // Σ s_i v_i
+    for (const RouteLeg& leg : legs_) {
+      if (!carries(leg)) continue;
+      const auto latency = latency_of(leg);
+      mean += leg.route_share * latency.mean_s;
+      within += leg.route_share * latency.variance_s2;
+    }
+    // A route that never answers (inf mean) makes the mixture's spread infinite too, but
+    // the between term would compute inf − inf = NaN, so state the limit directly. A NaN
+    // anywhere in the inputs still comes out as NaN.
+    if (std::isinf(mean)) {
+      return {.mean_s = mean, .variance_s2 = within + std::numeric_limits<double>::infinity()};
+    }
+    double between = 0.0;  // Σ s_i (m_i − mean)²; second pass, the lookup is a cheap read
+    for (const RouteLeg& leg : legs_) {
+      if (!carries(leg)) continue;
+      const double deviation = latency_of(leg).mean_s - mean;
+      between += leg.route_share * deviation * deviation;
+    }
+    return {.mean_s = mean, .variance_s2 = within + between};
   }
 
   // The ops this client sends, sorted by name, so reports list them deterministically.
@@ -209,8 +269,9 @@ class ClientBehaviour {
 // std::visit; a std::variant instead of an abstract base keeps every behaviour a plain
 // value (no heap allocation, no virtual calls, copyable). Phase 2 appends alternatives
 // (cache, queue, load balancer, ...).
-// C++17 std::variant (used here with C++20 concepts guarding each alternative): a
-// type-safe union that knows which alternative it holds.
+// C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
+// it holds) dispatched with std::visit. Closed: adding an alternative means editing this
+// line, and every std::visit that does not handle it then fails to compile.
 using Behaviour = std::variant<ClientBehaviour, ServiceBehaviour>;
 
 }  // namespace simsys::behaviours
@@ -234,6 +295,9 @@ namespace detail {
 }
 
 // Sorted by (target, link) so the engine adds flows in the same order on every run.
+// C++20 ranges algorithm with a projection: the third argument maps each Outgoing to the
+// (target, link) key it is compared by; `{}` is the default comparison (std::ranges::less).
+// Replaces a hand-written comparator lambda that repeats the key on both sides.
 void sort_by_destination(std::vector<Outgoing>& outgoing) {
   std::ranges::sort(outgoing, {}, [](const Outgoing& o) { return std::pair{o.target, o.link}; });
 }
@@ -242,6 +306,7 @@ void sort_by_destination(std::vector<Outgoing>& outgoing) {
 
 // ---- ServiceBehaviour ----
 
+// Only `ops` steps: a service has no `then` (loader-enforced, see the class comment).
 ServiceBehaviour::ServiceBehaviour(const graph::Graph& g, std::size_t self) : self_{self} {
   for (const auto& [op, steps] : g.nodes()[self].spec.ops) add_hops(g, op, steps);
 }
@@ -260,7 +325,8 @@ void ServiceBehaviour::add_hops(const graph::Graph& g, const std::string& op,
                        .link = link,
                        .factor = step.factor,
                        .mode = step.mode,
-                       .link_leg_s = seconds(g.links()[link].one_way)});
+                       .link_leg_s = seconds(g.links()[link].one_way),
+                       .feedback = g.links()[link].feedback});
   }
 }
 

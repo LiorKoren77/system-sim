@@ -1,7 +1,9 @@
 // Module `simsys.graph`: the scenario resolved into something the engine can step —
 // node capacities with provenance, link latencies and delay-line lengths, demand edges,
 // a topological order, client routes, and feedback edges for cycles (spec §3.1: cycles
-// use the previous step's value, which a one-step delay line gives us for free).
+// use the previous step's value, which a one-step delay line gives us for free). A
+// feedback edge is an asynchronous hand-off: its flow arrives a step later and the
+// sender does not wait for it, so it adds no latency to anybody's response.
 //
 // Models: the arrows of a System Design Interview (Alex Xu, vol. 1) diagram. Each box of
 // the book's designs (ch. 1 scaling, ch. 11 news feed, ch. 12 chat, ...) becomes a
@@ -19,9 +21,12 @@ module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this interface imports other modules
 // (GCC 14.2 'Bad file data' bug, CLAUDE.md §3). SimTime is compared through count().
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <expected>
+#include <initializer_list>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -39,8 +44,16 @@ import simsys.model;
 
 export namespace simsys::graph {
 
+// The longest delay line a link may need, in steps. A delay line holds one Flow per step
+// in flight, so this bounds its memory (a million steps of a few ops is tens of MB per
+// link) and keeps the step count well inside an int. A scenario that hits it almost
+// always pairs a tiny step with a long hop (1 us steps over a 1 h link); a coarser step
+// is the fix.
+inline constexpr int max_delay_steps = 1'000'000;
+
 // Why a scenario that loaded cleanly still cannot be simulated (a step with no link to
-// travel on, a client op that no link carries).
+// travel on, a client op that no link carries, demand sent into a client, a link longer
+// than max_delay_steps).
 struct EngineError {
   std::string message;
 };
@@ -60,8 +73,8 @@ struct ResolvedLink {
   model::Direction dir{model::Direction::out};
   SimTime one_way{};
   defaults::Source latency_source{defaults::Source::dc_default};
-  int delay_steps{};  // round(one_way / step), halves away from zero; >= 1 if feedback
-  bool feedback{false};
+  int delay_steps{};     // round(one_way / step), halves away from zero; >= 1 if feedback
+  bool feedback{false};  // closes a cycle: an asynchronous hand-off (see Graph::mark_feedback)
   std::vector<std::string> ops{};  // empty = all ops
   double weight{1.0};
 };
@@ -175,24 +188,60 @@ namespace {
   return text;
 }
 
-// How many whole steps a hop of `one_way` delays the flow (spec §3.4, refined): the
-// nearest whole number of steps, halves rounded away from zero. A hop shorter than half
-// a step only adds latency (the reply path accounts for it) and its flow passes through
-// in the same step; a 75 ms cross-datacenter hop (half the book's 150 ms round trip) at
-// 100 ms steps arrives one step late; 250 ms arrives three steps late. Rounding to the
-// nearest step keeps the average arrival time honest: ceil alone would delay every
-// 101 ms hop by two steps. count(): chrono's non-member operators are not visible here.
-[[nodiscard]] int delay_steps_for(SimTime one_way, SimTime step) {
-  const auto ratio = static_cast<double>(one_way.count()) / static_cast<double>(step.count());
-  return static_cast<int>(std::llround(ratio));
+// How many steps a hop of `one_way` lasts, before rounding. Kept in double so that a
+// ratio too large for an int can be detected (max_delay_steps) before it is converted.
+// count(): chrono's non-member operators are not visible here.
+[[nodiscard]] double steps_in(SimTime one_way, SimTime step) {
+  return static_cast<double>(one_way.count()) / static_cast<double>(step.count());
+}
+
+// How many whole steps the hop delays the flow (spec §3.4, refined): the nearest whole
+// number of steps, halves rounded away from zero. A hop shorter than half a step only
+// adds latency (the reply path accounts for it) and its flow passes through in the same
+// step; a 75 ms cross-datacenter hop (half the book's 150 ms round trip) at 100 ms steps
+// arrives one step late; 250 ms arrives three steps late. Rounding to the nearest step
+// keeps the average arrival time honest: ceil alone would delay every 101 ms hop by two
+// steps. Precondition: steps <= max_delay_steps, so the result fits an int.
+[[nodiscard]] int whole_delay_steps(double steps) {
+  return static_cast<int>(std::llround(steps));
+}
+
+// A non-negative double as a whole number ("3600000000"), for error messages. No
+// <format> in this interface (CLAUDE.md §3), and std::to_string(double) prints six
+// decimals; C++17 std::to_chars with fixed precision 0 prints exactly the digits, for any
+// magnitude, without allocating or consulting the locale.
+[[nodiscard]] std::string whole_number(double value) {
+  std::array<char, 320> digits{};  // the longest finite double printed in fixed notation fits
+  const auto end = std::to_chars(digits.data(), digits.data() + digits.size(), value,
+                                 std::chars_format::fixed, 0)
+                       .ptr;
+  return {digits.data(), end};
+}
+
+// Depth-first search roots for Graph::order_nodes: the clients first, then every other
+// node, each group in index order. Starting from the request sources makes the back edge
+// found in a loop the one that closes it as seen from the users (chat -> queue -> sync
+// workers -> back to chat: sync -> chat is the feedback hop), whatever order the
+// scenario file lists the nodes in. The other nodes are roots too, so nodes no client
+// reaches are still ordered.
+[[nodiscard]] std::vector<std::size_t> dfs_roots(std::span<const ResolvedNode> nodes) {
+  std::vector<std::size_t> roots;
+  roots.reserve(nodes.size());
+  for (const bool want_clients : {true, false}) {
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+      if ((nodes[i].spec.type == model::NodeType::client) == want_clients) roots.push_back(i);
+    }
+  }
+  return roots;
 }
 
 }  // namespace
 
-// Pattern: Factory method with staged construction — the static `build` runs a sequence
-// of named construction steps, each of which may fail with an EngineError, and hands out
-// a Graph only when all succeeded. The private constructor makes a half-built Graph
-// unreachable. (Not a classic Builder: callers do not configure the steps.)
+// Pattern: Static factory (named constructor) with fallible staged construction — the
+// static `build` runs a sequence of named construction steps, each of which may fail
+// with an EngineError, and hands out a Graph only when all succeeded. The private
+// constructor makes a half-built Graph unreachable. (Not a classic Builder: callers do
+// not configure the steps.)
 std::expected<Graph, EngineError> Graph::build(model::Scenario scenario) {
   Graph graph{std::move(scenario)};
   graph.resolve_nodes();
@@ -229,6 +278,9 @@ void Graph::resolve_nodes() {
   nodes_.reserve(scenario_.nodes.size());
   for (const auto& spec : scenario_.nodes) {
     if (spec.type == model::NodeType::client) {
+      // C++20 designated initializers: `.spec = spec` names the member it sets and leaves
+      // the others at their defaults, replacing positional `ResolvedNode{spec, {}, ...}`
+      // where a reader must count commas against the struct definition.
       nodes_.push_back(ResolvedNode{.spec = spec});
       continue;
     }
@@ -255,13 +307,19 @@ Graph::Result Graph::resolve_links() {
     }
     const bool cross_dc = nodes_[*from].spec.dc != nodes_[*to].spec.dc;
     const auto latency = defaults::resolve_link_latency(spec, cross_dc);
+    const double steps = steps_in(latency.value, scenario_.step);
+    if (steps > max_delay_steps) {
+      return std::unexpected{EngineError{
+          "link " + spec.from + " -> " + spec.to + ": latency is " + whole_number(steps) +
+          " steps at this step size; at most " + std::to_string(max_delay_steps) + " steps"}};
+    }
     links_.push_back(ResolvedLink{
         .from = *from,
         .to = *to,
         .dir = spec.dir,
         .one_way = latency.value,
         .latency_source = latency.source,
-        .delay_steps = delay_steps_for(latency.value, scenario_.step),
+        .delay_steps = whole_delay_steps(steps),
         .ops = spec.ops,
         .weight = spec.weight,
     });
@@ -269,7 +327,9 @@ Graph::Result Graph::resolve_links() {
   return {};
 }
 
-// Every step of every node becomes a demand edge, over the link that carries it.
+// Every step of every node becomes a demand edge, over the link that carries it. Steps
+// come from `ops` (per incoming op: services, gateways) and `then` (after processing:
+// workers, caches...); the loader never gives a service `then` steps.
 Graph::Result Graph::connect_steps() {
   for (std::size_t from = 0; from < nodes_.size(); ++from) {
     const auto& spec = nodes_[from].spec;
@@ -292,6 +352,12 @@ Graph::Result Graph::connect_step(std::size_t from, const model::Step& step) {
   if (!to) {
     return std::unexpected{EngineError{"node '" + sender + "' sends '" + step.op + "' to '" +
                                        step.to + "' which does not exist"}};
+  }
+  // A client is a source: it has no queue and no ops to absorb demand, so flow sent to it
+  // would vanish without being served or dropped.
+  if (nodes_[*to].spec.type == model::NodeType::client) {
+    return std::unexpected{EngineError{"node '" + sender + "' sends '" + step.op + "' to client '" +
+                                       step.to + "'; clients only send"}};
   }
   const auto link = demand_link(from, *to);
   if (!link) {
@@ -320,28 +386,38 @@ Graph::Result Graph::route_clients() {
 }
 
 // A client op goes out on every link from the client that carries it, split by the
-// links' weights: share_i = weight_i / sum of weights (all zero: equal shares). This is
-// how a scenario says "90% of video bytes from the CDN, 10% from origin" or "3:1 between
-// two load balancers" — a fixed split, as weighted DNS or round-robin would give.
+// links' weights: share_i = weight_i / sum of weights. This is how a scenario says "90%
+// of video bytes from the CDN, 10% from origin" or "3:1 between two load balancers" — a
+// fixed split, as weighted DNS or round-robin would give. Weight 0 means a drained
+// backend (as in the loader): it gets no share, and an op whose every link is drained
+// has nowhere to go, which is an error rather than a silent equal split.
 Graph::Result Graph::route_client_op(std::size_t client, const std::string& op) {
   struct Candidate {
     std::size_t link, target;
   };
+  const auto& id = nodes_[client].spec.id;
   std::vector<Candidate> eligible;
   double total_weight = 0;
   for (std::size_t i = 0; i < links_.size(); ++i) {
     const auto target = demand_target(links_[i], client);
     if (!target || !carries_op(links_[i], op)) continue;
+    if (nodes_[*target].spec.type == model::NodeType::client) {  // see connect_step
+      return std::unexpected{EngineError{"client '" + id + "': link to client '" +
+                                         nodes_[*target].spec.id + "' cannot carry op '" + op +
+                                         "'; clients only send"}};
+    }
     eligible.push_back({i, *target});
     total_weight += links_[i].weight;
   }
   if (eligible.empty()) {
+    return std::unexpected{EngineError{"client '" + id + "': no link carries op '" + op + "'"}};
+  }
+  if (total_weight <= 0) {
     return std::unexpected{
-        EngineError{"client '" + nodes_[client].spec.id + "': no link carries op '" + op + "'"}};
+        EngineError{"client '" + id + "': every link carrying op '" + op + "' has weight 0"}};
   }
   for (const auto& [link, target] : eligible) {
-    const double share = total_weight > 0 ? links_[link].weight / total_weight
-                                          : 1.0 / static_cast<double>(eligible.size());
+    const double share = links_[link].weight / total_weight;
     routes_[client].push_back(
         ClientRoute{.op = op, .target = target, .link = link, .share = share});
     add_edge(DemandEdge{.from = client, .to = target, .link = link});
@@ -356,6 +432,11 @@ void Graph::add_edge(const DemandEdge& edge) {
 
 // A cycle-closing link always delays by at least one step, so the engine reads the
 // previous step's flow on it: spec §3.1 "cycles use the previous step's value".
+// It is also asynchronous on the reply path: the sender hands the work off and does not
+// wait for it (behaviours::ServiceBehaviour::response skips feedback hops). Without that,
+// chat's `sync_workers -> chat_servers` or the crawler's `url_seen -> frontier` would
+// make a response include itself. This is what makes those loops well defined in phase 1;
+// phase 2's message queues make the same choice explicit.
 void Graph::mark_feedback(std::size_t link) {
   links_[link].feedback = true;
   links_[link].delay_steps = std::max(links_[link].delay_steps, 1);
@@ -365,9 +446,13 @@ void Graph::mark_feedback(std::size_t link) {
 // white (unvisited), grey (on the DFS path) or black (finished). An edge to a grey node is
 // a back edge, and a back edge is exactly an edge that closes a cycle; marking those as
 // feedback leaves a DAG, whose reverse post-order is a topological order (every node after
-// the nodes that send to it). Starting from every node in index order makes the result
-// deterministic and covers isolated nodes. In the chat loop of the tests the walk goes
-// u -> chat -> q -> sync and the back edge is sync -> chat.
+// the nodes that send to it). An edge into a black node (a cross or forward edge into a
+// finished subtree) closes no cycle and stays an ordinary edge. Roots come from
+// dfs_roots: clients first, so in the chat loop of the tests the walk goes
+// u -> chat -> q -> sync and the back edge is sync -> chat, whatever the file order.
+// The feedback set is inclusion-minimal, not minimum: every back edge closes a cycle made
+// of the DFS tree's edges, so none can be dropped, but a different walk might cut the
+// same cycles with fewer edges (finding the minimum feedback arc set is NP-hard).
 // Iterative (an explicit stack) rather than recursive, so a long chain cannot overflow
 // the call stack.
 void Graph::order_nodes() {
@@ -383,7 +468,7 @@ void Graph::order_nodes() {
     std::size_t node;
     std::size_t next_edge;
   };
-  for (std::size_t root = 0; root < nodes_.size(); ++root) {
+  for (const std::size_t root : dfs_roots(nodes_)) {
     if (colour[root] != Colour::white) continue;
     std::vector<Frame> stack{{root, 0}};
     colour[root] = Colour::grey;
