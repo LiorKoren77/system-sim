@@ -57,8 +57,14 @@ inline constexpr LatencyNumbers latency_numbers{
 
 // Chosen, not from the book or spec: a blob store counts objects of 1 MB, so the spec's
 // "blob 500 MB/s" means 500 objects/s, and one object costs one per-MB disk read plus
-// one per-MB network transfer. A scenario's byte_capacity is converted with it too.
+// one per-MB network transfer. A scenario's byte_capacity is converted with it too. The size is
+// an assumption no scenario states (youtube streams 50 MB, news-feed's media is 200 KB), so a
+// capacity converted with it is not checked by explain (byte_rate_behind) and a CDN sized in
+// bytes does not run: both wait for phase 2c's byte flows, which take each op's own size.
 inline constexpr double blob_object_bytes = 1e6;
+
+// Spec §6's QPS line: "blob 500 MB/s", one blob store machine's throughput.
+inline constexpr ByteRate blob_store_byte_rate{500e6};
 
 // What a node of a given type does when the scenario is silent: how many requests per
 // second one replica drains, how long one request occupies it, and how irregular that
@@ -119,7 +125,7 @@ struct TypeDefaults {
       // rate spec "blob 500 MB/s" / 1 MB objects = 500/s; time spec §6 "blob store
       // per-MB cost" (disk) + "per-MB transfer" (network) = 30 + 10 = 40 ms. Summed via
       // count(): see resolve_link_latency for why chrono's operator+ is not visible here.
-      return {Rate{500e6 / blob_object_bytes},
+      return {Rate{blob_store_byte_rate.bytes_per_second / blob_object_bytes},
               SimTime{t.disk_read_1mb.count() + t.network_read_1mb.count()}};
     case search_index:
       return {Rate{5'000}, 5_ms};  // chosen: an inverted-index query
@@ -194,6 +200,20 @@ struct Resolved {
     return {Rate{n.byte_capacity->bytes_per_second / blob_object_bytes}, Source::scenario};
   }
   return {for_type(n.type).service_rate, Source::type_default};
+}
+
+// The byte rate a node's request capacity was converted from at blob_object_bytes, if it was
+// converted: the scenario's `capacity: 100GB/s` (Source::scenario), or a blob store's type
+// default, spec §6's 500 MB/s (Source::type_default). Empty for a capacity in requests, stated
+// or defaulted. Explain tags such a capacity and gives its check no zone: the object size is
+// assumed, so the verdict would be too.
+[[nodiscard]] std::optional<Resolved<ByteRate>> byte_rate_behind(const model::NodeSpec& n) {
+  if (n.capacity) return std::nullopt;
+  if (n.byte_capacity) return Resolved<ByteRate>{*n.byte_capacity, Source::scenario};
+  if (n.type == model::NodeType::blob_store) {
+    return Resolved<ByteRate>{blob_store_byte_rate, Source::type_default};
+  }
+  return std::nullopt;
 }
 
 [[nodiscard]] Resolved<SimTime> resolve_service_time(const model::NodeSpec& n) {

@@ -699,32 +699,46 @@ template <class T, class F>
   return join(parts, "  ");
 }
 
-// Where a database's default write cost comes from (defaults::sql_write_cost): "default: spec
-// §6 5k reads/1k writes", the two rates of one SQL machine whose ratio is the cost.
+// Where a database's default write cost comes from (defaults::sql_write_cost): "spec §6 5k
+// reads/1k writes", the two rates of one SQL machine whose ratio is the cost.
 [[nodiscard]] std::string sql_write_cost_source() {
   const double read_rate = defaults::for_type(model::NodeType::sql_db).service_rate.per_second;
-  return "default: spec §6 " + with_si_prefix(read_rate) + " reads/" +
+  return "spec §6 " + with_si_prefix(read_rate) + " reads/" +
          with_si_prefix(defaults::sql_write_rate.per_second) + " writes";
 }
 
-// "cost: read 1, write 3" (ops sorted by name), or nothing when every op costs the default one
-// unit. A database's write op that reaches it with no stated cost costs 5 units, not 1
-// (defaults::op_cost): a fivefold load the scenario does not show, so it is printed too, with
-// its source, "write 5 (default: spec §6 5k reads/1k writes)".
-[[nodiscard]] std::string cost_summary(const graph::Graph& g, std::size_t node) {
+// A database's write ops that reach it with no stated cost: they cost 5 units each, not 1
+// (defaults::op_cost), "insert 5", "update 5", sorted by op (arriving_ops is sorted).
+[[nodiscard]] std::vector<std::string> defaulted_write_costs(const graph::Graph& g,
+                                                             std::size_t node) {
   const auto& spec = g.nodes()[node].spec;
-  std::map<std::string, std::string, std::less<>> entries;  // op -> its cost as printed
-  for (const auto& [op, units] : spec.cost) entries[op] = num(units, 6);
-  if (spec.type == model::NodeType::sql_db) {
-    for (const auto& op : g.arriving_ops(node)) {
-      if (!graph::is_write(spec, op) || spec.cost.contains(op)) continue;
-      entries[op] = num(defaults::op_cost(spec, op), 6) + " (" + sql_write_cost_source() + ")";
-    }
-  }
-  if (entries.empty()) return {};
   std::vector<std::string> parts;
-  for (const auto& [op, cost] : entries) parts.push_back(op + " " + cost);
-  return "  cost: " + join(parts, ", ");
+  if (spec.type != model::NodeType::sql_db) return parts;
+  for (const auto& op : g.arriving_ops(node)) {
+    if (!graph::is_write(spec, op) || spec.cost.contains(op)) continue;
+    parts.push_back(op + " " + num(defaults::op_cost(spec, op), 6));
+  }
+  return parts;
+}
+
+// "cost: read 1, write 3" (the stated costs, ops sorted by name), or nothing when every op costs
+// the default one unit. A database's write op that reaches it with no stated cost costs 5 units,
+// not 1: a fivefold load the scenario does not show, so it is printed too, after the stated ones
+// and with its source once, "cost: read 2; insert 5, update 5 (defaults: spec §6 5k reads/1k
+// writes)" (the semicolon ends the stated group, so the source covers only the defaulted one).
+[[nodiscard]] std::string cost_summary(const graph::Graph& g, std::size_t node) {
+  std::vector<std::string> stated;
+  for (const auto& [op, units] : g.nodes()[node].spec.cost)
+    stated.push_back(op + " " + num(units, 6));
+  const auto defaulted = defaulted_write_costs(g, node);
+  std::vector<std::string> groups;
+  if (!stated.empty()) groups.push_back(join(stated, ", "));
+  if (!defaulted.empty()) {
+    const std::string label = defaulted.size() > 1 ? "defaults: " : "default: ";
+    groups.push_back(join(defaulted, ", ") + " (" + label + sql_write_cost_source() + ")");
+  }
+  if (groups.empty()) return {};
+  return "  cost: " + join(groups, "; ");
 }
 
 // The vnodes of the consistent-hash balancer in front of `target` (the one whose ring
@@ -894,19 +908,35 @@ template <class T>
   return text;
 }
 
+// "serves: read, upload": the ops a CDN answers from its cache, every op that reaches it that is
+// not one of its write ops (model::write_ops_of; a write op that reaches a CDN is refused at
+// build). A scenario that sends an `upload` through a CDN without declaring it a write sees it
+// here, cached like a read. "serves: none" when nothing reaches the CDN.
+[[nodiscard]] std::string cdn_served_ops(const graph::Graph& g, std::size_t cdn) {
+  const auto& spec = g.nodes()[cdn].spec;
+  std::vector<std::string> served;
+  for (const auto& op : g.arriving_ops(cdn)) {
+    if (!graph::is_write(spec, op)) served.push_back(op);
+  }
+  return "  serves: " + (served.empty() ? std::string{"none"} : join(served, ", "));
+}
+
 // A CDN's model (plan 2b refinement 4), shown as a cache's is: `hit_ratio=0.95 (fixed) misses →
-// media_store keys=100k ttl=1h`. "misses → media_store": the CDN fetches what it misses from its
-// origin, so the reader sees where the 1 − h of the reads go (the check lines below count them
-// there). The keys the scenario left out are omitted.
+// media_store keys=100k ttl=1h  serves: read_media`. "misses → media_store": the CDN fetches what
+// it misses from its origin, so the reader sees where the 1 − h of the reads go (the check lines
+// below count them there). A CDN without a hit ratio says what that means, `hit_ratio=none (every
+// read misses: h = 0)`: the scenario's own statement, which runs as such. The keys the scenario
+// left out are omitted.
 [[nodiscard]] std::string cdn_summary(const graph::Graph& g, std::size_t cdn) {
   const auto& node = g.nodes()[cdn];
   const auto& spec = node.spec;
   if (spec.type != model::NodeType::cdn) return {};
   std::string text = "  " + hit_ratio_text(g, node);
+  if (!spec.hit_ratio) text += " (every read misses: h = 0)";
   if (spec.origin) text += " misses → " + *spec.origin;
   if (spec.keys) text += " keys=" + fmt_count(static_cast<double>(*spec.keys));
   if (spec.ttl) text += " ttl=" + fmt_duration(*spec.ttl);
-  return text;
+  return text + cdn_served_ops(g, cdn);
 }
 
 // "primary+1 replica", "primary+2 replicas", or "primary only" (replicas: 1).
@@ -967,6 +997,23 @@ struct QueueProvenance {
           provenance(node.service_time_source), "(pool)", provenance(queue_source)};
 }
 
+// "100GB/s at 1MB/object; byte flows: phase 2c": where a capacity converted from bytes came
+// from (defaults::byte_rate_behind), the byte rate in the scenario's grammar and the object size
+// assumed to turn it into requests.
+[[nodiscard]] std::string byte_conversion(const defaults::Resolved<ByteRate>& bytes) {
+  return with_si_prefix(bytes.value.bytes_per_second) + "B/s at " +
+         with_si_prefix(defaults::blob_object_bytes) + "B/object; byte flows: phase 2c";
+}
+
+// "(scenario)" or "(default)", or for a capacity converted from bytes "(scenario: 100GB/s at
+// 1MB/object; byte flows: phase 2c)": the number is not the scenario's, only the byte rate is.
+[[nodiscard]] std::string capacity_provenance(const graph::ResolvedNode& node) {
+  const auto bytes = defaults::byte_rate_behind(node.spec);
+  if (!bytes) return std::string{provenance(node.service_rate_source)};
+  const std::string source = bytes->source == defaults::Source::scenario ? "scenario" : "default";
+  return "(" + source + ": " + byte_conversion(*bytes) + ")";
+}
+
 [[nodiscard]] QueueProvenance queue_provenance(const graph::ResolvedNode& node) {
   if (is_leaky_bucket(node.spec)) return {"(limit)", "(limit)", "(leak slot)", "(burst)"};
   if (graph::pool_binds(node)) return pool_provenance(node);
@@ -980,8 +1027,8 @@ struct QueueProvenance {
   // a database's `pool` at or above that c binds nothing (graph::apply_database_keys).
   const std::string_view concurrency_source =
       spec.advanced.concurrency ? "(scenario)" : "(implied)";
-  return {std::string{provenance(node.service_rate_source)}, provenance(node.service_time_source),
-          concurrency_source, provenance(queue_source)};
+  return {capacity_provenance(node), provenance(node.service_time_source), concurrency_source,
+          provenance(queue_source)};
 }
 
 [[nodiscard]] std::string server_details(const graph::ResolvedNode& node) {
@@ -1230,8 +1277,8 @@ void forward_then_steps(const graph::Graph& g, std::size_t from, const OpLoad& a
   }
 }
 
-// What a cache or a CDN passes on: to its store (a CDN's origin), and along its `then` steps.
-// The hits stop here.
+// What a cache or a CDN passes on: to its store (a CDN's origin) and, for a cache, along its
+// `then` steps (a CDN has none). The hits stop here.
 void forward_cached(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
                     std::vector<OpLoad>& fed_back) {
   const OpLoad arriving = load[from];  // a copy, as in forward_steps
@@ -1257,7 +1304,7 @@ void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_
     forward_limited(g, table, from, load, fed_back);
     return;
   }
-  if (spec.type == model::NodeType::cache || spec.type == model::NodeType::cdn) {
+  if (graph::hits_or_misses(spec.type)) {
     forward_cached(g, from, load, fed_back);
     return;
   }
@@ -1364,22 +1411,25 @@ struct PaperLoad {
 
 // ---- loads that rest on an unknown hit ratio ----
 //
-// A cache or CDN with no number for h (a CDN without a hit ratio, or with `che` but no `keys`
-// size; a cache built in code without one: Graph::build resolves every other `che` to a number)
-// counts every read as a miss on paper (Graph::service_hops): the nodes behind its misses are
-// checked against their worst case, an upper bound. Their check lines say so, or a student would
-// read a red database as a flaw of the design.
+// A cache or CDN with no number for h that the engine refuses to run (a `che` CDN without a
+// `keys` size; a cache built in code without a hit ratio: Graph::build resolves every other
+// `che` to a number) counts every read as a miss on paper (Graph::miss_fraction): the nodes
+// behind its misses are checked against their worst case, an upper bound. Their check lines say
+// so, or a student would read a red database as a flaw of the design. A CDN the scenario gave no
+// hit ratio is not one of them: it misses every read, which is what the scenario says and what
+// runs, so the load behind it is the load (its own line says h = 0, cdn_summary).
 
 // Does `node` miss at a rate nobody knows yet?
 [[nodiscard]] bool unknown_misses(const graph::Graph& g, std::size_t node) {
-  const auto type = g.nodes()[node].spec.type;
-  const bool can_miss = type == model::NodeType::cache || type == model::NodeType::cdn;
-  return can_miss && !g.hit_ratio(node).has_value();
+  const auto& spec = g.nodes()[node].spec;
+  if (!graph::hits_or_misses(spec.type) || g.hit_ratio(node).has_value()) return false;
+  if (spec.type == model::NodeType::cdn) return spec.hit_ratio && spec.hit_ratio->che;
+  return true;
 }
 
 // The nodes that receive miss flow of such a cache directly: the targets of a service's
-// `on: miss` steps after it (ServiceHop::lookup), its read_through backend (a CDN's origin), and
-// the targets of its own `on: miss` then-steps.
+// `on: miss` steps after it (ServiceHop::lookup), its store hop (a read_through backend, a CDN's
+// origin), and the targets of a cache's own `on: miss` then-steps.
 [[nodiscard]] std::vector<std::size_t> unknown_miss_targets(const graph::Graph& g) {
   std::vector<std::size_t> targets;
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
@@ -1497,13 +1547,24 @@ struct PaperLoad {
 // Utilization at the paper load: peak offered / (capacity per replica × replicas, × shards
 // for a sharded database: every shard is a full set of copies), with the node's own zone
 // thresholds (a database's busiest copy's, headline_zone), and the hottest copy's behind a hash
-// ring. Both are in capacity units (requests when every cost is 1).
+// ring. Both are in capacity units (requests when every cost is 1); a database's are labelled
+// so, "peak offered 1.5k units/s", as its per-copy checks are (a write costs 5 of them).
+// A capacity converted from bytes (defaults::byte_rate_behind) gets the load but no percentage
+// and no zone: "(not checked: capacity from 100GB/s at 1MB/object; byte flows: phase 2c)". The
+// object size is an assumption no scenario states (youtube streams 50 MB), so a verdict on it
+// would be one on an invented number; the engine refuses to run a CDN sized so for that reason.
 [[nodiscard]] std::string check_details(const graph::ResolvedNode& node, double offered,
                                         const std::optional<graph::DatabaseCopyLoads>& loads) {
   const double copies = node.spec.replicas * node.spec.shards.value_or(1);
   const double total_capacity = node.capacity.service_rate.per_second * copies;
+  const std::string offered_text = node.spec.type == model::NodeType::sql_db
+                                       ? with_si_prefix(offered) + " units/s"
+                                       : fmt_rate(offered);
   const std::string head =
-      "peak offered " + fmt_rate(offered) + " vs " + fmt_rate(total_capacity) + " total capacity  ";
+      "peak offered " + offered_text + " vs " + fmt_rate(total_capacity) + " total capacity  ";
+  if (const auto bytes = defaults::byte_rate_behind(node.spec)) {
+    return head + "(not checked: capacity from " + byte_conversion(*bytes) + ")";
+  }
   if (total_capacity <= 0.0) return head + "(no capacity, red)" + hottest_copy_check(node, offered);
   const double rho = offered / total_capacity;
   return head + "(" + percent(rho) + ", " + headline_zone(node, rho, loads) + ")" +
@@ -1518,8 +1579,10 @@ struct PaperLoad {
     const auto& node = g.nodes()[i];
     if (node.spec.type == model::NodeType::client) continue;  // a source: see its offered=
     const std::string note =
-        upper_bound[i] ? " (hit ratio unknown: che counted as 0 — an upper bound)" : "";
-    const auto loads = database_loads(node, load.by_op[i]);
+        upper_bound[i] ? " (hit ratio unknown: counted as 0 — an upper bound)" : "";
+    // A capacity converted from bytes gets no verdict (check_details), per copy neither.
+    const auto loads =
+        defaults::byte_rate_behind(node.spec) ? std::nullopt : database_loads(node, load.by_op[i]);
     rows.push_back(
         {{node.spec.id},
          {check_details(node, load.totals[i], loads) + database_check(node, loads) + note}});

@@ -1000,18 +1000,26 @@ class SqlDbBehaviour {
 // It is a queue of its own (default 100k/s, 10 ms: serving a ~1 MB object over the network, see
 // simsys.defaults) that answers every read sent to it; the share h it hits (`hit_ratio`, fixed or
 // che) it answers alone, the misses 1 − h it fetches from the origin as the SAME op and answers
-// after the fetch (book ch. 1: "if the CDN server does not have the image in the cache, it
-// requests the file from the origin"). So it behaves exactly like a read_through cache whose
-// backend is the origin:
+// after the fetch (the book's ch. 1 CDN workflow, paraphrased: a CDN server that does not have
+// the image in its cache requests the file from the origin, stores it and returns it). So it
+// behaves exactly like a read_through cache whose backend is the origin:
 //   flow to the origin = rate × (1 − h) of each read           (graph::Graph::backend_fraction)
 //   response           = mixture {h: own, 1 − h: own + two link legs + the origin's response}
 //   delivered          = own × (h + (1 − h) × the origin's delivered fraction)
-// A CDN without a hit ratio misses every read (h = 0): the safe side on paper. It takes no
-// writes: graph::Graph::build refuses a write op (model::write_ops_of) that reaches one.
+// A `che` hit ratio is the Che approximation (simsys.caching) for the CDN's `keys` objects: it
+// assumes LRU eviction and independent requests drawn from the clients' key popularity (the
+// independent reference model), so a TTL-evicted edge and the bursts of a video going viral are
+// outside it. A CDN without a hit ratio misses every read (h = 0): the safe side on paper, and
+// what runs. A tiered CDN works as it should: a CDN whose origin is another CDN sends it its
+// misses, and a che hit ratio there is computed over the first tier's misses (graph's key walk).
+// "A read" is every op that is not one of the CDN's write ops (model::write_ops_of: `write`, or
+// the scenario's `write_ops`), and it takes no writes: graph::Graph::build refuses a write op
+// that reaches one, and explain lists the ops it serves.
 // Ignored: bytes (a CDN sized in `capacity: 100GB/s` waits for phase 2c's byte flows; the engine
-// refuses it), the TTL and the stale content it serves (`ttl` is accepted and not modelled), a
-// cold edge warming up, invalidation, the choice of the nearest PoP (a client's links say which
-// CDN it uses) and the CDN's price.
+// refuses it, explain does not check it), the TTL and the stale content it serves (`ttl` is
+// accepted and not modelled), a cold edge warming up, invalidation, ch. 1's "CDN fallback" (the
+// clients going to the origin while the CDN is down: phase 3's faults), the choice of the nearest
+// PoP (a client's links say which CDN it uses) and the CDN's price.
 // Pattern: Delegation (composition over inheritance) — a CDN IS the read_through shape of a
 // cache, so CdnBehaviour holds a CacheBehaviour and forwards every call to it rather than
 // restating route/response/delivered. graph::Graph resolves the origin as the cache's backend

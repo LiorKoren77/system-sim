@@ -419,8 +419,8 @@ struct NodeSpec {
   // read), and the sizing keys the Che approximation reads: `keys` (how many entries
   // fit), `eviction` (lru, lfu, fifo or ttl) and `ttl`. A `backend` on a cache names the store the
   // cache itself calls (read_through, write_through, write_around, write_back); a CDN reads
-  // `hit_ratio`, `keys` and `ttl` too, and `write_ops` when built in code (see `origin` below).
-  // `write_ops` (caches and SQL databases): absent means the TYPE's default, present means
+  // `hit_ratio`, `keys`, `ttl` and `write_ops` too (see `origin` below).
+  // `write_ops` (caches, CDNs and SQL databases): absent means the TYPE's default, present means
   // exactly the list the scenario wrote; the loader stores it as written and every reader asks
   // write_ops_of. An optional rather than a vector pre-filled with a default, because the two
   // types' defaults differ and a pre-filled `[write]` could not be told from a database's

@@ -437,9 +437,11 @@ struct Overloaded : Fs... {
 
 // Why a CDN cannot run, if it cannot (plan 2b refinement 4):
 //  - a byte capacity (`capacity: 100GB/s`): what a CDN's bandwidth limits is bytes, and the
-//    engine moves requests until phase 2c's byte flows (each op's size, a link's bandwidth);
-//    turning the bytes into requests at an assumed object size would invent the very number the
-//    scenario is about;
+//    engine moves requests until phase 2c's byte flows (each op's size, a link's bandwidth).
+//    simsys.defaults converts the bytes at an assumed object size (blob_object_bytes, 1 MB) so
+//    that explain can print a number, but that number is the assumption's, not the scenario's:
+//    explain tags it and gives it no verdict (defaults::byte_rate_behind), and the engine does
+//    not run on it (youtube's 50 MB streams would make 100GB/s 2k/s, not 100k/s);
 //  - a `che` hit ratio without a `keys` size: Graph::build leaves it without a number, and
 //    running it as h = 0 would silently replace the scenario's Che approximation by "every read
 //    misses" (explain shows that bound and says so; a run could not).
