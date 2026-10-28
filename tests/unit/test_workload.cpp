@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -24,6 +26,7 @@ using simsys::workload::Ramp;
 using simsys::workload::RateCurve;
 using simsys::workload::Spike;
 using simsys::workload::Wave;
+using simsys::workload::wave_multiplier;
 using simsys::workload::WaveShape;
 
 TEST_CASE("a bare base rate is constant", "[workload]") {
@@ -57,7 +60,28 @@ TEST_CASE("the diurnal shape has its minimum at night and averages one over a da
   REQUIRE(c.rate_at(4h).per_second < c.rate_at(20h).per_second);
   double sum = 0;
   for (int m = 0; m < 24 * 60; ++m) sum += c.rate_at(std::chrono::minutes{m}).per_second;
-  REQUIRE_THAT(sum / (24 * 60), WithinRel(1000.0, 1e-3));  // the table is normalised to mean 1
+  // Exact, not approximate: the curve is periodic and piecewise linear with its breakpoints
+  // on whole hours, which are sample points. On each hour the 60 left-endpoint samples sum
+  // to 60 a + 29.5 (b - a) for endpoints a, b; over the day the (b - a) terms telescope to 0,
+  // leaving 60 x (the table's sum, 24). So the left Riemann sum equals the true mean, 1.
+  REQUIRE_THAT(sum / (24 * 60), WithinRel(1000.0, 1e-12));  // the table is normalised to mean 1
+}
+
+TEST_CASE("the diurnal wave reproduces the table at whole hours and is continuous across midnight",
+          "[workload]") {
+  const Wave d{.shape = WaveShape::diurnal, .period = 24h, .amplitude = 1.0, .peak_at = 20h};
+  REQUIRE_THAT(wave_multiplier(d, 4h), WithinAbs(0.40, 1e-12));
+  REQUIRE_THAT(wave_multiplier(d, 20h), WithinAbs(1.60, 1e-12));
+  REQUIRE_THAT(wave_multiplier(d, 23h + 30min), WithinAbs(0.875, 1e-12));  // halfway 1.00 -> 0.75
+  REQUIRE_THAT(wave_multiplier(d, 24h - 1ns), WithinAbs(wave_multiplier(d, 0s), 1e-9));
+}
+
+TEST_CASE("peak_at off the hour shifts the whole diurnal table rigidly", "[workload]") {
+  const Wave d{
+      .shape = WaveShape::diurnal, .period = 24h, .amplitude = 1.0, .peak_at = 20h + 30min};
+  REQUIRE_THAT(wave_multiplier(d, 20h + 30min), WithinAbs(1.60, 1e-12));
+  REQUIRE_THAT(wave_multiplier(d, 4h + 30min), WithinAbs(0.40, 1e-12));
+  REQUIRE_THAT(wave_multiplier(d, 20h), WithinAbs(1.575, 1e-12));  // halfway table(19)=1.55 -> 1.60
 }
 
 TEST_CASE("a ramp moves linearly from `from` to `to` over `over`, then holds", "[workload]") {
@@ -67,6 +91,25 @@ TEST_CASE("a ramp moves linearly from `from` to `to` over `over`, then holds", "
   REQUIRE_THAT(c.rate_at(5min).per_second, WithinRel(1000.0, 1e-12));
   REQUIRE(c.rate_at(10min).per_second == 2000);
   REQUIRE(c.rate_at(3h).per_second == 2000);
+}
+
+TEST_CASE("a ramp over zero time is a step at t = 0 from `from` to `to`", "[workload]") {
+  RateCurve c{.base = Rate{1000}};
+  c.ramp = Ramp{.from = Rate{500}, .to = Rate{2000}, .over = 0s};
+  REQUIRE(c.rate_at(-1ns).per_second == 500);
+  REQUIRE(c.rate_at(0s).per_second == 2000);
+}
+
+TEST_CASE("a ramp without a base rate to be relative to is a programmer error", "[workload]") {
+  // The ramp is a multiplier of `base`; with base 0, or with points replacing the base,
+  // there is nothing to be relative to. The config loader rejects both scenarios.
+  RateCurve zero_base{.base = Rate{0}};
+  zero_base.ramp = Ramp{.from = Rate{0}, .to = Rate{2000}, .over = 10min};
+  REQUIRE_THROWS_AS(zero_base.rate_at(5min), std::invalid_argument);
+  RateCurve with_points{.base = Rate{1000}};
+  with_points.points = Points{.at = {{0s, Rate{1000}}}};
+  with_points.ramp = Ramp{.from = Rate{0}, .to = Rate{2000}, .over = 10min};
+  REQUIRE_THROWS_AS(with_points.rate_at(5min), std::invalid_argument);
 }
 
 TEST_CASE(
@@ -97,6 +140,15 @@ TEST_CASE("before the first point the rate is the first point's", "[workload]") 
   REQUIRE(c.rate_at(0s).per_second == 1000);
 }
 
+TEST_CASE("two points at the same time make a step that takes the later value from that instant",
+          "[workload]") {
+  RateCurve c{.base = Rate{0}};
+  c.points = Points{.at = {{1h, Rate{100}}, {1h, Rate{200}}, {2h, Rate{300}}}};
+  REQUIRE(c.rate_at(1h - 1ns).per_second == 100);
+  REQUIRE(c.rate_at(1h).per_second == 200);
+  REQUIRE_THAT(c.rate_at(1h + 30min).per_second, WithinRel(250.0, 1e-12));
+}
+
 TEST_CASE("terms multiply: a wave on top of a spike on top of points", "[workload]") {
   RateCurve c{.base = Rate{0}};
   c.points = Points{.at = {{0s, Rate{1000}}, {1h, Rate{1000}}}};
@@ -116,6 +168,27 @@ TEST_CASE("wave_multiplier is exposed so the curve command can print the shape a
   const Wave w{.shape = WaveShape::square, .period = 1h, .amplitude = 1.0, .peak_at = 0s};
   REQUIRE(simsys::workload::wave_multiplier(w, 0s) == 2.0);
   REQUIRE(simsys::workload::wave_multiplier(w, 30min) == 0.0);
+}
+
+TEST_CASE("the square wave's far edge is high at exactly a quarter period after the peak",
+          "[workload]") {
+  const Wave w{.shape = WaveShape::square, .period = 24h, .amplitude = 1.0, .peak_at = 12h};
+  REQUIRE(wave_multiplier(w, 18h) == 2.0);
+  REQUIRE(wave_multiplier(w, 18h + 1ns) == 0.0);
+}
+
+TEST_CASE("a wave amplitude outside zero to one is a programmer error", "[workload]") {
+  const Wave w{.shape = WaveShape::sine, .period = 1h, .amplitude = 1.5, .peak_at = 0s};
+  REQUIRE_THROWS_AS(wave_multiplier(w, 0s), std::invalid_argument);
+}
+
+TEST_CASE("a spike whose end would overflow the clock is still active after its start",
+          "[workload]") {
+  RateCurve c{.base = Rate{1}};
+  c.spikes = {Spike{.at = 2h,
+                    .duration = simsys::SimTime{std::numeric_limits<std::int64_t>::max()},
+                    .factor = 3}};
+  REQUIRE(c.rate_at(3h).per_second == 3);
 }
 
 using simsys::workload::Noise;

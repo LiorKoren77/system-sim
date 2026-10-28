@@ -204,6 +204,11 @@ TEST_CASE("parse_time_point accepts a clock time or a duration") {
   require_rejected(simsys::parse_time_point("noon"), "noon", "expected HH:MM or a duration");
 }
 
+TEST_CASE("parse_time_point keeps the clock-time range message for HH:MM-shaped text") {
+  require_rejected(simsys::parse_time_point("25:00"), "25:00", "hour must be 00-23");
+  require_rejected(simsys::parse_time_point("12:60"), "12:60", "minute must be 00-59");
+}
+
 TEST_CASE("simsys minute and hour literals equal their std::chrono counterparts") {
   using namespace simsys::literals;
   static_assert(5_min == 5min);
