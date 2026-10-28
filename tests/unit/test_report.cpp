@@ -24,6 +24,7 @@ using namespace std::chrono_literals;
 using Catch::Approx;
 using Catch::Matchers::WithinRel;
 using simsys::Rate;
+using simsys::model::LimiterAlgorithm;
 using simsys::model::LinkSpec;
 using simsys::model::NodeSpec;
 using simsys::model::NodeType;
@@ -90,6 +91,27 @@ Scenario loop(double gain) {
                .ops = {{"job", {Step{.to = "a", .op = "msg"}}}}}};
   s.links = {LinkSpec{.from = "users", .to = "a", .dir = simsys::model::Direction::inout},
              LinkSpec{.from = "a", .to = "b"}, LinkSpec{.from = "b", .to = "a"}};
+  return s;
+}
+
+// u(4000/s) -> limiter (token bucket, 1000/s, burst 100) -> api (10k/s): after the first step
+// the limiter admits 1000/s and refuses 3000/s of the 4000 it is offered. The 500 ms warmup
+// keeps the first step, where the bucket may still hold tokens, out of the summary.
+Scenario limited() {
+  Scenario s{.name = "limited", .version = 1, .duration = 1s, .warmup = 500ms};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{4000}},
+                                           .op_shares = {{"call", 1.0}}}},
+             NodeSpec{.id = "limiter",
+                      .type = NodeType::rate_limiter,
+                      .capacity = Rate{1e6},
+                      .algorithm = LimiterAlgorithm::token_bucket,
+                      .limit = Rate{1000},
+                      .burst = 100},
+             NodeSpec{.id = "api", .type = NodeType::service, .capacity = Rate{10'000}}};
+  s.links = {LinkSpec{.from = "u", .to = "limiter", .latency = 0s},
+             LinkSpec{.from = "limiter", .to = "api", .latency = 0s}};
   return s;
 }
 
@@ -367,4 +389,23 @@ TEST_CASE("explain summarises the client's curve and checks the peak offered loa
           std::string::npos);
   REQUIRE(text.find("  api  peak offered 1.5k/s vs 1.2k/s total capacity  (125%, red)\n") !=
           std::string::npos);
+}
+
+// A limiter refuses requests without dropping them from a queue, so the report needs a column
+// of its own for them, and the drop rate (dropped + rejected) / demand must count them or a
+// limiter that sheds 75% of its input would read as a node with no drops at all.
+TEST_CASE("the table and JSON report a rejected column and the drop rate counts rejections",
+          "[report]") {
+  const auto s = limited();
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  const auto text = simsys::report::render_table(summary, {}, /*color=*/false);
+  CAPTURE(text);
+  REQUIRE(text.find("rejected") != std::string::npos);
+  const auto json = simsys::report::render_json(summary, {});
+  CAPTURE(json);
+  REQUIRE(json.find("\"rejected\"") != std::string::npos);
+  REQUIRE_THAT(summary.drop_rate("limiter"), WithinRel(0.75, 1e-9));  // 3000 refused of 4000
+  REQUIRE(summary.drop_rate("api") == 0.0);
+  REQUIRE(summary.worst_drop_node() == "limiter");
 }

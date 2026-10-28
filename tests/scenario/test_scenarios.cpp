@@ -65,14 +65,26 @@ TEST_CASE("every shipped scenario resolves into a graph that explain can print",
   }
 }
 
-TEST_CASE("tutorial scenarios run in under five seconds and pass their SLOs", "[scenario]") {
+// Which scenarios run grows with each phase, so the test does not name them: a scenario whose
+// node types the engine does not simulate yet is refused by Simulation::create with a message
+// naming the phase ("... do not support yet (phase 2)") and is skipped; every other one is run
+// to its end and must meet its own SLOs. A scenario the engine refuses for any other reason is
+// a failure, not a skip.
+TEST_CASE("scenarios whose node types all exist run in under five seconds and pass their SLOs",
+          "[scenario]") {
   using namespace std::chrono_literals;
+  int ran = 0;
   for (const auto& file : scenario_files()) {
-    if (file.find("/tutorial/") == std::string::npos) continue;
     CAPTURE(file);
     const auto s = *simsys::config::load(file);
     const auto g = *simsys::graph::Graph::build(s);
-    auto sim = *simsys::engine::Simulation::create(g);
+    auto created = simsys::engine::Simulation::create(g);
+    if (!created) {
+      REQUIRE(created.error().message.find("phase 2") != std::string::npos);
+      continue;  // a node type of a later phase: nothing to run yet
+    }
+    ++ran;
+    auto& sim = *created;
     simsys::report::Summary summary{g, s.warmup};
     const auto started = std::chrono::steady_clock::now();
     // C++20 designated initializers: the run options name the fields they set, so the
@@ -87,6 +99,26 @@ TEST_CASE("tutorial scenarios run in under five seconds and pass their SLOs", "[
       REQUIRE(r.status != simsys::report::SloStatus::fail);
     }
   }
+  CHECK(ran > 0);  // the tutorials at least always run
+}
+
+// Phase 2a's goal: the rate-limiter lab, which uses a client with spikes, a rate limiter, a
+// cache and a service, runs end to end. Its `counters` cache (hit_ratio: {fixed: 1.0}) lands
+// in plan Task 10; until then Simulation::create refuses the cache and THIS CASE STAYS RED on
+// purpose. It goes green when the cache node exists: do not weaken it to a skip.
+TEST_CASE("labs/rate-limiter runs in phase 2a", "[scenario]") {
+  using namespace std::chrono_literals;
+  const auto s = simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} +
+                                      "/labs/rate-limiter/scenario.yaml");
+  if (!s) FAIL(s.error().file << ":" << s.error().line << ": " << s.error().message);
+  const auto g = simsys::graph::Graph::build(*s);
+  if (!g) FAIL(g.error().message);
+  auto sim = simsys::engine::Simulation::create(*g);
+  if (!sim) FAIL(sim.error().message);
+  // A short run is enough to prove the pipeline end to end: the first steps of 30 minutes.
+  int steps = 0;
+  sim->run({.duration = 1s, .step = s->step}, [&](const auto&) { ++steps; });
+  REQUIRE(steps == 10);
 }
 
 TEST_CASE("book scenarios are refused by run until their node types exist", "[scenario]") {
