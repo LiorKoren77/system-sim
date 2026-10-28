@@ -214,7 +214,7 @@ version: 1
 name: t
 duration: 1m
 nodes:
-  front: {type: cache, backend: ghost}
+  front: {type: cache, hit_ratio: {fixed: 0.5}, backend: ghost}
 links: []
 )",
                      "node 'front': backend refers to unknown node 'ghost'");
@@ -502,7 +502,7 @@ version: 1
 name: t
 duration: 1m
 nodes:
-  cache: {type: cache}
+  cache: {type: cache, hit_ratio: {fixed: 0.5}}
   api:
     type: service
     capacity: 1k/s
@@ -1292,7 +1292,7 @@ nodes:
       read:
         - {to: cache}
         - {to: db, op: select, on: miss, mode: parallel, factor: 3}
-  cache: {type: cache}
+  cache: {type: cache, hit_ratio: {fixed: 0.5}}
   db: {type: sql_db}
 links:
   - {from: web, to: cache}
@@ -1324,7 +1324,7 @@ duration: 1m
 nodes:
   w: {type: worker_pool, consumes: q, then: [{to: c, op: write, factor: 100}]}
   q: {type: message_queue}
-  c: {type: cache}
+  c: {type: cache, hit_ratio: {fixed: 0.5}}
 links:
   - {from: q, to: w}
   - {from: w, to: c}
@@ -1596,10 +1596,11 @@ TEST_CASE("a link's ops list may not be empty") {
 
 TEST_CASE("ops and then are accepted only on the types the schema gives them") {
   SECTION("a cache has no ops: it serves reads and forwards misses through then") {
-    require_rejected("simsys_cache_ops.yaml",
-                     scenario_with("  d: {type: sql_db}\n"
-                                   "  c: {type: cache, ops: {read: [{to: d}]}}\n"),
-                     "node 'c': key 'ops' is not valid for type 'cache'");
+    require_rejected(
+        "simsys_cache_ops.yaml",
+        scenario_with("  d: {type: sql_db}\n"
+                      "  c: {type: cache, hit_ratio: {fixed: 0.5}, ops: {read: [{to: d}]}}\n"),
+        "node 'c': key 'ops' is not valid for type 'cache'");
   }
   SECTION("a service has no then: its steps hang off each op") {
     require_rejected("simsys_service_then.yaml",
@@ -2599,7 +2600,7 @@ TEST_CASE("a node's per-op cost is typed and must be a positive finite number") 
   }
   SECTION("a cache accepts a cost map") {
     require_loaded("simsys_cost_cache.yaml",
-                   scenario_with("  c: {type: cache, cost: {read: 2}}\n"));
+                   scenario_with("  c: {type: cache, hit_ratio: {fixed: 0.5}, cost: {read: 2}}\n"));
   }
 }
 
@@ -2674,7 +2675,7 @@ TEST_CASE("a rate limiter's algorithm, limit, burst, window and backend are type
   const auto limiter_scenario = [](std::string_view body) {
     return scenario_with("  limiter: {type: rate_limiter, " + std::string{body} +
                              "}\n"
-                             "  counters: {type: cache}\n",
+                             "  counters: {type: cache, hit_ratio: {fixed: 0.5}}\n",
                          "links: [{from: limiter, to: counters, dir: inout}]\n");
   };
   SECTION("every key loads as given") {
@@ -2806,4 +2807,153 @@ TEST_CASE("reject_rate loads as an SLO metric with a ratio max") {
   REQUIRE(s->slos[0].metric == simsys::model::SloMetric::reject_rate);
   REQUIRE(s->slos[0].node == "limiter");
   REQUIRE(std::get<double>(s->slos[0].max) == 0.5);
+}
+
+// Plan 2a, Task 10 / refinement 7: a cache's hit ratio, strategy, write ops, key count,
+// eviction policy and ttl are read into typed fields. Hit ratio `che` (the Che
+// approximation of an LRU cache) is accepted here and computed in phase 2b.
+TEST_CASE(
+    "a cache's hit ratio, strategy, write ops, keys, eviction and ttl are typed and checked") {
+  // C++20 `using enum`: the cache strategies' enumerators in scope, as for the LB policies.
+  using enum simsys::model::CacheStrategy;
+  // A cache `c` in front of a database `db`, linked c -> db so a `backend: db` has an edge to
+  // follow; `body` is the cache's own YAML mapping.
+  const auto cache_scenario = [](std::string_view body) {
+    return scenario_with("  c: {type: cache, " + std::string{body} +
+                             "}\n"
+                             "  db: {type: sql_db}\n",
+                         "links: [{from: c, to: db, dir: inout}]\n");
+  };
+  // Loads a scenario that must be accepted and returns it.
+  const auto load_accepted = [](std::string_view file_name, const std::string& yaml) {
+    const auto path = write_temp(file_name, yaml);
+    auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    return *s;
+  };
+  SECTION("every key loads as given") {
+    const auto s = load_accepted(
+        "simsys_cache_all.yaml",
+        cache_scenario("hit_ratio: {fixed: 0.8}, strategy: read_through, backend: db, "
+                       "write_ops: [write, delete], keys: 20M, eviction: lru, ttl: 5m"));
+    const auto& c = s.nodes[0];
+    REQUIRE(c.type == simsys::model::NodeType::cache);
+    REQUIRE(c.hit_ratio.has_value());
+    REQUIRE(c.hit_ratio->fixed == 0.8);
+    REQUIRE_FALSE(c.hit_ratio->che);
+    REQUIRE(c.strategy == read_through);
+    REQUIRE(c.backend == "db");
+    REQUIRE(c.write_ops == std::vector<std::string>{"write", "delete"});
+    REQUIRE(c.keys == 20'000'000);
+    REQUIRE(c.eviction == "lru");
+    REQUIRE(c.ttl == 5min);
+  }
+  SECTION("a cache with only a hit ratio gets cache_aside and write as its only write op") {
+    const auto s =
+        load_accepted("simsys_cache_defaults.yaml", cache_scenario("hit_ratio: {fixed: 0.5}"));
+    const auto& c = s.nodes[0];
+    REQUIRE(c.strategy == cache_aside);
+    REQUIRE(c.write_ops == std::vector<std::string>{"write"});
+    REQUIRE_FALSE(c.backend.has_value());
+    REQUIRE_FALSE(c.keys.has_value());
+    REQUIRE_FALSE(c.eviction.has_value());
+    REQUIRE_FALSE(c.ttl.has_value());
+  }
+  SECTION("each strategy name loads as its enumerator") {
+    const std::pair<std::string_view, simsys::model::CacheStrategy> names[] = {
+        {"cache_aside", cache_aside},
+        {"read_through", read_through},
+        {"write_through", write_through},
+        {"write_around", write_around},
+        {"write_back", write_back}};
+    for (const auto& [name, expected] : names) {
+      CAPTURE(name);
+      const auto s = load_accepted(
+          "simsys_cache_strategy.yaml",
+          cache_scenario("hit_ratio: {fixed: 0.5}, backend: db, strategy: " + std::string{name}));
+      REQUIRE(s.nodes[0].strategy == expected);
+    }
+  }
+  SECTION("keys take the count suffixes the shipped scenarios use") {
+    const std::pair<std::string_view, long long> counts[] = {
+        {"500", 500}, {"10k", 10'000}, {"1M", 1'000'000}, {"1G", 1'000'000'000}};
+    for (const auto& [text, expected] : counts) {
+      CAPTURE(text);
+      const auto s =
+          load_accepted("simsys_cache_keys.yaml",
+                        cache_scenario("hit_ratio: {fixed: 0.5}, keys: " + std::string{text}));
+      REQUIRE(s.nodes[0].keys == expected);
+    }
+  }
+  SECTION("a hit ratio of 0 and of 1 are both valid: all misses and all hits") {
+    for (const std::string_view fixed : {"0", "1.0"}) {
+      CAPTURE(fixed);
+      const auto s =
+          load_accepted("simsys_cache_fixed_edge.yaml",
+                        cache_scenario("hit_ratio: {fixed: " + std::string{fixed} + "}"));
+      REQUIRE(s.nodes[0].hit_ratio.has_value());
+      REQUIRE(s.nodes[0].hit_ratio->fixed == std::stod(std::string{fixed}));
+    }
+  }
+  SECTION("hit_ratio che loads and leaves the number to phase 2b") {
+    const auto s = load_accepted("simsys_cache_che.yaml",
+                                 cache_scenario("hit_ratio: che, eviction: lru, keys: 20M"));
+    REQUIRE(s.nodes[0].hit_ratio.has_value());
+    REQUIRE(s.nodes[0].hit_ratio->che == true);
+    REQUIRE_FALSE(s.nodes[0].hit_ratio->fixed.has_value());
+  }
+  SECTION("a cache_aside cache with a backend loads: the backend is simply unused") {
+    const auto s = load_accepted(
+        "simsys_cache_aside_backend.yaml",
+        cache_scenario("hit_ratio: {fixed: 0.5}, strategy: cache_aside, backend: db"));
+    REQUIRE(s.nodes[0].strategy == cache_aside);
+    REQUIRE(s.nodes[0].backend == "db");
+  }
+  SECTION("a cache without a hit ratio") {
+    require_rejected("simsys_cache_no_hit_ratio.yaml", cache_scenario("strategy: cache_aside"),
+                     "node 'c': cache needs a hit_ratio");
+  }
+  SECTION("a fixed hit ratio outside 0..1") {
+    for (const std::string_view fixed : {"1.5", "-0.1"}) {
+      CAPTURE(fixed);
+      require_rejected("simsys_cache_fixed_range.yaml",
+                       cache_scenario("hit_ratio: {fixed: " + std::string{fixed} + "}"),
+                       "node 'c': hit_ratio.fixed must be between 0 and 1");
+    }
+  }
+  SECTION("a hit ratio that is neither che nor a fixed map") {
+    require_rejected("simsys_cache_hit_magic.yaml", cache_scenario("hit_ratio: magic"),
+                     "node 'c': hit_ratio must be che or {fixed: h}");
+  }
+  SECTION("a strategy that forwards to a backend needs one") {
+    for (const std::string_view strategy : {"read_through", "write_through", "write_around"}) {
+      CAPTURE(strategy);
+      require_rejected(
+          "simsys_cache_no_backend.yaml",
+          cache_scenario("hit_ratio: {fixed: 0.5}, strategy: " + std::string{strategy}),
+          "node 'c': strategy " + std::string{strategy} + " needs a backend");
+    }
+  }
+  SECTION("an unknown strategy") {
+    require_rejected("simsys_cache_sideways.yaml",
+                     cache_scenario("hit_ratio: {fixed: 0.5}, strategy: sideways"),
+                     "node 'c': strategy must be cache_aside, read_through, write_through, "
+                     "write_around or write_back");
+  }
+  SECTION("an empty write_ops list") {
+    require_rejected("simsys_cache_write_ops_empty.yaml",
+                     cache_scenario("hit_ratio: {fixed: 0.5}, write_ops: []"),
+                     "node 'c': write_ops must name at least one op");
+  }
+  SECTION("keys of zero") {
+    require_rejected("simsys_cache_keys_zero.yaml",
+                     cache_scenario("hit_ratio: {fixed: 0.5}, keys: 0"),
+                     "node 'c': keys must be a positive integer");
+  }
+  SECTION("an unknown eviction policy") {
+    require_rejected("simsys_cache_eviction_magic.yaml",
+                     cache_scenario("hit_ratio: {fixed: 0.5}, eviction: magic"),
+                     "node 'c': eviction must be lru, lfu, fifo or ttl");
+  }
 }

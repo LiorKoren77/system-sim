@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -25,14 +26,20 @@ import simsys.model;
 using namespace std::chrono_literals;
 using Catch::Matchers::WithinRel;
 using simsys::Rate;
+using simsys::graph::DemandEdge;
 using simsys::graph::Graph;
+using simsys::graph::ServiceHop;
+using simsys::model::CacheStrategy;
 using simsys::model::Direction;
+using simsys::model::HitRatio;
 using simsys::model::LbPolicy;
 using simsys::model::LinkSpec;
 using simsys::model::NodeSpec;
 using simsys::model::NodeType;
 using simsys::model::Scenario;
 using simsys::model::Step;
+using simsys::model::StepCondition;
+using simsys::model::StepMode;
 using simsys::model::Workload;
 
 namespace {
@@ -567,4 +574,161 @@ TEST_CASE("a leaky bucket's queue is one deterministic slot of rate limit with r
   REQUIRE_THAT(per_copy.service_time_s, WithinRel(0.002, 1e-12));
   REQUIRE(per_copy.concurrency == 1);
   REQUIRE(per_copy.queue_limit == 250.0);
+}
+
+// ---- Caches (plan 2a refinement 7, Task 10) ----
+
+// The shape of one resolved service hop, as Graph::service_hops exports it: the node it calls,
+// the op it sends, the share of the service's requests that take the hop (the step's factor
+// times, for an `on: miss` step, the preceding cache's miss fraction) and how it combines with
+// the other hops.
+static_assert(std::is_same_v<decltype(ServiceHop::target), std::size_t>);
+static_assert(std::is_same_v<decltype(ServiceHop::op), std::string>);
+static_assert(std::is_same_v<decltype(ServiceHop::fraction), double>);
+static_assert(std::is_same_v<decltype(ServiceHop::mode), StepMode>);
+
+namespace {
+// A cache node with a fixed hit ratio; `backend` (the node it forwards to, for read_through,
+// write_through and write_around) only when given. Designated initializers follow declaration
+// order: backend, then hit_ratio, then strategy.
+NodeSpec cache(std::string id, double hit, CacheStrategy strategy, std::string backend = "") {
+  NodeSpec node{.id = std::move(id),
+                .type = NodeType::cache,
+                .hit_ratio = HitRatio{.fixed = hit},
+                .strategy = strategy};
+  if (!backend.empty()) node.backend = std::move(backend);
+  return node;
+}
+// u -> web -> `cache_node` and web -> db, with `steps` as web's steps for the op `get`; when the
+// cache names a backend, cache_node -> that node's link too (the backend is always `db`).
+Scenario cached_web(NodeSpec cache_node, std::vector<Step> steps) {
+  const bool with_backend = cache_node.backend.has_value();
+  Scenario s{.name = "cached", .version = 1, .duration = 1min};
+  const std::string cache_id = cache_node.id;
+  s.nodes = {client("u", Rate{100}, {{"get", 1.0}}), service("web", {{"get", std::move(steps)}}),
+             std::move(cache_node), service("db")};
+  s.links = {LinkSpec{.from = "u", .to = "web", .dir = Direction::inout},
+             LinkSpec{.from = "web", .to = cache_id, .dir = Direction::inout},
+             LinkSpec{.from = "web", .to = "db", .dir = Direction::inout}};
+  if (with_backend) {
+    s.links.push_back(LinkSpec{.from = cache_id, .to = "db", .dir = Direction::inout});
+  }
+  return s;
+}
+// web.get = [cache.read, db.read on miss]: the cache-aside read path of ch. 1.
+std::vector<Step> read_then_db_on_miss() {
+  return {Step{.to = "cache", .op = "read"},
+          Step{.to = "db", .op = "read", .on = StepCondition::miss}};
+}
+}  // namespace
+
+// Ch. 1, cache-aside: the web tier asks the cache first and goes to the database only for
+// what the cache did not have. In the fluid model the share of requests that miss is
+// 1 - hit ratio, so a conditional `on: miss` step carries that fraction of the flow.
+TEST_CASE("a service step after a cache step fires on miss for the cache's miss fraction",
+          "[graph]") {
+  const auto s =
+      cached_web(cache("cache", 0.8, CacheStrategy::cache_aside), read_then_db_on_miss());
+  const auto built = Graph::build(s);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto& g = *built;
+  REQUIRE_THAT(*g.hit_ratio(*g.index_of("cache")), WithinRel(0.8, 1e-12));
+  const auto hops = g.service_hops(*g.index_of("web"), "get");
+  REQUIRE(hops.size() == 2);
+  REQUIRE(hops[0].target == *g.index_of("cache"));
+  REQUIRE(hops[0].op == "read");
+  REQUIRE_THAT(hops[0].fraction, WithinRel(1.0, 1e-12));  // the cache is asked about every read
+  REQUIRE(hops[1].target == *g.index_of("db"));
+  REQUIRE(hops[1].op == "read");
+  REQUIRE_THAT(hops[1].fraction, WithinRel(0.2, 1e-12));  // 1 - 0.8
+  REQUIRE(hops[1].mode == StepMode::sequential);
+}
+
+TEST_CASE("a node that is not a cache has no hit ratio", "[graph]") {
+  const auto g = *Graph::build(
+      cached_web(cache("cache", 0.8, CacheStrategy::cache_aside), read_then_db_on_miss()));
+  REQUIRE_FALSE(g.hit_ratio(*g.index_of("web")).has_value());
+  REQUIRE_FALSE(g.hit_ratio(*g.index_of("u")).has_value());
+}
+
+TEST_CASE("a cache that always hits sends nothing on to the miss step", "[graph]") {
+  const auto g = *Graph::build(
+      cached_web(cache("cache", 1.0, CacheStrategy::cache_aside), read_then_db_on_miss()));
+  const auto hops = g.service_hops(*g.index_of("web"), "get");
+  REQUIRE(hops.size() == 2);
+  REQUIRE_THAT(hops[1].fraction, WithinRel(0.0, 1e-12));
+}
+
+TEST_CASE("an on-miss step must follow a cache or cdn step", "[graph]") {
+  const std::string expected = "node 'web': an 'on: miss' step must follow a cache or cdn step";
+  SECTION("as the first step") {
+    const auto g =
+        Graph::build(cached_web(cache("cache", 0.8, CacheStrategy::cache_aside),
+                                {Step{.to = "db", .op = "read", .on = StepCondition::miss}}));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == expected);
+  }
+  SECTION("after a step to a service, which has no miss to report") {
+    const auto g =
+        Graph::build(cached_web(cache("cache", 0.8, CacheStrategy::cache_aside),
+                                {Step{.to = "db", .op = "read"},
+                                 Step{.to = "db", .op = "read", .on = StepCondition::miss}}));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == expected);
+  }
+}
+
+// A `che` hit ratio is the Che approximation of an LRU cache (phase 2b): the graph builds (so
+// explain can print the scenario) but has no number for it yet.
+TEST_CASE("a che hit ratio builds a graph with no static hit ratio", "[graph]") {
+  auto node = cache("cache", 0.0, CacheStrategy::cache_aside);
+  node.hit_ratio = HitRatio{.fixed = std::nullopt, .che = true};
+  const auto built = Graph::build(cached_web(std::move(node), {Step{.to = "cache", .op = "read"}}));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE_FALSE(built->hit_ratio(*built->index_of("cache")).has_value());
+}
+
+// read_through: on a miss the cache itself fetches from its backend; write_through: it writes
+// to the backend before answering. Both put a call from the cache to the backend on the graph,
+// so the backend's demand and the cycle checks see it. cache_aside never calls its backend.
+TEST_CASE("read_through and write_through caches get a demand edge to their backend", "[graph]") {
+  const std::vector<Step> to_cache{Step{.to = "cache", .op = "read"}};
+  for (const auto strategy : {CacheStrategy::read_through, CacheStrategy::write_through}) {
+    CAPTURE(static_cast<int>(strategy));
+    const auto built = Graph::build(cached_web(cache("cache", 0.8, strategy, "db"), to_cache));
+    INFO((built ? "" : built.error().message));
+    REQUIRE(built.has_value());
+    const auto cache_index = *built->index_of("cache");
+    const auto db_index = *built->index_of("db");
+    const auto link = built->demand_link(cache_index, db_index);
+    REQUIRE(link.has_value());
+    // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
+    // `std::find(begin, end, value) != end`; DemandEdge's defaulted == makes it comparable.
+    REQUIRE(std::ranges::contains(built->edges(),
+                                  DemandEdge{.from = cache_index, .to = db_index, .link = *link}));
+  }
+}
+
+TEST_CASE("a cache_aside cache's backend is unused: it gets no demand edge", "[graph]") {
+  const auto built = Graph::build(
+      cached_web(cache("cache", 0.8, CacheStrategy::cache_aside, "db"), read_then_db_on_miss()));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto cache_index = *built->index_of("cache");
+  const auto db_index = *built->index_of("db");
+  REQUIRE_FALSE(std::ranges::contains(
+      built->edges(), DemandEdge{.from = cache_index,
+                                 .to = db_index,
+                                 .link = *built->demand_link(cache_index, db_index)}));
+}
+
+TEST_CASE("a forwarding cache's backend needs a link from the cache", "[graph]") {
+  Scenario s = cached_web(cache("cache", 0.8, CacheStrategy::read_through, "db"),
+                          {Step{.to = "cache", .op = "read"}});
+  s.links.pop_back();  // cache -> db missing
+  const auto g = Graph::build(s);
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message.contains("node 'cache': backend 'db' needs a link"));
 }

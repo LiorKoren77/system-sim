@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -36,7 +37,9 @@ using Catch::Matchers::WithinRel;
 using simsys::Rate;
 using simsys::engine::Simulation;
 using simsys::graph::Graph;
+using simsys::model::CacheStrategy;
 using simsys::model::Direction;
+using simsys::model::HitRatio;
 using simsys::model::LbPolicy;
 using simsys::model::LimiterAlgorithm;
 using simsys::model::LinkSpec;
@@ -44,6 +47,7 @@ using simsys::model::NodeSpec;
 using simsys::model::NodeType;
 using simsys::model::Scenario;
 using simsys::model::Step;
+using simsys::model::StepCondition;
 using simsys::model::Workload;
 
 namespace {
@@ -127,6 +131,36 @@ Scenario limited(LimiterAlgorithm algorithm, double limit, int burst, double dem
              LinkSpec{.from = "limiter", .to = "api", .latency = 0s}};
   return s;
 }
+
+// u(1000/s of `read`) -> web -> [cache.read, db.read on miss], all links with zero latency:
+// the cache-aside read path of ch. 1. web (10k/s, 0.5 ms) and the cache (100k/s, 0.1 ms) are
+// nowhere near saturation; the db (1000/s, 5 ms: five servers) at the full 1000/s would be.
+// Each node has capacity enough that what the results show comes from the hit ratio alone.
+Scenario cached_reads(double hit) {
+  Scenario s{.name = "cached-reads", .version = 1, .duration = 10s};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"read", 1.0}}}},
+      NodeSpec{.id = "web",
+               .type = NodeType::service,
+               .capacity = Rate{10'000},
+               .latency = 500us,
+               .ops = {{"read",
+                        {Step{.to = "cache", .op = "read"},
+                         Step{.to = "db", .op = "read", .on = StepCondition::miss}}}}},
+      NodeSpec{.id = "cache",
+               .type = NodeType::cache,
+               .capacity = Rate{100'000},
+               .latency = 100us,
+               .hit_ratio = HitRatio{.fixed = hit},
+               .strategy = CacheStrategy::cache_aside},
+      NodeSpec{.id = "db", .type = NodeType::service, .capacity = Rate{1000}, .latency = 5ms}};
+  s.links = {LinkSpec{.from = "u", .to = "web", .latency = 0s},
+             LinkSpec{.from = "web", .to = "cache", .latency = 0s},
+             LinkSpec{.from = "web", .to = "db", .latency = 0s}};
+  return s;
+}
 }  // namespace
 
 TEST_CASE("one step of an M/M/1 node reproduces rho/(mu - lambda) + service time", "[theory]") {
@@ -205,12 +239,12 @@ TEST_CASE("dropped flow does not propagate downstream", "[theory]") {
 
 TEST_CASE("a simulation refuses node types the phase does not support yet", "[theory]") {
   Scenario s = mm1(1);
-  s.nodes[1].type = NodeType::cache;
+  s.nodes[1].type = NodeType::sql_db;
   const auto g = *simsys::graph::Graph::build(s);
   const auto sim = Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
-          "node 's' has type 'cache', which run/estimate do not support yet (phase 2)");
+          "node 's' has type 'sql_db', which run/estimate do not support yet (phase 2)");
 }
 
 TEST_CASE("run emits one record per step from 0 to duration, exclusive", "[theory]") {
@@ -932,4 +966,88 @@ TEST_CASE(
   const auto settled = (*Simulation::create(g)).estimate();
   REQUIRE_THAT(settled.nodes[*g.index_of("counters")].demand_per_s, WithinRel(4000.0, 1e-9));
   REQUIRE_THAT(settled.responses[0].answered.per_second, WithinRel(1000.0, 1e-9));
+}
+
+// Ch. 1, cache: with a hit ratio of 0.8 the cache absorbs four reads in five, so the database
+// behind it sees 1000/s x (1 - 0.8) = 200/s while the cache itself is asked about all 1000/s.
+// The same holds in the long-run state (estimate).
+TEST_CASE(
+    "a cache_aside cache in front of a database cuts the database's reads to the miss fraction",
+    "[theory]") {
+  const auto g = *Graph::build(cached_reads(0.8));
+  const auto r = (*Simulation::create(g)).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[*g.index_of("cache")].demand_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(r.nodes[*g.index_of("db")].demand_per_s, WithinRel(200.0, 1e-9));
+  const auto settled = (*Simulation::create(g)).estimate();
+  REQUIRE_THAT(settled.nodes[*g.index_of("cache")].demand_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(settled.nodes[*g.index_of("db")].demand_per_s, WithinRel(200.0, 1e-9));
+}
+
+// What the client waits for a read: web, then the cache (always), then the db for the 20 % the
+// cache missed. With zero link latencies and the node latencies the record reports (each
+// node's own sojourn: service time plus queueing wait), the mean is
+//   web + cache + 0.2 x db            (expectation of the hit/miss mixture),
+// and, the db's time being 0 for a hit and D for a miss, the variance adds the spread between
+// the two cases to the variances of the sequential parts:
+//   var web + var cache + 0.2 var D + 0.2 x 0.8 x (mean D)².
+TEST_CASE("reads served from cache are faster: the client's mean is the hit/miss mixture",
+          "[theory]") {
+  const auto g = *Graph::build(cached_reads(0.8));
+  const auto r = (*Simulation::create(g)).step(0s, 100ms);
+  const auto& web = r.nodes[*g.index_of("web")].latency;
+  const auto& cache = r.nodes[*g.index_of("cache")].latency;
+  const auto& db = r.nodes[*g.index_of("db")].latency;
+  REQUIRE(r.responses.size() == 1);
+  REQUIRE_THAT(r.responses[0].response.mean_s,
+               WithinRel(web.mean_s + cache.mean_s + 0.2 * db.mean_s, 1e-9));
+  REQUIRE_THAT(r.responses[0].response.variance_s2,
+               WithinRel(web.variance_s2 + cache.variance_s2 + 0.2 * db.variance_s2 +
+                             0.2 * 0.8 * db.mean_s * db.mean_s,
+                         1e-9));
+  // The mixture really is cheaper than sending every read to the database.
+  REQUIRE(r.responses[0].response.mean_s < web.mean_s + cache.mean_s + db.mean_s);
+  // Every read is answered: nothing here drops or rejects.
+  REQUIRE_THAT(r.responses[0].answered.per_second, WithinRel(1000.0, 1e-9));
+}
+
+TEST_CASE("a cache hit ratio of 1 sends nothing to the database and adds none of its latency",
+          "[theory]") {
+  const auto g = *Graph::build(cached_reads(1.0));
+  const auto r = (*Simulation::create(g)).step(0s, 100ms);
+  REQUIRE(r.nodes[*g.index_of("db")].demand_per_s == 0.0);
+  const auto& web = r.nodes[*g.index_of("web")].latency;
+  const auto& cache = r.nodes[*g.index_of("cache")].latency;
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(web.mean_s + cache.mean_s, 1e-9));
+}
+
+// The Che approximation (a hit ratio computed from the cache size, the key popularity and the
+// eviction policy) and the write_back strategy (acknowledge a write from the cache, flush it
+// to the store later: a queue of dirty entries) need machinery phase 2b brings. The graph builds,
+// so explain can print the scenario; running it is refused, naming the phase and the culprit.
+TEST_CASE("che hit ratios and write_back are refused until phase 2b", "[theory]") {
+  SECTION("a che hit ratio") {
+    auto s = cached_reads(0.8);
+    s.nodes[2].hit_ratio = HitRatio{.fixed = std::nullopt, .che = true};
+    const auto g = Graph::build(s);
+    REQUIRE(g.has_value());
+    const auto sim = Simulation::create(*g);
+    REQUIRE_FALSE(sim.has_value());
+    REQUIRE(sim.error().message.contains("phase 2b"));
+    REQUIRE(sim.error().message.contains("node 'cache'"));
+    REQUIRE(sim.error().message.contains("che"));
+  }
+  SECTION("the write_back strategy") {
+    auto s = cached_reads(0.8);
+    s.nodes[2].strategy = CacheStrategy::write_back;
+    s.nodes[2].backend = "db";
+    s.links.push_back(LinkSpec{.from = "cache", .to = "db", .latency = 0s});
+    const auto g = Graph::build(s);
+    INFO((g ? "" : g.error().message));
+    REQUIRE(g.has_value());
+    const auto sim = Simulation::create(*g);
+    REQUIRE_FALSE(sim.has_value());
+    REQUIRE(sim.error().message.contains("phase 2b"));
+    REQUIRE(sim.error().message.contains("node 'cache'"));
+    REQUIRE(sim.error().message.contains("write_back"));
+  }
 }
