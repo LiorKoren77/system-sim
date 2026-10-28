@@ -283,6 +283,14 @@ struct HitRatio {
 // `write`. Every other op is a read.
 inline constexpr std::string_view default_write_op = "write";
 
+// The ops a SQL database sends to its primary when the scenario gives no `write_ops` (plan 2b
+// refinement 3): the three SQL statements that change rows, plus the generic `write` the other
+// node types use. Every other op (select, read, get, ...) is a read a replica may answer.
+// Sorted, so the loader's default and the graph's (for a database built in code, see
+// graph::Graph::resolve_nodes) are the same list.
+inline constexpr std::array<std::string_view, 4> default_sql_write_ops{"delete", "insert", "update",
+                                                                       "write"};
+
 // The window a windowed limiter counts over when the scenario gives none. Chosen: the
 // book's ch. 4 examples are all "N requests per second", i.e. a one-second window.
 inline constexpr SimTime default_limiter_window = 1_s;
@@ -419,6 +427,17 @@ struct NodeSpec {
   std::optional<std::int64_t> keys{};
   std::optional<std::string> eviction{};
   std::optional<SimTime> ttl{};
+  // SQL databases only (plan 2b refinement 3; declared after the cache keys, for designated
+  // initializers). `replicas` is the primary plus `replicas - 1` read replicas (book ch. 1,
+  // "database replication"); `shards` splits the data over that many such sets (ch. 1,
+  // "sharding"; absent: one); `pool` is the connection pool, the requests each copy serves at
+  // once (sugar for advanced.concurrency; absent: the implied concurrency); `replication_lag`
+  // how far behind the primary a replica applies a write (absent: none). The loader leaves an
+  // absent one absent, so explain can tell stated from default. `write_ops` (above) says which
+  // ops go to the primary; a database's default is default_sql_write_ops.
+  std::optional<int> shards{};
+  std::optional<int> pool{};
+  std::optional<SimTime> replication_lag{};
   std::optional<Workload> workload{};  // clients only
 };
 

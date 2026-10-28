@@ -578,6 +578,43 @@ namespace {
   return spec.type == model::NodeType::cache;
 }
 
+// Graph::build also takes databases written in code: their `shards`, `pool` and
+// `replication_lag` obey the loader's rules (config's read_sql_keys), with its messages.
+[[nodiscard]] std::optional<EngineError> invalid_database(const model::NodeSpec& spec) {
+  const std::string name = "node '" + spec.id + "': ";
+  if (spec.shards && *spec.shards < 1)
+    return EngineError{name + "shards must be a positive integer"};
+  if (spec.pool && *spec.pool < 1) return EngineError{name + "pool must be a positive integer"};
+  if (spec.pool && *spec.pool > defaults::max_concurrency) {
+    return EngineError{name + "pool must be at most " + std::to_string(defaults::max_concurrency)};
+  }
+  if (spec.pool && spec.advanced.concurrency) {
+    return EngineError{name + "pool and advanced.concurrency are the same setting"};
+  }
+  if (spec.replication_lag && spec.replication_lag->count() < 0) {
+    return EngineError{name + "replication_lag must not be negative"};
+  }
+  return std::nullopt;
+}
+
+// What a database's own keys do to its resolved numbers (plan 2b refinement 3):
+//  - `pool` is the concurrency of every copy's queue, primary and replicas alike (the
+//    connection pool: how many queries one copy runs at once), in place of the c that
+//    Little's law implies from capacity × service time (defaults::implied_concurrency). The
+//    service rate stays `capacity`: a pool lets more queries wait in service at once, it
+//    does not make the disk faster.
+//  - `write_ops` left at model::NodeSpec's default (the cache's single `write`) means the
+//    database's own default, default_sql_write_ops. The loader writes that list itself, so
+//    this only reaches databases built in code; the price is that a scenario that writes
+//    `write_ops: [write]` on a database gets insert, update and delete as writes too.
+void apply_database_keys(ResolvedNode& node) {
+  if (node.spec.pool) node.capacity.concurrency = *node.spec.pool;
+  if (node.spec.write_ops == std::vector<std::string>{std::string{model::default_write_op}}) {
+    node.spec.write_ops.assign(model::default_sql_write_ops.begin(),
+                               model::default_sql_write_ops.end());
+  }
+}
+
 // The node types whose answer an `on: miss` step can follow: they hit or miss.
 [[nodiscard]] bool hits_or_misses(model::NodeType type) {
   return type == model::NodeType::cache || type == model::NodeType::cdn;
@@ -1424,6 +1461,9 @@ Graph::Result Graph::resolve_nodes() {
     if (is_cache(spec)) {
       if (auto invalid = invalid_cache(spec)) return std::unexpected{std::move(*invalid)};
     }
+    if (spec.type == model::NodeType::sql_db) {
+      if (auto invalid = invalid_database(spec)) return std::unexpected{std::move(*invalid)};
+    }
     ResolvedNode node{
         .spec = spec,
         .capacity = defaults::resolve_capacity(spec),
@@ -1436,6 +1476,7 @@ Graph::Result Graph::resolve_nodes() {
       node.service_rate_source = defaults::Source::scenario;
       node.service_time_source = defaults::Source::scenario;
     }
+    if (spec.type == model::NodeType::sql_db) apply_database_keys(node);
     nodes_.push_back(std::move(node));
   }
   routes_.resize(nodes_.size());

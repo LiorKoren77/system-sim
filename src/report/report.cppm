@@ -45,6 +45,10 @@ struct NodeSummary {
   double total_rejected{};
   double red_time_s{};  // seconds spent in the red zone
   bool unavailable{};   // the node's latency was infinite in some observed step
+  // A SQL database's staleness (engine::NodeSample::staleness_s: replication lag + the
+  // primary's write sojourn), time-averaged over the observed steps; infinite when the primary
+  // never answered in one of them; empty for every node that keeps no lagging copies.
+  std::optional<double> mean_staleness_s{};
 };
 
 // One (client, op) over the observed part of a run. Percentiles are a lognormal fit to
@@ -123,6 +127,8 @@ class Summary {
     double rejected{};  // Σ rejected_per_s·dt
     double red_time_s{};
     bool unavailable{};
+    double staleness_time{};    // Σ staleness_s·dt over the steps that report one
+    double staleness_seen_s{};  // Σ dt over those steps: 0 for a node with no staleness
     void add(const engine::NodeSample& sample, double dt_s);
     [[nodiscard]] double drop_rate() const;
     [[nodiscard]] double reject_rate() const;

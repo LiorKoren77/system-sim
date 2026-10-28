@@ -105,7 +105,7 @@ constexpr std::array<OwnKeys, model::node_type_names.size()> own_keys_by_type{{
     {model::NodeType::rate_limiter, "algorithm limit burst window backend"},
     {model::NodeType::service, "ops cost"},
     {model::NodeType::cache, "eviction strategy keys hit_ratio backend ttl then cost write_ops"},
-    {model::NodeType::sql_db, "replication_lag shards pool"},
+    {model::NodeType::sql_db, "replication_lag shards pool write_ops"},
     {model::NodeType::kv_cluster, "nodes vnodes replication write_quorum read_quorum mode"},
     {model::NodeType::message_queue, "partitions retention"},
     {model::NodeType::worker_pool, "consumes workers cost then"},
@@ -2224,6 +2224,55 @@ CheckResult read_cache_keys(const Site& site, const YAML::Node& body, model::Nod
       .and_then([&] { return read_cache_ttl(this_node, body, node); });
 }
 
+// ---- SQL database keys (plan 2b refinement 3) ----
+
+// `shards: 4`: how many independent primary + replicas sets the data is split over.
+CheckResult read_shards(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (!body["shards"]) return {};
+  if (auto checked = check_not_null(site, body, "shards", "shards"); !checked) return checked;
+  return read_positive_int(site, body["shards"], "shards").transform(store_in(node.shards));
+}
+
+// `pool: 32`: the connection pool, i.e. how many queries one copy (the primary or a replica)
+// runs at once: the c of its M/M/c queue. It is advanced.concurrency under the name a database
+// administrator uses, so it has the same bound (defaults::max_concurrency), and stating both is
+// refused: two numbers for one setting would contradict each other sooner or later.
+CheckResult read_pool(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  const auto value = body["pool"];
+  if (!value) return {};
+  if (auto checked = check_not_null(site, body, "pool", "pool"); !checked) return checked;
+  auto connections = read_positive_int(site, value, "pool");
+  if (!connections) return std::unexpected(connections.error());
+  if (*connections > defaults::max_concurrency) {
+    return site.fail(value, std::format("pool must be at most {}", defaults::max_concurrency));
+  }
+  if (node.advanced.concurrency) {
+    return site.fail(value, "pool and advanced.concurrency are the same setting");
+  }
+  node.pool = *connections;
+  return {};
+}
+
+// A database's write ops: the scenario's list (read_write_ops), else default_sql_write_ops.
+CheckResult read_sql_write_ops(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (body["write_ops"]) return read_write_ops(site, body, node);
+  node.write_ops.assign(model::default_sql_write_ops.begin(), model::default_sql_write_ops.end());
+  return {};
+}
+
+// `replication_lag: 50ms`: a constant, any non-negative duration (the parser refuses a negative
+// one). Zero is a synchronous replica.
+CheckResult read_sql_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (node.type != model::NodeType::sql_db) return {};
+  const auto this_node = node_site(site, node.id);
+  return read_shards(this_node, body, node)
+      .and_then([&] { return read_pool(this_node, body, node); })
+      .and_then([&] {
+        return read_optional_duration(this_node, body, "replication_lag", node.replication_lag);
+      })
+      .and_then([&] { return read_sql_write_ops(this_node, body, node); });
+}
+
 // A CDN (ch. 1: a cache at the network's edge) may state its hit ratio in the cache's own
 // grammar, `{fixed: h}` or `che`; a service's `on: miss` step after it uses the number
 // (graph::Graph::hit_ratio). Optional: a CDN without one counts as missing every time.
@@ -2276,6 +2325,7 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
     }
     if (auto read = read_limiter_keys(site, entry.second, *node, declared); !read) return read;
     if (auto read = read_cache_keys(site, entry.second, *node); !read) return read;
+    if (auto read = read_sql_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_cdn_keys(site, entry.second, *node); !read) return read;
     ++node;
   }

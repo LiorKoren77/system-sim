@@ -1112,13 +1112,14 @@ Scenario then_front(double hit, std::string target, std::vector<Step> then) {
   cache.then = std::move(then);
   NodeSpec target_node{.id = target, .type = NodeType::service};
   if (target == "lb") {
-    target_node = NodeSpec{.id = "lb", .type = NodeType::load_balancer, .policy = LbPolicy::round_robin};
+    target_node =
+        NodeSpec{.id = "lb", .type = NodeType::load_balancer, .policy = LbPolicy::round_robin};
   }
-  s.nodes = {NodeSpec{.id = "u",
-                      .type = NodeType::client,
-                      .workload = Workload{.curve = {.base = Rate{100}},
-                                           .op_shares = {{"suggest", 1.0}}}},
-             std::move(cache), std::move(target_node)};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"suggest", 1.0}}}},
+      std::move(cache), std::move(target_node)};
   s.links = {LinkSpec{.from = "u", .to = "cache", .latency = 0s},
              LinkSpec{.from = "cache", .to = target, .latency = 1ms}};
   if (target == "lb") {
@@ -1215,9 +1216,8 @@ TEST_CASE("a write_back cache serves writes itself and flushes them asynchronous
   REQUIRE_THAT(to_db.total().per_second, WithinRel(50.0, 1e-12));
 
   const LatencyEstimate own{0.001, 4e-8};
-  const auto r = cache.response("write", own, [](std::size_t, std::string_view) {
-    return LatencyEstimate{1.0, 0.0};
-  });
+  const auto r = cache.response(
+      "write", own, [](std::size_t, std::string_view) { return LatencyEstimate{1.0, 0.0}; });
   REQUIRE(r == own);
   const double delivered =
       cache.delivered("write", 1.0, [](std::size_t, std::string_view) { return 0.0; });

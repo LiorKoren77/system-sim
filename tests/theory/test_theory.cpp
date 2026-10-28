@@ -243,12 +243,12 @@ TEST_CASE("dropped flow does not propagate downstream", "[theory]") {
 
 TEST_CASE("a simulation refuses node types the phase does not support yet", "[theory]") {
   Scenario s = mm1(1);
-  s.nodes[1].type = NodeType::sql_db;
+  s.nodes[1].type = NodeType::kv_cluster;
   const auto g = *simsys::graph::Graph::build(s);
   const auto sim = Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
-          "node 's' has type 'sql_db', which run/estimate do not support yet (phase 2)");
+          "node 's' has type 'kv_cluster', which run/estimate do not support yet (phase 2)");
 }
 
 TEST_CASE("run emits one record per step from 0 to duration, exclusive", "[theory]") {
