@@ -3473,9 +3473,34 @@ TEST_CASE("sizes may not name an op the client does not send") {
                    "node 'u': sizes names op 'x', which the client does not send");
 }
 
-TEST_CASE("a size without a unit is refused and the message shows the grammar") {
+TEST_CASE("a size without a unit is refused and the message shows the grammar and the reason") {
   require_rejected("simsys_sizes_no_unit.yaml", client_with_sizes("{stream: 50}"),
-                   "node 'u': sizes 'stream' must be a size (B, KB, MB or GB: 50MB)");
+                   "node 'u': sizes 'stream' must be a size (B, KB, MB or GB: 50MB): missing "
+                   "size unit");
+}
+
+// The grammar alone would not say what is wrong with a size that has a unit: the parser's
+// reason follows it.
+TEST_CASE("a size above 1e15 bytes or below zero is refused with the parser's reason") {
+  SECTION("above the ceiling") {
+    require_rejected("simsys_sizes_too_big.yaml", client_with_sizes("{stream: 2e15B}"),
+                     "node 'u': sizes 'stream' must be a size (B, KB, MB or GB: 50MB): size must "
+                     "be at most 1e15B");
+  }
+  SECTION("negative") {
+    require_rejected("simsys_sizes_negative.yaml", client_with_sizes("{stream: -1MB}"),
+                     "node 'u': sizes 'stream' must be a size (B, KB, MB or GB: 50MB): expected "
+                     "a non-negative finite number");
+  }
+}
+
+// `0B` is a size (parse_size reads it), but no request: a byte-sized node charges a request its
+// megabytes, and a 0-byte request would cost nothing, so it could be served infinitely fast.
+TEST_CASE("a request size of zero bytes is refused on a client and on a step") {
+  require_rejected("simsys_sizes_zero.yaml", client_with_sizes("{stream: 0B}"),
+                   "node 'u': sizes 'stream' must be positive");
+  require_rejected("simsys_step_size_zero.yaml", step_with("op: write, size: 0B"),
+                   "node 'a': step size must be positive");
 }
 
 TEST_CASE("a step's size is typed into the step in bytes") {
@@ -3499,7 +3524,8 @@ TEST_CASE("a step that states no size has none") {
 
 TEST_CASE("a step's size that is not a size is refused with the same grammar") {
   require_rejected("simsys_step_size_word.yaml", step_with("op: write, size: fast"),
-                   "node 'a': step size must be a size (B, KB, MB or GB: 50MB)");
+                   "node 'a': step size must be a size (B, KB, MB or GB: 50MB): expected a "
+                   "number");
 }
 
 TEST_CASE("a link's bandwidth in bits is typed into the link as bytes per second") {
@@ -3531,6 +3557,14 @@ TEST_CASE("a link's bandwidth must be positive") {
   // A pipe of zero capacity can carry nothing: the message says what is wrong, not "invalid".
   require_rejected("simsys_link_bandwidth_zero.yaml", link_with("bandwidth: 0B/s"),
                    "link a -> b: bandwidth must be positive");
+}
+
+// The same ceiling as a byte capacity: 1e15 B/s, a million GB/s, far above any network.
+TEST_CASE("a link's bandwidth above 1e15 bytes per second is refused") {
+  require_rejected("simsys_link_bandwidth_too_big.yaml", link_with("bandwidth: 2e15B/s"),
+                   "link a -> b: bandwidth must be at most 1e15B/s");
+  require_rejected("simsys_link_bandwidth_bits_too_big.yaml", link_with("bandwidth: 1e16bit/s"),
+                   "link a -> b: bandwidth must be at most 1e15B/s");  // 1e16 / 8 = 1.25e15 B/s
 }
 
 TEST_CASE("a link's bandwidth that is a request rate is refused and the message shows byte forms") {
@@ -3581,4 +3615,42 @@ links:
   // 1 Gbit/s / 8 = 1.25e8 B/s.
   CHECK_THAT(s->links[0].bandwidth->bytes_per_second, Catch::Matchers::WithinRel(1.25e8, 1e-12));
   CHECK_FALSE(s->links[1].bandwidth.has_value());
+}
+
+// ---- Byte capacities: in bits too, and only where bytes are served (plan 2c fix round) ----
+
+// A network is rated in bits, and a storage tier's throughput sometimes is too: `40Gbit/s` is a
+// byte capacity of 40e9 / 8 = 5e9 B/s, read by the same parser as a link's bandwidth.
+TEST_CASE("a byte capacity may be written in bits") {
+  const auto path = write_temp("simsys_byte_capacity_bits.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  b: {type: blob_store, capacity: 40Gbit/s}
+links: []
+)");
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  CHECK_FALSE(s->nodes[0].capacity.has_value());
+  REQUIRE(s->nodes[0].byte_capacity.has_value());
+  CHECK_THAT(s->nodes[0].byte_capacity->bytes_per_second, Catch::Matchers::WithinRel(5e9, 1e-12));
+}
+
+// Only a CDN and a blob store serve bytes (plan 2c refinement 2): on any other type a byte rate
+// would have to be read as some number of requests, which no author means, so it is refused.
+TEST_CASE("a byte capacity is refused on a type that counts requests") {
+  require_rejected("simsys_byte_capacity_service.yaml",
+                   scenario_with("  svc: {type: service, capacity: 1GB/s}\n"),
+                   "node 'svc': a service counts requests; a byte capacity belongs on a cdn or "
+                   "blob_store");
+  require_rejected("simsys_byte_capacity_bits_service.yaml",
+                   scenario_with("  svc: {type: service, capacity: 8Gbit/s}\n"),
+                   "node 'svc': a service counts requests; a byte capacity belongs on a cdn or "
+                   "blob_store");
+  require_rejected("simsys_byte_capacity_sink.yaml",
+                   scenario_with("  api: {type: external_sink, capacity: 1GB/s}\n"),
+                   "node 'api': an external_sink counts requests; a byte capacity belongs on a "
+                   "cdn or blob_store");
 }
