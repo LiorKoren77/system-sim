@@ -10,6 +10,8 @@
 
 ## What the model captures
 - Bytes, not just requests: 50 MB streams and 300 MB uploads against GB/s capacities.
+  An upload is split into `upload` (the bytes, straight to `original_store`) and `upload_meta`
+  (the presigned-URL request and metadata write, through the API).
 - Two regions with a cross-DC origin fetch (150 ms) for European misses.
 - Transcoding as a long-running worker pool (60 s per video, 400 workers → 6.7 videos/s
   ceiling) and the backlog it builds during the evening upload peak.

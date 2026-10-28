@@ -17,5 +17,3 @@
 
 ## Things to try
 - Swap the weights to route to `snowflake`: the SLO passes with p99 ≈ link latency.
-- `ticket_server.replicas: 2` (multi-master, step 2): capacity doubles, but note the book's
-  warning about scaling with datacenters.

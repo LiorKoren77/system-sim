@@ -16,8 +16,8 @@ nodes:
     rate:
       base: 3k/s
       wave: {shape: diurnal, period: 24h, amplitude: 0.7, peak_at: 11:00}   # office hours
-    ops: {download: 0.70, upload: 0.08, metadata: 0.20, sync_poll: 0.02}
-    sizes: {download: 500KB, upload: 500KB, metadata: 1KB}
+    ops: {download: 0.70, upload: 0.06, upload_meta: 0.06, metadata: 0.16, sync_poll: 0.02}
+    sizes: {download: 500KB, upload: 500KB, upload_meta: 1KB, metadata: 1KB}
     keys: {zipf: 0.8, space: 500M}
     timeout: 30s
 
@@ -32,14 +32,14 @@ nodes:
       metadata:
         - {to: metadata_cache, op: read}
         - {to: metadata_db, op: read, on: miss}
-      upload:
+      upload_meta:
         - {to: metadata_db, op: write}
         - {to: notify_q, op: publish}
       download:
         - {to: metadata_cache, op: read}
         - {to: block_servers, op: fetch}
       sync_poll:
-        - {to: notification_svc, op: poll}
+        - {to: long_poll, op: poll}
 
   block_servers:                               # chunk, compress, encrypt, dedup
     type: service
@@ -81,7 +81,7 @@ nodes:
     then: [{to: cold_storage, op: write}]
 
 links:
-  - {from: clients, to: lb, dir: inout}
+  - {from: clients, to: lb, dir: inout, ops: [download, upload_meta, metadata, sync_poll]}
   - {from: lb, to: api, dir: inout}
   - {from: api, to: metadata_cache, dir: inout}
   - {from: api, to: metadata_db, dir: inout}
@@ -94,7 +94,7 @@ links:
   - {from: notification_svc, to: long_poll}
   - {from: long_poll, to: clients}
   - {from: backup_workers, to: cold_storage}
-  - {from: api, to: notification_svc, dir: inout, ops: [sync_poll]}
+  - {from: api, to: long_poll, dir: inout, ops: [sync_poll]}
 
 slo:
   - {metric: p99_latency, node: clients, op: download, max: 2s}

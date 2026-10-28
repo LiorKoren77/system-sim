@@ -12,8 +12,9 @@
   client waits for the second-fastest replica (order statistic of replica latencies).
 - Per-node capacity × 8 nodes vs 30k/s × (0.7 + 0.3×3) replica operations.
 - Node failure at 10 m: its share moves to neighbours (hinted handoff keeps writes flowing).
-- Partition at 20 m: in `ap` mode the minority keeps serving (stale fraction rises); in `cp`
-  mode requests that cannot reach a quorum are rejected (unavailable fraction rises).
+- Partition at 20 m, a partition splitting the cluster in half: in `ap` mode the minority keeps
+  serving (stale fraction rises); in `cp` mode requests that cannot reach a quorum are rejected
+  (unavailable fraction rises).
 
 ## What it abstracts away
 - Vector-clock semantics and conflict resolution, Merkle-tree anti-entropy, SSTable compaction,

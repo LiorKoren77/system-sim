@@ -36,8 +36,7 @@ nodes:
     latency: 0.5ms
     ops:
       suggest:
-        - {to: trie_cache, op: read}
-        - {to: trie_db, op: read, on: miss}
+        - {to: trie_cache, op: read}               # read_through: the cache forwards misses to trie_db itself
       search:
         - {to: query_log_q, op: publish}
 
@@ -68,7 +67,7 @@ nodes:
   aggregated_store: {type: blob_store, capacity: 100MB/s}
 
 links:
-  - {from: users, to: browser_cache, dir: inout}
+  - {from: users, to: browser_cache, dir: inout, ops: [suggest]}
   - {from: browser_cache, to: lb, dir: inout}
   - {from: users, to: lb, dir: inout, ops: [search]}
   - {from: lb, to: api, dir: inout}
