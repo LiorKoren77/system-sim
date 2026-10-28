@@ -36,6 +36,7 @@ target_sources(simsys
     src/queueing/queueing.cppm
     src/flow/flow.cppm
     src/fluid/fluid.cppm
+    src/workload/workload.cppm
     src/model/model.cppm
     src/defaults/defaults.cppm
     src/engine/graph.cppm
