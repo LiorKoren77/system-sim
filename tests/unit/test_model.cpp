@@ -135,3 +135,43 @@ TEST_CASE("write_ops absent is the type's default and present is exactly what wa
   cache.write_ops = std::vector<std::string>{"set", "delete"};
   REQUIRE(write_ops_of(cache) == std::vector<std::string>{"set", "delete"});
 }
+
+// ---- ID generator (plan 2b refinement 6; book ch. 7 "Design a unique ID generator") ----
+//
+// The three designs the chapter compares are a closed set, spelled in scenario files as
+// `algorithm: snowflake | ticket_server | uuid`; one name table drives both directions, exactly
+// as for the rate limiter's algorithms.
+
+// static_assert: proven while compiling, so a table with a missing, duplicated or misordered row
+// never builds; the last row pins "the table is complete", since nothing can count an enum's
+// enumerators.
+TEST_CASE("the id algorithm table round-trips and ends at its last enumerator", "[model]") {
+  static_assert(simsys::core::round_trips(simsys::model::id_algorithm_table));
+  static_assert(simsys::model::id_algorithm_table.back().value == simsys::model::IdAlgorithm::uuid);
+  SUCCEED();
+}
+
+TEST_CASE("every id algorithm name parses to its enumerator and prints back unchanged", "[model]") {
+  using simsys::model::IdAlgorithm;
+  using simsys::model::parse_id_algorithm;
+  using simsys::model::to_string;
+  REQUIRE(parse_id_algorithm("snowflake") == IdAlgorithm::snowflake);
+  REQUIRE(parse_id_algorithm("ticket_server") == IdAlgorithm::ticket_server);
+  REQUIRE(parse_id_algorithm("uuid") == IdAlgorithm::uuid);
+  REQUIRE(to_string(IdAlgorithm::snowflake) == "snowflake");
+  REQUIRE(to_string(IdAlgorithm::ticket_server) == "ticket_server");
+  REQUIRE(to_string(IdAlgorithm::uuid) == "uuid");
+}
+
+TEST_CASE("parse_id_algorithm rejects names the chapter does not compare", "[model]") {
+  // "multi_master" is a real ch. 7 design, but the model has no behaviour for it; "UUID" is the
+  // right idea spelled in a case the scenario grammar (all lower case) does not accept.
+  REQUIRE_FALSE(simsys::model::parse_id_algorithm("multi_master").has_value());
+  REQUIRE_FALSE(simsys::model::parse_id_algorithm("UUID").has_value());
+  REQUIRE_FALSE(simsys::model::parse_id_algorithm("").has_value());
+}
+
+TEST_CASE("a default NodeSpec has no id algorithm", "[model]") {
+  const simsys::model::NodeSpec n{.id = "x", .type = NodeType::id_generator};
+  REQUIRE_FALSE(n.id_algorithm.has_value());
+}

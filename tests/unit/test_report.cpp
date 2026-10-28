@@ -1329,3 +1329,86 @@ TEST_CASE("a cdn without a hit ratio is explained as h = 0, not as unknown", "[r
   REQUIRE(origin.contains("peak offered 1k/s"));
   REQUIRE_FALSE(origin.contains("unknown"));
 }
+
+// ---- ID generator as service sugar (plan 2b refinement 6; book ch. 7) ----
+//
+// explain prints the algorithm and what it stands for, so a student sees WHY the node has the
+// capacity it has: a snowflake's 12 sequence bits, a ticket server's single database.
+
+namespace {
+// u (10/s of `next_id`) -> ids: an id_generator of the given algorithm, with the numbers the
+// scenario states, if any.
+Scenario id_reported(simsys::model::IdAlgorithm algorithm, int replicas = 1,
+                     std::optional<Rate> capacity = {}) {
+  Scenario s{.name = "id-report", .version = 1, .duration = 1min};
+  NodeSpec ids{
+      .id = "ids", .type = NodeType::id_generator, .replicas = replicas, .capacity = capacity};
+  ids.id_algorithm = algorithm;
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{10}}, .op_shares = {{"next_id", 1.0}}}},
+      std::move(ids)};
+  s.links = {LinkSpec{.from = "u", .to = "ids", .dir = simsys::model::Direction::inout}};
+  return s;
+}
+
+// The node line of explain's nodes block: the line that starts, after its indent, with `id`
+// and a space.
+std::string node_line(const std::string& text, const std::string& id) {
+  const auto at = text.find("\n  " + id + " ", text.find("nodes:"));
+  if (at == std::string::npos) return {};
+  return text.substr(at + 1, text.find('\n', at + 1) - at - 1);
+}
+}  // namespace
+
+TEST_CASE("explain says what a snowflake generator stands for", "[report]") {
+  const auto text = explain_of(id_reported(simsys::model::IdAlgorithm::snowflake));
+  CAPTURE(text);
+  const auto line = node_line(text, "ids");
+  REQUIRE(line.contains("algorithm=snowflake (4.096M/s per replica by design)"));
+  REQUIRE(line.contains("capacity=4.096M/s"));
+  REQUIRE(line.contains("service_time=10us"));
+  // The algorithm supplied these numbers, the scenario did not.
+  REQUIRE_FALSE(line.contains("capacity=4.096M/s (scenario)"));
+  REQUIRE_FALSE(line.contains("service_time=10us (scenario)"));
+}
+
+TEST_CASE("explain says a ticket server is one database doing 1k writes a second", "[report]") {
+  const auto text = explain_of(id_reported(simsys::model::IdAlgorithm::ticket_server));
+  CAPTURE(text);
+  const auto line = node_line(text, "ids");
+  REQUIRE(line.contains("algorithm=ticket_server (one database: 1k/s, spec §6 writes)"));
+  REQUIRE(line.contains("capacity=1k/s"));
+  REQUIRE(line.contains("service_time=1ms"));
+}
+
+TEST_CASE("explain says a uuid generator is unbounded in practice", "[report]") {
+  const auto text = explain_of(id_reported(simsys::model::IdAlgorithm::uuid));
+  CAPTURE(text);
+  const auto line = node_line(text, "ids");
+  REQUIRE(line.contains("algorithm=uuid (unbounded: 1G/s)"));
+  REQUIRE(line.contains("capacity=1G/s"));
+  REQUIRE(line.contains("service_time=1us"));
+}
+
+TEST_CASE("explain tags a capacity the scenario stated on an id generator as scenario",
+          "[report]") {
+  const auto text =
+      explain_of(id_reported(simsys::model::IdAlgorithm::ticket_server, 1, Rate{8000}));
+  CAPTURE(text);
+  const auto line = node_line(text, "ids");
+  REQUIRE(line.contains("algorithm=ticket_server"));
+  REQUIRE(line.contains("capacity=8k/s (scenario)"));
+  // The service time was not stated: the algorithm's 1 ms stands, untagged as the scenario's.
+  REQUIRE(line.contains("service_time=1ms"));
+  REQUIRE_FALSE(line.contains("service_time=1ms (scenario)"));
+}
+
+// The paper load is checked against the node's total: 3 snowflake machines x 4.096M/s =
+// 12.288M/s, printed with four significant digits.
+TEST_CASE("explain checks an id generator against its replicas' total capacity", "[report]") {
+  const auto text = explain_of(id_reported(simsys::model::IdAlgorithm::snowflake, 3));
+  CAPTURE(text);
+  REQUIRE(check_line(text, "ids").contains("peak offered 10/s vs 12.29M/s total capacity"));
+}

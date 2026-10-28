@@ -3288,3 +3288,82 @@ TEST_CASE("a cdn states its size in keys for a che hit ratio") {
   REQUIRE(s.nodes[1].keys == 100'000);
   REQUIRE(s.nodes[1].ttl == std::chrono::hours{24});  // read as a cache's ttl, not modelled
 }
+
+// ---- ID generator (plan 2b refinement 6; book ch. 7 "Design a unique ID generator") ----
+//
+// `algorithm:` picks one of the three designs the chapter compares. Until now the loader
+// accepted the key on an id_generator and dropped it; it is now typed, and required, because
+// the algorithm decides the node's capacity (Graph::build) and a generator without one would
+// silently run on a made-up default.
+
+TEST_CASE("an id generator's algorithm loads as its enumerator") {
+  using simsys::model::IdAlgorithm;
+  const std::pair<std::string_view, IdAlgorithm> names[] = {
+      {"snowflake", IdAlgorithm::snowflake},
+      {"ticket_server", IdAlgorithm::ticket_server},
+      {"uuid", IdAlgorithm::uuid}};
+  for (const auto& [name, algorithm] : names) {
+    CAPTURE(name);
+    const auto path = write_temp(
+        "simsys_id_algorithm.yaml",
+        scenario_with("  ids: {type: id_generator, algorithm: " + std::string{name} + "}\n"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    REQUIRE(s->nodes[0].type == simsys::model::NodeType::id_generator);
+    REQUIRE(s->nodes[0].id_algorithm == algorithm);
+  }
+}
+
+// The generator's own numbers stay optional and are read as on a service: only the algorithm is
+// required, and a scenario that states a capacity keeps it (Graph::build lets it win).
+TEST_CASE("an id generator keeps the capacity, latency and replicas the scenario states") {
+  const auto path =
+      write_temp("simsys_id_numbers.yaml",
+                 scenario_with("  ids: {type: id_generator, algorithm: snowflake, replicas: 4, "
+                               "capacity: 4M/s, latency: 10us}\n"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->nodes[0].replicas == 4);
+  REQUIRE(s->nodes[0].capacity == simsys::Rate{4e6});
+  REQUIRE(s->nodes[0].latency == 10us);
+}
+
+// The message names the three words, as the limiter's does, so the fix is in the error.
+TEST_CASE("an id generator without a known algorithm is refused") {
+  const std::string message =
+      "node 'ids': id_generator needs algorithm: snowflake, ticket_server or uuid";
+  SECTION("no algorithm key") {
+    require_rejected("simsys_id_no_algorithm.yaml", scenario_with("  ids: {type: id_generator}\n"),
+                     message);
+  }
+  SECTION("an unknown algorithm") {
+    require_rejected("simsys_id_magic.yaml",
+                     scenario_with("  ids: {type: id_generator, algorithm: magic}\n"), message);
+  }
+  SECTION("a design of the chapter the model does not have") {
+    require_rejected("simsys_id_multi_master.yaml",
+                     scenario_with("  ids: {type: id_generator, algorithm: multi_master}\n"),
+                     message);
+  }
+}
+
+// `algorithm` on the other types is unchanged by this feature: a rate limiter has its own
+// (the case "a rate limiter's algorithm, limit, burst, window and backend are typed and checked"
+// above), and every other type still refuses the key. An id algorithm's names are not a
+// limiter's: `snowflake` on a limiter is an unknown limiter algorithm.
+TEST_CASE("the algorithm key stays the limiter's on a rate limiter and invalid elsewhere") {
+  SECTION("a service") {
+    require_rejected("simsys_algorithm_service.yaml",
+                     scenario_with("  s: {type: service, algorithm: snowflake}\n"),
+                     "node 's': key 'algorithm' is not valid for type 'service'");
+  }
+  SECTION("a rate limiter does not take an id algorithm") {
+    require_rejected("simsys_limiter_snowflake.yaml",
+                     scenario_with("  limiter: {type: rate_limiter, algorithm: snowflake, "
+                                   "limit: 1k/s}\n"),
+                     "node 'limiter': algorithm must be token_bucket, leaky_bucket, "
+                     "fixed_window, sliding_log or sliding_counter");
+  }
+}
