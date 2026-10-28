@@ -42,8 +42,10 @@ target_sources(simsys
     src/engine/graph.cppm
     src/engine/behaviours.cppm
     src/engine/engine.cppm
+    src/report/report.cppm
   PRIVATE                               # module implementation units are ordinary sources
-    src/config/config.cpp)
+    src/config/config.cpp
+    src/report/report.cpp)
 target_link_libraries(simsys PUBLIC yaml-cpp::yaml-cpp PRIVATE simsys_warnings)
 
 # --- executable --------------------------------------------------------------
