@@ -490,3 +490,70 @@ TEST_CASE("noise never produces a negative demand", "[theory]") {
     REQUIRE(r.nodes[1].demand_per_s >= 0.0);
   });
 }
+
+TEST_CASE("an op with cost 3 consumes three times the capacity of a cost-1 op", "[theory]") {
+  Scenario s = mm1(300);            // 300 req/s of op `op`
+  s.nodes[1].cost = {{"op", 3.0}};  // = 900 units/s against 1000 units/s
+  const auto r = (*Simulation::create(*Graph::build(s))).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[1].rho, WithinRel(0.9, 1e-12));
+  REQUIRE_THAT(r.nodes[1].demand_per_s, WithinRel(900.0, 1e-12));  // demand is in capacity units
+}
+
+TEST_CASE("costs do not change the number of requests forwarded", "[theory]") {
+  // c -> a (cost 2 on op) -> b: b still receives one request per request a drained.
+  Scenario s{.name = "cost", .version = 1, .duration = 1s};
+  s.nodes = {NodeSpec{.id = "c",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{300}}, .op_shares = {{"op", 1.0}}}},
+             NodeSpec{.id = "a",
+                      .type = NodeType::service,
+                      .capacity = Rate{1000},
+                      .latency = 1ms,
+                      .ops = {{"op", {Step{.to = "b", .op = "op"}}}},
+                      .cost = {{"op", 2.0}}},
+             NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{10000}, .latency = 100us}};
+  s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s},
+             LinkSpec{.from = "a", .to = "b", .latency = 0s}};
+  const auto r = (*Simulation::create(*Graph::build(s))).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[1].demand_per_s, WithinRel(600.0, 1e-12));  // units
+  REQUIRE_THAT(r.nodes[2].demand_per_s, WithinRel(300.0, 1e-12));  // requests (b's cost is 1)
+}
+
+TEST_CASE("an overloaded node with mixed costs drains units and forwards the right request mix",
+          "[theory]") {
+  // ops x (cost 1) and y (cost 4), 50/50 by rate, into a 1000 units/s node with queue 100:
+  // demand 500 + 2000 = 2500 units/s; drained 1000 units/s; the queue is well mixed in units,
+  // so the forwarded request mix equals the unit mix of the content: x:y units = 1:4.
+  Scenario s{.name = "mix", .version = 1, .duration = 1s};
+  s.nodes = {NodeSpec{.id = "c",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{1000}},
+                                           .op_shares = {{"x", 0.5}, {"y", 0.5}}}},
+             NodeSpec{.id = "a",
+                      .type = NodeType::service,
+                      .capacity = Rate{1000},
+                      .latency = 1ms,
+                      .advanced = {.queue_limit = 100},
+                      .ops = {{"x", {Step{.to = "b", .op = "x"}}}, {"y", {Step{.to = "b", .op = "y"}}}},
+                      .cost = {{"y", 4.0}}},
+             NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{100000}, .latency = 10us}};
+  s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s},
+             LinkSpec{.from = "a", .to = "b", .latency = 0s}};
+  auto sim = *Simulation::create(*Graph::build(s));
+  simsys::engine::StepRecord r;
+  for (int i = 0; i < 5; ++i) r = sim.step(i * 100ms, 100ms);
+  // b receives x and y requests in the ratio of their unit shares divided by cost:
+  // (200 units -> 200 req) : (800 units -> 200 req)
+  REQUIRE_THAT(r.nodes[2].demand_per_s, WithinRel(400.0, 1e-9));
+}
+
+TEST_CASE("estimate after a noisy run equals estimate before it", "[theory]") {
+  Scenario s = mm1(500);
+  s.nodes[0].workload->noise = simsys::workload::Noise{.sigma = 0.3, .correlation = 1s};
+  auto sim = *Simulation::create(*Graph::build(s));
+  const auto before = sim.estimate();
+  sim.run({.duration = 2s, .step = 100ms}, [](const auto&) {});
+  const auto after = sim.estimate();
+  REQUIRE(before.nodes[1].demand_per_s == after.nodes[1].demand_per_s);
+  REQUIRE(before.responses[0].response == after.responses[0].response);
+}

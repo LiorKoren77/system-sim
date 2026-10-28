@@ -319,3 +319,12 @@ TEST_CASE("client_seed separates seeds and clients", "[behaviours]") {
   REQUIRE(client_seed(1, 0) != client_seed(1, 1));
   REQUIRE(client_seed(1, 0) == client_seed(1, 0));
 }
+
+TEST_CASE("a service's cost per op comes from its spec and defaults to one", "[behaviours]") {
+  Scenario s = two_hop(StepMode::sequential);
+  s.nodes[1].cost = {{"get", 2.5}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const ServiceBehaviour web{g, *g.index_of("web")};
+  REQUIRE(web.cost("get") == 2.5);
+  REQUIRE(web.cost("put") == 1.0);
+}
