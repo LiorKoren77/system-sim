@@ -30,6 +30,7 @@ import simsys.workload;
 using namespace std::chrono_literals;
 using Catch::Matchers::WithinRel;
 using simsys::Rate;
+using simsys::behaviours::CacheBehaviour;
 using simsys::behaviours::ClientBehaviour;
 using simsys::behaviours::LoadBalancerBehaviour;
 using simsys::behaviours::Outgoing;
@@ -37,6 +38,8 @@ using simsys::behaviours::RateLimiterBehaviour;
 using simsys::behaviours::ServiceBehaviour;
 using simsys::flow::Flow;
 using simsys::flow::LatencyEstimate;
+using simsys::model::CacheStrategy;
+using simsys::model::HitRatio;
 using simsys::model::LbPolicy;
 using simsys::model::LimiterAlgorithm;
 using simsys::model::LinkSpec;
@@ -44,6 +47,7 @@ using simsys::model::NodeSpec;
 using simsys::model::NodeType;
 using simsys::model::Scenario;
 using simsys::model::Step;
+using simsys::model::StepCondition;
 using simsys::model::StepMode;
 using simsys::model::Workload;
 
@@ -134,6 +138,7 @@ static_assert(simsys::behaviours::NodeBehaviour<ServiceBehaviour>);
 static_assert(simsys::behaviours::RequestSource<ClientBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<LoadBalancerBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<RateLimiterBehaviour>);
+static_assert(simsys::behaviours::NodeBehaviour<CacheBehaviour>);
 
 // And the negative: a type that routes flow but cannot answer for its latency is not a
 // NodeBehaviour, so the engine refuses it at compile time instead of misbehaving at run time.
@@ -778,4 +783,270 @@ TEST_CASE("a load balancer's and a client's delivered fraction mix their routes 
   const ClientBehaviour users{g, *g.index_of("u")};
   REQUIRE_THAT(users.delivered("get", [](std::size_t, std::string_view) { return 0.4; }),
                WithinRel(0.4, 1e-12));
+}
+
+// ---- CacheBehaviour and the on-miss steps of a service (plan 2a refinement 7, Task 10) ----
+
+namespace {
+// u -> web -> cache (-> db). Node indices: u 0, web 1, cache 2, db 3 (only with a backend).
+// web forwards each of the ops read, write and set to the cache unchanged; the cache has the
+// given strategy and fixed hit ratio, and, with a backend, forwards to `db` over a link of
+// 1 ms one way. Links to and from web have zero latency.
+Scenario cached_front(CacheStrategy strategy, double hit, bool with_backend) {
+  Scenario s{.name = "cached", .version = 1, .duration = 1min};
+  NodeSpec cache{.id = "cache",
+                 .type = NodeType::cache,
+                 .hit_ratio = HitRatio{.fixed = hit},
+                 .strategy = strategy};
+  if (with_backend) cache.backend = "db";
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}},
+                                    .op_shares = {{"read", 0.6}, {"set", 0.2}, {"write", 0.2}}}},
+      NodeSpec{.id = "web",
+               .type = NodeType::service,
+               .ops = {{"read", {Step{.to = "cache", .op = "read"}}},
+                       {"set", {Step{.to = "cache", .op = "set"}}},
+                       {"write", {Step{.to = "cache", .op = "write"}}}}},
+      std::move(cache)};
+  s.links = {LinkSpec{.from = "u", .to = "web", .latency = 0s},
+             LinkSpec{.from = "web", .to = "cache", .latency = 0s}};
+  if (with_backend) {
+    s.nodes.push_back(NodeSpec{.id = "db", .type = NodeType::service});
+    s.links.push_back(LinkSpec{.from = "cache", .to = "db", .latency = 1ms});
+  }
+  return s;
+}
+// u -> web -> {cache, db} with web.get = [cache.read, db.read on miss]: the cache-aside read
+// path. The cache has the given fixed hit ratio; web -> cache is 0.5 ms one way, web -> db
+// 10 ms one way. Node indices: u 0, web 1, cache 2, db 3.
+Scenario aside_front(double hit) {
+  Scenario s{.name = "aside", .version = 1, .duration = 1min};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"get", 1.0}}}},
+      NodeSpec{.id = "web",
+               .type = NodeType::service,
+               .ops = {{"get",
+                        {Step{.to = "cache", .op = "read"},
+                         Step{.to = "db", .op = "read", .on = StepCondition::miss}}}}},
+      NodeSpec{.id = "cache",
+               .type = NodeType::cache,
+               .hit_ratio = HitRatio{.fixed = hit},
+               .strategy = CacheStrategy::cache_aside},
+      NodeSpec{.id = "db", .type = NodeType::service}};
+  s.links = {LinkSpec{.from = "u", .to = "web", .latency = 0s},
+             LinkSpec{.from = "web", .to = "cache", .latency = 500us},
+             LinkSpec{.from = "web", .to = "db", .latency = 10ms}};
+  return s;
+}
+// The flow a routed result sends to `target`, empty when it sends none.
+Flow sent_to(const simsys::behaviours::Routed& routed, std::size_t target) {
+  const auto it = std::ranges::find(routed.outgoing, target, &Outgoing::target);
+  return it == routed.outgoing.end() ? Flow{} : it->flow;
+}
+}  // namespace
+
+// Ch. 1 cache-aside ("lazy loading"): the application, not the cache, goes to the database on
+// a miss. So the cache node itself only ever answers: it serves every request it is sent and
+// forwards nothing; the misses are the service's business (the on-miss tests below).
+TEST_CASE("a cache_aside cache serves every read itself and forwards nothing", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(cached_front(CacheStrategy::cache_aside, 0.8, false));
+  CacheBehaviour cache{g, *g.index_of("cache")};
+  const auto routed = cache.route(flow_of("read", 100), 0s, 100ms);
+  REQUIRE(routed.outgoing.empty());
+  REQUIRE(routed.rejected.empty());
+  REQUIRE_THAT(routed.served.rate_of("read").per_second, WithinRel(100.0, 1e-12));
+  REQUIRE_THAT(routed.served.total().per_second, WithinRel(100.0, 1e-12));
+  // Its response is its own sojourn: whatever the lookup says about other nodes is ignored.
+  const LatencyEstimate own{0.0002, 3e-9};
+  const auto r = cache.response(
+      "read", own, [](std::size_t, std::string_view) { return LatencyEstimate{99.0, 99.0}; });
+  REQUIRE(r == own);
+  const double delivered =
+      cache.delivered("read", 0.9, [](std::size_t, std::string_view) { return 0.1; });
+  REQUIRE_THAT(delivered, WithinRel(0.9, 1e-12));
+}
+
+// Ch. 1 read-through: the cache itself fetches a missing value from the store and keeps it,
+// so the caller sees one call. With a fixed hit ratio h the fluid model sends the miss
+// fraction 1 - h of the reads on to the backend, as the same op, and the cache answers every
+// request itself (`served` is all of the input, hits and misses alike).
+TEST_CASE(
+    "a read_through cache forwards its miss fraction to the backend and charges it to the "
+    "response",
+    "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(cached_front(CacheStrategy::read_through, 0.8, true));
+  CacheBehaviour cache{g, *g.index_of("cache")};
+  const auto db = *g.index_of("db");
+  const auto routed = cache.route(flow_of("read", 100), 0s, 100ms);
+  REQUIRE(routed.outgoing.size() == 1);
+  REQUIRE(routed.outgoing[0].target == db);
+  REQUIRE_THAT(routed.outgoing[0].flow.rate_of("read").per_second, WithinRel(20.0, 1e-12));
+  REQUIRE_THAT(routed.outgoing[0].flow.total().per_second, WithinRel(20.0, 1e-12));
+  REQUIRE_THAT(routed.served.rate_of("read").per_second, WithinRel(100.0, 1e-12));
+  REQUIRE(routed.rejected.empty());
+
+  // Hit (80 %): own sojourn only, mean 1 ms, variance 4e-8. Miss (20 %): own + the hop to the
+  // db, 2 legs of 1 ms + the db's response (5 ms, variance 1e-6): mean 8 ms, variance 1.04e-6.
+  // A mixture (law of total variance, as for a client's split routes):
+  //   mean     = 0.8 x 1 ms + 0.2 x 8 ms                          = 2.4 ms
+  //   variance = Σ s_i v_i + Σ s_i (m_i - mean)²
+  //            = (0.8 x 4e-8 + 0.2 x 1.04e-6) + (0.8 x (1.4 ms)² + 0.2 x (5.6 ms)²)
+  //            = 2.4e-7 + (1.568e-6 + 6.272e-6) = 8.08e-6
+  std::vector<std::pair<std::size_t, std::string>> asked;
+  const auto r = cache.response("read", LatencyEstimate{0.001, 4e-8},
+                                [&](std::size_t node, std::string_view op) {
+                                  asked.emplace_back(node, std::string{op});
+                                  return LatencyEstimate{0.005, 1e-6};
+                                });
+  REQUIRE_THAT(r.mean_s, WithinRel(0.0024, 1e-12));
+  REQUIRE_THAT(r.variance_s2, WithinRel(8.08e-6, 1e-9));
+  REQUIRE(asked.size() == 1);
+  REQUIRE(asked[0] == std::pair{db, std::string{"read"}});
+}
+
+// A miss that the backend fails to answer is a request the client never gets back: of the
+// requests sent to the cache, the hits (80 %) are answered by the cache alone, the misses
+// (20 %) only as often as the backend answers them. Sequential parts multiply, a split is the
+// share-weighted mean (the rules above ServiceBehaviour).
+TEST_CASE("a read_through cache delivers its hits plus its misses times the backend's fraction",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(cached_front(CacheStrategy::read_through, 0.8, true));
+  const CacheBehaviour cache{g, *g.index_of("cache")};
+  const double delivered =
+      cache.delivered("read", 0.9, [](std::size_t, std::string_view) { return 0.5; });
+  REQUIRE_THAT(delivered, WithinRel(0.9 * (0.8 + 0.2 * 0.5), 1e-12));
+}
+
+// Ch. 1 write-through: every write goes to the cache AND the store, and the caller waits for
+// both. Write-around: writes go straight to the store, skipping the cache. A cache with a
+// fixed hit ratio does the same thing to the flow in both cases (every write reaches the
+// backend, synchronously); they differ in what the cache then holds, which a fixed ratio does
+// not model.
+TEST_CASE(
+    "write_through forwards every write to the backend synchronously; write_around the same flow",
+    "[behaviours]") {
+  for (const auto strategy : {CacheStrategy::write_through, CacheStrategy::write_around}) {
+    CAPTURE(static_cast<int>(strategy));
+    const auto g = *simsys::graph::Graph::build(cached_front(strategy, 0.8, true));
+    CacheBehaviour cache{g, *g.index_of("cache")};
+    const auto db = *g.index_of("db");
+    const auto routed = cache.route(flow_of("write", 50), 0s, 100ms);
+    REQUIRE(routed.outgoing.size() == 1);
+    REQUIRE(routed.outgoing[0].target == db);
+    REQUIRE_THAT(routed.outgoing[0].flow.rate_of("write").per_second, WithinRel(50.0, 1e-12));
+    REQUIRE_THAT(routed.outgoing[0].flow.total().per_second, WithinRel(50.0, 1e-12));
+    REQUIRE_THAT(routed.served.rate_of("write").per_second, WithinRel(50.0, 1e-12));
+    REQUIRE(routed.rejected.empty());
+
+    // own 1 ms + the hop (2 legs of 1 ms + the db's 5 ms) = 8 ms; the variances of sequential
+    // parts add: 4e-8 + 1e-6. No mixture: every write takes the hop.
+    std::vector<std::pair<std::size_t, std::string>> asked;
+    const auto r = cache.response("write", LatencyEstimate{0.001, 4e-8},
+                                  [&](std::size_t node, std::string_view op) {
+                                    asked.emplace_back(node, std::string{op});
+                                    return LatencyEstimate{0.005, 1e-6};
+                                  });
+    REQUIRE_THAT(r.mean_s, WithinRel(0.008, 1e-12));
+    REQUIRE_THAT(r.variance_s2, WithinRel(1.04e-6, 1e-9));
+    REQUIRE(asked.size() == 1);
+    REQUIRE(asked[0] == std::pair{db, std::string{"write"}});
+  }
+}
+
+// `write_ops` says which ops change data; every other op is a read. A cache whose write op
+// is called `set` forwards `set` under write_through, and treats an op called `write` like
+// any read (here, under read_through, a read's misses are what get forwarded).
+TEST_CASE("the cache's write ops come from write_ops", "[behaviours]") {
+  SECTION("a listed op is a write: write_through forwards all of it; an unlisted one is a read") {
+    auto s = cached_front(CacheStrategy::write_through, 1.0, true);  // all reads hit
+    s.nodes[2].write_ops = {"set"};
+    const auto g = *simsys::graph::Graph::build(s);
+    CacheBehaviour cache{g, *g.index_of("cache")};
+    const auto db = *g.index_of("db");
+    Flow in;
+    in.add("set", Rate{10});
+    in.add("write", Rate{10});
+    const auto routed = cache.route(in, 0s, 100ms);
+    const auto to_db = sent_to(routed, db);
+    REQUIRE_THAT(to_db.rate_of("set").per_second, WithinRel(10.0, 1e-12));
+    // "write" is a read now, and every read hits: nothing of it goes to the backend.
+    REQUIRE(to_db.rate_of("write").per_second == 0.0);
+    REQUIRE_THAT(routed.served.total().per_second, WithinRel(20.0, 1e-12));
+  }
+  SECTION("an op that is no longer listed is a read, so a read_through cache forwards its misses") {
+    auto s = cached_front(CacheStrategy::read_through, 0.8, true);
+    s.nodes[2].write_ops = {"set"};
+    const auto g = *simsys::graph::Graph::build(s);
+    CacheBehaviour cache{g, *g.index_of("cache")};
+    const auto routed = cache.route(flow_of("write", 10), 0s, 100ms);
+    REQUIRE_THAT(sent_to(routed, *g.index_of("db")).rate_of("write").per_second,
+                 WithinRel(2.0, 1e-12));  // 20 % of 10
+  }
+}
+
+TEST_CASE("a cache's cost per op comes from its spec and defaults to one", "[behaviours]") {
+  auto s = cached_front(CacheStrategy::cache_aside, 0.8, false);
+  s.nodes[2].cost = {{"read", 2.5}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const CacheBehaviour cache{g, *g.index_of("cache")};
+  REQUIRE(cache.cost("read") == 2.5);
+  REQUIRE(cache.cost("write") == 1.0);
+}
+
+// Cache-aside from the service's side (ch. 1): web asks the cache, and only for the share the
+// cache missed does it go on to the database. The step `{to: db, on: miss}` therefore carries
+// the miss fraction 1 - h of web's requests, while the cache step carries all of them.
+TEST_CASE("a service forwards a miss step's op at the preceding cache's miss fraction",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(aside_front(0.8));
+  const ServiceBehaviour web{g, *g.index_of("web")};
+  const auto routed = web.route(flow_of("get", 100), 0s, 100ms);
+  REQUIRE(routed.outgoing.size() == 2);
+  REQUIRE_THAT(sent_to(routed, *g.index_of("cache")).rate_of("read").per_second,
+               WithinRel(100.0, 1e-12));
+  REQUIRE_THAT(sent_to(routed, *g.index_of("db")).rate_of("read").per_second,
+               WithinRel(20.0, 1e-12));
+  REQUIRE_THAT(routed.served.total().per_second, WithinRel(100.0, 1e-12));
+}
+
+// The response of a cache-aside read: own + the cache hop (always) + the db hop for the miss
+// share only. The db hop is a two-point variable: 0 with probability 0.8, the hop's time with
+// probability 0.2, so its mean is 0.2 x hop and its variance, by the law of total variance,
+// 0.2 v + 0.2 x 0.8 x hop² (the second term is the spread between hit and miss).
+TEST_CASE("a cache_aside read's response is own + cache hop + the miss share of the db hop",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(aside_front(0.8));
+  const ServiceBehaviour web{g, *g.index_of("web")};
+  const auto cache = *g.index_of("cache");
+  std::vector<std::pair<std::size_t, std::string>> asked;
+  const auto r =
+      web.response("get", LatencyEstimate{0.001, 0.0}, [&](std::size_t node, std::string_view op) {
+        asked.emplace_back(node, std::string{op});
+        return node == cache ? LatencyEstimate{0.0002, 4e-8} : LatencyEstimate{0.005, 1e-6};
+      });
+  // cache hop: 2 x 0.5 ms + 0.2 ms = 1.2 ms (variance 4e-8)
+  // db hop:    2 x 10 ms + 5 ms    = 25 ms  (variance 1e-6), taken by 20 % of requests:
+  //            mean 5 ms, variance 0.2 x 1e-6 + 0.2 x 0.8 x (25 ms)² = 1.002e-4
+  // total: mean 1 ms + 1.2 ms + 5 ms = 7.2 ms; variance 4e-8 + 1.002e-4 = 1.0024e-4
+  REQUIRE_THAT(r.mean_s, WithinRel(0.0072, 1e-12));
+  REQUIRE_THAT(r.variance_s2, WithinRel(1.0024e-4, 1e-9));
+  REQUIRE(asked.size() == 2);
+  REQUIRE(std::ranges::find(asked, std::pair{cache, std::string{"read"}}) != asked.end());
+  REQUIRE(std::ranges::find(asked, std::pair{*g.index_of("db"), std::string{"read"}}) !=
+          asked.end());
+}
+
+TEST_CASE("a service's delivered fraction counts the db hop only for the share that misses",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(aside_front(0.8));
+  const ServiceBehaviour web{g, *g.index_of("web")};
+  const auto cache = *g.index_of("cache");
+  // cache answers 90 %, db 50 %: 1.0 x 0.9 x (0.8 + 0.2 x 0.5) = 0.81
+  const double delivered = web.delivered(
+      "get", 1.0, [&](std::size_t node, std::string_view) { return node == cache ? 0.9 : 0.5; });
+  REQUIRE_THAT(delivered, WithinRel(0.81, 1e-12));
 }
