@@ -832,17 +832,30 @@ class RateLimiterBehaviour {
 // store is graph::Graph::backend_fraction, the one rule the paper load and the call-cycle
 // search share with this behaviour.
 // `then` steps (plan 2b refinement 5): what happens after the cache has answered, when the
-// cache sits IN FRONT of the next tier rather than beside the application. Ch. 1's read path
-// draws the arrow "on a miss, go on to the next tier"; ch. 13's browser cache is one: a hit
-// answers the autocomplete request in the browser, a miss goes on to the load balancer.
+// cache sits IN FRONT of the next tier rather than beside the application: the inline placement,
+// in which the cache itself forwards what it misses (read-through in spirit), NOT ch. 1's
+// cache-aside, where the web server asks the cache and queries the database itself and the cache
+// forwards nothing. The book's examples of a cache in front: ch. 1's CDN workflow (a CDN that
+// does not have a file fetches it from the origin server, then serves it) and ch. 13's "Browser
+// caching" (Google keeps autocomplete suggestions in the browser cache for an hour: the
+// scenario's `ttl: 1h`): a hit answers in the browser, a miss goes on to the load balancer.
 //   on: always -> every request the cache handles, hit or miss, sends rate × factor of
-//                 `step.op` (an audit log, say), and waits for it: own + the hop.
+//                 `step.op` (an audit log, say), and waits for it: own + the hop. A sequential
+//                 one adds its hop; the `mode: parallel` ones form ONE group, whose slowest hop
+//                 the cache waits for AFTER its store hop and its sequential steps (own + store
+//                 hop + sequential hops + the slowest parallel one): they overlap one another,
+//                 never the store hop.
 //   on: miss   -> the misses of the READS only (writes do not miss): (1 − h) × factor of them.
 //                 A miss waits for the hop, a hit does not, so the response is the hit/miss
 //                 mixture {h: own, 1 − h: own + hop} (conditional_hop). Several miss steps
 //                 form one block, taken all together and in turn by a miss, like the miss
-//                 steps after one lookup of a service. A read_through cache cannot have one:
-//                 its own backend fetch already fetches the miss (graph::Graph refuses both).
+//                 steps after one lookup of a service; so each must be sequential (graph::Graph
+//                 refuses a parallel one). A read_through cache cannot have one (its own backend
+//                 fetch already fetches the miss), and a service cannot fetch the misses of a
+//                 cache that has one again with an `on: miss` step of its own (graph::Graph
+//                 refuses both double fetches).
+//   Neither may send the store the op the store hop sends it (graph::Graph refuses a then step
+//   that duplicates the backend hop).
 // The share of each op a then-step carries is graph::Graph::then_fraction, as the paper load's.
 // Pattern: Strategy (enum-dispatched) — the strategy is a closed enum, not a class per
 // strategy: graph::Graph::backend_fraction switches on it once per op at construction, and
@@ -1448,9 +1461,9 @@ Routed CacheBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt
 
 // ---- SqlDbBehaviour ----
 
-// graph::Graph::resolve_nodes already gave a database built in code the SQL default write ops.
+// The scenario's write ops as written, else the SQL default (model::write_ops_of).
 SqlDbBehaviour::SqlDbBehaviour(const graph::Graph& g, std::size_t self)
-    : write_ops_{g.nodes()[self].spec.write_ops},
+    : write_ops_{model::write_ops_of(g.nodes()[self].spec)},
       cost_by_op_{g.nodes()[self].spec.cost.begin(), g.nodes()[self].spec.cost.end()} {}
 
 double SqlDbBehaviour::cost(std::string_view op) const {

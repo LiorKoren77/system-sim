@@ -388,7 +388,8 @@ class Graph {
   Result route_client_op(std::size_t client, const std::string& op);
   Result route_forwarder(std::size_t node);
   void collect_arriving_ops();
-  [[nodiscard]] bool carries_flow(std::size_t node, const model::Step& step) const;
+  [[nodiscard]] bool carries_flow(std::size_t node, const model::Step& step,
+                                  std::string_view op) const;
   Result check_forwarded_ops(std::size_t node);
   Result mark_balanced_targets();
   void order_nodes();
@@ -544,13 +545,81 @@ namespace {
   return window_off_the_step_grid(spec, step);
 }
 
+[[nodiscard]] bool is_cache(const model::NodeSpec& spec) {
+  return spec.type == model::NodeType::cache;
+}
+
+// The node types whose answer an `on: miss` step can follow: they hit or miss.
+[[nodiscard]] bool hits_or_misses(model::NodeType type) {
+  return type == model::NodeType::cache || type == model::NodeType::cdn;
+}
+
+// Whether `op` changes data at `cache` (it is one of its write ops, model::write_ops_of); every
+// other op is a read, which can hit or miss.
+[[nodiscard]] bool is_write(const model::NodeSpec& cache, std::string_view op) {
+  return std::ranges::contains(model::write_ops_of(cache), op);
+}
+
+// Pattern: Strategy (enum-dispatched) — the cache strategy is a closed enum and this is the one
+// place that says which ops each strategy sends to the store (its backend hop, as the same op):
+// a read under read_through (its misses), a write under write_through, write_around and
+// write_back (every one; write_back's later and asynchronously), nothing else. Graph::
+// backend_fraction (how much), the key walk (detail::add_backend_hop) and the then-step check
+// below (invalid_then_steps) all ask it.
+[[nodiscard]] bool sends_to_store(const model::NodeSpec& cache, std::string_view op) {
+  // `using enum` (see replica_model_of): the strategies by their short names.
+  using enum model::CacheStrategy;
+  if (!is_write(cache, op)) return cache.strategy == read_through;
+  return cache.strategy == write_through || cache.strategy == write_around ||
+         cache.strategy == write_back;
+}
+
+// Does the cache or CDN forward its own misses (a `then` step on miss)? Then nothing after it
+// may fetch them again (Graph::invalid_miss_step).
+[[nodiscard]] bool forwards_own_misses(const model::NodeSpec& spec) {
+  // C++20 ranges algorithm: std::ranges::any_of takes the container itself instead of a
+  // begin/end pair (and a projection if wanted), replacing std::any_of(v.begin(), v.end(), p).
+  return std::ranges::any_of(
+      spec.then, [](const model::Step& step) { return step.on == model::StepCondition::miss; });
+}
+
+// Would `step`, a `then` step of `cache`, send its store the very request its backend hop sends
+// (the same node, an op sends_to_store says the hop carries)? Every such request would reach the
+// store twice, and under write_back the step would be taken for the asynchronous flush.
+[[nodiscard]] bool duplicates_backend_hop(const model::NodeSpec& cache, const model::Step& step) {
+  return cache.backend && step.to == *cache.backend && sends_to_store(cache, step.op);
+}
+
+// A cache's `then` steps (plan 2b refinement 5), checked against what the cache already does:
+//  - a step on miss beside a read_through backend: both would fetch the miss;
+//  - a step on miss in parallel: a miss waits for its then steps (the cache answers it only once
+//    the next tier has), so the step cannot be timed beside the lookup, as a service's miss step
+//    cannot (Graph::invalid_miss_step);
+//  - a step that duplicates the backend hop (duplicates_backend_hop).
+[[nodiscard]] std::optional<EngineError> invalid_then_steps(const model::NodeSpec& spec) {
+  const std::string name = "node '" + spec.id + "': ";
+  for (const model::Step& step : spec.then) {
+    const bool on_miss = step.on == model::StepCondition::miss;
+    if (on_miss && spec.strategy == model::CacheStrategy::read_through) {
+      return EngineError{name +
+                         "a then step on miss and a read_through backend both fetch the miss"};
+    }
+    if (on_miss && step.mode == model::StepMode::parallel) {
+      return EngineError{name + "a then step on miss must be sequential (a miss waits for it)"};
+    }
+    if (duplicates_backend_hop(spec, step)) {
+      return EngineError{name + "then step to '" + step.to + "' duplicates its backend hop"};
+    }
+  }
+  return std::nullopt;
+}
+
 // Graph::build also takes caches written in code, which the loader never checked: a fixed
 // hit ratio is a probability, a strategy in which the cache calls the store needs to know
 // which node that is, and one in which it does not (cache_aside) must not name one: it would
 // never be called (config's read_hit_ratio and read_cache_strategy). A cache with no
-// hit ratio at all builds (explain can show it); the engine refuses to run it. A read_through
-// cache fetches its misses from its backend itself, so a `then` step on miss would fetch each
-// miss a second time (plan 2b refinement 5): the two together are refused.
+// hit ratio at all builds (explain can show it); the engine refuses to run it. Its `then` steps
+// must agree with its strategy and its backend (invalid_then_steps).
 [[nodiscard]] std::optional<EngineError> invalid_cache(const model::NodeSpec& spec) {
   const std::string name = "node '" + spec.id + "': ";
   if (spec.hit_ratio && spec.hit_ratio->fixed) {
@@ -566,16 +635,7 @@ namespace {
     return EngineError{name + "backend is unused with strategy " +
                        std::string{model::to_string(spec.strategy)}};
   }
-  const bool then_on_miss = std::ranges::any_of(
-      spec.then, [](const model::Step& step) { return step.on == model::StepCondition::miss; });
-  if (spec.strategy == model::CacheStrategy::read_through && then_on_miss) {
-    return EngineError{name + "a then step on miss and a read_through backend both fetch the miss"};
-  }
-  return std::nullopt;
-}
-
-[[nodiscard]] bool is_cache(const model::NodeSpec& spec) {
-  return spec.type == model::NodeType::cache;
+  return invalid_then_steps(spec);
 }
 
 // Graph::build also takes databases written in code: their `shards`, `pool` and
@@ -603,25 +663,10 @@ namespace {
 //    Little's law implies from capacity × service time (defaults::implied_concurrency). The
 //    service rate stays `capacity`: a pool lets more queries wait in service at once, it
 //    does not make the disk faster.
-//  - `write_ops` left at model::NodeSpec's default (the cache's single `write`) means the
-//    database's own default, default_sql_write_ops. The loader writes that list itself, so
-//    this only reaches databases built in code; the price is that a scenario that writes
-//    `write_ops: [write]` on a database gets insert, update and delete as writes too.
+// (Its `write_ops` need nothing here: model::write_ops_of gives an absent list the database
+// default, default_sql_write_ops, wherever it is read.)
 void apply_database_keys(ResolvedNode& node) {
   if (node.spec.pool) node.capacity.concurrency = *node.spec.pool;
-  if (node.spec.write_ops == std::vector<std::string>{std::string{model::default_write_op}}) {
-    node.spec.write_ops.assign(model::default_sql_write_ops.begin(),
-                               model::default_sql_write_ops.end());
-  }
-}
-
-// The node types whose answer an `on: miss` step can follow: they hit or miss.
-[[nodiscard]] bool hits_or_misses(model::NodeType type) {
-  return type == model::NodeType::cache || type == model::NodeType::cdn;
-}
-
-[[nodiscard]] bool is_write(const model::NodeSpec& cache, std::string_view op) {
-  return std::ranges::contains(cache.write_ops, op);
 }
 
 // A leaky bucket (ch. 4) IS a queue: requests join a FIFO bucket that leaks at the fixed
@@ -953,18 +998,9 @@ void add_op_step_hops(const Graph& g, const model::NodeSpec& spec, std::string_v
 // read_through carries the cache's misses; a write under a write strategy carries every write.
 void add_backend_hop(const ResolvedNode& cache, std::size_t node, std::string_view op,
                      std::vector<KeyHop>& hops) {
-  if (!is_cache(cache.spec) || !cache.backend) return;
-  using enum model::CacheStrategy;  // see replica_model_of
-  const auto strategy = cache.spec.strategy;
-  if (!is_write(cache.spec, op)) {
-    if (strategy == read_through) {
-      hops.push_back({.to = *cache.backend, .op = std::string{op}, .misses_of = node});
-    }
-    return;
-  }
-  if (strategy == write_through || strategy == write_around || strategy == write_back) {
-    hops.push_back({.to = *cache.backend, .op = std::string{op}});
-  }
+  if (!is_cache(cache.spec) || !cache.backend || !sends_to_store(cache.spec, op)) return;
+  const auto misses_of = is_write(cache.spec, op) ? std::nullopt : std::optional{node};
+  hops.push_back({.to = *cache.backend, .op = std::string{op}, .misses_of = misses_of});
 }
 
 // `then` steps (Graph::then_fraction): an unconditional one carries everything, an `on: miss`
@@ -1578,10 +1614,10 @@ double Graph::hop_fraction(const model::Step& step, std::optional<std::size_t> l
 // Why an `on: miss` step cannot follow `lookup` (the nearest unconditional step before it, or
 // nothing), if it cannot. A miss step needs something that can miss (a cache or a CDN), asked
 // a read (a write updates or invalidates an entry: it has no miss to report), which leaves the
-// miss to the application (a read_through cache has already fetched it from its backend, so a
-// miss step would fetch it twice), and it must wait for the answer: neither it nor the lookup
-// can be a parallel branch, or the response would time the fetch alongside the lookup instead
-// of after it.
+// miss to the application (a read_through cache has already fetched it from its backend, and a
+// cache or CDN with a `then` step on miss forwards it itself: either way a miss step would fetch
+// it twice), and it must wait for the answer: neither it nor the lookup can be a parallel
+// branch, or the response would time the fetch alongside the lookup instead of after it.
 std::optional<EngineError> Graph::invalid_miss_step(std::size_t node, const model::Step& step,
                                                     const ServiceHop* lookup) const {
   const std::string name = "node '" + nodes_[node].spec.id + "': an 'on: miss' step ";
@@ -1597,6 +1633,10 @@ std::optional<EngineError> Graph::invalid_miss_step(std::size_t node, const mode
   if (is_cache(cache) && cache.strategy == model::CacheStrategy::read_through) {
     return EngineError{name + "cannot follow read_through cache '" + cache.id +
                        "' (the cache already fetched the miss)"};
+  }
+  if (forwards_own_misses(cache)) {
+    return EngineError{name + "cannot follow " + std::string{model::to_string(cache.type)} + " '" +
+                       cache.id + "', whose own then step on miss already fetches the miss"};
   }
   if (step.mode == model::StepMode::parallel || lookup->mode == model::StepMode::parallel) {
     return EngineError{name +
@@ -1701,19 +1741,14 @@ std::span<const ServiceHop> Graph::service_hops(std::size_t node, std::string_vi
   return found->second;
 }
 
-// Pattern: Strategy (enum-dispatched) — the cache strategy is a closed enum and this switch
-// over it is the one place that says what each strategy sends to the store; CacheBehaviour,
-// the paper load and the call-cycle search all read this answer.
+// Which ops go to the store is sends_to_store's answer (the strategy dispatch); this adds how
+// many: every write that goes, the misses of a read that goes. CacheBehaviour, the paper load
+// and the call-cycle search all read this share.
 double Graph::backend_fraction(std::size_t node, std::string_view op) const {
   const auto& resolved = nodes_.at(node);
   if (!is_cache(resolved.spec) || !resolved.backend) return 0.0;
-  // `using enum` (see replica_model_of): the strategies by their short names.
-  using enum model::CacheStrategy;
-  const auto strategy = resolved.spec.strategy;
-  if (!is_write(resolved.spec, op)) return strategy == read_through ? miss_fraction(node) : 0.0;
-  const bool writes_to_store =
-      strategy == write_through || strategy == write_around || strategy == write_back;
-  return writes_to_store ? 1.0 : 0.0;
+  if (!sends_to_store(resolved.spec, op)) return 0.0;
+  return is_write(resolved.spec, op) ? 1.0 : miss_fraction(node);
 }
 
 double Graph::then_fraction(std::size_t node, const model::Step& step, std::string_view op) const {
@@ -1996,13 +2031,15 @@ std::vector<Route> Graph::routes_for(std::size_t node, std::string_view op) cons
 }
 
 // Which ops reach every node: a worklist over (node, op) pairs, seeded with the client
-// routes, the steps that carry flow (unconditional `then` steps, `on: miss` `then` steps of a
-// cache or CDN that misses, and every resolved hop of positive fraction: an `on: miss` step
-// after a cache that misses) and the `counter` op of
-// every limiter's backend, and grown through load balancers and rate limiters, which pass
-// each op they receive on to every route whose link carries it and is not drained (weight 0:
-// no flow takes it), and through caches, which pass an op on to their backend when some of
-// it goes there (backend_fraction). Each pair enters the list once, so a loop ends.
+// routes, the steps that carry flow (the unconditional `then` steps of the node types that do
+// not hit or miss, and every resolved hop of positive fraction: an `on: miss` step after a cache
+// that misses) and the `counter` op of every limiter's backend, and grown through load balancers
+// and rate limiters, which pass each op they receive on to every route whose link carries it and
+// is not drained (weight 0: no flow takes it), through caches and CDNs, which pass each op they
+// receive on along every `then` step that carries some of THAT op (carries_flow: an `on: miss`
+// step carries the read misses, so a cache that only ever receives writes sends nothing along
+// it), and through caches, which pass an op on to their backend when some of it goes there
+// (backend_fraction). Each pair enters the list once, so a loop ends.
 void Graph::collect_arriving_ops() {
   std::vector<std::set<std::string>> arriving(nodes_.size());
   std::vector<std::pair<std::size_t, std::string>> work;
@@ -2019,8 +2056,13 @@ void Graph::collect_arriving_ops() {
         if (hop.fraction > 0.0) arrive(hop.target, hop.op);
       }
     }
-    for (const model::Step& step : spec.then) {
-      if (carries_flow(node, step)) arrive(*index_of(step.to), step.op);
+    // A cache's or CDN's then steps depend on the op (a miss step carries no write): they
+    // follow each op that arrives, below. Every other node's unconditional ones fire whatever
+    // it receives (a worker pool's work comes from the queue it consumes, not along an edge).
+    if (!hits_or_misses(spec.type)) {
+      for (const model::Step& step : spec.then) {
+        if (step.on == model::StepCondition::always) arrive(*index_of(step.to), step.op);
+      }
     }
     if (spec.type == model::NodeType::rate_limiter && nodes_[node].backend) {
       arrive(*nodes_[node].backend, std::string{counter_op});
@@ -2029,6 +2071,11 @@ void Graph::collect_arriving_ops() {
   while (!work.empty()) {
     const auto [node, op] = std::move(work.back());
     work.pop_back();
+    if (hits_or_misses(nodes_[node].spec.type)) {
+      for (const model::Step& step : nodes_[node].spec.then) {
+        if (carries_flow(node, step, op)) arrive(*index_of(step.to), step.op);
+      }
+    }
     if (is_cache(nodes_[node].spec)) {
       if (backend_fraction(node, op) > 0.0) arrive(*nodes_[node].backend, op);
       continue;
@@ -2043,13 +2090,12 @@ void Graph::collect_arriving_ops() {
   }
 }
 
-// Can a `then` step of `node` carry flow at all? An unconditional one always; an `on: miss` one
-// when the node can miss (a cache or CDN with a hit ratio below 1, or none known yet); an
-// `on: failure` one not before phase 2c. Which ops it carries is then_fraction's business.
-bool Graph::carries_flow(std::size_t node, const model::Step& step) const {
-  if (step.on == model::StepCondition::always) return true;
-  return step.on == model::StepCondition::miss && hits_or_misses(nodes_[node].spec.type) &&
-         miss_fraction(node) > 0.0;
+// Does a `then` step of cache or CDN `node` carry some of the requests of `op` that arrive at
+// it? then_fraction says: an unconditional one all of them, an `on: miss` one the misses of a
+// read (none if the node never misses) and nothing of a write, an `on: failure` one nothing
+// before phase 2c.
+bool Graph::carries_flow(std::size_t node, const model::Step& step, std::string_view op) const {
+  return then_fraction(node, step, op) > 0.0;
 }
 
 // Every op that reaches a load balancer must be able to leave it, or the balancer would
