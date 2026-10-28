@@ -249,7 +249,7 @@ target and, if that link lists `ops`, lists the step's op.
 
 | type | own keys | status |
 |---|---|---|
-| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `keys` read by the [`che` caches](#che-hit-ratios) downstream (`keys must be a map`, `keys needs zipf and space, or uniform`, `keys takes zipf+space or uniform, not both`, `keys.zipf must be a finite non-negative number`, `keys.space must be a positive count`, `keys.uniform must be a positive count`; `space` and `uniform` are [counts](#values): `100M`); `timeout` checked (a duration), not yet used; `sizes`, `retries` ignored |
+| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `keys` read by the [`che` caches](#che-hit-ratios) downstream (`keys must be a map`, `keys needs zipf and space, or uniform`, `keys takes zipf+space or uniform, not both`, `keys.zipf must be a finite non-negative number`, `keys.space must be a positive count (a whole number, optionally with k, M or G: 500, 10k, 100M)`, likewise `keys.uniform`; `space` and `uniform` are [counts](#values): `100M`); `timeout` checked (a duration), not yet used; `sizes`, `retries` ignored |
 | `cdn` | `origin` (node id, required), `hit_ratio` (`{fixed: h}` or `che`, optional), `keys`, `ttl`, `write_ops` | read and run (phase 2b), see [`cdn`](#cdn) |
 | `load_balancer` | `policy`, `vnodes` | read and run, see [`load_balancer`](#load_balancer) |
 | `rate_limiter` | `algorithm`, `limit`, `burst`, `window`, `backend` | read and run, see [`rate_limiter`](#rate_limiter) |
@@ -349,7 +349,13 @@ W = `limit × window` and `in` the inflow in requests per second:
 one `counter` request there, and the hop (two link legs + the store's response) adds to
 an admitted request's response. *(graph)* The backend needs a link from the limiter
 (`node 'rl': backend 'c' needs a link from the limiter`) that carries op `counter`
-(`link rl -> c does not carry op 'counter' (ops: x)`).
+(`link rl -> c does not carry op 'counter' (ops: x)`). `counter` is an INCR, a write, so the
+store lists it in its `write_ops` (`counters: {type: cache, ..., write_ops: [counter]}`); a store
+that would count it as a read is refused: `node 'rl': sends write 'counter' to 'c', which counts
+'counter' as a read; add it to c's write_ops`. A `che` hit ratio does not fit a counter store
+that only the limiter reaches: counters are keyed by user or rule, not by the clients' `keys`
+(`node 'c': hit_ratio che: the counter requests of rate limiter 'rl' carry no client keys ...`);
+give it `{fixed: h}`.
 
 **Terminal gate.** A limiter whose only outgoing link is its backend answers every admitted
 request itself. Its caller still calls its own later steps at the full rate; the refused
@@ -371,7 +377,7 @@ own (default 100k/s, 250 µs) that answers every request it receives, hit or mis
 | `hit_ratio` | required: `{fixed: h}` with `0 ≤ h ≤ 1`, or `che` (computed at build from `keys` and the clients' key distribution, see [`che` hit ratios](#che-hit-ratios)) | `cache needs a hit_ratio`, `hit_ratio must be che or {fixed: h}`, `hit_ratio.fixed must be between 0 and 1` (also for a quoted `"0.5"`) |
 | `strategy` | `cache_aside` (default), `read_through`, `write_through`, `write_around`, `write_back` | `strategy must be cache_aside, read_through, write_through, write_around or write_back` |
 | `backend` | a declared node; required by every strategy but `cache_aside`, and refused there (the application reads the store; the backend would never be called) | `strategy read_through needs a backend`, `backend is unused with strategy cache_aside`, `backend refers to unknown node 'x'`; *(graph)* `backend 'db' needs a link from the cache`, and the link must carry every op the cache passes on (`link c -> db does not carry op 'read' (ops: write)`); a store that calls back into the cache (`db.read -> c.read -> db.read`) is refused, since a fetch is always waited for: `node 'c': backend 'db' closes a call cycle` |
-| `write_ops` | a non-empty list of op names; default `[write]`. Every other op is a read. A stated list is taken exactly as written (it replaces the default) | `write_ops must be a list of op names`, `write_ops must name at least one op` |
+| `write_ops` | a non-empty list of op names; default `[write]`. Every other op is a read. A stated list is taken exactly as written (it replaces the default) | `write_ops must be a list of op names`, `write_ops must name at least one op`; *(graph)* a write the cache passes to a `sql_db` or `cache` backend must be a write there too, or the store would serve it as a read (a database from a replica, its primary idle): `node 'c': sends write 'set' to 'db', which counts 'set' as a read; add it to db's write_ops` |
 | `keys` | a [count](#values) (`20M`): the entries the cache holds, the Che approximation's cache size; required by `hit_ratio: che` | `keys must be a positive integer`; *(graph)* `node 'c': hit_ratio che needs keys (the cache's capacity in keys)` |
 | `eviction` | `lru`, `lfu`, `fifo`, `ttl` | `eviction must be lru, lfu, fifo or ttl` |
 | `ttl` | a positive duration | `ttl must be positive` |

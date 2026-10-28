@@ -16,7 +16,7 @@ nodes:
       wave: {shape: sine, period: 24h, amplitude: 0.4, peak_at: 18:00}
       spikes: [{at: 09:00, for: 15m, factor: 20}]       # marketing blast
     ops: {notify: 1.0}
-    keys: {zipf: 0.8, space: 10M}             # the user notified (~10M push users); user_cache's hit ratio follows
+    keys: {zipf: 0.8, space: 10M}             # the user notified, 10M ids after the book's 10M pushes/day; user_cache's hit ratio follows
     timeout: 5s
 
   lb: {type: load_balancer, policy: round_robin}
@@ -33,7 +33,9 @@ nodes:
         - {to: user_limiter, op: check}
         - {to: fanout, op: route}
 
-  user_cache: {type: cache, eviction: lru, keys: 5M, hit_ratio: che, strategy: cache_aside}
+  # Also user_limiter's counter store: its `counter` (an INCR, ch. 4) is a write, the cache's
+  # only one; the notification service's `read`s are what the Che hit ratio is about.
+  user_cache: {type: cache, eviction: lru, keys: 5M, hit_ratio: che, strategy: cache_aside, write_ops: [counter]}
   user_db: {type: sql_db, replicas: 2, capacity: 3k/s}
 
   user_limiter:                               # per-user rate limit

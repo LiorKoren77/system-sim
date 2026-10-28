@@ -62,8 +62,9 @@ struct CacheShard {
 // probability p_i. Two shapes:
 //  - uniform: p_i = 1/N — every key equally hot (the worst case for a cache);
 //  - Zipf:    p_i ∝ i^-s for ranks i = 1..N — a few keys get most of the requests
-//    (book ch. 8, URL shortener: "a few short links get most of the clicks"). s = 0 is
-//    uniform; s ≈ 1 is the classic web-object skew; larger s is hotter.
+//    (as in book ch. 8's URL shortener, where a few short links get most of the clicks;
+//    our paraphrase, not the book's words). s = 0 is uniform; s ≈ 1 is the classic
+//    web-object skew; larger s is hotter.
 //
 // A Zipf key space can hold 1e9 keys, too many to store one probability each. The ranks
 // are therefore grouped into at most 2000 log-spaced buckets of keys with nearly the same
@@ -158,7 +159,8 @@ class Popularity {
 // HitRatioModel: anything that answers hit_ratio(capacity) -> double, the share of reads a
 // cache of `capacity` keys serves. Each model owns whatever else it reads (the Che model its
 // key popularity), so a model that needs no popularity is not handed one. (Spec §5 wrote
-// hit_ratio(capacity, popularity); see docs/scenario-schema.md, `che` hit ratios.)
+// hit_ratio(w, keys), a workload and a key count; spec §18 records why it became
+// hit_ratio(capacity). See also docs/scenario-schema.md, `che` hit ratios.)
 template <class M>
 concept HitRatioModel = requires(const M& model, double capacity) {
   { model.hit_ratio(capacity) } -> std::same_as<double>;

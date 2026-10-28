@@ -1333,18 +1333,27 @@ TEST_CASE("a che cache no client's demand reaches is an error", "[graph]") {
 
 // A rate limiter asks its counter store "how many requests has THIS user made?": the store is
 // keyed per user (or per rule), not by the keys the client's requests are about, so the
-// counter op brings no client keys to it.
+// counter op brings no client keys to it. A che store that nothing else reaches has no key
+// distribution to solve over, and the message says why, rather than "no client's demand reaches
+// it": the clients' demand does, through the limiter (review of c9d5f8c). (`counter` is in the
+// store's write_ops: an INCR is a write, see "a limiter's counter that its store counts as a
+// read is refused" below.)
 TEST_CASE("a limiter's counter requests bring no client keys to its store", "[graph]") {
   Scenario s{.name = "lim", .version = 1, .duration = 1min};
   auto limiter = limiter_of(simsys::model::LimiterAlgorithm::token_bucket, std::nullopt);
   limiter.backend = "cache";
+  auto store = che_cache(10'000);
+  store.write_ops = std::vector<std::string>{"counter"};
   s.nodes = {keyed_client("u", KeySpec{.zipf = 1.0, .space = 100e6}), std::move(limiter),
-             che_cache(10'000), service("web")};
+             std::move(store), service("web")};
   s.links = {LinkSpec{.from = "u", .to = "limiter"}, LinkSpec{.from = "limiter", .to = "cache"},
              LinkSpec{.from = "limiter", .to = "web"}};
   const auto built = Graph::build(s);
   REQUIRE_FALSE(built.has_value());
-  REQUIRE(built.error().message == "node 'cache': hit_ratio che: no client's demand reaches it");
+  REQUIRE(built.error().message ==
+          "node 'cache': hit_ratio che: the counter requests of rate limiter 'limiter' carry no "
+          "client keys (a counter is keyed by user or rule), and no client's keys reach it "
+          "otherwise; give it hit_ratio: {fixed: ...}");
 }
 
 // `zipf: 0` IS the uniform distribution (p_i ∝ i^0 = 1): two clients writing it the two ways
@@ -1977,4 +1986,114 @@ TEST_CASE("an id generator built in code without an algorithm is refused", "[gra
   REQUIRE_FALSE(g.has_value());
   REQUIRE(g.error().message ==
           "node 'ids': id_generator needs algorithm: snowflake, ticket_server or uuid");
+}
+
+// ---- A write stays a write at its store (review of c9d5f8c, finding 1) ----
+//
+// Each node decides alone which of its ops are writes (model::write_ops_of): a cache's
+// `write_ops` (default `write`), a SQL database's (default the SQL statements insert, update,
+// delete and `write`). A cache that passes a write on to its store passes the op unchanged, so a
+// cache whose write is called `set` or `put` sends the database an op the database counts as a
+// READ: served by any replica at cost 1, the primary idle. Ch. 1's replication says the opposite
+// (every write goes to the primary). The graph refuses the disagreement instead of guessing, and
+// says which list to fix. The same holds for a rate limiter's `counter`, an INCR (ch. 4).
+
+namespace {
+// u -> wb -> db: a client sending `get` and `put` straight to a cache with fixed h = 0.9 whose
+// write op is `put` and whose strategy has it send that write to `db`, a SQL database.
+Scenario cache_writing_to_database(CacheStrategy strategy) {
+  Scenario s{.name = "cache-writes", .version = 1, .duration = 1min};
+  auto wb = cache("wb", 0.9, strategy, "db");
+  wb.write_ops = std::vector<std::string>{"put"};
+  s.nodes = {client("u", Rate{1000}, {{"get", 0.5}, {"put", 0.5}}), std::move(wb),
+             NodeSpec{.id = "db", .type = NodeType::sql_db, .replicas = 3}};
+  s.links = {LinkSpec{.from = "u", .to = "wb", .dir = Direction::inout},
+             LinkSpec{.from = "wb", .to = "db", .dir = Direction::inout}};
+  return s;
+}
+// u -> limiter -> api, and limiter -> `store`, the limiter's counter store.
+Scenario limiter_counting_in(NodeSpec store) {
+  auto limiter = limiter_of(simsys::model::LimiterAlgorithm::token_bucket, 100);
+  limiter.backend = store.id;
+  auto s = behind_limiter(std::move(limiter));
+  s.links.push_back(LinkSpec{.from = "limiter", .to = store.id});
+  s.nodes.push_back(std::move(store));
+  return s;
+}
+}  // namespace
+
+TEST_CASE("a write_back cache's put that its sql_db counts as a read is refused", "[graph]") {
+  const auto g = Graph::build(cache_writing_to_database(CacheStrategy::write_back));
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message ==
+          "node 'wb': sends write 'put' to 'db', which counts 'put' as a read; add it to db's "
+          "write_ops");
+}
+
+TEST_CASE("a cache's write that its sql_db lists in write_ops builds under every write strategy",
+          "[graph]") {
+  for (const auto strategy :
+       {CacheStrategy::write_through, CacheStrategy::write_back, CacheStrategy::write_around}) {
+    CAPTURE(static_cast<int>(strategy));
+    auto s = cache_writing_to_database(strategy);
+    s.nodes[2].write_ops = std::vector<std::string>{"put"};
+    const auto g = Graph::build(std::move(s));
+    INFO((g ? "" : g.error().message));
+    REQUIRE(g.has_value());
+    const auto db = *g->index_of("db");
+    REQUIRE(simsys::graph::is_write(g->nodes()[db].spec, "put"));
+  }
+}
+
+// Under read_through the cache sends its store only the misses of its reads; its writes stay in
+// the cache, so the database never sees `put` and its write_ops need not name it.
+TEST_CASE("a read_through cache's writes never reach the store, so its store's list is free",
+          "[graph]") {
+  const auto g = Graph::build(cache_writing_to_database(CacheStrategy::read_through));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+}
+
+// A cache behind a cache counts its writes too: a cache store with the default `write_ops`
+// (`write`) would answer a front cache's `put` from its hit ratio, as a read.
+TEST_CASE("a write that a store cache counts as a read is refused like a database's", "[graph]") {
+  auto s = cache_writing_to_database(CacheStrategy::write_through);
+  s.nodes[2] = cache("db", 0.5, CacheStrategy::cache_aside);
+  const auto refused = Graph::build(s);
+  REQUIRE_FALSE(refused.has_value());
+  REQUIRE(refused.error().message ==
+          "node 'wb': sends write 'put' to 'db', which counts 'put' as a read; add it to db's "
+          "write_ops");
+  s.nodes[2].write_ops = std::vector<std::string>{"put"};
+  const auto built = Graph::build(std::move(s));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+}
+
+// A limiter's `counter` is "read and increment this client's counter" (ch. 4's Redis INCR): a
+// write. A sql_db counter store with the default write_ops would serve it from a replica.
+TEST_CASE("a limiter's counter that its store counts as a read is refused", "[graph]") {
+  SECTION("a sql_db store") {
+    const auto g = Graph::build(
+        limiter_counting_in(NodeSpec{.id = "store", .type = NodeType::sql_db, .replicas = 2}));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message ==
+            "node 'limiter': sends write 'counter' to 'store', which counts 'counter' as a read; "
+            "add it to store's write_ops");
+  }
+  SECTION("a cache store") {
+    const auto g =
+        Graph::build(limiter_counting_in(cache("store", 1.0, CacheStrategy::cache_aside)));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message ==
+            "node 'limiter': sends write 'counter' to 'store', which counts 'counter' as a read; "
+            "add it to store's write_ops");
+  }
+  SECTION("a store that lists counter in its write_ops builds") {
+    auto store = NodeSpec{.id = "store", .type = NodeType::sql_db, .replicas = 2};
+    store.write_ops = std::vector<std::string>{"counter"};
+    const auto g = Graph::build(limiter_counting_in(std::move(store)));
+    INFO((g ? "" : g.error().message));
+    REQUIRE(g.has_value());
+  }
 }

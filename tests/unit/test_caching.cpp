@@ -118,14 +118,18 @@ TEST_CASE("a hotter key space (larger zipf exponent) hits more", "[caching]") {
   REQUIRE(cold > che_hit_ratio(1000, Popularity::uniform(1'000'000)));
 }
 
-TEST_CASE("a hundred-million-key zipf space evaluates in well under a second", "[caching]") {
+// Popularity groups the keys into buckets, so Che's sums run over buckets, not over 1e8 keys:
+// measured 3 ms in a Debug build and 1 ms in Release (2026-10-28). A pass over every key, once
+// per bisection step, would take minutes. The bound is far from both: generous for a loaded CI
+// machine running a Debug build, and still a failure for a per-key evaluation.
+TEST_CASE("a hundred-million-key zipf space evaluates without a pass over every key", "[caching]") {
   const auto started = std::chrono::steady_clock::now();
   const auto h =
       che_hit_ratio(20e6, Popularity::zipf(1.0, 100'000'000));  // url-shortener's url_cache
   const auto elapsed = std::chrono::steady_clock::now() - started;
   REQUIRE(h > 0.5);
   REQUIRE(h < 1.0);
-  REQUIRE(elapsed < std::chrono::milliseconds{500});
+  REQUIRE(elapsed < std::chrono::seconds{2});
 }
 
 TEST_CASE("invalid popularities are programmer errors", "[caching]") {
@@ -154,7 +158,9 @@ TEST_CASE("uniform and zipf round a fractional space the same way", "[caching]")
 
 TEST_CASE("the HitRatioModel concept is satisfied by the fixed and che policies", "[caching]") {
   // C++20 concepts: spec §5's HitRatioModel — anything with hit_ratio(capacity) -> double. A
-  // model owns what else it needs: the che policy carries its key popularity.
+  // model owns what else it needs: the che policy carries its key popularity. A concept names
+  // the requirement and checks it at compile time (static_assert below), replacing an abstract
+  // base class with a virtual hit_ratio (no vtable, no common base) or SFINAE tricks.
   static_assert(simsys::caching::HitRatioModel<FixedHitRatio>);
   static_assert(simsys::caching::HitRatioModel<CheHitRatio>);
   REQUIRE_THAT(FixedHitRatio{0.8}.hit_ratio(10), WithinRel(0.8, 1e-12));
@@ -164,6 +170,10 @@ TEST_CASE("the HitRatioModel concept is satisfied by the fixed and che policies"
 namespace {
 // True when buckets() can be called on a temporary Popularity (an rvalue, std::declval<P>()):
 // the span it returns would view buckets destroyed at the end of the full expression.
+// C++20 requires-expression: `requires { expr; }` is true when expr compiles, false otherwise,
+// with no error; wrapped in a concept it becomes a compile-time test of an API's shape, replacing
+// the C++17 detection idiom (std::void_t and a partial specialization). Here it proves that
+// buckets() cannot be called on an rvalue (its const&& overload is deleted).
 template <class P>
 concept views_buckets_of_temporary = requires { std::declval<P>().buckets(); };
 }  // namespace
@@ -198,6 +208,8 @@ DenseChe dense_che(const std::vector<double>& p, double capacity) {
   const double t = std::exp(lo);
   double h = 0;
   for (const double x : p) h += x * -std::expm1(-x * t);
+  // C++20 designated initializers: each member named, replacing positional `{h, t}` where two
+  // doubles could be swapped unnoticed.
   return {.hit_ratio = h, .characteristic_time = t};
 }
 std::vector<double> dense_zipf(double s, std::size_t n) {

@@ -500,7 +500,8 @@ Scenario balanced(simsys::model::LbPolicy policy) {
 }
 
 // u(100/s) -> limiter (token bucket 1k/s, burst 100, counters kept in `counters`) -> api, with
-// `counters` a cache that answers every read (fixed hit ratio 1.0, cache-aside).
+// `counters` a cache that answers every request (fixed hit ratio 1.0, cache-aside) and counts
+// `counter` as a write (an INCR; Graph::build refuses a store that counts it as a read).
 Scenario limited_with_counters() {
   Scenario s{.name = "counted", .version = 1, .duration = 1s};
   s.nodes = {
@@ -519,7 +520,8 @@ Scenario limited_with_counters() {
                .type = NodeType::cache,
                .capacity = Rate{100'000},
                .hit_ratio = simsys::model::HitRatio{.fixed = 1.0},
-               .strategy = simsys::model::CacheStrategy::cache_aside}};
+               .strategy = simsys::model::CacheStrategy::cache_aside,
+               .write_ops = std::vector<std::string>{"counter"}}};
   s.links = {LinkSpec{.from = "u", .to = "limiter"}, LinkSpec{.from = "limiter", .to = "api"},
              LinkSpec{.from = "limiter", .to = "counters"}};
   return s;
@@ -543,7 +545,7 @@ TEST_CASE("explain prints each node type's policy line", "[report]") {
     CAPTURE(text);
     REQUIRE(text.find("algorithm=token_bucket limit=1k/s burst=100 backend=counters") !=
             std::string::npos);
-    REQUIRE(text.find("hit_ratio=1 (fixed) strategy=cache_aside write_ops=write") !=
+    REQUIRE(text.find("hit_ratio=1 (fixed) strategy=cache_aside write_ops=counter") !=
             std::string::npos);
   }
 }
@@ -1273,6 +1275,30 @@ TEST_CASE("explain still renders a cdn that has a byte capacity", "[report]") {
 // where it came from, and the check line gives the load but no percentage and no zone (review of
 // 4d539b0, I1). Every capacity converted from bytes is treated so, a blob store's too, the type's
 // default (spec §6 "blob 500 MB/s") included.
+// A kv_cluster's `nodes`, `replication` and quorums are read and ignored until phase 3: its
+// capacity is that of one box (per replica, `replicas` 1), while the lab's `capacity: 10k/s` is
+// per node of eight, each write landing on N = 3 of them. A percentage against the one box would
+// be a verdict on a model the simulator does not have (labs/kv-store printed 300 %, red), so the
+// check gives the load and says why there is no verdict, as for a capacity converted from bytes
+// (review of c9d5f8c).
+TEST_CASE("explain gives no verdict on a kv_cluster, whose nodes are not modelled", "[report]") {
+  Scenario s{.name = "kv", .version = 1, .duration = 1min};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{30'000}},
+                                           .op_shares = {{"get", 0.7}, {"put", 0.3}}}},
+             NodeSpec{.id = "store", .type = NodeType::kv_cluster, .capacity = Rate{10'000}}};
+  s.links = {LinkSpec{.from = "u", .to = "store"}};
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  const auto line = check_line(text, "store");
+  REQUIRE(
+      line.contains("peak offered 30k/s vs 10k/s total capacity  (not checked: kv_cluster "
+                    "nodes, replication and quorums: phase 3)"));
+  REQUIRE_FALSE(line.contains(", red"));  // ("peak offered" contains "red")
+  REQUIRE_FALSE(line.contains("%"));
+}
+
 TEST_CASE("explain gives no verdict on a capacity converted from bytes", "[report]") {
   SECTION("a cdn sized in bytes") {
     const auto text = explain_of(cdn_reported("cdn_us", simsys::ByteRate{100e9}));

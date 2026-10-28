@@ -48,7 +48,13 @@ nodes:
         - {to: fanout_q, op: publish}
 
   feed_cache: {type: cache, eviction: lru, keys: 10M, hit_ratio: che, strategy: cache_aside}
-  post_cache: {type: cache, eviction: lru, keys: 50M, hit_ratio: che, strategy: cache_aside}
+  # A fixed ratio, not che: Che reads the key distribution of the client whose requests reach the
+  # cache, and `users.keys` describes user ids (whose feed is read), not the post ids this cache
+  # holds; with 50M slots over that 50M-key space Che would say h = 1. One client key space
+  # cannot describe two kinds of id; che needs a client whose `keys` are the cached keys (a
+  # client of posts). 0.95 is chosen, not the book's: a feed shows mostly recent posts, the ones
+  # an LRU post cache keeps.
+  post_cache: {type: cache, eviction: lru, keys: 50M, hit_ratio: {fixed: 0.95}, strategy: cache_aside}
   user_cache: {type: cache, eviction: lru, keys: 10M, hit_ratio: {fixed: 0.98}, strategy: cache_aside}
 
   post_db:

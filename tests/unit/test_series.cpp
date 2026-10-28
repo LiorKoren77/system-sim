@@ -731,6 +731,21 @@ TEST_CASE("explain gives youtube's metadata_db a lower bound: the completion han
   REQUIRE(check_line(text, "metadata_db").contains("(≥0.559%; load not propagated:"));
 }
 
+// chat-system's message_store is a kv_cluster fed partly through the queues: its capacity gets
+// no verdict (kv_cluster nodes are not modelled, test_report), and its load is a lower bound. It
+// printed "(≥315%, red; ...)" before: a red verdict on the one-box capacity (review of c9d5f8c).
+TEST_CASE("explain gives chat-system's kv_cluster no verdict, and marks its load a lower bound",
+          "[series]") {
+  const auto text = explain_shipped("chat-system");
+  CAPTURE(text);
+  const auto line = check_line(text, "message_store");
+  REQUIRE(
+      line.contains("(not checked: kv_cluster nodes, replication and quorums: phase 3)  "
+                    "(lower bound; load not propagated:"));
+  REQUIRE_FALSE(line.contains(", red"));  // ("peak offered" contains "red")
+  REQUIRE_FALSE(line.contains("%"));
+}
+
 // Web crawler (ch. 9): the URL frontier hands URLs to the downloader along its `then` (a type
 // the model has no phase for yet), and the downloader, a worker pool, sends on along its own
 // (phase 2c). dns is behind both; the mark names each blocking type once, nearest first. The

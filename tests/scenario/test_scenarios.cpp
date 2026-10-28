@@ -40,6 +40,23 @@ std::vector<std::string> scenario_files() {
   return files;
 }
 
+// The scenario at `path`, or the test fails with the loader's message (file:line: message), never
+// a dereference of an empty std::expected.
+simsys::model::Scenario load_or_fail(const std::string& path) {
+  auto loaded = simsys::config::load(path);
+  if (!loaded) {
+    FAIL(loaded.error().file << ":" << loaded.error().line << ": " << loaded.error().message);
+  }
+  return std::move(*loaded);
+}
+
+// The graph of `s`, or the test fails with the graph's message.
+simsys::graph::Graph build_or_fail(const simsys::model::Scenario& s) {
+  auto built = simsys::graph::Graph::build(s);
+  if (!built) FAIL(built.error().message);
+  return std::move(*built);
+}
+
 }  // namespace
 
 TEST_CASE("every shipped scenario validates", "[scenario]") {
@@ -83,7 +100,7 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
     const auto loaded = simsys::config::load(file);
     if (!loaded) FAIL(loaded.error().message);  // a broken file must fail here, not crash below
     const auto& s = *loaded;
-    const auto g = *simsys::graph::Graph::build(s);
+    const auto g = build_or_fail(s);
     auto created = simsys::engine::Simulation::create(g);
     if (!created) {
       REQUIRE(created.error().message.find("phase 2") != std::string::npos);
@@ -93,8 +110,8 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
     // reason:
     //  - lab-unique-id ships with the ticket server carrying the load, to FAIL its drop_rate SLO
     //    (8k/s of capacity against 10k/s offered): the lesson. Its own test pins that.
-    //  - url-shortener passes its SLOs, but 24 h at 1 s is 86.4k steps: 0.4 s in Release, 6.1 to
-    //    6.6 s in a Debug build (measured 2026-10-28), over the five seconds below. Its own test
+    //  - url-shortener passes its SLOs, but 24 h at 1 s is 86.4k steps: 0.4 s in Release, about
+    //    6 to 8 s in a Debug build (measured 2026-10-28), over the five seconds below. Its own test
     //    runs it end to end with no time limit and pins its SLO results.
     if (s.name == "lab-unique-id" || s.name == "url-shortener") continue;  // not run here
     ++ran;
@@ -117,9 +134,8 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
 }
 
 // Phase 2a's goal: the rate-limiter lab, which uses a client with spikes, a rate limiter, a
-// cache and a service, runs end to end. Its `counters` cache (hit_ratio: {fixed: 1.0}) lands
-// in plan Task 10; until then Simulation::create refuses the cache and THIS CASE STAYS RED on
-// purpose. It goes green when the cache node exists: do not weaken it to a skip.
+// cache and a service, runs end to end. (It was red on purpose until the cache node landed, plan
+// 2a Task 10; do not weaken it to a skip.)
 TEST_CASE("labs/rate-limiter runs in phase 2a", "[scenario]") {
   using namespace std::chrono_literals;
   const auto s =
@@ -158,6 +174,37 @@ TEST_CASE("labs/consistent-hashing runs and passes its SLOs", "[scenario]") {
   }
 }
 
+// The consistent-hashing lab's caches are read_through: a `set` stays in the cache. Switched to
+// write_through, each cache writes every `set` to db as `set`, an op the SQL database's default
+// write_ops (insert, update, delete, write) does not name: db would count it as a read, serve it
+// from a replica at cost 1 and report its primary idle, "0%, green", where 4k sets/s at cost 5
+// are 400 % of the primary's 5k units/s (review of c9d5f8c, finding 1). The graph refuses the
+// disagreement and names the list to fix; with `set` listed, explain shows the primary red.
+TEST_CASE("the consistent-hashing lab under write_through needs set in db's write_ops",
+          "[scenario]") {
+  auto s = simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} +
+                                "/labs/consistent-hashing/scenario.yaml");
+  if (!s) FAIL(s.error().file << ":" << s.error().line << ": " << s.error().message);
+  auto& caches = s->nodes[2];
+  auto& db = s->nodes[3];
+  REQUIRE(caches.id == "cache_servers");
+  REQUIRE(db.id == "db");
+  caches.strategy = simsys::model::CacheStrategy::write_through;
+  const auto refused = simsys::graph::Graph::build(*s);
+  REQUIRE_FALSE(refused.has_value());
+  REQUIRE(refused.error().message ==
+          "node 'cache_servers': sends write 'set' to 'db', which counts 'set' as a read; add it "
+          "to db's write_ops");
+  db.write_ops = std::vector<std::string>{"set"};
+  const auto built = simsys::graph::Graph::build(*s);
+  if (!built) FAIL(built.error().message);
+  const auto text = simsys::report::render_explain(*built);
+  CAPTURE(text);
+  // C++23 std::string::contains: a substring test in one call, replacing
+  // `find(...) != std::string::npos`, so the assertion reads as what it checks.
+  REQUIRE(text.contains("primary 20k units/s vs 5k/s (400%, red)"));
+}
+
 TEST_CASE("book scenarios are refused by run until their node types exist", "[scenario]") {
   // Phase 1 runs only client and service nodes; the book scenarios use more. The message must
   // name the node and the phase so a student knows what is missing, not that the file is wrong.
@@ -165,8 +212,8 @@ TEST_CASE("book scenarios are refused by run until their node types exist", "[sc
   // none of which exist yet. (url-shortener used to stand here; with the id generator, the last
   // node type it lacked, it runs: see the pinned list below.)
   const auto s =
-      *simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/chat-system/scenario.yaml");
-  const auto g = *simsys::graph::Graph::build(s);
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/chat-system/scenario.yaml");
+  const auto g = build_or_fail(s);
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message.find("phase 2") != std::string::npos);
@@ -188,7 +235,7 @@ TEST_CASE(
     const auto loaded = simsys::config::load(file);
     if (!loaded) FAIL(loaded.error().message);  // a broken file must fail here, not crash below
     const auto& s = *loaded;
-    const auto g = *simsys::graph::Graph::build(s);
+    const auto g = build_or_fail(s);
     if (simsys::engine::Simulation::create(g)) runnable.push_back(s.name);
   }
   std::ranges::sort(runnable);
@@ -200,8 +247,8 @@ TEST_CASE(
 TEST_CASE("a refused scenario's message names the first unsupported node and the phase",
           "[scenario]") {
   const auto s =
-      *simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/chat-system/scenario.yaml");
-  const auto g = *simsys::graph::Graph::build(s);
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/chat-system/scenario.yaml");
+  const auto g = build_or_fail(s);
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
   const auto& message = sim.error().message;
@@ -317,8 +364,6 @@ TEST_CASE("book scenarios give no verdict on capacities converted from bytes", "
     for (const auto& id : ids) {
       const auto line = check_line_of(text, id);
       CAPTURE(file, line);
-      // C++23 std::string::contains: a substring test in one call, replacing
-      // `find(...) != std::string::npos`.
       REQUIRE(line.contains("(not checked: capacity from "));
       REQUIRE(line.contains("at 1MB/object; byte flows: phase 2c)"));
       REQUIRE_FALSE(line.contains("green"));

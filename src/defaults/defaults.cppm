@@ -221,10 +221,10 @@ inline constexpr int snowflake_sequence_bits = 12;
 
 // The defaults a node falls back to: its type's (for_type), or, for an id generator, its
 // algorithm's.
-// Pattern: sugar resolved at build — an id generator is a ServiceBehaviour with chapter-7
-// defaults, no new behaviour class: the only thing its algorithm changes is the two numbers
-// returned here, which resolve_service_rate and resolve_service_time (and so resolve_capacity)
-// read like any type default. A scenario's `capacity` or `latency` still wins over them.
+// An id generator is a ServiceBehaviour with chapter-7 defaults, no new behaviour class: the only
+// thing its algorithm changes is the two numbers returned here, which resolve_service_rate and
+// resolve_service_time (and so resolve_capacity) read like any type default. A scenario's
+// `capacity` or `latency` still wins over them.
 [[nodiscard]] constexpr TypeDefaults defaults_of(const model::NodeSpec& n) {
   if (n.type == model::NodeType::id_generator && n.id_algorithm) {
     return for_id_algorithm(*n.id_algorithm);

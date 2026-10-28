@@ -1228,6 +1228,10 @@ TEST_CASE("url-shortener's url_cache resolves to a che hit ratio and the simulat
 // reference. With the lab's `vnodes: 1` the hottest server owns half the keys (k = 2) and the
 // three others a sixth each, so the hot server is a 4M-key cache over the whole space and the
 // cool ones hold their every key: h = 0.5 × 0.848235 + 0.5 × 1 = 0.924118.
+// Provenance of 0.962834 and 0.848235: Che's equation solved by 100 bisection steps over all 10M
+// ranks one at a time, in double precision and with no buckets (the method of test_caching.cpp's
+// dense_che_hit_ratio, run outside the suite: 10M ranks x 100 steps take seconds), recomputed
+// 2026-10-28.
 TEST_CASE("the consistent-hashing lab's cache hits 0.963 on even arcs and 0.924 on one vnode",
           "[theory]") {
   REQUIRE_THAT(simsys::caching::che_hit_ratio(8e6, simsys::caching::Popularity::zipf(0.9, 10e6)),
@@ -1294,6 +1298,9 @@ Scenario sql_front(int replicas, std::optional<int> shards, double reads, double
 }
 // The mean response the client sees for `op` in a one-step run of `s`.
 double client_mean_s(const simsys::engine::StepRecord& r, std::string_view op) {
+  // C++20 std::ranges::find with a projection: compares `op` with each sample's `op` member
+  // (the projection, a pointer to member), replacing std::find_if over begin/end with a lambda
+  // that reads the member.
   const auto it = std::ranges::find(r.responses, op, &simsys::engine::ResponseSample::op);
   REQUIRE(it != r.responses.end());
   return it->response.mean_s;

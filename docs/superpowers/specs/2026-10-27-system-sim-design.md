@@ -684,7 +684,7 @@ author meets are in `docs/scenario-schema.md` (v1.3).
     `cdn_us` read 0.28 % green where its 50 MB streams make it about 14 %, and
     `transcoded_store` 1.58 % green where it is about 79 %. *Ignores:* until phase 2c, every
     byte figure.
-12. **ID generator as service sugar** (plan refinement 6; Pattern: sugar resolved at build).
+12. **ID generator as service sugar** (plan refinement 6; no new behaviour class, no pattern).
     `algorithm` is required; it supplies a `service`'s two numbers: `snowflake` 4.096M/s per
     replica (12 sequence bits: 4096 ids per millisecond) and 10 µs (chosen), `ticket_server`
     1k/s (§6's SQL write rate: an id is a write) and 1 ms, `uuid` 1G/s and 1 µs (nothing to

@@ -24,5 +24,12 @@
 
 ## Things to try
 - `fanout.workers: 8` — the fan-out queue never drains after the 12:00 spike.
-- `post_cache.keys: 5M` — hydration misses push `post_db` into the red at 20:00.
+- `post_cache`'s hit ratio (`{fixed: 0.95}`, chosen: `users.keys` are user ids, not the post
+  ids the cache holds, so Che has no key space to read for it; see the comment in the YAML).
+  `post_db` is red before any read reaches it: the day's peak is the 12:00 spike, 21.6k/s (3×
+  a sine at 70 % of its base there), not 20:00's 16k/s, and its 10 % of posts are 2.162k
+  writes/s at cost 5, 10.81k units/s against one primary's 5k/s (`primary ... (216%, red)`),
+  which every replica replays. At 0.95 the hydration misses add 12.97k reads/s (20 per feed
+  read), `each replica 17.3k units/s vs 5k/s (346%, red)`; at `{fixed: 0.8}`, 735 %. The cure
+  for the writes is sharding (`shards`), as in the URL shortener; no hit ratio helps them.
 - Switch `post` share to 0.3 (a very chatty day) and watch `graph_db`.

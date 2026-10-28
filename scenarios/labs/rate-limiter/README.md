@@ -10,8 +10,9 @@
 ## The scenario
 800/s of `call` with three spikes: 5x for 30 s at 5m, 2x for 2 min at 15m, 20x for 5 s at
 25m. A limiter of 1k/s guards an `api` of 2 x 600/s (queue 200 per copy). Every checked
-request reads its counter in `counters`, a cache with `hit_ratio: {fixed: 1.0}` (the
-counters live in memory, so every read hits). SLOs: `api` utilization at most 90 %, the
+request reads and increments its counter in `counters`, a cache with `hit_ratio: {fixed: 1.0}`
+(the counters live in memory, so every lookup hits) and `write_ops: [counter]` (the increment
+is ch. 4's Redis INCR, a write; the graph refuses a store that would count it as a read). SLOs: `api` utilization at most 90 %, the
 client's p99 at most 50 ms.
 
 ## What the model captures

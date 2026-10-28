@@ -123,8 +123,8 @@ slo
 The second worked example is the [rate-limiter lab](scenarios/labs/rate-limiter/)
 (ch. 4): 800/s of `call` with three spikes (5x, 2x, 20x) through a 1k/s token bucket with
 `burst: 100`, whose counters live in a cache, in front of an api of 2 x 600/s. Each
-checked request reads its counter; what the bucket refuses is rejected (the book's 429),
-never forwarded, and reported apart from drops:
+checked request reads and increments its counter; what the bucket refuses is rejected (the
+book's 429), never forwarded, and reported apart from drops:
 
 ```
 $ simsys run scenarios/labs/rate-limiter/scenario.yaml
