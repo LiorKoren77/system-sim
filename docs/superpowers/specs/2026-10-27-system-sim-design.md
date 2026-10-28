@@ -473,8 +473,14 @@ The rules a scenario author meets are in `docs/scenario-schema.md` (v1.2).
    per step `[now, now + dt)` through `route(in, now, dt)`, with `W = limit × window`
    (window 1 s by default); `burst` sizes the two buckets only and defaults to one
    window's worth. Rejected flow is a channel of its own (`rejected_per_s`), never
-   forwarded and reported apart from drops; `estimate` uses each algorithm's long-run rate
-   `min(in, limit)`, and effects inside one step are not resolved.
+   forwarded and reported apart from drops; `estimate` admits `min(in, limit)`, and
+   effects inside one step are not resolved. `min(in, limit)` is the long-run rate of the
+   token bucket and the fixed window, but not of the sliding counter (about 10/11 of the
+   limit under a flood at ten steps per window), and it hides the fixed window's sawtooth
+   within each window (under a flood the p99 of `run` is far above `estimate`'s), so
+   `estimate`'s first line says so when the scenario has a windowed limiter. A windowed
+   algorithm's window must be a whole number of steps, at least one (a graph error
+   otherwise), so its boundaries fall on step starts.
 7. **Cache (2a scope).** Only `hit_ratio: {fixed: h}` runs; `write_ops` (default
    `[write]`) names the writes and every other op is a read. `cache_aside` serves hits and
    leaves the misses to the service's `{to: db, on: miss}` step, which fires for `1 − h`

@@ -43,9 +43,9 @@ Everything else is refused before the first step, with exit code 1:
 
 | what | message | runs from |
 |---|---|---|
-| a cache with `hit_ratio: che` | `node 'c': hit_ratio che (the Che approximation) is computed from phase 2b on; run/estimate need {fixed: h} until then` | 2b |
-| a cache with `strategy: write_back` | `node 'c': strategy write_back (writes flushed later) runs from phase 2b on` | 2b |
-| a cache with `then` steps | `node 'c': a cache's then steps run from phase 2b on` | 2b |
+| a cache with `hit_ratio: che` | `node 'c' has hit_ratio che (the Che approximation), which run/estimate do not support yet (phase 2b)` | 2b |
+| a cache with `strategy: write_back` | `node 'c' has strategy write_back (writes flushed later), which run/estimate do not support yet (phase 2b)` | 2b |
+| a cache with `then` steps | `node 'c' has then steps (fired per hit or miss), which run/estimate do not support yet (phase 2b)` | 2b |
 | `sql_db`, `cdn` | `node 'x' has type 'cdn', which run/estimate do not support yet (phase 2)` | 2b |
 | `blob_store`, `message_queue`, `worker_pool`, `external_sink` | the same message | 2c |
 | `kv_cluster`, `ws_gateway`, `service_discovery` | the same message | 3 |
@@ -57,9 +57,16 @@ The type message says "(phase 2)" for every type; the last column is the plan.
 **`estimate` versus `explain`.** `estimate` evaluates the long-run state once, at
 t = 0 (00:00): the rate curve's value there, without noise. Its first line says so:
 `estimate at t = 0 (00:00): the curve without noise; explain's checks use the peak`.
-In `estimate` a rate limiter other than a leaky bucket admits its long-run rate
-`min(in, limit)` (a settle pass at t = 0 would otherwise never leave the first window, or
-would keep spending a full bucket); a leaky bucket is a queue and settles like one.
+In `estimate` a rate limiter other than a leaky bucket admits `min(in, limit)` (a settle
+pass at t = 0 would otherwise never leave the first window, or would keep spending a full
+bucket); a leaky bucket is a queue and settles like one. `min(in, limit)` is the long-run
+rate of the token bucket and of the fixed window, but **not** of the sliding counter, which
+admits less under a flood (about 10/11 of `limit` at ten steps per window). And a long-run
+rate says nothing about the shape inside a window: under a flood the fixed window lets all
+of W through in each window's first step and nothing after, so `run`'s p99 there is far
+above what `estimate` shows. When the scenario has a windowed limiter, `estimate`'s first
+line adds `; windowed limiters are evaluated at min(in, limit) — run them to see the
+sawtooth`.
 `explain`'s `checks` block instead uses each client's **peak** over the run (see
 [Rate curve](#rate-curve-clientrate)), and passes at most `limit` on behind a rate limiter.
 
@@ -106,7 +113,7 @@ would keep spending a full bucket); a leaky bucket is a queue and settles like o
 |---|---|---|---|---|
 | `version` | integer | yes | read | always `1` (unquoted) |
 | `name` | string | yes | read | non-empty; shown in reports |
-| `seed` | integer | no | read | default 1; within the range of `int`. Printed by `explain`; seeds every client's `rate.noise` (`run --seed N` and `curve --seed N` override it). Client `i` (its index among all nodes, in file order) gets the engine seed `(seed × 0x9E3779B97F4A7C15) XOR i` mod 2^64, so adding a client never changes another client's noise |
+| `seed` | integer | no | read | default 1; within the range of `int`. Printed by `explain`; seeds every client's `rate.noise` (`run --seed N` and `curve --seed N` override it). Client `i` (its index among all nodes, in file order) gets the engine seed `(seed × 0x9E3779B97F4A7C15) XOR i` mod 2^64, so appending a node at the end of the file never changes another client's noise (inserting one before a client shifts that client's index, and so its noise) |
 | `duration` | duration | yes | read | simulated span of `run`; must be positive |
 | `step` | duration | no | read | default `100ms`; must be positive |
 | `warmup` | duration | no | read | steps before it are left out of the report; default 0; must be shorter than `duration`, so the report never covers an empty window (`run --duration` obeys the same rule) |
@@ -257,7 +264,7 @@ drops ([below](#drops-and-rejections)).
 |---|---|---|
 | `limit` | required; a rate, positive, at most `1e15/s`. The limiter's total, shared by its replicas | `rate_limiter needs a limit`, `limit must be positive`, `limit must be at most 1e15/s` |
 | `algorithm` | `token_bucket` (default), `leaky_bucket`, `fixed_window`, `sliding_log`, `sliding_counter` | `algorithm must be token_bucket, leaky_bucket, fixed_window, sliding_log or sliding_counter` |
-| `window` | a positive duration, default `1s`. A windowed algorithm's window; on a bucket it only sizes the default `burst` | `window must be positive` |
+| `window` | a positive duration, default `1s`. A windowed algorithm's window; on a bucket it only sizes the default `burst`. *(graph)* For `fixed_window`, `sliding_log` and `sliding_counter` (the default `1s` included), a whole number of steps, at least one: the fluid step sees a window boundary only where a step starts | `window must be positive`; *(graph)* `node 'x': window must be a positive whole number of steps (window 150ms, step 100ms)` |
 | `burst` | a positive integer, **buckets only**; default `limit × window` rounded up (one window's worth) | `burst must be a positive integer`, `burst applies only to token_bucket and leaky_bucket`, `limit x window is too large for a burst; give burst explicitly` |
 | `backend` | a declared node of type `cache`: the counter store | `backend refers to unknown node 'x'`, `backend must be a cache` |
 
@@ -287,9 +294,9 @@ an admitted request's response. *(graph)* The backend needs a link from the limi
 request itself. Its caller still calls its own later steps at the full rate; the refused
 share shows in the gate's reject rate and in the client's answered rate.
 
-Not resolved: anything inside a step (a window boundary inside a step is seen at the next
-step's start; a window shorter than the step is not resolved; a burst is spread over its
-step). Not modelled: per-client keys (one aggregate limit), races between limiter
+Not resolved: anything inside a step (a window is a whole number of steps, so its
+boundaries fall on step starts; the requests of one step arrive as one lump; a burst is
+spread over its step). Not modelled: per-client keys (one aggregate limit), races between limiter
 replicas, rate-limit headers and retries of rejected requests, soft limits.
 
 ### `cache`
@@ -360,7 +367,7 @@ clock time `HH:MM` (quoted or not) or a duration from the start (`5m`).
 | `wave` | all of `shape` (`sine`, `square`, `diurnal`), `period` > 0, `amplitude` in [0, 1], `peak_at` | `rate.wave needs shape, period, amplitude and peak_at`, `rate.wave.amplitude must be between 0 and 1`, ... |
 | `ramp` | all of `from`, `to` (rates, at most `1e15/s`), `over` > 0; needs a `base` above `0/s` and no `points`. The ramp sets the level, so `base` is not used in the arithmetic; the rule is kept so a file always states the client's nominal rate | `rate.ramp needs from, to and over`, `rate.ramp needs rate.base`, `rate.ramp.to must be at most 1e15/s` |
 | `spikes` | a list; each spike has `at`, `for` > 0 and `factor` in (0, 1e6]; the factors of the spikes active at any one moment multiply to at most `1e6` | `rate.spikes[2].factor must be positive` (numbered from 1), `rate.spikes: overlapping factors multiply to more than 1e6` |
-| `noise` | `sigma` in [0, 10] (stationary standard deviation), `correlation` > 0 (τ) | `rate.noise needs sigma and correlation`, `rate.noise.sigma must be at most 10` |
+| `noise` | `sigma` in [0, 10] (stationary standard deviation), `correlation` > 0 (τ). The multiplier is `max(0, 1 + x)`, and the floor lifts its mean to `Φ(1/σ) + σφ(1/σ)`: 1.004 at σ 0.5, 1.08 at 1, 1.40 at 2, 4.5 at 10 | `rate.noise needs sigma and correlation`, `rate.noise.sigma must be at most 10` |
 
 Every block rejects unknown keys (`unknown rate.wave key 'colour'`,
 `unknown rate.spikes[1] key 'why'`). A numeric key says what is wrong with its value:
@@ -428,6 +435,13 @@ Two different promises, kept apart on purpose:
 - a **rejection** is a rate limiter's **policy working** (ch. 4's 429): what a token bucket or a
   window algorithm refuses, and a leaky bucket's overflow. `reject_rate` = Σ rejected / Σ
   demand of that node, with the same rules.
+
+Per node and per step the numbers balance, `demand·dt = (drain + dropped)·dt + Δbacklog`:
+whatever reaches a node is served, shed or left waiting. A rejection is not a term of its
+own: a token bucket's or a window algorithm's rejections are inside `drain` (the limiter's
+queue checked them before refusing them), and a leaky bucket's overflow is the `dropped`
+term, reported as `rejected` instead. (`run --series` does not write demand and drain yet;
+see the phase 2b backlog.)
 
 Neither kind of request is answered, so neither contributes latency: each step's response
 is weighted by the client's offered rate times the fraction its path **delivers** (a

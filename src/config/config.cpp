@@ -1122,10 +1122,10 @@ CheckResult read_cost(const Site& site, const YAML::Node& body, model::NodeSpec&
 
 // ---- Load balancer keys (plan 2a refinement 5) ----
 
-// `policy: least_connections`; absent means round_robin (the schema's default), filled in
-// here so every later stage reads a policy instead of re-deciding the default.
+// `policy: least_connections`; absent means round_robin (the schema's default). An absent
+// policy stays absent, so explain can say "(default)": every reader writes
+// `policy.value_or(round_robin)`, as it must for scenarios built in code anyway.
 CheckResult read_lb_policy(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
-  node.policy = model::LbPolicy::round_robin;
   if (!body["policy"]) return {};
   auto word = scalar_value(site, body, "policy");
   if (!word) return std::unexpected(word.error());
@@ -1957,10 +1957,10 @@ CheckResult read_limiter_limit(const Site& site, const YAML::Node& body, model::
   return {};
 }
 
-// `window: 500ms`, default model::default_limiter_window (1 s). Zero would make a window
-// hold nothing and the default burst zero.
+// `window: 500ms`, default model::default_limiter_window (1 s), applied by
+// model::limiter_window (an absent window stays absent, so explain can say "(default)").
+// Zero would make a window hold nothing and the default burst zero.
 CheckResult read_limiter_window(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
-  node.window = model::default_limiter_window;
   if (!body["window"]) return {};
   auto window = parse_duration_key(site, body, "window");
   if (!window) return std::unexpected(window.error());
@@ -1973,7 +1973,9 @@ CheckResult read_limiter_window(const Site& site, const YAML::Node& body, model:
 // counts limit x window per window and has no bucket for a burst to size, so a burst on one
 // is an error (it would otherwise be silently ignored). Default for a bucket: limit x window
 // rounded up, one window's worth (one second's, by default), the conventional sizing of a
-// token bucket for want of a better number; the windowed algorithms get none.
+// token bucket for want of a better number; the windowed algorithms get none. The default
+// is applied by model::limiter_burst, not stored (explain then says "(default)"), but it is
+// checked here: it must fit the int a stated burst is.
 CheckResult read_limiter_burst(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   const bool windowed = model::is_windowed(*node.algorithm);
   if (body["burst"]) {
@@ -1988,7 +1990,6 @@ CheckResult read_limiter_burst(const Site& site, const YAML::Node& body, model::
   if (per_window > std::numeric_limits<int>::max()) {
     return site.fail(body, "limit x window is too large for a burst; give burst explicitly");
   }
-  node.burst = static_cast<int>(per_window);
   return {};
 }
 

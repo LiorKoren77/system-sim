@@ -18,7 +18,8 @@ client's p99 at most 50 ms.
 - Each algorithm as the state ch. 4 describes, stepped every 100 ms (plan 2a refinement 6):
   the token bucket as a fluid level that starts full; the leaky bucket as the limiter's own
   queue, one deterministic slot leaking at 1k/s with room for `burst`; the fixed window as a
-  counter reset every `window`; the sliding counter as `prev x (1 - f) + cur`.
+  counter reset every `window`; the sliding log as a ring of the last `window`'s admitted
+  counts, one per step; the sliding counter as `prev x (1 - f) + cur`.
 - Refused requests are rejected: never forwarded, and counted in `reject_rate`, apart from
   the drops of a node that fails. Latency figures count only the requests that are answered.
 - The counter store round trip (two link legs + the cache's 0.2 ms) in every admitted
@@ -27,13 +28,14 @@ client's p99 at most 50 ms.
 ## What it abstracts away
 - Per-client keys (the limit here is aggregate), header semantics, rule loading, retries
   of rejected requests, races between limiter replicas.
-- Anything inside a 100 ms step: a burst is spread over its step, a window boundary is seen
-  at the next step's start.
+- Anything inside a 100 ms step: a burst is spread over its step. A window must be a whole
+  number of steps (`window: 150ms` is an error at `step: 100ms`), so its boundaries fall on
+  step starts.
 
 ## Results (`simsys run`, 30 min, after the 1 min warmup)
-Same file, one algorithm each: `leaky_bucket` keeps `burst: 500`; `fixed_window` and
-`sliding_counter` take `window: 1s` instead of `burst` (the windowed algorithms refuse a
-burst). The default file is the token bucket with `burst: 100`, which meets both SLOs; the
+Same file, one algorithm each: `leaky_bucket` keeps `burst: 500`; `fixed_window`,
+`sliding_log` and `sliding_counter` take `window: 1s` instead of `burst` (the windowed
+algorithms refuse a burst). The default file is the token bucket with `burst: 100`, which meets both SLOs; the
 table below is the comparison at `burst: 500`, the setting the "things to try" section starts from.
 
 | algorithm | rejected | api mean rho | api peak backlog | api drops | client mean | client p99 (est.) | SLOs |
@@ -41,6 +43,7 @@ table below is the comparison at `burst: 500`, the setting the "things to try" s
 | token_bucket (burst 500) | 14.2 % | 0.68 | 400 | 140 | 6.51 ms | 62.1 ms | p99 FAIL (exit 2) |
 | leaky_bucket (burst 500) | 14.2 % | 0.68 | 0 | 0 | 63.8 ms | 621 ms | p99 FAIL (exit 2) |
 | fixed_window (1 s) | 14.3 % | 0.68 | 400 | 9.6k | 16.6 ms | 182 ms | p99 FAIL (exit 2) |
+| sliding_log (1 s) | 14.3 % | 0.68 | 160 | 0 | 10.8 ms | 117 ms | p99 FAIL (exit 2) |
 | sliding_counter (1 s) | 15.1 % | 0.67 | 80 | 0 | 5.52 ms | 24.3 ms | PASS (exit 0) |
 
 What happens at the spikes:
@@ -61,6 +64,13 @@ What happens at the spikes:
   it fills and overflows: the 9.6k drops are 7.2k and 2.4k, with 18 s and 2 s red. Under
   the 2x spike (2 min) it reaches 240 every second and drops nothing, but it is red for 96 s
   of the 116 s in all.
+- **Sliding log**: never more than 1000 in any second, but the log still holds the 80 per
+  step admitted just before a spike, so the spike's first step gets only the rest of the
+  window, 280; from then on each step admits exactly what left the window ten steps
+  earlier. Under a flood the pattern repeats every second: one step of 280 (the api clears
+  120), nine of 80. The api's backlog peaks at 160, below its queue limit, and drains in
+  0.4 s: no drops, but red for half of every second of a spike (77.5 s in all) and a p99
+  of 117 ms. A smaller lump than the fixed window's, a larger one than the sliding counter's.
 - **Sliding counter**: the estimate counts the previous window too, so nothing like a
   window's worth enters at once; under a flood it admits a little below the limit (the
   higher reject rate, 15.1 %). The api peaks briefly (backlog 80, about 0.3 s red per
@@ -77,5 +87,7 @@ bucket's 62 ms comes from about 7 s of saturation in 29 minutes.
   queue; p99 62.1 ms and the SLO fails. With the default `burst: 100` the surge shrinks to
   200 requests: api backlog 80, no drops, p99 29.4 ms, both SLOs met. The bucket's size is
   the burst the api must absorb.
-- `algorithm: sliding_log` with `window: 1s`: never more than 1000 in any second.
+- `algorithm: sliding_log` with `window: 500ms`: the same 1k/s in half-second windows. The
+  lump at each window's start shrinks to 180 (api backlog 60, 62 s red), but it comes twice
+  as often: p99 108 ms, still a FAIL.
 - `simsys sweep --param nodes.limiter.algorithm=... --metric api.utilization` (phase 2c).

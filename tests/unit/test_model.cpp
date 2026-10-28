@@ -40,6 +40,9 @@ TEST_CASE("the node type table is complete at compile time", "[model]") {
 namespace {
 // Two broken tables, to show that round_trips catches both ways a table can be wrong.
 enum class Colour { red, green };
+// C++20 std::to_array: builds a std::array from a braced list, deducing its length, so
+// the table can grow without a hand-counted size; replaces `std::array<T, N>{...}` where N
+// had to be kept in step with the rows.
 constexpr auto duplicated_name = std::to_array<simsys::core::EnumName<Colour>>({
     {Colour::red, "red"},
     {Colour::green, "red"},

@@ -55,7 +55,15 @@ The first term is how much of the old deviation survives the step; the second is
 randomness, scaled so the variance stays `σ²` (`σ²e^{−2dt/τ} + σ²(1 − e^{−2dt/τ}) = σ²`).
 The usual Euler–Maruyama step `x + (−x/τ)dt + σ·sqrt(2dt/τ)·ξ` is only right for
 `dt ≪ τ`, and overshoots when a 100 ms step meets a short `τ`. The floor at 0 keeps the
-rate non-negative; for large `σ` it lifts the mean multiplier slightly above 1.
+rate non-negative, and in doing so lifts the mean multiplier above 1: cutting off the
+negative tail removes values that would have pulled the mean down. With `Z ~ N(0, 1)`, `Φ`
+its CDF and `φ` its density,
+
+    E[max(0, 1 + σZ)] = Φ(1/σ) + σ·φ(1/σ)
+
+which is 1.004 at `σ = 0.5`, 1.08 at `σ = 1`, 1.40 at `σ = 2` and 4.5 at `σ = 10` (the
+loader's maximum). Up to `σ = 0.3` the lift is below 0.01 %; from `σ = 1` on the
+noise adds load as well as variability.
 
 ## Seeding and the determinism contract
 

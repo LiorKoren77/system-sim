@@ -989,6 +989,9 @@ struct RateRejection {
   std::string_view message;
 };
 
+// C++20 std::span<const T>: a non-owning view of contiguous elements (here a std::array of
+// cases), replacing a (pointer, length) pair or a template over the container type; the
+// callers' arrays of any length convert to it implicitly.
 void require_all_rejected(std::string_view file_name, std::span<const RateRejection> cases) {
   for (const auto& c : cases) {
     INFO("rate: " << c.rate_flow);
@@ -2626,13 +2629,15 @@ TEST_CASE("a load balancer's policy and vnodes are typed and checked") {
     REQUIRE(s.has_value());
     REQUIRE(s->nodes[0].policy == least_connections);
   }
-  SECTION("no policy key: the loader fills in round_robin") {
+  // The loader leaves an absent key absent, so explain can say "(default)"; every reader
+  // applies the default (round_robin) itself.
+  SECTION("no policy key: left absent, round_robin by default") {
     const auto path =
         write_temp("simsys_lb_default.yaml", scenario_with("  lb: {type: load_balancer}\n"));
     const auto s = simsys::config::load(path.string());
     INFO((s ? "" : s.error().message));
     REQUIRE(s.has_value());
-    REQUIRE(s->nodes[0].policy == round_robin);
+    REQUIRE_FALSE(s->nodes[0].policy.has_value());
   }
   SECTION("consistent_hash takes a vnodes count") {
     const auto path = write_temp(
@@ -2720,6 +2725,8 @@ TEST_CASE("a rate limiter's algorithm, limit, burst, window and backend are type
     REQUIRE(s.has_value());
     REQUIRE(s->nodes[0].window == 500ms);
   }
+  // Window and burst stay absent when not stated, so explain can say "(default)";
+  // model::limiter_window and model::limiter_burst apply the defaults for every reader.
   SECTION("defaults: token_bucket, a window of 1s, and a burst of limit times window") {
     const auto path = write_temp("simsys_limiter_defaults.yaml", limiter_scenario("limit: 1k/s"));
     const auto s = simsys::config::load(path.string());
@@ -2727,8 +2734,10 @@ TEST_CASE("a rate limiter's algorithm, limit, burst, window and backend are type
     REQUIRE(s.has_value());
     const auto& limiter = s->nodes[0];
     REQUIRE(limiter.algorithm == token_bucket);
-    REQUIRE(limiter.window == 1s);
-    REQUIRE(limiter.burst == 1000);  // limit 1000/s x window 1 s
+    REQUIRE_FALSE(limiter.window.has_value());
+    REQUIRE_FALSE(limiter.burst.has_value());
+    REQUIRE(simsys::model::limiter_window(limiter) == 1s);
+    REQUIRE(simsys::model::limiter_burst(limiter) == 1000.0);  // limit 1000/s x window 1 s
     REQUIRE_FALSE(limiter.backend.has_value());
   }
   SECTION("a windowed algorithm gets no default burst: it counts limit x window per window") {
@@ -2738,7 +2747,7 @@ TEST_CASE("a rate limiter's algorithm, limit, burst, window and backend are type
     INFO((s ? "" : s.error().message));
     REQUIRE(s.has_value());
     REQUIRE_FALSE(s->nodes[0].burst.has_value());
-    REQUIRE(s->nodes[0].window == 1s);
+    REQUIRE(simsys::model::limiter_window(s->nodes[0]) == 1s);
   }
   SECTION("a burst on a windowed algorithm") {
     for (const std::string_view algorithm : {"fixed_window", "sliding_log", "sliding_counter"}) {

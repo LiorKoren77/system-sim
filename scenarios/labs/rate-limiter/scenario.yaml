@@ -1,7 +1,8 @@
 # Lab: System Design Interview vol. 1, ch. 4 — Rate limiter.
-# Compare algorithms under a bursty client. The same file is run with `--param
-# nodes.limiter.algorithm=token_bucket|leaky_bucket|fixed_window|sliding_log|sliding_counter`;
-# a windowed algorithm also needs `burst` swapped for `window` (see the note on the limiter).
+# Compare algorithms under a bursty client. To try another one, edit `algorithm:` on the
+# limiter (token_bucket, leaky_bucket, fixed_window, sliding_log or sliding_counter) and swap
+# `burst` for `window` as the comment on the limiter explains, then `run` the file again.
+# (A `--param` sweep over the algorithms comes with phase 2c.)
 version: 1
 name: lab-rate-limiter
 seed: 1

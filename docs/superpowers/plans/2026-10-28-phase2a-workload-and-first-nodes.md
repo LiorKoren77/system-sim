@@ -471,3 +471,56 @@ Report the unit on the `demand_per_s` column as "units/s" in the table header wh
 - Placeholders: none; every task has test code and an interface.
 - Type consistency: `RateCurve::rate_at(SimTime) -> Rate`; `NoiseProcess::next(SimTime) -> double`; `ClientBehaviour{g, idx, seed}.tick(now, dt)`/`offer(now)`; `route(const Flow&, SimTime dt)` non-const for every behaviour from Task 9 on (Task 8's LB can start const and change in Task 9; say so in Task 9's brief); `Routed{outgoing, served, rejected}`; `NodeSample::rejected_per_s`; `ResolvedNode::{pooled, imbalance}`; `Graph::hit_ratio(node)`.
 - Settled by probe (2026-10-28): `<generator>` in the global module fragment of an interface that imports another module compiles, and an importer that includes `<format>`/`<print>` consumes the generator fine under GCC 14.2 (scratch probe `gen-probe/`). `samples()` can live in the interface.
+
+## Phase 2b backlog (from the comprehensive review)
+
+Found by the comprehensive review of phase 2a (2026-10-28) and left for phase 2b; the
+findings that had to be fixed before the push (I1–I4, I6, I7, M1–M4, and I5's sentence in
+the docs) are done.
+
+- **I5 series columns.** `run --series` and the JSON report gain `demand_per_s` and
+  `drain_per_s` per node, and `offered` and `answered` per (client, op), so the per-step
+  identity `demand·dt = (drain + dropped)·dt + Δbacklog` (engine::NodeSample, schema
+  "Drops and rejections") can be checked from the output alone.
+- **M5 long functions** (over 25 lines, added or grown in 2a): `Graph::mark_balanced_targets`
+  (40 lines), `Graph::collect_arriving_ops` (37), `Graph::resolve_nodes` (33),
+  `RateLimiterBehaviour::route` (26), the CLI's `main` (52).
+- **M6 duplicated helpers.** The per-op cost lookup three times (`ServiceBehaviour::cost`,
+  `CacheBehaviour::cost`, report's `cost_of`); spike activity twice (`workload.cppm` and
+  `config.cpp`); `BackendHop` twice in `behaviours.cppm`; the `"node '" + id + "': "`
+  message prefix built by hand dozens of times.
+- **M7 unit labels.** Comments in `report.cppm` say "requests" where the values are
+  capacity units; the table header and explain's "peak offered" carry no unit label when a
+  node has a `cost`, although plan Task 7 asked for one.
+- **M8 utilization SLO behind a hash ring.** The schema's `utilization` row says "the
+  node's mean busy fraction"; behind a `consistent_hash` balancer it is the hottest copy's.
+- **M9 duplicate `write_ops`.** `write_ops: [write, write]` is accepted, while a link's
+  `ops` must be distinct.
+- **M10 diurnal table in the schema.** The schema never describes it: peak 1.6 at 20:00,
+  trough 0.4 at 04:00, chosen rather than measured, and the period scaled onto 24 table hours.
+- **M11 transient answered-weight bias.** In a step where a queue builds up, `passed =
+  drain / demand`, and the later credit is capped at 1, so the requests that waited in the
+  backlog are under-weighted and p99 is slightly optimistic around spikes. Documented only in
+  `engine.cppm`.
+- **M12 `estimate` table shape.** Its table presents one step's worth of `rejected`,
+  `dropped` and `red_s` as totals, under a header that says "1 steps observed".
+- **M13 `curve --seed` without `--noise`** is silently ignored.
+- **M14 stale comments.** "phase 1 does not model" in `report.cpp`; queue_lag's "phase 2".
+- **M15 test nits.** "every enum name table round-trips" (`test_model.cpp`) skips four
+  tables and repeats static_asserts the module already makes; "consecutive samples are
+  correlated over the correlation time" checks only the lag of one 100 ms step; "labs/
+  rate-limiter runs in phase 2a" is not named as a property.
+- **Explain note for nodes fed through unsupported types.** Explain prints `0/s ... green`
+  for every node after `frontier` in web-crawler, and for the queues, workers and sinks in
+  notification-system, news-feed, youtube, chat-system and google-drive, because those types
+  do not propagate load yet (older than 2a). Say so on the check line.
+- **Test gaps** (numbered as in the review; gap 1 is I1's test, gap 4 is done):
+  2. per-node, per-step conservation with a token-bucket limiter and with saturated hot and
+     cool copies (it holds today, but nothing pins it);
+  3. `run` converging to `estimate` on balancer, limiter and cache paths, plus the
+     documented sliding-counter shortfall;
+  4. ~~the noise mean multiplier at σ = 1~~ (done: "the noise floor lifts the mean
+     multiplier: about 1.08 at sigma one");
+  5. determinism at the CSV level (spec §12 says "identical series"; the current test
+     compares one node's demand only);
+  6. pinning the transient answered weighting of M11.

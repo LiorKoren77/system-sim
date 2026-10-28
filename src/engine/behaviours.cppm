@@ -343,7 +343,9 @@ class ServiceBehaviour {
 };
 
 // The seed of client `index`'s noise process (spec phase 2a refinement 3): one
-// std::mt19937_64 per client, so adding a client never changes another client's noise.
+// std::mt19937_64 per client, so appending a node (client or not) at the end of the file
+// never changes another client's noise. The seed is the node index, so a node inserted
+// before a client moves that client's index, and so its noise.
 // Formula: (seed × 0x9E3779B97F4A7C15) XOR index, all mod 2^64. The constant is 2^64
 // divided by the golden ratio (splitmix64's increment); what matters is that it is odd and
 // large. The multiply is there to keep (seed, index) pairs apart, not to decorrelate
@@ -634,10 +636,11 @@ class LoadBalancerBehaviour {
 //    this behaviour admits everything the queue lets through, and the queue's overflow is
 //    the bucket's refusal, which the engine reports as `rejected`, not dropped
 //    (refuses_on_overflow).
-// What the fluid step cannot see: anything inside a step. A window boundary that falls
-// inside a step is seen at the next step's start; the requests of one step arrive as one
-// lump, so a window shorter than the step is not resolved; and the bursts the book draws
-// (100 requests in one millisecond) are spread over the step.
+// What the fluid step cannot see: anything inside a step. A window boundary inside a step
+// would be seen only at the next step's start, so the graph refuses a windowed limiter whose
+// window is not a whole number of steps (graph::window_off_the_step_grid); the requests of
+// one step arrive as one lump; and the bursts the book draws (100 requests in one
+// millisecond) are spread over the step.
 // Ignored: per-client keys (one aggregate limit for all clients: the book's per-user,
 // per-IP or per-API rules would need flows per key), the race conditions and
 // synchronisation of distributed counters (ch. 4's Lua scripts and sorted sets), the

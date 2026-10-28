@@ -52,6 +52,27 @@ using SimTime = std::chrono::duration<std::int64_t, std::nano>;
   return std::chrono::round<SimTime>(std::chrono::duration<double>(s));
 }
 
+// A duration in the largest unit that divides it exactly, so it reads as a scenario writes
+// it: 10s, 2m, 1500ms. Integer arithmetic on the tick count (nanoseconds) only, so the text
+// is exact for any duration; std::to_string rather than std::format, because importers of
+// this interface must not pull <format> into their own (CLAUDE.md §3).
+[[nodiscard]] inline std::string describe_duration(SimTime t) {
+  struct Unit {
+    std::string_view name;
+    std::int64_t ns;
+  };
+  constexpr std::array units{
+      Unit{"h", 3'600'000'000'000}, Unit{"m", 60'000'000'000}, Unit{"s", 1'000'000'000},
+      Unit{"ms", 1'000'000},        Unit{"us", 1'000},         Unit{"ns", 1}};
+  const std::int64_t ticks = t.count();
+  for (const auto& unit : units) {
+    if (ticks != 0 && ticks % unit.ns == 0) {
+      return std::to_string(ticks / unit.ns) + std::string{unit.name};
+    }
+  }
+  return "0s";
+}
+
 }  // namespace simsys
 
 // Not exported (same reason as the detail block below): the literals call it, but

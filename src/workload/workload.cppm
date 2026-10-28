@@ -165,8 +165,11 @@ class NoiseProcess {
   NoiseProcess(Noise spec, std::uint64_t seed);
 
   // Advances the process by `dt` and returns the multiplier max(0, 1 + x). The floor keeps
-  // the rate non-negative when sigma is large. Throws std::invalid_argument if `dt` is not
-  // positive. With sigma == 0 returns exactly 1.0 without touching the random engine.
+  // the rate non-negative when sigma is large, and so lifts the mean multiplier above 1:
+  //   E[max(0, 1 + sigma Z)] = Phi(1/sigma) + sigma phi(1/sigma)   (Z ~ N(0, 1); Phi, phi
+  // its CDF and density): 1.004 at sigma 0.5, 1.08 at 1, 1.40 at 2, 4.5 at 10. Throws
+  // std::invalid_argument if `dt` is not positive. With sigma == 0 returns exactly 1.0 without
+  // touching the random engine.
   [[nodiscard]] double next(SimTime dt);
 
  private:

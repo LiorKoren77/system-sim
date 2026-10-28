@@ -516,6 +516,9 @@ NodeSpec limiter_of(simsys::model::LimiterAlgorithm algorithm, std::optional<int
 // A windowed algorithm counts limit x window per window; it has no bucket for `burst` to
 // size, so a burst on one is a mistake the graph names, as the loader does for YAML.
 TEST_CASE("a burst on a windowed limiter written in code is rejected", "[graph]") {
+  // C++20 `using enum`: brings the enumerators of a scoped enum into this scope, so the
+  // list below reads `fixed_window` instead of `LimiterAlgorithm::fixed_window`. Replaces
+  // falling back to an unscoped enum (which leaks its names everywhere) to get short names.
   using enum simsys::model::LimiterAlgorithm;
   for (const auto algorithm : {fixed_window, sliding_log, sliding_counter}) {
     const auto g = Graph::build(behind_limiter(limiter_of(algorithm, 50)));
@@ -879,5 +882,7 @@ TEST_CASE("a forwarding cache's backend needs a link from the cache", "[graph]")
   s.links.pop_back();  // cache -> db missing
   const auto g = Graph::build(s);
   REQUIRE_FALSE(g.has_value());
+  // C++23 std::string::contains: a substring test in one call, replacing
+  // `find(...) != std::string::npos`; used where only part of the message is the point.
   REQUIRE(g.error().message.contains("node 'cache': backend 'db' needs a link"));
 }

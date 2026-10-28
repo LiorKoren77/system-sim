@@ -1033,6 +1033,8 @@ TEST_CASE("che hit ratios and write_back are refused until phase 2b", "[theory]"
     REQUIRE(g.has_value());
     const auto sim = Simulation::create(*g);
     REQUIRE_FALSE(sim.has_value());
+    // C++23 std::string::contains and C++20 ends_with: a substring and a suffix test in
+    // one call each, replacing `find(...) != npos` and a compare() on the tail.
     REQUIRE(sim.error().message.contains("phase 2b"));
     REQUIRE(sim.error().message.contains("node 'cache'"));
     REQUIRE(sim.error().message.contains("che"));

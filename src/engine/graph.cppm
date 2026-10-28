@@ -445,11 +445,31 @@ namespace {
   return roots;
 }
 
+// A windowed algorithm moves its counters at window boundaries, and the fluid step sees a
+// boundary only where a step starts: a 150 ms window stepped every 100 ms would reset at
+// 100 ms and 200 ms, a different window with a different limit x window from the one the
+// scenario states. So its window (stated, or the default 1 s) must hold a whole number of
+// steps, at least one. The buckets use the window only to size their default burst.
+[[nodiscard]] std::optional<EngineError> window_off_the_step_grid(const model::NodeSpec& spec,
+                                                                  SimTime step) {
+  const auto algorithm = spec.algorithm.value_or(model::LimiterAlgorithm::token_bucket);
+  if (!model::is_windowed(algorithm)) return std::nullopt;
+  const SimTime window = model::limiter_window(spec);
+  // On the nanosecond counts: this interface does not include <chrono> (CLAUDE.md §3), so the
+  // duration operators are out of reach, as in whole_delay_steps.
+  if (window.count() >= step.count() && window.count() % step.count() == 0) return std::nullopt;
+  return EngineError{"node '" + spec.id +
+                     "': window must be a positive whole number of steps (window " +
+                     describe_duration(window) + ", step " + describe_duration(step) + ")"};
+}
+
 // Graph::build also takes rate limiters written in code, which the loader never checked:
 // the same rules as config's read_limiter_* and check_leaky_bucket_keys (a limit, positive;
 // burst and window positive; a burst only on a bucket; a leaky bucket states nothing but
-// limit and burst, not a queue's own numbers).
-[[nodiscard]] std::optional<EngineError> invalid_limiter(const model::NodeSpec& spec) {
+// limit and burst, not a queue's own numbers). The loader does not know the step's role, so
+// the rule that a windowed limiter's window is a whole number of steps lives only here.
+[[nodiscard]] std::optional<EngineError> invalid_limiter(const model::NodeSpec& spec,
+                                                         SimTime step) {
   const std::string name = "node '" + spec.id + "': ";
   if (!spec.limit) return EngineError{name + "rate_limiter needs a limit"};
   if (!(spec.limit->per_second > 0) || !std::isfinite(spec.limit->per_second)) {
@@ -469,7 +489,7 @@ namespace {
                        "leaky_bucket takes limit and burst; capacity, latency, concurrency, "
                        "queue_limit and service_variability are not valid"};
   }
-  return std::nullopt;
+  return window_off_the_step_grid(spec, step);
 }
 
 // Graph::build also takes caches written in code, which the loader never checked: a fixed
@@ -747,6 +767,8 @@ std::optional<std::size_t> Graph::demand_link(std::size_t from, std::size_t to) 
 // A rate limiter is checked first (it needs a limit), and a leaky bucket's queue is the
 // bucket itself (leaky_bucket_capacity), its rate the scenario's `limit`.
 Graph::Result Graph::resolve_nodes() {
+  // First: the limiter checks below divide by the step.
+  if (scenario_.step.count() <= 0) return std::unexpected{EngineError{"step must be positive"}};
   nodes_.reserve(scenario_.nodes.size());
   for (const auto& spec : scenario_.nodes) {
     if (spec.type == model::NodeType::client) {
@@ -757,7 +779,8 @@ Graph::Result Graph::resolve_nodes() {
       continue;
     }
     if (spec.type == model::NodeType::rate_limiter) {
-      if (auto invalid = invalid_limiter(spec)) return std::unexpected{std::move(*invalid)};
+      if (auto invalid = invalid_limiter(spec, scenario_.step))
+        return std::unexpected{std::move(*invalid)};
     }
     if (is_cache(spec)) {
       if (auto invalid = invalid_cache(spec)) return std::unexpected{std::move(*invalid)};
@@ -785,7 +808,6 @@ Graph::Result Graph::resolve_nodes() {
 // Ids become indices; latency falls back to half the datacenter round trip
 // (defaults::resolve_link_latency), cross-datacenter when the two ends sit in different DCs.
 Graph::Result Graph::resolve_links() {
-  if (scenario_.step.count() <= 0) return std::unexpected{EngineError{"step must be positive"}};
   for (const auto& spec : scenario_.links) {
     const auto from = index_of(spec.from);
     const auto to = index_of(spec.to);
@@ -1346,7 +1368,7 @@ Graph::Result Graph::mark_balanced_targets() {
   for (std::size_t balancer = 0; balancer < nodes_.size(); ++balancer) {
     const auto& spec = nodes_[balancer].spec;
     if (spec.type != model::NodeType::load_balancer) continue;
-    // A scenario built in code may leave the policy out (the loader always fills it in).
+    // An absent policy (the loader leaves it absent, as code may) is round_robin.
     const auto replica_model = replica_model_of(spec.policy.value_or(model::LbPolicy::round_robin));
     const int vnodes = spec.vnodes.value_or(model::default_vnodes);
     if (vnodes <= 0) {

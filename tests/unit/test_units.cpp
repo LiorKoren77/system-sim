@@ -63,6 +63,18 @@ TEST_CASE("parse_duration rejects non-zero values below the 1ns resolution but a
   REQUIRE(simsys::parse_duration("0ms").value() == 0ns);
 }
 
+// Error messages quote durations back to the scenario author, so they must read the way a
+// scenario writes them and parse back to the same value.
+TEST_CASE("a duration is described in the largest unit that divides it exactly") {
+  REQUIRE(simsys::describe_duration(100ms) == "100ms");
+  REQUIRE(simsys::describe_duration(1500ms) == "1500ms");
+  REQUIRE(simsys::describe_duration(1s) == "1s");
+  REQUIRE(simsys::describe_duration(2min) == "2m");
+  REQUIRE(simsys::describe_duration(250us) == "250us");
+  REQUIRE(simsys::describe_duration(0ns) == "0s");
+  REQUIRE(simsys::parse_duration(simsys::describe_duration(1500ms)).value() == 1500ms);
+}
+
 TEST_CASE("parse_duration requires a unit") {
   require_rejected(simsys::parse_duration("5"), "5", "missing duration unit");
 }

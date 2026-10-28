@@ -93,6 +93,11 @@ class DelayLine {
 // reported here and not in `dropped_per_s`. Drops are failures, rejections are the policy
 // working: report::Summary keeps a drop rate and a reject rate apart. A limiter's every op
 // costs 1, so these units are requests.
+// Conservation, per node and per step (the fluid queue's balance, summed over copies):
+//   demand·dt = (drain + dropped)·dt + Δbacklog
+// whatever comes in is served, shed or left waiting. Rejections do not appear as a term of
+// their own: a token-family limiter's (token bucket, windowed) are inside `drain` (its
+// queue looked at them), and a leaky bucket's are the `dropped` term, moved to `rejected`.
 struct NodeSample {
   double demand_per_s{};
   double drain_per_s{};
@@ -492,8 +497,9 @@ Simulation::Simulation(const graph::Graph& g)
 // Pattern: Strategy — each node gets the behaviour of its type, held by value in the
 // behaviours::Behaviour variant and dispatched with std::visit in the forward pass.
 // A client's noise seed is client_seed(scenario seed, node index): one random engine per
-// client, so adding a client never changes another client's noise (spec phase 2a
-// refinement 3), and `simsys curve --noise` derives the same seed.
+// client, so appending a node at the end of the file never changes another client's noise
+// (the seed is the node index; inserting a node earlier shifts the clients after it; spec
+// phase 2a refinement 3), and `simsys curve --noise` derives the same seed.
 Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index) {
   const auto& resolved = g.nodes()[index];
   switch (resolved.spec.type) {
@@ -856,6 +862,9 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSampl
     }
     sojourns[i] = {.share = group.request_share, .latency = copy_step.latency};
   }
+  // C++20 std::span with C++17 class template argument deduction: `std::span{sojourns}`
+  // deduces std::span<Branch, max_copy_groups> from the array without spelling the type,
+  // and first(n) views only the n groups in use, replacing a (pointer, count) pair.
   sample.latency = node.copy_groups.size() == 1
                        ? sojourns[0].latency
                        : behaviours::mixture(std::span{sojourns}.first(node.copy_groups.size()));

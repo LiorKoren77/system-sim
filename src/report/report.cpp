@@ -653,6 +653,13 @@ template <class T, class F>
   return fewest;
 }
 
+// " (default)" after a number the scenario left out, nothing after one it stated (even
+// when it states the default value: provenance is about presence, as in server_details).
+template <class T>
+[[nodiscard]] std::string if_defaulted(const std::optional<T>& stated) {
+  return stated ? std::string{} : " (default)";
+}
+
 // What a load balancer's policy means for this node (plan 2a refinement 5): a balancer's
 // own policy, and on the node behind it `pooled` (least_connections) or the hottest
 // replica's `imbalance` (consistent_hash).
@@ -661,9 +668,10 @@ template <class T, class F>
   std::string text;
   if (node.spec.type == model::NodeType::load_balancer) {
     const auto policy = node.spec.policy.value_or(model::LbPolicy::round_robin);
-    text += "  policy=" + std::string{model::to_string(policy)};
+    text += "  policy=" + std::string{model::to_string(policy)} + if_defaulted(node.spec.policy);
     if (policy == model::LbPolicy::consistent_hash) {
-      text += " vnodes=" + std::to_string(node.spec.vnodes.value_or(model::default_vnodes));
+      text += " vnodes=" + std::to_string(node.spec.vnodes.value_or(model::default_vnodes)) +
+              if_defaulted(node.spec.vnodes);
     }
   }
   if (node.pooled) text += "  pooled";
@@ -682,8 +690,9 @@ template <class T, class F>
   const auto algorithm = spec.algorithm.value_or(model::LimiterAlgorithm::token_bucket);
   std::string text = "  algorithm=" + std::string{model::to_string(algorithm)} +
                      " limit=" + fmt_rate(spec.limit->per_second);
-  text += model::is_windowed(algorithm) ? " window=" + fmt_duration(model::limiter_window(spec))
-                                        : " burst=" + num(model::limiter_burst(spec), 10);
+  text += model::is_windowed(algorithm)
+              ? " window=" + fmt_duration(model::limiter_window(spec)) + if_defaulted(spec.window)
+              : " burst=" + num(model::limiter_burst(spec), 10) + if_defaulted(spec.burst);
   if (spec.backend) text += " backend=" + *spec.backend;
   return text;
 }
@@ -724,26 +733,46 @@ template <class T, class F>
   return text;
 }
 
-[[nodiscard]] std::string server_details(const graph::ResolvedNode& node) {
+// Where each of a queue's four numbers came from, as explain prints it.
+struct QueueProvenance {
+  std::string_view capacity;
+  std::string_view service_time;
+  std::string_view concurrency;
+  std::string_view queue_limit;
+};
+
+[[nodiscard]] bool is_leaky_bucket(const model::NodeSpec& spec) {
+  return spec.type == model::NodeType::rate_limiter &&
+         spec.algorithm == model::LimiterAlgorithm::leaky_bucket;
+}
+
+// A leaky bucket's queue is derived whole from the limiter (graph::leaky_bucket_capacity):
+// it drains at `limit` through one deterministic leak slot and holds `burst`. Any other
+// node's numbers are the scenario's, a default, or (c) implied by Little's law.
+[[nodiscard]] QueueProvenance queue_provenance(const graph::ResolvedNode& node) {
+  if (is_leaky_bucket(node.spec)) return {"(limit)", "(limit)", "(leak slot)", "(burst)"};
   const auto& spec = node.spec;
-  const auto& cap = node.capacity;
   // The graph keeps no provenance for queue_limit, so it is read off the spec: provenance
   // is about presence, not value. A scenario that writes the default (fluid::Capacity's
   // 1000) still wrote it, and explain says so.
   const auto queue_source =
       spec.advanced.queue_limit ? defaults::Source::scenario : defaults::Source::type_default;
   // c is derived by Little's law unless the scenario sets it (defaults::implied_concurrency).
-  const std::string_view concurrency_source =
-      spec.advanced.concurrency ? "(scenario)" : "(implied)";
+  return {provenance(node.service_rate_source), provenance(node.service_time_source),
+          spec.advanced.concurrency ? "(scenario)" : "(implied)", provenance(queue_source)};
+}
+
+[[nodiscard]] std::string server_details(const graph::ResolvedNode& node) {
+  const auto& spec = node.spec;
+  const auto& cap = node.capacity;
+  const auto source = queue_provenance(node);
   const std::array parts{
       "dc=" + spec.dc,
       "replicas=" + std::to_string(spec.replicas),
-      "capacity=" + fmt_rate(cap.service_rate.per_second) + " " +
-          std::string{provenance(node.service_rate_source)},
-      "service_time=" + fmt_duration(cap.service_time_s) + " " +
-          std::string{provenance(node.service_time_source)},
-      "c=" + std::to_string(cap.concurrency) + " " + std::string{concurrency_source},
-      "queue_limit=" + num(cap.queue_limit, 6) + " " + std::string{provenance(queue_source)},
+      "capacity=" + fmt_rate(cap.service_rate.per_second) + " " + std::string{source.capacity},
+      "service_time=" + fmt_duration(cap.service_time_s) + " " + std::string{source.service_time},
+      "c=" + std::to_string(cap.concurrency) + " " + std::string{source.concurrency},
+      "queue_limit=" + num(cap.queue_limit, 6) + " " + std::string{source.queue_limit},
       "variability=" + num(cap.service_variability, 3),
       "burstiness=" + num(cap.burstiness, 3)};
   return join(parts, "  ") + cost_summary(spec);

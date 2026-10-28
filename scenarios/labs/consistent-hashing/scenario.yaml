@@ -29,7 +29,9 @@ nodes:
     eviction: lru
     keys: 2M                                    # per server
     hit_ratio: che
-    strategy: cache_aside
+    strategy: read_through                      # a miss reads db itself
+    backend: db
+    write_ops: [set]                            # a set updates the cache; only gets miss
     capacity: 12k/s
     latency: 0.2ms
 

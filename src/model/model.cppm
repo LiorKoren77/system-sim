@@ -349,20 +349,22 @@ struct NodeSpec {
   // `{..., .ops = ..., .cost = ...}`.
   std::map<std::string, double> cost{};
   // Load balancers only (declared after `cost`, for designated initializers): the policy
-  // (the loader fills in round_robin when the key is absent) and, for consistent_hash,
-  // the virtual nodes per server (absent: default_vnodes).
+  // (absent: round_robin) and, for consistent_hash, the virtual nodes per server (absent:
+  // default_vnodes). The loader leaves an absent key absent, so explain can tell a stated
+  // number from a default; every reader applies the default.
   std::optional<LbPolicy> policy{};
   std::optional<int> vnodes{};
   // Rate limiters only (plan 2a refinement 6; declared after the LB keys, for designated
   // initializers): the algorithm (the loader fills in token_bucket when absent), the limit
   // (required: a limiter without one limits nothing), the burst of the two buckets (requests
-  // a token bucket lets through above the limit at once, the room of a leaky bucket; the
-  // loader fills in limit x window for them and leaves it empty for the windowed algorithms,
-  // which reject one), the window of the windowed algorithms (the loader fills in
-  // default_limiter_window) and the node holding the counters (`backend`, a cache), which
-  // the limiter consults once for every request it checks. A scenario built in code may
-  // leave algorithm, burst and window empty: the behaviour and the graph apply the same
-  // defaults.
+  // a token bucket lets through above the limit at once, the room of a leaky bucket;
+  // absent: limit x window, see limiter_burst; the windowed algorithms reject one), the
+  // window of the windowed algorithms (absent: default_limiter_window, see limiter_window)
+  // and the node holding the counters (`backend`, a cache), which the limiter consults once
+  // for every request it checks. The loader leaves an absent burst or window absent, so
+  // explain can say "(default)"; the behaviour, the graph and the report apply the defaults
+  // through limiter_burst and limiter_window. A scenario built in code may leave the
+  // algorithm empty too.
   std::optional<LimiterAlgorithm> algorithm{};
   std::optional<Rate> limit{};
   std::optional<int> burst{};
@@ -385,12 +387,12 @@ struct NodeSpec {
   std::optional<Workload> workload{};  // clients only
 };
 
-// The window and the burst a rate limiter works with, defaults applied. The loader fills
-// both in, but a scenario built in code may leave them empty, and the behaviour, the graph
-// and explain must agree on one number. Default burst (token and leaky bucket; the windowed
-// algorithms have none): limit x window, rounded up to a whole request and at least one (see
-// config's read_limiter_burst for why); 0 without a limit (Graph::build rejects such a
-// limiter before anything asks).
+// The window and the burst a rate limiter works with, defaults applied. The loader leaves
+// an absent one empty (so explain can say "(default)"), as may a scenario built in code,
+// and the behaviour, the graph and explain must agree on one number. Default burst (token and leaky
+// bucket; the windowed algorithms have none): limit x window, rounded up to a whole request and at
+// least one (see config's read_limiter_burst for why); 0 without a limit (Graph::build rejects such
+// a limiter before anything asks).
 [[nodiscard]] constexpr SimTime limiter_window(const NodeSpec& spec) {
   return spec.window.value_or(default_limiter_window);
 }

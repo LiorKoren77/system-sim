@@ -544,6 +544,60 @@ TEST_CASE("explain prints each node type's policy line", "[report]") {
   }
 }
 
+// A leaky bucket's queue is not configured like a server's: the graph derives all four
+// numbers from the limiter (rate `limit`, one deterministic leak slot, room `burst`), so
+// explain names that source instead of "(scenario)", "(implied)" or "(default)".
+TEST_CASE("explain says a leaky bucket's queue comes from its limit, leak slot and burst",
+          "[report]") {
+  auto s = limited_with_counters();
+  s.nodes[1].algorithm = LimiterAlgorithm::leaky_bucket;
+  s.nodes[1].capacity = std::nullopt;  // a leaky bucket refuses a capacity of its own
+  s.nodes[1].burst = 500;
+  const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(s));
+  CAPTURE(text);
+  REQUIRE(text.find("capacity=1k/s (limit)") != std::string::npos);
+  REQUIRE(text.find("service_time=1ms (limit)") != std::string::npos);
+  REQUIRE(text.find("c=1 (leak slot)") != std::string::npos);
+  REQUIRE(text.find("queue_limit=500 (burst)") != std::string::npos);
+}
+
+// Provenance is about presence, not value: a number the scenario left out says "(default)",
+// a stated one says nothing more, even when it equals the default.
+TEST_CASE("explain marks a defaulted burst, window, policy and vnodes as default", "[report]") {
+  const auto explain = [](const Scenario& s) {
+    return simsys::report::render_explain(*simsys::graph::Graph::build(s));
+  };
+  SECTION("a bucket's burst") {
+    auto s = limited_with_counters();
+    s.nodes[1].burst = std::nullopt;
+    const auto text = explain(s);
+    CAPTURE(text);
+    REQUIRE(text.find("burst=1000 (default) backend=counters") != std::string::npos);
+  }
+  SECTION("a windowed algorithm's window, stated or not") {
+    auto s = limited_with_counters();
+    s.nodes[1].algorithm = LimiterAlgorithm::sliding_log;
+    s.nodes[1].burst = std::nullopt;
+    const auto defaulted = explain(s);
+    CAPTURE(defaulted);
+    REQUIRE(defaulted.find("window=1s (default) backend=counters") != std::string::npos);
+    s.nodes[1].window = 1s;
+    const auto stated = explain(s);
+    CAPTURE(stated);
+    REQUIRE(stated.find("window=1s backend=counters") != std::string::npos);
+  }
+  SECTION("a balancer's policy and vnodes") {
+    auto s = balanced(simsys::model::LbPolicy::round_robin);
+    REQUIRE(explain(s).find("policy=round_robin\n") != std::string::npos);
+    s.nodes[1].policy = std::nullopt;
+    REQUIRE(explain(s).find("policy=round_robin (default)\n") != std::string::npos);
+    s.nodes[1].policy = simsys::model::LbPolicy::consistent_hash;
+    REQUIRE(explain(s).find("policy=consistent_hash vnodes=150 (default)\n") != std::string::npos);
+    s.nodes[1].vnodes = 150;
+    REQUIRE(explain(s).find("policy=consistent_hash vnodes=150\n") != std::string::npos);
+  }
+}
+
 TEST_CASE("explain prints the client's curve summary with wave, spikes and noise", "[report]") {
   using namespace simsys::workload;
   auto s = mm1(100);
@@ -664,6 +718,8 @@ TEST_CASE("explain forwards a cache's then-steps: misses reach the next node", "
   const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(browser_cached()));
   CAPTURE(text);
   // 60 % of 1k/s: the misses of a 0.4 hit ratio.
+  // C++23 std::string::contains: a substring test in one call, replacing
+  // `find(...) != std::string::npos`; the check line has more on it than this test is about.
   REQUIRE(check_line(text, "lb").contains("peak offered 600/s vs 100k/s"));
   REQUIRE(check_line(text, "api").contains("peak offered 600/s vs 5k/s"));
 }
