@@ -1022,11 +1022,10 @@ TEST_CASE("a cache hit ratio of 1 sends nothing to the database and adds none of
 }
 
 // The write_back strategy (acknowledge a write from the cache, flush it to the store later: a
-// queue of dirty entries) and a cache's then steps need machinery phase 2b brings. The graph
-// builds, so explain can print the scenario; running it is refused, naming the phase and the
-// culprit. (The Che hit ratio no longer belongs here: the graph resolves it at build, see the
-// url-shortener test below.)
-TEST_CASE("write_back and cache then steps are refused until phase 2b", "[theory]") {
+// queue of dirty entries) and a cache's then steps ran only in the graph until phase 2b; now
+// the engine runs both, so a scenario that uses them is accepted. (What they do to the flow and
+// the latency is checked by the two cases below.)
+TEST_CASE("write_back caches and cache then steps run in phase 2b", "[theory]") {
   SECTION("the write_back strategy") {
     auto s = cached_reads(0.8);
     s.nodes[2].strategy = CacheStrategy::write_back;
@@ -1036,13 +1035,8 @@ TEST_CASE("write_back and cache then steps are refused until phase 2b", "[theory
     INFO((g ? "" : g.error().message));
     REQUIRE(g.has_value());
     const auto sim = Simulation::create(*g);
-    REQUIRE_FALSE(sim.has_value());
-    // C++23 std::string::contains and C++20 ends_with: a substring and a suffix test in
-    // one call each, replacing `find(...) != npos` and a compare() on the tail.
-    REQUIRE(sim.error().message.contains("phase 2b"));
-    REQUIRE(sim.error().message.contains("node 'cache'"));
-    REQUIRE(sim.error().message.contains("write_back"));
-    REQUIRE(sim.error().message.ends_with("(phase 2b)"));
+    INFO((sim ? "" : sim.error().message));
+    REQUIRE(sim.has_value());
   }
   SECTION("a cache's then steps") {
     auto s = cached_reads(0.8);
@@ -1052,11 +1046,86 @@ TEST_CASE("write_back and cache then steps are refused until phase 2b", "[theory
     INFO((g ? "" : g.error().message));
     REQUIRE(g.has_value());
     const auto sim = Simulation::create(*g);
-    REQUIRE_FALSE(sim.has_value());
-    REQUIRE(sim.error().message.contains("node 'cache'"));
-    REQUIRE(sim.error().message.contains("then"));
-    REQUIRE(sim.error().message.ends_with("(phase 2b)"));
+    INFO((sim ? "" : sim.error().message));
+    REQUIRE(sim.has_value());
   }
+}
+
+// Search autocomplete (ch. 13): 1000 suggestions/s hit the browser cache, which answers 40 %
+// itself; the other 60 % go on to the load balancer and the service. So the service sees
+// 1000 x (1 - 0.4) = 600/s, and a client waits for the cache's own sojourn plus, for the 60 %
+// that miss, the lb and service path (zero-latency links), a hit/miss mixture whose mean is
+//   cache + 0.6 x (lb + svc).
+TEST_CASE("a browser cache in front of a load balancer lets only its misses through",
+          "[theory]") {
+  Scenario s{.name = "browser", .version = 1, .duration = 10s};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"suggest", 1.0}}}},
+      NodeSpec{.id = "browser_cache",
+               .type = NodeType::cache,
+               .capacity = Rate{100'000},
+               .latency = 100us,
+               .then = {Step{.to = "lb", .op = "suggest", .on = StepCondition::miss}},
+               .hit_ratio = HitRatio{.fixed = 0.4},
+               .strategy = CacheStrategy::cache_aside},
+      NodeSpec{.id = "lb", .type = NodeType::load_balancer, .policy = LbPolicy::round_robin},
+      NodeSpec{.id = "svc", .type = NodeType::service, .capacity = Rate{10'000}, .latency = 1ms}};
+  s.links = {LinkSpec{.from = "u", .to = "browser_cache", .latency = 0s},
+             LinkSpec{.from = "browser_cache", .to = "lb", .latency = 0s},
+             LinkSpec{.from = "lb", .to = "svc", .latency = 0s}};
+  const auto g = *Graph::build(s);
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const auto r = (*Simulation::create(g)).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[*g.index_of("browser_cache")].demand_per_s, WithinRel(1000.0, 1e-12));
+  REQUIRE_THAT(r.nodes[*g.index_of("svc")].demand_per_s, WithinRel(600.0, 1e-12));
+  const auto& cache = r.nodes[*g.index_of("browser_cache")].latency;
+  const auto& lb = r.nodes[*g.index_of("lb")].latency;
+  const auto& svc = r.nodes[*g.index_of("svc")].latency;
+  REQUIRE(svc.mean_s > 0.0);
+  REQUIRE(r.responses.size() == 1);
+  REQUIRE_THAT(r.responses[0].response.mean_s,
+               WithinRel(cache.mean_s + 0.6 * (lb.mean_s + svc.mean_s), 1e-9));
+  const auto settled = (*Simulation::create(g)).estimate();
+  REQUIRE_THAT(settled.nodes[*g.index_of("svc")].demand_per_s, WithinRel(600.0, 1e-12));
+}
+
+// Write-back: the cache acknowledges a write from its own memory and flushes it to the store
+// later. The store still has to absorb every write (its demand is the full 100/s: an upper
+// bound, no coalescing), but the client's write latency is the cache's own sojourn: the slow
+// flush is asynchronous and nobody waits for it.
+TEST_CASE("a write_back cache keeps the client's write latency to the cache's own sojourn while "
+          "the backend still sees the writes",
+          "[theory]") {
+  Scenario s{.name = "write-back", .version = 1, .duration = 10s};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"write", 1.0}}}},
+      NodeSpec{.id = "cache",
+               .type = NodeType::cache,
+               .capacity = Rate{100'000},
+               .latency = 100us,
+               .backend = "db",
+               .hit_ratio = HitRatio{.fixed = 0.8},
+               .strategy = CacheStrategy::write_back},
+      NodeSpec{.id = "db", .type = NodeType::service, .capacity = Rate{1000}, .latency = 5ms}};
+  s.links = {LinkSpec{.from = "u", .to = "cache", .latency = 0s},
+             LinkSpec{.from = "cache", .to = "db", .latency = 0s}};
+  const auto g = *Graph::build(s);
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const auto r = (*Simulation::create(g)).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[*g.index_of("db")].demand_per_s, WithinRel(100.0, 1e-12));
+  const auto& cache = r.nodes[*g.index_of("cache")].latency;
+  REQUIRE(cache.mean_s > 0.0);
+  REQUIRE(r.responses.size() == 1);
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(cache.mean_s, 1e-9));
+  REQUIRE_THAT(r.responses[0].answered.per_second, WithinRel(100.0, 1e-9));
 }
 
 // A scenario built in code may hand a cache an empty HitRatio{} (neither a number nor `che`):

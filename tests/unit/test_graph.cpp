@@ -1069,3 +1069,92 @@ TEST_CASE("explain shows a ring-partitioned che cache's capacity as keys × repl
   CAPTURE(round_robin_text);
   REQUIRE(round_robin_text.contains(" (che: zipf 1 over 100k keys from u)"));
 }
+
+// ---- Cache then-steps and write_back (plan 2b, Task 3) ----
+
+namespace {
+// u -> browser_cache -> lb -> svc: the search-autocomplete front. The cache has a fixed hit
+// ratio and the given `then` steps; it forwards to lb only through them. Plain links, as in
+// the scenario file.
+Scenario browser_front(NodeSpec browser_cache) {
+  Scenario s{.name = "browser", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"suggest", 1.0}}), std::move(browser_cache),
+             load_balancer("lb", LbPolicy::round_robin), service("svc")};
+  s.links = {LinkSpec{.from = "u", .to = "browser_cache", .dir = Direction::inout},
+             LinkSpec{.from = "browser_cache", .to = "lb", .dir = Direction::inout},
+             LinkSpec{.from = "lb", .to = "svc", .dir = Direction::inout}};
+  return s;
+}
+}  // namespace
+
+// Search autocomplete (ch. 13): the browser caches suggestions, and only what it misses goes on
+// to the load balancer. The cache's `then: [{to: lb, op: suggest, on: miss}]` is a demand edge
+// like a service's step, and the share of reads it carries is the miss fraction 1 - h.
+TEST_CASE("a cache's then step on miss gets a demand edge carrying the miss fraction", "[graph]") {
+  auto browser_cache = cache("browser_cache", 0.4, CacheStrategy::cache_aside);
+  browser_cache.then = {Step{.to = "lb", .op = "suggest", .on = StepCondition::miss}};
+  const auto built = Graph::build(browser_front(std::move(browser_cache)));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto& g = *built;
+  const auto from = *g.index_of("browser_cache");
+  const auto to = *g.index_of("lb");
+  const auto link = g.demand_link(from, to);
+  REQUIRE(link.has_value());
+  REQUIRE(std::ranges::contains(g.edges(), DemandEdge{.from = from, .to = to, .link = *link}));
+  const auto& step = g.nodes()[from].spec.then.front();
+  REQUIRE_THAT(g.then_fraction(from, step, "suggest"), WithinRel(0.6, 1e-12));
+}
+
+// A read_through cache already fetches the miss itself, from its backend. A then step on miss
+// would fetch the same miss a second time, so the two together are refused.
+TEST_CASE("a then step on miss and a read_through backend both fetching the miss is an error",
+          "[graph]") {
+  auto c = cache("c", 0.5, CacheStrategy::read_through, "db");
+  c.then = {Step{.to = "lb", .op = "read", .on = StepCondition::miss}};
+  Scenario s{.name = "double-fetch", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"read", 1.0}}), std::move(c), service("db"),
+             load_balancer("lb", LbPolicy::round_robin), service("svc")};
+  s.links = {LinkSpec{.from = "u", .to = "c", .dir = Direction::inout},
+             LinkSpec{.from = "c", .to = "db", .dir = Direction::inout},
+             LinkSpec{.from = "c", .to = "lb", .dir = Direction::inout},
+             LinkSpec{.from = "lb", .to = "svc", .dir = Direction::inout}};
+  const auto built = Graph::build(s);
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'c': a then step on miss and a read_through backend both fetch the miss");
+}
+
+// Write-back (general caching practice): the cache acknowledges a write itself and flushes it
+// to the store later. Nobody waits for the flush, so the hop from the cache to the backend is
+// asynchronous: it forwards flow but adds no latency to the caller.
+TEST_CASE("a write_back cache needs a backend and a link, and its flush hop is asynchronous",
+          "[graph]") {
+  const std::vector<Step> to_cache{Step{.to = "cache", .op = "write"}};
+  SECTION("with a backend and a link it builds and the flush hop is asynchronous") {
+    const auto built =
+        Graph::build(cached_web(cache("cache", 0.8, CacheStrategy::write_back, "db"), to_cache));
+    INFO((built ? "" : built.error().message));
+    REQUIRE(built.has_value());
+    const auto c = *built->index_of("cache");
+    const auto db = *built->index_of("db");
+    REQUIRE(built->is_async_hop(c, "write", db, "write"));
+    REQUIRE(std::ranges::contains(built->async_hops(),
+                                  simsys::graph::AsyncHop{.from = c,
+                                                          .op = "write",
+                                                          .to = db,
+                                                          .target_op = "write"}));
+  }
+  SECTION("without a backend it is refused") {
+    const auto built =
+        Graph::build(cached_web(cache("cache", 0.8, CacheStrategy::write_back), to_cache));
+    REQUIRE_FALSE(built.has_value());
+  }
+  SECTION("with a backend but no link from the cache it is refused") {
+    auto s = cached_web(cache("cache", 0.8, CacheStrategy::write_back, "db"), to_cache);
+    s.links.pop_back();  // cache -> db missing
+    const auto built = Graph::build(s);
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message.contains("node 'cache': backend 'db' needs a link"));
+  }
+}

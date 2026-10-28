@@ -1095,3 +1095,130 @@ TEST_CASE(
   REQUIRE_THAT(sent_to(routed, *g.index_of("db2")).rate_of("read").per_second,
                WithinRel(20.0, 1e-12));
 }
+
+// ---- Cache then-steps and write_back (plan 2b, Task 3) ----
+
+namespace {
+// u -> cache -> `target` -> svc. The cache has a fixed hit ratio and the given `then` steps;
+// the link from the cache to the target takes 1 ms one way. `target` is a load balancer when
+// it is called `lb` and a plain service otherwise. Node indices: u 0, cache 1, target 2.
+Scenario then_front(double hit, std::string target, std::vector<Step> then) {
+  Scenario s{.name = "then", .version = 1, .duration = 1min};
+  NodeSpec cache{.id = "cache",
+                 .type = NodeType::cache,
+                 .hit_ratio = HitRatio{.fixed = hit},
+                 .strategy = CacheStrategy::cache_aside};
+  cache.then = std::move(then);
+  NodeSpec target_node{.id = target, .type = NodeType::service};
+  if (target == "lb") {
+    target_node = NodeSpec{.id = "lb", .type = NodeType::load_balancer, .policy = LbPolicy::round_robin};
+  }
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{100}},
+                                           .op_shares = {{"suggest", 1.0}}}},
+             std::move(cache), std::move(target_node)};
+  s.links = {LinkSpec{.from = "u", .to = "cache", .latency = 0s},
+             LinkSpec{.from = "cache", .to = target, .latency = 1ms}};
+  if (target == "lb") {
+    s.nodes.push_back(NodeSpec{.id = "svc", .type = NodeType::service});
+    s.links.push_back(LinkSpec{.from = "lb", .to = "svc", .latency = 0s});
+  }
+  return s;
+}
+}  // namespace
+
+// Search autocomplete's browser cache (ch. 13): a hit is answered from the cache; a miss goes on
+// to the load balancer. The `then` step on miss carries the miss fraction 1 - h of the reads, and
+// the caller pays the hop only on a miss, so the response is a two-point mixture (as for a
+// cache-aside service's on-miss step):
+//   hit  (0.4): own
+//   miss (0.6): own + hop, hop = 2 legs of 1 ms + the lb's response (10 ms) = 12 ms
+//   mean     = own + 0.6 x 12 ms
+//   variance = 0.4 x 0.6 x (12 ms)²           (own and the lb's variances are 0)
+TEST_CASE(
+    "a cache's then step on miss forwards the miss fraction of reads and charges the hop to "
+    "misses",
+    "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(
+      then_front(0.4, "lb", {Step{.to = "lb", .op = "suggest", .on = StepCondition::miss}}));
+  CacheBehaviour cache{g, *g.index_of("cache")};
+  const auto lb = *g.index_of("lb");
+  const auto routed = cache.route(flow_of("suggest", 100), 0s, 100ms);
+  REQUIRE(routed.outgoing.size() == 1);
+  REQUIRE(routed.outgoing[0].target == lb);
+  REQUIRE_THAT(routed.outgoing[0].flow.rate_of("suggest").per_second, WithinRel(60.0, 1e-12));
+  REQUIRE_THAT(routed.outgoing[0].flow.total().per_second, WithinRel(60.0, 1e-12));
+  REQUIRE_THAT(routed.served.rate_of("suggest").per_second, WithinRel(100.0, 1e-12));
+  REQUIRE(routed.rejected.empty());
+
+  const double own = 0.001;
+  std::vector<std::pair<std::size_t, std::string>> asked;
+  const auto r = cache.response("suggest", LatencyEstimate{own, 0.0},
+                                [&](std::size_t node, std::string_view op) {
+                                  asked.emplace_back(node, std::string{op});
+                                  return LatencyEstimate{0.010, 0.0};
+                                });
+  REQUIRE_THAT(r.mean_s, WithinRel(own + 0.6 * 0.012, 1e-12));
+  REQUIRE_THAT(r.variance_s2, WithinRel(0.4 * 0.6 * 0.012 * 0.012, 1e-9));
+  REQUIRE(asked.size() == 1);
+  REQUIRE(asked[0] == std::pair{lb, std::string{"suggest"}});
+
+  // A hit is answered by the cache alone; a miss only as often as the lb answers it.
+  const double delivered =
+      cache.delivered("suggest", 1.0, [](std::size_t, std::string_view) { return 0.5; });
+  REQUIRE_THAT(delivered, WithinRel(0.4 + 0.6 * 0.5, 1e-12));
+}
+
+// `on: always` is the default condition: every request the cache handles, hit or miss, triggers
+// the step (an audit log, say). The flow is the whole input and the hop is paid by every request.
+TEST_CASE("a cache's then step on always forwards everything", "[behaviours]") {
+  const auto g =
+      *simsys::graph::Graph::build(then_front(0.4, "audit", {Step{.to = "audit", .op = "log"}}));
+  CacheBehaviour cache{g, *g.index_of("cache")};
+  const auto audit = *g.index_of("audit");
+  const auto routed = cache.route(flow_of("suggest", 100), 0s, 100ms);
+  REQUIRE(routed.outgoing.size() == 1);
+  REQUIRE(routed.outgoing[0].target == audit);
+  REQUIRE_THAT(routed.outgoing[0].flow.rate_of("log").per_second, WithinRel(100.0, 1e-12));
+  REQUIRE_THAT(routed.outgoing[0].flow.total().per_second, WithinRel(100.0, 1e-12));
+
+  // own 1 ms + the hop (2 legs of 1 ms + the audit's 5 ms): sequential, so the means and the
+  // variances add; no mixture because every request takes the hop.
+  const auto r = cache.response("suggest", LatencyEstimate{0.001, 4e-8},
+                                [&](std::size_t node, std::string_view op) {
+                                  REQUIRE(node == audit);
+                                  REQUIRE(op == "log");
+                                  return LatencyEstimate{0.005, 1e-6};
+                                });
+  REQUIRE_THAT(r.mean_s, WithinRel(0.008, 1e-12));
+  REQUIRE_THAT(r.variance_s2, WithinRel(1.04e-6, 1e-9));
+  const double delivered =
+      cache.delivered("suggest", 1.0, [](std::size_t, std::string_view) { return 0.5; });
+  REQUIRE_THAT(delivered, WithinRel(0.5, 1e-12));
+}
+
+// Write-back (general caching practice): the cache acknowledges a write itself and flushes it to
+// the store later. The flush is a hop nobody waits for: the backend still sees every write (the
+// forwarded flow), but the caller's latency and delivered fraction are the cache's alone.
+TEST_CASE("a write_back cache serves writes itself and flushes them asynchronously",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(cached_front(CacheStrategy::write_back, 0.8, true));
+  CacheBehaviour cache{g, *g.index_of("cache")};
+  const auto db = *g.index_of("db");
+  const auto routed = cache.route(flow_of("write", 50), 0s, 100ms);
+  REQUIRE_THAT(routed.served.rate_of("write").per_second, WithinRel(50.0, 1e-12));
+  REQUIRE(routed.rejected.empty());
+  const auto to_db = sent_to(routed, db);
+  REQUIRE_THAT(to_db.rate_of("write").per_second, WithinRel(50.0, 1e-12));
+  REQUIRE_THAT(to_db.total().per_second, WithinRel(50.0, 1e-12));
+
+  const LatencyEstimate own{0.001, 4e-8};
+  const auto r = cache.response("write", own, [](std::size_t, std::string_view) {
+    return LatencyEstimate{1.0, 0.0};
+  });
+  REQUIRE(r == own);
+  const double delivered =
+      cache.delivered("write", 1.0, [](std::size_t, std::string_view) { return 0.0; });
+  REQUIRE_THAT(delivered, WithinRel(1.0, 1e-12));
+}
