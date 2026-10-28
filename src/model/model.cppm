@@ -21,6 +21,7 @@ module;
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -35,7 +36,7 @@ export namespace simsys::model {
 
 // The node-type catalogue of docs/scenario-schema.md. A scoped enum (`enum class`) so a
 // NodeType never converts silently to int; std::uint8_t because 18 values fit in a byte.
-// The order matches `node_type_names` below (checked at compile time at the end of file).
+// The order matches `node_type_table` below (checked at compile time at the end of file).
 enum class NodeType : std::uint8_t {
   client,
   cdn,
@@ -57,41 +58,84 @@ enum class NodeType : std::uint8_t {
   frontier
 };
 
-// `inline` because an exported variable needs external linkage, which a plain
-// namespace-scope constexpr lacks.
-inline constexpr std::array<std::string_view, 18> node_type_names{"client",
-                                                                  "cdn",
-                                                                  "load_balancer",
-                                                                  "rate_limiter",
-                                                                  "service",
-                                                                  "cache",
-                                                                  "sql_db",
-                                                                  "kv_cluster",
-                                                                  "message_queue",
-                                                                  "worker_pool",
-                                                                  "blob_store",
-                                                                  "search_index",
-                                                                  "ws_gateway",
-                                                                  "service_discovery",
-                                                                  "id_generator",
-                                                                  "external_sink",
-                                                                  "notification_fanout",
-                                                                  "frontier"};
+// One row of the catalogue: an enumerator and its YAML spelling, side by side, so a row
+// can never pair a name with the wrong enumerator.
+struct NodeTypeName {
+  NodeType type;
+  std::string_view name;
+};
 
 // Pattern: Table-driven method — one constant table drives both directions of the
-// enum <-> string mapping, so adding a node type is one enumerator plus one table entry.
+// enum <-> string mapping, so adding a node type is one enumerator plus one row here
+// (plus its defaults: -Wswitch in defaults::for_type is what catches a NEW enumerator,
+// since nothing here can count the enumerators; is_cataloged() then rejects an
+// enumerator that got a case but no row).
+// C++20 std::to_array: builds a std::array from a braced list and deduces its size, so
+// the 18 is never written by hand. Replaces `std::array<NodeTypeName, 18>{...}`, whose
+// count must be kept in sync manually (CTAD alone cannot deduce from nested braces).
+// `inline` is not needed for linkage: a const variable in a module interface's purview
+// already has external linkage in C++20 ([basic.link]/3.2), unlike a header constant.
+// It is kept so the declaration reads like the C++17 header-style constants students know.
+inline constexpr auto node_type_table = std::to_array<NodeTypeName>({
+    {NodeType::client, "client"},
+    {NodeType::cdn, "cdn"},
+    {NodeType::load_balancer, "load_balancer"},
+    {NodeType::rate_limiter, "rate_limiter"},
+    {NodeType::service, "service"},
+    {NodeType::cache, "cache"},
+    {NodeType::sql_db, "sql_db"},
+    {NodeType::kv_cluster, "kv_cluster"},
+    {NodeType::message_queue, "message_queue"},
+    {NodeType::worker_pool, "worker_pool"},
+    {NodeType::blob_store, "blob_store"},
+    {NodeType::search_index, "search_index"},
+    {NodeType::ws_gateway, "ws_gateway"},
+    {NodeType::service_discovery, "service_discovery"},
+    {NodeType::id_generator, "id_generator"},
+    {NodeType::external_sink, "external_sink"},
+    {NodeType::notification_fanout, "notification_fanout"},
+    {NodeType::frontier, "frontier"},
+});
+
+// C++20 `consteval`: an immediate function, which may ONLY run at compile time (calling
+// it at run time is a compile error). Stronger than constexpr, which merely allows it;
+// right here because this is a build-time proof, used in static_assert below and in the
+// tests. Row i must hold the enumerator whose value is i, so indexing the table by
+// std::to_underlying(type) is correct.
+[[nodiscard]] consteval bool table_follows_enum_order() {
+  for (std::size_t i = 0; i < node_type_table.size(); ++i) {
+    if (std::to_underlying(node_type_table[i].type) != i) return false;
+  }
+  return true;
+}
+
+// The names alone, derived from the table at compile time (an immediately invoked
+// constexpr lambda), for callers that iterate the catalogue's spellings.
+inline constexpr auto node_type_names = [] {
+  std::array<std::string_view, node_type_table.size()> names{};
+  for (std::size_t i = 0; i < names.size(); ++i) names[i] = node_type_table[i].name;
+  return names;
+}();
+
 // C++23 std::to_underlying: the enum's integer value without a static_cast that could
 // silently accept the wrong type (it always yields exactly the underlying type).
+// False for a value cast from an integer that names no enumerator.
+[[nodiscard]] constexpr bool is_cataloged(NodeType t) {
+  return std::to_underlying(t) < node_type_table.size();
+}
+
 // constexpr function: callable at run time *and* in constant expressions, which is what
 // lets the static_asserts below (and in the tests) check the table during compilation.
+// An uncataloged value is a programmer error (the loader only produces valid types).
 [[nodiscard]] constexpr std::string_view to_string(NodeType t) {
-  return node_type_names[std::to_underlying(t)];
+  if (!is_cataloged(t)) throw std::invalid_argument{"unknown NodeType"};
+  return node_type_table[std::to_underlying(t)].name;
 }
 
 // The inverse of to_string; std::nullopt for a name not in the catalogue.
 [[nodiscard]] constexpr std::optional<NodeType> parse_node_type(std::string_view name) {
-  for (std::size_t i = 0; i < node_type_names.size(); ++i) {
-    if (node_type_names[i] == name) return static_cast<NodeType>(i);
+  for (const auto& row : node_type_table) {
+    if (row.name == name) return row.type;
   }
   return std::nullopt;
 }
@@ -134,6 +178,8 @@ struct Workload {
 
 struct NodeSpec {
   std::string id{};
+  // Value-initialized to the first enumerator, client. The loader always sets it from the
+  // YAML `type:` key, and tests must set it too: a forgotten type is a silent client.
   NodeType type{};
   std::string dc{"main"};
   int replicas{1};
@@ -195,7 +241,7 @@ struct Scenario {
 
 }  // namespace simsys::model
 
-// Compile-time table check: a missing or misordered entry in node_type_names breaks the
-// build here, not a scenario at run time.
-static_assert(simsys::model::node_type_names.size() == 18);
+// Compile-time table check: a misordered row in node_type_table breaks the build here,
+// not a scenario at run time.
+static_assert(simsys::model::table_follows_enum_order());
 static_assert(simsys::model::parse_node_type("frontier") == simsys::model::NodeType::frontier);
