@@ -582,6 +582,7 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
   const std::array fields{json_field("client", json_string(op.client)),
                           json_field("op", json_string(op.op)),
                           json_field("offered_per_s", json_number(op.offered_per_s)),
+                          json_field("answered_per_s", json_number(op.answered_per_s)),
                           json_field("mean_s", json_number(op.mean_s)),
                           json_field("p50_s", json_number(op.p50_s)),
                           json_field("p95_s", json_number(op.p95_s)),
@@ -1499,6 +1500,66 @@ struct PaperLoad {
   return flagged;
 }
 
+// ---- load the paper pass cannot follow yet ----
+//
+// The paper load (paper_pass, forward_steps) forwards from a client's routes, along a service's
+// (or any node's) `ops` steps, through load balancers and rate limiters over their links
+// (graph::forwards_by_link) and from caches and CDNs on their misses (graph::hits_or_misses).
+// It does not follow a blob store's or a worker pool's `then`, nor a message queue's
+// consumers (phase 2c; a worker pool's work comes from the queue it consumes, over a link, not
+// along a step), nor the `then` of a notification fan-out or a URL frontier (types without a
+// phase yet). A node fed only through one of those shows 0 offered load: a missing number, not
+// a zero, and a verdict on it ("0%, green") would read as "this tier is idle". Its check line
+// says so instead.
+
+// Until when the paper load leaves unfollowed what a node of `type` sends on: "phase 2c", "not
+// modelled yet", or nothing for a type it follows (or that sends nothing on).
+[[nodiscard]] std::optional<std::string_view> unfollowed_until(model::NodeType type) {
+  using enum model::NodeType;  // C++20, as in provenance
+  if (type == blob_store || type == message_queue || type == worker_pool) return "phase 2c";
+  if (type == notification_fanout || type == frontier) return "not modelled yet";
+  return std::nullopt;
+}
+
+// Per node, the node whose onward flow the paper load does not follow and that this node's load
+// would come through: its nearest such predecessor over a demand link, directly (transcode_q
+// behind youtube's blob store) or through nodes that are themselves unreached (a service fed only
+// by a queue's consumers). Only for a node the paper load gave nothing at all: a node with some
+// load keeps its verdict (an underestimate when part of its load is missing; youtube's
+// metadata_db and metadata_cache also take the completion handler's writes). Solved by repeated
+// sweeps, so the file's node order does not matter; each sweep marks at least one node or ends.
+[[nodiscard]] std::vector<std::optional<std::size_t>> unpropagated_through(
+    const graph::Graph& g, std::span<const double> totals) {
+  const auto count = g.nodes().size();
+  std::vector<std::optional<std::size_t>> through(count);
+  const auto blocker = [&](std::size_t from) -> std::optional<std::size_t> {
+    if (unfollowed_until(g.nodes()[from].spec.type)) return from;
+    return through[from];
+  };
+  for (bool marked = true; marked;) {
+    marked = false;
+    for (std::size_t node = 0; node < count; ++node) {
+      const bool reached = totals[node] > 0.0 || !std::isfinite(totals[node]);
+      if (through[node] || reached || g.nodes()[node].spec.type == model::NodeType::client) {
+        continue;
+      }
+      for (std::size_t from = 0; from < count && !through[node]; ++from) {
+        if (from == node || !g.demand_link(from, node)) continue;
+        through[node] = blocker(from);
+      }
+      marked = marked || through[node].has_value();
+    }
+  }
+  return through;
+}
+
+// "(load not propagated: blob_store is phase 2c)": what stands in for a percentage and a zone.
+[[nodiscard]] std::string unpropagated_mark(const graph::Graph& g, std::size_t through) {
+  const auto type = g.nodes()[through].spec.type;
+  return "(load not propagated: " + std::string{model::to_string(type)} + " is " +
+         std::string{*unfollowed_until(type)} + ")";
+}
+
 // Behind a hash ring (imbalance k > 1) the group's average hides the copy that breaks
 // first: the hottest of N copies is sent k / N of the offered load against ONE copy's
 // capacity (engine::Simulation::make_server models it apart). The consistent-hashing lab's
@@ -1580,15 +1641,21 @@ struct PaperLoad {
 // and no zone: "(not checked: capacity from 100GB/s at 1MB/object; byte flows: phase 2c)". The
 // object size is an assumption no scenario states (youtube streams 50 MB), so a verdict on it
 // would be one on an invented number; the engine refuses to run a CDN sized so for that reason.
-[[nodiscard]] std::string check_details(const graph::ResolvedNode& node, double offered,
-                                        const std::optional<graph::DatabaseCopyLoads>& loads) {
+// "peak offered 1.5k/s vs 2k/s total capacity  ": what every check line opens with.
+[[nodiscard]] std::string check_head(const graph::ResolvedNode& node, double offered) {
   const double copies = node.spec.replicas * node.spec.shards.value_or(1);
   const double total_capacity = node.capacity.service_rate.per_second * copies;
   const std::string offered_text = node.spec.type == model::NodeType::sql_db
                                        ? with_si_prefix(offered) + " units/s"
                                        : fmt_rate(offered);
-  const std::string head =
-      "peak offered " + offered_text + " vs " + fmt_rate(total_capacity) + " total capacity  ";
+  return "peak offered " + offered_text + " vs " + fmt_rate(total_capacity) + " total capacity  ";
+}
+
+[[nodiscard]] std::string check_details(const graph::ResolvedNode& node, double offered,
+                                        const std::optional<graph::DatabaseCopyLoads>& loads) {
+  const double copies = node.spec.replicas * node.spec.shards.value_or(1);
+  const double total_capacity = node.capacity.service_rate.per_second * copies;
+  const std::string head = check_head(node, offered);
   if (const auto bytes = defaults::byte_rate_behind(node.spec)) {
     return head + "(not checked: capacity from " + byte_conversion(*bytes) + ")";
   }
@@ -1598,21 +1665,30 @@ struct PaperLoad {
          hottest_copy_check(node, offered);
 }
 
+// One node's check line: the head and its verdict, or, for a node the paper load could not reach
+// (unpropagated_through), the head and the mark instead of any verdict, per copy neither.
+[[nodiscard]] std::string check_line(const graph::Graph& g, std::size_t i, const PaperLoad& load,
+                                     const std::vector<bool>& upper_bound,
+                                     std::optional<std::size_t> unpropagated) {
+  const auto& node = g.nodes()[i];
+  if (unpropagated) return check_head(node, load.totals[i]) + unpropagated_mark(g, *unpropagated);
+  const std::string note =
+      upper_bound[i] ? " (hit ratio unknown: counted as 0 — an upper bound)" : "";
+  // A capacity converted from bytes gets no verdict (check_details), per copy neither.
+  const auto loads =
+      defaults::byte_rate_behind(node.spec) ? std::nullopt : database_loads(node, load.by_op[i]);
+  return check_details(node, load.totals[i], loads) + database_check(node, loads) + note;
+}
+
 [[nodiscard]] std::string explain_checks(const graph::Graph& g) {
   const auto load = paper_load(g);
   const auto upper_bound = counts_unknown_hit_ratio(g);
+  const auto unpropagated = unpropagated_through(g, load.totals);
   std::vector<Row> rows;
   for (std::size_t i = 0; i < g.nodes().size(); ++i) {
     const auto& node = g.nodes()[i];
     if (node.spec.type == model::NodeType::client) continue;  // a source: see its offered=
-    const std::string note =
-        upper_bound[i] ? " (hit ratio unknown: counted as 0 — an upper bound)" : "";
-    // A capacity converted from bytes gets no verdict (check_details), per copy neither.
-    const auto loads =
-        defaults::byte_rate_behind(node.spec) ? std::nullopt : database_loads(node, load.by_op[i]);
-    rows.push_back(
-        {{node.spec.id},
-         {check_details(node, load.totals[i], loads) + database_check(node, loads) + note}});
+    rows.push_back({{node.spec.id}, {check_line(g, i, load, upper_bound, unpropagated[i])}});
   }
   const std::string note = load.converged ? "" : "  (no steady state: a loop of gain >= 1)\n";
   const std::string header = "checks (peak offered load over the first " +
@@ -1626,6 +1702,8 @@ struct PaperLoad {
                                          const engine::NodeSample& n) {
   const std::array fields{t_s,
                           id,
+                          num(n.demand_per_s, 6),
+                          num(n.drain_per_s, 6),
                           num(n.rho, 6),
                           num(n.backlog, 6),
                           num(n.dropped_per_s, 6),
@@ -1637,7 +1715,20 @@ struct PaperLoad {
 
 // A client is a source: no queue, so zeros where a server has numbers and zone `none`.
 [[nodiscard]] std::string csv_client_row(const std::string& t_s, const std::string& id) {
-  return t_s + "," + id + ",0,0,0,0,0,none\n";
+  return t_s + "," + id + ",0,0,0,0,0,0,0,none\n";
+}
+
+// One (client, op) of a step: what it offered, what came back answered, and the mean
+// response of an answered request in milliseconds (`inf` when the path never answers).
+[[nodiscard]] std::string csv_op_row(const std::string& t_s, const std::string& client,
+                                     const engine::ResponseSample& r) {
+  const std::array fields{t_s,
+                          client,
+                          r.op,
+                          num(r.offered.per_second, 6),
+                          num(r.answered.per_second, 6),
+                          num(r.response.mean_s * 1000.0, 6)};
+  return join(fields, ",") + "\n";
 }
 
 }  // namespace
@@ -1682,6 +1773,7 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
 // 0 × inf = NaN can reach the sums.
 void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
   offered += sample.offered.per_second * dt_s;
+  answered += sample.answered.per_second * dt_s;
   const auto& response = sample.response;
   if (!std::isfinite(response.mean_s) || !std::isfinite(response.variance_s2)) {
     unavailable = true;
@@ -1767,7 +1859,8 @@ std::vector<OpSummary> Summary::ops() const {
   for (const auto& t : ops_) {
     OpSummary op{.client = graph_->nodes()[t.client].spec.id,
                  .op = t.op,
-                 .offered_per_s = observed_s_ > 0.0 ? t.offered / observed_s_ : 0.0};
+                 .offered_per_s = observed_s_ > 0.0 ? t.offered / observed_s_ : 0.0,
+                 .answered_per_s = observed_s_ > 0.0 ? t.answered / observed_s_ : 0.0};
     const Moments& m = t.by_answered.weight > 0.0 ? t.by_answered : t.by_time;
     if (t.unavailable) {
       op.mean_s = op.p50_s = op.p95_s = op.p99_s = infinity;
@@ -1909,14 +2002,26 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
     ids_.push_back(node.spec.id);
     is_client_.push_back(node.spec.type == model::NodeType::client);
   }
-  *out_ << "t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone\n";
+  *out_ << "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,"
+           "latency_ms,zone\n";
 }
 
 // CSV is for machines, so every numeric column always holds a number:
 // - `t_s` is the shortest form that reads back to the same double (0.1, 2, 0.35), not a
-//   fixed number of decimals that would round a fine step away;
-// - a client row writes 0 in rho, backlog, drops_per_s, rejected_per_s and latency_ms (a
-//   source has no queue) and `none` as its zone, so a plot can filter clients out by zone;
+//   fixed number of decimals that would round a fine step away; the other numbers have 6
+//   significant digits;
+// - `demand_per_s` is what reached the node, `drain_per_s` what its queue served, both in
+//   capacity units (engine::NodeSample). With `drops_per_s` and `backlog` they balance, step
+//   by step and so over a run that starts empty (the fluid queue's conservation law):
+//       Σ demand·dt = Σ (drain + drops)·dt + backlog at the end
+//   whatever came in was served, shed or is still waiting. A limiter's rejections are not a
+//   term of their own (engine::NodeSample): a token bucket's or a window algorithm's were
+//   drained by its queue before it refused them, so they are inside `drain` (and
+//   `rejected_per_s` says how much of it); a leaky bucket's are its queue's overflow, written
+//   in `rejected_per_s` instead of `drops_per_s`, so for one the identity takes them in the
+//   drops' place;
+// - a client row writes 0 in every numeric column (a source has no queue) and `none` as its
+//   zone, so a plot can filter clients out by zone;
 // - an infinite latency is written as `inf` (which spreadsheet and plotting tools parse),
 //   unlike the table ("unavailable") and JSON (null), read by people or by parsers
 //   without an infinity.
@@ -1925,6 +2030,26 @@ void SeriesWriter::observe(const engine::StepRecord& record) {
   for (std::size_t i = 0; i < ids_.size() && i < record.nodes.size(); ++i) {
     *out_ << (is_client_[i] ? csv_client_row(t_s, ids_[i])
                             : csv_server_row(t_s, ids_[i], record.nodes[i]));
+  }
+}
+
+// ---- OpSeriesWriter ----
+
+OpSeriesWriter::OpSeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out} {
+  for (const auto& node : g.nodes()) ids_.push_back(node.spec.id);
+  *out_ << "t_s,client,op,offered_per_s,answered_per_s,mean_ms\n";
+}
+
+// One row per response sample, in the record's order (clients by node index, ops by name), with
+// the node series' conventions (SeriesWriter::observe): `t_s` in its shortest form, 6
+// significant digits, `inf` for a mean of a path that never answers. answered = offered × the
+// fraction the path delivered (engine::ResponseSample): below offered when a limiter refused or
+// a queue dropped some of the requests, never above. A sample whose client is not a node of the
+// writer's graph is a programmer error (a record of another simulation): `at` throws.
+void OpSeriesWriter::observe(const engine::StepRecord& record) {
+  const auto t_s = shortest(seconds(record.t));
+  for (const auto& sample : record.responses) {
+    *out_ << csv_op_row(t_s, ids_.at(sample.client), sample);
   }
 }
 

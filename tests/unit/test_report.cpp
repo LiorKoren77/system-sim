@@ -324,14 +324,16 @@ TEST_CASE("the series writer emits a header and one row per node per step; clien
   const auto text = out.str();
   // C++20 std::string::starts_with (and its twin ends_with): a prefix test in one call,
   // replacing `compare(0, prefix.size(), prefix) == 0` and its length bookkeeping.
-  REQUIRE(text.starts_with("t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone\n"));
+  REQUIRE(
+      text.starts_with("t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,"
+                       "latency_ms,zone\n"));
   // C++20 std::ranges::count: counts the matches in a whole range (here the characters of
   // the string), replacing std::count(text.begin(), text.end(), '\n').
   REQUIRE(std::ranges::count(text, '\n') == 1 + 3 * 2);
   REQUIRE(text.find("\n0.1,s,") != std::string::npos);  // shortest round-trip form of 0.1 s
   // A client is a source: its numeric columns are 0 (machines keep a number) and its zone
   // is `none` (it has no queue to colour).
-  REQUIRE(text.find("\n0,c,0,0,0,0,0,none\n") != std::string::npos);
+  REQUIRE(text.find("\n0,c,0,0,0,0,0,0,0,none\n") != std::string::npos);
 }
 
 TEST_CASE("render_explain lists every node with its resolved numbers and provenance", "[report]") {
@@ -451,9 +453,9 @@ TEST_CASE("the series writer emits rejected_per_s", "[report]") {
   std::string field;
   std::istringstream cells{line};
   while (std::getline(cells, field, ',')) fields.push_back(field);
-  REQUIRE(fields.size() == 8);
-  REQUIRE(fields[4] == "0");     // drops_per_s
-  REQUIRE(fields[5] == "3000");  // rejected_per_s
+  REQUIRE(fields.size() == 10);  // demand_per_s and drain_per_s after node (plan 2b ref. 7)
+  REQUIRE(fields[6] == "0");     // drops_per_s
+  REQUIRE(fields[7] == "3000");  // rejected_per_s
 }
 
 // Plan 2a refinement 8: a request that was rejected or dropped is not answered and sees no
@@ -655,7 +657,8 @@ TEST_CASE("the CSV series has the rejected_per_s column right after drops_per_s"
   simsys::report::SeriesWriter writer{out, g};
   const auto text = out.str();  // the header is written on construction, before any step
   REQUIRE(text.substr(0, text.find('\n') + 1) ==
-          "t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone\n");
+          "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,"
+          "zone\n");
 }
 
 namespace {
