@@ -433,7 +433,7 @@ struct NodeSpec {
   std::string dc{"main"};
   int replicas{1};
   std::optional<Rate> capacity{};           // per replica; absent -> type default
-  std::optional<ByteRate> byte_capacity{};  // blob stores, CDNs (byte flows: phase 2c)
+  std::optional<ByteRate> byte_capacity{};  // blob stores, CDNs: they count megabytes
   std::optional<SimTime> latency{};         // service time; absent -> type default
   Advanced advanced{};
   std::map<std::string, std::vector<Step>> ops{};  // incoming op -> steps (service, ws_gateway)

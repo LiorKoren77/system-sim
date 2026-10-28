@@ -1019,26 +1019,35 @@ class SqlDbBehaviour {
 // "A read" is every op that is not one of the CDN's write ops (model::write_ops_of: `write`, or
 // the scenario's `write_ops`), and it takes no writes: graph::Graph::build refuses a write op
 // that reaches one, and explain lists the ops it serves.
-// Ignored: bytes (a CDN sized in `capacity: 100GB/s` waits for phase 2c's byte flows; the engine
-// refuses it, explain does not check it), the TTL and the stale content it serves (`ttl` is
-// accepted and not modelled), a cold edge warming up, invalidation, ch. 1's "CDN fallback" (the
-// clients going to the origin while the CDN is down: phase 3's faults), the choice of the nearest
-// PoP (a client's links say which CDN it uses) and the CDN's price.
+// Bytes (plan 2c refinement 2): a CDN sized in bytes (`capacity: 100GB/s`) counts megabytes, as a
+// blob store does (BlobStoreBehaviour has the model and its bounds): 100k units/s of 1 MB, a
+// 50 MB stream costs 50 of them, the 10 ms service time is one megabyte's, so c = 100k/s × 10 ms
+// = 1000 streams in flight and the CDN saturates at 100e9 / 50e6 = 2k streams/s. What it forwards
+// to the origin is still the miss share of the REQUESTS: a cost prices work here, it does not
+// multiply requests. A CDN sized in requests (the default 100k/s) charges 1 per request whatever
+// its size.
+// Ignored: the TTL and the stale content it serves (`ttl` is accepted and not modelled), a cold
+// edge warming up, invalidation, ch. 1's "CDN fallback" (the clients going to the origin while
+// the CDN is down: phase 3's faults), the choice of the nearest PoP (a client's links say which
+// CDN it uses), the CDN's price, and, sized in bytes, the transfer time of all but a stream's
+// first megabyte (see BlobStoreBehaviour).
 // Pattern: Delegation (composition over inheritance) — a CDN IS the read_through shape of a
-// cache, so CdnBehaviour holds a CacheBehaviour and forwards every call to it rather than
-// restating route/response/delivered. graph::Graph resolves the origin as the cache's backend
-// (ResolvedNode::backend) with the read_through share, which is all CacheBehaviour reads.
+// cache, so CdnBehaviour holds a CacheBehaviour and forwards route/response/delivered to it
+// rather than restating them. graph::Graph resolves the origin as the cache's backend
+// (ResolvedNode::backend) with the read_through share, which is all CacheBehaviour reads. Only
+// cost() is its own: a cache counts requests, a CDN may count megabytes.
 class CdnBehaviour {
  public:
-  CdnBehaviour(const graph::Graph& g, std::size_t self) : cache_{g, self} {}
+  CdnBehaviour(const graph::Graph& g, std::size_t self);
 
   // Serves every read and forwards rate × (1 − h) of it to the origin (the class comment).
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const {
     return cache_.route(in, now, dt);
   }
 
-  // Capacity units one request of `op` consumes: 1 (a CDN has no `cost` key).
-  [[nodiscard]] double cost(std::string_view op) const { return cache_.cost(op); }
+  // Capacity units one request of `op` consumes (graph::op_cost): its megabytes when the CDN is
+  // sized in bytes, else 1 (a CDN has no `cost` key).
+  [[nodiscard]] double cost(std::string_view op) const;
 
   // own + (1 − h) × the origin hop, as a hit/miss mixture (the class comment).
   [[nodiscard]] flow::LatencyEstimate response(std::string_view op, flow::LatencyEstimate own,
@@ -1054,18 +1063,73 @@ class CdnBehaviour {
 
  private:
   CacheBehaviour cache_;
+  std::map<std::string, double, std::less<>> cost_by_op_;  // every op that reaches the CDN
+};
+
+// Models: the blob storage of System Design Interview (Alex Xu, vol. 1) ch. 14 ("Design YouTube":
+// the original storage that keeps the uploaded videos and the transcoded storage the CDN fetches
+// from) and ch. 15 ("Design Google Drive": the cloud storage, S3 in the book, that keeps the
+// file blocks, and its cold storage). Plan 2c refinement 2. Captured: a store whose capacity is
+// a byte rate counts MEGABYTES (defaults::byte_unit). Its capacity is bytes/s ÷ 1 MB units/s
+// (spec §6's default "blob 500 MB/s" is 500 units/s), a request costs its size in megabytes
+// (graph::op_cost: Graph::request_bytes / 1 MB, a 50 MB upload 50 units, a 2 KB read 0.002), and
+// its service time is ONE megabyte's (default 40 ms: the book's "read 1 MB sequentially from
+// disk", 30 ms, plus "... from the network", 10 ms), so Little's law gives c = 500/s × 40 ms = 20
+// transfers at once. It serves every op the same way (a byte is a byte, read or written) and
+// forwards nothing: a leaf, as a database is.
+//   demand   = Σ_op rate_op × size_op / 1 MB   units/s; rho = demand / capacity
+//   response = Wq + one megabyte's service time (M/M/c's wait, Erlang C, over the units)
+// The response is the time to FIRST BYTE, the small-object bound. A 2 KB read costs 0.002 units
+// but is answered in the whole 40 ms of one unit (an upper bound for small objects: a real store
+// answers it in about a disk seek), and a 50 MB object's other 49 MB are not added: the client
+// reads the rest as it streams in, overlapping the transfer, and the model's response time is
+// when the answer starts (a 300 MB upload at 25 MB/s takes 12 s, which no reported percentile
+// shows). The capacity does count every megabyte, so large objects queue everyone behind them.
+// Ignored: durability (replication across regions, erasure coding: the store never loses an
+// object and never fails), multipart and resumable uploads (an object is one request), lifecycle
+// rules (moving old objects to cold storage), that a request's megabytes arrive together (an M^X
+// batch, which waits longer than the Poisson units the queue assumes), and `then` steps: they
+// are event notifications (S3 event notifications, ch. 14's "transcoding starts when the upload
+// completes"), phase 2c Task 4; until then the engine refuses a store that has them.
+class BlobStoreBehaviour {
+ public:
+  BlobStoreBehaviour(const graph::Graph& g, std::size_t self);
+
+  // Serves every incoming op and forwards nothing. `now` and `dt` are unused (a store holds no
+  // state between steps).
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+
+  // Capacity units one request of `op` uses (graph::op_cost): its megabytes, or 1 for a store
+  // whose capacity the scenario states in requests (`capacity: 500/s`).
+  [[nodiscard]] double cost(std::string_view op) const;
+
+  // Its own sojourn: a blob store calls nobody.
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view /*op*/, flow::LatencyEstimate own,
+                                               ResponseLookup auto&& /*downstream*/) const {
+    return own;
+  }
+
+  // The share of the op's requests the store answers itself: no downstream to fail them.
+  [[nodiscard]] double delivered(std::string_view /*op*/, double own,
+                                 FractionLookup auto&& /*downstream*/) const {
+    return own;
+  }
+
+ private:
+  std::map<std::string, double, std::less<>> cost_by_op_;  // every op that reaches the store
 };
 
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
 // std::visit; a std::variant instead of an abstract base keeps every behaviour a plain
 // value (no heap allocation, no virtual calls, copyable). Phase 2a appended the load
-// balancer, the rate limiter and the cache, phase 2b the SQL database and the CDN; later phases
-// append the rest (queue, ...).
+// balancer, the rate limiter and the cache, phase 2b the SQL database and the CDN, phase 2c the
+// blob store; later phases append the rest (queue, ...).
 // C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
 // it holds) dispatched with std::visit. Closed: adding an alternative means editing this
 // line, and every std::visit that does not handle it then fails to compile.
-using Behaviour = std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour,
-                               RateLimiterBehaviour, CacheBehaviour, SqlDbBehaviour, CdnBehaviour>;
+using Behaviour =
+    std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour, RateLimiterBehaviour,
+                 CacheBehaviour, SqlDbBehaviour, CdnBehaviour, BlobStoreBehaviour>;
 
 }  // namespace simsys::behaviours
 
@@ -1079,6 +1143,7 @@ static_assert(NodeBehaviour<RateLimiterBehaviour>);
 static_assert(NodeBehaviour<CacheBehaviour>);
 static_assert(NodeBehaviour<SqlDbBehaviour>);
 static_assert(NodeBehaviour<CdnBehaviour>);
+static_assert(NodeBehaviour<BlobStoreBehaviour>);
 static_assert(RequestSource<ClientBehaviour>);
 
 namespace detail {
@@ -1099,6 +1164,33 @@ namespace detail {
 // Replaces a hand-written comparator lambda that repeats the key on both sides.
 void sort_by_destination(std::vector<Outgoing>& outgoing) {
   std::ranges::sort(outgoing, {}, [](const Outgoing& o) { return std::pair{o.target, o.link}; });
+}
+
+// What a leaf (a database, a blob store) does with a step's flow: serves all of it, forwards
+// nothing, rejects nothing.
+[[nodiscard]] Routed serve_everything(const flow::Flow& in) {
+  Routed routed;
+  for (const auto& [op, rate] : in.entries()) {
+    if (rate.per_second <= 0.0) continue;  // no empty entries (see ServiceBehaviour::route)
+    routed.served.add(op, rate);
+  }
+  return routed;
+}
+
+// The price of one request of every op that reaches `self` (graph::op_cost), resolved once so
+// cost() is one lookup per op and step.
+[[nodiscard]] std::map<std::string, double, std::less<>> arriving_op_costs(const graph::Graph& g,
+                                                                           std::size_t self) {
+  std::map<std::string, double, std::less<>> costs;
+  for (const auto& op : g.arriving_ops(self)) costs.emplace(op, graph::op_cost(g, self, op));
+  return costs;
+}
+
+// The price of `op` from such a table: 1 for an op not in it (one that never reaches the node).
+[[nodiscard]] double cost_in(const std::map<std::string, double, std::less<>>& costs,
+                             std::string_view op) {
+  const auto found = costs.find(op);
+  return found == costs.end() ? 1.0 : found->second;
 }
 
 }  // namespace detail
@@ -1559,12 +1651,30 @@ bool SqlDbBehaviour::is_write(std::string_view op) const {
 }
 
 Routed SqlDbBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
-  Routed routed;
-  for (const auto& [op, rate] : in.entries()) {
-    if (rate.per_second <= 0.0) continue;  // no empty entries (see ServiceBehaviour::route)
-    routed.served.add(op, rate);
-  }
-  return routed;
+  return detail::serve_everything(in);
+}
+
+// ---- CdnBehaviour ----
+
+CdnBehaviour::CdnBehaviour(const graph::Graph& g, std::size_t self)
+    : cache_{g, self}, cost_by_op_{detail::arriving_op_costs(g, self)} {}
+
+double CdnBehaviour::cost(std::string_view op) const {
+  return detail::cost_in(cost_by_op_, op);
+}
+
+// ---- BlobStoreBehaviour ----
+
+// Graph::build resolved every arriving op's size (a byte-sized node refuses an unsized one).
+BlobStoreBehaviour::BlobStoreBehaviour(const graph::Graph& g, std::size_t self)
+    : cost_by_op_{detail::arriving_op_costs(g, self)} {}
+
+double BlobStoreBehaviour::cost(std::string_view op) const {
+  return detail::cost_in(cost_by_op_, op);
+}
+
+Routed BlobStoreBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
+  return detail::serve_everything(in);
 }
 
 }  // namespace simsys::behaviours

@@ -952,7 +952,7 @@ std::expected<void, ParseError> read_capacity_text(std::string_view text, model:
   return parse_rate(text).transform(store_in(node.capacity));
 }
 
-// A byte capacity is bounded by the same number, in bytes: 1e15 B/s is 1e9 objects of 1 MB
+// A byte capacity is bounded by the same number, in bytes: 1e15 B/s is 1e9 megabytes
 // per second, far below the request-rate bound.
 CheckResult check_capacity_bounded(const Site& site, const YAML::Node& capacity,
                                    const model::NodeSpec& node) {

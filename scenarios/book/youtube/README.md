@@ -9,23 +9,33 @@
 - Cost: CDN is the bill; serve only popular videos from CDN, the long tail from origin.
 
 ## What the model captures
-- Bytes, not just requests, once phase 2c's byte flows exist: the scenario already states its
-  50 MB streams and 300 MB uploads (`sizes`) and its GB/s capacities. An upload is split into
-  `upload` (the bytes, straight to `original_store`) and `upload_meta` (the presigned-URL
-  request and metadata write, through the API).
-- Until then `explain` turns each byte capacity into requests at an assumed 1 MB per object
-  only to print a number, says so (`capacity=100k/s (scenario: 100GB/s at 1MB/object; byte
-  flows: phase 2c)`), and gives the check on it no percentage and no zone (`not checked`):
-  `cdn_us`, `cdn_eu`, `original_store` and `transcoded_store`. At 1 MB per object `cdn_us` would
-  read 0.28 % green; with the scenario's 50 MB streams its 281.6 streams/s are 14 GB/s, 14 % of
-  100GB/s, `transcoded_store`'s 157.8 misses/s are 7.9 GB/s, 79 % of 10GB/s (yellow, not
-  1.58 % green), and `original_store`'s 9.6 uploads/s are 2.9 GB/s, 58 % of 5GB/s. The request
-  counts on those lines (and the two hit ratios) are the model's; the verdicts wait for 2c.
+- Bytes, not just requests: the scenario states its 50 MB streams and 300 MB uploads (`sizes`)
+  and its GB/s capacities. An upload is split into `upload` (the bytes, straight to
+  `original_store`) and `upload_meta` (the presigned-URL request and metadata write, through the
+  API).
+- The CDNs and the two blob stores count megabytes (phase 2c): a 50 MB stream costs 50 units of
+  1 MB, the service time is one megabyte's (10 ms at a CDN, 40 ms at a blob store, the book's
+  per-MB rows), so `cdn_us` at 100GB/s holds 1000 transfers at once and saturates at 2k
+  streams/s. `explain` checks them in MB/s with the requests beside (the evening peak, 21:00):
+
+  ```
+  cdn_us              peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)
+  cdn_eu              peak offered 7.04k MB/s (140.8/s) vs 50k MB/s total capacity  (14.1%, green)
+  original_store      peak offered 2.88k MB/s (9.6/s) vs 5k MB/s total capacity  (57.6%, green)
+  transcoded_store    peak offered 7.891k MB/s (157.8/s) vs 10k MB/s total capacity  (≥78.9%; load not propagated: worker_pool, message_queue and blob_store are phase 2c)
+  ```
+
+  `transcoded_store`'s figure is the CDNs' misses alone, a lower bound: the transcoders' writes
+  come through a queue and a worker pool the paper load does not follow yet. A request's response
+  is its time to first byte (its wait plus one megabyte): the rest of a 50 MB stream is read as it
+  arrives, and the transfer time of a 300 MB upload is not in any percentile.
 - Two regions with a cross-DC origin fetch (150 ms) for European misses. Each CDN is a
   read-only cache in front of `transcoded_store`: its hit ratio comes from the Che approximation
   over the viewers' Zipf(1) popularity of 10M videos and the edge's size in videos (`keys: 100k`
-  in the US, `50k` in the EU), and only the misses reach the origin. The CDNs are sized in bytes
-  (`capacity: 100GB/s`), so the scenario explains but does not run before phase 2c's byte flows.
+  in the US, `50k` in the EU), and only the misses reach the origin. The CDNs and
+  `transcoded_store` run; `original_store` runs once its `then` (the upload event that starts
+  transcoding) does, and `run` stops first at `transcode_q`, a message queue (both later in
+  phase 2c).
 - Transcoding as a long-running worker pool (60 s per video, 400 workers → 6.7 videos/s
   ceiling) and the backlog it builds during the evening upload peak.
 - Fan-out of one upload into four output renditions.
@@ -36,8 +46,8 @@
 
 ## Things to try
 - `transcoders.workers: 200` — `transcode_q` lag grows all day and never recovers.
-- Lower `cdn_eu.capacity` or raise EU traffic — watch the origin link saturate (phase 2c: until
-  byte flows exist, `explain` shows the miss rate at `transcoded_store` but checks no bytes).
+- Lower `cdn_eu.capacity` to `5GB/s` — `explain` puts `cdn_eu` at 141 %, red (7.04k MB/s of 5k);
+  watching the origin link saturate needs link bandwidth (later in phase 2c).
 - Halve `cdn_us.keys` to 50k — `explain` shows its hit ratio fall from 0.642 to the EU edge's
   0.594 and `transcoded_store`'s miss load rise.
 - Add `{at: 21:00, kind: dc_down, dc: eu-west, for: 5m}` in `faults`.
