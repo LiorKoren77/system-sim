@@ -29,7 +29,7 @@ TEST_CASE("parse_node_type rejects unknown names", "[model]") {
 }
 
 TEST_CASE("the node type table is complete at compile time", "[model]") {
-  static_assert(simsys::model::node_type_names.size() == 18);
+  static_assert(simsys::model::table_follows_enum_order());
   static_assert(simsys::model::parse_node_type("service") == NodeType::service);
   static_assert(simsys::model::to_string(NodeType::frontier) == "frontier");
   SUCCEED();
@@ -60,7 +60,8 @@ TEST_CASE("a default Step forwards unconditionally, sequentially, with factor on
   REQUIRE(st.factor == 1.0);
 }
 
-TEST_CASE("a default LinkSpec is outbound, carries all ops, weight one, no latency override", "[model]") {
+TEST_CASE("a default LinkSpec is outbound, carries all ops, weight one, no latency override",
+          "[model]") {
   const simsys::model::LinkSpec l{.from = "a", .to = "b"};
   REQUIRE(l.dir == simsys::model::Direction::out);
   REQUIRE(l.ops.empty());
