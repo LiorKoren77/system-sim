@@ -1398,6 +1398,25 @@ links: []
   CHECK(s.error().line == 8);
 }
 
+TEST_CASE("a null number is reported at its own key, like a null text") {
+  // Integer and word keys are not read as text, so they need the same rule: `replicas:` is on
+  // line 8.
+  const auto path = write_temp("simsys_null_replicas.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a:
+    type: service
+    replicas:
+links: []
+)");
+  const auto s = simsys::config::load(path.string());
+  REQUIRE_FALSE(s.has_value());
+  REQUIRE(s.error().message == "node 'a': replicas must not be empty");
+  CHECK(s.error().line == 8);
+}
+
 TEST_CASE("the share-sum message shows the real sum") {
   // With 6 significant digits ({:g}) the sum 1.000002 printed as "1", contradicting
   // "expected 1".
