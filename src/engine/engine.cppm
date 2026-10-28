@@ -1,7 +1,8 @@
 // Module `simsys.engine`: the step loop (spec §3). One step = a forward pass in
 // topological order moving demand through delay lines and fluid queues, then a backward
-// pass composing response latency per (node, op). `estimate` is the same evaluation at
-// the long-run state. No randomness in phase 1, so runs are byte-identical by construction.
+// pass composing response latency per (node, op). `estimate` repeats the same evaluation
+// in settle mode until it stops changing: the long-run state. No randomness in phase 1, so
+// runs are byte-identical by construction.
 //
 // Models: a whole System Design Interview (Alex Xu, vol. 1) diagram set in motion. The
 // users box offers load (ch. 2 back-of-the-envelope QPS), every arrow carries it to the
@@ -17,9 +18,11 @@
 // explanation of modules versus headers).
 module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this interface imports other modules
-// (GCC 14.2 'Bad file data' bug, CLAUDE.md §3). This unit imports the whole module
-// chain; it compiles only with -flarge-source-files (top-level CMakeLists.txt).
+// (GCC 14.2 'Bad file data' bug, CLAUDE.md §3). Like every unit from simsys.behaviours
+// on, this one imports a deep module chain and needs -flarge-source-files (set for the
+// simsys library in the top-level CMakeLists.txt, which explains why).
 #include <algorithm>
+#include <cmath>
 #include <concepts>
 #include <cstddef>
 #include <expected>
@@ -56,10 +59,13 @@ export namespace simsys::engine {
 // `(head_ + steps) % size` is where this step's arrival goes. With one push and then one
 // pop per step, a flow pushed in step k is popped in step k + steps. (Pop before push,
 // as a feedback link does, adds one step: see Simulation::line_steps.)
+// Contract: push at most once per step. A second push in the same step writes the same
+// slot and replaces the first flow (it is not added); the engine sums everything a link
+// carries into one Flow first (Simulation::send).
 class DelayLine {
  public:
   explicit DelayLine(int steps);   // steps >= 0; a negative count is a programmer error
-  void push(flow::Flow arriving);  // what enters the link this step (exactly once per step)
+  void push(flow::Flow arriving);  // what enters the link this step (once per step, see above)
   [[nodiscard]] flow::Flow pop();  // what leaves the link this step; empty if nothing
 
  private:
@@ -93,6 +99,12 @@ struct StepRecord {
   SimTime t{};
   std::vector<NodeSample> nodes{};
   std::vector<ResponseSample> responses{};
+  // Only Simulation::estimate clears it: false means the settle passes hit their cap
+  // before the numbers stopped changing, so the record is the last pass, not a steady
+  // state. A loop that returns as much as it receives (gain >= 1) and that no capacity
+  // stops within reach climbs for ever: it has no steady state. Every step of `run`
+  // leaves it true.
+  bool converged{true};
 };
 
 // How long to run and how far to advance per step.
@@ -113,30 +125,36 @@ class Simulation {
   // C++23 std::expected<T, E>: a runnable Simulation or the reason the graph cannot be
   // run yet. Replaces a throwing constructor: an unsupported node type is user input
   // (a valid scenario for `explain`), not a programmer error.
-  // Pattern: Factory method — `create` validates first, then calls the private
-  // constructor, so a Simulation over an unsupported graph cannot exist.
+  // Pattern: Static factory (named constructor) — `create` validates first, then calls
+  // the private constructor, so a Simulation over an unsupported graph cannot exist.
   [[nodiscard]] static std::expected<Simulation, graph::EngineError> create(const graph::Graph& g);
 
-  // Advances every node by `dt` from simulated time `now`. Throws std::invalid_argument
-  // for dt <= 0 (FluidQueue::advance: a programmer error).
+  // Advances every node by `dt` from simulated time `now`. `dt` must be the scenario's
+  // step: Graph sized every delay line in steps of it, so another dt would silently
+  // rescale every link (a 150 ms link is 2 steps; at dt = 10 ms it would deliver after
+  // 20 ms). Throws std::invalid_argument otherwise (a programmer error).
   [[nodiscard]] StepRecord step(SimTime now, SimTime dt);
 
-  // The long-run state at the scenario's step, without disturbing this simulation: it
-  // evaluates a copy with every queue settled and every link passing flow straight
-  // through. Record time is 0.
+  // The long-run state at the scenario's step, without disturbing this simulation and
+  // independent of what it ran before: settle passes from a clean state until nothing
+  // changes (see the definition). Record time is 0; `converged` says whether a steady
+  // state was found.
   [[nodiscard]] StepRecord estimate() const;
 
-  // Steps from t = 0 while t < duration (so duration / step records, the last at
-  // duration - step) and hands every record to `observer`.
-  // Pattern: Observer — the loop keeps no record itself, so a 24 h run at 100 ms steps
-  // (864 000 records) uses no more memory than one step; reports, SLO checks and the CSV
-  // series writer are observers that keep only what they need.
+  // Steps from t = 0 while t < duration and hands every record to `observer`: that is
+  // ceil(duration / step) records, the last at the largest multiple of step below
+  // duration (1 s at 300 ms steps gives 0, 300, 600, 900 ms, so the last step simulates
+  // up to 1.2 s).
+  // Pattern: Observer, in its simplest form — a single observer passed per call instead
+  // of a list of subscribers. The loop keeps no record itself, so a 24 h run at 100 ms
+  // steps (864 000 records) uses no more memory than one step; reports, SLO checks and
+  // the CSV series writer are observers that keep only what they need.
   // C++20 abbreviated function template with a constrained placeholder:
   // `StepObserver auto&&` reads "anything satisfying StepObserver", replacing
   // `template <class F> requires StepObserver<F> void run(RunOptions, F&&)`. Defined here
   // because a template's body must be visible to the importer that instantiates it.
-  // Throws std::invalid_argument for step <= 0 or duration < 0 (programmer errors: the
-  // loader validates the scenario's values).
+  // Throws std::invalid_argument for step <= 0, a step other than the scenario's (see
+  // `step`) or duration < 0 (programmer errors: the loader validates the scenario).
   void run(RunOptions options, StepObserver auto&& observer) {
     require_valid(options);
     // `.count()` comparisons: chrono's non-member `<` is invisible in this interface
@@ -176,11 +194,15 @@ class Simulation {
     flow::Flow sent{};  // what the source put on the link in the latest evaluation
   };
 
+  Simulation() = default;  // only for settling_copy(), which fills every member
   explicit Simulation(const graph::Graph& g);
-  static void require_valid(const RunOptions& options);
+  void require_valid(const RunOptions& options) const;
+  void require_scenario_step(SimTime dt) const;
   [[nodiscard]] static Node make_node(const graph::Graph& g, std::size_t index);
   [[nodiscard]] static int line_steps(const graph::ResolvedLink& link);
   void connect(const graph::Graph& g);
+  void register_reachable_ops(const graph::Graph& g);
+  [[nodiscard]] Simulation settling_copy() const;
 
   [[nodiscard]] StepRecord evaluate(SimTime now, SimTime dt, Mode mode);
   void forward_pass(SimTime now, SimTime dt, Mode mode, std::vector<NodeSample>& samples);
@@ -199,7 +221,6 @@ class Simulation {
   std::vector<Link> links_;
   std::vector<std::size_t> order_;
   SimTime step_{};
-  int settle_passes_{1};
 };
 
 }  // namespace simsys::engine
@@ -231,6 +252,10 @@ struct Overloaded : Fs... {
   for (const auto& [op, share] : spec.workload->op_shares) {
     offered.emplace_back(op, Rate{spec.workload->base.per_second * share});
   }
+  // C++20 ranges algorithm with a projection: std::ranges::sort takes the container
+  // itself (no begin/end pair to mismatch), `{}` is the default comparison (std::less),
+  // and the projection `&pair::first` says "compare by op name", replacing a hand-written
+  // lambda that repeats `a.first < b.first`.
   std::ranges::sort(offered, {}, &std::pair<std::string, Rate>::first);
   return offered;
 }
@@ -273,6 +298,35 @@ void add_once(std::vector<std::size_t>& links, std::size_t link) {
                     .zone = step.zone};
 }
 
+// estimate()'s stopping rule: a pass changed nothing that matters when every node's
+// demand and every response a client sees moved by at most this fraction of its value.
+// 1e-12 is a few thousand ulps of a double: as close to "exactly equal" as rounding allows.
+inline constexpr double settle_tolerance = 1e-12;
+// ...and the most passes it tries. Each pass costs microseconds per node, so the cap
+// bounds estimate() well under a second for phase 1 scenarios; see estimate() for what
+// needs more passes than this.
+inline constexpr int max_settle_passes = 100'000;
+
+// Written so that a NaN never counts as unchanged (every comparison with NaN is false)
+// and an `inf` latency (a zero-capacity node, "unavailable") that stays inf does.
+[[nodiscard]] bool unchanged(double before, double after) {
+  return before == after || std::abs(after - before) <= settle_tolerance * std::abs(after);
+}
+
+// Records of two consecutive settle passes over the same simulation have the same nodes
+// and the same (client, op) responses in the same order.
+[[nodiscard]] bool settled(const StepRecord& before, const StepRecord& after) {
+  for (std::size_t i = 0; i < after.nodes.size(); ++i) {
+    if (!unchanged(before.nodes[i].demand_per_s, after.nodes[i].demand_per_s)) return false;
+  }
+  for (std::size_t i = 0; i < after.responses.size(); ++i) {
+    if (!unchanged(before.responses[i].response.mean_s, after.responses[i].response.mean_s)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 // ---- DelayLine ----
@@ -308,15 +362,13 @@ std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Gr
 }
 
 // Copies what a step needs out of the graph, so the Simulation does not outlive a
-// reference to it. Settle passes: see estimate().
+// reference to it.
 Simulation::Simulation(const graph::Graph& g)
-    : order_{g.topological_order().begin(), g.topological_order().end()},
-      step_{g.scenario().step},
-      settle_passes_{1 + static_cast<int>(std::ranges::count_if(
-                             g.links(), [](const graph::ResolvedLink& l) { return l.feedback; }))} {
+    : order_{g.topological_order().begin(), g.topological_order().end()}, step_{g.scenario().step} {
   for (std::size_t i = 0; i < g.nodes().size(); ++i) nodes_.push_back(make_node(g, i));
   for (const auto& link : g.links()) links_.push_back(Link{.line = DelayLine{line_steps(link)}});
   connect(g);
+  register_reachable_ops(g);
 }
 
 // Pattern: Strategy — each node gets the behaviour of its type, held by value in the
@@ -353,33 +405,101 @@ void Simulation::connect(const graph::Graph& g) {
   }
 }
 
+// Gives every (service, op) that some flow can bring to the service a response-table
+// entry up front: the ops of the client routes entering it and of the unconditional steps
+// targeting it (the only steps that forward flow in phase 1). The backward pass refreshes
+// every entry from step 0, so while a hop's flow is still in a delay line the caller
+// counts the target's empty-queue response (service time plus its own hops), which is
+// what a first request would see, instead of zero.
+void Simulation::register_reachable_ops(const graph::Graph& g) {
+  for (std::size_t client = 0; client < g.nodes().size(); ++client) {
+    for (const auto& route : g.client_routes(client)) {
+      nodes_[route.target].responses.try_emplace(route.op);
+    }
+  }
+  for (const auto& node : g.nodes()) {
+    for (const auto& [op, steps] : node.spec.ops) {
+      for (const auto& step : steps) {
+        if (step.on != model::StepCondition::always) continue;
+        nodes_[*g.index_of(step.to)].responses.try_emplace(step.op);  // Graph checked `to`
+      }
+    }
+  }
+}
+
 // ---- Simulation: one evaluation ----
 
 StepRecord Simulation::step(SimTime now, SimTime dt) {
+  require_scenario_step(dt);
   return evaluate(now, dt, Mode::advance);
 }
 
-void Simulation::require_valid(const RunOptions& options) {
+void Simulation::require_valid(const RunOptions& options) const {
   if (options.step.count() <= 0) throw std::invalid_argument{"Simulation::run: step must be > 0"};
+  require_scenario_step(options.step);
   if (options.duration.count() < 0) {
     throw std::invalid_argument{"Simulation::run: duration must be >= 0"};
   }
 }
 
-// The long run of an acyclic graph is reached in one settle pass: every node settles to
-// its demand, and the links pass flow straight through in topological order. A feedback
-// link is read before its source has run, so each pass carries the loop's flow one lap
-// further: 1 + (number of feedback links) passes resolve loops that do not re-amplify
-// themselves (chat: delivered messages do not re-enter the queue). A loop that feeds
-// itself indefinitely (a crawler's frontier) has no finite steady state to jump to;
-// `run` is the tool for it.
-StepRecord Simulation::estimate() const {
-  Simulation scratch = *this;  // a copy: estimate must not move a running simulation
-  StepRecord record;
-  for (int pass = 0; pass < settle_passes_; ++pass) {
-    record = scratch.evaluate(SimTime{0}, step_, Mode::settle);
+// `.count()`: chrono's non-member `!=` is invisible in this interface (see `run`).
+void Simulation::require_scenario_step(SimTime dt) const {
+  if (dt.count() != step_.count()) {
+    throw std::invalid_argument{
+        "Simulation: the step must be the scenario's (delay lines are sized for it)"};
   }
-  return record;
+}
+
+// The fixed point of the settle passes: run the same pass again and again until its
+// output stops changing (fixed-point iteration). Each pass settles every queue at its
+// demand and lets links pass flow straight through, in topological order. A feedback
+// link is read before its source has run, so each pass carries a loop's flow one lap
+// further: a loop of gain g (the fraction of its flow it sends round again) adds g^k of
+// the input on lap k, and its demand tends to the geometric series' sum, input / (1 - g).
+// The passes stop when nothing changes by more than settle_tolerance, which a loop of
+// gain g reaches after about log(tolerance) / log(g) passes (40 for g = 0.5, 260 for
+// g = 0.9). An acyclic graph takes two (the second confirms the first).
+//
+// Why it converges whenever a steady state exists: starting from no flow at all, demand
+// can only rise from pass to pass (every node forwards a non-decreasing function of what
+// it receives), and what a loop sends round is bounded by the drain of its nodes, which
+// capacity caps. A rising, bounded sequence converges, here to the smallest steady state.
+//
+// A loop of gain >= 1 climbs until a node on it saturates; that state is steady (the node
+// drops the excess) and is reported. If saturation is further away than the cap allows
+// (each pass adds the loop's input once, so it takes about capacity / input passes), or
+// the gain is so close to one that log(tolerance) / log(g) exceeds the cap, the result is
+// the last pass with `converged` false: no steady state in reach.
+StepRecord Simulation::estimate() const {
+  Simulation scratch = settling_copy();  // estimate must not move a running simulation
+  StepRecord previous = scratch.evaluate(SimTime{0}, step_, Mode::settle);
+  for (int pass = 2; pass <= max_settle_passes; ++pass) {
+    StepRecord current = scratch.evaluate(SimTime{0}, step_, Mode::settle);
+    if (settled(previous, current)) return current;
+    previous = std::move(current);
+  }
+  previous.converged = false;
+  return previous;
+}
+
+// A copy that remembers nothing of the steps this simulation ran, so estimate() gives
+// the same answer before and after a run: no flow on any link, no queue content, no
+// response yet (the response tables keep their ops, see register_reachable_ops). Delay
+// lines are not copied: settle mode reads `sent` directly, so each link gets an empty
+// one-slot line (a million-step link would otherwise copy a million Flows). The queues
+// need no reset either: settle mode sets each backlog from the demand (FluidQueue::settle).
+Simulation Simulation::settling_copy() const {
+  Simulation scratch;
+  scratch.order_ = order_;
+  scratch.step_ = step_;
+  scratch.nodes_ = nodes_;
+  for (auto& node : scratch.nodes_) {
+    node.inflow.clear();
+    node.waiting.clear();
+    for (auto& [op, response] : node.responses) response = flow::LatencyEstimate{};
+  }
+  scratch.links_.assign(links_.size(), Link{.line = DelayLine{0}});
+  return scratch;
 }
 
 StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
@@ -433,8 +553,9 @@ void Simulation::receive(std::size_t index, Mode mode) {
 // first when estimating), then route what the queue drained downstream.
 //
 // The FluidQueue knows only totals (one backlog number); `node.waiting` adds which ops
-// are queued. Model: the queue is well-mixed FIFO fluid. Every request in it, whether it
-// waited from an earlier step or arrived in this one, is equally likely to be among the
+// are queued. Model: the queue is well-mixed (random-order) fluid, not FIFO, and drops
+// are taken proportionally, not from the tail. Every request in it, whether it waited
+// from an earlier step or arrived in this one, is equally likely to be among the
 // drained, the dropped or the still waiting, so each part has the content's op mix:
 //   content   = waiting + arrivals × dt                     requests per op
 //   forwarded = content × drained / content_total           drained = drain × dt
@@ -446,7 +567,10 @@ void Simulation::receive(std::size_t index, Mode mode) {
 // This is what makes "what a node drains is what the next node receives" hold even with
 // no arrivals at all: a node working off its backlog forwards the queued ops, not this
 // step's (empty) mix. (Phase 2's rate curves will exercise that zero-arrival case.)
-// Ignored: priorities, per-op service times and any reordering inside the queue.
+// With a constant op mix the order makes no difference; once phase 2's rate curves vary
+// the mix, a FIFO queue would forward the old mix first and this one forwards a blend.
+// Ignored: FIFO order, tail drop (a full real queue rejects the newest arrivals),
+// priorities and per-op service times.
 behaviours::Routed Simulation::serve(std::size_t index, const behaviours::ServiceBehaviour& service,
                                      SimTime dt, Mode mode, NodeSample& sample) {
   auto& node = nodes_[index];
@@ -491,12 +615,15 @@ void Simulation::send(std::size_t index, const behaviours::Routed& routed, Mode 
 
 // Backward pass (plan refinement 1), nodes in reverse topological order: a service's
 // response to op = own sojourn this step + its hops (ServiceBehaviour::response). Reverse
-// order means every forward target was already computed this step; a feedback target
-// was not, so it contributes its previous step's entry — the same "previous step's
-// value" rule as the forward pass. A target that has not yet received an op (its flow is
-// still in a delay line) contributes zero latency for it.
-// The table keeps every op the node has ever received and refreshes all of them, so an
-// op that pauses keeps an estimate at the node's current load.
+// order means every target later in the order was already refreshed this step.
+// Asynchronous hops (those closing an op-level call cycle, graph::Graph::is_async_hop)
+// add no latency, so they are never looked up. A hop over a node-level back edge that
+// closes no call cycle targets a node earlier in the order, not yet refreshed: it reads
+// that node's previous-step entry, one step stale (the same "previous step's value" rule
+// as the forward pass).
+// The tables hold every op that can reach the node from construction on
+// (register_reachable_ops) and refresh all of them every step, so an op whose flow has
+// not arrived yet, or has paused, is estimated at the node's current load.
 void Simulation::backward_pass(const std::vector<NodeSample>& samples) {
   const auto lookup = [this](std::size_t target, std::string_view op) -> flow::LatencyEstimate {
     return response_of(target, op);
@@ -508,7 +635,6 @@ void Simulation::backward_pass(const std::vector<NodeSample>& samples) {
     // Only services compose a response here; clients are read in client_responses().
     const auto* service = std::get_if<behaviours::ServiceBehaviour>(&node.behaviour);
     if (service == nullptr) continue;
-    for (const auto& entry : node.inflow.entries()) node.responses.try_emplace(entry.op);
     for (auto& [op, response] : node.responses) {
       response = service->response(op, samples[index].latency, lookup);
     }
@@ -533,7 +659,7 @@ std::vector<ResponseSample> Simulation::client_responses() const {
   return responses;
 }
 
-// Zero for an op the node has never received (and for a client, which has no table).
+// Zero for an op no flow can bring to the node (and for a client, which has no table).
 flow::LatencyEstimate Simulation::response_of(std::size_t node, std::string_view op) const {
   const auto& table = nodes_[node].responses;
   const auto found = table.find(op);

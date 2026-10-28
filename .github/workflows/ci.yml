@@ -15,6 +15,21 @@ jobs:
         run: cmake --build --preset gcc14-debug
       - name: Test
         run: ctest --preset gcc14-debug
+  # The Release preset (-O3) hits GCC 14.2 optimiser bugs that Debug never does (an
+  # internal compiler error in ipa_comdats, see CMakeLists.txt), so it is built and
+  # tested too.
+  build-test-release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14 and Ninja
+        run: sudo apt-get update && sudo apt-get install -y gcc-14 g++-14 ninja-build
+      - name: Configure
+        run: cmake --preset gcc14-release
+      - name: Build
+        run: cmake --build --preset gcc14-release
+      - name: Test
+        run: ctest --preset gcc14-release
   format:
     runs-on: ubuntu-24.04
     steps:
