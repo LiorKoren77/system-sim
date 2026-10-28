@@ -935,14 +935,17 @@ class CacheBehaviour {
 //    book warns about is not modelled).
 //  - The connection pool (`pool`): how many queries one copy has in service at once. By
 //    Little's law (concurrency in service = throughput × service time) a pool below the c the
-//    capacity implies caps the copy at pool / service time with c = pool; a larger pool changes
-//    nothing (graph::apply_database_keys).
+//    capacity implies caps the copy at pool / service time with c = pool, in capacity units (a
+//    write at cost 5 holds its connection five service times); a larger pool changes nothing
+//    (graph::apply_database_keys).
 //  - Replication lag (`replication_lag`, a constant): a replica receives a write that long after
 //    the primary finished it and then applies it after its own queue's wait, so a read may
 //    return data as old as the primary's write sojourn + the lag + the replica's sojourn: the
 //    node's `staleness` (engine::NodeSample::staleness_s, the `staleness` SLO). A replica too
-//    busy to replay every write drops some (engine::NodeSample::replication_dropped_per_s) and
-//    diverges for good: the `staleness` SLO then fails whatever the mean age.
+//    busy to replay every write falls behind without bound (the model drops the excess at
+//    queue_limit; a real replica keeps it in its relay log/WAL until it is rebuilt): the
+//    writes one replica misses are engine::NodeSample::replication_dropped_per_s, the staleness
+//    stays the bounded queue's figure, and the `staleness` SLO fails whatever the mean age.
 // Who does what: the ENGINE holds the two kinds of queue (primary and replica copies, see
 // engine::Simulation::make_database) and splits the load between them with `is_write`; it
 // hands `response` the sojourn of the queue the op uses (a write the primary's, a read a

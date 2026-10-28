@@ -1599,6 +1599,18 @@ TEST_CASE("a database's pool bounds its throughput by Little's law and never rai
   }
 }
 
+// A database built in code obeys the loader's rule on `pool` and `advanced.concurrency` with its
+// message: both set c, and only the pool also caps the rate (re-review of 96848f0).
+TEST_CASE("a database's pool and advanced.concurrency are refused together in code", "[graph]") {
+  auto s = database_behind_ring(false);
+  s.nodes[1].pool = 8;
+  s.nodes[1].advanced.concurrency = 8;
+  const auto g = Graph::build(s);
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message ==
+          "node 'db': pool sets c and caps the rate by Little's law; drop advanced.concurrency");
+}
+
 // ---- Request-based CDN (plan 2b refinement 4, Task 5) ----
 //
 // A CDN (book ch. 1: a cache at the network's edge; ch. 13's browser cache is the same idea one

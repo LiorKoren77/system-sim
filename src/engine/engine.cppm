@@ -106,7 +106,8 @@ class DelayLine {
 // (the balance above holds for them: a replica full of replayed writes therefore drops while
 // the backlog shown is below queue_limit × copies), and the replication load shows where it
 // bites: in the replicas' rho, zone and the reads' sojourn (Simulation::clients_part), and in
-// the replayed writes a replica drops (`replication_dropped_per_s`).
+// the replayed writes a replica drops (`replication_dropped_per_s`, one replica's, beside
+// `committed_writes_per_s`, what one replica must replay).
 struct NodeSample {
   double demand_per_s{};
   double drain_per_s{};
@@ -122,15 +123,24 @@ struct NodeSample {
   // other replayed writes, then applied): a replica shows a write that long after the client
   // sent it. 0 for a database without replicas (every read is served by the primary, which has
   // the latest write); empty for every other node, which keeps no copies of data that could
-  // lag. Infinite when the primary or the replica never answers.
+  // lag. Infinite when the primary or the replica never answers. Finite while a replica drops
+  // replayed writes (below): the model's queue is bounded, so this is the bounded-queue figure,
+  // while a real replica's lag grows without bound (see replication_dropped_per_s).
   std::optional<double> staleness_s{};
-  // The committed writes the replicas failed to replay, per second, summed over the replicas,
-  // in REQUESTS (writes), not capacity units: a replica whose queue is full drops replayed
-  // writes with the rest, and from then on it never holds what the primary holds (it diverges;
-  // the `staleness` SLO fails on any). Counted apart from `dropped_per_s`, which is the
-  // clients' queries. Same convention as `staleness_s`: 0 for a database whose replicas keep up
-  // (or that has none), empty for every other node.
+  // The committed writes ONE replica failed to replay, per second, in REQUESTS (writes), not
+  // capacity units: the replicas' total / ((N − 1) · S), every replica being alike. A replica
+  // whose queue is full drops replayed writes with the rest: it falls behind without bound (the
+  // model drops the excess at queue_limit; a real replica keeps it in its relay log/WAL until it
+  // is rebuilt), and the `staleness` SLO fails on any. Per replica, so that it compares with
+  // `committed_writes_per_s` (a sum over replicas could exceed every write committed). Counted
+  // apart from `dropped_per_s`, which is the clients' queries. Same convention as
+  // `staleness_s`: 0 for a database whose replicas keep up (or that has none), empty for every
+  // other node.
   std::optional<double> replication_dropped_per_s{};
+  // The writes ONE shard's primary committed, per second, in requests: the primaries' total / S,
+  // and so the writes each replica of that shard must replay. Every database has it (0 when no
+  // write arrives); empty for every other node.
+  std::optional<double> committed_writes_per_s{};
 };
 
 // What a client sees for one op: the rate it offers, the part of it that comes back
@@ -249,8 +259,16 @@ class Simulation {
     double demand_share{};
     double request_share{};
   };
+  // What a copy group is to the data it holds, stated rather than read off its shares:
+  //   server   every node but a database: a copy like any other, serving every op
+  //   primary  a database's primaries: they commit the writes (and, without replicas, serve the
+  //            reads too); what they drained is the log the replicas replay
+  //   replica  a database's read replicas: they serve the reads and replay the committed
+  //            writes, which answer no client
+  enum class CopyRole { server, primary, replica };
   struct CopyGroup {
     fluid::FluidQueue queue;
+    CopyRole role{CopyRole::server};
     double demand_share{1};
     double copies{1};
     double request_share{1};
@@ -270,6 +288,14 @@ class Simulation {
     fluid::FluidStep copy{};
     flow::Flow drained{};
     flow::Flow dropped{};
+  };
+
+  // A database's replication this step, in requests (writes) per second (replay_committed,
+  // NodeSample::committed_writes_per_s and replication_dropped_per_s): what one shard's primary
+  // committed and what one replica of it failed to replay.
+  struct ReplicationTally {
+    double committed_per_shard{};
+    double missed_per_replica{};
   };
 
   // A database's two inputs to its staleness (make_database, NodeSample::staleness_s).
@@ -339,19 +365,20 @@ class Simulation {
                                               NodeSample& sample);
   [[nodiscard]] static flow::Flow group_arrivals(const CopyGroup& group, const flow::Flow& reads,
                                                  const flow::Flow& writes);
-  [[nodiscard]] static bool commits_writes(const CopyGroup& group);
-  [[nodiscard]] static bool replays_writes(const CopyGroup& group);
+  static void replay_committed(const CopyGroup& group, const GroupStep& step,
+                               const behaviours::Behaviour& behaviour, flow::Flow& writes,
+                               ReplicationTally& tally);
   [[nodiscard]] static flow::Flow clients_part(const CopyGroup& group, flow::Flow units,
                                                const behaviours::Behaviour& behaviour);
   [[nodiscard]] static double clients_share(const CopyGroup& group, const flow::Flow& units,
                                             const behaviours::Behaviour& behaviour);
   [[nodiscard]] static flow::Flow dropped_part(const flow::Flow& content,
                                                const fluid::FluidStep& copy_step, double copies);
-  static void record_sojourns(Node& node, std::span<const CopyGroup> groups,
-                              std::span<const flow::LatencyEstimate> sojourns, NodeSample& sample);
+  static void record_sojourns(Node& node, std::span<const flow::LatencyEstimate> sojourns,
+                              NodeSample& sample);
   [[nodiscard]] static flow::LatencyEstimate request_weighted_sojourn(const Node& node);
   static void record_replication(const Node& node, std::span<const flow::LatencyEstimate> sojourns,
-                                 double replicated_dropped_per_s, NodeSample& sample);
+                                 const ReplicationTally& tally, NodeSample& sample);
   [[nodiscard]] static flow::Flow take_drained(CopyGroup& group, const flow::Flow& content,
                                                const fluid::FluidStep& copy_step);
   void send(std::size_t index, const behaviours::Routed& routed, Mode mode);
@@ -759,13 +786,13 @@ void Simulation::add_hot_and_cool_copies(const graph::ResolvedNode& resolved,
 //   replicas      (N − 1) S     reads / ((N − 1) S) + committed / S    the reads
 // Every replica replays every write its shard's primary COMMITTED (its log holds nothing the
 // primary dropped), so its load is its share of the reads plus all of its shard's committed
-// writes: with N = 3, 1000 reads/s and 100 writes/s at the default write cost of 5 (500
-// units/s), each of the 2 replicas carries 500 + 500 = 1000 units/s and the primary 500. The
-// primaries come first so that serve() knows what they
+// writes: with N = 3, 1000 reads/s and 60 writes/s at the default write cost of 5 (300
+// units/s) on copies of 1k/s, each of the 2 replicas carries 500 + 300 = 800 units/s (rho 0.8)
+// and the primary 300 (rho 0.3). The primaries come first so that serve() knows what they
 // committed before it serves the replicas. The replicas' writes answer no client (WriteShares
 // request share 0): a write's response is the primary's sojourn, a read's a replica's
 // (own_sojourn). With N = 1 there are no replicas: S primaries take reads and writes alike,
-// (reads + writes) / S each.
+// (reads + writes) / S each. Each group's CopyRole says which it is.
 // Pattern: Strategy (data-driven), as in make_server — a fourth replica model is only another
 // set of copy groups (with WriteShares for the writes); serve() runs it like the others.
 // A balancer in front changes nothing here (graph::Graph::mark_balanced_targets marks no pool
@@ -781,6 +808,7 @@ Simulation::Node Simulation::make_database(behaviours::Behaviour behaviour,
                             .has_replicas = has_replicas}};
   if (!has_replicas) {
     node.copy_groups.push_back(CopyGroup{.queue = fluid::FluidQueue{resolved.capacity},
+                                         .role = CopyRole::primary,
                                          .demand_share = shares.primary_reads,
                                          .copies = shares.primaries,
                                          .request_share = 1.0});
@@ -788,12 +816,14 @@ Simulation::Node Simulation::make_database(behaviours::Behaviour behaviour,
   }
   node.copy_groups.push_back(CopyGroup{
       .queue = fluid::FluidQueue{resolved.capacity},
+      .role = CopyRole::primary,
       .demand_share = shares.primary_reads,  // 0: a primary serves no reads while replicas exist
       .copies = shares.primaries,
       .request_share = 0.0,
       .writes = WriteShares{.demand_share = shares.primary_writes, .request_share = 1.0}});
   node.copy_groups.push_back(CopyGroup{
       .queue = fluid::FluidQueue{resolved.capacity},
+      .role = CopyRole::replica,
       .demand_share = shares.replica_reads,
       .copies = shares.replicas,
       .request_share = 1.0,
@@ -1056,7 +1086,7 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSampl
   // Not const: `writes` becomes the primaries' committed writes below.
   auto [reads, writes] = split_writes(in_units(node.inflow, node.behaviour), node.behaviour);
   flow::Flow drained;
-  flow::Flow replicated_drops;  // a database replica's replayed writes it dropped, units per s
+  ReplicationTally replication;  // a database's committed and missed writes (replay_committed)
   sample = NodeSample{};
   // At most two groups (max_copy_groups): a fixed array, no allocation per step.
   std::array<flow::LatencyEstimate, max_copy_groups> sojourns{};
@@ -1071,24 +1101,15 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSampl
       sample.zone = step.copy.zone;
     }
     sojourns[i] = step.copy.latency;
-    // A replica replays the primaries' log, which holds what they COMMITTED, not what the
-    // clients offered: from here on the writes are what the primaries drained (make_database
-    // serves them first).
-    if (commits_writes(group)) writes = step.drained;
-    if (replays_writes(group))
-      replicated_drops += split_writes(step.dropped, node.behaviour).second;
+    replay_committed(group, step, node.behaviour, writes, replication);
     drained += clients_part(group, std::move(step.drained), node.behaviour);
   }
   // C++20 std::span with C++17 class template argument deduction: `std::span{sojourns}`
   // deduces std::span<LatencyEstimate, max_copy_groups> from the array without spelling the
   // type, and first(n) views only the n groups in use, replacing a (pointer, count) pair.
   const auto in_use = std::span{sojourns}.first(node.copy_groups.size());
-  record_sojourns(node, node.copy_groups, in_use, sample);
-  if (node.replication) {
-    const double replicated_dropped_per_s =
-        in_requests(replicated_drops, node.behaviour).total().per_second;
-    record_replication(node, in_use, replicated_dropped_per_s, sample);
-  }
+  record_sojourns(node, in_use, sample);
+  if (node.replication) record_replication(node, in_use, replication, sample);
   return in_requests(drained, node.behaviour);
 }
 
@@ -1103,14 +1124,26 @@ flow::Flow Simulation::group_arrivals(const CopyGroup& group, const flow::Flow& 
   return arrivals;
 }
 
-// A database's primaries: the group that answers the writes while replicas replay them.
-bool Simulation::commits_writes(const CopyGroup& group) {
-  return group.writes && group.writes->request_share > 0.0;
-}
-
-// A database's replicas: the group that applies writes no client waits for.
-bool Simulation::replays_writes(const CopyGroup& group) {
-  return group.writes && group.writes->request_share <= 0.0;
+// A database's replication through one copy group's step (book ch. 1, "database replication"):
+//  - at the primaries: a replica replays the primaries' log, which holds what they COMMITTED,
+//    not what the clients offered, so from here on `writes` are the writes the primaries drained
+//    (make_database serves them first). One shard's committed writes, in requests, are the
+//    group's total / S (S = the primaries' copies): what each replica of the shard must replay.
+//  - at the replicas: the replayed writes the group dropped, in requests, / ((N − 1) S) (the
+//    replicas' copies): what ONE replica missed, comparable with the committed per shard.
+// A server group (every node but a database) leaves both untouched.
+void Simulation::replay_committed(const CopyGroup& group, const GroupStep& step,
+                                  const behaviours::Behaviour& behaviour, flow::Flow& writes,
+                                  ReplicationTally& tally) {
+  const auto requests_per_copy = [&](const flow::Flow& write_units) {
+    return in_requests(write_units, behaviour).total().per_second / group.copies;
+  };
+  if (group.role == CopyRole::primary) {
+    writes = split_writes(step.drained, behaviour).second;
+    tally.committed_per_shard = requests_per_copy(writes);
+  } else if (group.role == CopyRole::replica) {
+    tally.missed_per_replica = requests_per_copy(split_writes(step.dropped, behaviour).second);
+  }
 }
 
 // The part of `units` (per op) that is the clients' work at this group: all of it, except the
@@ -1118,7 +1151,7 @@ bool Simulation::replays_writes(const CopyGroup& group) {
 // Taken by value: every group but a replica hands `units` straight back, moved.
 flow::Flow Simulation::clients_part(const CopyGroup& group, flow::Flow units,
                                     const behaviours::Behaviour& behaviour) {
-  if (!replays_writes(group)) return units;
+  if (group.role != CopyRole::replica) return units;
   flow::Flow part;
   for (const auto& [op, rate] : units.entries()) {
     if (!is_write_at(behaviour, op)) part.add(op, rate);
@@ -1130,7 +1163,7 @@ flow::Flow Simulation::clients_part(const CopyGroup& group, flow::Flow units,
 // replica, without copying anything for the groups where it is 1.
 double Simulation::clients_share(const CopyGroup& group, const flow::Flow& units,
                                  const behaviours::Behaviour& behaviour) {
-  if (!replays_writes(group)) return 1.0;
+  if (group.role != CopyRole::replica) return 1.0;
   return share_of(clients_part(group, units, behaviour), units);
 }
 
@@ -1142,9 +1175,9 @@ double Simulation::clients_share(const CopyGroup& group, const flow::Flow& units
 // is the two mixed by the requests of each (request_weighted_sojourn).
 // A group that answers none of a kind is left out of that kind's mixture, so a saturated
 // primary (an infinite sojourn) never reaches the reads as 0 × inf.
-void Simulation::record_sojourns(Node& node, std::span<const CopyGroup> groups,
-                                 std::span<const flow::LatencyEstimate> sojourns,
+void Simulation::record_sojourns(Node& node, std::span<const flow::LatencyEstimate> sojourns,
                                  NodeSample& sample) {
+  const std::span<const CopyGroup> groups = node.copy_groups;
   const auto mixed = [&](auto request_share) {
     std::array<behaviours::Branch, max_copy_groups> branches{};
     std::size_t used = 0;
@@ -1182,17 +1215,23 @@ flow::LatencyEstimate Simulation::request_weighted_sojourn(const Node& node) {
        {.share = 1.0 - read_share, .latency = node.write_sojourn}}));
 }
 
-// A database's replication numbers (plan 2b refinement 3; NodeSample::staleness_s and
-// replication_dropped_per_s). Staleness: a write a client sent shows at a replica after
+// A database's replication numbers (plan 2b refinement 3; NodeSample::staleness_s,
+// replication_dropped_per_s and committed_writes_per_s, the last two from replay_committed).
+// Staleness: a write a client sent shows at a replica after
 //   primary sojourn (wait + service: committed) + replication lag (shipped)
 //   + replica sojourn (waiting behind the reads and the other replayed writes, then applied)
 // the primaries' and the replicas' sojourns being the first and the second group's
 // (make_database). Assumes a replayed write waits like any query in the replica's queue (one
 // well-mixed queue, see serve); ignored: the replica applying the log on a thread of its own.
+// A replica that drops replayed writes falls behind without bound (the model drops the excess
+// at queue_limit; a real replica keeps it in its relay log/WAL until it is rebuilt): the
+// staleness here is then the bounded queue's, finite, and the `staleness` SLO fails through
+// the missed writes instead (report's note).
 void Simulation::record_replication(const Node& node,
                                     std::span<const flow::LatencyEstimate> sojourns,
-                                    double replicated_dropped_per_s, NodeSample& sample) {
-  sample.replication_dropped_per_s = replicated_dropped_per_s;
+                                    const ReplicationTally& tally, NodeSample& sample) {
+  sample.replication_dropped_per_s = tally.missed_per_replica;
+  sample.committed_writes_per_s = tally.committed_per_shard;
   if (!node.replication->has_replicas) {
     sample.staleness_s = 0.0;  // every read is the primary's: it has the latest write
     return;
@@ -1216,7 +1255,8 @@ Simulation::GroupStep Simulation::serve_copies(CopyGroup& group, const flow::Flo
   const flow::Flow content = queue_content(group.waiting, arrivals, dt);
   GroupStep step{.copy = group.queue.advance(per_copy, dt)};
   step.drained = take_drained(group, content, step.copy);
-  if (replays_writes(group)) step.dropped = dropped_part(content, step.copy, group.copies);
+  if (group.role == CopyRole::replica)
+    step.dropped = dropped_part(content, step.copy, group.copies);
   // The queue is well-mixed (see serve): what it drains, drops and holds has the content's op
   // mix, so the clients' share of the content is their share of each of those.
   add_copies(sample, step.copy, group.copies, clients_share(group, arrivals, behaviour),

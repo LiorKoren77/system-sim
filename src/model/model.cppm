@@ -440,10 +440,13 @@ struct NodeSpec {
   // initializers). `replicas` is the primary plus `replicas - 1` read replicas (book ch. 1,
   // "database replication"); `shards` splits the data over that many such sets (ch. 1,
   // "sharding"; absent: one); `pool` is the connection pool, the requests each copy serves at
-  // once (sugar for advanced.concurrency; absent: the implied concurrency); `replication_lag`
-  // how far behind the primary a replica applies a write (absent: none). The loader leaves an
-  // absent one absent, so explain can tell stated from default. `write_ops` (above) says which
-  // ops go to the primary; a database's default is default_sql_write_ops (write_ops_of).
+  // once: it sets the copy's c and caps its rate at pool / service time by Little's law
+  // (graph::apply_database_keys), so it is not advanced.concurrency renamed, and the loader
+  // refuses both together (absent: the implied concurrency, no cap); `replication_lag` how far
+  // behind the primary a replica applies a write (absent: 0, shipping takes no time). The loader
+  // leaves an absent one absent, so explain can tell stated from default. `write_ops` (above)
+  // says which ops go to the primary; a database's default is default_sql_write_ops
+  // (write_ops_of).
   std::optional<int> shards{};
   std::optional<int> pool{};
   std::optional<SimTime> replication_lag{};

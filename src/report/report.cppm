@@ -48,12 +48,19 @@ struct NodeSummary {
   // A SQL database's staleness (engine::NodeSample::staleness_s: the write's sojourn at the
   // primary + the replication lag + its sojourn at a replica), time-averaged over the observed
   // steps; infinite when a queue never answered in one of them; empty for every node that keeps
-  // no lagging copies.
+  // no lagging copies. The bounded-queue figure: finite while a replica misses writes, whose
+  // real lag grows without bound (below).
   std::optional<double> mean_staleness_s{};
-  // The committed writes its replicas failed to replay, per second (writes, not capacity units;
+  // The committed writes ONE replica failed to replay, per second (writes, not capacity units;
   // engine::NodeSample::replication_dropped_per_s), time-averaged over the observed steps: any
-  // at all means a replica diverged. Empty for every node that is not a database.
+  // at all means a replica falls behind without bound (the model drops the excess at
+  // queue_limit; a real replica keeps it in its relay log/WAL until it is rebuilt). Empty for
+  // every node that is not a database.
   std::optional<double> mean_replication_dropped_per_s{};
+  // The writes ONE shard's primary committed per second, which each of its replicas must replay
+  // (engine::NodeSample::committed_writes_per_s), time-averaged the same way: what the missed
+  // writes above are a share of. Empty for every node that is not a database.
+  std::optional<double> mean_committed_writes_per_s{};
 };
 
 // One (client, op) over the observed part of a run. Percentiles are a lognormal fit to
@@ -76,8 +83,8 @@ enum class SloStatus { pass, fail, skipped };
 // An SLO and its verdict. `observed` is in seconds for latency SLOs and a plain ratio
 // otherwise; it is empty when the metric is not modelled yet (skipped). `note` says why a
 // verdict is not what `observed` against `max` alone would give: a staleness SLO fails on a
-// database whose replica diverges ("replica diverges: drops 66.67/s replicated writes"),
-// whatever its mean staleness. Empty otherwise.
+// database whose replicas fall behind without bound ("each replica misses 66.67/s of 400/s
+// committed writes (16.7%)"), whatever its mean staleness. Empty otherwise.
 struct SloResult {
   model::SloSpec slo{};
   std::optional<double> observed{};
@@ -136,10 +143,11 @@ class Summary {
     double rejected{};  // Σ rejected_per_s·dt
     double red_time_s{};
     bool unavailable{};
-    double staleness_time{};              // Σ staleness_s·dt over the steps that report one
-    double staleness_seen_s{};            // Σ dt over those steps: 0 for a node with no staleness
-    double replication_dropped{};         // Σ replication_dropped_per_s·dt (writes)
-    double replication_dropped_seen_s{};  // Σ dt over the steps that report one
+    double staleness_time{};       // Σ staleness_s·dt over the steps that report one
+    double staleness_seen_s{};     // Σ dt over those steps: 0 for a node with no staleness
+    double replication_dropped{};  // Σ replication_dropped_per_s·dt (writes, per replica)
+    double committed_writes{};     // Σ committed_writes_per_s·dt (writes, per shard)
+    double replication_seen_s{};   // Σ dt over the steps that report the two above
     void add(const engine::NodeSample& sample, double dt_s);
     [[nodiscard]] double drop_rate() const;
     [[nodiscard]] double reject_rate() const;

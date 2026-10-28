@@ -2238,9 +2238,11 @@ CheckResult read_shards(const Site& site, const YAML::Node& body, model::NodeSpe
 }
 
 // `pool: 32`: the connection pool, i.e. how many queries one copy (the primary or a replica)
-// runs at once: the c of its M/M/c queue. It is advanced.concurrency under the name a database
-// administrator uses, so it has the same bound (defaults::max_concurrency), and stating both is
-// refused: two numbers for one setting would contradict each other sooner or later.
+// runs at once. It sets the c of the copy's M/M/c queue AND caps its rate at pool / service time
+// by Little's law (graph::apply_database_keys), which advanced.concurrency alone never does; it
+// has the same bound (defaults::max_concurrency: Erlang C costs O(c) per step). Stating both is
+// refused: two numbers for one c would contradict each other, and the message says to keep the
+// pool, the one that also models the connections' limit on throughput.
 CheckResult read_pool(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   const auto value = body["pool"];
   if (!value) return {};
@@ -2251,14 +2253,16 @@ CheckResult read_pool(const Site& site, const YAML::Node& body, model::NodeSpec&
     return site.fail(value, std::format("pool must be at most {}", defaults::max_concurrency));
   }
   if (node.advanced.concurrency) {
-    return site.fail(value, "pool and advanced.concurrency are the same setting");
+    return site.fail(value,
+                     "pool sets c and caps the rate by Little's law; drop advanced.concurrency");
   }
   node.pool = *connections;
   return {};
 }
 
 // `replication_lag: 50ms`: a constant, any non-negative duration (the parser refuses a negative
-// one). Zero is a synchronous replica.
+// one). Default 0: shipping takes no time; the write still waits in both queues (the primary's
+// and a replica's, engine::NodeSample::staleness_s), so zero lag is not zero staleness.
 CheckResult read_sql_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   if (node.type != model::NodeType::sql_db) return {};
   const auto this_node = node_site(site, node.id);
