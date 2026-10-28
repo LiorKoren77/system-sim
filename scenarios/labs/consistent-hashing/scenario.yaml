@@ -1,0 +1,51 @@
+# Lab: System Design Interview vol. 1, ch. 5 — Consistent hashing.
+# A load balancer hashes keys onto a ring of cache servers. Compare `vnodes: 1` (uneven
+# partitions) with `vnodes: 150` (even), and watch what happens when a server is removed.
+version: 1
+name: lab-consistent-hashing
+seed: 1
+duration: 20m
+step: 100ms
+warmup: 1m
+
+nodes:
+  clients:
+    type: client
+    rate: {base: 40k/s}
+    ops: {get: 0.9, set: 0.1}
+    keys: {zipf: 0.9, space: 10M}
+    timeout: 200ms
+
+  ring:
+    type: load_balancer
+    policy: consistent_hash
+    vnodes: 1                                   # try 150
+    capacity: 200k/s
+    latency: 0.05ms
+
+  cache_servers:
+    type: cache
+    replicas: 4
+    eviction: lru
+    keys: 2M                                    # per server
+    hit_ratio: che
+    strategy: cache_aside
+    capacity: 12k/s
+    latency: 0.2ms
+
+  db:
+    type: sql_db
+    replicas: 2
+    capacity: 5k/s
+
+links:
+  - {from: clients, to: ring, dir: inout}
+  - {from: ring, to: cache_servers, dir: inout}
+  - {from: cache_servers, to: db, dir: inout}
+
+slo:
+  - {metric: utilization, node: cache_servers, max: 0.85}
+  - {metric: utilization, node: db, max: 0.7}
+
+faults:
+  - {at: 10m, kind: node_down, node: cache_servers, for: 5m}    # one of the four replicas
