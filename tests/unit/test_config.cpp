@@ -129,7 +129,7 @@ links:
 )");
   const auto s = simsys::config::load(path.string());
   REQUIRE_FALSE(s.has_value());
-  REQUIRE(s.error().message == "link refers to unknown node 'apii'");
+  REQUIRE(s.error().message == "link 1: refers to unknown node 'apii'");
   REQUIRE(s.error().file == path.string());
   REQUIRE(s.error().line == 12);
   // `  - {from: users, to: apii}`: 2 spaces, "- " (cols 3-4), "{from: users, " (cols 5-18),
@@ -327,7 +327,7 @@ nodes:
   api: {type: service, capacity: 1k/s}
 links:
 )",
-                     "links must be a list");
+                     "links must not be empty (write [] for none)");
   }
 }
 
@@ -425,7 +425,7 @@ links:
   - from: [api]
     to: api
 )",
-                     "from must be a scalar");
+                     "link 1: from must be a scalar");
   }
   SECTION("consumes") {
     require_rejected("simsys_consumes_list.yaml", R"(
@@ -489,7 +489,7 @@ nodes:
 links:
   - api
 )",
-                     "link must be a map");
+                     "link 1: must be a map");
   }
   SECTION("then that is a scalar") {
     require_rejected("simsys_then_scalar.yaml", R"(
@@ -550,7 +550,7 @@ nodes:
 links:
   - {to: api}
 )",
-                     "link needs 'from'");
+                     "link 1: needs 'from'");
   }
   SECTION("a link without 'to'") {
     require_rejected("simsys_link_no_to.yaml", R"(
@@ -562,7 +562,7 @@ nodes:
 links:
   - {from: api}
 )",
-                     "link needs 'to'");
+                     "link 1: needs 'to'");
   }
 }
 
@@ -1497,4 +1497,471 @@ TEST_CASE("a client with an empty op map is told it needs an op") {
   require_rejected("simsys_client_empty_ops.yaml",
                    scenario_with("  u: {type: client, rate: {base: 1/s}, ops: {}}\n"),
                    "node 'u': client needs at least one op");
+}
+
+// ---- Re-verification batch: aliases, nulls, repeated keys, link and datacenter rules -----
+
+namespace {
+
+// Like require_rejected, and the error must also point at `line` (1-based; line 1 of a raw
+// string literal is the empty line right after `R"(`).
+void require_rejected_at(std::string_view file_name, std::string_view yaml,
+                         std::string_view message, int line) {
+  CAPTURE(yaml);
+  const auto path = write_temp(file_name, yaml);
+  const auto s = simsys::config::load(path.string());
+  REQUIRE_FALSE(s.has_value());
+  REQUIRE(s.error().message == message);
+  REQUIRE(s.error().line == line);
+}
+
+// The anchor of nesting level `level`: `base` is the fault map, a1, a2, ... the lists above it.
+std::string anchor_name(int level) {
+  return level == 0 ? "base" : "a" + std::to_string(level);
+}
+
+// `levels` lists nested inside each other, each holding `fan_out` copies of the level below:
+// the first copy defines that level in place (`&a3 [...]`), the others are aliases to it
+// (`*a3`). The text grows linearly with `levels`, but a walk that follows every alias meets
+// the innermost fault map fan_out^levels times.
+std::string nested_aliases(int levels, int fan_out) {
+  std::string level = "&base {kind: node_down, node: a, at: 1s}";
+  for (int i = 1; i <= levels; ++i) {
+    std::string list = "&" + anchor_name(i) + " [" + level;
+    for (int copy = 1; copy < fan_out; ++copy) list += ", *" + anchor_name(i - 1);
+    level = list + "]";
+  }
+  return level;
+}
+
+}  // namespace
+
+TEST_CASE("a scenario with nested YAML anchors validates in linear time") {
+  // 8 levels of 10 references each: 10^8 paths to the one `base` map. A repeated-key walk
+  // that follows every alias instead of visiting each shared node once takes minutes here
+  // (about 4 in a Debug build); a linear one takes milliseconds. `faults` is only checked to
+  // be a list until phase 3 types it, which is why nested lists are accepted inside it.
+  const auto path =
+      write_temp("simsys_nested_aliases.yaml",
+                 scenario_with("  a: {type: service}\n",
+                               "links: []\nfaults: [" + nested_aliases(8, 10) + "]\n"));
+  const auto start = std::chrono::steady_clock::now();
+  const auto s = simsys::config::load(path.string());
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(elapsed < 200ms);
+}
+
+TEST_CASE("a null value is reported at its own key, for maps and lists too") {
+  // A key with nothing after it holds null, and yaml-cpp places the null where the next token
+  // starts (usually the next line). Every message below must point at the key's own line.
+  // Where an empty list or map is valid, the message says how to write one, so it does not
+  // contradict `links: []`.
+  SECTION("advanced.queue_limit") {
+    require_rejected_at("simsys_null_queue_limit.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a:
+    type: service
+    advanced:
+      queue_limit:
+links: []
+)",
+                        "node 'a': advanced.queue_limit must not be empty", 9);
+  }
+  SECTION("a client op share") {
+    require_rejected_at("simsys_null_share.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  u:
+    type: client
+    rate: {base: 1/s}
+    ops:
+      ping:
+links: []
+)",
+                        "node 'u': op share 'ping' must not be empty", 10);
+  }
+  SECTION("a step's op") {
+    require_rejected_at("simsys_null_step_op.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  d: {type: sql_db}
+  s:
+    type: service
+    ops:
+      read:
+        - to: d
+          op:
+links: []
+)",
+                        "node 's': step op must not be empty", 12);
+  }
+  SECTION("a service's ops") {
+    require_rejected_at("simsys_null_service_ops.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  s:
+    type: service
+    ops:
+links: []
+)",
+                        "node 's': ops must not be empty (write {} for none)", 8);
+  }
+  SECTION("a client's ops: a client needs at least one, so no {} is suggested") {
+    require_rejected_at("simsys_null_client_ops.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  u:
+    type: client
+    rate: {base: 1/s}
+    ops:
+links: []
+)",
+                        "node 'u': ops must not be empty", 9);
+  }
+  SECTION("a node's then") {
+    require_rejected_at("simsys_null_then.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  w:
+    type: worker_pool
+    then:
+links: []
+)",
+                        "node 'w': then must not be empty (write [] for none)", 8);
+  }
+  SECTION("a node's advanced") {
+    require_rejected_at("simsys_null_advanced.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a:
+    type: service
+    advanced:
+links: []
+)",
+                        "node 'a': advanced must not be empty (write {} for none)", 8);
+  }
+  SECTION("a node's whole body") {
+    require_rejected_at("simsys_null_node.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a:
+links: []
+)",
+                        "node 'a' must not be empty", 6);
+  }
+  SECTION("an slo's metric") {
+    require_rejected_at("simsys_null_slo_metric.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a: {type: service}
+links: []
+slo:
+  - metric:
+    max: 0.1
+)",
+                        "slo: metric must not be empty", 9);
+  }
+  SECTION("an slo's max") {
+    require_rejected_at("simsys_null_slo_max.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a: {type: service}
+links: []
+slo:
+  - metric: drop_rate
+    max:
+)",
+                        "slo: max must not be empty", 10);
+  }
+  SECTION("a datacenter") {
+    require_rejected_at("simsys_null_datacenter.yaml", R"(
+version: 1
+name: t
+duration: 1m
+datacenters:
+  east:
+nodes:
+  a: {type: service}
+links: []
+)",
+                        "datacenters: 'east' must not be empty (write {} for none)", 6);
+  }
+  SECTION("a link's ops: an empty list is no valid filter, so no [] is suggested") {
+    require_rejected_at("simsys_null_link_ops.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a: {type: service}
+  b: {type: service}
+links:
+  - from: a
+    to: b
+    ops:
+)",
+                        "link a -> b: ops must not be empty", 11);
+  }
+  SECTION("top-level nodes") {
+    require_rejected_at("simsys_null_nodes.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+links: []
+)",
+                        "nodes must not be empty", 5);
+  }
+  SECTION("top-level links") {
+    require_rejected_at("simsys_null_links.yaml", R"(
+version: 1
+name: t
+duration: 1m
+links:
+nodes:
+  a: {type: service}
+)",
+                        "links must not be empty (write [] for none)", 5);
+  }
+  SECTION("top-level slo") {
+    require_rejected_at("simsys_null_slo.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a: {type: service}
+slo:
+links: []
+)",
+                        "slo must not be empty (write [] for none)", 7);
+  }
+}
+
+TEST_CASE("a key written twice is rejected at every level") {
+  // The message carries no "node 'a':" prefix: the repeated-key walk runs over the whole
+  // document before any reader, so it does not know whether a map is a node, a link or an
+  // SLO. What it does know is the second key's position, and line and column are what an
+  // editor jumps to, so each section pins the line of the second occurrence.
+  SECTION("top level") {
+    require_rejected_at("simsys_dup_top.yaml", R"(
+version: 1
+name: t
+name: u
+duration: 1m
+nodes:
+  a: {type: service}
+links: []
+)",
+                        "duplicate key 'name'", 4);
+  }
+  SECTION("advanced") {
+    require_rejected_at("simsys_dup_advanced.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a:
+    type: service
+    advanced:
+      yellow: 0.5
+      yellow: 0.6
+links: []
+)",
+                        "duplicate key 'yellow'", 10);
+  }
+  SECTION("a step") {
+    require_rejected_at("simsys_dup_step.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  d: {type: sql_db}
+  s:
+    type: service
+    ops:
+      read:
+        - to: d
+          to: d
+links: []
+)",
+                        "duplicate key 'to'", 12);
+  }
+  SECTION("client shares") {
+    require_rejected_at("simsys_dup_shares.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  u:
+    type: client
+    rate: {base: 1/s}
+    ops:
+      a: 0.5
+      a: 0.5
+links: []
+)",
+                        "duplicate key 'a'", 11);
+  }
+  SECTION("datacenters") {
+    require_rejected_at("simsys_dup_datacenters.yaml", R"(
+version: 1
+name: t
+duration: 1m
+datacenters:
+  eu: {}
+  eu: {}
+nodes:
+  a: {type: service}
+links: []
+)",
+                        "duplicate key 'eu'", 7);
+  }
+  SECTION("a link") {
+    require_rejected_at("simsys_dup_link.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a: {type: service}
+  b: {type: service}
+links:
+  - from: a
+    to: b
+    to: a
+)",
+                        "duplicate key 'to'", 11);
+  }
+  SECTION("an slo entry") {
+    require_rejected_at("simsys_dup_slo.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  a: {type: service}
+links: []
+slo:
+  - metric: drop_rate
+    max: 0.1
+    max: 0.2
+)",
+                        "duplicate key 'max'", 11);
+  }
+  SECTION("rate") {
+    require_rejected_at("simsys_dup_rate.yaml", R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  u:
+    type: client
+    rate:
+      base: 1/s
+      base: 2/s
+    ops: {a: 1}
+links: []
+)",
+                        "duplicate key 'base'", 10);
+  }
+}
+
+TEST_CASE("the index prefix names a link whose ends are not yet known") {
+  // Until both ends are read, "link a -> b" cannot be written, so these messages name the
+  // link by its position in the list, counted from 1 like line numbers.
+  const auto with_links = [](std::string_view links) {
+    return scenario_with("  a: {type: service}\n  b: {type: service}\n",
+                         "links: " + std::string{links} + "\n");
+  };
+  SECTION("a link that is not a map") {
+    require_rejected("simsys_link_index_scalar.yaml", with_links("[5]"), "link 1: must be a map");
+  }
+  SECTION("a link without from") {
+    require_rejected("simsys_link_index_no_from.yaml", with_links("[{to: a}]"),
+                     "link 1: needs 'from'");
+  }
+  SECTION("a from that is a list") {
+    require_rejected("simsys_link_index_from_list.yaml", with_links("[{from: [x], to: a}]"),
+                     "link 1: from must be a scalar");
+  }
+  SECTION("a from that names no node") {
+    require_rejected("simsys_link_index_ghost.yaml", with_links("[{from: ghost, to: a}]"),
+                     "link 1: refers to unknown node 'ghost'");
+  }
+  SECTION("the index counts the links before the bad one") {
+    require_rejected("simsys_link_index_second.yaml", with_links("[{from: a, to: b}, 5]"),
+                     "link 2: must be a map");
+  }
+}
+
+TEST_CASE("advanced.queue_limit follows the integer rule like replicas") {
+  // A whole number written as a decimal or in exponent form is no integer, as `replicas: 3.0`
+  // is no replica count: one rule for every integer key.
+  SECTION("a decimal") {
+    require_rejected("simsys_queue_limit_decimal.yaml",
+                     scenario_with("  a: {type: service, advanced: {queue_limit: 3.0}}\n"),
+                     "node 'a': advanced.queue_limit must be a positive integer");
+  }
+  SECTION("exponent form") {
+    require_rejected("simsys_queue_limit_exponent.yaml",
+                     scenario_with("  a: {type: service, advanced: {queue_limit: 1e3}}\n"),
+                     "node 'a': advanced.queue_limit must be a positive integer");
+  }
+}
+
+TEST_CASE("datacenter entries reject unknown keys and non-scalar names") {
+  const auto with_datacenters = [](std::string_view datacenters) {
+    return "version: 1\nname: t\nduration: 1m\ndatacenters: " + std::string{datacenters} +
+           "\nnodes:\n  a: {type: service}\nlinks: []\n";
+  };
+  SECTION("a key inside a datacenter: none is defined yet") {
+    require_rejected("simsys_dc_unknown_key.yaml", with_datacenters("{east: {foo: 1}}"),
+                     "datacenters: 'east' has unknown key 'foo'");
+  }
+  SECTION("a list as a datacenter name") {
+    require_rejected("simsys_dc_list_name.yaml", with_datacenters("{[a, b]: {}}"),
+                     "datacenters: name must be a scalar");
+  }
+}
+
+TEST_CASE("a link's ops may not repeat and its weight must be finite and at most 1e9") {
+  const auto with_link = [](std::string_view attributes) {
+    return scenario_with("  a: {type: service}\n  b: {type: service}\n",
+                         "links: [{from: a, to: b, " + std::string{attributes} + "}]\n");
+  };
+  SECTION("an op listed twice") {
+    require_rejected("simsys_link_ops_repeat.yaml", with_link("ops: [ping, ping]"),
+                     "link a -> b: duplicate op 'ping'");
+  }
+  SECTION("a weight that would overflow a sum of weights") {
+    require_rejected("simsys_link_weight_huge.yaml", with_link("weight: 1e308"),
+                     "link a -> b: weight must be at most 1e9");
+  }
+  SECTION("an infinite weight, in YAML's own spelling") {
+    require_rejected("simsys_link_weight_inf.yaml", with_link("weight: .inf"),
+                     "link a -> b: weight must be at most 1e9");
+  }
+  SECTION("the bound itself is allowed") {
+    require_loaded("simsys_link_weight_max.yaml", with_link("weight: 1e9"));
+  }
 }
