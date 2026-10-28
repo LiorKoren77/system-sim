@@ -467,22 +467,12 @@ struct Overloaded : Fs... {
   return std::nullopt;
 }
 
-// Why a blob store cannot run, if it cannot: `then` steps. They are event notifications (S3 event
-// notifications; book ch. 14's "transcoding starts when the upload completes"), asynchronous work
-// that arrives with plan 2c Task 4. A store without them is a leaf and runs
-// (behaviours::BlobStoreBehaviour).
-[[nodiscard]] std::optional<std::string> blob_store_not_runnable(const model::NodeSpec& spec) {
-  if (spec.then.empty()) return std::nullopt;
-  return "node '" + spec.id +
-         "': a blob store's then steps are event notifications, which run/estimate do not "
-         "support yet (phase 2c)";
-}
-
-// Why a node of a simulated type still cannot run, if it cannot (the cases above).
+// Why a node of a simulated type still cannot run, if it cannot (the cases above). A blob store
+// always runs, `then` steps included: they are event notifications (plan 2c refinements 6-7),
+// asynchronous hops the backward pass does not wait for (behaviours::BlobStoreBehaviour).
 [[nodiscard]] std::optional<std::string> not_runnable_yet(const model::NodeSpec& spec) {
   if (spec.type == model::NodeType::cache) return cache_not_runnable(spec);
   if (spec.type == model::NodeType::cdn) return cdn_not_runnable(spec);
-  if (spec.type == model::NodeType::blob_store) return blob_store_not_runnable(spec);
   return std::nullopt;
 }
 
@@ -1420,8 +1410,9 @@ void Simulation::send(std::size_t index, const behaviours::Routed& routed, Mode 
 // read a replica's) + its hops (ServiceBehaviour::response) or its
 // share-weighted routes (LoadBalancerBehaviour::response). Reverse
 // order means every target later in the order was already refreshed this step.
-// Asynchronous hops (those closing an op-level call cycle, graph::Graph::is_async_hop)
-// add no latency, so they are never looked up. A hop over a node-level back edge that
+// Asynchronous hops (those closing an op-level call cycle, a write_back cache's flushes and a
+// blob store's event notifications: graph::Graph::is_async_hop) add no latency and fail no
+// request, so they are never looked up. A hop over a node-level back edge that
 // closes no call cycle targets a node earlier in the order, not yet refreshed: it reads
 // that node's previous-step entry, one step stale (the same "previous step's value" rule
 // as the forward pass).
