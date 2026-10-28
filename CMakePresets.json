@@ -1,0 +1,25 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "gcc14-debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/gcc14-debug",
+      "cacheVariables": { "CMAKE_CXX_COMPILER": "g++-14", "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "gcc14-release",
+      "inherits": "gcc14-debug",
+      "binaryDir": "${sourceDir}/build/gcc14-release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "gcc14-debug", "configurePreset": "gcc14-debug" },
+    { "name": "gcc14-release", "configurePreset": "gcc14-release" }
+  ],
+  "testPresets": [
+    { "name": "gcc14-debug", "configurePreset": "gcc14-debug", "output": { "outputOnFailure": true } },
+    { "name": "gcc14-release", "configurePreset": "gcc14-release", "output": { "outputOnFailure": true } }
+  ]
+}
