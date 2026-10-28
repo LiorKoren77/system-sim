@@ -44,6 +44,7 @@ export module simsys.engine;
 
 import simsys.core;
 import simsys.behaviours;
+import simsys.defaults;
 import simsys.flow;
 import simsys.fluid;
 import simsys.graph;
@@ -76,7 +77,8 @@ class DelayLine {
 };
 
 // One node's numbers for one step. Rates and backlog are summed over replicas (plan
-// refinement 4); rho, latency and zone are per copy, which all copies share.
+// refinement 4); rho, latency and zone are per copy, which all copies share — or, behind
+// a consistent-hash balancer, those of the hottest copy (see Simulation::make_node).
 // Demand, drain, drops and backlog are in CAPACITY UNITS (per second for the rates), the
 // unit `capacity` is a rate of (phase 2a refinement 4): a request of an op with `cost` 3
 // counts three times. With every cost at its default of 1, units are requests, as in
@@ -185,8 +187,12 @@ class Simulation {
 
   struct Node {
     behaviours::Behaviour behaviour;
-    std::optional<fluid::FluidQueue> queue{};  // services only; a client is a source
-    double replicas{1};
+    std::optional<fluid::FluidQueue> queue{};  // every node but a client (a source)
+    // How many copies of the modelled queue make up the group: group totals = the queue's
+    // totals × group_scale, and the queue sees the group's arrivals / group_scale. It is
+    // `replicas` for independent copies, 1 for a pooled group (the one queue IS the
+    // group), and replicas / imbalance behind a consistent-hash ring (see make_node).
+    double group_scale{1};
     std::vector<std::size_t> incoming_links{};  // links delivering demand here
     std::vector<std::size_t> outgoing_links{};  // links this node sends demand on
     flow::Flow inflow{};                        // this step's arrivals
@@ -210,6 +216,8 @@ class Simulation {
   void require_valid(const RunOptions& options) const;
   void require_scenario_step(SimTime dt) const;
   [[nodiscard]] static Node make_node(const graph::Graph& g, std::size_t index);
+  [[nodiscard]] static Node make_server(behaviours::Behaviour behaviour,
+                                        const graph::ResolvedNode& resolved);
   [[nodiscard]] static int line_steps(const graph::ResolvedLink& link);
   void connect(const graph::Graph& g);
   void register_reachable_ops(const graph::Graph& g);
@@ -218,9 +226,9 @@ class Simulation {
   [[nodiscard]] StepRecord evaluate(SimTime now, SimTime dt, Mode mode);
   void forward_pass(SimTime now, SimTime dt, Mode mode, std::vector<NodeSample>& samples);
   void receive(std::size_t index, Mode mode);
-  [[nodiscard]] behaviours::Routed serve(std::size_t index,
-                                         const behaviours::ServiceBehaviour& service, SimTime dt,
-                                         Mode mode, NodeSample& sample);
+  // Any queueing node (service, load balancer): runs its queue and returns what it
+  // drained, in requests per second, for the behaviour to route.
+  [[nodiscard]] flow::Flow serve(std::size_t index, SimTime dt, Mode mode, NodeSample& sample);
   [[nodiscard]] static flow::Flow take_drained(Node& node, const flow::Flow& content,
                                                const fluid::FluidStep& copy_step);
   void send(std::size_t index, const behaviours::Routed& routed, Mode mode);
@@ -251,8 +259,12 @@ struct Overloaded : Fs... {
   using Fs::operator()...;
 };
 
-[[nodiscard]] bool supported_in_phase_1(model::NodeType type) {
-  return type == model::NodeType::client || type == model::NodeType::service;
+// The node types the engine can step today; the others arrive with their phase.
+[[nodiscard]] bool simulated(model::NodeType type) {
+  // C++20 `using enum`: the enumerators of NodeType in scope for this function only, so
+  // the test reads `client` instead of `model::NodeType::client`.
+  using enum model::NodeType;
+  return type == client || type == service || type == load_balancer;
 }
 
 void add_once(std::vector<std::size_t>& links, std::size_t link) {
@@ -278,15 +290,22 @@ void add_once(std::vector<std::size_t>& links, std::size_t link) {
   return demand_per_s > 0.0 ? arrivals.scaled(backlog / demand_per_s) : flow::Flow{};
 }
 
+// Capacity units one request of `op` uses at a node: its behaviour's cost(op). A client
+// has no queue to charge, so it never gets here; 1 keeps the visitor total.
+[[nodiscard]] double cost_of(const behaviours::Behaviour& behaviour, std::string_view op) {
+  return std::visit(Overloaded{[](const behaviours::ClientBehaviour&) { return 1.0; },
+                               [&](const auto& server) { return server.cost(op); }},
+                    behaviour);
+}
+
 // Requests per second -> capacity units per second: each op's rate × its cost (plan 2a
 // refinement 4). Demand in units is Σ rate_op × cost_op, the load the node's capacity
 // (a rate of units) is compared with: 300 req/s of an op of cost 3 is 900 units/s, so a
 // 1000 units/s node runs at rho = 0.9.
-[[nodiscard]] flow::Flow in_units(const flow::Flow& requests,
-                                  const behaviours::ServiceBehaviour& service) {
+[[nodiscard]] flow::Flow in_units(const flow::Flow& requests, const behaviours::Behaviour& server) {
   flow::Flow units;
   for (const auto& [op, rate] : requests.entries()) {
-    units.add(op, Rate{rate.per_second * service.cost(op)});
+    units.add(op, Rate{rate.per_second * cost_of(server, op)});
   }
   return units;
 }
@@ -294,25 +313,26 @@ void add_once(std::vector<std::size_t>& links, std::size_t link) {
 // The inverse: units per second of each op -> requests per second (units / cost). What a
 // node forwards downstream is requests, whatever they cost here: the next node prices
 // them with its own costs.
-[[nodiscard]] flow::Flow in_requests(const flow::Flow& units,
-                                     const behaviours::ServiceBehaviour& service) {
+[[nodiscard]] flow::Flow in_requests(const flow::Flow& units, const behaviours::Behaviour& server) {
   flow::Flow requests;
   for (const auto& [op, rate] : units.entries()) {
-    requests.add(op, Rate{rate.per_second / service.cost(op)});
+    requests.add(op, Rate{rate.per_second / cost_of(server, op)});
   }
   return requests;
 }
 
 // A replica group of `replicas` identical copies behind an equal split (plan refinement
 // 4): each copy saw demand / replicas, so the group's rates and backlog are the copy's
-// times `replicas`; utilization, latency and zone are the same for every copy.
-[[nodiscard]] NodeSample group_sample(const fluid::FluidStep& step, double replicas) {
+// times `replicas`; utilization, latency and zone are the same for every copy. In general
+// the factor is the node's group_scale (Simulation::Node), which also covers a pooled
+// group (1) and a hash ring's hottest copy (replicas / imbalance).
+[[nodiscard]] NodeSample group_sample(const fluid::FluidStep& step, double group_scale) {
   // C++20 designated initializers: name each field at the construction site, so the
   // five doubles in a row cannot be swapped silently.
-  return NodeSample{.demand_per_s = step.demand_per_s * replicas,
-                    .drain_per_s = step.drain_per_s * replicas,
-                    .dropped_per_s = step.dropped_per_s * replicas,
-                    .backlog = step.backlog * replicas,
+  return NodeSample{.demand_per_s = step.demand_per_s * group_scale,
+                    .drain_per_s = step.drain_per_s * group_scale,
+                    .dropped_per_s = step.dropped_per_s * group_scale,
+                    .backlog = step.backlog * group_scale,
                     .rho = step.rho,
                     .latency = step.latency,
                     .zone = step.zone};
@@ -373,7 +393,7 @@ flow::Flow DelayLine::pop() {
 
 std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Graph& g) {
   for (const auto& node : g.nodes()) {
-    if (supported_in_phase_1(node.spec.type)) continue;
+    if (simulated(node.spec.type)) continue;
     // C++23 std::unexpected<E>: wraps an error so it converts to the error side of a
     // std::expected (a bare EngineError would be taken as a value, and fail to convert).
     // Replaces throwing or returning a sentinel; the caller must look at the result.
@@ -401,13 +421,49 @@ Simulation::Simulation(const graph::Graph& g)
 // refinement 3), and `simsys curve --noise` derives the same seed.
 Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index) {
   const auto& resolved = g.nodes()[index];
-  if (resolved.spec.type == model::NodeType::client) {
-    return Node{.behaviour = behaviours::ClientBehaviour{
-                    g, index, behaviours::client_seed(g.scenario().seed, index)}};
+  switch (resolved.spec.type) {
+    case model::NodeType::client:
+      return Node{.behaviour = behaviours::ClientBehaviour{
+                      g, index, behaviours::client_seed(g.scenario().seed, index)}};
+    case model::NodeType::load_balancer:
+      return make_server(behaviours::LoadBalancerBehaviour{g, index}, resolved);
+    default:  // create() admitted only simulated types: the rest are services
+      return make_server(behaviours::ServiceBehaviour{g, index}, resolved);
   }
-  return Node{.behaviour = behaviours::ServiceBehaviour{g, index},
-              .queue = fluid::FluidQueue{resolved.capacity},
-              .replicas = static_cast<double>(resolved.spec.replicas)};
+}
+
+// The queue of a node that serves (plan 2a refinement 5: what the balancer in front, if
+// any, does to the replica group; graph::Graph::mark_balanced_targets sets the flags).
+//  - Independent copies (no balancer, round_robin, weighted): one queue models one copy,
+//    which sees demand / N; the group is N of it (group_scale = N).
+//  - Pooled (least_connections): ONE queue for the whole group with N × the service rate,
+//    N × the servers and N × the waiting room, i.e. M/M/(c·N). It sees the whole demand
+//    and its numbers are the group's (group_scale = 1). Assumes join-the-shortest-queue
+//    is perfect: no request ever waits while some replica is idle.
+//  - Imbalanced (consistent_hash, factor k = 1 + 1/sqrt(vnodes)): the queue models the
+//    HOTTEST copy, which sees k × demand / N, so its rho and latency are the hot copy's
+//    (the ones that break an SLO first). group_scale = N / k turns its drain, drops and
+//    backlog back into group totals: below saturation the hot copy drains all it is sent,
+//    so the group drains all of the demand. Assumption: the other copies are cooler and
+//    never the bottleneck; scaling the hot copy's fate to the group is pessimistic once it
+//    saturates (it sheds a share the cooler copies would have served).
+Simulation::Node Simulation::make_server(behaviours::Behaviour behaviour,
+                                         const graph::ResolvedNode& resolved) {
+  const double replicas = resolved.spec.replicas;
+  if (!resolved.pooled) {
+    return Node{.behaviour = std::move(behaviour),
+                .queue = fluid::FluidQueue{resolved.capacity},
+                .group_scale = replicas / resolved.imbalance};
+  }
+  fluid::Capacity pool = resolved.capacity;
+  pool.service_rate = Rate{pool.service_rate.per_second * replicas};
+  // c·N servers, capped like any concurrency (defaults::max_concurrency: Erlang C costs
+  // O(c) per step); computed in double so a large N × c cannot overflow an int.
+  pool.concurrency = static_cast<int>(std::min(static_cast<double>(pool.concurrency) * replicas,
+                                               static_cast<double>(defaults::max_concurrency)));
+  pool.queue_limit *= replicas;
+  return Node{
+      .behaviour = std::move(behaviour), .queue = fluid::FluidQueue{pool}, .group_scale = 1};
 }
 
 // How many steps the DelayLine itself must hold. A forward link's source runs before
@@ -431,25 +487,16 @@ void Simulation::connect(const graph::Graph& g) {
   }
 }
 
-// Gives every (service, op) that some flow can bring to the service a response-table
-// entry up front: the ops of the client routes entering it and of the unconditional steps
-// targeting it (the only steps that forward flow in phase 1). The backward pass refreshes
+// Gives every (node, op) that some flow can bring to the node a response-table entry up
+// front: the ops of the client routes entering it, of the unconditional steps targeting it
+// (the only steps that forward flow in phase 1) and those a load balancer in front passes
+// on (graph::Graph::arriving_ops collects all three). The backward pass refreshes
 // every entry from step 0, so while a hop's flow is still in a delay line the caller
 // counts the target's empty-queue response (service time plus its own hops), which is
 // what a first request would see, instead of zero.
 void Simulation::register_reachable_ops(const graph::Graph& g) {
-  for (std::size_t client = 0; client < g.nodes().size(); ++client) {
-    for (const auto& route : g.client_routes(client)) {
-      nodes_[route.target].responses.try_emplace(route.op);
-    }
-  }
-  for (const auto& node : g.nodes()) {
-    for (const auto& [op, steps] : node.spec.ops) {
-      for (const auto& step : steps) {
-        if (step.on != model::StepCondition::always) continue;
-        nodes_[*g.index_of(step.to)].responses.try_emplace(step.op);  // Graph checked `to`
-      }
-    }
+  for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+    for (const auto& op : g.arriving_ops(node)) nodes_[node].responses.try_emplace(op);
   }
 }
 
@@ -544,8 +591,8 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
 //   1. receive: pop every incoming link into the node's inflow;
 //   2. a client offers its load (in advance mode it first ticks its noise by dt; settle
 //      mode never ticks, so estimate sees the curve without noise at the time it passes,
-//      t = 0); a service runs its fluid queue on the inflow and routes the part it drained
-//      (backlog included, with the queue's op mix: see serve);
+//      t = 0); any other node (service, load balancer) runs its fluid queue on the inflow
+//      and routes the part it drained (backlog included, with the queue's op mix: see serve);
 //   3. send: accumulate the routed flow per link and push it into each link's delay line.
 // Why this order is right: a forward link's target comes later in the order, so it pops
 // after this step's push (a zero-step link delivers in the same step). A feedback link's
@@ -557,15 +604,17 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode,
   for (const std::size_t index : order_) {
     receive(index, mode);
     // A client's sample stays all zeros, green: a source has no queue.
-    const behaviours::Routed routed =
-        std::visit(Overloaded{[&](behaviours::ClientBehaviour& client) {
-                                if (mode == Mode::advance) client.tick(now, dt);
-                                return client.offer(now);
-                              },
-                              [&](const behaviours::ServiceBehaviour& service) {
-                                return serve(index, service, dt, mode, samples[index]);
-                              }},
-                   nodes_[index].behaviour);
+    const behaviours::Routed routed = std::visit(
+        Overloaded{
+            [&](behaviours::ClientBehaviour& client) {
+              if (mode == Mode::advance) client.tick(now, dt);
+              return client.offer(now);
+            },
+            // A generic lambda: every other alternative is a queueing node.
+            // Overload resolution prefers the non-template ClientBehaviour&
+            // lambda for a client, so this one sees only servers.
+            [&](auto& server) { return server.route(serve(index, dt, mode, samples[index]), dt); }},
+        nodes_[index].behaviour);
     send(index, routed, mode);
   }
 }
@@ -584,9 +633,11 @@ void Simulation::receive(std::size_t index, Mode mode) {
   }
 }
 
-// One service step: equal split over replicas, arrivals priced in capacity units, the
-// §3.3 fluid step per copy (settled first when estimating), then route what the queue
-// drained downstream, converted back to requests.
+// One step of a queueing node (service or load balancer): the group's arrivals priced in
+// capacity units and divided over the modelled queue (group_scale: one copy, the pool or
+// the hottest copy, see make_server), the §3.3 fluid step (settled first when
+// estimating); what the queue drained goes back, converted to requests, for the node's
+// behaviour to route downstream (forward_pass).
 //
 // Capacity units (plan 2a refinement 4): the queue holds WORK, not requests. An op of
 // cost c_op arriving at r_op req/s brings r_op × c_op units/s (in_units), the
@@ -621,13 +672,13 @@ void Simulation::receive(std::size_t index, Mode mode) {
 // Ignored: FIFO order, tail drop (a full real queue rejects the newest arrivals),
 // priorities and per-op service times (a costly op uses more capacity, not a longer
 // sojourn: see ServiceBehaviour).
-behaviours::Routed Simulation::serve(std::size_t index, const behaviours::ServiceBehaviour& service,
-                                     SimTime dt, Mode mode, NodeSample& sample) {
+flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSample& sample) {
   auto& node = nodes_[index];
-  auto& queue = *node.queue;  // every service has a queue (make_node)
-  // Replicas (plan refinement 4): `waiting` and the queue describe one copy, which sees
-  // 1/replicas of the arrivals; take_drained scales the forwarded flow back to the group.
-  const flow::Flow arrivals = in_units(node.inflow, service).scaled(1.0 / node.replicas);
+  auto& queue = *node.queue;  // every server has a queue (make_server)
+  // Replicas (plan refinement 4): `waiting` and the queue describe the modelled queue,
+  // which sees 1/group_scale of the arrivals; take_drained scales the forwarded flow back
+  // to the group.
+  const flow::Flow arrivals = in_units(node.inflow, node.behaviour).scaled(1.0 / node.group_scale);
   const Rate per_replica = arrivals.total();
   if (mode == Mode::settle) {
     queue.settle(per_replica);
@@ -635,13 +686,13 @@ behaviours::Routed Simulation::serve(std::size_t index, const behaviours::Servic
   }
   const flow::Flow content = queue_content(node.waiting, arrivals, dt);
   const fluid::FluidStep copy_step = queue.advance(per_replica, dt);
-  sample = group_sample(copy_step, node.replicas);
-  return service.route(in_requests(take_drained(node, content, copy_step), service));
+  sample = group_sample(copy_step, node.group_scale);
+  return in_requests(take_drained(node, content, copy_step), node.behaviour);
 }
 
 // Splits one copy's content (see serve) by the totals of its fluid step: keeps the
 // still-waiting part in `node.waiting` and returns the drained part as the group's
-// forwarded rate per op in units, content × (drain_per_s × replicas) / content_total:
+// forwarded rate per op in units, content × (drain_per_s × group_scale) / content_total:
 // the drained units per copy (drain × dt) over dt, times the copies. An empty queue with
 // no arrivals has nothing to split.
 flow::Flow Simulation::take_drained(Node& node, const flow::Flow& content,
@@ -652,7 +703,7 @@ flow::Flow Simulation::take_drained(Node& node, const flow::Flow& content,
     return flow::Flow{};
   }
   node.waiting = content.scaled(copy_step.backlog / content_total);
-  return content.scaled(copy_step.drain_per_s * node.replicas / content_total);
+  return content.scaled(copy_step.drain_per_s * node.group_scale / content_total);
 }
 
 void Simulation::send(std::size_t index, const behaviours::Routed& routed, Mode mode) {
@@ -663,8 +714,9 @@ void Simulation::send(std::size_t index, const behaviours::Routed& routed, Mode 
   for (const std::size_t link : outgoing_links) links_[link].line.push(links_[link].sent);
 }
 
-// Backward pass (plan refinement 1), nodes in reverse topological order: a service's
-// response to op = own sojourn this step + its hops (ServiceBehaviour::response). Reverse
+// Backward pass (plan refinement 1), nodes in reverse topological order: a server's
+// response to op = own sojourn this step + its hops (ServiceBehaviour::response) or its
+// share-weighted routes (LoadBalancerBehaviour::response). Reverse
 // order means every target later in the order was already refreshed this step.
 // Asynchronous hops (those closing an op-level call cycle, graph::Graph::is_async_hop)
 // add no latency, so they are never looked up. A hop over a node-level back edge that
@@ -682,12 +734,14 @@ void Simulation::backward_pass(const std::vector<NodeSample>& samples) {
   // replacing a reverse-iterator loop (rbegin/rend) or a reversed copy.
   for (const std::size_t index : order_ | std::views::reverse) {
     auto& node = nodes_[index];
-    // Only services compose a response here; clients are read in client_responses().
-    const auto* service = std::get_if<behaviours::ServiceBehaviour>(&node.behaviour);
-    if (service == nullptr) continue;
-    for (auto& [op, response] : node.responses) {
-      response = service->response(op, samples[index].latency, lookup);
-    }
+    // Only servers compose a response here; clients are read in client_responses().
+    std::visit(Overloaded{[](const behaviours::ClientBehaviour&) {},
+                          [&](const auto& server) {
+                            for (auto& [op, response] : node.responses) {
+                              response = server.response(op, samples[index].latency, lookup);
+                            }
+                          }},
+               node.behaviour);
   }
 }
 

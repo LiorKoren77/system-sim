@@ -1,7 +1,8 @@
 // Module `simsys.graph`: the scenario resolved into something the engine can step —
 // node capacities with provenance, link latencies and delay-line lengths, demand edges,
-// a topological order, client routes, feedback edges for node cycles and asynchronous
-// hops for call cycles. Cycles are found at two levels, for two different questions:
+// a topological order, routes of the nodes that split flow (clients, load balancers),
+// what each load balancer does to the replicas behind it, feedback edges for node cycles and
+// asynchronous hops for call cycles. Cycles are found at two levels, for two different questions:
 //  - Node level (Graph::order_nodes): which LINK closes a loop of boxes? Its flow goes
 //    through a delay line of at least one step, so the forward pass can run in
 //    topological order (spec §3.1: cycles use the previous step's value).
@@ -22,7 +23,10 @@
 // over several entry points (CDN vs origin, two load balancers), and which arrows close
 // a loop (chat servers -> message queue -> sync workers -> chat servers). Ignored:
 // bandwidth limits and link failures (phase 2), and any per-request routing decision —
-// splits are fixed fractions, as round-robin or a weighted DNS record would give.
+// splits are fixed fractions, as round-robin or a weighted DNS record would give. A load
+// balancer's policy is resolved here too, as a property of the node BEHIND it (plan 2a
+// refinement 5, see mark_balanced_targets): whether its replicas queue apart, as one
+// pool, or with a hot spot.
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -38,6 +42,7 @@ module;
 #include <map>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -61,9 +66,10 @@ export namespace simsys::graph {
 inline constexpr int max_delay_steps = 1'000'000;
 
 // Why a scenario that loaded cleanly still cannot be simulated (a step with no link to
-// travel on, a client op that no link carries, demand sent into a client, a link longer
-// than max_delay_steps, and, for scenarios built in code, a negative latency, a bad weight
-// or a non-positive step).
+// travel on, a client or load-balancer op that no link carries, demand sent into a client,
+// a load balancer with nowhere to send, a node behind load balancers of different policies,
+// a link longer than max_delay_steps, and, for scenarios built in code, a negative latency,
+// a bad weight, a non-positive vnodes or a non-positive step).
 struct EngineError {
   std::string message;
 };
@@ -74,6 +80,11 @@ struct ResolvedNode {
   fluid::Capacity capacity{};  // meaningless for clients (sources); the engine never reads it
   defaults::Source service_rate_source{defaults::Source::type_default};
   defaults::Source service_time_source{defaults::Source::type_default};
+  // Set on a node that sits behind a load balancer (Graph::mark_balanced_targets): its
+  // replicas form one pooled queue (least_connections), and the hottest replica carries
+  // `imbalance` times the average share (consistent_hash; 1 = an even split).
+  bool pooled{false};
+  double imbalance{1.0};
 };
 
 // A scenario link with node indices instead of ids, and its resolved timing.
@@ -91,13 +102,19 @@ struct ResolvedLink {
   double weight{1.0};
 };
 
-// Where a client sends one op and which share of that op's rate goes there.
-struct ClientRoute {
+// Where a splitter (a client or a load balancer) sends flow and which share goes there.
+// A client's route is per op: `op` names it and `share` is that op's fraction on this
+// link. A load balancer forwards whatever arrives, so its routes are per LINK: `op` is
+// empty ("any op the link's filter allows") and `share` is the link's weight over all its
+// outgoing links; Graph::routes_for renormalises it over the links that carry a given op.
+struct Route {
   std::string op{};
   std::size_t target{};
   std::size_t link{};
   double share{};
 };
+// The phase-1 name, kept for the code and tests written when only clients split flow.
+using ClientRoute = Route;
 
 // A demand edge: `from` forwards flow to `to` over `link` (because of a step or a client route).
 struct DemandEdge {
@@ -142,10 +159,20 @@ class Graph {
   [[nodiscard]] std::optional<std::size_t> index_of(std::string_view id) const;
   // The link that carries demand from `from` to `to`: (from,to,out|inout) or (to,from,in).
   [[nodiscard]] std::optional<std::size_t> demand_link(std::size_t from, std::size_t to) const;
-  // Empty for a node that is not a client. An index past the last node is a programmer
-  // error (std::out_of_range).
-  [[nodiscard]] std::span<const ClientRoute> client_routes(std::size_t client) const {
-    return routes_.at(client);
+  // Empty for a node that does not split flow (anything but a client or a load
+  // balancer). An index past the last node is a programmer error (std::out_of_range).
+  [[nodiscard]] std::span<const Route> routes(std::size_t node) const { return routes_.at(node); }
+  [[nodiscard]] std::span<const Route> client_routes(std::size_t client) const {
+    return routes(client);
+  }
+  // The routes of `node` that `op` takes, each with `op` filled in and its share of THAT
+  // op: a client's routes for the op as they are; a load balancer's routes whose link
+  // carries the op, their shares renormalised to sum to 1 over those links.
+  [[nodiscard]] std::vector<Route> routes_for(std::size_t node, std::string_view op) const;
+  // Every op some flow can bring to `node`, sorted: client routes and unconditional steps
+  // targeting it, and whatever a load balancer in front passes on. Empty for a client.
+  [[nodiscard]] std::span<const std::string> arriving_ops(std::size_t node) const {
+    return arriving_ops_.at(node);
   }
   // Does node `from`, handling `op`, hand `target_op` off to node `to` without waiting?
   // True exactly for the hops that close a call cycle (see detail::find_async_hops).
@@ -163,8 +190,13 @@ class Graph {
   Result resolve_links();
   Result connect_steps();
   Result connect_step(std::size_t from, const model::Step& step);
+  Result route_splitters();
   Result route_clients();
   Result route_client_op(std::size_t client, const std::string& op);
+  Result route_balancer(std::size_t balancer);
+  void collect_arriving_ops();
+  Result check_balancer_ops(std::size_t balancer);
+  Result mark_balanced_targets();
   void order_nodes();
   void add_edge(const DemandEdge& edge);
   void mark_feedback(std::size_t link);
@@ -174,8 +206,9 @@ class Graph {
   std::vector<ResolvedLink> links_;
   std::vector<DemandEdge> edges_;
   std::vector<std::size_t> order_;
-  std::vector<std::vector<ClientRoute>> routes_;  // per node index; empty for non-clients
-  std::vector<AsyncHop> async_hops_;              // sorted, no duplicates
+  std::vector<std::vector<Route>> routes_;              // per node index; empty for non-splitters
+  std::vector<std::vector<std::string>> arriving_ops_;  // per node index, sorted
+  std::vector<AsyncHop> async_hops_;                    // sorted, no duplicates
 };
 
 }  // namespace simsys::graph
@@ -283,9 +316,32 @@ struct Call {
   auto operator<=>(const Call&) const = default;  // a std::map key (see AsyncHop)
 };
 
+// A load balancer has no `ops` steps, yet each op it receives is a call to the nodes
+// behind it: (lb, op) -> (target, op) for every route that carries the op.
+// Pattern: Adapter — the balancer's routes are re-expressed as the steps the search below
+// already walks, keyed by the call they belong to, so the search needs no second case.
+using ForwardedSteps = std::map<Call, std::vector<model::Step>>;
+
+[[nodiscard]] ForwardedSteps balancer_steps(const Graph& g) {
+  ForwardedSteps forwarded;
+  for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+    if (g.nodes()[node].spec.type != model::NodeType::load_balancer) continue;
+    for (const auto& op : g.arriving_ops(node)) {
+      auto& steps = forwarded[Call{node, op}];
+      for (const auto& route : g.routes_for(node, op)) {
+        steps.push_back(model::Step{.to = g.nodes()[route.target].spec.id, .op = op});
+      }
+    }
+  }
+  return forwarded;
+}
+
 // The steps handling `call.op` at `call.node` runs, in declaration order; none for an op
-// the node lists without steps (terminal) or does not list at all.
-[[nodiscard]] std::span<const model::Step> steps_of(const Graph& g, const Call& call) {
+// the node lists without steps (terminal) or does not list at all. A load balancer's are
+// its forwarded steps.
+[[nodiscard]] std::span<const model::Step> steps_of(const Graph& g, const ForwardedSteps& forwarded,
+                                                    const Call& call) {
+  if (const auto found = forwarded.find(call); found != forwarded.end()) return found->second;
   const auto& ops = g.nodes()[call.node].spec.ops;
   const auto found = ops.find(call.op);
   if (found == ops.end()) return {};
@@ -293,11 +349,13 @@ struct Call {
 }
 
 // Roots of the call-graph search: every client route's (entry node, op), clients in index
-// order and each client's routes in order, so a call cycle is cut where it closes as seen
+// order and each client's routes in order (a load balancer's routes carry no op of their
+// own and are reached through the calls into it), so a call cycle is cut where it closes as seen
 // from the users. Then every op of every node, so a cycle no client reaches is still cut.
 [[nodiscard]] std::vector<Call> call_roots(const Graph& g) {
   std::vector<Call> roots;
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+    if (g.nodes()[node].spec.type != model::NodeType::client) continue;
     for (const auto& route : g.client_routes(node)) roots.push_back({route.target, route.op});
   }
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
@@ -312,7 +370,8 @@ struct Call {
 // The hops that close a call cycle: the back edges of a depth-first search over (node, op)
 // vertices, with an edge (node, op) -> (step.to, step.op) for every unconditional step
 // (conditional steps never fire in phase 1, see behaviours::ServiceBehaviour; `then`
-// steps belong to node types phase 1 does not run). Same white/grey/black classification
+// steps belong to node types phase 1 does not run), and an edge (lb, op) -> (target, op)
+// for every route of a load balancer that carries the op. Same white/grey/black classification
 // as Graph::order_nodes, one level finer: there the vertices are boxes, here they are
 // the calls a request makes. A back edge is a call that, followed far enough, calls
 // itself: chat.msg -> queue.publish -> sync.job -> chat.msg. A request cannot wait for
@@ -327,13 +386,14 @@ struct Call {
     std::span<const model::Step> steps;
     std::size_t next_step;
   };
+  const ForwardedSteps forwarded = balancer_steps(g);
   std::vector<AsyncHop> hops;
   for (const Call& root : call_roots(g)) {
     // C++20 std::map::contains: "is this key present?" in one call, replacing
     // `find(key) != end()` or `count(key) != 0`.
     if (colour.contains(root)) continue;
     colour.emplace(root, Colour::grey);
-    std::vector<Frame> stack{{root, steps_of(g, root), 0}};
+    std::vector<Frame> stack{{root, steps_of(g, forwarded, root), 0}};
     while (!stack.empty()) {
       auto& frame = stack.back();
       if (frame.next_step == frame.steps.size()) {
@@ -347,7 +407,7 @@ struct Call {
       const auto found = colour.find(callee);
       if (found == colour.end()) {
         colour.emplace(callee, Colour::grey);
-        const auto callee_steps = steps_of(g, callee);
+        const auto callee_steps = steps_of(g, forwarded, callee);
         stack.push_back({std::move(callee), callee_steps, 0});  // invalidates `frame`
       } else if (found->second == Colour::grey) {
         hops.push_back({frame.call.node, frame.call.op, callee.node, callee.op});
@@ -378,7 +438,7 @@ std::expected<Graph, EngineError> Graph::build(model::Scenario scenario) {
   // `if (!r) return std::unexpected(r.error());` between every pair of steps.
   const auto built =
       graph.resolve_links().and_then([&] { return graph.connect_steps(); }).and_then([&] {
-        return graph.route_clients();
+        return graph.route_splitters();
       });
   if (!built) return std::unexpected{built.error()};
   graph.order_nodes();
@@ -428,6 +488,7 @@ void Graph::resolve_nodes() {
     });
   }
   routes_.resize(nodes_.size());
+  arriving_ops_.resize(nodes_.size());
 }
 
 // Ids become indices; latency falls back to half the datacenter round trip
@@ -510,6 +571,24 @@ Graph::Result Graph::connect_step(std::size_t from, const model::Step& step) {
   return {};
 }
 
+// The nodes that split flow over their outgoing links, then what follows from those
+// splits: which ops reach each node (through any chain of load balancers), whether every
+// op reaching a load balancer can leave it, and what each balancer's policy does to the
+// replicas behind it.
+Graph::Result Graph::route_splitters() {
+  if (auto routed = route_clients(); !routed) return routed;
+  for (std::size_t node = 0; node < nodes_.size(); ++node) {
+    if (nodes_[node].spec.type != model::NodeType::load_balancer) continue;
+    if (auto routed = route_balancer(node); !routed) return routed;
+  }
+  collect_arriving_ops();
+  for (std::size_t node = 0; node < nodes_.size(); ++node) {
+    if (nodes_[node].spec.type != model::NodeType::load_balancer) continue;
+    if (auto checked = check_balancer_ops(node); !checked) return checked;
+  }
+  return mark_balanced_targets();
+}
+
 Graph::Result Graph::route_clients() {
   for (std::size_t client = 0; client < nodes_.size(); ++client) {
     const auto& workload = nodes_[client].spec.workload;
@@ -557,6 +636,165 @@ Graph::Result Graph::route_client_op(std::size_t client, const std::string& op) 
     routes_[client].push_back(
         ClientRoute{.op = op, .target = target, .link = link, .share = share});
     add_edge(DemandEdge{.from = client, .to = target, .link = link});
+  }
+  return {};
+}
+
+// A load balancer forwards whatever reaches it, so it is routed per LINK, not per op: one
+// Route on every link it sends demand on, its share the link's weight over the weights of
+// all of them (Route's comment; routes_for narrows that to the links carrying one op). The
+// split is the same for every policy: link weights spread traffic over DIFFERENT
+// downstream nodes, while the policy (mark_balanced_targets) is about how the replicas
+// INSIDE one downstream node share it. `weighted` is the policy that says the weights are
+// the point; round robin over equal weights (the default 1) is an even split.
+Graph::Result Graph::route_balancer(std::size_t balancer) {
+  const auto& id = nodes_[balancer].spec.id;
+  double total_weight = 0;
+  for (std::size_t i = 0; i < links_.size(); ++i) {
+    const auto target = demand_target(links_[i], balancer);
+    if (!target) continue;
+    if (nodes_[*target].spec.type == model::NodeType::client) {  // see connect_step
+      return std::unexpected{EngineError{"node '" + id + "': link to client '" +
+                                         nodes_[*target].spec.id +
+                                         "' cannot carry demand; clients only send"}};
+    }
+    routes_[balancer].push_back(Route{.target = *target, .link = i, .share = links_[i].weight});
+    total_weight += links_[i].weight;
+    add_edge(DemandEdge{.from = balancer, .to = *target, .link = i});
+  }
+  if (routes_[balancer].empty()) {
+    return std::unexpected{
+        EngineError{"node '" + id + "': a load balancer needs an outgoing link"}};
+  }
+  // All weights 0 leaves every share 0; check_balancer_ops reports it per op.
+  for (auto& route : routes_[balancer])
+    route.share = total_weight > 0 ? route.share / total_weight : 0;
+  return {};
+}
+
+std::vector<Route> Graph::routes_for(std::size_t node, std::string_view op) const {
+  std::vector<Route> taken;
+  if (nodes_.at(node).spec.type == model::NodeType::client) {
+    for (const auto& route : routes_[node]) {
+      if (route.op == op) taken.push_back(route);
+    }
+    return taken;
+  }
+  double total = 0;
+  for (const auto& route : routes_[node]) {
+    if (!carries_op(links_[route.link], op)) continue;
+    taken.push_back(Route{
+        .op = std::string{op}, .target = route.target, .link = route.link, .share = route.share});
+    total += route.share;
+  }
+  for (auto& route : taken) route.share = total > 0 ? route.share / total : 0;
+  return taken;
+}
+
+// Which ops reach every node: a worklist over (node, op) pairs, seeded with the client
+// routes and the unconditional steps (the only ones that forward flow in phase 2a), and
+// grown through load balancers, which pass each op they receive on to every route whose
+// link carries it. Each pair enters the list once, so a loop of balancers ends.
+void Graph::collect_arriving_ops() {
+  std::vector<std::set<std::string>> arriving(nodes_.size());
+  std::vector<std::pair<std::size_t, std::string>> work;
+  const auto arrive = [&](std::size_t node, const std::string& op) {
+    if (arriving[node].insert(op).second) work.emplace_back(node, op);
+  };
+  for (std::size_t node = 0; node < nodes_.size(); ++node) {
+    const auto& spec = nodes_[node].spec;
+    if (spec.type == model::NodeType::client) {
+      for (const auto& route : routes_[node]) arrive(route.target, route.op);
+    }
+    for (const model::Step& step : spec.ops | std::views::values | std::views::join) {
+      if (step.on == model::StepCondition::always) arrive(*index_of(step.to), step.op);
+    }
+    for (const model::Step& step : spec.then) {
+      if (step.on == model::StepCondition::always) arrive(*index_of(step.to), step.op);
+    }
+  }
+  while (!work.empty()) {
+    const auto [node, op] = std::move(work.back());
+    work.pop_back();
+    if (nodes_[node].spec.type != model::NodeType::load_balancer) continue;
+    for (const auto& route : routes_[node]) {
+      if (carries_op(links_[route.link], op)) arrive(route.target, op);
+    }
+  }
+  for (std::size_t node = 0; node < nodes_.size(); ++node) {
+    arriving_ops_[node].assign(arriving[node].begin(), arriving[node].end());  // sorted: a set
+  }
+}
+
+// Every op that reaches a load balancer must be able to leave it, or the balancer would
+// swallow it: the same two rules as a client op (route_client_op), with the node's wording.
+Graph::Result Graph::check_balancer_ops(std::size_t balancer) {
+  const auto& id = nodes_[balancer].spec.id;
+  for (const auto& op : arriving_ops_[balancer]) {
+    double total_weight = 0;
+    bool carried = false;
+    for (const auto& route : routes_[balancer]) {
+      if (!carries_op(links_[route.link], op)) continue;
+      carried = true;
+      total_weight += links_[route.link].weight;
+    }
+    if (!carried) {
+      return std::unexpected{EngineError{"node '" + id + "': no link carries op '" + op + "'"}};
+    }
+    if (total_weight <= 0) {
+      return std::unexpected{
+          EngineError{"node '" + id + "': every link carrying op '" + op + "' has weight 0"}};
+    }
+  }
+  return {};
+}
+
+// A load balancer's policy changes how the replicas of the node BEHIND it queue (plan 2a
+// refinement 5), so it is stored on that node, where the engine builds its queue:
+//  - round_robin, weighted: requests are dealt out blindly, every replica is its own
+//    queue (N independent M/M/c); nothing to mark.
+//  - least_connections: a request goes to the replica with the fewest in flight, so no
+//    replica idles while another has a queue. Idealised as join-the-shortest-queue: the
+//    replicas behave as ONE pool of N × c servers (M/M/(c·N)), `pooled`.
+//  - consistent_hash with v virtual nodes per server: keys land on ring arcs of uneven
+//    length, so the hottest replica holds more than 1/N of the keys. Heuristic (chosen,
+//    not derived exactly): the arcs' relative spread shrinks like 1/sqrt(v) (each server's
+//    share is a sum of v arcs, the Dynamo/Chord argument), so the hottest carries
+//    imbalance = 1 + 1/sqrt(v) times the average (v = 100: 1.1; v = 1: 2), capped at N
+//    (a single replica is the average).
+// A node behind two balancers of different policies would need two queueing models at
+// once, so that is an error. Two consistent_hash rings with different vnodes keep the
+// larger imbalance (the hotter ring decides the hottest replica).
+Graph::Result Graph::mark_balanced_targets() {
+  std::vector<std::optional<model::LbPolicy>> policy_of(nodes_.size());
+  for (std::size_t balancer = 0; balancer < nodes_.size(); ++balancer) {
+    const auto& spec = nodes_[balancer].spec;
+    if (spec.type != model::NodeType::load_balancer) continue;
+    // A scenario built in code may leave the policy out (the loader always fills it in).
+    const auto policy = spec.policy.value_or(model::LbPolicy::round_robin);
+    const int vnodes = spec.vnodes.value_or(model::default_vnodes);
+    if (vnodes <= 0) {
+      return std::unexpected{
+          EngineError{"node '" + spec.id + "': vnodes must be a positive integer"}};
+    }
+    for (const auto& route : routes_[balancer]) {
+      auto& target = nodes_[route.target];
+      if (policy_of[route.target] && *policy_of[route.target] != policy) {
+        return std::unexpected{EngineError{"node '" + target.spec.id +
+                                           "' is behind load balancers with different policies"}};
+      }
+      policy_of[route.target] = policy;
+      if (policy == model::LbPolicy::least_connections) target.pooled = true;
+      if (policy == model::LbPolicy::consistent_hash) {
+        // Imbalance factor 1 + 1/sqrt(v) (see the function comment), at most N: the hottest
+        // of N replicas cannot carry more than all of the demand, and one replica alone
+        // carries exactly the average (factor 1).
+        const double replicas = target.spec.replicas;
+        const double factor =
+            std::min(1.0 + 1.0 / std::sqrt(static_cast<double>(vnodes)), replicas);
+        target.imbalance = std::max(target.imbalance, factor);
+      }
+    }
   }
   return {};
 }

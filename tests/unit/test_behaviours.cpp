@@ -70,12 +70,13 @@ Scenario two_hop(StepMode mode) {
 // u -> lb -> {a (weight 3), b (weight 1)}, zero-latency links.
 Scenario weighted_lb() {
   Scenario s{.name = "lb", .version = 1, .duration = 1min};
-  s.nodes = {NodeSpec{.id = "u",
-                      .type = NodeType::client,
-                      .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"get", 1.0}}}},
-             NodeSpec{.id = "lb", .type = NodeType::load_balancer, .policy = LbPolicy::weighted},
-             NodeSpec{.id = "a", .type = NodeType::service},
-             NodeSpec{.id = "b", .type = NodeType::service}};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"get", 1.0}}}},
+      NodeSpec{.id = "lb", .type = NodeType::load_balancer, .policy = LbPolicy::weighted},
+      NodeSpec{.id = "a", .type = NodeType::service},
+      NodeSpec{.id = "b", .type = NodeType::service}};
   s.links = {LinkSpec{.from = "u", .to = "lb", .latency = 0s},
              LinkSpec{.from = "lb", .to = "a", .latency = 0s, .weight = 3},
              LinkSpec{.from = "lb", .to = "b", .latency = 0s, .weight = 1}};
@@ -378,15 +379,15 @@ TEST_CASE("a load balancer forwards every incoming op across its routes and serv
   REQUIRE_THAT(routed.served.total().per_second, WithinRel(100.0, 1e-12));
 }
 
-TEST_CASE("a load balancer's response is its own sojourn plus the share-weighted downstream mixture",
-          "[behaviours]") {
+TEST_CASE(
+    "a load balancer's response is its own sojourn plus the share-weighted downstream mixture",
+    "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(weighted_lb());
   const LoadBalancerBehaviour lb{g, *g.index_of("lb")};
-  const auto r = lb.response("get", LatencyEstimate{0.0001, 0.0},
-                             [&](std::size_t node, std::string_view) {
-                               return node == *g.index_of("a") ? LatencyEstimate{0.001, 0.0}
-                                                               : LatencyEstimate{0.005, 0.0};
-                             });
+  const auto r =
+      lb.response("get", LatencyEstimate{0.0001, 0.0}, [&](std::size_t node, std::string_view) {
+        return node == *g.index_of("a") ? LatencyEstimate{0.001, 0.0} : LatencyEstimate{0.005, 0.0};
+      });
   REQUIRE_THAT(r.mean_s, WithinRel(0.0001 + 0.75 * 0.001 + 0.25 * 0.005, 1e-12));
   // Between-branch variance of a two-point mixture: s_a s_b (m_a - m_b)^2; each branch is
   // deterministic and the links add nothing, so all of the variance is the spread between them.

@@ -378,8 +378,7 @@ TEST_CASE("a load balancer's routes honour link op filters and reject an op no l
   Scenario s{.name = "lb", .version = 1, .duration = 1min};
   s.nodes = {client("u", Rate{100}, {{"get", 0.5}, {"put", 0.5}}),
              load_balancer("lb", LbPolicy::round_robin), service("a"), service("b")};
-  s.links = {LinkSpec{.from = "u", .to = "lb"},
-             LinkSpec{.from = "lb", .to = "a", .ops = {"get"}},
+  s.links = {LinkSpec{.from = "u", .to = "lb"}, LinkSpec{.from = "lb", .to = "a", .ops = {"get"}},
              LinkSpec{.from = "lb", .to = "b", .ops = {"get"}}};
   const auto g = Graph::build(s);
   REQUIRE_FALSE(g.has_value());
@@ -388,8 +387,8 @@ TEST_CASE("a load balancer's routes honour link op filters and reject an op no l
 
 TEST_CASE("least_connections marks its downstream service as pooled", "[graph]") {
   Scenario s{.name = "lb", .version = 1, .duration = 1min};
-  s.nodes = {client("u", Rate{100}, {{"get", 1.0}}), load_balancer("lb", LbPolicy::least_connections),
-             service("a")};
+  s.nodes = {client("u", Rate{100}, {{"get", 1.0}}),
+             load_balancer("lb", LbPolicy::least_connections), service("a")};
   s.nodes[2].replicas = 4;
   s.links = {LinkSpec{.from = "u", .to = "lb"}, LinkSpec{.from = "lb", .to = "a"}};
   const auto g = *Graph::build(s);

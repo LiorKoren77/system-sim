@@ -145,6 +145,36 @@ inline constexpr auto step_mode_table = std::to_array<core::EnumName<StepMode>>(
   return core::parse_in(step_mode_table, name);
 }
 
+// How a load balancer spreads requests over the replicas behind it (System Design
+// Interview ch. 1 "Load balancer"; ch. 5 for the hash ring). In the fluid model the
+// policy decides how the DOWNSTREAM node's replicas queue (plan 2a refinement 5, see
+// graph::Graph::mark_balanced_targets): round_robin keeps them independent queues,
+// least_connections pools them into one, consistent_hash loads the hottest one more than
+// the average, weighted splits by the links' `weight` (as every policy does across
+// several outgoing links).
+enum class LbPolicy { round_robin, least_connections, weighted, consistent_hash };
+
+// Pattern: Table-driven method — the policy names, read by the loader (`policy:`) and
+// printed by explain from this one table.
+inline constexpr auto lb_policy_table = std::to_array<core::EnumName<LbPolicy>>({
+    {LbPolicy::round_robin, "round_robin"},
+    {LbPolicy::least_connections, "least_connections"},
+    {LbPolicy::weighted, "weighted"},
+    {LbPolicy::consistent_hash, "consistent_hash"},
+});
+
+[[nodiscard]] constexpr std::string_view to_string(LbPolicy p) {
+  return core::name_in(lb_policy_table, p);
+}
+[[nodiscard]] constexpr std::optional<LbPolicy> parse_lb_policy(std::string_view name) {
+  return core::parse_in(lb_policy_table, name);
+}
+
+// Virtual nodes per server on a consistent-hash ring when the scenario gives none.
+// Chosen: 150 is the per-server token count of Amazon Dynamo's evaluation and of the
+// Cassandra/Riak-style rings the book's ch. 5 describes ("vnodes: 150" in the lab).
+inline constexpr int default_vnodes = 150;
+
 // One thing a node does with an incoming op: forward (a multiple of) it to `to` as `op`.
 // Every struct below is an aggregate (public members, no constructors) with default
 // member initializers, so callers can use C++20 designated initializers and name only
@@ -203,6 +233,11 @@ struct NodeSpec {
   // designated initializers, which must follow declaration order, can write
   // `{..., .ops = ..., .cost = ...}`.
   std::map<std::string, double> cost{};
+  // Load balancers only (declared after `cost`, for designated initializers): the policy
+  // (the loader fills in round_robin when the key is absent) and, for consistent_hash,
+  // the virtual nodes per server (absent: default_vnodes).
+  std::optional<LbPolicy> policy{};
+  std::optional<int> vnodes{};
   std::optional<Workload> workload{};  // clients only
 };
 
@@ -298,9 +333,12 @@ static_assert(simsys::core::round_trips(simsys::model::direction_table));
 static_assert(simsys::core::round_trips(simsys::model::slo_metric_table));
 static_assert(simsys::core::round_trips(simsys::model::step_condition_table));
 static_assert(simsys::core::round_trips(simsys::model::step_mode_table));
+static_assert(simsys::core::round_trips(simsys::model::lb_policy_table));
 static_assert(simsys::model::node_type_table.back().value == simsys::model::NodeType::frontier);
 static_assert(simsys::model::direction_table.back().value == simsys::model::Direction::inout);
 static_assert(simsys::model::slo_metric_table.back().value == simsys::model::SloMetric::staleness);
 static_assert(simsys::model::step_condition_table.back().value ==
               simsys::model::StepCondition::failure);
 static_assert(simsys::model::step_mode_table.back().value == simsys::model::StepMode::parallel);
+static_assert(simsys::model::lb_policy_table.back().value ==
+              simsys::model::LbPolicy::consistent_hash);

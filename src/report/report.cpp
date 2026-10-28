@@ -620,6 +620,42 @@ template <class T, class F>
   return "  cost: " + join(entries, ", ");
 }
 
+// The vnodes of the consistent-hash balancer in front of `target` (the one whose ring
+// gives the largest imbalance, as Graph::mark_balanced_targets keeps), for explain.
+[[nodiscard]] int ring_vnodes(const graph::Graph& g, std::size_t target) {
+  int fewest = 0;  // fewest vnodes = largest imbalance 1 + 1/sqrt(v)
+  for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+    const auto& spec = g.nodes()[node].spec;
+    if (spec.policy != model::LbPolicy::consistent_hash) continue;
+    const int vnodes = spec.vnodes.value_or(model::default_vnodes);
+    for (const auto& route : g.routes(node)) {
+      if (route.target == target && (fewest == 0 || vnodes < fewest)) fewest = vnodes;
+    }
+  }
+  return fewest;
+}
+
+// What a load balancer's policy means for this node (plan 2a refinement 5): a balancer's
+// own policy, and on the node behind it `pooled` (least_connections) or the hottest
+// replica's `imbalance` (consistent_hash).
+[[nodiscard]] std::string balancing_summary(const graph::Graph& g, std::size_t index) {
+  const auto& node = g.nodes()[index];
+  std::string text;
+  if (node.spec.type == model::NodeType::load_balancer) {
+    const auto policy = node.spec.policy.value_or(model::LbPolicy::round_robin);
+    text += "  policy=" + std::string{model::to_string(policy)};
+    if (policy == model::LbPolicy::consistent_hash) {
+      text += " vnodes=" + std::to_string(node.spec.vnodes.value_or(model::default_vnodes));
+    }
+  }
+  if (node.pooled) text += "  pooled";
+  if (node.imbalance != 1.0) {
+    text += "  imbalance=" + num(node.imbalance, 3) + " (vnodes " +
+            std::to_string(ring_vnodes(g, index)) + ")";
+  }
+  return text;
+}
+
 [[nodiscard]] std::string server_details(const graph::ResolvedNode& node) {
   const auto& spec = node.spec;
   const auto& cap = node.capacity;
@@ -647,11 +683,13 @@ template <class T, class F>
 
 [[nodiscard]] std::string explain_nodes(const graph::Graph& g) {
   std::vector<Row> rows;
-  for (const auto& node : g.nodes()) {
+  for (std::size_t i = 0; i < g.nodes().size(); ++i) {
+    const auto& node = g.nodes()[i];
     const bool client = node.spec.type == model::NodeType::client;
-    rows.push_back({{node.spec.id},
-                    {std::string{model::to_string(node.spec.type)}},
-                    {client ? client_details(node.spec) : server_details(node)}});
+    rows.push_back(
+        {{node.spec.id},
+         {std::string{model::to_string(node.spec.type)}},
+         {client ? client_details(node.spec) : server_details(node) + balancing_summary(g, i)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }
@@ -771,14 +809,32 @@ constexpr SimTime peak_sample_step = 1_min;
   return found == spec.cost.end() ? 1.0 : found->second;
 }
 
+// Forwards what reached load balancer `from` over its routes, each op split by the
+// shares Graph::routes_for gives (as LoadBalancerBehaviour::route does).
+void forward_balanced(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
+                      std::vector<OpLoad>& fed_back) {
+  const OpLoad arriving = load[from];  // a copy, as in forward_steps
+  for (const auto& [op, rate] : arriving) {
+    for (const auto& route : g.routes_for(from, op)) {
+      auto& destination = g.links()[route.link].feedback ? fed_back : load;
+      destination[route.target][op] += rate * route.share;
+    }
+  }
+}
+
 // Forwards what reached node `from` along its unconditional `ops` steps (rate × factor),
-// as ServiceBehaviour::route does. Flow over a feedback link goes to `fed_back`: its
-// target came earlier in the order, so it counts in the next pass.
+// as ServiceBehaviour::route does, or over a load balancer's routes. Flow over a feedback
+// link goes to `fed_back`: its target came earlier in the order, so it counts in the next
+// pass.
 void forward_steps(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
                    std::vector<OpLoad>& fed_back) {
   const auto& spec = g.nodes()[from].spec;
   if (spec.type == model::NodeType::client) return;  // client routes are in client_load
-  const OpLoad arriving = load[from];                // a copy: a step may target `from` itself
+  if (spec.type == model::NodeType::load_balancer) {
+    forward_balanced(g, from, load, fed_back);
+    return;
+  }
+  const OpLoad arriving = load[from];  // a copy: a step may target `from` itself
   for (const auto& [op, rate] : arriving) {
     const auto steps = spec.ops.find(op);
     if (steps == spec.ops.end()) continue;
