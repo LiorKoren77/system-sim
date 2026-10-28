@@ -38,12 +38,13 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `load_balancer` | every policy |
 | `rate_limiter` | every algorithm, with or without a counter `backend` |
 | `cache` | a fixed or [`che`](#che-hit-ratios) hit ratio, every strategy (`write_back` with an asynchronous flush), [`then` steps](#then-steps-on-a-cache) |
+| `sql_db` | phase 2b: a primary and read replicas, `shards`, `pool`, `replication_lag` and the `staleness` SLO, see [`sql_db`](#sql_db) |
 
 Everything else is refused before the first step, with exit code 1:
 
 | what | message | runs from |
 |---|---|---|
-| `sql_db`, `cdn` | `node 'x' has type 'cdn', which run/estimate do not support yet (phase 2)` | 2b |
+| `cdn` | `node 'x' has type 'cdn', which run/estimate do not support yet (phase 2)` | 2b |
 | `blob_store`, `message_queue`, `worker_pool`, `external_sink` | the same message | 2c |
 | `kv_cluster`, `ws_gateway`, `service_discovery` | the same message | 3 |
 | `search_index`, `id_generator`, `notification_fanout`, `frontier` | the same message | not yet assigned to a phase |
@@ -191,7 +192,7 @@ target and, if that link lists `ops`, lists the step's op.
 | `rate_limiter` | `algorithm`, `limit`, `burst`, `window`, `backend` | read and run, see [`rate_limiter`](#rate_limiter) |
 | `service` | `ops`, `cost` | read and run |
 | `cache` | `hit_ratio`, `strategy`, `write_ops`, `backend`, `keys`, `eviction`, `ttl`, `then`, `cost` | read and run (fixed or `che` hit ratio), see [`cache`](#cache) |
-| `sql_db` | `replication_lag`, `shards` (int), `pool` (int connections) † | ignored; runs from phase 2b |
+| `sql_db` | `replication_lag`, `shards` (int), `pool` (int connections), `write_ops` | read and run (phase 2b), see [`sql_db`](#sql_db) |
 | `kv_cluster` | `nodes` (int), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp` | ignored; phase 3 |
 | `message_queue` | `partitions`, `retention` † | ignored; phase 2c |
 | `worker_pool` | `consumes` (queue node id), `workers`, `cost` (duration per job), `then` | `consumes` checked; others ignored; phase 2c |
@@ -410,6 +411,54 @@ x 4 partitioned, uneven arcs)`. A key space past `9999G` is written in digits. F
 For spec §18: the code's `HitRatioModel` is `hit_ratio(capacity) -> double`, each model owning its
 inputs (`CheHitRatio{popularity}`), where spec §5 wrote `hit_ratio(capacity, popularity)`.
 
+### `sql_db`
+
+Models the relational database of ch. 1 ("database replication", "sharding") and the DB box of
+the later designs. `replicas: N` is one **primary** and `N − 1` **read replicas**; `capacity`,
+`latency` and `advanced` describe one copy (default 5k/s, 150 µs: an SSD random read).
+
+| key | rule | message on violation |
+|---|---|---|
+| `shards` | a positive integer; default 1. The data is split over that many independent sets of `N` copies each | `shards must be a positive integer` |
+| `pool` | a positive integer of at most 100000: the connection pool, the queries one copy runs at once (the `c` of its M/M/c queue). It **is** `advanced.concurrency` under the database's name, so stating both is refused | `pool must be a positive integer`, `pool must be at most 100000`, `pool and advanced.concurrency are the same setting` |
+| `replication_lag` | a non-negative duration; default 0 (a synchronous replica) | the duration parser's (`replication_lag: expected a non-negative finite number`) |
+| `write_ops` | as a cache's; default `[write, insert, update, delete]`. These ops go to the primary; every other op is a read | as a cache's |
+
+A database built in code whose `write_ops` is left at the model's default (`[write]`) gets the
+database default too: the graph cannot tell it from a scenario's explicit `write_ops: [write]`,
+which therefore also counts `insert`, `update` and `delete` as writes.
+
+How the load is split, with `S` shards (each copy its own queue of the node's capacity):
+
+| copy | how many | one copy is sent | answers |
+|---|---|---|---|
+| primary | `S` | writes / `S` | the writes |
+| replica | `(N − 1) S` | reads / `((N − 1) S)` **+ writes / `S`** | the reads |
+
+Every replica applies every write of its shard (replication), so replicas scale reads, not
+writes: with `N = 3`, 1000 reads/s and 100 writes/s, the primary runs at 100/s and each replica
+at 500 + 100 = 600/s. With `N = 1` the `S` primaries take reads and writes alike. A write's
+response is the primary's sojourn, a read's a replica's. The node reports the busier kind's
+`rho` and zone; its demand, drain, drops and backlog count the clients' queries only (the
+replicas' replication work shows in their `rho` and in the reads' latency). A load balancer in
+front changes nothing: the database driver, not a balancer, sends writes to the primary.
+
+**Staleness**: a replica applies a write `replication_lag` after the primary finished it, so a
+read may return data as old as `replication_lag` + the primary's write sojourn (wait + service).
+That is the node's staleness, 0 without replicas; the `staleness` SLO compares its mean over the
+run with `max`, and JSON reports it per node as `staleness_s` (`null` for every other node). The
+text table has no staleness column: the SLO line and JSON carry it.
+
+`explain` prints the model, `primary+2 replicas  shards=4  lag=50ms  pool=32
+write_ops=write,insert` (`(default)` after a shard count or lag the scenario left out; `pool`
+only when stated, `c=32 (pool)` in the queue numbers), and its check splits the paper load:
+`primary 100/s vs 1k/s (10%, green), each replica 600/s vs 1k/s (60%, yellow)`.
+
+Not modelled: replication conflicts and multi-primary set-ups, failover, transactions and
+locks, waiting for a free connection beyond the pool's queue, cross-shard queries, hot shards
+(the sharding key is perfect), resharding, per-op service times (a costly op uses more capacity,
+`cost` † on a database built in code only), read-your-writes.
+
 ## Rate curve (`client.rate`)
 
 ```yaml
@@ -490,7 +539,7 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 | `reject_rate` | optional | not allowed | number in [0, 1] | **new in v1.2**: the node's rejected (a rate limiter's refusals, a leaky bucket's overflow included) / the requests sent to it, after warmup; without `node`, the worst node's |
 | `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup |
 | `queue_lag` | optional | not allowed | duration | reported `skipped` until `message_queue` runs (phase 2c) |
-| `staleness` | optional | not allowed | duration | reported `skipped` until replication lag is modelled (`sql_db`, phase 2b) |
+| `staleness` | optional; name a `sql_db` | not allowed | duration | phase 2b: the named database's mean staleness after warmup, `replication_lag` + its primary's write sojourn (see [`sql_db`](#sql_db)); `skipped` without a `node` or on a node that keeps no replicated data |
 
 The kind of `max` follows the metric, so `0.01` can never be read as 0.01 seconds
 (`slo: reject_rate max must be between 0 and 1`).
@@ -524,7 +573,8 @@ node's own served / inflow, times its downstream's: sequential parts multiply, s
 by share). `run`'s table header shows `drop rate`, and `reject rate X% (worst: node)` once
 some node refused anything; the node table has `dropped` and `rejected` columns; JSON has
 `drop_rate`, `worst_drop_node`, `reject_rate`, `worst_reject_node` and per node `dropped`,
-`rejected`.
+`rejected` and (phase 2b) `staleness_s`, a database's mean staleness in seconds, `null` for other
+nodes.
 
 `run --series` writes one CSV row per node per step:
 `t_s,node,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone` (`rejected_per_s` new in

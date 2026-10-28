@@ -1,6 +1,7 @@
 # Lab: System Design Interview vol. 1, ch. 5 — Consistent hashing.
-# A load balancer hashes keys onto a ring of cache servers. Compare `vnodes: 1` (uneven
-# partitions) with `vnodes: 150` (even), and watch what happens when a server is removed.
+# A load balancer hashes keys onto a ring of cache servers. The shipped `vnodes: 150` (even
+# partitions) meets the SLOs; try `vnodes: 1` (uneven: the hottest server takes half the load
+# and fails them). The fault below (a server removed) is typed in phase 3 and ignored until then.
 version: 1
 name: lab-consistent-hashing
 seed: 1
@@ -19,7 +20,7 @@ nodes:
   ring:
     type: load_balancer
     policy: consistent_hash
-    vnodes: 1                                   # try 150
+    vnodes: 150                                 # try 1: the hottest server at 133%
     capacity: 200k/s
     latency: 0.05ms
 
@@ -32,7 +33,7 @@ nodes:
     strategy: read_through                      # a miss reads db itself
     backend: db
     write_ops: [set]                            # a set updates the cache; only gets miss
-    capacity: 12k/s
+    capacity: 15k/s                             # 40k/s over 4: 67% each, room for the hottest
     latency: 0.2ms
 
   db:

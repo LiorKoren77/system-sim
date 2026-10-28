@@ -903,15 +903,80 @@ class CacheBehaviour {
   std::map<std::string, double, std::less<>> cost_by_op_;  // only the ops listed in `cost`
 };
 
+// Models: the relational database of System Design Interview (Alex Xu, vol. 1) ch. 1 ("Scale
+// from zero to millions of users"), as its two scaling sections draw it, and every "DB" box of
+// the later designs (ch. 8's URL table, ch. 7's ID tickets). Plan 2b refinement 3.
+//  - Database replication (ch. 1): `replicas: N` is one primary and N − 1 read replicas. Every
+//    write (an op in `write_ops`, default insert, update, delete and write) goes to the
+//    primary; reads go to the replicas, or to the primary when there are none (N = 1). Each
+//    replica applies every write the primary ships to it, so a replica's load is its share of
+//    the reads PLUS all the writes: the reason the book says replication scales reads, not
+//    writes.
+//  - Sharding (ch. 1, horizontal scaling): `shards: S` splits the data over S independent
+//    sets of the same shape (a primary and N − 1 replicas each), each seeing 1/S of the
+//    reads and of the writes: a perfect sharding key, no hot shard (the celebrity problem the
+//    book warns about is not modelled).
+//  - The connection pool (`pool`): how many queries one copy runs at once, the c of its M/M/c
+//    queue (graph::Graph::resolve_nodes applies it).
+//  - Replication lag (`replication_lag`, a constant): a replica applies a write that long after
+//    the primary finished it, so a read may return data as old as the lag plus the primary's
+//    write sojourn: the node's `staleness` (engine::NodeSample::staleness_s, the `staleness`
+//    SLO).
+// Who does what: the ENGINE holds the two kinds of queue (primary and replica copies, see
+// engine::Simulation::make_database) and splits the load between them with `is_write`; it
+// hands `response` the sojourn of the queue the op uses (a write the primary's, a read a
+// replica's). This behaviour serves everything, forwards nothing (a database is a leaf: it
+// calls nobody) and composes nothing more.
+// Ignored: replication conflicts and multi-primary set-ups, failover (a replica promoted when
+// the primary dies, ch. 1: no failures before phase 2c), transactions and locks, queueing for
+// a connection beyond the pool (a query waiting for a free connection waits in the same queue
+// here), cross-shard queries and joins, resharding, hot shards, per-op service times (a write's
+// disk seek costs more capacity via `cost`, not a longer service time), and read-your-writes:
+// a client that reads right after writing may see the stale replica, which only the staleness
+// number tells.
+class SqlDbBehaviour {
+ public:
+  SqlDbBehaviour(const graph::Graph& g, std::size_t self);
+
+  // Serves every incoming op and forwards nothing: a database answers queries itself. `now`
+  // and `dt` are unused (a database holds no state between steps).
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+
+  // Capacity units one query of `op` uses: the spec's `cost` entry, else 1 (on the primary
+  // and on each replica that applies it alike).
+  [[nodiscard]] double cost(std::string_view op) const;
+
+  // Whether `op` changes data and so goes to the primary (it is in `write_ops`); every other
+  // op is a read a replica answers.
+  [[nodiscard]] bool is_write(std::string_view op) const;
+
+  // The sojourn the engine chose for the op (its own queue's): a database calls nobody.
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view /*op*/, flow::LatencyEstimate own,
+                                               ResponseLookup auto&& /*downstream*/) const {
+    return own;
+  }
+
+  // The share of the op's queries the database answers itself: no downstream to fail them.
+  [[nodiscard]] double delivered(std::string_view /*op*/, double own,
+                                 FractionLookup auto&& /*downstream*/) const {
+    return own;
+  }
+
+ private:
+  std::vector<std::string> write_ops_;
+  std::map<std::string, double, std::less<>> cost_by_op_;  // only the ops listed in `cost`
+};
+
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
 // std::visit; a std::variant instead of an abstract base keeps every behaviour a plain
 // value (no heap allocation, no virtual calls, copyable). Phase 2a appended the load
-// balancer, the rate limiter and the cache; later phases append the rest (queue, ...).
+// balancer, the rate limiter and the cache, phase 2b the SQL database; later phases append the
+// rest (queue, ...).
 // C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
 // it holds) dispatched with std::visit. Closed: adding an alternative means editing this
 // line, and every std::visit that does not handle it then fails to compile.
 using Behaviour = std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour,
-                               RateLimiterBehaviour, CacheBehaviour>;
+                               RateLimiterBehaviour, CacheBehaviour, SqlDbBehaviour>;
 
 }  // namespace simsys::behaviours
 
@@ -923,6 +988,7 @@ static_assert(NodeBehaviour<ServiceBehaviour>);
 static_assert(NodeBehaviour<LoadBalancerBehaviour>);
 static_assert(NodeBehaviour<RateLimiterBehaviour>);
 static_assert(NodeBehaviour<CacheBehaviour>);
+static_assert(NodeBehaviour<SqlDbBehaviour>);
 static_assert(RequestSource<ClientBehaviour>);
 
 namespace detail {
@@ -1377,6 +1443,33 @@ Routed CacheBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt
     hops_.forward(op, rate, routed.outgoing);
   }
   detail::sort_by_destination(routed.outgoing);
+  return routed;
+}
+
+// ---- SqlDbBehaviour ----
+
+// graph::Graph::resolve_nodes already gave a database built in code the SQL default write ops.
+SqlDbBehaviour::SqlDbBehaviour(const graph::Graph& g, std::size_t self)
+    : write_ops_{g.nodes()[self].spec.write_ops},
+      cost_by_op_{g.nodes()[self].spec.cost.begin(), g.nodes()[self].spec.cost.end()} {}
+
+double SqlDbBehaviour::cost(std::string_view op) const {
+  const auto found = cost_by_op_.find(op);
+  return found == cost_by_op_.end() ? 1.0 : found->second;
+}
+
+bool SqlDbBehaviour::is_write(std::string_view op) const {
+  // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
+  // `std::find(begin, end, value) != end`.
+  return std::ranges::contains(write_ops_, op);
+}
+
+Routed SqlDbBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
+  Routed routed;
+  for (const auto& [op, rate] : in.entries()) {
+    if (rate.per_second <= 0.0) continue;  // no empty entries (see ServiceBehaviour::route)
+    routed.served.add(op, rate);
+  }
   return routed;
 }
 
