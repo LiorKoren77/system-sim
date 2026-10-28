@@ -30,6 +30,7 @@ module;
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <generator>
 #include <iterator>
 #include <numbers>
 #include <optional>
@@ -139,6 +140,38 @@ class NoiseProcess {
   std::mt19937_64 engine_;
   std::normal_distribution<double> normal_{0.0, 1.0};  // xi ~ N(0, 1)
 };
+
+// One point of a sampled curve: the time (offset from t = 0) and the rate at that time.
+struct Sample {
+  SimTime t{};
+  Rate rate{};
+};
+
+// C++20 coroutines + C++23 std::generator<T>: a function that `co_yield`s values becomes a
+// lazy range. It replaces building a whole std::vector up front or hand-writing an iterator
+// class; the curve is sampled only as far as the consumer reads (a day at 1 s steps is
+// 86400 samples nobody has to store). Each co_yield suspends the coroutine and hands one
+// Sample to the caller; resuming continues the loop. The body does not run until the first
+// begin(), which is why a bad `step` throws there (a programmer error; the CLI validates
+// its --step first). No design pattern: just a lazy range.
+//
+// `curve` is taken BY VALUE on purpose. A coroutine's parameters are copied into its heap
+// frame, and a reference parameter is copied as a *reference*: the generator outlives the
+// call expression (it is returned, then iterated later), so a `const RateCurve&` bound to
+// a caller's temporary would dangle by the time the body first runs. A by-value parameter
+// is moved or copied into the frame and lives as long as the generator does.
+//
+// Samples are taken at t = 0, step, 2 step, ... while t < until (end exclusive). Throws
+// std::invalid_argument if `step` is not positive.
+[[nodiscard]] std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until);
+
+// The same stream with workload noise (spec §9.2): the generator owns a NoiseProcess seeded
+// with `seed` and multiplies rate_at(t) by noise.next(step) for each sample, so the noise
+// advances exactly once per sample and the same arguments give the same stream, bit for bit.
+// Throws std::invalid_argument for a non-positive `step`, or the NoiseProcess's own errors
+// (negative sigma, non-positive correlation), on the first begin().
+[[nodiscard]] std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until,
+                                             Noise noise, std::uint64_t seed);
 
 }  // namespace simsys::workload
 
@@ -335,6 +368,26 @@ Rate RateCurve::rate_at(SimTime t) const {
   const double wave_term = wave ? wave_multiplier(*wave, t) : 1.0;
   const double ramp_term = ramp ? detail::ramp_multiplier(*ramp, base, t) : 1.0;
   return Rate{level * wave_term * ramp_term * detail::spikes_multiplier(spikes, t)};
+}
+
+std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until) {
+  if (step.count() <= 0) throw std::invalid_argument{"sample step must be positive"};
+  // Loop on integer nanoseconds (exact; no floating-point drift accumulates in t).
+  for (std::int64_t t = 0; t < until.count(); t += step.count()) {
+    const SimTime at{t};
+    co_yield Sample{.t = at, .rate = curve.rate_at(at)};
+  }
+}
+
+std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until, Noise noise,
+                               std::uint64_t seed) {
+  if (step.count() <= 0) throw std::invalid_argument{"sample step must be positive"};
+  // The process lives in the coroutine frame, so its state survives every suspension.
+  NoiseProcess process{noise, seed};
+  for (std::int64_t t = 0; t < until.count(); t += step.count()) {
+    const SimTime at{t};
+    co_yield Sample{.t = at, .rate = Rate{curve.rate_at(at).per_second * process.next(step)}};
+  }
 }
 
 }  // namespace simsys::workload
