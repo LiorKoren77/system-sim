@@ -1,0 +1,102 @@
+# System Design Interview vol. 1, ch. 15 — Google Drive.
+# Book numbers: 50M signed-up, 10M DAU, 10 GB free space, 2 uploads/user/day of ~500 KB
+# → ~240 uploads/s, 10:1 read:write. Block servers split files into 4 MB blocks,
+# compress, encrypt, dedup; cloud storage holds blocks; metadata DB holds the tree;
+# notification service pushes sync events over long polling.
+version: 1
+name: google-drive
+seed: 1
+duration: 24h
+step: 100ms
+warmup: 5m
+
+nodes:
+  clients:
+    type: client
+    rate:
+      base: 3k/s
+      wave: {shape: diurnal, period: 24h, amplitude: 0.7, peak_at: 11:00}   # office hours
+    ops: {download: 0.70, upload: 0.08, metadata: 0.20, sync_poll: 0.02}
+    sizes: {download: 500KB, upload: 500KB, metadata: 1KB}
+    keys: {zipf: 0.8, space: 500M}
+    timeout: 30s
+
+  lb: {type: load_balancer, policy: round_robin}
+
+  api:
+    type: service
+    replicas: 8
+    capacity: 2k/s
+    latency: 1ms
+    ops:
+      metadata:
+        - {to: metadata_cache, op: read}
+        - {to: metadata_db, op: read, on: miss}
+      upload:
+        - {to: metadata_db, op: write}
+        - {to: notify_q, op: publish}
+      download:
+        - {to: metadata_cache, op: read}
+        - {to: block_servers, op: fetch}
+      sync_poll:
+        - {to: notification_svc, op: poll}
+
+  block_servers:                               # chunk, compress, encrypt, dedup
+    type: service
+    replicas: 10
+    capacity: 500/s
+    latency: 20ms
+    ops:
+      upload:
+        - {to: cloud_storage, op: write, factor: 0.5}      # dedup halves stored blocks
+      fetch:
+        - {to: cloud_storage, op: read}
+
+  cloud_storage: {type: blob_store, capacity: 2GB/s}
+  cold_storage: {type: blob_store, capacity: 200MB/s}
+
+  metadata_cache: {type: cache, eviction: lru, keys: 50M, hit_ratio: che, strategy: cache_aside}
+  metadata_db:
+    type: sql_db
+    replicas: 3
+    shards: 4
+    capacity: 4k/s
+    replication_lag: 50ms
+
+  notify_q: {type: message_queue, partitions: 8}
+  notification_svc:
+    type: worker_pool
+    consumes: notify_q
+    workers: 8
+    cost: 1ms
+    then: [{to: long_poll, op: push, factor: 2}]        # avg 2 other devices per user
+
+  long_poll: {type: ws_gateway, replicas: 4, max_connections: 2M, heartbeat: 60s, fanout: 1, capacity: 20k/s}
+
+  backup_workers:
+    type: worker_pool
+    consumes: notify_q
+    workers: 2
+    cost: 10ms
+    then: [{to: cold_storage, op: write}]
+
+links:
+  - {from: clients, to: lb, dir: inout}
+  - {from: lb, to: api, dir: inout}
+  - {from: api, to: metadata_cache, dir: inout}
+  - {from: api, to: metadata_db, dir: inout}
+  - {from: api, to: notify_q}
+  - {from: api, to: block_servers, dir: inout}
+  - {from: clients, to: block_servers, dir: inout, ops: [upload]}   # uploads go to block servers directly
+  - {from: block_servers, to: cloud_storage, dir: inout}
+  - {from: notify_q, to: notification_svc}
+  - {from: notify_q, to: backup_workers}
+  - {from: notification_svc, to: long_poll}
+  - {from: long_poll, to: clients}
+  - {from: backup_workers, to: cold_storage}
+  - {from: api, to: notification_svc, dir: inout, ops: [sync_poll]}
+
+slo:
+  - {metric: p99_latency, node: clients, op: download, max: 2s}
+  - {metric: p99_latency, node: clients, op: metadata, max: 100ms}
+  - {metric: drop_rate, max: 0.001}
