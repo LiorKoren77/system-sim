@@ -15,6 +15,7 @@
 // when a std header is included after a module that included it in its global module fragment.
 import simsys.core;
 import simsys.fluid;
+import simsys.queueing;
 
 using Catch::Approx;
 using Catch::Matchers::WithinAbs;
@@ -161,6 +162,27 @@ TEST_CASE("a backlog larger than one step's spare capacity drains at full capaci
   REQUIRE(s.zone == Zone::red);
   // Fluid wait 950/1000 s wins over the 99 ms Erlang term, plus 1 ms service.
   REQUIRE_THAT(s.latency.mean_s, WithinRel(0.950 + 0.001, 1e-12));
+  // The variance keeps the stochastic term even though the fluid mean wins. M/M/1 at the
+  // capped rho 0.99 (c = 1, so P_wait = rho = 0.99; k = 1 for Poisson/exponential):
+  //   theta   = s / (c (1 - rho)) = 0.001 / 0.01 = 0.1 s
+  //   Var(Wq) = P (2 - P) theta^2 = 0.99 * 1.01 * 0.01 = 0.9999 * 0.01 = 0.009999 s^2
+  //   Var(S)  = cs^2 * s^2 = 1 * (0.001)^2 = 1e-6 s^2
+  REQUIRE_THAT(s.latency.variance_s2, WithinRel(0.009999 + 1e-6, 1e-9));
+}
+
+TEST_CASE("estimated p99 never decreases while overload deepens", "[fluid]") {
+  // The variance must not jump when the fluid wait overtakes the stochastic one,
+  // otherwise p99 would fall as the backlog grows (review finding).
+  FluidQueue q{web()};
+  double previous_p99 = 0.0;
+  for (int step = 0; step < 10; ++step) {
+    const auto s = q.advance(Rate{1500}, 100ms);
+    const double p99 = simsys::queueing::lognormal_quantile(s.latency.mean_s, s.latency.variance_s2,
+                                                            simsys::queueing::z_p99);
+    CAPTURE(step, s.latency.mean_s, s.latency.variance_s2);
+    REQUIRE(p99 >= previous_p99);
+    previous_p99 = p99;
+  }
 }
 
 TEST_CASE("a node with no capacity drains nothing and reports an unbounded wait", "[fluid]") {
