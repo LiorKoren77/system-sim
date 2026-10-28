@@ -982,8 +982,9 @@ TEST_CASE("the staleness SLO fails when a replica drops replicated writes", "[re
   auto s = replicated_db();
   s.duration = 10s;
   s.warmup = 6s;  // after the replica's queue is full: a steady 200/s of drops
-  s.nodes[0].workload = Workload{.curve = {.base = Rate{1200}},
-                                 .op_shares = {{"read", 800.0 / 1200.0}, {"write", 400.0 / 1200.0}}};
+  s.nodes[0].workload =
+      Workload{.curve = {.base = Rate{1200}},
+               .op_shares = {{"read", 800.0 / 1200.0}, {"write", 400.0 / 1200.0}}};
   s.nodes[1].replicas = 2;
   s.slos = {simsys::model::SloSpec{
       .metric = simsys::model::SloMetric::staleness, .node = "db", .max = 10s}};
@@ -995,14 +996,14 @@ TEST_CASE("the staleness SLO fails when a replica drops replicated writes", "[re
                WithinRel(200.0 * 400.0 / 1200.0, 1e-6));
   const auto results = simsys::report::evaluate_slos(summary, s.slos);
   REQUIRE(results[0].status == simsys::report::SloStatus::fail);
-  REQUIRE(results[0].note == "replica diverges: drops 66.7/s replicated writes");
+  REQUIRE(results[0].note == "replica diverges: drops 66.67/s replicated writes");
   const auto table = simsys::report::render_table(summary, results, false);
   CAPTURE(table);
-  REQUIRE(table.contains("replica diverges: drops 66.7/s replicated writes"));
+  REQUIRE(table.contains("replica diverges: drops 66.67/s replicated writes"));
   const auto json = simsys::report::render_json(summary, results);
   CAPTURE(json);
   REQUIRE_THAT(json_value(json, "replication_dropped_per_s"), WithinRel(200.0 / 3.0, 1e-6));
-  REQUIRE(json.contains("\"note\": \"replica diverges: drops 66.7/s replicated writes\""));
+  REQUIRE(json.contains("\"note\": \"replica diverges: drops 66.67/s replicated writes\""));
 }
 
 // Shards × replicas (review of 48d4d0b): explain's total counts N × S copies, 3 × 2 of 1k/s, and

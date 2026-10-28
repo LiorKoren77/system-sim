@@ -1378,9 +1378,9 @@ TEST_CASE("staleness is the replication lag plus the write's sojourn at the prim
 // 50 ms lag + (4 + 1) ms at the primary + (9 + 1) ms at the replica = 65 ms.
 TEST_CASE("staleness counts the wait in the primary's write queue and the replica's sojourn",
           "[theory]") {
-  const auto r = (*Simulation::create(
-                      *Graph::build(sql_front(3, std::nullopt, 200, 800, std::nullopt, 50ms))))
-                     .step(0s, 100ms);
+  const auto r =
+      (*Simulation::create(*Graph::build(sql_front(3, std::nullopt, 200, 800, std::nullopt, 50ms))))
+          .step(0s, 100ms);
   const auto primary = simsys::queueing::mmc_wait(1, 0.8, 0.001);
   const auto replica = simsys::queueing::mmc_wait(1, 0.9, 0.001);
   REQUIRE(r.nodes[1].staleness_s.has_value());

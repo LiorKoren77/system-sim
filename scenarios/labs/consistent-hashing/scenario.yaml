@@ -1,7 +1,8 @@
 # Lab: System Design Interview vol. 1, ch. 5 — Consistent hashing.
 # A load balancer hashes keys onto a ring of cache servers. The shipped `vnodes: 150` (even
 # partitions) meets the SLOs; try `vnodes: 1` (uneven: the hottest server takes half the load
-# and fails them). The fault below (a server removed) is typed in phase 3 and ignored until then.
+# and fails the cache servers' SLO; the database's still passes). The fault below (a server
+# removed) is typed in phase 3 and ignored until then.
 version: 1
 name: lab-consistent-hashing
 seed: 1

@@ -73,14 +73,18 @@ recommended setting. 15k/s gives 67 % on average and room for the spread.
   utilization on the hottest server, at the cost of ring memory (not modelled).
 
 ## Things to try
-- `vnodes: 1` — the table's last row: the hottest server at 133 %, both SLOs' story above.
+- `vnodes: 1` — the table's last row: the hottest server at 133 % fails the cache servers' SLO;
+  the database's passes (0.48 against its 0.7), since the hot server's drops never reach it.
 - `replicas: 2` on the cache servers — half the servers, the same 40k/s: 144 % on the hottest
   even with `vnodes: 150` (hit ratio 0.848, so the database's replica gets 5.5k/s against its
   5k/s and fails its SLO too: 0.82). With `vnodes: 1` the imbalance is total: k = 2 = N, the hot
   server owns every key, and the hit ratio falls to one 2M-key cache's, 0.747; the cache
   servers shed 62.5 % of the load, which is why the database, behind them, passes (0.68).
 - On the database: `replication_lag: 50ms` and an SLO `{metric: staleness, node: db, max:
-  100ms}` — the staleness is 50 ms plus the primary's write sojourn (no writes reach it, so
-  just its 150 µs service time): `staleness 50.1ms`, PASS. `shards: 2` halves the replica's
-  load (0.13). `replicas: 1` puts the reads on the primary: the same 0.27, since no writes
-  compete with them here.
+  100ms}` — the staleness is a write's sojourn at the primary (its 150 µs service time: no
+  write waits there) + the 50 ms lag + its sojourn at the replica (150 µs + a 55 µs wait at
+  rho 0.27): `staleness 50.4ms`, PASS. No write flows to the database in this lab (a `set`
+  stays in the cache), so the figure is the bound a write would see, not the age of any write
+  that happened. `shards: 2` halves the replica's load (0.13; staleness 50.3ms). `replicas: 1`
+  puts the reads on the primary: the same 0.27, since no writes compete with them here, and
+  nothing is stale (`explain` marks the lag `(unused: no replicas)`).
