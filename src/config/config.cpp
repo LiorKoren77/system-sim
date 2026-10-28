@@ -39,6 +39,8 @@ import simsys.defaults;
 // Only for fluid::Capacity's default zone thresholds: one source of truth for 0.7 / 0.9.
 import simsys.fluid;
 import simsys.model;
+// The rate curve types a client's `rate:` block is read into.
+import simsys.workload;
 
 namespace simsys::config::detail {
 
@@ -416,18 +418,40 @@ ConfigError unit_error(const Site& site, const YAML::Node& value, std::string_vi
   return site.error(value, std::format("{}: {}", key, error.message));
 }
 
-std::expected<SimTime, ConfigError> parse_duration_key(const Site& site, const YAML::Node& parent,
-                                                       std::string_view key) {
-  const auto value = parent[std::string{key}];
+// The value a unit parser (parse_duration, parse_rate, parse_time_point, ...) produces.
+template <typename Parse>
+using Parsed = typename std::invoke_result_t<Parse&, std::string_view>::value_type;
+
+// One scalar read by a unit parser; `label` names it in the messages ("rate.wave.period",
+// "rate.points[2]"). A list or a map is no text to parse.
+template <typename Parse>
+std::expected<Parsed<Parse>, ConfigError> parse_scalar(const Site& site, const YAML::Node& value,
+                                                       std::string_view label, Parse parse) {
+  if (!value.IsScalar()) return site.fail(value, std::format("{} must be a scalar", label));
+  // C++23 std::expected::transform_error: converts the error (ParseError -> ConfigError)
+  // and passes a value through untouched.
+  return parse(value.Scalar()).transform_error([&](const ParseError& error) {
+    return unit_error(site, value, label, error);
+  });
+}
+
+// `parent[key]`, which the caller has checked is present, read by a unit parser. A key
+// with nothing after it is reported as empty, at the key (check_not_null).
+template <typename Parse>
+std::expected<Parsed<Parse>, ConfigError> parse_key(const Site& site, const YAML::Node& parent,
+                                                    std::string_view key, std::string_view label,
+                                                    Parse parse) {
   // C++23 std::expected::and_then: runs the next fallible step only if the previous one
   // produced a value, passing an error through untouched; it chains steps without an
   // `if (!x) return std::unexpected(x.error());` between them.
-  // C++23 std::expected::transform_error: converts the error (ParseError -> ConfigError)
-  // and passes a value through untouched.
-  return scalar_value(site, parent, key).and_then([&](const std::string& text) {
-    return parse_duration(text).transform_error(
-        [&](const ParseError& error) { return unit_error(site, value, key, error); });
+  return check_not_null(site, parent, key, label).and_then([&] {
+    return parse_scalar(site, parent[std::string{key}], label, parse);
   });
+}
+
+std::expected<SimTime, ConfigError> parse_duration_key(const Site& site, const YAML::Node& parent,
+                                                       std::string_view key) {
+  return parse_key(site, parent, key, key, parse_duration);
 }
 
 // For durations a scenario may omit (step, warmup, latency): absent keeps `target`'s
@@ -1169,19 +1193,13 @@ constexpr std::array<NamedValue<model::StepMode>, 2> step_modes{{
     {"sequential", model::StepMode::sequential},
     {"parallel", model::StepMode::parallel},
 }};
-constexpr std::array<NamedValue<model::Direction>, 3> directions{{
-    {"in", model::Direction::in},
-    {"out", model::Direction::out},
-    {"inout", model::Direction::inout},
-}};
-constexpr std::array<NamedValue<model::SloMetric>, 7> slo_metrics{{
-    {"p50_latency", model::SloMetric::p50_latency},
-    {"p95_latency", model::SloMetric::p95_latency},
-    {"p99_latency", model::SloMetric::p99_latency},
-    {"drop_rate", model::SloMetric::drop_rate},
-    {"utilization", model::SloMetric::utilization},
-    {"queue_lag", model::SloMetric::queue_lag},
-    {"staleness", model::SloMetric::staleness},
+// The direction and SLO metric names live next to their enums in simsys.model
+// (model::parse_direction, model::parse_slo_metric), shared with the report.
+// The wave shapes of a client's rate curve (simsys.workload).
+constexpr std::array<NamedValue<workload::WaveShape>, 3> wave_shapes{{
+    {"sine", workload::WaveShape::sine},
+    {"square", workload::WaveShape::square},
+    {"diurnal", workload::WaveShape::diurnal},
 }};
 
 template <typename E, std::size_t N>
@@ -1191,25 +1209,31 @@ std::optional<E> find_named(const std::array<NamedValue<E>, N>& table, std::stri
   return row->value;
 }
 
-// The inverse lookup; every enumerator has a row, so the result is always a table word.
-template <typename E, std::size_t N>
-std::string_view name_of(const std::array<NamedValue<E>, N>& table, E value) {
-  return std::ranges::find(table, value, &NamedValue<E>::value)->name;
+// An optional word-valued key: absent keeps `target`'s default; present must be a word
+// `parse` recognises (model::parse_direction, or a lookup in one of the tables above),
+// otherwise `requirement` ("dir must be in, out or inout") is the message.
+// C++20 requires-clause: `parse` must turn a word into a std::optional<E>, the shape of
+// every lookup here; a lookup of another shape fails at the call, not inside the body.
+template <typename E, typename Parse>
+  requires std::same_as<std::invoke_result_t<Parse&, std::string_view>, std::optional<E>>
+CheckResult read_optional_word(const Site& site, const YAML::Node& parent, std::string_view key,
+                               Parse parse, std::string_view requirement, E& target) {
+  const auto value = parent[std::string{key}];
+  if (!value) return {};
+  if (auto checked = check_not_null(site, parent, key, key); !checked) return checked;
+  const auto word = parse(scalar_text(value));
+  if (!word) return site.fail(value, requirement);
+  target = *word;
+  return {};
 }
 
-// An optional word-valued key: absent keeps `target`'s default; present must be a word of
-// `table`, otherwise `requirement` ("dir must be in, out or inout") is the message.
+// The same with a local table as the lookup.
 template <typename E, std::size_t N>
 CheckResult read_optional_word(const Site& site, const YAML::Node& parent, std::string_view key,
                                const std::array<NamedValue<E>, N>& table,
                                std::string_view requirement, E& target) {
-  const auto value = parent[std::string{key}];
-  if (!value) return {};
-  if (auto checked = check_not_null(site, parent, key, key); !checked) return checked;
-  const auto word = find_named(table, scalar_text(value));
-  if (!word) return site.fail(value, requirement);
-  target = *word;
-  return {};
+  const auto lookup = [&table](std::string_view name) { return find_named(table, name); };
+  return read_optional_word(site, parent, key, lookup, requirement, target);
 }
 
 // An optional numeric key: absent keeps `target`'s default; present must be a number that
@@ -1361,11 +1385,18 @@ CheckResult read_then(const StepScope& scope, const YAML::Node& body, model::Nod
 //
 // Models the user population of the book's back-of-the-envelope estimates (ch. 2): a
 // request rate (DAU x requests per user / 86 400 s) and the mix of operations those
-// requests are (the read/write ratio, e.g. 10:1 for the URL shortener, ch. 8). Phase 1
-// keeps only the constant `rate.base`; the curve terms (wave, spikes, ramp, points, noise)
-// are accepted and ignored until phase 2 models time-varying load.
+// requests are (the read/write ratio, e.g. 10:1 for the URL shortener, ch. 8). Phase 2a
+// types the whole `rate:` block (spec §8): the level (`base`, or a `points` trace), the
+// multiplicative terms `wave`, `ramp` and `spikes` (simsys.workload has the formulas), and
+// the seeded `noise` process. The range rules below keep every term's multiplier finite
+// and non-negative, so no rate the engine computes from them can be negative or infinite.
 
 constexpr std::string_view rate_keys = "base wave spikes ramp points noise";
+// The keys of each curve block; every one of them is required.
+constexpr std::string_view wave_keys = "shape period amplitude peak_at";
+constexpr std::string_view ramp_keys = "from to over";
+constexpr std::string_view spike_keys = "at for factor";
+constexpr std::string_view noise_keys = "sigma correlation";
 
 // The tolerance of "the shares sum to 1": decimal shares are not exact in binary floating
 // point (0.1 + 0.2 != 0.3), so the sum is compared within 1e-6.
@@ -1374,27 +1405,315 @@ constexpr double share_sum_tolerance = 1e-6;
 using OpShare = std::pair<std::string, double>;
 using OpShares = std::vector<OpShare>;
 
-std::expected<Rate, ConfigError> read_rate_base(const Site& site, const YAML::Node& body) {
-  const auto rate = body["rate"];
-  if (auto checked = check_not_null(site, body, "rate", "rate"); !checked) {
-    return std::unexpected(checked.error());
+// A rate no larger than max_rate_per_second (see there); `label` names it ("rate.base",
+// "rate.ramp.to", "rate.points[3]").
+std::expected<Rate, ConfigError> check_rate_bounded(const Site& site, const YAML::Node& at,
+                                                    std::string_view label, Rate rate) {
+  if (rate.per_second <= max_rate_per_second) return rate;
+  return site.fail(at, std::format("{} must be at most 1e15/s", label));
+}
+
+std::expected<Rate, ConfigError> read_bounded_rate(const Site& site, const YAML::Node& parent,
+                                                   std::string_view key, std::string_view label) {
+  return parse_key(site, parent, key, label, parse_rate).and_then([&](Rate rate) {
+    return check_rate_bounded(site, parent[std::string{key}], label, rate);
+  });
+}
+
+// The words of a space-separated list, in order.
+std::vector<std::string> words_of(std::string_view words) {
+  std::vector<std::string> parts;
+  for (const auto piece : words | std::views::split(' '))
+    parts.emplace_back(piece.begin(), piece.end());
+  return parts;
+}
+
+// "a, b and c" from the words "a b c": the required keys of a curve block, as its
+// "needs ..." message lists them.
+std::string spoken_list(std::string_view words) {
+  const auto parts = words_of(words);
+  std::string text = parts.front();
+  for (std::size_t i = 1; i < parts.size(); ++i) {
+    text += i + 1 == parts.size() ? " and " : ", ";
+    text += parts[i];
   }
-  if (!rate || !rate.IsMap() || !rate["base"]) {
-    return site.fail(rate ? rate : body, "client needs rate.base");
+  return text;
+}
+
+// A curve block (`rate.wave`, `rate.spikes[2]`, ...) is a map that has exactly `keys`: none
+// unknown ("unknown rate.wave key 'colour'"), none missing ("rate.wave needs shape, period,
+// amplitude and peak_at"). Every key is required because no default would be a safe guess
+// (how long is the period of a wave written without one?).
+CheckResult check_curve_block(const Site& site, const YAML::Node& block, std::string_view label,
+                              std::string_view keys) {
+  if (!block.IsMap()) return site.fail(block, std::format("{} must be a map", label));
+  if (auto checked = check_known_keys(site, block, keys, std::format("{} key", label)); !checked) {
+    return checked;
   }
-  if (auto checked = check_known_keys(site, rate, rate_keys, "rate key"); !checked) {
-    return std::unexpected(checked.error());
-  }
-  return scalar_value(site, rate, "base", "rate.base")
-      .and_then([&](const std::string& text) {
-        return parse_rate(text).transform_error([&](const ParseError& error) {
-          return unit_error(site, rate["base"], "rate.base", error);
-        });
-      })
-      .and_then([&](Rate base) -> std::expected<Rate, ConfigError> {
-        if (base.per_second <= max_rate_per_second) return base;
-        return site.fail(rate["base"], "rate.base must be at most 1e15/s");
+  const auto required = words_of(keys);
+  const bool complete =
+      std::ranges::all_of(required, [&](const std::string& key) { return block[key].IsDefined(); });
+  if (complete) return {};
+  return site.fail(block, std::format("{} needs {}", label, spoken_list(keys)));
+}
+
+// `block[key]` as a number that passes `in_range`, else "<label>.<key> must be <requirement>".
+std::expected<double, ConfigError> read_curve_number(const Site& site, const YAML::Node& block,
+                                                     std::string_view label, std::string_view key,
+                                                     bool (*in_range)(double),
+                                                     std::string_view requirement) {
+  const auto number = number_value(block[std::string{key}]);
+  if (number && in_range(*number)) return *number;
+  return site.fail(shape_site(block, key),
+                   std::format("{}.{} must be {}", label, key, requirement));
+}
+
+// `block[key]` as a duration above zero: a period, a spike's length, a ramp's length, a
+// correlation time. Zero would divide by zero in the term's formula or make it vanish.
+std::expected<SimTime, ConfigError> read_positive_duration(const Site& site,
+                                                           const YAML::Node& block,
+                                                           std::string_view label,
+                                                           std::string_view key) {
+  const auto full = std::format("{}.{}", label, key);
+  return parse_key(site, block, key, full, parse_duration)
+      .and_then([&](SimTime t) -> std::expected<SimTime, ConfigError> {
+        if (t.count() > 0) return t;
+        return site.fail(block[std::string{key}], std::format("{} must be positive", full));
       });
+}
+
+// `block[key]` as a point in simulated time: a clock time ("20:00") or a duration from the
+// start ("5m"), both offsets from t = 0, which is midnight (phase 2a refinement 1). An
+// unquoted 20:00 is fine: yaml-cpp keeps every scalar's text, and YAML 1.2 has no base-60
+// numbers (YAML 1.1 read 20:00 as the integer 1200).
+std::expected<SimTime, ConfigError> read_time_point(const Site& site, const YAML::Node& block,
+                                                    std::string_view label, std::string_view key) {
+  return parse_key(site, block, key, std::format("{}.{}", label, key), parse_time_point);
+}
+
+std::expected<workload::WaveShape, ConfigError> read_wave_shape(const Site& site,
+                                                                const YAML::Node& wave) {
+  if (const auto shape = find_named(wave_shapes, scalar_text(wave["shape"]))) return *shape;
+  return site.fail(shape_site(wave, "shape"), "rate.wave.shape must be sine, square or diurnal");
+}
+
+// The amplitude stays in [0, 1] so the wave multiplier 1 + A x (shape - 1) never drops
+// below zero (see workload::Wave).
+std::expected<workload::Wave, ConfigError> read_wave(const Site& site, const YAML::Node& wave) {
+  constexpr std::string_view label = "rate.wave";
+  if (auto checked = check_curve_block(site, wave, label, wave_keys); !checked) {
+    return std::unexpected(checked.error());
+  }
+  workload::Wave read;
+  if (auto shape = read_wave_shape(site, wave).transform(store_in(read.shape)); !shape) {
+    return std::unexpected(shape.error());
+  }
+  if (auto period =
+          read_positive_duration(site, wave, label, "period").transform(store_in(read.period));
+      !period) {
+    return std::unexpected(period.error());
+  }
+  if (auto amplitude =
+          read_curve_number(site, wave, label, "amplitude", is_ratio, "between 0 and 1")
+              .transform(store_in(read.amplitude));
+      !amplitude) {
+    return std::unexpected(amplitude.error());
+  }
+  return read_time_point(site, wave, label, "peak_at").transform([&](SimTime peak_at) {
+    read.peak_at = peak_at;
+    return read;
+  });
+}
+
+std::expected<workload::Ramp, ConfigError> read_ramp(const Site& site, const YAML::Node& ramp) {
+  constexpr std::string_view label = "rate.ramp";
+  if (auto checked = check_curve_block(site, ramp, label, ramp_keys); !checked) {
+    return std::unexpected(checked.error());
+  }
+  workload::Ramp read;
+  if (auto from =
+          read_bounded_rate(site, ramp, "from", "rate.ramp.from").transform(store_in(read.from));
+      !from) {
+    return std::unexpected(from.error());
+  }
+  if (auto to = read_bounded_rate(site, ramp, "to", "rate.ramp.to").transform(store_in(read.to));
+      !to) {
+    return std::unexpected(to.error());
+  }
+  return read_positive_duration(site, ramp, label, "over").transform([&](SimTime over) {
+    read.over = over;
+    return read;
+  });
+}
+
+// A spike's factor is above zero (a zero factor silences the client; leave the spike out)
+// and at most max_step_factor, the bound of a step's fan-out factor, for the same reason:
+// rate x factor must stay far from overflowing a double.
+std::expected<workload::Spike, ConfigError> read_spike(const Site& site, const YAML::Node& spike,
+                                                       std::string_view label) {
+  if (auto checked = check_curve_block(site, spike, label, spike_keys); !checked) {
+    return std::unexpected(checked.error());
+  }
+  workload::Spike read;
+  if (auto at = read_time_point(site, spike, label, "at").transform(store_in(read.at)); !at) {
+    return std::unexpected(at.error());
+  }
+  if (auto length =
+          read_positive_duration(site, spike, label, "for").transform(store_in(read.duration));
+      !length) {
+    return std::unexpected(length.error());
+  }
+  if (auto factor = read_curve_number(site, spike, label, "factor", is_positive, "positive")
+                        .transform(store_in(read.factor));
+      !factor) {
+    return std::unexpected(factor.error());
+  }
+  if (read.factor <= max_step_factor) return read;
+  return site.fail(spike["factor"], std::format("{}.factor must be at most 1e6", label));
+}
+
+// Spikes are numbered from 1 in messages, as an author counts them ("rate.spikes[2]").
+std::expected<std::vector<workload::Spike>, ConfigError> read_spikes(const Site& site,
+                                                                     const YAML::Node& rate) {
+  std::vector<workload::Spike> spikes;
+  const auto list = rate["spikes"];
+  if (!list) return spikes;
+  if (auto checked = check_not_null(site, rate, "spikes", "rate.spikes", empty_list); !checked) {
+    return std::unexpected(checked.error());
+  }
+  if (!list.IsSequence()) return site.fail(list, "rate.spikes must be a list");
+  for (std::size_t i = 0; i < list.size(); ++i) {
+    auto spike = read_spike(site, list[i], std::format("rate.spikes[{}]", i + 1));
+    if (!spike) return std::unexpected(spike.error());
+    spikes.push_back(*spike);
+  }
+  return spikes;
+}
+
+// One `[time, rate]` entry of a trace; `label` ("rate.points[2]") prefixes a unit error.
+std::expected<std::pair<SimTime, Rate>, ConfigError> read_point(const Site& site,
+                                                                const YAML::Node& entry,
+                                                                std::string_view label) {
+  if (!entry.IsSequence() || entry.size() != 2) {
+    return site.fail(entry, "rate.points entries are [time, rate] pairs");
+  }
+  auto time = parse_scalar(site, entry[0], label, parse_time_point);
+  if (!time) return std::unexpected(time.error());
+  return parse_scalar(site, entry[1], label, parse_rate)
+      .and_then([&](Rate rate) { return check_rate_bounded(site, entry[1], label, rate); })
+      .transform([&](Rate rate) { return std::pair{*time, rate}; });
+}
+
+// Sorted by time, not necessarily strictly: two entries at the same time are a step change
+// (the interpolation takes the later one from that instant on).
+CheckResult check_points_sorted(const Site& site, const YAML::Node& list,
+                                const workload::Points& points) {
+  // C++20 std::ranges::is_sorted with a projection: compares the entries by their time
+  // (the nanosecond count) without a hand-written comparator over pairs.
+  const auto time_ns = [](const std::pair<SimTime, Rate>& point) { return point.first.count(); };
+  if (std::ranges::is_sorted(points.at, {}, time_ns)) return {};
+  return site.fail(list, "rate.points must be sorted by time");
+}
+
+// A recorded or drawn trace that replaces `base`. Its rates are non-negative because
+// parse_rate accepts no sign.
+std::expected<workload::Points, ConfigError> read_points(const Site& site, const YAML::Node& rate) {
+  if (auto checked = check_not_null(site, rate, "points", "rate.points"); !checked) {
+    return std::unexpected(checked.error());
+  }
+  const auto list = rate["points"];
+  if (!list.IsSequence()) return site.fail(list, "rate.points must be a list");
+  if (list.size() == 0) return site.fail(list, "rate.points must have at least one entry");
+  workload::Points points;
+  for (std::size_t i = 0; i < list.size(); ++i) {
+    auto point = read_point(site, list[i], std::format("rate.points[{}]", i + 1));
+    if (!point) return std::unexpected(point.error());
+    points.at.push_back(*point);
+  }
+  return check_points_sorted(site, list, points).transform([&] { return std::move(points); });
+}
+
+// The level the terms multiply: exactly one of `base` and `points`.
+CheckResult read_level(const Site& site, const YAML::Node& rate, workload::RateCurve& curve) {
+  const bool has_base = rate["base"].IsDefined();
+  const bool has_points = rate["points"].IsDefined();
+  if (has_base && has_points) return site.fail(rate, "rate.base and rate.points are alternatives");
+  if (has_points) return read_points(site, rate).transform(store_in(curve.points));
+  if (!has_base) return site.fail(rate, "client needs rate.base or rate.points");
+  return read_bounded_rate(site, rate, "base", "rate.base").transform(store_in(curve.base));
+}
+
+CheckResult read_wave_term(const Site& site, const YAML::Node& rate, workload::RateCurve& curve) {
+  if (!rate["wave"]) return {};
+  if (auto checked = check_not_null(site, rate, "wave", "rate.wave"); !checked) return checked;
+  return read_wave(site, rate["wave"]).transform(store_in(curve.wave));
+}
+
+// A ramp is a multiplier relative to `base` (from/base -> to/base, phase 2a refinement 2),
+// so it needs a nonzero base to be relative to: next to `points`, or with a base of 0/s,
+// it has no meaning.
+CheckResult read_ramp_term(const Site& site, const YAML::Node& rate, workload::RateCurve& curve) {
+  if (!rate["ramp"]) return {};
+  if (auto checked = check_not_null(site, rate, "ramp", "rate.ramp"); !checked) return checked;
+  // One message for both: a base of 0/s is no base to be relative to. workload's ramp
+  // term throws for either (a programmer error), so no scenario may reach it.
+  if (curve.points || curve.base.per_second <= 0.0) {
+    return site.fail(rate["ramp"], "rate.ramp needs rate.base");
+  }
+  return read_ramp(site, rate["ramp"]).transform(store_in(curve.ramp));
+}
+
+// The deterministic curve: the level, then the multiplicative terms.
+std::expected<workload::RateCurve, ConfigError> read_rate_curve(const Site& site,
+                                                                const YAML::Node& rate) {
+  workload::RateCurve curve;
+  if (auto read = read_level(site, rate, curve); !read) return std::unexpected(read.error());
+  if (auto read = read_wave_term(site, rate, curve); !read) return std::unexpected(read.error());
+  if (auto read = read_ramp_term(site, rate, curve); !read) return std::unexpected(read.error());
+  return read_spikes(site, rate).transform([&](std::vector<workload::Spike> spikes) {
+    curve.spikes = std::move(spikes);
+    return std::move(curve);
+  });
+}
+
+// The Ornstein-Uhlenbeck noise of spec §9.2: `sigma` is its stationary standard deviation
+// (0 is allowed: no noise), `correlation` (tau) roughly how long a burst lasts.
+std::expected<workload::Noise, ConfigError> read_noise(const Site& site, const YAML::Node& noise) {
+  constexpr std::string_view label = "rate.noise";
+  if (auto checked = check_curve_block(site, noise, label, noise_keys); !checked) {
+    return std::unexpected(checked.error());
+  }
+  workload::Noise read;
+  if (auto sigma = read_curve_number(site, noise, label, "sigma", is_non_negative, "non-negative")
+                       .transform(store_in(read.sigma));
+      !sigma) {
+    return std::unexpected(sigma.error());
+  }
+  return read_positive_duration(site, noise, label, "correlation").transform([&](SimTime tau) {
+    read.correlation = tau;
+    return read;
+  });
+}
+
+CheckResult read_noise_term(const Site& site, const YAML::Node& rate,
+                            std::optional<workload::Noise>& noise) {
+  if (!rate["noise"]) return {};
+  if (auto checked = check_not_null(site, rate, "noise", "rate.noise"); !checked) return checked;
+  return read_noise(site, rate["noise"]).transform(store_in(noise));
+}
+
+// The `rate:` block: a map of known keys, read into the curve and the noise.
+CheckResult read_rate(const Site& site, const YAML::Node& body, model::Workload& workload) {
+  if (auto checked = check_not_null(site, body, "rate", "rate"); !checked) return checked;
+  const auto rate = body["rate"];
+  if (!rate || !rate.IsMap()) {
+    return site.fail(rate ? rate : body, "client needs rate.base or rate.points");
+  }
+  if (auto checked = check_known_keys(site, rate, rate_keys, "rate key"); !checked) return checked;
+  if (auto read = read_rate_curve(site, rate).transform(store_in(workload.curve)); !read) {
+    return read;
+  }
+  return read_noise_term(site, rate, workload.noise);
 }
 
 // A share is the probability that a request is this op: above 0 (a zero share is an op
@@ -1458,9 +1777,7 @@ std::expected<OpShares, ConfigError> read_op_shares(const Site& site, const YAML
 std::expected<model::Workload, ConfigError> read_workload(const Site& site,
                                                           const YAML::Node& body) {
   model::Workload workload;
-  if (auto read = read_rate_base(site, body).transform(store_in(workload.base)); !read) {
-    return std::unexpected(read.error());
-  }
+  if (auto read = read_rate(site, body, workload); !read) return std::unexpected(read.error());
   if (auto read = read_op_shares(site, body).transform(store_in(workload.op_shares)); !read) {
     return std::unexpected(read.error());
   }
@@ -1598,8 +1915,8 @@ CheckResult read_link_weight(const Site& site, const YAML::Node& link, double& w
 
 CheckResult read_link_attributes(const Site& site, const YAML::Node& link, model::LinkSpec& spec) {
   if (auto checked = check_known_keys(site, link, link_keys, "key"); !checked) return checked;
-  if (auto read = read_optional_word(site, link, "dir", directions, "dir must be in, out or inout",
-                                     spec.dir);
+  if (auto read = read_optional_word(site, link, "dir", model::parse_direction,
+                                     "dir must be in, out or inout", spec.dir);
       !read) {
     return read;
   }
@@ -1692,7 +2009,7 @@ std::expected<model::SloMetric, ConfigError> read_slo_metric(const Site& site,
     return std::unexpected(checked.error());
   }
   const auto name = scalar_text(value);
-  if (const auto metric = find_named(slo_metrics, name)) return *metric;
+  if (const auto metric = model::parse_slo_metric(name)) return *metric;
   return site.fail(value, std::format("unknown metric '{}'", name));
 }
 
@@ -1717,7 +2034,7 @@ CheckResult read_slo_op(const Site& site, const YAML::Node& entry, std::optional
 // for the ratios, so "0.01" can never be read as 0.01 seconds.
 std::expected<SloMaximum, ConfigError> read_slo_max(const Site& site, const YAML::Node& entry,
                                                     model::SloMetric metric) {
-  const auto name = name_of(slo_metrics, metric);
+  const auto name = model::to_string(metric);
   const auto value = entry["max"];
   if (!value) return site.fail(entry, std::format("{} needs a max", name));
   if (auto checked = check_not_null(site, entry, "max", "max"); !checked) {
@@ -1744,7 +2061,7 @@ bool offers_op(const model::NodeSpec& client, std::string_view op) {
 CheckResult check_latency_target(const Site& site, const YAML::Node& entry,
                                  const model::SloSpec& slo, const Declarations& declared) {
   if (!is_latency_percentile(slo.metric)) return {};
-  const auto metric = name_of(slo_metrics, slo.metric);
+  const auto metric = model::to_string(slo.metric);
   if (!slo.node) return site.fail(entry, std::format("{} needs a node", metric));
   const auto& node = declared.nodes[declared.ids.find(*slo.node)->second];
   if (node.type != model::NodeType::client) {

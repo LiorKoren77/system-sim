@@ -11,6 +11,7 @@ module;
 #include <charconv>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <map>
@@ -42,6 +43,7 @@ import simsys.fluid;
 import simsys.graph;
 import simsys.model;
 import simsys.queueing;
+import simsys.workload;
 
 namespace simsys::report {
 
@@ -144,26 +146,8 @@ constexpr double rounds_to_one = 0.9995;
   std::unreachable();
 }
 
-[[nodiscard]] std::string_view metric_name(model::SloMetric metric) {
-  using enum model::SloMetric;
-  switch (metric) {
-    case p50_latency:
-      return "p50_latency";
-    case p95_latency:
-      return "p95_latency";
-    case p99_latency:
-      return "p99_latency";
-    case drop_rate:
-      return "drop_rate";
-    case utilization:
-      return "utilization";
-    case queue_lag:
-      return "queue_lag";
-    case staleness:
-      return "staleness";
-  }
-  std::unreachable();
-}
+// The SLO metric and link direction names come from their tables in simsys.model
+// (model::to_string), the same words the loader reads.
 
 [[nodiscard]] std::string_view status_name(SloStatus status) {
   using enum SloStatus;
@@ -174,19 +158,6 @@ constexpr double rounds_to_one = 0.9995;
       return "fail";
     case skipped:
       return "skipped";
-  }
-  std::unreachable();
-}
-
-[[nodiscard]] std::string_view direction_name(model::Direction dir) {
-  using enum model::Direction;
-  switch (dir) {
-    case in:
-      return "in";
-    case out:
-      return "out";
-    case inout:
-      return "inout";
   }
   std::unreachable();
 }
@@ -448,7 +419,7 @@ struct Overloaded : Fs... {
     const auto observed =
         r.observed.transform([&](double v) { return fmt_slo_value(r.slo.metric, v); });
     rows.push_back({status_cell(r.status, color),
-                    {std::string{metric_name(r.slo.metric)}},
+                    {std::string{model::to_string(r.slo.metric)}},
                     {r.slo.node.value_or("-")},
                     {r.slo.op.value_or("-")},
                     {observed.value_or("-")},
@@ -527,7 +498,7 @@ struct Overloaded : Fs... {
 
 // `observed` and `max` are in seconds for latency SLOs, plain ratios otherwise.
 [[nodiscard]] std::string json_slo(const SloResult& r) {
-  const std::array fields{json_field("metric", json_string(metric_name(r.slo.metric))),
+  const std::array fields{json_field("metric", json_string(model::to_string(r.slo.metric))),
                           json_field("node", json_optional_string(r.slo.node)),
                           json_field("op", json_optional_string(r.slo.op)),
                           json_field("observed", r.observed ? json_number(*r.observed) : "null"),
@@ -565,17 +536,82 @@ template <class T, class F>
          "datacenters: " + join(s.datacenters, ", ") + "\n";
 }
 
-// A client offers its base rate split into ops by fixed shares (phase 1 ignores the rate
-// curve's wave/spikes/ramp; explain says so).
-[[nodiscard]] std::string client_details(const model::NodeSpec& spec) {
-  const double base = spec.workload ? spec.workload->base.per_second : 0.0;
-  std::vector<std::string> shares;
-  if (spec.workload) {
-    for (const auto& [op, share] : spec.workload->op_shares)
-      shares.push_back(op + " " + percent(share));
+// ---- the rate curve in one line ----
+
+[[nodiscard]] std::string_view wave_shape_name(workload::WaveShape shape) {
+  using enum workload::WaveShape;
+  switch (shape) {
+    case sine:
+      return "sine";
+    case square:
+      return "square";
+    case diurnal:
+      return "diurnal";
   }
-  const std::array parts{"dc=" + spec.dc, "offered=" + fmt_rate(base), "ops: " + join(shares, ", "),
-                         std::string{"(rate curve: base only in phase 1)"}};
+  std::unreachable();
+}
+
+[[nodiscard]] std::string two_digits(std::int64_t value) {
+  return (value < 10 ? "0" : "") + std::to_string(value);
+}
+
+// A point in simulated time as a scenario writes it: "20:00" for a whole minute of the
+// first day (t = 0 is midnight, phase 2a refinement 1), otherwise a duration ("36h", "90s").
+// Integer nanoseconds, so 19:59:59.9 is never rounded to "20:00".
+[[nodiscard]] std::string clock_or_duration(SimTime t) {
+  constexpr auto minute_ns = (1_min).count();
+  constexpr auto day_ns = (24_h).count();
+  const auto ns = t.count();
+  if (ns < 0 || ns >= day_ns || ns % minute_ns != 0) return fmt_duration(t);
+  const auto minutes = ns / minute_ns;
+  return two_digits(minutes / 60) + ":" + two_digits(minutes % 60);
+}
+
+[[nodiscard]] std::string level_summary(const workload::RateCurve& curve) {
+  if (!curve.points) return "base " + fmt_rate(curve.base.per_second);
+  const auto& at = curve.points->at;
+  // C++20 std::ranges::minmax with a projection: the lowest and highest rate of the trace
+  // in one pass, comparing by the rate member instead of through a hand-written lambda.
+  const auto [low, high] = std::ranges::minmax(at | std::views::values, {}, &Rate::per_second);
+  return "points " + std::to_string(at.size()) + " (" + fmt_rate(low.per_second) + ".." +
+         fmt_rate(high.per_second) + ")";
+}
+
+[[nodiscard]] std::string wave_summary(const workload::Wave& wave) {
+  return "wave " + std::string{wave_shape_name(wave.shape)} + " P=" + fmt_duration(wave.period) +
+         " A=" + num(wave.amplitude) + " peak " + clock_or_duration(wave.peak_at);
+}
+
+[[nodiscard]] std::string ramp_summary(const workload::Ramp& ramp) {
+  return "ramp " + fmt_rate(ramp.from.per_second) + "->" + fmt_rate(ramp.to.per_second) + " over " +
+         fmt_duration(ramp.over);
+}
+
+[[nodiscard]] std::string noise_summary(const workload::Noise& noise) {
+  return "noise σ=" + num(noise.sigma) + " τ=" + fmt_duration(noise.correlation);
+}
+
+// "base 800/s, wave sine P=24h A=0.6 peak 20:00, ramp 0/s->10k/s over 5m, spikes 3,
+// noise σ=0.15 τ=5m": the level, then each term the client has, in composition order.
+[[nodiscard]] std::string curve_summary(const model::Workload& workload) {
+  const auto& curve = workload.curve;
+  std::vector<std::string> terms{level_summary(curve)};
+  if (curve.wave) terms.push_back(wave_summary(*curve.wave));
+  if (curve.ramp) terms.push_back(ramp_summary(*curve.ramp));
+  if (!curve.spikes.empty()) terms.push_back("spikes " + std::to_string(curve.spikes.size()));
+  if (workload.noise) terms.push_back(noise_summary(*workload.noise));
+  return join(terms, ", ");
+}
+
+// A client's datacenter, its rate curve and its op mix (fixed shares of the rate).
+[[nodiscard]] std::string client_details(const model::NodeSpec& spec) {
+  std::vector<std::string> parts{"dc=" + spec.dc};
+  if (!spec.workload) return join(parts, "  ");
+  std::vector<std::string> shares;
+  for (const auto& [op, share] : spec.workload->op_shares)
+    shares.push_back(op + " " + percent(share));
+  parts.push_back("rate: " + curve_summary(*spec.workload));
+  parts.push_back("ops: " + join(shares, ", "));
   return join(parts, "  ");
 }
 
@@ -643,7 +679,7 @@ template <class T, class F>
   std::vector<Row> rows;
   for (const auto& link : g.links()) {
     rows.push_back(
-        {{link_name(g, link)}, {std::string{direction_name(link.dir)}}, {link_details(g, link)}});
+        {{link_name(g, link)}, {std::string{model::to_string(link.dir)}}, {link_details(g, link)}});
   }
   return "links:\n" + aligned(rows, Align::all_left);
 }
@@ -673,7 +709,7 @@ using OpLoad = std::map<std::string, double, std::less<>>;
       const auto share =
           std::ranges::find(workload->op_shares, route.op, &std::pair<std::string, double>::first);
       if (share == workload->op_shares.end()) continue;
-      load[route.target][route.op] += workload->base.per_second * share->second * route.share;
+      load[route.target][route.op] += workload->curve.base.per_second * share->second * route.share;
     }
   }
   return load;
@@ -1015,6 +1051,10 @@ std::string render_json(const Summary& summary, std::span<const SloResult> slos)
       json_array("ops", map_to_strings(std::span<const OpSummary>{ops}, json_op)),
       json_array("slo", map_to_strings(slos, json_slo))};
   return "{\n" + join(lines, ",\n") + "\n}";
+}
+
+std::string format_number(double value) {
+  return shortest(value);
 }
 
 std::string render_explain(const graph::Graph& g) {

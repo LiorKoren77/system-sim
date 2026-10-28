@@ -31,6 +31,10 @@ module;
 export module simsys.model;
 
 import simsys.core;
+// The rate curve and noise types of a client's workload. Dependency direction: model ->
+// workload -> core; simsys.workload never imports simsys.model, so the curve maths stays
+// usable (and testable) without the scenario types.
+import simsys.workload;
 
 export namespace simsys::model {
 
@@ -169,9 +173,14 @@ struct Advanced {
   std::optional<double> red{};
 };
 
-// What a client offers. Phase 1: a constant base rate; curves come in phase 2.
+// What a client offers: a rate that varies over time, split into ops by fixed shares.
+// Phase 2a: the phase-1 `Rate base` member became `curve.base`. The whole `rate:` block is
+// now typed (spec §8): the deterministic curve (base or points, times wave, ramp and
+// spikes) in `curve`, and the seeded random multiplier in `noise`, kept apart because the
+// curve is a pure function of time while noise is a process with state the engine steps.
 struct Workload {
-  Rate base{};
+  workload::RateCurve curve{};
+  std::optional<workload::Noise> noise{};                   // absent: no noise, the curve exactly
   std::vector<std::pair<std::string, double>> op_shares{};  // sorted by op, shares sum to 1
   std::optional<SimTime> timeout{};
 };
@@ -192,7 +201,68 @@ struct NodeSpec {
   std::optional<Workload> workload{};              // clients only
 };
 
+// One row of a name table: an enumerator and the word the scenario schema spells it
+// with, side by side (the same shape as NodeTypeName above, for the smaller enums).
+template <typename E>
+struct EnumName {
+  E value;
+  std::string_view name;
+};
+
+// Row i of `table` must hold the enumerator whose value is i, so a lookup by
+// std::to_underlying is correct. consteval: a build-time proof, used in static_asserts at
+// the end of this file (see table_follows_enum_order above).
+template <typename E, std::size_t N>
+[[nodiscard]] consteval bool follows_enum_order(const std::array<EnumName<E>, N>& table) {
+  for (std::size_t i = 0; i < N; ++i) {
+    // C++20 std::cmp_not_equal: compares integers of different signedness by value. An
+    // int enum's value against a std::size_t index with plain != would convert the int to
+    // unsigned first (-1 == SIZE_MAX) and warn under -Wsign-compare; this cannot.
+    if (std::cmp_not_equal(std::to_underlying(table[i].value), i)) return false;
+  }
+  return true;
+}
+
+// The word for `value`. An enumerator without a row (a value cast from an integer) is a
+// programmer error: the loader only produces cataloged values.
+template <typename E, std::size_t N>
+[[nodiscard]] constexpr std::string_view name_in(const std::array<EnumName<E>, N>& table, E value) {
+  const auto index = std::to_underlying(value);
+  // C++20 std::in_range<T>(x): "does x fit in T?", correct for any mix of signed and
+  // unsigned types (a negative int does not fit in std::size_t). Replaces a hand-written
+  // `x >= 0` test, which warns as always true for an unsigned underlying type.
+  if (!std::in_range<std::size_t>(index) || static_cast<std::size_t>(index) >= N) {
+    throw std::invalid_argument{"enumerator without a name"};
+  }
+  return table[static_cast<std::size_t>(index)].name;
+}
+
+// The inverse of name_in; std::nullopt for a word not in the table.
+template <typename E, std::size_t N>
+[[nodiscard]] constexpr std::optional<E> parse_in(const std::array<EnumName<E>, N>& table,
+                                                  std::string_view name) {
+  for (const auto& row : table) {
+    if (row.name == name) return row.value;
+  }
+  return std::nullopt;
+}
+
 enum class Direction { in, out, inout };
+
+// Pattern: Table-driven method — as node_type_table: one table, read in both directions by
+// to_string/parse_direction, shared by the loader (reads `dir:`) and the report (prints it).
+inline constexpr auto direction_table = std::to_array<EnumName<Direction>>({
+    {Direction::in, "in"},
+    {Direction::out, "out"},
+    {Direction::inout, "inout"},
+});
+
+[[nodiscard]] constexpr std::string_view to_string(Direction d) {
+  return name_in(direction_table, d);
+}
+[[nodiscard]] constexpr std::optional<Direction> parse_direction(std::string_view name) {
+  return parse_in(direction_table, name);
+}
 
 struct LinkSpec {
   std::string from{};
@@ -212,6 +282,25 @@ enum class SloMetric {
   queue_lag,
   staleness
 };
+
+// Pattern: Table-driven method — the SLO metric names, read by the loader (`metric:`) and
+// printed by the report from this one table.
+inline constexpr auto slo_metric_table = std::to_array<EnumName<SloMetric>>({
+    {SloMetric::p50_latency, "p50_latency"},
+    {SloMetric::p95_latency, "p95_latency"},
+    {SloMetric::p99_latency, "p99_latency"},
+    {SloMetric::drop_rate, "drop_rate"},
+    {SloMetric::utilization, "utilization"},
+    {SloMetric::queue_lag, "queue_lag"},
+    {SloMetric::staleness, "staleness"},
+});
+
+[[nodiscard]] constexpr std::string_view to_string(SloMetric m) {
+  return name_in(slo_metric_table, m);
+}
+[[nodiscard]] constexpr std::optional<SloMetric> parse_slo_metric(std::string_view name) {
+  return parse_in(slo_metric_table, name);
+}
 
 struct SloSpec {
   SloMetric metric{};
@@ -245,3 +334,5 @@ struct Scenario {
 // not a scenario at run time.
 static_assert(simsys::model::table_follows_enum_order());
 static_assert(simsys::model::parse_node_type("frontier") == simsys::model::NodeType::frontier);
+static_assert(simsys::model::follows_enum_order(simsys::model::direction_table));
+static_assert(simsys::model::follows_enum_order(simsys::model::slo_metric_table));

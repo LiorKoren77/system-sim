@@ -49,7 +49,7 @@ Scenario mm1(double demand) {
   s.nodes = {
       NodeSpec{.id = "c",
                .type = NodeType::client,
-               .workload = Workload{.base = Rate{demand}, .op_shares = {{"op", 1.0}}}},
+               .workload = Workload{.curve = {.base = Rate{demand}}, .op_shares = {{"op", 1.0}}}},
       NodeSpec{.id = "s", .type = NodeType::service, .capacity = Rate{1000}, .latency = 1ms}};
   s.links = {LinkSpec{.from = "c", .to = "s", .dir = Direction::inout, .latency = 0s}};
   return s;
@@ -59,19 +59,20 @@ Scenario mm1(double demand) {
 // feedback link of the given latency: a loop of gain 0.5.
 Scenario half_loop(simsys::SimTime feedback_latency) {
   Scenario s{.name = "half-loop", .version = 1, .duration = 2s};
-  s.nodes = {NodeSpec{.id = "c",
-                      .type = NodeType::client,
-                      .workload = Workload{.base = Rate{100}, .op_shares = {{"x", 1.0}}}},
-             NodeSpec{.id = "f",
-                      .type = NodeType::service,
-                      .capacity = Rate{1e6},
-                      .latency = 100us,
-                      .ops = {{"x", {Step{.to = "g", .op = "x"}}}}},
-             NodeSpec{.id = "g",
-                      .type = NodeType::service,
-                      .capacity = Rate{1e6},
-                      .latency = 100us,
-                      .ops = {{"x", {Step{.to = "f", .op = "x", .factor = 0.5}}}}}};
+  s.nodes = {
+      NodeSpec{.id = "c",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"x", 1.0}}}},
+      NodeSpec{.id = "f",
+               .type = NodeType::service,
+               .capacity = Rate{1e6},
+               .latency = 100us,
+               .ops = {{"x", {Step{.to = "g", .op = "x"}}}}},
+      NodeSpec{.id = "g",
+               .type = NodeType::service,
+               .capacity = Rate{1e6},
+               .latency = 100us,
+               .ops = {{"x", {Step{.to = "f", .op = "x", .factor = 0.5}}}}}};
   s.links = {LinkSpec{.from = "c", .to = "f", .latency = 0s},
              LinkSpec{.from = "f", .to = "g", .latency = 0s},
              LinkSpec{.from = "g", .to = "f", .latency = feedback_latency}};
@@ -137,7 +138,7 @@ TEST_CASE("dropped flow does not propagate downstream", "[theory]") {
   s.nodes = {
       NodeSpec{.id = "c",
                .type = NodeType::client,
-               .workload = Workload{.base = Rate{3000}, .op_shares = {{"op", 1.0}}}},
+               .workload = Workload{.curve = {.base = Rate{3000}}, .op_shares = {{"op", 1.0}}}},
       NodeSpec{.id = "a",
                .type = NodeType::service,
                .capacity = Rate{1000},
@@ -177,19 +178,20 @@ TEST_CASE("run emits one record per step from 0 to duration, exclusive", "[theor
 TEST_CASE("flow is conserved at every node in every step of an overloaded chain", "[theory]") {
   // c -> a (fast) -> b (slow, overloaded): in = out + drops + delta backlog, per node, per step.
   Scenario s{.name = "chain", .version = 1, .duration = 5s};
-  s.nodes = {NodeSpec{.id = "c",
-                      .type = NodeType::client,
-                      .workload = Workload{.base = Rate{3000}, .op_shares = {{"op", 1.0}}}},
-             NodeSpec{.id = "a",
-                      .type = NodeType::service,
-                      .capacity = Rate{10000},
-                      .latency = 100us,
-                      .ops = {{"op", {simsys::model::Step{.to = "b", .op = "op"}}}}},
-             NodeSpec{.id = "b",
-                      .type = NodeType::service,
-                      .capacity = Rate{1000},
-                      .latency = 1ms,
-                      .advanced = {.queue_limit = 200}}};
+  s.nodes = {
+      NodeSpec{.id = "c",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{3000}}, .op_shares = {{"op", 1.0}}}},
+      NodeSpec{.id = "a",
+               .type = NodeType::service,
+               .capacity = Rate{10000},
+               .latency = 100us,
+               .ops = {{"op", {simsys::model::Step{.to = "b", .op = "op"}}}}},
+      NodeSpec{.id = "b",
+               .type = NodeType::service,
+               .capacity = Rate{1000},
+               .latency = 1ms,
+               .advanced = {.queue_limit = 200}}};
   s.links = {LinkSpec{.from = "c", .to = "a", .latency = 0s},
              LinkSpec{.from = "a", .to = "b", .latency = 0s}};
   const auto g = *simsys::graph::Graph::build(s);
@@ -214,7 +216,7 @@ TEST_CASE("what a node drains is what the next node receives", "[theory]") {
   s.nodes = {
       NodeSpec{.id = "c",
                .type = NodeType::client,
-               .workload = Workload{.base = Rate{1500}, .op_shares = {{"op", 1.0}}}},
+               .workload = Workload{.curve = {.base = Rate{1500}}, .op_shares = {{"op", 1.0}}}},
       NodeSpec{.id = "a",
                .type = NodeType::service,
                .capacity = Rate{1000},
@@ -241,7 +243,8 @@ TEST_CASE("the drained flow keeps the queue's op mix", "[theory]") {
   s.nodes = {
       NodeSpec{.id = "c",
                .type = NodeType::client,
-               .workload = Workload{.base = Rate{3000}, .op_shares = {{"x", 0.5}, {"y", 0.5}}}},
+               .workload =
+                   Workload{.curve = {.base = Rate{3000}}, .op_shares = {{"x", 0.5}, {"y", 0.5}}}},
       NodeSpec{.id = "a",
                .type = NodeType::service,
                .capacity = Rate{1000},
@@ -294,24 +297,25 @@ TEST_CASE("a feedback loop re-injects flow one step later and settles under esti
   // u -> chat -> q -> sync -> chat (push, terminal). Flow round the loop appears at chat one step
   // late.
   Scenario s{.name = "loop", .version = 1, .duration = 1s};
-  s.nodes = {NodeSpec{.id = "u",
-                      .type = NodeType::client,
-                      .workload = Workload{.base = Rate{100}, .op_shares = {{"msg", 1.0}}}},
-             NodeSpec{.id = "chat",
-                      .type = NodeType::service,
-                      .capacity = Rate{10000},
-                      .latency = 100us,
-                      .ops = {{"msg", {simsys::model::Step{.to = "q", .op = "publish"}}}}},
-             NodeSpec{.id = "q",
-                      .type = NodeType::service,
-                      .capacity = Rate{10000},
-                      .latency = 100us,
-                      .ops = {{"publish", {simsys::model::Step{.to = "sync", .op = "job"}}}}},
-             NodeSpec{.id = "sync",
-                      .type = NodeType::service,
-                      .capacity = Rate{10000},
-                      .latency = 100us,
-                      .ops = {{"job", {simsys::model::Step{.to = "chat", .op = "push"}}}}}};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"msg", 1.0}}}},
+      NodeSpec{.id = "chat",
+               .type = NodeType::service,
+               .capacity = Rate{10000},
+               .latency = 100us,
+               .ops = {{"msg", {simsys::model::Step{.to = "q", .op = "publish"}}}}},
+      NodeSpec{.id = "q",
+               .type = NodeType::service,
+               .capacity = Rate{10000},
+               .latency = 100us,
+               .ops = {{"publish", {simsys::model::Step{.to = "sync", .op = "job"}}}}},
+      NodeSpec{.id = "sync",
+               .type = NodeType::service,
+               .capacity = Rate{10000},
+               .latency = 100us,
+               .ops = {{"job", {simsys::model::Step{.to = "chat", .op = "push"}}}}}};
   s.links = {LinkSpec{.from = "u", .to = "chat", .latency = 0s},
              LinkSpec{.from = "chat", .to = "q", .latency = 0s},
              LinkSpec{.from = "q", .to = "sync", .latency = 0s},

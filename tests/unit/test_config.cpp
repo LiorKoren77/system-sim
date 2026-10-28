@@ -1091,6 +1091,8 @@ TEST_CASE("rate curve values are range-checked") {
         {"{base: 1/s, wave: {shape: sine}}",
          "node 'u': rate.wave needs shape, period, amplitude and peak_at"},
         {"{base: 1/s, wave: {shape: sine, period: 1h, amplitude: 0.5, peak_at: \"25:00\"}}",
+         "node 'u': rate.wave.peak_at: hour must be 00-23"},
+        {"{base: 1/s, wave: {shape: sine, period: 1h, amplitude: 0.5, peak_at: noon}}",
          "node 'u': rate.wave.peak_at: expected HH:MM or a duration"},
     };
     require_all_rejected("simsys_bad_wave.yaml", cases);
@@ -1110,6 +1112,10 @@ TEST_CASE("rate curve values are range-checked") {
         {"{base: 1/s, ramp: {from: 0/s, to: 1/s, over: 0s}}",
          "node 'u': rate.ramp.over must be positive"},
         {"{points: [[0s, 1/s]], ramp: {from: 0/s, to: 1/s, over: 1m}}",
+         "node 'u': rate.ramp needs rate.base"},
+        // A base of 0/s is no base to be relative to: the ramp multiplier from/base would
+        // divide by zero (workload's ramp term throws for it, a programmer error).
+        {"{base: 0/s, ramp: {from: 0/s, to: 1/s, over: 1m}}",
          "node 'u': rate.ramp needs rate.base"},
     };
     require_all_rejected("simsys_bad_ramp.yaml", cases);

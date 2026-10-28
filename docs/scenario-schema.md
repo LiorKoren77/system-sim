@@ -134,7 +134,7 @@ target and, if that link lists `ops`, lists the step's op.
 
 | type | own keys | phase 1 |
 |---|---|---|
-| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate.base` (at most `1e15/s`) and `ops` read; `timeout` checked (a duration), not yet used; `keys`, `sizes`, `retries` ignored |
+| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `timeout` checked (a duration), not yet used; `keys`, `sizes`, `retries` ignored |
 | `cdn` | `ttl`, `hit_ratio` (`fixed: h` or `model` †), `origin` (node id) | `origin` checked (a declared node); others ignored |
 | `load_balancer` | `policy` `round_robin|least_connections|weighted|consistent_hash`, `vnodes` (int, consistent_hash) | ignored |
 | `rate_limiter` | `algorithm` `token_bucket|leaky_bucket|fixed_window|sliding_log|sliding_counter`, `limit` (rate), `burst` (int), `backend` (node id of a cache holding counters) | `backend` checked; others ignored |
@@ -165,15 +165,33 @@ there is at least one op, and the shares sum to 1 within 1e-6. Order does not ma
 
 ```yaml
 rate:
-  base: 10k/s                                         # required; the only term phase 1 reads
-  wave:   {shape: sine|square|diurnal, period: 24h, amplitude: 0.6, peak_at: "20:00"}
-  ramp:   {from: 0, to: 10k/s, over: 5m}     # †
-  spikes: [{at: "12:00", for: 10m, factor: 3}]
+  base: 10k/s                                # or points; exactly one of the two
+  wave:   {shape: sine|square|diurnal, period: 24h, amplitude: 0.6, peak_at: 20:00}
+  ramp:   {from: 0/s, to: 10k/s, over: 5m}  # †
+  spikes: [{at: 12:00, for: 10m, factor: 3}]
   points: [[0s, 1k/s], [1h, 5k/s]]          # replaces base †
-  noise:  {sigma: 0.15, correlation: 5m}     # phase 2 †
+  noise:  {sigma: 0.15, correlation: 5m}    # †
 ```
-Terms multiply. Phase 1 checks the key names and ignores every term but `base`;
-`explain` prints "(rate curve: base only in phase 1)".
+All keys are **read** by the loader and printed by `explain` and `simsys curve`; the engine
+still offers `base` only until clients follow the curve (phase 2a, Task 6).
+
+Composition: `rate(t) = level(t) × wave(t) × ramp(t) × Π active spike factors × noise(t)`,
+where `level` is `base`, or `points` interpolated linearly (held flat before the first and
+after the last entry). t = 0 is midnight: a time point (`peak_at`, `at`, a point's time) is a
+clock time `HH:MM` (quoted or not) or a duration from the start (`5m`).
+
+| Key | Rule | Message on violation |
+|---|---|---|
+| `base` / `points` | exactly one | `client needs rate.base or rate.points`, `rate.base and rate.points are alternatives` |
+| `base` | a rate, at most `1e15/s` | `rate.base must be at most 1e15/s` |
+| `points` | a non-empty list of `[time, rate]` pairs, sorted by time (equal times make a step), rates at most `1e15/s` | `rate.points must have at least one entry`, `rate.points entries are [time, rate] pairs`, `rate.points must be sorted by time` |
+| `wave` | all of `shape` (`sine`, `square`, `diurnal`), `period` > 0, `amplitude` in [0, 1], `peak_at` | `rate.wave needs shape, period, amplitude and peak_at`, `rate.wave.amplitude must be between 0 and 1`, ... |
+| `ramp` | all of `from`, `to` (rates), `over` > 0; needs a `base` above `0/s` (it is a multiplier `from/base → to/base`) | `rate.ramp needs from, to and over`, `rate.ramp needs rate.base` |
+| `spikes` | a list; each spike has `at`, `for` > 0 and `factor` in (0, 1e6] | `rate.spikes[2].factor must be positive` (numbered from 1) |
+| `noise` | `sigma` ≥ 0 (stationary standard deviation), `correlation` > 0 (τ) | `rate.noise needs sigma and correlation` |
+
+Every block rejects unknown keys (`unknown rate.wave key 'colour'`,
+`unknown rate.spikes[1] key 'why'`).
 
 ## Links
 
