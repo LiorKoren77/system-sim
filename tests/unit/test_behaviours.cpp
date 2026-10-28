@@ -173,10 +173,11 @@ TEST_CASE("a client op split across two links mixes the responses by share", "[b
     return node == *g.index_of("fast") ? LatencyEstimate{0.001, 0.0} : LatencyEstimate{0.005, 0.0};
   });
   // Mixture: mean = 0.75 * 1 ms + 0.25 * 5 ms = 2 ms;
-  // variance = Σ s_i v_i + Σ s_i (m_i − mean)² = 0 + (0.75 * (1 ms − 2 ms)² + 0.25 * (5 ms −
-  // 2 ms)²) = 0.75e-6 + 2.25e-6 = 3e-6 (law of total variance: the expected conditional
-  // variance plus the variance of the conditional means; both routes are deterministic
-  // here, so all of it is the spread between routes).
+  // variance = Σ s_i v_i + Σ s_i (m_i − mean)²
+  //          = 0 + 0.75 * (1 ms − 2 ms)² + 0.25 * (5 ms − 2 ms)² = 0.75e-6 + 2.25e-6 = 3e-6
+  // (law of total variance: the expected conditional variance plus the variance of the
+  // conditional means; both routes are deterministic here, so all of it is the spread
+  // between routes).
   REQUIRE_THAT(r.mean_s, WithinRel(0.002, 1e-12));
   REQUIRE_THAT(r.variance_s2, WithinRel(3e-6, 1e-12));
 }
