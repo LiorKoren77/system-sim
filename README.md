@@ -1,10 +1,12 @@
 # system-sim
 
-A discrete-event **system design simulator** in modern C++23.
+A fluid-flow **system design simulator** in modern C++23.
 
 Describe a distributed system in YAML — clients, load balancers, caches, SQL and NoSQL
-stores, message queues, CDNs, datacenters and the links between them — then run traffic
-through it and watch where it turns yellow and red. Built to practise the systems in
+stores, message queues, CDNs, datacenters and the links between them — then push a day of
+traffic through it (waves, spikes, noise, failures) and watch where it turns yellow and red.
+Traffic is modelled as rates with analytic queueing per node, so every run is instant and
+reproducible. Built to practise the systems in
 *System Design Interview* (Alex Xu, vol. 1) and, at the same time, to study and teach
 C++20/23: modules, concepts, ranges, coroutines, `std::expected` and friends.
 
@@ -17,8 +19,8 @@ for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling 
 simsys validate scenario.yaml
 simsys explain  scenario.yaml
 simsys estimate scenario.yaml
-simsys run      scenario.yaml --seed 7 --report table --trace out.jsonl
-simsys sweep    scenario.yaml --param nodes.users.rate=1k/s..100k/s:10 --metric users.p99
+simsys run      scenario.yaml --seed 7 --report table --series out.csv
+simsys sweep    scenario.yaml --param nodes.users.rate.base=1k/s..100k/s:10 --metric users.p99
 ```
 
 ## Toolchain
