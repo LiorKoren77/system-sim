@@ -888,7 +888,7 @@ nodes:
     advanced: {burstiness: -1}
 links: []
 )",
-                     "node 'a': advanced.burstiness must be non-negative");
+                     "node 'a': advanced.burstiness must be a finite non-negative number");
   }
 }
 
@@ -1010,14 +1010,14 @@ links:
   CHECK(then[0].factor == 100.0);
 }
 
-TEST_CASE("step factor must be positive and on/mode must be known words") {
+TEST_CASE("step factor must be finite and positive and on/mode must be known words") {
   const auto with_step = [](std::string_view step) {
     return "version: 1\nname: t\nduration: 1m\nnodes:\n  a: {type: service, ops: {x: [" +
            std::string{step} + "]}}\nlinks: []\n";
   };
   SECTION("a zero factor") {
     require_rejected("simsys_step_factor_zero.yaml", with_step("{to: a, factor: 0}"),
-                     "node 'a': step factor must be positive");
+                     "node 'a': step factor must be a finite positive number");
   }
   SECTION("an unknown mode") {
     require_rejected("simsys_step_bad_mode.yaml", with_step("{to: a, mode: sideways}"),
@@ -1066,7 +1066,7 @@ TEST_CASE("a link's direction must be in, out or inout and its weight non-negati
   }
   SECTION("a negative weight") {
     require_rejected("simsys_link_bad_weight.yaml", with_link("{from: a, to: b, weight: -1}"),
-                     "link a -> b: weight must be non-negative");
+                     "link a -> b: weight must be a finite non-negative number");
   }
 }
 
@@ -1536,21 +1536,36 @@ std::string nested_aliases(int levels, int fan_out) {
 
 }  // namespace
 
-TEST_CASE("a scenario with nested YAML anchors validates in linear time") {
-  // 8 levels of 10 references each: 10^8 paths to the one `base` map. A repeated-key walk
-  // that follows every alias instead of visiting each shared node once takes minutes here
-  // (about 4 in a Debug build); a linear one takes milliseconds. `faults` is only checked to
-  // be a list until phase 3 types it, which is why nested lists are accepted inside it.
-  const auto path =
-      write_temp("simsys_nested_aliases.yaml",
-                 scenario_with("  a: {type: service}\n",
-                               "links: []\nfaults: [" + nested_aliases(8, 10) + "]\n"));
-  const auto start = std::chrono::steady_clock::now();
-  const auto s = simsys::config::load(path.string());
-  const auto elapsed = std::chrono::steady_clock::now() - start;
-  INFO((s ? "" : s.error().message));
-  REQUIRE(s.has_value());
-  REQUIRE(elapsed < 200ms);
+TEST_CASE("nested aliases are checked once and cheaply") {
+  // yaml-cpp resolves an alias to the anchored node itself, so nested aliases make a small
+  // file describe a huge tree: nested_aliases(8, 10) reaches the one `base` map 10^8 times. A
+  // walk that followed every path took minutes here (about 4 in a Debug build); the loader's
+  // walk meets each shared node once and remembers its expanded size, so it takes
+  // milliseconds whether the expansion is accepted or over the cap. `faults` is only checked
+  // to be a list until phase 3 types it, which is why nested lists are accepted inside it.
+  const auto load_timed = [](std::string_view file_name, int levels) {
+    const auto path = write_temp(
+        file_name, scenario_with("  a: {type: service}\n",
+                                 "links: []\nfaults: [" + nested_aliases(levels, 10) + "]\n"));
+    const auto start = std::chrono::steady_clock::now();
+    auto s = simsys::config::load(path.string());
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    CHECK(elapsed < 200ms);
+    return s;
+  };
+  SECTION("an expansion under the cap loads") {
+    // An entry is a map, a list or a scalar value. The fault map counts 4 (itself and its
+    // three values) and each list 1 plus its ten copies, so 5 levels expand to 411 111
+    // entries; the rest of the scenario adds 9.
+    const auto s = load_timed("simsys_nested_aliases_small.yaml", 5);
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+  }
+  SECTION("an expansion far over the cap is rejected without following every path") {
+    const auto s = load_timed("simsys_nested_aliases.yaml", 8);
+    REQUIRE_FALSE(s.has_value());
+    CHECK(s.error().message == "aliases expand the scenario to 411111120 entries; at most 1000000");
+  }
 }
 
 TEST_CASE("a null value is reported at its own key, for maps and lists too") {
@@ -1959,9 +1974,186 @@ TEST_CASE("a link's ops may not repeat and its weight must be finite and at most
   }
   SECTION("an infinite weight, in YAML's own spelling") {
     require_rejected("simsys_link_weight_inf.yaml", with_link("weight: .inf"),
-                     "link a -> b: weight must be at most 1e9");
+                     "link a -> b: weight must be a finite non-negative number");
   }
   SECTION("the bound itself is allowed") {
     require_loaded("simsys_link_weight_max.yaml", with_link("weight: 1e9"));
   }
+}
+
+// ---- Re-verification batch: alias expansion cap, number and key messages ----------------
+
+namespace {
+
+// `size` services that each declare `size` ops of `size` steps, written with two anchors:
+// the step list is written once (`&steps`) and every op refers to it, the op map is written
+// once (`&ops`) and every service refers to it. The text grows like size^2 (the alias
+// references), the expanded scenario like size^3 (every service, op and step is real to the
+// readers that build the Scenario).
+std::string cubic_aliases(int size) {
+  std::string steps = "[";
+  for (int i = 0; i < size; ++i) steps += i == 0 ? "{to: db}" : ", {to: db}";
+  steps += "]";
+  std::string ops = "{";
+  for (int i = 0; i < size; ++i) {
+    ops += (i == 0 ? "" : ", ") + std::string{"op"} + std::to_string(i) + ": " +
+           (i == 0 ? "&steps " + steps : std::string{"*steps"});
+  }
+  ops += "}";
+  std::string nodes = "  db: {type: service}\n";
+  for (int i = 0; i < size; ++i) {
+    nodes += "  s" + std::to_string(i) +
+             ": {type: service, ops: " + (i == 0 ? "&ops " + ops : std::string{"*ops"}) + "}\n";
+  }
+  return scenario_with(nodes);
+}
+
+}  // namespace
+
+TEST_CASE("aliases that expand the scenario past a million entries are rejected") {
+  // 100 services x 100 ops x 100 steps: about two million entries from a few kilobytes. The
+  // readers that build the Scenario expand every alias again; before the cap, a 10 KB file
+  // of this shape took about a minute and 800 MB. The cap is checked by the first walk over
+  // the document, before any reader runs, so the rejection is immediate.
+  const auto yaml = cubic_aliases(100);
+  REQUIRE(yaml.size() < 50'000);
+  const auto path = write_temp("simsys_cubic_aliases.yaml", yaml);
+  const auto start = std::chrono::steady_clock::now();
+  const auto s = simsys::config::load(path.string());
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  REQUIRE_FALSE(s.has_value());
+  INFO(s.error().message);
+  // C++20 std::string::starts_with: a prefix test in one call, replacing
+  // `message.rfind(prefix, 0) == 0` or a compare(0, n, prefix) with its length arithmetic.
+  CHECK(s.error().message.starts_with("aliases expand the scenario to"));
+  CHECK(s.error().message.ends_with("entries; at most 1000000"));
+  CHECK(elapsed < 1s);
+}
+
+TEST_CASE("an alias inside its own anchor is rejected, not followed forever") {
+  // yaml-cpp registers an anchor when its node starts, so `&loop [*loop]` is a list that
+  // contains itself: it expands to infinitely many entries.
+  const auto path =
+      write_temp("simsys_alias_cycle.yaml",
+                 scenario_with("  a: {type: service}\n", "links: []\nfaults: &loop [1, *loop]\n"));
+  const auto s = simsys::config::load(path.string());
+  REQUIRE_FALSE(s.has_value());
+  CHECK(s.error().message ==
+        "aliases expand the scenario to more entries than can be counted; at most 1000000");
+}
+
+TEST_CASE("bad numbers get the message for what is wrong") {
+  // A number too large for a double (1e309) is out of range, not "no number": it gets the
+  // key's range message. Not-a-number and infinity, in any spelling, are no finite number.
+  const auto with_link = [](std::string_view attributes) {
+    return scenario_with("  a: {type: service}\n  b: {type: service}\n",
+                         "links: [{from: a, to: b, " + std::string{attributes} + "}]\n");
+  };
+  SECTION("a NaN weight") {
+    require_rejected("simsys_weight_nan.yaml", with_link("weight: .nan"),
+                     "link a -> b: weight must be a finite non-negative number");
+  }
+  SECTION("infinity in the spelling of from_chars") {
+    require_rejected("simsys_weight_inf_word.yaml", with_link("weight: inf"),
+                     "link a -> b: weight must be a finite non-negative number");
+  }
+  SECTION("negative infinity") {
+    require_rejected("simsys_weight_minus_inf.yaml", with_link("weight: -.inf"),
+                     "link a -> b: weight must be a finite non-negative number");
+  }
+  SECTION("a weight too large for a double") {
+    require_rejected("simsys_weight_1e309.yaml", with_link("weight: 1e309"),
+                     "link a -> b: weight must be at most 1e9");
+  }
+  SECTION("a weight too negative for a double") {
+    require_rejected("simsys_weight_minus_1e309.yaml", with_link("weight: -1e309"),
+                     "link a -> b: weight must be a finite non-negative number");
+  }
+  SECTION("a weight too small for a double rounds to zero, a drained link") {
+    require_loaded("simsys_weight_1e-400.yaml", with_link("weight: 1e-400"));
+  }
+  SECTION("a replica count too large for an int") {
+    require_rejected("simsys_replicas_1e309.yaml",
+                     scenario_with("  a: {type: service, replicas: 1e309}\n"),
+                     "node 'a': replicas must be a positive integer");
+  }
+  SECTION("a replica count past the int range") {
+    require_rejected("simsys_replicas_huge.yaml",
+                     scenario_with("  a: {type: service, replicas: 99999999999}\n"),
+                     "node 'a': replicas must be a positive integer");
+  }
+  SECTION("an advanced number too large for a double") {
+    require_rejected("simsys_burstiness_1e309.yaml",
+                     scenario_with("  a: {type: service, advanced: {burstiness: 1e309}}\n"),
+                     "node 'a': advanced.burstiness must be a finite non-negative number");
+  }
+  SECTION("a step factor too large for a double") {
+    require_rejected("simsys_factor_1e309.yaml",
+                     scenario_with("  a: {type: service}\n"
+                                   "  b: {type: service, ops: {x: [{to: a, factor: 1e309}]}}\n"),
+                     "node 'b': step factor must be a finite positive number");
+  }
+  SECTION("a version past the int range is still not 1") {
+    require_rejected("simsys_version_huge.yaml",
+                     "version: 99999999999\nname: t\nduration: 1m\nnodes:\n  a: {type: "
+                     "service}\nlinks: []\n",
+                     "version must be 1");
+  }
+  SECTION("a seed past the int range") {
+    require_rejected("simsys_seed_huge.yaml",
+                     "version: 1\nname: t\nduration: 1m\nseed: 99999999999\nnodes:\n  a: "
+                     "{type: service}\nlinks: []\n",
+                     "seed must be between -2147483648 and 2147483647");
+  }
+}
+
+TEST_CASE("a non-scalar key is reported as such, not as an empty name") {
+  // A list or map is valid YAML as a map key, but names nothing; yaml-cpp's Scalar() reads
+  // it as "", which made messages like "unknown top-level key ''".
+  SECTION("at the top level") {
+    require_rejected("simsys_key_list_top.yaml",
+                     scenario_with("  a: {type: service}\n") + "[a, b]: 1\n",
+                     "top-level key must be a scalar");
+  }
+  SECTION("a node id") {
+    require_rejected("simsys_key_map_node_id.yaml", scenario_with("  {a: 1}: {type: service}\n"),
+                     "node id must be a scalar");
+  }
+  SECTION("a key of a node body") {
+    require_rejected("simsys_key_list_body.yaml", scenario_with("  a: {type: service, [x]: 1}\n"),
+                     "node 'a': key must be a scalar");
+  }
+  SECTION("a key inside advanced") {
+    require_rejected("simsys_key_list_advanced.yaml",
+                     scenario_with("  a: {type: service, advanced: {[x]: 1}}\n"),
+                     "node 'a': advanced key must be a scalar");
+  }
+  SECTION("a key of a link") {
+    require_rejected("simsys_key_list_link.yaml",
+                     scenario_with("  a: {type: service}\n  b: {type: service}\n",
+                                   "links: [{from: a, to: b, [x]: 1}]\n"),
+                     "link a -> b: key must be a scalar");
+  }
+  SECTION("a key of an slo entry") {
+    require_rejected("simsys_key_list_slo.yaml",
+                     scenario_with("  a: {type: service}\n",
+                                   "links: []\nslo: [{metric: utilization, max: 0.5, [x]: 1}]\n"),
+                     "slo: key must be a scalar");
+  }
+}
+
+TEST_CASE("datacenters with only a latency list are reported at the datacenters key") {
+  // `latency` is no datacenter, so this declares none. The message is about `datacenters` as
+  // a whole and points at its key (line 5), not at the first entry inside it.
+  require_rejected_at("simsys_dc_only_latency.yaml", R"(
+version: 1
+name: t
+duration: 1m
+datacenters:
+  latency: []
+nodes:
+  a: {type: service}
+links: []
+)",
+                      "datacenters must not be empty", 5);
 }
