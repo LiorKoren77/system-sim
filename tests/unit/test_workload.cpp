@@ -176,3 +176,42 @@ TEST_CASE("a non-positive correlation time or a negative sigma is a programmer e
   REQUIRE_THROWS_AS((NoiseProcess{Noise{.sigma = 0.1, .correlation = 0s}, 1}), std::invalid_argument);
   REQUIRE_THROWS_AS((NoiseProcess{Noise{.sigma = -0.1, .correlation = 1s}, 1}), std::invalid_argument);
 }
+
+TEST_CASE("samples yields one rate per step from zero up to but excluding until", "[workload]") {
+  RateCurve c{.base = Rate{100}};
+  c.spikes = {Spike{.at = 300ms, .duration = 100ms, .factor = 3}};
+  std::vector<double> got;
+  // C++23 std::generator: a lazy coroutine range; the curve is sampled only as far as consumed.
+  // It replaces building a whole std::vector up front or hand-writing an iterator class.
+  for (const auto& s : simsys::workload::samples(c, 100ms, 500ms)) got.push_back(s.rate.per_second);
+  REQUIRE(got == std::vector<double>{100, 100, 100, 300, 100});
+}
+
+TEST_CASE("samples carries the time of each sample", "[workload]") {
+  const RateCurve c{.base = Rate{1}};
+  auto gen = simsys::workload::samples(c, 1s, 3s);
+  auto it = gen.begin();
+  REQUIRE(it->t == 0s);
+  ++it;
+  REQUIRE(it->t == 1s);
+  ++it;
+  REQUIRE(it->t == 2s);
+  ++it;
+  REQUIRE(it == gen.end());
+}
+
+TEST_CASE("samples with noise applies the seeded multiplier and stays deterministic", "[workload]") {
+  const RateCurve c{.base = Rate{1000}};
+  const Noise noise{.sigma = 0.2, .correlation = 1s};
+  std::vector<double> a, b;
+  for (const auto& s : simsys::workload::samples(c, 100ms, 1s, noise, /*seed=*/5)) a.push_back(s.rate.per_second);
+  for (const auto& s : simsys::workload::samples(c, 100ms, 1s, noise, /*seed=*/5)) b.push_back(s.rate.per_second);
+  REQUIRE(a == b);
+  REQUIRE(a.size() == 10);
+  REQUIRE(a != std::vector<double>(10, 1000.0));  // the noise did something
+}
+
+TEST_CASE("samples with a non-positive step is a programmer error", "[workload]") {
+  const RateCurve c{.base = Rate{1}};
+  REQUIRE_THROWS_AS(simsys::workload::samples(c, 0s, 1s).begin(), std::invalid_argument);
+}
