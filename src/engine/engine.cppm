@@ -83,10 +83,15 @@ class DelayLine {
 // unit `capacity` is a rate of (phase 2a refinement 4): a request of an op with `cost` 3
 // counts three times. With every cost at its default of 1, units are requests, as in
 // phase 1. The drop ratio dropped / demand is therefore the share of the node's work it shed.
+// `rejected_per_s` is a second way to shed (plan 2a refinement 6): requests a rate limiter
+// refused by policy, after its own queue drained them, so they are part of `drain_per_s`
+// too and are never forwarded. Dropped and rejected together are what the node failed
+// (report::Summary::drop_rate). A limiter's every op costs 1, so these units are requests.
 struct NodeSample {
   double demand_per_s{};
   double drain_per_s{};
   double dropped_per_s{};
+  double rejected_per_s{};
   double backlog{};
   double rho{};
   flow::LatencyEstimate latency;  // own sojourn; zero for a client (a source has no queue)
@@ -264,7 +269,7 @@ struct Overloaded : Fs... {
   // C++20 `using enum`: the enumerators of NodeType in scope for this function only, so
   // the test reads `client` instead of `model::NodeType::client`.
   using enum model::NodeType;
-  return type == client || type == service || type == load_balancer;
+  return type == client || type == service || type == load_balancer || type == rate_limiter;
 }
 
 void add_once(std::vector<std::size_t>& links, std::size_t link) {
@@ -328,7 +333,8 @@ void add_once(std::vector<std::size_t>& links, std::size_t link) {
 // group (1) and a hash ring's hottest copy (replicas / imbalance).
 [[nodiscard]] NodeSample group_sample(const fluid::FluidStep& step, double group_scale) {
   // C++20 designated initializers: name each field at the construction site, so the
-  // five doubles in a row cannot be swapped silently.
+  // doubles in a row cannot be swapped silently. `rejected_per_s` stays 0: a queue never
+  // rejects; the forward pass fills it from the behaviour's Routed.
   return NodeSample{.demand_per_s = step.demand_per_s * group_scale,
                     .drain_per_s = step.drain_per_s * group_scale,
                     .dropped_per_s = step.dropped_per_s * group_scale,
@@ -427,6 +433,12 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
                       g, index, behaviours::client_seed(g.scenario().seed, index)}};
     case model::NodeType::load_balancer:
       return make_server(behaviours::LoadBalancerBehaviour{g, index}, resolved);
+    // A rate limiter's queue is built like any server's from the resolved capacity: for the
+    // token bucket family a plain gate (the type's 100k/s, 50 us check, or the scenario's
+    // `capacity`), for a leaky bucket the bucket itself (graph::leaky_bucket_capacity set
+    // service rate = limit and queue_limit = burst), so the queue does the leaking.
+    case model::NodeType::rate_limiter:
+      return make_server(behaviours::RateLimiterBehaviour{g, index}, resolved);
     default:  // create() admitted only simulated types: the rest are services
       return make_server(behaviours::ServiceBehaviour{g, index}, resolved);
   }
@@ -574,6 +586,12 @@ Simulation Simulation::settling_copy() const {
     if (auto* client = std::get_if<behaviours::ClientBehaviour>(&node.behaviour)) {
       client->reset_noise();
     }
+    // A full bucket would let the first settle passes admit more than the limit and take
+    // burst / ((in - limit) x dt) passes to drain; empty, the first pass admits min(in,
+    // limit), the long-run rate (see RateLimiterBehaviour::empty_bucket).
+    if (auto* limiter = std::get_if<behaviours::RateLimiterBehaviour>(&node.behaviour)) {
+      limiter->empty_bucket();
+    }
   }
   scratch.links_.assign(links_.size(), Link{.line = DelayLine{0}});
   return scratch;
@@ -591,8 +609,9 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
 //   1. receive: pop every incoming link into the node's inflow;
 //   2. a client offers its load (in advance mode it first ticks its noise by dt; settle
 //      mode never ticks, so estimate sees the curve without noise at the time it passes,
-//      t = 0); any other node (service, load balancer) runs its fluid queue on the inflow
-//      and routes the part it drained (backlog included, with the queue's op mix: see serve);
+//      t = 0); any other node (service, load balancer, rate limiter) runs its fluid queue
+//      on the inflow and routes the part it drained (backlog included, with the queue's op
+//      mix: see serve); what the route rejects is recorded and goes nowhere;
 //   3. send: accumulate the routed flow per link and push it into each link's delay line.
 // Why this order is right: a forward link's target comes later in the order, so it pops
 // after this step's push (a zero-step link delivers in the same step). A feedback link's
@@ -615,6 +634,7 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode,
             // lambda for a client, so this one sees only servers.
             [&](auto& server) { return server.route(serve(index, dt, mode, samples[index]), dt); }},
         nodes_[index].behaviour);
+    samples[index].rejected_per_s = routed.rejected.total().per_second;
     send(index, routed, mode);
   }
 }

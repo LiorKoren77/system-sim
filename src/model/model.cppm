@@ -16,7 +16,9 @@
 module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this interface imports simsys.core
 // (GCC 14.2 'Bad file data' bug, CLAUDE.md §3). Durations use simsys::literals (100_ms).
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -170,6 +172,47 @@ inline constexpr auto lb_policy_table = std::to_array<core::EnumName<LbPolicy>>(
   return core::parse_in(lb_policy_table, name);
 }
 
+// How a rate limiter decides which requests to turn away (System Design Interview ch. 4
+// "Design a rate limiter", the five algorithms of its "Algorithms for rate limiting"
+// section). In the fluid model (plan 2a refinement 6, see behaviours::RateLimiterBehaviour)
+// they reduce to two mechanisms:
+//   token_bucket                 -> a bucket of `burst` tokens refilled at `limit`;
+//   fixed_window, sliding_log,
+//   sliding_counter              -> the same bucket with burst = limit x window: the three
+//                                   differ in how exactly they count the last window,
+//                                   which a fluid (no individual requests) cannot see;
+//   leaky_bucket                 -> a FIFO queue drained at `limit` with room for `burst`:
+//                                   excess requests wait instead of being rejected.
+enum class LimiterAlgorithm {
+  token_bucket,
+  leaky_bucket,
+  fixed_window,
+  sliding_log,
+  sliding_counter
+};
+
+// Pattern: Table-driven method — the algorithm names, read by the loader (`algorithm:`) and
+// printed by explain from this one table.
+inline constexpr auto limiter_algorithm_table = std::to_array<core::EnumName<LimiterAlgorithm>>({
+    {LimiterAlgorithm::token_bucket, "token_bucket"},
+    {LimiterAlgorithm::leaky_bucket, "leaky_bucket"},
+    {LimiterAlgorithm::fixed_window, "fixed_window"},
+    {LimiterAlgorithm::sliding_log, "sliding_log"},
+    {LimiterAlgorithm::sliding_counter, "sliding_counter"},
+});
+
+[[nodiscard]] constexpr std::string_view to_string(LimiterAlgorithm a) {
+  return core::name_in(limiter_algorithm_table, a);
+}
+[[nodiscard]] constexpr std::optional<LimiterAlgorithm> parse_limiter_algorithm(
+    std::string_view name) {
+  return core::parse_in(limiter_algorithm_table, name);
+}
+
+// The window a windowed limiter counts over when the scenario gives none. Chosen: the
+// book's ch. 4 examples are all "N requests per second", i.e. a one-second window.
+inline constexpr SimTime default_limiter_window = 1_s;
+
 // Virtual nodes per server on a consistent-hash ring when the scenario gives none.
 // Chosen: 150 is the per-server token count of Amazon Dynamo's evaluation and of the
 // Cassandra/Riak-style rings the book's ch. 5 describes ("vnodes: 150" in the lab).
@@ -238,8 +281,35 @@ struct NodeSpec {
   // the virtual nodes per server (absent: default_vnodes).
   std::optional<LbPolicy> policy{};
   std::optional<int> vnodes{};
+  // Rate limiters only (plan 2a refinement 6; declared after the LB keys, for designated
+  // initializers): the algorithm (the loader fills in token_bucket when absent), the limit
+  // (required: a limiter without one limits nothing), the burst (requests the limiter lets
+  // through above the limit at once; the loader fills in limit x window), the window of the
+  // windowed algorithms (the loader fills in default_limiter_window) and the node holding
+  // the counters (`backend`, a cache), which every admitted request consults once. A
+  // scenario built in code may leave algorithm, burst and window empty: the behaviour and
+  // the graph apply the same defaults.
+  std::optional<LimiterAlgorithm> algorithm{};
+  std::optional<Rate> limit{};
+  std::optional<int> burst{};
+  std::optional<SimTime> window{};
+  std::optional<std::string> backend{};
   std::optional<Workload> workload{};  // clients only
 };
+
+// The window and the burst a rate limiter works with, defaults applied. The loader fills
+// both in, but a scenario built in code may leave them empty, and the behaviour, the graph
+// and explain must agree on one number. Default burst: limit x window, rounded up to a
+// whole request and at least one (see config's read_limiter_burst for why); 0 without a
+// limit (Graph::build rejects such a limiter before anything asks).
+[[nodiscard]] constexpr SimTime limiter_window(const NodeSpec& spec) {
+  return spec.window.value_or(default_limiter_window);
+}
+[[nodiscard]] inline double limiter_burst(const NodeSpec& spec) {
+  if (spec.burst) return *spec.burst;
+  if (!spec.limit) return 0.0;
+  return std::max(std::ceil(spec.limit->per_second * seconds(limiter_window(spec))), 1.0);
+}
 
 enum class Direction { in, out, inout };
 
@@ -342,3 +412,6 @@ static_assert(simsys::model::step_condition_table.back().value ==
 static_assert(simsys::model::step_mode_table.back().value == simsys::model::StepMode::parallel);
 static_assert(simsys::model::lb_policy_table.back().value ==
               simsys::model::LbPolicy::consistent_hash);
+static_assert(simsys::core::round_trips(simsys::model::limiter_algorithm_table));
+static_assert(simsys::model::limiter_algorithm_table.back().value ==
+              simsys::model::LimiterAlgorithm::sliding_counter);

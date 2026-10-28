@@ -116,12 +116,11 @@ Scenario limited(LimiterAlgorithm algorithm, double limit, int burst, double dem
                    .limit = Rate{limit},
                    .burst = burst};
   if (algorithm != LimiterAlgorithm::leaky_bucket) limiter.capacity = Rate{1e6};
-  s.nodes = {NodeSpec{.id = "u",
-                      .type = NodeType::client,
-                      .workload = Workload{.curve = {.base = Rate{demand}},
-                                           .op_shares = {{"call", 1.0}}}},
-             limiter,
-             NodeSpec{.id = "api", .type = NodeType::service, .capacity = Rate{10'000}}};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{demand}}, .op_shares = {{"call", 1.0}}}},
+      limiter, NodeSpec{.id = "api", .type = NodeType::service, .capacity = Rate{10'000}}};
   s.links = {LinkSpec{.from = "u", .to = "limiter", .latency = 0s},
              LinkSpec{.from = "limiter", .to = "api", .latency = 0s}};
   return s;
@@ -748,7 +747,7 @@ TEST_CASE("rejected requests count as drops at the limiter and never reach the s
   REQUIRE_THAT(limiter.demand_per_s, WithinRel(4000.0, 1e-9));
   REQUIRE_THAT(limiter.rejected_per_s, WithinRel(3000.0, 1e-9));  // 4000 offered - 1000 admitted
   REQUIRE(limiter.dropped_per_s == 0.0);                          // its own queue never overflows
-  REQUIRE_THAT(api.demand_per_s, WithinRel(1000.0, 1e-9));  // only the admitted flow arrives
+  REQUIRE_THAT(api.demand_per_s, WithinRel(1000.0, 1e-9));        // only the admitted flow arrives
   REQUIRE(api.rejected_per_s == 0.0);
   REQUIRE(last.responses.size() == 1);
   REQUIRE(last.responses[0].offered == Rate{4000});  // the client still offers all of it
@@ -791,8 +790,9 @@ TEST_CASE("the client's drop rate includes rejections", "[theory]") {
   // A warmup of 1 s keeps the first step, where the bucket may still hold a few tokens, out
   // of the average: the rest of the run is the limited steady state.
   simsys::report::Summary summary{g, simsys::SimTime{1s}};
-  (*Simulation::create(g)).run({.duration = s.duration, .step = s.step},
-                               [&](const auto& r) { summary.observe(r); });
+  (*Simulation::create(g)).run({.duration = s.duration, .step = s.step}, [&](const auto& r) {
+    summary.observe(r);
+  });
   REQUIRE_THAT(summary.drop_rate("limiter"), WithinRel(0.75, 1e-9));
   REQUIRE(summary.drop_rate("api") == 0.0);
   REQUIRE(summary.drop_rate("u") == 0.0);

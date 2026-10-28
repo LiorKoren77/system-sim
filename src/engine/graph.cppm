@@ -26,7 +26,9 @@
 // splits are fixed fractions, as round-robin or a weighted DNS record would give. A load
 // balancer's policy is resolved here too, as a property of the node BEHIND it (plan 2a
 // refinement 5, see mark_balanced_targets): whether its replicas queue apart, as one
-// pool, or with a hot spot.
+// pool, or with a hot spot. A rate limiter forwards like a balancer (per link, by weight)
+// whatever it admits, and its `backend` (the counter store) becomes a demand edge of its
+// own, carrying op `counter` (plan 2a refinement 6, see connect_backends).
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -85,7 +87,21 @@ struct ResolvedNode {
   // `imbalance` times the average share (consistent_hash; 1 = an even split).
   bool pooled{false};
   double imbalance{1.0};
+  // A rate limiter's counter store (spec.backend) as a node index, and the link its
+  // `counter` requests travel on (Graph::connect_backends); empty for every other node.
+  std::optional<std::size_t> backend{};
+  std::optional<std::size_t> backend_link{};
 };
+
+// The op a rate limiter sends its counter store once per admitted request (plan 2a
+// refinement 6): "read and increment this client's counter" (ch. 4's Redis INCR + EXPIRE).
+inline constexpr std::string_view counter_op = "counter";
+
+// Nodes that forward whatever reaches them over their links, split by link weight, rather
+// than by per-op steps: load balancers and rate limiters (Graph::route_forwarder).
+[[nodiscard]] constexpr bool forwards_by_link(model::NodeType type) {
+  return type == model::NodeType::load_balancer || type == model::NodeType::rate_limiter;
+}
 
 // A scenario link with node indices instead of ids, and its resolved timing.
 struct ResolvedLink {
@@ -102,9 +118,10 @@ struct ResolvedLink {
   double weight{1.0};
 };
 
-// Where a splitter (a client or a load balancer) sends flow and which share goes there.
-// A client's route is per op: `op` names it and `share` is that op's fraction on this
-// link. A load balancer forwards whatever arrives, so its routes are per LINK: `op` is
+// Where a splitter (a client, a load balancer or a rate limiter) sends flow and which share
+// goes there. A client's route is per op: `op` names it and `share` is that op's fraction on
+// this link. A load balancer (or limiter) forwards whatever arrives, so its routes are per
+// LINK: `op` is
 // empty ("any op the link's filter allows") and `share` is the link's weight over all its
 // outgoing links; Graph::routes_for renormalises it over the links that carry a given op.
 struct Route {
@@ -159,8 +176,9 @@ class Graph {
   [[nodiscard]] std::optional<std::size_t> index_of(std::string_view id) const;
   // The link that carries demand from `from` to `to`: (from,to,out|inout) or (to,from,in).
   [[nodiscard]] std::optional<std::size_t> demand_link(std::size_t from, std::size_t to) const;
-  // Empty for a node that does not split flow (anything but a client or a load
-  // balancer). An index past the last node is a programmer error (std::out_of_range).
+  // Empty for a node that does not split flow (anything but a client, a load balancer or a
+  // rate limiter; a limiter's backend link is not a route). An index past the last node is
+  // a programmer error (std::out_of_range).
   [[nodiscard]] std::span<const Route> routes(std::size_t node) const { return routes_.at(node); }
   [[nodiscard]] std::span<const Route> client_routes(std::size_t client) const {
     return routes(client);
@@ -170,7 +188,8 @@ class Graph {
   // carries the op, their shares renormalised to sum to 1 over those links.
   [[nodiscard]] std::vector<Route> routes_for(std::size_t node, std::string_view op) const;
   // Every op some flow can bring to `node`, sorted: client routes and unconditional steps
-  // targeting it, and whatever a load balancer in front passes on. Empty for a client.
+  // targeting it, whatever a load balancer or rate limiter in front passes on, and
+  // `counter` on a limiter's backend. Empty for a client.
   [[nodiscard]] std::span<const std::string> arriving_ops(std::size_t node) const {
     return arriving_ops_.at(node);
   }
@@ -186,16 +205,18 @@ class Graph {
 
   explicit Graph(model::Scenario scenario) : scenario_{std::move(scenario)} {}
 
-  void resolve_nodes();
+  Result resolve_nodes();
   Result resolve_links();
   Result connect_steps();
   Result connect_step(std::size_t from, const model::Step& step);
+  Result connect_backends();
+  Result connect_backend(std::size_t limiter);
   Result route_splitters();
   Result route_clients();
   Result route_client_op(std::size_t client, const std::string& op);
-  Result route_balancer(std::size_t balancer);
+  Result route_forwarder(std::size_t node);
   void collect_arriving_ops();
-  Result check_balancer_ops(std::size_t balancer);
+  Result check_forwarded_ops(std::size_t node);
   Result mark_balanced_targets();
   void order_nodes();
   void add_edge(const DemandEdge& edge);
@@ -302,6 +323,46 @@ namespace {
   return roots;
 }
 
+// Graph::build also takes rate limiters written in code, which the loader never checked:
+// the same rules as config's read_limiter_* (a limit, positive; burst and window positive).
+[[nodiscard]] std::optional<EngineError> invalid_limiter(const model::NodeSpec& spec) {
+  const std::string name = "node '" + spec.id + "': ";
+  if (!spec.limit) return EngineError{name + "rate_limiter needs a limit"};
+  if (!(spec.limit->per_second > 0) || !std::isfinite(spec.limit->per_second)) {
+    return EngineError{name + "limit must be positive"};
+  }
+  if (spec.burst && *spec.burst <= 0) return EngineError{name + "burst must be a positive integer"};
+  if (spec.window && spec.window->count() <= 0)
+    return EngineError{name + "window must be positive"};
+  return std::nullopt;
+}
+
+// A leaky bucket (ch. 4) IS a queue: requests join a FIFO bucket that leaks at the fixed
+// rate `limit`, and only a full bucket (`burst` waiting) turns requests away. So the
+// limiter's own queue becomes the bucket: service rate = limit, waiting room = burst. Both
+// are the limiter's TOTALS, so with N replicas each copy gets 1/N of them (the engine models
+// one copy, see engine::Simulation::make_server; a pooled group multiplies them back). The
+// service time stays the type's or the scenario's (50 us by default: a counter check), so
+// a request's sojourn is its wait in the bucket plus that check. The scenario's `capacity`
+// and `advanced.queue_limit` are overridden: for a leaky bucket they would be a second,
+// contradicting statement of the limit and the burst.
+[[nodiscard]] fluid::Capacity leaky_bucket_capacity(const model::NodeSpec& spec,
+                                                    fluid::Capacity capacity) {
+  const double replicas = spec.replicas;
+  capacity.service_rate = Rate{spec.limit->per_second / replicas};
+  capacity.queue_limit = model::limiter_burst(spec) / replicas;
+  if (!spec.advanced.concurrency) {
+    capacity.concurrency = defaults::implied_concurrency(
+        capacity.service_rate, defaults::resolve_service_time(spec).value);
+  }
+  return capacity;
+}
+
+[[nodiscard]] bool is_leaky_bucket(const model::NodeSpec& spec) {
+  return spec.type == model::NodeType::rate_limiter &&
+         spec.algorithm == model::LimiterAlgorithm::leaky_bucket;
+}
+
 }  // namespace
 
 // The call-graph search lives in a named, unexported namespace (module linkage) rather
@@ -316,18 +377,24 @@ struct Call {
   auto operator<=>(const Call&) const = default;  // a std::map key (see AsyncHop)
 };
 
-// A load balancer has no `ops` steps, yet each op it receives is a call to the nodes
-// behind it: (lb, op) -> (target, op) for every route that carries the op.
-// Pattern: Adapter — the balancer's routes are re-expressed as the steps the search below
+// A load balancer or a rate limiter has no `ops` steps, yet each op it receives is a call
+// to the nodes behind it: (lb, op) -> (target, op) for every route that carries the op; a
+// limiter with a backend also calls (backend, counter) first.
+// Pattern: Adapter — the forwarders' routes are re-expressed as the steps the search below
 // already walks, keyed by the call they belong to, so the search needs no second case.
 using ForwardedSteps = std::map<Call, std::vector<model::Step>>;
 
-[[nodiscard]] ForwardedSteps balancer_steps(const Graph& g) {
+[[nodiscard]] ForwardedSteps forwarder_steps(const Graph& g) {
   ForwardedSteps forwarded;
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
-    if (g.nodes()[node].spec.type != model::NodeType::load_balancer) continue;
+    const auto& resolved = g.nodes()[node];
+    if (!forwards_by_link(resolved.spec.type)) continue;
     for (const auto& op : g.arriving_ops(node)) {
       auto& steps = forwarded[Call{node, op}];
+      if (resolved.backend) {
+        steps.push_back(
+            model::Step{.to = g.nodes()[*resolved.backend].spec.id, .op = std::string{counter_op}});
+      }
       for (const auto& route : g.routes_for(node, op)) {
         steps.push_back(model::Step{.to = g.nodes()[route.target].spec.id, .op = op});
       }
@@ -337,8 +404,8 @@ using ForwardedSteps = std::map<Call, std::vector<model::Step>>;
 }
 
 // The steps handling `call.op` at `call.node` runs, in declaration order; none for an op
-// the node lists without steps (terminal) or does not list at all. A load balancer's are
-// its forwarded steps.
+// the node lists without steps (terminal) or does not list at all. A load balancer's or a
+// rate limiter's are its forwarded steps.
 [[nodiscard]] std::span<const model::Step> steps_of(const Graph& g, const ForwardedSteps& forwarded,
                                                     const Call& call) {
   if (const auto found = forwarded.find(call); found != forwarded.end()) return found->second;
@@ -386,7 +453,7 @@ using ForwardedSteps = std::map<Call, std::vector<model::Step>>;
     std::span<const model::Step> steps;
     std::size_t next_step;
   };
-  const ForwardedSteps forwarded = balancer_steps(g);
+  const ForwardedSteps forwarded = forwarder_steps(g);
   std::vector<AsyncHop> hops;
   for (const Call& root : call_roots(g)) {
     // C++20 std::map::contains: "is this key present?" in one call, replacing
@@ -432,14 +499,14 @@ using ForwardedSteps = std::map<Call, std::vector<model::Step>>;
 // not configure the steps.)
 std::expected<Graph, EngineError> Graph::build(model::Scenario scenario) {
   Graph graph{std::move(scenario)};
-  graph.resolve_nodes();
   // C++23 std::expected::and_then: runs the next fallible step only if the previous one
   // succeeded and passes the first error through untouched, replacing an
   // `if (!r) return std::unexpected(r.error());` between every pair of steps.
-  const auto built =
-      graph.resolve_links().and_then([&] { return graph.connect_steps(); }).and_then([&] {
-        return graph.route_splitters();
-      });
+  const auto built = graph.resolve_nodes()
+                         .and_then([&] { return graph.resolve_links(); })
+                         .and_then([&] { return graph.connect_steps(); })
+                         .and_then([&] { return graph.connect_backends(); })
+                         .and_then([&] { return graph.route_splitters(); });
   if (!built) return std::unexpected{built.error()};
   graph.order_nodes();
   graph.async_hops_ = detail::find_async_hops(graph);
@@ -470,7 +537,9 @@ std::optional<std::size_t> Graph::demand_link(std::size_t from, std::size_t to) 
 }
 
 // Node index = scenario order. Clients are sources, not queues, so they get no capacity.
-void Graph::resolve_nodes() {
+// A rate limiter is checked first (it needs a limit), and a leaky bucket's queue is the
+// bucket itself (leaky_bucket_capacity), its rate the scenario's `limit`.
+Graph::Result Graph::resolve_nodes() {
   nodes_.reserve(scenario_.nodes.size());
   for (const auto& spec : scenario_.nodes) {
     if (spec.type == model::NodeType::client) {
@@ -480,15 +549,24 @@ void Graph::resolve_nodes() {
       nodes_.push_back(ResolvedNode{.spec = spec});
       continue;
     }
-    nodes_.push_back(ResolvedNode{
+    if (spec.type == model::NodeType::rate_limiter) {
+      if (auto invalid = invalid_limiter(spec)) return std::unexpected{std::move(*invalid)};
+    }
+    ResolvedNode node{
         .spec = spec,
         .capacity = defaults::resolve_capacity(spec),
         .service_rate_source = defaults::resolve_service_rate(spec).source,
         .service_time_source = defaults::resolve_service_time(spec).source,
-    });
+    };
+    if (is_leaky_bucket(spec)) {
+      node.capacity = leaky_bucket_capacity(spec, node.capacity);
+      node.service_rate_source = defaults::Source::scenario;  // the limit is the scenario's
+    }
+    nodes_.push_back(std::move(node));
   }
   routes_.resize(nodes_.size());
   arriving_ops_.resize(nodes_.size());
+  return {};
 }
 
 // Ids become indices; latency falls back to half the datacenter round trip
@@ -571,20 +649,56 @@ Graph::Result Graph::connect_step(std::size_t from, const model::Step& step) {
   return {};
 }
 
+// A rate limiter's `backend` is the counter store it consults once per admitted request
+// (plan 2a refinement 6): a demand edge limiter -> backend carrying op `counter`, on the
+// link that carries demand between them. The loader checked that the backend exists and
+// is a cache; a scenario built in code is checked for existence here.
+Graph::Result Graph::connect_backends() {
+  for (std::size_t node = 0; node < nodes_.size(); ++node) {
+    const auto& spec = nodes_[node].spec;
+    if (spec.type != model::NodeType::rate_limiter || !spec.backend) continue;
+    if (auto connected = connect_backend(node); !connected) return connected;
+  }
+  return {};
+}
+
+Graph::Result Graph::connect_backend(std::size_t limiter) {
+  const auto& spec = nodes_[limiter].spec;
+  const auto backend = index_of(*spec.backend);
+  if (!backend) {
+    return std::unexpected{EngineError{"node '" + spec.id + "': backend refers to unknown node '" +
+                                       *spec.backend + "'"}};
+  }
+  const auto link = demand_link(limiter, *backend);
+  if (!link) {
+    return std::unexpected{EngineError{"node '" + spec.id + "': backend '" + *spec.backend +
+                                       "' needs a link from the limiter"}};
+  }
+  if (!carries_op(links_[*link], counter_op)) {
+    return std::unexpected{
+        EngineError{"link " + spec.id + " -> " + *spec.backend +
+                    " does not carry op 'counter' (ops: " + joined(links_[*link].ops, ", ") + ")"}};
+  }
+  nodes_[limiter].backend = *backend;
+  nodes_[limiter].backend_link = *link;
+  add_edge(DemandEdge{.from = limiter, .to = *backend, .link = *link});
+  return {};
+}
+
 // The nodes that split flow over their outgoing links, then what follows from those
-// splits: which ops reach each node (through any chain of load balancers), whether every
-// op reaching a load balancer can leave it, and what each balancer's policy does to the
-// replicas behind it.
+// splits: which ops reach each node (through any chain of balancers and limiters), whether
+// every op reaching one can leave it, and what each balancer's policy does to the replicas
+// behind it.
 Graph::Result Graph::route_splitters() {
   if (auto routed = route_clients(); !routed) return routed;
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
-    if (nodes_[node].spec.type != model::NodeType::load_balancer) continue;
-    if (auto routed = route_balancer(node); !routed) return routed;
+    if (!forwards_by_link(nodes_[node].spec.type)) continue;
+    if (auto routed = route_forwarder(node); !routed) return routed;
   }
   collect_arriving_ops();
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
-    if (nodes_[node].spec.type != model::NodeType::load_balancer) continue;
-    if (auto checked = check_balancer_ops(node); !checked) return checked;
+    if (!forwards_by_link(nodes_[node].spec.type)) continue;
+    if (auto checked = check_forwarded_ops(node); !checked) return checked;
   }
   return mark_balanced_targets();
 }
@@ -647,28 +761,32 @@ Graph::Result Graph::route_client_op(std::size_t client, const std::string& op) 
 // downstream nodes, while the policy (mark_balanced_targets) is about how the replicas
 // INSIDE one downstream node share it. `weighted` is the policy that says the weights are
 // the point; round robin over equal weights (the default 1) is an even split.
-Graph::Result Graph::route_balancer(std::size_t balancer) {
-  const auto& id = nodes_[balancer].spec.id;
+// A rate limiter forwards what it admits the same way, except over its backend link, which
+// carries only its own `counter` requests (connect_backend). A limiter with no other link
+// is a terminal gate: a service asks it "may I?" and it answers (notification-system's
+// per-user limiter); a balancer with nowhere to send is an error.
+Graph::Result Graph::route_forwarder(std::size_t node) {
+  const auto& id = nodes_[node].spec.id;
+  const auto backend_link = nodes_[node].backend_link;
   double total_weight = 0;
   for (std::size_t i = 0; i < links_.size(); ++i) {
-    const auto target = demand_target(links_[i], balancer);
-    if (!target) continue;
+    const auto target = demand_target(links_[i], node);
+    if (!target || i == backend_link) continue;
     if (nodes_[*target].spec.type == model::NodeType::client) {  // see connect_step
       return std::unexpected{EngineError{"node '" + id + "': link to client '" +
                                          nodes_[*target].spec.id +
                                          "' cannot carry demand; clients only send"}};
     }
-    routes_[balancer].push_back(Route{.target = *target, .link = i, .share = links_[i].weight});
+    routes_[node].push_back(Route{.target = *target, .link = i, .share = links_[i].weight});
     total_weight += links_[i].weight;
-    add_edge(DemandEdge{.from = balancer, .to = *target, .link = i});
+    add_edge(DemandEdge{.from = node, .to = *target, .link = i});
   }
-  if (routes_[balancer].empty()) {
+  if (routes_[node].empty() && nodes_[node].spec.type == model::NodeType::load_balancer) {
     return std::unexpected{
         EngineError{"node '" + id + "': a load balancer needs an outgoing link"}};
   }
-  // All weights 0 leaves every share 0; check_balancer_ops reports it per op.
-  for (auto& route : routes_[balancer])
-    route.share = total_weight > 0 ? route.share / total_weight : 0;
+  // All weights 0 leaves every share 0; check_forwarded_ops reports it per op.
+  for (auto& route : routes_[node]) route.share = total_weight > 0 ? route.share / total_weight : 0;
   return {};
 }
 
@@ -692,9 +810,10 @@ std::vector<Route> Graph::routes_for(std::size_t node, std::string_view op) cons
 }
 
 // Which ops reach every node: a worklist over (node, op) pairs, seeded with the client
-// routes and the unconditional steps (the only ones that forward flow in phase 2a), and
-// grown through load balancers, which pass each op they receive on to every route whose
-// link carries it. Each pair enters the list once, so a loop of balancers ends.
+// routes, the unconditional steps (the only ones that forward flow in phase 2a) and the
+// `counter` op of every limiter's backend, and grown through load balancers and rate
+// limiters, which pass each op they receive on to every route whose link carries it. Each
+// pair enters the list once, so a loop of balancers ends.
 void Graph::collect_arriving_ops() {
   std::vector<std::set<std::string>> arriving(nodes_.size());
   std::vector<std::pair<std::size_t, std::string>> work;
@@ -712,11 +831,12 @@ void Graph::collect_arriving_ops() {
     for (const model::Step& step : spec.then) {
       if (step.on == model::StepCondition::always) arrive(*index_of(step.to), step.op);
     }
+    if (nodes_[node].backend) arrive(*nodes_[node].backend, std::string{counter_op});
   }
   while (!work.empty()) {
     const auto [node, op] = std::move(work.back());
     work.pop_back();
-    if (nodes_[node].spec.type != model::NodeType::load_balancer) continue;
+    if (!forwards_by_link(nodes_[node].spec.type)) continue;
     for (const auto& route : routes_[node]) {
       if (carries_op(links_[route.link], op)) arrive(route.target, op);
     }
@@ -728,12 +848,15 @@ void Graph::collect_arriving_ops() {
 
 // Every op that reaches a load balancer must be able to leave it, or the balancer would
 // swallow it: the same two rules as a client op (route_client_op), with the node's wording.
-Graph::Result Graph::check_balancer_ops(std::size_t balancer) {
-  const auto& id = nodes_[balancer].spec.id;
-  for (const auto& op : arriving_ops_[balancer]) {
+// So must every op reaching a rate limiter that forwards at all; a limiter with no route
+// (a terminal gate, see route_forwarder) answers every op itself.
+Graph::Result Graph::check_forwarded_ops(std::size_t node) {
+  const auto& id = nodes_[node].spec.id;
+  if (routes_[node].empty()) return {};  // a terminal limiter (a balancer has a route)
+  for (const auto& op : arriving_ops_[node]) {
     double total_weight = 0;
     bool carried = false;
-    for (const auto& route : routes_[balancer]) {
+    for (const auto& route : routes_[node]) {
       if (!carries_op(links_[route.link], op)) continue;
       carried = true;
       total_weight += links_[route.link].weight;

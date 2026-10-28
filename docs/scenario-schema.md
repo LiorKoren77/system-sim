@@ -14,8 +14,9 @@ Two kinds of marks:
 
 `simsys validate` runs the loader only. `explain`, `estimate` and `run` also build the
 graph, which adds the checks marked *(graph)* below. `estimate` and `run` accept only
-`client` and `service` nodes in phase 1; any other type fails with "... which run/estimate
-do not support yet (phase 2)". `explain` works for every type.
+`client` and `service` nodes in phase 1, and `load_balancer` and `rate_limiter` from
+phase 2a; any other type fails with "... which run/estimate do not support yet (phase 2)".
+`explain` works for every type.
 
 ## Values
 
@@ -137,7 +138,7 @@ target and, if that link lists `ops`, lists the step's op.
 | `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `timeout` checked (a duration), not yet used; `keys`, `sizes`, `retries` ignored |
 | `cdn` | `ttl`, `hit_ratio` (`fixed: h` or `model` †), `origin` (node id) | `origin` checked (a declared node); others ignored |
 | `load_balancer` | `policy` `round_robin|least_connections|weighted|consistent_hash`, `vnodes` (int, consistent_hash) | read and simulated (phase 2a): `policy` defaults to `round_robin`; `vnodes` is a positive int, accepted only with `consistent_hash`, default 150. The balancer forwards every op over the links that carry it, split by link `weight`; the policy shapes the replicas *behind* it: `round_robin`/`weighted` independent copies, `least_connections` one pooled M/M/(c·N) queue, `consistent_hash` the hottest copy at `1 + 1/sqrt(vnodes)` × the average. *(graph)* It needs an outgoing link, every op reaching it needs a link that carries it, and a node may not sit behind balancers of different policies |
-| `rate_limiter` | `algorithm` `token_bucket|leaky_bucket|fixed_window|sliding_log|sliding_counter`, `limit` (rate), `burst` (int), `backend` (node id of a cache holding counters) | `backend` checked; others ignored |
+| `rate_limiter` | `algorithm` `token_bucket|leaky_bucket|fixed_window|sliding_log|sliding_counter`, `limit` (rate), `burst` (int), `window` (duration), `backend` (node id of a cache holding counters) | read and simulated (phase 2a): `limit` is required and positive; `algorithm` defaults to `token_bucket`, `window` to `1s` (positive), `burst` (a positive int) to `limit × window` rounded up; `backend` must name a cache. Token bucket: admits `min(in, limit + tokens/dt)` per step from a bucket of `burst` tokens (starting full) refilled at `limit`; the windowed three are token buckets of burst `limit × window`; the rest is **rejected** (never forwarded, counted in the `rejected` column and in the drop rate). Leaky bucket: the limiter's own queue becomes the bucket (service rate `limit`, `queue_limit` `burst`; its `capacity` and `advanced.queue_limit` are overridden), so excess waits and only overflow is dropped. Admitted flow is forwarded like a load balancer's, by link weight over every link but the backend's; with a `backend`, each admitted request sends one `counter` request there and the hop adds to the response. `limit` and `burst` are the limiter's totals, shared by its replicas. *(graph)* The backend needs a link from the limiter that carries op `counter`; a limiter with no other outgoing link is a terminal gate (it answers every op itself) |
 | `service` | `ops`, `cost` | read |
 | `cache` | `eviction` `lru|lfu|fifo|ttl`, `strategy` `cache_aside|read_through|write_through|write_around|write_back`, `keys` (int capacity), `hit_ratio` (`fixed: h` or `che`), `backend` (node id for read/write-through), `ttl`, `then`, `cost` | `backend` checked; `cost` read (simulated with the cache in phase 2a); others ignored |
 | `sql_db` | `replication_lag`, `shards` (int), `pool` (int connections) † | ignored |
@@ -236,7 +237,7 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 | metric | `node` | `op` | `max` | phase 1 evaluates |
 |---|---|---|---|---|
 | `p50_latency`, `p95_latency`, `p99_latency` | required, a **client** | optional, one the client sends | duration | the client's estimated end-to-end percentile; without `op`, the worst of its ops |
-| `drop_rate` | optional | not allowed | number in [0, 1] | the node's dropped / the requests sent to it, after warmup; without `node`, the worst node's (see note) |
+| `drop_rate` | optional | not allowed | number in [0, 1] | the node's dropped + rejected / the requests sent to it, after warmup; without `node`, the worst node's (see note) |
 | `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup |
 | `queue_lag` | optional | not allowed | duration | reported `skipped` until phase 2 |
 | `staleness` | optional | not allowed | duration | reported `skipped` until phase 2 |
@@ -245,7 +246,8 @@ The kind of `max` follows the metric, so `0.01` can never be read as 0.01 second
 `op` is only valid for latency metrics (`slo: op is only valid for latency metrics`): drop
 rate and utilization are measured per node, not per op.
 
-Note: `drop_rate` is per node, Σ dropped / Σ demand of that node, so it stays in [0, 1]
+Note: `drop_rate` is per node, Σ (dropped + rejected) / Σ demand of that node (a rate
+limiter's rejections are failed requests too), so it stays in [0, 1]
 even when fan-out multiplies the clients' requests before they reach it (one post → 100
 feed writes would make "dropped anywhere / offered by clients" 90). Without `node` it is
 the worst node's, since every node must keep the bound; the table header names that node.

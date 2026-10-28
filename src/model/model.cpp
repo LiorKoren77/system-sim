@@ -57,5 +57,8 @@ template void emit_special_members(std::map<std::string, std::vector<Step>>*,
                                    std::map<std::string, std::vector<Step>>&);
 // NodeSpec::cost (phase 2a): its move constructor went missing from the release link.
 template void emit_special_members(std::map<std::string, double>*, std::map<std::string, double>&);
+// NodeSpec::backend (phase 2a rate limiter): the move constructor of std::optional<std::string>
+// went missing from the release link of every importer that copies a NodeSpec.
+template void emit_special_members(std::optional<std::string>*, std::optional<std::string>&);
 
 }  // namespace simsys::model::detail

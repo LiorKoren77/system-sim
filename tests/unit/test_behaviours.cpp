@@ -511,9 +511,9 @@ TEST_CASE("admitted flow is forwarded downstream op by op; rejected flow is not"
   for (int i = 0; i < 100; ++i) (void)lim.route(idle, 100ms);  // bucket full
   Flow burst;
   burst.add("a", Rate{2000});
-  burst.add("b", Rate{2000});  // 4000/s in all, split 50/50
-  (void)lim.route(burst, 100ms);  // admits 4000, bucket 500 -> 200
-  (void)lim.route(burst, 100ms);  // admits 3000, bucket -> 0
+  burst.add("b", Rate{2000});                   // 4000/s in all, split 50/50
+  (void)lim.route(burst, 100ms);                // admits 4000, bucket 500 -> 200
+  (void)lim.route(burst, 100ms);                // admits 3000, bucket -> 0
   const auto routed = lim.route(burst, 100ms);  // admits the limit only: 1000 of 4000
   // The admitted 1000/s keeps the op mix: 500 of each op goes on to the api, in one flow.
   REQUIRE(routed.outgoing.size() == 1);
@@ -568,8 +568,8 @@ TEST_CASE("every windowed algorithm gives the same fluid behaviour at the same w
   // two 4000/s steps admit 4000 then 3000, the third only the limit.
   for (const auto algorithm : {LimiterAlgorithm::fixed_window, LimiterAlgorithm::sliding_log,
                                LimiterAlgorithm::sliding_counter}) {
-    const auto g = *simsys::graph::Graph::build(limiter_front(
-        limiter_spec(algorithm, 1000, std::nullopt, std::nullopt, 500ms)));
+    const auto g = *simsys::graph::Graph::build(
+        limiter_front(limiter_spec(algorithm, 1000, std::nullopt, std::nullopt, 500ms)));
     RateLimiterBehaviour lim{g, *g.index_of("limiter")};
     for (int i = 0; i < 100; ++i) (void)lim.route(flow_of("call", 800), 100ms);
     const Flow burst = flow_of("call", 4000);
@@ -657,16 +657,13 @@ TEST_CASE("a limiter's response adds the counter store hop and the api hop to it
   REQUIRE(asked.size() == 2);
 }
 
-TEST_CASE("a limiter without a backend adds only the api hop to its own sojourn",
-          "[behaviours]") {
-  const auto g = *simsys::graph::Graph::build(
-      limiter_front(limiter_spec(LimiterAlgorithm::token_bucket, 1000, 500), {{"call", 1.0}},
-                    0s, 3ms));
+TEST_CASE("a limiter without a backend adds only the api hop to its own sojourn", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(limiter_front(
+      limiter_spec(LimiterAlgorithm::token_bucket, 1000, 500), {{"call", 1.0}}, 0s, 3ms));
   const RateLimiterBehaviour lim{g, *g.index_of("limiter")};
-  const auto r = lim.response("call", LatencyEstimate{0.001, 0.0},
-                              [](std::size_t, std::string_view) {
-                                return LatencyEstimate{0.004, 1e-6};
-                              });
+  const auto r =
+      lim.response("call", LatencyEstimate{0.001, 0.0},
+                   [](std::size_t, std::string_view) { return LatencyEstimate{0.004, 1e-6}; });
   REQUIRE_THAT(r.mean_s, WithinRel(0.001 + 0.006 + 0.004, 1e-12));
   REQUIRE_THAT(r.variance_s2, WithinRel(1e-6, 1e-9));
 }

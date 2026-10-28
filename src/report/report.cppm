@@ -40,8 +40,11 @@ struct NodeSummary {
   double peak_rho{};       // highest utilization of any observed step
   double peak_backlog{};   // most requests waiting at the end of any observed step
   double total_dropped{};  // requests shed because the waiting room was full
-  double red_time_s{};     // seconds spent in the red zone
-  bool unavailable{};      // the node's latency was infinite in some observed step
+  // Requests refused by policy (a rate limiter's 429s, plan 2a refinement 6): answered at
+  // once, never forwarded, and counted with the drops in the drop rate.
+  double total_rejected{};
+  double red_time_s{};  // seconds spent in the red zone
+  bool unavailable{};   // the node's latency was infinite in some observed step
 };
 
 // One (client, op) over the observed part of a run. Percentiles are a lognormal fit to
@@ -82,10 +85,11 @@ class Summary {
   // Zero means the window after warmup was empty: there is no data, which the SLO
   // verdicts and the renderers report as such (nothing is evaluated, nothing passes).
   [[nodiscard]] std::size_t observed_steps() const { return observed_steps_; }
-  // One node's drop rate: the requests it dropped over the requests sent to it, summed
-  // over the observed steps (Σ dropped / Σ demand), so always in [0, 1]; 0 when nothing
-  // reached it. An unknown id is a programmer error (the loader checks SLO nodes): throws
-  // std::invalid_argument.
+  // One node's drop rate: the requests it failed (dropped from a full queue or rejected
+  // by a rate limiter, plan 2a refinement 8) over the requests sent to it, summed over the
+  // observed steps (Σ (dropped + rejected) / Σ demand), so always in [0, 1]; 0 when nothing
+  // reached it. From the client's side both are failed requests. An unknown id is a programmer
+  // error (the loader checks SLO nodes): throws std::invalid_argument.
   [[nodiscard]] double drop_rate(std::string_view node) const;
   // The worst node's drop rate: every node must keep its own, so the worst one decides.
   [[nodiscard]] double drop_rate() const;
@@ -106,8 +110,9 @@ class Summary {
     double rho_time{};  // Σ rho·dt
     double peak_rho{};
     double peak_backlog{};
-    double demand{};   // Σ demand_per_s·dt: requests sent to the node
-    double dropped{};  // Σ dropped_per_s·dt
+    double demand{};    // Σ demand_per_s·dt: requests sent to the node
+    double dropped{};   // Σ dropped_per_s·dt
+    double rejected{};  // Σ rejected_per_s·dt
     double red_time_s{};
     bool unavailable{};
     void add(const engine::NodeSample& sample, double dt_s);
