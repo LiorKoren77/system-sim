@@ -120,7 +120,7 @@ name: t
 duration: 1m
 nodes:
   users:
-    type: client
+    {type: client, rate: {base: 1/s}, ops: {x: 1}}
   api:
     type: service
     capacity: 1k/s
@@ -373,7 +373,7 @@ version: 1
 name: t
 duration: 1m
 nodes:
-  users: {type: client}
+  users: {type: client, rate: {base: 1/s}, ops: {x: 1}}
   api: {type: service, capacity: 1k/s}
 links:
   - {from: users, to: api, latency: never}
@@ -390,7 +390,7 @@ duration: 1m
 step: 100ms
 warmup: 2m
 nodes:
-  users: {type: client}
+  users: {type: client, rate: {base: 1/s}, ops: {x: 1}}
   api: {type: service, capacity: 1k/s, latency: 0.5ms}
 links:
   - {from: users, to: api, latency: 0.3ms}
@@ -566,7 +566,7 @@ links:
   }
 }
 
-TEST_CASE("a client's and a service's numeric op shares load") {
+TEST_CASE("a client's numeric op shares load") {
   const auto path = write_temp("simsys_numeric_ops.yaml", R"(
 version: 1
 name: t
@@ -574,11 +574,11 @@ duration: 1m
 nodes:
   users:
     type: client
+    rate: {base: 1/s}
     ops: {ping: 1.0}
   api:
     type: service
     capacity: 1k/s
-    ops: {ping: 0.5}
 links: []
 )");
   const auto s = simsys::config::load(path.string());
@@ -624,7 +624,7 @@ links: []
   }
 }
 
-TEST_CASE("an op value must be a step list or a share") {
+TEST_CASE("a non-client op value must be a step list") {
   const auto service_ops = [](std::string_view ops) {
     return "version: 1\nname: t\nduration: 1m\nnodes:\n  api:\n    type: service\n"
            "    capacity: 1k/s\n    ops: " +
@@ -632,11 +632,11 @@ TEST_CASE("an op value must be a step list or a share") {
   };
   SECTION("a map value that is neither a list nor a number") {
     require_rejected("simsys_op_map.yaml", service_ops("{read: {to: ghost}}"),
-                     "op 'read' must be a step list or a share");
+                     "op 'read' must be a step list");
   }
   SECTION("a text value that is not a number") {
     require_rejected("simsys_op_text.yaml", service_ops("{read: fast}"),
-                     "op 'read' must be a step list or a share");
+                     "op 'read' must be a step list");
   }
   SECTION("ops given as a scalar") {
     require_rejected("simsys_ops_scalar.yaml", service_ops("hello"), "ops must be a map");
@@ -644,11 +644,9 @@ TEST_CASE("an op value must be a step list or a share") {
   SECTION("ops given as a list") {
     require_rejected("simsys_ops_list.yaml", service_ops("[ghost]"), "ops must be a map");
   }
-  SECTION("a service op that is a share still loads") {
-    const auto path = write_temp("simsys_op_share.yaml", service_ops("{ping: 0.5}"));
-    const auto s = simsys::config::load(path.string());
-    INFO((s ? "" : s.error().message));
-    REQUIRE(s.has_value());
+  SECTION("a service op that is a share is rejected: only a client's ops are shares") {
+    require_rejected("simsys_op_share.yaml", service_ops("{ping: 0.5}"),
+                     "op 'ping' must be a step list");
   }
   SECTION("an empty step list is a valid terminal op") {
     const auto path = write_temp("simsys_op_empty_list.yaml", service_ops("{read: []}"));
