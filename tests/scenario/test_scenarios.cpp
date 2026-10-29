@@ -115,7 +115,14 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
     //  - url-shortener passes its SLOs, but 24 h at 1 s is 86.4k steps: 0.4 s in Release, about
     //    6 to 8 s in a Debug build (measured 2026-10-28), over the five seconds below. Its own test
     //    runs it end to end with no time limit and pins its SLO results.
-    if (s.name == "lab-unique-id" || s.name == "url-shortener") continue;  // not run here
+    //  - youtube runs since plan 2c Task 7 (its pool's `then` steps), but is exempt from its SLOs
+    //    until Task 16: its 300 MB uploads take 12 s at the store against the clients' 10 s
+    //    timeout (Task 13 applies timeouts, Task 16 sizes the upload's per resumable chunk), its
+    //    queue_lag SLO is Task 8's, and 24 h at 100 ms is 864k steps, far over the five seconds.
+    //    The "book/youtube runs" test below runs its first steps instead.
+    if (s.name == "lab-unique-id" || s.name == "url-shortener" || s.name == "youtube") {
+      continue;  // not run here
+    }
     ++ran;
     auto& sim = *created;
     simsys::report::Summary summary{g, s.warmup};
@@ -132,7 +139,7 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
       REQUIRE(r.status != simsys::report::SloStatus::fail);
     }
   }
-  CHECK(ran > 0);  // the tutorials at least always run here (the two above are not counted)
+  CHECK(ran > 0);  // the tutorials at least always run here (the three above are not counted)
 }
 
 // Phase 2a's goal: the rate-limiter lab, which uses a client with spikes, a rate limiter, a
@@ -224,12 +231,15 @@ TEST_CASE("book scenarios are refused by run until their node types exist", "[sc
 // Phase 2b runs the nodes up to the id generator: the two tutorials, the rate-limiter lab, the
 // consistent-hashing lab (client, load balancer, che cache, sql_db), the unique-id lab (client,
 // id_generator) and the book's URL shortener (client, rate limiter, caches, load balancer,
-// service, id_generator, sql_db) use only those. Every other lab and book scenario still needs a
-// later task's node types, so the set of runnable scenarios is pinned by name: a node type
-// added later makes this fail and forces whoever adds it to update the list on purpose.
+// service, id_generator, sql_db) use only those. Phase 2c adds the byte-sized nodes, the queue and
+// the pool with its `then` steps (Task 7): youtube (clients, CDNs, blob stores, balancer, service,
+// cache, SQL database, message queues, worker pools) is the first book scenario of 2c that runs.
+// Every other lab and book scenario still needs a later task's node types (google-drive's
+// ws_gateway, news-feed's kv_cluster, ...), so the set of runnable scenarios is pinned by name: a
+// node type added later makes this fail and forces whoever adds it to update the list on purpose.
 TEST_CASE(
-    "scenarios that run under phase 2b are: chain, hello, consistent-hashing, rate-limiter, "
-    "unique-id, url-shortener",
+    "scenarios that run today are: chain, hello, consistent-hashing, rate-limiter, unique-id, "
+    "url-shortener, youtube",
     "[scenario]") {
   std::vector<std::string> runnable;
   for (const auto& file : scenario_files()) {
@@ -242,8 +252,8 @@ TEST_CASE(
   }
   std::ranges::sort(runnable);
   REQUIRE(runnable == std::vector<std::string>{"chain", "hello", "lab-consistent-hashing",
-                                               "lab-rate-limiter", "lab-unique-id",
-                                               "url-shortener"});
+                                               "lab-rate-limiter", "lab-unique-id", "url-shortener",
+                                               "youtube"});
 }
 
 TEST_CASE("a refused scenario's message names the first unsupported node and the phase",
@@ -325,21 +335,16 @@ TEST_CASE("book/news-feed's media store is checked against the cdn's 5 percent m
 }
 
 // Ch. 14's YouTube sizes its two CDNs in bytes (`capacity: 100GB/s`, `50GB/s`) and gives them a
-// che hit ratio: valid scenario, explained, and its byte-sized nodes run (plan 2c Task 3). Since
-// Task 6 its queues and worker pools are simulated too, so the engine refuses it at its first
-// pool WITH `then` steps, transcoders (the node after transcode_q): a pool's `then` steps run in
-// Task 7. (Every type youtube uses is simulated now, so the refusal is the second loop of
-// Simulation::create, the nodes that cannot run yet, in file order: original_store, a blob store
-// whose `then` publishes each upload to transcode_q, runs since Task 4.) What
-// the cdn changed is pinned through explain (review of 4d539b0, M12): the two edges'
-// Che hit ratios (Zipf 1 over 10M videos, 100k and 50k of them at the edge: 0.642 and 0.594,
-// checked against an independent Python computation by the reviewer) and the miss flow they
-// send transcoded_store, which an explain that ignored the origin edge would leave at zero.
-TEST_CASE("book/youtube validates and explains, and the engine refuses it at transcoders",
-          "[scenario]") {
+// che hit ratio: valid scenario, explained, and the engine runs it (plan 2c Task 7: every type it
+// uses is simulated, and a worker pool's `then` steps run). What the cdn changed is pinned through
+// explain (review of 4d539b0, M12): the two edges' Che hit ratios (Zipf 1 over 10M videos, 100k and
+// 50k of them at the edge: 0.642 and 0.594, checked against an independent Python computation by
+// the reviewer) and the load they and the transcoders send transcoded_store, which an explain that
+// ignored the origin edge or the pool would leave at zero.
+TEST_CASE("book/youtube validates, explains and the engine accepts it", "[scenario]") {
   const auto s =
       simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml");
-  if (!s) FAIL(s.error().file << ":" << s.error().line << ": " << s.error().message);
+  if (!s) FAIL(s.error().file << ":" << s.error().line << ":" << s.error().message);
   // C++20 ranges algorithm with a projection: find the node whose `id` member equals "cdn_us",
   // replacing `std::find_if(begin, end, [](const auto& n) { return n.id == "cdn_us"; })`.
   const auto cdn_us = std::ranges::find(s->nodes, "cdn_us", &simsys::model::NodeSpec::id);
@@ -359,28 +364,49 @@ TEST_CASE("book/youtube validates and explains, and the engine refuses it at tra
   REQUIRE_THAT(*g->hit_ratio(*g->index_of("cdn_eu")), Catch::Matchers::WithinAbs(0.594, 5e-4));
   const auto text = simsys::report::render_explain(*g);
   CAPTURE(text);
-  // The edges' misses at the evening peak, (1 − h_us) × 281.6/s + (1 − h_eu) × 140.8/s (each
-  // client's base × 1.6 × 88 % streams) = 157.8/s; the transcoders' writes add nothing on paper
-  // yet (a worker pool's load is phase 2c's). The store counts megabytes, so its line leads with
-  // MB/s (157.82/s × 50 MB = 7.891k MB/s) and gives the requests in parentheses.
+  // At the evening peak transcoded_store is offered the edges' misses, (1 - h_us) x 281.6/s +
+  // (1 - h_eu) x 140.8/s (each client's base x 1.6 x 88 % streams) = 157.82/s of 50 MB, and the
+  // transcoders' renditions: 9.6 uploads/s x 4 writes = 38.4/s of 50 MB. In all 196.22/s, and
+  // 196.22 x 50 MB = 9.811k MB/s. (The store counts megabytes, so its line leads with MB/s and
+  // gives the requests in parentheses.)
   REQUIRE_THAT(peak_offered_requests_per_s(text, "transcoded_store"),
-               Catch::Matchers::WithinRel(157.8, 1e-3));
+               Catch::Matchers::WithinRel(196.2, 1e-3));
   REQUIRE_THAT(peak_offered_per_s(text, "transcoded_store"),
-               Catch::Matchers::WithinRel(7890.0, 1e-3));
+               Catch::Matchers::WithinRel(9811.0, 1e-3));
   const auto sim = simsys::engine::Simulation::create(*g);
-  REQUIRE_FALSE(sim.has_value());
-  // Every node's type is simulated, and transcode_q (a message queue) runs; transcoders, the next
-  // node in the file, is a worker pool whose `then` steps (a 50 MB write to transcoded_store and a
-  // publish to completion_q) run in Task 7.
-  REQUIRE(sim.error().message ==
-          "node 'transcoders': a worker pool's then steps run in phase 2c's next step");
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+}
+
+// The scenario runs: its first second at the start of the day (00:00, three hours past the 21:00
+// peak: both clients at base x (1 + 0.6 cos 45 deg) = x 1.4243, 300/s x 1.4243 = 427.3/s, of which
+// 2 % are uploads: 8.55/s) offers the 400 transcoders (60 s a video: 6.667 jobs/s) more than they
+// drain. The pool drains its capacity, so completion_q and its handler are sent the DRAINED
+// 400 / 60 = 6.667 messages/s, not the 8.55/s that arrived (the steps from the third one on: the
+// European upload link delays its uploads by one step).
+TEST_CASE("book/youtube runs: the transcoders hand on what they drained, 6.667 jobs a second",
+          "[scenario]") {
+  using namespace std::chrono_literals;
+  const auto g = build_or_fail(
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml"));
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  simsys::engine::StepRecord last;
+  for (int i = 0; i < 10; ++i) last = sim->step(i * 100ms, 100ms);
+  const auto& transcoders = last.nodes[*g.index_of("transcoders")];
+  REQUIRE(transcoders.demand_per_s > 8.0);  // 8.55/s offered
+  REQUIRE_THAT(transcoders.drain_per_s, Catch::Matchers::WithinRel(400.0 / 60.0, 1e-9));
+  REQUIRE(transcoders.backlog > 0.0);  // the excess waits in the queue's room
+  REQUIRE_THAT(last.nodes[*g.index_of("completion_q")].demand_per_s,
+               Catch::Matchers::WithinRel(400.0 / 60.0, 1e-9));
+  REQUIRE_THAT(last.nodes[*g.index_of("completion_handler")].demand_per_s,
+               Catch::Matchers::WithinRel(400.0 / 60.0, 1e-9));
 }
 
 // Ch. 15's Google Drive built its graph with the new queue wiring (notify_q's two consumer groups,
 // notification_svc and backup_workers, each consume it and are linked from it), and its queue and
-// pools are simulated since Task 6. The engine now stops at long_poll, its ws_gateway: Simulation::
-// create checks every node's TYPE first (a first loop over the whole file) and only then which
-// nodes of a simulated type cannot run yet (the pools' `then` steps, Task 7), so the first
+// pools (with their `then` steps since Task 7) are simulated. The engine stops at long_poll, its
+// ws_gateway: Simulation::create checks every node's TYPE over the whole file, so the first
 // unsimulated type, long_poll (declared after the pools), is the one it names. Phase 3 brings
 // ws_gateway.
 TEST_CASE("book/google-drive is refused at long_poll, its ws_gateway", "[scenario]") {
@@ -393,10 +419,9 @@ TEST_CASE("book/google-drive is refused at long_poll, its ws_gateway", "[scenari
           "(phase 2)");
 }
 
-// Ch. 11's news feed: its fan-out queue and pool are simulated since Task 6, and the engine stops
-// at graph_db, its kv_cluster (phase 2c Task 10): the type check runs over the whole file before
-// the pool's `then` steps (Task 7) are looked at, so the first unsimulated type is the one named,
-// though graph_db is declared after the pool (the refusal used to be at fanout_q, before that).
+// Ch. 11's news feed: its fan-out queue and pool are simulated (Task 6, their `then` steps Task 7),
+// and the engine stops at graph_db, its kv_cluster (phase 2c Task 10): the first unsimulated type
+// is the one named (the refusal used to be at fanout_q, before the queue ran).
 TEST_CASE("book/news-feed is refused at graph_db, its kv_cluster, no longer at fanout_q",
           "[scenario]") {
   const auto g = build_or_fail(
@@ -439,12 +464,15 @@ TEST_CASE("byte-sized capacities are checked in MB per second", "[scenario]") {
   const auto original = check_line_of(youtube_text, "original_store");
   REQUIRE(original.contains("peak offered 2.88k MB/s (9.6/s) vs 5k MB/s"));
   REQUIRE(original.contains("(57.6%, green)"));
-  // transcoded_store: only the cdns' misses reach it on paper, 157.82 streams/s (printed to four
-  // digits, 157.8) x 50 MB = 7.891k MB/s of 10GB/s = 10k MB/s: at least 78.9 %, a lower bound
-  // (the transcoders' writes come through queues the paper load does not follow yet).
+  // transcoded_store: the cdns' misses, 157.82 streams/s x 50 MB = 7.891k MB/s, plus the
+  // transcoders' renditions the paper load follows since Task 7: 9.6 uploads/s offered to the
+  // pool (the paper load does not queue) x 4 renditions x 50 MB = 1.92k MB/s. In all 9.811k MB/s
+  // (196.22 requests/s) of 10GB/s = 10k MB/s: 98.1 %, red, and a complete number.
   const auto transcoded = check_line_of(youtube_text, "transcoded_store");
-  REQUIRE(transcoded.contains("peak offered 7.891k MB/s (157.8/s) vs 10k MB/s"));
-  REQUIRE(transcoded.contains("(≥78.9%; load not propagated:"));
+  REQUIRE(
+      transcoded.contains("peak offered 9.811k MB/s (196.2/s) vs 10k MB/s total capacity  "
+                          "(98.1%, red)"));
+  REQUIRE_FALSE(transcoded.contains("load not propagated"));
 
   const auto news = build_or_fail(
       load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml"));
@@ -454,6 +482,26 @@ TEST_CASE("byte-sized capacities are checked in MB per second", "[scenario]") {
   REQUIRE(check_line_of(news_text, "media_store")
               .contains("peak offered 64.86 MB/s (324.3/s) vs 1k MB/s total capacity  "
                         "(6.49%, green)"));
+}
+
+// Since plan 2c Task 7 explain's paper load follows a message queue into its consumers and a worker
+// pool's `then` steps, so no shipped scenario is marked "load not propagated" on account of a
+// queue or a pool: whatever mark remains names a type with no phase yet (notification_fanout,
+// frontier). The check reads each mark, the text from "load not propagated:" to the end of its
+// line.
+TEST_CASE("no shipped scenario's explain blames a message queue or a worker pool for missing load",
+          "[scenario]") {
+  const std::string key = "load not propagated:";
+  for (const auto& file : scenario_files()) {
+    CAPTURE(file);
+    const auto text = simsys::report::render_explain(build_or_fail(load_or_fail(file)));
+    for (auto at = text.find(key); at != std::string::npos; at = text.find(key, at + 1)) {
+      const auto mark = text.substr(at, text.find('\n', at) - at);
+      CAPTURE(mark);
+      REQUIRE_FALSE(mark.contains("message_queue"));
+      REQUIRE_FALSE(mark.contains("worker_pool"));
+    }
+  }
 }
 
 // The 2b "not checked" note for capacities converted from bytes is gone from every shipped

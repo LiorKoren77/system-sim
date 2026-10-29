@@ -639,60 +639,93 @@ TEST_CASE("the JSON's answered_per_s equals offered_per_s when nothing is droppe
 // The paper load (report.cpp: paper_pass / forward_steps) forwards load from a client's routes,
 // from a service or worker over its `ops` steps, through load balancers and rate limiters over
 // their links (graph::forwards_by_link) and from caches and CDNs on misses (hits_or_misses).
-// A message queue's consumers and a worker pool's `then` are not followed yet (phase 2c), so
-// the nodes that only they feed show 0 offered load: before this change, `0%, green`, a verdict
+// A notification fan-out's and a URL frontier's `then` are not followed (types with no phase yet),
+// so the nodes that only they feed show 0 offered load: before this change, `0%, green`, a verdict
 // on a number that is missing, not zero. A blob store's `then` is followed since plan 2c Task 4
 // (its steps are event notifications that fire for every request it serves, and its capacity
-// counts megabytes): what it notifies has its load and its verdict.
+// counts megabytes), and a message queue's deliveries and a worker pool's `then` since Task 7:
+// what they feed has its load and its verdict.
 
-TEST_CASE(
-    "explain follows youtube's blob store into transcode_q and marks what lies behind the "
-    "queues",
-    "[series]") {
+// Peak (21:00) of youtube: both clients at base x 1.6 (200 -> 320/s, 100 -> 160/s), 480/s in all,
+// of which 2 % are uploads: 9.6/s. original_store's event publishes one message per upload to
+// transcode_q, 9.6/s; the 400 transcoders (60 s each: 400 / 60 = 6.667 jobs/s) are OFFERED all of
+// it, since the paper load does not queue: 9.6 / 6.667 = 1.44, 144 %, red (the real run saturates
+// them and builds a backlog: README's "transcoders.workers: 200" lesson). Per job they publish one
+// message to completion_q (9.6/s of 1M/s: 0.00096 %), which completion_handler (4 workers at 5 ms
+// = 800/s) is offered: 9.6 / 800 = 1.2 %, green.
+TEST_CASE("explain follows youtube from the blob store through the queues and pools: no mark",
+          "[series]") {
   const auto text = explain_shipped("youtube");
   CAPTURE(text);
-  // original_store (blob_store) receives the uploads from the clients directly, and its `then`
-  // publishes each served upload to transcode_q (no factor): the 9.6 uploads/s of the evening
-  // peak (the original_store line's own "(9.6/s)") are transcode_q's offered load, against its
-  // 1M/s, and its verdict is a plain green: the blob store is no longer a blocking type.
+  REQUIRE_FALSE(text.contains("load not propagated"));
   const auto queue = check_line(text, "transcode_q");
   REQUIRE_FALSE(queue.empty());
   REQUIRE(queue.contains("peak offered 9.6/s"));
   REQUIRE(queue.contains("green"));
-  REQUIRE_FALSE(queue.contains("load not propagated"));
-  REQUIRE_FALSE(queue.contains("blob_store"));
-  // transcoders consume transcode_q, a message queue, which the paper load does not follow yet
-  // (Task 7); completion_handler sits behind completion_q behind the transcoders (worker pools,
-  // Task 7). None has a verdict, and none names the blob store any more: the mark lists the types
-  // whose onward flow is still missing, nearest first.
   const auto transcoders = check_line(text, "transcoders");
-  REQUIRE(transcoders.contains("(load not propagated: message_queue is phase 2c)"));
-  REQUIRE_FALSE(transcoders.contains("green"));
+  REQUIRE(transcoders.contains("peak offered 9.6/s vs 6.667/s total capacity"));
+  REQUIRE(transcoders.contains("(144%, red)"));
   const auto completion_q = check_line(text, "completion_q");
-  REQUIRE(
-      completion_q.contains("(load not propagated: worker_pool and message_queue are phase 2c)"));
-  REQUIRE_FALSE(completion_q.contains("green"));
+  REQUIRE(completion_q.contains("peak offered 9.6/s vs 1M/s total capacity  (0.00096%, green)"));
   const auto handler = check_line(text, "completion_handler");
-  REQUIRE(handler.contains("(load not propagated: message_queue and worker_pool are phase 2c)"));
-  REQUIRE_FALSE(handler.contains("green"));
+  REQUIRE(handler.contains("peak offered 9.6/s vs 800/s total capacity  (1.2%, green)"));
 }
 
-TEST_CASE("explain marks the google-drive consumers of notify_q, and keeps notify_q's verdict",
+// google-drive: api's upload_meta publishes to notify_q, 255.6/s at the peak (the line's own
+// number), and both groups consuming it are offered all of it. notification_svc (8 workers at
+// 1 ms = 8k/s): 255.6 / 8000 = 3.2 %, green; backup_workers (2 workers at 10 ms = 200/s):
+// 255.6 / 200 = 128 %, red; its `then` writes each message's 500 KB (the step's size, the book's
+// average file) to cold_storage: 255.6 x 0.5 MB = 127.8 MB/s of 200 MB/s, 63.9 %, green. None
+// is marked by a queue or a pool any more. long_poll (a ws_gateway) is fed by the notification
+// service's pushes too; whatever it still says about its own type, it blames no queue or pool.
+TEST_CASE("explain follows google-drive's notify_q into its consumers and the backup store",
           "[series]") {
   const auto text = explain_shipped("google-drive");
   CAPTURE(text);
-  // api (a service) forwards `publish` to notify_q over its ops steps: notify_q has its load
-  // and keeps its verdict. Its consumers are fed only through the queue.
   const auto queue = check_line(text, "notify_q");
+  REQUIRE(queue.contains("peak offered 255.6/s"));
   REQUIRE(queue.contains("green"));
   REQUIRE_FALSE(queue.contains("load not propagated"));
-  for (const auto* id : {"notification_svc", "backup_workers"}) {
-    CAPTURE(id);
-    const auto line = check_line(text, id);
-    REQUIRE_FALSE(line.empty());
-    REQUIRE(line.contains("(load not propagated: message_queue is phase 2c)"));
-    REQUIRE_FALSE(line.contains("green"));
-  }
+  const auto notifier = check_line(text, "notification_svc");
+  REQUIRE(notifier.contains("peak offered 255.6/s vs 8k/s total capacity"));
+  REQUIRE(notifier.contains(", green)"));
+  REQUIRE_FALSE(notifier.contains("load not propagated"));
+  const auto backup = check_line(text, "backup_workers");
+  REQUIRE(backup.contains("peak offered 255.6/s vs 200/s total capacity"));
+  REQUIRE(backup.contains(", red)"));
+  REQUIRE_FALSE(backup.contains("load not propagated"));
+  const auto cold = check_line(text, "cold_storage");
+  REQUIRE(cold.contains("peak offered 127.8 MB/s (255.6/s) vs 200 MB/s total capacity"));
+  REQUIRE(cold.contains("(63.9%, green)"));
+  REQUIRE_FALSE(cold.contains("load not propagated"));
+  const auto gateway = check_line(text, "long_poll");
+  REQUIRE_FALSE(gateway.contains("worker_pool"));
+  REQUIRE_FALSE(gateway.contains("message_queue"));
+}
+
+// news-feed: posts are 10 % of the peak, 2.162k/s (fanout_q's own line), and the 32 workers at 5 ms
+// (32 / 0.005 s = 6.4k jobs/s) are offered all of it: 2162 / 6400 = 33.8 %, green. Per job they
+// read graph_db once (2.162k/s of its 30k/s) and write 300 feed entries: 2.162k x 300 = 648.6k/s
+// at feed_cache, on top of its 12.97k/s of reads, far over its 100k/s: red, complete (no lower
+// bound, no mark). graph_db is a kv_cluster, whose nodes, replication and quorums are not modelled
+// until plan 2c Task 10, so it gets its load and "not checked", marked by its own type and no
+// queue or pool.
+TEST_CASE("explain follows news-feed's fanout pool into graph_db and the feed caches", "[series]") {
+  const auto text = explain_shipped("news-feed");
+  CAPTURE(text);
+  const auto fanout = check_line(text, "fanout");
+  REQUIRE(fanout.contains("peak offered 2.162k/s vs 6.4k/s total capacity  (33.8%, green)"));
+  REQUIRE_FALSE(fanout.contains("load not propagated"));
+  const auto graph_db = check_line(text, "graph_db");
+  REQUIRE(graph_db.contains(
+      "peak offered 2.162k/s vs 30k/s total capacity  (not checked: kv_cluster nodes, "
+      "replication and quorums: phase 3)"));
+  REQUIRE_FALSE(graph_db.contains("worker_pool"));
+  REQUIRE_FALSE(graph_db.contains("message_queue"));
+  const auto feed_cache = check_line(text, "feed_cache");
+  REQUIRE(feed_cache.contains("%, red)"));
+  REQUIRE_FALSE(feed_cache.contains("load not propagated"));
+  REQUIRE_FALSE(feed_cache.contains("≥"));
 }
 
 TEST_CASE("nodes the paper load does reach keep their verdict and are not marked", "[series]") {
@@ -781,59 +814,82 @@ TEST_CASE("a node linked from a notification fan-out but sent no step keeps its 
               .contains("(≥0.05%; load not propagated: notification_fanout is not modelled yet)"));
 }
 
-TEST_CASE("explain gives youtube's metadata_db a lower bound: the completion handler writes too",
+// metadata_db at the peak: api's metadata reads that miss the cache and its upload_meta writes
+// were 50.28 units/s (9.6 writes/s x 5 units = 48, plus the reads' 2.28); the completion handler
+// now writes once per message it is offered, 9.6/s, which is 9.6 x 5 = 48 more units: 98.28
+// units/s of 9k (3 replicas x 3k/s): 98.28 / 9000 = 1.092 %, green (it was a lower bound,
+// "≥0.559%"). metadata_cache gets the handler's 9.6 writes/s on top of api's 38.4 reads/s: 48/s
+// of 100k/s, 0.048 %.
+TEST_CASE("explain gives youtube's metadata_db and metadata_cache the completion handler's writes",
           "[series]") {
   const auto text = explain_shipped("youtube");
   CAPTURE(text);
-  // api's metadata reads and upload_meta writes reach metadata_db on paper (50.28 units/s of
-  // 9k/s: 0.559 %); the completion handler's writes come through worker pools and message
-  // queues, which the paper load does not follow yet (the blob store in front of them is followed
-  // since plan 2c Task 4). Each blocking type is named once, nearest first: completion_handler
-  // (worker_pool), completion_q (message_queue).
-  for (const auto* id : {"metadata_db", "metadata_cache"}) {
-    CAPTURE(id);
-    const auto line = check_line(text, id);
-    REQUIRE(line.contains("(≥"));
-    REQUIRE(line.contains("; load not propagated: worker_pool and message_queue are phase 2c)"));
-    REQUIRE_FALSE(line.contains("green"));
-  }
-  REQUIRE(check_line(text, "metadata_db").contains("(≥0.559%; load not propagated:"));
+  const auto db = check_line(text, "metadata_db");
+  REQUIRE(db.contains("peak offered 98.28 units/s vs 9k/s total capacity  (1.09%, green)"));
+  REQUIRE_FALSE(db.contains("≥"));
+  REQUIRE_FALSE(db.contains("load not propagated"));
+  const auto cache = check_line(text, "metadata_cache");
+  REQUIRE(cache.contains("peak offered 48/s vs 100k/s total capacity  (0.048%, green)"));
+  REQUIRE_FALSE(cache.contains("≥"));
+  REQUIRE_FALSE(cache.contains("load not propagated"));
 }
 
-// chat-system's message_store is a kv_cluster fed partly through the queues: its capacity gets
-// no verdict (kv_cluster nodes are not modelled, test_report), and its load is a lower bound. It
-// printed "(≥315%, red; ...)" before: a red verdict on the one-box capacity (review of c9d5f8c).
-TEST_CASE("explain gives chat-system's kv_cluster no verdict, and marks its load a lower bound",
+// chat-system's message_store is a kv_cluster whose capacity gets no verdict (kv_cluster nodes are
+// not modelled, test_report): its line says why. It printed "(≥315%, red; ...)" before: a red
+// verdict on the one-box capacity (review of c9d5f8c). Behind the message queue and the pools the
+// paper load follows since Task 7, nothing it says blames a queue or a pool any more.
+TEST_CASE("explain gives chat-system's kv_cluster no verdict and blames no queue or pool",
           "[series]") {
   const auto text = explain_shipped("chat-system");
   CAPTURE(text);
   const auto line = check_line(text, "message_store");
-  REQUIRE(
-      line.contains("(not checked: kv_cluster nodes, replication and quorums: phase 3)  "
-                    "(lower bound; load not propagated:"));
+  REQUIRE(line.contains("(not checked: kv_cluster nodes, replication and quorums: phase 3)"));
   REQUIRE_FALSE(line.contains(", red"));  // ("peak offered" contains "red")
   REQUIRE_FALSE(line.contains("%"));
+  REQUIRE_FALSE(line.contains("worker_pool"));
+  REQUIRE_FALSE(line.contains("message_queue"));
 }
 
 // Web crawler (ch. 9): the URL frontier hands URLs to the downloader along its `then` (a type
-// the model has no phase for yet), and the downloader, a worker pool, sends on along its own
-// (phase 2c). dns is behind both; the mark names each blocking type once, nearest first. The
+// the model has no phase for yet), and the downloader, a worker pool, sends on along its own,
+// which the paper load follows since plan 2c Task 7. dns is behind both, but only the frontier is
+// a type whose onward flow is missing: the mark names it and no longer the worker pool. The
 // frontier is reached by the seeds (50/s) and also fed back by url_seen's misses, which come
 // through the downloader and the frontier itself: a lower bound as well.
-TEST_CASE("explain names every blocking type on the way to a web-crawler node", "[series]") {
+TEST_CASE("explain names only the frontier on the way to a web-crawler node", "[series]") {
   const auto text = explain_shipped("web-crawler");
   CAPTURE(text);
-  REQUIRE(check_line(text, "dns")
-              .contains(
-                  "(load not propagated: worker_pool is phase 2c, frontier is not modelled yet)"));
-  // The downloader's own type is on its way too, round the loop (url_seen's misses re-enter
-  // the frontier, which hands them back to the downloader), but further than the frontier.
+  REQUIRE(check_line(text, "dns").contains("(load not propagated: frontier is not modelled yet)"));
   REQUIRE(check_line(text, "downloader")
-              .contains("(load not propagated: frontier is not modelled yet, worker_pool is "
-                        "phase 2c)"));
+              .contains("(load not propagated: frontier is not modelled yet)"));
   REQUIRE(check_line(text, "frontier")
-              .contains("(≥1%; load not propagated: worker_pool is phase 2c, frontier is not "
-                        "modelled yet)"));
+              .contains("(≥1%; load not propagated: frontier is not modelled yet)"));
+}
+
+// Two types with no phase yet on the way to one node are both named, nearest first, each once, in
+// one group as they stay unfollowed for the same reason (the web crawler no longer shows it: it has
+// one such type, since pools are followed). A
+// notification fan-out feeds a frontier that hands URLs to db, and nothing else reaches db.
+TEST_CASE("explain names every blocking type on the way to a node, nearest first", "[series]") {
+  Scenario s{.name = "two-blockers", .version = 1, .duration = 1s, .step = 100ms};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{10}}, .op_shares = {{"fire", 1.0}}}},
+      NodeSpec{.id = "fan",
+               .type = NodeType::notification_fanout,
+               .then = {simsys::model::Step{.to = "seeds", .op = "url"}}},
+      NodeSpec{.id = "seeds",
+               .type = NodeType::frontier,
+               .then = {simsys::model::Step{.to = "db", .op = "write"}}},
+      NodeSpec{.id = "db", .type = NodeType::service, .capacity = Rate{2000}}};
+  s.links = {LinkSpec{.from = "u", .to = "fan"}, LinkSpec{.from = "fan", .to = "seeds"},
+             LinkSpec{.from = "seeds", .to = "db"}};
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  REQUIRE(check_line(text, "db")
+              .contains("(load not propagated: frontier and notification_fanout are not modelled "
+                        "yet)"));
 }
 
 // ---- A link's bandwidth is a pipe: its rows in the series and the JSON (plan 2c Task 5) ----
@@ -1043,8 +1099,8 @@ std::string node_line_of(const std::string& text, const std::string& id) {
 
 // transcoders: 400 workers at 60 s a video = 400 / 60 s = 6.667 videos/s (it was the worker_pool
 // type's default 1k/s: 2 ms at c = 2). completion_handler: 4 workers at 5 ms = 4 / 0.005 s = 800/s.
-// The marks about load not followed through the queues stay until Task 7: only the capacity
-// figure moves here (README and schema quote `transcoders  peak offered 0/s vs 6.667/s`).
+// Only the capacity figure moves in Task 6 (README and schema quoted `transcoders  peak offered
+// 0/s vs 6.667/s`); Task 7 follows the load through the queues and fills in the offered one.
 TEST_CASE("explain checks youtube's transcoders against workers over cost: 6.667 a second",
           "[series]") {
   const auto text = explain_shipped("youtube");
