@@ -3882,3 +3882,77 @@ TEST_CASE("a worker pool waits in its queue: advanced.queue_limit is refused for
                    queue_and_pool("", "workers: 4, cost: 5ms, advanced: {queue_limit: 100}"),
                    "node 'w': a worker pool waits in its queue: set the queue's retention");
 }
+
+// ---- External sinks are typed (plan 2c refinement 8, Task 9) ----
+//
+// An external sink is a third party's API: the type's numbers (1k/s, 100 ms, service SCV 2.0) plus
+// the share of what it serves that FAILS. `failure_rate` is a number in [0, 1] (0.02: one request
+// in fifty gets a 5xx; the bounds themselves are meaningful, a provider that never fails and one
+// that is down) and `politeness` a rate (how often one host may be called: the crawler's
+// "1/s per host"). Both were accepted by name and ignored; now they are read into typed fields.
+// A sink has no downstream calls, so `then` and `ops` stay refused as for every type that
+// does not list them.
+
+TEST_CASE("an external sink's failure_rate and politeness are typed") {
+  const auto path = write_temp("simsys_sink_typed.yaml",
+                               scenario_with("  apns: {type: external_sink, latency: 150ms, "
+                                             "failure_rate: 0.02, politeness: 1/s}\n"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  const auto& sink = s->nodes[0];
+  CHECK_THAT(sink.failure_rate, Catch::Matchers::WithinRel(0.02, 1e-12));
+  REQUIRE(sink.politeness.has_value());
+  CHECK_THAT(sink.politeness->per_second, Catch::Matchers::WithinRel(1.0, 1e-12));
+  CHECK(*sink.latency == 150ms);  // the other keys of the node read as before
+}
+
+// An absent failure_rate is 0 (the plain queue), an absent politeness stays absent (explain
+// prints the note only for a stated one).
+TEST_CASE("an external sink that states neither key fails nothing and has no politeness") {
+  const auto path =
+      write_temp("simsys_sink_untyped.yaml", scenario_with("  api: {type: external_sink}\n"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  CHECK(s->nodes[0].failure_rate == 0.0);
+  CHECK_FALSE(s->nodes[0].politeness.has_value());
+}
+
+// The closed interval: 0 and 1 are both valid (a provider that never fails; one that is down).
+TEST_CASE("a failure_rate of exactly 0 or exactly 1 is accepted") {
+  for (const auto* rate : {"0", "1"}) {
+    CAPTURE(rate);
+    const auto path = write_temp(
+        "simsys_sink_rate_bounds.yaml",
+        scenario_with("  s: {type: external_sink, failure_rate: " + std::string{rate} + "}\n"));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    CHECK(s->nodes[0].failure_rate == std::stod(rate));
+  }
+}
+
+TEST_CASE("a failure_rate outside 0 to 1 is refused") {
+  for (const auto* rate : {"1.5", "-0.1"}) {
+    CAPTURE(rate);
+    require_rejected(
+        "simsys_sink_rate_range.yaml",
+        scenario_with("  s: {type: external_sink, failure_rate: " + std::string{rate} + "}\n"),
+        "node 's': failure_rate must be between 0 and 1");
+  }
+}
+
+// A sink calls nobody: neither `then` nor `ops` is among its keys, so the loader's existing
+// message for a key a type does not take applies (pinned here so that giving the sink behaviour
+// does not quietly open these keys).
+TEST_CASE("an external sink may not have then steps or ops") {
+  require_rejected("simsys_sink_then.yaml",
+                   scenario_with("  s: {type: external_sink, then: [{to: t, op: x}]}\n"
+                                 "  t: {type: service}\n"),
+                   "node 's': key 'then' is not valid for type 'external_sink'");
+  require_rejected("simsys_sink_ops.yaml",
+                   scenario_with("  s: {type: external_sink, ops: {send: [{to: t, op: x}]}}\n"
+                                 "  t: {type: service}\n"),
+                   "node 's': key 'ops' is not valid for type 'external_sink'");
+}
