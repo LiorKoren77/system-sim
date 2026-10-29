@@ -2528,6 +2528,27 @@ CheckResult read_message_queue_keys(const Site& site, const YAML::Node& body,
   });
 }
 
+// ---- Search index keys (plan 2c refinement 10) ----
+//
+// A search index (ch. 13's trie database) serves like a service, so its capacity, latency and
+// replicas are read as a service's; `build_interval` is the one key it owns.
+
+// `build_interval: 24h`: how often the index is rebuilt from the aggregated query logs, a positive
+// duration (an interval of 0 would be a rebuild that never stops). Stored and printed, not
+// modelled: the rebuild's load and the freshness of the answers are ignored. Absent stays absent.
+CheckResult read_search_index_keys(const Site& site, const YAML::Node& body,
+                                   model::NodeSpec& node) {
+  if (node.type != model::NodeType::search_index || !body["build_interval"]) return {};
+  const auto this_node = node_site(site, node.id);
+  auto interval = parse_duration_key(this_node, body, "build_interval");
+  if (!interval) return std::unexpected(interval.error());
+  if (interval->count() <= 0) {
+    return this_node.fail(body["build_interval"], "build_interval must be positive");
+  }
+  node.build_interval = *interval;
+  return {};
+}
+
 // `workers: 400`, required: the pool's c, a positive integer with the bound of every c
 // (defaults::max_concurrency: Erlang C costs O(c) per step, as advanced.concurrency).
 CheckResult read_workers(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
@@ -2773,6 +2794,7 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
     if (auto read = read_worker_pool_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_external_sink_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_kv_cluster_keys(site, entry.second, *node); !read) return read;
+    if (auto read = read_search_index_keys(site, entry.second, *node); !read) return read;
     ++node;
   }
   return {};

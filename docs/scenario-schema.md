@@ -77,6 +77,7 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `cdn` | a fixed or `che` hit ratio (or none: every read misses), misses fetched from its `origin`, see [`cdn`](#cdn); with a byte `capacity` it counts megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)) |
 | `blob_store` | every op, counting megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)): its queue waits for whole objects, a write (`write_ops`) is answered at its last byte, a read at its first megabyte; `then` steps as asynchronous event notifications (see [Node types](#node-types)) |
 | `id_generator` | as a `service` whose capacity and service time its `algorithm` supplies, see [`id_generator`](#id_generator) |
+| `search_index` | as a `service` with no steps and the type's 5k/s and 5 ms unless stated; `build_interval` stored and printed, see [`search_index`](#search_index) (phase 2c) |
 | `message_queue` | the broker's append, every message copied to each consumer group, the publisher answered at the append (phase 2c, see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
 | `worker_pool` | M/M/c over consumption, `workers / cost` jobs a second, its room its queue's `retention`; its `then` steps fire for every job it drains, nobody waiting for them (phase 2c, same section) |
 | `external_sink` | a third party's API: a queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) that fails `failure_rate` of what it serves, counted as drops (phase 2c, see [Node types](#node-types)) |
@@ -87,7 +88,7 @@ Everything else is refused before the first step, with exit code 1:
 | what | message | runs from |
 |---|---|---|
 | `ws_gateway`, `service_discovery` | `node 'x' has type 'ws_gateway', which run/estimate do not support yet (phase 2)` | 3 |
-| `search_index`, `notification_fanout`, `frontier` | the same message | not yet assigned to a phase |
+| `notification_fanout`, `frontier` | the same message | not yet assigned to a phase |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
 | `faults` | none: the list is accepted and nothing happens | 3 |
 
@@ -95,11 +96,11 @@ The type message says "(phase 2)" for every type; the last column is the plan. T
 runs over the whole file first, and names the first node in file order whose type cannot run;
 only then are the nodes of runnable types checked (a CDN's `keys`), in file order: google-drive
 is refused at its `ws_gateway`, `long_poll`, the first type it has no model of. Of the 14
-shipped scenarios nine run: `tutorial/hello`, `tutorial/chain`, `labs/rate-limiter`,
+shipped scenarios ten run: `tutorial/hello`, `tutorial/chain`, `labs/rate-limiter`,
 `labs/consistent-hashing`, `labs/unique-id` (which fails its `drop_rate` SLO on purpose, exit 2),
 `book/url-shortener`, since phase 2c Task 7 `book/youtube` (its README numbers are Task 16's),
-and since Task 10 `labs/kv-store` and `book/news-feed` (which runs its day and fails its
-`drop_rate` SLO, exit 2, until Task 17 sizes it).
+since Task 10 `labs/kv-store` and `book/news-feed` (which runs its day and fails its
+`drop_rate` SLO, exit 2, until Task 17 sizes it), and since Task 11 `book/search-autocomplete`.
 
 **`estimate` versus `explain`.** `estimate` evaluates the long-run state once, at
 t = 0 (00:00): the rate curve's value there, without noise. Its first line says so:
@@ -286,7 +287,7 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `message_queue` | `partitions`, `retention` | read and run (phase 2c), see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool); `partitions` printed, not modelled |
 | `worker_pool` | `consumes` (queue node id, required), `workers`, `cost` (duration per job), `then` | `consumes`, `workers`, `cost` and `then` read and run (phase 2c), same section: the steps fire for every job it drains, `on: miss` and `on: failure` refused |
 | `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every **write** the store serves (an op in its `write_ops`; not one it drops) sends `factor` requests of the step's op to its target, and a read sends nothing (S3 notifies on ObjectCreated and ObjectRemoved, never on a GET: 1000 views/s of a video start no transcode; notifying on reads is phase 3). They are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. A step `on: miss` (`node 'store': a blob store's then steps fire for every write it stores (on: miss needs a cache)`) or `on: failure` (`... (on: failure: an event reports no failure before phase 3)`) is refused, and so is any `mode` (`node 'store': a blob store's then steps are event notifications nobody waits for (mode orders the calls a request waits for)`); an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, the delivery delay (an event arrives after the link's latency), failed notifications |
-| `search_index` | `build_interval` | ignored |
+| `search_index` | `build_interval` (positive duration) | read and run (phase 2c), see [`search_index`](#search_index); `build_interval` printed, not modelled |
 | `ws_gateway` | `max_connections`, `heartbeat` (duration), `fanout` (avg recipients per message), `ops` | `ops` checked as step lists; others ignored; phase 3 |
 | `service_discovery` | `failover` (duration) | ignored; phase 3 |
 | `id_generator` | `algorithm` `snowflake|ticket_server|uuid` (required) | read and run (phase 2b), see [`id_generator`](#id_generator) |
@@ -777,6 +778,16 @@ design)`, `algorithm=ticket_server (one database: 1k/s, spec §6 writes)`, `algo
 writes)`), and checks the peak load against replicas × capacity (`vs 12.29M/s total
 capacity` for three snowflake machines). The [unique-id lab](../scenarios/labs/unique-id/)
 compares the ticket server with snowflake.
+
+### `search_index`
+
+Book ch. 13, "Design a search autocomplete system" (plan 2c refinement 10). A search index is
+**served like a service**: no steps, `replicas` copies of the type's 5k/s and 5 ms (chosen: an
+inverted-index query) unless the scenario states its own `capacity` and `latency`, resolved as for
+any node. `build_interval` (a positive duration, `build_interval: 24h`) is stored and printed by
+`explain` as `build_interval=24h (rebuild load not modelled)`; the rebuild's load on the index and
+the freshness of its answers between rebuilds are ignored. `ops` stays refused: an index answers a
+query and calls nobody.
 
 ### `message_queue` and `worker_pool`
 

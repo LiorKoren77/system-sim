@@ -1306,6 +1306,15 @@ struct QueueProvenance {
   return text;
 }
 
+// A search index's rebuild (plan 2c refinement 10, book ch. 13): "  build_interval=24h (rebuild
+// load not modelled)", only when the scenario states one. The index serves like a service; how
+// often it is rebuilt from the aggregated logs is stored and printed, and the line says the
+// rebuild's load (and the freshness of the answers between rebuilds) is not part of the model.
+[[nodiscard]] std::string search_index_summary(const model::NodeSpec& spec) {
+  if (spec.type != model::NodeType::search_index || !spec.build_interval) return {};
+  return "  build_interval=" + fmt_duration(*spec.build_interval) + " (rebuild load not modelled)";
+}
+
 // An external sink's model (plan 2c refinement 8): "  failure_rate=2% politeness=1/s (not
 // modelled: phase 3)". The failure rate is always printed (0% is the plain queue): the share of
 // what the sink serves that fails, which a run counts as drops. Politeness only when the scenario
@@ -1333,7 +1342,7 @@ struct QueueProvenance {
                        limiter_summary(node.spec) + cache_summary(g, i) + cdn_summary(g, i) +
                        database_summary(node) + id_generator_summary(node.spec) +
                        message_queue_summary(node.spec) + worker_pool_summary(node) +
-                       external_sink_summary(node.spec)}});
+                       external_sink_summary(node.spec) + search_index_summary(node.spec)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }
