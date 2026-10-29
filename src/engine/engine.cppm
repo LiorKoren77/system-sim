@@ -544,7 +544,7 @@ struct Overloaded : Fs... {
   return type == client || type == service || type == load_balancer || type == rate_limiter ||
          type == cache || type == sql_db || type == cdn || type == id_generator ||
          type == blob_store || type == message_queue || type == worker_pool ||
-         type == external_sink || type == kv_cluster;
+         type == external_sink || type == kv_cluster || type == search_index;
 }
 
 // Why a cache cannot run, if it cannot: a scenario built in code left it without a number or
@@ -946,6 +946,11 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
       return make_database(behaviours::SqlDbBehaviour{g, index}, resolved);
     // An id generator (plan 2b refinement 6) is a service whose capacity and service time its
     // algorithm supplied at build (defaults::defaults_of): no behaviour of its own.
+    // A search index (plan 2c refinement 10; book ch. 13's trie database) is service sugar in
+    // the same way: a service with no steps and the type's numbers (5k/s, 5 ms) unless the
+    // scenario states its own. Serving is read-mostly, so nothing else is modelled; its
+    // `build_interval` is stored and printed, and the rebuild's load is ignored.
+    case model::NodeType::search_index:
     case model::NodeType::id_generator:
     default:  // create() admitted only simulated types: the rest are services
       return make_server(behaviours::ServiceBehaviour{g, index}, resolved);

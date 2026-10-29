@@ -19,10 +19,10 @@ clients' keys; every write strategy including write-back; `then` steps), SQL dat
 primary and read replicas, shards, a connection pool, replication lag and staleness), CDNs
 that fetch their misses from an origin, and id generators (snowflake, ticket server, uuid).
 Refused requests are counted apart from dropped ones (`reject_rate`), and a request counts
-as answered unless it was refused or dropped. Nine scenarios run end to end, the
+as answered unless it was refused or dropped. Ten scenarios run end to end, the
 [URL shortener](scenarios/book/url-shortener/) of ch. 8 among them (list below); the other
-five book systems validate and `explain`, waiting for the rest of phase 2c (search indexes,
-`sweep`) and phase 3. The scenario language is
+four book systems validate and `explain`, waiting for the rest of phase 2c (`sweep`) and
+phase 3. The scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.3).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
@@ -196,9 +196,11 @@ message copied to each consumer group, the slowest group's lag reported and chec
 `queue_lag` SLO) and worker pools (M/M/c at workers / cost, waiting in their
 queue's retention; their `then` steps fire for every job they drain, and nobody waits for them)
 external sinks (a third party's API at the type's 1k/s and 100 ms, failing its `failure_rate`
-of what it serves, counted as drops) and key-value clusters (ch. 6's Dynamo-style store: `nodes`
+of what it serves, counted as drops), key-value clusters (ch. 6's Dynamo-style store: `nodes`
 machines on a ring whose hottest machine is its own queue, every request sent to N replicas,
-answered at the W-th or R-th fastest). These nine scenarios run end to end:
+answered at the W-th or R-th fastest) and search indexes (ch. 13's trie database, served like a
+service at the type's 5k/s and 5 ms; its rebuild is not modelled). These ten scenarios run end to
+end:
 
 - [`tutorial/hello`](scenarios/tutorial/hello/), [`tutorial/chain`](scenarios/tutorial/chain/):
   one service, then two in a chain: the queueing basics.
@@ -225,8 +227,12 @@ answered at the W-th or R-th fastest). These nine scenarios run end to end:
   the 300 feed writes of every post and saturates all day, the other caches and the database
   saturate at the peaks, and 67.6 % of the work is dropped: its drop-rate SLO fails (exit 2)
   until the README's sizing (plan 2c Task 17).
+- [`book/search-autocomplete`](scenarios/book/search-autocomplete/): ch. 13 over 24 hours at
+  24k keystrokes/s (peak 36k/s): browser cache, a Che-sized trie cache (h = 0.995) in front of a
+  4-replica search index, and the query-log pipeline. Both SLOs pass (suggest p99 6.86 ms of
+  100 ms, nothing dropped); the log aggregators run at 90 % of their capacity at the peak.
 
-Every other node type (search indexes, WebSocket gateways, ...) already validates and appears in
+Every other node type (WebSocket gateways, ...) already validates and appears in
 `explain` with its resolved numbers, but `estimate` and `run` stop with "which run/estimate do
 not support yet (phase 2)" and exit 1. A `sweep` command
 (`--param nodes.users.rate.base=1k/s..100k/s:10`) is planned for phase 2c.

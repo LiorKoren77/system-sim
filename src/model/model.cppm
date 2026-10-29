@@ -590,6 +590,15 @@ struct NodeSpec {
   std::optional<int> write_quorum{};
   std::optional<int> read_quorum{};
   KvMode kv_mode{KvMode::ap};
+  // Search indexes only (plan 2c refinement 10; declared after the kv keys, for designated
+  // initializers): book ch. 13 ("Design a search autocomplete system") keeps its trie database
+  // fresh by rebuilding it periodically from the aggregated query logs, and `build_interval` says
+  // how often (search-autocomplete: 24h). Serving is read-mostly, so a search index runs as
+  // a service (engine::Simulation::make_node); the interval is stored and printed by explain, and
+  // absent means "not stated", never zero (the loader refuses a zero). Ignored: the rebuild's
+  // own load on the index and on the aggregators, and the freshness of the answers (a query
+  // typed after the last rebuild still finds the old trie).
+  std::optional<SimTime> build_interval{};
   std::optional<Workload> workload{};  // clients only
 };
 
