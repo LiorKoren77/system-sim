@@ -93,10 +93,14 @@ warmup).
 - Cache invalidation details (links are immutable, so there are none). The hit ratio is the
   warm steady state from the start: no cold cache after a deploy.
 - Storage: 365B rows and their bytes are not counted; shards are sized by write throughput.
-- How a request's steps depend on each other: each step of an op gets its share of the op's
-  traffic independently. With a ticket server that drops ids (below), the database still
-  receives every `shorten`'s write, where a real web server would not insert a row without an
-  id. A redirect's miss step does depend on the cache (`on: miss`).
+- How a request's steps depend on each other, partly. A step after a failed step does not run:
+  `shorten`'s database write is sent only the shortens whose id was issued (with a ticket server
+  that drops ids, below, url_db's writes fall by its drop rate), and a redirect's miss step goes
+  only to the cache's misses (`on: miss`). But the model is a fluid: "did not run" is a smaller
+  flow, worked out from the fraction the earlier step delivered in the PREVIOUS simulation step
+  (1 s here), so a change of loss reaches the database one step late, and the steps are assumed
+  to fail independently of one another. A failed request costs nothing more: no retry, no
+  timeout spent waiting.
 - The client's 1 s timeout does not cut latencies short: a response slower than that is
   still counted, not turned into a retry or an error.
 - Percentiles are estimated (a lognormal fitted to the mean and variance), and the SLOs are
@@ -121,9 +125,13 @@ warmup).
   auto-increment database, ch. 7; the loader refuses `replicas: 2` for a ticket server): the
   write path gets a hot spot. `explain`: `id_gen  peak offered 1.728k/s vs 1k/s total
   capacity (173%, red)`. In the run it is red for 15.5 h of the day (55,650 s), drops 22.96M
-  id requests (drop rate 0.2309), and `shorten` takes 669 ms on average, p99 2.42 s.
-  Redirects never touch it (p99 still 7.49 ms), so the redirect SLO passes and drop_rate
-  fails (exit 2). Snowflake's 4.096M ids/s per machine is why the book picks it.
+  id requests (drop rate 0.2309), and `shorten` takes 669 ms on average, p99 2.42 s. A shorten
+  whose id was not issued is never written: url_db commits 295.5 writes/s per shard over the
+  day instead of 384.2, the snowflake run's figure × (1 − 0.2309), and its busiest copy peaks at
+  rho 0.4029 instead of 0.6455 (the ticket server caps the writes at its 1k ids/s). Redirects
+  never touch the ticket server (p99 7.44 ms, a little under the shipped 7.49 ms: the replicas
+  replay fewer writes), so the redirect SLO passes and drop_rate fails (exit 2). Snowflake's
+  4.096M ids/s per machine is why the book picks it.
 - Remove the `limiter` and add a spike `{at: 14:00, for: 5m, factor: 5}`: the two runs are
   in "The rate limiter's role" above.
 - `shards: 2` on `url_db`: the replicas go red at the peak (96.8 %), yet the SLOs pass (p99

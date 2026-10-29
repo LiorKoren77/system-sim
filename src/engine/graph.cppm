@@ -1539,7 +1539,7 @@ void add_op_step_hops(const Graph& g, const model::NodeSpec& spec, std::string_v
     const auto target = *g.index_of(step.to);  // connect_step resolved every target
     switch (step.on) {
       case model::StepCondition::failure:
-        continue;
+        continue;  // never fires before phase 3; see the size walk's phase 3 note
       case model::StepCondition::always:
         lookup = hits_or_misses(g.nodes()[target].spec.type) ? std::optional{target} : std::nullopt;
         hops.push_back({.to = target, .op = step.op, .size = step.size});
@@ -1737,6 +1737,13 @@ void walk_client_keys(const Graph& g, std::size_t client,
 //
 // Assumed: one size per (node, op) (refinement 1: each op's size is its mean; a flow that
 // carries bytes per op is phase 3).
+//
+// Phase 3 note (review of plan 2c Task 5, M-5; recorded with Task 12): the walk skips `on:
+// failure` steps (call_hops leaves them out through add_op_step_hops, and add_sized_step_seed
+// seeds none), because they never fire before phase 3. So an unsized `on: failure` step over a
+// bandwidth link is never priced: its (node, op) has no size, and the link's pipe has no
+// megabytes for the op. Once failure steps fire, engine::megabytes_of would throw on the first
+// such request. Whoever makes them fire walks them for sizes too (or refuses them over a pipe).
 
 // A vertex of the size walk: `op` at `node`, `size` bytes long (unsized when empty), its size
 // set (or left unset) by `origin`, a client or the node of a step.

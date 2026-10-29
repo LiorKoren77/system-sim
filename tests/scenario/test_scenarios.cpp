@@ -509,9 +509,13 @@ TEST_CASE("book/news-feed is accepted by the engine now that its kv_cluster is s
 }
 
 // The news feed runs: in its first second (00:00, the curve at 1.3 x its 10k/s base: 13k/s, a
-// tenth of it posts) every post the web tier takes is one job for the fan-out pool, which reads
-// graph_db once per drained job. The pool's 32 workers at 5 ms drain up to 6.4k jobs/s, far above
-// the ~1.3k/s offered, so every job is drained, and the 6-node, N = 3 cluster is sent three
+// tenth of it posts, ~1.3k/s) every post the web tier takes is first written to post_db, and only
+// a post post_db wrote is published (plan 2c Task 12: a step after a failed step does not run).
+// post_db's primary takes 5k units/s at 5 units a write (defaults::sql_write_cost): 1k writes/s,
+// so it drops the rest and one fan-out job per WRITTEN post reaches the pool: 1.3k/s x (1k / 1.3k)
+// = 1k jobs/s (999.997/s at the 20th step: the curve has moved a little from 00:00), where it was
+// 1.3k/s while every post was published. The pool's 32 workers at 5 ms drain up to 6.4k jobs/s, so
+// every job is drained and read graph_db once, and the 6-node, N = 3 cluster is sent three
 // replica-requests per job: its demand is exactly 3 x what the pool drained.
 TEST_CASE("book/news-feed runs: graph_db is sent three replica-requests per fan-out job",
           "[scenario]") {
@@ -524,7 +528,8 @@ TEST_CASE("book/news-feed runs: graph_db is sent three replica-requests per fan-
   for (int i = 0; i < 20; ++i) last = sim->step(i * 100ms, 100ms);
   const auto& fanout = last.nodes[*g.index_of("fanout")];
   const auto& graph_db = last.nodes[*g.index_of("graph_db")];
-  REQUIRE(fanout.drain_per_s > 1000.0);  // about 1.3k jobs/s at the start of the day
+  // post_db's 1k writes/s: the posts it wrote (1e-4: the step's survival is the step before's)
+  REQUIRE_THAT(fanout.drain_per_s, Catch::Matchers::WithinRel(1000.0, 1e-4));
   REQUIRE_THAT(graph_db.demand_per_s, Catch::Matchers::WithinRel(3.0 * fanout.drain_per_s, 1e-6));
   REQUIRE(graph_db.dropped_per_s == 0.0);  // 3.9k of 180k replica-requests/s
 }
@@ -1229,10 +1234,13 @@ DayTotals run_day(const simsys::model::Scenario& s) {
 
 }  // namespace
 
-// The tolerance is 0.5 %: the engine reads the ticket server's fraction one step (1 s) late, so
+// The tolerance is 1e-6: the engine reads the ticket server's fraction one step (1 s) late, so
 // each second's writes are thinned by the previous second's survival. The daily wave moves the
-// fraction by a tiny amount in a second, and the very first second sends everything, so the lag
-// should cost far less than that; 0.5 % is a loose bound that the implementation may tighten.
+// fraction by a tiny amount in a second (and the very first second, which sends everything, is
+// at the day's low, where the ticket server drops nothing), and what the lag adds on the rising
+// half of the wave it takes back on the falling half: measured, the two sides differ by 7.3e-10
+// (0.76930846643 vs 0.76930846587), so 1e-6 keeps a factor of 1000 for rounding. It was 0.5 %
+// in the red commit, a loose bound for a lag nobody had measured yet.
 TEST_CASE(
     "book/url-shortener with a ticket server sends url_db only the shortens whose id was issued",
     "[scenario]") {
@@ -1248,5 +1256,5 @@ TEST_CASE(
   REQUIRE(ticket.id_gen_drop_rate() > 0.1);
   // The relation: url_db is sent what id_gen issued.
   REQUIRE_THAT(ticket.url_db_demand / snowflake.url_db_demand,
-               Catch::Matchers::WithinRel(1.0 - ticket.id_gen_drop_rate(), 5e-3));
+               Catch::Matchers::WithinRel(1.0 - ticket.id_gen_drop_rate(), 1e-6));
 }

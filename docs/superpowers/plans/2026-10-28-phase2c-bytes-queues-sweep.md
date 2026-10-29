@@ -250,9 +250,40 @@
 
 **Files:** `src/engine/behaviours.cppm` (the `NodeBehaviour` concept's `route(in, now, dt, delivered_last_step)` takes a `FractionLookup`; `detail::HopBlocks` thins each block's flow by the survival of the blocks before it), `src/engine/engine.cppm` (`forward_pass` passes last step's `delivered_of`), `scenarios/book/url-shortener/README.md` (the "How a request's steps depend on each other" bullet and the ticket-server item), tests in `test_behaviours.cpp`, `test_theory.cpp`, `test_scenarios.cpp`.
 
-- [ ] Tests (theory): a client at 1k/s → a 10k/s service with steps `[{to: a}, {to: b}]`, `a` of capacity 500/s and `queue_limit: 1` (delivering 0.5): `b`'s demand is **500/s** from the second step on (1k/s in the first: one step late), and `estimate` settles at 500/s; `[{to: a, mode: parallel}, {to: b, mode: parallel}, {to: c}]` with `a` at 0.5 and `b` at capacity 800 of 1k (0.8): `c` receives **400/s**, the client's answered 400/s; a miss block: `[cache read (h = 0.8), {to: db, on: miss} delivering 0.5, {to: x}]` sends `x` 0.8 + 0.2 × 0.5 = **0.9** of the rate; a worker's sequential `then` steps thin the same way; every test of a path with no losses is unchanged. Scenario: the url-shortener ticket-server variant (`id_gen: {type: id_generator, algorithm: ticket_server, replicas: 1}`) now sends `url_db` only the shortens whose id was issued: its write demand over the day falls by the ticket server's drop rate (0.2309 in the README run); the README's two bullets are rewritten with the measured numbers.
+- [x] Tests (theory): a client at 1k/s → a 10k/s service with steps `[{to: a}, {to: b}]`, `a` of capacity 500/s and `queue_limit: 1` (delivering 0.5): `b`'s demand is **500/s** from the second step on (1k/s in the first: one step late), and `estimate` settles at 500/s; `[{to: a, mode: parallel}, {to: b, mode: parallel}, {to: c}]` with `a` at 0.5 and `b` at capacity 800 of 1k (0.8): `c` receives **400/s**, the client's answered 400/s; a miss block: `[cache read (h = 0.8), {to: db, on: miss} delivering 0.5, {to: x}]` sends `x` 0.8 + 0.2 × 0.5 = **0.9** of the rate; a worker's sequential `then` steps thin the same way; every test of a path with no losses is unchanged. Scenario: the url-shortener ticket-server variant (`id_gen: {type: id_generator, algorithm: ticket_server, replicas: 1}`) now sends `url_db` only the shortens whose id was issued: its write demand over the day falls by the ticket server's drop rate (0.2309 in the README run); the README's two bullets are rewritten with the measured numbers.
   Note (review of Task 5, M-5): the size walk skips `on: failure` steps (they never fire before phase 3), so an unsized `on: failure` step over a bandwidth link is never priced; once failure steps fire, `engine::megabytes_of` would throw on it. Whoever makes them fire walks them for sizes too (or refuses them over a pipe).
-- [ ] Commit `nodes: a request stops at its first failed step; parallel groups fail as a whole`
+- [x] Commit `nodes: a request stops at its first failed step; parallel groups fail as a whole`
+  Resolution notes: Mechanism as planned. The `NodeBehaviour` concept requires `route(in, now, dt,
+  delivered_last_step)` with a `FractionLookup`; the engine's `forward_pass` passes
+  `hop_delivered(caller, target, op)`, which at that point still holds the previous evaluation's
+  delivered fractions (and a pipe's previous `passed`). `detail::HopBlocks::forward` thins: a
+  sequential block is sent the survivors S and multiplies S by its survival 1 − f × (1 − Π d)
+  (written so it is exactly 1 with no loss; `delivered` now uses the same helper); inside a block
+  hop j is sent S × f × Π_{i<j} d; asynchronous hops survive as 1. Decided (the plan left it
+  open): since all parallel steps of an op form one group wherever they sit, the group starts at
+  its FIRST member, every member is sent the S there, and from that point S is multiplied by the
+  whole group's survival (unit test `a parallel group starts where its first member sits and thins
+  every step after it`: [a ∥, s, b ∥, c] sends a, b 100, s 40, c 36). Service, cache (and CDN
+  through it), blob store and worker pool route with a `template <FractionLookup Lookup =
+  NothingLost>` head and a defaulted last argument, so the 59 unit-test calls of the three-argument
+  form stay as they were (`NothingLost` has a C++23 static `operator()`); the six behaviours with
+  nothing to thin (balancer, limiter, SQL, queue, external sink, kv) keep their three-argument
+  route and gain a four-argument overload that ignores the lookup. A rate limiter's counter check
+  does not thin its admitted flow (its admission is its own state). `estimate`'s comment no longer
+  claims demand only rises; explain's paper load stays unthinned (an upper bound, said in
+  report.cpp). The size-walk note (M-5) is in graph.cppm's size-walk section. Numbers: the
+  url-shortener ticket-server variant commits 295.5 writes/s per shard instead of 384.2 (× (1 −
+  0.2309)), url_db peak rho 0.6455 → 0.4029, redirect p99 7.49 → 7.44 ms; the scenario test's
+  ratio is off by 7.3e-10 (the lag's rising and falling halves cancel over the day), so its
+  tolerance went from 0.5 % to 1e-6. Of the ten runnable scenarios only news-feed's `run`,
+  JSON and `estimate` changed (the others have no loss before a later step: rate-limiter rejects
+  at a split, unique-id's client calls the ticket server directly, youtube drops nothing): drop
+  rate 0.6761 → 0.5987, read_feed p99 103 → 90.3 ms, post_cache/user_cache mean rho 0.865/0.863 →
+  0.476/0.465 (a feed read whose feed_cache lookup was dropped hydrates nothing), and `fanout`
+  drains the posts post_db wrote, at most its primary's 1k writes/s; re-quoted in its README and
+  the root README; its pin `fanout.drain_per_s > 1000` became `1000 ± 1e-4` (999.997). 1049 tests
+  (one unit test added); green in Debug and Release except Task 13's 13 red tests (its red commit
+  37ece9b sits under this one).
 
 ---
 
