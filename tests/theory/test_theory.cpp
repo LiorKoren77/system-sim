@@ -4717,3 +4717,196 @@ TEST_CASE("a search index steps exactly as the service of the same keys", "[theo
     REQUIRE(a.responses[0].answered.per_second == b.responses[0].answered.per_second);
   }
 }
+
+// ---- A step after a failed step does not run (plan 2c refinement, Task 12) ----------------------
+//
+// A request is answered only if every step of its op was; so a step that comes after one the
+// request already failed never fires. The flow sent on step k is
+//     rate x fraction x factor x S_k,
+// where S_k is the product of the delivered fractions d of the steps before it (d = what the
+// target answered: 1 minus the share its drops, and everything it called in turn, lost):
+//  - sequential steps thin one another:     S_k = d_1 x d_2 x ... x d_(k-1);
+//  - a parallel group fails as a whole:     its survivors product d_a x d_b multiplies what
+//  follows,
+//    while its own members are all sent the full flow (they start together);
+//  - a miss block (`on: miss` after a cache lookup) thins only its miss share: of every request,
+//    h hit and are done, 1 - h missed and go on to the block, so the block's survivors are
+//    h + (1 - h) x d_block.
+// The model ignores the order inside a request in time: it is a fluid, so "does not run" is a
+// smaller flow. Its one blind spot is the engine's step lag: the fraction a step reads is the one
+// the targets reported at the END OF THE LAST simulation step, so the first step still sends the
+// full flow and the thinned flow arrives from the next ones on (the targets of the tests below
+// report their steady fraction after a few steps, so every test reads the last record).
+//
+// Numbers, from one picture: a client sends 1000 x/s to svc (10k/s, nowhere near its limit), whose
+// op `x` calls the nodes below. A target with `capacity` units/s and a room of ONE request drains
+// `capacity` of what it is offered and drops the rest, so it delivers capacity / offered:
+//   a: 500/s of 1000 offered  -> 0.5          b: 800/s of 1000 -> 0.8
+// (Node indices: u 0, svc 1, then the targets in the order given.)
+
+namespace {
+// A service that drains `capacity_per_s` a second and keeps one request waiting: past that it
+// drops, so under a steady overload its delivered fraction is capacity / offered.
+NodeSpec lossy_target(std::string id, double capacity_per_s) {
+  return NodeSpec{.id = std::move(id),
+                  .type = NodeType::service,
+                  .capacity = Rate{capacity_per_s},
+                  .latency = 1ms,
+                  .advanced = {.queue_limit = 1}};
+}
+
+// u (1000/s of `x`) -> svc (10k/s) -> `targets`, all links of zero latency so that what a step
+// sends arrives in the same simulation step; svc's op `x` runs `steps`.
+Scenario steps_chain(std::vector<Step> steps, std::vector<NodeSpec> targets) {
+  Scenario s{.name = "steps-chain", .version = 1, .duration = 2s};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"x", 1.0}}}},
+      NodeSpec{.id = "svc",
+               .type = NodeType::service,
+               .capacity = Rate{10'000},
+               .latency = 1ms,
+               .ops = {{"x", std::move(steps)}}}};
+  s.links = {LinkSpec{.from = "u", .to = "svc", .latency = 0s}};
+  for (auto& target : targets) {
+    s.links.push_back(LinkSpec{.from = "svc", .to = target.id, .latency = 0s});
+    s.nodes.push_back(std::move(target));
+  }
+  return s;
+}
+
+// A request-counting service that never loses anything: the node a thinned flow ends at.
+NodeSpec plain_target(std::string id) {
+  return NodeSpec{
+      .id = std::move(id), .type = NodeType::service, .capacity = Rate{100'000}, .latency = 1ms};
+}
+
+double demand_at(const simsys::engine::StepRecord& record, const Graph& g, std::string_view id) {
+  return record.nodes[*g.index_of(id)].demand_per_s;
+}
+
+// The share of what `id` was sent in this step that it dropped.
+double dropped_share_at(const simsys::engine::StepRecord& record, const Graph& g,
+                        std::string_view id) {
+  const auto& node = record.nodes[*g.index_of(id)];
+  return node.dropped_per_s / node.demand_per_s;
+}
+
+constexpr auto parallel = simsys::model::StepMode::parallel;
+}  // namespace
+
+// a delivers 0.5, so the request that fails at a never reaches b:
+//   b's demand = 1000 x 0.5 = 500/s            (before: 1000/s, as if no request ever failed)
+// The first step still sends 1000/s: nothing was reported yet (the lag); the long run is
+// `estimate`.
+TEST_CASE("a second step is sent only what the first step delivered: 500 of 1000 a second",
+          "[theory]") {
+  const auto g = *Graph::build(steps_chain({Step{.to = "a", .op = "x"}, Step{.to = "b", .op = "x"}},
+                                           {lossy_target("a", 500), plain_target("b")}));
+  const auto records = records_of(g, 20);
+  REQUIRE_THAT(demand_at(records.front(), g, "b"), WithinRel(1000.0, 1e-9));  // one step late
+  for (std::size_t i = 3; i < records.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE_THAT(dropped_share_at(records[i], g, "a"), WithinRel(0.5, 1e-9));  // a delivers 0.5
+    REQUIRE_THAT(demand_at(records[i], g, "a"), WithinRel(1000.0, 1e-9));  // the first step: whole
+    REQUIRE_THAT(demand_at(records[i], g, "b"), WithinRel(500.0, 1e-3));   // 1000 x 0.5
+  }
+  const auto estimate = simulation_of(g).estimate();
+  REQUIRE_THAT(estimate.nodes[*g.index_of("b")].demand_per_s, WithinRel(500.0, 1e-4));
+}
+
+// Survival multiplies down the chain. a delivers 0.5, so b is offered 1000 x 0.5 = 500/s; b can
+// drain 250/s of them, so it delivers 250 / 500 = 0.5 (not 250 / 1000 = 0.25, the fraction it
+// would deliver if a failure at a did not stop the request); c is sent
+//   1000 x S_c = 1000 x (0.5 x 0.5) = 250/s.
+TEST_CASE("three sequential steps thin one another: the third is sent 1000 x 0.5 x 0.5 = 250",
+          "[theory]") {
+  const auto g = *Graph::build(steps_chain(
+      {Step{.to = "a", .op = "x"}, Step{.to = "b", .op = "x"}, Step{.to = "c", .op = "x"}},
+      {lossy_target("a", 500), lossy_target("b", 250), plain_target("c")}));
+  const auto last = records_of(g, 30).back();
+  REQUIRE_THAT(demand_at(last, g, "a"), WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(demand_at(last, g, "b"), WithinRel(500.0, 1e-3));       // 1000 x 0.5
+  REQUIRE_THAT(dropped_share_at(last, g, "b"), WithinRel(0.5, 1e-3));  // 250 of the 500 offered
+  REQUIRE_THAT(demand_at(last, g, "c"), WithinRel(250.0, 1e-3));       // 1000 x 0.5 x 0.5
+}
+
+// [a || b] then c: the group starts together, so a and b are both sent the whole 1000/s, and a
+// failure at either fails the request:
+//   survivors of the group = d_a x d_b = 0.5 x 0.8 = 0.4
+//   c's demand             = 1000 x 0.4 = 400/s
+// and the client's requests answered are exactly those that got through everything: 400/s.
+TEST_CASE("a parallel group fails as a whole: the step after it is sent 1000 x 0.5 x 0.8 = 400",
+          "[theory]") {
+  const auto g = *Graph::build(
+      steps_chain({Step{.to = "a", .op = "x", .mode = parallel},
+                   Step{.to = "b", .op = "x", .mode = parallel}, Step{.to = "c", .op = "x"}},
+                  {lossy_target("a", 500), lossy_target("b", 800), plain_target("c")}));
+  const auto records = records_of(g, 20);
+  REQUIRE_THAT(demand_at(records.front(), g, "c"), WithinRel(1000.0, 1e-9));  // one step late
+  const auto& last = records.back();
+  REQUIRE_THAT(demand_at(last, g, "a"), WithinRel(1000.0, 1e-9));      // members of a group are not
+  REQUIRE_THAT(demand_at(last, g, "b"), WithinRel(1000.0, 1e-9));      // thinned by one another
+  REQUIRE_THAT(dropped_share_at(last, g, "a"), WithinRel(0.5, 1e-9));  // 500 of 1000
+  REQUIRE_THAT(dropped_share_at(last, g, "b"), WithinRel(0.2, 1e-9));  // 200 of 1000: delivers 0.8
+  REQUIRE_THAT(demand_at(last, g, "c"), WithinRel(400.0, 1e-3));       // 1000 x 0.5 x 0.8
+  REQUIRE_THAT(last.responses[0].answered.per_second, WithinRel(400.0, 1e-3));
+  const auto estimate = simulation_of(g).estimate();
+  REQUIRE_THAT(estimate.nodes[*g.index_of("c")].demand_per_s, WithinRel(400.0, 1e-4));
+  REQUIRE_THAT(estimate.responses[0].answered.per_second, WithinRel(400.0, 1e-4));
+}
+
+// web's read: [cache lookup (hit ratio 0.8), db read on miss, then x]. The block is a miss block:
+// only the 1 - 0.8 = 0.2 that missed go to the db, which is offered 1000 x 0.2 = 200/s and can
+// drain 100/s, so it delivers 100 / 200 = 0.5. A request that hit never meets the db, so the miss
+// block fails only its own 0.2 share, and the survivors are
+//   0.8 + 0.2 x 0.5 = 0.9           (not 0.5 x ..., and not 0.8: a half-failed miss share still
+//   lives)
+// and x is sent 1000 x 0.9 = 900/s, the same 900/s the client has answered.
+TEST_CASE("a miss block thins only the miss share: x is sent 0.8 + 0.2 x 0.5 = 0.9 of the rate",
+          "[theory]") {
+  Scenario s = steps_chain(
+      {Step{.to = "cache", .op = "x"}, Step{.to = "db", .op = "x", .on = StepCondition::miss},
+       Step{.to = "x_target", .op = "x"}},
+      {NodeSpec{.id = "cache",
+                .type = NodeType::cache,
+                .capacity = Rate{100'000},
+                .latency = 100us,
+                .hit_ratio = HitRatio{.fixed = 0.8},
+                .strategy = CacheStrategy::cache_aside},
+       lossy_target("db", 100), plain_target("x_target")});
+  const auto g = *Graph::build(s);
+  const auto records = records_of(g, 20);
+  REQUIRE_THAT(demand_at(records.front(), g, "x_target"),
+               WithinRel(1000.0, 1e-9));  // one step late
+  const auto& last = records.back();
+  REQUIRE_THAT(demand_at(last, g, "db"), WithinRel(200.0, 1e-9));  // 1000 x 0.2: the misses alone
+  REQUIRE_THAT(dropped_share_at(last, g, "db"), WithinRel(0.5, 1e-9));   // 100 of the 200
+  REQUIRE_THAT(demand_at(last, g, "x_target"), WithinRel(900.0, 1e-3));  // 1000 x (0.8 + 0.2 x 0.5)
+  REQUIRE_THAT(last.responses[0].answered.per_second, WithinRel(900.0, 1e-3));
+}
+
+// A worker pool's `then` steps are sequential like a service's: 8 jobs/s drained (10 workers at 1 s
+// a job: capacity 10/s, rho 0.8). The first step's target drains 4/s of the 8 it is sent, so it
+// delivers 4 / 8 = 0.5, and the second step is sent only the jobs whose first step went through:
+//   8 x 0.5 = 4/s            (before: 8/s, a completion message for every job, failed or not)
+TEST_CASE(
+    "a worker pool's second then step is sent only the jobs whose first step delivered: 4 of 8",
+    "[theory]") {
+  auto pool = group_of("w", 10, 1s);
+  pool.then = {Step{.to = "render", .op = "job"}, Step{.to = "done", .op = "job"}};
+  auto s = published(8, {std::move(pool)});
+  s.nodes.push_back(lossy_target("render", 4));
+  s.nodes.push_back(plain_target("done"));
+  s.links.push_back(LinkSpec{.from = "w", .to = "render", .latency = 0s});
+  s.links.push_back(LinkSpec{.from = "w", .to = "done", .latency = 0s});
+  const auto g = *Graph::build(s);
+  const auto records = records_of(g, 50);
+  REQUIRE_THAT(demand_at(records.front(), g, "done"), WithinRel(8.0, 1e-9));  // one step late
+  const auto& last = records.back();
+  REQUIRE_THAT(demand_at(last, g, "w"), WithinRel(8.0, 1e-9));
+  REQUIRE_THAT(demand_at(last, g, "render"), WithinRel(8.0, 1e-9));  // the first step: every job
+  REQUIRE_THAT(dropped_share_at(last, g, "render"), WithinRel(0.5, 1e-9));  // 4 of the 8
+  REQUIRE_THAT(demand_at(last, g, "done"), WithinRel(4.0, 1e-3));           // 8 x 0.5
+}
