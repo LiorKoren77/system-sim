@@ -747,11 +747,12 @@ TEST_CASE("the JSON's answered_per_s equals offered_per_s when nothing is droppe
 
 // Peak (21:00) of youtube: both clients at base x 1.6 (200 -> 320/s, 100 -> 160/s), 480/s in all,
 // of which 2 % are uploads: 9.6/s. original_store's event publishes one message per upload to
-// transcode_q, 9.6/s; the 400 transcoders (60 s each: 400 / 60 = 6.667 jobs/s) are OFFERED all of
-// it, since the paper load does not queue: 9.6 / 6.667 = 1.44, 144 %, red (the real run saturates
-// them and builds a backlog: README's "transcoders.workers: 200" lesson). Per job they publish one
-// message to completion_q (9.6/s of 1M/s: 0.00096 %), which completion_handler (4 workers at 5 ms
-// = 800/s) is offered: 9.6 / 800 = 1.2 %, green.
+// transcode_q, 9.6/s; the 600 transcoders (60 s each: 600 / 60 = 10 jobs/s, plan 2c Task 16) are
+// OFFERED all of it, since the paper load does not queue: 9.6 / 10 = 0.96, 96 %, red (red is a
+// utilization verdict from 90 %; nothing backs up, and transcode_q's lag stays at the Erlang
+// wait, 0.57 s; at the 400 workers it shipped with, 144 %, the run built a backlog). Per job they
+// publish one message to completion_q (9.6/s of 1M/s: 0.00096 %), which completion_handler (4
+// workers at 5 ms = 800/s) is offered: 9.6 / 800 = 1.2 %, green.
 TEST_CASE("explain follows youtube from the blob store through the queues and pools: no mark",
           "[series]") {
   const auto text = explain_shipped("youtube");
@@ -762,8 +763,8 @@ TEST_CASE("explain follows youtube from the blob store through the queues and po
   REQUIRE(queue.contains("peak offered 9.6/s"));
   REQUIRE(queue.contains("green"));
   const auto transcoders = check_line(text, "transcoders");
-  REQUIRE(transcoders.contains("peak offered 9.6/s vs 6.667/s total capacity"));
-  REQUIRE(transcoders.contains("(144%, red)"));
+  REQUIRE(transcoders.contains("peak offered 9.6/s vs 10/s total capacity"));
+  REQUIRE(transcoders.contains("(96%, red)"));
   const auto completion_q = check_line(text, "completion_q");
   REQUIRE(completion_q.contains("peak offered 9.6/s vs 1M/s total capacity  (0.00096%, green)"));
   const auto handler = check_line(text, "completion_handler");
@@ -1242,31 +1243,31 @@ TEST_CASE("the tutorial chain's series are byte for byte what they were before l
 //
 // (node_line is tests/support/explain_lines.hpp's, shared with test_report.cpp.)
 
-// transcoders: 400 workers at 60 s a video = 400 / 60 s = 6.667 videos/s (it was the worker_pool
-// type's default 1k/s: 2 ms at c = 2). completion_handler: 4 workers at 5 ms = 4 / 0.005 s = 800/s.
-// Only the capacity figure moves in Task 6 (README and schema quoted `transcoders  peak offered
-// 0/s vs 6.667/s`); Task 7 follows the load through the queues and fills in the offered one.
-TEST_CASE("explain checks youtube's transcoders against workers over cost: 6.667 a second",
+// transcoders: 600 workers at 60 s a video = 600 / 60 s = 10 videos/s (it was the worker_pool
+// type's default 1k/s: 2 ms at c = 2; 400 workers, 6.667/s, until plan 2c Task 16 sized the pool).
+// completion_handler: 4 workers at 5 ms = 4 / 0.005 s = 800/s. Only the capacity figure moves in
+// Task 6; Task 7 follows the load through the queues and fills in the offered one.
+TEST_CASE("explain checks youtube's transcoders against workers over cost: 10 a second",
           "[series]") {
   const auto text = explain_shipped("youtube");
   CAPTURE(text);
   const auto transcoders = check_line(text, "transcoders");
-  REQUIRE(transcoders.contains("vs 6.667/s total capacity"));
+  REQUIRE(transcoders.contains("vs 10/s total capacity"));
   REQUIRE_FALSE(transcoders.contains("vs 1k/s"));
   const auto handler = check_line(text, "completion_handler");
   REQUIRE(handler.contains("vs 800/s total capacity"));
 }
 
-// What the nodes block says about youtube's queue and pool: 400 transcoders of 60 s a job
+// What the nodes block says about youtube's queue and pool: 600 transcoders of 60 s a job
 // (`cost=1m`), 32 partitions on transcode_q, and no retention stated, so Kafka's default.
 TEST_CASE("explain describes youtube's transcode queue and transcoders", "[series]") {
   const auto text = explain_shipped("youtube");
   CAPTURE(text);
   const auto transcoders = node_line(text, "transcoders");
-  REQUIRE(transcoders.contains("capacity=6.667/s (workers / cost)"));
-  // 7 days x 6.667/s = 604,800 x 400 / 60 = 4,032,000 messages: 4.032M (review of Task 6, M-1).
-  REQUIRE(transcoders.contains("queue_limit=4.032M (retention × capacity)"));
-  REQUIRE(transcoders.contains("consumes=transcode_q  workers=400 cost=1m"));
+  REQUIRE(transcoders.contains("capacity=10/s (workers / cost)"));
+  // 7 days x 10/s = 604,800 s x 600 / 60 = 6,048,000 messages: 6.048M (review of Task 6, M-1).
+  REQUIRE(transcoders.contains("queue_limit=6.048M (retention × capacity)"));
+  REQUIRE(transcoders.contains("consumes=transcode_q  workers=600 cost=1m"));
   const auto queue = node_line(text, "transcode_q");
   REQUIRE(queue.contains("retention=7d (default: Kafka's 168 h)"));
   REQUIRE(queue.contains("partitions=32 (not modelled)"));

@@ -124,13 +124,11 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
     //  - url-shortener passes its SLOs, but 24 h at 1 s is 86.4k steps: 0.4 s in Release, about
     //    6 to 8 s in a Debug build (measured 2026-10-28), over the five seconds below. Its own test
     //    runs it end to end with no time limit and pins its SLO results.
-    //  - youtube runs since plan 2c Task 7 (its pool's `then` steps), but is exempt from its SLOs
-    //    until Task 16: its 300 MB uploads take 12 s at the store against the clients' 10 s
-    //    timeout (Task 13 applies timeouts, Task 16 sizes the upload's per resumable chunk), its
-    //    queue_lag SLO is evaluated since Task 8 and FAILS (the 400 transcoders fall 2.66 h
-    //    behind, against its 30 m: the test below pins it) until Task 16 resizes them, and 24 h
-    //    at 100 ms is 864k steps, far over the five seconds. The "book/youtube runs" test below
-    //    runs its first steps instead.
+    //  - youtube runs since plan 2c Task 7 and MEETS its SLOs since Task 16 (600 transcoders, a
+    //    20 GB/s transcoded store, a 40 Gbit/s cross-DC link, a 30 s timeout for the resumable
+    //    uploads); it is exempt here only for time: 24 h at 100 ms is 864k steps, about 60 s of
+    //    CPU in Release (measured 2026-10-29), far over the five seconds. Its own test below runs
+    //    the day at 10 s steps and pins its three SLOs passing.
     //  - news-feed runs since plan 2c Task 10 (its kv_cluster, graph_db, is simulated), but is
     //    exempt from its SLOs until Task 17: 24 h at 100 ms is 864k steps, far over the five
     //    seconds, and its drop_rate and queue_lag SLOs are Task 17's to meet. The "book/news-feed
@@ -405,17 +403,30 @@ TEST_CASE("book/youtube validates, explains and the engine accepts it", "[scenar
   REQUIRE(sim.has_value());
 }
 
-// The scenario runs: its first second at the start of the day (00:00, three hours past the 21:00
-// peak: both clients at base x (1 + 0.6 cos 45 deg) = x 1.4243, 300/s x 1.4243 = 427.3/s, of which
-// 2 % are uploads: 8.55/s) offers the 400 transcoders (60 s a video: 6.667 jobs/s) more than they
-// drain. The pool drains its capacity, so completion_q and its handler are sent the DRAINED
-// 400 / 60 = 6.667 messages/s, not the 8.55/s that arrived (the steps from the third one on: the
-// European upload link delays its uploads by one step).
-TEST_CASE("book/youtube runs: the transcoders hand on what they drained, 6.667 jobs a second",
+namespace {
+// The shipped youtube scenario with the 400 transcoders it had before plan 2c Task 16 sized the
+// pool at 600 (the README's "Things to try"): 400 / 60 s = 6.667 videos/s, fewer than the uploads
+// from 15:43 to 02:17, so the pool saturates and its queue backs up.
+simsys::model::Scenario youtube_with_400_transcoders() {
+  auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml");
+  const auto pool = std::ranges::find(s.nodes, "transcoders", &simsys::model::NodeSpec::id);
+  REQUIRE(pool != s.nodes.end());
+  REQUIRE(pool->workers == 600);  // as shipped
+  pool->workers = 400;
+  return s;
+}
+}  // namespace
+
+// With 400 transcoders the first second of the day (00:00, three hours past the 21:00 peak: both
+// clients at base x (1 + 0.6 cos 45 deg) = x 1.4243, 300/s x 1.4243 = 427.3/s, of which 2 % are
+// uploads: 8.55/s) offers the pool (60 s a video: 6.667 jobs/s) more than it drains. The pool
+// drains its capacity, so completion_q and its handler are sent the DRAINED 400 / 60 = 6.667
+// messages/s, not the 8.55/s that arrived (the steps from the third one on: the European upload
+// link delays its uploads by one step). (The shipped 600 workers, 10 jobs/s, drain all 8.55/s.)
+TEST_CASE("book/youtube at 400 transcoders: the pool hands on what it drained, 6.667 jobs a second",
           "[scenario]") {
   using namespace std::chrono_literals;
-  const auto g = build_or_fail(
-      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml"));
+  const auto g = build_or_fail(youtube_with_400_transcoders());
   auto sim = simsys::engine::Simulation::create(g);
   if (!sim) FAIL(sim.error().message);
   simsys::engine::StepRecord last;
@@ -442,27 +453,26 @@ TEST_CASE("book/youtube runs: the transcoders hand on what they drained, 6.667 j
   REQUIRE_THAT(renditions_mb_per_s, Catch::Matchers::WithinRel(400.0 / 60.0 * 4.0 * 50.0, 1e-3));
 }
 
-// Task 8 evaluates youtube's `queue_lag` SLO (`transcode_q`, max 30m), which was `skipped` while no
-// queue reported a lag. The transcoders are 400 workers at 60 s a video = 400 / 60 s = 6.667
-// videos/s, and from 15:43 on the uploads (2 % of the viewers' requests, 8.55/s at 00:00 and more
-// at the 21:00 peak) exceed that, so the pool's backlog is still growing at 24:00: the run's peak
-// backlog is its last step's, 63.76k videos (the README's number, measured at 100 ms steps:
-// 63,759 here, 63,750 at the 10 s steps below). The queue's lag is the FIFO drain time of its one
-// group, backlog / drain, the pool draining its whole capacity while saturated:
+// youtube's `queue_lag` SLO (`transcode_q`, max 30m) at the 400 transcoders it shipped with
+// until plan 2c Task 16 (the README's sweep, "Things to try"): 400 workers at 60 s a video = 400 /
+// 60 s = 6.667 videos/s, and from 15:43 on the uploads (2 % of the viewers' requests, 8.55/s at
+// 00:00 and more at the 21:00 peak) exceed that, so the pool's backlog is still growing at 24:00:
+// the run's peak backlog is its last step's, 63.76k videos (the README's number, measured at
+// 100 ms steps: 63,759 there, 63,750 at the 10 s steps below). The queue's lag is the FIFO drain
+// time of its one group, backlog / drain, the pool draining its whole capacity while saturated:
 //   63,760 / 6.667/s = 9,564 s = 2.66 h  >  30 m = 1,800 s    -> FAIL
 // (the Erlang wait of refinement 5 is the smaller term at every step: the saturated pool's, at rho
-// clamped to 0.99, is Wq(400, 0.99, 60 s) = C(400, 0.99) x 60 s / (400 x 0.01) = 11.6 s). It FAILS
-// on purpose until Task 16 resizes the transcoders to 600 workers (backlog 0, lag 0.57 s: the
-// Erlang wait at rho 0.96).
+// clamped to 0.99, is Wq(400, 0.99, 60 s) = C(400, 0.99) x 60 s / (400 x 0.01) = 11.6 s). The
+// shipped 600 workers pass it (the next test).
 // The run uses 10 s steps, not the scenario's 100 ms: the fluid backlog is the same to 0.02 %
 // (checked at both) and 8,640 steps, not 864k, keep the test in seconds; hence the 1 % tolerance.
-// (The 24 h run stops before the daily peak: the inflow still exceeds the capacity at midnight and
-// the backlog peaks at about 71.9k videos, 3.0 h of lag, near 02:18 of the next day, the review of
-// Task 7 at b4e263a, I-1. The SLO sees what the run saw, 2.66 h; Task 16 decides how to run it.)
-TEST_CASE("book/youtube's queue_lag SLO is evaluated and fails: 2.66 h of lag against 30 m",
+// (The 24 h run stops before the backlog's peak: the inflow still exceeds the capacity at midnight
+// and the backlog peaks at about 71.9k videos, 3.0 h of lag, near 02:18 of the next day, the
+// review of Task 7 at b4e263a, I-1; `--duration 27h` shows it. The SLO sees what the run saw.)
+TEST_CASE("book/youtube at 400 transcoders fails its queue_lag SLO: 2.66 h of lag against 30 m",
           "[scenario]") {
   using namespace std::chrono_literals;
-  auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml");
+  auto s = youtube_with_400_transcoders();
   s.step = 10s;
   const auto g = build_or_fail(s);
   auto sim = simsys::engine::Simulation::create(g);
@@ -560,12 +570,17 @@ TEST_CASE("byte-sized capacities are checked in MB per second", "[scenario]") {
   // transcoded_store: the cdns' misses, 157.82 streams/s x 50 MB = 7.891k MB/s, plus the
   // transcoders' renditions the paper load follows since Task 7: 9.6 uploads/s offered to the
   // pool (the paper load does not queue) x 4 renditions x 50 MB = 1.92k MB/s. In all 9.811k MB/s
-  // (196.22 requests/s) of 10GB/s = 10k MB/s: 98.1 %, red, and a complete number.
+  // (196.22 requests/s) of 20GB/s = 20k MB/s: 49.1 %, green, and a complete number (at the
+  // 10GB/s it had until plan 2c Task 16: 98.1 %, red).
   const auto transcoded = check_line(youtube_text, "transcoded_store");
   REQUIRE(
-      transcoded.contains("peak offered 9.811k MB/s (196.2/s) vs 10k MB/s total capacity  "
-                          "(98.1%, red)"));
+      transcoded.contains("peak offered 9.811k MB/s (196.2/s) vs 20k MB/s total capacity  "
+                          "(49.1%, green)"));
   REQUIRE_FALSE(transcoded.contains("load not propagated"));
+  // The cross-DC origin link, 40Gbit/s = 5 GB/s: cdn_eu's misses, 140.8 x (1 - 0.594) x 50 MB =
+  // 2.856k MB/s, 57.1 %.
+  REQUIRE(check_line(youtube_text, "cdn_eu->transcoded_store")
+              .contains("peak offered 2.856k MB/s vs 5k MB/s  (57.1%, green)"));
 
   const auto news = build_or_fail(
       load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml"));
@@ -1491,4 +1506,39 @@ TEST_CASE(
   REQUIRE_THAT(lost / shorten->offered_per_s,
                Catch::Matchers::WithinRel(summary.drop_rate("id_gen"), 1e-3));
   REQUIRE(shorten->p99_s == 1.0);
+}
+
+// ---- youtube end to end (plan 2c Task 16) ----
+
+// Plan 2c Task 16: youtube as shipped runs the day and meets all three SLOs (`simsys run` exits 0).
+// The numbers, each measured with `simsys run` at the scenario's 100 ms steps and identical at the
+// 10 s steps used here (8,640 steps, not 864k: a few seconds in Debug):
+//  - viewers_eu's stream p99: 465 ms against 2 s. A lognormal fit to the response moments; a
+//    European miss crosses the Atlantic (2 x 75 ms) and waits for the 40 Gbit/s pipe, whose queue
+//    holds whole 50 MB objects (10 ms each on the wire). 1 % covers the fit's step-to-step drift.
+//  - transcode_q's peak lag: 0.573 s against 30 m. With 600 workers (10 videos/s against 9.6
+//    uploads/s at 21:00) nothing backs up, so the lag is the pool's Erlang C wait at rho 0.96:
+//    C(600, 0.96) x 60 s / (600 x 0.04) = 0.229 x 2.5 s = 0.57 s. 1 % (the derivation's rounding).
+//  - cdn_us's utilization over its worst hour (`over: 1h`, windows aligned from the 5 m warmup):
+//    0.1403 from 20:05, against 0.8: the hour whose middle, 20:35, is nearest the 21:00 peak.
+//    The sine's mean over it is 1 + 0.6 cos(2 pi 25/1440) sin(pi 60/1440) / (pi 60/1440) =
+//    1.5947 times the base, so 200/s x 88 % x 50 MB x 1.5947 = 14.03k MB/s of 100k: 0.1403, where
+//    the whole day's mean is 0.0879. 1e-3: a closed form.
+TEST_CASE("book/youtube runs the day and passes its three SLOs", "[scenario]") {
+  using namespace std::chrono_literals;
+  auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml");
+  s.step = 10s;
+  const auto results = run_slos(s);
+  REQUIRE(results.size() == 3);
+  for (const auto& r : results) {
+    CAPTURE(r.slo.node, static_cast<int>(r.slo.metric), r.observed.value_or(-1.0), r.note);
+    REQUIRE(r.status == simsys::report::SloStatus::pass);
+  }
+  const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
+  REQUIRE_THAT(*p99.observed, Catch::Matchers::WithinRel(0.465, 0.01));
+  const auto& lag = slo_of(results, simsys::model::SloMetric::queue_lag);
+  REQUIRE_THAT(*lag.observed, Catch::Matchers::WithinRel(0.573, 0.01));
+  const auto& utilization = slo_of(results, simsys::model::SloMetric::utilization);
+  REQUIRE_THAT(*utilization.observed, Catch::Matchers::WithinRel(0.1403, 1e-3));
+  REQUIRE(utilization.window_start == simsys::SimTime{20h + 5min});
 }

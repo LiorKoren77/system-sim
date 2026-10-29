@@ -279,36 +279,69 @@ TEST_CASE("p99 and p50 SLOs at the timeout pass when only 0.5 percent time out a
   }
 }
 
-// ---- The shipped youtube scenario: 300 MB uploads against a 10 s timeout ----
+// ---- The shipped youtube scenario: 300 MB uploads and the clients' timeout ----
 //
 // An upload is a write: the blob store acknowledges it at its last byte, 300 MB x 40 ms per MB =
 // 12 s after its wait (response p99 12.40 s, see test_theory.cpp's "a 300 MB upload's p99 is 12.4
 // s"), and the transfer is deterministic, so its response has almost no spread (variance 0.027 s^2:
-// sigma = 0.0137). The share below the clients' `timeout: 10s` is
-//   Phi((ln 10 - mu) / sigma) = Phi(-13.5) ~ 1e-41: no upload is answered in time.
-// This pin documents the CURRENT state of the scenario: Task 16 may change the timeout or the
-// upload path (resumable uploads, as the book describes them), and this test then moves with it.
+// sigma = 0.0137). Against a timeout T the share answered in time is Phi((ln T - mu) / sigma):
+//   T = 10 s: Phi(-13.5) ~ 1e-41: no upload is answered in time;
+//   T = 30 s: Phi((ln 30 - ln 12.1) / 0.0137) = Phi(66) ~ 1: every upload is.
+// Plan 2c Task 16 set the shipped timeout to 30 s: the book's uploads are resumable, so a client
+// gives up on a chunk, not on the file, and the model's one timeout per client is that patience
+// scaled to the whole 300 MB file. The second test keeps the old 10 s to show why it changed.
 // SIMSYS_SCENARIOS_DIR is injected by CMake (a compile definition: the one macro we accept,
 // because it carries a build-time path no language feature can).
-TEST_CASE("youtube's 300 MB uploads all time out against the clients' 10 s timeout", "[theory]") {
+namespace {
+// The shipped youtube scenario, with `edit` applied, run for its first ten seconds; its JSON
+// report. The scenario runs 24 h at 100 ms; its first ten seconds say the same about uploads (the
+// diurnal wave barely moves, and a response is the sum of the path's hops). The 5 m warmup would
+// hide all of it, so the summary keeps everything after the first 3 s.
+// (`edit` is a plain function pointer: the tests pass captureless lambdas, which convert to one.)
+std::string youtube_first_seconds_json(void (*edit)(Scenario&)) {
   auto loaded =
       simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml");
   if (!loaded)
     FAIL(loaded.error().file << ":" << loaded.error().line << ": " << loaded.error().message);
+  edit(*loaded);
   const auto built = Graph::build(*loaded);
   if (!built) FAIL(built.error().message);
-  // The scenario runs 24 h at 100 ms; its first ten seconds say the same (the diurnal wave barely
-  // moves, and a response is the sum of the path's hops). The 5 m warmup would hide all of it.
   simsys::report::Summary summary{*built, 3s};
   auto sim = Simulation::create(*built);
   if (!sim) FAIL(sim.error().message);
   sim->run({.duration = 10s, .step = loaded->step}, [&](const auto& r) { summary.observe(r); });
-  const auto json = simsys::report::render_json(summary, {});
+  return simsys::report::render_json(summary, {});
+}
+}  // namespace
+
+TEST_CASE("youtube's 300 MB uploads are all answered within the clients' 30 s timeout",
+          "[theory]") {
+  const auto json = youtube_first_seconds_json([](Scenario&) {});
   CAPTURE(json);
   for (const std::string_view client : {"viewers_us", "viewers_eu"}) {
     CAPTURE(client);
     const double offered = op_field(json, client, "upload", "offered_per_s");
     REQUIRE(offered > 1.0);  // 2 % of 200/s and of 100/s, times the curve's phase
+    REQUIRE(op_field(json, client, "upload", "timed_out_per_s") < 1e-6 * offered);
+    REQUIRE_THAT(op_field(json, client, "upload", "answered_per_s"), WithinRel(offered, 1e-6));
+    // answered at the last byte: 12 s of transfer (and the EU's 75 ms crossing), well under 30 s
+    const double mean = op_field(json, client, "upload", "mean_s");
+    REQUIRE(mean > 12.0);
+    REQUIRE(mean < 12.5);
+  }
+}
+
+TEST_CASE("youtube's 300 MB uploads all time out against a 10 s timeout", "[theory]") {
+  const auto json = youtube_first_seconds_json([](Scenario& s) {
+    for (auto& node : s.nodes) {
+      if (node.workload) node.workload->timeout = simsys::SimTime{10s};
+    }
+  });
+  CAPTURE(json);
+  for (const std::string_view client : {"viewers_us", "viewers_eu"}) {
+    CAPTURE(client);
+    const double offered = op_field(json, client, "upload", "offered_per_s");
+    REQUIRE(offered > 1.0);
     const double timed_out = op_field(json, client, "upload", "timed_out_per_s");
     const double answered = op_field(json, client, "upload", "answered_per_s");
     REQUIRE_THAT(timed_out, WithinRel(offered, 1e-6));

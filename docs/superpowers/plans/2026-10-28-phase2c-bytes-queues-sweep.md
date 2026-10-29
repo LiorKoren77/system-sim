@@ -512,8 +512,35 @@
 
 **Files:** `scenarios/book/youtube/scenario.yaml` (`transcoders.workers: 600`: 600 / 60 s = 10 videos/s ≥ the 9.6/s upload peak; `transcoded_store.capacity: 20GB/s`; `bandwidth: 40Gbit/s` on `cdn_eu → transcoded_store`; `over: 1h` on the `cdn_us` utilization SLO; each change with its reason in a comment), `scenarios/book/youtube/README.md`, `tests/scenario/test_scenarios.cpp` (youtube leaves the SLO exemption), `README.md`.
 
-- [ ] `simsys run scenarios/book/youtube/scenario.yaml` exits 0. README numbers, each re-measured and checked against these derivations at the 21:00 peak: `cdn_us` 14.08k MB/s of 100k (14.1 %), `cdn_eu` 7.04k of 50k (14.1 %), hit ratios 0.642 and 0.594; `transcoded_store` 7.891k MB/s of misses + 1.92k MB/s of renditions = 9.811k MB/s of 20k (**49.1 %**; at the shipped 10 GB/s it was 98.1 %, red); the cross-DC origin link 2.856k MB/s of 5k (**57.1 %**, M/D/1 wait 0.13 ms); `original_store` 2.88k MB/s of 5k (57.6 %); transcoders rho 0.96, Erlang C(600, 0.96) = 0.229, wait 0.229 × 60 s / (600 × 0.04) = **0.57 s**, so `transcode_q`'s peak lag ≈ 0.57 s (no fluid backlog); `metadata_db` 98.28 units/s of 9k; the EU stream p99 (measured) against its 2 s SLO. "Things to try": the README's sweep `simsys sweep scenarios/book/youtube/scenario.yaml --param nodes.transcoders.workers=400..600:3 --metric transcode_q.lag`: 400 workers end the day with a backlog of **63.8k** videos and **2.66 h** of lag (uploads exceed 6.67/s from 15:43, so the backlog is still growing at 24:00), 500 workers **39.5 min** (excess from 17:42), 600 workers 0.57 s; only 600 passes the 30-minute `queue_lag` SLO. Keep the halve-`cdn_us.keys` item (0.642 → 0.594) with its run numbers.
-- [ ] Commit `scenarios: youtube runs end to end; sized in bytes with the book's figures`
+- [x] `simsys run scenarios/book/youtube/scenario.yaml` exits 0. README numbers, each re-measured and checked against these derivations at the 21:00 peak: `cdn_us` 14.08k MB/s of 100k (14.1 %), `cdn_eu` 7.04k of 50k (14.1 %), hit ratios 0.642 and 0.594; `transcoded_store` 7.891k MB/s of misses + 1.92k MB/s of renditions = 9.811k MB/s of 20k (**49.1 %**; at the shipped 10 GB/s it was 98.1 %, red); the cross-DC origin link 2.856k MB/s of 5k (**57.1 %**, M/D/1 wait 0.13 ms); `original_store` 2.88k MB/s of 5k (57.6 %); transcoders rho 0.96, Erlang C(600, 0.96) = 0.229, wait 0.229 × 60 s / (600 × 0.04) = **0.57 s**, so `transcode_q`'s peak lag ≈ 0.57 s (no fluid backlog); `metadata_db` 98.28 units/s of 9k; the EU stream p99 (measured) against its 2 s SLO. "Things to try": the README's sweep `simsys sweep scenarios/book/youtube/scenario.yaml --param nodes.transcoders.workers=400..600:3 --metric transcode_q.lag`: 400 workers end the day with a backlog of **63.8k** videos and **2.66 h** of lag (uploads exceed 6.67/s from 15:43, so the backlog is still growing at 24:00), 500 workers **39.5 min** (excess from 17:42), 600 workers 0.57 s; only 600 passes the 30-minute `queue_lag` SLO. Keep the halve-`cdn_us.keys` item (0.642 → 0.594) with its run numbers.
+- [x] Commit `scenarios: youtube runs end to end; sized in bytes with the book's figures`
+
+**Resolution (2026-10-29, branch `task16-youtube`).** The four sizing changes as listed, each with
+its reason in the YAML. `simsys run` exits 0 (861,000 steps, ~58 s CPU in Release): EU stream p99
+**465 ms** of 2 s, `transcode_q` lag **573 ms** of 30 m, `cdn_us` worst hour **0.1403** of 0.8
+(20:05–21:05; the day's mean is 0.0879). Every derivation above matched the binary at 21:00
+(`explain` and the run's `--series`): cdn_us 14.08k MB/s 14.1 %, cdn_eu 7.04k 14.1 %, h 0.642 /
+0.594, transcoded_store 9.811k of 20k 49.1 %, original_store 2.88k 57.6 %, cross-DC link 2.856k of
+5k 57.1 %, transcoders rho 0.96, metadata_db 98.28 units/s of 9k, uploads 0 timed out (US 12 s,
+EU mean 12.1 s, p99 12.2 s), with **one deviation: the link's wait is 6.66 ms, not 0.13 ms.** The
+pipe's queue waits for whole requests (`MegabyteService::serialising`: a 50 MB stream holds the
+5 GB/s wire 10 ms), so M/D/1 gives 0.5 × 0.571 / 0.429 × 10 ms = 6.66 ms, plus 0.2 ms for the
+first megabyte = 6.86 ms, the series' `latency_ms` at 21:00; the 0.13 ms derivation used 1 MB
+units. It moves the EU stream p99 from 455 ms (no bandwidth) to 465 ms; the README explains it.
+Also measured: the transcoders are red (rho > 0.9) for 16.11k s, 18:46–23:14, a utilization
+verdict the README calls out (the pool keeps up). Decision 5: the viewers' `timeout: 30s`, the
+README's "Uploads and the timeout". Decision 6: `duration: 24h` kept; the sweep prints 2.66h /
+39.5m / 573ms; `--duration 27h` at 400 gives 71.91k videos and 3 h (peak when uploads fall under
+6.667/s at 02:17), at 500 39.7 min (excess 17:42–00:18). Decision 7: `estimate` with 600 workers
+passes everything at 00:00's numbers (transcoders rho 0.8546, lag 67.6 µs, cdn_us 0.1253, EU p99
+468 ms); with 400 it prints `drop rate 22% (worst: transcoders)` and `FAIL queue_lag transcode_q
+- 168h`; the README says `run` is the verdict. Tests: youtube's own end-to-end test runs the day at
+10 s steps (identical SLO numbers to 100 ms, 3.5 s in Debug) and pins the three SLOs passing
+(p99 and lag 1 %, utilization 1e-3, window start 20:05); the 400-worker tests (pool hands on what
+it drained, the 2.66 h lag) now set `workers: 400` themselves. Outside the planned files, three
+tests that pinned the shipped 400 workers or the 10 s timeout moved with them:
+`tests/unit/test_series.cpp` (transcoders 10/s, 96 %, queue_limit 6.048M) and
+`tests/theory/test_timeout.cpp` (uploads answered within 30 s; the 10 s case kept by setting it).
 
 ---
 

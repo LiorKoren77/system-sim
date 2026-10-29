@@ -26,7 +26,13 @@ nodes:
     # 2 KB metadata requests.
     sizes: {stream: 50MB, upload: 300MB, upload_meta: 2KB, metadata: 2KB}
     keys: {zipf: 1.0, space: 10M}
-    timeout: 10s
+    # Upload timeout. The book's uploads are resumable (ch. 14): the file goes up in chunks and a
+    # client that gives up gives up on a chunk, retrying it, never on the whole file. The model has
+    # one timeout per client, not one per chunk, so it is sized for the largest request: a 300 MB
+    # upload is acknowledged at its last byte, about 12 s after its wait (300 MB at 40 ms per MB),
+    # so 30 s is the chunk-level patience scaled up to the whole file. At 10 s every upload timed
+    # out. Streams are judged by their own p99 SLO below, not by this timeout.
+    timeout: 30s
 
   viewers_eu:
     type: client
@@ -37,7 +43,7 @@ nodes:
     ops: {stream: 0.88, upload: 0.02, upload_meta: 0.02, metadata: 0.08}
     sizes: {stream: 50MB, upload: 300MB, upload_meta: 2KB, metadata: 2KB}
     keys: {zipf: 1.0, space: 10M}
-    timeout: 10s
+    timeout: 30s                               # resumable uploads: see viewers_us
 
   # keys = videos held at the edge, objects not bytes (the capacity counts bytes): 100k × 50 MB ≈ 5 TB
   # of edge disk in the US, half that in the EU, in proportion to the two capacities.
@@ -78,7 +84,11 @@ nodes:
     type: worker_pool
     dc: us-east
     consumes: transcode_q
-    workers: 400
+    # 600 workers: 600 / 60 s = 10 videos/s, above the 9.6 uploads/s of the 21:00 peak (480
+    # requests/s x 2 % uploads), so rho = 0.96 and nothing backs up. Erlang C(600, 0.96) = 0.229,
+    # so a video waits 0.229 x 60 s / (600 x 0.04) = 0.57 s on average. At 400 (6.667/s) the
+    # uploads outran the pool from 15:43 and transcode_q fell 2.66 h behind by midnight.
+    workers: 600
     cost: 60s                                  # per 300 MB video
     then:
       # size: 50MB is chosen, not the book's: one rendition is the size of one stream (sizes.stream
@@ -87,7 +97,10 @@ nodes:
       - {to: transcoded_store, op: write, factor: 4, size: 50MB}     # 4 output resolutions
       - {to: completion_q, op: publish}
 
-  transcoded_store: {type: blob_store, dc: us-east, capacity: 10GB/s}
+  # 20 GB/s: at the 21:00 peak the store is read by the CDNs' misses (157.8 streams/s x 50 MB =
+  # 7.891k MB/s) and written by the transcoders' renditions (9.6 videos/s x 4 x 50 MB = 1.92k MB/s),
+  # 9.811k MB/s in all: 49.1 % of 20 GB/s, where the 10 GB/s it had were 98.1 %, red.
+  transcoded_store: {type: blob_store, dc: us-east, capacity: 20GB/s}
 
   completion_q: {type: message_queue, dc: us-east, partitions: 4}
   completion_handler:
@@ -104,7 +117,12 @@ links:
   - {from: viewers_us, to: cdn_us, dir: inout, ops: [stream]}
   - {from: viewers_eu, to: cdn_eu, dir: inout, ops: [stream]}
   - {from: cdn_us, to: transcoded_store, dir: inout}
-  - {from: cdn_eu, to: transcoded_store, dir: inout}          # cross-DC, 150 ms default
+  # Cross-DC, 150 ms default. The European misses cross the Atlantic: 140.8 streams/s x (1 - 0.594)
+  # x 50 MB = 2.856k MB/s at the 21:00 peak. A 40 Gbit/s (5 GB/s) pipe carries them at 57.1 %
+  # (unbounded without `bandwidth`). The pipe is one M/D/1 queue that waits for whole objects, 10 ms
+  # of wire for each 50 MB stream: 0.5 x 0.571 / 0.429 x 10 ms = 6.66 ms of wait, plus 0.2 ms for
+  # the first megabyte, at the peak.
+  - {from: cdn_eu, to: transcoded_store, dir: inout, bandwidth: 40Gbit/s}
   - {from: viewers_us, to: lb, dir: inout, ops: [metadata, upload_meta]}
   - {from: viewers_eu, to: lb, dir: inout, ops: [metadata, upload_meta]}
   - {from: lb, to: api, dir: inout}
@@ -123,4 +141,6 @@ links:
 slo:
   - {metric: p99_latency, node: viewers_eu, op: stream, max: 2s}
   - {metric: queue_lag, node: transcode_q, max: 30m}
-  - {metric: utilization, node: cdn_us, max: 0.8}
+  # over: 1h checks every hour of the day on its own: the whole-day mean is the quiet night's and
+  # the busy evening's together, and could stay under 0.8 while the 21:00 hour is over it.
+  - {metric: utilization, node: cdn_us, max: 0.8, over: 1h}
