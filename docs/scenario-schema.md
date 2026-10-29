@@ -127,12 +127,12 @@ Everything else is refused before the first step, with exit code 1:
 
 | what | message | runs from |
 |---|---|---|
-| `ws_gateway`, `service_discovery` | `node 'x' has type 'ws_gateway', which run/estimate do not support yet (phase 2)` | 3 |
+| `ws_gateway`, `service_discovery` | `node 'x' has type 'ws_gateway', which run/estimate do not support yet (phase 3)` | 3 |
 | `notification_fanout`, `frontier` | the same message | 3 |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
 | `faults` | none: the list is accepted and nothing happens | 3 |
 
-The type message says "(phase 2)" for every type; the last column is the plan (the phase 3
+The type message names the phase that plans the type's model, phase 3 for all four (the phase 3
 backlog of the 2c plan). The type check runs over the whole file first, and names the first node
 in file order whose type cannot run; only then are the nodes of runnable types checked (a CDN's
 `keys`), in file order: google-drive is refused at its `ws_gateway`, `long_poll`, the first type
@@ -244,7 +244,7 @@ copy or machine): they would be lower bounds too.
 | `seed` | integer | no | read | default 1; within the range of `int`. Printed by `explain`; seeds every client's `rate.noise` (`run --seed N` and `curve --seed N` override it). Client `i` (its index among all nodes, in file order) gets the engine seed `(seed × 0x9E3779B97F4A7C15) XOR i` mod 2^64, so appending a node at the end of the file never changes another client's noise (inserting one before a client shifts that client's index, and so its noise) |
 | `duration` | duration | yes | read | simulated span of `run`; must be positive |
 | `step` | duration | no | read | default `100ms`; must be positive. A rule of thumb (plan 2c refinement 16; the derivation and a measured lab are in [numerics, "Choosing the step"](study/numerics.md)): a step is a lump the model cannot see inside, so make it shorter than what you want to see. A token bucket of `burst` B under a peak offered rate `λ` above its `limit` L empties in `B / (λ − L)`, and a longer step passes the whole burst in its first step (a 2,000-token burst at `step: 1s` does), so `step ≤ B / (λ_peak − L)`; for a queue, `step ≤` a tenth of the shortest spike. Shorter steps cost run time, not accuracy of the totals: conservation holds at any step |
-| `warmup` | duration | no | read | steps before it are left out of the report; default 0; must be shorter than `duration`, so the report never covers an empty window (`run --duration` obeys the same rule) |
+| `warmup` | duration | no | read | steps before it are left out of the report; default 0; must be shorter than `duration`, so the report never covers an empty window (`run --duration` obeys the same rule, and leaves room for every SLO's `over`) |
 | `datacenters` | map | no | read | see below; default: one datacenter `main` |
 | `nodes` | map id → node | yes | read | non-empty; ids are non-empty and unique |
 | `links` | list | yes | read | `[]` for none |
@@ -827,12 +827,13 @@ group's sojourn mean and variance (wait + service), and the q-th fastest of the 
 its survival function: `S_q(t)` = P(fewer than q of the N have answered by t), a
 Poisson-binomial over the hot and cool replicas, integrated as `E[X] = ∫ S_q dt`,
 `E[X²] = ∫ 2t S_q dt` on a grid even in ln t ([numerics, section 7](study/numerics.md): under
-1e-8 relative error for a sojourn SCV of at most 10). The response is the latency of the requests
-ANSWERED: it mixes the two kinds of set (the law of total variance) by the share of the answered
-requests each gives, `p_hot (1 − L_hot)` and `(1 − p_hot)(1 − L_cool)` over `1 − L`, with the
-losses `L` below, so a set that loses more weighs less. So a quorum of 2 of 3 answers from the two cool replicas when
-the hot machine's queue is full: the kv-store lab with `vnodes: 1` (the hot machine at 114 %)
-answers in 0.378 ms and passes its p99, where a quorum of 3 waits for the full queue. For
+1e-8 relative error for a sojourn SCV from 1e-4 to 100). The response is the latency of the
+requests ANSWERED: it mixes the two kinds of set (the law of total variance) by the share of the
+answered requests each gives, `p_hot (1 − L_hot)` and `(1 − p_hot)(1 − L_cool)` over `1 − L`,
+with the losses `L` below, so a set that loses more weighs less, and a set that answers nothing
+not at all. So a quorum of 2 of 3 answers from the two cool replicas when the hot machine's queue
+is full: the kv-store lab with `vnodes: 1` (the hot machine at 114 %) answers in 0.378 ms and
+passes its p99, where a quorum of 3 waits for the full queue. For
 replicas all alike and exponential of mean m the closed form is Rényi's (the k-th smallest of n:
 `m × Σ_{i<k} 1/(n − i)`, 1/3, 5/6 and 11/6 of m for n = 3), which the quadrature reproduces and
 the lognormal fit departs from a little (0.421, 0.826 and 1.753 m at SCV 1).
@@ -897,9 +898,10 @@ compares the ticket server with snowflake.
 Book ch. 13, "Design a search autocomplete system" (plan 2c refinement 10). A search index is
 **served like a service**: no steps, `replicas` copies of the type's 5k/s and 5 ms (chosen: a
 prefix lookup in a trie that reads the prefix's stored top k, ch. 13) unless the scenario states
-its own `capacity` and `latency`, resolved as for any node. `build_interval` (a positive duration, `build_interval: 168h`) is stored and printed by
-`explain` as `build_interval=168h (rebuild load not modelled)`; the rebuild's load on the index and
-the freshness of its answers between rebuilds are ignored. `ops` stays refused: an index answers a
+its own `capacity` and `latency`, resolved as for any node. `build_interval` (a positive
+duration, `build_interval: 168h`) is stored and printed by `explain` as
+`build_interval=168h (rebuild load not modelled)`; the rebuild's load on the index and the
+freshness of its answers between rebuilds are ignored. `ops` stays refused: an index answers a
 query and calls nobody.
 
 ### `message_queue` and `worker_pool`
@@ -1125,8 +1127,10 @@ window that decided, `(worst 10m from 00:20)` (its start on the run's clock, war
 JSON gives it as `window_start_s` (seconds from the start of the run; `null` when skipped), a key
 only an SLO with `over` has. `over` must be at least one step and at most duration − warmup:
 `slo: over must be at least one step (50ms < step 100ms)`, `slo: over must fit in the run after
-warmup (2h > duration 1h - warmup 0s)`. Fixed windows split a burst that straddles two of them
-(a sliding window would find a slightly worse one).
+warmup (2h > duration 1h - warmup 0s)`. `run --duration` is held to the same rule with the
+duration it gives (youtube, `--duration 10m`: `error: --duration 10m: over must fit in the run
+after warmup (1h > duration 10m - warmup 5m)`, exit 1). Fixed windows split a burst that
+straddles two of them (a sliding window would find a slightly worse one).
 
 ### Queue lag
 

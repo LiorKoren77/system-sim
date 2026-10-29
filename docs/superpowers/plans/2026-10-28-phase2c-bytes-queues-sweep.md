@@ -257,12 +257,54 @@
 
 **Review of the kv/search fix round at 600d173 (adversarial, APPROVE, minors only) — minors folded into the nits round after Task 18.** Verified: 1090/1090 both presets, warning-free, clang-format clean; I-2 re-derived from the fluid formulas (k 2.02123, p_hot 0.37898, hot-set weight 0.3493, put 36.66 / 227.1 ms untimed; 6.622 % / 568.8/s timed out, 27.24 ms with the timeout; old weighting 39.62 / 233.3 ms) matching the binary; every-set-lost falls back to offered shares; the N·k/M = 1 cap (`nodes: 4`, `vnodes: 1`) has no NaN and run = estimate; the nothing-answered matrix (sink f = 1: nulls, `-`, latency SLOs skipped with the note, drop_rate evaluated; all timed out: FAIL at the timeout with the note; capacity 0: FAIL unavailable; 50 % lost: judged) in run and estimate; I-1 numbers re-run; I-3 Monte Carlo at nine (M, N, v) points matching the §8 table and `ring_imbalance`, k = 1.5 forced locally reproduces the README's 0.831 / 200 % / 0.7593; README numbers of both labs and search-autocomplete's explain; memo key covers every changing input, per instance, byte-identical output with the memo disabled on six probes incl. a lossy sine wave; first-use comments, formula docs, no invented patterns, test names.
 
-- [ ] M-1 `report.cpp` ~357 `every_request_lost` also matches an op nobody sent (`rate: {base: 0/s}` → `SKIP … nobody answered u.send`): add `offered_per_s > 0`, skip a zero-offered op without a note as `offered_in` does; test.
-- [ ] M-2 `behaviours.cppm` ~2577–2591 `answer_quorum`: a set with loss exactly 1 and an infinite reply time enters `mixture` as {share 0, mean inf} → 0 × inf = NaN (unreachable today, reachable in phase 3 with a dead hot machine at W = N): drop answered branches with share 0 before normalising; unit test with a dead hot machine at W = N.
-- [ ] M-3 the quadrature's error past SCV 10 is rounding in `1 − F` (`fewer_than` computes `1.0 − success` with F near 1, weighted by t²), not the trapezoid rule: with S = Φ(−z) via `erfc` the error is ≤ 4.4e-16 (mean) / 2.3e-15 (variance) at every SCV. Fix: carry `failure = normal_cdf(−z)` in `TrialGroup` and use it in the DP, removing the limit; rewrite numerics §7's rows 10/20/50 and the `queueing.cppm` ~552 comment accordingly (the note's own §2 lesson).
-- [ ] M-4 numerics line references still stale: §2 `power_integral` :211 → 209, `one_minus_exp_neg` :262 → 263 (comment 261–262); §5 `lognormal_quantile` `queueing.cppm:121-129` → 183, the clamp, the "estimated" label :113, `conditional_hop` `behaviours.cppm:187-191`: cite function names instead of line numbers.
-- [ ] M-5 unit tests for `KvClusterBehaviour`'s new paths: observe the same machines twice → same answer; change `kept` → recomputed; all lost → the offered mix.
-- [ ] Nits: commit message said "news-feed's saturated graph_db" (mean rho 0.014; nothing there is saturated); test name "…write_quorum three times only the puts delivered" → "…and a write quorum of three times only the delivered puts"; re-wrap the edited prose lines in `scenario-schema.md` (the `search_index` paragraph, the kv "ANSWERED" sentence) and `search-autocomplete/README.md` line 19.
+- [x] M-1 `report.cpp` ~357 `every_request_lost` also matches an op nobody sent (`rate: {base: 0/s}` → `SKIP … nobody answered u.send`): add `offered_per_s > 0`, skip a zero-offered op without a note as `offered_in` does; test.
+- [x] M-2 `behaviours.cppm` ~2577–2591 `answer_quorum`: a set with loss exactly 1 and an infinite reply time enters `mixture` as {share 0, mean inf} → 0 × inf = NaN (unreachable today, reachable in phase 3 with a dead hot machine at W = N): drop answered branches with share 0 before normalising; unit test with a dead hot machine at W = N.
+- [x] M-3 the quadrature's error past SCV 10 is rounding in `1 − F` (`fewer_than` computes `1.0 − success` with F near 1, weighted by t²), not the trapezoid rule: with S = Φ(−z) via `erfc` the error is ≤ 4.4e-16 (mean) / 2.3e-15 (variance) at every SCV. Fix: carry `failure = normal_cdf(−z)` in `TrialGroup` and use it in the DP, removing the limit; rewrite numerics §7's rows 10/20/50 and the `queueing.cppm` ~552 comment accordingly (the note's own §2 lesson).
+- [x] M-4 numerics line references still stale: §2 `power_integral` :211 → 209, `one_minus_exp_neg` :262 → 263 (comment 261–262); §5 `lognormal_quantile` `queueing.cppm:121-129` → 183, the clamp, the "estimated" label :113, `conditional_hop` `behaviours.cppm:187-191`: cite function names instead of line numbers.
+- [x] M-5 unit tests for `KvClusterBehaviour`'s new paths: observe the same machines twice → same answer; change `kept` → recomputed; all lost → the offered mix.
+- [x] Nits: commit message said "news-feed's saturated graph_db" (mean rho 0.014; nothing there is saturated); test name "…write_quorum three times only the puts delivered" → "…and a write quorum of three times only the delivered puts"; re-wrap the edited prose lines in `scenario-schema.md` (the `search_index` paragraph, the kv "ANSWERED" sentence) and `search-autocomplete/README.md` line 19.
+  Nits round notes (with the Task 19 items and the Task 15 review's m10; one commit,
+  `nodes,report,docs: review nits after the kv fix round; over re-checked under --duration; phase
+  3 named in refusals`): M-1 `report.cpp` `nothing_offered(op)` (offered 0); `every_request_lost`
+  requires an offered op and `worst_latency` skips a zero-offered one, so its SLO is skipped with
+  no note (test `a latency SLO on an op nobody sent is skipped without a note`). M-2
+  `answer_quorum` mixes only the answered sets (`detail::answered_only`, a compaction loop; the
+  nothing-delivered branch keeps the offered mix); test `a dead hot machine at a write quorum of N
+  leaves the writes the cool sets answer` (NaN before the fix, checked). M-3 `TrialGroup::failure`
+  (default member initializer `1.0 - success`, so `KvClusterBehaviour::loss` and the tests are
+  unchanged), set to `normal_cdf(-z)` in `integrate_quorum`, used by `fewer_than`. Re-measured
+  with a probe test (not kept) through `lognormal_order_statistic`: mean / variance relative
+  error 3e-16 / 1.2e-11 at SCV 1e-4 (the E[X^2] - E[X]^2 cancellation), at most 1.1e-15 / 2.4e-15
+  at SCV 0.01 to 100 (before: 8.5e-9, 1.1e-7, 1.7e-6, 9.2e-6 on the variance at 10, 20, 50, 100);
+  the tolerance test now runs SCV 20, 50 and 100 at 1e-8; numerics §7's table, a "Where the digits
+  went before" paragraph, the `queueing.cppm` comment and the schema's kv paragraph say so. The
+  narrow-beside-wide case (4000-point cap) still gives 8.4e-4 on the mean. Output: the ten
+  runnable scenarios' Release `run` (table and JSON), all estimates but kv-store's JSON, and the 14
+  explains are byte-identical to 58f782e; kv-store's `estimate` JSON moved by at most 9.4e-16
+  relative; its README variants (`nodes: 8`, `nodes: 4`, `vnodes: 1`, `vnodes: 1` + W = 3,
+  W3/R1, W1/R3, `nodes: 8` + W = 3) by at most 1.1e-13 in `run` JSON and 5.6e-13 in `estimate`
+  JSON (tables identical); news-feed's graph_db did not move. No pin moved. M-4 numerics §2, §5
+  (and §7, §8 and the try-its that pointed into `queueing.cppm`, which this round shifted) cite
+  function and test names instead of line numbers; §3, §4, §6 and two try-its still cite lines in
+  `caching.cppm`, `fluid.cppm` and the tests, untouched here. M-5 three unit tests in
+  `test_behaviours.cpp` (same machines twice → identical answer; only the hot kept share changed →
+  write delivered 1 − p_hot × 0.5; all lost → the offered p_hot mix of the two sets' order
+  statistics). Nits: the commit message cannot be amended (pushed); both kv-store W = 3 scenario
+  tests renamed (`... and a write quorum of three times only the delivered puts` / `... times out
+  the puts past 100ms`); the schema's `search_index` paragraph and kv "ANSWERED" sentence
+  re-wrapped; search-autocomplete's README had been rewritten by 9c107c6 and has no over-long
+  prose line left. Task 19 items: the refusal reads `... do not support yet (phase 3)` (the four
+  types left are all phase 3; seven tests and the schema); `run --duration` re-checks every SLO's
+  `over` (`main.cpp` `over_beyond_run`, the loader's wording: `error: --duration 10m: over must fit
+  in the run after warmup (1h > duration 10m - warmup 5m)`, exit 1), with two process-level ctest
+  checks (`tests/cli/run_duration.cmake`, the warmup rule had no test either); the Task 13 note's
+  7.3e-7 / 4.4 % corrected to the binary's 8.9e-7 of the delivered requests / 3.9 % (the same
+  figures were also still in numerics §6 and the rate-limiter README: corrected there too).
+  m10: the timed scenario test (it runs chain, hello, consistent-hashing, kv-store and
+  rate-limiter, at most 0.6 s each in Debug) measures CPU time (`std::clock`) instead of the wall
+  clock, keeping five seconds; renamed `... run in under five seconds of CPU and pass their SLOs`.
+  1138 tests (7 new), green in Debug and Release, warning-free, clang-format-18 clean.
+
 
 ### Task 12: A step after a failed step does not run
 
@@ -400,7 +442,7 @@
 - [x] **I-1 The run table hides timeouts** (`report.cpp` ~566–581): kv-store at 8 nodes shows `95.3ms 95.2ms 100ms 100ms` with 56 % timed out; unique-id prints `-` while the SLO row says 50 ms. Fix: a `timed out/s` column (at least when any client has a timeout) and, with C-1, `>100ms` in a percentile column where s > 1 − q.
 - [x] **I-2 JSON prints made-up latencies for an op with nothing answered:** `Summary::ops` falls back to `by_time`, which holds `lognormal_below`'s stand-in (the timeout, or 0 at `timeout: 0s`): youtube upload `mean_s` 9.99999999994 / `p99_s` 10, unique-id `mean_s` 0.0495. Fix: `null` when `by_answered.weight == 0 && timed_out > 0` (keep the limiter-refuses-everything fallback). The underflow guard's {limit, zero spread} is the right limit; it must just never be shown.
 - [x] **I-3 Missing plan-required test:** the ticket-server variant's shorten numbers (593.0 answered, 293.6 timed out, 266.1 lost, p99 == 1.0), i.e. losses and a timeout together with answered = offered − lost − timed out and timed_out taken from delivered.
-- [x] Minors: 1 rate-limiter p99 30.5 → 29.9 ms is a moment-fit artefact (the cut removes 7.3e-7 of requests carrying 4.4 % of the fitted variance; the requests' own p99 moves ~1e-6): accept, no skip threshold (a discontinuity), one clause in `rate-limiter/README.md` ~86–90 and numerics.md; 2 consistent-hashing `vnodes: 1` README ~73–76: the "slowest 0.5 % time out" is the fit's tail over a two-peaked mixture (51 % at ≈ 67 ms, 49 % at ≈ 1 ms): say so; rewrap line 76; 3 design spec line 85 still lists timeouts among drops: fix or add a §17 entry; 4 one shared helper for the cap + C-1 rule used by `Summary::ops` and Task 14's windows; 5 the timeout is read from the spec in the report and from `ClientBehaviour::timeout_s()` in the engine: one source; 6 `--series-ops` CSV has no `timed_out_per_s` column: add it (schema row); 7 the plan's Task 13 file list says `test_theory.cpp`, the tests are in `tests/theory/test_timeout.cpp`; 8 `lognormal_below` comment: a zero-spread response equal to the timeout counts as answered (as variance → 0 it tends to half).
+- [x] Minors: 1 rate-limiter p99 30.5 → 29.9 ms is a moment-fit artefact (the cut removes 8.9e-7 of the delivered requests carrying 3.9 % of the fitted variance, as the binary gives them; this note first said 7.3e-7 and 4.4 %; the requests' own p99 moves ~1e-6): accept, no skip threshold (a discontinuity), one clause in `rate-limiter/README.md` ~86–90 and numerics.md; 2 consistent-hashing `vnodes: 1` README ~73–76: the "slowest 0.5 % time out" is the fit's tail over a two-peaked mixture (51 % at ≈ 67 ms, 49 % at ≈ 1 ms): say so; rewrap line 76; 3 design spec line 85 still lists timeouts among drops: fix or add a §17 entry; 4 one shared helper for the cap + C-1 rule used by `Summary::ops` and Task 14's windows; 5 the timeout is read from the spec in the report and from `ClientBehaviour::timeout_s()` in the engine: one source; 6 `--series-ops` CSV has no `timed_out_per_s` column: add it (schema row); 7 the plan's Task 13 file list says `test_theory.cpp`, the tests are in `tests/theory/test_timeout.cpp`; 8 `lognormal_below` comment: a zero-spread response equal to the timeout counts as answered (as variance → 0 it tends to half).
 - [x] Commit `report: a latency SLO fails when its quantile timed out; timeouts shown in the table, null in JSON for nothing answered; review nits`.
   Fix round notes: C-1 one helper in `report.cpp`, `percentile_seen_by_client(mean, variance,
   share_timed_out, timeout, quantile)` (a `Quantile` is its level and z), used by `Summary::ops`
@@ -662,10 +704,11 @@ comprehensive review below covers them unless a separate review is run first.
 **Red commits on main:** none.
 
 **Left to do, in order:**
-1. The **nits round**: the minors of the kv/search fix round's review (M-1 to M-5 and the nits,
-   above, unticked), the items the Task 19 resolution notes and its report list for the 2c
-   review, and edits to `docs/study/numerics.md` §2, §5, §7 and the schema's kv/search paragraphs
-   (Task 19 left those sections alone for it).
+1. Done (its notes are under the kv/search review above). The **nits round**: the minors of the
+   kv/search fix round's review (M-1 to M-5 and the nits, above), the items the Task 19
+   resolution notes and its report list for the 2c review, and edits to
+   `docs/study/numerics.md` §2, §5, §7 and the schema's kv/search paragraphs (Task 19 left those
+   sections alone for it).
 2. The **comprehensive 2c review** (next section), its fix round, push, CI green.
 3. The **whole-of-phase-2 review** (2a + 2b + 2c, section after it), its fix round, push.
 4. Stop (owner's instruction of 2026-10-29): phase 3 waits for a new instruction.
@@ -679,7 +722,8 @@ comprehensive review below covers them unless a separate review is run first.
   re-check `over`**: the loader refuses `over` longer than the file's duration − warmup, but
   `simsys run scenarios/book/youtube/scenario.yaml --duration 10m` keeps `over: 1h` and reports
   `(worst 1h from 00:05)` for a 10-minute run (warmup is re-checked against `--duration`, `over`
-  is not); **`simsys sweep` is narrower than refinement 15** (three metric kinds, no SLO or exit
+  is not) [both resolved in the nits round: `(phase 3)`, and `--duration` re-checks `over`];
+  **`simsys sweep` is narrower than refinement 15** (three metric kinds, no SLO or exit
   columns, `--format`): spec §19 entry 15 says so, decide whether that is the final scope.
 - [ ] Fix round recorded here as "Comprehensive 2c review at <sha>" with each finding and its resolution; commit; push to `origin/main`.
 

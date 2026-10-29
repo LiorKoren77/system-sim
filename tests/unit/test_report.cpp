@@ -2427,6 +2427,26 @@ TEST_CASE("a latency SLO on an op nobody answered is skipped and says nobody ans
   REQUIRE(results[0].note == "nobody answered u.send: no latency to observe");
 }
 
+// An op nobody sent (the client's rate is 0) has no latency either, but nothing went wrong: the
+// SLO is skipped as a window with nothing offered is, without the "nobody answered" note, which
+// is for requests that were sent and all lost (review of the kv/search fix round, M-1).
+TEST_CASE("a latency SLO on an op nobody sent is skipped without a note", "[report]") {
+  auto s = sink_reported(0.0, std::nullopt);
+  s.nodes[0].workload->curve.base = Rate{0};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  REQUIRE(summary.ops().front().offered_per_s == 0.0);
+  const std::array slos{simsys::model::SloSpec{.metric = simsys::model::SloMetric::p99_latency,
+                                               .node = "u",
+                                               .op = "send",
+                                               .max = simsys::SimTime{50ms}}};
+  const auto results = simsys::report::evaluate_slos(summary, slos);
+  REQUIRE(results.size() == 1);
+  REQUIRE(results[0].status == simsys::report::SloStatus::skipped);
+  REQUIRE_FALSE(results[0].observed.has_value());
+  REQUIRE(results[0].note.empty());
+}
+
 TEST_CASE("explain prints no politeness note for a sink that states none", "[report]") {
   const auto text = explain_of(sink_reported(0.05, std::nullopt));
   CAPTURE(text);

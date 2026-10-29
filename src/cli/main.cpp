@@ -206,9 +206,26 @@ int run_estimate(const std::filesystem::path& file, const ReportOptions& options
   return print_report(summary, options);
 }
 
+// The first SLO window (`over`) longer than the run observes after the warmup, duration −
+// warmup, as the loader's rule words it (config.cpp, read_slo_over): such a window never
+// completes, so its SLO would check nothing. Empty when every window fits.
+std::optional<std::string> over_beyond_run(const simsys::model::Scenario& scenario,
+                                           simsys::SimTime duration) {
+  const auto observed = duration.count() - scenario.warmup.count();
+  for (const auto& slo : scenario.slos) {
+    if (!slo.over || slo.over->count() <= observed) continue;
+    return std::format("over must fit in the run after warmup ({} > duration {} - warmup {})",
+                       simsys::describe_duration(*slo.over), simsys::describe_duration(duration),
+                       simsys::describe_duration(scenario.warmup));
+  }
+  return std::nullopt;
+}
+
 // `--duration` overrides the scenario's; like the scenario's own, it must leave a non-empty
-// window after the warmup (the loader enforces the same rule on the file). The text is
-// the user's, so the message echoes what they typed.
+// window after the warmup, and room in that window for every SLO's `over` (the loader enforces
+// the same rules on the file; review of plan 2c Task 19: `--duration 10m` on youtube kept its
+// `over: 1h` and reported a 1 h window of a 10-minute run). The text is the user's, so the
+// message echoes what they typed.
 std::expected<simsys::SimTime, std::string> run_duration(const std::filesystem::path& file,
                                                          const simsys::model::Scenario& scenario,
                                                          const std::optional<std::string>& text) {
@@ -222,6 +239,10 @@ std::expected<simsys::SimTime, std::string> run_duration(const std::filesystem::
     return std::unexpected(std::format("{}: error: --duration {} is not longer than the warmup {}",
                                        file.string(), *text,
                                        simsys::describe_duration(scenario.warmup)));
+  }
+  if (const auto refused = over_beyond_run(scenario, *parsed)) {
+    return std::unexpected(
+        std::format("{}: error: --duration {}: {}", file.string(), *text, *refused));
   }
   return *parsed;
 }

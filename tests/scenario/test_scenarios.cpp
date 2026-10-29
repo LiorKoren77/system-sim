@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <ctime>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -99,12 +100,18 @@ TEST_CASE("every shipped scenario resolves into a graph that explain can print",
 
 // Which scenarios run grows with each phase, so the test does not name them: a scenario whose
 // node types the engine does not simulate yet is refused by Simulation::create with a message
-// naming the phase ("... do not support yet (phase 2)") and is skipped; every other one is run
+// naming the phase ("... do not support yet (phase 3)") and is skipped; every other one is run
 // to its end and must meet its own SLOs. A scenario the engine refuses for any other reason is
 // a failure, not a skip.
-TEST_CASE("scenarios whose node types all exist run in under five seconds and pass their SLOs",
-          "[scenario]") {
-  using namespace std::chrono_literals;
+// The time limit's point is "no shipped scenario takes minutes", not a benchmark: each one run here
+// costs at most 0.6 s of CPU in Debug and 0.04 s in Release (measured 2026-10-29). It is CPU time,
+// not wall-clock time: under `ctest -j` on a loaded machine this test took 4.61 s of wall clock
+// in Debug and its wall-clock limit was flaky (review of plan 2c Task 15, m10), while the CPU time
+// a single-threaded run spends is what the scenario costs, whoever else shares the machine.
+TEST_CASE(
+    "scenarios whose node types all exist run in under five seconds of CPU and pass their "
+    "SLOs",
+    "[scenario]") {
   int ran = 0;
   for (const auto& file : scenario_files()) {
     CAPTURE(file);
@@ -114,7 +121,7 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
     const auto g = build_or_fail(s);
     auto created = simsys::engine::Simulation::create(g);
     if (!created) {
-      REQUIRE(created.error().message.find("phase 2") != std::string::npos);
+      REQUIRE(created.error().message.find("phase 3") != std::string::npos);
       continue;  // a node type of a later phase: nothing to run yet
     }
     // Two runnable scenarios are checked by their own tests below instead, each for a stated
@@ -147,11 +154,14 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
     ++ran;
     auto& sim = *created;
     simsys::report::Summary summary{g, s.warmup};
-    const auto started = std::chrono::steady_clock::now();
+    // std::clock (C's <ctime>): the CPU time this process has used, in CLOCKS_PER_SEC ticks.
+    // std::chrono has no CPU clock, only wall clocks (steady_clock, system_clock).
+    const std::clock_t started = std::clock();
     // C++20 designated initializers: the run options name the fields they set, so the
     // call says which duration is which; replaces a positional {s.duration, s.step}.
     sim.run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
-    REQUIRE(std::chrono::steady_clock::now() - started < 5s);
+    const double cpu_s = static_cast<double>(std::clock() - started) / CLOCKS_PER_SEC;
+    REQUIRE(cpu_s < 5.0);
     const auto results = simsys::report::evaluate_slos(summary, s.slos);
     for (const auto& r : results) {
       // No to_string(SloMetric) exists yet, so the metric is captured as its enum value
@@ -246,7 +256,7 @@ TEST_CASE("book scenarios are refused by run until their node types exist", "[sc
   const auto g = build_or_fail(s);
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
-  REQUIRE(sim.error().message.find("phase 2") != std::string::npos);
+  REQUIRE(sim.error().message.find("phase 3") != std::string::npos);
 }
 
 // Phase 2b runs the nodes up to the id generator: the two tutorials, the rate-limiter lab, the
@@ -290,7 +300,7 @@ TEST_CASE("a refused scenario's message names the first unsupported node and the
   REQUIRE_FALSE(sim.has_value());
   const auto& message = sim.error().message;
   CAPTURE(message);
-  REQUIRE(message.find("phase 2") != std::string::npos);
+  REQUIRE(message.find("phase 3") != std::string::npos);
   // Name some node of the scenario: the engine reports the first unsupported one it meets.
   const auto names_a_node = std::ranges::any_of(
       s.nodes, [&](const auto& node) { return message.find(node.id) != std::string::npos; });
@@ -503,7 +513,7 @@ TEST_CASE("book/google-drive is refused at long_poll, its ws_gateway", "[scenari
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
           "node 'long_poll' has type 'ws_gateway', which run/estimate do not support yet "
-          "(phase 2)");
+          "(phase 3)");
 }
 
 // Ch. 11's news feed: its fan-out queue and pool are simulated (Task 6, their `then` steps Task 7),
@@ -1032,7 +1042,7 @@ TEST_CASE("book/notification-system is still refused at fanout, its notification
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
           "node 'fanout' has type 'notification_fanout', which run/estimate do not support yet "
-          "(phase 2)");
+          "(phase 3)");
 }
 
 // chat-system's nodes in file order: users, lb, the chat API service, then `discovery`, a
@@ -1043,7 +1053,7 @@ TEST_CASE("book/chat-system is still refused at discovery, its service_discovery
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
           "node 'discovery' has type 'service_discovery', which run/estimate do not support yet "
-          "(phase 2)");
+          "(phase 3)");
 }
 
 // The books' providers' failure rates are the numbers in the YAML: APNs and FCM 2 %, the SMS
@@ -1228,7 +1238,7 @@ simsys::report::OpSummary put_of(const simsys::model::Scenario& s) {
 // 39.62 ms and 233 ms: (0.3790 - 0.3493) x (100.3 - 0.6) ms = 2.96 ms of puts the hot set had
 // already lost.
 TEST_CASE(
-    "labs/kv-store with one virtual node and write_quorum three times only the puts delivered",
+    "labs/kv-store with one virtual node and a write quorum of three times only the delivered puts",
     "[scenario]") {
   const auto put = put_of(kv_lab_writing_to_all_three(false));
   const double k = ring_factor(16, 3, 1);
@@ -1250,7 +1260,7 @@ TEST_CASE(
 // and the p99 SLO fails at the timeout (more than 1 % timed out). Weighted by the puts offered, as
 // before the fix, it was 7.43 % (638.4/s) and a mean of 29.4 ms.
 TEST_CASE(
-    "labs/kv-store with one virtual node and write_quorum three times out the puts past 100ms",
+    "labs/kv-store with one virtual node and a write quorum of three times out the puts past 100ms",
     "[scenario]") {
   const auto untimed = put_of(kv_lab_writing_to_all_three(false));
   const auto put = put_of(kv_lab_writing_to_all_three(true));

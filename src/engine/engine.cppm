@@ -884,6 +884,8 @@ flow::Flow DelayLine::pop() {
 // simulated type still lacks (not_runnable_yet: a cache without a hit ratio, a che CDN without a
 // `keys` size). So a type the engine has no model for is named before a node that only lacks a
 // number: google-drive is refused at its ws_gateway, long_poll, the first type it has no model of.
+// The message names the phase that plans a model for the type: phase 3 for each of the four left
+// (ws_gateway, service_discovery, notification_fanout, frontier).
 std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Graph& g) {
   for (const auto& node : g.nodes()) {
     if (simulated(node.spec.type)) continue;
@@ -892,7 +894,7 @@ std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Gr
     // Replaces throwing or returning a sentinel; the caller must look at the result.
     return std::unexpected{graph::EngineError{
         "node '" + node.spec.id + "' has type '" + std::string{model::to_string(node.spec.type)} +
-        "', which run/estimate do not support yet (phase 2)"}};
+        "', which run/estimate do not support yet (phase 3)"}};
   }
   for (const auto& node : g.nodes()) {
     if (auto refused = not_runnable_yet(node.spec)) {

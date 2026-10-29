@@ -270,9 +270,15 @@ struct BelowLimit {
 
 // `trials` independent trials that each succeed with probability `success`: one kind of replica
 // in a quorum (its share of answered, or of kept, requests). See probability_fewer_than.
+// `failure` is 1 - success, carried rather than computed where it is needed: when success is
+// within 1e-16 of 1, the subtraction 1 - success keeps none of failure's digits (section 2 of
+// docs/study/numerics.md: cancellation), and the quadrature below has failure itself to the last
+// digit, Phi(-z) (review of the kv/search fix round, M-3). A group built without it gets
+// 1 - success, as before: a default member initializer may read a member declared above it.
 struct TrialGroup {
   int trials;
   double success;
+  double failure = 1.0 - success;
 };
 
 // A grid even in ln t: points first_log_s, first_log_s + step, ... (`points` of them). Even in
@@ -378,8 +384,9 @@ template <std::size_t N>
 
 // P(fewer than `successes` of the groups' trials succeed), with `below` (size `successes`) as the
 // working distribution: below[j] = P(exactly j successes so far), j < successes. Each trial of
-// success probability p moves mass up one (below[j] p to j + 1) or keeps it (below[j] (1 - p));
-// mass that reaches `successes` leaves the array, since only "fewer than" is asked.
+// success probability p moves mass up one (below[j] p to j + 1) or keeps it (below[j] (1 - p), the
+// group's `failure`); mass that reaches `successes` leaves the array, since only "fewer than" is
+// asked.
 // C++20 std::span: a non-owning view of contiguous elements, here of the caller's groups and of a
 // scratch array it owns, so the quadrature calls this once per grid point without allocating;
 // replaces a (pointer, size) pair or a `std::vector&` that would tie the caller to a vector.
@@ -390,9 +397,9 @@ template <std::size_t N>
   for (const TrialGroup& group : groups) {
     for (int trial = 0; trial < group.trials; ++trial) {
       for (std::size_t j = below.size() - 1; j > 0; --j) {
-        below[j] = below[j] * (1.0 - group.success) + below[j - 1] * group.success;
+        below[j] = below[j] * group.failure + below[j - 1] * group.success;
       }
-      below.front() *= 1.0 - group.success;
+      below.front() *= group.failure;
     }
   }
   // C++23 std::ranges::fold_left: a left fold over a range with an explicit initial value whose
@@ -484,7 +491,10 @@ struct FittedReplicas {
   return moments_from_survival(lognormal_grid(fitted), [&](double log_t) {
     for (std::size_t i = 0; i < fitted.size(); ++i) {
       const auto& [replicas, fit] = fitted[i];
-      answered[i] = {.trials = replicas, .success = normal_cdf((log_t - fit.mu) / fit.sigma)};
+      const double z = (log_t - fit.mu) / fit.sigma;
+      // Phi(-z), not 1 - Phi(z): S_k is a sum of products of the failures, and where they are
+      // small (t far above a group, weighted by t^2 in E[X^2]) the subtraction would lose them.
+      answered[i] = {.trials = replicas, .success = normal_cdf(z), .failure = normal_cdf(-z)};
     }
     return fewer_than(answered, below);
   });
@@ -549,9 +559,12 @@ export namespace simsys::queueing {
 //   S_k(t) = P(X > t) = P(fewer than k successes),  replica i succeeding with F_i(t) = P(X_i <= t)
 // the Poisson-binomial above over the groups, and the moments are E[X] = ∫ S_k dt and E[X^2] =
 // ∫ 2 t S_k dt (moments_from_survival, on a grid even in ln t that spans every group's fit to
-// 8 sigma, sigma / 2 apart: one lognormal comes back to its own moments within 1e-8 relative for a
-// sojourn SCV of at most 10, and no further: 1.1e-7 on the variance at SCV 20, 1.7e-6 at 50; see
-// docs/study/numerics.md). The bound holds while the grid keeps its sigma / 2 step: a very narrow
+// 8 sigma, sigma / 2 apart: one lognormal comes back to its own moments within 1e-8 relative at
+// every sojourn SCV from 1e-4 to 100, a few 1e-16 but for the variance at SCV 1e-4, 1.2e-11; see
+// docs/study/numerics.md section 7). That needs each replica's failure Phi(-z) as computed, not
+// 1 - Phi(z): past SCV 10 the subtraction's rounding, weighted by t^2 in E[X^2], was the error
+// (1.1e-7 on the variance at SCV 20, 1.7e-6 at 50; review of the kv/search fix round, M-3), not
+// the trapezoid rule. The bound holds while the grid keeps its sigma / 2 step: a very narrow
 // group (sigma clamped to 0.001) beside a wide one (SCV 10) needs more than its 4000 points, the
 // step widens, and the error grows to 8.4e-4 on the mean and 1.4e-3 on the variance (review of
 // plan 2c Task 11, minors 6 and 7). Where exponential_order_statistic needs every replica alike and
