@@ -49,6 +49,14 @@ target_sources(simsys
     src/sweep/sweep.cppm
   PRIVATE                               # module implementation units are ordinary sources
     src/config/config.cpp
+    src/config/detail.cpp
+    src/config/header.cpp
+    src/config/nodes.cpp
+    src/config/steps.cpp
+    src/config/workload.cpp
+    src/config/links.cpp
+    src/config/slos.cpp
+    src/config/overrides.cpp
     src/model/model.cpp
     src/report/explain.cpp
     src/report/report.cpp
