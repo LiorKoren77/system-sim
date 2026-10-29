@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "../support/explain_lines.hpp"
@@ -1295,28 +1296,87 @@ TEST_CASE("explain still renders a cdn that has a byte capacity", "[report]") {
   REQUIRE(text.contains("misses → origin"));
 }
 
-// A kv_cluster's `nodes`, `replication` and quorums are read and ignored until phase 3: its
-// capacity is that of one box (per replica, `replicas` 1), while the lab's `capacity: 10k/s` is
-// per node of eight, each write landing on N = 3 of them. A percentage against the one box would
-// be a verdict on a model the simulator does not have (labs/kv-store printed 300 %, red), so the
-// check gives the load and says why there is no verdict, as for a capacity converted from bytes
-// (review of c9d5f8c).
-TEST_CASE("explain gives no verdict on a kv_cluster, whose nodes are not modelled", "[report]") {
+// ---- kv_cluster's check line and node line (plan 2c refinement 9, Task 10; book ch. 6) ----
+//
+// A kv_cluster is `nodes` machines of `capacity` each, every request going to N of them, so the
+// paper load it is offered is N times the requests, and its total capacity `nodes` times one
+// node's. The check line says both: "peak offered 90k/s (30k/s x N 3) vs 80k/s (8 nodes)", the
+// requests beside the replica-requests, the machines beside the total. Behind a ring (N < nodes)
+// the average hides the node that breaks first, so the verdict is the HOTTEST node's, k = 1 +
+// 1/sqrt(vnodes) times the average (the balancer's ring, 1.0816 at the default 150 virtual
+// nodes): "(hottest 122%, red)"; with N = nodes every node holds every key and the verdict is the
+// plain average. This replaces the phase-2c "not checked: kv_cluster nodes, replication and
+// quorums: phase 3" note, which said the numbers had no model to be checked against.
+
+namespace {
+// u(`rate`/s of `get`) -> store, a kv_cluster of `nodes` machines of 10k/s each keeping N = 3
+// copies (Dynamo's default; the other keys are left to their defaults).
+Scenario kv_explained(int nodes, double rate) {
   Scenario s{.name = "kv", .version = 1, .duration = 1min};
-  s.nodes = {NodeSpec{.id = "u",
-                      .type = NodeType::client,
-                      .workload = Workload{.curve = {.base = Rate{30'000}},
-                                           .op_shares = {{"get", 0.7}, {"put", 0.3}}}},
-             NodeSpec{.id = "store", .type = NodeType::kv_cluster, .capacity = Rate{10'000}}};
+  NodeSpec store{.id = "store", .type = NodeType::kv_cluster, .capacity = Rate{10'000}};
+  store.kv_nodes = nodes;
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{rate}}, .op_shares = {{"get", 1.0}}}},
+      std::move(store)};
   s.links = {LinkSpec{.from = "u", .to = "store"}};
-  const auto text = explain_of(s);
+  return s;
+}
+}  // namespace
+
+// nodes = 8: 30k requests/s x N 3 = 90k replica-requests/s over 8 x 10k = 80k/s: 112.5 % on
+// average, and the hottest node k = 1.0816 x 11.25k = 12.17k/s: 121.7 %, printed to three digits
+// as 122 %, red.
+TEST_CASE("explain checks eight kv nodes at 30k requests a second: the hottest node is red",
+          "[report]") {
+  const auto text = explain_of(kv_explained(8, 30'000));
   CAPTURE(text);
   const auto line = check_line(text, "store");
   REQUIRE(
-      line.contains("peak offered 30k/s vs 10k/s total capacity  (not checked: kv_cluster "
-                    "nodes, replication and quorums: phase 3)"));
-  REQUIRE_FALSE(line.contains(", red"));  // ("peak offered" contains "red")
-  REQUIRE_FALSE(line.contains("%"));
+      line.contains("peak offered 90k/s (30k/s × N 3) vs 80k/s (8 nodes)  (hottest 122%, red)"));
+  REQUIRE_FALSE(line.contains("not checked"));
+}
+
+// nodes = 16: the same 90k/s over 160k/s, 56.25 % on average, the hottest 60.84 %: 60.8 %, green.
+TEST_CASE("explain checks sixteen kv nodes at 30k requests a second: the hottest node is green",
+          "[report]") {
+  const auto text = explain_of(kv_explained(16, 30'000));
+  CAPTURE(text);
+  REQUIRE(check_line(text, "store")
+              .contains("peak offered 90k/s (30k/s × N 3) vs 160k/s (16 nodes)  "
+                        "(hottest 60.8%, green)"));
+}
+
+// N = nodes = 3: every node holds every key, so the verdict is the plain average and no node is
+// called the hottest: 1k requests/s x 3 = 3k replica-requests/s over 3 x 10k = 30k/s, 10 %.
+TEST_CASE("explain gives a kv_cluster that replicates to every node a plain percentage",
+          "[report]") {
+  const auto text = explain_of(kv_explained(3, 1000));
+  CAPTURE(text);
+  const auto line = check_line(text, "store");
+  REQUIRE(line.contains("peak offered 3k/s (1k/s × N 3) vs 30k/s (3 nodes)  (10%, green)"));
+  REQUIRE_FALSE(line.contains("hottest"));
+}
+
+// The node line prints the resolved shape and what it does not yet model. Defaults applied
+// (N = 3, W = 2, R = 2, ap: Dynamo's classic quorum, ch. 6), without "(default)" marks.
+TEST_CASE("explain prints a kv_cluster's nodes, replication, quorums and mode", "[report]") {
+  SECTION("defaults for everything but the nodes") {
+    const auto text = explain_of(kv_explained(3, 1000));
+    CAPTURE(text);
+    REQUIRE(node_line(text, "store").contains("nodes=3 N=3 W=2 R=2 mode=ap (partitions: phase 3)"));
+  }
+  SECTION("stated values, cp mode") {
+    auto s = kv_explained(5, 1000);
+    s.nodes[1].replication = 5;
+    s.nodes[1].write_quorum = 3;
+    s.nodes[1].read_quorum = 3;
+    s.nodes[1].kv_mode = simsys::model::KvMode::cp;
+    const auto text = explain_of(s);
+    CAPTURE(text);
+    REQUIRE(node_line(text, "store").contains("nodes=5 N=5 W=3 R=3 mode=cp (partitions: phase 3)"));
+  }
 }
 
 // Plan 2c refinement 2: a capacity stated in bytes is checked in bytes. The node counts

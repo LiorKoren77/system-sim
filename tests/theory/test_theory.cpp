@@ -243,14 +243,16 @@ TEST_CASE("dropped flow does not propagate downstream", "[theory]") {
   REQUIRE(r.nodes[2].demand_per_s == Approx(1000).epsilon(1e-6));
 }
 
+// (The example used to be a kv_cluster; it is simulated since plan 2c Task 10, so the refusal is
+// shown on a ws_gateway, which waits for phase 3.)
 TEST_CASE("a simulation refuses node types the phase does not support yet", "[theory]") {
   Scenario s = mm1(1);
-  s.nodes[1].type = NodeType::kv_cluster;
+  s.nodes[1].type = NodeType::ws_gateway;
   const auto g = *simsys::graph::Graph::build(s);
   const auto sim = Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
-          "node 's' has type 'kv_cluster', which run/estimate do not support yet (phase 2)");
+          "node 's' has type 'ws_gateway', which run/estimate do not support yet (phase 2)");
 }
 
 TEST_CASE("run emits one record per step from 0 to duration, exclusive", "[theory]") {
@@ -4088,4 +4090,367 @@ TEST_CASE("a pool that calls a 2 percent sink loses 2 of 100 calls a second and 
   REQUIRE_THAT(e.nodes[*g.index_of("api")].dropped_per_s, WithinRel(2.0, 1e-9));
   REQUIRE_THAT(e.nodes[*g.index_of("api")].drain_per_s, WithinRel(98.0, 1e-9));
   REQUIRE_THAT(e.responses[0].answered.per_second, WithinRel(100.0, 1e-9));
+}
+
+// ---- kv_cluster in the steady state (plan 2c refinement 9, Task 10; book ch. 6, Dynamo) ----
+//
+// `nodes` machines of `capacity` each on a consistent-hash ring; the coordinator sends every
+// read and write to the key's N replicas (ch. 6 "quorum consensus"), so the cluster is sent N
+// times the requests. The sample counts that load in REPLICA-REQUESTS: `demand_per_s`,
+// `drain_per_s` and `dropped_per_s` are N x the client-level requests (the unit the nodes'
+// queues work in, so the balance demand = drain + dropped + d(backlog) holds as everywhere),
+// while the clients' offered and answered rates stay in requests. A read is answered by the R-th
+// fastest of N replica sojourns, a write by the W-th (Renyi's order statistics, test_queueing.cpp);
+// with N < nodes the hottest node carries k = 1 + 1/sqrt(vnodes) x the average (the balancer's
+// ring, the same hot and cool copy groups).
+
+namespace {
+// u(reads + writes per second) -> store, a kv_cluster of `nodes` machines, `replication` N copies
+// per key and the quorums W and R. Every node has `capacity` (default 10k/s) and a service time
+// `latency` (default 1 ms, so c = 10 servers per node by Little's law), the link has zero
+// latency: a response is the cluster's own. Node indices: u 0, store 1. Ops are `read` and
+// `write` (the default write op), left out of the client's mix when their rate is 0.
+struct KvFront {
+  int nodes{};
+  int replication{};
+  int write_quorum{};
+  int read_quorum{};
+  double reads{};
+  double writes{};
+  double capacity{10'000};
+  simsys::SimTime latency{1ms};
+  std::optional<int> vnodes{};
+};
+
+Scenario kv_front(const KvFront& shape) {
+  Scenario s{.name = "kv-front", .version = 1, .duration = 10s};
+  std::vector<std::pair<std::string, double>> shares;
+  const double total = shape.reads + shape.writes;
+  if (shape.reads > 0) shares.emplace_back("read", shape.reads / total);
+  if (shape.writes > 0) shares.emplace_back("write", shape.writes / total);
+  NodeSpec store{.id = "store",
+                 .type = NodeType::kv_cluster,
+                 .capacity = Rate{shape.capacity},
+                 .latency = shape.latency};
+  store.kv_nodes = shape.nodes;
+  store.replication = shape.replication;
+  store.write_quorum = shape.write_quorum;
+  store.read_quorum = shape.read_quorum;
+  store.vnodes = shape.vnodes;
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload =
+                          Workload{.curve = {.base = Rate{total}}, .op_shares = std::move(shares)}},
+             std::move(store)};
+  s.links = {LinkSpec{.from = "u", .to = "store", .latency = 0s}};
+  return s;
+}
+
+// What the client saw for `op` in record `r`.
+const simsys::engine::ResponseSample& response_of(const simsys::engine::StepRecord& r,
+                                                  std::string_view op) {
+  const auto it = std::ranges::find(r.responses, op, &simsys::engine::ResponseSample::op);
+  REQUIRE(it != r.responses.end());
+  return *it;
+}
+
+// The ring's imbalance for the default 150 virtual nodes (the balancer's: 1 + 1/sqrt(150)).
+const double ring_k = 1.0 + 1.0 / std::sqrt(150.0);
+}  // namespace
+
+// nodes = 3, N = 3: every node holds every key, so every node is sent every request: 1k reads/s
+// make 1k replica-requests/s at each of the three, 3k in all. Each node: capacity 10k/s x 1 ms
+// service = c = 10 servers, rho = 1000 / 10000 = 0.1 (utilization per server), and the chance a
+// request waits is Erlang C(c = 10, rho = 0.1) = 1.126e-7, a mean wait of C x s / (c (1 - rho)) =
+// 1.25e-11 s: nothing next to the 1 ms service (relative 1.3e-8), so each replica's sojourn is
+// m = 1 ms to a part in 1e8. The read's response is then the R-th order statistic of three
+// exponentials of mean m: 1/3, 5/6 and 11/6 ms for R = 1, 2, 3, variances 1/9, 13/36, 49/36 ms^2
+// (Renyi: m * sum_{i<R} 1/(3 - i), test_queueing.cpp).
+TEST_CASE("a three-node cluster at replication three answers a read in the R-th fastest replica",
+          "[theory]") {
+  REQUIRE(simsys::queueing::erlang_c(10, 0.1) < 2e-7);  // the wait is negligible, as derived
+  const auto read_with = [](int read_quorum) {
+    const auto g = *Graph::build(kv_front({.nodes = 3,
+                                           .replication = 3,
+                                           .write_quorum = 2,
+                                           .read_quorum = read_quorum,
+                                           .reads = 1000,
+                                           .writes = 0}));
+    return simulation_of(g).step(0s, 100ms);
+  };
+  SECTION("R = 1: the fastest of three, 0.3333 ms") {
+    const auto r = read_with(1);
+    REQUIRE_THAT(response_of(r, "read").response.mean_s, WithinRel(1.0 / 3.0 * 1e-3, 1e-6));
+    REQUIRE_THAT(response_of(r, "read").response.variance_s2, WithinRel(1.0 / 9.0 * 1e-6, 1e-6));
+  }
+  SECTION("R = 2: the quorum of two, 0.8333 ms") {
+    const auto r = read_with(2);
+    REQUIRE_THAT(response_of(r, "read").response.mean_s, WithinRel(5.0 / 6.0 * 1e-3, 1e-6));
+    REQUIRE_THAT(response_of(r, "read").response.variance_s2, WithinRel(13.0 / 36.0 * 1e-6, 1e-6));
+  }
+  SECTION("R = 3: the slowest of three, 1.8333 ms") {
+    const auto r = read_with(3);
+    REQUIRE_THAT(response_of(r, "read").response.mean_s, WithinRel(11.0 / 6.0 * 1e-3, 1e-6));
+    REQUIRE_THAT(response_of(r, "read").response.variance_s2, WithinRel(49.0 / 36.0 * 1e-6, 1e-6));
+  }
+}
+
+// The same cluster at 1k reads/s: each node is sent 1k x N / nodes = 1000/s, so the node is at
+// rho = 0.1 (the average, and the hottest too: N = nodes has no imbalance) and the sample counts
+// the cluster's 3 x 1000 = 3000 replica-requests/s, which it all serves.
+TEST_CASE("a kv_cluster's sample counts N times the requests in replica-requests", "[theory]") {
+  const auto g = *Graph::build(kv_front({.nodes = 3,
+                                         .replication = 3,
+                                         .write_quorum = 2,
+                                         .read_quorum = 2,
+                                         .reads = 1000,
+                                         .writes = 0}));
+  const auto r = simulation_of(g).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[1].demand_per_s, WithinRel(3000.0, 1e-12));
+  REQUIRE_THAT(r.nodes[1].drain_per_s, WithinRel(3000.0, 1e-9));
+  REQUIRE(r.nodes[1].dropped_per_s == 0.0);
+  REQUIRE_THAT(r.nodes[1].rho, WithinRel(0.1, 1e-12));
+  // The clients' side stays in requests: 1000 offered, all answered.
+  REQUIRE_THAT(response_of(r, "read").offered.per_second, WithinRel(1000.0, 1e-12));
+  REQUIRE_THAT(response_of(r, "read").answered.per_second, WithinRel(1000.0, 1e-9));
+}
+
+// A different N over a bigger ring: 4 nodes, N = 2, 4k reads/s: the cluster is sent 2 x 4000 =
+// 8000 replica-requests/s, 2000 per node on average (rho 0.2), and the hottest node k = 1.0816
+// times that: rho_hot = 0.2163, the node's reported rho.
+TEST_CASE("each request is sent to N replicas whatever the number of nodes", "[theory]") {
+  const auto g = *Graph::build(kv_front({.nodes = 4,
+                                         .replication = 2,
+                                         .write_quorum = 1,
+                                         .read_quorum = 1,
+                                         .reads = 4000,
+                                         .writes = 0}));
+  const auto r = simulation_of(g).step(0s, 100ms);
+  REQUIRE_THAT(r.nodes[1].demand_per_s, WithinRel(8000.0, 1e-12));
+  REQUIRE_THAT(r.nodes[1].rho, WithinRel(ring_k * 0.2, 1e-9));
+}
+
+// Writes wait for the W-th replica, reads for the R-th, from the same replicas: reads and writes
+// 500/s each at nodes = 3, N = 3 are 1000 replica-requests/s per node again (m = 1 ms), so with
+// R = 1 and W = 3 the read answers in 1/3 ms and the write in 11/6 ms, five and a half times
+// slower: the price of acknowledging at every replica.
+TEST_CASE("a write is answered at the W-th fastest replica and a read at the R-th", "[theory]") {
+  const auto g = *Graph::build(kv_front({.nodes = 3,
+                                         .replication = 3,
+                                         .write_quorum = 3,
+                                         .read_quorum = 1,
+                                         .reads = 500,
+                                         .writes = 500}));
+  const auto r = simulation_of(g).step(0s, 100ms);
+  REQUIRE_THAT(response_of(r, "read").response.mean_s, WithinRel(1.0 / 3.0 * 1e-3, 1e-6));
+  REQUIRE_THAT(response_of(r, "write").response.mean_s, WithinRel(11.0 / 6.0 * 1e-3, 1e-6));
+}
+
+TEST_CASE("a write quorum of two answers a write in 0.8333 ms", "[theory]") {
+  const auto g = *Graph::build(kv_front({.nodes = 3,
+                                         .replication = 3,
+                                         .write_quorum = 2,
+                                         .read_quorum = 3,
+                                         .reads = 0,
+                                         .writes = 1000}));
+  const auto r = simulation_of(g).step(0s, 100ms);
+  REQUIRE_THAT(response_of(r, "write").response.mean_s, WithinRel(5.0 / 6.0 * 1e-3, 1e-6));
+}
+
+// Which ops are writes is the node's `write_ops` (model::write_ops_of; absent: just `write`). With
+// write_ops = [put], a `put` waits for W = 3 and a `get` for R = 1, the same replicas as before.
+TEST_CASE("the ops a kv_cluster lists in write_ops use the write quorum", "[theory]") {
+  Scenario s = kv_front({.nodes = 3,
+                         .replication = 3,
+                         .write_quorum = 3,
+                         .read_quorum = 1,
+                         .reads = 500,
+                         .writes = 500});
+  s.nodes[0].workload->op_shares = {{"get", 0.5}, {"put", 0.5}};
+  s.nodes[1].write_ops = std::vector<std::string>{"put"};
+  const auto r = simulation_of(*Graph::build(s)).step(0s, 100ms);
+  REQUIRE_THAT(response_of(r, "get").response.mean_s, WithinRel(1.0 / 3.0 * 1e-3, 1e-6));
+  REQUIRE_THAT(response_of(r, "put").response.mean_s, WithinRel(11.0 / 6.0 * 1e-3, 1e-6));
+}
+
+// The replicas' sojourns have the mean of the copies, weighted by the requests each copy
+// serves, and the quorum's order statistic is taken over that one mean. nodes = 8, N = 3, 20k
+// reads/s at 10k/s per node, 1 ms (c = 10): 60k replica-requests/s, 7.5k per node on average,
+// rho = 0.75. The ring (k = 1 + 1/sqrt(150) = 1.08165): the hot node carries k x 7.5k = 8.112k
+// (rho_hot = 0.8112) and each of the 7 others (8 - k)/(8 x 7) x 60k = 7.4125k (rho_cool =
+// 0.7412); a request reaches the hot node with probability k/8 = 0.13521. With W_q the Erlang C
+// wait of an M/M/10 queue at that rho (queueing::mmc_wait) and s = 1 ms:
+//   m = (k/8) (s + Wq(0.8112)) + (1 - k/8) (s + Wq(0.7412))     (about 1.1282 ms)
+// and the read, R = 2, is answered in 5/6 m (0.9402 ms). The node reports the hot copy's rho.
+TEST_CASE("a kv_cluster's replicas answer with the request-weighted mean of its hot and cool nodes",
+          "[theory]") {
+  const auto g = *Graph::build(kv_front({.nodes = 8,
+                                         .replication = 3,
+                                         .write_quorum = 2,
+                                         .read_quorum = 2,
+                                         .reads = 20'000,
+                                         .writes = 0}));
+  const auto r = simulation_of(g).step(0s, 100ms);
+  constexpr double nodes = 8;
+  const double rho = 0.75;
+  const double rho_hot = ring_k * rho;
+  const double rho_cool = (nodes - ring_k) / (nodes - 1) * rho;
+  const double hot_sojourn = simsys::queueing::mmc_wait(10, rho_hot, 0.001).mean_s + 0.001;
+  const double cool_sojourn = simsys::queueing::mmc_wait(10, rho_cool, 0.001).mean_s + 0.001;
+  const double m = ring_k / nodes * hot_sojourn + (1 - ring_k / nodes) * cool_sojourn;
+  REQUIRE_THAT(m, WithinRel(1.1282e-3, 1e-3));  // the derivation's number
+  REQUIRE_THAT(response_of(r, "read").response.mean_s, WithinRel(5.0 / 6.0 * m, 1e-9));
+  REQUIRE_THAT(response_of(r, "read").response.variance_s2, WithinRel(13.0 / 36.0 * m * m, 1e-9));
+  REQUIRE_THAT(r.nodes[1].rho, WithinRel(rho_hot, 1e-12));
+  REQUIRE_THAT(r.nodes[1].demand_per_s, WithinRel(60'000.0, 1e-12));
+}
+
+// The book's lab as the plan first shipped it: nodes = 8, N = 3, vnodes 150, 30k requests/s of
+// capacity-10k/s nodes. The cluster is sent 3 x 30k = 90k replica-requests/s against 8 x 10k =
+// 80k: 11.25k per node on average (112.5 %), the hottest k = 1.0816 x that = 12.17k (121.7 %,
+// red) and each of the others (8 - k)/56 x 90k = 11.12k (111.2 %): every node is over capacity
+// and every queue ends full. The cluster serves 80k and drops 10k replica-requests/s, one ninth;
+// so only 8/9 of the requests are answered (delivered as the engine's drop accounting gives it:
+// drain over demand), 26.67k of the 30k. The hottest node's rho saturates at 1 (zone red).
+TEST_CASE("eight nodes at replication three overload at 30k requests a second", "[theory]") {
+  const auto g = *Graph::build(kv_front({.nodes = 8,
+                                         .replication = 3,
+                                         .write_quorum = 2,
+                                         .read_quorum = 2,
+                                         .reads = 21'000,
+                                         .writes = 9'000,
+                                         .vnodes = 150}));
+  const auto settled = simulation_of(g).estimate();
+  REQUIRE(settled.converged);
+  const auto& store = settled.nodes[1];
+  REQUIRE_THAT(store.demand_per_s, WithinRel(90'000.0, 1e-9));
+  REQUIRE_THAT(store.drain_per_s, WithinRel(80'000.0, 1e-9));
+  REQUIRE_THAT(store.dropped_per_s, WithinRel(10'000.0, 1e-9));
+  REQUIRE_THAT(store.rho, WithinRel(1.0, 1e-9));
+  REQUIRE(store.zone == simsys::fluid::Zone::red);
+  for (const auto* op : {"read", "write"}) {
+    CAPTURE(op);
+    const auto& answered = response_of(settled, op);
+    REQUIRE_THAT(answered.answered.per_second / answered.offered.per_second,
+                 WithinRel(8.0 / 9.0, 1e-6));
+  }
+}
+
+// The average load can be under capacity while the hottest node already sheds: nodes = 8, N = 3,
+// 25k requests/s make 75k replica-requests/s, 9.375k per node on average (93.75 %: under 10k/s).
+// The hottest node, sent k/8 = 13.52 % of them (10.14k/s, 101.4 %), drops 75k x k/8 - 10k =
+// 140.5 replica-requests/s once its queue is full; each of the others is sent (8 - k)/56 x 75k =
+// 9.266k/s and serves all of it. The cluster serves 75k - 140.5 and answers that share of the
+// requests: this is the lesson of the lab's overload at a gentler load.
+TEST_CASE("the hottest node of a ring drops while the average node is under capacity", "[theory]") {
+  const auto g = *Graph::build(kv_front({.nodes = 8,
+                                         .replication = 3,
+                                         .write_quorum = 2,
+                                         .read_quorum = 2,
+                                         .reads = 25'000,
+                                         .writes = 0}));
+  const auto settled = simulation_of(g).estimate();
+  const double dropped = 75'000.0 * ring_k / 8.0 - 10'000.0;
+  REQUIRE_THAT(dropped, WithinRel(140.47, 1e-4));  // the derivation's number
+  const auto& store = settled.nodes[1];
+  REQUIRE_THAT(store.dropped_per_s, WithinRel(dropped, 1e-6));
+  REQUIRE_THAT(store.drain_per_s, WithinRel(75'000.0 - dropped, 1e-9));
+  REQUIRE_THAT(store.rho, WithinRel(1.0, 1e-9));  // the hottest node's
+  const auto& answered = response_of(settled, "read");
+  REQUIRE_THAT(answered.answered.per_second / answered.offered.per_second,
+               WithinRel(1.0 - dropped / 75'000.0, 1e-9));
+}
+
+// The fix: double the nodes. 16 nodes of 10k/s against the same 90k replica-requests/s: 5.625k per
+// node on average (56.25 %), the hottest k x 5.625k = 6.084k (60.8 %, green), nothing dropped,
+// every request answered.
+TEST_CASE("sixteen nodes carry the same load with the hottest node at 60.8 percent", "[theory]") {
+  const auto g = *Graph::build(kv_front({.nodes = 16,
+                                         .replication = 3,
+                                         .write_quorum = 2,
+                                         .read_quorum = 2,
+                                         .reads = 21'000,
+                                         .writes = 9'000,
+                                         .vnodes = 150}));
+  const auto settled = simulation_of(g).estimate();
+  const auto& store = settled.nodes[1];
+  REQUIRE_THAT(store.demand_per_s, WithinRel(90'000.0, 1e-9));
+  REQUIRE_THAT(store.drain_per_s, WithinRel(90'000.0, 1e-9));
+  REQUIRE(store.dropped_per_s == 0.0);
+  REQUIRE_THAT(store.rho, WithinRel(ring_k * 0.5625, 1e-9));
+  REQUIRE_THAT(store.rho, WithinRel(0.6084, 1e-4));
+  REQUIRE(store.zone == simsys::fluid::Zone::green);
+  for (const auto* op : {"read", "write"}) {
+    CAPTURE(op);
+    REQUIRE_THAT(response_of(settled, op).answered.per_second,
+                 WithinRel(response_of(settled, op).offered.per_second, 1e-9));
+  }
+}
+
+// estimate is the long-run state of run: below capacity the last step of a run equals it, for
+// the even cluster (N = nodes) and for the ring, in the node's numbers and in each op's response.
+TEST_CASE("estimate and run agree on a kv_cluster below capacity", "[theory]") {
+  const auto agree = [](const KvFront& shape) {
+    const auto g = *Graph::build(kv_front(shape));
+    auto running = simulation_of(g);
+    simsys::engine::StepRecord last;
+    running.run({.duration = 2s, .step = 100ms},
+                [&](const simsys::engine::StepRecord& r) { last = r; });
+    const auto e = simulation_of(g).estimate();
+    REQUIRE_THAT(last.nodes[1].rho, WithinRel(e.nodes[1].rho, 1e-9));
+    REQUIRE_THAT(last.nodes[1].demand_per_s, WithinRel(e.nodes[1].demand_per_s, 1e-9));
+    REQUIRE_THAT(last.nodes[1].drain_per_s, WithinRel(e.nodes[1].drain_per_s, 1e-9));
+    for (const auto* op : {"read", "write"}) {
+      CAPTURE(op);
+      REQUIRE_THAT(response_of(last, op).response.mean_s,
+                   WithinRel(response_of(e, op).response.mean_s, 1e-9));
+      REQUIRE_THAT(response_of(last, op).answered.per_second,
+                   WithinRel(response_of(e, op).answered.per_second, 1e-9));
+    }
+  };
+  SECTION("three nodes, N = 3: every node alike") {
+    agree({.nodes = 3,
+           .replication = 3,
+           .write_quorum = 3,
+           .read_quorum = 1,
+           .reads = 500,
+           .writes = 500});
+  }
+  SECTION("sixteen nodes, N = 3: a ring") {
+    agree({.nodes = 16,
+           .replication = 3,
+           .write_quorum = 2,
+           .read_quorum = 2,
+           .reads = 21'000,
+           .writes = 9'000});
+  }
+}
+
+// Conservation in replica-requests, every step of the overloaded cluster: what the nodes were
+// sent (N x the requests) is what they served plus what they dropped plus what they added to
+// their queues. Nothing is created or lost by the replication, and the saturated run's last step
+// is the settled state: the queues fill within 5 to 9 steps (1000 of room per node, the excess
+// 112 to 217 per step).
+TEST_CASE("a kv_cluster conserves its replica-requests at every step of an overload", "[theory]") {
+  const auto g = *Graph::build(kv_front({.nodes = 8,
+                                         .replication = 3,
+                                         .write_quorum = 2,
+                                         .read_quorum = 2,
+                                         .reads = 21'000,
+                                         .writes = 9'000}));
+  auto sim = simulation_of(g);
+  double backlog = 0.0;
+  simsys::engine::StepRecord last;
+  sim.run({.duration = 3s, .step = 100ms}, [&](const simsys::engine::StepRecord& r) {
+    const auto& n = r.nodes[1];
+    REQUIRE_THAT(backlog + n.demand_per_s * 0.1,
+                 WithinRel((n.drain_per_s + n.dropped_per_s) * 0.1 + n.backlog, 1e-9));
+    REQUIRE_THAT(n.demand_per_s, WithinRel(90'000.0, 1e-9));  // 3 x 30k, every step
+    backlog = n.backlog;
+    last = r;
+  });
+  const auto settled = sim.estimate();
+  REQUIRE_THAT(last.nodes[1].drain_per_s, WithinRel(settled.nodes[1].drain_per_s, 1e-9));
+  REQUIRE_THAT(last.nodes[1].dropped_per_s, WithinRel(settled.nodes[1].dropped_per_s, 1e-9));
+  REQUIRE_THAT(backlog, WithinRel(8.0 * 1000.0, 1e-9));  // 8 full queues of 1000
 }

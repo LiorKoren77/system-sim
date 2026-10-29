@@ -3964,3 +3964,155 @@ TEST_CASE("an external sink's politeness must be a positive rate") {
                    scenario_with("  s: {type: external_sink, politeness: 0/s}\n"),
                    "node 's': politeness must be positive");
 }
+
+// ---- kv_cluster is typed (plan 2c refinement 9, Task 10; book ch. 6, Dynamo) ----
+//
+// A key-value store of `nodes` machines on a consistent-hash ring (`vnodes` virtual nodes each),
+// every key kept on `replication` N of them, a write acknowledged after W replicas and a read
+// answered after R. `mode` (ap or cp) says what a partition costs (availability or consistency)
+// and is read and printed only: it matters in phase 3. The loader reads them into typed fields
+// and refuses the shapes that cannot exist: more replicas than machines, a quorum above N.
+// Proposed field names (the plan's Files line): NodeSpec::kv_nodes, replication, write_quorum,
+// read_quorum, kv_mode (model::KvMode::ap / cp). Tests below compare with `==` only, so the
+// fields may be optionals (an absent key stays absent, as every other typed key) or plain ints.
+
+namespace {
+// One kv_cluster `store` whose own YAML mapping is `body`.
+std::string kv_scenario(std::string_view body) {
+  return scenario_with("  store: {type: kv_cluster, " + std::string{body} + "}\n");
+}
+}  // namespace
+
+// The lab's own line, with `mode: cp` (the lab says "try cp"), as written in labs/kv-store.
+TEST_CASE("a kv_cluster's nodes, vnodes, replication, quorums and mode are typed") {
+  const auto path = write_temp(
+      "simsys_kv_typed.yaml",
+      kv_scenario("nodes: 8, vnodes: 150, replication: 3, write_quorum: 2, read_quorum: 2, "
+                  "mode: cp, capacity: 10k/s"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  const auto& store = s->nodes[0];
+  REQUIRE(store.type == simsys::model::NodeType::kv_cluster);
+  REQUIRE(store.kv_nodes == 8);
+  REQUIRE(store.vnodes == 150);  // the ring's virtual nodes, read for a kv_cluster too
+  REQUIRE(store.replication == 3);
+  REQUIRE(store.write_quorum == 2);
+  REQUIRE(store.read_quorum == 2);
+  REQUIRE(store.kv_mode == simsys::model::KvMode::cp);
+  REQUIRE(store.replicas == 1);  // the machines are `nodes`; `replicas` stays at its default
+}
+
+// Dynamo's classic quorum (ch. 6: N = 3, W = 2, R = 2, so W + R > N) and the AP mode apply when
+// the scenario says nothing; the three defaults show in explain, not here (test_report pins
+// `nodes=3 N=3 W=2 R=2 mode=ap`). Here only: a kv_cluster that states `nodes` alone loads.
+TEST_CASE("a kv_cluster that states only its nodes loads and takes Dynamo's defaults") {
+  const auto path = write_temp("simsys_kv_nodes_only.yaml", kv_scenario("nodes: 3"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->nodes[0].kv_nodes == 3);
+}
+
+TEST_CASE("both modes are accepted, as ap and as cp") {
+  for (const auto& [text, mode] :
+       {std::pair{"ap", simsys::model::KvMode::ap}, std::pair{"cp", simsys::model::KvMode::cp}}) {
+    CAPTURE(text);
+    const auto path =
+        write_temp("simsys_kv_mode.yaml", kv_scenario("nodes: 3, mode: " + std::string{text}));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    REQUIRE(s->nodes[0].kv_mode == mode);
+  }
+}
+
+// W + R <= N is legal: no read is guaranteed to meet the latest write, which is exactly the
+// eventually consistent end of the dial (ch. 6: W = 1 is a fast write, R = 1 a fast read). The
+// loader does not insist on W + R > N.
+TEST_CASE("weak quorums where W plus R does not exceed N are accepted") {
+  const auto path =
+      write_temp("simsys_kv_weak_quorum.yaml",
+                 kv_scenario("nodes: 5, replication: 3, write_quorum: 1, read_quorum: 1"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+}
+
+// A quorum may be as large as N itself (write to all, read from all: the strongest and the
+// slowest setting) and N as large as the cluster (every node holds every key).
+TEST_CASE("replication equal to nodes and quorums equal to replication are accepted") {
+  const auto path =
+      write_temp("simsys_kv_full_quorum.yaml",
+                 kv_scenario("nodes: 3, replication: 3, write_quorum: 3, read_quorum: 3"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+}
+
+TEST_CASE("a kv_cluster needs nodes") {
+  require_rejected("simsys_kv_no_nodes.yaml", kv_scenario("replication: 3"),
+                   "node 'store': kv_cluster needs nodes");
+}
+
+// The counts are whole numbers of at least one, in the words of every other positive count.
+TEST_CASE("a kv_cluster's counts must be positive whole numbers") {
+  SECTION("nodes of zero") {
+    require_rejected("simsys_kv_nodes_zero.yaml", kv_scenario("nodes: 0"),
+                     "node 'store': nodes must be a positive integer");
+  }
+  SECTION("replication of zero") {
+    require_rejected("simsys_kv_replication_zero.yaml", kv_scenario("nodes: 3, replication: 0"),
+                     "node 'store': replication must be a positive integer");
+  }
+  SECTION("write_quorum of zero") {
+    require_rejected("simsys_kv_w_zero.yaml", kv_scenario("nodes: 3, write_quorum: 0"),
+                     "node 'store': write_quorum must be a positive integer");
+  }
+  SECTION("read_quorum of zero") {
+    require_rejected("simsys_kv_r_zero.yaml", kv_scenario("nodes: 3, read_quorum: 0"),
+                     "node 'store': read_quorum must be a positive integer");
+  }
+  SECTION("vnodes of zero") {
+    require_rejected("simsys_kv_vnodes_zero.yaml", kv_scenario("nodes: 3, vnodes: 0"),
+                     "node 'store': vnodes must be a positive integer");
+  }
+}
+
+// N copies need N machines to live on; a quorum is a number of those N replicas. The message
+// carries both numbers, "(5 > 3)": the offending value, then the limit it broke.
+TEST_CASE("replication above nodes and a quorum above replication are refused") {
+  SECTION("replication above nodes") {
+    require_rejected("simsys_kv_n_above_nodes.yaml", kv_scenario("nodes: 3, replication: 5"),
+                     "node 'store': replication must be at most nodes (5 > 3)");
+  }
+  SECTION("the default replication of 3 above a two-node cluster") {
+    // N defaults to 3 (Dynamo's), so a cluster of two that does not lower it is refused.
+    require_rejected("simsys_kv_default_n_above_nodes.yaml", kv_scenario("nodes: 2"),
+                     "node 'store': replication must be at most nodes (3 > 2)");
+  }
+  SECTION("write_quorum above replication") {
+    require_rejected("simsys_kv_w_above_n.yaml",
+                     kv_scenario("nodes: 5, replication: 3, write_quorum: 4"),
+                     "node 'store': write_quorum must be at most replication (4 > 3)");
+  }
+  SECTION("read_quorum above replication") {
+    require_rejected("simsys_kv_r_above_n.yaml",
+                     kv_scenario("nodes: 5, replication: 3, read_quorum: 4"),
+                     "node 'store': read_quorum must be at most replication (4 > 3)");
+  }
+}
+
+TEST_CASE("a kv_cluster's mode must be ap or cp") {
+  require_rejected("simsys_kv_mode_strong.yaml", kv_scenario("nodes: 3, mode: strong"),
+                   "node 'store': mode must be ap or cp");
+}
+
+// `replicas` is the copies of ONE machine behind a balancer, a service's way to scale. A
+// kv_cluster scales by `nodes` (machines on the ring) and keeps `replication` copies of every
+// key: three things that `replicas` could mean at once, so it is refused here, like a worker
+// pool's `replicas`, rather than guessed at.
+TEST_CASE("a kv_cluster refuses replicas: its machines are nodes") {
+  require_rejected("simsys_kv_replicas.yaml", kv_scenario("nodes: 3, replicas: 3"),
+                   "node 'store': a kv_cluster's machines are nodes; replicas is not a key here");
+}
