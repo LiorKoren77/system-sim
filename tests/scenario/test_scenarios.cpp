@@ -378,7 +378,8 @@ TEST_CASE("book/youtube validates and explains, and the engine refuses it at tra
 // Ch. 15's Google Drive is refused where its first message queue comes, notify_q (the order of the
 // file: lb, api, block_servers, the two stores, the metadata tier, then notify_q). Its blob stores
 // have no `then` steps, so they were never what stopped it; the queue and its two consumer groups
-// are Tasks 6 and 7, and the pin stays until then.
+// are Tasks 6 and 7, and the pin stays until then. A characterisation test: it passed before
+// plan 2c Task 4 too, and pins that the events did not move the refusal.
 TEST_CASE("book/google-drive is refused at notify_q", "[scenario]") {
   const auto g = build_or_fail(
       load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/google-drive/scenario.yaml"));

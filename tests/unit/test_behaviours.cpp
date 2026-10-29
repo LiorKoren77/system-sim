@@ -1645,13 +1645,15 @@ TEST_CASE("a blob store's response is its own sojourn and asks nobody downstream
 // ----
 //
 // S3 event notifications (book ch. 14: "transcoding starts when the upload completes"): every
-// request the store serves fires its `then` steps, and nobody waits for them. So the store
-// forwards what it serves (times `factor`), its response is its own sojourn, and its delivered
-// share is its own; losses at the notified nodes are those nodes' drops, not the uploader's.
+// write the store serves (an op in its `write_ops`) fires its `then` steps, and nobody waits for
+// them; a read fires nothing (S3 has no event for a GET). So the store forwards the writes it
+// serves (times `factor`), its response is its own sojourn, and its delivered share is its own;
+// losses at the notified nodes are those nodes' drops, not the uploader's.
 
 namespace {
-// u (uploads of 50 MB, reads of 1 MB) -> store (a default blob store whose `then` is `then`) ->
-// {svc, audit}, over zero-latency links. Node indices: u 0, store 1, svc 2, audit 3.
+// u (uploads of 50 MB, reads of 1 MB) -> store (a default blob store that lists `upload` in its
+// `write_ops`, as youtube's original_store, and whose `then` is `then`) -> {svc, audit}, over
+// zero-latency links. Node indices: u 0, store 1, svc 2, audit 3.
 Scenario notifying_store(std::vector<Step> then) {
   Scenario s{.name = "blob-events", .version = 1, .duration = 1min};
   s.nodes = {NodeSpec{.id = "u",
@@ -1660,7 +1662,10 @@ Scenario notifying_store(std::vector<Step> then) {
                                            .op_shares = {{"read", 0.5}, {"upload", 0.5}},
                                            .sizes = {{"upload", simsys::Bytes{50e6}},
                                                      {"read", simsys::Bytes{1e6}}}}},
-             NodeSpec{.id = "store", .type = NodeType::blob_store, .then = std::move(then)},
+             NodeSpec{.id = "store",
+                      .type = NodeType::blob_store,
+                      .then = std::move(then),
+                      .write_ops = std::vector<std::string>{"upload"}},
              NodeSpec{.id = "svc", .type = NodeType::service},
              NodeSpec{.id = "audit", .type = NodeType::service}};
   s.links = {LinkSpec{.from = "u", .to = "store", .latency = 0s},
@@ -1670,9 +1675,9 @@ Scenario notifying_store(std::vector<Step> then) {
 }
 }  // namespace
 
-// 2 uploads/s served, 2 notify/s sent: one notification per request, under the step's op name.
+// 2 uploads/s served, 2 notify/s sent: one notification per write, under the step's op name.
 // The store still serves its own requests (`served` is the whole input).
-TEST_CASE("a blob store forwards one notification per request it serves", "[behaviours]") {
+TEST_CASE("a blob store forwards one notification per write it serves", "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(notifying_store({Step{.to = "svc", .op = "notify"}}));
   const BlobStoreBehaviour store{g, *g.index_of("store")};
   const auto routed = store.route(flow_of("upload", 2), 0s, 100ms);
@@ -1695,9 +1700,11 @@ TEST_CASE("a blob store's notification factor multiplies what it forwards", "[be
   REQUIRE_THAT(routed.served.rate_of("upload").per_second, WithinRel(2.0, 1e-12));
 }
 
-// Every op the store serves fires every step: 3 reads/s and 2 uploads/s are 5 requests/s, so
-// svc is sent 5 x 4 = 20 notify/s and audit 5 log/s, each step under its own op name.
-TEST_CASE("a blob store's steps fire for every op it serves, reads included", "[behaviours]") {
+// Only a write fires the steps: of 3 reads/s and 2 uploads/s, the 2 uploads/s do, so svc is sent
+// 2 x 4 = 8 notify/s and audit 2 log/s, each step under its own op name; the 3 reads/s are served
+// and notify nobody (S3 has no event for a GET: 1000 views of a video start no transcode).
+TEST_CASE("a read at a blob store does not notify: only its writes fire the steps",
+          "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(notifying_store(
       {Step{.to = "svc", .op = "notify", .factor = 4.0}, Step{.to = "audit", .op = "log"}}));
   const BlobStoreBehaviour store{g, *g.index_of("store")};
@@ -1707,16 +1714,28 @@ TEST_CASE("a blob store's steps fire for every op it serves, reads included", "[
   const auto routed = store.route(in, 0s, 100ms);
   REQUIRE(routed.outgoing.size() == 2);
   const auto to_svc = sent_to(routed, *g.index_of("svc"));
-  REQUIRE_THAT(to_svc.rate_of("notify").per_second, WithinRel(20.0, 1e-12));
-  REQUIRE_THAT(to_svc.total().per_second, WithinRel(20.0, 1e-12));
+  REQUIRE_THAT(to_svc.rate_of("notify").per_second, WithinRel(8.0, 1e-12));
+  REQUIRE_THAT(to_svc.total().per_second, WithinRel(8.0, 1e-12));
   const auto to_audit = sent_to(routed, *g.index_of("audit"));
-  REQUIRE_THAT(to_audit.rate_of("log").per_second, WithinRel(5.0, 1e-12));
-  REQUIRE_THAT(to_audit.total().per_second, WithinRel(5.0, 1e-12));
+  REQUIRE_THAT(to_audit.rate_of("log").per_second, WithinRel(2.0, 1e-12));
+  REQUIRE_THAT(to_audit.total().per_second, WithinRel(2.0, 1e-12));
+  REQUIRE_THAT(routed.served.rate_of("read").per_second, WithinRel(3.0, 1e-12));
+}
+
+// Reads alone, however many, send nothing.
+TEST_CASE("a blob store serving only reads sends no notifications", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(notifying_store({Step{.to = "svc", .op = "notify"}}));
+  const BlobStoreBehaviour store{g, *g.index_of("store")};
+  const auto routed = store.route(flow_of("read", 1000), 0s, 100ms);
+  REQUIRE(sent_to(routed, *g.index_of("svc")).total().per_second == 0.0);
+  REQUIRE_THAT(routed.served.rate_of("read").per_second, WithinRel(1000.0, 1e-12));
 }
 
 // The notified node's sojourn and failures are not the uploader's: the response is the store's own
 // (nobody downstream is asked) and the delivered share is the store's own, whatever the targets
-// deliver (mirroring the write_back cache's flush).
+// deliver (mirroring the write_back cache's flush). A characterisation test: a blob store's
+// response and delivered share were already its own before plan 2c Task 4; this pins that the
+// events left them so.
 TEST_CASE("a blob store's response and delivered share ignore the notified nodes", "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(notifying_store({Step{.to = "svc", .op = "notify"}}));
   const BlobStoreBehaviour store{g, *g.index_of("store")};
@@ -1737,7 +1756,8 @@ TEST_CASE("a blob store's response and delivered share ignore the notified nodes
   REQUIRE_FALSE(asked_for_delivery);
 }
 
-// No request served, no notification: an idle store sends nothing.
+// No request served, no notification: an idle store sends nothing. A characterisation test: a
+// blob store sent nothing at all before plan 2c Task 4; this pins that an idle one still does not.
 TEST_CASE("a blob store with no requests sends no notifications", "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(notifying_store({Step{.to = "svc", .op = "notify"}}));
   const BlobStoreBehaviour store{g, *g.index_of("store")};

@@ -2523,18 +2523,21 @@ TEST_CASE("a zero-byte request at a byte-sized store is refused", "[graph]") {
 // ----
 //
 // S3 event notifications (book ch. 14: "transcoding starts when the upload completes"): for every
-// request the store served, each `then` step sends its op to its target, and nobody waits for it.
+// write the store stored (an op in its `write_ops`; S3's ObjectCreated), each `then` step sends its
+// op to its target, and nobody waits for it. A read fires nothing: S3 has no event for a GET.
 // The graph says so the way it does for a write_back cache's flush: Graph::is_async_hop, which the
 // engine's backward pass reads to leave the hop out of the sender's response and delivered share.
 
 namespace {
-// u (uploads of 100 MB and reads of 1 MB, 10/s each) -> store (a default blob store whose `then`
-// is `then`) -> svc, a service, over zero-latency links. Node indices: u 0, store 1, svc 2.
+// u (uploads of 100 MB and reads of 1 MB, 10/s each) -> store (a default blob store whose
+// `write_ops` is `[upload]`, as youtube's original_store, and whose `then` is `then`) -> svc, a
+// service, over zero-latency links. Node indices: u 0, store 1, svc 2.
 Scenario store_with_notifications(std::vector<Step> then) {
   Scenario s{.name = "blob-notify", .version = 1, .duration = 1min};
   auto u = client("u", Rate{20}, {{"read", 0.5}, {"upload", 0.5}});
   u.workload->sizes = {{"upload", simsys::Bytes{100e6}}, {"read", simsys::Bytes{1e6}}};
   auto store = default_blob_store();
+  store.write_ops = std::vector<std::string>{"upload"};
   store.then = std::move(then);
   s.nodes = {std::move(u), std::move(store), service("svc")};
   s.links = {LinkSpec{.from = "u", .to = "store", .latency = 0s},
@@ -2543,11 +2546,11 @@ Scenario store_with_notifications(std::vector<Step> then) {
 }
 }  // namespace
 
-// Every request the store serves fires the step, whatever its op (a read as much as an upload:
-// S3 can notify on a GET too in this model), so each op that arrives at the store has its own
-// asynchronous hop to the target, carrying the op the step names. The client's call into the store
-// stays synchronous, and so does a hop the step does not make.
-TEST_CASE("a blob store's then step is an asynchronous hop for every op the store serves",
+// Every write the store stores fires the step, so the write op has its own asynchronous hop to the
+// target, carrying the op the step names. A read fires nothing (S3 has no event for a GET), so it
+// has no hop at all. The client's call into the store stays synchronous, and so does a hop the
+// step does not make.
+TEST_CASE("a blob store's then step is an asynchronous hop for its writes and none for its reads",
           "[graph]") {
   const auto built = Graph::build(store_with_notifications({Step{.to = "svc", .op = "notify"}}));
   INFO((built ? "" : built.error().message));
@@ -2556,7 +2559,10 @@ TEST_CASE("a blob store's then step is an asynchronous hop for every op the stor
   const auto store = *built->index_of("store");
   const auto svc = *built->index_of("svc");
   REQUIRE(built->is_async_hop(store, "upload", svc, "notify"));
-  REQUIRE(built->is_async_hop(store, "read", svc, "notify"));
+  REQUIRE_FALSE(built->is_async_hop(store, "read", svc, "notify"));  // a read notifies nobody
+  REQUIRE_FALSE(std::ranges::contains(
+      built->async_hops(),
+      simsys::graph::AsyncHop{.from = store, .op = "read", .to = svc, .target_op = "notify"}));
   REQUIRE_FALSE(built->is_async_hop(store, "upload", svc, "other"));  // a hop no step makes
   REQUIRE_FALSE(built->is_async_hop(u, "upload", store, "upload"));   // the upload itself waits
   REQUIRE(std::ranges::contains(
@@ -2579,6 +2585,8 @@ TEST_CASE("a blob store's same-op then step is an asynchronous hop carrying that
 // The paper load (explain) and the engine's forward pass follow a blob store's then steps along
 // the graph's demand edges, as a service's steps: store -> svc is an edge over the link between
 // them, the op that arrives at svc is `notify`, and nothing else reaches it.
+// A characterisation test: it passed before plan 2c Task 4 too (a `then` step was already a
+// demand edge), and pins that the events kept it so.
 TEST_CASE("a blob store's then step is a demand edge that delivers its op to the target",
           "[graph]") {
   const auto built = Graph::build(store_with_notifications({Step{.to = "svc", .op = "notify"}}));
@@ -2596,13 +2604,13 @@ TEST_CASE("a blob store's then step is a demand edge that delivers its op to the
 }
 
 // A cache's miss is the only thing `on: miss` can name. A blob store never misses: its steps fire
-// for every request it serves, so a step on miss is refused at build with the reason.
+// for every write it stores, so a step on miss is refused at build with the reason.
 TEST_CASE("an on-miss then step on a blob store is refused", "[graph]") {
   const auto built = Graph::build(
       store_with_notifications({Step{.to = "svc", .op = "notify", .on = StepCondition::miss}}));
   REQUIRE_FALSE(built.has_value());
   REQUIRE(built.error().message ==
-          "node 'store': a blob store's then steps fire for every request it serves "
+          "node 'store': a blob store's then steps fire for every write it stores "
           "(on: miss needs a cache)");
 }
 
@@ -2612,6 +2620,63 @@ TEST_CASE("an on-miss step after an always step on a blob store is refused too",
                                 Step{.to = "svc", .op = "audit", .on = StepCondition::miss}}));
   REQUIRE_FALSE(built.has_value());
   REQUIRE(built.error().message ==
-          "node 'store': a blob store's then steps fire for every request it serves "
+          "node 'store': a blob store's then steps fire for every write it stores "
           "(on: miss needs a cache)");
+}
+
+// A store that only ever receives reads (its `write_ops` default to `[write]`, and `get` is no
+// write) fires no event: the step sends nothing, so `notify` never arrives at svc and the store
+// has no asynchronous hop. 1000 GETs/s of a video do not start 1000 transcodes/s.
+TEST_CASE("a blob store that only serves reads sends its then target nothing", "[graph]") {
+  Scenario s{.name = "blob-reads", .version = 1, .duration = 1min};
+  auto u = client("u", Rate{1000}, {{"get", 1.0}});
+  u.workload->sizes = {{"get", simsys::Bytes{1e6}}};
+  auto store = default_blob_store();
+  store.then = {Step{.to = "svc", .op = "notify"}};
+  s.nodes = {std::move(u), std::move(store), service("svc")};
+  s.links = {LinkSpec{.from = "u", .to = "store", .latency = 0s},
+             LinkSpec{.from = "store", .to = "svc", .latency = 0s}};
+  const auto built = Graph::build(s);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE(built->arriving_ops(*built->index_of("svc")).empty());
+  REQUIRE(built->async_hops().empty());
+  const auto& step = built->nodes()[*built->index_of("store")].spec.then[0];
+  REQUIRE(built->then_fraction(*built->index_of("store"), step, "get") == 0.0);
+}
+
+// The share of a store's requests a step carries (Graph::then_fraction): all of a write, none of
+// a read.
+TEST_CASE("a blob store's then step carries every write and no read", "[graph]") {
+  const auto built = Graph::build(store_with_notifications({Step{.to = "svc", .op = "notify"}}));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto store = *built->index_of("store");
+  const auto& step = built->nodes()[store].spec.then[0];
+  REQUIRE(built->then_fraction(store, step, "upload") == 1.0);
+  REQUIRE(built->then_fraction(store, step, "read") == 0.0);
+}
+
+// `on: failure` names a failed request's branch. An event reports no failure before phase 3 (S3
+// delivers at least once and the model never loses a notification), so the step would never fire:
+// refused at build, as `on: miss` is.
+TEST_CASE("an on-failure then step on a blob store is refused", "[graph]") {
+  const auto built = Graph::build(
+      store_with_notifications({Step{.to = "svc", .op = "notify", .on = StepCondition::failure}}));
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'store': a blob store's then steps fire for every write it stores "
+          "(on: failure: an event reports no failure before phase 3)");
+}
+
+// `mode` orders the calls a request waits for (sequential latencies add, parallel ones overlap).
+// Nobody waits for an event, so a parallel one means nothing: refused at build. (`mode:
+// sequential`, the model's default, is refused by the loader, which sees the key written.)
+TEST_CASE("a parallel then step on a blob store is refused", "[graph]") {
+  const auto built = Graph::build(
+      store_with_notifications({Step{.to = "svc", .op = "notify", .mode = StepMode::parallel}}));
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'store': a blob store's then steps are event notifications nobody waits for "
+          "(mode orders the calls a request waits for)");
 }
