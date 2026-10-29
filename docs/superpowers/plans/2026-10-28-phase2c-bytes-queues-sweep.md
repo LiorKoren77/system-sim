@@ -295,6 +295,15 @@
 
 ---
 
+**Review of Task 12 at dd9213b (adversarial, REQUEST_CHANGES, no critical) — fix round folded into Task 14's implementer, as its own commit before Task 14.** Verified: both presets, 1049 tests, exactly the 13 Task 13 reds; all six pins by hand; the ticket-server relation is not a tautology (1 vs 0.769 without thinning; offered − answered 22,961,375 = id_gen's drops); conservation ≤ 6e-6 on news-feed (864k steps) and the ticket variant; answered ≤ offered everywhere; lossless paths exactly 1; only news-feed's run/estimate changed among 14 scenarios; `estimate` = `run` on `[a, b, a]` (d = (√3 − 1)/2) and on a kv/write_through/miss/z probe; a sink at f = 1 ahead of other steps (0 from step 2, `-` in the table, no NaN); sink failures thin later steps (refinement 11); the pool's async hand-off op is in `delivered_of`; url-shortener and news-feed README numbers; first-use comment for `static operator()`; survival shared by `forward` and `delivered`.
+
+- [ ] **I-1 The one-step lag can lock `run` into a permanent two-step oscillation, and `estimate` misreports it.** `x: [a, a, a, a, a]` at 1k/s, `a` 3686/s with a room of 1 (true fixed point d = 0.9, load 4095, 10 % dropped): `run` alternates every step between 5000 offered (red, 1304 dropped) and 2988 (yellow, no drops) for the whole run; `estimate` warns "no steady state (a loop of gain >= 1)" (there is no loop) and reports drop rate 0 %, rho 0.81 (the low half of the cycle). Also `k = 4` at 3300/s and `[a, a×10, a×10]` at 16290/s; three calls damp very slowly. No shipped scenario triggers it (14 estimates converge, no sawtooth in news-feed). Fix: in settle mode thin with averaged fractions d̄ ← (d̄ + d)/2 (the map is decreasing and continuous, so averaging converges to the unique fixed point); the warning names both causes ("… or delivered fractions that did not settle (a step after a failed step)"); the schema paragraph and the `engine.cppm` comment (~1225–1251) say what `run` shows in this case (a sawtooth); a theory test where four calls to one node settle at d = 0.9 in `estimate`.
+- [ ] **I-2 `scenarios/book/news-feed/README.md` ~31–33 is false:** the 974.8 / 764.8 drops of post_cache/user_cache are not "all in the first 0.1 s step" (those fall inside the warm-up) but in the step the 12:00 spike starts, which is still thinned by feed_cache's pre-spike fraction (≈ 0.47 against the true 0.16: the lag); the same README calls the caches "below saturation" while peak_rho is 1 at that step. Rewrite both.
+- [ ] **I-3 The rate limiter's `route`, `response` and `delivered` disagree about a lost counter check** (`behaviours.cppm` ~880, ~909): `response` is sequential (check then forward), `delivered` multiplies by the check's fraction, the new overload thins nothing ("both start with the request"). Decision: fail-closed: thin the forwarded admitted flow by the check's last-step fraction, matching `delivered`; rewrite the overload's rationale and say it in the class comment. Shipped output does not move (rules_cache never drops).
+- [ ] **I-4 Parallel-group position:** the schema (~255, 261) says the parallel steps form one group wherever they sit and latency is position-free, the cache `then` row (~455) says the group is waited for after the store hop and the sequential steps, while thinning puts the group at its first member (`[a ∥, s, b ∥]` thins s by b, listed after it). Decision: refuse non-adjacent parallel steps at build (`node 'web': the parallel steps of op 'get' must be adjacent (they form one group)`); the `[a ∥, s, b ∥, c]` unit test becomes a refusal test (keep the pin `[a ∥, b ∥, s, c]`: a 100, b 100, s 40, c 36); schema and cache row then hold as written, say "adjacent" in the schema.
+- [ ] Minors: m-1 "one step late" (schema ~261, both README bullets, the `forward` comment) is the link's delay plus one step over a delay line (a 500 ms link at 100 ms steps: full flow until 0.6 s): say so; m-2 `behaviours.cppm` ~501 `template <FractionLookup Lookup = NothingLost>` is the file's first constrained template parameter: one line ("C++20: `template <C T>` is shorthand for `template <class T> requires C<T>`"); m-3 `BlobStoreBehaviour::route` takes the lookup yet thins nothing (every event asynchronous): move it to the six that ignore it, and fix the "behaviours that thin" lists (NodeBehaviour comment, plan note); m-4 the sequential-steps theory test loops from records[3] at 1e-3: pin records[1] = 510 (the first step's 0.51) and records[2..] at 1e-9 to show the lag exactly; m-5 root README ~227 "the database saturates at the peaks": post_db is red 15.9 h of 24 (red_s 5.72e4): reword; m-6 (observed, not Task 12's) `estimate` on a `failure_rate: 1` sink prints peak_backlog 1k where `run` shows 0: fix if it is a one-liner (the settle pass's backlog for an op nobody serves), else add to the Phase 3 backlog with the probe.
+- [ ] Commit `nodes: delivered fractions settle by averaging; parallel steps must be adjacent; a lost limiter check fails closed; review nits` (before Task 14's green commit).
+
 ### Task 13: Client timeout
 
 **Files:** `src/queueing/queueing.cppm` (`normal_cdf`, `lognormal_below(mean, variance, limit)` → `{fraction, mean_s, variance_s2}`), `src/engine/engine.cppm` (`client_responses` applies the client's `timeout`), `src/report/report.cppm`, `src/report/report.cpp` (percentiles capped at the timeout; JSON `timed_out_per_s`), `scenarios/book/url-shortener/README.md` (the timeout bullet; the ticket-server variant's shorten numbers), tests in `test_queueing.cpp`, `test_theory.cpp`, `test_report.cpp`.
@@ -369,6 +378,56 @@ Schema v1.4, spec §19, study notes, README. Commit `docs: schema v1.4, spec §1
 - [ ] Root README: phase 2c status, a `simsys sweep` example, youtube's explain lines in MB/s.
 
 ---
+
+## Status at the stop on 2026-10-29 (read this first when resuming)
+
+The owner stopped the session ("stop now the background processes. make sure to push everything that
+was completed. document what is in progress and what is left to do"). State pushed to `origin/main`:
+
+**Done (committed, reviewed where a review section exists above):** Tasks 1–12. Task 12 landed as
+`dd9213b` (1049 tests green in both presets at that commit, with `tests/unit/test_queueing.cpp`
+taken from `6aa78ac`; see below). Its review (REQUEST_CHANGES, section "Review of Task 12 at
+dd9213b" above) is recorded but **not yet fixed**.
+
+**Red commits on main, not yet implemented (so `main` does not build clean):**
+- `37ece9b` Task 13 (client timeout): `tests/unit/test_queueing.cpp` calls `queueing::lognormal_below`,
+  which does not exist yet, so the `unit_tests` target **does not compile at HEAD** and CI's
+  build-test jobs fail until Task 13's implementation lands. To build meanwhile:
+  `git checkout 6aa78ac -- tests/unit/test_queueing.cpp` (do not commit that).
+  The other Task 13 tests (`tests/theory/test_timeout.cpp`, the timeout tests at the end of
+  `tests/unit/test_report.cpp`) compile and fail at run time (13 tests). The test-writer's notes: the
+  fixture is one M/M/1 at rho 0.99 (sojourn mean 100 ms, variance 0.01 s²); youtube's uploads have
+  sigma ≈ 3e-7 so Φ underflows to 0 and the truncated moments must be guarded against 0/0;
+  `timed_out_per_s` is read only from the JSON; `ClientBehaviour`'s header still says timeouts are
+  ignored.
+- `dc8ec40` Task 14 (`over:` windows): `tests/theory/test_windows.cpp`, `over` tests in
+  `test_config.cpp` and at the end of `test_report.cpp`; they fail at load with
+  `slo: unknown key 'over'`. Test-writer's decisions to honour: windows align from the end of warmup
+  (url-shortener's worst hour is 13:02–14:02, `window_start_s` 47520, observed 0.6433 as shipped and
+  0.965 with `shards: 2`); an SLO without `over` has no `window_start_s` key; a windowed SLO whose
+  windows are all empty is `skipped`; the table prints `(worst 10m from 00:20)` with `HH:MM`; the YAML
+  key is `slo:`.
+
+**In progress, parked on branch `wip/kv-review-fix-round` (commit `3744c2a`, NOT built or tested):**
+the fix round for "Review of Task 11 and the kv fix round" (I-1..I-3, minors 1–11). The implementer was
+stopped while adding a scenario test; the diff touches queueing, behaviours, graph, defaults, report,
+numerics.md, the schema, the kv-store/consistent-hashing/search-autocomplete READMEs and tests. Resume
+by checking it out, building, finishing the open items against the plan section, and re-pinning the
+numbers that move; or redo from the plan section if the diff is confusing. Squash it into the commit
+named in that section.
+
+**Left to do, in order (each with the test-writer → implementer → adversarial reviewer loop):**
+1. Finish the kv/search review fix round (above) and commit it.
+2. Task 13 implementation (spec in "### Task 13" + the red tests' notes above).
+3. The Task 12 review fix round (section "Review of Task 12 at dd9213b": averaging in settle mode,
+   adjacent parallel steps refused, limiter fails closed, README/comment nits), then Task 14's
+   implementation; review both.
+4. Task 15 `simsys sweep`; Tasks 16–18 (youtube, news-feed, search-autocomplete end to end; note that
+   Task 12 changed news-feed's numbers: drop rate 0.5987, read_feed p99 90.3 ms, fanout capped at
+   1k jobs/s by post_db's primary, so Task 17's sizing starts from those); Task 19 docs.
+5. The comprehensive 2c review (list above), fix, push, CI green.
+6. The whole-of-phase-2 review (2a + 2b + 2c), fix, push. Then stop (owner's instruction of
+   2026-10-29); phase 3 waits for a new instruction.
 
 ## Comprehensive 2c review, then push
 
