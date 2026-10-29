@@ -736,7 +736,9 @@ A same-op step keeps only the size of the jobs that arrive under its op: when jo
 reach the pool, it renames the others, and a renamed request without `size:` has none, so a
 byte-sized target refuses them with a note (`... has no size: add size: to the step or sizes: to
 the client (a worker pool's then step keeps the size of the jobs that arrive as 'upload' only: it
-renames every other job, and a renamed job has no size)`); give such a step its own `size:`.
+renames every other job, and a renamed job has no size)`; the note appears only when the step's
+op is one the pool's jobs arrive as: a step that renames every job gets the plain advice); give
+such a step its own `size:`.
 A pool of 10 jobs/s draining 8/s with `then: [{to: store, op: write, factor: 4, size: 50MB}, {to:
 done_q, op: publish}]` sends the store 32 writes/s (1.6k MB/s) and `done_q` 8 messages/s;
 offered 12/s it drains 10/s, so its targets get 10 jobs' worth (2k MB/s, 10/s), and the excess
@@ -774,7 +776,8 @@ modelled)` on the queue (a retention of whole days in days, any other as other d
 `capacity=6.667/s (workers / cost)  service_time=1m (cost)  c=400 (workers)  queue_limit=4.032M
 (retention × capacity) ... consumes=transcode_q  workers=400 cost=1m` on the pool (a room of a
 million or more with an SI prefix, as a count). A queue's
-**lag**, how long its slowest group's next message has waited, is read off its pools every step
+**lag**, how long a message published now waits until its slowest group reads it, is read off its
+pools every step
 (see [Queue lag](#queue-lag), the `queue_lag` SLO).
 Ignored: ordering, delivery guarantees and redelivery, a consumer's commit interval, the broker's
 disk; a worker blocked on a slow downstream call (an external sink's 150 ms would hold a worker:
@@ -858,8 +861,10 @@ other op its first megabyte** (`min(size, 1 MB) × 1 MB / bandwidth`), since the
 its first megabyte while the rest streams in. Whether an op is a write is decided per link and op
 when the graph is built: it is one if a node its **body** reaches lists it in `write_ops` (`write`
 for a node that lists none), the receiver or any node behind it. The body goes on under the op's
-own name, and under the new name of a step that states its own `size:` (it forwards a payload);
-a renamed step without one is a new request (a lookup, a notification) and does not count. So a
+own name, and under the new name of a step whose `size:` equals the incoming request's (it
+forwards the body itself, relabelled); a renamed step without a size, or of another size, is a
+new request (a lookup, a notification, a 1 KB metadata write beside a 10 MB upload) and does not
+count. So a
 10 MB `upload` through a load balancer into a blob store that lists `upload` pays its whole 80 ms
 on the client's link exactly as it would straight into the store, and so does one a service sends
 on as `{to: store, op: put, size: 10MB}` to a store that writes `put` (a balancer or a service
@@ -914,15 +919,16 @@ rate, reject rate and utilization are measured per node, not per op.
 
 ### Queue lag
 
-A message queue's **lag** (phase 2c) is how long the message its slowest consumer group reads
-next has waited. The broker holds nothing back (it appends at 1M/s); what a group has not read
+A message queue's **lag** (phase 2c) is how long a message published at that step waits until
+its slowest consumer group reads it: Kafka's consumer lag in records divided by the group's
+consume rate. The broker holds nothing back (it appends at 1M/s); what a group has not read
 waits in its worker pool's queue, so every step the lag is read off the pools:
 
 ```
 lag(group) = max(min(k × Wq, retention), backlog / capacity)      lag(queue) = its worst group's
 ```
 
-`backlog / capacity` is the FIFO drain time: the oldest unread message is read after everything
+`backlog / capacity` is the FIFO drain time: a message published now is read after everything
 ahead of it, which the pool works off at its capacity (`workers / cost`) while it is behind.
 `k × Wq` is the stochastic part: the pool's Erlang C (M/M/c) wait scaled by Allen–Cunneen's `k`,
 at rho clamped to 0.99, what a message waits with no backlog because every worker happens to be
@@ -931,7 +937,15 @@ the job's `cost` is not lag (a message is read once a worker takes it). Worked: 
 workers at 3.333 ms lag 3.289 ms (no backlog); a 1.5k/s burst for 200 s into 12 workers at 10 ms
 (1.2k/s) leaves 60,000 messages waiting and the queue **50 s** behind at t = 200 s (60,000 /
 1200), 33.3 s at 300 s as the backlog drains; a pool saturated for the whole run climbs to its
-retention and stays there. Two groups on one queue: the slower one's lag.
+retention and stays there. Two groups on one queue: the slower one's lag. Taking the larger of
+the two terms is this simulator's heuristic (the fluid queue's wait, used for every node), not a
+published result. The lag is not the age of the oldest unread message, which some dashboards show:
+under FIFO the message published now is the oldest one lag later, so the age trails the lag by one
+lag and reaches the same peak that much later. The `queue_lag` SLO bounds the peak lag after
+warmup, so it reads "every message published after warmup was read within `max`": with `warmup:
+220s` on the burst above it observes 46.7 s (56,000 / 1200, the wait of a message published at
+220 s), while the oldest unread message is 44 s old then and 50 s old at 250 s, when the burst's
+last message is read.
 
 The `queue_lag` SLO observes the **peak** lag after warmup, not the mean or the last step's: a lag
 bound is a promise about the worst moment (`PASS queue_lag q - 50s 1m`, `FAIL queue_lag q - 50s

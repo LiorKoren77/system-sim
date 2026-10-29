@@ -110,6 +110,17 @@ constexpr double rounds_to_one = 0.9995;
   return fmt_duration(seconds(t));
 }
 
+// A queue lag as the node table and the SLO lines print it: a duration, or "<1us" for a lag that
+// would print below one microsecond (review of plan 2c Task 8, minor 6). An idle consumer group's
+// stochastic wait is Erlang C's tiny chance of waiting times a job (youtube's completion_q:
+// 6.3e-11 s, "0.0632ns"), a figure below anything a queue's lag is ever measured in; the JSON
+// and the CSV keep the number.
+[[nodiscard]] std::string fmt_lag(double seconds_value) {
+  const double below = rounds_to_one * 1e-6;  // what fmt_duration would print under "1us"
+  if (seconds_value > 0.0 && seconds_value < below) return "<1us";
+  return fmt_duration(seconds_value);
+}
+
 // From here on the largest prefix, G, would need an exponent itself ("1e+04G").
 constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
 
@@ -338,7 +349,8 @@ struct Overloaded : Fs... {
   }
   std::optional<double> worst;
   for (const auto& node : nodes) {
-    if (node.peak_queue_lag_s) worst = std::max(worst.value_or(0.0), *node.peak_queue_lag_s);
+    // The possibly-NaN lag first, so std::max passes a NaN on rather than hide it.
+    if (node.peak_queue_lag_s) worst = std::max(*node.peak_queue_lag_s, worst.value_or(0.0));
   }
   return worst;
 }
@@ -417,8 +429,8 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
 // A latency, a staleness or a queue lag is a time, printed with its unit; every other metric a
 // ratio.
 [[nodiscard]] std::string fmt_slo_value(model::SloMetric metric, double value) {
-  const bool is_time = is_latency(metric) || metric == model::SloMetric::staleness ||
-                       metric == model::SloMetric::queue_lag;
+  if (metric == model::SloMetric::queue_lag) return fmt_lag(value);
+  const bool is_time = is_latency(metric) || metric == model::SloMetric::staleness;
   return is_time ? fmt_duration(value) : num(value);
 }
 
@@ -475,7 +487,7 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
   if (resolved.spec.type == model::NodeType::client)
     return {{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}};
   Row row = queue_cells(node, resolved.capacity, color);
-  row.push_back({node.peak_queue_lag_s ? fmt_duration(*node.peak_queue_lag_s) : "-"});
+  row.push_back({node.peak_queue_lag_s ? fmt_lag(*node.peak_queue_lag_s) : "-"});
   row.push_back(unavailable_cell(node));
   return row;
 }
@@ -1639,9 +1651,17 @@ struct PaperLoad {
   std::vector<double> totals;
   std::vector<OpLoad> by_op;
   bool converged{};
-  // Per node, unconverged only: its total was still growing when the passes stopped (a loop of
-  // gain >= 1 feeds it), so `totals` holds a pass's figure, not a load (paper_load).
+  // Per node, unconverged only: its total was still growing when the passes stopped and its
+  // pass-to-pass increments did not shrink (a loop of gain >= 1 feeds it), so `totals` holds a
+  // pass's figure, not a load (paper_load).
   std::vector<bool> unbounded{};
+};
+
+// What one pass of the paper load produced: each node's total in capacity units and its load per
+// op in requests.
+struct PaperPass {
+  std::vector<double> totals;
+  std::vector<OpLoad> by_op;
 };
 
 // One pass: what the clients send plus what the feedback links carried in the previous
@@ -1702,14 +1722,86 @@ struct PaperLoad {
   return growing;
 }
 
-// The last finite pass of a paper load that did not converge, its growing nodes marked.
-[[nodiscard]] PaperLoad unconverged(std::vector<double> totals, std::vector<OpLoad> by_op,
-                                    std::span<const double> next) {
-  auto unbounded = still_growing(totals, next);
-  return {.totals = std::move(totals),
-          .by_op = std::move(by_op),
+// The last finite pass of a paper load whose next pass overflowed, its growing nodes marked: a
+// loop of gain well above 1 (2 doubles its flow every lap) reaches the double's limit long before
+// the pass cap.
+[[nodiscard]] PaperLoad overflowed(PaperPass last, std::span<const double> next) {
+  auto unbounded = still_growing(last.totals, next);
+  return {.totals = std::move(last.totals),
+          .by_op = std::move(last.by_op),
           .converged = false,
           .unbounded = std::move(unbounded)};
+}
+
+// How much smaller than the previous one a pass's increment must be for the loop to count as
+// converging: a loop of gain 1 adds the same amount every pass, which rounding can make look a
+// hair smaller (a part in 1e11 after 100,000 passes). Chosen: a gain within a millionth of 1 is
+// called unbounded; its fixed point would be over a million times the flow it is fed.
+constexpr double shrink_margin = 1e-6;
+
+// The share of the last increment that the next pass adds again, r = d_next / d_last, for a node
+// whose increments shrink geometrically (r < 1 - shrink_margin); empty for one whose increments do
+// not shrink. A loop of gain g adds g times its previous lap each pass, so r tends to g.
+[[nodiscard]] std::optional<double> shrinking_ratio(double before, double last, double next) {
+  const double last_step = last - before;
+  const double next_step = next - last;
+  if (!(last_step > 0.0)) return std::nullopt;
+  const double ratio = next_step / last_step;
+  if (ratio >= 1.0 - shrink_margin) return std::nullopt;
+  return std::max(ratio, 0.0);
+}
+
+// `next` + the rest of the geometric series its increments follow: each pass adds r times the
+// previous increment, so after an increment d the passes still to come add d (r + r² + ...)
+// = d r / (1 - r): the fixed point of the iteration, its error shrinking by r per pass (the
+// geometric series' sum, the same that makes a loop of gain g settle at input / (1 - g)).
+[[nodiscard]] double extrapolated(double last, double next, double ratio) {
+  return next + (next - last) * ratio / (1.0 - ratio);
+}
+
+// The node's load per op extrapolated with its totals' ratio: every op on a loop grows by the
+// loop's gain, so each op's increment shrinks like the total's.
+[[nodiscard]] OpLoad extrapolated_ops(const OpLoad& last, const OpLoad& next, double ratio) {
+  OpLoad ops = next;
+  for (auto& [op, rate] : ops) {
+    const auto found = last.find(op);
+    rate = extrapolated(found == last.end() ? 0.0 : found->second, rate, ratio);
+  }
+  return ops;
+}
+
+// The pass cap reached with some totals still moving (review of plan 2c Task 8, minors 2 and 3).
+// Node by node, from the last three passes: a loop of gain just below 1 converges too slowly for
+// the cap (0.9999 needs about 276,000 passes to reach the tolerance), but its increments shrink by
+// the gain every pass, so its fixed point is the geometric series' sum (extrapolated); a loop of
+// gain >= 1 has none, and its nodes' increments do not shrink: they are marked unbounded, their
+// figure the last pass's. Converged when no node is unbounded.
+[[nodiscard]] PaperLoad at_pass_cap(const PaperPass& before, const PaperPass& last,
+                                    PaperPass next) {
+  PaperLoad load{.totals = std::move(next.totals), .by_op = std::move(next.by_op)};
+  load.unbounded.assign(load.totals.size(), false);
+  for (std::size_t i = 0; i < load.totals.size(); ++i) {
+    if (unchanged_total(last.totals[i], load.totals[i])) continue;
+    const auto ratio = shrinking_ratio(before.totals[i], last.totals[i], load.totals[i]);
+    if (!ratio) {
+      load.unbounded[i] = true;
+      continue;
+    }
+    load.totals[i] = extrapolated(last.totals[i], load.totals[i], *ratio);
+    load.by_op[i] = extrapolated_ops(last.by_op[i], load.by_op[i], *ratio);
+  }
+  load.converged = !std::ranges::contains(load.unbounded, true);
+  if (load.converged) load.unbounded.clear();
+  return load;
+}
+
+// One pass of the paper load (paper_pass), its totals and its loads per op together.
+[[nodiscard]] PaperPass next_pass(const graph::Graph& g, const ForwardRoutes& table,
+                                  const std::vector<OpLoad>& offered,
+                                  std::vector<OpLoad>& fed_back) {
+  PaperPass pass;
+  pass.totals = paper_pass(g, table, offered, fed_back, pass.by_op);
+  return pass;
 }
 
 // The paper calculation (System Design Interview ch. 2, back-of-the-envelope QPS): the
@@ -1720,26 +1812,28 @@ struct PaperLoad {
 // one lap further, so a loop of gain g (the fraction of its flow it sends round again)
 // approaches input / (1 - g), the geometric series' sum, after about
 // log(tolerance) / log(g) passes (40 for g = 0.5). A loop of gain >= 1 has no fixed point:
-// its totals grow until the pass cap or until they overflow; either way the last finite
-// pass is returned, unconverged. Unlike estimate, nothing caps a node at its capacity here.
+// its totals grow until they overflow (the last finite pass is returned, unconverged) or until
+// the pass cap, where a loop whose increments still shrink is extrapolated to its fixed point
+// and the others are marked unbounded (at_pass_cap). Unlike estimate, nothing caps a node at its
+// capacity here.
 [[nodiscard]] PaperLoad paper_load(const graph::Graph& g) {
   const auto offered = client_load(g);
   const auto table = forward_routes(g);
   std::vector<OpLoad> fed_back(g.nodes().size());
-  std::vector<OpLoad> by_op;
-  auto totals = paper_pass(g, table, offered, fed_back, by_op);
-  std::vector<double> previous;
+  PaperPass before;
+  PaperPass last = next_pass(g, table, offered, fed_back);
   for (int pass = 1; pass < max_paper_passes; ++pass) {
-    std::vector<OpLoad> next_by_op;
-    auto next = paper_pass(g, table, offered, fed_back, next_by_op);
-    if (!all_finite(next)) return unconverged(std::move(totals), std::move(by_op), next);
-    if (settled(totals, next)) {
-      return {.totals = std::move(next), .by_op = std::move(next_by_op), .converged = true};
+    PaperPass next = next_pass(g, table, offered, fed_back);
+    if (!all_finite(next.totals)) return overflowed(std::move(last), next.totals);
+    if (settled(last.totals, next.totals)) {
+      return {.totals = std::move(next.totals), .by_op = std::move(next.by_op), .converged = true};
     }
-    previous = std::exchange(totals, std::move(next));
-    by_op = std::move(next_by_op);
+    before = std::exchange(last, std::move(next));
   }
-  return unconverged(std::move(totals), std::move(by_op), previous);
+  // One pass more at the cap, to set its increment against the last one's.
+  PaperPass next = next_pass(g, table, offered, fed_back);
+  if (!all_finite(next.totals)) return overflowed(std::move(last), next.totals);
+  return at_pass_cap(before, last, std::move(next));
 }
 
 // ---- loads that rest on an unknown hit ratio ----
@@ -2162,13 +2256,20 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 // node's is (partial_check): no percentage when nothing reached the link, a lower bound otherwise.
 // When the sender's load rests on an unknown hit ratio (it is behind such a cache, or it is one,
 // whose misses are what it sends on: counts_unknown_hit_ratio, unknown_misses) the line carries
-// the node lines' upper-bound note: every read counted as a miss.
+// the node lines' upper-bound note: every read counted as a miss. When a loop of gain >= 1 feeds
+// the sender (PaperLoad::unbounded), what it puts on the link has no figure either, and the line
+// says so as a node's does (unbounded_check; review of plan 2c Task 8, minor 1: a link behind a
+// gain-2 loop printed "8.988e+307 MB/s").
 [[nodiscard]] std::string link_check(const graph::Graph& g, const ForwardRoutes& table,
                                      const PaperLoad& load, std::size_t link,
                                      std::span<const model::NodeType> blocked_at_sender,
                                      bool upper_bound) {
   const auto& resolved = g.links()[link];
   const auto sender = graph::demand_sender(resolved);
+  if (!load.converged && load.unbounded[sender]) {
+    return "peak offered unbounded vs " + with_si_prefix(resolved.pipe->service_rate.per_second) +
+           " MB/s  (no steady state, red)";
+  }
   const bool from_client = g.nodes()[sender].spec.type == model::NodeType::client;
   const auto sent =
       from_client ? client_link_load(g, sender, link) : forwarded_link_load(g, table, load, link);
@@ -2304,7 +2405,8 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
     replication_seen_s += dt_s;
   }
   if (sample.queue_lag_s) {  // a message queue: its worst moment is what a lag bound bounds
-    peak_queue_lag_s = std::max(peak_queue_lag_s.value_or(0.0), *sample.queue_lag_s);
+    // The possibly-NaN sample first, so std::max passes a NaN on rather than hide it.
+    peak_queue_lag_s = std::max(*sample.queue_lag_s, peak_queue_lag_s.value_or(0.0));
   }
 }
 
@@ -2616,7 +2718,8 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
            "latency_ms,zone,queue_lag_s\n";
 }
 
-// CSV is for machines, so every numeric column always holds a number:
+// CSV is for machines, so every numeric column holds a number on every row the quantity exists
+// for, and is empty where it does not (only `queue_lag_s`, below):
 // - `t_s` is the shortest form that reads back to the same double (0.1, 2, 0.35), not a
 //   fixed number of decimals that would round a fine step away; the other numbers have 6
 //   significant digits;
@@ -2630,8 +2733,8 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
 //   `rejected_per_s` says how much of it); a leaky bucket's are its queue's overflow, written
 //   in `rejected_per_s` instead of `drops_per_s`, so for one the identity takes them in the
 //   drops' place;
-// - a client row writes 0 in every numeric column (a source has no queue) and `none` as its
-//   zone, so a plot can filter clients out by zone;
+// - a client row writes 0 in every numeric column but `queue_lag_s` (a source has no queue), which
+//   it leaves empty, and `none` as its zone, so a plot can filter clients out by zone;
 // - an infinite latency is written as `inf` (which spreadsheet and plotting tools parse),
 //   unlike the table ("unavailable") and JSON (null), read by people or by parsers
 //   without an infinity;

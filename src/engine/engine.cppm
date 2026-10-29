@@ -148,12 +148,14 @@ struct NodeSample {
   // write arrives); empty for every other node.
   std::optional<double> committed_writes_per_s{};
   // A message queue's lag, in seconds (plan 2c refinements 4 and 14; the queue between producers
-  // and workers of ch. 10 and ch. 14): how long the message its slowest consumer group reads next
-  // has waited. The broker holds nothing back (it appends at 1M/s); the unread messages wait
-  // in each group's worker pool, so the lag is read off the pools (Simulation::record_queue_lags):
+  // and workers of ch. 10 and ch. 14): how long a message published at this step waits until its
+  // slowest consumer group reads it. Kafka reports a group's lag as the records it has not read;
+  // divided by the rate the group consumes them, that is this time. The broker holds nothing back
+  // (it appends at 1M/s); the unread messages wait in each group's worker pool, so the lag is read
+  // off the pools (Simulation::record_queue_lags):
   //   lag(group) = the pool's queueing wait this step (fluid::FluidQueue::wait)
   //              = max(min(k × Wq, T), backlog / capacity)
-  //     backlog / capacity  the FIFO drain time: the oldest unread message is read after everything
+  //     backlog / capacity  the FIFO drain time: a message published now is read after everything
   //                         ahead of it, which the pool works off at its capacity (workers / cost)
   //                         while it is behind: 60,000 messages at 1200/s are 50 s;
   //     k × Wq              the stochastic part: Allen–Cunneen's factor k times the Erlang C wait
@@ -162,7 +164,12 @@ struct NodeSample {
   //                         busy, 3.289 ms for 1k/s into 4 workers at 3.333 ms;
   //     T                   the room's drain time, = the queue's retention: a message older than
   //                         that is deleted unconsumed, so no lag passes it.
+  //   The larger of the two terms is our heuristic (FluidQueue::wait), not a published result.
   //   lag(queue) = the largest over its groups: a queue is as far behind as its slowest reader.
+  // It is not the age of the oldest unread message, which a dashboard may show instead: under
+  // FIFO the message published now becomes the oldest one lag later, so the age trails this lag
+  // by one lag and reaches the same peak that much later. The `queue_lag` SLO bounds the peak
+  // after warmup, so it reads "every message published after warmup was read within `max`".
   // The wait only: the job's `cost` is not lag (a message is read once a worker takes it), so the
   // lag is the pool's latency minus its cost. Assumes the backlog is read first in, first out (a
   // Kafka partition is). Empty for every node that is not a message queue (a 0 would be a claim).
@@ -1274,7 +1281,9 @@ void Simulation::record_queue_lags(std::span<NodeSample> samples) const {
     const auto& groups = nodes_[queue].consumer_groups;
     if (groups.empty()) continue;  // not a message queue
     double lag = 0.0;
-    for (const std::size_t pool : groups) lag = std::max(lag, nodes_[pool].wait.mean_s);
+    // The possibly-NaN wait first: std::max returns its first argument when the comparison is
+    // false, so a NaN there propagates instead of being hidden (the project's convention).
+    for (const std::size_t pool : groups) lag = std::max(nodes_[pool].wait.mean_s, lag);
     samples[queue].queue_lag_s = lag;
   }
 }
