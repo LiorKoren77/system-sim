@@ -8,8 +8,8 @@
 // check (System Design Interview ch. 2) a student would do on paper before running.
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
-// explanation of modules versus headers). Only declarations live here; the renderers and
-// their number formatting are in report.cpp.
+// explanation of modules versus headers). Only declarations live here; the renderers are in
+// report.cpp and explain.cpp, the number formatting they share in the partition shared.cppm.
 module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this interface imports other modules
 // (GCC 14.2 'Bad file data' bug, CLAUDE.md §3). Heavy headers go in report.cpp.

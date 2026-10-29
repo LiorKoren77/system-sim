@@ -60,8 +60,8 @@ plus `run --report json` and `sweep` on hello, and `ctest` in both presets (the 
 
 **Files:** create `src/report/explain.cpp` (and `src/report/detail.hpp` or the partition); modify `src/report/report.cpp`, `CMakeLists.txt`.
 
-- [ ] Tests: none new (a move). Red state: none. Acceptance is the byte-identity check, `ctest` 1163 both presets, warning-free, clang-format clean, the Release link clean (fourth defect: a helper now instantiated in two units may need an `emit_special_members` line) and no "multiple definition" (fifth defect: any lambda handed to a range adaptor in moved code becomes a named `detail::` function).
-- [ ] Commit `report: explain in its own implementation unit`.
+- [x] Tests: none new (a move). Red state: none. Acceptance is the byte-identity check, `ctest` 1163 both presets, warning-free, clang-format clean, the Release link clean (fourth defect: a helper now instantiated in two units may need an `emit_special_members` line) and no "multiple definition" (fifth defect: any lambda handed to a range adaptor in moved code becomes a named `detail::` function). **Done:** 1,676 lines moved into `explain.cpp` (the explain sections, 1,672 lines, and `render_explain`), 153 into the partition; `report.cpp` 3,249 → 1,433 lines. Sharing: the module implementation partition `simsys.report:shared` (`src/report/shared.cppm`), not the header: GCC 14.2 builds and links it in both presets with no workaround (no `emit_special_members` line, no new `detail::` function: the moved code hands no lambda to a range adaptor). It defines the units, the number formatters, `zone_name` and the aligned table, and declares the three helpers whose bodies need the exported `format_duration` (no partition can import its own module's interface): `format_duration(SimTime)` (defined in `report.cpp`), `clock_or_duration` and `window_clock` (in `explain.cpp`). Byte-identical on all 14 scenarios × validate/explain/estimate/run/run --report json and the hello sweep; 1163 tests, names unchanged, both presets.
+- [x] Commit `report: explain in its own implementation unit`.
 
 ### Task 2: the loader's readers per concern
 

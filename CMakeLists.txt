@@ -44,11 +44,13 @@ target_sources(simsys
     src/engine/behaviours.cppm
     src/engine/engine.cppm
     src/report/report.cppm
+    src/report/shared.cppm               # implementation partition simsys.report:shared: a BMI too
     src/session/session.cppm
     src/sweep/sweep.cppm
   PRIVATE                               # module implementation units are ordinary sources
     src/config/config.cpp
     src/model/model.cpp
+    src/report/explain.cpp
     src/report/report.cpp
     src/session/session.cpp
     src/sweep/sweep.cpp)
