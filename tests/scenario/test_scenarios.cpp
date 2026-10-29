@@ -129,10 +129,10 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
     //    uploads); it is exempt here only for time: 24 h at 100 ms is 864k steps, about 60 s of
     //    CPU in Release (measured 2026-10-29), far over the five seconds. Its own test below runs
     //    the day at 10 s steps and pins its three SLOs passing.
-    //  - news-feed runs since plan 2c Task 10 (its kv_cluster, graph_db, is simulated), but is
-    //    exempt from its SLOs until Task 17: 24 h at 100 ms is 864k steps, far over the five
-    //    seconds, and its drop_rate and queue_lag SLOs are Task 17's to meet. The "book/news-feed
-    //    runs" test below runs its first steps instead.
+    //  - news-feed runs since plan 2c Task 10 (its kv_cluster, graph_db, is simulated) and MEETS
+    //    its three SLOs since Task 17 sized it for its 12:00 spike; it is exempt here only for
+    //    time: 24 h at 100 ms is 864k steps, about 20 s in Release (measured 2026-10-29), far over
+    //    the five seconds. Its own tests below run the day at a 1 s step and pin the SLOs passing.
     //  - search-autocomplete runs since plan 2c Task 11 (its search_index is a service) and MEETS
     //    its SLOs (measured 2026-10-29, Release, full day at 100 ms: p99 of suggest 6.86 ms
     //    against 100 ms, drop rate 0); it is exempt here only for time: 24 h at 100 ms is 862.8k
@@ -522,12 +522,13 @@ TEST_CASE("book/news-feed is accepted by the engine now that its kv_cluster is s
 // The news feed runs: in its first second (00:00, the curve at 1.3 x its 10k/s base: 13k/s, a
 // tenth of it posts, ~1.3k/s) every post the web tier takes is first written to post_db, and only
 // a post post_db wrote is published (plan 2c Task 12: a step after a failed step does not run).
-// post_db's primary takes 5k units/s at 5 units a write (defaults::sql_write_cost): 1k writes/s,
-// so it drops the rest and one fan-out job per WRITTEN post reaches the pool: 1.3k/s x (1k / 1.3k)
-// = 1k jobs/s (999.997/s at the 20th step: the curve has moved a little from 00:00), where it was
-// 1.3k/s while every post was published. The pool's 32 workers at 5 ms drain up to 6.4k jobs/s, so
-// every job is drained and read graph_db once, and the 6-node, N = 3 cluster is sent three
-// replica-requests per job: its demand is exactly 3 x what the pool drained.
+// Since Task 17 post_db has 6 shards, each primary committing 5k units/s at 5 units a write
+// (defaults::sql_write_cost): 1.3k x 5 / 6 = 1.083k units/s each, so every post is written and
+// one fan-out job per post reaches the pool: 0.1 x 10k x (1 + 0.6 cos(2 pi (1.9 s - 20 h) / 24 h))
+// = 1,299.93 jobs/s at the 20th step (the curve has moved a little from 00:00's 1.3k). With one
+// shard, as first shipped, the primary's 1k writes/s capped it at 999.997. The pool's 32 workers
+// at 5 ms drain up to 6.4k jobs/s, so every job is drained and reads graph_db once, and the
+// 6-node, N = 3 cluster is sent three replica-requests per job: exactly 3 x what the pool drained.
 TEST_CASE("book/news-feed runs: graph_db is sent three replica-requests per fan-out job",
           "[scenario]") {
   using namespace std::chrono_literals;
@@ -539,10 +540,104 @@ TEST_CASE("book/news-feed runs: graph_db is sent three replica-requests per fan-
   for (int i = 0; i < 20; ++i) last = sim->step(i * 100ms, 100ms);
   const auto& fanout = last.nodes[*g.index_of("fanout")];
   const auto& graph_db = last.nodes[*g.index_of("graph_db")];
-  // post_db's 1k writes/s: the posts it wrote (1e-4: the step's survival is the step before's)
-  REQUIRE_THAT(fanout.drain_per_s, Catch::Matchers::WithinRel(1000.0, 1e-4));
+  // Every post, nothing lost on the way (1e-6: the closed form above to its printed digits)
+  REQUIRE_THAT(fanout.drain_per_s, Catch::Matchers::WithinRel(1299.928, 1e-6));
   REQUIRE_THAT(graph_db.demand_per_s, Catch::Matchers::WithinRel(3.0 * fanout.drain_per_s, 1e-6));
   REQUIRE(graph_db.dropped_per_s == 0.0);  // 3.9k of 180k replica-requests/s
+}
+
+// ---- The news feed's whole day, sized for its 12:00 spike (plan 2c Task 17) ----
+//
+// The day's peak is the end of the 12:00 spike: 3 x the sine for 10 minutes while the sine is
+// still rising towards its 20:00 top, so the last step of the spike (12:09:59 at a 1 s step) is
+// the busiest of the day: 30k/s x (1 + 0.6 cos(2 pi (43,799 s - 72,000 s) / 86,400 s)) =
+// 21,687.4 requests/s. (explain's minute samples find 21.62k/s at 12:09, so its percentages are
+// 0.3 % below these.) At that step, per copy:
+//   web         70 % of it (feed reads and posts) over 12 x 2k/s           = 0.632548
+//   feed_cache  60 % reads + 10 % posts x 300 fan-out writes, over 10 x 100k = 0.663633
+//   post_db     a replica: 5 % of the 20 hydrations per read over 12 replicas,
+//               + its shard's writes, 10 % x 5 units / 6 shards, of 5k/s     = 0.578330
+//   fanout      10 % posts over 32 workers / 5 ms = 6.4k jobs/s             = 0.338865
+// The run's peak rho is that step's, so each matches its closed form to the digits computed
+// (1e-5 relative: six significant digits, against a closed form the run reproduces to 1e-15).
+// Nothing is dropped: every copy stays under rho 1. The day runs at 1 s, not the shipped 100 ms
+// (86.4k steps; 864k would take minutes in Debug): the peaks and the backlog move by less than
+// 1e-4 between the two (measured: 200.34 s and 200.36 s of lag below).
+
+namespace {
+
+// The whole day of book/news-feed at a 1 s step with `workers` fan-out workers: every node's
+// summary, the drop rate and the three SLO verdicts.
+struct NewsFeedDay {
+  std::vector<simsys::report::NodeSummary> nodes;
+  double drop_rate{};
+  std::vector<simsys::report::SloResult> slos;
+
+  [[nodiscard]] const simsys::report::NodeSummary& node(std::string_view id) const {
+    const auto found = std::ranges::find(nodes, id, &simsys::report::NodeSummary::id);
+    if (found == nodes.end()) FAIL("no node " << id);
+    return *found;
+  }
+  [[nodiscard]] const simsys::report::SloResult& slo(simsys::model::SloMetric metric) const {
+    const auto found = std::ranges::find(slos, metric, [](const auto& r) { return r.slo.metric; });
+    if (found == slos.end()) FAIL("the scenario has no such SLO");
+    return *found;
+  }
+};
+
+NewsFeedDay run_news_feed_day(int workers) {
+  using namespace std::chrono_literals;
+  auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml");
+  s.step = 1s;
+  std::ranges::find(s.nodes, "fanout", &simsys::model::NodeSpec::id)->workers = workers;
+  const auto g = build_or_fail(s);
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  simsys::report::Summary summary{g, s.warmup};
+  sim->run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
+  return {summary.nodes(), summary.drop_rate(), simsys::report::evaluate_slos(summary, s.slos)};
+}
+
+}  // namespace
+
+TEST_CASE("book/news-feed sized for its noon spike meets its three SLOs and drops nothing",
+          "[scenario]") {
+  const auto day = run_news_feed_day(32);  // as shipped
+  REQUIRE(day.slos.size() == 3);
+  for (const auto& r : day.slos) {
+    CAPTURE(static_cast<int>(r.slo.metric), r.observed.value_or(-1.0));
+    REQUIRE(r.status == simsys::report::SloStatus::pass);
+  }
+  REQUIRE(day.drop_rate == 0.0);
+  CHECK_THAT(day.node("web").peak_rho, Catch::Matchers::WithinRel(0.632548, 1e-5));
+  CHECK_THAT(day.node("feed_cache").peak_rho, Catch::Matchers::WithinRel(0.663633, 1e-5));
+  CHECK_THAT(day.node("post_db").peak_rho, Catch::Matchers::WithinRel(0.578330, 1e-5));
+  CHECK_THAT(day.node("fanout").peak_rho, Catch::Matchers::WithinRel(0.338865, 1e-5));
+  // The fan-out queue never falls behind: at most 34 % of the workers busy, the Erlang C wait of
+  // 32 workers is far below a microsecond (measured 3.5e-11 s). 1 ms is a bound with room, not a
+  // pin of a number that small.
+  const auto& lag = day.slo(simsys::model::SloMetric::queue_lag);
+  REQUIRE(lag.observed.has_value());
+  CHECK(*lag.observed < 1e-3);
+}
+
+// The README's first "Things to try": 8 workers drain 8 / 5 ms = 1.6k jobs/s, below the spike's
+// posts (2.1k/s at 12:00 rising to 2.169k/s at 12:10), so the pool falls behind for the spike's
+// 600 s by the integral of (posts - 1.6k/s): 534.2/s on average x 600 s = 320.5k messages at 12:10,
+// and a message published then waits for all of them: 320.5k / 1.6k/s = 200.3 s of lag, over the
+// 2-minute SLO. (The evening's 1.6k posts/s at 20:00 only meet the capacity, so no backlog grows
+// there.) The other two SLOs still pass: the fan-out is asynchronous, the reader's path never
+// waits for it. 1e-3: the integral's average to its four digits.
+TEST_CASE("book/news-feed with 8 fan-out workers falls 200 s behind in the spike and fails its lag",
+          "[scenario]") {
+  const auto day = run_news_feed_day(8);
+  const auto& lag = day.slo(simsys::model::SloMetric::queue_lag);
+  REQUIRE(lag.observed.has_value());
+  CHECK_THAT(*lag.observed, Catch::Matchers::WithinRel(200.3, 1e-3));
+  CHECK(lag.status == simsys::report::SloStatus::fail);
+  CHECK_THAT(day.node("fanout").peak_backlog, Catch::Matchers::WithinRel(320.5e3, 1e-3));
+  CHECK(day.slo(simsys::model::SloMetric::p99_latency).status == simsys::report::SloStatus::pass);
+  CHECK(day.drop_rate == 0.0);
 }
 
 // Plan 2c refinement 2: byte-sized nodes count megabytes, so the capacities the 2b scenarios gave

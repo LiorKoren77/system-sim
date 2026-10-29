@@ -30,10 +30,16 @@ nodes:
 
   lb: {type: load_balancer, dc: us-east, policy: least_connections}
 
+  # Sized for the day's peak, the 12:00 spike (3x the curve for 10 minutes: 21.6k/s, more than
+  # 20:00's 16k/s), as every number below. Stateless web tier scaled out (ch. 1 "stateless web
+  # tier"; ch. 11 "web servers"): the feed reads and posts, 70 % of 21.6k/s = 15.13k/s (media goes
+  # to the CDN), over 12 x 2k/s (the back-of-the-envelope "web 2k QPS") = 63 %, about two-thirds
+  # like every tier below (11 would be 69 %, at the edge of yellow). At 8 replicas it was 94.6 %,
+  # red.
   web:
     type: service
     dc: us-east
-    replicas: 8
+    replicas: 12
     capacity: 2k/s
     latency: 0.5ms
     ops:
@@ -47,19 +53,37 @@ nodes:
         - {to: post_cache, op: write}
         - {to: fanout_q, op: publish}
 
-  feed_cache: {type: cache, eviction: lru, keys: 10M, hit_ratio: che, strategy: cache_aside}
+  # Fan-out on write (ch. 11 "fanout service") multiplies every post by the ~300 friends whose
+  # feed it is written into: at the peak 2.162k posts/s x 300 = 648.6k writes/s, plus 12.97k feed
+  # reads/s, 661.5k/s in all, over 10 replicas x 100k/s (the "cache 100k QPS" line) = 66.2 %. One
+  # replica, as first shipped, was offered 662 %. This is the chapter's lesson in one number: the
+  # feed cache is sized by the writes the fan-out makes, not by the reads.
+  feed_cache: {type: cache, replicas: 10, eviction: lru, keys: 10M, hit_ratio: che, strategy: cache_aside}
   # A fixed ratio, not che: Che reads the key distribution of the client whose requests reach the
   # cache, and `users.keys` describes user ids (whose feed is read), not the post ids this cache
   # holds; with 50M slots over that 50M-key space Che would say h = 1. One client key space
   # cannot describe two kinds of id; che needs a client whose `keys` are the cached keys (a
   # client of posts). 0.95 is chosen, not the book's: a feed shows mostly recent posts, the ones
   # an LRU post cache keeps.
-  post_cache: {type: cache, eviction: lru, keys: 50M, hit_ratio: {fixed: 0.95}, strategy: cache_aside}
-  user_cache: {type: cache, eviction: lru, keys: 10M, hit_ratio: {fixed: 0.98}, strategy: cache_aside}
+  #
+  # The read path hydrates ~20 posts and their 20 authors per feed read (ch. 11 "newsfeed
+  # retrieval"): 12.97k reads/s x 20 = 259.4k/s at each of post_cache and user_cache (post_cache
+  # also takes the 2.162k post writes: 261.6k/s). 4 replicas x 100k/s: 65.4 % and 64.9 %. With 3
+  # they would be at 87 %, a step from red, and the spike is exactly when a cache must not drop.
+  post_cache: {type: cache, replicas: 4, eviction: lru, keys: 50M, hit_ratio: {fixed: 0.95}, strategy: cache_aside}
+  user_cache: {type: cache, replicas: 4, eviction: lru, keys: 10M, hit_ratio: {fixed: 0.98}, strategy: cache_aside}
 
+  # Writes at the peak: 2.162k posts/s x cost 5 = 10.81k units/s, where one primary commits 5k
+  # units/s (spec §6: 1k writes/s), and every read replica replays every write of its shard, so
+  # replicas cannot help (as in the URL shortener, ch. 8). The data is sharded (ch. 1 "sharding"):
+  # 6 shards, each a primary + 2 read replicas. Per copy at the peak: primary 10.81k / 6 = 1.802k
+  # units/s (36 %); replica the post_cache misses, 5 % x 259.4k = 12.97k reads/s over 12 replicas,
+  # + 1.802k replayed = 2.883k units/s (57.7 %). With 5 shards a replica would be at 69 %, at the
+  # edge of yellow, with 4 at 86 %, with 3 at 115 %, red.
   post_db:
     type: sql_db
-    replicas: 3
+    replicas: 3                                          # 1 primary + 2 read replicas per shard
+    shards: 6
     replication_lag: 50ms
     capacity: 5k/s
     advanced: {queue_limit: 500, service_variability: 1.5}
@@ -96,5 +120,6 @@ slo:
   - {metric: drop_rate, max: 0.001}
   - {metric: queue_lag, node: fanout_q, max: 2m}
 
+# Accepted and ignored: `run` applies no fault before phase 3 (see the README).
 faults:
   - {at: 15:00, kind: node_down, node: post_db, for: 30s}
