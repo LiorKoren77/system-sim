@@ -9,10 +9,16 @@
 // 100 ms"), no interpolation between points and no statistics across points: n points are n
 // independent runs, and the table shows them side by side.
 //
-// Lean on purpose: <thread> and <atomic> live in sweep.cpp, not here. The threads are how the
-// points run, not part of what a sweep is, and this interface imports nothing that needs them
-// (also: no <chrono>/<format> in a module interface, the GCC 14.2 'Bad file data' bug, CLAUDE.md
-// §3).
+// Lean by design: <thread> and <atomic> live in sweep.cpp, not here. The threads are how the
+// points run, not part of what a sweep is, so no importer should parse those headers. (The GCC
+// 14.2 'Bad file data' defect of CLAUDE.md §3 would not bite here: it needs <chrono>, <format>,
+// <filesystem> or <print> in an interface that imports another module, and this one imports
+// none.)
+//
+// C++20 named module, interface unit (see src/core/core.cppm for the longer explanation of
+// modules versus headers): `module;` opens the global module fragment for the #includes, and
+// `export module simsys.sweep;` starts the module's purview, where only `export`ed names are
+// visible to importers.
 module;
 #include <cstddef>
 #include <expected>
@@ -83,6 +89,10 @@ enum class SweepFormat { table, csv };
 
 // The CLI's default --jobs: the machine's hardware threads, or 1 when it cannot tell.
 [[nodiscard]] std::size_t default_jobs();
+
+// The largest --jobs the CLI accepts. Chosen, not from the book: far above any machine's hardware
+// threads, and run_sweep never starts more workers than there are points anyway.
+inline constexpr std::size_t max_jobs = 1024;
 
 // `table`: for people, a header naming the swept key and the metrics, then one line per point,
 // latencies in readable units (1.61 ms). `csv`: for programs, the same header with commas and

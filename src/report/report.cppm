@@ -307,6 +307,13 @@ class Summary {
 // A number for machines (CSV): the shortest text that reads back to the same double (0.1,
 // 2, 4000), locale-independent (std::to_chars). `simsys curve` prints its columns with it.
 [[nodiscard]] std::string format_number(double value);
+// A duration for people, as the tables print one: seconds in the largest unit that keeps the
+// number >= 1, three significant digits ("1.61ms", "2.66h"); "unavailable" for infinity.
+// `simsys sweep` prints its latencies with it.
+[[nodiscard]] std::string format_duration(double seconds);
+// A queue lag as the tables print one: format_duration, but "<1us" below a microsecond (an idle
+// consumer group's lag is a vanishing Erlang C figure, not a measurement).
+[[nodiscard]] std::string format_lag(double seconds);
 
 // `simsys explain`: every resolved number with its provenance, the links, the step order
 // and a static load check (offered load vs capacity, no queueing).

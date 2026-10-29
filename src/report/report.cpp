@@ -3074,6 +3074,14 @@ std::string format_number(double value) {
   return shortest(value);
 }
 
+std::string format_duration(double seconds_value) {
+  return fmt_duration(seconds_value);
+}
+
+std::string format_lag(double seconds_value) {
+  return fmt_lag(seconds_value);
+}
+
 std::string render_explain(const graph::Graph& g) {
   return explain_header(g.scenario()) + explain_nodes(g) + explain_links(g) + explain_order(g) +
          explain_checks(g);

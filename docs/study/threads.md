@@ -130,12 +130,13 @@ stored per point.
 
 `sweep.cppm`, the interface, declares what a sweep *is* (`SweepParam`, `run_sweep`, ...); how the
 points are spread over threads is an implementation detail no importer needs to see, so
-`<thread>` and `<atomic>` are included only in the implementation unit, `sweep.cpp`. Two more
-reasons: an importer (the CLI, the tests) does not pay to parse them, and module interface units
-in this project stay lean because GCC 14.2 fails on heavy headers in the global module fragment of
-an interface that imports another module (CLAUDE.md §3, "Bad file data"). Even `default_jobs()`
-(`std::thread::hardware_concurrency()`) is a function of the module, so `main.cpp` never includes
-`<thread>`.
+`<thread>` and `<atomic>` are included only in the implementation unit, `sweep.cpp`, and an
+importer (the CLI, the tests) does not pay to parse them. This is a design choice, a lean
+interface, not a compiler workaround: the GCC 14.2 "Bad file data" defect (CLAUDE.md §3) needs
+`<chrono>`, `<format>`, `<filesystem>` or `<print>` in the global module fragment of an interface
+that imports another module, and `sweep.cppm` imports none, so it would not bite here. Even
+`default_jobs()` (`std::thread::hardware_concurrency()`) is a function of the module, so
+`main.cpp` never includes `<thread>`.
 
 ## The pre-C++20 way
 

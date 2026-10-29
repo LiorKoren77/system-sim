@@ -9,6 +9,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstddef>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -191,12 +192,54 @@ TEST_CASE("a spec that does not follow the grammar is refused") {
   for (const std::string_view bad :
        {"nodes.users.rate.base", "nodes.users.rate.base=100/s",
         "nodes.users.rate.base=100/s..900/s", "nodes.users.rate.base=100/s..900/s:x",
-        "nodes.users.rate.base=100/s..900/s:0", "=100/s..900/s:3"}) {
+        "nodes.users.rate.base=100/s..900/s:0", "=100/s..900/s:3",
+        // A third dot: the upper end would read as `.5ms`, 0.5 ms, a different sweep than typed.
+        "nodes.api.latency=1ms...5ms:2"}) {
     CAPTURE(bad);
     const auto param = parse_param(bad);
     REQUIRE_FALSE(param.has_value());
     REQUIRE(param.error().starts_with("--param: "));
   }
+}
+
+TEST_CASE("a range of more than 10000 points is refused before it is expanded") {
+  // Each point is a whole simulation; a typo of a few zeros must not exhaust memory first.
+  const auto too_many = parse_param("nodes.users.rate.base=100/s..900/s:10001");
+  REQUIRE_FALSE(too_many.has_value());
+  REQUIRE(too_many.error() == "--param: 100/s..900/s:10001: at most 10000 points");
+  const auto absurd = parse_param("nodes.users.rate.base=100/s..900/s:1000000000000");
+  REQUIRE_FALSE(absurd.has_value());
+  const auto most = parse_param("nodes.users.rate.base=100/s..900/s:10000");
+  REQUIRE(most.has_value());
+  REQUIRE(most->values.size() == 10000);
+}
+
+TEST_CASE("only a key the loader reads as a whole number must get whole points") {
+  // Where the key sits decides, not its name alone: an op share that happens to be called
+  // `workers` is a fraction like any other share.
+  for (const std::string_view whole :
+       {"seed=1..2:3", "nodes.w.workers=1..2:3", "nodes.w.advanced.queue_limit=1..2:3",
+        "nodes.c.keys.space=1..2:3", "nodes.kv.nodes=1..2:3"}) {
+    CAPTURE(whole);
+    const auto param = parse_param(whole);
+    REQUIRE_FALSE(param.has_value());
+    REQUIRE(param.error().contains("must be whole"));
+  }
+  for (const std::string_view fractional :
+       {"nodes.u.ops.workers=0.1..0.9:4", "nodes.w.advanced.burstiness=1..2:3",
+        "nodes.w.latency=1ms..2ms:3"}) {
+    CAPTURE(fractional);
+    const auto param = parse_param(fractional);
+    INFO((param ? "" : param.error()));
+    REQUIRE(param.has_value());
+  }
+}
+
+TEST_CASE("the whole-number message shows the point with its unit") {
+  // 5M + 1 x (15M - 5M) / 3 = 8.33M keys: the unit belongs to the number.
+  const auto param = parse_param("nodes.c.keys=5M..15M:4");
+  REQUIRE_FALSE(param.has_value());
+  REQUIRE(param.error() == "--param: keys must be whole (5M..15M:4 gives 8.33M)");
 }
 
 // ---- parse_metric: what to read off each point ------------------------------------------------
@@ -287,6 +330,23 @@ TEST_CASE("an override path that runs through a list is refused") {
   REQUIRE(scenario.error().message.contains("list"));
 }
 
+TEST_CASE("an override path can be checked against the file without loading any value") {
+  REQUIRE(simsys::config::check_override_path(hello_path, "nodes.users.rate.base").has_value());
+  const auto missing = simsys::config::check_override_path(hello_path, "nodes.users.rate.bse");
+  REQUIRE_FALSE(missing.has_value());
+  REQUIRE(missing.error().message == "--param: nodes.users.rate.bse: no such key in the scenario");
+  REQUIRE(missing.error().line == 0);  // the mistake is on the command line, not in the file
+}
+
+TEST_CASE("a loader error is described the way compilers report errors") {
+  using simsys::config::ConfigError;
+  REQUIRE(simsys::config::describe(ConfigError{
+              .file = "a.yaml", .line = 3, .column = 7, .message = "m"}) == "a.yaml:3:7: error: m");
+  // No position when the line is unknown (a missing file, an override's path).
+  REQUIRE(simsys::config::describe(ConfigError{
+              .file = "a.yaml", .line = 0, .column = 0, .message = "m"}) == "a.yaml: error: m");
+}
+
 // ---- run_sweep: one simulation per point -------------------------------------------------------
 
 TEST_CASE("sweeping hello's rate gives the M/M/1 latency and utilization at each rate") {
@@ -353,6 +413,9 @@ TEST_CASE("a swept key that is not in the file is refused before any simulation 
   const auto rows = run_sweep(hello_path, param, metrics, 2);
   REQUIRE_FALSE(rows.has_value());
   REQUIRE(rows.error().contains("nodes.users.rate.bse: no such key in the scenario"));
+  // Every point would fail alike: the path is the sweep's mistake, not a point's.
+  REQUIRE_FALSE(rows.error().starts_with("point "));
+  REQUIRE(rows.error().starts_with(hello_path));
 }
 
 TEST_CASE("a scenario file that does not exist is an error naming the file") {
@@ -429,7 +492,7 @@ TEST_CASE("the table has a line per point that holds the value and its numbers")
   };
   const auto first = line_of("100/s");
   REQUIRE_FALSE(first.empty());
-  REQUIRE(first.contains("1.61"));
+  REQUIRE(first.contains("1.61ms"));  // as the report prints a latency
   REQUIRE(first.contains("0.1"));
   const auto second = line_of("500/s");
   REQUIRE_FALSE(second.empty());
@@ -461,4 +524,32 @@ TEST_CASE("the csv of a real sweep holds the same numbers as its rows") {
   REQUIRE_THAT(parse_double(split(lines[1], ',')[1]), WithinRel(mean_100, rel_tolerance));
   REQUIRE_THAT(parse_double(split(lines[2], ',')[1]), WithinRel(mean_500, rel_tolerance));
   REQUIRE_THAT(parse_double(split(lines[3], ',')[1]), WithinRel(mean_900, rel_tolerance));
+}
+
+TEST_CASE("a number the run did not produce is a dash in the table and an empty csv cell") {
+  // NaN: a latency of an op of which nothing was answered (the report prints `-` there too).
+  const auto latency = parse_metric("users.ping.mean");
+  REQUIRE(latency.has_value());
+  const std::vector<SweepMetric> metrics{*latency};
+  const std::vector<SweepRow> rows{
+      SweepRow{.value = "100/s", .metrics = {std::numeric_limits<double>::quiet_NaN()}}};
+  const auto csv = split(render_sweep(hello_rate_sweep(), metrics, rows, SweepFormat::csv), '\n');
+  REQUIRE(csv.size() == 2);
+  REQUIRE(csv[1] == "100/s,");
+  const auto table =
+      split(render_sweep(hello_rate_sweep(), metrics, rows, SweepFormat::table), '\n');
+  REQUIRE(table.back().starts_with("100/s"));
+  REQUIRE(table.back().ends_with(" -"));
+}
+
+TEST_CASE("a queue lag below a microsecond prints as the report prints it") {
+  // An idle consumer group's lag is Erlang C's tiny chance of waiting times a job (6.3e-11 s on
+  // youtube's completion_q); the report's tables say "<1us", and so does the sweep's.
+  const auto lag = parse_metric("transcode_q.lag");
+  REQUIRE(lag.has_value());
+  const std::vector<SweepMetric> metrics{*lag};
+  const std::vector<SweepRow> rows{SweepRow{.value = "400", .metrics = {6.3e-11}}};
+  const SweepParam param{.path = "nodes.transcoders.workers", .values = {"400"}};
+  const auto table = split(render_sweep(param, metrics, rows, SweepFormat::table), '\n');
+  REQUIRE(table.back().ends_with("<1us"));
 }

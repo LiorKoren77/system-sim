@@ -69,24 +69,10 @@ std::unexpected<std::string> param_error(std::string_view what) {
   return std::unexpected("--param: " + std::string{what});
 }
 
-// The keys the loader reads as whole numbers (read_positive_int, parse_whole<int> and parse_count
-// in config.cpp; `int` in docs/scenario-schema.md). A point of such a key must be whole: 466.67
-// workers is no pool. Keep in step with the loader when it gains an integer key.
-constexpr std::array<std::string_view, 18> whole_number_keys{
-    "version",     "seed",         "replicas",    "concurrency", "queue_limit", "vnodes",
-    "burst",       "shards",       "pool",        "partitions",  "workers",     "nodes",
-    "replication", "write_quorum", "read_quorum", "keys",        "space",       "uniform"};
-
 // The last segment of a dot path: the key itself (`workers` of `nodes.w.workers`).
 std::string_view last_key(std::string_view path) {
   const auto dot = path.rfind('.');
   return dot == std::string_view::npos ? path : path.substr(dot + 1);
-}
-
-bool counts_whole_things(std::string_view path) {
-  // C++23 std::ranges::contains: "is this value in the range?", replacing
-  // `std::find(begin, end, v) != end`.
-  return std::ranges::contains(whole_number_keys, last_key(path));
 }
 
 bool is_all_digits(std::string_view text) {
@@ -127,10 +113,16 @@ struct RangeEnd {
   std::string unit{};
 };
 
+// An end starts with a digit or a minus sign: from_chars would also read `.5ms` (0.5 ms), which is
+// what the upper end of `1ms...5ms` would be, a different sweep from the one typed.
+bool starts_like_a_number(std::string_view text) {
+  return !text.empty() && (text.front() == '-' || (text.front() >= '0' && text.front() <= '9'));
+}
+
 std::expected<RangeEnd, std::string> parse_end(std::string_view text) {
   double number{};
   const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), number);
-  if (error != std::errc{} || !std::isfinite(number)) {
+  if (!starts_like_a_number(text) || error != std::errc{} || !std::isfinite(number)) {
     return param_error("'" + std::string{text} + "' is not a number followed by a unit");
   }
   // C++20 designated initializers: each member named where the value is built, so the reader
@@ -165,7 +157,13 @@ std::expected<SpecParts, std::string> split_spec(std::string_view spec) {
                    .count = range.substr(colon + 1)};
 }
 
-// The number of points: a whole number, at least 2 (one point is a run, not a sweep).
+// The most points a sweep runs. Chosen, not from the book: each point is a whole simulation, so
+// 10,000 is far beyond any sweep a person reads, yet small enough that a typo of a few zeros
+// (`:1000000000000`) is refused before its values are expanded into memory.
+constexpr std::size_t max_points = 10'000;
+
+// The number of points: a whole number, at least 2 (one point is a run, not a sweep), at most
+// max_points.
 std::expected<std::size_t, std::string> parse_count(const SpecParts& parts) {
   std::size_t count{};
   const auto* end = parts.count.data() + parts.count.size();
@@ -175,6 +173,10 @@ std::expected<std::size_t, std::string> parse_count(const SpecParts& parts) {
   }
   if (count < 2) {
     return param_error(std::string{parts.range} + ": a range needs at least 2 points");
+  }
+  if (count > max_points) {
+    return param_error(std::string{parts.range} + ": at most " + std::to_string(max_points) +
+                       " points");
   }
   return count;
 }
@@ -198,13 +200,15 @@ std::string point_text(double value, bool whole) {
 std::expected<std::vector<std::string>, std::string> expand(const SpecParts& parts,
                                                             const RangeEnd& from,
                                                             const RangeEnd& to, std::size_t n) {
-  const bool whole = counts_whole_things(parts.path);
+  // The loader knows which keys it reads as whole numbers (466.67 workers is no pool).
+  const bool whole = config::counts_whole_things(parts.path);
   std::vector<std::string> values;
   for (std::size_t k = 0; k < n; ++k) {
     const double value = point_at(from.number, to.number, k, n);
     if (whole && !is_whole(value)) {
       return param_error(std::string{last_key(parts.path)} + " must be whole (" +
-                         std::string{parts.range} + " gives " + two_decimals(value) + ")");
+                         std::string{parts.range} + " gives " + two_decimals(value) + from.unit +
+                         ")");
     }
     values.push_back(point_text(value, whole) + from.unit);
   }
@@ -302,14 +306,16 @@ std::optional<std::string> first_metric_problem(const model::Scenario& scenario,
 
 // What a metric reads off one run: the report's own Summary (the numbers `simsys run --report
 // json` prints), so a sweep computes nothing the report does not. A NaN for a value the run did
-// not produce (a queue lag of a run that observed no step).
+// not produce: the mean latency of an op of which nothing was answered (the report prints `-`
+// there: a mean over no answers is no latency), a queue lag of a run that observed no step.
 constexpr double no_value = std::numeric_limits<double>::quiet_NaN();
 
 double read_metric(std::span<const report::NodeSummary> nodes,
                    std::span<const report::OpSummary> ops, const SweepMetric& metric) {
   if (metric.kind == MetricKind::mean_latency) {
     for (const auto& op : ops) {
-      if (op.client == metric.node && op.op == metric.op) return op.mean_s;
+      if (op.client != metric.node || op.op != metric.op) continue;
+      return op.answered_per_s > 0.0 ? op.mean_s : no_value;
     }
     return no_value;
   }
@@ -320,14 +326,6 @@ double read_metric(std::span<const report::NodeSummary> nodes,
 }
 
 // ---- one point ---------------------------------------------------------------------------------
-
-// Compiler-style `file:line:column: error: message`, as `simsys` prints loader errors; no
-// position when the line is unknown (a missing file, an override's path).
-std::string describe(const config::ConfigError& error) {
-  if (error.line == 0) return error.file + ": error: " + error.message;
-  return error.file + ":" + std::to_string(error.line) + ":" + std::to_string(error.column) +
-         ": error: " + error.message;
-}
 
 // "point 2 (nodes.users.rate.base=-1/s): ": points count from 1, as a person counts them.
 std::string point_label(const SweepParam& param, std::size_t index) {
@@ -343,7 +341,7 @@ std::expected<graph::Graph, std::string> prepare_point(const std::string& path,
   // C++23 monadic std::expected: transform_error rewrites only an error, and_then runs the next
   // fallible stage only on a value; no `if (!x) return ...` after each stage.
   return config::load(path, overrides)
-      .transform_error(describe)
+      .transform_error(config::describe)
       .and_then([&](model::Scenario scenario) {
         return graph::Graph::build(std::move(scenario))
             .transform_error([&](const graph::EngineError& error) {
@@ -446,33 +444,25 @@ PerPoint<T> for_each_point(std::size_t count, std::size_t jobs, const Stage& sta
 
 // ---- rendering ---------------------------------------------------------------------------------
 
-// A unit and its size in seconds, largest first, in the scenario grammar's spelling.
-struct TimeUnit {
-  std::string_view name;
-  double seconds;
-};
-constexpr std::array time_units{TimeUnit{"h", 3600.0}, TimeUnit{"m", 60.0},  TimeUnit{"s", 1.0},
-                                TimeUnit{"ms", 1e-3},  TimeUnit{"us", 1e-6}, TimeUnit{"ns", 1e-9}};
-
-// Seconds for a person: the largest unit that keeps the number at least 1, three significant
-// digits, a space before the unit (0.0016111 -> "1.61 ms"). report.cpp has its own, unexported,
-// for its tables; this one is the sweep table's.
-std::string human_duration(double seconds_value) {
-  if (std::isnan(seconds_value)) return "-";
-  if (!std::isfinite(seconds_value)) return "unavailable";
-  if (seconds_value == 0.0) return "0 s";
-  constexpr double rounds_to_one = 0.9995;  // 999.7 us prints "1 ms", not "1e+03 us"
-  for (const auto& unit : time_units) {
-    if (std::abs(seconds_value) / unit.seconds >= rounds_to_one) {
-      return significant(seconds_value / unit.seconds, 3) + " " + std::string{unit.name};
-    }
+// A cell for people, as the report's tables print the same number (report::format_duration and
+// format_lag: "1.61ms", "<1us"); "-" for a number the run did not produce.
+std::string human_cell(const SweepMetric& metric, double value) {
+  if (std::isnan(value)) return "-";
+  switch (metric.kind) {
+    case MetricKind::mean_latency:
+      return report::format_duration(value);
+    case MetricKind::mean_rho:
+      return significant(value, 3);
+    case MetricKind::peak_queue_lag:
+      return report::format_lag(value);
   }
-  return significant(seconds_value / 1e-9, 3) + " ns";
+  return "-";
 }
 
-std::string human_cell(const SweepMetric& metric, double value) {
-  if (metric.kind == MetricKind::mean_rho) return std::isnan(value) ? "-" : significant(value, 3);
-  return human_duration(value);
+// A cell for programs: the shortest text that reads back to the same double, empty for a number
+// the run did not produce (a CSV reader's missing value).
+std::string csv_cell(double value) {
+  return std::isnan(value) ? std::string{} : report::format_number(value);
 }
 
 // The table's cells, the header first.
@@ -533,7 +523,7 @@ std::string render_csv(const SweepParam& param, std::span<const SweepMetric> met
   text += "\n";
   for (const auto& row : rows) {
     text += row.value;
-    for (const double number : row.metrics) text += "," + report::format_number(number);
+    for (const double number : row.metrics) text += "," + csv_cell(number);
     text += "\n";
   }
   return text;
@@ -577,8 +567,13 @@ std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& s
                                                             std::span<const SweepMetric> metrics,
                                                             std::size_t jobs) {
   const auto base = config::load(scenario_path);
-  if (!base) return std::unexpected(describe(base.error()));
+  if (!base) return std::unexpected(config::describe(base.error()));
   if (auto problem = first_metric_problem(*base, metrics)) return std::unexpected(*problem);
+  // The path's mistakes (a missing key, a list on the way) are the same at every point: reported
+  // once, with no point to blame.
+  if (const auto path = config::check_override_path(scenario_path, param.path); !path) {
+    return std::unexpected(config::describe(path.error()));
+  }
 
   const auto count = param.values.size();
   const auto graphs = for_each_point<graph::Graph>(

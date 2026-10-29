@@ -205,6 +205,14 @@ constexpr std::array<AdvancedNumber, 4> advanced_numbers{{
 // whole number: no "3.0", no "1e3"). `queue_limit` is a double in the model, as the queueing
 // formulas take it, but a waiting room holds whole requests.
 constexpr std::string_view advanced_integer_keys = "concurrency queue_limit";
+// The other keys read as whole numbers (read_positive_int, parse_whole<int>, parse_count), by
+// where they sit: at the top level, on a node, and in a client's `keys:` block. Together with
+// advanced_integer_keys they decide counts_whole_things; a new integer key belongs in one of them.
+constexpr std::string_view top_level_integer_keys = "version seed";
+constexpr std::string_view node_integer_keys =
+    "replicas vnodes burst shards pool partitions workers nodes replication write_quorum "
+    "read_quorum keys";
+constexpr std::string_view client_keys_integer_keys = "space uniform";
 
 // How a scenario writes an empty list or map, for the messages about a key left without a
 // value where an empty one is valid (`links:` -> "write [] for none").
@@ -3289,6 +3297,8 @@ std::expected<YAML::Node, ConfigError> find_override_target(const std::string& f
 }
 
 // Replaces each override's scalar in `root`, in order; the first bad path stops.
+// C++20 std::span<const T>: a non-owning view of contiguous elements, so a vector, an array or
+// `{}` of overrides is read without a copy.
 std::expected<void, ConfigError> apply_overrides(const std::string& file, YAML::Node& root,
                                                  std::span<const Override> overrides) {
   for (const auto& replacement : overrides) {
@@ -3306,20 +3316,15 @@ std::expected<void, ConfigError> apply_overrides(const std::string& file, YAML::
 namespace simsys::config {
 
 std::expected<model::Scenario, ConfigError> load(const std::string& file) {
-  // The only exception boundary: yaml-cpp reports syntax errors (LoadFile) by throwing,
-  // and so does any shape mistake the checks above do not pre-empt (subscripting a
-  // scalar, reading a missing node); we return std::expected, so callers never need a
-  // try/catch.
-  try {
-    return detail::validate(file, YAML::LoadFile(file));
-  } catch (const YAML::Exception& e) {
-    return std::unexpected(detail::error_at_mark(file, e.mark, e.msg));
-  }
+  return load(file, {});
 }
 
 std::expected<model::Scenario, ConfigError> load(const std::string& file,
                                                  std::span<const Override> overrides) {
-  // The same exception boundary as load(file), around the same two throwing calls.
+  // The only exception boundary: yaml-cpp reports syntax errors (LoadFile) by throwing,
+  // and so does any shape mistake the checks above do not pre-empt (subscripting a
+  // scalar, reading a missing node); we return std::expected, so callers never need a
+  // try/catch.
   try {
     auto root = YAML::LoadFile(file);
     if (auto applied = detail::apply_overrides(file, root, overrides); !applied) {
@@ -3329,6 +3334,32 @@ std::expected<model::Scenario, ConfigError> load(const std::string& file,
   } catch (const YAML::Exception& e) {
     return std::unexpected(detail::error_at_mark(file, e.mark, e.msg));
   }
+}
+
+std::expected<void, ConfigError> check_override_path(const std::string& file,
+                                                     std::string_view override_path) {
+  try {
+    return detail::find_override_target(file, YAML::LoadFile(file), override_path)
+        .transform([](const YAML::Node&) {});
+  } catch (const YAML::Exception& e) {
+    return std::unexpected(detail::error_at_mark(file, e.mark, e.msg));
+  }
+}
+
+bool counts_whole_things(std::string_view override_path) {
+  const auto keys = detail::path_keys(override_path);
+  const auto& key = keys.back();
+  if (keys.size() == 1) return detail::lists_word(detail::top_level_integer_keys, key);
+  if (keys.size() < 3 || keys[0] != "nodes") return false;
+  if (keys.size() == 3) return detail::lists_word(detail::node_integer_keys, key);
+  if (keys.size() != 4) return false;
+  if (keys[2] == "advanced") return detail::lists_word(detail::advanced_integer_keys, key);
+  return keys[2] == "keys" && detail::lists_word(detail::client_keys_integer_keys, key);
+}
+
+std::string describe(const ConfigError& error) {
+  if (error.line == 0) return std::format("{}: error: {}", error.file, error.message);
+  return std::format("{}:{}:{}: error: {}", error.file, error.line, error.column, error.message);
 }
 
 }  // namespace simsys::config
