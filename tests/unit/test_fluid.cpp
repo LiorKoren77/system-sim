@@ -278,13 +278,14 @@ TEST_CASE(
                     std::invalid_argument);
 }
 
-// The M/M/c/K bound (review of plan 2c Task 3's fix round, C1): a request admitted to a waiting
+// The room-drain bound (review of plan 2c Task 3's fix round, C1): a request admitted to a waiting
 // room of K units cannot wait longer than the room takes to drain, K / service_rate, so the
-// stochastic term is min(Kingman wait, K / rate). A 500 MB/s store with a 1000 MB room fed 600 MB/s
-// of 2 s objects is past saturation: Erlang C at the 0.99 clamp would say C(20, 0.99) x 2 s /
-// (20 x 0.01) = 9.48 s, but the room drains in 1000 / 500 = 2 s, and that is the wait. Its spread
-// is bounded the same way: a wait in [0, T] has a variance of at most T^2 / 4 (Popoviciu's
-// inequality), here 1 s^2, where the clamp's variance is 99.7 s^2.
+// stochastic term is min(Kingman wait, K / rate) (exact for a deterministic drain, conservative
+// for random service: M/M/c/K's mean wait is below it). A 500 MB/s store with a 1000 MB room fed
+// 600 MB/s of 2 s objects is past saturation: Erlang C at the 0.99 clamp would say C(20, 0.99) x
+// 2 s / (20 x 0.01) = 9.48 s, but the room drains in 1000 / 500 = 2 s, and that is the wait. Its
+// spread is capped at the room's scale, T^2 / 4 (our heuristic, not a theorem), here 1 s^2, where
+// the clamp's variance is 99.7 s^2: the cap is what the variance is.
 TEST_CASE("a queue's stochastic wait is bounded by the time its waiting room takes to drain",
           "[fluid]") {
   FluidQueue q{Capacity{
@@ -293,15 +294,19 @@ TEST_CASE("a queue's stochastic wait is bounded by the time its waiting room tak
   const auto s = q.advance(Rate{600}, 100ms);  // backlog 10 MB: a fluid wait of 20 ms only
   REQUIRE_THAT(simsys::queueing::mmc_wait(20, 0.99, 2.0).mean_s, WithinAbs(9.4787, 1e-4));
   REQUIRE_THAT(s.wait.mean_s, WithinRel(2.0, 1e-12));
-  REQUIRE(s.wait.variance_s2 <= 1.0);
+  REQUIRE_THAT(s.wait.variance_s2, WithinRel(1.0, 1e-12));  // T^2 / 4 at T = 2 s
   REQUIRE_THAT(s.latency.mean_s, WithinRel(4.0, 1e-12));
 }
 
-// With the default room the bound never binds at a node that counts requests: the room holds
-// 1000 requests, ten times the ~100 that Erlang C's queue holds at the 0.99 clamp (Lq =
+// With the default room the bound does not bind at a node that counts requests unless its arrivals
+// are very bursty (a variability factor above 10 for the mean, 5 for the variance cap): the room
+// holds 1000 requests, ten times the ~100 that Erlang C's queue holds at the 0.99 clamp (Lq =
 // rho^2 / (1 - rho) = 98 at one server). The web node above still waits its 99 ms there, against a
 // room that drains in 1000 / 1000/s = 1 s.
-TEST_CASE("the room bound does not bind at a request-sized node with the default room", "[fluid]") {
+TEST_CASE(
+    "the room-drain bound does not bind at a request-sized node with the default room and Poisson "
+    "arrivals",
+    "[fluid]") {
   FluidQueue q{web()};
   const auto s = q.advance(Rate{2000}, 1ms);  // backlog 1: a fluid wait of 1 ms
   REQUIRE_THAT(s.wait.mean_s, WithinRel(0.099, 1e-9));

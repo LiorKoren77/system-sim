@@ -1174,15 +1174,18 @@ class CdnBehaviour {
 //   Wq       = (c_a² + c_s²) / 2 × Erlang C(c, rho) × s_obj / (c (1 − rho))
 //                                                               M/M/c's mean wait (Erlang C)
 //                                                               scaled by Allen–Cunneen
-//   Wq      <= queue_limit / capacity                           the room bound (M/M/c/K), the
-//                                                               fluid queue's (fluid::wait)
+//   Wq      <= queue_limit / capacity                           the room-drain bound, the
+//                                                               fluid queue's (fluid::wait):
+//                                                               exact for a deterministic
+//                                                               drain, conservative otherwise
 // One size at Poisson arrivals (c_a² = 1, c_s² = 0) waits (1 + 0) / 2 = half the M/M/c wait: at
 // rho 0.9, 50 MB objects at a default store wait 0.5 × C(20, 0.9) × 2 s / (20 × 0.1) = 0.28 s,
 // where exponential transfers would wait 0.55 s and 1 MB units would say 0.5508 × 40 ms / 2 =
 // 11 ms. Small requests among large ones raise c_s² (1000 reads/s of 2 KB beside 8 writes/s of
 // 50 MB: 124), so they lengthen the large ones' wait, as they should, where a mean object alone
 // would shrink it. Past saturation the wait is the waiting room's drain time: 1000 MB at 500 MB/s,
-// 2 s, not the 9.48 s Erlang C gives at its 0.99 clamp.
+// 2 s, not the 4.74 s the engine's Erlang C term gives at its 0.99 clamp (half of plain Erlang C's
+// 9.48 s, by the Allen–Cunneen factor of deterministic transfers).
 // When a request is answered depends on its direction (MegabyteService::sojourn):
 //   a write (an op in `write_ops`, default `write`)   response = Wq + MB_o × s_MB, its LAST
 //                                                     byte: a PUT is acknowledged once stored (a

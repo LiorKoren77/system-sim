@@ -16,8 +16,8 @@
 - The CDNs and the two blob stores count megabytes (phase 2c): a 50 MB stream costs 50 units of
   1 MB, the service time is one megabyte's (10 ms at a CDN, 40 ms at a blob store, the book's
   per-MB rows), so `cdn_us` at 100GB/s has 1000 slots that each move one stream at a time
-  (`c=1000 slots (1 object each)`) and saturates at 2k streams/s. `explain` checks them in MB/s with the requests beside (the evening
-  peak, 21:00):
+  (`c=1000 slots (1 object each)`) and saturates at 2k streams/s. `explain` checks them in MB/s
+  with the requests beside (the evening peak, 21:00):
 
   ```
   cdn_us              peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)
