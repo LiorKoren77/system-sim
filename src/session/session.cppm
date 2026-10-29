@@ -2,7 +2,7 @@
 // place. `simsys explain`, `estimate`, `run` and each point of `sweep` load the file into a
 // resolved graph (the loader's checks, then the graph builder's), and `run` and `sweep` run it
 // into a report::Summary. Before this module the sweep had its own copy of the CLI's loading and
-// running (comprehensive 2c review, I-4); now both call the functions below, so a point of a sweep
+// running; now both call the functions below, so a point of a sweep
 // is exactly a `simsys run` of the scenario with one value replaced.
 //
 // Models: nothing from the book; this is plumbing between the layers.

@@ -55,30 +55,30 @@ inline constexpr LatencyNumbers latency_numbers{
     .third_party_api = 100_ms,  // spec §6: external APIs, with variability 2.0
 };
 
-// The capacity unit of a byte-sized node (is_byte_sized below), plan 2c refinement 2: one
-// megabyte, decimal like every size in the project, so 500 MB/s is 500 units/s and a 50 MB
-// stream costs 50 units (byte_cost). Chosen because the book's latency table prices transfers
-// per MB ("read 1 MB sequentially from the network": 10 ms), which makes one unit's service
-// time a row of that table: a byte-sized node's service time is the time of ONE megabyte, and
-// Little's law gives its concurrency as for any node, c = units/s × s (a 100 GB/s CDN at 10 ms
-// per MB: 100k/s × 10 ms = 1000 megabyte slots). The size is each op's own, resolved by the
-// graph (graph::Graph::request_bytes), never an assumed object.
+// The capacity unit of a byte-sized node (is_byte_sized below), spec §19 entry 2: one megabyte,
+// decimal like every size in the project, so 500 MB/s is 500 units/s and a 50 MB stream costs 50
+// units (byte_cost). Chosen because the book's latency table prices transfers per MB ("read 1 MB
+// sequentially from the network": 10 ms), which makes one unit's service time a row of that table:
+// a byte-sized node's service time is the time of ONE megabyte, and Little's law gives its
+// concurrency as for any node, c = units/s × s (a 100 GB/s CDN at 10 ms per MB: 100k/s × 10 ms =
+// 1000 megabyte slots). The size is each op's own, resolved by the graph
+// (graph::Graph::request_bytes), never an assumed object.
 inline constexpr double byte_unit = 1e6;
 
 // Capacity units one request of `size` bytes uses at a byte-sized node: its megabytes, a 50 MB
 // stream 50, a 2 KB read 0.002. Unlike a SQL write's 5 units (sql_write_cost), which are capacity
-// only, these are also time: the request holds one megabyte slot for its whole transfer, size ×
-// the time of one MB, so the queue waits for whole objects, and a write is answered at its last
-// byte, a read at its first megabyte (behaviours::MegabyteService; review of plan 2c Task 3).
+// only, these are also time: the request holds one megabyte slot for its whole transfer, size × the
+// time of one MB, so the queue waits for whole objects, and a write is answered at its last byte, a
+// read at its first megabyte (behaviours::MegabyteService).
 [[nodiscard]] constexpr double byte_cost(Bytes size) {
   return size.count / byte_unit;
 }
 
-// Models: a network link with a bandwidth (spec §3.4: it "caps bytes/s and queues the excess like
-// a node"; plan 2c refinement 3), the cross-datacenter pipe of ch. 14's YouTube (40 Gbit/s
-// between the CDN and the transcoded storage) or any hop whose bytes are the constraint. The link
-// becomes a PIPE: one queue in megabytes (byte_unit), as a byte-sized node is, but a single
-// server, because a link sends one byte stream at a time:
+// Models: a network link with a bandwidth (spec §3.4: it "caps bytes/s and queues the excess like a
+// node"; spec §19 entry 3), the cross-datacenter pipe of ch. 14's YouTube (40 Gbit/s between the
+// CDN and the transcoded storage) or any hop whose bytes are the constraint. The link becomes a
+// PIPE: one queue in megabytes (byte_unit), as a byte-sized node is, but a single server, because a
+// link sends one byte stream at a time:
 //   service_rate    = bandwidth / 1 MB       MB/s: 1 Gbit/s = 125e6 B/s = 125 MB/s
 //   service_time_s  = 1 MB / bandwidth       the serialisation time of one megabyte: 8 ms at
 //                                            1 Gbit/s, 0.2 ms at 40 Gbit/s
@@ -107,8 +107,8 @@ inline constexpr double byte_unit = 1e6;
                          .service_variability = 0.0};
 }
 
-// How long a message queue keeps a message its consumer groups have not read (plan 2c refinement
-// 4) when the scenario states no `retention`: 7 days. The book gives no figure (ch. 1 and the
+// How long a message queue keeps a message its consumer groups have not read (spec §19 entry 4)
+// when the scenario states no `retention`: 7 days. The book gives no figure (ch. 1 and the
 // later designs draw a queue, never its retention); this is an industry default, Kafka's
 // `log.retention.hours = 168`. It sets each consumer group's waiting room, retention × the pool's
 // capacity (graph::Graph::build): 7 days are 604,800 s, so a pool of 1.2k jobs/s may fall
@@ -219,12 +219,12 @@ struct TypeDefaults {
 // reads" and "1k writes" per second (a write pays a disk seek and a log flush a read does not).
 inline constexpr Rate sql_write_rate{1'000};
 
-// What a write costs a SQL database, in capacity units (plan 2a refinement 4: `capacity` is a
-// rate of units, a read costs 1): the machine that does 5000 reads/s does 1000 writes/s, so one
-// write takes the capacity of 5000 / 1000 = 5 reads. Charged by op_cost to every write op
-// (model::write_ops_of) the scenario gives no `cost` for, on the primary and on each replica
-// that replays it. Ignored: a write's longer service time (a cost uses more capacity, not a
-// longer sojourn) and the gap between an append-only log write and a random update.
+// What a write costs a SQL database, in capacity units (spec §17 entry 4: `capacity` is a rate of
+// units, a read costs 1): the machine that does 5000 reads/s does 1000 writes/s, so one write takes
+// the capacity of 5000 / 1000 = 5 reads. Charged by op_cost to every write op (model::write_ops_of)
+// the scenario gives no `cost` for, on the primary and on each replica that replays it. Ignored: a
+// write's longer service time (a cost uses more capacity, not a longer sojourn) and the gap between
+// an append-only log write and a random update.
 inline constexpr double sql_write_cost =
     for_type(model::NodeType::sql_db).service_rate.per_second / sql_write_rate.per_second;
 
@@ -240,20 +240,20 @@ inline constexpr double sql_write_cost =
   return database_write ? sql_write_cost : 1.0;
 }
 
-// Capacity units one request of `op` uses at the node `spec` describes: machine_cost, times N for
-// a kv_cluster (plan 2c refinement 9; book ch. 6 "quorum consensus": the coordinator sends every
-// read and write to all N replicas of the key, so one request is N replica-requests, each one
-// unit of a replica machine's capacity; model::kv_replication applies the default N = 3). So the
-// cluster's demand, drain, drops and backlog are in replica-requests, and 30k requests/s at N = 3
-// are 90k/s against the machines' capacity. The one place the rule lives, so the engine (through
-// the behaviours) and explain's paper load price every op alike.
+// Capacity units one request of `op` uses at the node `spec` describes: machine_cost, times N for a
+// kv_cluster (spec §19 entry 9; book ch. 6 "quorum consensus": the coordinator sends every read and
+// write to all N replicas of the key, so one request is N replica-requests, each one unit of a
+// replica machine's capacity; model::kv_replication applies the default N = 3). So the cluster's
+// demand, drain, drops and backlog are in replica-requests, and 30k requests/s at N = 3 are 90k/s
+// against the machines' capacity. The one place the rule lives, so the engine (through the
+// behaviours) and explain's paper load price every op alike.
 [[nodiscard]] double op_cost(const model::NodeSpec& spec, std::string_view op) {
   const double one_machine = machine_cost(spec, op);
   if (spec.type != model::NodeType::kv_cluster) return one_machine;
   return one_machine * model::kv_replication(spec);
 }
 
-// ---- Id generators (plan 2b refinement 6; book ch. 7) ----
+// ---- Id generators (spec §18 entry 12; book ch. 7) ----
 
 // Snowflake's sequence field: 12 bits, the ids one machine may issue within one millisecond
 // (book ch. 7, "Twitter snowflake approach": "it can support a maximum of 4096 new IDs per
@@ -313,11 +313,11 @@ struct Resolved {
   Source source;
 };
 
-// A worker pool's rate (plan 2c refinement 5; spec §7: "capacity = workers / job cost"): its c
-// workers each finish one job per `cost`, so together `workers / cost` jobs a second, Little's law
-// read the other way round (c = rate × service time): youtube's 600 transcoders at 60 s a video
-// drain 600 / 60 s = 10 videos/s, news-feed's 32 fan-out workers at 5 ms 6.4k posts/s. Empty
-// for any other node, and for a pool built in code without both numbers (the type's then).
+// A worker pool's rate (spec §19 entry 5; spec §7: "capacity = workers / job cost"): its c workers
+// each finish one job per `cost`, so together `workers / cost` jobs a second, Little's law read the
+// other way round (c = rate × service time): youtube's 600 transcoders at 60 s a video drain 600 /
+// 60 s = 10 videos/s, news-feed's 32 fan-out workers at 5 ms 6.4k posts/s. Empty for any other
+// node, and for a pool built in code without both numbers (the type's then).
 [[nodiscard]] std::optional<Rate> worker_pool_rate(const model::NodeSpec& n) {
   if (n.type != model::NodeType::worker_pool || !n.workers || !n.job_cost) return std::nullopt;
   return Rate{*n.workers / seconds(*n.job_cost)};
@@ -336,26 +336,25 @@ struct Resolved {
   return {defaults_of(n).service_rate, Source::type_default};
 }
 
-// Does the node count bytes rather than requests (plan 2c refinement 2)? Exactly when its
-// capacity is a byte rate on a type that serves bytes: a stated `capacity: 100GB/s` on a CDN or
-// a blob store, or a blob store's type default, spec §6's 500 MB/s. A capacity stated in
-// requests is a request count on any type, and so is every type whose default is a request
-// rate. Such a node counts megabytes (byte_unit) and needs the size of every request it serves
-// (graph::Graph::request_bytes).
+// Does the node count bytes rather than requests (spec §19 entry 2)? Exactly when its capacity is a
+// byte rate on a type that serves bytes: a stated `capacity: 100GB/s` on a CDN or a blob store, or
+// a blob store's type default, spec §6's 500 MB/s. A capacity stated in requests is a request count
+// on any type, and so is every type whose default is a request rate. Such a node counts megabytes
+// (byte_unit) and needs the size of every request it serves (graph::Graph::request_bytes).
 [[nodiscard]] bool is_byte_sized(const model::NodeSpec& n) {
   if (n.capacity) return false;
   if (n.type == model::NodeType::blob_store) return true;
   return n.type == model::NodeType::cdn && n.byte_capacity.has_value();
 }
 
-// The squared coefficient of variation (SCV) of ONE request's service time when the scenario
-// states none: the type's (1, exponential, M/M/c's assumption; 2 for an erratic external sink),
-// except at a byte-sized node, where it is 0 (review of plan 2c Task 3's fix round, I2): a
-// transfer of a fixed number of megabytes at a fixed time per megabyte (one slot's share of the
-// node's bandwidth) takes a fixed time, size × s_MB, so the spread of service times there is the
-// size mix's alone (behaviours::MegabyteService) and a single size waits like M/D/c, half the
-// M/M/c wait with Poisson arrivals. Chosen, not from the book: a real disk and network add jitter
-// (seeks, retransmissions) that `advanced.service_variability` can put back.
+// The squared coefficient of variation (SCV) of ONE request's service time when the scenario states
+// none: the type's (1, exponential, M/M/c's assumption; 2 for an erratic external sink), except at
+// a byte-sized node, where it is 0: a transfer of a fixed number of megabytes at a fixed time per
+// megabyte (one slot's share of the node's bandwidth) takes a fixed time, size × s_MB, so the
+// spread of service times there is the size mix's alone (behaviours::MegabyteService) and a single
+// size waits like M/D/c, half the M/M/c wait with Poisson arrivals. Chosen, not from the book: a
+// real disk and network add jitter (seeks, retransmissions) that `advanced.service_variability` can
+// put back.
 [[nodiscard]] double default_service_variability(const model::NodeSpec& n) {
   if (is_byte_sized(n)) return 0.0;
   return defaults_of(n).service_variability;

@@ -10,20 +10,19 @@
 // in — and any feedback from the system (a slow site does not lower this curve; real users
 // would give up, which the model does not capture).
 //
-// Composition (spec §8, phase 2a refinement 2):
+// Composition (spec §8, spec §17 entry 2):
 //
 //     rate(t)  = level(t) x wave(t) x PRODUCT over active spikes of factor
 //     level(t) = ramp ? from + (to - from) x fraction(t)      (the ramp's own rate)
 //              : points ? interpolate(points, t)
 //              : base
 //
-// The spec writes the ramp as a multiplier ramp(t)/base of the base; base x ramp(t)/base
-// IS the ramp's rate, so the ramp is applied as the level itself. Same numbers, without
-// the division: 1e15/s over a base of 1e-300/s would overflow to infinity, and infinity
-// x a wave trough of 0 is NaN. The wave and the spikes are dimensionless multipliers
-// around 1, so they combine freely and each can be read (and printed by `simsys curve`)
-// on its own. Times are offsets from t = 0,
-// which is midnight (phase 2a refinement 1), so `peak_at: 20:00` is 20 h after start.
+// The spec writes the ramp as a multiplier ramp(t)/base of the base; base x ramp(t)/base IS the
+// ramp's rate, so the ramp is applied as the level itself. Same numbers, without the division:
+// 1e15/s over a base of 1e-300/s would overflow to infinity, and infinity x a wave trough of 0 is
+// NaN. The wave and the spikes are dimensionless multipliers around 1, so they combine freely and
+// each can be read (and printed by `simsys curve`) on its own. Times are offsets from t = 0, which
+// is midnight (spec §17 entry 1), so `peak_at: 20:00` is 20 h after start.
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation). CLAUDE.md §3: this interface imports simsys.core, so no <chrono> in the

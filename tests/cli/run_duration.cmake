@@ -6,7 +6,7 @@
 #   warmup - a duration not longer than the warmup is refused (exit 1): nothing would be observed;
 #   over   - a duration whose observed part (duration - warmup) is shorter than an SLO's `over` is
 #            refused (exit 1) with the loader's message: the window would never complete, and the
-#            report would name a 1 h window of a 30-minute run (review of plan 2c Task 19).
+#            report would name a 1 h window of a 30-minute run.
 cmake_minimum_required(VERSION 3.28)
 
 # Runs `simsys run` with the extra arguments and fails the test unless it exits 1 and its stderr

@@ -147,13 +147,12 @@ inline constexpr auto step_mode_table = std::to_array<core::EnumName<StepMode>>(
   return core::parse_in(step_mode_table, name);
 }
 
-// How a load balancer spreads requests over the replicas behind it (System Design
-// Interview ch. 1 "Load balancer"; ch. 5 for the hash ring). In the fluid model the
-// policy decides how the DOWNSTREAM node's replicas queue (plan 2a refinement 5, see
-// graph::Graph::mark_balanced_targets): round_robin keeps them independent queues,
-// least_connections pools them into one, consistent_hash loads the hottest one more than
-// the average, weighted splits by the links' `weight` (as every policy does across
-// several outgoing links).
+// How a load balancer spreads requests over the replicas behind it (System Design Interview ch. 1
+// "Load balancer"; ch. 5 for the hash ring). In the fluid model the policy decides how the
+// DOWNSTREAM node's replicas queue (spec §17 entry 5, see graph::Graph::mark_balanced_targets):
+// round_robin keeps them independent queues, least_connections pools them into one, consistent_hash
+// loads the hottest one more than the average, weighted splits by the links' `weight` (as every
+// policy does across several outgoing links).
 enum class LbPolicy { round_robin, least_connections, weighted, consistent_hash };
 
 // Pattern: Table-driven method — the policy names, read by the loader (`policy:`) and
@@ -172,10 +171,10 @@ inline constexpr auto lb_policy_table = std::to_array<core::EnumName<LbPolicy>>(
   return core::parse_in(lb_policy_table, name);
 }
 
-// How a rate limiter decides which requests to turn away (System Design Interview ch. 4
-// "Design a rate limiter", the five algorithms of its "Algorithms for rate limiting"
-// section). In the fluid model (plan 2a refinement 6, see behaviours::RateLimiterBehaviour)
-// each keeps the state ch. 4 describes, stepped every dt:
+// How a rate limiter decides which requests to turn away (System Design Interview ch. 4 "Design a
+// rate limiter", the five algorithms of its "Algorithms for rate limiting" section). In the fluid
+// model (spec §17 entry 6, see behaviours::RateLimiterBehaviour) each keeps the state ch. 4
+// describes, stepped every dt:
 //   token_bucket     -> a bucket of `burst` tokens refilled at `limit`;
 //   leaky_bucket     -> a FIFO bucket of room `burst` leaking one request every 1/limit:
 //                       excess requests wait, a full bucket refuses;
@@ -221,11 +220,10 @@ inline constexpr auto limiter_algorithm_table = std::to_array<core::EnumName<Lim
 }
 
 // How an id generator issues unique ids (System Design Interview ch. 7 "Design a unique ID
-// generator in distributed systems"): three of the designs the chapter compares. The model has
-// no behaviour of its own for any of them (plan 2b refinement 6): Graph::build turns the
-// algorithm into the capacity and service time of an ordinary service (defaults::
-// for_id_algorithm), so each design differs only in how many ids per second one replica can
-// issue and how long one takes:
+// generator in distributed systems"): three of the designs the chapter compares. The model has no
+// behaviour of its own for any of them (spec §18 entry 12): Graph::build turns the algorithm into
+// the capacity and service time of an ordinary service (defaults:: for_id_algorithm), so each
+// design differs only in how many ids per second one replica can issue and how long one takes:
 //   snowflake      -> Twitter's 64-bit layout: timestamp | datacenter | machine | 12 sequence
 //                     bits. A machine issues at most 2^12 = 4096 ids per millisecond, with no
 //                     coordination, so replicas add capacity.
@@ -283,14 +281,14 @@ inline constexpr auto kv_mode_table = std::to_array<core::EnumName<KvMode>>({
   return core::parse_in(kv_mode_table, name);
 }
 
-// How a cache and the store behind it share reads and writes (System Design Interview
-// ch. 1 "Cache", and the caches of ch. 8 url shortener, ch. 11 news feed, ch. 12 chat, ch. 13
-// autocomplete, ch. 14 YouTube). Names: ch. 1 draws one pattern, the application reading the
-// cache and fetching a miss from the database itself, and calls it a "read-through cache";
-// the industry's name for that pattern is cache-aside, and that is ours. Our `read_through`
-// is the cache-driven fetch (the cache itself loads a miss), and the write strategies are
-// general caching practice; the book names none of them. In the fluid model (plan 2a
-// refinement 7, see behaviours::CacheBehaviour), with a fixed hit ratio h:
+// How a cache and the store behind it share reads and writes (System Design Interview ch. 1
+// "Cache", and the caches of ch. 8 url shortener, ch. 11 news feed, ch. 12 chat, ch. 13
+// autocomplete, ch. 14 YouTube). Names: ch. 1 draws one pattern, the application reading the cache
+// and fetching a miss from the database itself, and calls it a "read-through cache"; the industry's
+// name for that pattern is cache-aside, and that is ours. Our `read_through` is the cache-driven
+// fetch (the cache itself loads a miss), and the write strategies are general caching practice; the
+// book names none of them. In the fluid model (spec §17 entry 7, see behaviours::CacheBehaviour),
+// with a fixed hit ratio h:
 //   cache_aside   -> "lazy loading": the APPLICATION asks the cache, and on a miss reads the
 //                    store itself (a service step `{to: db, on: miss}`, which carries the miss
 //                    fraction 1 - h); the cache only answers. Writes go to the store through
@@ -304,7 +302,7 @@ inline constexpr auto kv_mode_table = std::to_array<core::EnumName<KvMode>>({
 //   write_back    -> writes are acknowledged by the cache and flushed to the backend later
 //                    (a queue of dirty entries): every write still reaches the backend, at
 //                    the same rate (an upper bound: no coalescing), but over an asynchronous
-//                    hop, so the writer waits for the cache alone (plan 2b refinement 5;
+//                    hop, so the writer waits for the cache alone (spec §18 entry 5;
 //                    graph's write_back_flushes).
 enum class CacheStrategy { cache_aside, read_through, write_through, write_around, write_back };
 
@@ -346,10 +344,10 @@ struct HitRatio {
 // gives no `write_ops`: one op called `write`. Every other op is a read. Applied by write_ops_of.
 inline constexpr std::string_view default_write_op = "write";
 
-// The ops a SQL database sends to its primary when the scenario gives no `write_ops` (plan 2b
-// refinement 3): the three SQL statements that change rows, plus the generic `write` the other
-// node types use. Every other op (select, read, get, ...) is a read a replica may answer.
-// Sorted. Applied by write_ops_of.
+// The ops a SQL database sends to its primary when the scenario gives no `write_ops` (spec §18
+// entry 6): the three SQL statements that change rows, plus the generic `write` the other node
+// types use. Every other op (select, read, get, ...) is a read a replica may answer. Sorted.
+// Applied by write_ops_of.
 inline constexpr std::array<std::string_view, 4> default_sql_write_ops{"delete", "insert", "update",
                                                                        "write"};
 
@@ -384,11 +382,11 @@ struct Step {
   StepCondition on{StepCondition::always};  // `miss`: only cache misses go on (ch. 1 cache)
   StepMode mode{StepMode::sequential};
   double factor{1.0};  // fan-out: one post -> 100 feed writes (ch. 11 news feed)
-  // The payload this step's request carries (plan 2c refinement 1), when the step states one:
-  // a worker or service that sends bytes of its own, such as the youtube scenario's transcoders
-  // writing a 50 MB rendition (its choice; ch. 14 sizes no rendition) to the blob store. Positive
-  // (the loader refuses 0B: a request of no bytes costs a byte-sized node nothing). Absent: the
-  // request keeps its incoming size while it keeps its op name, and a renamed op is unsized
+  // The payload this step's request carries (spec §19 entry 1), when the step states one: a worker
+  // or service that sends bytes of its own, such as the youtube scenario's transcoders writing a 50
+  // MB rendition (its choice; ch. 14 sizes no rendition) to the blob store. Positive (the loader
+  // refuses 0B: a request of no bytes costs a byte-sized node nothing). Absent: the request keeps
+  // its incoming size while it keeps its op name, and a renamed op is unsized
   // (graph::Graph::request_bytes resolves which size each (node, op) carries).
   std::optional<Bytes> size{};
 };
@@ -403,14 +401,14 @@ struct Advanced {
   std::optional<double> red{};
 };
 
-// What a client offers: a rate that varies over time, split into ops by fixed shares.
-// Phase 2a: the phase-1 `Rate base` member became `curve.base`. The whole `rate:` block is
-// now typed (spec §8): the deterministic curve (base or points, times wave, ramp and
-// spikes) in `curve`, and the seeded random multiplier in `noise`, kept apart because the
-// curve is a pure function of time while noise is a process with state the engine steps.
-// A client's request key distribution (plan 2b refinement 1, `keys:` on a client): how
-// popular each of the `space` keys it asks for is, under the independent reference model of
-// simsys.caching (every request picks a key independently, with a fixed probability).
+// What a client offers: a rate that varies over time, split into ops by fixed shares. Phase 2a: the
+// phase-1 `Rate base` member became `curve.base`. The whole `rate:` block is now typed (spec §8):
+// the deterministic curve (base or points, times wave, ramp and spikes) in `curve`, and the seeded
+// random multiplier in `noise`, kept apart because the curve is a pure function of time while noise
+// is a process with state the engine steps. A client's request key distribution (spec §18 entry 1,
+// `keys:` on a client): how popular each of the `space` keys it asks for is, under the independent
+// reference model of simsys.caching (every request picks a key independently, with a fixed
+// probability).
 //  - `{zipf: s, space: N}`: Zipf over N keys with exponent s, `zipf` set — the key of rank i
 //    is asked with probability ∝ i^-s (as in book ch. 8's URL shortener, where a few short
 //    links get most of the clicks: our paraphrase; s ≈ 1 is the classic web skew);
@@ -445,13 +443,13 @@ struct Workload {
   // which keys it asks for (fine unless a `che` cache downstream needs to know).
   std::optional<KeySpec> keys{};
   std::optional<SimTime> timeout{};
-  // The size of one request of each op the client sends, for the ops that carry bytes (plan
-  // 2c refinement 1, `sizes:` on a client): ch. 14 YouTube's 300 MB average upload, ch. 15
-  // Google Drive's 500 KB average file (the youtube scenario's 50 MB stream is its own choice:
-  // the book sizes no stream). Each is positive (the loader refuses 0B). An op not listed is
-  // unsized, which only a byte-sized node or a bandwidth link minds; a request-counting node
-  // never needs a size. Each size is the op's mean: the model ignores a size distribution,
-  // headers and protocol overhead, and compression. Sorted by op, like op_shares.
+  // The size of one request of each op the client sends, for the ops that carry bytes (spec §19
+  // entry 1, `sizes:` on a client): ch. 14 YouTube's 300 MB average upload, ch. 15 Google Drive's
+  // 500 KB average file (the youtube scenario's 50 MB stream is its own choice: the book sizes no
+  // stream). Each is positive (the loader refuses 0B). An op not listed is unsized, which only a
+  // byte-sized node or a bandwidth link minds; a request-counting node never needs a size. Each
+  // size is the op's mean: the model ignores a size distribution, headers and protocol overhead,
+  // and compression. Sorted by op, like op_shares.
   std::map<std::string, Bytes> sizes{};
 };
 
@@ -471,137 +469,131 @@ struct NodeSpec {
   Advanced advanced{};
   std::map<std::string, std::vector<Step>> ops{};  // incoming op -> steps (service, ws_gateway)
   std::vector<Step> then{};                        // steps after processing (workers, caches...)
-  // Capacity units one request of an op consumes (plan 2a refinement 4; service, cache):
-  // `capacity` is then a rate of units, and a `write` of cost 3 uses three times the
-  // capacity of a `read` of cost 1. An op not listed costs 1, so an empty map is the
-  // phase-1 node where every request costs the same. Declared after ops/then so that
-  // designated initializers, which must follow declaration order, can write
-  // `{..., .ops = ..., .cost = ...}`.
+  // Capacity units one request of an op consumes (spec §17 entry 4; service, cache): `capacity` is
+  // then a rate of units, and a `write` of cost 3 uses three times the capacity of a `read` of cost
+  // 1. An op not listed costs 1, so an empty map is the phase-1 node where every request costs the
+  // same. Declared after ops/then so that designated initializers, which must follow declaration
+  // order, can write `{..., .ops = ..., .cost = ...}`.
   std::map<std::string, double> cost{};
-  // Load balancers only (declared after `cost`, for designated initializers): the policy
-  // (absent: round_robin) and, for consistent_hash, the virtual nodes per server (absent:
-  // default_vnodes). The loader leaves an absent key absent, so explain can tell a stated
-  // number from a default; every reader applies the default. A kv_cluster's ring reads `vnodes`
-  // too (plan 2c refinement 9: its machines sit on a ring of their own, see kv_nodes below).
+  // Load balancers only (declared after `cost`, for designated initializers): the policy (absent:
+  // round_robin) and, for consistent_hash, the virtual nodes per server (absent: default_vnodes).
+  // The loader leaves an absent key absent, so explain can tell a stated number from a default;
+  // every reader applies the default. A kv_cluster's ring reads `vnodes` too (spec §19 entry 9: its
+  // machines sit on a ring of their own, see kv_nodes below).
   std::optional<LbPolicy> policy{};
   std::optional<int> vnodes{};
-  // Rate limiters only (plan 2a refinement 6; declared after the LB keys, for designated
-  // initializers): the algorithm (the loader fills in token_bucket when absent), the limit
-  // (required: a limiter without one limits nothing), the burst of the two buckets (requests
-  // a token bucket lets through above the limit at once, the room of a leaky bucket;
-  // absent: limit x window, see limiter_burst; the windowed algorithms reject one), the
-  // window of the windowed algorithms (absent: default_limiter_window, see limiter_window)
-  // and the node holding the counters (`backend`, a cache), which the limiter consults once
-  // for every request it checks. The loader leaves an absent burst or window absent, so
-  // explain can say "(default)"; the behaviour, the graph and the report apply the defaults
-  // through limiter_burst and limiter_window. A scenario built in code may leave the
-  // algorithm empty too.
+  // Rate limiters only (spec §17 entry 6; declared after the LB keys, for designated initializers):
+  // the algorithm (the loader fills in token_bucket when absent), the limit (required: a limiter
+  // without one limits nothing), the burst of the two buckets (requests a token bucket lets through
+  // above the limit at once, the room of a leaky bucket; absent: limit x window, see limiter_burst;
+  // the windowed algorithms reject one), the window of the windowed algorithms (absent:
+  // default_limiter_window, see limiter_window) and the node holding the counters (`backend`, a
+  // cache), which the limiter consults once for every request it checks. The loader leaves an
+  // absent burst or window absent, so explain can say "(default)"; the behaviour, the graph and the
+  // report apply the defaults through limiter_burst and limiter_window. A scenario built in code
+  // may leave the algorithm empty too.
   std::optional<LimiterAlgorithm> algorithm{};
   std::optional<Rate> limit{};
   std::optional<int> burst{};
   std::optional<SimTime> window{};
   std::optional<std::string> backend{};
-  // Caches only (plan 2a refinement 7; declared after `backend`, for designated
-  // initializers): the hit ratio (required by the loader; a scenario built in code may
-  // leave it empty, which the engine refuses), the strategy (default cache_aside, the
-  // pattern ch. 1 draws and calls read-through), the ops that are writes (every other op is a
-  // read), and the sizing keys the Che approximation reads: `keys` (how many entries
-  // fit), `eviction` (lru, lfu, fifo or ttl) and `ttl`. A `backend` on a cache names the store the
-  // cache itself calls (read_through, write_through, write_around, write_back); a CDN reads
-  // `hit_ratio`, `keys`, `ttl` and `write_ops` too (see `origin` below).
-  // `write_ops` (caches, CDNs, SQL databases and blob stores, which answer a write at its last
-  // byte and a read at its first megabyte): absent means the TYPE's default, present means
-  // exactly the list the scenario wrote; the loader stores it as written and every reader asks
-  // write_ops_of. An optional rather than a vector pre-filled with a default, because the two
-  // types' defaults differ and a pre-filled `[write]` could not be told from a database's
-  // explicit `write_ops: [write]`.
+  // Caches only (spec §17 entry 7; declared after `backend`, for designated initializers): the hit
+  // ratio (required by the loader; a scenario built in code may leave it empty, which the engine
+  // refuses), the strategy (default cache_aside, the pattern ch. 1 draws and calls read-through),
+  // the ops that are writes (every other op is a read), and the sizing keys the Che approximation
+  // reads: `keys` (how many entries fit), `eviction` (lru, lfu, fifo or ttl) and `ttl`. A `backend`
+  // on a cache names the store the cache itself calls (read_through, write_through, write_around,
+  // write_back); a CDN reads `hit_ratio`, `keys`, `ttl` and `write_ops` too (see `origin` below).
+  // `write_ops` (caches, CDNs, SQL databases and blob stores, which answer a write at its last byte
+  // and a read at its first megabyte): absent means the TYPE's default, present means exactly the
+  // list the scenario wrote; the loader stores it as written and every reader asks write_ops_of. An
+  // optional rather than a vector pre-filled with a default, because the two types' defaults differ
+  // and a pre-filled `[write]` could not be told from a database's explicit `write_ops: [write]`.
   std::optional<HitRatio> hit_ratio{};
   CacheStrategy strategy{CacheStrategy::cache_aside};
   std::optional<std::vector<std::string>> write_ops{};
   std::optional<std::int64_t> keys{};
   std::optional<std::string> eviction{};
   std::optional<SimTime> ttl{};
-  // CDNs only (plan 2b refinement 4; declared after the cache keys, for designated
-  // initializers): the node a CDN fetches its misses from, as the same op (book ch. 1: an edge
-  // that does not have a file asks the origin server for it). Required: the loader and
-  // graph::Graph::build refuse a CDN without one, and one that names a client.
+  // CDNs only (spec §18 entry 10; declared after the cache keys, for designated initializers): the
+  // node a CDN fetches its misses from, as the same op (book ch. 1: an edge that does not have a
+  // file asks the origin server for it). Required: the loader and graph::Graph::build refuse a CDN
+  // without one, and one that names a client.
   std::optional<std::string> origin{};
-  // SQL databases only (plan 2b refinement 3; declared after the cache keys, for designated
+  // SQL databases only (spec §18 entry 6; declared after the cache keys, for designated
   // initializers). `replicas` is the primary plus `replicas - 1` read replicas (book ch. 1,
-  // "database replication"); `shards` splits the data over that many such sets (ch. 1,
-  // "sharding"; absent: one); `pool` is the connection pool, the requests each copy serves at
-  // once: it sets the copy's c and caps its rate at pool / service time by Little's law
-  // (graph::apply_database_keys), so it is not advanced.concurrency renamed, and the loader
-  // refuses both together (absent: the implied concurrency, no cap); `replication_lag` how far
-  // behind the primary a replica applies a write (absent: 0, shipping takes no time). The loader
-  // leaves an absent one absent, so explain can tell stated from default. `write_ops` (above)
-  // says which ops go to the primary; a database's default is default_sql_write_ops
-  // (write_ops_of).
+  // "database replication"); `shards` splits the data over that many such sets (ch. 1, "sharding";
+  // absent: one); `pool` is the connection pool, the requests each copy serves at once: it sets the
+  // copy's c and caps its rate at pool / service time by Little's law (graph::apply_database_keys),
+  // so it is not advanced.concurrency renamed, and the loader refuses both together (absent: the
+  // implied concurrency, no cap); `replication_lag` how far behind the primary a replica applies a
+  // write (absent: 0, shipping takes no time). The loader leaves an absent one absent, so explain
+  // can tell stated from default. `write_ops` (above) says which ops go to the primary; a
+  // database's default is default_sql_write_ops (write_ops_of).
   std::optional<int> shards{};
   std::optional<int> pool{};
   std::optional<SimTime> replication_lag{};
-  // Id generators only (plan 2b refinement 6; declared after the database keys, for designated
+  // Id generators only (spec §18 entry 12; declared after the database keys, for designated
   // initializers): which of ch. 7's designs the node is, and so its default capacity and service
-  // time (defaults::for_id_algorithm). Required: the loader and Graph::build refuse an
-  // id_generator without one. A separate member from the rate limiter's `algorithm`, although
-  // both are spelled `algorithm:` in a scenario: the two name different things.
+  // time (defaults::for_id_algorithm). Required: the loader and Graph::build refuse an id_generator
+  // without one. A separate member from the rate limiter's `algorithm`, although both are spelled
+  // `algorithm:` in a scenario: the two name different things.
   std::optional<IdAlgorithm> id_algorithm{};
-  // Worker pools only (plan 2c refinement 5; declared after the id generator's key, for designated
+  // Worker pools only (spec §19 entry 5; declared after the id generator's key, for designated
   // initializers): the pool is M/M/c over consumption (spec §7: "capacity = workers / job cost"),
   // so `workers` is its c and `job_cost` the time ONE worker spends on ONE job, the scenario's
   // `cost:` key, a duration here (`cost: 60s`), while a service's `cost:` is the per-op map of
-  // capacity units above (`cost`): one spelling, two meanings, read by type (config's read_cost
-  // and read_worker_pool_keys). Both are required by the loader; a pool built in code without
-  // them falls back to the type's numbers. `consumes` names the message queue (or URL frontier)
-  // whose messages the pool drains; Graph::build checks that the queue links to it.
+  // capacity units above (`cost`): one spelling, two meanings, read by type (config's read_cost and
+  // read_worker_pool_keys). Both are required by the loader; a pool built in code without them
+  // falls back to the type's numbers. `consumes` names the message queue (or URL frontier) whose
+  // messages the pool drains; Graph::build checks that the queue links to it.
   std::optional<int> workers{};
   std::optional<SimTime> job_cost{};
   std::optional<std::string> consumes{};
-  // Message queues only (plan 2c refinement 4): how long a message stays in the log before it is
+  // Message queues only (spec §19 entry 4): how long a message stays in the log before it is
   // deleted unconsumed (absent: defaults::default_retention, Kafka's 7 days), which sets each
   // consumer group's waiting room (Graph::build: retention x the pool's capacity), and
-  // `partitions`, accepted and printed, not modelled (phase 3: a partition is read by one worker
-  // of a group at a time). The loader leaves an absent one absent, so explain can say "(default)".
+  // `partitions`, accepted and printed, not modelled (phase 3: a partition is read by one worker of
+  // a group at a time). The loader leaves an absent one absent, so explain can say "(default)".
   std::optional<SimTime> retention{};
   std::optional<int> partitions{};
-  // External sinks only (plan 2c refinement 8; declared after the message queue's keys, for
-  // designated initializers): a third party's API, spec section 6's `third_party_api`, the
-  // providers of book ch. 10's notification system (APNs, FCM, an SMS gateway, an e-mail service)
-  // that our workers call and do not run. `failure_rate` is the share, in [0, 1], of the requests
-  // the sink SERVES that fail (a 5xx from the provider), which the engine moves from the node's
-  // drain to its drops (engine.cppm's fail_share). A plain double, not an optional: "fails
-  // nothing" is the real value 0, and a sink that states none is the plain queue it was before.
-  // `politeness` is how often one host may be called (the crawler's "1/s per host"), stored and
-  // printed, not modelled (phase 3: it needs per-host state); absent when not stated.
-  // Ignored: retries (an `on: failure` step never fires before phase 3), a provider's latency
-  // rising with OUR load (its queue is the type's 1k/s quota, not the provider's real fleet),
-  // and per-host politeness.
+  // External sinks only (spec §19 entry 8; declared after the message queue's keys, for designated
+  // initializers): a third party's API, spec section 6's `third_party_api`, the providers of book
+  // ch. 10's notification system (APNs, FCM, an SMS gateway, an e-mail service) that our workers
+  // call and do not run. `failure_rate` is the share, in [0, 1], of the requests the sink SERVES
+  // that fail (a 5xx from the provider), which the engine moves from the node's drain to its drops
+  // (engine.cppm's fail_share). A plain double, not an optional: "fails nothing" is the real value
+  // 0, and a sink that states none is the plain queue it was before. `politeness` is how often one
+  // host may be called (the crawler's "1/s per host"), stored and printed, not modelled (phase 3:
+  // it needs per-host state); absent when not stated. Ignored: retries (an `on: failure` step never
+  // fires before phase 3), a provider's latency rising with OUR load (its queue is the type's 1k/s
+  // quota, not the provider's real fleet), and per-host politeness.
   double failure_rate{0.0};
   std::optional<Rate> politeness{};
-  // Key-value clusters only (plan 2c refinement 9; declared after the external sink's keys, for
-  // designated initializers): book ch. 6's Dynamo-style store. `kv_nodes` (the scenario's
-  // `nodes:`) is how many machines sit on its consistent-hash ring, each of `capacity`, with
-  // `vnodes` virtual nodes each (the balancer's member above, shared: the same ring); every key
-  // lives on `replication` N of them, a write is acknowledged after `write_quorum` W replicas and
-  // a read answered after `read_quorum` R. `kv_nodes` is required (the loader and Graph::build
-  // refuse a cluster without one); the others default (default_replication, default_quorum: the
-  // book's N = 3, W = R = 2) through kv_replication, kv_write_quorum and kv_read_quorum. The
-  // loader leaves an absent one absent. `kv_mode` is ap or cp, what a partition would cost
-  // (KvMode): read and printed, not modelled before faults (phase 3); absent means ap (kv_mode_of),
-  // kept absent so explain can mark it "(default)" as it marks N, W and R.
+  // Key-value clusters only (spec §19 entry 9; declared after the external sink's keys, for
+  // designated initializers): book ch. 6's Dynamo-style store. `kv_nodes` (the scenario's `nodes:`)
+  // is how many machines sit on its consistent-hash ring, each of `capacity`, with `vnodes` virtual
+  // nodes each (the balancer's member above, shared: the same ring); every key lives on
+  // `replication` N of them, a write is acknowledged after `write_quorum` W replicas and a read
+  // answered after `read_quorum` R. `kv_nodes` is required (the loader and Graph::build refuse a
+  // cluster without one); the others default (default_replication, default_quorum: the book's N =
+  // 3, W = R = 2) through kv_replication, kv_write_quorum and kv_read_quorum. The loader leaves an
+  // absent one absent. `kv_mode` is ap or cp, what a partition would cost (KvMode): read and
+  // printed, not modelled before faults (phase 3); absent means ap (kv_mode_of), kept absent so
+  // explain can mark it "(default)" as it marks N, W and R.
   std::optional<int> kv_nodes{};
   std::optional<int> replication{};
   std::optional<int> write_quorum{};
   std::optional<int> read_quorum{};
   std::optional<KvMode> kv_mode{};
-  // Search indexes only (plan 2c refinement 10; declared after the kv keys, for designated
+  // Search indexes only (spec §19 entry 10; declared after the kv keys, for designated
   // initializers): book ch. 13 ("Design a search autocomplete system") keeps its trie database
   // fresh by rebuilding it periodically from the aggregated query logs, and `build_interval` says
-  // how often (search-autocomplete: 24h). Serving is read-mostly, so a search index runs as
-  // a service (engine::Simulation::make_node); the interval is stored and printed by explain, and
-  // absent means "not stated", never zero (the loader refuses a zero). Ignored: the rebuild's
-  // own load on the index and on the aggregators, and the freshness of the answers (a query
-  // typed after the last rebuild still finds the old trie).
+  // how often (search-autocomplete: 24h). Serving is read-mostly, so a search index runs as a
+  // service (engine::Simulation::make_node); the interval is stored and printed by explain, and
+  // absent means "not stated", never zero (the loader refuses a zero). Ignored: the rebuild's own
+  // load on the index and on the aggregators, and the freshness of the answers (a query typed after
+  // the last rebuild still finds the old trie).
   std::optional<SimTime> build_interval{};
   std::optional<Workload> workload{};  // clients only
 };
@@ -724,10 +716,10 @@ struct SloSpec {
   // SLOs carry a duration, ratio SLOs a plain number; the variant keeps "0.01" from being
   // read as 0.01 seconds, which a single double field could not prevent.
   std::variant<SimTime, double> max{};
-  // `over: 1h` (plan 2c Task 14; book ch. 3: a non-functional requirement holds at every hour
-  // of the day, not on the day's average): check the SLO on every window of this length,
-  // aligned from the end of warmup, and let the worst window decide. Absent: the whole run
-  // after warmup, as before. The loader keeps it between one step and duration − warmup.
+  // `over: 1h` (book ch. 3: a non-functional requirement holds at every hour of the day, not on the
+  // day's average): check the SLO on every window of this length, aligned from the end of warmup,
+  // and let the worst window decide. Absent: the whole run after warmup, as before. The loader
+  // keeps it between one step and duration − warmup.
   std::optional<SimTime> over{};
 };
 

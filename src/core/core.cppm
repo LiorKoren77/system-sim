@@ -383,14 +383,13 @@ export namespace simsys {
   return detail::to_sim_time(value * *scale, text);
 }
 
-// "20:00" -> 20h. Exactly HH:MM, two digits each side of a colon. Simulated time starts at
-// midnight (phase 2a refinement 1: t = 0 is 00:00), so a wall-clock time is simply an
-// offset from the start of the run; scenario keys such as `at:` and `peak_at:` use it.
-// std::chrono::hh_mm_ss exists for the opposite direction (splitting a duration into
-// hours, minutes and seconds for display). std::chrono::parse("%H:%M") does exist in
-// GCC 14's libstdc++ (verified with g++-14 -std=c++23), but it reads from a std::istream,
-// which pulls in <sstream> and locale machinery, and its failure is a bare stream state
-// bit, whereas the scenario author needs the exact messages below.
+// "20:00" -> 20h. Exactly HH:MM, two digits each side of a colon. Simulated time starts at midnight
+// (spec §17 entry 1: t = 0 is 00:00), so a wall-clock time is simply an offset from the start of
+// the run; scenario keys such as `at:` and `peak_at:` use it. std::chrono::hh_mm_ss exists for the
+// opposite direction (splitting a duration into hours, minutes and seconds for display).
+// std::chrono::parse("%H:%M") does exist in GCC 14's libstdc++ (verified with g++-14 -std=c++23),
+// but it reads from a std::istream, which pulls in <sstream> and locale machinery, and its failure
+// is a bare stream state bit, whereas the scenario author needs the exact messages below.
 [[nodiscard]] std::expected<SimTime, ParseError> parse_clock_time(std::string_view text) {
   if (text.size() != 5 || text[2] != ':') return detail::fail(text, "expected HH:MM");
   const auto hours = detail::parse_two_digits(text.substr(0, 2));
@@ -465,16 +464,16 @@ export namespace simsys {
   return error.message.substr(0, error.message.size() - grammar.size());
 }
 
-// The one place a double becomes text, for every module (comprehensive 2c review: five copies of
-// this wrapper had grown). std::to_chars (C++17): locale-independent, allocation-free, and free of
-// the GCC 14.2 defect of CLAUDE.md §3, under which a std::format width or precision throws at run
-// time in every unit that imports this module. `format` and `precision` as std::to_chars takes
-// them: neither, the shortest text that reads back to the same double (0.1, 4000, 1e+20); a format
-// alone, the shortest in that notation (fixed never writes an exponent); both, rounded to
-// `precision` digits (significant ones for general, after the point for fixed). A precision without
-// a format is general. The buffer holds any finite double in fixed notation (at most 309 digits
-// before the point; 327 characters for the smallest subnormal, 5e-324 = "0.000...5") with room for
-// a precision of up to 200; a longer result falls back to the shortest text.
+// The one place a double becomes text, for every module (five copies of this wrapper had grown
+// before it). std::to_chars (C++17): locale-independent, allocation-free, and free of the GCC 14.2
+// defect of CLAUDE.md §3, under which a std::format width or precision throws at run time in every
+// unit that imports this module. `format` and `precision` as std::to_chars takes them: neither, the
+// shortest text that reads back to the same double (0.1, 4000, 1e+20); a format alone, the shortest
+// in that notation (fixed never writes an exponent); both, rounded to `precision` digits
+// (significant ones for general, after the point for fixed). A precision without a format is
+// general. The buffer holds any finite double in fixed notation (at most 309 digits before the
+// point; 327 characters for the smallest subnormal, 5e-324 = "0.000...5") with room for a precision
+// of up to 200; a longer result falls back to the shortest text.
 [[nodiscard]] inline std::string to_chars_text(double value,
                                                std::optional<std::chars_format> format = {},
                                                std::optional<int> precision = {}) {

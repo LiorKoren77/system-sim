@@ -3,7 +3,8 @@
 This note is about doubles, not about a C++20/23 feature. It is here because every
 number the simulator prints (a hit ratio, a p99, a drop rate) is the end of a chain of
 `double` arithmetic, and a few of those chains are written the way they are only to keep
-the arithmetic honest. Line references are to the tree at the time of writing.
+the arithmetic honest. References name the function, comment or test to look for, since line
+numbers move as the code does.
 
 ## 1. Why a simulator cares about floating point
 
@@ -19,7 +20,8 @@ habits of this project make that matter:
   tiny" loses the something (section 2) and where `a^k / k!` leaves the range of a
   double altogether (section 4).
 - **Values that span hundreds of orders of magnitude.** Request probabilities of a Zipf
-  key space over 1e9 keys reach 1e-27 at s = 3 (`src/caching/caching.cppm:276`).
+  key space over 1e9 keys reach 1e-27 at s = 3 (the comment above `characteristic_time` in
+  `src/caching/caching.cppm`).
 
 The rule the code follows: reformulate the arithmetic so that intermediate values stay
 well scaled, and write down why next to the formula.
@@ -50,15 +52,16 @@ ln(1 + u). The code uses them in exactly three places:
 
 ## 3. Bisection vs. Newton for the Che characteristic time
 
-The Che equation (`src/caching/caching.cppm:135`) asks for the t where
-`keys_in_cache(t) = capacity`; `keys_in_cache` (lines 265-272) is the sum of
-count * (1 - e^{-p t}) over the buckets. The solver is `characteristic_time`
-(lines 283-291): bisection, 80 steps, on log t.
+The Che equation (`che_characteristic_time`, `src/caching/caching.cppm`) asks for the t where
+`keys_in_cache(t) = capacity`; `keys_in_cache` is the sum of
+count * (1 - e^{-p t}) over the buckets. The solver is `characteristic_time`:
+bisection, 80 steps, on log t.
 
-- **Monotone and bracketed.** `keys_in_cache` grows with t (line 266). t >= C is a proven
-  lower end (lines 278-280: 1 - e^{-x} <= x, so the sum is at most t) and 1e300 is the
-  upper end. A sign test on a monotone function cannot leave its bracket.
-- **Log space.** t_c ranges from about C to 1e27 and beyond (lines 275-278); halving in
+- **Monotone and bracketed.** `keys_in_cache` grows with t (every term 1 - e^{-p t} does).
+  t >= C is a proven lower end (the comment above `characteristic_time`: 1 - e^{-x} <= x, so
+  the sum is at most t) and 1e300 is the upper end. A sign test on a monotone function cannot
+  leave its bracket.
+- **Log space.** t_c ranges from about C to 1e27 and beyond (same comment); halving in
   log t costs the same number of steps for all of them.
 - **80 steps.** The bracket is at most ~1400 log units wide, 1400 / 2^80 = 1.2e-21 wide
   after 80 halvings: far below the double spacing of 2.2e-16 (about 64 halvings reach it;
@@ -66,7 +69,7 @@ count * (1 - e^{-p t}) over the buckets. The solver is `characteristic_time`
 - **Why not Newton.** Newton needs the derivative Σ count p e^{-p t}, which underflows to
   0 for large t (the flat tail of the curve), and from a poor start it can jump to a
   negative t or far outside the bracket. Bisection needs no derivative and cannot diverge.
-- **Cost** (`src/caching/caching.cppm:144-145`): 80 steps x at most 2000 buckets =
+- **Cost** (the comment on `che_hit_ratio`): 80 steps x at most 2000 buckets =
   160 000 `exp` calls, about half a millisecond in Release, once per cache when the graph
   is built. Newton would need fewer steps; the saving is not worth the failure modes at half a millisecond.
 
@@ -77,20 +80,21 @@ come denormals (less and less precision) down to 4.9e-324, and below that everyt
 In terms of the exponential: `exp(-708)` is the last normal value, `exp(-745)` is the last
 nonzero one (4.9e-324), and `exp(-746)` is exactly 0.
 
-**Erlang C** (`src/queueing/queueing.cppm:33-48`). The textbook formula contains
+**Erlang C** (`erlang_c`, `src/queueing/queueing.cppm`). The textbook formula contains
 a^c / c! with a the offered load. At a = c = 712 it is 2.47e307, at 713 it is 6.7e307, and
 a few servers later it passes DBL_MAX; a thousand pooled connections at rho 0.99 is
-a = 990. The recurrence B(0) = 1, B(k) = a B(k-1) / (k + a B(k-1)) (lines 43-45) is a
-probability at every step, so it never leaves [0, 1]. The test
-`tests/unit/test_queueing.cpp:119` pins erlang_c(1000, 0.99) to 12 digits.
+a = 990. The recurrence B(0) = 1, B(k) = a B(k-1) / (k + a B(k-1)) (the comment in its body)
+is a probability at every step, so it never leaves [0, 1]. The test
+`erlang_c stays finite for a thousand servers near saturation` (`tests/unit/test_queueing.cpp`)
+pins erlang_c(1000, 0.99) to 12 digits.
 
-**Zipf normalisation** (`src/caching/caching.cppm:251-257`): `normalise` divides every
+**Zipf normalisation** (`normalise`, `src/caching/caching.cppm`) divides every
 weight by the total, so Σ count * p = 1 and every probability is in [0, 1].
 
-**The miss weights** (`log_miss_weights`, lines 301-309, and `filtered_by`, lines 400-405):
+**The miss weights** (`log_miss_weights` and `Popularity::filtered_by`, same file):
 e^{-p t} is 0 for p t >= 746, and for a big cache every hot bucket has that, so
 computing it directly could make all weights 0 and 0/0 is no distribution. The fix has two
-parts: stay in logarithms (the log-sum-exp at lines 331-341 factors out the largest
+parts: stay in logarithms (the log-sum-exp in `log_miss_weights` factors out the largest
 term), and divide by the largest log weight before the final `exp`, so no value exceeds 1
 and at least one bucket is exactly 1.
 
@@ -133,7 +137,7 @@ mean (a 12 s upload with a variance of 0.03 s^2: 144.03 - 144.00) and can come o
 error below zero. `mixture` and the byte-sized node's per-op latency
 (`Simulation::request_weighted_megabyte_sojourn`, two passes over the ops, no allocation) use the
 first. Kingman's formula needs the second form's ingredient instead: a node whose requests take
-different times (a blob store's objects of different sizes, plan 2c) hands its queue the
+different times (a blob store's objects of different sizes) hands its queue the
 **squared coefficient of variation** of the mixture of service times,
 E[S^2] = Σ p_i (1 + cs_i^2) s_i^2 (each branch's second moment is its variance plus its squared
 mean, (1 + cs^2) s^2) and c_s^2 = E[S^2] / E[S]^2 - 1 (`MegabyteService::object_time_moments`).
@@ -144,13 +148,14 @@ writes' wait.
 
 ## 6. Fluid steps
 
-`FluidQueue::advance` (`src/fluid/fluid.cppm:149-167`) is a forward step in the sense
+`FluidQueue::advance` (`src/fluid/fluid.cppm`) is a forward step in the sense
 of Euler's method: freeze the demand for `dt`, move the state (the backlog) by rate times
-`dt`, and repeat. The formulas are in the block at lines 127-147:
+`dt`, and repeat. The formulas are in the comment block above it ("The §3.3 step"), one named
+helper per line:
 
-    drain    = min(demand + backlog / dt, capacity)       (line 188)
-    backlog += (demand - drain) * dt                      (line 197)
-    dropped  = max(backlog - queue_limit, 0) / dt         (line 202)
+    drain    = min(demand + backlog / dt, capacity)       (drain_for)
+    backlog += (demand - drain) * dt                      (grow_backlog)
+    dropped  = max(backlog - queue_limit, 0) / dt         (spill_overflow)
     rho_wait = min(demand, drain) / capacity              the load the stochastic (Erlang)
                                                           wait reads: what arrives, not the
                                                           busy fraction drain / capacity, so
@@ -160,20 +165,21 @@ of Euler's method: freeze the demand for `dt`, move the state (the backlog) by r
 
 A step like this is exact for demand that is constant within the step, and wrong for
 anything faster: a burst shorter than `dt` is averaged away, and the latency uses the
-end-of-step backlog, "pessimistic by up to half a step's growth" (line 221). So `dt` should
+end-of-step backlog, "pessimistic by up to half a step's growth" (the comment on
+`FluidQueue::backlog_wait_s`). So `dt` should
 be small against the time constants of the nodes: the drain time of a full waiting room
 (`queue_limit / service_rate`) and the variation of the demand curve. The default is
-100 ms (`docs/scenario-schema.md:116`).
+100 ms (the `step` row of the schema's [Top level](../scenario-schema.md#top-level)).
 
 **Conservation** holds for any `dt`, by construction: the same `drain` appears in the
 backlog update and in the printed flow. Two tests prove it:
-`flow is conserved every step: in = out + drops + delta backlog`
-(`tests/unit/test_fluid.cpp:90`) and
-`flow is conserved to rounding under adversarial demand, dt and queue limits`
-(`tests/unit/test_fluid.cpp:140`), which uses steps of 1 us, 100 ms and 1 h and demands of
+`flow is conserved every step: in = out + drops + delta backlog` and
+`flow is conserved to rounding under adversarial demand, dt and queue limits` (both in
+`tests/unit/test_fluid.cpp`); the second uses steps of 1 us, 100 ms and 1 h and demands of
 0 and 1e9, and asks for a residual below 1e-12 of the larger term.
 
-The invariant at `fluid.cppm:33-40` is a modelling one: `service_rate`, `concurrency` and
+The invariant in the comment on `Capacity` (`src/fluid/fluid.cppm`) is a modelling one:
+`service_rate`, `concurrency` and
 `service_time_s` describe one machine only if rate = concurrency / time. The drain uses the
 rate and the Erlang term uses the other two, so a mismatch makes them two machines.
 
@@ -182,8 +188,8 @@ rate and the Erlang term uses the other two, so a mismatch makes them two machin
 The step is the one knob that is not a property of the system but of the model, so it
 needs a rule. Two things in the tree set it: a token bucket and a queue.
 
-**A token bucket's burst.** The bucket (`admit_token_bucket`,
-`src/engine/behaviours.cppm:1455-1458`; the formula block is at lines 662-667) holds up to
+**A token bucket's burst.** The bucket (`RateLimiterBehaviour::admit_token_bucket`,
+`src/engine/behaviours.cppm`; the formula block is in the class comment) holds up to
 `B` tokens (`burst`) and refills at the limit `L`. Under an offered rate `λ` above `L` it
 loses tokens at `λ - L` per second, so it empties in
 
@@ -193,8 +199,8 @@ A step of `dt` does this in one move: `admitted = min(λ, L + tokens/dt)`, so a 
 lets `L + B/dt` per second through in the first step and exactly `L` after. If
 `dt > t_empty` the whole burst passes inside the first step and the step reports its
 average: the bucket's shape (a short fast stretch, then the limit) is gone. The
-url-shortener's limiter (`scenarios/book/url-shortener/scenario.yaml:31-32`: `limit: 20k/s`,
-`burst: 2000`, `step: 1s` at line 13) empties its bucket in under a second under any flood
+url-shortener's limiter (`scenarios/book/url-shortener/scenario.yaml`: `limit: 20k/s`,
+`burst: 2000`, and the scenario's `step: 1s`) empties its bucket in under a second under any flood
 more than 2,000 requests per second above the limit, so at that step it cannot show the
 burst at all. The shipped scenario never floods it (the peak is 19.2k/s), which is why the
 choice costs nothing there.
@@ -209,16 +215,16 @@ shorter than the step is smeared or missed (section 6, above), and ten steps acr
 resolve its height and length to about a tenth.
 
 **What the step does not lose.** The fluid step is exact for demand that is constant inside
-it (the `FluidQueue::advance` comment, `src/fluid/fluid.cppm:149-167`), and the bucket's
+it (the comment above `FluidQueue::advance`), and the bucket's
 total over a step is too: `L·dt + B` tokens pass whether the bucket empties at the start of
 the step or at its end. So a coarse step does not miscount the burst. It loses only what is
 shorter than the step: where in the step the burst fell, and anything the offered rate does
 inside it. A client samples its rate once, at the start of the step
-(`ClientBehaviour::rate`, `src/engine/behaviours.cppm:1339-1340`), so a spike that does not
+(`ClientBehaviour::rate`, `src/engine/behaviours.cppm`), so a spike that does not
 fill whole steps is rounded to whole steps.
 
-**Measured on the rate-limiter lab** (`scenarios/labs/rate-limiter/scenario.yaml`: `limit: 1k/s`
-and `burst: 100` at lines 32-33; the api behind it has `replicas: 2` and `capacity: 600/s`,
+**Measured on the rate-limiter lab** (`scenarios/labs/rate-limiter/scenario.yaml`: the limiter's
+`limit: 1k/s` and `burst: 100`; the api behind it has `replicas: 2` and `capacity: 600/s`,
 so 1,200/s). The spikes are 5x of 800/s = 4,000/s, 2x = 1,600/s and 20x = 16,000/s:
 
 | spike | `λ` | `B / (λ - L)` |
@@ -257,7 +263,7 @@ wait sits at its 0.99 clamp, so the p99 is the highest of the four, 30.5 ms. At 
 burst leaves a backlog that the api works off at full capacity while the spike's admitted
 1,000/s arrive: the stochastic wait reads the utilization of what arrives, min(demand, drain) /
 capacity = 1000 / 1200 (`FluidQueue::advance`; the backlog's own drain time is the fluid term),
-so the burst's wait falls with its backlog. (Before the comprehensive 2c review it read the busy
+so the burst's wait falls with its backlog. (An earlier version read the busy
 fraction, 1, and held at the clamp until the backlog was gone: 29.9 ms at both steps.) The
 clients' `timeout: 1s` moves none of these figures: it times out 3e-7 of the delivered calls, and
 a percentile is read off the fit to every delivered call, which the cut leaves alone
@@ -333,7 +339,7 @@ to 100**, which `one lognormal replica's order statistic returns its own moments
 1e-4, is section 5's lesson again: E[X^2] - E[X]^2 subtracts two numbers that agree to four
 digits when the variance is 1e-4 of the squared mean.
 
-**Where the digits went before.** Until the review of the kv/search fix round (M-3) the same
+**Where the digits went before.** An earlier version of the same
 table read 8.5e-9, 1.1e-7, 1.7e-6 and 9e-6 on the variance at SCV 10, 20, 50 and 100 (and
 8e-15 to 2e-11 on the mean from SCV 1 up), and the bound stopped at SCV 10. The grid was not to
 blame: the trapezoid rule was already exact to rounding. The dynamic programme took each
@@ -357,7 +363,7 @@ Two limits are deliberate: a sojourn with no spread at all is given sigma = 0.00
 4000 points, a very narrow group far from a wide one widening the step instead. Then the bound
 does not hold: a group clamped to sigma = 0.001 beside one of SCV 10 needs more than 4000 points
 at sigma / 2, and the widened step leaves 8.4e-4 of error on the mean and 1.4e-3 on the variance
-(the review of plan 2c Task 11; the trapezoid rule's error on a coarse step, which carrying the
+(found in code review; the trapezoid rule's error on a coarse step, which carrying the
 failure leaves as it was: 8.4e-4 on the mean re-measured after it). Such a pair would be a
 machine of deterministic service beside a very bursty one in the same quorum, which no shipped
 scenario has.
@@ -383,7 +389,7 @@ nodes, once for each of the N copies of a key it holds (N = 1 behind a load bala
 `replication` in a kv_cluster). One machine's share is a sum of N v arc lengths, so its
 relative spread is about 1 / sqrt(N v) (the book: about 10 % at 100 virtual nodes). The
 engine needs the HOTTEST machine's share, the maximum of M such shares, and that grows with
-M. `ring_imbalance` (`src/engine/graph.cppm:1171`) takes
+M. `ring_imbalance` (`src/engine/graph.cppm`) takes
 
     k = min(1 + z_M / sqrt(N v), M / N)
 
@@ -412,9 +418,9 @@ the hottest machine's load over the average, averaged over 20-400 rings):
 | 16 | 3 | 1 | 1.962 | 2.021 | 2 |
 | 128 | 3 | 1 | 2.943 | 2.492 | 2 |
 
-(the reviews of plan 2c Tasks 9-10 and Task 11 measured the N = 3 rows and the v = 1 rows; our
-own runs gave the others and 1.084 at 16. An earlier version of this table gave 1.945 for
-16/3/1, 21 standard errors below the 1.962 the review's larger run found.) With one copy per
+(code reviews measured the N = 3 rows and the v = 1 rows; our own runs gave the others and
+1.084 at 16. An earlier version of this table gave 1.945 for 16/3/1, 21 standard errors below
+the 1.962 a larger run found.) With one copy per
 key and one virtual node each, the M points cut the ring into M arcs, each a machine's, and
 the expected longest of M arcs is H_M / M of the ring (H_M the harmonic number): k = H_M
 exactly, 1.5 for two machines and 2.083 for four.
@@ -422,7 +428,7 @@ exactly, 1.5 for two machines and 2.083 for four.
 **Its limit.** Within about 1 % from v = 100 on, where a machine's share is a sum of hundreds
 of arcs and close to normal; at v = 1 it is a few whole arcs, far from normal, and k is off by
 up to ±16 % (high for few machines, 1.828 against 1.616 at 8/3/1; low for many, 2.492 against
-2.943 at 128/3/1). One formula is kept for every v anyway (review of plan 2c Task 11, I-3):
+2.943 at 128/3/1). One formula is kept for every v anyway:
 v = 1 is an experiment that shows what an uneven ring does, and the labs' verdicts at v = 1
 hold with the exact value too (the consistent-hashing lab's `replicas: 2, vnodes: 1` item
 says so with the numbers). The old factor ignored M: it is "one standard deviation above the
@@ -431,13 +437,14 @@ same function, so the consistent-hashing lab's balancer and the kv-store lab's c
 
 ## 9. Try it
 
-1. **Weaken the Che bisection.** In `characteristic_time` change `step < 80`
-   (`src/caching/caching.cppm:286`) to 20, rebuild, and run `[caching]`. The bracket is
-   then ~1400 / 2^20 = 1.3e-3 wide in log t, and the pinned checks fail:
-   `the characteristic time of a uniform cache solves N(1 - e^(-t/N)) = C` (1e-9,
-   `tests/unit/test_caching.cpp:221`) and `the characteristic time matches the dense
-   reference` (1e-4, line 231). Try 40, 55 and 64 to see where each tolerance starts to hold.
-2. **Undo the `expm1`.** In `one_minus_exp_neg` (line 262) return `1.0 - std::exp(-x)`
+1. **Weaken the Che bisection.** In `characteristic_time` (`src/caching/caching.cppm`) change
+   `step < 80` to 20, rebuild, and run `[caching]`. The bracket is
+   then ~1400 / 2^20 = 1.3e-3 wide in log t, and the pinned checks in
+   `tests/unit/test_caching.cpp` fail:
+   `the characteristic time of a uniform cache solves N(1 - e^(-t/N)) = C` (1e-9) and
+   `the characteristic time matches the dense reference` (1e-4). Try 40, 55 and 64 to see
+   where each tolerance starts to hold.
+2. **Undo the `expm1`.** In `one_minus_exp_neg` (same file) return `1.0 - std::exp(-x)`
    and see whether any `[caching]` test notices. With p t around 1e-12 the error is 2e-5
    relative (section 2); a cold key over a short characteristic time is exactly that case.
 3. **Coarsen the step.** Copy `scenarios/labs/unique-id/scenario.yaml` (step 100ms; its
@@ -445,7 +452,8 @@ same function, so the consistent-hashing lab's balancer and the kv-store lab's c
    `{at: 5m, for: 1s, factor: 3}` and compare `simsys run` at `step: 100ms` and at
    `step: 10s`. The demand is frozen across a step, so the 1 s spike is either smeared over
    ten seconds or missed, and the drop count and the p99 move. Conservation is not what
-   breaks: in `tests/unit/test_fluid.cpp:140` widen `dts` to include `10s` and the
+   breaks: in `flow is conserved to rounding under adversarial demand, dt and queue limits`
+   (`tests/unit/test_fluid.cpp`) widen `dts` to include `10s` and the
    residual check still passes (section 6). What coarse steps lose is fidelity, not balance.
 4. **Find the step where the burst disappears.** Run the rate-limiter lab at `step: 5ms`,
    `100ms`, `500ms` and `1s` (the commands are in "Choosing the step", section 6) and watch
@@ -480,7 +488,7 @@ same function, so the consistent-hashing lab's balancer and the kv-store lab's c
 
 ## 10. A client's timeout: the truncated lognormal
 
-A client with `timeout: τ` (plan 2c Task 13) gives up on a request the path has not answered by τ.
+A client with `timeout: τ` (spec §19 entry 12) gives up on a request the path has not answered by τ.
 The engine does not follow requests one by one, so each step it takes the client's response for
 an op as the lognormal of section 5, fitted to the path's mean m and variance v
 (`Simulation::give_up_after`, `src/engine/engine.cppm`, calling `queueing::lognormal_below`,
@@ -511,13 +519,13 @@ sums them over the run weighted by the requests delivered, answered plus timed o
 (`Summary::OpTotals::by_delivered`), and reads the percentile there at q itself, capped at τ
 (`percentile_seen_by_client`, `src/report/report.cpp`; the cap only matters for a run that mixes
 steps, since one steady step has s ≤ 1 − q exactly when the fit's q-quantile is at most τ). When
-s > 1 − q no request at q was answered and the percentile is the timeout itself, `>τ` (the C-1
-rule). So a percentile never falls as τ grows, meets τ from below as s rises to 1 − q, and is the
+s > 1 − q no request at q was answered and the percentile is the timeout itself, `>τ`. So a
+percentile never falls as τ grows, meets τ from below as s rises to 1 − q, and is the
 untimed client's once the cut is empty. The path below behind a 530 ms timeout (0.78 % timed out)
 has the p99 it has without one, 490.5 ms (tests/theory/test_timeout.cpp derives it, and checks
 that the p99 does not fall over ten timeouts from 300 ms to 3 s).
 
-**Why not refit the answered requests.** Until the comprehensive 2c review the reports fitted a
+**Why not refit the answered requests.** An earlier version of the reports fitted a
 second lognormal to the truncated moments and read it at q / (1 − s). That refit has a tail past
 τ the truncated distribution lacks, and its moments react to a cut far more than the requests do:
 the share of the k-th moment past τ is Φ(kσ − z), which grows with k. Behind a 1 s timeout the path
@@ -552,8 +560,9 @@ every weighted sum of the report (0 × NaN is NaN). `lognormal_below` returns th
 under τ), the engine counts every such request as timed out, and the report never shows those
 stand-in moments: JSON prints `null` latencies for an op of which nothing was answered in time and
 the table `>10s`. Try it: `sed 's/timeout: 30s/timeout: 10s/' scenarios/book/youtube/scenario.yaml
-> /tmp/yt10.yaml` and `simsys run /tmp/yt10.yaml --duration 10m`: `viewers_us.upload  5.641
-5.641  -  >10s  >10s  >10s`, every upload timed out. (The shipped 30 s timeout stands for the
+> /tmp/yt10.yaml` and `simsys run /tmp/yt10.yaml --duration 65m` (the shortest run that still
+holds the utilization SLO's `over: 1h` after the 5-minute warmup): `viewers_us.upload  5.415
+5.415  -  >10s  >10s  >10s`, every upload timed out. (The shipped 30 s timeout stands for the
 book's resumable uploads, which retry a chunk, not the whole file.) The other edges are limits of
 the same formulas: τ = ∞ returns m and v, an infinite m (a path that never answers) stays
 infinite so the report still calls it unavailable, and v = 0 is a step at m (all answered if

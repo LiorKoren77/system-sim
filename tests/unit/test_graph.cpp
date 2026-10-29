@@ -410,11 +410,11 @@ TEST_CASE("least_connections marks its downstream service as pooled", "[graph]")
   REQUIRE(g.nodes()[*g.index_of("a")].imbalance == 1.0);
 }
 
-// The ring heuristic of the review of plan 2c Tasks 9-10 (I-2): over M servers holding N copies
-// of each key, the hottest carries k = 1 + z_M / sqrt(N vnodes) times the average, z_M the expected
-// maximum of M standard normals by Blom's approximation, Phi^-1((M - 0.375) / (M + 0.25)) (pinned
-// in test_queueing.cpp): z_4 = 1.0491313979639711, z_8 = 1.4342001596863794. A balancer's ring
-// holds one copy of a key (N = 1).
+// The ring heuristic (numerics §8): over M servers holding N copies of each key, the hottest
+// carries k = 1 + z_M / sqrt(N vnodes) times the average, z_M the expected maximum of M standard
+// normals by Blom's approximation, Phi^-1((M - 0.375) / (M + 0.25)) (pinned in test_queueing.cpp):
+// z_4 = 1.0491313979639711, z_8 = 1.4342001596863794. A balancer's ring holds one copy of a key (N
+// = 1).
 namespace {
 constexpr double blom_z4 = 1.0491313979639711;
 constexpr double blom_z8 = 1.4342001596863794;
@@ -641,7 +641,7 @@ TEST_CASE("a leaky bucket's queue is one deterministic slot of rate limit with r
   REQUIRE(per_copy.queue_limit == 250.0);
 }
 
-// ---- Caches (plan 2a refinement 7, Task 10) ----
+// ---- Caches (spec §17 entry 7) ----
 
 // The shape of one resolved service hop, as Graph::service_hops exports it: the node it calls,
 // the op it sends, `fraction`, the share of the service's requests that take the hop at all (a
@@ -729,9 +729,9 @@ TEST_CASE("a cache that always hits sends nothing on to the miss step", "[graph]
   REQUIRE_THAT(hops[1].fraction, WithinRel(0.0, 1e-12));
 }
 
-// A miss step needs a cache in front of it. A CDN can miss too, but it fetches its own misses
-// from its origin, so a miss step after one is refused with a message of its own (below): the
-// message here names the one kind of node a miss step may follow (review of 4d539b0, M3).
+// A miss step needs a cache in front of it. A CDN can miss too, but it fetches its own misses from
+// its origin, so a miss step after one is refused with a message of its own (below): the message
+// here names the one kind of node a miss step may follow.
 TEST_CASE("an on-miss step must follow a cache step", "[graph]") {
   const std::string expected = "node 'web': an 'on: miss' step must follow a cache step";
   SECTION("as the first step") {
@@ -834,10 +834,10 @@ Scenario web_behind_cdn(std::optional<HitRatio> hit, std::vector<Step> steps) {
   return s;
 }
 
-// A CDN is a cache at the network's edge (ch. 1): a fixed hit ratio on it means what it means on
-// a cache. But a CDN fetches its own misses from its origin (plan 2b refinement 4), so the miss
-// share 1 - h travels on the cdn -> origin edge, and a service's `on: miss` step after a CDN
-// lookup, which would fetch every miss a second time, is refused, as after a read_through cache.
+// A CDN is a cache at the network's edge (ch. 1): a fixed hit ratio on it means what it means on a
+// cache. But a CDN fetches its own misses from its origin (spec §18 entry 10), so the miss share 1
+// - h travels on the cdn -> origin edge, and a service's `on: miss` step after a CDN lookup, which
+// would fetch every miss a second time, is refused, as after a read_through cache.
 TEST_CASE("a cdn's fixed hit ratio feeds its own origin edge, not a service's miss step",
           "[graph]") {
   SECTION("the misses go to the origin") {
@@ -933,7 +933,7 @@ TEST_CASE("a forwarding cache's backend needs a link from the cache", "[graph]")
   REQUIRE(g.error().message.contains("node 'cache': backend 'db' needs a link"));
 }
 
-// ---- Che hit ratios resolved from the clients' key distributions (plan 2b, Task 2) ----
+// ---- Che hit ratios resolved from the clients' key distributions (spec §18 entries 1-2) ----
 
 // The Che approximation needs the cache size (the cache's `keys`) and how popular each key is,
 // and popularity is a property of the clients, not of the cache: the graph reads it off the
@@ -1101,7 +1101,7 @@ TEST_CASE("a cache partitioned by a consistent-hash ring sums Che over its uneve
                WithinRel(che_over_100k_zipf1_keys(10'000), 1e-12));
 }
 
-// ---- Cache then-steps and write_back (plan 2b, Task 3) ----
+// ---- Cache then-steps and write_back (spec §18 entry 5) ----
 
 namespace {
 // u -> browser_cache -> lb -> svc: the search-autocomplete front. The cache has a fixed hit
@@ -1182,8 +1182,8 @@ TEST_CASE("a service miss step after a cache whose own then step fetches the mis
 
 // All the parallel steps of a step list form one group, and the steps after it are sent only the
 // requests the whole group answered. [a ∥, s, b ∥] leaves it unclear whether s runs before b or
-// after the group, so the group must be listed where it runs, its members side by side (review of
-// plan 2c Task 12, I-4). The same rule holds for `then` steps.
+// after the group, so the group must be listed where it runs, its members side by side. The same
+// rule holds for `then` steps.
 TEST_CASE("parallel steps that are not adjacent are refused, in an op and in then steps",
           "[graph]") {
   Scenario s{.name = "group", .version = 1, .duration = 1min};
@@ -1324,7 +1324,7 @@ TEST_CASE("a write_back cache needs a backend and a link, and its flush hop is a
   }
 }
 
-// ---- Which keys reach a che cache: the op-aware walk (plan 2b refinement 1, revised) ----
+// ---- Which keys reach a che cache: the op-aware walk (spec §18 entry 1, revised) ----
 //
 // A client's keys reach a cache only along the calls its ops make: an op that never calls the
 // cache brings none of its keys there, even when the same service sits in front of both.
@@ -1390,13 +1390,12 @@ TEST_CASE("a che cache no client's demand reaches is an error", "[graph]") {
   REQUIRE(built.error().message == "node 'cache': hit_ratio che: no client's demand reaches it");
 }
 
-// A rate limiter asks its counter store "how many requests has THIS user made?": the store is
-// keyed per user (or per rule), not by the keys the client's requests are about, so the
-// counter op brings no client keys to it. A che store that nothing else reaches has no key
-// distribution to solve over, and the message says why, rather than "no client's demand reaches
-// it": the clients' demand does, through the limiter (review of c9d5f8c). (`counter` is in the
-// store's write_ops: an INCR is a write, see "a limiter's counter that its store counts as a
-// read is refused" below.)
+// A rate limiter asks its counter store "how many requests has THIS user made?": the store is keyed
+// per user (or per rule), not by the keys the client's requests are about, so the counter op brings
+// no client keys to it. A che store that nothing else reaches has no key distribution to solve
+// over, and the message says why, rather than "no client's demand reaches it": the clients' demand
+// does, through the limiter. (`counter` is in the store's write_ops: an INCR is a write, see "a
+// limiter's counter that its store counts as a read is refused" below.)
 TEST_CASE("a limiter's counter requests bring no client keys to its store", "[graph]") {
   Scenario s{.name = "lim", .version = 1, .duration = 1min};
   auto limiter = limiter_of(simsys::model::LimiterAlgorithm::token_bucket, std::nullopt);
@@ -1522,7 +1521,7 @@ TEST_CASE("a che cache receiving both filtered and unfiltered reads is an error"
           "cache filtered");
 }
 
-// ---- Ring-partitioned caches: uneven arcs (plan 2b refinement 2, revised) ----
+// ---- Ring-partitioned caches: uneven arcs (spec §18 entry 2, revised) ----
 
 namespace {
 // u (zipf 0.9 over 10M) -> ring (consistent_hash, `vnodes`) -> c (4 replicas, 2M keys each,
@@ -1577,7 +1576,7 @@ TEST_CASE("a ring-partitioned cache that is also sent to directly is an error", 
           "node 'c': keys are partitioned by ring 'ring' but 'web' also sends to it directly");
 }
 
-// ---- SQL database (plan 2b, Task 4; review of 48d4d0b) ----
+// ---- SQL database (spec §18 entry 6) ----
 
 namespace {
 // u -> db, or u -> ring -> db through a consistent-hash balancer of one vnode per server: a SQL
@@ -1604,9 +1603,9 @@ Scenario database_behind_ring(bool ring) {
 }
 }  // namespace
 
-// The database driver, not a balancer, sends writes to the primary and reads to a replica, and
-// a sharding key spreads the shards evenly: a hash ring in front leaves the copies even
-// (imbalance 1), so explain and the engine agree that no copy is hot (review of 48d4d0b, I1).
+// The database driver, not a balancer, sends writes to the primary and reads to a replica, and a
+// sharding key spreads the shards evenly: a hash ring in front leaves the copies even (imbalance
+// 1), so explain and the engine agree that no copy is hot.
 TEST_CASE("a hash ring imposes no hot copy on a database", "[graph]") {
   const auto g = Graph::build(database_behind_ring(true));
   INFO((g ? "" : g.error().message));
@@ -1616,8 +1615,8 @@ TEST_CASE("a hash ring imposes no hot copy on a database", "[graph]") {
 
 // Two balancers whose policies give different replica models may both front a database: neither
 // model applies to it (its driver picks the copy), so there is no conflict to refuse. A hash ring
-// (imbalanced) and a least_connections balancer (pooled) both linked to `db` build, and `db`
-// keeps even, unpooled copies (re-review of 96848f0).
+// (imbalanced) and a least_connections balancer (pooled) both linked to `db` build, and `db` keeps
+// even, unpooled copies.
 TEST_CASE("balancers of different replica models may both front a database", "[graph]") {
   auto s = database_behind_ring(true);
   s.nodes.push_back(NodeSpec{
@@ -1651,8 +1650,8 @@ TEST_CASE("a link that carries demand out of a database is refused", "[graph]") 
 
 // Little's law, concurrency in service = throughput × service time, read backwards: a copy with
 // `pool` connections has at most `pool` queries in service, so it serves at most pool / service
-// time (review of 48d4d0b, C3). 5k/s × 10 ms implies 50 in service; `pool: 4` allows 4, so
-// 4 / 10 ms = 400/s with c = 4. A pool of 100 binds nothing: 5k/s and the implied c = 50 stay.
+// time. 5k/s × 10 ms implies 50 in service; `pool: 4` allows 4, so 4 / 10 ms = 400/s with c = 4. A
+// pool of 100 binds nothing: 5k/s and the implied c = 50 stay.
 TEST_CASE("a database's pool bounds its throughput by Little's law and never raises it",
           "[graph]") {
   auto s = database_behind_ring(false);
@@ -1674,7 +1673,7 @@ TEST_CASE("a database's pool bounds its throughput by Little's law and never rai
 }
 
 // A database built in code obeys the loader's rule on `pool` and `advanced.concurrency` with its
-// message: both set c, and only the pool also caps the rate (re-review of 96848f0).
+// message: both set c, and only the pool also caps the rate.
 TEST_CASE("a database's pool and advanced.concurrency are refused together in code", "[graph]") {
   auto s = database_behind_ring(false);
   s.nodes[1].pool = 8;
@@ -1685,7 +1684,7 @@ TEST_CASE("a database's pool and advanced.concurrency are refused together in co
           "node 'db': pool sets c and caps the rate by Little's law; drop advanced.concurrency");
 }
 
-// ---- Request-based CDN (plan 2b refinement 4, Task 5) ----
+// ---- Request-based CDN (spec §18 entry 10) ----
 //
 // A CDN (book ch. 1: a cache at the network's edge; ch. 13's browser cache is the same idea one
 // hop closer to the user) is a read-only cache in front of its `origin`. It answers the hit
@@ -1745,11 +1744,11 @@ TEST_CASE("a cdn without a hit ratio misses every read and still builds", "[grap
   REQUIRE_THAT(built->backend_fraction(cdn, "read"), WithinRel(1.0, 1e-12));
 }
 
-// A CDN serves static files from the edge and has no write path: there is nothing in its model
-// that a write could update, so a write that reaches it is a mistake in the scenario. "A write"
-// is whatever model::write_ops_of says for the node: a CDN's default is the op `write`, and a
-// scenario's `write_ops` replaces it, exactly as for a cache. The message names the op and a
-// node that sends it, so a student finds the arrow to remove (review of 4d539b0, M7).
+// A CDN serves static files from the edge and has no write path: there is nothing in its model that
+// a write could update, so a write that reaches it is a mistake in the scenario. "A write" is
+// whatever model::write_ops_of says for the node: a CDN's default is the op `write`, and a
+// scenario's `write_ops` replaces it, exactly as for a cache. The message names the op and a node
+// that sends it, so a student finds the arrow to remove.
 TEST_CASE("a write op reaching a cdn is refused", "[graph]") {
   SECTION("the default write op, sent by a client") {
     const auto g =
@@ -1850,17 +1849,17 @@ TEST_CASE("a cdn built in code with then steps is refused", "[graph]") {
 
 // A CDN that names itself as its origin would fetch its own misses from itself: a miss that can
 // never be answered. The loader refuses it (config tests), and so does the graph for a scenario
-// built in code, before it looks for the link (review of 4d539b0, M6).
+// built in code, before it looks for the link.
 TEST_CASE("a cdn built in code that is its own origin is refused", "[graph]") {
   const auto g = Graph::build(cdn_front(cdn_node(HitRatio{.fixed = 0.95}, "cdn")));
   REQUIRE_FALSE(g.has_value());
   REQUIRE(g.error().message == "node 'cdn': a cdn cannot be its own origin");
 }
 
-// A CDN is read_through towards its origin by definition; the cache's `strategy` and `backend`
-// keys are not its keys (the loader has no such key on a cdn). Written in code they would
-// contradict the model: a write_back strategy, for one, would excuse the origin hop from the
-// call-cycle check, although a miss always waits for the origin (review of 4d539b0, M9).
+// A CDN is read_through towards its origin by definition; the cache's `strategy` and `backend` keys
+// are not its keys (the loader has no such key on a cdn). Written in code they would contradict the
+// model: a write_back strategy, for one, would excuse the origin hop from the call-cycle check,
+// although a miss always waits for the origin.
 TEST_CASE("a cdn built in code with a cache strategy or a backend is refused", "[graph]") {
   SECTION("a strategy other than the default") {
     auto cdn = cdn_node(HitRatio{.fixed = 0.95});
@@ -1897,7 +1896,7 @@ TEST_CASE("a cdn whose origin hop closes a call cycle is refused", "[graph]") {
 }
 
 // Che's "filtered" popularity names the node whose misses a che cache receives, by its type: a
-// CDN's misses are a CDN's, not a cache's (review of 4d539b0, M7).
+// CDN's misses are a CDN's, not a cache's.
 TEST_CASE("a che cache receiving a cdn's misses and unfiltered reads names the cdn", "[graph]") {
   auto s = two_caches(HitRatio{.che = true}, 2'000'000);
   NodeSpec l1 = cdn_node(HitRatio{.che = true}, "l2");
@@ -1914,7 +1913,7 @@ TEST_CASE("a che cache receiving a cdn's misses and unfiltered reads names the c
           "cache filtered");
 }
 
-// ---- ID generator as service sugar (plan 2b refinement 6; book ch. 7) ----
+// ---- ID generator as service sugar (spec §18 entry 12; book ch. 7) ----
 //
 // An id_generator is not a new kind of behaviour: Graph::build turns its `algorithm` into the
 // capacity and service time a service of that design would have, and the node then runs as a
@@ -2050,7 +2049,7 @@ TEST_CASE("an id generator built in code without an algorithm is refused", "[gra
           "node 'ids': id_generator needs algorithm: snowflake, ticket_server or uuid");
 }
 
-// ---- A write stays a write at its store (review of c9d5f8c, finding 1) ----
+// ---- A write stays a write at its store ----
 //
 // Each node decides alone which of its ops are writes (model::write_ops_of): a cache's
 // `write_ops` (default `write`), a SQL database's (default the SQL statements insert, update,
@@ -2160,7 +2159,7 @@ TEST_CASE("a limiter's counter that its store counts as a read is refused", "[gr
   }
 }
 
-// ---- One request size per (node, op), resolved at build (plan 2c refinement 1, Task 2) ----
+// ---- One request size per (node, op), resolved at build (spec §19 entry 1) ----
 //
 // A byte-sized node counts megabytes, so it must know how big each request it serves is. The
 // graph resolves one size per (node, op) with a walk over the client routes and the steps that
@@ -2299,9 +2298,9 @@ TEST_CASE("a cache forwards a request to its backend with the size it arrived wi
   }
 }
 
-// A CDN is the read_through shape of a cache (plan 2b refinement 4): on a miss it fetches the
-// object from its origin. The origin is asked for the same stream, so it serves 50 MB = 5e7 B
-// per miss, and both the byte-sized CDN (capacity 100GB/s) and its blob-store origin know it.
+// A CDN is the read_through shape of a cache (spec §18 entry 10): on a miss it fetches the object
+// from its origin. The origin is asked for the same stream, so it serves 50 MB = 5e7 B per miss,
+// and both the byte-sized CDN (capacity 100GB/s) and its blob-store origin know it.
 TEST_CASE("a cdn's origin receives its reads' size", "[graph]") {
   NodeSpec cdn{.id = "cdn",
                .type = NodeType::cdn,
@@ -2400,8 +2399,8 @@ TEST_CASE("a step's size makes a renamed op acceptable to a byte-sized store", "
   REQUIRE_THAT(bytes_required(*built, "store", "fetch"), WithinRel(2e6, 1e-12));
 }
 
-// ---- Review of Tasks 1-2: every op at a byte-sized node has a size, and the size walk's
-// decisions pinned (plan 2c, fix round) ----
+// ---- Every op at a byte-sized node has a size, and the size walk's
+// decisions pinned ----
 //
 // Graph::collect_arriving_ops (which ops reach a node) and the size walk (which size each one
 // has) start from different places: a worker pool's unconditional `then` steps fire in the first
@@ -2410,9 +2409,8 @@ TEST_CASE("a step's size makes a renamed op acceptable to a byte-sized store", "
 // whatever its bytes, so the graph refuses such an op whichever walk found it.
 
 namespace {
-// A worker pool with the given `then` steps, one worker of 1 ms a job (since plan 2c Task 6 the
-// pool's capacity is workers / cost, and the loader requires both), draining `queue` when one is
-// named (a queue linked to a pool must be consumed by it).
+// A worker pool with the given `then` steps, one worker of 1 ms a job (and the loader requires
+// both), draining `queue` when one is named (a queue linked to a pool must be consumed by it).
 NodeSpec worker_pool(std::string id, std::vector<Step> then,
                      std::optional<std::string> queue = std::nullopt) {
   NodeSpec pool{.id = std::move(id), .type = NodeType::worker_pool};
@@ -2440,11 +2438,11 @@ const std::string no_size_advice = "has no size: add size: to the step or sizes:
 }  // namespace
 
 // Nothing feeds the pool, yet its `then` step counts as arriving at the store (an unconditional
-// `then` fires for whatever the node receives). Before this fix the store took `write` with no
-// size and charged it one unit; now the step must say how big a write is. No job arrives at the
-// pool as `write`, so the step renames every job: the message gives the plain advice, without the
-// note on a pool's same-op steps (review of plan 2c Task 8, minor 4: that note is for a step whose
-// op is one of the pool's arriving ops, the case of the test below with `upload` and `reupload`).
+// `then` fires for whatever the node receives). Before this fix the store took `write` with no size
+// and charged it one unit; now the step must say how big a write is. No job arrives at the pool as
+// `write`, so the step renames every job: the message gives the plain advice, without the note on a
+// pool's same-op steps (that note is for a step whose op is one of the pool's arriving ops, the
+// case of the test below with `upload` and `reupload`).
 TEST_CASE("a worker pool's then step that no queue feeds still needs a size at a byte-sized store",
           "[graph]") {
   const auto built = Graph::build(unfed_pool(Step{.to = "store", .op = "write"}));
@@ -2464,10 +2462,9 @@ TEST_CASE("a worker pool's then step that no queue feeds is sized by its own siz
 }
 
 // A pool built in code that names no queue (no `consumes`): the loader refuses such a file
-// (`worker_pool needs consumes`, review of plan 2c Task 6, I-1), and since the review of Task 7
-// (minor 4) so does Graph::build, in the same words. Before, it built and could never receive a
-// job (every sender but its queue is refused, and it had none), so its room fell back to the
-// default retention for a queue that did not exist.
+// (`worker_pool needs consumes`), and so does Graph::build, in the same words. Before, it built and
+// could never receive a job (every sender but its queue is refused, and it had none), so its room
+// fell back to the default retention for a queue that did not exist.
 TEST_CASE("a worker pool built in code without consumes is refused as the loader refuses it",
           "[graph]") {
   Scenario s{.name = "unlinked-pool", .version = 1, .duration = 1min};
@@ -2495,9 +2492,9 @@ TEST_CASE("a client's drained route brings no op to the node behind it", "[graph
   REQUIRE_FALSE(request_bytes_at(*built, "store", "get").has_value());
 }
 
-// A rate limiter asks its backend `counter` once per request it checks (plan 2a refinement 6):
-// the limiter's own request, which carries no client bytes. A byte-sized backend would have to
-// price it in megabytes, so it is refused with a message of its own.
+// A rate limiter asks its backend `counter` once per request it checks (spec §17 entry 6): the
+// limiter's own request, which carries no client bytes. A byte-sized backend would have to price it
+// in megabytes, so it is refused with a message of its own.
 TEST_CASE("a limiter's counter into a byte-sized store is refused: the counter carries no size",
           "[graph]") {
   auto store = default_blob_store();
@@ -2561,9 +2558,9 @@ TEST_CASE("a size conflict names the clients that stated the sizes, not the bala
           "node 'store': op 'get' arrives with two sizes, 1MB from 'a' and 2MB from 'b'");
 }
 
-// A message keeps its op name through the queue and into the pool (plan 2c refinement 4), so a
-// pool's `then` step with the same op carries the client's 300 MB on; a step that renames the op
-// carries its own `size:`, 50 MB (youtube's transcoders write renditions so).
+// A message keeps its op name through the queue and into the pool (spec §19 entry 4), so a pool's
+// `then` step with the same op carries the client's 300 MB on; a step that renames the op carries
+// its own `size:`, 50 MB (youtube's transcoders write renditions so).
 TEST_CASE("a queue's pool keeps a same-op size on its then step and uses a renamed step's size",
           "[graph]") {
   Scenario s{.name = "queue-pool", .version = 1, .duration = 1min};
@@ -2583,7 +2580,7 @@ TEST_CASE("a queue's pool keeps a same-op size on its then step and uses a renam
   REQUIRE_THAT(bytes_required(*built, "renditions", "write"), WithinRel(5e7, 1e-12));
 }
 
-// ---- A worker pool's then steps (plan 2c refinement 5, Task 7) ----
+// ---- A worker pool's then steps (spec §19 entry 5) ----
 //
 // A pool's `then` steps are the work each DRAINED job hands on (book ch. 14: a transcoding worker
 // writes its renditions and publishes a completion message), resolved like a cache's unconditional
@@ -2632,9 +2629,9 @@ TEST_CASE("a worker pool's then steps are demand edges to their targets", "[grap
 }
 
 // Every drained job fires every unconditional step, whatever op the queue brought it under: the
-// share is 1 for `publish`, the op this scenario publishes, and for any other op too (unlike a
-// blob store's steps, which fire for its writes only). A characterisation test of Task 6's graph:
-// the share was already 1 before the steps ran.
+// share is 1 for `publish`, the op this scenario publishes, and for any other op too (unlike a blob
+// store's steps, which fire for its writes only). A characterisation test of the graph: the share
+// was already 1 before the steps ran.
 TEST_CASE("a worker pool's then step takes a share of 1 of every job it drains", "[graph]") {
   const auto built = Graph::build(pool_handing_on(renditions_and_completion));
   REQUIRE(built.has_value());
@@ -2668,11 +2665,11 @@ TEST_CASE("a worker pool's same-op then step inherits the size of the job it dra
   REQUIRE_THAT(bytes_required(*built, "done_q", "publish"), WithinRel(2e3, 1e-12));
 }
 
-// A same-op step passes on the size of the jobs that arrive under its op only (review of plan 2c
-// Task 7, minor 2): u publishes `upload` and `reupload`, both 300 MB; the pool's step `{to: store,
-// op: upload}` carries the uploads' 300 MB on, but renames every `reupload` job to `upload`, and a
-// renamed request without `size:` has none. The store counts bytes, so the build fails, and the
-// message says why a size the client states did not reach it.
+// A same-op step passes on the size of the jobs that arrive under its op only: u publishes `upload`
+// and `reupload`, both 300 MB; the pool's step `{to: store, op: upload}` carries the uploads' 300
+// MB on, but renames every `reupload` job to `upload`, and a renamed request without `size:` has
+// none. The store counts bytes, so the build fails, and the message says why a size the client
+// states did not reach it.
 TEST_CASE(
     "a pool's same-op then step renames the jobs of another op unsized, and the error says so",
     "[graph]") {
@@ -2688,10 +2685,10 @@ TEST_CASE(
               "only: it renames every other job, and a renamed job has no size)");
 }
 
-// Nobody waits on a pool: the hop into it from its queue is asynchronous (Task 6). Its own
-// then-hops are ordinary hops from its point of view, not asynchronous hops: what a pool hands on
-// is not an event nobody waits for but a call the pool makes (and the engine's backward pass
-// never asks, because no one waits for the pool: its response stays its own).
+// Nobody waits on a pool: the hop into it from its queue is asynchronous. Its own then-hops are
+// ordinary hops from its point of view, not asynchronous hops: what a pool hands on is not an event
+// nobody waits for but a call the pool makes (and the engine's backward pass never asks, because no
+// one waits for the pool: its response stays its own).
 TEST_CASE("the queue's hop into a pool is asynchronous and the pool's own then hops are not",
           "[graph]") {
   const auto built = Graph::build(pool_handing_on(renditions_and_completion));
@@ -2762,7 +2759,7 @@ TEST_CASE("a zero-byte request at a byte-sized store is refused", "[graph]") {
           "0B: a request's size must be positive");
 }
 
-// ---- A blob store's then steps are asynchronous event notifications (plan 2c refinements 6-7)
+// ---- A blob store's then steps are asynchronous event notifications (spec §19 entries 6-7)
 // ----
 //
 // S3 event notifications (book ch. 14: "transcoding starts when the upload completes"): for every
@@ -2825,11 +2822,11 @@ TEST_CASE("a blob store's same-op then step is an asynchronous hop carrying that
   REQUIRE_FALSE(built->is_async_hop(store, "upload", svc, "notify"));
 }
 
-// The paper load (explain) and the engine's forward pass follow a blob store's then steps along
-// the graph's demand edges, as a service's steps: store -> svc is an edge over the link between
-// them, the op that arrives at svc is `notify`, and nothing else reaches it.
-// A characterisation test: it passed before plan 2c Task 4 too (a `then` step was already a
-// demand edge), and pins that the events kept it so.
+// The paper load (explain) and the engine's forward pass follow a blob store's then steps along the
+// graph's demand edges, as a service's steps: store -> svc is an edge over the link between them,
+// the op that arrives at svc is `notify`, and nothing else reaches it. A characterisation test: it
+// passed before a blob store's events were modelled too (a `then` step was already a demand edge),
+// and pins that the events kept it so.
 TEST_CASE("a blob store's then step is a demand edge that delivers its op to the target",
           "[graph]") {
   const auto built = Graph::build(store_with_notifications({Step{.to = "svc", .op = "notify"}}));
@@ -2924,7 +2921,7 @@ TEST_CASE("a parallel then step on a blob store is refused", "[graph]") {
           "(mode orders the calls a request waits for)");
 }
 
-// ---- A link's bandwidth is a pipe (plan 2c refinement 3, Task 5) ----
+// ---- A link's bandwidth is a pipe (spec §19 entry 3) ----
 //
 // A link that states `bandwidth` becomes a pipe the engine queues megabytes through: one server
 // (c = 1) whose unit is 1 MB, served in 1 MB / bandwidth, deterministic, with a waiting room of
@@ -3076,10 +3073,9 @@ TEST_CASE("only the ops a bandwidth link carries need a size", "[graph]") {
   }
 }
 
-// Two more requests a pipe cannot price in megabytes (review of plan 2c Task 5, M-8): one of
-// 0 bytes would cost nothing (the engine divides by its megabytes), and a rate limiter's `counter`
-// is the limiter's own request, which no `size:` can describe, so the link to its backend cannot
-// be a pipe at all; each refusal says why.
+// Two more requests a pipe cannot price in megabytes: one of 0 bytes would cost nothing (the engine
+// divides by its megabytes), and a rate limiter's `counter` is the limiter's own request, which no
+// `size:` can describe, so the link to its backend cannot be a pipe at all; each refusal says why.
 TEST_CASE("a pipe refuses a 0-byte request and a limiter's counter, each with its reason",
           "[graph]") {
   SECTION("a request of 0 bytes") {
@@ -3102,7 +3098,7 @@ TEST_CASE("a pipe refuses a 0-byte request and a limiter's counter, each with it
   }
 }
 
-// ---- Message queues and worker pools (plan 2c refinements 4-6, Task 6) ----
+// ---- Message queues and worker pools (spec §19 entries 4-6) ----
 //
 // A message queue is a broker (Kafka, ch. 14's transcode_q): a publisher's request is answered when
 // the message is appended, and every consumer group (a worker pool that `consumes` the queue)
@@ -3236,10 +3232,10 @@ TEST_CASE("a message queue has one route of share one per consumer group", "[gra
   REQUIRE(std::ranges::equal(g.arriving_ops(w2), std::vector<std::string>{"publish"}));
 }
 
-// Plan 2c refinement 6: the publisher waits for the append alone. The queue -> pool hop is the
-// hand-off nobody upstream waits for (as a write_back cache's flush and a blob store's event are),
-// so the backward pass leaves the pool's sojourn and losses out of the publisher's response and
-// delivered fraction. The publisher's own call into the queue stays synchronous.
+// Spec §19 entry 6: the publisher waits for the append alone. The queue -> pool hop is the hand-off
+// nobody upstream waits for (as a write_back cache's flush and a blob store's event are), so the
+// backward pass leaves the pool's sojourn and losses out of the publisher's response and delivered
+// fraction. The publisher's own call into the queue stays synchronous.
 TEST_CASE("the hop from a queue to its consumer is asynchronous and the publisher's is not",
           "[graph]") {
   const auto g = *Graph::build(
@@ -3300,8 +3296,7 @@ TEST_CASE("the broker itself keeps the type's append numbers: 1M messages a seco
   REQUIRE(broker.concurrency == 100);
 }
 
-// ---- Review of Task 6: a pool's only sender is its queue, and a queue's wiring carries flow
-// (plan 2c, I-1, M-2, M-3) ----
+// ---- A pool's only sender is its queue, and a queue's wiring carries flow ----
 //
 // A worker pool drains the queue it consumes and nothing else: any other demand edge into it (a
 // client's route, a service's step) would make it a server that a caller waits for, with a 7-day
@@ -3418,7 +3413,7 @@ TEST_CASE("a pool consuming a frontier gets the default room: 7 days of its rate
                WithinRel(604'800.0 * 800.0, 1e-9));
 }
 
-// ---- kv_cluster: a ring of nodes, N replicas per key (plan 2c refinement 9, Task 10) ----
+// ---- kv_cluster: a ring of nodes, N replicas per key (spec §19 entry 9) ----
 //
 // Book ch. 6 (Dynamo): `nodes` machines on a consistent-hash ring, every key kept on the N
 // machines that follow its position. The graph resolves the cluster like any node of copies: its
@@ -3563,7 +3558,7 @@ TEST_CASE("Graph::build refuses a kv_cluster built in code with an impossible sh
   }
 }
 
-// ---- Search index as service sugar (plan 2c refinement 10, Task 11; book ch. 13) ----
+// ---- Search index as service sugar (spec §19 entry 10; book ch. 13) ----
 //
 // A search_index is not a new kind of behaviour: it is a service with no steps and the type's
 // numbers unless the scenario states its own (spec section 7: "read-mostly capacity"). Graph::build

@@ -10,7 +10,8 @@ reproducible. Built to practise the systems in
 *System Design Interview* (Alex Xu, vol. 1) and, at the same time, to study and teach
 C++20/23: modules, concepts, ranges, coroutines, `std::expected` and friends.
 
-Status: phase 2c (bytes, queues and workers, external sinks, sweep), the last part of phase 2.
+Status: phase 2 is done; its last part, 2c, added bytes, queues and workers, external sinks and
+the sweep. Phase 3 (faults, retries and the four node types still missing) is next.
 Clients follow rate curves (daily waves, ramps, scripted spikes, replayed points) with seeded
 Ornstein–Uhlenbeck noise, state the key popularity they ask for (Zipf or uniform) and the size
 of each op (`sizes: {stream: 50MB}`), and may give up after a `timeout`; nodes charge a per-op
@@ -24,9 +25,9 @@ key-value clusters (ring, replication and quorums), search indexes and id genera
 a failed step does not run, refused, dropped and timed-out requests are counted apart
 (`reject_rate`, `drop_rate`, `timed_out_per_s`), and an SLO can be checked per window (`over: 1h`).
 `simsys sweep` runs a scenario over a range of one key, the points in parallel. Ten scenarios run
-end to end, five of the eight book systems among them (list below); chat-system, google-drive,
+end to end, four of the eight book systems among them (list below); chat-system, google-drive,
 notification-system and web-crawler validate and `explain`, and wait for phase 3's types
-(`ws_gateway`, `service_discovery`, `notification_fanout`, `frontier`). 1137 tests (Catch2, via
+(`ws_gateway`, `service_discovery`, `notification_fanout`, `frontier`). 1158 tests (Catch2, via
 `ctest`). The scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.4).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
@@ -64,9 +65,9 @@ a request waiting in a queue is answered later), the part that came back after t
 carry `answered_per_s` beside `offered_per_s` too, and `timed_out_per_s`: the requests the
 client gave up on (0 without a `timeout`; `run`'s table shows them as `timed out/s`); a client's
 percentile at q is read off the fit to every request the path delivered, before the timeout cut
-it (the fit that decided which requests timed out, so its fastest q are all answered), and never
-exceeds the timeout, and one more than whose share timed out (more than 1 % for a p99) is the
-timeout itself (`>1s` in the table), which fails a latency SLO whatever its `max`.
+it (the fit that decided which requests timed out, so its fastest q are all answered), capped at
+the timeout; when more than 1 − q of them timed out (more than 1 % for a p99) the percentile is
+the timeout itself (`>1s` in the table), which fails a latency SLO whatever its `max`.
 Exit codes: 0 every SLO passed, 2 an SLO failed, 1 an error.
 Colour is on when stdout is a terminal; `--no-color` turns it off and JSON never has it.
 `run --seed N` replaces the scenario's `seed`, which seeds every client's `rate.noise`

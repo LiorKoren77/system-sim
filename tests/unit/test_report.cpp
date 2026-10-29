@@ -272,7 +272,7 @@ TEST_CASE("SLOs pass, fail or are skipped when the metric is not available", "[r
   REQUIRE(results[1].status == SloStatus::pass);
   REQUIRE(results[2].status == SloStatus::fail);  // rho 0.5 > 0.3
   // queue_lag names a service, which has no queue lag: nothing to observe, so it is skipped (the
-  // loader refuses such a file: "slo: queue_lag needs a message_queue node", plan 2c Task 8).
+  // loader refuses such a file: "slo: queue_lag needs a message_queue node").
   REQUIRE(results[3].status == SloStatus::skipped);
   REQUIRE_FALSE(results[3].observed.has_value());
   REQUIRE(simsys::report::all_pass(results) == false);
@@ -384,10 +384,9 @@ TEST_CASE("explain says when a loop of gain >= 1 has no steady state", "[report]
   REQUIRE(text.ends_with("  (no steady state: a loop of gain >= 1)\n"));
 }
 
-// The loop's totals grow every pass until they overflow, so the last finite pass printed
-// "peak offered 5.618e+307/s" (review of plan 2c Task 7, minor 6): a number no reader can use.
-// Every node whose load was still growing when the passes stopped is "unbounded" instead: a and b
-// here, both on the loop.
+// The loop's totals grow every pass until they overflow, so the last finite pass printed "peak
+// offered 5.618e+307/s": a number no reader can use. Every node whose load was still growing when
+// the passes stopped is "unbounded" instead: a and b here, both on the loop.
 TEST_CASE("explain prints the nodes of a loop of gain >= 1 as unbounded, not as a huge number",
           "[report]") {
   const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(loop(2.0)));
@@ -402,8 +401,8 @@ TEST_CASE("explain prints the nodes of a loop of gain >= 1 as unbounded, not as 
 }
 
 // A bandwidth link out of such a loop carries what its sender sends, which has no figure either
-// (review of plan 2c Task 8, minor 1: its line printed "8.988e+307 MB/s"). a sends b `job`s of
-// 1 MB over 1 GB/s; the line says unbounded, as the nodes' do.
+// (its line printed "8.988e+307 MB/s"). a sends b `job`s of 1 MB over 1 GB/s; the line says
+// unbounded, as the nodes' do.
 TEST_CASE("explain prints a bandwidth link fed by a loop of gain >= 1 as unbounded", "[report]") {
   auto s = loop(2.0);
   s.nodes[1].ops.at("msg").front().size = simsys::Bytes{1e6};
@@ -417,9 +416,9 @@ TEST_CASE("explain prints a bandwidth link fed by a loop of gain >= 1 as unbound
 
 // A loop of gain 0.9999 has a fixed point, a = 100 / (1 - 0.9999) = 1M/s, but the passes reach it
 // only after about log(1e-12) / log(0.9999) = 276,000 laps, beyond the 100,000-pass cap. Its
-// increments still shrink by 0.9999 a pass, so the paper load sums the rest of the geometric
-// series instead of calling the loop unbounded (review of plan 2c Task 8, minor 2): a is offered
-// 1M/s, b 0.9999 x that, and no "no steady state" note.
+// increments still shrink by 0.9999 a pass, so the paper load sums the rest of the geometric series
+// instead of calling the loop unbounded: a is offered 1M/s, b 0.9999 x that, and no "no steady
+// state" note.
 TEST_CASE("explain sums a slowly converging loop to its fixed point rather than call it unbounded",
           "[report]") {
   const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(loop(0.9999)));
@@ -516,20 +515,20 @@ TEST_CASE("the series writer emits rejected_per_s", "[report]") {
   std::string field;
   std::istringstream cells{line};
   while (std::getline(cells, field, ',')) fields.push_back(field);
-  // eleven cells: demand_per_s and drain_per_s after node (plan 2b ref. 7), queue_lag_s last (plan
-  // 2c Task 8). getline drops the last one, which is empty on a limiter's row, so the comma count
-  // is what says there are eleven.
+  // eleven cells: demand_per_s and drain_per_s after node (spec §18 entry 13), queue_lag_s last.
+  // getline drops the last one, which is empty on a limiter's row, so the comma count is what says
+  // there are eleven.
   REQUIRE(std::ranges::count(line, ',') == 10);
   REQUIRE(fields.size() == 10);
   REQUIRE(fields[6] == "0");     // drops_per_s
   REQUIRE(fields[7] == "3000");  // rejected_per_s
 }
 
-// Plan 2a refinement 8: a request that was rejected or dropped is not answered and sees no
-// latency, so the client's latency moments are weighted by the requests ANSWERED in each
-// step, not by those offered. Two steps of 100 offered: the first answers all of them in
-// 1 ms, the second none (a 100 ms latency nobody experienced); the mean is 1 ms, where an
-// offered-weighted mean would report (1 + 100) / 2 = 50.5 ms.
+// Spec §17 entry 8: a request that was rejected or dropped is not answered and sees no latency, so
+// the client's latency moments are weighted by the requests ANSWERED in each step, not by those
+// offered. Two steps of 100 offered: the first answers all of them in 1 ms, the second none (a 100
+// ms latency nobody experienced); the mean is 1 ms, where an offered-weighted mean would report (1
+// + 100) / 2 = 50.5 ms.
 TEST_CASE("op latency is weighted by the requests answered, not offered", "[report]") {
   const auto s = mm1(500);
   const auto g = *simsys::graph::Graph::build(s);
@@ -820,10 +819,10 @@ TEST_CASE("explain annotates checks that count an unknown hit ratio as zero", "[
   REQUIRE_FALSE(resolved.contains("hit ratio unknown"));
 }
 
-// The other road to an unknown h: a cache built in code with no hit ratio (the loader requires
-// one; the engine refuses to run it). A service's `on: miss` step after it is taken by every
-// request on paper, so the database behind the step is an upper bound too, and says so (review
-// of 4d539b0, M5: the CDN case above goes through the origin edge, not a service's miss step).
+// The other road to an unknown h: a cache built in code with no hit ratio (the loader requires one;
+// the engine refuses to run it). A service's `on: miss` step after it is taken by every request on
+// paper, so the database behind the step is an upper bound too, and says so (the CDN case above
+// goes through the origin edge, not a service's miss step).
 TEST_CASE("explain marks the target of a miss step after a cache with no hit ratio", "[report]") {
   auto s = che_cached();
   s.nodes[2].hit_ratio = std::nullopt;
@@ -980,7 +979,7 @@ TEST_CASE("explain writes a key space beyond the G prefix in plain digits", "[re
   REQUIRE(text.contains(" (che: uniform over 20000000000000 keys from u)"));
 }
 
-// ---- SQL database: staleness SLO and explain line (plan 2b, Task 4) ----
+// ---- SQL database: staleness SLO and explain line (spec §18 entry 6) ----
 
 namespace {
 // u(1000 reads/s + 100 writes/s) -> db: a SQL database of 3 copies (1 primary + 2 replicas),
@@ -1059,15 +1058,14 @@ TEST_CASE("the staleness SLO compares the replication lag plus write sojourn wit
   }
 }
 
-// A replica that cannot keep up with the writes it replays falls behind without bound: a real
-// one keeps the excess in its relay log (MySQL) or WAL (Postgres) and its lag grows until it is
+// A replica that cannot keep up with the writes it replays falls behind without bound: a real one
+// keeps the excess in its relay log (MySQL) or WAL (Postgres) and its lag grows until it is
 // rebuilt; the model drops the excess at queue_limit, so its staleness stays finite. No staleness
-// bound holds either way (review of 48d4d0b, C1; re-review of 96848f0). 2 copies, 800 reads/s +
-// 400 writes/s at 1000/s per copy: the primary commits all 400 writes (rho 0.4); the replica is
-// sent 1200/s, fills its queue by 5 s and then drops 200/s in its queue's mix, a third of it
-// (66.67/s) replicated writes, 66.67 / 400 = 16.7 % of the committed writes. The staleness SLO
-// fails on them whatever the mean staleness (here within its 10 s bound), and says why; the
-// table and the JSON carry both numbers.
+// bound holds either way. 2 copies, 800 reads/s + 400 writes/s at 1000/s per copy: the primary
+// commits all 400 writes (rho 0.4); the replica is sent 1200/s, fills its queue by 5 s and then
+// drops 200/s in its queue's mix, a third of it (66.67/s) replicated writes, 66.67 / 400 = 16.7 %
+// of the committed writes. The staleness SLO fails on them whatever the mean staleness (here within
+// its 10 s bound), and says why; the table and the JSON carry both numbers.
 TEST_CASE("the staleness SLO fails when a replica drops replicated writes", "[report]") {
   auto s = replicated_db();
   s.duration = 10s;
@@ -1099,13 +1097,13 @@ TEST_CASE("the staleness SLO fails when a replica drops replicated writes", "[re
   REQUIRE(json.contains("\"note\": \"" + note + "\""));
 }
 
-// The missed writes are ONE replica's, against the writes ONE replica must replay (re-review of
-// 96848f0): summed over replicas they exceeded the writes committed (2131/s "dropped" of 900/s).
-// 6 copies (a primary and 5 replicas), 5000 reads/s + 900 writes/s at cost 1, 1000/s per copy:
-// the primary commits all 900 writes (rho 0.9); each replica is sent 5000 / 5 = 1000 reads + 900
-// replayed writes = 1900/s against 1000/s and drops 900/s in its queue's mix, 900 × 900/1900 =
-// 426.3/s of them replicated writes: 47.4 % of the 900/s committed. (The five together: 2132/s.)
-// The replication section shows both numbers per replica and per shard.
+// The missed writes are ONE replica's, against the writes ONE replica must replay: summed over
+// replicas they exceeded the writes committed (2131/s "dropped" of 900/s). 6 copies (a primary and
+// 5 replicas), 5000 reads/s + 900 writes/s at cost 1, 1000/s per copy: the primary commits all 900
+// writes (rho 0.9); each replica is sent 5000 / 5 = 1000 reads + 900 replayed writes = 1900/s
+// against 1000/s and drops 900/s in its queue's mix, 900 × 900/1900 = 426.3/s of them replicated
+// writes: 47.4 % of the 900/s committed. (The five together: 2132/s.) The replication section shows
+// both numbers per replica and per shard.
 TEST_CASE("the staleness note counts one replica's missed writes against the committed writes",
           "[report]") {
   auto s = replicated_db();
@@ -1130,9 +1128,9 @@ TEST_CASE("the staleness note counts one replica's missed writes against the com
   REQUIRE(table.contains("missed writes/s per replica"));
 }
 
-// Shards × replicas (review of 48d4d0b): explain's total counts N × S copies, 3 × 2 of 1k/s, and
-// its per-copy split divides each load by the shards: one primary is sent 100 / 2 = 50 writes/s,
-// one replica 1000 / (2 × 2) + 100 / 2 = 300/s.
+// Shards × replicas: explain's total counts N × S copies, 3 × 2 of 1k/s, and its per-copy split
+// divides each load by the shards: one primary is sent 100 / 2 = 50 writes/s, one replica 1000 / (2
+// × 2) + 100 / 2 = 300/s.
 TEST_CASE("explain counts every copy of every shard and splits the load per copy", "[report]") {
   auto s = replicated_db();
   s.nodes[1].shards = 2;
@@ -1144,9 +1142,9 @@ TEST_CASE("explain counts every copy of every shard and splits the load per copy
                     "(30%, green)"));
 }
 
-// The database driver, not the balancer, decides where a query goes (writes to the primary,
-// reads to a replica), so a hash ring in front of a database imposes no hot copy: explain
-// splits its load like any database's and has no hottest-copy line (review of 48d4d0b, I1).
+// The database driver, not the balancer, decides where a query goes (writes to the primary, reads
+// to a replica), so a hash ring in front of a database imposes no hot copy: explain splits its load
+// like any database's and has no hottest-copy line.
 TEST_CASE("a hash ring in front of a database leaves its copies even in explain", "[report]") {
   auto s = replicated_db();
   s.nodes.push_back(NodeSpec{.id = "ring",
@@ -1211,11 +1209,10 @@ TEST_CASE("explain shows the throughput a small pool allows", "[report]") {
 
 // A database's write op costs 5 capacity units unless `cost` lists it (spec §6: one SQL machine
 // does "5k reads" or "1k writes" per second), and a default that changes the load fivefold must be
-// visible: explain prints each defaulted write op that reaches the database with its cost and
-// where the 5 comes from, beside the costs the scenario states (re-review of 96848f0). The
-// check's per-copy numbers are then capacity units, not requests, and say so: 1000 reads/s and
-// 100 writes/s × 5 = 500 units/s; the primary carries 500, each of the 2 replicas
-// 1000 / 2 + 500 = 1000 units/s against 1k/s.
+// visible: explain prints each defaulted write op that reaches the database with its cost and where
+// the 5 comes from, beside the costs the scenario states. The check's per-copy numbers are then
+// capacity units, not requests, and say so: 1000 reads/s and 100 writes/s × 5 = 500 units/s; the
+// primary carries 500, each of the 2 replicas 1000 / 2 + 500 = 1000 units/s against 1k/s.
 TEST_CASE("explain prints a database's defaulted write cost and labels its checks in units",
           "[report]") {
   auto s = replicated_db();
@@ -1269,14 +1266,14 @@ TEST_CASE("explain prints a sql database as primary plus replicas with shards, l
   REQUIRE(text.find("pool=32") != std::string::npos);
 }
 
-// ---- Request-based CDN (plan 2b refinement 4, Task 5) ----
+// ---- Request-based CDN (spec §18 entry 10) ----
 
 namespace {
 // u(1k/s, the given ops: `read` by default) -> `cdn_id` (a CDN, fixed hit ratio 0.95, origin
 // `origin`) -> origin (a service of 5k/s). The CDN has the given byte capacity when one is passed.
-// Every op is 1 MB, the object size 2b assumed: a byte-sized node refuses an unsized request
-// (plan 2c refinement 1), and at that size one request is one unit of a node counting megabytes
-// (plan 2c refinement 2), so the numbers below read the same in requests and in MB.
+// Every op is 1 MB, the object size 2b assumed: a byte-sized node refuses an unsized request (spec
+// §19 entry 1), and at that size one request is one unit of a node counting megabytes (spec §19
+// entry 2), so the numbers below read the same in requests and in MB.
 Scenario cdn_reported(std::string cdn_id = "cdn", std::optional<simsys::ByteRate> bytes = {},
                       std::vector<std::pair<std::string, double>> ops = {{"read", 1.0}}) {
   Scenario s{.name = "cdn-report", .version = 1, .duration = 1min};
@@ -1321,8 +1318,8 @@ TEST_CASE("explain's paper load sends the origin the cdn's miss share", "[report
 }
 
 // A CDN sized in bytes (`capacity: 100GB/s`) builds and explains with its hit ratio and its miss
-// edge, as one sized in requests does; it counts megabytes (plan 2c refinement 2), which the
-// checks below pin.
+// edge, as one sized in requests does; it counts megabytes (spec §19 entry 2), which the checks
+// below pin.
 TEST_CASE("explain still renders a cdn that has a byte capacity", "[report]") {
   const auto built = simsys::graph::Graph::build(cdn_reported("cdn_us", simsys::ByteRate{100e9}));
   INFO((built ? "" : built.error().message));
@@ -1334,7 +1331,7 @@ TEST_CASE("explain still renders a cdn that has a byte capacity", "[report]") {
   REQUIRE(text.contains("misses → origin"));
 }
 
-// ---- kv_cluster's check line and node line (plan 2c refinement 9, Task 10; book ch. 6) ----
+// ---- kv_cluster's check line and node line (spec §19 entry 9; book ch. 6) ----
 //
 // A kv_cluster is `nodes` machines of `capacity` each, every request going to N of them, so the
 // paper load it is offered is N times the requests, and its total capacity `nodes` times one
@@ -1388,9 +1385,9 @@ TEST_CASE("explain checks sixteen kv nodes at 30k requests a second: the hottest
                         "(hottest 60.9%, green)"));
 }
 
-// A paper load far beyond capacity prints its percentage in full, not in exponent notation
-// (review of plan 2c Tasks 9-10, minor 11): 1M requests/s x 3 over 3 x 10k = 30k/s is 10000 %,
-// which three significant digits used to print as "1e+04%".
+// A paper load far beyond capacity prints its percentage in full, not in exponent notation: 1M
+// requests/s x 3 over 3 x 10k = 30k/s is 10000 %, which three significant digits used to print as
+// "1e+04%".
 TEST_CASE("explain prints a percentage beyond a thousand in full", "[report]") {
   const auto text = explain_of(kv_explained(3, 1'000'000));
   CAPTURE(text);
@@ -1409,9 +1406,9 @@ TEST_CASE("explain gives a kv_cluster that replicates to every node a plain perc
   REQUIRE_FALSE(line.contains("hottest"));
 }
 
-// The node line prints the resolved shape and what it does not yet model. Defaults applied
-// (N = 3, W = 2, R = 2, ap: Dynamo's classic quorum, ch. 6), each marked "(default)" as explain
-// marks every number the scenario did not state (review of plan 2c Tasks 9-10, minor 9).
+// The node line prints the resolved shape and what it does not yet model. Defaults applied (N = 3,
+// W = 2, R = 2, ap: Dynamo's classic quorum, ch. 6), each marked "(default)" as explain marks every
+// number the scenario did not state.
 TEST_CASE("explain prints a kv_cluster's nodes, replication, quorums and mode", "[report]") {
   SECTION("defaults for everything but the nodes") {
     const auto text = explain_of(kv_explained(3, 1000));
@@ -1435,8 +1432,8 @@ TEST_CASE("explain prints a kv_cluster's nodes, replication, quorums and mode", 
 // W + R > N is what makes a quorum read see the latest write (ch. 6: a read quorum and a write
 // quorum must share a replica). explain says when a scenario's quorums do not overlap, and that
 // `mode: cp` (consistency over availability) asks for exactly that overlap, so cp with W + R <= N
-// contradicts itself (review of plan 2c Tasks 9-10, minor 6). Nothing is modelled about it: the
-// model has no versions of a key, only the time and the loss of a quorum.
+// contradicts itself. Nothing is modelled about it: the model has no versions of a key, only the
+// time and the loss of a quorum.
 TEST_CASE("explain warns when the read and write quorums do not overlap", "[report]") {
   auto s = kv_explained(3, 1000);
   s.nodes[1].replication = 3;
@@ -1467,11 +1464,11 @@ TEST_CASE("explain warns when the read and write quorums do not overlap", "[repo
   }
 }
 
-// Plan 2c refinement 2: a capacity stated in bytes is checked in bytes. The node counts
-// megabytes, so its load is the requests' size summed, and the check line prints it in MB/s with
-// the request rate beside it: 1k reads/s of 1 MB at a 100 GB/s cdn are 1k MB/s (1k/s) against
-// 100k MB/s, 1 %; its 5 % misses, 50/s of 1 MB, are 50 MB/s at a blob store's default 500 MB/s
-// (spec section 6), 10 %. The verdict is a real one (a zone), and nothing says "not checked".
+// Spec §19 entry 2: a capacity stated in bytes is checked in bytes. The node counts megabytes, so
+// its load is the requests' size summed, and the check line prints it in MB/s with the request rate
+// beside it: 1k reads/s of 1 MB at a 100 GB/s cdn are 1k MB/s (1k/s) against 100k MB/s, 1 %; its 5
+// % misses, 50/s of 1 MB, are 50 MB/s at a blob store's default 500 MB/s (spec section 6), 10 %.
+// The verdict is a real one (a zone), and nothing says "not checked".
 TEST_CASE("explain checks a capacity stated in bytes in MB per second", "[report]") {
   SECTION("a cdn sized in bytes") {
     const auto text = explain_of(cdn_reported("cdn_us", simsys::ByteRate{100e9}));
@@ -1510,8 +1507,8 @@ TEST_CASE("explain checks a capacity stated in bytes in MB per second", "[report
 
 // A CDN caches every op that reaches it and is not one of its write ops (model::write_ops_of:
 // `write` unless the scenario lists its own `write_ops`). An `upload` a scenario forgot to declare
-// a write would be answered from the edge for the hit share of it, so explain lists the ops the
-// CDN serves from its cache: the slip is in plain sight (review of 4d539b0, I2).
+// a write would be answered from the edge for the hit share of it, so explain lists the ops the CDN
+// serves from its cache: the slip is in plain sight.
 TEST_CASE("explain lists the ops a cdn serves from its cache", "[report]") {
   const auto text = explain_of(cdn_reported("cdn", {}, {{"read", 0.8}, {"upload", 0.2}}));
   CAPTURE(text);
@@ -1519,8 +1516,8 @@ TEST_CASE("explain lists the ops a cdn serves from its cache", "[report]") {
 }
 
 // A CDN the scenario gave no hit ratio misses every read, and that is what runs (h = 0 is the
-// scenario's statement, not a number nobody knows): its line says so, and the origin's check is
-// a plain check, not an upper bound (review of 4d539b0, M4).
+// scenario's statement, not a number nobody knows): its line says so, and the origin's check is a
+// plain check, not an upper bound.
 TEST_CASE("a cdn without a hit ratio is explained as h = 0, not as unknown", "[report]") {
   auto s = cdn_reported();
   s.nodes[1].hit_ratio = std::nullopt;
@@ -1532,7 +1529,7 @@ TEST_CASE("a cdn without a hit ratio is explained as h = 0, not as unknown", "[r
   REQUIRE_FALSE(origin.contains("unknown"));
 }
 
-// ---- ID generator as service sugar (plan 2b refinement 6; book ch. 7) ----
+// ---- ID generator as service sugar (spec §18 entry 12; book ch. 7) ----
 //
 // explain prints the algorithm and what it stands for, so a student sees WHY the node has the
 // capacity it has: a snowflake's 12 sequence bits, a ticket server's single database.
@@ -1563,7 +1560,7 @@ TEST_CASE("explain says what a snowflake generator stands for", "[report]") {
   const auto line = node_line(text, "ids");
   REQUIRE(line.contains("algorithm=snowflake (4.096M/s per replica by design)"));
   // The algorithm supplied these numbers, the scenario did not, and the tag says so: not
-  // "(default)", which elsewhere means the node TYPE's number (review of 3adc555, M5).
+  // "(default)", which elsewhere means the node TYPE's number.
   REQUIRE(line.contains("capacity=4.096M/s (algorithm)"));
   REQUIRE(line.contains("service_time=10us (algorithm)"));
 }
@@ -1593,8 +1590,8 @@ TEST_CASE("explain tags a capacity the scenario stated on an id generator as sce
   CAPTURE(text);
   const auto line = node_line(text, "ids");
   REQUIRE(line.contains("capacity=8k/s (scenario)"));
-  // Beside a stated capacity the algorithm's own rate is the default it overrides, and the
-  // wording says so rather than reading as a second capacity (review of 3adc555, M5).
+  // Beside a stated capacity the algorithm's own rate is the default it overrides, and the wording
+  // says so rather than reading as a second capacity.
   REQUIRE(line.contains("algorithm=ticket_server (one database; default 1k/s, spec §6 writes)"));
   // The service time was not stated: the algorithm's 1 ms stands, tagged as the algorithm's.
   REQUIRE(line.contains("service_time=1ms (algorithm)"));
@@ -1608,7 +1605,7 @@ TEST_CASE("explain checks an id generator against its replicas' total capacity",
   REQUIRE(check_line(text, "ids").contains("peak offered 10/s vs 12.29M/s total capacity"));
 }
 
-// ---- Request sizes on byte-sized nodes (plan 2c refinement 1, Task 2) ----
+// ---- Request sizes on byte-sized nodes (spec §19 entry 1) ----
 
 namespace {
 // u (sending `stream` at 1k/s, each request `stream_size` long) -> cdn (fixed hit ratio 0.95,
@@ -1658,10 +1655,10 @@ TEST_CASE("explain prints no sizes on a node that counts requests", "[report]") 
   }
 }
 
-// A byte-sized node's `service_time` is the time of one megabyte (plan 2c refinement 2), so
-// explain says "per MB": the CDN's 10 ms is the book's "read 1 MB sequentially from the network",
-// the blob store's 40 ms the disk read (30 ms) plus the transfer (10 ms). A node that counts
-// requests has a time per request, with no unit after it.
+// A byte-sized node's `service_time` is the time of one megabyte (spec §19 entry 2), so explain
+// says "per MB": the CDN's 10 ms is the book's "read 1 MB sequentially from the network", the blob
+// store's 40 ms the disk read (30 ms) plus the transfer (10 ms). A node that counts requests has a
+// time per request, with no unit after it.
 TEST_CASE("explain prints a byte-sized node's service time per megabyte", "[report]") {
   auto s = cdn_reported("cdn_us", simsys::ByteRate{100e9});
   s.nodes[2] = NodeSpec{.id = "origin", .type = NodeType::blob_store};
@@ -1675,12 +1672,11 @@ TEST_CASE("explain prints a byte-sized node's service time per megabyte", "[repo
 
 // A byte-sized node's capacity units are megabytes, so its waiting room is too, and its c servers
 // are slots that each hold one object for its whole transfer (Little's law: c = MB/s x the time of
-// one MB; review of plan 2c Task 3, I1, and of its fix round, M4). explain labels both:
-// `c=1000 slots (1 object each) (implied)` on a 100 GB/s CDN at 10 ms per MB, `c=20 slots (1 object
-// each)` on a default blob store (500 MB/s x 40 ms), and `queue_limit=1000 MB (default)`, the
-// generic waiting room of 1000 units read in MB. A transfer of a fixed size at a fixed rate is
-// deterministic (second fix round, I2), so the per-object variability is 0 there. A node that
-// counts requests keeps its bare numbers.
+// one MB). explain labels both: `c=1000 slots (1 object each) (implied)` on a 100 GB/s CDN at 10 ms
+// per MB, `c=20 slots (1 object each)` on a default blob store (500 MB/s x 40 ms), and
+// `queue_limit=1000 MB (default)`, the generic waiting room of 1000 units read in MB. A transfer of
+// a fixed size at a fixed rate is deterministic, so the per-object variability is 0 there. A node
+// that counts requests keeps its bare numbers.
 TEST_CASE("explain labels a byte-sized node's c in object slots and queue_limit in megabytes",
           "[report]") {
   auto s = cdn_reported("cdn_us", simsys::ByteRate{100e9});
@@ -1715,10 +1711,10 @@ Scenario blob_store_reported(const std::string& op,
 }
 }  // namespace
 
-// A blob store answers its writes at their last byte and everything else at its first megabyte
-// (review of plan 2c Task 3, I2), so explain says which ops are its writes, as it does for a
-// cache: the scenario's `write_ops`, else the default `write`, with a note when none of them
-// reaches the store (an upload not listed would be answered as a read).
+// A blob store answers its writes at their last byte and everything else at its first megabyte, so
+// explain says which ops are its writes, as it does for a cache: the scenario's `write_ops`, else
+// the default `write`, with a note when none of them reaches the store (an upload not listed would
+// be answered as a read).
 TEST_CASE("explain lists a blob store's write ops", "[report]") {
   const auto stated = explain_of(blob_store_reported("upload", std::vector<std::string>{"upload"}));
   CAPTURE(stated);
@@ -1729,7 +1725,7 @@ TEST_CASE("explain lists a blob store's write ops", "[report]") {
   REQUIRE(node_line(defaulted, "store").contains("write_ops=write (never arrives)"));
 }
 
-// ---- A link's bandwidth is a pipe: what the reports say about it (plan 2c Task 5) ----
+// ---- A link's bandwidth is a pipe: what the reports say about it ----
 //
 // A link with a bandwidth is a queue of megabytes, so it gets a row of its own, named after the
 // link, `from->to`, wherever a node does: the summary table, the JSON `links`, the CSV series
@@ -1879,7 +1875,7 @@ TEST_CASE("explain checks a bandwidth link's peak offered MB per second against 
   }
 }
 
-// Two marks on a pipe's check that the node lines carry too (review of Task 6, M-3):
+// Two marks on a pipe's check that the node lines carry too:
 //  - behind a che CDN with no `keys` size (no hit ratio to resolve, so every read counts as a miss
 //    on paper) the pipe to its origin is checked against its worst case, and says so: 10 streams/s
 //    of 50 MB, all of them missing, are 500 MB/s of 5k MB/s, 10 %, an upper bound;
@@ -1928,12 +1924,12 @@ TEST_CASE("a pipe that a blocking type sends nothing on paper has no percentage"
   REQUIRE_FALSE(line.contains("%"));
 }
 
-// ---- Message queues and worker pools in explain (plan 2c refinements 4-5, Task 6) ----
+// ---- Message queues and worker pools in explain (spec §19 entries 4-5) ----
 //
 // explain says what the two types stand for, in the words of the plan:
 //  - a worker pool: `capacity=1.2k/s (workers / cost)` and `consumes=q  workers=12 cost=10ms`:
 //    the capacity is not a number the scenario states but 12 workers / 10 ms = 1200 jobs/s, and
-//    the line says so, once (review of Task 6, M-6: it used to repeat it after `cost=`);
+//    the line says so, once (it used to repeat it after `cost=`);
 //  - a message queue: `retention=7d (default: Kafka's 168 h)` when the scenario gives none (the
 //    book gives no figure; 168 h is Kafka's `log.retention.hours`), the stated value without the
 //    tag otherwise, and `partitions=8 (not modelled)`: accepted and printed, not simulated.
@@ -1971,10 +1967,10 @@ TEST_CASE("explain says a worker pool's capacity is workers over cost, once", "[
   REQUIRE(line.find("1.2k/s") == line.rfind("1.2k/s"));  // the capacity is stated once
 }
 
-// A pool's room is retention x its rate (graph::Graph::connect_consumer): Kafka's 7 days of
-// 1.2k jobs/s are 604,800 s x 1200/s = 725,760,000 messages, printed with an SI prefix to four
-// digits, 725.8M, rather than six digits' "7.2576e+08" (review of Task 6, M-1); a room under a
-// million keeps its digits (10 s x 1200/s = 12000).
+// A pool's room is retention x its rate (graph::Graph::connect_consumer): Kafka's 7 days of 1.2k
+// jobs/s are 604,800 s x 1200/s = 725,760,000 messages, printed with an SI prefix to four digits,
+// 725.8M, rather than six digits' "7.2576e+08"; a room under a million keeps its digits (10 s x
+// 1200/s = 12000).
 TEST_CASE("explain prints a pool's room of millions with an SI prefix", "[report]") {
   const auto days = explain_of(queue_and_pool_reported(std::nullopt, std::nullopt));
   CAPTURE(days);
@@ -1985,9 +1981,8 @@ TEST_CASE("explain prints a pool's room of millions with an SI prefix", "[report
 }
 
 // Six significant digits round a room in [999,999.5, 1e6) up to a million, which they print as
-// "1e+06" (review of plan 2c Task 7, minor 8): such a room is printed as the million it rounds to,
-// "1M", and the room just below keeps its six digits. 833.3333 s x 1200/s = 999,999.96 messages;
-// 833.332 s x 1200/s = 999,998.4.
+// "1e+06": such a room is printed as the million it rounds to, "1M", and the room just below keeps
+// its six digits. 833.3333 s x 1200/s = 999,999.96 messages; 833.332 s x 1200/s = 999,998.4.
 TEST_CASE("explain prints a room that rounds to a million as 1M, not 1e+06", "[report]") {
   using namespace std::chrono_literals;
   const auto rounds_up = explain_of(queue_and_pool_reported(833'333'300us, std::nullopt));
@@ -2017,12 +2012,12 @@ TEST_CASE("explain prints a stated retention without the default tag", "[report]
   REQUIRE_FALSE(line.contains("Kafka"));
 }
 
-// ---- explain's paper load follows queues and pools (plan 2c Task 7) ----
+// ---- explain's paper load follows queues and pools ----
 //
-// The paper load is the peak offered load, forwarded along the graph with no queueing. Since
-// Task 7 it follows a message queue into its consumers and a worker pool's `then` steps (each job
-// it is OFFERED: the paper load does not queue, so a pool offered more than its capacity still
-// passes all of it on), instead of marking everything behind them "load not propagated".
+// The paper load is the peak offered load, forwarded along the graph with no queueing. It follows a
+// message queue into its consumers and a worker pool's `then` steps (each job it is OFFERED: the
+// paper load does not queue, so a pool offered more than its capacity still passes all of it on),
+// instead of marking everything behind them "load not propagated".
 //
 // Picture: u sends `rate`/s of `publish` to q; pool w (12 workers at 10 ms = 1.2k jobs/s) drains
 // q and, per job, sends 4 `work` requests to svc (a 10k/s service) and one `publish` to done_q,
@@ -2077,9 +2072,9 @@ TEST_CASE("explain follows a queue into its pool and the pool's then steps into 
 }
 
 // 2000/s into a pool of 1.2k/s: 2000 / 1200 = 167 %, red. The paper load does not queue, so the
-// pool is offered, and passes on, all 2000 jobs/s: svc is offered 2000 x 4 = 8000/s of 10k/s
-// (80 %), done_q 2000/s and w2 2000/s of 2k/s (100 %). (What the engine sends on is what the pool
-// drained, 1.2k/s: Task 7's theory tests. Explain is the no-queue bound, "can this ever fit".)
+// pool is offered, and passes on, all 2000 jobs/s: svc is offered 2000 x 4 = 8000/s of 10k/s (80
+// %), done_q 2000/s and w2 2000/s of 2k/s (100 %). (What the engine sends on is what the pool
+// drained, "can this ever fit".)
 TEST_CASE("explain passes a saturated pool's whole arrival on: the paper load does not queue",
           "[report]") {
   const auto text = explain_of(queue_pool_chain(2000));
@@ -2114,7 +2109,7 @@ TEST_CASE("a node behind a notification fan-out and a queue and pool is marked b
   }
 }
 
-// ---- Queue lag: the queue_lag SLO and its columns (plan 2c refinement 4 and 14, Task 8) ----
+// ---- Queue lag: the queue_lag SLO and its columns (spec §19 entries 4 and 14) ----
 //
 // A message queue's lag is how far its slowest consumer group trails it: max(backlog / drain,
 // k x Wq) of the group's pool (see the theory tests for the formula). The queue_lag SLO bounds
@@ -2311,11 +2306,11 @@ TEST_CASE("the node table has a peak_lag column holding the queue's peak lag", "
   REQUIRE(queue_row[at] == "50s");
 }
 
-// A group that is almost never busy waits a vanishing time: 1 message/s into the 12 workers of
-// 1200 jobs/s is rho 1/1200, and Erlang C's chance that all 12 are busy is about 1e-33, so the lag
-// is a tiny fraction of a nanosecond. The node table and the SLO line print it as "<1us" rather
-// than such a figure (review of plan 2c Task 8, minor 6: youtube's completion_q printed
-// "0.0632ns"); the summary, the JSON and the CSV keep the number.
+// A group that is almost never busy waits a vanishing time: 1 message/s into the 12 workers of 1200
+// jobs/s is rho 1/1200, and Erlang C's chance that all 12 are busy is about 1e-33, so the lag is a
+// tiny fraction of a nanosecond. The node table and the SLO line print it as "<1us" rather than
+// such a figure (youtube's completion_q printed "0.0632ns"); the summary, the JSON and the CSV keep
+// the number.
 TEST_CASE("a queue lag below a microsecond prints as under one microsecond", "[report]") {
   Scenario s{.name = "quiet", .version = 1, .duration = 10s};
   add_lane(s, "", false);
@@ -2352,7 +2347,7 @@ TEST_CASE("the JSON nodes carry peak_queue_lag_s: the queue's peak, null on ever
   REQUIRE(nulls == 2);  // u and w; q's is the number
 }
 
-// ---- External sinks in explain (plan 2c refinement 8, Task 9) ----
+// ---- External sinks in explain (spec §19 entry 8) ----
 //
 // explain says what the two keys of an external sink mean for the model:
 //  - `failure_rate=2%`: the share of what the sink serves that fails (a 5xx), which the engine
@@ -2388,8 +2383,7 @@ TEST_CASE("explain prints a sink's failure rate as a percentage and its politene
 }
 
 // A sink that fails everything it serves answers nobody: there is no latency to report, and the op
-// table prints `-` rather than the sojourn of requests that all failed (review of plan 2c Tasks
-// 9-10, minor 8).
+// table prints `-` rather than the sojourn of requests that all failed.
 TEST_CASE("the op table prints no latency for an op nobody answered", "[report]") {
   const auto s = sink_reported(1.0, std::nullopt);
   const auto g = *simsys::graph::Graph::build(s);
@@ -2404,8 +2398,8 @@ TEST_CASE("the op table prints no latency for an op nobody answered", "[report]"
 }
 
 // The same op in the JSON: its moments describe requests that all failed, so they are null, as for
-// an op whose requests all timed out (plan 2c Task 13's review) and an infinite latency (review of
-// plan 2c Task 11, minor 4: the JSON said mean 0.1005 s, p99 0.662 s).
+// an op whose requests all timed out and an infinite latency (the JSON said mean 0.1005 s, p99
+// 0.662 s).
 TEST_CASE("the JSON gives an op nobody answered null latencies", "[report]") {
   const auto s = sink_reported(1.0, std::nullopt);
   const auto g = *simsys::graph::Graph::build(s);
@@ -2417,7 +2411,7 @@ TEST_CASE("the JSON gives an op nobody answered null latencies", "[report]") {
 }
 
 // A latency SLO has nothing to observe on an op nobody answered: it is skipped, not judged on the
-// failed requests' sojourn, and its note says why (review of plan 2c Task 11, minor 4).
+// failed requests' sojourn, and its note says why.
 TEST_CASE("a latency SLO on an op nobody answered is skipped and says nobody answered it",
           "[report]") {
   const auto s = sink_reported(1.0, std::nullopt);
@@ -2433,9 +2427,9 @@ TEST_CASE("a latency SLO on an op nobody answered is skipped and says nobody ans
   REQUIRE(results[0].note == "nobody answered u.send: no latency to observe");
 }
 
-// An op nobody sent (the client's rate is 0) has no latency either, but nothing went wrong: the
-// SLO is skipped as a window with nothing offered is, without the "nobody answered" note, which
-// is for requests that were sent and all lost (review of the kv/search fix round, M-1).
+// An op nobody sent (the client's rate is 0) has no latency either, but nothing went wrong: the SLO
+// is skipped as a window with nothing offered is, without the "nobody answered" note, which is for
+// requests that were sent and all lost.
 TEST_CASE("a latency SLO on an op nobody sent is skipped without a note", "[report]") {
   auto s = sink_reported(0.0, std::nullopt);
   s.nodes[0].workload->curve.base = Rate{0};
@@ -2461,7 +2455,7 @@ TEST_CASE("explain prints no politeness note for a sink that states none", "[rep
   REQUIRE_FALSE(line.contains("politeness"));
 }
 
-// ---- Search index as service sugar (plan 2c refinement 10, Task 11; book ch. 13) ----
+// ---- Search index as service sugar (spec §19 entry 10; book ch. 13) ----
 //
 // A search index's `build_interval` is how often the index is rebuilt from the aggregated logs. The
 // model does not load the index with that rebuild and does not age its answers, and explain says so
@@ -2503,7 +2497,7 @@ TEST_CASE("explain prints no build_interval for a search index that states none"
   REQUIRE_FALSE(line.contains("rebuild"));
 }
 
-// ---- A client's timeout in the reports (plan 2c Task 13) ----
+// ---- A client's timeout in the reports ----
 //
 // mm1(990): one M/M/1 server at rho 0.99 answers in 100 ms on average with variance 0.01 s^2 (an
 // exponential sojourn: the standard deviation is the mean). A client `timeout` of 200 ms answers
@@ -2571,11 +2565,11 @@ TEST_CASE("an op's percentiles never exceed the client's timeout, whatever its s
   }
 }
 
-// 10.59 % of the delivered requests time out, more than the 5 % a p95 and the 1 % a p99 leave
-// above them, so the client never saw those quantiles answered: the table prints `>200ms` there
-// (review of plan 2c Task 13, I-1), not the 490 ms of the uncapped fit nor a capped number that
-// looks measured. The p50 (half of the requests) was answered: a number. The `timed out/s` column
-// shows the 104.8/s; the table has it because the client has a timeout.
+// 10.59 % of the delivered requests time out, more than the 5 % a p95 and the 1 % a p99 leave above
+// them, so the client never saw those quantiles answered: the table prints `>200ms` there, not the
+// 490 ms of the uncapped fit nor a capped number that looks measured. The p50 (half of the
+// requests) was answered: a number. The `timed out/s` column shows the 104.8/s; the table has it
+// because the client has a timeout.
 TEST_CASE("the op table prints >200ms for a p99 more than 1 percent of whose requests timed out",
           "[report]") {
   const auto s = timing_out(200ms);
@@ -2593,10 +2587,10 @@ TEST_CASE("the op table prints >200ms for a p99 more than 1 percent of whose req
 }
 
 // The p50 that was answered is the client's p50, read off the fit to every DELIVERED request's
-// latency, before the timeout cut it (comprehensive 2c review, C-1): the engine times out exactly
-// the requests that fit puts past 200 ms (10.59 % of them), so the client's fastest half are all
-// answered and its median is the fit's. The path is exponential with mean 100 ms (variance
-// 0.01 s^2: sigma^2 = ln 2, mu = ln 0.1 − sigma^2 / 2), whose fit's median is
+// latency, before the timeout cut it: the engine times out exactly the requests that fit puts past
+// 200 ms (10.59 % of them), so the client's fastest half are all answered and its median is the
+// fit's. The path is exponential with mean 100 ms (variance 0.01 s^2: sigma^2 = ln 2, mu = ln 0.1 −
+// sigma^2 / 2), whose fit's median is
 //   exp(mu) = 0.1 / sqrt(2) = 70.71 ms,
 // the untimed client's p50. The refit of the answered requests' truncated moments (73.97 ms,
 // 0.0021022 s^2) said 68.44 ms read at 0.5 / 0.894 and 62.87 ms read at 0.5.
@@ -2618,7 +2612,7 @@ TEST_CASE("the op table has no timed out column when no client has a timeout", "
   REQUIRE(words_of_line_starting(table, "c.op").size() == 6);
 }
 
-// ---- SLOs per window: what the report prints (plan 2c Task 14) ----
+// ---- SLOs per window: what the report prints ----
 //
 // An SLO with `over: <duration>` is checked on every window of that length, aligned from the end
 // of warmup, and the worst window decides (test_windows.cpp derives the numbers). The report must

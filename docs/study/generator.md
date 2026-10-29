@@ -94,7 +94,7 @@ No design pattern: just a lazy range (the comment at the declaration says so, so
   the test "samples stops cleanly when the next step would overflow the clock" pins it.
 - **GCC 14.2 and modules.** `<generator>` is included in the global module fragment of an
   interface that imports another module, which CLAUDE.md §3 forbids for `<chrono>` and
-  `<format>`. A probe before Task 4 showed `<generator>` is not affected, so `samples()`
+  `<format>`. A probe build showed `<generator>` is not affected, so `samples()`
   lives in the interface.
 
 ## Further reading

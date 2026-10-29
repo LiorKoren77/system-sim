@@ -116,7 +116,7 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `cache` | a fixed or [`che`](#che-hit-ratios) hit ratio, every strategy (`write_back` with an asynchronous flush), [`then` steps](#then-steps-on-a-cache) |
 | `sql_db` | a primary and read replicas, `shards`, `pool`, `replication_lag` and the `staleness` SLO, see [`sql_db`](#sql_db) |
 | `cdn` | a fixed or `che` hit ratio (or none: every read misses), misses fetched from its `origin`, see [`cdn`](#cdn); with a byte `capacity` it counts megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)) |
-| `blob_store` | every op, counting megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)): its queue waits for whole objects, a write (`write_ops`) is answered at its last byte, a read at its first megabyte; `then` steps as asynchronous event notifications (see [Node types](#node-types)) |
+| `blob_store` | every op, counting megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)): its queue waits for whole objects, a write (`write_ops`) is answered at its last byte, a read at its first megabyte; `then` steps as asynchronous event notifications (see [Node types](#node-types)). A store whose `capacity` is a request rate (`capacity: 1k/s`) counts **requests** instead, as a service does: unsized ops are accepted and each takes the type's 40 ms (`c=40` at 1k/s) |
 | `id_generator` | as a `service` whose capacity and service time its `algorithm` supplies, see [`id_generator`](#id_generator) |
 | `search_index` | as a `service` with no steps and the type's 5k/s and 5 ms unless stated; `build_interval` stored and printed, see [`search_index`](#search_index) (phase 2c) |
 | `message_queue` | the broker's append, every message copied to each consumer group, the publisher answered at the append (phase 2c, see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
@@ -133,8 +133,8 @@ Everything else is refused before the first step, with exit code 1:
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
 | `faults` | none: the list is accepted and nothing happens | 3 |
 
-The type message names the phase that plans the type's model, phase 3 for all four (the phase 3
-backlog of the 2c plan). The type check runs over the whole file first, and names the first node
+The type message names the phase that plans the type's model, phase 3 for all four. The type
+check runs over the whole file first, and names the first node
 in file order whose type cannot run; only then are the nodes of runnable types checked (a CDN's
 `keys`), in file order: google-drive is refused at its `ws_gateway`, `long_poll`, the first type
 it has no model of, chat-system at its `service_discovery`, notification-system at its
@@ -253,7 +253,7 @@ copy or machine): they would be lower bounds too.
 | `name` | string | yes | read | non-empty; shown in reports |
 | `seed` | integer | no | read | default 1; within the range of `int`. Printed by `explain`; seeds every client's `rate.noise` (`run --seed N` and `curve --seed N` override it). Client `i` (its index among all nodes, in file order) gets the engine seed `(seed × 0x9E3779B97F4A7C15) XOR i` mod 2^64, so appending a node at the end of the file never changes another client's noise (inserting one before a client shifts that client's index, and so its noise) |
 | `duration` | duration | yes | read | simulated span of `run`; must be positive |
-| `step` | duration | no | read | default `100ms`; must be positive. A rule of thumb (plan 2c refinement 16; the derivation and a measured lab are in [numerics, "Choosing the step"](study/numerics.md)): a step is a lump the model cannot see inside, so make it shorter than what you want to see. A token bucket of `burst` B under a peak offered rate `λ` above its `limit` L empties in `B / (λ − L)`, and a longer step passes the whole burst in its first step (a 2,000-token burst at `step: 1s` does), so `step ≤ B / (λ_peak − L)`; for a queue, `step ≤` a tenth of the shortest spike. Shorter steps cost run time, not accuracy of the totals: conservation holds at any step |
+| `step` | duration | no | read | default `100ms`; must be positive. A rule of thumb (spec §19 entry 16; the derivation and a measured lab are in [numerics, "Choosing the step"](study/numerics.md)): a step is a lump the model cannot see inside, so make it shorter than what you want to see. A token bucket of `burst` B under a peak offered rate `λ` above its `limit` L empties in `B / (λ − L)`, and a longer step passes the whole burst in its first step (a 2,000-token burst at `step: 1s` does), so `step ≤ B / (λ_peak − L)`; for a queue, `step ≤` a tenth of the shortest spike. Shorter steps cost run time, not accuracy of the totals: conservation holds at any step |
 | `warmup` | duration | no | read | steps before it are left out of the report; default 0; must be shorter than `duration`, so the report never covers an empty window (`run --duration` obeys the same rule, and leaves room for every SLO's `over`) |
 | `datacenters` | map | no | read | see below; default: one datacenter `main` |
 | `nodes` | map id → node | yes | read | non-empty; ids are non-empty and unique |
@@ -280,9 +280,9 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 |---|---|---|---|---|
 | `type` | enum | all | read | one of the catalogue below |
 | `dc` | string | all | read | a declared datacenter; default as above. Decides whether a link without `latency` is intra- or cross-DC |
-| `replicas` | integer > 0 | all | read | N identical copies: each copy sees its share of the demand with the node's full capacity, concurrency and queue limit; backlog and drops are reported summed. How the demand is shared depends on a load balancer in front ([below](#load_balancer)); without one, `demand / N` each. On a `sql_db` the copies are one primary and `N − 1` read replicas, split by op whatever stands in front (see [`sql_db`](#sql_db)); on a `ticket_server` id generator it must be 1. No effect on a client |
-| `capacity` | rate or byte rate | all but `client` | read | service rate **per replica**; default per type (§6 of the spec; 100k/s for `load_balancer`, `rate_limiter` and `cache`). A byte rate (`100GB/s`, or in bits as a network is rated: `40Gbit/s` = 5 GB/s, printed `5GB/s`) on a `cdn` or `blob_store`, and a `blob_store`'s default (spec §6's 500 MB/s), makes the node count **megabytes**: its capacity is that many MB/s, a request costs its size in MB (the client's `sizes:` or the step's `size:`), and its service time is one megabyte's (10 ms at a CDN, 40 ms at a blob store), so by Little's law it has `c = MB/s × that time` slots, each moving one object at a time: `capacity=100k MB/s (scenario)  service_time=10ms per MB (default)  c=1000 slots (1 object each) (implied)  queue_limit=1000 MB (default)  variability=0`. Each request is a **batch** of megabytes that holds one slot for its whole transfer (size × the time of one MB: a 50 MB object 2 s at a blob store), a fixed time for a fixed size (so `service_variability` defaults to **0** there: deterministic transfers), and the node's queue waits for whole objects: Erlang C is fed the mean object time `s_obj = Σ p_op × MB_op × time per MB` (`p_op` = the op's share of the requests, recomputed every step from the arrivals) with the same `c`, which leaves `rho` as in MB/s and makes the wait a whole object's, and the Allen–Cunneen factor `(burstiness + c_s²) / 2` is fed the size mix's squared coefficient of variation `c_s² = Σ p_op (1 + service_variability) s_op² / s_obj² − 1`. One size waits like M/D/c, half the M/M/c wait: at `rho` 0.9, 50 MB objects at a default blob store (20 slots) wait `0.5 × C(20, 0.9) × 2 s / (20 × 0.1)` = 0.28 s (0.55 s with `service_variability: 1`), where 1 MB units would say 11 ms; small requests beside large ones raise `c_s²` and so lengthen the large ones' wait (1000 reads/s of 2 KB beside 8 writes/s of 50 MB: 64 ms against 61 ms alone). Like every queue's, the wait is never longer than the waiting room takes to drain, `queue_limit / capacity` (1000 MB at 500 MB/s: 2 s). A request is then answered after that wait at its **last byte** if it is a write (an op in a blob store's `write_ops`, default `write`): its whole transfer, so every 300 MB upload takes at least 12 s at 25 MB/s per slot (40 ms per MB), and a client `timeout` under that cuts all of them; and at its **first megabyte** otherwise (a read or a stream, which the client consumes as it arrives; this understates a large read needed whole before use). Either way a request under 1 MB takes one megabyte's time (an upper bound for small objects: a 2 KB read holds its slot 80 µs but is answered in 40 ms). `explain` checks it in MB/s with the requests beside: `cdn_us  peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)`. A byte rate on any other type is an error, since those types count requests: `a service counts requests; a byte capacity belongs on a cdn or blob_store`. At most `1e15/s` (`1e15B/s` for a byte rate). An error on a `leaky_bucket` limiter |
-| `latency` | duration | all but `client` | read | service time of one request; default per type (50 µs for `load_balancer` and `rate_limiter`, 250 µs for `cache`: the spec's memory read). An error on a `leaky_bucket` limiter |
+| `replicas` | integer > 0 | all but `kv_cluster` and `worker_pool` (refused there: a cluster's machines are its `nodes`, a pool's more workers are more `workers`; see [`kv_cluster`](#kv_cluster) and [`worker_pool`](#message_queue-and-worker_pool)) | read | N identical copies: each copy sees its share of the demand with the node's full capacity, concurrency and queue limit; backlog and drops are reported summed. How the demand is shared depends on a load balancer in front ([below](#load_balancer)); without one, `demand / N` each. On a `sql_db` the copies are one primary and `N − 1` read replicas, split by op whatever stands in front (see [`sql_db`](#sql_db)); on a `ticket_server` id generator it must be 1. No effect on a client |
+| `capacity` | rate or byte rate | all but `client` and `worker_pool` (a pool's rate is `workers / cost`: `node 'w': a worker pool's rate is workers / cost`) | read | service rate **per replica**; default per type (§6 of the spec; 100k/s for `load_balancer`, `rate_limiter` and `cache`). A byte rate (`100GB/s`, or in bits as a network is rated: `40Gbit/s` = 5 GB/s, printed `5GB/s`) on a `cdn` or `blob_store`, and a `blob_store`'s default (spec §6's 500 MB/s), makes the node count **megabytes**: its capacity is that many MB/s, a request costs its size in MB (the client's `sizes:` or the step's `size:`), and its service time is one megabyte's (10 ms at a CDN, 40 ms at a blob store), so by Little's law it has `c = MB/s × that time` slots, each moving one object at a time: `capacity=100k MB/s (scenario)  service_time=10ms per MB (default)  c=1000 slots (1 object each) (implied)  queue_limit=1000 MB (default)  variability=0`. Each request is a **batch** of megabytes that holds one slot for its whole transfer (size × the time of one MB: a 50 MB object 2 s at a blob store), a fixed time for a fixed size (so `service_variability` defaults to **0** there: deterministic transfers), and the node's queue waits for whole objects: Erlang C is fed the mean object time `s_obj = Σ p_op × MB_op × time per MB` (`p_op` = the op's share of the requests, recomputed every step from the arrivals) with the same `c`, which leaves `rho` as in MB/s and makes the wait a whole object's, and the Allen–Cunneen factor `(burstiness + c_s²) / 2` is fed the size mix's squared coefficient of variation `c_s² = Σ p_op (1 + service_variability) s_op² / s_obj² − 1`. One size waits like M/D/c, half the M/M/c wait: at `rho` 0.9, 50 MB objects at a default blob store (20 slots) wait `0.5 × C(20, 0.9) × 2 s / (20 × 0.1)` = 0.28 s (0.55 s with `service_variability: 1`), where counting 1 MB units as independent requests, as the first version of the model did, said 11 ms; small requests beside large ones raise `c_s²` and so lengthen the large ones' wait (1000 reads/s of 2 KB beside 8 writes/s of 50 MB: 67 ms against 64 ms alone). Like every queue's, the wait is never longer than the waiting room takes to drain, `queue_limit / capacity` (1000 MB at 500 MB/s: 2 s). A request is then answered after that wait at its **last byte** if it is a write (an op in a blob store's `write_ops`, default `write`): its whole transfer, so every 300 MB upload takes at least 12 s at 25 MB/s per slot (40 ms per MB), and a client `timeout` under that cuts all of them; and at its **first megabyte** otherwise (a read or a stream, which the client consumes as it arrives; this understates a large read needed whole before use). Either way a request under 1 MB takes one megabyte's time (an upper bound for small objects: a 2 KB read holds its slot 80 µs but is answered in 40 ms). `explain` checks it in MB/s with the requests beside: `cdn_us  peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)`. A byte rate on any other type is an error, since those types count requests: `a service counts requests; a byte capacity belongs on a cdn or blob_store`. At most `1e15/s` (`1e15B/s` for a byte rate). An error on a `leaky_bucket` limiter |
+| `latency` | duration | all but `client` and `worker_pool` (its `cost` is the time per job) | read | service time of one request; default per type (50 µs for `load_balancer` and `rate_limiter`, 250 µs for `cache`: the spec's memory read). An error on a `leaky_bucket` limiter |
 | `advanced` | map | all but `client` | read | see next table |
 | `ops` | map | `client`, `service`, `ws_gateway` | read (client, service); checked (ws_gateway) | client: op → share; otherwise op → step list (below) |
 | `cost` | map op → number | `service`, `cache`, `sql_db` | read | **new in v1.2**: the capacity units one request of that op consumes; an op not listed costs 1. Each value is a positive finite number (`cost 'write' must be a positive finite number`, also for a quoted `"3"`) of at most 1e6 (`cost 'write' must be at most 1e6`); anything but a map is `cost must be a map of op to units`, a bare `cost:` is `cost must not be empty (write {} for none)`. `capacity` is then a rate of units: demand is `Σ rate_op × cost_op`, and the node's demand, drops and backlog are reported in units. What it forwards stays requests (a drained `write` of cost 3 is one `write` downstream). A `sql_db` charges its write ops 5 unless `cost` lists them (see [`sql_db`](#sql_db)). A load balancer and a rate limiter charge 1 per request, and `cost` is not a key of theirs. A `worker_pool`'s `cost` is a different key, a duration per job (see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
@@ -296,8 +296,8 @@ A key outside its row is an error, e.g. `key 'capacity' is not valid for type 'c
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `queue_limit` | integer > 0 | 1000 (chosen) | units of work that may wait per replica (requests when every cost is 1; a request of `cost` 3 takes three); beyond it the excess is dropped, so nobody admitted waits longer than the full room takes to drain, `queue_limit / capacity` (the room-drain bound: exact for a deterministic drain such as a leaky bucket's, conservative for random arrivals and service, about twice M/M/c/K's mean wait near rho 1; with the default room it binds at a node that counts requests only when the arrivals' variability factor exceeds 10, 5 for the variance it caps at the room's scale, `(queue_limit / capacity)² / 4`, our heuristic; an estimated percentile is a lognormal fit that ignores the bound and can exceed it). On a node that counts megabytes (a byte `capacity`, see [Node (common keys)](#node-common-keys)) the units are MB: the default waiting room there is 1000 MB (chosen: the generic default read in the node's unit, twenty 50 MB streams), printed `queue_limit=1000 MB`. An error on a `leaky_bucket` limiter, whose `burst` is its waiting room |
-| `concurrency` | integer in [1, 100000] | implied: `max(1, ceil(capacity × latency))`, capped at 100000 | servers per replica, the c of M/M/c. The cap exists because the Erlang C term costs O(c) per node per step. The default is Little's law at full load (busy servers = throughput × time in service), which keeps the rate and the Erlang C term describing one machine. An error on a `leaky_bucket` limiter (one leak slot) |
+| `queue_limit` | integer > 0 | 1000 (chosen) | units of work that may wait per replica (requests when every cost is 1; a request of `cost` 3 takes three); beyond it the excess is dropped, so nobody admitted waits longer than the full room takes to drain, `queue_limit / capacity` (the room-drain bound: exact for a deterministic drain such as a leaky bucket's, conservative for random arrivals and service, about twice M/M/c/K's mean wait near rho 1; with the default room it binds at a node that counts requests only when the arrivals' variability factor exceeds 10, 5 for the variance it caps at the room's scale, `(queue_limit / capacity)² / 4`, our heuristic; an estimated percentile is a lognormal fit that ignores the bound and can exceed it: [How percentiles are estimated, and where they mislead](#how-percentiles-are-estimated-and-where-they-mislead)). On a node that counts megabytes (a byte `capacity`, see [Node (common keys)](#node-common-keys)) the units are MB: the default waiting room there is 1000 MB (chosen: the generic default read in the node's unit, twenty 50 MB streams), printed `queue_limit=1000 MB`. An error on a `leaky_bucket` limiter, whose `burst` is its waiting room, and on a `worker_pool`, which waits in its queue (`node 'w': a worker pool waits in its queue: set the queue's retention`) |
+| `concurrency` | integer in [1, 100000] | implied: `max(1, ceil(capacity × latency))`, capped at 100000 | servers per replica, the c of M/M/c. The cap exists because the Erlang C term costs O(c) per node per step. The default is Little's law at full load (busy servers = throughput × time in service), which keeps the rate and the Erlang C term describing one machine. An error on a `leaky_bucket` limiter (one leak slot) and on a `worker_pool`, whose c is its `workers` (`node 'w': a worker pool's rate is workers / cost`) |
 | `service_variability` | number ≥ 0 | 1.0 (2.0 for `external_sink`; 0 on a node that counts megabytes, see `capacity`) | squared coefficient of variation (SCV) of service time; 1 = exponential, 0 = every request takes the same time. On a node that counts megabytes it is one object's (a transfer of a fixed size is deterministic, hence the 0), and the queue uses the SCV of the size mix built on it. An error on a `leaky_bucket` limiter (the leak is deterministic: SCV 0) |
 | `burstiness` | number ≥ 0 | 1.0 | SCV of inter-arrival times; 1 = Poisson. With `service_variability` it forms the Allen–Cunneen factor `(burstiness + service_variability) / 2` that scales the queueing wait (Kingman's correction) |
 | `yellow` | number in (0, 1] | 0.70 | utilization where the node turns yellow |
@@ -332,10 +332,12 @@ node several times (`[a, a, a, a, a]`), each call thinned by the node's own loss
 much less (thinned by the previous step's drops), and so on for the whole run. `estimate` thins by
 fractions averaged over its passes, d̄ ← (1 − w) d̄ + w d, and halves a fraction's weight w
 (from 1/2) each time its average overshoots, so it settles at the true fixed point (five calls at
-1k/s to a node of 3686/s and a room of one: 10 % dropped, 4095/s offered; ten and twenty calls,
-whose fixed points are three and six times steeper, as well). The one limit: w stops at 1/1024,
-which settles any slope of the delivered fraction against itself down to −2047 (twenty calls are
-−6.2, a thousand −417). If the fractions still do not settle, it warns `no steady state (a loop of
+1k/s to a node of 3686/s and a room of one: 10 % dropped, 4095/s offered, where the delivered
+fraction's slope against itself is −1.79; ten and twenty calls to a node sized so that 10 % is
+dropped again, 5862/s and 7906/s, slopes −3.65 and −6.23, as well). The one limit: w stops at
+1/1024, which settles any slope down to −2047 (at the same 10 % sizing twenty calls are −6.2;
+a thousand calls, sized to settle at 99.9 % delivered, are −417). If the fractions still do not
+settle, it warns `no steady state (a loop of
 gain >= 1, or delivered fractions that did not settle: a step after a failed step)`.
 
 An op with an empty step list (`deliver: []`) is terminal: the node serves it and forwards
@@ -374,8 +376,8 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `service_discovery` | `failover` (duration) | ignored; phase 3 |
 | `id_generator` | `algorithm` `snowflake|ticket_server|uuid` (required) | read and run (phase 2b), see [`id_generator`](#id_generator) |
 | `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) | read and run (phase 2c): a third party's API (ch. 10's APNs, FCM, SMS and e-mail providers), a leaf queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) whose served requests fail at `failure_rate` f (default 0; outside [0, 1]: `node 's': failure_rate must be between 0 and 1`): `dropped += f × served`, `drain = (1 − f) × served`, so 500/s at f = 0.02 is answered 490/s and the failures count in the node's drop rate, never as rejections. `politeness` (a positive rate) is printed by `explain` as `politeness=1/s (not modelled: phase 3)`: it needs per-host state. `then` and `ops` stay refused, and nothing retries a failure before phase 3 |
-| `notification_fanout` | `channels` (map name → node id), `dedup` (0–1), `then` | ignored |
-| `frontier` | `politeness` (rate per host), `hosts` (int), `then` | ignored |
+| `notification_fanout` | `channels` (map name → node id), `dedup` (0–1), `then` | `then` checked as [steps](#steps) (`node 'fan': step refers to unknown node 'ghost'`); the others ignored; phase 3 |
+| `frontier` | `politeness` (rate per host), `hosts` (int), `then` | `then` checked as [steps](#steps); the others ignored; phase 3 |
 
 "Ignored" own keys are still checked by name, so a misspelling is caught today; their
 values are typed in the phase that simulates the type.
@@ -775,7 +777,7 @@ own (a replicated write waits in the same queue as the reads), read-your-writes.
 ### `kv_cluster`
 
 Book ch. 6, "Design a key-value store", Dynamo-style (Amazon's Dynamo, Cassandra), in the steady
-state (plan 2c refinement 9). `nodes` machines sit on a consistent-hash ring (ch. 5) of `vnodes`
+state (spec §19 entry 9). `nodes` machines sit on a consistent-hash ring (ch. 5) of `vnodes`
 virtual nodes each; every key lives on `replication` N of them, the N machines that follow it on
 the ring; the coordinator sends every read and every write to all N replicas and answers a write
 once W = `write_quorum` of them have acknowledged it and a read once R = `read_quorum` have replied
@@ -880,7 +882,7 @@ service is its hop.
 
 ### `id_generator`
 
-Book ch. 7, "Design a unique ID generator in distributed systems" (plan 2b refinement 6). An id
+Book ch. 7, "Design a unique ID generator in distributed systems" (spec §18 entry 12). An id
 generator is **sugar for a `service`**: no behaviour of its own, only the capacity and service
 time of the design its `algorithm` names, resolved at build. A `capacity` or `latency` the
 scenario states wins, as on any node; `replicas`, `advanced` and the other common keys work as
@@ -908,7 +910,7 @@ compares the ticket server with snowflake.
 
 ### `search_index`
 
-Book ch. 13, "Design a search autocomplete system" (plan 2c refinement 10). A search index is
+Book ch. 13, "Design a search autocomplete system" (spec §19 entry 10). A search index is
 **served like a service**: no steps, `replicas` copies of the type's 5k/s and 5 ms (chosen: a
 prefix lookup in a trie that reads the prefix's stored top k, ch. 13) unless the scenario states
 its own `capacity` and `latency`, resolved as for any node. `build_interval` (a positive
@@ -920,7 +922,7 @@ query and calls nobody.
 ### `message_queue` and `worker_pool`
 
 Book ch. 1 ("Message queue"), the transcoding queue of ch. 14 and the notification queue of
-ch. 15, Kafka in practice (plan 2c refinements 4-6). A `message_queue` is the **broker**: its own
+ch. 15, Kafka in practice (spec §19 entries 4-6). A `message_queue` is the **broker**: its own
 queue is the append (spec §6: 1M messages/s; 100 µs chosen, so `c = 1M/s × 100 µs = 100` by
 Little's law), and a publisher is answered **when its message is appended**, whatever happens to
 it later. Every link out of a queue must go to a `worker_pool` that `consumes` it (a consumer
@@ -1095,7 +1097,8 @@ CDN although the video comes back), and a reply adds no bytes: an `inout` link i
 its requests, and `{from: x, to: y}` and `{from: y, to: x}` with a bandwidth each are two pipes,
 each fed by its own direction's demand. Ignored: TCP slow start and windows, packet loss and
 retransmission, protocol headers, propagation delay growing with load, and the true direction of
-each byte (above). `run` adds a `links` table (the node table's columns, in MB) with a row `a->b`
+each byte (above). `run` adds a `links` table (the node table's columns but `peak_lag`, which
+only a message queue has, in MB) with a row `a->b`
 per pipe (the link as written, `from->to`, also for a `dir: in` link, whose demand and so whose
 megabytes travel from `to` to `from`), JSON a `links` array (`name`, `demand_per_s`, `drain_per_s`, `dropped_per_s`,
 `backlog`, `rho`, `latency_s`, `zone`, `peak_rho`, `peak_backlog`, `red_s`; `[]` without a
@@ -1116,7 +1119,7 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 
 | metric | `node` | `op` | `max` | evaluates |
 |---|---|---|---|---|
-| `p50_latency`, `p95_latency`, `p99_latency` | required, a **client** | optional, one the client sends | duration | the client's estimated end-to-end percentile, fitted to the requests the path **delivered** (a refused or dropped request saw no latency); without `op`, the worst of its ops. Behind a client `timeout` the fit is to every delivered request before the timeout cut it, read at q and capped at the timeout; a percentile at quantile q of whose op more than 1 − q of the delivered requests timed out (more than 1 % for a p99) fails whatever its `max`, observing the timeout, with a note: `57.3% of delivered requests timed out (more than 1%)` (see [Drops and rejections](#drops-and-rejections)) |
+| `p50_latency`, `p95_latency`, `p99_latency` | required, a **client** | optional, one the client sends | duration | the client's estimated end-to-end percentile, fitted to the requests the path **delivered** (a refused or dropped request saw no latency); without `op`, the worst of its ops. Behind a client `timeout` the fit is to every delivered request before the timeout cut it, read at q and capped at the timeout; a percentile at quantile q of whose op more than 1 − q of the delivered requests timed out (more than 1 % for a p99) fails whatever its `max`, observing the timeout, with a note: `57.3% of delivered requests timed out (more than 1%)`, or, for an SLO without `op`, naming the op with the largest timed-out share, `57.3% of delivered upload requests timed out (more than 1%)` (see [Drops and rejections](#drops-and-rejections) and [How percentiles are estimated](#how-percentiles-are-estimated-and-where-they-mislead)) |
 | `drop_rate` | optional | not allowed | number in [0, 1] | the node's dropped / the work sent to it, after warmup; without `node`, the worst node's or bandwidth link pipe's (a `node` names a node only) |
 | `reject_rate` | optional | not allowed | number in [0, 1] | **new in v1.2**: the node's rejected (a rate limiter's refusals, a leaky bucket's overflow included) / the requests sent to it, after warmup; without `node`, the worst node's |
 | `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup, of the copy the node reports: behind a `consistent_hash` balancer the **hottest copy** (`k = 1 + z_M/√vnodes` × the average share, z_M the expected maximum of M standard normals, see [`load_balancer`](#load_balancer)), on a `kv_cluster` its hottest machine (`k = min(1 + z_M/√(N·vnodes), nodes/N)`, see [`kv_cluster`](#kv_cluster)), on a `sql_db` the busier kind of copy (primary or replica); a byte-sized node's in megabytes |
@@ -1181,8 +1184,9 @@ published result. The lag is not the age of the oldest unread message, which som
 under FIFO the message published now is the oldest one lag later, so the age trails the lag by one
 lag and reaches the same peak that much later. The `queue_lag` SLO bounds the peak lag after
 warmup, so it reads "every message published after warmup was read within `max`": with `warmup:
-220s` on the burst above it observes 46.7 s (56,000 / 1200, the wait of a message published at
-220 s), while the oldest unread message is 44 s old then and 50 s old at 250 s, when the burst's
+220s` on the burst above it observes 46.6 s (55,980 / 1200: the first observed step ends at
+220.1 s, when 60,000 − 200 × 20.1 messages wait), while the oldest unread message is 44 s old
+then and 50 s old at 250 s, when the burst's
 last message is read.
 
 The `queue_lag` SLO observes the **peak** lag after warmup, not the mean or the last step's: a lag
@@ -1194,7 +1198,7 @@ youtube's 600 transcoders (10 videos/s) never build a backlog: at the 21:00 peak
 rho 0.96) the lag is the Erlang C wait alone, `PASS queue_lag transcode_q - 573ms 30m`. With 400
 (6.667/s, its README's sweep) the uploads exceed the pool from 15:43 and it falls 2.66 h behind
 by midnight (63.76k videos at 6.667/s = 9,564 s), so the 30-minute SLO fails; a run that stops
-while the backlog still grows understates the day's peak (about 3.0 h near 02:18 there,
+while the backlog still grows understates the day's peak (about 3.0 h near 02:17 there,
 `--duration 27h` shows it). Ignored: ordering across partitions, a consumer's
 commit interval (a group's lag counts from the message's append, not from its last commit).
 
@@ -1236,6 +1240,32 @@ some node refused anything; the node table has `dropped` and `rejected` columns;
 for other nodes, and (phase 2c) `peak_queue_lag_s`, a message queue's peak lag in seconds
 ([Queue lag](#queue-lag)), `null` for other nodes. Each SLO object has a `note`: `null`, or why the verdict is not `observed`
 against `max` alone (a replica that falls behind without bound).
+
+**`run --report json` (and `estimate --report json`), key by key.** Every figure is over the
+observed steps (after warmup). A node's `dropped` and `rejected` are **totals** over those steps,
+a link's `dropped_per_s` a **rate**: compare a link with a node by multiplying the link's rate by
+the observed seconds (`steps` × `step`).
+
+| object | key | unit |
+|---|---|---|
+| top level | `scenario`, `steps` | the name; the number of observed steps |
+| top level | `drop_rate`, `reject_rate` | ratios in [0, 1], the worst node's (a pipe's counts for drops); `null` when no step was observed |
+| top level | `worst_drop_node`, `worst_reject_node` | a node id or `from->to`; `null` when nothing was dropped or refused |
+| `nodes[]` | `id`, `mean_rho`, `peak_rho` | the node; time-averaged and highest busy fraction of one copy |
+| `nodes[]` | `peak_backlog` | the most work waiting at the end of any step: requests, cost units at a node with a `cost`, MB at a byte-sized node |
+| `nodes[]` | `dropped`, `rejected` | **totals** over the observed steps, in the same units as `peak_backlog` (`rejected` in requests) |
+| `nodes[]` | `red_s`, `unavailable` | seconds spent red; `true` when the node's latency was infinite in some step |
+| `nodes[]` | `staleness_s`, `replication_dropped_per_s`, `committed_writes_per_s` | seconds; writes per second per replica; writes per second per shard (a `sql_db` only, else `null`) |
+| `nodes[]` | `peak_queue_lag_s` | seconds (a `message_queue` only, else `null`) |
+| `links[]` | `name` | `from->to` as written |
+| `links[]` | `demand_per_s`, `drain_per_s`, `dropped_per_s` | MB per second, **time-averaged rates** |
+| `links[]` | `backlog`, `peak_backlog` | MB, time-averaged and highest |
+| `links[]` | `rho`, `peak_rho`, `latency_s`, `zone`, `red_s` | busy fraction, mean and highest; seconds (a request's wait plus its time on the wire); the worst zone of any step; seconds red |
+| `ops[]` | `client`, `op`, `offered_per_s`, `answered_per_s`, `timed_out_per_s` | requests per second, time-averaged |
+| `ops[]` | `mean_s`, `p50_s`, `p95_s`, `p99_s` | seconds; `null` when nothing was answered (in time) or the path never answers |
+| `slo[]` | `metric`, `node`, `op`, `status`, `note` | as written (`null` when absent); `pass`, `fail` or `skipped`; `null` or the reason |
+| `slo[]` | `observed`, `max` | seconds for a latency, `staleness` or `queue_lag` SLO, a ratio otherwise |
+| `slo[]` | `window_start_s` | seconds from the start of the run; only an SLO with `over` that `run` judged |
 At a node that counts megabytes (a byte `capacity`, see [Node (common keys)](#node-common-keys))
 the node's own numbers are in MB: the table's `dropped`, JSON's `dropped`, and the series'
 `demand_per_s`, `drain_per_s`, `drops_per_s` (MB/s) and `backlog` (MB), as its capacity and
@@ -1272,8 +1302,9 @@ percentile at quantile q is what the client saw there: when more than 1 − q of
 requests timed out (more than 1 % for the p99, 5 % for the p95, half for the p50), no request at q
 was answered, so the percentile is the timeout, printed `>1s` in `run`'s table, and a latency SLO
 on it **fails** whatever its `max` (it observes the timeout; the note says how many timed out:
-`57.3% of delivered requests timed out (more than 1%)`): the client cannot vouch for a quantile it
-never saw answered. Otherwise, with a share s ≤ 1 − q timed out, the percentile is read off the
+`57.3% of delivered requests timed out (more than 1%)`, and which op when the SLO names none,
+`57.3% of delivered upload requests timed out (more than 1%)`): the client cannot vouch for a
+quantile it never saw answered. Otherwise, with a share s ≤ 1 − q timed out, the percentile is read off the
 fit to **every delivered request's** latency, the moments each step had before the timeout cut
 them, at q itself, and capped at the timeout. The engine times out exactly the requests that fit
 puts past the timeout, so the fastest q of the delivered requests are all answered ones and the
@@ -1281,7 +1312,7 @@ client's q-quantile is that fit's: the timeout does not move it. An M/M/1 path o
 behind a 530 ms timeout (0.78 % timed out) shows a p99 of 490.5 ms, exactly as without the
 timeout, and fails a 420 ms SLO. So a percentile never falls as the timeout grows, meets the
 timeout from below as s rises to 1 − q, and is what the client without a timeout sees once the
-timeout cuts nothing. (The rule before the comprehensive 2c review refitted a lognormal to the
+timeout cuts nothing. (An earlier rule refitted a lognormal to the
 answered requests' truncated moments and read it at q / (1 − s); that refit has a tail past the
 cut the truncated distribution lacks, so its percentiles were neither exact nor monotonic in the
 timeout: 508.9 ms behind 600 ms, 475.5 ms behind 1 s, on the same path.) The cap only matters for a
@@ -1292,6 +1323,60 @@ for the latencies of an op of which nothing was answered in time (every delivere
 out).
 When no step was observed every SLO is `skipped` and `run` exits 1: no data is an error,
 not a pass.
+
+### How percentiles are estimated, and where they mislead
+
+The engine follows rates, not requests, so it never sees one request's latency. Each step it
+carries two numbers for every client op: the **mean** and the **variance** of the response, built
+hop by hop (means add along a path, variances add for independent hops, a cache's hit or miss and
+a balancer's split mix them by share; [numerics §5](study/numerics.md)). The **mean is the
+model's own number**: every queue's wait formula (Erlang C with Kingman's correction, the fluid
+drain, the room-drain bound) is a formula for a mean, and the op's mean is their sum along its
+path, as good as the queueing model under it. A **percentile is one step further**: the report
+fits a lognormal with that mean m and variance v (σ² = ln(1 + v/m²), μ = ln m − σ²/2) and reads it
+at q, `exp(μ + σ z_q)`; the op table says so in its heading, `(percentiles estimated: lognormal
+fit to the response moments)`, and in its `(estimated)` column. Two moments cannot carry a shape.
+The fit is good when the true latency is one right-skewed hump, which is what a path through a
+few busy queues looks like, and it misleads in two cases, both measured with `simsys run`:
+
+- **Two populations.** An op that takes one of two very different times has two peaks, and a
+  lognormal smears them into one long tail. youtube's European streams are a hit at the edge,
+  answered in 10.5 ms (59.4 % of them), or a miss that crosses the Atlantic, waits for the pipe
+  and reads its first megabyte at the store, about 207 ms (40.6 %). No stream takes longer than
+  about 207 ms, yet the fitted p99 is **465 ms**; the mean, 89.3 ms, is right
+  ([youtube's README](../scenarios/book/youtube/README.md), "The day's run"). A cache's
+  hit/miss mix does the same at a smaller scale (numerics §5: a p95 of 22.6 ms where every miss
+  takes 51 ms).
+- **Hard bounds.** A full waiting room bounds the wait: nobody admitted waits longer than the room
+  takes to drain, `queue_limit / capacity` (the room-drain bound of
+  [`advanced.queue_limit`](#advanced)). The model applies it to the mean and caps the wait's
+  variance at the room's scale, `(queue_limit / capacity)² / 4` (our heuristic), but a lognormal
+  has no upper end, so its percentiles pass the bound:
+
+  | probe (links of `latency: 0s`, a 1-minute run) | mean | p99 (estimated) | slowest real request |
+  |---|---|---|---|
+  | 12 writes/s of 50 MB into a default `blob_store` (600 MB/s against 500: the room stays full) | 4 s | **6.88 s** | 4 s: the room's 2 s and the write's own 2 s, both deterministic |
+  | 1.2k/s through a `leaky_bucket` of `limit: 1k/s`, `burst: 20`, to a service of 10k/s and 200 µs | 21.2 ms | **54.4 ms** | about 21.2 ms: 20 ms in the full bucket and its 1 ms leak, both deterministic, and the service's 0.2 ms on average |
+  | 1.2k/s into a service of 1k/s, 1 ms, `queue_limit: 10` | 11 ms | **27.9 ms** | no hard bound (the service time is exponential), but the true p99 is about 20 ms: a request behind the full room waits for ten exponential services and then takes its own, an Erlang distribution of 11 phases, whose p99 is 20.1 ms |
+
+  A finite slowest request exists only where every hop is deterministic (a fixed-size transfer, a
+  leak); anywhere a service time or an arrival process is random there is a scale but no hard
+  maximum, and clipping the fit at a bound would be a second heuristic stacked on the first. So
+  the reports **label** the percentiles instead of truncating them (the theory test `a saturated
+  blob store's percentiles are labelled, not truncated: its estimated p99 is 6.88 s past a 4 s
+  bound` pins the first row).
+
+How to read them: size off the mean and the utilization; read a percentile beside the mean; and
+where a p99 sits far above the slowest path you can add up by hand (youtube's does), treat it as
+the fit's tail, not as a request anybody waited for.
+
+**Behind a client `timeout`** a percentile follows the rule of [Drops and
+rejections](#drops-and-rejections): it is read off the fit to every request the path
+**delivered**, the moments each step had before the timeout cut them (the fit that decided which
+requests timed out, so its fastest q are all answered), at q, and capped at the timeout; when more
+than 1 − q of the delivered requests timed out (more than 1 % for a p99) no request at q was
+answered, the percentile is the timeout itself, printed `>τ` in the table (`>1s`, `>50ms`), and a
+latency SLO on it fails. The mean stays the answered requests' mean (the truncated lognormal's).
 
 ## Faults
 
@@ -1317,8 +1402,8 @@ a design review asks after `explain`: *how much of this do I need?*
 
 | option | rule | refused with |
 |---|---|---|
-| `--param` | required. `<dot.path>=<from>..<to>:<n>`: the key is a dot path through **maps only** (`nodes.users.rate.base`, `nodes.transcoders.workers`), which must exist in the file and hold a single value; a path through a list (`links.0.latency`) is refused, since list entries have no names, and a node whose id contains a dot cannot be swept or measured (the dot splits the path). The range gives `n` points, at least 2 and at most 10,000, evenly spaced from `from` to `to`, both included; both ends are numbers (each starts with a digit or `-`, so a third dot is an error) with the same unit text (`100/s..900/s`, `1ms..5ms`, `400..600`; `100/s..1k/s` is refused, not converted): `100/s..900/s:3` is 100/s, 500/s and 900/s. A key the loader reads as a whole number (a node's `workers`, `replicas`, `partitions`, `keys`, ..., an `advanced` block's `concurrency`) must get a whole number at every point | `--param: nodes.users.rate.bse: no such key in the scenario`; `--param: links.0.latency: '0' would index a list; a dot path goes through maps only (a list entry has no name)`; `--param: workers must be whole (400..600:4 gives 466.67)`; `--param: 1/s..2/s:20000: at most 10000 points`; `--param: 100/s..1k/s:2: both ends must be the same kind of value in the same unit (100/s and 1k/s)`; `--param: '.5ms' is not a number followed by a unit` (for `1ms...5ms`) |
-| `--metric` | required, repeatable: `<client>.<op>.mean` (the op's mean latency as the client sees it, over the answered requests), `<client>.<op>.p50`, `.p95` or `.p99` (the op table's estimated percentiles; where more than 1 − q of the delivered requests timed out, the timeout itself, printed `>1s` in the table as in `run`'s), `<node>.mean_rho` (a server's time-averaged utilization), `<node>.peak_rho` (its highest utilization of any observed step), `<node>.drop_rate` (the share of the work sent to it that it dropped, the node's own `drop_rate`) or `<queue>.lag` (a message queue's peak lag after warmup, what the `queue_lag` SLO observes). They are the numbers `run --report json` prints, after warmup. Each name is checked against the file before any point runs | a name outside the grammar, or one that does not fit the file: `--metric api.lag: 'api' has type service, not message_queue: only a message queue has a lag`; `--metric users.drop_rate: 'users' is a client, which serves nothing, so it has no drop rate` |
+| `--param` | required. `<dot.path>=<from>..<to>:<n>`: the key is a dot path through **maps only** (`nodes.users.rate.base`, `nodes.transcoders.workers`), which must exist in the file and hold a single value; a path through a list (`links.0.latency`) is refused, since list entries have no names, and a node whose id contains a dot cannot be swept or measured (the dot splits the path). The range gives `n` points, at least 2 and at most 10,000, evenly spaced from `from` to `to`, both included; both ends are numbers (each starts with a digit or `-`, so a third dot is an error) with the same unit text (`100/s..900/s`, `1ms..5ms`, `400..600`; `100/s..1k/s` is refused, not converted): `100/s..900/s:3` is 100/s, 500/s and 900/s. A key the loader reads as a whole number (a node's `workers`, `replicas`, `partitions`, `keys`, ..., an `advanced` block's `concurrency`) must get a whole number at every point, whole as written: the number before a `k`, `M` or `G` must be whole, as in a [count](#values) (`keys=1k..2k:3` gives 1.5k and is refused although 1500 keys are whole; write `1000..2000:3`) | (each after `<file>: error: `, as every refusal of an option) `--param: nodes.users.rate.bse: no such key in the scenario`; `--param: links.0.latency: '0' would index a list; a dot path goes through maps only (a list entry has no name)`; `--param: workers must be whole (400..600:4 gives 466.67)`; `--param: 1/s..2/s:20000: at most 10000 points`; `--param: 100/s..1k/s:2: both ends must be the same kind of value in the same unit (100/s and 1k/s)`; `--param: '.5ms' is not a number followed by a unit` (for `1ms...5ms`) |
+| `--metric` | required, repeatable (`--metric a --metric b`, or several names after one: `--metric a b`): `<client>.<op>.mean` (the op's mean latency as the client sees it, over the answered requests), `<client>.<op>.p50`, `.p95` or `.p99` (the op table's estimated percentiles; where more than 1 − q of the delivered requests timed out, the timeout itself, printed `>1s` in the table as in `run`'s), `<node>.mean_rho` (a server's time-averaged utilization), `<node>.peak_rho` (its highest utilization of any observed step), `<node>.drop_rate` (the share of the work sent to it that it dropped, the node's own `drop_rate`) or `<queue>.lag` (a message queue's peak lag after warmup, what the `queue_lag` SLO observes). They are the numbers `run --report json` prints, after warmup. Each name is checked against the file before any point runs | after `<file>: error: `, a name outside the grammar, `--metric: bogus: not a metric (write <client>.<op>.mean\|p50\|p95\|p99, <node>.mean_rho\|peak_rho\|drop_rate or <queue>.lag)`, or one that does not fit the file: `--metric: api.lag: 'api' has type service, not message_queue: only a message queue has a lag`; `--metric: users.drop_rate: 'users' is a client, which serves nothing, so it has no drop rate`; `--metric: nope.mean_rho: the scenario has no node 'nope'` |
 | `--jobs` | worker threads, 1 to 1024; default: the machine's hardware threads | CLI11's range message |
 | `--format` | `table` (latencies and lags as the report's tables print them: `1.61ms`, `<1us`, `>1s`; ratios to three significant digits) or `csv` (seconds and ratios, each number the shortest text that reads back to the same double) | |
 
@@ -1331,7 +1416,7 @@ node 'users': rate.base: expected a non-negative finite number`; a missing key o
 value under a YAML anchor (`&a`) is shared with every alias (`*a`): sweeping it through either path
 sweeps it everywhere the anchor is used. A number a run did not produce (a latency of an op of
 which nothing was answered) is `-` in the table and an empty cell in the CSV. A sweep has no SLO
-columns and no exit code per point (the Phase 3 backlog has them).
+columns and no exit code per point (planned for phase 3).
 
 **Parallel, and the same bytes for any `--jobs`.** The points run on `std::jthread` workers that
 take the next point index from one atomic counter; each point owns its YAML tree, graph,

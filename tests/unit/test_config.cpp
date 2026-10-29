@@ -886,9 +886,9 @@ links: []
   CHECK(s->nodes[0].byte_capacity == simsys::ByteRate{500e6});
 }
 
-// A blob store answers a write at its last byte and a read at its first megabyte (review of plan
-// 2c Task 3, I2), so which ops are writes matters there too: `write_ops` is a blob store's key, as
-// a cache's, a CDN's and a database's, stored as written (youtube's original_store lists `upload`).
+// A blob store answers a write at its last byte and a read at its first megabyte, so which ops are
+// writes matters there too: `write_ops` is a blob store's key, as a cache's, a CDN's and a
+// database's, stored as written (youtube's original_store lists `upload`).
 TEST_CASE("a blob store states which ops are writes with write_ops") {
   const auto path = write_temp("simsys_blob_write_ops.yaml", R"(
 version: 1
@@ -970,7 +970,7 @@ links: []
 }
 
 // A client that gives up after 0 s answers nothing and waits nothing, so a latency SLO would
-// observe 0 s and pass any max (review of plan 2c Task 13, C-1): a timeout must be a positive wait.
+// observe 0 s and pass any max: a timeout must be a positive wait.
 TEST_CASE("a client's timeout of zero is refused: a timeout is a positive wait") {
   for (const std::string_view timeout : {"0s", "0ms"}) {
     require_rejected("simsys_timeout_zero.yaml",
@@ -1047,8 +1047,8 @@ TEST_CASE("a client's keys block is validated") {
                    "node 'u': keys.zipf must be a finite non-negative number");
   require_rejected("simsys_keys_word.yaml", client_with("keys: {zipf: hot, space: 10}"),
                    "node 'u': keys.zipf must be a finite non-negative number");
-  // A count's message lists the forms it accepts, so a student who wrote `1.5M` or `-10` sees
-  // what to write instead (review of c9d5f8c).
+  // A count's message lists the forms it accepts, so a student who wrote `1.5M` or `-10` sees what
+  // to write instead.
   require_rejected("simsys_keys_zero_space.yaml", client_with("keys: {zipf: 1, space: 0}"),
                    "node 'u': keys.space must be a positive count (a whole number, optionally "
                    "with k, M or G: 500, 10k, 100M)");
@@ -1761,10 +1761,10 @@ TEST_CASE("latency SLOs must name a client and one of its ops; ratio maxima lie 
   }
 }
 
-// A queue lag is a message queue's (plan 2c Task 8, refinement 14): the lag is read off the
-// queue's consumer groups, so on a service, a client or any other node the SLO could never be
-// observed. `node` may be left out, which bounds the worst queue of the run. The message is the
-// latency rule's, in the same words: "needs a <type> node, '<id>' is a <type>".
+// A queue lag is a message queue's (spec §19 entry 14): the lag is read off the queue's consumer
+// groups, so on a service, a client or any other node the SLO could never be observed. `node` may
+// be left out, which bounds the worst queue of the run. The message is the latency rule's, in the
+// same words: "needs a <type> node, '<id>' is a <type>".
 TEST_CASE("a queue_lag SLO must name a message queue, or no node at all") {
   const auto with_slo = [](std::string_view entry) {
     return scenario_with(
@@ -2958,8 +2958,8 @@ TEST_CASE("a rate limiter's algorithm, limit, burst, window and backend are type
   }
 }
 
-// Plan 2a, D5 of the rate-limiter review: a limiter's refusals are policy, not failures, so
-// they have an SLO metric of their own, a ratio like drop_rate.
+// Spec §17 entry 16: a limiter's refusals are policy, not failures, so they have an SLO metric of
+// their own, a ratio like drop_rate.
 TEST_CASE("reject_rate loads as an SLO metric with a ratio max") {
   const auto path = write_temp(
       "simsys_slo_reject_rate.yaml",
@@ -2974,9 +2974,9 @@ TEST_CASE("reject_rate loads as an SLO metric with a ratio max") {
   REQUIRE(std::get<double>(s->slos[0].max) == 0.5);
 }
 
-// Plan 2a, Task 10 / refinement 7: a cache's hit ratio, strategy, write ops, key count,
-// eviction policy and ttl are read into typed fields. Hit ratio `che` (the Che
-// approximation of an LRU cache) is accepted here and computed in phase 2b.
+// Spec §17 entry 7: a cache's hit ratio, strategy, write ops, key count, eviction policy and ttl
+// are read into typed fields. Hit ratio `che` (the Che approximation of an LRU cache) is accepted
+// here and computed in phase 2b.
 TEST_CASE(
     "a cache's hit ratio, strategy, write ops, keys, eviction and ttl are typed and checked") {
   // C++20 `using enum`: the cache strategies' enumerators in scope, as for the LB policies.
@@ -3140,9 +3140,9 @@ TEST_CASE(
   }
 }
 
-// Plan 2b, Task 4 / refinement 3: a SQL database is a primary plus read replicas; `shards`
-// splits the data, `pool` is the connection pool (the concurrency of each queue) and
-// `replication_lag` how far behind the replicas run. All four are typed at load time.
+// Spec §18 entry 6: a SQL database is a primary plus read replicas; `shards` splits the data,
+// `pool` is the connection pool (the concurrency of each queue) and `replication_lag` how far
+// behind the replicas run. All four are typed at load time.
 TEST_CASE("a sql database's shards, pool, replication lag and write ops are typed and checked") {
   const auto db_scenario = [](std::string_view body) {
     return scenario_with("  db: {type: sql_db, " + std::string{body} + "}\n");
@@ -3219,9 +3219,9 @@ TEST_CASE("a sql database's shards, pool, replication lag and write ops are type
                      "node 'db': replication_lag: expected a non-negative finite number");
   }
   // `pool` is no longer sugar for `advanced.concurrency`: it sets c AND caps the copy's rate at
-  // pool / service time (Little's law, graph::apply_database_keys), which a bare concurrency
-  // never does. Two settings for one c would still contradict each other, so stating both is
-  // refused, and the message says which one to keep and why (re-review of 96848f0).
+  // pool / service time (Little's law, graph::apply_database_keys), which a bare concurrency never
+  // does. Two settings for one c would still contradict each other, so stating both is refused, and
+  // the message says which one to keep and why.
   SECTION("pool together with advanced.concurrency") {
     require_rejected(
         "simsys_sql_pool_and_concurrency.yaml", db_scenario("pool: 8, advanced: {concurrency: 8}"),
@@ -3231,7 +3231,7 @@ TEST_CASE("a sql database's shards, pool, replication lag and write ops are type
 
 // A database answers every query itself and calls nobody (behaviours::SqlDbBehaviour), so a link
 // that would carry demand out of it would carry nothing: the loader refuses it, whichever end
-// writes it (review of 48d4d0b).
+// writes it.
 TEST_CASE("a link that carries demand out of a sql database is refused") {
   const std::string nodes =
       "  u: {type: client, rate: {base: 1000/s}, ops: {select: 1}}\n"
@@ -3262,7 +3262,7 @@ TEST_CASE("a link that carries demand out of a sql database is refused") {
   }
 }
 
-// ---- Request-based CDN (plan 2b refinement 4, Task 5) ----
+// ---- Request-based CDN (spec §18 entry 10) ----
 //
 // A `cdn` (book ch. 1: a cache at the network's edge, serving static files close to the user)
 // is a read-only cache in front of an `origin`, the node it fetches its misses from. The origin
@@ -3314,18 +3314,16 @@ TEST_CASE("a cdn whose origin is a client is refused") {
                    "node 'cdn': origin 'u' is a client; clients only send");
 }
 
-// A CDN that is its own origin would ask itself for every miss: nothing could ever answer it
-// (review of 4d539b0, M6).
+// A CDN that is its own origin would ask itself for every miss: nothing could ever answer it.
 TEST_CASE("a cdn that is its own origin is refused") {
   require_rejected("simsys_cdn_origin_self.yaml", cdn_scenario("origin: cdn"),
                    "node 'cdn': a cdn cannot be its own origin");
 }
 
-// A CDN caches every op that reaches it unless the op is one of its write ops (`write` by
-// default): a client's `upload` sent through the CDN would be "served at the edge" for the hit
-// share of it. `write_ops` on a cdn names the ops that are writes, as on a cache, so the graph
-// refuses them on their way in (a cdn does not take writes) instead of caching them (review of
-// 4d539b0, I2).
+// A CDN caches every op that reaches it unless the op is one of its write ops (`write` by default):
+// a client's `upload` sent through the CDN would be "served at the edge" for the hit share of it.
+// `write_ops` on a cdn names the ops that are writes, as on a cache, so the graph refuses them on
+// their way in (a cdn does not take writes) instead of caching them.
 TEST_CASE("a cdn reads write_ops, the ops it refuses rather than caches") {
   const auto s = load_cdn("simsys_cdn_write_ops.yaml",
                           "hit_ratio: {fixed: 0.9}, write_ops: [upload], origin: origin");
@@ -3367,7 +3365,7 @@ TEST_CASE("a cdn states its size in keys for a che hit ratio") {
   REQUIRE(s.nodes[1].ttl == std::chrono::hours{24});  // read as a cache's ttl, not modelled
 }
 
-// ---- ID generator (plan 2b refinement 6; book ch. 7 "Design a unique ID generator") ----
+// ---- ID generator (spec §18 entry 12; book ch. 7 "Design a unique ID generator") ----
 //
 // `algorithm:` picks one of the three designs the chapter compares. Until now the loader
 // accepted the key on an id_generator and dropped it; it is now typed, and required, because
@@ -3428,8 +3426,8 @@ TEST_CASE("an id generator without a known algorithm is refused") {
 }
 
 // Ch. 7's ticket server is ONE auto-increment database (two copies would hand out the same ids).
-// Graph::build refuses more replicas; the loader now does too, so `simsys validate` catches it
-// with a line number, with the graph's message (review of 3adc555, M3).
+// Graph::build refuses more replicas; the loader now does too, so `simsys validate` catches it with
+// a line number, with the graph's message.
 TEST_CASE("the loader refuses a ticket server with more than one replica") {
   require_rejected(
       "simsys_id_ticket_replicas.yaml",
@@ -3457,7 +3455,7 @@ TEST_CASE("the algorithm key stays the limiter's on a rate limiter and invalid e
   }
 }
 
-// ---- Request sizes, step sizes and link bandwidth (phase 2c, Task 1) ---------------------------
+// ---- Request sizes, step sizes and link bandwidth (phase 2c) ---------------------------
 //
 // Until now `sizes` (on a client) and `bandwidth` (on a link) were accepted and ignored; now they
 // are typed into the model (Workload::sizes, LinkSpec::bandwidth) and a step may state `size`
@@ -3684,7 +3682,7 @@ links:
   CHECK_FALSE(s->links[1].bandwidth.has_value());
 }
 
-// ---- Byte capacities: in bits too, and only where bytes are served (plan 2c fix round) ----
+// ---- Byte capacities: in bits too, and only where bytes are served ----
 
 // A network is rated in bits, and a storage tier's throughput sometimes is too: `40Gbit/s` is a
 // byte capacity of 40e9 / 8 = 5e9 B/s, read by the same parser as a link's bandwidth.
@@ -3705,8 +3703,8 @@ links: []
   CHECK_THAT(s->nodes[0].byte_capacity->bytes_per_second, Catch::Matchers::WithinRel(5e9, 1e-12));
 }
 
-// Only a CDN and a blob store serve bytes (plan 2c refinement 2): on any other type a byte rate
-// would have to be read as some number of requests, which no author means, so it is refused.
+// Only a CDN and a blob store serve bytes (spec §19 entry 2): on any other type a byte rate would
+// have to be read as some number of requests, which no author means, so it is refused.
 TEST_CASE("a byte capacity is refused on a type that counts requests") {
   require_rejected("simsys_byte_capacity_service.yaml",
                    scenario_with("  svc: {type: service, capacity: 1GB/s}\n"),
@@ -3722,10 +3720,10 @@ TEST_CASE("a byte capacity is refused on a type that counts requests") {
                    "cdn or blob_store");
 }
 
-// A blob store's `then` steps are event notifications nobody waits for (plan 2c Task 4), so a step
-// `mode` (sequential latencies add, parallel ones overlap) means nothing there. The graph refuses
-// `mode: parallel`; only the loader sees `mode: sequential` written (the model's default), so it
-// refuses the key itself, at the key, whatever its value.
+// A blob store's `then` steps are event notifications nobody waits for, so a step `mode`
+// (sequential latencies add, parallel ones overlap) means nothing there. The graph refuses `mode:
+// parallel`; only the loader sees `mode: sequential` written (the model's default), so it refuses
+// the key itself, at the key, whatever its value.
 TEST_CASE("a blob store's then step may not state a mode") {
   for (const auto* mode : {"sequential", "parallel"}) {
     CAPTURE(mode);
@@ -3748,7 +3746,7 @@ links:
   }
 }
 
-// ---- Message queues and worker pools are typed (plan 2c refinements 4-5, Task 6) ----
+// ---- Message queues and worker pools are typed (spec §19 entries 4-5) ----
 //
 // A worker pool is M/M/c over consumption (spec section 7: "capacity = workers / job cost"): its
 // `workers` is c and its `cost` the DURATION one worker spends on one job, so youtube's 400
@@ -3827,8 +3825,8 @@ TEST_CASE("a worker pool needs workers and a cost") {
   }
 }
 
-// A pool's jobs come from the queue it drains and from nowhere else (review of plan 2c Task 6,
-// I-1): without `consumes` it would be a server any node could call, so the key is required.
+// A pool's jobs come from the queue it drains and from nowhere else: without `consumes` it would be
+// a server any node could call, so the key is required.
 TEST_CASE("a worker pool needs the queue it consumes") {
   require_rejected("simsys_pool_no_consumes.yaml",
                    scenario_with("  q: {type: message_queue}\n"
@@ -3897,7 +3895,7 @@ TEST_CASE("a worker pool waits in its queue: advanced.queue_limit is refused for
                    "node 'w': a worker pool waits in its queue: set the queue's retention");
 }
 
-// ---- External sinks are typed (plan 2c refinement 8, Task 9) ----
+// ---- External sinks are typed (spec §19 entry 8) ----
 //
 // An external sink is a third party's API: the type's numbers (1k/s, 100 ms, service SCV 2.0) plus
 // the share of what it serves that FAILS. `failure_rate` is a number in [0, 1] (0.02: one request
@@ -3979,7 +3977,7 @@ TEST_CASE("an external sink's politeness must be a positive rate") {
                    "node 's': politeness must be positive");
 }
 
-// ---- kv_cluster is typed (plan 2c refinement 9, Task 10; book ch. 6, Dynamo) ----
+// ---- kv_cluster is typed (spec §19 entry 9; book ch. 6, Dynamo) ----
 //
 // A key-value store of `nodes` machines on a consistent-hash ring (`vnodes` virtual nodes each),
 // every key kept on `replication` N of them, a write acknowledged after W replicas and a read
@@ -4017,11 +4015,10 @@ TEST_CASE("a kv_cluster's nodes, vnodes, replication, quorums and mode are typed
   REQUIRE(store.replicas == 1);  // the machines are `nodes`; `replicas` stays at its default
 }
 
-// Dynamo's classic quorum (ch. 6: N = 3, W = 2, R = 2, so W + R > N) and the AP mode apply when
-// the scenario says nothing; the defaults show in explain, marked "(default)", not here
-// (test_report pins them). Here: a kv_cluster that states `nodes` alone loads, and what it did not
-// state stays absent, the mode included, so explain can tell a default from a choice (review of
-// plan 2c Tasks 9-10, minor 9).
+// Dynamo's classic quorum (ch. 6: N = 3, W = 2, R = 2, so W + R > N) and the AP mode apply when the
+// scenario says nothing; the defaults show in explain, marked "(default)", not here (test_report
+// pins them). Here: a kv_cluster that states `nodes` alone loads, and what it did not state stays
+// absent, the mode included, so explain can tell a default from a choice.
 TEST_CASE("a kv_cluster that states only its nodes loads and takes Dynamo's defaults") {
   const auto path = write_temp("simsys_kv_nodes_only.yaml", kv_scenario("nodes: 3"));
   const auto s = simsys::config::load(path.string());
@@ -4033,10 +4030,10 @@ TEST_CASE("a kv_cluster that states only its nodes loads and takes Dynamo's defa
   REQUIRE(simsys::model::kv_mode_of(s->nodes[0]) == simsys::model::KvMode::ap);
 }
 
-// Which ops are writes, and so wait for W replicas instead of R, is the node's `write_ops`, as on
-// a cache, a CDN, a SQL database and a blob store (review of plan 2c Tasks 9-10, I-3). The graph
-// and the engine always honoured it; the loader refused it, so a client sending `put` straight to
-// a kv_cluster silently got the read quorum.
+// Which ops are writes, and so wait for W replicas instead of R, is the node's `write_ops`, as on a
+// cache, a CDN, a SQL database and a blob store. The graph and the engine always honoured it; the
+// loader refused it, so a client sending `put` straight to a kv_cluster silently got the read
+// quorum.
 TEST_CASE("a kv_cluster lists its write ops") {
   const auto path =
       write_temp("simsys_kv_write_ops.yaml", kv_scenario("nodes: 3, write_ops: [put, delete]"));
@@ -4149,7 +4146,7 @@ TEST_CASE("a kv_cluster refuses replicas: its machines are nodes") {
                    "node 'store': a kv_cluster's machines are nodes; replicas is not a key here");
 }
 
-// ---- Search indexes (plan 2c refinement 10, Task 11) ----
+// ---- Search indexes (spec §19 entry 10) ----
 //
 // A search index (ch. 13's trie database) serves like a service, and `build_interval` is the one
 // key it owns: how often the index is rebuilt from the aggregated logs. Until now the loader
@@ -4199,7 +4196,7 @@ TEST_CASE("a search index still refuses ops") {
                    "node 'trie_db': key 'ops' is not valid for type 'search_index'");
 }
 
-// ---- SLOs per window (plan 2c Task 14) ----
+// ---- SLOs per window ----
 //
 // An SLO may carry `over: <duration>`: the report then checks it on every window of that length
 // (aligned from the end of warmup) and the worst window decides. The loader owns the rule that

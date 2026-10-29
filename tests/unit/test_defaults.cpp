@@ -148,9 +148,9 @@ TEST_CASE("a cross-datacenter link defaults to half the cross-DC round trip, fro
   REQUIRE(x.source == Source::dc_default);
 }
 
-// Plan 2c refinement 2: a byte-sized node's capacity unit is one megabyte (defaults::byte_unit),
-// so a stated byte rate is that many MB per second whatever the type, and it is still the
-// scenario's own number: 200 MB/s = 200e6 B/s / 1e6 B per unit = 200 units/s.
+// Spec §19 entry 2: a byte-sized node's capacity unit is one megabyte (defaults::byte_unit), so a
+// stated byte rate is that many MB per second whatever the type, and it is still the scenario's own
+// number: 200 MB/s = 200e6 B/s / 1e6 B per unit = 200 units/s.
 TEST_CASE("a byte capacity resolves to megabytes per second and counts as a scenario value",
           "[defaults]") {
   NodeSpec n{.id = "blobs", .type = NodeType::blob_store};
@@ -190,11 +190,11 @@ TEST_CASE("a stated byte capacity keeps the type's per-megabyte service time", "
   REQUIRE(edge.concurrency == 1000);
 }
 
-// Plan 2c refinement 2: a node is byte-sized when its capacity is a byte rate, and then counts
-// megabytes. Three ways to get there: a stated `capacity: 100GB/s` (byte_capacity, on a CDN or
-// a blob store), or a blob store's type default, spec section 6's 500 MB/s. A capacity stated
-// in requests (`capacity: 5k/s`) is a request count, whatever the type; so is a type whose
-// default is a request rate (a CDN without a capacity, every service).
+// Spec §19 entry 2: a node is byte-sized when its capacity is a byte rate, and then counts
+// megabytes. Three ways to get there: a stated `capacity: 100GB/s` (byte_capacity, on a CDN or a
+// blob store), or a blob store's type default, spec section 6's 500 MB/s. A capacity stated in
+// requests (`capacity: 5k/s`) is a request count, whatever the type; so is a type whose default is
+// a request rate (a CDN without a capacity, every service).
 TEST_CASE("a blob store with no stated capacity is byte-sized by its type's default",
           "[defaults]") {
   REQUIRE(simsys::defaults::is_byte_sized(NodeSpec{.id = "blobs", .type = NodeType::blob_store}));
@@ -225,10 +225,9 @@ TEST_CASE("a node whose capacity counts requests is not byte-sized", "[defaults]
 }
 
 // A byte-sized node moves a fixed number of megabytes at a fixed rate per slot, so one object's
-// service time is deterministic: its squared coefficient of variation defaults to 0 (review of
-// plan 2c Task 3's fix round, I2), and the spread of service times at the node is its size mix's
-// alone. advanced.service_variability still overrides it. A blob store sized in requests keeps
-// the type's exponential service (1).
+// service time is deterministic: its squared coefficient of variation defaults to 0, and the spread
+// of service times at the node is its size mix's alone. advanced.service_variability still
+// overrides it. A blob store sized in requests keeps the type's exponential service (1).
 TEST_CASE("a byte-sized node's transfers are deterministic: service variability 0 unless stated",
           "[defaults]") {
   REQUIRE(simsys::defaults::resolve_capacity(NodeSpec{.id = "blobs", .type = NodeType::blob_store})
@@ -257,10 +256,10 @@ TEST_CASE("an out-of-range node type is a programmer error", "[defaults]") {
   REQUIRE_THROWS_AS(simsys::model::to_string(bogus), std::invalid_argument);
 }
 
-// A message queue's retention when the scenario states none (plan 2c refinement 4): 7 days. The
-// book gives no number; the industry default is Kafka's `log.retention.hours = 168`, and
-// 168 h = 7 d = 604,800 s. The graph turns it into the consumers' waiting room (retention x the
-// pool's capacity), and explain prints it as `retention=7d (default: Kafka's 168 h)`.
+// A message queue's retention when the scenario states none (spec §19 entry 4): 7 days. The book
+// gives no number; the industry default is Kafka's `log.retention.hours = 168`, and 168 h = 7 d =
+// 604,800 s. The graph turns it into the consumers' waiting room (retention x the pool's capacity),
+// and explain prints it as `retention=7d (default: Kafka's 168 h)`.
 TEST_CASE("a queue's default retention is Kafka's 168 hours, seven days", "[defaults]") {
   static_assert(simsys::defaults::default_retention == 168h);
   static_assert(simsys::defaults::default_retention == 7 * 24h);

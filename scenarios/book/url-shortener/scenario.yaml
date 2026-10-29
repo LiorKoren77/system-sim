@@ -8,8 +8,9 @@ name: url-shortener
 seed: 1
 duration: 24h
 # 1 s steps: the fluid step is exact while demand is constant within it, and the daily sine moves
-# by at most 0.003 % of its peak in a second; the summary and SLO numbers match a 100 ms run to
-# 1e-8 (README, "What the model captures"), at a tenth of the steps (86k instead of 864k).
+# by at most 0.003 % of its peak in a second; the day's figures match a 100 ms run to 1e-8 and
+# the worst hour's utilization to 1.3e-6 (README, "What the model captures"), at a tenth of the
+# steps (86k instead of 864k).
 step: 1s
 warmup: 2m
 
@@ -84,7 +85,7 @@ links:
 slo:
   - {metric: p99_latency, node: users, op: redirect, max: 50ms}
   - {metric: drop_rate, max: 0.001}
-  # The hour the whole-day SLOs cannot see (plan 2c Task 14): url_db's busiest copy averages
+  # The hour the whole-day SLOs cannot see: url_db's busiest copy averages
   # 0.43 over the day but 0.6433 in its worst hour (13:02-14:02, around the 14:00 peak). Checked
   # per hour, a design whose peak hour runs the database hot fails here (`shards: 2`: 0.965)
   # while its day-long numbers still pass.

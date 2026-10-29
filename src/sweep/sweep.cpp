@@ -299,7 +299,7 @@ std::optional<std::string> metric_problem(const model::Scenario& scenario,
                      ? std::optional{"the scenario has no node '" + metric.node + "'"}
                      : problem_with_node(*node, metric);
   if (!problem) return std::nullopt;
-  return "--metric " + metric.name + ": " + *problem;
+  return "--metric: " + metric.name + ": " + *problem;
 }
 
 std::optional<std::string> first_metric_problem(const model::Scenario& scenario,
@@ -567,7 +567,7 @@ std::expected<SweepParam, std::string> parse_param(std::string_view spec) {
 
 std::expected<SweepMetric, std::string> parse_metric(std::string_view name) {
   if (auto metric = metric_of(name, config::dot_path_keys(name))) return *metric;
-  return std::unexpected("--metric: '" + std::string{name} + "' is not a metric (write " +
+  return std::unexpected("--metric: " + std::string{name} + ": not a metric (write " +
                          std::string{metric_grammar} + ")");
 }
 
@@ -581,7 +581,11 @@ std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& s
                                                             std::size_t jobs) {
   const auto base = config::load(scenario_path);
   if (!base) return std::unexpected(config::describe(base.error()));
-  if (auto problem = first_metric_problem(*base, metrics)) return std::unexpected(*problem);
+  // A metric the file cannot answer is the file's mistake as much as the option's: worded as the
+  // loader words one (`<file>: error: `), as the CLI words a --param or --metric it refuses.
+  if (auto problem = first_metric_problem(*base, metrics)) {
+    return std::unexpected(scenario_path + ": error: " + *problem);
+  }
   // The path's mistakes (a missing key, a list on the way) are the same at every point: reported
   // once, with no point to blame.
   if (const auto path = config::check_override_path(scenario_path, param.path); !path) {

@@ -12,11 +12,12 @@ The book's numbers: 100M URLs written a day (≈1,160/s), ten reads per write (�
 and 9 % `shorten`, on a daily sine of ±50 % that peaks at 14:00 with 19.2k/s (12.8k × 1.5).
 
 ### How it is sized
-The first draft (6 web servers, one database of a primary and 2 read replicas) failed both
-SLOs: `simsys run` gave a redirect p99 of 759 ms (max 50 ms) and a drop rate of 0.200 (max
-0.001), and `explain` showed why: `web  peak offered 19.2k/s vs 18k/s total capacity (107%,
-red)` and `primary 8.64k units/s vs 5k/s (173%, red), each replica 9.683k units/s vs 5k/s
-(194%, red)`. The fixes are the book's remedies, sized with its numbers; the SLOs are unchanged.
+The first draft (6 web servers, one database of a primary and 2 read replicas) failed all three
+SLOs: `simsys run` gives it a redirect p99 of 766 ms (max 50 ms), a drop rate of 0.200 (max
+0.001) and the database's busiest copy at 1 in its worst hour (max 0.9), and `explain` shows
+why: `web  peak offered 19.2k/s vs 18k/s total capacity  (107%, red)` and `primary 8.64k
+units/s vs 5k/s (173%, red), each replica 9.683k units/s vs 5k/s (194%, red)`. The fixes are the
+book's remedies, sized with its numbers; the SLOs are unchanged.
 
 - **Web tier scaled out, 6 → 8 servers** (ch. 1 "stateless web tier"): 19.2k/s over 8 × 3k/s
   is `(80%, yellow)` at the peak. 7 would be `(91.4%, red)`. 8 also puts the tier's 24k/s
@@ -68,7 +69,7 @@ warmup).
   All three SLOs pass: `PASS p99_latency users redirect 7.49ms 50ms`, `PASS drop_rate 0 0.001`
   and `PASS utilization url_db - 0.6433 0.9 (worst 1h from 13:02)`, exit 0. No node drops
   anything; the busiest are the web tier (peak rho 0.8) and the database's replicas (0.6455).
-- **The hour the day hides** (plan 2c Task 14). The third SLO, `{metric: utilization, node:
+- **The hour the day hides.** The third SLO, `{metric: utilization, node:
   url_db, max: 0.9, over: 1h}`, is checked on every hour of the run, the hours aligned from the
   end of the 2-minute warmup (00:02-01:02, 01:02-02:02, ...), and the worst hour decides. The
   busiest database copy averages 0.4306 over the day, which a whole-day utilization SLO would
@@ -79,9 +80,10 @@ warmup).
   Release build, 6.4 s in Debug) where the first draft ran at 100 ms (862,800 steps; 4.4 s in
   Release, 65 s in Debug). The fluid step is exact while demand is constant within it, and the
   daily sine moves at most 0.003 % of its peak in a second. Compared field by field in
-  `run --report json`, the two runs agree to 1.1e-8 (utilizations, offered rates, committed
-  writes) and 2e-9 (every latency percentile; the p99 is 7.48975 ms in both): the same
-  results at a tenth of the steps. A spike is different (see the limiter below): there the
+  `run --report json`, the two runs agree to 1.1e-8 (the day's utilizations, offered rates,
+  committed writes), 2e-9 (every latency percentile; the p99 is 7.48975 ms in both) and 1.3e-6
+  (the worst hour's utilization, 0.643311 against 0.643312): the same results at a tenth of the
+  steps. A spike is different (see the limiter below): there the
   step decides how fast a full token bucket empties.
 - **The rate limiter's role.** At the shipped load it refuses nothing (rejected 0): its 20k/s
   is a ceiling just above the 19.2k/s peak. Its job shows with a spike, `spikes: [{at:
@@ -110,12 +112,12 @@ warmup).
   to the failing step's target, in whole steps: none here, a link of 0.25 ms rounds to zero
   steps), and the steps are assumed to fail independently of one another. A failed request
   costs nothing more: no retry, no timeout spent waiting.
-- The client's 1 s timeout, partly (plan 2c Task 13). Each step, the response time of an op is
+- The client's 1 s timeout, partly. Each step, the response time of an op is
   a lognormal fitted to its mean and variance; the share of it slower than 1 s is counted as
-  timed out (JSON's `timed_out_per_s`, the table's `timed out/s`), not answered, the latency
-  columns describe the requests answered in time, and no percentile is printed above 1 s (one
-  more than whose share of the requests timed out prints `>1s` and fails its SLO). The shipped
-  day never comes near it
+  timed out (JSON's `timed_out_per_s`, the table's `timed out/s`), not answered, and the mean
+  describes the requests answered in time. A percentile is read off the fit to every delivered
+  request, capped at 1 s; one at a quantile q of which more than 1 − q of the delivered requests
+  timed out (1 % for the p99) prints `>1s` and fails its SLO. The shipped day never comes near it
   (`timed_out_per_s` 0 for both ops). What it ignores: the servers still do a timed-out
   request's work (nothing cancels it), the client does not retry it, and a timed-out request is
   in no node's `drop_rate` (no node failed it).
@@ -144,9 +146,9 @@ warmup).
 - Change `id_gen` to `{type: id_generator, algorithm: ticket_server, replicas: 1}` (one
   auto-increment database, ch. 7; the loader refuses `replicas: 2` for a ticket server): the
   write path gets a hot spot. `explain`: `id_gen  peak offered 1.728k/s vs 1k/s total
-  capacity (173%, red)`. In the run it is red for 15.5 h of the day (55,650 s) and drops 22.96M
+  capacity  (173%, red)`. In the run it is red for 15.5 h of the day (55,650 s) and drops 22.96M
   id requests (drop rate 0.2309). Its full queue makes `shorten` slow, past the clients' 1 s
-  timeout (Task 13): of the 1.153k shortens/s offered over the day, 266.1/s lose their id
+  timeout: of the 1.153k shortens/s offered over the day, 266.1/s lose their id
   (0.2309), 293.6/s are timed out (`run --report json`: `timed_out_per_s` 293.57, a third of
   the 886.6/s the path delivered) and 593.0/s are answered, in 463 ms on average, p50 545 ms,
   p95 and p99 **1 s**, the timeout itself (`>1s` in the table): a third of the delivered shortens

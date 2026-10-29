@@ -16,7 +16,7 @@ is ch. 4's Redis INCR, a write; the graph refuses a store that would count it as
 client's p99 at most 50 ms.
 
 ## What the model captures
-- Each algorithm as the state ch. 4 describes, stepped every 100 ms (plan 2a refinement 6):
+- Each algorithm as the state ch. 4 describes, stepped every 100 ms (spec §17 entry 6):
   the token bucket as a fluid level that starts full; the leaky bucket as the limiter's own
   queue, one deterministic slot leaking at 1k/s with room for `burst`; the fixed window as a
   counter reset every `window`; the sliding log as a ring of the last `window`'s admitted
@@ -85,15 +85,15 @@ response over the run, so a few seconds of slow responses widen it a lot: the to
 backlog, every one of its servers is busy (rho 1), but the requests still arriving come at the
 limiter's 1k/s, rho 0.83 of the api: the model's stochastic wait reads that load, not the busy
 fraction, and the backlog's own drain time carries the rest, so the wait falls with the backlog
-(each p99 above fell 5 to 14 % when this landed in the comprehensive 2c review; the leaky
-bucket's, whose api never queues, and the fixed window's, whose queue overflows, did not move).
-The clients' `timeout: 1s` (plan 2c Task 13) changes none of the figures: of each step's fitted
+(each p99 above fell 5 to 14 % when the model changed to this reading; the leaky bucket's, whose
+api never queues, and the fixed window's, whose queue overflows, did not move).
+The clients' `timeout: 1s` changes none of the figures: of each step's fitted
 response the share past 1 s is timed out instead of answered, and almost nothing is
 (`timed_out_per_s` 0.0003 for the token bucket at `burst: 500` and at the shipped `burst: 100`,
 0.03 for the fixed window), and a client's percentile is read off the fit to every request the
-path delivered, before the cut, which the cut leaves where it was. (Until that review the reports
-refitted the answered requests alone, and a cut of 8.9e-7 of the calls moved the shipped p99 by
-2 %.)
+path delivered, before the cut, which the cut leaves where it was. (An earlier version of the
+reports refitted the answered requests alone, and a cut of 8.9e-7 of the calls moved the shipped
+p99 by 2 %.)
 
 ## Things to try
 - `burst: 5000`: each spike gets through for longer: 11.7k drops at the api, 16.5 s red,

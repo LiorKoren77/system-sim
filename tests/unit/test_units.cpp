@@ -39,8 +39,8 @@ TEST_CASE("parse_duration understands every unit used in scenario files") {
   REQUIRE(simsys::parse_duration("24h").value() == 24h);
 }
 
-// A day, for a message queue's retention (plan 2c Task 6): Kafka's default of 168 hours is
-// written `7d`, and a fraction of a day is hours: 1.5d = 36 h.
+// A day, for a message queue's retention: Kafka's default of 168 hours is written `7d`, and a
+// fraction of a day is hours: 1.5d = 36 h.
 TEST_CASE("parse_duration reads days: 7d is Kafka's 168 hours") {
   REQUIRE(simsys::parse_duration("7d").value() == 168h);
   REQUIRE(simsys::parse_duration("1d").value() == 24h);
@@ -207,7 +207,7 @@ TEST_CASE("simsys time literals equal their std::chrono counterparts") {
 }
 
 TEST_CASE("parse_clock_time reads HH:MM as an offset from midnight") {
-  // Simulated time starts at 00:00 (phase 2a refinement 1), so a clock time is a duration.
+  // Simulated time starts at 00:00 (spec §17 entry 1), so a clock time is a duration.
   REQUIRE(simsys::parse_clock_time("00:00").value() == 0s);
   REQUIRE(simsys::parse_clock_time("20:00").value() == 20h);
   REQUIRE(simsys::parse_clock_time("09:30").value() == 9h + 30min);
@@ -241,7 +241,7 @@ TEST_CASE("simsys minute and hour literals equal their std::chrono counterparts"
   SUCCEED();
 }
 
-// ---- Request sizes (phase 2c, Task 1) -------------------------------------------------------
+// ---- Request sizes (phase 2c) -------------------------------------------------------
 //
 // `Bytes` is a size in bytes, a strong type beside Rate and ByteRate (spec section 4): a size
 // cannot be passed where a rate is expected. `parse_size` reads the sizes a client's `sizes:`

@@ -27,7 +27,7 @@ same design's other limit, one database's throughput below the 10k/s requirement
 
 ## What the model captures
 - An `id_generator` is a service whose capacity and service time come from its `algorithm`
-  (plan 2b refinement 6, `defaults::for_id_algorithm`), unless the scenario states its own
+  (spec §18 entry 12, `defaults::for_id_algorithm`), unless the scenario states its own
   `capacity` or `latency`, as this lab does for the ticket server and not for the snowflake:
   - `snowflake`: 2^12 = 4096 ids per millisecond per machine (the 12 sequence bits), so
     4.096M/s per replica, 10 us each; replicas add capacity (no coordination);
@@ -54,8 +54,8 @@ same design's other limit, one database's throughput below the 10k/s requirement
   their values. 64 bits versus UUID's 128 (122 of them random) is not modelled.
 - The ticket server's single point of failure: failures are phase 3 (`faults`). The chapter's
   remedy, several ticket servers kept in sync, is not a mode of the model.
-- How a timed-out request ends: the services give up after their `timeout: 50ms` (plan 2c Task
-  13: the share of each step's fitted response slower than that is timed out, not answered), but
+- How a timed-out request ends: the services give up after their `timeout: 50ms` (the share of
+  each step's fitted response slower than that is timed out, not answered), but
   the generator still issues the id, and nobody retries.
 
 ## Results (`simsys run`, 10 min, after the 30 s warmup)

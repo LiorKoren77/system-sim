@@ -80,7 +80,7 @@ nodes:
   # 6 shards, each a primary + 2 read replicas. Per copy at the peak: primary 10.81k / 6 = 1.802k
   # units/s (36 %); replica the post_cache misses, 5 % x 259.4k = 12.97k reads/s over 12 replicas,
   # + 1.802k replayed = 2.883k units/s (57.7 %). With 5 shards a replica would be at 69.2 %, over
-  # two-thirds (it still passes every SLO, less than a point from yellow's 70 %), with 4 at 86 %,
+  # two-thirds (it still passes every SLO, less than a point from yellow's 70 %), with 4 at 86.5 %,
   # with 3 at 115 %, red.
   post_db:
     type: sql_db

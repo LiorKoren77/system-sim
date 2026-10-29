@@ -1,5 +1,5 @@
-// SLOs per window, `over:` (plan 2c Task 14; book ch. 3: non-functional requirements are checked
-// against the load the system really has, and a day's average hides the hour that breaks it).
+// SLOs per window, `over:` (book ch. 3: non-functional requirements are checked against the load
+// the system really has, and a day's average hides the hour that breaks it).
 //
 // Model under test: an SLO with `over: <duration>` is evaluated on every window of that length,
 // the windows aligned from the END OF WARMUP and stepping window by window (warmup, warmup +
@@ -327,8 +327,7 @@ TEST_CASE("a last window shorter than over is evaluated: 5 minutes at 0.9 fail a
 }
 
 // The same run's report names the window by the length it had, 5 minutes, not by `over`: a label
-// `(worst 10m from 00:20)` would claim ten minutes of a run that ends at 00:25 (review of the Task
-// 12/13 fix rounds and Task 14, minor 5).
+// `(worst 10m from 00:20)` would claim ten minutes of a run that ends at 00:25.
 TEST_CASE("a short last window is labelled with its real length: worst 5m from 00:20", "[theory]") {
   const auto s = one_service("duration: 25m\nstep: 1s\n",
                              "{base: 1k/s, spikes: [{at: 00:20, for: 5m, factor: 1.8}]}",
@@ -378,11 +377,10 @@ TEST_CASE("a window in which the client offered nothing is not the worst: the re
   REQUIRE(*start == 600.0);
 }
 
-// Nothing offered in any window: every window is skipped, so the SLO has nothing to evaluate and
-// is skipped itself (status `skipped`, no observed value, the table's `-`), never a pass on an
-// idle service's 4.9 ms (an idle p99 is the service time's own). The whole-run SLO of this
-// scenario is skipped the same way, an op nobody sent having no latency (review of the kv/search
-// fix round, M-1).
+// Nothing offered in any window: every window is skipped, so the SLO has nothing to evaluate and is
+// skipped itself (status `skipped`, no observed value, the table's `-`), never a pass on an idle
+// service's 4.9 ms (an idle p99 is the service time's own). The whole-run SLO of this scenario is
+// skipped the same way, an op nobody sent having no latency.
 TEST_CASE("an slo whose every window offered nothing is skipped, with nothing observed",
           "[theory]") {
   const auto s = one_service("duration: 10m\nstep: 1s\n", "{points: [[0s, 0/s], [10m, 0/s]]}",
@@ -396,11 +394,11 @@ TEST_CASE("an slo whose every window offered nothing is skipped, with nothing ob
 
 // ---- Every window is judged for a metric other than latency --------------------------------
 //
-// (Review of the Task 12/13 fix rounds and Task 14, I-1.) Only a latency SLO needs an offered
-// request to have something to bound. A node keeps working after its clients stop: one server of
-// 100 ms (10/s, c = 1) with room for 10k requests is sent 100/s from 00:04 to 00:05 and nothing
-// else. In that minute it drains 10/s and queues 90/s: 5,400 requests, which it drains at 10/s
-// for 540 s after 00:05, until 00:14. Its utilization per 5-minute window:
+// Only a latency SLO needs an offered request to have something to bound. A node keeps working
+// after its clients stop: one server of 100 ms (10/s, c = 1) with room for 10k requests is sent
+// 100/s from 00:04 to 00:05 and nothing else. In that minute it drains 10/s and queues 90/s: 5,400
+// requests, which it drains at 10/s for 540 s after 00:05, until 00:14. Its utilization per
+// 5-minute window:
 //   00:00-00:05: 1 minute busy of 5   -> 0.2
 //   00:05-00:10: busy throughout      -> 1
 //   00:10-00:15: busy until 00:14     -> 0.8
@@ -459,8 +457,8 @@ TEST_CASE("an idle run passes a windowed utilization SLO at 0 and skips a window
 // ---- `estimate` measures no window ------------------------------------------------------------
 //
 // `estimate` evaluates one steady state at t = 0. An SLO with `over` is checked on that one record,
-// and the report says so instead of naming a window it never measured (review of the Task 12/13 fix
-// rounds and Task 14, minor 1): `(at 00:00 only: run checks each 10m)`, and no `window_start_s`.
+// and the report says so instead of naming a window it never measured: `(at 00:00 only: run checks
+// each 10m)`, and no `window_start_s`.
 TEST_CASE("estimate checks an slo with over at 00:00 only and names no window", "[theory]") {
   const auto s = one_service(spike_hour_timing, spike_rate,
                              "  - {metric: utilization, node: s, max: 0.8, over: 10m}\n");

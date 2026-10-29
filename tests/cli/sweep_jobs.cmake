@@ -1,6 +1,6 @@
-# Process-level checks of `simsys sweep` (plan 2c Task 15): that the number of workers cannot
-# show in the output, and what the exit code says, can only be seen from outside the process.
-# Registered in tests/CMakeLists.txt, one ctest entry per CHECK.
+# Process-level checks of `simsys sweep`: that the number of workers cannot show in the output, and
+# what the exit code says, can only be seen from outside the process. Registered in
+# tests/CMakeLists.txt, one ctest entry per CHECK.
 #
 # Run by ctest as a CMake script:
 #   cmake -DSIMSYS=<simsys> -DSCENARIO=<hello's scenario.yaml> -DWORK=<scratch dir> -DCHECK=<name>
@@ -15,7 +15,10 @@
 #                       file does not have and a value the loader refuses each exit 1, with the
 #                       reason on stderr and nothing on stdout;
 #   slo_failure_exit_0 - a sweep where an SLO fails at every point still exits 0 (`run` on the
-#                       same file exits 2): a sweep reports numbers, it does not judge them.
+#                       same file exits 2): a sweep reports numbers, it does not judge them;
+#   error_prefixes    - every refusal of an option starts as the CLI's other errors do, with the
+#                       file and `error:`, then names its option the same way, `--param: ` or
+#                       `--metric: `, whether the text, the file or the loader found the mistake.
 cmake_minimum_required(VERSION 3.28)
 
 file(REMOVE_RECURSE "${WORK}")
@@ -132,6 +135,28 @@ elseif(CHECK STREQUAL "refuses_bad_param")
   if(at EQUAL -1)
     message(FATAL_ERROR "stderr does not name the unknown metric:\n${sweep_err}")
   endif()
+elseif(CHECK STREQUAL "error_prefixes")
+  set(param_prefix "${SCENARIO}: error: --param: ")
+  set(metric_prefix "${SCENARIO}: error: --metric: ")
+  foreach(case
+          "${param_prefix}|--param|nodes.users.rate.base|--metric|api.mean_rho"
+          "${param_prefix}|--param|nodes.api.workers=400..600:4|--metric|api.mean_rho"
+          "${param_prefix}|--param|nodes.users.rate.bse=100/s..900/s:3|--metric|api.mean_rho"
+          "${param_prefix}|--param|links.0.latency=1ms..2ms:2|--metric|api.mean_rho"
+          "${metric_prefix}|--param|${PARAM}|--metric|api.nonsense"
+          "${metric_prefix}|--param|${PARAM}|--metric|api.lag"
+          "${metric_prefix}|--param|${PARAM}|--metric|nope.mean_rho")
+    string(REPLACE "|" ";" words "${case}")
+    list(POP_FRONT words prefix)
+    run_sweep("${SCENARIO}" ${words})
+    if(NOT sweep_code EQUAL 1)
+      message(FATAL_ERROR "expected exit 1, got ${sweep_code} for ${words}\nstderr: ${sweep_err}")
+    endif()
+    string(FIND "${sweep_err}" "${prefix}" at)
+    if(NOT at EQUAL 0)
+      message(FATAL_ERROR "stderr does not start with '${prefix}' for ${words}:\n${sweep_err}")
+    endif()
+  endforeach()
 elseif(CHECK STREQUAL "slo_failure_exit_0")
   # hello at 100/s has a p99 of about 5.7 ms: a 1 ms SLO fails at every point of the sweep.
   file(READ "${SCENARIO}" hello_yaml)

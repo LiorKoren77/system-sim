@@ -1,7 +1,7 @@
-// `simsys sweep` (plan 2c Task 15): run one scenario over a range of one key, one simulation
-// per point, the points in parallel. Properties of the pieces: the `--param` grammar
-// (`<dot.path>=<from>..<to>:<n>`), the `--metric` names, the loader's `Override`, the sweep
-// itself (values pinned against M/M/1 on the tutorial's hello scenario) and the two renderings.
+// `simsys sweep`: run one scenario over a range of one key, one simulation per point, the points in
+// parallel. Properties of the pieces: the `--param` grammar (`<dot.path>=<from>..<to>:<n>`), the
+// `--metric` names, the loader's `Override`, the sweep itself (values pinned against M/M/1 on the
+// tutorial's hello scenario) and the two renderings.
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -270,8 +270,8 @@ TEST_CASE(
   }
 }
 
-// The run table's other figures (comprehensive 2c review): an op's percentiles as the op table
-// prints them, a node's peak utilization and its drop rate.
+// The run table's other figures: an op's percentiles as the op table prints them, a node's peak
+// utilization and its drop rate.
 TEST_CASE("a client op's p50, p95 and p99 and a node's peak_rho and drop_rate are metrics") {
   using simsys::sweep::MetricKind;
   const std::array expected{std::pair{"users.ping.p50", MetricKind::p50_latency},
@@ -295,9 +295,9 @@ TEST_CASE("a client has no drop rate to sweep, as it has no utilization") {
   const std::vector<SweepMetric> metrics{*drops};
   const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1);
   REQUIRE_FALSE(rows.has_value());
-  REQUIRE(rows.error() ==
-          "--metric users.drop_rate: 'users' is a client, which serves nothing, so it has no drop "
-          "rate");
+  REQUIRE(rows.error() == std::string{hello_path} +
+                              ": error: --metric: users.drop_rate: 'users' is a client, which "
+                              "serves nothing, so it has no drop rate");
 }
 
 TEST_CASE("an unknown metric is refused and named") {

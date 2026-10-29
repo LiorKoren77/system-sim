@@ -1,6 +1,6 @@
-// Module `simsys.sweep`, interface unit: `simsys sweep` (plan 2c Task 15) runs one scenario over
-// a range of one key, one simulation per point, the points in parallel, and prints one row per
-// point with the metrics asked for.
+// Module `simsys.sweep`, interface unit: `simsys sweep` runs one scenario over a range of one key,
+// one simulation per point, the points in parallel, and prints one row per point with the metrics
+// asked for.
 //
 // Models: nothing new from the book. A sweep is the capacity-planning question of System Design
 // Interview ch. 1 and 2 ("how does the system behave as the load grows?") asked of the simulator

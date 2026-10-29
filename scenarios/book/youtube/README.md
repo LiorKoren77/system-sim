@@ -13,7 +13,7 @@
   and its GB/s capacities. An upload is split into `upload` (the bytes, straight to
   `original_store`) and `upload_meta` (the presigned-URL request and metadata write, through the
   API).
-- The CDNs and the two blob stores count megabytes (phase 2c): a 50 MB stream costs 50 units of
+- The CDNs and the two blob stores count megabytes: a 50 MB stream costs 50 units of
   1 MB, the service time is one megabyte's (10 ms at a CDN, 40 ms at a blob store, the book's
   per-MB rows), so `cdn_us` at 100GB/s has 1000 slots that each move one stream at a time
   (`c=1000 slots (1 object each)`) and saturates at 2k streams/s. `explain` checks them in MB/s
@@ -45,7 +45,7 @@
   interleave their flows packet by packet instead of sending one object at a time: a stream's first
   megabyte would then take about 0.2 ms / (1 − 0.571) ≈ 0.47 ms in all (processor sharing
   stretches a transfer by 1 / (1 − rho)), so the model's whole-object wait is an upper bound.
-- `original_store`'s `then` is an S3-style event notification (phase 2c): each upload it stores
+- `original_store`'s `then` is an S3-style event notification: each upload it stores
   publishes one message to `transcode_q`, asynchronously (the uploader is answered by the store
   alone). Only a write fires an event (`upload`, the store's `write_ops`), as S3 notifies on
   ObjectCreated and never on a GET.
@@ -57,7 +57,8 @@
   the size mix's alone, which Kingman's correction (Allen–Cunneen) adds to the wait: one size
   waits like M/D/c, half the M/M/c wait, and small requests beside large ones lengthen the large
   ones' wait. It matters near saturation: at rho 0.9, 50 MB objects at a default blob store
-  (20 slots) wait 0.28 s, where 1 MB units would say 11 ms. And no wait outlasts the waiting room:
+  (20 slots) wait 0.28 s, where counting 1 MB units, as the first version of the model did, said
+  11 ms. And no wait outlasts the waiting room:
   `original_store`'s 1000 MB drain at 5 GB/s in 0.2 s, so an upload waits at most 0.2 s there
   even past saturation. At the 21:00 peak (rho 0.576 over 200 slots) it waits nothing
   measurable. When a request is answered depends on its direction: a stream is a read, answered
@@ -96,8 +97,9 @@
 ## Uploads and the timeout
 A 300 MB upload is a write, acknowledged at its last byte: 300 MB × 40 ms per MB = 12 s at
 `original_store`, plus the link there and back (0.5 ms in the US, 150 ms across the Atlantic).
-Before the phase 2c sizing the clients had `timeout: 10s`, so **every** upload timed out (`timed
-out/s` equal to `offered/s`, `>10s` in its percentiles) although the store stored each one. The
+With `timeout: 10s` on the clients, which an earlier version of this file had, **every** upload
+times out (`timed out/s` equal to `offered/s`, `>10s` in its percentiles) although the store
+stores each one. The
 book's answer is resumable uploads: the file goes up in chunks, and a client that gives up gives up
 on a chunk and retries it, never on the whole file. The model has one timeout per client, not one
 per chunk, so that timeout must exceed the whole file's acknowledgement: 12 s in the US, 12.15 s in
@@ -134,9 +136,10 @@ slo
   207 ms. The SLO passes with room either way. The US streams show the same: hit or miss inside
   one region, at most 10.5 + 0.5 (the link to the store and back) + 40 = 51 ms, reported p99
   97.6 ms. (The search-autocomplete
-  README shows the fit's other face, a p99 that *falls* when its two populations merge into one;
-  whether percentiles should respect a path's hard bound is an open item of the phase 2c
-  review.)
+  README shows the fit's other face, a p99 that *falls* when its two populations merge into one.
+  The schema's "[How percentiles are estimated, and where they
+  mislead](../../../docs/scenario-schema.md#how-percentiles-are-estimated-and-where-they-mislead)"
+  says why the reports label the percentiles rather than clip them at a path's slowest time.)
 - `transcode_q`'s lag, 573 ms against 30 minutes: the Erlang wait above.
 - `cdn_us` with `over: 1h`: the SLO is checked on every hour of the day (aligned from the end of
   the warmup), and the worst, 20:05 to 21:05, is 0.1403. Without `over` the SLO judged the
@@ -203,7 +206,9 @@ diurnal scenario with a pool, `run` is the verdict.
   MB/s (209.7/s), 52.4 %; in the run its peak rho is 0.5244 (0.4906 as shipped) and the US
   stream p99 101 ms (97.6 ms), every SLO still passing.
 - Set `timeout: 10s` on the viewers: every upload times out again (3.994 and 1.997 timed out a
-  second over the day, all that is offered), and nothing else in the run changes.
+  second over the day, all that is offered). The European streams' `timed out/s` rises from
+  5.6e-11 to 2.3e-7, the fitted lognormal's tail past 10 s instead of past 30 s; every
+  percentile and every SLO verdict stays as it was.
 - Put `transcoded_store.capacity` back to `10GB/s`: `explain` turns it red (98.1 %), and in the
   run it is red for 18.62k s around the evening, its peak rho 0.9811; the European p99 rises to
   498 ms, still within 2 s.

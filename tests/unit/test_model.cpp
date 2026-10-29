@@ -136,7 +136,7 @@ TEST_CASE("write_ops absent is the type's default and present is exactly what wa
   REQUIRE(write_ops_of(cache) == std::vector<std::string>{"set", "delete"});
 }
 
-// ---- ID generator (plan 2b refinement 6; book ch. 7 "Design a unique ID generator") ----
+// ---- ID generator (spec §18 entry 12; book ch. 7 "Design a unique ID generator") ----
 //
 // The three designs the chapter compares are a closed set, spelled in scenario files as
 // `algorithm: snowflake | ticket_server | uuid`; one name table drives both directions, exactly
@@ -176,11 +176,10 @@ TEST_CASE("a default NodeSpec has no id algorithm", "[model]") {
   REQUIRE_FALSE(n.id_algorithm.has_value());
 }
 
-// Request sizes and link bandwidth are optional in the scenario (phase 2c, Task 1): a client
-// states `sizes:` only for ops that carry bytes, a step `size:` only when it carries its own
-// payload, a link `bandwidth:` only when the pipe is a constraint. Absent means "not stated",
-// never zero, so the graph can tell an unsized op (an error at a byte-sized node) from a
-// zero-byte one.
+// Request sizes and link bandwidth are optional in the scenario (phase 2c): a client states
+// `sizes:` only for ops that carry bytes, a step `size:` only when it carries its own payload, a
+// link `bandwidth:` only when the pipe is a constraint. Absent means "not stated", never zero, so
+// the graph can tell an unsized op (an error at a byte-sized node) from a zero-byte one.
 TEST_CASE("a default Workload states no request sizes", "[model]") {
   const simsys::model::Workload w{};
   REQUIRE(w.sizes.empty());
@@ -196,7 +195,7 @@ TEST_CASE("a default LinkSpec states no bandwidth", "[model]") {
   REQUIRE_FALSE(l.bandwidth.has_value());
 }
 
-// ---- Message queues and worker pools (plan 2c refinements 4-5, Task 6) ----
+// ---- Message queues and worker pools (spec §19 entries 4-5) ----
 //
 // The five keys the loader types for the two asynchronous-work node types. All are optionals:
 // "absent" means "the type's default" (the retention) or "not stated" (the rest), so that explain
@@ -238,7 +237,7 @@ TEST_CASE(
   REQUIRE(pool.cost.empty());
 }
 
-// ---- External sinks (plan 2c refinement 8, Task 9) ----
+// ---- External sinks (spec §19 entry 8) ----
 //
 // An external sink is a third party's API (APNs, an SMS provider): a queue of the type's numbers
 // that fails a share of what it serves. Two typed keys describe it:
@@ -261,7 +260,7 @@ TEST_CASE("an external sink's failure rate is a number and its politeness a rate
   REQUIRE(sink.politeness->per_second == 1.0);
 }
 
-// ---- Search indexes (plan 2c refinement 10, Task 11) ----
+// ---- Search indexes (spec §19 entry 10) ----
 //
 // A search index serves like a service (read-mostly, spec section 7), and the one key it owns,
 // `build_interval`, says how often the index is rebuilt from the logs (ch. 13: the trie is rebuilt

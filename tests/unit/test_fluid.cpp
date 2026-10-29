@@ -127,9 +127,9 @@ TEST_CASE("settle jumps to the long-run state: empty below capacity, full above"
   REQUIRE(over.backlog() == Approx(1000));
 }
 
-// Review of plan 2c, 5c: at demand = capacity the fluid neither grows nor drains, so stepping from
-// an empty room keeps it empty; settle agrees (strict >), so `estimate` and `run` report the same
-// node at rho 1: an empty room and the 0.99 clamp's wait, Wq = rho / (1 − rho) × s = 99 ms.
+// At demand = capacity the fluid neither grows nor drains, so stepping from an empty room keeps it
+// empty; settle agrees (strict >), so `estimate` and `run` report the same node at rho 1: an empty
+// room and the 0.99 clamp's wait, Wq = rho / (1 − rho) × s = 99 ms.
 TEST_CASE("settle at exactly capacity keeps the room empty, as stepping does", "[fluid]") {
   FluidQueue settled{web()};
   settled.settle(Rate{1000});
@@ -181,9 +181,8 @@ TEST_CASE("a backlog larger than one step's spare capacity drains at full capaci
   REQUIRE(s.rho == Approx(1.0));  // busy draining, not "50% utilized"
   REQUIRE(s.zone == Zone::red);
   // The stochastic term reads the ARRIVALS' utilization, min(demand, drain) / cap = 500 / 1000 =
-  // 0.5, not the busy rho 1 (review of plan 2c, 5b): the new requests bunch as at half load, and
-  // the queue they find is the backlog. M/M/1 at rho 0.5 (c = 1, so P_wait = rho = 0.5; k = 1 for
-  // Poisson/exponential):
+  // 0.5, not the busy rho 1: the new requests bunch as at half load, and the queue they find is the
+  // backlog. M/M/1 at rho 0.5 (c = 1, so P_wait = rho = 0.5; k = 1 for Poisson/exponential):
   //   theta   = s / (c (1 - rho)) = 0.001 / 0.5 = 0.002 s
   //   Wq      = P theta = 0.5 * 0.002 = 1 ms
   //   Var(Wq) = P (2 - P) theta^2 = 0.5 * 1.5 * 4e-6 = 3e-6 s^2
@@ -245,12 +244,11 @@ TEST_CASE("a step reports the queueing wait apart from the service time", "[flui
   REQUIRE_THAT(s.latency.variance_s2, WithinRel(s.wait.variance_s2 + 1e-6, 1e-12));
 }
 
-// A byte-sized node's queue is fed the moments of its objects' service time each step (review of
-// plan 2c Task 3, I1, and of its fix round, I1) while its rate and c stay those of its megabytes,
-// so rho does not move and the wait scales with the mean time: a 20-slot store of 500 MB/s at
-// 250 MB/s is at rho 0.5 whether one slot is held 40 ms (one MB) or 2 s (a 50 MB object), and with
-// exponential service (SCV 1) Erlang C's wait is C(20, 0.5) x s / (20 x 0.5): 0.0149 ms against
-// 0.746 ms.
+// A byte-sized node's queue is fed the moments of its objects' service time each step while its
+// rate and c stay those of its megabytes, so rho does not move and the wait scales with the mean
+// time: a 20-slot store of 500 MB/s at 250 MB/s is at rho 0.5 whether one slot is held 40 ms (one
+// MB) or 2 s (a 50 MB object), and with exponential service (SCV 1) Erlang C's wait is C(20, 0.5) x
+// s / (20 x 0.5): 0.0149 ms against 0.746 ms.
 TEST_CASE("setting the service moments changes the Erlang wait and leaves rho alone", "[fluid]") {
   FluidQueue q{Capacity{.service_rate = Rate{500}, .service_time_s = 0.040, .concurrency = 20}};
   const auto per_megabyte = q.advance(Rate{250}, 100ms);
@@ -297,14 +295,14 @@ TEST_CASE(
                     std::invalid_argument);
 }
 
-// The room-drain bound (review of plan 2c Task 3's fix round, C1): a request admitted to a waiting
-// room of K units cannot wait longer than the room takes to drain, K / service_rate, so the
-// stochastic term is min(Kingman wait, K / rate) (exact for a deterministic drain, conservative
-// for random service: M/M/c/K's mean wait is below it). A 500 MB/s store with a 1000 MB room fed
-// 600 MB/s of 2 s objects is past saturation: Erlang C at the 0.99 clamp would say C(20, 0.99) x
-// 2 s / (20 x 0.01) = 9.48 s, but the room drains in 1000 / 500 = 2 s, and that is the wait. Its
-// spread is capped at the room's scale, T^2 / 4 (our heuristic, not a theorem), here 1 s^2, where
-// the clamp's variance is 99.7 s^2: the cap is what the variance is.
+// The room-drain bound: a request admitted to a waiting room of K units cannot wait longer than the
+// room takes to drain, K / service_rate, so the stochastic term is min(Kingman wait, K / rate)
+// (exact for a deterministic drain, conservative for random service: M/M/c/K's mean wait is below
+// it). A 500 MB/s store with a 1000 MB room fed 600 MB/s of 2 s objects is past saturation: Erlang
+// C at the 0.99 clamp would say C(20, 0.99) x 2 s / (20 x 0.01) = 9.48 s, but the room drains in
+// 1000 / 500 = 2 s, and that is the wait. Its spread is capped at the room's scale, T^2 / 4 (our
+// heuristic, not a theorem), here 1 s^2, where the clamp's variance is 99.7 s^2: the cap is what
+// the variance is.
 TEST_CASE("a queue's stochastic wait is bounded by the time its waiting room takes to drain",
           "[fluid]") {
   FluidQueue q{Capacity{

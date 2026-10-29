@@ -21,8 +21,8 @@ target_link_libraries(theory_tests PRIVATE simsys Catch2::Catch2WithMain simsys_
 target_compile_definitions(theory_tests PRIVATE SIMSYS_SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios")
 catch_discover_tests(theory_tests)
 
-# simsys itself, run as a process: what `run` does to the series files on disk (review of
-# 3e23477, M1 and M2). One scratch directory per check, so `ctest -j` runs them side by side.
+# simsys itself, run as a process: what `run` does to the series files on disk. One scratch
+# directory per check, so `ctest -j` runs them side by side.
 foreach(check same_file keeps_file)
   if(check STREQUAL "same_file")
     set(name "simsys run refuses one file for both series")
@@ -36,14 +36,16 @@ foreach(check same_file keeps_file)
                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/series_paths.cmake)
 endforeach()
 
-# simsys sweep, run as a process (plan 2c Task 15): the output does not depend on --jobs, a bad
-# --param is an error (exit 1), a failing SLO at some point is not (exit 0). One scratch
-# directory per check, so `ctest -j` runs them side by side.
-foreach(check same_bytes refuses_bad_param slo_failure_exit_0)
+# simsys sweep, run as a process: the output does not depend on --jobs, a bad --param is an error
+# (exit 1), a failing SLO at some point is not (exit 0). One scratch directory per check, so `ctest
+# -j` runs them side by side.
+foreach(check same_bytes refuses_bad_param error_prefixes slo_failure_exit_0)
   if(check STREQUAL "same_bytes")
     set(name "simsys sweep gives the same bytes with --jobs 1 and 3")
   elseif(check STREQUAL "refuses_bad_param")
     set(name "simsys sweep exits 1 on a bad --param")
+  elseif(check STREQUAL "error_prefixes")
+    set(name "simsys sweep words every option refusal as file, error, then the option")
   else()
     set(name "simsys sweep exits 0 when an SLO fails at some point")
   endif()
@@ -54,8 +56,8 @@ foreach(check same_bytes refuses_bad_param slo_failure_exit_0)
                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/sweep_jobs.cmake)
 endforeach()
 
-# simsys run --duration, run as a process (review of plan 2c Task 19): the override is held to the
-# file's own rules, the warmup and every SLO's `over` window.
+# simsys run --duration, run as a process: the override is held to the file's own rules, the warmup
+# and every SLO's `over` window.
 foreach(check warmup over)
   if(check STREQUAL "warmup")
     set(name "simsys run refuses a duration not longer than the warmup")

@@ -16,51 +16,48 @@
 // target's response table before it is refreshed this step
 // (engine::Simulation::backward_pass).
 //
-// Models: the arrows of a System Design Interview (Alex Xu, vol. 1) diagram. Each box of
-// the book's designs (ch. 1 scaling, ch. 11 news feed, ch. 12 chat, ...) becomes a
-// ResolvedNode; each arrow that carries requests becomes a DemandEdge over a
-// ResolvedLink. Captured: who sends demand to whom and over which link, how long a hop
-// takes (one way, from the book's datacenter round trips), how a client splits an op
-// over several entry points (CDN vs origin, two load balancers), and which arrows close
-// a loop (chat servers -> message queue -> sync workers -> chat servers), and, for a link that
-// states a `bandwidth`, the pipe the engine queues its megabytes in (ResolvedLink::pipe, plan 2c
-// refinement 3; every request it carries must have a size). Ignored: link failures (phase 3),
-// and any per-request routing decision —
-// splits are fixed fractions, as round-robin or a weighted DNS record would give. A load
-// balancer's policy is resolved here too, as a property of the node BEHIND it (plan 2a
-// refinement 5, see mark_balanced_targets): its ReplicaModel, whether its replicas queue
-// apart, as one pool, or with a hot spot. A drained route (link weight 0) carries nothing,
-// so it brings no op, closes no call cycle and imposes no replica model. A rate limiter
-// forwards like a balancer (per link, by weight) whatever it admits, and its `backend` (the
-// counter store) becomes a demand edge of its own, carrying op `counter` (plan 2a
-// refinement 6, see connect_backends). A cache (plan 2a refinement 7) contributes two
-// things: its hit ratio h (Graph::hit_ratio; a CDN's too), stated (`{fixed: h}`) or computed
-// once here by the Che approximation from the cache size and the key distribution of the
-// clients whose ops reach it (plan 2b refinements 1-2, see resolve_hit_ratios), which turns a
-// service's `on: miss` step after it into a hop taken by the miss fraction 1 - h of the requests
-// (Graph::service_hops), and, for the strategies in which the cache itself talks to the store,
-// a demand edge to its `backend` (Graph::backend_fraction says which share of each op takes
-// it; a write_back cache's flush over it is asynchronous by design, detail::write_back_flushes),
-// and its `then` steps, demand edges like a service's steps whose share of each op is
-// Graph::then_fraction (plan 2b refinement 5: what goes on to the next tier after the cache).
-// A CDN (plan 2b refinement 4) is the read_through shape of a cache: its `origin` becomes its
-// backend (Graph::connect_store), a demand edge carrying 1 - h of each read as the same op, no
-// write may reach it (Graph::check_reads_only), and no service `on: miss` step may follow it.
-// A blob store's `then` steps (plan 2c refinements 6-7) are its event notifications (S3 event
-// notifications, ch. 14 and 15): demand edges like a cache's unconditional steps, fired by every
-// write it serves (an op in its `write_ops`; a read fires nothing, Graph::then_fraction), and
-// asynchronous hops by design (detail::blob_store_events); a step on miss or on failure, or in
-// parallel mode, is refused, since an event is none of those (invalid_blob_store).
-// A message queue (plan 2c refinements 4-6; book ch. 1's message queue, ch. 10's queue-plus-workers
-// notification system, Kafka in ch. 14's transcoding and ch. 15's notification pipelines) COPIES:
-// each link out of it goes to a worker pool that `consumes` it (a consumer group), and every group
-// receives every message, so the queue's routes are one per group, each of share 1 (route_queue;
-// a queue nobody consumes is refused); the hops along them are asynchronous by design
-// (detail::consumer_deliveries: the publisher is answered at the append).
-// A worker pool is M/M/c over consumption: c = workers, service time = cost, rate workers / cost
-// (defaults::worker_pool_rate), and a waiting room of the messages its queue keeps,
-// retention × that rate (connect_consumers). It takes jobs from the queue it consumes and from
-// nobody else (check_pool_senders).
+// Models: the arrows of a System Design Interview (Alex Xu, vol. 1) diagram. Each box of the book's
+// designs (ch. 1 scaling, ch. 11 news feed, ch. 12 chat, ...) becomes a ResolvedNode; each arrow
+// that carries requests becomes a DemandEdge over a ResolvedLink. Captured: who sends demand to
+// whom and over which link, how long a hop takes (one way, from the book's datacenter round trips),
+// how a client splits an op over several entry points (CDN vs origin, two load balancers), and
+// which arrows close a loop (chat servers -> message queue -> sync workers -> chat servers), and,
+// for a link that states a `bandwidth`, the pipe the engine queues its megabytes in
+// (ResolvedLink::pipe, spec §19 entry 3; every request it carries must have a size). Ignored: link
+// failures (phase 3), and any per-request routing decision — splits are fixed fractions, as
+// round-robin or a weighted DNS record would give. A load balancer's policy is resolved here too,
+// as a property of the node BEHIND it (spec §17 entry 5, see mark_balanced_targets): its
+// ReplicaModel, whether its replicas queue apart, as one pool, or with a hot spot. A drained route
+// (link weight 0) carries nothing, so it brings no op, closes no call cycle and imposes no replica
+// model. A rate limiter forwards like a balancer (per link, by weight) whatever it admits, and its
+// `backend` (the counter store) becomes a demand edge of its own, carrying op `counter` (spec §17
+// entry 6, see connect_backends). A cache (spec §17 entry 7) contributes two things: its hit ratio
+// h (Graph::hit_ratio; a CDN's too), stated (`{fixed: h}`) or computed once here by the Che
+// approximation from the cache size and the key distribution of the clients whose ops reach it
+// (spec §18 entries 1-2, see resolve_hit_ratios), which turns a service's `on: miss` step after it
+// into a hop taken by the miss fraction 1 - h of the requests (Graph::service_hops), and, for the
+// strategies in which the cache itself talks to the store, a demand edge to its `backend`
+// (Graph::backend_fraction says which share of each op takes it; a write_back cache's flush over it
+// is asynchronous by design, detail::write_back_flushes), and its `then` steps, demand edges like a
+// service's steps whose share of each op is Graph::then_fraction (spec §18 entry 5: what goes on to
+// the next tier after the cache). A CDN (spec §18 entry 10) is the read_through shape of a cache:
+// its `origin` becomes its backend (Graph::connect_store), a demand edge carrying 1 - h of each
+// read as the same op, no write may reach it (Graph::check_reads_only), and no service `on: miss`
+// step may follow it. A blob store's `then` steps (spec §19 entries 6-7) are its event
+// notifications (S3 event notifications, ch. 14 and 15): demand edges like a cache's unconditional
+// steps, fired by every write it serves (an op in its `write_ops`; a read fires nothing,
+// Graph::then_fraction), and asynchronous hops by design (detail::blob_store_events); a step on
+// miss or on failure, or in parallel mode, is refused, since an event is none of those
+// (invalid_blob_store). A message queue (spec §19 entries 4-6; book ch. 1's message queue, ch. 10's
+// queue-plus-workers notification system, Kafka in ch. 14's transcoding and ch. 15's notification
+// pipelines) COPIES: each link out of it goes to a worker pool that `consumes` it (a consumer
+// group), and every group receives every message, so the queue's routes are one per group, each of
+// share 1 (route_queue; a queue nobody consumes is refused); the hops along them are asynchronous
+// by design (detail::consumer_deliveries: the publisher is answered at the append). A worker pool
+// is M/M/c over consumption: c = workers, service time = cost, rate workers / cost
+// (defaults::worker_pool_rate), and a waiting room of the messages its queue keeps, retention ×
+// that rate (connect_consumers). It takes jobs from the queue it consumes and from nobody else
+// (check_pool_senders).
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -121,18 +118,17 @@ struct EngineError {
   std::string message;
 };
 
-// A cache's or CDN's hit ratio h as the graph resolved it (plan 2b refinements 1-2):
-// `value`, and for `che` the inputs explain prints as its provenance: the key distribution
-// the clients send (`keys`), those clients (`key_clients`, node indices in scenario order),
-// and the cache size the approximation used (`capacity`, in keys): the cache's `keys`, times
-// its replicas when a consistent-hash ring partitions the key space over them (`partitions`,
-// the replica count then, 1 otherwise; the arcs are uneven, see detail::ring_arcs). When the
-// keys arrive as the misses of another che cache, `filtered_by` names it (the popularity is
-// that cache's, filtered: caching::Popularity::filtered_by); when they pass a cache with no
-// characteristic time to filter by (a fixed ratio), `unfiltered_through` names it and the
-// popularity is used unfiltered. `shards` is what a cache behind THIS one filters by: each
-// arc's key share and characteristic time (one shard of share 1 for an unpartitioned cache).
-// A fixed ratio has none of these.
+// A cache's or CDN's hit ratio h as the graph resolved it (spec §18 entries 1-2): `value`, and for
+// `che` the inputs explain prints as its provenance: the key distribution the clients send
+// (`keys`), those clients (`key_clients`, node indices in scenario order), and the cache size the
+// approximation used (`capacity`, in keys): the cache's `keys`, times its replicas when a
+// consistent-hash ring partitions the key space over them (`partitions`, the replica count then, 1
+// otherwise; the arcs are uneven, see detail::ring_arcs). When the keys arrive as the misses of
+// another che cache, `filtered_by` names it (the popularity is that cache's, filtered:
+// caching::Popularity::filtered_by); when they pass a cache with no characteristic time to filter
+// by (a fixed ratio), `unfiltered_through` names it and the popularity is used unfiltered. `shards`
+// is what a cache behind THIS one filters by: each arc's key share and characteristic time (one
+// shard of share 1 for an unpartitioned cache). A fixed ratio has none of these.
 struct ResolvedHitRatio {
   double value{};
   std::optional<model::KeySpec> keys{};
@@ -161,9 +157,9 @@ struct ResolvedNode {
   double imbalance{1.0};
   bool keys_partitioned{false};
   // A rate limiter's counter store, the store behind a cache whose strategy calls it
-  // (model::needs_backend), or a CDN's origin (plan 2b refinement 4: the CDN is the read_through
-  // shape of a cache, its origin the backend), as a node index, and the link its requests travel
-  // on (Graph::connect_backends); empty for every other node, a cache_aside cache included.
+  // (model::needs_backend), or a CDN's origin (spec §18 entry 10: the CDN is the read_through shape
+  // of a cache, its origin the backend), as a node index, and the link its requests travel on
+  // (Graph::connect_backends); empty for every other node, a cache_aside cache included.
   std::optional<std::size_t> backend{};
   std::optional<std::size_t> backend_link{};
   // A cache's or CDN's hit ratio, resolved once at build (Graph::resolve_hit_ratios), so every
@@ -180,15 +176,15 @@ struct ResolvedNode {
 
 // Does the cache or CDN `spec` fetch its own read misses from the node behind it
 // (ResolvedNode::backend), as the same op? A read_through cache does (from its `backend`), and so
-// does every CDN (from its `origin`, plan 2b refinement 4). Then nothing after it may fetch them
-// again (Graph::invalid_miss_step), and a read's miss share goes on to that node
+// does every CDN (from its `origin`, spec §18 entry 10). Then nothing after it may fetch them again
+// (Graph::invalid_miss_step), and a read's miss share goes on to that node
 // (Graph::backend_fraction). False for every other node.
 [[nodiscard]] bool fetches_read_misses(const model::NodeSpec& spec);
 
-// How a SQL database spreads its load over its copies (plan 2b refinement 3; book ch. 1,
-// "database replication" and "sharding"): N = replicas copies per shard, one primary and N − 1
-// read replicas, in S = shards shards. The share of the node's reads and of its writes that ONE
-// copy of each kind is sent:
+// How a SQL database spreads its load over its copies (spec §18 entry 6; book ch. 1, "database
+// replication" and "sharding"): N = replicas copies per shard, one primary and N − 1 read replicas,
+// in S = shards shards. The share of the node's reads and of its writes that ONE copy of each kind
+// is sent:
 //                 copies        reads share        writes share
 //   primary       S             0 (1/S if N = 1)   1/S
 //   replica       (N − 1) S     1/((N − 1) S)      1/S   (it replays every write of its shard)
@@ -220,8 +216,8 @@ struct DatabaseCopyLoads {
 // (apply_database_keys); explain says where the number came from.
 [[nodiscard]] bool pool_binds(const ResolvedNode& node);
 
-// The op a rate limiter sends its counter store once per request it checks (plan 2a
-// refinement 6): "read and increment this client's counter" (ch. 4's Redis INCR + EXPIRE).
+// The op a rate limiter sends its counter store once per request it checks (spec §17 entry 6):
+// "read and increment this client's counter" (ch. 4's Redis INCR + EXPIRE).
 inline constexpr std::string_view counter_op = "counter";
 
 // Nodes that forward whatever reaches them over their links, split by link weight, rather
@@ -244,8 +240,8 @@ inline constexpr std::string_view counter_op = "counter";
   return type == model::NodeType::cache || type == model::NodeType::cdn;
 }
 
-// How the replicas of a node behind a load balancer queue (plan 2a refinement 5): what the
-// balancer's policy does to them, which is all the fluid model can see of a policy.
+// How the replicas of a node behind a load balancer queue (spec §17 entry 5): what the balancer's
+// policy does to them, which is all the fluid model can see of a policy.
 //  - independent: each replica is its own queue at an equal share (round_robin, weighted:
 //    requests are dealt out blindly);
 //  - pooled: the replicas are one queue of N × the servers (least_connections);
@@ -332,25 +328,23 @@ struct ResolvedLink {
   bool feedback{false};
   std::vector<std::string> ops{};  // empty = all ops
   double weight{1.0};
-  // A link that states a `bandwidth` is a pipe (plan 2c refinement 3, defaults::pipe_capacity):
-  // one server in megabytes, its service_rate the bandwidth in MB/s and its service_time_s the
-  // time of ONE megabyte (the convention of a byte-sized node's ResolvedNode::capacity: a request
-  // of 10 MB does not change it; the engine sets each step's object moments on the queue). Every
-  // op it carries has a size (Graph::build refuses an unsized one). Empty without a bandwidth: the
-  // link only adds its latency.
+  // A link that states a `bandwidth` is a pipe (spec §19 entry 3, defaults::pipe_capacity): one
+  // server in megabytes, its service_rate the bandwidth in MB/s and its service_time_s the time of
+  // ONE megabyte (the convention of a byte-sized node's ResolvedNode::capacity: a request of 10 MB
+  // does not change it; the engine sets each step's object moments on the queue). Every op it
+  // carries has a size (Graph::build refuses an unsized one). Empty without a bandwidth: the link
+  // only adds its latency.
   std::optional<fluid::Capacity> pipe{};
-  // The ops this pipe carries that are WRITES for whoever receives them (review of plan 2c Task 5,
-  // I-2, and of Task 6, I-2): an op is a write on the link if a node its payload reaches, the
-  // receiver or any node behind it, lists it in its `write_ops` (model::write_ops_of), under its
-  // own name or under the name a step gives it that states a `size:` equal to the incoming one
-  // (review of Task 7, I-2, and of Task 8, I-2: such a step forwards the body itself; a step of
+  // The ops this pipe carries that are WRITES for whoever receives them: an op is a write on the
+  // link if a node its payload reaches, the receiver or any node behind it, lists it in its
+  // `write_ops` (model::write_ops_of), under its own name or under the name a step gives it that
+  // states a `size:` equal to the incoming one (such a step forwards the body itself; a step of
   // another size is a new request). So a 10 MB `upload` through a load balancer into a blob store
   // that lists `upload` is a write on the client's link too: the balancer forwards the body once
-  // all of it has arrived, as the store would; and so is one a service sends on as
-  // `{op: put, size: 10MB}` to a store that writes `put`. The engine pays a write's whole
-  // serialisation on the wire, any other op's first megabyte (behaviours::MegabyteService::
-  // serialising). Sorted; empty without a pipe (Graph::resolve_request_sizes,
-  // detail::written_downstream).
+  // all of it has arrived, as the store would; and so is one a service sends on as `{op: put, size:
+  // 10MB}` to a store that writes `put`. The engine pays a write's whole serialisation on the wire,
+  // any other op's first megabyte (behaviours::MegabyteService:: serialising). Sorted; empty
+  // without a pipe (Graph::resolve_request_sizes, detail::written_downstream).
   std::vector<std::string> write_ops{};
 };
 
@@ -363,12 +357,11 @@ struct ResolvedLink {
   return link.dir == model::Direction::in ? link.to : link.from;
 }
 
-// "a->b": a link as the scenario writes it, `from` then `to`, the name its pipe's rows carry in
-// the reports (plan 2c Task 5); with `quote` "'", "'a'->'b'", the form its errors quote ("link
-// 'a'->'b' has a bandwidth, ..."). Always the scenario's `from` and `to`, also for a link written
-// from the receiver's side (`dir: in`): `{from: a, to: b, dir: in}` is named `a->b` although its
-// demand, and so its pipe's megabytes, travel from b to a, so a reader finds the row under the
-// link as the file writes it.
+// "a->b": a link as the scenario writes it, `from` then `to`, the name its pipe's rows carry in the
+// reports; with `quote` "'", "'a'->'b'", the form its errors quote ("link 'a'->'b' has a bandwidth,
+// ..."). Always the scenario's `from` and `to`, also for a link written from the receiver's side
+// (`dir: in`): `{from: a, to: b, dir: in}` is named `a->b` although its demand, and so its pipe's
+// megabytes, travel from b to a, so a reader finds the row under the link as the file writes it.
 // C++20 std::span<const T>: a non-owning view of contiguous elements (pointer + size), replacing a
 // `const std::vector<T>&` parameter, which would leak the container choice into the API.
 [[nodiscard]] std::string link_label(std::span<const ResolvedNode> nodes, const ResolvedLink& link,
@@ -456,19 +449,19 @@ class Graph {
   // A cache's or a CDN's hit ratio, stated or computed at build (ResolvedNode::hit_ratio);
   // nothing for any other node, and for one that has no number (see ResolvedNode::hit_ratio).
   [[nodiscard]] std::optional<double> hit_ratio(std::size_t node) const;
-  // The size of one request of `op` at `node`, resolved once at build (plan 2c refinement 1,
-  // detail::size_walk): a client's `sizes:` entry or a step's `size:`, kept while the op
-  // keeps its name. Empty for an unsized (node, op), which only a node that counts requests
-  // may receive, and for an op that never reaches the node.
+  // The size of one request of `op` at `node`, resolved once at build (spec §19 entry 1,
+  // detail::size_walk): a client's `sizes:` entry or a step's `size:`, kept while the op keeps its
+  // name. Empty for an unsized (node, op), which only a node that counts requests may receive, and
+  // for an op that never reaches the node.
   [[nodiscard]] std::optional<Bytes> request_bytes(std::size_t node, std::string_view op) const;
   // The hops `node` makes for incoming `op`, one per step in declaration order, each with
   // the share of requests that take it (ServiceHop). Empty for an op the node does not list
   // or lists without steps.
   [[nodiscard]] std::span<const ServiceHop> service_hops(std::size_t node,
                                                          std::string_view op) const;
-  // The share of the requests of `op` arriving at cache `node` that the cache passes on to
-  // its backend (plan 2a refinement 7), as the same op (for a CDN: 1 - h of a read, to its
-  // origin, plan 2b refinement 4; it takes no writes):
+  // The share of the requests of `op` arriving at cache `node` that the cache passes on to its
+  // backend (spec §17 entry 7), as the same op (for a CDN: 1 - h of a read, to its origin, spec §18
+  // entry 10; it takes no writes):
   //   reads (ops not in write_ops): 1 - h under read_through, else 0 (cache_aside leaves the
   //     misses to the service's `on: miss` step; under the write strategies a read miss is
   //     the application's business too);
@@ -573,17 +566,17 @@ class Graph {
 
 // Capacity units one request of `op` uses at `node`, the one rule the behaviours' cost() and
 // explain's paper load share: at a byte-sized node (defaults::is_byte_sized) the request's
-// megabytes, Graph::request_bytes / 1 MB (plan 2c refinement 2: a 50 MB stream costs 50); at
-// any other node defaults::op_cost (its `cost` entry, a database write's 5, else 1). An op that
-// never reaches a byte-sized node has no size and is priced as at a request-counting one: no
-// flow of it is ever charged there. An op that does arrive there unsized cannot exist
-// (Graph::build refuses it, Graph::resolve_request_sizes): asked for one, op_cost throws
-// std::logic_error, a programmer error, rather than charge it one unit whatever its bytes.
+// megabytes, Graph::request_bytes / 1 MB (spec §19 entry 2: a 50 MB stream costs 50); at any other
+// node defaults::op_cost (its `cost` entry, a database write's 5, else 1). An op that never reaches
+// a byte-sized node has no size and is priced as at a request-counting one: no flow of it is ever
+// charged there. An op that does arrive there unsized cannot exist (Graph::build refuses it,
+// Graph::resolve_request_sizes): asked for one, op_cost throws std::logic_error, a programmer
+// error, rather than charge it one unit whatever its bytes.
 [[nodiscard]] double op_cost(const Graph& g, std::size_t node, std::string_view op);
 
-// A client's `timeout` in seconds (plan 2c Task 13), empty when it waits for ever (or the node
-// has no workload): the one place the engine (behaviours::ClientBehaviour, which applies it) and
-// the reports (which cap and judge percentiles by it) read it from.
+// A client's `timeout` in seconds, empty when it waits for ever (or the node has no workload): the
+// one place the engine (behaviours::ClientBehaviour, which applies it) and the reports (which cap
+// and judge percentiles by it) read it from.
 [[nodiscard]] std::optional<double> client_timeout_s(const model::NodeSpec& client);
 
 }  // namespace simsys::graph
@@ -798,7 +791,7 @@ namespace {
   return cache.backend && step.to == *cache.backend && sends_to_store(cache, step.op);
 }
 
-// A cache's `then` steps (plan 2b refinement 5), checked against what the cache already does:
+// A cache's `then` steps (spec §18 entry 5), checked against what the cache already does:
 //  - a step on miss beside a read_through backend: both would fetch the miss;
 //  - a step on miss in parallel: a miss waits for its then steps (the cache answers it only once
 //    the next tier has), so the step cannot be timed beside the lookup, as a service's miss step
@@ -822,12 +815,12 @@ namespace {
   return std::nullopt;
 }
 
-// Do the `mode: parallel` steps of one step list sit side by side? All of them form one group
-// (they start together, the slowest is waited for), so the response is the same wherever they sit,
-// but a request's later steps are thinned from the point where the group starts
+// Do the `mode: parallel` steps of one step list sit side by side? All of them form one group (they
+// start together, the slowest is waited for), so the response is the same wherever they sit, but a
+// request's later steps are thinned from the point where the group starts
 // (behaviours::detail::HopBlocks::forward): [a ∥, s, b ∥] would send s only the requests b
-// answered, though s runs before b. Listing the group where it runs removes the ambiguity (review
-// of plan 2c Task 12, I-4). A plain loop: the list is short and the state is two flags.
+// answered, though s runs before b. Listing the group where it runs removes the ambiguity. A plain
+// loop: the list is short and the state is two flags.
 [[nodiscard]] bool parallel_steps_adjacent(std::span<const model::Step> steps) {
   bool group_started = false;
   bool group_ended = false;
@@ -941,14 +934,13 @@ namespace {
   return std::nullopt;
 }
 
-// What a database's own keys do to its resolved numbers (plan 2b refinement 3): `pool` is the
-// connection pool, how many queries one copy (primary or replica alike) has in service at once.
-// The rates below are capacity units, like `capacity`: a query holds its connection for its
-// cost × the service time, so a write at the default cost of 5 holds one five times as long as a
-// read, and the pool caps units per second, not requests.
-// A copy already has a concurrency, the c Little's law implies from its capacity × service time
-// (defaults::implied_concurrency: 5k/s × 10 ms keeps 50 queries in service). A pool below it
-// leaves connections, not the disk, as the limit:
+// What a database's own keys do to its resolved numbers (spec §18 entry 6): `pool` is the
+// connection pool, how many queries one copy (primary or replica alike) has in service at once. The
+// rates below are capacity units, like `capacity`: a query holds its connection for its cost × the
+// service time, so a write at the default cost of 5 holds one five times as long as a read, and the
+// pool caps units per second, not requests. A copy already has a concurrency, the c Little's law
+// implies from its capacity × service time (defaults::implied_concurrency: 5k/s × 10 ms keeps 50
+// queries in service). A pool below it leaves connections, not the disk, as the limit:
 //   c            = min(pool, implied c)
 //   service rate = min(capacity, pool / service time)
 // so 4 connections of 10 ms queries serve at most 400/s however fast the disk. A pool at or above
@@ -1024,10 +1016,10 @@ void apply_database_keys(ResolvedNode& node) {
   return std::nullopt;
 }
 
-// A blob store's `then` steps are event notifications (plan 2c refinement 7; S3 event
-// notifications, book ch. 14's "transcoding starts when the upload completes"): each fires for
-// every write the store serves (Graph::then_fraction). Three step keys would ask for something an
-// event never does, so the scenario is told what the steps do instead of being run without them:
+// A blob store's `then` steps are event notifications (spec §19 entry 7; S3 event notifications,
+// book ch. 14's "transcoding starts when the upload completes"): each fires for every write the
+// store serves (Graph::then_fraction). Three step keys would ask for something an event never does,
+// so the scenario is told what the steps do instead of being run without them:
 //  - `on: miss`: a blob store never misses (only a cache can take a miss step);
 //  - `on: failure`: an event reports no failure before phase 3 (failed or retried notifications
 //    are ignored), so the step would never fire;
@@ -1052,10 +1044,10 @@ void apply_database_keys(ResolvedNode& node) {
   return std::nullopt;
 }
 
-// A worker pool's `then` steps are the work each job it DRAINS hands on (plan 2c refinement 5;
-// book ch. 14: a transcoder writes its renditions and publishes a completion message), every step
-// for every job (Graph::then_fraction is 1, whatever op the queue brought). Two step keys ask for
-// something a job never does, so they are refused in the blob store's words (invalid_blob_store):
+// A worker pool's `then` steps are the work each job it DRAINS hands on (spec §19 entry 5; book ch.
+// 14: a transcoder writes its renditions and publishes a completion message), every step for every
+// job (Graph::then_fraction is 1, whatever op the queue brought). Two step keys ask for something a
+// job never does, so they are refused in the blob store's words (invalid_blob_store):
 //  - `on: miss`: a pool has no lookup to miss (only a cache can take a miss step);
 //  - `on: failure`: a job reports no failure before phase 3 (failed or retried jobs are ignored),
 //    so the step would never fire.
@@ -1152,10 +1144,9 @@ void apply_database_keys(ResolvedNode& node) {
   return above(name, "read_quorum", model::kv_read_quorum(spec), "replication", replication);
 }
 
-// A consistent-hash ring's imbalance k: how many times the average share of the keys the HOTTEST
-// of `machines` holds (book ch. 5; review of plan 2c Tasks 9-10, I-2), the one heuristic shared by
-// a consistent_hash balancer's ring (one copy of each key: `copies_per_key` 1) and a kv_cluster's
-// (N copies on N successive machines):
+// A consistent-hash ring's imbalance k: how many times the average share of the keys the HOTTEST of
+// `machines` holds (book ch. 5), the one heuristic shared by a consistent_hash balancer's ring (one
+// copy of each key: `copies_per_key` 1) and a kv_cluster's (N copies on N successive machines):
 //   k = min(1 + z_M / sqrt(N v), M / N)
 //   M  the machines (servers) on the ring, N the copies of each key, v the virtual nodes each
 //   1 / sqrt(N v)  the relative spread of one machine's share: it is the sum of N v arc lengths
@@ -1172,10 +1163,10 @@ void apply_database_keys(ResolvedNode& node) {
 // 1.068, 1.083 and 1.122; one copy over 4 servers at v = 150, 1.086 against 1.086. Its limit:
 // within about 1 % at v >= 100, but at v = 1 a machine's share is a few whole arcs, far from
 // normal, and k is off by up to ±16 % (one copy over 2 machines: exactly 1.5 against k = 1.589;
-// three copies over 8 machines: 1.616 against 1.828; over 128: 2.943 against 2.492). One formula
-// is kept for every v (review of plan 2c Task 11, I-3): v = 1 is an experiment that shows an
-// uneven ring, and its verdicts hold either way. The old 1 + 1 / sqrt(v) ignored M (it is the k of
-// one standard deviation) and understated the hot spot beyond about 16 machines.
+// three copies over 8 machines: 1.616 against 1.828; over 128: 2.943 against 2.492). One formula is
+// kept for every v: v = 1 is an experiment that shows an uneven ring, and its verdicts hold either
+// way. The old 1 + 1 / sqrt(v) ignored M (it is the k of one standard deviation) and understated
+// the hot spot beyond about 16 machines.
 [[nodiscard]] double ring_imbalance(int machines, int copies_per_key, int vnodes) {
   if (machines <= 1) return 1.0;  // one machine carries exactly the average
   const double spread = 1.0 / std::sqrt(static_cast<double>(copies_per_key) * vnodes);
@@ -1183,16 +1174,16 @@ void apply_database_keys(ResolvedNode& node) {
                   static_cast<double>(machines) / copies_per_key);
 }
 
-// A kv_cluster's machines on their ring (plan 2c refinement 9; book ch. 5's ring, ch. 6's
-// replication): its copies are its `nodes`, each of the stated (per-node) capacity, so
-// `spec.replicas` becomes `nodes` (the scenario may not state `replicas` here: the loader refuses
-// it) and every reader of a node's copies (explain's total capacity, the engine's copy groups)
-// counts machines. With N < nodes each machine holds the keys of the arcs before its virtual nodes,
-// N times over (it is one of the N successive replicas of each), so the ring is uneven: the
-// hottest carries k = ring_imbalance(nodes, N, vnodes) times the average, as hot and cool copy
-// groups in the engine (add_hot_and_cool_copies). k is at most nodes / N: a machine is at most one
-// of a key's N replicas, so it is sent at most every request, N × rate / nodes × k <= rate. With
-// N = nodes every machine holds every key: k = 1, identical independent copies.
+// A kv_cluster's machines on their ring (spec §19 entry 9; book ch. 5's ring, ch. 6's replication):
+// its copies are its `nodes`, each of the stated (per-node) capacity, so `spec.replicas` becomes
+// `nodes` (the scenario may not state `replicas` here: the loader refuses it) and every reader of a
+// node's copies (explain's total capacity, the engine's copy groups) counts machines. With N <
+// nodes each machine holds the keys of the arcs before its virtual nodes, N times over (it is one
+// of the N successive replicas of each), so the ring is uneven: the hottest carries k =
+// ring_imbalance(nodes, N, vnodes) times the average, as hot and cool copy groups in the engine
+// (add_hot_and_cool_copies). k is at most nodes / N: a machine is at most one of a key's N
+// replicas, so it is sent at most every request, N × rate / nodes × k <= rate. With N = nodes every
+// machine holds every key: k = 1, identical independent copies.
 void apply_kv_ring(ResolvedNode& node) {
   const auto& spec = node.spec;
   const int machines = *spec.kv_nodes;
@@ -1202,10 +1193,9 @@ void apply_kv_ring(ResolvedNode& node) {
   node.imbalance =
       ring_imbalance(machines, replication, spec.vnodes.value_or(model::default_vnodes));
 }
-// What a worker pool may consume (plan 2c refinement 4): a message queue, or a URL frontier,
-// which is a queue of URLs (book ch. 9: the web crawler's downloaders take URLs from it). The
-// frontier is not simulated before phase 3, so its wiring is checked here and the engine still
-// refuses the type.
+// What a worker pool may consume (spec §19 entry 4): a message queue, or a URL frontier, which is a
+// queue of URLs (book ch. 9: the web crawler's downloaders take URLs from it). The frontier is not
+// simulated before phase 3, so its wiring is checked here and the engine still refuses the type.
 [[nodiscard]] bool can_be_consumed(model::NodeType type) {
   return type == model::NodeType::message_queue || type == model::NodeType::frontier;
 }
@@ -1380,8 +1370,8 @@ void add_backend_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls)
   }
 }
 
-// A cache's `then` steps (plan 2b refinement 5) fire per request the cache handles: every one
-// for an `on: always` step, the read misses for an `on: miss` one (Graph::then_fraction).
+// A cache's `then` steps (spec §18 entry 5) fire per request the cache handles: every one for an
+// `on: always` step, the read misses for an `on: miss` one (Graph::then_fraction).
 void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
   for (const auto& op : g.arriving_ops(cache)) {
     for (const model::Step& step : g.nodes()[cache].spec.then) {
@@ -1501,10 +1491,10 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
 }
 
 // The flush hops of every write_back cache: (cache, write) -> (backend, write) for each write op
-// that reaches it (plan 2b refinement 5). Asynchronous BY DESIGN, not because they close a call
-// cycle: the cache acknowledges the write from its own memory and flushes it later, so nobody
-// waits for the flush. It still forwards every write (Graph::backend_fraction is 1), so the
-// store's load is unchanged; the latency model skips it like any asynchronous hop.
+// that reaches it (spec §18 entry 5). Asynchronous BY DESIGN, not because they close a call cycle:
+// the cache acknowledges the write from its own memory and flushes it later, so nobody waits for
+// the flush. It still forwards every write (Graph::backend_fraction is 1), so the store's load is
+// unchanged; the latency model skips it like any asynchronous hop.
 [[nodiscard]] std::vector<AsyncHop> write_back_flushes(const Graph& g) {
   std::vector<AsyncHop> flushes;
   for (std::size_t cache = 0; cache < g.nodes().size(); ++cache) {
@@ -1519,12 +1509,12 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
   return flushes;
 }
 
-// The event notifications of every blob store (plan 2c refinements 6-7): (store, op) ->
-// (target, step.op) for each write op that reaches it and each `then` step (Graph::build refuses
-// an `on: miss` or `on: failure` one, invalid_blob_store). Asynchronous BY DESIGN, as a write-back
-// flush is: S3 sends the event once the object is stored (book ch. 14: transcoding starts when the
-// upload completes), and the uploader, answered by then, never waits for whoever receives it. A
-// read fires no step (Graph::then_fraction is 0: S3 has no event for a GET), so it has no hop.
+// The event notifications of every blob store (spec §19 entries 6-7): (store, op) -> (target,
+// step.op) for each write op that reaches it and each `then` step (Graph::build refuses an `on:
+// miss` or `on: failure` one, invalid_blob_store). Asynchronous BY DESIGN, as a write-back flush
+// is: S3 sends the event once the object is stored (book ch. 14: transcoding starts when the upload
+// completes), and the uploader, answered by then, never waits for whoever receives it. A read fires
+// no step (Graph::then_fraction is 0: S3 has no event for a GET), so it has no hop.
 [[nodiscard]] std::vector<AsyncHop> blob_store_events(const Graph& g) {
   std::vector<AsyncHop> events;
   for (std::size_t store = 0; store < g.nodes().size(); ++store) {
@@ -1540,11 +1530,11 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
   return events;
 }
 
-// The deliveries of every message queue to its consumer groups (plan 2c refinement 6): (queue,
-// op) -> (pool, op) for each op that reaches the queue and each route that carries it. Asynchronous
-// BY DESIGN, as a blob store's events are: the broker answers its publisher once the message is
-// appended (Kafka's acks), and the publisher never waits for the worker that reads it later, so
-// a pool's backlog and drops reach neither its response nor its answered rate.
+// The deliveries of every message queue to its consumer groups (spec §19 entry 6): (queue, op) ->
+// (pool, op) for each op that reaches the queue and each route that carries it. Asynchronous BY
+// DESIGN, as a blob store's events are: the broker answers its publisher once the message is
+// appended (Kafka's acks), and the publisher never waits for the worker that reads it later, so a
+// pool's backlog and drops reach neither its response nor its answered rate.
 [[nodiscard]] std::vector<AsyncHop> consumer_deliveries(const Graph& g) {
   std::vector<AsyncHop> deliveries;
   for (std::size_t queue = 0; queue < g.nodes().size(); ++queue) {
@@ -1577,7 +1567,7 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
 
 }  // namespace detail
 
-// ---- Hit ratios (plan 2b refinements 1-2) ----
+// ---- Hit ratios (spec §18 entries 1-2) ----
 //
 // In `detail` (module linkage) rather than the anonymous namespace, for the reason given on
 // the call-graph search above: these types hold std::vectors and std::sets.
@@ -1599,7 +1589,7 @@ namespace detail {
   return has_resolvable_hit_ratio(spec) && spec.hit_ratio->che;
 }
 
-// ---- Which keys reach which node: the op-aware walk (plan 2b refinement 1, revised) ----
+// ---- Which keys reach which node: the op-aware walk (spec §18 entry 1, revised) ----
 //
 // A che cache's popularity is the popularity of the keys that reach it, and keys travel with
 // requests: a client's keys reach a cache only along the CALLS its ops make. Walking demand
@@ -1607,12 +1597,12 @@ namespace detail {
 // same service, impose its key distribution on it. So the walk is over (node, op) vertices,
 // like the call-cycle search (detail::find_async_hops), and runs per client.
 //
-// Its hops cannot come from forwarder_steps: those read the resolved hops' fractions, which
-// need the very hit ratios being resolved here. call_hops below says, without any hit ratio,
-// which (node, op) a call may lead to — every hop that carries flow for SOME hit ratio below 1
-// (an `on: miss` step is reachable whatever h turns out to be) — and whose misses it carries.
-// The size walk further down (plan 2c refinement 1) follows the same hops, and walk_calls is
-// the depth-first search both run.
+// Its hops cannot come from forwarder_steps: those read the resolved hops' fractions, which need
+// the very hit ratios being resolved here. call_hops below says, without any hit ratio, which
+// (node, op) a call may lead to — every hop that carries flow for SOME hit ratio below 1 (an `on:
+// miss` step is reachable whatever h turns out to be) — and whose misses it carries. The size walk
+// further down (spec §19 entry 1) follows the same hops, and walk_calls is the depth-first search
+// both run.
 //
 // Assumed: every hop between a client and a cache carries the client's key (a service asked
 // for short link k asks its cache for k). One kind of hop does not, and is left out: a rate
@@ -1815,7 +1805,7 @@ void walk_client_keys(const Graph& g, std::size_t client,
   return sorted;
 }
 
-// ---- One request size per (node, op): the size walk (plan 2c refinement 1) ----
+// ---- One request size per (node, op): the size walk (spec §19 entry 1) ----
 //
 // A byte-sized node (defaults::is_byte_sized) counts megabytes, so it must know how big each
 // request it serves is. Sizes travel with requests, as keys do, so this is the key walk again
@@ -1840,15 +1830,15 @@ void walk_client_keys(const Graph& g, std::size_t client,
 // cannot reach (a pool's unsized `then` step with no queue in front) Graph::resolve_request_sizes
 // catches from arriving_ops.
 //
-// Assumed: one size per (node, op) (refinement 1: each op's size is its mean; a flow that
+// Assumed: one size per (node, op) (spec §19 entry 1: each op's size is its mean; a flow that
 // carries bytes per op is phase 3).
 //
-// Phase 3 note (review of plan 2c Task 5, M-5; recorded with Task 12): the walk skips `on:
-// failure` steps (call_hops leaves them out through add_op_step_hops, and add_sized_step_seed
-// seeds none), because they never fire before phase 3. So an unsized `on: failure` step over a
-// bandwidth link is never priced: its (node, op) has no size, and the link's pipe has no
-// megabytes for the op. Once failure steps fire, engine::megabytes_of would throw on the first
-// such request. Whoever makes them fire walks them for sizes too (or refuses them over a pipe).
+// Phase 3 note: the walk skips `on: failure` steps (call_hops leaves them out through
+// add_op_step_hops, and add_sized_step_seed seeds none), because they never fire before phase 3. So
+// an unsized `on: failure` step over a bandwidth link is never priced: its (node, op) has no size,
+// and the link's pipe has no megabytes for the op. Once failure steps fire, engine::megabytes_of
+// would throw on the first such request. Whoever makes them fire walks them for sizes too (or
+// refuses them over a pipe).
 
 // A vertex of the size walk: `op` at `node`, `size` bytes long (unsized when empty), its size
 // set (or left unset) by `origin`, a client or the node of a step.
@@ -2030,13 +2020,12 @@ struct SizeWalk {
   return "capacity " + format_byte_rate(defaults::blob_store_byte_rate) + ", default";
 }
 
-// Why a worker pool's step can send an op unsized although its jobs are sized (review of plan 2c
-// Task 7, minor 2): every job fires every step, so a same-op step `{op: upload}` carries the size
-// of the jobs that arrived as `upload` and renames the jobs of every other op, and a renamed
-// request has no size (refinement 1). Only when `op` is one of the ops the pool's jobs arrive as
-// (review of Task 8, minor 4): a step that renames every job (youtube's `{op: write}` after
-// `transcode` jobs) is a plain rename, which the message's own advice covers. Empty for any other
-// sender, whose steps are per op.
+// Why a worker pool's step can send an op unsized although its jobs are sized: every job fires
+// every step, so a same-op step `{op: upload}` carries the size of the jobs that arrived as
+// `upload` and renames the jobs of every other op, and a renamed request has no size (spec §19
+// entry 1). Only when `op` is one of the ops the pool's jobs arrive as: a step that renames every
+// job (youtube's `{op: write}` after `transcode` jobs) is a plain rename, which the message's own
+// advice covers. Empty for any other sender, whose steps are per op.
 [[nodiscard]] std::string pool_renaming_hint(const Graph& g, std::string_view op,
                                              std::size_t from) {
   if (g.nodes()[from].spec.type != model::NodeType::worker_pool) return {};
@@ -2059,8 +2048,8 @@ struct SizeWalk {
                      pool_renaming_hint(g, op, from)};
 }
 
-// Is the arrival a rate limiter's `counter` request to `node`, its backend (plan 2a refinement
-// 6)? Its origin is the limiter itself: the counter is the limiter's request, not a client's.
+// Is the arrival a rate limiter's `counter` request to `node`, its backend (spec §17 entry 6)? Its
+// origin is the limiter itself: the counter is the limiter's request, not a client's.
 [[nodiscard]] bool is_limiter_counter(std::span<const ResolvedNode> nodes, std::size_t node,
                                       const SizeArrival& arrival) {
   const auto& origin = nodes[arrival.origin];
@@ -2127,10 +2116,10 @@ struct SizeWalk {
 }
 
 // A pipe's error for the first request (its arrivals sorted by op, then origin) it cannot price in
-// megabytes (plan 2c refinement 1: an unsized op on a bandwidth link is refused like one at a
-// byte-sized node): an unsized one, naming the client or step that set or dropped its size and
-// what to add, a limiter's counter (no size can fix it), or one of 0 bytes (it would cost nothing,
-// and the engine divides by its megabytes). Nothing for a link without a bandwidth.
+// megabytes (spec §19 entry 1: an unsized op on a bandwidth link is refused like one at a
+// byte-sized node): an unsized one, naming the client or step that set or dropped its size and what
+// to add, a limiter's counter (no size can fix it), or one of 0 bytes (it would cost nothing, and
+// the engine divides by its megabytes). Nothing for a link without a bandwidth.
 [[nodiscard]] std::optional<EngineError> unpriced_on_pipe(const Graph& g, const ResolvedLink& link,
                                                           std::span<const SizeArrival> arrivals) {
   if (!link.pipe) return std::nullopt;
@@ -2158,16 +2147,15 @@ struct SizeWalk {
 
 // Does a hop for `op`, whose requests weigh `incoming` at the sender (Graph::request_bytes; empty
 // when unsized), carry the request's payload on? While the op keeps its name it does. A renamed
-// step does only when it states a `size:` equal to the incoming one (review of plan 2c Task 7,
-// I-2, narrowed by the review of Task 8, I-2): that is the body itself relabelled (a service that
-// takes an `upload` of 10 MB and stores it as `{op: put, size: 10MB}`), which the node had to take
-// in whole before sending it on, so the receiver far down writing it makes the first hop a write
-// as well. A renamed step of another size, or of none, is a new request of its own (a lookup, a
-// 1 KB metadata write, a notification), whose sender had read the incoming bytes already: a 10 MB
-// upload whose service writes `{op: put_meta, size: 1KB}` stays a read on the client's wire.
-// Sizes are compared in whole bytes (std::llround): `2.01MB` and `2010KB` parse to 2.01 × 1e6 =
-// 2009999.9999999998 and 2010 × 1e3 = 2010000, one rounding apart as doubles but one size (review
-// of plan 2c Tasks 9-10, minor 1). A request is a whole number of bytes anyway.
+// step does only when it states a `size:` equal to the incoming one: that is the body itself
+// relabelled (a service that takes an `upload` of 10 MB and stores it as `{op: put, size: 10MB}`),
+// which the node had to take in whole before sending it on, so the receiver far down writing it
+// makes the first hop a write as well. A renamed step of another size, or of none, is a new request
+// of its own (a lookup, a 1 KB metadata write, a notification), whose sender had read the incoming
+// bytes already: a 10 MB upload whose service writes `{op: put_meta, size: 1KB}` stays a read on
+// the client's wire. Sizes are compared in whole bytes (std::llround): `2.01MB` and `2010KB` parse
+// to 2.01 × 1e6 = 2009999.9999999998 and 2010 × 1e3 = 2010000, one rounding apart as doubles but
+// one size. A request is a whole number of bytes anyway.
 [[nodiscard]] bool carries_payload(std::string_view op, const std::optional<Bytes>& incoming,
                                    const CallHop& hop) {
   if (hop.op == op) return true;
@@ -2250,9 +2238,9 @@ struct KeySource {
   return std::nullopt;
 }
 
-// The clients' one key distribution (plan 2b refinement 1): every client whose ops reach the
-// cache must state its keys, and all must agree (KeySpec's defaulted ==, on the canonical form:
-// zipf 0 is uniform). Mixing several distributions by their rates is in the Phase 3 backlog.
+// The clients' one key distribution (spec §18 entry 1): every client whose ops reach the cache must
+// state its keys, and all must agree (KeySpec's defaulted ==, on the canonical form: zipf 0 is
+// uniform). Mixing several distributions by their rates is in the Phase 3 backlog.
 [[nodiscard]] std::expected<KeySource, EngineError> agreed_keys(
     std::span<const ResolvedNode> nodes, const std::string& name,
     std::span<const KeyArrival> arrivals) {
@@ -2847,15 +2835,15 @@ std::optional<double> Graph::hit_ratio(std::size_t node) const {
   return resolved->value;
 }
 
-// Every (node, op)'s one size, from the size walk (detail::size_walk), after every route,
-// step and backend exists and after collect_arriving_ops: nodes in scenario order, each node's
-// ops in name order, so the first error is the same on every run. C++23 views::chunk_by splits a
-// node's arrivals (sorted by op) into runs of one op each, replacing a hand-written loop that
-// tracks where each run starts; each run is contiguous, so it is passed on as a span. Then
-// every op that arrives at a byte-sized node must have a size, however it arrived
-// (check_sized_arrivals), and every request a bandwidth link carries must have one, links in
-// scenario order (detail::unpriced_on_pipe: a pipe prices megabytes, plan 2c refinement 3). The
-// same walk says which of a pipe's ops are writes downstream (detail::pipe_write_ops).
+// Every (node, op)'s one size, from the size walk (detail::size_walk), after every route, step and
+// backend exists and after collect_arriving_ops: nodes in scenario order, each node's ops in name
+// order, so the first error is the same on every run. C++23 views::chunk_by splits a node's
+// arrivals (sorted by op) into runs of one op each, replacing a hand-written loop that tracks where
+// each run starts; each run is contiguous, so it is passed on as a span. Then every op that arrives
+// at a byte-sized node must have a size, however it arrived (check_sized_arrivals), and every
+// request a bandwidth link carries must have one, links in scenario order
+// (detail::unpriced_on_pipe: a pipe prices megabytes, spec §19 entry 3). The same walk says which
+// of a pipe's ops are writes downstream (detail::pipe_write_ops).
 Graph::Result Graph::resolve_request_sizes() {
   const auto walk = detail::size_walk(*this);
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
@@ -2976,14 +2964,14 @@ Graph::Result Graph::connect_step(std::size_t from, const model::Step& step) {
   return {};
 }
 
-// A rate limiter's `backend` is the counter store it consults once per request it checks
-// (plan 2a refinement 6): a demand edge limiter -> backend carrying op `counter`, on the
-// link that carries demand between them. The loader checked that the backend exists and
-// is a cache; a scenario built in code is checked for existence here.
-// A cache whose strategy has it call the store (model::needs_backend) gets a demand edge to
-// its backend in the same way, and a CDN one to its origin, which carries its read misses
-// (connect_store, one rule for both); a cache_aside cache has none (the service's `on: miss`
-// step does the store read, and invalid_cache refuses a backend on it).
+// A rate limiter's `backend` is the counter store it consults once per request it checks (spec §17
+// entry 6): a demand edge limiter -> backend carrying op `counter`, on the link that carries demand
+// between them. The loader checked that the backend exists and is a cache; a scenario built in code
+// is checked for existence here. A cache whose strategy has it call the store
+// (model::needs_backend) gets a demand edge to its backend in the same way, and a CDN one to its
+// origin, which carries its read misses (connect_store, one rule for both); a cache_aside cache has
+// none (the service's `on: miss` step does the store read, and invalid_cache refuses a backend on
+// it).
 Graph::Result Graph::connect_backends() {
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
     const auto& spec = nodes_[node].spec;
@@ -3001,15 +2989,14 @@ Graph::Result Graph::connect_backends() {
   return {};
 }
 
-// The store behind a cache (its `backend`, `role` "backend") or a CDN (its `origin`, plan 2b
-// refinement 4: the read_through hop of a cache whose backend is the origin) becomes
-// ResolvedNode::backend, with a demand edge over the link that carries demand between the two.
-// One rule for both, each message in the node's own words: "backend 'db' needs a link from the
-// cache", "origin 'x' needs a link from the cdn". invalid_cache and invalid_cdn proved the name
-// is there; the loader checks the same (its reference check, config's read_cdn_origin).
-// Which ops travel on the edge is known only once every node's arriving ops are
-// (check_cache_backend_ops), and whether a request can wait for the hop only once the call
-// cycles are (check_cache_backend_calls).
+// The store behind a cache (its `backend`, `role` "backend") or a CDN (its `origin`, spec §18 entry
+// 10: the read_through hop of a cache whose backend is the origin) becomes ResolvedNode::backend,
+// with a demand edge over the link that carries demand between the two. One rule for both, each
+// message in the node's own words: "backend 'db' needs a link from the cache", "origin 'x' needs a
+// link from the cdn". invalid_cache and invalid_cdn proved the name is there; the loader checks the
+// same (its reference check, config's read_cdn_origin). Which ops travel on the edge is known only
+// once every node's arriving ops are (check_cache_backend_ops), and whether a request can wait for
+// the hop only once the call cycles are (check_cache_backend_calls).
 Graph::Result Graph::connect_store(std::size_t node, std::string_view role) {
   const auto& spec = nodes_[node].spec;
   const std::string& store_id = role == "origin" ? *spec.origin : *spec.backend;
@@ -3078,11 +3065,11 @@ std::string Graph::sender_of(std::size_t node, std::string_view op) const {
   return "?";  // not reached: an op arrives at a node only along one of the hops sends checks
 }
 
-// Every op a cache passes on to its backend must be one the link carries, or the cache
-// would send flow the link refuses: the same rule and message as a step's (connect_step). And
-// every write it passes on must be a write at the store too (write_counted_as_read): the
-// consistent-hashing lab under write_through would otherwise show its database's primary idle
-// while every `set` lands on it (review of c9d5f8c).
+// Every op a cache passes on to its backend must be one the link carries, or the cache would send
+// flow the link refuses: the same rule and message as a step's (connect_step). And every write it
+// passes on must be a write at the store too (write_counted_as_read): the consistent-hashing lab
+// under write_through would otherwise show its database's primary idle while every `set` lands on
+// it.
 Graph::Result Graph::check_cache_backend_ops(std::size_t cache) {
   const auto& resolved = nodes_[cache];
   if (!resolved.backend) return {};
@@ -3168,16 +3155,16 @@ Graph::Result Graph::route_splitters() {
   return {};
 }
 
-// A message queue delivers to its consumer groups (plan 2c refinement 4): every link it sends
-// demand on must reach a worker pool that `consumes` it, since a broker hands a message only to
-// the groups subscribed to it (anything else behind it would be a service the scenario believes
-// is fed and is not); a link to anything else is refused, naming it. Each such link is one
-// Route of share 1: every group reads EVERY message (a load balancer splits, shares summing to 1;
-// a queue copies), as the same op. A drained link (weight 0) is a group that reads nothing
-// (share 0), as everywhere a weight of 0 means a route nobody takes; any other weight changes
-// nothing, a group cannot read part of the log. A queue with no consumer at all is refused (review
-// of plan 2c Task 6, M-2): it would answer its publishers and keep their messages for nobody, a
-// pipeline the scenario believes runs and that ends at the broker.
+// A message queue delivers to its consumer groups (spec §19 entry 4): every link it sends demand on
+// must reach a worker pool that `consumes` it, since a broker hands a message only to the groups
+// subscribed to it (anything else behind it would be a service the scenario believes is fed and is
+// not); a link to anything else is refused, naming it. Each such link is one Route of share 1:
+// every group reads EVERY message (a load balancer splits, shares summing to 1; a queue copies), as
+// the same op. A drained link (weight 0) is a group that reads nothing (share 0), as everywhere a
+// weight of 0 means a route nobody takes; any other weight changes nothing, a group cannot read
+// part of the log. A queue with no consumer at all is refused: it would answer its publishers and
+// keep their messages for nobody, a pipeline the scenario believes runs and that ends at the
+// broker.
 Graph::Result Graph::route_queue(std::size_t queue) {
   const auto& id = nodes_[queue].spec.id;
   for (std::size_t i = 0; i < links_.size(); ++i) {
@@ -3203,14 +3190,13 @@ Graph::Result Graph::route_queue(std::size_t queue) {
   return {};
 }
 
-// A worker pool's jobs come from the queue it consumes and from nowhere else (review of plan 2c
-// Task 6, I-1): a demand edge into a pool from any other node (a client's route, a service's step,
-// a balancer's link, another pool's `then` step) is refused, naming the sender. Such a sender
-// would make the pool a server it calls: the loader requires `consumes`, and the pool's room is
-// that queue's retention (connect_consumer), a 7-day room in which a direct caller would wait
-// days and never be dropped. A queue's own link is the only way in, and it is asynchronous
-// (detail::consumer_deliveries): nobody waits for a pool. Run after route_splitters, the last
-// step that adds demand edges.
+// A worker pool's jobs come from the queue it consumes and from nowhere else: a demand edge into a
+// pool from any other node (a client's route, a service's step, a balancer's link, another pool's
+// `then` step) is refused, naming the sender. Such a sender would make the pool a server it calls:
+// the loader requires `consumes`, and the pool's room is that queue's retention (connect_consumer),
+// a 7-day room in which a direct caller would wait days and never be dropped. A queue's own link is
+// the only way in, and it is asynchronous (detail::consumer_deliveries): nobody waits for a pool.
+// Run after route_splitters, the last step that adds demand edges.
 Graph::Result Graph::check_pool_senders() const {
   for (const DemandEdge& edge : edges_) {
     const auto& pool = nodes_[edge.to].spec;
@@ -3225,10 +3211,10 @@ Graph::Result Graph::check_pool_senders() const {
   return {};
 }
 
-// Each consumer link of a queue whose `ops` filter names ops must carry one the queue receives
-// (review of plan 2c Task 6, M-2): a filter that carries none of them leaves the group with
-// nothing to read, a consumer in name only. Needs the arriving ops (collect_arriving_ops). A
-// drained link (weight 0) reads nothing by design and is not asked.
+// Each consumer link of a queue whose `ops` filter names ops must carry one the queue receives: a
+// filter that carries none of them leaves the group with nothing to read, a consumer in name only.
+// Needs the arriving ops (collect_arriving_ops). A drained link (weight 0) reads nothing by design
+// and is not asked.
 Graph::Result Graph::check_consumer_links(std::size_t queue) const {
   for (const Route& route : routes_[queue]) {
     const auto& link = links_[route.link];
@@ -3243,10 +3229,10 @@ Graph::Result Graph::check_consumer_links(std::size_t queue) const {
   return {};
 }
 
-// Each worker pool's queue (plan 2c refinements 4-5), checked from the pool's side: the node it
-// `consumes` exists, is a message queue or a URL frontier (can_be_consumed), and links to the
-// pool, or the pool would sit idle while the scenario says it drains the queue. The pool's
-// waiting room is then the messages its queue keeps for it (connect_consumer).
+// Each worker pool's queue (spec §19 entries 4-5), checked from the pool's side: the node it
+// `consumes` exists, is a message queue or a URL frontier (can_be_consumed), and links to the pool,
+// or the pool would sit idle while the scenario says it drains the queue. The pool's waiting room
+// is then the messages its queue keeps for it (connect_consumer).
 Graph::Result Graph::connect_consumers() {
   for (std::size_t pool = 0; pool < nodes_.size(); ++pool) {
     if (nodes_[pool].spec.type != model::NodeType::worker_pool) continue;
@@ -3255,19 +3241,18 @@ Graph::Result Graph::connect_consumers() {
   return {};
 }
 
-// A pool's room (plan 2c refinement 4): Kafka deletes a message older than the queue's
-// `retention`, so at most the messages that `retention` seconds of draining would have read can
-// wait for the group: queue_limit = retention × the pool's capacity (workers / cost),
+// A pool's room (spec §19 entry 4): Kafka deletes a message older than the queue's `retention`, so
+// at most the messages that `retention` seconds of draining would have read can wait for the group:
+// queue_limit = retention × the pool's capacity (workers / cost),
 //   10 s × 1200 jobs/s = 12,000 messages; the default 7 d × 1200/s = 725.76 million.
 // A message older than that is deleted unconsumed: the fluid queue drops what overflows the room,
 // and the drops are the pool's. Each group's room is its own (retention × ITS capacity). The
 // retention is the queue's, or defaults::default_retention when it states none or the pool reads a
 // frontier (which has no retention). A pool built in code without `consumes` is refused in the
-// loader's words (review of plan 2c Task 7, minor 4): it could never receive a job, since
-// check_pool_senders refuses every sender but its queue.
-// Assumed: the backlog drains first in, first out, so a message published now waits the FIFO drain
-// time of the backlog ahead of it (backlog over drain rate: its queue lag, engine::NodeSample::
-// queue_lag_s) and the room in messages is the room in seconds of draining.
+// loader's words: it could never receive a job, since check_pool_senders refuses every sender but
+// its queue. Assumed: the backlog drains first in, first out, so a message published now waits the
+// FIFO drain time of the backlog ahead of it (backlog over drain rate: its queue lag,
+// engine::NodeSample:: queue_lag_s) and the room in messages is the room in seconds of draining.
 Graph::Result Graph::connect_consumer(std::size_t pool) {
   auto& resolved = nodes_[pool];
   const auto& spec = resolved.spec;
@@ -3541,9 +3526,9 @@ Graph::Result Graph::check_forwarded_ops(std::size_t node) {
   return {};
 }
 
-// A load balancer's policy changes how the replicas of the node BEHIND it queue (plan 2a
-// refinement 5), so its ReplicaModel is stored on that node, where the engine builds the
-// queues (engine::Simulation::make_server):
+// A load balancer's policy changes how the replicas of the node BEHIND it queue (spec §17 entry 5),
+// so its ReplicaModel is stored on that node, where the engine builds the queues
+// (engine::Simulation::make_server):
 //  - round_robin, weighted -> independent: requests are dealt out blindly, every replica is
 //    its own queue (N independent M/M/c); nothing to mark.
 //  - least_connections -> pooled: a request goes to the replica with the fewest in flight,

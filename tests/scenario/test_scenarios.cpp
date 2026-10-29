@@ -33,7 +33,7 @@ import simsys.model;
 import simsys.queueing;
 import simsys.report;
 
-// explain's lines, shared with test_report and test_series (review of plan 2c Task 7, minor 7).
+// explain's lines, shared with test_report and test_series.
 using simsys::test_support::check_line;
 using simsys::test_support::node_line;
 
@@ -99,16 +99,15 @@ TEST_CASE("every shipped scenario resolves into a graph that explain can print",
   }
 }
 
-// Which scenarios run grows with each phase, so the test does not name them: a scenario whose
-// node types the engine does not simulate yet is refused by Simulation::create with a message
-// naming the phase ("... do not support yet (phase 3)") and is skipped; every other one is run
-// to its end and must meet its own SLOs. A scenario the engine refuses for any other reason is
-// a failure, not a skip.
-// The time limit's point is "no shipped scenario takes minutes", not a benchmark: each one run here
-// costs at most 0.6 s of CPU in Debug and 0.04 s in Release (measured 2026-10-29). It is CPU time,
-// not wall-clock time: under `ctest -j` on a loaded machine this test took 4.61 s of wall clock
-// in Debug and its wall-clock limit was flaky (review of plan 2c Task 15, m10), while the CPU time
-// a single-threaded run spends is what the scenario costs, whoever else shares the machine.
+// Which scenarios run grows with each phase, so the test does not name them: a scenario whose node
+// types the engine does not simulate yet is refused by Simulation::create with a message naming the
+// phase ("... do not support yet (phase 3)") and is skipped; every other one is run to its end and
+// must meet its own SLOs. A scenario the engine refuses for any other reason is a failure, not a
+// skip. The time limit's point is "no shipped scenario takes minutes", not a benchmark: each one
+// run here costs at most 0.6 s of CPU in Debug and 0.04 s in Release (measured 2026-10-29). It is
+// CPU time, not wall-clock time: under `ctest -j` on a loaded machine this test took 4.61 s of wall
+// clock in Debug and its wall-clock limit was flaky, while the CPU time a single-threaded run
+// spends is what the scenario costs, whoever else shares the machine.
 TEST_CASE(
     "scenarios whose node types all exist run in under five seconds of CPU and pass their "
     "SLOs",
@@ -132,22 +131,22 @@ TEST_CASE(
     //  - url-shortener passes its SLOs, but 24 h at 1 s is 86.4k steps: 0.4 s in Release, about
     //    6 to 8 s in a Debug build (measured 2026-10-28), over the five seconds below. Its own test
     //    runs it end to end with no time limit and pins its SLO results.
-    //  - youtube runs since plan 2c Task 7 and MEETS its SLOs since Task 16 (600 transcoders, a
+    //  - youtube runs and MEETS its SLOs (600 transcoders, a
     //    20 GB/s transcoded store, a 40 Gbit/s cross-DC link, a 30 s timeout for the resumable
     //    uploads); it is exempt here only for time: 24 h at 100 ms is 864k steps, about 60 s of
     //    CPU in Release (measured 2026-10-29), far over the five seconds. Its own test below runs
     //    the day at 10 s steps and pins its three SLOs passing.
-    //  - news-feed runs since plan 2c Task 10 (its kv_cluster, graph_db, is simulated) and MEETS
-    //    its three SLOs since Task 17 sized it for its 12:00 spike; it is exempt here only for
+    //  - news-feed runs (its kv_cluster, graph_db, is simulated) and MEETS
+    //    its three SLOs, sized for its 12:00 spike; it is exempt here only for
     //    time: 24 h at 100 ms is 864k steps, about 20 s in Release (measured 2026-10-29), far over
     //    the five seconds. Its own tests below run the day at a 1 s step and pin the SLOs passing.
-    //  - search-autocomplete runs since plan 2c Task 11 (its search_index is a service) and MEETS
+    //  - search-autocomplete runs (its search_index is a service) and MEETS
     //    its SLOs (measured 2026-10-29, Release, full day at 100 ms: p99 of suggest 6.86 ms
     //    against 100 ms, drop rate 0); it is exempt here only for time: 24 h at 100 ms is 862.8k
     //    steps, 4.9 s in Release on an idle machine (measured), at the edge of the five seconds
     //    below and far over them in Debug. Its own tests below run the day at a 1 s step (86.4k
     //    steps, as the url-shortener's does) and pin both SLOs passing and the README's headline
-    //    numbers (plan 2c Task 18).
+    //    numbers.
     if (s.name == "lab-unique-id" || s.name == "url-shortener" || s.name == "youtube" ||
         s.name == "news-feed" || s.name == "search-autocomplete") {
       continue;  // not run here
@@ -174,9 +173,9 @@ TEST_CASE(
   CHECK(ran > 0);  // the tutorials at least always run here (the three above are not counted)
 }
 
-// Phase 2a's goal: the rate-limiter lab, which uses a client with spikes, a rate limiter, a
-// cache and a service, runs end to end. (It was red on purpose until the cache node landed, plan
-// 2a Task 10; do not weaken it to a skip.)
+// Phase 2a's goal: the rate-limiter lab, which uses a client with spikes, a rate limiter, a cache
+// and a service, runs end to end. (It was red on purpose until the cache node landed; do not weaken
+// it to a skip.)
 TEST_CASE("labs/rate-limiter runs in phase 2a", "[scenario]") {
   using namespace std::chrono_literals;
   const auto s =
@@ -192,11 +191,11 @@ TEST_CASE("labs/rate-limiter runs in phase 2a", "[scenario]") {
   REQUIRE(steps == 10);
 }
 
-// Phase 2b, Task 4: the consistent-hashing lab (clients with Zipf keys -> a hash ring -> four che
-// caches -> a SQL database with a primary and a read replica) runs end to end and meets its own
-// SLOs (cache utilization <= 0.85, database utilization <= 0.7). If an SLO fails the CAPTUREd
-// numbers say by how much, so the implementer can judge whether the model or the lab's numbers
-// are off; the test must not be weakened to hide it.
+// Phase 2b: the consistent-hashing lab (clients with Zipf keys -> a hash ring -> four che caches ->
+// a SQL database with a primary and a read replica) runs end to end and meets its own SLOs (cache
+// utilization <= 0.85, database utilization <= 0.7). If an SLO fails the CAPTUREd numbers say by
+// how much, so the implementer can judge whether the model or the lab's numbers are off; the test
+// must not be weakened to hide it.
 TEST_CASE("labs/consistent-hashing runs and passes its SLOs", "[scenario]") {
   const auto s = simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} +
                                       "/labs/consistent-hashing/scenario.yaml");
@@ -218,9 +217,9 @@ TEST_CASE("labs/consistent-hashing runs and passes its SLOs", "[scenario]") {
 // The consistent-hashing lab's caches are read_through: a `set` stays in the cache. Switched to
 // write_through, each cache writes every `set` to db as `set`, an op the SQL database's default
 // write_ops (insert, update, delete, write) does not name: db would count it as a read, serve it
-// from a replica at cost 1 and report its primary idle, "0%, green", where 4k sets/s at cost 5
-// are 400 % of the primary's 5k units/s (review of c9d5f8c, finding 1). The graph refuses the
-// disagreement and names the list to fix; with `set` listed, explain shows the primary red.
+// from a replica at cost 1 and report its primary idle, "0%, green", where 4k sets/s at cost 5 are
+// 400 % of the primary's 5k units/s. The graph refuses the disagreement and names the list to fix;
+// with `set` listed, explain shows the primary red.
 TEST_CASE("the consistent-hashing lab under write_through needs set in db's write_ops",
           "[scenario]") {
   auto s = simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} +
@@ -262,16 +261,15 @@ TEST_CASE("book scenarios are refused by run until their node types exist", "[sc
 
 // Phase 2b runs the nodes up to the id generator: the two tutorials, the rate-limiter lab, the
 // consistent-hashing lab (client, load balancer, che cache, sql_db), the unique-id lab (client,
-// id_generator) and the book's URL shortener (client, rate limiter, caches, load balancer,
-// service, id_generator, sql_db) use only those. Phase 2c adds the byte-sized nodes, the queue and
-// the pool with its `then` steps (Task 7): youtube (clients, CDNs, blob stores, balancer, service,
-// cache, SQL database, message queues, worker pools) is the first book scenario of 2c that runs;
-// the kv_cluster (Task 10) adds the kv-store lab and the book's news feed (its graph_db is the one
-// node type it lacked); the search index (Task 11, a service with no steps) adds the book's search
-// autocomplete. Every other lab and book scenario still needs a later task's node types
-// (google-drive's ws_gateway, chat-system's service_discovery, ...), so the set of runnable
-// scenarios is pinned by name: a node type added later makes this fail and forces whoever adds it
-// to update the list on purpose.
+// id_generator) and the book's URL shortener (client, rate limiter, caches, load balancer, service,
+// id_generator, sql_db) use only those. Phase 2c adds the byte-sized nodes, the queue and the pool
+// with its `then` steps: youtube (clients, CDNs, blob stores, balancer, service, cache, SQL
+// database, message queues, worker pools) is the first book scenario of 2c that runs; the
+// kv_cluster adds the kv-store lab and the book's news feed (its graph_db is the one node type it
+// lacked); the search index (a service with no steps) adds the book's search autocomplete. Every
+// other lab and book scenario still needs a later task's node types (google-drive's ws_gateway,
+// chat-system's service_discovery, ...), so the set of runnable scenarios is pinned by name: a node
+// type added later makes this fail and forces whoever adds it to update the list on purpose.
 TEST_CASE(
     "exactly ten shipped scenarios use only simulated node types: chain, hello, "
     "consistent-hashing, kv-store, news-feed, rate-limiter, search-autocomplete, unique-id, "
@@ -309,7 +307,7 @@ TEST_CASE("a refused scenario's message names the first unsupported node and the
   REQUIRE(names_a_node);
 }
 
-// ---- Request-based CDN (plan 2b refinement 4, Task 5) ----
+// ---- Request-based CDN (spec §18 entry 10) ----
 
 namespace {
 // The peak offered load explain's check line gives node `id`, in requests per second: the number
@@ -330,8 +328,8 @@ double peak_offered_per_s(const std::string& explain_text, const std::string& id
   return value;
 }
 
-// The request rate in parentheses on the check line of a byte-sized node (plan 2c refinement 2):
-// "  media_store  peak offered 64.86 MB/s (324.3/s) vs 1k MB/s ...", where the number before the
+// The request rate in parentheses on the check line of a byte-sized node (spec §19 entry 2): "
+// media_store  peak offered 64.86 MB/s (324.3/s) vs 1k MB/s ...", where the number before the
 // parentheses is megabytes per second. Same k/M suffixes as peak_offered_per_s.
 double peak_offered_requests_per_s(const std::string& explain_text, const std::string& id) {
   const auto checks = explain_text.find("checks (");
@@ -371,13 +369,13 @@ TEST_CASE("book/news-feed's media store is checked against the cdn's 5 percent m
   REQUIRE_THAT(at_origin, Catch::Matchers::WithinRel(0.05 * at_cdn, 1e-3));
 }
 
-// Ch. 14's YouTube sizes its two CDNs in bytes (`capacity: 100GB/s`, `50GB/s`) and gives them a
-// che hit ratio: valid scenario, explained, and the engine runs it (plan 2c Task 7: every type it
-// uses is simulated, and a worker pool's `then` steps run). What the cdn changed is pinned through
-// explain (review of 4d539b0, M12): the two edges' Che hit ratios (Zipf 1 over 10M videos, 100k and
-// 50k of them at the edge: 0.642 and 0.594, checked against an independent Python computation by
-// the reviewer) and the load they and the transcoders send transcoded_store, which an explain that
-// ignored the origin edge or the pool would leave at zero.
+// Ch. 14's YouTube sizes its two CDNs in bytes (`capacity: 100GB/s`, `50GB/s`) and gives them a che
+// hit ratio: valid scenario, explained, and the engine runs it (every type it uses is simulated,
+// and a worker pool's `then` steps run). What the cdn changed is pinned through explain: the two
+// edges' Che hit ratios (Zipf 1 over 10M videos, 100k and 50k of them at the edge: 0.642 and 0.594,
+// checked against an independent Python computation by the reviewer) and the load they and the
+// transcoders send transcoded_store, which an explain that ignored the origin edge or the pool
+// would leave at zero.
 TEST_CASE("book/youtube validates, explains and the engine accepts it", "[scenario]") {
   const auto s =
       simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml");
@@ -390,8 +388,8 @@ TEST_CASE("book/youtube validates, explains and the engine accepts it", "[scenar
   REQUIRE(cdn_us->byte_capacity == simsys::ByteRate{100e9});
   REQUIRE(cdn_us->hit_ratio.has_value());
   REQUIRE(cdn_us->hit_ratio->che);
-  // original_store counts the uploads as writes (review of plan 2c Task 3, I2): a 300 MB upload is
-  // acknowledged at its last byte, 300 MB x 40 ms = 12 s after its wait, not at its first MB.
+  // original_store counts the uploads as writes: a 300 MB upload is acknowledged at its last byte,
+  // 300 MB x 40 ms = 12 s after its wait, not at its first MB.
   const auto original = std::ranges::find(s->nodes, "original_store", &simsys::model::NodeSpec::id);
   REQUIRE(original != s->nodes.end());
   REQUIRE(original->write_ops == std::vector<std::string>{"upload"});
@@ -416,9 +414,9 @@ TEST_CASE("book/youtube validates, explains and the engine accepts it", "[scenar
 }
 
 namespace {
-// The shipped youtube scenario with the 400 transcoders it had before plan 2c Task 16 sized the
-// pool at 600 (the README's "Things to try"): 400 / 60 s = 6.667 videos/s, fewer than the uploads
-// from 15:43 to 02:17, so the pool saturates and its queue backs up.
+// The shipped youtube scenario with the 400 transcoders it had before the pool was sized at 600
+// (the README's "Things to try"): 400 / 60 s = 6.667 videos/s, fewer than the uploads from 15:43 to
+// 02:17, so the pool saturates and its queue backs up.
 simsys::model::Scenario youtube_with_400_transcoders() {
   auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml");
   const auto pool = std::ranges::find(s.nodes, "transcoders", &simsys::model::NodeSpec::id);
@@ -451,11 +449,10 @@ TEST_CASE("book/youtube at 400 transcoders: the pool hands on what it drained, 6
                Catch::Matchers::WithinRel(400.0 / 60.0, 1e-9));
   REQUIRE_THAT(last.nodes[*g.index_of("completion_handler")].demand_per_s,
                Catch::Matchers::WithinRel(400.0 / 60.0, 1e-9));
-  // transcoded_store's other half (review of plan 2c Task 7, minor 9): beside the edges' misses,
-  // (1 - h) of what each CDN served, it is sent four 50 MB renditions per DRAINED job, 6.667 x 4 x
-  // 50 MB = 1333 MB/s, not the 8.55 x 4 x 50 = 1710 MB/s of the jobs that arrived. Its demand is in
-  // megabytes, as the CDNs' is. (The curve barely moves in the 150 ms the European misses take to
-  // cross: hence 0.1 %.)
+  // transcoded_store's other half: beside the edges' misses, (1 - h) of what each CDN served, it is
+  // sent four 50 MB renditions per DRAINED job, 6.667 x 4 x 50 MB = 1333 MB/s, not the 8.55 x 4 x
+  // 50 = 1710 MB/s of the jobs that arrived. Its demand is in megabytes, as the CDNs' is. (The
+  // curve barely moves in the 150 ms the European misses take to cross: hence 0.1 %.)
   const auto misses_mb_per_s = [&](std::string_view cdn) {
     const auto index = *g.index_of(cdn);
     return (1.0 - *g.hit_ratio(index)) * last.nodes[index].drain_per_s;
@@ -465,22 +462,21 @@ TEST_CASE("book/youtube at 400 transcoders: the pool hands on what it drained, 6
   REQUIRE_THAT(renditions_mb_per_s, Catch::Matchers::WithinRel(400.0 / 60.0 * 4.0 * 50.0, 1e-3));
 }
 
-// youtube's `queue_lag` SLO (`transcode_q`, max 30m) at the 400 transcoders it shipped with
-// until plan 2c Task 16 (the README's sweep, "Things to try"): 400 workers at 60 s a video = 400 /
-// 60 s = 6.667 videos/s, and from 15:43 on the uploads (2 % of the viewers' requests, 8.55/s at
-// 00:00 and more at the 21:00 peak) exceed that, so the pool's backlog is still growing at 24:00:
-// the run's peak backlog is its last step's, 63.76k videos (the README's number, measured at
-// 100 ms steps: 63,759 there, 63,750 at the 10 s steps below). The queue's lag is the FIFO drain
-// time of its one group, backlog / drain, the pool draining its whole capacity while saturated:
+// youtube's `queue_lag` SLO (`transcode_q`, max 30m) at the 400 transcoders it first shipped with
+// (the README's sweep, "Things to try"): 400 workers at 60 s a video = 400 / 60 s = 6.667 videos/s,
+// and from 15:43 on the uploads (2 % of the viewers' requests, 8.55/s at 00:00 and more at the
+// 21:00 peak) exceed that, so the pool's backlog is still growing at 24:00: the run's peak backlog
+// is its last step's, 63.76k videos (the README's number, measured at 100 ms steps: 63,759 there,
+// 63,750 at the 10 s steps below). The queue's lag is the FIFO drain time of its one group, backlog
+// / drain, the pool draining its whole capacity while saturated:
 //   63,760 / 6.667/s = 9,564 s = 2.66 h  >  30 m = 1,800 s    -> FAIL
-// (the Erlang wait of refinement 5 is the smaller term at every step: the saturated pool's, at rho
-// clamped to 0.99, is Wq(400, 0.99, 60 s) = C(400, 0.99) x 60 s / (400 x 0.01) = 11.6 s). The
-// shipped 600 workers pass it (the next test).
-// The run uses 10 s steps, not the scenario's 100 ms: the fluid backlog is the same to 0.02 %
-// (checked at both) and 8,640 steps, not 864k, keep the test in seconds; hence the 1 % tolerance.
-// (The 24 h run stops before the backlog's peak: the inflow still exceeds the capacity at midnight
-// and the backlog peaks at about 71.9k videos, 3.0 h of lag, near 02:18 of the next day, the
-// review of Task 7 at b4e263a, I-1; `--duration 27h` shows it. The SLO sees what the run saw.)
+// (the Erlang wait of spec §19 entry 5 is the smaller term at every step: the saturated pool's, at
+// rho clamped to 0.99, is Wq(400, 0.99, 60 s) = C(400, 0.99) x 60 s / (400 x 0.01) = 11.6 s). The
+// shipped 600 workers pass it (the next test). The run uses 10 s steps, not the scenario's 100 ms:
+// the fluid backlog is the same to 0.02 % (checked at both) and 8,640 steps, not 864k, keep the
+// test in seconds; hence the 1 % tolerance. (The 24 h run stops before the backlog's peak: the
+// inflow still exceeds the capacity at midnight and the backlog peaks at about 71.9k videos, 3.0 h
+// of lag, near 02:18 of the next day; `--duration 27h` shows it. The SLO sees what the run saw.)
 TEST_CASE("book/youtube at 400 transcoders fails its queue_lag SLO: 2.66 h of lag against 30 m",
           "[scenario]") {
   using namespace std::chrono_literals;
@@ -504,10 +500,9 @@ TEST_CASE("book/youtube at 400 transcoders fails its queue_lag SLO: 2.66 h of la
 
 // Ch. 15's Google Drive built its graph with the new queue wiring (notify_q's two consumer groups,
 // notification_svc and backup_workers, each consume it and are linked from it), and its queue and
-// pools (with their `then` steps since Task 7) are simulated. The engine stops at long_poll, its
-// ws_gateway: Simulation::create checks every node's TYPE over the whole file, so the first
-// unsimulated type, long_poll (declared after the pools), is the one it names. Phase 3 brings
-// ws_gateway.
+// pools are simulated. The engine stops at long_poll, its ws_gateway: Simulation::create checks
+// every node's TYPE over the whole file, so the first unsimulated type, long_poll (declared after
+// the pools), is the one it names. Phase 3 brings ws_gateway.
 TEST_CASE("book/google-drive is refused at long_poll, its ws_gateway", "[scenario]") {
   const auto g = build_or_fail(
       load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/google-drive/scenario.yaml"));
@@ -518,10 +513,10 @@ TEST_CASE("book/google-drive is refused at long_poll, its ws_gateway", "[scenari
           "(phase 3)");
 }
 
-// Ch. 11's news feed: its fan-out queue and pool are simulated (Task 6, their `then` steps Task 7),
-// and since plan 2c Task 10 so is graph_db, its kv_cluster, the last node type it lacked (the
-// refusal moved from fanout_q to graph_db, and now there is none: the nodes are client, cdn,
-// blob_store, load_balancer, service, cache, sql_db, message_queue, worker_pool and kv_cluster).
+// Ch. 11's news feed: its fan-out queue and pool are simulated, and so is graph_db, its kv_cluster,
+// the last node type it lacked (the refusal moved from fanout_q to graph_db, and now there is none:
+// the nodes are client, cdn, blob_store, load_balancer, service, cache, sql_db, message_queue,
+// worker_pool and kv_cluster).
 TEST_CASE("book/news-feed uses only node types the engine simulates, its kv_cluster included",
           "[scenario]") {
   const auto g = build_or_fail(
@@ -531,16 +526,16 @@ TEST_CASE("book/news-feed uses only node types the engine simulates, its kv_clus
   REQUIRE(sim.has_value());
 }
 
-// The news feed runs: in its first second (00:00, the curve at 1.3 x its 10k/s base: 13k/s, a
-// tenth of it posts, ~1.3k/s) every post the web tier takes is first written to post_db, and only
-// a post post_db wrote is published (plan 2c Task 12: a step after a failed step does not run).
-// Since Task 17 post_db has 6 shards, each primary committing 5k units/s at 5 units a write
-// (defaults::sql_write_cost): 1.3k x 5 / 6 = 1.083k units/s each, so every post is written and
-// one fan-out job per post reaches the pool: 0.1 x 10k x (1 + 0.6 cos(2 pi (1.9 s - 20 h) / 24 h))
-// = 1,299.93 jobs/s at the 20th step (the curve has moved a little from 00:00's 1.3k). With one
-// shard, as first shipped, the primary's 1k writes/s capped it at 999.997. The pool's 32 workers
-// at 5 ms drain up to 6.4k jobs/s, so every job is drained and reads graph_db once, and the
-// 6-node, N = 3 cluster is sent three replica-requests per job: exactly 3 x what the pool drained.
+// The news feed runs: in its first second (00:00, the curve at 1.3 x its 10k/s base: 13k/s, a tenth
+// of it posts, ~1.3k/s) every post the web tier takes is first written to post_db, and only a post
+// post_db wrote is published (a step after a failed step does not run). post_db has 6 shards, each
+// primary committing 5k units/s at 5 units a write (defaults::sql_write_cost): 1.3k x 5 / 6 =
+// 1.083k units/s each, so every post is written and one fan-out job per post reaches the pool: 0.1
+// x 10k x (1 + 0.6 cos(2 pi (1.9 s - 20 h) / 24 h)) = 1,299.93 jobs/s at the 20th step (the curve
+// has moved a little from 00:00's 1.3k). With one shard, as first shipped, the primary's 1k
+// writes/s capped it at 999.997. The pool's 32 workers at 5 ms drain up to 6.4k jobs/s, so every
+// job is drained and reads graph_db once, and the 6-node, N = 3 cluster is sent three
+// replica-requests per job: exactly 3 x what the pool drained.
 TEST_CASE("book/news-feed runs: graph_db is sent three replica-requests per fan-out job",
           "[scenario]") {
   using namespace std::chrono_literals;
@@ -558,7 +553,7 @@ TEST_CASE("book/news-feed runs: graph_db is sent three replica-requests per fan-
   REQUIRE(graph_db.dropped_per_s == 0.0);  // 3.9k of 180k replica-requests/s
 }
 
-// ---- The news feed's whole day, sized for its 12:00 spike (plan 2c Task 17) ----
+// ---- The news feed's whole day, sized for its 12:00 spike ----
 //
 // The day's peak is the end of the 12:00 spike: 3 x the sine for 10 minutes while the sine is
 // still rising towards its 20:00 top, so the last step of the spike (12:09:59 at a 1 s step) is
@@ -672,10 +667,10 @@ TEST_CASE("book/news-feed with 8 fan-out workers falls 200 s behind in the spike
   CHECK(day.drop_rate == 0.0);
 }
 
-// Plan 2c refinement 2: byte-sized nodes count megabytes, so the capacities the 2b scenarios gave
-// no verdict (converted from bytes at an assumed 1 MB per object: cdn_us 0.28 % where the bytes
-// give about 14 %) are checked in MB/s, with the numbers the books' sizes give: youtube's 50 MB
-// streams and 300 MB uploads at the 21:00 peak (the load the che hit ratios leave at each store),
+// Spec §19 entry 2: byte-sized nodes count megabytes, so the capacities the 2b scenarios gave no
+// verdict (converted from bytes at an assumed 1 MB per object: cdn_us 0.28 % where the bytes give
+// about 14 %) are checked in MB/s, with the numbers the books' sizes give: youtube's 50 MB streams
+// and 300 MB uploads at the 21:00 peak (the load the che hit ratios leave at each store),
 // news-feed's 200 KB media. The lines read "peak offered <MB/s> (<requests/s>) vs <capacity>".
 TEST_CASE("byte-sized capacities are checked in MB per second", "[scenario]") {
   const auto youtube = build_or_fail(
@@ -695,10 +690,9 @@ TEST_CASE("byte-sized capacities are checked in MB per second", "[scenario]") {
   REQUIRE(original.contains("peak offered 2.88k MB/s (9.6/s) vs 5k MB/s"));
   REQUIRE(original.contains("(57.6%, green)"));
   // transcoded_store: the cdns' misses, 157.82 streams/s x 50 MB = 7.891k MB/s, plus the
-  // transcoders' renditions the paper load follows since Task 7: 9.6 uploads/s offered to the
-  // pool (the paper load does not queue) x 4 renditions x 50 MB = 1.92k MB/s. In all 9.811k MB/s
-  // (196.22 requests/s) of 20GB/s = 20k MB/s: 49.1 %, green, and a complete number (at the
-  // 10GB/s it had until plan 2c Task 16: 98.1 %, red).
+  // transcoders' renditions the paper load follows: 9.6 uploads/s offered to the pool (the paper
+  // load does not queue) x 4 renditions x 50 MB = 1.92k MB/s. In all 9.811k MB/s (196.22
+  // requests/s) of 20GB/s = 20k MB/s: 49.1 %, green, and a complete number (98.1 %, red).
   const auto transcoded = check_line(youtube_text, "transcoded_store");
   REQUIRE(
       transcoded.contains("peak offered 9.811k MB/s (196.2/s) vs 20k MB/s total capacity  "
@@ -719,11 +713,10 @@ TEST_CASE("byte-sized capacities are checked in MB per second", "[scenario]") {
                         "(6.49%, green)"));
 }
 
-// Since plan 2c Task 7 explain's paper load follows a message queue into its consumers and a worker
-// pool's `then` steps, so no shipped scenario is marked "load not propagated" on account of a
-// queue or a pool: whatever mark remains names a type with no phase yet (notification_fanout,
-// frontier). The check reads each mark, the text from "load not propagated:" to the end of its
-// line.
+// explain's paper load follows a message queue into its consumers and a worker pool's `then` steps,
+// so no shipped scenario is marked "load not propagated" on account of a queue or a pool: whatever
+// mark remains names a type with no phase yet (notification_fanout, frontier). The check reads each
+// mark, the text from "load not propagated:" to the end of its line.
 TEST_CASE("no shipped scenario's explain blames a message queue or a worker pool for missing load",
           "[scenario]") {
   const std::string key = "load not propagated:";
@@ -740,8 +733,8 @@ TEST_CASE("no shipped scenario's explain blames a message queue or a worker pool
 }
 
 // The 2b "not checked" note for capacities converted from bytes is gone from every shipped
-// scenario, and so is the object-size assumption it rested on. (A kv_cluster's own note went with
-// the ring model of plan 2c Task 10: the test after the lab's, below, pins that.)
+// scenario, and so is the object-size assumption it rested on. (the test after the lab's, below,
+// pins that.)
 TEST_CASE("no shipped scenario's explain says a byte capacity is not checked", "[scenario]") {
   for (const auto& file : scenario_files()) {
     CAPTURE(file);
@@ -752,7 +745,7 @@ TEST_CASE("no shipped scenario's explain says a byte capacity is not checked", "
   }
 }
 
-// ---- ID generator as service sugar (plan 2b refinement 6; book ch. 7) ----
+// ---- ID generator as service sugar (spec §18 entry 12; book ch. 7) ----
 
 namespace {
 // Builds and runs the scenario `s` to its end and returns its SLO results, failing the test with
@@ -801,10 +794,10 @@ TEST_CASE("labs/unique-id runs and, with the ticket server carrying the load, fa
 }
 
 // Every id the ticket server issues comes back after the services' 50 ms timeout (its full queue of
-// 1000 at 8k/s is 125 ms of wait), so none is answered: 100 % of the delivered requests time out.
-// A p99 SLO then fails whatever its max (review of plan 2c Task 13, C-1): a max of 1 s, twenty
-// times the timeout, cannot be checked by a client that stopped waiting at 50 ms, and nothing it
-// saw was faster. It observes the timeout and says why.
+// 1000 at 8k/s is 125 ms of wait), so none is answered: 100 % of the delivered requests time out. A
+// p99 SLO then fails whatever its max: a max of 1 s, twenty times the timeout, cannot be checked by
+// a client that stopped waiting at 50 ms, and nothing it saw was faster. It observes the timeout
+// and says why.
 TEST_CASE("labs/unique-id fails a p99 SLO of 1 s: every delivered id timed out at 50 ms",
           "[scenario]") {
   auto s = load_scenario("/labs/unique-id/scenario.yaml");
@@ -840,9 +833,9 @@ TEST_CASE("labs/unique-id passes its SLOs once the link weights route to the sno
   REQUIRE(slo_of(results, simsys::model::SloMetric::drop_rate).observed == 0.0);
 }
 
-// The lab's snowflake states neither a capacity nor a latency: the algorithm supplies them
-// (review of 3adc555, I3), 2^12 ids per millisecond = 4.096M/s and 10 us per machine, so four
-// machines give 4 x 4.096M = 16.384M/s, printed with four significant digits.
+// The lab's snowflake states neither a capacity nor a latency: the algorithm supplies them, 2^12
+// ids per millisecond = 4.096M/s and 10 us per machine, so four machines give 4 x 4.096M =
+// 16.384M/s, printed with four significant digits.
 TEST_CASE("labs/unique-id's snowflake takes its capacity and latency from the algorithm",
           "[scenario]") {
   const auto s = load_scenario("/labs/unique-id/scenario.yaml");
@@ -882,7 +875,7 @@ TEST_CASE("book scenarios with a snowflake id generator validate and explain the
   }
 }
 
-// ---- The first book system end to end (plan 2b, Task 8; book ch. 8) ----
+// ---- The first book system end to end (spec §18; book ch. 8) ----
 
 // book/url-shortener, sized with the book's figures (100M writes/day, 10:1 reads; a stateless web
 // tier scaled out, a cache absorbing the reads, the database sharded), runs its 24 hours and
@@ -898,8 +891,8 @@ TEST_CASE("book scenarios with a snowflake id generator validate and explain the
 //    response's mean and variance; 2 % of tolerance, so a change to the model that moves it is
 //    seen and the README's numbers are re-checked.
 // And nothing is dropped: no node is red at the peak (web 80 %, the busiest database copy 65 %).
-// Its third SLO bounds url_db's utilization hour by hour (plan 2c Task 14): the worst hour,
-// 13:02-14:02, averages 0.6433 (test_windows.cpp derives it), under the 0.9 it allows.
+// Its third SLO bounds url_db's utilization hour by hour: the worst hour, 13:02-14:02, averages
+// 0.6433 (test_windows.cpp derives it), under the 0.9 it allows.
 TEST_CASE(
     "book/url-shortener runs its 24 hours and meets its three SLOs with a 0.881 che hit ratio",
     "[scenario]") {
@@ -924,7 +917,7 @@ TEST_CASE(
   REQUIRE_THAT(*hourly.observed, Catch::Matchers::WithinAbs(0.6433, 5e-4));
 }
 
-// ---- Request sizes and link bandwidth in the shipped scenarios (phase 2c, Task 1) --------------
+// ---- Request sizes and link bandwidth in the shipped scenarios (phase 2c) --------------
 //
 // `sizes:` and `bandwidth:` used to be read and ignored; the loader now types them, so a shipped
 // scenario that names an op its client does not send (or writes a size the grammar refuses, or
@@ -984,7 +977,7 @@ TEST_CASE("book scenarios and the kv-store lab state their request sizes in byte
   CHECK_THAT(stated_size_of(kv, "clients", "put"), Catch::Matchers::WithinRel(1e3, 1e-12));
 }
 
-// ---- Request sizes (plan 2c refinement 1, Task 2) ----
+// ---- Request sizes (spec §19 entry 1) ----
 //
 // A byte-sized node counts megabytes, so the graph refuses a scenario in which an op reaches one
 // without a size (Graph::build). Every shipped scenario builds, so every op that reaches one of
@@ -1047,14 +1040,14 @@ TEST_CASE("explain on book/youtube prints the stream size on the byte-sized cdn"
   REQUIRE(node_line(text, "cdn_us").contains("sizes: stream 50MB"));
 }
 
-// ---- The two shipped scenarios with external sinks (plan 2c Task 9) ----
+// ---- The two shipped scenarios with external sinks ----
 //
-// External sinks run since Task 9, but no scenario that runs after phase 2c reaches one:
-// notification-system (apns, fcm, sms_provider, email_provider: its workers' `then` steps) and
-// chat-system (push) each also need a type of a later phase, so the engine still refuses them,
-// and at the same node as before: Simulation::create checks every node's TYPE over the whole file
-// and names the first unsupported one in file order. Giving the sinks a model changes neither
-// refusal; their `failure_rate` shows in explain instead.
+// External sinks run, but no scenario that runs after phase 2c reaches one: notification-system
+// (apns, fcm, sms_provider, email_provider: its workers' `then` steps) and chat-system (push) each
+// also need a type of a later phase, so the engine still refuses them, and at the same node as
+// before: Simulation::create checks every node's TYPE over the whole file and names the first
+// unsupported one in file order. Giving the sinks a model changes neither refusal; their
+// `failure_rate` shows in explain instead.
 
 // notification-system's nodes in file order: services, lb, notification_svc, user_cache,
 // user_db, user_limiter (all simulated), then `fanout`, a notification_fanout: the first node of
@@ -1099,7 +1092,7 @@ TEST_CASE("explain on the shipped scenarios prints each external sink's failure 
   REQUIRE(node_line(chat_text, "push").contains("failure_rate=2%"));
 }
 
-// ---- The kv-store lab at 16 nodes (plan 2c refinement 9, Task 10; book ch. 6) ----
+// ---- The kv-store lab at 16 nodes (spec §19 entry 9; book ch. 6) ----
 //
 // The lab ships with `nodes: 16`: 30k requests/s from the clients, 3 x 30k = 90k replica-requests/s
 // (N = 3: the coordinator sends each read and write to three replicas) over 16 nodes of 10k/s.
@@ -1107,13 +1100,13 @@ TEST_CASE("explain on the shipped scenarios prints each external sink's failure 
 //   hottest node  k x 5.625k, k = 1 + z_16/sqrt(3 x 150) = 1.08338 (z_16 = 1.7688, the expected
 //                 maximum of 16 standard normals; 150 vnodes), = 6.094k/s = 60.94 %
 // The `utilization` SLO (max 0.8) is read at the hottest node, so it observes 0.6094 and passes;
-// the `drop_rate` SLO (max 0.01) sees nothing dropped; the put's p99 (max 20 ms) is far below it:
-// a put crosses four 0.25 ms link legs (1 ms), the coordinator (0.2 ms of service, utilization 0.5
+// the `drop_rate` SLO (max 0.01) sees nothing dropped; the put's p99 (max 20 ms) is far below it: a
+// put crosses four 0.25 ms link legs (1 ms), the coordinator (0.2 ms of service, utilization 0.5
 // over 4 x 15k/s: 0.232 ms with its Erlang wait) and the W = 2 quorum over its key's real replicas
 // (with probability p_hot = 3k/16 = 0.203 the hot machine and two cool ones, otherwise three cool
 // ones; each machine's sojourn a lognormal of its own moments: 0.313 ms), so its mean is 1.544 ms
-// and the lognormal fit's p99 2.31 ms (re-derived for the review of Tasks 9-10, C-1: 2.41 ms
-// before, when every replica was an exponential of the machines' mean sojourn).
+// and the lognormal fit's p99 2.31 ms (2.41 ms before, when every replica was an exponential of the
+// machines' mean sojourn).
 namespace {
 // k = min(1 + z_M / sqrt(N v), M / N), z_M by Blom (queueing::expected_normal_maximum).
 double ring_factor(int machines, int replication, int vnodes) {
@@ -1160,21 +1153,19 @@ TEST_CASE(
   REQUIRE_THAT(*p99.observed, Catch::Matchers::WithinAbs(2.31e-3, 0.01e-3));
 }
 
-// The lesson the lab's comment states: the same lab at the book's eight nodes is over capacity.
-// 90k replica-requests/s over 8 x 10k = 80k/s: 11.25k per node (112.5 %), the hottest
-// k = 1.0676 x that = 12.01k (120.1 %). Every node's queue fills, so the cluster serves 80k of the
-// 90k and drops one ninth: drop_rate 1/9 = 0.1111 against its 0.01, and the hottest node's rho
-// saturates at 1.0 against the utilization SLO's 0.8. The put's p99 fails too: every replica now
-// waits for its full room, 1000 requests drained at 10k/s = 100 ms, with the spread the fluid
-// gives a full queue (the Erlang wait's at the 0.99 clamp, sd 10 ms: three servers per machine);
-// the second of three such replies is 100.03 ms (sd 6.7 ms), and the client's response about 101 ms
-// (a lognormal p99 of 117.8 ms before plan 2c Task 13). The clients' `timeout: 100ms` now gives up
-// on the slow side of that response (56 % of the delivered requests), and the report caps every
-// percentile at the timeout: the p99 the SLO observes is the timeout itself, 0.1 s exactly
-// (seconds(100ms) is the double nearest 0.1, the same as the literal). (The 306 ms the lab showed
-// before the review of Tasks 9-10 came from treating each replica as an exponential of mean
-// 100 ms, sd 100 ms, not from the room.) Three SLOs fail. (5 minutes of the 30, 1 of them warmup:
-// the queues fill in under a second.)
+// The lesson the lab's comment states: the same lab at the book's eight nodes is over capacity. 90k
+// replica-requests/s over 8 x 10k = 80k/s: 11.25k per node (112.5 %), the hottest k = 1.0676 x that
+// = 12.01k (120.1 %). Every node's queue fills, so the cluster serves 80k of the 90k and drops one
+// ninth: drop_rate 1/9 = 0.1111 against its 0.01, and the hottest node's rho saturates at 1.0
+// against the utilization SLO's 0.8. The put's p99 fails too: every replica now waits for its full
+// room, 1000 requests drained at 10k/s = 100 ms, with the spread the fluid gives a full queue (the
+// Erlang wait's at the 0.99 clamp, sd 10 ms: three servers per machine); the second of three such
+// replies is 100.03 ms (sd 6.7 ms), and the client's response about 101 ms. The clients' `timeout:
+// 100ms` now gives up on the slow side of that response (56 % of the delivered requests), and the
+// report caps every percentile at the timeout: the p99 the SLO observes is the timeout itself, 0.1
+// s exactly (seconds(100ms) is the double nearest 0.1, the same as the literal). (sd 100 ms, not
+// from the room.) Three SLOs fail. (5 minutes of the 30, 1 of them warmup: the queues fill in under
+// a second.)
 TEST_CASE(
     "labs/kv-store at eight nodes drops a ninth of the replica-requests and fails all three "
     "SLOs",
@@ -1194,13 +1185,13 @@ TEST_CASE(
   REQUIRE(*p99.observed == 0.1);
 }
 
-// The lab's "try vnodes: 1" at 16 machines (review of Tasks 9-10, C-1): the ring is at its most
-// uneven, k = 1 + z_16/sqrt(3) = 2.021, so the hot machine is sent 11.37k/s against its 10k/s and
-// drops 1.37k of the 90k replica-requests/s (drop rate 1.52 %, the SLO's 1 % fails) at rho 1 (the
-// utilization SLO fails). The put's p99 PASSES: a key's three replicas hold the hot machine with
-// probability 3k/16 = 0.379, and then the two cool replicas (rho 0.524) answer a W = R = 2 quorum
-// first, so the store answers in 0.378 ms and nothing is lost; the client's p99 is 2.65 ms. (The
-// old model put the quorum over the machines' mean sojourn, 10.7 ms, and failed it at 39.7 ms.)
+// The lab's "try vnodes: 1" at 16 machines: the ring is at its most uneven, k = 1 + z_16/sqrt(3) =
+// 2.021, so the hot machine is sent 11.37k/s against its 10k/s and drops 1.37k of the 90k
+// replica-requests/s (drop rate 1.52 %, the SLO's 1 % fails) at rho 1 (the utilization SLO fails).
+// The put's p99 PASSES: a key's three replicas hold the hot machine with probability 3k/16 = 0.379,
+// and then the two cool replicas (rho 0.524) answer a W = R = 2 quorum first, so the store answers
+// in 0.378 ms and nothing is lost; the client's p99 is 2.65 ms. (The old model put the quorum over
+// the machines' mean sojourn, 10.7 ms, and failed it at 39.7 ms.)
 TEST_CASE("labs/kv-store with one virtual node passes its p99: the quorum hides the hot machine",
           "[scenario]") {
   const auto results = run_slos(kv_lab(16, 1, std::chrono::minutes{5}));
@@ -1248,8 +1239,7 @@ simsys::report::OpSummary put_of(const simsys::model::Scenario& s) {
 }  // namespace
 
 // A put now waits for all three replicas, the full hot queue included, and is lost when the hot
-// machine drops it (review of plan 2c Task 11, I-2). The hot machine keeps 10k of the 2.0212 x
-// 5.625k = 11.37k/s it is sent,
+// machine drops it. The hot machine keeps 10k of the 2.0212 x 5.625k = 11.37k/s it is sent,
 //   kept_hot = 0.8796,   p_hot = 3 k / 16 = 0.3790
 // so a put is lost with p_hot (1 - kept_hot) = 0.0456 and 8.589k of the 9k are delivered (a W = 3
 // set of three cool machines loses nothing). Without a timeout, the put's time is the mixture of
@@ -1276,17 +1266,16 @@ TEST_CASE(
   REQUIRE_THAT(put.p99_s, Catch::Matchers::WithinRel(227.1e-3, 1e-3));
 }
 
-// The same with the lab's `timeout: 100ms` (plan 2c Task 13): the client gives up on the delivered
-// puts slower than 100 ms. The untimed response above is a lognormal of mean m = 36.66 ms and
-// sigma^2 = 2 ln(m / p50) = 0.9957 (p50 22.28 ms), so v = m^2 (e^sigma^2 - 1) = 2.294e-3 s^2, and
+// The same with the lab's `timeout: 100ms`: the client gives up on the delivered puts slower than
+// 100 ms. The untimed response above is a lognormal of mean m = 36.66 ms and sigma^2 = 2 ln(m /
+// p50) = 0.9957 (p50 22.28 ms), so v = m^2 (e^sigma^2 - 1) = 2.294e-3 s^2, and
 // queueing::lognormal_below(m, v, 100 ms) answers Phi(z) = 0.9338 of them (z = (ln L - mu) / sigma)
 // in 27.24 ms on average: 6.62 % of the 8.589k delivered time out (568.8/s), 8.020k are answered,
 // and the p99 SLO fails at the timeout (more than 1 % timed out). Weighted by the puts offered, as
 // before the fix, it was 7.43 % (638.4/s) and a mean of 29.4 ms. The p50 is the client's: the
 // engine times out exactly the puts the delivered fit puts past 100 ms, so the fastest half of the
-// delivered puts are answered ones and the client's median is that fit's, the untimed 22.28 ms
-// (comprehensive 2c review, C-1; the refit of the answered puts read at 0.5 / 0.9338 said 22.7 ms,
-// read at 0.5 21.3 ms).
+// delivered puts are answered ones and the client's median is that fit's, the untimed 22.28 ms (a
+// refit of the answered puts read at 0.5 / 0.9338 said 22.7 ms, read at 0.5 21.3 ms).
 TEST_CASE(
     "labs/kv-store with one virtual node and a write quorum of three times out the puts past 100ms",
     "[scenario]") {
@@ -1310,10 +1299,10 @@ TEST_CASE(
   REQUIRE(p99.note == "6.62% of delivered requests timed out (more than 1%)");
 }
 
-// The consistent-hashing lab's balancer ring uses the same heuristic (review of Tasks 9-10, I-2),
-// with N = 1 copy of each key over its M = 4 cache servers: k = 1 + z_4/sqrt(150) = 1.0857
-// (z_4 = 1.0491). 40k/s over 4 x 15k/s is 66.7 % on average, so the hottest server, which the
-// utilization SLO reads, runs at 2/3 x 1.0857 = 0.7238 (0.7211 with the old 1 + 1/sqrt(150)).
+// The consistent-hashing lab's balancer ring uses the same heuristic, with N = 1 copy of each key
+// over its M = 4 cache servers: k = 1 + z_4/sqrt(150) = 1.0857 (z_4 = 1.0491). 40k/s over 4 x 15k/s
+// is 66.7 % on average, so the hottest server, which the utilization SLO reads, runs at 2/3 x
+// 1.0857 = 0.7238 (0.7211 with the old 1 + 1/sqrt(150)).
 TEST_CASE("the consistent-hashing lab's hottest server runs at the ring factor over four servers",
           "[scenario]") {
   const auto results = run_slos(load_scenario("/labs/consistent-hashing/scenario.yaml"));
@@ -1352,12 +1341,11 @@ TEST_CASE("explain on labs/kv-store checks the store at 16 nodes", "[scenario]")
   REQUIRE(node_line(text, "store").contains("nodes=16 N=3 W=2 R=2 mode=ap (partitions: phase 3)"));
 }
 
-// ---- Search autocomplete runs: the search index serves like a service (plan 2c Task 11) --------
+// ---- Search autocomplete runs: the search index serves like a service --------
 //
 // Ch. 13's trie database is a search_index: a service with no steps (spec section 7), here 4
 // replicas of 2k/s at 5 ms behind a read_through cache. Every node type the scenario uses is now
-// simulated (the queue, the pool and the blob store since 2c Tasks 4 and 6-7), so the engine
-// accepts it.
+// simulated (the queue), so the engine accepts it.
 
 TEST_CASE(
     "book/search-autocomplete uses only node types the engine simulates, its search_index included",
@@ -1380,7 +1368,7 @@ TEST_CASE(
 //    for h = 0.995 itself would say 102.6), against 4 replicas x 2k/s = 8k/s: 103.1 / 8000 =
 //    1.29 %, green;
 //  - query_log_q passes the 1.8k searches/s to the aggregators: 6 workers at 2 ms drain
-//    6 / 2 ms = 3k/s, so 1.8k / 3k = 60 %, green (plan 2c Task 18: at the 4 workers shipped
+//    6 / 2 ms = 3k/s, so 1.8k / 3k = 60 %, green (at the 4 workers first shipped
 //    before, 2k/s, the peak sat exactly on the red threshold, 90 %);
 //  - the aggregators write one 1 KB row per search (the `size: 1KB` step): 1.8k/s x 1 KB = 1.8 MB/s
 //    (decimal megabytes) against aggregated_store's 100 MB/s, 1.8 %, green.
@@ -1403,7 +1391,7 @@ TEST_CASE("explain on book/search-autocomplete checks the index, the aggregators
 
 // The index's own line: its numbers are the scenario's (2k/s and 5 ms per replica, so Little's law
 // gives c = 2000 x 5 ms = 10 per replica) and it says its `build_interval` is stored, not modelled:
-// 168h, the book's weekly rebuild (review of plan 2c Task 11, minor 10: the file said 24h).
+// 168h, the book's weekly rebuild (the file said 24h).
 TEST_CASE("explain on book/search-autocomplete prints the index's numbers and its build_interval",
           "[scenario]") {
   const auto g = build_or_fail(load_scenario("/book/search-autocomplete/scenario.yaml"));
@@ -1498,11 +1486,11 @@ TEST_CASE(
   REQUIRE(suggest->p99_s < 0.1);
   REQUIRE_THAT(suggest->p99_s, WithinRel(6.864e-3, 1e-3));
   REQUIRE_THAT(suggest->timed_out_per_s, WithinRel(1.794e-8, 1e-3));
-  REQUIRE(suggest->timed_out_share < 0.01);  // what the p99 SLO allows above it (Task 13's rule)
+  REQUIRE(suggest->timed_out_share < 0.01);  // what the p99 SLO allows above it
   REQUIRE_THAT(suggest->timed_out_share, WithinRel(7.870e-13, 1e-3));
 }
 
-// ---- A step after a failed step does not run: the url-shortener's ticket server (plan 2c, Task
+// ---- A step after a failed step does not run: the url-shortener's ticket server
 // 12) ----
 //
 // `shorten` on the web tier is [id_gen.next_id, url_db.write]: a shorten whose id was not issued
@@ -1597,22 +1585,22 @@ TEST_CASE(
 }
 
 // The same variant with everything else as shipped (reads, the 0.09 share of shortens, the che
-// cache): what its clients see over the day (plan 2c Task 13's scenario pin, added by its review,
-// I-3). A shorten first asks the ticket server for an id; the server's full queue drops 0.2309 of
-// the requests (its drop rate) and makes the rest slow, past the clients' 1 s timeout for a third
-// of them. Of the 1,152.7 shortens offered a second:
+// cache): what its clients see over the day (added by its review). A shorten first asks the ticket
+// server for an id; the server's full queue drops 0.2309 of the requests (its drop rate) and makes
+// the rest slow, past the clients' 1 s timeout for a third of them. Of the 1,152.7 shortens offered
+// a second:
 //   lost to id_gen      1,152.7 x 0.2309            = 266.1/s  (a step after a failed step does
 //                                                               not run: never written either)
 //   delivered           1,152.7 - 266.1             = 886.6/s
 //   timed out           293.6/s of the 886.6 delivered (0.331: the lognormal's share above 1 s)
 //   answered            886.6 - 293.6               = 593.0/s
 // and since more than 1 % of the delivered shortens timed out, the p99 the client saw is the
-// timeout itself, exactly 1 s (review of Task 13, C-1). The timed-out ones were delivered: they are
-// counted from what the path delivered, not from what was offered. Its p50 is the median of the fit
-// to every delivered shorten's latency, before the timeout cut it: the engine times out exactly the
-// shortens that fit puts past 1 s, so the fastest half are answered ones (comprehensive 2c review,
-// C-1): 544.7 ms, what the same run without the timeout reports (the refit of the answered shortens
-// read at 0.5 / (1 − 0.331) said 571 ms, read at 0.5 329 ms).
+// timeout itself, exactly 1 s. The timed-out ones were delivered: they are counted from what the
+// path delivered, not from what was offered. Its p50 is the median of the fit to every delivered
+// shorten's latency, before the timeout cut it: the engine times out exactly the shortens that fit
+// puts past 1 s, so the fastest half are answered ones: 544.7 ms, what the same run without the
+// timeout reports (the refit of the answered shortens read at 0.5 / (1 − 0.331) said 571 ms, read
+// at 0.5 329 ms).
 TEST_CASE(
     "book/url-shortener with a ticket server loses what id_gen drops and times out a third of the "
     "rest",
@@ -1642,13 +1630,13 @@ TEST_CASE(
   REQUIRE_THAT(shorten->p50_s, Catch::Matchers::WithinRel(0.5447, 2e-3));
 }
 
-// ---- youtube end to end (plan 2c Task 16) ----
+// ---- youtube end to end ----
 
-// Plan 2c Task 16: youtube as shipped runs the day and meets all three SLOs (`simsys run` exits 0).
-// The numbers, each measured with `simsys run` at the scenario's 100 ms steps; the 10 s steps used
-// here (8,640 steps, not 864k: a few seconds in Debug) move the p99 by 3e-8 (465.2300 ms either
-// way) and the worst hour by 1.5e-5, and the lag and the link are sampled at 21:00 itself at
-// either step, so 1e-3 pins the README's digits with room to spare for what the step moves:
+// youtube as shipped runs the day and meets all three SLOs (`simsys run` exits 0). The numbers,
+// each measured with `simsys run` at the scenario's 100 ms steps; the 10 s steps used here (8,640
+// steps, not 864k: a few seconds in Debug) move the p99 by 3e-8 (465.2300 ms either way) and the
+// worst hour by 1.5e-5, and the lag and the link are sampled at 21:00 itself at either step, so
+// 1e-3 pins the README's digits with room to spare for what the step moves:
 //  - viewers_eu's stream p99: 465 ms against 2 s. The lognormal fit to the response moments of a
 //    two-valued mix (hits 10.5 ms, misses about 207 ms: the README's "The day's run"), not a path
 //    anyone takes.

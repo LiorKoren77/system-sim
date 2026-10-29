@@ -25,7 +25,8 @@ recommended setting. 15k/s gives 67 % on average and room for the spread.
 ## What the model captures
 - Load imbalance across the four cache servers as a function of `vnodes`: a server's share of
   the keys spreads about 1/sqrt(vnodes) around the average, and the hottest of 4 sits z_4 = 1.05
-  such spreads above it (the expected maximum of 4 standard normals), so it carries
+  such spreads above it (the expected maximum of 4 standard normals, by Blom's approximation),
+  so it carries
   k = 1 + 1.05/sqrt(vnodes) times the average: **1.086** at 150 (a heuristic that grows with the
   number of servers, checked against Monte Carlo rings in
   [numerics, section 8](../../../docs/study/numerics.md); the kv-store lab's ring uses the same
@@ -43,7 +44,7 @@ recommended setting. 15k/s gives 67 % on average and room for the spread.
   DB gets 1 − 0.920 of the gets instead of 1 − 0.963: twice the misses. Hit ratio is concave in
   cache size, so what the hot server loses outweighs what the cool ones gain. `explain` prints
   `hit_ratio=0.92 (che: ...; 2M keys x 4 partitioned, uneven arcs)`.
-- The database as ch. 1 draws it (plan 2b refinement 3): the cache servers' misses are reads,
+- The database as ch. 1 draws it (spec §18 entry 6): the cache servers' misses are reads,
   and with `replicas: 2` they all go to the one read replica; the primary takes the writes. In
   this lab no write reaches the database (under `read_through` a `set` is the cache's own), so
   the primary idles and the replica carries the misses: `explain` prints `primary 0 units/s vs
@@ -70,14 +71,14 @@ recommended setting. 15k/s gives 67 % on average and room for the spread.
   queue fills (1k waiting, red for the whole run) and it sheds the excess, 5.49k/s, 13.7 % of
   all requests; a request that does get through waits about 67 ms in that full queue (1000
   requests drained at 15k/s), which is most of the 34.3 ms mean (51 % of the requests are on
-  the hot server). The clients' `timeout: 200ms` (plan 2c Task 13) gives up on 0.5 % of the
+  the hot server). The clients' `timeout: 200ms` gives up on 0.5 % of the
   requests that get through (`timed_out_per_s` 162.9 of the gets, 18.1 of the sets: s = 0.52 %
   of the gets delivered), and the mean is that of the requests answered in time (35.5 ms before
   the timeout applied). The p99 is what the client saw: the model times out exactly the requests
   its fitted lognormal puts past 200 ms, so the fastest 99 % of the delivered requests are answered
-  ones, and the client's p99 is that fit's, 166 ms, as without the timeout (the comprehensive 2c
-  review, C-1; a refit to the answered requests' truncated moments said 174 ms read at
-  0.99 / (1 − s) and 143 ms read at 0.99). That 0.5 % is the tail of the one
+  ones, and the client's p99 is that fit's, 166 ms, as without the timeout (earlier rules refitted
+  the answered requests' truncated moments, which said 174 ms read at 0.99 / (1 − s) and 143 ms
+  read at 0.99). That 0.5 % is the tail of the one
   lognormal fitted to a two-peaked mixture
   (51 % of the requests at about 67 ms on the hot server, 49 % at about 1 ms on the cool ones),
   whose spread reaches past 200 ms; the two peaks themselves are far below it, so the share is an

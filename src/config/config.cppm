@@ -62,11 +62,11 @@ struct ConfigError {
 // structured data (file, line, column, message) instead of a bare code.
 [[nodiscard]] std::expected<model::Scenario, ConfigError> load(const std::string& path);
 
-// One replaced value (`simsys sweep`, plan 2c Task 15): the scalar at the dot path `path`
-// (`nodes.users.rate.base`: map keys from the document's root down, never a list index) is
-// replaced by the text `value` (`500/s`, in the file's own unit syntax) before validation.
-// A value under a YAML anchor (`&a`) is one node shared with every alias (`*a`) to it: replacing
-// it through either path replaces it everywhere the anchor is used.
+// One replaced value (`simsys sweep`): the scalar at the dot path `path` (`nodes.users.rate.base`:
+// map keys from the document's root down, never a list index) is replaced by the text `value`
+// (`500/s`, in the file's own unit syntax) before validation. A value under a YAML anchor (`&a`) is
+// one node shared with every alias (`*a`) to it: replacing it through either path replaces it
+// everywhere the anchor is used.
 struct Override {
   std::string path;
   std::string value;

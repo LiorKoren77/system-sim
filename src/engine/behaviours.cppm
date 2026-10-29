@@ -64,37 +64,34 @@ struct Outgoing {
   flow::Flow flow{};
 };
 
-// What a behaviour does with one step's flow: what it forwards (one Outgoing per (target,
-// link), sorted by target then link so runs are deterministic), what it accepted (`served`:
-// its input minus what it rejected; a service or a balancer accepts all of it, a rate
-// limiter what it admits) and what it refuses (`rejected`: admission control, plan 2a
-// refinement 6; only a rate limiter fills it). The node's own load is not here: the engine
-// runs the queue BEFORE route and reports it in NodeSample (engine::Simulation::serve).
-// Rejected flow is answered at once ("429 Too Many Requests", ch. 4) and never forwarded;
-// the engine counts it in the node's `rejected_per_s`, apart from the queue's drops: a
-// rejection is the limiter's policy working, a drop a node failing (report::Summary's
-// reject_rate and drop_rate). `served` over the node's inflow is the fraction of its
-// requests the node passes on, the start of its delivered fraction (see `delivered`).
+// What a behaviour does with one step's flow: what it forwards (one Outgoing per (target, link),
+// sorted by target then link so runs are deterministic), what it accepted (`served`: its input
+// minus what it rejected; a service or a balancer accepts all of it, a rate limiter what it admits)
+// and what it refuses (`rejected`: admission control, spec §17 entry 6; only a rate limiter fills
+// it). The node's own load is not here: the engine runs the queue BEFORE route and reports it in
+// NodeSample (engine::Simulation::serve). Rejected flow is answered at once ("429 Too Many
+// Requests", ch. 4) and never forwarded; the engine counts it in the node's `rejected_per_s`, apart
+// from the queue's drops: a rejection is the limiter's policy working, a drop a node failing
+// (report::Summary's reject_rate and drop_rate). `served` over the node's inflow is the fraction of
+// its requests the node passes on, the start of its delivered fraction (see `delivered`).
 struct Routed {
   std::vector<Outgoing> outgoing{};
   flow::Flow served{};
   flow::Flow rejected{};
 };
 
-// C++20 concept: a named, compile-time predicate on a type. Replaces SFINAE tricks
-// (std::enable_if) and "duck typing discovered in a 30-line template error"; a
-// constrained parameter that does not fit fails at the call with the concept's name.
-// Here: anything that answers "how long does node `n` take to respond to op `o`?" —
-// the engine passes a lambda over its latest per-node estimates; tests pass stubs. The engine's
-// lookup is made for one caller and answers for the HOP to `n`: when the link between them is a
-// bandwidth pipe (plan 2c refinement 3), its wait and the request's serialisation come with `n`'s
-// response (engine::Simulation::hop_response), so every behaviour adds a pipe the way it adds the
-// node behind it, and knows nothing of pipes; it still adds the link's fixed legs itself
-// (round_trip).
-// (std::invocable and std::convertible_to are C++20 standard concepts from <concepts>;
-// convertible_to rather than same_as so a lookup returning `const LatencyEstimate&`
-// fits too.) Like every concept here it checks signatures, not behaviour: a lookup
-// that returns nonsense still satisfies it.
+// C++20 concept: a named, compile-time predicate on a type. Replaces SFINAE tricks (std::enable_if)
+// and "duck typing discovered in a 30-line template error"; a constrained parameter that does not
+// fit fails at the call with the concept's name. Here: anything that answers "how long does node
+// `n` take to respond to op `o`?" — the engine passes a lambda over its latest per-node estimates;
+// tests pass stubs. The engine's lookup is made for one caller and answers for the HOP to `n`: when
+// the link between them is a bandwidth pipe (spec §19 entry 3), its wait and the request's
+// serialisation come with `n`'s response (engine::Simulation::hop_response), so every behaviour
+// adds a pipe the way it adds the node behind it, and knows nothing of pipes; it still adds the
+// link's fixed legs itself (round_trip). (std::invocable and std::convertible_to are C++20 standard
+// concepts from <concepts>; convertible_to rather than same_as so a lookup returning `const
+// LatencyEstimate&` fits too.) Like every concept here it checks signatures, not behaviour: a
+// lookup that returns nonsense still satisfies it.
 template <class F>
 concept ResponseLookup = std::invocable<F, std::size_t, std::string_view> &&
                          std::convertible_to<std::invoke_result_t<F, std::size_t, std::string_view>,
@@ -120,30 +117,27 @@ struct NothingLost {
   }
 };
 
-// C++20 requires-expression: lists the operations a type must support, checked at
-// compile time (spec §5). This is the engine's whole requirement on a node behaviour,
-// written in code instead of in a comment on an abstract base class. The lambda is a
-// stand-in ResponseLookup (C++20 allows lambdas in unevaluated operands such as this).
-// It checks that the calls compile and return the right types; what they compute is
-// the tests' job. `cost(op)` is the capacity units one request of `op` uses (plan 2a
-// refinement 4): the engine charges the node's queue in units, not requests.
-// `route(in, now, dt)` takes the step's start and length and is called on a non-const
-// behaviour (`node`): a stateless node (service, load balancer) ignores both and may declare
-// route const, but a stateful one (the rate limiter's bucket or window counters) refills by
-// dt, finds its window from `now`, and must change itself. Requiring it on `B&` admits both;
-// `cost`, `response` and `delivered` stay const.
-// `delivered(op, own, lookup)` is the fraction of the requests of `op` sent to this node
-// that come back answered (plan 2a refinement 8): `own` is the share the node itself does not
-// lose on this step (the engine's 1 − (dropped + rejected) / inflow), times what its downstream
-// calls deliver.
-// `route`'s last argument is the same kind of lookup, `delivered_last_step` (plan 2c refinement
-// 11, "a step after a failed step does not run"): what each call delivered at the end of the
-// LAST step, which a node whose calls follow one another (a service's steps, a cache's store hop
-// and `then` steps, a worker pool's hand-offs: detail::HopBlocks::forward) uses to send a later
-// call only the requests that survived the earlier ones; a rate limiter thins its admitted flow
-// by its counter check's fraction (it fails closed). A node whose calls all start with the request
-// (a balancer's routes, a leaf) or whose calls nobody waits for (a blob store's events) has
-// nothing to thin and ignores it.
+// C++20 requires-expression: lists the operations a type must support, checked at compile time
+// (spec §5). This is the engine's whole requirement on a node behaviour, written in code instead of
+// in a comment on an abstract base class. The lambda is a stand-in ResponseLookup (C++20 allows
+// lambdas in unevaluated operands such as this). It checks that the calls compile and return the
+// right types; what they compute is the tests' job. `cost(op)` is the capacity units one request of
+// `op` uses (spec §17 entry 4): the engine charges the node's queue in units, not requests.
+// `route(in, now, dt)` takes the step's start and length and is called on a non-const behaviour
+// (`node`): a stateless node (service, load balancer) ignores both and may declare route const, but
+// a stateful one (the rate limiter's bucket or window counters) refills by dt, finds its window
+// from `now`, and must change itself. Requiring it on `B&` admits both; `cost`, `response` and
+// `delivered` stay const. `delivered(op, own, lookup)` is the fraction of the requests of `op` sent
+// to this node that come back answered (spec §17 entry 8): `own` is the share the node itself does
+// not lose on this step (the engine's 1 − (dropped + rejected) / inflow), times what its downstream
+// calls deliver. `route`'s last argument is the same kind of lookup, `delivered_last_step` (spec
+// §19 entry 11, "a step after a failed step does not run"): what each call delivered at the end of
+// the LAST step, which a node whose calls follow one another (a service's steps, a cache's store
+// hop and `then` steps, a worker pool's hand-offs: detail::HopBlocks::forward) uses to send a later
+// call only the requests that survived the earlier ones; a rate limiter thins its admitted flow by
+// its counter check's fraction (it fails closed). A node whose calls all start with the request (a
+// balancer's routes, a leaf) or whose calls nobody waits for (a blob store's events) has nothing to
+// thin and ignores it.
 template <class B>
 concept NodeBehaviour = requires(const B b, B& node, const flow::Flow& in, SimTime now, SimTime dt,
                                  flow::LatencyEstimate own) {
@@ -227,17 +221,17 @@ struct Branch {
 // f >= 1 is the hop itself; f <= 0 is nothing (and never asks for a possibly infinite hop).
 [[nodiscard]] flow::LatencyEstimate conditional_hop(double fraction, flow::LatencyEstimate hop);
 
-// Delivered fractions (plan 2a refinement 8, see NodeBehaviour): a request is answered only
-// if every part of its path answers it, so the fractions of SEQUENTIAL parts multiply (the
-// limiter's own admission x the counter check x the api: 0.25 x 1 x 0.9), and so do a
-// service's parallel calls (it needs every reply). Over a SPLIT (a client's routes, a load
-// balancer's links) a request takes one branch, so the fraction is the share-weighted mean
-// Σ s_i d_i. Assumes the parts fail independently of one another, as the fluid's per-node
-// fractions do. Where the fraction comes from at each node: what it does not lose, 1 − (dropped
-// + rejected) / inflow (engine::Simulation::account_rejections): a service or balancer loses
-// what its full queue drops, a token-family limiter what it refuses, a leaky bucket what
-// overflows; a request still waiting is not lost. engine::Simulation's backward pass composes
-// them, one step stale over a feedback hop as latency is.
+// Delivered fractions (spec §17 entry 8, see NodeBehaviour): a request is answered only if every
+// part of its path answers it, so the fractions of SEQUENTIAL parts multiply (the limiter's own
+// admission x the counter check x the api: 0.25 x 1 x 0.9), and so do a service's parallel calls
+// (it needs every reply). Over a SPLIT (a client's routes, a load balancer's links) a request takes
+// one branch, so the fraction is the share-weighted mean Σ s_i d_i. Assumes the parts fail
+// independently of one another, as the fluid's per-node fractions do. Where the fraction comes from
+// at each node: what it does not lose, 1 − (dropped + rejected) / inflow
+// (engine::Simulation::account_rejections): a service or balancer loses what its full queue drops,
+// a token-family limiter what it refuses, a leaky bucket what overflows; a request still waiting is
+// not lost. engine::Simulation's backward pass composes them, one step stale over a feedback hop as
+// latency is.
 
 }  // namespace simsys::behaviours
 
@@ -295,14 +289,14 @@ class HopBlocks {
   // blocks" (an empty view) without a static empty vector to point at.
   [[nodiscard]] std::span<const Block> blocks_of(std::string_view op) const;
 
-  // Adds to `outgoing` what each hop of `op` is sent when `rate` requests a second arrive:
-  // rate × the share still alive when the hop is called × the block's fraction × factor,
-  // asynchronous hops included (their flow goes on; only nobody waits for it).
-  // "Still alive" (plan 2c refinement 11, a step after a failed step does not run): a request is
-  // answered only if every call it waits for is, so a request one call failed makes none of the
-  // calls after it. With d_i the delivered fraction of call i (`delivered_last_step`: what the
-  // target answered at the end of the LAST simulation step, of what it was sent of that op,
-  // everything it called in turn included) and S the survival, the share of the requests alive:
+  // Adds to `outgoing` what each hop of `op` is sent when `rate` requests a second arrive: rate ×
+  // the share still alive when the hop is called × the block's fraction × factor, asynchronous hops
+  // included (their flow goes on; only nobody waits for it). "Still alive" (spec §19 entry 11, a
+  // step after a failed step does not run): a request is answered only if every call it waits for
+  // is, so a request one call failed makes none of the calls after it. With d_i the delivered
+  // fraction of call i (`delivered_last_step`: what the target answered at the end of the LAST
+  // simulation step, of what it was sent of that op, everything it called in turn included) and S
+  // the survival, the share of the requests alive:
   //   a sequential block       is sent S;  after it   S ← S × survival(block)
   //   survival(block)          = (1 − f) + f × Π d_i over its waited hops
   //                              (f the share that takes it: a miss block fails only its misses,
@@ -461,35 +455,32 @@ void add_then_blocks(const graph::Graph& g, std::size_t self, const std::string&
 
 export namespace simsys::behaviours {
 
-// Models: a `service` box of System Design Interview (Alex Xu, vol. 1) — the stateless
-// web/API tier of ch. 1 ("Scale from zero to millions of users"), and every application
-// server of the later designs (ch. 11 news feed fan-out service, ch. 12 chat servers).
-// Captured: for each incoming op, the downstream calls it makes (`ops` steps), the
-// fan-out of each call (`factor`: one post becomes 100 feed writes), and how the call
-// latencies compose — sequential calls add, parallel calls wait for the slowest — and
-// how much of the node's capacity each op uses (`cost`, in capacity units: a `write` of
-// cost 3 is three `read`s of cost 1, the way an expensive endpoint is weighed when sizing
-// a tier in ch. 2). Ignored: per-op service TIME (a costly op uses more capacity, but its
-// own sojourn is the node's one service time: the queue is not a multi-class one), the
-// burstiness a cost adds (a cost-c request arrives as a batch of c units at once, so
-// Kingman's `burstiness`, the SCV of arrivals taken unit by unit, understates its arrival
-// variability and the queueing wait with it), retries and timeouts, and `on: failure` steps:
-// phase 2a models no failures, so those never fire here. A service has no `then` steps either
-// (the loader rejects them for this type): everything it sends is per op. Hops that close a
-// call cycle are asynchronous hand-offs (see `response`).
-// A step after a failed step does not run (plan 2c refinement 11; ch. 8's shorten: a URL whose
-// id was not issued is never written): each step is sent only the requests every step before
+// Models: a `service` box of System Design Interview (Alex Xu, vol. 1) — the stateless web/API tier
+// of ch. 1 ("Scale from zero to millions of users"), and every application server of the later
+// designs (ch. 11 news feed fan-out service, ch. 12 chat servers). Captured: for each incoming op,
+// the downstream calls it makes (`ops` steps), the fan-out of each call (`factor`: one post becomes
+// 100 feed writes), and how the call latencies compose — sequential calls add, parallel calls wait
+// for the slowest — and how much of the node's capacity each op uses (`cost`, in capacity units: a
+// `write` of cost 3 is three `read`s of cost 1, the way an expensive endpoint is weighed when
+// sizing a tier in ch. 2). Ignored: per-op service TIME (a costly op uses more capacity, but its
+// own sojourn is the node's one service time: the queue is not a multi-class one), the burstiness a
+// cost adds (a cost-c request arrives as a batch of c units at once, so Kingman's `burstiness`, the
+// SCV of arrivals taken unit by unit, understates its arrival variability and the queueing wait
+// with it), retries and timeouts, and `on: failure` steps: phase 2a models no failures, so those
+// never fire here. A service has no `then` steps either (the loader rejects them for this type):
+// everything it sends is per op. Hops that close a call cycle are asynchronous hand-offs (see
+// `response`). A step after a failed step does not run (spec §19 entry 11; ch. 8's shorten: a URL
+// whose id was not issued is never written): each step is sent only the requests every step before
 // it answered, and the parallel group fails as a whole (route, detail::HopBlocks::forward), with
-// the fractions of the previous simulation step.
-// Cache-aside (plan 2a refinement 7; the pattern ch. 1 draws, which the book calls
-// read-through: the application reads the cache and fetches a miss itself): a step
-// `{to: db, on: miss}` after a step to a cache is taken by the cache's miss fraction 1 − h of
-// the requests only (graph::Graph::service_hops resolves that `fraction` once): it forwards
-// rate × factor × (1 − h) (the factor counting every missed lookup), costs the response
-// (1 − h) × the hop on average plus the spread between hit and miss (conditional_hop), and
-// fails a request only when it is taken (`delivered`). The miss steps after one lookup form
-// one Block: a miss takes all of them, one after another, so the block is one conditional hop
-// over the sum of their legs, and a miss is answered only if every fetch is.
+// the fractions of the previous simulation step. Cache-aside (spec §17 entry 7; the pattern ch. 1
+// draws, which the book calls read-through: the application reads the cache and fetches a miss
+// itself): a step `{to: db, on: miss}` after a step to a cache is taken by the cache's miss
+// fraction 1 − h of the requests only (graph::Graph::service_hops resolves that `fraction` once):
+// it forwards rate × factor × (1 − h) (the factor counting every missed lookup), costs the response
+// (1 − h) × the hop on average plus the spread between hit and miss (conditional_hop), and fails a
+// request only when it is taken (`delivered`). The miss steps after one lookup form one Block: a
+// miss takes all of them, one after another, so the block is one conditional hop over the sum of
+// their legs, and a miss is answered only if every fetch is.
 class ServiceBehaviour {
  public:
   ServiceBehaviour(const graph::Graph& g, std::size_t self);
@@ -552,39 +543,36 @@ class ServiceBehaviour {
   std::map<std::string, double, std::less<>> cost_by_op_;  // only the ops listed in `cost`
 };
 
-// The seed of client `index`'s noise process (spec phase 2a refinement 3): one
-// std::mt19937_64 per client, so appending a node (client or not) at the end of the file
-// never changes another client's noise. The seed is the node index, so a node inserted
-// before a client moves that client's index, and so its noise.
-// Formula: (seed × 0x9E3779B97F4A7C15) XOR index, all mod 2^64. The constant is 2^64
-// divided by the golden ratio (splitmix64's increment); what matters is that it is odd and
-// large. The multiply is there to keep (seed, index) pairs apart, not to decorrelate
-// neighbouring seeds (std::mt19937_64's own seeding already does that): a plain
-// seed XOR index collides, 1^0 == 0^1, while seed × K moves each seed's block of indices
-// far into the high bits, so for the seeds and client counts a scenario uses no two pairs
-// share an engine seed (tests/unit/test_behaviours.cpp checks seeds -100..100 × 64
-// clients). A negative seed converts to std::uint64_t modulo 2^64, so it is as deterministic
-// as a positive one: signed-to-unsigned conversion has always been defined that way; what
-// C++20's two's-complement rule fixed is the other direction (unsigned to signed). The engine
-// (Simulation::make_node) and `simsys curve
-// --noise` both call this, so the curve command prints exactly the noise a run will use.
+// The seed of client `index`'s noise process (spec §17 entry 3): one std::mt19937_64 per client, so
+// appending a node (client or not) at the end of the file never changes another client's noise. The
+// seed is the node index, so a node inserted before a client moves that client's index, and so its
+// noise. Formula: (seed × 0x9E3779B97F4A7C15) XOR index, all mod 2^64. The constant is 2^64 divided
+// by the golden ratio (splitmix64's increment); what matters is that it is odd and large. The
+// multiply is there to keep (seed, index) pairs apart, not to decorrelate neighbouring seeds
+// (std::mt19937_64's own seeding already does that): a plain seed XOR index collides, 1^0 == 0^1,
+// while seed × K moves each seed's block of indices far into the high bits, so for the seeds and
+// client counts a scenario uses no two pairs share an engine seed (tests/unit/test_behaviours.cpp
+// checks seeds -100..100 × 64 clients). A negative seed converts to std::uint64_t modulo 2^64, so
+// it is as deterministic as a positive one: signed-to-unsigned conversion has always been defined
+// that way; what C++20's two's-complement rule fixed is the other direction (unsigned to signed).
+// The engine (Simulation::make_node) and `simsys curve --noise` both call this, so the curve
+// command prints exactly the noise a run will use.
 inline constexpr std::uint64_t golden_ratio_increment = 0x9E3779B97F4A7C15;
 
 [[nodiscard]] constexpr std::uint64_t client_seed(int seed, std::size_t index) {
   return (static_cast<std::uint64_t>(seed) * golden_ratio_increment) ^ std::uint64_t{index};
 }
 
-// Models: the "User" box at the top of every System Design Interview diagram — web and
-// mobile clients as one aggregate source of load (ch. 1; the ch. 2 back-of-the-envelope
-// estimates give its rate, e.g. 300M DAU -> QPS). Captured: a request rate that follows
-// the scenario's rate curve over time (daily waves, ramps, spikes, replayed traces:
-// workload::RateCurve) times a seeded random multiplier (workload::NoiseProcess), split
-// into ops by fixed shares, each op split over the links that carry it by link weight
-// (DNS round-robin, CDN vs origin), and a `timeout` after which the client gives up on a
-// request (the engine counts the slow tail of each response as timed out instead of answered:
-// engine::Simulation::give_up_after, plan 2c Task 13). Ignored: think time and closed-loop
-// clients (offered load never reacts to latency: a slow site does not make these users send
-// less or leave), and retries (a timed-out request is not sent again).
+// Models: the "User" box at the top of every System Design Interview diagram — web and mobile
+// clients as one aggregate source of load (ch. 1; the ch. 2 back-of-the-envelope estimates give its
+// rate, e.g. 300M DAU -> QPS). Captured: a request rate that follows the scenario's rate curve over
+// time (daily waves, ramps, spikes, replayed traces: workload::RateCurve) times a seeded random
+// multiplier (workload::NoiseProcess), split into ops by fixed shares, each op split over the links
+// that carry it by link weight (DNS round-robin, CDN vs origin), and a `timeout` after which the
+// client gives up on a request (the engine counts the slow tail of each response as timed out
+// instead of answered: engine::Simulation::give_up_after). Ignored: think time and closed-loop
+// clients (offered load never reacts to latency: a slow site does not make these users send less or
+// leave), and retries (a timed-out request is not sent again).
 class ClientBehaviour {
  public:
   // `seed` seeds this client's noise process; the engine passes client_seed(scenario
@@ -762,15 +750,14 @@ class Forwarding {
 
 export namespace simsys::behaviours {
 
-// Models: the "Load balancer" box of System Design Interview (Alex Xu, vol. 1) ch. 1 —
-// the single public entry that spreads requests over a stateless web tier so that servers
-// can be added or lose one without users noticing — and the hash ring of ch. 5
-// ("Design consistent hashing"), which sends each key to the same server.
-// Captured: the balancer is a queue of its own (default 100k/s, 50 us: an L7 proxy hop,
-// see simsys.defaults), so it adds its own sojourn; it forwards every op it receives over
-// the links that carry it, split by link weight; and its policy (plan 2a refinement 5)
-// changes how the replicas BEHIND it queue, which graph::Graph::mark_balanced_targets
-// resolves and the engine applies:
+// Models: the "Load balancer" box of System Design Interview (Alex Xu, vol. 1) ch. 1 — the single
+// public entry that spreads requests over a stateless web tier so that servers can be added or lose
+// one without users noticing — and the hash ring of ch. 5 ("Design consistent hashing"), which
+// sends each key to the same server. Captured: the balancer is a queue of its own (default 100k/s,
+// 50 us: an L7 proxy hop, see simsys.defaults), so it adds its own sojourn; it forwards every op it
+// receives over the links that carry it, split by link weight; and its policy (spec §17 entry 5)
+// changes how the replicas BEHIND it queue, which graph::Graph::mark_balanced_targets resolves and
+// the engine applies:
 //   round_robin / weighted -> independent replicas, each an M/M/c at its share;
 //   least_connections      -> one pooled M/M/(c·N) queue (join-the-shortest-queue ideal);
 //   consistent_hash        -> the hottest of the M replicas carries 1 + z_M/sqrt(vnodes) × the
@@ -820,22 +807,21 @@ class LoadBalancerBehaviour {
   detail::Forwarding forwarding_;
 };
 
-// Models: the "Rate limiter" of System Design Interview (Alex Xu, vol. 1) ch. 4 — a
-// middleware in front of the API servers that counts each client's requests in a fast
-// store (Redis in the book) and answers "429 Too Many Requests" once a client is over its
-// limit. Captured (plan 2a refinement 6): the limiter is a queue of its own (default
-// 100k/s, 50 us: an in-memory counter check, see simsys.defaults) that sees EVERY request,
-// admitted or not; what it admits goes on over its links like a load balancer's flow; what
-// it refuses is `rejected`, answered at once and never forwarded; with a `backend` (the
-// counter store) every request it CHECKS, admitted or refused, first reads its counter
-// there (one `counter` request each), which adds that hop to the response. A check the store
-// lost fails the request closed: it is neither admitted onwards nor answered, so the admitted
+// Models: the "Rate limiter" of System Design Interview (Alex Xu, vol. 1) ch. 4 — a middleware in
+// front of the API servers that counts each client's requests in a fast store (Redis in the book)
+// and answers "429 Too Many Requests" once a client is over its limit. Captured (spec §17 entry 6):
+// the limiter is a queue of its own (default 100k/s, 50 us: an in-memory counter check, see
+// simsys.defaults) that sees EVERY request, admitted or not; what it admits goes on over its links
+// like a load balancer's flow; what it refuses is `rejected`, answered at once and never forwarded;
+// with a `backend` (the counter store) every request it CHECKS, admitted or refused, first reads
+// its counter there (one `counter` request each), which adds that hop to the response. A check the
+// store lost fails the request closed: it is neither admitted onwards nor answered, so the admitted
 // flow is forwarded × the share of the checks the store answered (last step's, as for any later
 // step: detail::HopBlocks::forward), the same factor `delivered` multiplies by. (Failing open, an
 // unanswered check letting the request through, is the other choice real limiters make; it would
-// forward everything and answer what the check lost.) Each of the five
-// algorithms of ch. 4 keeps its own state, stepped once per step of length dt that starts at
-// `now`. With W = limit × window (requests a window may hold) and `in` the inflow (req/s):
+// forward everything and answer what the check lost.) Each of the five algorithms of ch. 4 keeps
+// its own state, stepped once per step of length dt that starts at `now`. With W = limit × window
+// (requests a window may hold) and `in` the inflow (req/s):
 //  - token_bucket: a bucket of at most `burst` tokens, refilled at `limit` per second, one
 //    token per request. Over a step the bucket holds L tokens and receives limit·dt more:
 //      admitted = min(in, limit + L/dt)              (requests per second)
@@ -910,12 +896,12 @@ class RateLimiterBehaviour {
   // One capacity unit per request, admitted or rejected: the check costs the same.
   [[nodiscard]] double cost(std::string_view /*op*/) const { return 1.0; }
 
-  // own sojourn + the counter store hop (two link legs + the backend's `counter` response)
-  // + the downstream mixture as for a load balancer. The counter check happens BEFORE the
-  // request is passed on, so the two hops are sequential and add. This is the response of
-  // an ADMITTED request. A rejected request also waited for the counter check (own + the
-  // counter hop, then the 429), but it is not answered, so it never reaches the client's
-  // latency figures: plan 2a refinement 8 weighs them by the answered requests (`delivered`).
+  // own sojourn + the counter store hop (two link legs + the backend's `counter` response) + the
+  // downstream mixture as for a load balancer. The counter check happens BEFORE the request is
+  // passed on, so the two hops are sequential and add. This is the response of an ADMITTED request.
+  // A rejected request also waited for the counter check (own + the counter hop, then the 429), but
+  // it is not answered, so it never reaches the client's latency figures: spec §17 entry 8 weighs
+  // them by the answered requests (`delivered`).
   [[nodiscard]] flow::LatencyEstimate response(std::string_view op, flow::LatencyEstimate own,
                                                ResponseLookup auto&& downstream) const {
     flow::LatencyEstimate total = own;
@@ -995,19 +981,18 @@ class RateLimiterBehaviour {
   double log_sum_{0.0};
 };
 
-// Models: the "Cache" tier of System Design Interview (Alex Xu, vol. 1) ch. 1 ("Scale from
-// zero to millions of users": a memory store in front of the database for data read often
-// and changed rarely) and its uses in ch. 8 (URL shortener: <shortURL, longURL> in a
-// cache), ch. 11 (news feed caches), ch. 12 (chat), ch. 13 (autocomplete) and ch. 14
-// (YouTube metadata). Plan 2a refinement 7. Captured: the cache is a queue of its own
-// (default 100k/s, 250 µs: an in-memory lookup, the latency table's 1 MB memory read, see
-// simsys.defaults) that answers every
-// request sent to it, hits and misses alike, at its `cost` per op; a FIXED hit ratio h, the
-// share of reads it answers from memory; which ops are writes (`write_ops`, every other op
-// is a read); and the strategy, i.e. who talks to the store. Names: ch. 1 draws one pattern,
-// the application reading the cache and fetching a miss itself, and calls it "read-through";
-// the industry's name for it is cache-aside, which is ours. Our `read_through` is the
-// cache-driven fetch, and the write strategies are general caching practice, not the book's:
+// Models: the "Cache" tier of System Design Interview (Alex Xu, vol. 1) ch. 1 ("Scale from zero to
+// millions of users": a memory store in front of the database for data read often and changed
+// rarely) and its uses in ch. 8 (URL shortener: <shortURL, longURL> in a cache), ch. 11 (news feed
+// caches), ch. 12 (chat), ch. 13 (autocomplete) and ch. 14 (YouTube metadata). Spec §17 entry 7.
+// Captured: the cache is a queue of its own (default 100k/s, 250 µs: an in-memory lookup, the
+// latency table's 1 MB memory read, see simsys.defaults) that answers every request sent to it,
+// hits and misses alike, at its `cost` per op; a FIXED hit ratio h, the share of reads it answers
+// from memory; which ops are writes (`write_ops`, every other op is a read); and the strategy, i.e.
+// who talks to the store. Names: ch. 1 draws one pattern, the application reading the cache and
+// fetching a miss itself, and calls it "read-through"; the industry's name for it is cache-aside,
+// which is ours. Our `read_through` is the cache-driven fetch, and the write strategies are general
+// caching practice, not the book's:
 //   cache_aside   -> the application. The cache serves everything and forwards nothing; the
 //                    service's `{to: db, on: miss}` step carries the misses (ServiceBehaviour).
 //   read_through  -> the cache. It forwards 1 − h of each read to its `backend` as the same op
@@ -1017,25 +1002,24 @@ class RateLimiterBehaviour {
 //   write_around  -> the same flow as write_through: writes skip the cache and go to the
 //                    store. What differs is what the cache holds afterwards (fewer entries
 //                    nobody reads again), which shows in the hit ratio, and h is fixed here.
-//   write_back    -> (plan 2b refinement 5) the cache acknowledges a write from its own memory
+//   write_back    -> (spec §18 entry 5) the cache acknowledges a write from its own memory
 //                    and flushes it to the backend later: every write goes on to the store as
 //                    the same op (the store's load is unchanged: an upper bound, no coalescing
 //                    of repeated writes to one key), but the flush is ASYNCHRONOUS BY DESIGN
 //                    (graph::Graph marks it in its async hops), so the client's write response
 //                    is the cache's own sojourn and a lost flush fails no client request.
-// Under read_through a write is served by the cache alone (the application writes the store
-// itself, as in cache_aside); under the write strategies a read miss is the application's to
-// fetch (a service `on: miss` step), as in cache_aside. Which share of each op goes to the
-// store is graph::Graph::backend_fraction, the one rule the paper load and the call-cycle
-// search share with this behaviour.
-// `then` steps (plan 2b refinement 5): what happens after the cache has answered, when the
-// cache sits IN FRONT of the next tier rather than beside the application: the inline placement,
-// in which the cache itself forwards what it misses (read-through in spirit), NOT ch. 1's
-// cache-aside, where the web server asks the cache and queries the database itself and the cache
-// forwards nothing. The book's examples of a cache in front: ch. 1's CDN workflow (a CDN that
+// Under read_through a write is served by the cache alone (the application writes the store itself,
+// as in cache_aside); under the write strategies a read miss is the application's to fetch (a
+// service `on: miss` step), as in cache_aside. Which share of each op goes to the store is
+// graph::Graph::backend_fraction, the one rule the paper load and the call-cycle search share with
+// this behaviour. `then` steps (spec §18 entry 5): what happens after the cache has answered, when
+// the cache sits IN FRONT of the next tier rather than beside the application: the inline
+// placement, in which the cache itself forwards what it misses (read-through in spirit), NOT ch.
+// 1's cache-aside, where the web server asks the cache and queries the database itself and the
+// cache forwards nothing. The book's examples of a cache in front: ch. 1's CDN workflow (a CDN that
 // does not have a file fetches it from the origin server, then serves it) and ch. 13's "Browser
-// caching" (Google keeps autocomplete suggestions in the browser cache for an hour: the
-// scenario's `ttl: 1h`): a hit answers in the browser, a miss goes on to the load balancer.
+// caching" (Google keeps autocomplete suggestions in the browser cache for an hour: the scenario's
+// `ttl: 1h`): a hit answers in the browser, a miss goes on to the load balancer.
 //   on: always -> every request the cache handles, hit or miss, sends rate × factor of
 //                 `step.op` (an audit log, say), and waits for it: own + the hop. A sequential
 //                 one adds its hop; the `mode: parallel` ones form ONE group, whose slowest hop
@@ -1125,9 +1109,9 @@ class CacheBehaviour {
   std::map<std::string, double, std::less<>> cost_by_op_;  // only the ops listed in `cost`
 };
 
-// Models: the relational database of System Design Interview (Alex Xu, vol. 1) ch. 1 ("Scale
-// from zero to millions of users"), as its two scaling sections draw it, and every "DB" box of
-// the later designs (ch. 8's URL table, ch. 7's ID tickets). Plan 2b refinement 3.
+// Models: the relational database of System Design Interview (Alex Xu, vol. 1) ch. 1 ("Scale from
+// zero to millions of users"), as its two scaling sections draw it, and every "DB" box of the later
+// designs (ch. 8's URL table, ch. 7's ID tickets). Spec §18 entry 6.
 //  - Database replication (ch. 1): `replicas: N` is one primary and N − 1 read replicas. Every
 //    write (an op in `write_ops`, default insert, update, delete and write) goes to the
 //    primary; reads go to the replicas, or to the primary when there are none (N = 1). Each
@@ -1208,10 +1192,9 @@ class SqlDbBehaviour {
 };
 
 // How a byte-sized node (defaults::is_byte_sized: a blob store, a CDN sized in bytes) spends its
-// time on one request (plan 2c refinement 2; reviews of Task 3 at a8b6cb4 and 0248a47; the model
-// and its bounds are in BlobStoreBehaviour's header). Per op that reaches the node, resolved once
-// at build from its size in megabytes MB_o (graph::op_cost) and the node's service time s_MB, the
-// time of ONE megabyte:
+// time on one request (spec §19 entry 2; the model and its bounds are in BlobStoreBehaviour's
+// header). Per op that reaches the node, resolved once at build from its size in megabytes MB_o
+// (graph::op_cost) and the node's service time s_MB, the time of ONE megabyte:
 //   object time  MB_o × s_MB                     how long one request holds one of the c slots:
 //                                                its whole transfer
 //   answer time  max(MB_o, 1) × s_MB for a write  when its client has the answer once it is in
@@ -1233,11 +1216,11 @@ class MegabyteService {
  public:
   MegabyteService(const graph::Graph& g, std::size_t self);
 
-  // A bandwidth link's pipe (plan 2c refinement 3, engine::Simulation::pass_through_pipe): one
-  // megabyte takes `megabyte_s` (1 MB / bandwidth) and a request of op o is `megabytes_by_op[o]`
-  // long. The pipe's queue waits for whole requests (object time MB_o × s_MB: a request holds the
-  // one server for its whole serialisation); the hop's answer (review of plan 2c Task 5, I-2)
-  // follows refinement 2's rule for the node behind it:
+  // A bandwidth link's pipe (spec §19 entry 3, engine::Simulation::pass_through_pipe): one megabyte
+  // takes `megabyte_s` (1 MB / bandwidth) and a request of op o is `megabytes_by_op[o]` long. The
+  // pipe's queue waits for whole requests (object time MB_o × s_MB: a request holds the one server
+  // for its whole serialisation); the hop's answer follows spec §19 entry 2's rule for the node
+  // behind it:
   //   a write (`write_ops`: graph::ResolvedLink::write_ops)               MB_o × s_MB
   //        the receiver acts after the LAST byte (a PUT is stored once all of it arrived; an op is
   //        a write on the link if the receiver or a node behind it that its body reaches, under
@@ -1297,45 +1280,44 @@ class MegabyteService {
 };
 
 // Models: the CDN of System Design Interview (Alex Xu, vol. 1) ch. 1 ("Content delivery network":
-// geographically dispersed servers that keep static files close to the user) and ch. 14 (the
-// CDN that streams YouTube's videos); ch. 13's browser cache sits in the same place, one hop
-// closer. Plan 2b refinement 4. Captured: the CDN is a read-only cache in front of its `origin`.
-// It is a queue of its own (default 100k/s, 10 ms: serving a ~1 MB object over the network, see
-// simsys.defaults) that answers every read sent to it; the share h it hits (`hit_ratio`, fixed or
-// che) it answers alone, the misses 1 − h it fetches from the origin as the SAME op and answers
-// after the fetch (the book's ch. 1 CDN workflow, paraphrased: a CDN server that does not have
-// the image in its cache requests the file from the origin, stores it and returns it). So it
-// behaves exactly like a read_through cache whose backend is the origin:
+// geographically dispersed servers that keep static files close to the user) and ch. 14 (the CDN
+// that streams YouTube's videos); ch. 13's browser cache sits in the same place, one hop closer.
+// Spec §18 entry 10. Captured: the CDN is a read-only cache in front of its `origin`. It is a queue
+// of its own (default 100k/s, 10 ms: serving a ~1 MB object over the network, see simsys.defaults)
+// that answers every read sent to it; the share h it hits (`hit_ratio`, fixed or che) it answers
+// alone, the misses 1 − h it fetches from the origin as the SAME op and answers after the fetch
+// (the book's ch. 1 CDN workflow, paraphrased: a CDN server that does not have the image in its
+// cache requests the file from the origin, stores it and returns it). So it behaves exactly like a
+// read_through cache whose backend is the origin:
 //   flow to the origin = rate × (1 − h) of each read           (graph::Graph::backend_fraction)
 //   response           = mixture {h: own, 1 − h: own + two link legs + the origin's response}
 //   delivered          = own × (h + (1 − h) × the origin's delivered fraction)
 // A `che` hit ratio is the Che approximation (simsys.caching) for the CDN's `keys` objects: it
 // assumes LRU eviction and independent requests drawn from the clients' key popularity (the
 // independent reference model), so a TTL-evicted edge and the bursts of a video going viral are
-// outside it. A CDN without a hit ratio misses every read (h = 0): the safe side on paper, and
-// what runs. A tiered CDN works as it should: a CDN whose origin is another CDN sends it its
-// misses, and a che hit ratio there is computed over the first tier's misses (graph's key walk).
-// "A read" is every op that is not one of the CDN's write ops (model::write_ops_of: `write`, or
-// the scenario's `write_ops`), and it takes no writes: graph::Graph::build refuses a write op
-// that reaches one, and explain lists the ops it serves.
-// Bytes (plan 2c refinement 2): a CDN sized in bytes (`capacity: 100GB/s`) counts megabytes, as a
-// blob store does (BlobStoreBehaviour has the model and its bounds): 100k units/s of 1 MB, a
-// 50 MB stream costs 50 of them, the 10 ms service time is one megabyte's, so c = 100k/s × 10 ms
-// = 1000 megabyte slots and the CDN saturates at 100e9 / 50e6 = 2k streams/s. Its queue waits
-// for whole streams (a 50 MB stream holds a slot 0.5 s: MegabyteService) and a stream, a read,
-// is answered at its first megabyte. What it forwards to the origin is still the miss share of
-// the REQUESTS: a cost prices work here, it does not multiply requests. A CDN sized in requests
-// (the default 100k/s) charges 1 per request whatever its size.
+// outside it. A CDN without a hit ratio misses every read (h = 0): the safe side on paper, and what
+// runs. A tiered CDN works as it should: a CDN whose origin is another CDN sends it its misses, and
+// a che hit ratio there is computed over the first tier's misses (graph's key walk). "A read" is
+// every op that is not one of the CDN's write ops (model::write_ops_of: `write`, or the scenario's
+// `write_ops`), and it takes no writes: graph::Graph::build refuses a write op that reaches one,
+// and explain lists the ops it serves. Bytes (spec §19 entry 2): a CDN sized in bytes (`capacity:
+// 100GB/s`) counts megabytes, as a blob store does (BlobStoreBehaviour has the model and its
+// bounds): 100k units/s of 1 MB, a 50 MB stream costs 50 of them, the 10 ms service time is one
+// megabyte's, so c = 100k/s × 10 ms = 1000 megabyte slots and the CDN saturates at 100e9 / 50e6 =
+// 2k streams/s. Its queue waits for whole streams (a 50 MB stream holds a slot 0.5 s:
+// MegabyteService) and a stream, a read, is answered at its first megabyte. What it forwards to the
+// origin is still the miss share of the REQUESTS: a cost prices work here, it does not multiply
+// requests. A CDN sized in requests (the default 100k/s) charges 1 per request whatever its size.
 // Ignored: the TTL and the stale content it serves (`ttl` is accepted and not modelled), a cold
-// edge warming up, invalidation, ch. 1's "CDN fallback" (the clients going to the origin while
-// the CDN is down: phase 3's faults), the choice of the nearest PoP (a client's links say which
-// CDN it uses), the CDN's price, and, sized in bytes, the transfer time of all but a stream's
-// first megabyte (see BlobStoreBehaviour).
-// Pattern: Delegation (composition over inheritance) — a CDN IS the read_through shape of a
-// cache, so CdnBehaviour holds a CacheBehaviour and forwards route/response/delivered to it
-// rather than restating them. graph::Graph resolves the origin as the cache's backend
-// (ResolvedNode::backend) with the read_through share, which is all CacheBehaviour reads. Only
-// cost() and megabyte_service() are its own: a cache counts requests, a CDN may count megabytes.
+// edge warming up, invalidation, ch. 1's "CDN fallback" (the clients going to the origin while the
+// CDN is down: phase 3's faults), the choice of the nearest PoP (a client's links say which CDN it
+// uses), the CDN's price, and, sized in bytes, the transfer time of all but a stream's first
+// megabyte (see BlobStoreBehaviour). Pattern: Delegation (composition over inheritance) — a CDN IS
+// the read_through shape of a cache, so CdnBehaviour holds a CacheBehaviour and forwards
+// route/response/delivered to it rather than restating them. graph::Graph resolves the origin as
+// the cache's backend (ResolvedNode::backend) with the read_through share, which is all
+// CacheBehaviour reads. Only cost() and megabyte_service() are its own: a cache counts requests, a
+// CDN may count megabytes.
 class CdnBehaviour {
  public:
   CdnBehaviour(const graph::Graph& g, std::size_t self);
@@ -1378,22 +1360,20 @@ class CdnBehaviour {
 
 // Models: the blob storage of System Design Interview (Alex Xu, vol. 1) ch. 14 ("Design YouTube":
 // the original storage that keeps the uploaded videos and the transcoded storage the CDN fetches
-// from) and ch. 15 ("Design Google Drive": the cloud storage, S3 in the book, that keeps the
-// file blocks, and its cold storage). Plan 2c refinement 2, with the reviews of Task 3 at a8b6cb4
-// (I1, I2) and of its fix round at 0248a47 (C1, I1, I2). Captured: a store whose capacity is a byte
-// rate counts MEGABYTES (defaults::byte_unit). Its capacity is bytes/s ÷ 1 MB units/s (spec §6's
-// default "blob 500 MB/s" is 500 units/s), a request costs its size in megabytes (graph::op_cost:
+// from) and ch. 15 ("Design Google Drive": the cloud storage, S3 in the book, that keeps the file
+// blocks, and its cold storage). Spec §19 entry 2. Captured: a store whose capacity is a byte rate
+// counts MEGABYTES (defaults::byte_unit). Its capacity is bytes/s ÷ 1 MB units/s (spec §6's default
+// "blob 500 MB/s" is 500 units/s), a request costs its size in megabytes (graph::op_cost:
 // Graph::request_bytes / 1 MB, a 50 MB upload 50 units, a 2 KB read 0.002), and its service time
-// s_MB is ONE megabyte's (default 40 ms: the book's "read 1 MB sequentially from disk", 30 ms,
-// plus "... from the network", 10 ms), so Little's law gives c = 500/s × 40 ms = 20 megabyte
-// slots. Nobody it calls is waited for: without `then` steps it is a leaf, as a database is, and
-// its `then` steps are event notifications nobody waits for (below).
-// The batch view: each request is a BATCH of megabytes that holds one slot for its whole
-// transfer, MB_o × s_MB (a 50 MB object 2 s). That time is DETERMINISTIC (a fixed size at a fixed
-// rate per slot: per-object SCV cs² = 0, defaults::default_service_variability), so the spread of
-// service times is the size mix's alone, and the queue is M/G/c over objects, with c slots, the
-// mixture's moments (MegabyteService::object_time_moments) and Kingman's correction to Erlang C
-// (Allen–Cunneen):
+// s_MB is ONE megabyte's (default 40 ms: the book's "read 1 MB sequentially from disk", 30 ms, plus
+// "... from the network", 10 ms), so Little's law gives c = 500/s × 40 ms = 20 megabyte slots.
+// Nobody it calls is waited for: without `then` steps it is a leaf, as a database is, and its
+// `then` steps are event notifications nobody waits for (below). The batch view: each request is a
+// BATCH of megabytes that holds one slot for its whole transfer, MB_o × s_MB (a 50 MB object 2 s).
+// That time is DETERMINISTIC (a fixed size at a fixed rate per slot: per-object SCV cs² = 0,
+// defaults::default_service_variability), so the spread of service times is the size mix's alone,
+// and the queue is M/G/c over objects, with c slots, the mixture's moments
+// (MegabyteService::object_time_moments) and Kingman's correction to Erlang C (Allen–Cunneen):
 //   demand   = Σ_op rate_op × MB_op           units (MB) per second; rho = demand / capacity
 //   p_op     = rate_op / Σ rate,  s_op = MB_op × s_MB
 //   s_obj    = E[S] = Σ_op p_op s_op                            the mean time one object holds
@@ -1424,35 +1404,33 @@ class CdnBehaviour {
 //                                                     overlapping the transfer
 // The answer adds no spread of its own (cs² = 0): the response's variance is the wait's. So every
 // 300 MB upload takes at least 12 s at 25 MB/s per slot (40 ms per MB), and a client `timeout`
-// under 12 s cuts all of them (youtube's `timeout: 10s` times out every upload since plan Task
-// 13; Task 16 sizes it per the book, whose uploads are resumable). Both answers are at least one
+// under 12 s cuts all of them (youtube's clients wait 30 s, a margin for the book's resumable
+// uploads; at `timeout: 10s` every upload times out). Both answers are at least one
 // megabyte's time: a 2 KB request holds its slot only 0.002 × 40 ms = 80 µs (it uses the capacity
 // of its bytes) but is answered in the whole 40 ms of one unit (an upper bound for small objects: a
 // real store answers it in about a disk seek). The overlap argument holds for reads and streams
 // only, and it understates a large read that the client needs whole before it can act (a 1 GB file
 // downloaded to be opened takes 40 s, not 40 ms). The capacity counts every megabyte, so large
-// objects queue everyone behind them.
-// Ignored: durability (replication across regions, erasure coding: the store never loses an
-// object and never fails), multipart and resumable uploads (an object is one request), lifecycle
-// rules (moving old objects to cold storage), the jitter of real disks and networks (seeks,
-// retransmissions: `advanced.service_variability` puts a per-object SCV back).
-// Event notifications (plan 2c refinements 6-7): its `then` steps are S3 event notifications, the
-// way the book's event-driven pipelines start: ch. 14's "transcoding starts when the upload
-// completes" (the original storage tells the transcoding queue), ch. 15's upload that notifies
-// the metadata service. Every WRITE the store SERVED (an op in its `write_ops`, default `[write]`:
+// objects queue everyone behind them. Ignored: durability (replication across regions, erasure
+// coding: the store never loses an object and never fails), multipart and resumable uploads (an
+// object is one request), lifecycle rules (moving old objects to cold storage), the jitter of real
+// disks and networks (seeks, retransmissions: `advanced.service_variability` puts a per-object SCV
+// back). Event notifications (spec §19 entries 6-7): its `then` steps are S3 event notifications,
+// the way the book's event-driven pipelines start: ch. 14's "transcoding starts when the upload
+// completes" (the original storage tells the transcoding queue), ch. 15's upload that notifies the
+// metadata service. Every WRITE the store SERVED (an op in its `write_ops`, default `[write]`:
 // youtube's original_store lists `upload`; not one it dropped: the engine routes what the queue
 // drained) fires every step, rate × factor of the step's op. A read fires nothing: S3 notifies on
 // ObjectCreated and ObjectRemoved, never on a GET, so 1000 views of a video start no transcode
 // (graph::Graph::then_fraction is 0 for a read; notifying on reads is phase 3). A same-op step
-// keeps the request's size, a renamed one carries its `size:` or none (plan 2c refinement 1).
-// Nobody waits for an event (graph::Graph::is_async_hop): the uploader's response and delivered
-// share end at the store, as a write_back cache's flush is not waited for, and what the notified
-// node drops counts in that node's drop rate, never in the uploader's answered rate. A step can be
-// neither `on: miss` nor `on: failure` nor in a `mode` (graph::Graph::build and the loader refuse
-// them: an event never misses, reports no failure, and is waited for by nobody). Ignored: event
-// batching and the delivery delay (S3 sends an event within seconds, the model after the link's
-// latency), failed or duplicated notifications (S3 delivers at least once and may retry), and
-// filters by key prefix.
+// keeps the request's size, a renamed one carries its `size:` or none (spec §19 entry 1). Nobody
+// waits for an event (graph::Graph::is_async_hop): the uploader's response and delivered share end
+// at the store, as a write_back cache's flush is not waited for, and what the notified node drops
+// counts in that node's drop rate, never in the uploader's answered rate. A step can be neither
+// `on: miss` nor `on: failure` nor in a `mode` (graph::Graph::build and the loader refuse them: an
+// event never misses, reports no failure, and is waited for by nobody). Ignored: event batching and
+// the delivery delay (S3 sends an event within seconds, the model after the link's latency), failed
+// or duplicated notifications (S3 delivers at least once and may retry), and filters by key prefix.
 class BlobStoreBehaviour {
  public:
   BlobStoreBehaviour(const graph::Graph& g, std::size_t self);
@@ -1511,23 +1489,22 @@ class BlobStoreBehaviour {
 // durable buffer that lets a producer publish work and a consumer process it later, so the two
 // scale and fail apart), ch. 10's notification system (one queue per channel, drained by its
 // workers: the book's queue-plus-workers design) and the queues of ch. 14 (YouTube's transcoding
-// queue) and ch. 15 (Google Drive's notification queue), run in practice as Kafka. Plan 2c
-// refinements 4 and 6. Captured: the node is the BROKER. Its own queue is the append (spec §6: 1M
-// messages/s, 100 µs chosen, so c = 1M/s × 100 µs = 100 by Little's law), and a publisher is
-// answered when its message is appended: the response is the append's sojourn alone and the
-// delivered share the broker's own, whatever happens to the message later (the hops to the
-// consumers are asynchronous by design, graph::Graph::is_async_hop). Each appended message then
-// goes to EVERY consumer group, a worker pool that `consumes` the queue: Kafka's consumer groups
-// each read the whole log, so the broker's outflow is the sum of its groups' (two groups on 1k
-// messages/s receive 1k/s each, not 500), and a message keeps its op name. What a group has not
-// read waits in that GROUP's pool queue, whose room is the queue's retention × the pool's capacity
+// queue) and ch. 15 (Google Drive's notification queue), run in practice as Kafka. Spec §19 entries
+// 4 and 6. Captured: the node is the BROKER. Its own queue is the append (spec §6: 1M messages/s,
+// 100 µs chosen, so c = 1M/s × 100 µs = 100 by Little's law), and a publisher is answered when its
+// message is appended: the response is the append's sojourn alone and the delivered share the
+// broker's own, whatever happens to the message later (the hops to the consumers are asynchronous
+// by design, graph::Graph::is_async_hop). Each appended message then goes to EVERY consumer group,
+// a worker pool that `consumes` the queue: Kafka's consumer groups each read the whole log, so the
+// broker's outflow is the sum of its groups' (two groups on 1k messages/s receive 1k/s each, not
+// 500), and a message keeps its op name. What a group has not read waits in that GROUP's pool
+// queue, whose room is the queue's retention × the pool's capacity
 // (graph::Graph::connect_consumer): the backlog of an append-only log, held per reader. Its queue
 // lag, how far its slowest group is behind, is read off those pools by the engine
-// (engine::NodeSample::queue_lag_s, plan 2c Task 8). Ignored: ordering (partitions are printed, not
-// modelled), delivery guarantees and redelivery (at-least-once, a consumer that crashes before
-// committing reads a message again), the consumer's commit interval, the broker's disk (an append
-// costs the type's 100 µs whatever the message's size, and the log never fills a disk) and its
-// replication.
+// (engine::NodeSample::queue_lag_s). Ignored: ordering (partitions are printed, not modelled),
+// delivery guarantees and redelivery (at-least-once, a consumer that crashes before committing
+// reads a message again), the consumer's commit interval, the broker's disk (an append costs the
+// type's 100 µs whatever the message's size, and the log never fills a disk) and its replication.
 class MessageQueueBehaviour {
  public:
   MessageQueueBehaviour(const graph::Graph& g, std::size_t self);
@@ -1576,28 +1553,27 @@ class MessageQueueBehaviour {
 // notification workers (the book's queue-plus-workers design: each channel's queue drained by its
 // own workers, which call the third-party push service), ch. 14's transcoding servers, ch. 11's
 // fan-out workers, ch. 15's notification and backup workers, the consumers of ch. 1's message
-// queue. Plan 2c refinement 5, spec §7: "capacity = workers / job
-// cost". Captured: the pool is ONE M/M/c queue over consumption, its c = `workers` and its service
-// time = `cost` (the time one worker spends on one job), so its rate is workers / cost (400
-// transcoders at 60 s a video: 6.667 videos/s); one job is one capacity unit. Its waiting room is
-// what its queue keeps for it, retention × that rate (graph::Graph::connect_consumer), so a
-// backlog grows at inflow − rate while the pool is saturated, and what overflows the room is
-// deleted unconsumed: the pool's drops, which no publisher sees (the hop from the queue is
-// asynchronous). Its response and delivered share are its own: nothing upstream waits for it.
-// Its `then` steps are the work a finished job hands on (plan 2c refinement 5, Task 7; ch. 14's
-// transcoder writes its renditions to the transcoded store and publishes a completion message):
-// every step fires for every job the pool DRAINED (the engine routes what the queue served, so a
-// saturated pool hands on its capacity, not its arrivals, and the excess starts nothing until it
-// is drained), `factor` requests of the step's op each, whatever op the queue brought the job
-// under. A worker is busy for `cost` only: its hand-offs do not hold it, so a slow target leaves
-// the pool's rho and sojourn as they are, and the target's own queue absorbs (or drops) the load.
-// The hops are calls from the pool's side (graph::Graph::is_async_hop is false for them), but no
-// one waits for the pool, so they add nothing to any client's response and fail no client's
-// request (a sequential or parallel group alike); what a target drops counts in its own drop rate.
-// Ignored: a worker blocked on a slow downstream call (an external sink's 150 ms would hold a
-// worker and cut the pool's real capacity: phase 3), autoscaling (`workers` is fixed), poison
-// messages that fail and are retried forever, and the job-time spread of real work (the service
-// SCV is the exponential's 1 unless `advanced.service_variability` says otherwise).
+// queue. Spec §19 entry 5, spec §7: "capacity = workers / job cost". Captured: the pool is ONE
+// M/M/c queue over consumption, its c = `workers` and its service time = `cost` (the time one
+// worker spends on one job), so its rate is workers / cost (400 transcoders at 60 s a video: 6.667
+// videos/s); one job is one capacity unit. Its waiting room is what its queue keeps for it,
+// retention × that rate (graph::Graph::connect_consumer), so a backlog grows at inflow − rate while
+// the pool is saturated, and what overflows the room is deleted unconsumed: the pool's drops, which
+// no publisher sees (the hop from the queue is asynchronous). Its response and delivered share are
+// its own: nothing upstream waits for it. Its `then` steps are the work a finished job hands on
+// (spec §19 entry 5; ch. 14's transcoder writes its renditions to the transcoded store and
+// publishes a completion message): every step fires for every job the pool DRAINED (the engine
+// routes what the queue served, so a saturated pool hands on its capacity, not its arrivals, and
+// the excess starts nothing until it is drained), `factor` requests of the step's op each, whatever
+// op the queue brought the job under. A worker is busy for `cost` only: its hand-offs do not hold
+// it, so a slow target leaves the pool's rho and sojourn as they are, and the target's own queue
+// absorbs (or drops) the load. The hops are calls from the pool's side (graph::Graph::is_async_hop
+// is false for them), but no one waits for the pool, so they add nothing to any client's response
+// and fail no client's request (a sequential or parallel group alike); what a target drops counts
+// in its own drop rate. Ignored: a worker blocked on a slow downstream call (an external sink's 150
+// ms would hold a worker and cut the pool's real capacity: phase 3), autoscaling (`workers` is
+// fixed), poison messages that fail and are retried forever, and the job-time spread of real work
+// (the service SCV is the exponential's 1 unless `advanced.service_variability` says otherwise).
 class WorkerPoolBehaviour {
  public:
   WorkerPoolBehaviour(const graph::Graph& g, std::size_t self);
@@ -1650,20 +1626,20 @@ class WorkerPoolBehaviour {
 // Models: a third party's API, which our system calls and does not run: the providers of System
 // Design Interview (Alex Xu, vol. 1) ch. 10's notification system (Apple's APNs, Google's FCM, an
 // SMS gateway, an e-mail service), which the book's workers call for every message they send, and
-// chat-system's push gateway (ch. 12). Plan 2c refinement 8, spec section 6 `third_party_api`.
+// chat-system's push gateway (ch. 12). Spec §19 entry 8, spec section 6 `third_party_api`.
 // Captured: the node is a LEAF (it answers the request itself and calls nobody: the loader refuses
 // `then` and `ops` on it) whose queue has the type's numbers (simsys.defaults: capacity 1k/s,
-// chosen as the quota a provider grants one account; service time 100 ms and service SCV 2.0,
-// spec section 6: slow and more erratic than the exponential), and a share `failure_rate` f of
-// what that queue SERVES fails, a 5xx from the provider. The ENGINE counts the failures
-// (engine::Simulation::serve moves f × served from the node's drain to its drops), so they show
-// in the node's drop rate like a full queue's overflow, and the `own` share it hands `delivered`
+// chosen as the quota a provider grants one account; service time 100 ms and service SCV 2.0, spec
+// section 6: slow and more erratic than the exponential), and a share `failure_rate` f of what that
+// queue SERVES fails, a 5xx from the provider. The ENGINE counts the failures
+// (engine::Simulation::serve moves f × served from the node's drain to its drops), so they show in
+// the node's drop rate like a full queue's overflow, and the `own` share it hands `delivered`
 // already lacks them: this behaviour forwards nothing, composes nothing and must not apply f a
-// second time. A failure is the provider failing, not a policy working: nothing is ever counted
-// as rejected. Ignored: retries (an `on: failure` step never fires before phase 3, so a failed
-// push is simply lost), the provider's latency rising with our load (its queue is our account's
-// quota, not its fleet), failures that cost a different time than a success, and `politeness`
-// (printed, not modelled: it needs per-host state, phase 3).
+// second time. A failure is the provider failing, not a policy working: nothing is ever counted as
+// rejected. Ignored: retries (an `on: failure` step never fires before phase 3, so a failed push is
+// simply lost), the provider's latency rising with our load (its queue is our account's quota, not
+// its fleet), failures that cost a different time than a success, and `politeness` (printed, not
+// modelled: it needs per-host state, phase 3).
 class ExternalSinkBehaviour {
  public:
   ExternalSinkBehaviour(const graph::Graph& g, std::size_t self);
@@ -1717,13 +1693,12 @@ struct MachineGroup {
 };
 
 // Models: the key-value store of System Design Interview (Alex Xu, vol. 1) ch. 6, Dynamo-style
-// (Amazon's Dynamo, Cassandra), in the steady state (plan 2c refinement 9; the quorum over the real
-// replica set since the review of Tasks 9-10, C-1 and I-1). `nodes` machines sit on a
-// consistent-hash ring (ch. 5); every key lives on N = `replication` of them; the coordinator
-// sends each read and each write to all N replicas and answers a write once W = `write_quorum`
-// have acknowledged it and a read once R = `read_quorum` have replied (ch. 6, "quorum
-// consensus": W + R > N makes a read meet the latest write; W = 1 or R = 1 trades that for speed).
-// Captured, by four pieces:
+// (Amazon's Dynamo, Cassandra), in the steady state (spec §19 entry 9; the quorum over the real
+// replica set). `nodes` machines sit on a consistent-hash ring (ch. 5); every key lives on N =
+// `replication` of them; the coordinator sends each read and each write to all N replicas and
+// answers a write once W = `write_quorum` have acknowledged it and a read once R = `read_quorum`
+// have replied (ch. 6, "quorum consensus": W + R > N makes a read meet the latest write; W = 1 or R
+// = 1 trades that for speed). Captured, by four pieces:
 //  - the machines: graph::apply_kv_ring makes the node `nodes` copies of `capacity` each, and,
 //    when N < nodes, a hot machine carrying k times the average (graph::ring_imbalance, the
 //    balancer's ring heuristic), which the engine runs as hot and cool copy groups;
@@ -1743,18 +1718,18 @@ struct MachineGroup {
 //    Poisson-binomial), so the loss mixes the two kinds of set by p_hot. The response is the
 //    latency of the ANSWERED requests (what a client times), so it mixes them by the share each
 //    kind of set answers, p_hot (1 − L_hot) and (1 − p_hot)(1 − L_cool), over the share answered
-//    (law of total variance; review of plan 2c Task 11, I-2): a set that loses more weighs less. So
+//    (law of total variance): a set that loses more weighs less. So
 //    a quorum of 2 of 3 answers from the two cool replicas when the hot machine is slow or drops,
 //    and a quorum of all 3 waits for it and shares its losses.
 // `mode` (ap or cp) is carried for explain only. Ignored: network partitions and what ap or cp does
 // under them, sloppy quorum and hinted handoff (faults: phase 3), read repair and anti-entropy
 // (Merkle tree) traffic, vector clocks and conflict resolution; the replicas' times taken as
-// independent (one hot queue serves many keys) and lognormal (an M/M/c sojourn is not exactly
-// one); the spread among the cool machines (they are one group); the latency of a request that lost
-// a replica but still met its quorum (taken as if all N replied: its quorum would wait for a later
+// independent (one hot queue serves many keys) and lognormal (an M/M/c sojourn is not exactly one);
+// the spread among the cool machines (they are one group); the latency of a request that lost a
+// replica but still met its quorum (taken as if all N replied: its quorum would wait for a later
 // reply; a Monte Carlo of the 8-machine lab puts the cost at +1.6 % on the mean and about +6 ms on
-// the p99, review of plan 2c Task 11, minor 5). The coordinator's own hop is a node of the
-// scenario, if it is wanted (the kv-store lab's `coordinator` service).
+// the p99). The coordinator's own hop is a node of the scenario, if it is wanted (the kv-store
+// lab's `coordinator` service).
 class KvClusterBehaviour {
  public:
   KvClusterBehaviour(const graph::Graph& g, std::size_t self);
@@ -2447,7 +2422,7 @@ double BlobStoreBehaviour::cost(std::string_view op) const {
 // ---- MessageQueueBehaviour ----
 
 // The queue's routes for each op that reaches it (graph::Graph::routes_for: one per consumer group
-// whose link carries the op, each of share 1), review of plan 2c Task 6, M-4.
+// whose link carries the op, each of share 1).
 MessageQueueBehaviour::MessageQueueBehaviour(const graph::Graph& g, std::size_t self) {
   for (const auto& op : g.arriving_ops(self)) {
     auto& consumers = consumers_by_op_[op];
@@ -2580,12 +2555,11 @@ const KvClusterBehaviour::QuorumAnswer& KvClusterBehaviour::answer_of(std::strin
 // (behaviours::mixture, the law of total variance), each set weighted by the share of the requests
 // it answers over all those answered:
 //   w_hot = p_hot (1 − L_hot) / (1 − L),   w_cool = (1 − p_hot)(1 − L_cool) / (1 − L)
-// (review of plan 2c Task 11, I-2: weighting by p_hot alone timed the requests the hot set lost
-// too). With nothing lost the weights are p_hot and 1 − p_hot exactly; with everything lost no
-// request is timed, and the sets keep their offered shares (the time a request would take). A set
-// that answers nothing is left out of the answered mix (answered_only): its reply time may be
-// infinite (a dead hot machine at W = N), and its weight 0 would make 0 × inf = NaN (review of
-// the kv/search fix round, M-2).
+// (weighting by p_hot alone timed the requests the hot set lost too). With nothing lost the weights
+// are p_hot and 1 − p_hot exactly; with everything lost no request is timed, and the sets keep
+// their offered shares (the time a request would take). A set that answers nothing is left out of
+// the answered mix (answered_only): its reply time may be infinite (a dead hot machine at W = N),
+// and its weight 0 would make 0 × inf = NaN.
 KvClusterBehaviour::QuorumAnswer KvClusterBehaviour::answer_quorum(int quorum) const {
   std::array<Branch, 2> answered{};
   std::array<Branch, 2> offered{};
