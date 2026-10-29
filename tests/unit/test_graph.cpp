@@ -3484,3 +3484,77 @@ TEST_CASE("Graph::build refuses a kv_cluster built in code with an impossible sh
     REQUIRE(refused(kv_store(8, 3, 0)) == "node 'store': vnodes must be a positive integer");
   }
 }
+
+// ---- Search index as service sugar (plan 2c refinement 10, Task 11; book ch. 13) ----
+//
+// A search_index is not a new kind of behaviour: it is a service with no steps and the type's
+// numbers unless the scenario states its own (spec section 7: "read-mostly capacity"). Graph::build
+// resolves its capacity, service time and servers per copy exactly as for a service, through
+// Little's law: concurrency c = capacity x service time.
+
+namespace {
+// u (10/s of `suggest`) -> trie_cache (read_through, fixed hit ratio 0.9, backend trie_db) ->
+// trie_db: search-autocomplete's trie, with the numbers only when the scenario states them.
+// Node indices: u 0, trie_cache 1, trie_db 2.
+Scenario search_front(int replicas, std::optional<Rate> capacity = {},
+                      std::optional<simsys::SimTime> latency = {}) {
+  Scenario s{.name = "search-front", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{10}, {{"suggest", 1.0}}),
+             cache("trie_cache", 0.9, CacheStrategy::read_through, "trie_db"),
+             NodeSpec{.id = "trie_db",
+                      .type = NodeType::search_index,
+                      .replicas = replicas,
+                      .capacity = capacity,
+                      .latency = latency}};
+  s.links = {LinkSpec{.from = "u", .to = "trie_cache", .dir = Direction::inout},
+             LinkSpec{.from = "trie_cache", .to = "trie_db", .dir = Direction::inout}};
+  return s;
+}
+}  // namespace
+
+// replicas 4, capacity 2k/s, latency 5ms (search-autocomplete's trie_db): each copy keeps its
+// 2k/s and 5 ms (a service's capacity is per replica), the node's total is 4 x 2k = 8k/s, and
+// Little's law gives each copy c = 2000/s x 5 ms = 10 servers.
+TEST_CASE(
+    "a search index with stated numbers resolves as a service: 2k/s and 5 ms per replica, c 10",
+    "[graph]") {
+  const auto g = Graph::build(search_front(4, Rate{2000}, simsys::SimTime{5ms}));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto& index = g->nodes()[2];
+  REQUIRE(index.capacity.service_rate == Rate{2000});
+  REQUIRE_THAT(index.capacity.service_time_s, WithinRel(5e-3, 1e-12));
+  REQUIRE(index.capacity.concurrency == 10);
+  REQUIRE_THAT(index.capacity.service_rate.per_second * index.spec.replicas,
+               WithinRel(8000.0, 1e-12));
+  REQUIRE(index.service_rate_source == simsys::defaults::Source::scenario);
+  REQUIRE(index.service_time_source == simsys::defaults::Source::scenario);
+}
+
+// With nothing stated the type's row of the defaults table stands: 5k/s and 5 ms (rate and time
+// "chosen: an inverted-index query", defaults.cppm), so Little's law gives c = 5000 x 5 ms = 25.
+TEST_CASE("a search index without capacity or latency takes the type's 5k/s and 5 ms, c 25",
+          "[graph]") {
+  const auto g = Graph::build(search_front(1));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto& index = g->nodes()[2];
+  REQUIRE(index.capacity.service_rate == Rate{5000});
+  REQUIRE_THAT(index.capacity.service_time_s, WithinRel(5e-3, 1e-12));
+  REQUIRE(index.capacity.concurrency == 25);
+  REQUIRE(index.service_rate_source == simsys::defaults::Source::type_default);
+  REQUIRE(index.service_time_source == simsys::defaults::Source::type_default);
+}
+
+// One number stated, the other the type's: a latency of 10 ms with the default 5k/s is
+// c = 5000 x 10 ms = 50, and the capacity is still tagged as the type's.
+TEST_CASE("a search index states one number and takes the other from the type", "[graph]") {
+  const auto g = Graph::build(search_front(1, std::nullopt, simsys::SimTime{10ms}));
+  REQUIRE(g.has_value());
+  const auto& index = g->nodes()[2];
+  REQUIRE(index.capacity.service_rate == Rate{5000});
+  REQUIRE_THAT(index.capacity.service_time_s, WithinRel(10e-3, 1e-12));
+  REQUIRE(index.capacity.concurrency == 50);
+  REQUIRE(index.service_rate_source == simsys::defaults::Source::type_default);
+  REQUIRE(index.service_time_source == simsys::defaults::Source::scenario);
+}

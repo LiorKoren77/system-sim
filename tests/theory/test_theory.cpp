@@ -4474,3 +4474,86 @@ TEST_CASE("a kv_cluster conserves its replica-requests at every step of an overl
   REQUIRE_THAT(last.nodes[1].dropped_per_s, WithinRel(settled.nodes[1].dropped_per_s, 1e-9));
   REQUIRE_THAT(backlog, WithinRel(8.0 * 1000.0, 1e-9));  // 8 full queues of 1000
 }
+
+// ---- Search index as service sugar (plan 2c refinement 10, Task 11; book ch. 13) ----
+//
+// A search_index runs exactly as a service of the same keys: no steps, the fluid drain and the
+// M/M/c wait of Erlang C (queueing::mmc_wait). The scenario is search-autocomplete's trie, cut
+// to its core: u -> trie_cache (read_through) -> trie_db.
+
+namespace {
+// u (60k/s of `suggest`) -> trie_cache (fixed hit ratio 0.9, read_through, capacity 100k/s) ->
+// the trie: `trie_type` (a search_index, or the service it must equal) with 4 replicas, 2k/s each
+// and 5 ms, all links with zero latency so the client's response is the nodes' own sojourns.
+// Node indices: u 0, trie_cache 1, trie_db 2.
+Scenario search_chain(NodeType trie_type) {
+  Scenario s{.name = "search-chain", .version = 1, .duration = 10s, .warmup = 2s};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{60'000}},
+                                           .op_shares = {{"suggest", 1.0}}}},
+             NodeSpec{.id = "trie_cache",
+                      .type = NodeType::cache,
+                      .capacity = Rate{100'000},
+                      .latency = 250us,
+                      .backend = "trie_db",
+                      .hit_ratio = HitRatio{.fixed = 0.9},
+                      .strategy = CacheStrategy::read_through},
+             NodeSpec{.id = "trie_db",
+                      .type = trie_type,
+                      .replicas = 4,
+                      .capacity = Rate{2000},
+                      .latency = 5ms}};
+  s.links = {
+      LinkSpec{.from = "u", .to = "trie_cache", .dir = Direction::inout, .latency = 0s},
+      LinkSpec{.from = "trie_cache", .to = "trie_db", .dir = Direction::inout, .latency = 0s}};
+  return s;
+}
+}  // namespace
+
+// The index behind the cache is offered the misses: (1 - 0.9) x 60k = 6k/s over 4 copies of 2k/s,
+// per-copy rho = 6000 / 8000 = 0.75, with c = 2000/s x 5 ms = 10 servers per copy (Little's law).
+// Erlang C at c = 10 and rho = 0.75 gives its wait; the sojourn is that plus the 5 ms service.
+TEST_CASE(
+    "a search index behind a read_through cache answers with the Erlang C sojourn of its copies",
+    "[theory]") {
+  const auto g = *Graph::build(search_chain(NodeType::search_index));
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const auto r = (*Simulation::create(g)).step(0s, 100ms);
+  const auto& index = r.nodes[*g.index_of("trie_db")];
+  REQUIRE_THAT(index.demand_per_s, WithinRel(6000.0, 1e-9));
+  REQUIRE_THAT(index.rho, WithinRel(0.75, 1e-9));
+  const double sojourn = simsys::queueing::mmc_wait(10, 0.75, 5e-3).mean_s + 5e-3;
+  REQUIRE_THAT(index.latency.mean_s, WithinRel(sojourn, 1e-9));
+  REQUIRE(index.dropped_per_s == 0.0);
+}
+
+// "Sugar": the same scenario written with a `service` of the same keys gives identical samples,
+// bit for bit (== on doubles, not a tolerance): the engine runs one behaviour for both.
+TEST_CASE("a search index steps exactly as the service of the same keys", "[theory]") {
+  const auto as_index = *Graph::build(search_chain(NodeType::search_index));
+  const auto as_service = *Graph::build(search_chain(NodeType::service));
+  auto index_created = Simulation::create(as_index);
+  INFO((index_created ? "" : index_created.error().message));
+  REQUIRE(index_created.has_value());  // checked before the dereference below, so a refusal fails
+  auto service_created = Simulation::create(as_service);
+  REQUIRE(service_created.has_value());
+  auto& index_sim = *index_created;
+  auto& service_sim = *service_created;
+  for (int i = 0; i < 5; ++i) {
+    const auto a = index_sim.step(i * 100ms, 100ms);
+    const auto b = service_sim.step(i * 100ms, 100ms);
+    for (std::size_t node = 0; node < a.nodes.size(); ++node) {
+      CAPTURE(i, node);
+      REQUIRE(a.nodes[node].demand_per_s == b.nodes[node].demand_per_s);
+      REQUIRE(a.nodes[node].rho == b.nodes[node].rho);
+      REQUIRE(a.nodes[node].drain_per_s == b.nodes[node].drain_per_s);
+      REQUIRE(a.nodes[node].latency.mean_s == b.nodes[node].latency.mean_s);
+      REQUIRE(a.nodes[node].latency.variance_s2 == b.nodes[node].latency.variance_s2);
+    }
+    REQUIRE(a.responses[0].response.mean_s == b.responses[0].response.mean_s);
+    REQUIRE(a.responses[0].answered.per_second == b.responses[0].answered.per_second);
+  }
+}
