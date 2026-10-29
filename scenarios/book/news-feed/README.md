@@ -15,8 +15,11 @@
   200 KB read costs 0.2 units of 1 MB, and `explain` checks its 324.3 misses/s at the peak in
   MB/s, `media_store  peak offered 64.86 MB/s (324.3/s) vs 1k MB/s total capacity  (6.49%,
   green)`. A read is answered in one megabyte's 40 ms (an upper bound for a 200 KB object: the
-  model charges every request at least one unit's service time). `run` stops at `fanout_q`, a
-  message queue (later in phase 2c).
+  model charges every request at least one unit's service time). The fan-out queue and its
+  workers are followed on paper: the peak's 2.162k posts/s reach `fanout` (32 workers at 5 ms,
+  6.4k jobs/s: `33.8%, green`), and each post's 300 feed writes take `feed_cache` to 661.5k/s
+  of its 100k/s (`662%, red`). `run` stops at `graph_db`, a key-value cluster (plan 2c Task 10):
+  `node 'graph_db' has type 'kv_cluster', which run/estimate do not support yet (phase 2)`.
 - Queue lag at the evening peak as the fan-out workers fall behind.
 - A 30-second database outage at 15:00: writes back up in `fanout_q`; reads survive on caches.
 

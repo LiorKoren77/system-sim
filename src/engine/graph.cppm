@@ -472,12 +472,13 @@ class Graph {
   // as h = 0 (every read misses), as in service_hops.
   [[nodiscard]] double backend_fraction(std::size_t node, std::string_view op) const;
   // The share of the requests of `op` that node `node` has handled which go on to its `then`
-  // step `step`: 1 for an unconditional step, except at a blob store, whose steps are event
-  // notifications that fire for its writes only (1 of a write, 0 of a read: S3 notifies on
-  // ObjectCreated, never on a GET); for an `on: miss` step after a cache, 1 - h of a read (an
-  // unknown h counts as 0, as in service_hops) and 0 of a write (writes do not miss); 0 for an
-  // `on: failure` step (phase 3) and for a miss step anywhere else. (A CDN has no `then` steps:
-  // it fetches its misses from its origin, backend_fraction.)
+  // step `step`: 1 for an unconditional step (a worker pool's: every job it drains, whatever op
+  // its queue brought), except at a blob store, whose steps are event notifications that fire for
+  // its writes only (1 of a write, 0 of a read: S3 notifies on ObjectCreated, never on a GET); for
+  // an `on: miss` step after a cache, 1 - h of a read (an unknown h counts as 0, as in
+  // service_hops) and 0 of a write (writes do not miss); 0 for an `on: failure` step (phase 3) and
+  // for a miss step anywhere else. (A CDN has no `then` steps: it fetches its misses from its
+  // origin, backend_fraction.)
   [[nodiscard]] double then_fraction(std::size_t node, const model::Step& step,
                                      std::string_view op) const;
   // Does node `from`, handling `op`, hand `target_op` off to node `to` without waiting?
@@ -998,10 +999,35 @@ void apply_database_keys(ResolvedNode& node) {
   return std::nullopt;
 }
 
+// A worker pool's `then` steps are the work each job it DRAINS hands on (plan 2c refinement 5;
+// book ch. 14: a transcoder writes its renditions and publishes a completion message), every step
+// for every job (Graph::then_fraction is 1, whatever op the queue brought). Two step keys ask for
+// something a job never does, so they are refused in the blob store's words (invalid_blob_store):
+//  - `on: miss`: a pool has no lookup to miss (only a cache can take a miss step);
+//  - `on: failure`: a job reports no failure before phase 3 (failed or retried jobs are ignored),
+//    so the step would never fire.
+// A `mode: parallel` group is fine, unlike a blob store's: nobody waits for a pool (the hop from
+// its queue is asynchronous), so the mode changes no one's latency, and a scenario may group a
+// transcoder's renditions beside its completion message as the book draws them.
+[[nodiscard]] std::optional<EngineError> invalid_worker_then_steps(const model::NodeSpec& spec) {
+  const auto refused = [&](std::string_view why) {
+    return EngineError{"node '" + spec.id +
+                       "': a worker pool's then steps fire for every job it drains " +
+                       std::string{why}};
+  };
+  if (has_then_step_on(spec, model::StepCondition::miss)) {
+    return refused("(on: miss needs a cache)");
+  }
+  if (has_then_step_on(spec, model::StepCondition::failure)) {
+    return refused("(on: failure: a job reports no failure before phase 3)");
+  }
+  return std::nullopt;
+}
+
 // Graph::build also takes worker pools written in code, which the loader never checked (config's
 // read_worker_pool_keys): `workers` positive and at most max_concurrency, `cost` positive, with the
 // loader's messages. (A pool without them runs on the type's numbers: the loader requires them, a
-// test may leave them out.)
+// test may leave them out.) Its `then` steps are checked as well (invalid_worker_then_steps).
 [[nodiscard]] std::optional<EngineError> invalid_worker_pool(const model::NodeSpec& spec) {
   const std::string name = "node '" + spec.id + "': ";
   if (spec.workers && *spec.workers < 1) {
@@ -1014,7 +1040,7 @@ void apply_database_keys(ResolvedNode& node) {
   if (spec.job_cost && spec.job_cost->count() <= 0) {
     return EngineError{name + "cost must be positive"};
   }
-  return std::nullopt;
+  return invalid_worker_then_steps(spec);
 }
 
 // Graph::build also takes message queues written in code: `retention` and `partitions` obey the
@@ -1218,8 +1244,10 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
 // The hops that close a call cycle: the back edges of a depth-first search over (node, op)
 // vertices, with an edge (node, op) -> (step.to, step.op) for every hop that fires (an
 // unconditional step, or an `on: miss` step after a cache that misses; of the `then` steps
-// only a cache's: a blob store's are no calls, nobody waits for them (blob_store_events), and the
-// other node types that have them do not run yet), an edge (lb, op) ->
+// only a cache's: a blob store's are no calls, nobody waits for them (blob_store_events); a worker
+// pool's are calls, but no call reaches a pool (only its queue's asynchronous deliveries do,
+// Graph::check_pool_senders), so no call cycle can pass through one; a notification fan-out's and
+// a frontier's do not run yet), an edge (lb, op) ->
 // (target, op) for every route of a load balancer that carries the op, and (cache, op) ->
 // (backend, op) for what a cache passes on synchronously (forwarder_steps). Same white/grey/black
 // classification as Graph::order_nodes, one level finer: there the vertices are boxes, here they
