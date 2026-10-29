@@ -192,6 +192,8 @@ nodes:
   workers:
     type: worker_pool
     consumes: queue
+    workers: 1
+    cost: 1ms
     then: [{to: nowhere, op: write}]
 links: []
 )",
@@ -205,7 +207,7 @@ version: 1
 name: t
 duration: 1m
 nodes:
-  workers: {type: worker_pool, consumes: ghost}
+  workers: {type: worker_pool, consumes: ghost, workers: 1, cost: 1ms}
 links: []
 )",
                      "node 'workers': consumes refers to unknown node 'ghost'");
@@ -468,7 +470,7 @@ name: t
 duration: 1m
 nodes:
   q: {type: message_queue}
-  workers: {type: worker_pool, consumes: [q]}
+  workers: {type: worker_pool, consumes: [q], workers: 1, cost: 1ms}
 links: []
 )",
                      "node 'workers': consumes must be a scalar");
@@ -533,7 +535,7 @@ duration: 1m
 nodes:
   api: {type: service, capacity: 1k/s}
   queue: {type: message_queue}
-  workers: {type: worker_pool, consumes: queue, then: api}
+  workers: {type: worker_pool, consumes: queue, workers: 1, cost: 1ms, then: api}
 links: []
 )",
                      "node 'workers': then must be a list");
@@ -1425,7 +1427,7 @@ version: 1
 name: t
 duration: 1m
 nodes:
-  w: {type: worker_pool, consumes: q, then: [{to: c, op: write, factor: 100}]}
+  w: {type: worker_pool, consumes: q, workers: 1, cost: 1ms, then: [{to: c, op: write, factor: 100}]}
   q: {type: message_queue}
   c: {type: cache, hit_ratio: {fixed: 0.5}}
 links:
@@ -1607,7 +1609,7 @@ version: 1
 name: t
 duration: 1m
 nodes:
-  w: {type: worker_pool, then: [{to: w}]}
+  w: {type: worker_pool, workers: 1, cost: 1ms, then: [{to: w}]}
 links: []
 )",
                      "node 'w': then step needs an 'op'");
@@ -2088,10 +2090,12 @@ duration: 1m
 nodes:
   w:
     type: worker_pool
+    workers: 1
+    cost: 1ms
     then:
 links: []
 )",
-                        "node 'w': then must not be empty (write [] for none)", 8);
+                        "node 'w': then must not be empty (write [] for none)", 10);
   }
   SECTION("a node's advanced") {
     require_rejected_at("simsys_null_advanced.yaml", R"(
@@ -3698,4 +3702,144 @@ links:
                         "waits for (mode orders the calls a request waits for)",
                         9);
   }
+}
+
+// ---- Message queues and worker pools are typed (plan 2c refinements 4-5, Task 6) ----
+//
+// A worker pool is M/M/c over consumption (spec section 7: "capacity = workers / job cost"): its
+// `workers` is c and its `cost` the DURATION one worker spends on one job, so youtube's 400
+// transcoders at 60 s a video do 400 / 60 s = 6.67 videos a second. A queue's `retention` is how
+// long a message stays before it is deleted unconsumed, and its `partitions` is printed, not
+// modelled. The loader reads them into typed fields and refuses, with a reason, every key that
+// would state the pool's rate a second time.
+
+namespace {
+// A queue `q` and a pool `w` that consumes it, with `pool_keys` appended to the pool's flow map
+// (after `consumes: q`) and `queue_keys` to the queue's.
+std::string queue_and_pool(std::string_view queue_keys, std::string_view pool_keys) {
+  return scenario_with("  q: {type: message_queue" +
+                       (queue_keys.empty() ? std::string{} : ", " + std::string{queue_keys}) +
+                       "}\n  w: {type: worker_pool, consumes: q" +
+                       (pool_keys.empty() ? std::string{} : ", " + std::string{pool_keys}) + "}\n");
+}
+}  // namespace
+
+TEST_CASE("a worker pool's workers and cost and a queue's retention and partitions are typed") {
+  const auto path =
+      write_temp("simsys_queue_pool_typed.yaml",
+                 queue_and_pool("partitions: 32, retention: 168h", "workers: 400, cost: 60s"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  const auto& queue = s->nodes[0];
+  CHECK(queue.partitions == 32);
+  CHECK(queue.retention == 168h);
+  const auto& pool = s->nodes[1];
+  CHECK(pool.workers == 400);
+  CHECK(pool.job_cost == 60s);  // a duration per job
+  CHECK(pool.consumes == "q");
+  CHECK(pool.cost.empty());  // the capacity-unit map is a service's; a pool has none
+}
+
+// The loader leaves an absent retention absent, so that explain can say "(default: ...)" and the
+// graph applies defaults::default_retention in one place.
+TEST_CASE("a queue that states no retention or partitions leaves them absent") {
+  const auto path =
+      write_temp("simsys_queue_defaults.yaml", queue_and_pool("", "workers: 4, cost: 5ms"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  CHECK_FALSE(s->nodes[0].retention.has_value());
+  CHECK_FALSE(s->nodes[0].partitions.has_value());
+}
+
+// `cost` is spelled the same on a service and on a worker pool and means two things: a map of
+// op to capacity units on a service, a duration per job on a pool. Each loads on its own type.
+TEST_CASE("cost is a map of units on a service and a duration on a worker pool") {
+  const auto path =
+      write_temp("simsys_two_costs.yaml",
+                 scenario_with("  svc: {type: service, cost: {write: 3, read: 1}}\n"
+                               "  q: {type: message_queue}\n"
+                               "  w: {type: worker_pool, consumes: q, workers: 2, cost: 250ms}\n"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  const auto& svc = s->nodes[0];
+  CHECK(svc.cost == std::map<std::string, double>{{"read", 1.0}, {"write", 3.0}});
+  CHECK_FALSE(svc.job_cost.has_value());
+  const auto& pool = s->nodes[2];
+  CHECK(pool.job_cost == 250ms);
+  CHECK(pool.cost.empty());
+}
+
+TEST_CASE("a worker pool needs workers and a cost") {
+  SECTION("no workers") {
+    require_rejected("simsys_pool_no_workers.yaml", queue_and_pool("", "cost: 5ms"),
+                     "node 'w': worker_pool needs workers");
+  }
+  SECTION("no cost") {
+    require_rejected("simsys_pool_no_cost.yaml", queue_and_pool("", "workers: 4"),
+                     "node 'w': worker_pool needs cost");
+  }
+}
+
+TEST_CASE("workers, cost, retention and partitions must be positive, and workers bounded") {
+  SECTION("workers of zero") {
+    require_rejected("simsys_pool_workers_zero.yaml", queue_and_pool("", "workers: 0, cost: 5ms"),
+                     "node 'w': workers must be a positive integer");
+  }
+  SECTION("workers that is not a whole number") {
+    require_rejected("simsys_pool_workers_half.yaml", queue_and_pool("", "workers: 2.5, cost: 5ms"),
+                     "node 'w': workers must be a positive integer");
+  }
+  SECTION("workers above 100000: Erlang C costs O(c) per step, as advanced.concurrency") {
+    require_rejected("simsys_pool_workers_huge.yaml",
+                     queue_and_pool("", "workers: 100001, cost: 5ms"),
+                     "node 'w': workers must be at most 100000");
+  }
+  SECTION("a cost of zero") {
+    require_rejected("simsys_pool_cost_zero.yaml", queue_and_pool("", "workers: 4, cost: 0s"),
+                     "node 'w': cost must be positive");
+  }
+  SECTION("a retention of zero") {
+    require_rejected("simsys_queue_retention_zero.yaml",
+                     queue_and_pool("retention: 0s", "workers: 4, cost: 5ms"),
+                     "node 'q': retention must be positive");
+  }
+  SECTION("partitions of zero") {
+    require_rejected("simsys_queue_partitions_zero.yaml",
+                     queue_and_pool("partitions: 0", "workers: 4, cost: 5ms"),
+                     "node 'q': partitions must be a positive integer");
+  }
+}
+
+// Each of these four would state the pool's rate a second time: its c and service time are
+// `workers` and `cost`, so its capacity is workers / cost and nothing else can say it.
+TEST_CASE(
+    "a worker pool's rate is workers / cost: capacity, latency, replicas and concurrency "
+    "are refused") {
+  const std::string reason = "node 'w': a worker pool's rate is workers / cost";
+  const std::string own = "workers: 4, cost: 5ms, ";
+  SECTION("capacity") {
+    require_rejected("simsys_pool_capacity.yaml", queue_and_pool("", own + "capacity: 1k/s"),
+                     reason);
+  }
+  SECTION("latency") {
+    require_rejected("simsys_pool_latency.yaml", queue_and_pool("", own + "latency: 2ms"), reason);
+  }
+  SECTION("replicas") {
+    require_rejected("simsys_pool_replicas.yaml", queue_and_pool("", own + "replicas: 2"), reason);
+  }
+  SECTION("advanced.concurrency") {
+    require_rejected("simsys_pool_concurrency.yaml",
+                     queue_and_pool("", own + "advanced: {concurrency: 8}"), reason);
+  }
+}
+
+// A pool's waiting room is the part of the queue it has not read: messages wait in the log until
+// `retention` deletes them, so the room is set on the queue, not by a limit on the pool.
+TEST_CASE("a worker pool waits in its queue: advanced.queue_limit is refused for retention") {
+  require_rejected("simsys_pool_queue_limit.yaml",
+                   queue_and_pool("", "workers: 4, cost: 5ms, advanced: {queue_limit: 100}"),
+                   "node 'w': a worker pool waits in its queue: set the queue's retention");
 }

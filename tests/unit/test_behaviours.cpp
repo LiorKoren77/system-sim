@@ -36,10 +36,12 @@ using simsys::behaviours::CacheBehaviour;
 using simsys::behaviours::CdnBehaviour;
 using simsys::behaviours::ClientBehaviour;
 using simsys::behaviours::LoadBalancerBehaviour;
+using simsys::behaviours::MessageQueueBehaviour;
 using simsys::behaviours::Outgoing;
 using simsys::behaviours::RateLimiterBehaviour;
 using simsys::behaviours::ServiceBehaviour;
 using simsys::behaviours::SqlDbBehaviour;
+using simsys::behaviours::WorkerPoolBehaviour;
 using simsys::flow::Flow;
 using simsys::flow::LatencyEstimate;
 using simsys::model::CacheStrategy;
@@ -149,6 +151,8 @@ static_assert(simsys::behaviours::NodeBehaviour<RateLimiterBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<CacheBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<CdnBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<BlobStoreBehaviour>);
+static_assert(simsys::behaviours::NodeBehaviour<MessageQueueBehaviour>);
+static_assert(simsys::behaviours::NodeBehaviour<WorkerPoolBehaviour>);
 
 // And the negative: a type that routes flow but cannot answer for its latency is not a
 // NodeBehaviour, so the engine refuses it at compile time instead of misbehaving at run time.
@@ -1786,4 +1790,134 @@ TEST_CASE("a byte-sized cdn still forwards its miss share of the requests", "[be
   const auto routed = cdn.route(flow_of("stream", 100), 0s, 100ms);
   REQUIRE(routed.outgoing.size() == 1);
   REQUIRE_THAT(routed.outgoing[0].flow.rate_of("stream").per_second, WithinRel(5.0, 1e-12));
+}
+
+// ---- Message queues and worker pools (plan 2c refinements 4-6, Task 6) ----
+//
+// The broker (Kafka, book ch. 14's transcode_q): a publisher's request is answered when the
+// message is appended, so the broker's response is its own append sojourn and nobody downstream is
+// asked; the message then goes to EVERY consumer group, each of which reads all of it (a copy per
+// group, not a split), under the op name it arrived with. The worker pool drains its group's
+// messages; its `then` steps arrive in Task 7, so today it forwards nothing. Every message and
+// every job costs one unit.
+
+namespace {
+// u (publishes `publish` messages) -> q -> {w1, w2}, zero-latency links, each pool consuming q.
+// Node indices: u 0, q 1, w1 2, w2 3.
+Scenario queue_with_two_groups() {
+  Scenario s{.name = "queue", .version = 1, .duration = 1min};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload =
+                          Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"publish", 1.0}}}},
+             NodeSpec{.id = "q", .type = NodeType::message_queue}};
+  for (const auto* id : {"w1", "w2"}) {
+    NodeSpec pool{.id = id, .type = NodeType::worker_pool};
+    pool.consumes = "q";
+    pool.workers = 4;
+    pool.job_cost = 5ms;
+    s.nodes.push_back(std::move(pool));
+    s.links.push_back(LinkSpec{.from = "q", .to = id, .latency = 0s});
+  }
+  s.links.insert(s.links.begin(), LinkSpec{.from = "u", .to = "q", .latency = 0s});
+  return s;
+}
+}  // namespace
+
+// 1000 messages/s appended are 1000/s for group w1 AND 1000/s for group w2: a consumer group is
+// a subscriber to the whole log, so the broker's outflow is the sum of the groups', not a split.
+TEST_CASE("a message queue sends every message it appends to each consumer group", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(queue_with_two_groups());
+  MessageQueueBehaviour q{g, *g.index_of("q")};
+  const auto routed = q.route(flow_of("publish", 1000), 0s, 100ms);
+  REQUIRE(routed.outgoing.size() == 2);
+  for (const auto* id : {"w1", "w2"}) {
+    CAPTURE(id);
+    const auto sent = sent_to(routed, *g.index_of(id));
+    REQUIRE_THAT(sent.rate_of("publish").per_second, WithinRel(1000.0, 1e-12));
+    REQUIRE_THAT(sent.total().per_second, WithinRel(1000.0, 1e-12));
+  }
+  // The broker appended all of it: `served` is the input, and it refuses nothing.
+  REQUIRE_THAT(routed.served.rate_of("publish").per_second, WithinRel(1000.0, 1e-12));
+  REQUIRE(routed.rejected.empty());
+}
+
+// The op name survives the broker (plan 2c refinement 4): two ops published, two ops delivered, at
+// their own rates, to each group.
+TEST_CASE("a message queue keeps each message's op name on its way to the consumers",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(queue_with_two_groups());
+  MessageQueueBehaviour q{g, *g.index_of("q")};
+  Flow in;
+  in.add("publish", Rate{300});
+  in.add("audit", Rate{20});
+  const auto routed = q.route(in, 0s, 100ms);
+  const auto sent = sent_to(routed, *g.index_of("w2"));
+  REQUIRE_THAT(sent.rate_of("publish").per_second, WithinRel(300.0, 1e-12));
+  REQUIRE_THAT(sent.rate_of("audit").per_second, WithinRel(20.0, 1e-12));
+  REQUIRE_THAT(sent.total().per_second, WithinRel(320.0, 1e-12));
+}
+
+TEST_CASE("a message queue with nothing published sends nothing and costs one unit a message",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(queue_with_two_groups());
+  MessageQueueBehaviour q{g, *g.index_of("q")};
+  const auto routed = q.route(Flow{}, 0s, 100ms);
+  REQUIRE(sent_to(routed, *g.index_of("w1")).total().per_second == 0.0);
+  REQUIRE(sent_to(routed, *g.index_of("w2")).total().per_second == 0.0);
+  REQUIRE(routed.served.empty());
+  REQUIRE(q.cost("publish") == 1.0);
+  REQUIRE(q.cost("anything") == 1.0);
+}
+
+// A publisher is answered when the message is appended (plan 2c refinement 6): the response is the
+// append's own sojourn, nobody downstream is asked, and the delivered fraction is the broker's own
+// whatever the consumers lose. Asking would add the pool's seconds to a publisher who never waits.
+TEST_CASE("a message queue's response is the append alone and asks no consumer", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(queue_with_two_groups());
+  const MessageQueueBehaviour q{g, *g.index_of("q")};
+  const LatencyEstimate append{0.0001, 1e-12};  // 100 us, the broker's default append
+  bool asked = false;
+  const auto r = q.response("publish", append, [&](std::size_t, std::string_view) {
+    asked = true;
+    return LatencyEstimate{99.0, 99.0};
+  });
+  REQUIRE(r == append);
+  REQUIRE_FALSE(asked);
+  bool asked_for_delivery = false;
+  const double delivered = q.delivered("publish", 0.9, [&](std::size_t, std::string_view) {
+    asked_for_delivery = true;
+    return 0.0;
+  });
+  REQUIRE_THAT(delivered, WithinRel(0.9, 1e-12));
+  REQUIRE_FALSE(asked_for_delivery);
+}
+
+// Task 6's pool has no `then` steps: it drains its jobs and sends nothing on (Task 7 adds the
+// steps). Every job it is sent is served here.
+TEST_CASE("a worker pool without then steps serves every job and forwards nothing",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(queue_with_two_groups());
+  WorkerPoolBehaviour pool{g, *g.index_of("w1")};
+  const auto routed = pool.route(flow_of("publish", 1000), 0s, 100ms);
+  REQUIRE(routed.outgoing.empty());
+  REQUIRE(routed.rejected.empty());
+  REQUIRE_THAT(routed.served.rate_of("publish").per_second, WithinRel(1000.0, 1e-12));
+  REQUIRE(pool.cost("publish") == 1.0);  // one job is one unit of workers / cost
+}
+
+TEST_CASE("a worker pool's response and delivered share are its own sojourn and its own",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(queue_with_two_groups());
+  const WorkerPoolBehaviour pool{g, *g.index_of("w1")};
+  const LatencyEstimate own{0.0066, 1e-5};
+  bool asked = false;
+  const auto r = pool.response("publish", own, [&](std::size_t, std::string_view) {
+    asked = true;
+    return LatencyEstimate{99.0, 99.0};
+  });
+  REQUIRE(r == own);
+  REQUIRE_FALSE(asked);
+  REQUIRE_THAT(pool.delivered("publish", 0.75, [](std::size_t, std::string_view) { return 0.1; }),
+               WithinRel(0.75, 1e-12));
 }

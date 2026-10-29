@@ -2348,10 +2348,15 @@ TEST_CASE("a step's size makes a renamed op acceptable to a byte-sized store", "
 // whatever its bytes, so the graph refuses such an op whichever walk found it.
 
 namespace {
-// A worker pool with the given `then` steps (no `workers` or `cost`: the graph does not read them
-// before Task 6).
-NodeSpec worker_pool(std::string id, std::vector<Step> then) {
+// A worker pool with the given `then` steps, one worker of 1 ms a job (since plan 2c Task 6 the
+// pool's capacity is workers / cost, and the loader requires both), draining `queue` when one is
+// named (a queue linked to a pool must be consumed by it).
+NodeSpec worker_pool(std::string id, std::vector<Step> then,
+                     std::optional<std::string> queue = std::nullopt) {
   NodeSpec pool{.id = std::move(id), .type = NodeType::worker_pool};
+  pool.workers = 1;
+  pool.job_cost = 1ms;
+  pool.consumes = std::move(queue);
   pool.then = std::move(then);
   return pool;
 }
@@ -2392,9 +2397,10 @@ TEST_CASE("a worker pool's then step that no queue feeds is sized by its own siz
   REQUIRE_THAT(bytes_required(*built, "store", "write"), WithinRel(5e7, 1e-12));
 }
 
-// `consumes: q` without a link q -> pool: the queue holds the client's 300 MB uploads, but no
-// link takes them to the pool, so the pool's same-op `then` step inherits nothing. Its `upload`
-// still counts as arriving at the store, unsized.
+// A pool that names no queue (no `consumes`) and has no link q -> pool: the queue holds the
+// client's 300 MB uploads, but no link takes them to the pool, so the pool's same-op `then` step
+// inherits nothing. Its `upload` still counts as arriving at the store, unsized. (A pool that
+// DID name the queue without the link is an error since plan 2c Task 6: tested below.)
 TEST_CASE("a pool whose queue has no link to it sends its same-op then step unsized", "[graph]") {
   Scenario s{.name = "unlinked-pool", .version = 1, .duration = 1min};
   s.nodes = {sized_client("u", "upload", simsys::Bytes{300e6}), message_queue("q"),
@@ -2493,11 +2499,12 @@ TEST_CASE("a size conflict names the clients that stated the sizes, not the bala
 TEST_CASE("a queue's pool keeps a same-op size on its then step and uses a renamed step's size",
           "[graph]") {
   Scenario s{.name = "queue-pool", .version = 1, .duration = 1min};
-  s.nodes = {
-      sized_client("u", "upload", simsys::Bytes{300e6}), message_queue("q"),
-      worker_pool("pool", {Step{.to = "store", .op = "upload"},
-                           Step{.to = "renditions", .op = "write", .size = simsys::Bytes{50e6}}}),
-      default_blob_store(), default_blob_store("renditions")};
+  s.nodes = {sized_client("u", "upload", simsys::Bytes{300e6}), message_queue("q"),
+             worker_pool("pool",
+                         {Step{.to = "store", .op = "upload"},
+                          Step{.to = "renditions", .op = "write", .size = simsys::Bytes{50e6}}},
+                         "q"),
+             default_blob_store(), default_blob_store("renditions")};
   s.links = {LinkSpec{.from = "u", .to = "q"}, LinkSpec{.from = "q", .to = "pool"},
              LinkSpec{.from = "pool", .to = "store"}, LinkSpec{.from = "pool", .to = "renditions"}};
   const auto built = Graph::build(s);
@@ -2831,4 +2838,174 @@ TEST_CASE("only the ops a bandwidth link carries need a size", "[graph]") {
             "link 'u'->'w' has a bandwidth, but op 'get' from 'u' has no size: add size: to the "
             "step or sizes: to the client");
   }
+}
+
+// ---- Message queues and worker pools (plan 2c refinements 4-6, Task 6) ----
+//
+// A message queue is a broker (Kafka, ch. 14's transcode_q): a publisher's request is answered when
+// the message is appended, and every consumer group (a worker pool that `consumes` the queue)
+// receives EVERY message, as Kafka's consumer groups do; google-drive's two groups on notify_q
+// read it so. The graph checks the wiring both ways, gives the queue one route of share 1 per
+// consumer, makes each queue -> pool hop asynchronous (nobody upstream waits for a worker), and
+// resolves a pool as M/M/c over consumption: c = workers, service time = cost, capacity
+// workers / cost, with a waiting room of retention x capacity messages.
+
+namespace {
+// A pool of `workers` workers at `cost` a job that drains `queue`.
+NodeSpec consuming_pool(std::string id, std::string queue, int workers, simsys::SimTime cost) {
+  NodeSpec pool{.id = std::move(id), .type = NodeType::worker_pool};
+  pool.consumes = std::move(queue);
+  pool.workers = workers;
+  pool.job_cost = cost;
+  return pool;
+}
+
+// u (100 `publish`/s) -> q -> every pool in `pools`, each of which consumes q.
+// Node indices: u 0, q 1, then the pools in the order given.
+Scenario queue_feeding(std::vector<NodeSpec> pools) {
+  Scenario s{.name = "queue-feeding", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"publish", 1.0}}), message_queue("q")};
+  s.links = {LinkSpec{.from = "u", .to = "q"}};
+  for (auto& pool : pools) {
+    s.links.push_back(LinkSpec{.from = "q", .to = pool.id});
+    s.nodes.push_back(std::move(pool));
+  }
+  return s;
+}
+
+// The pool `w`: 4 workers of 3.333333 ms (a capacity of 4 / 3.333333 ms = 1200.00012/s).
+NodeSpec four_workers_at_3_333_ms() {
+  return consuming_pool("w", "q", 4, simsys::SimTime{3'333'333});
+}
+}  // namespace
+
+// Kafka delivers a message to the consumers of a group, not to a service that happens to be
+// linked: a link out of a queue to anything but a pool that consumes the queue is a design error,
+// and the message names the queue and the node that does not consume it. Both shapes of it: a
+// service behind the queue, and a pool that drains another queue.
+TEST_CASE("a message queue delivers only to the worker pools that consume it", "[graph]") {
+  SECTION("a service behind the queue") {
+    auto s = queue_feeding({});
+    s.nodes.push_back(service("svc"));
+    s.links.push_back(LinkSpec{.from = "q", .to = "svc"});
+    const auto built = Graph::build(s);
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message ==
+            "node 'q': a message queue delivers only to the worker pools that consume it ('svc' "
+            "does not)");
+  }
+  SECTION("a pool that consumes another queue") {
+    auto s = queue_feeding({consuming_pool("w", "other_q", 4, 5ms)});
+    s.nodes.push_back(message_queue("other_q"));
+    s.links.push_back(LinkSpec{.from = "other_q", .to = "w"});  // other_q's wiring is right
+    const auto built = Graph::build(s);
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message ==
+            "node 'q': a message queue delivers only to the worker pools that consume it ('w' "
+            "does not)");
+  }
+}
+
+// The other direction of the wiring: a pool that says it drains `q` is fed by a link from `q`.
+// Without it the pool would sit idle while the scenario claims otherwise; the message names both
+// the pool and the queue.
+TEST_CASE("a worker pool's consumes queue must link to it, and the error names both", "[graph]") {
+  auto s = queue_feeding({});
+  s.nodes.push_back(four_workers_at_3_333_ms());  // consumes q, but nothing links q -> w
+  const auto built = Graph::build(s);
+  REQUIRE_FALSE(built.has_value());
+  const auto& message = built.error().message;
+  INFO(message);
+  REQUIRE(message.starts_with("node 'w'"));
+  REQUIRE(message.contains("'q'"));
+  REQUIRE(message.contains("link"));
+}
+
+// Every consumer group receives every message: the queue's routes are one per consumer, each of
+// share 1 (a load balancer's shares sum to 1 because it SPLITS; a queue COPIES). With two groups
+// each gets the whole flow, not half. The op keeps its name, so each pool is reached by `publish`.
+TEST_CASE("a message queue has one route of share one per consumer group", "[graph]") {
+  const auto g = *Graph::build(
+      queue_feeding({consuming_pool("w1", "q", 4, 5ms), consuming_pool("w2", "q", 2, 10ms)}));
+  const auto q = *g.index_of("q");
+  const auto w1 = *g.index_of("w1");
+  const auto w2 = *g.index_of("w2");
+  const auto routes = g.routes(q);
+  REQUIRE(routes.size() == 2);
+  for (const auto& route : routes) {
+    CAPTURE(route.target);
+    REQUIRE_THAT(route.share, WithinRel(1.0, 1e-12));
+  }
+  REQUIRE(std::ranges::count(routes, w1, &simsys::graph::Route::target) == 1);
+  REQUIRE(std::ranges::count(routes, w2, &simsys::graph::Route::target) == 1);
+  // Per op the shares are still 1 each: nothing renormalises a copy into a split.
+  const auto publish = g.routes_for(q, "publish");
+  REQUIRE(publish.size() == 2);
+  for (const auto& route : publish) REQUIRE_THAT(route.share, WithinRel(1.0, 1e-12));
+  REQUIRE(std::ranges::equal(g.arriving_ops(w1), std::vector<std::string>{"publish"}));
+  REQUIRE(std::ranges::equal(g.arriving_ops(w2), std::vector<std::string>{"publish"}));
+}
+
+// Plan 2c refinement 6: the publisher waits for the append alone. The queue -> pool hop is the
+// hand-off nobody upstream waits for (as a write_back cache's flush and a blob store's event are),
+// so the backward pass leaves the pool's sojourn and losses out of the publisher's response and
+// delivered fraction. The publisher's own call into the queue stays synchronous.
+TEST_CASE("the hop from a queue to its consumer is asynchronous and the publisher's is not",
+          "[graph]") {
+  const auto g = *Graph::build(
+      queue_feeding({consuming_pool("w1", "q", 4, 5ms), consuming_pool("w2", "q", 2, 10ms)}));
+  const auto u = *g.index_of("u");
+  const auto q = *g.index_of("q");
+  REQUIRE(g.is_async_hop(q, "publish", *g.index_of("w1"), "publish"));
+  REQUIRE(g.is_async_hop(q, "publish", *g.index_of("w2"), "publish"));
+  REQUIRE_FALSE(g.is_async_hop(u, "publish", q, "publish"));
+}
+
+// The pool is M/M/c over consumption (spec section 7: "capacity = workers / job cost"):
+//   c            = workers                         = 4
+//   service time = cost                            = 3.333333 ms
+//   capacity     = workers / cost = 4 / 3.333333 ms = 1200.00012 jobs/s (1.2k/s)
+//   room         = retention x capacity: Kafka deletes a message older than `retention`, so at
+//                  most the messages `retention` seconds of draining could have read can wait:
+//                  10 s x 1200.00012/s = 12,000 messages.
+TEST_CASE("a worker pool resolves to c workers, service time cost and capacity workers over cost",
+          "[graph]") {
+  const auto g = *Graph::build(queue_feeding({four_workers_at_3_333_ms()}));
+  const auto& pool = g.nodes()[*g.index_of("w")].capacity;
+  REQUIRE(pool.concurrency == 4);
+  REQUIRE_THAT(pool.service_time_s, WithinRel(3.333333e-3, 1e-9));
+  REQUIRE_THAT(pool.service_rate.per_second, WithinRel(1200.0, 1e-6));
+}
+
+TEST_CASE("a pool's waiting room is the queue's retention times its capacity", "[graph]") {
+  SECTION("retention stated: 10 s of draining is 12,000 messages") {
+    auto s = queue_feeding({four_workers_at_3_333_ms()});
+    s.nodes[1].retention = 10s;
+    const auto g = *Graph::build(s);
+    REQUIRE_THAT(g.nodes()[*g.index_of("w")].capacity.queue_limit, WithinRel(12'000.0, 1e-6));
+  }
+  SECTION("retention absent: Kafka's default of 7 days, 604,800 s x 1200/s = 725.76 million") {
+    const auto g = *Graph::build(queue_feeding({four_workers_at_3_333_ms()}));
+    REQUIRE_THAT(g.nodes()[*g.index_of("w")].capacity.queue_limit,
+                 WithinRel(604'800.0 * 1200.0, 1e-6));
+  }
+  SECTION("each group's room is its own: retention x ITS capacity") {
+    auto s = queue_feeding({four_workers_at_3_333_ms(), consuming_pool("slow", "q", 1, 100ms)});
+    s.nodes[1].retention = 10s;
+    const auto g = *Graph::build(s);
+    // slow: 1 worker at 100 ms = 10 jobs/s, so 10 s x 10/s = 100 messages.
+    REQUIRE_THAT(g.nodes()[*g.index_of("slow")].capacity.queue_limit, WithinRel(100.0, 1e-9));
+    REQUIRE_THAT(g.nodes()[*g.index_of("w")].capacity.queue_limit, WithinRel(12'000.0, 1e-6));
+  }
+}
+
+// The broker's own queue is the append (spec section 6: 1M msg/s at 100 us chosen), c = 1M/s x
+// 100 us = 100 by Little's law: it keeps the type's numbers whatever consumes it.
+TEST_CASE("the broker itself keeps the type's append numbers: 1M messages a second, c = 100",
+          "[graph]") {
+  const auto g = *Graph::build(queue_feeding({four_workers_at_3_333_ms()}));
+  const auto& broker = g.nodes()[*g.index_of("q")].capacity;
+  REQUIRE_THAT(broker.service_rate.per_second, WithinRel(1e6, 1e-12));
+  REQUIRE_THAT(broker.service_time_s, WithinRel(100e-6, 1e-12));
+  REQUIRE(broker.concurrency == 100);
 }

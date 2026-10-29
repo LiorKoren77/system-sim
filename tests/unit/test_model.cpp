@@ -195,3 +195,45 @@ TEST_CASE("a default LinkSpec states no bandwidth", "[model]") {
   const simsys::model::LinkSpec l{.from = "a", .to = "b"};
   REQUIRE_FALSE(l.bandwidth.has_value());
 }
+
+// ---- Message queues and worker pools (plan 2c refinements 4-5, Task 6) ----
+//
+// The five keys the loader types for the two asynchronous-work node types. All are optionals:
+// "absent" means "the type's default" (the retention) or "not stated" (the rest), so that explain
+// can say `(default: ...)` and the graph can apply one default through `defaults`.
+//   worker_pool:    workers   the pool's c, a positive int (M/M/c's c);
+//                   job_cost  the time one worker spends on one job, a positive DURATION (the
+//                             pool's `cost`: not the per-op capacity-unit map of a service, which
+//                             stays `NodeSpec::cost`);
+//                   consumes  the id of the queue the pool drains;
+//   message_queue:  retention how long a message stays before it is deleted unconsumed;
+//                   partitions printed, not modelled.
+TEST_CASE("a default NodeSpec states no workers, job cost, queue, retention or partitions",
+          "[model]") {
+  const simsys::model::NodeSpec n{.id = "x", .type = NodeType::worker_pool};
+  REQUIRE_FALSE(n.workers.has_value());
+  REQUIRE_FALSE(n.job_cost.has_value());
+  REQUIRE_FALSE(n.consumes.has_value());
+  REQUIRE_FALSE(n.retention.has_value());
+  REQUIRE_FALSE(n.partitions.has_value());
+}
+
+TEST_CASE(
+    "a worker pool's workers, job cost and queue, and a queue's retention and partitions "
+    "are typed fields",
+    "[model]") {
+  simsys::model::NodeSpec pool{.id = "transcoders", .type = NodeType::worker_pool};
+  pool.workers = 400;
+  pool.job_cost = 60s;  // a duration per job; youtube's transcoders take a minute per video
+  pool.consumes = "transcode_q";
+  REQUIRE(*pool.workers == 400);
+  REQUIRE(*pool.job_cost == 60s);
+  REQUIRE(*pool.consumes == "transcode_q");
+  simsys::model::NodeSpec queue{.id = "transcode_q", .type = NodeType::message_queue};
+  queue.retention = 168h;
+  queue.partitions = 32;
+  REQUIRE(*queue.retention == 168h);
+  REQUIRE(*queue.partitions == 32);
+  // The pool's `cost` is a duration here and a map of capacity units on a service: two members.
+  REQUIRE(pool.cost.empty());
+}

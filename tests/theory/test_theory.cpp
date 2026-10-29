@@ -2909,3 +2909,338 @@ TEST_CASE("an unsized op on a bandwidth link is refused with the advice to add a
           "link 'a'->'b' has a bandwidth, but op 'ping' from 'a' has no size: add size: to the "
           "step or sizes: to the client");
 }
+
+// ---- Message queues hold what worker pools have not drained; pools are M/M/c over consumption
+// (plan 2c refinements 4-6, Task 6) ----
+//
+// The broker (book ch. 14's transcode_q, Kafka in practice) answers its publisher once the message
+// is appended; the message then goes to every consumer group, and what a group has not drained
+// waits in that group's pool queue, whose room is `retention x the pool's capacity` (a message
+// older than `retention` is deleted unconsumed: the pool's drop). Nobody upstream waits for a
+// worker: the hop is asynchronous, so a pool's backlog and drops never reach the publisher's
+// response or answered rate.
+//
+// Numbers, from one picture: a client publishes 1000 messages/s to the queue over a 250 us link
+// (0.5 ms round trip); the queue's default append is 1M/s at 100 us (spec section 6, c = 1M/s x
+// 100 us = 100); one group drains it with 4 workers at 3.333333 ms a job:
+//   pool capacity = workers / cost = 4 / 3.333333 ms = 1200.00012 jobs/s ~ 1.2k/s (Little's law
+//                   again: c / service time)
+//   rho           = 1000 / 1200 = 0.8333      (offered load a = 1000 x 3.3333 ms = 3.3333 erlangs
+//                                              over 4 servers)
+//   Erlang C(4, a = 3.3333) = 0.6577          (the chance a message finds all 4 workers busy)
+//   Wq   (M/M/c)  = C x s / (c (1 - rho)) = 0.6577 x 3.3333 ms / (4 x 0.16667) = 3.289 ms
+//   sojourn       = Wq + s = 3.289 + 3.333 = 6.622 ms      (the pool's service SCV is 1: the
+//                   default, an exponential job time, and Poisson arrivals: Allen-Cunneen's
+//                   factor (1 + 1) / 2 = 1, so M/M/c exactly)
+// The publisher's response is none of that:
+//   append sojourn = 100 us (+ a wait of Erlang C(100, rho 0.001) x ... ~ 1e-259 s: none)
+//   response       = 100 us + the link's round trip 2 x 250 us = 0.6 ms
+namespace {
+// A pool `id` of `workers` workers at `cost` a job, draining queue `q`.
+NodeSpec group_of(std::string id, int workers, simsys::SimTime cost) {
+  NodeSpec pool{.id = std::move(id), .type = NodeType::worker_pool};
+  pool.consumes = "q";
+  pool.workers = workers;
+  pool.job_cost = cost;
+  return pool;
+}
+
+// u (`rate`/s of `publish`, 250 us link) -> q (a message queue, `retention` as given, the type's
+// default when none) -> every group in `groups` over zero-latency links, so that everything a
+// step sends arrives in the same step. Node indices: u 0, q 1, then the groups in order.
+Scenario published(double rate, std::vector<NodeSpec> groups,
+                   std::optional<simsys::SimTime> retention = std::nullopt) {
+  Scenario s{.name = "published", .version = 1, .duration = 60s};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload =
+                          Workload{.curve = {.base = Rate{rate}}, .op_shares = {{"publish", 1.0}}}},
+             NodeSpec{.id = "q", .type = NodeType::message_queue}};
+  s.nodes[1].retention = retention;
+  s.links = {LinkSpec{.from = "u", .to = "q", .latency = 250us}};
+  for (auto& group : groups) {
+    s.links.push_back(LinkSpec{.from = "q", .to = group.id, .latency = 0s});
+    s.nodes.push_back(std::move(group));
+  }
+  return s;
+}
+
+// 4 workers at 3.333333 ms: the picture above.
+NodeSpec four_workers() {
+  return group_of("w", 4, simsys::SimTime{3'333'333});
+}
+// 12 workers at 10 ms: also 1200 jobs/s, but EXACTLY (12 / 0.01 s), so the backlog arithmetic of
+// the burst tests below is exact; c = 12.
+NodeSpec twelve_workers() {
+  return group_of("w", 12, 10ms);
+}
+constexpr double pool_cost_s = 3.333333e-3;
+}  // namespace
+
+TEST_CASE(
+    "a pool of 4 workers at 3.333 ms fed 1k messages a second runs at rho 0.8333 and waits "
+    "3.289 ms",
+    "[theory]") {
+  const auto g = *Graph::build(published(1000, {four_workers()}));
+  const auto r = first_step(g);
+  const auto& pool = r.nodes[*g.index_of("w")];
+  const double capacity = 4.0 / pool_cost_s;  // 1200.00012/s
+  REQUIRE_THAT(pool.demand_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(pool.rho, WithinRel(1000.0 / capacity, 1e-9));
+  REQUIRE_THAT(pool.rho, WithinAbs(0.8333, 1e-4));
+  const double wait = simsys::queueing::mmc_wait(4, pool.rho, pool_cost_s).mean_s;
+  REQUIRE_THAT(wait, WithinAbs(0.003289, 1e-6));  // the napkin number: 3.289 ms
+  REQUIRE_THAT(pool.latency.mean_s, WithinRel(wait + pool_cost_s, 1e-9));
+  REQUIRE_THAT(pool.latency.mean_s, WithinAbs(0.006622, 1e-6));  // sojourn 6.622 ms
+}
+
+// The Erlang C value itself, so the 3.289 ms is not taken on trust: P(wait) = 0.6577 at c = 4 and
+// 3.3333 erlangs (queueing::erlang_c takes the per-server utilisation).
+TEST_CASE("the chance a message waits for one of 4 workers at rho 0.8333 is 0.6577", "[theory]") {
+  REQUIRE_THAT(simsys::queueing::erlang_c(4, 1000.0 * pool_cost_s / 4.0), WithinAbs(0.6577, 1e-4));
+}
+
+// The publisher is answered at the append: 100 us (the broker's c = 100 servers at rho 0.001 make
+// the wait vanish) + the 0.5 ms round trip = 0.6 ms. The worker's 6.6 ms is not in it, nor is its
+// loss: all 1000/s are answered.
+TEST_CASE("the publisher is answered when the message is appended: 0.6 ms, not the worker's 6.6",
+          "[theory]") {
+  const auto g = *Graph::build(published(1000, {four_workers()}));
+  const auto r = first_step(g);
+  const auto& broker = r.nodes[*g.index_of("q")];
+  REQUIRE_THAT(broker.rho, WithinRel(1000.0 / 1e6, 1e-9));  // 0.001: the append's rho
+  REQUIRE_THAT(broker.latency.mean_s, WithinAbs(100e-6, 1e-9));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(broker.latency.mean_s + 0.0005, 1e-9));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.0006, 1e-9));
+  REQUIRE_THAT(r.responses[0].answered.per_second, WithinRel(1000.0, 1e-9));
+}
+
+// Every consumer group receives every message: two pools on one queue are each offered the
+// queue's whole 1000/s (a split would give each 500/s), and the broker still appends 1000/s.
+TEST_CASE("two worker pools consuming one queue each receive all 1k messages a second",
+          "[theory]") {
+  auto second = group_of("w2", 10, 5ms);  // 2000 jobs/s: no queue to speak of
+  const auto g = *Graph::build(published(1000, {four_workers(), std::move(second)}));
+  const auto r = first_step(g);
+  REQUIRE_THAT(r.nodes[*g.index_of("q")].demand_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(r.nodes[*g.index_of("w")].demand_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(r.nodes[*g.index_of("w2")].demand_per_s, WithinRel(1000.0, 1e-9));
+  // w2: rho = 1000 / 2000 = 0.5 per server (10 workers, a = 5 erlangs).
+  REQUIRE_THAT(r.nodes[*g.index_of("w2")].rho, WithinRel(0.5, 1e-9));
+  // The publisher is still answered by the append alone, however many groups listen.
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.0006, 1e-9));
+}
+
+TEST_CASE("the engine runs a queue and a pool that has no then steps", "[theory]") {
+  const auto g = *Graph::build(published(1000, {four_workers()}));
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+}
+
+// Task 7 runs a pool's `then` steps; until then the engine says so rather than drop them silently.
+TEST_CASE("the engine refuses a worker pool's then steps until phase 2c's next step", "[theory]") {
+  auto pool = four_workers();
+  pool.then = {Step{.to = "svc", .op = "done"}};
+  auto s = published(1000, {std::move(pool)});
+  s.nodes.push_back(NodeSpec{.id = "svc", .type = NodeType::service});
+  s.links.push_back(LinkSpec{.from = "w", .to = "svc"});
+  const auto g = *Graph::build(s);
+  const auto sim = Simulation::create(g);
+  REQUIRE_FALSE(sim.has_value());
+  REQUIRE(sim.error().message ==
+          "node 'w': a worker pool's then steps run in phase 2c's next step");
+  const auto& text = sim.error().message;
+  // C++23 std::string::contains: a substring test in one call, replacing
+  // `find(...) != std::string::npos`; four short pins that survive a rewording of the rest.
+  REQUIRE(text.contains("node 'w'"));
+  REQUIRE(text.contains("worker pool's then steps"));
+  REQUIRE(text.contains("phase 2c"));
+  REQUIRE(text.contains("next step"));
+}
+
+// ---- A backlog grows at (inflow - capacity) and drains at (capacity - inflow) ----
+//
+// A pool of 12 workers at 10 ms is exactly 1200 jobs/s. The client publishes 1000/s with a spike
+// of x1.5 for the first 200 s: 1500/s, so the pool's backlog grows by 1500 - 1200 = 300 messages
+// a second to 200 s x 300 = 60,000 messages (Little's law: the oldest message waits 60,000 / 1200
+// = 50 s). The default 7-day retention keeps all of them (a room of 725.76 million). Then the
+// inflow falls to 1000/s and the pool drains the backlog at 1200 - 1000 = 200/s: empty after
+// 60,000 / 200 = 300 s more, at t = 500 s. Steps of 100 ms: record i ends at t = (i + 1) x 0.1 s.
+
+namespace {
+Scenario burst_then_calm() {
+  auto s = published(1000, {twelve_workers()});
+  s.nodes[0].workload->curve.spikes = {
+      simsys::workload::Spike{.at = 0s, .duration = 200s, .factor = 1.5}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("a 1.5k per second burst for 200 s grows the pool's backlog by 300 a second to 60000",
+          "[theory]") {
+  const auto g = *Graph::build(burst_then_calm());
+  const auto records = records_of(g, 2000);  // the 200 s of the burst
+  const auto pool = *g.index_of("w");
+  REQUIRE_THAT(records[0].nodes[pool].backlog, WithinAbs(30.0, 1e-6));        // 300/s x 0.1 s
+  REQUIRE_THAT(records[999].nodes[pool].backlog, WithinAbs(30'000.0, 1e-3));  // t = 100 s
+  const auto& peak = records[1999].nodes[pool];                               // t = 200 s
+  REQUIRE_THAT(peak.backlog, WithinAbs(60'000.0, 1e-3));
+  REQUIRE_THAT(peak.drain_per_s, WithinRel(1200.0, 1e-9));  // saturated: it drains its capacity
+  REQUIRE(peak.dropped_per_s == 0.0);                       // the 7-day room has not filled
+  REQUIRE_THAT(peak.demand_per_s, WithinRel(1500.0, 1e-9));
+  // The publisher never notices: every message is appended and answered, in the same 0.6 ms.
+  for (const auto i : {std::size_t{0}, std::size_t{999}, std::size_t{1999}}) {
+    CAPTURE(i);
+    const auto& answer = records[i].responses[0];
+    REQUIRE_THAT(answer.answered.per_second, WithinRel(1500.0, 1e-9));
+    REQUIRE_THAT(answer.answered.per_second, WithinRel(answer.offered.per_second, 1e-12));
+    REQUIRE_THAT(answer.response.mean_s, WithinAbs(0.0006, 1e-9));
+  }
+}
+
+TEST_CASE("after the burst the pool drains the backlog at 200 a second and empties at 500 s",
+          "[theory]") {
+  const auto g = *Graph::build(burst_then_calm());
+  const auto records = records_of(g, 5000);  // 500 s
+  const auto pool = *g.index_of("w");
+  REQUIRE_THAT(records[1999].nodes[pool].backlog, WithinAbs(60'000.0, 1e-3));  // t = 200 s
+  REQUIRE_THAT(records[2000].nodes[pool].demand_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(records[2000].nodes[pool].backlog, WithinAbs(59'980.0, 1e-3));  // - 200 x 0.1 s
+  REQUIRE_THAT(records[3499].nodes[pool].backlog, WithinAbs(30'000.0, 1e-3));  // t = 350 s
+  REQUIRE_THAT(records[3499].nodes[pool].drain_per_s, WithinRel(1200.0, 1e-9));
+  REQUIRE_THAT(records[4999].nodes[pool].backlog, WithinAbs(0.0, 1e-3));  // t = 500 s
+  for (std::size_t i = 2000; i < records.size(); ++i) {
+    REQUIRE(records[i].nodes[pool].dropped_per_s == 0.0);
+  }
+}
+
+// ---- Retention bounds the backlog: the pool drops what is older than the room ----
+//
+// The same 1500/s into the same 1200/s pool, but the queue keeps messages for 10 s: the room is
+// retention x capacity = 10 s x 1200/s = 12,000 messages, full after 12,000 / 300 = 40 s (step
+// 399 ends at t = 40 s); from then on the pool drops the 300/s that arrive beyond its drain
+// ("deleted unconsumed"), and the publisher is still answered 1500/s: asynchronous completion.
+
+namespace {
+Scenario retained_for_10_s() {
+  auto s = published(1500, {twelve_workers()}, 10s);
+  s.duration = 100s;
+  return s;
+}
+}  // namespace
+
+TEST_CASE("with 10 s of retention the pool's room is 12000 messages and fills after 40 s",
+          "[theory]") {
+  const auto g = *Graph::build(retained_for_10_s());
+  const auto pool = *g.index_of("w");
+  REQUIRE_THAT(g.nodes()[pool].capacity.queue_limit, WithinRel(12'000.0, 1e-9));
+  const auto records = records_of(g, 600);  // 60 s
+  std::size_t first_drop = records.size();
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE(records[i].nodes[pool].backlog <= 12'000.0 + 1e-6);
+    if (first_drop == records.size() && records[i].nodes[pool].dropped_per_s > 1e-6) first_drop = i;
+  }
+  // Step 399 ends at t = 40 s with 400 x 30 = 12,000 waiting: the first drop is the next step; one
+  // step either way absorbs the rounding of the accumulated backlog.
+  REQUIRE(first_drop >= 399);
+  REQUIRE(first_drop <= 401);
+  REQUIRE_THAT(records[199].nodes[pool].backlog, WithinAbs(6'000.0, 1e-3));  // t = 20 s
+  REQUIRE(records[199].nodes[pool].dropped_per_s == 0.0);
+}
+
+TEST_CASE(
+    "once the room is full the pool drops 300 a second while the publisher is still "
+    "answered 1500",
+    "[theory]") {
+  const auto g = *Graph::build(retained_for_10_s());
+  const auto records = records_of(g, 600);
+  const auto& last = records.back();
+  const auto& pool = last.nodes[*g.index_of("w")];
+  REQUIRE_THAT(pool.dropped_per_s, WithinRel(300.0, 1e-6));  // inflow - capacity
+  REQUIRE_THAT(pool.drain_per_s, WithinRel(1200.0, 1e-9));
+  REQUIRE_THAT(pool.backlog, WithinAbs(12'000.0, 1e-6));
+  REQUIRE_THAT(pool.rho, WithinRel(1.0, 1e-9));
+  // Asynchronous completion: the pool's drops are its own; the broker dropped nothing and the
+  // client is answered all 1500/s in 0.6 ms.
+  REQUIRE(last.nodes[*g.index_of("q")].dropped_per_s == 0.0);
+  REQUIRE_THAT(last.responses[0].answered.per_second, WithinRel(1500.0, 1e-9));
+  REQUIRE_THAT(last.responses[0].answered.per_second / last.responses[0].offered.per_second,
+               WithinRel(1.0, 1e-9));
+  REQUIRE_THAT(last.responses[0].response.mean_s, WithinAbs(0.0006, 1e-9));
+}
+
+// estimate() is the long-run state: a pool fed above its capacity ends with its room full and
+// drops what it cannot drain, inflow - capacity = 1500 - 1200 = 300/s.
+TEST_CASE("estimate of a pool fed above capacity settles with a full room and drops the excess",
+          "[theory]") {
+  const auto g = *Graph::build(retained_for_10_s());
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const auto e = sim->estimate();
+  REQUIRE(e.converged);
+  const auto& pool = e.nodes[*g.index_of("w")];
+  REQUIRE_THAT(pool.backlog, WithinAbs(12'000.0, 1e-6));
+  REQUIRE_THAT(pool.drain_per_s, WithinRel(1200.0, 1e-9));
+  REQUIRE_THAT(pool.dropped_per_s, WithinRel(300.0, 1e-6));
+  REQUIRE_THAT(e.responses[0].answered.per_second, WithinRel(1500.0, 1e-9));
+}
+
+// Below capacity the long-run state is the state `run` reaches: constant rates, so the last step
+// of a run equals it, for the pool, the broker and the publisher's response.
+TEST_CASE("estimate and run agree on a queue and its pool below capacity", "[theory]") {
+  const auto g = *Graph::build(published(1000, {four_workers()}));
+  auto running = *Simulation::create(g);
+  simsys::engine::StepRecord last;
+  running.run({.duration = 2s, .step = 100ms},
+              [&](const simsys::engine::StepRecord& r) { last = r; });
+  const auto e = (*Simulation::create(g)).estimate();
+  REQUIRE(e.converged);
+  for (const auto* id : {"q", "w"}) {
+    CAPTURE(id);
+    const auto node = *g.index_of(id);
+    REQUIRE_THAT(last.nodes[node].demand_per_s, WithinRel(e.nodes[node].demand_per_s, 1e-9));
+    REQUIRE_THAT(last.nodes[node].rho, WithinRel(e.nodes[node].rho, 1e-9));
+    REQUIRE_THAT(last.nodes[node].latency.mean_s, WithinRel(e.nodes[node].latency.mean_s, 1e-9));
+    REQUIRE(e.nodes[node].dropped_per_s == 0.0);
+    REQUIRE(e.nodes[node].backlog == 0.0);
+  }
+  REQUIRE_THAT(e.nodes[*g.index_of("w")].latency.mean_s, WithinAbs(0.006622, 1e-6));
+  REQUIRE_THAT(last.responses[0].response.mean_s, WithinRel(e.responses[0].response.mean_s, 1e-9));
+  REQUIRE_THAT(e.responses[0].response.mean_s, WithinAbs(0.0006, 1e-9));
+}
+
+// The fluid queue's balance at the broker and at the pool, every step of an overloaded run (the
+// 10 s retention scenario, 60 s): what came in was drained, dropped or is waiting,
+// demand.dt = (drain + dropped).dt + (backlog - the previous backlog).
+TEST_CASE(
+    "the pool conserves messages at every step: demand x dt = drained + dropped + change "
+    "in backlog",
+    "[theory]") {
+  const auto g = *Graph::build(retained_for_10_s());
+  const auto records = records_of(g, 600);
+  const double dt = 0.1;
+  for (const auto* id : {"q", "w"}) {
+    CAPTURE(id);
+    const auto node = *g.index_of(id);
+    double previous_backlog = 0.0;
+    bool grew = false;
+    bool dropped = false;
+    for (std::size_t i = 0; i < records.size(); ++i) {
+      const auto& sample = records[i].nodes[node];
+      CAPTURE(i);
+      const double in = sample.demand_per_s * dt;
+      const double out = (sample.drain_per_s + sample.dropped_per_s) * dt;
+      REQUIRE_THAT(in, WithinAbs(out + (sample.backlog - previous_backlog), 1e-9));
+      grew = grew || sample.backlog > previous_backlog;
+      dropped = dropped || sample.dropped_per_s > 0.0;
+      previous_backlog = sample.backlog;
+    }
+    // Not vacuous for the pool: its backlog really filled and its room really overflowed. The
+    // broker, at rho 0.0015, never queues.
+    REQUIRE(grew == (std::string_view{id} == "w"));
+    REQUIRE(dropped == (std::string_view{id} == "w"));
+  }
+}

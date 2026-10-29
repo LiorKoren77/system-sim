@@ -256,3 +256,13 @@ TEST_CASE("an out-of-range node type is a programmer error", "[defaults]") {
   REQUIRE_THROWS_AS(simsys::defaults::for_type(bogus), std::invalid_argument);
   REQUIRE_THROWS_AS(simsys::model::to_string(bogus), std::invalid_argument);
 }
+
+// A message queue's retention when the scenario states none (plan 2c refinement 4): 7 days. The
+// book gives no number; the industry default is Kafka's `log.retention.hours = 168`, and
+// 168 h = 7 d = 604,800 s. The graph turns it into the consumers' waiting room (retention x the
+// pool's capacity), and explain prints it as `retention=7d (default: Kafka's 168 h)`.
+TEST_CASE("a queue's default retention is Kafka's 168 hours, seven days", "[defaults]") {
+  static_assert(simsys::defaults::default_retention == 168h);
+  static_assert(simsys::defaults::default_retention == 7 * 24h);
+  REQUIRE(simsys::defaults::default_retention == 604'800s);
+}

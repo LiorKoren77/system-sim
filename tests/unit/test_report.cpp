@@ -1703,3 +1703,61 @@ TEST_CASE("explain checks a bandwidth link's peak offered MB per second against 
     REQUIRE(check_line(text, "a->b").empty());
   }
 }
+
+// ---- Message queues and worker pools in explain (plan 2c refinements 4-5, Task 6) ----
+//
+// explain says what the two types stand for, in the words of the plan:
+//  - a worker pool: `workers=12 cost=10ms (capacity 1.2k/s: workers / cost)`: the capacity is not
+//    a number the scenario states but 12 workers / 10 ms = 1200 jobs/s, and the line says so;
+//  - a message queue: `retention=7d (default: Kafka's 168 h)` when the scenario gives none (the
+//    book gives no figure; 168 h is Kafka's `log.retention.hours`), the stated value without the
+//    tag otherwise, and `partitions=8 (not modelled)`: accepted and printed, not simulated.
+// (The plan's example `cost=3.333ms` prints as `3.33ms`: explain writes durations with three
+// significant digits. The pins use costs that print exactly.)
+
+namespace {
+// u -> q -> w: a queue with the given extra keys, a pool of 12 workers at 10 ms draining it.
+Scenario queue_and_pool_reported(std::optional<simsys::SimTime> retention,
+                                 std::optional<int> partitions) {
+  Scenario s{.name = "queue-report", .version = 1, .duration = 1min};
+  NodeSpec queue{.id = "q", .type = NodeType::message_queue};
+  queue.retention = retention;
+  queue.partitions = partitions;
+  NodeSpec pool{.id = "w", .type = NodeType::worker_pool};
+  pool.consumes = "q";
+  pool.workers = 12;
+  pool.job_cost = 10ms;
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"publish", 1.0}}}},
+      std::move(queue), std::move(pool)};
+  s.links = {LinkSpec{.from = "u", .to = "q"}, LinkSpec{.from = "q", .to = "w"}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("explain says a worker pool's capacity is workers over cost", "[report]") {
+  const auto text = explain_of(queue_and_pool_reported(std::nullopt, 8));
+  CAPTURE(text);
+  REQUIRE(node_line(text, "w").contains("workers=12 cost=10ms (capacity 1.2k/s: workers / cost)"));
+}
+
+TEST_CASE(
+    "explain marks an absent retention as Kafka's default and prints partitions as not "
+    "modelled",
+    "[report]") {
+  const auto text = explain_of(queue_and_pool_reported(std::nullopt, 8));
+  CAPTURE(text);
+  const auto line = node_line(text, "q");
+  REQUIRE(line.contains("retention=7d (default: Kafka's 168 h)"));
+  REQUIRE(line.contains("partitions=8 (not modelled)"));
+}
+
+TEST_CASE("explain prints a stated retention without the default tag", "[report]") {
+  const auto text = explain_of(queue_and_pool_reported(10s, 8));
+  CAPTURE(text);
+  const auto line = node_line(text, "q");
+  REQUIRE(line.contains("retention=10s"));
+  REQUIRE_FALSE(line.contains("Kafka"));
+}
