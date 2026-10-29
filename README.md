@@ -36,6 +36,8 @@ simsys estimate scenario.yaml [--report table|json] [--no-color]
 simsys run      scenario.yaml [--duration 30s] [--seed N] [--report table|json]
                               [--series out.csv] [--series-ops ops.csv] [--no-color]
 simsys curve    scenario.yaml <client> [--step 1m] [--until 1h] [--seed N] [--noise]
+simsys sweep    scenario.yaml --param <dot.path>=<from>..<to>:<n> --metric <m>...
+                              [--jobs N] [--format table|csv]
 ```
 
 `estimate` evaluates the long-run (steady) state once, at t = 0 (midnight): the rate curve's
@@ -83,6 +85,23 @@ t_s,rate_per_s
 240,800
 300,4000
 360,800
+```
+
+`sweep` runs the scenario once per value of one key, the runs in parallel (`--jobs`, default:
+the machine's hardware threads; the output does not depend on it), and prints one row per value
+with the metrics asked for: `<client>.<op>.mean`, `<node>.mean_rho` or `<queue>.lag`
+([schema](docs/scenario-schema.md#command-line-simsys-sweep-phase-2c)). On the
+[hello tutorial](scenarios/tutorial/hello/), an M/M/1 queue with a 1 ms service time: the latency is
+s / (1 − rho) plus the 0.5 ms round trip, and it bends upward as rho nears 1:
+
+```
+$ simsys sweep scenarios/tutorial/hello/scenario.yaml --param nodes.users.rate.base=100/s..900/s:3 \
+      --metric users.ping.mean --metric api.mean_rho
+nodes.users.rate.base  users.ping.mean  api.mean_rho
+----------------------------------------------------
+100/s                          1.61 ms           0.1
+500/s                           2.5 ms           0.5
+900/s                          10.5 ms           0.9
 ```
 
 `explain` on the [chain tutorial](scenarios/tutorial/chain/) (trimmed):

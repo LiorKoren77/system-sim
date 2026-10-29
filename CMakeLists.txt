@@ -44,11 +44,16 @@ target_sources(simsys
     src/engine/behaviours.cppm
     src/engine/engine.cppm
     src/report/report.cppm
+    src/sweep/sweep.cppm
   PRIVATE                               # module implementation units are ordinary sources
     src/config/config.cpp
     src/model/model.cpp
-    src/report/report.cpp)
-target_link_libraries(simsys PUBLIC yaml-cpp::yaml-cpp PRIVATE simsys_warnings)
+    src/report/report.cpp
+    src/sweep/sweep.cpp)
+# std::jthread (simsys.sweep's workers) needs the platform's thread library; Threads::Threads is
+# CMake's portable name for it (-pthread with GCC on Linux).
+find_package(Threads REQUIRED)
+target_link_libraries(simsys PUBLIC yaml-cpp::yaml-cpp Threads::Threads PRIVATE simsys_warnings)
 # GCC 14.2 + named modules: each import maps the imported module's whole line table (its
 # global-module-fragment headers included) into this translation unit's source-location
 # space. The module units at the end of the import chain, from simsys.behaviours on

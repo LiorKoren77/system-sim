@@ -20,6 +20,7 @@
 // translation units) instead of being attached to `simsys.config`.
 module;
 #include <expected>
+#include <span>
 #include <string>
 
 export module simsys.config;
@@ -52,5 +53,24 @@ struct ConfigError {
 // exceptions and out-parameters; the caller must inspect it, and the error carries
 // structured data (file, line, column, message) instead of a bare code.
 [[nodiscard]] std::expected<model::Scenario, ConfigError> load(const std::string& path);
+
+// One replaced value (`simsys sweep`, plan 2c Task 15): the scalar at the dot path `path`
+// (`nodes.users.rate.base`: map keys from the document's root down, never a list index) is
+// replaced by the text `value` (`500/s`, in the file's own unit syntax) before validation.
+struct Override {
+  std::string path;
+  std::string value;
+};
+
+// `load`, with each override applied to the parsed YAML before any check runs, so a replaced
+// value is validated exactly like one written in the file and the engine never sees a value the
+// loader did not check. A path that does not lead to one scalar of the file (a missing key, a
+// list on the way, a map or a list at its end) is a ConfigError whose message starts with
+// "--param: " and which has no line (the mistake is on the command line, not in the file).
+// No overrides gives what load(path) gives.
+// C++20 std::span<const T>: a non-owning view of contiguous elements, so the caller passes a
+// vector, an array or `{}` without a copy and without making `load` a template.
+[[nodiscard]] std::expected<model::Scenario, ConfigError> load(const std::string& path,
+                                                               std::span<const Override> overrides);
 
 }  // namespace simsys::config
