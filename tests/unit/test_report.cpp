@@ -1569,3 +1569,137 @@ TEST_CASE("explain lists a blob store's write ops", "[report]") {
   CAPTURE(defaulted);
   REQUIRE(node_line(defaulted, "store").contains("write_ops=write (never arrives)"));
 }
+
+// ---- A link's bandwidth is a pipe: what the reports say about it (plan 2c Task 5) ----
+//
+// A link with a bandwidth is a queue of megabytes, so it gets a row of its own, named after the
+// link, `from->to`, wherever a node does: the summary table, the JSON `links`, the CSV series
+// (test_series.cpp) and explain's checks. Numbers on a link are in MEGABYTES (a rate of MB/s).
+//
+// One picture throughout: client `a` sends 100 `put`/s of 1 MB to service `b` over a 1 Gbit/s
+// link = 125 MB/s, so the pipe's rho is 100 / 125 = 0.8, yellow. A pipe whose utilization the
+// run reports is the NodeSample's conservation law again, so no new idea, only a new row.
+//
+// Proposed forms (the implementer may adjust the words, not the facts):
+//  - table: the link's row has the node table's columns, so its first cells after the name are
+//    mean_rho and peak_rho;
+//  - explain, links block: `bandwidth=1Gbit/s (125MB/s)`, the bits form first (a network is rated
+//    in bits) with the bytes after it; 5e9 B/s reads `40Gbit/s (5GB/s)`;
+//  - explain, checks block: `a->b  peak offered 100 MB/s vs 125 MB/s  (80%, yellow)`.
+
+namespace {
+// a(`rate`/s of `put`, 1 MB each) -> b (a service of 1M/s) over a link of the given bandwidth
+// (none: a plain link). 2 s at 100 ms steps, the first 500 ms warmup.
+Scenario piped(double rate, std::optional<simsys::ByteRate> bandwidth) {
+  Scenario s{.name = "piped", .version = 1, .duration = 2s, .warmup = 500ms};
+  s.nodes = {NodeSpec{.id = "a",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{rate}},
+                                           .op_shares = {{"put", 1.0}},
+                                           .sizes = {{"put", simsys::Bytes{1e6}}}}},
+             NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{1e6}, .latency = 1ms}};
+  s.links = {LinkSpec{.from = "a", .to = "b", .latency = 250us, .bandwidth = bandwidth}};
+  return s;
+}
+
+// The cells of the first line of `text` whose first cell is `first`, split at whitespace; empty
+// when no line starts with it. The table is aligned with spaces, so this reads a row back.
+std::vector<std::string> row_starting_with(const std::string& text, const std::string& first) {
+  std::istringstream lines{text};
+  std::string line;
+  while (std::getline(lines, line)) {
+    std::istringstream cells{line};
+    std::vector<std::string> row;
+    std::string cell;
+    while (cells >> cell) row.push_back(cell);
+    if (!row.empty() && row.front() == first) return row;
+  }
+  return {};
+}
+}  // namespace
+
+TEST_CASE("the table has a row for a bandwidth link, named from->to, with the pipe's utilization",
+          "[report]") {
+  const auto s = piped(100, simsys::ByteRate{125e6});
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto text = simsys::report::render_table(summarize(s, g), {}, /*color=*/false);
+  CAPTURE(text);
+  const auto row = row_starting_with(text, "a->b");
+  REQUIRE(row.size() >= 3);
+  REQUIRE(row[1] == "0.8");  // mean_rho: 100 MB/s over 125 MB/s
+  REQUIRE(row[2] == "0.8");  // peak_rho: constant load, so the same
+}
+
+TEST_CASE("a scenario without a bandwidth has no link rows in its table", "[report]") {
+  const auto s = piped(100, std::nullopt);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto text = simsys::report::render_table(summarize(s, g), {}, /*color=*/false);
+  CAPTURE(text);
+  REQUIRE_FALSE(text.contains("a->b"));
+  REQUIRE_FALSE(text.contains("->"));
+  REQUIRE(text.contains("a.put"));  // the op table is unchanged
+}
+
+// A pipe above its capacity fills its 1000 MB room and drops: 1000 puts/s of 1 MB offer 1000 MB/s
+// to a 125 MB/s pipe, whose backlog grows by 875 x 0.1 s = 87.5 MB per step and overflows in the
+// 12th step (1.1 s), inside the observed part of a 5 s run. The row shows a saturated pipe (rho 1),
+// a backlog and dropped megabytes, in the node table's columns.
+TEST_CASE("a pipe that overflows shows its dropped megabytes in its row and the header",
+          "[report]") {
+  auto s = piped(1000, simsys::ByteRate{125e6});
+  s.duration = 5s;
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto text = simsys::report::render_table(summarize(s, g), {}, /*color=*/false);
+  CAPTURE(text);
+  const auto row = row_starting_with(text, "a->b");
+  REQUIRE(row.size() >= 6);
+  REQUIRE(row[1] == "1");  // mean_rho: the pipe is saturated, 125 MB/s drained of 125
+  REQUIRE(row[3] != "0");  // peak_backlog: the room filled
+  REQUIRE(row[4] != "0");  // dropped
+}
+
+TEST_CASE("explain prints a link's bandwidth in bits with the bytes after it", "[report]") {
+  SECTION("1 Gbit/s") {
+    const auto text = explain_of(piped(100, simsys::ByteRate{125e6}));
+    CAPTURE(text);
+    REQUIRE(text.contains("bandwidth=1Gbit/s (125MB/s)"));
+  }
+  SECTION("40 Gbit/s") {
+    const auto text = explain_of(piped(100, simsys::ByteRate{5e9}));
+    CAPTURE(text);
+    REQUIRE(text.contains("bandwidth=40Gbit/s (5GB/s)"));
+  }
+  SECTION("no bandwidth, nothing said") {
+    const auto text = explain_of(piped(100, std::nullopt));
+    CAPTURE(text);
+    REQUIRE_FALSE(text.contains("bandwidth"));
+  }
+}
+
+// The paper check for the pipe: 100 puts/s x 1 MB = 100 MB/s offered against 125 MB/s, 80 %,
+// yellow (0.70 <= rho < 0.90): the verdict a student reaches before running; at 40 Gbit/s = 5k MB/s
+// the same load is 2 %.
+TEST_CASE("explain checks a bandwidth link's peak offered MB per second against its capacity",
+          "[report]") {
+  SECTION("1 Gbit/s") {
+    const auto text = explain_of(piped(100, simsys::ByteRate{125e6}));
+    CAPTURE(text);
+    REQUIRE(check_line(text, "a->b")
+                .contains("a->b  peak offered 100 MB/s vs 125 MB/s  (80%, yellow)"));
+  }
+  SECTION("40 Gbit/s") {
+    const auto text = explain_of(piped(100, simsys::ByteRate{5e9}));
+    CAPTURE(text);
+    REQUIRE(check_line(text, "a->b").contains("peak offered 100 MB/s vs 5k MB/s  (2%, green)"));
+  }
+  SECTION("above the capacity") {
+    const auto text = explain_of(piped(200, simsys::ByteRate{125e6}));
+    CAPTURE(text);
+    REQUIRE(check_line(text, "a->b").contains("peak offered 200 MB/s vs 125 MB/s  (160%, red)"));
+  }
+  SECTION("a link without a bandwidth has no check") {
+    const auto text = explain_of(piped(100, std::nullopt));
+    CAPTURE(text);
+    REQUIRE(check_line(text, "a->b").empty());
+  }
+}

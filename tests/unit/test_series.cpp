@@ -12,7 +12,9 @@
 #include <charconv>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -25,6 +27,7 @@
 import simsys.config;
 import simsys.core;
 import simsys.engine;
+import simsys.fluid; // Zone: a hand-made LinkSample's
 import simsys.graph;
 import simsys.model;
 import simsys.report;
@@ -831,4 +834,195 @@ TEST_CASE("explain names every blocking type on the way to a web-crawler node", 
   REQUIRE(check_line(text, "frontier")
               .contains("(≥1%; load not propagated: worker_pool is phase 2c, frontier is not "
                         "modelled yet)"));
+}
+
+// ---- A link's bandwidth is a pipe: its rows in the series and the JSON (plan 2c Task 5) ----
+//
+// A link with a bandwidth is a queue of megabytes and is plotted like a node: one CSV row per
+// step with the link's name, `from->to`, in the `node` column, the same ten columns, in
+// MEGABYTES (a rate of MB/s; engine::StepRecord::links, one LinkSample per bandwidth link). So
+// the conservation law holds on those rows too, and a student checks the pipe from the file.
+// The JSON gets `links`: one object per bandwidth link (an empty array without any).
+//
+// Picture: client `a` sends `rate` puts/s of 1 MB to service `b` over a 1 Gbit/s = 125 MB/s link.
+
+namespace {
+// a(`rate`/s of 1 MB `put`s) -> b over a 250 us link of 1 Gbit/s (none when `bandwidth` is
+// empty). 3 s at 100 ms steps, the first 500 ms warmup.
+Scenario piped(double rate, std::optional<simsys::ByteRate> bandwidth = simsys::ByteRate{125e6}) {
+  Scenario s{.name = "piped", .version = 1, .duration = 3s, .step = 100ms, .warmup = 500ms};
+  s.nodes = {NodeSpec{.id = "a",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{rate}},
+                                           .op_shares = {{"put", 1.0}},
+                                           .sizes = {{"put", simsys::Bytes{1e6}}}}},
+             NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{1e6}, .latency = 1ms}};
+  s.links = {LinkSpec{.from = "a", .to = "b", .latency = 250us, .bandwidth = bandwidth}};
+  return s;
+}
+
+// The text of the JSON object that starts at the first `"name": "<name>"` (up to its closing
+// brace), or empty: the keys of one link or node, without those of the next.
+std::string json_object_named(const std::string& json, std::string_view name) {
+  const auto at = json.find("\"name\": \"" + std::string{name} + "\"");
+  if (at == std::string::npos) return {};
+  return json.substr(at, json.find('}', at) - at);
+}
+
+// The number after the first key that starts with `key_prefix` (a quoted key without its closing
+// quote, `"latency`), whatever its suffix (`latency` or `latency_s`).
+double number_of_key(const std::string& object, std::string_view key_prefix) {
+  const auto at = object.find(key_prefix);
+  INFO("key: " << key_prefix << " in " << object);
+  REQUIRE(at != std::string::npos);
+  const auto colon = object.find(": ", at);
+  REQUIRE(colon != std::string::npos);
+  return number_after(object, ": ", colon).value;
+}
+}  // namespace
+
+TEST_CASE(
+    "a link row of the node series carries the LinkSample it was fed, in the same ten columns",
+    "[series]") {
+  const auto s = piped(100);
+  const auto g = graph_of(s);
+  std::ostringstream out;
+  simsys::report::SeriesWriter writer{out, g};
+  REQUIRE(header_of(out.str()) == node_header);  // no column is added for links
+  // A hand-made record, every column a different, exactly printable number: the nodes' samples
+  // stay zero (a client and b), the pipe's are made up.
+  simsys::engine::StepRecord record{
+      .t = 100ms, .nodes = std::vector<simsys::engine::NodeSample>(2), .responses = {}};
+  simsys::engine::LinkSample link{};
+  link.demand_per_s = 100.5;
+  link.drain_per_s = 100.25;
+  link.dropped_per_s = 5;
+  link.backlog = 34.25;
+  link.rho = 0.8;
+  link.latency = {.mean_s = 0.0125, .variance_s2 = 0.0};
+  link.zone = simsys::fluid::Zone::yellow;
+  record.links = {link};
+  writer.observe(record);
+  const auto rows = data_rows(out.str());
+  REQUIRE(rows.size() == 3);  // the two nodes' rows and the link's, in whatever order
+  const auto found = std::ranges::find_if(rows, [](const auto& row) { return row[1] == "a->b"; });
+  REQUIRE(found != rows.end());
+  const auto& row = *found;
+  REQUIRE(row.size() == 10);
+  REQUIRE(row[0] == "0.1");
+  REQUIRE(row[2] == "100.5");   // demand_per_s, MB/s
+  REQUIRE(row[3] == "100.25");  // drain_per_s
+  REQUIRE(row[4] == "0.8");     // rho
+  REQUIRE(row[5] == "34.25");   // backlog, MB
+  REQUIRE(row[6] == "5");       // drops_per_s
+  REQUIRE(row[7] == "0");       // rejected_per_s: a pipe refuses nothing by policy
+  REQUIRE(row[8] == "12.5");    // latency_ms: 0.0125 s
+  REQUIRE(row[9] == "yellow");
+}
+
+// 1000 puts/s of 1 MB offer the pipe 1000 MB/s against 125 MB/s: the backlog grows by
+// 875 x 0.1 s = 87.5 MB per step to 962.5 MB after 11 steps, the 12th overflows the 1000 MB room
+// (1050 - 1000 = 50 MB, 500 MB/s over the step) and from then on the pipe drops 875 MB/s: all
+// three terms of the identity. 30 steps of 1000 MB/s x 0.1 s are 3000 MB offered.
+TEST_CASE("the conservation identity holds on the link rows read back from the series file",
+          "[series]") {
+  const auto s = piped(1000);
+  const auto g = graph_of(s);
+  std::ostringstream out;
+  simsys::report::SeriesWriter writer{out, g};
+  run_into(s, g, [&](const auto& r) { writer.observe(r); });
+  const auto rows = data_rows(out.str());
+  CAPTURE(out.str());
+  REQUIRE(rows.size() == 30 * 3);  // 30 steps x (the client, b and the link)
+  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 10; }));
+  constexpr double dt = 0.1;
+  double demand = 0.0;
+  double drain = 0.0;
+  double drops = 0.0;
+  double backlog = 0.0;
+  int link_rows = 0;
+  for (const auto& row : rows) {
+    if (row[1] != "a->b") continue;
+    ++link_rows;
+    demand += number(row[2]) * dt;
+    drain += number(row[3]) * dt;
+    drops += number(row[6]) * dt;
+    backlog = number(row[5]);  // the last row's: what is left waiting at the end
+  }
+  REQUIRE(link_rows == 30);
+  REQUIRE_THAT(demand, WithinRel(3000.0, 1e-5));
+  REQUIRE(drops > 0.0);                            // not vacuous: the pipe really dropped ...
+  REQUIRE(backlog > 0.0);                          // ... and really holds megabytes
+  REQUIRE_THAT(backlog, WithinRel(1000.0, 1e-5));  // the room is full at the end
+  REQUIRE_THAT(demand, WithinRel(drain + drops + backlog, 1e-5));
+  // b is sent what the pipe drained: 125 MB/s of 1 MB puts, 125 requests/s, in every row it has.
+  for (const auto& row : rows) {
+    if (row[1] == "b") REQUIRE_THAT(number(row[2]), WithinRel(125.0, 1e-5));
+  }
+}
+
+// The JSON `links`: one object per bandwidth link. Constant load, so every step of the run has
+// the same numbers and any way of summarising them (mean, peak, last) reads the same:
+// 100 MB/s offered and drained, nothing dropped or waiting, rho 0.8 (yellow), a sojourn of 24 ms
+// (Wq 16 ms + 8 ms, see test_theory). The latency's key is `latency_s` if it follows the other
+// `_s` keys, `latency` as the plan words it: either is read here; its value is in seconds.
+TEST_CASE("the JSON has links with the pipe's demand, drain, drops, backlog, rho, latency and zone",
+          "[series]") {
+  const auto json = json_of(piped(100));
+  CAPTURE(json);
+  REQUIRE(json.contains("\"links\": [\n"));
+  const auto link = json_object_named(json, "a->b");
+  REQUIRE_FALSE(link.empty());
+  REQUIRE_THAT(number_of_key(link, "\"demand_per_s\""), WithinRel(100.0, 1e-9));
+  REQUIRE_THAT(number_of_key(link, "\"drain_per_s\""), WithinRel(100.0, 1e-9));
+  REQUIRE(number_of_key(link, "\"dropped_per_s\"") == 0.0);
+  REQUIRE(number_of_key(link, "\"backlog\"") == 0.0);
+  REQUIRE_THAT(number_of_key(link, "\"rho\""), WithinRel(0.8, 1e-9));
+  REQUIRE_THAT(number_of_key(link, "\"latency"), WithinAbs(0.024, 1e-9));
+  REQUIRE(link.contains("\"zone\": \"yellow\""));
+}
+
+TEST_CASE("the JSON has an empty links array when no link has a bandwidth", "[series]") {
+  const auto json = json_of(piped(100, std::nullopt));
+  CAPTURE(json);
+  REQUIRE(json.contains("\"links\": []"));
+  REQUIRE_FALSE(json.contains("a->b"));
+}
+
+// What a link without a bandwidth did before Task 5 must not change by a byte. `tutorial/chain`
+// (1.5k/s through two services and a database, no bandwidth, no size) is run for its whole 2
+// minutes and its node series and op series hashed (64-bit FNV-1a over the bytes of each file);
+// the hashes were taken from the output at 0097309, the commit before the pipe, with the same
+// seed. A pipe's code path that leaks into a link without one changes a number, a row or a
+// delay-line slot, and with it the hash.
+namespace {
+std::uint64_t fnv1a(const std::string& text) {
+  std::uint64_t hash = 0xcbf29ce484222325ULL;  // the 64-bit FNV offset basis
+  for (const char c : text) {
+    hash ^= static_cast<unsigned char>(c);
+    hash *= 0x100000001b3ULL;  // the 64-bit FNV prime
+  }
+  return hash;
+}
+}  // namespace
+
+TEST_CASE("the tutorial chain's series are byte for byte what they were before link bandwidths",
+          "[series]") {
+  const auto loaded =
+      simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/tutorial/chain/scenario.yaml");
+  INFO((loaded ? "" : loaded.error().message));
+  REQUIRE(loaded.has_value());
+  const auto g = graph_of(*loaded);
+  std::ostringstream nodes_out;
+  std::ostringstream ops_out;
+  simsys::report::SeriesWriter nodes{nodes_out, g};
+  simsys::report::OpSeriesWriter ops{ops_out, g};
+  run_into(*loaded, g, [&](const auto& r) {
+    nodes.observe(r);
+    ops.observe(r);
+  });
+  REQUIRE(nodes_out.str().find("->") == std::string::npos);  // no link rows
+  REQUIRE(data_rows(nodes_out.str()).size() == 1200 * 3);    // 2 min of 100 ms steps x 3 nodes
+  REQUIRE(fnv1a(nodes_out.str()) == 0x3d3a6ed1d31da525ULL);
+  REQUIRE(fnv1a(ops_out.str()) == 0x9dfc7de84e1afe59ULL);
 }
