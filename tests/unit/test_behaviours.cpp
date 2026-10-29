@@ -2155,3 +2155,62 @@ TEST_CASE("an external sink prices each op by the graph's op cost", "[behaviours
   REQUIRE(sink.cost("call") == 2.0);
   REQUIRE(sink.cost("status") == 1.0);
 }
+
+// ---- A step after a failed step does not run (plan 2c Task 12) ----
+//
+// The theory tests run the engine; this one pins where a parallel group sits among sequential
+// steps, which only a route with a hand-made lookup shows exactly. web's get is
+//   [a (parallel), s (sequential), b (parallel), c (sequential)]
+// and every parallel step of an op is one group (the schema's rule), which starts where its
+// first member sits: a and b are both sent what is alive there, the whole 100/s, and every step
+// after that point is thinned by the group as a whole, d_a × d_b = 0.5 × 0.8 = 0.4. So
+//   a: 100, b: 100            (the group: they start together and do not thin each other)
+//   s: 100 × 0.4 = 40         (after the group's first member: the group's survivors)
+//   c: 40 × d_s = 40 × 0.9 = 36
+TEST_CASE("a parallel group starts where its first member sits and thins every step after it",
+          "[behaviours]") {
+  Scenario s{.name = "group", .version = 1, .duration = 1min};
+  s.nodes = {
+      NodeSpec{.id = "users",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"get", 1.0}}}},
+      NodeSpec{.id = "web",
+               .type = NodeType::service,
+               .ops = {{"get",
+                        {Step{.to = "a", .op = "get", .mode = StepMode::parallel},
+                         Step{.to = "s", .op = "get"},
+                         Step{.to = "b", .op = "get", .mode = StepMode::parallel},
+                         Step{.to = "c", .op = "get"}}}}},
+      NodeSpec{.id = "a", .type = NodeType::service},
+      NodeSpec{.id = "s", .type = NodeType::service},
+      NodeSpec{.id = "b", .type = NodeType::service},
+      NodeSpec{.id = "c", .type = NodeType::service}};
+  s.links = {LinkSpec{.from = "users", .to = "web"}};
+  for (const char* target : {"a", "s", "b", "c"}) {
+    s.links.push_back(LinkSpec{.from = "web", .to = target});
+  }
+  const auto g = *simsys::graph::Graph::build(s);
+  const ServiceBehaviour web{g, *g.index_of("web")};
+  // What each target delivered last step: a 0.5, b 0.8, s 0.9, c everything.
+  const auto delivered_last_step = [&](std::size_t target, std::string_view /*op*/) {
+    if (target == *g.index_of("a")) return 0.5;
+    if (target == *g.index_of("b")) return 0.8;
+    if (target == *g.index_of("s")) return 0.9;
+    return 1.0;
+  };
+  const auto routed = web.route(flow_of("get", 100), 0s, 100ms, delivered_last_step);
+  const auto sent_to = [&](std::string_view id) {
+    const auto found = std::ranges::find(routed.outgoing, *g.index_of(id), &Outgoing::target);
+    REQUIRE(found != routed.outgoing.end());
+    return found->flow.rate_of("get").per_second;
+  };
+  REQUIRE_THAT(sent_to("a"), WithinRel(100.0, 1e-12));
+  REQUIRE_THAT(sent_to("b"), WithinRel(100.0, 1e-12));
+  REQUIRE_THAT(sent_to("s"), WithinRel(40.0, 1e-12));
+  REQUIRE_THAT(sent_to("c"), WithinRel(36.0, 1e-12));
+  // Without a lookup (NothingLost: before any step was reported) every step gets the full 100/s.
+  const auto unthinned = web.route(flow_of("get", 100), 0s, 100ms);
+  for (const Outgoing& out : unthinned.outgoing) {
+    REQUIRE_THAT(out.flow.rate_of("get").per_second, WithinRel(100.0, 1e-12));
+  }
+}

@@ -1684,7 +1684,9 @@ void forward_handed_on(const graph::Graph& g, std::size_t from, std::vector<OpLo
 // graph::ServiceHop), as ServiceBehaviour::route does, or over a load balancer's, a rate
 // limiter's or a message queue's routes, or to a cache's store, or along a blob store's events or
 // a worker pool's hand-offs. Flow over a feedback link goes to `fed_back`: its target came earlier
-// in the order, so it counts in the next pass.
+// in the order, so it counts in the next pass. On paper nothing is lost, so no step is thinned by
+// an earlier one's losses as in a run (detail::HopBlocks::forward): a later step's peak offered
+// load is the upper bound of a request that never fails before it.
 void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_t from,
                    std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   const auto& spec = g.nodes()[from].spec;

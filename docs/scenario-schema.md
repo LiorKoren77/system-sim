@@ -256,6 +256,14 @@ A **step** is `{to: <node id>, op: <op name>, on: always|miss|failure, mode: seq
 | `factor` | 1 | read | finite, positive, at most `1e6`; multiplies the flow (fan-out: one post → 100 feed writes) |
 | `size` | none | checked | a [size](#values): the payload this step's request carries (a transcoder's 50 MB rendition), what a byte-sized node charges the request, in MB; positive (`step size must be a size (B, KB, MB or GB: 50MB): missing size unit`, the parser's reason after the colon; `step size must be positive` for `0B`) |
 
+**A step after a failed step does not run** *(phase 2c)*: a request is answered only if every
+step it waits for is, so each step is sent only the requests the steps before it delivered
+(sequential steps thin one another, the parallel group fails as a whole and thins what follows
+the point where its first member sits, a miss block fails only its misses), at a service, at a
+cache (store hop and `then` steps) and at a worker pool (its `then` steps). The fractions are the
+previous simulation step's, so the thinning is one step late: the first step sends every step
+the full flow.
+
 An op with an empty step list (`deliver: []`) is terminal: the node serves it and forwards
 nothing. *(graph)* Every step needs a link that carries demand from the node to its
 target and, if that link lists `ops`, lists the step's op.
@@ -385,8 +393,9 @@ that only the limiter reaches: counters are keyed by user or rule, not by the cl
 give it `{fixed: h}`.
 
 **Terminal gate.** A limiter whose only outgoing link is its backend answers every admitted
-request itself. Its caller still calls its own later steps at the full rate; the refused
-share shows in the gate's reject rate and in the client's answered rate.
+request itself. Its caller sends its own later steps only the requests the gate let through
+(a step after a failed step does not run, see [Steps](#steps)), one simulation step late; the
+refused share shows in the gate's reject rate and in the client's answered rate.
 
 Not resolved: anything inside a step (a window is a whole number of steps, so its
 boundaries fall on step starts; the requests of one step arrive as one lump; a burst is

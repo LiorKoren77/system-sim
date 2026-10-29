@@ -108,6 +108,18 @@ concept FractionLookup =
     std::invocable<F, std::size_t, std::string_view> &&
     std::convertible_to<std::invoke_result_t<F, std::size_t, std::string_view>, double>;
 
+// The FractionLookup of a step before anything was reported lost: every call delivers all it is
+// sent. The default `delivered_last_step` of a route that thins its later calls (see
+// NodeBehaviour), so a unit test that routes one flow by hand need not build a lookup.
+struct NothingLost {
+  // C++23 static operator(): a call operator that reads no member may be declared static, so a
+  // call passes no `this` (before C++23 it had to be a const member function). Right here: the
+  // answer is the constant 1, whoever asks.
+  [[nodiscard]] static double operator()(std::size_t /*node*/, std::string_view /*op*/) {
+    return 1.0;
+  }
+};
+
 // C++20 requires-expression: lists the operations a type must support, checked at
 // compile time (spec §5). This is the engine's whole requirement on a node behaviour,
 // written in code instead of in a comment on an abstract base class. The lambda is a
@@ -124,10 +136,18 @@ concept FractionLookup =
 // that come back answered (plan 2a refinement 8): `own` is the share the node itself does not
 // lose on this step (the engine's 1 − (dropped + rejected) / inflow), times what its downstream
 // calls deliver.
+// `route`'s last argument is the same kind of lookup, `delivered_last_step` (plan 2c refinement
+// 11, "a step after a failed step does not run"): what each call delivered at the end of the
+// LAST step, which a node whose calls follow one another (a service's steps, a cache's store hop
+// and `then` steps, a worker pool's hand-offs: detail::HopBlocks::forward) uses to send a later
+// call only the requests that survived the earlier ones. A node whose calls all start with the
+// request (a balancer's or a limiter's routes, a leaf) has nothing to thin and ignores it.
 template <class B>
 concept NodeBehaviour = requires(const B b, B& node, const flow::Flow& in, SimTime now, SimTime dt,
                                  flow::LatencyEstimate own) {
-  { node.route(in, now, dt) } -> std::same_as<Routed>;
+  {
+    node.route(in, now, dt, [](std::size_t, std::string_view) { return 1.0; })
+  } -> std::same_as<Routed>;
   { b.cost(std::string_view{}) } -> std::same_as<double>;
   {
     b.response(std::string_view{}, own,
@@ -224,6 +244,15 @@ struct Branch {
 // down).
 namespace simsys::behaviours::detail {
 
+// The outgoing flow towards (target, link), created on first use; the outgoing flows sorted by
+// (target, link), so the engine adds them in the same order on every run; and what a node that
+// rejects nothing accepts of a step's flow, all of it. Defined further down; declared here for
+// the route templates below.
+[[nodiscard]] flow::Flow& flow_towards(std::vector<Outgoing>& outgoing, std::size_t target,
+                                       std::size_t link);
+void sort_by_destination(std::vector<Outgoing>& outgoing);
+[[nodiscard]] Routed serve_everything(const flow::Flow& in);
+
 // One downstream call, resolved against the graph once at construction.
 struct Hop {
   std::string op;      // the op sent downstream
@@ -264,9 +293,48 @@ class HopBlocks {
   // blocks" (an empty view) without a static empty vector to point at.
   [[nodiscard]] std::span<const Block> blocks_of(std::string_view op) const;
 
-  // Adds rate × factor × the block's fraction of each hop of `op` to `outgoing`,
+  // Adds to `outgoing` what each hop of `op` is sent when `rate` requests a second arrive:
+  // rate × the share still alive when the hop is called × the block's fraction × factor,
   // asynchronous hops included (their flow goes on; only nobody waits for it).
-  void forward(std::string_view op, Rate rate, std::vector<Outgoing>& outgoing) const;
+  // "Still alive" (plan 2c refinement 11, a step after a failed step does not run): a request is
+  // answered only if every call it waits for is, so a request one call failed makes none of the
+  // calls after it. With d_i the delivered fraction of call i (`delivered_last_step`: what the
+  // target answered at the end of the LAST simulation step, of what it was sent of that op,
+  // everything it called in turn included) and S the survival, the share of the requests alive:
+  //   a sequential block       is sent S;  after it   S ← S × survival(block)
+  //   survival(block)          = (1 − f) + f × Π d_i over its waited hops
+  //                              (f the share that takes it: a miss block fails only its misses,
+  //                              h + (1 − h) × d for a cache's hit ratio h; 1 for a plain step)
+  //   inside a block           hop j is sent S × f × Π_{i<j} d_i: a miss takes its fetches in turn
+  //   the parallel group       every member is sent the S of the point where the group's first
+  //                            member sits (they start together and do not thin one another);
+  //                            from there on S ← S × Π survival(member): the group fails as a
+  //                            whole, a request lost by any member is lost
+  // An asynchronous hop (nobody waits for it) survives as 1: it fails no request. The model
+  // assumes the calls fail independently (as `delivered` does) and that a failed request costs
+  // its later targets nothing (no retry, no timeout spent waiting: phase 3). Its blind spot is
+  // the lag: d is last step's, so the first step sends every call the full flow and a change of
+  // loss reaches the calls after it one step late (the engine's forward pass runs before the
+  // backward pass that measures this step's d).
+  void forward(std::string_view op, Rate rate, std::vector<Outgoing>& outgoing,
+               FractionLookup auto&& delivered_last_step) const {
+    const auto blocks = blocks_of(op);
+    const double group_survival = parallel_group_survival(blocks, delivered_last_step);
+    double alive = 1.0;                // S: the share no earlier call has failed
+    std::optional<double> group_sent;  // the S every member of the parallel group is sent
+    for (const Block& block : blocks) {
+      if (block.mode == model::StepMode::sequential) {
+        forward_block(block, rate.per_second * alive, outgoing, delivered_last_step);
+        alive *= survival(block, delivered_last_step);
+        continue;
+      }
+      if (!group_sent) {  // the group's first member: the group starts here
+        group_sent = alive;
+        alive *= group_survival;
+      }
+      forward_block(block, rate.per_second * *group_sent, outgoing, delivered_last_step);
+    }
+  }
 
   // own + Σ sequential blocks + the slowest parallel block, where a block is the sum of its
   // waited legs (two link legs + the downstream response each), taken by a share `fraction`
@@ -306,17 +374,49 @@ class HopBlocks {
   [[nodiscard]] double delivered(std::string_view op, double own,
                                  FractionLookup auto&& downstream) const {
     double fraction = own;
-    for (const Block& block : blocks_of(op)) {
-      double every_hop_answers = 1.0;
-      for (const Hop& hop : block.hops) {
-        if (!hop.asynchronous) every_hop_answers *= downstream(hop.target, hop.op);
-      }
-      fraction *= (1.0 - block.fraction) + block.fraction * every_hop_answers;
-    }
+    for (const Block& block : blocks_of(op)) fraction *= survival(block, downstream);
     return fraction;
   }
 
  private:
+  // The share of the requests that reach `block` and get through it, (1 − f) + f × Π d over its
+  // waited hops (see `delivered`), an asynchronous hop counting 1. Written 1 − f × (1 − Π d), "all
+  // but the share that takes the block and fails in it", which is exactly 1 when nothing is lost
+  // (the sum form can round to 1 − 1e-16 and thin a lossless path by an ulp).
+  [[nodiscard]] static double survival(const Block& block, FractionLookup auto&& downstream) {
+    double every_hop_answers = 1.0;
+    for (const Hop& hop : block.hops) {
+      if (!hop.asynchronous) every_hop_answers *= downstream(hop.target, hop.op);
+    }
+    return 1.0 - block.fraction * (1.0 - every_hop_answers);
+  }
+
+  // Π survival over the parallel blocks of an op: the share its parallel group lets through
+  // (1 when it has none).
+  [[nodiscard]] static double parallel_group_survival(std::span<const Block> blocks,
+                                                      FractionLookup auto&& downstream) {
+    double through = 1.0;
+    for (const Block& block : blocks) {
+      if (block.mode == model::StepMode::parallel) through *= survival(block, downstream);
+    }
+    return through;
+  }
+
+  // Sends each hop of `block` its part of `requests_per_s`, the requests alive when the block
+  // starts: × the share f that takes the block, × the hop's factor, × the share the block's
+  // earlier hops delivered (a miss takes its fetches one after another).
+  static void forward_block(const Block& block, double requests_per_s,
+                            std::vector<Outgoing>& outgoing, FractionLookup auto&& downstream) {
+    double alive_in_block = 1.0;
+    for (const Hop& hop : block.hops) {
+      // rate × factor × fraction first, the survivals last: on a path with no losses every
+      // survival is exactly 1, so the product is rate × factor × fraction to the last bit.
+      flow_towards(outgoing, hop.target, hop.link)
+          .add(hop.op, Rate{requests_per_s * hop.factor * block.fraction * alive_in_block});
+      if (!hop.asynchronous) alive_in_block *= downstream(hop.target, hop.op);
+    }
+  }
+
   // The block's legs a request waits for, added up (two link legs plus the downstream's
   // response each, one after another); nothing when every hop is an asynchronous hand-off.
   [[nodiscard]] static std::optional<flow::LatencyEstimate> waited_legs(
@@ -372,6 +472,10 @@ export namespace simsys::behaviours {
 // phase 2a models no failures, so those never fire here. A service has no `then` steps either
 // (the loader rejects them for this type): everything it sends is per op. Hops that close a
 // call cycle are asynchronous hand-offs (see `response`).
+// A step after a failed step does not run (plan 2c refinement 11; ch. 8's shorten: a URL whose
+// id was not issued is never written): each step is sent only the requests every step before
+// it answered, and the parallel group fails as a whole (route, detail::HopBlocks::forward), with
+// the fractions of the previous simulation step.
 // Cache-aside (plan 2a refinement 7; the pattern ch. 1 draws, which the book calls
 // read-through: the application reads the cache and fetches a miss itself): a step
 // `{to: db, on: miss}` after a step to a cache is taken by the cache's miss fraction 1 − h of
@@ -386,11 +490,28 @@ class ServiceBehaviour {
   ServiceBehaviour(const graph::Graph& g, std::size_t self);
 
   // Serves every incoming op and forwards rate × factor along each of the op's steps,
-  // asynchronous hops included (over a feedback link, the flow arrives a step later).
-  // Returns a fresh Routed every call; if profiling shows the per-step allocations
-  // matter, the engine can pass a scratch `Routed&` to be cleared and refilled instead.
-  // `now` and `dt` are unused: a service holds no state between steps (see NodeBehaviour).
-  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+  // asynchronous hops included (over a feedback link, the flow arrives a step later), each
+  // step sent only the requests the steps before it delivered last step
+  // (detail::HopBlocks::forward; `delivered_last_step` defaults to NothingLost, every step the
+  // full flow). Returns a fresh Routed every call; if profiling shows the per-step allocations
+  // matter, the engine can pass a scratch `Routed&` to be cleared and refilled instead. `now` and
+  // `dt` are unused: a service holds no state between steps (see NodeBehaviour).
+  // An explicit template head rather than `FractionLookup auto&&`: a default argument needs a
+  // type to default to, and an abbreviated parameter has none.
+  template <FractionLookup Lookup = NothingLost>
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/,
+                             Lookup&& delivered_last_step = {}) const {
+    Routed routed;
+    for (const auto& [op, rate] : in.entries()) {
+      routed.served.add(op, rate);
+      // A zero rate forwards nothing: an empty branch must not exist, or the engine would
+      // weight its (possibly inf) latency by zero.
+      if (rate.per_second <= 0.0) continue;
+      hops_.forward(op, rate, routed.outgoing, delivered_last_step);
+    }
+    detail::sort_by_destination(routed.outgoing);
+    return routed;
+  }
 
   // Capacity units one request of `op` consumes: the spec's `cost` entry, 1 when the op
   // is not listed (every op of a phase-1 node costs one unit).
@@ -657,6 +778,12 @@ class LoadBalancerBehaviour {
   // rejects nothing, so `served`, the flow it accepted, is its whole input. `now` and `dt`
   // are unused: the balancer holds no state between steps (see NodeBehaviour).
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+  // The engine's call (see NodeBehaviour): a balancer's routes are a split, each request takes
+  // one, so no call follows another and last step's losses thin nothing.
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt,
+                             FractionLookup auto&& /*delivered_last_step*/) const {
+    return route(in, now, dt);
+  }
 
   // One capacity unit per request, whatever the op: forwarding costs the same for all.
   [[nodiscard]] double cost(std::string_view /*op*/) const { return 1.0; }
@@ -733,10 +860,11 @@ class LoadBalancerBehaviour {
 // or window state is the group's, not one per copy.
 // A limiter with no outgoing link but its backend is a terminal gate (notification-system's
 // per-user `user_limiter`): it answers every request it checks itself, so its response is
-// its own sojourn plus the counter check. Its CALLER keeps calling its own later steps at
-// the full rate, whatever the gate refused: a service's steps fire per request it serves,
-// and a fluid has no per-request outcome to branch on. The refused share shows in the
-// gate's reject rate and, through `delivered`, in the answered rate the client sees.
+// its own sojourn plus the counter check. Its CALLER sends its later steps only the requests
+// the gate let through: a refused request is answered with a 429 and goes no further, so the
+// gate's delivered fraction (its refusals included) thins the steps after it, one simulation
+// step late (detail::HopBlocks::forward). The refused share shows in the gate's reject rate
+// and, through `delivered`, in the answered rate the client sees.
 class RateLimiterBehaviour {
  public:
   RateLimiterBehaviour(const graph::Graph& g, std::size_t self);
@@ -749,6 +877,13 @@ class RateLimiterBehaviour {
   // std::invalid_argument for dt <= 0 (the bucket would divide by it; a programmer error,
   // as in fluid::FluidQueue::advance).
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt);
+  // The engine's call (see NodeBehaviour): the admitted flow and the counter checks both start
+  // with the request, so last step's losses thin nothing here (the gate's own refusals do,
+  // at its caller: the class comment).
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt,
+                             FractionLookup auto&& /*delivered_last_step*/) {
+    return route(in, now, dt);
+  }
 
   // One capacity unit per request, admitted or rejected: the check costs the same.
   [[nodiscard]] double cost(std::string_view /*op*/) const { return 1.0; }
@@ -910,9 +1045,23 @@ class CacheBehaviour {
 
   // Serves every incoming op (`served` is the whole input: a miss is answered too, after
   // the fetch), forwards rate × backend share of each op to the backend, and rate × factor ×
-  // the step's share along each `then` step (the class comment). `now` and `dt` are unused:
-  // with a fixed hit ratio the cache holds no state between steps.
-  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+  // the step's share along each `then` step (the class comment), each block sent only the
+  // requests the blocks before it delivered last step (detail::HopBlocks::forward: a `then` step
+  // after a read_through fetch is sent the hits and the misses the store answered). `now` and
+  // `dt` are unused: with a fixed hit ratio the cache holds no state between steps. The template
+  // head as in ServiceBehaviour::route.
+  template <FractionLookup Lookup = NothingLost>
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/,
+                             Lookup&& delivered_last_step = {}) const {
+    Routed routed;
+    for (const auto& [op, rate] : in.entries()) {
+      if (rate.per_second <= 0.0) continue;  // no empty branches (see ServiceBehaviour::route)
+      routed.served.add(op, rate);
+      hops_.forward(op, rate, routed.outgoing, delivered_last_step);
+    }
+    detail::sort_by_destination(routed.outgoing);
+    return routed;
+  }
 
   // Capacity units one request of `op` consumes: the spec's `cost` entry, else 1 (a hit and
   // a miss cost the cache the same lookup; the miss's fetch is charged to the backend).
@@ -998,6 +1147,11 @@ class SqlDbBehaviour {
   // Serves every incoming op and forwards nothing: a database answers queries itself. `now`
   // and `dt` are unused (a database holds no state between steps).
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+  // The engine's call (see NodeBehaviour): a leaf calls nobody, so there is nothing to thin.
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt,
+                             FractionLookup auto&& /*delivered_last_step*/) const {
+    return route(in, now, dt);
+  }
 
   // Capacity units one query of `op` uses (defaults::op_cost): the spec's `cost` entry, else 5
   // for a write (defaults::sql_write_cost), else 1; on the primary and on each replica that
@@ -1155,9 +1309,13 @@ class CdnBehaviour {
  public:
   CdnBehaviour(const graph::Graph& g, std::size_t self);
 
-  // Serves every read and forwards rate × (1 − h) of it to the origin (the class comment).
-  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const {
-    return cache_.route(in, now, dt);
+  // Serves every read and forwards rate × (1 − h) of it to the origin (the class comment). The
+  // origin fetch is a CDN's only call, so `delivered_last_step` thins nothing; it is passed on to
+  // the cache that does the routing.
+  template <FractionLookup Lookup = NothingLost>
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt,
+                             Lookup&& delivered_last_step = {}) const {
+    return cache_.route(in, now, dt, delivered_last_step);
   }
 
   // Capacity units one request of `op` consumes (graph::op_cost): its megabytes when the CDN is
@@ -1270,8 +1428,19 @@ class BlobStoreBehaviour {
 
   // Serves every incoming op and sends rate × factor of each `then` step's op for each write it
   // served (the class comment's events; a read sends nothing). `now` and `dt` are unused (a store
-  // holds no state between steps).
-  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+  // holds no state between steps). Every event is asynchronous, so none fails the request and
+  // `delivered_last_step` thins none of the events after it (detail::HopBlocks::forward); the
+  // template head as in ServiceBehaviour::route.
+  template <FractionLookup Lookup = NothingLost>
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/,
+                             Lookup&& delivered_last_step = {}) const {
+    Routed routed = detail::serve_everything(in);
+    for (const auto& [op, rate] : routed.served.entries()) {
+      events_.forward(op, rate, routed.outgoing, delivered_last_step);
+    }
+    detail::sort_by_destination(routed.outgoing);
+    return routed;
+  }
 
   // Capacity units one request of `op` uses (graph::op_cost): its megabytes, or 1 for a store
   // whose capacity the scenario states in requests (`capacity: 500/s`).
@@ -1335,6 +1504,12 @@ class MessageQueueBehaviour {
   // has no group: it is appended and read by nobody). `now` and `dt` are unused: the broker keeps
   // no state between steps (the backlog is the pools').
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+  // The engine's call (see NodeBehaviour): every consumer group gets a copy of each message,
+  // asynchronously, so no hand-off follows another and nothing is thinned.
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt,
+                             FractionLookup auto&& /*delivered_last_step*/) const {
+    return route(in, now, dt);
+  }
 
   // One capacity unit per message, whatever its op or size: an append.
   [[nodiscard]] double cost(std::string_view /*op*/) const { return 1.0; }
@@ -1396,9 +1571,22 @@ class WorkerPoolBehaviour {
 
   // Serves every job it is sent (`in` is what the engine's queue drained this step) and sends
   // rate × factor of each `then` step's op for all of them, whatever their ops (the class
-  // comment). `now` and `dt` are unused: the pool keeps no state between steps (its backlog is its
-  // queue's).
-  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+  // comment), each step only the jobs the steps before it delivered last step
+  // (detail::HopBlocks::forward: a completion message is not published for a rendition the store
+  // lost). `now` and `dt` are unused: the pool keeps no state between steps (its backlog is its
+  // queue's). The template head as in ServiceBehaviour::route.
+  template <FractionLookup Lookup = NothingLost>
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/,
+                             Lookup&& delivered_last_step = {}) const {
+    Routed routed = detail::serve_everything(in);
+    const Rate jobs = routed.served.total();
+    // No empty branches (see ServiceBehaviour::route): an idle pool sends nothing on.
+    if (jobs.per_second > 0.0) {
+      hand_offs_.forward(every_job, jobs, routed.outgoing, delivered_last_step);
+    }
+    detail::sort_by_destination(routed.outgoing);
+    return routed;
+  }
 
   // One capacity unit per job: a job takes one worker for `cost`, whatever its op.
   [[nodiscard]] double cost(std::string_view /*op*/) const { return 1.0; }
@@ -1451,6 +1639,11 @@ class ExternalSinkBehaviour {
   // engine's queue drained, failures already taken out; `now` and `dt` are unused (a sink holds no
   // state between steps).
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+  // The engine's call (see NodeBehaviour): a leaf calls nobody, so there is nothing to thin.
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt,
+                             FractionLookup auto&& /*delivered_last_step*/) const {
+    return route(in, now, dt);
+  }
 
   // The capacity units one request of `op` uses (graph::op_cost, as every behaviour and explain's
   // paper load price it): 1 for every op of a scenario file, whose sinks take no `cost` key.
@@ -1528,6 +1721,11 @@ class KvClusterBehaviour {
   // Serves every incoming op and forwards nothing: the replicas answer the coordinator, which
   // this node includes. `now` and `dt` are unused (the quorums come from observe()).
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+  // The engine's call (see NodeBehaviour): a leaf calls nobody, so there is nothing to thin.
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt,
+                             FractionLookup auto&& /*delivered_last_step*/) const {
+    return route(in, now, dt);
+  }
 
   // N capacity units per request (graph::op_cost): one per replica the request is sent to.
   [[nodiscard]] double cost(std::string_view op) const;
@@ -1700,17 +1898,6 @@ std::span<const detail::Block> detail::HopBlocks::blocks_of(std::string_view op)
   return found->second;
 }
 
-// Each hop forwards rate × factor × the share of requests that take its block.
-void detail::HopBlocks::forward(std::string_view op, Rate rate,
-                                std::vector<Outgoing>& outgoing) const {
-  for (const Block& block : blocks_of(op)) {
-    for (const Hop& hop : block.hops) {
-      flow_towards(outgoing, hop.target, hop.link)
-          .add(hop.op, Rate{rate.per_second * hop.factor * block.fraction});
-    }
-  }
-}
-
 // ---- ServiceBehaviour ----
 
 // Only `ops` steps: a service has no `then` (loader-enforced, see the class comment).
@@ -1753,20 +1940,6 @@ void ServiceBehaviour::add_hops(const graph::Graph& g, const std::string& op) {
             .link_leg_s = seconds(g.links()[link].one_way),
             .asynchronous = g.is_async_hop(self_, op, resolved.target, resolved.op)});
   }
-}
-
-// Each hop forwards rate × factor × the share of requests that take its block.
-Routed ServiceBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
-  Routed routed;
-  for (const auto& [op, rate] : in.entries()) {
-    routed.served.add(op, rate);
-    // A zero rate forwards nothing: an empty branch must not exist, or the engine would
-    // weight its (possibly inf) latency by zero.
-    if (rate.per_second <= 0.0) continue;
-    hops_.forward(op, rate, routed.outgoing);
-  }
-  detail::sort_by_destination(routed.outgoing);
-  return routed;
 }
 
 // ---- ClientBehaviour ----
@@ -2089,17 +2262,6 @@ void detail::add_then_blocks(const graph::Graph& g, std::size_t self, const std:
   }
 }
 
-Routed CacheBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
-  Routed routed;
-  for (const auto& [op, rate] : in.entries()) {
-    if (rate.per_second <= 0.0) continue;  // no empty branches (see ServiceBehaviour::route)
-    routed.served.add(op, rate);
-    hops_.forward(op, rate, routed.outgoing);
-  }
-  detail::sort_by_destination(routed.outgoing);
-  return routed;
-}
-
 // ---- SqlDbBehaviour ----
 
 // The scenario's write ops as written, else the SQL default (model::write_ops_of), and their
@@ -2235,13 +2397,6 @@ double BlobStoreBehaviour::cost(std::string_view op) const {
   return detail::cost_in(cost_by_op_, op);
 }
 
-Routed BlobStoreBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
-  Routed routed = detail::serve_everything(in);
-  for (const auto& [op, rate] : routed.served.entries()) events_.forward(op, rate, routed.outgoing);
-  detail::sort_by_destination(routed.outgoing);
-  return routed;
-}
-
 // ---- MessageQueueBehaviour ----
 
 // The queue's routes for each op that reaches it (graph::Graph::routes_for: one per consumer group
@@ -2289,16 +2444,6 @@ WorkerPoolBehaviour::WorkerPoolBehaviour(const graph::Graph& g, std::size_t self
         .lookup = std::nullopt,
         .hops = {detail::hop_with(g, self, *g.index_of(step.to), step.op, step.factor, false)}});
   }
-}
-
-// Every job drained, whatever its op, fires every step once: the steps see the total.
-Routed WorkerPoolBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
-  Routed routed = detail::serve_everything(in);
-  const Rate jobs = routed.served.total();
-  // No empty branches (see ServiceBehaviour::route): an idle pool sends nothing on.
-  if (jobs.per_second > 0.0) hand_offs_.forward(every_job, jobs, routed.outgoing);
-  detail::sort_by_destination(routed.outgoing);
-  return routed;
 }
 
 // ---- ExternalSinkBehaviour ----

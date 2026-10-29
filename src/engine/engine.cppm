@@ -1225,12 +1225,24 @@ void Simulation::require_scenario_step(SimTime dt) const {
 // the input on lap k, and its demand tends to the geometric series' sum, input / (1 - g).
 // The passes stop when nothing changes by more than settle_tolerance, which a loop of
 // gain g reaches after about log(tolerance) / log(g) passes (40 for g = 0.5, 260 for
-// g = 0.9). An acyclic graph takes two (the second confirms the first).
+// g = 0.9). An acyclic graph takes two (the second confirms the first) when nothing is lost;
+// with losses, a few more (below).
 //
 // Why it converges whenever a steady state exists: starting from no flow at all, demand
 // can only rise from pass to pass (every node forwards a non-decreasing function of what
 // it receives), and what a loop sends round is bounded by the drain of its nodes, which
 // capacity caps. A rising, bounded sequence converges, here to the smallest steady state.
+// One mechanism breaks the "only rise": a step after a failed step does not run (plan 2c
+// refinement 11, behaviours::detail::HopBlocks::forward), and each pass thins a later step by
+// the delivered fractions of the PREVIOUS pass, which the backward pass measures after the
+// forward one. So the first pass sends every step the full flow, and the passes after it carry
+// each loss one step further down an op's steps: a chain of k lossy steps settles in about k + 1
+// passes more. A loss that feeds back on itself (a node called twice by one op, [a, b, a], whose
+// later call is thinned by its own earlier loss, or two ops whose losses load each other's
+// nodes) is a fixed-point iteration of its own, d ← f(d); it converges when |f'| < 1 at the fixed
+// point, and passes that oscillate for ever end at the cap with `converged` false. The estimate
+// of every shipped scenario that runs converges (news-feed's, the one with losses before later
+// steps, included).
 //
 // A loop of gain >= 1 climbs until a node on it saturates; that state is steady (the node
 // drops the excess) and is reported. If saturation is further away than the cap allows
@@ -1327,8 +1339,9 @@ void Simulation::record_queue_lags(std::span<NodeSample> samples) const {
 //      mode never ticks, so estimate sees the curve without noise at the time it passes,
 //      t = 0); any other node (service, load balancer, rate limiter) runs its fluid queue
 //      on the inflow and routes the part it drained (backlog included, with the queue's op
-//      mix: see serve) for the step [now, now + dt); what the route rejects is recorded
-//      and goes nowhere (account_rejections);
+//      mix: see serve) for the step [now, now + dt), each call after another sent only what
+//      the calls before it delivered at the end of the previous step (delivered_last_step);
+//      what the route rejects is recorded and goes nowhere (account_rejections);
 //   3. send: accumulate the routed flow per link, pass it through the link's pipe if the link
 //      has a bandwidth (pass_through_pipe), and push it into each link's delay line.
 // Why this order is right: a forward link's target comes later in the order, so it pops
@@ -1340,19 +1353,27 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
   auto& samples = record.nodes;
   for (const std::size_t index : order_) {
     receive(index, mode);
+    // What each of this node's calls delivered at the end of the LAST evaluation: the backward
+    // pass that fills the response tables runs after this one, and a pipe on the way has not
+    // passed this step's flow yet (send, below), so every target reads one step stale. Before the
+    // first backward pass every table says 1 (Answer), so the first step thins nothing.
+    const auto delivered_last_step = [this, index](std::size_t target, std::string_view op) {
+      return hop_delivered(index, target, op);
+    };
     // A client's sample stays all zeros, green: a source has no queue.
-    const behaviours::Routed routed = std::visit(
-        Overloaded{[&](behaviours::ClientBehaviour& client) {
-                     if (mode == Mode::advance) client.tick(now, dt);
-                     return client.offer(now);
-                   },
-                   // A generic lambda: every other alternative is a queueing node.
-                   // Overload resolution prefers the non-template ClientBehaviour&
-                   // lambda for a client, so this one sees only servers.
-                   [&](auto& server) {
-                     return server.route(serve(index, dt, mode, samples[index]), now, dt);
-                   }},
-        nodes_[index].behaviour);
+    const behaviours::Routed routed =
+        std::visit(Overloaded{[&](behaviours::ClientBehaviour& client) {
+                                if (mode == Mode::advance) client.tick(now, dt);
+                                return client.offer(now);
+                              },
+                              // A generic lambda: every other alternative is a queueing node.
+                              // Overload resolution prefers the non-template ClientBehaviour&
+                              // lambda for a client, so this one sees only servers.
+                              [&](auto& server) {
+                                return server.route(serve(index, dt, mode, samples[index]), now, dt,
+                                                    delivered_last_step);
+                              }},
+                   nodes_[index].behaviour);
     account_rejections(index, routed, samples[index]);
     send(index, routed, dt, mode, record.links);
   }
