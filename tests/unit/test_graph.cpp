@@ -2680,3 +2680,155 @@ TEST_CASE("a parallel then step on a blob store is refused", "[graph]") {
           "node 'store': a blob store's then steps are event notifications nobody waits for "
           "(mode orders the calls a request waits for)");
 }
+
+// ---- A link's bandwidth is a pipe (plan 2c refinement 3, Task 5) ----
+//
+// A link that states `bandwidth` becomes a pipe the engine queues megabytes through: one server
+// (c = 1) whose unit is 1 MB, served in 1 MB / bandwidth, deterministic, with a waiting room of
+// 1000 MB (the generic queue_limit default read in megabytes). The graph resolves it once, at
+// build, as it resolves a byte-sized node's capacity.
+//
+// The accessor these tests propose: `ResolvedLink::pipe`, a `std::optional<fluid::Capacity>`: the
+// pipe's capacity in megabytes (service_rate in MB/s, service_time_s the time of ONE megabyte,
+// the same convention as a byte-sized node's ResolvedNode::capacity, so a request of 10 MB does
+// not change it; the engine sets each step's object moments on the queue), empty for a link
+// without a bandwidth.
+//
+// And a pipe needs the size of every op it carries (it prices megabytes, not requests), as a
+// byte-sized node does: an op that reaches the link unsized is an error at build.
+
+namespace {
+// u -> lb -> svc -> store (see sized_chain), with `bandwidth` on the link into `store`
+// (links()[2]); `store` counts requests, so only the pipe minds a missing size.
+Scenario pipe_chain(std::optional<simsys::Bytes> size, Step step, simsys::ByteRate bandwidth) {
+  auto s = sized_chain(size, std::move(step), service("store"));
+  s.links[2].bandwidth = bandwidth;
+  return s;
+}
+
+constexpr simsys::ByteRate one_gbit_per_s{125e6};  // 1 Gbit/s = 1e9 / 8 bytes per second
+}  // namespace
+
+// 1 Gbit/s = 125e6 B/s = 125 units of 1 MB per second; one unit takes 1 / 125 s = 8 ms; c = rate
+// x time = 125 x 8 ms = 1 (the invariant fluid::Capacity states, with c = 1, as a pipe is a
+// single server); the room is the generic 1000 units read as megabytes; each object's own service
+// is deterministic (SCV 0: a fixed number of megabytes at a fixed rate), and arrivals are Poisson
+// until the scenario says otherwise (burstiness 1).
+TEST_CASE("a link with a bandwidth resolves a one-server pipe in megabytes", "[graph]") {
+  const auto built = Graph::build(
+      pipe_chain(simsys::Bytes{1e6}, Step{.to = "store", .op = "get"}, one_gbit_per_s));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE(built->links().size() == 3);
+  REQUIRE(built->links()[2].pipe.has_value());
+  const auto& pipe = *built->links()[2].pipe;
+  REQUIRE_THAT(pipe.service_rate.per_second, WithinRel(125.0, 1e-12));
+  REQUIRE_THAT(pipe.service_time_s, WithinRel(0.008, 1e-12));
+  REQUIRE(pipe.concurrency == 1);
+  REQUIRE_THAT(pipe.queue_limit, WithinRel(1000.0, 1e-12));
+  REQUIRE(pipe.service_variability == 0.0);
+  REQUIRE(pipe.burstiness == 1.0);
+}
+
+TEST_CASE("the pipe's numbers follow the bandwidth in bits or bytes, not the request size",
+          "[graph]") {
+  SECTION("40 Gbit/s is 5 GB/s: 5000 MB per second, 0.2 ms per megabyte") {
+    const auto built = Graph::build(
+        pipe_chain(simsys::Bytes{1e6}, Step{.to = "store", .op = "get"}, simsys::ByteRate{5e9}));
+    REQUIRE(built.has_value());
+    const auto& pipe = *built->links()[2].pipe;
+    REQUIRE_THAT(pipe.service_rate.per_second, WithinRel(5000.0, 1e-12));
+    REQUIRE_THAT(pipe.service_time_s, WithinRel(0.0002, 1e-12));
+    REQUIRE(pipe.concurrency == 1);
+  }
+  SECTION("1 GB/s stated in bytes: 1000 MB per second, 1 ms per megabyte") {
+    const auto built = Graph::build(
+        pipe_chain(simsys::Bytes{1e6}, Step{.to = "store", .op = "get"}, simsys::ByteRate{1e9}));
+    REQUIRE(built.has_value());
+    const auto& pipe = *built->links()[2].pipe;
+    REQUIRE_THAT(pipe.service_rate.per_second, WithinRel(1000.0, 1e-12));
+    REQUIRE_THAT(pipe.service_time_s, WithinRel(0.001, 1e-12));
+  }
+  SECTION("a 10 MB request leaves the per-megabyte numbers alone") {
+    const auto built = Graph::build(
+        pipe_chain(simsys::Bytes{10e6}, Step{.to = "store", .op = "get"}, one_gbit_per_s));
+    REQUIRE(built.has_value());
+    const auto& pipe = *built->links()[2].pipe;
+    REQUIRE_THAT(pipe.service_rate.per_second, WithinRel(125.0, 1e-12));
+    REQUIRE_THAT(pipe.service_time_s, WithinRel(0.008, 1e-12));
+    REQUIRE_THAT(bytes_required(*built, "store", "get"), WithinRel(10e6, 1e-12));
+  }
+}
+
+TEST_CASE("only the link that states a bandwidth has a pipe", "[graph]") {
+  const auto built = Graph::build(
+      pipe_chain(simsys::Bytes{1e6}, Step{.to = "store", .op = "get"}, one_gbit_per_s));
+  REQUIRE(built.has_value());
+  REQUIRE_FALSE(built->links()[0].pipe.has_value());  // u -> lb
+  REQUIRE_FALSE(built->links()[1].pipe.has_value());  // lb -> svc
+  REQUIRE(built->links()[2].pipe.has_value());        // svc -> store
+  // A scenario with no bandwidth anywhere has no pipe, sized requests or not.
+  const auto plain = Graph::build(
+      sized_chain(simsys::Bytes{1e6}, Step{.to = "store", .op = "get"}, service("store")));
+  REQUIRE(plain.has_value());
+  for (const auto& link : plain->links()) REQUIRE_FALSE(link.pipe.has_value());
+}
+
+// The message names the link, the op, the node that sent it and what to add, as a byte-sized
+// node's does.
+TEST_CASE("an unsized op on a bandwidth link is an error that says where to add the size",
+          "[graph]") {
+  const std::string advice = "has no size: add size: to the step or sizes: to the client";
+  SECTION("sent by a service's renaming step") {
+    const auto built = Graph::build(
+        pipe_chain(simsys::Bytes{1e6}, Step{.to = "store", .op = "fetch"}, one_gbit_per_s));
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message ==
+            "link 'svc'->'store' has a bandwidth, but op 'fetch' from 'svc' " + advice);
+  }
+  SECTION("sent by a client that states no size") {
+    auto s = sized_chain(std::nullopt, Step{.to = "store", .op = "get"}, service("store"));
+    s.links[0].bandwidth = one_gbit_per_s;  // u -> lb
+    const auto built = Graph::build(s);
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message ==
+            "link 'u'->'lb' has a bandwidth, but op 'get' from 'u' " + advice);
+  }
+}
+
+TEST_CASE("a step's size makes a renamed op acceptable on a bandwidth link", "[graph]") {
+  const auto built = Graph::build(
+      pipe_chain(simsys::Bytes{1e6}, Step{.to = "store", .op = "fetch", .size = simsys::Bytes{2e6}},
+                 one_gbit_per_s));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE(built->links()[2].pipe.has_value());
+  REQUIRE_THAT(bytes_required(*built, "store", "fetch"), WithinRel(2e6, 1e-12));
+}
+
+// A pipe prices the ops its link CARRIES: a client's `put`s go over the bandwidth link (its ops
+// filter) and its unsized `get`s over another, so nothing needs the `get` a size; give the
+// bandwidth link the `get` as well and it does.
+TEST_CASE("only the ops a bandwidth link carries need a size", "[graph]") {
+  Scenario s{.name = "split", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"get", 0.5}, {"put", 0.5}}), service("w"), service("r")};
+  s.nodes[0].workload->sizes = {{"put", simsys::Bytes{1e6}}};  // `get` has no size
+  s.links = {LinkSpec{.from = "u", .to = "w", .ops = {"put"}, .bandwidth = one_gbit_per_s},
+             LinkSpec{.from = "u", .to = "r", .ops = {"get"}}};
+  SECTION("the unsized op takes the link without a bandwidth") {
+    const auto built = Graph::build(s);
+    INFO((built ? "" : built.error().message));
+    REQUIRE(built.has_value());
+    REQUIRE(built->links()[0].pipe.has_value());
+    REQUIRE_FALSE(built->links()[1].pipe.has_value());
+  }
+  SECTION("the same op on the bandwidth link is refused") {
+    s.links[0].ops = {"put", "get"};
+    s.links[1].ops = {"get"};
+    const auto built = Graph::build(s);
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message ==
+            "link 'u'->'w' has a bandwidth, but op 'get' from 'u' has no size: add size: to the "
+            "step or sizes: to the client");
+  }
+}
