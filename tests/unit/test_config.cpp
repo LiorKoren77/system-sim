@@ -3783,6 +3783,15 @@ TEST_CASE("a worker pool needs workers and a cost") {
   }
 }
 
+// A pool's jobs come from the queue it drains and from nowhere else (review of plan 2c Task 6,
+// I-1): without `consumes` it would be a server any node could call, so the key is required.
+TEST_CASE("a worker pool needs the queue it consumes") {
+  require_rejected("simsys_pool_no_consumes.yaml",
+                   scenario_with("  q: {type: message_queue}\n"
+                                 "  w: {type: worker_pool, workers: 4, cost: 5ms}\n"),
+                   "node 'w': worker_pool needs consumes");
+}
+
 TEST_CASE("workers, cost, retention and partitions must be positive, and workers bounded") {
   SECTION("workers of zero") {
     require_rejected("simsys_pool_workers_zero.yaml", queue_and_pool("", "workers: 0, cost: 5ms"),

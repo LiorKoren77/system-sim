@@ -12,6 +12,8 @@
 #include <string_view>
 #include <vector>
 
+#include "../support/explain_lines.hpp"
+
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
@@ -35,6 +37,8 @@ using simsys::model::Scenario;
 using simsys::model::Step;
 using simsys::model::Workload;
 using simsys::report::Summary;
+using simsys::test_support::check_line;
+using simsys::test_support::node_line;
 
 namespace {
 // queue_limit is set only when given, so explain's provenance test sees "(default)".
@@ -711,14 +715,6 @@ Scenario che_cached() {
              LinkSpec{.from = "web", .to = "url_db"}};
   return s;
 }
-// The line of explain's checks block (after "checks (") that starts, after its indent, with
-// `id` and a space; empty when there is none.
-std::string check_line(const std::string& text, const std::string& id) {
-  const auto at = text.find("\n  " + id + " ", text.find("checks ("));
-  if (at == std::string::npos) return {};
-  const auto end = text.find('\n', at + 1);
-  return text.substr(at + 1, end - at - 1);
-}
 }  // namespace
 
 // A cache's `then` steps are what happens after it answers: `on: miss` ones carry the share it
@@ -1389,13 +1385,6 @@ Scenario id_reported(simsys::model::IdAlgorithm algorithm, int replicas = 1,
   return s;
 }
 
-// The node line of explain's nodes block: the line that starts, after its indent, with `id`
-// and a space.
-std::string node_line(const std::string& text, const std::string& id) {
-  const auto at = text.find("\n  " + id + " ", text.find("nodes:"));
-  if (at == std::string::npos) return {};
-  return text.substr(at + 1, text.find('\n', at + 1) - at - 1);
-}
 }  // namespace
 
 TEST_CASE("explain says what a snowflake generator stands for", "[report]") {
@@ -1720,11 +1709,61 @@ TEST_CASE("explain checks a bandwidth link's peak offered MB per second against 
   }
 }
 
+// Two marks on a pipe's check that the node lines carry too (review of Task 6, M-3):
+//  - behind a che CDN with no `keys` size (no hit ratio to resolve, so every read counts as a miss
+//    on paper) the pipe to its origin is checked against its worst case, and says so: 10 streams/s
+//    of 50 MB, all of them missing, are 500 MB/s of 5k MB/s, 10 %, an upper bound;
+//  - a pipe whose sender is a type the paper load does not follow (a notification fan-out) and
+//    that it therefore sends nothing on paper prints the mark without a percentage, as a node
+//    line does: no "0%, green" verdict on a load that is missing, not zero.
+TEST_CASE("a pipe behind a cdn of unknown hit ratio is checked as an upper bound", "[report]") {
+  Scenario s{.name = "pipe-upper", .version = 1, .duration = 1min};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{10}},
+                                           .op_shares = {{"stream", 1.0}},
+                                           .sizes = {{"stream", simsys::Bytes{50e6}}}}},
+             NodeSpec{.id = "cdn",
+                      .type = NodeType::cdn,
+                      .hit_ratio = simsys::model::HitRatio{.fixed = std::nullopt, .che = true},
+                      .origin = "store"},
+             NodeSpec{.id = "store", .type = NodeType::blob_store}};
+  s.links = {LinkSpec{.from = "u", .to = "cdn"},
+             LinkSpec{.from = "cdn", .to = "store", .bandwidth = simsys::ByteRate{5e9}}};
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  REQUIRE(check_line(text, "cdn->store")
+              .contains("peak offered 500 MB/s vs 5k MB/s  (10%, green) (hit ratio unknown: "
+                        "counted as 0 — an upper bound)"));
+}
+
+TEST_CASE("a pipe that a blocking type sends nothing on paper has no percentage", "[report]") {
+  Scenario s{.name = "pipe-unloaded", .version = 1, .duration = 1min};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{10}}, .op_shares = {{"fire", 1.0}}}},
+      NodeSpec{.id = "fan",
+               .type = NodeType::notification_fanout,
+               .then = {Step{.to = "svc", .op = "push", .size = simsys::Bytes{1e6}}}},
+      NodeSpec{.id = "svc", .type = NodeType::service}};
+  s.links = {LinkSpec{.from = "u", .to = "fan"},
+             LinkSpec{.from = "fan", .to = "svc", .bandwidth = simsys::ByteRate{125e6}}};
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  const auto line = check_line(text, "fan->svc");
+  REQUIRE(line.contains(
+      "peak offered 0 MB/s vs 125 MB/s  (load not propagated: notification_fanout is not "
+      "modelled yet)"));
+  REQUIRE_FALSE(line.contains("%"));
+}
+
 // ---- Message queues and worker pools in explain (plan 2c refinements 4-5, Task 6) ----
 //
 // explain says what the two types stand for, in the words of the plan:
-//  - a worker pool: `workers=12 cost=10ms (capacity 1.2k/s: workers / cost)`: the capacity is not
-//    a number the scenario states but 12 workers / 10 ms = 1200 jobs/s, and the line says so;
+//  - a worker pool: `capacity=1.2k/s (workers / cost)` and `consumes=q  workers=12 cost=10ms`:
+//    the capacity is not a number the scenario states but 12 workers / 10 ms = 1200 jobs/s, and
+//    the line says so, once (review of Task 6, M-6: it used to repeat it after `cost=`);
 //  - a message queue: `retention=7d (default: Kafka's 168 h)` when the scenario gives none (the
 //    book gives no figure; 168 h is Kafka's `log.retention.hours`), the stated value without the
 //    tag otherwise, and `partitions=8 (not modelled)`: accepted and printed, not simulated.
@@ -1753,10 +1792,26 @@ Scenario queue_and_pool_reported(std::optional<simsys::SimTime> retention,
 }
 }  // namespace
 
-TEST_CASE("explain says a worker pool's capacity is workers over cost", "[report]") {
+TEST_CASE("explain says a worker pool's capacity is workers over cost, once", "[report]") {
   const auto text = explain_of(queue_and_pool_reported(std::nullopt, 8));
   CAPTURE(text);
-  REQUIRE(node_line(text, "w").contains("workers=12 cost=10ms (capacity 1.2k/s: workers / cost)"));
+  const auto line = node_line(text, "w");
+  REQUIRE(line.contains("capacity=1.2k/s (workers / cost)"));
+  REQUIRE(line.ends_with("consumes=q  workers=12 cost=10ms"));
+  REQUIRE(line.find("1.2k/s") == line.rfind("1.2k/s"));  // the capacity is stated once
+}
+
+// A pool's room is retention x its rate (graph::Graph::connect_consumer): Kafka's 7 days of
+// 1.2k jobs/s are 604,800 s x 1200/s = 725,760,000 messages, printed with an SI prefix to four
+// digits, 725.8M, rather than six digits' "7.2576e+08" (review of Task 6, M-1); a room under a
+// million keeps its digits (10 s x 1200/s = 12000).
+TEST_CASE("explain prints a pool's room of millions with an SI prefix", "[report]") {
+  const auto days = explain_of(queue_and_pool_reported(std::nullopt, std::nullopt));
+  CAPTURE(days);
+  REQUIRE(node_line(days, "w").contains("queue_limit=725.8M (retention × capacity)"));
+  const auto seconds = explain_of(queue_and_pool_reported(10s, std::nullopt));
+  CAPTURE(seconds);
+  REQUIRE(node_line(seconds, "w").contains("queue_limit=12000 (retention × capacity)"));
 }
 
 TEST_CASE(
