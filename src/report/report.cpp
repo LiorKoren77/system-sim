@@ -1211,16 +1211,16 @@ constexpr std::array bit_prefixes{BitPrefix{1e9, "G"}, BitPrefix{1e6, "M"}, BitP
 
 // "1Gbit/s (125MB/s)": a bandwidth as a network is rated, in bits, then the bytes the pipe
 // counts. Derived from the bytes (the model keeps no record of how the scenario wrote it): the bit
-// form is printed only when bytes × 8 is a whole number of its largest prefix, k, M or G (125 MB/s
-// is 1 Gbit/s, 5 GB/s is 40 Gbit/s); otherwise ("187.5MB/s", 1.5 Gbit/s) the bytes alone, rather
-// than a bit rate with decimals nobody writes.
+// form is printed with the largest prefix, G, M or k, of which bytes × 8 is a whole number:
+// 125 MB/s is 1 Gbit/s, 5 GB/s is 40 Gbit/s, and 187.5 MB/s (written 1.5Gbit/s) is 1500Mbit/s.
+// When no prefix gives one (1001 B/s) the bytes alone, rather than a bit rate with decimals
+// nobody writes.
 [[nodiscard]] std::string fmt_bandwidth(ByteRate bandwidth) {
   const std::string bytes = format_byte_rate(bandwidth);
   const double bits = bandwidth.bytes_per_second * 8.0;
   for (const auto& prefix : bit_prefixes) {
-    if (bits < prefix.size) continue;
     const double count = bits / prefix.size;
-    if (count != std::round(count)) return bytes;
+    if (count < 1.0 || count != std::round(count)) continue;
     return to_text(count, std::chars_format::fixed, 0) + std::string{prefix.name} + "bit/s (" +
            bytes + ")";
   }
@@ -1246,6 +1246,9 @@ constexpr std::array bit_prefixes{BitPrefix{1e9, "G"}, BitPrefix{1e6, "M"}, BitP
 // Graph::build resolves the scenario's links in order, one each, so link i is spec i.
 [[nodiscard]] std::string explain_links(const graph::Graph& g) {
   std::vector<Row> rows;
+  // C++23 std::views::zip: walks two ranges in lockstep and yields pairs of references (here
+  // each resolved link and the scenario link it came from), replacing an index loop over both
+  // (and it stops at the shorter one).
   for (const auto [link, spec] : std::views::zip(g.links(), g.scenario().links)) {
     rows.push_back({{link_name(g, link)},
                     {std::string{model::to_string(link.dir)}},
@@ -1551,8 +1554,6 @@ struct PaperLoad {
 
 // No total moved by more than the tolerance (NaN never counts as unchanged).
 [[nodiscard]] bool settled(std::span<const double> before, std::span<const double> after) {
-  // C++23 std::views::zip: walks two ranges in lockstep and yields pairs of references,
-  // replacing an index loop over both spans (and stops at the shorter one).
   return std::ranges::all_of(std::views::zip(before, after), [](const auto& pair) {
     const auto [b, a] = pair;
     return a == b || std::abs(a - b) <= paper_tolerance * std::abs(a);
@@ -1603,6 +1604,10 @@ struct PaperLoad {
 // so, or a student would read a red database as a flaw of the design. A CDN the scenario gave no
 // hit ratio is not one of them: it misses every read, which is what the scenario says and what
 // runs, so the load behind it is the load (its own line says h = 0, cdn_summary).
+
+// What a check line resting on such a cache's misses ends with.
+constexpr std::string_view unknown_hit_ratio_note =
+    " (hit ratio unknown: counted as 0 — an upper bound)";
 
 // Does `node` miss at a rate nobody knows yet?
 [[nodiscard]] bool unknown_misses(const graph::Graph& g, std::size_t node) {
@@ -1939,8 +1944,7 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
                                      const std::vector<bool>& upper_bound,
                                      std::span<const model::NodeType> blocked) {
   const auto& node = g.nodes()[i];
-  const std::string note =
-      upper_bound[i] ? " (hit ratio unknown: counted as 0 — an upper bound)" : "";
+  const std::string note{upper_bound[i] ? unknown_hit_ratio_note : std::string_view{}};
   if (!blocked.empty()) return partial_check(node, load.totals[i], load.by_op[i], blocked) + note;
   // A capacity with no verdict (unchecked_capacity) gets none per copy either.
   const auto loads = unchecked_capacity(node) ? std::nullopt : database_loads(node, load.by_op[i]);
@@ -1999,11 +2003,15 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 // A bandwidth link's check (plan 2c Task 5): the megabytes its sender puts on it at the paper load
 // against the pipe's bandwidth in MB/s, "peak offered 100 MB/s vs 125 MB/s  (80%, yellow)", with
 // the generic zones of a pipe (defaults::pipe_capacity). When the sender's own load is incomplete
-// (blocked_on_the_way, or the sender is a type the paper load does not follow) the percentage is a
-// lower bound, marked as a node's is (partial_check).
+// (blocked_on_the_way, or the sender is a type the paper load does not follow) it is marked as a
+// node's is (partial_check): no percentage when nothing reached the link, a lower bound otherwise.
+// When the sender's load rests on an unknown hit ratio (it is behind such a cache, or it is one,
+// whose misses are what it sends on: counts_unknown_hit_ratio, unknown_misses) the line carries
+// the node lines' upper-bound note: every read counted as a miss.
 [[nodiscard]] std::string link_check(const graph::Graph& g, const ForwardRoutes& table,
                                      const PaperLoad& load, std::size_t link,
-                                     std::span<const model::NodeType> blocked_at_sender) {
+                                     std::span<const model::NodeType> blocked_at_sender,
+                                     bool upper_bound) {
   const auto& resolved = g.links()[link];
   const auto sender = graph::demand_sender(resolved);
   const bool from_client = g.nodes()[sender].spec.type == model::NodeType::client;
@@ -2019,9 +2027,11 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   if (unfollowed_until(g.nodes()[sender].spec.type)) {
     add_missing(blocked, std::array{g.nodes()[sender].spec.type});
   }
-  if (blocked.empty()) return head + "(" + percent(rho) + ", " + zone + ")";
+  const std::string note{upper_bound ? unknown_hit_ratio_note : std::string_view{}};
+  if (blocked.empty()) return head + "(" + percent(rho) + ", " + zone + ")" + note;
+  if (!(offered > 0.0)) return head + "(" + unpropagated_mark(blocked) + note;
   const std::string red = zone == "red" ? ", red" : "";
-  return head + "(≥" + percent(rho) + red + "; " + unpropagated_mark(blocked);
+  return head + "(≥" + percent(rho) + red + "; " + unpropagated_mark(blocked) + note;
 }
 
 [[nodiscard]] std::string explain_checks(const graph::Graph& g) {
@@ -2038,8 +2048,10 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   for (std::size_t link = 0; link < g.links().size(); ++link) {
     const auto& resolved = g.links()[link];
     if (!resolved.pipe) continue;
+    const auto sender = graph::demand_sender(resolved);
+    const bool upper = upper_bound[sender] || unknown_misses(g, sender);
     rows.push_back({{graph::link_label(g.nodes(), resolved)},
-                    {link_check(g, table, load, link, blocked[graph::demand_sender(resolved)])}});
+                    {link_check(g, table, load, link, blocked[sender], upper)}});
   }
   const std::string note = load.converged ? "" : "  (no steady state: a loop of gain >= 1)\n";
   const std::string header = "checks (peak offered load over the first " +
@@ -2464,7 +2476,8 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
 //   without an infinity;
 // - after the nodes, a row per link with a bandwidth (plan 2c Task 5), `from->to` in the node
 //   column, in MEGABYTES (engine::LinkSample): the pipe is a queue, so the same identity holds on
-//   its rows, `rejected_per_s` is 0 and `latency_ms` is a request's wait plus its serialisation.
+//   its rows, `rejected_per_s` is 0 and `latency_ms` is a request's wait plus its answer time on
+//   the wire (a write's whole serialisation, any other op's first megabyte).
 void SeriesWriter::observe(const engine::StepRecord& record) {
   const auto t_s = shortest(seconds(record.t));
   for (std::size_t i = 0; i < ids_.size() && i < record.nodes.size(); ++i) {

@@ -2840,6 +2840,32 @@ TEST_CASE("only the ops a bandwidth link carries need a size", "[graph]") {
   }
 }
 
+// Two more requests a pipe cannot price in megabytes (review of plan 2c Task 5, M-8): one of
+// 0 bytes would cost nothing (the engine divides by its megabytes), and a rate limiter's `counter`
+// is the limiter's own request, which no `size:` can describe, so the link to its backend cannot
+// be a pipe at all; each refusal says why.
+TEST_CASE("a pipe refuses a 0-byte request and a limiter's counter, each with its reason",
+          "[graph]") {
+  SECTION("a request of 0 bytes") {
+    const auto built = Graph::build(
+        pipe_chain(simsys::Bytes{0}, Step{.to = "store", .op = "get"}, one_gbit_per_s));
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message ==
+            "link 'svc'->'store' has a bandwidth, but op 'get' from 'u' has size 0B: a request's "
+            "size must be positive");
+  }
+  SECTION("a limiter's counter over its backend link") {
+    auto s = limiter_counting_in(service("store"));
+    s.links.back().bandwidth = one_gbit_per_s;  // limiter -> store
+    const auto built = Graph::build(s);
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message ==
+            "link 'limiter'->'store' has a bandwidth, but 'limiter' sends its counter over it: a "
+            "limiter's counter carries no size, so its backend link cannot have a bandwidth; "
+            "remove it");
+  }
+}
+
 // ---- Message queues and worker pools (plan 2c refinements 4-6, Task 6) ----
 //
 // A message queue is a broker (Kafka, ch. 14's transcode_q): a publisher's request is answered when
