@@ -346,6 +346,10 @@ scenarios' READMEs against the binary), a fix round, push, CI; then the phase 3 
 partitions, ws_gateway, notification_fanout, frontier, request/reply over queues, the backlog below) and
 its execution with the same loop.
 
+Narrowed on 2026-10-29: "when you are done with phase 2 do another comprehensive code review, push
+everything and stop". So this session ends after the whole-of-phase-2 review and its push; the phase 3
+plan waits for a new instruction.
+
 ## Phase 3 backlog (left out of 2c)
 
 - **Types:** `ws_gateway` (connections as a level, session fan-out: chat-system, google-drive), `service_discovery` (lookup latency, failover: chat-system), `notification_fanout` (channels, dedup, retries with a dead-letter queue: notification-system), `frontier` and an external sink's `politeness` (per-host state: web-crawler).
