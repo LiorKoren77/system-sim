@@ -106,7 +106,8 @@ constexpr std::array<OwnKeys, model::node_type_names.size()> own_keys_by_type{{
     {model::NodeType::service, "ops cost"},
     {model::NodeType::cache, "eviction strategy keys hit_ratio backend ttl then cost write_ops"},
     {model::NodeType::sql_db, "replication_lag shards pool write_ops cost"},
-    {model::NodeType::kv_cluster, "nodes vnodes replication write_quorum read_quorum mode"},
+    {model::NodeType::kv_cluster,
+     "nodes vnodes replication write_quorum read_quorum mode write_ops"},
     {model::NodeType::message_queue, "partitions retention"},
     {model::NodeType::worker_pool, "consumes workers cost then"},
     {model::NodeType::blob_store, "then write_ops"},
@@ -2745,7 +2746,8 @@ CheckResult read_kv_cluster_keys(const Site& site, const YAML::Node& body, model
   return refused_kv_replicas(this_node, body)
       .and_then([&] { return read_kv_counts(this_node, body, node); })
       .and_then([&] { return check_kv_shape(this_node, body, node); })
-      .and_then([&] { return read_kv_mode(this_node, body, node); });
+      .and_then([&] { return read_kv_mode(this_node, body, node); })
+      .and_then([&] { return read_write_ops(this_node, body, node); });
 }
 
 // ---- Node bodies: the second pass -----------------------------------------------------

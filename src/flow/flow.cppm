@@ -51,6 +51,9 @@ export namespace simsys::flow {
 // every comparison with NaN is false, so it returns its FIRST argument when the second is
 // NaN: a NaN branch after a finite one would vanish from the maximum, and the result would
 // depend on branch order. A NaN latency means an upstream bug, so it must stay visible.
+// Exported for the running maxima of the engine and the report (a queue's lag over its groups,
+// the worst lag over steps and queues): folded with this, a NaN met at any element stays to the
+// end, where "the NaN first" in std::max only survives until the next finite element.
 [[nodiscard]] double nan_propagating_max(double a, double b) {
   if (std::isnan(a) || std::isnan(b)) return std::numeric_limits<double>::quiet_NaN();
   return std::max(a, b);

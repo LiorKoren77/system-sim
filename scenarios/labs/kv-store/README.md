@@ -20,23 +20,33 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   of its key (ch. 6, "quorum consensus"), so the 30k requests/s are **90k replica-requests/s**
   for the machines. `explain`:
   `store  peak offered 90k/s (30k/s × N 3) vs 160k/s (16 nodes)  (hottest 60.8%, green)`.
-- **The ring's hot machine.** Each machine holds the keys of the arcs before it on the ring, and
-  with 150 virtual nodes the hottest carries 1 + 1/sqrt(150) = **1.0816** times the average:
-  5.625k/s on average (56.25 %), **6.084k/s (60.8 %)** on the hottest. The simulator runs that
-  machine as its own queue, so the `utilization` SLO reads it: `PASS utilization store 0.6084`.
-- **Quorum latency.** A read is answered when the R-th fastest replica replies, a write when the
-  W-th does. With each replica's sojourn exponential of mean m, the k-th fastest of 3 takes
-  1/3, **5/6** or 11/6 of m for k = 1, 2, 3 (Rényi's representation, the schema's
-  [`kv_cluster`](../../../docs/scenario-schema.md#kv_cluster) section). Here m is a machine's
-  0.3 ms plus its Erlang C wait (3 servers per machine at rho 0.608 on the hottest, 0.559 on the
-  others, weighted by the requests each serves): m = 0.371 ms, so W = R = 2 answer in
-  5/6 × 0.371 = 0.309 ms. With the four 0.25 ms link legs and the coordinator's 0.232 ms a request
-  takes **1.54 ms**, p99 **2.41 ms** (`run`; `get` and `put` alike since W = R).
+- **The ring's hot machine.** Each machine holds the keys of the arcs before its virtual nodes,
+  three times over (it is one of the three successive replicas of each), so its share of the
+  load is a sum of 3 × 150 arcs and spreads about 1/sqrt(450) around the average. The hottest of
+  16 such shares sits z_16 = 1.77 spreads above it (the expected maximum of 16 normals), so it
+  carries 1 + 1.77/sqrt(450) = **1.0834** times the average: 5.625k/s on average (56.25 %),
+  **6.094k/s (60.9 %)** on the hottest. The simulator runs that machine as its own queue, so the
+  `utilization` SLO reads it: `PASS utilization store 0.6094`. (A heuristic checked against
+  Monte Carlo rings: [numerics, section 8](../../../docs/study/numerics.md).)
+- **Quorum latency over the real replica set.** A read is answered when the R-th fastest of its
+  key's three replicas replies, a write when the W-th does. The three are three DIFFERENT
+  machines, so at most one is the hot one: it is in a request's set with probability
+  p_hot = 3k/16 = 0.203 (it is sent k/16 of the replica-requests, one per such request), and
+  otherwise the request meets three cool machines. Each machine's reply time is a lognormal of
+  its own queue's moments (0.3 ms plus the Erlang C wait of 3 servers: 0.394 ms on the hot
+  machine at rho 0.609, 0.369 ms on a cool one at 0.559), and the R-th fastest is integrated
+  from the survival function ([numerics, section 7](../../../docs/study/numerics.md)): W = R = 2
+  answer in **0.313 ms**. With the four 0.25 ms link legs and the coordinator's 0.232 ms a request
+  takes **1.54 ms**, p99 **2.31 ms** (`run`; `get` and `put` alike since W = R). (Every replica an
+  exponential of the machines' mean sojourn, Rényi's 5/6 of it, gave 2.41 ms before.)
+- **Loss over the same set.** A request is lost when fewer than its quorum of its three
+  replica-requests come back: the binomial over its set, not the share of replica-requests
+  dropped. Nothing is dropped here; see `nodes: 8` below.
 - `run` (30 minutes, 1 minute of warmup) passes all three SLOs, exit 0:
 
   ```
-  PASS    p99_latency  clients  put  2.41ms    20ms
-  PASS    utilization  store    -    0.6084    0.8
+  PASS    p99_latency  clients  put  2.31ms    20ms
+  PASS    utilization  store    -    0.6094    0.8
   PASS    drop_rate    -        -    0         0.01
   ```
 
@@ -46,24 +56,44 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   partition (stale versus unavailable) wait for phase 3. `mode` is printed, nothing more.
 - Vector clocks and conflict resolution, read repair and Merkle-tree anti-entropy traffic,
   gossip, the storage engine (commit log, memtable, SSTables, compaction).
-- The replicas' sojourns are taken as independent exponentials (a machine of 3 servers is not
-  exactly one), the hot and cool machines' spread is folded into one mean, and which keys are
-  hot is ignored (the clients' Zipf keys matter to caches, not to the ring's arcs).
-- A request is lost in the share its replica-requests are dropped: a quorum that still answers
-  after one of its three replicas dropped the request is not modelled.
+- The replicas' reply times are taken as independent lognormals of their machine's mean and
+  variance (a machine of 3 servers is not exactly one: a Monte Carlo of the exact M/M/3 sojourns
+  gives the `vnodes: 1` quorum below 2.8 % slower), the cool machines are one group (their own
+  spread is ignored), and which keys are hot is ignored (the clients' Zipf keys matter to caches,
+  not to the ring's arcs).
+- A request that lost a replica-request but still met its quorum is timed as if all three
+  replied (its quorum would in fact wait for a later reply).
 
 ## Things to try
 - `nodes: 8`, the book's size: 90k replica-requests/s over 80k/s, 11.25k/s per machine on
-  average (112.5 %) and **12.17k/s (122 %)** on the hottest (`explain`: `(hottest 122%, red)`).
-  Every machine is over capacity, every queue fills, and the cluster drops a ninth of the
-  replica-requests: `run` fails all three SLOs (drop rate 0.1111, utilization 1, `put` p99
-  306 ms: each replica waits for its full room of 1000, 100 ms). The fix is more machines, not a
-  different quorum: the load is N × the requests whatever W and R are.
-- `vnodes: 1` (at 16 machines): the hottest machine carries twice the average (`imbalance=2`),
-  11.25k/s, `(hottest 112%, red)`; it alone drops 1.25k of the 90k replica-requests/s (drop rate
-  0.01389) and the three SLOs fail, while the average machine is at 56 %.
-- `write_quorum: 3, read_quorum: 1`: a `put` waits for the slowest of three replicas (11/6 m) and
-  a `get` for the fastest (1/3 m): `put` 1.91 ms (p99 3.31 ms), `get` 1.36 ms (p99 2.04 ms).
-  `write_quorum: 1, read_quorum: 3` swaps them. The load does not change.
-- `mode: cp`: no difference until partitions exist (phase 3).
-- `nodes: 4`: 22.5k/s per machine; the cluster drops 55.6 % of the replica-requests.
+  average (112.5 %) and **12.01k/s (120 %)** on the hottest (k = 1 + z_8/sqrt(450) = 1.068;
+  `explain`: `(hottest 120%, red)`). Every machine is over capacity, every queue fills, and the
+  cluster drops a ninth of the replica-requests (`drop_rate 0.1111`). A request is lost only when
+  two of its three replica-requests are dropped: 3.4 % of them, so 96.6 % are answered (`run
+  --report json`: 20.28k of the 21k gets), not the 8/9 a ninth would suggest. `run` fails all
+  three SLOs: drop rate 0.1111, utilization 1, `put` p99 **118 ms**. Every replica now waits for
+  its full room, 1000 requests drained at 10k/s = 100 ms, with the spread the fluid gives a full
+  queue (about 10 ms), so the second of three replies is 100.0 ms with a 6.7 ms spread; the p99
+  is that plus the path. (Before the quorum was taken over the real replica set the lab said
+  306 ms and blamed the room; the 306 ms came from treating each replica as an exponential of
+  mean 100 ms, whose spread is as large as its mean.) The fix is more machines, not a different
+  quorum: the load is N × the requests whatever W and R are.
+- `vnodes: 1` (at 16 machines): the ring is at its most uneven, the hottest machine carries
+  1 + z_16/sqrt(3) = 2.02 times the average (`imbalance=2.02`), 11.37k/s, `(hottest 114%, red)`;
+  it alone drops 1.37k of the 90k replica-requests/s (drop rate 0.01522) and the utilization and
+  drop-rate SLOs fail, while the average machine is at 56 %. The `put` p99 **passes**: 2.65 ms.
+  A key's three replicas include the hot machine with probability 3 × 2.02/16 = 0.379, and then
+  the two cool replicas answer a quorum of two first, so the store's time is 0.378 ms and no
+  request is lost: the quorum hides the hot machine, which is why Dynamo answers at W or R of
+  N replies and not at the slowest. Add `write_quorum: 3` and it no longer does: a `put` waits for every replica, the full
+  queue included, mean 39.6 ms, p99 233 ms (FAIL), and loses what the hot machine drops: 4.6 %
+  of the puts (8.59k of 9k answered).
+- `write_quorum: 3, read_quorum: 1`: a `put` waits for the slowest of three replicas and a `get`
+  for the fastest: `put` 1.87 ms (p99 3.3 ms), `get` 1.4 ms (p99 2.05 ms).
+  `write_quorum: 1, read_quorum: 3` swaps them. The load does not change. `explain` marks either
+  with `(W + R ≤ N: a read may miss the latest write)` only when the two quorums stop overlapping
+  (W + R = 4 > 3 here: they still do).
+- `mode: cp`: no difference until partitions exist (phase 3). With quorums that do not overlap
+  (say `write_quorum: 1, read_quorum: 1`) `explain` says that cp contradicts them.
+- `nodes: 4`: 22.5k/s per machine; the cluster drops 55.6 % of the replica-requests and answers
+  41.7 % of the requests (the binomial again: a request needs two of its three).

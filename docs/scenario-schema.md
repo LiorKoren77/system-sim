@@ -81,7 +81,7 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `message_queue` | the broker's append, every message copied to each consumer group, the publisher answered at the append (phase 2c, see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
 | `worker_pool` | M/M/c over consumption, `workers / cost` jobs a second, its room its queue's `retention`; its `then` steps fire for every job it drains, nobody waiting for them (phase 2c, same section) |
 | `external_sink` | a third party's API: a queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) that fails `failure_rate` of what it serves, counted as drops (phase 2c, see [Node types](#node-types)) |
-| `kv_cluster` | `nodes` machines on a ring, every request sent to `replication` N of them, answered at the W-th (write) or R-th (read) fastest; the ring's hottest machine as its own queue (phase 2c, see [`kv_cluster`](#kv_cluster)) |
+| `kv_cluster` | `nodes` machines on a ring, every request sent to `replication` N of them, answered at the W-th (write) or R-th (read) fastest of its own replica set and lost when fewer come back; the ring's hottest machine as its own queue (phase 2c, see [`kv_cluster`](#kv_cluster)) |
 
 Everything else is refused before the first step, with exit code 1:
 
@@ -283,7 +283,7 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `service` | `ops`, `cost` | read and run |
 | `cache` | `hit_ratio`, `strategy`, `write_ops`, `backend`, `keys`, `eviction`, `ttl`, `then`, `cost` | read and run (fixed or `che` hit ratio), see [`cache`](#cache) |
 | `sql_db` | `replication_lag`, `shards` (int), `pool` (int connections), `write_ops`, `cost` | read and run (phase 2b), see [`sql_db`](#sql_db) |
-| `kv_cluster` | `nodes` (int, required), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp` | read and run (phase 2c), see [`kv_cluster`](#kv_cluster); `mode` printed, not modelled (partitions are phase 3) |
+| `kv_cluster` | `nodes` (int, required), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp`, `write_ops` | read and run (phase 2c), see [`kv_cluster`](#kv_cluster); `mode` printed, not modelled (partitions are phase 3) |
 | `message_queue` | `partitions`, `retention` | read and run (phase 2c), see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool); `partitions` printed, not modelled |
 | `worker_pool` | `consumes` (queue node id, required), `workers`, `cost` (duration per job), `then` | `consumes`, `workers`, `cost` and `then` read and run (phase 2c), same section: the steps fire for every job it drains, `on: miss` and `on: failure` refused |
 | `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every **write** the store serves (an op in its `write_ops`; not one it drops) sends `factor` requests of the step's op to its target, and a read sends nothing (S3 notifies on ObjectCreated and ObjectRemoved, never on a GET: 1000 views/s of a video start no transcode; notifying on reads is phase 3). They are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. A step `on: miss` (`node 'store': a blob store's then steps fire for every write it stores (on: miss needs a cache)`) or `on: failure` (`... (on: failure: an event reports no failure before phase 3)`) is refused, and so is any `mode` (`node 'store': a blob store's then steps are event notifications nobody waits for (mode orders the calls a request waits for)`); an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, the delivery delay (an event arrives after the link's latency), failed notifications |
@@ -319,7 +319,7 @@ changes how the replicas **behind** it queue (the node's *replica model*).
 |---|---|---|
 | `round_robin`, `weighted` | independent | N independent M/M/c copies, each at `demand / N` (phase 1's `replicas`) |
 | `least_connections` | pooled | one M/M/(c·N) queue with N × the capacity: join-the-shortest-queue, idealised |
-| `consistent_hash` | imbalanced | the hottest copy carries `k = 1 + 1/sqrt(vnodes)` × the average share (capped at N) and is queued apart from the N − 1 cool copies, which share the rest; the node reports the hot copy's rho and zone and, as latency, the mixture a request sees (hot with probability k/N) |
+| `consistent_hash` | imbalanced | the hottest copy carries `k = 1 + z_N/sqrt(vnodes)` × the average share, `z_N` the expected maximum of N standard normals (Blom: `Φ⁻¹((N − 0.375)/(N + 0.25))`, 1.05 for 4 replicas; capped at N; see the kv_cluster's ring below and [numerics, section 8](study/numerics.md) for the derivation and its Monte Carlo check), and is queued apart from the N − 1 cool copies, which share the rest; the node reports the hot copy's rho and zone and, as latency, the mixture a request sees (hot with probability k/N) |
 
 `explain` prints the factor on the node behind (`imbalance=1.1 (vnodes 100)`) and a
 `hottest copy` figure in its checks. The factor is a chosen heuristic (the mean plus one
@@ -504,7 +504,7 @@ unfiltered, and `explain` says so.
 
 **Effective capacity.** `keys` is per replica. Behind a `consistent_hash` load balancer each key
 hashes to one replica, so the replicas hold disjoint parts of the key space, `keys × replicas`
-together. The ring's arcs are uneven: with imbalance `k = 1 + 1/√vnodes` (the load balancer's
+together. The ring's arcs are uneven: with imbalance `k = 1 + z_N/√vnodes` (the load balancer's
 model) the hottest of `N` replicas owns `a_hot = k/N` of the keys and the others
 `a_cool = (1 − k/N)/(N − 1)` each. A replica owning a share `a` of a random partition is, for
 Che, one cache of `keys / a` over the whole space, and serves `a` of the requests, so
@@ -700,7 +700,7 @@ once W = `write_quorum` of them have acknowledged it and a read once R = `read_q
 | `write_quorum`, `read_quorum` | positive integers of at most `replication`; default **min(2, N)**: ch. 6's W = R = 2, lowered to 1 when `replication: 1`. W + R ≤ N is accepted: it is the eventually consistent end of ch. 6's dial (W = 1 a fast write, R = 1 a fast read; a read may miss the latest write) | `write_quorum must be a positive integer`, `write_quorum must be at most replication (4 > 3)`, the same for `read_quorum` |
 | `mode` | `ap` (default) or `cp`: what a partition costs, staleness or unavailability (ch. 6, "CAP theorem"). Read and printed; it changes nothing until partitions exist (phase 3) | `mode must be ap or cp` |
 | `replicas` | refused: a cluster scales by `nodes` and keeps `replication` copies of a key, two things `replicas` could mean | `node 'store': a kv_cluster's machines are nodes; replicas is not a key here` |
-| `write_ops` | not a key here: a kv_cluster's writes are the op `write` (the default of every node but a database); every other op is a read | the key table's |
+| `write_ops` | a list of op names, as on a [cache](#cache): the ops that wait for the **write** quorum W; every other op waits for R. Default `[write]` (the default of every node but a database). A client that sends `put` straight to the cluster lists it here | `write_ops must be a list of op names`, `write_ops must name at least one op` |
 
 `Graph::build` refuses the same shapes in the same words for a scenario built in code.
 
@@ -712,43 +712,75 @@ requests/s at N = 3 are 90k replica-requests/s: over 8 machines of 10k/s 11.25k/
 over 16, 5.625k/s, 56.25 %.
 
 **The ring's hottest machine.** With N < `nodes` each machine holds the keys of the arcs before
-it on the ring, so the machines are unevenly loaded; the hottest carries **k = 1 + 1/√vnodes**
-times the average (1.0816 at 150 vnodes), the heuristic of the consistent-hash balancer
-([`load_balancer`](#load_balancer); a machine holding N arcs rather than one is a little evener,
-so k is on the safe side), at most `nodes / N` (a machine is one of a key's N replicas at most
-once). The engine runs it as a hot machine and `nodes − 1` cool ones, as behind a balancer's
-ring: the node's `rho` and zone are the hottest machine's, so a `utilization` SLO reads it (the
-lab at 16 nodes: 1.0816 × 0.5625 = **0.6084**). With N = `nodes` every machine holds every key:
-k = 1, no hot machine.
-
-**The quorum's latency.** A read is answered at the **R-th fastest** of its N replicas, a write at
-the **W-th**. Each replica's sojourn (wait + service) is taken as exponential with mean m, the
-machines' sojourn weighted by the requests each serves (the hot machine k / nodes of them); the
-k-th smallest of n independent exponentials (Rényi's representation: a sum of k independent
-gaps, the i-th the first finish among the n − i still running) has
+its virtual nodes, N times over (it is one of the N successive replicas of each), so its share is
+a sum of N × `vnodes` arcs and spreads about 1/√(N·vnodes) around the average. The hottest of the
+M = `nodes` machines sits z_M such spreads above it, z_M the expected maximum of M standard
+normals (Blom's approximation, `Φ⁻¹((M − 0.375)/(M + 0.25))`: 1.43 for 8 machines, 1.77 for 16,
+2.58 for 128), so it carries
 
 ```
-mean = m × Σ_{i=0}^{k−1} 1 / (n − i)        variance = m² × Σ_{i=0}^{k−1} 1 / (n − i)²
+k = min(1 + z_M / √(N · vnodes), nodes / N)
 ```
 
-so with N = 3 a quorum of 1, 2 or 3 answers in 1/3, **5/6** or 11/6 of m (variances 1/9, 13/36
-and 49/36 of m²): Dynamo's W = R = 2 waits 0.8333 m, and `write_quorum: 3` makes a write 2.2
-times slower than that. A request is lost in the share its replica-requests are dropped.
+times the average (1.068 for 8 machines, 1.083 for 16 at N = 3 and 150 vnodes), at most
+`nodes / N` (a machine is one of a key's N replicas at most once). The same function gives the
+consistent-hash balancer's ring with N = 1 ([`load_balancer`](#load_balancer)), so the two agree.
+It is a heuristic, checked against Monte Carlo rings ([numerics, section 8](study/numerics.md):
+the expected hottest over the average is 1.073, 1.091 and 1.133 for 8, 16 and 128 machines at
+N = 3 and 150 vnodes, where k gives 1.068, 1.083 and 1.122); the old `1 + 1/√vnodes` ignored the
+number of machines and understated the hot spot beyond about 16. The engine runs the hot machine
+and `nodes − 1` cool ones as two copy groups, as behind a balancer's ring: the node's `rho` and
+zone are the hottest machine's, so a `utilization` SLO reads it (the lab at 16 nodes: 1.0834 ×
+0.5625 = **0.6094**). With N = `nodes` every machine holds every key: k = 1, no hot machine.
+
+**The quorum's latency, over the request's real replica set.** A read is answered at the
+**R-th fastest** of its N replicas, a write at the **W-th** (an op in `write_ops`). The N replicas
+are N different machines, so at most one is the hot one; it is sent k / `nodes` of the
+replica-requests, one from each request whose key it holds, so a request's set includes it with
+probability
+
+```
+p_hot = N · k / nodes            (16 machines, N = 3, k = 1.083: 0.203)
+```
+
+and is otherwise N cool machines. Each machine's reply time is a lognormal fitted to its own copy
+group's sojourn mean and variance (wait + service), and the q-th fastest of the set comes from
+its survival function: `S_q(t)` = P(fewer than q of the N have answered by t), a
+Poisson-binomial over the hot and cool replicas, integrated as `E[X] = ∫ S_q dt`,
+`E[X²] = ∫ 2t S_q dt` on a grid even in ln t ([numerics, section 7](study/numerics.md): under
+1e-8 relative error for sojourn SCVs up to 10). The response mixes the two kinds of set by
+p_hot (the law of total variance). So a quorum of 2 of 3 answers from the two cool replicas when
+the hot machine's queue is full: the kv-store lab with `vnodes: 1` (the hot machine at 114 %)
+answers in 0.378 ms and passes its p99, where a quorum of 3 waits for the full queue. For
+replicas all alike and exponential of mean m the closed form is Rényi's (the k-th smallest of n:
+`m × Σ_{i<k} 1/(n − i)`, 1/3, 5/6 and 11/6 of m for n = 3), which the quadrature reproduces and
+the lognormal fit departs from a little (0.421, 0.826 and 1.753 m at SCV 1).
+
+**The quorum's losses.** A request is lost when fewer than q of its N replica-requests come back,
+each kept with its machine's kept share this step (1 − dropped / sent): the Poisson-binomial
+again, mixed by p_hot. Eight saturated machines that each drop about a ninth lose 3.4 % of the
+W = R = 2 requests (0.14 % at q = 1, 29.8 % at q = N), not the ninth that "the share of
+replica-requests dropped" gives at every q: that rule over-counted a forgiving quorum and
+under-counted a strict one.
 
 `explain` prints the shape, `nodes=16 N=3 W=2 R=2 mode=ap (partitions: phase 3)  imbalance=1.08
-(vnodes 150)` (no `replicas=`), and checks the replica-requests against the machines, the hottest
-machine's percentage when N < `nodes`: `peak offered 90k/s (30k/s × N 3) vs 80k/s (8 nodes)
-(hottest 122%, red)`; with N = `nodes`, the plain average, `peak offered 3k/s (1k/s × N 3) vs
-30k/s (3 nodes)  (10%, green)`.
+(vnodes 150)` (no `replicas=`), each of N, W, R and the mode marked `(default)` when the scenario
+left it (`N=3 (default) W=2 (default) R=2 (default) mode=ap (default; partitions: phase 3)`).
+Quorums that do not overlap add `(W + R ≤ N: a read may miss the latest write)` after R, and
+`mode: cp` with them adds `cp needs W + R > N: these quorums contradict it` to the mode's note.
+It checks the replica-requests against the machines, the hottest machine's percentage when
+N < `nodes`: `peak offered 90k/s (30k/s × N 3) vs 80k/s (8 nodes)  (hottest 120%, red)`; with
+N = `nodes`, the plain average, `peak offered 3k/s (1k/s × N 3) vs 30k/s (3 nodes)  (10%,
+green)`.
 
 Not modelled: network partitions and what `ap` or `cp` does under them, sloppy quorum and hinted
 handoff, node failures (faults: phase 3), read repair and anti-entropy (Merkle tree) traffic,
 vector clocks and conflict resolution, gossip, the storage engine (commit log, memtable,
-SSTables, compaction), a quorum that survives one lost replica (a request is lost with its
-replica-requests' share), the replicas' sojourns not being exponential (a machine of `c > 1`
-servers, a service SCV other than 1) nor independent, the spread between the hot and the cool
-machines (the order statistic is taken over their mean), and which keys are hot (a Zipf hot key
-is the caches' business). The coordinator is no part of the node: the lab's `coordinator`
+SSTables, compaction), the latency of a request that lost a replica-request but still met its
+quorum (timed as if all N replied), the replicas' reply times being exactly lognormal (a Monte
+Carlo of the lab's exact M/M/3 sojourns is 2.8 % slower) and independent (one hot queue serves
+many keys), the spread among the cool machines (one group), and which keys are hot (a Zipf hot
+key is the caches' business). The coordinator is no part of the node: the lab's `coordinator`
 service is its hop.
 
 ### `id_generator`

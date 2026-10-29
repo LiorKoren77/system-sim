@@ -1502,16 +1502,19 @@ Scenario ring_lab(int vnodes) {
 
 TEST_CASE("one vnode per server over four servers: the hot arc halves the ring's hit ratio gain",
           "[graph]") {
-  // vnodes 1: k = 2, so the hot replica owns 2/4 of the keys (Che of 2M / 0.5 = 4M keys: 0.848)
-  // and each cool one 1/6 (12M > 10M keys: every key fits, 1). h = 0.5 × 0.848 + 0.5 × 1 = 0.924,
-  // below the 0.963 an even split (one 8M-key cache) would give.
+  // vnodes 1: k = 1 + z_4 = 2.0491, so the hot replica owns k/4 = 0.5123 of the keys (Che of
+  // 2M / 0.5123 = 3.904M keys: 0.8445) and each cool one (1 - 0.5123)/3 = 0.1626 (12.3M > 10M
+  // keys: every key fits, 1). h = 0.5123 × 0.8445 + 0.4877 × 1 = 0.9203, below the 0.963 an even
+  // split (one 8M-key cache) would give.
   const auto built = Graph::build(ring_lab(1));
   INFO((built ? "" : built.error().message));
   REQUIRE(built.has_value());
   const auto zipf = simsys::caching::Popularity::zipf(0.9, 10e6);
-  REQUIRE_THAT(*built->hit_ratio(*built->index_of("c")),
-               WithinRel(0.5 * simsys::caching::che_hit_ratio(4e6, zipf) + 0.5, 1e-12));
-  REQUIRE_THAT(*built->hit_ratio(*built->index_of("c")), WithinAbs(0.924118, 1e-4));
+  const double hot = (1.0 + blom_z4) / 4.0;
+  REQUIRE_THAT(
+      *built->hit_ratio(*built->index_of("c")),
+      WithinRel(hot * simsys::caching::che_hit_ratio(2e6 / hot, zipf) + (1.0 - hot), 1e-12));
+  REQUIRE_THAT(*built->hit_ratio(*built->index_of("c")), WithinAbs(0.920318, 1e-4));
 }
 
 TEST_CASE("a ring-partitioned cache that is also sent to directly is an error", "[graph]") {

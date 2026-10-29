@@ -93,6 +93,7 @@ import simsys.core;
 import simsys.defaults;
 import simsys.fluid;
 import simsys.model;
+import simsys.queueing;
 
 // What resolving one cache's hit ratio reads (defined with the hit-ratio code below); declared
 // here for Graph::resolve_hit_ratio. Not exported: module linkage, like everything in detail.
@@ -1104,27 +1105,51 @@ void apply_database_keys(ResolvedNode& node) {
   return above(name, "read_quorum", model::kv_read_quorum(spec), "replication", replication);
 }
 
-// A kv_cluster's machines on their ring (plan 2c refinement 9; book ch. 5's ring, ch. 6's
-// replication): its copies are its `nodes`, each of the stated (per-node) capacity, so
-// `spec.replicas` becomes `nodes` and every reader of a node's copies (explain's total capacity,
-// the engine's copy groups) counts machines. With N < nodes each machine holds the keys of the
-// arcs before it, as uneven as a balancer's ring: the hottest carries k = 1 + 1/sqrt(vnodes)
-// times the average, the balancer's heuristic (Graph::mark_balanced_targets has its derivation
-// and limits; a machine holding N arcs instead of one is a little EVENER than that, so k is on
-// the safe side), as hot and cool copy groups in the engine (add_hot_and_cool_copies). k is at
-// most nodes / N: a machine is at most one of a key's N replicas, so it is sent at most every
-// request, N × rate / nodes × k <= rate. With N = nodes every machine holds every key: k = 1,
-// identical independent copies.
-void apply_kv_ring(ResolvedNode& node) {
-  const auto& spec = node.spec;
-  const double machines = *spec.kv_nodes;
-  const double replication = model::kv_replication(spec);
-  node.spec.replicas = *spec.kv_nodes;
-  if (replication >= machines) return;  // every node holds every key: no hot node
-  const double vnodes = spec.vnodes.value_or(model::default_vnodes);
-  node.imbalance = std::min(1.0 + 1.0 / std::sqrt(vnodes), machines / replication);
+// A consistent-hash ring's imbalance k: how many times the average share of the keys the HOTTEST
+// of `machines` holds (book ch. 5; review of plan 2c Tasks 9-10, I-2), the one heuristic shared by
+// a consistent_hash balancer's ring (one copy of each key: `copies_per_key` 1) and a kv_cluster's
+// (N copies on N successive machines):
+//   k = min(1 + z_M / sqrt(N v), M / N)
+//   M  the machines (servers) on the ring, N the copies of each key, v the virtual nodes each
+//   1 / sqrt(N v)  the relative spread of one machine's share: it is the sum of N v arc lengths
+//                  (v positions, each owning the arc before it, once per copy), and a sum of n
+//                  roughly independent arcs spreads like 1 / sqrt(n) (the Dynamo/Chord argument;
+//                  the book's "about 10 % at 100 virtual nodes")
+//   z_M  the expected maximum of M standard normals (queueing::expected_normal_maximum, Blom's
+//        approximation): the hottest of M shares sits that many spreads above the average, and
+//        that grows with M (0 for one machine, 1.05 for 4, 1.77 for 16, 2.58 for 128)
+//   M / N  the cap: a machine holds a key at most once, so it is sent at most every request
+// A heuristic, not a theorem (shares are not quite normal nor independent: they sum to N), checked
+// against Monte Carlo rings (docs/study/numerics.md): N = 3, v = 150, the expected hottest over the
+// average is 1.073, 1.091 and 1.133 for 8, 16 and 128 machines where k gives 1.068, 1.083 and
+// 1.122; one copy over 4 servers at v = 150, 1.086 against 1.086. The old 1 + 1 / sqrt(v) ignored M
+// (it is the k of one standard deviation) and understated the hot spot beyond about 16 machines.
+[[nodiscard]] double ring_imbalance(int machines, int copies_per_key, int vnodes) {
+  if (machines <= 1) return 1.0;  // one machine carries exactly the average
+  const double spread = 1.0 / std::sqrt(static_cast<double>(copies_per_key) * vnodes);
+  return std::min(1.0 + queueing::expected_normal_maximum(machines) * spread,
+                  static_cast<double>(machines) / copies_per_key);
 }
 
+// A kv_cluster's machines on their ring (plan 2c refinement 9; book ch. 5's ring, ch. 6's
+// replication): its copies are its `nodes`, each of the stated (per-node) capacity, so
+// `spec.replicas` becomes `nodes` (the scenario may not state `replicas` here: the loader refuses
+// it) and every reader of a node's copies (explain's total capacity, the engine's copy groups)
+// counts machines. With N < nodes each machine holds the keys of the arcs before its virtual nodes,
+// N times over (it is one of the N successive replicas of each), so the ring is uneven: the
+// hottest carries k = ring_imbalance(nodes, N, vnodes) times the average, as hot and cool copy
+// groups in the engine (add_hot_and_cool_copies). k is at most nodes / N: a machine is at most one
+// of a key's N replicas, so it is sent at most every request, N × rate / nodes × k <= rate. With
+// N = nodes every machine holds every key: k = 1, identical independent copies.
+void apply_kv_ring(ResolvedNode& node) {
+  const auto& spec = node.spec;
+  const int machines = *spec.kv_nodes;
+  const int replication = model::kv_replication(spec);
+  node.spec.replicas = machines;
+  if (replication >= machines) return;  // every node holds every key: no hot node
+  node.imbalance =
+      ring_imbalance(machines, replication, spec.vnodes.value_or(model::default_vnodes));
+}
 // What a worker pool may consume (plan 2c refinement 4): a message queue, or a URL frontier,
 // which is a queue of URLs (book ch. 9: the web crawler's downloaders take URLs from it). The
 // frontier is not simulated before phase 3, so its wiring is checked here and the engine still
@@ -2019,10 +2044,14 @@ struct SizeWalk {
 // as well. A renamed step of another size, or of none, is a new request of its own (a lookup, a
 // 1 KB metadata write, a notification), whose sender had read the incoming bytes already: a 10 MB
 // upload whose service writes `{op: put_meta, size: 1KB}` stays a read on the client's wire.
+// Sizes are compared in whole bytes (std::llround): `2.01MB` and `2010KB` parse to 2.01 × 1e6 =
+// 2009999.9999999998 and 2010 × 1e3 = 2010000, one rounding apart as doubles but one size (review
+// of plan 2c Tasks 9-10, minor 1). A request is a whole number of bytes anyway.
 [[nodiscard]] bool carries_payload(std::string_view op, const std::optional<Bytes>& incoming,
                                    const CallHop& hop) {
   if (hop.op == op) return true;
-  return hop.size.has_value() && incoming.has_value() && *hop.size == *incoming;
+  return hop.size.has_value() && incoming.has_value() &&
+         std::llround(hop.size->count) == std::llround(incoming->count);
 }
 
 // Is `op` a write at `node`, or at a node the request's payload reaches from there
@@ -2286,12 +2315,12 @@ struct ArcGroup {
 };
 
 // How a consistent-hash ring splits the key space over N replicas, from its imbalance k (the
-// hottest replica's load over the average, Graph::mark_balanced_targets: 1 + 1/sqrt(vnodes)):
+// hottest replica's load over the average, Graph::mark_balanced_targets: ring_imbalance):
 // the hottest replica owns a_hot = k/N of the keys, the N − 1 others share the rest evenly,
 // a_cool = (1 − k/N)/(N − 1). Two groups, not N arcs: the cool replicas are interchangeable,
 // and one Che solve per group keeps a 1000-replica cache as cheap as a 4-replica one. Like k
-// itself a heuristic: "one replica one standard deviation hot, the others even". One group of
-// share 1 for an unpartitioned cache.
+// itself a heuristic: "the hottest replica as hot as the expected maximum, the others even".
+// One group of share 1 for an unpartitioned cache.
 [[nodiscard]] std::vector<ArcGroup> ring_arcs(int partitions, double imbalance) {
   if (partitions <= 1) return {{.replica_share = 1.0, .replicas = 1.0}};
   const double n = partitions;
@@ -3437,14 +3466,11 @@ Graph::Result Graph::check_forwarded_ops(std::size_t node) {
 //    of uneven length, so some replica holds more than 1/N of the keys (book ch. 5: the
 //    standard deviation of the load is about 10% of the mean at 100 vnodes, 5% at 200). The
 //    engine models the HOTTEST replica apart from the cooler ones, and needs its share:
-//      imbalance k = 1 + 1/sqrt(v)                 (v = 100: 1.1; v = 150: 1.082; v = 1: 2)
-//    capped at N (a single replica is the average). A heuristic, chosen, not derived: each
-//    server's share is a sum of v arcs, so its relative spread shrinks like 1/sqrt(v) (the
-//    Dynamo/Chord argument, and the book's 10% at v = 100), and k is "the mean plus one
-//    standard deviation". That is the hottest of a FEW servers; the hottest of N is an
-//    extreme value, which grows with N: for roughly normal shares it sits near
-//    sqrt(2 ln N) standard deviations above the mean, so for large N this k understates
-//    the hot spot. A possible refinement is the N-aware k = 1 + sqrt(2 ln N)/sqrt(v).
+//      imbalance k = 1 + z_N / sqrt(v)       (ring_imbalance with one copy per key; z_N the
+//                                             expected maximum of N standard normals)
+//    4 replicas: v = 100: 1.105; v = 150: 1.086; v = 1: 2.049. Capped at N (a single replica
+//    is the average). ring_imbalance has the derivation, its limits and its Monte Carlo check;
+//    a kv_cluster's own ring uses the same function, so the two agree.
 // A drained route (weight 0) sends the target nothing and imposes no model. A node behind
 // two balancers whose policies give different models would need two queueing models at
 // once, so that is an error; the same model from different policies (round_robin and
@@ -3492,12 +3518,10 @@ Graph::Result Graph::mark_balanced_targets() {
       if (replica_model == ReplicaModel::pooled) target.pooled = true;
       if (replica_model == ReplicaModel::imbalanced) {
         target.keys_partitioned = true;  // each key hashes to one replica
-        // Imbalance factor 1 + 1/sqrt(v) (see the function comment), at most N: the hottest
+        // Imbalance factor 1 + z_N/sqrt(v) (see the function comment), at most N: the hottest
         // of N replicas cannot carry more than all of the demand, and one replica alone
-        // carries exactly the average (factor 1).
-        const double replicas = target.spec.replicas;
-        const double factor =
-            std::min(1.0 + 1.0 / std::sqrt(static_cast<double>(vnodes)), replicas);
+        // carries exactly the average (factor 1). One copy of each key on a balancer's ring.
+        const double factor = ring_imbalance(target.spec.replicas, 1, vnodes);
         target.imbalance = std::max(target.imbalance, factor);
       }
     }

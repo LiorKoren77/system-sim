@@ -659,6 +659,17 @@ inline constexpr std::size_t max_copy_groups = 2;
   return sink != nullptr ? sink->failure_rate() : 0.0;
 }
 
+// A kv_cluster's quorum needs its machines one kind at a time (review of plan 2c Tasks 9-10, C-1
+// and I-1): what one replica-request saw on the hot machine and on a cool one this step, and the
+// share each kind kept, in make_server's group order (behaviours::KvClusterBehaviour::observe).
+// Every other node mixes its groups into one sojourn (record_sojourns) and is told nothing.
+void report_machines(behaviours::Behaviour& behaviour,
+                     std::span<const behaviours::MachineGroup> machines) {
+  if (auto* cluster = std::get_if<behaviours::KvClusterBehaviour>(&behaviour)) {
+    cluster->observe(machines);
+  }
+}
+
 // An external sink's failures (plan 2c refinement 8; book ch. 10: the third-party providers are
 // the unreliable part of the notification pipeline). The provider works on a request that fails as
 // long as on one that succeeds, so the queue serves both alike and its rho counts every request it
@@ -737,12 +748,17 @@ void add_copies(NodeSample& sample, const fluid::FluidStep& copy_step, double co
   sample.backlog += copy_step.backlog * copies * content_share;
 }
 
-// The share of the requests that arrived and were not lost, 1 − lost / arrived, kept in [0, 1]
-// (see account_rejections); 1 when nothing arrived: nothing was lost.
+// The share of what arrived that was not lost, 1 − lost / arrived, kept in [0, 1] (see
+// account_rejections); 1 when nothing arrived: nothing was lost.
+[[nodiscard]] double kept_fraction(double lost_per_s, double arrived_per_s) {
+  if (arrived_per_s <= 0.0) return 1.0;
+  return std::clamp(1.0 - lost_per_s / arrived_per_s, 0.0, 1.0);
+}
+
+// kept_fraction of two flows' totals: the requests (or units) lost and those that arrived.
 [[nodiscard]] double kept_share(const flow::Flow& lost, const flow::Flow& arrived) {
   const double arrived_per_s = arrived.total().per_second;
-  if (arrived_per_s <= 0.0) return 1.0;
-  return std::clamp(1.0 - lost.total().per_second / arrived_per_s, 0.0, 1.0);
+  return kept_fraction(lost.total().per_second, arrived_per_s);
 }
 
 // estimate()'s stopping rule: a pass changed nothing that matters when every node's
@@ -1296,9 +1312,11 @@ void Simulation::record_queue_lags(std::span<NodeSample> samples) const {
     const auto& groups = nodes_[queue].consumer_groups;
     if (groups.empty()) continue;  // not a message queue
     double lag = 0.0;
-    // The possibly-NaN wait first: std::max returns its first argument when the comparison is
-    // false, so a NaN there propagates instead of being hidden (the project's convention).
-    for (const std::size_t pool : groups) lag = std::max(nodes_[pool].wait.mean_s, lag);
+    // flow::nan_propagating_max, not std::max: a NaN wait met at any group stays in the fold
+    // (std::max would let the next finite wait replace it).
+    for (const std::size_t pool : groups) {
+      lag = flow::nan_propagating_max(nodes_[pool].wait.mean_s, lag);
+    }
     samples[queue].queue_lag_s = lag;
   }
 }
@@ -1448,10 +1466,11 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSampl
   // At most two groups (max_copy_groups): fixed arrays, no allocation per step.
   std::array<flow::LatencyEstimate, max_copy_groups> sojourns{};
   std::array<flow::LatencyEstimate, max_copy_groups> waits{};
+  std::array<behaviours::MachineGroup, max_copy_groups> machines{};
   for (std::size_t i = 0; i < node.copy_groups.size(); ++i) {
     auto& group = node.copy_groups[i];
-    GroupStep step =
-        serve_copies(group, group_arrivals(group, reads, writes), dt, mode, node.behaviour, sample);
+    const flow::Flow arrivals = group_arrivals(group, reads, writes);
+    GroupStep step = serve_copies(group, arrivals, dt, mode, node.behaviour, sample);
     // The busiest kind of copy speaks for the node's load: the hottest copy behind a ring (it
     // takes the largest share), the busier of a database's primary and replicas.
     if (i == 0 || step.copy.rho > sample.rho) {
@@ -1460,6 +1479,11 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSampl
     }
     sojourns[i] = step.copy.latency;
     waits[i] = step.copy.wait;
+    // One machine's sojourn, and the share the group's copies kept of what they were sent (the
+    // arrivals are one copy's; step.dropped is the group's): a kv_cluster's quorum reads both.
+    machines[i] = {.sojourn = step.copy.latency,
+                   .kept = kept_fraction(step.dropped.total().per_second,
+                                         arrivals.total().per_second * group.copies)};
     replay_committed(group, step, node.behaviour, writes, replication);
     drained += clients_part(group, std::move(step.drained), node.behaviour);
     dropped += clients_part(group, std::move(step.dropped), node.behaviour);
@@ -1471,6 +1495,7 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSampl
   // first(n) views only the n groups in use.
   const auto in_use = std::span{sojourns}.first(node.copy_groups.size());
   record_sojourns(node, in_use, std::span{waits}.first(node.copy_groups.size()), sample);
+  report_machines(node.behaviour, std::span{machines}.first(node.copy_groups.size()));
   if (node.replication) record_replication(node, in_use, replication, sample);
   return in_requests(drained, node.behaviour);
 }

@@ -1420,7 +1420,6 @@ TEST_CASE("explain prints a kv_cluster's nodes, replication, quorums and mode", 
     const auto text = explain_of(s);
     CAPTURE(text);
     REQUIRE(node_line(text, "store").contains("nodes=5 N=5 W=3 R=3 mode=cp (partitions: phase 3)"));
-    REQUIRE_FALSE(node_line(text, "store").contains("default"));
   }
 }
 

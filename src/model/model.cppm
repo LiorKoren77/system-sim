@@ -461,6 +461,9 @@ struct NodeSpec {
   // YAML `type:` key, and tests must set it too: a forgotten type is a silent client.
   NodeType type{};
   std::string dc{"main"};
+  // The copies of the node, each of `capacity`. A kv_cluster may not state it (the loader refuses
+  // the key): graph::apply_kv_ring overwrites it with the cluster's `kv_nodes`, so the readers of
+  // a node's copies count its machines; read a cluster's machine count from `kv_nodes`.
   int replicas{1};
   std::optional<Rate> capacity{};           // per replica; absent -> type default
   std::optional<ByteRate> byte_capacity{};  // blob stores, CDNs: they count megabytes
