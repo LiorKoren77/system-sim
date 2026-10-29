@@ -37,10 +37,12 @@ export namespace simsys::report {
 // replicas, utilization is per copy (see engine::NodeSample).
 struct NodeSummary {
   std::string id{};
-  double mean_rho{};       // time-averaged utilization (busy fraction)
-  double peak_rho{};       // highest utilization of any observed step
-  double peak_backlog{};   // most requests waiting at the end of any observed step
-  double total_dropped{};  // requests shed because the waiting room was full: failures
+  double mean_rho{};      // time-averaged utilization (busy fraction)
+  double peak_rho{};      // highest utilization of any observed step
+  double peak_backlog{};  // most requests waiting at the end of any observed step
+  // Requests shed because the waiting room was full, and an external sink's failed requests (its
+  // `failure_rate` of what it served, plan 2c refinement 8): failures.
+  double total_dropped{};
   // Requests refused by policy (a rate limiter's 429s, plan 2a refinement 6): answered at
   // once, never forwarded, and counted apart from the drops (reject_rate, not drop_rate).
   double total_rejected{};

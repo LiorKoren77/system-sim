@@ -104,7 +104,9 @@ class DelayLine {
 //   demand·dt = (drain + dropped)·dt + Δbacklog
 // whatever comes in is served, shed or left waiting. Rejections do not appear as a term of
 // their own: a token-family limiter's (token bucket, windowed) are inside `drain` (its
-// queue looked at them), and a leaky bucket's are the `dropped` term, moved to `rejected`.
+// queue looked at them), and a leaky bucket's are the `dropped` term, moved to `rejected`. An
+// external sink's failed requests are moved from `drain` to `dropped` (fail_share): the sum, and
+// with it the balance, does not change.
 // A database's replicas also replay every write the primary committed (replication); that
 // work answers no client, so demand, drain, drops and backlog count the CLIENTS' queries only
 // (the balance above holds for them: a replica full of replayed writes therefore drops while
@@ -530,7 +532,8 @@ struct Overloaded : Fs... {
   using enum model::NodeType;
   return type == client || type == service || type == load_balancer || type == rate_limiter ||
          type == cache || type == sql_db || type == cdn || type == id_generator ||
-         type == blob_store || type == message_queue || type == worker_pool;
+         type == blob_store || type == message_queue || type == worker_pool ||
+         type == external_sink;
 }
 
 // Why a cache cannot run, if it cannot: a scenario built in code left it without a number or
@@ -563,7 +566,8 @@ struct Overloaded : Fs... {
 // always runs, `then` steps included: they are event notifications (plan 2c refinements 6-7),
 // asynchronous hops the backward pass does not wait for (behaviours::BlobStoreBehaviour). So do
 // a message queue (behaviours::MessageQueueBehaviour) and a worker pool, `then` steps included
-// since plan 2c Task 7: the work each drained job hands on (behaviours::WorkerPoolBehaviour).
+// since plan 2c Task 7: the work each drained job hands on (behaviours::WorkerPoolBehaviour), and
+// an external sink, whatever its failure_rate (behaviours::ExternalSinkBehaviour, fail_share).
 [[nodiscard]] std::optional<std::string> not_runnable_yet(const model::NodeSpec& spec) {
   if (spec.type == model::NodeType::cache) return cache_not_runnable(spec);
   if (spec.type == model::NodeType::cdn) return cdn_not_runnable(spec);
@@ -635,6 +639,34 @@ inline constexpr std::size_t max_copy_groups = 2;
 [[nodiscard]] bool is_write_at(const behaviours::Behaviour& behaviour, std::string_view op) {
   const auto* database = std::get_if<behaviours::SqlDbBehaviour>(&behaviour);
   return database != nullptr && database->is_write(op);
+}
+
+// The share of what a node serves that fails (plan 2c refinement 8): an external sink's
+// `failure_rate` (behaviours::ExternalSinkBehaviour); every other node fails nothing it served.
+[[nodiscard]] double failure_rate_of(const behaviours::Behaviour& behaviour) {
+  const auto* sink = std::get_if<behaviours::ExternalSinkBehaviour>(&behaviour);
+  return sink != nullptr ? sink->failure_rate() : 0.0;
+}
+
+// An external sink's failures (plan 2c refinement 8; book ch. 10: the third-party providers are
+// the unreliable part of the notification pipeline). The provider works on a request that fails as
+// long as on one that succeeds, so the queue serves both alike and its rho counts every request it
+// served; what changes is where a failed request goes. With f the failure rate and `served` what
+// the node's queues drained this step (per op, and in total in the sample):
+//   failed   = f × served         a 5xx: counted as a DROP (the node failing), never a rejection
+//   dropped' = dropped + failed   the queue's overflow plus the failures
+//   drain'   = (1 − f) × served   what is answered, and what the behaviour is handed
+// Conservation is untouched: drain' + dropped' = drain + dropped, so demand·dt = (drain +
+// dropped)·dt + Δbacklog still holds, and the node's own delivered share 1 − (dropped + rejected)
+// / inflow (account_rejections) loses the failures once: 500/s at f = 0.02 is answered 490/s.
+// Assumes every op fails alike and that a failure is final (no retries before phase 3).
+void fail_share(double failure_rate, flow::Flow& drained, flow::Flow& dropped, NodeSample& sample) {
+  if (failure_rate <= 0.0) return;  // fails nothing: the plain queue, bit for bit
+  dropped += drained.scaled(failure_rate);
+  drained = drained.scaled(1.0 - failure_rate);
+  const double failed_per_s = failure_rate * sample.drain_per_s;
+  sample.dropped_per_s += failed_per_s;
+  sample.drain_per_s -= failed_per_s;
 }
 
 // How a node times its requests in megabytes (behaviours::MegabyteService) when it counts them:
@@ -887,6 +919,10 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
     // messages, and what overflows it deleted unconsumed.
     case model::NodeType::worker_pool:
       return make_server(behaviours::WorkerPoolBehaviour{g, index}, resolved);
+    // An external sink's queue is the provider answering (the type's 1k/s at 100 ms, service SCV
+    // 2.0); serve fails `failure_rate` of what it served (fail_share).
+    case model::NodeType::external_sink:
+      return make_server(behaviours::ExternalSinkBehaviour{g, index}, resolved);
     // A database's queues are its primaries and its replicas (make_database), whatever a
     // balancer in front of it does.
     case model::NodeType::sql_db:
@@ -1404,6 +1440,7 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSampl
     drained += clients_part(group, std::move(step.drained), node.behaviour);
     dropped += clients_part(group, std::move(step.dropped), node.behaviour);
   }
+  fail_share(failure_rate_of(node.behaviour), drained, dropped, sample);
   node.dropped = in_requests(dropped, node.behaviour);
   // std::span with C++17 class template argument deduction: `std::span{sojourns}` deduces
   // std::span<LatencyEstimate, max_copy_groups> from the array without spelling the type, and

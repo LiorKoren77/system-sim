@@ -3,7 +3,8 @@
 // everything on across its links; rate limiter: pass on what it admits, reject the rest;
 // cache: answer, and pass to its store what its strategy sends there; blob store: answer, and
 // notify along its `then` steps for each write; message queue: append, and copy every message to
-// each consumer group; worker pool: drain its jobs and hand each one on along its `then` steps) and
+// each consumer group; worker pool: drain its jobs and hand each one on along its `then` steps;
+// external sink: answer, calling nobody, while the engine fails a share of what it served) and
 // how it composes response latency from its own sojourn plus link legs and downstream responses.
 //
 // Latency composes on the reply path. A hop to a downstream node costs two link legs
@@ -1423,18 +1424,69 @@ class WorkerPoolBehaviour {
   detail::HopBlocks hand_offs_;
 };
 
+// Models: a third party's API, which our system calls and does not run: the providers of System
+// Design Interview (Alex Xu, vol. 1) ch. 10's notification system (Apple's APNs, Google's FCM, an
+// SMS gateway, an e-mail service), which the book's workers call for every message they send, and
+// chat-system's push gateway (ch. 12). Plan 2c refinement 8, spec section 6 `third_party_api`.
+// Captured: the node is a LEAF (it answers the request itself and calls nobody: the loader refuses
+// `then` and `ops` on it) whose queue has the type's numbers (simsys.defaults: capacity 1k/s,
+// chosen as the quota a provider grants one account; service time 100 ms and service SCV 2.0,
+// spec section 6: slow and more erratic than the exponential), and a share `failure_rate` f of
+// what that queue SERVES fails, a 5xx from the provider. The ENGINE counts the failures
+// (engine::Simulation::serve moves f × served from the node's drain to its drops), so they show
+// in the node's drop rate like a full queue's overflow, and the `own` share it hands `delivered`
+// already lacks them: this behaviour forwards nothing, composes nothing and must not apply f a
+// second time. A failure is the provider failing, not a policy working: nothing is ever counted
+// as rejected. Ignored: retries (an `on: failure` step never fires before phase 3, so a failed
+// push is simply lost), the provider's latency rising with our load (its queue is our account's
+// quota, not its fleet), failures that cost a different time than a success, and `politeness`
+// (printed, not modelled: it needs per-host state, phase 3).
+class ExternalSinkBehaviour {
+ public:
+  ExternalSinkBehaviour(const graph::Graph& g, std::size_t self);
+
+  // Serves every incoming op and forwards nothing: a provider calls nobody back. `in` is what the
+  // engine's queue drained, failures already taken out; `now` and `dt` are unused (a sink holds no
+  // state between steps).
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+
+  // One capacity unit per request, whatever its op: the type takes no `cost` key.
+  [[nodiscard]] double cost(std::string_view /*op*/) const { return 1.0; }
+
+  // The share f of what the sink serves that fails: the engine reads it to move those requests
+  // from the node's drain to its drops (engine::Simulation::serve).
+  [[nodiscard]] double failure_rate() const { return failure_rate_; }
+
+  // Its own sojourn: a failed request takes as long as an answered one, and nothing is downstream.
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view /*op*/, flow::LatencyEstimate own,
+                                               ResponseLookup auto&& /*downstream*/) const {
+    return own;
+  }
+
+  // The engine's own share, 1 − (dropped + rejected) / inflow, which already counts the failures
+  // as drops: returned unchanged, or each failure would be charged twice ((1 − f)² for 1 − f).
+  [[nodiscard]] double delivered(std::string_view /*op*/, double own,
+                                 FractionLookup auto&& /*downstream*/) const {
+    return own;
+  }
+
+ private:
+  double failure_rate_{};
+};
+
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
 // std::visit; a std::variant instead of an abstract base keeps every behaviour a plain
 // value (no heap allocation, no virtual calls, copyable). Phase 2a appended the load
 // balancer, the rate limiter and the cache, phase 2b the SQL database and the CDN, phase 2c the
-// blob store, the message queue and the worker pool; later phases append the rest (external sink,
-// kv cluster, ...).
+// blob store, the message queue, the worker pool and the external sink; later phases append the
+// rest (kv cluster, ...).
 // C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
 // it holds) dispatched with std::visit. Closed: adding an alternative means editing this
 // line, and every std::visit that does not handle it then fails to compile.
-using Behaviour = std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour,
-                               RateLimiterBehaviour, CacheBehaviour, SqlDbBehaviour, CdnBehaviour,
-                               BlobStoreBehaviour, MessageQueueBehaviour, WorkerPoolBehaviour>;
+using Behaviour =
+    std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour, RateLimiterBehaviour,
+                 CacheBehaviour, SqlDbBehaviour, CdnBehaviour, BlobStoreBehaviour,
+                 MessageQueueBehaviour, WorkerPoolBehaviour, ExternalSinkBehaviour>;
 
 }  // namespace simsys::behaviours
 
@@ -1451,6 +1503,7 @@ static_assert(NodeBehaviour<CdnBehaviour>);
 static_assert(NodeBehaviour<BlobStoreBehaviour>);
 static_assert(NodeBehaviour<MessageQueueBehaviour>);
 static_assert(NodeBehaviour<WorkerPoolBehaviour>);
+static_assert(NodeBehaviour<ExternalSinkBehaviour>);
 static_assert(RequestSource<ClientBehaviour>);
 
 namespace detail {
@@ -1473,8 +1526,8 @@ void sort_by_destination(std::vector<Outgoing>& outgoing) {
   std::ranges::sort(outgoing, {}, [](const Outgoing& o) { return std::pair{o.target, o.link}; });
 }
 
-// What a leaf (a database, a blob store) does with a step's flow: serves all of it, forwards
-// nothing, rejects nothing.
+// What a leaf (a database, a blob store, an external sink) does with a step's flow: serves all of
+// it, forwards nothing, rejects nothing.
 [[nodiscard]] Routed serve_everything(const flow::Flow& in) {
   Routed routed;
   for (const auto& [op, rate] : in.entries()) {
@@ -2140,6 +2193,15 @@ Routed WorkerPoolBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime
   if (jobs.per_second > 0.0) hand_offs_.forward(every_job, jobs, routed.outgoing);
   detail::sort_by_destination(routed.outgoing);
   return routed;
+}
+
+// ---- ExternalSinkBehaviour ----
+
+ExternalSinkBehaviour::ExternalSinkBehaviour(const graph::Graph& g, std::size_t self)
+    : failure_rate_{g.nodes()[self].spec.failure_rate} {}
+
+Routed ExternalSinkBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
+  return detail::serve_everything(in);
 }
 
 }  // namespace simsys::behaviours

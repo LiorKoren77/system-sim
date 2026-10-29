@@ -3956,3 +3956,11 @@ TEST_CASE("an external sink may not have then steps or ops") {
                                  "  t: {type: service}\n"),
                    "node 's': key 'ops' is not valid for type 'external_sink'");
 }
+
+// politeness is a rate one host may be called at: 0/s would be a provider nobody may call, which
+// a missing link says more plainly (added by the implementer with the check it pins).
+TEST_CASE("an external sink's politeness must be a positive rate") {
+  require_rejected("simsys_sink_politeness_zero.yaml",
+                   scenario_with("  s: {type: external_sink, politeness: 0/s}\n"),
+                   "node 's': politeness must be positive");
+}

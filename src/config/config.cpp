@@ -2594,6 +2594,49 @@ CheckResult read_worker_pool_keys(const Site& site, const YAML::Node& body, mode
       .and_then([&] { return refused_worker_pool_keys(this_node, body); });
 }
 
+// ---- External sink keys (plan 2c refinement 8) ----
+//
+// An external sink is a third party's API (book ch. 10's APNs, FCM, SMS and e-mail providers): a
+// queue of the type's numbers whose served requests fail a share `failure_rate`, and a
+// `politeness` printed, not modelled. Neither key names another node; `then` and `ops` stay
+// refused by own_keys_by_type (a provider calls nobody of ours).
+
+// `failure_rate: 0.02`: the share of what the sink serves that fails (a 5xx), in [0, 1]. Both
+// bounds are meaningful: 0 is a provider that never fails, 1 one that is down. Absent stays
+// model::NodeSpec's 0, the plain queue.
+CheckResult read_failure_rate(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (!body["failure_rate"]) return {};
+  const auto rate = number_value(body["failure_rate"]);
+  if (!rate || !is_ratio(*rate)) {
+    return site.fail(body["failure_rate"], "failure_rate must be between 0 and 1");
+  }
+  node.failure_rate = *rate;
+  return {};
+}
+
+// `politeness: 1/s`: how often one host may be called, a positive rate (0/s would be a provider
+// nobody may call, which a missing link says more plainly). Stored for explain, not modelled
+// (phase 3: it needs per-host state). Absent stays absent.
+CheckResult read_politeness(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (!body["politeness"]) return {};
+  auto politeness = read_bounded_rate(site, body, "politeness", "politeness");
+  if (!politeness) return std::unexpected(politeness.error());
+  if (!is_positive(politeness->per_second)) {
+    return site.fail(body["politeness"], "politeness must be positive");
+  }
+  node.politeness = *politeness;
+  return {};
+}
+
+CheckResult read_external_sink_keys(const Site& site, const YAML::Node& body,
+                                    model::NodeSpec& node) {
+  if (node.type != model::NodeType::external_sink) return {};
+  const auto this_node = node_site(site, node.id);
+  return read_failure_rate(this_node, body, node).and_then([&] {
+    return read_politeness(this_node, body, node);
+  });
+}
+
 // ---- Node bodies: the second pass -----------------------------------------------------
 
 // A client offers traffic (its `ops` are shares of its rate); every other node forwards
@@ -2644,6 +2687,7 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
     if (auto read = read_id_generator_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_message_queue_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_worker_pool_keys(site, entry.second, *node); !read) return read;
+    if (auto read = read_external_sink_keys(site, entry.second, *node); !read) return read;
     ++node;
   }
   return {};

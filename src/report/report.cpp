@@ -1268,6 +1268,19 @@ struct QueueProvenance {
   return text;
 }
 
+// An external sink's model (plan 2c refinement 8): "  failure_rate=2% politeness=1/s (not
+// modelled: phase 3)". The failure rate is always printed (0% is the plain queue): the share of
+// what the sink serves that fails, which a run counts as drops. Politeness only when the scenario
+// states it, and marked as what it is: stored, never simulated (it needs per-host state).
+[[nodiscard]] std::string external_sink_summary(const model::NodeSpec& spec) {
+  if (spec.type != model::NodeType::external_sink) return {};
+  std::string text = "  failure_rate=" + percent(spec.failure_rate);
+  if (spec.politeness) {
+    text += " politeness=" + fmt_rate(spec.politeness->per_second) + " (not modelled: phase 3)";
+  }
+  return text;
+}
+
 [[nodiscard]] std::string explain_nodes(const graph::Graph& g) {
   std::vector<Row> rows;
   for (std::size_t i = 0; i < g.nodes().size(); ++i) {
@@ -1281,7 +1294,8 @@ struct QueueProvenance {
                        blob_store_summary(g, i) + balancing_summary(g, i) +
                        limiter_summary(node.spec) + cache_summary(g, i) + cdn_summary(g, i) +
                        database_summary(node) + id_generator_summary(node.spec) +
-                       message_queue_summary(node.spec) + worker_pool_summary(node)}});
+                       message_queue_summary(node.spec) + worker_pool_summary(node) +
+                       external_sink_summary(node.spec)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }
