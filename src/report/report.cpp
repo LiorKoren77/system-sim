@@ -1242,7 +1242,8 @@ struct QueueProvenance {
          " N=" + std::to_string(model::kv_replication(spec)) +
          " W=" + std::to_string(model::kv_write_quorum(spec)) +
          " R=" + std::to_string(model::kv_read_quorum(spec)) +
-         " mode=" + std::string{model::to_string(spec.kv_mode)} + " (partitions: phase 3)";
+         " mode=" + std::string{model::to_string(model::kv_mode_of(spec))} +
+         " (partitions: phase 3)";
 }
 
 // "  sizes: stream 50MB, upload 300MB": on a byte-sized node (defaults::is_byte_sized), the size

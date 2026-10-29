@@ -410,7 +410,17 @@ TEST_CASE("least_connections marks its downstream service as pooled", "[graph]")
   REQUIRE(g.nodes()[*g.index_of("a")].imbalance == 1.0);
 }
 
-TEST_CASE("consistent_hash gives its downstream an imbalance of one plus one over root vnodes",
+// The ring heuristic of the review of plan 2c Tasks 9-10 (I-2): over M servers holding N copies
+// of each key, the hottest carries k = 1 + z_M / sqrt(N vnodes) times the average, z_M the expected
+// maximum of M standard normals by Blom's approximation, Phi^-1((M - 0.375) / (M + 0.25)) (pinned
+// in test_queueing.cpp): z_4 = 1.0491313979639711, z_8 = 1.4342001596863794. A balancer's ring
+// holds one copy of a key (N = 1).
+namespace {
+constexpr double blom_z4 = 1.0491313979639711;
+constexpr double blom_z8 = 1.4342001596863794;
+}  // namespace
+
+TEST_CASE("consistent_hash gives its downstream the expected hottest of its replicas' shares",
           "[graph]") {
   Scenario s{.name = "lb", .version = 1, .duration = 1min};
   s.nodes = {client("u", Rate{100}, {{"get", 1.0}}), load_balancer("lb", LbPolicy::consistent_hash),
@@ -419,9 +429,11 @@ TEST_CASE("consistent_hash gives its downstream an imbalance of one plus one ove
   s.nodes[2].replicas = 4;
   s.links = {LinkSpec{.from = "u", .to = "lb"}, LinkSpec{.from = "lb", .to = "a"}};
   const auto g = *Graph::build(s);
-  // 1 + 1/sqrt(100) = 1.1: the hottest of the ring's arcs carries about that much more than
-  // the average (a heuristic: the spread of a hash ring shrinks as 1/sqrt(vnodes)).
-  REQUIRE_THAT(g.nodes()[*g.index_of("a")].imbalance, WithinRel(1.1, 1e-12));
+  // 1 + z_4/sqrt(100) = 1.1049: a server's share spreads about 1/sqrt(vnodes) around the
+  // average (book ch. 5: 10 % at 100 virtual nodes), and the hottest of 4 sits z_4 = 1.049
+  // standard deviations above it.
+  REQUIRE_THAT(g.nodes()[*g.index_of("a")].imbalance, WithinRel(1.0 + blom_z4 / 10.0, 1e-12));
+  REQUIRE_THAT(g.nodes()[*g.index_of("a")].imbalance, WithinRel(1.1049, 1e-4));
   REQUIRE_FALSE(g.nodes()[*g.index_of("a")].pooled);
 }
 
@@ -1065,7 +1077,7 @@ double che_over_100k_zipf1_keys(double capacity) {
 }
 }  // namespace
 
-// The ring's arcs are uneven (ResolvedNode::imbalance k, 1 + 1/sqrt(vnodes)): the hottest
+// The ring's arcs are uneven (ResolvedNode::imbalance k, 1 + z_N/sqrt(vnodes)): the hottest
 // replica owns k/N of the keys and the others share the rest. Each replica is an LRU cache of
 // `keys` over its own arc, which for Che is one cache of keys / a over the whole space (a the
 // arc's share), and it serves a of the requests: h = Σ_j a_j · Che(keys / a_j).
@@ -1074,7 +1086,7 @@ TEST_CASE("a cache partitioned by a consistent-hash ring sums Che over its uneve
   const auto ring = Graph::build(replicated_che_cache(LbPolicy::consistent_hash));
   INFO((ring ? "" : ring.error().message));
   REQUIRE(ring.has_value());
-  const double k = 1.0 + 1.0 / std::sqrt(150.0);  // default vnodes
+  const double k = 1.0 + blom_z4 / std::sqrt(150.0);  // 4 replicas, default vnodes: 1.0857
   const double hot = k / 4;
   const double cool = (1 - hot) / 3;
   REQUIRE_THAT(*ring->hit_ratio(*ring->index_of("cache")),
@@ -3360,11 +3372,11 @@ TEST_CASE("a pool consuming a frontier gets the default room: 7 days of its rate
 // machines that follow its position. The graph resolves the cluster like any node of copies: its
 // copies are its `nodes`, each of `capacity` (a kv_cluster's `capacity` is PER NODE, as the lab
 // says), and the ring gives it an imbalance exactly as a consistent_hash balancer gives the
-// nodes behind it (mark_balanced_targets: the hottest copy carries k = 1 + 1/sqrt(vnodes) times
-// the average). With N = nodes every node holds every key, so no node is hotter than another.
-// The demand a cluster is sent is N times its requests (every request goes to N replicas); that
-// is a number the paper load and the engine compute, pinned in test_report.cpp and
-// test_theory.cpp, not a field of the graph.
+// nodes behind it (mark_balanced_targets: the hottest copy carries k = 1 + z_M/sqrt(N vnodes)
+// times the average, M the machines, N the copies of a key). With N = nodes every node holds every
+// key, so no node is hotter than another. The demand a cluster is sent is N times its requests
+// (every request goes to N replicas); that is a number the paper load and the engine compute,
+// pinned in test_report.cpp and test_theory.cpp, not a field of the graph.
 //
 // Proposed shape: Graph::build resolves the copies into ResolvedNode::spec.replicas (the count
 // that explain's capacity, the engine's copy groups and the balancer's ring already read) and
@@ -3412,36 +3424,50 @@ TEST_CASE("a kv_cluster's copies are its nodes, each of the stated per-node capa
   REQUIRE(store_of(*g).capacity.service_rate == Rate{10'000});
 }
 
-// One virtual-node count of 100 over a cluster of 8 whose keys live on 3 each: 1 + 1/sqrt(100)
-// = 1.1 times the average on the hottest node (the book's ch. 5 spread, as for the balancer).
+// One virtual-node count of 100 over a cluster of 8 whose keys live on 3 each: a machine holds
+// the arcs of its 100 virtual nodes for each of the 3 copies, 300 arcs, so its share spreads
+// 1/sqrt(300) around the average, and the hottest of 8 sits z_8 = 1.434 deviations above it:
+// 1 + 1.434/sqrt(300) = 1.0828 times the average.
 TEST_CASE(
-    "a kv_cluster keeping fewer copies than it has nodes is imbalanced by one plus one over root "
-    "vnodes",
+    "a kv_cluster keeping fewer copies than it has nodes is imbalanced by its hottest machine",
     "[graph]") {
   const auto g = Graph::build(kv_behind_client(kv_store(8, 3, 100)));
   INFO((g ? "" : g.error().message));
   REQUIRE(g.has_value());
-  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(1.1, 1e-12));
+  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(1.0 + blom_z8 / std::sqrt(300.0), 1e-12));
+  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(1.0828, 1e-4));
   REQUIRE_FALSE(store_of(*g).pooled);
 }
 
-// Without `vnodes` the ring takes model::default_vnodes, the balancer's 150: 1 + 1/sqrt(150) =
-// 1.08165 (the lab's "try 150").
+// Without `vnodes` the ring takes model::default_vnodes, the balancer's 150: 1 + z_8/sqrt(450) =
+// 1.06761 (the lab's "try 150" at 8 nodes).
 TEST_CASE("a kv_cluster without vnodes takes the balancer's default of 150", "[graph]") {
   const auto g = Graph::build(kv_behind_client(kv_store(8, 3)));
   INFO((g ? "" : g.error().message));
   REQUIRE(g.has_value());
-  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(1.0 + 1.0 / std::sqrt(150.0), 1e-12));
-  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(1.0816, 1e-4));
+  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(1.0 + blom_z8 / std::sqrt(450.0), 1e-12));
+  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(1.0676, 1e-4));
 }
 
-// One virtual node per machine is the worst ring: 1 + 1/sqrt(1) = 2, the hottest node carries
-// twice the average (as the consistent-hashing lab's "try vnodes: 1").
-TEST_CASE("one virtual node per machine doubles the hottest node's share", "[graph]") {
+// One virtual node per machine is the worst ring: each machine holds 3 arcs, so the hottest of 8
+// carries 1 + z_8/sqrt(3) = 1.828 times the average (as the consistent-hashing lab's "try
+// vnodes: 1", where one copy per key and 4 servers give 2.049).
+TEST_CASE("one virtual node per machine nearly doubles the hottest node's share", "[graph]") {
   const auto g = Graph::build(kv_behind_client(kv_store(8, 3, 1)));
   INFO((g ? "" : g.error().message));
   REQUIRE(g.has_value());
-  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(2.0, 1e-12));
+  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(1.0 + blom_z8 / std::sqrt(3.0), 1e-12));
+  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(1.828, 1e-3));
+}
+
+// The cap: a machine holds a key at most once, so it is sent at most every request, k N / M <= 1.
+// 3 machines, N = 2, one virtual node: 1 + z_3/sqrt(2) = 1.615 is beyond M / N = 1.5, so k = 1.5:
+// the hottest machine is one of every key's two replicas.
+TEST_CASE("a kv ring's hottest machine carries at most every request", "[graph]") {
+  const auto g = Graph::build(kv_behind_client(kv_store(3, 2, 1)));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE(store_of(*g).imbalance == 1.5);
 }
 
 // With N = nodes every node holds a replica of every key, so the load splits evenly whatever

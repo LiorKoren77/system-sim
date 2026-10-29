@@ -2730,16 +2730,22 @@ CheckResult refused_kv_replicas(const Site& site, const YAML::Node& body) {
                    "a kv_cluster's machines are nodes; replicas is not a key here");
 }
 
+// `mode: cp`, absent left absent (model::kv_mode_of applies ap), so explain can tell a stated
+// mode from the default.
+CheckResult read_kv_mode(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (!body["mode"]) return {};
+  model::KvMode mode{};
+  return read_optional_word(site, body, "mode", model::parse_kv_mode, "mode must be ap or cp", mode)
+      .transform([&] { node.kv_mode = mode; });
+}
+
 CheckResult read_kv_cluster_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   if (node.type != model::NodeType::kv_cluster) return {};
   const auto this_node = node_site(site, node.id);
   return refused_kv_replicas(this_node, body)
       .and_then([&] { return read_kv_counts(this_node, body, node); })
       .and_then([&] { return check_kv_shape(this_node, body, node); })
-      .and_then([&] {
-        return read_optional_word(this_node, body, "mode", model::parse_kv_mode,
-                                  "mode must be ap or cp", node.kv_mode);
-      });
+      .and_then([&] { return read_kv_mode(this_node, body, node); });
 }
 
 // ---- Node bodies: the second pass -----------------------------------------------------

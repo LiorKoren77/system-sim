@@ -4004,14 +4004,32 @@ TEST_CASE("a kv_cluster's nodes, vnodes, replication, quorums and mode are typed
 }
 
 // Dynamo's classic quorum (ch. 6: N = 3, W = 2, R = 2, so W + R > N) and the AP mode apply when
-// the scenario says nothing; the three defaults show in explain, not here (test_report pins
-// `nodes=3 N=3 W=2 R=2 mode=ap`). Here only: a kv_cluster that states `nodes` alone loads.
+// the scenario says nothing; the defaults show in explain, marked "(default)", not here
+// (test_report pins them). Here: a kv_cluster that states `nodes` alone loads, and what it did not
+// state stays absent, the mode included, so explain can tell a default from a choice (review of
+// plan 2c Tasks 9-10, minor 9).
 TEST_CASE("a kv_cluster that states only its nodes loads and takes Dynamo's defaults") {
   const auto path = write_temp("simsys_kv_nodes_only.yaml", kv_scenario("nodes: 3"));
   const auto s = simsys::config::load(path.string());
   INFO((s ? "" : s.error().message));
   REQUIRE(s.has_value());
   REQUIRE(s->nodes[0].kv_nodes == 3);
+  REQUIRE_FALSE(s->nodes[0].replication.has_value());
+  REQUIRE_FALSE(s->nodes[0].kv_mode.has_value());
+  REQUIRE(simsys::model::kv_mode_of(s->nodes[0]) == simsys::model::KvMode::ap);
+}
+
+// Which ops are writes, and so wait for W replicas instead of R, is the node's `write_ops`, as on
+// a cache, a CDN, a SQL database and a blob store (review of plan 2c Tasks 9-10, I-3). The graph
+// and the engine always honoured it; the loader refused it, so a client sending `put` straight to
+// a kv_cluster silently got the read quorum.
+TEST_CASE("a kv_cluster lists its write ops") {
+  const auto path =
+      write_temp("simsys_kv_write_ops.yaml", kv_scenario("nodes: 3, write_ops: [put, delete]"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->nodes[0].write_ops == std::vector<std::string>{"put", "delete"});
 }
 
 TEST_CASE("both modes are accepted, as ap and as cp") {

@@ -11,6 +11,7 @@
 module;
 #include <cmath>
 #include <limits>
+#include <span>
 #include <stdexcept>
 
 export module simsys.queueing;
@@ -48,7 +49,7 @@ export namespace simsys::queueing {
   return blocking / (1.0 - rho * (1.0 - blocking));
 }
 
-struct WaitMoments {
+struct TimeMoments {
   double mean_s;
   double variance_s2;
 };
@@ -70,7 +71,7 @@ struct WaitMoments {
 // Infinite at saturation: a queue with rho >= 1 has no steady state.
 // Same preconditions as erlang_c: `servers >= 1` (throws), NaN rho propagates, and a
 // negative service time simply yields negative waits (not guarded).
-[[nodiscard]] WaitMoments mmc_wait(int servers, double rho, double service_time_s) {
+[[nodiscard]] TimeMoments mmc_wait(int servers, double rho, double service_time_s) {
   if (servers < 1) throw std::invalid_argument{"servers must be >= 1"};
   if (rho >= 1.0) {
     constexpr double inf = std::numeric_limits<double>::infinity();
@@ -99,7 +100,7 @@ struct WaitMoments {
 // servers or a service SCV other than 1 (whose sojourn is not exponential).
 // Preconditions (programmer errors: the loader and graph::Graph::build refuse such a quorum):
 // 1 <= k <= n, else std::invalid_argument. An infinite mean gives infinite moments.
-[[nodiscard]] WaitMoments exponential_order_statistic(int n, int k, double mean_s) {
+[[nodiscard]] TimeMoments exponential_order_statistic(int n, int k, double mean_s) {
   if (n < 1) throw std::invalid_argument{"exponential_order_statistic: n must be >= 1"};
   if (k < 1 || k > n) {
     throw std::invalid_argument{"exponential_order_statistic: k must be in [1, n]"};
@@ -156,6 +157,40 @@ inline constexpr double z_p99 = 2.3263478740408408;
   const double sigma_sq = std::log1p((variance / mean) / mean);
   const double mu = std::log(mean) - sigma_sq / 2.0;
   return std::exp(mu + std::sqrt(sigma_sq) * z_score);
+}
+
+// RED STUBS (TDD): signatures only.
+[[nodiscard]] double normal_cdf(double) {
+  return 0.0;
+}
+[[nodiscard]] double normal_quantile(double) {
+  return 0.0;
+}
+[[nodiscard]] double expected_normal_maximum(int) {
+  return 1.0;
+}
+struct TrialGroup {
+  int trials;
+  double success;
+};
+[[nodiscard]] double probability_fewer_than(std::span<const TrialGroup>, int) {
+  return 0.0;
+}
+struct LogGrid {
+  double first_log_s;
+  double step;
+  int points;
+};
+template <class Survival>
+[[nodiscard]] TimeMoments moments_from_survival(LogGrid, Survival&&) {
+  return {};
+}
+struct ReplicaGroup {
+  int replicas;
+  TimeMoments sojourn;
+};
+[[nodiscard]] TimeMoments lognormal_order_statistic(std::span<const ReplicaGroup>, int) {
+  return {};
 }
 
 }  // namespace simsys::queueing

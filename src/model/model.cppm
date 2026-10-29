@@ -584,12 +584,13 @@ struct NodeSpec {
   // refuse a cluster without one); the others default (default_replication, default_quorum: the
   // book's N = 3, W = R = 2) through kv_replication, kv_write_quorum and kv_read_quorum. The
   // loader leaves an absent one absent. `kv_mode` is ap or cp, what a partition would cost
-  // (KvMode): read and printed, not modelled before faults (phase 3).
+  // (KvMode): read and printed, not modelled before faults (phase 3); absent means ap (kv_mode_of),
+  // kept absent so explain can mark it "(default)" as it marks N, W and R.
   std::optional<int> kv_nodes{};
   std::optional<int> replication{};
   std::optional<int> write_quorum{};
   std::optional<int> read_quorum{};
-  KvMode kv_mode{KvMode::ap};
+  std::optional<KvMode> kv_mode{};
   // Search indexes only (plan 2c refinement 10; declared after the kv keys, for designated
   // initializers): book ch. 13 ("Design a search autocomplete system") keeps its trie database
   // fresh by rebuilding it periodically from the aggregated query logs, and `build_interval` says
@@ -613,6 +614,10 @@ struct NodeSpec {
 }
 [[nodiscard]] constexpr int kv_read_quorum(const NodeSpec& spec) {
   return spec.read_quorum.value_or(std::min(default_quorum, kv_replication(spec)));
+}
+// The mode, ap (Dynamo's choice: available and possibly stale under a partition) by default.
+[[nodiscard]] constexpr KvMode kv_mode_of(const NodeSpec& spec) {
+  return spec.kv_mode.value_or(KvMode::ap);
 }
 
 // The window and the burst a rate limiter works with, defaults applied. The loader leaves

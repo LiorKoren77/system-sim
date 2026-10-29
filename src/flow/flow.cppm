@@ -43,6 +43,10 @@ void require_finite_non_negative(double value, const char* message) {
     throw std::invalid_argument{message};
 }
 
+}  // namespace simsys::flow
+
+export namespace simsys::flow {
+
 // The larger of two moments, NaN if either is NaN. std::max(a, b) is `a < b ? b : a`, and
 // every comparison with NaN is false, so it returns its FIRST argument when the second is
 // NaN: a NaN branch after a finite one would vanish from the maximum, and the result would
@@ -51,9 +55,6 @@ void require_finite_non_negative(double value, const char* message) {
   if (std::isnan(a) || std::isnan(b)) return std::numeric_limits<double>::quiet_NaN();
   return std::max(a, b);
 }
-}  // namespace simsys::flow
-
-export namespace simsys::flow {
 
 using OpName = std::string;
 
