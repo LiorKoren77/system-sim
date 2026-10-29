@@ -201,9 +201,7 @@ int run_estimate(const std::filesystem::path& file, const ReportOptions& options
     std::println("{}{}", estimate_header,
                  has_windowed_limiter(*g) ? windowed_limiter_caveat : std::string_view{});
   }
-  report::Summary summary{*g, simsys::SimTime{0}};
-  summary.observe(record);
-  return print_report(summary, options);
+  return print_report(report::Summary::of_estimate(*g, record), options);
 }
 
 // The first SLO window (`over`) longer than the run observes after the warmup, duration −

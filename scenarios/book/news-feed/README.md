@@ -151,7 +151,7 @@ steps, 5 min warmup: 861,000 observed steps, about 20 s in a Release build).
   rho falls from 0.1576 to 0.1266, `feed_cache`'s from 0.3087 to 0.2492), and a hydration whose
   miss read was dropped skips its author (`user_cache` 0.3027 → 0.2973). The replicas fall
   behind without bound (`missed writes/s per replica 267`). The `read_feed` p99 still passes
-  (75.1 ms), so only the drop rate tells.
+  (75.7 ms), so only the drop rate tells.
 - **A worse post cache** (`post_cache`'s `hit_ratio: {fixed: 0.8}`, from 0.95): the misses
   quadruple to 51.88k reads/s and the 6 shards' replicas are no longer enough: `each replica
   6.125k units/s vs 5k/s (123%, red)` while the primaries stay at 36 %; the run drops 0.211 %

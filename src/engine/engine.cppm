@@ -307,14 +307,25 @@ class Simulation {
   // read links without their delay (in the long run a link delivers what it is sent).
   enum class Mode { advance, settle };
 
+  // Settle mode only: a delivered fraction as estimate()'s passes thin later steps by, the damped
+  // running average d̄ of what the passes measured (see estimate). Each pass moves it a share
+  // `weight` of the way to the new measurement, d̄ ← (1 − w) d̄ + w d, and halves w whenever the
+  // gap d − d̄ changes sign (the average overshot the fixed point), down to min_settling_weight.
+  // 1 with w = 1/2 before any pass: nothing lost yet, and at first the old halfway average.
+  struct DampedFraction {
+    double value{1.0};
+    double weight{0.5};
+    double last_gap{0.0};  // d − d̄ at the previous pass: 0 before the first
+    void move_towards(double measured);
+  };
+
   // What the backward pass knows about one (node, op): the response time of an answered
   // request and the fraction of the requests that are answered (plan 2a refinement 8).
   struct Answer {
     flow::LatencyEstimate latency{};
     double delivered{1.0};  // 1 until the first backward pass: nothing lost yet
-    // Settle mode only: the running average d̄ ← (d̄ + delivered) / 2 that estimate()'s passes
-    // thin later steps by instead of `delivered` (see estimate). 1 before any pass.
-    double settling_delivered{1.0};
+    // Settle mode only: `delivered` damped over estimate()'s passes, which thin later steps by it.
+    DampedFraction settling_delivered{};
   };
   // Per-op answers of one node, kept across steps: a feedback target reads the previous
   // step's entry. std::less<> (transparent) lets find() take a string_view.
@@ -428,10 +439,10 @@ class Simulation {
     CopyGroup group;  // one copy (CopyGroup's defaults): the queue and what it holds, in MB
     behaviours::MegabyteService timing;
     std::map<std::string, double, std::less<>> megabytes_by_op{};  // every op it may carry
-    std::size_t slot{};            // its sample's index in StepRecord::links
-    flow::LatencyEstimate wait{};  // this step's queueing wait
-    double passed{1.0};            // the share of this step's arriving megabytes not dropped
-    double settling_passed{1.0};   // settle mode only: `passed` averaged as Answer's d̄ is
+    std::size_t slot{};                // its sample's index in StepRecord::links
+    flow::LatencyEstimate wait{};      // this step's queueing wait
+    double passed{1.0};                // the share of this step's arriving megabytes not dropped
+    DampedFraction settling_passed{};  // settle mode only: `passed` damped as Answer's d̄ is
   };
 
   struct Link {
@@ -787,6 +798,11 @@ inline constexpr double settle_tolerance = 1e-12;
 // bounds estimate() well under a second for phase 1 scenarios; see estimate() for what
 // needs more passes than this.
 inline constexpr int max_settle_passes = 100'000;
+// ...and the smallest weight a damped fraction's average moves by (Simulation::DampedFraction):
+// small enough to settle a self-thinning slope down to f' = 1 − 2 × 1024 = −2047 (the damped map's
+// slope 1 − w + w f' stays above −1), large enough that the slowest fraction, its slope near 0,
+// still settles in about 1024 × ln(1e12) ≈ 28k passes, inside max_settle_passes.
+inline constexpr double min_settling_weight = 1.0 / 1024.0;
 
 // Written so that a NaN never counts as unchanged (every comparison with NaN is false)
 // and an `inf` latency (a zero-capacity node, "unavailable") that stays inf does.
@@ -1261,11 +1277,21 @@ void Simulation::require_scenario_step(SimTime dt) const {
 // fixed-point iteration of its own, d = f(d): the more a delivers, the more its later calls are
 // sent, the less it delivers, so f is decreasing. Fed back raw (d ← f(d)), a steep f (|f'| > 1)
 // never settles: the fractions flip between a high and a low value every pass. So settle mode
-// thins by a running average instead (average_settling_fractions):
-//   d̄ ← (d̄ + f(d̄)) / 2                       (damped fixed-point iteration, "averaging")
-// whose fixed point is the same, d̄ = f(d̄), and which converges whenever f' > −3 there (its slope
-// is (1 + f') / 2); f decreasing and continuous has exactly one fixed point. Five calls to `a`
-// (3686/s, a room of one) at 1k/s settle at d = 0.9: load 4095, 10 % dropped. `run` cannot settle
+// thins by a damped running average instead (average_settling_fractions, DampedFraction):
+//   d̄ ← (1 − w) d̄ + w f(d̄)                   (damped fixed-point iteration, Mann's "averaging")
+// whose fixed point is the same, d̄ = f(d̄); f decreasing and continuous has exactly one. Near it
+// the error is multiplied each pass by the damped map's slope 1 − w + w f', which shrinks it when
+// it lies in (−1, 1), i.e. when f' > 1 − 2 / w. A fixed w = 1/2 (the plain halfway average) thus
+// settles only for f' > −3: five calls to one node (f' = −1.79) do, ten (f' = −3.65) and twenty
+// (f' = −6.2) did not, flipping round the fixed point until the pass cap. So w starts at 1/2 and
+// is halved whenever d − d̄ changes sign, the sign that d̄ overshot the fixed point: each halving
+// doubles the slope the iteration can absorb, so after k overshoots it settles any f' > 1 − 2^(k+2)
+// and stops overshooting (the slope turns positive) once w < 1 / (1 − f'). A fraction that never
+// overshoots keeps w = 1/2 and settles exactly as before. w stops halving at min_settling_weight
+// (1/1024): the one limit left, f' > −2047, far steeper than any op calls one node (twenty calls
+// are −6.2). Five calls to `a` (3686/s, a room of one) at 1k/s settle at d = 0.9: load 4095, 10 %
+// dropped; ten and twenty calls at the capacity that makes d = 0.9 their fixed point settle there
+// too (tests/theory/test_theory.cpp). `run` cannot settle
 // there in that case: its steps thin by the raw last step's fraction (the one-step lag), so it
 // shows a sawtooth, a step at 5000 offered and red alternating with one at 2988 and yellow, for the
 // whole run; its averages over many steps are not the fixed point either. The estimate of every
@@ -1329,7 +1355,7 @@ Simulation Simulation::settling_copy() const {
     pipe.group.waiting.clear();
     pipe.wait = flow::LatencyEstimate{};
     pipe.passed = 1.0;
-    pipe.settling_passed = 1.0;
+    pipe.settling_passed = DampedFraction{};
   }
   return scratch;
 }
@@ -1347,19 +1373,29 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
 }
 
 // The damping of estimate()'s thinning (see estimate): after each settle pass every delivered
-// fraction later steps are thinned by, a node's per op and a pipe's kept share, moves halfway to
-// what the pass measured, d̄ ← (d̄ + d) / 2. Exactly 1 stays 1 (a lossless path is untouched), and
-// at the fixed point d̄ = d.
+// fraction later steps are thinned by, a node's per op and a pipe's kept share, moves towards what
+// the pass measured (DampedFraction::move_towards). Exactly 1 stays 1 (a lossless path is
+// untouched), and at the fixed point d̄ = d.
 void Simulation::average_settling_fractions() {
   for (auto& node : nodes_) {
     for (auto& [op, answer] : node.responses) {
-      answer.settling_delivered = (answer.settling_delivered + answer.delivered) / 2.0;
+      answer.settling_delivered.move_towards(answer.delivered);
     }
   }
   for (auto& link : links_) {
-    if (link.pipe)
-      link.pipe->settling_passed = (link.pipe->settling_passed + link.pipe->passed) / 2.0;
+    if (link.pipe) link.pipe->settling_passed.move_towards(link.pipe->passed);
   }
+}
+
+// Damped fixed-point iteration with an adaptive weight (see estimate for why it converges):
+//   d̄ ← (1 − w) d̄ + w d,   w halved when (d − d̄) and the previous pass's gap differ in sign.
+// At w = 1/2, (1 − w) d̄ + w d is (d̄ + d) / 2 to the last bit (halving is exact in binary), so a
+// fraction that never overshoots settles exactly as the plain halfway average did.
+void Simulation::DampedFraction::move_towards(double measured) {
+  const double gap = measured - value;
+  if (gap * last_gap < 0.0) weight = std::max(weight / 2.0, min_settling_weight);
+  last_gap = gap;
+  value = (1.0 - weight) * value + weight * measured;
 }
 
 // Each message queue's lag (NodeSample::queue_lag_s has the formula): the largest of its consumer
@@ -2064,9 +2100,9 @@ double Simulation::hop_delivered_for_thinning(std::size_t caller, std::size_t ta
   if (mode == Mode::advance) return hop_delivered(caller, target, op);
   const auto& table = nodes_[target].responses;
   const auto found = table.find(op);
-  const double settled = found == table.end() ? 1.0 : found->second.settling_delivered;
+  const double settled = found == table.end() ? 1.0 : found->second.settling_delivered.value;
   const Pipe* pipe = pipe_between(caller, target);
-  return pipe == nullptr ? settled : pipe->settling_passed * settled;
+  return pipe == nullptr ? settled : pipe->settling_passed.value * settled;
 }
 
 }  // namespace simsys::engine

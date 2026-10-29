@@ -1279,7 +1279,10 @@ TEST_CASE(
 // queueing::lognormal_below(m, v, 100 ms) answers Phi(z) = 0.9338 of them (z = (ln L - mu) / sigma)
 // in 27.24 ms on average: 6.62 % of the 8.589k delivered time out (568.8/s), 8.020k are answered,
 // and the p99 SLO fails at the timeout (more than 1 % timed out). Weighted by the puts offered, as
-// before the fix, it was 7.43 % (638.4/s) and a mean of 29.4 ms.
+// before the fix, it was 7.43 % (638.4/s) and a mean of 29.4 ms. The p50 is the client's: the
+// timed-out puts are all slower than the answered ones, so it is the answered puts' fit read at
+// q_eff = 0.5 / 0.9338 = 0.5355 (z = 0.0890), 22.7 ms (review of the Task 12/13 fix rounds and
+// Task 14, C-1; read at 0.5, their own median, it was 21.3 ms).
 TEST_CASE(
     "labs/kv-store with one virtual node and a write quorum of three times out the puts past 100ms",
     "[scenario]") {
@@ -1294,6 +1297,11 @@ TEST_CASE(
   REQUIRE_THAT(put.mean_s, Catch::Matchers::WithinRel(below.mean_s, 1e-6));
   REQUIRE_THAT(put.timed_out_per_s / delivered, Catch::Matchers::WithinRel(0.06622, 1e-3));
   REQUIRE_THAT(put.mean_s, Catch::Matchers::WithinRel(27.24e-3, 1e-3));
+  const double z_eff = simsys::queueing::normal_quantile(0.5 / below.fraction);
+  REQUIRE_THAT(put.p50_s, Catch::Matchers::WithinRel(simsys::queueing::lognormal_quantile(
+                                                         below.mean_s, below.variance_s2, z_eff),
+                                                     1e-5));
+  REQUIRE_THAT(put.p50_s, Catch::Matchers::WithinRel(22.7e-3, 2e-3));
   const auto results = run_slos(kv_lab_writing_to_all_three(true));
   const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
   REQUIRE(p99.status == simsys::report::SloStatus::fail);
@@ -1599,7 +1607,10 @@ TEST_CASE(
 //   answered            886.6 - 293.6               = 593.0/s
 // and since more than 1 % of the delivered shortens timed out, the p99 the client saw is the
 // timeout itself, exactly 1 s (review of Task 13, C-1). The timed-out ones were delivered: they are
-// counted from what the path delivered, not from what was offered.
+// counted from what the path delivered, not from what was offered. Its p50 is the answered
+// shortens' fit read at 0.5 / (1 − 0.331) = 0.747, since every timed-out shorten is slower than
+// every answered one: 571 ms (review of the Task 12/13 fix rounds and Task 14, C-1; read at 0.5,
+// the answered shortens' own median, it was 329 ms; without the timeout the fit's median is 545).
 TEST_CASE(
     "book/url-shortener with a ticket server answers 593 shortens a second and times out 293.6",
     "[scenario]") {
@@ -1625,6 +1636,7 @@ TEST_CASE(
   REQUIRE_THAT(lost / shorten->offered_per_s,
                Catch::Matchers::WithinRel(summary.drop_rate("id_gen"), 1e-3));
   REQUIRE(shorten->p99_s == 1.0);
+  REQUIRE_THAT(shorten->p50_s, Catch::Matchers::WithinRel(0.571, 2e-3));
 }
 
 // ---- youtube end to end (plan 2c Task 16) ----

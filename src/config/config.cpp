@@ -3144,9 +3144,14 @@ CheckResult check_slo_shape(const Site& site, const YAML::Node& entry, const mod
 }
 
 // `over: 10m` (plan 2c Task 14): the SLO is checked on every window of that length after warmup,
-// and the worst window decides (report::Summary). A window must hold at least one step (a shorter
-// one would observe nothing: the run moves a step at a time) and at most the observed run,
-// duration − warmup (a longer one would never complete, so the SLO would check nothing).
+// and the worst window decides (report::Summary). A window must hold a whole number of steps, at
+// least one: the run moves a step at a time and a step belongs to the window its start falls in,
+// so a shorter window would observe nothing, and `over: 1500ms` at `step: 1s` would make windows
+// of two steps and one step in turn (the rule a windowed rate limiter's `window` follows,
+// graph::window_off_the_step_grid). And at most the observed run, duration − warmup: a longer one
+// would hold the whole run as one window shorter than `over`, which the report would call a
+// window of `over` it never filled. (A run whose observed part is not a whole number of windows
+// still ends with a shorter window; that one is checked and labelled with its real length.)
 CheckResult read_slo_over(const Site& site, const YAML::Node& entry, const model::Scenario& run,
                           std::optional<SimTime>& over) {
   if (!entry["over"]) return {};
@@ -3155,6 +3160,11 @@ CheckResult read_slo_over(const Site& site, const YAML::Node& entry, const model
   if (window->count() < run.step.count()) {
     return site.fail(entry["over"],
                      std::format("over must be at least one step ({} < step {})",
+                                 describe_duration(*window), describe_duration(run.step)));
+  }
+  if (window->count() % run.step.count() != 0) {
+    return site.fail(entry["over"],
+                     std::format("over must be a whole number of steps ({}, step {})",
                                  describe_duration(*window), describe_duration(run.step)));
   }
   const SimTime observed{run.duration.count() - run.warmup.count()};

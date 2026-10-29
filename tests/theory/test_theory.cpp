@@ -4830,8 +4830,9 @@ TEST_CASE("a second step is sent only what the first step delivered: 500 of 1000
 // d straight back never settles: d = 1 offers 5000 (drops 26 %), d = 0.74 offers 2988 (drops
 // nothing), d = 1 again... `run` thins every step by the raw fraction of the step before (it
 // cannot know this step's before serving it), so it shows exactly that sawtooth for the whole run:
-// the fixed point is not a state any step passes through. `estimate` thins by the average of its
-// passes' fractions, d̄ ← (d̄ + d) / 2, whose slope there is (1 − 1.79) / 2 ≈ −0.4, and settles.
+// the fixed point is not a state any step passes through. `estimate` thins by a damped average of
+// its passes' fractions, d̄ ← (1 − w) d̄ + w d, starting at w = 1/2, whose slope there is
+// (1 − 1.79) / 2 ≈ −0.4, and settles.
 TEST_CASE("five calls to one overloaded node settle at d = 0.9 under estimate: 4095 offered",
           "[theory]") {
   const Step call_a{.to = "a", .op = "x"};
@@ -4844,6 +4845,41 @@ TEST_CASE("five calls to one overloaded node settle at d = 0.9 under estimate: 4
   // The client is answered only when all five calls are: d⁵ = 0.59 of its 1000/s.
   REQUIRE_THAT(estimate.responses[0].answered.per_second,
                WithinRel(1000.0 * std::pow(0.9, 5), 1e-3));
+}
+
+// The same op with ten and with twenty calls to `a`, each `a` sized so that d = 0.9 is again the
+// fixed point (review of the Task 12/13 fix rounds and Task 14, minor 2). With n calls
+//   L(d) = 1000 × (1 − dⁿ) / (1 − d),   capacity = 0.9 × L(0.9):
+//   n = 10: L(0.9) = 6513.2, capacity 5862 (d = 0.900004);  n = 20: L(0.9) = 8784.2, capacity 7906.
+// The map f(d) = capacity / L(d) is much steeper there: f'(d) = −d L'(d) / L(d) = −3.65 at ten
+// calls and −6.23 at twenty. The plain halfway average has slope 1/2 + f'/2 = −1.32 and −2.62:
+// past −1, so it overshot further every pass, and estimate ended at the pass cap with the
+// no-steady-state warning and 20.8 % (ten calls) or 0 % (twenty) dropped instead of 10 %.
+// Halving the weight at each overshoot (Simulation::DampedFraction) brings the slope 1 − w + w f'
+// inside (−1, 1) once w is down to 1/4 at ten calls (−0.16) and to 1/8 at twenty (0.10), and the
+// passes settle on d = 0.9. (By hand, the same way: fifty calls at d = 0.95, f' = −14.8, and a
+// thousand at d = 0.999, f' = −417, settle too.)
+TEST_CASE("ten and twenty calls to one overloaded node settle at d = 0.9 under estimate",
+          "[theory]") {
+  const Step call_a{.to = "a", .op = "x"};
+  struct Case {
+    std::size_t calls;
+    double capacity;
+    double offered;  // L(0.9) for that many calls
+  };
+  for (const auto& c : {Case{.calls = 10, .capacity = 5862, .offered = 6513.2},
+                        Case{.calls = 20, .capacity = 7906, .offered = 8784.2}}) {
+    CAPTURE(c.calls);
+    const auto g = *Graph::build(
+        steps_chain(std::vector<Step>(c.calls, call_a), {lossy_target("a", c.capacity)}));
+    const auto estimate = simulation_of(g).estimate();
+    REQUIRE(estimate.converged);
+    REQUIRE_THAT(demand_at(estimate, g, "a"), WithinRel(c.offered, 1e-3));
+    REQUIRE_THAT(dropped_share_at(estimate, g, "a"), WithinRel(0.1, 1e-3));  // d = 0.9
+    // Answered only when all n calls are: 0.9ⁿ of the 1000/s.
+    REQUIRE_THAT(estimate.responses[0].answered.per_second,
+                 WithinRel(1000.0 * std::pow(0.9, static_cast<double>(c.calls)), 1e-3));
+  }
 }
 
 // Survival multiplies down the chain. a delivers 0.5, so b is offered 1000 x 0.5 = 500/s; b can

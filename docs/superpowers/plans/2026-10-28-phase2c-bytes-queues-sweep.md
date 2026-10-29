@@ -525,10 +525,64 @@
 
 **Review of cea7355, d92834f and 0d1a8d5 (Task 12/13 fix rounds and Task 14) at 0d1a8d5 (adversarial, REQUEST_CHANGES, one critical) — fix round on main before the comprehensive 2c review.** Verified: 1086/1086 both presets, warning-free, format clean; the sawtooth on `[a×5]` (run 5000 ↔ 2988.1, estimate 10 % dropped) and `[a, b, a]` (run 1366.03, estimate d²); every earlier probe (ticket variant, `timeout: 0s` refused, 1 ns/1 ms/391 ms FAIL, 604 ms PASS, unique-id `max: 1s` FAIL with null JSON); every Task 14 pin; the timeout rule per window (only the spike window fails with `1.98 % … timed out`); window reproduction by plain runs (0.6433106763224665); `window_start_s` 46920 right (47520 was the slip); conservation on all ten scenarios (≥ −2e-6 from CSV rounding), CSV = JSON ≤ 1e-6; the chain hash re-derived byte-equal; explain byte-identical across the three commits; estimate sane on all 14 with `over: 1m` on every SLO; README re-quotes; `same_slo` claim true (defaulted `==` fails on `std::chrono::duration@simsys.core`); `over` = step on 24 h url-shortener 1.22 s vs 0.55 s; no NaN; one code path for windows (a window is a `Summary`); first-use comments; test names.
 
-- [ ] **C-1 (reopened) A timeout still turns a failing latency SLO into a passing one while the timed-out share s stays under 1 − q** (`report.cpp` ~329 `percentile_seen_by_client`): below the threshold the percentile is the answered requests' quantile at q, but the client's real quantile is the answered quantile at q / (1 − s). M/M/1 (990/s, 1k/s, 1 ms), p99 SLO max 420 ms: no timeout FAIL 490; 470 ms (1.15 %) FAIL 470; **530 ms (0.78 %) PASS 404**; 700 ms FAIL 437; 1 s FAIL 465 (true exponential p99 460): not monotonic. The spike probe (1k/s, 2.5× spike, 2k/s service, `timeout: 50ms`): a whole-run p50 SLO max 1 ms PASSes at 957 µs with 28.6 % timed out (FAILs at 77.1 ms without). Fix: read the fit at q_eff = q / (1 − s) with z = `queueing::normal_quantile(q_eff)`, cap at the timeout; keep the `beyond_timeout` note path for s > 1 − q (continuous at the threshold: q_eff → 1 gives the timeout; the 0.5 %-at-604 ms PASS test stays valid). Update the schema (~1169 "Otherwise the percentile is the answered requests' fit"), the `OpSummary` comment, every README/test number that moves (consistent-hashing `vnodes: 1`, rate-limiter, kv-store, news-feed, youtube, url-shortener: re-quote from the binary), numerics §10; tests for the 530 ms case and the p50 spike case.
-- [ ] **I-1 Non-latency windows are skipped when no client offers in them even while the system is still busy** (`report.cpp` ~519 `offered_in`): a queue fed 100/s from 4 m to 5 m, one 100 ms worker, `{utilization, w, max 0.8, over: 5m}`: the 00:05 window runs at utilization 1 (draining) but is skipped, the windowed SLO PASSes at 0.2 while the whole-run SLO observes 0.3333 (a worst window below the mean). Fix: skip only latency SLOs' windows where the op offered nothing; judge every other metric on every window (an all-idle run PASSes at 0 like the whole-run SLO); schema `over` paragraph.
-- [ ] Minors: 1 `estimate` prints a window it never measured (`(worst 1h from 00:00)`, `window_start_s: 0`): print `(at 00:00 only: run checks each 1h)`, drop `window_start_s` in estimate, schema; 2 the ½ damping converges only for f' > −3 (ten calls to one node, f' = −3.65, and twenty, −6.2, end with the warning and 20.8 % / 0 % dropped instead of 10 %; eight calls converge): halve the averaging weight whenever the sign of d − d̄ flips (or Mann 1/(k+1)); theory test with 10 and 20 calls; state any remaining limit in the schema (~270 says "settles at the true fixed point" unconditionally); 3 `over` must be a whole number of steps like a limiter's `window` (`config.cpp` ~3141; `over: 1500ms` at `step: 1s` gives alternating 2- and 1-step windows); 4 window starts off a minute print `from 20m` for 1199 s (`report.cpp` ~961): HH:MM:SS when not minute-aligned; 5 a short last window is labelled with the full length (`run --duration 30m` on url-shortener: `(worst 1h from 00:02)` for 28 minutes) and the loader's comment "would never complete" is contradicted: print the actual length when shorter, fix the comment; 6 `test_windows.cpp` ~391 "the whole-day mean … 0.6455" is the peak (day mean 0.4306); 7 `report.cppm` ~272 `std::vector<Summary> current` as an optional of an incomplete type needs a one-line reason; 8 `graph.cppm` ~837 `split_parallel_group` → `nonadjacent_parallel_steps`; 9 `report.cpp` ~776 duplicates the `std::optional::transform` first-use comment (first use is ~532); 10 schema ~1066 "slightly worse" understates the grid-vs-sliding gap (0.70 vs 0.82). (The flaky five-second test was fixed in a2e0f42 by measuring CPU time.)
-- [ ] Commit `report: a client's percentile read at q/(1 − s); busy windows judged; estimate's window text; damping that converges; review nits`.
+- [x] **C-1 (reopened) A timeout still turns a failing latency SLO into a passing one while the timed-out share s stays under 1 − q** (`report.cpp` ~329 `percentile_seen_by_client`): below the threshold the percentile is the answered requests' quantile at q, but the client's real quantile is the answered quantile at q / (1 − s). M/M/1 (990/s, 1k/s, 1 ms), p99 SLO max 420 ms: no timeout FAIL 490; 470 ms (1.15 %) FAIL 470; **530 ms (0.78 %) PASS 404**; 700 ms FAIL 437; 1 s FAIL 465 (true exponential p99 460): not monotonic. The spike probe (1k/s, 2.5× spike, 2k/s service, `timeout: 50ms`): a whole-run p50 SLO max 1 ms PASSes at 957 µs with 28.6 % timed out (FAILs at 77.1 ms without). Fix: read the fit at q_eff = q / (1 − s) with z = `queueing::normal_quantile(q_eff)`, cap at the timeout; keep the `beyond_timeout` note path for s > 1 − q (continuous at the threshold: q_eff → 1 gives the timeout; the 0.5 %-at-604 ms PASS test stays valid). Update the schema (~1169 "Otherwise the percentile is the answered requests' fit"), the `OpSummary` comment, every README/test number that moves (consistent-hashing `vnodes: 1`, rate-limiter, kv-store, news-feed, youtube, url-shortener: re-quote from the binary), numerics §10; tests for the 530 ms case and the p50 spike case.
+- [x] **I-1 Non-latency windows are skipped when no client offers in them even while the system is still busy** (`report.cpp` ~519 `offered_in`): a queue fed 100/s from 4 m to 5 m, one 100 ms worker, `{utilization, w, max 0.8, over: 5m}`: the 00:05 window runs at utilization 1 (draining) but is skipped, the windowed SLO PASSes at 0.2 while the whole-run SLO observes 0.3333 (a worst window below the mean). Fix: skip only latency SLOs' windows where the op offered nothing; judge every other metric on every window (an all-idle run PASSes at 0 like the whole-run SLO); schema `over` paragraph.
+- [x] Minors: 1 `estimate` prints a window it never measured (`(worst 1h from 00:00)`, `window_start_s: 0`): print `(at 00:00 only: run checks each 1h)`, drop `window_start_s` in estimate, schema; 2 the ½ damping converges only for f' > −3 (ten calls to one node, f' = −3.65, and twenty, −6.2, end with the warning and 20.8 % / 0 % dropped instead of 10 %; eight calls converge): halve the averaging weight whenever the sign of d − d̄ flips (or Mann 1/(k+1)); theory test with 10 and 20 calls; state any remaining limit in the schema (~270 says "settles at the true fixed point" unconditionally); 3 `over` must be a whole number of steps like a limiter's `window` (`config.cpp` ~3141; `over: 1500ms` at `step: 1s` gives alternating 2- and 1-step windows); 4 window starts off a minute print `from 20m` for 1199 s (`report.cpp` ~961): HH:MM:SS when not minute-aligned; 5 a short last window is labelled with the full length (`run --duration 30m` on url-shortener: `(worst 1h from 00:02)` for 28 minutes) and the loader's comment "would never complete" is contradicted: print the actual length when shorter, fix the comment; 6 `test_windows.cpp` ~391 "the whole-day mean … 0.6455" is the peak (day mean 0.4306); 7 `report.cppm` ~272 `std::vector<Summary> current` as an optional of an incomplete type needs a one-line reason; 8 `graph.cppm` ~837 `split_parallel_group` → `nonadjacent_parallel_steps`; 9 `report.cpp` ~776 duplicates the `std::optional::transform` first-use comment (first use is ~532); 10 schema ~1066 "slightly worse" understates the grid-vs-sliding gap (0.70 vs 0.82). (The flaky five-second test was fixed in a2e0f42 by measuring CPU time.)
+- [x] Commit `report: a client's percentile read at q/(1 − s); busy windows judged; estimate's window text; damping that converges; review nits`.
+  Fix round notes: C-1 `percentile_seen_by_client` reads the answered requests' fit at
+  q_eff = q / (1 − s) (z = `queueing::normal_quantile(q_eff)`), capped at the timeout; s = 0 keeps
+  the three constant z-scores (a client with nothing timed out is bit-identical to before),
+  q_eff ≥ 1 (s = 1 − q exactly) is the timeout unflagged, s > 1 − q keeps the `beyond_timeout`
+  path. Tests (test_timeout.cpp): the 530 ms M/M/1 case (s 0.777 %, the fit at q_eff 0.99776 is at
+  590.9 ms, so the p99 is the cap, 530 ms: a 420 ms SLO FAILs; p50 72.92 ms), and a spike case of my
+  own (1k/s, 2.5× for 1 minute in 10, 2k/s service, `timeout: 50ms`; the reviewer's exact probe
+  was not recorded): s 18.37 %, p50 read at 0.6125 is 1.158 ms where the answered median was
+  0.889 ms, a 1 ms p50 SLO FAILs (39.2 ms without the timeout), the p50 checked against the fit
+  rebuilt from the step records. Pins added: test_report 200 ms p50 68.44 ms; test_scenarios the
+  kv `vnodes: 1` + `write_quorum: 3` p50 (fit at 0.5 / 0.9338, 22.7 ms) and the url-shortener
+  ticket p50 571 ms. Schema (v1.4 list, SLO table, `client` row, timeout paragraph), `OpSummary`,
+  the spec's §19 entries 12/13, the root README and numerics §10 (a "Which quantile of that fit"
+  paragraph) say the rule. I-1 `offered_in` is gone: every window goes through `evaluate_slo`,
+  whose `worst_latency` already leaves out an op nobody sent, so only a latency SLO skips an idle
+  window; tests: a service draining 5,400 queued requests after its client stops (windowed
+  utilization FAIL 1 from 00:05, whole run 0.6667; it PASSed at 0.2 before), an idle run PASSes a
+  windowed utilization at 0 and skips a windowed p99. Minor 1 `Summary::of_estimate` (the CLI's
+  `estimate` uses it) marks windowed SLOs `at_one_instant`: `(at 00:00 only: run checks each 1h)`,
+  no `window_start_s`. Minor 2 `Simulation::DampedFraction`: d̄ ← (1 − w) d̄ + w d, w from 1/2
+  halved whenever d − d̄ changes sign, floor 1/1024 (`min_settling_weight`): converges for any
+  self-thinning slope f' > −2047; at w = 1/2 the formula is (d̄ + d) / 2 bit for bit, and no
+  shipped scenario's estimate moved. Theory test: 10 calls (cap 5862, f' −3.65) and 20 (7906,
+  −6.23) settle at d = 0.9; by hand 50 calls (f' −14.8), 200 (−68) and 1000 (−417) settle too, the
+  old binary warned at 10 and 20 (20.8 % / 0 % dropped). Schema claim qualified with the floor's
+  limit. Minor 3 loader: `slo: over must be a whole number of steps (1500ms, step 1s)`, test.
+  Minor 4 `window_clock`: HH:MM:SS off a whole minute (`00:19:59`), the exact duration past the
+  first day; test. Minor 5 `SloResult::window_length`, the window's real end (its last step +
+  step): `(worst 28m from 14:02, the run's short last window)` (url-shortener `--duration 870m`);
+  test; the loader's comment and test_config's two comments no longer say "never completes".
+  Minors 6–10 as listed (`nonadjacent_parallel_steps`; the second `optional::transform` comment
+  removed; schema and url-shortener README quantify the grid/sliding gap, 0.7 vs 0.82, and the
+  wave's 0.6433 vs about 0.645). Also: a stale test_windows comment ("whole-run SLO reports PASS
+  4.9ms today": it is skipped since M-1) corrected. Numbers that moved (old → new, Release): the
+  ten runnable scenarios' `run` tables are byte-identical (no shipped op times out more than
+  1.5e-6 of its requests); their JSON moves only in the last digits of the percentiles of the four
+  ops with a nonzero timed-out share (rate-limiter p99 0.0299243 → 0.0299251; news-feed read_media,
+  search-autocomplete suggest, youtube's EU stream, ≤ 5e-5 relative); `estimate`'s windowed SLO
+  line on url-shortener and youtube (`(worst 1h from 00:00)` → `(at 00:00 only: run checks each
+  1h)`, `window_start_s` dropped). Variants: consistent-hashing `vnodes: 1` p99 143 → 174 ms (p50
+  26.3 → 26.4, p95 87.1 → 90.4; 166 ms without the timeout: the truncated refit read at 0.9952
+  lands above the untruncated fit); rate-limiter fixed window p99 227 → 228 ms (falls from the
+  timeout now 0.3–1.6 %, were 0.2–2 %; the others round the same); kv-store `vnodes: 1` +
+  `write_quorum: 3` p50 21.3 → 22.7 ms (now quoted); news-feed `shards: 1` read_feed p99 75.1 →
+  75.7 ms; url-shortener ticket server p50 329 → 571 ms (545 ms untimed); search-autocomplete
+  `keys: 100` p50 9.42 → 12.2 ms (not quoted); numerics §10 p50 62.9 → 68.4 ms (200 ms timeout) and
+  p99 465 → 475 ms (1 s timeout, a 3 % fall, was 5 %). youtube's variants, the url-shortener's
+  other variants, unique-id and the rate-limiter's 29.9 ms (§6) do not move at printed precision.
+  SLO verdicts that read a percentile with a nonzero timed-out share in shipped scenarios:
+  rate-limiter p99 PASS 29.9 ms of 50 ms, search-autocomplete suggest p99 PASS 6.86 ms of 100 ms
+  (and youtube's EU stream PASS 465 ms of 2 s): no status changed, every exit code is unchanged.
+  1147 tests, all green in Debug and Release, warning-free, clang-format-18 clean; 14 scenarios
+  validate and explain exit 0, explain byte-identical.
+
 
 ### Task 15: `simsys sweep`
 

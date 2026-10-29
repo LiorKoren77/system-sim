@@ -45,7 +45,7 @@ table below is the comparison at `burst: 500`, the setting the "things to try" s
 |---|---|---|---|---|---|---|---|
 | token_bucket (burst 500) | 14.2 % | 0.68 | 400 | 140 | 6.71 ms | 67.1 ms | p99 FAIL (exit 2) |
 | leaky_bucket (burst 500) | 14.2 % | 0.68 | 0 | 0 | 64.1 ms | 624 ms | p99 FAIL (exit 2) |
-| fixed_window (1 s) | 14.3 % | 0.68 | 400 | 9.6k | 21.6 ms | 227 ms | p99 FAIL (exit 2) |
+| fixed_window (1 s) | 14.3 % | 0.68 | 400 | 9.6k | 21.6 ms | 228 ms | p99 FAIL (exit 2) |
 | sliding_log (1 s) | 14.3 % | 0.68 | 160 | 0 | 11.9 ms | 127 ms | p99 FAIL (exit 2) |
 | sliding_counter (1 s) | 15.1 % | 0.67 | 80 | 0 | 5.53 ms | 25.2 ms | PASS (exit 0) |
 
@@ -85,9 +85,13 @@ bucket's 67 ms comes from about 7 s of saturation in 29 minutes. The clients' `t
 (plan 2c Task 13) trims that tail a little: each step's response is a lognormal, and the share of
 it past 1 s is timed out instead of answered. Almost nothing is (`timed_out_per_s` 0.0015 for
 the token bucket at `burst: 500`, 0.0007 at the shipped `burst: 100`), but those far-tail
-requests weighed heavily on the variance the p99 is fitted to: each p99 above fell by 0.2 to
-2 % when the timeout began to apply (67.3, 228, 129 and 25.6 ms before; the leaky bucket's
-624 ms did not move). That fall is an artefact of the moment fit, not of the requests: at the
+requests weighed heavily on the variance the p99 is fitted to: each p99 above fell by 0.3 to
+1.6 % when the timeout began to apply (67.3, 228, 129 and 25.6 ms without it; the leaky bucket's
+624 ms did not move). The p99 is read off the answered requests' fit at 0.99 / (1 − s), s the
+share timed out (every timed-out request is slower than every answered one, so the client's 99th
+percentile is the answered requests' 0.99 / (1 − s)-th), which gives back only a sliver here: s is
+4e-5 at most (the fixed window's), and its p99 is 227.7 ms where the fit read at 0.99 gave 227.2
+ms. That fall is an artefact of the moment fit, not of the requests: at the
 shipped `burst: 100`, cutting 8.9e-7 of the delivered requests removes 3.9 % of the fitted
 variance, so the refitted lognormal narrows, while the requests' own p99 moves by about 1e-6. It
 is kept (no threshold below which a cut is ignored: that would make the percentile jump where

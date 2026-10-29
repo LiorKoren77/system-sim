@@ -943,21 +943,28 @@ scenario tests or printed by the Release binary.
     a latency SLO at quantile q fails whatever its `max` when more than 1 − q of the delivered
     requests timed out, observing the timeout with the note `57.3% of delivered requests timed out
     (more than 1%)` (the refit's p99 had passed while 2 % timed out, and adding a timeout could
-    turn a FAIL into a PASS); otherwise the percentile is the answered requests' fit capped at τ;
-    one helper (`percentile_seen_by_client`) serves the whole run and every window; `timeout ≤ 0`
+    turn a FAIL into a PASS); otherwise the percentile is the answered requests' fit read at
+    q / (1 − s), s the timed-out share, and capped at τ (*corrected again by the review of the Task
+    12/13 fix rounds and Task 14:* read at q, the fit ignored the timed-out tail, and a 530 ms
+    timeout lowered an M/M/1 path's p99 from 490 to 404 ms; the timed-out requests are all slower
+    than the answered ones, so the client's q-quantile is the answered requests' q / (1 − s)); one
+    helper (`percentile_seen_by_client`) serves the whole run and every window; `timeout ≤ 0`
     is refused; `run`'s table gains a `timed out/s` column and prints `>1s` where a quantile timed
     out (I-1); JSON's latencies are `null` when nothing was answered in time (I-2); the series
     `--series-ops` gains `timed_out_per_s`. *Ignores:* timeouts at intermediate hops, that a path
     is not exactly lognormal (a 1 s timeout cutting 9e-7 of the rate-limiter lab's requests moves
     its p99 30.5 → 29.9 ms through the refit).
-13. **SLOs per window: `over: D`.** Any SLO may state `over` (at least one step, at most the run
-    after warmup). The observed span is cut into consecutive windows of D **aligned to the end of
+13. **SLOs per window: `over: D`.** Any SLO may state `over` (a whole number of steps, at least
+    one, at most the run after warmup). The observed span is cut into consecutive windows of D **aligned to the end of
     warmup**; a step belongs to the window its start falls in; a last, shorter window is still
     judged; each window is measured exactly as a whole run (the C-1 rule included); the **worst**
-    window decides (a fail before a pass, then the higher observed, the earlier on a tie); a
-    window in which nothing the SLO is about was offered is skipped, and an SLO all of whose
-    windows are skipped is `skipped`. The table names the window, `(worst 1h from 13:02)`; JSON
-    gives `window_start_s`. A 2k/s service at rho 0.5 for an hour with a 1.8× spike for 10 minutes:
+    window decides (a fail before a pass, then the higher observed, the earlier on a tie); every
+    window is judged, except that a latency SLO skips a window in which its op was not offered
+    (a node draining a queue after its clients stopped is still busy: review of the Task 12/13 fix
+    rounds and Task 14, I-1), and an SLO all of whose windows are skipped is `skipped`. The table
+    names the window, `(worst 1h from 13:02)` (`HH:MM:SS` off a whole minute; a short last window
+    by the length it had); JSON gives `window_start_s`. `estimate` measures no window: `(at 00:00
+    only: run checks each 1h)`, no `window_start_s`. A 2k/s service at rho 0.5 for an hour with a 1.8× spike for 10 minutes:
     the whole hour's utilization 0.5667 passes `max: 0.8`, `over: 10m` observes 0.9 and fails,
     `over: 15m` 0.7667. url-shortener ships `{metric: utilization, node: url_db, max: 0.9, over:
     1h}`: 0.6433 in 13:02–14:02, where the day's mean is 0.4306. A zone SLO is not added: a

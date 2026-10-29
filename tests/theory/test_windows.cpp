@@ -3,8 +3,9 @@
 //
 // Model under test: an SLO with `over: <duration>` is evaluated on every window of that length,
 // the windows aligned from the END OF WARMUP and stepping window by window (warmup, warmup +
-// over, warmup + 2 over, ...); a last window shorter than `over` is still evaluated; a window in
-// which nothing was offered is skipped; the WORST window decides, and the report says which one
+// over, warmup + 2 over, ...); a last window shorter than `over` is still evaluated (and labelled
+// with its real length); a latency SLO skips a window in which its op was not offered, while every
+// other metric is judged on every window; the WORST window decides, and the report says which one
 // (table: `(worst 10m from 00:20)`, JSON: `window_start_s`, seconds from the start of the run).
 // An SLO without `over` is checked over the whole run after warmup, exactly as before.
 //
@@ -325,7 +326,32 @@ TEST_CASE("a last window shorter than over is evaluated: 5 minutes at 0.9 fail a
   REQUIRE(*start == 1200.0);
 }
 
-// ---- A window with nothing offered is skipped --------------------------------------------------
+// The same run's report names the window by the length it had, 5 minutes, not by `over`: a label
+// `(worst 10m from 00:20)` would claim ten minutes of a run that ends at 00:25 (review of the Task
+// 12/13 fix rounds and Task 14, minor 5).
+TEST_CASE("a short last window is labelled with its real length: worst 5m from 00:20", "[theory]") {
+  const auto s = one_service("duration: 25m\nstep: 1s\n",
+                             "{base: 1k/s, spikes: [{at: 00:20, for: 5m, factor: 1.8}]}",
+                             "  - {metric: utilization, node: s, max: 0.8, over: 10m}\n");
+  const auto v = run(s);
+  CAPTURE(v.table);
+  REQUIRE(v.table.contains("(worst 5m from 00:20, the run's short last window)"));
+  REQUIRE(result_at(v, 0).window_length == simsys::SimTime{5min});
+}
+
+// A window that starts off a whole minute is named to the second (minor 4): warmup 1199 s puts
+// the first window of `over: 10m` at 00:19:59, which explain's clock would round to "20m". The
+// load is constant, so every window ties at 0.5 and the earlier one is reported.
+TEST_CASE("a window starting off the minute is named to the second: from 00:19:59", "[theory]") {
+  const auto s = one_service("duration: 40m\nstep: 1s\nwarmup: 1199s\n", "{base: 1k/s}",
+                             "  - {metric: utilization, node: s, max: 0.8, over: 10m}\n");
+  const auto v = run(s);
+  CAPTURE(v.table);
+  REQUIRE(v.table.contains("(worst 10m from 00:19:59)"));
+  REQUIRE(number_of(slo_json_line(v.json, 0), "window_start_s") == 1199.0);
+}
+
+// ---- A latency SLO skips a window with nothing offered -----------------------------------------
 //
 // The client offers 0/s for the first 10 minutes, then 1k/s (a trace with a step at 10 m). With
 // over: 10m the first window offered nothing and has no response time to bound, so it is skipped;
@@ -354,8 +380,9 @@ TEST_CASE("a window in which the client offered nothing is not the worst: the re
 
 // Nothing offered in any window: every window is skipped, so the SLO has nothing to evaluate and
 // is skipped itself (status `skipped`, no observed value, the table's `-`), never a pass on an
-// idle service's 4.9 ms. (Without `over` the whole-run SLO of this scenario reports PASS 4.9ms
-// today: an idle p99 is the service time's own; that is the behaviour `over` must not inherit.)
+// idle service's 4.9 ms (an idle p99 is the service time's own). The whole-run SLO of this
+// scenario is skipped the same way, an op nobody sent having no latency (review of the kv/search
+// fix round, M-1).
 TEST_CASE("an slo whose every window offered nothing is skipped, with nothing observed",
           "[theory]") {
   const auto s = one_service("duration: 10m\nstep: 1s\n", "{points: [[0s, 0/s], [10m, 0/s]]}",
@@ -365,6 +392,94 @@ TEST_CASE("an slo whose every window offered nothing is skipped, with nothing ob
   REQUIRE(windowed.status == SloStatus::skipped);
   REQUIRE_FALSE(windowed.observed.has_value());
   REQUIRE_FALSE(number_of(slo_json_line(v.json, 0), "window_start_s").has_value());
+}
+
+// ---- Every window is judged for a metric other than latency --------------------------------
+//
+// (Review of the Task 12/13 fix rounds and Task 14, I-1.) Only a latency SLO needs an offered
+// request to have something to bound. A node keeps working after its clients stop: one server of
+// 100 ms (10/s, c = 1) with room for 10k requests is sent 100/s from 00:04 to 00:05 and nothing
+// else. In that minute it drains 10/s and queues 90/s: 5,400 requests, which it drains at 10/s
+// for 540 s after 00:05, until 00:14. Its utilization per 5-minute window:
+//   00:00-00:05: 1 minute busy of 5   -> 0.2
+//   00:05-00:10: busy throughout      -> 1
+//   00:10-00:15: busy until 00:14     -> 0.8
+// and over the whole 15 minutes (60 + 300 + 240) / 900 = 0.6667. The worst window is 00:05, at 1,
+// although no client offered anything in it: the windowed SLO FAILs max 0.8. Skipping the windows
+// nobody offered in, as the reports did, judged only 00:00-00:05 and PASSed at 0.2, a worst
+// window below the run's own mean.
+namespace {
+Scenario draining_service(std::string_view rate, std::string_view slos) {
+  return load_yaml("simsys_windows_drain.yaml",
+                   "version: 1\nname: drain\nduration: 15m\nstep: 1s\n"
+                   "nodes:\n"
+                   "  u: {type: client, rate: " +
+                       std::string{rate} +
+                       ", ops: {get: 1}}\n"
+                       "  s: {type: service, capacity: 10/s, latency: 100ms, advanced: "
+                       "{queue_limit: 10000}}\n"
+                       "links:\n  - {from: u, to: s, dir: inout, latency: 0s}\n"
+                       "slo:\n" +
+                       std::string{slos});
+}
+}  // namespace
+
+TEST_CASE("a window in which nobody offered is judged when the node is still busy: 1 from 00:05",
+          "[theory]") {
+  const auto v = run(draining_service(
+      "{points: [[0s, 0/s], [4m, 0/s], [4m, 100/s], [5m, 100/s], [5m, 0/s], [15m, 0/s]]}",
+      "  - {metric: utilization, node: s, max: 0.8}\n"
+      "  - {metric: utilization, node: s, max: 0.8, over: 5m}\n"));
+  const auto& whole = result_at(v, 0);
+  REQUIRE(whole.observed.has_value());
+  REQUIRE_THAT(*whole.observed, WithinRel(600.0 / 900.0, 1e-6));
+  REQUIRE(whole.status == SloStatus::pass);
+  const auto& windowed = result_at(v, 1);
+  REQUIRE(windowed.observed.has_value());
+  REQUIRE_THAT(*windowed.observed, WithinRel(1.0, 1e-9));
+  REQUIRE(windowed.status == SloStatus::fail);
+  REQUIRE(number_of(slo_json_line(v.json, 1), "window_start_s") == 300.0);
+}
+
+// A run in which nothing is ever offered: the node idles in every window, utilization 0, and the
+// windowed SLO PASSes at 0 as the whole-run one does (it used to be `skipped`, every window having
+// been skipped). A latency SLO on the same run stays skipped: no request, no latency.
+TEST_CASE("an idle run passes a windowed utilization SLO at 0 and skips a windowed p99",
+          "[theory]") {
+  const auto v = run(draining_service("{points: [[0s, 0/s], [15m, 0/s]]}",
+                                      "  - {metric: utilization, node: s, max: 0.8, over: 5m}\n"
+                                      "  - {metric: p99_latency, node: u, max: 1s, over: 5m}\n"));
+  const auto& utilization = result_at(v, 0);
+  REQUIRE(utilization.status == SloStatus::pass);
+  REQUIRE(utilization.observed == 0.0);
+  REQUIRE(number_of(slo_json_line(v.json, 0), "window_start_s") == 0.0);  // the first of equals
+  REQUIRE(result_at(v, 1).status == SloStatus::skipped);
+}
+
+// ---- `estimate` measures no window ------------------------------------------------------------
+//
+// `estimate` evaluates one steady state at t = 0. An SLO with `over` is checked on that one record,
+// and the report says so instead of naming a window it never measured (review of the Task 12/13 fix
+// rounds and Task 14, minor 1): `(at 00:00 only: run checks each 10m)`, and no `window_start_s`.
+TEST_CASE("estimate checks an slo with over at 00:00 only and names no window", "[theory]") {
+  const auto s = one_service(spike_hour_timing, spike_rate,
+                             "  - {metric: utilization, node: s, max: 0.8, over: 10m}\n");
+  const auto g = Graph::build(s);
+  if (!g) FAIL(g.error().message);
+  auto sim = Simulation::create(*g);
+  if (!sim) FAIL(sim.error().message);
+  const auto summary = simsys::report::Summary::of_estimate(*g, sim->estimate());
+  const auto results = simsys::report::evaluate_slos(summary, s.slos);
+  REQUIRE(results.size() == 1);
+  REQUIRE(results[0].at_one_instant);
+  REQUIRE_FALSE(results[0].window_start.has_value());
+  REQUIRE_THAT(*results[0].observed, WithinRel(0.5, 1e-9));  // 1k/s at 00:00: rho 0.5
+  const auto table = simsys::report::render_table(summary, results, /*color=*/false);
+  CAPTURE(table);
+  REQUIRE(table.contains("(at 00:00 only: run checks each 10m)"));
+  REQUIRE_FALSE(table.contains("worst"));
+  const auto json = simsys::report::render_json(summary, results);
+  REQUIRE_FALSE(slo_json_line(json, 0).contains("window_start_s"));
 }
 
 // ---- The shipped url-shortener: the hour the whole-day SLOs cannot see -------------------------
@@ -388,8 +503,9 @@ TEST_CASE("an slo whose every window offered nothing is skipped, with nothing ob
 // with room. With `shards: 2` the replicas are at 4.841k of 5k, rho_peak = 0.9683 (README: 96.8 %),
 // so the worst hour is 0.9683 x 0.9966 = 0.9650, above 0.9: it fails. (The plan said about
 // 0.966, the peak instant's 96.8 % shaded by the hour's average; the arithmetic gives 0.965, so
-// the check allows 0.965 +- 0.002.) The whole-day mean of the same copy is only 0.6455, which is
-// why the day-long SLOs never saw this.
+// the check allows 0.965 +- 0.002.) The whole-day mean of the same copy is only 0.4306 (the
+// wave's mean, 1 / 1.5 of the peak's 0.6455, give or take the warmup), which is why the day-long
+// SLOs never saw this.
 namespace {
 std::string url_shortener_text() {
   std::ifstream file{std::string{SIMSYS_SCENARIOS_DIR} + "/book/url-shortener/scenario.yaml"};

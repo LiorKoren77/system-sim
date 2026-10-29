@@ -834,7 +834,7 @@ namespace {
 
 // The first step list of `spec` whose parallel steps are not adjacent (parallel_steps_adjacent),
 // an op's steps or its `then` steps, if there is one.
-[[nodiscard]] std::optional<EngineError> split_parallel_group(const model::NodeSpec& spec) {
+[[nodiscard]] std::optional<EngineError> nonadjacent_parallel_steps(const model::NodeSpec& spec) {
   const std::string name = "node '" + spec.id + "': ";
   for (const auto& [op, steps] : spec.ops) {
     if (!parallel_steps_adjacent(steps)) {
@@ -2646,7 +2646,7 @@ Graph::Result Graph::resolve_links() {
 Graph::Result Graph::connect_steps() {
   for (std::size_t from = 0; from < nodes_.size(); ++from) {
     const auto& spec = nodes_[from].spec;
-    if (auto split = split_parallel_group(spec)) return std::unexpected{std::move(*split)};
+    if (auto split = nonadjacent_parallel_steps(spec)) return std::unexpected{std::move(*split)};
     // `views::values` (like `views::keys` in detail::add_hop_steps, but each entry's vector of
     // steps), then C++20 `views::join`, which flattens those vectors into one lazy sequence of
     // steps. Replaces two nested loops over the map and each vector; nothing is copied.

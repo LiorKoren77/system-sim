@@ -122,7 +122,9 @@ warmup).
 - Percentiles are estimated (a lognormal fitted to the mean and variance), and an SLO without
   `over:` is checked over the whole day: a few minutes of red at the peak can hide in the day's
   p99. The hourly utilization SLO checks hours on a fixed grid, so a peak that straddles two
-  hours is split between them (a sliding window would find a slightly worse hour).
+  hours is split between them. On this smooth daily wave a sliding window would find a slightly
+  worse hour, 13:30-14:30 at about 0.645 against the grid's 0.6433; on a short burst the gap can be
+  large (the schema's `over` paragraph: 0.82 against 0.7).
 
 ## Things to try
 - **Remove the cache** (delete `url_cache` and its link, and make `redirect: [{to: url_db,
@@ -146,11 +148,14 @@ warmup).
   id requests (drop rate 0.2309). Its full queue makes `shorten` slow, past the clients' 1 s
   timeout (Task 13): of the 1.153k shortens/s offered over the day, 266.1/s lose their id
   (0.2309), 293.6/s are timed out (`run --report json`: `timed_out_per_s` 293.57, a third of
-  the 886.6/s the path delivered) and 593.0/s are answered, in 463 ms on average, p50 329 ms,
+  the 886.6/s the path delivered) and 593.0/s are answered, in 463 ms on average, p50 571 ms,
   p95 and p99 **1 s**, the timeout itself (`>1s` in the table): a third of the delivered shortens
   timed out, far more than the 5 % and 1 % those quantiles leave above them, so the clients never
-  saw them answered. (Without the timeout: all
-  886.6/s answered, mean 669 ms, p99 2.42 s.) A shorten whose id was not issued is never
+  saw them answered. The p50 is the client's too: the timed-out third are all slower than every
+  answered shorten, so the client's median is the answered shortens' 0.5 / (1 − 0.331) = 0.747
+  quantile, 571 ms on their fit (read at 0.5, their own median, it said 329 ms, as if the slow
+  third had never been sent). (Without the timeout: all 886.6/s answered, mean 669 ms, p50 545 ms,
+  p99 2.42 s.) A shorten whose id was not issued is never
   written: url_db commits 295.5 writes/s per shard over the
   day instead of 384.2, the snowflake run's figure × (1 − 0.2309), and its busiest copy peaks at
   rho 0.4029 instead of 0.6455 (the ticket server caps the writes at its 1k ids/s). Redirects

@@ -63,8 +63,10 @@ a request waiting in a queue is answered later), the part that came back after t
 `timeout`, and the mean response in milliseconds (`inf` when the path never answers). The JSON report's ops
 carry `answered_per_s` beside `offered_per_s` too, and `timed_out_per_s`: the requests the
 client gave up on (0 without a `timeout`; `run`'s table shows them as `timed out/s`); a client's
-percentiles never exceed its timeout, and one more than whose share timed out (more than 1 % for
-a p99) is the timeout itself (`>1s` in the table), which fails a latency SLO whatever its `max`.
+percentile at q is the answered requests' fit read at q / (1 − s), s the share that timed out
+(those are all slower than the answered ones), and never exceeds its timeout, and one more than
+whose share timed out (more than 1 % for a p99) is the timeout itself (`>1s` in the table), which
+fails a latency SLO whatever its `max`.
 Exit codes: 0 every SLO passed, 2 an SLO failed, 1 an error.
 Colour is on when stdout is a terminal; `--no-color` turns it off and JSON never has it.
 `run --seed N` replaces the scenario's `seed`, which seeds every client's `rate.noise`

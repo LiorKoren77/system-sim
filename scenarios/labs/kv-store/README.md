@@ -101,7 +101,9 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   but, losing more, only 0.349 of those delivered; they answer in about 100 ms (its full room),
   the all-cool sets in 0.6 ms, so a delivered put takes 36.7 ms on average, p99 227 ms, before
   the timeout. The slow ones meet the 100 ms timeout: 569/s time out, 8.02k/s are answered, mean
-  27.2 ms, p95 and p99 `>100ms`: 6.62 % of the delivered puts timed out, so the p99 SLO fails at
+  27.2 ms, p50 22.7 ms (the answered puts' fit read at 0.5 / (1 − 0.0662) = 0.535: the timed-out
+  puts are all slower than the answered ones), p95 and p99 `>100ms`: 6.62 % of the delivered puts
+  timed out, so the p99 SLO fails at
   the timeout (`6.62% of delivered requests timed out (more than 1%)`). (Weighting the two sets
   by the puts offered, the lost ones included, gave 7.43 % timed out and a mean of 29.4 ms, 39.6
   ms and 233 ms without the timeout, before the review of Task 11.)
