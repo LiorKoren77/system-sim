@@ -1159,3 +1159,94 @@ TEST_CASE("book/search-autocomplete meets both SLOs over its day at a one second
   REQUIRE(drops.status == simsys::report::SloStatus::pass);
   REQUIRE(drops.observed == 0.0);
 }
+
+// ---- A step after a failed step does not run: the url-shortener's ticket server (plan 2c, Task
+// 12) ----
+//
+// `shorten` on the web tier is [id_gen.next_id, url_db.write]: a shorten whose id was not issued
+// cannot be written (the book's chapter 8 flow: the short URL IS the id). The README's "things to
+// try" swaps the snowflake for ONE ticket server, which at the day's peak is offered 1.74k ids/s
+// against 1k/s of capacity and drops a fifth of them. The relation between the numbers the run
+// reports, whatever those numbers are:
+//     url_db's write demand over the day = (1 - id_gen's drop rate) x the writes of the snowflake
+//     run
+// with the drop rate the one the report prints, sum(dropped) / sum(demand) of id_gen.
+//
+// The test keeps the scenario's write rate and drops the reads, so that url_db's demand IS the
+// writes (with the reads in, url_db's demand also holds the cache's misses, which this relation
+// does not cover). A write costs the database 5 capacity units (defaults::sql_write_cost), so over
+// the day it is offered 5 x 1,152/s x 86,400 s = 497.66M units in the snowflake run; the test
+// compares the two runs' totals as a ratio, so that the 5 and the rate cancel. Everything else is
+// the shipped scenario: the limiter, the web tier, the sharded database and the 24-hour sine at the
+// shipped 1 s step.
+
+namespace {
+
+// The shipped url-shortener with `id_gen` as given, a client that sends only `shorten` at the
+// scenario's own writes, 12.8k/s x 0.09 = 1,152/s (the book's ~1,160/s), and no key
+// distribution: with no reads no op reaches the url_cache, and a `che` cache nothing reaches has
+// no demand to compute a hit ratio from (the loader refuses it), so its ratio is fixed at the
+// 0.88 the shipped run computes: it never sees a request here, so the number is for the loader.
+simsys::model::Scenario url_shortener_writing_with(simsys::model::IdAlgorithm algorithm,
+                                                   int replicas) {
+  auto s = load_scenario("/book/url-shortener/scenario.yaml");
+  auto& users = *std::ranges::find(s.nodes, "users", &simsys::model::NodeSpec::id);
+  users.workload->op_shares = {{"shorten", 1.0}};
+  users.workload->curve.base = simsys::Rate{1152};
+  users.workload->keys.reset();
+  std::ranges::find(s.nodes, "url_cache", &simsys::model::NodeSpec::id)->hit_ratio =
+      simsys::model::HitRatio{.fixed = 0.88};
+  auto& id_gen = *std::ranges::find(s.nodes, "id_gen", &simsys::model::NodeSpec::id);
+  id_gen.id_algorithm = algorithm;
+  id_gen.replicas = replicas;
+  return s;
+}
+
+// What a whole-day run of a url-shortener variant sent url_db and id_gen, in requests' worth of
+// each node's own unit (the sum over the steps of the rate x the step, so a ratio of two sums is a
+// ratio of totals).
+struct DayTotals {
+  double url_db_demand{};
+  double id_gen_demand{};
+  double id_gen_dropped{};
+  [[nodiscard]] double id_gen_drop_rate() const { return id_gen_dropped / id_gen_demand; }
+};
+
+DayTotals run_day(const simsys::model::Scenario& s) {
+  const auto g = build_or_fail(s);
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  const auto url_db = *g.index_of("url_db");
+  const auto id_gen = *g.index_of("id_gen");
+  DayTotals totals;
+  sim->run({.duration = s.duration, .step = s.step}, [&](const auto& r) {
+    totals.url_db_demand += r.nodes[url_db].demand_per_s;
+    totals.id_gen_demand += r.nodes[id_gen].demand_per_s;
+    totals.id_gen_dropped += r.nodes[id_gen].dropped_per_s;
+  });
+  return totals;
+}
+
+}  // namespace
+
+// The tolerance is 0.5 %: the engine reads the ticket server's fraction one step (1 s) late, so
+// each second's writes are thinned by the previous second's survival. The daily wave moves the
+// fraction by a tiny amount in a second, and the very first second sends everything, so the lag
+// should cost far less than that; 0.5 % is a loose bound that the implementation may tighten.
+TEST_CASE(
+    "book/url-shortener with a ticket server sends url_db only the shortens whose id was issued",
+    "[scenario]") {
+  const auto snowflake =
+      run_day(url_shortener_writing_with(simsys::model::IdAlgorithm::snowflake, 2));
+  const auto ticket =
+      run_day(url_shortener_writing_with(simsys::model::IdAlgorithm::ticket_server, 1));
+  CAPTURE(snowflake.url_db_demand, ticket.url_db_demand, ticket.id_gen_drop_rate());
+  // The preconditions: the snowflake loses nothing, so its totals are the writes; and the ticket
+  // server is offered the same ids and does lose some (the README's run: 0.2309).
+  REQUIRE(snowflake.id_gen_dropped == 0.0);
+  REQUIRE_THAT(ticket.id_gen_demand, Catch::Matchers::WithinRel(snowflake.id_gen_demand, 1e-9));
+  REQUIRE(ticket.id_gen_drop_rate() > 0.1);
+  // The relation: url_db is sent what id_gen issued.
+  REQUIRE_THAT(ticket.url_db_demand / snowflake.url_db_demand,
+               Catch::Matchers::WithinRel(1.0 - ticket.id_gen_drop_rate(), 5e-3));
+}
