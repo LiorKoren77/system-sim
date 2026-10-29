@@ -315,8 +315,8 @@ struct Resolved {
 
 // A worker pool's rate (plan 2c refinement 5; spec §7: "capacity = workers / job cost"): its c
 // workers each finish one job per `cost`, so together `workers / cost` jobs a second, Little's law
-// read the other way round (c = rate × service time): youtube's 400 transcoders at 60 s a video
-// drain 400 / 60 s = 6.667 videos/s, news-feed's 32 fan-out workers at 5 ms 6.4k posts/s. Empty
+// read the other way round (c = rate × service time): youtube's 600 transcoders at 60 s a video
+// drain 600 / 60 s = 10 videos/s, news-feed's 32 fan-out workers at 5 ms 6.4k posts/s. Empty
 // for any other node, and for a pool built in code without both numbers (the type's then).
 [[nodiscard]] std::optional<Rate> worker_pool_rate(const model::NodeSpec& n) {
   if (n.type != model::NodeType::worker_pool || !n.workers || !n.job_cost) return std::nullopt;

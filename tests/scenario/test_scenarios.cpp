@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <ctime>
 #include <filesystem>
+#include <numbers>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -565,19 +566,22 @@ TEST_CASE("book/news-feed runs: graph_db is sent three replica-requests per fan-
 // 0.3 % below these.) At that step, per copy:
 //   web         70 % of it (feed reads and posts) over 12 x 2k/s           = 0.632548
 //   feed_cache  60 % reads + 10 % posts x 300 fan-out writes, over 10 x 100k = 0.663633
+//   post_cache  60 % reads x 20 hydrations + 10 % post writes, over 4 x 100k = 0.656043
+//   user_cache  60 % reads x 20 hydrations, over 4 x 100k                   = 0.650621
 //   post_db     a replica: 5 % of the 20 hydrations per read over 12 replicas,
 //               + its shard's writes, 10 % x 5 units / 6 shards, of 5k/s     = 0.578330
 //   fanout      10 % posts over 32 workers / 5 ms = 6.4k jobs/s             = 0.338865
 // The run's peak rho is that step's, so each matches its closed form to the digits computed
 // (1e-5 relative: six significant digits, against a closed form the run reproduces to 1e-15).
-// Nothing is dropped: every copy stays under rho 1. The day runs at 1 s, not the shipped 100 ms
-// (86.4k steps; 864k would take minutes in Debug): the peaks and the backlog move by less than
-// 1e-4 between the two (measured: 200.34 s and 200.36 s of lag below).
+// The README quotes the shipped 100 ms run, whose last spike step is 12:09:59.9, a hair busier
+// (post_cache 0.6561, user_cache 0.6507). Nothing is dropped: every copy stays under rho 1. The
+// day runs at 1 s, not the shipped 100 ms (86.4k steps; 864k would take minutes in Debug): the
+// peaks move by less than 1e-4 between the two.
 
 namespace {
 
-// The whole day of book/news-feed at a 1 s step with `workers` fan-out workers: every node's
-// summary, the drop rate and the three SLO verdicts.
+// The whole day of book/news-feed at `step` with `workers` fan-out workers: every node's summary,
+// the drop rate and the three SLO verdicts.
 struct NewsFeedDay {
   std::vector<simsys::report::NodeSummary> nodes;
   double drop_rate{};
@@ -595,10 +599,9 @@ struct NewsFeedDay {
   }
 };
 
-NewsFeedDay run_news_feed_day(int workers) {
-  using namespace std::chrono_literals;
+NewsFeedDay run_news_feed_day(int workers, simsys::SimTime step) {
   auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml");
-  s.step = 1s;
+  s.step = step;
   std::ranges::find(s.nodes, "fanout", &simsys::model::NodeSpec::id)->workers = workers;
   const auto g = build_or_fail(s);
   auto sim = simsys::engine::Simulation::create(g);
@@ -612,7 +615,8 @@ NewsFeedDay run_news_feed_day(int workers) {
 
 TEST_CASE("book/news-feed sized for its noon spike meets its three SLOs and drops nothing",
           "[scenario]") {
-  const auto day = run_news_feed_day(32);  // as shipped
+  using namespace std::chrono_literals;
+  const auto day = run_news_feed_day(32, 1s);  // as shipped, at a 1 s step
   REQUIRE(day.slos.size() == 3);
   for (const auto& r : day.slos) {
     CAPTURE(static_cast<int>(r.slo.metric), r.observed.value_or(-1.0));
@@ -621,6 +625,8 @@ TEST_CASE("book/news-feed sized for its noon spike meets its three SLOs and drop
   REQUIRE(day.drop_rate == 0.0);
   CHECK_THAT(day.node("web").peak_rho, Catch::Matchers::WithinRel(0.632548, 1e-5));
   CHECK_THAT(day.node("feed_cache").peak_rho, Catch::Matchers::WithinRel(0.663633, 1e-5));
+  CHECK_THAT(day.node("post_cache").peak_rho, Catch::Matchers::WithinRel(0.656043, 1e-5));
+  CHECK_THAT(day.node("user_cache").peak_rho, Catch::Matchers::WithinRel(0.650621, 1e-5));
   CHECK_THAT(day.node("post_db").peak_rho, Catch::Matchers::WithinRel(0.578330, 1e-5));
   CHECK_THAT(day.node("fanout").peak_rho, Catch::Matchers::WithinRel(0.338865, 1e-5));
   // The fan-out queue never falls behind: at most 34 % of the workers busy, the Erlang C wait of
@@ -633,19 +639,34 @@ TEST_CASE("book/news-feed sized for its noon spike meets its three SLOs and drop
 
 // The README's first "Things to try": 8 workers drain 8 / 5 ms = 1.6k jobs/s, below the spike's
 // posts (2.1k/s at 12:00 rising to 2.169k/s at 12:10), so the pool falls behind for the spike's
-// 600 s by the integral of (posts - 1.6k/s): 534.2/s on average x 600 s = 320.5k messages at 12:10,
-// and a message published then waits for all of them: 320.5k / 1.6k/s = 200.3 s of lag, over the
-// 2-minute SLO. (The evening's 1.6k posts/s at 20:00 only meet the capacity, so no backlog grows
-// there.) The other two SLOs still pass: the fan-out is asynchronous, the reader's path never
-// waits for it. 1e-3: the integral's average to its four digits.
+// 600 s by the integral of (posts - 1.6k/s): about 320.5k messages at 12:10, and a message
+// published then waits for all of them: 320.5k / 1.6k/s = 200.3 s of lag, over the 2-minute SLO.
+// (The evening's 1.6k posts/s at 20:00 only meet the capacity, so no backlog grows there.) The
+// other two SLOs still pass: the fan-out is asynchronous, the reader's path never waits for it.
+//
+// The day runs at 10 s steps (8,640, a tenth of the 1 s test's), where the engine integrates each
+// step's rate over the step that follows it: the backlog at 12:10 is the left Riemann sum of
+// (posts(t) - 1.6k/s) x 10 s over the spike's 60 steps, 320.229k messages and 200.143 s of lag
+// (the shipped 100 ms run, which the README quotes: 320.570k and 200.356 s, 0.1 % more). The test
+// computes that sum and pins both to 1e-9: the run reproduces it to rounding.
 TEST_CASE("book/news-feed with 8 fan-out workers falls 200 s behind in the spike and fails its lag",
           "[scenario]") {
-  const auto day = run_news_feed_day(8);
+  using namespace std::chrono_literals;
+  const auto day = run_news_feed_day(8, 10s);
+  // posts(t) = 10 % of 10k/s x 3 (the spike) x (1 + 0.6 cos(2 pi (t - 20:00) / 24 h)).
+  // C++20 std::numbers::pi: the constant as a typed variable template, replacing the M_PI macro
+  // (POSIX, not standard C++) and hand-typed digits.
+  const auto posts = [](double t_s) {
+    return 3'000.0 * (1.0 + 0.6 * std::cos(2.0 * std::numbers::pi * (t_s - 72'000.0) / 86'400.0));
+  };
+  double backlog = 0.0;
+  for (int k = 0; k < 60; ++k) backlog += (posts(43'200.0 + 10.0 * k) - 1'600.0) * 10.0;
+  REQUIRE_THAT(backlog, Catch::Matchers::WithinRel(320.229e3, 1e-6));
   const auto& lag = day.slo(simsys::model::SloMetric::queue_lag);
   REQUIRE(lag.observed.has_value());
-  CHECK_THAT(*lag.observed, Catch::Matchers::WithinRel(200.3, 1e-3));
+  CHECK_THAT(*lag.observed, Catch::Matchers::WithinRel(backlog / 1'600.0, 1e-9));
   CHECK(lag.status == simsys::report::SloStatus::fail);
-  CHECK_THAT(day.node("fanout").peak_backlog, Catch::Matchers::WithinRel(320.5e3, 1e-3));
+  CHECK_THAT(day.node("fanout").peak_backlog, Catch::Matchers::WithinRel(backlog, 1e-9));
   CHECK(day.slo(simsys::model::SloMetric::p99_latency).status == simsys::report::SloStatus::pass);
   CHECK(day.drop_rate == 0.0);
 }
@@ -1384,35 +1405,18 @@ TEST_CASE("explain on book/search-autocomplete prints the index's numbers and it
   REQUIRE(line.contains("build_interval=168h (rebuild load not modelled)"));
 }
 
-// Measured 2026-10-29 (Release, the shipped 100 ms step, the whole day): p99 of suggest 6.86 ms
-// against its 100 ms and a drop rate of 0 against 0.0005; the busiest node is the aggregators at
-// 60 % of peak (plan 2c Task 18 gave them 6 workers). Both SLOs PASS on the shipped numbers. Here
-// the day runs at a 1 s step, as the url-shortener's test does (86.4k steps, a few seconds in
-// Debug, where 862.8k steps at 100 ms would take minutes): every number below agrees with the
-// 100 ms run to about 1e-9 (measured: p99 6.864354247 ms at 1 s, 6.864354252 ms at 100 ms), since
-// the fluid model's steady rates do not depend on the step on a curve this smooth.
-TEST_CASE("book/search-autocomplete meets both SLOs over its day at a one second step",
-          "[scenario]") {
-  using namespace std::chrono_literals;
-  auto s = load_scenario("/book/search-autocomplete/scenario.yaml");
-  s.step = 1s;
-  const auto results = run_slos(std::move(s));
-  REQUIRE(results.size() == 2);
-  const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
-  const auto& drops = slo_of(results, simsys::model::SloMetric::drop_rate);
-  CAPTURE(p99.observed.value_or(-1.0), drops.observed.value_or(-1.0));
-  REQUIRE(p99.status == simsys::report::SloStatus::pass);
-  REQUIRE(drops.status == simsys::report::SloStatus::pass);
-  REQUIRE(drops.observed == 0.0);
-}
-
 namespace {
-// The shipped search-autocomplete run over its whole day at a 1 s step (see the test above), with
-// its graph kept for the hit ratio and the summary for the nodes and ops.
+// The shipped search-autocomplete run over its whole day at a 1 s step, as the url-shortener's
+// test does (86.4k steps, a few seconds in Debug, where 862.8k steps at 100 ms would take
+// minutes): every number below agrees with the shipped 100 ms run to about 1e-9 (measured: p99
+// 6.864354247 ms at 1 s, 6.864354252 ms at 100 ms), since the fluid model's steady rates do not
+// depend on the step on a curve this smooth. Kept: the graph for the hit ratio, the summary's
+// nodes and ops, and the two SLO verdicts. One run serves the whole check below.
 struct AutocompleteDay {
   simsys::graph::Graph graph;
   std::vector<simsys::report::NodeSummary> nodes;
   std::vector<simsys::report::OpSummary> ops;
+  std::vector<simsys::report::SloResult> slos;
 };
 
 AutocompleteDay run_autocomplete_day() {
@@ -1426,7 +1430,8 @@ AutocompleteDay run_autocomplete_day() {
   sim->run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
   auto nodes = summary.nodes();
   auto ops = summary.ops();
-  return {std::move(g), std::move(nodes), std::move(ops)};
+  auto slos = simsys::report::evaluate_slos(summary, s.slos);
+  return {std::move(g), std::move(nodes), std::move(ops), std::move(slos)};
 }
 
 const simsys::report::NodeSummary& node_of(const AutocompleteDay& day, std::string_view id) {
@@ -1436,7 +1441,9 @@ const simsys::report::NodeSummary& node_of(const AutocompleteDay& day, std::stri
 }
 }  // namespace
 
-// The README's headline numbers at the 20:00 peak, 36k keystrokes/s (24k/s x 1.5), each derived:
+// The day passes both SLOs (measured 2026-10-29 in Release at the shipped 100 ms step: suggest p99
+// 6.86 ms against 100 ms, drop rate 0 against 0.0005), and the README's headline numbers at the
+// 20:00 peak, 36k keystrokes/s (24k/s x 1.5), are each derived:
 //  - api: offered the browser cache's misses, 0.6 x 0.95 x 36k = 20.52k suggests/s, plus the
 //    5 % searches, 1.8k/s: 22.32k/s of 10 x 5k/s, rho = 0.4464 exactly (no queueing in rho);
 //  - trie_cache: Che's hit ratio for a 50M-entry LRU under Zipf 1.2 over 100M prefixes, which
@@ -1451,12 +1458,19 @@ const simsys::report::NodeSummary& node_of(const AutocompleteDay& day, std::stri
 //    p99, not the timeout): both pinned to 1e-3 relative, the README's four digits (the 1 s step
 //    moves them by 1e-8 relative, measured).
 TEST_CASE(
-    "book/search-autocomplete at its peak: api 44.6 percent, trie_cache hits 0.995, "
-    "aggregators 60 percent, suggest p99 6.86 ms",
+    "book/search-autocomplete passes both SLOs over its day: api 44.6 percent, trie_cache hits "
+    "0.995, aggregators 60 percent, suggest p99 6.86 ms",
     "[scenario]") {
   const auto day = run_autocomplete_day();
   using Catch::Matchers::WithinAbs;
   using Catch::Matchers::WithinRel;
+  REQUIRE(day.slos.size() == 2);
+  const auto& p99 = slo_of(day.slos, simsys::model::SloMetric::p99_latency);
+  const auto& drops = slo_of(day.slos, simsys::model::SloMetric::drop_rate);
+  CAPTURE(p99.observed.value_or(-1.0), drops.observed.value_or(-1.0));
+  REQUIRE(p99.status == simsys::report::SloStatus::pass);
+  REQUIRE(drops.status == simsys::report::SloStatus::pass);
+  REQUIRE(drops.observed == 0.0);
   REQUIRE_THAT(node_of(day, "api").peak_rho, WithinRel(22'320.0 / 50'000.0, 1e-9));
 
   const double h = *day.graph.hit_ratio(*day.graph.index_of("trie_cache"));
@@ -1616,14 +1630,22 @@ TEST_CASE(
 // ---- youtube end to end (plan 2c Task 16) ----
 
 // Plan 2c Task 16: youtube as shipped runs the day and meets all three SLOs (`simsys run` exits 0).
-// The numbers, each measured with `simsys run` at the scenario's 100 ms steps and identical at the
-// 10 s steps used here (8,640 steps, not 864k: a few seconds in Debug):
-//  - viewers_eu's stream p99: 465 ms against 2 s. A lognormal fit to the response moments; a
-//    European miss crosses the Atlantic (2 x 75 ms) and waits for the 40 Gbit/s pipe, whose queue
-//    holds whole 50 MB objects (10 ms each on the wire). 1 % covers the fit's step-to-step drift.
+// The numbers, each measured with `simsys run` at the scenario's 100 ms steps; the 10 s steps used
+// here (8,640 steps, not 864k: a few seconds in Debug) move the p99 by 3e-8 (465.2300 ms either
+// way) and the worst hour by 1.5e-5, and the lag and the link are sampled at 21:00 itself at
+// either step, so 1e-3 pins the README's digits with room to spare for what the step moves:
+//  - viewers_eu's stream p99: 465 ms against 2 s. The lognormal fit to the response moments of a
+//    two-valued mix (hits 10.5 ms, misses about 207 ms: the README's "The day's run"), not a path
+//    anyone takes.
 //  - transcode_q's peak lag: 0.573 s against 30 m. With 600 workers (10 videos/s against 9.6
 //    uploads/s at 21:00) nothing backs up, so the lag is the pool's Erlang C wait at rho 0.96:
-//    C(600, 0.96) x 60 s / (600 x 0.04) = 0.229 x 2.5 s = 0.57 s. 1 % (the derivation's rounding).
+//    C(600, 0.96) x 60 s / (600 x 0.04) = 0.229 x 2.5 s = 0.57 s, which queueing::mmc_wait
+//    computes; the run reproduces it to rounding (1e-9).
+//  - the cross-DC pipe's latency at 21:00: 6.8588 ms. The European misses, 140.8 streams/s x
+//    (1 - h) x 50 MB with h cdn_eu's Che hit ratio, load the 5 GB/s pipe at rho = 0.5711; an
+//    M/D/1 queue of whole 50 MB objects (10 ms of wire each) waits 0.5 x rho / (1 - rho) x 10 ms
+//    (Pollaczek-Khinchine with deterministic service), and the first megabyte adds 0.2 ms. The
+//    closed form is computed from the graph's h and pinned to 1e-9; the README's 6.8588 ms to 1e-4.
 //  - cdn_us's utilization over its worst hour (`over: 1h`, windows aligned from the 5 m warmup):
 //    0.1403 from 20:05, against 0.8: the hour whose middle, 20:35, is nearest the 21:00 peak.
 //    The sine's mean over it is 1 + 0.6 cos(2 pi 25/1440) sin(pi 60/1440) / (pi 60/1440) =
@@ -1631,19 +1653,43 @@ TEST_CASE(
 //    the whole day's mean is 0.0879. 1e-3: a closed form.
 TEST_CASE("book/youtube runs the day and passes its three SLOs", "[scenario]") {
   using namespace std::chrono_literals;
+  using Catch::Matchers::WithinRel;
   auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml");
   s.step = 10s;
-  const auto results = run_slos(s);
+  const auto g = build_or_fail(s);
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  simsys::report::Summary summary{g, s.warmup};
+  std::optional<double> pipe_latency_at_peak_s;
+  sim->run({.duration = s.duration, .step = s.step}, [&](const auto& r) {
+    summary.observe(r);
+    // youtube's one link with a bandwidth, cdn_eu -> transcoded_store, is the step's only pipe.
+    if (r.t == simsys::SimTime{21h} && r.links.size() == 1) {
+      pipe_latency_at_peak_s = r.links.front().latency.mean_s;
+    }
+  });
+  const auto results = simsys::report::evaluate_slos(summary, s.slos);
   REQUIRE(results.size() == 3);
   for (const auto& r : results) {
     CAPTURE(r.slo.node, static_cast<int>(r.slo.metric), r.observed.value_or(-1.0), r.note);
     REQUIRE(r.status == simsys::report::SloStatus::pass);
   }
   const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
-  REQUIRE_THAT(*p99.observed, Catch::Matchers::WithinRel(0.465, 0.01));
+  REQUIRE_THAT(*p99.observed, WithinRel(0.4652, 1e-3));
+
   const auto& lag = slo_of(results, simsys::model::SloMetric::queue_lag);
-  REQUIRE_THAT(*lag.observed, Catch::Matchers::WithinRel(0.573, 0.01));
+  const double erlang_wait = simsys::queueing::mmc_wait(600, 0.96, 60.0).mean_s;
+  REQUIRE_THAT(erlang_wait, WithinRel(0.5729, 1e-3));
+  REQUIRE_THAT(*lag.observed, WithinRel(erlang_wait, 1e-9));
+
+  REQUIRE(pipe_latency_at_peak_s.has_value());
+  const double h_eu = *g.hit_ratio(*g.index_of("cdn_eu"));
+  const double pipe_rho = 140.8 * (1.0 - h_eu) * 50.0 / 5'000.0;
+  const double md1_wait_s = 0.5 * pipe_rho / (1.0 - pipe_rho) * 10e-3;
+  REQUIRE_THAT(*pipe_latency_at_peak_s, WithinRel(md1_wait_s + 0.2e-3, 1e-9));
+  REQUIRE_THAT(*pipe_latency_at_peak_s, WithinRel(6.8588e-3, 1e-4));
+
   const auto& utilization = slo_of(results, simsys::model::SloMetric::utilization);
-  REQUIRE_THAT(*utilization.observed, Catch::Matchers::WithinRel(0.1403, 1e-3));
+  REQUIRE_THAT(*utilization.observed, WithinRel(0.1403, 1e-3));
   REQUIRE(utilization.window_start == simsys::SimTime{20h + 5min});
 }
