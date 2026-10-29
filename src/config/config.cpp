@@ -2572,14 +2572,13 @@ CheckResult refused_worker_pool_keys(const Site& site, const YAML::Node& body) {
   return {};
 }
 
-// `consumes: transcode_q`: read_node_routing has checked that the node exists; whether it is a
-// queue that links to the pool is Graph::build's to check (a scenario built in code needs it too).
 // `consumes: transcode_q`, required (review of plan 2c Task 6, I-1): the queue whose messages the
 // pool drains, its only source of jobs. A pool without one would be a server any node could call,
 // waiting days in a 7-day room and never dropping, which is no worker pool of the book's designs
 // (graph::Graph::check_pool_senders refuses every other sender). The reference itself was checked
-// with the other node references (reference_keys); what it may name, a queue or a frontier, is the
-// graph's check.
+// with the other node references (reference_keys); what it may name (a queue or a frontier that
+// links to the pool) is Graph::build's to check, which refuses a missing `consumes` in these words
+// too, since a scenario built in code skips the loader.
 CheckResult read_consumes(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   if (!body["consumes"]) return site.fail(body, "worker_pool needs consumes");
   node.consumes = scalar_text(body["consumes"]);

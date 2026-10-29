@@ -10,7 +10,8 @@
 // (request out, reply back) plus that node's own response; sequential hops add, parallel
 // hops cost the slowest branch, and an op split over several links (by a client or a load
 // balancer) is a share-weighted mixture of its routes (`mixture`). A hop that closes a cycle of
-// CALLS (graph::Graph::is_async_hop: chat.msg -> queue -> sync.job -> chat.msg) is asynchronous:
+// CALLS (graph::Graph::is_async_hop: a.msg -> b.relay -> c.job -> a.msg, three services each
+// calling the next) is asynchronous:
 // its flow goes round, but the sender does not wait for it, so it adds nothing to the
 // response. A hop over a node-level feedback link that closes no call cycle (A.x -> B.y,
 // B.z -> A.w: the boxes loop, the calls do not) is waited for like any other, one step
@@ -338,9 +339,14 @@ class HopBlocks {
 [[nodiscard]] Hop hop_to(const graph::Graph& g, std::size_t self, std::string_view incoming_op,
                          std::size_t target, std::string op, double factor);
 
+// The same hop when the caller knows whether it is asynchronous without asking per incoming op
+// (a worker pool's hand-offs, WorkerPoolBehaviour, which never are).
+[[nodiscard]] Hop hop_with(const graph::Graph& g, std::size_t self, std::size_t target,
+                           std::string op, double factor, bool asynchronous);
+
 // Adds to `hops` the blocks of node `self`'s `then` steps for incoming `op`, each taken by the
 // share graph::Graph::then_fraction gives (a cache's, CacheBehaviour; a blob store's events,
-// BlobStoreBehaviour; a worker pool's hand-offs, WorkerPoolBehaviour).
+// BlobStoreBehaviour). A worker pool builds its own (WorkerPoolBehaviour): one set for every op.
 void add_then_blocks(const graph::Graph& g, std::size_t self, const std::string& op,
                      HopBlocks& hops);
 
@@ -1046,8 +1052,9 @@ class MegabyteService {
   // follows refinement 2's rule for the node behind it:
   //   a write (`write_ops`: graph::ResolvedLink::write_ops)               MB_o × s_MB
   //        the receiver acts after the LAST byte (a PUT is stored once all of it arrived; an op is
-  //        a write on the link if the receiver or a node behind it that the op reaches under its
-  //        own name lists it, so a balancer in front of the store changes nothing);
+  //        a write on the link if the receiver or a node behind it that its body reaches, under
+  //        its own name or a sized step's, lists it, so a balancer in front of the store changes
+  //        nothing, nor does a service that sends the body on as a sized `put`);
   //   any other op                                                        min(MB_o, 1) × s_MB
   //        the receiver answers at its first megabyte while the rest streams in behind it.
   // For a streamed PUT into a blob store the wire's and the disk's whole-object times then add in
@@ -1407,10 +1414,11 @@ class WorkerPoolBehaviour {
 
  private:
   // The key the `then` blocks are filed under: one set of blocks for every job, since every step
-  // fires for every job whatever its op (graph::Graph::then_fraction is 1 at a pool).
+  // fires for every job whatever its op (graph::Graph::then_fraction is 1 at a pool) and none of
+  // its hops is asynchronous (see the constructor). A key, never an op: nothing is asked about it.
   static constexpr std::string_view every_job = "";
 
-  // One block per `then` step (detail::add_then_blocks), only ever forwarded.
+  // One block per `then` step (built in the constructor), only ever forwarded.
   detail::HopBlocks hand_offs_;
 };
 
@@ -1863,8 +1871,13 @@ double CacheBehaviour::cost(std::string_view op) const {
 
 detail::Hop detail::hop_to(const graph::Graph& g, std::size_t self, std::string_view incoming_op,
                            std::size_t target, std::string op, double factor) {
-  const auto link = *g.demand_link(self, target);  // Graph::build proved it exists
   const bool asynchronous = g.is_async_hop(self, incoming_op, target, op);
+  return hop_with(g, self, target, std::move(op), factor, asynchronous);
+}
+
+detail::Hop detail::hop_with(const graph::Graph& g, std::size_t self, std::size_t target,
+                             std::string op, double factor, bool asynchronous) {
+  const auto link = *g.demand_link(self, target);  // Graph::build proved it exists
   return detail::Hop{.op = std::move(op),
                      .target = target,
                      .link = link,
@@ -2099,10 +2112,23 @@ Routed MessageQueueBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTi
 
 // ---- WorkerPoolBehaviour ----
 
-// Graph::build resolved the `then` steps' targets and links, and refused one on miss or on failure,
-// so every step is unconditional: then_fraction is 1 for any op, the empty `every_job` included.
+// One block per `then` step, each in its declared mode, under the one key `every_job`. Graph::build
+// resolved the steps' targets and links, and refused one on miss or on failure, so every step is
+// unconditional and taken by every job (graph::Graph::then_fraction is 1 at a pool, whatever the
+// op). No hop is asynchronous: no call reaches a pool (Graph::check_pool_senders: only its queue's
+// deliveries do, and they are asynchronous), so no call cycle passes through one
+// (detail::find_async_hops leaves its steps out), and the other asynchronous hops start at a cache,
+// a blob store or a queue. That is what lets ONE set of blocks serve the jobs of every op: were a
+// pool's hop asynchronous for some op and not for another, the blocks would have to be per op.
 WorkerPoolBehaviour::WorkerPoolBehaviour(const graph::Graph& g, std::size_t self) {
-  detail::add_then_blocks(g, self, std::string{every_job}, hand_offs_);
+  auto& blocks = hand_offs_.blocks_for(std::string{every_job});
+  for (const model::Step& step : g.nodes()[self].spec.then) {
+    blocks.push_back(detail::Block{
+        .fraction = 1.0,
+        .mode = step.mode,
+        .lookup = std::nullopt,
+        .hops = {detail::hop_with(g, self, *g.index_of(step.to), step.op, step.factor, false)}});
+  }
 }
 
 // Every job drained, whatever its op, fires every step once: the steps see the total.

@@ -732,6 +732,11 @@ A pool's **`then` steps** are the work a finished job hands on (ch. 14's transco
 renditions to the transcoded store and publishes a completion message): every step fires for
 every job the pool **drains**, `factor` requests of the step's op each, whatever op the queue
 brought the job under, sized by the step's `size:` or, for a same-op step, by the job's own size.
+A same-op step keeps only the size of the jobs that arrive under its op: when jobs of several ops
+reach the pool, it renames the others, and a renamed request without `size:` has none, so a
+byte-sized target refuses them with a note (`... has no size: add size: to the step or sizes: to
+the client (a worker pool's then step keeps the size of the jobs that arrive as 'upload' only: it
+renames every other job, and a renamed job has no size)`); give such a step its own `size:`.
 A pool of 10 jobs/s draining 8/s with `then: [{to: store, op: write, factor: 4, size: 50MB}, {to:
 done_q, op: publish}]` sends the store 32 writes/s (1.6k MB/s) and `done_q` 8 messages/s;
 offered 12/s it drains 10/s, so its targets get 10 jobs' worth (2k MB/s, 10/s), and the excess
@@ -850,12 +855,15 @@ request's answer time on the wire, by the rule of a [byte-sized node](#node-comm
 **write** pays its **whole serialisation**, since the receiver acts after its last byte, and **any
 other op its first megabyte** (`min(size, 1 MB) × 1 MB / bandwidth`), since the receiver answers at
 its first megabyte while the rest streams in. Whether an op is a write is decided per link and op
-when the graph is built: it is one if a node it reaches **under its own name** lists it in
-`write_ops` (`write` for a node that lists none), the receiver or any node behind it, so a 10 MB
-`upload` through a load balancer into a blob store that lists `upload` pays its whole 80 ms on the
-client's link exactly as it would straight into the store (a balancer or a service passing a body
-on has it all before it forwards it); a renamed request is a new one and does not count. So: 16 + 8 = 24 ms there; for 10 MB requests at 10/s, 160 + 8 = 168 ms for a
-read and 160 + 80 = 240 ms for a write. A streamed upload into a blob store thus pays the wire's
+when the graph is built: it is one if a node its **body** reaches lists it in `write_ops` (`write`
+for a node that lists none), the receiver or any node behind it. The body goes on under the op's
+own name, and under the new name of a step that states its own `size:` (it forwards a payload);
+a renamed step without one is a new request (a lookup, a notification) and does not count. So a
+10 MB `upload` through a load balancer into a blob store that lists `upload` pays its whole 80 ms
+on the client's link exactly as it would straight into the store, and so does one a service sends
+on as `{to: store, op: put, size: 10MB}` to a store that writes `put` (a balancer or a service
+passing a body on has it all before it forwards it). So: 16 + 8 = 24 ms there; for 10 MB requests
+at 10/s, 160 + 8 = 168 ms for a read and 160 + 80 = 240 ms for a write. A streamed upload into a blob store thus pays the wire's
 whole-object time and then the store's in series (an upper bound: a real PUT overlaps them).
 Requests of several sizes wait longer than one size at the same rho (1 MB and 4 MB at 20/s each:
 54.4 ms, Pollaczek–Khinchine). Like a node's, the wait is never longer than the room takes to

@@ -76,9 +76,15 @@
 - The whole day runs: `simsys run` steps 24 h at 100 ms (861,000 steps observed after the
   warmup, about 19 s in a Release build) and exits 0. The EU stream p99 (456 ms against 2 s) and
   `cdn_us`'s mean utilization (0.0879 against 0.8) pass; the `queue_lag` SLO is skipped, since
-  queue lag is not measured yet (plan 2c Task 8). The transcoders spend 48.27k s (13.4 h) in the
-  red zone, saturated (peak rho 1), and their backlog peaks at 63.76k videos: the lag that SLO
-  will catch. (Uploads take 12 s, past the clients' 10 s timeout that is not applied yet: above.)
+  queue lag is not measured yet (plan 2c Task 8). From 15:43 the uploads outrun the transcoders'
+  6.667 videos/s, so they run saturated (peak rho 1) and their backlog grows into the night: the
+  run's `peak_backlog`, 63.76k videos, is its last step's, at midnight, with the inflow (8.55/s)
+  still above their capacity. It is not the day's peak, which comes after the run ends: about
+  71.9k videos (3.0 h of lag) near 02:18 (`--duration 27h` shows it). Their 48.27k s (13.4 h) in
+  the red zone counts 00:00 to 02:18 as well, when the run's queue fills from empty where the real
+  one would still be working off the evening before. `transcoded_store` is red for 10.79k s
+  (3.0 h) around the evening peak (peak rho 0.9225: the CDNs' misses and the renditions, 98.1 %
+  on paper). (Uploads take 12 s, past the clients' 10 s timeout that is not applied yet: above.)
 
 ## What it abstracts away
 - Adaptive bitrate selection, chunked upload resume, DRM.

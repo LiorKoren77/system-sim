@@ -2365,11 +2365,12 @@ NodeSpec message_queue(std::string id) {
   return NodeSpec{.id = std::move(id), .type = NodeType::message_queue};
 }
 
-// pool -> store, the pool's one `then` step being `step`; no queue feeds the pool.
+// q -> pool -> store, the pool's one `then` step being `step`; nothing publishes to q, so no job
+// ever reaches the pool.
 Scenario unfed_pool(Step step) {
   Scenario s{.name = "unfed-pool", .version = 1, .duration = 1min};
-  s.nodes = {worker_pool("pool", {std::move(step)}), default_blob_store()};
-  s.links = {LinkSpec{.from = "pool", .to = "store"}};
+  s.nodes = {message_queue("q"), worker_pool("pool", {std::move(step)}, "q"), default_blob_store()};
+  s.links = {LinkSpec{.from = "q", .to = "pool"}, LinkSpec{.from = "pool", .to = "store"}};
   return s;
 }
 
@@ -2378,14 +2379,17 @@ const std::string no_size_advice = "has no size: add size: to the step or sizes:
 
 // Nothing feeds the pool, yet its `then` step counts as arriving at the store (an unconditional
 // `then` fires for whatever the node receives). Before this fix the store took `write` with no
-// size and charged it one unit; now the step must say how big a write is.
+// size and charged it one unit; now the step must say how big a write is. The sender is a pool,
+// so the message says how its step lost the size (review of plan 2c Task 7, minor 2).
 TEST_CASE("a worker pool's then step that no queue feeds still needs a size at a byte-sized store",
           "[graph]") {
   const auto built = Graph::build(unfed_pool(Step{.to = "store", .op = "write"}));
   REQUIRE_FALSE(built.has_value());
   REQUIRE(built.error().message ==
           "node 'store' counts bytes (capacity 500MB/s, default), but op 'write' from 'pool' " +
-              no_size_advice);
+              no_size_advice +
+              " (a worker pool's then step keeps the size of the jobs that arrive as 'write' "
+              "only: it renames every other job, and a renamed job has no size)");
 }
 
 // The step's own size holds wherever the step fires, fed or not: 50 MB = 5e7 B.
@@ -2397,12 +2401,13 @@ TEST_CASE("a worker pool's then step that no queue feeds is sized by its own siz
   REQUIRE_THAT(bytes_required(*built, "store", "write"), WithinRel(5e7, 1e-12));
 }
 
-// A pool that names no queue (no `consumes`) and has no link q -> pool: the queue holds the
-// client's 300 MB uploads, but no link takes them to the pool (they go to another group, `other`),
-// so the pool's same-op `then` step inherits nothing. Its `upload` still counts as arriving at the
-// store, unsized. (A pool that DID name the queue without the link is an error since plan 2c Task
-// 6: tested below; so is a queue nobody consumes, since its review: hence `other`.)
-TEST_CASE("a pool whose queue has no link to it sends its same-op then step unsized", "[graph]") {
+// A pool built in code that names no queue (no `consumes`): the loader refuses such a file
+// (`worker_pool needs consumes`, review of plan 2c Task 6, I-1), and since the review of Task 7
+// (minor 4) so does Graph::build, in the same words. Before, it built and could never receive a
+// job (every sender but its queue is refused, and it had none), so its room fell back to the
+// default retention for a queue that did not exist.
+TEST_CASE("a worker pool built in code without consumes is refused as the loader refuses it",
+          "[graph]") {
   Scenario s{.name = "unlinked-pool", .version = 1, .duration = 1min};
   s.nodes = {sized_client("u", "upload", simsys::Bytes{300e6}), message_queue("q"),
              worker_pool("other", {}, "q"),
@@ -2411,9 +2416,7 @@ TEST_CASE("a pool whose queue has no link to it sends its same-op then step unsi
              LinkSpec{.from = "pool", .to = "store"}};
   const auto built = Graph::build(s);
   REQUIRE_FALSE(built.has_value());
-  REQUIRE(built.error().message ==
-          "node 'store' counts bytes (capacity 500MB/s, default), but op 'upload' from 'pool' " +
-              no_size_advice);
+  REQUIRE(built.error().message == "node 'pool': worker_pool needs consumes");
 }
 
 // A client link of weight 0 is drained: no request takes it (Graph::client_routes gives it share
@@ -2601,6 +2604,26 @@ TEST_CASE("a worker pool's same-op then step inherits the size of the job it dra
   REQUIRE(built.has_value());
   REQUIRE_THAT(bytes_required(*built, "w", "publish"), WithinRel(2e3, 1e-12));
   REQUIRE_THAT(bytes_required(*built, "done_q", "publish"), WithinRel(2e3, 1e-12));
+}
+
+// A same-op step passes on the size of the jobs that arrive under its op only (review of plan 2c
+// Task 7, minor 2): u publishes `upload` and `reupload`, both 300 MB; the pool's step `{to: store,
+// op: upload}` carries the uploads' 300 MB on, but renames every `reupload` job to `upload`, and a
+// renamed request without `size:` has none. The store counts bytes, so the build fails, and the
+// message says why a size the client states did not reach it.
+TEST_CASE(
+    "a pool's same-op then step renames the jobs of another op unsized, and the error says so",
+    "[graph]") {
+  NodeSpec u = client("u", Rate{8}, {{"upload", 0.5}, {"reupload", 0.5}});
+  u.workload->sizes = {{"upload", simsys::Bytes{300e6}}, {"reupload", simsys::Bytes{300e6}}};
+  const auto built =
+      Graph::build(pool_handing_on({Step{.to = "store", .op = "upload"}}, std::move(u)));
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'store' counts bytes (capacity 500MB/s, default), but op 'upload' from 'w' " +
+              no_size_advice +
+              " (a worker pool's then step keeps the size of the jobs that arrive as 'upload' "
+              "only: it renames every other job, and a renamed job has no size)");
 }
 
 // Nobody waits on a pool: the hop into it from its queue is asynchronous (Task 6). Its own
@@ -3222,13 +3245,13 @@ TEST_CASE("the broker itself keeps the type's append numbers: 1M messages a seco
 // filter lets none of the queue's ops through, are pipelines the scenario believes run and that
 // carry nothing: all refused at build, each naming what to fix.
 
-// A client sending straight to a pool: refused, naming the sender (the pool here has no
-// `consumes`, as only a scenario built in code can: the loader requires it).
+// A client sending straight to a pool: refused, naming the sender (the pool consumes q, which
+// nothing publishes to: the client's route is its only way in).
 TEST_CASE("a client sending to a worker pool is refused: a pool takes jobs from its queue only",
           "[graph]") {
   Scenario s{.name = "direct-pool", .version = 1, .duration = 1min};
-  s.nodes = {client("u", Rate{100}, {{"job", 1.0}}), worker_pool("w", {})};
-  s.links = {LinkSpec{.from = "u", .to = "w"}};
+  s.nodes = {client("u", Rate{100}, {{"job", 1.0}}), message_queue("q"), worker_pool("w", {}, "q")};
+  s.links = {LinkSpec{.from = "u", .to = "w"}, LinkSpec{.from = "q", .to = "w"}};
   const auto built = Graph::build(s);
   REQUIRE_FALSE(built.has_value());
   REQUIRE(built.error().message ==

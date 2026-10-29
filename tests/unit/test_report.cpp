@@ -261,7 +261,7 @@ TEST_CASE("SLOs pass, fail or are skipped when the metric is not available", "[r
   REQUIRE(results[0].status == SloStatus::pass);
   REQUIRE(results[0].observed.has_value());
   REQUIRE(results[1].status == SloStatus::pass);
-  REQUIRE(results[2].status == SloStatus::fail);     // rho 0.5 > 0.3
+  REQUIRE(results[2].status == SloStatus::fail);  // rho 0.5 > 0.3
   // queue_lag names a service, which has no queue lag: nothing to observe, so it is skipped (the
   // loader refuses such a file: "slo: queue_lag needs a message_queue node", plan 2c Task 8).
   REQUIRE(results[3].status == SloStatus::skipped);
@@ -373,6 +373,21 @@ TEST_CASE("explain says when a loop of gain >= 1 has no steady state", "[report]
   const auto text = simsys::report::render_explain(g);
   CAPTURE(text);
   REQUIRE(text.ends_with("  (no steady state: a loop of gain >= 1)\n"));
+}
+
+// The loop's totals grow every pass until they overflow, so the last finite pass printed
+// "peak offered 5.618e+307/s" (review of plan 2c Task 7, minor 6): a number no reader can use.
+// Every node whose load was still growing when the passes stopped is "unbounded" instead: a and b
+// here, both on the loop.
+TEST_CASE("explain prints the nodes of a loop of gain >= 1 as unbounded, not as a huge number",
+          "[report]") {
+  const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(loop(2.0)));
+  CAPTURE(text);
+  REQUIRE(check_line(text, "a").ends_with(
+      "peak offered unbounded vs 10k/s total capacity  (no steady state, red)"));
+  REQUIRE(check_line(text, "b").ends_with(
+      "peak offered unbounded vs 10k/s total capacity  (no steady state, red)"));
+  REQUIRE_FALSE(text.contains("e+30"));
 }
 
 TEST_CASE("explain summarises the client's curve and checks the peak offered load", "[report]") {
@@ -1819,6 +1834,20 @@ TEST_CASE("explain prints a pool's room of millions with an SI prefix", "[report
   const auto seconds = explain_of(queue_and_pool_reported(10s, std::nullopt));
   CAPTURE(seconds);
   REQUIRE(node_line(seconds, "w").contains("queue_limit=12000 (retention × capacity)"));
+}
+
+// Six significant digits round a room in [999,999.5, 1e6) up to a million, which they print as
+// "1e+06" (review of plan 2c Task 7, minor 8): such a room is printed as the million it rounds to,
+// "1M", and the room just below keeps its six digits. 833.3333 s x 1200/s = 999,999.96 messages;
+// 833.332 s x 1200/s = 999,998.4.
+TEST_CASE("explain prints a room that rounds to a million as 1M, not 1e+06", "[report]") {
+  using namespace std::chrono_literals;
+  const auto rounds_up = explain_of(queue_and_pool_reported(833'333'300us, std::nullopt));
+  CAPTURE(rounds_up);
+  REQUIRE(node_line(rounds_up, "w").contains("queue_limit=1M (retention × capacity)"));
+  const auto below = explain_of(queue_and_pool_reported(833'332ms, std::nullopt));
+  CAPTURE(below);
+  REQUIRE(node_line(below, "w").contains("queue_limit=999998 (retention × capacity)"));
 }
 
 TEST_CASE(

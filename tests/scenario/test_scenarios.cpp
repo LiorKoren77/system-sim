@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+#include "../support/explain_lines.hpp"
+
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion. It comes after the #includes because GCC 14 reports redefinitions
 // when a std header is included after importing a module that included it in its
@@ -25,6 +27,10 @@ import simsys.engine;
 import simsys.graph;
 import simsys.model;
 import simsys.report;
+
+// explain's lines, shared with test_report and test_series (review of plan 2c Task 7, minor 7).
+using simsys::test_support::check_line;
+using simsys::test_support::node_line;
 
 namespace {
 
@@ -403,6 +409,18 @@ TEST_CASE("book/youtube runs: the transcoders hand on what they drained, 6.667 j
                Catch::Matchers::WithinRel(400.0 / 60.0, 1e-9));
   REQUIRE_THAT(last.nodes[*g.index_of("completion_handler")].demand_per_s,
                Catch::Matchers::WithinRel(400.0 / 60.0, 1e-9));
+  // transcoded_store's other half (review of plan 2c Task 7, minor 9): beside the edges' misses,
+  // (1 - h) of what each CDN served, it is sent four 50 MB renditions per DRAINED job, 6.667 x 4 x
+  // 50 MB = 1333 MB/s, not the 8.55 x 4 x 50 = 1710 MB/s of the jobs that arrived. Its demand is in
+  // megabytes, as the CDNs' is. (The curve barely moves in the 150 ms the European misses take to
+  // cross: hence 0.1 %.)
+  const auto misses_mb_per_s = [&](std::string_view cdn) {
+    const auto index = *g.index_of(cdn);
+    return (1.0 - *g.hit_ratio(index)) * last.nodes[index].drain_per_s;
+  };
+  const double renditions_mb_per_s = last.nodes[*g.index_of("transcoded_store")].demand_per_s -
+                                     misses_mb_per_s("cdn_us") - misses_mb_per_s("cdn_eu");
+  REQUIRE_THAT(renditions_mb_per_s, Catch::Matchers::WithinRel(400.0 / 60.0 * 4.0 * 50.0, 1e-3));
 }
 
 // Task 8 evaluates youtube's `queue_lag` SLO (`transcode_q`, max 30m), which was `skipped` while no
@@ -471,15 +489,6 @@ TEST_CASE("book/news-feed is refused at graph_db, its kv_cluster, no longer at f
           "(phase 2)");
 }
 
-namespace {
-// The check line of node `id` in explain's checks block.
-std::string check_line_of(const std::string& explain_text, const std::string& id) {
-  const auto at = explain_text.find("\n  " + id + " ", explain_text.find("checks ("));
-  REQUIRE(at != std::string::npos);
-  return explain_text.substr(at + 1, explain_text.find('\n', at + 1) - at - 1);
-}
-}  // namespace
-
 // Plan 2c refinement 2: byte-sized nodes count megabytes, so the capacities the 2b scenarios gave
 // no verdict (converted from bytes at an assumed 1 MB per object: cdn_us 0.28 % where the bytes
 // give about 14 %) are checked in MB/s, with the numbers the books' sizes give: youtube's 50 MB
@@ -491,22 +500,22 @@ TEST_CASE("byte-sized capacities are checked in MB per second", "[scenario]") {
   const auto youtube_text = simsys::report::render_explain(youtube);
   CAPTURE(youtube_text);
   // cdn_us: 281.6 streams/s x 50 MB = 14.08k MB/s of 100GB/s = 100k MB/s: 14.08 %.
-  const auto us = check_line_of(youtube_text, "cdn_us");
+  const auto us = check_line(youtube_text, "cdn_us");
   REQUIRE(us.contains("peak offered 14.08k MB/s (281.6/s) vs 100k MB/s"));
   REQUIRE(us.contains("(14.1%, green)"));
   // cdn_eu: 140.8 streams/s x 50 MB = 7.04k MB/s of 50GB/s = 50k MB/s: 14.08 %.
-  const auto eu = check_line_of(youtube_text, "cdn_eu");
+  const auto eu = check_line(youtube_text, "cdn_eu");
   REQUIRE(eu.contains("peak offered 7.04k MB/s (140.8/s) vs 50k MB/s"));
   REQUIRE(eu.contains("(14.1%, green)"));
   // original_store: 9.6 uploads/s x 300 MB = 2.88k MB/s of 5GB/s = 5k MB/s: 57.6 %.
-  const auto original = check_line_of(youtube_text, "original_store");
+  const auto original = check_line(youtube_text, "original_store");
   REQUIRE(original.contains("peak offered 2.88k MB/s (9.6/s) vs 5k MB/s"));
   REQUIRE(original.contains("(57.6%, green)"));
   // transcoded_store: the cdns' misses, 157.82 streams/s x 50 MB = 7.891k MB/s, plus the
   // transcoders' renditions the paper load follows since Task 7: 9.6 uploads/s offered to the
   // pool (the paper load does not queue) x 4 renditions x 50 MB = 1.92k MB/s. In all 9.811k MB/s
   // (196.22 requests/s) of 10GB/s = 10k MB/s: 98.1 %, red, and a complete number.
-  const auto transcoded = check_line_of(youtube_text, "transcoded_store");
+  const auto transcoded = check_line(youtube_text, "transcoded_store");
   REQUIRE(
       transcoded.contains("peak offered 9.811k MB/s (196.2/s) vs 10k MB/s total capacity  "
                           "(98.1%, red)"));
@@ -517,7 +526,7 @@ TEST_CASE("byte-sized capacities are checked in MB per second", "[scenario]") {
   const auto news_text = simsys::report::render_explain(news);
   CAPTURE(news_text);
   // media_store: the cdn's 5 % misses, 324.3 reads/s x 200 KB = 64.86 MB/s of 1GB/s = 1k MB/s.
-  REQUIRE(check_line_of(news_text, "media_store")
+  REQUIRE(check_line(news_text, "media_store")
               .contains("peak offered 64.86 MB/s (324.3/s) vs 1k MB/s total capacity  "
                         "(6.49%, green)"));
 }
@@ -640,7 +649,7 @@ TEST_CASE("labs/unique-id's snowflake takes its capacity and latency from the al
   const auto text = simsys::report::render_explain(*g);
   CAPTURE(text);
   REQUIRE(text.contains("capacity=4.096M/s (algorithm)  service_time=10us (algorithm)"));
-  REQUIRE(check_line_of(text, "snowflake").contains("16.38M/s total capacity"));
+  REQUIRE(check_line(text, "snowflake").contains("16.38M/s total capacity"));
 }
 
 // The two book scenarios that use `algorithm: snowflake` still load, build and explain, and now
@@ -815,19 +824,9 @@ TEST_CASE("book/youtube sizes its streams, uploads and renditions at the byte-si
                Catch::Matchers::WithinRel(5e7, 1e-12));
 }
 
-namespace {
-// The line that describes node `id` in explain's `nodes:` block: the first line that starts with
-// the id (the nodes come before the links and the checks).
-std::string node_line_of(const std::string& explain_text, const std::string& id) {
-  const auto at = explain_text.find("\n  " + id + " ");
-  REQUIRE(at != std::string::npos);
-  return explain_text.substr(at + 1, explain_text.find('\n', at + 1) - at - 1);
-}
-}  // namespace
-
 TEST_CASE("explain on book/youtube prints the stream size on the byte-sized cdn", "[scenario]") {
   const auto g = build_or_fail(load_scenario("/book/youtube/scenario.yaml"));
   const auto text = simsys::report::render_explain(g);
   CAPTURE(text);
-  REQUIRE(node_line_of(text, "cdn_us").contains("sizes: stream 50MB"));
+  REQUIRE(node_line(text, "cdn_us").contains("sizes: stream 50MB"));
 }

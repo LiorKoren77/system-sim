@@ -168,9 +168,10 @@ t_s,client,op,offered_per_s,answered_per_s,mean_ms
 [YouTube](scenarios/book/youtube/) (ch. 14) the CDNs are sized in bytes, so they count megabytes
 and are checked in MB/s, the requests beside; each upload's event goes through the transcoding
 queue to the transcoders, a worker pool whose capacity is workers / cost (400 transcoders at 60 s
-a video: 6.667/s), and every video they are offered writes four renditions to the transcoded
-store and a completion the metadata tier records. The paper load does not queue, so the pool
-passes on all it is offered, and its red line says the evening peak outruns it (trimmed):
+a video: 6.667/s), and on paper every video they are offered writes four renditions to the
+transcoded store and a completion the metadata tier records (in a run, every video they drain).
+The paper load does not queue, so the pool passes on all it is offered, and its red line says the
+evening peak outruns it (trimmed):
 
 ```
 $ simsys explain scenarios/book/youtube/scenario.yaml
@@ -207,9 +208,10 @@ These seven scenarios run end to end:
   and a SQL database in 3 shards; both SLOs pass (redirect p99 7.49 ms, nothing dropped).
 - [`book/youtube`](scenarios/book/youtube/): ch. 14 over 24 hours in bytes: two CDNs, blob
   stores, the transcoding queue and workers, the metadata tier. It runs to the end and passes
-  its two checked SLOs (exit 0); the 400 transcoders fall behind every evening (a backlog of
-  63.76k videos) and the `queue_lag` SLO that would say so is still skipped (phase 2c Task 8);
-  the README's sizing is Task 16's.
+  its two checked SLOs (exit 0); from 15:43 the 400 transcoders fall behind (63.76k videos wait
+  at midnight, where the run ends, and the backlog is still growing: the day's peak, about
+  71.9k, comes near 02:18) and the `queue_lag` SLO that would say so is still skipped (phase 2c
+  Task 8); the README's sizing is Task 16's.
 
 Every other node type (external sinks, key-value clusters, ...) already validates and appears in
 `explain` with its resolved numbers, but `estimate` and `run` stop with "which run/estimate do

@@ -1022,9 +1022,9 @@ int Simulation::line_steps(const graph::ResolvedLink& link) {
 // megabytes (graph::ResolvedLink::pipe, defaults::pipe_capacity), the size of every op its
 // receiver can be sent with one (Graph::build refused a link that carries an unsized op, so these
 // cover every op that crosses it) and the ops that are writes on it (graph::ResolvedLink::
-// write_ops: for the receiver or a node behind it that the op reaches under its own name), which a
-// hop pays whole while any other op pays its first megabyte (MegabyteService::serialising). `slot`
-// is its sample's place in StepRecord::links.
+// write_ops: for the receiver or a node behind it that the request's body reaches, under its own
+// name or a sized step's), which a hop pays whole while any other op pays its first megabyte
+// (MegabyteService::serialising). `slot` is its sample's place in StepRecord::links.
 std::optional<Simulation::Pipe> Simulation::make_pipe(const graph::Graph& g, std::size_t link,
                                                       std::size_t slot) {
   const auto& resolved = g.links()[link];
