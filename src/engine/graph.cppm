@@ -337,13 +337,16 @@ struct ResolvedLink {
   // link only adds its latency.
   std::optional<fluid::Capacity> pipe{};
   // The ops this pipe carries that are WRITES for whoever receives them (review of plan 2c Task 5,
-  // I-2, and of Task 6, I-2): an op is a write on the link if a node it reaches under its own name,
-  // the receiver or any node behind it, lists it in its `write_ops` (model::write_ops_of). So a
-  // 10 MB `upload` through a load balancer into a blob store that lists `upload` is a write on the
-  // client's link too: the balancer forwards the body once all of it has arrived, as the store
-  // would. The engine pays a write's whole serialisation on the wire, any other op's first
-  // megabyte (behaviours::MegabyteService::serialising). Sorted; empty without a pipe (Graph::
-  // resolve_request_sizes, detail::written_downstream).
+  // I-2, and of Task 6, I-2): an op is a write on the link if a node its payload reaches, the
+  // receiver or any node behind it, lists it in its `write_ops` (model::write_ops_of), under its
+  // own name or under the name a step that states its own `size:` gives it (review of Task 7, I-2:
+  // such a step forwards a body). So a 10 MB `upload` through a load balancer into a blob store
+  // that lists `upload` is a write on the client's link too: the balancer forwards the body once
+  // all of it has arrived, as the store would; and so is one a service sends on as
+  // `{op: put, size: 10MB}` to a store that writes `put`. The engine pays a write's whole
+  // serialisation on the wire, any other op's first megabyte (behaviours::MegabyteService::
+  // serialising). Sorted; empty without a pipe (Graph::resolve_request_sizes,
+  // detail::written_downstream).
   std::vector<std::string> write_ops{};
 };
 
@@ -1252,10 +1255,11 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
 // (backend, op) for what a cache passes on synchronously (forwarder_steps). Same white/grey/black
 // classification as Graph::order_nodes, one level finer: there the vertices are boxes, here they
 // are the calls a request makes. A back edge is a call that, followed far enough, calls itself:
-// chat.msg -> queue.publish -> sync.job -> chat.msg. A request cannot wait for its own descendant,
-// so that hop is a fire-and-forget hand-off (the latency model skips it). A node loop that ends in
-// a terminal op (sync.job -> chat.push) has no back edge here, so every one of its hops is waited
-// for.
+// a.msg -> b.relay -> c.job -> a.msg, three services each calling the next (a message queue in
+// that loop would end the calls at it: its deliveries are asynchronous, consumer_deliveries). A
+// request cannot wait for its own descendant, so that hop is a fire-and-forget hand-off (the
+// latency model skips it). A node loop that ends in a terminal op (c.job -> a.push, where `push`
+// makes no call) has no back edge here, so every one of its hops is waited for.
 [[nodiscard]] std::vector<AsyncHop> find_async_hops(const Graph& g) {
   enum class Colour { grey, black };  // absent from the map = white (not yet visited)
   std::map<Call, Colour> colour;
@@ -1820,6 +1824,17 @@ struct SizeWalk {
   return "capacity " + format_byte_rate(defaults::blob_store_byte_rate) + ", default";
 }
 
+// Why a worker pool's step can send an op unsized although its jobs are sized (review of plan 2c
+// Task 7, minor 2): every job fires every step, so a same-op step `{op: upload}` carries the size
+// of the jobs that arrived as `upload` and renames the jobs of every other op, and a renamed
+// request has no size (refinement 1). Empty for any other sender, whose steps are per op.
+[[nodiscard]] std::string pool_renaming_hint(std::span<const ResolvedNode> nodes,
+                                             std::string_view op, std::size_t from) {
+  if (nodes[from].spec.type != model::NodeType::worker_pool) return {};
+  return " (a worker pool's then step keeps the size of the jobs that arrive as '" +
+         std::string{op} + "' only: it renames every other job, and a renamed job has no size)";
+}
+
 // "node 'store' counts bytes (capacity 500MB/s, default), but op 'fetch' from 'svc' has no size:
 // ...": a byte-sized node's error for an unsized op, naming where to add the size.
 [[nodiscard]] EngineError no_size_error(std::span<const ResolvedNode> nodes, std::size_t node,
@@ -1827,7 +1842,8 @@ struct SizeWalk {
   const auto& spec = nodes[node].spec;
   return EngineError{"node '" + spec.id + "' counts bytes (" + byte_capacity_text(spec) +
                      "), but op '" + std::string{op} + "' from '" + nodes[from].spec.id +
-                     "' has no size: add size: to the step or sizes: to the client"};
+                     "' has no size: add size: to the step or sizes: to the client" +
+                     pool_renaming_hint(nodes, op, from)};
 }
 
 // Is the arrival a rate limiter's `counter` request to `node`, its backend (plan 2a refinement
@@ -1912,7 +1928,8 @@ struct SizeWalk {
     }
     if (!arrival.size) {
       return EngineError{name + "op '" + arrival.op + "' from '" + origin +
-                         "' has no size: add size: to the step or sizes: to the client"};
+                         "' has no size: add size: to the step or sizes: to the client" +
+                         pool_renaming_hint(nodes, arrival.op, arrival.origin)};
     }
     if (!(arrival.size->count > 0.0)) {
       return EngineError{name + "op '" + arrival.op + "' from '" + origin + "' has size " +
@@ -1922,18 +1939,27 @@ struct SizeWalk {
   return std::nullopt;
 }
 
-// Is `op` a write at `node`, or at a node the request reaches from there under its own name
-// (ResolvedLink::write_ops)? The size walk's hops (call_hops and the size-only hops), followed only
-// while the op keeps its name: a renamed request is a new request, whose bytes the receiver has
-// already taken in. `seen` holds the nodes already asked, so a loop ends.
+// Does a hop for `op` carry the request's payload on? While the op keeps its name it does; a
+// renamed step that states its own `size:` does too (review of plan 2c Task 7, I-2): it forwards
+// a body, which the node had to take in whole before sending it on, so the receiver far down
+// writing it makes the first hop a write as well. A renamed step without a size is a new request
+// of its own (a lookup, a notification), whose sender had read the incoming bytes already.
+[[nodiscard]] bool carries_payload(std::string_view op, const CallHop& hop) {
+  return hop.op == op || hop.size.has_value();
+}
+
+// Is `op` a write at `node`, or at a node the request's payload reaches from there
+// (ResolvedLink::write_ops)? The size walk's hops (call_hops and the size-only hops) that carry
+// the payload on (carries_payload), under its name or under the name a sized step gives it.
+// `seen` holds the (node, op) pairs already asked, so a loop ends.
 [[nodiscard]] bool written_downstream(const Graph& g, std::size_t node, const std::string& op,
-                                      std::set<std::size_t>& seen) {
-  if (!seen.insert(node).second) return false;
+                                      std::set<std::pair<std::size_t, std::string>>& seen) {
+  if (!seen.emplace(node, op).second) return false;
   if (is_write(g.nodes()[node].spec, op)) return true;
   auto hops = call_hops(g, node, op);
   add_size_only_hops(g, node, op, hops);
   for (const CallHop& hop : hops) {
-    if (hop.op == op && written_downstream(g, hop.to, op, seen)) return true;
+    if (carries_payload(op, hop) && written_downstream(g, hop.to, hop.op, seen)) return true;
   }
   return false;
 }
@@ -1947,7 +1973,7 @@ struct SizeWalk {
   if (!link.pipe) return writes;
   for (const SizeArrival& arrival : arrivals) {
     if (std::ranges::contains(writes, arrival.op)) continue;
-    std::set<std::size_t> seen;
+    std::set<std::pair<std::size_t, std::string>> seen;
     if (written_downstream(g, demand_receiver(link), arrival.op, seen)) {
       writes.push_back(arrival.op);
     }
@@ -3041,32 +3067,34 @@ Graph::Result Graph::connect_consumers() {
 //   10 s × 1200 jobs/s = 12,000 messages; the default 7 d × 1200/s = 725.76 million.
 // A message older than that is deleted unconsumed: the fluid queue drops what overflows the room,
 // and the drops are the pool's. Each group's room is its own (retention × ITS capacity). The
-// retention is the queue's, or defaults::default_retention when it states none, when the pool
-// reads a frontier (which has no retention) or names no queue at all (a pool built in code).
+// retention is the queue's, or defaults::default_retention when it states none or the pool reads a
+// frontier (which has no retention). A pool built in code without `consumes` is refused in the
+// loader's words (review of plan 2c Task 7, minor 4): it could never receive a job, since
+// check_pool_senders refuses every sender but its queue.
 // Assumed: the backlog drains first in, first out, so the oldest message waits the FIFO drain time
 // (backlog over drain rate) and the room in messages is the room in seconds of draining.
 Graph::Result Graph::connect_consumer(std::size_t pool) {
   auto& resolved = nodes_[pool];
   const auto& spec = resolved.spec;
-  SimTime retention = defaults::default_retention;
-  if (spec.consumes) {
-    const std::string name = "node '" + spec.id + "': consumes ";
-    const auto queue = index_of(*spec.consumes);
-    if (!queue) {
-      return std::unexpected{EngineError{name + "refers to unknown node '" + *spec.consumes + "'"}};
-    }
-    const auto& source = nodes_[*queue].spec;
-    if (!can_be_consumed(source.type)) {
-      return std::unexpected{EngineError{
-          name + "'" + source.id + "' (type " + std::string{model::to_string(source.type)} +
-          "); a worker pool consumes a message_queue or a frontier"}};
-    }
-    if (!demand_link(*queue, pool)) {
-      return std::unexpected{EngineError{name + "'" + source.id + "', but no link from '" +
-                                         source.id + "' delivers its messages to it"}};
-    }
-    retention = source.retention.value_or(defaults::default_retention);
+  if (!spec.consumes) {
+    return std::unexpected{EngineError{"node '" + spec.id + "': worker_pool needs consumes"}};
   }
+  const std::string name = "node '" + spec.id + "': consumes ";
+  const auto queue = index_of(*spec.consumes);
+  if (!queue) {
+    return std::unexpected{EngineError{name + "refers to unknown node '" + *spec.consumes + "'"}};
+  }
+  const auto& source = nodes_[*queue].spec;
+  if (!can_be_consumed(source.type)) {
+    return std::unexpected{EngineError{name + "'" + source.id + "' (type " +
+                                       std::string{model::to_string(source.type)} +
+                                       "); a worker pool consumes a message_queue or a frontier"}};
+  }
+  if (!demand_link(*queue, pool)) {
+    return std::unexpected{EngineError{name + "'" + source.id + "', but no link from '" +
+                                       source.id + "' delivers its messages to it"}};
+  }
+  const SimTime retention = source.retention.value_or(defaults::default_retention);
   resolved.capacity.queue_limit = seconds(retention) * resolved.capacity.service_rate.per_second;
   return {};
 }

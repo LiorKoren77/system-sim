@@ -1955,21 +1955,24 @@ TEST_CASE("a worker pool's response and delivered share are its own sojourn and 
 // the theory tests'. Its response and delivered share stay its own: nobody waits for a pool.
 
 namespace {
-// u (publishes `publish`) -> q -> w (4 workers at 5 ms, consuming q, `then` as given) -> {svc,
-// audit}, over zero-latency links. Node indices: u 0, q 1, w 2, svc 3, audit 4.
-Scenario pool_with_then(std::vector<Step> then) {
+// u (publishes `publish`, or the ops of `published`) -> q -> w (4 workers at 5 ms, consuming q,
+// `then` as given) -> {svc, audit}, over zero-latency links. Node indices: u 0, q 1, w 2, svc 3,
+// audit 4.
+Scenario pool_with_then(std::vector<Step> then,
+                        std::vector<std::pair<std::string, double>> published = {
+                            {"publish", 1.0}}) {
   Scenario s{.name = "pool-then", .version = 1, .duration = 1min};
   NodeSpec pool{.id = "w", .type = NodeType::worker_pool, .then = std::move(then)};
   pool.consumes = "q";
   pool.workers = 4;
   pool.job_cost = 5ms;
-  s.nodes = {
-      NodeSpec{.id = "u",
-               .type = NodeType::client,
-               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"publish", 1.0}}}},
-      NodeSpec{.id = "q", .type = NodeType::message_queue}, std::move(pool),
-      NodeSpec{.id = "svc", .type = NodeType::service},
-      NodeSpec{.id = "audit", .type = NodeType::service}};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{100}},
+                                           .op_shares = std::move(published)}},
+             NodeSpec{.id = "q", .type = NodeType::message_queue}, std::move(pool),
+             NodeSpec{.id = "svc", .type = NodeType::service},
+             NodeSpec{.id = "audit", .type = NodeType::service}};
   s.links = {LinkSpec{.from = "u", .to = "q", .latency = 0s},
              LinkSpec{.from = "q", .to = "w", .latency = 0s},
              LinkSpec{.from = "w", .to = "svc", .latency = 0s},
@@ -1998,10 +2001,17 @@ TEST_CASE("a worker pool forwards each drained job's then steps times their fact
 }
 
 // The steps fire for every job, whichever op it was brought under: 3 `publish`/s and 2 `retry`/s
-// are 5 jobs/s, so svc is sent 5 x 4 = 20 `work`/s and audit 5 `log`/s.
+// are 5 jobs/s, so svc is sent 5 x 4 = 20 `work`/s and audit 5 `log`/s. The client publishes both
+// ops (review of plan 2c Task 7, minor 1), so `retry` is an op the graph saw arrive at the pool,
+// as in a run: the pool's blocks do not depend on it, but a fixture that fed an op no scenario
+// could send would prove nothing about one that can.
 TEST_CASE("a worker pool's then steps fire for every drained job whatever its op", "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(pool_with_then(
-      {Step{.to = "svc", .op = "work", .factor = 4.0}, Step{.to = "audit", .op = "log"}}));
+      {Step{.to = "svc", .op = "work", .factor = 4.0}, Step{.to = "audit", .op = "log"}},
+      {{"publish", 0.6}, {"retry", 0.4}}));
+  // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
+  // `std::ranges::find(r, v) != std::ranges::end(r)`.
+  REQUIRE(std::ranges::contains(g.arriving_ops(*g.index_of("w")), std::string{"retry"}));
   const WorkerPoolBehaviour pool{g, *g.index_of("w")};
   Flow in;
   in.add("publish", Rate{3});

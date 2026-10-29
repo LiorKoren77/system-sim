@@ -2735,6 +2735,41 @@ TEST_CASE("a 10 MB upload behind a load balancer pays the wire as a write, as st
                WithinRel(only_link(straight).latency.mean_s, 1e-12));
 }
 
+// A renamed step that states its own `size:` forwards a payload (review of plan 2c Task 7, I-2):
+// the service had the client's whole body before it sent it on, so when the store behind it
+// writes the renamed op, the client's hop into the service is a write on the wire as well. 10 MB
+// `upload`s at 5/s over 1 Gbit/s into a service whose step is `{to: store, op: put, size: 10MB}`,
+// in front of a blob store whose write op is `put`, pay the same 26.67 + 80 = 106.67 ms on the
+// wire as `{to: store, op: upload, size: 10MB}` in front of one that writes `upload`, and the
+// client gets the same response. Before the fix the walk stopped at the renamed step: the hop was
+// paid as a read, 26.67 + 8 = 34.67 ms, 72 ms less for the same bytes.
+namespace {
+// a (5 `upload`s/s of 10 MB) -> b, over 1 Gbit/s; b's `upload` sends `store_op` (10 MB) on to a
+// default blob store that lists `store_op` as its write.
+Scenario upload_relayed_as(const std::string& store_op) {
+  auto s = pipe_over(5, simsys::Bytes{10e6});
+  s.nodes[0].workload->op_shares = {{"upload", 1.0}};
+  s.nodes[0].workload->sizes = {{"upload", simsys::Bytes{10e6}}};
+  s.nodes[1].ops = {{"upload", {Step{.to = "store", .op = store_op, .size = simsys::Bytes{10e6}}}}};
+  NodeSpec store{.id = "store", .type = NodeType::blob_store};
+  store.write_ops = std::vector<std::string>{store_op};
+  s.nodes.push_back(std::move(store));
+  s.links.push_back(LinkSpec{.from = "b", .to = "store", .latency = 250us});
+  return s;
+}
+}  // namespace
+
+TEST_CASE("an upload a service sends on as a sized put pays the client's wire as a write",
+          "[theory]") {
+  const auto renamed = first_step(*Graph::build(upload_relayed_as("put")));
+  const auto same_op = first_step(*Graph::build(upload_relayed_as("upload")));
+  const double wait = 0.5 * simsys::queueing::mmc_wait(1, 0.4, 0.080).mean_s;  // 26.67 ms
+  REQUIRE_THAT(only_link(same_op).latency.mean_s, WithinRel(wait + 0.080, 1e-9));
+  REQUIRE_THAT(only_link(renamed).latency.mean_s, WithinRel(wait + 0.080, 1e-9));
+  REQUIRE_THAT(response_to(renamed, "upload").response.mean_s,
+               WithinRel(response_to(same_op, "upload").response.mean_s, 1e-12));
+}
+
 // Two ops of different sizes share one pipe: 20/s of `get` (1 MB, 8 ms, a read) and 20/s of `write`
 // (4 MB, 32 ms, a write at b) are 20 + 80 = 100 MB/s, rho 0.8 again, but the objects are NOT
 // alike. With p = 1/2 each:

@@ -137,10 +137,13 @@ constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
 // A queue's waiting room: as written up to six digits (1000, 12000, 500000), and from a million
 // on with an SI prefix, four digits (a pool's room is retention × its rate: 7 days of 6.667/s is
 // 4.032M, of 1.2k/s 725.8M; review of plan 2c Task 6, M-1), where six digits would print
-// "4.032e+06".
+// "4.032e+06". Six digits round [999,999.5, 1e6) up to that million too, so such a room is printed
+// as the million it rounds to, "1M" (review of plan 2c Task 7, minor 8).
 [[nodiscard]] std::string fmt_room(double units) {
   constexpr double million = 1e6;
-  return std::abs(units) < million ? num(units, 6) : fmt_count(units);
+  constexpr double rounds_to_a_million = million - 0.5;
+  if (std::abs(units) < rounds_to_a_million) return num(units, 6);
+  return fmt_count(std::abs(units) < million ? std::copysign(million, units) : units);
 }
 
 [[nodiscard]] std::string fmt_rate(double per_second) {
@@ -1584,6 +1587,9 @@ struct PaperLoad {
   std::vector<double> totals;
   std::vector<OpLoad> by_op;
   bool converged{};
+  // Per node, unconverged only: its total was still growing when the passes stopped (a loop of
+  // gain >= 1 feeds it), so `totals` holds a pass's figure, not a load (paper_load).
+  std::vector<bool> unbounded{};
 };
 
 // One pass: what the clients send plus what the feedback links carried in the previous
@@ -1614,16 +1620,44 @@ struct PaperLoad {
   return totals;
 }
 
-// No total moved by more than the tolerance (NaN never counts as unchanged).
+// A total that moved by no more than the tolerance (NaN never counts as unchanged).
+[[nodiscard]] bool unchanged_total(double before, double after) {
+  return after == before || std::abs(after - before) <= paper_tolerance * std::abs(after);
+}
+
+// No total moved by more than the tolerance.
 [[nodiscard]] bool settled(std::span<const double> before, std::span<const double> after) {
   return std::ranges::all_of(std::views::zip(before, after), [](const auto& pair) {
     const auto [b, a] = pair;
-    return a == b || std::abs(a - b) <= paper_tolerance * std::abs(a);
+    return unchanged_total(b, a);
   });
 }
 
 [[nodiscard]] bool all_finite(std::span<const double> totals) {
   return std::ranges::all_of(totals, [](double t) { return std::isfinite(t); });
+}
+
+// The nodes whose totals moved between the last two passes (`after` may have overflowed): a loop
+// of gain >= 1 still feeds them. Their last figure is the pass cap's or the double's, not a load
+// (review of plan 2c Task 7, minor 6: "5.618e+307/s").
+[[nodiscard]] std::vector<bool> still_growing(std::span<const double> before,
+                                              std::span<const double> after) {
+  std::vector<bool> growing;
+  for (const auto [b, a] : std::views::zip(before, after)) {
+    // An overflowed total (inf) is as close to inf as the tolerance allows: test it first.
+    growing.push_back(!std::isfinite(a) || !unchanged_total(b, a));
+  }
+  return growing;
+}
+
+// The last finite pass of a paper load that did not converge, its growing nodes marked.
+[[nodiscard]] PaperLoad unconverged(std::vector<double> totals, std::vector<OpLoad> by_op,
+                                    std::span<const double> next) {
+  auto unbounded = still_growing(totals, next);
+  return {.totals = std::move(totals),
+          .by_op = std::move(by_op),
+          .converged = false,
+          .unbounded = std::move(unbounded)};
 }
 
 // The paper calculation (System Design Interview ch. 2, back-of-the-envelope QPS): the
@@ -1642,19 +1676,18 @@ struct PaperLoad {
   std::vector<OpLoad> fed_back(g.nodes().size());
   std::vector<OpLoad> by_op;
   auto totals = paper_pass(g, table, offered, fed_back, by_op);
+  std::vector<double> previous;
   for (int pass = 1; pass < max_paper_passes; ++pass) {
     std::vector<OpLoad> next_by_op;
     auto next = paper_pass(g, table, offered, fed_back, next_by_op);
-    if (!all_finite(next)) {
-      return {.totals = std::move(totals), .by_op = std::move(by_op), .converged = false};
-    }
+    if (!all_finite(next)) return unconverged(std::move(totals), std::move(by_op), next);
     if (settled(totals, next)) {
       return {.totals = std::move(next), .by_op = std::move(next_by_op), .converged = true};
     }
-    totals = std::move(next);
+    previous = std::exchange(totals, std::move(next));
     by_op = std::move(next_by_op);
   }
-  return {.totals = std::move(totals), .by_op = std::move(by_op), .converged = false};
+  return unconverged(std::move(totals), std::move(by_op), previous);
 }
 
 // ---- loads that rest on an unknown hit ratio ----
@@ -2000,12 +2033,20 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   return head + "(≥" + percent(rho) + red + "; " + mark;
 }
 
+// A node a loop of gain >= 1 feeds (PaperLoad::unbounded): its load has no figure, and no
+// capacity holds it. The footer of the checks names the loop.
+[[nodiscard]] std::string unbounded_check(const graph::ResolvedNode& node) {
+  return "peak offered unbounded vs " + fmt_units(node.spec, total_capacity(node)) +
+         " total capacity  (no steady state, red)";
+}
+
 // One node's check line: the head and its verdict, or, for a node part or all of whose load the
 // paper load could not follow (blocked_on_the_way), partial_check's lower bound or mark.
 [[nodiscard]] std::string check_line(const graph::Graph& g, std::size_t i, const PaperLoad& load,
                                      const std::vector<bool>& upper_bound,
                                      std::span<const model::NodeType> blocked) {
   const auto& node = g.nodes()[i];
+  if (!load.converged && load.unbounded[i]) return unbounded_check(node);
   const std::string note{upper_bound[i] ? unknown_hit_ratio_note : std::string_view{}};
   if (!blocked.empty()) return partial_check(node, load.totals[i], load.by_op[i], blocked) + note;
   // A capacity with no verdict (unchecked_capacity) gets none per copy either.
