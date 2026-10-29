@@ -555,12 +555,12 @@ TEST_CASE("admitted flow is forwarded downstream op by op; rejected flow is not"
                WithinRel(4000.0, 1e-12));
 }
 
-// The three windowed algorithms of ch. 4 allow at most limit x window requests per window;
-// they differ in WHICH window they count, and in a fluid stepped every dt that difference is
-// visible at the step level (plan 2a refinement 6). The tests below flood a 1000/s limit with
-// 16k/s (the lab's 20x spike on 800/s) at 100 ms steps, window 1 s: W = limit x window = 1000
-// requests per window, and one step at 16k/s brings 1600, more than a whole window's worth.
-// The step's start `now` is passed in, so window boundaries fall where the clock puts them.
+// The three windowed algorithms of ch. 4 allow at most limit x window requests per window; they
+// differ in WHICH window they count, and in a fluid stepped every dt that difference is visible at
+// the step level (spec §17 entry 6). The tests below flood a 1000/s limit with 16k/s (the lab's 20x
+// spike on 800/s) at 100 ms steps, window 1 s: W = limit x window = 1000 requests per window, and
+// one step at 16k/s brings 1600, more than a whole window's worth. The step's start `now` is passed
+// in, so window boundaries fall where the clock puts them.
 namespace {
 // Admitted rate of each of `steps` steps of length dt from t = 0, inflow `demand(k)` at step k.
 template <class Demand>
@@ -721,9 +721,9 @@ TEST_CASE("a limiter with a backend asks the counter store about every request i
 }
 
 // The counter check comes before the request is passed on, so a check the store lost fails the
-// request closed (review of plan 2c Task 12, I-3): of 800 admitted calls a second, with the store
-// having answered 0.75 of its checks last step, the api is sent 800 x 0.75 = 600, the share
-// `delivered` also counts answered. The store is still asked about all 800: the check is made.
+// request closed: of 800 admitted calls a second, with the store having answered 0.75 of its checks
+// last step, the api is sent 800 x 0.75 = 600, the share `delivered` also counts answered. The
+// store is still asked about all 800: the check is made.
 TEST_CASE("a limiter whose counter check was lost forwards only the checked share: 600 of 800",
           "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(
@@ -791,10 +791,10 @@ TEST_CASE("a limiter refuses a step of zero length", "[behaviours]") {
   REQUIRE_THROWS_AS(lim.route(flow_of("call", 5000), 0s, 0s), std::invalid_argument);
 }
 
-// Plan 2a refinement 8: only ANSWERED requests reach the client's latency, so the backward
-// pass carries, next to each (node, op)'s latency, the fraction of its requests that come
-// back answered. Sequential parts multiply (a request must pass the limiter AND the counter
-// check AND the api); a split is the share-weighted mixture of its routes.
+// Spec §17 entry 8: only ANSWERED requests reach the client's latency, so the backward pass
+// carries, next to each (node, op)'s latency, the fraction of its requests that come back answered.
+// Sequential parts multiply (a request must pass the limiter AND the counter check AND the api); a
+// split is the share-weighted mixture of its routes.
 TEST_CASE("a limiter delivers its own fraction times the counter check's times its routes'",
           "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(
@@ -829,7 +829,7 @@ TEST_CASE("a load balancer's and a client's delivered fraction mix their routes 
                WithinRel(0.4, 1e-12));
 }
 
-// ---- CacheBehaviour and the on-miss steps of a service (plan 2a refinement 7, Task 10) ----
+// ---- CacheBehaviour and the on-miss steps of a service (spec §17 entry 7) ----
 
 namespace {
 // u -> web -> cache (-> db). Node indices: u 0, web 1, cache 2, db 3 (only with a backend).
@@ -1140,7 +1140,7 @@ TEST_CASE(
                WithinRel(20.0, 1e-12));
 }
 
-// ---- Cache then-steps and write_back (plan 2b, Task 3) ----
+// ---- Cache then-steps and write_back (spec §18 entry 5) ----
 
 namespace {
 // u -> cache -> `target` -> svc. The cache has a fixed hit ratio and the given `then` steps;
@@ -1359,7 +1359,7 @@ TEST_CASE("a service's parallel, sequential and miss blocks compose to 6.5 ms", 
   REQUIRE_THAT(r.mean_s, WithinRel(0.0065, 1e-12));
 }
 
-// ---- SqlDbBehaviour (plan 2b, Task 4) ----
+// ---- SqlDbBehaviour (spec §18 entry 6) ----
 
 namespace {
 // u -> db, zero-latency link; the client sends reads (90 %) and writes (10 %) to the database
@@ -1467,7 +1467,7 @@ TEST_CASE("a sql database's response is the sojourn the engine chose, with no do
                WithinRel(0.9, 1e-12));
 }
 
-// ---- CdnBehaviour (plan 2b refinement 4, Task 5) ----
+// ---- CdnBehaviour (spec §18 entry 10) ----
 //
 // A CDN (book ch. 1: a cache at the network's edge) answers the share h of the reads it is sent
 // from its own store and fetches the rest, 1 - h, from its origin as the SAME op: the shape of a
@@ -1552,7 +1552,7 @@ TEST_CASE("a cdn delivers its hits plus its misses times the origin's delivered 
   REQUIRE_THAT(delivered, WithinRel(0.8775, 1e-12));
 }
 
-// ---- Byte-sized nodes count megabytes (plan 2c refinement 2, Task 3) ----
+// ---- Byte-sized nodes count megabytes (spec §19 entry 2) ----
 //
 // A node whose capacity is a byte rate (a blob store's default, spec section 6's 500 MB/s, or a
 // CDN's stated `capacity: 100GB/s`) counts one MB as one unit of capacity, so a request of op o
@@ -1604,9 +1604,9 @@ TEST_CASE("a byte-sized blob store charges a request its size in megabytes", "[b
   REQUIRE_THAT(store.cost("read"), WithinRel(0.002, 1e-12));   // 2e3 B / 1e6 B per unit
 }
 
-// What a byte-sized store hands its queue each step (review of plan 2c Task 3's fix round, I1 and
-// I2): the moments of the time one arriving object holds a slot, a mixture over the ops by their
-// request rates. Each object's own time is deterministic (size x 40 ms per MB, c_s^2 = 0), so:
+// What a byte-sized store hands its queue each step: the moments of the time one arriving object
+// holds a slot, a mixture over the ops by their request rates. Each object's own time is
+// deterministic (size x 40 ms per MB, c_s^2 = 0), so:
 //   E[S]  = (5 x 2 s + 1000 x 80 us) / 1005 = 10.08 / 1005 s
 //   E[S^2] = (5 x (2 s)^2 + 1000 x (80 us)^2) / 1005
 //   c_s^2 = E[S^2] / E[S]^2 - 1 = 196.8: the few large uploads among many small reads
@@ -1675,7 +1675,7 @@ TEST_CASE("a blob store's response is its own sojourn and asks nobody downstream
                WithinRel(0.9, 1e-12));
 }
 
-// ---- A blob store's then steps are asynchronous event notifications (plan 2c refinements 6-7)
+// ---- A blob store's then steps are asynchronous event notifications (spec §19 entries 6-7)
 // ----
 //
 // S3 event notifications (book ch. 14: "transcoding starts when the upload completes"): every
@@ -1768,8 +1768,8 @@ TEST_CASE("a blob store serving only reads sends no notifications", "[behaviours
 // The notified node's sojourn and failures are not the uploader's: the response is the store's own
 // (nobody downstream is asked) and the delivered share is the store's own, whatever the targets
 // deliver (mirroring the write_back cache's flush). A characterisation test: a blob store's
-// response and delivered share were already its own before plan 2c Task 4; this pins that the
-// events left them so.
+// response and delivered share were already its own before its events were modelled; this pins that
+// the events left them so.
 TEST_CASE("a blob store's response and delivered share ignore the notified nodes", "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(notifying_store({Step{.to = "svc", .op = "notify"}}));
   const BlobStoreBehaviour store{g, *g.index_of("store")};
@@ -1790,8 +1790,9 @@ TEST_CASE("a blob store's response and delivered share ignore the notified nodes
   REQUIRE_FALSE(asked_for_delivery);
 }
 
-// No request served, no notification: an idle store sends nothing. A characterisation test: a
-// blob store sent nothing at all before plan 2c Task 4; this pins that an idle one still does not.
+// No request served, no notification: an idle store sends nothing. A characterisation test: a blob
+// store sent nothing at all before its events were modelled; this pins that an idle one still does
+// not.
 TEST_CASE("a blob store with no requests sends no notifications", "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(notifying_store({Step{.to = "svc", .op = "notify"}}));
   const BlobStoreBehaviour store{g, *g.index_of("store")};
@@ -1822,14 +1823,14 @@ TEST_CASE("a byte-sized cdn still forwards its miss share of the requests", "[be
   REQUIRE_THAT(routed.outgoing[0].flow.rate_of("stream").per_second, WithinRel(5.0, 1e-12));
 }
 
-// ---- Message queues and worker pools (plan 2c refinements 4-6, Task 6) ----
+// ---- Message queues and worker pools (spec §19 entries 4-6) ----
 //
-// The broker (Kafka, book ch. 14's transcode_q): a publisher's request is answered when the
-// message is appended, so the broker's response is its own append sojourn and nobody downstream is
-// asked; the message then goes to EVERY consumer group, each of which reads all of it (a copy per
-// group, not a split), under the op name it arrived with. The worker pool drains its group's
-// messages and hands each drained job on along its `then` steps (Task 7, further down). Every
-// message and every job costs one unit.
+// The broker (Kafka, book ch. 14's transcode_q): a publisher's request is answered when the message
+// is appended, so the broker's response is its own append sojourn and nobody downstream is asked;
+// the message then goes to EVERY consumer group, each of which reads all of it (a copy per group,
+// not a split), under the op name it arrived with. The worker pool drains its group's messages and
+// hands each drained job on along its `then` steps (further down). Every message and every job
+// costs one unit.
 
 namespace {
 // u (publishes `publish` messages) -> q -> {w1, w2}, zero-latency links, each pool consuming q.
@@ -1872,9 +1873,9 @@ TEST_CASE("a message queue sends every message it appends to each consumer group
   REQUIRE(routed.rejected.empty());
 }
 
-// The op name survives the broker (plan 2c refinement 4): two ops published, two ops delivered, at
+// The op name survives the broker (spec §19 entry 4): two ops published, two ops delivered, at
 // their own rates, to each group. The client publishes both, so the graph saw both arrive: the
-// broker's groups are the graph's routes for each op that reaches it (review of Task 6, M-4).
+// broker's groups are the graph's routes for each op that reaches it.
 TEST_CASE("a message queue keeps each message's op name on its way to the consumers",
           "[behaviours]") {
   auto s = queue_with_two_groups();
@@ -1923,7 +1924,7 @@ TEST_CASE("a message queue with nothing published sends nothing and costs one un
   REQUIRE(q.cost("anything") == 1.0);
 }
 
-// A publisher is answered when the message is appended (plan 2c refinement 6): the response is the
+// A publisher is answered when the message is appended (spec §19 entry 6): the response is the
 // append's own sojourn, nobody downstream is asked, and the delivered fraction is the broker's own
 // whatever the consumers lose. Asking would add the pool's seconds to a publisher who never waits.
 TEST_CASE("a message queue's response is the append alone and asks no consumer", "[behaviours]") {
@@ -1946,8 +1947,8 @@ TEST_CASE("a message queue's response is the append alone and asks no consumer",
   REQUIRE_FALSE(asked_for_delivery);
 }
 
-// A pool with no `then` steps drains its jobs and sends nothing on (Task 6; the steps are the
-// section at the end of this file). Every job it is sent is served here.
+// A pool with no `then` steps drains its jobs and sends nothing on (the steps are the section at
+// the end of this file). Every job it is sent is served here.
 TEST_CASE("a worker pool without then steps serves every job and forwards nothing",
           "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(queue_with_two_groups());
@@ -1975,7 +1976,7 @@ TEST_CASE("a worker pool's response and delivered share are its own sojourn and 
                WithinRel(0.75, 1e-12));
 }
 
-// ---- A worker pool forwards its then steps per drained job (plan 2c refinement 5, Task 7) ----
+// ---- A worker pool forwards its then steps per drained job (spec §19 entry 5) ----
 //
 // A transcoding worker, once it has finished a job, writes the renditions and publishes a
 // completion message (book ch. 14): each `then` step fires for every job the pool DRAINS, times
@@ -2032,9 +2033,9 @@ TEST_CASE("a worker pool forwards each drained job's then steps times their fact
 
 // The steps fire for every job, whichever op it was brought under: 3 `publish`/s and 2 `retry`/s
 // are 5 jobs/s, so svc is sent 5 x 4 = 20 `work`/s and audit 5 `log`/s. The client publishes both
-// ops (review of plan 2c Task 7, minor 1), so `retry` is an op the graph saw arrive at the pool,
-// as in a run: the pool's blocks do not depend on it, but a fixture that fed an op no scenario
-// could send would prove nothing about one that can.
+// ops, so `retry` is an op the graph saw arrive at the pool, as in a run: the pool's blocks do not
+// depend on it, but a fixture that fed an op no scenario could send would prove nothing about one
+// that can.
 TEST_CASE("a worker pool's then steps fire for every drained job whatever its op", "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(pool_with_then(
       {Step{.to = "svc", .op = "work", .factor = 4.0}, Step{.to = "audit", .op = "log"}},
@@ -2097,7 +2098,7 @@ TEST_CASE("a worker pool with no jobs sends nothing on", "[behaviours]") {
   REQUIRE(sent_to(routed, *g.index_of("svc")).total().per_second == 0.0);
 }
 
-// ---- ExternalSinkBehaviour (plan 2c refinement 8, Task 9) ----
+// ---- ExternalSinkBehaviour (spec §19 entry 8) ----
 //
 // A third party's API (book ch. 10: APNs, FCM, an SMS provider) is a leaf: it answers the request
 // itself and calls nobody. Its queue is the type's (1k/s, 100 ms, service SCV 2.0) and the share
@@ -2170,10 +2171,10 @@ TEST_CASE("an external sink's delivered share is the engine's own, with failures
   }
 }
 
-// A sink's price per request comes from the one rule every behaviour and explain's paper load
-// share (graph::op_cost, through detail::arriving_op_costs), not from a hard-coded 1 (review of
-// plan 2c Tasks 9-10, minor 7): the loader gives a sink no `cost` key, so from a file every op
-// costs 1, but a scenario built in code may state one, and the engine and explain must then agree.
+// A sink's price per request comes from the one rule every behaviour and explain's paper load share
+// (graph::op_cost, through detail::arriving_op_costs), not from a hard-coded 1: the loader gives a
+// sink no `cost` key, so from a file every op costs 1, but a scenario built in code may state one,
+// and the engine and explain must then agree.
 TEST_CASE("an external sink prices each op by the graph's op cost", "[behaviours]") {
   auto s = sink_front(0.0);
   s.nodes[1].cost = {{"call", 2.0}};
@@ -2185,7 +2186,7 @@ TEST_CASE("an external sink prices each op by the graph's op cost", "[behaviours
   REQUIRE(sink.cost("status") == 1.0);
 }
 
-// ---- A step after a failed step does not run (plan 2c Task 12) ----
+// ---- A step after a failed step does not run ----
 //
 // The theory tests run the engine; this one pins how a parallel group thins the steps after it,
 // which only a route with a hand-made lookup shows exactly. web's get is
@@ -2243,13 +2244,13 @@ TEST_CASE("a parallel group is sent the whole flow and thins every step after it
   }
 }
 
-// ---- KvClusterBehaviour's quorum answer (plan 2c refinement 9; book ch. 6) ----
+// ---- KvClusterBehaviour's quorum answer (spec §19 entry 9; book ch. 6) ----
 //
 // The engine hands a kv_cluster its machines each step (observe: the hot machine's group, then the
-// cool ones'), and the behaviour answers each op from its quorum over the two kinds of replica
-// set: {hot, N - 1 cool} with probability p_hot = N k / M, {N cool} otherwise. These tests drive
-// observe by hand, with machines the engine would not produce on its own, to pin the paths the
-// review of the kv/search fix round asked for (M-2, M-5).
+// cool ones'), and the behaviour answers each op from its quorum over the two kinds of replica set:
+// {hot, N - 1 cool} with probability p_hot = N k / M, {N cool} otherwise. These tests drive observe
+// by hand, with machines the engine would not produce on its own, to pin the paths a code review
+// asked for.
 
 namespace {
 // u -> store: a kv_cluster of 8 machines (10k/s and 1 ms each), N = 3 replicas per key, the given
@@ -2364,9 +2365,9 @@ TEST_CASE("a kv cluster that loses every request reports the offered mix of its 
 
 // A dead hot machine (no capacity: it keeps nothing and never answers, an infinite sojourn) at a
 // write quorum of N = 3: a write whose set includes it is lost, and its reply time is infinite.
-// That set answers nothing, so it has no weight among the answered writes and must not enter
-// their mix at all (0 x inf is NaN): the writes answered are the all-cool sets', at the slowest
-// of their three replies (review of the kv/search fix round, M-2).
+// That set answers nothing, so it has no weight among the answered writes and must not enter their
+// mix at all (0 x inf is NaN): the writes answered are the all-cool sets', at the slowest of their
+// three replies.
 TEST_CASE("a dead hot machine at a write quorum of N leaves the writes the cool sets answer",
           "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(kv_ring(3, 2));

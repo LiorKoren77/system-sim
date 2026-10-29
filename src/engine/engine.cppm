@@ -81,32 +81,29 @@ class DelayLine {
   std::size_t head_{0};
 };
 
-// One node's numbers for one step. Rates and backlog are summed over replicas (plan
-// refinement 4); rho and zone are per copy, which all copies share — or, behind a
-// consistent-hash balancer, those of the hottest copy, the one that breaks an SLO first, and
-// for a SQL database those of the busier of its primary and its replicas —
-// and latency is the sojourn a request sees: one copy's, or behind a hash ring the
-// share-weighted mixture of the hot and the cool copies' (see Simulation::make_server), or
-// for a database the mixture of its writes' (primary) and its reads' (replica) sojourns,
-// weighted by their request rates (Simulation::make_database), and for a byte-sized node the
-// mixture of its ops' sojourns, each answered at its own time, by their request rates
-// (Simulation::request_weighted_megabyte_sojourn).
-// Demand, drain, drops and backlog are in CAPACITY UNITS (per second for the rates), the
-// unit `capacity` is a rate of (phase 2a refinement 4): a request of an op with `cost` 3
-// counts three times. With every cost at its default of 1, units are requests, as in
-// phase 1. The drop ratio dropped / demand is therefore the share of the node's work it shed.
-// A kv_cluster's every request costs N units (plan 2c refinement 9, defaults::op_cost): its
-// demand, drain, drops and backlog are REPLICA-REQUESTS, N times the requests its clients sent
+// One node's numbers for one step. Rates and backlog are summed over replicas (spec §16 entry 4);
+// rho and zone are per copy, which all copies share — or, behind a consistent-hash balancer, those
+// of the hottest copy, the one that breaks an SLO first, and for a SQL database those of the busier
+// of its primary and its replicas — and latency is the sojourn a request sees: one copy's, or
+// behind a hash ring the share-weighted mixture of the hot and the cool copies' (see
+// Simulation::make_server), or for a database the mixture of its writes' (primary) and its reads'
+// (replica) sojourns, weighted by their request rates (Simulation::make_database), and for a
+// byte-sized node the mixture of its ops' sojourns, each answered at its own time, by their request
+// rates (Simulation::request_weighted_megabyte_sojourn). Demand, drain, drops and backlog are in
+// CAPACITY UNITS (per second for the rates), the unit `capacity` is a rate of (spec §17 entry 4): a
+// request of an op with `cost` 3 counts three times. With every cost at its default of 1, units are
+// requests, as in phase 1. The drop ratio dropped / demand is therefore the share of the node's
+// work it shed. A kv_cluster's every request costs N units (spec §19 entry 9, defaults::op_cost):
+// its demand, drain, drops and backlog are REPLICA-REQUESTS, N times the requests its clients sent
 // (30k requests/s at N = 3 are 90k/s), the work its machines do; the clients' offered and answered
-// rates (ResponseSample) stay in requests.
-// `rejected_per_s` is a second way to shed (plan 2a refinement 6): requests a rate limiter
-// refused by POLICY, never forwarded. For the token bucket and the windowed algorithms they
-// are refused after the limiter's queue drained them, so they are part of `drain_per_s`
-// too; for a leaky bucket they are its queue's overflow ("bucket full"), which is then
-// reported here and not in `dropped_per_s`. Drops are failures, rejections are the policy
-// working: report::Summary keeps a drop rate and a reject rate apart. A limiter's every op
-// costs 1, so these units are requests.
-// Conservation, per node and per step (the fluid queue's balance, summed over copies):
+// rates (ResponseSample) stay in requests. `rejected_per_s` is a second way to shed (spec §17 entry
+// 6): requests a rate limiter refused by POLICY, never forwarded. For the token bucket and the
+// windowed algorithms they are refused after the limiter's queue drained them, so they are part of
+// `drain_per_s` too; for a leaky bucket they are its queue's overflow ("bucket full"), which is
+// then reported here and not in `dropped_per_s`. Drops are failures, rejections are the policy
+// working: report::Summary keeps a drop rate and a reject rate apart. A limiter's every op costs 1,
+// so these units are requests. Conservation, per node and per step (the fluid queue's balance,
+// summed over copies):
 //   demand·dt = (drain + dropped)·dt + Δbacklog
 // whatever comes in is served, shed or left waiting. Rejections do not appear as a term of
 // their own: a token-family limiter's (token bucket, windowed) are inside `drain` (its
@@ -129,15 +126,15 @@ struct NodeSample {
   double rho{};
   flow::LatencyEstimate latency;  // own sojourn; zero for a client (a source has no queue)
   fluid::Zone zone{fluid::Zone::green};
-  // How old the data a read may return is, in seconds (plan 2b refinement 3): for a SQL
-  // database, the write's sojourn at the primary (wait + service, until it is committed) + the
-  // replication lag (shipping it) + its sojourn at a replica (waiting behind the reads and the
-  // other replayed writes, then applied): a replica shows a write that long after the client
-  // sent it. 0 for a database without replicas (every read is served by the primary, which has
-  // the latest write); empty for every other node, which keeps no copies of data that could
-  // lag. Infinite when the primary or the replica never answers. Finite while a replica drops
-  // replayed writes (below): the model's queue is bounded, so this is the bounded-queue figure,
-  // while a real replica's lag grows without bound (see replication_dropped_per_s).
+  // How old the data a read may return is, in seconds (spec §18 entry 6): for a SQL database, the
+  // write's sojourn at the primary (wait + service, until it is committed) + the replication lag
+  // (shipping it) + its sojourn at a replica (waiting behind the reads and the other replayed
+  // writes, then applied): a replica shows a write that long after the client sent it. 0 for a
+  // database without replicas (every read is served by the primary, which has the latest write);
+  // empty for every other node, which keeps no copies of data that could lag. Infinite when the
+  // primary or the replica never answers. Finite while a replica drops replayed writes (below): the
+  // model's queue is bounded, so this is the bounded-queue figure, while a real replica's lag grows
+  // without bound (see replication_dropped_per_s).
   std::optional<double> staleness_s{};
   // The committed writes ONE replica failed to replay, per second, in REQUESTS (writes), not
   // capacity units: the replicas' total / ((N − 1) · S), every replica being alike. A replica
@@ -153,8 +150,8 @@ struct NodeSample {
   // and so the writes each replica of that shard must replay. Every database has it (0 when no
   // write arrives); empty for every other node.
   std::optional<double> committed_writes_per_s{};
-  // A message queue's lag, in seconds (plan 2c refinements 4 and 14; the queue between producers
-  // and workers of ch. 10 and ch. 14): how long a message published at this step waits until its
+  // A message queue's lag, in seconds (spec §19 entries 4 and 14; the queue between producers and
+  // workers of ch. 10 and ch. 14): how long a message published at this step waits until its
   // slowest consumer group reads it. Kafka reports a group's lag as the records it has not read;
   // divided by the rate the group consumes them, that is this time. The broker holds nothing back
   // (it appends at 1M/s); the unread messages wait in each group's worker pool, so the lag is read
@@ -182,20 +179,18 @@ struct NodeSample {
   std::optional<double> queue_lag_s{};
 };
 
-// What a client sees for one op: the rate it offers, the part of it that comes back
-// answered, and the response time an answered request gets. `answered` = offered × the
-// delivered fraction the backward pass composes along the op's path (plan 2a refinement 8,
-// behaviours::NodeBehaviour::delivered): a request a limiter refused or a full queue dropped
-// is not answered (one still waiting in a queue is: later, see Simulation::account_rejections),
-// and reports weigh latency by `answered` so that those requests, which never saw the path's
-// latency, do not dilute it.
-// A client with a `timeout` (plan 2c Task 13, Simulation::give_up_after) also gives up on the
+// What a client sees for one op: the rate it offers, the part of it that comes back answered, and
+// the response time an answered request gets. `answered` = offered × the delivered fraction the
+// backward pass composes along the op's path (spec §17 entry 8,
+// behaviours::NodeBehaviour::delivered): a request a limiter refused or a full queue dropped is not
+// answered (one still waiting in a queue is: later, see Simulation::account_rejections), and
+// reports weigh latency by `answered` so that those requests, which never saw the path's latency,
+// do not dilute it. A client with a `timeout` (Simulation::give_up_after) also gives up on the
 // delivered requests slower than it: those are `timed_out`, not answered, and `response` is the
-// latency of the ones answered in time. So answered = offered − lost − timed_out, and timed_out
-// is 0 for a client that waits for ever. `delivered_response` is the latency of every delivered
+// latency of the ones answered in time. So answered = offered − lost − timed_out, and timed_out is
+// 0 for a client that waits for ever. `delivered_response` is the latency of every delivered
 // request, answered or timed out, before the client gave up (the untruncated fit the timeout cut):
-// the reports read a timed-out client's percentiles off it (review of plan 2c, C-1). Without a
-// timeout the two are equal.
+// the reports read a timed-out client's percentiles off it. Without a timeout the two are equal.
 struct ResponseSample {
   std::size_t client{};
   std::string op{};
@@ -206,11 +201,11 @@ struct ResponseSample {
   flow::LatencyEstimate delivered_response{};
 };
 
-// One bandwidth link's pipe for one step (plan 2c refinement 3; Simulation::pass_through_pipe):
+// One bandwidth link's pipe for one step (spec §19 entry 3; Simulation::pass_through_pipe):
 // NodeSample's fields of the same names, in MEGABYTES (per second for the rates), the pipe being a
 // queue of megabytes like a byte-sized node. `demand_per_s` is what the sender put on the link,
-// `drain_per_s` what the pipe passed on to the receiver, `dropped_per_s` what overflowed its
-// 1000 MB room; they balance as a node's do,
+// `drain_per_s` what the pipe passed on to the receiver, `dropped_per_s` what overflowed its 1000
+// MB room; they balance as a node's do,
 //   demand·dt = (drain + dropped)·dt + Δbacklog.
 // `rho` and `zone` are the one server's; `latency` is what a hop over the pipe adds, its wait plus
 // the request's answer time on the wire (a write's whole serialisation, size × 1 MB / bandwidth;
@@ -323,8 +318,8 @@ class Simulation {
     void move_towards(double measured);
   };
 
-  // What the backward pass knows about one (node, op): the response time of an answered
-  // request and the fraction of the requests that are answered (plan 2a refinement 8).
+  // What the backward pass knows about one (node, op): the response time of an answered request and
+  // the fraction of the requests that are answered (spec §17 entry 8).
   struct Answer {
     flow::LatencyEstimate latency{};
     double delivered{1.0};  // 1 until the first backward pass: nothing lost yet
@@ -432,12 +427,12 @@ class Simulation {
     std::vector<std::size_t> consumer_groups{};
   };
 
-  // A bandwidth link's pipe (plan 2c refinement 3; defaults::pipe_capacity has its numbers and
-  // what it models): one queue of one server in MEGABYTES, fed what the sender puts on the link,
-  // each request priced at its size (megabytes_by_op) and timed by `timing` (a request holds the
-  // pipe for its whole serialisation, size × 1 MB / bandwidth; the receiver acts on a write at its
-  // last byte and on any other op at its first megabyte). Its step's wait and the share it passed
-  // (not dropped) are what the backward pass adds to every hop over the link (hop_response,
+  // A bandwidth link's pipe (spec §19 entry 3; defaults::pipe_capacity has its numbers and what it
+  // models): one queue of one server in MEGABYTES, fed what the sender puts on the link, each
+  // request priced at its size (megabytes_by_op) and timed by `timing` (a request holds the pipe
+  // for its whole serialisation, size × 1 MB / bandwidth; the receiver acts on a write at its last
+  // byte and on any other op at its first megabyte). Its step's wait and the share it passed (not
+  // dropped) are what the backward pass adds to every hop over the link (hop_response,
   // hop_delivered).
   struct Pipe {
     CopyGroup group;  // one copy (CopyGroup's defaults): the queue and what it holds, in MB
@@ -580,12 +575,11 @@ struct Overloaded : Fs... {
          type == external_sink || type == kv_cluster || type == search_index;
 }
 
-// Why a cache cannot run, if it cannot: a scenario built in code left it without a number or
-// `che` for its hit ratio (the loader requires one: the same message). Everything else a cache
-// can say runs: a `che` hit ratio (Graph::build has already turned it into a number,
+// Why a cache cannot run, if it cannot: a scenario built in code left it without a number or `che`
+// for its hit ratio (the loader requires one: the same message). Everything else a cache can say
+// runs: a `che` hit ratio (Graph::build has already turned it into a number,
 // Graph::resolve_hit_ratios), every strategy including write_back (its flush is an asynchronous
-// hop, graph::Graph::is_async_hop) and `then` steps (plan 2b refinement 5,
-// behaviours::CacheBehaviour).
+// hop, graph::Graph::is_async_hop) and `then` steps (spec §18 entry 5, behaviours::CacheBehaviour).
 [[nodiscard]] std::optional<std::string> cache_not_runnable(const model::NodeSpec& spec) {
   const bool has_number = spec.hit_ratio && spec.hit_ratio->fixed;
   const bool is_che = spec.hit_ratio && spec.hit_ratio->che;
@@ -593,12 +587,11 @@ struct Overloaded : Fs... {
   return std::nullopt;
 }
 
-// Why a CDN cannot run, if it cannot (plan 2b refinement 4): a `che` hit ratio without a `keys`
-// size. Graph::build leaves it without a number, and running it as h = 0 would silently replace
-// the scenario's Che approximation by "every read misses" (explain shows that bound and says so;
-// a run could not). A CDN with no hit ratio at all runs: it misses every read, as the scenario
-// says. A CDN sized in bytes runs too, counting megabytes (plan 2c refinement 2,
-// behaviours::CdnBehaviour).
+// Why a CDN cannot run, if it cannot (spec §18 entry 10): a `che` hit ratio without a `keys` size.
+// Graph::build leaves it without a number, and running it as h = 0 would silently replace the
+// scenario's Che approximation by "every read misses" (explain shows that bound and says so; a run
+// could not). A CDN with no hit ratio at all runs: it misses every read, as the scenario says. A
+// CDN sized in bytes runs too, counting megabytes (spec §19 entry 2, behaviours::CdnBehaviour).
 [[nodiscard]] std::optional<std::string> cdn_not_runnable(const model::NodeSpec& spec) {
   if (spec.hit_ratio && spec.hit_ratio->che && !spec.keys) {
     return "node '" + spec.id + "': hit_ratio che needs keys (the cdn's size in objects)";
@@ -607,11 +600,11 @@ struct Overloaded : Fs... {
 }
 
 // Why a node of a simulated type still cannot run, if it cannot (the cases above). A blob store
-// always runs, `then` steps included: they are event notifications (plan 2c refinements 6-7),
-// asynchronous hops the backward pass does not wait for (behaviours::BlobStoreBehaviour). So do
-// a message queue (behaviours::MessageQueueBehaviour) and a worker pool, `then` steps included
-// since plan 2c Task 7: the work each drained job hands on (behaviours::WorkerPoolBehaviour), and
-// an external sink, whatever its failure_rate (behaviours::ExternalSinkBehaviour, fail_share).
+// always runs, `then` steps included: they are event notifications (spec §19 entries 6-7),
+// asynchronous hops the backward pass does not wait for (behaviours::BlobStoreBehaviour). So do a
+// message queue (behaviours::MessageQueueBehaviour) and a worker pool, `then` steps included:
+// the work each drained job hands on (behaviours::WorkerPoolBehaviour), and an
+// external sink, whatever its failure_rate (behaviours::ExternalSinkBehaviour, fail_share).
 [[nodiscard]] std::optional<std::string> not_runnable_yet(const model::NodeSpec& spec) {
   if (spec.type == model::NodeType::cache) return cache_not_runnable(spec);
   if (spec.type == model::NodeType::cdn) return cdn_not_runnable(spec);
@@ -649,10 +642,10 @@ void add_once(std::vector<std::size_t>& links, std::size_t link) {
                     behaviour);
 }
 
-// Requests per second -> capacity units per second: each op's rate × its cost (plan 2a
-// refinement 4). Demand in units is Σ rate_op × cost_op, the load the node's capacity
-// (a rate of units) is compared with: 300 req/s of an op of cost 3 is 900 units/s, so a
-// 1000 units/s node runs at rho = 0.9.
+// Requests per second -> capacity units per second: each op's rate × its cost (spec §17 entry 4).
+// Demand in units is Σ rate_op × cost_op, the load the node's capacity (a rate of units) is
+// compared with: 300 req/s of an op of cost 3 is 900 units/s, so a 1000 units/s node runs at rho =
+// 0.9.
 [[nodiscard]] flow::Flow in_units(const flow::Flow& requests, const behaviours::Behaviour& server) {
   flow::Flow units;
   for (const auto& [op, rate] : requests.entries()) {
@@ -685,17 +678,17 @@ inline constexpr std::size_t max_copy_groups = 2;
   return database != nullptr && database->is_write(op);
 }
 
-// The share of what a node serves that fails (plan 2c refinement 8): an external sink's
-// `failure_rate` (behaviours::ExternalSinkBehaviour); every other node fails nothing it served.
+// The share of what a node serves that fails (spec §19 entry 8): an external sink's `failure_rate`
+// (behaviours::ExternalSinkBehaviour); every other node fails nothing it served.
 [[nodiscard]] double failure_rate_of(const behaviours::Behaviour& behaviour) {
   const auto* sink = std::get_if<behaviours::ExternalSinkBehaviour>(&behaviour);
   return sink != nullptr ? sink->failure_rate() : 0.0;
 }
 
-// A kv_cluster's quorum needs its machines one kind at a time (review of plan 2c Tasks 9-10, C-1
-// and I-1): what one replica-request saw on the hot machine and on a cool one this step, and the
-// share each kind kept, in make_server's group order (behaviours::KvClusterBehaviour::observe).
-// Every other node mixes its groups into one sojourn (record_sojourns) and is told nothing.
+// A kv_cluster's quorum needs its machines one kind at a time: what one replica-request saw on the
+// hot machine and on a cool one this step, and the share each kind kept, in make_server's group
+// order (behaviours::KvClusterBehaviour::observe). Every other node mixes its groups into one
+// sojourn (record_sojourns) and is told nothing.
 void report_machines(behaviours::Behaviour& behaviour,
                      std::span<const behaviours::MachineGroup> machines) {
   if (auto* cluster = std::get_if<behaviours::KvClusterBehaviour>(&behaviour)) {
@@ -703,9 +696,9 @@ void report_machines(behaviours::Behaviour& behaviour,
   }
 }
 
-// An external sink's failures (plan 2c refinement 8; book ch. 10: the third-party providers are
-// the unreliable part of the notification pipeline). The provider works on a request that fails as
-// long as on one that succeeds, so the queue serves both alike and its rho counts every request it
+// An external sink's failures (spec §19 entry 8; book ch. 10: the third-party providers are the
+// unreliable part of the notification pipeline). The provider works on a request that fails as long
+// as on one that succeeds, so the queue serves both alike and its rho counts every request it
 // served; what changes is where a failed request goes. With f the failure rate and `served` what
 // the node's queues drained this step (per op, and in total in the sample):
 //   failed   = f × served         a 5xx: counted as a DROP (the node failing), never a rejection
@@ -765,14 +758,14 @@ void fail_share(double failure_rate, flow::Flow& drained, flow::Flow& dropped, N
   return total > 0.0 ? part.total().per_second / total : 1.0;
 }
 
-// Adds `copies` identical copies, each of which took `copy_step`, to the group's totals
-// (plan refinement 4): N copies behind an equal split each saw demand / N, so the group's
-// rates and backlog are the copy's times N. A pooled group is one copy (its queue IS the
-// group); a hash ring adds its hot copy (1) and its cool ones (N - 1); a database its S
-// primaries and its (N - 1) S replicas. Only the clients' part of the work counts (NodeSample):
-// `arrived_share` of the copy's demand and `content_share` of what it drained, dropped and
-// holds, both 1 except on a database replica (Simulation::serve_copies). `rejected_per_s`
-// stays 0: a queue never rejects; the forward pass fills it (account_rejections).
+// Adds `copies` identical copies, each of which took `copy_step`, to the group's totals (spec §16
+// entry 4): N copies behind an equal split each saw demand / N, so the group's rates and backlog
+// are the copy's times N. A pooled group is one copy (its queue IS the group); a hash ring adds its
+// hot copy (1) and its cool ones (N - 1); a database its S primaries and its (N - 1) S replicas.
+// Only the clients' part of the work counts (NodeSample): `arrived_share` of the copy's demand and
+// `content_share` of what it drained, dropped and holds, both 1 except on a database replica
+// (Simulation::serve_copies). `rejected_per_s` stays 0: a queue never rejects; the forward pass
+// fills it (account_rejections).
 void add_copies(NodeSample& sample, const fluid::FluidStep& copy_step, double copies,
                 double arrived_share, double content_share) {
   sample.demand_per_s += copy_step.demand_per_s * copies * arrived_share;
@@ -949,13 +942,12 @@ Simulation::Simulation(const graph::Graph& g)
 // behaviour routes and composes its own way. Not every question goes through the strategy: a few
 // helpers ask the variant which kind it holds (std::get_if, std::holds_alternative: is_write_at,
 // failure_rate_of, report_machines, split_writes) for what only one or two node types have, a
-// database's writes, a sink's failures, a kv cluster's machines. That is a type test, the
-// opposite of Strategy; it is kept where the alternative would be a member every other behaviour
-// implements to do nothing.
-// A client's noise seed is client_seed(scenario seed, node index): one random engine per
-// client, so appending a node at the end of the file never changes another client's noise
-// (the seed is the node index; inserting a node earlier shifts the clients after it; spec
-// phase 2a refinement 3), and `simsys curve --noise` derives the same seed.
+// database's writes, a sink's failures, a kv cluster's machines. That is a type test, the opposite
+// of Strategy; it is kept where the alternative would be a member every other behaviour implements
+// to do nothing. A client's noise seed is client_seed(scenario seed, node index): one random engine
+// per client, so appending a node at the end of the file never changes another client's noise (the
+// seed is the node index; inserting a node earlier shifts the clients after it; spec §17 entry 3),
+// and `simsys curve --noise` derives the same seed.
 Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index) {
   const auto& resolved = g.nodes()[index];
   switch (resolved.spec.type) {
@@ -1006,12 +998,12 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
     // balancer in front of it does.
     case model::NodeType::sql_db:
       return make_database(behaviours::SqlDbBehaviour{g, index}, resolved);
-    // An id generator (plan 2b refinement 6) is a service whose capacity and service time its
-    // algorithm supplied at build (defaults::defaults_of): no behaviour of its own.
-    // A search index (plan 2c refinement 10; book ch. 13's trie database) is service sugar in
-    // the same way: a service with no steps and the type's numbers (5k/s, 5 ms) unless the
-    // scenario states its own. Serving is read-mostly, so nothing else is modelled; its
-    // `build_interval` is stored and printed, and the rebuild's load is ignored.
+    // An id generator (spec §18 entry 12) is a service whose capacity and service time its
+    // algorithm supplied at build (defaults::defaults_of): no behaviour of its own. A search index
+    // (spec §19 entry 10; book ch. 13's trie database) is service sugar in the same way: a service
+    // with no steps and the type's numbers (5k/s, 5 ms) unless the scenario states its own. Serving
+    // is read-mostly, so nothing else is modelled; its `build_interval` is stored and printed, and
+    // the rebuild's load is ignored.
     case model::NodeType::search_index:
     case model::NodeType::id_generator:
     default:  // create() admitted only simulated types: the rest are services
@@ -1019,12 +1011,12 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
   }
 }
 
-// The queues of a node that serves (plan 2a refinement 5: what the balancer in front, if
-// any, does to the replica group; graph::Graph::mark_balanced_targets sets the flags and
-// documents the models). A node reached both through a balancer and directly gets the
-// balancer's model for all its traffic: the model belongs to the group, not to one path.
-// Pattern: Strategy (data-driven) — the three replica models differ only in the copy
-// groups built here; serve() runs any list of groups the same way.
+// The queues of a node that serves (spec §17 entry 5: what the balancer in front, if any, does to
+// the replica group; graph::Graph::mark_balanced_targets sets the flags and documents the models).
+// A node reached both through a balancer and directly gets the balancer's model for all its
+// traffic: the model belongs to the group, not to one path. Pattern: Strategy (data-driven) — the
+// three replica models differ only in the copy groups built here; serve() runs any list of groups
+// the same way.
 //  - Independent copies (no balancer, round_robin, weighted): independent_copies.
 //  - Pooled (least_connections): pooled_copies.
 //  - Imbalanced (consistent_hash, imbalance k > 1): add_hot_and_cool_copies.
@@ -1099,11 +1091,11 @@ void Simulation::add_hot_and_cool_copies(const graph::ResolvedNode& resolved,
                              .request_share = (replicas - k) / replicas});
 }
 
-// A SQL database (plan 2b refinement 3, behaviours::SqlDbBehaviour; book ch. 1 "database
-// replication" and "sharding") with N = replicas copies per shard and S = shards is TWO kinds
-// of copy, each copy its own queue of the node's capacity (concurrency and rate bounded by
-// `pool`, graph::apply_database_keys). graph::database_shares says what one copy of each kind is
-// sent; in short:
+// A SQL database (spec §18 entry 6, behaviours::SqlDbBehaviour; book ch. 1 "database replication"
+// and "sharding") with N = replicas copies per shard and S = shards is TWO kinds of copy, each copy
+// its own queue of the node's capacity (concurrency and rate bounded by `pool`,
+// graph::apply_database_keys). graph::database_shares says what one copy of each kind is sent; in
+// short:
 //                 copies        one copy is sent                       answers
 //   primaries     S             writes / S                             the writes
 //   replicas      (N − 1) S     reads / ((N − 1) S) + committed / S    the reads
@@ -1274,21 +1266,21 @@ void Simulation::require_scenario_step(SimTime dt) const {
 // g = 0.9). An acyclic graph takes two (the second confirms the first) when nothing is lost;
 // with losses, a few more (below).
 //
-// Why it converges whenever a steady state exists: starting from no flow at all, demand
-// can only rise from pass to pass (every node forwards a non-decreasing function of what
-// it receives), and what a loop sends round is bounded by the drain of its nodes, which
-// capacity caps. A rising, bounded sequence converges, here to the smallest steady state.
-// One mechanism breaks the "only rise": a step after a failed step does not run (plan 2c
-// refinement 11, behaviours::detail::HopBlocks::forward), and a pass can thin a later step only by
-// delivered fractions measured in an earlier pass (the backward pass runs after the forward one).
-// So the first pass sends every step the full flow, and the passes after it carry each loss one
-// step further down an op's steps: a chain of k lossy steps settles in about k + 1 passes more.
-// A loss that feeds back on itself (a node called several times by one op, [a, a, a, a, a], whose
-// later calls are thinned by its own loss, or two ops whose losses load each other's nodes) is a
+// Why it converges whenever a steady state exists: starting from no flow at all, demand can only
+// rise from pass to pass (every node forwards a non-decreasing function of what it receives), and
+// what a loop sends round is bounded by the drain of its nodes, which capacity caps. A rising,
+// bounded sequence converges, here to the smallest steady state. One mechanism breaks the "only
+// rise": a step after a failed step does not run (spec §19 entry 11,
+// behaviours::detail::HopBlocks::forward), and a pass can thin a later step only by delivered
+// fractions measured in an earlier pass (the backward pass runs after the forward one). So the
+// first pass sends every step the full flow, and the passes after it carry each loss one step
+// further down an op's steps: a chain of k lossy steps settles in about k + 1 passes more. A loss
+// that feeds back on itself (a node called several times by one op, [a, a, a, a, a], whose later
+// calls are thinned by its own loss, or two ops whose losses load each other's nodes) is a
 // fixed-point iteration of its own, d = f(d): the more a delivers, the more its later calls are
 // sent, the less it delivers, so f is decreasing. Fed back raw (d ← f(d)), a steep f (|f'| > 1)
-// never settles: the fractions flip between a high and a low value every pass. So settle mode
-// thins by a damped running average instead (average_settling_fractions, DampedFraction):
+// never settles: the fractions flip between a high and a low value every pass. So settle mode thins
+// by a damped running average instead (average_settling_fractions, DampedFraction):
 //   d̄ ← (1 − w) d̄ + w f(d̄)                   (damped fixed-point iteration, Mann's "averaging")
 // whose fixed point is the same, d̄ = f(d̄); f decreasing and continuous has exactly one. Near it
 // the error is multiplied each pass by the damped map's slope 1 − w + w f', which shrinks it when
@@ -1482,7 +1474,7 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
 //    The pairing is per step: this step's drops are set against this step's arrivals, though
 //    the well-mixed queue (see serve) drops older requests too. In a steady state it equals
 //    served / inflow, the share used before: with the backlog still, drain + drops = inflow,
-//    and served = drain − rejected. Out of one, served / inflow (review of 3e23477, I2) counted
+//    and served = drain − rejected. Out of one, served / inflow counted
 //    every request still waiting at the end of its arrival step as lost and never credited it
 //    later: a 3x spike into a deep queue, nothing dropped, reported 583/s answered of 667/s.
 //    No arrivals: 1 (nothing was lost). A database's reads and writes queue at different
@@ -1533,10 +1525,10 @@ void Simulation::receive(std::size_t index, Mode mode) {
 // request-share-weighted mixture of the groups' sojourns (record_sojourns), which with one
 // group is that group's sojourn.
 //
-// Capacity units (plan 2a refinement 4): the queue holds WORK, not requests. An op of
-// cost c_op arriving at r_op req/s brings r_op × c_op units/s (in_units), the
-// FluidQueue serves `capacity` units/s, and everything below is in units. Only on the
-// way out does a drained op become requests again: forwarded units / c_op (in_requests).
+// Capacity units (spec §17 entry 4): the queue holds WORK, not requests. An op of cost c_op
+// arriving at r_op req/s brings r_op × c_op units/s (in_units), the FluidQueue serves `capacity`
+// units/s, and everything below is in units. Only on the way out does a drained op become requests
+// again: forwarded units / c_op (in_requests).
 //
 // The FluidQueue knows only totals (one backlog number); each copy group's `waiting` adds
 // which ops are queued. Model: the queue is well-mixed (random-order) fluid, not FIFO, and
@@ -1712,10 +1704,9 @@ void Simulation::record_sojourns(Node& node, std::span<const flow::LatencyEstima
   sample.latency = request_weighted_sojourn(node);
 }
 
-// A byte-sized node's queue waits for whole objects (plan 2c refinement 2; review of Task 3 at
-// a8b6cb4, I1, and of its fix round at 0248a47, I1): each request holds one of its c megabyte
-// slots for its whole transfer, so the queue is fed the moments of this step's arrivals' object
-// times (behaviours::MegabyteService::object_time_moments):
+// A byte-sized node's queue waits for whole objects (spec §19 entry 2): each request holds one of
+// its c megabyte slots for its whole transfer, so the queue is fed the moments of this step's
+// arrivals' object times (behaviours::MegabyteService::object_time_moments):
 //   s_obj = Σ_op p_op × MB_op × s_MB          the mean, what Erlang C is fed (p_op = rate share)
 //   c_s²  = Σ_op p_op (1 + cs²) s_op² / s_obj² − 1     the size mix's SCV, what the Allen–Cunneen
 //                                                      factor (c_a² + c_s²) / 2 is fed
@@ -1782,7 +1773,7 @@ flow::LatencyEstimate Simulation::request_weighted_sojourn(const Node& node) {
        {.share = 1.0 - read_share, .latency = node.write_sojourn}}));
 }
 
-// A database's replication numbers (plan 2b refinement 3; NodeSample::staleness_s,
+// A database's replication numbers (spec §18 entry 6; NodeSample::staleness_s,
 // replication_dropped_per_s and committed_writes_per_s, the last two from replay_committed).
 // Staleness: a write a client sent shows at a replica after
 //   primary sojourn (wait + service: committed) + replication lag (shipped)
@@ -1806,10 +1797,10 @@ void Simulation::record_replication(const Node& node,
   sample.staleness_s = sojourns[0].mean_s + node.replication->lag_s + sojourns[1].mean_s;
 }
 
-// One copy group's step (replicas, plan refinement 4): `waiting` and the queue describe one
-// copy, which is sent `arrivals` (group_arrivals). Returns one copy's fluid step and what the
-// group's copies drained (and, at a database replica, dropped), and adds the clients' part
-// (clients_share) of their totals to `sample` (add_copies).
+// One copy group's step (replicas, spec §16 entry 4): `waiting` and the queue describe one copy,
+// which is sent `arrivals` (group_arrivals). Returns one copy's fluid step and what the group's
+// copies drained (and, at a database replica, dropped), and adds the clients' part (clients_share)
+// of their totals to `sample` (add_copies).
 Simulation::GroupStep Simulation::serve_copies(CopyGroup& group, const flow::Flow& arrivals,
                                                SimTime dt, Mode mode,
                                                const behaviours::Behaviour& behaviour,
@@ -1882,8 +1873,8 @@ void Simulation::send(std::size_t index, const behaviours::Routed& routed, SimTi
   for (const std::size_t link : outgoing_links) links_[link].line.push(links_[link].sent);
 }
 
-// A bandwidth link's pipe for one step (plan 2c refinement 3), between the sender and the delay
-// line: a fluid queue like a byte-sized node's, in megabytes.
+// A bandwidth link's pipe for one step (spec §19 entry 3), between the sender and the delay line: a
+// fluid queue like a byte-sized node's, in megabytes.
 //   demand   = Σ_op rate_op × MB_op                           MB/s put on the link
 //   s_obj    = Σ_op p_op MB_op × s_MB,  c_s² = the size mix's SCV    (MegabyteService::
 //              object_time_moments: one request holds the pipe for its whole serialisation,
@@ -1933,26 +1924,22 @@ void Simulation::pass_through_pipe(Link& link, SimTime dt, Mode mode,
   link.sent = to_requests(step.drained, pipe.megabytes_by_op);
 }
 
-// Backward pass (plan refinement 1), nodes in reverse topological order: a server's
-// response to op = own sojourn this step (own_sojourn: a database's write the primary's, its
-// read a replica's) + its hops (ServiceBehaviour::response) or its
-// share-weighted routes (LoadBalancerBehaviour::response). Reverse
-// order means every target later in the order was already refreshed this step.
-// Asynchronous hops (those closing an op-level call cycle, a write_back cache's flushes and a
-// blob store's event notifications: graph::Graph::is_async_hop) add no latency and fail no
-// request, so they are never looked up. A hop over a node-level back edge that
-// closes no call cycle targets a node earlier in the order, not yet refreshed: it reads
-// that node's previous-step entry, one step stale (the same "previous step's value" rule
-// as the forward pass).
-// The tables hold every op that can reach the node from construction on
-// (register_reachable_ops) and refresh all of them every step, so an op whose flow has
-// not arrived yet, or has paused, is estimated at the node's current load.
+// Backward pass (spec §16 entry 1), nodes in reverse topological order: a server's response to op =
+// own sojourn this step (own_sojourn: a database's write the primary's, its read a replica's) + its
+// hops (ServiceBehaviour::response) or its share-weighted routes (LoadBalancerBehaviour::response).
+// Reverse order means every target later in the order was already refreshed this step. Asynchronous
+// hops (those closing an op-level call cycle, a write_back cache's flushes and a blob store's event
+// notifications: graph::Graph::is_async_hop) add no latency and fail no request, so they are never
+// looked up. A hop over a node-level back edge that closes no call cycle targets a node earlier in
+// the order, not yet refreshed: it reads that node's previous-step entry, one step stale (the same
+// "previous step's value" rule as the forward pass). The tables hold every op that can reach the
+// node from construction on (register_reachable_ops) and refresh all of them every step, so an op
+// whose flow has not arrived yet, or has paused, is estimated at the node's current load.
 //
-// Next to each latency it composes the DELIVERED fraction (plan 2a refinement 8): the share
-// of the node's requests of that op that come back answered, the node's own `passed` share
-// times what its downstream calls deliver (behaviours::NodeBehaviour::delivered: sequential
-// parts multiply, splits mix by share). A feedback target is read one step stale, as for
-// latency.
+// Next to each latency it composes the DELIVERED fraction (spec §17 entry 8): the share of the
+// node's requests of that op that come back answered, the node's own `passed` share times what its
+// downstream calls deliver (behaviours::NodeBehaviour::delivered: sequential parts multiply, splits
+// mix by share). A feedback target is read one step stale, as for latency.
 void Simulation::backward_pass() {
   // C++20 std::views::reverse: walks the order back to front without copying it,
   // replacing a reverse-iterator loop (rbegin/rend) or a reversed copy.
@@ -2012,17 +1999,16 @@ std::vector<ResponseSample> Simulation::client_responses(SimTime now) const {
   return responses;
 }
 
-// A client's `timeout` (plan 2c Task 13; book ch. 1 and ch. 8: a client does not wait for ever).
-// Of the requests the path delivered, the share whose response time is below the timeout is
-// answered, with the moments of that share alone; the rest are timed out. The response time is
-// the lognormal fitted to the response's mean and variance (queueing::lognormal_below), the same
-// fit the reports read percentiles off. A write at a byte-sized node is answered at its last byte
+// A client's `timeout` (book ch. 1 and ch. 8: a client does not wait for ever). Of the requests the
+// path delivered, the share whose response time is below the timeout is answered, with the moments
+// of that share alone; the rest are timed out. The response time is the lognormal fitted to the
+// response's mean and variance (queueing::lognormal_below), the same fit the reports read
+// percentiles off. A write at a byte-sized node is answered at its last byte
 // (behaviours::MegabyteService::sojourn), and that is already in `response`, so an upload is timed
-// out on its whole transfer.
-// Only the client gives up: nothing cancels the request at the servers, which still queue and
-// serve it, so their demand and utilisation do not change (the work of a timed-out request is
-// wasted, not saved). Ignored: retries (phase 3) and a request answered after the client left
-// (it counts as timed out, never as answered late).
+// out on its whole transfer. Only the client gives up: nothing cancels the request at the servers,
+// which still queue and serve it, so their demand and utilisation do not change (the work of a
+// timed-out request is wasted, not saved). Ignored: retries (phase 3) and a request answered after
+// the client left (it counts as timed out, never as answered late).
 void Simulation::give_up_after(double timeout_s, ResponseSample& sample) {
   const auto below =
       queueing::lognormal_below(sample.response.mean_s, sample.response.variance_s2, timeout_s);

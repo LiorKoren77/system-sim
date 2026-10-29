@@ -198,10 +198,10 @@ std::optional<std::string> unparsable_duration(const std::filesystem::path& file
                      parsed.error().message);
 }
 
-// Why the file loads but not with `--duration`, worded after the option: a duration not longer
-// than the warmup (nothing would be observed), or the loader's rule as it judged the new duration
-// (an SLO's `over` that no longer fits after the warmup: review of plan 2c Task 19, where
-// `--duration 10m` on youtube kept its `over: 1h`), at the line it judged. The file's own mistake
+// Why the file loads but not with `--duration`, worded after the option: a duration not longer than
+// the warmup (nothing would be observed), or the loader's rule as it judged the new duration (an
+// SLO's `over` that no longer fits after the warmup: `--duration 10m` on youtube once kept its
+// `over: 1h`), at the line it judged. The file's own mistake
 // comes first, as the loader words it.
 std::string duration_refusal(const std::filesystem::path& file, const std::string& text,
                              const simsys::config::ConfigError& refused) {
@@ -218,8 +218,8 @@ std::string duration_refusal(const std::filesystem::path& file, const std::strin
 }
 
 // The graph `run` simulates. `--duration` is applied as a config::Override, so the loader holds it
-// to every rule it holds the file's own duration to (comprehensive 2c review, I-4: the CLI kept a
-// copy of the `over` rule); `--seed` replaces the scenario's before the graph is built: the engine
+// to every rule it holds the file's own duration to (the CLI once kept a copy of the `over`
+// rule); `--seed` replaces the scenario's before the graph is built: the engine
 // seeds every client's noise from Graph::scenario().seed (behaviours::client_seed), so replacing
 // it any later would not reach the clients.
 std::expected<graph::Graph, std::string> load_for_run(const std::filesystem::path& file,
@@ -252,7 +252,7 @@ bool open_series(const std::string& path, std::ofstream& file) {
 
 // Can `path` be opened for writing? Probed in append mode, which never truncates, and a file the
 // probe created is removed again: a run refused for the OTHER series file leaves this one as it
-// found it (review of 3e23477, M1: `--series` was truncated before `--series-ops` failed).
+// found it (`--series` was truncated before `--series-ops` failed).
 bool writable(const std::string& path) {
   std::error_code ignored;  // the non-throwing overloads: a probe answers, it does not throw
   const bool existed = std::filesystem::exists(path, ignored);
@@ -270,9 +270,9 @@ std::filesystem::path resolved(const std::string& path) {
   return error ? std::filesystem::path{path}.lexically_normal() : canonical;
 }
 
-// Why the series files cannot be written, before either is opened (opening truncates), or
-// nothing: two names for one file (both writers would truncate it and interleave their rows,
-// M2), or a path that cannot be opened for writing.
+// Why the series files cannot be written, before either is opened (opening truncates), or nothing:
+// two names for one file (both writers would truncate it and interleave their rows), or a path that
+// cannot be opened for writing.
 std::optional<std::string> series_paths_refused(const std::optional<std::string>& series,
                                                 const std::optional<std::string>& series_ops) {
   if (series && series_ops && resolved(*series) == resolved(*series_ops)) {
@@ -492,16 +492,18 @@ std::expected<std::vector<simsys::sweep::SweepMetric>, std::string> parse_metric
 }
 
 // `simsys sweep <file> --param <spec> --metric <m>...`: one run per point, one row per point.
-// Nothing reaches stdout unless every point ran, so a script never reads half a table.
+// Nothing reaches stdout unless every point ran, so a script never reads half a table. A --param
+// or --metric refused for its text is worded as every other refusal of the command, after the
+// file and `error:`, so all of them read `<file>: error: --param: ...` or `... --metric: ...`.
 int run_sweep_command(const std::filesystem::path& file, const SweepArgs& args) {
   const auto param = simsys::sweep::parse_param(args.param);
   if (!param) {
-    print_error(param.error());
+    print_error(file.string() + ": error: " + param.error());
     return 1;
   }
   const auto metrics = parse_metrics(args.metrics);
   if (!metrics) {
-    print_error(metrics.error());
+    print_error(file.string() + ": error: " + metrics.error());
     return 1;
   }
   const auto rows = simsys::sweep::run_sweep(file.string(), *param, *metrics, args.jobs);

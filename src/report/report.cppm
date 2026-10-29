@@ -41,10 +41,10 @@ struct NodeSummary {
   double peak_rho{};      // highest utilization of any observed step
   double peak_backlog{};  // most requests waiting at the end of any observed step
   // Requests shed because the waiting room was full, and an external sink's failed requests (its
-  // `failure_rate` of what it served, plan 2c refinement 8): failures.
+  // `failure_rate` of what it served, spec §19 entry 8): failures.
   double total_dropped{};
-  // Requests refused by policy (a rate limiter's 429s, plan 2a refinement 6): answered at
-  // once, never forwarded, and counted apart from the drops (reject_rate, not drop_rate).
+  // Requests refused by policy (a rate limiter's 429s, spec §17 entry 6): answered at once, never
+  // forwarded, and counted apart from the drops (reject_rate, not drop_rate).
   double total_rejected{};
   double red_time_s{};  // seconds spent in the red zone
   bool unavailable{};   // the node's latency was infinite in some observed step
@@ -65,21 +65,21 @@ struct NodeSummary {
   // writes above are a share of. Empty for every node that is not a database.
   std::optional<double> mean_committed_writes_per_s{};
   // A message queue's peak lag over the observed steps, in seconds (engine::NodeSample::
-  // queue_lag_s: its slowest consumer group's wait, max(k × Wq, backlog / capacity)): the PEAK,
-  // not the mean, since a lag bound is a promise about the worst moment (a notification an hour
-  // late is late whatever the day's average was). What the `queue_lag` SLO observes (plan 2c
-  // refinement 14). Empty for every node that is not a message queue.
+  // queue_lag_s: its slowest consumer group's wait, max(k × Wq, backlog / capacity)): the PEAK, not
+  // the mean, since a lag bound is a promise about the worst moment (a notification an hour late is
+  // late whatever the day's average was). What the `queue_lag` SLO observes (spec §19 entry 14).
+  // Empty for every node that is not a message queue.
   std::optional<double> peak_queue_lag_s{};
 };
 
-// One bandwidth link's pipe over the observed part of a run (plan 2c Task 5;
-// engine::LinkSample), in MEGABYTES (per second for the rates). `name` is the link as written,
-// `from->to` (graph::link_label), how every report names its row, also for a `dir: in` link,
-// whose demand travels from `to` to `from`. The node table's columns (`queue`: its id is the name,
-// and a pipe never rejects nor goes unavailable) and, for JSON, the time-averaged rates and
-// backlog of the pipe, its mean latency (a request's wait plus its answer time on the wire, a
-// write's whole serialisation and any other op's first megabyte, weighted by the megabytes offered
-// in each step; by time when none were) and the worst zone of any observed step.
+// One bandwidth link's pipe over the observed part of a run (engine::LinkSample), in MEGABYTES (per
+// second for the rates). `name` is the link as written, `from->to` (graph::link_label), how every
+// report names its row, also for a `dir: in` link, whose demand travels from `to` to `from`. The
+// node table's columns (`queue`: its id is the name, and a pipe never rejects nor goes unavailable)
+// and, for JSON, the time-averaged rates and backlog of the pipe, its mean latency (a request's
+// wait plus its answer time on the wire, a write's whole serialisation and any other op's first
+// megabyte, weighted by the megabytes offered in each step; by time when none were) and the worst
+// zone of any observed step.
 struct LinkSummary {
   NodeSummary queue{};
   double demand_per_s{};
@@ -90,26 +90,25 @@ struct LinkSummary {
   fluid::Zone zone{fluid::Zone::green};
 };
 
-// One (client, op) over the observed part of a run. Percentiles are a lognormal fit to
-// the latency moments averaged over the ANSWERED requests (plan 2a refinement 8: a refused
-// or dropped request saw no latency); `offered_per_s` still counts every request sent, and
-// `answered_per_s` the part of them that came back answered (plan 2b refinement 7): offered
-// minus what was refused or dropped on the way (a request still waiting in a queue is answered
-// later, not lost), so answered / offered is the fraction the path delivered. A client with a
-// `timeout` (plan 2c Task 13) also gives up on the delivered requests slower than it:
-// `timed_out_per_s` counts them (0 without a timeout), `answered_per_s` leaves them out (offered
-// − lost − timed out), and the mean describes the requests answered in time. A percentile is what
-// the client sees at its quantile q (report.cpp's percentile_seen_by_client, comprehensive 2c
-// review, C-1): when more than 1 − q of the delivered requests timed out
-// (`timed_out_share` > 1 − q: more than 1 % for a p99), no request at that quantile was answered,
-// and the percentile IS the timeout (the table prints `>1s`, a latency SLO on it
-// fails whatever its max); otherwise it is the fit to every DELIVERED request's latency, before the
-// timeout cut it, read at q and capped at the timeout (the engine times out exactly the requests
-// that fit puts past the timeout, so its fastest q are all answered). A
-// timed-out request is not a drop: no node failed it, so it is in no node's drop rate. An infinite
-// mean makes every latency infinite, which the renderers print as "unavailable" (table) or null
-// (JSON); an op of which nothing was answered in time but something timed out has no latency of its
-// own either (the JSON's null).
+// One (client, op) over the observed part of a run. Percentiles are a lognormal fit to the latency
+// moments averaged over the ANSWERED requests (spec §17 entry 8: a refused or dropped request saw
+// no latency); `offered_per_s` still counts every request sent, and `answered_per_s` the part of
+// them that came back answered (spec §18 entry 13): offered minus what was refused or dropped on
+// the way (a request still waiting in a queue is answered later, not lost), so answered / offered
+// is the fraction the path delivered. A client with a `timeout` also gives up on the delivered
+// requests slower than it: `timed_out_per_s` counts them (0 without a timeout), `answered_per_s`
+// leaves them out (offered − lost − timed out), and the mean describes the requests answered in
+// time. A percentile is what the client sees at its quantile q (report.cpp's
+// percentile_seen_by_client): when more than 1 − q of the delivered
+// requests timed out (`timed_out_share` > 1 − q: more than 1 % for a p99), no request at that
+// quantile was answered, and the percentile IS the timeout (the table prints `>1s`, a latency SLO
+// on it fails whatever its max); otherwise it is the fit to every DELIVERED request's latency,
+// before the timeout cut it, read at q and capped at the timeout (the engine times out exactly the
+// requests that fit puts past the timeout, so its fastest q are all answered). A timed-out request
+// is not a drop: no node failed it, so it is in no node's drop rate. An infinite mean makes every
+// latency infinite, which the renderers print as "unavailable" (table) or null (JSON); an op of
+// which nothing was answered in time but something timed out has no latency of its own either (the
+// JSON's null).
 struct OpSummary {
   std::string client{};
   std::string op{};
@@ -141,23 +140,21 @@ enum class OpLatency { mean, p50, p95, p99 };
 enum class SloStatus { pass, fail, skipped };
 
 // An SLO and its verdict. `observed` is in seconds for the time SLOs (latency, staleness, queue
-// lag) and a plain ratio otherwise; it is empty when the run has nothing to measure it on (a
-// queue lag without a message queue, a staleness on a node that is no database) or observed no
-// step: skipped.
-// `note` says why a verdict is not what `observed` against `max` alone would give: a staleness SLO
-// fails on a database whose replicas fall behind without bound ("each replica misses 66.67/s of
-// 400/s committed writes (16.7%)"), whatever its mean staleness; a latency SLO does not read an op
-// whose requests were all lost ("nobody answered c.op: no latency to observe"), and is skipped when
-// it reads only such ops. Empty otherwise.
-// An SLO with `over` (plan 2c Task 14) is judged by its worst window (Summary::windowed_verdict):
-// `observed`, `status` and `note` are that window's, `window_start` says where it starts,
-// counted from the start of the run (warmup included, the clock a scenario's `at:` uses), and
-// `window_length` how long it is: `over`, or less for the run's last window when the observed run
-// is not a whole number of windows. Both are empty for an SLO without `over`, for a windowed
-// latency SLO in none of whose windows its op was offered (then `skipped`), and under `estimate`.
-// `estimate` (Summary::of_estimate) has one steady-state record, at t = 0, and no windows: it
-// judges an SLO with `over` on that record and sets `at_one_instant`, so the reports say that run
-// is what checks each window (`(at 00:00 only: run checks each 1h)`).
+// lag) and a plain ratio otherwise; it is empty when the run has nothing to measure it on (a queue
+// lag without a message queue, a staleness on a node that is no database) or observed no step:
+// skipped. `note` says why a verdict is not what `observed` against `max` alone would give: a
+// staleness SLO fails on a database whose replicas fall behind without bound ("each replica misses
+// 66.67/s of 400/s committed writes (16.7%)"), whatever its mean staleness; a latency SLO does not
+// read an op whose requests were all lost ("nobody answered c.op: no latency to observe"), and is
+// skipped when it reads only such ops. Empty otherwise. An SLO with `over` is judged by its worst
+// window (Summary::windowed_verdict): `observed`, `status` and `note` are that window's,
+// `window_start` says where it starts, counted from the start of the run (warmup included, the
+// clock a scenario's `at:` uses), and `window_length` how long it is: `over`, or less for the run's
+// last window when the observed run is not a whole number of windows. Both are empty for an SLO
+// without `over`, for a windowed latency SLO in none of whose windows its op was offered (then
+// `skipped`), and under `estimate`. `estimate` (Summary::of_estimate) has one steady-state record,
+// at t = 0, and no windows: it judges an SLO with `over` on that record and sets `at_one_instant`,
+// so the reports say that run is what checks each window (`(at 00:00 only: run checks each 1h)`).
 struct SloResult {
   model::SloSpec slo{};
   std::optional<double> observed{};
@@ -168,18 +165,17 @@ struct SloResult {
   bool at_one_instant{};
 };
 
-// Running aggregates over the StepRecords of a run, from `warmup` on (earlier records only
-// fix the step length). Keeps a handful of sums per node and per op, never the records.
-// Pattern: Observer — pass `[&](const auto& r) { summary.observe(r); }` to
-// engine::Simulation::run. The Summary refers to `g`, which must outlive it.
-// SLOs per window (plan 2c Task 14): for every SLO of the scenario with `over`, the Summary also
-// keeps one more Summary of the same kind, fed only the steps of the window being accumulated
-// (windows of length `over`, aligned from the end of warmup: [warmup + k·over, warmup +
+// Running aggregates over the StepRecords of a run, from `warmup` on (earlier records only fix the
+// step length). Keeps a handful of sums per node and per op, never the records. Pattern: Observer —
+// pass `[&](const auto& r) { summary.observe(r); }` to engine::Simulation::run. The Summary refers
+// to `g`, which must outlive it. SLOs per window: for every SLO of the scenario with `over`, the
+// Summary also keeps one more Summary of the same kind, fed only the steps of the window being
+// accumulated (windows of length `over`, aligned from the end of warmup: [warmup + k·over, warmup +
 // (k + 1)·over); a step belongs to the window its start falls in). When a step opens the next
 // window the finished one is judged like a whole run and only its verdict is kept if it is the
 // worst so far; so a window's figures come from exactly the code that makes the run's (its
-// percentiles from percentile_seen_by_client, its drop rates from the same totals), and the
-// memory is one Summary per windowed SLO, whatever the run's length.
+// percentiles from percentile_seen_by_client, its drop rates from the same totals), and the memory
+// is one Summary per windowed SLO, whatever the run's length.
 class Summary {
  public:
   Summary(const graph::Graph& g, SimTime warmup);
@@ -202,10 +198,10 @@ class Summary {
   // 0 when nothing reached it. An unknown id is a programmer error (the loader checks SLO
   // nodes): throws std::invalid_argument.
   [[nodiscard]] double drop_rate(std::string_view node) const;
-  // The worst node's drop rate: every node must keep its own, so the worst one decides. A
-  // bandwidth link's pipe counts as a node here (plan 2c Task 5): a request its full room drops is
-  // lost as surely as one a node drops, so its drop rate (megabytes dropped over megabytes sent)
-  // can be the worst. An SLO's `node:` still names nodes only.
+  // The worst node's drop rate: every node must keep its own, so the worst one decides. A bandwidth
+  // link's pipe counts as a node here: a request its full room drops is lost as surely as one a
+  // node drops, so its drop rate (megabytes dropped over megabytes sent) can be the worst. An SLO's
+  // `node:` still names nodes only.
   [[nodiscard]] double drop_rate() const;
   // The id of the node with the highest drop rate (a link's `from->to` when its pipe is the worst;
   // the first of equals, nodes before links); empty when nothing dropped anything.
@@ -382,11 +378,10 @@ class SeriesWriter {
 };
 
 // For plotting what the clients see: one CSV row per (client, op) per step,
-// `t_s,client,op,offered_per_s,answered_per_s,timed_out_per_s,mean_ms` (plan 2b refinement 7;
-// `timed_out_per_s` since the review of plan 2c Task 13). The header is
-// written on construction; the column rules are at OpSeriesWriter::observe in report.cpp.
-// Pattern: Observer, like SeriesWriter: the CLI hands each step record to both, and neither
-// knows of the other. `out` and `g` must outlive the writer.
+// `t_s,client,op,offered_per_s,answered_per_s,timed_out_per_s,mean_ms` (spec §18 entry 13;
+// `timed_out_per_s` spec §19 entry 12). The header is written on construction; the column rules are
+// at OpSeriesWriter::observe in report.cpp. Pattern: Observer, like SeriesWriter: the CLI hands
+// each step record to both, and neither knows of the other. `out` and `g` must outlive the writer.
 class OpSeriesWriter {
  public:
   OpSeriesWriter(std::ostream& out, const graph::Graph& g);

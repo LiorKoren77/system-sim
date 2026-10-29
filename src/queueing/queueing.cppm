@@ -60,7 +60,7 @@ export namespace simsys::queueing {
 
 // The mean and variance of a time, in seconds and seconds squared: a queueing wait (mmc_wait) or a
 // whole reply time, a quorum's (the order statistics below). Was WaitMoments, a name that read
-// wrong at a sojourn (review of plan 2c Tasks 9-10, minor 10).
+// wrong at a sojourn.
 struct TimeMoments {
   double mean_s;
   double variance_s2;
@@ -110,7 +110,7 @@ struct TimeMoments {
 // k = 3 → 11/6 ms (the slowest, the harmonic number H_3). Assumes the replicas' times are
 // independent and exponential: true of an M/M/1 sojourn, an approximation for a node of c > 1
 // servers or a service SCV other than 1 (whose sojourn is not exponential). The engine does not
-// use it since the review of plan 2c Tasks 9-10 (C-1): a kv_cluster's replicas are not alike (one
+// use it: a kv_cluster's replicas are not alike (one
 // may be the ring's hot machine) and not exponential, so lognormal_order_statistic takes each
 // machine's own moments. It stays as the closed form a student can check by hand, and as the
 // cross-check of that quadrature (fed exponentials, it must reproduce these sums).
@@ -196,11 +196,11 @@ struct LognormalFit {
   return 0.5 * std::erfc(-z / std::numbers::sqrt2);
 }
 
-// What a client that gives up after `limit` seconds gets back from a response time X (plan 2c
-// Task 13; book ch. 1 and ch. 8: a client does not wait for ever, its HTTP library or the user
-// abandons a slow request). Fitted as a lognormal like every response the reports describe:
-// the path's time is a sum of positive, right-skewed terms (link legs, waits, services), which
-// is what a lognormal fits well, and its slow tail is exactly the part a timeout cuts.
+// What a client that gives up after `limit` seconds gets back from a response time X (book ch. 1
+// and ch. 8: a client does not wait for ever, its HTTP library or the user abandons a slow
+// request). Fitted as a lognormal like every response the reports describe: the path's time is a
+// sum of positive, right-skewed terms (link legs, waits, services), which is what a lognormal fits
+// well, and its slow tail is exactly the part a timeout cuts.
 //   fraction     P(X < L): the share answered in time; the rest timed out
 //   mean_s       E[X | X < L]: the mean of the answered requests alone
 //   variance_s2  Var[X | X < L]: their spread
@@ -268,13 +268,13 @@ struct BelowLimit {
   return {.fraction = fraction, .mean_s = mean_below, .variance_s2 = variance_below};
 }
 
-// `trials` independent trials that each succeed with probability `success`: one kind of replica
-// in a quorum (its share of answered, or of kept, requests). See probability_fewer_than.
-// `failure` is 1 - success, carried rather than computed where it is needed: when success is
-// within 1e-16 of 1, the subtraction 1 - success keeps none of failure's digits (section 2 of
-// docs/study/numerics.md: cancellation), and the quadrature below has failure itself to the last
-// digit, Phi(-z) (review of the kv/search fix round, M-3). A group built without it gets
-// 1 - success, as before: a default member initializer may read a member declared above it.
+// `trials` independent trials that each succeed with probability `success`: one kind of replica in
+// a quorum (its share of answered, or of kept, requests). See probability_fewer_than. `failure` is
+// 1 - success, carried rather than computed where it is needed: when success is within 1e-16 of 1,
+// the subtraction 1 - success keeps none of failure's digits (section 2 of docs/study/numerics.md:
+// cancellation), and the quadrature below has failure itself to the last digit, Phi(-z). A group
+// built without it gets 1 - success, as before: a default member initializer may read a member
+// declared above it.
 struct TrialGroup {
   int trials;
   double success;
@@ -554,30 +554,27 @@ export namespace simsys::queueing {
 }
 
 // How long a coordinator waits for the k-th fastest of a request's replicas when each group's
-// replies are lognormal, fitted to that group's own sojourn moments (review of plan 2c Tasks 9-10,
-// C-1). The k-th reply X is later than t exactly when fewer than k replicas have answered by t:
+// replies are lognormal, fitted to that group's own sojourn moments. The k-th reply X is later than
+// t exactly when fewer than k replicas have answered by t:
 //   S_k(t) = P(X > t) = P(fewer than k successes),  replica i succeeding with F_i(t) = P(X_i <= t)
-// the Poisson-binomial above over the groups, and the moments are E[X] = ∫ S_k dt and E[X^2] =
-// ∫ 2 t S_k dt (moments_from_survival, on a grid even in ln t that spans every group's fit to
-// 8 sigma, sigma / 2 apart: one lognormal comes back to its own moments within 1e-8 relative at
-// every sojourn SCV from 1e-4 to 100, a few 1e-16 but for the variance at SCV 1e-4, 1.2e-11; see
-// docs/study/numerics.md section 7). That needs each replica's failure Phi(-z) as computed, not
-// 1 - Phi(z): past SCV 10 the subtraction's rounding, weighted by t^2 in E[X^2], was the error
-// (1.1e-7 on the variance at SCV 20, 1.7e-6 at 50; review of the kv/search fix round, M-3), not
-// the trapezoid rule. The bound holds while the grid keeps its sigma / 2 step: a very narrow
-// group (sigma clamped to 0.001) beside a wide one (SCV 10) needs more than its 4000 points, the
-// step widens, and the error grows to 8.4e-4 on the mean and 1.4e-3 on the variance (review of
-// plan 2c Task 11, minors 6 and 7). Where exponential_order_statistic needs every replica alike and
+// the Poisson-binomial above over the groups, and the moments are E[X] = ∫ S_k dt and E[X^2] = ∫ 2
+// t S_k dt (moments_from_survival, on a grid even in ln t that spans every group's fit to 8 sigma,
+// sigma / 2 apart: one lognormal comes back to its own moments within 1e-8 relative at every
+// sojourn SCV from 1e-4 to 100, a few 1e-16 but for the variance at SCV 1e-4, 1.2e-11; see
+// docs/study/numerics.md section 7). That needs each replica's failure Phi(-z) as computed, not 1 -
+// Phi(z): past SCV 10 the subtraction's rounding, weighted by t^2 in E[X^2], was the error (1.1e-7
+// on the variance at SCV 20, 1.7e-6 at 50), not the trapezoid rule. The bound holds while the grid
+// keeps its sigma / 2 step: a very narrow group (sigma clamped to 0.001) beside a wide one (SCV 10)
+// needs more than its 4000 points, the step widens, and the error grows to 8.4e-4 on the mean and
+// 1.4e-3 on the variance. Where exponential_order_statistic needs every replica alike and
 // exponential, this takes the replicas as they are: a hot machine beside cool ones, each with its
-// own spread. Assumes the replicas' times are independent (one hot queue serves many keys, so
-// they are not quite) and that a lognormal of the right mean and variance has the right shape (an
-// M/M/c sojourn is not exactly one: the review's Monte Carlo of the kv-store lab's quorum lands
-// within 3 %).
-// Edge cases: a group of mean 0 answers at once; one without a finite mean and variance (a machine
-// with no capacity) never answers, so a quorum it is needed for takes forever ({inf, inf}); a NaN
-// anywhere is an upstream bug and comes out as NaN.
-// Precondition: 1 <= k <= the replicas of all groups (programmer error: Graph::build refuses
-// such a quorum), else std::invalid_argument.
+// own spread. Assumes the replicas' times are independent (one hot queue serves many keys, so they
+// are not quite) and that a lognormal of the right mean and variance has the right shape (an M/M/c
+// sojourn is not exactly one: the review's Monte Carlo of the kv-store lab's quorum lands within 3
+// %). Edge cases: a group of mean 0 answers at once; one without a finite mean and variance (a
+// machine with no capacity) never answers, so a quorum it is needed for takes forever ({inf, inf});
+// a NaN anywhere is an upstream bug and comes out as NaN. Precondition: 1 <= k <= the replicas of
+// all groups (programmer error: Graph::build refuses such a quorum), else std::invalid_argument.
 [[nodiscard]] TimeMoments lognormal_order_statistic(std::span<const ReplicaGroup> groups, int k) {
   if (k < 1 || k > detail::replicas_in(groups)) {
     throw std::invalid_argument{"lognormal_order_statistic: k must be in [1, replicas]"};

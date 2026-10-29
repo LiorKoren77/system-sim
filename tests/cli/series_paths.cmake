@@ -1,6 +1,5 @@
-# Process-level checks of `simsys run --series <file> --series-ops <file>` (review of 3e23477,
-# M1 and M2): what happens to the files on disk can only be seen from outside the process.
-# Run by ctest as a CMake script:
+# Process-level checks of `simsys run --series <file> --series-ops <file>`: what happens to the
+# files on disk can only be seen from outside the process. Run by ctest as a CMake script:
 #   cmake -DSIMSYS=<simsys> -DSCENARIO=<scenario.yaml> -DWORK=<scratch dir> -DCHECK=<name>
 #         -P series_paths.cmake
 # CHECK picks one property:

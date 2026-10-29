@@ -1,10 +1,10 @@
-// A client's `timeout` against closed-form results (plan 2c Task 13; book ch. 1 and ch. 8: a
-// client that gives up on a slow request). Model under test: the client's response time is fitted
-// as a lognormal with the path's mean and variance (the fit the reports already use); the share
-// below the timeout is answered, with the truncated moments; the rest is timed out. The servers
-// still do the work of a timed-out request: nothing cancels it, so their demand is unchanged. The
-// client's percentiles are that delivered fit's, capped at the timeout, or the timeout itself when
-// more than 1 − q of the delivered requests timed out (comprehensive 2c review, C-1).
+// A client's `timeout` against closed-form results (book ch. 1 and ch. 8: a client that gives up on
+// a slow request). Model under test: the client's response time is fitted as a lognormal with the
+// path's mean and variance (the fit the reports already use); the share below the timeout is
+// answered, with the truncated moments; the rest is timed out. The servers still do the work of a
+// timed-out request: nothing cancels it, so their demand is unchanged. The client's percentiles are
+// that delivered fit's, capped at the timeout, or the timeout itself when more than 1 − q of the
+// delivered requests timed out.
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
@@ -230,7 +230,7 @@ TEST_CASE(
   REQUIRE_THAT(answered, WithinRel(demand_per_s, 1e-9));
 }
 
-// ---- A latency SLO against a timeout (review of plan 2c Task 13, C-1) ----
+// ---- A latency SLO against a timeout ----
 //
 // The same exponential path, mean 100 ms (lognormal fit: sigma^2 = ln 2, sigma = 0.83255,
 // mu = ln 0.1 - sigma^2 / 2 = -2.64916). The share of it slower than a timeout L is
@@ -284,7 +284,7 @@ TEST_CASE("p99 and p50 SLOs at the timeout pass when only 0.5 percent time out a
   }
 }
 
-// ---- The client's quantile is the delivered fit's quantile (comprehensive 2c review, C-1) ----
+// ---- The client's quantile is the delivered fit's quantile ----
 //
 // The engine times a request out exactly when the lognormal fitted to the DELIVERED requests'
 // latency (the path's own moments, before the timeout) puts it past the timeout (give_up_after). So
@@ -351,13 +351,13 @@ TEST_CASE("the p99 and p50 never fall as the client's timeout grows, and meet th
 //   the answered requests: mean 1.358 ms, and their own fit's median 0.897 ms.
 // The answered requests are mostly the quiet minutes' fast ones, so their median is under a
 // millisecond, and a p50 SLO of 1 ms read there would PASS. But 18.4 % of the delivered requests,
-// all slower than 50 ms, are not in that median. The client's p50 is the median of the fit to
-// every DELIVERED request, the moments each step had before the timeout cut them, weighted by the
+// all slower than 50 ms, are not in that median. The client's p50 is the median of the fit to every
+// DELIVERED request, the moments each step had before the timeout cut them, weighted by the
 // requests delivered (answered + timed out): exactly what the same run without the timeout reports,
-// 39.21 ms (comprehensive 2c review, C-1), and the SLO FAILs. The spike's minute weighs in
-// with its backlog's seconds of wait, so the mixture's median sits far above the quiet minutes'
-// millisecond. The test rebuilds the delivered moments from the step records, as the Summary does,
-// and checks the p50 is exactly their fit's median.
+// 39.21 ms, and the SLO FAILs. The spike's minute weighs in with its backlog's seconds of wait, so
+// the mixture's median sits far above the quiet minutes' millisecond. The test rebuilds the
+// delivered moments from the step records, as the Summary does, and checks the p50 is exactly their
+// fit's median.
 namespace {
 Scenario spike_past_the_timeout(std::optional<simsys::SimTime> timeout) {
   Scenario s{.name = "spike", .version = 1, .duration = 10min, .step = 100ms};
@@ -427,11 +427,11 @@ TEST_CASE(
 // sigma = 0.0137). Against a timeout T the share answered in time is Phi((ln T - mu) / sigma):
 //   T = 10 s: Phi(-13.5) ~ 1e-41: no upload is answered in time;
 //   T = 30 s: Phi((ln 30 - ln 12.1) / 0.0137) = Phi(66) ~ 1: every upload is.
-// Plan 2c Task 16 set the shipped timeout to 30 s: the book's uploads are resumable, so a client
-// gives up on a chunk, not on the file, and the model's one timeout per client is that patience
-// scaled to the whole 300 MB file. The second test keeps the old 10 s to show why it changed.
-// SIMSYS_SCENARIOS_DIR is injected by CMake (a compile definition: the one macro we accept,
-// because it carries a build-time path no language feature can).
+// The shipped timeout is 30 s: the book's uploads are resumable, so a client gives up on a chunk,
+// not on the file, and the model's one timeout per client is that patience scaled to the whole 300
+// MB file. The second test keeps the old 10 s to show why it changed. SIMSYS_SCENARIOS_DIR is
+// injected by CMake (a compile definition: the one macro we accept, because it carries a build-time
+// path no language feature can).
 namespace {
 // The shipped youtube scenario, with `edit` applied, run for its first ten seconds; its JSON
 // report. The scenario runs 24 h at 100 ms; its first ten seconds say the same about uploads (the

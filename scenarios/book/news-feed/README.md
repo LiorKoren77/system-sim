@@ -19,8 +19,9 @@ As first shipped (8 web servers, one replica of each cache, one `post_db` shard)
 showed five nodes red at the peak: `web  peak offered 15.13k/s vs 16k/s total capacity  (94.6%,
 red)`, `feed_cache  peak offered 661.5k/s vs 100k/s total capacity  (662%, red)`, `post_cache`
 262 %, `user_cache` 259 %, and `post_db  ... primary 10.81k units/s vs 5k/s (216%, red), each
-replica 17.3k units/s vs 5k/s (346%, red)`. `simsys run` dropped 59.9 % of the work (`drop rate
-59.9% (worst: feed_cache)`), the feed cache saturated all day (`red_s 8.61e+04`) and the
+replica 17.3k units/s vs 5k/s (346%, red)`. In `simsys run` the feed cache dropped 59.9 % of the
+work sent to it (`drop rate 59.9% (worst: feed_cache)`: the header's drop rate is the worst
+node's), saturated all day (`red_s 8.61e+04`), and the
 `drop_rate` SLO failed (`FAIL drop_rate - - 0.5987 0.001`, exit 2). Every fix is the book's
 remedy, sized with its numbers for the 12:00 peak by one rule: **the smallest count whose peak
 is at most two-thirds of its capacity**, i.e. capacity 1.5 times the peak, room for the noise and
@@ -70,7 +71,7 @@ steps, 5 min warmup: 861,000 observed steps, about 20 s in a Release build).
   each is `explain`'s percentage × 21.69k / 21.62k).
 - **The 300× write amplification of fan-out on write** hitting `feed_cache` (above) and the
   friendship graph. Each fan-out job reads the poster's friend list once from `graph_db`, a
-  key-value cluster of 6 machines keeping N = 3 copies (simulated since phase 2c), so 3
+  key-value cluster of 6 machines keeping N = 3 copies, so 3
   replica-requests per job against the machines' 6 × 30k/s, the hottest of them (1 +
   z_6/sqrt(3 × 150) = 1.0604 times the average, z_6 = 1.28 the expected maximum of 6 standard
   normals) checked: `graph_db  peak offered 6.486k/s (2.162k/s × N 3) vs 180k/s (6 nodes)
@@ -96,8 +97,8 @@ steps, 5 min warmup: 861,000 observed steps, about 20 s in a Release build).
   (1.5 in a million), not a queue: the busiest node on the media path, `media_store`, is 6.51 %
   busy at the peak.
 - **Media in bytes.** Media reads (30 % of requests, 200 KB each) go to the CDN and only the 5 %
-  misses reach `media_store`, which is sized in bytes (`capacity: 1GB/s`) and so counts megabytes
-  (phase 2c): each 200 KB read costs 0.2 units of 1 MB: `media_store  peak offered 64.86 MB/s
+  misses reach `media_store`, which is sized in bytes (`capacity: 1GB/s`) and so counts
+  megabytes: each 200 KB read costs 0.2 units of 1 MB: `media_store  peak offered 64.86 MB/s
   (324.3/s) vs 1k MB/s total capacity  (6.49%, green)`. A read is answered in one megabyte's
   40 ms (an upper bound for a 200 KB object: the model charges every request at least one
   unit's service time).
@@ -145,13 +146,13 @@ steps, 5 min warmup: 861,000 observed steps, about 20 s in a Release build).
   spike's lag at 101 µs.
 - **One database shard** (`post_db.shards: 1`): `primary 10.81k units/s vs 5k/s (216%, red), each
   replica 17.3k units/s vs 5k/s (346%, red)`. The run drops 28.4 % of what reaches `post_db`
-  (`FAIL drop_rate - - 0.2844 0.001`, exit 2), and since a step after a failed step does not run
-  (since phase 2c), the losses thin what follows them: a post whose write was dropped is
+  (`FAIL drop_rate - - 0.2844 0.001`, exit 2), and since a step after a failed step does not
+  run, the losses thin what follows them: a post whose write was dropped is
   neither cached nor published (810.4 of the 1.009k posts a second are answered; `fanout`'s mean
   rho falls from 0.1576 to 0.1266, `feed_cache`'s from 0.3087 to 0.2492), and a hydration whose
   miss read was dropped skips its author (`user_cache` 0.3027 → 0.2973). The replicas fall
   behind without bound (`missed writes/s per replica 267`). The `read_feed` p99 still passes
-  (75.7 ms), so only the drop rate tells.
+  (82.3 ms), so only the drop rate tells.
 - **A worse post cache** (`post_cache`'s `hit_ratio: {fixed: 0.8}`, from 0.95): the misses
   quadruple to 51.88k reads/s and the 6 shards' replicas are no longer enough: `each replica
   6.125k units/s vs 5k/s (123%, red)` while the primaries stay at 36 %; the run drops 0.211 %

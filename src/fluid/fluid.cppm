@@ -31,21 +31,19 @@ export namespace simsys::fluid {
 // fluid drain, `service_time_s` is how long one request occupies one of the
 // `concurrency` servers and feeds the Erlang C term.
 //
-// Invariant: `service_rate` should equal `concurrency / service_time_s`. The defaults
-// keep it, up to rounding c up to a whole server, by deriving c
-// (defaults::implied_concurrency, Little's law); a scenario that sets
-// advanced.concurrency owns it. The fluid drain uses `service_rate`, the Erlang C term
-// `concurrency` and `service_time_s`, so a mismatch makes them describe two different
-// machines. Example: rate 2000/s,
-// s = 1 ms, c = 1 at 1500/s gives an Erlang wait computed at rho 0.75 (3 ms) while a
-// consistent 2000/s server (s = 0.5 ms) would wait 1.5 ms. `service_rate` must be >= 0.
-// One planned exception, a byte-sized node (plan 2c refinement 2): `service_rate` counts
+// Invariant: `service_rate` should equal `concurrency / service_time_s`. The defaults keep it, up
+// to rounding c up to a whole server, by deriving c (defaults::implied_concurrency, Little's law);
+// a scenario that sets advanced.concurrency owns it. The fluid drain uses `service_rate`, the
+// Erlang C term `concurrency` and `service_time_s`, so a mismatch makes them describe two different
+// machines. Example: rate 2000/s, s = 1 ms, c = 1 at 1500/s gives an Erlang wait computed at rho
+// 0.75 (3 ms) while a consistent 2000/s server (s = 0.5 ms) would wait 1.5 ms. `service_rate` must
+// be >= 0. One planned exception, a byte-sized node (spec §19 entry 2): `service_rate` counts
 // megabytes (MB/s) and c = MB/s × the time of one MB, but `service_time_s` is the mean time one
 // OBJECT holds a server and `service_variability` the squared coefficient of variation of those
 // times over the node's size mix (FluidQueue::set_service, from the engine each step), so the rate
 // is MB/s and c / service_time_s is objects/s. The invariant then holds where it matters, in rho:
-// objects/s × s_obj / c = MB/s × s_MB / c = MB/s / service_rate (Little's law), so the fluid
-// drain and Erlang C see the same utilization and the wait is a whole object's.
+// objects/s × s_obj / c = MB/s × s_MB / c = MB/s / service_rate (Little's law), so the fluid drain
+// and Erlang C see the same utilization and the wait is a whole object's.
 struct Capacity {
   Rate service_rate;        // requests per second one replica can drain
   double service_time_s{};  // seconds one request occupies a server
@@ -193,12 +191,12 @@ FluidStep FluidQueue::advance(Rate demand, SimTime dt) {
   const double dropped_per_s = spill_overflow(dt_s);
   const double rho = utilization(drain_per_s);
   // The stochastic wait reads the utilization of what ARRIVES, min(demand, drain) / cap, not the
-  // busy fraction rho (review of plan 2c, 5b). They differ only while a backlog drains after the
-  // load fell (a ramp down: demand < drain = cap): every server is busy, but the new arrivals no
-  // longer bunch as at rho 1, and the queue they find is the backlog, which the fluid term carries.
-  // Read at rho 1 the wait held at the clamp (or the room's drain time) until the backlog was gone;
-  // read at the arrivals' load it falls with the backlog. Filling or saturated (demand >= drain)
-  // and with an empty backlog (drain = demand) it is rho itself. Demand first: a NaN propagates.
+  // busy fraction rho. They differ only while a backlog drains after the load fell (a ramp down:
+  // demand < drain = cap): every server is busy, but the new arrivals no longer bunch as at rho 1,
+  // and the queue they find is the backlog, which the fluid term carries. Read at rho 1 the wait
+  // held at the clamp (or the room's drain time) until the backlog was gone; read at the arrivals'
+  // load it falls with the backlog. Filling or saturated (demand >= drain) and with an empty
+  // backlog (drain = demand) it is rho itself. Demand first: a NaN propagates.
   const flow::LatencyEstimate waited = wait(utilization(std::min(demand_per_s, drain_per_s)));
   // C++20 designated initializers: name the fields at the construction site. Replaces
   // positional aggregate init, which silently swaps same-typed doubles when the struct
@@ -213,10 +211,10 @@ FluidStep FluidQueue::advance(Rate demand, SimTime dt) {
                    .zone = zone_of(rho, capacity_)};
 }
 
-// Strictly above capacity (review of plan 2c, 5c): at demand = capacity exactly the fluid neither
-// grows nor drains, so the long-run backlog is whatever it started at, and both commands start
-// empty. The stochastic wait at rho 1 is the clamp's (max_stochastic_rho), not a full room's. A
-// real queue at rho 1 is null-recurrent and holds about half its room on average: size off rho 1.
+// Strictly above capacity: at demand = capacity exactly the fluid neither grows nor drains, so the
+// long-run backlog is whatever it started at, and both commands start empty. The stochastic wait at
+// rho 1 is the clamp's (max_stochastic_rho), not a full room's. A real queue at rho 1 is
+// null-recurrent and holds about half its room on average: size off rho 1.
 void FluidQueue::settle(Rate demand) {
   backlog_ = demand.per_second > capacity_.service_rate.per_second ? capacity_.queue_limit : 0.0;
 }
@@ -311,29 +309,27 @@ double FluidQueue::room_drain_s() const {
 //          advance()), rho_st the arrivals' utilization min(demand, drain)/cap (advance()).
 //          Assumes steady state at that rho. Bounded by the room (below).
 //
-// The room-drain bound (review of plan 2c Task 3's fix round, C1; named in the review of its
-// second fix round, I-2): a queue with a waiting room of K units turns away whoever finds it full,
-// so a request it admits has at most K units ahead of it and waits at most T = K / cap, the full
-// room's drain time; stoch is min(k * Wq, T). For a deterministic drain (the fluid backlog, a
-// leaky bucket's regular leak) T is exact: the last one admitted to a full room waits exactly
-// that. For random arrivals and service it is conservative: T bounds the WORST admitted wait, so
-// it is above M/M/c/K's MEAN wait, about twice it near rho = 1 (M/M/1 with a room of 10 at rho
-// 0.98 waits 4.8 ms on average where T says 10 ms). Erlang C at the 0.99 clamp knows no room:
-// with 2 s objects at a 20-slot blob store the engine's stochastic term would be (1 + 0) / 2 x
-// C(20, 0.99) x 2 s / (20 x 0.01) = 4.74 s (9.48 s with exponential service), where the 1000 MB
-// room drains in 2 s. At a node that counts requests with the default room it binds only for
-// very bursty arrivals: the room holds 1000 requests, ten times the ~100 Erlang C queues at the
-// clamp (Lq = rho^2 / (1 - rho) = 98 at one server; T / clamp >= (1000 s/c) / (100 s/c) = 10),
-// so the mean binds only when the arrivals' variability factor k exceeds 10, and the variance
-// cap below when k exceeds 5; otherwise only a small `queue_limit` or objects of many units meet
-// it.
-// Its variance is capped at T^2 / 4, OUR HEURISTIC: the room's scale, which keeps a bounded wait
-// from carrying the clamp's spread (99.7 s^2 for that blob store, against 1 s^2). It is not a
-// theorem: a wait in [0, T] whose mean sits at T has no spread at all (Bhatia–Davis), and the
-// tight bound for a given mean would make the spread, and so the p99, fall as the load rises.
-// What it does not do is bound the percentiles: the reports fit a lognormal to the mean and
-// variance (queueing::lognormal_quantile), which knows no bound, so an estimated p99 can exceed
-// T + s (a blob store fed 12 writes/s of 50 MB: p99 6.88 s against T + s = 4 s).
+// The room-drain bound: a queue with a waiting room of K units turns away whoever finds it full, so
+// a request it admits has at most K units ahead of it and waits at most T = K / cap, the full
+// room's drain time; stoch is min(k * Wq, T). For a deterministic drain (the fluid backlog, a leaky
+// bucket's regular leak) T is exact: the last one admitted to a full room waits exactly that. For
+// random arrivals and service it is conservative: T bounds the WORST admitted wait, so it is above
+// M/M/c/K's MEAN wait, about twice it near rho = 1 (M/M/1 with a room of 10 at rho 0.98 waits 4.8
+// ms on average where T says 10 ms). Erlang C at the 0.99 clamp knows no room: with 2 s objects at
+// a 20-slot blob store the engine's stochastic term would be (1 + 0) / 2 x C(20, 0.99) x 2 s / (20
+// x 0.01) = 4.74 s (9.48 s with exponential service), where the 1000 MB room drains in 2 s. At a
+// node that counts requests with the default room it binds only for very bursty arrivals: the room
+// holds 1000 requests, ten times the ~100 Erlang C queues at the clamp (Lq = rho^2 / (1 - rho) = 98
+// at one server; T / clamp >= (1000 s/c) / (100 s/c) = 10), so the mean binds only when the
+// arrivals' variability factor k exceeds 10, and the variance cap below when k exceeds 5; otherwise
+// only a small `queue_limit` or objects of many units meet it. Its variance is capped at T^2 / 4,
+// OUR HEURISTIC: the room's scale, which keeps a bounded wait from carrying the clamp's spread
+// (99.7 s^2 for that blob store, against 1 s^2). It is not a theorem: a wait in [0, T] whose mean
+// sits at T has no spread at all (Bhatia–Davis), and the tight bound for a given mean would make
+// the spread, and so the p99, fall as the load rises. What it does not do is bound the percentiles:
+// the reports fit a lognormal to the mean and variance (queueing::lognormal_quantile), which knows
+// no bound, so an estimated p99 can exceed T + s (a blob store fed 12 writes/s of 50 MB: p99 6.88 s
+// against T + s = 4 s).
 //
 // Why max and not the sum: by Little's law (L = lambda * W) the M/M/1 wait at rho 0.99
 // corresponds to a stochastic queue of ~99 requests (Lq = rho^2/(1 - rho) = 98). Once the fluid

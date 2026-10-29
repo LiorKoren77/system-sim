@@ -1,5 +1,4 @@
-// Lines of `simsys explain`'s text, for the tests that pin them (test_report.cpp and
-// test_series.cpp share these: review of plan 2c Task 6, M-9). A plain header rather than a
+// Lines of `simsys explain`'s text, for the tests that pin them. A plain header rather than a
 // module: it is test scaffolding over std::string alone, included before the test's imports (see
 // the note on import order in each test file).
 #pragma once

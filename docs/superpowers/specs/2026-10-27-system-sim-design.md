@@ -744,7 +744,9 @@ author meets are in `docs/scenario-schema.md` (v1.3).
     `1 − (dropped + rejected) / inflow`, so answered is offered minus what a limiter refused or
     a queue dropped, and a backlog is neutral; in a steady state the two agree, and no pinned
     value moved. Transient runs move: the requests that waited out a surge now count, with
-    their wait (the rate-limiter lab's p99 30.5 ms, was 29.4 ms).
+    their wait (the rate-limiter lab's p99 rose from 29.4 ms to 30.5 ms; it was 30.5 ms before
+    the stochastic wait read the min(demand, drain) utilisation, §19 entry 2, and is 24.8 ms
+    since).
 15. **Explain marks load it cannot follow** (Task 7, review I1). In phase 2b the paper load did
     not pass through a blob store's or worker pool's `then`, a message queue's consumers, or a
     fan-out's or frontier's `then`; since phase 2c it follows all of them but the last two
@@ -814,7 +816,10 @@ scenario tests or printed by the Release binary.
      for a deterministic drain and conservative otherwise (about twice M/M/c/K's mean near
      rho 1); its variance is capped at the room's scale squared over 4, our heuristic. The
      lognormal percentiles ignore the bound (a saturated store's p99 6.88 s against its 4 s,
-     pinned as a characterisation test and listed for the comprehensive review).
+     pinned as a characterisation test). *Decided by the comprehensive 2c review (5a):* label
+     the percentiles, do not truncate them, since only an all-deterministic path has a finite
+     maximum; the schema's "How percentiles are estimated, and where they mislead" gives the
+     measured cases (two-peaked mixes, hard bounds) and the rule behind a client timeout.
    A byte-sized node's demand, drops and backlog are in MB, its clients' rates in requests.
    *Corrected by the comprehensive 2c review (5b):* the stochastic wait reads the arrivals' load,
    `min(demand, drain) / capacity`, not the busy fraction `drain / capacity`, so a ramp's

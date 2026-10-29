@@ -977,9 +977,9 @@ std::string type_with_article(model::NodeType type) {
   return std::format("{} {}", vowel ? "an" : "a", name);
 }
 
-// Only the types that serve bytes may count them (plan 2c refinement 2, defaults::is_byte_sized):
-// a CDN and a blob store. Every other type counts requests, and a byte rate there would have to
-// be read as some number of requests, which no author means.
+// Only the types that serve bytes may count them (spec §19 entry 2, defaults::is_byte_sized): a CDN
+// and a blob store. Every other type counts requests, and a byte rate there would have to be read
+// as some number of requests, which no author means.
 CheckResult check_byte_capacity_type(const Site& site, const YAML::Node& capacity,
                                      const model::NodeSpec& node) {
   if (!node.byte_capacity) return {};
@@ -1106,7 +1106,7 @@ CheckResult read_advanced(const Site& site, const YAML::Node& body, model::NodeS
   return check_thresholds_ordered(site, advanced, node);
 }
 
-// ---- Per-op cost (plan 2a refinement 4) ----
+// ---- Per-op cost (spec §17 entry 4) ----
 
 // The types whose `cost` is a map op -> capacity units (a SQL database's writes default to
 // defaults::sql_write_cost; a stated cost replaces it). A worker_pool's `cost` is a
@@ -1160,7 +1160,7 @@ CheckResult read_cost(const Site& site, const YAML::Node& body, model::NodeSpec&
   return {};
 }
 
-// ---- Load balancer keys (plan 2a refinement 5) ----
+// ---- Load balancer keys (spec §17 entry 5) ----
 
 // `policy: least_connections`; absent means round_robin (the schema's default). An absent
 // policy stays absent, so explain can say "(default)": every reader writes
@@ -1352,7 +1352,7 @@ CheckResult read_optional_number(const Site& site, const YAML::Node& parent, std
   return {};
 }
 
-// ---- Sizes (plan 2c refinement 1) ------------------------------------------------------
+// ---- Sizes (spec §19 entry 1) ------------------------------------------------------
 
 // One request's size, as a client's `sizes` entry or a step's `size` writes it (parse_size:
 // `50MB`). The message states the grammar, then the parser's reason ("missing size unit", "size
@@ -1411,10 +1411,10 @@ CheckResult read_step_size(const Site& site, const YAML::Node& yaml, model::Step
   });
 }
 
-// `on` gates the flow (a cache's `miss` steps see only what it did not serve, ch. 1),
-// `mode` decides whether latencies add (sequential) or overlap (parallel: the max counts),
-// `size` is the payload the request carries (plan 2c refinement 1),
-// `factor` multiplies the flow (fan-out on write: one post -> 100 feed writes, ch. 11).
+// `on` gates the flow (a cache's `miss` steps see only what it did not serve, ch. 1), `mode`
+// decides whether latencies add (sequential) or overlap (parallel: the max counts), `size` is the
+// payload the request carries (spec §19 entry 1), `factor` multiplies the flow (fan-out on write:
+// one post -> 100 feed writes, ch. 11).
 CheckResult read_step_attributes(const Site& site, const YAML::Node& yaml, model::Step& step) {
   if (auto read = read_optional_word(site, yaml, "on", model::parse_step_condition,
                                      "step condition must be always, miss or failure", step.on);
@@ -1640,10 +1640,10 @@ std::expected<SimTime, ConfigError> read_positive_duration(const Site& site,
       });
 }
 
-// `block[key]` as a point in simulated time: a clock time ("20:00") or a duration from the
-// start ("5m"), both offsets from t = 0, which is midnight (phase 2a refinement 1). An
-// unquoted 20:00 is fine: yaml-cpp keeps every scalar's text, and YAML 1.2 has no base-60
-// numbers (YAML 1.1 read 20:00 as the integer 1200).
+// `block[key]` as a point in simulated time: a clock time ("20:00") or a duration from the start
+// ("5m"), both offsets from t = 0, which is midnight (spec §17 entry 1). An unquoted 20:00 is fine:
+// yaml-cpp keeps every scalar's text, and YAML 1.2 has no base-60 numbers (YAML 1.1 read 20:00 as
+// the integer 1200).
 std::expected<SimTime, ConfigError> read_time_point(const Site& site, const YAML::Node& block,
                                                     std::string_view label, std::string_view key) {
   return parse_key(site, block, key, std::format("{}.{}", label, key), parse_time_point);
@@ -2011,7 +2011,7 @@ std::optional<std::int64_t> parse_count(std::string_view text) {
   return *count * scale;
 }
 
-// ---- Client keys (plan 2b refinement 1) ----
+// ---- Client keys (spec §18 entry 1) ----
 
 constexpr std::string_view client_keys_keys = "zipf space uniform";
 
@@ -2122,14 +2122,14 @@ std::expected<model::Workload, ConfigError> read_workload(const Site& site,
     return std::unexpected(read.error());
   }
   // A client that gives up at once answers nothing, and a latency SLO would observe the 0 s the
-  // client waited (review of plan 2c Task 13, C-1): a timeout is a positive wait.
+  // client waited: a timeout is a positive wait.
   if (workload.timeout && workload.timeout->count() <= 0) {
     return site.fail(body["timeout"], "timeout must be positive");
   }
   return workload;
 }
 
-// ---- Rate limiter keys (plan 2a refinement 6) -------------------------------------------
+// ---- Rate limiter keys (spec §17 entry 6) -------------------------------------------
 //
 // Read in the second pass, where every reader above is declared and every node's type is
 // known (`backend` must name a cache). Order matters: the default burst is limit x window.
@@ -2236,7 +2236,7 @@ CheckResult read_limiter_keys(const Site& site, const YAML::Node& body, model::N
       .and_then([&] { return read_limiter_backend(this_node, body, node, declared); });
 }
 
-// ---- Id generator keys (plan 2b refinement 6; book ch. 7) ------------------------------
+// ---- Id generator keys (spec §18 entry 12; book ch. 7) ------------------------------
 
 // `algorithm: snowflake`, required: the algorithm decides the generator's capacity and service
 // time (defaults::for_id_algorithm), so a generator without one would run on a made-up number.
@@ -2265,7 +2265,7 @@ CheckResult read_id_generator_keys(const Site& site, const YAML::Node& body,
   return {};
 }
 
-// ---- Cache keys (plan 2a refinement 7) -------------------------------------------------
+// ---- Cache keys (spec §17 entry 7) -------------------------------------------------
 //
 // Read in the second pass, after read_node_routing has checked that a `backend` names a
 // declared node. Order matters: whether a backend is required depends on the strategy.
@@ -2380,7 +2380,7 @@ CheckResult read_cache_keys(const Site& site, const YAML::Node& body, model::Nod
       .and_then([&] { return read_cache_ttl(this_node, body, node); });
 }
 
-// ---- SQL database keys (plan 2b refinement 3) ----
+// ---- SQL database keys (spec §18 entry 6) ----
 
 // `shards: 4`: how many independent primary + replicas sets the data is split over.
 CheckResult read_shards(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
@@ -2426,7 +2426,7 @@ CheckResult read_sql_keys(const Site& site, const YAML::Node& body, model::NodeS
       .and_then([&] { return read_write_ops(this_node, body, node); });
 }
 
-// ---- CDN keys (plan 2b refinement 4) ----
+// ---- CDN keys (spec §18 entry 10) ----
 //
 // A CDN (ch. 1: a cache at the network's edge) is a read-only cache in front of its `origin`:
 // it answers the hits and fetches the misses from the origin as the same op.
@@ -2471,11 +2471,11 @@ CheckResult read_cdn_keys(const Site& site, const YAML::Node& body, model::NodeS
       .and_then([&] { return read_write_ops(this_node, body, node); });
 }
 
-// ---- Blob store keys (plan 2c refinement 2; review of Task 3 at a8b6cb4, I2) ----
+// ---- Blob store keys (spec §19 entry 2) ----
 //
 // `write_ops: [upload]`: the ops a blob store acknowledges at their last byte (a PUT is answered
 // once the object is stored), and the only ones that fire its `then` steps, its event
-// notifications (plan 2c Task 4); every other op is a read, answered at its first megabyte
+// notifications; every other op is a read, answered at its first megabyte
 // (behaviours::MegabyteService). Read as a cache's are (read_write_ops); default `write`.
 
 // A blob store's `then` steps are event notifications nobody waits for, so a step `mode`
@@ -2503,7 +2503,7 @@ CheckResult read_blob_store_keys(const Site& site, const YAML::Node& body, model
   });
 }
 
-// ---- Message queue and worker pool keys (plan 2c refinements 4-5) ----
+// ---- Message queue and worker pool keys (spec §19 entries 4-5) ----
 //
 // A message queue is a broker whose own numbers are the type's (an append); what it adds is
 // `retention`, how long a message waits for its consumer groups before it is deleted unread, and
@@ -2543,7 +2543,7 @@ CheckResult read_message_queue_keys(const Site& site, const YAML::Node& body,
   });
 }
 
-// ---- Search index keys (plan 2c refinement 10) ----
+// ---- Search index keys (spec §19 entry 10) ----
 //
 // A search index (ch. 13's trie database) serves like a service, so its capacity, latency and
 // replicas are read as a service's; `build_interval` is the one key it owns.
@@ -2612,13 +2612,13 @@ CheckResult refused_worker_pool_keys(const Site& site, const YAML::Node& body) {
   return {};
 }
 
-// `consumes: transcode_q`, required (review of plan 2c Task 6, I-1): the queue whose messages the
-// pool drains, its only source of jobs. A pool without one would be a server any node could call,
-// waiting days in a 7-day room and never dropping, which is no worker pool of the book's designs
-// (graph::Graph::check_pool_senders refuses every other sender). The reference itself was checked
-// with the other node references (reference_keys); what it may name (a queue or a frontier that
-// links to the pool) is Graph::build's to check, which refuses a missing `consumes` in these words
-// too, since a scenario built in code skips the loader.
+// `consumes: transcode_q`, required: the queue whose messages the pool drains, its only source of
+// jobs. A pool without one would be a server any node could call, waiting days in a 7-day room and
+// never dropping, which is no worker pool of the book's designs (graph::Graph::check_pool_senders
+// refuses every other sender). The reference itself was checked with the other node references
+// (reference_keys); what it may name (a queue or a frontier that links to the pool) is
+// Graph::build's to check, which refuses a missing `consumes` in these words too, since a scenario
+// built in code skips the loader.
 CheckResult read_consumes(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   if (!body["consumes"]) return site.fail(body, "worker_pool needs consumes");
   node.consumes = scalar_text(body["consumes"]);
@@ -2634,7 +2634,7 @@ CheckResult read_worker_pool_keys(const Site& site, const YAML::Node& body, mode
       .and_then([&] { return refused_worker_pool_keys(this_node, body); });
 }
 
-// ---- External sink keys (plan 2c refinement 8) ----
+// ---- External sink keys (spec §19 entry 8) ----
 //
 // An external sink is a third party's API (book ch. 10's APNs, FCM, SMS and e-mail providers): a
 // queue of the type's numbers whose served requests fail a share `failure_rate`, and a
@@ -2677,7 +2677,7 @@ CheckResult read_external_sink_keys(const Site& site, const YAML::Node& body,
   });
 }
 
-// ---- Key-value cluster keys (plan 2c refinement 9; book ch. 6) ----
+// ---- Key-value cluster keys (spec §19 entry 9; book ch. 6) ----
 //
 // A kv_cluster is book ch. 6's Dynamo-style store: `nodes` machines on a consistent-hash ring of
 // `vnodes` virtual nodes each, every key on `replication` N of them, a write acknowledged by
@@ -3108,9 +3108,9 @@ CheckResult check_utilization_target(const Site& site, const YAML::Node& entry,
                    std::format("utilization needs a server node, '{}' is a client", node.id));
 }
 
-// A queue lag is a message queue's (plan 2c refinement 14): how far its slowest consumer group
-// trails it, read off the worker pools behind it, so on a service, a client or any other node the
-// SLO could never be observed. A frontier is accepted too: it is the web crawler's queue (ch. 9),
+// A queue lag is a message queue's (spec §19 entry 14): how far its slowest consumer group trails
+// it, read off the worker pools behind it, so on a service, a client or any other node the SLO
+// could never be observed. A frontier is accepted too: it is the web crawler's queue (ch. 9),
 // drained by worker pools as a message queue is, and simulated in phase 3 (until then its SLO is
 // skipped). Without `node` the SLO bounds every message queue of the run: the worst one decides.
 CheckResult check_queue_lag_target(const Site& site, const YAML::Node& entry,
@@ -3143,15 +3143,15 @@ CheckResult check_slo_shape(const Site& site, const YAML::Node& entry, const mod
   return check_op_is_for_latency(site, entry, slo);
 }
 
-// `over: 10m` (plan 2c Task 14): the SLO is checked on every window of that length after warmup,
-// and the worst window decides (report::Summary). A window must hold a whole number of steps, at
-// least one: the run moves a step at a time and a step belongs to the window its start falls in,
-// so a shorter window would observe nothing, and `over: 1500ms` at `step: 1s` would make windows
-// of two steps and one step in turn (the rule a windowed rate limiter's `window` follows,
+// `over: 10m`: the SLO is checked on every window of that length after warmup, and the worst window
+// decides (report::Summary). A window must hold a whole number of steps, at least one: the run
+// moves a step at a time and a step belongs to the window its start falls in, so a shorter window
+// would observe nothing, and `over: 1500ms` at `step: 1s` would make windows of two steps and one
+// step in turn (the rule a windowed rate limiter's `window` follows,
 // graph::window_off_the_step_grid). And at most the observed run, duration − warmup: a longer one
-// would hold the whole run as one window shorter than `over`, which the report would call a
-// window of `over` it never filled. (A run whose observed part is not a whole number of windows
-// still ends with a shorter window; that one is checked and labelled with its real length.)
+// would hold the whole run as one window shorter than `over`, which the report would call a window
+// of `over` it never filled. (A run whose observed part is not a whole number of windows still ends
+// with a shorter window; that one is checked and labelled with its real length.)
 CheckResult read_slo_over(const Site& site, const YAML::Node& entry, const model::Scenario& run,
                           std::optional<SimTime>& over) {
   if (!entry["over"]) return {};
@@ -3244,7 +3244,7 @@ std::expected<model::Scenario, ConfigError> validate(const std::string& file,
   return scenario;
 }
 
-// ---- Overrides (`simsys sweep`, plan 2c Task 15) ----
+// ---- Overrides (`simsys sweep`) ----
 // An override replaces one scalar of the parsed document before `validate` sees it, so the
 // replaced text meets the same checks as text written in the file. It addresses the scalar by
 // map keys only: a list entry has no name a path could say (`links.0` would depend on the order

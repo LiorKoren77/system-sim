@@ -155,7 +155,7 @@ TEST_CASE("lognormal_quantile survives means whose square underflows a double", 
   REQUIRE(q > 0.0);
 }
 
-// ---- Order statistics of exponentials (plan 2c Task 10; book ch. 6 quorum consensus) ----
+// ---- Order statistics of exponentials (book ch. 6 quorum consensus) ----
 //
 // A kv_cluster's coordinator sends a read to all N replicas and answers after the R-th reply
 // (the R-th FASTEST of N), a write after the W-th. If each replica's sojourn is exponential with
@@ -239,15 +239,15 @@ TEST_CASE("a quorum beyond the replicas or below one is a programmer error", "[q
   REQUIRE_THROWS_AS(exponential_order_statistic(0, 1, 0.001), std::invalid_argument);
 }
 
-// The moment pair the order statistics return is the project's TimeMoments, the same type
-// mmc_wait returns for a wait: a sojourn is a time like a wait, and the old name WaitMoments
-// read wrong at a quorum's reply (review of plan 2c Tasks 9-10, minor 10).
+// The moment pair the order statistics return is the project's TimeMoments, the same type mmc_wait
+// returns for a wait: a sojourn is a time like a wait, and the old name WaitMoments read wrong at a
+// quorum's reply.
 TEST_CASE("an order statistic and a wait share one moment pair, TimeMoments", "[queueing]") {
   STATIC_REQUIRE(std::is_same_v<decltype(exponential_order_statistic(3, 2, 0.001)), TimeMoments>);
   STATIC_REQUIRE(std::is_same_v<decltype(mmc_wait(1, 0.5, 0.001)), TimeMoments>);
 }
 
-// ---- The standard normal (review of plan 2c Tasks 9-10, I-2 and C-1) ----
+// ---- The standard normal ----
 //
 // Phi(z) = P(Z <= z) for a standard normal Z, and its inverse. Phi is erfc in disguise:
 // Phi(z) = erfc(-z / sqrt 2) / 2. The inverse has no closed form; the reference values below are
@@ -277,7 +277,7 @@ TEST_CASE("normal_quantile outside the open interval from 0 to 1 is a programmer
                     std::invalid_argument);
 }
 
-// ---- The expected maximum of M standard normals: the ring's hottest machine (I-2) ----
+// ---- The expected maximum of M standard normals: the ring's hottest machine ----
 //
 // A consistent-hash ring gives each of M machines a share of the keys that varies around the
 // average; the hottest machine is the MAXIMUM of M such shares, and the maximum of M standard
@@ -306,7 +306,7 @@ TEST_CASE("the expected maximum of no machines is a programmer error", "[queuein
   REQUIRE_THROWS_AS(expected_normal_maximum(0), std::invalid_argument);
 }
 
-// ---- The Poisson-binomial: how many of a quorum's replicas succeed (I-1, C-1) ----
+// ---- The Poisson-binomial: how many of a quorum's replicas succeed ----
 //
 // N independent trials, the ones of a group sharing one success probability: how likely are FEWER
 // than q successes? With one group it is the binomial, P(Bin(N, p) < q). A kv_cluster whose
@@ -339,7 +339,7 @@ TEST_CASE("a Poisson-binomial over two groups counts their successes together", 
   REQUIRE(probability_fewer_than(groups, 4) == 1.0);
 }
 
-// ---- A quorum's reply time by quadrature (C-1) ----
+// ---- A quorum's reply time by quadrature ----
 //
 // The k-th fastest of N replies, X, is later than t exactly when fewer than k replicas have
 // answered by t: P(X > t) = S_k(t), the Poisson-binomial above with each replica's success
@@ -367,11 +367,11 @@ TEST_CASE("the survival-function quadrature reproduces Renyi for exponential rep
 }
 
 // One replica is its own order statistic: the lognormal fitted to its moments, integrated back,
-// returns them. This is the quadrature's documented error bound (docs/study/numerics.md section
-// 7): below 1e-8 relative at every sojourn SCV from 1e-4 to 100 (measured: a few 1e-16, the
-// variance at SCV 1e-4 1.2e-11). Before the Poisson-binomial carried each replica's failure
-// Phi(-z) (review of the kv/search fix round, M-3) it held to SCV 10 only: 1 - Phi(z) lost the
-// slow tail's digits, 1.1e-7 on the variance at SCV 20 and 1.7e-6 at 50.
+// returns them. This is the quadrature's documented error bound (docs/study/numerics.md section 7):
+// below 1e-8 relative at every sojourn SCV from 1e-4 to 100 (measured: a few 1e-16, the variance at
+// SCV 1e-4 1.2e-11). Before the Poisson-binomial carried each replica's failure Phi(-z) it held to
+// SCV 10 only: 1 - Phi(z) lost the slow tail's digits, 1.1e-7 on the variance at SCV 20 and 1.7e-6
+// at 50.
 TEST_CASE("one lognormal replica's order statistic returns its own moments", "[queueing]") {
   for (const double scv : {1e-4, 0.01, 0.5, 1.0, 2.0, 10.0, 20.0, 50.0, 100.0}) {
     CAPTURE(scv);
@@ -443,7 +443,7 @@ TEST_CASE("a lognormal quorum beyond its replicas is a programmer error", "[queu
   REQUIRE_THROWS_AS(lognormal_order_statistic(two, 0), std::invalid_argument);
 }
 
-// ---- lognormal_below: a client's timeout cuts the slow tail (plan 2c Task 13) ----
+// ---- lognormal_below: a client's timeout cuts the slow tail ----
 //
 // A client that gives up after `limit` turns every response slower than that into an unanswered
 // request. With the response time fitted as a lognormal (the same fit the reports use), the share

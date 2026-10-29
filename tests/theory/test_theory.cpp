@@ -244,8 +244,8 @@ TEST_CASE("dropped flow does not propagate downstream", "[theory]") {
   REQUIRE(r.nodes[2].demand_per_s == Approx(1000).epsilon(1e-6));
 }
 
-// (The example used to be a kv_cluster; it is simulated since plan 2c Task 10, so the refusal is
-// shown on a ws_gateway, which waits for phase 3.)
+// (The example used to be a kv_cluster; it is simulated, so the refusal is shown on a ws_gateway,
+// which waits for phase 3.)
 TEST_CASE("a simulation refuses node types the phase does not support yet", "[theory]") {
   Scenario s = mm1(1);
   s.nodes[1].type = NodeType::ws_gateway;
@@ -749,12 +749,12 @@ TEST_CASE("least connections pools the replicas: one M/M/c queue with c = replic
   REQUIRE(a.latency.mean_s < round_robin.nodes[2].latency.mean_s);
 }
 
-// The ring's imbalance k, the hottest machine's load over the average (review of plan 2c Tasks
-// 9-10, I-2): each of M machines holds the keys of its v virtual nodes' arcs, N copies of each key
-// (N = 1 behind a balancer), so its share is a sum of N v arc lengths whose relative spread is
-// about 1/sqrt(N v) (book ch. 5: about 10 % at 100 virtual nodes). The hottest of M such shares
-// sits z_M standard deviations above the mean, z_M the expected maximum of M standard normals
-// (Blom: queueing::expected_normal_maximum, unit-tested against its own figures):
+// The ring's imbalance k, the hottest machine's load over the average: each of M machines holds the
+// keys of its v virtual nodes' arcs, N copies of each key (N = 1 behind a balancer), so its share
+// is a sum of N v arc lengths whose relative spread is about 1/sqrt(N v) (book ch. 5: about 10 % at
+// 100 virtual nodes). The hottest of M such shares sits z_M standard deviations above the mean, z_M
+// the expected maximum of M standard normals (Blom: queueing::expected_normal_maximum, unit-tested
+// against its own figures):
 //   k = min(1 + z_M / sqrt(N v), M / N)        (M / N: a machine holds at most every key once)
 // v = 100, M = 4: 1 + 1.0491 / 10 = 1.1049;  v = 150, M = 4: 1.0857;  v = 1, M = 4: 2.0491.
 namespace {
@@ -883,11 +883,11 @@ TEST_CASE("a load balancer in the chain costs its own service time and nothing e
                WithinRel(lb_sojourn, 1e-6));
 }
 
-// The rate limiter of ch. 4 turns excess requests away instead of queueing them. The client is
-// not told: the limiter's own queue is empty and it drops nothing; what it refuses is counted
-// in a separate channel (`rejected_per_s`), apart from the drops, and none of it is forwarded,
-// so the service behind sees the admitted rate only. The client's `answered` rate is what got
-// through: 1000 of the 4000 it offers (plan 2a refinement 8).
+// The rate limiter of ch. 4 turns excess requests away instead of queueing them. The client is not
+// told: the limiter's own queue is empty and it drops nothing; what it refuses is counted in a
+// separate channel (`rejected_per_s`), apart from the drops, and none of it is forwarded, so the
+// service behind sees the admitted rate only. The client's `answered` rate is what got through:
+// 1000 of the 4000 it offers (spec §17 entry 8).
 TEST_CASE("rejected requests are counted at the limiter and never reach the service", "[theory]") {
   const auto g = *Graph::build(limited(LimiterAlgorithm::token_bucket, 1000, 100, 4000));
   auto sim = *Simulation::create(g);
@@ -951,10 +951,10 @@ TEST_CASE("a leaky bucket's wait below the limit is M/D/1", "[theory]") {
 // A leaky bucket is one deterministic slot leaking a request every 1/limit with a room of `burst`
 // (graph::leaky_bucket_capacity), so a request it admits finds at most `burst` ahead of it and
 // waits at most burst / limit: 20 / 1000/s = 20 ms (the room-drain bound, exact for a drain this
-// regular; review of plan 2c Task 3's second fix round, M-2). Erlang C knows no room: at 990/s
-// its M/D/1 wait is (1 + 0) / 2 x 0.99 / 0.01 x 1 ms = 49.5 ms, so there the bound is what the
-// wait is. At every load, below the limit, at it and above it (where the fluid backlog fills the
-// room and its drain time is the bound itself), the mean wait never passes 20 ms.
+// regular). Erlang C knows no room: at 990/s its M/D/1 wait is (1 + 0) / 2 x 0.99 / 0.01 x 1 ms =
+// 49.5 ms, so there the bound is what the wait is. At every load, below the limit, at it and above
+// it (where the fluid backlog fills the room and its drain time is the bound itself), the mean wait
+// never passes 20 ms.
 TEST_CASE("a leaky bucket's mean wait never exceeds burst over limit, at any load", "[theory]") {
   constexpr double bound_s = 20.0 / 1000.0;  // burst / limit
   constexpr double leak_s = 0.001;           // the slot's service time, 1 / limit
@@ -997,10 +997,10 @@ TEST_CASE("a limiter's reject rate counts its refusals; the nodes it protects dr
   REQUIRE(summary.worst_drop_node().empty());
 }
 
-// The client's latency summary averages over the requests ANSWERED (plan 2a refinement 8): a
-// rejected request never sees the api's queue, so it must not weigh the api's latency. Here
-// the counter check makes every answered request pay the counter store's hop, and the
-// client's `answered` rate is the admitted 1000/s; the 3000/s refused are not in it.
+// The client's latency summary averages over the requests ANSWERED (spec §17 entry 8): a rejected
+// request never sees the api's queue, so it must not weigh the api's latency. Here the counter
+// check makes every answered request pay the counter store's hop, and the client's `answered` rate
+// is the admitted 1000/s; the 3000/s refused are not in it.
 TEST_CASE(
     "the counter store sees every request a limiter checks; the client is answered only the "
     "admitted",
@@ -1272,15 +1272,15 @@ TEST_CASE("url-shortener's url_cache resolves to a che hit ratio and the simulat
 }
 
 // The consistent-hashing lab (zipf 0.9 over 10M keys, four 2M-key cache servers behind a ring).
-// With perfectly even arcs the four would act as one 8M-key cache: 0.962834 by the dense
-// reference. With the lab's `vnodes: 1` the hottest server owns k/4 = 0.512283 of the keys
-// (k = 1 + z_4/sqrt(1) = 2.049131, ring_factor) and the three others 0.162572 each, so the hot
-// server is a 2M / 0.512283 = 3.904093M-key cache over the whole space and the cool ones hold
-// their every key: h = 0.512283 × 0.844457 + 0.487717 × 1 = 0.920318.
-// Provenance of 0.962834 and 0.844457: Che's equation solved by 100 bisection steps over all 10M
-// ranks one at a time, in double precision and with no buckets (the method of test_caching.cpp's
-// dense_che_hit_ratio, run outside the suite: 10M ranks x 100 steps take seconds), recomputed
-// 2026-10-29 for the review of plan 2c Tasks 9-10, I-2 (0.848235 at the old k = 2, 4M keys).
+// With perfectly even arcs the four would act as one 8M-key cache: 0.962834 by the dense reference.
+// With the lab's `vnodes: 1` the hottest server owns k/4 = 0.512283 of the keys (k = 1 +
+// z_4/sqrt(1) = 2.049131, ring_factor) and the three others 0.162572 each, so the hot server is a
+// 2M / 0.512283 = 3.904093M-key cache over the whole space and the cool ones hold their every key:
+// h = 0.512283 × 0.844457 + 0.487717 × 1 = 0.920318. Provenance of 0.962834 and 0.844457: Che's
+// equation solved by 100 bisection steps over all 10M ranks one at a time, in double precision and
+// with no buckets (the method of test_caching.cpp's dense_che_hit_ratio, run outside the suite: 10M
+// ranks x 100 steps take seconds), recomputed 2026-10-29 for the ring heuristic of numerics §8
+// (0.848235 at the old k = 2, 4M keys).
 TEST_CASE("the consistent-hashing lab's cache hits 0.963 on even arcs and 0.920 on one vnode",
           "[theory]") {
   REQUIRE_THAT(simsys::caching::che_hit_ratio(8e6, simsys::caching::Popularity::zipf(0.9, 10e6)),
@@ -1310,7 +1310,7 @@ TEST_CASE("the consistent-hashing lab's cache hits 0.963 on even arcs and 0.920 
   REQUIRE_THAT(*g->hit_ratio(*g->index_of("cache")), WithinAbs(0.920318, 1e-5));
 }
 
-// ---- SQL database: a primary and read replicas (plan 2b refinement 3, book ch. 1) ----
+// ---- SQL database: a primary and read replicas (spec §18 entry 6, book ch. 1) ----
 
 namespace {
 // u(reads + writes per second) -> db, a SQL database of `replicas` copies (one primary plus
@@ -1428,11 +1428,11 @@ TEST_CASE("staleness is the replication lag plus the write's sojourn at the prim
   }
 }
 
-// The two queues a write crosses on its way to a reader both count, with their waits (review of
-// 48d4d0b, C1). 3 copies, 200 reads/s and 800 writes/s: the primary runs at 800 / 1000 = 0.8,
-// so a write waits rho / (1 − rho) × s = 4 ms there (M/M/1), four times its 1 ms service; each
-// replica applies the 800 writes plus its 100 reads, rho 0.9, and waits 9 ms. Staleness =
-// 50 ms lag + (4 + 1) ms at the primary + (9 + 1) ms at the replica = 65 ms.
+// The two queues a write crosses on its way to a reader both count, with their waits. 3 copies, 200
+// reads/s and 800 writes/s: the primary runs at 800 / 1000 = 0.8, so a write waits rho / (1 − rho)
+// × s = 4 ms there (M/M/1), four times its 1 ms service; each replica applies the 800 writes plus
+// its 100 reads, rho 0.9, and waits 9 ms. Staleness = 50 ms lag + (4 + 1) ms at the primary + (9 +
+// 1) ms at the replica = 65 ms.
 TEST_CASE("staleness counts the wait in the primary's write queue and the replica's sojourn",
           "[theory]") {
   const auto r =
@@ -1446,13 +1446,13 @@ TEST_CASE("staleness counts the wait in the primary's write queue and the replic
   REQUIRE_THAT(*r.nodes[1].staleness_s, WithinRel(0.065, 1e-9));
 }
 
-// A replica replays the primary's log, and the log holds only the writes the primary COMMITTED
-// (review of 48d4d0b, C2): what the primary dropped never reaches a replica. 2 copies, 100
-// reads/s + 1500 writes/s, 1000/s per copy, settled (estimate: both queues full). The primary
-// drains 1000 writes/s and drops 500. The replica is sent its 100 reads + the 1000 committed
-// writes = 1100/s against 1000/s: it drops 100/s in its queue's mix, 100 × 100/1100 reads (the
-// clients' part, in the node's drops) and 100 × 1000/1100 replicated writes (reported apart,
-// `replication_dropped_per_s`). Every write costs 1 here (the fixture), so units are requests.
+// A replica replays the primary's log, and the log holds only the writes the primary COMMITTED:
+// what the primary dropped never reaches a replica. 2 copies, 100 reads/s + 1500 writes/s, 1000/s
+// per copy, settled (estimate: both queues full). The primary drains 1000 writes/s and drops 500.
+// The replica is sent its 100 reads + the 1000 committed writes = 1100/s against 1000/s: it drops
+// 100/s in its queue's mix, 100 × 100/1100 reads (the clients' part, in the node's drops) and 100 ×
+// 1000/1100 replicated writes (reported apart, `replication_dropped_per_s`). Every write costs 1
+// here (the fixture), so units are requests.
 TEST_CASE("replicas replay only the writes the primary committed", "[theory]") {
   const auto r =
       (*Simulation::create(*Graph::build(sql_front(2, std::nullopt, 100, 1500)))).estimate();
@@ -1464,13 +1464,12 @@ TEST_CASE("replicas replay only the writes the primary committed", "[theory]") {
   REQUIRE_THAT(r.nodes[1].committed_writes_per_s.value_or(-1.0), WithinRel(1000.0, 1e-6));
 }
 
-// The balance demand·dt = (drain + dropped)·dt + Δbacklog holds for the CLIENTS' queries even
-// while a replica is overloaded by replication (review of 48d4d0b, I4). 2 copies, 800 reads/s +
-// 400 writes/s: the primary commits all 400 writes (rho 0.4); the replica is sent 800 + 400 =
-// 1200/s against 1000/s, its queue grows by 20 a step and is full (1000) from step 50 on. Its
-// content keeps the arrival mix, 800 : 400, so the backlog the node shows is the clients' two
-// thirds of the full queue, 1000 × 800/1200 = 666.7, below queue_limit while it already drops;
-// the replicated third of the drops is reported apart.
+// The balance demand·dt = (drain + dropped)·dt + Δbacklog holds for the CLIENTS' queries even while
+// a replica is overloaded by replication. 2 copies, 800 reads/s + 400 writes/s: the primary commits
+// all 400 writes (rho 0.4); the replica is sent 800 + 400 = 1200/s against 1000/s, its queue grows
+// by 20 a step and is full (1000) from step 50 on. Its content keeps the arrival mix, 800 : 400, so
+// the backlog the node shows is the clients' two thirds of the full queue, 1000 × 800/1200 = 666.7,
+// below queue_limit while it already drops; the replicated third of the drops is reported apart.
 TEST_CASE("a database's client totals balance while a replica drops replicated writes",
           "[theory]") {
   auto sim = *Simulation::create(*Graph::build(sql_front(2, std::nullopt, 800, 400)));
@@ -1512,14 +1511,14 @@ TEST_CASE("only a database reports replication drops", "[theory]") {
   }
 }
 
-// The replication drops are ONE replica's, beside the writes ONE replica must replay (re-review
-// of 96848f0): summed over the replicas they could exceed the writes committed, which reads as
-// nonsense ("2131/s dropped of 900/s"). 3 copies × 2 shards, 3200 reads/s + 600 writes/s, 1000/s
-// per copy, settled. Each shard's primary is sent 600 / 2 = 300 writes/s (rho 0.3) and commits
-// them all: committed per shard = 300/s. Each of the (3 − 1) × 2 = 4 replicas is sent
-// 3200 / 4 = 800 reads + its shard's 300 committed writes = 1100/s against 1000/s, so it drops
-// 100/s in its queue's mix, 100 × 300/1100 = 27.27/s of them replicated writes. That is the
-// per-replica figure; the four replicas together drop 4 × 27.27 = 109.1/s, which is not reported.
+// The replication drops are ONE replica's, beside the writes ONE replica must replay: summed over
+// the replicas they could exceed the writes committed, which reads as nonsense ("2131/s dropped of
+// 900/s"). 3 copies × 2 shards, 3200 reads/s + 600 writes/s, 1000/s per copy, settled. Each shard's
+// primary is sent 600 / 2 = 300 writes/s (rho 0.3) and commits them all: committed per shard =
+// 300/s. Each of the (3 − 1) × 2 = 4 replicas is sent 3200 / 4 = 800 reads + its shard's 300
+// committed writes = 1100/s against 1000/s, so it drops 100/s in its queue's mix, 100 × 300/1100 =
+// 27.27/s of them replicated writes. That is the per-replica figure; the four replicas together
+// drop 4 × 27.27 = 109.1/s, which is not reported.
 TEST_CASE("replication drops are one replica's, beside the committed writes per shard",
           "[theory]") {
   const auto r = (*Simulation::create(*Graph::build(sql_front(3, 2, 3200, 600)))).estimate();
@@ -1547,8 +1546,8 @@ TEST_CASE("a pool below Little's law's concurrency is each queue's c and bounds 
 }
 
 // A pool at or above the concurrency Little's law implies changes nothing: the disk, not the
-// connections, is the limit (review of 48d4d0b, C3). 1000/s × 1 ms implies one query in service;
-// `pool: 4` leaves the replicas at M/M/1, rho 0.5, as with no pool at all.
+// connections, is the limit. 1000/s × 1 ms implies one query in service; `pool: 4` leaves the
+// replicas at M/M/1, rho 0.5, as with no pool at all.
 TEST_CASE("a pool above the concurrency Little's law implies changes nothing", "[theory]") {
   const auto r =
       (*Simulation::create(*Graph::build(sql_front(3, std::nullopt, 1000, 0, 4)))).step(0s, 100ms);
@@ -1589,7 +1588,7 @@ TEST_CASE("a write costs five units on a database by default", "[theory]") {
   }
 }
 
-// ---- Request-based CDN (plan 2b refinement 4, Task 5) ----
+// ---- Request-based CDN (spec §18 entry 10) ----
 //
 // Book ch. 1: a CDN is a cache at the network's edge. Here it is a read-only cache in front of
 // an origin: it answers the share h of the reads itself and sends the misses, as the same op, to
@@ -1681,7 +1680,7 @@ TEST_CASE("a che cdn without a keys size builds but the engine refuses to run it
           "node 'cdn': hit_ratio che needs keys (the cdn's size in objects)");
 }
 
-// ---- Byte-sized nodes count megabytes (plan 2c refinement 2, Task 3 and its review) ----
+// ---- Byte-sized nodes count megabytes (spec §19 entry 2) ----
 //
 // Spec section 6: a blob store does 500 MB/s and a CDN's per-MB transfer takes 10 ms; the book's
 // latency table gives a megabyte 30 ms from disk and 10 ms over the network. A node whose
@@ -1689,26 +1688,24 @@ TEST_CASE("a che cdn without a keys size builds but the engine refuses to run it
 // of op o costs request_bytes(o) / 1e6 units, and its service time s_MB is the time of ONE
 // megabyte, so the implied concurrency is Little's law again, c = units/s x s_MB.
 //
-// The queue waits for whole OBJECTS (review of Task 3 at a8b6cb4, I1): each request is a batch of
-// megabytes that holds one of the c slots for its whole transfer, size x s_MB, so Erlang C is fed
-// the rate-weighted mean object service time
+// The queue waits for whole OBJECTS: each request is a batch of megabytes that holds one of the c
+// slots for its whole transfer, size x s_MB, so Erlang C is fed the rate-weighted mean object
+// service time
 //   s_obj = sum_o (rate_o x MB_o x s_MB) / sum_o rate_o
 // with the same c. rho is unchanged (Little's law: objects/s x s_obj / c = MB/s / capacity), only
-// the wait is a whole object's. A request is then answered (I2):
+// the wait is a whole object's. A request is then answered:
 //   a write (an op in the store's write_ops)  at its LAST byte:  Wq + MB_o x s_MB
 //   a read or a stream                         at its FIRST MB:   Wq + s_MB
 // and a request under 1 MB still takes one megabyte's time either way (the small-object bound).
 //
-// The second fix round (review at 0248a47): a transfer of a fixed size at a fixed rate takes a
-// fixed time, so each object's own service is deterministic (SCV 0) and the spread of the service
-// times is the size mix's alone (I2). The queue's Allen-Cunneen factor is (c_a^2 + c_s^2) / 2 with
-// c_s^2 the mixture's SCV (I1):
+// A transfer of a fixed size at a fixed rate takes a fixed time, so each object's own service is
+// deterministic (SCV 0) and the spread of the service times is the size mix's alone. The queue's
+// Allen-Cunneen factor is (c_a^2 + c_s^2) / 2 with c_s^2 the mixture's SCV:
 //   E[S]   = sum_o p_o s_o,   E[S^2] = sum_o p_o (1 + cs_o^2) s_o^2   (p_o = rate_o / sum rate)
 //   c_s^2  = E[S^2] / E[S]^2 - 1
 // so a single size with Poisson arrivals waits (1 + 0) / 2 = HALF the M/M/c wait (M/D/c), and the
 // answer adds no variance of its own: the response's variance is the wait's. And the stochastic
-// wait is bounded by the room (C1): never longer than queue_limit / capacity, the room-drain
-// bound.
+// wait is bounded by the room: never longer than queue_limit / capacity, the room-drain bound.
 
 namespace {
 // u (`rate`/s of `op`, each `size` long) -> store, a zero-latency link, so the client's response
@@ -1817,15 +1814,14 @@ TEST_CASE("a 300 MB upload is answered at its last byte, 12 s after its wait", "
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(12.0181, 1e-4));
 }
 
-// The same upload's spread (second fix round, I2): the 12 s transfer is deterministic, so the
-// response's variance is the wait's alone, (1/2)^2 x Var(Wq of M/M/c) (the Allen-Cunneen factor
-// applied to the variance, the engine's heuristic) = 0.25 x P (2 - P) theta^2 with P = 0.024134
-// and theta = 12 s / (20 x 0.4) = 1.5 s: 0.026824 s^2, a standard deviation of 0.16 s. The
-// lognormal fit then puts the p99 at 12.40 s and the p1 at 11.64 s (below the 12 s no upload can
-// beat: an artefact of the fit, whose left tail knows no floor): every upload takes more than
-// 10 s, so youtube's `timeout: 10s` (plan Task 13) would time out all of them, not the ~42 % an
-// exponential transfer (CV 1: variance 144 s^2 more, a p99 of 58.9 s) suggested. Task 16 sizes that
-// timeout per the book (resumable uploads).
+// The same upload's spread: the 12 s transfer is deterministic, so the response's variance is the
+// wait's alone, (1/2)^2 x Var(Wq of M/M/c) (the Allen-Cunneen factor applied to the variance, the
+// engine's heuristic) = 0.25 x P (2 - P) theta^2 with P = 0.024134 and theta = 12 s / (20 x 0.4) =
+// 1.5 s: 0.026824 s^2, a standard deviation of 0.16 s. The lognormal fit then puts the p99 at 12.40
+// s and the p1 at 11.64 s (below the 12 s no upload can beat: an artefact of the fit, whose left
+// tail knows no floor): every upload takes more than 10 s, so youtube's `timeout: 10s` would time
+// out all of them, not the ~42 % an exponential transfer (CV 1: variance 144 s^2 more, a p99 of
+// 58.9 s) suggested. The shipped scenario sizes that timeout per the book (resumable uploads).
 TEST_CASE("a 300 MB upload's p99 is 12.4 s and its p1 is above 10 s: the transfer is deterministic",
           "[theory]") {
   const auto g =
@@ -1940,8 +1936,8 @@ TEST_CASE("an overloaded blob store answers the same share of large and small re
                WithinRel((writes.response.mean_s + reads.response.mean_s) / 2.0, 1e-9));
 }
 
-// ---- The second fix round of Task 3 (review at 0248a47): the room bounds the wait (C1), the size
-// mix's spread enters Kingman (I1) ----
+// ---- The room bounds the wait, the size
+// mix's spread enters Kingman ----
 
 namespace {
 // The last step of `steps` 100 ms steps of a fresh simulation of `g`.
@@ -1954,12 +1950,12 @@ simsys::engine::StepRecord step_until(const Graph& g, int steps) {
 }
 }  // namespace
 
-// 12 writes/s of 50 MB are 600 MB/s against a default store's 500: past saturation. Erlang C at
-// the 0.99 clamp with 2 s objects would add C(20, 0.99) x 2 s / (20 x 0.01) x 1/2 = 4.74 s (9.48 s
-// with exponential service, what the first fix round reported: an 11.48 s response). But the
-// store's waiting room holds 1000 MB and drains at 500 MB/s, so nobody admitted waits more than
-// 1000 / 500 = 2 s (the room-drain bound); the full room's fluid wait is exactly that. A write is
-// then answered at its last byte, 2 s later: 4 s. The excess, 100 MB/s, is dropped.
+// 12 writes/s of 50 MB are 600 MB/s against a default store's 500: past saturation. Erlang C at the
+// 0.99 clamp with 2 s objects would add C(20, 0.99) x 2 s / (20 x 0.01) x 1/2 = 4.74 s (9.48 s with
+// exponential service, what an earlier version reported: an 11.48 s response). But the store's
+// waiting room holds 1000 MB and drains at 500 MB/s, so nobody admitted waits more than 1000 / 500
+// = 2 s (the room-drain bound); the full room's fluid wait is exactly that. A write is then
+// answered at its last byte, 2 s later: 4 s. The excess, 100 MB/s, is dropped.
 TEST_CASE("twelve 50 MB writes per second wait at most the 2 s their room drains in: about 4 s",
           "[theory]") {
   const auto g = *Graph::build(blob_store_chain("write", 12, simsys::Bytes{50e6}));
@@ -1971,15 +1967,18 @@ TEST_CASE("twelve 50 MB writes per second wait at most the 2 s their room drains
   REQUIRE_THAT(last.responses[0].response.mean_s, WithinRel(4.0, 1e-9));
 }
 
-// What the room-drain bound does NOT bound: the estimated percentiles (review of plan 2c Task 3's
-// second fix round, I-1). The same twelve 50 MB writes per second over a run: every admitted write
-// waits at most the room's 2 s and is answered 2 s after it, so none takes longer than 4 s. The
-// report's percentiles are a lognormal fitted to the mean (4 s) and the variance (the wait's,
-// capped at the room's scale, T^2 / 4 = 1 s^2), and a lognormal has no upper bound: its p99 is
-// 6.88 s. A characterisation test: it pins what the model reports today, beyond the hard bound,
-// for the comprehensive 2c review ("percentiles respect a hard bound") to change on purpose.
-TEST_CASE("a saturated blob store's estimated p99 is 6.88 s, beyond its 4 s hard bound",
-          "[theory]") {
+// What the room-drain bound does NOT bound: the estimated percentiles. The same twelve 50 MB
+// writes per second over a run: every admitted write waits at most the room's 2 s and is answered
+// 2 s after it, so none takes longer than 4 s. The report's percentiles are a lognormal fitted to
+// the mean (4 s) and the variance (the wait's, capped at the room's scale, T^2 / 4 = 1 s^2), and a
+// lognormal has no upper bound: its p99 is 6.88 s. The decision this pins: percentiles are
+// labelled `(estimated)`, not truncated at a bound, since only a path whose every hop is
+// deterministic has a finite slowest request (docs/scenario-schema.md, "How percentiles are
+// estimated, and where they mislead").
+TEST_CASE(
+    "a saturated blob store's percentiles are labelled, not truncated: its estimated p99 is "
+    "6.88 s past a 4 s bound",
+    "[theory]") {
   Scenario s = blob_store_chain("write", 12, simsys::Bytes{50e6});
   s.duration = 60s;
   const auto g = *Graph::build(s);
@@ -1997,7 +1996,7 @@ TEST_CASE("a saturated blob store's estimated p99 is 6.88 s, beyond its 4 s hard
 // default store (720 MB/s against 500) for 20 s and then stop. From then on nothing arrives, and
 // the store's latency is what a read arriving now would see: the wait plus one megabyte (40 ms).
 // While the full room drains (1000 MB at 500 MB/s, 2 s), the wait is bounded by the room's drain
-// time, 2 s, where the first fix round held it at the clamp's 5.7 s; once the room is empty nothing
+// time, 2 s, where an earlier version held it at the clamp's 5.7 s; once the room is empty nothing
 // waits and the latency is the 40 ms of one megabyte. It never rises on the way down.
 TEST_CASE(
     "after an overload stops a blob store's latency falls to one megabyte's time, never "
@@ -2026,15 +2025,14 @@ TEST_CASE(
   REQUIRE_THAT(latency, WithinAbs(0.040, 1e-9));
 }
 
-// A ramp down (comprehensive 2c review, 5b; the review of Task 3's second fix round, I-3): twelve
-// 50 MB writes a second (600 MB/s) fill a default store's 1000 MB room for 20 s, then the load
-// falls to four (200 MB/s). The room drains at 500 − 200 = 300 MB/s, 30 MB a step: empty after
-// 3.3 seconds. Every server stays busy meanwhile (drain 500 MB/s, rho 1), but the new writes arrive
-// at rho 200 / 500 = 0.4, where Erlang C(20, 0.4) adds about 20 us: the stochastic wait reads the
-// arrivals' utilization, min(demand, drain) / capacity. So the wait is the backlog's own drain
-// time, backlog / 500 MB/s, and a write's latency, that wait plus its 2 s transfer, falls with the
-// backlog: 3.94 s at 970 MB, 2.02 s at 10 MB. Read at the busy rho 1 it held at the room's 2 s
-// drain time, 4 s, until the room was empty.
+// A ramp down: twelve 50 MB writes a second (600 MB/s) fill a default store's 1000 MB room for 20
+// s, then the load falls to four (200 MB/s). The room drains at 500 − 200 = 300 MB/s, 30 MB a step:
+// empty after 3.3 seconds. Every server stays busy meanwhile (drain 500 MB/s, rho 1), but the new
+// writes arrive at rho 200 / 500 = 0.4, where Erlang C(20, 0.4) adds about 20 us: the stochastic
+// wait reads the arrivals' utilization, min(demand, drain) / capacity. So the wait is the backlog's
+// own drain time, backlog / 500 MB/s, and a write's latency, that wait plus its 2 s transfer, falls
+// with the backlog: 3.94 s at 970 MB, 2.02 s at 10 MB. Read at the busy rho 1 it held at the room's
+// 2 s drain time, 4 s, until the room was empty.
 TEST_CASE("after a ramp down a blob store's latency falls with its backlog, 3.94 s to 2.02 s",
           "[theory]") {
   Scenario s = blob_store_chain("write", 12, simsys::Bytes{50e6});
@@ -2080,13 +2078,13 @@ double write_wait(const Graph& g) {
 }
 }  // namespace
 
-// The size mix's spread (second fix round, I1). The writes alone, 7.9632/s of 50 MB, are rho
-// 0.79632 of a default store and, every one holding a slot the same 2 s (c_s^2 = 0, M/D/c), wait
+// The size mix's spread. The writes alone, 7.9632/s of 50 MB, are rho 0.79632 of a default store
+// and, every one holding a slot the same 2 s (c_s^2 = 0, M/D/c), wait
 //   (1 + 0) / 2 x C(20, 0.79632) x 2 s / (20 x 0.20368) = 60.9 ms.
 // Add 1000 reads/s of 2 KB (80 us of a slot each): rho rises to 0.80032. A mean object time alone
-// (E[S] = 0.9921 x 80 us + 0.0079 x 2 s = 15.88 ms) would cut the writes' wait to 1.02 ms (what the
-// first fix round did: the reads look like they make the store faster). The mixture's SCV says
-// how spread those times are:
+// (E[S] = 0.9921 x 80 us + 0.0079 x 2 s = 15.88 ms) would cut the writes' wait to 1.02 ms (what an
+// earlier version did: the reads look like they make the store faster). The mixture's SCV says how
+// spread those times are:
 //   E[S^2] = 0.9921 x (80 us)^2 + 0.0079 x (2 s)^2 = 0.0316 s^2   (per-object c_s^2 = 0)
 //   c_s^2  = E[S^2] / E[S]^2 - 1 = 0.0316 / 0.01588^2 - 1 = 124.3
 //   Wq     = (1 + 124.3) / 2 x C(20, 0.80032) x 15.88 ms / (20 x 0.19968) = 62.66 x 1.021 ms
@@ -2142,11 +2140,11 @@ Scenario byte_cdn_chain(double streams, simsys::ByteRate bytes) {
 }
 }  // namespace
 
-// A CDN sized in bytes per second (`capacity: 100GB/s`) is a byte-sized node (plan 2c refinement
-// 2): it counts megabytes, every op that reaches it has a size (Graph::request_bytes), and the
-// engine runs it. The numbers it runs on are pinned by the byte-sized tests below. Only the che
-// hit ratio without `keys` (next test) still keeps a CDN from running. The node is called cdn_us
-// as in book/youtube; its streams are sized as there.
+// A CDN sized in bytes per second (`capacity: 100GB/s`) is a byte-sized node (spec §19 entry 2): it
+// counts megabytes, every op that reaches it has a size (Graph::request_bytes), and the engine runs
+// it. The numbers it runs on are pinned by the byte-sized tests below. Only the che hit ratio
+// without `keys` (next test) still keeps a CDN from running. The node is called cdn_us as in
+// book/youtube; its streams are sized as there.
 TEST_CASE("a cdn with a byte capacity builds and the engine runs it", "[theory]") {
   const auto g = Graph::build(byte_cdn_chain(1000, simsys::ByteRate{100e9}));
   INFO((g ? "" : g.error().message));
@@ -2205,7 +2203,7 @@ TEST_CASE("a 100 GB per second cdn saturates at 2k streams of 50 MB per second",
 
 namespace {
 // u -> store (a blob store, 50 MB uploads at 1/s) -> svc, with the store's `then` step notifying
-// svc: the shape Task 4 turns into an asynchronous event. Node indices: u 0, store 1, svc 2.
+// svc: the shape a blob store's events make asynchronous. Node indices: u 0, store 1, svc 2.
 Scenario blob_store_with_event() {
   auto s = blob_store_chain("upload", 1, simsys::Bytes{50e6},
                             NodeSpec{.id = "store",
@@ -2236,7 +2234,7 @@ TEST_CASE("Simulation::create accepts a blob store whose writes notify through t
   REQUIRE(sim.has_value());
 }
 
-// ---- A blob store's then steps are asynchronous event notifications (plan 2c refinements 6-7)
+// ---- A blob store's then steps are asynchronous event notifications (spec §19 entries 6-7)
 // ----
 //
 // S3 event notifications (book ch. 14: "transcoding starts when the upload completes"): for every
@@ -2340,10 +2338,10 @@ TEST_CASE("a write-listed upload notifies and is answered at its last byte, svc 
   REQUIRE_THAT(r.nodes[*g.index_of("svc")].demand_per_s, WithinRel(2.0, 1e-12));
 }
 
-// The reviewer's probe of Task 4 (I1): 1000 viewers/s read 1 MB videos from the store and one
-// uploader/s writes a 100 MB one; the store's `then` asks a transcoder for one job per event. The
-// transcoder must see 1 job/s, the uploads, not 1001/s: S3 notifies on ObjectCreated, never on a
-// GET. (With reads included, the transcoder of 10 jobs/s was offered 1001/s, 100x its capacity.)
+// A reviewer's probe: 1000 viewers/s read 1 MB videos from the store and one uploader/s writes a
+// 100 MB one; the store's `then` asks a transcoder for one job per event. The transcoder must see 1
+// job/s, the uploads, not 1001/s: S3 notifies on ObjectCreated, never on a GET. (With reads
+// included, the transcoder of 10 jobs/s was offered 1001/s, 100x its capacity.)
 TEST_CASE("1000 reads/s and 1 upload/s at a blob store send its transcoder 1 job/s", "[theory]") {
   Scenario s{.name = "views-and-uploads", .version = 1, .duration = 10s};
   s.nodes = {
@@ -2413,9 +2411,9 @@ TEST_CASE("a notification's factor multiplies the notifications sent: 4 per uplo
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(4.000544, 1e-6));
 }
 
-// The size walk (plan 2c refinement 1) is how the graph resolves it, and the engine must accept
-// all three shapes: a step that keeps the op name carries the upload's 100 MB (1e8 B), a renamed
-// step is unsized unless it states `size:`. svc counts requests, so it takes an unsized notify.
+// The size walk (spec §19 entry 1) is how the graph resolves it, and the engine must accept all
+// three shapes: a step that keeps the op name carries the upload's 100 MB (1e8 B), a renamed step
+// is unsized unless it states `size:`. svc counts requests, so it takes an unsized notify.
 TEST_CASE(
     "a notification carries the upload's size when the op keeps its name and none when "
     "renamed",
@@ -2478,7 +2476,7 @@ TEST_CASE("estimate and run agree on a blob store with a notification", "[theory
                WithinRel(e.responses[0].answered.per_second, 1e-9));
 }
 
-// ---- ID generator as service sugar (plan 2b refinement 6; book ch. 7) ----
+// ---- ID generator as service sugar (spec §18 entry 12; book ch. 7) ----
 //
 // An id_generator runs exactly as a service whose capacity and service time the algorithm
 // supplies (Graph::build). So the numbers below are a service's: the fluid drain, and the M/M/c
@@ -2594,7 +2592,7 @@ TEST_CASE("a ticket server with the algorithm's default capacity saturates at 1k
   REQUIRE_THAT(e.nodes[*g.index_of("ids")].dropped_per_s, WithinRel(500.0, 1e-6));
 }
 
-// ---- A link's bandwidth is a pipe that queues and drops megabytes (plan 2c refinement 3, Task 5)
+// ---- A link's bandwidth is a pipe that queues and drops megabytes (spec §19 entry 3)
 // ----
 //
 // A link that states `bandwidth` is a pipe (spec section 3.4: it "caps bytes/s and queues the
@@ -2606,8 +2604,8 @@ TEST_CASE("a ticket server with the algorithm's default capacity saturates at 1k
 // direction it is sent, whichever way its bytes really travel, and a reply adds no bytes (so an
 // `inout` link is one pipe, and `a->b` and `b->a` with a bandwidth each are two).
 //
-// What a hop over the pipe adds to the round trip, once (review of Task 5, I-2): the pipe's WAIT
-// plus the request's answer time on the wire, by refinement 2's rule for the node behind it:
+// What a hop over the pipe adds to the round trip, once: the pipe's WAIT plus the request's answer
+// time on the wire, by spec §19 entry 2's rule for the node behind it:
 //  - a WRITE (an op in the receiver's write_ops; a service's is `write`) its WHOLE serialisation,
 //    size x 1 MB / bandwidth: the receiver acts after the last byte;
 //  - any other op its FIRST megabyte, min(size, 1 MB) x 1 MB / bandwidth: the rest streams in
@@ -2749,10 +2747,9 @@ TEST_CASE("a 10 MB write waits 160 ms and is serialised whole for 80 ms: a 240 m
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(0.0005 + 0.240 + b_sojourn, 1e-9));
 }
 
-// Whether a hop pays a request whole on the wire is decided per (link, op) at build (review of
-// plan 2c Task 6, I-2): an op is a write on a link if a node it reaches under its own name lists it
-// in `write_ops`, the receiver or any node behind it. A 10 MB `upload` at 5/s over 1 Gbit/s into a
-// blob store that lists `upload`:
+// Whether a hop pays a request whole on the wire is decided per (link, op) at build: an op is a
+// write on a link if a node it reaches under its own name lists it in `write_ops`, the receiver or
+// any node behind it. A 10 MB `upload` at 5/s over 1 Gbit/s into a blob store that lists `upload`:
 //   rho = 5 x 10 MB / 125 MB/s = 0.4;  s_obj = 10 x 8 ms = 80 ms
 //   Wq (M/D/1) = 0.5 x 0.4 / 0.6 x 80 ms = 26.67 ms;  a write's answer: the whole 80 ms
 //   pipe = 106.67 ms, whether the link ends at the store or at a load balancer in front of it.
@@ -2792,14 +2789,14 @@ TEST_CASE("a 10 MB upload behind a load balancer pays the wire as a write, as st
                WithinRel(only_link(straight).latency.mean_s, 1e-12));
 }
 
-// A renamed step that states its own `size:` forwards a payload (review of plan 2c Task 7, I-2):
-// the service had the client's whole body before it sent it on, so when the store behind it
-// writes the renamed op, the client's hop into the service is a write on the wire as well. 10 MB
-// `upload`s at 5/s over 1 Gbit/s into a service whose step is `{to: store, op: put, size: 10MB}`,
-// in front of a blob store whose write op is `put`, pay the same 26.67 + 80 = 106.67 ms on the
-// wire as `{to: store, op: upload, size: 10MB}` in front of one that writes `upload`, and the
-// client gets the same response. Before the fix the walk stopped at the renamed step: the hop was
-// paid as a read, 26.67 + 8 = 34.67 ms, 72 ms less for the same bytes.
+// A renamed step that states its own `size:` forwards a payload: the service had the client's whole
+// body before it sent it on, so when the store behind it writes the renamed op, the client's hop
+// into the service is a write on the wire as well. 10 MB `upload`s at 5/s over 1 Gbit/s into a
+// service whose step is `{to: store, op: put, size: 10MB}`, in front of a blob store whose write op
+// is `put`, pay the same 26.67 + 80 = 106.67 ms on the wire as `{to: store, op: upload, size:
+// 10MB}` in front of one that writes `upload`, and the client gets the same response. Before the
+// fix the walk stopped at the renamed step: the hop was paid as a read, 26.67 + 8 = 34.67 ms, 72 ms
+// less for the same bytes.
 namespace {
 // a (5 `upload`s/s of 10 MB) -> b, over 1 Gbit/s; b's `upload` sends `store_op` (10 MB) on to a
 // default blob store that lists `store_op` as its write.
@@ -2827,12 +2824,12 @@ TEST_CASE("an upload a service sends on as a sized put pays the client's wire as
                WithinRel(response_to(same_op, "upload").response.mean_s, 1e-12));
 }
 
-// Only the body itself, relabelled, makes the client's hop a write (review of plan 2c Task 8,
-// I-2): a step of another size is a new request. The same 10 MB uploads, but the service writes a
-// 1 KB `put_meta` (the object's metadata) to a store that lists `put_meta`: the store writes 1 KB,
-// not the client's 10 MB, so the client's hop stays a read on the wire, answered at its first
-// megabyte: 26.67 + 8 = 34.67 ms, not the 106.67 ms of a forwarded body. (Before the fix any
-// sized rename counted as forwarding the body, 72 ms too much.)
+// Only the body itself, relabelled, makes the client's hop a write: a step of another size is a new
+// request. The same 10 MB uploads, but the service writes a 1 KB `put_meta` (the object's metadata)
+// to a store that lists `put_meta`: the store writes 1 KB, not the client's 10 MB, so the client's
+// hop stays a read on the wire, answered at its first megabyte: 26.67 + 8 = 34.67 ms, not the
+// 106.67 ms of a forwarded body. (Before the fix any sized rename counted as forwarding the body,
+// 72 ms too much.)
 TEST_CASE("an upload whose service writes a 1 KB put_meta stays a read on the client's wire",
           "[theory]") {
   auto s = upload_relayed_as("put_meta");
@@ -2845,10 +2842,10 @@ TEST_CASE("an upload whose service writes a 1 KB put_meta stays a read on the cl
   REQUIRE_THAT(only_link(r).latency.mean_s, WithinAbs(0.034667, 1e-6));
 }
 
-// The same size written two ways is the same body (review of plan 2c Tasks 9-10, minor 1): the
-// client's `2.01MB` and the step's `2010KB` parse to 2.01 x 1e6 = 2009999.9999999998 and
-// 2010 x 1e3 = 2010000 bytes, two doubles one rounding apart, so the step carries the upload on and
-// the client's hop is a write on the wire. Sizes are compared in whole bytes (std::llround).
+// The same size written two ways is the same body: the client's `2.01MB` and the step's `2010KB`
+// parse to 2.01 x 1e6 = 2009999.9999999998 and 2010 x 1e3 = 2010000 bytes, two doubles one rounding
+// apart, so the step carries the upload on and the client's hop is a write on the wire. Sizes are
+// compared in whole bytes (std::llround).
 TEST_CASE("a 2010KB step carries a 2.01MB upload on: sizes compare in whole bytes", "[theory]") {
   auto s = upload_relayed_as("put");
   const auto upload = *simsys::parse_size("2.01MB");
@@ -2904,9 +2901,9 @@ TEST_CASE("two sizes on one pipe wait 54.4 ms, more than one size at the same rh
   REQUIRE(wait > 3.0 * alone_wait);  // 54.4 ms against 16 ms
 }
 
-// A 40 Gbit/s link (youtube's cross-datacenter one, Task 16) is 5 GB/s = 5000 MB/s, 0.2 ms per
-// MB. 100 MB/s of it is rho = 0.02: Wq = 0.5 x 0.02 / 0.98 x 0.2 ms = 2.04 us, and the hop adds
-// 0.2 ms + 2.04 us. A wide pipe is nearly free; the model must not invent delay for it.
+// A 40 Gbit/s link (youtube's cross-datacenter one) is 5 GB/s = 5000 MB/s, 0.2 ms per MB. 100 MB/s
+// of it is rho = 0.02: Wq = 0.5 x 0.02 / 0.98 x 0.2 ms = 2.04 us, and the hop adds 0.2 ms + 2.04
+// us. A wide pipe is nearly free; the model must not invent delay for it.
 TEST_CASE("a 40 Gbit/s pipe at 100 MB per second adds 0.2 ms: rho 0.02, a wait of 2 us",
           "[theory]") {
   const auto g = *Graph::build(pipe_over(100, simsys::Bytes{1e6}, simsys::ByteRate{5e9}));
@@ -3064,9 +3061,9 @@ TEST_CASE("an inout link is one pipe fed by its requests alone: replies add no b
                WithinRel(out.responses[0].response.mean_s, 1e-12));
 }
 
-// A link without `bandwidth` behaves exactly as before Task 5: no sample, and the round trip is
-// the link's own 2 x 250 us plus b's sojourn, as in the blob store tests above (the same 0.5 ms),
-// whether or not the client states a size.
+// A link without `bandwidth` behaves exactly as before pipes existed: no sample, and the round trip
+// is the link's own 2 x 250 us plus b's sojourn, as in the blob store tests above (the same 0.5
+// ms), whether or not the client states a size.
 TEST_CASE("a link without a bandwidth has no pipe: no link sample and only its own latency",
           "[theory]") {
   SECTION("sized requests") {
@@ -3104,7 +3101,7 @@ TEST_CASE("an unsized op on a bandwidth link is refused with the advice to add a
 }
 
 // ---- Message queues hold what worker pools have not drained; pools are M/M/c over consumption
-// (plan 2c refinements 4-6, Task 6) ----
+// (spec §19 entries 4-6) ----
 //
 // The broker (book ch. 14's transcode_q, Kafka in practice) answers its publisher once the message
 // is appended; the message then goes to every consumer group, and what a group has not drained
@@ -3232,8 +3229,8 @@ TEST_CASE("Simulation::create accepts a message queue consumed by a pool without
   REQUIRE(sim.has_value());
 }
 
-// Task 6 refused a pool's `then` steps ("run in phase 2c's next step") rather than drop them
-// silently; Task 7 runs them, so the refusal is now its opposite: the engine accepts a pool that
+// An earlier version refused a pool's `then` steps ("run in phase 2c's next step") rather than drop
+// them silently; they run now, so the refusal is now its opposite: the engine accepts a pool that
 // hands its drained jobs on (the pins on what it sends are the section at the end of this file).
 TEST_CASE("Simulation::create accepts a worker pool that hands its jobs on through then steps",
           "[theory]") {
@@ -3435,7 +3432,7 @@ TEST_CASE(
   }
 }
 
-// ---- A worker pool's then steps carry each DRAINED job on (plan 2c refinement 5, Task 7) ----
+// ---- A worker pool's then steps carry each DRAINED job on (spec §19 entry 5) ----
 //
 // A pool's `then` steps are the work a finished job hands on, like a cache's unconditional `then`
 // (book ch. 14: a transcoding worker writes its renditions to the transcoded store and publishes a
@@ -3594,7 +3591,7 @@ TEST_CASE("a then target that drops most of its load leaves the publisher and th
   REQUIRE_THAT(e.responses[0].response.mean_s, WithinAbs(0.0006, 1e-9));
 }
 
-// A worker is busy for `cost` only (plan 2c refinement 5, ignored: a worker blocked on a slow
+// A worker is busy for `cost` only (spec §19 entry 5, ignored: a worker blocked on a slow
 // downstream call, phase 3's backlog): the pool hands a job on to a service that takes 5 s and
 // serves 1/s, and its own rho (0.8) and sojourn (1.20459 s, M/M/10) are what they are without any
 // then step at all.
@@ -3687,7 +3684,7 @@ TEST_CASE("a pool and its then targets conserve their load at every step of a sa
   }
 }
 
-// ---- Queue lag: how far a message queue trails its consumers (plan 2c refinement 4, Task 8) ----
+// ---- Queue lag: how far a message queue trails its consumers (spec §19 entry 4) ----
 //
 // A message queue's lag is how long a message published now waits until its consumer group reads
 // it (Kafka's records-lag divided by the group's consume rate): the queue's own broker never waits
@@ -3701,14 +3698,14 @@ TEST_CASE("a pool and its then targets conserve their load at every step of a sa
 //                    C) of the pool, what an arriving message waits even with no backlog because
 //                    all c workers happen to be busy. k = 1 here: Poisson arrivals, exponential
 //                    jobs. Erlang C is clamped at rho 0.99, as everywhere in the fluid model.
-// and the queue's lag is its WORST group's: a consumer group that is far behind is a queue that
-// is far behind. It is the wait only: the pool's own `latency` is wait + `cost`, the lag has no
-// cost in it. (It is the same wait fluid::FluidQueue computes for the pool; Task 8 exposes it on
-// the queue's sample, `NodeSample::queue_lag_s`, empty on every node that is not a message queue.)
+// and the queue's lag is its WORST group's: a consumer group that is far behind is a queue that is
+// far behind. It is the wait only: the pool's own `latency` is wait + `cost`, the lag has no cost
+// in it. (It is the same wait fluid::FluidQueue computes for the pool, `NodeSample::queue_lag_s`,
+// empty on every node that is not a message queue.)
 //
-// Numbers, with the Task 6 pictures above: 12 workers at 10 ms are 1200 jobs/s exactly, and the
-// burst's 1500/s grows the backlog by 300/s = 30 per 100 ms step, so after step i (the record
-// whose t ends at (i + 1) x 0.1 s) the backlog is (i + 1) x 30 messages and the fluid lag
+// Numbers, with the pictures above: 12 workers at 10 ms are 1200 jobs/s exactly, and the burst's
+// 1500/s grows the backlog by 300/s = 30 per 100 ms step, so after step i (the record whose t ends
+// at (i + 1) x 0.1 s) the backlog is (i + 1) x 30 messages and the fluid lag
 //   (i + 1) x 30 / 1200 = (i + 1) x 0.025 s            (50 s at i = 1999, t = 200 s: 60,000 / 1200)
 // The stochastic part of a SATURATED pool (rho 1, clamped to 0.99 for Erlang C) is
 //   Wq(c = 12, rho = 0.99, s = 10 ms) = C(12, 11.88) x 10 ms / (12 x 0.01) = 0.0800 s
@@ -3777,9 +3774,9 @@ TEST_CASE("after the burst the lag falls with the backlog back to the pool's sto
   REQUIRE_THAT(queue_lag_of(records[5099], g), WithinRel(wait, 1e-9));
 }
 
-// The steady lag of the Task 6 picture (1000/s into 4 workers at 3.333 ms, rho 0.8333, no
-// backlog) is the pool's Erlang wait alone, 3.289 ms: the lag leaves out the 3.333 ms of `cost`
-// that the pool's 6.622 ms sojourn includes.
+// The steady lag of the picture above (1000/s into 4 workers at 3.333 ms, rho 0.8333, no backlog)
+// is the pool's Erlang wait alone, 3.289 ms: the lag leaves out the 3.333 ms of `cost` that the
+// pool's 6.622 ms sojourn includes.
 TEST_CASE("a queue with no backlog is lagging by the pool's stochastic wait: 3.289 ms",
           "[theory]") {
   const auto g = *Graph::build(published(1000, {four_workers()}));
@@ -3877,8 +3874,7 @@ TEST_CASE("estimate reports the steady lag: 3.289 ms below capacity, the retenti
   REQUIRE_THAT(*settled.nodes[*overloaded.index_of("q")].queue_lag_s, WithinAbs(10.0, 1e-6));
 }
 
-// ---- An external sink answers slowly and fails a share of what it serves (plan 2c refinement 8,
-// Task 9) ----
+// ---- An external sink answers slowly and fails a share of what it serves (spec §19 entry 8) ----
 //
 // A third party's API (book ch. 10: APNs, FCM, an SMS provider) is a queue of the type's numbers
 // whose server sometimes answers with a 5xx. The numbers, from one picture: a client sends `rate`
@@ -4173,19 +4169,18 @@ TEST_CASE("a pool that calls a 2 percent sink loses 2 of 100 calls a second and 
   REQUIRE_THAT(e.responses[0].answered.per_second, WithinRel(100.0, 1e-9));
 }
 
-// ---- kv_cluster in the steady state (plan 2c refinement 9, Task 10; book ch. 6, Dynamo) ----
+// ---- kv_cluster in the steady state (spec §19 entry 9; book ch. 6, Dynamo) ----
 //
-// `nodes` machines of `capacity` each on a consistent-hash ring; the coordinator sends every
-// read and write to the key's N replicas (ch. 6 "quorum consensus"), so the cluster is sent N
-// times the requests. The sample counts that load in REPLICA-REQUESTS: `demand_per_s`,
-// `drain_per_s` and `dropped_per_s` are N x the client-level requests (the unit the nodes'
-// queues work in, so the balance demand = drain + dropped + d(backlog) holds as everywhere),
-// while the clients' offered and answered rates stay in requests. With N < nodes the hottest
-// machine carries k = 1 + z_M/sqrt(N vnodes) x the average (ring_factor), as hot and cool copy
-// groups. Since the review of Tasks 9-10 (C-1, I-1) a request's answer is taken over its REAL
-// replica set: with probability p_hot = N k / M its N replicas are the hot machine and N - 1 cool
-// ones, otherwise N cool ones; a read is answered at the R-th fastest reply, a write at the W-th,
-// each machine's sojourn a lognormal fitted to its own mean and variance
+// `nodes` machines of `capacity` each on a consistent-hash ring; the coordinator sends every read
+// and write to the key's N replicas (ch. 6 "quorum consensus"), so the cluster is sent N times the
+// requests. The sample counts that load in REPLICA-REQUESTS: `demand_per_s`, `drain_per_s` and
+// `dropped_per_s` are N x the client-level requests (the unit the nodes' queues work in, so the
+// balance demand = drain + dropped + d(backlog) holds as everywhere), while the clients' offered
+// and answered rates stay in requests. With N < nodes the hottest machine carries k = 1 +
+// z_M/sqrt(N vnodes) x the average (ring_factor), as hot and cool copy groups. A request's answer
+// is taken over its REAL replica set: with probability p_hot = N k / M its N replicas are the hot
+// machine and N - 1 cool ones, otherwise N cool ones; a read is answered at the R-th fastest reply,
+// a write at the W-th, each machine's sojourn a lognormal fitted to its own mean and variance
 // (queueing::lognormal_order_statistic), and the request is lost when fewer than q of its N
 // replica-requests come back (queueing::probability_fewer_than).
 
@@ -4464,10 +4459,9 @@ TEST_CASE("with one virtual node the quorum of two hides the hot machine", "[the
   }
 }
 
-// A request is lost when fewer than q of its N replica-requests come back (I-1). Three machines,
-// N = 3, each sent 11.25k/s against its 10k/s: each keeps 8/9 of what it is sent once its room is
-// full. A read needing R replies is lost with P(Bin(3, 8/9) < R)
-// (queueing::probability_fewer_than):
+// A request is lost when fewer than q of its N replica-requests come back. Three machines, N = 3,
+// each sent 11.25k/s against its 10k/s: each keeps 8/9 of what it is sent once its room is full. A
+// read needing R replies is lost with P(Bin(3, 8/9) < R) (queueing::probability_fewer_than):
 //   R = 1  1/729 = 0.14 %,   R = 2  25/729 = 3.4 %,   R = 3  1 - 512/729 = 29.8 %
 // where the old rule lost the replica-requests' share, 1/9 = 11.1 %, at every R: it over-counted
 // a forgiving quorum and under-counted a strict one.
@@ -4491,14 +4485,14 @@ TEST_CASE("a quorum of q of three saturated replicas is lost with the binomial's
 }
 
 // The book's lab as the plan first shipped it: nodes = 8, N = 3, vnodes 150, 30k requests/s of
-// capacity-10k/s nodes. The cluster is sent 3 x 30k = 90k replica-requests/s against 8 x 10k =
-// 80k: 11.25k per node on average (112.5 %), the hottest k = 1.0676 x that = 12.01k (120.1 %,
-// red) and each of the others (8 - k)/56 x 90k = 11.14k (111.4 %): every node is over capacity
-// and every queue ends full. The cluster serves 80k and drops 10k replica-requests/s, one ninth:
-// the hot machine keeps 10k/12.01k = 0.8326 of what it is sent, a cool one 10k/11.14k = 0.8976.
-// A request is lost when fewer than two of its three replicas answer (I-1), over its real replica
-// set: with p_hot = 3k/8 = 0.4004, P(< 2 of {hot, cool, cool}), otherwise P(< 2 of three cool):
-// 3.41 % lost, 96.59 % answered, not the 8/9 of the old "share of replica-requests dropped".
+// capacity-10k/s nodes. The cluster is sent 3 x 30k = 90k replica-requests/s against 8 x 10k = 80k:
+// 11.25k per node on average (112.5 %), the hottest k = 1.0676 x that = 12.01k (120.1 %, red) and
+// each of the others (8 - k)/56 x 90k = 11.14k (111.4 %): every node is over capacity and every
+// queue ends full. The cluster serves 80k and drops 10k replica-requests/s, one ninth: the hot
+// machine keeps 10k/12.01k = 0.8326 of what it is sent, a cool one 10k/11.14k = 0.8976. A request
+// is lost when fewer than two of its three replicas answer, over its real replica set: with p_hot =
+// 3k/8 = 0.4004, P(< 2 of {hot, cool, cool}), otherwise P(< 2 of three cool): 3.41 % lost, 96.59 %
+// answered, not the 8/9 of the old "share of replica-requests dropped".
 TEST_CASE("eight nodes at replication three overload at 30k requests a second", "[theory]") {
   const auto g = *Graph::build(kv_front({.nodes = 8,
                                          .replication = 3,
@@ -4659,7 +4653,7 @@ TEST_CASE("a kv_cluster conserves its replica-requests at every step of an overl
   REQUIRE_THAT(backlog, WithinRel(8.0 * 1000.0, 1e-9));  // 8 full queues of 1000
 }
 
-// ---- Search index as service sugar (plan 2c refinement 10, Task 11; book ch. 13) ----
+// ---- Search index as service sugar (spec §19 entry 10; book ch. 13) ----
 //
 // A search_index runs exactly as a service of the same keys: no steps, the fluid drain and the
 // M/M/c wait of Erlang C (queueing::mmc_wait). The scenario is search-autocomplete's trie, cut
@@ -4742,7 +4736,7 @@ TEST_CASE("a search index steps exactly as the service of the same keys", "[theo
   }
 }
 
-// ---- A step after a failed step does not run (plan 2c refinement, Task 12) ----------------------
+// ---- A step after a failed step does not run (spec §19 entry 11) ----------------------
 //
 // A request is answered only if every step of its op was; so a step that comes after one the
 // request already failed never fires. The flow sent on step k is
@@ -4845,8 +4839,7 @@ TEST_CASE("a second step is sent only what the first step delivered: 500 of 1000
 }
 
 // An op that calls one overloaded node five times, x: [a, a, a, a, a] at 1k/s, each call sent only
-// the requests the calls before it got through (review of plan 2c Task 12, I-1). With d the share
-// a delivers, a is offered
+// the requests the calls before it got through. With d the share a delivers, a is offered
 //   L(d) = 1000 × (1 + d + d² + d³ + d⁴)          (call k is sent 1000 × d^(k-1))
 // and with 3686/s of capacity and a room of one it drops what is over capacity, so d = 3686 / L(d).
 // The fixed point is d = 0.9: L = 4095.1, 3686 / 4095.1 = 0.9001 (10 % dropped). The map
@@ -4872,7 +4865,7 @@ TEST_CASE("five calls to one overloaded node settle at d = 0.9 under estimate: 4
 }
 
 // The same op with ten and with twenty calls to `a`, each `a` sized so that d = 0.9 is again the
-// fixed point (review of the Task 12/13 fix rounds and Task 14, minor 2). With n calls
+// fixed point. With n calls
 //   L(d) = 1000 × (1 − dⁿ) / (1 − d),   capacity = 0.9 × L(0.9):
 //   n = 10: L(0.9) = 6513.2, capacity 5862 (d = 0.900004);  n = 20: L(0.9) = 8784.2, capacity 7906.
 // The map f(d) = capacity / L(d) is much steeper there: f'(d) = −d L'(d) / L(d) = −3.65 at ten
@@ -5001,7 +4994,7 @@ TEST_CASE(
   REQUIRE_THAT(demand_at(last, g, "done"), WithinRel(4.0, 1e-3));           // 8 x 0.5
 }
 
-// ---- estimate = run at exactly rho 1 (comprehensive 2c review, 5c) ----
+// ---- estimate = run at exactly rho 1 ----
 //
 // At demand = capacity the fluid neither grows nor drains: a room that starts empty stays empty,
 // and the stochastic wait is the 0.99 clamp's (fluid::max_stochastic_rho). `run` steps from an

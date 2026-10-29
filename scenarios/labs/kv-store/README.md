@@ -78,7 +78,7 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   room, 1000 requests drained at 10k/s = 100 ms, with the spread the fluid gives a full queue
   (about 10 ms), so the second of three replies is 100.0 ms with a 6.7 ms spread, and the
   client's response about 101 ms: past the clients' `timeout: 100ms` more often than not. The
-  timeout (plan 2c Task 13) gives up on 56 % of the delivered requests (`run --report json`:
+  timeout gives up on 56 % of the delivered requests (`run --report json`:
   `timed_out_per_s` 11.41k of the gets), so only 8.88k of the 21k gets/s are answered, in
   95.3 ms on average. `run` fails all three SLOs: drop rate 0.1111, utilization 1, `put` p99
   **100 ms**, the timeout itself: 56.2 % of the delivered requests timed out, more than the 1 % a
@@ -106,7 +106,7 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   timed out, so the p99 SLO fails at
   the timeout (`6.62% of delivered requests timed out (more than 1%)`). (Weighting the two sets
   by the puts offered, the lost ones included, gave 7.43 % timed out and a mean of 29.4 ms, 39.6
-  ms and 233 ms without the timeout, before the review of Task 11.)
+  ms and 233 ms without the timeout, in an earlier version of the quorum model.)
 - `write_quorum: 3, read_quorum: 1`: a `put` waits for the slowest of three replicas and a `get`
   for the fastest: `put` 1.87 ms (p99 3.3 ms), `get` 1.4 ms (p99 2.05 ms).
   `write_quorum: 1, read_quorum: 3` swaps them. The load does not change. `explain` marks either

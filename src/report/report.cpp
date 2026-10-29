@@ -103,10 +103,9 @@ std::string format_duration(double seconds_value) {
 }
 
 // A queue lag as the node table and the SLO lines print it: a duration, or "<1us" for a lag that
-// would print below one microsecond (review of plan 2c Task 8, minor 6). An idle consumer group's
-// stochastic wait is Erlang C's tiny chance of waiting times a job (youtube's completion_q:
-// 6.3e-11 s, "0.0632ns"), a figure below anything a queue's lag is ever measured in; the JSON
-// and the CSV keep the number.
+// would print below one microsecond. An idle consumer group's stochastic wait is Erlang C's tiny
+// chance of waiting times a job (youtube's completion_q: 6.3e-11 s, "0.0632ns"), a figure below
+// anything a queue's lag is ever measured in; the JSON and the CSV keep the number.
 std::string format_lag(double seconds_value) {
   const double below = rounds_to_one * 1e-6;  // what format_duration would print under "1us"
   if (seconds_value > 0.0 && seconds_value < below) return "<1us";
@@ -140,11 +139,10 @@ constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
   return to_chars_text(value, std::chars_format::fixed, 0);
 }
 
-// A queue's waiting room: as written up to six digits (1000, 12000, 500000), and from a million
-// on with an SI prefix, four digits (a pool's room is retention × its rate: 7 days of 6.667/s is
-// 4.032M, of 1.2k/s 725.8M; review of plan 2c Task 6, M-1), where six digits would print
-// "4.032e+06". Six digits round [999,999.5, 1e6) up to that million too, so such a room is printed
-// as the million it rounds to, "1M" (review of plan 2c Task 7, minor 8).
+// A queue's waiting room: as written up to six digits (1000, 12000, 500000), and from a million on
+// with an SI prefix, four digits (a pool's room is retention × its rate: 7 days of 6.667/s is
+// 4.032M, of 1.2k/s 725.8M), where six digits would print "4.032e+06". Six digits round [999,999.5,
+// 1e6) up to that million too, so such a room is printed as the million it rounds to, "1M".
 [[nodiscard]] std::string fmt_room(double units) {
   constexpr double million = 1e6;
   constexpr double rounds_to_a_million = million - 0.5;
@@ -157,8 +155,8 @@ constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
 }
 
 // A ratio as a percentage, three significant digits (12.3%, 0.048%), and from 1000 % on in whole
-// percents (10000%), where three significant digits would need an exponent, "1e+04%" (review of
-// plan 2c Tasks 9-10, minor 11). 999.5 and up rounds to four digits, so that is where it switches.
+// percents (10000%), where three significant digits would need an exponent, "1e+04%". 999.5 and up
+// rounds to four digits, so that is where it switches.
 [[nodiscard]] std::string percent(double ratio) {
   const double value = ratio * 100.0;
   if (value >= 999.5) return to_chars_text(value, std::chars_format::fixed, 0) + "%";
@@ -307,10 +305,10 @@ constexpr Quantile ninety_ninth{.level = 0.99, .z = queueing::z_p99};
   return share_timed_out > 1.0 - q.level;
 }
 
-// The percentile at q of the response a client sees (plan 2c Task 13 and the comprehensive 2c
-// review, C-1): the one rule for the whole run's op table and for each window of an SLO's `over`
-// (plan 2c Task 14). `mean_s` and `variance_s2` are the DELIVERED requests' moments, before the
-// timeout cut them (Summary::OpTotals::by_delivered), s the timed-out share of them.
+// The percentile at q of the response a client sees: the one rule for the whole run's op table and
+// for each window of an SLO's `over`. `mean_s` and `variance_s2` are the DELIVERED requests'
+// moments, before the timeout cut them (Summary::OpTotals::by_delivered), s the timed-out share of
+// them.
 //  - Without a timeout: the lognormal fitted to those moments, read at q.
 //  - With one, when more than 1 − q of the delivered requests timed out (s > 1 − q): the
 //    timeout, flagged `beyond_timeout`. No request at quantile q was answered; a latency SLO at q
@@ -362,16 +360,16 @@ struct SeenPercentile {
 
 // An op nobody sent (a client of rate 0, `rate: {base: 0/s}`, or an SLO window in which the op was
 // not offered): no request, so no latency either. A latency SLO leaves it out without a note:
-// nothing went wrong (review of the kv/search fix round, M-1).
+// nothing went wrong.
 [[nodiscard]] bool nothing_offered(const OpSummary& op) {
   return op.offered_per_s <= 0.0;
 }
 
 // The case of nothing_answered that no other rule judges: requests were sent and every one was lost
 // on a path that does answer (nothing timed out, a finite latency), so the moments describe
-// requests that all failed (review of plan 2c Task 11, minor 4). A latency SLO does not read such
-// an op, and says so (unanswered_note). One that timed out fails at the timeout
-// (fail_if_quantile_timed_out), an unavailable one at infinity.
+// requests that all failed. A latency SLO does not read such an op, and says so (unanswered_note).
+// One that timed out fails at the timeout (fail_if_quantile_timed_out), an unavailable one at
+// infinity.
 [[nodiscard]] bool every_request_lost(const OpSummary& op) {
   return !nothing_offered(op) && nothing_answered(op) && op.timed_out_per_s <= 0.0 &&
          std::isfinite(op.mean_s);
@@ -445,10 +443,10 @@ struct Overloaded : Fs... {
   return found->mean_rho;
 }
 
-// The named node's mean staleness (plan 2b refinement 3: a SQL database's write sojourn at the
-// primary + replication lag + sojourn at a replica, how old the data a read may return is), in
-// seconds; empty for a node with no lagging copies, whose staleness SLO is then skipped (nothing
-// to observe).
+// The named node's mean staleness (spec §18 entry 6: a SQL database's write sojourn at the primary
+// + replication lag + sojourn at a replica, how old the data a read may return is), in seconds;
+// empty for a node with no lagging copies, whose staleness SLO is then skipped (nothing to
+// observe).
 [[nodiscard]] std::optional<double> mean_staleness(std::span<const NodeSummary> nodes,
                                                    const model::SloSpec& slo) {
   const auto found = std::ranges::find(nodes, slo.node.value_or(""), &NodeSummary::id);
@@ -457,9 +455,9 @@ struct Overloaded : Fs... {
 }
 
 // The peak lag after warmup (NodeSummary::peak_queue_lag_s) of the named message queue, or of the
-// worst queue when the SLO names none (every queue must keep the bound, so the worst decides; plan
-// 2c refinement 14); empty when no message queue ran (a frontier's lag is phase 3's), and the SLO
-// is skipped.
+// worst queue when the SLO names none (every queue must keep the bound, so the worst decides; spec
+// §19 entry 14); empty when no message queue ran (a frontier's lag is phase 3's), and the SLO is
+// skipped.
 [[nodiscard]] std::optional<double> peak_queue_lag(std::span<const NodeSummary> nodes,
                                                    const model::SloSpec& slo) {
   if (slo.node) {
@@ -554,7 +552,7 @@ void fail_if_quantile_timed_out(SloResult& result, std::span<const OpSummary> op
   return SloResult{.slo = slo, .observed = std::nullopt, .status = SloStatus::skipped};
 }
 
-// ---- SLOs per window (plan 2c Task 14) ----
+// ---- SLOs per window ----
 
 // Are `a` and `b` the same SLO, every key alike? Written out rather than a defaulted
 // SloSpec::operator==: SimTime's == (std::chrono's) is not reachable through the model module's
@@ -694,10 +692,9 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   return "nodes\n" + aligned(rows);
 }
 
-// The bandwidth links' pipes (plan 2c Task 5), in the node table's columns but a table of their
-// own, since their numbers are megabytes: `a->b`, its utilization, the most megabytes it held and
-// the megabytes it dropped (a pipe refuses nothing, so `rejected` is 0). Nothing without a
-// bandwidth link.
+// The bandwidth links' pipes, in the node table's columns but a table of their own, since their
+// numbers are megabytes: `a->b`, its utilization, the most megabytes it held and the megabytes it
+// dropped (a pipe refuses nothing, so `rejected` is 0). Nothing without a bandwidth link.
 [[nodiscard]] std::string link_table(const Summary& summary, bool color) {
   const auto links = summary.links();
   if (links.empty()) return {};
@@ -738,9 +735,8 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   return "replication\n" + aligned(rows);
 }
 
-// An op's latency cell: `-` when nobody was answered (review of plan 2c Tasks 9-10, minor 8: a sink
-// that fails everything it serves has no latency to show, only the sojourn of requests that all
-// failed), else the duration.
+// An op's latency cell: `-` when nobody was answered (a sink that fails everything it serves has no
+// latency to show, only the sojourn of requests that all failed), else the duration.
 [[nodiscard]] std::string op_latency_cell(const OpSummary& op, double seconds_value) {
   return nothing_answered(op) ? "-" : format_duration(seconds_value);
 }
@@ -753,8 +749,8 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   return op_latency_cell(op, seconds_value);
 }
 
-// The `timed out/s` column (plan 2c Task 13's review, I-1) is there when some client has a
-// timeout: without one nothing can time out, and the table keeps its old shape.
+// The `timed out/s` column is there when some client has a timeout: without one nothing can time
+// out, and the table keeps its old shape.
 [[nodiscard]] std::string op_table(const Summary& summary) {
   const auto ops = summary.ops();
   // C++20 std::ranges::any_of: the range itself instead of a begin/end pair (std::any_of), so it
@@ -1003,9 +999,9 @@ template <class T, class F>
   return (value < 10 ? "0" : "") + std::to_string(value);
 }
 
-// A point in simulated time as a scenario writes it: "20:00" for a whole minute of the
-// first day (t = 0 is midnight, phase 2a refinement 1), otherwise a duration ("36h", "90s").
-// Integer nanoseconds, so 19:59:59.9 is never rounded to "20:00".
+// A point in simulated time as a scenario writes it: "20:00" for a whole minute of the first day (t
+// = 0 is midnight, spec §17 entry 1), otherwise a duration ("36h", "90s"). Integer nanoseconds, so
+// 19:59:59.9 is never rounded to "20:00".
 [[nodiscard]] std::string clock_or_duration(SimTime t) {
   constexpr auto minute_ns = (1_min).count();
   constexpr auto day_ns = (24_h).count();
@@ -1155,9 +1151,9 @@ template <class T>
   return stated ? std::string{} : " (default)";
 }
 
-// What a load balancer's policy means for this node (plan 2a refinement 5): a balancer's
-// own policy, and on the node behind it `pooled` (least_connections) or the hottest
-// replica's `imbalance` (consistent_hash).
+// What a load balancer's policy means for this node (spec §17 entry 5): a balancer's own policy,
+// and on the node behind it `pooled` (least_connections) or the hottest replica's `imbalance`
+// (consistent_hash).
 [[nodiscard]] std::string balancing_summary(const graph::Graph& g, std::size_t index) {
   const auto& node = g.nodes()[index];
   std::string text;
@@ -1177,9 +1173,9 @@ template <class T>
   return text;
 }
 
-// A rate limiter's algorithm and its numbers with the defaults applied (plan 2a refinement
-// 6): `algorithm=token_bucket limit=1k/s burst=500 backend=counters`. A bucket shows its
-// burst, a windowed algorithm its window (the one number that sizes each).
+// A rate limiter's algorithm and its numbers with the defaults applied (spec §17 entry 6):
+// `algorithm=token_bucket limit=1k/s burst=500 backend=counters`. A bucket shows its burst, a
+// windowed algorithm its window (the one number that sizes each).
 [[nodiscard]] std::string limiter_summary(const model::NodeSpec& spec) {
   if (spec.type != model::NodeType::rate_limiter || !spec.limit) return {};
   const auto algorithm = spec.algorithm.value_or(model::LimiterAlgorithm::token_bucket);
@@ -1193,14 +1189,14 @@ template <class T>
   return text;
 }
 
-// What an id generator's algorithm stands for (plan 2b refinement 6; book ch. 7), with the
-// numbers the algorithm gives one replica (defaults::for_id_algorithm), so a student sees WHY
-// the node has the capacity it has: `algorithm=snowflake (4.096M/s per replica by design)`,
-// `algorithm=ticket_server (one database: 1k/s, spec §6 writes)`, `algorithm=uuid (unbounded:
-// 1G/s)`. The algorithm's number even when the scenario states its own `capacity`, which the
-// node line then shows tagged `(scenario)`: the reader sees the design's figure and the
-// override, and the figure is then called the default it is, so that it does not read as a
-// second capacity: `algorithm=ticket_server (one database; default 1k/s, spec §6 writes)`.
+// What an id generator's algorithm stands for (spec §18 entry 12; book ch. 7), with the numbers the
+// algorithm gives one replica (defaults::for_id_algorithm), so a student sees WHY the node has the
+// capacity it has: `algorithm=snowflake (4.096M/s per replica by design)`, `algorithm=ticket_server
+// (one database: 1k/s, spec §6 writes)`, `algorithm=uuid (unbounded: 1G/s)`. The algorithm's number
+// even when the scenario states its own `capacity`, which the node line then shows tagged
+// `(scenario)`: the reader sees the design's figure and the override, and the figure is then called
+// the default it is, so that it does not read as a second capacity: `algorithm=ticket_server (one
+// database; default 1k/s, spec §6 writes)`.
 [[nodiscard]] std::string id_algorithm_meaning(model::IdAlgorithm algorithm, bool capacity_stated) {
   const std::string rate = fmt_rate(defaults::for_id_algorithm(algorithm).service_rate.per_second);
   const std::string figure = capacity_stated ? "default " + rate : rate;
@@ -1301,12 +1297,11 @@ template <class T>
   return text + partition_summary(node) + unfiltered_caveat(g, resolved) + ")";
 }
 
-// A cache's model (plan 2a refinement 7): `hit_ratio=0.8 (fixed) strategy=cache_aside
-// write_ops=write backend=db keys=20M eviction=lru ttl=5m`, the keys the scenario left out
-// omitted (strategy and write_ops always have a value: their defaults). A che hit ratio shows
-// its provenance instead of `(fixed)` (hit_ratio_summary).
-// `hit_ratio=0.8 (fixed)`, `hit_ratio=0.732 (che: ...)`, `hit_ratio=che` (no number) or
-// `hit_ratio=none`: what a cache and a CDN both open with.
+// A cache's model (spec §17 entry 7): `hit_ratio=0.8 (fixed) strategy=cache_aside write_ops=write
+// backend=db keys=20M eviction=lru ttl=5m`, the keys the scenario left out omitted (strategy and
+// write_ops always have a value: their defaults). A che hit ratio shows its provenance instead of
+// `(fixed)` (hit_ratio_summary). `hit_ratio=0.8 (fixed)`, `hit_ratio=0.732 (che: ...)`,
+// `hit_ratio=che` (no number) or `hit_ratio=none`: what a cache and a CDN both open with.
 [[nodiscard]] std::string hit_ratio_text(const graph::Graph& g, const graph::ResolvedNode& node) {
   std::string text = "hit_ratio=" + hit_ratio_summary(node);
   if (node.hit_ratio && node.hit_ratio->keys) {
@@ -1343,7 +1338,7 @@ template <class T>
   return "  serves: " + (served.empty() ? std::string{"none"} : join(served, ", "));
 }
 
-// A CDN's model (plan 2b refinement 4), shown as a cache's is: `hit_ratio=0.95 (fixed) misses →
+// A CDN's model (spec §18 entry 10), shown as a cache's is: `hit_ratio=0.95 (fixed) misses →
 // media_store keys=100k ttl=1h  serves: read_media`. "misses → media_store": the CDN fetches what
 // it misses from its origin, so the reader sees where the 1 − h of the reads go (the check lines
 // below count them there). A CDN without a hit ratio says what that means, `hit_ratio=none (every
@@ -1377,11 +1372,10 @@ template <class T>
   return spec.replicas < 2 ? lag + " (unused: no replicas)" : lag;
 }
 
-// A SQL database's model (plan 2b refinement 3): `primary+2 replicas  shards=4  lag=50ms
-// pool=32  write_ops=insert,update`, the defaults applied and marked: one shard, no lag; `pool`
-// only when stated (the queue numbers say whether it binds: `capacity=400/s (pool 4 / 10ms)
-// ... c=4 (pool)`), and the write ops always (the database default delete,insert,update,write,
-// or the scenario's).
+// A SQL database's model (spec §18 entry 6): `primary+2 replicas  shards=4  lag=50ms pool=32
+// write_ops=insert,update`, the defaults applied and marked: one shard, no lag; `pool` only when
+// stated (the queue numbers say whether it binds: `capacity=400/s (pool 4 / 10ms) ... c=4 (pool)`),
+// and the write ops always (the database default delete,insert,update,write, or the scenario's).
 [[nodiscard]] std::string database_summary(const graph::ResolvedNode& node) {
   const auto& spec = node.spec;
   if (spec.type != model::NodeType::sql_db) return {};
@@ -1420,8 +1414,8 @@ struct QueueProvenance {
 }
 
 // A rate in a node's capacity units: "1.5k/s" (requests) for most nodes, "100k MB/s" for a node
-// that counts megabytes (defaults::is_byte_sized, plan 2c refinement 2), whose capacity, load
-// and checks are all in MB.
+// that counts megabytes (defaults::is_byte_sized, spec §19 entry 2), whose capacity, load and
+// checks are all in MB.
 [[nodiscard]] std::string fmt_units(const model::NodeSpec& spec, double per_second) {
   if (defaults::is_byte_sized(spec)) return with_si_prefix(per_second) + " MB/s";
   return fmt_rate(per_second);
@@ -1505,10 +1499,10 @@ struct QueueProvenance {
   return model::kv_write_quorum(spec) + model::kv_read_quorum(spec) > model::kv_replication(spec);
 }
 
-// "N=3 W=2 R=2", each count marked "(default)" when the scenario left it to Dynamo's (N = 3,
-// W = R = 2: model::kv_replication and the quorum helpers), and a note when W + R <= N: the
-// quorums do not overlap, so a read may miss the latest write (review of plan 2c Tasks 9-10,
-// minors 6 and 9). The model has no versions of a key, so the note is all explain can say.
+// "N=3 W=2 R=2", each count marked "(default)" when the scenario left it to Dynamo's (N = 3, W = R
+// = 2: model::kv_replication and the quorum helpers), and a note when W + R <= N: the quorums do
+// not overlap, so a read may miss the latest write. The model has no versions of a key, so the note
+// is all explain can say.
 [[nodiscard]] std::string kv_quorums(const model::NodeSpec& spec) {
   std::string text =
       "N=" + std::to_string(model::kv_replication(spec)) + if_defaulted(spec.replication) +
@@ -1530,9 +1524,9 @@ struct QueueProvenance {
   return "mode=" + std::string{model::to_string(mode)} + " (" + notes + ")";
 }
 
-// A kv_cluster's shape (plan 2c refinement 9; book ch. 6): "  nodes=6 N=3 W=2 R=2 mode=ap
-// (partitions: phase 3)", the machines on its ring (`nodes`, which graph::apply_kv_ring also
-// copies into `replicas`), the copies of each key and the two quorums (kv_quorums) and the mode
+// A kv_cluster's shape (spec §19 entry 9; book ch. 6): "  nodes=6 N=3 W=2 R=2 mode=ap (partitions:
+// phase 3)", the machines on its ring (`nodes`, which graph::apply_kv_ring also copies into
+// `replicas`), the copies of each key and the two quorums (kv_quorums) and the mode
 // (kv_mode_summary). Nothing on any other type.
 [[nodiscard]] std::string kv_cluster_summary(const model::NodeSpec& spec) {
   if (spec.type != model::NodeType::kv_cluster) return {};
@@ -1563,11 +1557,10 @@ struct QueueProvenance {
   return " " + write_ops_summary(g, node);
 }
 
-// A worker pool's model (plan 2c refinement 5): "  consumes=transcode_q  workers=400 cost=1m",
-// the two numbers its capacity follows from. The capacity itself is stated once, in the queue
-// numbers before it, `capacity=6.667/s (workers / cost)` (queue_provenance; review of plan 2c
-// Task 6, M-6). Nothing for a pool built in code without both numbers (it runs on the type's,
-// which server_details shows).
+// A worker pool's model (spec §19 entry 5): "  consumes=transcode_q  workers=400 cost=1m", the two
+// numbers its capacity follows from. The capacity itself is stated once, in the queue numbers
+// before it, `capacity=6.667/s (workers / cost)` (queue_provenance). Nothing for a pool built in
+// code without both numbers (it runs on the type's, which server_details shows).
 [[nodiscard]] std::string worker_pool_summary(const graph::ResolvedNode& node) {
   const auto& spec = node.spec;
   if (!defaults::worker_pool_rate(spec)) return {};
@@ -1586,11 +1579,11 @@ struct QueueProvenance {
   return format_duration(retention);
 }
 
-// A message queue's model (plan 2c refinement 4): "  retention=7d (default: Kafka's 168 h)
-// partitions=32 (not modelled)". The retention sets each consumer group's waiting room
-// (retention × the pool's capacity: see the pools' queue_limit); the book gives no figure, so an
-// absent one is Kafka's `log.retention.hours`, and the line says whose default it is. Partitions
-// are accepted and printed, not simulated (phase 3).
+// A message queue's model (spec §19 entry 4): "  retention=7d (default: Kafka's 168 h)
+// partitions=32 (not modelled)". The retention sets each consumer group's waiting room (retention ×
+// the pool's capacity: see the pools' queue_limit); the book gives no figure, so an absent one is
+// Kafka's `log.retention.hours`, and the line says whose default it is. Partitions are accepted and
+// printed, not simulated (phase 3).
 [[nodiscard]] std::string message_queue_summary(const model::NodeSpec& spec) {
   if (spec.type != model::NodeType::message_queue) return {};
   std::string text =
@@ -1601,20 +1594,20 @@ struct QueueProvenance {
   return text;
 }
 
-// A search index's rebuild (plan 2c refinement 10, book ch. 13): "  build_interval=24h (rebuild
-// load not modelled)", only when the scenario states one. The index serves like a service; how
-// often it is rebuilt from the aggregated logs is stored and printed, and the line says the
-// rebuild's load (and the freshness of the answers between rebuilds) is not part of the model.
+// A search index's rebuild (spec §19 entry 10, book ch. 13): "  build_interval=24h (rebuild load
+// not modelled)", only when the scenario states one. The index serves like a service; how often it
+// is rebuilt from the aggregated logs is stored and printed, and the line says the rebuild's load
+// (and the freshness of the answers between rebuilds) is not part of the model.
 [[nodiscard]] std::string search_index_summary(const model::NodeSpec& spec) {
   if (spec.type != model::NodeType::search_index || !spec.build_interval) return {};
   return "  build_interval=" + format_duration(*spec.build_interval) +
          " (rebuild load not modelled)";
 }
 
-// An external sink's model (plan 2c refinement 8): "  failure_rate=2% politeness=1/s (not
-// modelled: phase 3)". The failure rate is always printed (0% is the plain queue): the share of
-// what the sink serves that fails, which a run counts as drops. Politeness only when the scenario
-// states it, and marked as what it is: stored, never simulated (it needs per-host state).
+// An external sink's model (spec §19 entry 8): "  failure_rate=2% politeness=1/s (not modelled:
+// phase 3)". The failure rate is always printed (0% is the plain queue): the share of what the sink
+// serves that fails, which a run counts as drops. Politeness only when the scenario states it, and
+// marked as what it is: stored, never simulated (it needs per-host state).
 [[nodiscard]] std::string external_sink_summary(const model::NodeSpec& spec) {
   if (spec.type != model::NodeType::external_sink) return {};
   std::string text = "  failure_rate=" + percent(spec.failure_rate);
@@ -1831,7 +1824,7 @@ using ForwardRoutes = std::vector<RoutesByOp>;  // per node index; empty for non
 
 // Forwards what reached load balancer or message queue `from` over its routes, each op times the
 // share Graph::routes_for gives: a balancer's split (as LoadBalancerBehaviour::route does), a
-// queue's copy of every message to each consumer group, a share of 1 each (plan 2c Task 7, as
+// queue's copy of every message to each consumer group, a share of 1 each (as
 // MessageQueueBehaviour::route does). On paper nothing is dropped, so every message appended is
 // delivered.
 void forward_routed(const graph::Graph& g, const ForwardRoutes& table, std::size_t from,
@@ -1889,11 +1882,11 @@ void forward_to_backend(const graph::Graph& g, std::size_t from, const OpLoad& a
 
 // Forwards along a cache's, a blob store's or a worker pool's `then` steps (what happens after it
 // answers: ch. 13's browser cache sends its misses on to the servers; an upload's event starts
-// transcoding; a transcoder writes its renditions): rate × factor × Graph::then_fraction, the
-// whole flow for an unconditional step (at a blob store, every write and no read; at a pool, every
-// job whatever its op) and the misses (1 − h of a read) for an `on: miss` one. A share of 0 sends
-// nothing, not a 0/s entry. The same multiplications as CacheBehaviour::route (plan 2b refinement
-// 5), BlobStoreBehaviour::route and WorkerPoolBehaviour::route.
+// transcoding; a transcoder writes its renditions): rate × factor × Graph::then_fraction, the whole
+// flow for an unconditional step (at a blob store, every write and no read; at a pool, every job
+// whatever its op) and the misses (1 − h of a read) for an `on: miss` one. A share of 0 sends
+// nothing, not a 0/s entry. The same multiplications as CacheBehaviour::route (spec §18 entry 5),
+// BlobStoreBehaviour::route and WorkerPoolBehaviour::route.
 void forward_then_steps(const graph::Graph& g, std::size_t from, const OpLoad& arriving,
                         std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   for (const model::Step& step : g.nodes()[from].spec.then) {
@@ -1943,12 +1936,12 @@ void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_
     return;
   }
   // What a blob store or a worker pool sends on along its `then` steps: a store one event per
-  // write, rate × factor, and nothing for a read (plan 2c refinements 6-7, as
-  // BlobStoreBehaviour::route does; S3 has no event for a GET); a pool every step for every job
-  // it is OFFERED (plan 2c Task 7). On paper nothing queues or is dropped: every write that
-  // arrives is served and notifies, and a pool offered more than its workers / cost passes all of
-  // it on (its own line is red; what the engine forwards is what the pool drains, at most its
-  // capacity). The paper load answers "can this ever fit", not "what goes through".
+  // write, rate × factor, and nothing for a read (spec §19 entries 6-7, as
+  // BlobStoreBehaviour::route does; S3 has no event for a GET); a pool every step for every job it
+  // is OFFERED. On paper nothing queues or is dropped: every write that arrives is served and
+  // notifies, and a pool offered more than its workers / cost passes all of it on (its own line is
+  // red; what the engine forwards is what the pool drains, at most its capacity). The paper load
+  // answers "can this ever fit", not "what goes through".
   if (spec.type == model::NodeType::blob_store || spec.type == model::NodeType::worker_pool) {
     const OpLoad arriving = load[from];  // a copy: a step may target `from` itself
     forward_then_steps(g, from, arriving, load, fed_back);
@@ -1992,11 +1985,11 @@ struct PaperPass {
   std::vector<OpLoad> by_op;
 };
 
-// One pass: what the clients send plus what the feedback links carried in the previous
-// pass (`fed_back`, replaced by this pass's), pushed through every node in topological
-// order. Returns the total offered load per node in capacity units (Σ rate_op × cost_op,
-// plan 2a refinement 4), the quantity the node's capacity is a rate of. Forwarding stays
-// in requests: a cost prices work at one node, it does not multiply requests.
+// One pass: what the clients send plus what the feedback links carried in the previous pass
+// (`fed_back`, replaced by this pass's), pushed through every node in topological order. Returns
+// the total offered load per node in capacity units (Σ rate_op × cost_op, spec §17 entry 4), the
+// quantity the node's capacity is a rate of. Forwarding stays in requests: a cost prices work at
+// one node, it does not multiply requests.
 [[nodiscard]] std::vector<double> paper_pass(const graph::Graph& g, const ForwardRoutes& table,
                                              const std::vector<OpLoad>& offered,
                                              std::vector<OpLoad>& fed_back,
@@ -2037,9 +2030,9 @@ struct PaperPass {
   return std::ranges::all_of(totals, [](double t) { return std::isfinite(t); });
 }
 
-// The nodes whose totals moved between the last two passes (`after` may have overflowed): a loop
-// of gain >= 1 still feeds them. Their last figure is the pass cap's or the double's, not a load
-// (review of plan 2c Task 7, minor 6: "5.618e+307/s").
+// The nodes whose totals moved between the last two passes (`after` may have overflowed): a loop of
+// gain >= 1 still feeds them. Their last figure is the pass cap's or the double's, not a load
+// ("5.618e+307/s").
 [[nodiscard]] std::vector<bool> still_growing(std::span<const double> before,
                                               std::span<const double> after) {
   std::vector<bool> growing;
@@ -2098,12 +2091,12 @@ constexpr double shrink_margin = 1e-6;
   return ops;
 }
 
-// The pass cap reached with some totals still moving (review of plan 2c Task 8, minors 2 and 3).
-// Node by node, from the last three passes: a loop of gain just below 1 converges too slowly for
-// the cap (0.9999 needs about 276,000 passes to reach the tolerance), but its increments shrink by
-// the gain every pass, so its fixed point is the geometric series' sum (extrapolated); a loop of
-// gain >= 1 has none, and its nodes' increments do not shrink: they are marked unbounded, their
-// figure the last pass's. Converged when no node is unbounded.
+// The pass cap reached with some totals still moving. Node by node, from the last three passes: a
+// loop of gain just below 1 converges too slowly for the cap (0.9999 needs about 276,000 passes to
+// reach the tolerance), but its increments shrink by the gain every pass, so its fixed point is the
+// geometric series' sum (extrapolated); a loop of gain >= 1 has none, and its nodes' increments do
+// not shrink: they are marked unbounded, their figure the last pass's. Converged when no node is
+// unbounded.
 [[nodiscard]] PaperLoad at_pass_cap(const PaperPass& before, const PaperPass& last,
                                     PaperPass next) {
   PaperLoad load{.totals = std::move(next.totals), .by_op = std::move(next.by_op)};
@@ -2233,22 +2226,20 @@ constexpr std::string_view unknown_hit_ratio_note =
 
 // ---- load the paper pass cannot follow yet ----
 //
-// The paper load (paper_pass, forward_steps) forwards from a client's routes, along a service's
-// (or any node's) `ops` steps, through load balancers and rate limiters over their links
+// The paper load (paper_pass, forward_steps) forwards from a client's routes, along a service's (or
+// any node's) `ops` steps, through load balancers and rate limiters over their links
 // (graph::forwards_by_link), from caches and CDNs on their misses (graph::hits_or_misses), along a
-// blob store's `then` steps, its event notifications (plan 2c Task 4), and from a message queue
-// into each of its consumer groups and along a worker pool's `then` steps (plan 2c Task 7).
-// It does not follow the `then` of a notification fan-out or a URL frontier (types without a
-// phase yet). A node fed through one of those misses that part of its load: with nothing else it
-// shows 0 offered load, a missing number, not a zero, and a verdict on it ("0%, green") would read
-// as "this tier is idle"; with some load from elsewhere its percentage is a lower bound, and a
-// green or yellow verdict on it would read as "this tier has room" (review of 3e23477, I1: a node
-// fed 1/s by a client and 10k/s through a blob store printed "(0.05%, green)"). Its check line says
-// so instead.
+// blob store's `then` steps, its event notifications, and from a message queue into each of its
+// consumer groups and along a worker pool's `then` steps. It does not follow the `then` of a
+// notification fan-out or a URL frontier (types without a phase yet). A node fed through one of
+// those misses that part of its load: with nothing else it shows 0 offered load, a missing number,
+// not a zero, and a verdict on it ("0%, green") would read as "this tier is idle"; with some load
+// from elsewhere its percentage is a lower bound, and a green or yellow verdict on it would read as
+// "this tier has room" (a node fed 1/s by a client and 10k/s through a blob store once printed
+// "(0.05%, green)"). Its check line says so instead.
 
 // Until when the paper load leaves unfollowed what a node of `type` sends on: "not modelled yet",
-// or nothing for a type it follows (or that sends nothing on). (Until plan 2c Task 7 a message
-// queue and a worker pool were "phase 2c".)
+// or nothing for a type it follows (or that sends nothing on).
 [[nodiscard]] std::optional<std::string_view> unfollowed_until(model::NodeType type) {
   using enum model::NodeType;  // C++20, as in provenance
   if (type == notification_fanout || type == frontier) return "not modelled yet";
@@ -2326,8 +2317,8 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 
 // "load not propagated: frontier is not modelled yet)" or, with several types, grouped by how long
 // each stays unfollowed, in the order they come: "... frontier and notification_fanout are not
-// modelled yet)". (Every type left unfollowed now waits for the same thing, so there is one group;
-// the grouping held "phase 2c" apart until plan 2c Task 7 and will hold the next phase's apart.)
+// modelled yet)". (Every type left unfollowed now waits for the same thing, phase 3, so there is
+// one group; the grouping will hold the next phase's types apart.)
 [[nodiscard]] std::string unpropagated_mark(std::span<const model::NodeType> blocked) {
   std::vector<std::pair<std::string_view, std::vector<std::string>>> groups;
   for (const model::NodeType type : blocked) {
@@ -2418,16 +2409,15 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   return std::string{zone_name(busiest)} + " at the busiest copy";
 }
 
-// Utilization at the paper load: peak offered / (capacity per replica × replicas, × shards
-// for a sharded database: every shard is a full set of copies), with the node's own zone
-// thresholds (a database's busiest copy's, headline_zone), and the hottest copy's behind a hash
-// ring. Both are in capacity units (requests when every cost is 1); a database's are labelled
-// so, "peak offered 1.5k units/s", as its per-copy checks are (a write costs 5 of them), and a
-// byte-sized node's are megabytes, "peak offered 14.08k MB/s (281.6/s)", the requests beside
-// them (plan 2c refinement 2: the request's own size in MB, Graph::request_bytes, so the
-// percentage is the bytes' and youtube's cdn_us is at 14.1 %).
-// Capacity per replica × replicas, × shards for a sharded database (every shard is a full set
-// of copies), in capacity units per second.
+// Utilization at the paper load: peak offered / (capacity per replica × replicas, × shards for a
+// sharded database: every shard is a full set of copies), with the node's own zone thresholds (a
+// database's busiest copy's, headline_zone), and the hottest copy's behind a hash ring. Both are in
+// capacity units (requests when every cost is 1); a database's are labelled so, "peak offered 1.5k
+// units/s", as its per-copy checks are (a write costs 5 of them), and a byte-sized node's are
+// megabytes, "peak offered 14.08k MB/s (281.6/s)", the requests beside them (spec §19 entry 2: the
+// request's own size in MB, Graph::request_bytes, so the percentage is the bytes' and youtube's
+// cdn_us is at 14.1 %). Capacity per replica × replicas, × shards for a sharded database (every
+// shard is a full set of copies), in capacity units per second.
 [[nodiscard]] double total_capacity(const graph::ResolvedNode& node) {
   const double copies = node.spec.replicas * node.spec.shards.value_or(1);
   return node.capacity.service_rate.per_second * copies;
@@ -2444,11 +2434,11 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   return fmt_units(node.spec, offered) + " (" + fmt_rate(requests) + ")";
 }
 
-// A kv_cluster's head (plan 2c refinement 9; book ch. 6): every request goes to N replicas, so
-// its paper load is N times the requests (defaults::op_cost) and its capacity `nodes` times one
+// A kv_cluster's head (spec §19 entry 9; book ch. 6): every request goes to N replicas, so its
+// paper load is N times the requests (defaults::op_cost) and its capacity `nodes` times one
 // machine's (graph::apply_kv_ring), and the line says both: "peak offered 90k/s (30k/s × N 3) vs
-// 80k/s (8 nodes)  ", the replica-requests with the requests that make them, the machines'
-// total with how many there are.
+// 80k/s (8 nodes)  ", the replica-requests with the requests that make them, the machines' total
+// with how many there are.
 [[nodiscard]] std::string kv_check_head(const graph::ResolvedNode& node, double offered,
                                         const OpLoad& arriving) {
   const double requests = std::ranges::fold_left(arriving | std::views::values, 0.0, std::plus<>{});
@@ -2587,17 +2577,16 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   return megabytes;
 }
 
-// A bandwidth link's check (plan 2c Task 5): the megabytes its sender puts on it at the paper load
-// against the pipe's bandwidth in MB/s, "peak offered 100 MB/s vs 125 MB/s  (80%, yellow)", with
-// the generic zones of a pipe (defaults::pipe_capacity). When the sender's own load is incomplete
+// A bandwidth link's check: the megabytes its sender puts on it at the paper load against the
+// pipe's bandwidth in MB/s, "peak offered 100 MB/s vs 125 MB/s  (80%, yellow)", with the generic
+// zones of a pipe (defaults::pipe_capacity). When the sender's own load is incomplete
 // (blocked_on_the_way, or the sender is a type the paper load does not follow) it is marked as a
 // node's is (partial_check): no percentage when nothing reached the link, a lower bound otherwise.
 // When the sender's load rests on an unknown hit ratio (it is behind such a cache, or it is one,
-// whose misses are what it sends on: counts_unknown_hit_ratio, unknown_misses) the line carries
-// the node lines' upper-bound note: every read counted as a miss. When a loop of gain >= 1 feeds
-// the sender (PaperLoad::unbounded), what it puts on the link has no figure either, and the line
-// says so as a node's does (unbounded_check; review of plan 2c Task 8, minor 1: a link behind a
-// gain-2 loop printed "8.988e+307 MB/s").
+// whose misses are what it sends on: counts_unknown_hit_ratio, unknown_misses) the line carries the
+// node lines' upper-bound note: every read counted as a miss. When a loop of gain >= 1 feeds the
+// sender (PaperLoad::unbounded), what it puts on the link has no figure either, and the line says
+// so as a node's does (unbounded_check; a link behind a gain-2 loop printed "8.988e+307 MB/s").
 [[nodiscard]] std::string link_check(const graph::Graph& g, const ForwardRoutes& table,
                                      const PaperLoad& load, std::size_t link,
                                      std::span<const model::NodeType> blocked_at_sender,
@@ -2776,13 +2765,13 @@ void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
     unavailable = true;
     return;
   }
-  // Weighted by the requests ANSWERED (plan 2a refinement 8): a request a limiter refused
-  // or a full queue dropped never saw this latency, so it must not weigh it. In a step where
-  // a limiter refuses 3 of 4 requests, only the admitted quarter counts.
+  // Weighted by the requests ANSWERED (spec §17 entry 8): a request a limiter refused or a full
+  // queue dropped never saw this latency, so it must not weigh it. In a step where a limiter
+  // refuses 3 of 4 requests, only the admitted quarter counts.
   by_answered.add(sample.answered.per_second * dt_s, response.mean_s, response.variance_s2);
   by_time.add(dt_s, response.mean_s, response.variance_s2);
-  // Weighted by the requests DELIVERED (review of plan 2c, C-1): the client's quantiles range over
-  // every request that came back, the ones it gave up on included.
+  // Weighted by the requests DELIVERED: the client's quantiles range over every request that came
+  // back, the ones it gave up on included.
   const auto& delivered = sample.delivered_response;
   by_delivered.add((sample.answered.per_second + sample.timed_out.per_second) * dt_s,
                    delivered.mean_s, delivered.variance_s2);
@@ -2888,11 +2877,10 @@ void Summary::observe_windows(const engine::StepRecord& record) {
 }
 
 // The current window of `windowed` judged like a whole run (evaluate_slo), with where it starts.
-// Every window is judged (review of the Task 12/13 fix rounds and Task 14, I-1): a queue still
-// draining after its clients stopped is busy, and its utilization, drops or lag in that window
-// count. Only a latency SLO skips a window, one in which its op was not offered: the same
-// evaluate_slo leaves out an op nobody sent (worst_latency, nothing_offered), as an idle
-// service's p99 would be its service time's, a bound no request met.
+// Every window is judged: a queue still draining after its clients stopped is busy, and its
+// utilization, drops or lag in that window count. Only a latency SLO skips a window, one in which
+// its op was not offered: the same evaluate_slo leaves out an op nobody sent (worst_latency,
+// nothing_offered), as an idle service's p99 would be its service time's, a bound no request met.
 SloResult Summary::judge_window(const WindowedSlo& windowed) const {
   const Summary& window = windowed.current.front();
   SloResult result = evaluate_slo(window, window.nodes(), window.ops(), windowed.slo);
@@ -3218,10 +3206,10 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
 // - an infinite latency is written as `inf` (which spreadsheet and plotting tools parse),
 //   unlike the table ("unavailable") and JSON (null), read by people or by parsers
 //   without an infinity;
-// - `queue_lag_s` (plan 2c Task 8, engine::NodeSample::queue_lag_s) is a message queue's lag in
+// - `queue_lag_s` (engine::NodeSample::queue_lag_s) is a message queue's lag in
 //   SECONDS (a lag is minutes or hours, plotted against the backlog), and EMPTY on every other
 //   row, clients' and links' included: a 0 would claim a lag the node cannot have;
-// - after the nodes, a row per link with a bandwidth (plan 2c Task 5), `from->to` in the node
+// - after the nodes, a row per link with a bandwidth, `from->to` in the node
 //   column, in MEGABYTES (engine::LinkSample): the pipe is a queue, so the same identity holds on
 //   its rows, `rejected_per_s` is 0 and `latency_ms` is a request's wait plus its answer time on
 //   the wire (a write's whole serialisation, any other op's first megabyte).

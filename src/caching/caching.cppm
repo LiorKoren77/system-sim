@@ -1,5 +1,5 @@
-// Module `simsys.caching`: how much of the read traffic a cache absorbs (spec §5, §7 cache
-// row; phase 2b refinement 2).
+// Module `simsys.caching`: how much of the read traffic a cache absorbs (spec §5, §7 cache row;
+// spec §18 entry 2).
 //
 // Models: the hit ratio of the cache tier of System Design Interview ch. 1 (and of the URL
 // shortener's cache in ch. 8), computed from the clients' request popularity with the Che
@@ -194,12 +194,12 @@ struct CheHitRatio {
 namespace simsys::caching {
 namespace {
 
-// Number of log-spaced buckets a Zipf key space is grouped into (phase 2b refinement 2).
-// Error: measured against dense sums (N ≤ 1e5) and against 40 000 buckets (N = 1e9), the
-// relative hit-ratio error is at most 2e-6 for s ≤ 3 and N ≤ 1e9 (the dense-sum test pins
-// 1e-5). It grows with the spread of p inside a bucket, a factor of up to N^{s/B}, so with
-// N^{1/B}: a larger key space needs more buckets for the same accuracy. Cost: building
-// the buckets of a 1e8-key space and solving Che takes about half a millisecond.
+// Number of log-spaced buckets a Zipf key space is grouped into (spec §18 entry 2). Error: measured
+// against dense sums (N ≤ 1e5) and against 40 000 buckets (N = 1e9), the relative hit-ratio error
+// is at most 2e-6 for s ≤ 3 and N ≤ 1e9 (the dense-sum test pins 1e-5). It grows with the spread of
+// p inside a bucket, a factor of up to N^{s/B}, so with N^{1/B}: a larger key space needs more
+// buckets for the same accuracy. Cost: building the buckets of a 1e8-key space and solving Che
+// takes about half a millisecond.
 constexpr int zipf_bucket_count = 2000;
 
 // ∫_a^b x^{−s} dx, in a form that stays accurate as s → 1:

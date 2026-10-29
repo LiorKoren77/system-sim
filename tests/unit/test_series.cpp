@@ -1,5 +1,5 @@
-// The series files and the explain marks of phase 2b's refinement 7: what a student can check
-// from the output alone.
+// The series files and the explain marks of spec §18 entry 13: what a student can check from the
+// output alone.
 //  - the node series carries each node's demand and drain, so the conservation law
 //    Σ demand·dt = Σ (drain + drops)·dt + backlog can be checked from the CSV;
 //  - a second file carries, per client op, what was offered and what came back answered;
@@ -114,13 +114,11 @@ Scenario spike_into_big_queue() {
 }
 
 // Two clients feed `db` (a service of 2k/s): `reader` sends `read_rate` of `read` straight to it
-// over a client route, which the paper load follows; `uploader` sends 10k/s of `put` to `blobs`,
-// a blob store whose `then` writes each upload's metadata to db (an event notification: the paper
-// load follows it since plan 2c Task 4; before, it did not and db's load was only the reader's
-// part: the probe of the review of 3e23477, I1). A blob store notifies only for its writes (review
-// of Task 4, I1), so `blobs` lists `put` in its `write_ops` (S3's PUT, ObjectCreated): with the
-// default `[write]` a put would be a read and notify nobody. `blobs` also has a link to `audit`
-// but no step along it: nothing flows there.
+// over a client route, which the paper load follows; `uploader` sends 10k/s of `put` to `blobs`, a
+// blob store whose `then` writes each upload's metadata to db (an event notification: the paper
+// load follows it; before). A blob store notifies only for its writes, so `blobs` lists `put` in
+// its `write_ops` (S3's PUT, ObjectCreated): with the default `[write]` a put would be a read and
+// notify nobody. `blobs` also has a link to `audit` but no step along it: nothing flows there.
 Scenario partly_behind_blob_store(double read_rate) {
   Scenario s{.name = "partial", .version = 1, .duration = 1s, .step = 100ms};
   s.nodes = {
@@ -346,7 +344,7 @@ TEST_CASE("every row of a run has eleven fields, one row per node per step", "[s
   REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 11; }));
 }
 
-// ---- node series: queue_lag_s (plan 2c Task 8) ----
+// ---- node series: queue_lag_s ----
 //
 // A message queue's lag (engine::NodeSample::queue_lag_s: its worst consumer group's wait,
 // max(backlog / drain, k x Wq)) is the node series' last column, `queue_lag_s`, in SECONDS (not
@@ -563,9 +561,8 @@ TEST_CASE(
                                                    .response = {.mean_s = 0.0125}}}});
   const auto rows = data_rows(out.str());
   REQUIRE(rows.size() == 1);
-  // t_s, client, op, offered_per_s, answered_per_s, timed_out_per_s (review of plan 2c Task 13,
-  // minor 6: what the client gave up on, delivered after its timeout), mean_ms: 0.0125 s is
-  // 12.5 ms.
+  // t_s, client, op, offered_per_s, answered_per_s, timed_out_per_s (what the client gave up on,
+  // delivered after its timeout), mean_ms: 0.0125 s is 12.5 ms.
   REQUIRE(rows[0] == std::vector<std::string>{"0.2", "c", "op", "250.5", "125.25", "4.5", "12.5"});
 }
 
@@ -647,13 +644,12 @@ TEST_CASE("a limiter that refuses half of the requests shows answered = offered 
 
 // ---- answered counts what was lost, not what was served in the same step ----
 //
-// A request that waits in a growing queue is answered later, not lost. The per-step delivered
-// share at a queue is therefore 1 − (dropped + rejected) / inflow (engine.cppm,
-// account_rejections): only a drop or a refusal makes a request unanswered, and a backlog that
-// grows and drains again is neutral. Before (review of 3e23477, I2) it was served / inflow capped
-// at 1, which counted every request still waiting at the end of its arrival step as unanswered
-// and never credited it later: the review's probe, this spike over a 2-minute run, reported
-// 583/s answered of 667/s offered with nothing dropped.
+// A request that waits in a growing queue is answered later, not lost. The per-step delivered share
+// at a queue is therefore 1 − (dropped + rejected) / inflow (engine.cppm, account_rejections): only
+// a drop or a refusal makes a request unanswered, and a backlog that grows and drains again is
+// neutral. Before it was served / inflow capped at 1, which counted every request still waiting at
+// the end of its arrival step as unanswered and never credited it later: the review's probe, this
+// spike over a 2-minute run, reported 583/s answered of 667/s offered with nothing dropped.
 
 TEST_CASE("a backlog that grows and drains without drops leaves answered equal to offered",
           "[series]") {
@@ -739,22 +735,22 @@ TEST_CASE("the JSON's answered_per_s equals offered_per_s when nothing is droppe
 //
 // The paper load (report.cpp: paper_pass / forward_steps) forwards load from a client's routes,
 // from a service or worker over its `ops` steps, through load balancers and rate limiters over
-// their links (graph::forwards_by_link) and from caches and CDNs on misses (hits_or_misses).
-// A notification fan-out's and a URL frontier's `then` are not followed (types with no phase yet),
-// so the nodes that only they feed show 0 offered load: before this change, `0%, green`, a verdict
-// on a number that is missing, not zero. A blob store's `then` is followed since plan 2c Task 4
-// (its steps are event notifications that fire for every request it serves, and its capacity
-// counts megabytes), and a message queue's deliveries and a worker pool's `then` since Task 7:
-// what they feed has its load and its verdict.
+// their links (graph::forwards_by_link) and from caches and CDNs on misses (hits_or_misses). A
+// notification fan-out's and a URL frontier's `then` are not followed (types with no phase yet), so
+// the nodes that only they feed show 0 offered load: before this change, `0%, green`, a verdict on
+// a number that is missing, not zero. A blob store's `then` is followed (its steps are event
+// notifications that fire for every request it serves, and its capacity counts megabytes), and a
+// message queue's deliveries and a worker pool's `then` too: what they feed has its load and its
+// verdict.
 
 // Peak (21:00) of youtube: both clients at base x 1.6 (200 -> 320/s, 100 -> 160/s), 480/s in all,
 // of which 2 % are uploads: 9.6/s. original_store's event publishes one message per upload to
-// transcode_q, 9.6/s; the 600 transcoders (60 s each: 600 / 60 = 10 jobs/s, plan 2c Task 16) are
-// OFFERED all of it, since the paper load does not queue: 9.6 / 10 = 0.96, 96 %, red (red is a
-// utilization verdict from 90 %; nothing backs up, and transcode_q's lag stays at the Erlang
-// wait, 0.57 s; at the 400 workers it shipped with, 144 %, the run built a backlog). Per job they
-// publish one message to completion_q (9.6/s of 1M/s: 0.00096 %), which completion_handler (4
-// workers at 5 ms = 800/s) is offered: 9.6 / 800 = 1.2 %, green.
+// transcode_q, 9.6/s; the 600 transcoders (60 s each: 600 / 60 = 10 jobs/s) are OFFERED all of it,
+// since the paper load does not queue: 9.6 / 10 = 0.96, 96 %, red (red is a utilization verdict
+// from 90 %; nothing backs up, and transcode_q's lag stays at the Erlang wait, 0.57 s; at the 400
+// workers it shipped with, 144 %, the run built a backlog). Per job they publish one message to
+// completion_q (9.6/s of 1M/s: 0.00096 %), which completion_handler (4 workers at 5 ms = 800/s) is
+// offered: 9.6 / 800 = 1.2 %, green.
 TEST_CASE("explain follows youtube from the blob store through the queues and pools: no mark",
           "[series]") {
   const auto text = explain_shipped("youtube");
@@ -809,13 +805,13 @@ TEST_CASE("explain follows google-drive's notify_q into its consumers and the ba
 // (32 / 0.005 s = 6.4k jobs/s) are offered all of it: 2162 / 6400 = 33.8 %, green. Per job they
 // read graph_db once and write 300 feed entries: 2.162k x 300 = 648.6k/s at feed_cache, on top of
 // its 12.97k/s of reads: 661.5k/s, a complete number (no lower bound, no mark), against the 10
-// replicas x 100k/s plan 2c Task 17 sized it with (one replica, as first shipped, was 662 %, red).
-// graph_db is a kv_cluster of 6 nodes of 30k/s keeping N = 3 copies (plan 2c Task 10): each read
-// goes to 3 replicas, 3 x 2.162k = 6.486k replica-requests/s over 6 x 30k = 180k/s, 3.6 % on
-// average; behind the ring (default 150 virtual nodes, k = 1 + z_6/sqrt(3 x 150) = 1.0604, z_6 =
-// 1.2816 the expected maximum of 6 standard normals) the hottest node is sent 1.0604 x 1.081k =
-// 1.146k/s of its 30k/s: 3.821 %, printed as 3.82 %, green. The "not checked" note of the phase
-// before the model is gone. The node line marks the mode, which the scenario leaves to its default.
+// replicas x 100k/s it is sized with (one replica, as first shipped, was 662 %, red). graph_db is a
+// kv_cluster of 6 nodes of 30k/s keeping N = 3 copies: each read goes to 3 replicas, 3 x 2.162k =
+// 6.486k replica-requests/s over 6 x 30k = 180k/s, 3.6 % on average; behind the ring (default 150
+// virtual nodes, k = 1 + z_6/sqrt(3 x 150) = 1.0604, z_6 = 1.2816 the expected maximum of 6
+// standard normals) the hottest node is sent 1.0604 x 1.081k = 1.146k/s of its 30k/s: 3.821 %,
+// printed as 3.82 %, green. The "not checked" note of the phase before the model is gone. The node
+// line marks the mode, which the scenario leaves to its default.
 TEST_CASE("explain follows news-feed's fanout pool into graph_db and the feed caches", "[series]") {
   const auto text = explain_shipped("news-feed");
   CAPTURE(text);
@@ -849,8 +845,8 @@ TEST_CASE("nodes the paper load does reach keep their verdict and are not marked
     REQUIRE(line.contains("green"));
     REQUIRE_FALSE(line.contains("load not propagated"));
   }
-  // The CDNs and the blob store fed straight from clients or caches are checked in MB/s (plan 2c
-  // refinement 2), with a percentage and a zone: no "not checked" note, no propagation mark.
+  // The CDNs and the blob store fed straight from clients or caches are checked in MB/s (spec §19
+  // entry 2), with a percentage and a zone: no "not checked" note, no propagation mark.
   for (const auto* id : {"cdn_us", "original_store"}) {
     CAPTURE(id);
     const auto line = check_line(text, id);
@@ -863,24 +859,23 @@ TEST_CASE("nodes the paper load does reach keep their verdict and are not marked
 
 // ---- explain: a node fed partly through such a type gets a lower bound, not a verdict ----
 //
-// The mark above covered only nodes whose paper load was exactly 0. A node that also receives
-// load the paper pass follows got an ordinary verdict on a partial number (review of 3e23477,
-// I1): db below, fed 1/s by a client and 10k/s through a blob store's `then`, printed
-// "(0.05%, green)". Every node with a blocking predecessor, direct or further up, is now marked;
-// a reached one keeps its percentage as a lower bound ("≥"), with no zone below red. A red lower
-// bound is a true verdict (the real load is at least that), so it keeps its "red". The blob store
-// stopped being a blocking type in plan 2c Task 4 (its `then` is followed), so the two db cases
-// below now show the complete number; the lower bound still marks what lies behind a worker pool
-// or a message queue (the youtube cases further down).
+// The mark above covered only nodes whose paper load was exactly 0. A node that also receives load
+// the paper pass follows got an ordinary verdict on a partial number: db below, fed 1/s by a client
+// and 10k/s through a blob store's `then`, printed "(0.05%, green)". Every node with a blocking
+// predecessor, direct or further up, is now marked; a reached one keeps its percentage as a lower
+// bound ("≥"), with no zone below red. A red lower bound is a true verdict (the real load is at
+// least that), so it keeps its "red". The blob store is no blocking type (its `then` is followed),
+// so the two db cases below now show the complete number; the lower bound still marks what lies
+// behind a worker pool or a message queue (the youtube cases further down).
 
 TEST_CASE("a node fed partly through a blob store counts the store's notifications in full",
           "[series]") {
   const auto text = explain_of(partly_behind_blob_store(1.0));
   CAPTURE(text);
   const auto line = check_line(text, "db");
-  // 1/s of reads plus the blob store's 10k/s of writes (one per served upload, factor 1) is
-  // 10001/s against 2k/s: 500 %, red, a complete number: no lower bound and no mark (plan 2c
-  // Task 4: a blob store's then steps are followed).
+  // 1/s of reads plus the blob store's 10k/s of writes (one per served upload, factor 1) is 10001/s
+  // against 2k/s: 500 %, red, a complete number: no lower bound and no mark (a blob store's then
+  // steps are followed).
   REQUIRE(line.contains("(500%, red)"));
   REQUIRE_FALSE(line.contains("load not propagated"));
   REQUIRE_FALSE(line.contains("≥"));
@@ -896,9 +891,9 @@ TEST_CASE("a blob store's notifications add to the load a node gets from elsewhe
 }
 
 // A red lower bound is a true verdict: 3000/s of reads alone against 2k/s is 150 %, so db is
-// overloaded whatever else the fan-out adds. Its line keeps the percentage as a lower bound
-// ("≥"), keeps "red", and names the type whose flow is missing. (Re-pinned on a type that stays
-// blocking: the blob store this test used before is followed since plan 2c Task 4.)
+// overloaded whatever else the fan-out adds. Its line keeps the percentage as a lower bound ("≥"),
+// keeps "red", and names the type whose flow is missing. (Re-pinned on a type that stays blocking:
+// the blob store this test used before is followed.)
 TEST_CASE("a red lower bound stays red", "[series]") {
   const auto text = explain_of(partly_behind_fanout(3000.0));
   CAPTURE(text);
@@ -942,16 +937,15 @@ TEST_CASE("explain gives youtube's metadata_db and metadata_cache the completion
   REQUIRE_FALSE(cache.contains("load not propagated"));
 }
 
-// chat-system's two kv_clusters are checked since plan 2c Task 10 (they printed "not checked"
-// before):
+// chat-system's two kv_clusters are checked (they once printed "not checked"):
 //  - message_store, 12 nodes of 10k/s, N = 3, vnodes 256 (k = 1 + z_12/sqrt(3 x 256) = 1.0590,
 //    z_12 = 1.6350): the peak 31.5k writes/s x 3 = 94.5k replica-requests/s over 120k/s, 78.75 %
 //    on average, the hottest node 1.0590 x 7.875k = 8.340k/s = 83.4 %: yellow (from 70 %);
 //  - presence, 4 nodes of the type's default 50k/s, N = 2, default vnodes (k = 1 + z_4/sqrt(2 x
 //    150) = 1.0606): 81k/s x 2 = 162k over 200k/s, 81 % on average, the hottest 1.0606 x 40.5k =
 //    42.95k = 85.9 %: yellow (red from 90 %).
-// Behind the message queue and the pools the paper load follows since Task 7, so nothing says
-// "load not propagated" and nothing blames a queue or a pool.
+// Behind the message queue and the pools the paper load follows, so nothing says "load not
+// propagated" and nothing blames a queue or a pool.
 TEST_CASE("explain checks chat-system's two kv_clusters at their hottest node", "[series]") {
   const auto text = explain_shipped("chat-system");
   CAPTURE(text);
@@ -969,12 +963,11 @@ TEST_CASE("explain checks chat-system's two kv_clusters at their hottest node", 
   }
 }
 
-// chat-system's presence and notification-system's log_db keep N = 2 copies and answer at the
-// first reply for reads and writes alike (W = R = 1): fast, and the quorums do not overlap, so a
-// read may miss the latest write, which explain now says (review of plan 2c Tasks 9-10, minor 6)
-// beside the mode the scenarios leave to its default. Their rings: 4 machines, k = 1 + z_4 /
-// sqrt(2 x 150) = 1.0606, printed 1.06; 3 machines, 1 + z_3 / sqrt(300) = 1.0502, printed 1.05
-// (1.08 for both with the old 1 + 1/sqrt(150)).
+// chat-system's presence and notification-system's log_db keep N = 2 copies and answer at the first
+// reply for reads and writes alike (W = R = 1): fast, and the quorums do not overlap, so a read may
+// miss the latest write, which explain now says beside the mode the scenarios leave to its default.
+// Their rings: 4 machines, k = 1 + z_4 / sqrt(2 x 150) = 1.0606, printed 1.06; 3 machines, 1 + z_3
+// / sqrt(300) = 1.0502, printed 1.05 (1.08 for both with the old 1 + 1/sqrt(150)).
 TEST_CASE("explain notes the non-overlapping quorums of chat's presence and notification's log_db",
           "[series]") {
   const auto chat = explain_shipped("chat-system");
@@ -989,12 +982,12 @@ TEST_CASE("explain notes the non-overlapping quorums of chat's presence and noti
                         "mode=ap (default; partitions: phase 3)  imbalance=1.05 (vnodes 150)"));
 }
 
-// Web crawler (ch. 9): the URL frontier hands URLs to the downloader along its `then` (a type
-// the model has no phase for yet), and the downloader, a worker pool, sends on along its own,
-// which the paper load follows since plan 2c Task 7. dns is behind both, but only the frontier is
-// a type whose onward flow is missing: the mark names it and no longer the worker pool. The
-// frontier is reached by the seeds (50/s) and also fed back by url_seen's misses, which come
-// through the downloader and the frontier itself: a lower bound as well.
+// Web crawler (ch. 9): the URL frontier hands URLs to the downloader along its `then` (a type the
+// model has no phase for yet), and the downloader, a worker pool, sends on along its own, which the
+// paper load follows. dns is behind both, but only the frontier is a type whose onward flow is
+// missing: the mark names it and no longer the worker pool. The frontier is reached by the seeds
+// (50/s) and also fed back by url_seen's misses, which come through the downloader and the frontier
+// itself: a lower bound as well.
 TEST_CASE("explain names only the frontier on the way to a web-crawler node", "[series]") {
   const auto text = explain_shipped("web-crawler");
   CAPTURE(text);
@@ -1031,7 +1024,7 @@ TEST_CASE("explain names every blocking type on the way to a node, nearest first
                         "yet)"));
 }
 
-// ---- A link's bandwidth is a pipe: its rows in the series and the JSON (plan 2c Task 5) ----
+// ---- A link's bandwidth is a pipe: its rows in the series and the JSON ----
 //
 // A link with a bandwidth is a queue of megabytes and is plotted like a node: one CSV row per
 // step with the link's name, `from->to`, in the `node` column, the same eleven columns, in
@@ -1185,30 +1178,30 @@ TEST_CASE("the JSON has an empty links array when no link has a bandwidth", "[se
   REQUIRE_FALSE(json.contains("a->b"));
 }
 
-// What a link without a bandwidth did before Task 5 must not change by a byte. `tutorial/chain`
-// (1.5k/s through two services and a database, no bandwidth, no size) is run for its whole 2
-// minutes and its node series and op series hashed (64-bit FNV-1a over the bytes of each file);
-// the hashes were taken from the output at 0097309, the commit before the pipe, with the same
-// seed. A pipe's code path that leaks into a link without one changes a number, a row or a
-// delay-line slot, and with it the hash. It guards Task 5 (and every later change to the pipe)
-// against touching plain links; a later task that changes `chain`'s numbers ON PURPOSE (a new
-// default, a model change that reaches services or databases) re-pins both hashes in the same
-// commit and says why.
+// What a link without a bandwidth did before pipes existed must not change by a byte.
+// `tutorial/chain` (1.5k/s through two services and a database, no bandwidth, no size) is run for
+// its whole 2 minutes and its node series and op series hashed (64-bit FNV-1a over the bytes of
+// each file); the hashes were taken from the output of the last build before the pipe, with the
+// same seed. A pipe's code path that leaks into a link without one changes a number, a row or a
+// delay-line slot, and with it the hash. It guards the pipe (and every later change to it) against
+// touching plain links; a later task that changes `chain`'s numbers ON PURPOSE (a new default, a
+// model change that reaches services or databases) re-pins both hashes in the same commit and says
+// why.
 //
-// Re-pinned for plan 2c Task 8, on purpose: the node series gained a trailing `queue_lag_s`
-// column (empty on every row but a message queue's), so each of the chain's 3,600 node rows ends
-// in a comma and the header in `,queue_lag_s`, and nothing else changed. The new node hash was
-// not taken from a build of Task 8 but derived from the old output: the series of the binary at
-// b4e263a (which reproduces the old hash, 0x3d3a6ed1d31da525) with `,queue_lag_s` appended to
-// its header and `,` to each of its 3,600 rows, hashed with this function. An implementation
-// whose chain rows differ from that in any byte (a number in the new column, a different empty
-// cell) fails here. The op series had no new column then: its hash was the old one.
+// Re-pinned on purpose: the node series gained a trailing `queue_lag_s` column (empty on every row
+// but a message queue's), so each of the chain's 3,600 node rows ends in a comma and the header in
+// `,queue_lag_s`, and nothing else changed. The new node hash was not taken from a build with the
+// column but derived from the old output: the series of the binary before it (which reproduces the
+// old hash, 0x3d3a6ed1d31da525) with `,queue_lag_s` appended to its header and `,` to each of its
+// 3,600 rows, hashed with this function. An implementation whose chain rows differ from that in any
+// byte (a number in the new column, a different empty cell) fails here. The op series had no new
+// column then: its hash was the old one.
 //
-// Re-pinned for the review of plan 2c Task 13 (minor 6), on purpose: the op series gained a
-// `timed_out_per_s` column after `answered_per_s`, 0 on every row of the chain (its client has no
-// timeout), and nothing else changed. Derived the same way: the op series of the binary at
-// 691a3ef (which reproduces the old hash, 0x9dfc7de84e1afe59) with `timed_out_per_s` inserted in
-// its header and `0` in each of its rows before `mean_ms`, hashed with this function.
+// Re-pinned on purpose: the op series gained a `timed_out_per_s` column after `answered_per_s`, 0
+// on every row of the chain (its client has no timeout), and nothing else changed. Derived the same
+// way: the op series of the binary at 691a3ef (which reproduces the old hash, 0x9dfc7de84e1afe59)
+// with `timed_out_per_s` inserted in its header and `0` in each of its rows before `mean_ms`,
+// hashed with this function.
 namespace {
 std::uint64_t fnv1a(const std::string& text) {
   std::uint64_t hash = 0xcbf29ce484222325ULL;  // the 64-bit FNV offset basis
@@ -1242,14 +1235,14 @@ TEST_CASE("the tutorial chain's series are byte for byte what they were before l
   REQUIRE(fnv1a(ops_out.str()) == 0xa2e246b7176cc3f3ULL);    // re-pinned for timed_out_per_s
 }
 
-// ---- explain on youtube: a pool's capacity is workers / cost (plan 2c Task 6) ----
+// ---- explain on youtube: a pool's capacity is workers / cost ----
 //
 // (node_line is tests/support/explain_lines.hpp's, shared with test_report.cpp.)
 
 // transcoders: 600 workers at 60 s a video = 600 / 60 s = 10 videos/s (it was the worker_pool
-// type's default 1k/s: 2 ms at c = 2; 400 workers, 6.667/s, until plan 2c Task 16 sized the pool).
-// completion_handler: 4 workers at 5 ms = 4 / 0.005 s = 800/s. Only the capacity figure moves in
-// Task 6; Task 7 follows the load through the queues and fills in the offered one.
+// type's default 1k/s: 2 ms at c = 2; 400 workers, 6.667/s). completion_handler: 4 workers at 5 ms
+// = 4 / 0.005 s = 800/s. The capacity figure is workers / cost; the paper load follows the queues
+// and fills in the offered one.
 TEST_CASE("explain checks youtube's transcoders against workers over cost: 10 a second",
           "[series]") {
   const auto text = explain_shipped("youtube");
@@ -1268,7 +1261,7 @@ TEST_CASE("explain describes youtube's transcode queue and transcoders", "[serie
   CAPTURE(text);
   const auto transcoders = node_line(text, "transcoders");
   REQUIRE(transcoders.contains("capacity=10/s (workers / cost)"));
-  // 7 days x 10/s = 604,800 s x 600 / 60 = 6,048,000 messages: 6.048M (review of Task 6, M-1).
+  // 7 days x 10/s = 604,800 s x 600 / 60 = 6,048,000 messages: 6.048M.
   REQUIRE(transcoders.contains("queue_limit=6.048M (retention × capacity)"));
   REQUIRE(transcoders.contains("consumes=transcode_q  workers=600 cost=1m"));
   const auto queue = node_line(text, "transcode_q");
