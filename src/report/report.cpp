@@ -161,8 +161,13 @@ constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
   return with_si_prefix(per_second) + "/s";
 }
 
+// A ratio as a percentage, three significant digits (12.3%, 0.048%), and from 1000 % on in whole
+// percents (10000%), where three significant digits would need an exponent, "1e+04%" (review of
+// plan 2c Tasks 9-10, minor 11). 999.5 and up rounds to four digits, so that is where it switches.
 [[nodiscard]] std::string percent(double ratio) {
-  return num(ratio * 100.0, 3) + "%";
+  const double value = ratio * 100.0;
+  if (value >= 999.5) return to_text(value, std::chars_format::fixed, 0) + "%";
+  return num(value, 3) + "%";
 }
 
 // ---- enum names ----
@@ -349,8 +354,11 @@ struct Overloaded : Fs... {
   }
   std::optional<double> worst;
   for (const auto& node : nodes) {
-    // The possibly-NaN lag first, so std::max passes a NaN on rather than hide it.
-    if (node.peak_queue_lag_s) worst = std::max(*node.peak_queue_lag_s, worst.value_or(0.0));
+    // flow::nan_propagating_max: a NaN lag at any queue stays in the fold, where std::max would
+    // let the next queue's finite lag replace it.
+    if (node.peak_queue_lag_s) {
+      worst = flow::nan_propagating_max(*node.peak_queue_lag_s, worst.value_or(0.0));
+    }
   }
   return worst;
 }
@@ -552,16 +560,23 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
   return "replication\n" + aligned(rows);
 }
 
+// An op's latency cell: `-` when nobody was answered (review of plan 2c Tasks 9-10, minor 8: a sink
+// that fails everything it serves has no latency to show, only the sojourn of requests that all
+// failed), else the duration.
+[[nodiscard]] std::string op_latency_cell(const OpSummary& op, double seconds_value) {
+  return op.answered_per_s > 0.0 ? fmt_duration(seconds_value) : "-";
+}
+
 [[nodiscard]] std::string op_table(const Summary& summary) {
   std::vector<Row> rows{
       {{"client.op"}, {"offered/s"}, {"mean"}, {"p50"}, {"p95"}, {"p99"}, {"(estimated)"}}};
   for (const auto& op : summary.ops()) {
     rows.push_back({{op.client + "." + op.op},
                     {with_si_prefix(op.offered_per_s)},
-                    {fmt_duration(op.mean_s)},
-                    {fmt_duration(op.p50_s)},
-                    {fmt_duration(op.p95_s)},
-                    {fmt_duration(op.p99_s)}});
+                    {op_latency_cell(op, op.mean_s)},
+                    {op_latency_cell(op, op.p50_s)},
+                    {op_latency_cell(op, op.p95_s)},
+                    {op_latency_cell(op, op.p99_s)}});
   }
   return "ops (percentiles estimated: lognormal fit to the response moments)\n" + aligned(rows);
 }
@@ -870,7 +885,7 @@ template <class T, class F>
   if (target_spec.type == model::NodeType::kv_cluster) {
     return target_spec.vnodes.value_or(model::default_vnodes);
   }
-  int fewest = 0;  // fewest vnodes = largest imbalance 1 + 1/sqrt(v)
+  int fewest = 0;  // fewest vnodes = largest imbalance 1 + z_N/sqrt(v)
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
     const auto& spec = g.nodes()[node].spec;
     if (spec.policy != model::LbPolicy::consistent_hash) continue;
@@ -1232,18 +1247,46 @@ struct QueueProvenance {
   return join(parts, "  ");
 }
 
+// Whether a kv_cluster's quorums overlap: W + R > N is what makes every read quorum share a
+// replica with every write quorum, so a read meets the latest write (book ch. 6, "quorum
+// consensus"). Defaults applied.
+[[nodiscard]] bool kv_quorums_overlap(const model::NodeSpec& spec) {
+  return model::kv_write_quorum(spec) + model::kv_read_quorum(spec) > model::kv_replication(spec);
+}
+
+// "N=3 W=2 R=2", each count marked "(default)" when the scenario left it to Dynamo's (N = 3,
+// W = R = 2: model::kv_replication and the quorum helpers), and a note when W + R <= N: the
+// quorums do not overlap, so a read may miss the latest write (review of plan 2c Tasks 9-10,
+// minors 6 and 9). The model has no versions of a key, so the note is all explain can say.
+[[nodiscard]] std::string kv_quorums(const model::NodeSpec& spec) {
+  std::string text =
+      "N=" + std::to_string(model::kv_replication(spec)) + if_defaulted(spec.replication) +
+      " W=" + std::to_string(model::kv_write_quorum(spec)) + if_defaulted(spec.write_quorum) +
+      " R=" + std::to_string(model::kv_read_quorum(spec)) + if_defaulted(spec.read_quorum);
+  if (!kv_quorums_overlap(spec)) text += " (W + R ≤ N: a read may miss the latest write)";
+  return text;
+}
+
+// "mode=ap (default; partitions: phase 3)": the mode only a partition would show (faults are
+// phase 3), marked when defaulted; `cp` (consistency first) with quorums that do not overlap asks
+// for what the quorums do not give, and the line says so.
+[[nodiscard]] std::string kv_mode_summary(const model::NodeSpec& spec) {
+  const auto mode = model::kv_mode_of(spec);
+  std::string notes = spec.kv_mode ? "partitions: phase 3" : "default; partitions: phase 3";
+  if (mode == model::KvMode::cp && !kv_quorums_overlap(spec)) {
+    notes += "; cp needs W + R > N: these quorums contradict it";
+  }
+  return "mode=" + std::string{model::to_string(mode)} + " (" + notes + ")";
+}
+
 // A kv_cluster's shape (plan 2c refinement 9; book ch. 6): "  nodes=6 N=3 W=2 R=2 mode=ap
-// (partitions: phase 3)", the machines on its ring, the copies of each key and the two quorums,
-// defaults applied (N = 3, W = R = 2: model::kv_replication and the quorum helpers), and the mode,
-// which only a partition would show (faults are phase 3). Nothing on any other type.
+// (partitions: phase 3)", the machines on its ring (`nodes`, which graph::apply_kv_ring also
+// copies into `replicas`), the copies of each key and the two quorums (kv_quorums) and the mode
+// (kv_mode_summary). Nothing on any other type.
 [[nodiscard]] std::string kv_cluster_summary(const model::NodeSpec& spec) {
   if (spec.type != model::NodeType::kv_cluster) return {};
-  return "  nodes=" + std::to_string(spec.replicas) +
-         " N=" + std::to_string(model::kv_replication(spec)) +
-         " W=" + std::to_string(model::kv_write_quorum(spec)) +
-         " R=" + std::to_string(model::kv_read_quorum(spec)) +
-         " mode=" + std::string{model::to_string(model::kv_mode_of(spec))} +
-         " (partitions: phase 3)";
+  return "  nodes=" + std::to_string(*spec.kv_nodes) + " " + kv_quorums(spec) + " " +
+         kv_mode_summary(spec);
 }
 
 // "  sizes: stream 50MB, upload 300MB": on a byte-sized node (defaults::is_byte_sized), the size
@@ -2162,7 +2205,7 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   const double requests = std::ranges::fold_left(arriving | std::views::values, 0.0, std::plus<>{});
   return "peak offered " + fmt_rate(offered) + " (" + fmt_rate(requests) + " × N " +
          std::to_string(model::kv_replication(node.spec)) + ") vs " +
-         fmt_rate(total_capacity(node)) + " (" + std::to_string(node.spec.replicas) + " nodes)  ";
+         fmt_rate(total_capacity(node)) + " (" + std::to_string(*node.spec.kv_nodes) + " nodes)  ";
 }
 
 // "peak offered 1.5k/s vs 2k/s total capacity  ": what every check line opens with (a
@@ -2176,9 +2219,10 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 
 // A kv_cluster's verdict: behind its ring (N < nodes, imbalance k > 1) the average hides the
 // machine that sheds first, so the verdict is the hottest machine's, k times the average:
-// "(hottest 122%, red)" for 90k replica-requests/s over 8 machines of 10k/s (112.5 % on average,
-// k = 1.0816 at 150 vnodes); with N = nodes every machine holds every key and carries the
-// average, "(10%, green)". The engine runs the same hot machine (its node rho is the hottest's).
+// "(hottest 120%, red)" for 90k replica-requests/s over 8 machines of 10k/s (112.5 % on average,
+// k = 1.0676 at 150 vnodes: graph::ring_imbalance); with N = nodes every machine holds every key
+// and carries the average, "(10%, green)". The engine runs the same hot machine (its node rho is
+// the hottest's).
 [[nodiscard]] std::string kv_verdict(const graph::ResolvedNode& node, double offered) {
   const double capacity = total_capacity(node);
   if (capacity <= 0.0) return "(no capacity, red)";
@@ -2450,8 +2494,10 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
     replication_seen_s += dt_s;
   }
   if (sample.queue_lag_s) {  // a message queue: its worst moment is what a lag bound bounds
-    // The possibly-NaN sample first, so std::max passes a NaN on rather than hide it.
-    peak_queue_lag_s = std::max(*sample.queue_lag_s, peak_queue_lag_s.value_or(0.0));
+    // flow::nan_propagating_max: a NaN step stays NaN for the run, where std::max would let the
+    // next step's finite lag replace it.
+    peak_queue_lag_s =
+        flow::nan_propagating_max(*sample.queue_lag_s, peak_queue_lag_s.value_or(0.0));
   }
 }
 

@@ -39,10 +39,14 @@ nodes:
     # the 30k requests/s are 90k replica-requests/s for the cluster, and each node of 10k/s
     # carries on average 90k / nodes:
     #   8 nodes   11.25k/s average (112.5 %); the hottest node of the ring carries
-    #             1 + 1/sqrt(vnodes) = 1.0816 x that = 12.17k/s (121.7 %): red, and the cluster
-    #             drops 10k of its 90k replica-requests/s (a ninth), failing two SLOs. The lesson.
-    #   16 nodes  5.625k/s average (56.25 %); the hottest 6.084k/s (60.8 %): green, no drops.
-    # Try `nodes: 8` to see it, and `vnodes: 1` to see how much the ring's spread costs.
+    #             1 + z_8/sqrt(3 x vnodes) = 1.068 x that = 12.01k/s (120 %): red, and the
+    #             cluster drops 10k of its 90k replica-requests/s (a ninth), failing all three
+    #             SLOs (drops, utilization, the put's p99 of 118 ms). The lesson.
+    #   16 nodes  5.625k/s average (56.25 %); the hottest 1.083 x that = 6.094k/s (60.9 %):
+    #             green, no drops.
+    # (z_M: the expected maximum of M standard normals, 1.43 for 8 nodes, 1.77 for 16.)
+    # Try `nodes: 8` to see it, and `vnodes: 1` to see how much the ring's spread costs (and how
+    # a quorum of two hides it from the p99).
     nodes: 16
     vnodes: 150
     replication: 3

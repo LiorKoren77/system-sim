@@ -52,7 +52,7 @@ import simsys.flow;
 import simsys.fluid; // ServiceMoments: what a byte-sized node hands its queue
 import simsys.graph;
 import simsys.model;
-import simsys.queueing; // exponential_order_statistic: a quorum's reply time
+import simsys.queueing; // lognormal_order_statistic, probability_fewer_than: a quorum
 import simsys.workload;
 
 export namespace simsys::behaviours {
@@ -640,8 +640,9 @@ export namespace simsys::behaviours {
 // resolves and the engine applies:
 //   round_robin / weighted -> independent replicas, each an M/M/c at its share;
 //   least_connections      -> one pooled M/M/(c·N) queue (join-the-shortest-queue ideal);
-//   consistent_hash        -> the hottest replica carries 1 + 1/sqrt(vnodes) × the average
-//                             and is queued apart from the N - 1 cooler ones.
+//   consistent_hash        -> the hottest replica carries 1 + z_N/sqrt(vnodes) × the average
+//                             (z_N the expected maximum of N standard normals) and is queued
+//                             apart from the N - 1 cooler ones.
 // Ignored: health checks and failover (no failures yet), sticky sessions, the L4 vs L7
 // difference (both are one hop with a service time here), connection setup (TLS), and
 // per-key routing: a consistent-hash balancer here splits by link weight like the others;
@@ -1451,8 +1452,9 @@ class ExternalSinkBehaviour {
   // state between steps).
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
 
-  // One capacity unit per request, whatever its op: the type takes no `cost` key.
-  [[nodiscard]] double cost(std::string_view /*op*/) const { return 1.0; }
+  // The capacity units one request of `op` uses (graph::op_cost, as every behaviour and explain's
+  // paper load price it): 1 for every op of a scenario file, whose sinks take no `cost` key.
+  [[nodiscard]] double cost(std::string_view op) const;
 
   // The share f of what the sink serves that fails: the engine reads it to move those requests
   // from the node's drain to its drops (engine::Simulation::serve).
@@ -1472,71 +1474,109 @@ class ExternalSinkBehaviour {
   }
 
  private:
+  std::map<std::string, double, std::less<>> cost_by_op_;
   double failure_rate_{};
 };
 
+// One kind of machine of a kv_cluster this step, as the engine served it (engine::Simulation::serve
+// hands one per copy group): the sojourn ONE replica-request sees on one such machine, and the
+// share of the replica-requests sent to those machines that they did not drop.
+struct MachineGroup {
+  flow::LatencyEstimate sojourn{};
+  double kept{1.0};
+};
+
 // Models: the key-value store of System Design Interview (Alex Xu, vol. 1) ch. 6, Dynamo-style
-// (Amazon's Dynamo, Cassandra), in the steady state (plan 2c refinement 9). `nodes` machines sit
-// on a consistent-hash ring (ch. 5); every key lives on N = `replication` of them; the coordinator
+// (Amazon's Dynamo, Cassandra), in the steady state (plan 2c refinement 9; the quorum over the real
+// replica set since the review of Tasks 9-10, C-1 and I-1). `nodes` machines sit on a
+// consistent-hash ring (ch. 5); every key lives on N = `replication` of them; the coordinator
 // sends each read and each write to all N replicas and answers a write once W = `write_quorum`
 // have acknowledged it and a read once R = `read_quorum` have replied (ch. 6, "quorum
-// consensus"). Captured, by three pieces:
+// consensus": W + R > N makes a read meet the latest write; W = 1 or R = 1 trades that for speed).
+// Captured, by four pieces:
 //  - the machines: graph::apply_kv_ring makes the node `nodes` copies of `capacity` each, and,
-//    when N < nodes, a hot node carrying k = 1 + 1/sqrt(vnodes) times the average (the
+//    when N < nodes, a hot machine carrying k times the average (graph::ring_imbalance, the
 //    balancer's ring heuristic), which the engine runs as hot and cool copy groups;
 //  - the fan-out: every request is N replica-requests, so cost() is N (defaults::op_cost) and the
 //    node's demand, drain, drops and backlog count replica-requests (30k requests/s at N = 3 are
 //    90k/s on the machines);
-//  - the quorum's latency: the k-th fastest of N replica sojourns (k = R for a read, W for a write,
-//    the ops of model::write_ops_of, `write` by default), each taken as an exponential of the
-//    node's mean sojourn m, the request-weighted mixture of its hot and cool copies. The k-th
-//    smallest of N such exponentials is queueing::exponential_order_statistic (Rényi):
-//    N = 3 gives 1/3 m for k = 1, 5/6 m for k = 2 (Dynamo's W = R = 2), 11/6 m for k = 3.
-// A request counts as lost in the share its replica-requests are dropped (the fluid's per-node
-// fraction), and `mode` (ap or cp) is carried for explain only. Ignored: network partitions and
-// what ap or cp does under them, sloppy quorum and hinted handoff (faults: phase 3), read repair
-// and anti-entropy (Merkle tree) traffic, vector clocks and conflict resolution, a quorum that
-// survives a lost replica (k < N answers although one of N was dropped), the replicas' sojourns
-// not being exponential when c > 1 or the service SCV is not 1 (nor independent: one hot queue
-// serves many keys), and the spread between the hot and the cool copies (the order statistic is
-// taken over their mean). The coordinator's own hop is a node of the scenario, if it is wanted
-// (the kv-store lab's `coordinator` service).
+//  - the replica set: a key's N replicas are N DIFFERENT machines, so at most one of them is the
+//    hot machine. It holds the keys whose sets include it, and is sent one replica-request per such
+//    request: k/M of the N λ replica-requests, so a request includes it with probability
+//      p_hot = N k / M        (at most 1: k <= M / N)
+//    and otherwise reaches N cool machines;
+//  - the quorum: a read is answered at the R-th fastest reply of its set, a write at the W-th (the
+//    ops of model::write_ops_of, `write` by default), each machine's sojourn a lognormal fitted to
+//    its own copy group's mean and variance (queueing::lognormal_order_statistic, which integrates
+//    the survival function). The response mixes the two kinds of set by p_hot (law of total
+//    variance). A request is LOST when fewer than q of its N replica-requests come back, each kept
+//    with its machine's kept share (queueing::probability_fewer_than, the Poisson-binomial, with
+//    the same p_hot mixing). So a quorum of 2 of 3 answers from the two cool replicas when the hot
+//    machine is slow or drops, and a quorum of all 3 waits for it and shares its losses.
+// `mode` (ap or cp) is carried for explain only. Ignored: network partitions and what ap or cp does
+// under them, sloppy quorum and hinted handoff (faults: phase 3), read repair and anti-entropy
+// (Merkle tree) traffic, vector clocks and conflict resolution; the replicas' times taken as
+// independent (one hot queue serves many keys) and lognormal (an M/M/c sojourn is not exactly
+// one); the spread among the cool machines (they are one group); the latency of a request that lost
+// a replica but still met its quorum (taken as if all N replied: its quorum would wait for a later
+// reply). The coordinator's own hop is a node of the scenario, if it is wanted (the kv-store lab's
+// `coordinator` service).
 class KvClusterBehaviour {
  public:
   KvClusterBehaviour(const graph::Graph& g, std::size_t self);
 
   // Serves every incoming op and forwards nothing: the replicas answer the coordinator, which
-  // this node includes. `now` and `dt` are unused (the cluster holds no state between steps).
+  // this node includes. `now` and `dt` are unused (the quorums come from observe()).
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
 
   // N capacity units per request (graph::op_cost): one per replica the request is sent to.
   [[nodiscard]] double cost(std::string_view op) const;
 
-  // How many replies the coordinator waits for: W for a write op, R for any other.
-  [[nodiscard]] int quorum_of(std::string_view op) const;
+  // This step's machines, in engine::Simulation::make_server's order: the hot machine first and
+  // then the cool ones when the ring is uneven, else one group of identical machines. Recomputes
+  // both quorums' answers, which response() and delivered() return until the next step.
+  void observe(std::span<const MachineGroup> machines);
 
-  // The k-th fastest of N replicas whose sojourns are exponential of mean `own.mean_s` (the
-  // copies' request-weighted mean sojourn, engine::Simulation::serve): Rényi's order statistic.
-  // `own.variance_s2` is not used: the order statistic's variance replaces it (class comment).
-  [[nodiscard]] flow::LatencyEstimate response(std::string_view op, flow::LatencyEstimate own,
+  // The op's quorum over its real replica set (class comment), from the last observe(). `own`,
+  // the copies' request-weighted sojourn, is not used: a quorum is not one averaged replica.
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view op, flow::LatencyEstimate /*own*/,
                                                ResponseLookup auto&& /*downstream*/) const {
-    const auto quorum =
-        queueing::exponential_order_statistic(replication_, quorum_of(op), own.mean_s);
-    return {.mean_s = quorum.mean_s, .variance_s2 = quorum.variance_s2};
+    return answer_of(op).latency;
   }
 
-  // The share of the op's replica-requests the machines did not drop: nothing downstream.
-  [[nodiscard]] double delivered(std::string_view /*op*/, double own,
+  // The share of the op's requests whose quorum was met (class comment). `own`, the share of the
+  // replica-requests kept, is not used: a request needs q of its N, not all of them.
+  [[nodiscard]] double delivered(std::string_view op, double /*own*/,
                                  FractionLookup auto&& /*downstream*/) const {
-    return own;
+    return answer_of(op).delivered;
   }
 
  private:
+  // A request's replicas: on the hot machine (0 or 1 of them) and on cool machines (the rest).
+  struct ReplicaSet {
+    int hot;
+    int cool;
+  };
+  // What a quorum gives the clients this step.
+  struct QuorumAnswer {
+    flow::LatencyEstimate latency{};
+    double delivered{1.0};
+  };
+  [[nodiscard]] const QuorumAnswer& answer_of(std::string_view op) const;
+  [[nodiscard]] QuorumAnswer answer_quorum(int quorum) const;
+  [[nodiscard]] flow::LatencyEstimate reply_time(ReplicaSet set, int quorum) const;
+  [[nodiscard]] double loss(ReplicaSet set, int quorum) const;
+
   std::map<std::string, double, std::less<>> cost_by_op_;
   std::vector<std::string> write_ops_;
   int replication_{};
   int write_quorum_{};
   int read_quorum_{};
+  double hot_share_{};  // p_hot: the share of the requests whose replicas include the hot machine
+  MachineGroup hot_{};
+  MachineGroup cool_{};
+  QuorumAnswer read_answer_{};
+  QuorumAnswer write_answer_{};
 };
 
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
@@ -2264,13 +2304,32 @@ Routed WorkerPoolBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime
 // ---- ExternalSinkBehaviour ----
 
 ExternalSinkBehaviour::ExternalSinkBehaviour(const graph::Graph& g, std::size_t self)
-    : failure_rate_{g.nodes()[self].spec.failure_rate} {}
+    : cost_by_op_{detail::arriving_op_costs(g, self)},
+      failure_rate_{g.nodes()[self].spec.failure_rate} {}
+
+double ExternalSinkBehaviour::cost(std::string_view op) const {
+  return detail::cost_in(cost_by_op_, op);
+}
 
 Routed ExternalSinkBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
   return detail::serve_everything(in);
 }
 
 // ---- KvClusterBehaviour ----
+
+namespace detail {
+// p_hot = N k / M, the share of the requests whose N replicas include the hot machine (class
+// comment): 0 when the ring is even (k = 1, N = nodes).
+[[nodiscard]] double hot_replica_share(const graph::ResolvedNode& node) {
+  if (node.imbalance <= 1.0) return 0.0;
+  const double machines = *node.spec.kv_nodes;
+  return std::min(1.0, model::kv_replication(node.spec) * node.imbalance / machines);
+}
+
+[[nodiscard]] queueing::TimeMoments moments_of(const flow::LatencyEstimate& latency) {
+  return {.mean_s = latency.mean_s, .variance_s2 = latency.variance_s2};
+}
+}  // namespace detail
 
 // Graph::build checked the shape (1 <= W, R <= N <= nodes); the defaults (N = 3, W = R = 2) are
 // model::kv_replication's and the quorum helpers'.
@@ -2279,7 +2338,8 @@ KvClusterBehaviour::KvClusterBehaviour(const graph::Graph& g, std::size_t self)
       write_ops_{model::write_ops_of(g.nodes()[self].spec)},
       replication_{model::kv_replication(g.nodes()[self].spec)},
       write_quorum_{model::kv_write_quorum(g.nodes()[self].spec)},
-      read_quorum_{model::kv_read_quorum(g.nodes()[self].spec)} {}
+      read_quorum_{model::kv_read_quorum(g.nodes()[self].spec)},
+      hot_share_{detail::hot_replica_share(g.nodes()[self])} {}
 
 Routed KvClusterBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
   return detail::serve_everything(in);
@@ -2289,8 +2349,58 @@ double KvClusterBehaviour::cost(std::string_view op) const {
   return detail::cost_in(cost_by_op_, op);
 }
 
-int KvClusterBehaviour::quorum_of(std::string_view op) const {
-  return std::ranges::contains(write_ops_, op) ? write_quorum_ : read_quorum_;
+// The engine builds the hot and the cool group exactly when the graph gave the ring an imbalance
+// (engine::Simulation::make_server), which is when hot_share_ > 0; anything else is a programmer
+// error. With W = R the write's answer is the read's, computed once.
+void KvClusterBehaviour::observe(std::span<const MachineGroup> machines) {
+  const std::size_t expected = hot_share_ > 0.0 ? 2 : 1;
+  if (machines.size() != expected) {
+    throw std::logic_error{"KvClusterBehaviour::observe: expected " + std::to_string(expected) +
+                           " machine groups, got " + std::to_string(machines.size())};
+  }
+  hot_ = machines.front();
+  cool_ = machines.back();
+  read_answer_ = answer_quorum(read_quorum_);
+  write_answer_ = write_quorum_ == read_quorum_ ? read_answer_ : answer_quorum(write_quorum_);
+}
+
+// A write op (model::write_ops_of) waits for W replies, any other op for R.
+const KvClusterBehaviour::QuorumAnswer& KvClusterBehaviour::answer_of(std::string_view op) const {
+  return std::ranges::contains(write_ops_, op) ? write_answer_ : read_answer_;
+}
+
+// A quorum over the two kinds of replica set: {hot, N - 1 cool} with probability p_hot, {N cool}
+// otherwise. The latency is the mixture of the two sets' order statistics (behaviours::mixture:
+// the law of total variance), the loss the same mixture of the two sets' losses.
+KvClusterBehaviour::QuorumAnswer KvClusterBehaviour::answer_quorum(int quorum) const {
+  std::array<Branch, 2> branches{};
+  std::size_t used = 0;
+  double lost = 0.0;
+  const auto add_set = [&](double share, ReplicaSet set) {
+    if (share <= 0.0) return;  // a set no request meets: never weighted (0 x inf is NaN)
+    branches[used++] = {.share = share, .latency = reply_time(set, quorum)};
+    lost += share * loss(set, quorum);
+  };
+  add_set(hot_share_, {.hot = 1, .cool = replication_ - 1});
+  add_set(1.0 - hot_share_, {.hot = 0, .cool = replication_});
+  return {.latency = mixture(std::span{branches}.first(used)), .delivered = 1.0 - lost};
+}
+
+// The quorum-th fastest reply of the set: queueing::lognormal_order_statistic over its machines.
+flow::LatencyEstimate KvClusterBehaviour::reply_time(ReplicaSet set, int quorum) const {
+  const std::array groups{
+      queueing::ReplicaGroup{.replicas = set.hot, .sojourn = detail::moments_of(hot_.sojourn)},
+      queueing::ReplicaGroup{.replicas = set.cool, .sojourn = detail::moments_of(cool_.sojourn)}};
+  const auto reply = queueing::lognormal_order_statistic(groups, quorum);
+  return {.mean_s = reply.mean_s, .variance_s2 = reply.variance_s2};
+}
+
+// P(fewer than `quorum` of the set's replica-requests come back), each kept with its machine's
+// kept share: queueing::probability_fewer_than.
+double KvClusterBehaviour::loss(ReplicaSet set, int quorum) const {
+  const std::array kept{queueing::TrialGroup{.trials = set.hot, .success = hot_.kept},
+                        queueing::TrialGroup{.trials = set.cool, .success = cool_.kept}};
+  return queueing::probability_fewer_than(kept, quorum);
 }
 
 }  // namespace simsys::behaviours

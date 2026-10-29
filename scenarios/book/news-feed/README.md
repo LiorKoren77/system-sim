@@ -20,9 +20,10 @@
   6.4k jobs/s: `33.8%, green`), and each post's 300 feed writes take `feed_cache` to 661.5k/s
   of its 100k/s (`662%, red`). Each post's one look-up in `graph_db`, a key-value cluster of 6
   machines keeping N = 3 copies (plan 2c Task 10), is 3 replica-requests, against the machines'
-  6 × 30k/s, the hottest of them (1 + 1/sqrt(150) = 1.0816 times the average) checked:
-  `graph_db  peak offered 6.486k/s (2.162k/s × N 3) vs 180k/s (6 nodes)  (hottest 3.9%, green)`.
-  `run` goes through the whole day since then (11.7 s), but the scenario is not yet sized for
+  6 × 30k/s, the hottest of them (1 + z_6/sqrt(3 × 150) = 1.0604 times the average, z_6 = 1.28
+  the expected maximum of 6 standard normals) checked:
+  `graph_db  peak offered 6.486k/s (2.162k/s × N 3) vs 180k/s (6 nodes)  (hottest 3.82%, green)`.
+  `run` goes through the whole day since then (about 14 s), but the scenario is not yet sized for
   its 12:00 peak (plan 2c Task 17): as shipped 67.6 % of the work is dropped (`feed_cache`'s one
   replica first) and `drop_rate` fails (exit 2), while the `read_feed` p99 (103 ms of 200 ms)
   and `fanout_q`'s lag (`<1us` of 2 m) pass.

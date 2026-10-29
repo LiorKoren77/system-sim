@@ -23,22 +23,26 @@ nodes) put the busiest one above that: 90 % at `vnodes: 150`, a failed SLO with 
 recommended setting. 15k/s gives 67 % on average and room for the spread.
 
 ## What the model captures
-- Load imbalance across the four cache servers as a function of `vnodes` (the standard
-  deviation of partition sizes shrinks roughly with 1/sqrt(vnodes)); the hottest server's
-  utilization is what the SLO checks.
+- Load imbalance across the four cache servers as a function of `vnodes`: a server's share of
+  the keys spreads about 1/sqrt(vnodes) around the average, and the hottest of 4 sits z_4 = 1.05
+  such spreads above it (the expected maximum of 4 standard normals), so it carries
+  k = 1 + 1.05/sqrt(vnodes) times the average: **1.086** at 150 (a heuristic that grows with the
+  number of servers, checked against Monte Carlo rings in
+  [numerics, section 8](../../../docs/study/numerics.md); the kv-store lab's ring uses the same
+  one). The hottest server's utilization is what the SLO checks.
 - The cache tier's hit ratio (`hit_ratio: che`, from the clients' zipf 0.9 over 10M keys). The
   ring sends each key to one server, so the four servers hold different keys: 2M each, 8M
   together. With perfectly even arcs they would hit like one 8M-key LRU cache, 0.963. The arcs
-  are not even: with imbalance k (1 + 1/sqrt(vnodes), the hottest server's share of the load
-  over the average) the hottest server owns k/4 of the keys and the three others share the
-  rest. Each server is an LRU cache of 2M keys over its own arc, which for the Che
-  approximation is one cache of 2M / (its share) over the whole space, and it serves its share
-  of the requests: h = Σ share × Che(2M / share). With `vnodes: 1`, k = 2: the hot server
-  owns half the keys (a 4M-key cache over the space: 0.848) and each cool one a sixth (12M >
-  10M keys: every key fits, 1), so h = 0.5 × 0.848 + 0.5 × 1 = **0.924**, and the DB gets
-  1 − 0.924 of the gets instead of 1 − 0.963: twice the misses. Hit ratio is concave in cache
-  size, so what the hot server loses outweighs what the cool ones gain. `explain` prints
-  `hit_ratio=0.924 (che: ...; 2M keys x 4 partitioned, uneven arcs)`.
+  are not even: with imbalance k (above, the hottest server's share of the load over the
+  average) the hottest server owns k/4 of the keys and the three others share the rest. Each
+  server is an LRU cache of 2M keys over its own arc, which for the Che approximation is one
+  cache of 2M / (its share) over the whole space, and it serves its share of the requests:
+  h = Σ share × Che(2M / share). With `vnodes: 1`, k = 1 + 1.05/sqrt(1) = 2.05: the hot server
+  owns 51.2 % of the keys (a 3.90M-key cache over the space: 0.844) and each cool one 16.3 %
+  (12.3M > 10M keys: every key fits, 1), so h = 0.512 × 0.844 + 0.488 × 1 = **0.920**, and the
+  DB gets 1 − 0.920 of the gets instead of 1 − 0.963: twice the misses. Hit ratio is concave in
+  cache size, so what the hot server loses outweighs what the cool ones gain. `explain` prints
+  `hit_ratio=0.92 (che: ...; 2M keys x 4 partitioned, uneven arcs)`.
 - The database as ch. 1 draws it (plan 2b refinement 3): the cache servers' misses are reads,
   and with `replicas: 2` they all go to the one read replica; the primary takes the writes. In
   this lab no write reaches the database (under `read_through` a `set` is the cache's own), so
@@ -57,30 +61,32 @@ recommended setting. 15k/s gives 67 % on average and room for the spread.
 
 | setting | imbalance k | hit ratio | hottest cache server rho | cache drops | db rho | get mean / p99 (est.) | SLOs |
 |---|---|---|---|---|---|---|---|
-| `vnodes: 150` (shipped) | 1.08 | 0.963 | 0.72 | 0 | 0.27 | 1.37 ms / 2.22 ms | PASS (exit 0) |
+| `vnodes: 150` (shipped) | 1.09 | 0.963 | 0.72 | 0 | 0.27 | 1.37 ms / 2.22 ms | PASS (exit 0) |
 | `vnodes: 1000` | 1.03 | 0.963 | 0.69 | 0 | 0.27 | 1.37 ms / 2.21 ms | PASS |
-| `vnodes: 100` | 1.1 | 0.963 | 0.73 | 0 | 0.27 | 1.37 ms / 2.23 ms | PASS |
-| `vnodes: 1` | 2 | 0.924 | 1 (20k/s vs 15k/s: 133 %) | 5.7M (12.5 %) | 0.48 | 34.7 ms / 166 ms | cache FAIL (exit 2) |
+| `vnodes: 100` | 1.1 | 0.963 | 0.74 | 0 | 0.27 | 1.37 ms / 2.23 ms | PASS |
+| `vnodes: 1` | 2.05 | 0.92 | 1 (20.49k/s vs 15k/s: 137 %) | 6.26M (13.7 %) | 0.495 | 35.5 ms / 166 ms | cache FAIL (exit 2) |
 
-- **`vnodes: 1`**: the hottest server owns half the ring, 20k/s against its 15k/s. Its queue
-  fills (1k waiting, red for the whole run) and it sheds the excess, 5k/s, an eighth of all
-  requests; a request that does get through waits about 70 ms in that full queue, which is the
-  34.7 ms mean (half the requests are on the hot server). The three cool servers sit at 44 %.
-  Uneven arcs also cost hit ratio, 0.924 instead of 0.963: twice the misses on paper (`explain`
-  offers the database's replica 2.73k/s, 55 %); the hot server's drops never reach it, so it
-  runs at 0.48 instead of 0.27.
-- **More virtual nodes**: from 100 on, the hottest server is within 10 % of the average, and
-  the hit ratio is the even-arc value to three digits. Going from 150 to 1000 buys 3 points of
-  utilization on the hottest server, at the cost of ring memory (not modelled).
+- **`vnodes: 1`**: the hottest server owns 51 % of the ring, 20.49k/s against its 15k/s. Its
+  queue fills (1k waiting, red for the whole run) and it sheds the excess, 5.49k/s, 13.7 % of
+  all requests; a request that does get through waits about 67 ms in that full queue (1000
+  requests drained at 15k/s), which is most of the 35.5 ms mean (51 % of the requests are on
+  the hot server). The three cool servers sit at 43 %. Uneven arcs also cost hit ratio, 0.920
+  instead of 0.963: twice the misses on paper (`explain` offers the database's replica
+  2.87k/s, 57 %); the hot server's drops never reach it, so it runs at 0.495 instead of 0.27.
+- **More virtual nodes**: from 100 on, the hottest server is within about 10 % of the average,
+  and the hit ratio is the even-arc value to three digits. Going from 150 to 1000 buys 3.5
+  points of utilization on the hottest server, at the cost of ring memory (not modelled).
 
 ## Things to try
-- `vnodes: 1` — the table's last row: the hottest server at 133 % fails the cache servers' SLO;
-  the database's passes (0.48 against its 0.7), since the hot server's drops never reach it.
-- `replicas: 2` on the cache servers — half the servers, the same 40k/s: 144 % on the hottest
-  even with `vnodes: 150` (hit ratio 0.848, so the database's replica gets 5.5k/s against its
-  5k/s and fails its SLO too: 0.82). With `vnodes: 1` the imbalance is total: k = 2 = N, the hot
-  server owns every key, and the hit ratio falls to one 2M-key cache's, 0.747; the cache
-  servers shed 62.5 % of the load, which is why the database, behind them, passes (0.68).
+- `vnodes: 1` — the table's last row: the hottest server at 137 % fails the cache servers' SLO;
+  the database's passes (0.495 against its 0.7), since the hot server's drops never reach it.
+- `replicas: 2` on the cache servers — half the servers, the same 40k/s: 140 % on the hottest
+  even with `vnodes: 150` (k = 1 + z_2/sqrt(150) = 1.048; hit ratio 0.848, so the database's
+  replica gets 5.47k/s against its 5k/s and fails its SLO too: 0.82). With `vnodes: 1` the
+  hotter of two servers holds k = 1 + 0.59 = 1.59 times the average, 79.5 % of the keys: the hit
+  ratio falls to 0.824, the hottest server is at 212 % and the cache servers shed 42 % of the
+  load, yet what gets through still misses enough to put the database's replica at 6.35k/s
+  against its 5k/s: it fails too (0.74).
 - On the database: `replication_lag: 50ms` and an SLO `{metric: staleness, node: db, max:
   100ms}` — the staleness is a write's sojourn at the primary (its 150 µs service time: no
   write waits there) + the 50 ms lag + its sojourn at the replica (150 µs + a 55 µs wait at

@@ -193,12 +193,12 @@ bytes, they count megabytes, wait for whole objects and answer a write at its la
 at its first megabyte; a blob store's `then` steps are asynchronous event notifications, fired by
 its writes only), id generators, message queues (the publisher answered at the append, every
 message copied to each consumer group, the slowest group's lag reported and checked by the
-`queue_lag` SLO) and worker pools (M/M/c at workers / cost, waiting in their
-queue's retention; their `then` steps fire for every job they drain, and nobody waits for them)
+`queue_lag` SLO), worker pools (M/M/c at workers / cost, waiting in their
+queue's retention; their `then` steps fire for every job they drain, and nobody waits for them),
 external sinks (a third party's API at the type's 1k/s and 100 ms, failing its `failure_rate`
 of what it serves, counted as drops), key-value clusters (ch. 6's Dynamo-style store: `nodes`
 machines on a ring whose hottest machine is its own queue, every request sent to N replicas,
-answered at the W-th or R-th fastest) and search indexes (ch. 13's trie database, served like a
+answered at the W-th or R-th fastest of its own replica set and lost when fewer answer) and search indexes (ch. 13's trie database, served like a
 service at the type's 5k/s and 5 ms; its rebuild is not modelled). These ten scenarios run end to
 end:
 
@@ -210,8 +210,8 @@ end:
 - [`labs/unique-id`](scenarios/labs/unique-id/): ch. 7's ticket server vs snowflake; fails its
   drop-rate SLO on purpose (exit 2).
 - [`labs/kv-store`](scenarios/labs/kv-store/): ch. 6's key-value store, 30k requests/s on 16
-  machines with N = 3, W = R = 2: 90k replica-requests/s, the ring's hottest machine at 60.8 %,
-  put p99 2.41 ms; every SLO passes (at the book's 8 machines it drops a ninth: "Things to try").
+  machines with N = 3, W = R = 2: 90k replica-requests/s, the ring's hottest machine at 60.9 %,
+  put p99 2.31 ms; every SLO passes (at the book's 8 machines it drops a ninth: "Things to try").
 - [`book/url-shortener`](scenarios/book/url-shortener/): ch. 8 over 24 hours at 12.8k/s
   (peak 19.2k/s): limiter, 8 stateless web servers, a Che cache (h = 0.881), snowflake ids
   and a SQL database in 3 shards; both SLOs pass (redirect p99 7.49 ms, nothing dropped).

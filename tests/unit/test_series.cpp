@@ -960,6 +960,26 @@ TEST_CASE("explain checks chat-system's two kv_clusters at their hottest node", 
   }
 }
 
+// chat-system's presence and notification-system's log_db keep N = 2 copies and answer at the
+// first reply for reads and writes alike (W = R = 1): fast, and the quorums do not overlap, so a
+// read may miss the latest write, which explain now says (review of plan 2c Tasks 9-10, minor 6)
+// beside the mode the scenarios leave to its default. Their rings: 4 machines, k = 1 + z_4 /
+// sqrt(2 x 150) = 1.0606, printed 1.06; 3 machines, 1 + z_3 / sqrt(300) = 1.0502, printed 1.05
+// (1.08 for both with the old 1 + 1/sqrt(150)).
+TEST_CASE("explain notes the non-overlapping quorums of chat's presence and notification's log_db",
+          "[series]") {
+  const auto chat = explain_shipped("chat-system");
+  CAPTURE(chat);
+  REQUIRE(node_line(chat, "presence")
+              .contains("nodes=4 N=2 W=1 R=1 (W + R ≤ N: a read may miss the latest write) "
+                        "mode=ap (default; partitions: phase 3)  imbalance=1.06 (vnodes 150)"));
+  const auto notification = explain_shipped("notification-system");
+  CAPTURE(notification);
+  REQUIRE(node_line(notification, "log_db")
+              .contains("nodes=3 N=2 W=1 R=1 (W + R ≤ N: a read may miss the latest write) "
+                        "mode=ap (default; partitions: phase 3)  imbalance=1.05 (vnodes 150)"));
+}
+
 // Web crawler (ch. 9): the URL frontier hands URLs to the downloader along its `then` (a type
 // the model has no phase for yet), and the downloader, a worker pool, sends on along its own,
 // which the paper load follows since plan 2c Task 7. dns is behind both, but only the frontier is

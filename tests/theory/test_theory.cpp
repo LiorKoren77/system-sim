@@ -1273,14 +1273,15 @@ TEST_CASE("url-shortener's url_cache resolves to a che hit ratio and the simulat
 
 // The consistent-hashing lab (zipf 0.9 over 10M keys, four 2M-key cache servers behind a ring).
 // With perfectly even arcs the four would act as one 8M-key cache: 0.962834 by the dense
-// reference. With the lab's `vnodes: 1` the hottest server owns half the keys (k = 2) and the
-// three others a sixth each, so the hot server is a 4M-key cache over the whole space and the
-// cool ones hold their every key: h = 0.5 × 0.848235 + 0.5 × 1 = 0.924118.
-// Provenance of 0.962834 and 0.848235: Che's equation solved by 100 bisection steps over all 10M
+// reference. With the lab's `vnodes: 1` the hottest server owns k/4 = 0.512283 of the keys
+// (k = 1 + z_4/sqrt(1) = 2.049131, ring_factor) and the three others 0.162572 each, so the hot
+// server is a 2M / 0.512283 = 3.904093M-key cache over the whole space and the cool ones hold
+// their every key: h = 0.512283 × 0.844457 + 0.487717 × 1 = 0.920318.
+// Provenance of 0.962834 and 0.844457: Che's equation solved by 100 bisection steps over all 10M
 // ranks one at a time, in double precision and with no buckets (the method of test_caching.cpp's
 // dense_che_hit_ratio, run outside the suite: 10M ranks x 100 steps take seconds), recomputed
-// 2026-10-28.
-TEST_CASE("the consistent-hashing lab's cache hits 0.963 on even arcs and 0.924 on one vnode",
+// 2026-10-29 for the review of plan 2c Tasks 9-10, I-2 (0.848235 at the old k = 2, 4M keys).
+TEST_CASE("the consistent-hashing lab's cache hits 0.963 on even arcs and 0.920 on one vnode",
           "[theory]") {
   REQUIRE_THAT(simsys::caching::che_hit_ratio(8e6, simsys::caching::Popularity::zipf(0.9, 10e6)),
                WithinAbs(0.962834, 1e-5));
@@ -1306,7 +1307,7 @@ TEST_CASE("the consistent-hashing lab's cache hits 0.963 on even arcs and 0.924 
   const auto g = Graph::build(s);
   INFO((g ? "" : g.error().message));
   REQUIRE(g.has_value());
-  REQUIRE_THAT(*g->hit_ratio(*g->index_of("cache")), WithinAbs(0.924118, 1e-5));
+  REQUIRE_THAT(*g->hit_ratio(*g->index_of("cache")), WithinAbs(0.920318, 1e-5));
 }
 
 // ---- SQL database: a primary and read replicas (plan 2b refinement 3, book ch. 1) ----
