@@ -195,6 +195,76 @@ struct LognormalFit {
   return 0.5 * std::erfc(-z / std::numbers::sqrt2);
 }
 
+// What a client that gives up after `limit` seconds gets back from a response time X (plan 2c
+// Task 13; book ch. 1 and ch. 8: a client does not wait for ever, its HTTP library or the user
+// abandons a slow request). Fitted as a lognormal like every response the reports describe:
+// the path's time is a sum of positive, right-skewed terms (link legs, waits, services), which
+// is what a lognormal fits well, and its slow tail is exactly the part a timeout cuts.
+//   fraction     P(X < L): the share answered in time; the rest timed out
+//   mean_s       E[X | X < L]: the mean of the answered requests alone
+//   variance_s2  Var[X | X < L]: their spread
+// The last two are the moments of a TRUNCATED distribution: the original one with everything
+// past L removed and the rest scaled up to total 1 again (divided by the fraction). Truncating
+// can only shorten the mean and narrow the spread, since only the slowest requests go.
+struct BelowLimit {
+  double fraction;
+  double mean_s;
+  double variance_s2;
+};
+
+// lognormal_below(m, v, L): BelowLimit for a lognormal X with mean m and variance v. With the fit
+// sigma^2 = ln(1 + v/m^2), mu = ln m - sigma^2/2 (lognormal_fit) and z = (ln L - mu) / sigma,
+// L's place on the normal scale of ln X:
+//   P(X < L)            = Phi(z)                                 (ln X < ln L, a normal's cdf)
+//   E[X^k 1{X < L}]     = exp(k mu + k^2 sigma^2 / 2) Phi(z - k sigma)   (k = 1, 2)
+//                         the "partial moments": the k-th moment collected below L only; the
+//                         exp(...) factor is the whole k-th moment (m for k = 1, m^2 + v for
+//                         k = 2) and Phi(z - k sigma) the share of it found below L
+//   E[X | X < L]        = E[X 1{X < L}] / Phi(z)
+//   Var[X | X < L]      = E[X^2 1{X < L}] / Phi(z) - E[X | X < L]^2
+// m = 100 ms, v = 0.01 s^2, L = 200 ms: 89.41 % answered, mean 73.97 ms, variance 0.0021022 s^2.
+// Assumes the response is lognormal, which it only approximates (the reports' percentiles rest on
+// the same fit). Edge cases, each the limit of the formulas:
+//  - L = infinity: everything is answered, the moments are m and v unchanged;
+//  - no spread (v <= 0, or m <= 0: a time of exactly m): all answered if m <= L, else none;
+//  - nothing answered (Phi(z) = 0, which happens in floating point below z = -38.5: a 12 s upload
+//    of almost no spread against a 10 s timeout, as youtube's): the moments would be 0 / 0, a
+//    NaN that the reports' weighted sums would spread to every step (0 x NaN is NaN). They are L
+//    and 0 instead, the limit as the answered share vanishes (what is left piles up just under L),
+//    and the time the client waited before giving up;
+//  - an infinite m (a path that never answers): nothing is answered in time, and the moments stay
+//    infinite so the reports still call the path unavailable;
+//  - a NaN anywhere is an upstream bug and comes out as NaN.
+// Rounding: a narrow truncated part loses digits in E[X^2] - E[X]^2, so the mean is clamped to at
+// most L and the variance to at least 0.
+[[nodiscard]] BelowLimit lognormal_below(double mean, double variance, double limit) {
+  constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+  if (std::isnan(mean) || std::isnan(variance) || std::isnan(limit)) {
+    return {.fraction = nan, .mean_s = nan, .variance_s2 = nan};
+  }
+  if (limit == std::numeric_limits<double>::infinity()) {
+    return {.fraction = 1.0, .mean_s = mean, .variance_s2 = variance};
+  }
+  if (std::isinf(mean)) return {.fraction = 0.0, .mean_s = mean, .variance_s2 = variance};
+  const BelowLimit nothing_answered{
+      .fraction = 0.0, .mean_s = std::max(limit, 0.0), .variance_s2 = 0.0};
+  if (variance <= 0.0 || mean <= 0.0) {
+    if (mean > limit) return nothing_answered;
+    return {.fraction = 1.0, .mean_s = std::max(mean, 0.0), .variance_s2 = 0.0};
+  }
+  if (limit <= 0.0) return nothing_answered;  // no response takes 0 s or less
+  const LognormalFit fit = lognormal_fit(mean, variance);
+  const double z = (std::log(limit) - fit.mu) / fit.sigma;
+  const double fraction = normal_cdf(z);
+  if (fraction == 0.0) return nothing_answered;
+  const double first_partial = mean * normal_cdf(z - fit.sigma);  // E[X 1{X < L}]
+  const double second_partial =
+      (mean * mean + variance) * normal_cdf(z - 2.0 * fit.sigma);  // E[X^2 1{X < L}]
+  const double mean_below = std::min(first_partial / fraction, limit);
+  const double variance_below = std::max(second_partial / fraction - mean_below * mean_below, 0.0);
+  return {.fraction = fraction, .mean_s = mean_below, .variance_s2 = variance_below};
+}
+
 // `trials` independent trials that each succeed with probability `success`: one kind of replica
 // in a quorum (its share of answered, or of kept, requests). See probability_fewer_than.
 struct TrialGroup {

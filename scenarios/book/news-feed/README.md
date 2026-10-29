@@ -25,7 +25,7 @@
   `graph_db  peak offered 6.486k/s (2.162k/s × N 3) vs 180k/s (6 nodes)  (hottest 3.82%, green)`.
   `run` goes through the whole day since then (about 14 s), but the scenario is not yet sized for
   its 12:00 peak (plan 2c Task 17): as shipped 59.9 % of the work is dropped (`feed_cache`'s one
-  replica first) and `drop_rate` fails (exit 2), while the `read_feed` p99 (90.3 ms of 200 ms)
+  replica first) and `drop_rate` fails (exit 2), while the `read_feed` p99 (89.2 ms of 200 ms)
   and `fanout_q`'s lag (`<1us` of 2 m) pass. A request stops at its first failed step (plan 2c
   Task 12), so the losses also thin what follows them: a `read_feed` whose `feed_cache` lookup was
   dropped hydrates no posts. That keeps `post_cache` and `user_cache` below saturation (mean rho

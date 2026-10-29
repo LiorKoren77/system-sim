@@ -53,21 +53,29 @@ same design's other limit, one database's throughput below the 10k/s requirement
   their values. 64 bits versus UUID's 128 (122 of them random) is not modelled.
 - The ticket server's single point of failure: failures are phase 3 (`faults`). The chapter's
   remedy, several ticket servers kept in sync, is not a mode of the model.
-- The client's `timeout: 50ms` is read but not used yet.
+- How a timed-out request ends: the services give up after their `timeout: 50ms` (plan 2c Task
+  13: the share of each step's fitted response slower than that is timed out, not answered), but
+  the generator still issues the id, and nobody retries.
 
 ## Results (`simsys run`, 10 min, after the 30 s warmup)
 
 | setting | generator rho | dropped | drop rate | next_id mean / p99 (est.) | SLOs |
 |---|---|---|---|---|---|
-| shipped: ticket server at 8k/s | 1 (red for all 570 s) | 2.34M | 0.339 | 127 ms / 158 ms | both FAIL (exit 2) |
-| ticket server at its default 1k/s (delete `capacity`) | 1 | 6.33M | 0.917 | 1 s / 1.26 s | both FAIL |
+| shipped: ticket server at 8k/s | 1 (red for all 570 s) | 2.34M | 0.339 | all timed out (would be 127 ms) | both FAIL (exit 2) |
+| ticket server at its default 1k/s (delete `capacity`) | 1 | 6.33M | 0.917 | all timed out (would be 1 s) | both FAIL |
 | snowflake, 4 x 4.096M/s (weights switched) | 0.00074 | 0 | 0 | 510 us / 534 us | PASS (exit 0) |
 | uuid (weights switched, `algorithm: uuid`) | ~0 | 0 | 0 | 501 us / 503 us | PASS |
 
 - **Ticket server**: 10k/s against 8k/s, 30k/s in the spike. Demand over the observed 570 s is
   10k x 510 s + 30k x 60 s = 6.9M ids; it issues at most 8k x 570 s = 4.56M, so at least 2.34M
   are dropped, a drop rate of 2.34M / 6.9M = **0.339**. The queue is full all the time, so every
-  answered request waits about 125 ms. Even without the spike it would drop 2k of every 10k.
+  id it issues waits about 125 ms (127 ms with the links and the service), far past the
+  services' 50 ms timeout: `run --report json` gives `answered_per_s` 0 and `timed_out_per_s`
+  8000 (every id issued, 8k/s, is one the caller gave up on), and the table prints `-` for the
+  latencies. The p99 SLO observes 50 ms (the timeout caps every percentile, plan 2c Task 13; it
+  was 158 ms before) and still fails against its 10 ms. Even without the spike it would drop 2k
+  of every 10k. At the default 1k/s the same holds: 1k/s issued, all timed out (each would take
+  about 1 s).
 - **Snowflake**: 12.1k/s on average against 4 x 4.096M/s = 16.38M/s: each machine is 0.074 %
   busy (12.11k / 16.38M = 0.00074) and nobody waits. The response is the two link hops (250 us
   each way) plus the 10 us service time.

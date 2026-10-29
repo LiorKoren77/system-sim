@@ -41,7 +41,8 @@ nodes:
     #   8 nodes   11.25k/s average (112.5 %); the hottest node of the ring carries
     #             1 + z_8/sqrt(3 x vnodes) = 1.068 x that = 12.01k/s (120 %): red, and the
     #             cluster drops 10k of its 90k replica-requests/s (a ninth), failing all three
-    #             SLOs (drops, utilization, the put's p99 of 118 ms). The lesson.
+    #             SLOs (drops, utilization, the put's p99: capped at the clients' 100 ms
+    #             timeout, which more than half of the requests outlast). The lesson.
     #   16 nodes  5.625k/s average (56.25 %); the hottest 1.083 x that = 6.094k/s (60.9 %):
     #             green, no drops.
     # (z_M: the expected maximum of M standard normals, 1.43 for 8 nodes, 1.77 for 16.)

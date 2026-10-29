@@ -995,10 +995,14 @@ TEST_CASE(
 // saturates at 1.0 against the utilization SLO's 0.8. The put's p99 fails too: every replica now
 // waits for its full room, 1000 requests drained at 10k/s = 100 ms, with the spread the fluid
 // gives a full queue (the Erlang wait's at the 0.99 clamp, sd 10 ms: three servers per machine);
-// the second of three such replies is 100.03 ms (sd 6.7 ms), and the client's p99 117.8 ms. (The
-// 306 ms the lab showed before the review of Tasks 9-10 came from treating each replica as an
-// exponential of mean 100 ms, sd 100 ms, not from the room.) Three SLOs fail. (5 minutes of the
-// 30, 1 of them warmup: the queues fill in under a second.)
+// the second of three such replies is 100.03 ms (sd 6.7 ms), and the client's response about 101 ms
+// (a lognormal p99 of 117.8 ms before plan 2c Task 13). The clients' `timeout: 100ms` now gives up
+// on the slow side of that response (56 % of the delivered requests), and the report caps every
+// percentile at the timeout: the p99 the SLO observes is the timeout itself, 0.1 s exactly
+// (seconds(100ms) is the double nearest 0.1, the same as the literal). (The 306 ms the lab showed
+// before the review of Tasks 9-10 came from treating each replica as an exponential of mean
+// 100 ms, sd 100 ms, not from the room.) Three SLOs fail. (5 minutes of the 30, 1 of them warmup:
+// the queues fill in under a second.)
 TEST_CASE(
     "labs/kv-store at eight nodes drops a ninth of the replica-requests and fails all three "
     "SLOs",
@@ -1015,7 +1019,7 @@ TEST_CASE(
   const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
   REQUIRE(p99.status == simsys::report::SloStatus::fail);
   REQUIRE(p99.observed.has_value());
-  REQUIRE_THAT(*p99.observed, Catch::Matchers::WithinRel(117.8e-3, 0.01));
+  REQUIRE(*p99.observed == 0.1);
 }
 
 // The lab's "try vnodes: 1" at 16 machines (review of Tasks 9-10, C-1): the ring is at its most

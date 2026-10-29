@@ -574,9 +574,11 @@ inline constexpr std::uint64_t golden_ratio_increment = 0x9E3779B97F4A7C15;
 // the scenario's rate curve over time (daily waves, ramps, spikes, replayed traces:
 // workload::RateCurve) times a seeded random multiplier (workload::NoiseProcess), split
 // into ops by fixed shares, each op split over the links that carry it by link weight
-// (DNS round-robin, CDN vs origin). Ignored: think time and closed-loop clients (offered
-// load never reacts to latency: a slow site does not make these users wait or leave),
-// and client-side timeouts.
+// (DNS round-robin, CDN vs origin), and a `timeout` after which the client gives up on a
+// request (the engine counts the slow tail of each response as timed out instead of answered:
+// engine::Simulation::give_up_after, plan 2c Task 13). Ignored: think time and closed-loop
+// clients (offered load never reacts to latency: a slow site does not make these users send
+// less or leave), and retries (a timed-out request is not sent again).
 class ClientBehaviour {
  public:
   // `seed` seeds this client's noise process; the engine passes client_seed(scenario
@@ -652,6 +654,9 @@ class ClientBehaviour {
   // The ops this client sends, sorted by name, so reports list them deterministically.
   [[nodiscard]] std::span<const std::string> ops() const { return ops_; }
 
+  // The client's `timeout` in seconds; empty when it waits for ever.
+  [[nodiscard]] std::optional<double> timeout_s() const { return timeout_s_; }
+
  private:
   // One graph::ClientRoute plus what the behaviour needs per step.
   struct RouteLeg {
@@ -675,6 +680,7 @@ class ClientBehaviour {
   std::vector<std::pair<std::string, double>> op_shares_;  // sorted by op
   std::vector<RouteLeg> legs_;
   std::vector<std::string> ops_;
+  std::optional<double> timeout_s_{};
 };
 
 }  // namespace simsys::behaviours
@@ -1393,12 +1399,12 @@ class CdnBehaviour {
 //                                                     overlapping the transfer
 // The answer adds no spread of its own (cs² = 0): the response's variance is the wait's. So every
 // 300 MB upload takes at least 12 s at 25 MB/s per slot (40 ms per MB), and a client `timeout`
-// under 12 s would cut all of them (youtube's `timeout: 10s`: plan Task 16 sizes it per the book,
-// whose uploads are resumable, and Task 13 applies it). Both answers are at least one megabyte's
-// time: a 2 KB request holds its slot only 0.002 × 40 ms = 80 µs (it uses the capacity of its
-// bytes) but is answered in the whole 40 ms of one unit (an upper bound for small objects: a real
-// store answers it in about a disk seek). The overlap argument holds for reads and streams only,
-// and it understates a large read that the client needs whole before it can act (a 1 GB file
+// under 12 s cuts all of them (youtube's `timeout: 10s` times out every upload since plan Task
+// 13; Task 16 sizes it per the book, whose uploads are resumable). Both answers are at least one
+// megabyte's time: a 2 KB request holds its slot only 0.002 × 40 ms = 80 µs (it uses the capacity
+// of its bytes) but is answered in the whole 40 ms of one unit (an upper bound for small objects: a
+// real store answers it in about a disk seek). The overlap argument holds for reads and streams
+// only, and it understates a large read that the client needs whole before it can act (a 1 GB file
 // downloaded to be opened takes 40 s, not 40 ms). The capacity counts every megabyte, so large
 // objects queue everyone behind them.
 // Ignored: durability (replication across regions, erasure coding: the store never loses an
@@ -1950,6 +1956,7 @@ ClientBehaviour::ClientBehaviour(const graph::Graph& g, std::size_t self, std::u
   if (!workload) return;  // a client without a workload offers nothing
   curve_ = workload->curve;
   noise_spec_ = workload->noise;
+  if (workload->timeout) timeout_s_ = seconds(*workload->timeout);
   reset_noise();
   op_shares_ = workload->op_shares;
   std::ranges::sort(op_shares_, {}, &std::pair<std::string, double>::first);

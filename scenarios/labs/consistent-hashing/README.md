@@ -64,13 +64,16 @@ recommended setting. 15k/s gives 67 % on average and room for the spread.
 | `vnodes: 150` (shipped) | 1.09 | 0.963 | 0.72 | 0 | 0.27 | 1.37 ms / 2.22 ms | PASS (exit 0) |
 | `vnodes: 1000` | 1.03 | 0.963 | 0.69 | 0 | 0.27 | 1.37 ms / 2.21 ms | PASS |
 | `vnodes: 100` | 1.1 | 0.963 | 0.74 | 0 | 0.27 | 1.37 ms / 2.23 ms | PASS |
-| `vnodes: 1` | 2.05 | 0.92 | 1 (20.49k/s vs 15k/s: 137 %) | 6.26M (13.7 %) | 0.495 | 35.5 ms / 166 ms | cache FAIL (exit 2) |
+| `vnodes: 1` | 2.05 | 0.92 | 1 (20.49k/s vs 15k/s: 137 %) | 6.26M (13.7 %) | 0.495 | 34.3 ms / 143 ms | cache FAIL (exit 2) |
 
 - **`vnodes: 1`**: the hottest server owns 51 % of the ring, 20.49k/s against its 15k/s. Its
   queue fills (1k waiting, red for the whole run) and it sheds the excess, 5.49k/s, 13.7 % of
   all requests; a request that does get through waits about 67 ms in that full queue (1000
-  requests drained at 15k/s), which is most of the 35.5 ms mean (51 % of the requests are on
-  the hot server). The three cool servers sit at 43 %. Uneven arcs also cost hit ratio, 0.920
+  requests drained at 15k/s), which is most of the 34.3 ms mean (51 % of the requests are on
+  the hot server). The clients' `timeout: 200ms` (plan 2c Task 13) gives up on the slowest
+  0.5 % of the requests that get through (`timed_out_per_s` 162.9 of the gets, 18.1 of the
+  sets), and the latencies are those of the requests answered in time: before the timeout
+  applied they were 35.5 ms / 166 ms. The three cool servers sit at 43 %. Uneven arcs also cost hit ratio, 0.920
   instead of 0.963: twice the misses on paper (`explain` offers the database's replica
   2.87k/s, 57 %); the hot server's drops never reach it, so it runs at 0.495 instead of 0.27.
 - **More virtual nodes**: from 100 on, the hottest server is within about 10 % of the average,

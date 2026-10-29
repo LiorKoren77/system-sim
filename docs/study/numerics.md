@@ -236,13 +236,13 @@ all three runs: `reject rate 14.3%`, `rejected 236.7k`; `red_s`, which adds a wh
 per red step, is left out):
 
     step     node  peak_rho  peak_backlog   op            mean    p50     p95    p99
-    5ms      api          1            98   clients.call  5.79ms  3.93ms  16.7ms 30.5ms
-    100ms    api          1            80   clients.call  5.79ms  3.93ms  16.7ms 30.5ms
+    5ms      api          1            98   clients.call  5.79ms  3.97ms  16.6ms 29.9ms
+    100ms    api          1            80   clients.call  5.79ms  3.97ms  16.6ms 29.9ms
     1s       api     0.9167             0   clients.call  5.69ms  4.69ms  13ms   19.9ms
 
 The limiter admits the same total at every step, as the paragraph above says. What a coarse
 step erases is the burst's effect downstream: at 1 s the api sees 1,100/s, never overloads,
-and the p99 falls from 30.5 ms to 19.9 ms. A step shorter than the 5 s spike but not a
+and the p99 falls from 29.9 ms to 19.9 ms. A step shorter than the 5 s spike but not a
 divisor of it shows the other loss. At `step: 2s` the 5 s spike at 25 min is sampled at
 t = 25:00, 25:02 and 25:04, so it is offered for 6 s: the limiter then prints
 `reject rate 15%` and `rejected 251.7k`, 15,000 more, which is the 1 s of extra spike times
@@ -377,7 +377,7 @@ lab's cluster agree.
    residual check still passes (section 6). What coarse steps lose is fidelity, not balance.
 4. **Find the step where the burst disappears.** Run the rate-limiter lab at `step: 5ms`,
    `100ms`, `500ms` and `1s` (the commands are in "Choosing the step", section 6) and watch
-   the api row's `peak_backlog` (98, 80, 0, 0) and the p99 (30.5 ms until the step reaches
+   the api row's `peak_backlog` (98, 80, 0, 0) and the p99 (29.9 ms until the step reaches
    1 s, then 19.9 ms). Then set the limiter's `burst: 1000`, which moves the ceiling to
    1000 / 15000 = 67 ms. The burst now overfills the api's queue at every step, so the step
    hardly matters: the api's `dropped` is 1.385k at 5 ms, 1.36k at 100 ms and 1.2k at

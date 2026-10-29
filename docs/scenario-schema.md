@@ -284,7 +284,7 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 
 | type | own keys | status |
 |---|---|---|
-| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `keys` read by the [`che` caches](#che-hit-ratios) downstream (`keys must be a map`, `keys needs zipf and space, or uniform`, `keys takes zipf+space or uniform, not both`, `keys.zipf must be a finite non-negative number`, `keys.space must be a positive count (a whole number, optionally with k, M or G: 500, 10k, 100M)`, likewise `keys.uniform`; `space` and `uniform` are [counts](#values): `100M`); `timeout` checked (a duration), not yet used; `sizes` checked: each names an op the client sends and is a [size](#values) (`sizes names op 'x', which the client does not send`, `sizes 'stream' must be a size (B, KB, MB or GB: 50MB): size must be at most 1e15B`, the parser's reason after the colon; `sizes 'stream' must be positive` for `0B`, a size but no request), read by byte-sized nodes (each request costs its size in MB); `retries` ignored |
+| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `keys` read by the [`che` caches](#che-hit-ratios) downstream (`keys must be a map`, `keys needs zipf and space, or uniform`, `keys takes zipf+space or uniform, not both`, `keys.zipf must be a finite non-negative number`, `keys.space must be a positive count (a whole number, optionally with k, M or G: 500, 10k, 100M)`, likewise `keys.uniform`; `space` and `uniform` are [counts](#values): `100M`); `timeout` read (a duration; absent: the client waits for ever): each step the client's response to an op is fitted as a lognormal, and the share slower than the timeout is timed out instead of answered (`timed_out_per_s` in JSON, see [Drops and rejections](#drops-and-rejections)), the latencies are the answered share's (the lognormal's truncated moments) and every percentile is capped at the timeout; the servers still do a timed-out request's work, and nothing retries it; `sizes` checked: each names an op the client sends and is a [size](#values) (`sizes names op 'x', which the client does not send`, `sizes 'stream' must be a size (B, KB, MB or GB: 50MB): size must be at most 1e15B`, the parser's reason after the colon; `sizes 'stream' must be positive` for `0B`, a size but no request), read by byte-sized nodes (each request costs its size in MB); `retries` ignored |
 | `cdn` | `origin` (node id, required), `hit_ratio` (`{fixed: h}` or `che`, optional), `keys`, `ttl`, `write_ops` | read and run (phase 2b), see [`cdn`](#cdn) |
 | `load_balancer` | `policy`, `vnodes` | read and run, see [`load_balancer`](#load_balancer) |
 | `rate_limiter` | `algorithm`, `limit`, `burst`, `window`, `backend` | read and run, see [`rate_limiter`](#rate_limiter) |
@@ -1139,9 +1139,20 @@ step, the ops the link carries weighed alike).
 `t_s,client,op,offered_per_s,answered_per_s,mean_ms`, where `answered_per_s` is the part of
 the offered rate that came back answered (offered × the fraction the path delivered: offered
 minus what a limiter refused or a queue dropped on the way, never above offered; requests
-still waiting in a queue count as answered, later) and `mean_ms` the mean response of an
-answered request (`inf` when the path never answers). Numbers have 6 significant digits, `t_s`
-its shortest exact form. JSON's op entries carry `answered_per_s` beside `offered_per_s`.
+still waiting in a queue count as answered, later; requests slower than the client's `timeout`
+do not) and `mean_ms` the mean response of an answered request (`inf` when the path never
+answers). Numbers have 6 significant digits, `t_s` its shortest exact form. JSON's op entries
+carry `answered_per_s` beside `offered_per_s`, and `timed_out_per_s` (phase 2c).
+
+A **timeout** is a third kind of unanswered request, the client's own: a client with a `timeout`
+gives up on the requests its path delivered later than that (the share of the step's fitted
+lognormal response above the timeout). JSON's `timed_out_per_s` counts them per client op (0
+without a `timeout`), so `answered_per_s` = `offered_per_s` − what was dropped or refused on the
+way − `timed_out_per_s`. A timed-out request is **not** in any `drop_rate`: no node failed it
+(the servers still did its work, and their demand and utilization include it), so `drop_rate`
+stays a property of the nodes. The op's latencies describe the requests answered in time, and
+its percentiles (table, JSON and the latency SLOs) never exceed the timeout: a latency SLO whose
+`max` is at or above the client's timeout cannot fail, however many requests time out.
 When no step was observed every SLO is `skipped` and `run` exits 1: no data is an error,
 not a pass.
 

@@ -95,14 +95,19 @@ struct LinkSummary {
 // or dropped request saw no latency); `offered_per_s` still counts every request sent, and
 // `answered_per_s` the part of them that came back answered (plan 2b refinement 7): offered
 // minus what was refused or dropped on the way (a request still waiting in a queue is answered
-// later, not lost), so answered / offered is the fraction the path delivered. An infinite mean
-// makes every latency
-// infinite, which the renderers print as "unavailable" (table) or null (JSON).
+// later, not lost), so answered / offered is the fraction the path delivered. A client with a
+// `timeout` (plan 2c Task 13) also gives up on the delivered requests slower than it:
+// `timed_out_per_s` counts them (0 without a timeout), `answered_per_s` leaves them out (offered
+// − lost − timed out), the latencies describe the requests answered in time, and every
+// percentile is capped at the timeout (no answered request took longer). A timed-out request is
+// not a drop: no node failed it, so it is in no node's drop rate. An infinite mean makes every
+// latency infinite, which the renderers print as "unavailable" (table) or null (JSON).
 struct OpSummary {
   std::string client{};
   std::string op{};
   double offered_per_s{};
   double answered_per_s{};
+  double timed_out_per_s{};
   double mean_s{};
   double p50_s{};
   double p95_s{};
@@ -210,6 +215,7 @@ class Summary {
     std::string op{};
     double offered{};       // Σ offered·dt, requests
     double answered{};      // Σ answered·dt, requests: the part of `offered` that came back
+    double timed_out{};     // Σ timed_out·dt, requests: delivered, but after the client gave up
     Moments by_answered{};  // weighted by requests answered: what an average answer sees
     Moments by_time{};      // weighted by time: the fallback when nothing was answered
     bool unavailable{};

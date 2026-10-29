@@ -69,15 +69,19 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   average (112.5 %) and **12.01k/s (120 %)** on the hottest (k = 1 + z_8/sqrt(450) = 1.068;
   `explain`: `(hottest 120%, red)`). Every machine is over capacity, every queue fills, and the
   cluster drops a ninth of the replica-requests (`drop_rate 0.1111`). A request is lost only when
-  two of its three replica-requests are dropped: 3.4 % of them, so 96.6 % are answered (`run
-  --report json`: 20.28k of the 21k gets), not the 8/9 a ninth would suggest. `run` fails all
-  three SLOs: drop rate 0.1111, utilization 1, `put` p99 **118 ms**. Every replica now waits for
-  its full room, 1000 requests drained at 10k/s = 100 ms, with the spread the fluid gives a full
-  queue (about 10 ms), so the second of three replies is 100.0 ms with a 6.7 ms spread; the p99
-  is that plus the path. (Before the quorum was taken over the real replica set the lab said
-  306 ms and blamed the room; the 306 ms came from treating each replica as an exponential of
-  mean 100 ms, whose spread is as large as its mean.) The fix is more machines, not a different
-  quorum: the load is N × the requests whatever W and R are.
+  two of its three replica-requests are dropped: 3.4 % of them, so 96.6 % are delivered (20.28k
+  of the 21k gets/s), not the 8/9 a ninth would suggest. Every replica now waits for its full
+  room, 1000 requests drained at 10k/s = 100 ms, with the spread the fluid gives a full queue
+  (about 10 ms), so the second of three replies is 100.0 ms with a 6.7 ms spread, and the
+  client's response about 101 ms: past the clients' `timeout: 100ms` more often than not. The
+  timeout (plan 2c Task 13) gives up on 56 % of the delivered requests (`run --report json`:
+  `timed_out_per_s` 11.41k of the gets), so only 8.88k of the 21k gets/s are answered, in
+  95.3 ms on average. `run` fails all three SLOs: drop rate 0.1111, utilization 1, `put` p99
+  **100 ms**, the timeout itself, since no answered request took longer (the lognormal fit
+  without the cap said 118 ms). (Before the quorum was taken over the real replica set the lab
+  said 306 ms and blamed the room; the 306 ms came from treating each replica as an exponential
+  of mean 100 ms, whose spread is as large as its mean.) The fix is more machines, not a
+  different quorum: the load is N × the requests whatever W and R are.
 - `vnodes: 1` (at 16 machines): the ring is at its most uneven, the hottest machine carries
   1 + z_16/sqrt(3) = 2.02 times the average (`imbalance=2.02`), 11.37k/s, `(hottest 114%, red)`;
   it alone drops 1.37k of the 90k replica-requests/s (drop rate 0.01522) and the utilization and
@@ -85,9 +89,10 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   A key's three replicas include the hot machine with probability 3 × 2.02/16 = 0.379, and then
   the two cool replicas answer a quorum of two first, so the store's time is 0.378 ms and no
   request is lost: the quorum hides the hot machine, which is why Dynamo answers at W or R of
-  N replies and not at the slowest. Add `write_quorum: 3` and it no longer does: a `put` waits for every replica, the full
-  queue included, mean 39.6 ms, p99 233 ms (FAIL), and loses what the hot machine drops: 4.6 %
-  of the puts (8.59k of 9k answered).
+  N replies and not at the slowest. Add `write_quorum: 3` and it no longer does: a `put` waits
+  for every replica, the full queue included, and loses what the hot machine drops: 4.6 % of the
+  puts (8.59k of 9k delivered). The slow ones meet the 100 ms timeout: 638/s time out, 7.95k/s
+  are answered, mean 29.4 ms, p99 100 ms (FAIL; 39.6 ms and 233 ms before the timeout applied).
 - `write_quorum: 3, read_quorum: 1`: a `put` waits for the slowest of three replicas and a `get`
   for the fastest: `put` 1.87 ms (p99 3.3 ms), `get` 1.4 ms (p99 2.05 ms).
   `write_quorum: 1, read_quorum: 3` swaps them. The load does not change. `explain` marks either
@@ -95,5 +100,7 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   (W + R = 4 > 3 here: they still do).
 - `mode: cp`: no difference until partitions exist (phase 3). With quorums that do not overlap
   (say `write_quorum: 1, read_quorum: 1`) `explain` says that cp contradicts them.
-- `nodes: 4`: 22.5k/s per machine; the cluster drops 55.6 % of the replica-requests and answers
-  41.7 % of the requests (the binomial again: a request needs two of its three).
+- `nodes: 4`: 22.5k/s per machine; the cluster drops 55.6 % of the replica-requests and delivers
+  41.7 % of the requests (the binomial again: a request needs two of its three); the 100 ms
+  timeout then gives up on 56 % of those, as at 8 machines, so 18.3 % are answered (3.83k of the
+  21k gets/s).
