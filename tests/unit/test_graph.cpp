@@ -2398,14 +2398,17 @@ TEST_CASE("a worker pool's then step that no queue feeds is sized by its own siz
 }
 
 // A pool that names no queue (no `consumes`) and has no link q -> pool: the queue holds the
-// client's 300 MB uploads, but no link takes them to the pool, so the pool's same-op `then` step
-// inherits nothing. Its `upload` still counts as arriving at the store, unsized. (A pool that
-// DID name the queue without the link is an error since plan 2c Task 6: tested below.)
+// client's 300 MB uploads, but no link takes them to the pool (they go to another group, `other`),
+// so the pool's same-op `then` step inherits nothing. Its `upload` still counts as arriving at the
+// store, unsized. (A pool that DID name the queue without the link is an error since plan 2c Task
+// 6: tested below; so is a queue nobody consumes, since its review: hence `other`.)
 TEST_CASE("a pool whose queue has no link to it sends its same-op then step unsized", "[graph]") {
   Scenario s{.name = "unlinked-pool", .version = 1, .duration = 1min};
   s.nodes = {sized_client("u", "upload", simsys::Bytes{300e6}), message_queue("q"),
+             worker_pool("other", {}, "q"),
              worker_pool("pool", {Step{.to = "store", .op = "upload"}}), default_blob_store()};
-  s.links = {LinkSpec{.from = "u", .to = "q"}, LinkSpec{.from = "pool", .to = "store"}};
+  s.links = {LinkSpec{.from = "u", .to = "q"}, LinkSpec{.from = "q", .to = "other"},
+             LinkSpec{.from = "pool", .to = "store"}};
   const auto built = Graph::build(s);
   REQUIRE_FALSE(built.has_value());
   REQUIRE(built.error().message ==
@@ -3111,7 +3114,7 @@ TEST_CASE("a worker pool consumes only a message queue or a frontier", "[graph]"
             "frontier");
   }
   SECTION("a frontier is one") {
-    auto s = queue_feeding({});
+    auto s = queue_feeding({consuming_pool("w0", "q", 4, 5ms)});  // q needs a consumer of its own
     s.nodes.push_back(NodeSpec{.id = "frontier", .type = NodeType::frontier});
     s.nodes.push_back(consuming_pool("w", "frontier", 4, 5ms));
     s.links.push_back(LinkSpec{.from = "frontier", .to = "w"});
@@ -3208,4 +3211,122 @@ TEST_CASE("the broker itself keeps the type's append numbers: 1M messages a seco
   REQUIRE_THAT(broker.service_rate.per_second, WithinRel(1e6, 1e-12));
   REQUIRE_THAT(broker.service_time_s, WithinRel(100e-6, 1e-12));
   REQUIRE(broker.concurrency == 100);
+}
+
+// ---- Review of Task 6: a pool's only sender is its queue, and a queue's wiring carries flow
+// (plan 2c, I-1, M-2, M-3) ----
+//
+// A worker pool drains the queue it consumes and nothing else: any other demand edge into it (a
+// client's route, a service's step) would make it a server that a caller waits for, with a 7-day
+// room in which nobody is ever dropped. A queue nobody consumes, and a consumer link whose `ops`
+// filter lets none of the queue's ops through, are pipelines the scenario believes run and that
+// carry nothing: all refused at build, each naming what to fix.
+
+// A client sending straight to a pool: refused, naming the sender (the pool here has no
+// `consumes`, as only a scenario built in code can: the loader requires it).
+TEST_CASE("a client sending to a worker pool is refused: a pool takes jobs from its queue only",
+          "[graph]") {
+  Scenario s{.name = "direct-pool", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"job", 1.0}}), worker_pool("w", {})};
+  s.links = {LinkSpec{.from = "u", .to = "w"}};
+  const auto built = Graph::build(s);
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'w': a worker pool takes jobs only from the queue it consumes ('u' sends to it)");
+}
+
+// The pool consumes q, but a service also calls it directly: the second way in is refused, though
+// the first is fine (the review measured rho 1.67 and a client's response holding the pool's
+// sojourn before this check).
+TEST_CASE("a service step into a pool that consumes a queue is refused, naming the service",
+          "[graph]") {
+  auto s = queue_feeding({consuming_pool("w", "q", 4, 5ms)});
+  s.nodes[0].workload->op_shares = {{"publish", 0.5}, {"call", 0.5}};
+  s.nodes.push_back(service("svc", {{"call", {Step{.to = "w", .op = "publish"}}}}));
+  s.links.push_back(LinkSpec{.from = "u", .to = "svc"});
+  s.links.push_back(LinkSpec{.from = "svc", .to = "w"});
+  const auto built = Graph::build(s);
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'w': a worker pool takes jobs only from the queue it consumes ('svc' sends to it)");
+}
+
+// A queue with no link to any pool would answer its publishers and keep their messages for nobody.
+TEST_CASE("a message queue that no worker pool consumes is refused", "[graph]") {
+  const auto built = Graph::build(queue_feeding({}));
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'q': no worker pool consumes this message queue (its messages would be kept for "
+          "nobody)");
+}
+
+// A consumer link's `ops` filter selects what its group reads: here w1 reads only `publish` and
+// w2 everything, so the 10 % `audit` messages reach w2 alone (each group still reads ALL of what
+// it reads: share 1, a copy).
+TEST_CASE("a consumer link's ops filter decides which ops its group reads", "[graph]") {
+  auto s = queue_feeding({consuming_pool("w1", "q", 4, 5ms), consuming_pool("w2", "q", 4, 5ms)});
+  s.nodes[0].workload->op_shares = {{"publish", 0.9}, {"audit", 0.1}};
+  s.links[1].ops = {"publish"};  // q -> w1
+  const auto g = *Graph::build(s);
+  const auto q = *g.index_of("q");
+  const auto w1 = *g.index_of("w1");
+  const auto w2 = *g.index_of("w2");
+  REQUIRE(std::ranges::equal(g.arriving_ops(w1), std::vector<std::string>{"publish"}));
+  REQUIRE(std::ranges::equal(g.arriving_ops(w2), std::vector<std::string>{"audit", "publish"}));
+  const auto audit = g.routes_for(q, "audit");
+  REQUIRE(audit.size() == 1);
+  REQUIRE(audit.front().target == w2);
+  REQUIRE_THAT(audit.front().share, WithinRel(1.0, 1e-12));
+  REQUIRE(g.is_async_hop(q, "audit", w2, "audit"));
+  REQUIRE_FALSE(g.is_async_hop(q, "audit", w1, "audit"));
+}
+
+// A filter that lets none of the queue's ops through leaves its group nothing to read.
+TEST_CASE("a consumer link whose ops filter carries nothing the queue receives is refused",
+          "[graph]") {
+  auto s = queue_feeding({consuming_pool("w", "q", 4, 5ms)});
+  s.links[1].ops = {"audit"};  // q -> w; the queue only ever receives `publish`
+  const auto built = Graph::build(s);
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "link 'q'->'w' carries none of the ops 'q' receives (link ops: audit; it receives: "
+          "publish)");
+}
+
+// A consumer link of weight 0 is a drained route, as everywhere: its group reads nothing (share
+// 0), so no op arrives at it and no delivery to it is an asynchronous hop; the other group still
+// reads every message.
+TEST_CASE("a weight-0 consumer link is a group that reads nothing: share 0", "[graph]") {
+  auto s = queue_feeding({consuming_pool("w1", "q", 4, 5ms), consuming_pool("idle", "q", 4, 5ms)});
+  s.links[2].weight = 0.0;  // q -> idle
+  const auto g = *Graph::build(s);
+  const auto q = *g.index_of("q");
+  const auto idle = *g.index_of("idle");
+  const auto routes = g.routes(q);
+  REQUIRE(routes.size() == 2);
+  for (const auto& route : routes) {
+    CAPTURE(route.target);
+    REQUIRE(route.share == (route.target == idle ? 0.0 : 1.0));
+  }
+  REQUIRE(g.arriving_ops(idle).empty());
+  REQUIRE_FALSE(g.is_async_hop(q, "publish", idle, "publish"));
+  REQUIRE(
+      std::ranges::equal(g.arriving_ops(*g.index_of("w1")), std::vector<std::string>{"publish"}));
+}
+
+// A URL frontier has no `retention`, so a pool draining one gets the default room: Kafka's 7 days
+// of its own rate, 604,800 s x (4 workers / 5 ms = 800/s) = 483.84 million URLs.
+TEST_CASE("a pool consuming a frontier gets the default room: 7 days of its rate", "[graph]") {
+  Scenario s{.name = "frontier-pool", .version = 1, .duration = 1min};
+  s.nodes = {
+      client("u", Rate{100}, {{"url", 1.0}}),
+      NodeSpec{
+          .id = "frontier", .type = NodeType::frontier, .then = {Step{.to = "w", .op = "url"}}},
+      consuming_pool("w", "frontier", 4, 5ms)};
+  s.links = {LinkSpec{.from = "u", .to = "frontier"}, LinkSpec{.from = "frontier", .to = "w"}};
+  const auto g = Graph::build(s);
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE_THAT(g->nodes()[*g->index_of("w")].capacity.queue_limit,
+               WithinRel(604'800.0 * 800.0, 1e-9));
 }

@@ -1843,10 +1843,13 @@ TEST_CASE("a message queue sends every message it appends to each consumer group
 }
 
 // The op name survives the broker (plan 2c refinement 4): two ops published, two ops delivered, at
-// their own rates, to each group.
+// their own rates, to each group. The client publishes both, so the graph saw both arrive: the
+// broker's groups are the graph's routes for each op that reaches it (review of Task 6, M-4).
 TEST_CASE("a message queue keeps each message's op name on its way to the consumers",
           "[behaviours]") {
-  const auto g = *simsys::graph::Graph::build(queue_with_two_groups());
+  auto s = queue_with_two_groups();
+  s.nodes[0].workload->op_shares = {{"publish", 0.9375}, {"audit", 0.0625}};  // 300 : 20
+  const auto g = *simsys::graph::Graph::build(s);
   MessageQueueBehaviour q{g, *g.index_of("q")};
   Flow in;
   in.add("publish", Rate{300});
@@ -1856,6 +1859,26 @@ TEST_CASE("a message queue keeps each message's op name on its way to the consum
   REQUIRE_THAT(sent.rate_of("publish").per_second, WithinRel(300.0, 1e-12));
   REQUIRE_THAT(sent.rate_of("audit").per_second, WithinRel(20.0, 1e-12));
   REQUIRE_THAT(sent.total().per_second, WithinRel(320.0, 1e-12));
+}
+
+// A consumer link's `ops` filter is the graph's (graph::Graph::routes_for): w1's link carries only
+// `publish`, so the `audit` messages go to w2 alone, while both groups read every `publish`.
+TEST_CASE("a message queue sends an op only to the groups whose link carries it", "[behaviours]") {
+  auto s = queue_with_two_groups();
+  s.nodes[0].workload->op_shares = {{"publish", 0.9375}, {"audit", 0.0625}};
+  s.links[1].ops = {"publish"};  // q -> w1
+  const auto g = *simsys::graph::Graph::build(s);
+  MessageQueueBehaviour q{g, *g.index_of("q")};
+  Flow in;
+  in.add("publish", Rate{300});
+  in.add("audit", Rate{20});
+  const auto routed = q.route(in, 0s, 100ms);
+  const auto w1 = sent_to(routed, *g.index_of("w1"));
+  REQUIRE_THAT(w1.rate_of("publish").per_second, WithinRel(300.0, 1e-12));
+  REQUIRE(w1.rate_of("audit").per_second == 0.0);
+  const auto w2 = sent_to(routed, *g.index_of("w2"));
+  REQUIRE_THAT(w2.rate_of("publish").per_second, WithinRel(300.0, 1e-12));
+  REQUIRE_THAT(w2.rate_of("audit").per_second, WithinRel(20.0, 1e-12));
 }
 
 TEST_CASE("a message queue with nothing published sends nothing and costs one unit a message",

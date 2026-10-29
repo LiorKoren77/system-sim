@@ -21,6 +21,8 @@
 #include <utility>
 #include <vector>
 
+#include "../support/explain_lines.hpp"
+
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions when a
 // std header is included after a module that included it in its global module fragment.
@@ -43,6 +45,8 @@ using simsys::model::NodeSpec;
 using simsys::model::NodeType;
 using simsys::model::Scenario;
 using simsys::model::Workload;
+using simsys::test_support::check_line;
+using simsys::test_support::node_line;
 
 namespace {
 
@@ -215,15 +219,6 @@ double number(const std::string& cell) {
 constexpr std::string_view node_header =
     "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone";
 constexpr std::string_view op_header = "t_s,client,op,offered_per_s,answered_per_s,mean_ms";
-
-// The line of explain's checks block (after "checks (") that starts, after its indent, with
-// `id` and a space; empty when there is none.
-std::string check_line(const std::string& text, const std::string& id) {
-  const auto at = text.find("\n  " + id + " ", text.find("checks ("));
-  if (at == std::string::npos) return {};
-  const auto end = text.find('\n', at + 1);
-  return text.substr(at + 1, end - at - 1);
-}
 
 // `explain` of a shipped book scenario, as `simsys explain scenarios/book/<name>/scenario.yaml`
 // prints it. SIMSYS_SCENARIOS_DIR is injected by tests/CMakeLists.txt, like in scenario_tests.
@@ -1088,14 +1083,7 @@ TEST_CASE("the tutorial chain's series are byte for byte what they were before l
 
 // ---- explain on youtube: a pool's capacity is workers / cost (plan 2c Task 6) ----
 //
-// The line of the nodes block that starts, after its indent, with `id`.
-namespace {
-std::string node_line_of(const std::string& text, const std::string& id) {
-  const auto at = text.find("\n  " + id + " ", text.find("nodes:"));
-  if (at == std::string::npos) return {};
-  return text.substr(at + 1, text.find('\n', at + 1) - at - 1);
-}
-}  // namespace
+// (node_line is tests/support/explain_lines.hpp's, shared with test_report.cpp.)
 
 // transcoders: 400 workers at 60 s a video = 400 / 60 s = 6.667 videos/s (it was the worker_pool
 // type's default 1k/s: 2 ms at c = 2). completion_handler: 4 workers at 5 ms = 4 / 0.005 s = 800/s.
@@ -1117,9 +1105,12 @@ TEST_CASE("explain checks youtube's transcoders against workers over cost: 6.667
 TEST_CASE("explain describes youtube's transcode queue and transcoders", "[series]") {
   const auto text = explain_shipped("youtube");
   CAPTURE(text);
-  REQUIRE(node_line_of(text, "transcoders")
-              .contains("workers=400 cost=1m (capacity 6.667/s: workers / cost)"));
-  const auto queue = node_line_of(text, "transcode_q");
+  const auto transcoders = node_line(text, "transcoders");
+  REQUIRE(transcoders.contains("capacity=6.667/s (workers / cost)"));
+  // 7 days x 6.667/s = 604,800 x 400 / 60 = 4,032,000 messages: 4.032M (review of Task 6, M-1).
+  REQUIRE(transcoders.contains("queue_limit=4.032M (retention × capacity)"));
+  REQUIRE(transcoders.contains("consumes=transcode_q  workers=400 cost=1m"));
+  const auto queue = node_line(text, "transcode_q");
   REQUIRE(queue.contains("retention=7d (default: Kafka's 168 h)"));
   REQUIRE(queue.contains("partitions=32 (not modelled)"));
 }

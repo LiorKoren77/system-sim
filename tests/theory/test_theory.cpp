@@ -2692,6 +2692,49 @@ TEST_CASE("a 10 MB write waits 160 ms and is serialised whole for 80 ms: a 240 m
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(0.0005 + 0.240 + b_sojourn, 1e-9));
 }
 
+// Whether a hop pays a request whole on the wire is decided per (link, op) at build (review of
+// plan 2c Task 6, I-2): an op is a write on a link if a node it reaches under its own name lists it
+// in `write_ops`, the receiver or any node behind it. A 10 MB `upload` at 5/s over 1 Gbit/s into a
+// blob store that lists `upload`:
+//   rho = 5 x 10 MB / 125 MB/s = 0.4;  s_obj = 10 x 8 ms = 80 ms
+//   Wq (M/D/1) = 0.5 x 0.4 / 0.6 x 80 ms = 26.67 ms;  a write's answer: the whole 80 ms
+//   pipe = 106.67 ms, whether the link ends at the store or at a load balancer in front of it.
+// Before the fix the balancer (whose own `write_ops` is the default `[write]`) made it a read on
+// the wire: 26.67 + 8 = 34.67 ms, 72 ms less than the same bytes straight into the store.
+namespace {
+// a (5 `upload`s/s of 10 MB) -> [lb ->] store (a default blob store whose write op is `upload`),
+// the first hop over 1 Gbit/s.
+Scenario upload_over_pipe(bool behind_balancer) {
+  auto s = pipe_over(5, simsys::Bytes{10e6});
+  s.nodes[0].workload->op_shares = {{"upload", 1.0}};
+  s.nodes[0].workload->sizes = {{"upload", simsys::Bytes{10e6}}};
+  NodeSpec store{.id = "store", .type = NodeType::blob_store};
+  store.write_ops = std::vector<std::string>{"upload"};
+  if (!behind_balancer) {
+    s.nodes[1] = std::move(store);
+    s.links[0].to = "store";
+    return s;
+  }
+  s.nodes[1] = NodeSpec{.id = "lb", .type = NodeType::load_balancer};
+  s.nodes.push_back(std::move(store));
+  s.links[0].to = "lb";
+  s.links.push_back(LinkSpec{.from = "lb", .to = "store", .latency = 250us});
+  return s;
+}
+}  // namespace
+
+TEST_CASE("a 10 MB upload behind a load balancer pays the wire as a write, as straight in",
+          "[theory]") {
+  const auto straight = first_step(*Graph::build(upload_over_pipe(false)));
+  const auto balanced = first_step(*Graph::build(upload_over_pipe(true)));
+  const double wait = 0.5 * simsys::queueing::mmc_wait(1, 0.4, 0.080).mean_s;
+  REQUIRE_THAT(wait, WithinAbs(0.026667, 1e-6));
+  REQUIRE_THAT(only_link(straight).rho, WithinRel(0.4, 1e-12));
+  REQUIRE_THAT(only_link(straight).latency.mean_s, WithinRel(wait + 0.080, 1e-9));
+  REQUIRE_THAT(only_link(balanced).latency.mean_s,
+               WithinRel(only_link(straight).latency.mean_s, 1e-12));
+}
+
 // Two ops of different sizes share one pipe: 20/s of `get` (1 MB, 8 ms, a read) and 20/s of `write`
 // (4 MB, 32 ms, a write at b) are 20 + 80 = 100 MB/s, rho 0.8 again, but the objects are NOT
 // alike. With p = 1/2 each:

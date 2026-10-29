@@ -1030,9 +1030,10 @@ int Simulation::line_steps(const graph::ResolvedLink& link) {
 // A bandwidth link's pipe (Pipe), or nothing for a link without a bandwidth: its queue of
 // megabytes (graph::ResolvedLink::pipe, defaults::pipe_capacity), the size of every op its
 // receiver can be sent with one (Graph::build refused a link that carries an unsized op, so these
-// cover every op that crosses it) and the receiver's write ops, which a hop pays whole while any
-// other op pays its first megabyte (MegabyteService::serialising). `slot` is its sample's place in
-// StepRecord::links.
+// cover every op that crosses it) and the ops that are writes on it (graph::ResolvedLink::
+// write_ops: for the receiver or a node behind it that the op reaches under its own name), which a
+// hop pays whole while any other op pays its first megabyte (MegabyteService::serialising). `slot`
+// is its sample's place in StepRecord::links.
 std::optional<Simulation::Pipe> Simulation::make_pipe(const graph::Graph& g, std::size_t link,
                                                       std::size_t slot) {
   const auto& resolved = g.links()[link];
@@ -1044,9 +1045,8 @@ std::optional<Simulation::Pipe> Simulation::make_pipe(const graph::Graph& g, std
       megabytes_by_op.emplace(op, defaults::byte_cost(*size));
     }
   }
-  auto timing =
-      behaviours::MegabyteService::serialising(resolved.pipe->service_time_s, megabytes_by_op,
-                                               model::write_ops_of(g.nodes()[receiver].spec));
+  auto timing = behaviours::MegabyteService::serialising(resolved.pipe->service_time_s,
+                                                         megabytes_by_op, resolved.write_ops);
   return Pipe{.group = CopyGroup{.queue = fluid::FluidQueue{*resolved.pipe}},
               .timing = std::move(timing),
               .megabytes_by_op = std::move(megabytes_by_op),

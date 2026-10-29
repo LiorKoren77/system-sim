@@ -276,7 +276,7 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `sql_db` | `replication_lag`, `shards` (int), `pool` (int connections), `write_ops`, `cost` | read and run (phase 2b), see [`sql_db`](#sql_db) |
 | `kv_cluster` | `nodes` (int), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp` | ignored; phase 3 |
 | `message_queue` | `partitions`, `retention` | read and run (phase 2c), see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool); `partitions` printed, not modelled |
-| `worker_pool` | `consumes` (queue node id), `workers`, `cost` (duration per job), `then` | `consumes`, `workers` and `cost` read and run (phase 2c), same section; `then` checked, run from Task 7 (a pool with `then` steps is refused by `run`/`estimate` until then) |
+| `worker_pool` | `consumes` (queue node id, required), `workers`, `cost` (duration per job), `then` | `consumes`, `workers` and `cost` read and run (phase 2c), same section; `then` checked, run from Task 7 (a pool with `then` steps is refused by `run`/`estimate` until then) |
 | `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every **write** the store serves (an op in its `write_ops`; not one it drops) sends `factor` requests of the step's op to its target, and a read sends nothing (S3 notifies on ObjectCreated and ObjectRemoved, never on a GET: 1000 views/s of a video start no transcode; notifying on reads is phase 3). They are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. A step `on: miss` (`node 'store': a blob store's then steps fire for every write it stores (on: miss needs a cache)`) or `on: failure` (`... (on: failure: an event reports no failure before phase 3)`) is refused, and so is any `mode` (`node 'store': a blob store's then steps are event notifications nobody waits for (mode orders the calls a request waits for)`); an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, the delivery delay (an event arrives after the link's latency), failed notifications |
 | `search_index` | `build_interval` | ignored |
 | `ws_gateway` | `max_connections`, `heartbeat` (duration), `fanout` (avg recipients per message), `ops` | `ops` checked as step lists; others ignored; phase 3 |
@@ -727,18 +727,26 @@ pool then drops 300/s while the publisher is still answered 1.5k/s.
 |---|---|---|---|
 | `retention` | `message_queue` | a positive [duration](#values) (`7d` = 168 h); default **7 days**, Kafka's `log.retention.hours = 168` (an industry default: the book gives none) | `node 'q': retention must be positive` |
 | `partitions` | `message_queue` | a positive integer, printed by `explain` and **not modelled** (it would cap a group's parallelism: phase 3) | `node 'q': partitions must be a positive integer` |
-| `consumes` | `worker_pool` | the queue (or URL `frontier`) the pool drains; *(graph)* it must be a `message_queue` or a `frontier` and link to the pool | `node 'w': consumes 'svc' (type service); a worker pool consumes a message_queue or a frontier`, `node 'w': consumes 'q', but no link from 'q' delivers its messages to it` |
+| `consumes` | `worker_pool` | **required**: the queue (or URL `frontier`) the pool drains, its only source of jobs; *(graph)* it must be a `message_queue` or a `frontier` and link to the pool, and no other node may send to the pool (a client, a service's step, another pool's `then`: a pool is no server anyone calls) | `node 'w': worker_pool needs consumes`, `node 'w': consumes 'svc' (type service); a worker pool consumes a message_queue or a frontier`, `node 'w': consumes 'q', but no link from 'q' delivers its messages to it`, `node 'w': a worker pool takes jobs only from the queue it consumes ('svc' sends to it)` |
 | `workers` | `worker_pool` | required, a positive integer, at most 100000 (Erlang C costs O(c) per step) | `node 'w': worker_pool needs workers`, `workers must be a positive integer`, `workers must be at most 100000` |
 | `cost` | `worker_pool` | required, a positive duration: the time one worker spends on one job (a service's `cost` is a map of capacity units; same spelling, read by type) | `node 'w': worker_pool needs cost`, `cost must be positive` |
 | `capacity`, `latency`, `replicas`, `advanced.concurrency` | `worker_pool` | refused: each would restate `workers` or `cost` | `node 'w': a worker pool's rate is workers / cost` |
 | `advanced.queue_limit` | `worker_pool` | refused: the pool waits in its queue | `node 'w': a worker pool waits in its queue: set the queue's retention` |
 
 *(graph)* A link from a queue to anything but a pool that consumes it is refused: `node 'q': a
-message queue delivers only to the worker pools that consume it ('svc' does not)`. `explain` says
-what each number is: `retention=7d (default: Kafka's 168 h) partitions=32 (not modelled)` on the
-queue (a retention of whole days in days, any other as other durations), `capacity=6.667/s
-(workers / cost)  service_time=1m (cost)  c=400 (workers)  queue_limit=4.032e+06 (retention ×
-capacity) ... workers=400 cost=1m (capacity 6.667/s: workers / cost)` on the pool. A group's
+message queue delivers only to the worker pools that consume it ('svc' does not)`; so is a queue no
+pool consumes (`node 'q': no worker pool consumes this message queue (its messages would be kept
+for nobody)`) and a consumer link whose `ops` filter carries none of the ops the queue receives
+(`link 'q'->'w' carries none of the ops 'q' receives (link ops: audit; it receives: publish)`); a
+link's `ops` otherwise selects what its group reads, and a link of `weight: 0` is a group that reads
+nothing. A `bandwidth` on a queue → pool link is a pipe like any other: once its 1000 MB room is
+full it **drops** messages, where a real consumer pulls at its own pace and only falls behind (a
+Kafka group lags, it loses nothing before `retention`); leave queue → pool links without one.
+`explain` says what each number is: `retention=7d (default: Kafka's 168 h) partitions=32 (not
+modelled)` on the queue (a retention of whole days in days, any other as other durations),
+`capacity=6.667/s (workers / cost)  service_time=1m (cost)  c=400 (workers)  queue_limit=4.032M
+(retention × capacity) ... consumes=transcode_q  workers=400 cost=1m` on the pool (a room of a
+million or more with an SI prefix, as a count). A group's
 **queue lag**, the age of its oldest unread message, is measured in Task 8 (the `queue_lag` SLO).
 Ignored: ordering, delivery guarantees and redelivery, a consumer's commit interval, the broker's
 disk; a worker blocked on a slow downstream call (an external sink's 150 ms would hold a worker:
@@ -817,10 +825,14 @@ no `advanced` block) beyond which it drops. Fed what the sender puts on the link
 line: 1 MB requests at 100/s over 1 Gbit/s are rho 0.8, an M/D/1 wait of 0.5 × 0.8 / 0.2 × 8 ms =
 16 ms. A hop over the pipe adds, once, beside the link's two fixed legs, the pipe's wait plus the
 request's answer time on the wire, by the rule of a [byte-sized node](#node-common-keys): a
-**write** (an op in the receiver's `write_ops`; `write` for a node that lists none) pays its
-**whole serialisation**, since the receiver acts after its last byte, and **any other op its first
-megabyte** (`min(size, 1 MB) × 1 MB / bandwidth`), since the receiver answers at its first megabyte
-while the rest streams in: 16 + 8 = 24 ms there; for 10 MB requests at 10/s, 160 + 8 = 168 ms for a
+**write** pays its **whole serialisation**, since the receiver acts after its last byte, and **any
+other op its first megabyte** (`min(size, 1 MB) × 1 MB / bandwidth`), since the receiver answers at
+its first megabyte while the rest streams in. Whether an op is a write is decided per link and op
+when the graph is built: it is one if a node it reaches **under its own name** lists it in
+`write_ops` (`write` for a node that lists none), the receiver or any node behind it, so a 10 MB
+`upload` through a load balancer into a blob store that lists `upload` pays its whole 80 ms on the
+client's link exactly as it would straight into the store (a balancer or a service passing a body
+on has it all before it forwards it); a renamed request is a new one and does not count. So: 16 + 8 = 24 ms there; for 10 MB requests at 10/s, 160 + 8 = 168 ms for a
 read and 160 + 80 = 240 ms for a write. A streamed upload into a blob store thus pays the wire's
 whole-object time and then the store's in series (an upper bound: a real PUT overlaps them).
 Requests of several sizes wait longer than one size at the same rho (1 MB and 4 MB at 20/s each:

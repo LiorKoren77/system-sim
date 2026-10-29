@@ -51,14 +51,16 @@
 // write it serves (an op in its `write_ops`; a read fires nothing, Graph::then_fraction), and
 // asynchronous hops by design (detail::blob_store_events); a step on miss or on failure, or in
 // parallel mode, is refused, since an event is none of those (invalid_blob_store).
-// A message queue (plan 2c refinements 4-6; book ch. 1's message queue, Kafka in ch. 14's
-// transcoding and ch. 15's notification pipelines) COPIES: each link out of it goes to a worker
-// pool that `consumes` it (a consumer group), and every group receives every message, so the
-// queue's routes are one per group, each of share 1 (route_queue); the hops along them are
-// asynchronous by design (detail::consumer_deliveries: the publisher is answered at the append).
+// A message queue (plan 2c refinements 4-6; book ch. 1's message queue, ch. 10's queue-plus-workers
+// notification system, Kafka in ch. 14's transcoding and ch. 15's notification pipelines) COPIES:
+// each link out of it goes to a worker pool that `consumes` it (a consumer group), and every group
+// receives every message, so the queue's routes are one per group, each of share 1 (route_queue;
+// a queue nobody consumes is refused); the hops along them are asynchronous by design
+// (detail::consumer_deliveries: the publisher is answered at the append).
 // A worker pool is M/M/c over consumption: c = workers, service time = cost, rate workers / cost
 // (defaults::worker_pool_rate), and a waiting room of the messages its queue keeps,
-// retention × that rate (connect_consumers).
+// retention × that rate (connect_consumers). It takes jobs from the queue it consumes and from
+// nobody else (check_pool_senders).
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -334,6 +336,15 @@ struct ResolvedLink {
   // op it carries has a size (Graph::build refuses an unsized one). Empty without a bandwidth: the
   // link only adds its latency.
   std::optional<fluid::Capacity> pipe{};
+  // The ops this pipe carries that are WRITES for whoever receives them (review of plan 2c Task 5,
+  // I-2, and of Task 6, I-2): an op is a write on the link if a node it reaches under its own name,
+  // the receiver or any node behind it, lists it in its `write_ops` (model::write_ops_of). So a
+  // 10 MB `upload` through a load balancer into a blob store that lists `upload` is a write on the
+  // client's link too: the balancer forwards the body once all of it has arrived, as the store
+  // would. The engine pays a write's whole serialisation on the wire, any other op's first
+  // megabyte (behaviours::MegabyteService::serialising). Sorted; empty without a pipe (Graph::
+  // resolve_request_sizes, detail::written_downstream).
+  std::vector<std::string> write_ops{};
 };
 
 // The node a link delivers demand to: its `to`, or its `from` for a link written from the
@@ -505,6 +516,8 @@ class Graph {
   Result check_cache_backend_calls() const;
   Result route_splitters();
   Result route_queue(std::size_t queue);
+  Result check_pool_senders() const;
+  Result check_consumer_links(std::size_t queue) const;
   Result connect_consumers();
   Result connect_consumer(std::size_t pool);
   Result resolve_hit_ratios();
@@ -1881,6 +1894,39 @@ struct SizeWalk {
   return std::nullopt;
 }
 
+// Is `op` a write at `node`, or at a node the request reaches from there under its own name
+// (ResolvedLink::write_ops)? The size walk's hops (call_hops and the size-only hops), followed only
+// while the op keeps its name: a renamed request is a new request, whose bytes the receiver has
+// already taken in. `seen` holds the nodes already asked, so a loop ends.
+[[nodiscard]] bool written_downstream(const Graph& g, std::size_t node, const std::string& op,
+                                      std::set<std::size_t>& seen) {
+  if (!seen.insert(node).second) return false;
+  if (is_write(g.nodes()[node].spec, op)) return true;
+  auto hops = call_hops(g, node, op);
+  add_size_only_hops(g, node, op, hops);
+  for (const CallHop& hop : hops) {
+    if (hop.op == op && written_downstream(g, hop.to, op, seen)) return true;
+  }
+  return false;
+}
+
+// The ops a pipe carries (its arrivals, sorted by op) that are writes for whoever receives them
+// under that name (ResolvedLink::write_ops), each once and in order; none for a link without a
+// bandwidth.
+[[nodiscard]] std::vector<std::string> pipe_write_ops(const Graph& g, const ResolvedLink& link,
+                                                      std::span<const SizeArrival> arrivals) {
+  std::vector<std::string> writes;
+  if (!link.pipe) return writes;
+  for (const SizeArrival& arrival : arrivals) {
+    if (std::ranges::contains(writes, arrival.op)) continue;
+    std::set<std::size_t> seen;
+    if (written_downstream(g, demand_receiver(link), arrival.op, seen)) {
+      writes.push_back(arrival.op);
+    }
+  }
+  return writes;
+}
+
 // ---- What a che cache's keys are ----
 
 // The key distribution a che cache sees, the clients that send it, and the filters it went
@@ -2225,6 +2271,7 @@ std::expected<Graph, EngineError> Graph::build(model::Scenario scenario) {
                          .and_then([&] { return graph.connect_steps(); })
                          .and_then([&] { return graph.connect_backends(); })
                          .and_then([&] { return graph.route_splitters(); })
+                         .and_then([&] { return graph.check_pool_senders(); })
                          .and_then([&] { return graph.mark_balanced_targets(); })
                          .and_then([&] { return graph.resolve_hit_ratios(); })
                          .and_then([&] { return graph.resolve_hops(); })
@@ -2564,7 +2611,8 @@ std::optional<double> Graph::hit_ratio(std::size_t node) const {
 // tracks where each run starts; each run is contiguous, so it is passed on as a span. Then
 // every op that arrives at a byte-sized node must have a size, however it arrived
 // (check_sized_arrivals), and every request a bandwidth link carries must have one, links in
-// scenario order (detail::unpriced_on_pipe: a pipe prices megabytes, plan 2c refinement 3).
+// scenario order (detail::unpriced_on_pipe: a pipe prices megabytes, plan 2c refinement 3). The
+// same walk says which of a pipe's ops are writes downstream (detail::pipe_write_ops).
 Graph::Result Graph::resolve_request_sizes() {
   const auto walk = detail::size_walk(*this);
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
@@ -2580,6 +2628,7 @@ Graph::Result Graph::resolve_request_sizes() {
     if (auto unpriced = detail::unpriced_on_pipe(nodes_, links_[link], walk.over_links[link])) {
       return std::unexpected{std::move(*unpriced)};
     }
+    links_[link].write_ops = detail::pipe_write_ops(*this, links_[link], walk.over_links[link]);
   }
   return {};
 }
@@ -2878,8 +2927,9 @@ Graph::Result Graph::route_splitters() {
 // Route of share 1: every group reads EVERY message (a load balancer splits, shares summing to 1;
 // a queue copies), as the same op. A drained link (weight 0) is a group that reads nothing
 // (share 0), as everywhere a weight of 0 means a route nobody takes; any other weight changes
-// nothing, a group cannot read part of the log. A queue with no link holds its messages for
-// nobody: no route, and it answers its publishers all the same.
+// nothing, a group cannot read part of the log. A queue with no consumer at all is refused (review
+// of plan 2c Task 6, M-2): it would answer its publishers and keep their messages for nobody, a
+// pipeline the scenario believes runs and that ends at the broker.
 Graph::Result Graph::route_queue(std::size_t queue) {
   const auto& id = nodes_[queue].spec.id;
   for (std::size_t i = 0; i < links_.size(); ++i) {
@@ -2895,6 +2945,52 @@ Graph::Result Graph::route_queue(std::size_t queue) {
     const double share = links_[i].weight > 0.0 ? 1.0 : 0.0;
     routes_[queue].push_back(Route{.target = *target, .link = i, .share = share});
     add_edge(DemandEdge{.from = queue, .to = *target, .link = i});
+  }
+  if (routes_[queue].empty()) {
+    return std::unexpected{
+        EngineError{"node '" + id +
+                    "': no worker pool consumes this message queue (its messages would be "
+                    "kept for nobody)"}};
+  }
+  return {};
+}
+
+// A worker pool's jobs come from the queue it consumes and from nowhere else (review of plan 2c
+// Task 6, I-1): a demand edge into a pool from any other node (a client's route, a service's step,
+// a balancer's link, another pool's `then` step) is refused, naming the sender. Such a sender
+// would make the pool a server it calls: the loader requires `consumes`, and the pool's room is
+// that queue's retention (connect_consumer), a 7-day room in which a direct caller would wait
+// days and never be dropped. A queue's own link is the only way in, and it is asynchronous
+// (detail::consumer_deliveries): nobody waits for a pool. Run after route_splitters, the last
+// step that adds demand edges.
+Graph::Result Graph::check_pool_senders() const {
+  for (const DemandEdge& edge : edges_) {
+    const auto& pool = nodes_[edge.to].spec;
+    if (pool.type != model::NodeType::worker_pool) continue;
+    const auto& sender = nodes_[edge.from].spec;
+    if (pool.consumes == sender.id) continue;
+    return std::unexpected{EngineError{"node '" + pool.id +
+                                       "': a worker pool takes jobs only from the queue it "
+                                       "consumes ('" +
+                                       sender.id + "' sends to it)"}};
+  }
+  return {};
+}
+
+// Each consumer link of a queue whose `ops` filter names ops must carry one the queue receives
+// (review of plan 2c Task 6, M-2): a filter that carries none of them leaves the group with
+// nothing to read, a consumer in name only. Needs the arriving ops (collect_arriving_ops). A
+// drained link (weight 0) reads nothing by design and is not asked.
+Graph::Result Graph::check_consumer_links(std::size_t queue) const {
+  for (const Route& route : routes_[queue]) {
+    const auto& link = links_[route.link];
+    if (link.ops.empty() || route.share <= 0.0) continue;
+    const auto carried = [&](const std::string& op) { return carries_op(link, op); };
+    if (std::ranges::any_of(arriving_ops_[queue], carried)) continue;
+    return std::unexpected{
+        EngineError{"link " + link_label(nodes_, link, "'") + " carries none of the ops '" +
+                    nodes_[queue].spec.id + "' receives (link ops: " + joined(link.ops, ", ") +
+                    "; it receives: " + joined(arriving_ops_[queue], ", ") + ")"}};
   }
   return {};
 }
@@ -2919,8 +3015,8 @@ Graph::Result Graph::connect_consumers() {
 // and the drops are the pool's. Each group's room is its own (retention × ITS capacity). The
 // retention is the queue's, or defaults::default_retention when it states none, when the pool
 // reads a frontier (which has no retention) or names no queue at all (a pool built in code).
-// Assumed: the backlog drains first in, first out, so the oldest message waits backlog / drain
-// (Little's law) and the room in messages is the room in seconds of draining.
+// Assumed: the backlog drains first in, first out, so the oldest message waits the FIFO drain time
+// (backlog over drain rate) and the room in messages is the room in seconds of draining.
 Graph::Result Graph::connect_consumer(std::size_t pool) {
   auto& resolved = nodes_[pool];
   const auto& spec = resolved.spec;
@@ -2948,10 +3044,10 @@ Graph::Result Graph::connect_consumer(std::size_t pool) {
 }
 
 // What follows from the splits and the resolved hops: which ops reach each node (through any
-// chain of balancers and limiters), whether every op reaching one can leave it, and that no
-// write reaches a CDN. (What each balancer's policy does to the replicas behind it is marked
-// earlier, right after the splits, because a che cache's capacity depends on it:
-// mark_balanced_targets.)
+// chain of balancers and limiters), whether every op reaching one can leave it, that no write
+// reaches a CDN, and that every consumer link of a queue carries something it receives. (What each
+// balancer's policy does to the replicas behind it is marked earlier, right after the splits,
+// because a che cache's capacity depends on it: mark_balanced_targets.)
 Graph::Result Graph::check_routed_ops() {
   collect_arriving_ops();
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
@@ -2960,6 +3056,9 @@ Graph::Result Graph::check_routed_ops() {
     }
     if (nodes_[node].spec.type == model::NodeType::cdn) {
       if (auto checked = check_reads_only(node); !checked) return checked;
+    }
+    if (copies_to_consumers(nodes_[node].spec.type)) {
+      if (auto checked = check_consumer_links(node); !checked) return checked;
     }
     if (!forwards_by_link(nodes_[node].spec.type)) continue;
     if (auto checked = check_forwarded_ops(node); !checked) return checked;

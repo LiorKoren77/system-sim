@@ -134,6 +134,15 @@ constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
   return to_text(value, std::chars_format::fixed, 0);  // no std::format precision: see the top
 }
 
+// A queue's waiting room: as written up to six digits (1000, 12000, 500000), and from a million
+// on with an SI prefix, four digits (a pool's room is retention × its rate: 7 days of 6.667/s is
+// 4.032M, of 1.2k/s 725.8M; review of plan 2c Task 6, M-1), where six digits would print
+// "4.032e+06".
+[[nodiscard]] std::string fmt_room(double units) {
+  constexpr double million = 1e6;
+  return std::abs(units) < million ? num(units, 6) : fmt_count(units);
+}
+
 [[nodiscard]] std::string fmt_rate(double per_second) {
   return with_si_prefix(per_second) + "/s";
 }
@@ -1150,7 +1159,7 @@ struct QueueProvenance {
           std::string{source.service_time},
       "c=" + std::to_string(cap.concurrency) + std::string{per_slot(spec)} + " " +
           std::string{source.concurrency},
-      "queue_limit=" + num(cap.queue_limit, 6) + std::string{queued_unit(spec)} + " " +
+      "queue_limit=" + fmt_room(cap.queue_limit) + std::string{queued_unit(spec)} + " " +
           std::string{source.queue_limit},
       "variability=" + num(cap.service_variability, 3),
       "burstiness=" + num(cap.burstiness, 3)};
@@ -1180,18 +1189,17 @@ struct QueueProvenance {
   return " " + write_ops_summary(g, node);
 }
 
-// A worker pool's model (plan 2c refinement 5): "  consumes=transcode_q workers=400 cost=1m
-// (capacity 6.667/s: workers / cost)": the capacity is no number the scenario states but its
-// workers over the time one of them spends on a job, and the line says so. Nothing for a pool
-// built in code without both numbers (it runs on the type's, which server_details shows).
+// A worker pool's model (plan 2c refinement 5): "  consumes=transcode_q  workers=400 cost=1m",
+// the two numbers its capacity follows from. The capacity itself is stated once, in the queue
+// numbers before it, `capacity=6.667/s (workers / cost)` (queue_provenance; review of plan 2c
+// Task 6, M-6). Nothing for a pool built in code without both numbers (it runs on the type's,
+// which server_details shows).
 [[nodiscard]] std::string worker_pool_summary(const graph::ResolvedNode& node) {
   const auto& spec = node.spec;
   if (!defaults::worker_pool_rate(spec)) return {};
-  const double capacity = node.capacity.service_rate.per_second * spec.replicas;
   const std::string consumes = spec.consumes ? "  consumes=" + *spec.consumes : "";
   return consumes + "  workers=" + std::to_string(*spec.workers) +
-         " cost=" + fmt_duration(*spec.job_cost) + " (capacity " + fmt_rate(capacity) +
-         ": workers / cost)";
+         " cost=" + fmt_duration(*spec.job_cost);
 }
 
 // A retention as a queue's is quoted: in whole days when it is some ("7d", Kafka's default of

@@ -1044,8 +1044,10 @@ class MegabyteService {
   // long. The pipe's queue waits for whole requests (object time MB_o × s_MB: a request holds the
   // one server for its whole serialisation); the hop's answer (review of plan 2c Task 5, I-2)
   // follows refinement 2's rule for the node behind it:
-  //   a write (an op in the receiver's `write_ops`, model::write_ops_of)   MB_o × s_MB
-  //        the receiver acts after the LAST byte (a PUT is stored once all of it arrived);
+  //   a write (`write_ops`: graph::ResolvedLink::write_ops)               MB_o × s_MB
+  //        the receiver acts after the LAST byte (a PUT is stored once all of it arrived; an op is
+  //        a write on the link if the receiver or a node behind it that the op reaches under its
+  //        own name lists it, so a balancer in front of the store changes nothing);
   //   any other op                                                        min(MB_o, 1) × s_MB
   //        the receiver answers at its first megabyte while the rest streams in behind it.
   // For a streamed PUT into a blob store the wire's and the disk's whole-object times then add in
@@ -1295,29 +1297,32 @@ class BlobStoreBehaviour {
 
 // Models: the message queue of System Design Interview (Alex Xu, vol. 1) ch. 1 ("Message queue": a
 // durable buffer that lets a producer publish work and a consumer process it later, so the two
-// scale and fail apart) and the queues of ch. 14 (YouTube's transcoding queue) and ch. 15 (Google
-// Drive's notification queue), run in practice as Kafka. Plan 2c refinements 4 and 6. Captured:
-// the node is the BROKER. Its own queue is the append (spec §6: 1M messages/s, 100 µs chosen, so
-// c = 1M/s × 100 µs = 100 by Little's law), and a publisher is answered when its message is
-// appended: the response is the append's sojourn alone and the delivered share the broker's own,
-// whatever happens to the message later (the hops to the consumers are asynchronous by design,
-// graph::Graph::is_async_hop). Each appended message then goes to EVERY consumer group, a worker
-// pool that `consumes` the queue: Kafka's consumer groups each read the whole log, so the broker's
-// outflow is the sum of its groups' (two groups on 1k messages/s receive 1k/s each, not 500), and
-// a message keeps its op name. What a group has not read waits in that GROUP's pool queue, whose
-// room is the queue's retention × the pool's capacity (graph::Graph::connect_consumer): the backlog
-// of an append-only log, held per reader. Its queue lag (how far a group is behind) is Task 8's.
-// Ignored: ordering (partitions are printed, not modelled), delivery guarantees and redelivery
-// (at-least-once, a consumer that crashes before committing reads a message again), the consumer's
-// commit interval, the broker's disk (an append costs the type's 100 µs whatever the message's
-// size, and the log never fills a disk) and its replication.
+// scale and fail apart), ch. 10's notification system (one queue per channel, drained by its
+// workers: the book's queue-plus-workers design) and the queues of ch. 14 (YouTube's transcoding
+// queue) and ch. 15 (Google Drive's notification queue), run in practice as Kafka. Plan 2c
+// refinements 4 and 6. Captured: the node is the BROKER. Its own queue is the append (spec §6: 1M
+// messages/s, 100 µs chosen, so c = 1M/s × 100 µs = 100 by Little's law), and a publisher is
+// answered when its message is appended: the response is the append's sojourn alone and the
+// delivered share the broker's own, whatever happens to the message later (the hops to the
+// consumers are asynchronous by design, graph::Graph::is_async_hop). Each appended message then
+// goes to EVERY consumer group, a worker pool that `consumes` the queue: Kafka's consumer groups
+// each read the whole log, so the broker's outflow is the sum of its groups' (two groups on 1k
+// messages/s receive 1k/s each, not 500), and a message keeps its op name. What a group has not
+// read waits in that GROUP's pool queue, whose room is the queue's retention × the pool's capacity
+// (graph::Graph::connect_consumer): the backlog of an append-only log, held per reader. Its queue
+// lag (how far a group is behind) is Task 8's. Ignored: ordering (partitions are printed, not
+// modelled), delivery guarantees and redelivery (at-least-once, a consumer that crashes before
+// committing reads a message again), the consumer's commit interval, the broker's disk (an append
+// costs the type's 100 µs whatever the message's size, and the log never fills a disk) and its
+// replication.
 class MessageQueueBehaviour {
  public:
   MessageQueueBehaviour(const graph::Graph& g, std::size_t self);
 
   // Appends every message it is sent (`served` is the input, nothing is refused) and sends each
-  // op on, whole, to every consumer group whose link carries it. `now` and `dt` are unused: the
-  // broker keeps no state between steps (the backlog is the pools').
+  // op on, whole, to every consumer group whose link carries it (an op the graph never saw arrive
+  // has no group: it is appended and read by nobody). `now` and `dt` are unused: the broker keeps
+  // no state between steps (the backlog is the pools').
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
 
   // One capacity unit per message, whatever its op or size: an append.
@@ -1336,21 +1341,23 @@ class MessageQueueBehaviour {
   }
 
  private:
-  // One consumer group: the pool, the link its messages travel on, and the ops that link carries
-  // (empty: all of them). A drained link (weight 0) is no group (graph::Graph::route_queue).
+  // One consumer group that reads an op: the pool, and the link its messages travel on.
   struct Consumer {
     std::size_t target;
     std::size_t link;
-    std::vector<std::string> ops;
   };
-  [[nodiscard]] static bool reads(const Consumer& consumer, std::string_view op);
 
-  std::vector<Consumer> consumers_;
+  // Per op that reaches the queue (graph::Graph::arriving_ops), the groups whose link carries it,
+  // from graph::Graph::routes_for, the source the graph's asynchronous deliveries are built from
+  // too (detail::consumer_deliveries): a drained link (weight 0, share 0) is no group.
+  std::map<std::string, std::vector<Consumer>, std::less<>> consumers_by_op_;
 };
 
-// Models: the workers behind a queue in System Design Interview (Alex Xu, vol. 1): ch. 14's
-// transcoding servers, ch. 11's fan-out workers, ch. 15's notification and backup workers, the
-// consumers of ch. 1's message queue. Plan 2c refinement 5, spec §7: "capacity = workers / job
+// Models: the workers behind a queue in System Design Interview (Alex Xu, vol. 1): ch. 10's
+// notification workers (the book's queue-plus-workers design: each channel's queue drained by its
+// own workers, which call the third-party push service), ch. 14's transcoding servers, ch. 11's
+// fan-out workers, ch. 15's notification and backup workers, the consumers of ch. 1's message
+// queue. Plan 2c refinement 5, spec §7: "capacity = workers / job
 // cost". Captured: the pool is ONE M/M/c queue over consumption, its c = `workers` and its service
 // time = `cost` (the time one worker spends on one job), so its rate is workers / cost (400
 // transcoders at 60 s a video: 6.667 videos/s); one job is one capacity unit. Its waiting room is
@@ -2045,28 +2052,26 @@ Routed BlobStoreBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime 
 
 // ---- MessageQueueBehaviour ----
 
-// The queue's routes (graph::Graph::route_queue), one per consumer group: whatever op a message
-// carries, a group reads it if its link carries that op.
+// The queue's routes for each op that reaches it (graph::Graph::routes_for: one per consumer group
+// whose link carries the op, each of share 1), review of plan 2c Task 6, M-4.
 MessageQueueBehaviour::MessageQueueBehaviour(const graph::Graph& g, std::size_t self) {
-  for (const auto& route : g.routes(self)) {
-    if (route.share <= 0.0) continue;  // a drained link: a group that reads nothing
-    consumers_.push_back(
-        Consumer{.target = route.target, .link = route.link, .ops = g.links()[route.link].ops});
+  for (const auto& op : g.arriving_ops(self)) {
+    auto& consumers = consumers_by_op_[op];
+    for (const auto& route : g.routes_for(self, op)) {
+      if (route.share <= 0.0) continue;  // a drained link: a group that reads nothing
+      consumers.push_back(Consumer{.target = route.target, .link = route.link});
+    }
   }
-}
-
-bool MessageQueueBehaviour::reads(const Consumer& consumer, std::string_view op) {
-  return consumer.ops.empty() || std::ranges::contains(consumer.ops, op);
 }
 
 // Every group gets the whole rate of every op it reads: a copy, not a split.
 Routed MessageQueueBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
   Routed routed = detail::serve_everything(in);
   for (const auto& [op, rate] : routed.served.entries()) {
-    for (const Consumer& consumer : consumers_) {
-      if (reads(consumer, op)) {
-        detail::flow_towards(routed.outgoing, consumer.target, consumer.link).add(op, rate);
-      }
+    const auto readers = consumers_by_op_.find(op);
+    if (readers == consumers_by_op_.end()) continue;  // an op the graph never saw: no group
+    for (const Consumer& consumer : readers->second) {
+      detail::flow_towards(routed.outgoing, consumer.target, consumer.link).add(op, rate);
     }
   }
   detail::sort_by_destination(routed.outgoing);
