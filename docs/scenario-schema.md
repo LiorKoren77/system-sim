@@ -79,13 +79,13 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `id_generator` | as a `service` whose capacity and service time its `algorithm` supplies, see [`id_generator`](#id_generator) |
 | `message_queue` | the broker's append, every message copied to each consumer group, the publisher answered at the append (phase 2c, see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
 | `worker_pool` | M/M/c over consumption, `workers / cost` jobs a second, its room its queue's `retention`; its `then` steps fire for every job it drains, nobody waiting for them (phase 2c, same section) |
+| `external_sink` | a third party's API: a queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) that fails `failure_rate` of what it serves, counted as drops (phase 2c, see [Node types](#node-types)) |
 
 Everything else is refused before the first step, with exit code 1:
 
 | what | message | runs from |
 |---|---|---|
-| `external_sink` | `node 'x' has type 'external_sink', which run/estimate do not support yet (phase 2)` | 2c |
-| `kv_cluster`, `ws_gateway`, `service_discovery` | the same message | 3 |
+| `kv_cluster`, `ws_gateway`, `service_discovery` | `node 'x' has type 'kv_cluster', which run/estimate do not support yet (phase 2)` | 3 |
 | `search_index`, `notification_fanout`, `frontier` | the same message | not yet assigned to a phase |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
 | `faults` | none: the list is accepted and nothing happens | 3 |
@@ -287,7 +287,7 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `ws_gateway` | `max_connections`, `heartbeat` (duration), `fanout` (avg recipients per message), `ops` | `ops` checked as step lists; others ignored; phase 3 |
 | `service_discovery` | `failover` (duration) | ignored; phase 3 |
 | `id_generator` | `algorithm` `snowflake|ticket_server|uuid` (required) | read and run (phase 2b), see [`id_generator`](#id_generator) |
-| `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) | ignored; phase 2c |
+| `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) | read and run (phase 2c): a third party's API (ch. 10's APNs, FCM, SMS and e-mail providers), a leaf queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) whose served requests fail at `failure_rate` f (default 0; outside [0, 1]: `node 's': failure_rate must be between 0 and 1`): `dropped += f × served`, `drain = (1 − f) × served`, so 500/s at f = 0.02 is answered 490/s and the failures count in the node's drop rate, never as rejections. `politeness` (a positive rate) is printed by `explain` as `politeness=1/s (not modelled: phase 3)`: it needs per-host state. `then` and `ops` stay refused, and nothing retries a failure before phase 3 |
 | `notification_fanout` | `channels` (map name → node id), `dedup` (0–1), `then` | ignored |
 | `frontier` | `politeness` (rate per host), `hosts` (int), `then` | ignored |
 
@@ -947,7 +947,8 @@ commit interval (a group's lag counts from the message's append, not from its la
 
 Two different promises, kept apart on purpose:
 
-- a **drop** is a node **failing**: its waiting room was full, so the excess is shed.
+- a **drop** is a node **failing**: its waiting room was full, so the excess is shed, or, at an
+  `external_sink`, the provider answered `failure_rate` of what it served with an error.
   `drop_rate` = Σ dropped / Σ demand **of that node** (in capacity units when the node has
   a `cost` or counts megabytes), so it stays in [0, 1] even when fan-out multiplies the clients' requests
   before they reach it (one post → 100 feed writes would make "dropped anywhere / offered

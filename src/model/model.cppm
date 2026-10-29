@@ -533,6 +533,20 @@ struct NodeSpec {
   // of a group at a time). The loader leaves an absent one absent, so explain can say "(default)".
   std::optional<SimTime> retention{};
   std::optional<int> partitions{};
+  // External sinks only (plan 2c refinement 8; declared after the message queue's keys, for
+  // designated initializers): a third party's API, spec section 6's `third_party_api`, the
+  // providers of book ch. 10's notification system (APNs, FCM, an SMS gateway, an e-mail service)
+  // that our workers call and do not run. `failure_rate` is the share, in [0, 1], of the requests
+  // the sink SERVES that fail (a 5xx from the provider), which the engine moves from the node's
+  // drain to its drops (engine.cppm's fail_share). A plain double, not an optional: "fails
+  // nothing" is the real value 0, and a sink that states none is the plain queue it was before.
+  // `politeness` is how often one host may be called (the crawler's "1/s per host"), stored and
+  // printed, not modelled (phase 3: it needs per-host state); absent when not stated.
+  // Ignored: retries (an `on: failure` step never fires before phase 3), a provider's latency
+  // rising with OUR load (its queue is the type's 1k/s quota, not the provider's real fleet),
+  // and per-host politeness.
+  double failure_rate{0.0};
+  std::optional<Rate> politeness{};
   std::optional<Workload> workload{};  // clients only
 };
 
@@ -594,9 +608,10 @@ struct LinkSpec {
 };
 
 // drop_rate and reject_rate are two different promises: a drop is a node FAILING (its
-// waiting room was full), a rejection is a rate limiter's POLICY working (ch. 4's 429).
-// A design wants few drops anywhere and as many rejections as its limits call for, so
-// each has its own target (report::Summary::drop_rate / reject_rate).
+// waiting room was full, or an external sink's provider answered with an error), a rejection is a
+// rate limiter's POLICY working (ch. 4's 429). A design wants few drops anywhere and as many
+// rejections as its limits call for, so each has its own target (report::Summary::drop_rate /
+// reject_rate).
 enum class SloMetric {
   p50_latency,
   p95_latency,

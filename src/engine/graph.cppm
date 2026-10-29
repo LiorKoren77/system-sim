@@ -294,7 +294,8 @@ inline constexpr auto replica_model_table = std::to_array<core::EnumName<Replica
 //     cache with no number (one built in code without a hit ratio) counts as missing every
 //     time, the safe side for a capacity check on paper. (A CDN fetches its own misses from its
 //     origin, so no miss step may follow one: Graph::invalid_miss_step.)
-//   - 0 for an `on: failure` step until external sinks fail (phase 2c);
+//   - 0 for an `on: failure` step: external sinks fail since phase 2c (the engine counts their
+//     failures as drops), but nothing reacts to a failure before phase 3 (retries);
 //   `factor`, the requests the hop sends per request that takes it: the step's own fan-out
 //   (one post -> 100 feed writes), times the lookup's for an `on: miss` step. A request
 //   that looks up k keys misses k(1 - h) of them on average (linearity of expectation, true

@@ -194,8 +194,9 @@ at its first megabyte; a blob store's `then` steps are asynchronous event notifi
 its writes only), id generators, message queues (the publisher answered at the append, every
 message copied to each consumer group, the slowest group's lag reported and checked by the
 `queue_lag` SLO) and worker pools (M/M/c at workers / cost, waiting in their
-queue's retention; their `then` steps fire for every job they drain, and nobody waits for them).
-These seven scenarios run end to end:
+queue's retention; their `then` steps fire for every job they drain, and nobody waits for them)
+and external sinks (a third party's API at the type's 1k/s and 100 ms, failing its `failure_rate`
+of what it serves, counted as drops). These seven scenarios run end to end:
 
 - [`tutorial/hello`](scenarios/tutorial/hello/), [`tutorial/chain`](scenarios/tutorial/chain/):
   one service, then two in a chain: the queueing basics.
@@ -214,7 +215,7 @@ These seven scenarios run end to end:
   day's peak, about 71.9k, comes near 02:18), so `transcode_q` is 2.66 h behind and its
   `queue_lag` SLO (30 m) fails (exit 2) until the README's sizing (plan 2c Task 16).
 
-Every other node type (external sinks, key-value clusters, ...) already validates and appears in
+Every other node type (key-value clusters, WebSocket gateways, ...) already validates and appears in
 `explain` with its resolved numbers, but `estimate` and `run` stop with "which run/estimate do
 not support yet (phase 2)" and exit 1. A `sweep` command
 (`--param nodes.users.rate.base=1k/s..100k/s:10`) is planned for phase 2c.
