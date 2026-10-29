@@ -27,7 +27,7 @@ a failed step does not run, refused, dropped and timed-out requests are counted 
 `simsys sweep` runs a scenario over a range of one key, the points in parallel. Ten scenarios run
 end to end, four of the eight book systems among them (list below); chat-system, google-drive,
 notification-system and web-crawler validate and `explain`, and wait for phase 3's types
-(`ws_gateway`, `service_discovery`, `notification_fanout`, `frontier`). 1158 tests (Catch2, via
+(`ws_gateway`, `service_discovery`, `notification_fanout`, `frontier`). 1163 tests (Catch2, via
 `ctest`). The scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.4).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
