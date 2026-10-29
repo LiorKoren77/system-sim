@@ -2455,11 +2455,33 @@ CheckResult read_cdn_keys(const Site& site, const YAML::Node& body, model::NodeS
 // ---- Blob store keys (plan 2c refinement 2; review of Task 3 at a8b6cb4, I2) ----
 //
 // `write_ops: [upload]`: the ops a blob store acknowledges at their last byte (a PUT is answered
-// once the object is stored); every other op is a read, answered at its first megabyte
+// once the object is stored), and the only ones that fire its `then` steps, its event
+// notifications (plan 2c Task 4); every other op is a read, answered at its first megabyte
 // (behaviours::MegabyteService). Read as a cache's are (read_write_ops); default `write`.
+
+// A blob store's `then` steps are event notifications nobody waits for, so a step `mode`
+// (sequential latencies add, parallel ones overlap) means nothing there. The graph refuses
+// `mode: parallel` (graph's invalid_blob_store), but `mode: sequential` is the model's default:
+// only here, where the key is written, can it be told apart, so the key is refused whatever its
+// value. read_then has already checked the list and its steps.
+CheckResult check_event_steps_have_no_mode(const Site& site, const YAML::Node& body) {
+  const auto then = body["then"];
+  if (!then || !then.IsSequence()) return {};
+  for (const auto& step : then) {
+    if (!step.IsMap() || !step["mode"]) continue;
+    return site.fail(step["mode"],
+                     "a blob store's then steps are event notifications nobody waits for "
+                     "(mode orders the calls a request waits for)");
+  }
+  return {};
+}
+
 CheckResult read_blob_store_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   if (node.type != model::NodeType::blob_store) return {};
-  return read_write_ops(node_site(site, node.id), body, node);
+  const auto this_node = node_site(site, node.id);
+  return read_write_ops(this_node, body, node).and_then([&] {
+    return check_event_steps_have_no_mode(this_node, body);
+  });
 }
 
 // ---- Node bodies: the second pass -----------------------------------------------------

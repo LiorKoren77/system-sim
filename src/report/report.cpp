@@ -1348,10 +1348,12 @@ void forward_to_backend(const graph::Graph& g, std::size_t from, const OpLoad& a
   }
 }
 
-// Forwards along a cache's `then` steps (what happens after it answers: ch. 13's browser
-// cache sends its misses on to the servers): rate × factor × Graph::then_fraction, the whole
-// flow for an unconditional step and the misses (1 − h of a read) for an `on: miss` one.
-// The same multiplications as CacheBehaviour::route (plan 2b refinement 5).
+// Forwards along a cache's or a blob store's `then` steps (what happens after it answers: ch.
+// 13's browser cache sends its misses on to the servers; an upload's event starts transcoding):
+// rate × factor × Graph::then_fraction, the whole flow for an unconditional step (at a blob store,
+// every write and no read) and the misses (1 − h of a read) for an `on: miss` one. A share of 0
+// sends nothing, not a 0/s entry. The same multiplications as CacheBehaviour::route (plan 2b
+// refinement 5) and BlobStoreBehaviour::route.
 void forward_then_steps(const graph::Graph& g, std::size_t from, const OpLoad& arriving,
                         std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   for (const model::Step& step : g.nodes()[from].spec.then) {
@@ -1360,7 +1362,8 @@ void forward_then_steps(const graph::Graph& g, std::size_t from, const OpLoad& a
     if (!link) continue;  // Graph::build proved it exists; skip defensively
     auto& destination = g.links()[*link].feedback ? fed_back : load;
     for (const auto& [op, rate] : arriving) {
-      destination[*target][step.op] += rate * step.factor * g.then_fraction(from, step, op);
+      const double share = g.then_fraction(from, step, op);
+      if (share > 0.0) destination[*target][step.op] += rate * step.factor * share;
     }
   }
 }
@@ -1374,9 +1377,9 @@ void forward_cached(const graph::Graph& g, std::size_t from, std::vector<OpLoad>
   forward_then_steps(g, from, arriving, load, fed_back);
 }
 
-// What a blob store sends on: one event per request along each `then` step, rate × factor
-// (plan 2c refinements 6-7, as BlobStoreBehaviour::route does). On paper nothing is dropped, so
-// every request that arrives is served and notifies.
+// What a blob store sends on: one event per write along each `then` step, rate × factor, and
+// nothing for a read (plan 2c refinements 6-7, as BlobStoreBehaviour::route does; S3 has no event
+// for a GET). On paper nothing is dropped, so every write that arrives is served and notifies.
 void forward_events(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
                     std::vector<OpLoad>& fed_back) {
   const OpLoad arriving = load[from];  // a copy, as in forward_steps

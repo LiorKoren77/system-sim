@@ -180,8 +180,8 @@ $ simsys explain scenarios/book/youtube/scenario.yaml
 What runs today: clients, services, load balancers, rate limiters, caches (a fixed or a
 Che hit ratio), SQL databases (primary, read replicas, shards), CDNs and blob stores (sized in
 bytes, they count megabytes, wait for whole objects and answer a write at its last byte, a read
-at its first megabyte; a blob store's `then` steps are asynchronous event notifications) and id
-generators.
+at its first megabyte; a blob store's `then` steps are asynchronous event notifications, fired by
+its writes only) and id generators.
 These six scenarios run end to end:
 
 - [`tutorial/hello`](scenarios/tutorial/hello/), [`tutorial/chain`](scenarios/tutorial/chain/):

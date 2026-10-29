@@ -30,7 +30,9 @@
   come through a queue and a worker pool the paper load does not follow yet.
 - `original_store`'s `then` is an S3-style event notification (phase 2c): each upload it stores
   publishes one message to `transcode_q`, asynchronously (the uploader is answered by the store
-  alone), so `transcode_q` now receives the store's events on paper:
+  alone), so `transcode_q` now receives the store's events on paper. Only a write fires an event
+  (`upload`, the store's `write_ops`), as S3 notifies on ObjectCreated and never on a GET; a read
+  of the original would notify nobody:
 
   ```
   transcode_q         peak offered 9.6/s vs 1M/s total capacity  (0.00096%, green)
