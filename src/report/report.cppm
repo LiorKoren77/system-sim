@@ -134,17 +134,31 @@ enum class SloStatus { pass, fail, skipped };
 // `note` says why a verdict is not what `observed` against `max` alone would give: a staleness SLO
 // fails on a database whose replicas fall behind without bound ("each replica misses 66.67/s of
 // 400/s committed writes (16.7%)"), whatever its mean staleness. Empty otherwise.
+// An SLO with `over` (plan 2c Task 14) is judged by its worst window (Summary::windowed_verdict):
+// `observed`, `status` and `note` are that window's, and `window_start` says where it starts,
+// counted from the start of the run (warmup included, the clock a scenario's `at:` uses). Empty
+// for an SLO without `over` and for a windowed one none of whose windows had anything offered
+// (then `skipped`).
 struct SloResult {
   model::SloSpec slo{};
   std::optional<double> observed{};
   SloStatus status{};
   std::string note{};
+  std::optional<SimTime> window_start{};
 };
 
 // Running aggregates over the StepRecords of a run, from `warmup` on (earlier records only
 // fix the step length). Keeps a handful of sums per node and per op, never the records.
 // Pattern: Observer — pass `[&](const auto& r) { summary.observe(r); }` to
 // engine::Simulation::run. The Summary refers to `g`, which must outlive it.
+// SLOs per window (plan 2c Task 14): for every SLO of the scenario with `over`, the Summary also
+// keeps one more Summary of the same kind, fed only the steps of the window being accumulated
+// (windows of length `over`, aligned from the end of warmup: [warmup + k·over, warmup +
+// (k + 1)·over); a step belongs to the window its start falls in). When a step opens the next
+// window the finished one is judged like a whole run and only its verdict is kept if it is the
+// worst so far; so a window's figures come from exactly the code that makes the run's (its
+// percentiles from percentile_seen_by_client, its drop rates from the same totals), and the
+// memory is one Summary per windowed SLO, whatever the run's length.
 class Summary {
  public:
   Summary(const graph::Graph& g, SimTime warmup);
@@ -180,6 +194,12 @@ class Summary {
   [[nodiscard]] std::string_view worst_reject_node() const;
   [[nodiscard]] std::string_view scenario_name() const;
   [[nodiscard]] const graph::Graph& graph() const { return *graph_; }
+  // The verdict of an SLO with `over`: its worst window's, the window still open at the end of the
+  // run (a last window shorter than `over`) included; a window in which nothing was offered is
+  // skipped, and an SLO all of whose windows are skipped is `skipped`. "Worst" is a fail before a
+  // pass, then the higher observed value (every SLO is an upper bound). `slo` must be one of the
+  // scenario's SLOs with `over` (evaluate_slos asks for exactly those); another is `skipped`.
+  [[nodiscard]] SloResult windowed_verdict(const model::SloSpec& slo) const;
 
  private:
   // Weighted first and second moments of a latency, accumulated across steps.
@@ -245,6 +265,19 @@ class Summary {
   [[nodiscard]] double worst_node_drop_rate() const;
   [[nodiscard]] const LinkTotals* worst_dropping_link() const;
 
+  // One SLO with `over` and its windows (see the class comment).
+  struct WindowedSlo {
+    model::SloSpec slo{};
+    long long index{-1};               // the window being accumulated; -1 before the first step
+    std::vector<Summary> current{};    // that window's Summary: empty before the first step
+    std::optional<SloResult> worst{};  // the worst verdict of the windows already finished
+  };
+
+  // A window's Summary: like the public constructor's, but tracking no windows of its own.
+  Summary(const graph::Graph& g, SimTime warmup, bool track_windows);
+  void observe_windows(const engine::StepRecord& record);
+  [[nodiscard]] SloResult judge_window(const WindowedSlo& windowed) const;
+
   // A pointer, not a reference, so a Summary stays copy- and move-assignable.
   const graph::Graph* graph_;
   SimTime warmup_;
@@ -253,7 +286,8 @@ class Summary {
   double observed_s_{};
   std::vector<NodeTotals> nodes_;
   std::vector<OpTotals> ops_;
-  std::vector<LinkTotals> links_;  // one per link with a bandwidth, in Graph::links() order
+  std::vector<LinkTotals> links_;     // one per link with a bandwidth, in Graph::links() order
+  std::vector<WindowedSlo> windows_;  // one per scenario SLO with `over`, in the scenario's order
 };
 
 // C++20 std::span<const T>: a non-owning view of contiguous elements, so callers can pass

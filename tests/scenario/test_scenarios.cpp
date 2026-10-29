@@ -755,22 +755,30 @@ TEST_CASE("book scenarios with a snowflake id generator validate and explain the
 //    response's mean and variance; 2 % of tolerance, so a change to the model that moves it is
 //    seen and the README's numbers are re-checked.
 // And nothing is dropped: no node is red at the peak (web 80 %, the busiest database copy 65 %).
-TEST_CASE("book/url-shortener runs its 24 hours and meets both SLOs with a 0.881 che hit ratio",
-          "[scenario]") {
+// Its third SLO bounds url_db's utilization hour by hour (plan 2c Task 14): the worst hour,
+// 13:02-14:02, averages 0.6433 (test_windows.cpp derives it), under the 0.9 it allows.
+TEST_CASE(
+    "book/url-shortener runs its 24 hours and meets its three SLOs with a 0.881 che hit ratio",
+    "[scenario]") {
   const auto s = load_scenario("/book/url-shortener/scenario.yaml");
   const auto g = simsys::graph::Graph::build(s);
   if (!g) FAIL(g.error().message);
   REQUIRE_THAT(*g->hit_ratio(*g->index_of("url_cache")), Catch::Matchers::WithinAbs(0.881, 5e-4));
   const auto results = run_slos(s);
-  REQUIRE(results.size() == 2);
+  REQUIRE(results.size() == 3);
   const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
   const auto& drops = slo_of(results, simsys::model::SloMetric::drop_rate);
-  CAPTURE(p99.observed.value_or(-1.0), drops.observed.value_or(-1.0));
+  const auto& hourly = slo_of(results, simsys::model::SloMetric::utilization);
+  CAPTURE(p99.observed.value_or(-1.0), drops.observed.value_or(-1.0),
+          hourly.observed.value_or(-1.0));
   REQUIRE(p99.status == simsys::report::SloStatus::pass);
   REQUIRE(drops.status == simsys::report::SloStatus::pass);
+  REQUIRE(hourly.status == simsys::report::SloStatus::pass);
   REQUIRE(p99.observed.has_value());
   REQUIRE_THAT(*p99.observed, Catch::Matchers::WithinRel(7.49e-3, 0.02));
   REQUIRE(drops.observed == 0.0);
+  REQUIRE(hourly.observed.has_value());
+  REQUIRE_THAT(*hourly.observed, Catch::Matchers::WithinAbs(0.6433, 5e-4));
 }
 
 // ---- Request sizes and link bandwidth in the shipped scenarios (phase 2c, Task 1) --------------

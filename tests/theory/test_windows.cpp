@@ -380,7 +380,8 @@ TEST_CASE("an slo whose every window offered nothing is skipped, with nothing ob
 // (0.008726 + 0.250390) / 0.261799 = 0.98979, so the window's mean load is
 // (1 + 0.5 x 0.98979) / 1.5 = 0.99660 of the peak's. The next hour, 14:02-15:02, gives
 // (sin(62 w) - sin(2 w)) / (60 w) = 0.98704, a little less, and every earlier one less still:
-// the worst hour is the one starting at 13:02 = 13 x 3600 + 120 = 47520 s.
+// the worst hour is the one starting at 13:02 = 13 x 3600 + 120 = 46920 s
+// (the red commit wrote 47520, an addition slip: 13 x 3600 = 46800).
 //
 // Shipped (3 shards): the README's busiest copy is a replica at 3.228k of 5k units/s at the
 // peak, rho_peak = 0.6455, so the worst hour is 0.6455 x 0.9966 = 0.6433: passes max 0.9
@@ -430,7 +431,7 @@ TEST_CASE(
   REQUIRE(hourly.status == SloStatus::pass);
   const auto start = number_of(slo_json_line(v.json, 0), "window_start_s");
   REQUIRE(start.has_value());
-  REQUIRE(*start == 47520.0);
+  REQUIRE(*start == 46920.0);
   REQUIRE(v.table.contains("(worst 1h from 13:02)"));
 }
 
@@ -443,5 +444,5 @@ TEST_CASE("url-shortener with 2 shards on url_db fails the 1h utilization SLO at
   REQUIRE(hourly.status == SloStatus::fail);
   const auto start = number_of(slo_json_line(v.json, 0), "window_start_s");
   REQUIRE(start.has_value());
-  REQUIRE(*start == 47520.0);
+  REQUIRE(*start == 46920.0);
 }
