@@ -17,27 +17,34 @@
   1 MB, the service time is one megabyte's (10 ms at a CDN, 40 ms at a blob store, the book's
   per-MB rows), so `cdn_us` at 100GB/s has 1000 slots that each move one stream at a time
   (`c=1000 slots (1 object each)`) and saturates at 2k streams/s. `explain` checks them in MB/s
-  with the requests beside (the evening peak, 21:00):
+  with the requests beside (the evening peak, 21:00), and the cross-DC link in MB/s too:
 
   ```
-  cdn_us              peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)
-  cdn_eu              peak offered 7.04k MB/s (140.8/s) vs 50k MB/s total capacity  (14.1%, green)
-  original_store      peak offered 2.88k MB/s (9.6/s) vs 5k MB/s total capacity  (57.6%, green)
-  transcoded_store    peak offered 9.811k MB/s (196.2/s) vs 10k MB/s total capacity  (98.1%, red)
+  cdn_us                    peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)
+  cdn_eu                    peak offered 7.04k MB/s (140.8/s) vs 50k MB/s total capacity  (14.1%, green)
+  original_store            peak offered 2.88k MB/s (9.6/s) vs 5k MB/s total capacity  (57.6%, green)
+  transcoded_store          peak offered 9.811k MB/s (196.2/s) vs 20k MB/s total capacity  (49.1%, green)
+  cdn_eu->transcoded_store  peak offered 2.856k MB/s vs 5k MB/s  (57.1%, green)
   ```
 
   `transcoded_store`'s figure is the CDNs' misses, 157.8 streams/s × 50 MB = 7.891k MB/s, plus
-  the transcoders' renditions, 9.6 uploads/s × 4 × 50 MB = 1.92k MB/s: 98.1 % of its 10 GB/s,
-  red (plan 2c Task 16 sizes it).
+  the transcoders' renditions, 9.6 uploads/s × 4 × 50 MB = 1.92k MB/s: 49.1 % of its 20 GB/s.
+  At the 10 GB/s it first had it was 98.1 %, red ("Things to try" runs it).
+- The two edges' hit ratios come from the Che approximation over the viewers' Zipf(1)
+  popularity of 10M videos and the edge's size in videos (`keys: 100k` in the US, `50k` in the
+  EU): 0.642 and 0.594. Only the misses reach the origin.
+- Two regions: European misses cross the Atlantic to `transcoded_store` (150 ms there and
+  back), over a link with `bandwidth: 40Gbit/s` (5 GB/s). The link is a pipe: one M/D/1 queue in
+  megabytes that, like the stores, waits for whole objects (a 50 MB stream holds the wire for
+  50 MB / 5 GB/s = 10 ms). At 21:00 it carries 140.8 × (1 − 0.594) × 50 MB = 2.856k MB/s,
+  rho 0.571, and adds its wait, 0.5 × 0.571 / 0.429 × 10 ms = 6.66 ms (Pollaczek–Khinchine for
+  deterministic service: half the M/M/1 wait), plus 0.2 ms for the first megabyte: the run's
+  series prints 6.86 ms on the link at 21:00. That is what moves the European stream p99 from
+  455 ms (no bandwidth stated: the link is never a bottleneck) to 465 ms.
 - `original_store`'s `then` is an S3-style event notification (phase 2c): each upload it stores
   publishes one message to `transcode_q`, asynchronously (the uploader is answered by the store
-  alone), so `transcode_q` now receives the store's events on paper. Only a write fires an event
-  (`upload`, the store's `write_ops`), as S3 notifies on ObjectCreated and never on a GET; a read
-  of the original would notify nobody:
-
-  ```
-  transcode_q         peak offered 9.6/s vs 1M/s total capacity  (0.00096%, green)
-  ```
+  alone). Only a write fires an event (`upload`, the store's `write_ops`), as S3 notifies on
+  ObjectCreated and never on a GET.
 - Each request is a batch of megabytes that holds one slot for its whole transfer (a stream
   0.5 s at a CDN, an upload 300 MB × 40 ms = 12 s at `original_store`), so the queues wait for
   whole objects: Erlang C is fed the mean object's time, with the slots as servers (rho is the
@@ -48,73 +55,126 @@
   ones' wait. It matters near saturation: at rho 0.9, 50 MB objects at a default blob store
   (20 slots) wait 0.28 s, where 1 MB units would say 11 ms. And no wait outlasts the waiting room:
   `original_store`'s 1000 MB drain at 5 GB/s in 0.2 s, so an upload waits at most 0.2 s there
-  even past saturation (Erlang C at its 0.99 clamp would say 2.5 s). At the 21:00 peak (rho
-  0.576 over 200 slots) it waits nothing measurable. When a request is answered depends on its
-  direction: a stream is a read, answered at its first megabyte (its wait plus 10 ms; the rest
-  is read as it arrives), and an upload is a write (`original_store` lists `write_ops: [upload]`),
-  acknowledged at its last byte, 12 s after its wait.
-- Every 300 MB upload therefore takes at least 12 s (300 MB at 25 MB/s per slot), with no spread
-  but its wait's. Since plan 2c Task 13 the clients' `timeout: 10s` is applied, and as shipped
-  it times out **every** upload: each would be answered at about 12 s (12.0 s in the US, 12.1 s
-  in the EU before the timeout), so `run --report json` shows `timed_out_per_s` equal to
-  `offered_per_s`, `answered_per_s` 0 and `null` latencies for both clients' `upload`, and the
-  table prints its `timed out/s`, `-` for its mean and `>10s` for its percentiles (nothing
-  answered: the clients saw no upload come back within 10 s). The uploads still reach `original_store` and the
-  transcoders: nothing cancels them, so every other number of `run`'s table is as before. The
-  book's uploads are resumable (chunked, each chunk retried on its own); plan Task 16 resolves
-  this, with resumable uploads or a timeout sized for `upload`.
-- Two regions with a cross-DC origin fetch (150 ms) for European misses. Each CDN is a
-  read-only cache in front of `transcoded_store`: its hit ratio comes from the Che approximation
-  over the viewers' Zipf(1) popularity of 10M videos and the edge's size in videos (`keys: 100k`
-  in the US, `50k` in the EU), and only the misses reach the origin.
-- Transcoding as a long-running worker pool (60 s per video, 400 workers → 6.7 videos/s
-  ceiling) and the backlog it builds during the evening upload peak. `transcode_q` is the
+  even past saturation. At the 21:00 peak (rho 0.576 over 200 slots) it waits nothing
+  measurable. When a request is answered depends on its direction: a stream is a read, answered
+  at its first megabyte (its wait plus 10 ms; the rest is read as it arrives), and an upload is a
+  write (`original_store` lists `write_ops: [upload]`), acknowledged at its last byte, 12 s after
+  its wait.
+- Transcoding as a long-running worker pool: 600 workers at 60 s a video, 600 / 60 s = 10
+  videos/s, against the 9.6 uploads/s of 21:00 (480 requests/s × 2 %). `transcode_q` is the
   broker: an upload's event is answered at the append, and the transcoders drain it as an M/M/c
-  queue of 400 workers at 60 s a job. On paper the pool is offered every upload of the peak,
-  `transcoders  peak offered 9.6/s vs 6.667/s total capacity  (144%, red)`; in a run it drains
-  6.667 videos/s at most and the rest waits in its queue.
-- Fan-out of one upload into four output renditions: each video the transcoders DRAIN (not each
+  queue of 600 servers. `explain` offers the pool every upload of the peak:
+  `transcoders  peak offered 9.6/s vs 10/s total capacity  (96%, red)`. Red is a utilization
+  verdict (from 90 %), not a failure: the pool keeps up, nothing backs up, and a video waits only
+  the Erlang C wait, C(600, 0.96) × 60 s / (600 × 0.04) = 0.229 × 2.5 s = 0.57 s, which is
+  `transcode_q`'s peak lag in the run (573 ms). The run counts the transcoders red for 16.11k s
+  (4.5 h, 18:46 to 23:14), the hours the uploads are above 9/s. That is the price of sizing a
+  60-second job pool close to its peak: 600 slots at 96 % wait under a second, where the same 96 %
+  at 4 slots would wait minutes (Erlang C falls fast as c grows: the pooling effect).
+- Fan-out of one upload into four output renditions: each video the transcoders drain (not each
   one that arrives) writes four 50 MB renditions to `transcoded_store` and publishes one message
   to `completion_q`, whose `completion_handler` updates `metadata_db` and `metadata_cache`
   (`completion_handler  peak offered 9.6/s vs 800/s total capacity  (1.2%, green)`). Nobody
-  waits for the pool, so none of this is in any viewer's response time.
-- The whole day runs: `simsys run` steps 24 h at 100 ms (861,000 steps observed after the
-  warmup, about 19 s in a Release build) and exits 2, one SLO failing:
+  waits for the pool, so none of this is in any viewer's response time. `metadata_db` is offered
+  98.28 units/s at the peak (the API's upload_meta writes and cache misses, and the handler's
+  writes, 5 units each) of its 9k: 1.09 %.
 
-  ```
-  slo
-    status  metric       node         op      observed  max
-    PASS    p99_latency  viewers_eu   stream  456ms     2s
-    FAIL    queue_lag    transcode_q  -       2.66h     30m
-    PASS    utilization  cdn_us       -       0.08787   0.8
-  ```
+## Uploads and the timeout
+A 300 MB upload is a write, acknowledged at its last byte: 300 MB × 40 ms per MB = 12 s at
+`original_store`, plus the EU's 75 ms crossing. Until plan 2c Task 16 the clients had
+`timeout: 10s`, so **every** upload timed out (`timed out/s` equal to `offered/s`, `>10s` in its
+percentiles) although the store stored each one. The book's answer is resumable uploads: the
+file goes up in chunks, and a client that gives up gives up on a chunk and retries it, never on
+the whole file. The model has one timeout per client, not one per chunk, so the viewers'
+`timeout` is now `30s`: the chunk-level patience scaled to the whole file. In the run nothing
+times out: the US uploads are answered at 12 s (mean and p99), the European ones at 12.1 s
+(p99 12.2 s). Streams are judged by their own p99 SLO, not by this timeout (a stream answers at
+its first megabyte, in milliseconds). Still abstracted: the chunks themselves (a chunk lost is
+retried, not the file) and every retry; a request that times out is simply counted, nobody
+sends it again.
 
-  From 15:43 the uploads outrun the transcoders' 6.667 videos/s, so they run saturated (peak
-  rho 1) and their backlog grows into the night: the run's `peak_backlog`, 63.76k videos, is its
-  last step's, at midnight, with the inflow (8.55/s) still above their capacity. `transcode_q`'s
-  lag is that backlog's FIFO drain time, 63.76k / 6.667/s = 9,564 s = 2.66 h (the node table's
-  `peak_lag`), against the 30 minutes the SLO allows: the 400 transcoders are too few on purpose
-  until plan 2c Task 16 sizes them. (`completion_q`'s lag is its handlers' Erlang wait alone, a
-  fraction of a nanosecond.) Midnight is not the day's peak, which comes after the run ends:
-  about 71.9k videos (3.0 h of lag) near 02:18 (`--duration 27h` shows it), so the SLO's 2.66 h
-  understates the worst lag of a day. The transcoders' 48.27k s (13.4 h) in the red zone counts
-  00:00 to 02:18 as well, when the run's queue fills from empty where the real one would still
-  be working off the evening before. `transcoded_store` is red for 10.79k s (3.0 h) around the
-  evening peak (peak rho 0.9225: the CDNs' misses and the renditions, 98.1 % on paper). (Uploads
-  take 12 s, past the clients' 10 s timeout, so every one of them times out: above.)
+## The day's run
+`simsys run` steps 24 h at 100 ms (861,000 steps observed after the 5 m warmup, about a minute
+of CPU in a Release build) and exits 0, every SLO passing:
+
+```
+slo
+  status  metric       node         op      observed  max
+  PASS    p99_latency  viewers_eu   stream  465ms     2s
+  PASS    queue_lag    transcode_q  -       573ms     30m
+  PASS    utilization  cdn_us       -       0.1403    0.8  (worst 1h from 20:05)
+```
+
+- The European stream p99, 465 ms against 2 s: a miss (40.6 % of streams) crosses the Atlantic
+  twice and waits for the pipe; a hit is answered in about 10 ms.
+- `transcode_q`'s lag, 573 ms against 30 minutes: the Erlang wait above.
+- `cdn_us` with `over: 1h`: the SLO is checked on every hour of the day (aligned from the end of
+  the warmup), and the worst, 20:05 to 21:05, is 0.1403. Without `over` the SLO judged the
+  day's mean, 0.0879, which the quiet night pulls down: a busy evening could hide behind it.
+
+At the 21:00 peak, each figure against its back-of-the-envelope derivation (the run's series):
+
+| node | at 21:00 | of | rho |
+|---|---|---|---|
+| `cdn_us` | 14.08k MB/s (281.6 streams/s × 50 MB) | 100k MB/s | 0.141 |
+| `cdn_eu` | 7.04k MB/s (140.8 × 50 MB) | 50k MB/s | 0.141 |
+| `original_store` | 2.88k MB/s (9.6 × 300 MB) | 5k MB/s | 0.576 |
+| `transcoded_store` | 9.811k MB/s (7.891k misses + 1.92k renditions) | 20k MB/s | 0.491 |
+| `cdn_eu->transcoded_store` | 2.856k MB/s | 5k MB/s | 0.571 |
+| `transcoders` | 9.6 videos/s | 10/s | 0.96 |
+| `metadata_db` | 98.28 units/s | 9k units/s | 0.011 (3.2 % at the primary) |
+
+**`estimate` is not the run's verdict here.** `simsys estimate` evaluates one steady state with
+the curve frozen at t = 0, which is 00:00, three hours after the peak (8.55 uploads/s, 427 requests/s).
+With the shipped 600 workers it passes everything, but with 00:00's numbers: `transcoders` at
+rho 0.8546, `transcode_q`'s lag 67.6 µs (the run's is 573 ms), `cdn_us` 0.1253 (the worst hour
+is 0.1403), the European p99 468 ms. With 400 workers it is worse than misleading: 8.55 uploads/s
+against 6.667/s held for ever fills the queue's whole 7-day room, so `estimate` drops 22 % of the
+transcoders' jobs (`drop rate 22% (worst: transcoders)`) and prints the full retention as the lag,
+`FAIL queue_lag transcode_q - 168h`, where the 24 h run drops nothing and lags 2.66 h. For a
+diurnal scenario with a pool, `run` is the verdict.
 
 ## What it abstracts away
-- Adaptive bitrate selection, chunked upload resume, DRM.
+- Adaptive bitrate selection, DRM.
+- Chunked, resumable uploads (one timeout per client stands for the chunk's) and retries of any
+  kind, in the clients or in the DAG (retry per stage).
 - The jitter of real disks and networks (each transfer takes exactly its size's time;
   `advanced.service_variability` can put a spread back), and a large read needed whole (a stream
   answers at its first megabyte, which understates a download that must finish before it is
   used).
-- Error handling in the DAG (retry per stage).
+- `transcode_q`'s 32 partitions (`partitions=32 (not modelled)`): Kafka would let at most one
+  consumer per partition read in parallel, which would cap 600 transcoders at 32 readers unless
+  each hands jobs to a local pool; the model lets all 600 consume.
+- The other renditions' and thumbnails' work in the DAG: one 60 s cost per video stands for it.
 
 ## Things to try
-- `transcoders.workers: 200` — `transcode_q` lag grows all day and never recovers.
-- Lower `cdn_eu.capacity` to `5GB/s` — `explain` puts `cdn_eu` at 141 %, red (7.04k MB/s of 5k);
-  watching the origin link saturate needs link bandwidth (later in phase 2c).
-- Halve `cdn_us.keys` to 50k — `explain` shows its hit ratio fall from 0.642 to the EU edge's
-  0.594 and `transcoded_store`'s miss load rise.
-- Add `{at: 21:00, kind: dc_down, dc: eu-west, for: 5m}` in `faults`.
+- Sweep the pool:
+
+  ```
+  $ simsys sweep scenarios/book/youtube/scenario.yaml --param nodes.transcoders.workers=400..600:3 --metric transcode_q.lag
+  nodes.transcoders.workers  transcode_q.lag
+  ------------------------------------------
+  400                                  2.66h
+  500                                  39.5m
+  600                                  573ms
+  ```
+
+  Only 600 passes the 30-minute `queue_lag` SLO. At 400 (6.667 videos/s) the uploads exceed
+  the pool from 15:43, so the backlog is still growing at 24:00, where the run ends: 63.76k
+  videos, 63.76k / 6.667/s = 2.66 h of lag. Its true peak comes the next morning, when the
+  uploads fall back under 6.667/s at 02:17: `simsys run --duration 27h` shows it, 71.91k videos
+  and 3 h of lag. At 500 (8.333/s) the excess runs from 17:42 to 00:18, so the 24 h run's 39.5
+  minutes is near its peak (39.7 minutes in a 27 h run). (`estimate` cannot show any of this:
+  above.)
+- Halve `cdn_us.keys` to 50k: the US edge's hit ratio falls from 0.642 to the EU edge's 0.594,
+  and its misses from 100.8 to 114.3 streams/s, so `explain` puts `transcoded_store` at 10.49k
+  MB/s (209.7/s), 52.4 %; in the run its peak rho is 0.5244 (0.4906 as shipped) and the US
+  stream p99 101 ms (97.6 ms), every SLO still passing.
+- Set `timeout: 10s` on the viewers: every upload times out again (3.994 and 1.997 timed out a
+  second over the day, all that is offered), and nothing else in the run changes.
+- Put `transcoded_store.capacity` back to `10GB/s`: `explain` turns it red (98.1 %), and in the
+  run it is red for 18.62k s around the evening, its peak rho 0.9811; the European p99 rises to
+  498 ms, still within 2 s.
+- Lower `cdn_eu.capacity` to `5GB/s`: `explain` puts `cdn_eu` at 141 %, red (7.04k MB/s of 5k).
+- Add `{at: 21:00, kind: dc_down, dc: eu-west, for: 5m}` in `faults` (phase 3: faults are
+  accepted and ignored today).

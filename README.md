@@ -189,20 +189,22 @@ t_s,client,op,offered_per_s,answered_per_s,timed_out_per_s,mean_ms
 `explain` follows the load through every tier the engine runs. On
 [YouTube](scenarios/book/youtube/) (ch. 14) the CDNs are sized in bytes, so they count megabytes
 and are checked in MB/s, the requests beside; each upload's event goes through the transcoding
-queue to the transcoders, a worker pool whose capacity is workers / cost (400 transcoders at 60 s
-a video: 6.667/s), and on paper every video they are offered writes four renditions to the
+queue to the transcoders, a worker pool whose capacity is workers / cost (600 transcoders at 60 s
+a video: 10/s), and on paper every video they are offered writes four renditions to the
 transcoded store and a completion the metadata tier records (in a run, every video they drain).
-The paper load does not queue, so the pool passes on all it is offered, and its red line says the
-evening peak outruns it (trimmed):
+The paper load does not queue, so the pool passes on all it is offered; its red line is a
+utilization verdict (96 % at the evening peak), not a backlog, and the cross-DC origin link, with
+a bandwidth, is checked in MB/s too (trimmed):
 
 ```
 $ simsys explain scenarios/book/youtube/scenario.yaml
 ...
-  cdn_us            peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)
-  api               peak offered 48/s vs 12k/s total capacity  (0.4%, green)
-  metadata_db       peak offered 98.28 units/s vs 9k/s total capacity  (1.09%, green)  ...
-  transcoders       peak offered 9.6/s vs 6.667/s total capacity  (144%, red)
-  transcoded_store  peak offered 9.811k MB/s (196.2/s) vs 10k MB/s total capacity  (98.1%, red)
+  cdn_us                    peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)
+  api                       peak offered 48/s vs 12k/s total capacity  (0.4%, green)
+  metadata_db               peak offered 98.28 units/s vs 9k/s total capacity  (1.09%, green)  ...
+  transcoders               peak offered 9.6/s vs 10/s total capacity  (96%, red)
+  transcoded_store          peak offered 9.811k MB/s (196.2/s) vs 20k MB/s total capacity  (49.1%, green)
+  cdn_eu->transcoded_store  peak offered 2.856k MB/s vs 5k MB/s  (57.1%, green)
 ```
 
 Only a URL frontier's and a notification fan-out's onward load is still left out (types with
@@ -238,11 +240,11 @@ end:
   (peak 19.2k/s): limiter, 8 stateless web servers, a Che cache (h = 0.881), snowflake ids
   and a SQL database in 3 shards; both SLOs pass (redirect p99 7.49 ms, nothing dropped).
 - [`book/youtube`](scenarios/book/youtube/): ch. 14 over 24 hours in bytes: two CDNs, blob
-  stores, the transcoding queue and workers, the metadata tier. It runs to the end and passes
-  its stream-latency and CDN-utilization SLOs, but from 15:43 the 400 transcoders fall behind
-  (63.76k videos wait at midnight, where the run ends, and the backlog is still growing: the
-  day's peak, about 71.9k, comes near 02:18), so `transcode_q` is 2.66 h behind and its
-  `queue_lag` SLO (30 m) fails (exit 2) until the README's sizing (plan 2c Task 16).
+  stores, a 40 Gbit/s cross-DC origin link, the transcoding queue and 600 workers, the metadata
+  tier. Every SLO passes (exit 0): European stream p99 465 ms, `transcode_q` 573 ms behind at
+  worst, `cdn_us` at 0.1403 in its worst hour; the 300 MB uploads are answered at about 12 s
+  within the 30 s timeout that stands for the book's resumable chunks. Its README sweeps the pool:
+  at 400 workers the queue falls 2.66 h behind by midnight.
 - [`book/news-feed`](scenarios/book/news-feed/): ch. 11 over 24 hours: fan-out on write through a
   queue and 32 workers, feed, post and user caches, a SQL database and the friendship graph as a
   key-value cluster. It runs to the end, but as shipped its one feed-cache replica is offered
