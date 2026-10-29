@@ -87,7 +87,10 @@ it past 1 s is timed out instead of answered. Almost nothing is (`timed_out_per_
 the token bucket at `burst: 500`, 0.0007 at the shipped `burst: 100`), but those far-tail
 requests weighed heavily on the variance the p99 is fitted to: each p99 above fell by 0.2 to
 2 % when the timeout began to apply (67.3, 228, 129 and 25.6 ms before; the leaky bucket's
-624 ms did not move).
+624 ms did not move). That fall is an artefact of the moment fit, not of the requests: cutting
+7.3e-7 of them removes 4.4 % of the fitted variance, so the refitted lognormal narrows, while the
+requests' own p99 moves by about 1e-6. It is kept (no threshold below which a cut is ignored:
+that would make the percentile jump where the threshold is crossed).
 
 ## Things to try
 - `burst: 5000`: each spike gets through for longer: 11.7k drops at the api, 16.5 s red,

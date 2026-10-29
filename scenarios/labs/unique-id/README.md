@@ -71,9 +71,11 @@ same design's other limit, one database's throughput below the 10k/s requirement
   are dropped, a drop rate of 2.34M / 6.9M = **0.339**. The queue is full all the time, so every
   id it issues waits about 125 ms (127 ms with the links and the service), far past the
   services' 50 ms timeout: `run --report json` gives `answered_per_s` 0 and `timed_out_per_s`
-  8000 (every id issued, 8k/s, is one the caller gave up on), and the table prints `-` for the
-  latencies. The p99 SLO observes 50 ms (the timeout caps every percentile, plan 2c Task 13; it
-  was 158 ms before) and still fails against its 10 ms. Even without the spike it would drop 2k
+  8000 (every id issued, 8k/s, is one the caller gave up on), and the table prints `8k` under
+  `timed out/s`, `-` for the mean and `>50ms` for every percentile. The p99 SLO observes 50 ms, the
+  timeout: every delivered id timed out, more than the 1 % a p99 allows, so it fails whatever its
+  `max` (`100% of delivered requests timed out (more than 1%)`; a `max: 1s` fails too, since the
+  services never saw an id answered). It observed 158 ms before the timeout applied. Even without the spike it would drop 2k
   of every 10k. At the default 1k/s the same holds: 1k/s issued, all timed out (each would take
   about 1 s).
 - **Snowflake**: 12.1k/s on average against 4 x 4.096M/s = 16.38M/s: each machine is 0.074 %

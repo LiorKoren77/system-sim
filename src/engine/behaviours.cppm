@@ -1977,7 +1977,7 @@ ClientBehaviour::ClientBehaviour(const graph::Graph& g, std::size_t self, std::u
   if (!workload) return;  // a client without a workload offers nothing
   curve_ = workload->curve;
   noise_spec_ = workload->noise;
-  if (workload->timeout) timeout_s_ = seconds(*workload->timeout);
+  timeout_s_ = graph::client_timeout_s(g.nodes()[self].spec);
   reset_noise();
   op_shares_ = workload->op_shares;
   std::ranges::sort(op_shares_, {}, &std::pair<std::string, double>::first);

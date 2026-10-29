@@ -573,6 +573,11 @@ class Graph {
 // std::logic_error, a programmer error, rather than charge it one unit whatever its bytes.
 [[nodiscard]] double op_cost(const Graph& g, std::size_t node, std::string_view op);
 
+// A client's `timeout` in seconds (plan 2c Task 13), empty when it waits for ever (or the node
+// has no workload): the one place the engine (behaviours::ClientBehaviour, which applies it) and
+// the reports (which cap and judge percentiles by it) read it from.
+[[nodiscard]] std::optional<double> client_timeout_s(const model::NodeSpec& client);
+
 }  // namespace simsys::graph
 
 namespace simsys::graph {
@@ -2863,6 +2868,11 @@ std::optional<Bytes> Graph::request_bytes(std::size_t node, std::string_view op)
   const auto found = by_op.find(op);
   if (found == by_op.end()) return std::nullopt;
   return found->second;
+}
+
+std::optional<double> client_timeout_s(const model::NodeSpec& client) {
+  if (!client.workload || !client.workload->timeout) return std::nullopt;
+  return seconds(*client.workload->timeout);
 }
 
 double op_cost(const Graph& g, std::size_t node, std::string_view op) {

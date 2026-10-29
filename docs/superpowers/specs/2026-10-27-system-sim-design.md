@@ -82,7 +82,9 @@ even when the fluid term wins the mean, so percentiles keep rising as overload d
 Applying `k²` to the variance is our own heuristic; Allen–Cunneen scales only the mean.
 
 Zones: green below `yellow` (default 0.70 utilization), yellow up to `red` (0.90), red
-above; drops are `overflow` plus anything the behaviour rejects (rate limiter, timeouts).
+above; drops are `overflow` (and an external sink's failures); what the behaviour rejects (a rate
+limiter) is counted apart, and a request slower than its client's timeout is timed out, neither
+dropped nor rejected (plan 2c Task 13: no node failed it).
 
 ### 3.4 Links
 
@@ -698,7 +700,8 @@ author meets are in `docs/scenario-schema.md` (v1.3).
     `demand_per_s,drain_per_s` after `node`, so the conservation law `Σ demand·dt = Σ (drain
     + drops)·dt + backlog` can be checked from the file. What the clients see goes to a second
     file rather than a second section of the first: `run --series-ops` writes
-    `t_s,client,op,offered_per_s,answered_per_s,mean_ms`, from an `OpSeriesWriter` that
+    `t_s,client,op,offered_per_s,answered_per_s,mean_ms` (`timed_out_per_s` before `mean_ms`
+    since plan 2c Task 13's review), from an `OpSeriesWriter` that
     observes the same step records as the summary and the node writer (Pattern: Observer).
     `run` checks both paths before truncating either and refuses one file for both. JSON's
     ops gain `answered_per_s`; its nodes `staleness_s`, `replication_dropped_per_s` and

@@ -2112,6 +2112,11 @@ std::expected<model::Workload, ConfigError> read_workload(const Site& site,
   if (auto read = read_optional_duration(site, body, "timeout", workload.timeout); !read) {
     return std::unexpected(read.error());
   }
+  // A client that gives up at once answers nothing, and a latency SLO would observe the 0 s the
+  // client waited (review of plan 2c Task 13, C-1): a timeout is a positive wait.
+  if (workload.timeout && workload.timeout->count() <= 0) {
+    return site.fail(body["timeout"], "timeout must be positive");
+  }
   return workload;
 }
 

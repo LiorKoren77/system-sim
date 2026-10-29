@@ -105,8 +105,9 @@ warmup).
   timeout spent waiting.
 - The client's 1 s timeout, partly (plan 2c Task 13). Each step, the response time of an op is
   a lognormal fitted to its mean and variance; the share of it slower than 1 s is counted as
-  timed out (JSON's `timed_out_per_s`), not answered, the latency columns describe the requests
-  answered in time, and no percentile is printed above 1 s. The shipped day never comes near it
+  timed out (JSON's `timed_out_per_s`, the table's `timed out/s`), not answered, the latency
+  columns describe the requests answered in time, and no percentile is printed above 1 s (one
+  more than whose share of the requests timed out prints `>1s` and fails its SLO). The shipped day never comes near it
   (`timed_out_per_s` 0 for both ops). What it ignores: the servers still do a timed-out
   request's work (nothing cancels it), the client does not retry it, and a timed-out request is
   in no node's `drop_rate` (no node failed it).
@@ -136,7 +137,9 @@ warmup).
   timeout (Task 13): of the 1.153k shortens/s offered over the day, 266.1/s lose their id
   (0.2309), 293.6/s are timed out (`run --report json`: `timed_out_per_s` 293.57, a third of
   the 886.6/s the path delivered) and 593.0/s are answered, in 463 ms on average, p50 329 ms,
-  p95 and p99 **1 s**: the cap, no answered request took longer. (Without the timeout: all
+  p95 and p99 **1 s**, the timeout itself (`>1s` in the table): a third of the delivered shortens
+  timed out, far more than the 5 % and 1 % those quantiles leave above them, so the clients never
+  saw them answered. (Without the timeout: all
   886.6/s answered, mean 669 ms, p99 2.42 s.) A shorten whose id was not issued is never
   written: url_db commits 295.5 writes/s per shard over the
   day instead of 384.2, the snowflake run's figure × (1 − 0.2309), and its busiest copy peaks at

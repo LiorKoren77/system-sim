@@ -98,10 +98,16 @@ struct LinkSummary {
 // later, not lost), so answered / offered is the fraction the path delivered. A client with a
 // `timeout` (plan 2c Task 13) also gives up on the delivered requests slower than it:
 // `timed_out_per_s` counts them (0 without a timeout), `answered_per_s` leaves them out (offered
-// − lost − timed out), the latencies describe the requests answered in time, and every
-// percentile is capped at the timeout (no answered request took longer). A timed-out request is
-// not a drop: no node failed it, so it is in no node's drop rate. An infinite mean makes every
-// latency infinite, which the renderers print as "unavailable" (table) or null (JSON).
+// − lost − timed out), and the mean describes the requests answered in time. A percentile is what
+// the client sees at its quantile q (report.cpp's percentile_seen_by_client, review of plan 2c
+// Task 13, C-1): when more than 1 − q of the delivered requests timed out
+// (`timed_out_share` > 1 − q: more than 1 % for a p99), no request at that quantile was answered,
+// and the percentile IS the timeout (the table prints `>1s`, a latency SLO on it
+// fails whatever its max); otherwise it is the answered requests' fitted percentile, capped at the
+// timeout (no answered request took longer). A timed-out request is not a drop: no node failed
+// it, so it is in no node's drop rate. An infinite mean makes every latency infinite, which the
+// renderers print as "unavailable" (table) or null (JSON); an op of which nothing was answered in
+// time but something timed out has no latency of its own either (the JSON's null).
 struct OpSummary {
   std::string client{};
   std::string op{};
@@ -112,6 +118,11 @@ struct OpSummary {
   double p50_s{};
   double p95_s{};
   double p99_s{};
+  // The client's timeout in seconds (graph::client_timeout_s), empty when it waits for ever, and
+  // timed_out / (answered + timed_out) over the observed steps: 0 without a timeout or with
+  // nothing delivered.
+  std::optional<double> timeout_s{};
+  double timed_out_share{};
 };
 
 enum class SloStatus { pass, fail, skipped };
@@ -222,6 +233,8 @@ class Summary {
     void add(const engine::ResponseSample& sample, double dt_s);
   };
 
+  // An op's mean and percentiles from the moments its answered requests left (Summary::ops).
+  static void fill_latencies(const Moments& m, OpSummary& op);
   [[nodiscard]] double step_length_s(SimTime t);
   [[nodiscard]] OpTotals& totals_for(const engine::ResponseSample& sample, std::size_t hint);
   // The index of the node with the highest `rate` (drop or reject), the first of equals.
@@ -283,7 +296,8 @@ class SeriesWriter {
 };
 
 // For plotting what the clients see: one CSV row per (client, op) per step,
-// `t_s,client,op,offered_per_s,answered_per_s,mean_ms` (plan 2b refinement 7). The header is
+// `t_s,client,op,offered_per_s,answered_per_s,timed_out_per_s,mean_ms` (plan 2b refinement 7;
+// `timed_out_per_s` since the review of plan 2c Task 13). The header is
 // written on construction; the column rules are at OpSeriesWriter::observe in report.cpp.
 // Pattern: Observer, like SeriesWriter: the CLI hands each step record to both, and neither
 // knows of the other. `out` and `g` must outlive the writer.

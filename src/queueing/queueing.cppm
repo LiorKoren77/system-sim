@@ -226,7 +226,9 @@ struct BelowLimit {
 // Assumes the response is lognormal, which it only approximates (the reports' percentiles rest on
 // the same fit). Edge cases, each the limit of the formulas:
 //  - L = infinity: everything is answered, the moments are m and v unchanged;
-//  - no spread (v <= 0, or m <= 0: a time of exactly m): all answered if m <= L, else none;
+//  - no spread (v <= 0, or m <= 0: a time of exactly m): all answered if m <= L, else none (a
+//    response of exactly the timeout counts as answered, though as v -> 0 the share tends to a
+//    half: the lognormal's median sits at m, half of it on each side of L = m);
 //  - nothing answered (Phi(z) = 0, which happens in floating point below z = -38.5: a 12 s upload
 //    of almost no spread against a 10 s timeout, as youtube's): the moments would be 0 / 0, a
 //    NaN that the reports' weighted sums would spread to every step (0 x NaN is NaN). They are L

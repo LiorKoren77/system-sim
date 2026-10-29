@@ -969,6 +969,18 @@ links: []
   CHECK(workload->timeout == 1s);
 }
 
+// A client that gives up after 0 s answers nothing and waits nothing, so a latency SLO would
+// observe 0 s and pass any max (review of plan 2c Task 13, C-1): a timeout must be a positive wait.
+TEST_CASE("a client's timeout of zero is refused: a timeout is a positive wait") {
+  for (const std::string_view timeout : {"0s", "0ms"}) {
+    require_rejected("simsys_timeout_zero.yaml",
+                     "version: 1\nname: t\nduration: 1m\nnodes:\n  u: {type: client, rate: "
+                     "{base: 10/s}, ops: {a: 1}, timeout: " +
+                         std::string{timeout} + "}\nlinks: []\n",
+                     "node 'u': timeout must be positive");
+  }
+}
+
 namespace {
 // A scenario with one client `u` whose body after `ops` is `extra` (e.g. `keys: 5`).
 std::string client_with(std::string_view extra) {

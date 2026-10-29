@@ -227,7 +227,8 @@ double number(const std::string& cell) {
 constexpr std::string_view node_header =
     "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone,"
     "queue_lag_s";
-constexpr std::string_view op_header = "t_s,client,op,offered_per_s,answered_per_s,mean_ms";
+constexpr std::string_view op_header =
+    "t_s,client,op,offered_per_s,answered_per_s,timed_out_per_s,mean_ms";
 
 // `explain` of a shipped book scenario, as `simsys explain scenarios/book/<name>/scenario.yaml`
 // prints it. SIMSYS_SCENARIOS_DIR is injected by tests/CMakeLists.txt, like in scenario_tests.
@@ -495,7 +496,7 @@ TEST_CASE("a limiter's rejections are inside its drain, so the identity needs no
   REQUIRE_THAT(demand, WithinRel(drain + drops + backlog, 1e-5));
 }
 
-// ---- op series: offered_per_s, answered_per_s, mean_ms ----
+// ---- op series: offered_per_s, answered_per_s, timed_out_per_s, mean_ms ----
 
 TEST_CASE("the op series has its own writer and header, written on construction", "[series]") {
   const auto s = mm1(500);
@@ -514,7 +515,7 @@ TEST_CASE("the op series has one row per client op per step", "[series]") {
   const auto rows = data_rows(out.str());
   CAPTURE(out.str());
   REQUIRE(rows.size() == 5);  // 5 steps x 1 (client, op)
-  REQUIRE(rows[0].size() == 6);
+  REQUIRE(rows[0].size() == 7);
   REQUIRE(rows[0][0] == "0");
   REQUIRE(rows[0][1] == "c");
   REQUIRE(rows[0][2] == "op");
@@ -542,8 +543,9 @@ TEST_CASE("the op series has one row per client op per step", "[series]") {
   REQUIRE(pair[1][2] == "put");
 }
 
-TEST_CASE("an op series row holds the sample's offered and answered rates and its mean in ms",
-          "[series]") {
+TEST_CASE(
+    "an op series row holds the sample's offered, answered and timed out rates and its mean in ms",
+    "[series]") {
   const auto s = mm1(500);
   const auto g = graph_of(s);
   std::ostringstream out;
@@ -555,11 +557,14 @@ TEST_CASE("an op series row holds the sample's offered and answered rates and it
                                                    .op = "op",
                                                    .offered = Rate{250.5},
                                                    .answered = Rate{125.25},
+                                                   .timed_out = Rate{4.5},
                                                    .response = {.mean_s = 0.0125}}}});
   const auto rows = data_rows(out.str());
   REQUIRE(rows.size() == 1);
-  // t_s, client, op, offered_per_s, answered_per_s, mean_ms: 0.0125 s is 12.5 ms.
-  REQUIRE(rows[0] == std::vector<std::string>{"0.2", "c", "op", "250.5", "125.25", "12.5"});
+  // t_s, client, op, offered_per_s, answered_per_s, timed_out_per_s (review of plan 2c Task 13,
+  // minor 6: what the client gave up on, delivered after its timeout), mean_ms: 0.0125 s is
+  // 12.5 ms.
+  REQUIRE(rows[0] == std::vector<std::string>{"0.2", "c", "op", "250.5", "125.25", "4.5", "12.5"});
 }
 
 // Same convention as the node series (report.cpp, SeriesWriter::observe): a CSV cell is
@@ -580,7 +585,7 @@ TEST_CASE("an op series row with an infinite mean writes inf", "[series]") {
           .response = {.mean_s = std::numeric_limits<double>::infinity()}}}});
   const auto rows = data_rows(out.str());
   REQUIRE(rows.size() == 1);
-  REQUIRE(rows[0][5] == "inf");
+  REQUIRE(rows[0][6] == "inf");
 }
 
 TEST_CASE("answered never exceeds offered, and falls below it when a queue sheds", "[series]") {
@@ -1193,7 +1198,13 @@ TEST_CASE("the JSON has an empty links array when no link has a bandwidth", "[se
 // b4e263a (which reproduces the old hash, 0x3d3a6ed1d31da525) with `,queue_lag_s` appended to
 // its header and `,` to each of its 3,600 rows, hashed with this function. An implementation
 // whose chain rows differ from that in any byte (a number in the new column, a different empty
-// cell) fails here. The op series has no new column: its hash is the old one.
+// cell) fails here. The op series had no new column then: its hash was the old one.
+//
+// Re-pinned for the review of plan 2c Task 13 (minor 6), on purpose: the op series gained a
+// `timed_out_per_s` column after `answered_per_s`, 0 on every row of the chain (its client has no
+// timeout), and nothing else changed. Derived the same way: the op series of the binary at
+// 691a3ef (which reproduces the old hash, 0x9dfc7de84e1afe59) with `timed_out_per_s` inserted in
+// its header and `0` in each of its rows before `mean_ms`, hashed with this function.
 namespace {
 std::uint64_t fnv1a(const std::string& text) {
   std::uint64_t hash = 0xcbf29ce484222325ULL;  // the 64-bit FNV offset basis
@@ -1224,7 +1235,7 @@ TEST_CASE("the tutorial chain's series are byte for byte what they were before l
   REQUIRE(data_rows(nodes_out.str()).size() == 1200 * 3);    // 2 min of 100 ms steps x 3 nodes
   REQUIRE(header_of(nodes_out.str()) == node_header);
   REQUIRE(fnv1a(nodes_out.str()) == 0xd0b4c7d05759bd57ULL);  // re-pinned for queue_lag_s, above
-  REQUIRE(fnv1a(ops_out.str()) == 0x9dfc7de84e1afe59ULL);
+  REQUIRE(fnv1a(ops_out.str()) == 0xa2e246b7176cc3f3ULL);    // re-pinned for timed_out_per_s
 }
 
 // ---- explain on youtube: a pool's capacity is workers / cost (plan 2c Task 6) ----

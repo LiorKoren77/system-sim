@@ -77,8 +77,10 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   timeout (plan 2c Task 13) gives up on 56 % of the delivered requests (`run --report json`:
   `timed_out_per_s` 11.41k of the gets), so only 8.88k of the 21k gets/s are answered, in
   95.3 ms on average. `run` fails all three SLOs: drop rate 0.1111, utilization 1, `put` p99
-  **100 ms**, the timeout itself, since no answered request took longer (the lognormal fit
-  without the cap said 118 ms). (Before the quorum was taken over the real replica set the lab
+  **100 ms**, the timeout itself: 56.2 % of the delivered requests timed out, more than the 1 % a
+  p99 leaves above it, so the client never saw its 99th percentile answered (the table prints
+  `>100ms` in every percentile column, and the SLO line says `56.2% of delivered requests timed
+  out (more than 1%)`; the lognormal fit without the timeout said 118 ms). (Before the quorum was taken over the real replica set the lab
   said 306 ms and blamed the room; the 306 ms came from treating each replica as an exponential
   of mean 100 ms, whose spread is as large as its mean.) The fix is more machines, not a
   different quorum: the load is N × the requests whatever W and R are.
@@ -92,7 +94,9 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   N replies and not at the slowest. Add `write_quorum: 3` and it no longer does: a `put` waits
   for every replica, the full queue included, and loses what the hot machine drops: 4.6 % of the
   puts (8.59k of 9k delivered). The slow ones meet the 100 ms timeout: 638/s time out, 7.95k/s
-  are answered, mean 29.4 ms, p99 100 ms (FAIL; 39.6 ms and 233 ms before the timeout applied).
+  are answered, mean 29.4 ms, p95 and p99 `>100ms`: 7.43 % of the delivered puts timed out, so
+  the p99 SLO fails at the timeout (`7.43% of delivered requests timed out (more than 1%)`; 39.6 ms
+  and 233 ms before the timeout applied).
 - `write_quorum: 3, read_quorum: 1`: a `put` waits for the slowest of three replicas and a `get`
   for the fastest: `put` 1.87 ms (p99 3.3 ms), `get` 1.4 ms (p99 2.05 ms).
   `write_quorum: 1, read_quorum: 3` swaps them. The load does not change. `explain` marks either
