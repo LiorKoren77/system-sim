@@ -54,10 +54,14 @@
   is read as it arrives), and an upload is a write (`original_store` lists `write_ops: [upload]`),
   acknowledged at its last byte, 12 s after its wait.
 - Every 300 MB upload therefore takes at least 12 s (300 MB at 25 MB/s per slot), with no spread
-  but its wait's. The clients' `timeout: 10s` is read but not applied yet: applied as it stands
-  it would time out **every** upload (plan 2c Task 13 honours the timeout). The book's uploads
-  are resumable (chunked, each chunk retried on its own), so plan Task 16 sizes the timeout per
-  the book (a timeout per chunk, or a longer one for `upload`) before Task 13 applies it.
+  but its wait's. Since plan 2c Task 13 the clients' `timeout: 10s` is applied, and as shipped
+  it times out **every** upload: each would be answered at about 12 s (12.0 s in the US, 12.1 s
+  in the EU before the timeout), so `run --report json` shows `timed_out_per_s` equal to
+  `offered_per_s` and `answered_per_s` 0 for both clients' `upload`, and the table prints `-`
+  for its latencies (nothing answered). The uploads still reach `original_store` and the
+  transcoders: nothing cancels them, so every other number of `run`'s table is as before. The
+  book's uploads are resumable (chunked, each chunk retried on its own); plan Task 16 resolves
+  this, with resumable uploads or a timeout sized for `upload`.
 - Two regions with a cross-DC origin fetch (150 ms) for European misses. Each CDN is a
   read-only cache in front of `transcoded_store`: its hit ratio comes from the Che approximation
   over the viewers' Zipf(1) popularity of 10M videos and the edge's size in videos (`keys: 100k`
@@ -96,7 +100,7 @@
   00:00 to 02:18 as well, when the run's queue fills from empty where the real one would still
   be working off the evening before. `transcoded_store` is red for 10.79k s (3.0 h) around the
   evening peak (peak rho 0.9225: the CDNs' misses and the renditions, 98.1 % on paper). (Uploads
-  take 12 s, past the clients' 10 s timeout that is not applied yet: above.)
+  take 12 s, past the clients' 10 s timeout, so every one of them times out: above.)
 
 ## What it abstracts away
 - Adaptive bitrate selection, chunked upload resume, DRM.

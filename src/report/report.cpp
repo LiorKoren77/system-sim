@@ -703,6 +703,7 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
                           json_field("op", json_string(op.op)),
                           json_field("offered_per_s", json_number(op.offered_per_s)),
                           json_field("answered_per_s", json_number(op.answered_per_s)),
+                          json_field("timed_out_per_s", json_number(op.timed_out_per_s)),
                           json_field("mean_s", json_number(op.mean_s)),
                           json_field("p50_s", json_number(op.p50_s)),
                           json_field("p95_s", json_number(op.p95_s)),
@@ -2460,6 +2461,17 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   return join(fields, ",") + "\n";
 }
 
+// A client's timeout bounds what it reports (plan 2c Task 13): every answered request took less
+// than the timeout, so no percentile can be longer. The lognormal refitted to the answered
+// requests' moments has a tail past the cut that the truncated distribution does not (mean
+// 73.97 ms, variance 0.0021022 s^2 after a 200 ms timeout put its p99 at 236.7 ms); the cap is
+// the truncation it forgets. The mean needs no cap: a truncated mean is below the cut.
+void cap_percentiles(OpSummary& op, double timeout_s) {
+  op.p50_s = std::min(op.p50_s, timeout_s);
+  op.p95_s = std::min(op.p95_s, timeout_s);
+  op.p99_s = std::min(op.p99_s, timeout_s);
+}
+
 }  // namespace
 
 // ---- Summary ----
@@ -2509,6 +2521,7 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
 void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
   offered += sample.offered.per_second * dt_s;
   answered += sample.answered.per_second * dt_s;
+  timed_out += sample.timed_out.per_second * dt_s;
   const auto& response = sample.response;
   if (!std::isfinite(response.mean_s) || !std::isfinite(response.variance_s2)) {
     unavailable = true;
@@ -2640,10 +2653,12 @@ std::vector<LinkSummary> Summary::links() const {
 std::vector<OpSummary> Summary::ops() const {
   std::vector<OpSummary> out;
   for (const auto& t : ops_) {
-    OpSummary op{.client = graph_->nodes()[t.client].spec.id,
+    const auto& client = graph_->nodes()[t.client].spec;
+    OpSummary op{.client = client.id,
                  .op = t.op,
                  .offered_per_s = observed_s_ > 0.0 ? t.offered / observed_s_ : 0.0,
-                 .answered_per_s = observed_s_ > 0.0 ? t.answered / observed_s_ : 0.0};
+                 .answered_per_s = observed_s_ > 0.0 ? t.answered / observed_s_ : 0.0,
+                 .timed_out_per_s = observed_s_ > 0.0 ? t.timed_out / observed_s_ : 0.0};
     const Moments& m = t.by_answered.weight > 0.0 ? t.by_answered : t.by_time;
     if (t.unavailable) {
       op.mean_s = op.p50_s = op.p95_s = op.p99_s = infinity;
@@ -2658,6 +2673,9 @@ std::vector<OpSummary> Summary::ops() const {
       op.p50_s = queueing::lognormal_quantile(op.mean_s, variance, queueing::z_p50);
       op.p95_s = queueing::lognormal_quantile(op.mean_s, variance, queueing::z_p95);
       op.p99_s = queueing::lognormal_quantile(op.mean_s, variance, queueing::z_p99);
+      if (client.workload && client.workload->timeout) {
+        cap_percentiles(op, seconds(*client.workload->timeout));
+      }
     }
     out.push_back(std::move(op));
   }

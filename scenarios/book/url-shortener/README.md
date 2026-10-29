@@ -13,7 +13,7 @@ and 9 % `shorten`, on a daily sine of ±50 % that peaks at 14:00 with 19.2k/s (1
 
 ### How it is sized
 The first draft (6 web servers, one database of a primary and 2 read replicas) failed both
-SLOs: `simsys run` gave a redirect p99 of 766 ms (max 50 ms) and a drop rate of 0.200 (max
+SLOs: `simsys run` gave a redirect p99 of 759 ms (max 50 ms) and a drop rate of 0.200 (max
 0.001), and `explain` showed why: `web  peak offered 19.2k/s vs 18k/s total capacity (107%,
 red)` and `primary 8.64k units/s vs 5k/s (173%, red), each replica 9.683k units/s vs 5k/s
 (194%, red)`. The fixes are the book's remedies, sized with its numbers; the SLOs are unchanged.
@@ -101,8 +101,13 @@ warmup).
   (1 s here), so a change of loss reaches the database one step late, and the steps are assumed
   to fail independently of one another. A failed request costs nothing more: no retry, no
   timeout spent waiting.
-- The client's 1 s timeout does not cut latencies short: a response slower than that is
-  still counted, not turned into a retry or an error.
+- The client's 1 s timeout, partly (plan 2c Task 13). Each step, the response time of an op is
+  a lognormal fitted to its mean and variance; the share of it slower than 1 s is counted as
+  timed out (JSON's `timed_out_per_s`), not answered, the latency columns describe the requests
+  answered in time, and no percentile is printed above 1 s. The shipped day never comes near it
+  (`timed_out_per_s` 0 for both ops). What it ignores: the servers still do a timed-out
+  request's work (nothing cancels it), the client does not retry it, and a timed-out request is
+  in no node's `drop_rate` (no node failed it).
 - Percentiles are estimated (a lognormal fitted to the mean and variance), and the SLOs are
   checked over the whole day, not per minute: a few minutes of red at the peak can hide in
   the day's p99.
@@ -124,9 +129,14 @@ warmup).
 - Change `id_gen` to `{type: id_generator, algorithm: ticket_server, replicas: 1}` (one
   auto-increment database, ch. 7; the loader refuses `replicas: 2` for a ticket server): the
   write path gets a hot spot. `explain`: `id_gen  peak offered 1.728k/s vs 1k/s total
-  capacity (173%, red)`. In the run it is red for 15.5 h of the day (55,650 s), drops 22.96M
-  id requests (drop rate 0.2309), and `shorten` takes 669 ms on average, p99 2.42 s. A shorten
-  whose id was not issued is never written: url_db commits 295.5 writes/s per shard over the
+  capacity (173%, red)`. In the run it is red for 15.5 h of the day (55,650 s) and drops 22.96M
+  id requests (drop rate 0.2309). Its full queue makes `shorten` slow, past the clients' 1 s
+  timeout (Task 13): of the 1.153k shortens/s offered over the day, 266.1/s lose their id
+  (0.2309), 293.6/s are timed out (`run --report json`: `timed_out_per_s` 293.57, a third of
+  the 886.6/s the path delivered) and 593.0/s are answered, in 463 ms on average, p50 329 ms,
+  p95 and p99 **1 s**: the cap, no answered request took longer. (Without the timeout: all
+  886.6/s answered, mean 669 ms, p99 2.42 s.) A shorten whose id was not issued is never
+  written: url_db commits 295.5 writes/s per shard over the
   day instead of 384.2, the snowflake run's figure × (1 − 0.2309), and its busiest copy peaks at
   rho 0.4029 instead of 0.6455 (the ticket server caps the writes at its 1k ids/s). Redirects
   never touch the ticket server (p99 7.44 ms, a little under the shipped 7.49 ms: the replicas

@@ -308,9 +308,48 @@
 
 **Files:** `src/queueing/queueing.cppm` (`normal_cdf`, `lognormal_below(mean, variance, limit)` → `{fraction, mean_s, variance_s2}`), `src/engine/engine.cppm` (`client_responses` applies the client's `timeout`), `src/report/report.cppm`, `src/report/report.cpp` (percentiles capped at the timeout; JSON `timed_out_per_s`), `scenarios/book/url-shortener/README.md` (the timeout bullet; the ticket-server variant's shorten numbers), tests in `test_queueing.cpp`, `test_theory.cpp`, `test_report.cpp`.
 
-- [ ] Tests: `lognormal_below(0.1, 0.01, 0.2)`: fraction **0.89414**, mean **0.073970 s**, variance 0.0021022 s²; limit 1 s → fraction 0.99927; 50 ms → 0.33860; a limit of infinity returns the input moments and fraction 1. Theory: a client with `timeout: 200ms` whose path has mean 100 ms and variance 0.01 s² reports answered 0.8941 × offered, the answered mean 73.97 ms, `timed_out_per_s` = 0.1059 × offered, p99 ≤ 200 ms; the server's demand is unchanged (the work is still done); no `timeout` → unchanged. Scenario: under the ticket-server variant `shorten` (p99 2.42 s without the timeout) now reports p99 capped at 1 s and an answered rate below its offered rate by the timed-out share; the README states both measured.
+- [x] Tests: `lognormal_below(0.1, 0.01, 0.2)`: fraction **0.89414**, mean **0.073970 s**, variance 0.0021022 s²; limit 1 s → fraction 0.99927; 50 ms → 0.33860; a limit of infinity returns the input moments and fraction 1. Theory: a client with `timeout: 200ms` whose path has mean 100 ms and variance 0.01 s² reports answered 0.8941 × offered, the answered mean 73.97 ms, `timed_out_per_s` = 0.1059 × offered, p99 ≤ 200 ms; the server's demand is unchanged (the work is still done); no `timeout` → unchanged. Scenario: under the ticket-server variant `shorten` (p99 2.42 s without the timeout) now reports p99 capped at 1 s and an answered rate below its offered rate by the timed-out share; the README states both measured.
   The client's `timeout` must see the last-byte response of uploads (Task 3 fix round, I2): youtube's 300 MB uploads are writes answered at 12 s + wait, a deterministic transfer (second fix round, I2: response p99 12.40 s, p1 11.64 s), so its `timeout: 10s` times out **100 %** of them unless Task 16 changes the timeout (resumable uploads per the book); pin it, and say in the youtube README whether the timeout or the upload path changes.
-- [ ] Commit `nodes: a client's timeout turns its slow tail into unanswered requests`
+- [x] Commit `nodes: a client's timeout turns its slow tail into unanswered requests`
+  Resolution notes: `queueing::lognormal_below(m, v, L)` → `BelowLimit{fraction, mean_s,
+  variance_s2}` by the partial moments E[X^k 1{X<L}] = exp(k mu + k² sigma²/2) Φ(z − k sigma);
+  edge cases: L = ∞ returns the input, v ≤ 0 is a step at m (answered iff m ≤ L), Φ(z) = 0 (below
+  z = −38.5) returns {0, L, 0} (the limit as the share vanishes; no 0/0), an infinite m returns
+  {0, ∞, ∞} so the report still says unavailable, NaN in → NaN out; the mean is clamped to ≤ L and
+  the variance to ≥ 0 against rounding. `ResponseSample` gained `timed_out`; the engine's
+  `Simulation::give_up_after` (called from `client_responses`, so `run` and `estimate` alike)
+  applies the client's `timeout` (`ClientBehaviour::timeout_s`) to the path's response after the
+  delivered fraction: timed_out = delivered × (1 − fraction), answered = delivered − timed_out
+  (exact sum; a share under 1.1e-16 answers nothing, unique-id's 5e-21 included), response = the
+  truncated moments. Server demand is untouched (the theory test checks it). Report: OpSummary and
+  JSON `timed_out_per_s` (after `answered_per_s`), percentiles capped at the timeout in
+  `Summary::ops()` (so table, JSON and the latency SLOs; an unavailable op stays infinite); the CSV
+  op series keeps its columns (its `answered_per_s` now excludes timeouts). Decided: a timed-out
+  request is in no `drop_rate` (no node failed it), said in the schema's "Drops and rejections";
+  the schema also warns that a latency SLO whose max is at or above the client's timeout cannot
+  fail. Of the ten runnable scenarios, `run`'s table moved for four: youtube (both clients'
+  `upload` 100 % timed out, `-` latencies, everything else identical), unique-id (every issued id
+  times out at 50 ms: `-` latencies, the p99 SLO observes 50 ms instead of 158 ms, still FAIL),
+  rate-limiter (p99 30.5 → 29.9 ms, p50 3.93 → 3.97, p95 16.7 → 16.6: 0.0007/s time out at 1 s,
+  but they carried the far tail of the fitted variance) and news-feed (read_feed p99 90.3 → 89.2
+  ms, p95 50.1 → 49.7; read_media p99 65 → 64.9; estimate's read_feed p99 108 → 106 ms);
+  search-autocomplete's JSON moved at 1e-9 (1.8e-8 suggests/s time out); url-shortener, kv-store,
+  consistent-hashing, chain and hello gained only the key (`timed_out_per_s` 0). README and pin
+  moves: url-shortener ticket-server variant: shorten answered 593.0/s of 1.153k offered (266.1/s
+  lost to id_gen, 293.6/s timed out), mean 669 → 463 ms, p50 545 → 329 ms, p95 1.56 → 1 s, p99
+  2.42 → 1 s; its first draft's redirect p99 766 → 759 ms; kv-store `nodes: 8`: 56 % of the
+  delivered requests time out (8.88k of 21k gets/s answered), p99 118 → 100 ms (the
+  `test_scenarios.cpp` pin `117.8e-3 ± 1 %` became `== 0.1`; the YAML comment and README re-quoted),
+  `vnodes: 1, write_quorum: 3` put mean 39.6 → 29.4 ms, p99 233 → 100 ms (638/s time out),
+  `nodes: 4` 18.3 % answered; consistent-hashing `vnodes: 1`: 34.3 ms / 143 ms (35.5 / 166);
+  rate-limiter table (67.3 → 67.1, 228 → 227, 129 → 127, 25.6 → 25.2 ms; sliding_log 500 ms 118 →
+  116 ms) and the root README's and numerics.md's 30.5 → 29.9 ms; unique-id's table rows 1–2.
+  Deviation: this landed before the kv/search review fix round (still parked on
+  `wip/kv-review-fix-round`, which also edits queueing.cppm, report, numerics.md, the schema and
+  the kv-store and consistent-hashing READMEs: expect conflicts there when it resumes, and
+  re-measure its README numbers with the timeout applied). Observed, not fixed: search-autocomplete's "Things to try" says
+  `trie_cache.keys: 1M` fails the p99 SLO, but it passes at 9.27 ms before and after this task
+  (Task 18's README pass). 1077 tests; green in Debug and Release except Task 14's 21 red tests.
 
 ---
 
@@ -384,22 +423,13 @@ Schema v1.4, spec §19, study notes, README. Commit `docs: schema v1.4, spec §1
 The owner stopped the session ("stop now the background processes. make sure to push everything that
 was completed. document what is in progress and what is left to do"). State pushed to `origin/main`:
 
-**Done (committed, reviewed where a review section exists above):** Tasks 1–12. Task 12 landed as
+**Done (committed, reviewed where a review section exists above):** Tasks 1–13. Task 13 landed
+after this stop (see its resolution notes; not yet reviewed). Task 12 landed as
 `dd9213b` (1049 tests green in both presets at that commit, with `tests/unit/test_queueing.cpp`
 taken from `6aa78ac`; see below). Its review (REQUEST_CHANGES, section "Review of Task 12 at
 dd9213b" above) is recorded but **not yet fixed**.
 
-**Red commits on main, not yet implemented (so `main` does not build clean):**
-- `37ece9b` Task 13 (client timeout): `tests/unit/test_queueing.cpp` calls `queueing::lognormal_below`,
-  which does not exist yet, so the `unit_tests` target **does not compile at HEAD** and CI's
-  build-test jobs fail until Task 13's implementation lands. To build meanwhile:
-  `git checkout 6aa78ac -- tests/unit/test_queueing.cpp` (do not commit that).
-  The other Task 13 tests (`tests/theory/test_timeout.cpp`, the timeout tests at the end of
-  `tests/unit/test_report.cpp`) compile and fail at run time (13 tests). The test-writer's notes: the
-  fixture is one M/M/1 at rho 0.99 (sojourn mean 100 ms, variance 0.01 s²); youtube's uploads have
-  sigma ≈ 3e-7 so Φ underflows to 0 and the truncated moments must be guarded against 0/0;
-  `timed_out_per_s` is read only from the JSON; `ClientBehaviour`'s header still says timeouts are
-  ignored.
+**Red commits on main, not yet implemented (so `main`'s tests are not all green):**
 - `dc8ec40` Task 14 (`over:` windows): `tests/theory/test_windows.cpp`, `over` tests in
   `test_config.cpp` and at the end of `test_report.cpp`; they fail at load with
   `slo: unknown key 'over'`. Test-writer's decisions to honour: windows align from the end of warmup
@@ -418,7 +448,7 @@ named in that section.
 
 **Left to do, in order (each with the test-writer → implementer → adversarial reviewer loop):**
 1. Finish the kv/search review fix round (above) and commit it.
-2. Task 13 implementation (spec in "### Task 13" + the red tests' notes above).
+2. ~~Task 13 implementation~~ done; its adversarial review is still to do.
 3. The Task 12 review fix round (section "Review of Task 12 at dd9213b": averaging in settle mode,
    adjacent parallel steps refused, limiter fails closed, README/comment nits), then Task 14's
    implementation; review both.

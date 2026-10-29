@@ -15,8 +15,9 @@
 // pipe's wait and serialisation with them, Simulation::hop_response). Captured:
 // saturation spreading downstream as reduced throughput (dropped flow never reaches the
 // next box), propagation delay, fan-out and the feedback loops of ch. 12 (chat). Ignored:
-// individual requests (flow is a fluid), retries and timeouts, and anything that changes
-// within a step (demand is constant across one step).
+// individual requests (flow is a fluid), retries, and anything that changes within a step
+// (demand is constant across one step). A client's timeout is applied to the fitted response
+// time it sees (Simulation::give_up_after), not request by request.
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -52,6 +53,7 @@ import simsys.flow;
 import simsys.fluid;
 import simsys.graph;
 import simsys.model;
+import simsys.queueing; // lognormal_below: what a client's timeout leaves answered
 
 export namespace simsys::engine {
 
@@ -187,11 +189,16 @@ struct NodeSample {
 // is not answered (one still waiting in a queue is: later, see Simulation::account_rejections),
 // and reports weigh latency by `answered` so that those requests, which never saw the path's
 // latency, do not dilute it.
+// A client with a `timeout` (plan 2c Task 13, Simulation::give_up_after) also gives up on the
+// delivered requests slower than it: those are `timed_out`, not answered, and `response` is the
+// latency of the ones answered in time. So answered = offered − lost − timed_out, and timed_out
+// is 0 for a client that waits for ever.
 struct ResponseSample {
   std::size_t client{};
   std::string op{};
   Rate offered{};
   Rate answered{};
+  Rate timed_out{};
   flow::LatencyEstimate response{};
 };
 
@@ -502,6 +509,8 @@ class Simulation {
   void account_rejections(std::size_t index, const behaviours::Routed& routed, NodeSample& sample);
   void backward_pass();
   [[nodiscard]] std::vector<ResponseSample> client_responses(SimTime now) const;
+  // Applies a client's `timeout` to one of its samples (see the definition).
+  static void give_up_after(double timeout_s, ResponseSample& sample);
   [[nodiscard]] flow::LatencyEstimate response_of(std::size_t node, std::string_view op) const;
   [[nodiscard]] static flow::LatencyEstimate own_sojourn(const Node& node, std::string_view op);
   [[nodiscard]] static double own_passed(const Node& node, std::string_view op);
@@ -1906,15 +1915,40 @@ std::vector<ResponseSample> Simulation::client_responses(SimTime now) const {
       return hop_delivered(index, target, op);
     };
     for (const auto& [op, offered] : client->offered(now)) {
-      responses.push_back(
-          ResponseSample{.client = index,
-                         .op = op,
-                         .offered = offered,
-                         .answered = Rate{offered.per_second * client->delivered(op, fraction)},
-                         .response = client->response(op, lookup)});
+      ResponseSample sample{.client = index,
+                            .op = op,
+                            .offered = offered,
+                            .answered = Rate{offered.per_second * client->delivered(op, fraction)},
+                            .response = client->response(op, lookup)};
+      if (const auto timeout_s = client->timeout_s()) give_up_after(*timeout_s, sample);
+      responses.push_back(std::move(sample));
     }
   }
   return responses;
+}
+
+// A client's `timeout` (plan 2c Task 13; book ch. 1 and ch. 8: a client does not wait for ever).
+// Of the requests the path delivered, the share whose response time is below the timeout is
+// answered, with the moments of that share alone; the rest are timed out. The response time is
+// the lognormal fitted to the response's mean and variance (queueing::lognormal_below), the same
+// fit the reports read percentiles off. A write at a byte-sized node is answered at its last byte
+// (behaviours::MegabyteService::sojourn), and that is already in `response`, so an upload is timed
+// out on its whole transfer.
+// Only the client gives up: nothing cancels the request at the servers, which still queue and
+// serve it, so their demand and utilisation do not change (the work of a timed-out request is
+// wasted, not saved). Ignored: retries (phase 3) and a request answered after the client left
+// (it counts as timed out, never as answered late).
+void Simulation::give_up_after(double timeout_s, ResponseSample& sample) {
+  const auto below =
+      queueing::lognormal_below(sample.response.mean_s, sample.response.variance_s2, timeout_s);
+  // The timed-out part first and the answered part as what is left, so answered + timed_out is
+  // the delivered rate exactly, and a share answered too small for a double to tell 1 − share
+  // from 1 (under 1.1e-16: unique-id's ids, 126 ms against 50 ms, answer about 5e-21) answers
+  // nothing at all rather than a few requests a year that the table would print latencies for.
+  const double delivered_per_s = sample.answered.per_second;
+  sample.timed_out = Rate{delivered_per_s * (1.0 - below.fraction)};
+  sample.answered = Rate{delivered_per_s - sample.timed_out.per_second};
+  sample.response = {.mean_s = below.mean_s, .variance_s2 = below.variance_s2};
 }
 
 // The node's own sojourn for `op` this step (record_sojourns): a database's write waits at
