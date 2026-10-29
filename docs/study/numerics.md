@@ -121,6 +121,24 @@ median of 2.2 ms (true: 1), a p95 of 22.6 ms (true: 51) and a p99 of 58.9 ms (tr
 Real latency is bimodal and the fit smooths the two modes into one hump; reports
 label the number "estimated" (`src/queueing/queueing.cppm:113`): it is a fit, not a measurement.
 
+A mixture's moments come in two algebraically equal forms. With branch shares p_i, means m_i and
+variances v_i, the mean is Σ p_i m_i and the variance either Σ p_i (v_i + (m_i - mean)^2) (the law
+of total variance: the spread within the branches plus the spread between them) or
+Σ p_i (v_i + m_i^2) - mean^2 (the second moment less the squared mean). The first is a sum of
+non-negative terms; the second subtracts two large numbers when the spread is small against the
+mean (a 12 s upload with a variance of 0.03 s^2: 144.03 - 144.00) and can come out a rounding
+error below zero. `mixture` and the byte-sized node's per-op latency
+(`Simulation::request_weighted_megabyte_sojourn`, two passes over the ops, no allocation) use the
+first. Kingman's formula needs the second form's ingredient instead: a node whose requests take
+different times (a blob store's objects of different sizes, plan 2c) hands its queue the
+**squared coefficient of variation** of the mixture of service times,
+E[S^2] = Σ p_i (1 + cs_i^2) s_i^2 (each branch's second moment is its variance plus its squared
+mean, (1 + cs^2) s^2) and c_s^2 = E[S^2] / E[S]^2 - 1 (`MegabyteService::object_time_moments`).
+There the result is clamped at 0, which only ever removes rounding (one size gives exactly
+E[S^2] = E[S]^2 on paper), and it is large exactly when it matters: 1000 reads/s of 80 us beside
+8 writes/s of 2 s give c_s^2 = 124, which is what keeps the small reads from shrinking the large
+writes' wait.
+
 ## 6. Fluid steps
 
 `FluidQueue::advance` (`src/fluid/fluid.cppm:149-167`) is a forward step in the sense

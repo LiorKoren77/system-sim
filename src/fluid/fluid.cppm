@@ -8,8 +8,8 @@
 // continuous fluid, not individuals. Captured: saturation (backlog grows past capacity),
 // load shedding (drops once the waiting room is full), and the stochastic delay a real
 // node shows below saturation (bunching of random arrivals). Ignored: request sizes (the
-// engine prices them as capacity units and, at a byte-sized node, sets the mean object's
-// service time: set_service_time), priorities, retries, and any per-request identity.
+// engine prices them as capacity units and, at a byte-sized node, sets the moments of its
+// objects' service time: set_service), priorities, retries, and any per-request identity.
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation). Note CLAUDE.md §3: no <chrono> here; time helpers come from simsys.core.
@@ -41,8 +41,9 @@ export namespace simsys::fluid {
 // consistent 2000/s server (s = 0.5 ms) would wait 1.5 ms. `service_rate` must be >= 0.
 // One planned exception, a byte-sized node (plan 2c refinement 2): `service_rate` counts
 // megabytes (MB/s) and c = MB/s × the time of one MB, but `service_time_s` is the mean time one
-// OBJECT holds a server (FluidQueue::set_service_time, from the engine each step), so the rate is
-// MB/s and c / service_time_s is objects/s. The invariant then holds where it matters, in rho:
+// OBJECT holds a server and `service_variability` the squared coefficient of variation of those
+// times over the node's size mix (FluidQueue::set_service, from the engine each step), so the rate
+// is MB/s and c / service_time_s is objects/s. The invariant then holds where it matters, in rho:
 // objects/s × s_obj / c = MB/s × s_MB / c = MB/s / service_rate (Little's law), so the fluid
 // drain and Erlang C see the same utilization and the wait is a whole object's.
 struct Capacity {
@@ -60,6 +61,15 @@ struct Capacity {
   double service_variability{
       1};                // squared coefficient of variation of service time (1 = exponential)
   double burstiness{1};  // squared coefficient of variation of inter-arrival times (1 = Poisson)
+};
+
+// The first two moments of the time one request holds a server, as Kingman's formula reads them:
+// the mean and the squared coefficient of variation (SCV, variance / mean²; 0 = every request
+// takes the same time, 1 = exponential). What a node whose service time moves with its op mix
+// hands its queue each step (FluidQueue::set_service).
+struct ServiceMoments {
+  double mean_s{};
+  double scv{};
 };
 
 enum class Zone { green, yellow, red };
@@ -100,12 +110,14 @@ class FluidQueue {
   // empty (drain = demand = capacity), settle() fills it (the >= below).
   void settle(Rate demand);
 
-  // Replaces the time one request occupies a server, which feeds the Erlang C wait and the
-  // sojourn's service term; the rate, c and the backlog stay. For a node whose mean service time
+  // Replaces the moments of the time one request occupies a server: the mean feeds the Erlang C
+  // wait and the sojourn's service term, the SCV the Allen–Cunneen factor (and the sojourn's
+  // service variance); the rate, c, the room and the backlog stay. For a node whose service time
   // moves with its op mix: a byte-sized node's objects are as long as their sizes (the engine
-  // sets their rate-weighted mean every step; see Capacity's invariant). Throws
-  // std::invalid_argument unless `service_time_s` > 0 (a programmer error).
-  void set_service_time(double service_time_s);
+  // sets their mixture's moments every step; see Capacity's invariant). One call for both, so the
+  // queue never sees a new mean with an old spread. Throws std::invalid_argument unless the mean
+  // is > 0 and the SCV >= 0 (a programmer error).
+  void set_service(ServiceMoments service);
 
   [[nodiscard]] double backlog() const { return backlog_; }
   [[nodiscard]] const Capacity& capacity() const { return capacity_; }
@@ -117,6 +129,7 @@ class FluidQueue {
   [[nodiscard]] double spill_overflow(double dt_s);
   [[nodiscard]] double utilization(double drain_per_s) const;
   [[nodiscard]] double backlog_wait_s() const;
+  [[nodiscard]] double room_drain_s() const;
   [[nodiscard]] flow::LatencyEstimate wait(double rho) const;
   [[nodiscard]] flow::LatencyEstimate sojourn(const flow::LatencyEstimate& waited) const;
   static void require_positive_step(SimTime dt);
@@ -156,12 +169,16 @@ Zone zone_of(double rho, const Capacity& c) {
 //                                                          capacity counts as saturated
 //   k      = variability_factor(burstiness, service_variability)
 //   fluid  = backlog_/cap                                  deterministic drain time
-//   stoch  = k * mmc_wait(c, min(rho, 0.99), s).mean       random bunching of arrivals
+//   room   = queue_limit/cap                               the full waiting room's drain time
+//   stoch  = min(k * mmc_wait(c, min(rho, 0.99), s).mean, room)
+//                                                          random bunching of arrivals, never
+//                                                          longer than the room (M/M/c/K bound)
 //   latency.mean = max(fluid, stoch) + s                   OUR HEURISTIC blend, see sojourn()
-//   latency.var  = k^2 * mmc_wait(...).variance + service_variability * s^2   (always)
-//                  Allen–Cunneen scales the MEAN wait by k. Applying k^2 to the variance is
-//                  OUR OWN HEURISTIC (a scaled random variable has k^2 times the variance);
-//                  no published result is claimed for it.
+//   latency.var  = min(k^2 * mmc_wait(...).variance, room^2/4) + service_variability * s^2
+//                  (always). Allen–Cunneen scales the MEAN wait by k. Applying k^2 to the
+//                  variance is OUR OWN HEURISTIC (a scaled random variable has k^2 times the
+//                  variance); no published result is claimed for it. The room^2/4 cap is
+//                  Popoviciu's inequality, see wait().
 //   zone   = zone_of(rho, capacity_)
 //
 // Conservation: demand*dt = (drain + dropped)*dt + (backlog_after - backlog_before).
@@ -191,12 +208,16 @@ void FluidQueue::settle(Rate demand) {
   backlog_ = demand.per_second >= capacity_.service_rate.per_second ? capacity_.queue_limit : 0.0;
 }
 
-// `!(s > 0)` rather than `s <= 0` so that a NaN is refused too.
-void FluidQueue::set_service_time(double service_time_s) {
-  if (!(service_time_s > 0.0)) {
-    throw std::invalid_argument{"FluidQueue::set_service_time: the time must be > 0"};
+// `!(x > 0)` and `!(x >= 0)` rather than `x <= 0` and `x < 0` so that a NaN is refused too.
+void FluidQueue::set_service(ServiceMoments service) {
+  if (!(service.mean_s > 0.0)) {
+    throw std::invalid_argument{"FluidQueue::set_service: the mean time must be > 0"};
   }
-  capacity_.service_time_s = service_time_s;
+  if (!(service.scv >= 0.0)) {
+    throw std::invalid_argument{"FluidQueue::set_service: the SCV must be >= 0"};
+  }
+  capacity_.service_time_s = service.mean_s;
+  capacity_.service_variability = service.scv;
 }
 
 // `dt.count() <= 0`, not `dt <= SimTime::zero()`: SimTime::zero() is a static member and
@@ -258,6 +279,15 @@ double FluidQueue::backlog_wait_s() const {
   return backlog_ / cap;
 }
 
+// The longest anyone admitted can wait: a FULL waiting room's drain time, queue_limit / cap. A
+// request that finds the room full is dropped (spill_overflow), so one that gets in finds at most
+// queue_limit units ahead of it, drained at cap per second. +inf with no capacity, as above.
+double FluidQueue::room_drain_s() const {
+  const double cap = capacity_.service_rate.per_second;
+  if (cap <= 0.0) return std::numeric_limits<double>::infinity();
+  return capacity_.queue_limit / cap;
+}
+
 // Sojourn time (what the book calls latency) = queueing wait (wait()) + service time
 // (sojourn()), where the queueing wait is the LARGER of two estimates (our heuristic, not a
 // published result):
@@ -265,7 +295,19 @@ double FluidQueue::backlog_wait_s() const {
 //   fluid  backlog_/cap: the deterministic drain time of the backlog (backlog_wait_s()).
 //   stoch  k * M/M/c Wq at min(rho, 0.99): the random bunching of arrivals that a node
 //          shows below saturation; k is the Allen–Cunneen factor (formula block above
-//          advance()). Assumes steady state at that rho.
+//          advance()). Assumes steady state at that rho. Bounded by the room (below).
+//
+// The room bound (review of plan 2c Task 3's fix round, C1) is the M/M/c/K one: a queue with a
+// waiting room of K units turns away whoever finds it full, so a request it admits has at most K
+// units ahead of it and waits at most T = K / cap, the full room's drain time; stoch is
+// min(k * Wq, T). Erlang C at the 0.99 clamp knows no room: with 2 s objects at a 20-slot blob
+// store it says 9.48 s where the 1000 MB room drains in 2 s. It never binds at a node that counts
+// requests with the default room: 1000 requests, ten times the ~100 Erlang C queues at the clamp
+// (Lq = rho^2 / (1 - rho) = 98 at one server; with k = 1, T / clamp >= (1000 s/c) / (100 s/c) =
+// 10), so only a small `queue_limit` or objects of many units meet it. Its variance is bounded the
+// same way: a wait in [0, T] has a variance of at most T^2 / 4 (Popoviciu's inequality on
+// variances), which keeps a bounded wait from carrying the clamp's spread (99.7 s^2 for that blob
+// store, against 1 s^2); at the default room it binds only where k > 5.
 //
 // Why max and not the sum: by Little's law (L = lambda * W) the M/M/1 wait at rho 0.99
 // corresponds to a stochastic queue of ~99 requests (Lq = rho^2/(1 - rho) = 98). Once the fluid
@@ -274,8 +316,8 @@ double FluidQueue::backlog_wait_s() const {
 // formula below saturation (backlog 0), is continuous in the mean, and becomes fluid-only
 // deep in overload.
 //
-// Variance: k^2 * Var(Wq at min(rho, 0.99)) + cs^2 * s^2, ALWAYS, whichever term wins
-// the mean; for exponential service (cs^2 = 1) the second term is s^2. Wait and service
+// Variance: min(k^2 * Var(Wq at min(rho, 0.99)), T^2 / 4) + cs^2 * s^2, ALWAYS, whichever
+// term wins the mean; for exponential service (cs^2 = 1) the second term is s^2. Wait and service
 // are assumed independent, so their variances add. The stochastic variance is kept even
 // when the fluid drain carries the mean, so percentiles stay monotone as overload
 // deepens: dropping it (a "deterministic drain" has no spread) made the estimated p99
@@ -286,11 +328,13 @@ flow::LatencyEstimate FluidQueue::wait(double rho) const {
       queueing::variability_factor(capacity_.burstiness, capacity_.service_variability);
   const auto erlang = queueing::mmc_wait(capacity_.concurrency, std::min(rho, max_stochastic_rho),
                                          capacity_.service_time_s);
+  const double room_s = room_drain_s();
   const double fluid_wait_s = backlog_wait_s();
-  const double stochastic_wait_s = k * erlang.mean_s;
-  // std::max(stochastic, fluid): the stochastic term first, so a NaN in it propagates.
+  // The scaled Erlang terms first in std::min and std::max, so a NaN in them propagates.
+  const double stochastic_wait_s = std::min(k * erlang.mean_s, room_s);
+  const double stochastic_variance_s2 = std::min(k * k * erlang.variance_s2, room_s * room_s / 4.0);
   return flow::LatencyEstimate{.mean_s = std::max(stochastic_wait_s, fluid_wait_s),
-                               .variance_s2 = k * k * erlang.variance_s2};
+                               .variance_s2 = stochastic_variance_s2};
 }
 
 // The wait plus one service time s, its variance cs^2 × s^2 (independent of the wait).
