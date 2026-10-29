@@ -325,16 +325,17 @@ TEST_CASE("book/news-feed's media store is checked against the cdn's 5 percent m
 }
 
 // Ch. 14's YouTube sizes its two CDNs in bytes (`capacity: 100GB/s`, `50GB/s`) and gives them a
-// che hit ratio: valid scenario, explained, and its byte-sized nodes run (plan 2c Task 3), but
-// the engine still refuses it at its first queue, transcode_q: the queues and workers are
-// Tasks 6 and 7. The first refusal is the first node in the YAML whose type the engine does not
-// simulate (original_store, a blob store whose `then` publishes each upload to transcode_q, is
-// simulated since Task 4: its steps are asynchronous event notifications). What
+// che hit ratio: valid scenario, explained, and its byte-sized nodes run (plan 2c Task 3). Since
+// Task 6 its queues and worker pools are simulated too, so the engine refuses it at its first
+// pool WITH `then` steps, transcoders (the node after transcode_q): a pool's `then` steps run in
+// Task 7. (Every type youtube uses is simulated now, so the refusal is the second loop of
+// Simulation::create, the nodes that cannot run yet, in file order: original_store, a blob store
+// whose `then` publishes each upload to transcode_q, runs since Task 4.) What
 // the cdn changed is pinned through explain (review of 4d539b0, M12): the two edges'
 // Che hit ratios (Zipf 1 over 10M videos, 100k and 50k of them at the edge: 0.642 and 0.594,
 // checked against an independent Python computation by the reviewer) and the miss flow they
 // send transcoded_store, which an explain that ignored the origin edge would leave at zero.
-TEST_CASE("book/youtube validates and explains, and the engine refuses it at transcode_q",
+TEST_CASE("book/youtube validates and explains, and the engine refuses it at transcoders",
           "[scenario]") {
   const auto s =
       simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml");
@@ -368,38 +369,42 @@ TEST_CASE("book/youtube validates and explains, and the engine refuses it at tra
                Catch::Matchers::WithinRel(7890.0, 1e-3));
   const auto sim = simsys::engine::Simulation::create(*g);
   REQUIRE_FALSE(sim.has_value());
-  // viewers_us, viewers_eu, cdn_us, cdn_eu, lb, api, metadata_cache, metadata_db, original_store
-  // are all simulated; transcode_q, the next node in the file, is a message queue.
+  // Every node's type is simulated, and transcode_q (a message queue) runs; transcoders, the next
+  // node in the file, is a worker pool whose `then` steps (a 50 MB write to transcoded_store and a
+  // publish to completion_q) run in Task 7.
   REQUIRE(sim.error().message ==
-          "node 'transcode_q' has type 'message_queue', which run/estimate do not support yet "
-          "(phase 2)");
+          "node 'transcoders': a worker pool's then steps run in phase 2c's next step");
 }
 
-// Ch. 15's Google Drive is refused where its first message queue comes, notify_q (the order of the
-// file: lb, api, block_servers, the two stores, the metadata tier, then notify_q). Its blob stores
-// have no `then` steps, so they were never what stopped it; the queue and its two consumer groups
-// are Tasks 6 and 7, and the pin stays until then. A characterisation test: it passed before
-// plan 2c Task 4 too, and pins that the events did not move the refusal.
-TEST_CASE("book/google-drive is refused at notify_q", "[scenario]") {
+// Ch. 15's Google Drive built its graph with the new queue wiring (notify_q's two consumer groups,
+// notification_svc and backup_workers, each consume it and are linked from it), and its queue and
+// pools are simulated since Task 6. The engine now stops at long_poll, its ws_gateway: Simulation::
+// create checks every node's TYPE first (a first loop over the whole file) and only then which
+// nodes of a simulated type cannot run yet (the pools' `then` steps, Task 7), so the first
+// unsimulated type, long_poll (declared after the pools), is the one it names. Phase 3 brings
+// ws_gateway.
+TEST_CASE("book/google-drive is refused at long_poll, its ws_gateway", "[scenario]") {
   const auto g = build_or_fail(
       load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/google-drive/scenario.yaml"));
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
-          "node 'notify_q' has type 'message_queue', which run/estimate do not support yet "
+          "node 'long_poll' has type 'ws_gateway', which run/estimate do not support yet "
           "(phase 2)");
 }
 
-// Ch. 11's news feed gets as far as its fan-out queue: the cdn and the media store (a blob store
-// counting megabytes) are simulated now, so the first node the engine cannot run is fanout_q, a
-// message queue (the second node of the media path used to be the one refused).
-TEST_CASE("book/news-feed is refused at fanout_q, no longer at media_store", "[scenario]") {
+// Ch. 11's news feed: its fan-out queue and pool are simulated since Task 6, and the engine stops
+// at graph_db, its kv_cluster (phase 2c Task 10): the type check runs over the whole file before
+// the pool's `then` steps (Task 7) are looked at, so the first unsimulated type is the one named,
+// though graph_db is declared after the pool (the refusal used to be at fanout_q, before that).
+TEST_CASE("book/news-feed is refused at graph_db, its kv_cluster, no longer at fanout_q",
+          "[scenario]") {
   const auto g = build_or_fail(
       load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml"));
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
-          "node 'fanout_q' has type 'message_queue', which run/estimate do not support yet "
+          "node 'graph_db' has type 'kv_cluster', which run/estimate do not support yet "
           "(phase 2)");
 }
 

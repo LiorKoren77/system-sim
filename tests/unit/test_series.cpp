@@ -1026,3 +1026,41 @@ TEST_CASE("the tutorial chain's series are byte for byte what they were before l
   REQUIRE(fnv1a(nodes_out.str()) == 0x3d3a6ed1d31da525ULL);
   REQUIRE(fnv1a(ops_out.str()) == 0x9dfc7de84e1afe59ULL);
 }
+
+// ---- explain on youtube: a pool's capacity is workers / cost (plan 2c Task 6) ----
+//
+// The line of the nodes block that starts, after its indent, with `id`.
+namespace {
+std::string node_line_of(const std::string& text, const std::string& id) {
+  const auto at = text.find("\n  " + id + " ", text.find("nodes:"));
+  if (at == std::string::npos) return {};
+  return text.substr(at + 1, text.find('\n', at + 1) - at - 1);
+}
+}  // namespace
+
+// transcoders: 400 workers at 60 s a video = 400 / 60 s = 6.667 videos/s (it was the worker_pool
+// type's default 1k/s: 2 ms at c = 2). completion_handler: 4 workers at 5 ms = 4 / 0.005 s = 800/s.
+// The marks about load not followed through the queues stay until Task 7: only the capacity
+// figure moves here (README and schema quote `transcoders  peak offered 0/s vs 6.667/s`).
+TEST_CASE("explain checks youtube's transcoders against workers over cost: 6.667 a second",
+          "[series]") {
+  const auto text = explain_shipped("youtube");
+  CAPTURE(text);
+  const auto transcoders = check_line(text, "transcoders");
+  REQUIRE(transcoders.contains("vs 6.667/s total capacity"));
+  REQUIRE_FALSE(transcoders.contains("vs 1k/s"));
+  const auto handler = check_line(text, "completion_handler");
+  REQUIRE(handler.contains("vs 800/s total capacity"));
+}
+
+// What the nodes block says about youtube's queue and pool: 400 transcoders of 60 s a job
+// (`cost=1m`), 32 partitions on transcode_q, and no retention stated, so Kafka's default.
+TEST_CASE("explain describes youtube's transcode queue and transcoders", "[series]") {
+  const auto text = explain_shipped("youtube");
+  CAPTURE(text);
+  REQUIRE(node_line_of(text, "transcoders")
+              .contains("workers=400 cost=1m (capacity 6.667/s: workers / cost)"));
+  const auto queue = node_line_of(text, "transcode_q");
+  REQUIRE(queue.contains("retention=7d (default: Kafka's 168 h)"));
+  REQUIRE(queue.contains("partitions=32 (not modelled)"));
+}
