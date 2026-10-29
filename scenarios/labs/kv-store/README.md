@@ -19,7 +19,7 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
 - **Write and read amplification.** The coordinator sends every request to all N = 3 replicas
   of its key (ch. 6, "quorum consensus"), so the 30k requests/s are **90k replica-requests/s**
   for the machines. `explain`:
-  `store  peak offered 90k/s (30k/s × N 3) vs 160k/s (16 nodes)  (hottest 60.8%, green)`.
+  `store  peak offered 90k/s (30k/s × N 3) vs 160k/s (16 nodes)  (hottest 60.9%, green)`.
 - **The ring's hot machine.** Each machine holds the keys of the arcs before its virtual nodes,
   three times over (it is one of the three successive replicas of each), so its share of the
   load is a sum of 3 × 150 arcs and spreads about 1/sqrt(450) around the average. The hottest of
@@ -62,7 +62,11 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   spread is ignored), and which keys are hot is ignored (the clients' Zipf keys matter to caches,
   not to the ring's arcs).
 - A request that lost a replica-request but still met its quorum is timed as if all three
-  replied (its quorum would in fact wait for a later reply).
+  replied (its quorum would in fact wait for a later reply). Only the overloaded settings below
+  lose replica-requests, and there it costs little: a Monte Carlo of the store's second reply over
+  the answered requests at `nodes: 8` gives a mean 1.6 % higher and a p99 of 123 ms instead of
+  116 ms, about +6 ms on the p99 (at `nodes: 4`, +4.6 % and +9.8 %), a tail the clients' 100 ms
+  timeout cuts off there anyway.
 
 ## Things to try
 - `nodes: 8`, the book's size: 90k replica-requests/s over 80k/s, 11.25k/s per machine on
@@ -93,10 +97,14 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   request is lost: the quorum hides the hot machine, which is why Dynamo answers at W or R of
   N replies and not at the slowest. Add `write_quorum: 3` and it no longer does: a `put` waits
   for every replica, the full queue included, and loses what the hot machine drops: 4.6 % of the
-  puts (8.59k of 9k delivered). The slow ones meet the 100 ms timeout: 638/s time out, 7.95k/s
-  are answered, mean 29.4 ms, p95 and p99 `>100ms`: 7.43 % of the delivered puts timed out, so
-  the p99 SLO fails at the timeout (`7.43% of delivered requests timed out (more than 1%)`; 39.6 ms
-  and 233 ms before the timeout applied).
+  puts (8.59k of 9k delivered). The sets that hold the hot machine are 0.379 of the puts offered
+  but, losing more, only 0.349 of those delivered; they answer in about 100 ms (its full room),
+  the all-cool sets in 0.6 ms, so a delivered put takes 36.7 ms on average, p99 227 ms, before
+  the timeout. The slow ones meet the 100 ms timeout: 569/s time out, 8.02k/s are answered, mean
+  27.2 ms, p95 and p99 `>100ms`: 6.62 % of the delivered puts timed out, so the p99 SLO fails at
+  the timeout (`6.62% of delivered requests timed out (more than 1%)`). (Weighting the two sets
+  by the puts offered, the lost ones included, gave 7.43 % timed out and a mean of 29.4 ms, 39.6
+  ms and 233 ms without the timeout, before the review of Task 11.)
 - `write_quorum: 3, read_quorum: 1`: a `put` waits for the slowest of three replicas and a `get`
   for the fastest: `put` 1.87 ms (p99 3.3 ms), `get` 1.4 ms (p99 2.05 ms).
   `write_quorum: 1, read_quorum: 3` swaps them. The load does not change. `explain` marks either

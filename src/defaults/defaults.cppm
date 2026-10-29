@@ -187,7 +187,7 @@ struct TypeDefaults {
       return {Rate{blob_store_byte_rate.bytes_per_second / byte_unit},
               SimTime{t.disk_read_1mb.count() + t.network_read_1mb.count()}};
     case search_index:
-      return {Rate{5'000}, 5_ms};  // chosen: an inverted-index query
+      return {Rate{5'000}, 5_ms};  // chosen: a prefix lookup in a trie, top k read (ch. 13)
     case ws_gateway:
       return {Rate{50'000}, 100_us};  // chosen: relaying one frame
     case service_discovery:

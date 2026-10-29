@@ -133,7 +133,9 @@ enum class SloStatus { pass, fail, skipped };
 // step: skipped.
 // `note` says why a verdict is not what `observed` against `max` alone would give: a staleness SLO
 // fails on a database whose replicas fall behind without bound ("each replica misses 66.67/s of
-// 400/s committed writes (16.7%)"), whatever its mean staleness. Empty otherwise.
+// 400/s committed writes (16.7%)"), whatever its mean staleness; a latency SLO does not read an op
+// whose requests were all lost ("nobody answered c.op: no latency to observe"), and is skipped when
+// it reads only such ops. Empty otherwise.
 // An SLO with `over` (plan 2c Task 14) is judged by its worst window (Summary::windowed_verdict):
 // `observed`, `status` and `note` are that window's, and `window_start` says where it starts,
 // counted from the start of the run (warmup included, the clock a scenario's `at:` uses). Empty

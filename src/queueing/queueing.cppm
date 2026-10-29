@@ -17,6 +17,7 @@ module;
 #include <functional>
 #include <limits>
 #include <numbers>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <type_traits>
@@ -419,9 +420,9 @@ struct FittedReplicas {
   LognormalFit fit;
 };
 
-// A replica that answers at all: a finite, positive mean and a finite variance. (One of mean 0
-// answers at once; one without a finite moment never does.)
-[[nodiscard]] bool answers_in_time(const ReplicaGroup& group) {
+// A replica that answers eventually, after some time: a finite, positive mean and a finite
+// variance. (One of mean 0 answers at once; one without a finite moment never does.)
+[[nodiscard]] bool answers_eventually(const ReplicaGroup& group) {
   return group.replicas > 0 && group.sojourn.mean_s > 0.0 && std::isfinite(group.sojourn.mean_s) &&
          std::isfinite(group.sojourn.variance_s2);
 }
@@ -434,9 +435,14 @@ struct FittedReplicas {
   return std::isnan(group.sojourn.mean_s) || std::isnan(group.sojourn.variance_s2);
 }
 
-[[nodiscard]] int replicas_in(std::span<const ReplicaGroup> groups) {
+// The replicas of all the groups, fitted (FittedReplicas) or not (ReplicaGroup).
+// C++20 abbreviated function template with a constrained placeholder: `const
+// std::ranges::input_range auto&` makes this a template over any range (a span, a vector) without
+// a `template <class R>` head, and the concept rejects a non-range at the call. Replaces one
+// overload per group type, or a template whose misuse fails inside the loop.
+[[nodiscard]] int replicas_in(const std::ranges::input_range auto& groups) {
   int replicas = 0;
-  for (const ReplicaGroup& group : groups) replicas += group.replicas;
+  for (const auto& group : groups) replicas += group.replicas;
   return replicas;
 }
 
@@ -444,7 +450,7 @@ struct FittedReplicas {
 [[nodiscard]] std::vector<FittedReplicas> fitted_answering(std::span<const ReplicaGroup> groups) {
   std::vector<FittedReplicas> fitted;
   for (const ReplicaGroup& group : groups) {
-    if (!answers_in_time(group)) continue;
+    if (!answers_eventually(group)) continue;
     LognormalFit fit = lognormal_fit(group.sojourn.mean_s, group.sojourn.variance_s2);
     fit.sigma = std::max(fit.sigma, min_sigma);
     fitted.push_back({.replicas = group.replicas, .fit = fit});
@@ -543,8 +549,12 @@ export namespace simsys::queueing {
 //   S_k(t) = P(X > t) = P(fewer than k successes),  replica i succeeding with F_i(t) = P(X_i <= t)
 // the Poisson-binomial above over the groups, and the moments are E[X] = ∫ S_k dt and E[X^2] =
 // ∫ 2 t S_k dt (moments_from_survival, on a grid even in ln t that spans every group's fit to
-// 8 sigma, sigma / 2 apart: under 1e-8 relative error for sojourn SCVs up to 10, see
-// docs/study/numerics.md). Where exponential_order_statistic needs every replica alike and
+// 8 sigma, sigma / 2 apart: one lognormal comes back to its own moments within 1e-8 relative for a
+// sojourn SCV of at most 10, and no further: 1.1e-7 on the variance at SCV 20, 1.7e-6 at 50; see
+// docs/study/numerics.md). The bound holds while the grid keeps its sigma / 2 step: a very narrow
+// group (sigma clamped to 0.001) beside a wide one (SCV 10) needs more than its 4000 points, the
+// step widens, and the error grows to 8.4e-4 on the mean and 1.4e-3 on the variance (review of
+// plan 2c Task 11, minors 6 and 7). Where exponential_order_statistic needs every replica alike and
 // exponential, this takes the replicas as they are: a hot machine beside cool ones, each with its
 // own spread. Assumes the replicas' times are independent (one hot queue serves many keys, so
 // they are not quite) and that a lognormal of the right mean and variance has the right shape (an
@@ -569,9 +579,7 @@ export namespace simsys::queueing {
   }
   if (quorum <= 0) return {.mean_s = 0.0, .variance_s2 = 0.0};
   const auto fitted = detail::fitted_answering(groups);
-  int answering = 0;
-  for (const auto& group : fitted) answering += group.replicas;
-  if (quorum > answering) return {.mean_s = inf, .variance_s2 = inf};
+  if (quorum > detail::replicas_in(fitted)) return {.mean_s = inf, .variance_s2 = inf};
   return detail::integrate_quorum(fitted, quorum);
 }
 

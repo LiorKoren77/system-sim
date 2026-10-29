@@ -1159,10 +1159,15 @@ void apply_database_keys(ResolvedNode& node) {
 //        that grows with M (0 for one machine, 1.05 for 4, 1.77 for 16, 2.58 for 128)
 //   M / N  the cap: a machine holds a key at most once, so it is sent at most every request
 // A heuristic, not a theorem (shares are not quite normal nor independent: they sum to N), checked
-// against Monte Carlo rings (docs/study/numerics.md): N = 3, v = 150, the expected hottest over the
-// average is 1.073, 1.091 and 1.133 for 8, 16 and 128 machines where k gives 1.068, 1.083 and
-// 1.122; one copy over 4 servers at v = 150, 1.086 against 1.086. The old 1 + 1 / sqrt(v) ignored M
-// (it is the k of one standard deviation) and understated the hot spot beyond about 16 machines.
+// against Monte Carlo rings (docs/study/numerics.md, section 8): N = 3, v = 150, the expected
+// hottest over the average is 1.073, 1.091 and 1.133 for 8, 16 and 128 machines where k gives
+// 1.068, 1.083 and 1.122; one copy over 4 servers at v = 150, 1.086 against 1.086. Its limit:
+// within about 1 % at v >= 100, but at v = 1 a machine's share is a few whole arcs, far from
+// normal, and k is off by up to ±16 % (one copy over 2 machines: exactly 1.5 against k = 1.589;
+// three copies over 8 machines: 1.616 against 1.828; over 128: 2.943 against 2.492). One formula
+// is kept for every v (review of plan 2c Task 11, I-3): v = 1 is an experiment that shows an
+// uneven ring, and its verdicts hold either way. The old 1 + 1 / sqrt(v) ignored M (it is the k of
+// one standard deviation) and understated the hot spot beyond about 16 machines.
 [[nodiscard]] double ring_imbalance(int machines, int copies_per_key, int vnodes) {
   if (machines <= 1) return 1.0;  // one machine carries exactly the average
   const double spread = 1.0 / std::sqrt(static_cast<double>(copies_per_key) * vnodes);
@@ -3515,12 +3520,13 @@ Graph::Result Graph::check_forwarded_ops(std::size_t node) {
 //    so no replica idles while another has a queue. Idealised as join-the-shortest-queue:
 //    the replicas behave as ONE pool of N × c servers (M/M/(c·N)), `pooled`.
 //  - consistent_hash with v virtual nodes per server -> imbalanced: keys land on ring arcs
-//    of uneven length, so some replica holds more than 1/N of the keys (book ch. 5: the
-//    standard deviation of the load is about 10% of the mean at 100 vnodes, 5% at 200). The
-//    engine models the HOTTEST replica apart from the cooler ones, and needs its share:
-//      imbalance k = 1 + z_N / sqrt(v)       (ring_imbalance with one copy per key; z_N the
-//                                             expected maximum of N standard normals)
-//    4 replicas: v = 100: 1.105; v = 150: 1.086; v = 1: 2.049. Capped at N (a single replica
+//    of uneven length, so some of the M replicas holds more than 1/M of the keys (book ch. 5:
+//    the standard deviation of the load is about 10% of the mean at 100 vnodes, 5% at 200).
+//    The engine models the HOTTEST replica apart from the cooler ones, and needs its share:
+//      imbalance k = 1 + z_M / sqrt(v)       (ring_imbalance with one copy per key; z_M the
+//                                             expected maximum of M standard normals, M the
+//                                             replicas behind the balancer: its ring's machines)
+//    4 replicas: v = 100: 1.105; v = 150: 1.086; v = 1: 2.049. Capped at M (a single replica
 //    is the average). ring_imbalance has the derivation, its limits and its Monte Carlo check;
 //    a kv_cluster's own ring uses the same function, so the two agree.
 // A drained route (weight 0) sends the target nothing and imposes no model. A node behind
@@ -3570,8 +3576,8 @@ Graph::Result Graph::mark_balanced_targets() {
       if (replica_model == ReplicaModel::pooled) target.pooled = true;
       if (replica_model == ReplicaModel::imbalanced) {
         target.keys_partitioned = true;  // each key hashes to one replica
-        // Imbalance factor 1 + z_N/sqrt(v) (see the function comment), at most N: the hottest
-        // of N replicas cannot carry more than all of the demand, and one replica alone
+        // Imbalance factor 1 + z_M/sqrt(v) (see the function comment), at most M: the hottest
+        // of M replicas cannot carry more than all of the demand, and one replica alone
         // carries exactly the average (factor 1). One copy of each key on a balancer's ring.
         const double factor = ring_imbalance(target.spec.replicas, 1, vnodes);
         target.imbalance = std::max(target.imbalance, factor);
