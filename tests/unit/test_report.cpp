@@ -1777,3 +1777,100 @@ TEST_CASE("explain prints a stated retention without the default tag", "[report]
   REQUIRE(line.contains("retention=10s"));
   REQUIRE_FALSE(line.contains("Kafka"));
 }
+
+// ---- explain's paper load follows queues and pools (plan 2c Task 7) ----
+//
+// The paper load is the peak offered load, forwarded along the graph with no queueing. Since
+// Task 7 it follows a message queue into its consumers and a worker pool's `then` steps (each job
+// it is OFFERED: the paper load does not queue, so a pool offered more than its capacity still
+// passes all of it on), instead of marking everything behind them "load not propagated".
+//
+// Picture: u sends `rate`/s of `publish` to q; pool w (12 workers at 10 ms = 1.2k jobs/s) drains
+// q and, per job, sends 4 `work` requests to svc (a 10k/s service) and one `publish` to done_q,
+// which pool w2 (10 workers at 5 ms = 2k jobs/s) drains.
+
+namespace {
+Scenario queue_pool_chain(double rate) {
+  Scenario s{.name = "paper-chain", .version = 1, .duration = 1min};
+  NodeSpec pool{.id = "w",
+                .type = NodeType::worker_pool,
+                .then = {Step{.to = "svc", .op = "work", .factor = 4.0},
+                         Step{.to = "done_q", .op = "publish"}}};
+  pool.consumes = "q";
+  pool.workers = 12;
+  pool.job_cost = 10ms;
+  NodeSpec done_pool{.id = "w2", .type = NodeType::worker_pool};
+  done_pool.consumes = "done_q";
+  done_pool.workers = 10;
+  done_pool.job_cost = 5ms;
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload =
+                          Workload{.curve = {.base = Rate{rate}}, .op_shares = {{"publish", 1.0}}}},
+             NodeSpec{.id = "q", .type = NodeType::message_queue},
+             std::move(pool),
+             NodeSpec{.id = "svc", .type = NodeType::service, .capacity = Rate{10'000}},
+             NodeSpec{.id = "done_q", .type = NodeType::message_queue},
+             std::move(done_pool)};
+  s.links = {LinkSpec{.from = "u", .to = "q"}, LinkSpec{.from = "q", .to = "w"},
+             LinkSpec{.from = "w", .to = "svc"}, LinkSpec{.from = "w", .to = "done_q"},
+             LinkSpec{.from = "done_q", .to = "w2"}};
+  return s;
+}
+}  // namespace
+
+// 100/s into q: q 100/s of 1M/s; w 100/s of 1.2k/s (100 / 1200 = 8.33 %); svc 100 x 4 = 400/s of
+// 10k/s (4 %); done_q 100/s of 1M/s; w2 100/s of 2k/s (5 %). Every node has a verdict, none a
+// mark.
+TEST_CASE("explain follows a queue into its pool and the pool's then steps into their targets",
+          "[report]") {
+  const auto text = explain_of(queue_pool_chain(100));
+  CAPTURE(text);
+  REQUIRE_FALSE(text.contains("load not propagated"));
+  REQUIRE(check_line(text, "q").contains("peak offered 100/s vs 1M/s total capacity"));
+  REQUIRE(check_line(text, "w").contains(
+      "peak offered 100/s vs 1.2k/s total capacity  (8.33%, green)"));
+  REQUIRE(
+      check_line(text, "svc").contains("peak offered 400/s vs 10k/s total capacity  (4%, green)"));
+  REQUIRE(check_line(text, "done_q").contains("peak offered 100/s vs 1M/s total capacity"));
+  REQUIRE(
+      check_line(text, "w2").contains("peak offered 100/s vs 2k/s total capacity  (5%, green)"));
+}
+
+// 2000/s into a pool of 1.2k/s: 2000 / 1200 = 167 %, red. The paper load does not queue, so the
+// pool is offered, and passes on, all 2000 jobs/s: svc is offered 2000 x 4 = 8000/s of 10k/s
+// (80 %), done_q 2000/s and w2 2000/s of 2k/s (100 %). (What the engine sends on is what the pool
+// drained, 1.2k/s: Task 7's theory tests. Explain is the no-queue bound, "can this ever fit".)
+TEST_CASE("explain passes a saturated pool's whole arrival on: the paper load does not queue",
+          "[report]") {
+  const auto text = explain_of(queue_pool_chain(2000));
+  CAPTURE(text);
+  REQUIRE(
+      check_line(text, "w").contains("peak offered 2k/s vs 1.2k/s total capacity  (167%, red)"));
+  REQUIRE(check_line(text, "svc").contains("peak offered 8k/s vs 10k/s total capacity"));
+  REQUIRE(check_line(text, "w2").contains("peak offered 2k/s vs 2k/s total capacity"));
+}
+
+// The mark that remains is for the types with no phase yet: a pool's target behind a notification
+// fan-out is marked by the fan-out alone, and the mark does not name the queue or the pool on the
+// way (they are followed now). The fixture is the one the lower-bound cases use: the fan-out's
+// `then` sends to q, whose pool w sends on to svc.
+TEST_CASE("a node behind a notification fan-out and a queue and pool is marked by the fan-out only",
+          "[report]") {
+  auto s = queue_pool_chain(100);
+  s.nodes[0].workload->op_shares = {{"fire", 1.0}};
+  s.nodes.insert(s.nodes.begin() + 1, NodeSpec{.id = "fan",
+                                               .type = NodeType::notification_fanout,
+                                               .then = {Step{.to = "q", .op = "publish"}}});
+  s.links[0] = LinkSpec{.from = "u", .to = "fan"};
+  s.links.push_back(LinkSpec{.from = "fan", .to = "q"});
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  for (const auto* id : {"q", "w", "svc", "done_q", "w2"}) {
+    CAPTURE(id);
+    const auto line = check_line(text, id);
+    REQUIRE(line.contains("(load not propagated: notification_fanout is not modelled yet)"));
+    REQUIRE_FALSE(line.contains("worker_pool"));
+    REQUIRE_FALSE(line.contains("message_queue"));
+  }
+}

@@ -2515,6 +2515,154 @@ TEST_CASE("a queue's pool keeps a same-op size on its then step and uses a renam
   REQUIRE_THAT(bytes_required(*built, "renditions", "write"), WithinRel(5e7, 1e-12));
 }
 
+// ---- A worker pool's then steps (plan 2c refinement 5, Task 7) ----
+//
+// A pool's `then` steps are the work each DRAINED job hands on (book ch. 14: a transcoding worker
+// writes its renditions and publishes a completion message), resolved like a cache's unconditional
+// steps: demand edges to their targets, a share of 1 whatever op the pool's queue brought (every
+// drained job fires every step), the step's own `size:` or, for a same-op step, the job's size.
+// `on: miss` and `on: failure` are refused as a blob store's are: a pool has no lookup to miss, and
+// a job reports no failure before phase 3.
+
+namespace {
+// u (publishes `publish`, 8/s) -> q -> w (consumes q; `then`) -> {store (a default blob store),
+// done_q} and done_q -> w2. Node indices: u 0, q 1, w 2, store 3, done_q 4, w2 5.
+Scenario pool_handing_on(std::vector<Step> then,
+                         NodeSpec u = client("u", Rate{8}, {{"publish", 1.0}})) {
+  Scenario s{.name = "pool-then", .version = 1, .duration = 1min};
+  s.nodes = {std::move(u),         message_queue("q"),      worker_pool("w", std::move(then), "q"),
+             default_blob_store(), message_queue("done_q"), worker_pool("w2", {}, "done_q")};
+  s.links = {LinkSpec{.from = "u", .to = "q"}, LinkSpec{.from = "q", .to = "w"},
+             LinkSpec{.from = "w", .to = "store"}, LinkSpec{.from = "w", .to = "done_q"},
+             LinkSpec{.from = "done_q", .to = "w2"}};
+  return s;
+}
+
+const std::vector<Step> renditions_and_completion{
+    Step{.to = "store", .op = "write", .factor = 4.0, .size = simsys::Bytes{50e6}},
+    Step{.to = "done_q", .op = "publish"}};
+}  // namespace
+
+TEST_CASE("a worker pool's then steps are demand edges to their targets", "[graph]") {
+  const auto built = Graph::build(pool_handing_on(renditions_and_completion));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto pool = *built->index_of("w");
+  for (const auto* target : {"store", "done_q"}) {
+    CAPTURE(target);
+    const auto to = *built->index_of(target);
+    const auto link = built->demand_link(pool, to);
+    REQUIRE(link.has_value());
+    REQUIRE(
+        std::ranges::contains(built->edges(), DemandEdge{.from = pool, .to = to, .link = *link}));
+  }
+  // The ops that arrive are the steps' own, once each: `write` at the store, `publish` at done_q.
+  const std::vector<std::string> writes{"write"};
+  REQUIRE(std::ranges::equal(built->arriving_ops(*built->index_of("store")), writes));
+  const std::vector<std::string> publishes{"publish"};
+  REQUIRE(std::ranges::equal(built->arriving_ops(*built->index_of("done_q")), publishes));
+}
+
+// Every drained job fires every unconditional step, whatever op the queue brought it under: the
+// share is 1 for `publish`, the op this scenario publishes, and for any other op too (unlike a
+// blob store's steps, which fire for its writes only). A characterisation test of Task 6's graph:
+// the share was already 1 before the steps ran.
+TEST_CASE("a worker pool's then step takes a share of 1 of every job it drains", "[graph]") {
+  const auto built = Graph::build(pool_handing_on(renditions_and_completion));
+  REQUIRE(built.has_value());
+  const auto pool = *built->index_of("w");
+  for (const auto& step : built->nodes()[pool].spec.then) {
+    CAPTURE(step.to);
+    REQUIRE(built->then_fraction(pool, step, "publish") == 1.0);
+    REQUIRE(built->then_fraction(pool, step, "audit") == 1.0);
+  }
+}
+
+// The step's `size:` is the write's 50 MB = 5e7 B at the byte-sized store, where the renamed op
+// would otherwise be unsized and refused; the completion message states none and the client's
+// `publish` is unsized, so done_q's `publish` has no size (it counts requests, not bytes).
+TEST_CASE("a worker pool's then step is sized by its own size at the store", "[graph]") {
+  const auto built = Graph::build(pool_handing_on(renditions_and_completion));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE_THAT(bytes_required(*built, "store", "write"), WithinRel(5e7, 1e-12));
+  REQUIRE_FALSE(request_bytes_at(*built, "done_q", "publish").has_value());
+}
+
+// A same-op step carries the size the job came with: the client's 2 KB `publish` goes through the
+// queue and into the pool, and the pool's own `publish` step to done_q still weighs 2 KB = 2e3 B.
+TEST_CASE("a worker pool's same-op then step inherits the size of the job it drains", "[graph]") {
+  const auto built = Graph::build(pool_handing_on(
+      {Step{.to = "done_q", .op = "publish"}}, sized_client("u", "publish", simsys::Bytes{2e3})));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE_THAT(bytes_required(*built, "w", "publish"), WithinRel(2e3, 1e-12));
+  REQUIRE_THAT(bytes_required(*built, "done_q", "publish"), WithinRel(2e3, 1e-12));
+}
+
+// Nobody waits on a pool: the hop into it from its queue is asynchronous (Task 6). Its own
+// then-hops are ordinary hops from its point of view, not asynchronous hops: what a pool hands on
+// is not an event nobody waits for but a call the pool makes (and the engine's backward pass
+// never asks, because no one waits for the pool: its response stays its own).
+TEST_CASE("the queue's hop into a pool is asynchronous and the pool's own then hops are not",
+          "[graph]") {
+  const auto built = Graph::build(pool_handing_on(renditions_and_completion));
+  REQUIRE(built.has_value());
+  const auto queue = *built->index_of("q");
+  const auto pool = *built->index_of("w");
+  REQUIRE(built->is_async_hop(queue, "publish", pool, "publish"));
+  REQUIRE_FALSE(built->is_async_hop(pool, "publish", *built->index_of("store"), "write"));
+  REQUIRE_FALSE(built->is_async_hop(pool, "publish", *built->index_of("done_q"), "publish"));
+}
+
+// `on: miss` names a cache's miss; a pool has no lookup. Refused at build, with the reason, in
+// the blob store's words (a pool's steps fire for every job it drains).
+TEST_CASE("an on-miss then step on a worker pool is refused", "[graph]") {
+  const auto built = Graph::build(
+      pool_handing_on({Step{.to = "done_q", .op = "publish", .on = StepCondition::miss}}));
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'w': a worker pool's then steps fire for every job it drains "
+          "(on: miss needs a cache)");
+}
+
+TEST_CASE("an on-miss step after an always step on a worker pool is refused too", "[graph]") {
+  const auto built = Graph::build(
+      pool_handing_on({Step{.to = "done_q", .op = "publish"},
+                       Step{.to = "done_q", .op = "audit", .on = StepCondition::miss}}));
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'w': a worker pool's then steps fire for every job it drains "
+          "(on: miss needs a cache)");
+}
+
+// `on: failure` names a failed job's branch. A job reports no failure before phase 3 (external
+// sinks that fail and retries), so the step would never fire: refused at build, as `on: miss` is.
+TEST_CASE("an on-failure then step on a worker pool is refused", "[graph]") {
+  const auto built = Graph::build(
+      pool_handing_on({Step{.to = "done_q", .op = "publish", .on = StepCondition::failure}}));
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'w': a worker pool's then steps fire for every job it drains "
+          "(on: failure: a job reports no failure before phase 3)");
+}
+
+// Parallel is fine on a pool (unlike a blob store's event): nobody waits for either, but a
+// scenario may group the hand-offs as it likes (a transcoder writes its renditions beside its
+// completion message), and both steps fire.
+TEST_CASE("a parallel then group on a worker pool builds and fires both steps", "[graph]") {
+  const auto built = Graph::build(pool_handing_on(
+      {Step{.to = "store", .op = "write", .mode = StepMode::parallel, .size = simsys::Bytes{50e6}},
+       Step{.to = "done_q", .op = "publish", .mode = StepMode::parallel}}));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto pool = *built->index_of("w");
+  REQUIRE(built->demand_link(pool, *built->index_of("store")).has_value());
+  REQUIRE(built->demand_link(pool, *built->index_of("done_q")).has_value());
+  REQUIRE_FALSE(built->arriving_ops(*built->index_of("store")).empty());
+  REQUIRE_FALSE(built->arriving_ops(*built->index_of("done_q")).empty());
+}
+
 // A request of 0 bytes costs 0 megabytes: a byte-sized node would serve infinitely many of them
 // per second and divide by zero to say so. The loader refuses `0B` in `sizes:` and `size:`; the
 // graph refuses it too, for a scenario built in code.

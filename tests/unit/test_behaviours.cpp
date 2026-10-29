@@ -1798,8 +1798,8 @@ TEST_CASE("a byte-sized cdn still forwards its miss share of the requests", "[be
 // message is appended, so the broker's response is its own append sojourn and nobody downstream is
 // asked; the message then goes to EVERY consumer group, each of which reads all of it (a copy per
 // group, not a split), under the op name it arrived with. The worker pool drains its group's
-// messages; its `then` steps arrive in Task 7, so today it forwards nothing. Every message and
-// every job costs one unit.
+// messages and hands each drained job on along its `then` steps (Task 7, further down). Every
+// message and every job costs one unit.
 
 namespace {
 // u (publishes `publish` messages) -> q -> {w1, w2}, zero-latency links, each pool consuming q.
@@ -1893,8 +1893,8 @@ TEST_CASE("a message queue's response is the append alone and asks no consumer",
   REQUIRE_FALSE(asked_for_delivery);
 }
 
-// Task 6's pool has no `then` steps: it drains its jobs and sends nothing on (Task 7 adds the
-// steps). Every job it is sent is served here.
+// A pool with no `then` steps drains its jobs and sends nothing on (Task 6; the steps are the
+// section at the end of this file). Every job it is sent is served here.
 TEST_CASE("a worker pool without then steps serves every job and forwards nothing",
           "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(queue_with_two_groups());
@@ -1920,4 +1920,116 @@ TEST_CASE("a worker pool's response and delivered share are its own sojourn and 
   REQUIRE_FALSE(asked);
   REQUIRE_THAT(pool.delivered("publish", 0.75, [](std::size_t, std::string_view) { return 0.1; }),
                WithinRel(0.75, 1e-12));
+}
+
+// ---- A worker pool forwards its then steps per drained job (plan 2c refinement 5, Task 7) ----
+//
+// A transcoding worker, once it has finished a job, writes the renditions and publishes a
+// completion message (book ch. 14): each `then` step fires for every job the pool DRAINS, times
+// its `factor`, under the step's own op name, whatever op the queue brought the job under (unlike
+// a blob store's events, which fire for writes only). The behaviour is handed what the engine's
+// fluid queue drained (`in`) and forwards that; the engine's saturation (drained, not arrived) is
+// the theory tests'. Its response and delivered share stay its own: nobody waits for a pool.
+
+namespace {
+// u (publishes `publish`) -> q -> w (4 workers at 5 ms, consuming q, `then` as given) -> {svc,
+// audit}, over zero-latency links. Node indices: u 0, q 1, w 2, svc 3, audit 4.
+Scenario pool_with_then(std::vector<Step> then) {
+  Scenario s{.name = "pool-then", .version = 1, .duration = 1min};
+  NodeSpec pool{.id = "w", .type = NodeType::worker_pool, .then = std::move(then)};
+  pool.consumes = "q";
+  pool.workers = 4;
+  pool.job_cost = 5ms;
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"publish", 1.0}}}},
+      NodeSpec{.id = "q", .type = NodeType::message_queue}, std::move(pool),
+      NodeSpec{.id = "svc", .type = NodeType::service},
+      NodeSpec{.id = "audit", .type = NodeType::service}};
+  s.links = {LinkSpec{.from = "u", .to = "q", .latency = 0s},
+             LinkSpec{.from = "q", .to = "w", .latency = 0s},
+             LinkSpec{.from = "w", .to = "svc", .latency = 0s},
+             LinkSpec{.from = "w", .to = "audit", .latency = 0s}};
+  return s;
+}
+}  // namespace
+
+// 2 jobs/s drained, 2 x 4 = 8 `work` requests/s to svc (factor 4) and 2 `log`/s to audit, each
+// under its own step's op. The pool still serves its own jobs (`served` is the whole input).
+TEST_CASE("a worker pool forwards each drained job's then steps times their factor",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(pool_with_then(
+      {Step{.to = "svc", .op = "work", .factor = 4.0}, Step{.to = "audit", .op = "log"}}));
+  const WorkerPoolBehaviour pool{g, *g.index_of("w")};
+  const auto routed = pool.route(flow_of("publish", 2), 0s, 100ms);
+  REQUIRE(routed.outgoing.size() == 2);
+  const auto to_svc = sent_to(routed, *g.index_of("svc"));
+  REQUIRE_THAT(to_svc.rate_of("work").per_second, WithinRel(8.0, 1e-12));
+  REQUIRE_THAT(to_svc.total().per_second, WithinRel(8.0, 1e-12));
+  const auto to_audit = sent_to(routed, *g.index_of("audit"));
+  REQUIRE_THAT(to_audit.rate_of("log").per_second, WithinRel(2.0, 1e-12));
+  REQUIRE_THAT(to_audit.total().per_second, WithinRel(2.0, 1e-12));
+  REQUIRE_THAT(routed.served.rate_of("publish").per_second, WithinRel(2.0, 1e-12));
+  REQUIRE(routed.rejected.empty());
+}
+
+// The steps fire for every job, whichever op it was brought under: 3 `publish`/s and 2 `retry`/s
+// are 5 jobs/s, so svc is sent 5 x 4 = 20 `work`/s and audit 5 `log`/s.
+TEST_CASE("a worker pool's then steps fire for every drained job whatever its op", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(pool_with_then(
+      {Step{.to = "svc", .op = "work", .factor = 4.0}, Step{.to = "audit", .op = "log"}}));
+  const WorkerPoolBehaviour pool{g, *g.index_of("w")};
+  Flow in;
+  in.add("publish", Rate{3});
+  in.add("retry", Rate{2});
+  const auto routed = pool.route(in, 0s, 100ms);
+  REQUIRE_THAT(sent_to(routed, *g.index_of("svc")).rate_of("work").per_second,
+               WithinRel(20.0, 1e-12));
+  REQUIRE_THAT(sent_to(routed, *g.index_of("audit")).rate_of("log").per_second,
+               WithinRel(5.0, 1e-12));
+  REQUIRE_THAT(routed.served.total().per_second, WithinRel(5.0, 1e-12));
+}
+
+// A step that keeps the op name sends the job on under it: 7 `publish`/s drained are 7 `publish`/s
+// to svc, a fan-out of 1.
+TEST_CASE("a worker pool's same-op then step passes the job's op name on", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(pool_with_then({Step{.to = "svc", .op = "publish"}}));
+  const WorkerPoolBehaviour pool{g, *g.index_of("w")};
+  const auto routed = pool.route(flow_of("publish", 7), 0s, 100ms);
+  REQUIRE_THAT(sent_to(routed, *g.index_of("svc")).rate_of("publish").per_second,
+               WithinRel(7.0, 1e-12));
+  REQUIRE(routed.outgoing.size() == 1);
+}
+
+// The pool's response and delivered share are its own, however many steps it has: nobody upstream
+// waits for it (the queue's hop into it is asynchronous), so neither downstream is asked.
+TEST_CASE("a worker pool with then steps still answers with its own sojourn and share",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(pool_with_then(
+      {Step{.to = "svc", .op = "work", .factor = 4.0}, Step{.to = "audit", .op = "log"}}));
+  const WorkerPoolBehaviour pool{g, *g.index_of("w")};
+  const LatencyEstimate own{0.0066, 1e-5};
+  bool asked = false;
+  const auto r = pool.response("publish", own, [&](std::size_t, std::string_view) {
+    asked = true;
+    return LatencyEstimate{99.0, 99.0};
+  });
+  REQUIRE(r == own);
+  REQUIRE_FALSE(asked);
+  bool asked_for_delivery = false;
+  const double delivered = pool.delivered("publish", 0.75, [&](std::size_t, std::string_view) {
+    asked_for_delivery = true;
+    return 0.1;
+  });
+  REQUIRE_THAT(delivered, WithinRel(0.75, 1e-12));
+  REQUIRE_FALSE(asked_for_delivery);
+}
+
+// No job drained, no hand-off: an idle pool sends nothing.
+TEST_CASE("a worker pool with no jobs sends nothing on", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(pool_with_then({Step{.to = "svc", .op = "work"}}));
+  const WorkerPoolBehaviour pool{g, *g.index_of("w")};
+  const auto routed = pool.route(Flow{}, 0s, 100ms);
+  REQUIRE(sent_to(routed, *g.index_of("svc")).total().per_second == 0.0);
 }

@@ -3063,8 +3063,10 @@ TEST_CASE("the engine runs a queue and a pool that has no then steps", "[theory]
   REQUIRE(sim.has_value());
 }
 
-// Task 7 runs a pool's `then` steps; until then the engine says so rather than drop them silently.
-TEST_CASE("the engine refuses a worker pool's then steps until phase 2c's next step", "[theory]") {
+// Task 6 refused a pool's `then` steps ("run in phase 2c's next step") rather than drop them
+// silently; Task 7 runs them, so the refusal is now its opposite: the engine accepts a pool that
+// hands its drained jobs on (the pins on what it sends are the section at the end of this file).
+TEST_CASE("the engine runs a worker pool that has then steps", "[theory]") {
   auto pool = four_workers();
   pool.then = {Step{.to = "svc", .op = "done"}};
   auto s = published(1000, {std::move(pool)});
@@ -3072,16 +3074,8 @@ TEST_CASE("the engine refuses a worker pool's then steps until phase 2c's next s
   s.links.push_back(LinkSpec{.from = "w", .to = "svc"});
   const auto g = *Graph::build(s);
   const auto sim = Simulation::create(g);
-  REQUIRE_FALSE(sim.has_value());
-  REQUIRE(sim.error().message ==
-          "node 'w': a worker pool's then steps run in phase 2c's next step");
-  const auto& text = sim.error().message;
-  // C++23 std::string::contains: a substring test in one call, replacing
-  // `find(...) != std::string::npos`; four short pins that survive a rewording of the rest.
-  REQUIRE(text.contains("node 'w'"));
-  REQUIRE(text.contains("worker pool's then steps"));
-  REQUIRE(text.contains("phase 2c"));
-  REQUIRE(text.contains("next step"));
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
 }
 
 // ---- A backlog grows at (inflow - capacity) and drains at (capacity - inflow) ----
@@ -3268,4 +3262,267 @@ TEST_CASE(
     REQUIRE(grew == (std::string_view{id} == "w"));
     REQUIRE(dropped == (std::string_view{id} == "w"));
   }
+}
+
+// ---- A worker pool's then steps carry each DRAINED job on (plan 2c refinement 5, Task 7) ----
+//
+// A pool's `then` steps are the work a finished job hands on, like a cache's unconditional `then`
+// (book ch. 14: a transcoding worker writes its renditions to the transcoded store and publishes a
+// completion message). Three rules, each pinned below:
+//  - they fire per DRAINED job, what the pool served, not what arrived: a saturated pool leaves
+//    the excess in its backlog (or drops it), and the excess starts no downstream work;
+//  - a worker is busy for `cost` only, so a slow `then` target does not hold it: the pool's rho and
+//    sojourn are M/M/c over `workers` and `cost` whatever it hands on to;
+//  - nobody waits on the pool (the hop from its queue is asynchronous), so the then-hops add
+//    nothing to any client's response, whether the steps are sequential or parallel.
+//
+// Numbers, from one picture: a client publishes `rate` messages/s to q (default queue: append
+// 100 us, c = 100) over a 250 us link; pool w drains q with 10 workers at 1 s a job:
+//   capacity = workers / cost = 10 / 1 s = 10 jobs/s       (Little's law: c / service time)
+//   a        = 8/s x 1 s = 8 erlangs over 10 servers: rho = 0.8
+//   Erlang C(10, a = 8) = 0.40918, Wq = C x s / (c (1 - rho)) = 0.40918 x 1 s / (10 x 0.2)
+//            = 0.20459 s, sojourn = Wq + s = 1.20459 s   (service SCV 1: M/M/c exactly)
+// w's then steps (zero-latency links, so a step's sends arrive in the same step):
+//   {to: store, op: write, factor: 4, size: 50MB}: a blob store of 5 GB/s
+//       (5000 MB/s, c = 5000 x 40 ms = 200 slots) receives 4 writes of 50 MB per job
+//   {to: done_q, op: publish}: a message queue consumed by a second pool, w2 (100 workers at
+//       10 ms = 10k jobs/s), receives one message per job
+// The publisher's response is q's append and the round trip alone:
+//   100 us (the append: rho 8e-6 at c = 100, no wait) + 2 x 250 us = 0.6 ms
+// (Node indices: u 0, q 1, w 2, store 3, done_q 4, w2 5.)
+
+namespace {
+// The picture above: `rate` messages/s into w, whose `then` is `then`, and a store of
+// `store_capacity` bytes/s.
+Scenario worker_chain(double rate, std::vector<Step> then,
+                      simsys::ByteRate store_capacity = simsys::ByteRate{5e9}) {
+  auto pool = group_of("w", 10, 1s);
+  pool.then = std::move(then);
+  auto s = published(rate, {std::move(pool)});
+  auto done_consumers = group_of("w2", 100, 10ms);
+  done_consumers.consumes = "done_q";
+  s.nodes.push_back(
+      NodeSpec{.id = "store", .type = NodeType::blob_store, .byte_capacity = store_capacity});
+  s.nodes.push_back(NodeSpec{.id = "done_q", .type = NodeType::message_queue});
+  s.nodes.push_back(std::move(done_consumers));
+  s.links.push_back(LinkSpec{.from = "w", .to = "store", .latency = 0s});
+  s.links.push_back(LinkSpec{.from = "w", .to = "done_q", .latency = 0s});
+  s.links.push_back(LinkSpec{.from = "done_q", .to = "w2", .latency = 0s});
+  return s;
+}
+
+// A fresh simulation of `g`, failing the test with the engine's message when it refuses the
+// scenario (instead of dereferencing the refusal).
+Simulation simulation_of(const Graph& g) {
+  auto sim = Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  return std::move(*sim);
+}
+
+// 4 renditions of 50 MB per job into the store, one completion message per job.
+std::vector<Step> store_and_done() {
+  return {Step{.to = "store", .op = "write", .factor = 4.0, .size = simsys::Bytes{50e6}},
+          Step{.to = "done_q", .op = "publish"}};
+}
+
+const std::vector<Step> store_and_done_in_parallel{
+    Step{.to = "store",
+         .op = "write",
+         .mode = simsys::model::StepMode::parallel,
+         .factor = 4.0,
+         .size = simsys::Bytes{50e6}},
+    Step{.to = "done_q", .op = "publish", .mode = simsys::model::StepMode::parallel}};
+
+// 10 workers at 1 s a job fed 8/s: Erlang C(10, 8 erlangs) x 1 s / (10 x 0.2) + 1 s.
+constexpr double pool_sojourn_8_per_s = 1.20459;
+}  // namespace
+
+// 8 jobs/s drained x 4 writes x 50 MB = 1600 MB/s: the store counts megabytes, so its demand is
+// 32 writes/s x 50 = 1600 units/s of 5000 (rho 0.32); done_q gets one message per job, 8/s, and
+// hands each to w2.
+TEST_CASE("a pool draining 8 jobs a second sends its blob store 32 writes a second: 1.6k MB",
+          "[theory]") {
+  const auto g = *Graph::build(worker_chain(8, store_and_done()));
+  const auto r = first_step(g);
+  const auto& pool = r.nodes[*g.index_of("w")];
+  REQUIRE_THAT(pool.demand_per_s, WithinRel(8.0, 1e-9));
+  REQUIRE_THAT(pool.rho, WithinRel(0.8, 1e-9));
+  REQUIRE_THAT(r.nodes[*g.index_of("store")].demand_per_s, WithinRel(1600.0, 1e-9));
+  REQUIRE_THAT(r.nodes[*g.index_of("store")].rho, WithinRel(0.32, 1e-9));
+  REQUIRE_THAT(r.nodes[*g.index_of("done_q")].demand_per_s, WithinRel(8.0, 1e-9));
+  REQUIRE_THAT(r.nodes[*g.index_of("w2")].demand_per_s, WithinRel(8.0, 1e-9));
+  REQUIRE_THAT(pool.latency.mean_s, WithinAbs(pool_sojourn_8_per_s, 1e-4));
+}
+
+// Offered 12 jobs/s the pool drains 10 (its capacity) and queues the other 2/s: its backlog after
+// 5 s (50 steps of 0.1 s) is 10 jobs. The then targets are sent what it DRAINED: 10 jobs x 4 x
+// 50 MB = 2000 MB/s (40 writes/s) and 10 messages/s, not the 12 jobs/s (2400 MB/s, 12/s) that
+// arrived. The room (7 days of retention x 10/s) is nowhere near full: nothing is dropped.
+TEST_CASE("a saturated pool hands on what it drained, 10 jobs a second, not the 12 offered",
+          "[theory]") {
+  const auto g = *Graph::build(worker_chain(12, store_and_done()));
+  const auto records = records_of(g, 50);
+  const auto& last = records.back();
+  const auto& pool = last.nodes[*g.index_of("w")];
+  REQUIRE_THAT(pool.demand_per_s, WithinRel(12.0, 1e-9));
+  REQUIRE_THAT(pool.drain_per_s, WithinRel(10.0, 1e-9));
+  REQUIRE_THAT(pool.backlog, WithinAbs(10.0, 1e-6));  // (12 - 10) per second x 5 s
+  REQUIRE(pool.dropped_per_s == 0.0);
+  REQUIRE_THAT(last.nodes[*g.index_of("store")].demand_per_s, WithinRel(2000.0, 1e-9));
+  REQUIRE_THAT(last.nodes[*g.index_of("done_q")].demand_per_s, WithinRel(10.0, 1e-9));
+  REQUIRE_THAT(last.nodes[*g.index_of("w2")].demand_per_s, WithinRel(10.0, 1e-9));
+}
+
+// The long-run state says the same: the estimate settles with the pool saturated, so the targets'
+// demand is 10 x 4 x 50 = 2000 MB/s and 10 messages/s however long the backlog has grown.
+TEST_CASE("the estimate of a saturated pool sends its targets the drained 10 jobs a second",
+          "[theory]") {
+  const auto g = *Graph::build(worker_chain(12, store_and_done()));
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const auto e = sim->estimate();
+  REQUIRE_THAT(e.nodes[*g.index_of("w")].drain_per_s, WithinRel(10.0, 1e-9));
+  REQUIRE_THAT(e.nodes[*g.index_of("store")].demand_per_s, WithinRel(2000.0, 1e-9));
+  REQUIRE_THAT(e.nodes[*g.index_of("done_q")].demand_per_s, WithinRel(10.0, 1e-9));
+}
+
+// The publisher is answered by q's append: 0.6 ms (see the picture), with or without the pool's
+// then steps. The pool's own sojourn (1.2 s) and its hand-offs are nowhere in it, and all 8
+// messages/s are answered.
+TEST_CASE("the then hops add nothing to the publisher's response: 0.6 ms with or without them",
+          "[theory]") {
+  const auto with_then = *Graph::build(worker_chain(8, store_and_done()));
+  const auto without_then = *Graph::build(published(8, {group_of("w", 10, 1s)}));
+  const auto a = first_step(with_then);
+  const auto b = first_step(without_then);
+  REQUIRE_THAT(a.responses[0].response.mean_s, WithinAbs(0.0006, 1e-9));
+  REQUIRE_THAT(a.responses[0].response.mean_s, WithinRel(b.responses[0].response.mean_s, 1e-12));
+  REQUIRE_THAT(a.responses[0].answered.per_second, WithinRel(8.0, 1e-9));
+  REQUIRE_THAT(a.responses[0].answered.per_second / a.responses[0].offered.per_second,
+               WithinRel(1.0, 1e-9));
+}
+
+// A target that cannot keep up drops its own load and nobody upstream hears of it: the store here
+// is 100 MB/s (c = 100 x 40 ms = 4 slots) fed 1600 MB/s, so in the long run it serves 100 and
+// drops 1500 MB/s (1600 - 100), 93.75 % of what it is sent; the publisher is still answered 8/s
+// in 0.6 ms, and the pool still drains its 8 jobs/s (it needs its workers for `cost` only).
+TEST_CASE("a then target that drops most of its load leaves the publisher and the pool untouched",
+          "[theory]") {
+  const auto g = *Graph::build(worker_chain(8, store_and_done(), simsys::ByteRate{100e6}));
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const auto e = sim->estimate();
+  const auto& store = e.nodes[*g.index_of("store")];
+  REQUIRE_THAT(store.demand_per_s, WithinRel(1600.0, 1e-9));
+  REQUIRE_THAT(store.drain_per_s, WithinRel(100.0, 1e-6));
+  REQUIRE_THAT(store.dropped_per_s, WithinRel(1500.0, 1e-6));
+  REQUIRE_THAT(e.nodes[*g.index_of("w")].drain_per_s, WithinRel(8.0, 1e-9));
+  REQUIRE_THAT(e.responses[0].answered.per_second, WithinRel(8.0, 1e-9));
+  REQUIRE_THAT(e.responses[0].response.mean_s, WithinAbs(0.0006, 1e-9));
+}
+
+// A worker is busy for `cost` only (plan 2c refinement 5, ignored: a worker blocked on a slow
+// downstream call, phase 3's backlog): the pool hands a job on to a service that takes 5 s and
+// serves 1/s, and its own rho (0.8) and sojourn (1.20459 s, M/M/10) are what they are without any
+// then step at all.
+TEST_CASE("a slow then target does not hold the workers: the pool stays M/M/10 at rho 0.8",
+          "[theory]") {
+  auto pool = group_of("w", 10, 1s);
+  pool.then = {Step{.to = "slow", .op = "work"}};
+  auto s = published(8, {std::move(pool)});
+  s.nodes.push_back(NodeSpec{.id = "slow",
+                             .type = NodeType::service,
+                             .capacity = Rate{1},
+                             .latency = 5s,
+                             .advanced = {.queue_limit = 1}});
+  s.links.push_back(LinkSpec{.from = "w", .to = "slow", .latency = 0s});
+  const auto g = *Graph::build(s);
+  const auto bare = *Graph::build(published(8, {group_of("w", 10, 1s)}));
+  const auto r = first_step(g);
+  const auto reference = first_step(bare);
+  const auto& pool_sample = r.nodes[*g.index_of("w")];
+  REQUIRE_THAT(pool_sample.rho, WithinRel(0.8, 1e-9));
+  REQUIRE_THAT(pool_sample.latency.mean_s, WithinAbs(pool_sojourn_8_per_s, 1e-4));
+  REQUIRE_THAT(pool_sample.latency.mean_s,
+               WithinRel(reference.nodes[*bare.index_of("w")].latency.mean_s, 1e-12));
+  REQUIRE_THAT(r.nodes[*g.index_of("slow")].demand_per_s, WithinRel(8.0, 1e-9));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.0006, 1e-9));
+}
+
+// Nobody waits for a pool, so how its steps are ordered means nothing to the client: a sequential
+// group and a parallel one send the same load (1600 MB/s, 8/s) and leave the same 0.6 ms answer
+// and the same pool sojourn. Both fire.
+TEST_CASE("a sequential and a parallel then group fire the same and change nothing for the client",
+          "[theory]") {
+  const auto sequential = first_step(*Graph::build(worker_chain(8, store_and_done())));
+  const auto g = *Graph::build(worker_chain(8, store_and_done_in_parallel));
+  const auto parallel = first_step(g);
+  REQUIRE_THAT(parallel.nodes[*g.index_of("store")].demand_per_s, WithinRel(1600.0, 1e-9));
+  REQUIRE_THAT(parallel.nodes[*g.index_of("done_q")].demand_per_s, WithinRel(8.0, 1e-9));
+  REQUIRE_THAT(parallel.responses[0].response.mean_s,
+               WithinRel(sequential.responses[0].response.mean_s, 1e-12));
+  REQUIRE_THAT(parallel.responses[0].response.mean_s, WithinAbs(0.0006, 1e-9));
+  REQUIRE_THAT(parallel.nodes[*g.index_of("w")].latency.mean_s,
+               WithinRel(sequential.nodes[*g.index_of("w")].latency.mean_s, 1e-12));
+}
+
+// Below capacity the long-run state is the state `run` reaches: constant rates, so the last step
+// of a run equals the estimate, at the pool and at both targets (and for the publisher).
+TEST_CASE("estimate and run agree on a pool with then steps below capacity", "[theory]") {
+  const auto g = *Graph::build(worker_chain(8, store_and_done()));
+  auto running = simulation_of(g);
+  simsys::engine::StepRecord last;
+  running.run({.duration = 2s, .step = 100ms},
+              [&](const simsys::engine::StepRecord& r) { last = r; });
+  const auto e = simulation_of(g).estimate();
+  REQUIRE(e.converged);
+  for (const auto* id : {"w", "store", "done_q", "w2"}) {
+    CAPTURE(id);
+    const auto node = *g.index_of(id);
+    REQUIRE_THAT(last.nodes[node].demand_per_s, WithinRel(e.nodes[node].demand_per_s, 1e-9));
+    REQUIRE_THAT(last.nodes[node].rho, WithinRel(e.nodes[node].rho, 1e-9));
+    REQUIRE_THAT(last.nodes[node].latency.mean_s, WithinRel(e.nodes[node].latency.mean_s, 1e-9));
+  }
+  REQUIRE_THAT(e.nodes[*g.index_of("store")].demand_per_s, WithinRel(1600.0, 1e-9));
+  REQUIRE_THAT(last.responses[0].response.mean_s, WithinRel(e.responses[0].response.mean_s, 1e-9));
+}
+
+// The fluid balance at the pool and at both targets, every step of the saturated run: what came
+// in was drained, dropped or is waiting, demand.dt = (drain + dropped).dt + (backlog - previous).
+// The pool's backlog really grows (2 jobs/s), so the law is not met vacuously there; the targets
+// run below capacity, so theirs is the plain demand = drain.
+TEST_CASE("a pool and its then targets conserve their load at every step of a saturated run",
+          "[theory]") {
+  const auto g = *Graph::build(worker_chain(12, store_and_done()));
+  const auto records = records_of(g, 50);
+  const double dt = 0.1;
+  for (const auto* id : {"w", "store", "done_q"}) {
+    CAPTURE(id);
+    const auto node = *g.index_of(id);
+    double previous_backlog = 0.0;
+    bool grew = false;
+    for (std::size_t i = 0; i < records.size(); ++i) {
+      const auto& sample = records[i].nodes[node];
+      CAPTURE(i);
+      const double in = sample.demand_per_s * dt;
+      const double out = (sample.drain_per_s + sample.dropped_per_s) * dt;
+      REQUIRE_THAT(in, WithinAbs(out + (sample.backlog - previous_backlog), 1e-9));
+      grew = grew || sample.backlog > previous_backlog;
+      previous_backlog = sample.backlog;
+    }
+    REQUIRE(grew == (std::string_view{id} == "w"));
+  }
+}
+
+// `on: miss` names a cache's miss, and a pool has no lookup to miss: refused at build with the
+// reason (the message is pinned in test_graph).
+TEST_CASE("an on-miss then step on a worker pool is refused", "[theory]") {
+  auto s = worker_chain(8, {Step{.to = "done_q", .op = "publish", .on = StepCondition::miss}});
+  const auto built = Graph::build(s);
+  REQUIRE_FALSE(built.has_value());
+  // C++23 std::string::contains: a substring test in one call, replacing
+  // `find(...) != std::string::npos`; the exact wording is pinned in test_graph.
+  REQUIRE(built.error().message.contains("node 'w': a worker pool's then steps"));
 }
