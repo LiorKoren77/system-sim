@@ -13,8 +13,10 @@ target_link_libraries(scenario_tests PRIVATE simsys Catch2::Catch2WithMain simsy
 target_compile_definitions(scenario_tests PRIVATE SIMSYS_SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios")
 catch_discover_tests(scenario_tests)
 
-add_executable(theory_tests theory/test_theory.cpp)
+add_executable(theory_tests theory/test_theory.cpp theory/test_timeout.cpp)
 target_link_libraries(theory_tests PRIVATE simsys Catch2::Catch2WithMain simsys_warnings)
+# test_timeout.cpp pins the shipped youtube scenario's uploads, so it needs the directory too.
+target_compile_definitions(theory_tests PRIVATE SIMSYS_SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios")
 catch_discover_tests(theory_tests)
 
 # simsys itself, run as a process: what `run` does to the series files on disk (review of
