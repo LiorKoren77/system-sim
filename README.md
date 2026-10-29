@@ -19,10 +19,10 @@ clients' keys; every write strategy including write-back; `then` steps), SQL dat
 primary and read replicas, shards, a connection pool, replication lag and staleness), CDNs
 that fetch their misses from an origin, and id generators (snowflake, ticket server, uuid).
 Refused requests are counted apart from dropped ones (`reject_rate`), and a request counts
-as answered unless it was refused or dropped. Six scenarios run end to end, the
+as answered unless it was refused or dropped. Nine scenarios run end to end, the
 [URL shortener](scenarios/book/url-shortener/) of ch. 8 among them (list below); the other
-7 book systems and the kv-store lab validate and `explain`, waiting for phases 2c (blob-store
-events, queues, workers, external sinks, `sweep`) and 3. The scenario language is
+five book systems validate and `explain`, waiting for the rest of phase 2c (search indexes,
+`sweep`) and phase 3. The scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.3).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
@@ -195,8 +195,10 @@ its writes only), id generators, message queues (the publisher answered at the a
 message copied to each consumer group, the slowest group's lag reported and checked by the
 `queue_lag` SLO) and worker pools (M/M/c at workers / cost, waiting in their
 queue's retention; their `then` steps fire for every job they drain, and nobody waits for them)
-and external sinks (a third party's API at the type's 1k/s and 100 ms, failing its `failure_rate`
-of what it serves, counted as drops). These seven scenarios run end to end:
+external sinks (a third party's API at the type's 1k/s and 100 ms, failing its `failure_rate`
+of what it serves, counted as drops) and key-value clusters (ch. 6's Dynamo-style store: `nodes`
+machines on a ring whose hottest machine is its own queue, every request sent to N replicas,
+answered at the W-th or R-th fastest). These nine scenarios run end to end:
 
 - [`tutorial/hello`](scenarios/tutorial/hello/), [`tutorial/chain`](scenarios/tutorial/chain/):
   one service, then two in a chain: the queueing basics.
@@ -205,6 +207,9 @@ of what it serves, counted as drops). These seven scenarios run end to end:
   Che caches in front of a SQL database.
 - [`labs/unique-id`](scenarios/labs/unique-id/): ch. 7's ticket server vs snowflake; fails its
   drop-rate SLO on purpose (exit 2).
+- [`labs/kv-store`](scenarios/labs/kv-store/): ch. 6's key-value store, 30k requests/s on 16
+  machines with N = 3, W = R = 2: 90k replica-requests/s, the ring's hottest machine at 60.8 %,
+  put p99 2.41 ms; every SLO passes (at the book's 8 machines it drops a ninth: "Things to try").
 - [`book/url-shortener`](scenarios/book/url-shortener/): ch. 8 over 24 hours at 12.8k/s
   (peak 19.2k/s): limiter, 8 stateless web servers, a Che cache (h = 0.881), snowflake ids
   and a SQL database in 3 shards; both SLOs pass (redirect p99 7.49 ms, nothing dropped).
@@ -214,8 +219,14 @@ of what it serves, counted as drops). These seven scenarios run end to end:
   (63.76k videos wait at midnight, where the run ends, and the backlog is still growing: the
   day's peak, about 71.9k, comes near 02:18), so `transcode_q` is 2.66 h behind and its
   `queue_lag` SLO (30 m) fails (exit 2) until the README's sizing (plan 2c Task 16).
+- [`book/news-feed`](scenarios/book/news-feed/): ch. 11 over 24 hours: fan-out on write through a
+  queue and 32 workers, feed, post and user caches, a SQL database and the friendship graph as a
+  key-value cluster. It runs to the end, but as shipped its one feed-cache replica is offered
+  the 300 feed writes of every post and saturates all day, the other caches and the database
+  saturate at the peaks, and 67.6 % of the work is dropped: its drop-rate SLO fails (exit 2)
+  until the README's sizing (plan 2c Task 17).
 
-Every other node type (key-value clusters, WebSocket gateways, ...) already validates and appears in
+Every other node type (search indexes, WebSocket gateways, ...) already validates and appears in
 `explain` with its resolved numbers, but `estimate` and `run` stop with "which run/estimate do
 not support yet (phase 2)" and exit 1. A `sweep` command
 (`--param nodes.users.rate.base=1k/s..100k/s:10`) is planned for phase 2c.

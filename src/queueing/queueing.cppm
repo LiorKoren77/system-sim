@@ -84,6 +84,36 @@ struct WaitMoments {
   return {.mean_s = p_wait * theta, .variance_s2 = p_wait * (2.0 - p_wait) * theta * theta};
 }
 
+// The k-th smallest of n independent exponential times of mean `mean_s`: how long a coordinator
+// that sends one request to n replicas waits for the k-th reply (book ch. 6, "quorum consensus":
+// a Dynamo-style store answers a read after R of its N replicas reply, a write after W).
+// Rényi's representation: while n − i replicas are still running, the next one finishes after
+// the minimum of n − i exponentials, itself exponential with mean m / (n − i) (the first of
+// several "coin-flip" clocks rings sooner the more of them run), and by memorylessness each such
+// gap is independent of the ones before. The k-th reply is the sum of the first k gaps:
+//   mean     = m × Σ_{i=0}^{k−1} 1 / (n − i)
+//   variance = m² × Σ_{i=0}^{k−1} 1 / (n − i)²        (independent terms: their variances add)
+// n = 3, m = 1 ms: k = 1 → 1/3 ms (the fastest of three), k = 2 → 5/6 ms (Dynamo's quorum of 2),
+// k = 3 → 11/6 ms (the slowest, the harmonic number H_3). Assumes the replicas' times are
+// independent and exponential: true of an M/M/1 sojourn, an approximation for a node of c > 1
+// servers or a service SCV other than 1 (whose sojourn is not exponential).
+// Preconditions (programmer errors: the loader and graph::Graph::build refuse such a quorum):
+// 1 <= k <= n, else std::invalid_argument. An infinite mean gives infinite moments.
+[[nodiscard]] WaitMoments exponential_order_statistic(int n, int k, double mean_s) {
+  if (n < 1) throw std::invalid_argument{"exponential_order_statistic: n must be >= 1"};
+  if (k < 1 || k > n) {
+    throw std::invalid_argument{"exponential_order_statistic: k must be in [1, n]"};
+  }
+  double mean_factor = 0.0;      // Σ 1 / (n − i)
+  double variance_factor = 0.0;  // Σ 1 / (n − i)²
+  for (int i = 0; i < k; ++i) {
+    const double running = n - i;  // replicas still to reply
+    mean_factor += 1.0 / running;
+    variance_factor += 1.0 / (running * running);
+  }
+  return {.mean_s = mean_s * mean_factor, .variance_s2 = mean_s * mean_s * variance_factor};
+}
+
 // Kingman's formula is the G/G/1 approximation
 //   E[Wq] ~ (rho / (1 - rho)) * ((c_a^2 + c_s^2) / 2) * s;
 // its multi-server extension is Allen-Cunneen, which is what this factor implements: a

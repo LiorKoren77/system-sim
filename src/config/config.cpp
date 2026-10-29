@@ -1165,19 +1165,23 @@ CheckResult read_lb_policy(const Site& site, const YAML::Node& body, model::Node
   return {};
 }
 
-// `vnodes: 150`: virtual nodes per server on the hash ring, so it means something only to
-// consistent_hash; on another policy it is a leftover from an edit, not a no-op to accept.
-// Absent, the graph uses model::default_vnodes.
-CheckResult read_vnodes(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+// `vnodes: 150`: virtual nodes per server on a hash ring (a consistent_hash balancer's, or a
+// kv_cluster's own), a positive integer. Absent stays absent: every reader applies
+// model::default_vnodes.
+CheckResult read_ring_vnodes(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   const auto value = body["vnodes"];
   if (!value) return {};
   if (auto checked = check_not_null(site, body, "vnodes", "vnodes"); !checked) return checked;
-  auto count = read_positive_int(site, value, "vnodes");
-  if (!count) return std::unexpected(count.error());
-  if (node.policy != model::LbPolicy::consistent_hash) {
-    return site.fail(value, "vnodes applies only to consistent_hash");
+  return read_positive_int(site, value, "vnodes").transform(store_in(node.vnodes));
+}
+
+// A balancer's ring is its consistent_hash policy's, so `vnodes` means something only to that
+// policy; on another it is a leftover from an edit, not a no-op to accept.
+CheckResult read_vnodes(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (auto read = read_ring_vnodes(site, body, node); !read) return read;
+  if (node.vnodes && node.policy != model::LbPolicy::consistent_hash) {
+    return site.fail(body["vnodes"], "vnodes applies only to consistent_hash");
   }
-  node.vnodes = *count;
   return {};
 }
 
@@ -2637,6 +2641,86 @@ CheckResult read_external_sink_keys(const Site& site, const YAML::Node& body,
   });
 }
 
+// ---- Key-value cluster keys (plan 2c refinement 9; book ch. 6) ----
+//
+// A kv_cluster is book ch. 6's Dynamo-style store: `nodes` machines on a consistent-hash ring of
+// `vnodes` virtual nodes each, every key on `replication` N of them, a write acknowledged by
+// `write_quorum` W replicas and a read answered by `read_quorum` R; `mode` (ap or cp) is printed
+// until partitions exist (phase 3). Each count is a positive integer, `nodes` is required, and the
+// shapes that cannot exist are refused: more copies of a key than machines to hold them, a quorum
+// larger than the copies it counts. W + R <= N is allowed: it is the eventually consistent end of
+// ch. 6's dial (fast writes and reads, a read may miss the latest write).
+
+// An optional count of a kv_cluster ("replication: 3"): a positive integer, or absent.
+CheckResult read_kv_count(const Site& site, const YAML::Node& body, std::string_view key,
+                          std::optional<int>& target) {
+  const auto value = body[std::string{key}];
+  if (!value) return {};
+  if (auto checked = check_not_null(site, body, key, key); !checked) return checked;
+  return read_positive_int(site, value, key).transform(store_in(target));
+}
+
+// "replication must be at most nodes (5 > 3)": `value`, of key `what`, above `limit`, the value
+// of key `limit_name`. Pointed at `what`'s line, or at `fallback` when the scenario left `what`
+// to its default (the default N = 3 on a two-node cluster is reported at `nodes`).
+CheckResult check_at_most(const Site& site, const YAML::Node& body, std::string_view what,
+                          int value, std::string_view limit_name, int limit,
+                          std::string_view fallback) {
+  if (value <= limit) return {};
+  const auto at = body[std::string{what}] ? body[std::string{what}] : body[std::string{fallback}];
+  return site.fail(at,
+                   std::format("{} must be at most {} ({} > {})", what, limit_name, value, limit));
+}
+
+// `nodes: 8`, required, and the counts that default: vnodes, replication, the two quorums.
+CheckResult read_kv_counts(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (!body["nodes"]) return site.fail(body, "kv_cluster needs nodes");
+  if (auto read = read_kv_count(site, body, "nodes", node.kv_nodes); !read) return read;
+  if (auto read = read_ring_vnodes(site, body, node); !read) return read;
+  if (auto read = read_kv_count(site, body, "replication", node.replication); !read) return read;
+  if (auto read = read_kv_count(site, body, "write_quorum", node.write_quorum); !read) return read;
+  return read_kv_count(site, body, "read_quorum", node.read_quorum);
+}
+
+// N copies need N machines; a quorum counts replies from those N (model::kv_replication and the
+// quorum helpers apply the defaults, so a default is checked like a stated value).
+CheckResult check_kv_shape(const Site& site, const YAML::Node& body, const model::NodeSpec& node) {
+  const int replication = model::kv_replication(node);
+  if (auto checked =
+          check_at_most(site, body, "replication", replication, "nodes", *node.kv_nodes, "nodes");
+      !checked) {
+    return checked;
+  }
+  if (auto checked = check_at_most(site, body, "write_quorum", model::kv_write_quorum(node),
+                                   "replication", replication, "replication");
+      !checked) {
+    return checked;
+  }
+  return check_at_most(site, body, "read_quorum", model::kv_read_quorum(node), "replication",
+                       replication, "replication");
+}
+
+// `replicas` is how a service scales behind a balancer; a kv_cluster's machines are its `nodes`
+// and the copies of a key its `replication`, so `replicas` could mean either and is refused rather
+// than guessed at (as a worker pool's is).
+CheckResult refused_kv_replicas(const Site& site, const YAML::Node& body) {
+  if (!body["replicas"]) return {};
+  return site.fail(body["replicas"],
+                   "a kv_cluster's machines are nodes; replicas is not a key here");
+}
+
+CheckResult read_kv_cluster_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (node.type != model::NodeType::kv_cluster) return {};
+  const auto this_node = node_site(site, node.id);
+  return refused_kv_replicas(this_node, body)
+      .and_then([&] { return read_kv_counts(this_node, body, node); })
+      .and_then([&] { return check_kv_shape(this_node, body, node); })
+      .and_then([&] {
+        return read_optional_word(this_node, body, "mode", model::parse_kv_mode,
+                                  "mode must be ap or cp", node.kv_mode);
+      });
+}
+
 // ---- Node bodies: the second pass -----------------------------------------------------
 
 // A client offers traffic (its `ops` are shares of its rate); every other node forwards
@@ -2688,6 +2772,7 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
     if (auto read = read_message_queue_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_worker_pool_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_external_sink_keys(site, entry.second, *node); !read) return read;
+    if (auto read = read_kv_cluster_keys(site, entry.second, *node); !read) return read;
     ++node;
   }
   return {};

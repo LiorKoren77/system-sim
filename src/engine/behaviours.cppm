@@ -52,6 +52,7 @@ import simsys.flow;
 import simsys.fluid; // ServiceMoments: what a byte-sized node hands its queue
 import simsys.graph;
 import simsys.model;
+import simsys.queueing; // exponential_order_statistic: a quorum's reply time
 import simsys.workload;
 
 export namespace simsys::behaviours {
@@ -1474,19 +1475,83 @@ class ExternalSinkBehaviour {
   double failure_rate_{};
 };
 
+// Models: the key-value store of System Design Interview (Alex Xu, vol. 1) ch. 6, Dynamo-style
+// (Amazon's Dynamo, Cassandra), in the steady state (plan 2c refinement 9). `nodes` machines sit
+// on a consistent-hash ring (ch. 5); every key lives on N = `replication` of them; the coordinator
+// sends each read and each write to all N replicas and answers a write once W = `write_quorum`
+// have acknowledged it and a read once R = `read_quorum` have replied (ch. 6, "quorum
+// consensus"). Captured, by three pieces:
+//  - the machines: graph::apply_kv_ring makes the node `nodes` copies of `capacity` each, and,
+//    when N < nodes, a hot node carrying k = 1 + 1/sqrt(vnodes) times the average (the
+//    balancer's ring heuristic), which the engine runs as hot and cool copy groups;
+//  - the fan-out: every request is N replica-requests, so cost() is N (defaults::op_cost) and the
+//    node's demand, drain, drops and backlog count replica-requests (30k requests/s at N = 3 are
+//    90k/s on the machines);
+//  - the quorum's latency: the k-th fastest of N replica sojourns (k = R for a read, W for a write,
+//    the ops of model::write_ops_of, `write` by default), each taken as an exponential of the
+//    node's mean sojourn m, the request-weighted mixture of its hot and cool copies. The k-th
+//    smallest of N such exponentials is queueing::exponential_order_statistic (Rényi):
+//    N = 3 gives 1/3 m for k = 1, 5/6 m for k = 2 (Dynamo's W = R = 2), 11/6 m for k = 3.
+// A request counts as lost in the share its replica-requests are dropped (the fluid's per-node
+// fraction), and `mode` (ap or cp) is carried for explain only. Ignored: network partitions and
+// what ap or cp does under them, sloppy quorum and hinted handoff (faults: phase 3), read repair
+// and anti-entropy (Merkle tree) traffic, vector clocks and conflict resolution, a quorum that
+// survives a lost replica (k < N answers although one of N was dropped), the replicas' sojourns
+// not being exponential when c > 1 or the service SCV is not 1 (nor independent: one hot queue
+// serves many keys), and the spread between the hot and the cool copies (the order statistic is
+// taken over their mean). The coordinator's own hop is a node of the scenario, if it is wanted
+// (the kv-store lab's `coordinator` service).
+class KvClusterBehaviour {
+ public:
+  KvClusterBehaviour(const graph::Graph& g, std::size_t self);
+
+  // Serves every incoming op and forwards nothing: the replicas answer the coordinator, which
+  // this node includes. `now` and `dt` are unused (the cluster holds no state between steps).
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+
+  // N capacity units per request (graph::op_cost): one per replica the request is sent to.
+  [[nodiscard]] double cost(std::string_view op) const;
+
+  // How many replies the coordinator waits for: W for a write op, R for any other.
+  [[nodiscard]] int quorum_of(std::string_view op) const;
+
+  // The k-th fastest of N replicas whose sojourns are exponential of mean `own.mean_s` (the
+  // copies' request-weighted mean sojourn, engine::Simulation::serve): Rényi's order statistic.
+  // `own.variance_s2` is not used: the order statistic's variance replaces it (class comment).
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view op, flow::LatencyEstimate own,
+                                               ResponseLookup auto&& /*downstream*/) const {
+    const auto quorum =
+        queueing::exponential_order_statistic(replication_, quorum_of(op), own.mean_s);
+    return {.mean_s = quorum.mean_s, .variance_s2 = quorum.variance_s2};
+  }
+
+  // The share of the op's replica-requests the machines did not drop: nothing downstream.
+  [[nodiscard]] double delivered(std::string_view /*op*/, double own,
+                                 FractionLookup auto&& /*downstream*/) const {
+    return own;
+  }
+
+ private:
+  std::map<std::string, double, std::less<>> cost_by_op_;
+  std::vector<std::string> write_ops_;
+  int replication_{};
+  int write_quorum_{};
+  int read_quorum_{};
+};
+
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
 // std::visit; a std::variant instead of an abstract base keeps every behaviour a plain
 // value (no heap allocation, no virtual calls, copyable). Phase 2a appended the load
 // balancer, the rate limiter and the cache, phase 2b the SQL database and the CDN, phase 2c the
-// blob store, the message queue, the worker pool and the external sink; later phases append the
-// rest (kv cluster, ...).
+// blob store, the message queue, the worker pool, the external sink and the kv cluster; later
+// phases append the rest (ws_gateway, ...).
 // C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
 // it holds) dispatched with std::visit. Closed: adding an alternative means editing this
 // line, and every std::visit that does not handle it then fails to compile.
-using Behaviour =
-    std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour, RateLimiterBehaviour,
-                 CacheBehaviour, SqlDbBehaviour, CdnBehaviour, BlobStoreBehaviour,
-                 MessageQueueBehaviour, WorkerPoolBehaviour, ExternalSinkBehaviour>;
+using Behaviour = std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour,
+                               RateLimiterBehaviour, CacheBehaviour, SqlDbBehaviour, CdnBehaviour,
+                               BlobStoreBehaviour, MessageQueueBehaviour, WorkerPoolBehaviour,
+                               ExternalSinkBehaviour, KvClusterBehaviour>;
 
 }  // namespace simsys::behaviours
 
@@ -1504,6 +1569,7 @@ static_assert(NodeBehaviour<BlobStoreBehaviour>);
 static_assert(NodeBehaviour<MessageQueueBehaviour>);
 static_assert(NodeBehaviour<WorkerPoolBehaviour>);
 static_assert(NodeBehaviour<ExternalSinkBehaviour>);
+static_assert(NodeBehaviour<KvClusterBehaviour>);
 static_assert(RequestSource<ClientBehaviour>);
 
 namespace detail {
@@ -2202,6 +2268,29 @@ ExternalSinkBehaviour::ExternalSinkBehaviour(const graph::Graph& g, std::size_t 
 
 Routed ExternalSinkBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
   return detail::serve_everything(in);
+}
+
+// ---- KvClusterBehaviour ----
+
+// Graph::build checked the shape (1 <= W, R <= N <= nodes); the defaults (N = 3, W = R = 2) are
+// model::kv_replication's and the quorum helpers'.
+KvClusterBehaviour::KvClusterBehaviour(const graph::Graph& g, std::size_t self)
+    : cost_by_op_{detail::arriving_op_costs(g, self)},
+      write_ops_{model::write_ops_of(g.nodes()[self].spec)},
+      replication_{model::kv_replication(g.nodes()[self].spec)},
+      write_quorum_{model::kv_write_quorum(g.nodes()[self].spec)},
+      read_quorum_{model::kv_read_quorum(g.nodes()[self].spec)} {}
+
+Routed KvClusterBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
+  return detail::serve_everything(in);
+}
+
+double KvClusterBehaviour::cost(std::string_view op) const {
+  return detail::cost_in(cost_by_op_, op);
+}
+
+int KvClusterBehaviour::quorum_of(std::string_view op) const {
+  return std::ranges::contains(write_ops_, op) ? write_quorum_ : read_quorum_;
 }
 
 }  // namespace simsys::behaviours

@@ -1,6 +1,7 @@
 # Lab: System Design Interview vol. 1, ch. 6 — Key-value store (Dynamo-style).
 # N=3 replicas, W=2, R=2 quorum, consistent hashing with virtual nodes, hinted handoff,
-# vector clocks, gossip failure detection. Two faults: a node failure and a partition.
+# vector clocks, gossip failure detection. Two faults: a node failure and a partition (accepted
+# and ignored until faults run, phase 3; so are hinted handoff, vector clocks and gossip).
 version: 1
 name: lab-kv-store
 seed: 1
@@ -61,5 +62,5 @@ slo:
   - {metric: drop_rate, max: 0.01}
 
 faults:
-  - {at: 10m, kind: node_down, node: store, for: 3m}            # one of eight nodes
+  - {at: 10m, kind: node_down, node: store, for: 3m}            # one of the nodes
   - {at: 20m, kind: partition, node: store, fraction: 0.5, for: 2m}   # split the ring in two halves that cannot see each other
