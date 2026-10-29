@@ -533,23 +533,14 @@ struct Overloaded : Fs... {
   return std::nullopt;
 }
 
-// Why a worker pool cannot run, if it cannot: its `then` steps, the work each drained job hands on
-// (plan 2c refinement 5), run in Task 7. Running the pool without them would drop that load
-// silently, so the engine says so instead; a pool with no steps runs (behaviours::
-// WorkerPoolBehaviour).
-[[nodiscard]] std::optional<std::string> worker_pool_not_runnable(const model::NodeSpec& spec) {
-  if (spec.then.empty()) return std::nullopt;
-  return "node '" + spec.id + "': a worker pool's then steps run in phase 2c's next step";
-}
-
 // Why a node of a simulated type still cannot run, if it cannot (the cases above). A blob store
 // always runs, `then` steps included: they are event notifications (plan 2c refinements 6-7),
-// asynchronous hops the backward pass does not wait for (behaviours::BlobStoreBehaviour). So does
-// a message queue (behaviours::MessageQueueBehaviour).
+// asynchronous hops the backward pass does not wait for (behaviours::BlobStoreBehaviour). So do
+// a message queue (behaviours::MessageQueueBehaviour) and a worker pool, `then` steps included
+// since plan 2c Task 7: the work each drained job hands on (behaviours::WorkerPoolBehaviour).
 [[nodiscard]] std::optional<std::string> not_runnable_yet(const model::NodeSpec& spec) {
   if (spec.type == model::NodeType::cache) return cache_not_runnable(spec);
   if (spec.type == model::NodeType::cdn) return cdn_not_runnable(spec);
-  if (spec.type == model::NodeType::worker_pool) return worker_pool_not_runnable(spec);
   return std::nullopt;
 }
 
@@ -788,9 +779,9 @@ flow::Flow DelayLine::pop() {
 // ---- Simulation: construction ----
 
 // Two passes over the nodes, in file order: first every node's TYPE, then what a node of a
-// simulated type still lacks (not_runnable_yet). So a type the engine has no model for is named
-// before a node that only waits for a later task: google-drive is refused at its ws_gateway,
-// long_poll, although its worker pools, declared before it, have `then` steps (Task 7).
+// simulated type still lacks (not_runnable_yet: a cache without a hit ratio, a che CDN without a
+// `keys` size). So a type the engine has no model for is named before a node that only lacks a
+// number: google-drive is refused at its ws_gateway, long_poll, the first type it has no model of.
 std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Graph& g) {
   for (const auto& node : g.nodes()) {
     if (simulated(node.spec.type)) continue;

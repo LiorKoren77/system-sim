@@ -1401,8 +1401,8 @@ constexpr SimTime peak_sample_step = 1_min;
   return graph::op_cost(g, i, op);
 }
 
-// Each forwarding node's (load balancer's, rate limiter's) routes per op that can reach
-// it, as Graph::routes_for gives them, drained routes (share 0) left out: they carry
+// Each routing node's (load balancer's, rate limiter's, message queue's) routes per op that can
+// reach it, as Graph::routes_for gives them, drained routes (share 0) left out: they carry
 // nothing. routes_for builds a fresh vector per call, so the table is built once per
 // paper_load rather than once per op, node and pass.
 using RoutesByOp = std::map<std::string, std::vector<graph::Route>, std::less<>>;
@@ -1411,7 +1411,8 @@ using ForwardRoutes = std::vector<RoutesByOp>;  // per node index; empty for non
 [[nodiscard]] ForwardRoutes forward_routes(const graph::Graph& g) {
   ForwardRoutes table(g.nodes().size());
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
-    if (!graph::forwards_by_link(g.nodes()[node].spec.type)) continue;
+    const auto type = g.nodes()[node].spec.type;
+    if (!graph::forwards_by_link(type) && !graph::copies_to_consumers(type)) continue;
     for (const auto& op : g.arriving_ops(node)) {
       auto& routes = table[node][op];
       for (const auto& route : g.routes_for(node, op)) {
@@ -1422,7 +1423,7 @@ using ForwardRoutes = std::vector<RoutesByOp>;  // per node index; empty for non
   return table;
 }
 
-// The routes `op` takes out of forwarding node `from`; none for an op that cannot reach it.
+// The routes `op` takes out of routing node `from`; none for an op that cannot reach it.
 [[nodiscard]] std::span<const graph::Route> routes_of(const ForwardRoutes& table, std::size_t from,
                                                       std::string_view op) {
   const auto found = table[from].find(op);
@@ -1430,10 +1431,13 @@ using ForwardRoutes = std::vector<RoutesByOp>;  // per node index; empty for non
   return found->second;
 }
 
-// Forwards what reached load balancer `from` over its routes, each op split by the
-// shares Graph::routes_for gives (as LoadBalancerBehaviour::route does).
-void forward_balanced(const graph::Graph& g, const ForwardRoutes& table, std::size_t from,
-                      std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
+// Forwards what reached load balancer or message queue `from` over its routes, each op times the
+// share Graph::routes_for gives: a balancer's split (as LoadBalancerBehaviour::route does), a
+// queue's copy of every message to each consumer group, a share of 1 each (plan 2c Task 7, as
+// MessageQueueBehaviour::route does). On paper nothing is dropped, so every message appended is
+// delivered.
+void forward_routed(const graph::Graph& g, const ForwardRoutes& table, std::size_t from,
+                    std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   const OpLoad arriving = load[from];  // a copy, as in forward_steps
   for (const auto& [op, rate] : arriving) {
     for (const auto& route : routes_of(table, from, op)) {
@@ -1485,12 +1489,13 @@ void forward_to_backend(const graph::Graph& g, std::size_t from, const OpLoad& a
   }
 }
 
-// Forwards along a cache's or a blob store's `then` steps (what happens after it answers: ch.
-// 13's browser cache sends its misses on to the servers; an upload's event starts transcoding):
-// rate × factor × Graph::then_fraction, the whole flow for an unconditional step (at a blob store,
-// every write and no read) and the misses (1 − h of a read) for an `on: miss` one. A share of 0
-// sends nothing, not a 0/s entry. The same multiplications as CacheBehaviour::route (plan 2b
-// refinement 5) and BlobStoreBehaviour::route.
+// Forwards along a cache's, a blob store's or a worker pool's `then` steps (what happens after it
+// answers: ch. 13's browser cache sends its misses on to the servers; an upload's event starts
+// transcoding; a transcoder writes its renditions): rate × factor × Graph::then_fraction, the
+// whole flow for an unconditional step (at a blob store, every write and no read; at a pool, every
+// job whatever its op) and the misses (1 − h of a read) for an `on: miss` one. A share of 0 sends
+// nothing, not a 0/s entry. The same multiplications as CacheBehaviour::route (plan 2b refinement
+// 5), BlobStoreBehaviour::route and WorkerPoolBehaviour::route.
 void forward_then_steps(const graph::Graph& g, std::size_t from, const OpLoad& arriving,
                         std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   for (const model::Step& step : g.nodes()[from].spec.then) {
@@ -1514,11 +1519,15 @@ void forward_cached(const graph::Graph& g, std::size_t from, std::vector<OpLoad>
   forward_then_steps(g, from, arriving, load, fed_back);
 }
 
-// What a blob store sends on: one event per write along each `then` step, rate × factor, and
-// nothing for a read (plan 2c refinements 6-7, as BlobStoreBehaviour::route does; S3 has no event
-// for a GET). On paper nothing is dropped, so every write that arrives is served and notifies.
-void forward_events(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
-                    std::vector<OpLoad>& fed_back) {
+// What a blob store or a worker pool sends on along its `then` steps: a store one event per write,
+// rate × factor, and nothing for a read (plan 2c refinements 6-7, as BlobStoreBehaviour::route
+// does; S3 has no event for a GET); a pool every step for every job it is OFFERED (plan 2c Task 7).
+// On paper nothing queues or is dropped: every write that arrives is served and notifies, and a
+// pool offered more than its workers / cost passes all of it on (its own line is red; what the
+// engine forwards is what the pool drains, at most its capacity). The paper load answers "can
+// this ever fit", not "what goes through".
+void forward_handed_on(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
+                       std::vector<OpLoad>& fed_back) {
   const OpLoad arriving = load[from];  // a copy, as in forward_steps
   forward_then_steps(g, from, arriving, load, fed_back);
 }
@@ -1526,16 +1535,16 @@ void forward_events(const graph::Graph& g, std::size_t from, std::vector<OpLoad>
 // Forwards what reached node `from` along its resolved `ops` hops (rate × factor × the share
 // of requests that take the hop: 1, or a cache's miss fraction 1 − h for an `on: miss`
 // step, whose factor includes its lookup's, so every missed lookup is fetched;
-// graph::ServiceHop), as ServiceBehaviour::route does, or over a load balancer's or a
-// rate limiter's routes, or to a cache's store, or along a blob store's events. Flow over a
-// feedback link goes to `fed_back`: its target came earlier in the order, so it counts in the
-// next pass.
+// graph::ServiceHop), as ServiceBehaviour::route does, or over a load balancer's, a rate
+// limiter's or a message queue's routes, or to a cache's store, or along a blob store's events or
+// a worker pool's hand-offs. Flow over a feedback link goes to `fed_back`: its target came earlier
+// in the order, so it counts in the next pass.
 void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_t from,
                    std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   const auto& spec = g.nodes()[from].spec;
   if (spec.type == model::NodeType::client) return;  // client routes are in client_load
-  if (spec.type == model::NodeType::load_balancer) {
-    forward_balanced(g, table, from, load, fed_back);
+  if (spec.type == model::NodeType::load_balancer || graph::copies_to_consumers(spec.type)) {
+    forward_routed(g, table, from, load, fed_back);
     return;
   }
   if (spec.type == model::NodeType::rate_limiter) {
@@ -1546,8 +1555,8 @@ void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_
     forward_cached(g, from, load, fed_back);
     return;
   }
-  if (spec.type == model::NodeType::blob_store) {
-    forward_events(g, from, load, fed_back);
+  if (spec.type == model::NodeType::blob_store || spec.type == model::NodeType::worker_pool) {
+    forward_handed_on(g, from, load, fed_back);
     return;
   }
   const OpLoad arriving = load[from];  // a copy: a step may target `from` itself
@@ -1719,32 +1728,31 @@ constexpr std::string_view unknown_hit_ratio_note =
 //
 // The paper load (paper_pass, forward_steps) forwards from a client's routes, along a service's
 // (or any node's) `ops` steps, through load balancers and rate limiters over their links
-// (graph::forwards_by_link), from caches and CDNs on their misses (graph::hits_or_misses) and
-// along a blob store's `then` steps, its event notifications (plan 2c Task 4).
-// It does not follow a worker pool's `then`, nor a message queue's deliveries to its consumer
-// groups (plan 2c Task 7; the engine runs a queue and a pool without `then` steps since Task 6),
-// nor the `then` of a notification fan-out or a URL frontier (types without a phase yet). A node
-// fed through one of those misses that part of its load: with nothing else it shows 0 offered load,
-// a missing number, not a zero, and a verdict on it ("0%, green") would read as "this tier is
-// idle"; with some load from elsewhere its percentage is a lower bound, and a green or yellow
-// verdict on it would read as "this tier has room" (review of 3e23477, I1: a node fed 1/s by a
-// client and 10k/s through a blob store printed "(0.05%, green)"). Its check line says so instead.
+// (graph::forwards_by_link), from caches and CDNs on their misses (graph::hits_or_misses), along a
+// blob store's `then` steps, its event notifications (plan 2c Task 4), and from a message queue
+// into each of its consumer groups and along a worker pool's `then` steps (plan 2c Task 7).
+// It does not follow the `then` of a notification fan-out or a URL frontier (types without a
+// phase yet). A node fed through one of those misses that part of its load: with nothing else it
+// shows 0 offered load, a missing number, not a zero, and a verdict on it ("0%, green") would read
+// as "this tier is idle"; with some load from elsewhere its percentage is a lower bound, and a
+// green or yellow verdict on it would read as "this tier has room" (review of 3e23477, I1: a node
+// fed 1/s by a client and 10k/s through a blob store printed "(0.05%, green)"). Its check line says
+// so instead.
 
-// Until when the paper load leaves unfollowed what a node of `type` sends on: "phase 2c", "not
-// modelled yet", or nothing for a type it follows (or that sends nothing on).
+// Until when the paper load leaves unfollowed what a node of `type` sends on: "not modelled yet",
+// or nothing for a type it follows (or that sends nothing on). (Until plan 2c Task 7 a message
+// queue and a worker pool were "phase 2c".)
 [[nodiscard]] std::optional<std::string_view> unfollowed_until(model::NodeType type) {
   using enum model::NodeType;  // C++20, as in provenance
-  if (type == message_queue || type == worker_pool) return "phase 2c";
   if (type == notification_fanout || type == frontier) return "not modelled yet";
   return std::nullopt;
 }
 
 // Where `from` sends on what it receives. For a type the paper load does not follow: the targets
-// of its `then` steps, the flow it would send; for one with none (a message queue, whose
-// consumers are the pools its links deliver to, graph::Graph::route_queue), the nodes its links
-// carry demand to. For every other node: its demand edges (steps, client routes, a
-// balancer's links, a cache's backend, a blob store's events), what the paper load follows from
-// it.
+// of its `then` steps, the flow it would send; for one with none (a frontier that only feeds its
+// consumers over its links), the nodes its links carry demand to. For every other node: its demand
+// edges (steps, client routes, a balancer's links, a cache's backend, a blob store's events, a
+// queue's consumer groups, a pool's hand-offs), what the paper load follows from it.
 [[nodiscard]] std::vector<std::size_t> onward_targets(const graph::Graph& g, std::size_t from) {
   std::vector<std::size_t> targets;
   const auto& spec = g.nodes()[from].spec;
@@ -1774,14 +1782,14 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 }
 
 // Per node, the types on its way in whose onward flow the paper load does not follow, each once,
-// nearest first: youtube's transcoders, behind transcode_q, have [message_queue]; metadata_db,
-// also written by the completion handler, [worker_pool, message_queue]. Empty for a node
-// whose load the paper pass has in full. A node passes on its own type (if it is such a type)
-// and everything on its way, so the mark crosses ordinary nodes too (the web crawler's parser,
-// behind the downloader). A node in a loop through such a type has it on its way as well: the
-// load that comes round is missing too. Breadth-first from every such node at once, which puts
-// the nearest types first; a node is visited again only when its list grows, which happens at
-// most once per type, so a loop ends.
+// nearest first: the web crawler's dns, behind the frontier and the downloader, has [frontier];
+// a node fed by a frontier that a notification fan-out feeds, [frontier, notification_fanout].
+// Empty for a node whose load the paper pass has in full. A node passes on its own type (if it is
+// such a type) and everything on its way, so the mark crosses ordinary nodes too (the web
+// crawler's parser, behind the downloader). A node in a loop through such a type has it on its way
+// as well: the load that comes round is missing too. Breadth-first from every such node at once,
+// which puts the nearest types first; a node is visited again only when its list grows, which
+// happens at most once per type, so a loop ends.
 [[nodiscard]] std::vector<std::vector<model::NodeType>> blocked_on_the_way(const graph::Graph& g) {
   const auto count = g.nodes().size();
   std::vector<std::vector<model::NodeType>> blocked(count);
@@ -1809,9 +1817,10 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   return join(items.first(items.size() - 1), ", ") + " and " + items.back();
 }
 
-// "load not propagated: message_queue is phase 2c)" or, with several types, grouped by how long
-// each stays unfollowed, in the order they come: "load not propagated: worker_pool is phase 2c,
-// frontier is not modelled yet)", "... worker_pool and message_queue are phase 2c)".
+// "load not propagated: frontier is not modelled yet)" or, with several types, grouped by how long
+// each stays unfollowed, in the order they come: "... frontier and notification_fanout are not
+// modelled yet)". (Every type left unfollowed now waits for the same thing, so there is one group;
+// the grouping held "phase 2c" apart until plan 2c Task 7 and will hold the next phase's apart.)
 [[nodiscard]] std::string unpropagated_mark(std::span<const model::NodeType> blocked) {
   std::vector<std::pair<std::string_view, std::vector<std::string>>> groups;
   for (const model::NodeType type : blocked) {
@@ -1963,7 +1972,7 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 
 // The check of a node whose paper load misses what comes through `blocked` (blocked_on_the_way):
 //  - nothing reached it: the head and the mark, no percentage and no zone,
-//    "(load not propagated: message_queue is phase 2c)";
+//    "(load not propagated: frontier is not modelled yet)";
 //  - some load reached it: that load's percentage as a lower bound, "(≥0.05%; load not
 //    propagated: ...)". No zone below red: the real load is higher, so green or yellow might not
 //    hold, but a red lower bound is red for certain, "(≥150%, red; ...)" (a database's at the

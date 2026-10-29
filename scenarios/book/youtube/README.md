@@ -23,11 +23,12 @@
   cdn_us              peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)
   cdn_eu              peak offered 7.04k MB/s (140.8/s) vs 50k MB/s total capacity  (14.1%, green)
   original_store      peak offered 2.88k MB/s (9.6/s) vs 5k MB/s total capacity  (57.6%, green)
-  transcoded_store    peak offered 7.891k MB/s (157.8/s) vs 10k MB/s total capacity  (≥78.9%; load not propagated: worker_pool and message_queue are phase 2c)
+  transcoded_store    peak offered 9.811k MB/s (196.2/s) vs 10k MB/s total capacity  (98.1%, red)
   ```
 
-  `transcoded_store`'s figure is the CDNs' misses alone, a lower bound: the transcoders' writes
-  come through a queue and a worker pool the paper load does not follow yet.
+  `transcoded_store`'s figure is the CDNs' misses, 157.8 streams/s × 50 MB = 7.891k MB/s, plus
+  the transcoders' renditions, 9.6 uploads/s × 4 × 50 MB = 1.92k MB/s: 98.1 % of its 10 GB/s,
+  red (plan 2c Task 16 sizes it).
 - `original_store`'s `then` is an S3-style event notification (phase 2c): each upload it stores
   publishes one message to `transcode_q`, asynchronously (the uploader is answered by the store
   alone), so `transcode_q` now receives the store's events on paper. Only a write fires an event
@@ -60,12 +61,24 @@
 - Two regions with a cross-DC origin fetch (150 ms) for European misses. Each CDN is a
   read-only cache in front of `transcoded_store`: its hit ratio comes from the Che approximation
   over the viewers' Zipf(1) popularity of 10M videos and the edge's size in videos (`keys: 100k`
-  in the US, `50k` in the EU), and only the misses reach the origin. The CDNs and both blob
-  stores run (`original_store` with its upload event); `run` stops first at `transcode_q`, a
-  message queue (later in phase 2c).
+  in the US, `50k` in the EU), and only the misses reach the origin.
 - Transcoding as a long-running worker pool (60 s per video, 400 workers → 6.7 videos/s
-  ceiling) and the backlog it builds during the evening upload peak.
-- Fan-out of one upload into four output renditions.
+  ceiling) and the backlog it builds during the evening upload peak. `transcode_q` is the
+  broker: an upload's event is answered at the append, and the transcoders drain it as an M/M/c
+  queue of 400 workers at 60 s a job. On paper the pool is offered every upload of the peak,
+  `transcoders  peak offered 9.6/s vs 6.667/s total capacity  (144%, red)`; in a run it drains
+  6.667 videos/s at most and the rest waits in its queue.
+- Fan-out of one upload into four output renditions: each video the transcoders DRAIN (not each
+  one that arrives) writes four 50 MB renditions to `transcoded_store` and publishes one message
+  to `completion_q`, whose `completion_handler` updates `metadata_db` and `metadata_cache`
+  (`completion_handler  peak offered 9.6/s vs 800/s total capacity  (1.2%, green)`). Nobody
+  waits for the pool, so none of this is in any viewer's response time.
+- The whole day runs: `simsys run` steps 24 h at 100 ms (861,000 steps observed after the
+  warmup, about 19 s in a Release build) and exits 0. The EU stream p99 (456 ms against 2 s) and
+  `cdn_us`'s mean utilization (0.0879 against 0.8) pass; the `queue_lag` SLO is skipped, since
+  queue lag is not measured yet (plan 2c Task 8). The transcoders spend 48.27k s (13.4 h) in the
+  red zone, saturated (peak rho 1), and their backlog peaks at 63.76k videos: the lag that SLO
+  will catch. (Uploads take 12 s, past the clients' 10 s timeout that is not applied yet: above.)
 
 ## What it abstracts away
 - Adaptive bitrate selection, chunked upload resume, DRM.

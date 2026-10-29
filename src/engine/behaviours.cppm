@@ -3,8 +3,8 @@
 // everything on across its links; rate limiter: pass on what it admits, reject the rest;
 // cache: answer, and pass to its store what its strategy sends there; blob store: answer, and
 // notify along its `then` steps for each write; message queue: append, and copy every message to
-// each consumer group; worker pool: drain its jobs) and how it composes response latency from its
-// own sojourn plus link legs and downstream responses.
+// each consumer group; worker pool: drain its jobs and hand each one on along its `then` steps) and
+// how it composes response latency from its own sojourn plus link legs and downstream responses.
 //
 // Latency composes on the reply path. A hop to a downstream node costs two link legs
 // (request out, reply back) plus that node's own response; sequential hops add, parallel
@@ -249,9 +249,9 @@ struct Block {
 // The blocks of hops a node makes for each incoming op, and the three things the engine asks
 // of them: the flow they forward, the latency they add and the share of requests they answer.
 // Pattern: Delegation (composition over inheritance) — ServiceBehaviour (its `ops` steps),
-// CacheBehaviour (its store hop and its `then` steps) and BlobStoreBehaviour (its events) each
-// hold one HopBlocks, as the forwarding behaviours hold a Forwarding, instead of sharing the
-// arithmetic through a base.
+// CacheBehaviour (its store hop and its `then` steps), BlobStoreBehaviour (its events) and
+// WorkerPoolBehaviour (its hand-offs) each hold one HopBlocks, as the forwarding behaviours hold a
+// Forwarding, instead of sharing the arithmetic through a base.
 class HopBlocks {
  public:
   // The blocks of `op`, created empty on first use: the owner fills them at construction.
@@ -340,7 +340,7 @@ class HopBlocks {
 
 // Adds to `hops` the blocks of node `self`'s `then` steps for incoming `op`, each taken by the
 // share graph::Graph::then_fraction gives (a cache's, CacheBehaviour; a blob store's events,
-// BlobStoreBehaviour).
+// BlobStoreBehaviour; a worker pool's hand-offs, WorkerPoolBehaviour).
 void add_then_blocks(const graph::Graph& g, std::size_t self, const std::string& op,
                      HopBlocks& hops);
 
@@ -1365,8 +1365,16 @@ class MessageQueueBehaviour {
 // backlog grows at inflow − rate while the pool is saturated, and what overflows the room is
 // deleted unconsumed: the pool's drops, which no publisher sees (the hop from the queue is
 // asynchronous). Its response and delivered share are its own: nothing upstream waits for it.
-// Phase 2c Task 6: a pool's `then` steps (the work it hands on) run in Task 7; until then the
-// engine refuses a pool that has any (engine::Simulation::create), and the pool forwards nothing.
+// Its `then` steps are the work a finished job hands on (plan 2c refinement 5, Task 7; ch. 14's
+// transcoder writes its renditions to the transcoded store and publishes a completion message):
+// every step fires for every job the pool DRAINED (the engine routes what the queue served, so a
+// saturated pool hands on its capacity, not its arrivals, and the excess starts nothing until it
+// is drained), `factor` requests of the step's op each, whatever op the queue brought the job
+// under. A worker is busy for `cost` only: its hand-offs do not hold it, so a slow target leaves
+// the pool's rho and sojourn as they are, and the target's own queue absorbs (or drops) the load.
+// The hops are calls from the pool's side (graph::Graph::is_async_hop is false for them), but no
+// one waits for the pool, so they add nothing to any client's response and fail no client's
+// request (a sequential or parallel group alike); what a target drops counts in its own drop rate.
 // Ignored: a worker blocked on a slow downstream call (an external sink's 150 ms would hold a
 // worker and cut the pool's real capacity: phase 3), autoscaling (`workers` is fixed), poison
 // messages that fail and are retried forever, and the job-time spread of real work (the service
@@ -1375,24 +1383,35 @@ class WorkerPoolBehaviour {
  public:
   WorkerPoolBehaviour(const graph::Graph& g, std::size_t self);
 
-  // Serves every job it is sent and forwards nothing (its `then` steps are Task 7's). `now` and
-  // `dt` are unused: the pool keeps no state between steps (its backlog is its queue's).
+  // Serves every job it is sent (`in` is what the engine's queue drained this step) and sends
+  // rate × factor of each `then` step's op for all of them, whatever their ops (the class
+  // comment). `now` and `dt` are unused: the pool keeps no state between steps (its backlog is its
+  // queue's).
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
 
   // One capacity unit per job: a job takes one worker for `cost`, whatever its op.
   [[nodiscard]] double cost(std::string_view /*op*/) const { return 1.0; }
 
-  // Its own sojourn (wait for a worker + cost): it calls nobody before Task 7.
+  // Its own sojourn (wait for a worker + cost): nobody waits for its hand-offs, and nobody asks
+  // (the queue's hop into the pool is asynchronous, so no caller looks this up through a call).
   [[nodiscard]] flow::LatencyEstimate response(std::string_view /*op*/, flow::LatencyEstimate own,
                                                ResponseLookup auto&& /*downstream*/) const {
     return own;
   }
 
-  // The share of the jobs it does not drop.
+  // The share of the jobs it does not drop: a hand-off its target loses fails no job.
   [[nodiscard]] double delivered(std::string_view /*op*/, double own,
                                  FractionLookup auto&& /*downstream*/) const {
     return own;
   }
+
+ private:
+  // The key the `then` blocks are filed under: one set of blocks for every job, since every step
+  // fires for every job whatever its op (graph::Graph::then_fraction is 1 at a pool).
+  static constexpr std::string_view every_job = "";
+
+  // One block per `then` step (detail::add_then_blocks), only ever forwarded.
+  detail::HopBlocks hand_offs_;
 };
 
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
@@ -2080,10 +2099,20 @@ Routed MessageQueueBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTi
 
 // ---- WorkerPoolBehaviour ----
 
-WorkerPoolBehaviour::WorkerPoolBehaviour(const graph::Graph& /*g*/, std::size_t /*self*/) {}
+// Graph::build resolved the `then` steps' targets and links, and refused one on miss or on failure,
+// so every step is unconditional: then_fraction is 1 for any op, the empty `every_job` included.
+WorkerPoolBehaviour::WorkerPoolBehaviour(const graph::Graph& g, std::size_t self) {
+  detail::add_then_blocks(g, self, std::string{every_job}, hand_offs_);
+}
 
+// Every job drained, whatever its op, fires every step once: the steps see the total.
 Routed WorkerPoolBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
-  return detail::serve_everything(in);
+  Routed routed = detail::serve_everything(in);
+  const Rate jobs = routed.served.total();
+  // No empty branches (see ServiceBehaviour::route): an idle pool sends nothing on.
+  if (jobs.per_second > 0.0) hand_offs_.forward(every_job, jobs, routed.outgoing);
+  detail::sort_by_destination(routed.outgoing);
+  return routed;
 }
 
 }  // namespace simsys::behaviours

@@ -164,22 +164,27 @@ t_s,client,op,offered_per_s,answered_per_s,mean_ms
 0,users,shorten,653.169,653.169,3.98179
 ```
 
-`explain` says where its paper load is incomplete rather than print a verdict on a missing
-number. On [YouTube](scenarios/book/youtube/) (ch. 14) the CDNs are sized in bytes, so they
-count megabytes and are checked in MB/s, the requests beside; part of the metadata tier's load
-arrives through the transcoding pipeline (message queue, worker pool: explain follows it from
-phase 2c Task 7), so its percentage is a lower bound with no zone; and a pool fed only through
-that pipeline has no percentage at all, only its capacity, workers / cost (400 transcoders at
-60 s a video: 6.667/s) (trimmed):
+`explain` follows the load through every tier the engine runs. On
+[YouTube](scenarios/book/youtube/) (ch. 14) the CDNs are sized in bytes, so they count megabytes
+and are checked in MB/s, the requests beside; each upload's event goes through the transcoding
+queue to the transcoders, a worker pool whose capacity is workers / cost (400 transcoders at 60 s
+a video: 6.667/s), and every video they are offered writes four renditions to the transcoded
+store and a completion the metadata tier records. The paper load does not queue, so the pool
+passes on all it is offered, and its red line says the evening peak outruns it (trimmed):
 
 ```
 $ simsys explain scenarios/book/youtube/scenario.yaml
 ...
-  cdn_us       peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)
-  api          peak offered 48/s vs 12k/s total capacity  (0.4%, green)
-  metadata_db  peak offered 50.28 units/s vs 9k/s total capacity  (≥0.559%; load not propagated: worker_pool and message_queue are phase 2c)
-  transcoders  peak offered 0/s vs 6.667/s total capacity  (load not propagated: message_queue is phase 2c)
+  cdn_us            peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)
+  api               peak offered 48/s vs 12k/s total capacity  (0.4%, green)
+  metadata_db       peak offered 98.28 units/s vs 9k/s total capacity  (1.09%, green)  ...
+  transcoders       peak offered 9.6/s vs 6.667/s total capacity  (144%, red)
+  transcoded_store  peak offered 9.811k MB/s (196.2/s) vs 10k MB/s total capacity  (98.1%, red)
 ```
+
+Only a URL frontier's and a notification fan-out's onward load is still left out (types with
+no phase yet): what lies behind them is marked `(load not propagated: frontier is not modelled
+yet)`, with no percentage when nothing else reaches it and a lower bound (`≥1%`) otherwise.
 
 What runs today: clients, services, load balancers, rate limiters, caches (a fixed or a
 Che hit ratio), SQL databases (primary, read replicas, shards), CDNs and blob stores (sized in
@@ -187,8 +192,8 @@ bytes, they count megabytes, wait for whole objects and answer a write at its la
 at its first megabyte; a blob store's `then` steps are asynchronous event notifications, fired by
 its writes only), id generators, message queues (the publisher answered at the append, every
 message copied to each consumer group) and worker pools (M/M/c at workers / cost, waiting in their
-queue's retention; their `then` steps run from the next task).
-These six scenarios run end to end:
+queue's retention; their `then` steps fire for every job they drain, and nobody waits for them).
+These seven scenarios run end to end:
 
 - [`tutorial/hello`](scenarios/tutorial/hello/), [`tutorial/chain`](scenarios/tutorial/chain/):
   one service, then two in a chain: the queueing basics.
@@ -200,8 +205,13 @@ These six scenarios run end to end:
 - [`book/url-shortener`](scenarios/book/url-shortener/): ch. 8 over 24 hours at 12.8k/s
   (peak 19.2k/s): limiter, 8 stateless web servers, a Che cache (h = 0.881), snowflake ids
   and a SQL database in 3 shards; both SLOs pass (redirect p99 7.49 ms, nothing dropped).
+- [`book/youtube`](scenarios/book/youtube/): ch. 14 over 24 hours in bytes: two CDNs, blob
+  stores, the transcoding queue and workers, the metadata tier. It runs to the end and passes
+  its two checked SLOs (exit 0); the 400 transcoders fall behind every evening (a backlog of
+  63.76k videos) and the `queue_lag` SLO that would say so is still skipped (phase 2c Task 8);
+  the README's sizing is Task 16's.
 
-Every other node type (queues, workers, external sinks, ...) already validates and appears in
+Every other node type (external sinks, key-value clusters, ...) already validates and appears in
 `explain` with its resolved numbers, but `estimate` and `run` stop with "which run/estimate do
 not support yet (phase 2)" and exit 1. A `sweep` command
 (`--param nodes.users.rate.base=1k/s..100k/s:10`) is planned for phase 2c.
