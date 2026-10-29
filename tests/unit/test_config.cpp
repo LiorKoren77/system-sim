@@ -4201,13 +4201,14 @@ TEST_CASE("a search index still refuses ops") {
 //
 // An SLO may carry `over: <duration>`: the report then checks it on every window of that length
 // (aligned from the end of warmup) and the worst window decides. The loader owns the rule that
-// makes a window meaningful: `over` is a duration, at least one step (a window with no step in it
-// observes nothing) and at most the observed part of the run, duration - warmup (a longer window
-// never completes, so it would silently check nothing). These tests state the rule through what
-// the loader accepts and refuses; what a window measures is pinned in test_windows.cpp and
-// test_report.cpp. The refusals pin the message loosely: it must name `over` and the rule's
-// own words, so a message that only says "unknown key 'over'" (what the loader says today)
-// does not pass.
+// makes a window meaningful: `over` is a duration, a whole number of steps and at least one (a
+// window with no step in it observes nothing, and `over: 1500ms` at `step: 1s` would alternate
+// windows of two steps and of one), and at most the observed part of the run, duration - warmup
+// (a longer window would be the whole run under the name of a window it never filled). These tests
+// state the rule through what the loader accepts and refuses; what a window measures is pinned in
+// test_windows.cpp and test_report.cpp. The refusals pin the message loosely: it must name `over`
+// and the rule's own words, so a message that only says "unknown key 'over'" (what the loader says
+// today) does not pass.
 
 namespace {
 // One client, one service, no links (the SLO shape rules do not need them), a run of `timing`
@@ -4292,6 +4293,17 @@ TEST_CASE("an over shorter than the step is refused, naming over and the step") 
   }
 }
 
+// Steps of 1 s against `over: 1500ms`: window k is [1.5k s, 1.5(k + 1) s), and a step belongs to
+// the window its start falls in, so the windows hold the steps {0, 1}, {2}, {3, 4}, {5}, ...: two
+// steps and one in turn, not one length. The loader refuses it, as a windowed rate limiter's
+// `window` off the step grid is refused.
+TEST_CASE("an over that is not a whole number of steps is refused, naming over and the step") {
+  require_rejected_naming("simsys_over_off_grid.yaml",
+                          window_scenario("duration: 1h\nstep: 1s\n",
+                                          "{metric: utilization, node: s, max: 0.9, over: 1500ms}"),
+                          {"over", "whole number of steps", "step 1s"});
+}
+
 TEST_CASE("an over longer than the run is refused, naming over and the duration") {
   require_rejected_naming("simsys_over_beyond_run.yaml",
                           window_scenario("duration: 1h\nstep: 1s\n",
@@ -4301,7 +4313,7 @@ TEST_CASE("an over longer than the run is refused, naming over and the duration"
 
 // Warmup is not observed, so a window cannot reach back into it: with 10m of warmup in a 1h run
 // only 50m are observed, and a 55m window (shorter than the run, longer than what is observed)
-// would never complete.
+// would never be filled.
 TEST_CASE("an over longer than the run after warmup is refused although it fits the whole run") {
   require_rejected_naming("simsys_over_beyond_observed.yaml",
                           window_scenario("duration: 1h\nstep: 1s\nwarmup: 10m\n",

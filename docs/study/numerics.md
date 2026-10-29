@@ -488,25 +488,44 @@ CDF at z − kσ. The answered requests' moments are those of a **truncated** di
 original with everything past τ removed and the rest scaled back to 1 (divided by Φ(z)); the
 reports then fit their percentiles to the truncated moments and cap them at τ.
 
+**Which quantile of that fit.** The client's percentile at q is not the answered requests' own
+percentile at q. Of the requests the path delivered, a share s = 1 − Φ(z) timed out and every one
+of them is slower than τ, slower than every answered request. So the fastest q of the delivered
+requests (for q ≤ 1 − s) are all answered ones, the fastest q / (1 − s) of them:
+
+    client's q-quantile = answered requests' quantile at q_eff = q / (1 − s)
+
+and the report reads the refitted lognormal at z = Φ⁻¹(q_eff) (`queueing::normal_quantile`), capped
+at τ (`percentile_seen_by_client`, `src/report/report.cpp`). Read at q itself, the fit ignored the
+timed-out tail, and a timeout made a percentile look better: the path below behind a 530 ms
+timeout (0.78 % timed out) showed a p99 of 404 ms, under the 490 ms the same path has without a
+timeout; at q_eff = 0.99 / 0.99223 = 0.99776 the refit is at 591 ms, so the p99 is the cap, 530 ms
+(tests/theory/test_timeout.cpp derives both). As s rises to 1 − q, q_eff rises to 1 and the
+percentile to τ: it meets the rule for s > 1 − q (the timeout itself, `>τ`) continuously.
+
 **Checked against the binary.** A client at 10/s sending `get` to a service of 100 ms service
 time and 1k/s (c = 100, so no wait: the sojourn is exponential, m = 100 ms, v = 0.01 s², SCV 1)
 over a link of `latency: 0s`, with `timeout: 200ms` (σ = 0.8326, μ = −2.6492, z = 1.2488):
 
     client.op  offered/s  timed out/s  mean     p50     p95     p99  (estimated)
-    users.get         10        1.059  74ms  62.9ms  >200ms  >200ms
+    users.get         10        1.059  74ms  68.4ms  >200ms  >200ms
 
 89.41 % answered (JSON `answered_per_s` 8.941367), 10.59 % timed out, and the answered mean
 73.97 ms (`mean_s` 0.0739704), as the formulas give. At `timeout: 1s` 99.927 % are answered, at
-`50ms` 33.86 %. The p95 and the p99 print `>200ms`: more than 5 % of the delivered requests timed
-out, so no request at those quantiles was answered, and a latency SLO on them fails whatever its
-`max` (the review's C-1 rule, `percentile_seen_by_client` in `src/report/report.cpp`).
+`50ms` 33.86 %. The p50 is the refit (σ' = 0.5702, μ' = −2.7667) read at q_eff = 0.5 / 0.89414 =
+0.5592, z = 0.1489: exp(−2.7667 + 0.5702 × 0.1489) = 68.4 ms (at q it would be the refit's
+median, 62.9 ms; the untruncated path's median is 70.7 ms). The p95 and the p99 print `>200ms`:
+more than 5 % of the delivered requests timed out, so no request at those quantiles was answered,
+and a latency SLO on them fails whatever its `max` (the review's C-1 rule,
+`percentile_seen_by_client` in `src/report/report.cpp`).
 
 **Why a tiny cut moves a percentile.** At `timeout: 1s` the same path times out 0.073 % of its
-requests (`P(X > τ)` = Φ(−3.182) = 7.31e-4), yet its p99 falls from 490 ms to 465 ms, 5 %. The
+requests (`P(X > τ)` = Φ(−3.182) = 7.31e-4), yet its p99 falls from 490 ms to 475 ms, 3 %. The
 partial moments say why: the share of the k-th moment past τ is Φ(kσ − z), which grows with k.
 Past 1 s lie 0.073 % of the requests, 0.94 % of the first moment (Φ(σ − z)) and 6.5 % of the
 second (Φ(2σ − z)). Removing the tail takes 11 % of the variance with it (0.01 → 0.00889 s²) and
-the refitted lognormal is narrower: its p99 is exp(μ' + 2.326 σ') = 464.9 ms. Nothing is wrong:
+the refitted lognormal is narrower: read at q its p99 is exp(μ' + 2.326 σ') = 464.9 ms, and at
+q_eff = 0.99 / 0.99927 = 0.99073 (z = 2.354) it is 475.5 ms, the report's. Nothing is wrong:
 the requests' own p99 barely moved (it was below 1 s), but a percentile read off two moments
 reacts to a change in the second moment, and a heavy tail carries much more second moment than
 probability. The rate-limiter lab shows the same in a whole run: its clients' `timeout: 1s` cuts

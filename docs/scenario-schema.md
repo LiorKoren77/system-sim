@@ -40,7 +40,8 @@ New in v1.4:
   steps before it delivered, and the parallel steps of an op must be adjacent;
 - a client's [`timeout`](#drops-and-rejections): the slow tail of each step's response is timed
   out, not answered (`timed_out_per_s` in JSON, the series and `run`'s `timed out/s` column),
-  percentiles are capped at it, and a latency SLO whose quantile timed out fails;
+  a percentile at q is the answered requests' fit read at q / (1 − s) (s the share timed out) and
+  capped at it, and a latency SLO whose quantile timed out fails;
 - an SLO's [`over`](#slo): the SLO is checked per window and the worst window decides
   (`(worst 1h from 13:02)`, JSON's `window_start_s`);
 - [`simsys sweep`](#command-line-simsys-sweep-phase-2c): one scenario over a range of one key, the
@@ -320,10 +321,13 @@ target plus one step: the first step sends every step the full flow, and behind 
 node several times (`[a, a, a, a, a]`), each call thinned by the node's own loss, that lag can lock
 `run` into a sawtooth: one step offers the node much more than it drains (red, dropping), the next
 much less (thinned by the previous step's drops), and so on for the whole run. `estimate` thins by
-fractions averaged over its passes and settles at the true fixed point (five calls at 1k/s to a
-node of 3686/s and a room of one: 10 % dropped, 4095/s offered); if they do not settle, it warns
-`no steady state (a loop of gain >= 1, or delivered fractions that did not settle: a step after a
-failed step)`.
+fractions averaged over its passes, d̄ ← (1 − w) d̄ + w d, and halves a fraction's weight w
+(from 1/2) each time its average overshoots, so it settles at the true fixed point (five calls at
+1k/s to a node of 3686/s and a room of one: 10 % dropped, 4095/s offered; ten and twenty calls,
+whose fixed points are three and six times steeper, as well). The one limit: w stops at 1/1024,
+which settles any slope of the delivered fraction against itself down to −2047 (twenty calls are
+−6.2, a thousand −417). If the fractions still do not settle, it warns `no steady state (a loop of
+gain >= 1, or delivered fractions that did not settle: a step after a failed step)`.
 
 An op with an empty step list (`deliver: []`) is terminal: the node serves it and forwards
 nothing. *(graph)* Every step needs a link that carries demand from the node to its
@@ -345,7 +349,7 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 
 | type | own keys | status |
 |---|---|---|
-| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `keys` read by the [`che` caches](#che-hit-ratios) downstream (`keys must be a map`, `keys needs zipf and space, or uniform`, `keys takes zipf+space or uniform, not both`, `keys.zipf must be a finite non-negative number`, `keys.space must be a positive count (a whole number, optionally with k, M or G: 500, 10k, 100M)`, likewise `keys.uniform`; `space` and `uniform` are [counts](#values): `100M`); `timeout` read (a duration; absent: the client waits for ever): each step the client's response to an op is fitted as a lognormal, and the share slower than the timeout is timed out instead of answered (`timed_out_per_s` in JSON and in `run`'s `timed out/s` column, see [Drops and rejections](#drops-and-rejections)), the latencies are the answered share's (the lognormal's truncated moments) and every percentile is capped at the timeout, or is the timeout itself (`>1s` in the table) when more than its share of the requests timed out; it must be positive (`node 'u': timeout must be positive`); the servers still do a timed-out request's work, and nothing retries it; `sizes` checked: each names an op the client sends and is a [size](#values) (`sizes names op 'x', which the client does not send`, `sizes 'stream' must be a size (B, KB, MB or GB: 50MB): size must be at most 1e15B`, the parser's reason after the colon; `sizes 'stream' must be positive` for `0B`, a size but no request), read by byte-sized nodes (each request costs its size in MB); `retries` ignored |
+| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `keys` read by the [`che` caches](#che-hit-ratios) downstream (`keys must be a map`, `keys needs zipf and space, or uniform`, `keys takes zipf+space or uniform, not both`, `keys.zipf must be a finite non-negative number`, `keys.space must be a positive count (a whole number, optionally with k, M or G: 500, 10k, 100M)`, likewise `keys.uniform`; `space` and `uniform` are [counts](#values): `100M`); `timeout` read (a duration; absent: the client waits for ever): each step the client's response to an op is fitted as a lognormal, and the share slower than the timeout is timed out instead of answered (`timed_out_per_s` in JSON and in `run`'s `timed out/s` column, see [Drops and rejections](#drops-and-rejections)), the latencies are the answered share's (the lognormal's truncated moments), a percentile at q is their fit read at q / (1 − s) (s the share timed out, all slower than the answered ones) and capped at the timeout, or is the timeout itself (`>1s` in the table) when more than its share of the requests timed out; it must be positive (`node 'u': timeout must be positive`); the servers still do a timed-out request's work, and nothing retries it; `sizes` checked: each names an op the client sends and is a [size](#values) (`sizes names op 'x', which the client does not send`, `sizes 'stream' must be a size (B, KB, MB or GB: 50MB): size must be at most 1e15B`, the parser's reason after the colon; `sizes 'stream' must be positive` for `0B`, a size but no request), read by byte-sized nodes (each request costs its size in MB); `retries` ignored |
 | `cdn` | `origin` (node id, required), `hit_ratio` (`{fixed: h}` or `che`, optional), `keys`, `ttl`, `write_ops` | read and run (phase 2b), see [`cdn`](#cdn) |
 | `load_balancer` | `policy`, `vnodes` | read and run, see [`load_balancer`](#load_balancer) |
 | `rate_limiter` | `algorithm`, `limit`, `burst`, `window`, `backend` | read and run, see [`rate_limiter`](#rate_limiter) |
@@ -1103,7 +1107,7 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 
 | metric | `node` | `op` | `max` | evaluates |
 |---|---|---|---|---|
-| `p50_latency`, `p95_latency`, `p99_latency` | required, a **client** | optional, one the client sends | duration | the client's estimated end-to-end percentile over the **answered** requests; without `op`, the worst of its ops. Behind a client `timeout`, a percentile at quantile q of whose op more than 1 − q of the delivered requests timed out (more than 1 % for a p99) fails whatever its `max`, observing the timeout, with a note: `57.3% of delivered requests timed out (more than 1%)` (see [Drops and rejections](#drops-and-rejections)) |
+| `p50_latency`, `p95_latency`, `p99_latency` | required, a **client** | optional, one the client sends | duration | the client's estimated end-to-end percentile, fitted to the **answered** requests; without `op`, the worst of its ops. Behind a client `timeout` it is the percentile of everything the path delivered: the answered requests' fit read at q / (1 − s), s the share that timed out, and capped at the timeout; a percentile at quantile q of whose op more than 1 − q of the delivered requests timed out (more than 1 % for a p99) fails whatever its `max`, observing the timeout, with a note: `57.3% of delivered requests timed out (more than 1%)` (see [Drops and rejections](#drops-and-rejections)) |
 | `drop_rate` | optional | not allowed | number in [0, 1] | the node's dropped / the work sent to it, after warmup; without `node`, the worst node's or bandwidth link pipe's (a `node` names a node only) |
 | `reject_rate` | optional | not allowed | number in [0, 1] | **new in v1.2**: the node's rejected (a rate limiter's refusals, a leaky bucket's overflow included) / the requests sent to it, after warmup; without `node`, the worst node's |
 | `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup, of the copy the node reports: behind a `consistent_hash` balancer the **hottest copy** (`k = 1 + z_M/√vnodes` × the average share, z_M the expected maximum of M standard normals, see [`load_balancer`](#load_balancer)), on a `kv_cluster` its hottest machine (`k = min(1 + z_M/√(N·vnodes), nodes/N)`, see [`kv_cluster`](#kv_cluster)), on a `sql_db` the busier kind of copy (primary or replica); a byte-sized node's in megabytes |
@@ -1119,18 +1123,28 @@ rate, reject rate and utilization are measured per node, not per op.
 the whole run, and the **worst** window decides (a fail before a pass, then the highest observed
 value). The windows are aligned from the end of warmup and follow one another (`warmup: 2m`,
 `over: 1h`: 00:02-01:02, 01:02-02:02, ...); a step belongs to the window its start falls in; a
-last window shorter than `over` is still checked; a window in which nothing was offered (by the
-latency SLO's client op, or by any client for the other metrics) is skipped, and an SLO all of
+last window shorter than `over` is still checked. Every window is judged: a node still draining a
+queue after its clients stopped is busy, and its utilization, drops or lag count. Only a latency
+SLO skips a window in which its client op was not offered (no request, no latency), and one all of
 whose windows are skipped is `skipped`. Each window is measured exactly as a whole run is (its
-percentiles capped at, or set to, a client's timeout by the same rule). The table names the
-window that decided, `(worst 10m from 00:20)` (its start on the run's clock, warmup included);
-JSON gives it as `window_start_s` (seconds from the start of the run; `null` when skipped), a key
-only an SLO with `over` has. `over` must be at least one step and at most duration − warmup:
-`slo: over must be at least one step (50ms < step 100ms)`, `slo: over must fit in the run after
-warmup (2h > duration 1h - warmup 0s)`. `run --duration` is held to the same rule with the
-duration it gives (youtube, `--duration 10m`: `error: --duration 10m: over must fit in the run
-after warmup (1h > duration 10m - warmup 5m)`, exit 1). Fixed windows split a burst that
-straddles two of them (a sliding window would find a slightly worse one).
+percentiles read and capped, or set to, a client's timeout by the same rule). The table names the
+window that decided, `(worst 10m from 00:20)` (its start on the run's clock, warmup included:
+`HH:MM`, or `HH:MM:SS` when it is not on a whole minute, `00:19:59`; past the first day the exact
+duration from the start); a last window cut short by the end of the run is named with the length
+it had (url-shortener, `run --duration 870m`: `(worst 28m from 14:02, the run's short last
+window)`). JSON gives the start as
+`window_start_s` (seconds from the start of the run; `null` when skipped), a key only an SLO with
+`over` has. `estimate` measures no window (one steady state at t = 0): it checks an SLO with
+`over` on that state and says so, `(at 00:00 only: run checks each 1h)`, with no `window_start_s`.
+`over` must be a whole number of steps, at least one, and at most duration − warmup: `slo: over
+must be at least one step (50ms < step 100ms)`, `slo: over must be a whole number of steps
+(1500ms, step 1s)` (windows of two steps and of one in turn otherwise), `slo: over must fit in the
+run after warmup (2h > duration 1h - warmup 0s)`. `run --duration` is held to the same rule with
+the duration it gives (youtube, `--duration 10m`: `error: --duration 10m: over must fit in the run
+after warmup (1h > duration 10m - warmup 5m)`, exit 1). Fixed windows split a burst that straddles
+two of them, and a sliding window can find a much worse one: an 8-minute spike to 0.9 from 00:20
+on a load of 0.5, checked `over: 10m` after a 5-minute warmup, is cut into 0.7 and 0.62 by the
+grid (00:15-00:25, 00:25-00:35), where the sliding window 00:20-00:30 holds all of it, 0.82.
 
 ### Queue lag
 
@@ -1250,7 +1264,14 @@ requests timed out (more than 1 % for the p99, 5 % for the p95, half for the p50
 was answered, so the percentile is the timeout, printed `>1s` in `run`'s table, and a latency SLO
 on it **fails** whatever its `max` (it observes the timeout; the note says how many timed out:
 `57.3% of delivered requests timed out (more than 1%)`): the client cannot vouch for a quantile it
-never saw answered. Otherwise the percentile is the answered requests' fit, capped at the timeout.
+never saw answered. Otherwise, with a share s ≤ 1 − q timed out, the percentile is the answered
+requests' fit read at **q / (1 − s)**, capped at the timeout: every timed-out request is slower
+than every answered one, so the fastest q of the delivered requests are the fastest q / (1 − s)
+of the answered ones. (Read at q itself, the fit ignored the timed-out tail and a timeout lowered
+the percentile: an M/M/1 path of p99 490 ms showed 404 ms behind a 530 ms timeout, 0.78 % timed
+out, and passed a 420 ms SLO; read at 0.99 / 0.9922 its p99 is the timeout, 530 ms, and the SLO
+fails.) At s = 1 − q the level reaches 1 and the percentile the timeout, where the rule above
+takes over.
 `run`'s op table has a `timed out/s` column when some client has a timeout; JSON prints `null`
 for the latencies of an op of which nothing was answered in time (every delivered request timed
 out).

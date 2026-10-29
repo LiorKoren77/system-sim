@@ -2586,6 +2586,22 @@ TEST_CASE("the op table prints >200ms for a p99 more than 1 percent of whose req
   REQUIRE(row[6] == ">200ms");
 }
 
+// The p50 that was answered is the client's p50, not the answered requests' own median: 10.59 % of
+// the delivered requests timed out, every one slower than every answered one, so the client's
+// fastest half are the answered requests' fastest 0.5 / 0.894137 = 0.5592 (review of the Task 12/13
+// fix rounds and Task 14, C-1). The answered requests' refit (mean 73.97 ms, variance
+// 0.0021022 s^2: sigma' = 0.57020, mu' = -2.76665) read there, z = Phi^-1(0.5592) = 0.14894, is
+//   exp(-2.76665 + 0.57020 x 0.14894) = 68.44 ms;
+// its median, exp(mu'), the old reading, is 62.87 ms.
+TEST_CASE("the p50 behind a 200 ms timeout is the answered fit read at 0.5 / 0.894: 68.44 ms",
+          "[report]") {
+  const auto s = timing_out(200ms);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto ops = summarize(s, g).ops();
+  REQUIRE(ops.size() == 1);
+  REQUIRE_THAT(ops[0].p50_s, WithinRel(0.068445, 1e-4));
+}
+
 // Without a timeout nothing times out, and the op table keeps its old six columns.
 TEST_CASE("the op table has no timed out column when no client has a timeout", "[report]") {
   const auto s = timing_out(std::nullopt);

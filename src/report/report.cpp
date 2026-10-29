@@ -314,27 +314,54 @@ constexpr Quantile ninety_ninth{.level = 0.99, .z = queueing::z_p99};
 //    `beyond_timeout`. A latency SLO at q then fails whatever its max: past a max below the
 //    timeout the requests are certainly slower, and a max at or above it cannot be checked
 //    (the client stopped measuring at the timeout).
-//  - With one, otherwise: the fit, capped at the timeout. The fit to the answered requests'
-//    truncated moments has a tail past the cut that the truncated distribution does not (mean
-//    73.97 ms, variance 0.0021022 s² after a 200 ms timeout put its p99 at 236.7 ms); the cap is
-//    the truncation it forgets.
-// The cap alone is not enough: the refit's p99 stays below the timeout though more than 1 %
-// timed out (an exponential path of mean 100 ms against 391 ms: 2 % time out, the refit's p99 is
-// 357 ms, 0.91 of the timeout), and an SLO of 380 ms would pass on requests never answered.
+//  - With one, otherwise: the answered requests' fit read at the higher level
+//      q_eff = q / (1 − s)        (s the timed-out share, s <= 1 − q, so q_eff <= 1)
+//    and capped at the timeout. Why q_eff: of the client's delivered requests a share 1 − s was
+//    answered (all faster than the timeout) and a share s timed out (all slower). The fastest q of
+//    them are therefore all answered ones, the fastest q / (1 − s) of the answered requests: the
+//    client's q-quantile is the answered requests' q_eff-quantile (review of the Task 12/13 fix
+//    rounds and Task 14, C-1). Reading the fit at q itself ignored the timed-out tail and made a
+//    timeout LOWER a percentile: an M/M/1 path at rho 0.99 (p99 490 ms) behind a 530 ms timeout
+//    (0.78 % timed out) showed a p99 of 404 ms. q_eff -> 1 as s -> 1 − q, where the fit's tail
+//    reaches the cap: the percentile meets the timeout from below, continuous with the first rule.
+//    The cap is still needed: the fit to the answered requests' truncated moments has a tail past
+//    the cut that the truncated distribution does not (mean 73.97 ms, variance 0.0021022 s² after
+//    a 200 ms timeout put its p99 at 236.7 ms); the cap is the truncation it forgets.
+// The cap alone is not enough for the first rule: the refit's p99 stays below the timeout though
+// more than 1 % timed out (an exponential path of mean 100 ms against 391 ms: 2 % time out, the
+// refit's p99 is 357 ms, 0.91 of the timeout), and an SLO of 380 ms would pass on requests never
+// answered.
 struct SeenPercentile {
   double seconds;
   bool beyond_timeout;
 };
 
+// The answered requests' lognormal fit read at the z-score `z`, capped at the timeout.
+[[nodiscard]] double capped_fit(double mean_s, double variance_s2, double z, double timeout_s) {
+  return std::min(queueing::lognormal_quantile(mean_s, variance_s2, z), timeout_s);
+}
+
 [[nodiscard]] SeenPercentile percentile_seen_by_client(double mean_s, double variance_s2,
                                                        double share_timed_out,
                                                        std::optional<double> timeout_s,
                                                        Quantile q) {
-  if (timeout_s && quantile_timed_out(share_timed_out, q)) {
+  if (!timeout_s) {
+    return {.seconds = queueing::lognormal_quantile(mean_s, variance_s2, q.z),
+            .beyond_timeout = false};
+  }
+  if (quantile_timed_out(share_timed_out, q)) {
     return {.seconds = *timeout_s, .beyond_timeout = true};
   }
-  const double fitted = queueing::lognormal_quantile(mean_s, variance_s2, q.z);
-  return {.seconds = timeout_s ? std::min(fitted, *timeout_s) : fitted, .beyond_timeout = false};
+  // Nothing timed out: q_eff = q, read at q's own constant z, so such a client's figures are
+  // exactly what they were before the rule.
+  if (share_timed_out <= 0.0) {
+    return {.seconds = capped_fit(mean_s, variance_s2, q.z, *timeout_s), .beyond_timeout = false};
+  }
+  const double q_eff = q.level / (1.0 - share_timed_out);
+  // s = 1 − q exactly: q_eff = 1, the fit's far tail, which the cap turns into the timeout.
+  if (q_eff >= 1.0) return {.seconds = *timeout_s, .beyond_timeout = false};
+  return {.seconds = capped_fit(mean_s, variance_s2, queueing::normal_quantile(q_eff), *timeout_s),
+          .beyond_timeout = false};
 }
 
 // The same question of a summarised op.
@@ -350,9 +377,9 @@ struct SeenPercentile {
   return op.answered_per_s <= 0.0;
 }
 
-// An op nobody sent (a client of rate 0, `rate: {base: 0/s}`): no request, so no latency either.
-// A latency SLO leaves it out without a note, as a window with nothing offered is skipped
-// (offered_in): nothing went wrong (review of the kv/search fix round, M-1).
+// An op nobody sent (a client of rate 0, `rate: {base: 0/s}`, or an SLO window in which the op was
+// not offered): no request, so no latency either. A latency SLO leaves it out without a note:
+// nothing went wrong (review of the kv/search fix round, M-1).
 [[nodiscard]] bool nothing_offered(const OpSummary& op) {
   return op.offered_per_s <= 0.0;
 }
@@ -548,17 +575,6 @@ void fail_if_quantile_timed_out(SloResult& result, std::span<const OpSummary> op
 }
 
 // ---- SLOs per window (plan 2c Task 14) ----
-
-// Was anything the SLO is about offered in `window`? For a latency SLO, its client's op (or ops);
-// for any other, any client's. A window without it has nothing to judge (an idle service's p99
-// is its service time's, a bound no request met), so it is skipped.
-[[nodiscard]] bool offered_in(const Summary& window, const model::SloSpec& slo) {
-  for (const auto& op : window.ops()) {
-    const bool concerned = !is_latency(slo.metric) || slo_reads_op(slo, op);
-    if (concerned && op.offered_per_s > 0.0) return true;
-  }
-  return false;
-}
 
 // Are `a` and `b` the same SLO, every key alike? Written out rather than a defaulted
 // SloSpec::operator==: SimTime's == (std::chrono's) is not reachable through the model module's
@@ -792,14 +808,24 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   std::unreachable();
 }
 
-[[nodiscard]] std::string clock_or_duration(SimTime t);  // defined with explain's rate curve
+// Defined with explain's rate curve.
+[[nodiscard]] std::string clock_or_duration(SimTime t);
+[[nodiscard]] std::string window_clock(SimTime t);
 
 // Which window decided an SLO with `over`: `(worst 10m from 00:20)`, its length as `over` reads
-// and its start on the run's clock (explain's form: HH:MM in the first day). Empty otherwise.
+// and its start on the run's clock (window_clock). A last window cut short by the end of the run
+// is labelled with the length it had: `(worst 28m from 14:02, the run's short last window)`.
+// Under `estimate`, which measured no window: `(at 00:00 only: run checks each 1h)`. Empty
+// without `over`, or when every window was skipped.
 [[nodiscard]] std::string window_text(const SloResult& r) {
-  if (!r.slo.over || !r.window_start) return {};
-  return "(worst " + describe_duration(*r.slo.over) + " from " +
-         clock_or_duration(*r.window_start) + ")";
+  if (!r.slo.over) return {};
+  if (r.at_one_instant) {
+    return "(at 00:00 only: run checks each " + describe_duration(*r.slo.over) + ")";
+  }
+  if (!r.window_start || !r.window_length) return {};
+  const bool cut_short = r.window_length->count() < r.slo.over->count();
+  return "(worst " + describe_duration(*r.window_length) + " from " +
+         window_clock(*r.window_start) + (cut_short ? ", the run's short last window)" : ")");
 }
 
 // The trailing, unlabelled cell of an SLO's row: the window that decided it and why the verdict
@@ -814,8 +840,6 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   if (slos.empty()) return {};
   std::vector<Row> rows{{{"status"}, {"metric"}, {"node"}, {"op"}, {"observed"}, {"max"}}};
   for (const auto& r : slos) {
-    // C++23 std::optional::transform: applies the function to a present value and passes
-    // an empty optional through, replacing `observed ? f(*observed) : nullopt`.
     const auto observed =
         r.observed.transform([&](double v) { return fmt_slo_value(r.slo.metric, v); });
     Row row{status_cell(r.status, color), {std::string{model::to_string(r.slo.metric)}},
@@ -943,9 +967,9 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
                           json_field("max", json_number(limit_value(r.slo.max))),
                           json_field("status", json_string(status_name(r.status))),
                           json_field("note", r.note.empty() ? "null" : json_string(r.note))};
-  if (!r.slo.over) return json_object(fields);
-  // Only an SLO with `over` has the key: its worst window's start, in seconds from the start of
-  // the run; null when no window had anything offered.
+  if (!r.slo.over || r.at_one_instant) return json_object(fields);
+  // Only an SLO with `over` that `run` judged has the key (estimate measured no window): its worst
+  // window's start, in seconds from the start of the run; null when every window was skipped.
   std::vector<std::string> windowed{fields.begin(), fields.end()};
   windowed.push_back(json_field("window_start_s",
                                 r.window_start ? json_number(seconds(*r.window_start)) : "null"));
@@ -1007,6 +1031,21 @@ template <class T, class F>
   if (ns < 0 || ns >= day_ns || ns % minute_ns != 0) return fmt_duration(t);
   const auto minutes = ns / minute_ns;
   return two_digits(minutes / 60) + ":" + two_digits(minutes % 60);
+}
+
+// A window's start on the run's clock: explain's HH:MM for a whole minute of the first day,
+// HH:MM:SS for a whole second (a warmup of 1199 s starts the first window at 00:19:59, which
+// clock_or_duration would round to "20m"), else the exact duration from the start of the run
+// ("1500ms"; "1502m" for 25:02, past the first day).
+[[nodiscard]] std::string window_clock(SimTime t) {
+  constexpr auto second_ns = (1_s).count();
+  constexpr auto day_ns = (24_h).count();
+  const auto ns = t.count();
+  if (ns < 0 || ns >= day_ns || ns % second_ns != 0) return describe_duration(t);
+  if (ns % (60 * second_ns) == 0) return clock_or_duration(t);
+  const auto total_s = ns / second_ns;
+  return two_digits(total_s / 3600) + ":" + two_digits(total_s / 60 % 60) + ":" +
+         two_digits(total_s % 60);
 }
 
 [[nodiscard]] std::string level_summary(const workload::RateCurve& curve) {
@@ -2774,6 +2813,13 @@ void Summary::LinkTotals::add(const engine::LinkSample& sample, double dt_s) {
 
 Summary::Summary(const graph::Graph& g, SimTime warmup) : Summary{g, warmup, true} {}
 
+Summary Summary::of_estimate(const graph::Graph& g, const engine::StepRecord& record) {
+  Summary summary{g, SimTime{0}, false};
+  summary.estimate_ = true;
+  summary.observe(record);
+  return summary;
+}
+
 Summary::Summary(const graph::Graph& g, SimTime warmup, bool track_windows)
     : graph_{&g}, warmup_{warmup}, nodes_(g.nodes().size()) {
   for (const auto& link : g.links()) {
@@ -2845,19 +2891,32 @@ void Summary::observe_windows(const engine::StepRecord& record) {
   }
 }
 
-// The current window of `windowed` judged like a whole run (evaluate_slo), with where it starts;
-// skipped when nothing the SLO is about was offered in it (offered_in).
+// The current window of `windowed` judged like a whole run (evaluate_slo), with where it starts.
+// Every window is judged (review of the Task 12/13 fix rounds and Task 14, I-1): a queue still
+// draining after its clients stopped is busy, and its utilization, drops or lag in that window
+// count. Only a latency SLO skips a window, one in which its op was not offered: the same
+// evaluate_slo leaves out an op nobody sent (worst_latency, nothing_offered), as an idle
+// service's p99 would be its service time's, a bound no request met.
 SloResult Summary::judge_window(const WindowedSlo& windowed) const {
   const Summary& window = windowed.current.front();
-  if (!offered_in(window, windowed.slo)) return skipped(windowed.slo);
   SloResult result = evaluate_slo(window, window.nodes(), window.ops(), windowed.slo);
-  if (result.status != SloStatus::skipped) {
-    result.window_start = SimTime{warmup_.count() + windowed.index * windowed.slo.over->count()};
-  }
+  if (result.status == SloStatus::skipped) return result;
+  // Where it starts, and how long it is: `over`, or up to the end of its last step when the run
+  // ends first (the still-open last window, windowed_verdict). `.count()` arithmetic, as above.
+  const auto over = windowed.slo.over->count();
+  const auto start = warmup_.count() + static_cast<SimTime::rep>(windowed.index) * over;
+  const auto end = window.last_t_->count() + graph_->scenario().step.count();
+  result.window_start = SimTime{start};
+  result.window_length = SimTime{std::min(over, end - start)};
   return result;
 }
 
 SloResult Summary::windowed_verdict(const model::SloSpec& slo) const {
+  if (estimate_) {
+    SloResult result = evaluate_slo(*this, nodes(), ops(), slo);
+    result.at_one_instant = true;
+    return result;
+  }
   const auto found = std::ranges::find_if(
       windows_, [&](const WindowedSlo& windowed) { return same_slo(windowed.slo, slo); });
   if (found == windows_.end() || found->current.empty()) return skipped(slo);
