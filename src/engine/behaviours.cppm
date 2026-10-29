@@ -140,8 +140,10 @@ struct NothingLost {
 // 11, "a step after a failed step does not run"): what each call delivered at the end of the
 // LAST step, which a node whose calls follow one another (a service's steps, a cache's store hop
 // and `then` steps, a worker pool's hand-offs: detail::HopBlocks::forward) uses to send a later
-// call only the requests that survived the earlier ones. A node whose calls all start with the
-// request (a balancer's or a limiter's routes, a leaf) has nothing to thin and ignores it.
+// call only the requests that survived the earlier ones; a rate limiter thins its admitted flow
+// by its counter check's fraction (it fails closed). A node whose calls all start with the request
+// (a balancer's routes, a leaf) or whose calls nobody waits for (a blob store's events) has
+// nothing to thin and ignores it.
 template <class B>
 concept NodeBehaviour = requires(const B b, B& node, const flow::Flow& in, SimTime now, SimTime dt,
                                  flow::LatencyEstimate own) {
@@ -306,16 +308,19 @@ class HopBlocks {
   //                              (f the share that takes it: a miss block fails only its misses,
   //                              h + (1 − h) × d for a cache's hit ratio h; 1 for a plain step)
   //   inside a block           hop j is sent S × f × Π_{i<j} d_i: a miss takes its fetches in turn
-  //   the parallel group       every member is sent the S of the point where the group's first
-  //                            member sits (they start together and do not thin one another);
-  //                            from there on S ← S × Π survival(member): the group fails as a
-  //                            whole, a request lost by any member is lost
+  //   the parallel group       every member is sent the S of the point where the group sits
+  //                            (they start together and do not thin one another; Graph::build
+  //                            makes its members adjacent); after it S ← S × Π survival(member):
+  //                            the group fails as a whole, a request lost by any member is lost
   // An asynchronous hop (nobody waits for it) survives as 1: it fails no request. The model
   // assumes the calls fail independently (as `delivered` does) and that a failed request costs
   // its later targets nothing (no retry, no timeout spent waiting: phase 3). Its blind spot is
-  // the lag: d is last step's, so the first step sends every call the full flow and a change of
-  // loss reaches the calls after it one step late (the engine's forward pass runs before the
-  // backward pass that measures this step's d).
+  // the lag: d is last step's (the engine's forward pass runs before the backward pass that
+  // measures this step's d), and a failing call's d moves only once its flow has crossed the
+  // link to it, so a change of loss reaches the calls after it that link's delay plus one step
+  // late (behind a 500 ms link at 100 ms steps the later calls are sent the full flow until
+  // 0.6 s). Calls that load one another's losses can lock `run` into a sawtooth (the engine's
+  // estimate() says when, and how settle mode avoids it).
   void forward(std::string_view op, Rate rate, std::vector<Outgoing>& outgoing,
                FractionLookup auto&& delivered_last_step) const {
     const auto blocks = blocks_of(op);
@@ -498,6 +503,7 @@ class ServiceBehaviour {
   // `dt` are unused: a service holds no state between steps (see NodeBehaviour).
   // An explicit template head rather than `FractionLookup auto&&`: a default argument needs a
   // type to default to, and an abbreviated parameter has none.
+  // C++20 type-constraint: `template <C T>` is shorthand for `template <class T> requires C<T>`.
   template <FractionLookup Lookup = NothingLost>
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/,
                              Lookup&& delivered_last_step = {}) const {
@@ -821,7 +827,12 @@ class LoadBalancerBehaviour {
 // admitted or not; what it admits goes on over its links like a load balancer's flow; what
 // it refuses is `rejected`, answered at once and never forwarded; with a `backend` (the
 // counter store) every request it CHECKS, admitted or refused, first reads its counter
-// there (one `counter` request each), which adds that hop to the response. Each of the five
+// there (one `counter` request each), which adds that hop to the response. A check the store
+// lost fails the request closed: it is neither admitted onwards nor answered, so the admitted
+// flow is forwarded × the share of the checks the store answered (last step's, as for any later
+// step: detail::HopBlocks::forward), the same factor `delivered` multiplies by. (Failing open, an
+// unanswered check letting the request through, is the other choice real limiters make; it would
+// forward everything and answer what the check lost.) Each of the five
 // algorithms of ch. 4 keeps its own state, stepped once per step of length dt that starts at
 // `now`. With W = limit × window (requests a window may hold) and `in` the inflow (req/s):
 //  - token_bucket: a bucket of at most `burst` tokens, refilled at `limit` per second, one
@@ -869,8 +880,8 @@ class LoadBalancerBehaviour {
 // its own sojourn plus the counter check. Its CALLER sends its later steps only the requests
 // the gate let through: a refused request is answered with a 429 and goes no further, so the
 // gate's delivered fraction (its refusals included) thins the steps after it, one simulation
-// step late (detail::HopBlocks::forward). The refused share shows in the gate's reject rate
-// and, through `delivered`, in the answered rate the client sees.
+// step plus the link's delay late (detail::HopBlocks::forward). The refused share shows in the
+// gate's reject rate and, through `delivered`, in the answered rate the client sees.
 class RateLimiterBehaviour {
  public:
   RateLimiterBehaviour(const graph::Graph& g, std::size_t self);
@@ -882,13 +893,17 @@ class RateLimiterBehaviour {
   // starts at `now` and lasts `dt`, so it is not const (see NodeBehaviour). Throws
   // std::invalid_argument for dt <= 0 (the bucket would divide by it; a programmer error,
   // as in fluid::FluidQueue::advance).
-  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt);
-  // The engine's call (see NodeBehaviour): the admitted flow and the counter checks both start
-  // with the request, so last step's losses thin nothing here (the gate's own refusals do,
-  // at its caller: the class comment).
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) {
+    return route_checked(in, now, dt, 1.0);
+  }
+  // The engine's call (see NodeBehaviour): the counter check comes BEFORE the request is passed
+  // on (as in `response`), so the limiter fails closed: a request whose check was lost is not
+  // forwarded. The admitted flow is thinned by the check's delivered fraction of the last step
+  // (detail::HopBlocks::forward's rule for a later step), matching `delivered`.
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt,
-                             FractionLookup auto&& /*delivered_last_step*/) {
-    return route(in, now, dt);
+                             FractionLookup auto&& delivered_last_step) {
+    const double check = backend_ ? delivered_last_step(backend_->target, graph::counter_op) : 1.0;
+    return route_checked(in, now, dt, check);
   }
 
   // One capacity unit per request, admitted or rejected: the check costs the same.
@@ -952,6 +967,10 @@ class RateLimiterBehaviour {
   [[nodiscard]] double admit_sliding_counter(double offered_per_s, SimTime now, double dt_s);
   // Moves the window counters to the window containing `now`.
   void enter_window_of(SimTime now);
+  // `route` with the share of the counter checks that answered, `check_answered`: the admitted
+  // flow is forwarded × that share (fail closed), the counter checks are sent whole.
+  [[nodiscard]] Routed route_checked(const flow::Flow& in, SimTime now, SimTime dt,
+                                     double check_answered);
 
   detail::Forwarding forwarding_;
   std::optional<BackendHop> backend_{};
@@ -1434,18 +1453,20 @@ class BlobStoreBehaviour {
 
   // Serves every incoming op and sends rate × factor of each `then` step's op for each write it
   // served (the class comment's events; a read sends nothing). `now` and `dt` are unused (a store
-  // holds no state between steps). Every event is asynchronous, so none fails the request and
-  // `delivered_last_step` thins none of the events after it (detail::HopBlocks::forward); the
-  // template head as in ServiceBehaviour::route.
-  template <FractionLookup Lookup = NothingLost>
-  [[nodiscard]] Routed route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/,
-                             Lookup&& delivered_last_step = {}) const {
+  // holds no state between steps).
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
     Routed routed = detail::serve_everything(in);
     for (const auto& [op, rate] : routed.served.entries()) {
-      events_.forward(op, rate, routed.outgoing, delivered_last_step);
+      events_.forward(op, rate, routed.outgoing, NothingLost{});
     }
     detail::sort_by_destination(routed.outgoing);
     return routed;
+  }
+  // The engine's call (see NodeBehaviour): every event is asynchronous, so none fails the request
+  // and last step's losses thin none of the events after it.
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt,
+                             FractionLookup auto&& /*delivered_last_step*/) const {
+    return route(in, now, dt);
   }
 
   // Capacity units one request of `op` uses (graph::op_cost): its megabytes, or 1 for a store
@@ -2162,7 +2183,8 @@ double RateLimiterBehaviour::admit_sliding_counter(double offered_per_s, SimTime
 // Every op keeps the same admitted fraction: the limiter counts requests, not ops, so
 // under a limit the op mix that gets through is the mix that arrived (and so is the
 // rejected part). Zero rates are skipped, so an empty or idle inflow yields empty flows.
-Routed RateLimiterBehaviour::route(const flow::Flow& in, SimTime now, SimTime dt) {
+Routed RateLimiterBehaviour::route_checked(const flow::Flow& in, SimTime now, SimTime dt,
+                                           double check_answered) {
   if (dt.count() <= 0) {
     throw std::invalid_argument{"RateLimiterBehaviour::route: dt must be > 0"};
   }
@@ -2177,7 +2199,7 @@ Routed RateLimiterBehaviour::route(const flow::Flow& in, SimTime now, SimTime dt
     const double refused = rate.per_second - passed;
     if (passed > 0.0) {
       routed.served.add(op, Rate{passed});
-      forwarding_.forward(op, Rate{passed}, routed.outgoing);
+      forwarding_.forward(op, Rate{passed * check_answered}, routed.outgoing);
     }
     if (refused > 0.0) routed.rejected.add(op, Rate{refused});
   }

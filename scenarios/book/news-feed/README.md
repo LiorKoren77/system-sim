@@ -28,9 +28,14 @@
   replica first) and `drop_rate` fails (exit 2), while the `read_feed` p99 (89.2 ms of 200 ms)
   and `fanout_q`'s lag (`<1us` of 2 m) pass. A request stops at its first failed step (plan 2c
   Task 12), so the losses also thin what follows them: a `read_feed` whose `feed_cache` lookup was
-  dropped hydrates no posts. That keeps `post_cache` and `user_cache` below saturation (mean rho
-  0.476 and 0.465; they drop 974.8 and 764.8 requests in the whole day, all in the first 0.1 s
-  step, which still sends every step the whole flow); before, they saturated at the peaks. And a
+  dropped hydrates no posts. That keeps `post_cache` and `user_cache` below capacity for all but
+  one step of the day (mean rho 0.476 and 0.465; before, they saturated at the peaks). That step
+  is the 0.1 s in which the 12:00 spike starts: they reach rho 1 (`peak_rho` 1, `red_s` 0.1) and
+  drop 974.8 and 764.8 requests, the whole day's drops after warmup, because that step's
+  hydrations are still thinned by the share of reads `feed_cache` delivered in the step BEFORE the
+  spike (0.47) instead of the spike's own (0.16): the model's one-step lag (a step's losses thin
+  the later steps from the next simulation step on). From the next step on they are back below
+  capacity. And a
   `post` whose `post_db` write was dropped is not published, so `fanout` drains at most the
   primary's 1k writes/s (5k units/s at 5 units a write).
 - Queue lag at the evening peak as the fan-out workers fall behind.

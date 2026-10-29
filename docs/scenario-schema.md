@@ -252,17 +252,25 @@ A **step** is `{to: <node id>, op: <op name>, on: always|miss|failure, mode: seq
 | `to` | required | read | a declared node, **not the node itself** (a retry, the one reason to call yourself, is `client.retries`); *(graph)* not a client (clients only send) |
 | `op` | the incoming op | read | required in `then` steps, which have no incoming op to inherit |
 | `on` | `always` | read | `miss` applies to the flow a cache did not serve, `failure` to failed requests. In an op's step list, an `on: miss` step belongs to the nearest unconditional step before it, its lookup, which must ask a `cache` for a read, leave the miss to the application, and be waited for. *(graph)* `node 'web': an 'on: miss' step must follow a cache step`; `... cannot follow a write to cache 'c' (writes do not miss)`; `... cannot follow read_through cache 'c' (the cache already fetched the miss)`; `... cannot follow cdn 'edge' (the cdn already fetched the miss from its origin)` (a CDN fetches its own misses, see [`cdn`](#cdn)); `... and the cache step it follows must be sequential (the miss step waits for the cache's answer)`. A miss step is taken by the miss fraction `1 − h` of the requests (`h` the cache's hit ratio, stated or [resolved at build](#che-hit-ratios); a cache built in code without one counts as `h = 0`, and `explain` marks the checks that rest on it). After a lookup of `factor: k` it sends `k(1 − h)` requests per request: every missed lookup is fetched. Several `on: miss` steps after one lookup form one block that a miss takes whole, one step after another: the response adds `1 − h` × the sum of their hops on average, with the hit/miss spread in the variance, and a miss is answered only if every fetch is. (For latency, a request's `k` lookups are assumed to hit or miss together.) `failure` steps never fire before phase 2c |
-| `mode` | `sequential` | read | sequential steps add their latencies; **all parallel steps of an op form one group wherever they sit** among the sequential ones, and the group costs its slowest branch |
+| `mode` | `sequential` | read | sequential steps add their latencies; **the parallel steps of an op form one group** and must be adjacent (before, between or after the sequential ones), and the group costs its slowest branch. *(graph)* `node 'web': the parallel steps of op 'get' must be adjacent (they form one group)`; for `then` steps, `node 'c': the parallel then steps must be adjacent (they form one group)` |
 | `factor` | 1 | read | finite, positive, at most `1e6`; multiplies the flow (fan-out: one post → 100 feed writes) |
 | `size` | none | checked | a [size](#values): the payload this step's request carries (a transcoder's 50 MB rendition), what a byte-sized node charges the request, in MB; positive (`step size must be a size (B, KB, MB or GB: 50MB): missing size unit`, the parser's reason after the colon; `step size must be positive` for `0B`) |
 
 **A step after a failed step does not run** *(phase 2c)*: a request is answered only if every
 step it waits for is, so each step is sent only the requests the steps before it delivered
-(sequential steps thin one another, the parallel group fails as a whole and thins what follows
-the point where its first member sits, a miss block fails only its misses), at a service, at a
+(sequential steps thin one another, the parallel group fails as a whole and thins the steps
+after it, a miss block fails only its misses), at a service, at a
 cache (store hop and `then` steps) and at a worker pool (its `then` steps). The fractions are the
-previous simulation step's, so the thinning is one step late: the first step sends every step
-the full flow.
+previous simulation step's, so the thinning is late by the delay of the link to the failing step's
+target plus one step: the first step sends every step the full flow, and behind a 500 ms link at
+100 ms steps the later steps receive the full flow until 0.6 s. When an op calls one overloaded
+node several times (`[a, a, a, a, a]`), each call thinned by the node's own loss, that lag can lock
+`run` into a sawtooth: one step offers the node much more than it drains (red, dropping), the next
+much less (thinned by the previous step's drops), and so on for the whole run. `estimate` thins by
+fractions averaged over its passes and settles at the true fixed point (five calls at 1k/s to a
+node of 3686/s and a room of one: 10 % dropped, 4095/s offered); if they do not settle, it warns
+`no steady state (a loop of gain >= 1, or delivered fractions that did not settle: a step after a
+failed step)`.
 
 An op with an empty step list (`deliver: []`) is terminal: the node serves it and forwards
 nothing. *(graph)* Every step needs a link that carries demand from the node to its
@@ -394,7 +402,8 @@ give it `{fixed: h}`.
 
 **Terminal gate.** A limiter whose only outgoing link is its backend answers every admitted
 request itself. Its caller sends its own later steps only the requests the gate let through
-(a step after a failed step does not run, see [Steps](#steps)), one simulation step late; the
+(a step after a failed step does not run, see [Steps](#steps)), one simulation step plus the
+link's delay late; the
 refused share shows in the gate's reject rate and in the client's answered rate.
 
 Not resolved: anything inside a step (a window is a whole number of steps, so its

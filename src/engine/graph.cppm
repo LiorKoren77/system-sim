@@ -809,6 +809,40 @@ namespace {
   return std::nullopt;
 }
 
+// Do the `mode: parallel` steps of one step list sit side by side? All of them form one group
+// (they start together, the slowest is waited for), so the response is the same wherever they sit,
+// but a request's later steps are thinned from the point where the group starts
+// (behaviours::detail::HopBlocks::forward): [a ∥, s, b ∥] would send s only the requests b
+// answered, though s runs before b. Listing the group where it runs removes the ambiguity (review
+// of plan 2c Task 12, I-4). A plain loop: the list is short and the state is two flags.
+[[nodiscard]] bool parallel_steps_adjacent(std::span<const model::Step> steps) {
+  bool group_started = false;
+  bool group_ended = false;
+  for (const model::Step& step : steps) {
+    const bool parallel = step.mode == model::StepMode::parallel;
+    if (parallel && group_ended) return false;
+    if (!parallel && group_started) group_ended = true;
+    if (parallel) group_started = true;
+  }
+  return true;
+}
+
+// The first step list of `spec` whose parallel steps are not adjacent (parallel_steps_adjacent),
+// an op's steps or its `then` steps, if there is one.
+[[nodiscard]] std::optional<EngineError> split_parallel_group(const model::NodeSpec& spec) {
+  const std::string name = "node '" + spec.id + "': ";
+  for (const auto& [op, steps] : spec.ops) {
+    if (!parallel_steps_adjacent(steps)) {
+      return EngineError{name + "the parallel steps of op '" + op +
+                         "' must be adjacent (they form one group)"};
+    }
+  }
+  if (!parallel_steps_adjacent(spec.then)) {
+    return EngineError{name + "the parallel then steps must be adjacent (they form one group)"};
+  }
+  return std::nullopt;
+}
+
 // A fixed hit ratio is a probability (config's read_hit_ratio), for a cache and a CDN alike.
 [[nodiscard]] std::optional<EngineError> invalid_fixed_hit_ratio(const model::NodeSpec& spec) {
   if (!spec.hit_ratio || !spec.hit_ratio->fixed) return std::nullopt;
@@ -2602,6 +2636,7 @@ Graph::Result Graph::resolve_links() {
 Graph::Result Graph::connect_steps() {
   for (std::size_t from = 0; from < nodes_.size(); ++from) {
     const auto& spec = nodes_[from].spec;
+    if (auto split = split_parallel_group(spec)) return std::unexpected{std::move(*split)};
     // `views::values` (like `views::keys` in detail::add_hop_steps, but each entry's vector of
     // steps), then C++20 `views::join`, which flattens those vectors into one lazy sequence of
     // steps. Replaces two nested loops over the map and each vector; nothing is copied.

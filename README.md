@@ -225,8 +225,8 @@ end:
 - [`book/news-feed`](scenarios/book/news-feed/): ch. 11 over 24 hours: fan-out on write through a
   queue and 32 workers, feed, post and user caches, a SQL database and the friendship graph as a
   key-value cluster. It runs to the end, but as shipped its one feed-cache replica is offered
-  the 300 feed writes of every post and saturates all day, the database saturates at the peaks,
-  and 59.9 % of the work is dropped: its drop-rate SLO fails (exit 2) until the README's sizing
+  the 300 feed writes of every post and saturates all day, the database is red for 15.9 h of the
+  24 (`red_s` 5.72e+04), and 59.9 % of the work is dropped: its drop-rate SLO fails (exit 2) until the README's sizing
   (plan 2c Task 17).
 - [`book/search-autocomplete`](scenarios/book/search-autocomplete/): ch. 13 over 24 hours at
   24k keystrokes/s (peak 36k/s): browser cache, a Che-sized trie cache (h = 0.995) in front of a
