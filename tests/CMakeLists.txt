@@ -2,9 +2,10 @@
 list(APPEND CMAKE_MODULE_PATH ${Catch2_SOURCE_DIR}/extras)
 include(Catch)
 
-add_executable(unit_tests unit/test_units.cpp unit/test_config.cpp unit/test_queueing.cpp unit/test_flow.cpp unit/test_fluid.cpp unit/test_workload.cpp unit/test_caching.cpp unit/test_model.cpp unit/test_defaults.cpp unit/test_graph.cpp unit/test_behaviours.cpp unit/test_engine.cpp unit/test_report.cpp unit/test_series.cpp)
+add_executable(unit_tests unit/test_units.cpp unit/test_config.cpp unit/test_queueing.cpp unit/test_flow.cpp unit/test_fluid.cpp unit/test_workload.cpp unit/test_caching.cpp unit/test_model.cpp unit/test_defaults.cpp unit/test_graph.cpp unit/test_behaviours.cpp unit/test_engine.cpp unit/test_report.cpp unit/test_series.cpp unit/test_sweep.cpp)
 target_link_libraries(unit_tests PRIVATE simsys Catch2::Catch2WithMain simsys_warnings)
-# test_series.cpp explains shipped scenarios, so it needs the directory, like scenario_tests.
+# test_series.cpp explains shipped scenarios and test_sweep.cpp sweeps tutorial/hello, so they need
+# the directory, like scenario_tests.
 target_compile_definitions(unit_tests PRIVATE SIMSYS_SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios")
 catch_discover_tests(unit_tests)
 
@@ -33,4 +34,22 @@ foreach(check same_file keeps_file)
                    -DSCENARIO=${CMAKE_SOURCE_DIR}/scenarios/tutorial/hello/scenario.yaml
                    -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-${check} -DCHECK=${check}
                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/series_paths.cmake)
+endforeach()
+
+# simsys sweep, run as a process (plan 2c Task 15): the output does not depend on --jobs, a bad
+# --param is an error (exit 1), a failing SLO at some point is not (exit 0). One scratch
+# directory per check, so `ctest -j` runs them side by side.
+foreach(check same_bytes refuses_bad_param slo_failure_exit_0)
+  if(check STREQUAL "same_bytes")
+    set(name "simsys sweep gives the same bytes with --jobs 1 and 3")
+  elseif(check STREQUAL "refuses_bad_param")
+    set(name "simsys sweep exits 1 on a bad --param")
+  else()
+    set(name "simsys sweep exits 0 when an SLO fails at some point")
+  endif()
+  add_test(NAME "${name}"
+           COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
+                   -DSCENARIO=${CMAKE_SOURCE_DIR}/scenarios/tutorial/hello/scenario.yaml
+                   -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-sweep-${check} -DCHECK=${check}
+                   -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/sweep_jobs.cmake)
 endforeach()

@@ -1,27 +1,6 @@
 # Process-level checks of `simsys sweep` (plan 2c Task 15): that the number of workers cannot
 # show in the output, and what the exit code says, can only be seen from outside the process.
-#
-# NOT registered yet (TDD red: simsys.sweep does not exist). The implementer adds this to
-# tests/CMakeLists.txt after the series_paths foreach, and adds `unit/test_sweep.cpp` to the
-# unit_tests sources:
-#
-#   # simsys sweep, run as a process (plan 2c Task 15): the output does not depend on --jobs, a bad
-#   # --param is an error (exit 1), a failing SLO at some point is not (exit 0). One scratch
-#   # directory per check, so `ctest -j` runs them side by side.
-#   foreach(check same_bytes refuses_bad_param slo_failure_exit_0)
-#     if(check STREQUAL "same_bytes")
-#       set(name "simsys sweep gives the same bytes with --jobs 1 and 3")
-#     elseif(check STREQUAL "refuses_bad_param")
-#       set(name "simsys sweep exits 1 on a bad --param")
-#     else()
-#       set(name "simsys sweep exits 0 when an SLO fails at some point")
-#     endif()
-#     add_test(NAME "${name}"
-#              COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
-#                      -DSCENARIO=${CMAKE_SOURCE_DIR}/scenarios/tutorial/hello/scenario.yaml
-#                      -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-sweep-${check} -DCHECK=${check}
-#                      -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/sweep_jobs.cmake)
-#   endforeach()
+# Registered in tests/CMakeLists.txt, one ctest entry per CHECK.
 #
 # Run by ctest as a CMake script:
 #   cmake -DSIMSYS=<simsys> -DSCENARIO=<hello's scenario.yaml> -DWORK=<scratch dir> -DCHECK=<name>

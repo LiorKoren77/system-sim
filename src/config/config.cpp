@@ -20,6 +20,7 @@ module;
 #include <optional>
 #include <ranges>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -3225,6 +3226,81 @@ std::expected<model::Scenario, ConfigError> validate(const std::string& file,
   return scenario;
 }
 
+// ---- Overrides (`simsys sweep`, plan 2c Task 15) ----
+// An override replaces one scalar of the parsed document before `validate` sees it, so the
+// replaced text meets the same checks as text written in the file. It addresses the scalar by
+// map keys only: a list entry has no name a path could say (`links.0` would depend on the order
+// of the file's lines), so a path through a list is refused, not guessed.
+
+// A mistake in an override's path: on the command line, so it has no line in the file.
+std::unexpected<ConfigError> override_error(const std::string& file, std::string_view path,
+                                            std::string_view what) {
+  return std::unexpected(ConfigError{
+      .file = file, .line = 0, .column = 0, .message = std::format("--param: {}: {}", path, what)});
+}
+
+// "nodes.users.rate.base" -> {"nodes", "users", "rate", "base"}; empty pieces are kept, so
+// "a..b" has an empty key, which no map holds. A loop, not views::split | views::transform:
+// a lambda passed to a range adaptor in a module is emitted twice by GCC 14.2 (CLAUDE.md §3).
+std::vector<std::string> path_keys(std::string_view path) {
+  std::vector<std::string> keys{std::string{}};
+  for (const char c : path) {
+    if (c == '.') {
+      keys.emplace_back();
+    } else {
+      keys.back() += c;
+    }
+  }
+  return keys;
+}
+
+// Why `key` cannot be looked up in `parent`, the node at `walked` ("" for the document), or
+// nothing when `parent` is a map.
+std::optional<std::string> not_a_map(const YAML::Node& parent, std::string_view walked) {
+  if (parent.IsMap()) return std::nullopt;
+  const auto name = walked.empty() ? std::string{"the document"} : std::string{walked};
+  if (parent.IsSequence()) return name + " is a list; a dot path goes through maps only";
+  return name + " is a single value, it has no keys";
+}
+
+// The node at `path` in `root`, or why there is none. Only const lookups: yaml-cpp's
+// non-const `node[key]` inserts a missing key, which would turn a typo into a new key.
+std::expected<YAML::Node, ConfigError> find_override_target(const std::string& file,
+                                                            const YAML::Node& root,
+                                                            std::string_view path) {
+  YAML::Node current = root;
+  std::string walked;
+  for (const auto& key : path_keys(path)) {
+    if (const auto refused = not_a_map(current, walked)) {
+      return override_error(file, path, *refused);
+    }
+    const YAML::Node& parent = current;
+    const YAML::Node next = parent[key];
+    if (!next) return override_error(file, path, "no such key in the scenario");
+    // yaml-cpp's `current = next` would not move the handle: it rebinds the node `current`
+    // refers to, rewriting the document. reset() moves the handle and leaves the document alone.
+    current.reset(next);
+    walked += walked.empty() ? key : "." + key;
+  }
+  if (!current.IsScalar()) {
+    return override_error(file, path, "not a single value (a map or a list)");
+  }
+  return current;
+}
+
+// Replaces each override's scalar in `root`, in order; the first bad path stops.
+std::expected<void, ConfigError> apply_overrides(const std::string& file, YAML::Node& root,
+                                                 std::span<const Override> overrides) {
+  for (const auto& replacement : overrides) {
+    auto target = find_override_target(file, root, replacement.path);
+    if (!target) return std::unexpected(target.error());
+    // Assigning text to a scalar keeps the node's tag: a plain `400` stays a plain scalar, which
+    // the number readers require (number_text), and a quoted one stays quoted.
+    *target = replacement.value;
+  }
+  return {};
+}
+
 }  // namespace simsys::config::detail
 
 namespace simsys::config {
@@ -3236,6 +3312,20 @@ std::expected<model::Scenario, ConfigError> load(const std::string& file) {
   // try/catch.
   try {
     return detail::validate(file, YAML::LoadFile(file));
+  } catch (const YAML::Exception& e) {
+    return std::unexpected(detail::error_at_mark(file, e.mark, e.msg));
+  }
+}
+
+std::expected<model::Scenario, ConfigError> load(const std::string& file,
+                                                 std::span<const Override> overrides) {
+  // The same exception boundary as load(file), around the same two throwing calls.
+  try {
+    auto root = YAML::LoadFile(file);
+    if (auto applied = detail::apply_overrides(file, root, overrides); !applied) {
+      return std::unexpected(applied.error());
+    }
+    return detail::validate(file, root);
   } catch (const YAML::Exception& e) {
     return std::unexpected(detail::error_at_mark(file, e.mark, e.msg));
   }

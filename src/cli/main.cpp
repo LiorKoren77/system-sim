@@ -3,7 +3,8 @@
 //
 // Exit codes: 0 the run worked and every SLO passed, 2 it worked but an SLO failed, 1 an
 // error (bad file, bad option, a scenario the engine cannot run yet, or a run that observed
-// no step: no data is an error, not a pass).
+// no step: no data is an error, not a pass). `sweep` reports numbers and judges none: 0 when
+// every point ran, whatever its SLOs, 1 on an error.
 #include <unistd.h>  // isatty, STDOUT_FILENO: POSIX, which is fine for this project
 #include <CLI/CLI.hpp>
 
@@ -38,6 +39,7 @@ import simsys.engine;
 import simsys.graph;
 import simsys.model;
 import simsys.report;
+import simsys.sweep;
 import simsys.workload;
 
 // Every engine call below lives in a named helper, never in main()'s body: GCC 14.2 at
@@ -478,6 +480,50 @@ int run_curve(const std::filesystem::path& file, const CurveArgs& args) {
   return 0;
 }
 
+// What `sweep` takes beyond the file.
+struct SweepArgs {
+  std::string param{};
+  std::vector<std::string> metrics{};
+  std::size_t jobs{simsys::sweep::default_jobs()};
+  std::string format{"table"};
+};
+
+// The --metric texts, parsed; the first bad one is the error.
+std::expected<std::vector<simsys::sweep::SweepMetric>, std::string> parse_metrics(
+    const std::vector<std::string>& texts) {
+  std::vector<simsys::sweep::SweepMetric> metrics;
+  for (const auto& text : texts) {
+    auto metric = simsys::sweep::parse_metric(text);
+    if (!metric) return std::unexpected(metric.error());
+    metrics.push_back(std::move(*metric));
+  }
+  return metrics;
+}
+
+// `simsys sweep <file> --param <spec> --metric <m>...`: one run per point, one row per point.
+// Nothing reaches stdout unless every point ran, so a script never reads half a table.
+int run_sweep_command(const std::filesystem::path& file, const SweepArgs& args) {
+  const auto param = simsys::sweep::parse_param(args.param);
+  if (!param) {
+    print_error(param.error());
+    return 1;
+  }
+  const auto metrics = parse_metrics(args.metrics);
+  if (!metrics) {
+    print_error(metrics.error());
+    return 1;
+  }
+  const auto rows = simsys::sweep::run_sweep(file.string(), *param, *metrics, args.jobs);
+  if (!rows) {
+    print_error(rows.error());
+    return 1;
+  }
+  const auto format =
+      args.format == "csv" ? simsys::sweep::SweepFormat::csv : simsys::sweep::SweepFormat::table;
+  std::print("{}", simsys::sweep::render_sweep(*param, *metrics, *rows, format));
+  return 0;
+}
+
 // The options `estimate` and `run` share.
 void add_report_options(CLI::App& command, ReportOptions& options) {
   command.add_option("--report", options.format, "output format: table (default) or json")
@@ -520,6 +566,27 @@ int main(int argc, char** argv) {
   curve->add_flag("--noise", curve_args.noise,
                   "multiply in the client's seeded noise, advanced every scenario step as in a run "
                   "(--step must then be a multiple of it)");
+  SweepArgs sweep_args;
+  auto* sweep = app.add_subcommand(
+      "sweep", "run the scenario once per value of one key, the runs in parallel; one row each");
+  sweep->add_option("file", scenario_file, "scenario YAML file")
+      ->required()
+      ->check(CLI::ExistingFile);
+  sweep
+      ->add_option("--param", sweep_args.param,
+                   "the swept key and its range, <dot.path>=<from>..<to>:<n>, "
+                   "e.g. nodes.users.rate.base=100/s..900/s:3")
+      ->required();
+  sweep
+      ->add_option("--metric", sweep_args.metrics,
+                   "a column: <client>.<op>.mean, <node>.mean_rho or <queue>.lag (repeatable)")
+      ->required();
+  sweep
+      ->add_option("--jobs", sweep_args.jobs,
+                   "worker threads (default: the machine's hardware threads)")
+      ->check(CLI::PositiveNumber);
+  sweep->add_option("--format", sweep_args.format, "output format: table (default) or csv")
+      ->check(CLI::IsMember({"table", "csv"}));
   add_report_options(*estimate, report_options);
   add_report_options(*run, report_options);
   run->add_option("--duration", run_args.duration,
@@ -542,5 +609,6 @@ int main(int argc, char** argv) {
   if (estimate->parsed()) return run_estimate(scenario_file, report_options);
   if (run->parsed()) return run_scenario(scenario_file, run_args, report_options);
   if (curve->parsed()) return run_curve(scenario_file, curve_args);
+  if (sweep->parsed()) return run_sweep_command(scenario_file, sweep_args);
   return 0;
 }

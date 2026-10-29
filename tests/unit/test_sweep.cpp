@@ -2,9 +2,6 @@
 // per point, the points in parallel. Properties of the pieces: the `--param` grammar
 // (`<dot.path>=<from>..<to>:<n>`), the `--metric` names, the loader's `Override`, the sweep
 // itself (values pinned against M/M/1 on the tutorial's hello scenario) and the two renderings.
-//
-// NOT registered in tests/CMakeLists.txt yet (TDD red, written before src/sweep exists): the
-// implementer adds `unit/test_sweep.cpp` to the unit_tests sources once `simsys.sweep` builds.
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
