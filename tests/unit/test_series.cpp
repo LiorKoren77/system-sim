@@ -806,7 +806,8 @@ TEST_CASE("explain follows google-drive's notify_q into its consumers and the ba
 // news-feed: posts are 10 % of the peak, 2.162k/s (fanout_q's own line), and the 32 workers at 5 ms
 // (32 / 0.005 s = 6.4k jobs/s) are offered all of it: 2162 / 6400 = 33.8 %, green. Per job they
 // read graph_db once and write 300 feed entries: 2.162k x 300 = 648.6k/s at feed_cache, on top of
-// its 12.97k/s of reads, far over its 100k/s: red, complete (no lower bound, no mark).
+// its 12.97k/s of reads: 661.5k/s, a complete number (no lower bound, no mark), against the 10
+// replicas x 100k/s plan 2c Task 17 sized it with (one replica, as first shipped, was 662 %, red).
 // graph_db is a kv_cluster of 6 nodes of 30k/s keeping N = 3 copies (plan 2c Task 10): each read
 // goes to 3 replicas, 3 x 2.162k = 6.486k replica-requests/s over 6 x 30k = 180k/s, 3.6 % on
 // average; behind the ring (default 150 virtual nodes, k = 1 + z_6/sqrt(3 x 150) = 1.0604, z_6 =
@@ -828,7 +829,7 @@ TEST_CASE("explain follows news-feed's fanout pool into graph_db and the feed ca
   REQUIRE(node_line(text, "graph_db")
               .contains("nodes=6 N=3 W=2 R=2 mode=ap (default; partitions: phase 3)"));
   const auto feed_cache = check_line(text, "feed_cache");
-  REQUIRE(feed_cache.contains("%, red)"));
+  REQUIRE(feed_cache.contains("peak offered 661.5k/s vs 1M/s total capacity  (66.2%, green)"));
   REQUIRE_FALSE(feed_cache.contains("load not propagated"));
   REQUIRE_FALSE(feed_cache.contains("≥"));
 }

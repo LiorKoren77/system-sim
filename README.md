@@ -245,12 +245,11 @@ end:
   worst, `cdn_us` at 0.1403 in its worst hour; the 300 MB uploads are answered at about 12 s
   within the 30 s timeout that stands for the book's resumable chunks. Its README sweeps the pool:
   at 400 workers the queue falls 2.66 h behind by midnight.
-- [`book/news-feed`](scenarios/book/news-feed/): ch. 11 over 24 hours: fan-out on write through a
-  queue and 32 workers, feed, post and user caches, a SQL database and the friendship graph as a
-  key-value cluster. It runs to the end, but as shipped its one feed-cache replica is offered
-  the 300 feed writes of every post and saturates all day, the database is red for 15.9 h of the
-  24 (`red_s` 5.72e+04), and 59.9 % of the work is dropped: its drop-rate SLO fails (exit 2) until the README's sizing
-  (plan 2c Task 17).
+- [`book/news-feed`](scenarios/book/news-feed/): ch. 11 over 24 hours, sized for its 12:00 spike
+  (21.6k/s): fan-out on write through a queue and 32 workers, feed, post and user caches, a SQL
+  database in 6 shards and the friendship graph as a key-value cluster. Each post's 300 feed
+  writes make the feed cache the biggest tier (10 replicas, 66 % at the peak); all three SLOs
+  pass (feed p99 5.99 ms, nothing dropped, fan-out lag under a microsecond).
 - [`book/search-autocomplete`](scenarios/book/search-autocomplete/): ch. 13 over 24 hours at
   24k keystrokes/s (peak 36k/s): browser cache, a Che-sized trie cache (h = 0.995) in front of a
   4-replica search index, and the query-log pipeline. Both SLOs pass (suggest p99 6.86 ms of
