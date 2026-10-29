@@ -145,6 +145,26 @@ struct NodeSample {
   // and so the writes each replica of that shard must replay. Every database has it (0 when no
   // write arrives); empty for every other node.
   std::optional<double> committed_writes_per_s{};
+  // A message queue's lag, in seconds (plan 2c refinements 4 and 14; the queue between producers
+  // and workers of ch. 10 and ch. 14): how long the message its slowest consumer group reads next
+  // has waited. The broker holds nothing back (it appends at 1M/s); the unread messages wait
+  // in each group's worker pool, so the lag is read off the pools (Simulation::record_queue_lags):
+  //   lag(group) = the pool's queueing wait this step (fluid::FluidQueue::wait)
+  //              = max(min(k × Wq, T), backlog / capacity)
+  //     backlog / capacity  the FIFO drain time: the oldest unread message is read after everything
+  //                         ahead of it, which the pool works off at its capacity (workers / cost)
+  //                         while it is behind: 60,000 messages at 1200/s are 50 s;
+  //     k × Wq              the stochastic part: Allen–Cunneen's factor k times the Erlang C wait
+  //                         of an M/M/c queue (c = workers, service time = cost, rho clamped at
+  //                         0.99): what a message waits with no backlog because every worker is
+  //                         busy, 3.289 ms for 1k/s into 4 workers at 3.333 ms;
+  //     T                   the room's drain time, = the queue's retention: a message older than
+  //                         that is deleted unconsumed, so no lag passes it.
+  //   lag(queue) = the largest over its groups: a queue is as far behind as its slowest reader.
+  // The wait only: the job's `cost` is not lag (a message is read once a worker takes it), so the
+  // lag is the pool's latency minus its cost. Assumes the backlog is read first in, first out (a
+  // Kafka partition is). Empty for every node that is not a message queue (a 0 would be a claim).
+  std::optional<double> queue_lag_s{};
 };
 
 // What a client sees for one op: the rate it offers, the part of it that comes back
@@ -367,6 +387,10 @@ class Simulation {
     // (receiver, link) of every bandwidth link this node sends demand on (connect_pipes): where
     // its hop lookups find a pipe (hop_response, hop_delivered). Empty for most nodes.
     std::vector<std::pair<std::size_t, std::size_t>> pipes_out{};
+    // A message queue's consumer groups (connect_consumer_groups): the worker pools whose waits
+    // are its lag (record_queue_lags). Empty for every other node; a queue has at least one
+    // (Graph::build refuses a queue nobody consumes).
+    std::vector<std::size_t> consumer_groups{};
   };
 
   // A bandwidth link's pipe (plan 2c refinement 3; defaults::pipe_capacity has its numbers and
@@ -415,11 +439,13 @@ class Simulation {
                                                      std::size_t slot);
   void connect(const graph::Graph& g);
   void connect_pipes(const graph::Graph& g);
+  void connect_consumer_groups(const graph::Graph& g);
   void register_reachable_ops(const graph::Graph& g);
   [[nodiscard]] Simulation settling_copy() const;
 
   [[nodiscard]] StepRecord evaluate(SimTime now, SimTime dt, Mode mode);
   void forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& record);
+  void record_queue_lags(std::span<NodeSample> samples) const;
   void receive(std::size_t index, Mode mode);
   // Any queueing node (service, load balancer, rate limiter): runs its queues and returns
   // what they drained, in requests per second, for the behaviour to route.
@@ -815,6 +841,7 @@ Simulation::Simulation(const graph::Graph& g)
   }
   connect(g);
   connect_pipes(g);
+  connect_consumer_groups(g);
   register_reachable_ops(g);
 }
 
@@ -1067,6 +1094,19 @@ void Simulation::connect_pipes(const graph::Graph& g) {
   }
 }
 
+// Tells each message queue which worker pools consume it (Node::consumer_groups): every pool whose
+// `consumes` names the queue (Graph::build checked that it links to it). A pool reading a frontier
+// is no message queue's group: a frontier is not simulated yet.
+void Simulation::connect_consumer_groups(const graph::Graph& g) {
+  for (std::size_t pool = 0; pool < g.nodes().size(); ++pool) {
+    const auto& spec = g.nodes()[pool].spec;
+    if (spec.type != model::NodeType::worker_pool || !spec.consumes) continue;
+    const auto queue = *g.index_of(*spec.consumes);  // Graph::connect_consumer resolved it
+    if (g.nodes()[queue].spec.type != model::NodeType::message_queue) continue;
+    nodes_[queue].consumer_groups.push_back(pool);
+  }
+}
+
 // Gives every (node, op) that some flow can bring to the node a response-table entry up
 // front: the ops of the client routes entering it, of the unconditional steps targeting it
 // (the only steps that forward flow in phase 1) and those a load balancer in front passes
@@ -1142,7 +1182,9 @@ StepRecord Simulation::estimate() const {
 // lines are not copied: settle mode reads `sent` directly, so each link gets an empty
 // one-slot line (a million-step link would otherwise copy a million Flows), with a copy of its
 // pipe, if it has one, that holds nothing and has lost nothing yet. The queues need no reset
-// either: settle mode sets each backlog from the demand (FluidQueue::settle).
+// either: settle mode sets each backlog from the demand (FluidQueue::settle). What the nodes
+// were built with comes along unchanged, a queue's consumer groups included (so estimate reports
+// its lag, record_queue_lags).
 Simulation Simulation::settling_copy() const {
   Simulation scratch;
   scratch.order_ = order_;
@@ -1182,9 +1224,23 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
                     .nodes = std::vector<NodeSample>(nodes_.size()),
                     .links = std::vector<LinkSample>(pipe_count_)};
   forward_pass(now, dt, mode, record);
+  record_queue_lags(record.nodes);
   backward_pass();
   record.responses = client_responses(now);
   return record;
+}
+
+// Each message queue's lag (NodeSample::queue_lag_s has the formula): the largest of its consumer
+// groups' waits this step. After the forward pass, since a queue comes before its pools in the
+// order and their waits are this step's only once they have served.
+void Simulation::record_queue_lags(std::span<NodeSample> samples) const {
+  for (std::size_t queue = 0; queue < nodes_.size(); ++queue) {
+    const auto& groups = nodes_[queue].consumer_groups;
+    if (groups.empty()) continue;  // not a message queue
+    double lag = 0.0;
+    for (const std::size_t pool : groups) lag = std::max(lag, nodes_[pool].wait.mean_s);
+    samples[queue].queue_lag_s = lag;
+  }
 }
 
 // Forward pass (spec §3.2-3.4), nodes in topological order. For each node:

@@ -1317,7 +1317,8 @@ class BlobStoreBehaviour {
 // messages/s receive 1k/s each, not 500), and a message keeps its op name. What a group has not
 // read waits in that GROUP's pool queue, whose room is the queue's retention × the pool's capacity
 // (graph::Graph::connect_consumer): the backlog of an append-only log, held per reader. Its queue
-// lag (how far a group is behind) is Task 8's. Ignored: ordering (partitions are printed, not
+// lag, how far its slowest group is behind, is read off those pools by the engine
+// (engine::NodeSample::queue_lag_s, plan 2c Task 8). Ignored: ordering (partitions are printed, not
 // modelled), delivery guarantees and redelivery (at-least-once, a consumer that crashes before
 // committing reads a message again), the consumer's commit interval, the broker's disk (an append
 // costs the type's 100 µs whatever the message's size, and the log never fills a disk) and its
