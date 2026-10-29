@@ -4184,3 +4184,130 @@ TEST_CASE("a search index still refuses ops") {
                    search_index_scenario("ops: {suggest: [{to: other, op: read}]}"),
                    "node 'trie_db': key 'ops' is not valid for type 'search_index'");
 }
+
+// ---- SLOs per window (plan 2c Task 14) ----
+//
+// An SLO may carry `over: <duration>`: the report then checks it on every window of that length
+// (aligned from the end of warmup) and the worst window decides. The loader owns the rule that
+// makes a window meaningful: `over` is a duration, at least one step (a window with no step in it
+// observes nothing) and at most the observed part of the run, duration - warmup (a longer window
+// never completes, so it would silently check nothing). These tests state the rule through what
+// the loader accepts and refuses; what a window measures is pinned in test_windows.cpp and
+// test_report.cpp. The refusals pin the message loosely: it must name `over` and the rule's
+// own words, so a message that only says "unknown key 'over'" (what the loader says today)
+// does not pass.
+
+namespace {
+// One client, one service, no links (the SLO shape rules do not need them), a run of `timing`
+// ("duration: 1h\nstep: 1s\n...") and one SLO entry.
+std::string window_scenario(std::string_view timing, std::string_view slo_entry) {
+  return "version: 1\nname: t\n" + std::string{timing} +
+         "nodes:\n  u: {type: client, rate: {base: 10/s}, ops: {a: 1}}\n  s: {type: service}\n"
+         "links: []\nslo: [" +
+         std::string{slo_entry} + "]\n";
+}
+
+bool mentions_any(std::string_view message, std::initializer_list<std::string_view> words) {
+  for (const auto word : words) {
+    if (message.contains(word)) return true;
+  }
+  return false;
+}
+
+// Loads `yaml` and asserts it is rejected by a message that contains every word of `all_of` and,
+// when `any_of` is not empty, at least one of its words; attributed to the file, as every error is.
+void require_rejected_naming(std::string_view file_name, std::string_view yaml,
+                             std::initializer_list<std::string_view> all_of,
+                             std::initializer_list<std::string_view> any_of = {}) {
+  CAPTURE(yaml);
+  const auto path = write_temp(file_name, yaml);
+  const auto s = simsys::config::load(path.string());
+  REQUIRE_FALSE(s.has_value());
+  const std::string& message = s.error().message;
+  CAPTURE(message);
+  for (const auto word : all_of) CHECK(message.contains(word));
+  if (any_of.size() != 0) CHECK(mentions_any(message, any_of));
+  CHECK(s.error().file == path.string());
+}
+}  // namespace
+
+TEST_CASE("an slo accepts over, a duration inside the run, on every kind of metric") {
+  const auto timing = "duration: 1h\nstep: 1s\n";
+  SECTION("a latency percentile") {
+    require_loaded("simsys_over_p99.yaml",
+                   window_scenario(timing, "{metric: p99_latency, node: u, max: 1s, over: 10m}"));
+  }
+  SECTION("a utilization") {
+    require_loaded("simsys_over_utilization.yaml",
+                   window_scenario(timing, "{metric: utilization, node: s, max: 0.9, over: 15m}"));
+  }
+  SECTION("a drop rate, which names no node") {
+    require_loaded("simsys_over_drop_rate.yaml",
+                   window_scenario(timing, "{metric: drop_rate, max: 0.001, over: 5m}"));
+  }
+  SECTION("an over as long as the whole run is the whole-run SLO spelled out") {
+    require_loaded("simsys_over_whole_run.yaml",
+                   window_scenario(timing, "{metric: drop_rate, max: 0.001, over: 1h}"));
+  }
+}
+
+TEST_CASE(
+    "over may be exactly one step and exactly the run after warmup: both bounds are inclusive") {
+  SECTION("over equal to the step") {
+    require_loaded("simsys_over_one_step.yaml",
+                   window_scenario("duration: 1m\nstep: 100ms\n",
+                                   "{metric: utilization, node: s, max: 0.9, over: 100ms}"));
+  }
+  SECTION("over equal to duration minus warmup: 1h - 10m = 50m") {
+    require_loaded("simsys_over_after_warmup.yaml",
+                   window_scenario("duration: 1h\nstep: 1s\nwarmup: 10m\n",
+                                   "{metric: utilization, node: s, max: 0.9, over: 50m}"));
+  }
+}
+
+TEST_CASE("an over shorter than the step is refused, naming over and the step") {
+  SECTION("50ms at a step of 100ms: half a step, no window could hold a step") {
+    require_rejected_naming("simsys_over_below_step.yaml",
+                            window_scenario("duration: 1h\nstep: 100ms\n",
+                                            "{metric: utilization, node: s, max: 0.9, over: 50ms}"),
+                            {"over", "step"});
+  }
+  SECTION("zero is below any step") {
+    require_rejected_naming("simsys_over_zero.yaml",
+                            window_scenario("duration: 1h\nstep: 1s\n",
+                                            "{metric: utilization, node: s, max: 0.9, over: 0s}"),
+                            {"over", "step"});
+  }
+}
+
+TEST_CASE("an over longer than the run is refused, naming over and the duration") {
+  require_rejected_naming("simsys_over_beyond_run.yaml",
+                          window_scenario("duration: 1h\nstep: 1s\n",
+                                          "{metric: utilization, node: s, max: 0.9, over: 2h}"),
+                          {"over"}, {"duration", "warmup", "run"});
+}
+
+// Warmup is not observed, so a window cannot reach back into it: with 10m of warmup in a 1h run
+// only 50m are observed, and a 55m window (shorter than the run, longer than what is observed)
+// would never complete.
+TEST_CASE("an over longer than the run after warmup is refused although it fits the whole run") {
+  require_rejected_naming("simsys_over_beyond_observed.yaml",
+                          window_scenario("duration: 1h\nstep: 1s\nwarmup: 10m\n",
+                                          "{metric: utilization, node: s, max: 0.9, over: 55m}"),
+                          {"over"}, {"warmup", "duration", "run"});
+}
+
+TEST_CASE("an over that is not a duration is refused, naming over and duration") {
+  SECTION("a word") {
+    require_rejected_naming("simsys_over_word.yaml",
+                            window_scenario("duration: 1h\nstep: 1s\n",
+                                            "{metric: utilization, node: s, max: 0.9, over: fast}"),
+                            {"over", "duration"});
+  }
+  SECTION("a bare number, which has no unit") {
+    require_rejected_naming("simsys_over_bare_number.yaml",
+                            window_scenario("duration: 1h\nstep: 1s\n",
+                                            "{metric: utilization, node: s, max: 0.9, over: 600}"),
+                            {"over", "duration"});
+  }
+}

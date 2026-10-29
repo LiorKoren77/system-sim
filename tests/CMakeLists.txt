@@ -13,9 +13,10 @@ target_link_libraries(scenario_tests PRIVATE simsys Catch2::Catch2WithMain simsy
 target_compile_definitions(scenario_tests PRIVATE SIMSYS_SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios")
 catch_discover_tests(scenario_tests)
 
-add_executable(theory_tests theory/test_theory.cpp theory/test_timeout.cpp)
+add_executable(theory_tests theory/test_theory.cpp theory/test_timeout.cpp theory/test_windows.cpp)
 target_link_libraries(theory_tests PRIVATE simsys Catch2::Catch2WithMain simsys_warnings)
-# test_timeout.cpp pins the shipped youtube scenario's uploads, so it needs the directory too.
+# test_timeout.cpp pins the shipped youtube scenario's uploads and test_windows.cpp the shipped
+# url-shortener's hours, so they need the directory too.
 target_compile_definitions(theory_tests PRIVATE SIMSYS_SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios")
 catch_discover_tests(theory_tests)
 
