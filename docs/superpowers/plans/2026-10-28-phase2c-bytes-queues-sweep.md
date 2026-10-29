@@ -779,25 +779,28 @@ Schema v1.4, spec §19, study notes, README. Commit `docs: schema v1.4, spec §1
 
 ## Status at the stop on 2026-10-29 (read this first when resuming)
 
-The owner stopped the session on 2026-10-29 ("stop now the background processes. make sure to push
-everything that was completed. document what is in progress and what is left to do"), and work
-resumed after it. State now:
+The owner narrowed the plan on 2026-10-29: "when you are done with phase 2 do another
+comprehensive code review, push everything and stop". This is the state at that stop.
 
-**Phase 2c is complete**, pending the whole-of-phase-2 review. On `main`: Tasks 1–19, the nits
-round, the comprehensive 2c review at 946f1b4 and both of its fix rounds: A (code and the numbers
-it moved, a96b584, pushed: `origin/main` = a96b584) and B (docs, the commit after it, not pushed
-yet). 1158 tests (1157 at a96b584, plus round B's CLI check of the sweep's error prefixes), green in
-Debug. Every task has been reviewed: Tasks 1–13 and 15 and the kv/search fix round separately,
-Tasks 14 and 16–19 by the comprehensive review.
+**Phase 2 is complete.** On `main`: Tasks 1–19, the nits round, the comprehensive 2c review at
+946f1b4 with its two fix rounds (A, code, a96b584; B, docs, 738801a), and the whole-of-phase-2
+review at 738801a (section below) with its last fix round, two branches merged: `fix-p2-code`
+(C-1, a waited-for backend on any call cycle is refused; I-3, node types exhaustive; the code
+minors) and `fix-p2-docs` (C-2, the four refused book scenarios say so; I-1, the study notes
+current; I-2, `docs/study/small-features.md`; I-4 and the doc minors, numbers re-quoted from the
+binary). Every task has been reviewed: Tasks 1–13 and 15 and the kv/search fix round separately,
+Tasks 14 and 16–19 by the comprehensive 2c review, and all of phase 2 by the whole-of-phase-2
+review. The test count is the root README's.
 
-**Red commits on main:** none.
+**Red commits on main:** none. **In progress:** nothing.
 
-**Left to do, in order:**
-1. Re-verify round B (the numbers it quotes against the binary, links, both presets, clang-format)
-   and push it; CI green.
-2. The **whole-of-phase-2 review** (2a + 2b + 2c, section "After 2c" below, with the item the 2c
-   review carried to it), its fix round, push.
-3. Stop (owner's instruction of 2026-10-29): phase 3 waits for a new instruction.
+**What the owner's next instruction decides:** whether and when phase 3 starts. Its plan is not
+written yet. Its inputs are spec §13's phase-3 list and the "Phase 3 backlog" at the end of this
+file: the four types that four book scenarios wait for (`ws_gateway`, `service_discovery`,
+`notification_fanout`, `frontier`; each of those scenarios' READMEs opens with what `explain`
+shows today), faults and retries, kv partitions, the queue and byte refinements, and the file
+splits the whole-of-phase-2 review recommended. Phase 3 is to run as phase 2 did: test-driven,
+small tasks, clean code, study notes, a review per task.
 
 ## Comprehensive 2c review, then push
 
@@ -915,14 +918,63 @@ lies on any call cycle), see the last item of that review.
 Verified: both presets warning-free, 1158/1158 (Debug 30 s at -j8), clang-format as CI, the six GCC workarounds; module graph acyclic, no module reaches another's `detail::`, session → config/engine/graph/model/report, sweep → session/report, report does not import behaviours; no heavy headers in importing interfaces, no width/precision specs, only `chunk_by(detail::same_op)` takes a callable; per-type tables agree (loader `own_keys_by_type` vs schema rows with a static_assert; `simulated()` 14 = schema's 14; `for_type` has no default); every JSON key and CLI flag documented; no raw new/macros, throw only for programmer errors; six cross-phase probes (limiter → queue → pool → sql_db; Che cache → kv with a timeout; consistent-hash over blob stores with pipes; sql_db lag with a dropped write thinning the next step; a spike through a queue with windowed SLOs; a mixed graph) conserve to ≤ 2.3e-6, estimate = run, no NaN, sensible explain; async cycles (queue → pool → then → producer; blob event → pool → the same store) accepted and marked "no steady state"; a limiter straight into a pool refused; run and sweep deterministic with noise; every README/YAML number of the four runnable book scenarios and the four labs except I-4 and the timings; study notes generator/threads/random current.
 
 - [x] **C-1 A cache, CDN or rate-limiter backend on a call cycle is accepted depending on where the client enters** (`Graph::check_cache_backend_calls` ~3098 refuses only when `is_async_hop(cache, op, backend, op)`, i.e. when the DFS happened to cut that hop): `c_cycle.yaml` (client at `c`, read_through to `db`, `db.read → c.read`) runs at 1.5 ms, also behind a front service; `cdn_cycle.yaml` a gain-1 loop (origin saturated, 3.87 % dropped, 452 ms mean); `lim_cycle2.yaml` a token bucket whose `counters` cache (write_through to `db` calling `lim.call`) closes the loop (db rho 0.98, 51.9 % rejected). Schema ~495/~640 promise the refusal. Decision: refuse whenever a waited-for backend hop lies on any call cycle: build the call graph once (the edges of `detail::find_async_hops`: `forwarder_steps` plus balancer routes), Tarjan SCCs, refuse when `(cache, op)` and `(backend, op)` share a component; same for `(limiter, op)` and `(backend, counter op)` in `Graph::connect_backend` (~3117) with `node 'lim': backend 'counters' closes a call cycle`; tests for client-at-cache, client-at-CDN and the limiter, keep the existing two; schema rows ~495, ~640 and the rate_limiter `backend` row.
-- [ ] **C-2 The four refused book scenarios' READMEs (chat-system, google-drive, notification-system, web-crawler) never say they are refused** (all exit 1 at `discovery`, `long_poll`, `fanout`, `frontier`; "What the model captures" in the present tense; every "Things to try" exits 1; chat-system ~20 cites a `traffic_spike` fault that is ignored; explain's red checks unmentioned: chat `push` 945 %, `lb` 90 %; notification `notification_svc` 140 %, `user_db` replicas 173 %; google-drive `backup_workers` 128 %). Fix per README: a status section with the exact refusal line, what `explain` shows today (red checks, `load not propagated` marks), "What the model captures" → "What phase 3 will model" (or conditional wording), "Things to try" marked phase 3.
-- [ ] **I-1 Study notes stale:** `modules.md` (line references :12, :34–35, :55 → symbols; the "Used in" table lists 2 of 15 modules; defects 4–6 and the module-linkage `namespace detail` (graph.cppm ~1323) missing); `concepts.md` (:24–35 shows a 3-argument `route`, now a `FractionLookup` fourth; table omits `FractionLookup`, `HitRatioModel`; :114–117 contradicts :39–43 and the stateful limiter; :86 points at main.cpp's observer lambda); `expected.md` (:43–46, `parse_capacity`, `check_version`, `check_step_list`, `Pattern: Validator pipeline` gone; "Used in" lacks `Graph::build`, `Simulation::create`, `session::*`); `format-print.md` (`shortest`/`to_text`/`fmt_duration` → `format_number`/`to_chars_text`/`format_duration`; :86–91 raw to_chars; :64 `<format>` also in session.cpp; :7 `create_simulation` is in session.cpp); `ranges.md` (`name_of`, `offered_rates`, `count_if` in `paper_load` gone; `views::chunk_by` with the fifth-defect workaround missing); `variant-visit.md` (:10 two alternatives, now 12; :84–89 "when phase 2 adds a cache"); study README (:32 observer lambda → `session::run_summary`; :17 `exponential_order_statistic` has no src caller). Cite symbols, not lines.
-- [ ] **I-2 No notes for constructs phase 2 uses widely:** designated initializers (29 first-use comments), `std::span` (17), `<=>`/defaulted `==` (7), `using enum` (11), `consteval`, `std::to_array`, `std::to_underlying`, `std::unreachable`, `std::chrono` for `SimTime`, deducing `this` (`Flow::position_of`), `static operator()`. Fix: `docs/study/small-features.md`, one section each (what, the pre-C++20 way, where used by symbol), indexed in the study README and linked from the first-use comments.
+- [x] **C-2 The four refused book scenarios' READMEs (chat-system, google-drive, notification-system, web-crawler) never say they are refused** (all exit 1 at `discovery`, `long_poll`, `fanout`, `frontier`; "What the model captures" in the present tense; every "Things to try" exits 1; chat-system ~20 cites a `traffic_spike` fault that is ignored; explain's red checks unmentioned: chat `push` 945 %, `lb` 90 %; notification `notification_svc` 140 %, `user_db` replicas 173 %; google-drive `backup_workers` 128 %). Fix per README: a status section with the exact refusal line, what `explain` shows today (red checks, `load not propagated` marks), "What the model captures" → "What phase 3 will model" (or conditional wording), "Things to try" marked phase 3.
+- [x] **I-1 Study notes stale:** `modules.md` (line references :12, :34–35, :55 → symbols; the "Used in" table lists 2 of 15 modules; defects 4–6 and the module-linkage `namespace detail` (graph.cppm ~1323) missing); `concepts.md` (:24–35 shows a 3-argument `route`, now a `FractionLookup` fourth; table omits `FractionLookup`, `HitRatioModel`; :114–117 contradicts :39–43 and the stateful limiter; :86 points at main.cpp's observer lambda); `expected.md` (:43–46, `parse_capacity`, `check_version`, `check_step_list`, `Pattern: Validator pipeline` gone; "Used in" lacks `Graph::build`, `Simulation::create`, `session::*`); `format-print.md` (`shortest`/`to_text`/`fmt_duration` → `format_number`/`to_chars_text`/`format_duration`; :86–91 raw to_chars; :64 `<format>` also in session.cpp; :7 `create_simulation` is in session.cpp); `ranges.md` (`name_of`, `offered_rates`, `count_if` in `paper_load` gone; `views::chunk_by` with the fifth-defect workaround missing); `variant-visit.md` (:10 two alternatives, now 12; :84–89 "when phase 2 adds a cache"); study README (:32 observer lambda → `session::run_summary`; :17 `exponential_order_statistic` has no src caller). Cite symbols, not lines.
+- [x] **I-2 No notes for constructs phase 2 uses widely:** designated initializers (29 first-use comments), `std::span` (17), `<=>`/defaulted `==` (7), `using enum` (11), `consteval`, `std::to_array`, `std::to_underlying`, `std::unreachable`, `std::chrono` for `SimTime`, deducing `this` (`Flow::position_of`), `static operator()`. Fix: `docs/study/small-features.md`, one section each (what, the pre-C++20 way, where used by symbol), indexed in the study README and linked from the first-use comments.
 - [x] **I-3 Per-type knowledge bypasses exhaustiveness:** `Simulation::make_node` (~953) ends in `default:` → ServiceBehaviour; `simulated()` (~568) is a second hand-kept list. Fix: exhaustive switch (`case service:` explicit; the four phase-3 types → `std::unreachable()` with a comment that `create` refused them); derive `simulated()` from a "runs" flag in `simsys.model`'s `node_type_table`, used by the "exactly ten shipped scenarios" test.
-- [ ] **I-4 Doc numbers vs binary:** `tutorial/chain/README.md` ~27 "p99 about 1.1 s" at `replicas: 1` → the 1 s timeout cuts it (`>1s`, FAIL with 51.8 % / 53.8 % timed out: say what the timeout does); `tutorial/hello/README.md` ~14 explain line lacks "peak" and the two spaces; `search-autocomplete/README.md` ~106 `keys: 1k` 16.6 → 16.7 ms; `url-shortener/scenario.yaml` ~13 "86k instead of 864k" → 86,280 vs 862,800 observed steps.
+- [x] **I-4 Doc numbers vs binary:** `tutorial/chain/README.md` ~27 "p99 about 1.1 s" at `replicas: 1` → the 1 s timeout cuts it (`>1s`, FAIL with 51.8 % / 53.8 % timed out: say what the timeout does); `tutorial/hello/README.md` ~14 explain line lacks "peak" and the two spaces; `search-autocomplete/README.md` ~106 `keys: 1k` 16.6 → 16.7 ms; `url-shortener/scenario.yaml` ~13 "86k instead of 864k" → 86,280 vs 862,800 observed steps.
 - [ ] Minors: numerics (:42 four places use expm1/log1p; :85 DBL_MAX at c = 714; :97–98 subtracts, not divides; :450–457 try-it 3 rewritten: the ticket server is saturated either way, drops 1.16M → 1.34M; :266–267, :535–536 old 29.9/30.5 vs today's 24.8 ms and cut 3.5e-7; :49–51 add `lognormal_below`); `caching.cppm` ~261 `one_minus_exp_neg` comment ("would round to 0" at 1e-12: the error is 2.2e-5); schema ~1221–1227 identity needs "+ rejected_per_s" at a leaky bucket (probe residual 0.56 % = 826.8 rejected); `client_seed` lives in `simsys.behaviours` only for main.cpp/test_theory: move to `simsys.workload` or re-export; duplicated helpers (`ServiceBehaviour::cost`, `CacheBehaviour::cost`, `SqlDbBehaviour::cost` vs `detail::cost_in`; `report.cpp` ~1791 `cost_of` forwards to `graph::op_cost`; `Overloaded` twice (engine ~563, report ~388) → core; `sweep.cpp` ~49 `significant` vs `report.cpp` ~61 `num`); test-only exports (`exponential_order_statistic`, `from_seconds`, `Flow::rate_of`): mark as test helpers or remove; `report.cppm` ~383 "the CLI hands each step record" → `session::run_summary`; float residue (`peak_backlog 1.819e-13`): clamp |x| < 1e-9 × capacity to 0 when printing; test names ("labs/rate-limiter runs in phase 2a" redundant with the five-seconds test: delete; drop "still" from four names); `test_behaviours.cpp` ~152–160 static_asserts miss three behaviours; duplicated test helpers (`ring_factor`, `explain_of`, `piped`); wall-clock claims (url-shortener ~79–80, search-autocomplete ~16, news-feed ~121, youtube ~117): "on the author's machine" or drop.
-- [ ] Recommended for phase 3 (recorded in the Phase 3 backlog, not done now): split `report.cpp` (explain → `explain.cpp`), `config.cpp` (readers per concern), `graph.cppm` (definitions → `graph.cpp` or partitions), checking the fourth/fifth defects after each move; split `test_theory.cpp` (5053 lines, 215 cases) along its `// ----` sections into nine files with a `tests/support/fixtures.cppm`; cut node cycles at the asynchronous queue → pool edge once C-1 lands.
+- [x] Recommended for phase 3 (recorded in the Phase 3 backlog, not done now): split `report.cpp` (explain → `explain.cpp`), `config.cpp` (readers per concern), `graph.cppm` (definitions → `graph.cpp` or partitions), checking the fourth/fifth defects after each move; split `test_theory.cpp` (5053 lines, 215 cases) along its `// ----` sections into nine files with a `tests/support/fixtures.cppm`; cut node cycles at the asynchronous queue → pool edge once C-1 lands.
 - [ ] Commits: `graph: a backend on any call cycle is refused; node types exhaustive; review nits` and `docs: the refused book scenarios say so; study notes current; small-features note; numbers re-quoted`.
+  **Fix round notes (docs)** (branch `fix-p2-docs`, from 3441722; written for the state after
+  `fix-p2-code`'s moves: `Overloaded` in `simsys.core`, `client_seed` in `simsys.workload`, no
+  `cost_of` cited, `simulated()` from the type table, `std::unreachable` in `make_node`). Every
+  number quoted was re-run on a Release build of 3441722. **C-2:** each of the four READMEs opens
+  with a "Status: `explain` only until phase 3" section: `validate`'s line, the exact refusal
+  (`discovery`, `long_poll`, `fanout`, `frontier`), `explain`'s red and yellow checks quoted
+  (chat `lb` 90 %, `push` 945 % at an external sink's default 1k/s, `message_store` 83.4 %,
+  `presence` 85.9 %; google-drive `backup_workers` 128 % (85.2 % yellow at `workers: 3`, the
+  backlog item below) and `cloud_storage` 77.7 %; notification `notification_svc` 140 %,
+  `user_db` replicas 173 %, `fanout` 279 % and its 13 `load not propagated` nodes; web-crawler's
+  frontier `≥1%` and its ten marked nodes), and what is accepted but does nothing (chat's
+  `node_down` fault, there was never a `traffic_spike`; the gateway's `fanout`/`heartbeat`, which
+  leave every check unchanged; the `politeness` keys). "What the model captures" became "What
+  phase 3 will model", each bullet saying what `explain` already shows (the Che hit ratios
+  0.763 and 0.814, the paper loads); "Things to try" split into `explain` today (chat
+  `message_store.nodes: 6` hottest 165 %; google-drive `block_servers.replicas: 4` 162 %) and
+  `run` in phase 3. google-drive's `metadata_db.shards: 1` claim ("fails the 100 ms SLO") is now a
+  question: `explain` puts every copy under 37 %. web-crawler states its loop gain, 0.7 × 50 × 0.1
+  = 3.5 URLs a page. Book design sections untouched. Root README points at the status sections.
+  **I-1:** `modules.md` (a table of the 15 modules with files, kind and imports; module linkage
+  and the call graph's `namespace detail`; defects 3–6; the interface-only rebuild trade-off;
+  no line numbers); `concepts.md` (the 4-argument `route`, `FractionLookup`, `HitRatioModel`,
+  the defaulted constrained template parameter, `moments_from_survival`'s requires clause,
+  `replicas_in`, `megabyte_service_of`'s `if constexpr (requires ...)`; the constness pitfall
+  rewritten for the stateful limiter; the observer lambda in `session::run_summary`);
+  `expected.md` (`parse_size`, `Graph::build`, `Simulation::create`, `session::*`; examples
+  `parse_scalar`, `session::load_graph`, `store_in`, `read_version`; the pipeline's real
+  `Pattern:` name); `format-print.md` (`config::describe`, `session::engine_refusal`,
+  `to_chars_text`, `format_number`/`format_duration`, `<format>` in `session.cpp`);
+  `ranges.md` (every row re-checked by symbol; `chunk_by` and the fifth defect as a pitfall,
+  with `config::dot_path_keys` as the same defect met the other way); `variant-visit.md` (twelve
+  alternatives; exhaustiveness through the concept with two lambdas per `visit`; the
+  `make_node`/`simulated()` lesson of I-3); study README (index, `session::run_summary`,
+  `lognormal_order_statistic` for the removed caller); `random.md` and `threads.md` follow
+  `client_seed` to `simsys.workload`. **I-2:** `docs/study/small-features.md`, eleven sections
+  (what, before, where by symbol, a pitfall where one was met), indexed in the study README and
+  linked from concepts and variant-visit; the first-use comments in src are the code agent's, so
+  linking them is a follow-up. **I-4:** chain `replicas: 1` (drop rate 0.3333, exit 2; 51.8 % /
+  53.8 % of delivered reads/writes timed out, every percentile `>1s`, mean 962 ms; p99 1.13 s with
+  the timeout deleted); hello's explain line verbatim; search-autocomplete `keys: 1k` 16.7 ms;
+  url-shortener YAML 86,280 vs 862,800 (and 1.1e-8, as its README says). **Doc minors:**
+  numerics §2 four places (`moments_from_survival`'s `expm1`), `lognormal_fit` behind
+  `lognormal_below`, §4 DBL_MAX at 714 and "subtract the largest log weight", §6 the earlier
+  version's 30.5 ms vs today's 24.8 and the 3.5e-7 cut, §9 try-it 3 rewritten (saturated either
+  way, `>50ms` in both, offered 10.04k → 10.35k/s, dropped 1.16M → 1.34M = 9 s × 20k/s), §10 the
+  refit paragraph dated and today's 24.8 ms with and without the timeout; wall-clock figures in
+  url-shortener, search-autocomplete, news-feed (two) and youtube "on the author's machine". The
+  Phase 3 backlog gained the recommended splits (below). Acceptance greps: no `.cppm:N`/`.cpp:N`
+  in `docs/study`; `grep -rn 'phase 2c will\|not yet' scenarios docs/study` is empty.
 
 Fix round notes (code): `Graph::build` builds the call graph once (`detail::forwarder_steps`), takes the asynchronous hops from it and its strongly connected components (`detail::call_components`, Tarjan, documented inline); `Graph::check_backend_calls` (was `check_cache_backend_calls`) refuses a cache's or CDN's fetch and a limiter's `counter` hop whose two ends share a component. The limiter check runs there, after the build, not in `connect_backend` as the decision said: the call graph needs the routes and resolved hops that `connect_backend` precedes. The four probes are refused with the decided messages; the 14 scenarios explain and run byte-identically (their call graphs have no such cycle), and the only changed output is the probe `q_cycle.yaml`'s `peak_backlog 1.819e-13` → `0`. `simulated()` is the `runs` column of `model::node_type_table` (rows are `NodeTypeRow`; `core`'s name lookups take any row through a `NameRow` concept); `make_node` is exhaustive with `std::unreachable()`. Code minors done: `client_seed` in `simsys.workload`, the three `cost()`s on `detail::cost_in`, `cost_of` gone, `core::Overloaded`, `simsys::significant` for `num`/`significant`, the three test-only exports marked, `without_residue` in `Summary::nodes`/`links` (backlog, drops, rejections under 1e-9 × capacity), the redundant rate-limiter test gone, "still" dropped from the notification/chat refusal, `parse_byte_rate` and byte-CDN explain names, all eleven behaviours asserted, `ring_factor`/`explain_of`/`piped` in `tests/support/scenario_helpers.hpp` (the test-report `piped` now runs 3 s, as the series one did). Schema: the three refusal rows and the leaky-bucket identity. 1163 tests (Debug, Release).
 
@@ -936,7 +988,31 @@ Fix round notes (code): `Graph::build` builds the call graph once (`detail::forw
 - **google-drive's `backup_workers`** (review of Task 6, M-10): 2 workers at 10 ms (200/s) are offered notify_q's 255.6/s at the peak, rho **1.28**, a backlog that grows all evening; its README says nothing of it. When google-drive runs (phase 3, with `ws_gateway`), size the pool or say in the README why the backlog is the point.
 - **Reports:** a `T` prefix for rates and byte rates (`1e15B/s` prints without one: `with_si_prefix` stops at G; review of Task 6, M-11).
 - **Sweep:** a column per SLO with its verdict and a per-point exit code (refinement 15 as the plan's header wrote it; the comprehensive 2c review kept `sweep` to numbers: spec §19 entry 15), and `reject_rate` as a metric.
-- **Cycles:** cut a node cycle at an asynchronous edge (a queue → pool link) when there is one, rather than at the first back edge the depth-first search finds (review of Task 6, M-12): chat-system's `sync_workers -> chat_servers` became its feedback link in Task 6, where `message_q -> sync_workers` is the edge nobody waits for.
+- **Cycles:** cut a node cycle at an asynchronous edge (a queue → pool link) when there is one, rather than at the first back edge the depth-first search finds (review of Task 6, M-12): chat-system's `sync_workers -> chat_servers` became its feedback link in Task 6, where `message_q -> sync_workers` is the edge nobody waits for. The whole-of-phase-2 review recommends doing it once its C-1 has landed: the call graph's strongly connected components, built once for C-1's refusal, are what says which queue → pool edge lies on a node cycle.
+- **Code layout (recommended by the whole-of-phase-2 review at 738801a, not done in phase 2):**
+  split the three largest units, re-checking the fourth and fifth GCC 14.2 defects (CLAUDE.md §3:
+  special members not emitted in Release, lambdas in range adaptors defined twice) after each
+  move, since both depend on where code is instantiated:
+  - `report.cpp` (3,249 lines): `explain` (the paper load, the checks, the provenance lines) into
+    an `explain.cpp` implementation unit of `simsys.report`, or a module of its own;
+  - `config.cpp` (3,395 lines): the readers per concern (header and datacenters, node bodies and
+    advanced keys, steps, links, SLOs, overrides), as implementation units or partitions of
+    `simsys.config`;
+  - `graph.cppm` (3,674 lines, interface only): the definitions into a `graph.cpp`
+    implementation unit (or module partitions), so that editing a body stops rebuilding every
+    importer.
+  - `tests/theory/test_theory.cpp` (5,053 lines, 194 `TEST_CASE`s at 738801a) along its
+    `// ----` sections into nine files, with the helpers several files need (and the duplicated
+    `ring_factor`, `explain_of`, `piped`) in a `tests/support/fixtures.cppm` module: lines
+    1–1312 the phase 1 and 2a closed forms (M/M/1, chains, delay and feedback links, estimate,
+    balancers, limiters, caches, the consistent-hashing lab); 1313–1682 SQL database and the
+    request-based CDN; 1683–2236 byte-sized nodes, the room bounding the wait, which byte-sized
+    nodes run; 2237–2594 a blob store's event notifications and the id generator; 2595–3102 link
+    bandwidth as a pipe; 3103–3686 message queues and worker pools (backlog growth, retention,
+    `then` steps); 3687–4171 queue lag, external sinks, a pool calling a sink; 4172–4738
+    kv_cluster and the search index; 4739–5053 a step after a failed step and estimate = run at
+    rho 1. The nine files join the `theory_tests` executable beside `test_timeout.cpp` and
+    `test_windows.cpp` (`tests/CMakeLists.txt`), so the split renames no test.
 - **Other mechanisms:** mixing key distributions by rate at a che cache (§18 entry 1); a search index's rebuild load (`build_interval`); `estimate --at`; replications (§9.3) and sweeps over seeds or two keys; geometric sweep spacing; a zone SLO metric; the tail-at-scale quantile for wide fan-outs (§16 entry 11).
 - **Carried over from the 2a backlog, still open:** M5 long functions, M6 duplicated helpers (cost lookup, spike activity, message prefix), M7 unit labels when a node has a `cost`, M9 duplicate `write_ops` accepted, M10 the diurnal table in the schema, M12 `estimate`'s table shape, M13 `curve --seed` without `--noise`, M15 test nits; test gaps 2 (conservation with a token bucket and hot/cool copies), 3 (run → estimate on balancer, limiter and cache paths), 5 (CSV-level determinism), 6 (transient answered weighting).
 

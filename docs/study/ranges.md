@@ -5,17 +5,18 @@
 | Construct | Where (file: function) |
 |---|---|
 | `ranges::lower_bound` + member projection | `src/flow/flow.cppm`: `Flow::position_of` |
-| `ranges::find` + member projection | `src/config/config.cpp`: `find_advanced_number`, `name_of`; `src/report/report.cpp`: `mean_utilization`; `src/engine/behaviours.cppm`: `ClientBehaviour` constructor |
+| `ranges::find` + member projection | `src/config/config.cpp`: `find_advanced_number`; `src/report/report.cpp`: `mean_utilization`; `src/engine/behaviours.cppm`: `ClientBehaviour` constructor |
 | `ranges::find` + lambda projection | `src/engine/graph.cppm`: `Graph::index_of` |
-| `ranges::sort` (+ projection) | `graph.cppm`: `detail::find_async_hops`; `behaviours.cppm`: `detail::sort_by_destination`; `engine.cppm`: `offered_rates`; `config.cpp`: `read_op_shares` |
-| `ranges::unique`, `ranges::binary_search` | `graph.cppm`: `find_async_hops`, `Graph::is_async_hop`; `behaviours.cppm`: `ClientBehaviour::response` |
-| `ranges::count_if` with a member pointer | `report.cpp`: `paper_load` (`&graph::ResolvedLink::feedback`) |
-| `views::values`, `views::keys`, `views::join` | `graph.cppm`: `Graph::connect_steps`, `Graph::route_clients`, `detail::call_roots`; `config.cpp`: `offers_op` |
+| `ranges::find_if_not` + member projection | `graph.cppm`: `detail::check_ring_only` (`&KeyArrival::sender`) |
+| `ranges::sort` (+ projection) | `graph.cppm`: `detail::find_async_hops`; `behaviours.cppm`: `detail::sort_by_destination`, the `ClientBehaviour` constructor; `config.cpp`: `read_op_shares` |
+| `ranges::unique`, `ranges::binary_search` | `graph.cppm`: `detail::find_async_hops`, `Graph::is_async_hop`, `op_cost`; `behaviours.cppm`: `ClientBehaviour::response` |
+| `views::values`, `views::keys`, `views::join` | `graph.cppm`: `Graph::connect_steps`, `Graph::route_clients`, `detail::call_roots`; `config.cpp`: `sends_op` |
+| C++23 `views::chunk_by` | `graph.cppm`: `Graph::resolve_request_sizes` (with `detail::same_op`, the fifth GCC defect's workaround, below) |
 | `views::split` + `ranges::any_of` | `config.cpp`: `lists_word` |
-| `views::reverse` | `engine.cppm`: `Simulation::backward_pass` |
-| C++23 `ranges::contains` | `graph.cppm`: `carries_op`, `Graph::add_edge`; `config.cpp`: `read_dc`, `offers_op`; `engine.cppm`: `add_once` |
-| C++23 `ranges::fold_left` | `config.cpp`: `check_shares_sum_to_one`; `report.cpp`: `paper_load` |
-| C++23 `ranges::to`, `views::join_with`, `views::zip` | `report.cpp`: `join`, `map_to_strings`, `Summary::observe` |
+| `views::reverse` | `src/engine/engine.cppm`: `Simulation::backward_pass` |
+| C++23 `ranges::contains` | `graph.cppm`: `carries_op`, `Graph::add_edge`; `config.cpp`: `read_dc`, `sends_op`; `engine.cppm`: `add_once`; `behaviours.cppm`: `SqlDbBehaviour::is_write` |
+| C++23 `ranges::fold_left` | `config.cpp`: `check_shares_sum_to_one`; `report.cpp`: `forward_limited`, `paper_pass`; `behaviours.cppm`: `RateLimiterBehaviour::admit_sliding_log` |
+| C++23 `ranges::to`, `views::join_with`, `views::zip` | `report.cpp`: `join`, `map_to_strings`, `Summary::observe`, `explain_links`; `config.cpp`: `read_client_sizes` (`ranges::to<std::map>`) |
 
 ## What
 
@@ -92,6 +93,32 @@ copying a single step.
   a dead vector. GCC 14 does not implement C++23's range-for lifetime extension (P2718R0).
 - **`views::split` yields subranges, not strings.** `lists_word` builds a `std::string_view`
   from each piece with the C++20 iterator-pair constructor, which needs contiguous pieces.
+- **A lambda handed to a range adaptor in a module is defined twice (GCC 14.2).** The
+  natural way to split a node's arrivals, sorted by op, into one run per op is C++23's
+  `views::chunk_by`, which starts a new chunk wherever two neighbours fail a predicate:
+
+  ```cpp
+  // graph.cppm, Graph::resolve_request_sizes
+  for (const auto op_arrivals : walk.at_nodes[node] | std::views::chunk_by(detail::same_op)) {
+    const std::span<const detail::SizeArrival> one_op{op_arrivals};
+    ...
+  }
+  ```
+
+  The natural predicate is a lambda, `[](const SizeArrival& a, const SizeArrival& b) { return
+  a.op == b.op; }`. With a lambda there the code compiled, and the link failed with "multiple
+  definition" of the lambda's conversion to a function pointer: GCC 14.2 emitted it in the module's object file and again in every unit
+  that imports the module. That is the fifth defect of `CLAUDE.md` §3. The workaround is a
+  named function, `detail::same_op`, whose comment says why it is not a lambda. Only a callable
+  handed to a range *adaptor* (a view) is affected: a lambda passed to a range *algorithm*
+  (`ranges::any_of` in `lists_word`, `ranges::sort` with a lambda projection) is fine, and so
+  is a lambda inside a function body. `config::dot_path_keys` meets the same defect from the
+  other side: it splits a dotted path with a plain loop, not `views::split | views::transform`
+  with a lambda, and its comment says so.
+- **`chunk_by` chunks are contiguous subranges.** Each chunk of a vector is a subrange of
+  vector iterators, so it converts to a `std::span` (`one_op` above) and can be passed to a
+  function that takes `std::span<const SizeArrival>` without a copy. Over a non-contiguous
+  range (a `std::list`, a filtered view) that conversion would not compile.
 
 ## Further reading
 
@@ -102,7 +129,7 @@ copying a single step.
   [`ranges::to`](https://en.cppreference.com/w/cpp/ranges/to).
 - P0896R4, *The One Ranges Proposal* (C++20 ranges, projections, views).
 - P2302R4, *std::ranges::contains*; P2322R6, *ranges::fold*; P1206R7, *ranges::to*;
-  P2321R2, *zip*; P2441R2, *views::join_with* (all C++23).
+  P2321R2, *zip*; P2441R2, *views::join_with*; P2443R1, *views::chunk_by* (all C++23).
 - P2328R1, *join_view should join all views of ranges*; P2718R0, *Wording for P2644R1 Fix
   for Range-based for Loop* (temporaries' lifetime).
 - Eric Niebler's range-v3, the library the standard design came from.

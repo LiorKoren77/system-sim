@@ -39,16 +39,20 @@ Take x = 1e-12 and compute 1 - e^{-x} in IEEE doubles (checked with Python's `ma
 `exp(-1e-12)` is stored as 0.999999999999 rounded to the nearest multiple of 1.1e-16,
 and the subtraction then exposes that rounding. `std::expm1(u)` computes e^u - 1
 directly (a series for small u) with no subtraction; `std::log1p(u)` does the same for
-ln(1 + u). The code uses them in exactly three places:
+ln(1 + u). The code uses them in four places:
 
 - `power_integral` (`src/caching/caching.cppm`): the Zipf bucket mass
   (b^{1-s} - a^{1-s}) / (1-s) is rewritten as a^{1-s} * expm1((1-s) ln(b/a)) / (1-s),
   which stays accurate as s approaches 1 (where the textbook form is 0/0).
 - `one_minus_exp_neg` (`src/caching/caching.cppm`): the Che term 1 - e^{-p t}; a cold
   key over a short characteristic time has p t near 1e-12 (the comment above the function).
-- `lognormal_fit` (`src/queueing/queueing.cppm`, behind `lognormal_quantile` and the
-  quorum's quadrature, section 7): sigma^2 = ln(1 + v/m^2), where v/m^2 is small for a nearly
-  deterministic latency.
+- `lognormal_fit` (`src/queueing/queueing.cppm`): sigma^2 = ln(1 + v/m^2), where v/m^2 is
+  small for a nearly deterministic latency. Every lognormal of the simulator goes through it:
+  `lognormal_quantile` (the reported percentiles), `lognormal_below` (what a client's timeout
+  leaves answered, section 10) and the quorum's quadrature (section 7).
+- `moments_from_survival` (same file, the quadrature of section 7): the trapezoid rule's
+  geometric left tail h t / (e^h - 1) is written `h * t / std::expm1(h)`, which keeps its digits
+  for the small grid steps h the rule uses.
 
 ## 3. Bisection vs. Newton for the Che characteristic time
 
@@ -82,7 +86,7 @@ nonzero one (4.9e-324), and `exp(-746)` is exactly 0.
 
 **Erlang C** (`erlang_c`, `src/queueing/queueing.cppm`). The textbook formula contains
 a^c / c! with a the offered load. At a = c = 712 it is 2.47e307, at 713 it is 6.7e307, and
-a few servers later it passes DBL_MAX; a thousand pooled connections at rho 0.99 is
+at 714 it passes DBL_MAX; a thousand pooled connections at rho 0.99 is
 a = 990. The recurrence B(0) = 1, B(k) = a B(k-1) / (k + a B(k-1)) (the comment in its body)
 is a probability at every step, so it never leaves [0, 1]. The test
 `erlang_c stays finite for a thousand servers near saturation` (`tests/unit/test_queueing.cpp`)
@@ -95,8 +99,8 @@ weight by the total, so Σ count * p = 1 and every probability is in [0, 1].
 e^{-p t} is 0 for p t >= 746, and for a big cache every hot bucket has that, so
 computing it directly could make all weights 0 and 0/0 is no distribution. The fix has two
 parts: stay in logarithms (the log-sum-exp in `log_miss_weights` factors out the largest
-term), and divide by the largest log weight before the final `exp`, so no value exceeds 1
-and at least one bucket is exactly 1.
+term), and subtract the largest log weight before the final `exp` (dividing by the largest
+weight, done in logarithms), so no value exceeds 1 and at least one bucket is exactly 1.
 
 ## 5. Moments through a graph
 
@@ -264,8 +268,9 @@ burst leaves a backlog that the api works off at full capacity while the spike's
 1,000/s arrive: the stochastic wait reads the utilization of what arrives, min(demand, drain) /
 capacity = 1000 / 1200 (`FluidQueue::advance`; the backlog's own drain time is the fluid term),
 so the burst's wait falls with its backlog. (An earlier version read the busy
-fraction, 1, and held at the clamp until the backlog was gone: 29.9 ms at both steps.) The
-clients' `timeout: 1s` moves none of these figures: it times out 3e-7 of the delivered calls, and
+fraction, 1, and held at the clamp until the backlog was gone: a p99 of 30.5 ms at 100 ms, where
+it is 24.8 ms now; spec §18 entry 14 keeps the history.) The
+clients' `timeout: 1s` moves none of these figures: it times out 3.5e-7 of the delivered calls, and
 a percentile is read off the fit to every delivered call, which the cut leaves alone
 (section 10). A step shorter than the 5 s spike but not a
 divisor of it shows the other loss. At `step: 2s` the 5 s spike at 25 min is sampled at
@@ -450,15 +455,21 @@ same function, so the consistent-hashing lab's balancer and the kv-store lab's c
 3. **Coarsen the step.** Copy `scenarios/labs/unique-id/scenario.yaml` (step 100ms; its
    ticket server has capacity 8k/s and a queue limit of 1000), change the spike to
    `{at: 5m, for: 1s, factor: 3}` and compare `simsys run` at `step: 100ms` and at
-   `step: 10s`. The demand is frozen across a step, so the 1 s spike is either smeared over
-   ten seconds or missed, and the drop count and the p99 move. Conservation is not what
+   `step: 10s`. The demand is frozen across a step, so a 1 s spike is either held for a whole
+   step or missed. Here the step that starts at 5:00 samples it, and offers 30k/s for ten
+   seconds. The ticket server is saturated either way (the base 10k/s already exceeds its
+   8k/s), so the latencies cannot show the difference: in both runs every delivered id times
+   out at the clients' 50 ms (`>50ms`). The volumes show it. The offered rate averages
+   10.04k/s at 100 ms and 10.35k/s at 10 s, and the ticket server's `dropped` rises from
+   1.16M to 1.34M: the 9 extra seconds of a 20k/s excess, 180k. Conservation is not what
    breaks: in `flow is conserved to rounding under adversarial demand, dt and queue limits`
    (`tests/unit/test_fluid.cpp`) widen `dts` to include `10s` and the
    residual check still passes (section 6). What coarse steps lose is fidelity, not balance.
 4. **Find the step where the burst disappears.** Run the rate-limiter lab at `step: 5ms`,
    `100ms`, `500ms` and `1s` (the commands are in "Choosing the step", section 6) and watch
    the api row's `peak_backlog` (98, 80, 0, 0) and the p99 (24.1 ms, 24.8 ms, 30.5 ms at the
-   step that makes each burst exactly the api's capacity, then 19.9 ms). Then set the limiter's `burst: 1000`, which moves the ceiling to
+   step that makes each burst exactly the api's capacity, then 19.9 ms). Then set the
+   limiter's `burst: 1000`, which moves the ceiling to
    1000 / 15000 = 67 ms. The burst now overfills the api's queue at every step, so the step
    hardly matters: the api's `dropped` is 1.385k at 5 ms, 1.36k at 100 ms and 1.2k at
    500 ms. Why? (The api's waiting room, `queue_limit`, caps the backlog the same way at
@@ -533,8 +544,10 @@ below times out 0.073 % of its requests, yet 0.94 % of its first moment and 6.5 
 lie past 1 s; cutting them takes 11 % of the variance (0.01 → 0.00889 s²), and the refit's p99 was
 475.5 ms where the requests' own p99 had not moved from 490 ms. Behind 600 ms it was 508.9 ms, so
 the old p99 rose and fell as the timeout grew. The rate-limiter lab showed it in a whole run: a
-cut of 8.9e-7 of its calls moved its p99 from 30.5 to 29.9 ms. Reading the delivered fit removes
-both: a tiny cut moves no percentile.
+cut of 8.9e-7 of its calls moved its p99 from 30.5 to 29.9 ms (before the stochastic wait read
+min(demand, drain), section 6). Reading the delivered fit removes both: a tiny cut moves no
+percentile. Today the lab cuts 3.5e-7 of its calls and prints a p99 of 24.8 ms with its
+`timeout: 1s` and without it.
 
 **Checked against the binary.** A client at 10/s sending `get` to a service of 100 ms service
 time and 1k/s (c = 100, so no wait: the sojourn is exponential, m = 100 ms, v = 0.01 s², SCV 1)

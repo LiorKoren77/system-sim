@@ -24,9 +24,16 @@
 ## Things to try
 - Set `replicas: 1` on `api`: `explain` reports it offered 150 % of its capacity
   (1.5k/s against 1k/s), red. `run` shows a busy fraction of 100 % (it cannot be busier
-  than always busy), a backlog stuck at the 1000-request queue limit, a third of the
-  requests dropped and a p99 of about 1.1 s: all three SLOs fail. The database calms
-  down to 24 % because the saturated API passes on only 1k/s.
+  than always busy), a backlog stuck at the 1000-request queue limit and a third of the
+  requests dropped (drop rate 0.3333): all three SLOs fail, exit code 2. A full queue of
+  1000 requests drained at 1k/s makes each request wait about a second, which is exactly
+  the clients' `timeout: 1s`. Of the requests the API answers, 51.8 % of the reads and
+  53.8 % of the writes come back too late and are counted as timed out, not answered
+  (`timed out/s` 414.4 and 107.6). With that many past the timeout, every percentile is
+  the timeout itself and prints `>1s`; the mean (962 ms for a read) is the mean of the
+  requests answered in time. Delete `timeout: 1s` and the same run reports what the
+  clients would wait: p99 1.13 s. The database calms down to 24 % because the saturated
+  API passes on only 1k/s.
 - Raise `latency` on `db`: a write pays it twice, but its SLO is twice as loose, and two
   calls in a row partly average out (the mean doubles, the spread grows only by about
   √2), so a write's p99 is less than twice a read's. The read SLO fails first, between

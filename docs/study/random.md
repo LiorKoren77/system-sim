@@ -10,7 +10,7 @@ whole project leans on ("same scenario + same seed = the same run, byte for byte
 |---|---|---|
 | `std::mt19937_64` engine, seeded with one `std::uint64_t` | `src/workload/workload.cppm` | `NoiseProcess::engine_`, `NoiseProcess::NoiseProcess` |
 | `std::normal_distribution<double>{0.0, 1.0}` | `src/workload/workload.cppm` | `NoiseProcess::normal_`, drawn in `NoiseProcess::next` |
-| the per-client seed | `src/engine/behaviours.cppm` | `behaviours::client_seed(seed, index)` |
+| the per-client seed | `src/workload/workload.cppm` | `workload::client_seed(seed, index)` (beside the noise it seeds, so the CLI's `curve --noise` and the tests need not import the behaviours) |
 | one process per client, ticked once per step | `src/engine/behaviours.cppm`, `src/engine/engine.cppm` | `ClientBehaviour::tick`, `ClientBehaviour::reset_noise`, `Simulation::make_node` |
 | the same path printed | `src/cli/main.cpp`, `src/workload/workload.cppm` | `curve_samples` (`--noise`, `--seed`), the noisy `samples` overload |
 
@@ -71,8 +71,8 @@ noise adds load as well as variability.
   (mod 2^64), with `i` the client's node index. A plain `seed XOR i` collides
   (`1 ^ 0 == 0 ^ 1`); multiplying by the odd constant (2^64 / golden ratio, splitmix64's
   increment) moves each seed's block of indices into the high bits.
-  `tests/unit/test_behaviours.cpp` checks that seeds −100..100 × 64 clients never share
-  an engine seed.
+  The test `client_seed never gives two seed and client pairs the same engine seed` checks
+  that seeds −100..100 × 64 clients never share an engine seed.
 - **Ticks, not calls.** The engine ticks every client exactly once per step, before it
   offers; `estimate` never ticks (it sees the curve without noise); a `sigma: 0` client
   returns 1 without drawing, so it is identical to a client without noise.

@@ -8,9 +8,9 @@ name: url-shortener
 seed: 1
 duration: 24h
 # 1 s steps: the fluid step is exact while demand is constant within it, and the daily sine moves
-# by at most 0.003 % of its peak in a second; the day's figures match a 100 ms run to 1e-8 and
+# by at most 0.003 % of its peak in a second; the day's figures match a 100 ms run to 1.1e-8 and
 # the worst hour's utilization to 1.3e-6 (README, "What the model captures"), at a tenth of the
-# steps (86k instead of 864k).
+# steps (86,280 observed after the warmup instead of 862,800).
 step: 1s
 warmup: 2m
 
