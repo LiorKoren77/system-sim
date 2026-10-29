@@ -228,10 +228,9 @@ inline constexpr Rate sql_write_rate{1'000};
 inline constexpr double sql_write_cost =
     for_type(model::NodeType::sql_db).service_rate.per_second / sql_write_rate.per_second;
 
-// Capacity units one request of `op` uses at the node `spec` describes: its `cost` entry, else
-// sql_write_cost for a database's write op, else 1. The one place the rule lives, so the engine
-// (through the behaviours) and explain's paper load price every op alike.
-[[nodiscard]] double op_cost(const model::NodeSpec& spec, std::string_view op) {
+// Capacity units one request of `op` uses at ONE machine of the node `spec` describes: its `cost`
+// entry, else sql_write_cost for a database's write op, else 1.
+[[nodiscard]] double machine_cost(const model::NodeSpec& spec, std::string_view op) {
   const auto stated = spec.cost.find(std::string{op});
   if (stated != spec.cost.end()) return stated->second;
   // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
@@ -239,6 +238,19 @@ inline constexpr double sql_write_cost =
   const bool database_write =
       spec.type == model::NodeType::sql_db && std::ranges::contains(model::write_ops_of(spec), op);
   return database_write ? sql_write_cost : 1.0;
+}
+
+// Capacity units one request of `op` uses at the node `spec` describes: machine_cost, times N for
+// a kv_cluster (plan 2c refinement 9; book ch. 6 "quorum consensus": the coordinator sends every
+// read and write to all N replicas of the key, so one request is N replica-requests, each one
+// unit of a replica machine's capacity; model::kv_replication applies the default N = 3). So the
+// cluster's demand, drain, drops and backlog are in replica-requests, and 30k requests/s at N = 3
+// are 90k/s against the machines' capacity. The one place the rule lives, so the engine (through
+// the behaviours) and explain's paper load price every op alike.
+[[nodiscard]] double op_cost(const model::NodeSpec& spec, std::string_view op) {
+  const double one_machine = machine_cost(spec, op);
+  if (spec.type != model::NodeType::kv_cluster) return one_machine;
+  return one_machine * model::kv_replication(spec);
 }
 
 // ---- Id generators (plan 2b refinement 6; book ch. 7) ----

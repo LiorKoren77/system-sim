@@ -263,6 +263,26 @@ inline constexpr auto id_algorithm_table = std::to_array<core::EnumName<IdAlgori
   return core::parse_in(id_algorithm_table, name);
 }
 
+// What a Dynamo-style key-value store gives up when a network partition splits it (System Design
+// Interview ch. 6, "CAP theorem"): `ap` keeps answering on both sides and returns stale data
+// (Dynamo, Cassandra), `cp` refuses what cannot reach a quorum (unavailable instead of stale).
+// Read and printed only: without partitions (faults are phase 3) the two behave alike.
+enum class KvMode { ap, cp };
+
+// Pattern: Table-driven method — the mode names, read by the loader (`mode:`) and printed by
+// explain from this one table.
+inline constexpr auto kv_mode_table = std::to_array<core::EnumName<KvMode>>({
+    {KvMode::ap, "ap"},
+    {KvMode::cp, "cp"},
+});
+
+[[nodiscard]] constexpr std::string_view to_string(KvMode m) {
+  return core::name_in(kv_mode_table, m);
+}
+[[nodiscard]] constexpr std::optional<KvMode> parse_kv_mode(std::string_view name) {
+  return core::parse_in(kv_mode_table, name);
+}
+
 // How a cache and the store behind it share reads and writes (System Design Interview
 // ch. 1 "Cache", and the caches of ch. 8 url shortener, ch. 11 news feed, ch. 12 chat, ch. 13
 // autocomplete, ch. 14 YouTube). Names: ch. 1 draws one pattern, the application reading the
@@ -342,6 +362,13 @@ inline constexpr SimTime default_limiter_window = 1_s;
 // of the mean with 100 virtual nodes and 5% with 200; 150 sits between the two (the lab's
 // "try 150"). graph::Graph::mark_balanced_targets turns it into the imbalance factor.
 inline constexpr int default_vnodes = 150;
+
+// A kv_cluster's replication factor N and its two quorums when the scenario gives none: book
+// ch. 6's worked example, N = 3 with W = R = 2, Dynamo's classic configuration (W + R > N, so a
+// read always meets the latest write). The quorums default to min(2, N) (kv_write_quorum,
+// kv_read_quorum), so a cluster that states `replication: 1` keeps a valid W = R = 1.
+inline constexpr int default_replication = 3;
+inline constexpr int default_quorum = 2;
 
 // One thing a node does with an incoming op: forward (a multiple of) it to `to` as `op`.
 // Every struct below is an aggregate (public members, no constructors) with default
@@ -451,7 +478,8 @@ struct NodeSpec {
   // Load balancers only (declared after `cost`, for designated initializers): the policy
   // (absent: round_robin) and, for consistent_hash, the virtual nodes per server (absent:
   // default_vnodes). The loader leaves an absent key absent, so explain can tell a stated
-  // number from a default; every reader applies the default.
+  // number from a default; every reader applies the default. A kv_cluster's ring reads `vnodes`
+  // too (plan 2c refinement 9: its machines sit on a ring of their own, see kv_nodes below).
   std::optional<LbPolicy> policy{};
   std::optional<int> vnodes{};
   // Rate limiters only (plan 2a refinement 6; declared after the LB keys, for designated
@@ -547,8 +575,36 @@ struct NodeSpec {
   // and per-host politeness.
   double failure_rate{0.0};
   std::optional<Rate> politeness{};
+  // Key-value clusters only (plan 2c refinement 9; declared after the external sink's keys, for
+  // designated initializers): book ch. 6's Dynamo-style store. `kv_nodes` (the scenario's
+  // `nodes:`) is how many machines sit on its consistent-hash ring, each of `capacity`, with
+  // `vnodes` virtual nodes each (the balancer's member above, shared: the same ring); every key
+  // lives on `replication` N of them, a write is acknowledged after `write_quorum` W replicas and
+  // a read answered after `read_quorum` R. `kv_nodes` is required (the loader and Graph::build
+  // refuse a cluster without one); the others default (default_replication, default_quorum: the
+  // book's N = 3, W = R = 2) through kv_replication, kv_write_quorum and kv_read_quorum. The
+  // loader leaves an absent one absent. `kv_mode` is ap or cp, what a partition would cost
+  // (KvMode): read and printed, not modelled before faults (phase 3).
+  std::optional<int> kv_nodes{};
+  std::optional<int> replication{};
+  std::optional<int> write_quorum{};
+  std::optional<int> read_quorum{};
+  KvMode kv_mode{KvMode::ap};
   std::optional<Workload> workload{};  // clients only
 };
+
+// A kv_cluster's replication factor N and its quorums W and R with the defaults applied: N = 3
+// (default_replication), W = R = min(2, N) (default_quorum, lowered for a cluster of N = 1). The
+// one place the defaults live, so the graph, the behaviour and explain agree.
+[[nodiscard]] constexpr int kv_replication(const NodeSpec& spec) {
+  return spec.replication.value_or(default_replication);
+}
+[[nodiscard]] constexpr int kv_write_quorum(const NodeSpec& spec) {
+  return spec.write_quorum.value_or(std::min(default_quorum, kv_replication(spec)));
+}
+[[nodiscard]] constexpr int kv_read_quorum(const NodeSpec& spec) {
+  return spec.read_quorum.value_or(std::min(default_quorum, kv_replication(spec)));
+}
 
 // The window and the burst a rate limiter works with, defaults applied. The loader leaves
 // an absent one empty (so explain can say "(default)"), as may a scenario built in code,
@@ -697,3 +753,5 @@ static_assert(simsys::model::cache_strategy_table.back().value ==
               simsys::model::CacheStrategy::write_back);
 static_assert(simsys::core::round_trips(simsys::model::id_algorithm_table));
 static_assert(simsys::model::id_algorithm_table.back().value == simsys::model::IdAlgorithm::uuid);
+static_assert(simsys::core::round_trips(simsys::model::kv_mode_table));
+static_assert(simsys::model::kv_mode_table.back().value == simsys::model::KvMode::cp);

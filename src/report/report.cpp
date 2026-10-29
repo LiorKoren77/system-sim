@@ -863,8 +863,13 @@ template <class T, class F>
 
 // The vnodes of the consistent-hash balancer in front of `target` (the one whose ring
 // gives the largest imbalance, as Graph::mark_balanced_targets keeps), for explain. A
-// drained route (weight 0) sends nothing, so its ring does not count (as there).
+// drained route (weight 0) sends nothing, so its ring does not count (as there). A kv_cluster's
+// ring is its own (graph::apply_kv_ring): its `vnodes`, or the default.
 [[nodiscard]] int ring_vnodes(const graph::Graph& g, std::size_t target) {
+  const auto& target_spec = g.nodes()[target].spec;
+  if (target_spec.type == model::NodeType::kv_cluster) {
+    return target_spec.vnodes.value_or(model::default_vnodes);
+  }
   int fewest = 0;  // fewest vnodes = largest imbalance 1 + 1/sqrt(v)
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
     const auto& spec = g.nodes()[node].spec;
@@ -1200,13 +1205,21 @@ struct QueueProvenance {
           provenance(queue_source)};
 }
 
+// "dc=main  replicas=4", or "dc=main" alone for a kv_cluster, whose copies are its machines,
+// printed as `nodes=` with its ring and quorums (kv_cluster_summary): the graph stores them in
+// `replicas` (graph::apply_kv_ring), a key the scenario may not state there.
+[[nodiscard]] std::string placement(const model::NodeSpec& spec) {
+  const std::string dc = "dc=" + spec.dc;
+  if (spec.type == model::NodeType::kv_cluster) return dc;
+  return dc + "  replicas=" + std::to_string(spec.replicas);
+}
+
 [[nodiscard]] std::string server_details(const graph::ResolvedNode& node) {
   const auto& spec = node.spec;
   const auto& cap = node.capacity;
   const auto source = queue_provenance(node);
   const std::array parts{
-      "dc=" + spec.dc,
-      "replicas=" + std::to_string(spec.replicas),
+      placement(spec),
       "capacity=" + fmt_units(spec, cap.service_rate.per_second) + " " + source.capacity,
       "service_time=" + fmt_duration(cap.service_time_s) + std::string{per_unit(spec)} + " " +
           std::string{source.service_time},
@@ -1217,6 +1230,19 @@ struct QueueProvenance {
       "variability=" + num(cap.service_variability, 3),
       "burstiness=" + num(cap.burstiness, 3)};
   return join(parts, "  ");
+}
+
+// A kv_cluster's shape (plan 2c refinement 9; book ch. 6): "  nodes=6 N=3 W=2 R=2 mode=ap
+// (partitions: phase 3)", the machines on its ring, the copies of each key and the two quorums,
+// defaults applied (N = 3, W = R = 2: model::kv_replication and the quorum helpers), and the mode,
+// which only a partition would show (faults are phase 3). Nothing on any other type.
+[[nodiscard]] std::string kv_cluster_summary(const model::NodeSpec& spec) {
+  if (spec.type != model::NodeType::kv_cluster) return {};
+  return "  nodes=" + std::to_string(spec.replicas) +
+         " N=" + std::to_string(model::kv_replication(spec)) +
+         " W=" + std::to_string(model::kv_write_quorum(spec)) +
+         " R=" + std::to_string(model::kv_read_quorum(spec)) +
+         " mode=" + std::string{model::to_string(spec.kv_mode)} + " (partitions: phase 3)";
 }
 
 // "  sizes: stream 50MB, upload 300MB": on a byte-sized node (defaults::is_byte_sized), the size
@@ -1302,8 +1328,8 @@ struct QueueProvenance {
         {{node.spec.id},
          {std::string{model::to_string(node.spec.type)}},
          {client ? client_details(node.spec)
-                 : server_details(node) + cost_summary(g, i) + size_summary(g, i) +
-                       blob_store_summary(g, i) + balancing_summary(g, i) +
+                 : server_details(node) + kv_cluster_summary(node.spec) + cost_summary(g, i) +
+                       size_summary(g, i) + blob_store_summary(g, i) + balancing_summary(g, i) +
                        limiter_summary(node.spec) + cache_summary(g, i) + cdn_summary(g, i) +
                        database_summary(node) + id_generator_summary(node.spec) +
                        message_queue_summary(node.spec) + worker_pool_summary(node) +
@@ -2116,23 +2142,40 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   return fmt_units(node.spec, offered) + " (" + fmt_rate(requests) + ")";
 }
 
-// "peak offered 1.5k/s vs 2k/s total capacity  ": what every check line opens with.
+// A kv_cluster's head (plan 2c refinement 9; book ch. 6): every request goes to N replicas, so
+// its paper load is N times the requests (defaults::op_cost) and its capacity `nodes` times one
+// machine's (graph::apply_kv_ring), and the line says both: "peak offered 90k/s (30k/s × N 3) vs
+// 80k/s (8 nodes)  ", the replica-requests with the requests that make them, the machines'
+// total with how many there are.
+[[nodiscard]] std::string kv_check_head(const graph::ResolvedNode& node, double offered,
+                                        const OpLoad& arriving) {
+  const double requests = std::ranges::fold_left(arriving | std::views::values, 0.0, std::plus<>{});
+  return "peak offered " + fmt_rate(offered) + " (" + fmt_rate(requests) + " × N " +
+         std::to_string(model::kv_replication(node.spec)) + ") vs " +
+         fmt_rate(total_capacity(node)) + " (" + std::to_string(node.spec.replicas) + " nodes)  ";
+}
+
+// "peak offered 1.5k/s vs 2k/s total capacity  ": what every check line opens with (a
+// kv_cluster's says what its numbers are made of: kv_check_head).
 [[nodiscard]] std::string check_head(const graph::ResolvedNode& node, double offered,
                                      const OpLoad& arriving) {
+  if (node.spec.type == model::NodeType::kv_cluster) return kv_check_head(node, offered, arriving);
   return "peak offered " + offered_text(node, offered, arriving) + " vs " +
          fmt_units(node.spec, total_capacity(node)) + " total capacity  ";
 }
 
-// Why a node's capacity gets no verdict, or nothing when it gets one: a kv_cluster's `nodes`,
-// `replication` and quorums are read and ignored until plan 2c Task 10 (schema), so its capacity
-// is ONE box's (`capacity: 10k/s` is per node in labs/kv-store, of eight, each write landing on
-// N = 3 of them). A percentage against it would be a verdict on a model the simulator does not
-// have: labs/kv-store printed 300 %, red.
-[[nodiscard]] std::optional<std::string> unchecked_capacity(const graph::ResolvedNode& node) {
-  if (node.spec.type == model::NodeType::kv_cluster) {
-    return std::string{"kv_cluster nodes, replication and quorums: phase 3"};
-  }
-  return std::nullopt;
+// A kv_cluster's verdict: behind its ring (N < nodes, imbalance k > 1) the average hides the
+// machine that sheds first, so the verdict is the hottest machine's, k times the average:
+// "(hottest 122%, red)" for 90k replica-requests/s over 8 machines of 10k/s (112.5 % on average,
+// k = 1.0816 at 150 vnodes); with N = nodes every machine holds every key and carries the
+// average, "(10%, green)". The engine runs the same hot machine (its node rho is the hottest's).
+[[nodiscard]] std::string kv_verdict(const graph::ResolvedNode& node, double offered) {
+  const double capacity = total_capacity(node);
+  if (capacity <= 0.0) return "(no capacity, red)";
+  const double rho = offered * node.imbalance / capacity;
+  const std::string hottest = node.imbalance > 1.0 ? "hottest " : "";
+  return "(" + hottest + percent(rho) + ", " +
+         std::string{zone_name(fluid::zone_of(rho, node.capacity))} + ")";
 }
 
 [[nodiscard]] std::string check_details(const graph::ResolvedNode& node, double offered,
@@ -2140,9 +2183,7 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
                                         const std::optional<graph::DatabaseCopyLoads>& loads) {
   const double capacity = total_capacity(node);
   const std::string head = check_head(node, offered, arriving);
-  if (const auto unchecked = unchecked_capacity(node)) {
-    return head + "(not checked: " + *unchecked + ")";
-  }
+  if (node.spec.type == model::NodeType::kv_cluster) return head + kv_verdict(node, offered);
   if (capacity <= 0.0) return head + "(no capacity, red)" + hottest_copy_check(node, offered);
   const double rho = offered / capacity;
   return head + "(" + percent(rho) + ", " + headline_zone(node, rho, loads) + ")" +
@@ -2156,8 +2197,6 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 //    propagated: ...)". No zone below red: the real load is higher, so green or yellow might not
 //    hold, but a red lower bound is red for certain, "(≥150%, red; ...)" (a database's at the
 //    busiest copy, headline_zone);
-//  - a capacity with no verdict (unchecked_capacity): its own "not checked" note
-//    (check_details), then the mark.
 // No per-copy checks: each would be a verdict on the same partial number.
 [[nodiscard]] std::string partial_check(const graph::ResolvedNode& node, double offered,
                                         const OpLoad& arriving,
@@ -2166,9 +2205,6 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   const std::string mark = unpropagated_mark(blocked);
   const bool reached = offered > 0.0 || !std::isfinite(offered);
   if (!reached) return head + "(" + mark;
-  if (unchecked_capacity(node)) {
-    return check_details(node, offered, arriving, std::nullopt) + "  (lower bound; " + mark;
-  }
   const double capacity = total_capacity(node);
   if (capacity <= 0.0) return head + "(no capacity, red; " + mark;
   const double rho = offered / capacity;
@@ -2195,8 +2231,7 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   if (!load.converged && load.unbounded[i]) return unbounded_check(node);
   const std::string note{upper_bound[i] ? unknown_hit_ratio_note : std::string_view{}};
   if (!blocked.empty()) return partial_check(node, load.totals[i], load.by_op[i], blocked) + note;
-  // A capacity with no verdict (unchecked_capacity) gets none per copy either.
-  const auto loads = unchecked_capacity(node) ? std::nullopt : database_loads(node, load.by_op[i]);
+  const auto loads = database_loads(node, load.by_op[i]);
   return check_details(node, load.totals[i], load.by_op[i], loads) + database_check(node, loads) +
          note;
 }

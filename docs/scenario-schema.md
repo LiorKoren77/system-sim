@@ -80,12 +80,13 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `message_queue` | the broker's append, every message copied to each consumer group, the publisher answered at the append (phase 2c, see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
 | `worker_pool` | M/M/c over consumption, `workers / cost` jobs a second, its room its queue's `retention`; its `then` steps fire for every job it drains, nobody waiting for them (phase 2c, same section) |
 | `external_sink` | a third party's API: a queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) that fails `failure_rate` of what it serves, counted as drops (phase 2c, see [Node types](#node-types)) |
+| `kv_cluster` | `nodes` machines on a ring, every request sent to `replication` N of them, answered at the W-th (write) or R-th (read) fastest; the ring's hottest machine as its own queue (phase 2c, see [`kv_cluster`](#kv_cluster)) |
 
 Everything else is refused before the first step, with exit code 1:
 
 | what | message | runs from |
 |---|---|---|
-| `kv_cluster`, `ws_gateway`, `service_discovery` | `node 'x' has type 'kv_cluster', which run/estimate do not support yet (phase 2)` | 3 |
+| `ws_gateway`, `service_discovery` | `node 'x' has type 'ws_gateway', which run/estimate do not support yet (phase 2)` | 3 |
 | `search_index`, `notification_fanout`, `frontier` | the same message | not yet assigned to a phase |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
 | `faults` | none: the list is accepted and nothing happens | 3 |
@@ -94,9 +95,11 @@ The type message says "(phase 2)" for every type; the last column is the plan. T
 runs over the whole file first, and names the first node in file order whose type cannot run;
 only then are the nodes of runnable types checked (a CDN's `keys`), in file order: google-drive
 is refused at its `ws_gateway`, `long_poll`, the first type it has no model of. Of the 14
-shipped scenarios seven run: `tutorial/hello`, `tutorial/chain`, `labs/rate-limiter`,
+shipped scenarios nine run: `tutorial/hello`, `tutorial/chain`, `labs/rate-limiter`,
 `labs/consistent-hashing`, `labs/unique-id` (which fails its `drop_rate` SLO on purpose, exit 2),
-`book/url-shortener` and, since phase 2c Task 7, `book/youtube` (its README numbers are Task 16's).
+`book/url-shortener`, since phase 2c Task 7 `book/youtube` (its README numbers are Task 16's),
+and since Task 10 `labs/kv-store` and `book/news-feed` (which runs its day and fails its
+`drop_rate` SLO, exit 2, until Task 17 sizes it).
 
 **`estimate` versus `explain`.** `estimate` evaluates the long-run state once, at
 t = 0 (00:00): the rate curve's value there, without noise. Its first line says so:
@@ -134,12 +137,12 @@ every link it has. A node that also receives load the checks do follow gets its 
 **lower bound**, with no zone unless even that is red (the real load is higher, so green or yellow
 might not hold, but red does): `frontier  peak offered 50/s vs 5k/s total capacity  (≥1%; load
 not propagated: frontier is not modelled yet)` (the web crawler's frontier, fed back through
-itself), `(≥150%, red; ...)`. A check that is already `not checked` (a `kv_cluster`'s) keeps that
-mark and adds the bound after it: `... (not checked: kv_cluster nodes, replication and quorums:
-phase 3)  (lower bound; load not propagated: ...)`. (A `kv_cluster` fed in full, as news-feed's
-`graph_db` is through the fan-out workers, has its own note and no mark.)
+itself), `(≥150%, red; ...)`. A `kv_cluster` behind such a type keeps its own head (see
+[`kv_cluster`](#kv_cluster)) and takes the mark like any node: notification-system's `log_db`,
+`peak offered 0/s (0/s × N 2) vs 60k/s (3 nodes)  (load not propagated: notification_fanout is not
+modelled yet)`.
 A lower-bound line has no per-copy figures (a database's primary/replica split, a ring's hottest
-copy): they would be lower bounds too.
+copy or machine): they would be lower bounds too.
 
 ## Values
 
@@ -279,7 +282,7 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `service` | `ops`, `cost` | read and run |
 | `cache` | `hit_ratio`, `strategy`, `write_ops`, `backend`, `keys`, `eviction`, `ttl`, `then`, `cost` | read and run (fixed or `che` hit ratio), see [`cache`](#cache) |
 | `sql_db` | `replication_lag`, `shards` (int), `pool` (int connections), `write_ops`, `cost` | read and run (phase 2b), see [`sql_db`](#sql_db) |
-| `kv_cluster` | `nodes` (int), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp` | ignored; phase 3 |
+| `kv_cluster` | `nodes` (int, required), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp` | read and run (phase 2c), see [`kv_cluster`](#kv_cluster); `mode` printed, not modelled (partitions are phase 3) |
 | `message_queue` | `partitions`, `retention` | read and run (phase 2c), see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool); `partitions` printed, not modelled |
 | `worker_pool` | `consumes` (queue node id, required), `workers`, `cost` (duration per job), `then` | `consumes`, `workers`, `cost` and `then` read and run (phase 2c), same section: the steps fire for every job it drains, `on: miss` and `on: failure` refused |
 | `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every **write** the store serves (an op in its `write_ops`; not one it drops) sends `factor` requests of the step's op to its target, and a read sends nothing (S3 notifies on ObjectCreated and ObjectRemoved, never on a GET: 1000 views/s of a video start no transcode; notifying on reads is phase 3). They are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. A step `on: miss` (`node 'store': a blob store's then steps fire for every write it stores (on: miss needs a cache)`) or `on: failure` (`... (on: failure: an event reports no failure before phase 3)`) is refused, and so is any `mode` (`node 'store': a blob store's then steps are event notifications nobody waits for (mode orders the calls a request waits for)`); an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, the delivery delay (an event arrives after the link's latency), failed notifications |
@@ -677,6 +680,75 @@ locks, waiting for a free connection beyond the pool's queue, cross-shard querie
 (the sharding key is perfect), resharding, per-op service times (a write uses more capacity, 5
 units by default, not a longer service time), the replica applying its log on a thread of its
 own (a replicated write waits in the same queue as the reads), read-your-writes.
+
+### `kv_cluster`
+
+Book ch. 6, "Design a key-value store", Dynamo-style (Amazon's Dynamo, Cassandra), in the steady
+state (plan 2c refinement 9). `nodes` machines sit on a consistent-hash ring (ch. 5) of `vnodes`
+virtual nodes each; every key lives on `replication` N of them, the N machines that follow it on
+the ring; the coordinator sends every read and every write to all N replicas and answers a write
+once W = `write_quorum` of them have acknowledged it and a read once R = `read_quorum` have replied
+(ch. 6, "quorum consensus"). `capacity`, `latency` and `advanced` describe **one machine** (default
+50k/s, 150 µs: spec §6's "KV 50k" and a NoSQL read).
+
+| key | rule | message on violation |
+|---|---|---|
+| `nodes` | required, a positive integer: the machines | `node 'store': kv_cluster needs nodes`, `nodes must be a positive integer` |
+| `vnodes` | a positive integer; default 150 (the balancer's, ch. 5) | `vnodes must be a positive integer` |
+| `replication` | a positive integer of at most `nodes`; default **3** (ch. 6's N) | `replication must be a positive integer`, `replication must be at most nodes (3 > 2)` (the default counts: a two-node cluster must lower it) |
+| `write_quorum`, `read_quorum` | positive integers of at most `replication`; default **min(2, N)**: ch. 6's W = R = 2, lowered to 1 when `replication: 1`. W + R ≤ N is accepted: it is the eventually consistent end of ch. 6's dial (W = 1 a fast write, R = 1 a fast read; a read may miss the latest write) | `write_quorum must be a positive integer`, `write_quorum must be at most replication (4 > 3)`, the same for `read_quorum` |
+| `mode` | `ap` (default) or `cp`: what a partition costs, staleness or unavailability (ch. 6, "CAP theorem"). Read and printed; it changes nothing until partitions exist (phase 3) | `mode must be ap or cp` |
+| `replicas` | refused: a cluster scales by `nodes` and keeps `replication` copies of a key, two things `replicas` could mean | `node 'store': a kv_cluster's machines are nodes; replicas is not a key here` |
+| `write_ops` | not a key here: a kv_cluster's writes are the op `write` (the default of every node but a database); every other op is a read | the key table's |
+
+`Graph::build` refuses the same shapes in the same words for a scenario built in code.
+
+**N times the requests.** Every request is N replica-requests: a request costs N capacity units
+(as a database write costs 5), so the node's demand, drain, drops and backlog, and the paper load,
+count replica-requests, N times what the clients sent, against `nodes ×` one machine's
+`capacity`. The clients' offered and answered rates stay in requests. The kv-store lab's 30k
+requests/s at N = 3 are 90k replica-requests/s: over 8 machines of 10k/s 11.25k/s each, 112.5 %;
+over 16, 5.625k/s, 56.25 %.
+
+**The ring's hottest machine.** With N < `nodes` each machine holds the keys of the arcs before
+it on the ring, so the machines are unevenly loaded; the hottest carries **k = 1 + 1/√vnodes**
+times the average (1.0816 at 150 vnodes), the heuristic of the consistent-hash balancer
+([`load_balancer`](#load_balancer); a machine holding N arcs rather than one is a little evener,
+so k is on the safe side), at most `nodes / N` (a machine is one of a key's N replicas at most
+once). The engine runs it as a hot machine and `nodes − 1` cool ones, as behind a balancer's
+ring: the node's `rho` and zone are the hottest machine's, so a `utilization` SLO reads it (the
+lab at 16 nodes: 1.0816 × 0.5625 = **0.6084**). With N = `nodes` every machine holds every key:
+k = 1, no hot machine.
+
+**The quorum's latency.** A read is answered at the **R-th fastest** of its N replicas, a write at
+the **W-th**. Each replica's sojourn (wait + service) is taken as exponential with mean m, the
+machines' sojourn weighted by the requests each serves (the hot machine k / nodes of them); the
+k-th smallest of n independent exponentials (Rényi's representation: a sum of k independent
+gaps, the i-th the first finish among the n − i still running) has
+
+```
+mean = m × Σ_{i=0}^{k−1} 1 / (n − i)        variance = m² × Σ_{i=0}^{k−1} 1 / (n − i)²
+```
+
+so with N = 3 a quorum of 1, 2 or 3 answers in 1/3, **5/6** or 11/6 of m (variances 1/9, 13/36
+and 49/36 of m²): Dynamo's W = R = 2 waits 0.8333 m, and `write_quorum: 3` makes a write 2.2
+times slower than that. A request is lost in the share its replica-requests are dropped.
+
+`explain` prints the shape, `nodes=16 N=3 W=2 R=2 mode=ap (partitions: phase 3)  imbalance=1.08
+(vnodes 150)` (no `replicas=`), and checks the replica-requests against the machines, the hottest
+machine's percentage when N < `nodes`: `peak offered 90k/s (30k/s × N 3) vs 80k/s (8 nodes)
+(hottest 122%, red)`; with N = `nodes`, the plain average, `peak offered 3k/s (1k/s × N 3) vs
+30k/s (3 nodes)  (10%, green)`.
+
+Not modelled: network partitions and what `ap` or `cp` does under them, sloppy quorum and hinted
+handoff, node failures (faults: phase 3), read repair and anti-entropy (Merkle tree) traffic,
+vector clocks and conflict resolution, gossip, the storage engine (commit log, memtable,
+SSTables, compaction), a quorum that survives one lost replica (a request is lost with its
+replica-requests' share), the replicas' sojourns not being exponential (a machine of `c > 1`
+servers, a service SCV other than 1) nor independent, the spread between the hot and the cool
+machines (the order statistic is taken over their mean), and which keys are hot (a Zipf hot key
+is the caches' business). The coordinator is no part of the node: the lab's `coordinator`
+service is its hop.
 
 ### `id_generator`
 

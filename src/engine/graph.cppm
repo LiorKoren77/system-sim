@@ -1061,6 +1061,70 @@ void apply_database_keys(ResolvedNode& node) {
   return std::nullopt;
 }
 
+// "write_quorum must be at most replication (4 > 3)", the loader's words (config's
+// check_at_most).
+[[nodiscard]] std::optional<EngineError> above(const std::string& name, std::string_view what,
+                                               int value, std::string_view limit_name, int limit) {
+  if (value <= limit) return std::nullopt;
+  return EngineError{name + std::string{what} + " must be at most " + std::string{limit_name} +
+                     " (" + std::to_string(value) + " > " + std::to_string(limit) + ")"};
+}
+
+// "nodes must be a positive integer" for a stated count below one, the loader's words.
+[[nodiscard]] std::optional<EngineError> not_positive(const std::string& name,
+                                                      std::string_view what,
+                                                      const std::optional<int>& count) {
+  if (!count || *count >= 1) return std::nullopt;
+  return EngineError{name + std::string{what} + " must be a positive integer"};
+}
+
+// Graph::build also takes kv_clusters written in code, which the loader never checked (config's
+// read_kv_cluster_keys): `nodes` present, every count positive, N <= nodes, W and R <= N, and no
+// `replicas` (the graph sets it to `nodes`: apply_kv_ring), each in the loader's words.
+[[nodiscard]] std::optional<EngineError> invalid_kv_cluster(const model::NodeSpec& spec) {
+  const std::string name = "node '" + spec.id + "': ";
+  if (!spec.kv_nodes) return EngineError{name + "kv_cluster needs nodes"};
+  if (spec.replicas != 1) {
+    return EngineError{name + "a kv_cluster's machines are nodes; replicas is not a key here"};
+  }
+  for (const auto& [what, count] :
+       {std::pair{"nodes", spec.kv_nodes}, std::pair{"vnodes", spec.vnodes},
+        std::pair{"replication", spec.replication}, std::pair{"write_quorum", spec.write_quorum},
+        std::pair{"read_quorum", spec.read_quorum}}) {
+    if (auto invalid = not_positive(name, what, count)) return invalid;
+  }
+  const int replication = model::kv_replication(spec);
+  if (auto invalid = above(name, "replication", replication, "nodes", *spec.kv_nodes)) {
+    return invalid;
+  }
+  if (auto invalid =
+          above(name, "write_quorum", model::kv_write_quorum(spec), "replication", replication)) {
+    return invalid;
+  }
+  return above(name, "read_quorum", model::kv_read_quorum(spec), "replication", replication);
+}
+
+// A kv_cluster's machines on their ring (plan 2c refinement 9; book ch. 5's ring, ch. 6's
+// replication): its copies are its `nodes`, each of the stated (per-node) capacity, so
+// `spec.replicas` becomes `nodes` and every reader of a node's copies (explain's total capacity,
+// the engine's copy groups) counts machines. With N < nodes each machine holds the keys of the
+// arcs before it, as uneven as a balancer's ring: the hottest carries k = 1 + 1/sqrt(vnodes)
+// times the average, the balancer's heuristic (Graph::mark_balanced_targets has its derivation
+// and limits; a machine holding N arcs instead of one is a little EVENER than that, so k is on
+// the safe side), as hot and cool copy groups in the engine (add_hot_and_cool_copies). k is at
+// most nodes / N: a machine is at most one of a key's N replicas, so it is sent at most every
+// request, N × rate / nodes × k <= rate. With N = nodes every machine holds every key: k = 1,
+// identical independent copies.
+void apply_kv_ring(ResolvedNode& node) {
+  const auto& spec = node.spec;
+  const double machines = *spec.kv_nodes;
+  const double replication = model::kv_replication(spec);
+  node.spec.replicas = *spec.kv_nodes;
+  if (replication >= machines) return;  // every node holds every key: no hot node
+  const double vnodes = spec.vnodes.value_or(model::default_vnodes);
+  node.imbalance = std::min(1.0 + 1.0 / std::sqrt(vnodes), machines / replication);
+}
+
 // What a worker pool may consume (plan 2c refinement 4): a message queue, or a URL frontier,
 // which is a queue of URLs (book ch. 9: the web crawler's downloaders take URLs from it). The
 // frontier is not simulated before phase 3, so its wiring is checked here and the engine still
@@ -2425,6 +2489,9 @@ Graph::Result Graph::resolve_nodes() {
     if (spec.type == model::NodeType::message_queue) {
       if (auto invalid = invalid_message_queue(spec)) return std::unexpected{std::move(*invalid)};
     }
+    if (spec.type == model::NodeType::kv_cluster) {
+      if (auto invalid = invalid_kv_cluster(spec)) return std::unexpected{std::move(*invalid)};
+    }
     // An id generator needs nothing more here: its algorithm's numbers are type defaults
     // (defaults::defaults_of), resolved below like any node's.
     ResolvedNode node{
@@ -2440,6 +2507,7 @@ Graph::Result Graph::resolve_nodes() {
       node.service_time_source = defaults::Source::scenario;
     }
     if (spec.type == model::NodeType::sql_db) apply_database_keys(node);
+    if (spec.type == model::NodeType::kv_cluster) apply_kv_ring(node);
     nodes_.push_back(std::move(node));
   }
   routes_.resize(nodes_.size());
@@ -3409,6 +3477,9 @@ Graph::Result Graph::mark_balanced_targets() {
       // applies to it (engine::Simulation::make_database): it imposes neither a pool nor a hot
       // copy, and two balancers of different models in front of one database do not conflict.
       if (target.spec.type == model::NodeType::sql_db) continue;
+      // Nor to a kv_cluster's: its coordinator sends each request to the key's N replicas on its
+      // own ring (apply_kv_ring), whatever a balancer in front of it does.
+      if (target.spec.type == model::NodeType::kv_cluster) continue;
       auto& earlier = marked[route.target];
       if (earlier && earlier->model != replica_model) {
         return std::unexpected{EngineError{

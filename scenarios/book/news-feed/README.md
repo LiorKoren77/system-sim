@@ -18,8 +18,14 @@
   model charges every request at least one unit's service time). The fan-out queue and its
   workers are followed on paper: the peak's 2.162k posts/s reach `fanout` (32 workers at 5 ms,
   6.4k jobs/s: `33.8%, green`), and each post's 300 feed writes take `feed_cache` to 661.5k/s
-  of its 100k/s (`662%, red`). `run` stops at `graph_db`, a key-value cluster (plan 2c Task 10):
-  `node 'graph_db' has type 'kv_cluster', which run/estimate do not support yet (phase 2)`.
+  of its 100k/s (`662%, red`). Each post's one look-up in `graph_db`, a key-value cluster of 6
+  machines keeping N = 3 copies (plan 2c Task 10), is 3 replica-requests, against the machines'
+  6 × 30k/s, the hottest of them (1 + 1/sqrt(150) = 1.0816 times the average) checked:
+  `graph_db  peak offered 6.486k/s (2.162k/s × N 3) vs 180k/s (6 nodes)  (hottest 3.9%, green)`.
+  `run` goes through the whole day since then (11.7 s), but the scenario is not yet sized for
+  its 12:00 peak (plan 2c Task 17): as shipped 67.6 % of the work is dropped (`feed_cache`'s one
+  replica first) and `drop_rate` fails (exit 2), while the `read_feed` p99 (103 ms of 200 ms)
+  and `fanout_q`'s lag (`<1us` of 2 m) pass.
 - Queue lag at the evening peak as the fan-out workers fall behind.
 - A 30-second database outage at 15:00: writes back up in `fanout_q`; reads survive on caches.
 

@@ -93,6 +93,10 @@ class DelayLine {
 // unit `capacity` is a rate of (phase 2a refinement 4): a request of an op with `cost` 3
 // counts three times. With every cost at its default of 1, units are requests, as in
 // phase 1. The drop ratio dropped / demand is therefore the share of the node's work it shed.
+// A kv_cluster's every request costs N units (plan 2c refinement 9, defaults::op_cost): its
+// demand, drain, drops and backlog are REPLICA-REQUESTS, N times the requests its clients sent
+// (30k requests/s at N = 3 are 90k/s), the work its machines do; the clients' offered and answered
+// rates (ResponseSample) stay in requests.
 // `rejected_per_s` is a second way to shed (plan 2a refinement 6): requests a rate limiter
 // refused by POLICY, never forwarded. For the token bucket and the windowed algorithms they
 // are refused after the limiter's queue drained them, so they are part of `drain_per_s`
@@ -540,7 +544,7 @@ struct Overloaded : Fs... {
   return type == client || type == service || type == load_balancer || type == rate_limiter ||
          type == cache || type == sql_db || type == cdn || type == id_generator ||
          type == blob_store || type == message_queue || type == worker_pool ||
-         type == external_sink;
+         type == external_sink || type == kv_cluster;
 }
 
 // Why a cache cannot run, if it cannot: a scenario built in code left it without a number or
@@ -930,6 +934,12 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
     // 2.0); serve fails `failure_rate` of what it served (fail_share).
     case model::NodeType::external_sink:
       return make_server(behaviours::ExternalSinkBehaviour{g, index}, resolved);
+    // A kv_cluster's queues are its machines (graph::apply_kv_ring: `nodes` copies of `capacity`,
+    // a hot and a cool group behind its own ring when N < nodes); each request is N
+    // replica-requests (its cost) and is answered at the quorum's reply
+    // (behaviours::KvClusterBehaviour).
+    case model::NodeType::kv_cluster:
+      return make_server(behaviours::KvClusterBehaviour{g, index}, resolved);
     // A database's queues are its primaries and its replicas (make_database), whatever a
     // balancer in front of it does.
     case model::NodeType::sql_db:
