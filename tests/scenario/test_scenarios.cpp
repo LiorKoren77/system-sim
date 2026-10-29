@@ -137,10 +137,11 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
     //    runs" test below runs its first steps instead.
     //  - search-autocomplete runs since plan 2c Task 11 (its search_index is a service) and MEETS
     //    its SLOs (measured 2026-10-29, Release, full day at 100 ms: p99 of suggest 6.86 ms
-    //    against 100 ms, drop rate 0), so Task 18 has nothing to fix; it is exempt here only for
-    //    time: 24 h at 100 ms is 862.8k steps, 8.3 s in Release (measured), over the five seconds
-    //    below. Its own test below runs the day at a 1 s step (86.4k steps, as the url-shortener's
-    //    does) and pins both SLOs passing.
+    //    against 100 ms, drop rate 0); it is exempt here only for time: 24 h at 100 ms is 862.8k
+    //    steps, 4.9 s in Release on an idle machine (measured), at the edge of the five seconds
+    //    below and far over them in Debug. Its own tests below run the day at a 1 s step (86.4k
+    //    steps, as the url-shortener's does) and pin both SLOs passing and the README's headline
+    //    numbers (plan 2c Task 18).
     if (s.name == "lab-unique-id" || s.name == "url-shortener" || s.name == "youtube" ||
         s.name == "news-feed" || s.name == "search-autocomplete") {
       continue;  // not run here
@@ -1228,8 +1229,9 @@ TEST_CASE(
 //    forwards to trie_db are (1 - h) x 20.52k = 103.1/s (the exact h is read from the graph below,
 //    for h = 0.995 itself would say 102.6), against 4 replicas x 2k/s = 8k/s: 103.1 / 8000 =
 //    1.29 %, green;
-//  - query_log_q passes the 1.8k searches/s to the aggregators: 4 workers at 2 ms drain
-//    4 / 2 ms = 2k/s, so 1.8k / 2k = 90 %, red (the red zone starts at the engine's 90 % default);
+//  - query_log_q passes the 1.8k searches/s to the aggregators: 6 workers at 2 ms drain
+//    6 / 2 ms = 3k/s, so 1.8k / 3k = 60 %, green (plan 2c Task 18: at the 4 workers shipped
+//    before, 2k/s, the peak sat exactly on the red threshold, 90 %);
 //  - the aggregators write one 1 KB row per search (the `size: 1KB` step): 1.8k/s x 1 KB = 1.8 MB/s
 //    (decimal megabytes) against aggregated_store's 100 MB/s, 1.8 %, green.
 TEST_CASE("explain on book/search-autocomplete checks the index, the aggregators and the store",
@@ -1243,7 +1245,7 @@ TEST_CASE("explain on book/search-autocomplete checks the index, the aggregators
   REQUIRE(check_line(text, "trie_db")
               .contains("peak offered 103.1/s vs 8k/s total capacity  (1.29%, green)"));
   REQUIRE(check_line(text, "aggregators")
-              .contains("peak offered 1.8k/s vs 2k/s total capacity  (90%, red)"));
+              .contains("peak offered 1.8k/s vs 3k/s total capacity  (60%, green)"));
   REQUIRE(
       check_line(text, "aggregated_store")
           .contains("peak offered 1.8 MB/s (1.8k/s) vs 100 MB/s total capacity  (1.8%, green)"));
@@ -1264,10 +1266,11 @@ TEST_CASE("explain on book/search-autocomplete prints the index's numbers and it
 
 // Measured 2026-10-29 (Release, the shipped 100 ms step, the whole day): p99 of suggest 6.86 ms
 // against its 100 ms and a drop rate of 0 against 0.0005; the busiest node is the aggregators at
-// 90 % of peak and never above it (no red second, no drop). Both SLOs PASS on the shipped
-// numbers. Here the day runs at a 1 s step, as the url-shortener's test does (86.4k steps, a few
-// seconds in Debug, where 862.8k steps at 100 ms would take minutes): the fluid model's averages do
-// not depend on the step, and a pass with a wide margin (6.86 ms of 100 ms) does not hinge on it.
+// 60 % of peak (plan 2c Task 18 gave them 6 workers). Both SLOs PASS on the shipped numbers. Here
+// the day runs at a 1 s step, as the url-shortener's test does (86.4k steps, a few seconds in
+// Debug, where 862.8k steps at 100 ms would take minutes): every number below agrees with the
+// 100 ms run to about 1e-9 (measured: p99 6.864354247 ms at 1 s, 6.864354252 ms at 100 ms), since
+// the fluid model's steady rates do not depend on the step on a curve this smooth.
 TEST_CASE("book/search-autocomplete meets both SLOs over its day at a one second step",
           "[scenario]") {
   using namespace std::chrono_literals;
@@ -1281,6 +1284,79 @@ TEST_CASE("book/search-autocomplete meets both SLOs over its day at a one second
   REQUIRE(p99.status == simsys::report::SloStatus::pass);
   REQUIRE(drops.status == simsys::report::SloStatus::pass);
   REQUIRE(drops.observed == 0.0);
+}
+
+namespace {
+// The shipped search-autocomplete run over its whole day at a 1 s step (see the test above), with
+// its graph kept for the hit ratio and the summary for the nodes and ops.
+struct AutocompleteDay {
+  simsys::graph::Graph graph;
+  std::vector<simsys::report::NodeSummary> nodes;
+  std::vector<simsys::report::OpSummary> ops;
+};
+
+AutocompleteDay run_autocomplete_day() {
+  using namespace std::chrono_literals;
+  auto s = load_scenario("/book/search-autocomplete/scenario.yaml");
+  s.step = 1s;
+  auto g = build_or_fail(s);
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  simsys::report::Summary summary{g, s.warmup};
+  sim->run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
+  auto nodes = summary.nodes();
+  auto ops = summary.ops();
+  return {std::move(g), std::move(nodes), std::move(ops)};
+}
+
+const simsys::report::NodeSummary& node_of(const AutocompleteDay& day, std::string_view id) {
+  const auto found = std::ranges::find(day.nodes, id, &simsys::report::NodeSummary::id);
+  if (found == day.nodes.end()) FAIL("no node " << id);
+  return *found;
+}
+}  // namespace
+
+// The README's headline numbers at the 20:00 peak, 36k keystrokes/s (24k/s x 1.5), each derived:
+//  - api: offered the browser cache's misses, 0.6 x 0.95 x 36k = 20.52k suggests/s, plus the
+//    5 % searches, 1.8k/s: 22.32k/s of 10 x 5k/s, rho = 0.4464 exactly (no queueing in rho);
+//  - trie_cache: Che's hit ratio for a 50M-entry LRU under Zipf 1.2 over 100M prefixes, which
+//    explain prints as 0.995 (pinned to that rounding, +-5e-4), and trie_db is offered the misses,
+//    (1 - h) x 20.52k against 4 x 2k/s: its peak rho is that ratio exactly (103.1/s, 1.29 %);
+//  - aggregators: 1.8k jobs/s against 6 workers / 2 ms = 3k/s, rho = 0.6 exactly, and the query
+//    log's peak lag is the M/M/6 wait there (Erlang C), 0.197 x 2 ms / (6 x 0.4) = 164 us: the pool
+//    is variability 1 and burstiness 1, so the lag is the plain Erlang C mean;
+//  - suggest: p99 6.864 ms of the 100 ms SLO (the README quotes 6.86 ms: pinned to 1e-3, the
+//    README's rounding); the users' 100 ms timeout cuts 1.794e-08 suggests/s, 7.870e-13 of the
+//    22.79k/s delivered, far below the 1 % a p99 leaves above it (so the SLO reads the answered
+//    p99, not the timeout): both pinned to 1e-3 relative, the README's four digits (the 1 s step
+//    moves them by 1e-8 relative, measured).
+TEST_CASE(
+    "book/search-autocomplete at its peak: api 44.6 percent, trie_cache hits 0.995, "
+    "aggregators 60 percent, suggest p99 6.86 ms",
+    "[scenario]") {
+  const auto day = run_autocomplete_day();
+  using Catch::Matchers::WithinAbs;
+  using Catch::Matchers::WithinRel;
+  REQUIRE_THAT(node_of(day, "api").peak_rho, WithinRel(22'320.0 / 50'000.0, 1e-9));
+
+  const double h = *day.graph.hit_ratio(*day.graph.index_of("trie_cache"));
+  REQUIRE_THAT(h, WithinAbs(0.995, 5e-4));
+  REQUIRE_THAT(node_of(day, "trie_db").peak_rho, WithinRel(20'520.0 * (1.0 - h) / 8'000.0, 1e-9));
+
+  REQUIRE_THAT(node_of(day, "aggregators").peak_rho, WithinRel(1'800.0 / 3'000.0, 1e-9));
+  const double erlang_wait = simsys::queueing::mmc_wait(6, 0.6, 2e-3).mean_s;
+  REQUIRE_THAT(erlang_wait, WithinRel(163.8e-6, 1e-3));
+  REQUIRE(node_of(day, "query_log_q").peak_queue_lag_s.has_value());
+  REQUIRE_THAT(*node_of(day, "query_log_q").peak_queue_lag_s, WithinRel(erlang_wait, 1e-9));
+
+  const auto suggest = std::ranges::find(day.ops, "suggest", &simsys::report::OpSummary::op);
+  REQUIRE(suggest != day.ops.end());
+  CAPTURE(suggest->p99_s, suggest->timed_out_per_s, suggest->timed_out_share);
+  REQUIRE(suggest->p99_s < 0.1);
+  REQUIRE_THAT(suggest->p99_s, WithinRel(6.864e-3, 1e-3));
+  REQUIRE_THAT(suggest->timed_out_per_s, WithinRel(1.794e-8, 1e-3));
+  REQUIRE(suggest->timed_out_share < 0.01);  // what the p99 SLO allows above it (Task 13's rule)
+  REQUIRE_THAT(suggest->timed_out_share, WithinRel(7.870e-13, 1e-3));
 }
 
 // ---- A step after a failed step does not run: the url-shortener's ticket server (plan 2c, Task

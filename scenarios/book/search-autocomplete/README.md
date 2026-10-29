@@ -9,18 +9,39 @@
 ## What the model captures
 - One request per keystroke and the 40% browser-cache cut.
 - Extreme key skew (Zipf 1.2): a 50M-entry cache serves nearly everything; the trie DB
-  is only touched by rare prefixes and rebuilds.
+  is only touched by rare prefixes (the rebuild's own load is not modelled, below).
 - The 100 ms latency budget against a 5 ms index read on misses.
 
 ## What the model shows
-`simsys run` (about 4.5 s in Release, exit 0) plays the whole day at the shipped 100 ms step.
-At the 20:00 peak the users send 36k keystrokes/s; the browser cache absorbs 40 % of the
-suggests, the trie cache (Che hit ratio 0.995) absorbs nearly all of the rest, and `explain` finds
-`trie_db` offered 103.1/s against its 8k/s (4 replicas x 2k/s): 1.29 %, green. The data-gathering
-side (the query log and its aggregation) is the tighter one: `aggregators` are offered 1.8k/s against the 2k/s of 4 workers at 2 ms, 90 %,
-red in `explain` (the zone starts at 90 %) but never above it, so the run drops nothing. The
-aggregated rows cost the store `aggregated_store` 1.8 MB/s of its 100 MB/s (1.8 %, green). The
-day's result: `suggest` p99 6.86 ms against the 100 ms SLO, drop rate 0 against 0.0005; both pass.
+`simsys run` plays the whole day at the shipped 100 ms step (862.8k steps, about 5 s in Release)
+and exits 0. At the 20:00 peak the users send 24k/s × 1.5 = 36k keystrokes/s, 95 % suggests and
+5 % searches. The numbers below are `explain`'s peak checks and the run's `peak_rho`:
+
+| node | peak load | of | utilization |
+|---|---|---|---|
+| `browser_cache` | 34.2k suggests/s | 100k/s | 34.2 % |
+| `api` (10 × 5k/s) | 22.32k/s: the 60 % of suggests the browser missed (20.52k) + 1.8k searches | 50k/s | 44.6 % |
+| `trie_cache` | 20.52k/s, Che hit ratio h = 0.995 | 100k/s | 20.5 % |
+| `trie_db` (4 × 2k/s) | (1 − h) × 20.52k = 103.1/s | 8k/s | 1.29 % |
+| `query_log_q` | 1.8k logged searches/s | 1M/s | 0.18 % |
+| `aggregators` (6 × 2 ms) | 1.8k jobs/s | 3k/s | 60 % |
+| `aggregated_store` | 1.8k rows/s × 1 KB = 1.8 MB/s | 100 MB/s | 1.8 % |
+
+- **The trie cache's hit ratio.** The Che approximation sizes a 50M-entry LRU against Zipf 1.2
+  over 100M prefixes: h = 0.995. The browser cache in front of it has a *fixed* ratio (0.4), which
+  says nothing about which keys it keeps, so the trie cache sees the users' key distribution
+  unfiltered (`explain`: `fed through fixed-ratio cache 'browser_cache': treated as unfiltered`).
+  A real browser cache keeps each user's own hot prefixes, so the trie cache would see a somewhat
+  flatter stream and hit a little less.
+- **The busiest node is on the data-gathering side** (the query log and its aggregation), not on
+  the query path: the aggregators at 60 %, then the API tier at 44.6 %. The query log waits
+  164 µs at the peak (`peak_lag`: Erlang C for 6 workers at 60 %, C(6, ρ = 0.6) = 0.197 over
+  3k − 1.8k jobs/s).
+- **The day's result:** `suggest` p99 **6.86 ms** (mean 2.16 ms) against the 100 ms SLO, drop
+  rate 0 against 0.0005: both pass. The users give up after `timeout: 100ms`; the lognormal fit
+  puts a vanishing tail past it: the table's `timed out/s` column shows `1.794e-08` for
+  `users.suggest` (`run --report json`: `timed_out_per_s` 1.794e-08), about 8e-13 of the
+  22.79k suggests/s of the day, so the p99 SLO reads the answered latency itself.
 
 `build_interval: 168h`, the book's weekly rebuild, is read, stored and printed
 (`build_interval=168h (rebuild load not modelled)`). The model does not load the index or the
@@ -33,5 +54,46 @@ for the same machines, and a new trending query is invisible until the next one.
 - Real-time trending (the book defers it too).
 
 ## Things to try
-- `trie_cache.keys: 1M` — misses hit `trie_db` and p99 fails the SLO at 20:00.
-- `browser_cache.hit_ratio: 0` — the API tier needs twice the replicas.
+- **`aggregators.workers: 4`** (2k jobs/s): the peak is 1.8k/2k = **90 %**, exactly where the red
+  zone starts, and `explain` marks it `(90%, red)`. The run shows what red means here: no job is
+  dropped and no SLO fails (suggest p99 6.86 ms, exit 0), but the query log's wait at the peak
+  rises from 164 µs to **3.94 ms** (Erlang C for 4 workers at ρ = 0.9 is 0.788; wait = 0.788 /
+  (2k − 1.8k)/s). Red is a utilization verdict, "no headroom for a burst", not a failure.
+  (Whether the run counts the peak as red is a rounding accident: at the shipped 100 ms step the
+  peak step's utilization comes out as 0.8999999999999999, one rounding error below the
+  threshold, and `red_s` is 0; at `step: 1s` it is 0.90000000000000002 and `red_s` is 1. Sizing
+  to a threshold exactly is the mistake; 6 workers stay clear of it.)
+  A sweep shows the wait falling fast as workers are added:
+
+  ```
+  $ simsys sweep scenarios/book/search-autocomplete/scenario.yaml \
+      --param nodes.aggregators.workers=4..8:3 \
+      --metric query_log_q.lag --metric aggregators.mean_rho
+  nodes.aggregators.workers  query_log_q.lag  aggregators.mean_rho
+  ----------------------------------------------------------------
+  4                                   3.94ms                   0.6
+  6                                    164us                   0.4
+  8                                   15.7us                   0.3
+  ```
+
+  The lag is the peak's (Erlang C: 0.788 / 200 = 3.94 ms, 0.197 / 1.2k = 164 µs, 0.0346 / 2.2k =
+  15.7 µs); `mean_rho` is the day's average: the mean rate, 24k/s, is two thirds of the 36k/s peak.
+  With a weekly rebuild a few milliseconds of lag cost nothing; the margin is for the bursts the
+  smooth sine does not have.
+- **`browser_cache.hit_ratio: {fixed: 0}`** (no browser caching): every keystroke reaches the
+  servers, so `api` is offered 36k/s at the peak, **72 %** (yellow) instead of 44.6 %; the trie
+  cache is offered 34.2k/s and `trie_db` 171.8/s (2.15 %). Ten API replicas still carry it: the
+  browser cache buys headroom, not survival. The suggest mean rises from 2.16 to 3.22 ms (no answer
+  comes from the browser any more), yet the reported p99 *falls*, 6.86 → 5.81 ms: with the browser
+  cache the suggests are two populations (40 % answered in under a millisecond, 60 % in about
+  3 ms), and the lognormal fitted to that mixture's mean and variance has a longer tail than either
+  population. The mixture's own p99 is the misses' 98.3rd percentile (1 − 0.01/0.6), which lies
+  below the 5.81 ms p99 of the no-cache run, whose misses meet a busier API tier.
+- **A smaller trie cache, `trie_cache.keys: 1M`** (50× smaller): the Che hit ratio falls from
+  0.995 to 0.952, so `trie_db` is offered 982.9/s at the peak instead of 103.1/s (12.3 %, still
+  green), and the suggest p99 rises from 6.86 to 9.27 ms, which still passes the 100 ms SLO. The
+  Zipf head carries the cache: at `keys: 1k` h is still 0.727 (`trie_db` at 70.2 %, p99 16.6 ms,
+  both SLOs pass). Only at `keys: 100` (h = 0.551) is `trie_db` offered 9.211k/s, 115 % of its
+  8k/s: it drops (drop rate 3.8 %), 16.1 % of the delivered suggests time out at 100 ms, and both
+  SLOs fail (exit 2). On this skew, cache size is about the database's load long before it is
+  about latency.
