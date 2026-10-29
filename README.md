@@ -252,7 +252,8 @@ end:
 - [`book/search-autocomplete`](scenarios/book/search-autocomplete/): ch. 13 over 24 hours at
   24k keystrokes/s (peak 36k/s): browser cache, a Che-sized trie cache (h = 0.995) in front of a
   4-replica search index, and the query-log pipeline. Both SLOs pass (suggest p99 6.86 ms of
-  100 ms, nothing dropped); the log aggregators run at 90 % of their capacity at the peak.
+  100 ms, nothing dropped); the busiest node is on the data-gathering side, the log aggregators at
+  60 % at the peak (6 workers; at 4 they sit on the red threshold, 90 %).
 
 Every other node type (WebSocket gateways, ...) already validates and appears in
 `explain` with its resolved numbers, but `estimate` and `run` stop with "which run/estimate do

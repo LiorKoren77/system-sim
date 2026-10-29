@@ -530,8 +530,35 @@
 
 **Files:** `scenarios/book/search-autocomplete/scenario.yaml` (`aggregators.workers: 6`: 1.8k of 3k jobs/s, 60 %; at 4 it sits exactly at the red threshold, 90 %), `scenarios/book/search-autocomplete/README.md`, `tests/scenario/test_scenarios.cpp`.
 
-- [ ] `simsys run scenarios/book/search-autocomplete/scenario.yaml` exits 0. README numbers at the 20:00 peak (36k/s), re-measured against: `browser_cache` 34.2k/s (34.2 %), `api` 22.32k of 50k (44.6 %), `trie_cache` 20.52k with che h = 0.995 (Zipf 1.2 over 100M prefixes, passed unfiltered through the fixed-ratio browser cache), `trie_db` 103.1/s of 8k (1.29 %), `query_log_q` 1.8k/s, `aggregators` 60 %, `aggregated_store` 1.8 MB/s of 100 MB/s; the suggest p99 against its 100 ms SLO and the share timed out at the users' 100 ms timeout (measured). "Things to try": `aggregators.workers: 4`: 90 %, red at the peak, Erlang C(4, 0.9) = 0.788, wait **3.94 ms**: red is a utilization verdict, not a failure, and no SLO fails; `browser_cache` hit ratio 0 → `api` at 72 % (36k/s).
-- [ ] Commit `scenarios: search-autocomplete runs end to end`
+- [x] `simsys run scenarios/book/search-autocomplete/scenario.yaml` exits 0. README numbers at the 20:00 peak (36k/s), re-measured against: `browser_cache` 34.2k/s (34.2 %), `api` 22.32k of 50k (44.6 %), `trie_cache` 20.52k with che h = 0.995 (Zipf 1.2 over 100M prefixes, passed unfiltered through the fixed-ratio browser cache), `trie_db` 103.1/s of 8k (1.29 %), `query_log_q` 1.8k/s, `aggregators` 60 %, `aggregated_store` 1.8 MB/s of 100 MB/s; the suggest p99 against its 100 ms SLO and the share timed out at the users' 100 ms timeout (measured). "Things to try": `aggregators.workers: 4`: 90 %, red at the peak, Erlang C(4, 0.9) = 0.788, wait **3.94 ms**: red is a utilization verdict, not a failure, and no SLO fails; `browser_cache` hit ratio 0 → `api` at 72 % (36k/s).
+- [x] Commit `scenarios: search-autocomplete runs end to end`
+  Resolution notes: `aggregators.workers: 6` with a ch. 13 comment (weekly rebuild, so no
+  real-time need, but the 1.8k/s peak must drain; 4 sits on the 90 % threshold). Every planned
+  number re-measured (Release, shipped 100 ms step, exit 0, 4.9 s): browser_cache 34.2 %, api
+  22.32k of 50k (44.6 %), trie_cache 20.52k/s with Che h = 0.995 (explain says "treated as
+  unfiltered"), trie_db 103.1/s of 8k (1.29 %), query_log_q 1.8k/s (0.18 %), aggregators 60 %,
+  aggregated_store 1.8 MB/s of 100 MB/s; suggest p99 6.86 ms of 100 ms (mean 2.16 ms), drop rate 0;
+  timed out `1.794e-08`/s (JSON `timed_out_per_s` 1.79378546e-08), 7.870e-13 of the delivered;
+  query_log_q's peak lag 164 µs = Erlang C(6, 0.6) wait. Things to try, measured: workers 4 →
+  explain `(90%, red)`, lag 3.94 ms (= C(4, 0.9) 0.788 / 200/s), p99 unchanged, exit 0; one
+  surprise, explained in the README: the run's peak step is 0.8999999999999999 at 100 ms (`red_s`
+  0) but 0.90000000000000002 at `step: 1s` (`red_s` 1), a rounding accident at the threshold. A
+  `sweep` over `workers=4..8:3` (lag 3.94 ms / 164 µs / 15.7 µs, each = Erlang C) is quoted.
+  Browser hit ratio 0: api 72 % (36k/s, yellow), trie_db 171.8/s; the old "needs twice the
+  replicas" was wrong and is gone; the suggest p99 *falls* 6.86 → 5.81 ms (mean 2.16 → 3.22 ms):
+  the lognormal fit to the two-population mixture (browser hits under 1 ms, misses about 3 ms)
+  overstates its tail; said in the README. The stale `trie_cache.keys: 1M` item: h 0.995 → 0.952,
+  trie_db 982.9/s (12.3 %), p99 9.27 ms, PASS (the reviewer was right); rewritten with the
+  scale-down series measured: 1k keys h 0.727, trie_db 70.2 %, p99 16.6 ms, pass; 100 keys h
+  0.551, trie_db 115 %, drop rate 3.8 %, 16.1 % of delivered suggests timed out, both SLOs fail.
+  Wording: "the data-gathering side ... is the tighter one" (fixed in Task 11's round) kept as
+  "the busiest node is on the data-gathering side"; header "rebuilt weekly" and `build_interval:
+  168h` agree. Tests: the explain pin moved to `1.8k/s vs 3k/s (60%, green)`; a new scenario case
+  pins api peak rho 0.4464, h within 5e-4 of 0.995, trie_db peak rho = 20.52k (1 − h)/8k, aggregators
+  0.6, query_log_q's lag = `mmc_wait(6, 0.6, 2 ms)`, suggest p99 6.864 ms (1e-3) and < 100 ms,
+  timed out 1.794e-08/s and share 7.870e-13 (1e-3) at a 1 s step (agrees with 100 ms to 1e-8).
+  Red check: with `workers: 4` the explain pin and the aggregators' 0.6 fail. Root README line
+  updated. Other scenarios untouched.
 
 ---
 

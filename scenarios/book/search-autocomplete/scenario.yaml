@@ -60,7 +60,11 @@ nodes:
   aggregators:
     type: worker_pool
     consumes: query_log_q
-    workers: 4
+    # Ch. 13 rebuilds the trie weekly from these aggregated logs, so the aggregators need not
+    # keep up in real time, but they must drain the day's peak, 36k/s x 5 % searches = 1.8k
+    # logged queries/s. 6 workers at 2 ms drain 3k/s: 60 % at the peak. At 4 (2k/s) the peak
+    # sits exactly on the red threshold, 90 %, with no room for a burst (README "Things to try").
+    workers: 6
     cost: 2ms
     # size: 1KB is chosen, not the book's: one aggregated row (a query string, its count and a
     # timestamp). The write renames the op `publish`, so the byte-sized store needs a size here.
