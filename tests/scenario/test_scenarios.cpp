@@ -1073,6 +1073,92 @@ TEST_CASE("labs/kv-store with one virtual node passes its p99: the quorum hides 
                    (90'000.0 * ring_factor(16, 3, 1) / 16.0 - 10'000.0) / 90'000.0, 1e-3));
 }
 
+namespace {
+// The lab's "Add `write_quorum: 3`" at `vnodes: 1`, 16 machines, 5 minutes, with and without the
+// clients' 100 ms timeout: the lab with that change and every other key as shipped.
+simsys::model::Scenario kv_lab_writing_to_all_three(bool keep_timeout) {
+  auto s = kv_lab(16, 1, std::chrono::minutes{5});
+  const auto store = std::ranges::find(s.nodes, "store", &simsys::model::NodeSpec::id);
+  REQUIRE(store != s.nodes.end());
+  store->write_quorum = 3;
+  if (!keep_timeout) {
+    const auto clients = std::ranges::find(s.nodes, "clients", &simsys::model::NodeSpec::id);
+    REQUIRE(clients != s.nodes.end());
+    clients->workload->timeout = std::nullopt;
+  }
+  return s;
+}
+
+simsys::report::OpSummary put_of(const simsys::model::Scenario& s) {
+  const auto g = build_or_fail(s);
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  simsys::report::Summary summary{g, s.warmup};
+  sim->run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
+  const auto ops = summary.ops();
+  const auto put = std::ranges::find(ops, "put", &simsys::report::OpSummary::op);
+  REQUIRE(put != ops.end());
+  return *put;
+}
+}  // namespace
+
+// A put now waits for all three replicas, the full hot queue included, and is lost when the hot
+// machine drops it (review of plan 2c Task 11, I-2). The hot machine keeps 10k of the 2.0212 x
+// 5.625k = 11.37k/s it is sent,
+//   kept_hot = 0.8796,   p_hot = 3 k / 16 = 0.3790
+// so a put is lost with p_hot (1 - kept_hot) = 0.0456 and 8.589k of the 9k are delivered (a W = 3
+// set of three cool machines loses nothing). Without a timeout, the put's time is the mixture of
+// the two sets' third replies over the puts DELIVERED: the hot set (third reply about 100.3 ms, the
+// hot machine's full room of 1000 drained at 10k/s) weighs
+//   w_hot = p_hot kept_hot / (1 - 0.0456) = 0.3493     (0.3790 when weighted by puts offered)
+// and the cool set (third of three cool replies, about 0.6 ms) the rest; with the 1.232 ms of the
+// path (four 0.25 ms legs and the coordinator's sojourn) the put's mean is 36.66 ms, and the
+// lognormal fit's p99 227.1 ms. Weighted by the puts offered, as before the fix, the same sets gave
+// 39.62 ms and 233 ms: (0.3790 - 0.3493) x (100.3 - 0.6) ms = 2.96 ms of puts the hot set had
+// already lost.
+TEST_CASE(
+    "labs/kv-store with one virtual node and write_quorum three times only the puts delivered",
+    "[scenario]") {
+  const auto put = put_of(kv_lab_writing_to_all_three(false));
+  const double k = ring_factor(16, 3, 1);
+  const double kept_hot = 10'000.0 / (90'000.0 * k / 16.0);
+  const double p_hot = 3.0 * k / 16.0;
+  REQUIRE(put.timed_out_per_s == 0.0);
+  REQUIRE_THAT(put.answered_per_s / put.offered_per_s,
+               Catch::Matchers::WithinRel(1.0 - p_hot * (1.0 - kept_hot), 1e-6));
+  REQUIRE_THAT(put.answered_per_s, Catch::Matchers::WithinRel(8'589.17, 1e-5));
+  REQUIRE_THAT(put.mean_s, Catch::Matchers::WithinRel(36.66e-3, 1e-3));
+  REQUIRE_THAT(put.p99_s, Catch::Matchers::WithinRel(227.1e-3, 1e-3));
+}
+
+// The same with the lab's `timeout: 100ms` (plan 2c Task 13): the client gives up on the delivered
+// puts slower than 100 ms. The untimed response above is a lognormal of mean m = 36.66 ms and
+// sigma^2 = 2 ln(m / p50) = 0.9957 (p50 22.28 ms), so v = m^2 (e^sigma^2 - 1) = 2.294e-3 s^2, and
+// queueing::lognormal_below(m, v, 100 ms) answers Phi(z) = 0.9338 of them (z = (ln L - mu) / sigma)
+// in 27.24 ms on average: 6.62 % of the 8.589k delivered time out (568.8/s), 8.020k are answered,
+// and the p99 SLO fails at the timeout (more than 1 % timed out). Weighted by the puts offered, as
+// before the fix, it was 7.43 % (638.4/s) and a mean of 29.4 ms.
+TEST_CASE(
+    "labs/kv-store with one virtual node and write_quorum three times out the puts past 100ms",
+    "[scenario]") {
+  const auto untimed = put_of(kv_lab_writing_to_all_three(false));
+  const auto put = put_of(kv_lab_writing_to_all_three(true));
+  const double sigma2 = 2.0 * std::log(untimed.mean_s / untimed.p50_s);
+  const double variance = untimed.mean_s * untimed.mean_s * std::expm1(sigma2);
+  const auto below = simsys::queueing::lognormal_below(untimed.mean_s, variance, 0.1);
+  const double delivered = put.answered_per_s + put.timed_out_per_s;
+  REQUIRE_THAT(delivered, Catch::Matchers::WithinRel(untimed.answered_per_s, 1e-9));
+  REQUIRE_THAT(put.answered_per_s / delivered, Catch::Matchers::WithinRel(below.fraction, 1e-6));
+  REQUIRE_THAT(put.mean_s, Catch::Matchers::WithinRel(below.mean_s, 1e-6));
+  REQUIRE_THAT(put.timed_out_per_s / delivered, Catch::Matchers::WithinRel(0.06622, 1e-3));
+  REQUIRE_THAT(put.mean_s, Catch::Matchers::WithinRel(27.24e-3, 1e-3));
+  const auto results = run_slos(kv_lab_writing_to_all_three(true));
+  const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
+  REQUIRE(p99.status == simsys::report::SloStatus::fail);
+  REQUIRE(p99.observed == std::optional<double>{0.1});
+  REQUIRE(p99.note == "6.62% of delivered requests timed out (more than 1%)");
+}
+
 // The consistent-hashing lab's balancer ring uses the same heuristic (review of Tasks 9-10, I-2),
 // with N = 1 copy of each key over its M = 4 cache servers: k = 1 + z_4/sqrt(150) = 1.0857
 // (z_4 = 1.0491). 40k/s over 4 x 15k/s is 66.7 % on average, so the hottest server, which the
@@ -1164,7 +1250,8 @@ TEST_CASE("explain on book/search-autocomplete checks the index, the aggregators
 }
 
 // The index's own line: its numbers are the scenario's (2k/s and 5 ms per replica, so Little's law
-// gives c = 2000 x 5 ms = 10 per replica) and it says its `build_interval` is stored, not modelled.
+// gives c = 2000 x 5 ms = 10 per replica) and it says its `build_interval` is stored, not modelled:
+// 168h, the book's weekly rebuild (review of plan 2c Task 11, minor 10: the file said 24h).
 TEST_CASE("explain on book/search-autocomplete prints the index's numbers and its build_interval",
           "[scenario]") {
   const auto g = build_or_fail(load_scenario("/book/search-autocomplete/scenario.yaml"));
@@ -1172,7 +1259,7 @@ TEST_CASE("explain on book/search-autocomplete prints the index's numbers and it
   CAPTURE(text);
   const auto line = node_line(text, "trie_db");
   REQUIRE(line.contains("capacity=2k/s (scenario)  service_time=5ms (scenario)  c=10 (implied)"));
-  REQUIRE(line.contains("build_interval=24h (rebuild load not modelled)"));
+  REQUIRE(line.contains("build_interval=168h (rebuild load not modelled)"));
 }
 
 // Measured 2026-10-29 (Release, the shipped 100 ms step, the whole day): p99 of suggest 6.86 ms

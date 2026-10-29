@@ -93,7 +93,12 @@ recommended setting. 15k/s gives 67 % on average and room for the spread.
   hotter of two servers holds k = 1 + 0.59 = 1.59 times the average, 79.5 % of the keys: the hit
   ratio falls to 0.824, the hottest server is at 212 % and the cache servers shed 42 % of the
   load, yet what gets through still misses enough to put the database's replica at 6.35k/s
-  against its 5k/s: it fails too (0.74).
+  against its 5k/s: it fails too (0.74). Here the ring heuristic is at its least accurate: two
+  servers of one virtual node each split the ring at two random points, so the hotter one's
+  expected share is exactly 3/4, k = 1.5, not 1.59 (the heuristic is within 1 % at 100 virtual
+  nodes and more, off by up to ±16 % at one; [numerics, section 8](../../../docs/study/numerics.md)).
+  The verdict holds: with k = 1.5 the hit ratio is 0.831, the hottest server at 200 %, and the
+  database's replica still fails, at 0.759.
 - On the database: `replication_lag: 50ms` and an SLO `{metric: staleness, node: db, max:
   100ms}` — the staleness is a write's sojourn at the primary (its 150 µs service time: no
   write waits there) + the 50 ms lag + its sojourn at the replica (150 µs + a 55 µs wait at

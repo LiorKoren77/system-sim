@@ -4,6 +4,7 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -2394,6 +2395,36 @@ TEST_CASE("the op table prints no latency for an op nobody answered", "[report]"
   const auto line = row.substr(0, row.find('\n'));
   REQUIRE_FALSE(line.contains("ms"));
   REQUIRE(line.contains(" -"));
+}
+
+// The same op in the JSON: its moments describe requests that all failed, so they are null, as for
+// an op whose requests all timed out (plan 2c Task 13's review) and an infinite latency (review of
+// plan 2c Task 11, minor 4: the JSON said mean 0.1005 s, p99 0.662 s).
+TEST_CASE("the JSON gives an op nobody answered null latencies", "[report]") {
+  const auto s = sink_reported(1.0, std::nullopt);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto json = simsys::report::render_json(summarize(s, g), {});
+  CAPTURE(json);
+  REQUIRE(
+      json.contains("\"answered_per_s\": 0, \"timed_out_per_s\": 0, \"mean_s\": null, "
+                    "\"p50_s\": null, \"p95_s\": null, \"p99_s\": null"));
+}
+
+// A latency SLO has nothing to observe on an op nobody answered: it is skipped, not judged on the
+// failed requests' sojourn, and its note says why (review of plan 2c Task 11, minor 4).
+TEST_CASE("a latency SLO on an op nobody answered is skipped and says nobody answered it",
+          "[report]") {
+  const auto s = sink_reported(1.0, std::nullopt);
+  const auto g = *simsys::graph::Graph::build(s);
+  const std::array slos{simsys::model::SloSpec{.metric = simsys::model::SloMetric::p99_latency,
+                                               .node = "u",
+                                               .op = "send",
+                                               .max = simsys::SimTime{50ms}}};
+  const auto results = simsys::report::evaluate_slos(summarize(s, g), slos);
+  REQUIRE(results.size() == 1);
+  REQUIRE(results[0].status == simsys::report::SloStatus::skipped);
+  REQUIRE_FALSE(results[0].observed.has_value());
+  REQUIRE(results[0].note == "nobody answered u.send: no latency to observe");
 }
 
 TEST_CASE("explain prints no politeness note for a sink that states none", "[report]") {

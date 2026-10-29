@@ -53,7 +53,7 @@ nodes:
     replicas: 4
     capacity: 2k/s
     latency: 5ms
-    build_interval: 24h
+    build_interval: 168h                        # the book's weekly rebuild
 
   query_log_q: {type: message_queue, partitions: 8}
 

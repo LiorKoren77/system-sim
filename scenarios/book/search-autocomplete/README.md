@@ -16,17 +16,17 @@
 `simsys run` (about 4.5 s in Release, exit 0) plays the whole day at the shipped 100 ms step.
 At the 20:00 peak the users send 36k keystrokes/s; the browser cache absorbs 40 % of the
 suggests, the trie cache (Che hit ratio 0.995) absorbs nearly all of the rest, and `explain` finds
-`trie_db` offered 103.1/s against its 8k/s (4 replicas x 2k/s): 1.29 %, green. The search side is
-the tighter one: `aggregators` are offered 1.8k/s against the 2k/s of 4 workers at 2 ms, 90 %,
+`trie_db` offered 103.1/s against its 8k/s (4 replicas x 2k/s): 1.29 %, green. The data-gathering
+side (the query log and its aggregation) is the tighter one: `aggregators` are offered 1.8k/s against the 2k/s of 4 workers at 2 ms, 90 %,
 red in `explain` (the zone starts at 90 %) but never above it, so the run drops nothing. The
 aggregated rows cost the store `aggregated_store` 1.8 MB/s of its 100 MB/s (1.8 %, green). The
 day's result: `suggest` p99 6.86 ms against the 100 ms SLO, drop rate 0 against 0.0005; both pass.
 
-`build_interval: 24h` is read, stored and printed (`build_interval=24h (rebuild load not
-modelled)`). The model does not load the index or the aggregators with the rebuild, and it does
-not age the answers: a suggestion is as fresh at 23:59 as at 00:01. In the real system the daily
-rebuild competes with serving for the same machines, and a new trending query is invisible until
-the next one.
+`build_interval: 168h`, the book's weekly rebuild, is read, stored and printed
+(`build_interval=168h (rebuild load not modelled)`). The model does not load the index or the
+aggregators with the rebuild, and it does not age the answers: a suggestion is as fresh at the end
+of the week as just after a rebuild. In the real system the weekly rebuild competes with serving
+for the same machines, and a new trending query is invisible until the next one.
 
 ## What it abstracts away
 - Trie structure, top-k pre-computation, sharding by prefix ranges.

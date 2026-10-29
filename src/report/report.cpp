@@ -342,10 +342,20 @@ struct SeenPercentile {
   return op.timeout_s && quantile_timed_out(op.timed_out_share, q);
 }
 
-// An op the path delivered something of but answered nothing of in time: no answered request has a
-// latency (the JSON's null; the engine's stand-in moments are the timeout, never a measurement).
-[[nodiscard]] bool nothing_answered_in_time(const OpSummary& op) {
-  return op.answered_per_s <= 0.0 && op.timed_out_per_s > 0.0;
+// An op of which nothing came back answered in time: its requests all timed out, all failed on the
+// path (a sink failing everything it serves), or the path never answers. No answered request has a
+// latency: the JSON's null, the table's `-` (the engine's stand-in moments are the timeout or the
+// failed requests' sojourn, never a measurement).
+[[nodiscard]] bool nothing_answered(const OpSummary& op) {
+  return op.answered_per_s <= 0.0;
+}
+
+// The case of nothing_answered that no other rule judges: every request was lost on a path that
+// does answer (nothing timed out, a finite latency), so the moments describe requests that all
+// failed (review of plan 2c Task 11, minor 4). A latency SLO does not read such an op. One that
+// timed out fails at the timeout (fail_if_quantile_timed_out), an unavailable one at infinity.
+[[nodiscard]] bool every_request_lost(const OpSummary& op) {
+  return nothing_answered(op) && op.timed_out_per_s <= 0.0 && std::isfinite(op.mean_s);
 }
 
 // ---- SLO evaluation ----
@@ -371,8 +381,15 @@ struct Overloaded : Fs... {
       max);
 }
 
+// Whether a latency SLO reads `op`: the SLO's client's op, or any of its ops when it names none.
+[[nodiscard]] bool slo_reads_op(const model::SloSpec& slo, const OpSummary& op) {
+  return op.client == slo.node.value_or("") && (!slo.op || op.op == *slo.op);
+}
+
 // The latency quantile `quantile` of the client's op, or the worst one over all of the
-// client's ops when the SLO names none (every op must meet it, so the worst decides).
+// client's ops when the SLO names none (every op must meet it, so the worst decides); an op whose
+// requests were all lost (every_request_lost) is left out, and with only such ops there is nothing
+// to observe (skipped).
 // `double OpSummary::*` is a pointer to a data member (C++98): it selects p50/p95/p99
 // without three copies of the loop.
 [[nodiscard]] std::optional<double> worst_latency(std::span<const OpSummary> ops,
@@ -380,12 +397,24 @@ struct Overloaded : Fs... {
                                                   double OpSummary::*quantile) {
   std::optional<double> worst;
   for (const auto& op : ops) {
-    if (op.client != slo.node.value_or("")) continue;
-    if (slo.op && op.op != *slo.op) continue;
+    if (!slo_reads_op(slo, op) || every_request_lost(op)) continue;
     const double value = op.*quantile;
     worst = worst ? std::max(*worst, value) : value;
   }
   return worst;
+}
+
+// Why a latency SLO observed less than it reads: "nobody answered c.op" for each op it would read
+// whose requests were all lost (empty when there is none, or for any other metric).
+[[nodiscard]] std::string unanswered_note(std::span<const OpSummary> ops,
+                                          const model::SloSpec& slo) {
+  if (!is_latency(slo.metric)) return {};
+  std::vector<std::string> silent;
+  for (const auto& op : ops) {
+    if (slo_reads_op(slo, op) && every_request_lost(op)) silent.push_back(op.client + "." + op.op);
+  }
+  if (silent.empty()) return {};
+  return "nobody answered " + join(silent, ", ") + ": no latency to observe";
 }
 
 [[nodiscard]] std::optional<double> mean_utilization(std::span<const NodeSummary> nodes,
@@ -488,9 +517,7 @@ void fail_if_quantile_timed_out(SloResult& result, std::span<const OpSummary> op
   const Quantile q = quantile_of(result.slo.metric);
   const OpSummary* worst = nullptr;
   for (const auto& op : ops) {
-    if (op.client != result.slo.node.value_or("")) continue;
-    if (result.slo.op && op.op != *result.slo.op) continue;
-    if (!beyond_timeout(op, q)) continue;
+    if (!slo_reads_op(result.slo, op) || !beyond_timeout(op, q)) continue;
     if (worst == nullptr || op.timed_out_share > worst->timed_out_share) worst = &op;
   }
   if (worst == nullptr) return;
@@ -518,8 +545,7 @@ void fail_if_quantile_timed_out(SloResult& result, std::span<const OpSummary> op
 // is its service time's, a bound no request met), so it is skipped.
 [[nodiscard]] bool offered_in(const Summary& window, const model::SloSpec& slo) {
   for (const auto& op : window.ops()) {
-    const bool concerned = !is_latency(slo.metric) ||
-                           (op.client == slo.node.value_or("") && (!slo.op || op.op == *slo.op));
+    const bool concerned = !is_latency(slo.metric) || slo_reads_op(slo, op);
     if (concerned && op.offered_per_s > 0.0) return true;
   }
   return false;
@@ -564,10 +590,16 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
                                      std::span<const OpSummary> ops, const model::SloSpec& slo) {
   if (summary.observed_steps() == 0) return skipped(slo);
   const auto observed = observe_metric(summary, nodes, ops, slo);
-  if (!observed) return skipped(slo);
+  if (!observed) {
+    SloResult result = skipped(slo);
+    result.note = unanswered_note(ops, slo);
+    return result;
+  }
   const bool within = *observed <= limit_value(slo.max);
-  SloResult result{
-      .slo = slo, .observed = observed, .status = within ? SloStatus::pass : SloStatus::fail};
+  SloResult result{.slo = slo,
+                   .observed = observed,
+                   .status = within ? SloStatus::pass : SloStatus::fail,
+                   .note = unanswered_note(ops, slo)};
   if (slo.metric == model::SloMetric::staleness) fail_if_replica_falls_behind(result, nodes);
   if (is_latency(slo.metric)) fail_if_quantile_timed_out(result, ops);
   return result;
@@ -705,7 +737,7 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
 // that fails everything it serves has no latency to show, only the sojourn of requests that all
 // failed), else the duration.
 [[nodiscard]] std::string op_latency_cell(const OpSummary& op, double seconds_value) {
-  return op.answered_per_s > 0.0 ? fmt_duration(seconds_value) : "-";
+  return nothing_answered(op) ? "-" : fmt_duration(seconds_value);
 }
 
 // A percentile's cell: `>1s` when more than 1 − q of the delivered requests timed out (the client
@@ -874,10 +906,11 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   return json_object(fields);
 }
 
-// An op of which nothing was answered in time has no latency to report: null, as for a path that
-// never answers (the numbers it holds are the client's waits, not answers).
+// An op of which nothing was answered (nothing_answered) has no latency to report: null, as for a
+// path that never answers (the numbers it holds are the client's waits or the failed requests'
+// sojourn, not answers).
 [[nodiscard]] std::string json_op(const OpSummary& op) {
-  const bool no_latency = nothing_answered_in_time(op);
+  const bool no_latency = nothing_answered(op);
   const auto latency = [&](double value) { return no_latency ? "null" : json_number(value); };
   const std::array fields{json_field("client", json_string(op.client)),
                           json_field("op", json_string(op.op)),
@@ -1072,7 +1105,7 @@ template <class T, class F>
   if (target_spec.type == model::NodeType::kv_cluster) {
     return target_spec.vnodes.value_or(model::default_vnodes);
   }
-  int fewest = 0;  // fewest vnodes = largest imbalance 1 + z_N/sqrt(v)
+  int fewest = 0;  // fewest vnodes = largest imbalance 1 + z_M/sqrt(v), M the machines
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
     const auto& spec = g.nodes()[node].spec;
     if (spec.policy != model::LbPolicy::consistent_hash) continue;

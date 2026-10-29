@@ -335,12 +335,15 @@ changes how the replicas **behind** it queue (the node's *replica model*).
 |---|---|---|
 | `round_robin`, `weighted` | independent | N independent M/M/c copies, each at `demand / N` (phase 1's `replicas`) |
 | `least_connections` | pooled | one M/M/(c·N) queue with N × the capacity: join-the-shortest-queue, idealised |
-| `consistent_hash` | imbalanced | the hottest copy carries `k = 1 + z_N/sqrt(vnodes)` × the average share, `z_N` the expected maximum of N standard normals (Blom: `Φ⁻¹((N − 0.375)/(N + 0.25))`, 1.05 for 4 replicas; capped at N; see the kv_cluster's ring below and [numerics, section 8](study/numerics.md) for the derivation and its Monte Carlo check), and is queued apart from the N − 1 cool copies, which share the rest; the node reports the hot copy's rho and zone and, as latency, the mixture a request sees (hot with probability k/N) |
+| `consistent_hash` | imbalanced | the hottest of the node's M copies carries `k = 1 + z_M/sqrt(vnodes)` × the average share, `z_M` the expected maximum of M standard normals (Blom: `Φ⁻¹((M − 0.375)/(M + 0.25))`, 1.05 for 4 replicas; capped at M; the kv_cluster's ring below with one copy per key, see [numerics, section 8](study/numerics.md) for the derivation and its Monte Carlo check), and is queued apart from the M − 1 cool copies, which share the rest; the node reports the hot copy's rho and zone and, as latency, the mixture a request sees (hot with probability k/M) |
 
 `explain` prints the factor on the node behind (`imbalance=1.1 (vnodes 100)`) and a
-`hottest copy` figure in its checks. The factor is a chosen heuristic (the mean plus one
-standard deviation of a server's share; ch. 5 gives about 10 % at 100 vnodes) and
-understates the hottest of many copies. *(graph)* rules:
+`hottest copy` figure in its checks. The factor is a heuristic: a server's share spreads about
+1/√vnodes around the average (ch. 5 gives about 10 % at 100 vnodes), and the hottest of M
+servers sits z_M such spreads above it, so the factor grows with the number of servers (for 4:
+1.105 at 100 vnodes, 1.086 at 150). Monte Carlo rings put it within about 1 % at
+100 vnodes and more; at `vnodes: 1` it is off by up to ±16 % (two servers: exactly 1.5 against
+1.589), [numerics, section 8](study/numerics.md). *(graph)* rules:
 
 - the balancer needs an outgoing link (`node 'lb': a load balancer needs an outgoing link`)
   and every op reaching it a link that carries it with a positive weight;
@@ -522,13 +525,13 @@ unfiltered, and `explain` says so.
 
 **Effective capacity.** `keys` is per replica. Behind a `consistent_hash` load balancer each key
 hashes to one replica, so the replicas hold disjoint parts of the key space, `keys × replicas`
-together. The ring's arcs are uneven: with imbalance `k = 1 + z_N/√vnodes` (the load balancer's
-model) the hottest of `N` replicas owns `a_hot = k/N` of the keys and the others
-`a_cool = (1 − k/N)/(N − 1)` each. A replica owning a share `a` of a random partition is, for
-Che, one cache of `keys / a` over the whole space, and serves `a` of the requests, so
+together. The ring's arcs are uneven: with imbalance `k = 1 + z_M/√vnodes` (the load balancer's
+model, M the replicas) the hottest of the `M` replicas owns `a_hot = k/M` of the keys and the
+others `a_cool = (1 − k/M)/(M − 1)` each. A replica owning a share `a` of a random partition is,
+for Che, one cache of `keys / a` over the whole space, and serves `a` of the requests, so
 `h = Σ_j a_j · Che(keys / a_j)`. The hit ratio is concave in the cache size, so uneven arcs hit
-less than one cache of `keys × N`: the consistent-hashing lab's four 2M-key servers with
-`vnodes: 1` (`k = 2`) give 0.924, where even arcs would give 0.963. A cache the ring partitions
+less than one cache of `keys × M`: the consistent-hashing lab's four 2M-key servers with
+`vnodes: 1` (`k = 2.05`) give 0.920, where even arcs would give 0.963. A cache the ring partitions
 must be reached through rings only: *(graph)* `node 'c': keys are partitioned by ring 'lb' but
 'web' also sends to it directly`. Behind any other policy, or with no balancer, every replica can
 see every key and fills itself with the same hot keys, so the cache size is `keys`. A replica
@@ -745,7 +748,9 @@ times the average (1.068 for 8 machines, 1.083 for 16 at N = 3 and 150 vnodes), 
 consistent-hash balancer's ring with N = 1 ([`load_balancer`](#load_balancer)), so the two agree.
 It is a heuristic, checked against Monte Carlo rings ([numerics, section 8](study/numerics.md):
 the expected hottest over the average is 1.073, 1.091 and 1.133 for 8, 16 and 128 machines at
-N = 3 and 150 vnodes, where k gives 1.068, 1.083 and 1.122); the old `1 + 1/√vnodes` ignored the
+N = 3 and 150 vnodes, where k gives 1.068, 1.083 and 1.122): within about 1 % from 100 vnodes on,
+but off by up to ±16 % at `vnodes: 1`, where a machine's share is a few whole arcs (16 machines:
+1.962 against k = 2.021; 128: 2.943 against 2.492). The old `1 + 1/√vnodes` ignored the
 number of machines and understated the hot spot beyond about 16. The engine runs the hot machine
 and `nodes − 1` cool ones as two copy groups, as behind a balancer's ring: the node's `rho` and
 zone are the hottest machine's, so a `utilization` SLO reads it (the lab at 16 nodes: 1.0834 ×
@@ -766,8 +771,10 @@ group's sojourn mean and variance (wait + service), and the q-th fastest of the 
 its survival function: `S_q(t)` = P(fewer than q of the N have answered by t), a
 Poisson-binomial over the hot and cool replicas, integrated as `E[X] = ∫ S_q dt`,
 `E[X²] = ∫ 2t S_q dt` on a grid even in ln t ([numerics, section 7](study/numerics.md): under
-1e-8 relative error for sojourn SCVs up to 10). The response mixes the two kinds of set by
-p_hot (the law of total variance). So a quorum of 2 of 3 answers from the two cool replicas when
+1e-8 relative error for a sojourn SCV of at most 10). The response is the latency of the requests
+ANSWERED: it mixes the two kinds of set (the law of total variance) by the share of the answered
+requests each gives, `p_hot (1 − L_hot)` and `(1 − p_hot)(1 − L_cool)` over `1 − L`, with the
+losses `L` below, so a set that loses more weighs less. So a quorum of 2 of 3 answers from the two cool replicas when
 the hot machine's queue is full: the kv-store lab with `vnodes: 1` (the hot machine at 114 %)
 answers in 0.378 ms and passes its p99, where a quorum of 3 waits for the full queue. For
 replicas all alike and exponential of mean m the closed form is Rényi's (the k-th smallest of n:
@@ -832,10 +839,10 @@ compares the ticket server with snowflake.
 ### `search_index`
 
 Book ch. 13, "Design a search autocomplete system" (plan 2c refinement 10). A search index is
-**served like a service**: no steps, `replicas` copies of the type's 5k/s and 5 ms (chosen: an
-inverted-index query) unless the scenario states its own `capacity` and `latency`, resolved as for
-any node. `build_interval` (a positive duration, `build_interval: 24h`) is stored and printed by
-`explain` as `build_interval=24h (rebuild load not modelled)`; the rebuild's load on the index and
+**served like a service**: no steps, `replicas` copies of the type's 5k/s and 5 ms (chosen: a
+prefix lookup in a trie that reads the prefix's stored top k, ch. 13) unless the scenario states
+its own `capacity` and `latency`, resolved as for any node. `build_interval` (a positive duration, `build_interval: 168h`) is stored and printed by
+`explain` as `build_interval=168h (rebuild load not modelled)`; the rebuild's load on the index and
 the freshness of its answers between rebuilds are ignored. `ops` stays refused: an index answers a
 query and calls nobody.
 

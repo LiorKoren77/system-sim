@@ -44,7 +44,7 @@ ln(1 + u). The code uses them in exactly three places:
   which stays accurate as s approaches 1 (where the textbook form is 0/0).
 - `one_minus_exp_neg`, `src/caching/caching.cppm:262`: the Che term 1 - e^{-p t}; a cold
   key over a short characteristic time has p t near 1e-12 (comment at lines 259-260).
-- `lognormal_fit`, `src/queueing/queueing.cppm:168` (behind `lognormal_quantile` and the
+- `lognormal_fit`, `src/queueing/queueing.cppm:166` (behind `lognormal_quantile` and the
   quorum's quadrature, section 7): sigma^2 = ln(1 + v/m^2), where v/m^2 is small for a nearly
   deterministic latency.
 
@@ -260,7 +260,7 @@ A kv_cluster's coordinator (book ch. 6) sends each request to the key's N replic
 at the q-th reply (q = R for a read, W for a write). One of the N may be the ring's hot machine
 (section 8), the others are cool, and each kind has its own sojourn mean and variance from its
 queue. The q-th fastest of such a mix has no closed form, so `lognormal_order_statistic`
-(`src/queueing/queueing.cppm:486`) integrates it.
+(`src/queueing/queueing.cppm:568`) integrates it.
 
 **The integral.** The q-th reply X is later than t exactly when fewer than q replicas have
 answered by t:
@@ -268,48 +268,62 @@ answered by t:
     S_q(t) = P(X > t) = P(fewer than q of the N have answered by t)
 
 Replica i has answered by t with probability F_i(t), the CDF of a lognormal fitted to its
-group's moments (`lognormal_fit`, line 165: Phi((ln t - mu) / sigma)). Fewer than q successes
+group's moments (`lognormal_fit`, line 166: Phi((ln t - mu) / sigma)). Fewer than q successes
 among trials of different probabilities is the **Poisson-binomial** distribution, computed by
-`fewer_than` (line 313) as a small dynamic programme: below[j] = P(exactly j so far), each
+`fewer_than` (line 386) as a small dynamic programme: below[j] = P(exactly j so far), each
 trial moving mass from j to j + 1 with its p. Then, integrating P(X > t) instead of t f(t):
 
     E[X] = integral of S_q(t) dt,     E[X^2] = integral of 2 t S_q(t) dt      (t from 0 to inf)
 
-**The grid.** `moments_from_survival` (line 232) substitutes u = ln t (dt = t du), because the
+**The grid.** `moments_from_survival` (line 305) substitutes u = ln t (dt = t du), because the
 times span orders of magnitude (a cool machine's 0.3 ms, a full queue's 100 ms), and sums
-t S and 2 t^2 S with the trapezoid rule on a grid even in u. `lognormal_grid` (line 386)
+t S and 2 t^2 S with the trapezoid rule on a grid even in u. `lognormal_grid` (line 464)
 spans every group's fit from mu - 8 sigma (Phi(-8) = 6e-16: nobody has answered) to
 mu + 2 sigma^2 + 8 sigma (everybody has, even for the second moment, whose integrand peaks
-at mu + 2 sigma^2), sigma / 2 apart for the narrowest group (`steps_per_sigma`, line 341).
+at mu + 2 sigma^2), sigma / 2 apart for the narrowest group (`steps_per_sigma`, line 414).
 Below the grid S is 1, and the rule's sum over that whole left tail is a geometric series,
-added in closed form (line 235):
+added in closed form (line 308):
 
     h Σ_{j >= 1} e^(u0 - j h) = h e^u0 / (e^h - 1)
 
 **The error bound.** With the tail summed, the rule runs over the whole real line in u, and
 for an integrand that is smooth and dies off at both ends the trapezoid rule converges faster
-than any power of h: its error falls like e^(-c / h), not like h^2. Without the closed-form
-tail (the grid simply starting at mu - 8 sigma) the error is O(h^2): 1e-5 at sigma / 2, the
-endpoint term of Euler-Maclaurin. With it, at sigma / 2:
+than any power of h: its error falls like e^(-c / h), not like h^2. The closed-form tail is not
+a refinement: it is most of the answer for a narrow sojourn. A grid that simply starts at
+t0 = e^(mu - 8 sigma) leaves out the whole interval [0, t0], where S = 1, and that interval is
+worth t0 of the mean, t0 / m = e^(-8 sigma - sigma^2 / 2) relative: 92 % at SCV 1e-4 (sigma =
+0.01, so t0 is 0.92 m), 45 % at 0.01, 9e-4 at 1, and only at SCV 10 down to 1.3e-6. Adding the
+interval back exactly (t0 to the mean, t0^2 to the second moment) leaves the truncated
+trapezoid's own O(h^2) endpoint error: 1.9e-6, 9.3e-5 and 1.3e-5 on the mean at SCV 1e-4, 0.01
+and 1, and 3.3e-2 on the variance at SCV 1e-4. The geometric series instead continues the
+trapezoid rule itself past the grid's first point, so no endpoint is left. With it, at
+sigma / 2:
 
 | sojourn SCV | grid points | mean, relative error | variance, relative error |
 |---|---|---|---|
 | 1e-4 to 0.1 | 34-35 | below 1e-15 | below 1e-11 |
 | 1 | 37 | 8e-15 | 3e-12 |
-| 10 | 40 | 8e-13 | 9e-9 |
+| 10 | 40 | 8e-13 | 8.5e-9 |
+| 20 | 40 | 2.5e-12 | 1.1e-7 |
+| 50 | 41 | 9e-12 | 1.7e-6 |
 | 100 | 42 | 2e-11 | 9e-6 |
 
 (one lognormal integrated back to its own moments; a Python run of the same rule). The
-documented bound is **1e-8 relative for sojourn SCVs up to 10**, which
+documented bound is **1e-8 relative for a sojourn SCV of at most 10**, and no further (the
+variance's error passes 1e-7 at 20), which
 `one lognormal replica's order statistic returns its own moments`
 (`tests/unit/test_queueing.cpp:372`) checks. A fluid sojourn's SCV is around 1 (exponential
 service plus an Erlang wait); it reaches 10 only for very bursty arrivals. Two limits are
-deliberate: a sojourn with no spread at all is given sigma = 0.001 (`min_sigma`, line 335),
+deliberate: a sojourn with no spread at all is given sigma = 0.001 (`min_sigma`, line 408),
 since a step in S(t) cannot be resolved on any even grid; and a grid is at most 4000 points,
-a very narrow group far from a wide one widening the step instead (then the bound loosens).
+a very narrow group far from a wide one widening the step instead. Then the bound does not
+hold: a group clamped to sigma = 0.001 beside one of SCV 10 needs more than 4000 points at
+sigma / 2, and the widened step leaves 8.4e-4 of error on the mean and 1.4e-3 on the variance
+(the review of plan 2c Task 11). Such a pair would be a machine of deterministic service beside
+a very bursty one in the same quorum, which no shipped scenario has.
 
 **The cross-check.** Fed N exponentials of one mean, the same quadrature must reproduce
-Rényi's closed form (`exponential_order_statistic`, line 118: 1/3, 5/6, 11/6 of the mean for
+Rényi's closed form (`exponential_order_statistic`, line 119: 1/3, 5/6, 11/6 of the mean for
 the 1st, 2nd and 3rd of three): `the survival-function quadrature reproduces Renyi for
 exponential replicas` (line 350) checks it to 1e-9 at a step of 0.25 in ln t (the
 exponential's left tail is not Gaussian, so it needs a finer step than sigma / 2; 0.5 gives
@@ -329,7 +343,7 @@ nodes, once for each of the N copies of a key it holds (N = 1 behind a load bala
 `replication` in a kv_cluster). One machine's share is a sum of N v arc lengths, so its
 relative spread is about 1 / sqrt(N v) (the book: about 10 % at 100 virtual nodes). The
 engine needs the HOTTEST machine's share, the maximum of M such shares, and that grows with
-M. `ring_imbalance` (`src/engine/graph.cppm:1127`) takes
+M. `ring_imbalance` (`src/engine/graph.cppm:1171`) takes
 
     k = min(1 + z_M / sqrt(N v), M / N)
 
@@ -337,8 +351,8 @@ with z_M the expected maximum of M standard normals, by Blom's approximation (19
 
     z_M = Phi^-1((M - 0.375) / (M + 0.25))
 
-(`expected_normal_maximum`, `src/queueing/queueing.cppm:448`; Phi^-1 is `normal_quantile`,
-line 426: Acklam's rational approximation, relative error 1.15e-9, polished by one Halley
+(`expected_normal_maximum`, `src/queueing/queueing.cppm:526`; Phi^-1 is `normal_quantile`,
+line 504: Acklam's rational approximation, relative error 1.15e-9, polished by one Halley
 step to full double precision). M / N is the cap: a machine holds a key at most once.
 
 It is a heuristic (shares are neither normal nor independent: they sum to N), checked against
@@ -348,17 +362,32 @@ the hottest machine's load over the average, averaged over 20-400 rings):
 | machines M | copies N | vnodes v | Monte Carlo | k | old 1 + 1/sqrt(v) |
 |---|---|---|---|---|---|
 | 4 | 1 | 150 | 1.086 | 1.086 | 1.082 |
-| 4 | 1 | 1 | 2.086 | 2.049 | 2 |
 | 8 | 3 | 150 | 1.073 | 1.068 | 1.082 |
 | 16 | 3 | 150 | 1.084-1.091 | 1.083 | 1.082 |
-| 16 | 3 | 1 | 1.945 | 2.021 | 2 |
 | 128 | 3 | 150 | 1.133 | 1.122 | 1.082 |
+| 2 | 1 | 1 | 1.497 (exact 1.5) | 1.589 | 2 |
+| 4 | 1 | 1 | 2.075 (exact H_4 = 2.083) | 2.049 | 2 |
+| 4 | 2 | 1 | 1.496 | 1.742 | 2 |
+| 8 | 3 | 1 | 1.616 | 1.828 | 2 |
+| 16 | 3 | 1 | 1.962 | 2.021 | 2 |
+| 128 | 3 | 1 | 2.943 | 2.492 | 2 |
 
-(the review of plan 2c Tasks 9-10 measured 1.073, 1.091 and 1.133 for the N = 3 rows; our
-own runs gave the others and 1.084 at 16). The old factor ignored M: it is "one standard
-deviation above the average", right for a few machines and increasingly low beyond about 16.
-Both rings use the same function, so the consistent-hashing lab's balancer and the kv-store
-lab's cluster agree.
+(the reviews of plan 2c Tasks 9-10 and Task 11 measured the N = 3 rows and the v = 1 rows; our
+own runs gave the others and 1.084 at 16. An earlier version of this table gave 1.945 for
+16/3/1, 21 standard errors below the 1.962 the review's larger run found.) With one copy per
+key and one virtual node each, the M points cut the ring into M arcs, each a machine's, and
+the expected longest of M arcs is H_M / M of the ring (H_M the harmonic number): k = H_M
+exactly, 1.5 for two machines and 2.083 for four.
+
+**Its limit.** Within about 1 % from v = 100 on, where a machine's share is a sum of hundreds
+of arcs and close to normal; at v = 1 it is a few whole arcs, far from normal, and k is off by
+up to ±16 % (high for few machines, 1.828 against 1.616 at 8/3/1; low for many, 2.492 against
+2.943 at 128/3/1). One formula is kept for every v anyway (review of plan 2c Task 11, I-3):
+v = 1 is an experiment that shows what an uneven ring does, and the labs' verdicts at v = 1
+hold with the exact value too (the consistent-hashing lab's `replicas: 2, vnodes: 1` item
+says so with the numbers). The old factor ignored M: it is "one standard deviation above the
+average", right for a few machines and increasingly low beyond about 16. Both rings use the
+same function, so the consistent-hashing lab's balancer and the kv-store lab's cluster agree.
 
 ## 9. Try it
 
@@ -386,16 +415,25 @@ lab's cluster agree.
    hardly matters: the api's `dropped` is 1.385k at 5 ms, 1.36k at 100 ms and 1.2k at
    500 ms. Why? (The api's waiting room, `queue_limit`, caps the backlog the same way at
    every step.)
-5. **Coarsen the quadrature.** Set `steps_per_sigma` (`src/queueing/queueing.cppm:341`) to
+5. **Coarsen the quadrature.** Set `steps_per_sigma` (`src/queueing/queueing.cppm:414`) to
    1.0, rebuild and run `[queueing]`: three checks fail, the fastest of three lognormals by
    4e-5 relative (0.42098 against 0.42100 ms). At 0.5 four fail and the fastest is 3.3 % off
    (0.4071 ms): two points per standard deviation is where the rule's e^(-c / h) error is
    still far below anything a report prints.
-6. **Drop the closed-form tail.** In `moments_from_survival` (line 235) start `first` and
-   `second` at 0 and the grid's first point at weight h / 2: the rule becomes the ordinary
-   truncated trapezoid, and its error grows to O(h^2), about 1e-5 at sigma / 2.
+6. **Replace the closed-form tail.** In `moments_from_survival` (line 308) start `first` and
+   `second` at t0 and t0^2 (`first_t` and `first_t * first_t`: the exact integrals of S = 1 and
+   2 t S over [0, t0]) and give the grid's first point weight h / 2: the rule becomes the
+   ordinary trapezoid on the grid plus the exact interval below it. Run `[queueing]` and watch
+   `one lognormal replica's order statistic returns its own moments` fail: the mean is now off
+   by 1.9e-6, 9.3e-5 and 1.3e-5 at SCV 1e-4, 0.01 and 1 (the truncated trapezoid's O(h^2)
+   endpoint error), and the variance by 3.3e-2 at SCV 1e-4. Then start them at 0 as well, the
+   left tail dropped altogether: the mean loses t0, 92 % of it at SCV 1e-4 (section 7).
 7. **Watch the quorum hide the hot machine.** In `scenarios/labs/kv-store/scenario.yaml` set
    `vnodes: 1`: the hot machine is at 114 % and drops, yet the put's p99 is 2.65 ms (PASS),
    because a quorum of two answers from the two cool replicas. Then set `write_quorum: 3`:
    a put now waits for every replica, the hot one's full queue included, and loses what it
-   drops (the README's "Things to try" has the numbers).
+   drops: 8.59k of the 9k puts/s come back. The sets that hold the hot machine are 0.379 of
+   the puts offered but only 0.349 of those that come back, and the latency is theirs: 36.7 ms
+   on average, p99 227 ms, before the clients' `timeout: 100ms`. With it, 6.62 % of them come
+   back too late (569/s), 8.02k/s are answered in 27.2 ms, and the p99 SLO fails at the
+   timeout (the README's "Things to try" has the derivation).

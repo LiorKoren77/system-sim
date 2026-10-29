@@ -1077,9 +1077,9 @@ double che_over_100k_zipf1_keys(double capacity) {
 }
 }  // namespace
 
-// The ring's arcs are uneven (ResolvedNode::imbalance k, 1 + z_N/sqrt(vnodes)): the hottest
-// replica owns k/N of the keys and the others share the rest. Each replica is an LRU cache of
-// `keys` over its own arc, which for Che is one cache of keys / a over the whole space (a the
+// The ring's arcs are uneven (ResolvedNode::imbalance k, 1 + z_M/sqrt(vnodes), M the replicas): the
+// hottest replica owns k/M of the keys and the others share the rest. Each replica is an LRU cache
+// of `keys` over its own arc, which for Che is one cache of keys / a over the whole space (a the
 // arc's share), and it serves a of the requests: h = Σ_j a_j · Che(keys / a_j).
 TEST_CASE("a cache partitioned by a consistent-hash ring sums Che over its uneven arcs",
           "[graph]") {
@@ -3608,7 +3608,8 @@ TEST_CASE(
 }
 
 // With nothing stated the type's row of the defaults table stands: 5k/s and 5 ms (rate and time
-// "chosen: an inverted-index query", defaults.cppm), so Little's law gives c = 5000 x 5 ms = 25.
+// "chosen: a prefix lookup in a trie, top k read", defaults.cppm), so Little's law gives
+// c = 5000 x 5 ms = 25.
 TEST_CASE("a search index without capacity or latency takes the type's 5k/s and 5 ms, c 25",
           "[graph]") {
   const auto g = Graph::build(search_front(1));
