@@ -54,13 +54,9 @@ constexpr double infinity = std::numeric_limits<double>::infinity();
 
 // ---- number formatting ----
 
-// Every number is written by simsys::to_chars_text (simsys.core), never by a std::format precision
-// (see the top of the file).
-
-// `value` with `digits` significant digits, trailing zeros dropped: 0.5, 1.5, 1000.
-[[nodiscard]] std::string num(double value, int digits = 4) {
-  return to_chars_text(value, std::chars_format::general, digits);
-}
+// Every number is written by simsys::to_chars_text (simsys.core), mostly through
+// simsys::significant (a few significant digits), never by a std::format precision (see the top of
+// the file).
 
 // A unit and its size in the base unit (seconds, or one request).
 struct Unit {
@@ -90,10 +86,10 @@ std::string format_duration(double seconds_value) {
   if (seconds_value == 0.0) return "0s";
   for (const auto& unit : duration_units) {
     if (std::abs(seconds_value) / unit.size >= rounds_to_one) {
-      return num(seconds_value / unit.size, 3) + std::string{unit.name};
+      return significant(seconds_value / unit.size, 3) + std::string{unit.name};
     }
   }
-  return num(seconds_value / 1e-9, 3) + "ns";  // below one nanosecond
+  return significant(seconds_value / 1e-9, 3) + "ns";  // below one nanosecond
 }
 
 // The same for a SimTime (module linkage: not exported, but an overload of the exported name, so
@@ -122,11 +118,13 @@ constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
 // the largest prefix, as in the scenario grammar (core's rate_prefixes stop at G).
 [[nodiscard]] std::string with_si_prefix(double value) {
   if (!std::isfinite(value)) return "unavailable";
-  if (std::abs(value) >= beyond_prefixes) return num(value);
+  if (std::abs(value) >= beyond_prefixes) return significant(value);
   for (const auto& prefix : si_prefixes) {
-    if (std::abs(value) >= prefix.size) return num(value / prefix.size) + std::string{prefix.name};
+    if (std::abs(value) >= prefix.size) {
+      return significant(value / prefix.size) + std::string{prefix.name};
+    }
   }
-  return num(value);
+  return significant(value);
 }
 
 // A count of things (keys) with an SI prefix, as with_si_prefix — 500, 1.5k, 2M, 9999G — but
@@ -146,7 +144,7 @@ constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
 [[nodiscard]] std::string fmt_room(double units) {
   constexpr double million = 1e6;
   constexpr double rounds_to_a_million = million - 0.5;
-  if (std::abs(units) < rounds_to_a_million) return num(units, 6);
+  if (std::abs(units) < rounds_to_a_million) return significant(units, 6);
   return fmt_count(std::abs(units) < million ? std::copysign(million, units) : units);
 }
 
@@ -160,7 +158,7 @@ constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
 [[nodiscard]] std::string percent(double ratio) {
   const double value = ratio * 100.0;
   if (value >= 999.5) return to_chars_text(value, std::chars_format::fixed, 0) + "%";
-  return num(value, 3) + "%";
+  return significant(value, 3) + "%";
 }
 
 // ---- enum names ----
@@ -377,25 +375,15 @@ struct SeenPercentile {
 
 // ---- SLO evaluation ----
 
-// The "overloaded" idiom: one object whose operator() is overloaded by every lambda it is
-// built from, so std::visit picks the lambda matching the alternative held.
-// C++17 pack expansion in a using-declaration (`using Fs::operator()...`) merges the
-// lambdas' call operators. C++20 class template argument deduction for aggregates deduces
-// `Overloaded<L1, L2>` from the braces, so C++17's deduction guide
-// (`Overloaded(Fs...) -> Overloaded<Fs...>`) is no longer needed; the struct itself is
-// still the idiom, as the standard library offers no ready-made overload set.
-template <class... Fs>
-struct Overloaded : Fs... {
-  using Fs::operator()...;
-};
-
 // An SLO's limit as a plain number: seconds for a latency, the ratio itself otherwise.
 // Pattern: Visitor over a closed sum type — the variant lists every kind of limit, and
 // std::visit fails to compile if a lambda for one of them is missing.
 [[nodiscard]] double limit_value(const std::variant<SimTime, double>& max) {
-  return std::visit(
-      Overloaded{[](SimTime limit) { return seconds(limit); }, [](double limit) { return limit; }},
-      max);
+  // core::Overloaded: the overloaded-visitor idiom; C++20 class template argument deduction for
+  // aggregates deduces its lambdas' types from the braces (see simsys.core).
+  return std::visit(core::Overloaded{[](SimTime limit) { return seconds(limit); },
+                                     [](double limit) { return limit; }},
+                    max);
 }
 
 // Whether a latency SLO reads `op`: the SLO's client's op, or any of its ops when it names none.
@@ -615,13 +603,13 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
 [[nodiscard]] std::string fmt_slo_value(model::SloMetric metric, double value) {
   if (metric == model::SloMetric::queue_lag) return format_lag(value);
   const bool is_time = is_latency(metric) || metric == model::SloMetric::staleness;
-  return is_time ? format_duration(value) : num(value);
+  return is_time ? format_duration(value) : significant(value);
 }
 
 // A limit in its own kind: a duration with a unit (queue_lag's 1s too), a ratio as is.
 [[nodiscard]] std::string fmt_limit(const std::variant<SimTime, double>& max) {
-  return std::visit(Overloaded{[](SimTime limit) { return format_duration(limit); },
-                               [](double limit) { return num(limit); }},
+  return std::visit(core::Overloaded{[](SimTime limit) { return format_duration(limit); },
+                                     [](double limit) { return significant(limit); }},
                     max);
 }
 
@@ -650,12 +638,12 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
     return color ? ansi_for(fluid::zone_of(rho, capacity)) : std::string_view{};
   };
   return {{node.id},
-          {num(node.mean_rho), colour_of(node.mean_rho)},
-          {num(node.peak_rho), colour_of(node.peak_rho)},
+          {significant(node.mean_rho), colour_of(node.mean_rho)},
+          {significant(node.peak_rho), colour_of(node.peak_rho)},
           {with_si_prefix(node.peak_backlog)},
           {with_si_prefix(node.total_dropped)},
           {with_si_prefix(node.total_rejected)},
-          {num(node.red_time_s)}};
+          {significant(node.red_time_s)}};
 }
 
 // The last, unlabelled cell of a queue's row: why its figures are not to be trusted, if they are
@@ -1040,7 +1028,7 @@ template <class T, class F>
 
 [[nodiscard]] std::string wave_summary(const workload::Wave& wave) {
   return "wave " + std::string{workload::to_string(wave.shape)} +
-         " P=" + format_duration(wave.period) + " A=" + num(wave.amplitude) + " peak " +
+         " P=" + format_duration(wave.period) + " A=" + significant(wave.amplitude) + " peak " +
          clock_or_duration(wave.peak_at);
 }
 
@@ -1050,7 +1038,7 @@ template <class T, class F>
 }
 
 [[nodiscard]] std::string noise_summary(const workload::Noise& noise) {
-  return "noise σ=" + num(noise.sigma) + " τ=" + format_duration(noise.correlation);
+  return "noise σ=" + significant(noise.sigma) + " τ=" + format_duration(noise.correlation);
 }
 
 // "base 800/s, wave sine P=24h A=0.6 peak 20:00, ramp 0/s->10k/s over 5m, spikes 3,
@@ -1097,7 +1085,7 @@ template <class T, class F>
     // `cost.find(op) != cost.end()` or `cost.count(op) != 0`; here: did the scenario state
     // this op's cost?
     if (!graph::is_write(spec, op) || spec.cost.contains(op)) continue;
-    parts.push_back(op + " " + num(defaults::op_cost(spec, op), 6));
+    parts.push_back(op + " " + significant(defaults::op_cost(spec, op), 6));
   }
   return parts;
 }
@@ -1110,7 +1098,7 @@ template <class T, class F>
 [[nodiscard]] std::string cost_summary(const graph::Graph& g, std::size_t node) {
   std::vector<std::string> stated;
   for (const auto& [op, units] : g.nodes()[node].spec.cost)
-    stated.push_back(op + " " + num(units, 6));
+    stated.push_back(op + " " + significant(units, 6));
   const auto defaulted = defaulted_write_costs(g, node);
   std::vector<std::string> groups;
   if (!stated.empty()) groups.push_back(join(stated, ", "));
@@ -1167,7 +1155,7 @@ template <class T>
   }
   if (node.pooled) text += "  pooled";
   if (node.imbalance != 1.0) {
-    text += "  imbalance=" + num(node.imbalance, 3) + " (vnodes " +
+    text += "  imbalance=" + significant(node.imbalance, 3) + " (vnodes " +
             std::to_string(ring_vnodes(g, index)) + ")";
   }
   return text;
@@ -1184,7 +1172,7 @@ template <class T>
   text +=
       model::is_windowed(algorithm)
           ? " window=" + format_duration(model::limiter_window(spec)) + if_defaulted(spec.window)
-          : " burst=" + num(model::limiter_burst(spec), 10) + if_defaulted(spec.burst);
+          : " burst=" + significant(model::limiter_burst(spec), 10) + if_defaulted(spec.burst);
   if (spec.backend) text += " backend=" + *spec.backend;
   return text;
 }
@@ -1237,7 +1225,7 @@ template <class T>
 // A client key distribution as a reader says it: "zipf 1 over 100M keys", "uniform over 10k
 // keys" (the scenario's `{zipf: 1.0, space: 100M}` and `{uniform: 10k}`).
 [[nodiscard]] std::string key_distribution(const model::KeySpec& keys) {
-  const std::string shape = keys.zipf ? "zipf " + num(*keys.zipf) : "uniform";
+  const std::string shape = keys.zipf ? "zipf " + significant(*keys.zipf) : "uniform";
   return shape + " over " + fmt_count(keys.space) + " keys";
 }
 
@@ -1257,7 +1245,7 @@ template <class T>
   const auto& stated = node.spec.hit_ratio;
   if (!stated) return "none";
   if (!node.hit_ratio) return stated->che ? "che" : "none";
-  return num(node.hit_ratio->value, stated->che ? 3 : 6);
+  return significant(node.hit_ratio->value, stated->che ? 3 : 6);
 }
 
 // "; 10k keys x 4 partitioned, uneven arcs" for a che cache behind a consistent-hash ring: its
@@ -1487,8 +1475,8 @@ struct QueueProvenance {
           std::string{source.concurrency},
       "queue_limit=" + fmt_room(cap.queue_limit) + std::string{queued_unit(spec)} + " " +
           std::string{source.queue_limit},
-      "variability=" + num(cap.service_variability, 3),
-      "burstiness=" + num(cap.burstiness, 3)};
+      "variability=" + significant(cap.service_variability, 3),
+      "burstiness=" + significant(cap.burstiness, 3)};
   return join(parts, "  ");
 }
 
@@ -1678,7 +1666,7 @@ constexpr std::array bit_prefixes{BitPrefix{1e9, "G"}, BitPrefix{1e6, "M"}, BitP
       "delay_steps=" + std::to_string(link.delay_steps)};
   if (spec.bandwidth) parts.push_back("bandwidth=" + fmt_bandwidth(*spec.bandwidth));
   if (!link.ops.empty()) parts.push_back("ops=" + join(link.ops, ","));
-  if (link.weight != 1.0) parts.push_back("weight=" + num(link.weight));
+  if (link.weight != 1.0) parts.push_back("weight=" + significant(link.weight));
   if (link.feedback) parts.emplace_back("[feedback]");
   return join(parts, "  ");
 }
@@ -1782,14 +1770,6 @@ constexpr SimTime peak_sample_step = 1_min;
     }
   }
   return load;
-}
-
-// Capacity units one request of `op` uses at node `i`: its megabytes at a byte-sized node, else
-// its `cost` entry, else 5 for a database's write, else 1 (graph::op_cost, the rule the
-// behaviours' cost() follow), so explain prices every op as a run does, on any graph, including
-// types the engine does not simulate yet.
-[[nodiscard]] double cost_of(const graph::Graph& g, std::size_t i, const std::string& op) {
-  return graph::op_cost(g, i, op);
 }
 
 // Each routing node's (load balancer's, rate limiter's, message queue's) routes per op that can
@@ -2007,7 +1987,7 @@ struct PaperPass {
   for (std::size_t i = 0; i < load.size(); ++i) {
     // std::ranges::fold_left (see forward_limited), each op weighed by its cost.
     totals.push_back(std::ranges::fold_left(load[i], 0.0, [&](double sum, const auto& entry) {
-      return sum + entry.second * cost_of(g, i, entry.first);
+      return sum + entry.second * graph::op_cost(g, i, entry.first);
     }));
   }
   return totals;
@@ -2347,7 +2327,7 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   const double copy_capacity = node.capacity.service_rate.per_second;
   const std::string head =
       "  hottest copy " + fmt_units(node.spec, hot) + " vs " + fmt_units(node.spec, copy_capacity);
-  const std::string imbalance = "imbalance " + num(node.imbalance, 3) + ")";
+  const std::string imbalance = "imbalance " + significant(node.imbalance, 3) + ")";
   if (copy_capacity <= 0.0) return head + " (no capacity, red; " + imbalance;
   const double rho = hot / copy_capacity;
   return head + " (" + percent(rho) + ", " +
@@ -2648,15 +2628,15 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
                                          const engine::NodeSample& n) {
   const std::array fields{t_s,
                           id,
-                          num(n.demand_per_s, 6),
-                          num(n.drain_per_s, 6),
-                          num(n.rho, 6),
-                          num(n.backlog, 6),
-                          num(n.dropped_per_s, 6),
-                          num(n.rejected_per_s, 6),
-                          num(n.latency.mean_s * 1000.0, 6),
+                          significant(n.demand_per_s, 6),
+                          significant(n.drain_per_s, 6),
+                          significant(n.rho, 6),
+                          significant(n.backlog, 6),
+                          significant(n.dropped_per_s, 6),
+                          significant(n.rejected_per_s, 6),
+                          significant(n.latency.mean_s * 1000.0, 6),
                           std::string{zone_name(n.zone)},
-                          n.queue_lag_s ? num(*n.queue_lag_s, 6) : std::string{}};
+                          n.queue_lag_s ? significant(*n.queue_lag_s, 6) : std::string{}};
   return join(fields, ",") + "\n";
 }
 
@@ -2666,13 +2646,13 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
                                        const engine::LinkSample& l) {
   const std::array fields{t_s,
                           name,
-                          num(l.demand_per_s, 6),
-                          num(l.drain_per_s, 6),
-                          num(l.rho, 6),
-                          num(l.backlog, 6),
-                          num(l.dropped_per_s, 6),
+                          significant(l.demand_per_s, 6),
+                          significant(l.drain_per_s, 6),
+                          significant(l.rho, 6),
+                          significant(l.backlog, 6),
+                          significant(l.dropped_per_s, 6),
                           std::string{"0"},
-                          num(l.latency.mean_s * 1000.0, 6),
+                          significant(l.latency.mean_s * 1000.0, 6),
                           std::string{zone_name(l.zone)},
                           std::string{}};
   return join(fields, ",") + "\n";
@@ -2691,11 +2671,26 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   const std::array fields{t_s,
                           client,
                           r.op,
-                          num(r.offered.per_second, 6),
-                          num(r.answered.per_second, 6),
-                          num(r.timed_out.per_second, 6),
-                          num(r.response.mean_s * 1000.0, 6)};
+                          significant(r.offered.per_second, 6),
+                          significant(r.answered.per_second, 6),
+                          significant(r.timed_out.per_second, 6),
+                          significant(r.response.mean_s * 1000.0, 6)};
   return join(fields, ",") + "\n";
+}
+
+// Float residue is no quantity. A queue that fills and drains back to empty can be left with
+// |x| ~ 1e-13 where the exact figure is 0 (the subtractions of its conservation law do not cancel
+// to the last bit): a pool behind a saturated service printed `peak_backlog 1.819e-13`. A backlog,
+// drop or rejection total below 1e-9 of what the queue serves in one second (its capacity per
+// replica; an absolute 1e-9 for a queue with none) is reported as 0, so nobody goes looking for a
+// backlog that is not there. The totals the summary keeps are not touched, only the figures it
+// hands the reports (Summary::nodes, Summary::links).
+constexpr double residue_per_capacity = 1e-9;
+
+[[nodiscard]] double without_residue(double value, double capacity_per_s) {
+  const double threshold =
+      capacity_per_s > 0.0 ? residue_per_capacity * capacity_per_s : residue_per_capacity;
+  return std::abs(value) < threshold ? 0.0 : value;
 }
 
 }  // namespace
@@ -2913,12 +2908,13 @@ std::vector<NodeSummary> Summary::nodes() const {
   std::vector<NodeSummary> out;
   for (std::size_t i = 0; i < nodes_.size(); ++i) {
     const auto& t = nodes_[i];
+    const double capacity = graph_->nodes()[i].capacity.service_rate.per_second;
     out.push_back(NodeSummary{.id = graph_->nodes()[i].spec.id,
                               .mean_rho = observed_s_ > 0.0 ? t.rho_time / observed_s_ : 0.0,
                               .peak_rho = t.peak_rho,
-                              .peak_backlog = t.peak_backlog,
-                              .total_dropped = t.dropped,
-                              .total_rejected = t.rejected,
+                              .peak_backlog = without_residue(t.peak_backlog, capacity),
+                              .total_dropped = without_residue(t.dropped, capacity),
+                              .total_rejected = without_residue(t.rejected, capacity),
                               .red_time_s = t.red_time_s,
                               .unavailable = t.unavailable,
                               .peak_queue_lag_s = t.peak_queue_lag_s});
@@ -2935,14 +2931,18 @@ std::vector<NodeSummary> Summary::nodes() const {
 std::vector<LinkSummary> Summary::links() const {
   std::vector<LinkSummary> out;
   const auto per_s = [&](double total) { return observed_s_ > 0.0 ? total / observed_s_ : 0.0; };
-  for (const auto& t : links_) {
+  std::size_t next = 0;  // links_ follows Graph::links(), pipes only
+  for (const auto& link : graph_->links()) {
+    if (!link.pipe) continue;
+    const auto& t = links_[next++];
+    const double capacity = link.pipe->service_rate.per_second;
     const Moments& latency = t.by_demand.weight > 0.0 ? t.by_demand : t.by_time;
     out.push_back(LinkSummary{
         .queue = NodeSummary{.id = t.name,
                              .mean_rho = per_s(t.queue.rho_time),
                              .peak_rho = t.queue.peak_rho,
-                             .peak_backlog = t.queue.peak_backlog,
-                             .total_dropped = t.queue.dropped,
+                             .peak_backlog = without_residue(t.queue.peak_backlog, capacity),
+                             .total_dropped = without_residue(t.queue.dropped, capacity),
                              .total_rejected = 0.0,
                              .red_time_s = t.queue.red_time_s,
                              .unavailable = t.queue.unavailable},

@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "../support/explain_lines.hpp"
+#include "../support/scenario_helpers.hpp"
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions when a
@@ -47,6 +48,9 @@ using simsys::model::Scenario;
 using simsys::model::Workload;
 using simsys::test_support::check_line;
 using simsys::test_support::node_line;
+// Shared with test_series / test_report (tests/support/scenario_helpers.hpp).
+using simsys::test_support::explain_of;
+using simsys::test_support::piped;
 
 namespace {
 
@@ -236,11 +240,6 @@ std::string explain_shipped(const std::string& name) {
   INFO((loaded ? "" : loaded.error().message));
   REQUIRE(loaded.has_value());
   return simsys::report::render_explain(graph_of(*loaded));
-}
-
-// `explain` of a scenario built in code.
-std::string explain_of(const Scenario& s) {
-  return simsys::report::render_explain(graph_of(s));
 }
 
 // The first number after `key` (a quoted JSON key, with its colon) at or after `from`, and the
@@ -1035,19 +1034,8 @@ TEST_CASE("explain names every blocking type on the way to a node, nearest first
 // Picture: client `a` sends `rate` puts/s of 1 MB to service `b` over a 1 Gbit/s = 125 MB/s link.
 
 namespace {
-// a(`rate`/s of 1 MB `put`s) -> b over a 250 us link of 1 Gbit/s (none when `bandwidth` is
-// empty). 3 s at 100 ms steps, the first 500 ms warmup.
-Scenario piped(double rate, std::optional<simsys::ByteRate> bandwidth = simsys::ByteRate{125e6}) {
-  Scenario s{.name = "piped", .version = 1, .duration = 3s, .step = 100ms, .warmup = 500ms};
-  s.nodes = {NodeSpec{.id = "a",
-                      .type = NodeType::client,
-                      .workload = Workload{.curve = {.base = Rate{rate}},
-                                           .op_shares = {{"put", 1.0}},
-                                           .sizes = {{"put", simsys::Bytes{1e6}}}}},
-             NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{1e6}, .latency = 1ms}};
-  s.links = {LinkSpec{.from = "a", .to = "b", .latency = 250us, .bandwidth = bandwidth}};
-  return s;
-}
+// The scenario: test_support::piped (tests/support/scenario_helpers.hpp), a(`rate`/s of 1 MB
+// `put`s) -> b over a 250 us link of 1 Gbit/s, 3 s at 100 ms steps, the first 500 ms warmup.
 
 // The text of the JSON object that starts at the first `"name": "<name>"` (up to its closing
 // brace), or empty: the keys of one link or node, without those of the next.

@@ -9,7 +9,10 @@
 //    topological order (spec §3.1: cycles use the previous step's value).
 //  - Op level (detail::find_async_hops): which HOP closes a loop of CALLS, (node, op) ->
 //    (node', op') -> ... -> (node, op)? A request cannot wait for itself, so that hop is
-//    an asynchronous hand-off and adds no latency to its caller.
+//    an asynchronous hand-off and adds no latency to its caller. A hop that is always waited
+//    for (a cache's or a CDN's fetch from its store, a rate limiter's counter request) can be
+//    no such hand-off, so a call cycle through one is refused, wherever the cycle is entered
+//    (detail::call_components, Graph::check_backend_calls).
 // A node cycle need not be a call cycle: with A.x -> B.y and B.z -> A.w the boxes loop
 // but no call does. A hop over a node-level feedback link that closes no call cycle is
 // counted in latency like any other, one step stale: the backward pass reads the
@@ -93,10 +96,13 @@ import simsys.fluid;
 import simsys.model;
 import simsys.queueing;
 
-// What resolving one cache's hit ratio reads (defined with the hit-ratio code below); declared
-// here for Graph::resolve_hit_ratio. Not exported: module linkage, like everything in detail.
+// What resolving one cache's hit ratio reads (defined with the hit-ratio code below), and which
+// calls lie on a common call cycle (defined with the call-graph search); declared here for
+// Graph::resolve_hit_ratio and Graph::check_backend_calls. Not exported: module linkage, like
+// everything in detail.
 namespace simsys::graph::detail {
 struct HitRatioInputs;
+struct CallComponents;
 }  // namespace simsys::graph::detail
 
 export namespace simsys::graph {
@@ -515,7 +521,7 @@ class Graph {
   [[nodiscard]] bool sends(std::size_t from, std::string_view op, std::size_t to) const;
   [[nodiscard]] std::string sender_of(std::size_t node, std::string_view op) const;
   Result check_cache_backend_ops(std::size_t cache);
-  Result check_cache_backend_calls() const;
+  Result check_backend_calls(const detail::CallComponents& components) const;
   Result route_splitters();
   Result route_queue(std::size_t queue);
   Result check_pool_senders() const;
@@ -884,7 +890,7 @@ namespace {
 // `strategy` and no `backend`, and none may be written in code: the CDN fetches its own misses,
 // so a then step on miss would fetch them twice and an unconditional one has no place in an
 // edge cache's model; it is read_through towards its origin by definition, so a strategy would
-// contradict it (write_back would even excuse the origin hop from check_cache_backend_calls),
+// contradict it (write_back would even excuse the origin hop from check_backend_calls),
 // and its store is its origin, so a backend would be a second one.
 [[nodiscard]] std::optional<EngineError> invalid_cdn(const model::NodeSpec& spec) {
   const std::string name = "node '" + spec.id + "': ";
@@ -1446,7 +1452,8 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
 // request cannot wait for its own descendant, so that hop is a fire-and-forget hand-off (the
 // latency model skips it). A node loop that ends in a terminal op (c.job -> a.push, where `push`
 // makes no call) has no back edge here, so every one of its hops is waited for.
-[[nodiscard]] std::vector<AsyncHop> find_async_hops(const Graph& g) {
+[[nodiscard]] std::vector<AsyncHop> find_async_hops(const Graph& g,
+                                                    const ForwardedSteps& forwarded) {
   enum class Colour { grey, black };  // absent from the map = white (not yet visited)
   std::map<Call, Colour> colour;
   struct Frame {
@@ -1454,7 +1461,6 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
     std::span<const model::Step> steps;
     std::size_t next_step;
   };
-  const ForwardedSteps forwarded = forwarder_steps(g);
   std::vector<AsyncHop> hops;
   for (const Call& root : call_roots(g)) {
     // C++20 std::map::contains: "is this key present?" in one call, replacing
@@ -1488,6 +1494,119 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
   const auto duplicates = std::ranges::unique(hops);
   hops.erase(duplicates.begin(), duplicates.end());
   return hops;
+}
+
+// ---- Which calls share a call cycle: strongly connected components (Tarjan, 1972) ----
+//
+// find_async_hops answers "which hop does a depth-first search meet as a back edge?", and the
+// answer depends on where the search starts: in u -> c.read -> db.read -> c.read the search from c
+// cuts db's call back to c, the search from db (a client calling db) cuts c's fetch from db.
+// Whether a hop lies on a call cycle at all must not depend on that, so it is asked of the call
+// graph's strongly connected components instead.
+//
+// A strongly connected component (SCC) of a directed graph is a largest set of vertices in which
+// every vertex reaches every other along the edges. Every vertex is in exactly one (a vertex on no
+// cycle is a component on its own). Two distinct calls X and Y are in the same component exactly
+// when there are paths X -> ... -> Y and Y -> ... -> X; put end to end, the two paths are a cycle
+// through both. So "does the hop X -> Y lie on a call cycle?" is "are X and Y in one component?":
+// Y reaches X back, and the hop closes the loop.
+//
+// Tarjan's algorithm finds every component in one depth-first search, in time linear in the calls
+// plus the hops. Each call gets `index`, the order in which the search discovered it, and `low`,
+// the smallest index it can reach through the calls below it in the search and one hop back to a
+// call still being worked on (on the stack). Discovered calls are pushed on a stack. When a call
+// finishes with low == index, nothing below it reaches higher up the search, so it is the first
+// call discovered of its component, and the component is that call and every call above it on the
+// stack: they are popped together and numbered. The recursion is as deep as the longest chain of
+// calls, a few dozen in any scenario a person writes.
+struct CallComponents {
+  std::map<Call, std::size_t> component_of;  // every call the search reached -> its component
+
+  // Do the distinct calls `a` and `b` lie on a common call cycle? A call that is in no hop
+  // (absent from the map) is on no cycle.
+  [[nodiscard]] bool on_common_cycle(const Call& a, const Call& b) const {
+    const auto found_a = component_of.find(a);
+    const auto found_b = component_of.find(b);
+    if (found_a == component_of.end() || found_b == component_of.end()) return false;
+    return found_a->second == found_b->second;
+  }
+};
+
+class ComponentSearch {
+ public:
+  ComponentSearch(const Graph& g, const ForwardedSteps& forwarded) : g_{g}, forwarded_{forwarded} {}
+
+  // Every call that makes a call is a root, in the map's order, so the numbering is reproducible
+  // (a call that makes none is reached from its caller, or is in no hop at all).
+  [[nodiscard]] CallComponents run() {
+    for (const Call& call : forwarded_ | std::views::keys) {
+      if (!marks_.contains(call)) visit(call);
+    }
+    return std::move(components_);
+  }
+
+ private:
+  struct Mark {
+    std::size_t index{};
+    std::size_t low{};
+    bool on_stack{};
+  };
+
+  void visit(const Call& call) {
+    // A std::map's elements never move, so `mark` stays valid while visit() inserts others.
+    Mark& mark = marks_[call] = Mark{.index = next_index_, .low = next_index_, .on_stack = true};
+    ++next_index_;
+    stack_.push_back(call);
+    for (const model::Step& step : steps_of(forwarded_, call)) {
+      const Call callee{*g_.index_of(step.to), step.op};  // build proved the target exists
+      const auto found = marks_.find(callee);
+      if (found == marks_.end()) {
+        visit(callee);
+        mark.low = std::min(mark.low, marks_.at(callee).low);
+      } else if (found->second.on_stack) {
+        mark.low = std::min(mark.low, found->second.index);  // a hop back up the search
+      }
+    }
+    if (mark.low == mark.index) close_component(call);
+  }
+
+  // Pops the component whose first-discovered call is `root`: everything above it on the stack.
+  void close_component(const Call& root) {
+    bool reached_root = false;
+    while (!reached_root) {
+      Call member = std::move(stack_.back());
+      stack_.pop_back();
+      marks_.at(member).on_stack = false;
+      reached_root = member == root;
+      components_.component_of.emplace(std::move(member), next_component_);
+    }
+    ++next_component_;
+  }
+
+  const Graph& g_;
+  const ForwardedSteps& forwarded_;
+  std::map<Call, Mark> marks_;  // absent = not yet discovered
+  std::vector<Call> stack_;
+  std::size_t next_index_{};
+  CallComponents components_;
+  std::size_t next_component_{};
+};
+
+[[nodiscard]] CallComponents call_components(const Graph& g, const ForwardedSteps& forwarded) {
+  return ComponentSearch{g, forwarded}.run();
+}
+
+// The op node `node` sends its backend for a request of `op` and waits for, if any: `counter` at a
+// rate limiter (it asks its counter store before it admits, book ch. 4); the op itself at a cache
+// or CDN that passes some of it on (Graph::backend_fraction), except a write_back cache's write,
+// whose flush nobody waits for (write_back_flushes).
+[[nodiscard]] std::optional<std::string> waited_backend_op(const Graph& g, std::size_t node,
+                                                           const std::string& op) {
+  const auto& spec = g.nodes()[node].spec;
+  if (spec.type == model::NodeType::rate_limiter) return std::string{counter_op};
+  if (is_cache(spec) && spec.strategy == model::CacheStrategy::write_back) return std::nullopt;
+  if (g.backend_fraction(node, op) <= 0.0) return std::nullopt;
+  return op;
 }
 
 // The flush hops of every write_back cache: (cache, write) -> (backend, write) for each write op
@@ -1550,8 +1669,8 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
 
 // The call-cycle hops, the write-back flushes, the blob stores' events and the queues' deliveries,
 // sorted and without duplicates, as Graph::is_async_hop's binary search needs them.
-[[nodiscard]] std::vector<AsyncHop> async_hops(const Graph& g) {
-  auto hops = find_async_hops(g);
+[[nodiscard]] std::vector<AsyncHop> async_hops(const Graph& g, const ForwardedSteps& forwarded) {
+  auto hops = find_async_hops(g, forwarded);
   // (C++23's std::vector::append_range would say this in one call; GCC 14's library lacks it.)
   const auto flushes = write_back_flushes(g);
   hops.insert(hops.end(), flushes.begin(), flushes.end());
@@ -2549,8 +2668,11 @@ std::expected<Graph, EngineError> Graph::build(model::Scenario scenario) {
                          .and_then([&] { return graph.resolve_request_sizes(); });
   if (!built) return std::unexpected{built.error()};
   graph.order_nodes();
-  graph.async_hops_ = detail::async_hops(graph);
-  if (auto checked = graph.check_cache_backend_calls(); !checked) {
+  // The call graph, built once: the asynchronous hops are its back edges, and no hop a request
+  // waits for may lie on one of its cycles.
+  const detail::ForwardedSteps calls = detail::forwarder_steps(graph);
+  graph.async_hops_ = detail::async_hops(graph, calls);
+  if (auto checked = graph.check_backend_calls(detail::call_components(graph, calls)); !checked) {
     return std::unexpected{checked.error()};
   }
   return graph;
@@ -2996,7 +3118,7 @@ Graph::Result Graph::connect_backends() {
 // link from the cdn". invalid_cache and invalid_cdn proved the name is there; the loader checks the
 // same (its reference check, config's read_cdn_origin). Which ops travel on the edge is known only
 // once every node's arriving ops are (check_cache_backend_ops), and whether a request can wait for
-// the hop only once the call cycles are (check_cache_backend_calls).
+// the hop only once the call cycles are (check_backend_calls).
 Graph::Result Graph::connect_store(std::size_t node, std::string_view role) {
   const auto& spec = nodes_[node].spec;
   const std::string& store_id = role == "origin" ? *spec.origin : *spec.backend;
@@ -3090,22 +3212,25 @@ Graph::Result Graph::check_cache_backend_ops(std::size_t cache) {
   return {};
 }
 
-// A cache's fetch from its store is always waited for: a read_through miss is answered with
-// what the store returns, a write_through write once the store has it. So the hop cannot be
-// the one the call-cycle search cuts (detail::find_async_hops): a store that calls back into
-// the cache in front of it (db.read -> cache.read -> db.read) asks a request to wait for
-// itself, and the scenario is refused. (write_back's flush is not a call: nobody waits.)
-Graph::Result Graph::check_cache_backend_calls() const {
-  for (std::size_t cache = 0; cache < nodes_.size(); ++cache) {
-    const auto& resolved = nodes_[cache];
-    if (!hits_or_misses(resolved.spec.type) || !resolved.backend) continue;
-    if (is_cache(resolved.spec) && resolved.spec.strategy == model::CacheStrategy::write_back) {
-      continue;
-    }
-    const std::string role = resolved.spec.type == model::NodeType::cdn ? "origin" : "backend";
-    for (const auto& op : arriving_ops_[cache]) {
-      if (backend_fraction(cache, op) <= 0.0) continue;
-      if (!is_async_hop(cache, op, *resolved.backend, op)) continue;
+// A cache's fetch from its store is always waited for: a read_through miss is answered with what
+// the store returns, a write_through write once the store has it. A CDN's fetch from its origin is
+// a read_through miss, and a rate limiter asks its counter store before it admits a request. So
+// none of these hops can be an asynchronous hand-off, and a store that calls back into the node in
+// front of it (db.read -> cache.read -> db.read) asks a request to wait for itself: the scenario is
+// refused. "On a call cycle" is asked of the call graph's strongly connected components
+// (detail::call_components), not of the hop the cycle search happened to cut
+// (detail::find_async_hops), so the answer does not depend on where the clients enter the loop.
+// (write_back's flush is not a call: nobody waits.)
+Graph::Result Graph::check_backend_calls(const detail::CallComponents& components) const {
+  for (std::size_t node = 0; node < nodes_.size(); ++node) {
+    const auto& resolved = nodes_[node];
+    if (!resolved.backend) continue;
+    for (const auto& op : arriving_ops_[node]) {
+      const auto waited = detail::waited_backend_op(*this, node, op);
+      if (!waited || !components.on_common_cycle({node, op}, {*resolved.backend, *waited})) {
+        continue;
+      }
+      const std::string role = resolved.spec.type == model::NodeType::cdn ? "origin" : "backend";
       return std::unexpected{EngineError{"node '" + resolved.spec.id + "': " + role + " '" +
                                          nodes_[*resolved.backend].spec.id +
                                          "' closes a call cycle"}};

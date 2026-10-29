@@ -2,8 +2,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -225,6 +227,23 @@ TEST_CASE("the same seed gives the same noise path and a different seed differs"
     if (x != c.next(100ms)) any_difference = true;
   }
   REQUIRE(any_difference);
+}
+
+TEST_CASE("client_seed separates seeds and clients", "[workload]") {
+  using simsys::workload::client_seed;
+  REQUIRE(client_seed(1, 0) != client_seed(2, 0));
+  REQUIRE(client_seed(1, 0) != client_seed(1, 1));
+  REQUIRE(client_seed(1, 0) == client_seed(1, 0));
+}
+
+TEST_CASE("client_seed never gives two seed and client pairs the same engine seed", "[workload]") {
+  using simsys::workload::client_seed;
+  REQUIRE(client_seed(1, 0) != client_seed(0, 1));  // plain seed ^ index would collide here
+  std::vector<std::uint64_t> seeds;
+  for (int seed = -100; seed <= 100; ++seed)
+    for (std::size_t i = 0; i < 64; ++i) seeds.push_back(client_seed(seed, i));
+  std::ranges::sort(seeds);
+  REQUIRE(std::ranges::adjacent_find(seeds) == seeds.end());
 }
 
 TEST_CASE("the noise multiplier is never negative", "[workload]") {

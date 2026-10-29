@@ -117,8 +117,9 @@ class Flow {
     OpName op;
     Rate rate;
   };
-  void add(std::string_view op, Rate rate);               // accumulates
-  [[nodiscard]] Rate rate_of(std::string_view op) const;  // Rate{0} when absent
+  void add(std::string_view op, Rate rate);  // accumulates
+  // Rate{0} when absent. test helper: no caller in src (the engine walks entries()).
+  [[nodiscard]] Rate rate_of(std::string_view op) const;
   [[nodiscard]] Rate total() const;
   void scale(double factor);                       // multiplies every rate in place
   [[nodiscard]] Flow scaled(double factor) const;  // a scaled copy; does not mutate

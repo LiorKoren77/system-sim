@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "../support/explain_lines.hpp"
+#include "../support/scenario_helpers.hpp"
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion. It comes after the #includes because GCC 14 reports redefinitions
@@ -36,6 +37,8 @@ import simsys.report;
 // explain's lines, shared with test_report and test_series.
 using simsys::test_support::check_line;
 using simsys::test_support::node_line;
+// The ring imbalance formula, shared with test_theory.
+using simsys::test_support::ring_factor;
 
 namespace {
 
@@ -173,24 +176,6 @@ TEST_CASE(
   CHECK(ran > 0);  // the tutorials at least always run here (the three above are not counted)
 }
 
-// Phase 2a's goal: the rate-limiter lab, which uses a client with spikes, a rate limiter, a cache
-// and a service, runs end to end. (It was red on purpose until the cache node landed; do not weaken
-// it to a skip.)
-TEST_CASE("labs/rate-limiter runs in phase 2a", "[scenario]") {
-  using namespace std::chrono_literals;
-  const auto s =
-      simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/labs/rate-limiter/scenario.yaml");
-  if (!s) FAIL(s.error().file << ":" << s.error().line << ": " << s.error().message);
-  const auto g = simsys::graph::Graph::build(*s);
-  if (!g) FAIL(g.error().message);
-  auto sim = simsys::engine::Simulation::create(*g);
-  if (!sim) FAIL(sim.error().message);
-  // A short run is enough to prove the pipeline end to end: the first steps of 30 minutes.
-  int steps = 0;
-  sim->run({.duration = 1s, .step = s->step}, [&](const auto&) { ++steps; });
-  REQUIRE(steps == 10);
-}
-
 // Phase 2b: the consistent-hashing lab (clients with Zipf keys -> a hash ring -> four che caches ->
 // a SQL database with a primary and a read replica) runs end to end and meets its own SLOs (cache
 // utilization <= 0.85, database utilization <= 0.7). If an SLO fails the CAPTUREd numbers say by
@@ -269,7 +254,9 @@ TEST_CASE("book scenarios are refused by run until their node types exist", "[sc
 // lacked); the search index (a service with no steps) adds the book's search autocomplete. Every
 // other lab and book scenario still needs a later task's node types (google-drive's ws_gateway,
 // chat-system's service_discovery, ...), so the set of runnable scenarios is pinned by name: a node
-// type added later makes this fail and forces whoever adds it to update the list on purpose.
+// type added later makes this fail and forces whoever adds it to update the list on purpose. A
+// scenario counts as runnable when the node-type table says every type in it runs
+// (model::simulated), and Simulation::create must agree: it refuses exactly the others.
 TEST_CASE(
     "exactly ten shipped scenarios use only simulated node types: chain, hello, "
     "consistent-hashing, kv-store, news-feed, rate-limiter, search-autocomplete, unique-id, "
@@ -281,8 +268,11 @@ TEST_CASE(
     const auto loaded = simsys::config::load(file);
     if (!loaded) FAIL(loaded.error().message);  // a broken file must fail here, not crash below
     const auto& s = *loaded;
+    const bool every_type_runs = std::ranges::all_of(
+        s.nodes, [](const auto& node) { return simsys::model::simulated(node.type); });
     const auto g = build_or_fail(s);
-    if (simsys::engine::Simulation::create(g)) runnable.push_back(s.name);
+    REQUIRE(simsys::engine::Simulation::create(g).has_value() == every_type_runs);
+    if (every_type_runs) runnable.push_back(s.name);
   }
   std::ranges::sort(runnable);
   REQUIRE(runnable == std::vector<std::string>{"chain", "hello", "lab-consistent-hashing",
@@ -1052,8 +1042,7 @@ TEST_CASE("explain on book/youtube prints the stream size on the byte-sized cdn"
 // notification-system's nodes in file order: services, lb, notification_svc, user_cache,
 // user_db, user_limiter (all simulated), then `fanout`, a notification_fanout: the first node of
 // a type with no model.
-TEST_CASE("book/notification-system is still refused at fanout, its notification_fanout",
-          "[scenario]") {
+TEST_CASE("book/notification-system is refused at fanout, its notification_fanout", "[scenario]") {
   const auto g = build_or_fail(load_scenario("/book/notification-system/scenario.yaml"));
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
@@ -1064,7 +1053,7 @@ TEST_CASE("book/notification-system is still refused at fanout, its notification
 
 // chat-system's nodes in file order: users, lb, the chat API service, then `discovery`, a
 // service_discovery, which comes before the `chat_servers` ws_gateway after it.
-TEST_CASE("book/chat-system is still refused at discovery, its service_discovery", "[scenario]") {
+TEST_CASE("book/chat-system is refused at discovery, its service_discovery", "[scenario]") {
   const auto g = build_or_fail(load_scenario("/book/chat-system/scenario.yaml"));
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
@@ -1108,13 +1097,6 @@ TEST_CASE("explain on the shipped scenarios prints each external sink's failure 
 // and the lognormal fit's p99 2.31 ms (2.41 ms before, when every replica was an exponential of the
 // machines' mean sojourn).
 namespace {
-// k = min(1 + z_M / sqrt(N v), M / N), z_M by Blom (queueing::expected_normal_maximum).
-double ring_factor(int machines, int replication, int vnodes) {
-  return std::min(1.0 + simsys::queueing::expected_normal_maximum(machines) /
-                            std::sqrt(static_cast<double>(replication) * vnodes),
-                  static_cast<double>(machines) / replication);
-}
-
 // The lab with its store at `nodes` machines of `vnodes` virtual nodes each, `minutes` long.
 simsys::model::Scenario kv_lab(int nodes, int vnodes, std::chrono::minutes minutes) {
   auto s = load_scenario("/labs/kv-store/scenario.yaml");

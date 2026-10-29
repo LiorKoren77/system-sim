@@ -922,6 +922,45 @@ TEST_CASE("a cache whose backend hop closes a call cycle is refused", "[graph]")
   REQUIRE(g.error().message == "node 'cache': backend 'db' closes a call cycle");
 }
 
+// The same loop entered at the cache (the client calls it, directly or through a front service):
+// u -> cache.read -> db.read -> cache.read. The depth-first search that picks the asynchronous hops
+// (detail::find_async_hops) now starts at the cache and cuts db's call back to it, so the cache's
+// fetch is no cut hop; yet it still waits for itself. The refusal asks whether the fetch lies on
+// ANY call cycle (its two ends in one strongly connected component of the call graph), so where the
+// client enters no longer matters.
+namespace {
+Scenario loop_entered_at_cache(bool through_front) {
+  Scenario s{.name = "loop-at-cache", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"read", 1.0}}),
+             cache("cache", 0.5, CacheStrategy::read_through, "db"),
+             service("db", {{"read", {Step{.to = "cache", .op = "read"}}}})};
+  s.links = {LinkSpec{.from = "cache", .to = "db", .dir = Direction::inout},
+             LinkSpec{.from = "db", .to = "cache", .dir = Direction::inout}};
+  if (!through_front) {
+    s.links.push_back(LinkSpec{.from = "u", .to = "cache", .dir = Direction::inout});
+    return s;
+  }
+  s.nodes.push_back(service("front", {{"read", {Step{.to = "cache", .op = "read"}}}}));
+  s.links.push_back(LinkSpec{.from = "u", .to = "front", .dir = Direction::inout});
+  s.links.push_back(LinkSpec{.from = "front", .to = "cache", .dir = Direction::inout});
+  return s;
+}
+}  // namespace
+
+TEST_CASE("a cache whose backend hop closes a call cycle is refused wherever the client enters",
+          "[graph]") {
+  SECTION("the client calls the cache") {
+    const auto g = Graph::build(loop_entered_at_cache(false));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == "node 'cache': backend 'db' closes a call cycle");
+  }
+  SECTION("the client calls a front service that calls the cache") {
+    const auto g = Graph::build(loop_entered_at_cache(true));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == "node 'cache': backend 'db' closes a call cycle");
+  }
+}
+
 TEST_CASE("a forwarding cache's backend needs a link from the cache", "[graph]") {
   Scenario s = cached_web(cache("cache", 0.8, CacheStrategy::read_through, "db"),
                           {Step{.to = "cache", .op = "read"}});
@@ -1895,6 +1934,23 @@ TEST_CASE("a cdn whose origin hop closes a call cycle is refused", "[graph]") {
   REQUIRE(g.error().message == "node 'cdn': origin 'origin' closes a call cycle");
 }
 
+// The loop entered at the CDN: u -> cdn.get -> origin.get -> cdn.get. With h = 0 every request
+// the origin sends back misses again, a loop of gain 1 that a run would let saturate the origin.
+// The search for asynchronous hops starts at the CDN and cuts the origin's call, not the miss
+// fetch, but the fetch is on the cycle all the same: refused.
+TEST_CASE("a cdn whose origin hop closes a call cycle is refused when the client calls the cdn",
+          "[graph]") {
+  Scenario s{.name = "cdn-loop-at-edge", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"get", 1.0}}), cdn_node(HitRatio{.fixed = 0.0}),
+             service("origin", {{"get", {Step{.to = "cdn", .op = "get"}}}})};
+  s.links = {LinkSpec{.from = "u", .to = "cdn", .dir = Direction::inout},
+             LinkSpec{.from = "cdn", .to = "origin", .dir = Direction::inout},
+             LinkSpec{.from = "origin", .to = "cdn", .dir = Direction::inout}};
+  const auto g = Graph::build(s);
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message == "node 'cdn': origin 'origin' closes a call cycle");
+}
+
 // Che's "filtered" popularity names the node whose misses a che cache receives, by its type: a
 // CDN's misses are a CDN's, not a cache's.
 TEST_CASE("a che cache receiving a cdn's misses and unfiltered reads names the cdn", "[graph]") {
@@ -2157,6 +2213,23 @@ TEST_CASE("a limiter's counter that its store counts as a read is refused", "[gr
     INFO((g ? "" : g.error().message));
     REQUIRE(g.has_value());
   }
+}
+
+// A limiter asks its counter store before it admits a request (ch. 4: read and increment the
+// counter, then forward or refuse), so the counter hop is always waited for, like a cache's fetch.
+// Here the store is a write_through cache whose database calls the limiter again: limiter.call ->
+// counters.counter -> db.counter -> limiter.call, a request that waits for itself. Refused, naming
+// the limiter and its backend.
+TEST_CASE("a limiter whose counter store calls back into it is refused", "[graph]") {
+  auto counters = cache("counters", 0.5, CacheStrategy::write_through, "db");
+  counters.write_ops = std::vector<std::string>{"counter"};
+  auto s = limiter_counting_in(std::move(counters));
+  s.nodes.push_back(service("db", {{"counter", {Step{.to = "limiter", .op = "call"}}}}));
+  s.links.push_back(LinkSpec{.from = "counters", .to = "db", .dir = Direction::inout});
+  s.links.push_back(LinkSpec{.from = "db", .to = "limiter", .dir = Direction::inout});
+  const auto g = Graph::build(s);
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message == "node 'limiter': backend 'counters' closes a call cycle");
 }
 
 // ---- One request size per (node, op), resolved at build (spec §19 entry 1) ----
@@ -2436,6 +2509,26 @@ Scenario unfed_pool(Step step) {
 
 const std::string no_size_advice = "has no size: add size: to the step or sizes: to the client";
 }  // namespace
+
+// The control: a loop of BOXES that is no loop of CALLS. The store publishes each read to a queue
+// whose worker pool reads the cache again, but a queue answers its publisher at the append
+// (detail::consumer_deliveries), so no request waits for the pool: the cache's fetch lies on no
+// call cycle, and the scenario builds.
+TEST_CASE("a cache whose store hands work to a queue that reaches the cache again builds",
+          "[graph]") {
+  Scenario s{.name = "async-loop", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{100}, {{"read", 1.0}}),
+             cache("cache", 0.5, CacheStrategy::read_through, "db"),
+             service("db", {{"read", {Step{.to = "q", .op = "read"}}}}), message_queue("q"),
+             worker_pool("pool", {Step{.to = "cache", .op = "read"}}, "q")};
+  s.links = {LinkSpec{.from = "u", .to = "cache", .dir = Direction::inout},
+             LinkSpec{.from = "cache", .to = "db", .dir = Direction::inout},
+             LinkSpec{.from = "db", .to = "q", .dir = Direction::inout},
+             LinkSpec{.from = "q", .to = "pool"}, LinkSpec{.from = "pool", .to = "cache"}};
+  const auto g = Graph::build(s);
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+}
 
 // Nothing feeds the pool, yet its `then` step counts as arriving at the store (an unconditional
 // `then` fires for whatever the node receives). Before this fix the store took `write` with no size

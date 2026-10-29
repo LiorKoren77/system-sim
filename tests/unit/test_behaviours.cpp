@@ -149,15 +149,20 @@ Flow flow_of(std::string_view op, double per_second) {
 
 // C++20 concepts checked at compile time: the behaviours must satisfy the engine's
 // requirements, or this file does not compile.
-static_assert(simsys::behaviours::NodeBehaviour<ServiceBehaviour>);
+// All eleven behaviours of the Behaviour variant, the client a RequestSource and the ten servers
+// NodeBehaviours.
 static_assert(simsys::behaviours::RequestSource<ClientBehaviour>);
+static_assert(simsys::behaviours::NodeBehaviour<ServiceBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<LoadBalancerBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<RateLimiterBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<CacheBehaviour>);
+static_assert(simsys::behaviours::NodeBehaviour<SqlDbBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<CdnBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<BlobStoreBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<MessageQueueBehaviour>);
 static_assert(simsys::behaviours::NodeBehaviour<WorkerPoolBehaviour>);
+static_assert(simsys::behaviours::NodeBehaviour<ExternalSinkBehaviour>);
+static_assert(simsys::behaviours::NodeBehaviour<KvClusterBehaviour>);
 
 // And the negative: a type that routes flow but cannot answer for its latency is not a
 // NodeBehaviour, so the engine refuses it at compile time instead of misbehaving at run time.
@@ -384,7 +389,7 @@ TEST_CASE("a client offers the curve's rate at the step's time", "[behaviours]")
   s.nodes[0].workload->curve.spikes = {
       simsys::workload::Spike{.at = 1s, .duration = 1s, .factor = 3}};
   const auto g = *simsys::graph::Graph::build(s);
-  ClientBehaviour c{g, *g.index_of("users"), simsys::behaviours::client_seed(1, 0)};
+  ClientBehaviour c{g, *g.index_of("users"), simsys::workload::client_seed(1, 0)};
   REQUIRE_THAT(c.offer(0s).outgoing[0].flow.rate_of("get").per_second, WithinRel(80.0, 1e-12));
   REQUIRE_THAT(c.offer(1s).outgoing[0].flow.rate_of("get").per_second, WithinRel(240.0, 1e-12));
 }
@@ -401,24 +406,6 @@ TEST_CASE("noise applies only after a tick and is deterministic per seed", "[beh
   c.tick(0s, 100ms);
   REQUIRE(a.offer(0s).outgoing[0].flow.total() == b.offer(0s).outgoing[0].flow.total());
   REQUIRE(a.offer(0s).outgoing[0].flow.total() != c.offer(0s).outgoing[0].flow.total());
-}
-
-TEST_CASE("client_seed separates seeds and clients", "[behaviours]") {
-  using simsys::behaviours::client_seed;
-  REQUIRE(client_seed(1, 0) != client_seed(2, 0));
-  REQUIRE(client_seed(1, 0) != client_seed(1, 1));
-  REQUIRE(client_seed(1, 0) == client_seed(1, 0));
-}
-
-TEST_CASE("client_seed never gives two seed and client pairs the same engine seed",
-          "[behaviours]") {
-  using simsys::behaviours::client_seed;
-  REQUIRE(client_seed(1, 0) != client_seed(0, 1));  // plain seed ^ index would collide here
-  std::vector<std::uint64_t> seeds;
-  for (int seed = -100; seed <= 100; ++seed)
-    for (std::size_t i = 0; i < 64; ++i) seeds.push_back(client_seed(seed, i));
-  std::ranges::sort(seeds);
-  REQUIRE(std::ranges::adjacent_find(seeds) == seeds.end());
 }
 
 TEST_CASE("a service's cost per op comes from its spec and defaults to one", "[behaviours]") {

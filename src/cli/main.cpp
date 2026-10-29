@@ -33,7 +33,6 @@
 // redefinition errors when a std header is #included after importing a module that
 // included the same header in its global module fragment.
 import simsys.core;
-import simsys.behaviours; // client_seed: the noise seed the engine gives each client
 import simsys.config;
 import simsys.engine;
 import simsys.graph;
@@ -220,7 +219,7 @@ std::string duration_refusal(const std::filesystem::path& file, const std::strin
 // The graph `run` simulates. `--duration` is applied as a config::Override, so the loader holds it
 // to every rule it holds the file's own duration to (the CLI once kept a copy of the `over`
 // rule); `--seed` replaces the scenario's before the graph is built: the engine
-// seeds every client's noise from Graph::scenario().seed (behaviours::client_seed), so replacing
+// seeds every client's noise from Graph::scenario().seed (workload::client_seed), so replacing
 // it any later would not reach the clients.
 std::expected<graph::Graph, std::string> load_for_run(const std::filesystem::path& file,
                                                       const RunArgs& args) {
@@ -412,7 +411,7 @@ std::expected<CurveGrid, std::string> curve_grid(const std::filesystem::path& fi
 
 // The client's curve as a lazy stream of samples: the deterministic curve, or with
 // `--noise` the curve times the client's noise process, so the printed noise is the noise
-// a run will see: seeded exactly as the engine seeds it (behaviours::client_seed), advanced
+// a run will see: seeded exactly as the engine seeds it (workload::client_seed), advanced
 // every scenario step (the engine's dt) whatever --step prints, and ticked before each
 // value is read, as the engine ticks a client before it offers. The t = 0 row therefore
 // already includes one noise step, like the first step of a run.
@@ -429,8 +428,7 @@ std::expected<std::generator<simsys::workload::Sample>, std::string> curve_sampl
     return std::unexpected(
         std::format("{}: error: client '{}' has no noise block", file.string(), client.spec->id));
   }
-  const auto seed =
-      simsys::behaviours::client_seed(args.seed.value_or(scenario.seed), client.index);
+  const auto seed = simsys::workload::client_seed(args.seed.value_or(scenario.seed), client.index);
   return simsys::workload::samples(workload.curve, grid.step, grid.until, *workload.noise, seed,
                                    scenario.step);
 }

@@ -441,7 +441,7 @@ drops ([below](#drops-and-rejections)).
 | `algorithm` | `token_bucket` (default), `leaky_bucket`, `fixed_window`, `sliding_log`, `sliding_counter` | `algorithm must be token_bucket, leaky_bucket, fixed_window, sliding_log or sliding_counter` |
 | `window` | a positive duration, default `1s`. A windowed algorithm's window; on a bucket it only sizes the default `burst`. *(graph)* For `fixed_window`, `sliding_log` and `sliding_counter` (the default `1s` included), a whole number of steps, at least one: the fluid step sees a window boundary only where a step starts | `window must be positive`; *(graph)* `node 'x': window must be a positive whole number of steps (window 150ms, step 100ms)` |
 | `burst` | a positive integer, **buckets only**; default `limit × window` rounded up (one window's worth) | `burst must be a positive integer`, `burst applies only to token_bucket and leaky_bucket`, `limit x window is too large for a burst; give burst explicitly` |
-| `backend` | a declared node of type `cache`: the counter store | `backend refers to unknown node 'x'`, `backend must be a cache` |
+| `backend` | a declared node of type `cache`: the counter store | `backend refers to unknown node 'x'`, `backend must be a cache`; *(graph)* the limiter waits for its counter, so a store that calls back into the limiter (through its own backend or steps) is refused: `node 'lim': backend 'counters' closes a call cycle` |
 
 A `leaky_bucket` refuses `capacity`, `latency`, `advanced.queue_limit`,
 `advanced.concurrency` and `advanced.service_variability` (the leak is deterministic):
@@ -492,7 +492,7 @@ own (default 100k/s, 250 µs) that answers every request it receives, hit or mis
 |---|---|---|
 | `hit_ratio` | required: `{fixed: h}` with `0 ≤ h ≤ 1`, or `che` (computed at build from `keys` and the clients' key distribution, see [`che` hit ratios](#che-hit-ratios)) | `cache needs a hit_ratio`, `hit_ratio must be che or {fixed: h}`, `hit_ratio.fixed must be between 0 and 1` (also for a quoted `"0.5"`) |
 | `strategy` | `cache_aside` (default), `read_through`, `write_through`, `write_around`, `write_back` | `strategy must be cache_aside, read_through, write_through, write_around or write_back` |
-| `backend` | a declared node; required by every strategy but `cache_aside`, and refused there (the application reads the store; the backend would never be called) | `strategy read_through needs a backend`, `backend is unused with strategy cache_aside`, `backend refers to unknown node 'x'`; *(graph)* `backend 'db' needs a link from the cache`, and the link must carry every op the cache passes on (`link c -> db does not carry op 'read' (ops: write)`); a store that calls back into the cache (`db.read -> c.read -> db.read`) is refused, since a fetch is always waited for: `node 'c': backend 'db' closes a call cycle` |
+| `backend` | a declared node; required by every strategy but `cache_aside`, and refused there (the application reads the store; the backend would never be called) | `strategy read_through needs a backend`, `backend is unused with strategy cache_aside`, `backend refers to unknown node 'x'`; *(graph)* `backend 'db' needs a link from the cache`, and the link must carry every op the cache passes on (`link c -> db does not carry op 'read' (ops: write)`); a fetch on any call cycle is refused, since a fetch is always waited for: a store that calls back into the cache (`db.read -> c.read -> db.read`), whether the clients call the cache, the store or a service in front: `node 'c': backend 'db' closes a call cycle` |
 | `write_ops` | a non-empty list of op names; default `[write]`. Every other op is a read. A stated list is taken exactly as written (it replaces the default) | `write_ops must be a list of op names`, `write_ops must name at least one op`; *(graph)* a write the cache passes to a `sql_db` or `cache` backend must be a write there too, or the store would serve it as a read (a database from a replica, its primary idle): `node 'c': sends write 'set' to 'db', which counts 'set' as a read; add it to db's write_ops` |
 | `keys` | a [count](#values) (`20M`): the entries the cache holds, the Che approximation's cache size; required by `hit_ratio: che` | `keys must be a positive integer`; *(graph)* `node 'c': hit_ratio che needs keys (the cache's capacity in keys)` |
 | `eviction` | `lru`, `lfu`, `fifo`, `ttl` | `eviction must be lru, lfu, fifo or ttl` |
@@ -637,7 +637,7 @@ a CDN server without the file requests it from the origin, stores it and returns
 
 | key | rule | message on violation |
 |---|---|---|
-| `origin` | required; a declared node that is not a client and not the CDN itself, with a link from the CDN. Another CDN is fine: a tiered CDN (edge → regional → origin), whose second tier's `che` is computed over the first tier's misses | `node 'edge': a cdn needs an origin`; `node 'edge': origin refers to unknown node 'x'`; `node 'edge': origin 'u' is a client; clients only send`; `node 'edge': a cdn cannot be its own origin`; *(graph)* `node 'edge': origin 'x' needs a link from the cdn`; `node 'edge': origin 'x' closes a call cycle` (the origin calls back into the CDN, so a miss would wait for itself) |
+| `origin` | required; a declared node that is not a client and not the CDN itself, with a link from the CDN. Another CDN is fine: a tiered CDN (edge → regional → origin), whose second tier's `che` is computed over the first tier's misses | `node 'edge': a cdn needs an origin`; `node 'edge': origin refers to unknown node 'x'`; `node 'edge': origin 'u' is a client; clients only send`; `node 'edge': a cdn cannot be its own origin`; *(graph)* `node 'edge': origin 'x' needs a link from the cdn`; `node 'edge': origin 'x' closes a call cycle` (the origin calls back into the CDN, so a miss would wait for itself; refused wherever the clients enter the loop) |
 | `hit_ratio` | `{fixed: h}` (`0 ≤ h ≤ 1`) or `che`, as a cache's; optional: without one every read misses (`h = 0`) and still runs | `node 'edge': hit_ratio must be che or {fixed: h}` |
 | `keys` | the CDN's size in **objects** (not bytes), a positive [count](#values); a `che` hit ratio resolves from it and the `keys` of the clients that reach the CDN, exactly as a [cache's](#che-hit-ratios) | `node 'edge': keys must be a positive integer` |
 | `ttl` | a positive duration, printed and not modelled | `node 'edge': ttl must be positive` |
@@ -1224,7 +1224,9 @@ own: a token bucket's or a window algorithm's rejections are inside `drain` (the
 queue checked them before refusing them), and a leaky bucket's overflow is the `dropped`
 term, reported as `rejected` instead. `run --series` writes demand and drain (phase 2b), so the
 identity can be checked from the file: summed over a run that starts empty,
-Σ demand·dt = Σ (drain + drops)·dt + the backlog left at the end.
+Σ demand·dt = Σ (drain + drops)·dt + the backlog left at the end, and at a leaky bucket,
+whose overflow the file writes in `rejected_per_s` rather than `drops_per_s`,
+Σ demand·dt = Σ (drain + drops + rejected_per_s)·dt + the backlog left at the end.
 
 Neither kind of request is answered, so neither contributes latency: each step's response
 is weighted by the client's offered rate times the fraction its path **delivers** (a

@@ -318,7 +318,7 @@ TEST_CASE("parse_byte_rate reads network bit rates and converts them to bytes pe
                Catch::Matchers::WithinRel(1.25e7, 1e-12));
 }
 
-TEST_CASE("parse_byte_rate still reads 500MB/s as 5e8 bytes per second") {
+TEST_CASE("parse_byte_rate reads 500MB/s as 5e8 bytes per second") {
   // 500 x 1e6 = 5e8: the byte spelling is unchanged by the bit spelling.
   REQUIRE_THAT(simsys::parse_byte_rate("500MB/s").value().bytes_per_second,
                Catch::Matchers::WithinRel(5e8, 1e-12));

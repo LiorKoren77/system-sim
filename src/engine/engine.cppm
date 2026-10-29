@@ -3,7 +3,7 @@
 // pass composing response latency per (node, op). `estimate` repeats the same evaluation
 // in settle mode until it stops changing: the long-run state. The only randomness is the
 // clients' workload noise, and each client draws it from its own engine seeded from the
-// scenario's `seed` (behaviours::client_seed), so runs with the same seed are
+// scenario's `seed` (workload::client_seed), so runs with the same seed are
 // byte-identical by construction.
 //
 // Models: a whole System Design Interview (Alex Xu, vol. 1) diagram set in motion. The
@@ -54,6 +54,7 @@ import simsys.fluid;
 import simsys.graph;
 import simsys.model;
 import simsys.queueing; // lognormal_below: what a client's timeout leaves answered
+import simsys.workload; // client_seed: each client's noise seed
 
 export namespace simsys::engine {
 
@@ -553,28 +554,6 @@ namespace simsys::engine {
 
 namespace {
 
-// The "overloaded" visitor idiom: one object whose operator() is overloaded by every
-// lambda it is built from, so std::visit picks the lambda matching the alternative held.
-// C++17 pack expansion in a using-declaration (`using Fs::operator()...`) merges the
-// lambdas' call operators into one overload set. C++20 class template argument deduction
-// for aggregates deduces `Overloaded<L1, L2>` from the braces, so the deduction guide
-// C++17 needed (`Overloaded(Fs...) -> Overloaded<Fs...>`) is gone.
-template <class... Fs>
-struct Overloaded : Fs... {
-  using Fs::operator()...;
-};
-
-// The node types the engine can step today; the others arrive with their phase.
-[[nodiscard]] bool simulated(model::NodeType type) {
-  // C++20 `using enum`: the enumerators of NodeType in scope for this function only, so
-  // the test reads `client` instead of `model::NodeType::client`.
-  using enum model::NodeType;
-  return type == client || type == service || type == load_balancer || type == rate_limiter ||
-         type == cache || type == sql_db || type == cdn || type == id_generator ||
-         type == blob_store || type == message_queue || type == worker_pool ||
-         type == external_sink || type == kv_cluster || type == search_index;
-}
-
 // Why a cache cannot run, if it cannot: a scenario built in code left it without a number or `che`
 // for its hit ratio (the loader requires one: the same message). Everything else a cache can say
 // runs: a `che` hit ratio (Graph::build has already turned it into a number,
@@ -637,8 +616,10 @@ void add_once(std::vector<std::size_t>& links, std::size_t link) {
 // Capacity units one request of `op` uses at a node: its behaviour's cost(op). A client
 // has no queue to charge, so it never gets here; 1 keeps the visitor total.
 [[nodiscard]] double cost_of(const behaviours::Behaviour& behaviour, std::string_view op) {
-  return std::visit(Overloaded{[](const behaviours::ClientBehaviour&) { return 1.0; },
-                               [&](const auto& server) { return server.cost(op); }},
+  // core::Overloaded: the overloaded-visitor idiom; C++20 class template argument deduction for
+  // aggregates deduces its lambdas' types from the braces (see simsys.core).
+  return std::visit(core::Overloaded{[](const behaviours::ClientBehaviour&) { return 1.0; },
+                                     [&](const auto& server) { return server.cost(op); }},
                     behaviour);
 }
 
@@ -899,10 +880,11 @@ flow::Flow DelayLine::pop() {
 // `keys` size). So a type the engine has no model for is named before a node that only lacks a
 // number: google-drive is refused at its ws_gateway, long_poll, the first type it has no model of.
 // The message names the phase that plans a model for the type: phase 3 for each of the four left
-// (ws_gateway, service_discovery, notification_fanout, frontier).
+// (ws_gateway, service_discovery, notification_fanout, frontier), the types whose row in
+// model::node_type_table does not say `runs` (model::simulated).
 std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Graph& g) {
   for (const auto& node : g.nodes()) {
-    if (simulated(node.spec.type)) continue;
+    if (model::simulated(node.spec.type)) continue;
     // C++23 std::unexpected<E>: wraps an error so it converts to the error side of a
     // std::expected (a bare EngineError would be taken as a value, and fail to convert).
     // Replaces throwing or returning a sentinel; the caller must look at the result.
@@ -953,7 +935,7 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
   switch (resolved.spec.type) {
     case model::NodeType::client:
       return Node{.behaviour = behaviours::ClientBehaviour{
-                      g, index, behaviours::client_seed(g.scenario().seed, index)}};
+                      g, index, workload::client_seed(g.scenario().seed, index)}};
     case model::NodeType::load_balancer:
       return make_server(behaviours::LoadBalancerBehaviour{g, index}, resolved);
     // A rate limiter's queue is built like any server's from the resolved capacity: for the
@@ -1004,11 +986,23 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
     // with no steps and the type's numbers (5k/s, 5 ms) unless the scenario states its own. Serving
     // is read-mostly, so nothing else is modelled; its `build_interval` is stored and printed, and
     // the rebuild's load is ignored.
+    case model::NodeType::service:
     case model::NodeType::search_index:
     case model::NodeType::id_generator:
-    default:  // create() admitted only simulated types: the rest are services
       return make_server(behaviours::ServiceBehaviour{g, index}, resolved);
+    // The four types with no model yet (phase 3): create() refused every scenario that has one
+    // (model::simulated), so no Simulation is ever constructed over them.
+    case model::NodeType::ws_gateway:
+    case model::NodeType::service_discovery:
+    case model::NodeType::notification_fanout:
+    case model::NodeType::frontier:
+      break;
   }
+  // C++23 std::unreachable(): tells the compiler control never gets here, replacing the
+  // compiler-specific __builtin_unreachable(); reaching it is undefined behaviour. The switch
+  // above has no `default:`, so -Wswitch (an error under -Werror) names any enumerator a new
+  // node type adds without a case, where a default would have turned it silently into a service.
+  std::unreachable();
 }
 
 // The queues of a node that serves (spec §17 entry 5: what the balancer in front, if any, does to
@@ -1447,17 +1441,17 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
     };
     // A client's sample stays all zeros, green: a source has no queue.
     const behaviours::Routed routed =
-        std::visit(Overloaded{[&](behaviours::ClientBehaviour& client) {
-                                if (mode == Mode::advance) client.tick(now, dt);
-                                return client.offer(now);
-                              },
-                              // A generic lambda: every other alternative is a queueing node.
-                              // Overload resolution prefers the non-template ClientBehaviour&
-                              // lambda for a client, so this one sees only servers.
-                              [&](auto& server) {
-                                return server.route(serve(index, dt, mode, samples[index]), now, dt,
-                                                    delivered_last_step);
-                              }},
+        std::visit(core::Overloaded{[&](behaviours::ClientBehaviour& client) {
+                                      if (mode == Mode::advance) client.tick(now, dt);
+                                      return client.offer(now);
+                                    },
+                                    // A generic lambda: every other alternative is a queueing node.
+                                    // Overload resolution prefers the non-template ClientBehaviour&
+                                    // lambda for a client, so this one sees only servers.
+                                    [&](auto& server) {
+                                      return server.route(serve(index, dt, mode, samples[index]),
+                                                          now, dt, delivered_last_step);
+                                    }},
                    nodes_[index].behaviour);
     account_rejections(index, routed, samples[index]);
     send(index, routed, dt, mode, record.links);
@@ -1954,14 +1948,15 @@ void Simulation::backward_pass() {
       return hop_delivered(index, target, op);
     };
     // Only servers compose a response here; clients are read in client_responses().
-    std::visit(Overloaded{[](const behaviours::ClientBehaviour&) {},
-                          [&](const auto& server) {
-                            for (auto& [op, answer] : node.responses) {
-                              answer.latency = server.response(op, own_sojourn(node, op), lookup);
-                              answer.delivered =
-                                  server.delivered(op, own_passed(node, op), fraction);
-                            }
-                          }},
+    std::visit(core::Overloaded{[](const behaviours::ClientBehaviour&) {},
+                                [&](const auto& server) {
+                                  for (auto& [op, answer] : node.responses) {
+                                    answer.latency =
+                                        server.response(op, own_sojourn(node, op), lookup);
+                                    answer.delivered =
+                                        server.delivered(op, own_passed(node, op), fraction);
+                                  }
+                                }},
                node.behaviour);
   }
 }

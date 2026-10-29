@@ -116,6 +116,7 @@ struct TimeMoments {
 // cross-check of that quadrature (fed exponentials, it must reproduce these sums).
 // Preconditions (programmer errors: the loader and graph::Graph::build refuse such a quorum):
 // 1 <= k <= n, else std::invalid_argument. An infinite mean gives infinite moments.
+// test helper: no caller in src (tests/unit/test_queueing.cpp pins it and the quadrature with it).
 [[nodiscard]] TimeMoments exponential_order_statistic(int n, int k, double mean_s) {
   if (n < 1) throw std::invalid_argument{"exponential_order_statistic: n must be >= 1"};
   if (k < 1 || k > n) {

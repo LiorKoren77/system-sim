@@ -37,9 +37,11 @@ export namespace simsys::report {
 // replicas, utilization is per copy (see engine::NodeSample).
 struct NodeSummary {
   std::string id{};
-  double mean_rho{};      // time-averaged utilization (busy fraction)
-  double peak_rho{};      // highest utilization of any observed step
-  double peak_backlog{};  // most requests waiting at the end of any observed step
+  double mean_rho{};  // time-averaged utilization (busy fraction)
+  double peak_rho{};  // highest utilization of any observed step
+  // Most requests waiting at the end of any observed step. This and the two totals below are
+  // reported as 0 when they are float residue, under 1e-9 of the queue's capacity per second.
+  double peak_backlog{};
   // Requests shed because the waiting room was full, and an external sink's failed requests (its
   // `failure_rate` of what it served, spec §19 entry 8): failures.
   double total_dropped{};
@@ -380,8 +382,9 @@ class SeriesWriter {
 // For plotting what the clients see: one CSV row per (client, op) per step,
 // `t_s,client,op,offered_per_s,answered_per_s,timed_out_per_s,mean_ms` (spec §18 entry 13;
 // `timed_out_per_s` spec §19 entry 12). The header is written on construction; the column rules are
-// at OpSeriesWriter::observe in report.cpp. Pattern: Observer, like SeriesWriter: the CLI hands
-// each step record to both, and neither knows of the other. `out` and `g` must outlive the writer.
+// at OpSeriesWriter::observe in report.cpp. Pattern: Observer, like SeriesWriter:
+// session::run_summary hands each step record to both, and neither knows of the other. `out` and
+// `g` must outlive the writer.
 class OpSeriesWriter {
  public:
   OpSeriesWriter(std::ostream& out, const graph::Graph& g);

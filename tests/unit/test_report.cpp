@@ -21,6 +21,7 @@
 #include <unistd.h>  // getpid
 
 #include "../support/explain_lines.hpp"
+#include "../support/scenario_helpers.hpp"
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
@@ -48,6 +49,9 @@ using simsys::model::Workload;
 using simsys::report::Summary;
 using simsys::test_support::check_line;
 using simsys::test_support::node_line;
+// Shared with test_series / test_report (tests/support/scenario_helpers.hpp).
+using simsys::test_support::explain_of;
+using simsys::test_support::piped;
 
 namespace {
 // queue_limit is set only when given, so explain's provenance test sees "(default)".
@@ -931,12 +935,6 @@ Scenario cache_behind_cache(simsys::model::HitRatio l1_ratio) {
              LinkSpec{.from = "l2", .to = "db"}};
   return s;
 }
-std::string explain_of(const Scenario& s) {
-  const auto built = simsys::graph::Graph::build(s);
-  INFO((built ? "" : built.error().message));
-  REQUIRE(built.has_value());
-  return simsys::report::render_explain(*built);
-}
 }  // namespace
 
 // The provenance names the capacity the ring multiplied, and that its arcs are uneven, so a
@@ -1320,7 +1318,7 @@ TEST_CASE("explain's paper load sends the origin the cdn's miss share", "[report
 // A CDN sized in bytes (`capacity: 100GB/s`) builds and explains with its hit ratio and its miss
 // edge, as one sized in requests does; it counts megabytes (spec §19 entry 2), which the checks
 // below pin.
-TEST_CASE("explain still renders a cdn that has a byte capacity", "[report]") {
+TEST_CASE("explain renders a cdn that has a byte capacity", "[report]") {
   const auto built = simsys::graph::Graph::build(cdn_reported("cdn_us", simsys::ByteRate{100e9}));
   INFO((built ? "" : built.error().message));
   REQUIRE(built.has_value());
@@ -1743,19 +1741,8 @@ TEST_CASE("explain lists a blob store's write ops", "[report]") {
 //  - explain, checks block: `a->b  peak offered 100 MB/s vs 125 MB/s  (80%, yellow)`.
 
 namespace {
-// a(`rate`/s of `put`, 1 MB each) -> b (a service of 1M/s) over a link of the given bandwidth
-// (none: a plain link). 2 s at 100 ms steps, the first 500 ms warmup.
-Scenario piped(double rate, std::optional<simsys::ByteRate> bandwidth) {
-  Scenario s{.name = "piped", .version = 1, .duration = 2s, .warmup = 500ms};
-  s.nodes = {NodeSpec{.id = "a",
-                      .type = NodeType::client,
-                      .workload = Workload{.curve = {.base = Rate{rate}},
-                                           .op_shares = {{"put", 1.0}},
-                                           .sizes = {{"put", simsys::Bytes{1e6}}}}},
-             NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{1e6}, .latency = 1ms}};
-  s.links = {LinkSpec{.from = "a", .to = "b", .latency = 250us, .bandwidth = bandwidth}};
-  return s;
-}
+// The scenario: test_support::piped (tests/support/scenario_helpers.hpp), a(`rate`/s of 1 MB
+// `put`s) -> b (a service of 1M/s) over a link of the given bandwidth (none: a plain link).
 
 // The cells of the first line of `text` whose first cell is `first`, split at whitespace; empty
 // when no line starts with it. The table is aligned with spaces, so this reads a row back.
@@ -1793,6 +1780,41 @@ TEST_CASE("a scenario without a bandwidth has no link rows in its table", "[repo
   REQUIRE_FALSE(text.contains("a->b"));
   REQUIRE_FALSE(text.contains("->"));
   REQUIRE(text.contains("a.put"));  // the op table is unchanged
+}
+
+// Float residue is no backlog. A service that publishes to a queue whose pool hands every job back
+// to the service (u -> svc -> q -> pool -> svc, the asynchronous loop of gain 1) saturates svc; the
+// pool works at svc's pace and never holds a job past its step, yet the subtractions of its
+// conservation law leave a peak backlog of about 1.8e-13 jobs. Below 1e-9 of what the queue serves
+// in a second (the pool's 10k jobs/s) the table prints such a figure as 0, not "1.819e-13".
+TEST_CASE("a backlog that is only float residue prints as 0", "[report]") {
+  Scenario s{.name = "qcycle", .version = 1, .duration = 2min};
+  NodeSpec pool{.id = "pool", .type = NodeType::worker_pool};
+  pool.consumes = "q";
+  pool.workers = 10;
+  pool.job_cost = 1ms;
+  pool.then = {Step{.to = "svc", .op = "relay"}};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"post", 1.0}}}},
+      NodeSpec{.id = "svc",
+               .type = NodeType::service,
+               .capacity = Rate{10'000},
+               .ops = {{"post", {Step{.to = "q", .op = "publish"}}},
+                       {"relay", {Step{.to = "q", .op = "publish"}}}}},
+      NodeSpec{.id = "q", .type = NodeType::message_queue}, std::move(pool)};
+  s.links = {LinkSpec{.from = "u", .to = "svc", .dir = simsys::model::Direction::inout},
+             LinkSpec{.from = "svc", .to = "q", .dir = simsys::model::Direction::inout},
+             LinkSpec{.from = "q", .to = "pool"}, LinkSpec{.from = "pool", .to = "svc"}};
+  const auto g = simsys::graph::Graph::build(s);
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto text = simsys::report::render_table(summarize(s, *g), {}, /*color=*/false);
+  CAPTURE(text);
+  const auto row = row_starting_with(text, "pool");
+  REQUIRE(row.size() >= 4);
+  REQUIRE(row[3] == "0");  // peak_backlog
 }
 
 // A pipe above its capacity fills its 1000 MB room and drops: 1000 puts/s of 1 MB offer 1000 MB/s
