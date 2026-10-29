@@ -27,6 +27,7 @@ export module simsys.report;
 // re-parsing any text (the compiler reads the imported module's compiled interface).
 import simsys.core;
 import simsys.engine;
+import simsys.fluid; // Zone: a link's worst zone
 import simsys.graph;
 import simsys.model;
 
@@ -61,6 +62,23 @@ struct NodeSummary {
   // (engine::NodeSample::committed_writes_per_s), time-averaged the same way: what the missed
   // writes above are a share of. Empty for every node that is not a database.
   std::optional<double> mean_committed_writes_per_s{};
+};
+
+// One bandwidth link's pipe over the observed part of a run (plan 2c Task 5;
+// engine::LinkSample), in MEGABYTES (per second for the rates). `name` is the link as written,
+// `from->to` (graph::link_label), how every report names its row. The node table's columns
+// (`queue`: its id is the name, and a pipe never rejects nor goes unavailable) and, for JSON, the
+// time-averaged rates and backlog of the pipe, its mean latency (a request's wait plus its whole
+// serialisation, weighted by the megabytes offered in each step; by time when none were) and the
+// worst zone of any observed step.
+struct LinkSummary {
+  NodeSummary queue{};
+  double demand_per_s{};
+  double drain_per_s{};
+  double dropped_per_s{};
+  double backlog{};
+  double latency_s{};
+  fluid::Zone zone{fluid::Zone::green};
 };
 
 // One (client, op) over the observed part of a run. Percentiles are a lognormal fit to
@@ -108,6 +126,8 @@ class Summary {
 
   [[nodiscard]] std::vector<NodeSummary> nodes() const;  // indexed like Graph::nodes()
   [[nodiscard]] std::vector<OpSummary> ops() const;      // clients in node order, ops by name
+  // One per link with a bandwidth, in Graph::links() order (engine::StepRecord::links).
+  [[nodiscard]] std::vector<LinkSummary> links() const;
   // Zero means the window after warmup was empty: there is no data, which the SLO
   // verdicts and the renderers report as such (nothing is evaluated, nothing passes).
   [[nodiscard]] std::size_t observed_steps() const { return observed_steps_; }
@@ -116,9 +136,13 @@ class Summary {
   // 0 when nothing reached it. An unknown id is a programmer error (the loader checks SLO
   // nodes): throws std::invalid_argument.
   [[nodiscard]] double drop_rate(std::string_view node) const;
-  // The worst node's drop rate: every node must keep its own, so the worst one decides.
+  // The worst node's drop rate: every node must keep its own, so the worst one decides. A
+  // bandwidth link's pipe counts as a node here (plan 2c Task 5): a request its full room drops is
+  // lost as surely as one a node drops, so its drop rate (megabytes dropped over megabytes sent)
+  // can be the worst. An SLO's `node:` still names nodes only.
   [[nodiscard]] double drop_rate() const;
-  // The id of the node with the highest drop rate; empty when no node dropped anything.
+  // The id of the node with the highest drop rate (a link's `from->to` when its pipe is the worst;
+  // the first of equals, nodes before links); empty when nothing dropped anything.
   [[nodiscard]] std::string_view worst_drop_node() const;
   // The same three for REJECTIONS, a rate limiter's refusals by policy (Σ rejected / Σ
   // demand; a leaky bucket's overflow included): a limiter that sheds what its limit says
@@ -156,6 +180,17 @@ class Summary {
     [[nodiscard]] double drop_rate() const;
     [[nodiscard]] double reject_rate() const;
   };
+  // A bandwidth link's pipe: a node's totals (in MB), and what its JSON adds.
+  struct LinkTotals {
+    std::string name{};
+    NodeTotals queue{};
+    double drained{};       // Σ drain_per_s·dt
+    double backlog_time{};  // Σ backlog·dt
+    Moments by_demand{};    // latency weighted by the megabytes offered
+    Moments by_time{};      // ... and by time: the fallback when nothing was offered
+    fluid::Zone worst_zone{fluid::Zone::green};
+    void add(const engine::LinkSample& sample, double dt_s);
+  };
   // Every member has an initializer, even `{}`: GCC's -Wmissing-field-initializers flags
   // a designated initializer that omits one without.
   struct OpTotals {
@@ -174,6 +209,10 @@ class Summary {
   // The index of the node with the highest `rate` (drop or reject), the first of equals.
   [[nodiscard]] std::size_t worst_index(double (NodeTotals::*rate)() const) const;
   [[nodiscard]] double node_rate(std::string_view node, double (NodeTotals::*rate)() const) const;
+  // The node with the highest drop rate, the first of equals (0 without nodes), and the same for
+  // the links' pipes (null without a bandwidth link).
+  [[nodiscard]] double worst_node_drop_rate() const;
+  [[nodiscard]] const LinkTotals* worst_dropping_link() const;
 
   // A pointer, not a reference, so a Summary stays copy- and move-assignable.
   const graph::Graph* graph_;
@@ -183,6 +222,7 @@ class Summary {
   double observed_s_{};
   std::vector<NodeTotals> nodes_;
   std::vector<OpTotals> ops_;
+  std::vector<LinkTotals> links_;  // one per link with a bandwidth, in Graph::links() order
 };
 
 // C++20 std::span<const T>: a non-owning view of contiguous elements, so callers can pass
@@ -206,7 +246,8 @@ class Summary {
 [[nodiscard]] std::string render_explain(const graph::Graph& g);
 
 // For plotting: one CSV row per node per step,
-// `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`.
+// `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`,
+// then one per link with a bandwidth, its `from->to` in the node column, in megabytes.
 // The header is written on construction; the column rules are at SeriesWriter::observe in
 // report.cpp.
 // Pattern: Observer, like Summary. `out` and `g` must outlive the writer.
@@ -218,7 +259,8 @@ class SeriesWriter {
  private:
   std::ostream* out_;
   std::vector<std::string> ids_;
-  std::vector<bool> is_client_;  // indexed like ids_
+  std::vector<bool> is_client_;          // indexed like ids_
+  std::vector<std::string> link_names_;  // the bandwidth links', like engine::StepRecord::links
 };
 
 // For plotting what the clients see: one CSV row per (client, op) per step,

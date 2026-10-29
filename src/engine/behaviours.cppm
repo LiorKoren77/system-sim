@@ -81,7 +81,12 @@ struct Routed {
 // (std::enable_if) and "duck typing discovered in a 30-line template error"; a
 // constrained parameter that does not fit fails at the call with the concept's name.
 // Here: anything that answers "how long does node `n` take to respond to op `o`?" —
-// the engine passes a lambda over its latest per-node estimates; tests pass stubs.
+// the engine passes a lambda over its latest per-node estimates; tests pass stubs. The engine's
+// lookup is made for one caller and answers for the HOP to `n`: when the link between them is a
+// bandwidth pipe (plan 2c refinement 3), its wait and the request's serialisation come with `n`'s
+// response (engine::Simulation::hop_response), so every behaviour adds a pipe the way it adds the
+// node behind it, and knows nothing of pipes; it still adds the link's fixed legs itself
+// (round_trip).
 // (std::invocable and std::convertible_to are C++20 standard concepts from <concepts>;
 // convertible_to rather than same_as so a lookup returning `const LatencyEstimate&`
 // fits too.) Like every concept here it checks signatures, not behaviour: a lookup
@@ -92,7 +97,8 @@ concept ResponseLookup = std::invocable<F, std::size_t, std::string_view> &&
                                              flow::LatencyEstimate>;
 
 // The same shape for the other quantity the backward pass carries: "what fraction of the
-// requests of op `o` sent to node `n` come back answered?" (see `delivered` below).
+// requests of op `o` sent to node `n` come back answered?" (see `delivered` below). The engine's
+// lookup includes the share a pipe on the way did not drop (engine::Simulation::hop_delivered).
 template <class F>
 concept FractionLookup =
     std::invocable<F, std::size_t, std::string_view> &&
@@ -1026,10 +1032,22 @@ class SqlDbBehaviour {
 // Each object's time is deterministic by default (cs² = 0, defaults::default_service_variability:
 // a fixed size at a fixed rate), so the spread the queue sees is the size mix's.
 // A CDN takes no writes (graph::Graph::build refuses them), so all its answers are first
-// megabytes.
+// megabytes. A bandwidth link's pipe times its requests with this class too, every one at its
+// last byte (serialising).
 class MegabyteService {
  public:
   MegabyteService(const graph::Graph& g, std::size_t self);
+
+  // A bandwidth link's pipe (plan 2c refinement 3, engine::Simulation::pass_through_pipe): one
+  // megabyte takes `megabyte_s` (1 MB / bandwidth), a request of op o is `megabytes_by_op[o]` long
+  // and is timed at its LAST byte, MB_o × s_MB, both as the object time the pipe's queue waits for
+  // and as its answer: the receiver cannot act on a request before all of it has arrived. No floor
+  // of one megabyte (a store's unit of service; a link serialises bytes) and no per-object spread
+  // (cs² = 0: a fixed size at a fixed rate).
+  // Pattern: Static factory (named constructor) — the same timing, built from a link's numbers
+  // rather than a node's, under a name that says so.
+  [[nodiscard]] static MegabyteService serialising(
+      double megabyte_s, const std::map<std::string, double, std::less<>>& megabytes_by_op);
 
   // The moments of the object time over this step's arrivals `requests` (requests per second per
   // op), a mixture whose branch o is taken with probability p_o = rate_o / Σ rate and lasts
@@ -1062,6 +1080,7 @@ class MegabyteService {
     double object_s{};
     double answer_s{};
   };
+  MegabyteService() = default;  // only for serialising, which fills every member
   [[nodiscard]] Times times_of(std::string_view op) const;
   [[nodiscard]] flow::LatencyEstimate answered_after(const flow::LatencyEstimate& wait,
                                                      double answer_s) const;
@@ -1814,6 +1833,18 @@ MegabyteService::MegabyteService(const graph::Graph& g, std::size_t self)
         op, Times{.object_s = megabytes * megabyte_s_,
                   .answer_s = write ? std::max(megabytes, 1.0) * megabyte_s_ : megabyte_s_});
   }
+}
+
+MegabyteService MegabyteService::serialising(
+    double megabyte_s, const std::map<std::string, double, std::less<>>& megabytes_by_op) {
+  MegabyteService pipe;
+  pipe.megabyte_s_ = megabyte_s;
+  pipe.service_variability_ = 0.0;
+  for (const auto& [op, megabytes] : megabytes_by_op) {
+    const double last_byte_s = megabytes * megabyte_s;
+    pipe.times_by_op_.emplace(op, Times{.object_s = last_byte_s, .answer_s = last_byte_s});
+  }
+  return pipe;
 }
 
 // The sums are weighted by rate and divided by the total rate once at the end: Σ rate_o s_o / Σ

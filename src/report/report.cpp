@@ -413,14 +413,11 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
          "\n";
 }
 
-// Clients are sources with no queue: their queue columns show "-". The rho cells are
-// coloured by the node's own zone thresholds.
-[[nodiscard]] Row node_row(const NodeSummary& node, const graph::ResolvedNode& resolved,
-                           bool color) {
-  if (resolved.spec.type == model::NodeType::client)
-    return {{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}};
+// A queue's row (a node's, or a bandwidth link's pipe's), its rho cells coloured by the queue's
+// own zone thresholds.
+[[nodiscard]] Row queue_row(const NodeSummary& node, const fluid::Capacity& capacity, bool color) {
   const auto colour_of = [&](double rho) {
-    return color ? ansi_for(fluid::zone_of(rho, resolved.capacity)) : std::string_view{};
+    return color ? ansi_for(fluid::zone_of(rho, capacity)) : std::string_view{};
   };
   return {{node.id},
           {num(node.mean_rho), colour_of(node.mean_rho)},
@@ -430,6 +427,14 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
           {with_si_prefix(node.total_rejected)},
           {num(node.red_time_s)},
           {node.unavailable ? "unavailable" : ""}};
+}
+
+// Clients are sources with no queue: their queue columns show "-".
+[[nodiscard]] Row node_row(const NodeSummary& node, const graph::ResolvedNode& resolved,
+                           bool color) {
+  if (resolved.spec.type == model::NodeType::client)
+    return {{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}};
+  return queue_row(node, resolved.capacity, color);
 }
 
 [[nodiscard]] std::string node_table(const Summary& summary, bool color) {
@@ -445,6 +450,27 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
     rows.push_back(node_row(nodes[i], summary.graph().nodes()[i], color));
   }
   return "nodes\n" + aligned(rows);
+}
+
+// The bandwidth links' pipes (plan 2c Task 5), in the node table's columns but a table of their
+// own, since their numbers are megabytes: `a->b`, its utilization, the most megabytes it held and
+// the megabytes it dropped (a pipe refuses nothing, so `rejected` is 0). Nothing without a
+// bandwidth link.
+[[nodiscard]] std::string link_table(const Summary& summary, bool color) {
+  const auto links = summary.links();
+  if (links.empty()) return {};
+  std::vector<Row> rows{{{"link"},
+                         {"mean_rho"},
+                         {"peak_rho"},
+                         {"peak_backlog"},
+                         {"dropped"},
+                         {"rejected"},
+                         {"red_s"}}};
+  std::size_t next = 0;  // links() follows Graph::links(), pipes only
+  for (const auto& link : summary.graph().links()) {
+    if (link.pipe) rows.push_back(queue_row(links[next++].queue, *link.pipe, color));
+  }
+  return "links (bandwidth pipes, in megabytes: peak_backlog and dropped are MB)\n" + aligned(rows);
 }
 
 // A database's replication, which the node table has no columns for: the mean staleness, the
@@ -576,6 +602,23 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
       json_field("replication_dropped_per_s",
                  json_optional_number(n.mean_replication_dropped_per_s)),
       json_field("committed_writes_per_s", json_optional_number(n.mean_committed_writes_per_s))};
+  return json_object(fields);
+}
+
+// A bandwidth link's pipe (LinkSummary), in megabytes: its time-averaged rates and backlog, the
+// fields a step's engine::LinkSample has, then its peaks and red time as a node's.
+[[nodiscard]] std::string json_link(const LinkSummary& link) {
+  const std::array fields{json_field("name", json_string(link.queue.id)),
+                          json_field("demand_per_s", json_number(link.demand_per_s)),
+                          json_field("drain_per_s", json_number(link.drain_per_s)),
+                          json_field("dropped_per_s", json_number(link.dropped_per_s)),
+                          json_field("backlog", json_number(link.backlog)),
+                          json_field("rho", json_number(link.queue.mean_rho)),
+                          json_field("latency_s", json_number(link.latency_s)),
+                          json_field("zone", json_string(zone_name(link.zone))),
+                          json_field("peak_rho", json_number(link.queue.peak_rho)),
+                          json_field("peak_backlog", json_number(link.queue.peak_backlog)),
+                          json_field("red_s", json_number(link.queue.red_time_s))};
   return json_object(fields);
 }
 
@@ -1159,10 +1202,37 @@ struct QueueProvenance {
   return cross_dc ? "(cross_dc_rtt/2)" : "(intra_dc_rtt/2)";
 }
 
-[[nodiscard]] std::string link_details(const graph::Graph& g, const graph::ResolvedLink& link) {
+// The SI prefixes a network's bit rate is written with (core's byte-rate grammar reads the same).
+struct BitPrefix {
+  double size;
+  std::string_view name;
+};
+constexpr std::array bit_prefixes{BitPrefix{1e9, "G"}, BitPrefix{1e6, "M"}, BitPrefix{1e3, "k"}};
+
+// "1Gbit/s (125MB/s)": a bandwidth as a network is rated, in bits, then the bytes the pipe
+// counts. Derived from the bytes (the model keeps no record of how the scenario wrote it): the bit
+// form is printed only when bytes × 8 is a whole number of its largest prefix, k, M or G (125 MB/s
+// is 1 Gbit/s, 5 GB/s is 40 Gbit/s); otherwise ("187.5MB/s", 1.5 Gbit/s) the bytes alone, rather
+// than a bit rate with decimals nobody writes.
+[[nodiscard]] std::string fmt_bandwidth(ByteRate bandwidth) {
+  const std::string bytes = format_byte_rate(bandwidth);
+  const double bits = bandwidth.bytes_per_second * 8.0;
+  for (const auto& prefix : bit_prefixes) {
+    if (bits < prefix.size) continue;
+    const double count = bits / prefix.size;
+    if (count != std::round(count)) return bytes;
+    return to_text(count, std::chars_format::fixed, 0) + std::string{prefix.name} + "bit/s (" +
+           bytes + ")";
+  }
+  return bytes;
+}
+
+[[nodiscard]] std::string link_details(const graph::Graph& g, const graph::ResolvedLink& link,
+                                       const model::LinkSpec& spec) {
   std::vector<std::string> parts{
       "one_way=" + fmt_duration(link.one_way) + " " + link_latency_source(g, link),
       "delay_steps=" + std::to_string(link.delay_steps)};
+  if (spec.bandwidth) parts.push_back("bandwidth=" + fmt_bandwidth(*spec.bandwidth));
   if (!link.ops.empty()) parts.push_back("ops=" + join(link.ops, ","));
   if (link.weight != 1.0) parts.push_back("weight=" + num(link.weight));
   if (link.feedback) parts.emplace_back("[feedback]");
@@ -1173,11 +1243,13 @@ struct QueueProvenance {
   return g.nodes()[link.from].spec.id + " -> " + g.nodes()[link.to].spec.id;
 }
 
+// Graph::build resolves the scenario's links in order, one each, so link i is spec i.
 [[nodiscard]] std::string explain_links(const graph::Graph& g) {
   std::vector<Row> rows;
-  for (const auto& link : g.links()) {
-    rows.push_back(
-        {{link_name(g, link)}, {std::string{model::to_string(link.dir)}}, {link_details(g, link)}});
+  for (const auto [link, spec] : std::views::zip(g.links(), g.scenario().links)) {
+    rows.push_back({{link_name(g, link)},
+                    {std::string{model::to_string(link.dir)}},
+                    {link_details(g, link, spec)}});
   }
   return "links:\n" + aligned(rows, Align::all_left);
 }
@@ -1239,6 +1311,16 @@ constexpr SimTime peak_sample_step = 1_min;
 // when two clients peak at different times: an upper bound on the load at any one moment,
 // which is the safe side for a capacity check on paper. (`estimate` evaluates t = 0
 // instead; the two agree for a constant rate.)
+// What a client whose peak rate is `peak` sends on one of its routes: peak × op share × route
+// share; nothing for an op its workload does not list.
+[[nodiscard]] std::optional<double> peak_on_route(const model::Workload& workload, double peak,
+                                                  const graph::Route& route) {
+  const auto share =
+      std::ranges::find(workload.op_shares, route.op, &std::pair<std::string, double>::first);
+  if (share == workload.op_shares.end()) return std::nullopt;
+  return peak * share->second * route.share;
+}
+
 [[nodiscard]] std::vector<OpLoad> client_load(const graph::Graph& g) {
   std::vector<OpLoad> load(g.nodes().size());
   const auto duration = g.scenario().duration;
@@ -1247,10 +1329,9 @@ constexpr SimTime peak_sample_step = 1_min;
     if (!workload) continue;
     const double peak = peak_rate(workload->curve, duration);
     for (const auto& route : g.client_routes(client)) {
-      const auto share =
-          std::ranges::find(workload->op_shares, route.op, &std::pair<std::string, double>::first);
-      if (share == workload->op_shares.end()) continue;
-      load[route.target][route.op] += peak * share->second * route.share;
+      if (const auto rate = peak_on_route(*workload, peak, route)) {
+        load[route.target][route.op] += *rate;
+      }
     }
   }
   return load;
@@ -1867,6 +1948,82 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
          note;
 }
 
+// ---- a bandwidth link's pipe on paper ----
+
+// What a client sends over link `link` at its peak, per op in requests: its routes over it.
+[[nodiscard]] OpLoad client_link_load(const graph::Graph& g, std::size_t client, std::size_t link) {
+  OpLoad sent;
+  const auto& workload = g.nodes()[client].spec.workload;
+  if (!workload) return sent;
+  const double peak = peak_rate(workload->curve, g.scenario().duration);
+  for (const auto& route : g.client_routes(client)) {
+    if (route.link != link) continue;
+    if (const auto rate = peak_on_route(*workload, peak, route)) sent[route.op] += *rate;
+  }
+  return sent;
+}
+
+// What any other node sends over link `link` at the paper load, per op in requests: its arrivals
+// (`load.by_op`) forwarded once more, alone (forward_steps), and what lands at the link's
+// receiver, whether it travels this pass or, over a feedback link, the next. One link per pair and
+// direction, so everything the sender sends the receiver crosses this link.
+[[nodiscard]] OpLoad forwarded_link_load(const graph::Graph& g, const ForwardRoutes& table,
+                                         const PaperLoad& load, std::size_t link) {
+  const auto& resolved = g.links()[link];
+  const auto sender = graph::demand_sender(resolved);
+  const auto receiver = graph::demand_receiver(resolved);
+  std::vector<OpLoad> sent_now(g.nodes().size());
+  std::vector<OpLoad> sent_later(g.nodes().size());
+  sent_now[sender] = load.by_op[sender];
+  forward_steps(g, table, sender, sent_now, sent_later);
+  OpLoad sent = sent_later[receiver];
+  for (const auto& [op, rate] : sent_now[receiver]) sent[op] += rate;
+  if (receiver == sender) {  // a self-loop: what the sender held is no part of what it sent
+    for (const auto& [op, rate] : load.by_op[sender]) sent[op] -= rate;
+  }
+  return sent;
+}
+
+// The megabytes per second a link's requests carry: each op's rate × its size at the receiver
+// (Graph::request_bytes; Graph::build refused an unsized op on a bandwidth link).
+[[nodiscard]] double link_megabytes(const graph::Graph& g, std::size_t receiver,
+                                    const OpLoad& sent) {
+  double megabytes = 0.0;
+  for (const auto& [op, rate] : sent) {
+    const auto size = g.request_bytes(receiver, op);
+    if (size) megabytes += rate * defaults::byte_cost(*size);
+  }
+  return megabytes;
+}
+
+// A bandwidth link's check (plan 2c Task 5): the megabytes its sender puts on it at the paper load
+// against the pipe's bandwidth in MB/s, "peak offered 100 MB/s vs 125 MB/s  (80%, yellow)", with
+// the generic zones of a pipe (defaults::pipe_capacity). When the sender's own load is incomplete
+// (blocked_on_the_way, or the sender is a type the paper load does not follow) the percentage is a
+// lower bound, marked as a node's is (partial_check).
+[[nodiscard]] std::string link_check(const graph::Graph& g, const ForwardRoutes& table,
+                                     const PaperLoad& load, std::size_t link,
+                                     std::span<const model::NodeType> blocked_at_sender) {
+  const auto& resolved = g.links()[link];
+  const auto sender = graph::demand_sender(resolved);
+  const bool from_client = g.nodes()[sender].spec.type == model::NodeType::client;
+  const auto sent =
+      from_client ? client_link_load(g, sender, link) : forwarded_link_load(g, table, load, link);
+  const double offered = link_megabytes(g, graph::demand_receiver(resolved), sent);
+  const double capacity = resolved.pipe->service_rate.per_second;
+  const double rho = offered / capacity;
+  const std::string zone{zone_name(fluid::zone_of(rho, *resolved.pipe))};
+  const std::string head = "peak offered " + with_si_prefix(offered) + " MB/s vs " +
+                           with_si_prefix(capacity) + " MB/s  ";
+  std::vector<model::NodeType> blocked{blocked_at_sender.begin(), blocked_at_sender.end()};
+  if (unfollowed_until(g.nodes()[sender].spec.type)) {
+    add_missing(blocked, std::array{g.nodes()[sender].spec.type});
+  }
+  if (blocked.empty()) return head + "(" + percent(rho) + ", " + zone + ")";
+  const std::string red = zone == "red" ? ", red" : "";
+  return head + "(≥" + percent(rho) + red + "; " + unpropagated_mark(blocked);
+}
+
 [[nodiscard]] std::string explain_checks(const graph::Graph& g) {
   const auto load = paper_load(g);
   const auto upper_bound = counts_unknown_hit_ratio(g);
@@ -1876,6 +2033,13 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
     const auto& node = g.nodes()[i];
     if (node.spec.type == model::NodeType::client) continue;  // a source: see its offered=
     rows.push_back({{node.spec.id}, {check_line(g, i, load, upper_bound, blocked[i])}});
+  }
+  const auto table = forward_routes(g);
+  for (std::size_t link = 0; link < g.links().size(); ++link) {
+    const auto& resolved = g.links()[link];
+    if (!resolved.pipe) continue;
+    rows.push_back({{graph::link_label(g.nodes(), resolved)},
+                    {link_check(g, table, load, link, blocked[graph::demand_sender(resolved)])}});
   }
   const std::string note = load.converged ? "" : "  (no steady state: a loop of gain >= 1)\n";
   const std::string header = "checks (peak offered load over the first " +
@@ -1897,6 +2061,23 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
                           num(n.rejected_per_s, 6),
                           num(n.latency.mean_s * 1000.0, 6),
                           std::string{zone_name(n.zone)}};
+  return join(fields, ",") + "\n";
+}
+
+// A bandwidth link's pipe, in the same ten columns as a node's, in megabytes; `rejected_per_s` is
+// 0 (a pipe refuses nothing by policy).
+[[nodiscard]] std::string csv_link_row(const std::string& t_s, const std::string& name,
+                                       const engine::LinkSample& l) {
+  const std::array fields{t_s,
+                          name,
+                          num(l.demand_per_s, 6),
+                          num(l.drain_per_s, 6),
+                          num(l.rho, 6),
+                          num(l.backlog, 6),
+                          num(l.dropped_per_s, 6),
+                          std::string{"0"},
+                          num(l.latency.mean_s * 1000.0, 6),
+                          std::string{zone_name(l.zone)}};
   return join(fields, ",") + "\n";
 }
 
@@ -1973,8 +2154,30 @@ void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
   by_time.add(dt_s, response.mean_s, response.variance_s2);
 }
 
+// A bandwidth link's pipe is a queue like a node's (engine::LinkSample has NodeSample's fields of
+// the same names, in megabytes), so its node-table columns accumulate exactly as a node's do
+// (NodeTotals::add); a pipe never rejects. What only the link's JSON shows comes beside them.
+void Summary::LinkTotals::add(const engine::LinkSample& sample, double dt_s) {
+  queue.add(engine::NodeSample{.demand_per_s = sample.demand_per_s,
+                               .drain_per_s = sample.drain_per_s,
+                               .dropped_per_s = sample.dropped_per_s,
+                               .backlog = sample.backlog,
+                               .rho = sample.rho,
+                               .latency = sample.latency,
+                               .zone = sample.zone},
+            dt_s);
+  drained += sample.drain_per_s * dt_s;
+  backlog_time += sample.backlog * dt_s;
+  by_demand.add(sample.demand_per_s * dt_s, sample.latency.mean_s, sample.latency.variance_s2);
+  by_time.add(dt_s, sample.latency.mean_s, sample.latency.variance_s2);
+  worst_zone = std::max(worst_zone, sample.zone);  // green < yellow < red, as declared
+}
+
 Summary::Summary(const graph::Graph& g, SimTime warmup)
     : graph_{&g}, warmup_{warmup}, nodes_(g.nodes().size()) {
+  for (const auto& link : g.links()) {
+    if (link.pipe) links_.push_back(LinkTotals{.name = graph::link_label(g.nodes(), link)});
+  }
   // One entry per (client, op), in the engine's order: clients by node index, ops by name.
   for (std::size_t client = 0; client < g.nodes().size(); ++client) {
     const auto& workload = g.nodes()[client].spec.workload;
@@ -2013,6 +2216,7 @@ void Summary::observe(const engine::StepRecord& record) {
   ++observed_steps_;
   observed_s_ += dt_s;
   for (auto [totals, sample] : std::views::zip(nodes_, record.nodes)) totals.add(sample, dt_s);
+  for (auto [totals, sample] : std::views::zip(links_, record.links)) totals.add(sample, dt_s);
   for (std::size_t k = 0; k < record.responses.size(); ++k) {
     const auto& sample = record.responses[k];
     totals_for(sample, k).add(sample, dt_s);
@@ -2037,6 +2241,30 @@ std::vector<NodeSummary> Summary::nodes() const {
       out.back().mean_replication_dropped_per_s = t.replication_dropped / t.replication_seen_s;
       out.back().mean_committed_writes_per_s = t.committed_writes / t.replication_seen_s;
     }
+  }
+  return out;
+}
+
+std::vector<LinkSummary> Summary::links() const {
+  std::vector<LinkSummary> out;
+  const auto per_s = [&](double total) { return observed_s_ > 0.0 ? total / observed_s_ : 0.0; };
+  for (const auto& t : links_) {
+    const Moments& latency = t.by_demand.weight > 0.0 ? t.by_demand : t.by_time;
+    out.push_back(LinkSummary{
+        .queue = NodeSummary{.id = t.name,
+                             .mean_rho = per_s(t.queue.rho_time),
+                             .peak_rho = t.queue.peak_rho,
+                             .peak_backlog = t.queue.peak_backlog,
+                             .total_dropped = t.queue.dropped,
+                             .total_rejected = 0.0,
+                             .red_time_s = t.queue.red_time_s,
+                             .unavailable = t.queue.unavailable},
+        .demand_per_s = per_s(t.queue.demand),
+        .drain_per_s = per_s(t.drained),
+        .dropped_per_s = per_s(t.queue.dropped),
+        .backlog = per_s(t.backlog_time),
+        .latency_s = latency.weight > 0.0 ? latency.weighted_mean / latency.weight : 0.0,
+        .zone = t.worst_zone});
   }
   return out;
 }
@@ -2102,12 +2330,29 @@ double Summary::drop_rate(std::string_view node) const {
   return node_rate(node, &NodeTotals::drop_rate);
 }
 
-double Summary::drop_rate() const {
+double Summary::worst_node_drop_rate() const {
   return nodes_.empty() ? 0.0 : nodes_[worst_index(&NodeTotals::drop_rate)].drop_rate();
 }
 
+// The first of equal maxima, as worst_index.
+const Summary::LinkTotals* Summary::worst_dropping_link() const {
+  const auto worst = std::ranges::max_element(
+      links_, std::less<>{}, [](const LinkTotals& link) { return link.queue.drop_rate(); });
+  return worst == links_.end() ? nullptr : &*worst;
+}
+
+// The worst node's, or the worst pipe's when it is higher.
+double Summary::drop_rate() const {
+  const auto* link = worst_dropping_link();
+  const double node = worst_node_drop_rate();
+  return link != nullptr ? std::max(node, link->queue.drop_rate()) : node;
+}
+
+// A tie between a node and a pipe names the node.
 std::string_view Summary::worst_drop_node() const {
   if (drop_rate() <= 0.0) return {};
+  const auto* link = worst_dropping_link();
+  if (link != nullptr && link->queue.drop_rate() > worst_node_drop_rate()) return link->name;
   return graph_->nodes()[worst_index(&NodeTotals::drop_rate)].spec.id;
 }
 
@@ -2148,14 +2393,15 @@ bool all_pass(std::span<const SloResult> results) {
 // With no observed step there are no node or op figures to show, only the skipped SLOs.
 std::string render_table(const Summary& summary, std::span<const SloResult> slos, bool color) {
   if (summary.observed_steps() == 0) return table_header(summary) + slo_table(slos, color);
-  return table_header(summary) + node_table(summary, color) + replication_table(summary) +
-         op_table(summary) + slo_table(slos, color);
+  return table_header(summary) + node_table(summary, color) + link_table(summary, color) +
+         replication_table(summary) + op_table(summary) + slo_table(slos, color);
 }
 
 // With no observed step the drop and reject rates are null: there is no data, not a rate of 0.
 std::string render_json(const Summary& summary, std::span<const SloResult> slos) {
   const auto nodes = summary.nodes();
   const auto ops = summary.ops();
+  const auto links = summary.links();
   const bool observed = summary.observed_steps() > 0;
   const auto worst = summary.worst_drop_node();
   const auto worst_rejecting = summary.worst_reject_node();
@@ -2168,6 +2414,7 @@ std::string render_json(const Summary& summary, std::span<const SloResult> slos)
       "  " + json_field("worst_reject_node",
                         worst_rejecting.empty() ? "null" : json_string(worst_rejecting)),
       json_array("nodes", map_to_strings(std::span<const NodeSummary>{nodes}, json_node)),
+      json_array("links", map_to_strings(std::span<const LinkSummary>{links}, json_link)),
       json_array("ops", map_to_strings(std::span<const OpSummary>{ops}, json_op)),
       json_array("slo", map_to_strings(slos, json_slo))};
   return "{\n" + join(lines, ",\n") + "\n}";
@@ -2188,6 +2435,9 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
   for (const auto& node : g.nodes()) {
     ids_.push_back(node.spec.id);
     is_client_.push_back(node.spec.type == model::NodeType::client);
+  }
+  for (const auto& link : g.links()) {
+    if (link.pipe) link_names_.push_back(graph::link_label(g.nodes(), link));
   }
   *out_ << "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,"
            "latency_ms,zone\n";
@@ -2211,12 +2461,18 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
 //   zone, so a plot can filter clients out by zone;
 // - an infinite latency is written as `inf` (which spreadsheet and plotting tools parse),
 //   unlike the table ("unavailable") and JSON (null), read by people or by parsers
-//   without an infinity.
+//   without an infinity;
+// - after the nodes, a row per link with a bandwidth (plan 2c Task 5), `from->to` in the node
+//   column, in MEGABYTES (engine::LinkSample): the pipe is a queue, so the same identity holds on
+//   its rows, `rejected_per_s` is 0 and `latency_ms` is a request's wait plus its serialisation.
 void SeriesWriter::observe(const engine::StepRecord& record) {
   const auto t_s = shortest(seconds(record.t));
   for (std::size_t i = 0; i < ids_.size() && i < record.nodes.size(); ++i) {
     *out_ << (is_client_[i] ? csv_client_row(t_s, ids_[i])
                             : csv_server_row(t_s, ids_[i], record.nodes[i]));
+  }
+  for (std::size_t i = 0; i < link_names_.size() && i < record.links.size(); ++i) {
+    *out_ << csv_link_row(t_s, link_names_[i], record.links[i]);
   }
 }
 
