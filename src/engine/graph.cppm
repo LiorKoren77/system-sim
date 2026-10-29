@@ -73,6 +73,7 @@ module;
 #include <compare>
 #include <cstddef>
 #include <expected>
+#include <functional>
 #include <initializer_list>
 #include <map>
 #include <optional>
@@ -368,6 +369,8 @@ struct ResolvedLink {
 // from the receiver's side (`dir: in`): `{from: a, to: b, dir: in}` is named `a->b` although its
 // demand, and so its pipe's megabytes, travel from b to a, so a reader finds the row under the
 // link as the file writes it.
+// C++20 std::span<const T>: a non-owning view of contiguous elements (pointer + size), replacing a
+// `const std::vector<T>&` parameter, which would leak the container choice into the API.
 [[nodiscard]] std::string link_label(std::span<const ResolvedNode> nodes, const ResolvedLink& link,
                                      std::string_view quote = "");
 
@@ -420,9 +423,8 @@ class Graph {
   [[nodiscard]] static std::expected<Graph, EngineError> build(model::Scenario scenario);
 
   [[nodiscard]] const model::Scenario& scenario() const { return scenario_; }
-  // C++20 std::span<const T>: a non-owning view of contiguous elements (pointer + size).
-  // Replaces returning `const std::vector<T>&`, which leaks the container choice into
-  // the API; callers can iterate and index but neither resize nor modify.
+  // Spans, not `const std::vector<T>&`: callers can iterate and index but neither resize nor
+  // modify, and the container choice stays inside Graph.
   [[nodiscard]] std::span<const ResolvedNode> nodes() const { return nodes_; }
   [[nodiscard]] std::span<const ResolvedLink> links() const { return links_; }
   [[nodiscard]] std::span<const DemandEdge> edges() const { return edges_; }
@@ -536,6 +538,12 @@ class Graph {
   Result route_client_op(std::size_t client, const std::string& op);
   Result route_forwarder(std::size_t node);
   void collect_arriving_ops();
+  // collect_arriving_ops' two halves; `arrive(target, op)` records that `op` reaches `target`.
+  // A std::function, not a template parameter: a member template of an exported class may not
+  // reach the helpers of this file's anonymous namespace (internal linkage) that these call.
+  using Arrive = std::function<void(std::size_t, const std::string&)>;
+  void seed_arrivals(std::size_t node, const Arrive& arrive) const;
+  void pass_on(std::size_t node, const std::string& op, const Arrive& arrive) const;
   Result resolve_request_sizes();
   Result check_sized_arrivals(std::size_t node) const;
   [[nodiscard]] bool carries_flow(std::size_t node, const model::Step& step,
@@ -1218,6 +1226,59 @@ void apply_kv_ring(ResolvedNode& node) {
   return std::nullopt;
 }
 
+// What the graph refuses in a node on its own, before any link is resolved: one check per type
+// that has one (a client's keys, a limiter's algorithm against the step, a cache's, a CDN's, a
+// database's, ... settings); nothing for the other types or a node that passes.
+[[nodiscard]] std::optional<EngineError> invalid_node(const model::NodeSpec& spec, SimTime step) {
+  using enum model::NodeType;  // `using enum` (see replica_model_of): the types by their names
+  switch (spec.type) {
+    case client:
+      return invalid_client_keys(spec);
+    case rate_limiter:
+      return invalid_limiter(spec, step);
+    case cache:
+      return invalid_cache(spec);
+    case cdn:
+      return invalid_cdn(spec);
+    case sql_db:
+      return invalid_database(spec);
+    case id_generator:
+      return invalid_id_generator(spec);
+    case blob_store:
+      return invalid_blob_store(spec);
+    case worker_pool:
+      return invalid_worker_pool(spec);
+    case message_queue:
+      return invalid_message_queue(spec);
+    case kv_cluster:
+      return invalid_kv_cluster(spec);
+    default:  // a type with no check of its own
+      return std::nullopt;
+  }
+}
+
+// A node that serves, resolved: its capacity from the scenario or the type's defaults, where each
+// number came from, a leaky bucket's queue made of its bucket (leaky_bucket_capacity, its rate the
+// scenario's `limit`), a database's connection pool and a kv cluster's ring applied. An id
+// generator needs nothing more: its algorithm's numbers are type defaults (defaults::defaults_of).
+[[nodiscard]] ResolvedNode resolved_server(const model::NodeSpec& spec) {
+  ResolvedNode node{
+      .spec = spec,
+      .capacity = defaults::resolve_capacity(spec),
+      .service_rate_source = defaults::resolve_service_rate(spec).source,
+      .service_time_source = defaults::resolve_service_time(spec).source,
+  };
+  if (is_leaky_bucket(spec)) {
+    node.capacity = leaky_bucket_capacity(spec, node.capacity);
+    // Both follow from the scenario's `limit`.
+    node.service_rate_source = defaults::Source::scenario;
+    node.service_time_source = defaults::Source::scenario;
+  }
+  if (spec.type == model::NodeType::sql_db) apply_database_keys(node);
+  if (spec.type == model::NodeType::kv_cluster) apply_kv_ring(node);
+  return node;
+}
+
 }  // namespace
 
 bool is_write(const model::NodeSpec& spec, std::string_view op) {
@@ -1570,10 +1631,10 @@ struct CallHop {
   std::optional<Bytes> size{};
 };
 
-// A service's (or any node's) `ops` steps for `op`: every step but `on: failure` (nothing fails
-// before phase 2c). An `on: miss` step carries the misses of its lookup, the nearest
-// unconditional step before it (as Graph::resolve_service_hops pairs them; a miss step after
-// something that is no cache is refused there, and inherits here).
+// A service's (or any node's) `ops` steps for `op`: every step but `on: failure` (only an external
+// sink fails, and nothing reacts to a failure before phase 3). An `on: miss` step carries the
+// misses of its lookup, the nearest unconditional step before it (as Graph::resolve_service_hops
+// pairs them; a miss step after something that is no cache is refused there, and inherits here).
 void add_op_step_hops(const Graph& g, const model::NodeSpec& spec, std::string_view op,
                       std::vector<CallHop>& hops) {
   const auto steps = spec.ops.find(std::string{op});
@@ -1893,6 +1954,9 @@ void add_sized_step_seed(const Graph& g, std::size_t node, const model::Step& st
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
     const auto& spec = g.nodes()[node].spec;
     if (spec.type == model::NodeType::client) add_client_seeds(g, node, seeds);
+    // C++20 `views::values`: a lazy view of each map entry's value (here a node's vector of steps
+    // per op), the twin of `views::keys`; replaces `for (const auto& [op, steps] : ...)` with an
+    // unused name.
     for (const auto& steps : spec.ops | std::views::values) {
       for (const model::Step& step : steps) add_sized_step_seed(g, node, step, seeds);
     }
@@ -1976,6 +2040,8 @@ struct SizeWalk {
 [[nodiscard]] std::string pool_renaming_hint(const Graph& g, std::string_view op,
                                              std::size_t from) {
   if (g.nodes()[from].spec.type != model::NodeType::worker_pool) return {};
+  // C++20 std::ranges::binary_search: the range itself instead of a begin/end pair; a yes/no
+  // lookup in O(log n) on a sorted range (arriving_ops is sorted by name).
   if (!std::ranges::binary_search(g.arriving_ops(from), op)) return {};
   return " (a worker pool's then step keeps the size of the jobs that arrive as '" +
          std::string{op} + "' only: it renames every other job, and a renamed job has no size)";
@@ -2048,6 +2114,10 @@ struct SizeWalk {
 // inherit a size that only some of the requests have.
 [[nodiscard]] std::expected<std::optional<Bytes>, EngineError> resolved_size(
     const Graph& g, std::size_t node, std::span<const SizeArrival> arrivals) {
+  // C++23 std::unexpected<E>: wraps an error so it converts to the error side of any
+  // std::expected<T, E>, replacing a thrown exception or a (bool, out-parameter) pair; a plain
+  // `return value;` is the value side. Every fallible step of the build returns its error this
+  // way (see Graph::build).
   if (auto conflict = two_sizes(g.nodes(), node, arrivals)) return std::unexpected{*conflict};
   if (auto zero = zero_bytes(g.nodes(), node, arrivals)) return std::unexpected{*zero};
   if (auto unsized = unsized_bytes(g, node, arrivals)) return std::unexpected{*unsized};
@@ -2182,15 +2252,11 @@ struct KeySource {
 
 // The clients' one key distribution (plan 2b refinement 1): every client whose ops reach the
 // cache must state its keys, and all must agree (KeySpec's defaulted ==, on the canonical form:
-// zipf 0 is uniform). Phase 2c may mix several distributions by their rates.
+// zipf 0 is uniform). Mixing several distributions by their rates is in the Phase 3 backlog.
 [[nodiscard]] std::expected<KeySource, EngineError> agreed_keys(
     std::span<const ResolvedNode> nodes, const std::string& name,
     std::span<const KeyArrival> arrivals) {
   if (arrivals.empty()) {
-    // C++23 std::unexpected<E>: wraps an error so it converts to the error side of any
-    // std::expected<T, E> (here the KeySource one), replacing a thrown exception or a
-    // (bool, out-parameter) pair; `return KeySource{...}` is the value side. Every fallible step
-    // of the build returns its error this way (see Graph::build).
     return std::unexpected{EngineError{name + ": no client's demand reaches it"}};
   }
   std::optional<KeySource> source;
@@ -2535,60 +2601,16 @@ std::optional<std::size_t> Graph::demand_link(std::size_t from, std::size_t to) 
 // A rate limiter is checked first (it needs a limit), and a leaky bucket's queue is the
 // bucket itself (leaky_bucket_capacity), its rate the scenario's `limit`.
 Graph::Result Graph::resolve_nodes() {
-  // First: the limiter checks below divide by the step.
+  // First: the limiter checks divide by the step.
   if (scenario_.step.count() <= 0) return std::unexpected{EngineError{"step must be positive"}};
   nodes_.reserve(scenario_.nodes.size());
   for (const auto& spec : scenario_.nodes) {
-    if (spec.type == model::NodeType::client) {
-      if (auto invalid = invalid_client_keys(spec)) return std::unexpected{std::move(*invalid)};
-      nodes_.push_back(ResolvedNode{.spec = spec});  // the other members at their defaults
-      continue;
+    if (auto invalid = invalid_node(spec, scenario_.step)) {
+      return std::unexpected{std::move(*invalid)};
     }
-    if (spec.type == model::NodeType::rate_limiter) {
-      if (auto invalid = invalid_limiter(spec, scenario_.step))
-        return std::unexpected{std::move(*invalid)};
-    }
-    if (is_cache(spec)) {
-      if (auto invalid = invalid_cache(spec)) return std::unexpected{std::move(*invalid)};
-    }
-    if (spec.type == model::NodeType::cdn) {
-      if (auto invalid = invalid_cdn(spec)) return std::unexpected{std::move(*invalid)};
-    }
-    if (spec.type == model::NodeType::sql_db) {
-      if (auto invalid = invalid_database(spec)) return std::unexpected{std::move(*invalid)};
-    }
-    if (spec.type == model::NodeType::id_generator) {
-      if (auto invalid = invalid_id_generator(spec)) return std::unexpected{std::move(*invalid)};
-    }
-    if (spec.type == model::NodeType::blob_store) {
-      if (auto invalid = invalid_blob_store(spec)) return std::unexpected{std::move(*invalid)};
-    }
-    if (spec.type == model::NodeType::worker_pool) {
-      if (auto invalid = invalid_worker_pool(spec)) return std::unexpected{std::move(*invalid)};
-    }
-    if (spec.type == model::NodeType::message_queue) {
-      if (auto invalid = invalid_message_queue(spec)) return std::unexpected{std::move(*invalid)};
-    }
-    if (spec.type == model::NodeType::kv_cluster) {
-      if (auto invalid = invalid_kv_cluster(spec)) return std::unexpected{std::move(*invalid)};
-    }
-    // An id generator needs nothing more here: its algorithm's numbers are type defaults
-    // (defaults::defaults_of), resolved below like any node's.
-    ResolvedNode node{
-        .spec = spec,
-        .capacity = defaults::resolve_capacity(spec),
-        .service_rate_source = defaults::resolve_service_rate(spec).source,
-        .service_time_source = defaults::resolve_service_time(spec).source,
-    };
-    if (is_leaky_bucket(spec)) {
-      node.capacity = leaky_bucket_capacity(spec, node.capacity);
-      // Both follow from the scenario's `limit`.
-      node.service_rate_source = defaults::Source::scenario;
-      node.service_time_source = defaults::Source::scenario;
-    }
-    if (spec.type == model::NodeType::sql_db) apply_database_keys(node);
-    if (spec.type == model::NodeType::kv_cluster) apply_kv_ring(node);
-    nodes_.push_back(std::move(node));
+    // A client gets no capacity: the other members stay at their defaults.
+    nodes_.push_back(spec.type == model::NodeType::client ? ResolvedNode{.spec = spec}
+                                                          : resolved_server(spec));
   }
   routes_.resize(nodes_.size());
   arriving_ops_.resize(nodes_.size());
@@ -2647,9 +2669,9 @@ Graph::Result Graph::connect_steps() {
   for (std::size_t from = 0; from < nodes_.size(); ++from) {
     const auto& spec = nodes_[from].spec;
     if (auto split = nonadjacent_parallel_steps(spec)) return std::unexpected{std::move(*split)};
-    // `views::values` (like `views::keys` in detail::add_hop_steps, but each entry's vector of
-    // steps), then C++20 `views::join`, which flattens those vectors into one lazy sequence of
-    // steps. Replaces two nested loops over the map and each vector; nothing is copied.
+    // `views::values` (see size_seeds), then C++20 `views::join`, which flattens those vectors into
+    // one lazy sequence of steps. Replaces two nested loops over the map and each vector; nothing
+    // is copied.
     for (const model::Step& step : spec.ops | std::views::values | std::views::join) {
       if (auto connected = connect_step(from, step); !connected) return connected;
     }
@@ -2678,9 +2700,9 @@ double Graph::miss_fraction(std::size_t cache) const {
 }
 
 // The share of requests that take `step` (ServiceHop's `fraction`): every request for an
-// unconditional step, none for an `on: failure` step (nothing fails before phase 2c's external
-// sinks), the miss fraction of `looked_up`, the cache the step's lookup asked, for an `on:
-// miss` step (invalid_miss_step has made sure there is one).
+// unconditional step, none for an `on: failure` step (external sinks fail, but no step reacts to
+// a failure before phase 3), the miss fraction of `looked_up`, the cache the step's lookup asked,
+// for an `on: miss` step (invalid_miss_step has made sure there is one).
 double Graph::hop_fraction(const model::Step& step, std::optional<std::size_t> looked_up) const {
   // `using enum` (see replica_model_of): the conditions by their short names.
   using enum model::StepCondition;
@@ -3422,58 +3444,66 @@ void Graph::collect_arriving_ops() {
     if (arriving[node].try_emplace(op, sender).second) work.emplace_back(node, op);
   };
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
-    const auto& spec = nodes_[node].spec;
-    const auto arrive = [&](std::size_t target, const std::string& op) {
-      arrive_from(node, target, op);
-    };
-    if (spec.type == model::NodeType::client) {
-      for (const auto& route : routes_[node]) {
-        if (route.share > 0.0) arrive(route.target, route.op);
-      }
-    }
-    for (const auto& hops : service_hops_[node] | std::views::values) {
-      for (const ServiceHop& hop : hops) {
-        if (hop.fraction > 0.0) arrive(hop.target, hop.op);
-      }
-    }
-    // A cache's then steps depend on the op (a miss step carries no write), and so do a blob
-    // store's (an event fires for a write only): they follow each op that arrives, below. (A CDN
-    // has none.) Every other node's unconditional ones fire whatever it receives (a worker pool's
-    // too: they fire for every job it drains, whichever op its queue brought).
-    if (!then_steps_follow_the_op(spec.type)) {
-      for (const model::Step& step : spec.then) {
-        if (step.on == model::StepCondition::always) arrive(*index_of(step.to), step.op);
-      }
-    }
-    if (spec.type == model::NodeType::rate_limiter && nodes_[node].backend) {
-      arrive(*nodes_[node].backend, std::string{counter_op});
-    }
+    seed_arrivals(
+        node, [&](std::size_t target, const std::string& op) { arrive_from(node, target, op); });
   }
   while (!work.empty()) {
     const auto [node, op] = std::move(work.back());
     work.pop_back();
-    const auto arrive = [&](std::size_t target, const std::string& sent) {
-      arrive_from(node, target, sent);
-    };
-    if (then_steps_follow_the_op(nodes_[node].spec.type)) {
-      for (const model::Step& step : nodes_[node].spec.then) {
-        if (carries_flow(node, step, op)) arrive(*index_of(step.to), step.op);
-      }
-    }
-    if (hits_or_misses(nodes_[node].spec.type)) {
-      if (backend_fraction(node, op) > 0.0) arrive(*nodes_[node].backend, op);
-      continue;
-    }
-    const auto type = nodes_[node].spec.type;
-    if (!forwards_by_link(type) && !copies_to_consumers(type)) continue;
-    for (const auto& route : routes_[node]) {
-      if (route.share > 0.0 && carries_op(links_[route.link], op)) arrive(route.target, op);
-    }
+    pass_on(node, op,
+            [&](std::size_t target, const std::string& sent) { arrive_from(node, target, sent); });
   }
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
     const auto ops = arriving[node] | std::views::keys;  // sorted: a map
     arriving_ops_[node].assign(ops.begin(), ops.end());
     first_sender_[node] = std::move(arriving[node]);
+  }
+}
+
+// What `node` sends whatever reaches it: a client's routes that carry flow, its hops of positive
+// fraction, its unconditional `then` steps unless they follow the op, a limiter's `counter`.
+void Graph::seed_arrivals(std::size_t node, const Arrive& arrive) const {
+  const auto& spec = nodes_[node].spec;
+  if (spec.type == model::NodeType::client) {
+    for (const auto& route : routes_[node]) {
+      if (route.share > 0.0) arrive(route.target, route.op);
+    }
+  }
+  for (const auto& hops : service_hops_[node] | std::views::values) {
+    for (const ServiceHop& hop : hops) {
+      if (hop.fraction > 0.0) arrive(hop.target, hop.op);
+    }
+  }
+  // A cache's then steps depend on the op (a miss step carries no write), and so do a blob
+  // store's (an event fires for a write only): they follow each op that arrives (pass_on). (A CDN
+  // has none.) Every other node's unconditional ones fire whatever it receives (a worker pool's
+  // too: they fire for every job it drains, whichever op its queue brought).
+  if (!then_steps_follow_the_op(spec.type)) {
+    for (const model::Step& step : spec.then) {
+      if (step.on == model::StepCondition::always) arrive(*index_of(step.to), step.op);
+    }
+  }
+  if (spec.type == model::NodeType::rate_limiter && nodes_[node].backend) {
+    arrive(*nodes_[node].backend, std::string{counter_op});
+  }
+}
+
+// Where `op`, once it reached `node`, goes next: along the `then` steps that follow the op, to a
+// cache's or a CDN's backend, or over a forwarder's or a queue's routes that carry it.
+void Graph::pass_on(std::size_t node, const std::string& op, const Arrive& arrive) const {
+  const auto type = nodes_[node].spec.type;
+  if (then_steps_follow_the_op(type)) {
+    for (const model::Step& step : nodes_[node].spec.then) {
+      if (carries_flow(node, step, op)) arrive(*index_of(step.to), step.op);
+    }
+  }
+  if (hits_or_misses(type)) {
+    if (backend_fraction(node, op) > 0.0) arrive(*nodes_[node].backend, op);
+    return;
+  }
+  if (!forwards_by_link(type) && !copies_to_consumers(type)) return;
+  for (const auto& route : routes_[node]) {
+    if (route.share > 0.0 && carries_op(links_[route.link], op)) arrive(route.target, op);
   }
 }
 

@@ -388,8 +388,8 @@ struct Step {
   // a worker or service that sends bytes of its own, such as the youtube scenario's transcoders
   // writing a 50 MB rendition (its choice; ch. 14 sizes no rendition) to the blob store. Positive
   // (the loader refuses 0B: a request of no bytes costs a byte-sized node nothing). Absent: the
-  // request keeps its incoming size while it keeps its op name, and a renamed op is unsized (the
-  // graph resolves this in phase 2c).
+  // request keeps its incoming size while it keeps its op name, and a renamed op is unsized
+  // (graph::Graph::request_bytes resolves which size each (node, op) carries).
   std::optional<Bytes> size{};
 };
 
@@ -676,7 +676,7 @@ struct LinkSpec {
   // The bytes per second the network hop can carry (spec section 3.4: a link's bandwidth "caps
   // bytes/s and queues the excess like a node"), written in bytes or, as a network is rated,
   // in bits (40Gbit/s = 5e9 B/s). Absent: the link only adds its latency, the pipe is never the
-  // constraint. Typed by the loader now; the engine models the pipe in phase 2c (Task 5).
+  // constraint. The engine models the pipe (engine::Simulation::pass_through_pipe).
   std::optional<ByteRate> bandwidth{};
 };
 

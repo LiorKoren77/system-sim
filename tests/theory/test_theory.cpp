@@ -1006,8 +1006,8 @@ TEST_CASE(
     "admitted",
     "[theory]") {
   auto s = limited(LimiterAlgorithm::token_bucket, 1000, 100, 4000);
-  // A service stands in for the counter store: caches are not simulated yet, and the
-  // graph (unlike the loader) takes any node as a backend.
+  // A service stands in for the counter store, the simplest node that serves a backend's calls:
+  // the graph (unlike the loader) takes any node as a backend.
   s.nodes.push_back(NodeSpec{.id = "counters", .type = NodeType::service, .capacity = Rate{1e6}});
   s.nodes[1].backend = "counters";
   s.links.push_back(LinkSpec{.from = "limiter", .to = "counters", .latency = 0s});
@@ -2026,6 +2026,38 @@ TEST_CASE(
   REQUIRE_THAT(latency, WithinAbs(0.040, 1e-9));
 }
 
+// A ramp down (comprehensive 2c review, 5b; the review of Task 3's second fix round, I-3): twelve
+// 50 MB writes a second (600 MB/s) fill a default store's 1000 MB room for 20 s, then the load
+// falls to four (200 MB/s). The room drains at 500 − 200 = 300 MB/s, 30 MB a step: empty after
+// 3.3 seconds. Every server stays busy meanwhile (drain 500 MB/s, rho 1), but the new writes arrive
+// at rho 200 / 500 = 0.4, where Erlang C(20, 0.4) adds about 20 us: the stochastic wait reads the
+// arrivals' utilization, min(demand, drain) / capacity. So the wait is the backlog's own drain
+// time, backlog / 500 MB/s, and a write's latency, that wait plus its 2 s transfer, falls with the
+// backlog: 3.94 s at 970 MB, 2.02 s at 10 MB. Read at the busy rho 1 it held at the room's 2 s
+// drain time, 4 s, until the room was empty.
+TEST_CASE("after a ramp down a blob store's latency falls with its backlog, 3.94 s to 2.02 s",
+          "[theory]") {
+  Scenario s = blob_store_chain("write", 12, simsys::Bytes{50e6});
+  s.nodes[0].workload->curve.points =
+      simsys::workload::Points{.at = {{0s, Rate{12}}, {20s, Rate{12}}, {20s, Rate{4}}}};
+  const auto g = *Graph::build(s);
+  auto sim = Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  const auto store = *g.index_of("store");
+  for (int i = 0; i < 200; ++i) (void)sim->step(i * 100ms, 100ms);  // 20 s: the room is full
+  double previous = std::numeric_limits<double>::infinity();
+  for (int i = 200; i < 233; ++i) {  // 3.3 s of draining, 30 MB a step
+    const auto sample = sim->step(i * 100ms, 100ms).nodes[store];
+    CAPTURE(i, sample.backlog, sample.latency.mean_s);
+    REQUIRE_THAT(sample.backlog, WithinAbs(1000.0 - 30.0 * (i - 199), 1e-6));
+    REQUIRE(sample.rho == 1.0);  // busy throughout
+    REQUIRE_THAT(sample.latency.mean_s, WithinAbs(2.0 + sample.backlog / 500.0, 1e-9));
+    REQUIRE(sample.latency.mean_s < previous);
+    previous = sample.latency.mean_s;
+  }
+  REQUIRE_THAT(previous, WithinAbs(2.02, 1e-9));
+}
+
 namespace {
 // The review's probe (mix.yaml): 1008 requests/s into a default blob store, 99.21 % of them 2 KB
 // reads (1000/s) and 0.79 % 50 MB writes (7.9632/s). `variability` is the store's
@@ -2185,7 +2217,7 @@ Scenario blob_store_with_event() {
 }
 }  // namespace
 
-TEST_CASE("the engine runs a blob store that has no then steps", "[theory]") {
+TEST_CASE("Simulation::create accepts a blob store without then steps", "[theory]") {
   const auto g = Graph::build(blob_store_chain("upload", 5, simsys::Bytes{50e6}));
   INFO((g ? "" : g.error().message));
   REQUIRE(g.has_value());
@@ -2194,7 +2226,8 @@ TEST_CASE("the engine runs a blob store that has no then steps", "[theory]") {
   REQUIRE(sim.has_value());
 }
 
-TEST_CASE("the engine runs a blob store that has then steps", "[theory]") {
+TEST_CASE("Simulation::create accepts a blob store whose writes notify through then steps",
+          "[theory]") {
   const auto g = Graph::build(blob_store_with_event());
   INFO((g ? "" : g.error().message));
   REQUIRE(g.has_value());
@@ -3191,7 +3224,8 @@ TEST_CASE("two worker pools consuming one queue each receive all 1k messages a s
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.0006, 1e-9));
 }
 
-TEST_CASE("the engine runs a queue and a pool that has no then steps", "[theory]") {
+TEST_CASE("Simulation::create accepts a message queue consumed by a pool without then steps",
+          "[theory]") {
   const auto g = *Graph::build(published(1000, {four_workers()}));
   const auto sim = Simulation::create(g);
   INFO((sim ? "" : sim.error().message));
@@ -3201,7 +3235,8 @@ TEST_CASE("the engine runs a queue and a pool that has no then steps", "[theory]
 // Task 6 refused a pool's `then` steps ("run in phase 2c's next step") rather than drop them
 // silently; Task 7 runs them, so the refusal is now its opposite: the engine accepts a pool that
 // hands its drained jobs on (the pins on what it sends are the section at the end of this file).
-TEST_CASE("the engine runs a worker pool that has then steps", "[theory]") {
+TEST_CASE("Simulation::create accepts a worker pool that hands its jobs on through then steps",
+          "[theory]") {
   auto pool = four_workers();
   pool.then = {Step{.to = "svc", .op = "done"}};
   auto s = published(1000, {std::move(pool)});
@@ -3650,17 +3685,6 @@ TEST_CASE("a pool and its then targets conserve their load at every step of a sa
     }
     REQUIRE(grew == (std::string_view{id} == "w"));
   }
-}
-
-// `on: miss` names a cache's miss, and a pool has no lookup to miss: refused at build with the
-// reason (the message is pinned in test_graph).
-TEST_CASE("an on-miss then step on a worker pool is refused", "[theory]") {
-  auto s = worker_chain(8, {Step{.to = "done_q", .op = "publish", .on = StepCondition::miss}});
-  const auto built = Graph::build(s);
-  REQUIRE_FALSE(built.has_value());
-  // C++23 std::string::contains: a substring test in one call, replacing
-  // `find(...) != std::string::npos`; the exact wording is pinned in test_graph.
-  REQUIRE(built.error().message.contains("node 'w': a worker pool's then steps"));
 }
 
 // ---- Queue lag: how far a message queue trails its consumers (plan 2c refinement 4, Task 8) ----
@@ -4975,4 +4999,62 @@ TEST_CASE(
   REQUIRE_THAT(demand_at(last, g, "render"), WithinRel(8.0, 1e-9));  // the first step: every job
   REQUIRE_THAT(dropped_share_at(last, g, "render"), WithinRel(0.5, 1e-9));  // 4 of the 8
   REQUIRE_THAT(demand_at(last, g, "done"), WithinRel(4.0, 1e-3));           // 8 x 0.5
+}
+
+// ---- estimate = run at exactly rho 1 (comprehensive 2c review, 5c) ----
+//
+// At demand = capacity the fluid neither grows nor drains: a room that starts empty stays empty,
+// and the stochastic wait is the 0.99 clamp's (fluid::max_stochastic_rho). `run` steps from an
+// empty room; `estimate` settles one, and settles it empty too (FluidQueue::settle is strict), so
+// both report the same node. A real queue at rho 1 has no steady state (its backlog wanders, about
+// half its room on average): size a system off rho 1, which both commands mark red.
+namespace {
+// estimate()'s record and the 50th step's (5 s) of fresh simulations of `g`.
+std::pair<simsys::engine::StepRecord, simsys::engine::StepRecord> estimate_and_run(const Graph& g) {
+  const auto estimated = (*Simulation::create(g)).estimate();
+  const auto records = records_of(g, 50);
+  return {estimated, records.back()};
+}
+}  // namespace
+
+// M/M/1 at the clamp: Wq = rho / (1 − rho) × s = 0.99 / 0.01 × 1 ms = 99 ms, plus the 1 ms service.
+TEST_CASE("a service offered exactly its capacity reports the same empty room in estimate and run",
+          "[theory]") {
+  const auto g = *Graph::build(mm1(1000));
+  const auto [estimated, ran] = estimate_and_run(g);
+  for (const auto& r : {estimated, ran}) {
+    REQUIRE(r.nodes[1].backlog == 0.0);
+    REQUIRE(r.nodes[1].rho == 1.0);
+    REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(0.099 + 0.001, 1e-12));
+  }
+}
+
+// 125 gets/s of 1 MB on 1 Gbit/s (125 MB/s): one deterministic server of 8 ms per MB at the clamp,
+// M/D/1 (Pollaczek–Khinchine): Wq = (1 + 0) / 2 × 0.99 / 0.01 × 8 ms = 396 ms; the hop adds that
+// and the first megabyte's 8 ms: 404 ms. (Settling a full room said 8.05 s.)
+TEST_CASE("a pipe offered exactly its bandwidth reports the same empty room in estimate and run",
+          "[theory]") {
+  const auto g = *Graph::build(pipe_over(pipe_mb_per_s, simsys::Bytes{1e6}));
+  const auto [estimated, ran] = estimate_and_run(g);
+  for (const auto& r : {estimated, ran}) {
+    REQUIRE(only_link(r).backlog == 0.0);
+    REQUIRE(only_link(r).rho == 1.0);
+    REQUIRE_THAT(only_link(r).latency.mean_s, WithinRel(0.396 + 0.008, 1e-9));
+  }
+}
+
+// An external sink at its default 1k/s offered 1k/s (the Phase 3 backlog's probe): the room stays
+// empty in both, where settling filled it (peak_backlog 1k against run's 0).
+TEST_CASE("an external sink offered exactly its capacity reports the same empty room in both",
+          "[theory]") {
+  Scenario s = mm1(1000);
+  s.nodes[1] = NodeSpec{.id = "s", .type = NodeType::external_sink};
+  const auto g = *Graph::build(s);
+  const auto [estimated, ran] = estimate_and_run(g);
+  REQUIRE(estimated.nodes[1].backlog == 0.0);
+  REQUIRE(ran.nodes[1].backlog == 0.0);
+  REQUIRE(estimated.nodes[1].rho == 1.0);
+  REQUIRE_THAT(estimated.nodes[1].latency.mean_s, WithinRel(ran.nodes[1].latency.mean_s, 1e-12));
+  REQUIRE_THAT(estimated.responses[0].response.mean_s,
+               WithinRel(ran.responses[0].response.mean_s, 1e-12));
 }

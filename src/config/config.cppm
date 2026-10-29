@@ -20,9 +20,11 @@
 // translation units) instead of being attached to `simsys.config`.
 module;
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 export module simsys.config;
 
@@ -42,6 +44,11 @@ struct ConfigError {
   int line{};  // int, like yaml-cpp's Mark; 0 when the location is unknown
   int column{};
   std::string message;
+  // The rule broken, without the construct `message` names first ("over must fit in the run
+  // after warmup (...)" where the message reads "slo: over must fit ..."): what a caller that
+  // knows better what to blame puts after its own prefix (`run --duration 30m: ...`). Equal to
+  // `message` when the message names no construct.
+  std::string rule{};
 };
 
 // Reads and validates a scenario file. Every problem, including YAML syntax errors and a
@@ -81,6 +88,17 @@ struct Override {
 // as `load` with an Override of that path.
 [[nodiscard]] std::expected<void, ConfigError> check_override_path(const std::string& path,
                                                                    std::string_view override_path);
+
+// The keys of a dot path, in order: "nodes.users.rate.base" -> {nodes, users, rate, base}. Empty
+// pieces are kept ("a..b" has an empty middle key, which no map holds). `simsys sweep` splits its
+// metric names with it too.
+[[nodiscard]] std::vector<std::string> dot_path_keys(std::string_view path);
+
+// The mistakes a dot path makes on its own, before any file is read: an empty key, or a key of
+// digits only, which could only be a list index (a dot path goes through maps only: a list entry
+// has no name a path could say). Nothing when it makes neither; whether its keys exist is
+// check_override_path's question.
+[[nodiscard]] std::optional<std::string> dot_path_problem(std::string_view path);
 
 // Whether the loader reads the key at `override_path` as a whole number (`version`, `seed`, a
 // node's `workers`, `replicas`, `keys`, ..., an `advanced` block's `concurrency` or `queue_limit`,

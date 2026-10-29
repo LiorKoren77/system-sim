@@ -127,6 +127,21 @@ TEST_CASE("settle jumps to the long-run state: empty below capacity, full above"
   REQUIRE(over.backlog() == Approx(1000));
 }
 
+// Review of plan 2c, 5c: at demand = capacity the fluid neither grows nor drains, so stepping from
+// an empty room keeps it empty; settle agrees (strict >), so `estimate` and `run` report the same
+// node at rho 1: an empty room and the 0.99 clamp's wait, Wq = rho / (1 − rho) × s = 99 ms.
+TEST_CASE("settle at exactly capacity keeps the room empty, as stepping does", "[fluid]") {
+  FluidQueue settled{web()};
+  settled.settle(Rate{1000});
+  REQUIRE(settled.backlog() == 0.0);
+  FluidQueue stepped{web()};
+  const auto s = stepped.advance(Rate{1000}, 100ms);
+  REQUIRE(s.backlog == 0.0);
+  REQUIRE_THAT(s.latency.mean_s, WithinRel(0.099 + 0.001, 1e-12));
+  REQUIRE_THAT(settled.advance(Rate{1000}, 100ms).latency.mean_s,
+               WithinRel(s.latency.mean_s, 1e-15));
+}
+
 TEST_CASE("burstiness and service variability scale the stochastic wait (Kingman)", "[fluid]") {
   auto bursty = web();
   bursty.burstiness = 3.0;           // ca^2
@@ -165,14 +180,18 @@ TEST_CASE("a backlog larger than one step's spare capacity drains at full capaci
   REQUIRE(s.backlog == Approx(950));
   REQUIRE(s.rho == Approx(1.0));  // busy draining, not "50% utilized"
   REQUIRE(s.zone == Zone::red);
-  // Fluid wait 950/1000 s wins over the 99 ms Erlang term, plus 1 ms service.
-  REQUIRE_THAT(s.latency.mean_s, WithinRel(0.950 + 0.001, 1e-12));
-  // The variance keeps the stochastic term even though the fluid mean wins. M/M/1 at the
-  // capped rho 0.99 (c = 1, so P_wait = rho = 0.99; k = 1 for Poisson/exponential):
-  //   theta   = s / (c (1 - rho)) = 0.001 / 0.01 = 0.1 s
-  //   Var(Wq) = P (2 - P) theta^2 = 0.99 * 1.01 * 0.01 = 0.9999 * 0.01 = 0.009999 s^2
+  // The stochastic term reads the ARRIVALS' utilization, min(demand, drain) / cap = 500 / 1000 =
+  // 0.5, not the busy rho 1 (review of plan 2c, 5b): the new requests bunch as at half load, and
+  // the queue they find is the backlog. M/M/1 at rho 0.5 (c = 1, so P_wait = rho = 0.5; k = 1 for
+  // Poisson/exponential):
+  //   theta   = s / (c (1 - rho)) = 0.001 / 0.5 = 0.002 s
+  //   Wq      = P theta = 0.5 * 0.002 = 1 ms
+  //   Var(Wq) = P (2 - P) theta^2 = 0.5 * 1.5 * 4e-6 = 3e-6 s^2
   //   Var(S)  = cs^2 * s^2 = 1 * (0.001)^2 = 1e-6 s^2
-  REQUIRE_THAT(s.latency.variance_s2, WithinRel(0.009999 + 1e-6, 1e-9));
+  // Fluid wait 950/1000 s wins over the 1 ms Erlang term, plus 1 ms service.
+  REQUIRE_THAT(s.latency.mean_s, WithinRel(0.950 + 0.001, 1e-12));
+  // The variance keeps the stochastic term even though the fluid mean wins.
+  REQUIRE_THAT(s.latency.variance_s2, WithinRel(3e-6 + 1e-6, 1e-9));
 }
 
 TEST_CASE("estimated p99 never decreases while overload deepens", "[fluid]") {

@@ -227,7 +227,8 @@ ConfigError error_at_mark(const std::string& file, const YAML::Mark& mark, std::
   return ConfigError{.file = file,
                      .line = mark.line + 1,
                      .column = mark.column + 1,
-                     .message = std::move(message)};
+                     .message = message,
+                     .rule = message};
 }
 
 ConfigError error_at(const std::string& file, const YAML::Node& node, std::string message) {
@@ -245,7 +246,9 @@ struct Site {
     // C++20 std::format: type-checked (at compile time) formatting that returns a
     // std::string, replacing std::ostringstream chains and snprintf buffers.
     if (where.empty()) return error_at(file, at, std::string{what});
-    return error_at(file, at, std::format("{}: {}", where, what));
+    auto error = error_at(file, at, std::format("{}: {}", where, what));
+    error.rule = what;
+    return error;
   }
 
   // The error as the failed outcome of any reader: std::unexpected<ConfigError> converts
@@ -1952,10 +1955,7 @@ std::expected<OpShare, ConfigError> read_op_share(const Site& site, const YamlEl
 // (verified 2026-10-28 with a three-file probe; the same GCC 14.2 module defect behind the
 // lean-interface rule of CLAUDE.md section 3). Plain "{}" is unaffected.
 std::string with_significant_digits(double value) {
-  std::array<char, 32> buffer{};  // 15 digits, sign, point and exponent fit with room to spare
-  const auto written = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value,
-                                     std::chars_format::general, 15);
-  return std::string{buffer.data(), written.ptr};
+  return to_chars_text(value, std::chars_format::general, 15);
 }
 
 // Every request is exactly one op, so the shares are a probability distribution.
@@ -3253,32 +3253,27 @@ std::expected<model::Scenario, ConfigError> validate(const std::string& file,
 // A mistake in an override's path: on the command line, so it has no line in the file.
 std::unexpected<ConfigError> override_error(const std::string& file, std::string_view path,
                                             std::string_view what) {
-  return std::unexpected(ConfigError{
-      .file = file, .line = 0, .column = 0, .message = std::format("--param: {}: {}", path, what)});
+  return std::unexpected(ConfigError{.file = file,
+                                     .line = 0,
+                                     .column = 0,
+                                     .message = std::format("--param: {}: {}", path, what),
+                                     .rule = std::string{what}});
 }
 
-// "nodes.users.rate.base" -> {"nodes", "users", "rate", "base"}; empty pieces are kept, so
-// "a..b" has an empty key, which no map holds. A loop, not views::split | views::transform:
-// a lambda passed to a range adaptor in a module is emitted twice by GCC 14.2 (CLAUDE.md §3).
-std::vector<std::string> path_keys(std::string_view path) {
-  std::vector<std::string> keys{std::string{}};
-  for (const char c : path) {
-    if (c == '.') {
-      keys.emplace_back();
-    } else {
-      keys.back() += c;
-    }
-  }
-  return keys;
-}
+// Why a dot path cannot enter a list, in every message that says so (here and dot_path_problem).
+constexpr std::string_view maps_only = "a dot path goes through maps only";
 
 // Why `key` cannot be looked up in `parent`, the node at `walked` ("" for the document), or
 // nothing when `parent` is a map.
 std::optional<std::string> not_a_map(const YAML::Node& parent, std::string_view walked) {
   if (parent.IsMap()) return std::nullopt;
   const auto name = walked.empty() ? std::string{"the document"} : std::string{walked};
-  if (parent.IsSequence()) return name + " is a list; a dot path goes through maps only";
+  if (parent.IsSequence()) return name + " is a list; " + std::string{maps_only};
   return name + " is a single value, it has no keys";
+}
+
+bool is_all_digits(std::string_view text) {
+  return !text.empty() && std::ranges::all_of(text, [](char c) { return c >= '0' && c <= '9'; });
 }
 
 // The node at `path` in `root`, or why there is none. Only const lookups: yaml-cpp's
@@ -3288,7 +3283,7 @@ std::expected<YAML::Node, ConfigError> find_override_target(const std::string& f
                                                             std::string_view path) {
   YAML::Node current = root;
   std::string walked;
-  for (const auto& key : path_keys(path)) {
+  for (const auto& key : dot_path_keys(path)) {
     if (const auto refused = not_a_map(current, walked)) {
       return override_error(file, path, *refused);
     }
@@ -3356,8 +3351,33 @@ std::expected<void, ConfigError> check_override_path(const std::string& file,
   }
 }
 
+// A loop, not views::split | views::transform: a lambda passed to a range adaptor in a module is
+// emitted twice by GCC 14.2 (CLAUDE.md §3).
+std::vector<std::string> dot_path_keys(std::string_view path) {
+  std::vector<std::string> keys{std::string{}};
+  for (const char c : path) {
+    if (c == '.') {
+      keys.emplace_back();
+    } else {
+      keys.back() += c;
+    }
+  }
+  return keys;
+}
+
+std::optional<std::string> dot_path_problem(std::string_view path) {
+  for (const auto& key : dot_path_keys(path)) {
+    if (key.empty()) return std::string{path} + ": a dot path has no empty keys";
+    if (detail::is_all_digits(key)) {
+      return std::string{path} + ": '" + key + "' would index a list; " +
+             std::string{detail::maps_only} + " (a list entry has no name)";
+    }
+  }
+  return std::nullopt;
+}
+
 bool counts_whole_things(std::string_view override_path) {
-  const auto keys = detail::path_keys(override_path);
+  const auto keys = dot_path_keys(override_path);
   const auto& key = keys.back();
   if (keys.size() == 1) return detail::lists_word(detail::top_level_integer_keys, key);
   if (keys.size() < 3 || keys[0] != "nodes") return false;

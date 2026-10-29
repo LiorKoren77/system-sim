@@ -105,9 +105,9 @@ class FluidQueue {
   // compiler prints in the warning, so a caller learns *why* dropping the value is a bug.
   [[nodiscard("the drained flow must be routed downstream")]] FluidStep advance(Rate demand,
                                                                                 SimTime dt);
-  // Jumps to the long-run state: empty below capacity, full (queue_limit) at/above.
-  // At exactly rho = 1 the two disagree, per spec: advance() keeps an empty backlog
-  // empty (drain = demand = capacity), settle() fills it (the >= below).
+  // Jumps to the long-run state: empty at or below capacity, full (queue_limit) above it.
+  // At exactly rho = 1 it keeps the room empty, as advance() does from an empty backlog
+  // (drain = demand = capacity), so `estimate` and `run` agree there (the strict > in the body).
   void settle(Rate demand);
 
   // Replaces the moments of the time one request occupies a server: the mean feeds the Erlang C
@@ -170,7 +170,8 @@ Zone zone_of(double rho, const Capacity& c) {
 //   k      = variability_factor(burstiness, service_variability)
 //   fluid  = backlog_/cap                                  deterministic drain time
 //   room   = queue_limit/cap                               the full waiting room's drain time
-//   stoch  = min(k * mmc_wait(c, min(rho, 0.99), s).mean, room)
+//   rho_st = min(demand, drain)/cap                        the load the NEW arrivals bring
+//   stoch  = min(k * mmc_wait(c, min(rho_st, 0.99), s).mean, room)
 //                                                          random bunching of arrivals, never
 //                                                          longer than the room (the room-drain
 //                                                          bound, see wait())
@@ -191,7 +192,14 @@ FluidStep FluidQueue::advance(Rate demand, SimTime dt) {
   grow_backlog(demand_per_s, drain_per_s, dt_s);
   const double dropped_per_s = spill_overflow(dt_s);
   const double rho = utilization(drain_per_s);
-  const flow::LatencyEstimate waited = wait(rho);
+  // The stochastic wait reads the utilization of what ARRIVES, min(demand, drain) / cap, not the
+  // busy fraction rho (review of plan 2c, 5b). They differ only while a backlog drains after the
+  // load fell (a ramp down: demand < drain = cap): every server is busy, but the new arrivals no
+  // longer bunch as at rho 1, and the queue they find is the backlog, which the fluid term carries.
+  // Read at rho 1 the wait held at the clamp (or the room's drain time) until the backlog was gone;
+  // read at the arrivals' load it falls with the backlog. Filling or saturated (demand >= drain)
+  // and with an empty backlog (drain = demand) it is rho itself. Demand first: a NaN propagates.
+  const flow::LatencyEstimate waited = wait(utilization(std::min(demand_per_s, drain_per_s)));
   // C++20 designated initializers: name the fields at the construction site. Replaces
   // positional aggregate init, which silently swaps same-typed doubles when the struct
   // is reordered; FluidStep has five doubles in a row, so the names earn their keep.
@@ -205,8 +213,12 @@ FluidStep FluidQueue::advance(Rate demand, SimTime dt) {
                    .zone = zone_of(rho, capacity_)};
 }
 
+// Strictly above capacity (review of plan 2c, 5c): at demand = capacity exactly the fluid neither
+// grows nor drains, so the long-run backlog is whatever it started at, and both commands start
+// empty. The stochastic wait at rho 1 is the clamp's (max_stochastic_rho), not a full room's. A
+// real queue at rho 1 is null-recurrent and holds about half its room on average: size off rho 1.
 void FluidQueue::settle(Rate demand) {
-  backlog_ = demand.per_second >= capacity_.service_rate.per_second ? capacity_.queue_limit : 0.0;
+  backlog_ = demand.per_second > capacity_.service_rate.per_second ? capacity_.queue_limit : 0.0;
 }
 
 // `!(x > 0)` and `!(x >= 0)` rather than `x <= 0` and `x < 0` so that a NaN is refused too.
@@ -294,9 +306,10 @@ double FluidQueue::room_drain_s() const {
 // published result):
 //
 //   fluid  backlog_/cap: the deterministic drain time of the backlog (backlog_wait_s()).
-//   stoch  k * M/M/c Wq at min(rho, 0.99): the random bunching of arrivals that a node
+//   stoch  k * M/M/c Wq at min(rho_st, 0.99): the random bunching of arrivals that a node
 //          shows below saturation; k is the Allen–Cunneen factor (formula block above
-//          advance()). Assumes steady state at that rho. Bounded by the room (below).
+//          advance()), rho_st the arrivals' utilization min(demand, drain)/cap (advance()).
+//          Assumes steady state at that rho. Bounded by the room (below).
 //
 // The room-drain bound (review of plan 2c Task 3's fix round, C1; named in the review of its
 // second fix round, I-2): a queue with a waiting room of K units turns away whoever finds it full,
@@ -329,7 +342,7 @@ double FluidQueue::room_drain_s() const {
 // formula below saturation (backlog 0), is continuous in the mean, and becomes fluid-only
 // deep in overload.
 //
-// Variance: min(k^2 * Var(Wq at min(rho, 0.99)), T^2 / 4) + cs^2 * s^2, ALWAYS, whichever
+// Variance: min(k^2 * Var(Wq at min(rho_st, 0.99)), T^2 / 4) + cs^2 * s^2, ALWAYS, whichever
 // term wins the mean; for exponential service (cs^2 = 1) the second term is s^2. Wait and service
 // are assumed independent, so their variances add. The stochastic variance is kept even
 // when the fluid drain carries the mean, so percentiles stay monotone as overload

@@ -46,10 +46,15 @@ struct SweepParam {
 // out-parameter plus bool; the caller must look before it uses the value.
 [[nodiscard]] std::expected<SweepParam, std::string> parse_param(std::string_view spec);
 
-// What a metric reads off a point's run summary.
+// What a metric reads off a point's run summary: the numbers `simsys run --report json` prints.
 enum class MetricKind {
   mean_latency,   // `<client>.<op>.mean`: the op's mean latency as the client sees it, seconds
+  p50_latency,    // `<client>.<op>.p50`: its estimated median, seconds, as the op table's p50
+  p95_latency,    // `<client>.<op>.p95`: ... its p95
+  p99_latency,    // `<client>.<op>.p99`: ... its p99
   mean_rho,       // `<node>.mean_rho`: the node's time-averaged utilization, a ratio
+  peak_rho,       // `<node>.peak_rho`: its highest utilization of any observed step, a ratio
+  drop_rate,      // `<node>.drop_rate`: the share of the work sent to it that it dropped, a ratio
   peak_queue_lag  // `<queue>.lag`: a message queue's peak lag after warmup, seconds
 };
 
@@ -67,11 +72,14 @@ struct SweepMetric {
 [[nodiscard]] std::expected<SweepMetric, std::string> parse_metric(std::string_view name);
 
 // One point: its value as written in the param, and one number per metric, in the order asked,
-// in SI base units (seconds for a latency or a lag, a plain ratio for a utilization), like
-// report::SloResult::observed.
+// in SI base units (seconds for a latency or a lag, a plain ratio for a utilization or a drop
+// rate), like report::SloResult::observed. `beyond_timeout` lists (by index into `metrics`) the
+// percentiles that are the client's timeout, not a latency it saw: more than 1 − q of the
+// delivered requests timed out, and the table prints them `>1s`, as the op table does.
 struct SweepRow {
   std::string value;
   std::vector<double> metrics;
+  std::vector<std::size_t> beyond_timeout{};
 };
 
 enum class SweepFormat { table, csv };

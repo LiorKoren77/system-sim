@@ -1509,7 +1509,7 @@ TEST_CASE("a cache's then step on miss filters the keys it passes on", "[graph]"
 }
 
 // One popularity per cache: reads that arrive as l1's misses and reads that skipped l1 have
-// different popularities, and mixing them by rate is phase 2c's.
+// different popularities, and mixing them by rate is in the Phase 3 backlog.
 TEST_CASE("a che cache receiving both filtered and unfiltered reads is an error", "[graph]") {
   auto s = two_caches(HitRatio{.che = true}, 2'000'000);
   s.nodes[0].workload->op_shares = {{"get", 0.5}, {"peek", 0.5}};
@@ -3224,6 +3224,8 @@ TEST_CASE("a message queue has one route of share one per consumer group", "[gra
     CAPTURE(route.target);
     REQUIRE_THAT(route.share, WithinRel(1.0, 1e-12));
   }
+  // C++20 std::ranges::count with a projection: how many routes have `target` == w1, replacing
+  // std::count_if with a lambda that compares the member by hand.
   REQUIRE(std::ranges::count(routes, w1, &simsys::graph::Route::target) == 1);
   REQUIRE(std::ranges::count(routes, w2, &simsys::graph::Route::target) == 1);
   // Per op the shares are still 1 each: nothing renormalises a copy into a split.

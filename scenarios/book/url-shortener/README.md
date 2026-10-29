@@ -148,13 +148,14 @@ warmup).
   id requests (drop rate 0.2309). Its full queue makes `shorten` slow, past the clients' 1 s
   timeout (Task 13): of the 1.153k shortens/s offered over the day, 266.1/s lose their id
   (0.2309), 293.6/s are timed out (`run --report json`: `timed_out_per_s` 293.57, a third of
-  the 886.6/s the path delivered) and 593.0/s are answered, in 463 ms on average, p50 571 ms,
+  the 886.6/s the path delivered) and 593.0/s are answered, in 463 ms on average, p50 545 ms,
   p95 and p99 **1 s**, the timeout itself (`>1s` in the table): a third of the delivered shortens
   timed out, far more than the 5 % and 1 % those quantiles leave above them, so the clients never
-  saw them answered. The p50 is the client's too: the timed-out third are all slower than every
-  answered shorten, so the client's median is the answered shortens' 0.5 / (1 − 0.331) = 0.747
-  quantile, 571 ms on their fit (read at 0.5, their own median, it said 329 ms, as if the slow
-  third had never been sent). (Without the timeout: all 886.6/s answered, mean 669 ms, p50 545 ms,
+  saw them answered. The p50 is the client's too: the model times out exactly the shortens the
+  fit to every delivered shorten puts past 1 s, so the timed-out third are that fit's slowest and
+  its median, 545 ms, is the client's, the same as without the timeout (a refit to the answered
+  shortens said 571 ms read at 0.5 / (1 − 0.331), and 329 ms read at 0.5, as if the slow third
+  had never been sent). (Without the timeout: all 886.6/s answered, mean 669 ms, p50 545 ms,
   p99 2.42 s.) A shorten whose id was not issued is never
   written: url_db commits 295.5 writes/s per shard over the
   day instead of 384.2, the snowflake run's figure × (1 − 0.2309), and its busiest copy peaks at

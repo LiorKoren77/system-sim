@@ -2,9 +2,10 @@
 // phases of a sweep (load every point, then simulate every point) on worker threads, and the two
 // renderings. <thread> and <atomic> are included here and nowhere else (docs/study/threads.md).
 //
-// Numbers are written with std::to_chars, never with a std::format width or precision: this unit
-// imports simsys.core, whose <chrono> brings <format>, and GCC 14.2 then throws std::format_error
-// at run time on `{:.3}` (CLAUDE.md §3). Columns are padded by hand.
+// Numbers are written with std::to_chars (simsys::to_chars_text), never with a std::format width or
+// precision: this unit imports simsys.core, whose <chrono> brings <format>, and GCC 14.2 then
+// throws std::format_error at run time on `{:.3}` (CLAUDE.md §3). Columns are padded by
+// report::align_columns, the run tables' own aligner.
 module;
 #include <algorithm>
 #include <array>
@@ -29,12 +30,14 @@ module;
 // heavy headers (here <thread>) without making every importer parse them.
 module simsys.sweep;
 
+// C++20 `import`: the compiled interfaces of the modules this unit reads from, instead of
+// re-parsing their text as an #include would.
 import simsys.config;
 import simsys.core;
-import simsys.engine;
 import simsys.graph;
 import simsys.model;
 import simsys.report;
+import simsys.session;
 
 namespace simsys::sweep {
 
@@ -43,21 +46,8 @@ namespace {
 // ---- numbers as text ------------------------------------------------------------------------
 
 // `value` with at most `digits` significant digits, trailing zeros dropped (0.1, 500, 1.61).
-// std::to_chars (C++17): locale-independent, allocation-free, and free of the GCC 14.2 format
-// defect above.
 std::string significant(double value, int digits) {
-  std::array<char, 64> buffer{};
-  const auto written = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value,
-                                     std::chars_format::general, digits);
-  return std::string{buffer.data(), written.ptr};
-}
-
-// `value` with exactly two decimals (466.67): how far a point is from a whole number.
-std::string two_decimals(double value) {
-  std::array<char, 400> buffer{};  // fixed notation of any finite double fits in 400 chars
-  const auto written = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value,
-                                     std::chars_format::fixed, 2);
-  return std::string{buffer.data(), written.ptr};
+  return to_chars_text(value, std::chars_format::general, digits);
 }
 
 // ---- --param: <dot.path>=<from>..<to>:<n> ------------------------------------------------------
@@ -75,37 +65,6 @@ std::string_view last_key(std::string_view path) {
   return dot == std::string_view::npos ? path : path.substr(dot + 1);
 }
 
-bool is_all_digits(std::string_view text) {
-  // C++20 ranges algorithms (std::ranges::all_of, find, any_of): take the range itself instead of
-  // a begin/end pair, and accept a projection (`&NodeSpec::id`) instead of a comparison lambda.
-  return !text.empty() && std::ranges::all_of(text, [](char c) { return c >= '0' && c <= '9'; });
-}
-
-// "a.b.c" -> {"a", "b", "c"}; empty pieces are kept ("a..b" has an empty middle one).
-std::vector<std::string_view> split_dots(std::string_view text) {
-  std::vector<std::string_view> pieces;
-  std::size_t start = 0;
-  for (auto dot = text.find('.'); dot != std::string_view::npos; dot = text.find('.', start)) {
-    pieces.push_back(text.substr(start, dot - start));
-    start = dot + 1;
-  }
-  pieces.push_back(text.substr(start));
-  return pieces;
-}
-
-// The path's own mistakes, before any file is read: an empty key, or a list index. Whether the
-// keys exist is the loader's question (config::load with an Override).
-std::optional<std::string> path_problem(std::string_view path) {
-  for (const auto key : split_dots(path)) {
-    if (key.empty()) return std::string{path} + ": a dot path has no empty keys";
-    if (is_all_digits(key)) {
-      return std::string{path} + ": '" + std::string{key} +
-             "' would index a list; a dot path goes through maps only (a list entry has no name)";
-    }
-  }
-  return std::nullopt;
-}
-
 // One end of a range: a number and the unit text after it ("100/s" -> 100, "/s"; "400" -> 400,
 // "").
 struct RangeEnd {
@@ -119,6 +78,8 @@ bool starts_like_a_number(std::string_view text) {
   return !text.empty() && (text.front() == '-' || (text.front() >= '0' && text.front() <= '9'));
 }
 
+// C++23 std::expected<T, E>: the parsed end or the message, replacing an exception or an
+// out-parameter plus a bool; the caller must look before it uses the value.
 std::expected<RangeEnd, std::string> parse_end(std::string_view text) {
   double number{};
   const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), number);
@@ -207,8 +168,8 @@ std::expected<std::vector<std::string>, std::string> expand(const SpecParts& par
     const double value = point_at(from.number, to.number, k, n);
     if (whole && !is_whole(value)) {
       return param_error(std::string{last_key(parts.path)} + " must be whole (" +
-                         std::string{parts.range} + " gives " + two_decimals(value) + from.unit +
-                         ")");
+                         std::string{parts.range} + " gives " +
+                         to_chars_text(value, std::chars_format::fixed, 2) + from.unit + ")");
     }
     values.push_back(point_text(value, whole) + from.unit);
   }
@@ -217,31 +178,69 @@ std::expected<std::vector<std::string>, std::string> expand(const SpecParts& par
 
 // ---- --metric --------------------------------------------------------------------------------
 
-constexpr std::string_view metric_grammar = "<client>.<op>.mean, <node>.mean_rho or <queue>.lag";
+constexpr std::string_view metric_grammar =
+    "<client>.<op>.mean|p50|p95|p99, <node>.mean_rho|peak_rho|drop_rate or <queue>.lag";
+
+// A metric's last word and what it reads (sweep.cppm's MetricKind); one row each.
+struct MetricWord {
+  std::string_view word;
+  MetricKind kind;
+};
+
+// Pattern: Table-driven method — a new metric is one row here (and one case in read_metric), not
+// another `if`.
+constexpr std::array op_metric_words{
+    MetricWord{"mean", MetricKind::mean_latency}, MetricWord{"p50", MetricKind::p50_latency},
+    MetricWord{"p95", MetricKind::p95_latency}, MetricWord{"p99", MetricKind::p99_latency}};
+constexpr std::array node_metric_words{
+    MetricWord{"mean_rho", MetricKind::mean_rho}, MetricWord{"peak_rho", MetricKind::peak_rho},
+    MetricWord{"drop_rate", MetricKind::drop_rate}, MetricWord{"lag", MetricKind::peak_queue_lag}};
 
 // C++20 std::span<const T>: a non-owning view of contiguous elements (pointer + size), so a
 // function reads a vector or an array without a copy and without being a template.
-std::optional<SweepMetric> metric_of(std::string_view name,
-                                     std::span<const std::string_view> pieces) {
-  // No `&std::string_view::empty` as the predicate: taking the address of a standard library
-  // member function is not allowed (it may be overloaded or change between versions).
-  if (std::ranges::any_of(pieces, [](std::string_view piece) { return piece.empty(); })) {
+std::optional<MetricKind> kind_named(std::span<const MetricWord> words, std::string_view word) {
+  // C++20 ranges algorithms (std::ranges::find, find_if, any_of): take the range itself instead
+  // of a begin/end pair, and accept a projection (`&MetricWord::word`) instead of a
+  // comparison lambda.
+  const auto found = std::ranges::find(words, word, &MetricWord::word);
+  if (found == words.end()) return std::nullopt;
+  return found->kind;
+}
+
+std::optional<SweepMetric> metric_of(std::string_view name, std::span<const std::string> pieces) {
+  // No `&std::string::empty` as the predicate: taking the address of a standard library member
+  // function is not allowed (it may be overloaded or change between versions).
+  if (std::ranges::any_of(pieces, [](const std::string& piece) { return piece.empty(); })) {
     return std::nullopt;
   }
   const std::string text{name};
-  if (pieces.size() == 3 && pieces[2] == "mean") {
-    return SweepMetric{.name = text,
-                       .kind = MetricKind::mean_latency,
-                       .node = std::string{pieces[0]},
-                       .op = std::string{pieces[1]}};
+  if (pieces.size() == 3) {
+    const auto kind = kind_named(op_metric_words, pieces[2]);
+    if (!kind) return std::nullopt;
+    return SweepMetric{.name = text, .kind = *kind, .node = pieces[0], .op = pieces[1]};
   }
   if (pieces.size() != 2) return std::nullopt;
-  if (pieces[1] == "mean_rho") {
-    return SweepMetric{.name = text, .kind = MetricKind::mean_rho, .node = std::string{pieces[0]}};
-  }
-  if (pieces[1] == "lag") {
-    return SweepMetric{
-        .name = text, .kind = MetricKind::peak_queue_lag, .node = std::string{pieces[0]}};
+  const auto kind = kind_named(node_metric_words, pieces[1]);
+  if (!kind) return std::nullopt;
+  return SweepMetric{.name = text, .kind = *kind, .node = pieces[0]};
+}
+
+// Which of the op table's latency columns a latency metric reads; empty for the others.
+std::optional<report::OpLatency> latency_column(MetricKind kind) {
+  switch (kind) {
+    case MetricKind::mean_latency:
+      return report::OpLatency::mean;
+    case MetricKind::p50_latency:
+      return report::OpLatency::p50;
+    case MetricKind::p95_latency:
+      return report::OpLatency::p95;
+    case MetricKind::p99_latency:
+      return report::OpLatency::p99;
+    case MetricKind::mean_rho:
+    case MetricKind::peak_rho:
+    case MetricKind::drop_rate:
+    case MetricKind::peak_queue_lag:
+      return std::nullopt;
   }
   return std::nullopt;
 }
@@ -260,9 +259,10 @@ std::optional<std::string> latency_problem(const model::NodeSpec& node, const Sw
   return "client '" + node.id + "' sends no op '" + metric.op + "'";
 }
 
-std::optional<std::string> utilization_problem(const model::NodeSpec& node) {
+// A client serves nothing: it has no utilization and drops nothing (`what` names the metric).
+std::optional<std::string> serving_problem(const model::NodeSpec& node, std::string_view what) {
   if (node.type != model::NodeType::client) return std::nullopt;
-  return "'" + node.id + "' is a client, which serves nothing, so it has no utilization";
+  return "'" + node.id + "' is a client, which serves nothing, so it has no " + std::string{what};
 }
 
 std::optional<std::string> lag_problem(const model::NodeSpec& node) {
@@ -275,9 +275,15 @@ std::optional<std::string> problem_with_node(const model::NodeSpec& node,
                                              const SweepMetric& metric) {
   switch (metric.kind) {
     case MetricKind::mean_latency:
+    case MetricKind::p50_latency:
+    case MetricKind::p95_latency:
+    case MetricKind::p99_latency:
       return latency_problem(node, metric);
     case MetricKind::mean_rho:
-      return utilization_problem(node);
+    case MetricKind::peak_rho:
+      return serving_problem(node, "utilization");
+    case MetricKind::drop_rate:
+      return serving_problem(node, "drop rate");
     case MetricKind::peak_queue_lag:
       return lag_problem(node);
   }
@@ -306,23 +312,66 @@ std::optional<std::string> first_metric_problem(const model::Scenario& scenario,
 
 // What a metric reads off one run: the report's own Summary (the numbers `simsys run --report
 // json` prints), so a sweep computes nothing the report does not. A NaN for a value the run did
-// not produce: the mean latency of an op of which nothing was answered (the report prints `-`
-// there: a mean over no answers is no latency), a queue lag of a run that observed no step.
+// not produce: a latency of an op of which nothing was answered (the report prints `-` there: no
+// answer, no latency), a queue lag of a run that observed no step.
 constexpr double no_value = std::numeric_limits<double>::quiet_NaN();
 
-double read_metric(std::span<const report::NodeSummary> nodes,
-                   std::span<const report::OpSummary> ops, const SweepMetric& metric) {
-  if (metric.kind == MetricKind::mean_latency) {
-    for (const auto& op : ops) {
-      if (op.client != metric.node || op.op != metric.op) continue;
-      return op.answered_per_s > 0.0 ? op.mean_s : no_value;
-    }
-    return no_value;
-  }
+// One point's numbers and, by index, the percentiles that are the client's timeout rather than a
+// latency it saw (SweepRow::beyond_timeout).
+struct Measured {
+  std::vector<double> numbers;
+  std::vector<std::size_t> beyond_timeout;
+};
+
+// A latency metric's op, or nothing when the run has no row for it.
+const report::OpSummary* op_of(std::span<const report::OpSummary> ops, const SweepMetric& metric) {
+  const auto found = std::ranges::find_if(ops, [&](const report::OpSummary& op) {
+    return op.client == metric.node && op.op == metric.op;
+  });
+  return found == ops.end() ? nullptr : &*found;
+}
+
+double node_metric(const report::Summary& summary, std::span<const report::NodeSummary> nodes,
+                   const SweepMetric& metric) {
   const auto node = std::ranges::find(nodes, metric.node, &report::NodeSummary::id);
   if (node == nodes.end()) return no_value;
-  if (metric.kind == MetricKind::mean_rho) return node->mean_rho;
-  return node->peak_queue_lag_s.value_or(no_value);
+  switch (metric.kind) {
+    case MetricKind::mean_rho:
+      return node->mean_rho;
+    case MetricKind::peak_rho:
+      return node->peak_rho;
+    case MetricKind::drop_rate:
+      return summary.drop_rate(metric.node);
+    case MetricKind::peak_queue_lag:
+      return node->peak_queue_lag_s.value_or(no_value);
+    case MetricKind::mean_latency:  // an op's, read by read_metrics
+    case MetricKind::p50_latency:
+    case MetricKind::p95_latency:
+    case MetricKind::p99_latency:
+      return no_value;
+  }
+  return no_value;
+}
+
+// Every metric of one point's summary, in the order asked.
+Measured read_metrics(const report::Summary& summary, std::span<const SweepMetric> metrics) {
+  const auto nodes = summary.nodes();
+  const auto ops = summary.ops();
+  Measured measured;
+  for (const auto& metric : metrics) {
+    const auto column = latency_column(metric.kind);
+    if (!column) {
+      measured.numbers.push_back(node_metric(summary, nodes, metric));
+      continue;
+    }
+    const auto* op = op_of(ops, metric);
+    const bool answered = op != nullptr && op->answered_per_s > 0.0;
+    measured.numbers.push_back(answered ? report::op_latency_s(*op, *column) : no_value);
+    if (answered && report::latency_beyond_timeout(*op, *column)) {
+      measured.beyond_timeout.push_back(measured.numbers.size() - 1);
+    }
+  }
+  return measured;
 }
 
 // ---- one point ---------------------------------------------------------------------------------
@@ -334,40 +383,28 @@ std::string point_label(const SweepParam& param, std::size_t index) {
 }
 
 // Phase 1 for one point: the scenario with the point's value in place, checked by the loader
-// and resolved by the graph builder. No simulation yet.
+// and resolved by the graph builder, exactly as `simsys explain` and `run` load a file
+// (session::load_graph). No simulation yet.
 std::expected<graph::Graph, std::string> prepare_point(const std::string& path,
                                                        const SweepParam& param, std::size_t index) {
   const std::array overrides{config::Override{.path = param.path, .value = param.values[index]}};
-  // C++23 monadic std::expected: transform_error rewrites only an error, and_then runs the next
-  // fallible stage only on a value; no `if (!x) return ...` after each stage.
-  return config::load(path, overrides)
-      .transform_error(config::describe)
-      .and_then([&](model::Scenario scenario) {
-        return graph::Graph::build(std::move(scenario))
-            .transform_error([&](const graph::EngineError& error) {
-              return path + ": error: " + error.message;
-            });
-      })
-      .transform_error(
-          [&](const std::string& message) { return point_label(param, index) + message; });
+  // C++23 std::expected::transform_error: rewrites only an error (here: the point's label in front
+  // of the message), passing a value through.
+  return session::load_graph(path, overrides).transform_error([&](const std::string& message) {
+    return point_label(param, index) + message;
+  });
 }
 
-// Phase 2 for one point: a run of the whole scenario, as `simsys run` does it (its duration, its
-// step, its warmup), and each metric read off the summary. The Simulation, the Summary and the
-// graph belong to this point alone: nothing here is shared with another thread.
-std::expected<std::vector<double>, std::string> measure_point(
-    const std::string& path, const graph::Graph& g, std::span<const SweepMetric> metrics) {
-  auto sim = engine::Simulation::create(g);
-  if (!sim) return std::unexpected(path + ": error: " + sim.error().message);
-  const auto& scenario = g.scenario();
-  report::Summary summary{g, scenario.warmup};
-  sim->run({.duration = scenario.duration, .step = scenario.step},
-           [&](const engine::StepRecord& record) { summary.observe(record); });
-  const auto nodes = summary.nodes();
-  const auto ops = summary.ops();
-  std::vector<double> numbers;
-  for (const auto& metric : metrics) numbers.push_back(read_metric(nodes, ops, metric));
-  return numbers;
+// Phase 2 for one point: a run of the whole scenario, exactly as `simsys run` does it (its
+// duration, its step, its warmup: session::run_summary), and each metric read off the summary.
+// The Simulation, the Summary and the graph belong to this point alone: nothing here is shared
+// with another thread.
+std::expected<Measured, std::string> measure_point(const std::string& path, const graph::Graph& g,
+                                                   std::span<const SweepMetric> metrics) {
+  // C++23 std::expected::transform: maps the value (a summary into its metrics) and passes an
+  // error through untouched.
+  return session::run_summary(g, path).transform(
+      [&](const report::Summary& summary) { return read_metrics(summary, metrics); });
 }
 
 // ---- the points in parallel --------------------------------------------------------------------
@@ -386,7 +423,9 @@ void pull_indices(std::atomic<std::size_t>& next, std::size_t count,
 // the queue here is just an atomic counter over the indices 0..count-1, since the tasks are known
 // up front and need no other state. A worker that finishes a short point takes the next one, so a
 // slow point does not hold back a whole share of them (as a static split into `jobs` slices
-// would).
+// would). The pool lives for one phase only: its workers start here and are joined before this
+// function returns, so each phase of a sweep (load every point, then run every point) gets a
+// fresh pool; nothing is submitted to it later, unlike a long-lived pool of a server.
 void run_in_parallel(std::size_t count, std::size_t jobs,
                      const std::function<void(std::size_t)>& work) {
   // C++11 std::atomic<T>: a value that threads read and modify without a data race; fetch_add is
@@ -445,18 +484,14 @@ PerPoint<T> for_each_point(std::size_t count, std::size_t jobs, const Stage& sta
 // ---- rendering ---------------------------------------------------------------------------------
 
 // A cell for people, as the report's tables print the same number (report::format_duration and
-// format_lag: "1.61ms", "<1us"); "-" for a number the run did not produce.
-std::string human_cell(const SweepMetric& metric, double value) {
+// format_lag: "1.61ms", "<1us"; `>1s` for a percentile that is the client's timeout, as the op
+// table prints it); "-" for a number the run did not produce.
+std::string human_cell(const SweepMetric& metric, double value, bool beyond_timeout) {
   if (std::isnan(value)) return "-";
-  switch (metric.kind) {
-    case MetricKind::mean_latency:
-      return report::format_duration(value);
-    case MetricKind::mean_rho:
-      return significant(value, 3);
-    case MetricKind::peak_queue_lag:
-      return report::format_lag(value);
-  }
-  return "-";
+  if (beyond_timeout) return ">" + report::format_duration(value);
+  if (latency_column(metric.kind)) return report::format_duration(value);
+  if (metric.kind == MetricKind::peak_queue_lag) return report::format_lag(value);
+  return significant(value, 3);  // a utilization or a drop rate: a ratio
 }
 
 // A cell for programs: the shortest text that reads back to the same double, empty for a number
@@ -468,52 +503,31 @@ std::string csv_cell(double value) {
 // The table's cells, the header first.
 using Cells = std::vector<std::vector<std::string>>;
 
+std::vector<std::string> table_row(std::span<const SweepMetric> metrics, const SweepRow& row) {
+  std::vector<std::string> line{row.value};
+  for (std::size_t m = 0; m < metrics.size() && m < row.metrics.size(); ++m) {
+    const bool beyond = std::ranges::contains(row.beyond_timeout, m);
+    line.push_back(human_cell(metrics[m], row.metrics[m], beyond));
+  }
+  return line;
+}
+
 Cells table_cells(const SweepParam& param, std::span<const SweepMetric> metrics,
                   std::span<const SweepRow> rows) {
   Cells cells;
   auto& header = cells.emplace_back(std::vector<std::string>{param.path});
   for (const auto& metric : metrics) header.push_back(metric.name);
-  for (const auto& row : rows) {
-    auto& line = cells.emplace_back(std::vector<std::string>{row.value});
-    for (std::size_t m = 0; m < metrics.size() && m < row.metrics.size(); ++m) {
-      line.push_back(human_cell(metrics[m], row.metrics[m]));
-    }
-  }
+  for (const auto& row : rows) cells.push_back(table_row(metrics, row));
   return cells;
 }
 
-std::vector<std::size_t> column_widths(const Cells& cells) {
-  std::vector<std::size_t> widths;
-  for (const auto& line : cells) {
-    if (widths.size() < line.size()) widths.resize(line.size());
-    for (std::size_t c = 0; c < line.size(); ++c) widths[c] = std::max(widths[c], line[c].size());
-  }
-  return widths;
-}
-
-// The swept value left-aligned, the numbers right-aligned (their units line up), two spaces
-// between columns. Padded by hand: no std::format width (CLAUDE.md §3).
-std::string table_line(const std::vector<std::string>& line, std::span<const std::size_t> widths) {
-  std::string text;
-  for (std::size_t c = 0; c < line.size(); ++c) {
-    const std::string padding(widths[c] - line[c].size(), ' ');
-    if (c == 0) {
-      text += line[c] + padding;
-    } else {
-      text += "  " + padding + line[c];
-    }
-  }
-  return text + "\n";
-}
-
+// The report's aligner (report::align_columns: the swept value left, the numbers right, two spaces
+// between columns), with a rule of dashes under the header as wide as the header line.
 std::string render_table(const Cells& cells) {
-  const auto widths = column_widths(cells);
-  std::size_t total = 0;
-  for (const auto width : widths) total += width;
-  total += 2 * (widths.empty() ? 0 : widths.size() - 1);
-  std::string text = table_line(cells.front(), widths) + std::string(total, '-') + "\n";
-  for (std::size_t r = 1; r < cells.size(); ++r) text += table_line(cells[r], widths);
-  return text;
+  const std::string aligned = report::align_columns(cells, "");
+  const auto header_end = aligned.find('\n');
+  return aligned.substr(0, header_end + 1) + std::string(header_end, '-') + "\n" +
+         aligned.substr(header_end + 1);
 }
 
 std::string render_csv(const SweepParam& param, std::span<const SweepMetric> metrics,
@@ -534,7 +548,7 @@ std::string render_csv(const SweepParam& param, std::span<const SweepMetric> met
 std::expected<SweepParam, std::string> parse_param(std::string_view spec) {
   const auto parts = split_spec(spec);
   if (!parts) return std::unexpected(parts.error());
-  if (auto problem = path_problem(parts->path)) return param_error(*problem);
+  if (auto problem = config::dot_path_problem(parts->path)) return param_error(*problem);
   const auto count = parse_count(*parts);
   if (!count) return std::unexpected(count.error());
   const auto from = parse_end(parts->from);
@@ -552,8 +566,7 @@ std::expected<SweepParam, std::string> parse_param(std::string_view spec) {
 }
 
 std::expected<SweepMetric, std::string> parse_metric(std::string_view name) {
-  const auto pieces = split_dots(name);
-  if (auto metric = metric_of(name, pieces)) return *metric;
+  if (auto metric = metric_of(name, config::dot_path_keys(name))) return *metric;
   return std::unexpected("--metric: '" + std::string{name} + "' is not a metric (write " +
                          std::string{metric_grammar} + ")");
 }
@@ -580,15 +593,18 @@ std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& s
       count, jobs, [&](std::size_t i) { return prepare_point(scenario_path, param, i); });
   if (auto error = graphs.first_error()) return std::unexpected(*error);
 
-  const auto numbers = for_each_point<std::vector<double>>(count, jobs, [&](std::size_t i) {
+  const auto measured = for_each_point<Measured>(count, jobs, [&](std::size_t i) {
     return measure_point(scenario_path, *graphs.values[i], metrics)
         .transform_error([&](const std::string& e) { return point_label(param, i) + e; });
   });
-  if (auto error = numbers.first_error()) return std::unexpected(*error);
+  if (auto error = measured.first_error()) return std::unexpected(*error);
 
   std::vector<SweepRow> rows;
   for (std::size_t i = 0; i < count; ++i) {
-    rows.push_back(SweepRow{.value = param.values[i], .metrics = *numbers.values[i]});
+    const auto& point = *measured.values[i];
+    rows.push_back(SweepRow{.value = param.values[i],
+                            .metrics = point.numbers,
+                            .beyond_timeout = point.beyond_timeout});
   }
   return rows;
 }

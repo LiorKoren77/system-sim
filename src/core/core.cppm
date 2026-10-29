@@ -465,22 +465,47 @@ export namespace simsys {
   return error.message.substr(0, error.message.size() - grammar.size());
 }
 
+// The one place a double becomes text, for every module (comprehensive 2c review: five copies of
+// this wrapper had grown). std::to_chars (C++17): locale-independent, allocation-free, and free of
+// the GCC 14.2 defect of CLAUDE.md §3, under which a std::format width or precision throws at run
+// time in every unit that imports this module. `format` and `precision` as std::to_chars takes
+// them: neither, the shortest text that reads back to the same double (0.1, 4000, 1e+20); a format
+// alone, the shortest in that notation (fixed never writes an exponent); both, rounded to
+// `precision` digits (significant ones for general, after the point for fixed). A precision without
+// a format is general. The buffer holds any finite double in fixed notation (at most 309 digits
+// before the point; 327 characters for the smallest subnormal, 5e-324 = "0.000...5") with room for
+// a precision of up to 200; a longer result falls back to the shortest text.
+[[nodiscard]] inline std::string to_chars_text(double value,
+                                               std::optional<std::chars_format> format = {},
+                                               std::optional<int> precision = {}) {
+  std::array<char, 512> buffer{};
+  char* const first = buffer.data();
+  char* const last = first + buffer.size();
+  std::to_chars_result written{};
+  if (precision) {
+    written =
+        std::to_chars(first, last, value, format.value_or(std::chars_format::general), *precision);
+  } else if (format) {
+    written = std::to_chars(first, last, value, *format);
+  } else {
+    written = std::to_chars(first, last, value);
+  }
+  if (written.ec != std::errc{}) return to_chars_text(value);
+  return std::string{first, written.ptr};
+}
+
 // Bytes{5e7} -> "50MB": the inverse of parse_size, for messages and explain, so a size reads
 // back in the scenario's own grammar. The largest unit that keeps the number at least 1 (200B,
 // 2KB, 50MB, 1.5GB; 0B), the number in its shortest round-trip form in fixed notation, so a
-// petabyte prints "1000000GB" rather than "1e+06GB", which no author writes. Never an exponent:
-// the buffer holds any finite double in fixed notation (at most 309 digits before the point,
-// 1.8e308; at most 327 characters for the smallest subnormal, 5e-324 = "0.000...5").
+// petabyte prints "1000000GB" rather than "1e+06GB", which no author writes (to_chars_text: never
+// an exponent in fixed notation).
 [[nodiscard]] std::string format_size(Bytes size) {
   const detail::Scale* unit = &detail::size_units.front();
   for (const auto& candidate : detail::size_units) {
     if (size.count >= candidate.factor) unit = &candidate;
   }
-  const double number = size.count / unit->factor;
-  std::array<char, 512> buffer{};
-  const auto written =
-      std::to_chars(buffer.data(), buffer.data() + buffer.size(), number, std::chars_format::fixed);
-  return std::string{buffer.data(), written.ptr} + std::string{unit->suffix};
+  return to_chars_text(size.count / unit->factor, std::chars_format::fixed) +
+         std::string{unit->suffix};
 }
 
 // ByteRate{5e8} -> "500MB/s": a byte rate in the grammar parse_byte_rate reads (its prefixes

@@ -2,7 +2,8 @@
 # Compare algorithms under a bursty client. To try another one, edit `algorithm:` on the
 # limiter (token_bucket, leaky_bucket, fixed_window, sliding_log or sliding_counter) and swap
 # `burst` for `window` as the comment on the limiter explains, then `run` the file again.
-# (A `--param` sweep over the algorithms comes with phase 2c.)
+# (`simsys sweep` ranges over numbers only, so an algorithm, a word, is edited by hand; the
+# README sweeps the bucket's size.)
 version: 1
 name: lab-rate-limiter
 seed: 1

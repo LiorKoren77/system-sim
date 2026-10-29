@@ -99,13 +99,13 @@ struct LinkSummary {
 // `timeout` (plan 2c Task 13) also gives up on the delivered requests slower than it:
 // `timed_out_per_s` counts them (0 without a timeout), `answered_per_s` leaves them out (offered
 // − lost − timed out), and the mean describes the requests answered in time. A percentile is what
-// the client sees at its quantile q (report.cpp's percentile_seen_by_client, review of plan 2c
-// Task 13, C-1): when more than 1 − q of the delivered requests timed out
+// the client sees at its quantile q (report.cpp's percentile_seen_by_client, comprehensive 2c
+// review, C-1): when more than 1 − q of the delivered requests timed out
 // (`timed_out_share` > 1 − q: more than 1 % for a p99), no request at that quantile was answered,
 // and the percentile IS the timeout (the table prints `>1s`, a latency SLO on it
-// fails whatever its max); otherwise it is the answered requests' fit read at q / (1 − s), s the
-// timed-out share (the client's fastest q are the answered requests' fastest q / (1 − s): the
-// timed-out ones are all slower), capped at the timeout (no answered request took longer). A
+// fails whatever its max); otherwise it is the fit to every DELIVERED request's latency, before the
+// timeout cut it, read at q and capped at the timeout (the engine times out exactly the requests
+// that fit puts past the timeout, so its fastest q are all answered). A
 // timed-out request is not a drop: no node failed it, so it is in no node's drop rate. An infinite
 // mean makes every latency infinite, which the renderers print as "unavailable" (table) or null
 // (JSON); an op of which nothing was answered in time but something timed out has no latency of its
@@ -126,6 +126,17 @@ struct OpSummary {
   std::optional<double> timeout_s{};
   double timed_out_share{};
 };
+
+// The op table's latency columns: OpSummary's mean_s, p50_s, p95_s and p99_s.
+enum class OpLatency { mean, p50, p95, p99 };
+
+// The number in that column, in seconds.
+[[nodiscard]] double op_latency_s(const OpSummary& op, OpLatency column);
+
+// Whether that column is the client's timeout rather than a latency it saw: a percentile at q of
+// an op more than 1 − q of whose delivered requests timed out (the op table's `>1s`). Never the
+// mean, which describes the requests answered in time.
+[[nodiscard]] bool latency_beyond_timeout(const OpSummary& op, OpLatency column);
 
 enum class SloStatus { pass, fail, skipped };
 
@@ -223,6 +234,9 @@ class Summary {
     double weighted_mean{};    // Σ w·m
     double weighted_square{};  // Σ w·(v + m²) = Σ w·E[X²]
     void add(double w, double mean_s, double variance_s2);
+    // The mixture's mean and variance; precondition: weight > 0.
+    [[nodiscard]] double mean_s() const;
+    [[nodiscard]] double variance_s2() const;
   };
   struct NodeTotals {
     double rho_time{};  // Σ rho·dt
@@ -264,12 +278,17 @@ class Summary {
     double timed_out{};     // Σ timed_out·dt, requests: delivered, but after the client gave up
     Moments by_answered{};  // weighted by requests answered: what an average answer sees
     Moments by_time{};      // weighted by time: the fallback when nothing was answered
+    // The delivered requests' latency before the client gave up (ResponseSample::
+    // delivered_response), weighted by the requests delivered, answered + timed out: what a
+    // timed-out client's percentiles are read off (percentile_seen_by_client).
+    Moments by_delivered{};
     bool unavailable{};
     void add(const engine::ResponseSample& sample, double dt_s);
   };
 
-  // An op's mean and percentiles from the moments its answered requests left (Summary::ops).
-  static void fill_latencies(const Moments& m, OpSummary& op);
+  // An op's mean from the moments its answered requests left, its percentiles from the delivered
+  // ones (Summary::ops).
+  static void fill_latencies(const OpTotals& totals, OpSummary& op);
   [[nodiscard]] double step_length_s(SimTime t);
   [[nodiscard]] OpTotals& totals_for(const engine::ResponseSample& sample, std::size_t hint);
   // The index of the node with the highest `rate` (drop or reject), the first of equals.
@@ -332,6 +351,12 @@ class Summary {
 // A queue lag as the tables print one: format_duration, but "<1us" below a microsecond (an idle
 // consumer group's lag is a vanishing Erlang C figure, not a measurement).
 [[nodiscard]] std::string format_lag(double seconds);
+// The tables' aligner, for a table of plain text cells (`simsys sweep` prints its own with it):
+// every column padded to its widest cell, the first left-aligned and the rest right-aligned (so
+// numbers line up on their units), two spaces between columns; each line starts with `indent`
+// and ends with a newline, trailing blanks trimmed.
+[[nodiscard]] std::string align_columns(std::span<const std::vector<std::string>> rows,
+                                        std::string_view indent);
 
 // `simsys explain`: every resolved number with its provenance, the links, the step order
 // and a static load check (offered load vs capacity, no queueing).

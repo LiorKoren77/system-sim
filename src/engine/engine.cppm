@@ -192,7 +192,10 @@ struct NodeSample {
 // A client with a `timeout` (plan 2c Task 13, Simulation::give_up_after) also gives up on the
 // delivered requests slower than it: those are `timed_out`, not answered, and `response` is the
 // latency of the ones answered in time. So answered = offered − lost − timed_out, and timed_out
-// is 0 for a client that waits for ever.
+// is 0 for a client that waits for ever. `delivered_response` is the latency of every delivered
+// request, answered or timed out, before the client gave up (the untruncated fit the timeout cut):
+// the reports read a timed-out client's percentiles off it (review of plan 2c, C-1). Without a
+// timeout the two are equal.
 struct ResponseSample {
   std::size_t client{};
   std::string op{};
@@ -200,6 +203,7 @@ struct ResponseSample {
   Rate answered{};
   Rate timed_out{};
   flow::LatencyEstimate response{};
+  flow::LatencyEstimate delivered_response{};
 };
 
 // One bandwidth link's pipe for one step (plan 2c refinement 3; Simulation::pass_through_pipe):
@@ -274,8 +278,8 @@ class Simulation {
   // The long-run state at the scenario's step, without disturbing this simulation and
   // independent of what it ran before: settle passes from a clean state until nothing
   // changes (see the definition). Clients offer their rate curve at t = 0 without noise
-  // (estimating at another time, `--at`, is phase 2c). Record time is 0; `converged` says
-  // whether a steady state was found.
+  // (estimating at another time, `--at`, is in the Phase 3 backlog). Record time is 0; `converged`
+  // says whether a steady state was found.
   [[nodiscard]] StepRecord estimate() const;
 
   // Steps from t = 0 while t < duration and hands every record to `observer`: that is
@@ -481,6 +485,9 @@ class Simulation {
 
   [[nodiscard]] StepRecord evaluate(SimTime now, SimTime dt, Mode mode);
   void forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& record);
+  // C++20 std::span<T>: a non-owning view of contiguous elements (a whole array or vector, or
+  // the front of one), replacing a (pointer, count) pair or a `std::vector&` that would force the
+  // caller to own a vector. Here the step's node samples, which this fills in place.
   void record_queue_lags(std::span<NodeSample> samples) const;
   void receive(std::size_t index, Mode mode);
   // Any queueing node (service, load balancer, rate limiter): runs its queues and returns
@@ -503,10 +510,8 @@ class Simulation {
                                             const behaviours::Behaviour& behaviour);
   [[nodiscard]] static flow::Flow dropped_part(const flow::Flow& content,
                                                const fluid::FluidStep& copy_step, double copies);
-  // C++20 std::span<const T>: a non-owning view of contiguous elements (a whole array or
-  // vector, or the front of one), replacing a (pointer, count) pair or a `const std::vector&`
-  // that would force the caller to own a vector. The sojourns live in a fixed-size array of
-  // which only the groups in use are passed (see the caller).
+  // The sojourns live in a fixed-size array of which only the groups in use are passed as a span
+  // (see the caller).
   static void record_sojourns(Node& node, std::span<const flow::LatencyEstimate> sojourns,
                               std::span<const flow::LatencyEstimate> waits, NodeSample& sample);
   [[nodiscard]] static flow::LatencyEstimate request_weighted_sojourn(const Node& node);
@@ -940,7 +945,13 @@ Simulation::Simulation(const graph::Graph& g)
 }
 
 // Pattern: Strategy — each node gets the behaviour of its type, held by value in the
-// behaviours::Behaviour variant and dispatched with std::visit in the forward pass.
+// behaviours::Behaviour variant and dispatched with std::visit in the forward pass, where every
+// behaviour routes and composes its own way. Not every question goes through the strategy: a few
+// helpers ask the variant which kind it holds (std::get_if, std::holds_alternative: is_write_at,
+// failure_rate_of, report_machines, split_writes) for what only one or two node types have, a
+// database's writes, a sink's failures, a kv cluster's machines. That is a type test, the
+// opposite of Strategy; it is kept where the alternative would be a member every other behaviour
+// implements to do nothing.
 // A client's noise seed is client_seed(scenario seed, node index): one random engine per
 // client, so appending a node at the end of the file never changes another client's noise
 // (the seed is the node index; inserting a node earlier shifts the clients after it; spec
@@ -1993,6 +2004,7 @@ std::vector<ResponseSample> Simulation::client_responses(SimTime now) const {
                             .offered = offered,
                             .answered = Rate{offered.per_second * client->delivered(op, fraction)},
                             .response = client->response(op, lookup)};
+      sample.delivered_response = sample.response;  // before give_up_after cuts `response`
       if (const auto timeout_s = client->timeout_s()) give_up_after(*timeout_s, sample);
       responses.push_back(std::move(sample));
     }

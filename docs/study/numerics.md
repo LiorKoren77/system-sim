@@ -151,6 +151,12 @@ of Euler's method: freeze the demand for `dt`, move the state (the backlog) by r
     drain    = min(demand + backlog / dt, capacity)       (line 188)
     backlog += (demand - drain) * dt                      (line 197)
     dropped  = max(backlog - queue_limit, 0) / dt         (line 202)
+    rho_wait = min(demand, drain) / capacity              the load the stochastic (Erlang)
+                                                          wait reads: what arrives, not the
+                                                          busy fraction drain / capacity, so
+                                                          a backlog drained after the load
+                                                          fell is waited out by the fluid
+                                                          term alone
 
 A step like this is exact for demand that is constant within the step, and wrong for
 anything faster: a burst shorter than `dt` is averaged away, and the latency uses the
@@ -238,17 +244,24 @@ all three runs: `reject rate 14.3%`, `rejected 236.7k`; `red_s`, which adds a wh
 per red step, is left out):
 
     step     node  peak_rho  peak_backlog   op            mean    p50     p95    p99
-    5ms      api          1            98   clients.call  5.79ms  3.97ms  16.6ms 29.9ms
-    100ms    api          1            80   clients.call  5.79ms  3.97ms  16.6ms 29.9ms
+    5ms      api          1            98   clients.call  5.73ms  4.39ms  14.6ms 24.1ms
+    100ms    api          1            80   clients.call  5.73ms  4.32ms  14.9ms 24.8ms
+    500ms    api          1             0   clients.call  5.79ms  3.93ms  16.7ms 30.5ms
     1s       api     0.9167             0   clients.call  5.69ms  4.69ms  13ms   19.9ms
 
 The limiter admits the same total at every step, as the paragraph above says. What a coarse
 step erases is the burst's effect downstream: at 1 s the api sees 1,100/s, never overloads,
-and the p99 falls from 29.9 ms to 19.9 ms. (The 29.9 ms was 30.5 ms before the clients'
-`timeout: 1s` applied: cutting 8.9e-7 of the delivered requests, the far tail of the fitted
-lognormal, removes 3.9 % of its variance, and the refit narrows; the requests' own p99 moves by
-about 1e-6.
-A moment fit reacts to its tail that much.) A step shorter than the 5 s spike but not a
+and the p99 falls from 24.8 ms to 19.9 ms. At 500 ms the first step of a spike sends the api
+1,200/s, exactly its capacity: no backlog, but rho 1 for the whole step, where the stochastic
+wait sits at its 0.99 clamp, so the p99 is the highest of the four, 30.5 ms. At 5 ms and 100 ms the
+burst leaves a backlog that the api works off at full capacity while the spike's admitted
+1,000/s arrive: the stochastic wait reads the utilization of what arrives, min(demand, drain) /
+capacity = 1000 / 1200 (`FluidQueue::advance`; the backlog's own drain time is the fluid term),
+so the burst's wait falls with its backlog. (Before the comprehensive 2c review it read the busy
+fraction, 1, and held at the clamp until the backlog was gone: 29.9 ms at both steps.) The
+clients' `timeout: 1s` moves none of these figures: it times out 3e-7 of the delivered calls, and
+a percentile is read off the fit to every delivered call, which the cut leaves alone
+(section 10). A step shorter than the 5 s spike but not a
 divisor of it shows the other loss. At `step: 2s` the 5 s spike at 25 min is sampled at
 t = 25:00, 25:02 and 25:04, so it is offered for 6 s: the limiter then prints
 `reject rate 15%` and `rejected 251.7k`, 15,000 more, which is the 1 s of extra spike times
@@ -436,8 +449,8 @@ same function, so the consistent-hashing lab's balancer and the kv-store lab's c
    residual check still passes (section 6). What coarse steps lose is fidelity, not balance.
 4. **Find the step where the burst disappears.** Run the rate-limiter lab at `step: 5ms`,
    `100ms`, `500ms` and `1s` (the commands are in "Choosing the step", section 6) and watch
-   the api row's `peak_backlog` (98, 80, 0, 0) and the p99 (29.9 ms until the step reaches
-   1 s, then 19.9 ms). Then set the limiter's `burst: 1000`, which moves the ceiling to
+   the api row's `peak_backlog` (98, 80, 0, 0) and the p99 (24.1 ms, 24.8 ms, 30.5 ms at the
+   step that makes each burst exactly the api's capacity, then 19.9 ms). Then set the limiter's `burst: 1000`, which moves the ceiling to
    1000 / 15000 = 67 ms. The burst now overfills the api's queue at every step, so the step
    hardly matters: the api's `dropped` is 1.385k at 5 ms, 1.36k at 100 ms and 1.2k at
    500 ms. Why? (The api's waiting room, `queue_limit`, caps the backlog the same way at
@@ -485,54 +498,50 @@ its digits in both tails (`1 − erf` would lose every digit below Φ = 1e-16, s
 cancellation again). The partial moments come from completing the square: X^k = e^{k ln X}
 shifts the normal density of ln X by kσ², so the share of the k-th moment below τ is the normal
 CDF at z − kσ. The answered requests' moments are those of a **truncated** distribution, the
-original with everything past τ removed and the rest scaled back to 1 (divided by Φ(z)); the
-reports then fit their percentiles to the truncated moments and cap them at τ.
+original with everything past τ removed and the rest scaled back to 1 (divided by Φ(z)): the
+op's **mean** is theirs, the time an answer took on average.
 
-**Which quantile of that fit.** The client's percentile at q is not the answered requests' own
-percentile at q. Of the requests the path delivered, a share s = 1 − Φ(z) timed out and every one
-of them is slower than τ, slower than every answered request. So the fastest q of the delivered
-requests (for q ≤ 1 − s) are all answered ones, the fastest q / (1 − s) of them:
+**Which fit the percentiles are read off.** Not the truncated one. The engine decides who times
+out on the untruncated fit: a request is timed out exactly when that lognormal puts it past τ. So
+of the requests the path delivered, the share s = 1 − Φ(z) that timed out are the fit's slowest s,
+and for q ≤ 1 − s the fastest q of the delivered requests are all answered ones: the client's
+q-quantile **is** the untruncated fit's q-quantile, which the timeout does not move. The engine
+keeps those moments beside the truncated ones (`ResponseSample::delivered_response`), the report
+sums them over the run weighted by the requests delivered, answered plus timed out
+(`Summary::OpTotals::by_delivered`), and reads the percentile there at q itself, capped at τ
+(`percentile_seen_by_client`, `src/report/report.cpp`; the cap only matters for a run that mixes
+steps, since one steady step has s ≤ 1 − q exactly when the fit's q-quantile is at most τ). When
+s > 1 − q no request at q was answered and the percentile is the timeout itself, `>τ` (the C-1
+rule). So a percentile never falls as τ grows, meets τ from below as s rises to 1 − q, and is the
+untimed client's once the cut is empty. The path below behind a 530 ms timeout (0.78 % timed out)
+has the p99 it has without one, 490.5 ms (tests/theory/test_timeout.cpp derives it, and checks
+that the p99 does not fall over ten timeouts from 300 ms to 3 s).
 
-    client's q-quantile = answered requests' quantile at q_eff = q / (1 − s)
-
-and the report reads the refitted lognormal at z = Φ⁻¹(q_eff) (`queueing::normal_quantile`), capped
-at τ (`percentile_seen_by_client`, `src/report/report.cpp`). Read at q itself, the fit ignored the
-timed-out tail, and a timeout made a percentile look better: the path below behind a 530 ms
-timeout (0.78 % timed out) showed a p99 of 404 ms, under the 490 ms the same path has without a
-timeout; at q_eff = 0.99 / 0.99223 = 0.99776 the refit is at 591 ms, so the p99 is the cap, 530 ms
-(tests/theory/test_timeout.cpp derives both). As s rises to 1 − q, q_eff rises to 1 and the
-percentile to τ: it meets the rule for s > 1 − q (the timeout itself, `>τ`) continuously.
+**Why not refit the answered requests.** Until the comprehensive 2c review the reports fitted a
+second lognormal to the truncated moments and read it at q / (1 − s). That refit has a tail past
+τ the truncated distribution lacks, and its moments react to a cut far more than the requests do:
+the share of the k-th moment past τ is Φ(kσ − z), which grows with k. Behind a 1 s timeout the path
+below times out 0.073 % of its requests, yet 0.94 % of its first moment and 6.5 % of its second
+lie past 1 s; cutting them takes 11 % of the variance (0.01 → 0.00889 s²), and the refit's p99 was
+475.5 ms where the requests' own p99 had not moved from 490 ms. Behind 600 ms it was 508.9 ms, so
+the old p99 rose and fell as the timeout grew. The rate-limiter lab showed it in a whole run: a
+cut of 8.9e-7 of its calls moved its p99 from 30.5 to 29.9 ms. Reading the delivered fit removes
+both: a tiny cut moves no percentile.
 
 **Checked against the binary.** A client at 10/s sending `get` to a service of 100 ms service
 time and 1k/s (c = 100, so no wait: the sojourn is exponential, m = 100 ms, v = 0.01 s², SCV 1)
 over a link of `latency: 0s`, with `timeout: 200ms` (σ = 0.8326, μ = −2.6492, z = 1.2488):
 
     client.op  offered/s  timed out/s  mean     p50     p95     p99  (estimated)
-    users.get         10        1.059  74ms  68.4ms  >200ms  >200ms
+    users.get         10        1.059  74ms  70.7ms  >200ms  >200ms
 
 89.41 % answered (JSON `answered_per_s` 8.941367), 10.59 % timed out, and the answered mean
 73.97 ms (`mean_s` 0.0739704), as the formulas give. At `timeout: 1s` 99.927 % are answered, at
-`50ms` 33.86 %. The p50 is the refit (σ' = 0.5702, μ' = −2.7667) read at q_eff = 0.5 / 0.89414 =
-0.5592, z = 0.1489: exp(−2.7667 + 0.5702 × 0.1489) = 68.4 ms (at q it would be the refit's
-median, 62.9 ms; the untruncated path's median is 70.7 ms). The p95 and the p99 print `>200ms`:
-more than 5 % of the delivered requests timed out, so no request at those quantiles was answered,
-and a latency SLO on them fails whatever its `max` (the review's C-1 rule,
-`percentile_seen_by_client` in `src/report/report.cpp`).
-
-**Why a tiny cut moves a percentile.** At `timeout: 1s` the same path times out 0.073 % of its
-requests (`P(X > τ)` = Φ(−3.182) = 7.31e-4), yet its p99 falls from 490 ms to 475 ms, 3 %. The
-partial moments say why: the share of the k-th moment past τ is Φ(kσ − z), which grows with k.
-Past 1 s lie 0.073 % of the requests, 0.94 % of the first moment (Φ(σ − z)) and 6.5 % of the
-second (Φ(2σ − z)). Removing the tail takes 11 % of the variance with it (0.01 → 0.00889 s²) and
-the refitted lognormal is narrower: read at q its p99 is exp(μ' + 2.326 σ') = 464.9 ms, and at
-q_eff = 0.99 / 0.99927 = 0.99073 (z = 2.354) it is 475.5 ms, the report's. Nothing is wrong:
-the requests' own p99 barely moved (it was below 1 s), but a percentile read off two moments
-reacts to a change in the second moment, and a heavy tail carries much more second moment than
-probability. The rate-limiter lab shows the same in a whole run: its clients' `timeout: 1s` cuts
-0.0007284 of the 818 calls a second the path delivers (8.9e-7 of them), and the p99 goes from
-30.5 ms (delete the `timeout` line and run) to 29.9 ms, 2 % (the run's variance, backed out of its
-printed mean and p50, falls 3.9 %). The model accepts this rather than add a threshold below which
-a timeout is ignored: a threshold would make the p99 jump where the share crosses it.
+`50ms` 33.86 %. The p50 is the fit's median, exp(μ) = 0.1 / √2 = 70.7 ms, what the path shows
+without a timeout. The p95 and the p99 print `>200ms`: more than 5 % of the delivered requests
+timed out, so no request at those quantiles was answered, and a latency SLO on them fails whatever
+its `max`. At `timeout: 1s` the row reads `99.1ms  70.7ms  278ms  490ms`: the untimed path's
+percentiles.
 
 **The underflow guard.** When a response hardly varies and sits well above τ, z is far below
 zero and Φ(z) underflows to exactly 0 (below about z = −38.5): youtube's 300 MB uploads take 12 s

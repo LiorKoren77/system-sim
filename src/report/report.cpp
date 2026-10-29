@@ -2,9 +2,9 @@
 // four renderers (table, JSON, CSV series, explain). Heavy headers (<ostream>, <ranges>,
 // ...) belong here, not in the interface unit (CLAUDE.md §3, GCC 14.2 'Bad file data' bug).
 //
-// Every number is formatted with std::to_chars, never with a std::format precision such as
-// "{:.3f}": with GCC 14.2, a precision in a format spec throws std::format_error at run
-// time in a unit that imports simsys.core (CLAUDE.md §3, second <format> defect).
+// Every number is formatted with std::to_chars (simsys::to_chars_text), never with a std::format
+// precision such as "{:.3f}": with GCC 14.2, a precision in a format spec throws std::format_error
+// at run time in a unit that imports simsys.core (CLAUDE.md §3, second <format> defect).
 module;
 #include <algorithm>
 #include <array>
@@ -54,27 +54,12 @@ constexpr double infinity = std::numeric_limits<double>::infinity();
 
 // ---- number formatting ----
 
-// std::to_chars (C++17): locale-independent, allocation-free number formatting. Used for
-// every number here instead of std::format precisions (see the top of the file).
-// A value too long for the buffer (only possible for huge fixed-point numbers) falls back
-// to the shortest round-trip form, which always fits.
-[[nodiscard]] std::string shortest(double value) {
-  std::array<char, 32> buffer{};  // the shortest form of any double is at most 24 chars
-  const auto written = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
-  return std::string{buffer.data(), written.ptr};
-}
-
-[[nodiscard]] std::string to_text(double value, std::chars_format format, int precision) {
-  std::array<char, 128> buffer{};
-  const auto written =
-      std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, format, precision);
-  if (written.ec != std::errc{}) return shortest(value);
-  return std::string{buffer.data(), written.ptr};
-}
+// Every number is written by simsys::to_chars_text (simsys.core), never by a std::format precision
+// (see the top of the file).
 
 // `value` with `digits` significant digits, trailing zeros dropped: 0.5, 1.5, 1000.
 [[nodiscard]] std::string num(double value, int digits = 4) {
-  return to_text(value, std::chars_format::general, digits);
+  return to_chars_text(value, std::chars_format::general, digits);
 }
 
 // A unit and its size in the base unit (seconds, or one request).
@@ -93,9 +78,14 @@ constexpr std::array si_prefixes{Unit{"G", 1e9}, Unit{"M", 1e6}, Unit{"k", 1e3}}
 // that unit: 999.7 us reads "1ms", not "1e+03us".
 constexpr double rounds_to_one = 0.9995;
 
+}  // namespace
+
+// The two exported formatters of the tables (report.cppm) are defined here, outside the anonymous
+// namespace, so the renderers below call them by their one name (format_duration, format_lag).
+
 // Seconds in the largest unit that keeps the number >= 1, three significant digits:
 // 0.0005 -> "500us", 120 -> "2m". Infinity means the node never answers: "unavailable".
-[[nodiscard]] std::string fmt_duration(double seconds_value) {
+std::string format_duration(double seconds_value) {
   if (!std::isfinite(seconds_value)) return "unavailable";
   if (seconds_value == 0.0) return "0s";
   for (const auto& unit : duration_units) {
@@ -106,8 +96,10 @@ constexpr double rounds_to_one = 0.9995;
   return num(seconds_value / 1e-9, 3) + "ns";  // below one nanosecond
 }
 
-[[nodiscard]] std::string fmt_duration(SimTime t) {
-  return fmt_duration(seconds(t));
+// The same for a SimTime (module linkage: not exported, but an overload of the exported name, so
+// one name serves both).
+[[nodiscard]] std::string format_duration(SimTime t) {
+  return format_duration(seconds(t));
 }
 
 // A queue lag as the node table and the SLO lines print it: a duration, or "<1us" for a lag that
@@ -115,11 +107,13 @@ constexpr double rounds_to_one = 0.9995;
 // stochastic wait is Erlang C's tiny chance of waiting times a job (youtube's completion_q:
 // 6.3e-11 s, "0.0632ns"), a figure below anything a queue's lag is ever measured in; the JSON
 // and the CSV keep the number.
-[[nodiscard]] std::string fmt_lag(double seconds_value) {
-  const double below = rounds_to_one * 1e-6;  // what fmt_duration would print under "1us"
+std::string format_lag(double seconds_value) {
+  const double below = rounds_to_one * 1e-6;  // what format_duration would print under "1us"
   if (seconds_value > 0.0 && seconds_value < below) return "<1us";
-  return fmt_duration(seconds_value);
+  return format_duration(seconds_value);
 }
+
+namespace {
 
 // From here on the largest prefix, G, would need an exponent itself ("1e+04G").
 constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
@@ -142,7 +136,8 @@ constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
 // grammar writes counts with k/M/G or digits only (config's parse_count).
 [[nodiscard]] std::string fmt_count(double value) {
   if (!std::isfinite(value) || std::abs(value) < beyond_prefixes) return with_si_prefix(value);
-  return to_text(value, std::chars_format::fixed, 0);  // no std::format precision: see the top
+  // No std::format precision: see the top.
+  return to_chars_text(value, std::chars_format::fixed, 0);
 }
 
 // A queue's waiting room: as written up to six digits (1000, 12000, 500000), and from a million
@@ -166,7 +161,7 @@ constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
 // plan 2c Tasks 9-10, minor 11). 999.5 and up rounds to four digits, so that is where it switches.
 [[nodiscard]] std::string percent(double ratio) {
   const double value = ratio * 100.0;
-  if (value >= 999.5) return to_text(value, std::chars_format::fixed, 0) + "%";
+  if (value >= 999.5) return to_chars_text(value, std::chars_format::fixed, 0) + "%";
   return num(value, 3) + "%";
 }
 
@@ -262,13 +257,15 @@ constexpr std::string_view ansi_reset = "\x1b[0m";
 
 // Every column padded to its widest cell (names left, numbers right by default), two
 // spaces between columns, colour codes wrapped around the padded text so they do not
-// count towards the width. Trailing blanks are trimmed.
+// count towards the width. Every line starts with `indent` (the tables' two spaces under their
+// heading); trailing blanks are trimmed.
 [[nodiscard]] std::string aligned(std::span<const Row> rows,
-                                  Align align = Align::first_left_rest_right) {
+                                  Align align = Align::first_left_rest_right,
+                                  std::string_view indent = "  ") {
   const auto widths = column_widths(rows);
   std::string out;
   for (const auto& row : rows) {
-    std::string line = "  ";
+    std::string line{indent};
     for (std::size_t i = 0; i < row.size(); ++i) {
       if (i > 0) line += "  ";
       const bool right = align == Align::first_left_rest_right && i > 0;
@@ -290,6 +287,9 @@ struct Quantile {
   double level;
   double z;
 };
+// C++20 designated initializers: name the fields being set, so two doubles (here `level` and `z`)
+// cannot be swapped unnoticed; a field left out keeps its default member initializer. Replaces
+// positional braces, which say nothing about which value is which.
 constexpr Quantile median{.level = 0.50, .z = queueing::z_p50};
 constexpr Quantile ninety_fifth{.level = 0.95, .z = queueing::z_p95};
 constexpr Quantile ninety_ninth{.level = 0.99, .z = queueing::z_p99};
@@ -307,61 +307,44 @@ constexpr Quantile ninety_ninth{.level = 0.99, .z = queueing::z_p99};
   return share_timed_out > 1.0 - q.level;
 }
 
-// The percentile at q of the response a client sees (plan 2c Task 13 and its review, C-1): the one
-// rule for the whole run's op table and for each window of an SLO's `over` (plan 2c Task 14).
-//  - Without a timeout: the lognormal fitted to the answered requests' mean and variance.
-//  - With one, when more than 1 − q of the delivered requests timed out: the timeout, flagged
-//    `beyond_timeout`. A latency SLO at q then fails whatever its max: past a max below the
-//    timeout the requests are certainly slower, and a max at or above it cannot be checked
-//    (the client stopped measuring at the timeout).
-//  - With one, otherwise: the answered requests' fit read at the higher level
-//      q_eff = q / (1 − s)        (s the timed-out share, s <= 1 − q, so q_eff <= 1)
-//    and capped at the timeout. Why q_eff: of the client's delivered requests a share 1 − s was
-//    answered (all faster than the timeout) and a share s timed out (all slower). The fastest q of
-//    them are therefore all answered ones, the fastest q / (1 − s) of the answered requests: the
-//    client's q-quantile is the answered requests' q_eff-quantile (review of the Task 12/13 fix
-//    rounds and Task 14, C-1). Reading the fit at q itself ignored the timed-out tail and made a
-//    timeout LOWER a percentile: an M/M/1 path at rho 0.99 (p99 490 ms) behind a 530 ms timeout
-//    (0.78 % timed out) showed a p99 of 404 ms. q_eff -> 1 as s -> 1 − q, where the fit's tail
-//    reaches the cap: the percentile meets the timeout from below, continuous with the first rule.
-//    The cap is still needed: the fit to the answered requests' truncated moments has a tail past
-//    the cut that the truncated distribution does not (mean 73.97 ms, variance 0.0021022 s² after
-//    a 200 ms timeout put its p99 at 236.7 ms); the cap is the truncation it forgets.
-// The cap alone is not enough for the first rule: the refit's p99 stays below the timeout though
-// more than 1 % timed out (an exponential path of mean 100 ms against 391 ms: 2 % time out, the
-// refit's p99 is 357 ms, 0.91 of the timeout), and an SLO of 380 ms would pass on requests never
-// answered.
+// The percentile at q of the response a client sees (plan 2c Task 13 and the comprehensive 2c
+// review, C-1): the one rule for the whole run's op table and for each window of an SLO's `over`
+// (plan 2c Task 14). `mean_s` and `variance_s2` are the DELIVERED requests' moments, before the
+// timeout cut them (Summary::OpTotals::by_delivered), s the timed-out share of them.
+//  - Without a timeout: the lognormal fitted to those moments, read at q.
+//  - With one, when more than 1 − q of the delivered requests timed out (s > 1 − q): the
+//    timeout, flagged `beyond_timeout`. No request at quantile q was answered; a latency SLO at q
+//    then fails whatever its max: past a max below the timeout the requests are certainly slower,
+//    and a max at or above it cannot be checked (the client stopped measuring at the timeout).
+//  - With one, otherwise (s <= 1 − q): the same delivered fit read at q, capped at the timeout.
+//    Why the delivered fit: the engine decides who times out on that fit (give_up_after), so a
+//    request is timed out exactly when the fit puts it past the timeout, and the fastest q of the
+//    delivered requests are the fastest q of the fit: answered ones, all faster than the timeout.
+//    The client's q-quantile IS the fit's, which the timeout does not move. The cap only matters
+//    when the run mixes steps: one steady step has s <= 1 − q exactly when the fit's q-quantile is
+//    at or below the timeout.
+// So a percentile never falls as the timeout grows (a longer timeout times out fewer requests and
+// caps higher), and a client whose timeout cut nothing reads exactly what it would without one.
+// The rule it replaced refitted a lognormal to the answered requests' truncated moments and read it
+// at q / (1 − s); that refit has a tail past the cut the truncated distribution does not, and was
+// neither exact nor monotonic: M/M/1 at 990/s and 1 ms (model p99 490.5 ms) printed a p99 of
+// 508.9 ms behind a 600 ms timeout and 475.5 ms behind a 1 s one.
 struct SeenPercentile {
   double seconds;
   bool beyond_timeout;
 };
 
-// The answered requests' lognormal fit read at the z-score `z`, capped at the timeout.
-[[nodiscard]] double capped_fit(double mean_s, double variance_s2, double z, double timeout_s) {
-  return std::min(queueing::lognormal_quantile(mean_s, variance_s2, z), timeout_s);
-}
-
 [[nodiscard]] SeenPercentile percentile_seen_by_client(double mean_s, double variance_s2,
                                                        double share_timed_out,
                                                        std::optional<double> timeout_s,
                                                        Quantile q) {
-  if (!timeout_s) {
-    return {.seconds = queueing::lognormal_quantile(mean_s, variance_s2, q.z),
-            .beyond_timeout = false};
-  }
+  const double fit_s = queueing::lognormal_quantile(mean_s, variance_s2, q.z);
+  if (!timeout_s) return {.seconds = fit_s, .beyond_timeout = false};
   if (quantile_timed_out(share_timed_out, q)) {
     return {.seconds = *timeout_s, .beyond_timeout = true};
   }
-  // Nothing timed out: q_eff = q, read at q's own constant z, so such a client's figures are
-  // exactly what they were before the rule.
-  if (share_timed_out <= 0.0) {
-    return {.seconds = capped_fit(mean_s, variance_s2, q.z, *timeout_s), .beyond_timeout = false};
-  }
-  const double q_eff = q.level / (1.0 - share_timed_out);
-  // s = 1 − q exactly: q_eff = 1, the fit's far tail, which the cap turns into the timeout.
-  if (q_eff >= 1.0) return {.seconds = *timeout_s, .beyond_timeout = false};
-  return {.seconds = capped_fit(mean_s, variance_s2, queueing::normal_quantile(q_eff), *timeout_s),
-          .beyond_timeout = false};
+  // The fit first in std::min: a NaN propagates.
+  return {.seconds = std::min(fit_s, *timeout_s), .beyond_timeout = false};
 }
 
 // The same question of a summarised op.
@@ -568,9 +551,6 @@ void fail_if_quantile_timed_out(SloResult& result, std::span<const OpSummary> op
 // node that is no database, a queue lag with no message queue, a frontier's before phase 3), or
 // no step was observed.
 [[nodiscard]] SloResult skipped(const model::SloSpec& slo) {
-  // C++20 designated initializers: name the fields being set, so `observed` and `status`
-  // cannot be swapped unnoticed; a field left out keeps its default member initializer.
-  // Replaces positional braces, which say nothing about which value is which.
   return SloResult{.slo = slo, .observed = std::nullopt, .status = SloStatus::skipped};
 }
 
@@ -635,14 +615,14 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
 // A latency, a staleness or a queue lag is a time, printed with its unit; every other metric a
 // ratio.
 [[nodiscard]] std::string fmt_slo_value(model::SloMetric metric, double value) {
-  if (metric == model::SloMetric::queue_lag) return fmt_lag(value);
+  if (metric == model::SloMetric::queue_lag) return format_lag(value);
   const bool is_time = is_latency(metric) || metric == model::SloMetric::staleness;
-  return is_time ? fmt_duration(value) : num(value);
+  return is_time ? format_duration(value) : num(value);
 }
 
 // A limit in its own kind: a duration with a unit (queue_lag's 1s too), a ratio as is.
 [[nodiscard]] std::string fmt_limit(const std::variant<SimTime, double>& max) {
-  return std::visit(Overloaded{[](SimTime limit) { return fmt_duration(limit); },
+  return std::visit(Overloaded{[](SimTime limit) { return format_duration(limit); },
                                [](double limit) { return num(limit); }},
                     max);
 }
@@ -693,7 +673,7 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   if (resolved.spec.type == model::NodeType::client)
     return {{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}};
   Row row = queue_cells(node, resolved.capacity, color);
-  row.push_back({node.peak_queue_lag_s ? fmt_lag(*node.peak_queue_lag_s) : "-"});
+  row.push_back({node.peak_queue_lag_s ? format_lag(*node.peak_queue_lag_s) : "-"});
   row.push_back(unavailable_cell(node));
   return row;
 }
@@ -750,7 +730,7 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   for (const auto& node : summary.nodes()) {
     if (!node.mean_replication_dropped_per_s) continue;
     rows.push_back({{node.id},
-                    {fmt_duration(node.mean_staleness_s.value_or(0.0))},
+                    {format_duration(node.mean_staleness_s.value_or(0.0))},
                     {with_si_prefix(node.mean_committed_writes_per_s.value_or(0.0))},
                     {with_si_prefix(*node.mean_replication_dropped_per_s)}});
   }
@@ -762,14 +742,14 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
 // that fails everything it serves has no latency to show, only the sojourn of requests that all
 // failed), else the duration.
 [[nodiscard]] std::string op_latency_cell(const OpSummary& op, double seconds_value) {
-  return nothing_answered(op) ? "-" : fmt_duration(seconds_value);
+  return nothing_answered(op) ? "-" : format_duration(seconds_value);
 }
 
 // A percentile's cell: `>1s` when more than 1 − q of the delivered requests timed out (the client
 // never saw that quantile answered: percentile_seen_by_client), else as any latency cell.
 [[nodiscard]] std::string op_percentile_cell(const OpSummary& op, double seconds_value,
                                              Quantile q) {
-  if (beyond_timeout(op, q)) return ">" + fmt_duration(*op.timeout_s);
+  if (beyond_timeout(op, q)) return ">" + format_duration(*op.timeout_s);
   return op_latency_cell(op, seconds_value);
 }
 
@@ -777,6 +757,8 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
 // timeout: without one nothing can time out, and the table keeps its old shape.
 [[nodiscard]] std::string op_table(const Summary& summary) {
   const auto ops = summary.ops();
+  // C++20 std::ranges::any_of: the range itself instead of a begin/end pair (std::any_of), so it
+  // cannot be paired with another container's end by mistake.
   const bool any_timeout =
       std::ranges::any_of(ops, [](const OpSummary& op) { return op.timeout_s.has_value(); });
   Row header{{"client.op"}, {"offered/s"}};
@@ -877,7 +859,7 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
 
 // JSON has no infinity: a latency that never arrives is null.
 [[nodiscard]] std::string json_number(double value) {
-  return std::isfinite(value) ? shortest(value) : "null";
+  return std::isfinite(value) ? format_number(value) : "null";
 }
 
 [[nodiscard]] std::string json_optional_number(const std::optional<double>& value) {
@@ -1010,8 +992,8 @@ template <class T, class F>
 
 [[nodiscard]] std::string explain_header(const model::Scenario& s) {
   return "scenario " + s.name + "  version " + std::to_string(s.version) + "  duration " +
-         fmt_duration(s.duration) + "  step " + fmt_duration(s.step) + "  warmup " +
-         fmt_duration(s.warmup) + "  seed " + std::to_string(s.seed) + "\n" +
+         format_duration(s.duration) + "  step " + format_duration(s.step) + "  warmup " +
+         format_duration(s.warmup) + "  seed " + std::to_string(s.seed) + "\n" +
          "datacenters: " + join(s.datacenters, ", ") + "\n";
 }
 
@@ -1028,7 +1010,7 @@ template <class T, class F>
   constexpr auto minute_ns = (1_min).count();
   constexpr auto day_ns = (24_h).count();
   const auto ns = t.count();
-  if (ns < 0 || ns >= day_ns || ns % minute_ns != 0) return fmt_duration(t);
+  if (ns < 0 || ns >= day_ns || ns % minute_ns != 0) return format_duration(t);
   const auto minutes = ns / minute_ns;
   return two_digits(minutes / 60) + ":" + two_digits(minutes % 60);
 }
@@ -1062,17 +1044,17 @@ template <class T, class F>
 
 [[nodiscard]] std::string wave_summary(const workload::Wave& wave) {
   return "wave " + std::string{workload::to_string(wave.shape)} +
-         " P=" + fmt_duration(wave.period) + " A=" + num(wave.amplitude) + " peak " +
+         " P=" + format_duration(wave.period) + " A=" + num(wave.amplitude) + " peak " +
          clock_or_duration(wave.peak_at);
 }
 
 [[nodiscard]] std::string ramp_summary(const workload::Ramp& ramp) {
   return "ramp " + fmt_rate(ramp.from.per_second) + "->" + fmt_rate(ramp.to.per_second) + " over " +
-         fmt_duration(ramp.over);
+         format_duration(ramp.over);
 }
 
 [[nodiscard]] std::string noise_summary(const workload::Noise& noise) {
-  return "noise σ=" + num(noise.sigma) + " τ=" + fmt_duration(noise.correlation);
+  return "noise σ=" + num(noise.sigma) + " τ=" + format_duration(noise.correlation);
 }
 
 // "base 800/s, wave sine P=24h A=0.6 peak 20:00, ramp 0/s->10k/s over 5m, spikes 3,
@@ -1203,9 +1185,10 @@ template <class T>
   const auto algorithm = spec.algorithm.value_or(model::LimiterAlgorithm::token_bucket);
   std::string text = "  algorithm=" + std::string{model::to_string(algorithm)} +
                      " limit=" + fmt_rate(spec.limit->per_second);
-  text += model::is_windowed(algorithm)
-              ? " window=" + fmt_duration(model::limiter_window(spec)) + if_defaulted(spec.window)
-              : " burst=" + num(model::limiter_burst(spec), 10) + if_defaulted(spec.burst);
+  text +=
+      model::is_windowed(algorithm)
+          ? " window=" + format_duration(model::limiter_window(spec)) + if_defaulted(spec.window)
+          : " burst=" + num(model::limiter_burst(spec), 10) + if_defaulted(spec.burst);
   if (spec.backend) text += " backend=" + *spec.backend;
   return text;
 }
@@ -1343,7 +1326,7 @@ template <class T>
   if (spec.backend) text += " backend=" + *spec.backend;
   if (spec.keys) text += " keys=" + fmt_count(static_cast<double>(*spec.keys));
   if (spec.eviction) text += " eviction=" + *spec.eviction;
-  if (spec.ttl) text += " ttl=" + fmt_duration(*spec.ttl);
+  if (spec.ttl) text += " ttl=" + format_duration(*spec.ttl);
   return text;
 }
 
@@ -1374,7 +1357,7 @@ template <class T>
   if (!spec.hit_ratio) text += " (every read misses: h = 0)";
   if (spec.origin) text += " misses → " + *spec.origin;
   if (spec.keys) text += " keys=" + fmt_count(static_cast<double>(*spec.keys));
-  if (spec.ttl) text += " ttl=" + fmt_duration(*spec.ttl);
+  if (spec.ttl) text += " ttl=" + format_duration(*spec.ttl);
   return text + cdn_served_ops(g, cdn);
 }
 
@@ -1389,7 +1372,7 @@ template <class T>
 // nothing replicates, so a stated lag describes nothing (it is accepted, so a scenario can keep
 // it while trying one copy).
 [[nodiscard]] std::string lag_summary(const model::NodeSpec& spec) {
-  const std::string lag = "  lag=" + fmt_duration(spec.replication_lag.value_or(SimTime{0}));
+  const std::string lag = "  lag=" + format_duration(spec.replication_lag.value_or(SimTime{0}));
   if (!spec.replication_lag) return lag + " (default)";
   return spec.replicas < 2 ? lag + " (unused: no replicas)" : lag;
 }
@@ -1432,7 +1415,7 @@ struct QueueProvenance {
   const auto queue_source =
       spec.advanced.queue_limit ? defaults::Source::scenario : defaults::Source::type_default;
   return {"(pool " + std::to_string(*spec.pool) + " / " +
-              fmt_duration(node.capacity.service_time_s) + ")",
+              format_duration(node.capacity.service_time_s) + ")",
           provenance(node.service_time_source), "(pool)", provenance(queue_source)};
 }
 
@@ -1504,7 +1487,7 @@ struct QueueProvenance {
   const std::array parts{
       placement(spec),
       "capacity=" + fmt_units(spec, cap.service_rate.per_second) + " " + source.capacity,
-      "service_time=" + fmt_duration(cap.service_time_s) + std::string{per_unit(spec)} + " " +
+      "service_time=" + format_duration(cap.service_time_s) + std::string{per_unit(spec)} + " " +
           std::string{source.service_time},
       "c=" + std::to_string(cap.concurrency) + std::string{per_slot(spec)} + " " +
           std::string{source.concurrency},
@@ -1590,17 +1573,17 @@ struct QueueProvenance {
   if (!defaults::worker_pool_rate(spec)) return {};
   const std::string consumes = spec.consumes ? "  consumes=" + *spec.consumes : "";
   return consumes + "  workers=" + std::to_string(*spec.workers) +
-         " cost=" + fmt_duration(*spec.job_cost);
+         " cost=" + format_duration(*spec.job_cost);
 }
 
 // A retention as a queue's is quoted: in whole days when it is some ("7d", Kafka's default of
 // 168 h), else as explain writes any duration ("10s", "36h"). Only here: every other duration
-// keeps fmt_duration's hours ("ttl=24h"), so this rule changes no other line.
+// keeps format_duration's hours ("ttl=24h"), so this rule changes no other line.
 [[nodiscard]] std::string fmt_retention(SimTime retention) {
   constexpr SimTime::rep ns_per_day = 86'400'000'000'000;
   const auto ticks = retention.count();
   if (ticks > 0 && ticks % ns_per_day == 0) return std::to_string(ticks / ns_per_day) + "d";
-  return fmt_duration(retention);
+  return format_duration(retention);
 }
 
 // A message queue's model (plan 2c refinement 4): "  retention=7d (default: Kafka's 168 h)
@@ -1624,7 +1607,8 @@ struct QueueProvenance {
 // rebuild's load (and the freshness of the answers between rebuilds) is not part of the model.
 [[nodiscard]] std::string search_index_summary(const model::NodeSpec& spec) {
   if (spec.type != model::NodeType::search_index || !spec.build_interval) return {};
-  return "  build_interval=" + fmt_duration(*spec.build_interval) + " (rebuild load not modelled)";
+  return "  build_interval=" + format_duration(*spec.build_interval) +
+         " (rebuild load not modelled)";
 }
 
 // An external sink's model (plan 2c refinement 8): "  failure_rate=2% politeness=1/s (not
@@ -1688,8 +1672,8 @@ constexpr std::array bit_prefixes{BitPrefix{1e9, "G"}, BitPrefix{1e6, "M"}, BitP
   for (const auto& prefix : bit_prefixes) {
     const double count = bits / prefix.size;
     if (count < 1.0 || count != std::round(count)) continue;
-    return to_text(count, std::chars_format::fixed, 0) + std::string{prefix.name} + "bit/s (" +
-           bytes + ")";
+    return to_chars_text(count, std::chars_format::fixed, 0) + std::string{prefix.name} +
+           "bit/s (" + bytes + ")";
   }
   return bytes;
 }
@@ -1697,7 +1681,7 @@ constexpr std::array bit_prefixes{BitPrefix{1e9, "G"}, BitPrefix{1e6, "M"}, BitP
 [[nodiscard]] std::string link_details(const graph::Graph& g, const graph::ResolvedLink& link,
                                        const model::LinkSpec& spec) {
   std::vector<std::string> parts{
-      "one_way=" + fmt_duration(link.one_way) + " " + link_latency_source(g, link),
+      "one_way=" + format_duration(link.one_way) + " " + link_latency_source(g, link),
       "delay_steps=" + std::to_string(link.delay_steps)};
   if (spec.bandwidth) parts.push_back("bandwidth=" + fmt_bandwidth(*spec.bandwidth));
   if (!link.ops.empty()) parts.push_back("ops=" + join(link.ops, ","));
@@ -1933,19 +1917,6 @@ void forward_cached(const graph::Graph& g, std::size_t from, std::vector<OpLoad>
   forward_then_steps(g, from, arriving, load, fed_back);
 }
 
-// What a blob store or a worker pool sends on along its `then` steps: a store one event per write,
-// rate × factor, and nothing for a read (plan 2c refinements 6-7, as BlobStoreBehaviour::route
-// does; S3 has no event for a GET); a pool every step for every job it is OFFERED (plan 2c Task 7).
-// On paper nothing queues or is dropped: every write that arrives is served and notifies, and a
-// pool offered more than its workers / cost passes all of it on (its own line is red; what the
-// engine forwards is what the pool drains, at most its capacity). The paper load answers "can
-// this ever fit", not "what goes through".
-void forward_handed_on(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
-                       std::vector<OpLoad>& fed_back) {
-  const OpLoad arriving = load[from];  // a copy, as in forward_steps
-  forward_then_steps(g, from, arriving, load, fed_back);
-}
-
 // Forwards what reached node `from` along its resolved `ops` hops (rate × factor × the share
 // of requests that take the hop: 1, or a cache's miss fraction 1 − h for an `on: miss`
 // step, whose factor includes its lookup's, so every missed lookup is fetched;
@@ -1971,8 +1942,16 @@ void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_
     forward_cached(g, from, load, fed_back);
     return;
   }
+  // What a blob store or a worker pool sends on along its `then` steps: a store one event per
+  // write, rate × factor, and nothing for a read (plan 2c refinements 6-7, as
+  // BlobStoreBehaviour::route does; S3 has no event for a GET); a pool every step for every job
+  // it is OFFERED (plan 2c Task 7). On paper nothing queues or is dropped: every write that
+  // arrives is served and notifies, and a pool offered more than its workers / cost passes all of
+  // it on (its own line is red; what the engine forwards is what the pool drains, at most its
+  // capacity). The paper load answers "can this ever fit", not "what goes through".
   if (spec.type == model::NodeType::blob_store || spec.type == model::NodeType::worker_pool) {
-    forward_handed_on(g, from, load, fed_back);
+    const OpLoad arriving = load[from];  // a copy: a step may target `from` itself
+    forward_then_steps(g, from, arriving, load, fed_back);
     return;
   }
   const OpLoad arriving = load[from];  // a copy: a step may target `from` itself
@@ -2670,7 +2649,7 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   }
   const std::string note = load.converged ? "" : "  (no steady state: a loop of gain >= 1)\n";
   const std::string header = "checks (peak offered load over the first " +
-                             fmt_duration(g.scenario().duration) + ", no queueing):\n";
+                             format_duration(g.scenario().duration) + ", no queueing):\n";
   return header + aligned(rows, Align::all_left) + note;
 }
 
@@ -2743,6 +2722,18 @@ void Summary::Moments::add(double w, double mean_s, double variance_s2) {
   weighted_square += w * (variance_s2 + mean_s * mean_s);
 }
 
+double Summary::Moments::mean_s() const {
+  return weighted_mean / weight;
+}
+
+// Law of total variance over the steps: Var X = E[X²] − (E[X])², where E[X²] already holds each
+// step's own spread (v) and the spread between step means (m²). Assumes a request's step is chosen
+// in proportion to the weight (requests) the step added.
+double Summary::Moments::variance_s2() const {
+  const double mean = mean_s();
+  return weighted_square / weight - mean * mean;
+}
+
 // Demand, drops and backlog arrive in capacity units (engine::NodeSample): a request of
 // an op with `cost` 3 counts three times. The tables keep their column names; with every
 // cost at its default of 1, units are requests. A node's drop rate is therefore the share of the
@@ -2790,6 +2781,11 @@ void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
   // a limiter refuses 3 of 4 requests, only the admitted quarter counts.
   by_answered.add(sample.answered.per_second * dt_s, response.mean_s, response.variance_s2);
   by_time.add(dt_s, response.mean_s, response.variance_s2);
+  // Weighted by the requests DELIVERED (review of plan 2c, C-1): the client's quantiles range over
+  // every request that came back, the ones it gave up on included.
+  const auto& delivered = sample.delivered_response;
+  by_delivered.add((sample.answered.per_second + sample.timed_out.per_second) * dt_s,
+                   delivered.mean_s, delivered.variance_s2);
 }
 
 // A bandwidth link's pipe is a queue like a node's (engine::LinkSample has NodeSample's fields of
@@ -2983,27 +2979,31 @@ std::vector<OpSummary> Summary::ops() const {
                  .timed_out_per_s = observed_s_ > 0.0 ? t.timed_out / observed_s_ : 0.0,
                  .timeout_s = graph::client_timeout_s(client),
                  .timed_out_share = timed_out_share(t.answered, t.timed_out)};
-    const Moments& m = t.by_answered.weight > 0.0 ? t.by_answered : t.by_time;
     if (t.unavailable) {
       op.mean_s = op.p50_s = op.p95_s = op.p99_s = infinity;
-    } else if (m.weight > 0.0) {
-      fill_latencies(m, op);
+    } else {
+      fill_latencies(t, op);
     }
     out.push_back(std::move(op));
   }
   return out;
 }
 
-// Law of total variance over the steps: Var X = E[X²] − (E[X])², where E[X²] already holds each
-// step's own spread (v) and the spread between step means (m²). Assumes a request's step is chosen
-// in proportion to the requests answered in it. The percentiles are a lognormal moment fit
-// (Fenton-Wilkinson, see queueing::lognormal_quantile): an estimate, which is why every renderer
-// labels them "estimated"; percentile_seen_by_client applies the client's timeout.
-void Summary::fill_latencies(const Moments& m, OpSummary& op) {
-  op.mean_s = m.weighted_mean / m.weight;
-  const double variance = m.weighted_square / m.weight - op.mean_s * op.mean_s;
+// The mean is the answered requests' (the time an answer took on average). The percentiles are a
+// lognormal moment fit (Fenton-Wilkinson, see queueing::lognormal_quantile): an estimate, which is
+// why every renderer labels them "estimated". percentile_seen_by_client reads them off the
+// delivered requests' moments, before any timeout cut them (identical to the answered ones without
+// a timeout), and applies the client's timeout. Whichever moments are empty fall back to the
+// time-weighted ones: an op nothing reached, which no renderer prints a latency for.
+void Summary::fill_latencies(const OpTotals& totals, OpSummary& op) {
+  const Moments& answered = totals.by_answered.weight > 0.0 ? totals.by_answered : totals.by_time;
+  if (answered.weight <= 0.0) return;  // no step observed
+  op.mean_s = answered.mean_s();
+  const bool timed = op.timeout_s.has_value() && totals.by_delivered.weight > 0.0;
+  const Moments& delivered = timed ? totals.by_delivered : answered;
   const auto seen = [&](Quantile q) {
-    return percentile_seen_by_client(op.mean_s, variance, op.timed_out_share, op.timeout_s, q)
+    return percentile_seen_by_client(delivered.mean_s(), delivered.variance_s2(),
+                                     op.timed_out_share, op.timeout_s, q)
         .seconds;
   };
   op.p50_s = seen(median);
@@ -3138,16 +3138,45 @@ std::string render_json(const Summary& summary, std::span<const SloResult> slos)
   return "{\n" + join(lines, ",\n") + "\n}";
 }
 
+double op_latency_s(const OpSummary& op, OpLatency column) {
+  switch (column) {
+    case OpLatency::mean:
+      return op.mean_s;
+    case OpLatency::p50:
+      return op.p50_s;
+    case OpLatency::p95:
+      return op.p95_s;
+    case OpLatency::p99:
+      return op.p99_s;
+  }
+  std::unreachable();
+}
+
+bool latency_beyond_timeout(const OpSummary& op, OpLatency column) {
+  switch (column) {
+    case OpLatency::mean:
+      return false;
+    case OpLatency::p50:
+      return beyond_timeout(op, median);
+    case OpLatency::p95:
+      return beyond_timeout(op, ninety_fifth);
+    case OpLatency::p99:
+      return beyond_timeout(op, ninety_ninth);
+  }
+  std::unreachable();
+}
+
 std::string format_number(double value) {
-  return shortest(value);
+  return to_chars_text(value);
 }
 
-std::string format_duration(double seconds_value) {
-  return fmt_duration(seconds_value);
-}
-
-std::string format_lag(double seconds_value) {
-  return fmt_lag(seconds_value);
+std::string align_columns(std::span<const std::vector<std::string>> rows, std::string_view indent) {
+  std::vector<Row> cells;
+  for (const auto& row : rows) {
+    auto& line = cells.emplace_back();
+    for (const auto& text : row) line.push_back(Cell{.text = text});
+  }
+  return aligned(cells, Align::first_left_rest_right, indent);
 }
 
 std::string render_explain(const graph::Graph& g) {
@@ -3197,7 +3226,7 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
 //   its rows, `rejected_per_s` is 0 and `latency_ms` is a request's wait plus its answer time on
 //   the wire (a write's whole serialisation, any other op's first megabyte).
 void SeriesWriter::observe(const engine::StepRecord& record) {
-  const auto t_s = shortest(seconds(record.t));
+  const auto t_s = format_number(seconds(record.t));
   for (std::size_t i = 0; i < ids_.size() && i < record.nodes.size(); ++i) {
     *out_ << (is_client_[i] ? csv_client_row(t_s, ids_[i])
                             : csv_server_row(t_s, ids_[i], record.nodes[i]));
@@ -3223,7 +3252,7 @@ OpSeriesWriter::OpSeriesWriter(std::ostream& out, const graph::Graph& g) : out_{
 // not a node of the writer's graph is a programmer error (a record of another simulation): `at`
 // throws.
 void OpSeriesWriter::observe(const engine::StepRecord& record) {
-  const auto t_s = shortest(seconds(record.t));
+  const auto t_s = format_number(seconds(record.t));
   for (const auto& sample : record.responses) {
     *out_ << csv_op_row(t_s, ids_.at(sample.client), sample);
   }
