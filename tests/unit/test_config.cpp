@@ -3477,6 +3477,8 @@ std::string client_with_sizes(std::string_view sizes_value) {
 
 // The size the workload states for `op`, in bytes, or nullopt when it states none.
 std::optional<double> stated_size(const simsys::model::Workload& workload, std::string_view op) {
+  // C++20 std::ranges::find_if: the range itself and a predicate, replacing std::find_if's
+  // begin/end pair.
   const auto found =
       std::ranges::find_if(workload.sizes, [&](const auto& entry) { return entry.first == op; });
   if (found == workload.sizes.end()) return std::nullopt;
@@ -4222,6 +4224,8 @@ std::string window_scenario(std::string_view timing, std::string_view slo_entry)
 
 bool mentions_any(std::string_view message, std::initializer_list<std::string_view> words) {
   for (const auto word : words) {
+    // C++23 std::string_view::contains: a substring test in one call, replacing
+    // `find(word) != std::string_view::npos`.
     if (message.contains(word)) return true;
   }
   return false;

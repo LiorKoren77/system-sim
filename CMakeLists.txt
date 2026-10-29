@@ -44,11 +44,13 @@ target_sources(simsys
     src/engine/behaviours.cppm
     src/engine/engine.cppm
     src/report/report.cppm
+    src/session/session.cppm
     src/sweep/sweep.cppm
   PRIVATE                               # module implementation units are ordinary sources
     src/config/config.cpp
     src/model/model.cpp
     src/report/report.cpp
+    src/session/session.cpp
     src/sweep/sweep.cpp)
 # std::jthread (simsys.sweep's workers) needs the platform's thread library; Threads::Threads is
 # CMake's portable name for it (-pthread with GCC on Linux).

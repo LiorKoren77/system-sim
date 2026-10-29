@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -395,6 +396,8 @@ TEST_CASE("explain prints the nodes of a loop of gain >= 1 as unbounded, not as 
       "peak offered unbounded vs 10k/s total capacity  (no steady state, red)"));
   REQUIRE(check_line(text, "b").ends_with(
       "peak offered unbounded vs 10k/s total capacity  (no steady state, red)"));
+  // C++23 std::string::contains: a substring test in one call, replacing
+  // `find(...) != std::string::npos`.
   REQUIRE_FALSE(text.contains("e+30"));
 }
 
@@ -782,9 +785,8 @@ Scenario che_cached() {
 TEST_CASE("explain forwards a cache's then-steps: misses reach the next node", "[report]") {
   const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(browser_cached()));
   CAPTURE(text);
-  // 60 % of 1k/s: the misses of a 0.4 hit ratio.
-  // C++23 std::string::contains: a substring test in one call, replacing
-  // `find(...) != std::string::npos`; the check line has more on it than this test is about.
+  // 60 % of 1k/s: the misses of a 0.4 hit ratio. `contains`: the check line has more on it than
+  // this test is about.
   REQUIRE(check_line(text, "lb").contains("peak offered 600/s vs 100k/s"));
   REQUIRE(check_line(text, "api").contains("peak offered 600/s vs 5k/s"));
 }
@@ -2185,6 +2187,8 @@ std::vector<std::string> words_of_line_starting(const std::string& text,
 
 const simsys::report::NodeSummary& node_summary(
     const std::vector<simsys::report::NodeSummary>& nodes, std::string_view id) {
+  // C++20 std::ranges::find with a projection: the node whose `id` member equals `id`, replacing
+  // std::find_if with a lambda that compares the member by hand.
   const auto found = std::ranges::find(nodes, id, &simsys::report::NodeSummary::id);
   REQUIRE(found != nodes.end());
   return *found;
@@ -2328,6 +2332,8 @@ TEST_CASE("a queue lag below a microsecond prints as under one microsecond", "[r
   CAPTURE(table);
   REQUIRE(words_of_line_starting(table, "q").back() == "<1us");
   const auto slo_line = words_of_line_starting(table, "PASS");
+  // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
+  // `std::ranges::find(...) != end`.
   REQUIRE(std::ranges::contains(slo_line, std::string{"<1us"}));
 }
 
@@ -2503,9 +2509,9 @@ TEST_CASE("explain prints no build_interval for a search index that states none"
 // exponential sojourn: the standard deviation is the mean). A client `timeout` of 200 ms answers
 // the lognormal's share below it, 0.894137, so of the 990 requests per second 885.2 are answered
 // and 0.105863 x 990 = 104.8 per second time out; the answered mean is 73.97 ms. Percentiles are
-// capped at the timeout: the p99 of the answered part would be 236.7 ms by the refitted lognormal,
-// but no answered request took longer than 200 ms. (The theory tests derive the same numbers
-// through the engine; these pin what the report prints.)
+// read off the fit to every delivered request (mean 100 ms, p99 490 ms) and capped at the timeout:
+// more than 1 % timed out, so the p99 is the timeout itself. (The theory tests derive the same
+// numbers through the engine; these pin what the report prints.)
 
 namespace {
 // mm1(990) whose client has the given timeout (none: the client waits for ever).
@@ -2586,20 +2592,20 @@ TEST_CASE("the op table prints >200ms for a p99 more than 1 percent of whose req
   REQUIRE(row[6] == ">200ms");
 }
 
-// The p50 that was answered is the client's p50, not the answered requests' own median: 10.59 % of
-// the delivered requests timed out, every one slower than every answered one, so the client's
-// fastest half are the answered requests' fastest 0.5 / 0.894137 = 0.5592 (review of the Task 12/13
-// fix rounds and Task 14, C-1). The answered requests' refit (mean 73.97 ms, variance
-// 0.0021022 s^2: sigma' = 0.57020, mu' = -2.76665) read there, z = Phi^-1(0.5592) = 0.14894, is
-//   exp(-2.76665 + 0.57020 x 0.14894) = 68.44 ms;
-// its median, exp(mu'), the old reading, is 62.87 ms.
-TEST_CASE("the p50 behind a 200 ms timeout is the answered fit read at 0.5 / 0.894: 68.44 ms",
-          "[report]") {
+// The p50 that was answered is the client's p50, read off the fit to every DELIVERED request's
+// latency, before the timeout cut it (comprehensive 2c review, C-1): the engine times out exactly
+// the requests that fit puts past 200 ms (10.59 % of them), so the client's fastest half are all
+// answered and its median is the fit's. The path is exponential with mean 100 ms (variance
+// 0.01 s^2: sigma^2 = ln 2, mu = ln 0.1 − sigma^2 / 2), whose fit's median is
+//   exp(mu) = 0.1 / sqrt(2) = 70.71 ms,
+// the untimed client's p50. The refit of the answered requests' truncated moments (73.97 ms,
+// 0.0021022 s^2) said 68.44 ms read at 0.5 / 0.894 and 62.87 ms read at 0.5.
+TEST_CASE("the p50 behind a 200 ms timeout is the delivered fit's median, 70.71 ms", "[report]") {
   const auto s = timing_out(200ms);
   const auto g = *simsys::graph::Graph::build(s);
   const auto ops = summarize(s, g).ops();
   REQUIRE(ops.size() == 1);
-  REQUIRE_THAT(ops[0].p50_s, WithinRel(0.068445, 1e-4));
+  REQUIRE_THAT(ops[0].p50_s, WithinRel(0.1 / std::sqrt(2.0), 1e-9));
 }
 
 // Without a timeout nothing times out, and the op table keeps its old six columns.

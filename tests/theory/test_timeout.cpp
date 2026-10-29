@@ -2,12 +2,15 @@
 // client that gives up on a slow request). Model under test: the client's response time is fitted
 // as a lognormal with the path's mean and variance (the fit the reports already use); the share
 // below the timeout is answered, with the truncated moments; the rest is timed out. The servers
-// still do the work of a timed-out request: nothing cancels it, so their demand is unchanged.
+// still do the work of a timed-out request: nothing cancels it, so their demand is unchanged. The
+// client's percentiles are that delivered fit's, capped at the timeout, or the timeout itself when
+// more than 1 − q of the delivered requests timed out (comprehensive 2c review, C-1).
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -120,10 +123,9 @@ TEST_CASE("an M/M/1 server at rho 0.99 gives the client a 100 ms response with v
 // lognormal_below in test_queueing.cpp): sigma^2 = ln(1 + 0.01 / 0.1^2) = ln 2, mu = -2.649159,
 //   answered share = Phi((ln 0.2 - mu) / sigma) = Phi(1.248832) = 0.894137,
 //   answered mean  = E[X | X < 200 ms] = 0.073970 s,   answered variance = 0.0021022 s^2.
-// Of 990 requests/s: 885.2 answered, 104.8 timed out. Percentiles are capped at the timeout: the
-// refitted lognormal of the answered part (mean 73.97 ms, SCV 0.384, so sigma = 0.570 and
-// mu = -2.767) would put its p99 at exp(mu + 2.3263 sigma) = 236.7 ms, past the 200 ms nothing
-// can take, so the p99 IS 200 ms; the p95 (160.6 ms) is under the cap and is not pinned.
+// Of 990 requests/s: 885.2 answered, 104.8 timed out. More than 1 % of the delivered requests
+// timed out (10.59 %, and more than 5 %), so the client never saw its p95 or p99 answered: both ARE
+// the timeout, 200 ms.
 TEST_CASE("a 200 ms timeout on a 100 ms exponential path answers 89.4 percent of the requests",
           "[theory]") {
   const auto s = slow_exponential_path(200ms);
@@ -282,61 +284,82 @@ TEST_CASE("p99 and p50 SLOs at the timeout pass when only 0.5 percent time out a
   }
 }
 
-// ---- The client's quantile is the answered requests' quantile at q / (1 - s) ----
+// ---- The client's quantile is the delivered fit's quantile (comprehensive 2c review, C-1) ----
 //
-// (Review of the Task 12/13 fix rounds and Task 14, C-1.) Of a client's delivered requests a share
-// s timed out, every one of them slower than the timeout, and 1 - s were answered, every one
-// faster. So the fastest q of the delivered requests (q <= 1 - s) are all answered ones: the
-// fastest q / (1 - s) of the answered requests. The client's q-quantile is the answered requests'
-// quantile at q_eff = q / (1 - s), and the report reads the answered requests' fit there, capped at
-// the timeout. Reading it at q itself, as the reports did, ignores the timed-out tail, and a
-// timeout then LOWERS the percentile and turns a failing SLO into a passing one.
+// The engine times a request out exactly when the lognormal fitted to the DELIVERED requests'
+// latency (the path's own moments, before the timeout) puts it past the timeout (give_up_after). So
+// when a share s <= 1 − q timed out, the fastest q of the delivered requests are all answered, and
+// the client's q-quantile is that fit's q-quantile: the timeout does not move it. The report reads
+// it off the delivered moments it keeps beside the answered ones, capped at the timeout (a run that
+// mixes steps can put the mixture's quantile past it).
 //
 // The same exponential path behind a 530 ms timeout:
 //   z = (ln 0.53 + 2.64916) / 0.83255 = 2.4194,  s = 1 - Phi(2.4194) = 0.00777 (0.78 % time out,
 //   under the 1 % a p99 leaves above it, so the p99 is no `>530ms`);
-//   answered moments (the truncated lognormal's, as for 200 ms above): mean 95.11 ms, variance
-//   0.0065683 s^2,
-//   refit sigma' = 0.73882, mu' = -2.62563.
-// Read at q = 0.99 (z = 2.3263) the refit's p99 is exp(-2.62563 + 0.73882 x 2.3263) = 403.8 ms: a
-// p99 SLO of 420 ms passed, though the same path without a timeout has a p99 of 490 ms and fails
-// it, and a timeout of 470 ms (1.15 % timed out) fails it at the timeout.
-// Read at q_eff = 0.99 / (1 - 0.00777) = 0.997756 (z = 2.8416): exp(-2.62563 + 0.73882 x 2.8416) =
-// 590.9 ms, past the timeout, so the p99 is the cap, 530 ms, and the SLO fails. The p50 moves too,
-// a little: q_eff = 0.5 / 0.99223 = 0.503917 (z = 0.00982), exp(-2.62563 + 0.73882 x 0.00982) =
-// 72.92 ms instead of the refit's median, 72.39 ms.
-TEST_CASE("a p99 SLO of 420 ms fails behind a 530 ms timeout: the p99 is read at 0.99 / (1 - s)",
-          "[theory]") {
+//   the delivered fit (sigma = 0.83255, mu = -2.64916) read at q = 0.99 (z = 2.3263):
+//   exp(-2.64916 + 0.83255 x 2.3263) = 490.5 ms, under the cap, and its median exp(mu) = 70.71 ms.
+// A p99 SLO of 420 ms fails, as it does without the timeout. The rule it replaced refitted the
+// answered requests' truncated moments (95.11 ms, 0.0065683 s^2) and read them at
+// q / (1 − s) = 0.997756: 590.9 ms, capped to 530 ms, and a p50 of 72.92 ms.
+TEST_CASE(
+    "a p99 SLO of 420 ms fails behind a 530 ms timeout: the p99 is the delivered fit's 490 ms",
+    "[theory]") {
   using simsys::model::SloMetric;
   const auto results = verdicts(530ms, {latency_slo(SloMetric::p99_latency, 420ms)});
   REQUIRE(results.size() == 1);
   CAPTURE(results[0].note);
   REQUIRE(results[0].status == simsys::report::SloStatus::fail);
-  REQUIRE_THAT(*results[0].observed, WithinRel(0.53, 1e-12));  // the cap: the fit is at 590.9 ms
+  REQUIRE_THAT(*results[0].observed, WithinAbs(0.490492, 1e-6));
   REQUIRE(results[0].note.empty());  // 0.78 % timed out, not more than 1 %: no `>530ms` rule
   const auto s = slow_exponential_path(530ms);
   const auto ops = summarize(*Graph::build(s), 1s, s.step).ops();
   REQUIRE(ops.size() == 1);
   REQUIRE_THAT(ops[0].timed_out_share, WithinAbs(0.00777, 5e-6));
-  REQUIRE_THAT(ops[0].p50_s, WithinRel(0.07292, 1e-3));
+  REQUIRE_THAT(ops[0].p50_s, WithinRel(0.1 / std::sqrt(2.0), 1e-9));
+}
+
+// A longer timeout times out fewer requests and caps higher, so no percentile may fall as it grows
+// (the rule it replaced printed 530 → 508.9 → 481.8 → 475.5 ms for timeouts of 530 ms, 600 ms,
+// 700 ms and 1 s on this path). The p99 is the timeout while more than 1 % time out (below the
+// fit's 490.5 ms), then the fit's 490.5 ms itself, which the client without a timeout reports too.
+TEST_CASE("the p99 and p50 never fall as the client's timeout grows, and meet the untimed ones",
+          "[theory]") {
+  const auto untimed_s = slow_exponential_path(std::nullopt);
+  const auto untimed = summarize(*Graph::build(untimed_s), 1s, untimed_s.step).ops().at(0);
+  double previous_p99 = 0.0;
+  double previous_p50 = 0.0;
+  for (const auto timeout :
+       {300ms, 450ms, 490ms, 500ms, 530ms, 600ms, 700ms, 1000ms, 1500ms, 3000ms}) {
+    const auto s = slow_exponential_path(simsys::SimTime{timeout});
+    const auto op = summarize(*Graph::build(s), 1s, s.step).ops().at(0);
+    CAPTURE(timeout.count(), op.p99_s, op.p50_s);
+    REQUIRE(op.p99_s >= previous_p99);
+    REQUIRE(op.p50_s >= previous_p50);
+    REQUIRE(op.p99_s <= untimed.p99_s * (1.0 + 1e-12));
+    previous_p99 = op.p99_s;
+    previous_p50 = op.p50_s;
+  }
+  REQUIRE_THAT(previous_p99, WithinRel(untimed.p99_s, 1e-12));
+  REQUIRE_THAT(previous_p50, WithinRel(untimed.p50_s, 1e-12));
 }
 
 // A whole run in which a spike pushes many requests past the timeout. 1k/s to a service of 2k/s
 // (two servers of 1 ms: rho 0.5, a sojourn of about a millisecond), and from 1:00 to 2:00 a spike
 // of 2.5x, 2.5k/s: the queue fills, its wait passes the clients' 50 ms, and most of the spike's
-// requests time out. Over the 10 minutes the run reports (Release, `run --report json`):
-//   offered 1150/s, answered 899.31/s, timed out 202.36/s: s = 202.36 / 1101.67 = 0.1837;
-//   the answered requests: mean 1.362 ms, and their fit's median exp(mu') = 0.889 ms.
+// requests time out. Over the 10 minutes (Release, `run --report json`):
+//   offered 1150/s, answered 899.27/s, timed out 202.39/s: s = 202.39 / 1101.67 = 0.1837;
+//   the answered requests: mean 1.358 ms, and their own fit's median 0.897 ms.
 // The answered requests are mostly the quiet minutes' fast ones, so their median is under a
-// millisecond, and a p50 SLO of 1 ms read there PASSed at 889 us (without the timeout the same run
-// FAILs it at 39.2 ms). But 18.4 % of the delivered requests, all slower than 50 ms, are not in
-// that median: the client's p50 is the answered requests' quantile at q_eff = 0.5 / (1 - 0.1837) =
-// 0.6125, z = 0.2859. With sigma' = sqrt(2 ln(1.362 / 0.889)) = 0.924 (a lognormal's mean is its
-// median times exp(sigma^2 / 2)), that is 0.889 x exp(0.924 x 0.2859) = 1.158 ms: the SLO FAILs.
-// The test rebuilds the answered moments from the step records, as the Summary does (weights:
-// answered requests), and checks the p50 is exactly the fit read at q_eff.
+// millisecond, and a p50 SLO of 1 ms read there would PASS. But 18.4 % of the delivered requests,
+// all slower than 50 ms, are not in that median. The client's p50 is the median of the fit to
+// every DELIVERED request, the moments each step had before the timeout cut them, weighted by the
+// requests delivered (answered + timed out): exactly what the same run without the timeout reports,
+// 39.21 ms (comprehensive 2c review, C-1), and the SLO FAILs. The spike's minute weighs in
+// with its backlog's seconds of wait, so the mixture's median sits far above the quiet minutes'
+// millisecond. The test rebuilds the delivered moments from the step records, as the Summary does,
+// and checks the p50 is exactly their fit's median.
 namespace {
-Scenario spike_past_the_timeout() {
+Scenario spike_past_the_timeout(std::optional<simsys::SimTime> timeout) {
   Scenario s{.name = "spike", .version = 1, .duration = 10min, .step = 100ms};
   s.nodes = {
       NodeSpec{.id = "c",
@@ -345,16 +368,17 @@ Scenario spike_past_the_timeout() {
                                               .spikes = {simsys::workload::Spike{
                                                   .at = 1min, .duration = 1min, .factor = 2.5}}},
                                     .op_shares = {{"op", 1.0}},
-                                    .timeout = simsys::SimTime{50ms}}},
+                                    .timeout = timeout}},
       NodeSpec{.id = "s", .type = NodeType::service, .capacity = Rate{2000}, .latency = 1ms}};
   s.links = {LinkSpec{.from = "c", .to = "s", .dir = Direction::inout, .latency = 0s}};
   return s;
 }
 }  // namespace
 
-TEST_CASE("a p50 SLO of 1 ms fails when a spike times out 18 percent: the p50 is read at 0.6125",
-          "[theory]") {
-  const auto s = spike_past_the_timeout();
+TEST_CASE(
+    "a p50 SLO of 1 ms fails when a spike times out 18 percent: the p50 is the delivered fit's",
+    "[theory]") {
+  const auto s = spike_past_the_timeout(simsys::SimTime{50ms});
   const auto g = *Graph::build(s);
   simsys::report::Summary summary{g, 0s};
   double weight = 0.0;
@@ -365,27 +389,26 @@ TEST_CASE("a p50 SLO of 1 ms fails when a spike times out 18 percent: the p50 is
   sim->run({.duration = s.duration, .step = s.step}, [&](const auto& r) {
     summary.observe(r);
     const auto& response = r.responses[0];
-    const double w = response.answered.per_second;  // every step lasts the same 100 ms
+    // Every step lasts the same 100 ms, so the weight is the rate delivered.
+    const double w = response.answered.per_second + response.timed_out.per_second;
+    const auto& delivered = response.delivered_response;
     weight += w;
-    weighted_mean += w * response.response.mean_s;
-    weighted_square +=
-        w * (response.response.variance_s2 + response.response.mean_s * response.response.mean_s);
+    weighted_mean += w * delivered.mean_s;
+    weighted_square += w * (delivered.variance_s2 + delivered.mean_s * delivered.mean_s);
   });
   const auto ops = summary.ops();
   REQUIRE(ops.size() == 1);
-  const double share = ops[0].timed_out_share;
-  REQUIRE_THAT(share, WithinAbs(0.1837, 5e-5));
+  REQUIRE_THAT(ops[0].timed_out_share, WithinAbs(0.1837, 5e-5));
+  REQUIRE_THAT(ops[0].mean_s, WithinAbs(0.001358, 1e-6));  // the answered requests' mean
   const double mean = weighted_mean / weight;
   const double variance = weighted_square / weight - mean * mean;
-  REQUIRE_THAT(ops[0].mean_s, WithinRel(mean, 1e-9));
-  // The old reading, the answered requests' own median: under 1 ms.
-  REQUIRE_THAT(simsys::queueing::lognormal_quantile(mean, variance, 0.0),
-               WithinAbs(0.000889, 1e-6));
-  const double z_eff = simsys::queueing::normal_quantile(0.5 / (1.0 - share));
-  REQUIRE_THAT(z_eff, WithinAbs(0.2859, 1e-4));
   REQUIRE_THAT(ops[0].p50_s,
-               WithinRel(simsys::queueing::lognormal_quantile(mean, variance, z_eff), 1e-9));
-  REQUIRE_THAT(ops[0].p50_s, WithinAbs(0.001158, 1e-6));
+               WithinRel(simsys::queueing::lognormal_quantile(mean, variance, 0.0), 1e-9));
+  REQUIRE_THAT(ops[0].p50_s, WithinRel(0.03921, 1e-3));
+  const auto untimed_s = spike_past_the_timeout(std::nullopt);
+  const auto untimed_g = *Graph::build(untimed_s);
+  const auto untimed = summarize(untimed_g, untimed_s.duration, untimed_s.step).ops().at(0);
+  REQUIRE_THAT(ops[0].p50_s, WithinRel(untimed.p50_s, 1e-9));
   const std::array slo{simsys::model::SloSpec{.metric = simsys::model::SloMetric::p50_latency,
                                               .node = "c",
                                               .op = "op",

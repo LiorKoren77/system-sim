@@ -67,7 +67,9 @@ backlog   += (demand − drain) × dt                 (grows past capacity, shri
 overflow   = max(0, backlog − queue_limit) / dt;  backlog = min(backlog, queue_limit)
 rho        = drain / capacity                      (busy fraction; 1 when capacity is 0)
 k          = (burstiness + service_variability) / 2          (Allen–Cunneen / Kingman factor)
-rho'       = min(rho, 0.99)
+rho'       = min(min(demand, drain) / capacity, 0.99)   (the arrivals' load, not the busy
+                                                   fraction: equal unless a backlog drains
+                                                   after the load fell; §19 entry 2)
 Wq         = k × ErlangC(c, rho') × s / (c × (1 − rho'))     (stochastic queueing, §9.1)
 wait_mean  = max(backlog / capacity, Wq)           (fluid drain time vs. stochastic wait: the larger)
 latency    = wait_mean + s
@@ -678,9 +680,11 @@ author meets are in `docs/scenario-schema.md` (v1.3).
    misses per second beside the writes one shard's primary committed (summed over replicas,
    the first figure exceeded the committed writes), and the `staleness` SLO fails on any
    missed write with the note `each replica misses 88.89/s of 200/s committed writes
-   (44.4%)`. At exactly `rho = 1` a run keeps an empty queue empty and `estimate` takes it as
-   full (200 inserts/s on two 1k/s copies: 250 ms against 2.05 s); the docs size examples
-   off that edge. *Ignores:* the lag's own variation, semi-synchronous replication, the
+   (44.4%)`. At exactly `rho = 1` both commands keep the queue empty and wait the stochastic
+   wait at the 0.99 clamp (200 inserts/s on two 1k/s copies: 250 ms; *corrected by the
+   comprehensive 2c review, 5c:* `estimate` used to settle a full queue there, 2.05 s, while
+   `run` kept it empty; `FluidQueue::settle` now fills a room only strictly above capacity); the
+   docs size examples off that edge. *Ignores:* the lag's own variation, semi-synchronous replication, the
    growing lag itself.
 10. **CDN** (plan refinement 4, redesigned in Task 5). Until Task 5 a CDN was a cache whose
     hit ratio a service's `on: miss` step read: the CDN forwarded nothing and its `origin`
@@ -812,9 +816,13 @@ scenario tests or printed by the Release binary.
      lognormal percentiles ignore the bound (a saturated store's p99 6.88 s against its 4 s,
      pinned as a characterisation test and listed for the comprehensive review).
    A byte-sized node's demand, drops and backlog are in MB, its clients' rates in requests.
+   *Corrected by the comprehensive 2c review (5b):* the stochastic wait reads the arrivals' load,
+   `min(demand, drain) / capacity`, not the busy fraction `drain / capacity`, so a ramp's
+   transient wait falls with the backlog (12 → 4 writes/s of 50 MB at a default store: 3.94 s
+   at 970 MB down to 2.02 s at 10 MB, where it held 4 s while the room drained; every queue,
+   not only a byte-sized one: the rate-limiter lab's p99 24.8 ms, was 30.5 ms untimed).
    *Ignores:* a read's last byte (a download needed whole before use), that a request's megabytes
-   arrive together (an M^X batch), a ramp's transient wait not falling with the backlog (the
-   Erlang term reads rho = drain / capacity; phase 3 backlog).
+   arrive together (an M^X batch).
 3. **A link's `bandwidth` is a pipe** (§3.4). One server (`c = 1`) in megabytes, draining
    `bandwidth / 1 MB` (1 Gbit/s = 125 MB/s, 8 ms per MB), each request holding it for its whole
    serialisation, deterministic, with a 1000 MB waiting room (chosen: the generic `queue_limit`
@@ -943,17 +951,24 @@ scenario tests or printed by the Release binary.
     a latency SLO at quantile q fails whatever its `max` when more than 1 − q of the delivered
     requests timed out, observing the timeout with the note `57.3% of delivered requests timed out
     (more than 1%)` (the refit's p99 had passed while 2 % timed out, and adding a timeout could
-    turn a FAIL into a PASS); otherwise the percentile is the answered requests' fit read at
-    q / (1 − s), s the timed-out share, and capped at τ (*corrected again by the review of the Task
-    12/13 fix rounds and Task 14:* read at q, the fit ignored the timed-out tail, and a 530 ms
-    timeout lowered an M/M/1 path's p99 from 490 to 404 ms; the timed-out requests are all slower
-    than the answered ones, so the client's q-quantile is the answered requests' q / (1 − s)); one
-    helper (`percentile_seen_by_client`) serves the whole run and every window; `timeout ≤ 0`
-    is refused; `run`'s table gains a `timed out/s` column and prints `>1s` where a quantile timed
-    out (I-1); JSON's latencies are `null` when nothing was answered in time (I-2); the series
-    `--series-ops` gains `timed_out_per_s`. *Ignores:* timeouts at intermediate hops, that a path
-    is not exactly lognormal (a 1 s timeout cutting 9e-7 of the rate-limiter lab's requests moves
-    its p99 30.5 → 29.9 ms through the refit).
+    turn a FAIL into a PASS); otherwise (s ≤ 1 − q, s the timed-out share) the percentile is the
+    **delivered** fit, the untruncated lognormal of every request the path delivered, read at q
+    and capped at τ. *Settled by the comprehensive 2c review (C-1),* after two rules that read the
+    answered requests' refitted truncated moments, first at q (a 530 ms timeout lowered an M/M/1
+    path's p99 from 490 to 404 ms), then at q / (1 − s) (biased and not monotonic in τ: 530, 508.9,
+    481.8, 475.5 ms behind 530 ms, 600 ms, 700 ms, 1 s): the engine times out exactly the requests
+    the delivered fit puts past τ, so the client's q-quantile is that fit's, which τ does not move.
+    The engine keeps those moments (`ResponseSample::delivered_response`, set before
+    `give_up_after` cuts `response`), the Summary accumulates them per op weighted by (answered +
+    timed out)·dt, and the mean stays the answered requests' mean. The percentile is exact for one
+    steady step, never falls as τ grows, and equals the untimed client's when nothing timed out (a
+    1 s timeout cutting 9e-7 of the rate-limiter lab's requests now moves no percentile; it moved
+    its p99 30.5 → 29.9 ms through the refit). One helper (`percentile_seen_by_client`) serves the
+    whole run and every window; `timeout ≤ 0` is refused; `run`'s table gains a `timed out/s`
+    column and prints `>1s` where a quantile timed out (I-1); JSON's latencies are `null` when
+    nothing was answered in time (I-2); the series `--series-ops` gains `timed_out_per_s`.
+    *Ignores:* timeouts at intermediate hops, that a path is not exactly lognormal (the share timed
+    out is the fit's tail, not the requests').
 13. **SLOs per window: `over: D`.** Any SLO may state `over` (a whole number of steps, at least
     one, at most the run after warmup). The observed span is cut into consecutive windows of D **aligned to the end of
     warmup**; a step belongs to the window its start falls in; a last, shorter window is still
@@ -982,15 +997,19 @@ scenario tests or printed by the Release binary.
     number. The key is a dot path through maps only and must exist; each point's value replaces the
     file's text before the loader's checks (`config::load(path, overrides)`), every point is loaded
     and built before any runs, and a YAML anchor's value moves with its aliases. Metrics:
-    `<client>.<op>.mean`, `<node>.mean_rho`, `<queue>.lag`, the numbers `run --report json`
-    prints, formatted as the report formats them (I-3: `1.61ms`, `<1us`, `-` for nothing answered).
+    `<client>.<op>.mean`, `<node>.mean_rho`, `<queue>.lag`, and since the comprehensive 2c review
+    `<client>.<op>.p50|p95|p99`, `<node>.peak_rho` and `<node>.drop_rate`, the numbers `run
+    --report json` prints, formatted as the report formats them (I-3: `1.61ms`, `<1us`, `-` for
+    nothing answered, `>1s` for a percentile that is the timeout). A point loads and runs exactly
+    as `simsys run` does (`simsys.session`'s `load_graph` and `run_summary`, which the CLI calls
+    too; review I-4).
     Points run on `std::jthread` workers pulling indices from one atomic counter, each a
     `Simulation` of its own, so the output is byte-identical for any `--jobs` (1 to 1024, default
     the hardware threads; `docs/study/threads.md`). Exit 0 when every point ran (verdicts are not
-    judged), 1 on any error. *Narrower than the plan's header:* the plan listed percentiles,
-    `peak_rho`, `drop_rate` and `reject_rate` as metrics, a column per SLO with its verdict and the
-    point's exit code, and `--report`; the implementation has the three metrics above, no SLO
-    columns and `--format`. *Ignores:* grids over two keys, geometric spacing, list values,
+    judged), 1 on any error. *Narrower than the plan's header:* the plan listed `reject_rate` as a
+    metric too, a column per SLO with its verdict and the point's exit code, and `--report`; the
+    implementation has the seven metrics above, no SLO or exit columns (Phase 3 backlog) and
+    `--format`. *Ignores:* grids over two keys, geometric spacing, list values,
     replications per point (phase 3).
 16. **Step size rule of thumb** (2b backlog; docs only). A token bucket of `B` tokens under an
     offered rate `λ` above its limit `L` empties in `B / (λ − L)`; a longer step passes the whole

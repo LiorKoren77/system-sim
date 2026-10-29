@@ -6,14 +6,20 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
+
+#include <unistd.h>  // getpid: a temporary file per test process
 
 // C++20 `import`: brings a named module's exported names into this translation unit without
 // textual inclusion (the compiler reads the module's compiled interface). It replaces
@@ -114,6 +120,15 @@ std::vector<std::string> split(std::string_view text, char separator) {
   }
   if (!current.empty()) pieces.push_back(current);
   return pieces;
+}
+
+// The words of a table line, the runs of characters between spaces.
+std::vector<std::string> split_words(std::string_view line) {
+  std::vector<std::string> words;
+  for (const auto& piece : split(line, ' ')) {
+    if (!piece.empty()) words.push_back(piece);
+  }
+  return words;
 }
 
 double parse_double(const std::string& text) {
@@ -255,8 +270,38 @@ TEST_CASE(
   }
 }
 
+// The run table's other figures (comprehensive 2c review): an op's percentiles as the op table
+// prints them, a node's peak utilization and its drop rate.
+TEST_CASE("a client op's p50, p95 and p99 and a node's peak_rho and drop_rate are metrics") {
+  using simsys::sweep::MetricKind;
+  const std::array expected{std::pair{"users.ping.p50", MetricKind::p50_latency},
+                            std::pair{"users.ping.p95", MetricKind::p95_latency},
+                            std::pair{"users.ping.p99", MetricKind::p99_latency},
+                            std::pair{"api.peak_rho", MetricKind::peak_rho},
+                            std::pair{"api.drop_rate", MetricKind::drop_rate}};
+  for (const auto& [name, kind] : expected) {
+    CAPTURE(name);
+    const auto metric = parse_metric(name);
+    INFO((metric ? "" : metric.error()));
+    REQUIRE(metric.has_value());
+    REQUIRE(metric->kind == kind);
+  }
+  REQUIRE(parse_metric("users.ping.p99")->op == "ping");
+}
+
+TEST_CASE("a client has no drop rate to sweep, as it has no utilization") {
+  const auto drops = parse_metric("users.drop_rate");
+  REQUIRE(drops.has_value());
+  const std::vector<SweepMetric> metrics{*drops};
+  const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1);
+  REQUIRE_FALSE(rows.has_value());
+  REQUIRE(rows.error() ==
+          "--metric users.drop_rate: 'users' is a client, which serves nothing, so it has no drop "
+          "rate");
+}
+
 TEST_CASE("an unknown metric is refused and named") {
-  for (const std::string_view bad : {"api.nonsense", "api", "users.ping.p99", ""}) {
+  for (const std::string_view bad : {"api.nonsense", "api", "users.ping.p90", "api.p99", ""}) {
     CAPTURE(bad);
     const auto metric = parse_metric(bad);
     REQUIRE_FALSE(metric.has_value());
@@ -284,7 +329,7 @@ TEST_CASE("an override replaces the value at its dot path and leaves the rest of
   REQUIRE(scenario->nodes[1].latency == 1ms);
 }
 
-TEST_CASE("several overrides apply together") {
+TEST_CASE("several overrides apply together, each replacing the value at its own path") {
   const std::vector<Override> overrides{{.path = "nodes.users.rate.base", .value = "250/s"},
                                         {.path = "nodes.api.latency", .value = "2ms"}};
   const auto scenario = simsys::config::load(hello_path, overrides);
@@ -347,6 +392,21 @@ TEST_CASE("a loader error is described the way compilers report errors") {
               .file = "a.yaml", .line = 0, .column = 0, .message = "m"}) == "a.yaml: error: m");
 }
 
+// `run --duration 30m` on url-shortener (warmup 2m, an SLO `over: 1h`) is an override of
+// `duration`, which the loader refuses at the SLO: its message names the construct (`slo: `), and
+// `rule` is the rule alone, which the CLI puts after its own `--duration 30m: `.
+TEST_CASE("a loader error inside a construct gives the rule apart from the construct's name") {
+  const std::string url_shortener =
+      std::string{SIMSYS_SCENARIOS_DIR} + "/book/url-shortener/scenario.yaml";
+  const std::vector<Override> overrides{{.path = "duration", .value = "30m"}};
+  const auto scenario = simsys::config::load(url_shortener, overrides);
+  REQUIRE_FALSE(scenario.has_value());
+  const std::string rule = "over must fit in the run after warmup (1h > duration 30m - warmup 2m)";
+  REQUIRE(scenario.error().message == "slo: " + rule);
+  REQUIRE(scenario.error().rule == rule);
+  REQUIRE(scenario.error().line > 0);  // at the SLO's line in the file
+}
+
 // ---- run_sweep: one simulation per point -------------------------------------------------------
 
 TEST_CASE("sweeping hello's rate gives the M/M/1 latency and utilization at each rate") {
@@ -365,6 +425,79 @@ TEST_CASE("sweeping hello's rate gives the M/M/1 latency and utilization at each
   REQUIRE(rows[2].value == "900/s");
   REQUIRE_THAT(rows[2].metrics[0], WithinRel(mean_900, rel_tolerance));  // 10.5 ms
   REQUIRE_THAT(rows[2].metrics[1], WithinAbs(0.9, 1e-9));
+}
+
+// The percentiles of hello at 500/s: the api is M/M/1 at rho 0.5, whose sojourn is exponential
+// with mean s / (1 − rho) = 2 ms, so variance (2 ms)^2 = 4e-6 s^2; the link's 0.5 ms round trip
+// adds to the mean and not to the spread: mean 2.5 ms, variance 4e-6 s^2. The reports fit a
+// lognormal to those two moments (queueing::lognormal_quantile): sigma^2 = ln(1 + 4e-6 / 2.5e-3^2)
+// = ln 1.64 = 0.4947, mu = ln 2.5e-3 − sigma^2 / 2 = −6.2388, so
+//   p50 = exp(mu) = 1.952 ms,  p95 = exp(mu + 1.6449 sigma) = 6.208 ms,
+//   p99 = exp(mu + 2.3263 sigma) = 10.03 ms.
+// The api's peak utilization is its steady 0.5 and it drops nothing.
+TEST_CASE("a sweep reads hello's percentiles, peak utilization and drop rate as the run does") {
+  std::vector<SweepMetric> metrics;
+  for (const auto* name :
+       {"users.ping.p50", "users.ping.p95", "users.ping.p99", "api.peak_rho", "api.drop_rate"}) {
+    metrics.push_back(*parse_metric(name));
+  }
+  const SweepParam param{.path = "nodes.users.rate.base", .values = {"500/s", "900/s"}};
+  const auto rows = run_sweep(hello_path, param, metrics, 2);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  const auto& at_500 = (*rows)[0].metrics;
+  REQUIRE_THAT(at_500[0], WithinRel(1.952e-3, 1e-3));
+  REQUIRE_THAT(at_500[1], WithinRel(6.208e-3, 1e-3));
+  REQUIRE_THAT(at_500[2], WithinRel(10.03e-3, 1e-3));
+  REQUIRE_THAT(at_500[3], WithinAbs(0.5, 1e-9));
+  REQUIRE(at_500[4] == 0.0);
+  REQUIRE((*rows)[0].beyond_timeout.empty());  // hello's client waits for ever
+  REQUIRE((*rows)[1].metrics[2] > at_500[2]);  // 900/s queues longer
+}
+
+namespace {
+// hello at 900/s whose client gives up after 5 ms: a scenario file of the test's own, because a
+// sweep replaces values and cannot add the `timeout` key hello lacks.
+std::string hello_with_timeout_path() {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("simsys-sweep-timeout-" + std::to_string(getpid()) + ".yaml");
+  std::ofstream{path} << "version: 1\nname: hello-timeout\nduration: 10s\nnodes:\n"
+                         "  users: {type: client, rate: {base: 900/s}, ops: {ping: 1.0}, "
+                         "timeout: 5ms}\n"
+                         "  api:   {type: service, capacity: 1k/s, latency: 1ms}\n"
+                         "links:\n  - {from: users, to: api, dir: inout}\n";
+  return path.string();
+}
+}  // namespace
+
+// hello at 900/s: mean 10.5 ms, variance (10 ms)^2 = 1e-4 s^2, lognormal sigma^2 = ln(1 + 1e-4 /
+// 10.5e-3^2) = 0.6456, mu = ln 10.5e-3 − 0.3228 = −4.8792. Behind a 5 ms timeout,
+// P(X > 5 ms) = 1 − Phi((ln 5e-3 − mu) / sigma) = 1 − Phi(−0.521) = 0.70 time out: more than half,
+// so the p50 and the p99 are the timeout, never seen answered. Behind 45 ms,
+// P(X > 45 ms) = 1 − Phi(2.213) = 1.35 %: more than the 1 % a p99 leaves, so the p99 is the
+// timeout while the p50 is the fit's median, exp(mu) = 7.60 ms. The table prints such a cell as
+// the op table does, `>5ms`; the csv keeps the number.
+TEST_CASE("a percentile that is the client's timeout prints as the op table prints it") {
+  const auto path = hello_with_timeout_path();
+  const std::vector<SweepMetric> metrics{*parse_metric("users.ping.p50"),
+                                         *parse_metric("users.ping.p99")};
+  const SweepParam param{.path = "nodes.users.timeout", .values = {"5ms", "45ms"}};
+  const auto rows = run_sweep(path, param, metrics, 1);
+  std::filesystem::remove(path);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  REQUIRE((*rows)[0].beyond_timeout == std::vector<std::size_t>{0, 1});
+  REQUIRE((*rows)[0].metrics[1] == 0.005);
+  REQUIRE((*rows)[1].beyond_timeout == std::vector<std::size_t>{1});
+  REQUIRE_THAT((*rows)[1].metrics[0], WithinRel(7.60e-3, 1e-3));
+  REQUIRE((*rows)[1].metrics[1] == 0.045);
+  const auto table = split(render_sweep(param, metrics, *rows, SweepFormat::table), '\n');
+  CAPTURE(table);
+  // Words of the lines: the swept value, then one cell per metric.
+  REQUIRE(split_words(table[2]) == std::vector<std::string>{"5ms", ">5ms", ">5ms"});
+  REQUIRE(split_words(table[3]) == std::vector<std::string>{"45ms", "7.6ms", ">45ms"});
+  const auto csv = split(render_sweep(param, metrics, *rows, SweepFormat::csv), '\n');
+  REQUIRE(csv[1] == "5ms,0.005,0.005");
 }
 
 TEST_CASE("the rows do not depend on how many workers ran the points") {
@@ -461,6 +594,7 @@ TEST_CASE("the csv has the swept key and the metrics as its header and one line 
   const auto metrics = hello_metrics();
   const auto text =
       render_sweep(hello_rate_sweep(), metrics, hello_rows_by_hand(), SweepFormat::csv);
+  // C++20 std::string::ends_with: a suffix test in one call, replacing a compare() on the tail.
   REQUIRE(text.ends_with('\n'));
   const auto lines = split(text, '\n');
   REQUIRE(lines.size() == 4);  // header + 3 rows

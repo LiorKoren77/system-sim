@@ -39,12 +39,13 @@ import simsys.engine;
 import simsys.graph;
 import simsys.model;
 import simsys.report;
+import simsys.session;
 import simsys.sweep;
 import simsys.workload;
 
-// Every engine call below lives in a named helper, never in main()'s body: GCC 14.2 at
-// -O2 crashes ("in ipa_comdats") when Graph::build, Simulation::create and step are
-// inlined into main (see the -fno-ipa-sra comment in CMakeLists.txt and the Lessons of
+// Every engine call below lives in a named helper (most in simsys.session), never in main()'s
+// body: GCC 14.2 at -O2 crashes ("in ipa_comdats") when Graph::build, Simulation::create and
+// step are inlined into main (see the -fno-ipa-sra comment in CMakeLists.txt and the Lessons of
 // the phase 1 plan).
 //
 // Numbers are formatted by simsys.report only. GCC 14 throws at run time on precision
@@ -53,7 +54,6 @@ import simsys.workload;
 
 namespace {
 
-namespace engine = simsys::engine;
 namespace graph = simsys::graph;
 namespace report = simsys::report;
 
@@ -68,38 +68,12 @@ void print_error(const std::string& message) {
   std::println(stderr, "{}", message);
 }
 
-// Scenario file -> resolved graph, or the message to print. `seed`, when given (`run
-// --seed`), replaces the scenario's own before the graph is built: the engine seeds every
-// client's noise from Graph::scenario().seed (behaviours::client_seed), so overriding it
-// any later would not reach the clients.
-// C++23 std::expected<T, E>: a value-or-error return type; the error here is the finished
-// message, so every command prints it the same way. C++23 monadic operations chain the
-// two fallible stages without an `if` per stage: transform_error rewrites only an error
-// (ConfigError or EngineError -> text), and_then runs the next stage only on a value and
-// passes an error straight through. The pre-C++23 way is an early return after each step.
-std::expected<graph::Graph, std::string> load_graph(const std::filesystem::path& file,
-                                                    std::optional<int> seed = std::nullopt) {
-  return simsys::config::load(file.string())
-      .transform_error(describe)
-      .and_then([&](simsys::model::Scenario scenario) {
-        if (seed) scenario.seed = *seed;
-        return graph::Graph::build(std::move(scenario))
-            .transform_error([&](const graph::EngineError& error) {
-              // C++20 std::format: type-safe formatting into a std::string, with `{}`
-              // placeholders checked against the arguments at compile time. Replaces snprintf
-              // and std::ostringstream chains. Strings and integers only here (see above).
-              return std::format("{}: error: {}", file.string(), error.message);
-            });
-      });
-}
-
-// A graph the engine can run, or `file: error: why not` (e.g. a node type that phase 1
-// validates and explains but does not simulate yet).
-std::expected<engine::Simulation, std::string> create_simulation(
-    const graph::Graph& g, const std::filesystem::path& file) {
-  return engine::Simulation::create(g).transform_error([&](const graph::EngineError& error) {
-    return std::format("{}: error: {}", file.string(), error.message);
-  });
+// Scenario file -> resolved graph, or the message to print (simsys.session: `sweep` loads each
+// of its points the same way).
+// C++23 std::expected<T, E>: the graph or the finished message, so every command prints an error
+// the same way.
+std::expected<graph::Graph, std::string> load_graph(const std::filesystem::path& file) {
+  return simsys::session::load_graph(file.string());
 }
 
 // How `estimate` and `run` print their result.
@@ -185,7 +159,7 @@ int run_estimate(const std::filesystem::path& file, const ReportOptions& options
     print_error(g.error());
     return 1;
   }
-  const auto sim = create_simulation(*g, file);
+  const auto sim = simsys::session::create_simulation(*g, file.string());
   if (!sim) {
     print_error(sim.error());
     return 1;
@@ -204,54 +178,70 @@ int run_estimate(const std::filesystem::path& file, const ReportOptions& options
   return print_report(report::Summary::of_estimate(*g, record), options);
 }
 
-// The first SLO window (`over`) longer than the run observes after the warmup, duration −
-// warmup, as the loader's rule words it (config.cpp, read_slo_over): such a window never
-// completes, so its SLO would check nothing. Empty when every window fits.
-std::optional<std::string> over_beyond_run(const simsys::model::Scenario& scenario,
-                                           simsys::SimTime duration) {
-  const auto observed = duration.count() - scenario.warmup.count();
-  for (const auto& slo : scenario.slos) {
-    if (!slo.over || slo.over->count() <= observed) continue;
-    return std::format("over must fit in the run after warmup ({} > duration {} - warmup {})",
-                       simsys::describe_duration(*slo.over), simsys::describe_duration(duration),
-                       simsys::describe_duration(scenario.warmup));
-  }
-  return std::nullopt;
-}
-
-// `--duration` overrides the scenario's; like the scenario's own, it must leave a non-empty
-// window after the warmup, and room in that window for every SLO's `over` (the loader enforces
-// the same rules on the file; review of plan 2c Task 19: `--duration 10m` on youtube kept its
-// `over: 1h` and reported a 1 h window of a 10-minute run). The text is the user's, so the
-// message echoes what they typed.
-std::expected<simsys::SimTime, std::string> run_duration(const std::filesystem::path& file,
-                                                         const simsys::model::Scenario& scenario,
-                                                         const std::optional<std::string>& text) {
-  if (!text) return scenario.duration;
-  const auto parsed = simsys::parse_duration(*text);
-  if (!parsed) {
-    return std::unexpected(std::format("{}: error: --duration '{}': {}", file.string(),
-                                       parsed.error().input, parsed.error().message));
-  }
-  if (parsed->count() <= scenario.warmup.count()) {
-    return std::unexpected(std::format("{}: error: --duration {} is not longer than the warmup {}",
-                                       file.string(), *text,
-                                       simsys::describe_duration(scenario.warmup)));
-  }
-  if (const auto refused = over_beyond_run(scenario, *parsed)) {
-    return std::unexpected(
-        std::format("{}: error: --duration {}: {}", file.string(), *text, *refused));
-  }
-  return *parsed;
-}
-
 // What `run` takes beyond the report options.
 struct RunArgs {
   std::optional<std::string> duration{};    // overrides the scenario's
   std::optional<std::string> series{};      // CSV output path, one row per node per step
   std::optional<std::string> series_ops{};  // CSV output path, one row per client op per step
-  std::optional<int> seed{};                // overrides the scenario's (see load_graph)
+  std::optional<int> seed{};                // overrides the scenario's (see load_for_run)
 };
+
+// `--duration`'s text, checked as a duration before anything is loaded, so its message echoes
+// what the user typed.
+std::optional<std::string> unparsable_duration(const std::filesystem::path& file,
+                                               const std::string& text) {
+  const auto parsed = simsys::parse_duration(text);
+  if (parsed) return std::nullopt;
+  // C++20 std::format: type-safe formatting into a std::string, with `{}` placeholders checked
+  // against the arguments at compile time. Strings and integers only here (see the top).
+  return std::format("{}: error: --duration '{}': {}", file.string(), parsed.error().input,
+                     parsed.error().message);
+}
+
+// Why the file loads but not with `--duration`, worded after the option: a duration not longer
+// than the warmup (nothing would be observed), or the loader's rule as it judged the new duration
+// (an SLO's `over` that no longer fits after the warmup: review of plan 2c Task 19, where
+// `--duration 10m` on youtube kept its `over: 1h`), at the line it judged. The file's own mistake
+// comes first, as the loader words it.
+std::string duration_refusal(const std::filesystem::path& file, const std::string& text,
+                             const simsys::config::ConfigError& refused) {
+  const auto file_alone = simsys::config::load(file.string());
+  if (!file_alone) return describe(file_alone.error());
+  const auto duration = simsys::parse_duration(text);  // parsed already: unparsable_duration
+  if (duration && duration->count() <= file_alone->warmup.count()) {
+    return std::format("{}: error: --duration {} is not longer than the warmup {}", file.string(),
+                       text, simsys::describe_duration(file_alone->warmup));
+  }
+  auto blamed = refused;
+  blamed.message = std::format("--duration {}: {}", text, refused.rule);
+  return describe(blamed);
+}
+
+// The graph `run` simulates. `--duration` is applied as a config::Override, so the loader holds it
+// to every rule it holds the file's own duration to (comprehensive 2c review, I-4: the CLI kept a
+// copy of the `over` rule); `--seed` replaces the scenario's before the graph is built: the engine
+// seeds every client's noise from Graph::scenario().seed (behaviours::client_seed), so replacing
+// it any later would not reach the clients.
+std::expected<graph::Graph, std::string> load_for_run(const std::filesystem::path& file,
+                                                      const RunArgs& args) {
+  std::vector<simsys::config::Override> overrides;
+  if (args.duration) {
+    if (auto refused = unparsable_duration(file, *args.duration)) {
+      // C++23 std::unexpected<E>: wraps the error so it converts to any std::expected<T, E>.
+      return std::unexpected(std::move(*refused));
+    }
+    // C++20 designated initializers: the members named where the value is built, in declaration
+    // order, replacing positional braces where a reader must remember which string is which.
+    overrides.push_back({.path = "duration", .value = *args.duration});
+  }
+  auto scenario = simsys::config::load(file.string(), overrides);
+  if (!scenario) {
+    return std::unexpected(args.duration ? duration_refusal(file, *args.duration, scenario.error())
+                                         : describe(scenario.error()));
+  }
+  if (args.seed) scenario->seed = *args.seed;
+  return simsys::session::build_graph(file.string(), std::move(*scenario));
+}
 
 // Opens `path` for a series file (`--series`, `--series-ops`), or says why it cannot.
 bool open_series(const std::string& path, std::ofstream& file) {
@@ -296,24 +286,18 @@ std::optional<std::string> series_paths_refused(const std::optional<std::string>
 
 // `simsys run <file>`: steps through the scenario, feeding every record to the summary
 // and, when asked, to the CSV series (the contract a GUI plots from).
-// `--seed` reaches the engine through the scenario (load_graph); a process-level test of
+// `--seed` reaches the engine through the scenario (load_for_run); a process-level test of
 // that would need to spawn simsys, so it is checked by hand (two seeds, two outputs) and
 // the engine half is pinned in tests/theory ("two runs with the same seed are identical
 // and a different seed is not").
 int run_scenario(const std::filesystem::path& file, const RunArgs& args,
                  const ReportOptions& options) {
-  const auto g = load_graph(file, args.seed);
+  const auto g = load_for_run(file, args);
   if (!g) {
     print_error(g.error());
     return 1;
   }
-  const auto& scenario = g->scenario();
-  const auto duration = run_duration(file, scenario, args.duration);
-  if (!duration) {
-    print_error(duration.error());
-    return 1;
-  }
-  auto sim = create_simulation(*g, file);
+  auto sim = simsys::session::create_simulation(*g, file.string());
   if (!sim) {
     print_error(sim.error());
     return 1;
@@ -334,17 +318,9 @@ int run_scenario(const std::filesystem::path& file, const RunArgs& args,
   if (args.series) series.emplace(series_file, *g);
   if (args.series_ops) series_ops.emplace(series_ops_file, *g);
 
-  report::Summary summary{*g, scenario.warmup};
-  // Pattern: Observer — the step loop hands each record to one callable; this lambda fans
-  // it out to the observers (summary, optional node and op series) so none knows of another.
-  const auto observe = [&](const engine::StepRecord& record) {
-    summary.observe(record);
-    if (series) series->observe(record);
-    if (series_ops) series_ops->observe(record);
-  };
-  // C++20 designated initializers: members named at the call site, in declaration order,
-  // replacing a positional `{duration, step}` where a reader must remember which is which.
-  sim->run({.duration = *duration, .step = scenario.step}, observe);
+  const auto summary = simsys::session::run_summary(
+      *g, *sim,
+      {.series = series ? &*series : nullptr, .series_ops = series_ops ? &*series_ops : nullptr});
   return print_report(summary, options);
 }
 
@@ -547,6 +523,55 @@ void add_report_options(CLI::App& command, ReportOptions& options) {
                    "never colour the table (default: colour when stdout is a terminal)");
 }
 
+// Every command's first argument: the scenario file, which must exist.
+void add_file_argument(CLI::App& command, std::filesystem::path& file) {
+  command.add_option("file", file, "scenario YAML file")->required()->check(CLI::ExistingFile);
+}
+
+// `run`'s own options, after the report options it shares with `estimate`.
+void add_run_options(CLI::App& run, RunArgs& args) {
+  run.add_option("--duration", args.duration, "simulated time, e.g. 30s (default: scenario's)");
+  run.add_option("--seed", args.seed, "seed of the clients' rate noise (default: scenario's)");
+  run.add_option("--series", args.series, "write one CSV row per node per step to this file");
+  run.add_option("--series-ops", args.series_ops,
+                 "write one CSV row per client op per step to this file");
+}
+
+CLI::App* add_curve_command(CLI::App& app, CurveArgs& args, std::filesystem::path& file) {
+  auto* curve = app.add_subcommand("curve", "print a client's rate curve as CSV (t_s,rate_per_s)");
+  add_file_argument(*curve, file);
+  curve->add_option("client", args.client, "id of a client node")->required();
+  curve->add_option("--step", args.step, "time between samples (default 1m)");
+  curve->add_option("--until", args.until,
+                    "end of the curve, exclusive (default: scenario's duration)");
+  curve->add_option("--seed", args.seed, "noise seed (default: scenario's seed)");
+  curve->add_flag("--noise", args.noise,
+                  "multiply in the client's seeded noise, advanced every scenario step as in a run "
+                  "(--step must then be a multiple of it)");
+  return curve;
+}
+
+CLI::App* add_sweep_command(CLI::App& app, SweepArgs& args, std::filesystem::path& file) {
+  auto* sweep = app.add_subcommand(
+      "sweep", "run the scenario once per value of one key, the runs in parallel; one row each");
+  add_file_argument(*sweep, file);
+  sweep
+      ->add_option("--param", args.param,
+                   "the swept key and its range, <dot.path>=<from>..<to>:<n>, "
+                   "e.g. nodes.users.rate.base=100/s..900/s:3")
+      ->required();
+  sweep
+      ->add_option("--metric", args.metrics,
+                   "a column: <client>.<op>.mean|p50|p95|p99, <node>.mean_rho|peak_rho|drop_rate "
+                   "or <queue>.lag (repeatable)")
+      ->required();
+  sweep->add_option("--jobs", args.jobs, "worker threads (default: the machine's hardware threads)")
+      ->check(CLI::Range(std::size_t{1}, simsys::sweep::max_jobs));
+  sweep->add_option("--format", args.format, "output format: table (default) or csv")
+      ->check(CLI::IsMember({"table", "csv"}));
+  return sweep;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -557,59 +582,21 @@ int main(int argc, char** argv) {
   std::filesystem::path scenario_file;
   ReportOptions report_options;
   RunArgs run_args;
+  CurveArgs curve_args;
+  SweepArgs sweep_args;
 
   auto* validate = app.add_subcommand("validate", "check a scenario's types, references and units");
   auto* explain = app.add_subcommand(
       "explain", "print every resolved number, where it came from, and a static load check");
   auto* estimate = app.add_subcommand("estimate", "evaluate the steady state once and check SLOs");
   auto* run = app.add_subcommand("run", "step through the scenario and check SLOs");
-  for (auto* command : {validate, explain, estimate, run}) {
-    command->add_option("file", scenario_file, "scenario YAML file")
-        ->required()
-        ->check(CLI::ExistingFile);
-  }
-  CurveArgs curve_args;
-  auto* curve = app.add_subcommand("curve", "print a client's rate curve as CSV (t_s,rate_per_s)");
-  curve->add_option("file", scenario_file, "scenario YAML file")
-      ->required()
-      ->check(CLI::ExistingFile);
-  curve->add_option("client", curve_args.client, "id of a client node")->required();
-  curve->add_option("--step", curve_args.step, "time between samples (default 1m)");
-  curve->add_option("--until", curve_args.until,
-                    "end of the curve, exclusive (default: scenario's duration)");
-  curve->add_option("--seed", curve_args.seed, "noise seed (default: scenario's seed)");
-  curve->add_flag("--noise", curve_args.noise,
-                  "multiply in the client's seeded noise, advanced every scenario step as in a run "
-                  "(--step must then be a multiple of it)");
-  SweepArgs sweep_args;
-  auto* sweep = app.add_subcommand(
-      "sweep", "run the scenario once per value of one key, the runs in parallel; one row each");
-  sweep->add_option("file", scenario_file, "scenario YAML file")
-      ->required()
-      ->check(CLI::ExistingFile);
-  sweep
-      ->add_option("--param", sweep_args.param,
-                   "the swept key and its range, <dot.path>=<from>..<to>:<n>, "
-                   "e.g. nodes.users.rate.base=100/s..900/s:3")
-      ->required();
-  sweep
-      ->add_option("--metric", sweep_args.metrics,
-                   "a column: <client>.<op>.mean, <node>.mean_rho or <queue>.lag (repeatable)")
-      ->required();
-  sweep
-      ->add_option("--jobs", sweep_args.jobs,
-                   "worker threads (default: the machine's hardware threads)")
-      ->check(CLI::Range(std::size_t{1}, simsys::sweep::max_jobs));
-  sweep->add_option("--format", sweep_args.format, "output format: table (default) or csv")
-      ->check(CLI::IsMember({"table", "csv"}));
+  for (auto* command : {validate, explain, estimate, run})
+    add_file_argument(*command, scenario_file);
+  auto* curve = add_curve_command(app, curve_args, scenario_file);
+  auto* sweep = add_sweep_command(app, sweep_args, scenario_file);
   add_report_options(*estimate, report_options);
   add_report_options(*run, report_options);
-  run->add_option("--duration", run_args.duration,
-                  "simulated time, e.g. 30s (default: scenario's)");
-  run->add_option("--seed", run_args.seed, "seed of the clients' rate noise (default: scenario's)");
-  run->add_option("--series", run_args.series, "write one CSV row per node per step to this file");
-  run->add_option("--series-ops", run_args.series_ops,
-                  "write one CSV row per client op per step to this file");
+  add_run_options(*run, run_args);
 
   try {
     app.parse(argc, argv);

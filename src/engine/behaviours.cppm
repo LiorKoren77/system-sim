@@ -1160,7 +1160,8 @@ class CacheBehaviour {
 // replica's). This behaviour serves everything, forwards nothing (a database is a leaf: it
 // calls nobody) and composes nothing more.
 // Ignored: replication conflicts and multi-primary set-ups, failover (a replica promoted when
-// the primary dies, ch. 1: no failures before phase 2c), transactions and locks, queueing for
+// the primary dies, ch. 1: a database never fails in this model; faults come with phase 3),
+// transactions and locks, queueing for
 // a connection beyond the pool (a query waiting for a free connection waits in the same queue
 // here), cross-shard queries and joins, resharding, hot shards, per-op service times (a write
 // costs more capacity, 5 units by default, not a longer service time), and read-your-writes:
@@ -1224,6 +1225,10 @@ class SqlDbBehaviour {
 // A CDN takes no writes (graph::Graph::build refuses them), so all its answers are first
 // megabytes. A bandwidth link's pipe times its requests with this class too (serialising): a
 // write at its last byte, any other op at its first megabyte.
+// Pattern: Delegation — a blob store and a CDN sized in bytes each hold one MegabyteService (an
+// optional member) and hand it their timing questions (megabyte_service(): object times for the
+// queue, a request's answer time), as the engine's pipes do; none of them inherits it, and a
+// node that counts requests simply holds none.
 class MegabyteService {
  public:
   MegabyteService(const graph::Graph& g, std::size_t self);
@@ -1953,7 +1958,8 @@ double ServiceBehaviour::cost(std::string_view op) const {
 }
 
 // The graph's resolved hops (graph::Graph::service_hops), minus those no request takes: an
-// `on: failure` step (no failures before phase 2c) and an `on: miss` step after a cache
+// `on: failure` step (taken by no request: only an external sink fails, and nothing reacts to
+// a failure before phase 3) and an `on: miss` step after a cache
 // that always hits. Such a hop forwards nothing and adds nothing, so it is left out rather
 // than carried as a zero branch. Each unconditional hop opens a block of its own; a miss hop
 // joins the block of the miss hops of the same lookup before it (detail::Block).

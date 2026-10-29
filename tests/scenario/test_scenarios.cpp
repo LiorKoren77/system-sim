@@ -273,8 +273,9 @@ TEST_CASE("book scenarios are refused by run until their node types exist", "[sc
 // scenarios is pinned by name: a node type added later makes this fail and forces whoever adds it
 // to update the list on purpose.
 TEST_CASE(
-    "scenarios that run today are: chain, hello, consistent-hashing, kv-store, news-feed, "
-    "rate-limiter, search-autocomplete, unique-id, url-shortener, youtube",
+    "exactly ten shipped scenarios use only simulated node types: chain, hello, "
+    "consistent-hashing, kv-store, news-feed, rate-limiter, search-autocomplete, unique-id, "
+    "url-shortener, youtube",
     "[scenario]") {
   std::vector<std::string> runnable;
   for (const auto& file : scenario_files()) {
@@ -521,7 +522,7 @@ TEST_CASE("book/google-drive is refused at long_poll, its ws_gateway", "[scenari
 // and since plan 2c Task 10 so is graph_db, its kv_cluster, the last node type it lacked (the
 // refusal moved from fanout_q to graph_db, and now there is none: the nodes are client, cdn,
 // blob_store, load_balancer, service, cache, sql_db, message_queue, worker_pool and kv_cluster).
-TEST_CASE("book/news-feed is accepted by the engine now that its kv_cluster is simulated",
+TEST_CASE("book/news-feed uses only node types the engine simulates, its kv_cluster included",
           "[scenario]") {
   const auto g = build_or_fail(
       load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml"));
@@ -939,6 +940,8 @@ double stated_size_of(const simsys::model::Scenario& scenario, std::string_view 
   const auto client = std::ranges::find(scenario.nodes, client_id, &simsys::model::NodeSpec::id);
   REQUIRE(client != scenario.nodes.end());
   REQUIRE(client->workload.has_value());
+  // C++20 std::ranges::find_if: the range itself and a predicate, replacing std::find_if's
+  // begin/end pair.
   const auto found = std::ranges::find_if(client->workload->sizes,
                                           [&](const auto& entry) { return entry.first == op; });
   REQUIRE(found != client->workload->sizes.end());
@@ -1280,9 +1283,10 @@ TEST_CASE(
 // in 27.24 ms on average: 6.62 % of the 8.589k delivered time out (568.8/s), 8.020k are answered,
 // and the p99 SLO fails at the timeout (more than 1 % timed out). Weighted by the puts offered, as
 // before the fix, it was 7.43 % (638.4/s) and a mean of 29.4 ms. The p50 is the client's: the
-// timed-out puts are all slower than the answered ones, so it is the answered puts' fit read at
-// q_eff = 0.5 / 0.9338 = 0.5355 (z = 0.0890), 22.7 ms (review of the Task 12/13 fix rounds and
-// Task 14, C-1; read at 0.5, their own median, it was 21.3 ms).
+// engine times out exactly the puts the delivered fit puts past 100 ms, so the fastest half of the
+// delivered puts are answered ones and the client's median is that fit's, the untimed 22.28 ms
+// (comprehensive 2c review, C-1; the refit of the answered puts read at 0.5 / 0.9338 said 22.7 ms,
+// read at 0.5 21.3 ms).
 TEST_CASE(
     "labs/kv-store with one virtual node and a write quorum of three times out the puts past 100ms",
     "[scenario]") {
@@ -1297,11 +1301,8 @@ TEST_CASE(
   REQUIRE_THAT(put.mean_s, Catch::Matchers::WithinRel(below.mean_s, 1e-6));
   REQUIRE_THAT(put.timed_out_per_s / delivered, Catch::Matchers::WithinRel(0.06622, 1e-3));
   REQUIRE_THAT(put.mean_s, Catch::Matchers::WithinRel(27.24e-3, 1e-3));
-  const double z_eff = simsys::queueing::normal_quantile(0.5 / below.fraction);
-  REQUIRE_THAT(put.p50_s, Catch::Matchers::WithinRel(simsys::queueing::lognormal_quantile(
-                                                         below.mean_s, below.variance_s2, z_eff),
-                                                     1e-5));
-  REQUIRE_THAT(put.p50_s, Catch::Matchers::WithinRel(22.7e-3, 2e-3));
+  REQUIRE_THAT(put.p50_s, Catch::Matchers::WithinRel(untimed.p50_s, 1e-9));
+  REQUIRE_THAT(put.p50_s, Catch::Matchers::WithinRel(22.28e-3, 1e-3));
   const auto results = run_slos(kv_lab_writing_to_all_three(true));
   const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
   REQUIRE(p99.status == simsys::report::SloStatus::fail);
@@ -1359,7 +1360,7 @@ TEST_CASE("explain on labs/kv-store checks the store at 16 nodes", "[scenario]")
 // accepts it.
 
 TEST_CASE(
-    "book/search-autocomplete is accepted by the engine now that its search_index is simulated",
+    "book/search-autocomplete uses only node types the engine simulates, its search_index included",
     "[scenario]") {
   const auto g = build_or_fail(load_scenario("/book/search-autocomplete/scenario.yaml"));
   const auto sim = simsys::engine::Simulation::create(g);
@@ -1466,8 +1467,8 @@ const simsys::report::NodeSummary& node_of(const AutocompleteDay& day, std::stri
 //    p99, not the timeout): both pinned to 1e-3 relative, the README's four digits (the 1 s step
 //    moves them by 1e-8 relative, measured).
 TEST_CASE(
-    "book/search-autocomplete passes both SLOs over its day: api 44.6 percent, trie_cache hits "
-    "0.995, aggregators 60 percent, suggest p99 6.86 ms",
+    "book/search-autocomplete meets both SLOs over its day with every peak where the paper load "
+    "puts it",
     "[scenario]") {
   const auto day = run_autocomplete_day();
   using Catch::Matchers::WithinAbs;
@@ -1607,12 +1608,14 @@ TEST_CASE(
 //   answered            886.6 - 293.6               = 593.0/s
 // and since more than 1 % of the delivered shortens timed out, the p99 the client saw is the
 // timeout itself, exactly 1 s (review of Task 13, C-1). The timed-out ones were delivered: they are
-// counted from what the path delivered, not from what was offered. Its p50 is the answered
-// shortens' fit read at 0.5 / (1 − 0.331) = 0.747, since every timed-out shorten is slower than
-// every answered one: 571 ms (review of the Task 12/13 fix rounds and Task 14, C-1; read at 0.5,
-// the answered shortens' own median, it was 329 ms; without the timeout the fit's median is 545).
+// counted from what the path delivered, not from what was offered. Its p50 is the median of the fit
+// to every delivered shorten's latency, before the timeout cut it: the engine times out exactly the
+// shortens that fit puts past 1 s, so the fastest half are answered ones (comprehensive 2c review,
+// C-1): 544.7 ms, what the same run without the timeout reports (the refit of the answered shortens
+// read at 0.5 / (1 − 0.331) said 571 ms, read at 0.5 329 ms).
 TEST_CASE(
-    "book/url-shortener with a ticket server answers 593 shortens a second and times out 293.6",
+    "book/url-shortener with a ticket server loses what id_gen drops and times out a third of the "
+    "rest",
     "[scenario]") {
   auto s = load_scenario("/book/url-shortener/scenario.yaml");
   auto& id_gen = *std::ranges::find(s.nodes, "id_gen", &simsys::model::NodeSpec::id);
@@ -1636,7 +1639,7 @@ TEST_CASE(
   REQUIRE_THAT(lost / shorten->offered_per_s,
                Catch::Matchers::WithinRel(summary.drop_rate("id_gen"), 1e-3));
   REQUIRE(shorten->p99_s == 1.0);
-  REQUIRE_THAT(shorten->p50_s, Catch::Matchers::WithinRel(0.571, 2e-3));
+  REQUIRE_THAT(shorten->p50_s, Catch::Matchers::WithinRel(0.5447, 2e-3));
 }
 
 // ---- youtube end to end (plan 2c Task 16) ----

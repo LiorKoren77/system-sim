@@ -428,6 +428,8 @@ TEST_CASE("a run's queue rows hold the lag in seconds and the client and pool ro
       REQUIRE(row[10].empty());
     }
   }
+  // C++20 std::ranges::find_if: the range itself and a predicate, replacing std::find_if's
+  // begin/end pair.
   const auto last_q =
       std::ranges::find_if(rows, [](const auto& row) { return row[0] == "0.9" && row[1] == "q"; });
   REQUIRE(last_q != rows.end());

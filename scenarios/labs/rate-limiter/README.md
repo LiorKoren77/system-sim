@@ -43,16 +43,16 @@ table below is the comparison at `burst: 500`, the setting the "things to try" s
 
 | algorithm | rejected | api mean rho | api peak backlog | api drops | client mean | client p99 (est.) | SLOs |
 |---|---|---|---|---|---|---|---|
-| token_bucket (burst 500) | 14.2 % | 0.68 | 400 | 140 | 6.71 ms | 67.1 ms | p99 FAIL (exit 2) |
+| token_bucket (burst 500) | 14.2 % | 0.68 | 400 | 140 | 6.64 ms | 63.8 ms | p99 FAIL (exit 2) |
 | leaky_bucket (burst 500) | 14.2 % | 0.68 | 0 | 0 | 64.1 ms | 624 ms | p99 FAIL (exit 2) |
 | fixed_window (1 s) | 14.3 % | 0.68 | 400 | 9.6k | 21.6 ms | 228 ms | p99 FAIL (exit 2) |
-| sliding_log (1 s) | 14.3 % | 0.68 | 160 | 0 | 11.9 ms | 127 ms | p99 FAIL (exit 2) |
-| sliding_counter (1 s) | 15.1 % | 0.67 | 80 | 0 | 5.53 ms | 25.2 ms | PASS (exit 0) |
+| sliding_log (1 s) | 14.3 % | 0.68 | 160 | 0 | 10.4 ms | 111 ms | p99 FAIL (exit 2) |
+| sliding_counter (1 s) | 15.1 % | 0.67 | 80 | 0 | 5.51 ms | 23.1 ms | PASS (exit 0) |
 
 What happens at the spikes:
 - **Token bucket**: at the start of each spike the full bucket lets its 500 tokens through
   on top of the refill, 600 requests in one 100 ms step, while the api clears 120. The
-  response stays above 100 ms for about 2 s per spike. Under the 5x and the 20x spikes the
+  response stays above 100 ms for 1.5 to 2 s per spike. Under the 5x and the 20x spikes the
   queue fills (400) and overflows: the 140 drops are 60 at the 5x spike and 80 at the 20x
   one. Under the 2x spike it reaches 320 and drops nothing. After the surge exactly 1k/s
   gets through (api at 83 %). "A burst passes untouched" is the whole point of the
@@ -73,54 +73,55 @@ What happens at the spikes:
   earlier. Under a flood the pattern repeats every second: one step of 280 (the api clears
   120), nine of 80. The api's backlog peaks at 160, below its queue limit, and drains in
   0.4 s: no drops, but red for half of every second of a spike (77.5 s in all) and a p99
-  of 127 ms. A smaller lump than the fixed window's, a larger one than the sliding counter's.
+  of 111 ms. A smaller lump than the fixed window's, a larger one than the sliding counter's.
 - **Sliding counter**: the estimate counts the previous window too, so nothing like a
   window's worth enters at once; under a flood it admits a little below the limit (the
   higher reject rate, 15.1 %). The api peaks briefly (backlog 80, about 0.3 s red per
   spike) and the run meets both SLOs.
 
 The p99 column is estimated from a lognormal fitted to the mean and variance of the
-response over the run, so a few seconds of 300 ms responses widen it a lot: the token
-bucket's 67 ms comes from about 7 s of saturation in 29 minutes. The clients' `timeout: 1s`
-(plan 2c Task 13) trims that tail a little: each step's response is a lognormal, and the share of
-it past 1 s is timed out instead of answered. Almost nothing is (`timed_out_per_s` 0.0015 for
-the token bucket at `burst: 500`, 0.0007 at the shipped `burst: 100`), but those far-tail
-requests weighed heavily on the variance the p99 is fitted to: each p99 above fell by 0.3 to
-1.6 % when the timeout began to apply (67.3, 228, 129 and 25.6 ms without it; the leaky bucket's
-624 ms did not move). The p99 is read off the answered requests' fit at 0.99 / (1 − s), s the
-share timed out (every timed-out request is slower than every answered one, so the client's 99th
-percentile is the answered requests' 0.99 / (1 − s)-th), which gives back only a sliver here: s is
-4e-5 at most (the fixed window's), and its p99 is 227.7 ms where the fit read at 0.99 gave 227.2
-ms. That fall is an artefact of the moment fit, not of the requests: at the
-shipped `burst: 100`, cutting 8.9e-7 of the delivered requests removes 3.9 % of the fitted
-variance, so the refitted lognormal narrows, while the requests' own p99 moves by about 1e-6. It
-is kept (no threshold below which a cut is ignored: that would make the percentile jump where
-the threshold is crossed).
+response over the run, so a few seconds of slow responses widen it a lot: the token bucket's
+64 ms comes from about 7 s of saturation in 29 minutes. While the api works off a burst's
+backlog, every one of its servers is busy (rho 1), but the requests still arriving come at the
+limiter's 1k/s, rho 0.83 of the api: the model's stochastic wait reads that load, not the busy
+fraction, and the backlog's own drain time carries the rest, so the wait falls with the backlog
+(each p99 above fell 5 to 14 % when this landed in the comprehensive 2c review; the leaky
+bucket's, whose api never queues, and the fixed window's, whose queue overflows, did not move).
+The clients' `timeout: 1s` (plan 2c Task 13) changes none of the figures: of each step's fitted
+response the share past 1 s is timed out instead of answered, and almost nothing is
+(`timed_out_per_s` 0.0003 for the token bucket at `burst: 500` and at the shipped `burst: 100`,
+0.03 for the fixed window), and a client's percentile is read off the fit to every request the
+path delivered, before the cut, which the cut leaves where it was. (Until that review the reports
+refitted the answered requests alone, and a cut of 8.9e-7 of the calls moved the shipped p99 by
+2 %.)
 
 ## Things to try
 - `burst: 5000`: each spike gets through for longer: 11.7k drops at the api, 16.5 s red,
-  p99 112 ms.
+  p99 111 ms.
 - `burst: 500` (the table above): the first-step surge of 600 requests overflows the api's
-  queue; p99 67.1 ms and the SLO fails. With the default `burst: 100` the surge shrinks to
-  200 requests: api backlog 80, no drops, p99 29.9 ms, both SLOs met. The bucket's size is
+  queue; p99 63.8 ms and the SLO fails. With the default `burst: 100` the surge shrinks to
+  200 requests: api backlog 80, no drops, p99 24.8 ms, both SLOs met. The bucket's size is
   the burst the api must absorb.
 - `algorithm: sliding_log` with `window: 500ms`: the same 1k/s in half-second windows. The
   lump at each window's start shrinks to 180 (api backlog 60, 62 s red), but it comes twice
-  as often: p99 116 ms, still a FAIL.
+  as often: p99 96.8 ms, still a FAIL.
 - Sweep the bucket's size (an algorithm is a word, which `sweep` cannot range over; edit it by
   hand as above):
 
   ```
   $ simsys sweep scenarios/labs/rate-limiter/scenario.yaml --param nodes.limiter.burst=100..500:5 \
-        --metric clients.call.mean --metric api.mean_rho
-  nodes.limiter.burst  clients.call.mean  api.mean_rho
-  ----------------------------------------------------
-  100                             5.79ms         0.682
-  200                             5.94ms         0.682
-  300                             6.19ms         0.682
-  400                             6.52ms         0.682
-  500                             6.71ms         0.682
+        --metric clients.call.mean --metric clients.call.p99 --metric api.mean_rho \
+        --metric api.drop_rate
+  nodes.limiter.burst  clients.call.mean  clients.call.p99  api.mean_rho  api.drop_rate
+  -------------------------------------------------------------------------------------
+  100                             5.73ms            24.8ms         0.682              0
+  200                             5.87ms            32.4ms         0.682              0
+  300                             6.12ms            45.4ms         0.682              0
+  400                             6.45ms            58.2ms         0.682              0
+  500                             6.64ms            63.8ms         0.682       9.83e-05
   ```
 
   The api does the same work at every size (the bucket admits the same total); what a bigger
-  bucket changes is how much of it arrives at once, and so the wait.
+  bucket changes is how much of it arrives at once, and so the wait: the p99 SLO of 50 ms holds
+  up to a bucket of about 300 and fails from 400, and at 500 the surge overflows the api's queue
+  (its drop rate, 140 of 1.42M requests).

@@ -389,7 +389,10 @@ TEST_CASE("one lognormal replica's order statistic returns its own moments", "[q
 // integrals). Next to Renyi's exponentials of the same mean (1/3, 5/6, 11/6 ms) the lognormal's
 // lighter left tail makes the fastest slower (0.4210 ms) and its lighter right tail the slowest
 // faster (1.7528 ms); the quorum of two barely moves (0.8262 against 0.8333 ms).
-TEST_CASE("the k-th fastest of three lognormal replicas of SCV one", "[queueing]") {
+TEST_CASE(
+    "of three lognormal replicas of SCV one the fastest answers in 0.421 ms, the second in "
+    "0.826 ms and the slowest in 1.753 ms",
+    "[queueing]") {
   const std::array three{
       ReplicaGroup{.replicas = 3, .sojourn = {.mean_s = 1e-3, .variance_s2 = 1e-6}}};
   const auto first = lognormal_order_statistic(three, 1);

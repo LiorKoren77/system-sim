@@ -64,7 +64,7 @@ recommended setting. 15k/s gives 67 % on average and room for the spread.
 | `vnodes: 150` (shipped) | 1.09 | 0.963 | 0.72 | 0 | 0.27 | 1.37 ms / 2.22 ms | PASS (exit 0) |
 | `vnodes: 1000` | 1.03 | 0.963 | 0.69 | 0 | 0.27 | 1.37 ms / 2.21 ms | PASS |
 | `vnodes: 100` | 1.1 | 0.963 | 0.74 | 0 | 0.27 | 1.37 ms / 2.23 ms | PASS |
-| `vnodes: 1` | 2.05 | 0.92 | 1 (20.49k/s vs 15k/s: 137 %) | 6.26M (13.7 %) | 0.495 | 34.3 ms / 174 ms | cache FAIL (exit 2) |
+| `vnodes: 1` | 2.05 | 0.92 | 1 (20.49k/s vs 15k/s: 137 %) | 6.26M (13.7 %) | 0.495 | 34.3 ms / 166 ms | cache FAIL (exit 2) |
 
 - **`vnodes: 1`**: the hottest server owns 51 % of the ring, 20.49k/s against its 15k/s. Its
   queue fills (1k waiting, red for the whole run) and it sheds the excess, 5.49k/s, 13.7 % of
@@ -73,11 +73,11 @@ recommended setting. 15k/s gives 67 % on average and room for the spread.
   the hot server). The clients' `timeout: 200ms` (plan 2c Task 13) gives up on 0.5 % of the
   requests that get through (`timed_out_per_s` 162.9 of the gets, 18.1 of the sets: s = 0.52 %
   of the gets delivered), and the mean is that of the requests answered in time (35.5 ms before
-  the timeout applied). The p99 is what the client saw: every timed-out request is slower than
-  every answered one, so the client's 99th percentile is the answered requests' 0.99 / (1 − s) =
-  0.9952-th, which their refitted lognormal puts at 174 ms (read at 0.99 it said 143 ms, a timeout
-  making the p99 look better; without the timeout the fit says 166 ms: the refit to the truncated
-  moments is not the original fit, and lands a little above it). That 0.5 % is the tail of the one
+  the timeout applied). The p99 is what the client saw: the model times out exactly the requests
+  its fitted lognormal puts past 200 ms, so the fastest 99 % of the delivered requests are answered
+  ones, and the client's p99 is that fit's, 166 ms, as without the timeout (the comprehensive 2c
+  review, C-1; a refit to the answered requests' truncated moments said 174 ms read at
+  0.99 / (1 − s) and 143 ms read at 0.99). That 0.5 % is the tail of the one
   lognormal fitted to a two-peaked mixture
   (51 % of the requests at about 67 ms on the hot server, 49 % at about 1 ms on the cool ones),
   whose spread reaches past 200 ms; the two peaks themselves are far below it, so the share is an

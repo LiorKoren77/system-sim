@@ -90,7 +90,7 @@ steps, 5 min warmup: 861,000 observed steps, about 20 s in a Release build).
   |---|---|---|---|---|---|---|
   | `post` | 1.009k | 0 | 3.7 ms | 3.65 ms | 4.79 ms | 5.36 ms |
   | `read_feed` | 6.053k | 0 | 4.14 ms | 4.08 ms | 5.35 ms | 5.99 ms |
-  | `read_media` | 3.027k | 0.00456 | 12.5 ms | 8.58 ms | 35.9 ms | 64.9 ms |
+  | `read_media` | 3.027k | 0.00456 | 12.5 ms | 8.57 ms | 35.9 ms | 65 ms |
 
   The 0.00456 media reads a second that time out are the fitted lognormal's tail past 500 ms
   (1.5 in a million), not a queue: the busiest node on the media path, `media_store`, is 6.51 %

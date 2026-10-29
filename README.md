@@ -63,10 +63,10 @@ a request waiting in a queue is answered later), the part that came back after t
 `timeout`, and the mean response in milliseconds (`inf` when the path never answers). The JSON report's ops
 carry `answered_per_s` beside `offered_per_s` too, and `timed_out_per_s`: the requests the
 client gave up on (0 without a `timeout`; `run`'s table shows them as `timed out/s`); a client's
-percentile at q is the answered requests' fit read at q / (1 − s), s the share that timed out
-(those are all slower than the answered ones), and never exceeds its timeout, and one more than
-whose share timed out (more than 1 % for a p99) is the timeout itself (`>1s` in the table), which
-fails a latency SLO whatever its `max`.
+percentile at q is read off the fit to every request the path delivered, before the timeout cut
+it (the fit that decided which requests timed out, so its fastest q are all answered), and never
+exceeds the timeout, and one more than whose share timed out (more than 1 % for a p99) is the
+timeout itself (`>1s` in the table), which fails a latency SLO whatever its `max`.
 Exit codes: 0 every SLO passed, 2 an SLO failed, 1 an error.
 Colour is on when stdout is a terminal; `--no-color` turns it off and JSON never has it.
 `run --seed N` replaces the scenario's `seed`, which seeds every client's `rate.noise`
@@ -96,7 +96,8 @@ t_s,rate_per_s
 
 `sweep` runs the scenario once per value of one key, the runs in parallel (`--jobs`, default:
 the machine's hardware threads; the output does not depend on it), and prints one row per value
-with the metrics asked for: `<client>.<op>.mean`, `<node>.mean_rho` or `<queue>.lag`
+with the metrics asked for: `<client>.<op>.mean`, `.p50`, `.p95` or `.p99`, `<node>.mean_rho`,
+`.peak_rho` or `.drop_rate`, or `<queue>.lag`
 ([schema](docs/scenario-schema.md#command-line-simsys-sweep-phase-2c)). On the
 [hello tutorial](scenarios/tutorial/hello/), an M/M/1 queue with a 1 ms service time: the latency is
 s / (1 − rho) plus the 0.5 ms round trip, and it bends upward as rho nears 1:
@@ -169,11 +170,11 @@ nodes
   api         0.6817         1            80        0         0    1.5         -
 ops (percentiles estimated: lognormal fit to the response moments)
   client.op     offered/s  timed out/s    mean     p50     p95     p99  (estimated)
-  clients.call        954    0.0007284  5.79ms  3.97ms  16.6ms  29.9ms
+  clients.call        954    0.0002833  5.73ms  4.32ms  14.9ms  24.8ms
 slo
   status  metric       node     op    observed  max
   PASS    utilization  api      -     0.6817    0.9
-  PASS    p99_latency  clients  call  29.9ms    50ms
+  PASS    p99_latency  clients  call  24.8ms    50ms
 ```
 
 At the start of each spike the full bucket lets its 100 tokens through on top of the
