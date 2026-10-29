@@ -262,7 +262,10 @@ TEST_CASE("SLOs pass, fail or are skipped when the metric is not available", "[r
   REQUIRE(results[0].observed.has_value());
   REQUIRE(results[1].status == SloStatus::pass);
   REQUIRE(results[2].status == SloStatus::fail);     // rho 0.5 > 0.3
-  REQUIRE(results[3].status == SloStatus::skipped);  // queue_lag arrives in phase 2
+  // queue_lag names a service, which has no queue lag: nothing to observe, so it is skipped (the
+  // loader refuses such a file: "slo: queue_lag needs a message_queue node", plan 2c Task 8).
+  REQUIRE(results[3].status == SloStatus::skipped);
+  REQUIRE_FALSE(results[3].observed.has_value());
   REQUIRE(simsys::report::all_pass(results) == false);
 }
 
@@ -331,14 +334,14 @@ TEST_CASE("the series writer emits a header and one row per node per step; clien
   // replacing `compare(0, prefix.size(), prefix) == 0` and its length bookkeeping.
   REQUIRE(
       text.starts_with("t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,"
-                       "latency_ms,zone\n"));
+                       "latency_ms,zone,queue_lag_s\n"));
   // C++20 std::ranges::count: counts the matches in a whole range (here the characters of
   // the string), replacing std::count(text.begin(), text.end(), '\n').
   REQUIRE(std::ranges::count(text, '\n') == 1 + 3 * 2);
   REQUIRE(text.find("\n0.1,s,") != std::string::npos);  // shortest round-trip form of 0.1 s
   // A client is a source: its numeric columns are 0 (machines keep a number) and its zone
   // is `none` (it has no queue to colour).
-  REQUIRE(text.find("\n0,c,0,0,0,0,0,0,0,none\n") != std::string::npos);
+  REQUIRE(text.find("\n0,c,0,0,0,0,0,0,0,none,\n") != std::string::npos);  // no lag: empty cell
 }
 
 TEST_CASE("render_explain lists every node with its resolved numbers and provenance", "[report]") {
@@ -458,7 +461,11 @@ TEST_CASE("the series writer emits rejected_per_s", "[report]") {
   std::string field;
   std::istringstream cells{line};
   while (std::getline(cells, field, ',')) fields.push_back(field);
-  REQUIRE(fields.size() == 10);  // demand_per_s and drain_per_s after node (plan 2b ref. 7)
+  // eleven cells: demand_per_s and drain_per_s after node (plan 2b ref. 7), queue_lag_s last (plan
+  // 2c Task 8). getline drops the last one, which is empty on a limiter's row, so the comma count
+  // is what says there are eleven.
+  REQUIRE(std::ranges::count(line, ',') == 10);
+  REQUIRE(fields.size() == 10);
   REQUIRE(fields[6] == "0");     // drops_per_s
   REQUIRE(fields[7] == "3000");  // rejected_per_s
 }
@@ -665,7 +672,7 @@ TEST_CASE("the CSV series has the rejected_per_s column right after drops_per_s"
   const auto text = out.str();  // the header is written on construction, before any step
   REQUIRE(text.substr(0, text.find('\n') + 1) ==
           "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,"
-          "zone\n");
+          "zone,queue_lag_s\n");
 }
 
 namespace {
@@ -1928,4 +1935,212 @@ TEST_CASE("a node behind a notification fan-out and a queue and pool is marked b
     REQUIRE_FALSE(line.contains("worker_pool"));
     REQUIRE_FALSE(line.contains("message_queue"));
   }
+}
+
+// ---- Queue lag: the queue_lag SLO and its columns (plan 2c refinement 4 and 14, Task 8) ----
+//
+// A message queue's lag is how far its slowest consumer group trails it: max(backlog / drain,
+// k x Wq) of the group's pool (see the theory tests for the formula). The queue_lag SLO bounds
+// the PEAK lag after warmup: a lag bound of "5 minutes" is a promise about the worst moment, not
+// about the average one, since a notification that arrives 20 minutes late is late whatever the
+// mean was.
+//
+// Picture: u publishes 1000/s to the queue q, one group w of 12 workers at 10 ms (exactly 1200
+// jobs/s). For the first 200 s u bursts to 1500/s, so w falls behind by 300 messages a second:
+// after the burst's 200 s there are 60,000 waiting, and the oldest of them waits for all the
+// others to drain, 60,000 / 1200 = 50 s: the peak lag. Afterwards w drains 200 a second faster
+// than the inflow, so the lag falls (40,000 / 1200 = 33.3 s at t = 300 s).
+
+namespace {
+// Adds a publisher u<tag> (1000/s of `publish`, 1500/s for the first 200 s when `bursting`), its
+// message queue q<tag> and the queue's one consumer group w<tag>: 12 workers at 10 ms a job.
+void add_lane(Scenario& s, const std::string& tag, bool bursting) {
+  Workload workload{.curve = {.base = Rate{1000}}, .op_shares = {{"publish", 1.0}}};
+  if (bursting) {
+    workload.curve.spikes = {simsys::workload::Spike{.at = 0s, .duration = 200s, .factor = 1.5}};
+  }
+  s.nodes.push_back(NodeSpec{.id = "u" + tag, .type = NodeType::client, .workload = workload});
+  s.nodes.push_back(NodeSpec{.id = "q" + tag, .type = NodeType::message_queue});
+  s.nodes.push_back(NodeSpec{.id = "w" + tag,
+                             .type = NodeType::worker_pool,
+                             .workers = 12,
+                             .job_cost = 10ms,
+                             .consumes = "q" + tag});
+  s.links.push_back(LinkSpec{.from = "u" + tag, .to = "q" + tag, .latency = 0s});
+  s.links.push_back(LinkSpec{.from = "q" + tag, .to = "w" + tag, .latency = 0s});
+}
+
+// The burst picture above, run for `duration`.
+Scenario bursting_queue(simsys::SimTime duration = 200s) {
+  Scenario s{.name = "lag", .version = 1, .duration = duration};
+  add_lane(s, "", true);
+  return s;
+}
+
+simsys::model::SloSpec queue_lag_slo(std::optional<std::string> node, simsys::SimTime max) {
+  return simsys::model::SloSpec{
+      .metric = simsys::model::SloMetric::queue_lag, .node = std::move(node), .max = max};
+}
+
+simsys::report::SloResult only_result(Scenario s, simsys::model::SloSpec slo) {
+  s.slos = {std::move(slo)};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto results = simsys::report::evaluate_slos(summarize(s, g), s.slos);
+  REQUIRE(results.size() == 1);
+  return results[0];
+}
+
+// The whitespace-separated words of the first line of `text` that starts with `first_word`.
+std::vector<std::string> words_of_line_starting(const std::string& text,
+                                                std::string_view first_word) {
+  std::istringstream lines{text};
+  std::string line;
+  while (std::getline(lines, line)) {
+    std::istringstream words{line};
+    std::string word;
+    std::vector<std::string> found;
+    while (words >> word) found.push_back(word);
+    if (!found.empty() && found.front() == first_word) return found;
+  }
+  FAIL("no line starts with " << first_word << " in:\n" << text);
+  return {};
+}
+
+const simsys::report::NodeSummary& node_summary(
+    const std::vector<simsys::report::NodeSummary>& nodes, std::string_view id) {
+  const auto found = std::ranges::find(nodes, id, &simsys::report::NodeSummary::id);
+  REQUIRE(found != nodes.end());
+  return *found;
+}
+}  // namespace
+
+TEST_CASE("the queue_lag SLO passes within 1m and fails within 30s: the burst peaks at 50 s",
+          "[report]") {
+  using simsys::report::SloStatus;
+  SECTION("max 1m passes with the peak, 50 s, observed") {
+    const auto result = only_result(bursting_queue(), queue_lag_slo("q", 1min));
+    REQUIRE(result.status == SloStatus::pass);
+    REQUIRE(result.observed.has_value());
+    REQUIRE_THAT(*result.observed, WithinRel(50.0, 1e-6));  // 60,000 waiting / 1200 a second
+  }
+  SECTION("max 30s fails, with the same 50 s observed") {
+    const auto result = only_result(bursting_queue(), queue_lag_slo("q", 30s));
+    REQUIRE(result.status == SloStatus::fail);
+    REQUIRE(result.observed.has_value());
+    REQUIRE_THAT(*result.observed, WithinRel(50.0, 1e-6));
+  }
+}
+
+// The table's slo block, one line a verdict: status, metric, node, op, observed, max, as the
+// staleness line is (`-` for the op a queue_lag has none of).
+TEST_CASE("the SLO table shows the queue_lag verdict with its observed peak: PASS queue_lag q 50s",
+          "[report]") {
+  auto s = bursting_queue();
+  s.slos = {queue_lag_slo("q", 1min), queue_lag_slo("q", 30s)};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  const auto table =
+      simsys::report::render_table(summary, simsys::report::evaluate_slos(summary, s.slos), false);
+  CAPTURE(table);
+  const std::vector<std::string> pass{"PASS", "queue_lag", "q", "-", "50s", "1m"};
+  const std::vector<std::string> fail{"FAIL", "queue_lag", "q", "-", "50s", "30s"};
+  REQUIRE(words_of_line_starting(table, "PASS") == pass);
+  REQUIRE(words_of_line_starting(table, "FAIL") == fail);
+}
+
+// 250 s: 50 s after the backlog peaked at t = 200 s the pool has drained 200 x 50 = 10,000 more
+// than arrived, so the lag at the end is (60,000 - 10,000) / 1200 = 41.67 s; the SLO still sees
+// the 50 s it was.
+TEST_CASE("the queue_lag SLO observes the peak, not the lag at the end of the run", "[report]") {
+  const auto s = bursting_queue(250s);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  const auto nodes = summary.nodes();  // a copy: node_summary returns a reference into it
+  const auto& queue = node_summary(nodes, "q");
+  REQUIRE(queue.peak_queue_lag_s.has_value());
+  REQUIRE_THAT(*queue.peak_queue_lag_s, WithinRel(50.0, 1e-6));
+  // What the last step reports, from the engine's own sample, is lower:
+  auto sim = *simsys::engine::Simulation::create(g);
+  simsys::engine::StepRecord last;
+  sim.run({.duration = s.duration, .step = s.step}, [&](const auto& r) { last = r; });
+  REQUIRE_THAT(*last.nodes[*g.index_of("q")].queue_lag_s, WithinRel(50'000.0 / 1200.0, 1e-6));
+}
+
+// Only the steps after warmup count (like every metric): with 220 s of warmup the first observed
+// step is the one starting at t = 220 s, ending at 220.1 s with 60,000 - 200 x 20.1 = 55,980
+// waiting: 55,980 / 1200 = 46.65 s, and the 50 s of t = 200 s is not in the window.
+TEST_CASE("the observed queue lag is the peak after warmup only", "[report]") {
+  auto s = bursting_queue(250s);
+  s.warmup = 220s;
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  REQUIRE_THAT(*node_summary(summary.nodes(), "q").peak_queue_lag_s, WithinRel(46.65, 2e-3));
+}
+
+// Two queues, one calm (1000/s into 1200/s: a lag of the Erlang wait, 2.247 ms) and one bursting
+// (50 s), the lagging one declared SECOND so that "the first queue" would be wrong. Without
+// `node` the SLO bounds every queue's peak, so the worst one decides: 50 s.
+TEST_CASE("without a node the queue_lag SLO takes the worst queue", "[report]") {
+  using simsys::report::SloStatus;
+  Scenario s{.name = "two queues", .version = 1, .duration = 200s};
+  add_lane(s, "_calm", false);
+  add_lane(s, "_burst", true);
+  const auto passes = only_result(s, queue_lag_slo(std::nullopt, 1min));
+  REQUIRE(passes.status == SloStatus::pass);
+  REQUIRE_THAT(*passes.observed, WithinRel(50.0, 1e-6));
+  const auto fails = only_result(s, queue_lag_slo(std::nullopt, 30s));
+  REQUIRE(fails.status == SloStatus::fail);
+  REQUIRE_THAT(*fails.observed, WithinRel(50.0, 1e-6));
+  // Named, the calm queue is checked alone: 2.247 ms, a pass at a bound the burst would break.
+  const auto calm = only_result(s, queue_lag_slo("q_calm", 1s));
+  REQUIRE(calm.status == SloStatus::pass);
+  REQUIRE_THAT(*calm.observed, WithinRel(0.002247, 1e-3));  // Wq(12, 1000/1200, 10 ms)
+}
+
+TEST_CASE("a queue_lag SLO with no message queue in the run is skipped, nothing observed",
+          "[report]") {
+  const auto result = only_result(mm1(500), queue_lag_slo(std::nullopt, 1s));
+  REQUIRE(result.status == simsys::report::SloStatus::skipped);
+  REQUIRE_FALSE(result.observed.has_value());
+}
+
+TEST_CASE("only a message queue has a peak lag in the node summaries", "[report]") {
+  const auto s = bursting_queue();
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  const auto nodes = summary.nodes();
+  REQUIRE_FALSE(node_summary(nodes, "u").peak_queue_lag_s.has_value());
+  REQUIRE(node_summary(nodes, "q").peak_queue_lag_s.has_value());
+  REQUIRE_FALSE(node_summary(nodes, "w").peak_queue_lag_s.has_value());
+}
+
+// The node table's new column, `peak_lag`, holds the queue's peak lag in the table's duration
+// notation (50 s: "50s") on its row.
+TEST_CASE("the node table has a peak_lag column holding the queue's peak lag", "[report]") {
+  const auto s = bursting_queue();
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto table = simsys::report::render_table(summarize(s, g), {}, false);
+  CAPTURE(table);
+  const auto header = words_of_line_starting(table, "node");
+  const auto column = std::ranges::find(header, "peak_lag");
+  REQUIRE(column != header.end());
+  const auto queue_row = words_of_line_starting(table, "q");
+  const auto at = static_cast<std::size_t>(column - header.begin());
+  REQUIRE(queue_row.size() > at);
+  REQUIRE(queue_row[at] == "50s");
+}
+
+TEST_CASE("the JSON nodes carry peak_queue_lag_s: the queue's peak, null on every other node",
+          "[report]") {
+  const auto s = bursting_queue();
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto json = simsys::report::render_json(summarize(s, g), {});
+  CAPTURE(json);
+  REQUIRE_THAT(json_value(json, "peak_queue_lag_s"), WithinRel(50.0, 1e-6));  // seconds
+  std::size_t nulls = 0;
+  for (auto at = json.find("\"peak_queue_lag_s\": null"); at != std::string::npos;
+       at = json.find("\"peak_queue_lag_s\": null", at + 1)) {
+    ++nulls;
+  }
+  REQUIRE(nulls == 2);  // u and w; q's is the number
 }

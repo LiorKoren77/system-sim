@@ -1749,6 +1749,36 @@ TEST_CASE("latency SLOs must name a client and one of its ops; ratio maxima lie 
   }
 }
 
+// A queue lag is a message queue's (plan 2c Task 8, refinement 14): the lag is read off the
+// queue's consumer groups, so on a service, a client or any other node the SLO could never be
+// observed. `node` may be left out, which bounds the worst queue of the run. The message is the
+// latency rule's, in the same words: "needs a <type> node, '<id>' is a <type>".
+TEST_CASE("a queue_lag SLO must name a message queue, or no node at all") {
+  const auto with_slo = [](std::string_view entry) {
+    return scenario_with(
+        "  u: {type: client, rate: {base: 1/s}, ops: {a: 1}}\n"
+        "  svc: {type: service}\n"
+        "  q: {type: message_queue}\n",
+        "links: []\nslo: [" + std::string{entry} + "]\n");
+  };
+  SECTION("a service has no queue lag") {
+    require_rejected("simsys_slo_lag_service.yaml",
+                     with_slo("{metric: queue_lag, node: svc, max: 1m}"),
+                     "slo: queue_lag needs a message_queue node ('svc' is a service)");
+  }
+  SECTION("a client has none either") {
+    require_rejected("simsys_slo_lag_client.yaml",
+                     with_slo("{metric: queue_lag, node: u, max: 1m}"),
+                     "slo: queue_lag needs a message_queue node ('u' is a client)");
+  }
+  SECTION("a message queue is accepted") {
+    require_loaded("simsys_slo_lag_queue.yaml", with_slo("{metric: queue_lag, node: q, max: 1m}"));
+  }
+  SECTION("no node is accepted: the worst queue is bounded") {
+    require_loaded("simsys_slo_lag_worst.yaml", with_slo("{metric: queue_lag, max: 1m}"));
+  }
+}
+
 TEST_CASE("a node may not send to itself and a link may not loop") {
   SECTION("a step to its own node") {
     require_rejected("simsys_step_self.yaml",

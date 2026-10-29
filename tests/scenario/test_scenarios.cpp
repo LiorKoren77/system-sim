@@ -118,8 +118,10 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
     //  - youtube runs since plan 2c Task 7 (its pool's `then` steps), but is exempt from its SLOs
     //    until Task 16: its 300 MB uploads take 12 s at the store against the clients' 10 s
     //    timeout (Task 13 applies timeouts, Task 16 sizes the upload's per resumable chunk), its
-    //    queue_lag SLO is Task 8's, and 24 h at 100 ms is 864k steps, far over the five seconds.
-    //    The "book/youtube runs" test below runs its first steps instead.
+    //    queue_lag SLO is evaluated since Task 8 and FAILS (the 400 transcoders fall 2.66 h
+    //    behind, against its 30 m: the test below pins it) until Task 16 resizes them, and 24 h
+    //    at 100 ms is 864k steps, far over the five seconds. The "book/youtube runs" test below
+    //    runs its first steps instead.
     if (s.name == "lab-unique-id" || s.name == "url-shortener" || s.name == "youtube") {
       continue;  // not run here
     }
@@ -401,6 +403,42 @@ TEST_CASE("book/youtube runs: the transcoders hand on what they drained, 6.667 j
                Catch::Matchers::WithinRel(400.0 / 60.0, 1e-9));
   REQUIRE_THAT(last.nodes[*g.index_of("completion_handler")].demand_per_s,
                Catch::Matchers::WithinRel(400.0 / 60.0, 1e-9));
+}
+
+// Task 8 evaluates youtube's `queue_lag` SLO (`transcode_q`, max 30m), which was `skipped` while no
+// queue reported a lag. The transcoders are 400 workers at 60 s a video = 400 / 60 s = 6.667
+// videos/s, and from 15:43 on the uploads (2 % of the viewers' requests, 8.55/s at 00:00 and more
+// at the 21:00 peak) exceed that, so the pool's backlog is still growing at 24:00: the run's peak
+// backlog is its last step's, 63.76k videos (the README's number, measured at 100 ms steps:
+// 63,759 here, 63,750 at the 10 s steps below). The queue's lag is the FIFO drain time of its one
+// group, backlog / drain, the pool draining its whole capacity while saturated:
+//   63,760 / 6.667/s = 9,564 s = 2.66 h  >  30 m = 1,800 s    -> FAIL
+// (the Erlang wait of refinement 5, 0.57 s at rho 0.96, is the smaller term at every step). It
+// FAILS on purpose until Task 16 resizes the transcoders to 600 workers (backlog 0, lag 0.57 s).
+// The run uses 10 s steps, not the scenario's 100 ms: the fluid backlog is the same to 0.02 %
+// (checked at both) and 8,640 steps, not 864k, keep the test in seconds; hence the 1 % tolerance.
+// (The 24 h run stops before the daily peak: the inflow still exceeds the capacity at midnight and
+// the backlog peaks at about 71.9k videos, 3.0 h of lag, near 02:18 of the next day, the review of
+// Task 7 at b4e263a, I-1. The SLO sees what the run saw, 2.66 h; Task 16 decides how to run it.)
+TEST_CASE("book/youtube's queue_lag SLO is evaluated and fails: 2.66 h of lag against 30 m",
+          "[scenario]") {
+  using namespace std::chrono_literals;
+  auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/youtube/scenario.yaml");
+  s.step = 10s;
+  const auto g = build_or_fail(s);
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  simsys::report::Summary summary{g, s.warmup};
+  sim->run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
+  const auto results = simsys::report::evaluate_slos(summary, s.slos);
+  const auto lag = std::ranges::find(results, simsys::model::SloMetric::queue_lag,
+                                     [](const auto& r) { return r.slo.metric; });
+  REQUIRE(lag != results.end());
+  REQUIRE(lag->slo.node == "transcode_q");
+  REQUIRE(lag->status == simsys::report::SloStatus::fail);  // not skipped, not passing
+  REQUIRE(lag->observed.has_value());
+  REQUIRE_THAT(*lag->observed, Catch::Matchers::WithinRel(9564.0, 0.01));
+  REQUIRE(*lag->observed > 1800.0);  // the SLO's 30 m
 }
 
 // Ch. 15's Google Drive built its graph with the new queue wiring (notify_q's two consumer groups,

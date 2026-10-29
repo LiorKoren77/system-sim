@@ -3569,3 +3569,192 @@ TEST_CASE("an on-miss then step on a worker pool is refused", "[theory]") {
   // `find(...) != std::string::npos`; the exact wording is pinned in test_graph.
   REQUIRE(built.error().message.contains("node 'w': a worker pool's then steps"));
 }
+
+// ---- Queue lag: how far a message queue trails its consumers (plan 2c refinement 4, Task 8) ----
+//
+// A message queue's lag is the wait of the message a consumer group would read next: the queue's
+// own broker never waits (it appends at 1M/s), the messages wait in each group's pool, so the lag
+// is read off the pool. For one group,
+//   lag = max(backlog / drain, k x Wq)
+//   backlog / drain  the FIFO drain time: the oldest waiting message is served after everything
+//                    ahead of it, which the pool drains at `drain` a second (the "fluid" part,
+//                    exact when the pool is saturated, since then drain = capacity);
+//   k x Wq           the stochastic part: Allen-Cunneen's scaling k of the M/M/c wait Wq (Erlang
+//                    C) of the pool, what an arriving message waits even with no backlog because
+//                    all c workers happen to be busy. k = 1 here: Poisson arrivals, exponential
+//                    jobs. Erlang C is clamped at rho 0.99, as everywhere in the fluid model.
+// and the queue's lag is its WORST group's: a consumer group that is far behind is a queue that
+// is far behind. It is the wait only: the pool's own `latency` is wait + `cost`, the lag has no
+// cost in it. (It is the same wait fluid::FluidQueue computes for the pool; Task 8 exposes it on
+// the queue's sample, `NodeSample::queue_lag_s`, empty on every node that is not a message queue.)
+//
+// Numbers, with the Task 6 pictures above: 12 workers at 10 ms are 1200 jobs/s exactly, and the
+// burst's 1500/s grows the backlog by 300/s = 30 per 100 ms step, so after step i (the record
+// whose t ends at (i + 1) x 0.1 s) the backlog is (i + 1) x 30 messages and the fluid lag
+//   (i + 1) x 30 / 1200 = (i + 1) x 0.025 s            (50 s at i = 1999, t = 200 s: 60,000 / 1200)
+// The stochastic part of a SATURATED pool (rho 1, clamped to 0.99 for Erlang C) is
+//   Wq(c = 12, rho = 0.99, s = 10 ms) = C(12, 11.88) x 10 ms / (12 x 0.01) = 0.0800 s
+// so the first steps (fluid lag 0.025, 0.05, 0.075 s) report that 80 ms floor, and from step 3
+// (0.1 s) on the backlog is the larger term. After the backlog drains (rho 1000/1200 = 0.8333)
+// only the stochastic part is left: Wq(12, 0.8333, 10 ms) = 2.247 ms.
+
+namespace {
+// The lag the queue `q` reports in `record`; the test fails when it reports none.
+double queue_lag_of(const simsys::engine::StepRecord& record, const Graph& g) {
+  const auto& lag = record.nodes[*g.index_of("q")].queue_lag_s;
+  REQUIRE(lag.has_value());
+  return *lag;
+}
+
+// 12 workers at 10 ms: Erlang C of a saturated pool, rho clamped to 0.99
+// (fluid::max_stochastic_rho).
+double saturated_floor_s() {
+  return simsys::queueing::mmc_wait(12, 0.99, 0.01).mean_s;
+}
+}  // namespace
+
+TEST_CASE("the burst leaves the queue 50 s behind at t = 200 s: 60000 messages over 1200 a second",
+          "[theory]") {
+  const auto g = *Graph::build(burst_then_calm());
+  const auto records = records_of(g, 2000);  // the 200 s of the burst
+  REQUIRE_THAT(queue_lag_of(records[1999], g), WithinRel(50.0, 1e-6));
+  REQUIRE_THAT(queue_lag_of(records[999], g), WithinRel(25.0, 1e-6));  // t = 100 s: 30,000 / 1200
+  // The peak of the whole burst is its last step: the lag never falls while the pool is behind.
+  double peak = 0.0;
+  for (const auto& record : records) peak = std::max(peak, queue_lag_of(record, g));
+  REQUIRE_THAT(peak, WithinRel(50.0, 1e-6));
+}
+
+TEST_CASE(
+    "every step of the burst reports the larger of the 80 ms Erlang wait and backlog over drain",
+    "[theory]") {
+  const auto g = *Graph::build(burst_then_calm());
+  const auto records = records_of(g, 2000);
+  REQUIRE_THAT(saturated_floor_s(), WithinAbs(0.0800, 1e-4));  // the napkin number
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    CAPTURE(i);
+    const double backlog_over_drain = static_cast<double>(i + 1) * 30.0 / 1200.0;
+    REQUIRE_THAT(queue_lag_of(records[i], g),
+                 WithinAbs(std::max(saturated_floor_s(), backlog_over_drain), 1e-6));
+  }
+  // Steps 0 to 2 are the stochastic floor (0.025, 0.05, 0.075 s of backlog are under it); step 3
+  // is the first with the fluid part larger: 0.1 s.
+  REQUIRE_THAT(queue_lag_of(records[2], g), WithinAbs(saturated_floor_s(), 1e-6));
+  REQUIRE_THAT(queue_lag_of(records[3], g), WithinAbs(0.1, 1e-6));
+}
+
+// After the burst the pool drains 200 a second faster than the inflow: the lag falls with the
+// backlog, 60,000 - 200 x 100 s = 40,000 at t = 300 s (33.33 s), 30,000 at t = 350 s (25 s), and
+// once the backlog is gone only the stochastic wait of an 0.8333-loaded pool is left.
+TEST_CASE("after the burst the lag falls with the backlog back to the pool's stochastic wait",
+          "[theory]") {
+  const auto g = *Graph::build(burst_then_calm());
+  const auto records = records_of(g, 5100);  // 510 s: the backlog is empty from t = 500 s
+  REQUIRE_THAT(queue_lag_of(records[2999], g), WithinRel(40'000.0 / 1200.0, 1e-6));  // t = 300 s
+  REQUIRE_THAT(queue_lag_of(records[3499], g), WithinRel(25.0, 1e-6));               // t = 350 s
+  const auto& pool = records[5099].nodes[*g.index_of("w")];
+  REQUIRE_THAT(pool.rho, WithinRel(1000.0 / 1200.0, 1e-9));
+  const double wait = simsys::queueing::mmc_wait(12, pool.rho, 0.01).mean_s;
+  REQUIRE_THAT(wait, WithinAbs(0.002247, 1e-6));  // Wq(12, 0.8333, 10 ms) = 2.247 ms
+  REQUIRE_THAT(queue_lag_of(records[5099], g), WithinRel(wait, 1e-9));
+}
+
+// The steady lag of the Task 6 picture (1000/s into 4 workers at 3.333 ms, rho 0.8333, no
+// backlog) is the pool's Erlang wait alone, 3.289 ms: the lag leaves out the 3.333 ms of `cost`
+// that the pool's 6.622 ms sojourn includes.
+TEST_CASE("a queue with no backlog is lagging by the pool's stochastic wait: 3.289 ms",
+          "[theory]") {
+  const auto g = *Graph::build(published(1000, {four_workers()}));
+  const auto r = first_step(g);
+  REQUIRE_THAT(queue_lag_of(r, g), WithinAbs(0.003289, 1e-6));
+  const auto& pool = r.nodes[*g.index_of("w")];
+  REQUIRE_THAT(queue_lag_of(r, g), WithinAbs(pool.latency.mean_s - pool_cost_s, 1e-9));
+}
+
+// One queue, two consumer groups, each receiving every message: the lag is the slower group's.
+// "fast" is 10 workers at 1 ms (10,000 jobs/s: rho 0.15 at the burst's 1500/s, no backlog, a wait
+// of about 1e-11 s), "slow" the burst's 12 workers at 10 ms; the queue is 50 s behind whichever
+// order they are declared in, never the fast group's 0 and not a sum.
+TEST_CASE("a queue with two consumer groups reports the slower group's lag", "[theory]") {
+  const auto lag_at_peak = [](std::vector<NodeSpec> groups) {
+    auto s = published(1000, std::move(groups));
+    s.nodes[0].workload->curve.spikes = {
+        simsys::workload::Spike{.at = 0s, .duration = 200s, .factor = 1.5}};
+    const auto g = *Graph::build(s);
+    const auto records = records_of(g, 2000);
+    return queue_lag_of(records[1999], g);
+  };
+  const auto fast = [] { return group_of("fast", 10, 1ms); };
+  const auto slow = [] { return group_of("slow", 12, 10ms); };
+  REQUIRE_THAT(lag_at_peak({fast(), slow()}), WithinRel(50.0, 1e-6));
+  REQUIRE_THAT(lag_at_peak({slow(), fast()}), WithinRel(50.0, 1e-6));
+}
+
+// The same maximum over the stochastic parts alone (no backlog): `w` waits 3.289 ms (above) and
+// `w2`, 10 workers at 5 ms at 1000/s (a = 5 erlangs, rho 0.5), 0.036 ms: the queue's lag is w's.
+TEST_CASE("with no backlog the queue's lag is the larger of its groups' Erlang waits", "[theory]") {
+  const auto g = *Graph::build(published(1000, {four_workers(), group_of("w2", 10, 5ms)}));
+  const auto r = first_step(g);
+  const double w_wait = r.nodes[*g.index_of("w")].latency.mean_s - pool_cost_s;
+  const double w2_wait = r.nodes[*g.index_of("w2")].latency.mean_s - 0.005;
+  REQUIRE_THAT(w_wait, WithinAbs(0.003289, 1e-6));
+  REQUIRE_THAT(w2_wait, WithinAbs(0.0000361, 1e-7));  // Wq(10, 0.5, 5 ms) = 36.1 us
+  REQUIRE_THAT(queue_lag_of(r, g), WithinRel(w_wait, 1e-9));
+}
+
+// A pool saturated for the whole run (1500/s into 1200/s, room = retention 10 s x 1200 = 12,000
+// messages): the backlog grows 30 a step to the room at step 399 (t = 40 s) and the lag with it,
+// max(0.08 s floor, (i + 1) x 0.025 s): 2.5 s at t = 10 s, 5 s at t = 20 s, then the full room's
+// drain time, 12,000 / 1200 = retention = 10 s, where it stays: a message older than `retention`
+// is deleted, so a queue's lag cannot pass its retention.
+TEST_CASE("a pool saturated for the whole run reports a lag that grows to the retention and stays",
+          "[theory]") {
+  const auto g = *Graph::build(retained_for_10_s());
+  const auto records = records_of(g, 600);                            // 60 s
+  REQUIRE_THAT(queue_lag_of(records[99], g), WithinAbs(2.5, 1e-6));   // t = 10 s: 3,000 / 1200
+  REQUIRE_THAT(queue_lag_of(records[199], g), WithinAbs(5.0, 1e-6));  // t = 20 s: 6,000 / 1200
+  double previous = 0.0;
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    CAPTURE(i);
+    const double lag = queue_lag_of(records[i], g);
+    REQUIRE(lag >= previous);     // it never falls while the inflow exceeds the capacity
+    REQUIRE(lag <= 10.0 + 1e-6);  // and never passes the retention
+    if (i < 400) {
+      const double backlog_over_drain = static_cast<double>(i + 1) * 30.0 / 1200.0;
+      REQUIRE_THAT(lag, WithinAbs(std::max(saturated_floor_s(), backlog_over_drain), 1e-6));
+    } else {
+      REQUIRE_THAT(lag, WithinAbs(10.0, 1e-6));  // the room is full from step 399 on
+    }
+    previous = lag;
+  }
+}
+
+// Only a message queue has a lag: the client that publishes and the pool that drains report
+// none (`queue_lag_s` is empty, not 0), in a run and in estimate().
+TEST_CASE("queue_lag_s is present on the message queue and absent on the nodes around it",
+          "[theory]") {
+  const auto g = *Graph::build(published(1000, {four_workers()}));
+  const auto r = first_step(g);
+  REQUIRE(r.nodes[*g.index_of("q")].queue_lag_s.has_value());
+  REQUIRE_FALSE(r.nodes[*g.index_of("u")].queue_lag_s.has_value());
+  REQUIRE_FALSE(r.nodes[*g.index_of("w")].queue_lag_s.has_value());
+  const auto e = (*Simulation::create(g)).estimate();
+  REQUIRE(e.nodes[*g.index_of("q")].queue_lag_s.has_value());
+  REQUIRE_FALSE(e.nodes[*g.index_of("u")].queue_lag_s.has_value());
+  REQUIRE_FALSE(e.nodes[*g.index_of("w")].queue_lag_s.has_value());
+}
+
+// estimate() is the long-run state: below capacity the 3.289 ms Erlang wait, and for a pool fed
+// above its capacity the settled room, 12,000 messages over 1200 a second = 10 s.
+TEST_CASE("estimate reports the steady lag: 3.289 ms below capacity, the retention above it",
+          "[theory]") {
+  const auto steady = *Graph::build(published(1000, {four_workers()}));
+  const auto e = (*Simulation::create(steady)).estimate();
+  REQUIRE(e.converged);
+  REQUIRE_THAT(*e.nodes[*steady.index_of("q")].queue_lag_s, WithinAbs(0.003289, 1e-6));
+
+  const auto overloaded = *Graph::build(retained_for_10_s());
+  const auto settled = (*Simulation::create(overloaded)).estimate();
+  REQUIRE(settled.converged);
+  REQUIRE_THAT(*settled.nodes[*overloaded.index_of("q")].queue_lag_s, WithinAbs(10.0, 1e-6));
+}

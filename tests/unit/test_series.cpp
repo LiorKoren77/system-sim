@@ -182,12 +182,20 @@ void run_into(const Scenario& s, const simsys::graph::Graph& g, Observer&& obser
   sim.run({.duration = s.duration, .step = s.step}, observer);
 }
 
-// The text of one CSV line split at commas: `line` is a row, with no newline.
+// The text of one CSV line split at commas: `line` is a row, with no newline. A trailing empty
+// cell is a field ("a,b," has three): the node series' last column, queue_lag_s, is empty on
+// every row but a message queue's, and std::getline(cells, field, ',') would drop it silently,
+// so that a row with and without the column would count the same.
 std::vector<std::string> split_commas(const std::string& line) {
   std::vector<std::string> fields;
-  std::string field;
-  std::istringstream cells{line};
-  while (std::getline(cells, field, ',')) fields.push_back(field);
+  std::size_t begin = 0;
+  while (true) {
+    const auto comma = line.find(',', begin);
+    if (comma == std::string::npos) break;
+    fields.push_back(line.substr(begin, comma - begin));
+    begin = comma + 1;
+  }
+  fields.push_back(line.substr(begin));
   return fields;
 }
 
@@ -217,7 +225,8 @@ double number(const std::string& cell) {
 }
 
 constexpr std::string_view node_header =
-    "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone";
+    "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone,"
+    "queue_lag_s";
 constexpr std::string_view op_header = "t_s,client,op,offered_per_s,answered_per_s,mean_ms";
 
 // `explain` of a shipped book scenario, as `simsys explain scenarios/book/<name>/scenario.yaml`
@@ -292,7 +301,7 @@ TEST_CASE("a node series row carries the demand and drain of the NodeSample it w
   const auto rows = data_rows(out.str());
   REQUIRE(rows.size() == 2);  // one row per node: the client's and the server's
   const auto& server = rows[1];
-  REQUIRE(server.size() == 10);
+  REQUIRE(server.size() == 11);
   REQUIRE(server[0] == "0.1");
   REQUIRE(server[1] == "s");
   REQUIRE(server[2] == "1234.5");   // demand_per_s
@@ -303,6 +312,7 @@ TEST_CASE("a node series row carries the demand and drain of the NodeSample it w
   REQUIRE(server[7] == "7");        // rejected_per_s
   REQUIRE(server[8] == "12.5");     // latency_ms: 0.0125 s
   REQUIRE(server[9] == "green");    // the NodeSample's default zone
+  REQUIRE(server[10] == "");        // queue_lag_s: a service has no lag, the cell is empty
 }
 
 TEST_CASE("a client row has zeros for demand and drain: a source queues and serves nothing",
@@ -314,14 +324,15 @@ TEST_CASE("a client row has zeros for demand and drain: a source queues and serv
   run_into(s, g, [&](const auto& r) { writer.observe(r); });
   const auto text = out.str();
   CAPTURE(text);
-  // t, node, demand, drain, rho, backlog, drops, rejected, latency, zone: a client's engine
-  // sample is all zeros (engine.cppm: "a source has no queue") and its zone is `none`.
+  // t, node, demand, drain, rho, backlog, drops, rejected, latency, zone, queue_lag_s: a client's
+  // engine sample is all zeros (engine.cppm: "a source has no queue"), its zone is `none` and its
+  // last cell (a lag is a message queue's) is empty.
   // C++23 std::string::contains: a substring test in one call, replacing
   // `find(...) != std::string::npos`.
-  REQUIRE(text.contains("\n0,c,0,0,0,0,0,0,0,none\n"));
+  REQUIRE(text.contains("\n0,c,0,0,0,0,0,0,0,none,\n"));
 }
 
-TEST_CASE("every row of a run has ten fields, one row per node per step", "[series]") {
+TEST_CASE("every row of a run has eleven fields, one row per node per step", "[series]") {
   const auto s = mm1(500);  // 500 ms at 100 ms steps: 5 steps
   const auto g = graph_of(s);
   std::ostringstream out;
@@ -331,7 +342,95 @@ TEST_CASE("every row of a run has ten fields, one row per node per step", "[seri
   REQUIRE(rows.size() == 5 * 2);  // 5 steps x 2 nodes (the client and the server)
   // C++20 std::ranges::all_of: the algorithm takes the whole range and a predicate, replacing
   // the begin()/end() pair of std::all_of.
-  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 10; }));
+  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 11; }));
+}
+
+// ---- node series: queue_lag_s (plan 2c Task 8) ----
+//
+// A message queue's lag (engine::NodeSample::queue_lag_s: its worst consumer group's wait,
+// max(backlog / drain, k x Wq)) is the node series' last column, `queue_lag_s`, in SECONDS (not
+// ms: the lag of a queue is minutes, hours: the column is for plotting it against the backlog). It
+// is empty, not 0, on every row of a node that is not a message queue (a 0 lag would be a claim),
+// clients, services and bandwidth links' pipes included: the header is one for the whole file.
+//
+// Picture: u publishes 1500/s to the queue q, whose one group w has 12 workers at 10 ms (exactly
+// 1200 jobs/s): the backlog grows by 300/s = 30 a 100 ms step, so the record that starts at
+// t = 0.9 s, the tenth step, leaves 300 messages waiting: 300 / 1200 = 0.25 s, above the 0.08 s
+// Erlang floor of a saturated 12-worker pool (Wq(12, rho clamped to 0.99, 10 ms)).
+
+namespace {
+Scenario queue_and_group() {
+  Scenario s{.name = "lag", .version = 1, .duration = 1s, .step = 100ms};
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload =
+                          Workload{.curve = {.base = Rate{1500}}, .op_shares = {{"publish", 1.0}}}},
+             NodeSpec{.id = "q", .type = NodeType::message_queue},
+             NodeSpec{.id = "w",
+                      .type = NodeType::worker_pool,
+                      .workers = 12,
+                      .job_cost = 10ms,
+                      .consumes = "q"}};
+  s.links = {LinkSpec{.from = "u", .to = "q", .latency = 0s},
+             LinkSpec{.from = "q", .to = "w", .latency = 0s}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("the node series header ends with the queue_lag_s column", "[series]") {
+  const auto g = graph_of(queue_and_group());
+  std::ostringstream out;
+  simsys::report::SeriesWriter writer{out, g};
+  const auto header = split_commas(header_of(out.str()));
+  REQUIRE(header.size() == 11);
+  REQUIRE(header.back() == "queue_lag_s");
+  REQUIRE(header[9] == "zone");  // the ten columns before it keep their places
+}
+
+TEST_CASE("a message queue's row ends with the lag of its sample and every other row ends empty",
+          "[series]") {
+  const auto s = queue_and_group();
+  const auto g = graph_of(s);
+  std::ostringstream out;
+  simsys::report::SeriesWriter writer{out, g};
+  std::vector<simsys::engine::NodeSample> nodes(3);  // u 0, q 1, w 2
+  nodes[1].queue_lag_s = 1.5;                        // a lag of 1.5 s, exactly printable
+  writer.observe(simsys::engine::StepRecord{.t = 100ms, .nodes = nodes, .responses = {}});
+  const auto rows = data_rows(out.str());
+  REQUIRE(rows.size() == 3);
+  REQUIRE(rows[1][1] == "q");
+  REQUIRE(rows[1].size() == 11);
+  REQUIRE(rows[1][10] == "1.5");
+  for (const auto i : {std::size_t{0}, std::size_t{2}}) {
+    CAPTURE(rows[i][1]);
+    REQUIRE(rows[i].size() == 11);
+    REQUIRE(rows[i][10] == "");  // the client's and the pool's: no lag, not a lag of 0
+  }
+}
+
+TEST_CASE("a run's queue rows hold the lag in seconds and the client and pool rows stay empty",
+          "[series]") {
+  const auto s = queue_and_group();
+  const auto g = graph_of(s);
+  std::ostringstream out;
+  simsys::report::SeriesWriter writer{out, g};
+  run_into(s, g, [&](const auto& r) { writer.observe(r); });
+  const auto rows = data_rows(out.str());
+  REQUIRE(rows.size() == 10 * 3);  // 10 steps x (u, q, w)
+  for (const auto& row : rows) {
+    CAPTURE(row[0], row[1]);
+    REQUIRE(row.size() == 11);
+    if (row[1] == "q") {
+      REQUIRE_FALSE(row[10].empty());
+      REQUIRE(number(row[10]) >= 0.0);
+    } else {
+      REQUIRE(row[10].empty());
+    }
+  }
+  const auto last_q =
+      std::ranges::find_if(rows, [](const auto& row) { return row[0] == "0.9" && row[1] == "q"; });
+  REQUIRE(last_q != rows.end());
+  REQUIRE_THAT(number((*last_q)[10]), WithinAbs(0.25, 1e-6));  // 300 waiting / 1200 a second
 }
 
 // The fluid queue's balance, step by step: demand·dt = (drain + dropped)·dt + Δbacklog. Summed
@@ -890,7 +989,7 @@ TEST_CASE("explain names every blocking type on the way to a node, nearest first
 // ---- A link's bandwidth is a pipe: its rows in the series and the JSON (plan 2c Task 5) ----
 //
 // A link with a bandwidth is a queue of megabytes and is plotted like a node: one CSV row per
-// step with the link's name, `from->to`, in the `node` column, the same ten columns, in
+// step with the link's name, `from->to`, in the `node` column, the same eleven columns, in
 // MEGABYTES (a rate of MB/s; engine::StepRecord::links, one LinkSample per bandwidth link). So
 // the conservation law holds on those rows too, and a student checks the pipe from the file.
 // The JSON gets `links`: one object per bandwidth link (an empty array without any).
@@ -933,7 +1032,7 @@ double number_of_key(const std::string& object, std::string_view key_prefix) {
 }  // namespace
 
 TEST_CASE(
-    "a link row of the node series carries the LinkSample it was fed, in the same ten columns",
+    "a link row of the node series carries the LinkSample it was fed, in the same eleven columns",
     "[series]") {
   const auto s = piped(100);
   const auto g = graph_of(s);
@@ -959,7 +1058,7 @@ TEST_CASE(
   const auto found = std::ranges::find_if(rows, [](const auto& row) { return row[1] == "a->b"; });
   REQUIRE(found != rows.end());
   const auto& row = *found;
-  REQUIRE(row.size() == 10);
+  REQUIRE(row.size() == 11);
   REQUIRE(row[0] == "0.1");
   REQUIRE(row[2] == "100.5");   // demand_per_s, MB/s
   REQUIRE(row[3] == "100.25");  // drain_per_s
@@ -969,6 +1068,7 @@ TEST_CASE(
   REQUIRE(row[7] == "0");       // rejected_per_s: a pipe refuses nothing by policy
   REQUIRE(row[8] == "12.5");    // latency_ms: 0.0125 s
   REQUIRE(row[9] == "yellow");
+  REQUIRE(row[10] == "");  // queue_lag_s: a pipe is not a message queue
 }
 
 // 1000 puts/s of 1 MB offer the pipe 1000 MB/s against 125 MB/s: the backlog grows by
@@ -985,7 +1085,7 @@ TEST_CASE("the conservation identity holds on the link rows read back from the s
   const auto rows = data_rows(out.str());
   CAPTURE(out.str());
   REQUIRE(rows.size() == 30 * 3);  // 30 steps x (the client, b and the link)
-  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 10; }));
+  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 11; }));
   constexpr double dt = 0.1;
   double demand = 0.0;
   double drain = 0.0;
@@ -1049,6 +1149,15 @@ TEST_CASE("the JSON has an empty links array when no link has a bandwidth", "[se
 // against touching plain links; a later task that changes `chain`'s numbers ON PURPOSE (a new
 // default, a model change that reaches services or databases) re-pins both hashes in the same
 // commit and says why.
+//
+// Re-pinned for plan 2c Task 8, on purpose: the node series gained a trailing `queue_lag_s`
+// column (empty on every row but a message queue's), so each of the chain's 3,600 node rows ends
+// in a comma and the header in `,queue_lag_s`, and nothing else changed. The new node hash was
+// not taken from a build of Task 8 but derived from the old output: the series of the binary at
+// b4e263a (which reproduces the old hash, 0x3d3a6ed1d31da525) with `,queue_lag_s` appended to
+// its header and `,` to each of its 3,600 rows, hashed with this function. An implementation
+// whose chain rows differ from that in any byte (a number in the new column, a different empty
+// cell) fails here. The op series has no new column: its hash is the old one.
 namespace {
 std::uint64_t fnv1a(const std::string& text) {
   std::uint64_t hash = 0xcbf29ce484222325ULL;  // the 64-bit FNV offset basis
@@ -1077,7 +1186,8 @@ TEST_CASE("the tutorial chain's series are byte for byte what they were before l
   });
   REQUIRE(nodes_out.str().find("->") == std::string::npos);  // no link rows
   REQUIRE(data_rows(nodes_out.str()).size() == 1200 * 3);    // 2 min of 100 ms steps x 3 nodes
-  REQUIRE(fnv1a(nodes_out.str()) == 0x3d3a6ed1d31da525ULL);
+  REQUIRE(header_of(nodes_out.str()) == node_header);
+  REQUIRE(fnv1a(nodes_out.str()) == 0xd0b4c7d05759bd57ULL);  // re-pinned for queue_lag_s, above
   REQUIRE(fnv1a(ops_out.str()) == 0x9dfc7de84e1afe59ULL);
 }
 
