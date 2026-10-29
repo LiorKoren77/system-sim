@@ -73,6 +73,33 @@ inline constexpr double byte_unit = 1e6;
   return size.count / byte_unit;
 }
 
+// Models: a network link with a bandwidth (spec §3.4: it "caps bytes/s and queues the excess like
+// a node"; plan 2c refinement 3), the cross-datacenter pipe of ch. 14's YouTube (40 Gbit/s
+// between the CDN and the transcoded storage) or any hop whose bytes are the constraint. The link
+// becomes a PIPE: one queue in megabytes (byte_unit), as a byte-sized node is, but a single
+// server, because a link sends one byte stream at a time:
+//   service_rate    = bandwidth / 1 MB       MB/s: 1 Gbit/s = 125e6 B/s = 125 MB/s
+//   service_time_s  = 1 MB / bandwidth       the serialisation time of one megabyte: 8 ms at
+//                                            1 Gbit/s, 0.2 ms at 40 Gbit/s
+//   concurrency     = 1                      one server: c = rate × time = 1 (Little's law)
+//   queue_limit     = 1000 MB                chosen: fluid::Capacity's generic room of 1000
+//                                            units, read in megabytes (a router's buffer is
+//                                            far smaller; the room is the model's, not a
+//                                            device's)
+//   variability     = 0                      a fixed size at a fixed rate takes a fixed time;
+//                                            the spread the pipe sees is its size mix's
+//                                            (behaviours::MegabyteService, set per step)
+//   burstiness      = 1                      Poisson arrivals, as everywhere by default
+// The zone thresholds are the generic 70 % / 90 %. A link has no `advanced` block: these are
+// the pipe's numbers whatever the scenario.
+[[nodiscard]] constexpr fluid::Capacity pipe_capacity(ByteRate bandwidth) {
+  const double megabytes_per_s = bandwidth.bytes_per_second / byte_unit;
+  return fluid::Capacity{.service_rate = Rate{megabytes_per_s},
+                         .service_time_s = 1.0 / megabytes_per_s,
+                         .concurrency = 1,
+                         .service_variability = 0.0};
+}
+
 // Spec §6's QPS line: "blob 500 MB/s", one blob store machine's throughput.
 inline constexpr ByteRate blob_store_byte_rate{500e6};
 

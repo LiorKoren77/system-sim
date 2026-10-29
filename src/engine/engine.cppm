@@ -8,9 +8,11 @@
 //
 // Models: a whole System Design Interview (Alex Xu, vol. 1) diagram set in motion. The
 // users box offers load (ch. 2 back-of-the-envelope QPS), every arrow carries it to the
-// next box after the hop's latency, every box serves what its capacity allows and queues
-// or sheds the rest (ch. 1 scaling), and the response time a user sees is built up on
-// the way back: each box's own wait and service time plus the hops it made. Captured:
+// next box after the hop's latency (an arrow with a bandwidth through a pipe that queues and
+// drops megabytes first, Simulation::pass_through_pipe), every box serves what its capacity
+// allows and queues or sheds the rest (ch. 1 scaling), and the response time a user sees is
+// built up on the way back: each box's own wait and service time plus the hops it made (a
+// pipe's wait and serialisation with them, Simulation::hop_response). Captured:
 // saturation spreading downstream as reduced throughput (dropped flow never reaches the
 // next box), propagation delay, fan-out and the feedback loops of ch. 12 (chat). Ignored:
 // individual requests (flow is a fluid), retries and timeouts, and anything that changes
@@ -160,12 +162,35 @@ struct ResponseSample {
   flow::LatencyEstimate response{};
 };
 
-// Everything one step produced: one NodeSample per node (indexed like Graph::nodes()) and
-// one ResponseSample per (client, op), clients in node order, ops sorted by name.
+// One bandwidth link's pipe for one step (plan 2c refinement 3; Simulation::pass_through_pipe):
+// NodeSample's fields of the same names, in MEGABYTES (per second for the rates), the pipe being a
+// queue of megabytes like a byte-sized node. `demand_per_s` is what the sender put on the link,
+// `drain_per_s` what the pipe passed on to the receiver, `dropped_per_s` what overflowed its
+// 1000 MB room; they balance as a node's do,
+//   demand·dt = (drain + dropped)·dt + Δbacklog.
+// `rho` and `zone` are the one server's; `latency` is what a request spends in the pipe, its wait
+// plus its own whole serialisation (size × 1 MB / bandwidth), mixed over the ops that arrived by
+// their requests (the link's fixed one-way delay is not in it). A pipe refuses nothing by policy,
+// so it has no `rejected_per_s`.
+struct LinkSample {
+  double demand_per_s{};
+  double drain_per_s{};
+  double dropped_per_s{};
+  double backlog{};
+  double rho{};
+  flow::LatencyEstimate latency{};
+  fluid::Zone zone{fluid::Zone::green};
+};
+
+// Everything one step produced: one NodeSample per node (indexed like Graph::nodes()), one
+// ResponseSample per (client, op), clients in node order, ops sorted by name, and one LinkSample
+// per link that has a bandwidth, in Graph::links() order (none without a bandwidth: such a link
+// only delays its flow).
 struct StepRecord {
   SimTime t{};
   std::vector<NodeSample> nodes{};
   std::vector<ResponseSample> responses{};
+  std::vector<LinkSample> links{};
   // Only Simulation::estimate clears it: false means the settle passes hit their cap
   // before the numbers stopped changing, so the record is the last pass, not a steady
   // state. A loop that returns as much as it receives (gain >= 1) and that no capacity
@@ -284,10 +309,12 @@ class Simulation {
     flow::Flow waiting{};
   };
 
-  // What one copy group's step produced (serve_copies): one copy's fluid step, and what all the
-  // group's copies drained and dropped, per op, in capacity units per second: the group's
+  // What one copy group's step produced (advance_group): what one copy's queue held during the
+  // step (its waiting content plus the step's arrivals, in units), one copy's fluid step, and what
+  // all the group's copies drained and dropped, per op, in capacity units per second: the group's
   // totals, the clients' work and a replica's replayed writes alike.
   struct GroupStep {
+    flow::Flow content{};
     fluid::FluidStep copy{};
     flow::Flow drained{};
     flow::Flow dropped{};
@@ -336,11 +363,33 @@ class Simulation {
     flow::LatencyEstimate wait{};
     std::optional<Replication> replication{};  // databases only
     ResponseTable responses{};
+    // (receiver, link) of every bandwidth link this node sends demand on (connect_pipes): where
+    // its hop lookups find a pipe (hop_response, hop_delivered). Empty for most nodes.
+    std::vector<std::pair<std::size_t, std::size_t>> pipes_out{};
+  };
+
+  // A bandwidth link's pipe (plan 2c refinement 3; defaults::pipe_capacity has its numbers and
+  // what it models): one queue of one server in MEGABYTES, fed what the sender puts on the link,
+  // each request priced at its size (megabytes_by_op) and timed by `timing` (a request holds the
+  // pipe for its whole serialisation, size × 1 MB / bandwidth, and is handed on at its last
+  // byte). Its step's wait and the share it passed (not dropped) are what the backward pass adds
+  // to every hop over the link (hop_response, hop_delivered).
+  struct Pipe {
+    CopyGroup group;  // one copy (CopyGroup's defaults): the queue and what it holds, in MB
+    behaviours::MegabyteService timing;
+    std::map<std::string, double, std::less<>> megabytes_by_op{};  // every op it may carry
+    std::size_t slot{};            // its sample's index in StepRecord::links
+    flow::LatencyEstimate wait{};  // this step's queueing wait
+    double passed{1.0};            // the share of this step's arriving megabytes not dropped
   };
 
   struct Link {
     DelayLine line;
-    flow::Flow sent{};  // what the source put on the link in the latest evaluation
+    // What leaves the sender's end of the link in the latest evaluation: what the sender put on
+    // it, or, over a pipe, the part the pipe passed on (pass_through_pipe). The delay line
+    // carries it to the receiver.
+    flow::Flow sent{};
+    std::optional<Pipe> pipe{};  // a link with a bandwidth only
   };
 
   Simulation() = default;  // only for settling_copy(), which fills every member
@@ -360,16 +409,21 @@ class Simulation {
   [[nodiscard]] static Node make_database(behaviours::Behaviour behaviour,
                                           const graph::ResolvedNode& resolved);
   [[nodiscard]] static int line_steps(const graph::ResolvedLink& link);
+  [[nodiscard]] static std::optional<Pipe> make_pipe(const graph::Graph& g, std::size_t link,
+                                                     std::size_t slot);
   void connect(const graph::Graph& g);
+  void connect_pipes(const graph::Graph& g);
   void register_reachable_ops(const graph::Graph& g);
   [[nodiscard]] Simulation settling_copy() const;
 
   [[nodiscard]] StepRecord evaluate(SimTime now, SimTime dt, Mode mode);
-  void forward_pass(SimTime now, SimTime dt, Mode mode, std::vector<NodeSample>& samples);
+  void forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& record);
   void receive(std::size_t index, Mode mode);
   // Any queueing node (service, load balancer, rate limiter): runs its queues and returns
   // what they drained, in requests per second, for the behaviour to route.
   [[nodiscard]] flow::Flow serve(std::size_t index, SimTime dt, Mode mode, NodeSample& sample);
+  [[nodiscard]] static GroupStep advance_group(CopyGroup& group, const flow::Flow& arrivals,
+                                               SimTime dt, Mode mode);
   [[nodiscard]] static GroupStep serve_copies(CopyGroup& group, const flow::Flow& arrivals,
                                               SimTime dt, Mode mode,
                                               const behaviours::Behaviour& behaviour,
@@ -394,12 +448,16 @@ class Simulation {
   [[nodiscard]] static flow::LatencyEstimate request_weighted_sojourn(const Node& node);
   static void time_whole_objects(Node& node);
   [[nodiscard]] static flow::LatencyEstimate request_weighted_megabyte_sojourn(
-      const Node& node, const behaviours::MegabyteService& megabyte_service);
+      const flow::Flow& requests, const flow::LatencyEstimate& wait,
+      const behaviours::MegabyteService& megabyte_service);
   static void record_replication(const Node& node, std::span<const flow::LatencyEstimate> sojourns,
                                  const ReplicationTally& tally, NodeSample& sample);
   [[nodiscard]] static flow::Flow take_drained(CopyGroup& group, const flow::Flow& content,
                                                const fluid::FluidStep& copy_step);
-  void send(std::size_t index, const behaviours::Routed& routed, Mode mode);
+  void send(std::size_t index, const behaviours::Routed& routed, SimTime dt, Mode mode,
+            std::span<LinkSample> link_samples);
+  static void pass_through_pipe(Link& link, SimTime dt, Mode mode,
+                                std::span<LinkSample> link_samples);
   void account_rejections(std::size_t index, const behaviours::Routed& routed, NodeSample& sample);
   void backward_pass();
   [[nodiscard]] std::vector<ResponseSample> client_responses(SimTime now) const;
@@ -407,9 +465,15 @@ class Simulation {
   [[nodiscard]] static flow::LatencyEstimate own_sojourn(const Node& node, std::string_view op);
   [[nodiscard]] static double own_passed(const Node& node, std::string_view op);
   [[nodiscard]] double delivered_of(std::size_t node, std::string_view op) const;
+  [[nodiscard]] const Pipe* pipe_between(std::size_t caller, std::size_t target) const;
+  [[nodiscard]] flow::LatencyEstimate hop_response(std::size_t caller, std::size_t target,
+                                                   std::string_view op) const;
+  [[nodiscard]] double hop_delivered(std::size_t caller, std::size_t target,
+                                     std::string_view op) const;
 
   std::vector<Node> nodes_;
   std::vector<Link> links_;
+  std::size_t pipe_count_{};  // the links with a bandwidth: StepRecord::links has one each
   std::vector<std::size_t> order_;
   SimTime step_{};
 };
@@ -640,6 +704,39 @@ inline constexpr int max_settle_passes = 100'000;
   return true;
 }
 
+// The megabytes one request of `op` is on a pipe (Simulation::Pipe::megabytes_by_op). An op it
+// was not built with cannot cross it: Graph::build refuses a bandwidth link that carries an
+// unsized op (graph::Graph::resolve_request_sizes), so this is a programmer error.
+[[nodiscard]] double megabytes_of(const std::map<std::string, double, std::less<>>& by_op,
+                                  std::string_view op) {
+  const auto found = by_op.find(op);
+  if (found == by_op.end()) {
+    throw std::logic_error{"a pipe carries op '" + std::string{op} + "', which has no size"};
+  }
+  return found->second;
+}
+
+// Requests per second -> megabytes per second on a pipe, op by op (rate × MB), as in_units prices
+// a byte-sized node's requests.
+[[nodiscard]] flow::Flow to_megabytes(const flow::Flow& requests,
+                                      const std::map<std::string, double, std::less<>>& by_op) {
+  flow::Flow megabytes;
+  for (const auto& [op, rate] : requests.entries()) {
+    megabytes.add(op, Rate{rate.per_second * megabytes_of(by_op, op)});
+  }
+  return megabytes;
+}
+
+// The inverse (MB / MB per request): what a pipe passes on is requests again.
+[[nodiscard]] flow::Flow to_requests(const flow::Flow& megabytes,
+                                     const std::map<std::string, double, std::less<>>& by_op) {
+  flow::Flow requests;
+  for (const auto& [op, rate] : megabytes.entries()) {
+    requests.add(op, Rate{rate.per_second / megabytes_of(by_op, op)});
+  }
+  return requests;
+}
+
 }  // namespace
 
 // ---- DelayLine ----
@@ -690,8 +787,13 @@ Simulation::Simulation(const graph::Graph& g)
   // C++20 designated initializers: `Link{.line = ...}` names the member it sets and leaves
   // the others at their defaults, replacing positional braces where a reader must count
   // members against the struct (and same-typed doubles, as in CopyGroup, could swap silently).
-  for (const auto& link : g.links()) links_.push_back(Link{.line = DelayLine{line_steps(link)}});
+  for (std::size_t i = 0; i < g.links().size(); ++i) {
+    links_.push_back(
+        Link{.line = DelayLine{line_steps(g.links()[i])}, .pipe = make_pipe(g, i, pipe_count_)});
+    if (links_.back().pipe) ++pipe_count_;
+  }
   connect(g);
+  connect_pipes(g);
   register_reachable_ops(g);
 }
 
@@ -886,6 +988,29 @@ int Simulation::line_steps(const graph::ResolvedLink& link) {
   return link.feedback ? link.delay_steps - 1 : link.delay_steps;
 }
 
+// A bandwidth link's pipe (Pipe), or nothing for a link without a bandwidth: its queue of
+// megabytes (graph::ResolvedLink::pipe, defaults::pipe_capacity) and the size of every op its
+// receiver can be sent with one (Graph::build refused a link that carries an unsized op, so these
+// cover every op that crosses it). `slot` is its sample's place in StepRecord::links.
+std::optional<Simulation::Pipe> Simulation::make_pipe(const graph::Graph& g, std::size_t link,
+                                                      std::size_t slot) {
+  const auto& resolved = g.links()[link];
+  if (!resolved.pipe) return std::nullopt;
+  const auto receiver = graph::demand_receiver(resolved);
+  std::map<std::string, double, std::less<>> megabytes_by_op;
+  for (const auto& op : g.arriving_ops(receiver)) {
+    if (const auto size = g.request_bytes(receiver, op)) {
+      megabytes_by_op.emplace(op, defaults::byte_cost(*size));
+    }
+  }
+  auto timing =
+      behaviours::MegabyteService::serialising(resolved.pipe->service_time_s, megabytes_by_op);
+  return Pipe{.group = CopyGroup{.queue = fluid::FluidQueue{*resolved.pipe}},
+              .timing = std::move(timing),
+              .megabytes_by_op = std::move(megabytes_by_op),
+              .slot = slot};
+}
+
 // Every demand edge makes its link an output of the sender and an input of the receiver.
 // One link carries demand one way only, so each link is pushed by one node and popped by
 // one node, once per step.
@@ -893,6 +1018,19 @@ void Simulation::connect(const graph::Graph& g) {
   for (const auto& edge : g.edges()) {
     add_once(nodes_[edge.from].outgoing_links, edge.link);
     add_once(nodes_[edge.to].incoming_links, edge.link);
+  }
+}
+
+// Tells each sender which of its links are pipes, and to whom (Node::pipes_out): a link carries
+// demand one way, from its sending side to its receiving side (graph::demand_sender and
+// demand_receiver), and there is one link per pair and direction, so (sender, receiver) finds the
+// pipe a hop crosses.
+void Simulation::connect_pipes(const graph::Graph& g) {
+  for (std::size_t link = 0; link < g.links().size(); ++link) {
+    const auto& resolved = g.links()[link];
+    if (!resolved.pipe) continue;
+    nodes_[graph::demand_sender(resolved)].pipes_out.emplace_back(graph::demand_receiver(resolved),
+                                                                  link);
   }
 }
 
@@ -969,12 +1107,14 @@ StepRecord Simulation::estimate() const {
 // response yet (the response tables keep their ops, see register_reachable_ops), and
 // every client's noise back at multiplier 1 (settle mode never ticks it again). Delay
 // lines are not copied: settle mode reads `sent` directly, so each link gets an empty
-// one-slot line (a million-step link would otherwise copy a million Flows). The queues
-// need no reset either: settle mode sets each backlog from the demand (FluidQueue::settle).
+// one-slot line (a million-step link would otherwise copy a million Flows), with a copy of its
+// pipe, if it has one, that holds nothing and has lost nothing yet. The queues need no reset
+// either: settle mode sets each backlog from the demand (FluidQueue::settle).
 Simulation Simulation::settling_copy() const {
   Simulation scratch;
   scratch.order_ = order_;
   scratch.step_ = step_;
+  scratch.pipe_count_ = pipe_count_;
   scratch.nodes_ = nodes_;
   for (auto& node : scratch.nodes_) {
     node.inflow.clear();
@@ -994,12 +1134,21 @@ Simulation Simulation::settling_copy() const {
     }
   }
   scratch.links_.assign(links_.size(), Link{.line = DelayLine{0}});
+  for (std::size_t i = 0; i < links_.size(); ++i) {
+    if (!links_[i].pipe) continue;
+    auto& pipe = scratch.links_[i].pipe.emplace(*links_[i].pipe);
+    pipe.group.waiting.clear();
+    pipe.wait = flow::LatencyEstimate{};
+    pipe.passed = 1.0;
+  }
   return scratch;
 }
 
 StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
-  StepRecord record{.t = now, .nodes = std::vector<NodeSample>(nodes_.size())};
-  forward_pass(now, dt, mode, record.nodes);
+  StepRecord record{.t = now,
+                    .nodes = std::vector<NodeSample>(nodes_.size()),
+                    .links = std::vector<LinkSample>(pipe_count_)};
+  forward_pass(now, dt, mode, record);
   backward_pass();
   record.responses = client_responses(now);
   return record;
@@ -1013,14 +1162,15 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
 //      on the inflow and routes the part it drained (backlog included, with the queue's op
 //      mix: see serve) for the step [now, now + dt); what the route rejects is recorded
 //      and goes nowhere (account_rejections);
-//   3. send: accumulate the routed flow per link and push it into each link's delay line.
+//   3. send: accumulate the routed flow per link, pass it through the link's pipe if the link
+//      has a bandwidth (pass_through_pipe), and push it into each link's delay line.
 // Why this order is right: a forward link's target comes later in the order, so it pops
 // after this step's push (a zero-step link delivers in the same step). A feedback link's
 // target came earlier, so it already popped and gets this push next step. Every link is
 // pushed exactly once per step (an empty flow if the source routed nothing on it) and
 // popped exactly once, which keeps each delay line's ring in step with the clock.
-void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode,
-                              std::vector<NodeSample>& samples) {
+void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& record) {
+  auto& samples = record.nodes;
   for (const std::size_t index : order_) {
     receive(index, mode);
     // A client's sample stays all zeros, green: a source has no queue.
@@ -1037,7 +1187,7 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode,
                    }},
         nodes_[index].behaviour);
     account_rejections(index, routed, samples[index]);
-    send(index, routed, mode);
+    send(index, routed, dt, mode, record.links);
   }
 }
 
@@ -1259,7 +1409,7 @@ void Simulation::record_sojourns(Node& node, std::span<const flow::LatencyEstima
   node.wait = mixed(waits, read_share);
   if (const auto* megabyte_service = megabyte_service_of(node.behaviour)) {
     node.write_sojourn = node.read_sojourn;
-    sample.latency = request_weighted_megabyte_sojourn(node, *megabyte_service);
+    sample.latency = request_weighted_megabyte_sojourn(node.inflow, node.wait, *megabyte_service);
     return;
   }
   if (!node.replication) {
@@ -1296,9 +1446,10 @@ void Simulation::time_whole_objects(Node& node) {
 }
 
 // A byte-sized node's latency: each op's own sojourn (own_sojourn) mixed by the requests of it
-// that arrived this step, what an average request saw, as a database mixes its reads and writes
-// (request_weighted_sojourn). Nothing arrived: what a read arriving now would see, the wait plus
-// one megabyte. The mixture of behaviours::mixture, accumulated in place over the inflow (two
+// that arrived this step (`requests`), what an average request saw, as a database mixes its reads
+// and writes (request_weighted_sojourn); a pipe's likewise, each op's wait plus its serialisation
+// (pass_through_pipe). Nothing arrived: what a read arriving now would see, the wait plus one
+// megabyte. The mixture of behaviours::mixture, accumulated in place over the arrivals (two
 // passes, no allocation per step), with p_op = rate_op / Σ rate and op o's sojourn of mean m_o and
 // variance v_o:
 //   mean     = Σ_o p_o m_o
@@ -1306,18 +1457,19 @@ void Simulation::time_whole_objects(Node& node) {
 // equal to Σ p (v + m²) − mean² but written as a sum of non-negative terms, so it cannot come out
 // negative when the two nearly cancel (one op: a 12 s upload with a variance of 0.03 s²).
 flow::LatencyEstimate Simulation::request_weighted_megabyte_sojourn(
-    const Node& node, const behaviours::MegabyteService& megabyte_service) {
-  const double total_per_s = node.inflow.total().per_second;
-  if (total_per_s <= 0.0) return megabyte_service.first_megabyte(node.wait);
+    const flow::Flow& requests, const flow::LatencyEstimate& wait,
+    const behaviours::MegabyteService& megabyte_service) {
+  const double total_per_s = requests.total().per_second;
+  if (total_per_s <= 0.0) return megabyte_service.first_megabyte(wait);
   double mean_s = 0.0;
-  for (const auto& [op, rate] : node.inflow.entries()) {
+  for (const auto& [op, rate] : requests.entries()) {
     if (rate.per_second <= 0.0) continue;
-    mean_s += rate.per_second / total_per_s * megabyte_service.sojourn(op, node.wait).mean_s;
+    mean_s += rate.per_second / total_per_s * megabyte_service.sojourn(op, wait).mean_s;
   }
   double variance_s2 = 0.0;
-  for (const auto& [op, rate] : node.inflow.entries()) {
+  for (const auto& [op, rate] : requests.entries()) {
     if (rate.per_second <= 0.0) continue;
-    const auto own = megabyte_service.sojourn(op, node.wait);
+    const auto own = megabyte_service.sojourn(op, wait);
     const double apart_s = own.mean_s - mean_s;
     variance_s2 += rate.per_second / total_per_s * (own.variance_s2 + apart_s * apart_s);
   }
@@ -1372,21 +1524,31 @@ Simulation::GroupStep Simulation::serve_copies(CopyGroup& group, const flow::Flo
                                                SimTime dt, Mode mode,
                                                const behaviours::Behaviour& behaviour,
                                                NodeSample& sample) {
+  GroupStep step = advance_group(group, arrivals, dt, mode);
+  // The queue is well-mixed (see serve): what it drains, drops and holds has the content's op
+  // mix, so the clients' share of the content is their share of each of those.
+  add_copies(sample, step.copy, group.copies, clients_share(group, arrivals, behaviour),
+             clients_share(group, step.content, behaviour));
+  return step;
+}
+
+// The fluid step of one copy of `group`, sent `arrivals` (per op, in capacity units per second),
+// settled first when estimating, and what the group's copies drained and dropped of it, per op,
+// in the content's mix (the queue is well-mixed, see serve). Every copy group of a node runs
+// through here (serve_copies), and so does a bandwidth link's pipe (pass_through_pipe).
+Simulation::GroupStep Simulation::advance_group(CopyGroup& group, const flow::Flow& arrivals,
+                                                SimTime dt, Mode mode) {
   const Rate per_copy = arrivals.total();
   if (mode == Mode::settle) {
     group.queue.settle(per_copy);
     group.waiting = settled_waiting(arrivals, group.queue.backlog());
   }
-  const flow::Flow content = queue_content(group.waiting, arrivals, dt);
-  GroupStep step{.copy = group.queue.advance(per_copy, dt)};
-  step.drained = take_drained(group, content, step.copy);
+  GroupStep step{.content = queue_content(group.waiting, arrivals, dt)};
+  step.copy = group.queue.advance(per_copy, dt);
+  step.drained = take_drained(group, step.content, step.copy);
   // Every group's drops, per op: a replica's replayed writes it missed (replay_committed) and,
   // on every node, the requests lost (account_rejections).
-  step.dropped = dropped_part(content, step.copy, group.copies);
-  // The queue is well-mixed (see serve): what it drains, drops and holds has the content's op
-  // mix, so the clients' share of the content is their share of each of those.
-  add_copies(sample, step.copy, group.copies, clients_share(group, arrivals, behaviour),
-             clients_share(group, content, behaviour));
+  step.dropped = dropped_part(step.content, step.copy, group.copies);
   return step;
 }
 
@@ -1415,12 +1577,61 @@ flow::Flow Simulation::take_drained(CopyGroup& group, const flow::Flow& content,
   return content.scaled(copy_step.drain_per_s * group.copies / content_total);
 }
 
-void Simulation::send(std::size_t index, const behaviours::Routed& routed, Mode mode) {
+// What node `index` routed goes onto its links: summed per link (one push per link and step,
+// see DelayLine), through the link's pipe first when it has a bandwidth (pass_through_pipe, whose
+// sample lands in `link_samples`), then into the delay line.
+void Simulation::send(std::size_t index, const behaviours::Routed& routed, SimTime dt, Mode mode,
+                      std::span<LinkSample> link_samples) {
   const auto& outgoing_links = nodes_[index].outgoing_links;
   for (const std::size_t link : outgoing_links) links_[link].sent.clear();
   for (const auto& out : routed.outgoing) links_[out.link].sent += out.flow;
+  for (const std::size_t link : outgoing_links) {
+    if (links_[link].pipe) pass_through_pipe(links_[link], dt, mode, link_samples);
+  }
   if (mode == Mode::settle) return;  // estimate reads `sent` directly; lines stay untouched
   for (const std::size_t link : outgoing_links) links_[link].line.push(links_[link].sent);
+}
+
+// A bandwidth link's pipe for one step (plan 2c refinement 3), between the sender and the delay
+// line: a fluid queue like a byte-sized node's, in megabytes.
+//   demand   = Σ_op rate_op × MB_op                           MB/s put on the link
+//   s_obj    = Σ_op p_op MB_op × s_MB,  c_s² = the size mix's SCV    (MegabyteService::
+//              object_time_moments: one request holds the pipe for its whole serialisation,
+//              s_MB = 1 MB / bandwidth; p_op = rate_op / Σ rate)
+//   Wq       = (c_a² + c_s²) / 2 × Erlang C(1, rho) × s_obj / (1 − rho)     (Allen–Cunneen with
+//              one server: for Poisson arrivals Pollaczek–Khinchine's M/G/1 wait, exact), at most
+//              the room's drain time, 1000 MB / bandwidth, and at least the backlog's
+//              (fluid::FluidQueue::advance)
+// What it drains goes on to the receiver as requests; what overflows the room is lost, and the
+// share it kept, 1 − dropped / arrived (in MB: the queue is well-mixed, so every op loses the same
+// share), multiplies the delivered fraction of every hop over the link (hop_delivered). Its wait
+// is kept for the backward pass, which adds wait + MB_op × s_MB to every hop over the link
+// (hop_response). Both directions share the one pipe, and only the requests feed it: an `inout`
+// link's replies carry no bytes here (an upper bound on contention for request-heavy links, an
+// understatement for a download whose bytes come back as the reply). Its sample's latency is that
+// hop term mixed by the requests that arrived (request_weighted_megabyte_sojourn).
+// Ignored: TCP's slow start and windows, packet loss and retransmission, the propagation delay
+// changing with load (the link's one-way latency stays fixed), full duplex.
+void Simulation::pass_through_pipe(Link& link, SimTime dt, Mode mode,
+                                   std::span<LinkSample> link_samples) {
+  Pipe& pipe = *link.pipe;
+  const flow::Flow& requests = link.sent;
+  if (const auto moments = pipe.timing.object_time_moments(requests)) {
+    pipe.group.queue.set_service(*moments);
+  }
+  const flow::Flow megabytes = to_megabytes(requests, pipe.megabytes_by_op);
+  const GroupStep step = advance_group(pipe.group, megabytes, dt, mode);
+  pipe.wait = step.copy.wait;
+  pipe.passed = kept_share(step.dropped, megabytes);
+  link_samples[pipe.slot] =
+      LinkSample{.demand_per_s = step.copy.demand_per_s,
+                 .drain_per_s = step.copy.drain_per_s,
+                 .dropped_per_s = step.copy.dropped_per_s,
+                 .backlog = step.copy.backlog,
+                 .rho = step.copy.rho,
+                 .latency = request_weighted_megabyte_sojourn(requests, pipe.wait, pipe.timing),
+                 .zone = step.copy.zone};
+  link.sent = to_requests(step.drained, pipe.megabytes_by_op);
 }
 
 // Backward pass (plan refinement 1), nodes in reverse topological order: a server's
@@ -1444,16 +1655,18 @@ void Simulation::send(std::size_t index, const behaviours::Routed& routed, Mode 
 // parts multiply, splits mix by share). A feedback target is read one step stale, as for
 // latency.
 void Simulation::backward_pass() {
-  const auto lookup = [this](std::size_t target, std::string_view op) -> flow::LatencyEstimate {
-    return response_of(target, op);
-  };
-  const auto fraction = [this](std::size_t target, std::string_view op) {
-    return delivered_of(target, op);
-  };
   // C++20 std::views::reverse: walks the order back to front without copying it,
   // replacing a reverse-iterator loop (rbegin/rend) or a reversed copy.
   for (const std::size_t index : order_ | std::views::reverse) {
     auto& node = nodes_[index];
+    // This node's hops: a pipe on the link to a target comes with the target's answer.
+    const auto lookup = [this, index](std::size_t target,
+                                      std::string_view op) -> flow::LatencyEstimate {
+      return hop_response(index, target, op);
+    };
+    const auto fraction = [this, index](std::size_t target, std::string_view op) {
+      return hop_delivered(index, target, op);
+    };
     // Only servers compose a response here; clients are read in client_responses().
     std::visit(Overloaded{[](const behaviours::ClientBehaviour&) {},
                           [&](const auto& server) {
@@ -1475,16 +1688,17 @@ void Simulation::backward_pass() {
 // queues fed by flow sent up to d steps ago (d = the path's delay in steps), so the latency
 // a spike causes is attributed to the requests offered d steps later.
 std::vector<ResponseSample> Simulation::client_responses(SimTime now) const {
-  const auto lookup = [this](std::size_t target, std::string_view op) -> flow::LatencyEstimate {
-    return response_of(target, op);
-  };
-  const auto fraction = [this](std::size_t target, std::string_view op) {
-    return delivered_of(target, op);
-  };
   std::vector<ResponseSample> responses;
   for (std::size_t index = 0; index < nodes_.size(); ++index) {
     const auto* client = std::get_if<behaviours::ClientBehaviour>(&nodes_[index].behaviour);
     if (client == nullptr) continue;
+    const auto lookup = [this, index](std::size_t target,
+                                      std::string_view op) -> flow::LatencyEstimate {
+      return hop_response(index, target, op);
+    };
+    const auto fraction = [this, index](std::size_t target, std::string_view op) {
+      return hop_delivered(index, target, op);
+    };
     for (const auto& [op, offered] : client->offered(now)) {
       responses.push_back(
           ResponseSample{.client = index,
@@ -1526,6 +1740,42 @@ double Simulation::delivered_of(std::size_t node, std::string_view op) const {
   const auto& table = nodes_[node].responses;
   const auto found = table.find(op);
   return found == table.end() ? 1.0 : found->second.delivered;
+}
+
+// The pipe a hop from `caller` to `target` crosses (connect_pipes), or null when their link has
+// no bandwidth: the usual case, an empty list.
+const Simulation::Pipe* Simulation::pipe_between(std::size_t caller, std::size_t target) const {
+  for (const auto& [receiver, link] : nodes_[caller].pipes_out) {
+    if (receiver == target) return &*links_[link].pipe;
+  }
+  return nullptr;
+}
+
+// What the backward pass hands a behaviour as the answer of a hop (behaviours::ResponseLookup):
+// the target's response to `op` and, when the link to it is a pipe, the pipe's term before it,
+// this step's wait plus the request's whole serialisation, MB_op × 1 MB / bandwidth
+// (MegabyteService::serialising). One mechanism for every hop of every behaviour: each adds the
+// link's fixed legs (round_trip) and what this returns, so a pipe is counted once per hop, after
+// the two legs, wherever the hop is (a client's route, a balancer's link, a service's step, a
+// cache's store hop), and never for an asynchronous hop, which nobody looks up. Per step and per
+// (link, op): the wait is the pipe's this step, the serialisation the op's own. A hop without a
+// pipe returns the target's response untouched, so a scenario without a bandwidth runs exactly
+// as before.
+flow::LatencyEstimate Simulation::hop_response(std::size_t caller, std::size_t target,
+                                               std::string_view op) const {
+  const Pipe* pipe = pipe_between(caller, target);
+  if (pipe == nullptr) return response_of(target, op);
+  return pipe->timing.sojourn(op, pipe->wait) + response_of(target, op);
+}
+
+// The same for the delivered fraction (behaviours::FractionLookup): the target's, times the share
+// of this step's megabytes the pipe did not drop when the hop crosses one. A pipe's losses fail
+// requests as a node's drops do, and multiply with what is lost further on.
+double Simulation::hop_delivered(std::size_t caller, std::size_t target,
+                                 std::string_view op) const {
+  const Pipe* pipe = pipe_between(caller, target);
+  if (pipe == nullptr) return delivered_of(target, op);
+  return pipe->passed * delivered_of(target, op);
 }
 
 }  // namespace simsys::engine

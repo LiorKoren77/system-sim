@@ -22,7 +22,7 @@ Refused requests are counted apart from dropped ones (`reject_rate`), and a requ
 as answered unless it was refused or dropped. Six scenarios run end to end, the
 [URL shortener](scenarios/book/url-shortener/) of ch. 8 among them (list below); the other
 7 book systems and the kv-store lab validate and `explain`, waiting for phases 2c (blob-store
-events, queues, workers, external sinks, link bandwidth, `sweep`) and 3. The scenario language is
+events, queues, workers, external sinks, `sweep`) and 3. The scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.3).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
@@ -46,7 +46,10 @@ with `--series`, writes one CSV row per node per step
 the file a plot or GUI reads; demand, drain, drops and backlog balance, so the fluid queue's
 conservation law, Σ demand·dt = Σ (drain + drops)·dt + backlog, can be checked from the file (a
 token bucket's or a window's refusals are inside drain; a leaky bucket's overflow is in
-`rejected_per_s`, in the drops' place). With `--series-ops`, it writes one CSV row per client op
+`rejected_per_s`, in the drops' place). A link with a `bandwidth` is a pipe that queues and drops
+megabytes: it gets a row of its own, named `from->to`, after the nodes in the series (same
+columns, in MB), in the table's `links` section and in JSON's `links`, and a check line in
+`explain`. With `--series-ops`, it writes one CSV row per client op
 per step (`t_s,client,op,offered_per_s,answered_per_s,mean_ms`): what each client sent, the part
 of it that came back answered (a limiter's refusals and a queue's drops are not; a request
 waiting in a queue is answered later), and the mean

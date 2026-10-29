@@ -751,13 +751,35 @@ header names the span: `checks (peak offered load over the first 24h, no queuein
 | `dir` | read | the direction **demand** travels. `out`: `from` sends to `to`. `in`: `to` sends to `from`; the link is written from the receiver's side. `inout`: like `out`, and replies flow back on the same link (the normal request/response case). The engine charges every hop a request leg and a reply leg (2 × one-way) whatever `dir` says |
 | `ops` | read | a non-empty list of distinct op names; absent means all ops. `ops: []` is an error (it would load as "all", the opposite of what it says) |
 | `latency` | read | **one way**. Default: half the round trip, `intra_dc_rtt / 2` = 250 µs inside a datacenter, `cross_dc_rtt / 2` = 75 ms across |
-| `bandwidth` † | checked | a positive [byte rate](#values), in bytes or bits (`40Gbit/s` = 5e9 B/s): `bandwidth must be positive`, `bandwidth must be at most 1e15B/s`, `bandwidth is a byte rate (B/s, or bit/s for a network: 40Gbit/s)`. The pipe it caps is modelled from phase 2c |
+| `bandwidth` † | read | a positive [byte rate](#values), in bytes or bits (`40Gbit/s` = 5e9 B/s): `bandwidth must be positive`, `bandwidth must be at most 1e15B/s`, `bandwidth is a byte rate (B/s, or bit/s for a network: 40Gbit/s)`. From phase 2c the link is a **pipe** that queues and drops megabytes (below). *(graph)* Every op the link carries needs a size: `link 'a'->'b' has a bandwidth, but op 'ping' from 'a' has no size: add size: to the step or sizes: to the client` (the sender named is the client or the renaming step that set or dropped the size). `explain` prints `bandwidth=1Gbit/s (125MB/s)` (the bit form only when bytes × 8 is a whole number of kbit/s, Mbit/s or Gbit/s, else the bytes alone) |
 | `weight` | read | finite, ≥ 0, at most 1e9; default 1. When several links from a **client, load balancer or rate limiter** carry the same op, the op is split `weight_i / Σ weight` over them. 0 means a drained backend: the route carries nothing, so it brings no op to its target, closes no call cycle and imposes no replica model (a balancer's policy, below). *(graph)* An op whose every link has weight 0 is an error (`client 'u': every link carrying op 'read' has weight 0`; `node 'lb': ...` for a balancer). A service's steps and a cache's or limiter's backend name their target, so a weight there has no effect |
 
 **One link per pair and demand direction.** A second link between the same two nodes in
 the same demand direction is rejected ("duplicate link (put several ops or a weight on
 one link)"); `{from: a, to: b}` and `{from: b, to: a, dir: in}` are the same direction.
 Several ops go in one link's `ops`.
+
+**A bandwidth is a pipe** (phase 2c; spec §3.4: it "caps bytes/s and queues the excess like a
+node"). The link gets one queue in **megabytes**, like a [byte-sized node](#node-common-keys): one
+server (`c = 1`: a link sends one byte stream at a time) draining `bandwidth / 1 MB` (1 Gbit/s =
+125 MB/s), one megabyte taking `1 MB / bandwidth` (8 ms at 1 Gbit/s), each request holding it for
+its whole serialisation, `size × 1 MB / bandwidth`, deterministic (the spread is the size mix's),
+with a waiting room of **1000 MB** (chosen: the generic `queue_limit` read in megabytes; a link has
+no `advanced` block) beyond which it drops. Fed what the sender puts on the link, before the delay
+line: 1 MB requests at 100/s over 1 Gbit/s are rho 0.8, an M/D/1 wait of 0.5 × 0.8 / 0.2 × 8 ms =
+16 ms. A hop over the pipe adds, once, beside the link's two fixed legs, the pipe's wait plus the
+request's **whole serialisation** (the receiver cannot act before its last byte): 16 + 8 = 24 ms
+there, 160 + 80 ms for 10 MB requests at 10/s; requests of several sizes wait longer than one size
+at the same rho (1 MB and 4 MB at 20/s each: 54.4 ms, Pollaczek–Khinchine). Past the bandwidth the
+room fills (150 MB/s into 125: after 40 s), then the pipe drops the excess (25 MB/s), which fails
+the requests that cross it as a node's drops do (the client is answered 5/6 of them). Both
+directions share the one pipe and only the requests feed it: an `inout` link's replies carry no
+bytes. Ignored: TCP slow start and windows, packet loss and retransmission, propagation delay
+growing with load, full duplex. `run` adds a `links` table (the node table's columns, in MB) with a
+row `a->b` per pipe, JSON a `links` array (`name`, `demand_per_s`, `drain_per_s`, `dropped_per_s`,
+`backlog`, `rho`, `latency_s`, `zone`, `peak_rho`, `peak_backlog`, `red_s`; `[]` without a
+bandwidth), `--series` a row per pipe and step; `explain` checks it on paper: `a->b  peak offered
+100 MB/s vs 125 MB/s  (80%, yellow)`.
 
 **Delay lines** *(graph)*: a link delays its flow by `round(one_way / step)` steps, halves
 rounded away from zero (this replaces the spec's original `ceil` rule, see spec §16).
@@ -772,7 +794,7 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 | metric | `node` | `op` | `max` | evaluates |
 |---|---|---|---|---|
 | `p50_latency`, `p95_latency`, `p99_latency` | required, a **client** | optional, one the client sends | duration | the client's estimated end-to-end percentile over the **answered** requests; without `op`, the worst of its ops |
-| `drop_rate` | optional | not allowed | number in [0, 1] | the node's dropped / the work sent to it, after warmup; without `node`, the worst node's |
+| `drop_rate` | optional | not allowed | number in [0, 1] | the node's dropped / the work sent to it, after warmup; without `node`, the worst node's or bandwidth link pipe's (a `node` names a node only) |
 | `reject_rate` | optional | not allowed | number in [0, 1] | **new in v1.2**: the node's rejected (a rate limiter's refusals, a leaky bucket's overflow included) / the requests sent to it, after warmup; without `node`, the worst node's |
 | `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup |
 | `queue_lag` | optional | not allowed | duration | reported `skipped` until `message_queue` runs (phase 2c) |
@@ -792,7 +814,8 @@ Two different promises, kept apart on purpose:
   a `cost` or counts megabytes), so it stays in [0, 1] even when fan-out multiplies the clients' requests
   before they reach it (one post → 100 feed writes would make "dropped anywhere / offered
   by clients" 90). Without `node` it is the worst node's, since every node must keep the
-  bound.
+  bound, and a bandwidth link's pipe counts as one (megabytes dropped over megabytes sent; the
+  header then names it `worst: a->b`).
 - a **rejection** is a rate limiter's **policy working** (ch. 4's 429): what a token bucket or a
   window algorithm refuses, and a leaky bucket's overflow. `reject_rate` = Σ rejected / Σ
   demand of that node, with the same rules.
@@ -829,7 +852,9 @@ rates, each answered at its last byte (a write) or its first megabyte (a read).
 `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`
 (`rejected_per_s` new in v1.2, `demand_per_s` and `drain_per_s` in phase 2b; demand, drain,
 drops and backlog in capacity units, megabytes at a byte-sized node; a client row has zeros and
-zone `none`).
+zone `none`), then one row per [bandwidth link](#links) and step, its `from->to` in the `node`
+column, in megabytes, `rejected_per_s` 0 and `latency_ms` a request's wait plus its
+serialisation.
 `run --series-ops` writes one CSV row per client op per step (phase 2b):
 `t_s,client,op,offered_per_s,answered_per_s,mean_ms`, where `answered_per_s` is the part of
 the offered rate that came back answered (offered × the fraction the path delivered: offered

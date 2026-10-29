@@ -22,8 +22,10 @@
 // ResolvedLink. Captured: who sends demand to whom and over which link, how long a hop
 // takes (one way, from the book's datacenter round trips), how a client splits an op
 // over several entry points (CDN vs origin, two load balancers), and which arrows close
-// a loop (chat servers -> message queue -> sync workers -> chat servers). Ignored:
-// bandwidth limits and link failures (phase 2), and any per-request routing decision —
+// a loop (chat servers -> message queue -> sync workers -> chat servers), and, for a link that
+// states a `bandwidth`, the pipe the engine queues its megabytes in (ResolvedLink::pipe, plan 2c
+// refinement 3; every request it carries must have a size). Ignored: link failures (phase 3),
+// and any per-request routing decision —
 // splits are fixed fractions, as round-robin or a weighted DNS record would give. A load
 // balancer's policy is resolved here too, as a property of the node BEHIND it (plan 2a
 // refinement 5, see mark_balanced_targets): its ReplicaModel, whether its replicas queue
@@ -310,7 +312,27 @@ struct ResolvedLink {
   bool feedback{false};
   std::vector<std::string> ops{};  // empty = all ops
   double weight{1.0};
+  // A link that states a `bandwidth` is a pipe (plan 2c refinement 3, defaults::pipe_capacity):
+  // one server in megabytes, its service_rate the bandwidth in MB/s and its service_time_s the
+  // time of ONE megabyte (the convention of a byte-sized node's ResolvedNode::capacity: a request
+  // of 10 MB does not change it; the engine sets each step's object moments on the queue). Every
+  // op it carries has a size (Graph::build refuses an unsized one). Empty without a bandwidth: the
+  // link only adds its latency.
+  std::optional<fluid::Capacity> pipe{};
 };
+
+// The node a link delivers demand to: its `to`, or its `from` for a link written from the
+// receiver's side (`dir: in`); and the node that sends demand on it, the other end.
+[[nodiscard]] constexpr std::size_t demand_receiver(const ResolvedLink& link) {
+  return link.dir == model::Direction::in ? link.from : link.to;
+}
+[[nodiscard]] constexpr std::size_t demand_sender(const ResolvedLink& link) {
+  return link.dir == model::Direction::in ? link.to : link.from;
+}
+
+// "a->b": a link as the scenario writes it, from and to, the name its pipe's rows carry in the
+// reports (plan 2c Task 5) and its errors quote ("link 'a'->'b' has a bandwidth, ...").
+[[nodiscard]] std::string link_label(std::span<const ResolvedNode> nodes, const ResolvedLink& link);
 
 // Where a splitter (a client, a load balancer or a rate limiter) sends flow and which share
 // goes there. A client's route is per op: `op` names it and `share` is that op's fraction on
@@ -394,7 +416,7 @@ class Graph {
   // nothing for any other node, and for one that has no number (see ResolvedNode::hit_ratio).
   [[nodiscard]] std::optional<double> hit_ratio(std::size_t node) const;
   // The size of one request of `op` at `node`, resolved once at build (plan 2c refinement 1,
-  // detail::size_arrivals): a client's `sizes:` entry or a step's `size:`, kept while the op
+  // detail::size_walk): a client's `sizes:` entry or a step's `size:`, kept while the op
   // keeps its name. Empty for an unsized (node, op), which only a node that counts requests
   // may receive, and for an op that never reaches the node.
   [[nodiscard]] std::optional<Bytes> request_bytes(std::size_t node, std::string_view op) const;
@@ -1609,21 +1631,38 @@ void add_sized_step_seed(const Graph& g, std::size_t node, const model::Step& st
   return seeds;
 }
 
+// Sorted copies of per-place arrival sets: what the size walk hands its readers.
+[[nodiscard]] SizeArrivals sorted_arrivals(const std::vector<std::set<SizeArrival>>& sets) {
+  SizeArrivals sorted(sets.size());
+  for (std::size_t place = 0; place < sets.size(); ++place) {
+    sorted[place].assign(sets[place].begin(), sets[place].end());
+  }
+  return sorted;
+}
+
+// What the size walk found: per node, every way a request arrives at it, and per link (index of
+// Graph::links()), every way a request crosses it, which a pipe (ResolvedLink::pipe) must price in
+// megabytes. A request from `sender` to a node crosses the one link that carries demand between
+// them (Graph::demand_link: one link per pair and direction).
+struct SizeWalk {
+  SizeArrivals at_nodes;
+  SizeArrivals over_links;
+};
+
 // The size walk from every seed at once: a size depends on the path a request took, not on
 // which client sent it.
-[[nodiscard]] SizeArrivals size_arrivals(const Graph& g) {
-  std::vector<std::set<SizeArrival>> arrivals(g.nodes().size());
+[[nodiscard]] SizeWalk size_walk(const Graph& g) {
+  std::vector<std::set<SizeArrival>> at_nodes(g.nodes().size());
+  std::vector<std::set<SizeArrival>> over_links(g.links().size());
   const auto next = [&](const SizeStream& stream) { return next_sizes(g, stream); };
-  const auto record = [&](std::size_t /*sender*/, const SizeStream& stream) {
-    arrivals[stream.node].insert({.op = stream.op, .origin = stream.origin, .size = stream.size});
+  const auto record = [&](std::size_t sender, const SizeStream& stream) {
+    const SizeArrival arrival{.op = stream.op, .origin = stream.origin, .size = stream.size};
+    at_nodes[stream.node].insert(arrival);
+    if (const auto link = g.demand_link(sender, stream.node)) over_links[*link].insert(arrival);
   };
   auto seeds = size_seeds(g);
   walk_calls(std::move(seeds), next, record);
-  SizeArrivals sorted(arrivals.size());
-  for (std::size_t node = 0; node < arrivals.size(); ++node) {
-    sorted[node].assign(arrivals[node].begin(), arrivals[node].end());
-  }
-  return sorted;
+  return {.at_nodes = sorted_arrivals(at_nodes), .over_links = sorted_arrivals(over_links)};
 }
 
 // "op 'get' arrives with two sizes, 1MB from 'a' and 2MB from 'b'", if two of the arrivals of one
@@ -1728,6 +1767,41 @@ void add_sized_step_seed(const Graph& g, std::size_t node, const model::Step& st
   const auto has_no_size = [](const SizeArrival& arrival) { return !arrival.size; };
   if (std::ranges::any_of(arrivals, has_no_size)) return std::nullopt;
   return arrivals.front().size;
+}
+
+// "link 'svc'->'store'": a link as the scenario writes it (link_label), quoted, for a pipe's
+// errors.
+[[nodiscard]] std::string quoted_link(std::span<const ResolvedNode> nodes,
+                                      const ResolvedLink& link) {
+  return "link '" + nodes[link.from].spec.id + "'->'" + nodes[link.to].spec.id + "'";
+}
+
+// A pipe's error for the first request (its arrivals sorted by op, then origin) it cannot price in
+// megabytes (plan 2c refinement 1: an unsized op on a bandwidth link is refused like one at a
+// byte-sized node): an unsized one, naming the client or step that set or dropped its size and
+// what to add, a limiter's counter (no size can fix it), or one of 0 bytes (it would cost nothing,
+// and the engine divides by its megabytes). Nothing for a link without a bandwidth.
+[[nodiscard]] std::optional<EngineError> unpriced_on_pipe(std::span<const ResolvedNode> nodes,
+                                                          const ResolvedLink& link,
+                                                          std::span<const SizeArrival> arrivals) {
+  if (!link.pipe) return std::nullopt;
+  const std::string name = quoted_link(nodes, link) + " has a bandwidth, but ";
+  for (const SizeArrival& arrival : arrivals) {
+    const std::string& origin = nodes[arrival.origin].spec.id;
+    if (!arrival.size && is_limiter_counter(nodes, demand_receiver(link), arrival)) {
+      return EngineError{name + "'" + origin +
+                         "' sends its counter over it: a limiter's counter carries no size"};
+    }
+    if (!arrival.size) {
+      return EngineError{name + "op '" + arrival.op + "' from '" + origin +
+                         "' has no size: add size: to the step or sizes: to the client"};
+    }
+    if (!(arrival.size->count > 0.0)) {
+      return EngineError{name + "op '" + arrival.op + "' from '" + origin + "' has size " +
+                         format_size(*arrival.size) + ": a request's size must be positive"};
+    }
+  }
+  return std::nullopt;
 }
 
 // ---- What a che cache's keys are ----
@@ -2103,6 +2177,10 @@ bool Graph::is_async_hop(std::size_t from, std::string_view op, std::size_t to,
                                     AsyncHop{from, std::string{op}, to, std::string{target_op}});
 }
 
+std::string link_label(std::span<const ResolvedNode> nodes, const ResolvedLink& link) {
+  return nodes[link.from].spec.id + "->" + nodes[link.to].spec.id;
+}
+
 std::optional<std::size_t> Graph::demand_link(std::size_t from, std::size_t to) const {
   for (std::size_t i = 0; i < links_.size(); ++i) {
     if (carries_demand(links_[i], from, to)) return i;
@@ -2198,6 +2276,10 @@ Graph::Result Graph::resolve_links() {
         .delay_steps = static_cast<int>(steps),  // fits: steps <= max_delay_steps
         .ops = spec.ops,
         .weight = spec.weight,
+        // C++23 std::optional::transform: maps a present bandwidth through the function and
+        // passes an absent one through as empty, replacing `bandwidth ? optional{f(*bandwidth)}
+        // : nullopt`: a link has a pipe exactly when it has a bandwidth.
+        .pipe = spec.bandwidth.transform(defaults::pipe_capacity),
     });
   }
   return {};
@@ -2389,23 +2471,29 @@ std::optional<double> Graph::hit_ratio(std::size_t node) const {
   return resolved->value;
 }
 
-// Every (node, op)'s one size, from the size walk (detail::size_arrivals), after every route,
+// Every (node, op)'s one size, from the size walk (detail::size_walk), after every route,
 // step and backend exists and after collect_arriving_ops: nodes in scenario order, each node's
 // ops in name order, so the first error is the same on every run. C++23 views::chunk_by splits a
 // node's arrivals (sorted by op) into runs of one op each, replacing a hand-written loop that
 // tracks where each run starts; each run is contiguous, so it is passed on as a span. Then
 // every op that arrives at a byte-sized node must have a size, however it arrived
-// (check_sized_arrivals).
+// (check_sized_arrivals), and every request a bandwidth link carries must have one, links in
+// scenario order (detail::unpriced_on_pipe: a pipe prices megabytes, plan 2c refinement 3).
 Graph::Result Graph::resolve_request_sizes() {
-  const auto arrivals = detail::size_arrivals(*this);
+  const auto walk = detail::size_walk(*this);
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
-    for (const auto op_arrivals : arrivals[node] | std::views::chunk_by(detail::same_op)) {
+    for (const auto op_arrivals : walk.at_nodes[node] | std::views::chunk_by(detail::same_op)) {
       const std::span<const detail::SizeArrival> one_op{op_arrivals};
       auto size = detail::resolved_size(nodes_, node, one_op);
       if (!size) return std::unexpected{std::move(size.error())};
       if (*size) request_bytes_[node].emplace(one_op.front().op, **size);
     }
     if (auto checked = check_sized_arrivals(node); !checked) return checked;
+  }
+  for (std::size_t link = 0; link < links_.size(); ++link) {
+    if (auto unpriced = detail::unpriced_on_pipe(nodes_, links_[link], walk.over_links[link])) {
+      return std::unexpected{std::move(*unpriced)};
+    }
   }
   return {};
 }
