@@ -102,4 +102,20 @@ that would make the percentile jump where the threshold is crossed).
 - `algorithm: sliding_log` with `window: 500ms`: the same 1k/s in half-second windows. The
   lump at each window's start shrinks to 180 (api backlog 60, 62 s red), but it comes twice
   as often: p99 116 ms, still a FAIL.
-- `simsys sweep --param nodes.limiter.algorithm=... --metric api.utilization` (phase 2c).
+- Sweep the bucket's size (an algorithm is a word, which `sweep` cannot range over; edit it by
+  hand as above):
+
+  ```
+  $ simsys sweep scenarios/labs/rate-limiter/scenario.yaml --param nodes.limiter.burst=100..500:5 \
+        --metric clients.call.mean --metric api.mean_rho
+  nodes.limiter.burst  clients.call.mean  api.mean_rho
+  ----------------------------------------------------
+  100                             5.79ms         0.682
+  200                             5.94ms         0.682
+  300                             6.19ms         0.682
+  400                             6.52ms         0.682
+  500                             6.71ms         0.682
+  ```
+
+  The api does the same work at every size (the bucket admits the same total); what a bigger
+  bucket changes is how much of it arrives at once, and so the wait.

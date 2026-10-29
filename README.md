@@ -10,20 +10,25 @@ reproducible. Built to practise the systems in
 *System Design Interview* (Alex Xu, vol. 1) and, at the same time, to study and teach
 C++20/23: modules, concepts, ranges, coroutines, `std::expected` and friends.
 
-Status: phase 2b. Clients follow rate curves (daily waves, ramps, scripted spikes,
-replayed points) with seeded Ornstein–Uhlenbeck noise and state the key popularity they
-ask for (Zipf or uniform); nodes charge a per-op `cost`. Next to clients and services run
-load balancers (four policies), rate limiters (the five algorithms of ch. 4, with a counter
-store), caches (a fixed hit ratio or one computed with the Che approximation from the
-clients' keys; every write strategy including write-back; `then` steps), SQL databases (a
-primary and read replicas, shards, a connection pool, replication lag and staleness), CDNs
-that fetch their misses from an origin, and id generators (snowflake, ticket server, uuid).
-Refused requests are counted apart from dropped ones (`reject_rate`), and a request counts
-as answered unless it was refused or dropped. Ten scenarios run end to end, the
-[URL shortener](scenarios/book/url-shortener/) of ch. 8 among them (list below); the other
-four book systems validate and `explain`, waiting for the rest of phase 2c (`sweep`) and
-phase 3. The scenario language is
-[`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.3).
+Status: phase 2c (bytes, queues and workers, external sinks, sweep), the last part of phase 2.
+Clients follow rate curves (daily waves, ramps, scripted spikes, replayed points) with seeded
+Ornstein–Uhlenbeck noise, state the key popularity they ask for (Zipf or uniform) and the size
+of each op (`sizes: {stream: 50MB}`), and may give up after a `timeout`; nodes charge a per-op
+`cost`. Next to clients and services run load balancers (four policies), rate limiters (the five
+algorithms of ch. 4, with a counter store), caches (a fixed hit ratio or one computed with the Che
+approximation from the clients' keys; every write strategy including write-back; `then` steps),
+SQL databases (a primary and read replicas, shards, a connection pool, replication lag and
+staleness), CDNs and blob stores sized in bytes, links with a `bandwidth` (a pipe that queues and
+drops megabytes), message queues and the worker pools that consume them, external sinks,
+key-value clusters (ring, replication and quorums), search indexes and id generators. A step after
+a failed step does not run, refused, dropped and timed-out requests are counted apart
+(`reject_rate`, `drop_rate`, `timed_out_per_s`), and an SLO can be checked per window (`over: 1h`).
+`simsys sweep` runs a scenario over a range of one key, the points in parallel. Ten scenarios run
+end to end, five of the eight book systems among them (list below); chat-system, google-drive,
+notification-system and web-crawler validate and `explain`, and wait for phase 3's types
+(`ws_gateway`, `service_discovery`, `notification_fanout`, `frontier`). 1131 tests (Catch2, via
+`ctest`). The scenario language is
+[`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.4).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
 
@@ -207,8 +212,8 @@ $ simsys explain scenarios/book/youtube/scenario.yaml
   cdn_eu->transcoded_store  peak offered 2.856k MB/s vs 5k MB/s  (57.1%, green)
 ```
 
-Only a URL frontier's and a notification fan-out's onward load is still left out (types with
-no phase yet): what lies behind them is marked `(load not propagated: frontier is not modelled
+Only a URL frontier's and a notification fan-out's onward load is still left out (phase 3
+types): what lies behind them is marked `(load not propagated: frontier is not modelled
 yet)`, with no percentage when nothing else reaches it and a lower bound (`≥1%`) otherwise.
 
 What runs today: clients, services, load balancers, rate limiters, caches (a fixed or a
@@ -238,7 +243,8 @@ end:
   put p99 2.31 ms; every SLO passes (at the book's 8 machines it drops a ninth: "Things to try").
 - [`book/url-shortener`](scenarios/book/url-shortener/): ch. 8 over 24 hours at 12.8k/s
   (peak 19.2k/s): limiter, 8 stateless web servers, a Che cache (h = 0.881), snowflake ids
-  and a SQL database in 3 shards; both SLOs pass (redirect p99 7.49 ms, nothing dropped).
+  and a SQL database in 3 shards; all three SLOs pass (redirect p99 7.49 ms, nothing dropped, the
+  database at 0.6433 in its worst hour, 13:02-14:02, against `max: 0.9, over: 1h`).
 - [`book/youtube`](scenarios/book/youtube/): ch. 14 over 24 hours in bytes: two CDNs, blob
   stores, a 40 Gbit/s cross-DC origin link, the transcoding queue and 600 workers, the metadata
   tier. Every SLO passes (exit 0): European stream p99 465 ms, `transcode_q` 573 ms behind at
@@ -256,10 +262,10 @@ end:
   100 ms, nothing dropped); the busiest node is on the data-gathering side, the log aggregators at
   60 % at the peak (6 workers; at 4 they sit on the red threshold, 90 %).
 
-Every other node type (WebSocket gateways, ...) already validates and appears in
-`explain` with its resolved numbers, but `estimate` and `run` stop with "which run/estimate do
-not support yet (phase 2)" and exit 1. A `sweep` command
-(`--param nodes.users.rate.base=1k/s..100k/s:10`) is planned for phase 2c.
+The four phase 3 types (WebSocket gateways, service discovery, notification fan-outs and URL
+frontiers) already validate and appear in `explain` with their resolved numbers, but `estimate`,
+`run` and `sweep` stop with "which run/estimate do not support yet" and exit 1, as do the four book
+systems that need them. Faults, retries, `on: failure` steps and kv partitions are phase 3 too.
 
 ## Toolchain
 

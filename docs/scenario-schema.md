@@ -1,13 +1,53 @@
-# Scenario schema v1.3 (phase 2b)
+# Scenario schema v1.4 (phase 2c)
 
 v1 was fitted to the 12 book and lab drafts plus the first tutorial; v1.1 wrote down the
 rules the phase 1 loader enforces; v1.2 added phase 2a's rate curves, balancers, limiters and
-fixed-ratio caches. **v1.3** is the language as phase 2b reads it: the loader
-(`src/config/config.cpp`), the graph builder (`src/engine/graph.cppm`), the node behaviours
-(`src/engine/behaviours.cppm`) and the reports (`src/report/report.cpp`). All 14 files under
-`scenarios/` load under it, and six of them run end to end ([below](#what-runs-in-phase-2b)).
-The design decisions behind the new rules, with what each ignores, are spec §18
-(`docs/superpowers/specs/2026-10-27-system-sim-design.md`).
+fixed-ratio caches; v1.3 phase 2b's Che caches, SQL databases, CDNs and id generators.
+**v1.4** is the language as phase 2c reads it: the loader (`src/config/config.cpp`), the graph
+builder (`src/engine/graph.cppm`), the node behaviours (`src/engine/behaviours.cppm`), the
+reports (`src/report/report.cpp`) and the sweep (`src/sweep/sweep.cpp`). All 14 files under
+`scenarios/` load under it, and ten of them run end to end ([below](#what-runs-in-phase-2c)).
+The design decisions behind the new rules, with what each ignores, are spec §18 (phase 2b) and
+§19 (phase 2c) (`docs/superpowers/specs/2026-10-27-system-sim-design.md`).
+
+New in v1.4:
+
+- **bytes**: a client's [`sizes`](#node-types) (`{stream: 50MB}`) and a step's
+  [`size`](#steps) give requests a size, resolved once per (node, op) at build
+  ([Request sizes](#steps)); a byte [`capacity`](#node-common-keys) on a `cdn` or a
+  `blob_store` (and a blob store's default) makes the node count **megabytes**: its queue waits
+  for whole objects, a write is answered at its last byte and a read at its first megabyte; a
+  [byte rate](#values) may be written in bits (`40Gbit/s`), and sizes (`200B`, `1.5GB`) are a
+  value kind of their own;
+- a link's [`bandwidth`](#links) is a **pipe**: one deterministic server in megabytes that queues
+  and drops, with a row of its own in `run`'s `links` table, JSON's `links`, the series and
+  `explain`'s checks;
+- [`message_queue`](#message_queue-and-worker_pool) (`retention`, default 7 days; `partitions`
+  printed, not modelled) and [`worker_pool`](#message_queue-and-worker_pool) (`consumes`,
+  `workers`, `cost` as a duration per job, `then` steps that fire for every job drained): a
+  publisher is answered at the append, every consumer group gets every message, and nobody waits
+  for a pool; a queue's [lag](#queue-lag), the `queue_lag` SLO, the table's `peak_lag` column,
+  JSON's `peak_queue_lag_s` and the series' `queue_lag_s`;
+- a `blob_store`'s `then` steps run as asynchronous **event notifications**, one per write it
+  stores ([Node types](#node-types)), and `write_ops` on a blob store says which ops are writes;
+- [`external_sink`](#node-types): a third party's API that fails `failure_rate` of what it serves,
+  counted as drops (`politeness` printed, not modelled);
+- [`kv_cluster`](#kv_cluster): `nodes`, `vnodes`, `replication`, `write_quorum`, `read_quorum`,
+  `mode` (printed, not modelled) and `write_ops`; the ring's hottest machine as its own queue, a
+  quorum's latency and losses over its request's real replica set;
+- [`search_index`](#search_index), served like a service (`build_interval` printed, not modelled);
+- **a step after a failed step does not run** ([Steps](#steps)): each step is sent only what the
+  steps before it delivered, and the parallel steps of an op must be adjacent;
+- a client's [`timeout`](#drops-and-rejections): the slow tail of each step's response is timed
+  out, not answered (`timed_out_per_s` in JSON, the series and `run`'s `timed out/s` column),
+  percentiles are capped at it, and a latency SLO whose quantile timed out fails;
+- an SLO's [`over`](#slo): the SLO is checked per window and the worst window decides
+  (`(worst 1h from 13:02)`, JSON's `window_start_s`);
+- [`simsys sweep`](#command-line-simsys-sweep-phase-2c): one scenario over a range of one key, the
+  points run in parallel;
+- the duration unit `d` (a day), the [step rule of thumb](#top-level) in the `step` row, and the
+  runnable set: the six of v1.3 plus `book/youtube`, `book/news-feed`,
+  `book/search-autocomplete` and `labs/kv-store`.
 
 New in v1.3:
 
@@ -35,7 +75,7 @@ New in v1.3:
   (dropped or rejected), so a request waiting in a growing queue still counts;
 - `explain`'s marks: a node whose load comes only through a type that does not propagate it yet
   is marked `(load not propagated: ...)` with no percentage, a node that is partly fed so gets
-  its percentage as a lower bound `(≥p%; ...)` ([below](#what-runs-in-phase-2b)), and a node
+  its percentage as a lower bound `(≥p%; ...)` ([below](#what-runs-in-phase-2c)), and a node
   whose capacity is a byte rate is checked in MB/s (from phase 2c; see `capacity` in
   [Node (common keys)](#node-common-keys));
 - the runnable set: `tutorial/hello`, `tutorial/chain`, `labs/rate-limiter`,
@@ -60,13 +100,13 @@ Two kinds of marks:
   **checked** means the loader validates it but nothing uses it yet; **ignored** means the
   key is accepted (a misspelt key is still an error) and its value is not looked at.
 
-## What runs in phase 2b
+## What runs in phase 2c
 
 `simsys validate` runs the loader only. `explain`, `estimate` and `run` also build the
 graph, which adds the checks marked *(graph)* below. `explain` works for every node type.
-`estimate` and `run` step these types:
+`estimate` and `run` (and so `sweep`) step these types:
 
-| type | runs in phase 2b |
+| type | runs in phase 2c |
 |---|---|
 | `client` | the whole rate curve, with its seeded noise |
 | `service` | ops, steps, per-op `cost` |
@@ -88,19 +128,30 @@ Everything else is refused before the first step, with exit code 1:
 | what | message | runs from |
 |---|---|---|
 | `ws_gateway`, `service_discovery` | `node 'x' has type 'ws_gateway', which run/estimate do not support yet (phase 2)` | 3 |
-| `notification_fanout`, `frontier` | the same message | not yet assigned to a phase |
+| `notification_fanout`, `frontier` | the same message | 3 |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
 | `faults` | none: the list is accepted and nothing happens | 3 |
 
-The type message says "(phase 2)" for every type; the last column is the plan. The type check
-runs over the whole file first, and names the first node in file order whose type cannot run;
-only then are the nodes of runnable types checked (a CDN's `keys`), in file order: google-drive
-is refused at its `ws_gateway`, `long_poll`, the first type it has no model of. Of the 14
-shipped scenarios ten run: `tutorial/hello`, `tutorial/chain`, `labs/rate-limiter`,
-`labs/consistent-hashing`, `labs/unique-id` (which fails its `drop_rate` SLO on purpose, exit 2),
-`book/url-shortener`, since phase 2c Task 7 `book/youtube` (its README numbers are Task 16's),
-since Task 10 `labs/kv-store` and `book/news-feed` (which runs its day and fails its
-`drop_rate` SLO, exit 2, until Task 17 sizes it), and since Task 11 `book/search-autocomplete`.
+The type message says "(phase 2)" for every type; the last column is the plan (the phase 3
+backlog of the 2c plan). The type check runs over the whole file first, and names the first node
+in file order whose type cannot run; only then are the nodes of runnable types checked (a CDN's
+`keys`), in file order: google-drive is refused at its `ws_gateway`, `long_poll`, the first type
+it has no model of, chat-system at its `service_discovery`, notification-system at its
+`notification_fanout` and web-crawler at its `frontier`. Of the 14 shipped scenarios ten run
+(`exit` is `simsys run`'s exit code, Release build):
+
+| scenario | exit | what it shows |
+|---|---|---|
+| `tutorial/hello` | 0 | one M/M/1 service |
+| `tutorial/chain` | 0 | two services in a chain |
+| `labs/rate-limiter` | 0 | ch. 4's token bucket against three spikes |
+| `labs/consistent-hashing` | 0 | ch. 5's ring over four Che caches |
+| `labs/unique-id` | **2** | ch. 7's ticket server overloaded **on purpose**: its `drop_rate` SLO fails (0.3391) and so does its p99, every delivered id timing out at the 50 ms timeout |
+| `labs/kv-store` | 0 | ch. 6's Dynamo-style store on 16 machines |
+| `book/url-shortener` | 0 | ch. 8 over a day, with a windowed utilization SLO |
+| `book/youtube` | 0 | ch. 14 in bytes: CDNs, blob stores, a bandwidth link, a transcoding queue and pool |
+| `book/news-feed` | 0 | ch. 11's fan-out on write through a queue, with a kv_cluster for the graph |
+| `book/search-autocomplete` | 0 | ch. 13's trie cache, search index and query-log pipeline |
 
 **`estimate` versus `explain`.** `estimate` evaluates the long-run state once, at
 t = 0 (00:00): the rate curve's value there, without noise. Its first line says so:
@@ -125,10 +176,12 @@ caches and CDNs (their misses, their store, a cache's `then`), along a `blob_sto
 consumer groups (a copy of every message, as the engine delivers) and along a `worker_pool`'s
 `then` (every step for every job the pool is **offered**: the paper load does not queue, so a
 pool offered more than its `workers / cost` is red on its own line and still passes all of it on;
-youtube's 400 transcoders are offered 9.6 uploads/s, `9.6/s vs 6.667/s  (144%, red)`, and their
-renditions bring `transcoded_store` to `9.811k MB/s (196.2/s) vs 10k MB/s  (98.1%, red)`; the
-engine forwards what a pool drains, at most its capacity). They do **not** follow the `then` of a
-`notification_fanout` or a `frontier` (types with no phase yet). A node whose load can only come
+youtube's 600 transcoders are offered 9.6 uploads/s at the 21:00 peak, `9.6/s vs 10/s  (96%,
+red)`, and their renditions bring `transcoded_store` to `9.811k MB/s (196.2/s) vs 20k MB/s
+(49.1%, green)`; at the 400 workers of its README's sweep the pool reads `9.6/s vs 6.667/s
+(144%, red)` and still hands on all 9.6/s on paper, while the engine forwards what a pool drains,
+at most its capacity). They do **not** follow the `then` of a
+`notification_fanout` or a `frontier` (types of phase 3). A node whose load can only come
 through one of those gets 0 on paper: a number that is missing, not zero. Its check line therefore
 has no percentage and no zone, but a mark naming each such type on the way to it, nearest first:
 `dns  peak offered 0/s vs 100k/s total capacity  (load not propagated: frontier is not modelled
@@ -190,7 +243,7 @@ copy or machine): they would be lower bounds too.
 | `name` | string | yes | read | non-empty; shown in reports |
 | `seed` | integer | no | read | default 1; within the range of `int`. Printed by `explain`; seeds every client's `rate.noise` (`run --seed N` and `curve --seed N` override it). Client `i` (its index among all nodes, in file order) gets the engine seed `(seed × 0x9E3779B97F4A7C15) XOR i` mod 2^64, so appending a node at the end of the file never changes another client's noise (inserting one before a client shifts that client's index, and so its noise) |
 | `duration` | duration | yes | read | simulated span of `run`; must be positive |
-| `step` | duration | no | read | default `100ms`; must be positive |
+| `step` | duration | no | read | default `100ms`; must be positive. A rule of thumb (plan 2c refinement 16; the derivation and a measured lab are in [numerics, "Choosing the step"](study/numerics.md)): a step is a lump the model cannot see inside, so make it shorter than what you want to see. A token bucket of `burst` B under a peak offered rate `λ` above its `limit` L empties in `B / (λ − L)`, and a longer step passes the whole burst in its first step (a 2,000-token burst at `step: 1s` does), so `step ≤ B / (λ_peak − L)`; for a queue, `step ≤` a tenth of the shortest spike. Shorter steps cost run time, not accuracy of the totals: conservation holds at any step |
 | `warmup` | duration | no | read | steps before it are left out of the report; default 0; must be shorter than `duration`, so the report never covers an empty window (`run --duration` obeys the same rule) |
 | `datacenters` | map | no | read | see below; default: one datacenter `main` |
 | `nodes` | map id → node | yes | read | non-empty; ids are non-empty and unique |
@@ -251,10 +304,10 @@ A **step** is `{to: <node id>, op: <op name>, on: always|miss|failure, mode: seq
 |---|---|---|---|
 | `to` | required | read | a declared node, **not the node itself** (a retry, the one reason to call yourself, is `client.retries`); *(graph)* not a client (clients only send) |
 | `op` | the incoming op | read | required in `then` steps, which have no incoming op to inherit |
-| `on` | `always` | read | `miss` applies to the flow a cache did not serve, `failure` to failed requests. In an op's step list, an `on: miss` step belongs to the nearest unconditional step before it, its lookup, which must ask a `cache` for a read, leave the miss to the application, and be waited for. *(graph)* `node 'web': an 'on: miss' step must follow a cache step`; `... cannot follow a write to cache 'c' (writes do not miss)`; `... cannot follow read_through cache 'c' (the cache already fetched the miss)`; `... cannot follow cdn 'edge' (the cdn already fetched the miss from its origin)` (a CDN fetches its own misses, see [`cdn`](#cdn)); `... and the cache step it follows must be sequential (the miss step waits for the cache's answer)`. A miss step is taken by the miss fraction `1 − h` of the requests (`h` the cache's hit ratio, stated or [resolved at build](#che-hit-ratios); a cache built in code without one counts as `h = 0`, and `explain` marks the checks that rest on it). After a lookup of `factor: k` it sends `k(1 − h)` requests per request: every missed lookup is fetched. Several `on: miss` steps after one lookup form one block that a miss takes whole, one step after another: the response adds `1 − h` × the sum of their hops on average, with the hit/miss spread in the variance, and a miss is answered only if every fetch is. (For latency, a request's `k` lookups are assumed to hit or miss together.) `failure` steps never fire before phase 2c |
+| `on` | `always` | read | `miss` applies to the flow a cache did not serve, `failure` to failed requests. In an op's step list, an `on: miss` step belongs to the nearest unconditional step before it, its lookup, which must ask a `cache` for a read, leave the miss to the application, and be waited for. *(graph)* `node 'web': an 'on: miss' step must follow a cache step`; `... cannot follow a write to cache 'c' (writes do not miss)`; `... cannot follow read_through cache 'c' (the cache already fetched the miss)`; `... cannot follow cdn 'edge' (the cdn already fetched the miss from its origin)` (a CDN fetches its own misses, see [`cdn`](#cdn)); `... and the cache step it follows must be sequential (the miss step waits for the cache's answer)`. A miss step is taken by the miss fraction `1 − h` of the requests (`h` the cache's hit ratio, stated or [resolved at build](#che-hit-ratios); a cache built in code without one counts as `h = 0`, and `explain` marks the checks that rest on it). After a lookup of `factor: k` it sends `k(1 − h)` requests per request: every missed lookup is fetched. Several `on: miss` steps after one lookup form one block that a miss takes whole, one step after another: the response adds `1 − h` × the sum of their hops on average, with the hit/miss spread in the variance, and a miss is answered only if every fetch is. (For latency, a request's `k` lookups are assumed to hit or miss together.) `failure` steps never fire before phase 3 (faults and retries), and the size walk skips them |
 | `mode` | `sequential` | read | sequential steps add their latencies; **the parallel steps of an op form one group** and must be adjacent (before, between or after the sequential ones), and the group costs its slowest branch. *(graph)* `node 'web': the parallel steps of op 'get' must be adjacent (they form one group)`; for `then` steps, `node 'c': the parallel then steps must be adjacent (they form one group)` |
 | `factor` | 1 | read | finite, positive, at most `1e6`; multiplies the flow (fan-out: one post → 100 feed writes) |
-| `size` | none | checked | a [size](#values): the payload this step's request carries (a transcoder's 50 MB rendition), what a byte-sized node charges the request, in MB; positive (`step size must be a size (B, KB, MB or GB: 50MB): missing size unit`, the parser's reason after the colon; `step size must be positive` for `0B`) |
+| `size` | none | read | a [size](#values): the payload this step's request carries (a transcoder's 50 MB rendition), what a byte-sized node charges the request, in MB; positive (`step size must be a size (B, KB, MB or GB: 50MB): missing size unit`, the parser's reason after the colon; `step size must be positive` for `0B`) |
 
 **A step after a failed step does not run** *(phase 2c)*: a request is answered only if every
 step it waits for is, so each step is sent only the requests the steps before it delivered
@@ -466,7 +519,7 @@ browser, a miss goes on to the load balancer).
 |---|---|---|---|
 | `always` (default) | every op, `× factor`, as `step.op` | own + the hop (two link legs + the target's response) for every request; the `mode: parallel` ones form **one group**, the slowest of which is waited for after the store hop and the sequential steps (they overlap one another, never the store hop) | × the target's delivered fraction |
 | `miss` | `(1 − h) × factor` of each **read**; writes do not miss and send nothing | the mixture `{h: own, 1 − h: own + hop}`; several miss steps form one block that a miss takes in turn, so each must be sequential | `(1 − f) + f × Π d` over the block, `f = 1 − h` |
-| `failure` | nothing before phase 2c | — | — |
+| `failure` | nothing before phase 3 | — | — |
 
 Refused at build *(graph)*:
 
@@ -603,7 +656,10 @@ A CDN with a byte `capacity` counts megabytes (see `capacity` in
 and saturates at 2k streams/s of 50 MB; its queue waits for whole streams (one holds a slot
 0.5 s) and a stream, a read, is answered at its first megabyte.
 
-Not modelled: link bandwidth (phase 2c), the transfer time of a stream beyond its first megabyte,
+The wire behind a CDN is a link's business: give the link to the origin a `bandwidth` and it is
+a pipe of its own ([Links](#links)), as youtube's cross-DC `cdn_eu->transcoded_store` is.
+
+Not modelled: the transfer time of a stream beyond its first megabyte,
 TTL expiry and the stale content it serves, a cold
 edge, invalidation and purges, the choice of the nearest point of presence (the client's links
 say which CDN it uses), and the CDN's price.
@@ -858,7 +914,7 @@ log; google-drive's two groups on `notify_q` each get all of it), as the same op
 queue to a pool is **asynchronous**: the publisher's response and answered rate end at the append,
 and what a pool loses counts in its own drop rate only. A `worker_pool` is **M/M/c over
 consumption** (spec §7: "capacity = workers / job cost"): `c = workers`, service time `cost`,
-rate `workers / cost` (youtube's 400 transcoders at `cost: 60s` drain 400 / 60 s = 6.667
+rate `workers / cost` (youtube's 600 transcoders at `cost: 60s` drain 600 / 60 s = 10
 videos/s). What a group has not drained waits in **its pool's queue**, whose waiting room is the
 queue's `retention` × the pool's rate (a message older than `retention` is deleted unconsumed:
 those are the pool's drops); each group's room is its own. Worked: 1k messages/s into 4 workers
@@ -913,8 +969,8 @@ full it **drops** messages, where a real consumer pulls at its own pace and only
 Kafka group lags, it loses nothing before `retention`); leave queue → pool links without one.
 `explain` says what each number is: `retention=7d (default: Kafka's 168 h) partitions=32 (not
 modelled)` on the queue (a retention of whole days in days, any other as other durations),
-`capacity=6.667/s (workers / cost)  service_time=1m (cost)  c=400 (workers)  queue_limit=4.032M
-(retention × capacity) ... consumes=transcode_q  workers=400 cost=1m` on the pool (a room of a
+`capacity=10/s (workers / cost)  service_time=1m (cost)  c=600 (workers)  queue_limit=6.048M
+(retention × capacity) ... consumes=transcode_q  workers=600 cost=1m` on the pool (a room of a
 million or more with an SI prefix, as a count). A queue's
 **lag**, how long a message published now waits until its slowest group reads it, is read off its
 pools every step
@@ -936,7 +992,7 @@ rate:
 ```
 All keys are **read**: the loader types them, `explain` and `simsys curve` print them, and
 `run` offers the curve (with its noise) at every step. `estimate` evaluates it once, at t = 0, without noise
-(see [What runs](#what-runs-in-phase-2b)).
+(see [What runs](#what-runs-in-phase-2c)).
 
 Composition: `rate(t) = level(t) × wave(t) × Π active spike factors × noise(t)`, where
 `level` is the ramp's rate `from + (to − from) × min(t / over, 1)` when there is a ramp,
@@ -970,7 +1026,7 @@ header names the span: `checks (peak offered load over the first 24h, no queuein
 
 ## Links
 
-`{from, to, dir: in|out|inout (default out), ops: [..] (default all), latency, bandwidth †, weight}`.
+`{from, to, dir: in|out|inout (default out), ops: [..] (default all), latency, bandwidth, weight}`.
 
 | key | status | rule |
 |---|---|---|
@@ -978,7 +1034,7 @@ header names the span: `checks (peak offered load over the first 24h, no queuein
 | `dir` | read | the direction **demand** travels. `out`: `from` sends to `to`. `in`: `to` sends to `from`; the link is written from the receiver's side. `inout`: like `out`, and replies flow back on the same link (the normal request/response case). The engine charges every hop a request leg and a reply leg (2 × one-way) whatever `dir` says |
 | `ops` | read | a non-empty list of distinct op names; absent means all ops. `ops: []` is an error (it would load as "all", the opposite of what it says) |
 | `latency` | read | **one way**. Default: half the round trip, `intra_dc_rtt / 2` = 250 µs inside a datacenter, `cross_dc_rtt / 2` = 75 ms across |
-| `bandwidth` † | read | a positive [byte rate](#values), in bytes or bits (`40Gbit/s` = 5e9 B/s): `bandwidth must be positive`, `bandwidth must be at most 1e15B/s`, `bandwidth is a byte rate (B/s, or bit/s for a network: 40Gbit/s)`. From phase 2c the link is a **pipe** that queues and drops megabytes (below). *(graph)* Every op the link carries needs a size: `link 'a'->'b' has a bandwidth, but op 'ping' from 'a' has no size: add size: to the step or sizes: to the client` (the sender named is the client or the renaming step that set or dropped the size). `explain` prints `bandwidth=1Gbit/s (125MB/s)` (the bit form with the largest prefix, G, M or k, of which bytes × 8 is a whole number: `1.5Gbit/s` prints `1500Mbit/s (187.5MB/s)`; the bytes alone when none is). A limiter's counter cannot cross a pipe (it has no size): `link 'limiter'->'store' has a bandwidth, but 'limiter' sends its counter over it: a limiter's counter carries no size, so its backend link cannot have a bandwidth; remove it` |
+| `bandwidth` | read | a positive [byte rate](#values), in bytes or bits (`40Gbit/s` = 5e9 B/s): `bandwidth must be positive`, `bandwidth must be at most 1e15B/s`, `bandwidth is a byte rate (B/s, or bit/s for a network: 40Gbit/s)`. From phase 2c the link is a **pipe** that queues and drops megabytes (below). *(graph)* Every op the link carries needs a size: `link 'a'->'b' has a bandwidth, but op 'ping' from 'a' has no size: add size: to the step or sizes: to the client` (the sender named is the client or the renaming step that set or dropped the size). `explain` prints `bandwidth=1Gbit/s (125MB/s)` (the bit form with the largest prefix, G, M or k, of which bytes × 8 is a whole number: `1.5Gbit/s` prints `1500Mbit/s (187.5MB/s)`; the bytes alone when none is). A limiter's counter cannot cross a pipe (it has no size): `link 'limiter'->'store' has a bandwidth, but 'limiter' sends its counter over it: a limiter's counter carries no size, so its backend link cannot have a bandwidth; remove it` |
 | `weight` | read | finite, ≥ 0, at most 1e9; default 1. When several links from a **client, load balancer or rate limiter** carry the same op, the op is split `weight_i / Σ weight` over them. 0 means a drained backend: the route carries nothing, so it brings no op to its target, closes no call cycle and imposes no replica model (a balancer's policy, below). *(graph)* An op whose every link has weight 0 is an error (`client 'u': every link carrying op 'read' has weight 0`; `node 'lb': ...` for a balancer). A service's steps and a cache's or limiter's backend name their target, so a weight there has no effect |
 
 **One link per pair and demand direction.** A second link between the same two nodes in
@@ -1048,7 +1104,7 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 | `p50_latency`, `p95_latency`, `p99_latency` | required, a **client** | optional, one the client sends | duration | the client's estimated end-to-end percentile over the **answered** requests; without `op`, the worst of its ops. Behind a client `timeout`, a percentile at quantile q of whose op more than 1 − q of the delivered requests timed out (more than 1 % for a p99) fails whatever its `max`, observing the timeout, with a note: `57.3% of delivered requests timed out (more than 1%)` (see [Drops and rejections](#drops-and-rejections)) |
 | `drop_rate` | optional | not allowed | number in [0, 1] | the node's dropped / the work sent to it, after warmup; without `node`, the worst node's or bandwidth link pipe's (a `node` names a node only) |
 | `reject_rate` | optional | not allowed | number in [0, 1] | **new in v1.2**: the node's rejected (a rate limiter's refusals, a leaky bucket's overflow included) / the requests sent to it, after warmup; without `node`, the worst node's |
-| `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup |
+| `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup, of the copy the node reports: behind a `consistent_hash` balancer the **hottest copy** (`k = 1 + z_M/√vnodes` × the average share, z_M the expected maximum of M standard normals, see [`load_balancer`](#load_balancer)), on a `kv_cluster` its hottest machine (`k = min(1 + z_M/√(N·vnodes), nodes/N)`, see [`kv_cluster`](#kv_cluster)), on a `sql_db` the busier kind of copy (primary or replica); a byte-sized node's in megabytes |
 | `queue_lag` | optional; a `message_queue` | not allowed | duration | phase 2c: the named message queue's **peak** lag after warmup, its slowest consumer group's wait (see [Queue lag](#queue-lag)); without `node`, the worst queue's; `skipped` when no message queue ran. A `frontier` is accepted (the web crawler's queue) and skipped until it runs (phase 3); any other node is refused (`slo: queue_lag needs a message_queue node ('svc' is a service)`) |
 | `staleness` | optional; name a `sql_db` | not allowed | duration | phase 2b: the named database's mean staleness after warmup, its write sojourn at the primary + `replication_lag` + its sojourn at a replica (see [`sql_db`](#sql_db)); fails whatever that mean when a replica misses committed writes (it falls behind without bound; the note says how many per replica, of how many committed); `skipped` without a `node` or on a node that keeps no replicated data (any type but `sql_db`); a `sql_db` with `replicas: 1` reports 0 |
 
@@ -1107,9 +1163,12 @@ bound is a promise about the worst moment (`PASS queue_lag q - 50s 1m`, `FAIL qu
 30s`). The node table's `peak_lag` column shows each queue's (`-` on other rows), JSON's nodes
 carry `peak_queue_lag_s` in seconds (`null` on other nodes), and `run --series` ends each row with
 `queue_lag_s`, the step's lag in seconds (empty on every other row, clients and links included).
-youtube's 400 transcoders fall 2.66 h behind by midnight (63.76k videos at 6.667/s = 9,564 s), so
-its 30-minute `queue_lag` SLO fails; a run that stops while the backlog still grows understates
-the day's peak (about 3.0 h near 02:18 there). Ignored: ordering across partitions, a consumer's
+youtube's 600 transcoders (10 videos/s) never build a backlog: at the 21:00 peak (9.6 uploads/s,
+rho 0.96) the lag is the Erlang C wait alone, `PASS queue_lag transcode_q - 573ms 30m`. With 400
+(6.667/s, its README's sweep) the uploads exceed the pool from 15:43 and it falls 2.66 h behind
+by midnight (63.76k videos at 6.667/s = 9,564 s), so the 30-minute SLO fails; a run that stops
+while the backlog still grows understates the day's peak (about 3.0 h near 02:18 there,
+`--duration 27h` shows it). Ignored: ordering across partitions, a consumer's
 commit interval (a group's lag counts from the message's append, not from its last commit).
 
 ### Drops and rejections
@@ -1212,33 +1271,50 @@ simsys sweep scenario.yaml --param <dot.path>=<from>..<to>:<n> --metric <m> [--m
 ```
 
 Runs the scenario once per point, each run exactly as `simsys run` would (the file's duration,
-step, warmup and seed), with one key replaced, and prints one row per point.
+step, warmup and seed), with one key replaced, and prints one row per point: the point's value,
+then one column per `--metric`, in the order given (spec §19 entry 15). It answers the question
+a design review asks after `explain`: *how much of this do I need?*
 
-- `--param`: the key is a dot path through **maps only** (`nodes.users.rate.base`,
-  `nodes.transcoders.workers`); a path through a list (`links.0.latency`) is refused, since list
-  entries have no names. A node whose id contains a dot cannot be swept or measured: the dot
-  splits the path. The key must exist in the file and hold a single value. The range gives
-  `n` (at least 2, at most 10000) evenly spaced points from `from` to `to`, both included; both
-  ends are a number (starting with a digit or `-`) and the same unit text (`100/s..900/s`,
-  `1ms..5ms`, `400..600`), so `100/s..900/s:3` is 100/s, 500/s and 900/s. A key the loader reads
-  as a whole number (a node's `workers`, `replicas`, `partitions`, `keys`, ..., an `advanced`
-  block's `concurrency`) must get a whole number at every point (`400..600:4` is refused: it gives
-  466.67). Each point's value replaces the file's text **before** the loader's checks, so it is
-  validated like a value written in the file; a refused point is reported as
-  `point 2 (nodes.users.rate.base=-1/s): ...`. A value under a YAML anchor (`&a`) is shared with
-  every alias (`*a`): sweeping it through either path sweeps it everywhere the anchor is used.
-- `--metric`: `<client>.<op>.mean` (the op's mean latency as the client sees it),
-  `<node>.mean_rho` (a server's time-averaged utilization) or `<queue>.lag` (a message queue's peak
-  lag after warmup, what the `queue_lag` SLO observes). They are the numbers `run --report json`
-  prints, after warmup.
-- `--jobs`: worker threads (default: the machine's hardware threads). Each point is its own
-  simulation, so the output is the same, byte for byte, for any `--jobs`.
-- `--format`: `table` (latencies and lags as the report's tables print them: `1.61ms`, `<1us`)
-  or `csv` (seconds and ratios, each number the shortest text that reads back to the same double).
-  A number a run did not produce (the mean latency of an op of which nothing was answered) is `-`
-  in the table and an empty cell in the CSV.
+| option | rule | refused with |
+|---|---|---|
+| `--param` | required. `<dot.path>=<from>..<to>:<n>`: the key is a dot path through **maps only** (`nodes.users.rate.base`, `nodes.transcoders.workers`), which must exist in the file and hold a single value; a path through a list (`links.0.latency`) is refused, since list entries have no names, and a node whose id contains a dot cannot be swept or measured (the dot splits the path). The range gives `n` points, at least 2 and at most 10,000, evenly spaced from `from` to `to`, both included; both ends are numbers (each starts with a digit or `-`, so a third dot is an error) with the same unit text (`100/s..900/s`, `1ms..5ms`, `400..600`; `100/s..1k/s` is refused, not converted): `100/s..900/s:3` is 100/s, 500/s and 900/s. A key the loader reads as a whole number (a node's `workers`, `replicas`, `partitions`, `keys`, ..., an `advanced` block's `concurrency`) must get a whole number at every point | `--param: nodes.users.rate.bse: no such key in the scenario`; `--param: links.0.latency: '0' would index a list; a dot path goes through maps only (a list entry has no name)`; `--param: workers must be whole (400..600:4 gives 466.67)`; `--param: 1/s..2/s:20000: at most 10000 points`; `--param: 100/s..1k/s:2: both ends must be the same kind of value in the same unit (100/s and 1k/s)`; `--param: '.5ms' is not a number followed by a unit` (for `1ms...5ms`) |
+| `--metric` | required, repeatable: `<client>.<op>.mean` (the op's mean latency as the client sees it, over the answered requests), `<node>.mean_rho` (a server's time-averaged utilization) or `<queue>.lag` (a message queue's peak lag after warmup, what the `queue_lag` SLO observes). They are the numbers `run --report json` prints, after warmup. Each name is checked against the file before any point runs | a name outside the grammar, or one that does not fit the file: `--metric api.lag: 'api' has type service, not message_queue: only a message queue has a lag` |
+| `--jobs` | worker threads, 1 to 1024; default: the machine's hardware threads | CLI11's range message |
+| `--format` | `table` (latencies and lags as the report's tables print them: `1.61ms`, `<1us`) or `csv` (seconds and ratios, each number the shortest text that reads back to the same double) | |
 
-A sweep reports numbers and judges none: it exits 0 when every point ran, even if an SLO fails at
-some point, and 1 on any error (the file, `--param`, `--metric`, or a point the loader refuses),
-with the message on stderr and nothing on stdout.
+**Each point is a scenario of its own.** The point's value replaces the file's text **before**
+the loader's checks, so it is validated like a value written in the file, and every point is
+loaded and its graph built before any is simulated: a value the loader refuses at the ninth point
+costs no run of the first eight, and names its point (`--param nodes.users.rate.base=-1/s..1/s:3`
+on hello: `point 1 (nodes.users.rate.base=-1/s): scenarios/tutorial/hello/scenario.yaml:7:38: error:
+node 'users': rate.base: expected a non-negative finite number`; a missing key or a bad path is reported once, without a point: every point would fail alike). A
+value under a YAML anchor (`&a`) is shared with every alias (`*a`): sweeping it through either path
+sweeps it everywhere the anchor is used. A number a run did not produce (the mean latency of an op
+of which nothing was answered) is `-` in the table and an empty cell in the CSV.
 
+**Parallel, and the same bytes for any `--jobs`.** The points run on `std::jthread` workers that
+take the next point index from one atomic counter; each point owns its YAML tree, graph,
+simulation and summary, and writes its row into its own slot, so nothing is shared while they run
+and the output is the same, byte for byte, whatever `--jobs` says ([threads](study/threads.md)).
+
+**Exit codes.** A sweep reports numbers and judges none: it exits 0 when every point ran, even if
+an SLO fails at some point, and 1 on any error (the file, `--param`, `--metric`, or a point the
+loader refuses), with the message on stderr and nothing on stdout.
+
+How many transcoders youtube needs (Release build, about 46 s on 14 threads; each point a 24-hour
+day):
+
+```
+$ simsys sweep scenarios/book/youtube/scenario.yaml --param nodes.transcoders.workers=400..600:3 \
+      --metric transcode_q.lag --metric viewers_eu.stream.mean --metric transcoders.mean_rho
+nodes.transcoders.workers  transcode_q.lag  viewers_eu.stream.mean  transcoders.mean_rho
+----------------------------------------------------------------------------------------
+400                                  2.66h                  89.3ms                 0.789
+500                                  39.5m                  89.3ms                 0.692
+600                                  573ms                  89.3ms                 0.599
+```
+
+Only 600 keeps the queue within its 30-minute SLO; the viewers never notice, since nobody waits
+for a transcoder (the hop from the queue to the pool is asynchronous).
+
+Ignored: grids over two keys, geometric spacing, list values, replications per point (phase 3).

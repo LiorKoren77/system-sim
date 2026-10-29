@@ -91,7 +91,9 @@ dropped nor rejected (plan 2c Task 13: no node failed it).
 A link adds its latency to the flow's accumulated mean. If the link latency is shorter
 than `dt` that is all it does; if it is longer (cross-datacenter links at 150 ms with
 `dt` = 100 ms) the flow is also delayed through a ring-buffer delay line of
-`ceil(latency / dt)` steps (revised in phase 1 to `round(one_way / dt)`, see §16). Bandwidth, when given, caps bytes/s and queues the excess like a node.
+`ceil(latency / dt)` steps (revised in phase 1 to `round(one_way / dt)`, see §16). Bandwidth, when given, caps bytes/s and queues the excess like a node (phase 2c: a pipe of one
+deterministic server in megabytes that waits for whole requests and drops past a 1000 MB room;
+a write pays its whole serialisation, any other op its first megabyte; see §19 entry 3).
 
 ### 3.5 End-to-end latency and percentiles
 
@@ -107,8 +109,9 @@ All percentiles are labelled "estimated" in reports.
 - `run`: the time-stepped loop above, producing time series.
 
 Determinism: one seed, one thread per run, floating-point evaluation in fixed order.
-Identical input gives byte-identical output. Replications and sweeps run in parallel
-across seeds.
+Identical input gives byte-identical output. `sweep` runs its points in parallel, each a
+simulation of its own, so its output does not depend on the number of threads (§19 entry 15);
+replications across seeds are phase 3.
 
 ## 4. Core types
 
@@ -164,26 +167,33 @@ programmer should know" table.
 A SQL write uses 5 capacity units of the 5k/s read rate unless the scenario gives it a `cost`:
 the table's "5k reads / 1k writes" for one machine (§18 entry 7).
 
+The per-MB rows price a **byte-sized node** (§19 entry 2): a `cdn` or `blob_store` whose capacity
+is a byte rate counts megabytes, one megabyte taking `network_read_1mb` = 10 ms at a CDN and
+`disk_read_1mb + network_read_1mb` = 40 ms at a blob store (chosen serial: no pipelining), and a
+request costs its size in MB. `third_party_api` is the external sink's (§19 entry 8, at a chosen
+1k/s); the queue's 1M msg/s its append (100 µs chosen), and its `retention` defaults to Kafka's 7
+days (§19 entry 4).
+
 ## 7. Node catalogue (as flow transfer functions)
 
 | Node | Transfer function and knobs | Chapters |
 |---|---|---|
-| `client` | emits the workload curve per op; receives replies, fits percentiles; `timeout` turns the slow fraction into a retry feedback flow (phase 3) | all |
-| `cdn` | (revised, see §18 entry 10) a read-only cache in front of a required `origin`, which fetches its own misses: the hit share `h` (`fixed`, `che` over the CDN's `keys` in objects and the clients' key distribution, or none: `h = 0`) is answered at the edge and the misses `1 − h` go to the origin as the same op (the `read_through` shape of a cache). The ops in `write_ops` (default `write`) are refused at build: content changes at the origin. A service's `on: miss` step after a CDN is refused, since it would fetch each miss twice. `ttl` accepted, not modelled; a byte capacity waits for phase 2c; one instance per `dc`, as the scenario writes it | 1, 14, 15 |
-| `load_balancer` | (revised, see §17) forwards every op over its links, split by link `weight`; the policy sets how the replicas *behind* it queue: `round_robin` / `weighted` independent copies, `least_connections` one pooled M/M/(c·N) queue, `consistent_hash` the hottest copy at `1 + 1/sqrt(vnodes)` × the average, queued apart from the cool ones | all |
+| `client` | (revised, see §19 entries 1 and 12) emits the workload curve per op, each op with an optional size (`sizes`); receives replies, fits percentiles; `timeout` times out the share of each step's fitted response slower than it (answered requests' moments truncated, percentiles capped, a latency SLO failing when its quantile timed out); retries of the timed-out share as a feedback flow are phase 3 | all |
+| `cdn` | (revised, see §18 entry 10 and §19 entry 2) a read-only cache in front of a required `origin`, which fetches its own misses: the hit share `h` (`fixed`, `che` over the CDN's `keys` in objects and the clients' key distribution, or none: `h = 0`) is answered at the edge and the misses `1 − h` go to the origin as the same op (the `read_through` shape of a cache). The ops in `write_ops` (default `write`) are refused at build: content changes at the origin. A service's `on: miss` step after a CDN is refused, since it would fetch each miss twice. `ttl` accepted, not modelled; a byte capacity (`100GB/s`) makes it count megabytes, its queue waiting for whole streams and a stream answered at its first megabyte (§19 entry 2); one instance per `dc`, as the scenario writes it | 1, 14, 15 |
+| `load_balancer` | (revised, see §17) forwards every op over its links, split by link `weight`; the policy sets how the replicas *behind* it queue: `round_robin` / `weighted` independent copies, `least_connections` one pooled M/M/(c·N) queue, `consistent_hash` the hottest copy at `1 + z_M/sqrt(vnodes)` × the average (z_M the expected maximum of M standard normals, §19 entry 9), queued apart from the cool ones | all |
 | `rate_limiter` | (revised, see §17) `token_bucket` (bucket level is fluid state, bursts pass until it empties), `leaky_bucket` (the node's own queue as one deterministic leak slot), `fixed_window`, `sliding_log`, `sliding_counter`, each stepped once per step; rejected flow is its own channel (`reject_rate`), never forwarded and not a drop; an optional counter `backend` sees every checked request | 4, 8, 10 |
 | `service` | per-op cost; downstream steps sequential (latencies add) or parallel (max); `replicas: N` | all |
 | `cache` | (revised, see §17 and §18) hit ratio from `fixed: h` (phase 2a) or `che` (LRU under the key distribution of the clients that reach it, filtered behind another cache, partitioned behind a hash ring; phase 2b); `write_ops` name the writes, every other op is a read; strategy `cache_aside` (misses fetched by the service's `on: miss` step) / `read_through` / `write_through` / `write_around` (phase 2a) / `write_back` (writes acknowledged from memory and flushed to the backend as an asynchronous hop; phase 2b); `then` steps, `always` or `on: miss` (phase 2b) | 8, 11–14 |
 | `sql_db` | (revised, see §18 entries 6–9) one primary and `replicas − 1` read replicas: writes to the primary, reads split over the replicas, every replica replaying the committed writes; a write costs 5 read units by default; `pool` sets `c` and caps the rate by Little's law; `shards` divides the load; staleness = primary sojourn + replication lag + replica sojourn, and a replica that misses committed writes fails the `staleness` SLO | 8, 10–12, 15 |
-| `kv_cluster` | hash ring with virtual nodes → load imbalance factor; replication N amplifies writes; quorum W/R → latency is the W-th (R-th) order statistic of replica latencies; partition → unavailable fraction (CP) or stale fraction (AP) | 6, 11–13 |
-| `message_queue` | backlog level, consumer drain rate, lag = backlog / drain, partitions bound parallelism | 10–12, 14, 15 |
-| `worker_pool` | capacity = workers / job cost; DAG stages chain | 9, 10, 14, 15 |
-| `blob_store` | MB/s capacity; flows in bytes; multipart = parallel branches | 14, 15 |
-| `search_index` | read-mostly capacity; build-vs-serve split | 13 |
+| `kv_cluster` | (revised, see §19 entry 9) `nodes` machines on a hash ring with virtual nodes, the hottest at `min(1 + z_M/√(N·vnodes), nodes/N)` × the average as its own queue; every request goes to N replicas (N capacity units); a write is answered at the W-th fastest, a read at the R-th, of its own replica set (the hot machine in it with probability `N k / nodes`), computed from each machine's fitted lognormal, and lost when fewer than W (R) come back; partition → unavailable fraction (CP) or stale fraction (AP): phase 3 | 6, 11–13 |
+| `message_queue` | (revised, see §19 entries 4, 6 and 14) the broker's append (the publisher is answered there); every consumer group gets every message and its backlog waits in its pool, whose room is `retention`; lag = the wait of a message published now until its slowest group reads it, `max(min(k × Wq, retention), backlog / capacity)`; `partitions` printed, bounding parallelism in phase 3 | 10–12, 14, 15 |
+| `worker_pool` | (revised, see §19 entry 5) M/M/c with c = workers and service time = job cost, capacity = workers / job cost; consumes one queue, takes jobs from nothing else; `then` steps fire for every job drained (DAG stages chain through queues), nobody waiting for them | 9, 10, 14, 15 |
+| `blob_store` | (revised, see §19 entries 2 and 7) MB/s capacity, counting megabytes: its queue waits for whole objects, a write (`write_ops`) is answered at its last byte, a read at its first megabyte, transfers deterministic; `then` steps are asynchronous event notifications, one per write; multipart uploads (parallel branches) not modelled | 14, 15 |
+| `search_index` | (revised, see §19 entry 10) a service with no steps at the type's 5k/s and 5 ms; `build_interval` printed, the build-vs-serve split (rebuild load) not modelled | 13 |
 | `ws_gateway` | connections as a level (connect − disconnect rates); fan-out multiplies message flow by session size | 12 |
 | `service_discovery` | adds lookup latency; failover time on `node_down` | 6, 12 |
 | `id_generator` | (revised, see §18 entry 12) a `service` whose capacity and service time its `algorithm` supplies: `snowflake` 4.096M IDs/s per replica, `ticket_server` one 1k/s database (exactly one replica), `uuid` unbounded | 7, 8, 12 |
-| `external_sink` | latency distribution + failure fraction + per-host politeness rate cap | 9, 10 |
+| `external_sink` | (revised, see §19 entry 8) a queue of the `third_party_api` numbers (1k/s, 100 ms, service SCV 2.0) that fails `failure_rate` of what it serves, counted as drops; the per-host politeness rate cap is printed, modelled in phase 3 | 9, 10 |
 | `notification_fanout` | per-channel split, dedup fraction, retry feedback with DLQ | 10 |
 | `frontier` | URL backlog with politeness rate per host | 9 |
 
@@ -285,7 +295,7 @@ retries). These are provided as scripted faults (`cache_flush`, `timeout_storm`)
 | Designated initializers, `consteval`, `constexpr` containers | defaults table, unit literals (`10k/s`, `0.5ms`) parsed at compile time |
 | `std::span`, `std::string_view`, `std::variant` + `std::visit` | flows, policy dispatch |
 | `std::chrono` | `SimTime`, wall-clock-of-day for diurnal curves |
-| `std::jthread`, `stop_token`, `latch` | replications and sweeps |
+| `std::jthread`, `stop_token`, `latch` | `simsys sweep`'s points on `std::jthread` workers with an atomic work counter (§19 entry 15, `docs/study/threads.md`); `stop_token` and `latch` wait for replications (phase 3) |
 | `std::mdspan` (if available in GCC 14; else skip) | DC latency matrix |
 
 Not used on purpose: raw `new`, macros, exceptions for control flow.
@@ -311,7 +321,8 @@ simsys estimate scenario.yaml [--at 12:00]                  # steady state, inst
 simsys run      scenario.yaml [--seed 7] [--duration 24h] [--report table|json|csv] [--series out.csv]
                                                             # --report csv: phase 2+
 simsys run      scenario.yaml --replications 50 [--jobs 8]  # phase 3
-simsys sweep    scenario.yaml --param nodes.users.rate.base=1k/s..100k/s:10 --metric users.p99
+simsys sweep    scenario.yaml --param nodes.users.rate.base=1k/s..100k/s:10 --metric users.read.mean
+                              [--jobs 8] [--format table|csv]  # §19 entry 15
 ```
 
 `run` prints a per-node table (peak and mean utilization coloured green/yellow/red, peak
@@ -345,6 +356,16 @@ contract for the future GUI.
 | | **Total CLI v1** | **≈ 8 weeks (≈ 15)** |
 | later | GUI reading the series file | 2 months |
 | later | Discrete-event engine behind the same YAML (§15) | 6–8 weeks |
+
+Phase 2 ran as three parts (2a, 2b, 2c; §17–§19), and two types moved forward from phase 3 into
+2c: the **steady state of `kv_cluster`** (ring, replication, quorum latency and losses; §19 entry
+9), because news-feed's friendship graph is one and the book system could not run without it,
+while its partition half (`mode: ap|cp`, sloppy quorum, hinted handoff) needs faults and stays in
+phase 3; and **`search_index`**, which no phase named and which is a service with no steps
+(§19 entry 10), so search-autocomplete runs too. Phase 3 keeps `ws_gateway`,
+`service_discovery`, `notification_fanout` and `frontier`, with them chat-system, google-drive,
+notification-system and web-crawler, and faults, retries and replications. The CLI's `sweep`,
+planned for phase 2, landed in 2c (§19 entry 15).
 
 ## 14. Repository layout
 
@@ -472,8 +493,9 @@ The rules a scenario author meets are in `docs/scenario-schema.md` (v1.2).
    policy becomes the *replica model* of the node behind it: independent copies
    (`round_robin`, `weighted`), one pooled M/M/(c·N) queue (`least_connections`, the
    join-the-shortest-queue ideal), or a hot spot (`consistent_hash`: the hottest copy at
-   `1 + 1/sqrt(vnodes)` × the average, a chosen heuristic that understates the hottest of
-   many copies).
+   `1 + 1/sqrt(vnodes)` × the average in phase 2a; since phase 2c `1 + z_M/sqrt(vnodes)`, z_M the
+   expected maximum of M standard normals, the kv ring's function with one copy per key, §19
+   entry 9).
 6. **Rate limiter.** Every algorithm keeps the state ch. 4 describes and is stepped once
    per step `[now, now + dt)` through `route(in, now, dt)`, with `W = limit × window`
    (window 1 s by default); `burst` sizes the two buckets only and defaults to one
@@ -552,7 +574,7 @@ author meets are in `docs/scenario-schema.md` (v1.3).
    with different specs is a graph error naming them. *Why:* the plan walked demand edges box
    to box, and the Task 2 review found that a writer sharing a service with the cache's
    readers then imposed its keys on the cache, and that the limiter's counter hop counted as
-   client keys. *Ignores:* several distributions mixed by rate (phase 2c), a key space per op,
+   client keys. *Ignores:* several distributions mixed by rate (phase 3), a key space per op,
    any correlation between a client's ops and its keys.
 2. **Che approximation** (Che, Tung & Wang 2002; Fricker, Robert & Roberts 2012 for why it
    holds for LRU). With popularities `p_i` and a cache of `C` keys, the characteristic time
@@ -587,7 +609,8 @@ author meets are in `docs/scenario-schema.md` (v1.3).
 4. **Partitioned caches behind a hash ring** (review of Task 2). `keys` is per replica.
    Behind a `consistent_hash` balancer each key lives on one replica, so the replicas
    partition the key space; the hottest owns `a_hot = k/N` of it (`k = 1 + 1/√vnodes`, the
-   balancer's imbalance of §17 entry 5) and the others `(1 − k/N)/(N − 1)` each, and
+   balancer's imbalance of §17 entry 5; `1 + z_M/√vnodes` since §19 entry 9, which gives 0.920 at
+   `vnodes: 1`) and the others `(1 − k/N)/(N − 1)` each, and
    `h = Σ_j a_j · Che(keys / a_j)`. The hit ratio is concave in the cache size, so uneven arcs
    hit less than one cache of `keys × N`: the consistent-hashing lab's four 2M-key servers give
    0.924 at `vnodes: 1`. Behind any other policy every replica caches the same hot keys, and
@@ -672,12 +695,16 @@ author meets are in `docs/scenario-schema.md` (v1.3).
     build, naming the op and its sender, since content changes at the origin (review I2: an
     `upload` sent through a CDN was otherwise served from the edge); `explain` lists the ops
     a CDN serves. Also refused: a service's miss step after a CDN, a CDN that is its own
-    origin, an origin that calls back into the CDN, and a byte `capacity` (phase 2c). A CDN
+    origin, and an origin that calls back into the CDN. A byte `capacity` was refused by
+    `run`/`estimate` in phase 2b (entry 11); since phase 2c it runs, counting megabytes (§19
+    entry 2). A CDN
     as another CDN's origin is a tiered CDN, whose second tier's `che` is filtered (entry 3).
-    *Ignores:* bytes and bandwidth, TTL expiry (`ttl` is accepted and printed), a cold edge,
+    *Ignores:* bytes and bandwidth (until phase 2c: §19 entries 2 and 3), TTL expiry (`ttl` is
+    accepted and printed), a cold edge,
     purges, ch. 1's "CDN fallback" (phase 3's faults), the choice of the nearest PoP (the
     client's links say which CDN it uses), the CDN's price.
-11. **Byte-derived capacities are not checked** (review I1 of Task 5). `simsys.defaults`
+11. **Byte-derived capacities are not checked** (review I1 of Task 5; superseded in phase 2c by
+    §19 entry 2, which counts megabytes and checks them, so no `not checked` line is left). `simsys.defaults`
     converts a byte rate (`capacity: 100GB/s`, a blob store's default 500 MB/s) into
     requests at an assumed 1 MB per object, which no scenario states. The engine refuses to
     run on such a number, and `explain` prints it tagged with where it came from and gives
@@ -714,12 +741,253 @@ author meets are in `docs/scenario-schema.md` (v1.3).
     a queue dropped, and a backlog is neutral; in a steady state the two agree, and no pinned
     value moved. Transient runs move: the requests that waited out a surge now count, with
     their wait (the rate-limiter lab's p99 30.5 ms, was 29.4 ms).
-15. **Explain marks load it cannot follow** (Task 7, review I1). The paper load does not yet
-    pass through a blob store's or worker pool's `then`, a message queue's consumers, or a
-    fan-out's or frontier's `then`. A node reached only that way prints no percentage and no
-    zone but `(load not propagated: blob_store is phase 2c)`, naming each blocking type once,
-    nearest first, grouped by phase. A node that also gets load the checks follow keeps its
-    percentage as a **lower bound**, `(≥0.559%; load not propagated: ...)`, with no zone
+15. **Explain marks load it cannot follow** (Task 7, review I1). In phase 2b the paper load did
+    not pass through a blob store's or worker pool's `then`, a message queue's consumers, or a
+    fan-out's or frontier's `then`; since phase 2c it follows all of them but the last two
+    (§19 entry 6). A node reached only that way prints no percentage and no zone but a mark
+    naming each blocking type once, nearest first: `dns  peak offered 0/s vs 100k/s total
+    capacity  (load not propagated: frontier is not modelled yet)` (web-crawler). A node that
+    also gets load the checks follow keeps its percentage as a **lower bound**, `frontier  peak
+    offered 50/s vs 5k/s total capacity  (≥1%; load not propagated: frontier is not modelled
+    yet)`, with no zone
     unless it is already red (a red lower bound is red for certain) and no per-copy figures;
-    a `not checked` line adds `(lower bound; ...)`. *Why:* "0 %, green" and "(0.05%, green)"
+    a `not checked` line added `(lower bound; ...)` until phase 2c removed those lines (entry 11). *Why:* "0 %, green" and "(0.05%, green)"
     read as an idle tier when the number is missing. *Ignores:* how much load is missing.
+
+## 19. Phase 2c refinements (2026-10-29)
+
+Building phase 2c (plan `docs/superpowers/plans/2026-10-28-phase2c-bytes-queues-sweep.md`) fixed
+the following points. The plan's header listed sixteen refinements; the review rounds of its
+tasks corrected several of them, so each entry below is the rule as finally implemented, with the
+review that changed it. Where they conflict with an earlier section, this section wins; §7's
+`client`, `cdn`, `load_balancer`, `kv_cluster`, `message_queue`, `worker_pool`, `blob_store`,
+`search_index` and `external_sink` rows are updated in place, §3.4 points at entry 3, §6 at
+entry 2, §11 at entry 15 and §13 says which phase 3 types moved forward. The rules a scenario
+author meets are in `docs/scenario-schema.md` (v1.4). Worked numbers are pinned by the theory and
+scenario tests or printed by the Release binary.
+
+1. **Request sizes, resolved once.** A client's `sizes: {op: size}` gives each op it sends a size
+   in bytes (`200B`, `2KB`, `50MB`, `1.5GB`; decimal, 1 KB = 1000 B, at most 1e15 B, `0B` refused
+   as a request size); a step may state `size:`. A request keeps its size while it keeps its op
+   name (through balancers and limiters, a cache's or CDN's forwarding, a queue's copies to its
+   pools, a same-op step or `then` step); a renamed op without `size:` is unsized. The graph
+   resolves one size per (node, op) at build (`Graph::request_bytes`, a size walk beside the key
+   walk of §18 entry 1, seeded also with every step that states a size). Two sizes at one
+   (node, op) are an error at any node, naming the client or step each came from (review of
+   Tasks 1–2, item 6: not `from 'lb' and 'lb'`); an unsized op reaching a byte-sized node or a
+   bandwidth link is an error too, checked over every op that arrives (item 1: the two walks
+   seeded differently and let some through), with a hint when a pool's same-op step renames other
+   jobs. A byte `capacity` is valid only on a `cdn` or `blob_store`, and may be written in bits
+   (`40Gbit/s` = 5 GB/s; item 3). A limiter's counter carries no size, so its backend link cannot
+   have a bandwidth. *Why static:* every shipped scenario sends one size per (node, op); bytes
+   carried in the flow (§3.2) are phase 3. *Ignores:* a size distribution (each op's size is its
+   mean), headers and protocol overhead, compression.
+2. **Byte-sized nodes count megabytes** (§6's per-MB rows). A node is byte-sized when its capacity
+   is a byte rate (any `cdn` or `blob_store` that states one, and a blob store by default: §6's
+   500 MB/s). Its unit is **1 MB** (`defaults::byte_unit = 1e6`, replacing 2b's assumed 1 MB per
+   object, §18 entry 11): its capacity is MB/s, a request of op `o` costs `request_bytes(o) / 1e6`
+   units through the existing op cost (§17 entry 4), and its `latency` is one megabyte's time (a
+   CDN `network_read_1mb` = 10 ms; a blob store `disk_read_1mb + network_read_1mb` = 40 ms, chosen
+   serial: no pipelining), so Little's law gives `c = MB/s × time per MB` slots (`cdn_us` 100k
+   MB/s × 10 ms = 1000; a default blob store 500 × 0.04 = 20). A 100 GB/s CDN saturates at 2k
+   streams/s of 50 MB; youtube's 281.6 streams/s at 21:00 are 14.08k MB/s, 14.1 % of `cdn_us`.
+   *Corrected by the review of Task 3 and its two fix rounds:*
+   - **the queue waits for whole objects** (I1): Erlang C is fed the rate-weighted mean object
+     time `s_obj = Σ p_op × MB_op × s_MB` with the same `c`, so `rho` is as in MB/s and the wait
+     is a whole object's (at rho 0.9, 50 MB objects at a default store wait 0.28 s, where 1 MB
+     units said 11 ms);
+   - **a write is answered at its last byte** (I2): an op in the node's `write_ops` (now a key of
+     a blob store, default `[write]`; youtube's `original_store` lists `upload`) is answered after
+     the wait plus `size × s_MB`, any other op at its first megabyte (the wait plus one MB's time);
+     a request under 1 MB takes one megabyte's time either way (an upper bound for small objects);
+   - **transfers are deterministic** (second round, I2): a fixed size at a fixed rate has
+     per-object SCV 0 (`service_variability` defaults to 0 there), and the Allen–Cunneen factor is
+     fed the size mix's SCV, `c_s² = Σ p (1 + cs²) s² / s_obj² − 1` (second round, I1: a
+     rate-weighted mean alone let 1000 small reads/s cut the large writes' wait 120×); one size
+     waits like M/D/c. Every 300 MB upload therefore takes at least 12 s at 25 MB/s per slot;
+   - **the room-drain bound** (first round, C1; renamed in the second, I-2): every queue's
+     stochastic wait is `min(k × Wq, queue_limit / capacity)` (1000 MB at 500 MB/s: 2 s), exact
+     for a deterministic drain and conservative otherwise (about twice M/M/c/K's mean near
+     rho 1); its variance is capped at the room's scale squared over 4, our heuristic. The
+     lognormal percentiles ignore the bound (a saturated store's p99 6.88 s against its 4 s,
+     pinned as a characterisation test and listed for the comprehensive review).
+   A byte-sized node's demand, drops and backlog are in MB, its clients' rates in requests.
+   *Ignores:* a read's last byte (a download needed whole before use), that a request's megabytes
+   arrive together (an M^X batch), a ramp's transient wait not falling with the backlog (the
+   Erlang term reads rho = drain / capacity; phase 3 backlog).
+3. **A link's `bandwidth` is a pipe** (§3.4). One server (`c = 1`) in megabytes, draining
+   `bandwidth / 1 MB` (1 Gbit/s = 125 MB/s, 8 ms per MB), each request holding it for its whole
+   serialisation, deterministic, with a 1000 MB waiting room (chosen: the generic `queue_limit`
+   in MB) beyond which it drops; its losses multiply the hop's delivered fraction. 1 MB requests
+   at 100/s over 1 Gbit/s: rho 0.8, M/D/1 wait 0.5 × 0.8 / 0.2 × 8 ms = 16 ms. A hop over the pipe
+   adds its wait plus the request's answer time on the wire, by entry 2's rule (review of Task 5,
+   I-2): a **write** its whole serialisation, any other op its first megabyte
+   (`min(size, 1 MB) / bandwidth`): 10 MB at 10/s, a read 160 + 8 = 168 ms, a write 160 + 80 =
+   240 ms; a streamed PUT into a blob store pays the wire's and the disk's whole-object times in
+   series (an upper bound). Write-ness is decided per (link, op) at build (review of Task 6, I-2):
+   an op is a write on a link if a node its body reaches lists it, under its own name or under the
+   new name of a step whose `size` equals the incoming request's (reviews of Task 7, I-2, and
+   Task 8, I-2: a 1 KB metadata write beside a 10 MB upload is a new request), so a balancer or a
+   relaying service in front of the store changes nothing. **Direction** (review of Task 5, I-1):
+   the pipe is fed by the demand that crosses the link, each request charged its whole size in
+   the direction it is sent; replies add no bytes, so an `inout` link is one pipe and `x->y`,
+   `y->x` with a bandwidth are two. Reports get a `links` table, JSON `links`, a series row
+   `from->to` and an `explain` check per pipe; a pipe counts in `drop_rate` without `node`.
+   youtube's 40 Gbit/s cross-DC origin link carries 2.856k MB/s at 21:00 (57.1 %) and its wait is
+   6.66 ms (a 50 MB stream holds the 5 GB/s wire 10 ms: 0.5 × 0.571 / 0.429 × 10 ms), not the
+   0.13 ms a 1 MB unit would give (Task 16's measured deviation). *Ignores:* TCP slow start and
+   windows, packet loss and retransmission, headers, the true direction of each byte, full
+   duplex; the room's drain time (8 s at 1 Gbit/s) caps the wait of requests larger than the
+   room (2 GB uploads: 32 s by Pollaczek–Khinchine, 8 s reported).
+4. **A message queue is a broker plus its consumers' waiting room** (ch. 1, ch. 10's notification
+   queue, ch. 14's transcoding queue; Kafka). The `message_queue` node's own queue is the append
+   (§6: 1M msg/s; 100 µs chosen), and a publisher is answered at the append. Every link out of a
+   queue must reach a `worker_pool` that `consumes` it, and every consumer group receives every
+   message (Kafka's consumer groups); a queue nobody consumes, and a consumer link whose `ops`
+   carry nothing the queue receives, are refused (review of Task 6, M-2). What a group has not
+   drained waits in its pool's queue, whose room is `retention × the pool's rate` (default 7 days,
+   Kafka's `log.retention.hours = 168`; older messages are deleted unconsumed: the pool's drops).
+   **The lag** (review of Task 8, I-1: the docs had described the oldest message's age) is how
+   long a message published at that step waits until its slowest group reads it, Kafka's
+   records-lag over the consume rate: `max(min(k × Wq, retention), backlog / capacity)`, the FIFO
+   drain time (review of Task 6, M-7: not Little's law) or the pool's Allen–Cunneen M/M/c wait,
+   whichever is larger (our heuristic, the fluid queue's wait). The oldest unread message's age
+   trails it by one lag and reaches the same peak that much later. `partitions` is printed, not
+   modelled (phase 3: it would cap a group's parallelism). *Ignores:* ordering, delivery
+   guarantees and redelivery, a consumer's commit interval, the broker's disk.
+5. **A worker pool is M/M/c over consumption** (§7: "capacity = workers / job cost"). `c =
+   workers`, service time `cost` (a duration), rate `workers / cost`: youtube's 600 transcoders at
+   60 s drain 10 videos/s. 1k msgs/s into 4 workers at 3.333 ms: rho 0.8333, Erlang C 0.6577, Wq
+   3.289 ms. `consumes` is required and a pool takes jobs only from that queue (review of Task 6,
+   I-1: a pool fed by a service ran as a synchronous M/M/c with a 7-day room); `capacity`,
+   `latency`, `replicas`, `advanced.concurrency` and `advanced.queue_limit` are refused. Its
+   `then` steps fire for every job it **drains** (Task 7), `factor` requests each, sized by the
+   step's `size:` or, same-op, by the job's own size; `on: miss` and `on: failure` are refused. A
+   worker is busy for `cost` only: its `then` hops do not hold it. *Ignores:* a worker blocked on
+   a slow downstream call (phase 3), autoscaling, poison messages.
+6. **Asynchronous completion.** The hops from a queue to its pools and a blob store's events are
+   asynchronous (`Graph::async_hops`, as write-back flushes, §18 entry 5): a publisher waits for
+   the append alone and an uploader for the store alone; what a pool or a notified node loses
+   counts in its own drop rate, not in the client's answered rate, and `explain`'s paper load
+   follows these hops (Task 7). *Ignores:* the end-to-end completion time of the asynchronous
+   work (upload → playable); the queue lag is what the SLOs check. A request/reply over a queue is
+   phase 3.
+7. **A blob store's `then` steps are event notifications** (S3 event notifications; ch. 14's
+   "transcoding starts when the upload completes"). *Corrected by the review of Task 4 (I1):* they
+   fire for every **write** the store serves (an op in its `write_ops`), never for a read, since
+   S3 has no event for a GET (1000 views/s of a video start no transcode); a same-op step keeps the
+   write's size (Tasks 1–2 review, item 10), a renamed one carries its `size:` or none. `on: miss`,
+   `on: failure` and any `mode` are refused (M1). *Ignores:* event batching, delivery delay beyond
+   the link's latency, failed notifications; notifying on reads is phase 3.
+8. **External sink.** A third party's API (ch. 10's APNs, FCM, SMS and e-mail providers) as a
+   queue of §6's `third_party_api` numbers (1k/s chosen: one account's quota; 100 ms; service SCV
+   2.0); `failure_rate f` fails that share of what it serves, `dropped += f × served`, `drain =
+   (1 − f) × served`, so 500/s at f = 0.02 is answered 490/s with a drop rate of 0.02. Failures
+   are drops (the node failing), never rejections. With `f = 1` nothing is answered: JSON prints
+   `null` latencies and a latency SLO is `skipped` with `nobody answered c.op: no latency to
+   observe` (reviews of Tasks 9–10, minor 8, and of the kv fix round, minor 4). `politeness` is
+   printed, not modelled (it needs per-host state: phase 3, with `frontier`). *Ignores:* retries,
+   a provider's latency rising with our load.
+9. **kv_cluster, steady state** (§7; ch. 6). `nodes` machines of `capacity` each on a ring of
+   `vnodes` virtual nodes; every request goes to its key's `replication` N replicas, so a request
+   costs N capacity units (one line in `defaults::op_cost`) and the clients' rates stay in
+   requests. W = R = min(2, N) by default; `replicas` is refused; `write_ops` names the writes
+   (review I-3); `mode: ap|cp` is printed and matters only under partitions (phase 3). *Corrected
+   by the review of Tasks 9–10 (C-1, I-1, I-2) and of its fix round (I-2, I-3):*
+   - **the ring's hottest machine** carries `k = min(1 + z_M/√(N·vnodes), nodes/N)` × the
+     average, z_M the expected maximum of M = `nodes` standard normals (Blom's approximation);
+     the consistent-hash balancer's ring uses the same function with N = 1, so the two agree. It
+     is a heuristic checked against Monte Carlo rings: within about 1 % from 100 vnodes on, off by
+     up to ±16 % at `vnodes: 1` (`docs/study/numerics.md` §8). The old `1 + 1/√vnodes` ignored
+     the number of machines and understated the hot spot beyond about 16;
+   - **the quorum's latency over the request's real replica set**: a request's N replicas include
+     the hot machine with probability `p_hot = N k / nodes`, else are N cool machines; the q-th
+     fastest reply (q = R or W) is computed from each machine's own fitted lognormal through the
+     survival function, a Poisson-binomial over the two groups integrated on a grid even in ln t
+     (`numerics.md` §7), and mixed by the share of the **answered** requests each kind of set
+     gives (fix round I-2: a set that loses more weighs less). Rényi's closed form for iid
+     exponentials (the k-th of n: `m Σ_{i<k} 1/(n − i)`, 5/6 m for 2 of 3) stays as the teaching
+     case and the quadrature's cross-check;
+   - **the quorum's losses**: a request is lost when fewer than q of its N replica-requests come
+     back, the same Poisson-binomial with each machine's kept share (8 saturated machines dropping
+     a ninth lose 3.4 % at q = 2, 0.14 % at q = 1, 29.8 % at q = N, not a ninth at every q).
+   The kv-store lab at 16 machines: hottest 0.6094 (k = 1.0834), put p99 2.31 ms. *Ignores:*
+   partitions, sloppy quorum and hinted handoff, read repair and anti-entropy, vector clocks,
+   the latency of a request that lost a replica-request but met its quorum (timed as if all N
+   replied), replies being exactly lognormal and independent, the spread among cool machines.
+10. **search_index serves like a service** (§7: "read-mostly capacity"): a `ServiceBehaviour`
+    with no steps and the type's numbers, 5k/s and 5 ms (chosen: a prefix lookup in a trie that
+    stores each prefix's top k, ch. 13), unless stated, as the id generator is sugar (§18 entry
+    12). `build_interval` is printed (`168h`: ch. 13 rebuilds weekly), its load not modelled.
+    *Ignores:* index build load, freshness between rebuilds.
+11. **A step after a failed step does not run** (2b backlog). In an op's step list, a cache's or a
+    pool's `then`, step k is sent `rate × fraction × factor × S_k`, `S_k` the product of the
+    delivered fractions `d` of the sequential hops and parallel groups before it (a group delivers
+    the product of its branches'; a miss block passes `h + (1 − h) Π d`). 1k/s through `[a, b]`
+    with `a` at 0.5 sends `b` 500/s; `[a ∥ b, c]` with 0.5 and 0.8 sends `c` 400/s. The `d` are
+    the previous step's, so the thinning is late by one step plus the link's delay (review of
+    Task 12, m-1). *Corrected by that review:* `estimate` thins by fractions averaged over its
+    settle passes and reaches the unique fixed point (I-1: five calls at 1k/s to a node of
+    3686/s with a room of one settle at 10 % dropped, 4095/s offered), while `run` can lock into a
+    two-step sawtooth there, which the schema explains and `estimate`'s warning names; the
+    parallel steps of an op must be **adjacent** (I-4: a group starts at its first member); a rate
+    limiter whose counter check was lost forwards only the checked share (I-3: fails closed).
+    *Ignores:* a step that fails after the next one started, partial work of a failed request.
+12. **Client timeout** (§7's `client` row). Each step a client op's response is fitted as a
+    lognormal (`σ² = ln(1 + v/m²)`, `μ = ln m − σ²/2`); with `timeout: τ` the share `Φ(z)`,
+    `z = (ln τ − μ)/σ`, is answered and the rest timed out, and the answered requests' moments are
+    the truncated lognormal's (`queueing::lognormal_below`: m = 100 ms, v = 0.01 s², τ = 200 ms →
+    89.41 % answered, mean 73.97 ms; `numerics.md` §10 has the formulas and the underflow guard).
+    Servers still do a timed-out request's work, nothing retries it, and it is in no `drop_rate`:
+    no node failed it (§3.3's zones line). *Corrected by the review of Task 13:* **the C-1 rule**,
+    a latency SLO at quantile q fails whatever its `max` when more than 1 − q of the delivered
+    requests timed out, observing the timeout with the note `57.3% of delivered requests timed out
+    (more than 1%)` (the refit's p99 had passed while 2 % timed out, and adding a timeout could
+    turn a FAIL into a PASS); otherwise the percentile is the answered requests' fit capped at τ;
+    one helper (`percentile_seen_by_client`) serves the whole run and every window; `timeout ≤ 0`
+    is refused; `run`'s table gains a `timed out/s` column and prints `>1s` where a quantile timed
+    out (I-1); JSON's latencies are `null` when nothing was answered in time (I-2); the series
+    `--series-ops` gains `timed_out_per_s`. *Ignores:* timeouts at intermediate hops, that a path
+    is not exactly lognormal (a 1 s timeout cutting 9e-7 of the rate-limiter lab's requests moves
+    its p99 30.5 → 29.9 ms through the refit).
+13. **SLOs per window: `over: D`.** Any SLO may state `over` (at least one step, at most the run
+    after warmup). The observed span is cut into consecutive windows of D **aligned to the end of
+    warmup**; a step belongs to the window its start falls in; a last, shorter window is still
+    judged; each window is measured exactly as a whole run (the C-1 rule included); the **worst**
+    window decides (a fail before a pass, then the higher observed, the earlier on a tie); a
+    window in which nothing the SLO is about was offered is skipped, and an SLO all of whose
+    windows are skipped is `skipped`. The table names the window, `(worst 1h from 13:02)`; JSON
+    gives `window_start_s`. A 2k/s service at rho 0.5 for an hour with a 1.8× spike for 10 minutes:
+    the whole hour's utilization 0.5667 passes `max: 0.8`, `over: 10m` observes 0.9 and fails,
+    `over: 15m` 0.7667. url-shortener ships `{metric: utilization, node: url_db, max: 0.9, over:
+    1h}`: 0.6433 in 13:02–14:02, where the day's mean is 0.4306. A zone SLO is not added: a
+    windowed utilization says the same in numbers. *Ignores:* sliding windows (a burst straddling
+    two fixed windows is split).
+14. **`queue_lag` SLO.** `node` optional, a `message_queue` (or a `frontier`, accepted and skipped
+    until phase 3); the observed value is the queue's **peak** lag after warmup, read "every
+    message published after warmup was read within `max`". JSON nodes gain `peak_queue_lag_s`, the
+    series a trailing `queue_lag_s`, the table a `peak_lag` column (`<1us` below a microsecond).
+    youtube: `PASS queue_lag transcode_q - 573ms 30m` at 600 workers; at 400, 2.66 h by midnight.
+15. **`simsys sweep`** (§11). `simsys sweep <file> --param <dot.path>=<from>..<to>:<n> --metric
+    <m>... [--jobs N] [--format table|csv]`: `n` points (2 to 10,000; review of Task 15, I-1),
+    evenly spaced, both ends included, both ends numbers in the same unit text (I-2: `1ms...5ms`
+    is refused, not read as 0.5 ms), whole at every point for a key the loader reads as a whole
+    number. The key is a dot path through maps only and must exist; each point's value replaces the
+    file's text before the loader's checks (`config::load(path, overrides)`), every point is loaded
+    and built before any runs, and a YAML anchor's value moves with its aliases. Metrics:
+    `<client>.<op>.mean`, `<node>.mean_rho`, `<queue>.lag`, the numbers `run --report json`
+    prints, formatted as the report formats them (I-3: `1.61ms`, `<1us`, `-` for nothing answered).
+    Points run on `std::jthread` workers pulling indices from one atomic counter, each a
+    `Simulation` of its own, so the output is byte-identical for any `--jobs` (1 to 1024, default
+    the hardware threads; `docs/study/threads.md`). Exit 0 when every point ran (verdicts are not
+    judged), 1 on any error. *Narrower than the plan's header:* the plan listed percentiles,
+    `peak_rho`, `drop_rate` and `reject_rate` as metrics, a column per SLO with its verdict and the
+    point's exit code, and `--report`; the implementation has the three metrics above, no SLO
+    columns and `--format`. *Ignores:* grids over two keys, geometric spacing, list values,
+    replications per point (phase 3).
+16. **Step size rule of thumb** (2b backlog; docs only). A token bucket of `B` tokens under an
+    offered rate `λ` above its limit `L` empties in `B / (λ − L)`; a longer step passes the whole
+    burst in its first step and the bucket's shape vanishes (a 2,000-token burst at `step: 1s`
+    does). Rule: `step ≤ B / (λ_peak − L)`, and for queues `step ≤` a tenth of the shortest
+    spike. In the schema's `step` row and `docs/study/numerics.md` §6, "Choosing the step", with the
+    rate-limiter lab measured at four steps.

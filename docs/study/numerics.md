@@ -437,3 +437,78 @@ same function, so the consistent-hashing lab's balancer and the kv-store lab's c
    on average, p99 227 ms, before the clients' `timeout: 100ms`. With it, 6.62 % of them come
    back too late (569/s), 8.02k/s are answered in 27.2 ms, and the p99 SLO fails at the
    timeout (the README's "Things to try" has the derivation).
+
+## 10. A client's timeout: the truncated lognormal
+
+A client with `timeout: τ` (plan 2c Task 13) gives up on a request the path has not answered by τ.
+The engine does not follow requests one by one, so each step it takes the client's response for
+an op as the lognormal of section 5, fitted to the path's mean m and variance v
+(`Simulation::give_up_after`, `src/engine/engine.cppm`, calling `queueing::lognormal_below`,
+`src/queueing/queueing.cppm`), and cuts it at τ. Four formulas, all from the fit
+σ² = ln(1 + v/m²), μ = ln m − σ²/2 and the timeout's place on the normal scale of ln X,
+z = (ln τ − μ) / σ:
+
+    P(X < τ)            = Φ(z)                                    the share answered in time
+    E[X^k 1{X < τ}]     = E[X^k] Φ(z − kσ)          (k = 1, 2)    the k-th "partial moment"
+    E[X | X < τ]        = m Φ(z − σ) / Φ(z)                       the answered requests' mean
+    E[X² | X < τ]       = (m² + v) Φ(z − 2σ) / Φ(z)               ... and second moment
+
+Φ is the standard normal CDF, `normal_cdf`, computed as `erfc(−z/√2) / 2`: one call that keeps
+its digits in both tails (`1 − erf` would lose every digit below Φ = 1e-16, section 2's
+cancellation again). The partial moments come from completing the square: X^k = e^{k ln X}
+shifts the normal density of ln X by kσ², so the share of the k-th moment below τ is the normal
+CDF at z − kσ. The answered requests' moments are those of a **truncated** distribution, the
+original with everything past τ removed and the rest scaled back to 1 (divided by Φ(z)); the
+reports then fit their percentiles to the truncated moments and cap them at τ.
+
+**Checked against the binary.** A client at 10/s sending `get` to a service of 100 ms service
+time and 1k/s (c = 100, so no wait: the sojourn is exponential, m = 100 ms, v = 0.01 s², SCV 1)
+over a link of `latency: 0s`, with `timeout: 200ms` (σ = 0.8326, μ = −2.6492, z = 1.2488):
+
+    client.op  offered/s  timed out/s  mean     p50     p95     p99  (estimated)
+    users.get         10        1.059  74ms  62.9ms  >200ms  >200ms
+
+89.41 % answered (JSON `answered_per_s` 8.941367), 10.59 % timed out, and the answered mean
+73.97 ms (`mean_s` 0.0739704), as the formulas give. At `timeout: 1s` 99.927 % are answered, at
+`50ms` 33.86 %. The p95 and the p99 print `>200ms`: more than 5 % of the delivered requests timed
+out, so no request at those quantiles was answered, and a latency SLO on them fails whatever its
+`max` (the review's C-1 rule, `percentile_seen_by_client` in `src/report/report.cpp`).
+
+**Why a tiny cut moves a percentile.** At `timeout: 1s` the same path times out 0.073 % of its
+requests (`P(X > τ)` = Φ(−3.182) = 7.31e-4), yet its p99 falls from 490 ms to 465 ms, 5 %. The
+partial moments say why: the share of the k-th moment past τ is Φ(kσ − z), which grows with k.
+Past 1 s lie 0.073 % of the requests, 0.94 % of the first moment (Φ(σ − z)) and 6.5 % of the
+second (Φ(2σ − z)). Removing the tail takes 11 % of the variance with it (0.01 → 0.00889 s²) and
+the refitted lognormal is narrower: its p99 is exp(μ' + 2.326 σ') = 464.9 ms. Nothing is wrong:
+the requests' own p99 barely moved (it was below 1 s), but a percentile read off two moments
+reacts to a change in the second moment, and a heavy tail carries much more second moment than
+probability. The rate-limiter lab shows the same in a whole run: its clients' `timeout: 1s` cuts
+0.0007284 of the 818 calls a second the path delivers (8.9e-7 of them), and the p99 goes from
+30.5 ms (delete the `timeout` line and run) to 29.9 ms, 2 % (the run's variance, backed out of its
+printed mean and p50, falls 3.9 %). The model accepts this rather than add a threshold below which
+a timeout is ignored: a threshold would make the p99 jump where the share crosses it.
+
+**The underflow guard.** When a response hardly varies and sits well above τ, z is far below
+zero and Φ(z) underflows to exactly 0 (below about z = −38.5): youtube's 300 MB uploads take 12 s
+at a blob store's 25 MB/s per slot with almost no spread (a fixed-size transfer is deterministic),
+and against a 10 s timeout the truncated moments would be 0 / 0. A NaN there would spread through
+every weighted sum of the report (0 × NaN is NaN). `lognormal_below` returns the limit instead,
+`{fraction 0, mean τ, variance 0}` (what is left as the answered share vanishes piles up just
+under τ), the engine counts every such request as timed out, and the report never shows those
+stand-in moments: JSON prints `null` latencies for an op of which nothing was answered in time and
+the table `>10s`. Try it: `sed 's/timeout: 30s/timeout: 10s/' scenarios/book/youtube/scenario.yaml
+> /tmp/yt10.yaml` and `simsys run /tmp/yt10.yaml --duration 10m`: `viewers_us.upload  5.641
+5.641  -  >10s  >10s  >10s`, every upload timed out. (The shipped 30 s timeout stands for the
+book's resumable uploads, which retry a chunk, not the whole file.) The other edges are limits of
+the same formulas: τ = ∞ returns m and v, an infinite m (a path that never answers) stays
+infinite so the report still calls it unavailable, and v = 0 is a step at m (all answered if
+m ≤ τ). The mean is clamped to at most τ and the variance to at least 0, since a narrow truncated
+part loses digits in E[X²] − E[X]² (section 5's cancellation).
+
+**What it ignores.** The response is not exactly lognormal (a cache's hit/miss mixture is
+bimodal, section 5), so the share timed out is the fit's tail, not the requests'; the timeout is
+the client's alone (nothing cancels the request at the servers, whose demand and utilization
+still include it, and nothing retries it before phase 3); and a timed-out request is in no
+`drop_rate`, since no node failed it.
+
+(Numbers from a Release build of this tree; every run is deterministic.)
