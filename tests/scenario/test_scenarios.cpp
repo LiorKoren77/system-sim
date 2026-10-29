@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <filesystem>
 #include <string>
@@ -128,7 +129,12 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
     //    behind, against its 30 m: the test below pins it) until Task 16 resizes them, and 24 h
     //    at 100 ms is 864k steps, far over the five seconds. The "book/youtube runs" test below
     //    runs its first steps instead.
-    if (s.name == "lab-unique-id" || s.name == "url-shortener" || s.name == "youtube") {
+    //  - news-feed runs since plan 2c Task 10 (its kv_cluster, graph_db, is simulated), but is
+    //    exempt from its SLOs until Task 17: 24 h at 100 ms is 864k steps, far over the five
+    //    seconds, and its drop_rate and queue_lag SLOs are Task 17's to meet. The "book/news-feed
+    //    runs" test below runs its first steps instead.
+    if (s.name == "lab-unique-id" || s.name == "url-shortener" || s.name == "youtube" ||
+        s.name == "news-feed") {
       continue;  // not run here
     }
     ++ran;
@@ -241,13 +247,15 @@ TEST_CASE("book scenarios are refused by run until their node types exist", "[sc
 // id_generator) and the book's URL shortener (client, rate limiter, caches, load balancer,
 // service, id_generator, sql_db) use only those. Phase 2c adds the byte-sized nodes, the queue and
 // the pool with its `then` steps (Task 7): youtube (clients, CDNs, blob stores, balancer, service,
-// cache, SQL database, message queues, worker pools) is the first book scenario of 2c that runs.
-// Every other lab and book scenario still needs a later task's node types (google-drive's
-// ws_gateway, news-feed's kv_cluster, ...), so the set of runnable scenarios is pinned by name: a
-// node type added later makes this fail and forces whoever adds it to update the list on purpose.
+// cache, SQL database, message queues, worker pools) is the first book scenario of 2c that runs;
+// the kv_cluster (Task 10) adds the kv-store lab and the book's news feed (its graph_db is the one
+// node type it lacked). Every other lab and book scenario still needs a later task's node types
+// (google-drive's ws_gateway, chat-system's service_discovery, ...), so the set of runnable
+// scenarios is pinned by name: a node type added later makes this fail and forces whoever adds it
+// to update the list on purpose.
 TEST_CASE(
-    "scenarios that run today are: chain, hello, consistent-hashing, rate-limiter, unique-id, "
-    "url-shortener, youtube",
+    "scenarios that run today are: chain, hello, consistent-hashing, kv-store, news-feed, "
+    "rate-limiter, unique-id, url-shortener, youtube",
     "[scenario]") {
   std::vector<std::string> runnable;
   for (const auto& file : scenario_files()) {
@@ -260,8 +268,8 @@ TEST_CASE(
   }
   std::ranges::sort(runnable);
   REQUIRE(runnable == std::vector<std::string>{"chain", "hello", "lab-consistent-hashing",
-                                               "lab-rate-limiter", "lab-unique-id", "url-shortener",
-                                               "youtube"});
+                                               "lab-kv-store", "lab-rate-limiter", "lab-unique-id",
+                                               "news-feed", "url-shortener", "youtube"});
 }
 
 TEST_CASE("a refused scenario's message names the first unsupported node and the phase",
@@ -476,17 +484,37 @@ TEST_CASE("book/google-drive is refused at long_poll, its ws_gateway", "[scenari
 }
 
 // Ch. 11's news feed: its fan-out queue and pool are simulated (Task 6, their `then` steps Task 7),
-// and the engine stops at graph_db, its kv_cluster (phase 2c Task 10): the first unsimulated type
-// is the one named (the refusal used to be at fanout_q, before the queue ran).
-TEST_CASE("book/news-feed is refused at graph_db, its kv_cluster, no longer at fanout_q",
+// and since plan 2c Task 10 so is graph_db, its kv_cluster, the last node type it lacked (the
+// refusal moved from fanout_q to graph_db, and now there is none: the nodes are client, cdn,
+// blob_store, load_balancer, service, cache, sql_db, message_queue, worker_pool and kv_cluster).
+TEST_CASE("book/news-feed is accepted by the engine now that its kv_cluster is simulated",
           "[scenario]") {
   const auto g = build_or_fail(
       load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml"));
   const auto sim = simsys::engine::Simulation::create(g);
-  REQUIRE_FALSE(sim.has_value());
-  REQUIRE(sim.error().message ==
-          "node 'graph_db' has type 'kv_cluster', which run/estimate do not support yet "
-          "(phase 2)");
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+}
+
+// The news feed runs: in its first second (00:00, the curve at 1.3 x its 10k/s base: 13k/s, a
+// tenth of it posts) every post the web tier takes is one job for the fan-out pool, which reads
+// graph_db once per drained job. The pool's 32 workers at 5 ms drain up to 6.4k jobs/s, far above
+// the ~1.3k/s offered, so every job is drained, and the 6-node, N = 3 cluster is sent three
+// replica-requests per job: its demand is exactly 3 x what the pool drained.
+TEST_CASE("book/news-feed runs: graph_db is sent three replica-requests per fan-out job",
+          "[scenario]") {
+  using namespace std::chrono_literals;
+  const auto g = build_or_fail(
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml"));
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  simsys::engine::StepRecord last;
+  for (int i = 0; i < 20; ++i) last = sim->step(i * 100ms, 100ms);
+  const auto& fanout = last.nodes[*g.index_of("fanout")];
+  const auto& graph_db = last.nodes[*g.index_of("graph_db")];
+  REQUIRE(fanout.drain_per_s > 1000.0);  // about 1.3k jobs/s at the start of the day
+  REQUIRE_THAT(graph_db.demand_per_s, Catch::Matchers::WithinRel(3.0 * fanout.drain_per_s, 1e-6));
+  REQUIRE(graph_db.dropped_per_s == 0.0);  // 3.9k of 180k replica-requests/s
 }
 
 // Plan 2c refinement 2: byte-sized nodes count megabytes, so the capacities the 2b scenarios gave
@@ -552,9 +580,8 @@ TEST_CASE("no shipped scenario's explain blames a message queue or a worker pool
 }
 
 // The 2b "not checked" note for capacities converted from bytes is gone from every shipped
-// scenario, and so is the object-size assumption it rested on. (A kv_cluster's capacity still has
-// its own "not checked" note until the ring is modelled, plan 2c Task 10: that one is a different
-// reason and stays.)
+// scenario, and so is the object-size assumption it rested on. (A kv_cluster's own note went with
+// the ring model of plan 2c Task 10: the test after the lab's, below, pins that.)
 TEST_CASE("no shipped scenario's explain says a byte capacity is not checked", "[scenario]") {
   for (const auto& file : scenario_files()) {
     CAPTURE(file);
@@ -881,4 +908,92 @@ TEST_CASE("explain on the shipped scenarios prints each external sink's failure 
   const auto chat_text = simsys::report::render_explain(chat);
   CAPTURE(chat_text);
   REQUIRE(node_line(chat_text, "push").contains("failure_rate=2%"));
+}
+
+// ---- The kv-store lab at 16 nodes (plan 2c refinement 9, Task 10; book ch. 6) ----
+//
+// The lab ships with `nodes: 16`: 30k requests/s from the clients, 3 x 30k = 90k replica-requests/s
+// (N = 3: the coordinator sends each read and write to three replicas) over 16 nodes of 10k/s.
+//   average node  90k / 16 = 5.625k/s   = 56.25 %
+//   hottest node  k x 5.625k, k = 1 + 1/sqrt(150) = 1.08165 (150 vnodes), = 6.084k/s = 60.84 %
+// The `utilization` SLO (max 0.8) is read at the hottest node, so it observes 0.6084 and passes;
+// the `drop_rate` SLO (max 0.01) sees nothing dropped; the put's p99 (max 20 ms) is far below it:
+// a put crosses four 0.25 ms link legs (1 ms), the coordinator (0.2 ms of service, utilization 0.5
+// over 4 x 15k/s) and the W = 2 quorum of three 0.3 ms store nodes (5/6 of their mean sojourn,
+// about 0.3 ms), so its mean is a little over 1.5 ms and the lognormal fit's p99 lies between that
+// and 5 ms.
+TEST_CASE(
+    "labs/kv-store at sixteen nodes runs and passes its SLOs with the hottest node at 60.8 percent",
+    "[scenario]") {
+  const auto s = load_scenario("/labs/kv-store/scenario.yaml");
+  const auto store = std::ranges::find(s.nodes, "store", &simsys::model::NodeSpec::id);
+  REQUIRE(store != s.nodes.end());
+  REQUIRE(store->kv_nodes == 16);
+  const auto results = run_slos(s);
+  REQUIRE(results.size() == s.slos.size());
+  for (const auto& r : results) {
+    CAPTURE(r.slo.node, static_cast<int>(r.slo.metric), r.observed.value_or(-1.0));
+    REQUIRE(r.status == simsys::report::SloStatus::pass);
+  }
+  const auto& utilization = slo_of(results, simsys::model::SloMetric::utilization);
+  REQUIRE(utilization.observed.has_value());
+  REQUIRE_THAT(*utilization.observed,
+               Catch::Matchers::WithinRel(
+                   90'000.0 / 16.0 / 10'000.0 * (1.0 + 1.0 / std::sqrt(150.0)), 1e-3));
+  REQUIRE_THAT(*utilization.observed, Catch::Matchers::WithinAbs(0.6084, 5e-4));
+  const auto& drops = slo_of(results, simsys::model::SloMetric::drop_rate);
+  REQUIRE(drops.observed == 0.0);
+  const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
+  REQUIRE(p99.observed.has_value());
+  REQUIRE(*p99.observed > 1.5e-3);
+  REQUIRE(*p99.observed < 5e-3);
+}
+
+// The lesson the lab's comment states: the same lab at the book's eight nodes is over capacity.
+// 90k replica-requests/s over 8 x 10k = 80k/s: 11.25k per node (112.5 %), the hottest 1.0816 x that
+// = 12.17k (121.7 %). Every node's queue fills, so the cluster serves 80k of the 90k and drops one
+// ninth: drop_rate 1/9 = 0.1111 against its 0.01, and the hottest node's rho saturates at 1.0
+// against the utilization SLO's 0.8. Both fail. (5 minutes of the 30, 1 of them warmup: the
+// queues fill in under a second.)
+TEST_CASE("labs/kv-store at eight nodes drops a ninth of the replica-requests and fails two SLOs",
+          "[scenario]") {
+  using namespace std::chrono_literals;
+  auto s = load_scenario("/labs/kv-store/scenario.yaml");
+  const auto store = std::ranges::find(s.nodes, "store", &simsys::model::NodeSpec::id);
+  REQUIRE(store != s.nodes.end());
+  store->kv_nodes = 8;
+  s.duration = 5min;
+  const auto results = run_slos(std::move(s));
+  const auto& drops = slo_of(results, simsys::model::SloMetric::drop_rate);
+  REQUIRE(drops.status == simsys::report::SloStatus::fail);
+  REQUIRE(drops.observed.has_value());
+  REQUIRE_THAT(*drops.observed, Catch::Matchers::WithinRel(1.0 / 9.0, 1e-3));
+  const auto& utilization = slo_of(results, simsys::model::SloMetric::utilization);
+  REQUIRE(utilization.status == simsys::report::SloStatus::fail);
+  REQUIRE(utilization.observed.has_value());
+  REQUIRE_THAT(*utilization.observed, Catch::Matchers::WithinRel(1.0, 1e-3));
+}
+
+// The "not checked: kv_cluster ..." note of phase 2c's first half is gone from every shipped
+// scenario: each kv_cluster (the lab's store, news-feed's graph_db, chat-system's message_store
+// and presence, notification-system's log_db) is modelled now, so explain checks it, or, where
+// its load is behind a type with no model yet (notification-system's fanout), marks that.
+TEST_CASE("no shipped scenario's explain says a kv_cluster is not checked", "[scenario]") {
+  for (const auto& file : scenario_files()) {
+    CAPTURE(file);
+    const auto text = simsys::report::render_explain(build_or_fail(load_or_fail(file)));
+    REQUIRE_FALSE(text.contains("not checked: kv_cluster"));
+    REQUIRE_FALSE(text.contains("replication and quorums: phase 3)"));
+  }
+}
+
+// The lab's own explain, at its shipped 16 nodes: the line the paper load gives the store.
+TEST_CASE("explain on labs/kv-store checks the store at 16 nodes", "[scenario]") {
+  const auto g = build_or_fail(load_scenario("/labs/kv-store/scenario.yaml"));
+  const auto text = simsys::report::render_explain(g);
+  CAPTURE(text);
+  REQUIRE(check_line(text, "store")
+              .contains("peak offered 90k/s (30k/s × N 3) vs 160k/s (16 nodes)  "
+                        "(hottest 60.8%, green)"));
+  REQUIRE(node_line(text, "store").contains("nodes=16 N=3 W=2 R=2 mode=ap (partitions: phase 3)"));
 }

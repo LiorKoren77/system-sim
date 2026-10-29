@@ -3353,3 +3353,134 @@ TEST_CASE("a pool consuming a frontier gets the default room: 7 days of its rate
   REQUIRE_THAT(g->nodes()[*g->index_of("w")].capacity.queue_limit,
                WithinRel(604'800.0 * 800.0, 1e-9));
 }
+
+// ---- kv_cluster: a ring of nodes, N replicas per key (plan 2c refinement 9, Task 10) ----
+//
+// Book ch. 6 (Dynamo): `nodes` machines on a consistent-hash ring, every key kept on the N
+// machines that follow its position. The graph resolves the cluster like any node of copies: its
+// copies are its `nodes`, each of `capacity` (a kv_cluster's `capacity` is PER NODE, as the lab
+// says), and the ring gives it an imbalance exactly as a consistent_hash balancer gives the
+// nodes behind it (mark_balanced_targets: the hottest copy carries k = 1 + 1/sqrt(vnodes) times
+// the average). With N = nodes every node holds every key, so no node is hotter than another.
+// The demand a cluster is sent is N times its requests (every request goes to N replicas); that
+// is a number the paper load and the engine compute, pinned in test_report.cpp and
+// test_theory.cpp, not a field of the graph.
+//
+// Proposed shape: Graph::build resolves the copies into ResolvedNode::spec.replicas (the count
+// that explain's capacity, the engine's copy groups and the balancer's ring already read) and
+// the ring into ResolvedNode::imbalance; the loader refuses `replicas` on a kv_cluster, so the
+// resolved value is never one the scenario stated. `copies_of` is the one place a different
+// shape (a new ResolvedNode::copies, say) would change these tests.
+
+namespace {
+// A kv_cluster `store` of `nodes` machines keeping `replication` copies of each key, behind a
+// client `u` sending 1000 `get`/s over one link. `vnodes` only when given (absent: the default).
+NodeSpec kv_store(int nodes, int replication, std::optional<int> vnodes = std::nullopt) {
+  NodeSpec store{.id = "store", .type = NodeType::kv_cluster, .capacity = Rate{10'000}};
+  store.kv_nodes = nodes;
+  store.replication = replication;
+  store.write_quorum = 1;
+  store.read_quorum = 1;
+  store.vnodes = vnodes;
+  return store;
+}
+
+Scenario kv_behind_client(NodeSpec store) {
+  Scenario s{.name = "kv", .version = 1, .duration = 1min};
+  s.nodes = {client("u", Rate{1000}, {{"get", 1.0}}), std::move(store)};
+  s.links = {LinkSpec{.from = "u", .to = "store"}};
+  return s;
+}
+
+// How many machines the resolved cluster is made of.
+int copies_of(const simsys::graph::ResolvedNode& node) {
+  return node.spec.replicas;
+}
+
+const simsys::graph::ResolvedNode& store_of(const Graph& g) {
+  return g.nodes()[*g.index_of("store")];
+}
+}  // namespace
+
+TEST_CASE("a kv_cluster's copies are its nodes, each of the stated per-node capacity", "[graph]") {
+  const auto g = Graph::build(kv_behind_client(kv_store(8, 3)));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE(copies_of(store_of(*g)) == 8);
+  // `capacity` is one node's, not the cluster's: the graph does not multiply it by `nodes`
+  // (explain's total capacity does: 8 x 10k/s).
+  REQUIRE(store_of(*g).capacity.service_rate == Rate{10'000});
+}
+
+// One virtual-node count of 100 over a cluster of 8 whose keys live on 3 each: 1 + 1/sqrt(100)
+// = 1.1 times the average on the hottest node (the book's ch. 5 spread, as for the balancer).
+TEST_CASE(
+    "a kv_cluster keeping fewer copies than it has nodes is imbalanced by one plus one over root "
+    "vnodes",
+    "[graph]") {
+  const auto g = Graph::build(kv_behind_client(kv_store(8, 3, 100)));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(1.1, 1e-12));
+  REQUIRE_FALSE(store_of(*g).pooled);
+}
+
+// Without `vnodes` the ring takes model::default_vnodes, the balancer's 150: 1 + 1/sqrt(150) =
+// 1.08165 (the lab's "try 150").
+TEST_CASE("a kv_cluster without vnodes takes the balancer's default of 150", "[graph]") {
+  const auto g = Graph::build(kv_behind_client(kv_store(8, 3)));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(1.0 + 1.0 / std::sqrt(150.0), 1e-12));
+  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(1.0816, 1e-4));
+}
+
+// One virtual node per machine is the worst ring: 1 + 1/sqrt(1) = 2, the hottest node carries
+// twice the average (as the consistent-hashing lab's "try vnodes: 1").
+TEST_CASE("one virtual node per machine doubles the hottest node's share", "[graph]") {
+  const auto g = Graph::build(kv_behind_client(kv_store(8, 3, 1)));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE_THAT(store_of(*g).imbalance, WithinRel(2.0, 1e-12));
+}
+
+// With N = nodes every node holds a replica of every key, so the load splits evenly whatever
+// the ring looks like: no hot node, imbalance exactly 1 (the engine then models independent,
+// identical copies), even with a single virtual node.
+TEST_CASE("a kv_cluster whose replication equals its nodes has no imbalance", "[graph]") {
+  const auto g = Graph::build(kv_behind_client(kv_store(3, 3, 1)));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE(copies_of(store_of(*g)) == 3);
+  REQUIRE(store_of(*g).imbalance == 1.0);
+}
+
+// A scenario built in code skips the loader, so Graph::build says the same words (as it does
+// for a worker pool without `consumes`).
+TEST_CASE("Graph::build refuses a kv_cluster built in code with an impossible shape", "[graph]") {
+  const auto refused = [](NodeSpec store) {
+    const auto g = Graph::build(kv_behind_client(std::move(store)));
+    REQUIRE_FALSE(g.has_value());
+    return g.error().message;
+  };
+  SECTION("no nodes") {
+    NodeSpec store{.id = "store", .type = NodeType::kv_cluster};
+    REQUIRE(refused(store) == "node 'store': kv_cluster needs nodes");
+  }
+  SECTION("replication above nodes") {
+    REQUIRE(refused(kv_store(3, 5)) == "node 'store': replication must be at most nodes (5 > 3)");
+  }
+  SECTION("a write quorum above replication") {
+    auto store = kv_store(5, 3);
+    store.write_quorum = 4;
+    REQUIRE(refused(store) == "node 'store': write_quorum must be at most replication (4 > 3)");
+  }
+  SECTION("a read quorum above replication") {
+    auto store = kv_store(5, 3);
+    store.read_quorum = 4;
+    REQUIRE(refused(store) == "node 'store': read_quorum must be at most replication (4 > 3)");
+  }
+  SECTION("vnodes of zero, in the balancer's words") {
+    REQUIRE(refused(kv_store(8, 3, 0)) == "node 'store': vnodes must be a positive integer");
+  }
+}

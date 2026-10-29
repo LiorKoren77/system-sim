@@ -150,3 +150,87 @@ TEST_CASE("lognormal_quantile survives means whose square underflows a double", 
   REQUIRE(std::isfinite(q));
   REQUIRE(q > 0.0);
 }
+
+// ---- Order statistics of exponentials (plan 2c Task 10; book ch. 6 quorum consensus) ----
+//
+// A kv_cluster's coordinator sends a read to all N replicas and answers after the R-th reply
+// (the R-th FASTEST of N), a write after the W-th. If each replica's sojourn is exponential with
+// mean m and the replicas are independent, the k-th smallest of n of them has a closed form
+// (Renyi's representation): it is a sum of k independent exponentials, the i-th (i = 0 .. k-1)
+// being the wait for the first of the n - i replicas still running to finish, with mean
+// m / (n - i). So
+//   mean     = m * sum_{i=0}^{k-1} 1 / (n - i)
+//   variance = m^2 * sum_{i=0}^{k-1} 1 / (n - i)^2        (independent terms: variances add)
+// Worked for n = 3 and m = 1 ms (the harmonic-like sums are 1/3, 1/3 + 1/2, 1/3 + 1/2 + 1):
+//   k = 1  mean 1/3 = 0.3333 ms   variance 1/9              = 0.1111 ms^2
+//   k = 2  mean 5/6 = 0.8333 ms   variance 1/9 + 1/4        = 0.3611 ms^2 (= 13/36)
+//   k = 3  mean 11/6 = 1.8333 ms  variance 1/9 + 1/4 + 1    = 1.3611 ms^2 (= 49/36)
+// The signature proposed here: exponential_order_statistic(n, k, mean_s) returns the same
+// {mean_s, variance_s2} shape as mmc_wait (the project's moment pair), the mean in seconds.
+TEST_CASE("the k-th fastest of three exponential replicas has Renyi's mean and variance",
+          "[queueing]") {
+  constexpr double m = 0.001;  // 1 ms
+  SECTION("k = 1: the fastest of three, mean 1/3 ms, variance 1/9 ms^2") {
+    const auto fastest = exponential_order_statistic(3, 1, m);
+    REQUIRE_THAT(fastest.mean_s, WithinRel(1.0 / 3.0 * m, 1e-12));
+    REQUIRE_THAT(fastest.variance_s2, WithinRel(1.0 / 9.0 * m * m, 1e-12));
+  }
+  SECTION("k = 2: the quorum of two, mean 5/6 ms, variance 13/36 ms^2") {
+    const auto second = exponential_order_statistic(3, 2, m);
+    REQUIRE_THAT(second.mean_s, WithinRel(5.0 / 6.0 * m, 1e-12));
+    REQUIRE_THAT(second.mean_s, WithinRel(0.8333e-3, 1e-4));  // the book-sized number
+    REQUIRE_THAT(second.variance_s2, WithinRel(13.0 / 36.0 * m * m, 1e-12));
+    REQUIRE_THAT(second.variance_s2, WithinRel(0.3611e-6, 1e-4));
+  }
+  SECTION("k = 3: the slowest of three, mean 11/6 ms, variance 49/36 ms^2") {
+    const auto slowest = exponential_order_statistic(3, 3, m);
+    REQUIRE_THAT(slowest.mean_s, WithinRel(11.0 / 6.0 * m, 1e-12));
+    REQUIRE_THAT(slowest.mean_s, WithinRel(1.8333e-3, 1e-4));
+    REQUIRE_THAT(slowest.variance_s2, WithinRel(49.0 / 36.0 * m * m, 1e-12));
+    REQUIRE_THAT(slowest.variance_s2, WithinRel(1.3611e-6, 1e-4));
+  }
+}
+
+// n = 1, k = 1 is the exponential itself (mean m, variance m^2: an exponential's standard
+// deviation equals its mean); k = n = 2 is the maximum of two, whose mean is the harmonic number
+// H_2 = 1 + 1/2 = 1.5 times m (the slower of two coin-flip waits) and variance m^2 (1/4 + 1).
+TEST_CASE("one replica is the exponential itself and the slowest of two is 1.5 means",
+          "[queueing]") {
+  const auto only = exponential_order_statistic(1, 1, 0.002);
+  REQUIRE_THAT(only.mean_s, WithinRel(0.002, 1e-12));
+  REQUIRE_THAT(only.variance_s2, WithinRel(0.002 * 0.002, 1e-12));
+  const auto slower_of_two = exponential_order_statistic(2, 2, 0.002);
+  REQUIRE_THAT(slower_of_two.mean_s, WithinRel(1.5 * 0.002, 1e-12));
+  REQUIRE_THAT(slower_of_two.variance_s2, WithinRel(1.25 * 0.002 * 0.002, 1e-12));
+}
+
+// The mean scales with m and the variance with m^2 (a change of time unit): ten times the
+// replica sojourn is ten times the quorum's mean and a hundred times its variance.
+TEST_CASE(
+    "an order statistic scales its mean with the replica mean and its variance with the square",
+    "[queueing]") {
+  const auto base = exponential_order_statistic(5, 3, 0.001);
+  const auto tenfold = exponential_order_statistic(5, 3, 0.010);
+  REQUIRE_THAT(tenfold.mean_s, WithinRel(10.0 * base.mean_s, 1e-12));
+  REQUIRE_THAT(tenfold.variance_s2, WithinRel(100.0 * base.variance_s2, 1e-12));
+}
+
+// Waiting for one more replica never makes the answer sooner: the k-th smallest grows with k.
+TEST_CASE("waiting for more replicas lengthens the mean and the variance", "[queueing]") {
+  for (int k = 1; k < 5; ++k) {
+    CAPTURE(k);
+    const auto fewer = exponential_order_statistic(5, k, 0.001);
+    const auto more = exponential_order_statistic(5, k + 1, 0.001);
+    REQUIRE(more.mean_s > fewer.mean_s);
+    REQUIRE(more.variance_s2 > fewer.variance_s2);
+  }
+}
+
+// A quorum larger than the replica count, or smaller than one, is not a question this function
+// can answer: callers (the loader and Graph::build) have already refused it, so it is a
+// programmer error and throws, like erlang_c with no servers.
+TEST_CASE("a quorum beyond the replicas or below one is a programmer error", "[queueing]") {
+  REQUIRE_THROWS_AS(exponential_order_statistic(3, 4, 0.001), std::invalid_argument);
+  REQUIRE_THROWS_AS(exponential_order_statistic(3, 0, 0.001), std::invalid_argument);
+  REQUIRE_THROWS_AS(exponential_order_statistic(0, 1, 0.001), std::invalid_argument);
+}
