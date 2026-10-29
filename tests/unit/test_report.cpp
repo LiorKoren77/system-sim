@@ -2514,16 +2514,35 @@ TEST_CASE("an op's percentiles never exceed the client's timeout, whatever its s
   }
 }
 
-TEST_CASE("the op table's p99 is the timeout, 200ms, not the 490ms the uncapped fit gives",
+// 10.59 % of the delivered requests time out, more than the 5 % a p95 and the 1 % a p99 leave
+// above them, so the client never saw those quantiles answered: the table prints `>200ms` there
+// (review of plan 2c Task 13, I-1), not the 490 ms of the uncapped fit nor a capped number that
+// looks measured. The p50 (half of the requests) was answered: a number. The `timed out/s` column
+// shows the 104.8/s; the table has it because the client has a timeout.
+TEST_CASE("the op table prints >200ms for a p99 more than 1 percent of whose requests timed out",
           "[report]") {
   const auto s = timing_out(200ms);
   const auto g = *simsys::graph::Graph::build(s);
   const auto table = simsys::report::render_table(summarize(s, g), {}, /*color=*/false);
   CAPTURE(table);
-  // Words of the row: `c.op offered mean p50 p95 p99`.
+  REQUIRE(table.contains("timed out/s"));
+  // Words of the row: `c.op offered timed_out mean p50 p95 p99`.
   const auto row = words_of_line_starting(table, "c.op");
-  REQUIRE(row.size() == 6);
-  REQUIRE(row.back() == "200ms");
+  REQUIRE(row.size() == 7);
+  REQUIRE(row[2] == "104.8");
+  REQUIRE_FALSE(row[4].starts_with(">"));
+  REQUIRE(row[5] == ">200ms");
+  REQUIRE(row[6] == ">200ms");
+}
+
+// Without a timeout nothing times out, and the op table keeps its old six columns.
+TEST_CASE("the op table has no timed out column when no client has a timeout", "[report]") {
+  const auto s = timing_out(std::nullopt);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto table = simsys::report::render_table(summarize(s, g), {}, /*color=*/false);
+  CAPTURE(table);
+  REQUIRE_FALSE(table.contains("timed out"));
+  REQUIRE(words_of_line_starting(table, "c.op").size() == 6);
 }
 
 // ---- SLOs per window: what the report prints (plan 2c Task 14) ----

@@ -57,8 +57,9 @@
   but its wait's. Since plan 2c Task 13 the clients' `timeout: 10s` is applied, and as shipped
   it times out **every** upload: each would be answered at about 12 s (12.0 s in the US, 12.1 s
   in the EU before the timeout), so `run --report json` shows `timed_out_per_s` equal to
-  `offered_per_s` and `answered_per_s` 0 for both clients' `upload`, and the table prints `-`
-  for its latencies (nothing answered). The uploads still reach `original_store` and the
+  `offered_per_s`, `answered_per_s` 0 and `null` latencies for both clients' `upload`, and the
+  table prints its `timed out/s`, `-` for its mean and `>10s` for its percentiles (nothing
+  answered: the clients saw no upload come back within 10 s). The uploads still reach `original_store` and the
   transcoders: nothing cancels them, so every other number of `run`'s table is as before. The
   book's uploads are resumable (chunked, each chunk retried on its own); plan Task 16 resolves
   this, with resumable uploads or a timeout sized for `upload`.

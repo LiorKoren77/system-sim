@@ -242,7 +242,10 @@ per red step, is left out):
 
 The limiter admits the same total at every step, as the paragraph above says. What a coarse
 step erases is the burst's effect downstream: at 1 s the api sees 1,100/s, never overloads,
-and the p99 falls from 29.9 ms to 19.9 ms. A step shorter than the 5 s spike but not a
+and the p99 falls from 29.9 ms to 19.9 ms. (The 29.9 ms was 30.5 ms before the clients'
+`timeout: 1s` applied: cutting 7.3e-7 of the requests, the far tail of the fitted lognormal,
+removes 4.4 % of its variance, and the refit narrows; the requests' own p99 moves by about 1e-6.
+A moment fit reacts to its tail that much.) A step shorter than the 5 s spike but not a
 divisor of it shows the other loss. At `step: 2s` the 5 s spike at 25 min is sampled at
 t = 25:00, 25:02 and 25:04, so it is offered for 6 s: the limiter then prints
 `reject rate 15%` and `rejected 251.7k`, 15,000 more, which is the 1 s of extra spike times

@@ -282,6 +282,72 @@ constexpr std::string_view ansi_reset = "\x1b[0m";
   return out;
 }
 
+// ---- what a client with a timeout sees ----
+
+// A percentile the reports print: its level q and its place on the normal scale, the z-score the
+// lognormal fit reads it at (queueing::lognormal_quantile).
+struct Quantile {
+  double level;
+  double z;
+};
+constexpr Quantile median{.level = 0.50, .z = queueing::z_p50};
+constexpr Quantile ninety_fifth{.level = 0.95, .z = queueing::z_p95};
+constexpr Quantile ninety_ninth{.level = 0.99, .z = queueing::z_p99};
+
+// timed_out / (answered + timed_out): the share of the requests the path delivered that came back
+// after the client had given up; 0 when nothing was delivered.
+[[nodiscard]] double timed_out_share(double answered, double timed_out) {
+  const double delivered = answered + timed_out;
+  return delivered > 0.0 ? timed_out / delivered : 0.0;
+}
+
+// Did more than 1 − q of the delivered requests time out (more than 1 % for a p99)? Then no
+// request at quantile q was answered: the client saw the timeout there.
+[[nodiscard]] bool quantile_timed_out(double share_timed_out, Quantile q) {
+  return share_timed_out > 1.0 - q.level;
+}
+
+// The percentile at q of the response a client sees (plan 2c Task 13 and its review, C-1): the one
+// rule for the whole run's op table and for each window of an SLO's `over` (plan 2c Task 14).
+//  - Without a timeout: the lognormal fitted to the answered requests' mean and variance.
+//  - With one, when more than 1 − q of the delivered requests timed out: the timeout, flagged
+//    `beyond_timeout`. A latency SLO at q then fails whatever its max: past a max below the
+//    timeout the requests are certainly slower, and a max at or above it cannot be checked
+//    (the client stopped measuring at the timeout).
+//  - With one, otherwise: the fit, capped at the timeout. The fit to the answered requests'
+//    truncated moments has a tail past the cut that the truncated distribution does not (mean
+//    73.97 ms, variance 0.0021022 s² after a 200 ms timeout put its p99 at 236.7 ms); the cap is
+//    the truncation it forgets.
+// The cap alone is not enough: the refit's p99 stays below the timeout though more than 1 %
+// timed out (an exponential path of mean 100 ms against 391 ms: 2 % time out, the refit's p99 is
+// 357 ms, 0.91 of the timeout), and an SLO of 380 ms would pass on requests never answered.
+struct SeenPercentile {
+  double seconds;
+  bool beyond_timeout;
+};
+
+[[nodiscard]] SeenPercentile percentile_seen_by_client(double mean_s, double variance_s2,
+                                                       double share_timed_out,
+                                                       std::optional<double> timeout_s,
+                                                       Quantile q) {
+  if (timeout_s && quantile_timed_out(share_timed_out, q)) {
+    return {.seconds = *timeout_s, .beyond_timeout = true};
+  }
+  const double fitted = queueing::lognormal_quantile(mean_s, variance_s2, q.z);
+  return {.seconds = timeout_s ? std::min(fitted, *timeout_s) : fitted, .beyond_timeout = false};
+}
+
+// The same question of a summarised op.
+[[nodiscard]] bool beyond_timeout(const OpSummary& op, Quantile q) {
+  return op.timeout_s && quantile_timed_out(op.timed_out_share, q);
+}
+
+// An op the path delivered something of but answered nothing of in time: no answered request has a
+// latency (the JSON's null; the engine's stand-in moments are the timeout, never a measurement).
+[[nodiscard]] bool nothing_answered_in_time(const OpSummary& op) {
+  return op.answered_per_s <= 0.0 && op.timed_out_per_s > 0.0;
+}
+
 // ---- SLO evaluation ----
 
 // The "overloaded" idiom: one object whose operator() is overloaded by every lambda it is
@@ -407,6 +473,34 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
   if (committed_per_s > 0.0) result.note += " (" + percent(missed_per_s / committed_per_s) + ")";
 }
 
+// The quantile a latency SLO bounds.
+[[nodiscard]] Quantile quantile_of(model::SloMetric metric) {
+  if (metric == model::SloMetric::p50_latency) return median;
+  if (metric == model::SloMetric::p95_latency) return ninety_fifth;
+  return ninety_ninth;
+}
+
+// A latency SLO at quantile q on an op of which more than 1 − q of the delivered requests timed
+// out fails whatever its max (percentile_seen_by_client): it observes the timeout and says why,
+// "57.3% of delivered requests timed out (more than 1%)", naming the op when the SLO names none
+// (the op with the largest timed-out share speaks for the client).
+void fail_if_quantile_timed_out(SloResult& result, std::span<const OpSummary> ops) {
+  const Quantile q = quantile_of(result.slo.metric);
+  const OpSummary* worst = nullptr;
+  for (const auto& op : ops) {
+    if (op.client != result.slo.node.value_or("")) continue;
+    if (result.slo.op && op.op != *result.slo.op) continue;
+    if (!beyond_timeout(op, q)) continue;
+    if (worst == nullptr || op.timed_out_share > worst->timed_out_share) worst = &op;
+  }
+  if (worst == nullptr) return;
+  result.status = SloStatus::fail;
+  result.observed = *worst->timeout_s;
+  const std::string requests = result.slo.op ? "requests" : worst->op + " requests";
+  result.note = percent(worst->timed_out_share) + " of delivered " + requests +
+                " timed out (more than " + percent(1.0 - q.level) + ")";
+}
+
 // An SLO with nothing observed: the run has nothing the metric is measured on (a staleness on a
 // node that is no database, a queue lag with no message queue, a frontier's before phase 3), or
 // no step was observed.
@@ -429,6 +523,7 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
   SloResult result{
       .slo = slo, .observed = observed, .status = within ? SloStatus::pass : SloStatus::fail};
   if (slo.metric == model::SloMetric::staleness) fail_if_replica_falls_behind(result, nodes);
+  if (is_latency(slo.metric)) fail_if_quantile_timed_out(result, ops);
   return result;
 }
 
@@ -567,16 +662,32 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
   return op.answered_per_s > 0.0 ? fmt_duration(seconds_value) : "-";
 }
 
+// A percentile's cell: `>1s` when more than 1 − q of the delivered requests timed out (the client
+// never saw that quantile answered: percentile_seen_by_client), else as any latency cell.
+[[nodiscard]] std::string op_percentile_cell(const OpSummary& op, double seconds_value,
+                                             Quantile q) {
+  if (beyond_timeout(op, q)) return ">" + fmt_duration(*op.timeout_s);
+  return op_latency_cell(op, seconds_value);
+}
+
+// The `timed out/s` column (plan 2c Task 13's review, I-1) is there when some client has a
+// timeout: without one nothing can time out, and the table keeps its old shape.
 [[nodiscard]] std::string op_table(const Summary& summary) {
-  std::vector<Row> rows{
-      {{"client.op"}, {"offered/s"}, {"mean"}, {"p50"}, {"p95"}, {"p99"}, {"(estimated)"}}};
-  for (const auto& op : summary.ops()) {
-    rows.push_back({{op.client + "." + op.op},
-                    {with_si_prefix(op.offered_per_s)},
-                    {op_latency_cell(op, op.mean_s)},
-                    {op_latency_cell(op, op.p50_s)},
-                    {op_latency_cell(op, op.p95_s)},
-                    {op_latency_cell(op, op.p99_s)}});
+  const auto ops = summary.ops();
+  const bool any_timeout =
+      std::ranges::any_of(ops, [](const OpSummary& op) { return op.timeout_s.has_value(); });
+  Row header{{"client.op"}, {"offered/s"}};
+  if (any_timeout) header.push_back({"timed out/s"});
+  header.insert(header.end(), {{"mean"}, {"p50"}, {"p95"}, {"p99"}, {"(estimated)"}});
+  std::vector<Row> rows{std::move(header)};
+  for (const auto& op : ops) {
+    Row row{{op.client + "." + op.op}, {with_si_prefix(op.offered_per_s)}};
+    if (any_timeout) row.push_back({with_si_prefix(op.timed_out_per_s)});
+    row.insert(row.end(), {{op_latency_cell(op, op.mean_s)},
+                           {op_percentile_cell(op, op.p50_s, median)},
+                           {op_percentile_cell(op, op.p95_s, ninety_fifth)},
+                           {op_percentile_cell(op, op.p99_s, ninety_ninth)}});
+    rows.push_back(std::move(row));
   }
   return "ops (percentiles estimated: lognormal fit to the response moments)\n" + aligned(rows);
 }
@@ -698,16 +809,20 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
   return json_object(fields);
 }
 
+// An op of which nothing was answered in time has no latency to report: null, as for a path that
+// never answers (the numbers it holds are the client's waits, not answers).
 [[nodiscard]] std::string json_op(const OpSummary& op) {
+  const bool no_latency = nothing_answered_in_time(op);
+  const auto latency = [&](double value) { return no_latency ? "null" : json_number(value); };
   const std::array fields{json_field("client", json_string(op.client)),
                           json_field("op", json_string(op.op)),
                           json_field("offered_per_s", json_number(op.offered_per_s)),
                           json_field("answered_per_s", json_number(op.answered_per_s)),
                           json_field("timed_out_per_s", json_number(op.timed_out_per_s)),
-                          json_field("mean_s", json_number(op.mean_s)),
-                          json_field("p50_s", json_number(op.p50_s)),
-                          json_field("p95_s", json_number(op.p95_s)),
-                          json_field("p99_s", json_number(op.p99_s))};
+                          json_field("mean_s", latency(op.mean_s)),
+                          json_field("p50_s", latency(op.p50_s)),
+                          json_field("p95_s", latency(op.p95_s)),
+                          json_field("p99_s", latency(op.p99_s))};
   return json_object(fields);
 }
 
@@ -2448,8 +2563,9 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   return t_s + "," + id + ",0,0,0,0,0,0,0,none,\n";
 }
 
-// One (client, op) of a step: what it offered, what came back answered, and the mean
-// response of an answered request in milliseconds (`inf` when the path never answers).
+// One (client, op) of a step: what it offered, what came back answered, what came back after the
+// client's timeout (0 without one), and the mean response of an answered request in milliseconds
+// (`inf` when the path never answers).
 [[nodiscard]] std::string csv_op_row(const std::string& t_s, const std::string& client,
                                      const engine::ResponseSample& r) {
   const std::array fields{t_s,
@@ -2457,19 +2573,9 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
                           r.op,
                           num(r.offered.per_second, 6),
                           num(r.answered.per_second, 6),
+                          num(r.timed_out.per_second, 6),
                           num(r.response.mean_s * 1000.0, 6)};
   return join(fields, ",") + "\n";
-}
-
-// A client's timeout bounds what it reports (plan 2c Task 13): every answered request took less
-// than the timeout, so no percentile can be longer. The lognormal refitted to the answered
-// requests' moments has a tail past the cut that the truncated distribution does not (mean
-// 73.97 ms, variance 0.0021022 s^2 after a 200 ms timeout put its p99 at 236.7 ms); the cap is
-// the truncation it forgets. The mean needs no cap: a truncated mean is below the cut.
-void cap_percentiles(OpSummary& op, double timeout_s) {
-  op.p50_s = std::min(op.p50_s, timeout_s);
-  op.p95_s = std::min(op.p95_s, timeout_s);
-  op.p99_s = std::min(op.p99_s, timeout_s);
 }
 
 }  // namespace
@@ -2658,28 +2764,35 @@ std::vector<OpSummary> Summary::ops() const {
                  .op = t.op,
                  .offered_per_s = observed_s_ > 0.0 ? t.offered / observed_s_ : 0.0,
                  .answered_per_s = observed_s_ > 0.0 ? t.answered / observed_s_ : 0.0,
-                 .timed_out_per_s = observed_s_ > 0.0 ? t.timed_out / observed_s_ : 0.0};
+                 .timed_out_per_s = observed_s_ > 0.0 ? t.timed_out / observed_s_ : 0.0,
+                 .timeout_s = graph::client_timeout_s(client),
+                 .timed_out_share = timed_out_share(t.answered, t.timed_out)};
     const Moments& m = t.by_answered.weight > 0.0 ? t.by_answered : t.by_time;
     if (t.unavailable) {
       op.mean_s = op.p50_s = op.p95_s = op.p99_s = infinity;
     } else if (m.weight > 0.0) {
-      // Law of total variance over the steps: Var X = E[X²] − (E[X])², where E[X²] already
-      // holds each step's own spread (v) and the spread between step means (m²). Assumes a
-      // request's step is chosen in proportion to the requests answered in it.
-      op.mean_s = m.weighted_mean / m.weight;
-      const double variance = m.weighted_square / m.weight - op.mean_s * op.mean_s;
-      // Lognormal moment fit (Fenton-Wilkinson, see queueing::lognormal_quantile): an
-      // estimate, which is why every renderer labels the percentiles "estimated".
-      op.p50_s = queueing::lognormal_quantile(op.mean_s, variance, queueing::z_p50);
-      op.p95_s = queueing::lognormal_quantile(op.mean_s, variance, queueing::z_p95);
-      op.p99_s = queueing::lognormal_quantile(op.mean_s, variance, queueing::z_p99);
-      if (client.workload && client.workload->timeout) {
-        cap_percentiles(op, seconds(*client.workload->timeout));
-      }
+      fill_latencies(m, op);
     }
     out.push_back(std::move(op));
   }
   return out;
+}
+
+// Law of total variance over the steps: Var X = E[X²] − (E[X])², where E[X²] already holds each
+// step's own spread (v) and the spread between step means (m²). Assumes a request's step is chosen
+// in proportion to the requests answered in it. The percentiles are a lognormal moment fit
+// (Fenton-Wilkinson, see queueing::lognormal_quantile): an estimate, which is why every renderer
+// labels them "estimated"; percentile_seen_by_client applies the client's timeout.
+void Summary::fill_latencies(const Moments& m, OpSummary& op) {
+  op.mean_s = m.weighted_mean / m.weight;
+  const double variance = m.weighted_square / m.weight - op.mean_s * op.mean_s;
+  const auto seen = [&](Quantile q) {
+    return percentile_seen_by_client(op.mean_s, variance, op.timed_out_share, op.timeout_s, q)
+        .seconds;
+  };
+  op.p50_s = seen(median);
+  op.p95_s = seen(ninety_fifth);
+  op.p99_s = seen(ninety_ninth);
 }
 
 // Per node, not per scenario: a node's drops are a fraction of what it was sent, so the
@@ -2871,7 +2984,7 @@ void SeriesWriter::observe(const engine::StepRecord& record) {
 
 OpSeriesWriter::OpSeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out} {
   for (const auto& node : g.nodes()) ids_.push_back(node.spec.id);
-  *out_ << "t_s,client,op,offered_per_s,answered_per_s,mean_ms\n";
+  *out_ << "t_s,client,op,offered_per_s,answered_per_s,timed_out_per_s,mean_ms\n";
 }
 
 // One row per response sample, in the record's order (clients by node index, ops by name), with

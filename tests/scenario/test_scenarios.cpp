@@ -657,6 +657,25 @@ TEST_CASE("labs/unique-id runs and, with the ticket server carrying the load, fa
   REQUIRE_THAT(*drops.observed, Catch::Matchers::WithinAbs(0.339, 2e-3));
 }
 
+// Every id the ticket server issues comes back after the services' 50 ms timeout (its full queue of
+// 1000 at 8k/s is 125 ms of wait), so none is answered: 100 % of the delivered requests time out.
+// A p99 SLO then fails whatever its max (review of plan 2c Task 13, C-1): a max of 1 s, twenty
+// times the timeout, cannot be checked by a client that stopped waiting at 50 ms, and nothing it
+// saw was faster. It observes the timeout and says why.
+TEST_CASE("labs/unique-id fails a p99 SLO of 1 s: every delivered id timed out at 50 ms",
+          "[scenario]") {
+  auto s = load_scenario("/labs/unique-id/scenario.yaml");
+  auto& p99 = *std::ranges::find(s.slos, simsys::model::SloMetric::p99_latency,
+                                 &simsys::model::SloSpec::metric);
+  p99.max = simsys::SimTime{std::chrono::seconds{1}};
+  const auto results = run_slos(std::move(s));
+  const auto& latency = slo_of(results, simsys::model::SloMetric::p99_latency);
+  CAPTURE(latency.note);
+  REQUIRE(latency.status == simsys::report::SloStatus::fail);
+  REQUIRE(latency.observed == 0.05);
+  REQUIRE(latency.note == "100% of delivered requests timed out (more than 1%)");
+}
+
 // Switching the link weights, as the lab's comment says, routes everything to the four
 // snowflake generators: 16M ids/s of capacity against 10k/s (30k/s in the spike), so nothing
 // drops and every SLO passes. The lab's two links are written in this order: ticket_server,
@@ -1261,4 +1280,44 @@ TEST_CASE(
   // The relation: url_db is sent what id_gen issued.
   REQUIRE_THAT(ticket.url_db_demand / snowflake.url_db_demand,
                Catch::Matchers::WithinRel(1.0 - ticket.id_gen_drop_rate(), 1e-6));
+}
+
+// The same variant with everything else as shipped (reads, the 0.09 share of shortens, the che
+// cache): what its clients see over the day (plan 2c Task 13's scenario pin, added by its review,
+// I-3). A shorten first asks the ticket server for an id; the server's full queue drops 0.2309 of
+// the requests (its drop rate) and makes the rest slow, past the clients' 1 s timeout for a third
+// of them. Of the 1,152.7 shortens offered a second:
+//   lost to id_gen      1,152.7 x 0.2309            = 266.1/s  (a step after a failed step does
+//                                                               not run: never written either)
+//   delivered           1,152.7 - 266.1             = 886.6/s
+//   timed out           293.6/s of the 886.6 delivered (0.331: the lognormal's share above 1 s)
+//   answered            886.6 - 293.6               = 593.0/s
+// and since more than 1 % of the delivered shortens timed out, the p99 the client saw is the
+// timeout itself, exactly 1 s (review of Task 13, C-1). The timed-out ones were delivered: they are
+// counted from what the path delivered, not from what was offered.
+TEST_CASE(
+    "book/url-shortener with a ticket server answers 593 shortens a second and times out 293.6",
+    "[scenario]") {
+  auto s = load_scenario("/book/url-shortener/scenario.yaml");
+  auto& id_gen = *std::ranges::find(s.nodes, "id_gen", &simsys::model::NodeSpec::id);
+  id_gen.id_algorithm = simsys::model::IdAlgorithm::ticket_server;
+  id_gen.replicas = 1;
+  const auto g = build_or_fail(s);
+  simsys::report::Summary summary{g, s.warmup};
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  sim->run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
+  const auto ops = summary.ops();
+  const auto shorten = std::ranges::find(ops, "shorten", &simsys::report::OpSummary::op);
+  REQUIRE(shorten != ops.end());
+  const double lost = shorten->offered_per_s - shorten->answered_per_s - shorten->timed_out_per_s;
+  CAPTURE(shorten->offered_per_s, shorten->answered_per_s, shorten->timed_out_per_s, lost);
+  REQUIRE_THAT(shorten->offered_per_s, Catch::Matchers::WithinRel(1152.7, 1e-4));
+  REQUIRE_THAT(shorten->answered_per_s, Catch::Matchers::WithinRel(593.0, 1e-3));
+  REQUIRE_THAT(shorten->timed_out_per_s, Catch::Matchers::WithinRel(293.6, 1e-3));
+  REQUIRE_THAT(lost, Catch::Matchers::WithinRel(266.1, 1e-3));
+  // The share lost is the ticket server's drop rate: the shortens it failed and nothing else.
+  REQUIRE_THAT(lost / shorten->offered_per_s,
+               Catch::Matchers::WithinRel(summary.drop_rate("id_gen"), 1e-3));
+  REQUIRE(shorten->p99_s == 1.0);
 }

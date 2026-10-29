@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
@@ -222,6 +223,60 @@ TEST_CASE(
   const double answered = op_field(json, "c", "op", "answered_per_s");
   REQUIRE(timed_out == 0.0);
   REQUIRE_THAT(answered, WithinRel(demand_per_s, 1e-9));
+}
+
+// ---- A latency SLO against a timeout (review of plan 2c Task 13, C-1) ----
+//
+// The same exponential path, mean 100 ms (lognormal fit: sigma^2 = ln 2, sigma = 0.83255,
+// mu = ln 0.1 - sigma^2 / 2 = -2.64916). The share of it slower than a timeout L is
+//   P(X > L) = 1 - Phi((ln L - mu) / sigma)
+//   L = 391 ms:  z = (-0.93905 + 2.64916) / 0.83255 = 2.0541, P = 0.0200: 2 % time out
+//   L = 604 ms:  z = (-0.50418 + 2.64916) / 0.83255 = 2.5764, P = 0.0050: 0.5 % time out
+// At 391 ms more than the 1 % a p99 leaves above it time out: no request at the 99th percentile
+// was answered, so the client's p99 is the timeout and a p99 SLO fails whatever its max. The
+// answered requests' own refit has its p99 at 357 ms (0.91 of the timeout), so without the rule a
+// max of 380 ms would pass on requests nobody answered (it failed at 490 ms before the timeout).
+// At 604 ms only 0.5 % time out: the p99 and the p50 were answered, and their capped percentiles
+// pass any max at or above the timeout.
+namespace {
+simsys::model::SloSpec latency_slo(simsys::model::SloMetric metric, simsys::SimTime max) {
+  return simsys::model::SloSpec{.metric = metric, .node = "c", .op = "op", .max = max};
+}
+
+std::vector<simsys::report::SloResult> verdicts(simsys::SimTime timeout,
+                                                std::vector<simsys::model::SloSpec> slos) {
+  const auto s = slow_exponential_path(timeout);
+  const auto g = *Graph::build(s);
+  return simsys::report::evaluate_slos(summarize(g, 1s, s.step), slos);
+}
+}  // namespace
+
+TEST_CASE("a p99 SLO of 380 ms fails when 2 percent time out at 391 ms: it observes the timeout",
+          "[theory]") {
+  using simsys::model::SloMetric;
+  const auto results = verdicts(391ms, {latency_slo(SloMetric::p99_latency, 380ms)});
+  REQUIRE(results.size() == 1);
+  CAPTURE(results[0].note);
+  REQUIRE(results[0].status == simsys::report::SloStatus::fail);
+  REQUIRE(results[0].observed == 0.391);
+  // C++20 std::string::ends_with: a suffix test in one call, replacing a compare() on the tail
+  // (or rfind arithmetic); the share's digits in front are whatever the fit gives (about 2).
+  REQUIRE(results[0].note.ends_with("% of delivered requests timed out (more than 1%)"));
+}
+
+TEST_CASE("p99 and p50 SLOs at the timeout pass when only 0.5 percent time out at 604 ms",
+          "[theory]") {
+  using simsys::model::SloMetric;
+  const auto results = verdicts(
+      604ms, {latency_slo(SloMetric::p99_latency, 604ms),
+              latency_slo(SloMetric::p50_latency, 604ms), latency_slo(SloMetric::p99_latency, 1s)});
+  REQUIRE(results.size() == 3);
+  for (const auto& result : results) {
+    CAPTURE(result.note);
+    REQUIRE(result.status == simsys::report::SloStatus::pass);
+    REQUIRE(result.note.empty());
+    REQUIRE(*result.observed <= 0.604);
+  }
 }
 
 // ---- The shipped youtube scenario: 300 MB uploads against a 10 s timeout ----

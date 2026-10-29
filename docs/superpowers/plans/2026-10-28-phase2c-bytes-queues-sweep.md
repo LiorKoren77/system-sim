@@ -337,7 +337,7 @@
 
 ### Task 13: Client timeout
 
-**Files:** `src/queueing/queueing.cppm` (`normal_cdf`, `lognormal_below(mean, variance, limit)` → `{fraction, mean_s, variance_s2}`), `src/engine/engine.cppm` (`client_responses` applies the client's `timeout`), `src/report/report.cppm`, `src/report/report.cpp` (percentiles capped at the timeout; JSON `timed_out_per_s`), `scenarios/book/url-shortener/README.md` (the timeout bullet; the ticket-server variant's shorten numbers), tests in `test_queueing.cpp`, `test_theory.cpp`, `test_report.cpp`.
+**Files:** `src/queueing/queueing.cppm` (`normal_cdf`, `lognormal_below(mean, variance, limit)` → `{fraction, mean_s, variance_s2}`), `src/engine/engine.cppm` (`client_responses` applies the client's `timeout`), `src/report/report.cppm`, `src/report/report.cpp` (percentiles capped at the timeout; JSON `timed_out_per_s`), `scenarios/book/url-shortener/README.md` (the timeout bullet; the ticket-server variant's shorten numbers), tests in `test_queueing.cpp`, `tests/theory/test_timeout.cpp` (planned as `test_theory.cpp`; corrected by the review, minor 7), `test_report.cpp`.
 
 - [x] Tests: `lognormal_below(0.1, 0.01, 0.2)`: fraction **0.89414**, mean **0.073970 s**, variance 0.0021022 s²; limit 1 s → fraction 0.99927; 50 ms → 0.33860; a limit of infinity returns the input moments and fraction 1. Theory: a client with `timeout: 200ms` whose path has mean 100 ms and variance 0.01 s² reports answered 0.8941 × offered, the answered mean 73.97 ms, `timed_out_per_s` = 0.1059 × offered, p99 ≤ 200 ms; the server's demand is unchanged (the work is still done); no `timeout` → unchanged. Scenario: under the ticket-server variant `shorten` (p99 2.42 s without the timeout) now reports p99 capped at 1 s and an answered rate below its offered rate by the timed-out share; the README states both measured.
   The client's `timeout` must see the last-byte response of uploads (Task 3 fix round, I2): youtube's 300 MB uploads are writes answered at 12 s + wait, a deterministic transfer (second fix round, I2: response p99 12.40 s, p1 11.64 s), so its `timeout: 10s` times out **100 %** of them unless Task 16 changes the timeout (resumable uploads per the book); pin it, and say in the youtube README whether the timeout or the upload path changes.
@@ -381,6 +381,53 @@
   re-measure its README numbers with the timeout applied). Observed, not fixed: search-autocomplete's "Things to try" says
   `trie_cache.keys: 1M` fails the p99 SLO, but it passes at 9.27 ms before and after this task
   (Task 18's README pass). 1077 tests; green in Debug and Release except Task 14's 21 red tests.
+
+---
+
+**Review of Task 13 at 691a3ef (adversarial, REQUEST_CHANGES, one critical) — fix round done by the Task 14 implementer as its own commit between the Task 12 fix round and Task 14's green.** Verified: both presets, 1077 tests, exactly the 21 Task 14 reds; `lognormal_below` re-derived by closed form and numerical integration (pins to 1e-9; timeout = mean 0.661396; variance 100 m²; variance 1e-14 above/below the mean; sub-1e-300 limits, zero/negative limit, mean 0 all finite); the timeout applies only to the `ResponseSample` in `client_responses` (no thinning of later steps, server demand unchanged, delivered = answered + timed out); run = estimate on a steady probe (970.21 answered, 19.785 timed out, p99 357.39 ms); conservation offered = answered + lost + timed out to 1.5e-12 on youtube, unique-id, the ticket variant, kv-store at 8 and 4 nodes and `vnodes: 1` + W = 3; youtube at timeouts 11.9/12.05/12.2/13 s (US answered from 12.05, EU from 12.2); every README/pin re-quote; first-use comments; no invented patterns; test names.
+
+- [x] **C-1 Latency SLOs pass while requests time out; adding a timeout can turn FAIL into PASS** (`report.cpp` ~2464–2473 `cap_percentiles`, ~2676–2678, ~372–378 `observe_metric`; `config.cpp` ~2112 accepts `timeout: 0s`). Evidence: hello with `timeout: 0s` (100 % timed out): p99 SLO max 1 ms and p50 SLO max 1 µs both PASS at observed 0 s, exit 0 (same with 1 ns); `timeout: 1ms` (67 % timed out) passes a p99 of max 1 ms at 1 ms; an M/M/1 path (mean 100 ms, 990/s) with `timeout: 391ms` times out 2 % (> the 1 % a p99 allows) yet the p99 SLO with max 380 ms PASSes at 357 ms where it FAILed at 490 ms without the timeout. The assumption "the p99 is already the timeout when > 1 % time out" is false: the refit's p99 / timeout is 0.91 at SCV 1 with 2 % out, 0.90 at SCV 10 with 5 %, 0.93 at SCV 100 with 10 %. Rule: for a latency SLO at quantile q on an op whose client has a timeout, s = timed_out / (answered + timed_out) over the observed steps; if s > 1 − q the SLO FAILs whatever its `max`, observed = the timeout, note `57.3 % of delivered requests timed out (more than 1 %)`; else the capped answered percentile (then exact). Refuse `timeout` ≤ 0 at load (`timeout must be positive`). Schema ~1155: delete "a latency SLO whose max is at or above the client's timeout cannot fail", state the rule. Tests: `timeout: 0s` refused; 2 % timed out → p99 max 380 ms FAILs; a 100 %-timed-out op FAILs an SLO with max ≥ the timeout (unique-id, `max: 1s`); 0.5 % timed out with max ≥ timeout → p99 and p50 PASS. The same rule and cap must serve Task 14's windows: one helper, e.g. `percentile_seen_by_client(moments, share_timed_out, timeout, z)` (minor 4).
+- [x] **I-1 The run table hides timeouts** (`report.cpp` ~566–581): kv-store at 8 nodes shows `95.3ms 95.2ms 100ms 100ms` with 56 % timed out; unique-id prints `-` while the SLO row says 50 ms. Fix: a `timed out/s` column (at least when any client has a timeout) and, with C-1, `>100ms` in a percentile column where s > 1 − q.
+- [x] **I-2 JSON prints made-up latencies for an op with nothing answered:** `Summary::ops` falls back to `by_time`, which holds `lognormal_below`'s stand-in (the timeout, or 0 at `timeout: 0s`): youtube upload `mean_s` 9.99999999994 / `p99_s` 10, unique-id `mean_s` 0.0495. Fix: `null` when `by_answered.weight == 0 && timed_out > 0` (keep the limiter-refuses-everything fallback). The underflow guard's {limit, zero spread} is the right limit; it must just never be shown.
+- [x] **I-3 Missing plan-required test:** the ticket-server variant's shorten numbers (593.0 answered, 293.6 timed out, 266.1 lost, p99 == 1.0), i.e. losses and a timeout together with answered = offered − lost − timed out and timed_out taken from delivered.
+- [x] Minors: 1 rate-limiter p99 30.5 → 29.9 ms is a moment-fit artefact (the cut removes 7.3e-7 of requests carrying 4.4 % of the fitted variance; the requests' own p99 moves ~1e-6): accept, no skip threshold (a discontinuity), one clause in `rate-limiter/README.md` ~86–90 and numerics.md; 2 consistent-hashing `vnodes: 1` README ~73–76: the "slowest 0.5 % time out" is the fit's tail over a two-peaked mixture (51 % at ≈ 67 ms, 49 % at ≈ 1 ms): say so; rewrap line 76; 3 design spec line 85 still lists timeouts among drops: fix or add a §17 entry; 4 one shared helper for the cap + C-1 rule used by `Summary::ops` and Task 14's windows; 5 the timeout is read from the spec in the report and from `ClientBehaviour::timeout_s()` in the engine: one source; 6 `--series-ops` CSV has no `timed_out_per_s` column: add it (schema row); 7 the plan's Task 13 file list says `test_theory.cpp`, the tests are in `tests/theory/test_timeout.cpp`; 8 `lognormal_below` comment: a zero-spread response equal to the timeout counts as answered (as variance → 0 it tends to half).
+- [x] Commit `report: a latency SLO fails when its quantile timed out; timeouts shown in the table, null in JSON for nothing answered; review nits`.
+  Fix round notes: C-1 one helper in `report.cpp`, `percentile_seen_by_client(mean, variance,
+  share_timed_out, timeout, quantile)` (a `Quantile` is its level and z), used by `Summary::ops`
+  (through `Summary::fill_latencies`) and, in Task 14, by each window; `OpSummary` gained
+  `timeout_s` and `timed_out_share`; `fail_if_quantile_timed_out` (after `evaluate_slo`'s
+  verdict) fails a latency SLO, observed = the timeout, note `57.3% of delivered requests timed
+  out (more than 1%)` (`percent`'s format; the op is named when the SLO names none); the loader
+  refuses `timeout` ≤ 0 (`node 'u': timeout must be positive`). Tests: config `a client's timeout
+  of zero is refused: a timeout is a positive wait` (0s, 0ms); theory `a p99 SLO of 380 ms fails
+  when 2 percent time out at 391 ms: it observes the timeout` and `p99 and p50 SLOs at the
+  timeout pass when only 0.5 percent time out at 604 ms`; scenario `labs/unique-id fails a p99
+  SLO of 1 s: every delivered id timed out at 50 ms`. Schema: the latency row and the timeout
+  paragraph state the rule (the "cannot fail" sentence is gone). I-1 `timed out/s` column after
+  `offered/s` when some client has a timeout (so 9 of the 10 runnable scenarios' tables gain it;
+  hello's does not), `>100ms` in a percentile column past its share (`op_percentile_cell`); the
+  Task 13 report test now pins `>200ms` for p95 and p99 and a new one the six-column table
+  without a timeout. I-2 `json_op` prints `null` latencies when nothing was answered in time and
+  something timed out (`nothing_answered_in_time`, read from answered_per_s = 0, the same as
+  `by_answered.weight == 0`); youtube's two `upload` rows and unique-id's `next_id`. I-3 scenario
+  test `book/url-shortener with a ticket server answers 593 shortens a second and times out
+  293.6` (offered 1,152.7, answered 593.0, timed out 293.6, lost 266.1 = id_gen's drop rate,
+  p99 == 1.0). Minors: 1 rate-limiter README and numerics.md (rate-limiter step table) explain
+  the 30.5 → 29.9 ms as the fit's reaction to its tail; 2 consistent-hashing README reworded and
+  rewrapped; 3 design spec §3.3's zones line no longer counts timeouts among drops; 4 the helper
+  above; 5 `graph::client_timeout_s(spec)`, read by `ClientBehaviour` and the report; 6
+  `--series-ops` gained `timed_out_per_s` before `mean_ms` (schema, root README, spec §18 entry;
+  `test_series.cpp`'s chain hash re-derived from 691a3ef's output with the column inserted,
+  0x9dfc7de84e1afe59 → 0xa2e246b7176cc3f3); 7 Task 13's file list; 8 the comment line. Output
+  against the Task 12 fix round: every `run`/`estimate` table but hello's gains the `timed out/s`
+  column (values 0 except youtube's uploads 3.994 and 1.997 with `>10s`, unique-id's 8k with
+  `>50ms` and its SLO note, rate-limiter 0.0007284, news-feed 1.134e-05 / 0.05332 / 0.00456,
+  search-autocomplete's suggest 1.794e-08, youtube EU stream 1.899e-07); JSON changed only for
+  youtube's uploads and unique-id (null latencies, the note); no SLO status of a shipped scenario
+  moved. README re-quotes: root README's chain and rate-limiter tables, unique-id, kv-store
+  (`nodes: 8`: 56.2 % timed out, `>100ms`, the note; `vnodes: 1, write_quorum: 3`: 7.43 %),
+  youtube, url-shortener (ticket variant's `>1s`). 1086 tests; green in both presets except Task
+  14's 21.
 
 ---
 
