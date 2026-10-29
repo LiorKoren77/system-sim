@@ -42,7 +42,8 @@ same design's other limit, one database's throughput below the 10k/s requirement
   (one database; default 1k/s, spec §6 writes)`.
 - The ticket server as one capacity-limited queue facing more than it can serve: its waiting
   room fills, the wait grows to queue / rate (1000 / 8k/s = 125 ms), and the excess is dropped.
-- Link `weight` as the switch between the two designs (`sweep` over it is planned for phase 2c).
+- Link `weight` as the switch between the two designs (edit it by hand: a link is a list entry,
+  and `simsys sweep` reaches only keys in maps, `nodes.<id>.<key>`).
 
 ## What it abstracts away
 - Clock skew and NTP, the bit layout, datacenter and machine ids (the 5-bit machine field caps

@@ -594,49 +594,93 @@ tests that pinned the shipped 400 workers or the 10 s timeout moved with them:
 
 Schema v1.4, spec §19, study notes, README. Commit `docs: schema v1.4, spec §19 phase 2c refinements, threads and numerics notes, README for the runnable set`.
 
-- [ ] Schema v1.4: "New in v1.4" list; "What runs in phase 2c" table (adds `blob_store`, byte-sized `cdn`, `message_queue`, `worker_pool`, `external_sink`, `kv_cluster`, `search_index`; refused: `ws_gateway`, `service_discovery` (phase 3), `notification_fanout`, `frontier` (phase 3); the ten runnable scenarios by name); size grammar loses its †; `sizes`, step `size`, `bandwidth` (with `bit/s`), `retention`, `partitions` (not modelled), `workers`, `cost` on a pool, `failure_rate`, `politeness` (not modelled), the kv keys, `build_interval`, `timeout`, `over`, `queue_lag`; the drops section's external failures; the CSV's `queue_lag_s` column and link rows; the step rule of thumb in the `step` row; the utilization row behind a ring (hottest copy, 2a backlog M8); `simsys sweep` in a CLI section.
-- [ ] Spec §19: the sixteen refinements as finally implemented, each with its review corrections (refinement 2 with the Task 3 fix round: queues wait for whole objects, writes answer at the last byte, `write_ops` on a blob store); §7's `cdn`, `message_queue`, `worker_pool`, `blob_store`, `kv_cluster`, `search_index`, `external_sink` and `client` rows revised; §3.4 points at entry 3, §6 at entry 2, §11's sweep line at entry 15, §13 says which phase-3 types moved forward and why. Note (Task 3 review, M6): §7's `cdn` row and §18 entry 10 still describe the 2b refusal of a byte capacity (a cdn sized in bytes is refused by run/estimate); both now run, counting megabytes, so rewrite them. Note (Task 4 review, M4): §18 entry 15 still quotes `(load not propagated: blob_store is phase 2c)`; a blob store's events are followed since Task 4 (writes only, after its fix round), so quote a type that still blocks.
-- [ ] `docs/study/threads.md` (from Task 15: `std::jthread` vs `std::thread`, why each point is its own Simulation, why the output does not depend on `--jobs`, why `<thread>` lives in `sweep.cpp`); `docs/study/numerics.md` gains order statistics of exponentials, the truncated lognormal and the step-size rule; the study README's index and "where to look" for the 2c patterns.
-- [ ] Root README: phase 2c status, a `simsys sweep` example, youtube's explain lines in MB/s.
-
----
+- [x] Schema v1.4: "New in v1.4" list; "What runs in phase 2c" table (adds `blob_store`, byte-sized `cdn`, `message_queue`, `worker_pool`, `external_sink`, `kv_cluster`, `search_index`; refused: `ws_gateway`, `service_discovery` (phase 3), `notification_fanout`, `frontier` (phase 3); the ten runnable scenarios by name); size grammar loses its †; `sizes`, step `size`, `bandwidth` (with `bit/s`), `retention`, `partitions` (not modelled), `workers`, `cost` on a pool, `failure_rate`, `politeness` (not modelled), the kv keys, `build_interval`, `timeout`, `over`, `queue_lag`; the drops section's external failures; the CSV's `queue_lag_s` column and link rows; the step rule of thumb in the `step` row; the utilization row behind a ring (hottest copy, 2a backlog M8); `simsys sweep` in a CLI section.
+- [x] Spec §19: the sixteen refinements as finally implemented, each with its review corrections (refinement 2 with the Task 3 fix round: queues wait for whole objects, writes answer at the last byte, `write_ops` on a blob store); §7's `cdn`, `message_queue`, `worker_pool`, `blob_store`, `kv_cluster`, `search_index`, `external_sink` and `client` rows revised; §3.4 points at entry 3, §6 at entry 2, §11's sweep line at entry 15, §13 says which phase-3 types moved forward and why. Note (Task 3 review, M6): §7's `cdn` row and §18 entry 10 still describe the 2b refusal of a byte capacity (a cdn sized in bytes is refused by run/estimate); both now run, counting megabytes, so rewrite them. Note (Task 4 review, M4): §18 entry 15 still quotes `(load not propagated: blob_store is phase 2c)`; a blob store's events are followed since Task 4 (writes only, after its fix round), so quote a type that still blocks.
+- [x] `docs/study/threads.md` (from Task 15: `std::jthread` vs `std::thread`, why each point is its own Simulation, why the output does not depend on `--jobs`, why `<thread>` lives in `sweep.cpp`); `docs/study/numerics.md` gains order statistics of exponentials, the truncated lognormal and the step-size rule; the study README's index and "where to look" for the 2c patterns.
+- [x] Root README: phase 2c status, a `simsys sweep` example, youtube's explain lines in MB/s.
+- [x] Commit `docs: schema v1.4, spec §19 phase 2c refinements, threads and numerics notes, README for the runnable set` (branch `task19-docs`, from 84b771e).
+  Resolution notes: every number quoted was re-run on a Release build of 84b771e (1131 tests,
+  all green). **Schema** (`docs/scenario-schema.md`): title and intro v1.4, a "New in v1.4" list,
+  "What runs in phase 2c" with the four refused types all "runs from 3" and a table of the ten
+  runnable scenarios and their `run` exit codes (all 0 but `labs/unique-id`, 2 on purpose: drop
+  rate 0.3391 and the p99 at its 50 ms timeout); the `step` row's rule of thumb; the step `size`
+  row `read` (it said `checked`); `on: failure` "never fires before phase 3" in the steps table and
+  the cache `then` table (both said 2c); the CDN's "Not modelled: link bandwidth (phase 2c)" replaced
+  by a pointer to the pipe; `bandwidth` loses its † (youtube states one; the size row had lost it
+  already; `ramp`, `points`, `noise`, `retries`, a datacenter `latency` and the fault kinds keep
+  theirs: no scenario uses them); the `utilization` row says which copy it reads (the hottest copy
+  behind a ring with its z_M factor, a kv_cluster's hottest machine, a database's busier kind); the
+  stale youtube figures (the paper-load paragraph's 400 transcoders, 144 % and 98.1 %; the pool
+  section's 6.667/s and its explain line's `c=400`, `4.032M`; the queue-lag section's 2.66 h as the
+  shipped verdict) now quote the 600-worker binary (`9.6/s vs 10/s (96%, red)`, `transcoded_store
+  9.811k MB/s ... vs 20k MB/s (49.1%, green)`, `queue_limit=6.048M`, `PASS queue_lag transcode_q -
+  573ms 30m`), with 400 workers kept as the README's sweep (144 %, 2.66 h, 63.76k videos = 9,564 s;
+  uploads above 6.667/s from 15:43, measured with `simsys curve`); the sweep section restructured
+  (an option table with the binary's exact refusals, loading order, parallelism, exit codes, the
+  youtube sweep 2.66h / 39.5m / 573ms with two more metrics), keeping the 10,000-point cap, anchors
+  and the dotted-id line. **Spec**: §19 (sixteen entries, each with the reviews that corrected it;
+  entry 15 says where the implemented sweep is narrower than refinement 15: three metric kinds, no
+  SLO or exit-code columns, `--format` not `--report`); §3.4, §3.6, §6 (per-MB rows, sink, queue),
+  §7's `client`, `cdn`, `load_balancer`, `kv_cluster`, `message_queue`, `worker_pool`, `blob_store`,
+  `search_index`, `external_sink` rows, §10's thread row, §11's sweep line (`--metric users.p99`,
+  which the sweep refuses, became `users.read.mean`), §13's note on what moved forward, §17 entry 5
+  (no "understates the hottest of many copies"), §18 entries 1 (mixing by rate: phase 3), 4, 10 (no
+  byte-capacity refusal), 11 (superseded), 15 (quotes web-crawler's `frontier` marks). Line 85
+  already kept timeouts out of the drops (Task 13's fix round). **Study notes**: numerics §10, "A
+  client's timeout: the truncated lognormal" (formulas, a 100 ms exponential path run at 200 ms /
+  1 s / 50 ms timeouts: 89.41 %, 73.97 ms, 99.927 %, 33.86 %; why cutting 0.073 % moves the p99
+  490 → 465 ms (the k-th partial moment past τ is Φ(kσ − z)); the rate-limiter lab's 30.5 → 29.9 ms
+  at 8.9e-7 cut, variance −3.9 % from its printed mean and p50, where the plan's notes said 7.3e-7
+  and 4.4 %; the underflow guard shown on youtube at a 10 s timeout); "Choosing the step" (§6)
+  already covered refinement 16 and §7/§8 the order statistics and the ring, so nothing else was
+  added. The study README's index (concepts' `FractionLookup` and `template <C T>`, numerics' new
+  topics) and a phase 2c "where to look" block (Strategy on the variant and `make_node`, Delegation
+  on `HopBlocks`, the sweep's Thread pool and Pipeline, `MegabyteService::serialising`, the fifth
+  defect's `detail::same_op`, `static operator()`, constrained template parameters, `std::jthread`).
+  **README**: phase 2c status (1131 tests, schema v1.4, what waits for phase 3), url-shortener's
+  three SLOs, the refused-types paragraph (it still said a sweep was "planned for phase 2c"); the
+  youtube explain lines, chain/rate-limiter outputs, curve, sweep and series examples re-run and
+  unchanged. Beyond the list: `labs/rate-limiter/README.md` (a `sweep` over `algorithm` "(phase
+  2c)", which cannot be swept, became a measured sweep over `burst`) and `labs/unique-id/README.md`
+  (a link weight cannot be swept: links are a list). Links in the touched docs resolve (relative
+  paths and heading anchors checked by script); the 14 scenarios still validate (exit 0).
 
 ## Status at the stop on 2026-10-29 (read this first when resuming)
 
-The owner stopped the session ("stop now the background processes. make sure to push everything that
-was completed. document what is in progress and what is left to do"). State pushed to `origin/main`:
+The owner stopped the session on 2026-10-29 ("stop now the background processes. make sure to push
+everything that was completed. document what is in progress and what is left to do"), and work
+resumed after it. State on the branches, newest first:
 
-**Done (committed, reviewed where a review section exists above):** Tasks 1–14. Task 13 landed
-after this stop; its review (section "Review of Task 13 at 691a3ef") and the Task 12 review's fix
-rounds are committed, each as its own commit, then Task 14 (SLOs per window). `main` builds
-warning-free and its 1086 tests are green in Debug and Release (update of 2026-10-29, after the
-stop). Task 14 still needs its adversarial review, and the two fix rounds a check by it.
+**Done (committed):** Tasks 1–19. Task 19 (docs) is on branch `task19-docs` (from 84b771e, not
+pushed); everything before it is on `main`, pushed (`origin/main` = 84b771e), whose 1131 tests are
+green in Release. Reviewed with a
+recorded "Review of …" section: Tasks 1–13 and 15, and the kv/search fix round (approved, minors).
+**Not separately reviewed:** Task 14 (`over:` windows; its review was also to check the Task 12 and
+Task 13 fix rounds), Tasks 16–18 (the three book scenarios' sizing and READMEs) and Task 19: the
+comprehensive review below covers them unless a separate review is run first.
 
-**Red commits on main:** none left. (Task 14's, kept for the record:)
-- `dc8ec40` Task 14 (`over:` windows): `tests/theory/test_windows.cpp`, `over` tests in
-  `test_config.cpp` and at the end of `test_report.cpp`; they fail at load with
-  `slo: unknown key 'over'`. Test-writer's decisions to honour: windows align from the end of warmup
-  (url-shortener's worst hour is 13:02–14:02, `window_start_s` 46920 (47520 in the red commit, an
-  arithmetic slip), observed 0.6433 as shipped and
-  0.965 with `shards: 2`); an SLO without `over` has no `window_start_s` key; a windowed SLO whose
-  windows are all empty is `skipped`; the table prints `(worst 10m from 00:20)` with `HH:MM`; the YAML
-  key is `slo:`.
+**Red commits on main:** none.
 
-**Left to do, in order (each with the test-writer → implementer → adversarial reviewer loop):**
-1. ~~Finish the kv/search review fix round~~ done (`nodes,docs: quorum latency over answered requests; ...`), its WIP branch deleted.
-2. ~~Task 13 implementation~~ done, reviewed, its fix round committed.
-3. ~~The Task 12 review fix round, then Task 14's implementation~~ done; the adversarial review of
-   Task 14 (and of the two fix rounds) is still to do.
-4. Task 15 `simsys sweep`; Tasks 16–18 (youtube, news-feed, search-autocomplete end to end; note that
-   Task 12 changed news-feed's numbers: drop rate 0.5987, read_feed p99 90.3 ms, fanout capped at
-   1k jobs/s by post_db's primary, so Task 17's sizing starts from those); Task 19 docs.
-5. The comprehensive 2c review (list above), fix, push, CI green.
-6. The whole-of-phase-2 review (2a + 2b + 2c), fix, push. Then stop (owner's instruction of
-   2026-10-29); phase 3 waits for a new instruction.
+**Left to do, in order:**
+1. The **nits round**: the minors of the kv/search fix round's review (M-1 to M-5 and the nits,
+   above, unticked), the items the Task 19 resolution notes and its report list for the 2c
+   review, and edits to `docs/study/numerics.md` §2, §5, §7 and the schema's kv/search paragraphs
+   (Task 19 left those sections alone for it).
+2. The **comprehensive 2c review** (next section), its fix round, push, CI green.
+3. The **whole-of-phase-2 review** (2a + 2b + 2c, section after it), its fix round, push.
+4. Stop (owner's instruction of 2026-10-29): phase 3 waits for a new instruction.
 
 ## Comprehensive 2c review, then push
 
 - [ ] An adversarial reviewer (fresh context, own worktree, both presets) checks: warning-free Debug and Release builds and the whole suite; clang-format as CI runs it; conservation from `--series` on every runnable scenario, link rows included; answered ≤ offered everywhere; `estimate` = `run` on steady probes through queues, pools, pipes, sinks and kv clusters; every README number of the four newly runnable scenarios and of url-shortener; `sweep` byte-identical across `--jobs`; first-use comments (CLAUDE.md §1) for every new C++20/23 construct; `Pattern:` labels where a named pattern is used (Strategy for the new variant alternatives, Delegation where a behaviour reuses another); test names free of `[`/`]` and named after properties; no function over ~50 lines added; the four GCC workarounds in place. Two items carried from the review of Task 3's second fix round at 9a547e2: **percentiles respect a hard bound** (I-1: a byte-sized node's write answers within T + s = queue_limit / capacity + its transfer, a leaky bucket's within burst / limit + 1 / limit, yet the lognormal fit reports beyond them: `sat.yaml` p99 6.88 s against 4 s, pinned as a characterisation test; leaky bucket p99 57.5 ms against 21 ms; a 10-request room 28.2 ms against 11 ms), decide whether the fit is truncated at the bound or the percentiles are labelled; and **a ramp transient's latency should fall with the backlog** (I-3: `ramp.yaml`, 12 → 4 writes/s of 50 MB, holds 4000.5 ms for 3.3 s while the backlog drains 910 → 10 MB, where the fluid wait falls 1.82 s → 20 ms), see the Phase 3 backlog. One from the review of Task 5 (M-6): **`estimate` ≠ `run` at exactly rho 1** (pre-existing for plain services, not only pipes): the settled backlog and the stepped one part where demand equals capacity; decide which is the long-run answer and pin it.
+- Carried from Task 19 (docs vs code, left as found): **the refusal message of the phase 3 types**
+  still reads `node 'x' has type 'ws_gateway', which run/estimate do not support yet (phase 2)`
+  (the schema quotes it as it is and says the plan's phase is 3); **`run --duration` does not
+  re-check `over`**: the loader refuses `over` longer than the file's duration − warmup, but
+  `simsys run scenarios/book/youtube/scenario.yaml --duration 10m` keeps `over: 1h` and reports
+  `(worst 1h from 00:05)` for a 10-minute run (warmup is re-checked against `--duration`, `over`
+  is not); **`simsys sweep` is narrower than refinement 15** (three metric kinds, no SLO or exit
+  columns, `--format`): spec §19 entry 15 says so, decide whether that is the final scope.
 - [ ] Fix round recorded here as "Comprehensive 2c review at <sha>" with each finding and its resolution; commit; push to `origin/main`.
 
 ## After 2c: whole-of-phase-2 review, then phase 3
