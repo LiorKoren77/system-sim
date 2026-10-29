@@ -2947,6 +2947,32 @@ TEST_CASE("a worker pool's consumes queue must link to it, and the error names b
   REQUIRE(message.contains("link"));
 }
 
+// What a pool may drain is a queue: a message queue, or a URL frontier (web-crawler's downloader
+// consumes `frontier`; the frontier itself runs in phase 3). Naming any other node is refused with
+// its type, so the scenario's author sees what was named.
+TEST_CASE("a worker pool consumes only a message queue or a frontier", "[graph]") {
+  SECTION("a service is no queue") {
+    auto s = queue_feeding({});
+    s.nodes.push_back(service("svc"));
+    s.nodes.push_back(consuming_pool("w", "svc", 4, 5ms));
+    s.links.push_back(LinkSpec{.from = "svc", .to = "w"});
+    const auto built = Graph::build(s);
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message ==
+            "node 'w': consumes 'svc' (type service); a worker pool consumes a message_queue or a "
+            "frontier");
+  }
+  SECTION("a frontier is one") {
+    auto s = queue_feeding({});
+    s.nodes.push_back(NodeSpec{.id = "frontier", .type = NodeType::frontier});
+    s.nodes.push_back(consuming_pool("w", "frontier", 4, 5ms));
+    s.links.push_back(LinkSpec{.from = "frontier", .to = "w"});
+    const auto built = Graph::build(s);
+    INFO((built ? "" : built.error().message));
+    REQUIRE(built.has_value());
+  }
+}
+
 // Every consumer group receives every message: the queue's routes are one per consumer, each of
 // share 1 (a load balancer's shares sum to 1 because it SPLITS; a queue COPIES). With two groups
 // each gets the whole flow, not half. The op keeps its name, so each pool is reached by `publish`.

@@ -39,6 +39,14 @@ TEST_CASE("parse_duration understands every unit used in scenario files") {
   REQUIRE(simsys::parse_duration("24h").value() == 24h);
 }
 
+// A day, for a message queue's retention (plan 2c Task 6): Kafka's default of 168 hours is
+// written `7d`, and a fraction of a day is hours: 1.5d = 36 h.
+TEST_CASE("parse_duration reads days: 7d is Kafka's 168 hours") {
+  REQUIRE(simsys::parse_duration("7d").value() == 168h);
+  REQUIRE(simsys::parse_duration("1d").value() == 24h);
+  REQUIRE(simsys::parse_duration("1.5d").value() == 36h);
+}
+
 TEST_CASE("parse_duration rejects unknown units and non-numbers with a structured error") {
   require_rejected(simsys::parse_duration("5 parsecs"), "5 parsecs",
                    "unknown duration unit ' parsecs'");

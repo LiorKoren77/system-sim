@@ -167,9 +167,10 @@ t_s,client,op,offered_per_s,answered_per_s,mean_ms
 `explain` says where its paper load is incomplete rather than print a verdict on a missing
 number. On [YouTube](scenarios/book/youtube/) (ch. 14) the CDNs are sized in bytes, so they
 count megabytes and are checked in MB/s, the requests beside; part of the metadata tier's load
-arrives through the transcoding pipeline (message queue, worker pool: phase 2c), so its
-percentage is a lower bound with no zone; and a pool fed only through that pipeline has no
-percentage at all (trimmed):
+arrives through the transcoding pipeline (message queue, worker pool: explain follows it from
+phase 2c Task 7), so its percentage is a lower bound with no zone; and a pool fed only through
+that pipeline has no percentage at all, only its capacity, workers / cost (400 transcoders at
+60 s a video: 6.667/s) (trimmed):
 
 ```
 $ simsys explain scenarios/book/youtube/scenario.yaml
@@ -177,14 +178,16 @@ $ simsys explain scenarios/book/youtube/scenario.yaml
   cdn_us       peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)
   api          peak offered 48/s vs 12k/s total capacity  (0.4%, green)
   metadata_db  peak offered 50.28 units/s vs 9k/s total capacity  (≥0.559%; load not propagated: worker_pool and message_queue are phase 2c)
-  transcoders  peak offered 0/s vs 1k/s total capacity  (load not propagated: message_queue is phase 2c)
+  transcoders  peak offered 0/s vs 6.667/s total capacity  (load not propagated: message_queue is phase 2c)
 ```
 
 What runs today: clients, services, load balancers, rate limiters, caches (a fixed or a
 Che hit ratio), SQL databases (primary, read replicas, shards), CDNs and blob stores (sized in
 bytes, they count megabytes, wait for whole objects and answer a write at its last byte, a read
 at its first megabyte; a blob store's `then` steps are asynchronous event notifications, fired by
-its writes only) and id generators.
+its writes only), id generators, message queues (the publisher answered at the append, every
+message copied to each consumer group) and worker pools (M/M/c at workers / cost, waiting in their
+queue's retention; their `then` steps run from the next task).
 These six scenarios run end to end:
 
 - [`tutorial/hello`](scenarios/tutorial/hello/), [`tutorial/chain`](scenarios/tutorial/chain/):

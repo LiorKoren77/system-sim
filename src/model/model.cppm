@@ -515,6 +515,24 @@ struct NodeSpec {
   // id_generator without one. A separate member from the rate limiter's `algorithm`, although
   // both are spelled `algorithm:` in a scenario: the two name different things.
   std::optional<IdAlgorithm> id_algorithm{};
+  // Worker pools only (plan 2c refinement 5; declared after the id generator's key, for designated
+  // initializers): the pool is M/M/c over consumption (spec §7: "capacity = workers / job cost"),
+  // so `workers` is its c and `job_cost` the time ONE worker spends on ONE job, the scenario's
+  // `cost:` key, a duration here (`cost: 60s`), while a service's `cost:` is the per-op map of
+  // capacity units above (`cost`): one spelling, two meanings, read by type (config's read_cost
+  // and read_worker_pool_keys). Both are required by the loader; a pool built in code without
+  // them falls back to the type's numbers. `consumes` names the message queue (or URL frontier)
+  // whose messages the pool drains; Graph::build checks that the queue links to it.
+  std::optional<int> workers{};
+  std::optional<SimTime> job_cost{};
+  std::optional<std::string> consumes{};
+  // Message queues only (plan 2c refinement 4): how long a message stays in the log before it is
+  // deleted unconsumed (absent: defaults::default_retention, Kafka's 7 days), which sets each
+  // consumer group's waiting room (Graph::build: retention x the pool's capacity), and
+  // `partitions`, accepted and printed, not modelled (phase 3: a partition is read by one worker
+  // of a group at a time). The loader leaves an absent one absent, so explain can say "(default)".
+  std::optional<SimTime> retention{};
+  std::optional<int> partitions{};
   std::optional<Workload> workload{};  // clients only
 };
 

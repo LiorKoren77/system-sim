@@ -174,8 +174,12 @@ struct Scale {
 // Pattern: Table-driven method (Code Complete) — each grammar (duration units,
 // request-rate prefixes, byte-rate prefixes, size units) is a constant table searched by
 // one function, so adding a unit is a one-line data change instead of another `if` branch.
-constexpr std::array duration_units{Scale{"ns", 1.0}, Scale{"us", 1e3}, Scale{"ms", 1e6},
-                                    Scale{"s", 1e9},  Scale{"m", 60e9}, Scale{"h", 3600e9}};
+// `d` (a day, 24 h) is there for a message queue's retention, which is quoted in days (Kafka's
+// default of 168 h is 7d); describe_duration still writes hours (`24h`), so the text of every
+// other duration explain prints is unchanged.
+constexpr std::array duration_units{Scale{"ns", 1.0},   Scale{"us", 1e3}, Scale{"ms", 1e6},
+                                    Scale{"s", 1e9},    Scale{"m", 60e9}, Scale{"h", 3600e9},
+                                    Scale{"d", 86400e9}};
 constexpr std::array rate_prefixes{Scale{"", 1.0}, Scale{"k", 1e3}, Scale{"M", 1e6},
                                    Scale{"G", 1e9}};
 // Decimal SI prefixes, not binary: K = 1e3, not 1024. Capital K, matching how "KB" is

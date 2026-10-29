@@ -1,9 +1,10 @@
 // Module `simsys.behaviours`: what each node type does with flow (client: offer load
 // along its routes; service: forward step demand, serve the rest; load balancer: pass
 // everything on across its links; rate limiter: pass on what it admits, reject the rest;
-// cache: answer, and pass to its store what its strategy sends there)
-// and how it composes response latency from its own sojourn plus link legs and downstream
-// responses.
+// cache: answer, and pass to its store what its strategy sends there; blob store: answer, and
+// notify along its `then` steps for each write; message queue: append, and copy every message to
+// each consumer group; worker pool: drain its jobs) and how it composes response latency from its
+// own sojourn plus link legs and downstream responses.
 //
 // Latency composes on the reply path. A hop to a downstream node costs two link legs
 // (request out, reply back) plus that node's own response; sequential hops add, parallel
@@ -1292,17 +1293,113 @@ class BlobStoreBehaviour {
   detail::HopBlocks events_;
 };
 
+// Models: the message queue of System Design Interview (Alex Xu, vol. 1) ch. 1 ("Message queue": a
+// durable buffer that lets a producer publish work and a consumer process it later, so the two
+// scale and fail apart) and the queues of ch. 14 (YouTube's transcoding queue) and ch. 15 (Google
+// Drive's notification queue), run in practice as Kafka. Plan 2c refinements 4 and 6. Captured:
+// the node is the BROKER. Its own queue is the append (spec §6: 1M messages/s, 100 µs chosen, so
+// c = 1M/s × 100 µs = 100 by Little's law), and a publisher is answered when its message is
+// appended: the response is the append's sojourn alone and the delivered share the broker's own,
+// whatever happens to the message later (the hops to the consumers are asynchronous by design,
+// graph::Graph::is_async_hop). Each appended message then goes to EVERY consumer group, a worker
+// pool that `consumes` the queue: Kafka's consumer groups each read the whole log, so the broker's
+// outflow is the sum of its groups' (two groups on 1k messages/s receive 1k/s each, not 500), and
+// a message keeps its op name. What a group has not read waits in that GROUP's pool queue, whose
+// room is the queue's retention × the pool's capacity (graph::Graph::connect_consumer): the backlog
+// of an append-only log, held per reader. Its queue lag (how far a group is behind) is Task 8's.
+// Ignored: ordering (partitions are printed, not modelled), delivery guarantees and redelivery
+// (at-least-once, a consumer that crashes before committing reads a message again), the consumer's
+// commit interval, the broker's disk (an append costs the type's 100 µs whatever the message's
+// size, and the log never fills a disk) and its replication.
+class MessageQueueBehaviour {
+ public:
+  MessageQueueBehaviour(const graph::Graph& g, std::size_t self);
+
+  // Appends every message it is sent (`served` is the input, nothing is refused) and sends each
+  // op on, whole, to every consumer group whose link carries it. `now` and `dt` are unused: the
+  // broker keeps no state between steps (the backlog is the pools').
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+
+  // One capacity unit per message, whatever its op or size: an append.
+  [[nodiscard]] double cost(std::string_view /*op*/) const { return 1.0; }
+
+  // The append's sojourn: the publisher waits for nobody downstream.
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view /*op*/, flow::LatencyEstimate own,
+                                               ResponseLookup auto&& /*downstream*/) const {
+    return own;
+  }
+
+  // The share the broker appended: a message a consumer group later loses fails no publisher.
+  [[nodiscard]] double delivered(std::string_view /*op*/, double own,
+                                 FractionLookup auto&& /*downstream*/) const {
+    return own;
+  }
+
+ private:
+  // One consumer group: the pool, the link its messages travel on, and the ops that link carries
+  // (empty: all of them). A drained link (weight 0) is no group (graph::Graph::route_queue).
+  struct Consumer {
+    std::size_t target;
+    std::size_t link;
+    std::vector<std::string> ops;
+  };
+  [[nodiscard]] static bool reads(const Consumer& consumer, std::string_view op);
+
+  std::vector<Consumer> consumers_;
+};
+
+// Models: the workers behind a queue in System Design Interview (Alex Xu, vol. 1): ch. 14's
+// transcoding servers, ch. 11's fan-out workers, ch. 15's notification and backup workers, the
+// consumers of ch. 1's message queue. Plan 2c refinement 5, spec §7: "capacity = workers / job
+// cost". Captured: the pool is ONE M/M/c queue over consumption, its c = `workers` and its service
+// time = `cost` (the time one worker spends on one job), so its rate is workers / cost (400
+// transcoders at 60 s a video: 6.667 videos/s); one job is one capacity unit. Its waiting room is
+// what its queue keeps for it, retention × that rate (graph::Graph::connect_consumer), so a
+// backlog grows at inflow − rate while the pool is saturated, and what overflows the room is
+// deleted unconsumed: the pool's drops, which no publisher sees (the hop from the queue is
+// asynchronous). Its response and delivered share are its own: nothing upstream waits for it.
+// Phase 2c Task 6: a pool's `then` steps (the work it hands on) run in Task 7; until then the
+// engine refuses a pool that has any (engine::Simulation::create), and the pool forwards nothing.
+// Ignored: a worker blocked on a slow downstream call (an external sink's 150 ms would hold a
+// worker and cut the pool's real capacity: phase 3), autoscaling (`workers` is fixed), poison
+// messages that fail and are retried forever, and the job-time spread of real work (the service
+// SCV is the exponential's 1 unless `advanced.service_variability` says otherwise).
+class WorkerPoolBehaviour {
+ public:
+  WorkerPoolBehaviour(const graph::Graph& g, std::size_t self);
+
+  // Serves every job it is sent and forwards nothing (its `then` steps are Task 7's). `now` and
+  // `dt` are unused: the pool keeps no state between steps (its backlog is its queue's).
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+
+  // One capacity unit per job: a job takes one worker for `cost`, whatever its op.
+  [[nodiscard]] double cost(std::string_view /*op*/) const { return 1.0; }
+
+  // Its own sojourn (wait for a worker + cost): it calls nobody before Task 7.
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view /*op*/, flow::LatencyEstimate own,
+                                               ResponseLookup auto&& /*downstream*/) const {
+    return own;
+  }
+
+  // The share of the jobs it does not drop.
+  [[nodiscard]] double delivered(std::string_view /*op*/, double own,
+                                 FractionLookup auto&& /*downstream*/) const {
+    return own;
+  }
+};
+
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
 // std::visit; a std::variant instead of an abstract base keeps every behaviour a plain
 // value (no heap allocation, no virtual calls, copyable). Phase 2a appended the load
 // balancer, the rate limiter and the cache, phase 2b the SQL database and the CDN, phase 2c the
-// blob store; later phases append the rest (queue, ...).
+// blob store, the message queue and the worker pool; later phases append the rest (external sink,
+// kv cluster, ...).
 // C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
 // it holds) dispatched with std::visit. Closed: adding an alternative means editing this
 // line, and every std::visit that does not handle it then fails to compile.
-using Behaviour =
-    std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour, RateLimiterBehaviour,
-                 CacheBehaviour, SqlDbBehaviour, CdnBehaviour, BlobStoreBehaviour>;
+using Behaviour = std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour,
+                               RateLimiterBehaviour, CacheBehaviour, SqlDbBehaviour, CdnBehaviour,
+                               BlobStoreBehaviour, MessageQueueBehaviour, WorkerPoolBehaviour>;
 
 }  // namespace simsys::behaviours
 
@@ -1317,6 +1414,8 @@ static_assert(NodeBehaviour<CacheBehaviour>);
 static_assert(NodeBehaviour<SqlDbBehaviour>);
 static_assert(NodeBehaviour<CdnBehaviour>);
 static_assert(NodeBehaviour<BlobStoreBehaviour>);
+static_assert(NodeBehaviour<MessageQueueBehaviour>);
+static_assert(NodeBehaviour<WorkerPoolBehaviour>);
 static_assert(RequestSource<ClientBehaviour>);
 
 namespace detail {
@@ -1942,6 +2041,44 @@ Routed BlobStoreBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime 
   for (const auto& [op, rate] : routed.served.entries()) events_.forward(op, rate, routed.outgoing);
   detail::sort_by_destination(routed.outgoing);
   return routed;
+}
+
+// ---- MessageQueueBehaviour ----
+
+// The queue's routes (graph::Graph::route_queue), one per consumer group: whatever op a message
+// carries, a group reads it if its link carries that op.
+MessageQueueBehaviour::MessageQueueBehaviour(const graph::Graph& g, std::size_t self) {
+  for (const auto& route : g.routes(self)) {
+    if (route.share <= 0.0) continue;  // a drained link: a group that reads nothing
+    consumers_.push_back(
+        Consumer{.target = route.target, .link = route.link, .ops = g.links()[route.link].ops});
+  }
+}
+
+bool MessageQueueBehaviour::reads(const Consumer& consumer, std::string_view op) {
+  return consumer.ops.empty() || std::ranges::contains(consumer.ops, op);
+}
+
+// Every group gets the whole rate of every op it reads: a copy, not a split.
+Routed MessageQueueBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
+  Routed routed = detail::serve_everything(in);
+  for (const auto& [op, rate] : routed.served.entries()) {
+    for (const Consumer& consumer : consumers_) {
+      if (reads(consumer, op)) {
+        detail::flow_towards(routed.outgoing, consumer.target, consumer.link).add(op, rate);
+      }
+    }
+  }
+  detail::sort_by_destination(routed.outgoing);
+  return routed;
+}
+
+// ---- WorkerPoolBehaviour ----
+
+WorkerPoolBehaviour::WorkerPoolBehaviour(const graph::Graph& /*g*/, std::size_t /*self*/) {}
+
+Routed WorkerPoolBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
+  return detail::serve_everything(in);
 }
 
 }  // namespace simsys::behaviours

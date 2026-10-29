@@ -504,7 +504,7 @@ struct Overloaded : Fs... {
   using enum model::NodeType;
   return type == client || type == service || type == load_balancer || type == rate_limiter ||
          type == cache || type == sql_db || type == cdn || type == id_generator ||
-         type == blob_store;
+         type == blob_store || type == message_queue || type == worker_pool;
 }
 
 // Why a cache cannot run, if it cannot: a scenario built in code left it without a number or
@@ -533,12 +533,23 @@ struct Overloaded : Fs... {
   return std::nullopt;
 }
 
+// Why a worker pool cannot run, if it cannot: its `then` steps, the work each drained job hands on
+// (plan 2c refinement 5), run in Task 7. Running the pool without them would drop that load
+// silently, so the engine says so instead; a pool with no steps runs (behaviours::
+// WorkerPoolBehaviour).
+[[nodiscard]] std::optional<std::string> worker_pool_not_runnable(const model::NodeSpec& spec) {
+  if (spec.then.empty()) return std::nullopt;
+  return "node '" + spec.id + "': a worker pool's then steps run in phase 2c's next step";
+}
+
 // Why a node of a simulated type still cannot run, if it cannot (the cases above). A blob store
 // always runs, `then` steps included: they are event notifications (plan 2c refinements 6-7),
-// asynchronous hops the backward pass does not wait for (behaviours::BlobStoreBehaviour).
+// asynchronous hops the backward pass does not wait for (behaviours::BlobStoreBehaviour). So does
+// a message queue (behaviours::MessageQueueBehaviour).
 [[nodiscard]] std::optional<std::string> not_runnable_yet(const model::NodeSpec& spec) {
   if (spec.type == model::NodeType::cache) return cache_not_runnable(spec);
   if (spec.type == model::NodeType::cdn) return cdn_not_runnable(spec);
+  if (spec.type == model::NodeType::worker_pool) return worker_pool_not_runnable(spec);
   return std::nullopt;
 }
 
@@ -776,6 +787,10 @@ flow::Flow DelayLine::pop() {
 
 // ---- Simulation: construction ----
 
+// Two passes over the nodes, in file order: first every node's TYPE, then what a node of a
+// simulated type still lacks (not_runnable_yet). So a type the engine has no model for is named
+// before a node that only waits for a later task: google-drive is refused at its ws_gateway,
+// long_poll, although its worker pools, declared before it, have `then` steps (Task 7).
 std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Graph& g) {
   for (const auto& node : g.nodes()) {
     if (simulated(node.spec.type)) continue;
@@ -845,6 +860,15 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index)
     // the scenario's numbers); a request is charged its size (behaviours::BlobStoreBehaviour).
     case model::NodeType::blob_store:
       return make_server(behaviours::BlobStoreBehaviour{g, index}, resolved);
+    // A message queue's queue is the broker's append (spec §6: 1M msg/s at 100 µs); what its
+    // consumer groups have not read waits in THEIR queues, behind it.
+    case model::NodeType::message_queue:
+      return make_server(behaviours::MessageQueueBehaviour{g, index}, resolved);
+    // A worker pool's queue is one M/M/c of `workers` servers at `cost` a job, its room the
+    // retention of the queue it reads (graph::Graph::connect_consumer): a backlog of unread
+    // messages, and what overflows it deleted unconsumed.
+    case model::NodeType::worker_pool:
+      return make_server(behaviours::WorkerPoolBehaviour{g, index}, resolved);
     // A database's queues are its primaries and its replicas (make_database), whatever a
     // balancer in front of it does.
     case model::NodeType::sql_db:
