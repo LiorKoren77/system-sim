@@ -367,10 +367,13 @@ TEST_CASE("the survival-function quadrature reproduces Renyi for exponential rep
 }
 
 // One replica is its own order statistic: the lognormal fitted to its moments, integrated back,
-// returns them. This is the quadrature's documented error bound (docs/study/numerics.md): below
-// 1e-8 relative for any sojourn SCV up to 10.
+// returns them. This is the quadrature's documented error bound (docs/study/numerics.md section
+// 7): below 1e-8 relative at every sojourn SCV from 1e-4 to 100 (measured: a few 1e-16, the
+// variance at SCV 1e-4 1.2e-11). Before the Poisson-binomial carried each replica's failure
+// Phi(-z) (review of the kv/search fix round, M-3) it held to SCV 10 only: 1 - Phi(z) lost the
+// slow tail's digits, 1.1e-7 on the variance at SCV 20 and 1.7e-6 at 50.
 TEST_CASE("one lognormal replica's order statistic returns its own moments", "[queueing]") {
-  for (const double scv : {1e-4, 0.01, 0.5, 1.0, 2.0, 10.0}) {
+  for (const double scv : {1e-4, 0.01, 0.5, 1.0, 2.0, 10.0, 20.0, 50.0, 100.0}) {
     CAPTURE(scv);
     const double m = 0.37e-3;
     const std::array one{

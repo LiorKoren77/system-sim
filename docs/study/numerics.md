@@ -39,12 +39,12 @@ and the subtraction then exposes that rounding. `std::expm1(u)` computes e^u - 1
 directly (a series for small u) with no subtraction; `std::log1p(u)` does the same for
 ln(1 + u). The code uses them in exactly three places:
 
-- `power_integral`, `src/caching/caching.cppm:211`: the Zipf bucket mass
+- `power_integral` (`src/caching/caching.cppm`): the Zipf bucket mass
   (b^{1-s} - a^{1-s}) / (1-s) is rewritten as a^{1-s} * expm1((1-s) ln(b/a)) / (1-s),
   which stays accurate as s approaches 1 (where the textbook form is 0/0).
-- `one_minus_exp_neg`, `src/caching/caching.cppm:262`: the Che term 1 - e^{-p t}; a cold
-  key over a short characteristic time has p t near 1e-12 (comment at lines 259-260).
-- `lognormal_fit`, `src/queueing/queueing.cppm:166` (behind `lognormal_quantile` and the
+- `one_minus_exp_neg` (`src/caching/caching.cppm`): the Che term 1 - e^{-p t}; a cold
+  key over a short characteristic time has p t near 1e-12 (the comment above the function).
+- `lognormal_fit` (`src/queueing/queueing.cppm`, behind `lognormal_quantile` and the
   quorum's quadrature, section 7): sigma^2 = ln(1 + v/m^2), where v/m^2 is small for a nearly
   deterministic latency.
 
@@ -96,31 +96,33 @@ and at least one bucket is exactly 1.
 
 ## 5. Moments through a graph
 
-A latency estimate is two numbers, the mean and the variance (`LatencyEstimate`,
-`src/flow/flow.cppm:64-76`). Two composition rules:
+A latency estimate is two numbers, the mean and the variance (`LatencyEstimate` in
+`src/flow/flow.cppm`). Two composition rules:
 
-- **Sequential hops add** (`operator+=`, lines 153-157): means add always;
+- **Sequential hops add** (`LatencyEstimate::operator+=`): means add always;
   variances add only if the hops are independent, Var(X+Y) = Var X + Var Y. Correlated
   hops (two calls to the same slow disk) would add covariance; the model ignores it.
-- **Parallel fan-out** (`parallel_max`, lines 159-166): the max of the branch means and
-  the max of the branch variances. The comment at lines 78-92 says why this is
+- **Parallel fan-out** (`parallel_max`): the max of the branch means and
+  the max of the branch variances. The comment above its declaration says why this is
   optimistic: E[max] >= max E (two Exp(1) branches: 1.5 against 1.0), and a fan-out of
   100 hides the tail amplification of "The Tail at Scale".
 
-Percentiles come last: `lognormal_quantile` (`src/queueing/queueing.cppm:121-129`) fits
+Percentiles come last: `lognormal_quantile` (`src/queueing/queueing.cppm`) fits
 a lognormal with the same mean m and variance v (sigma^2 = ln(1 + v/m^2),
-mu = ln m - sigma^2/2) and reads off exp(mu + sigma z). The `(variance / mean) / mean`
-at line 126 instead of `variance / (mean * mean)` is for means below ~1e-162, whose
-square underflows to 0 (test at `tests/unit/test_queueing.cpp:148`).
+mu = ln m - sigma^2/2, `lognormal_fit`) and reads off exp(mu + sigma z). The
+`(variance / mean) / mean` in `lognormal_fit` instead of `variance / (mean * mean)` is for
+means below ~1e-162, whose square underflows to 0 (test `lognormal_quantile survives means
+whose square underflows a double`).
 
 Where the fit is honest: a sum of many positive, independent, right-skewed terms, which
 is what a path through several queues looks like. Where it is not: a **mixture**. A cache
 with h = 0.9, a hit costing 1 ms and a miss 51 ms (both spikes) has mean 6 ms and
-variance h(1-h) * 50^2 = 225 ms^2 (the two-point mixture of `conditional_hop`,
-`src/engine/behaviours.cppm:187-191`). The lognormal fit with those moments gives a
+variance h(1-h) * 50^2 = 225 ms^2 (the two-point mixture of `conditional_hop` in
+`src/engine/behaviours.cppm`). The lognormal fit with those moments gives a
 median of 2.2 ms (true: 1), a p95 of 22.6 ms (true: 51) and a p99 of 58.9 ms (true: 51).
 Real latency is bimodal and the fit smooths the two modes into one hump; reports
-label the number "estimated" (`src/queueing/queueing.cppm:113`): it is a fit, not a measurement.
+label the number "estimated" (the comment on `lognormal_quantile`, and the op table's
+`(estimated)` column): it is a fit, not a measurement.
 
 A mixture's moments come in two algebraically equal forms. With branch shares p_i, means m_i and
 variances v_i, the mean is Σ p_i m_i and the variance either Σ p_i (v_i + (m_i - mean)^2) (the law
@@ -243,8 +245,9 @@ per red step, is left out):
 The limiter admits the same total at every step, as the paragraph above says. What a coarse
 step erases is the burst's effect downstream: at 1 s the api sees 1,100/s, never overloads,
 and the p99 falls from 29.9 ms to 19.9 ms. (The 29.9 ms was 30.5 ms before the clients'
-`timeout: 1s` applied: cutting 7.3e-7 of the requests, the far tail of the fitted lognormal,
-removes 4.4 % of its variance, and the refit narrows; the requests' own p99 moves by about 1e-6.
+`timeout: 1s` applied: cutting 8.9e-7 of the delivered requests, the far tail of the fitted
+lognormal, removes 3.9 % of its variance, and the refit narrows; the requests' own p99 moves by
+about 1e-6.
 A moment fit reacts to its tail that much.) A step shorter than the 5 s spike but not a
 divisor of it shows the other loss. At `step: 2s` the 5 s spike at 25 min is sampled at
 t = 25:00, 25:02 and 25:04, so it is offered for 6 s: the limiter then prints
@@ -260,7 +263,7 @@ A kv_cluster's coordinator (book ch. 6) sends each request to the key's N replic
 at the q-th reply (q = R for a read, W for a write). One of the N may be the ring's hot machine
 (section 8), the others are cool, and each kind has its own sojourn mean and variance from its
 queue. The q-th fastest of such a mix has no closed form, so `lognormal_order_statistic`
-(`src/queueing/queueing.cppm:568`) integrates it.
+(`src/queueing/queueing.cppm`) integrates it.
 
 **The integral.** The q-th reply X is later than t exactly when fewer than q replicas have
 answered by t:
@@ -268,21 +271,22 @@ answered by t:
     S_q(t) = P(X > t) = P(fewer than q of the N have answered by t)
 
 Replica i has answered by t with probability F_i(t), the CDF of a lognormal fitted to its
-group's moments (`lognormal_fit`, line 166: Phi((ln t - mu) / sigma)). Fewer than q successes
+group's moments (`lognormal_fit`: Phi((ln t - mu) / sigma)). Fewer than q successes
 among trials of different probabilities is the **Poisson-binomial** distribution, computed by
-`fewer_than` (line 386) as a small dynamic programme: below[j] = P(exactly j so far), each
-trial moving mass from j to j + 1 with its p. Then, integrating P(X > t) instead of t f(t):
+`fewer_than` as a small dynamic programme: below[j] = P(exactly j so far), each
+trial moving mass from j to j + 1 with its p and keeping it with 1 - p. Then, integrating
+P(X > t) instead of t f(t):
 
     E[X] = integral of S_q(t) dt,     E[X^2] = integral of 2 t S_q(t) dt      (t from 0 to inf)
 
-**The grid.** `moments_from_survival` (line 305) substitutes u = ln t (dt = t du), because the
+**The grid.** `moments_from_survival` substitutes u = ln t (dt = t du), because the
 times span orders of magnitude (a cool machine's 0.3 ms, a full queue's 100 ms), and sums
-t S and 2 t^2 S with the trapezoid rule on a grid even in u. `lognormal_grid` (line 464)
+t S and 2 t^2 S with the trapezoid rule on a grid even in u. `lognormal_grid`
 spans every group's fit from mu - 8 sigma (Phi(-8) = 6e-16: nobody has answered) to
 mu + 2 sigma^2 + 8 sigma (everybody has, even for the second moment, whose integrand peaks
-at mu + 2 sigma^2), sigma / 2 apart for the narrowest group (`steps_per_sigma`, line 414).
+at mu + 2 sigma^2), sigma / 2 apart for the narrowest group (`steps_per_sigma`).
 Below the grid S is 1, and the rule's sum over that whole left tail is a geometric series,
-added in closed form (line 308):
+added in closed form (in `moments_from_survival`):
 
     h Σ_{j >= 1} e^(u0 - j h) = h e^u0 / (e^h - 1)
 
@@ -301,31 +305,54 @@ sigma / 2:
 
 | sojourn SCV | grid points | mean, relative error | variance, relative error |
 |---|---|---|---|
-| 1e-4 to 0.1 | 34-35 | below 1e-15 | below 1e-11 |
-| 1 | 37 | 8e-15 | 3e-12 |
-| 10 | 40 | 8e-13 | 8.5e-9 |
-| 20 | 40 | 2.5e-12 | 1.1e-7 |
-| 50 | 41 | 9e-12 | 1.7e-6 |
-| 100 | 42 | 2e-11 | 9e-6 |
+| 1e-4 | 34 | 3e-16 | 1.2e-11 |
+| 0.01 to 0.1 | 34-35 | below 5e-16 | below 7e-15 |
+| 1 | 37 | 4e-16 | 2e-16 |
+| 10 | 40 | 2e-16 | 7e-16 |
+| 20 | 40 | 3e-16 | 1e-16 |
+| 50 | 41 | 1.1e-15 | 2.4e-15 |
+| 100 | 42 | 4e-16 | 0 |
 
-(one lognormal integrated back to its own moments; a Python run of the same rule). The
-documented bound is **1e-8 relative for a sojourn SCV of at most 10**, and no further (the
-variance's error passes 1e-7 at 20), which
-`one lognormal replica's order statistic returns its own moments`
-(`tests/unit/test_queueing.cpp:372`) checks. A fluid sojourn's SCV is around 1 (exponential
-service plus an Erlang wait); it reaches 10 only for very bursty arrivals. Two limits are
-deliberate: a sojourn with no spread at all is given sigma = 0.001 (`min_sigma`, line 408),
-since a step in S(t) cannot be resolved on any even grid; and a grid is at most 4000 points,
-a very narrow group far from a wide one widening the step instead. Then the bound does not
-hold: a group clamped to sigma = 0.001 beside one of SCV 10 needs more than 4000 points at
-sigma / 2, and the widened step leaves 8.4e-4 of error on the mean and 1.4e-3 on the variance
-(the review of plan 2c Task 11). Such a pair would be a machine of deterministic service beside
-a very bursty one in the same quorum, which no shipped scenario has.
+(one lognormal integrated back to its own moments by `lognormal_order_statistic` itself; a
+probe test, not kept). The documented bound is **1e-8 relative for a sojourn SCV from 1e-4
+to 100**, which `one lognormal replica's order statistic returns its own moments`
+(`tests/unit/test_queueing.cpp`) checks. The one error above rounding, the variance at SCV
+1e-4, is section 5's lesson again: E[X^2] - E[X]^2 subtracts two numbers that agree to four
+digits when the variance is 1e-4 of the squared mean.
+
+**Where the digits went before.** Until the review of the kv/search fix round (M-3) the same
+table read 8.5e-9, 1.1e-7, 1.7e-6 and 9e-6 on the variance at SCV 10, 20, 50 and 100 (and
+8e-15 to 2e-11 on the mean from SCV 1 up), and the bound stopped at SCV 10. The grid was not to
+blame: the trapezoid rule was already exact to rounding. The dynamic programme took each
+replica's chance of not having answered as 1 - Phi(z), and right of the mean, where Phi(z) is
+close to 1, that subtraction is section 2's cancellation: Phi(z) is stored to about 1.1e-16, so
+at 1 - Phi(z) = 1e-10 six of the result's digits are rounding, and past 1e-16 all of them. The
+second moment weights S by 2 t^2, which is largest exactly there, and the wider the lognormal
+(the larger the SCV) the further right that weight reaches. The fix is the one section 2
+teaches: compute the small number directly. `normal_cdf(-z)` is Phi(-z) = 1 - Phi(z) to the
+last digit (it is `erfc` of a positive argument), so `integrate_quorum` hands each `TrialGroup`
+both its `success` Phi(z) and its `failure` Phi(-z), and `fewer_than` multiplies by `failure`
+instead of subtracting. A group built with a success only (a machine's kept share, where 1 -
+kept is exact enough) gets 1 - success by default. A fluid sojourn's SCV is around 1
+(exponential service plus an Erlang wait); it reaches 10 only for very bursty arrivals, so the
+shipped answers hardly moved: the kv-store lab's `run` output is byte-identical, its `estimate`
+moved by 9e-16 relative, and its variants of the README (`vnodes: 1`, the W/R swaps) by at most
+5.6e-13.
+
+Two limits are deliberate: a sojourn with no spread at all is given sigma = 0.001
+(`min_sigma`), since a step in S(t) cannot be resolved on any even grid; and a grid is at most
+4000 points, a very narrow group far from a wide one widening the step instead. Then the bound
+does not hold: a group clamped to sigma = 0.001 beside one of SCV 10 needs more than 4000 points
+at sigma / 2, and the widened step leaves 8.4e-4 of error on the mean and 1.4e-3 on the variance
+(the review of plan 2c Task 11; the trapezoid rule's error on a coarse step, which carrying the
+failure leaves as it was: 8.4e-4 on the mean re-measured after it). Such a pair would be a
+machine of deterministic service beside a very bursty one in the same quorum, which no shipped
+scenario has.
 
 **The cross-check.** Fed N exponentials of one mean, the same quadrature must reproduce
-Rényi's closed form (`exponential_order_statistic`, line 119: 1/3, 5/6, 11/6 of the mean for
+Rényi's closed form (`exponential_order_statistic`: 1/3, 5/6, 11/6 of the mean for
 the 1st, 2nd and 3rd of three): `the survival-function quadrature reproduces Renyi for
-exponential replicas` (line 350) checks it to 1e-9 at a step of 0.25 in ln t (the
+exponential replicas` checks it to 1e-9 at a step of 0.25 in ln t (the
 exponential's left tail is not Gaussian, so it needs a finer step than sigma / 2; 0.5 gives
 1e-6 to 1e-8).
 
@@ -351,8 +378,8 @@ with z_M the expected maximum of M standard normals, by Blom's approximation (19
 
     z_M = Phi^-1((M - 0.375) / (M + 0.25))
 
-(`expected_normal_maximum`, `src/queueing/queueing.cppm:526`; Phi^-1 is `normal_quantile`,
-line 504: Acklam's rational approximation, relative error 1.15e-9, polished by one Halley
+(`expected_normal_maximum` in `src/queueing/queueing.cppm`; Phi^-1 is `normal_quantile`:
+Acklam's rational approximation, relative error 1.15e-9, polished by one Halley
 step to full double precision). M / N is the cap: a machine holds a key at most once.
 
 It is a heuristic (shares are neither normal nor independent: they sum to N), checked against
@@ -415,12 +442,12 @@ same function, so the consistent-hashing lab's balancer and the kv-store lab's c
    hardly matters: the api's `dropped` is 1.385k at 5 ms, 1.36k at 100 ms and 1.2k at
    500 ms. Why? (The api's waiting room, `queue_limit`, caps the backlog the same way at
    every step.)
-5. **Coarsen the quadrature.** Set `steps_per_sigma` (`src/queueing/queueing.cppm:414`) to
+5. **Coarsen the quadrature.** Set `steps_per_sigma` (`src/queueing/queueing.cppm`) to
    1.0, rebuild and run `[queueing]`: three checks fail, the fastest of three lognormals by
    4e-5 relative (0.42098 against 0.42100 ms). At 0.5 four fail and the fastest is 3.3 % off
    (0.4071 ms): two points per standard deviation is where the rule's e^(-c / h) error is
    still far below anything a report prints.
-6. **Replace the closed-form tail.** In `moments_from_survival` (line 308) start `first` and
+6. **Replace the closed-form tail.** In `moments_from_survival` start `first` and
    `second` at t0 and t0^2 (`first_t` and `first_t * first_t`: the exact integrals of S = 1 and
    2 t S over [0, t0]) and give the grid's first point weight h / 2: the rule becomes the
    ordinary trapezoid on the grid plus the exact interval below it. Run `[queueing]` and watch

@@ -53,3 +53,17 @@ foreach(check same_bytes refuses_bad_param slo_failure_exit_0)
                    -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-sweep-${check} -DCHECK=${check}
                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/sweep_jobs.cmake)
 endforeach()
+
+# simsys run --duration, run as a process (review of plan 2c Task 19): the override is held to the
+# file's own rules, the warmup and every SLO's `over` window.
+foreach(check warmup over)
+  if(check STREQUAL "warmup")
+    set(name "simsys run refuses a duration not longer than the warmup")
+  else()
+    set(name "simsys run refuses a duration that leaves an SLO's over window no room")
+  endif()
+  add_test(NAME "${name}"
+           COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
+                   -DSCENARIO=${CMAKE_SOURCE_DIR}/scenarios/book/url-shortener/scenario.yaml
+                   -DCHECK=${check} -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/run_duration.cmake)
+endforeach()

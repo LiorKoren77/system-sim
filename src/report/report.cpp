@@ -350,12 +350,21 @@ struct SeenPercentile {
   return op.answered_per_s <= 0.0;
 }
 
-// The case of nothing_answered that no other rule judges: every request was lost on a path that
-// does answer (nothing timed out, a finite latency), so the moments describe requests that all
-// failed (review of plan 2c Task 11, minor 4). A latency SLO does not read such an op. One that
-// timed out fails at the timeout (fail_if_quantile_timed_out), an unavailable one at infinity.
+// An op nobody sent (a client of rate 0, `rate: {base: 0/s}`): no request, so no latency either.
+// A latency SLO leaves it out without a note, as a window with nothing offered is skipped
+// (offered_in): nothing went wrong (review of the kv/search fix round, M-1).
+[[nodiscard]] bool nothing_offered(const OpSummary& op) {
+  return op.offered_per_s <= 0.0;
+}
+
+// The case of nothing_answered that no other rule judges: requests were sent and every one was lost
+// on a path that does answer (nothing timed out, a finite latency), so the moments describe
+// requests that all failed (review of plan 2c Task 11, minor 4). A latency SLO does not read such
+// an op, and says so (unanswered_note). One that timed out fails at the timeout
+// (fail_if_quantile_timed_out), an unavailable one at infinity.
 [[nodiscard]] bool every_request_lost(const OpSummary& op) {
-  return nothing_answered(op) && op.timed_out_per_s <= 0.0 && std::isfinite(op.mean_s);
+  return !nothing_offered(op) && nothing_answered(op) && op.timed_out_per_s <= 0.0 &&
+         std::isfinite(op.mean_s);
 }
 
 // ---- SLO evaluation ----
@@ -387,9 +396,9 @@ struct Overloaded : Fs... {
 }
 
 // The latency quantile `quantile` of the client's op, or the worst one over all of the
-// client's ops when the SLO names none (every op must meet it, so the worst decides); an op whose
-// requests were all lost (every_request_lost) is left out, and with only such ops there is nothing
-// to observe (skipped).
+// client's ops when the SLO names none (every op must meet it, so the worst decides); an op nobody
+// sent (nothing_offered) or whose requests were all lost (every_request_lost) is left out, and
+// with only such ops there is nothing to observe (skipped).
 // `double OpSummary::*` is a pointer to a data member (C++98): it selects p50/p95/p99
 // without three copies of the loop.
 [[nodiscard]] std::optional<double> worst_latency(std::span<const OpSummary> ops,
@@ -397,7 +406,7 @@ struct Overloaded : Fs... {
                                                   double OpSummary::*quantile) {
   std::optional<double> worst;
   for (const auto& op : ops) {
-    if (!slo_reads_op(slo, op) || every_request_lost(op)) continue;
+    if (!slo_reads_op(slo, op) || nothing_offered(op) || every_request_lost(op)) continue;
     const double value = op.*quantile;
     worst = worst ? std::max(*worst, value) : value;
   }

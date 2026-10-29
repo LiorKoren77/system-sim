@@ -253,7 +253,7 @@ TEST_CASE("a simulation refuses node types the phase does not support yet", "[th
   const auto sim = Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
-          "node 's' has type 'ws_gateway', which run/estimate do not support yet (phase 2)");
+          "node 's' has type 'ws_gateway', which run/estimate do not support yet (phase 3)");
 }
 
 TEST_CASE("run emits one record per step from 0 to duration, exclusive", "[theory]") {

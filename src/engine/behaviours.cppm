@@ -2515,6 +2515,16 @@ namespace detail {
 [[nodiscard]] queueing::TimeMoments moments_of(const flow::LatencyEstimate& latency) {
   return {.mean_s = latency.mean_s, .variance_s2 = latency.variance_s2};
 }
+
+// The branches that answer some requests (share > 0), moved to the front in their order: the span
+// returned holds them, and what follows it in `branches` is left unspecified.
+[[nodiscard]] std::span<Branch> answered_only(std::span<Branch> branches) {
+  std::size_t answering = 0;
+  for (const Branch& branch : branches) {
+    if (branch.share > 0.0) branches[answering++] = branch;
+  }
+  return branches.first(answering);
+}
 }  // namespace detail
 
 // Graph::build checked the shape (1 <= W, R <= N <= nodes); the defaults (N = 3, W = R = 2) are
@@ -2566,7 +2576,10 @@ const KvClusterBehaviour::QuorumAnswer& KvClusterBehaviour::answer_of(std::strin
 //   w_hot = p_hot (1 − L_hot) / (1 − L),   w_cool = (1 − p_hot)(1 − L_cool) / (1 − L)
 // (review of plan 2c Task 11, I-2: weighting by p_hot alone timed the requests the hot set lost
 // too). With nothing lost the weights are p_hot and 1 − p_hot exactly; with everything lost no
-// request is timed, and the sets keep their offered shares (the time a request would take).
+// request is timed, and the sets keep their offered shares (the time a request would take). A set
+// that answers nothing is left out of the answered mix (answered_only): its reply time may be
+// infinite (a dead hot machine at W = N), and its weight 0 would make 0 × inf = NaN (review of
+// the kv/search fix round, M-2).
 KvClusterBehaviour::QuorumAnswer KvClusterBehaviour::answer_quorum(int quorum) const {
   std::array<Branch, 2> answered{};
   std::array<Branch, 2> offered{};
@@ -2587,8 +2600,9 @@ KvClusterBehaviour::QuorumAnswer KvClusterBehaviour::answer_quorum(int quorum) c
   if (delivered <= 0.0) {
     return {.latency = mixture(std::span{offered}.first(used)), .delivered = delivered};
   }
-  for (Branch& branch : std::span{answered}.first(used)) branch.share /= delivered;
-  return {.latency = mixture(std::span{answered}.first(used)), .delivered = delivered};
+  const auto kept = detail::answered_only(std::span{answered}.first(used));
+  for (Branch& branch : kept) branch.share /= delivered;
+  return {.latency = mixture(kept), .delivered = delivered};
 }
 
 // The quorum-th fastest reply of the set: queueing::lognormal_order_statistic over its machines.

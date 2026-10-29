@@ -3,6 +3,7 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -25,6 +26,7 @@ import simsys.core;
 import simsys.flow;
 import simsys.graph;
 import simsys.model;
+import simsys.queueing;
 import simsys.workload;
 
 using namespace std::chrono_literals;
@@ -36,7 +38,9 @@ using simsys::behaviours::CacheBehaviour;
 using simsys::behaviours::CdnBehaviour;
 using simsys::behaviours::ClientBehaviour;
 using simsys::behaviours::ExternalSinkBehaviour;
+using simsys::behaviours::KvClusterBehaviour;
 using simsys::behaviours::LoadBalancerBehaviour;
+using simsys::behaviours::MachineGroup;
 using simsys::behaviours::MessageQueueBehaviour;
 using simsys::behaviours::Outgoing;
 using simsys::behaviours::RateLimiterBehaviour;
@@ -2237,4 +2241,141 @@ TEST_CASE("a parallel group is sent the whole flow and thins every step after it
   for (const Outgoing& out : unthinned.outgoing) {
     REQUIRE_THAT(out.flow.rate_of("get").per_second, WithinRel(100.0, 1e-12));
   }
+}
+
+// ---- KvClusterBehaviour's quorum answer (plan 2c refinement 9; book ch. 6) ----
+//
+// The engine hands a kv_cluster its machines each step (observe: the hot machine's group, then the
+// cool ones'), and the behaviour answers each op from its quorum over the two kinds of replica
+// set: {hot, N - 1 cool} with probability p_hot = N k / M, {N cool} otherwise. These tests drive
+// observe by hand, with machines the engine would not produce on its own, to pin the paths the
+// review of the kv/search fix round asked for (M-2, M-5).
+
+namespace {
+// u -> store: a kv_cluster of 8 machines (10k/s and 1 ms each), N = 3 replicas per key, the given
+// quorums. At the default 150 virtual nodes the ring makes the hottest machine k = 1.0676 times
+// the average (graph::ring_imbalance), so p_hot = 3 k / 8 = 0.4004.
+Scenario kv_ring(int write_quorum, int read_quorum) {
+  Scenario s{.name = "kv", .version = 1, .duration = 1min};
+  NodeSpec store{
+      .id = "store", .type = NodeType::kv_cluster, .capacity = Rate{10'000}, .latency = 1ms};
+  store.kv_nodes = 8;
+  store.replication = 3;
+  store.write_quorum = write_quorum;
+  store.read_quorum = read_quorum;
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{1000}},
+                                           .op_shares = {{"read", 0.5}, {"write", 0.5}}}},
+             std::move(store)};
+  s.links = {LinkSpec{.from = "u", .to = "store"}};
+  return s;
+}
+
+// The share of the requests whose replica set includes the hot machine (the class comment).
+double hot_share_of(const simsys::graph::Graph& g) {
+  return 3.0 * g.nodes()[*g.index_of("store")].imbalance / 8.0;
+}
+
+// The q-th fastest reply of a set of `hot` replicas on the hot machine and `cool` on cool ones.
+LatencyEstimate reply_of(const MachineGroup& hot_machine, int hot, const MachineGroup& cool_machine,
+                         int cool, int quorum) {
+  using simsys::queueing::ReplicaGroup;
+  const std::array set{ReplicaGroup{.replicas = hot,
+                                    .sojourn = {.mean_s = hot_machine.sojourn.mean_s,
+                                                .variance_s2 = hot_machine.sojourn.variance_s2}},
+                       ReplicaGroup{.replicas = cool,
+                                    .sojourn = {.mean_s = cool_machine.sojourn.mean_s,
+                                                .variance_s2 = cool_machine.sojourn.variance_s2}}};
+  const auto reply = simsys::queueing::lognormal_order_statistic(set, quorum);
+  return {reply.mean_s, reply.variance_s2};
+}
+
+// A kv_cluster's answer to `op`: a leaf, so the downstream lookups are never called.
+LatencyEstimate kv_response(const KvClusterBehaviour& kv, std::string_view op) {
+  return kv.response(op, LatencyEstimate{},
+                     [](std::size_t, std::string_view) { return LatencyEstimate{}; });
+}
+
+double kv_delivered(const KvClusterBehaviour& kv, std::string_view op) {
+  return kv.delivered(op, 1.0, [](std::size_t, std::string_view) { return 1.0; });
+}
+
+// A hot machine at rho 0.9 (a longer, wider sojourn) and a cool one at rho 0.5, both keeping all
+// they are sent.
+const MachineGroup busy_hot{.sojourn = {0.004, 1.6e-5}, .kept = 1.0};
+const MachineGroup calm_cool{.sojourn = {0.0012, 1.5e-6}, .kept = 1.0};
+}  // namespace
+
+// observe() is memoised: a step whose machines equal last step's returns last step's answer
+// without the quadrature. That shortcut must be invisible: the same machines give the same answer.
+TEST_CASE("a kv cluster observing the same machines twice gives the same answer", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(kv_ring(2, 2));
+  KvClusterBehaviour kv{g, *g.index_of("store")};
+  const std::array machines{busy_hot, calm_cool};
+  kv.observe(machines);
+  const LatencyEstimate first = kv_response(kv, "read");
+  kv.observe(machines);
+  const LatencyEstimate second = kv_response(kv, "read");
+  REQUIRE(second.mean_s == first.mean_s);
+  REQUIRE(second.variance_s2 == first.variance_s2);
+  REQUIRE(kv_delivered(kv, "read") == 1.0);
+}
+
+// The memo's key is the whole MachineGroup, kept share included: a step where only the hot
+// machine's kept share changes is recomputed. At W = N = 3 a write needs every replica, so the
+// sets that include the hot machine lose what it drops: delivered = 1 - p_hot x (1 - 0.5).
+TEST_CASE("a kv cluster recomputes its answer when only a machine's kept share changes",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(kv_ring(3, 2));
+  KvClusterBehaviour kv{g, *g.index_of("store")};
+  kv.observe(std::array{busy_hot, calm_cool});
+  REQUIRE(kv_delivered(kv, "write") == 1.0);
+  MachineGroup dropping_hot = busy_hot;
+  dropping_hot.kept = 0.5;
+  kv.observe(std::array{dropping_hot, calm_cool});
+  REQUIRE_THAT(kv_delivered(kv, "write"), WithinRel(1.0 - hot_share_of(g) * 0.5, 1e-12));
+  REQUIRE(kv_delivered(kv, "read") == 1.0);  // R = 2: the two cool replicas meet it
+}
+
+// With every replica-request lost no request is answered, so there is nothing to weight by the
+// answered share; the response is the time a request would take, the two sets mixed by the
+// shares they are offered (p_hot and 1 - p_hot), by the law of total variance.
+TEST_CASE("a kv cluster that loses every request reports the offered mix of its two sets",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(kv_ring(2, 2));
+  KvClusterBehaviour kv{g, *g.index_of("store")};
+  MachineGroup lost_hot = busy_hot;
+  MachineGroup lost_cool = calm_cool;
+  lost_hot.kept = 0.0;
+  lost_cool.kept = 0.0;
+  kv.observe(std::array{lost_hot, lost_cool});
+  const double p_hot = hot_share_of(g);
+  const LatencyEstimate with_hot = reply_of(busy_hot, 1, calm_cool, 2, 2);
+  const LatencyEstimate all_cool = reply_of(busy_hot, 0, calm_cool, 3, 2);
+  const double mean = p_hot * with_hot.mean_s + (1 - p_hot) * all_cool.mean_s;
+  const double variance =
+      p_hot * (with_hot.variance_s2 + (with_hot.mean_s - mean) * (with_hot.mean_s - mean)) +
+      (1 - p_hot) * (all_cool.variance_s2 + (all_cool.mean_s - mean) * (all_cool.mean_s - mean));
+  REQUIRE(kv_delivered(kv, "read") == 0.0);
+  REQUIRE_THAT(kv_response(kv, "read").mean_s, WithinRel(mean, 1e-12));
+  REQUIRE_THAT(kv_response(kv, "read").variance_s2, WithinRel(variance, 1e-12));
+}
+
+// A dead hot machine (no capacity: it keeps nothing and never answers, an infinite sojourn) at a
+// write quorum of N = 3: a write whose set includes it is lost, and its reply time is infinite.
+// That set answers nothing, so it has no weight among the answered writes and must not enter
+// their mix at all (0 x inf is NaN): the writes answered are the all-cool sets', at the slowest
+// of their three replies (review of the kv/search fix round, M-2).
+TEST_CASE("a dead hot machine at a write quorum of N leaves the writes the cool sets answer",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(kv_ring(3, 2));
+  KvClusterBehaviour kv{g, *g.index_of("store")};
+  constexpr double inf = std::numeric_limits<double>::infinity();
+  const MachineGroup dead_hot{.sojourn = {inf, inf}, .kept = 0.0};
+  kv.observe(std::array{dead_hot, calm_cool});
+  const LatencyEstimate all_cool = reply_of(calm_cool, 0, calm_cool, 3, 3);
+  REQUIRE_THAT(kv_delivered(kv, "write"), WithinRel(1.0 - hot_share_of(g), 1e-12));
+  REQUIRE_THAT(kv_response(kv, "write").mean_s, WithinRel(all_cool.mean_s, 1e-12));
+  REQUIRE_THAT(kv_response(kv, "write").variance_s2, WithinRel(all_cool.variance_s2, 1e-12));
 }
