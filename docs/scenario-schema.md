@@ -77,20 +77,25 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `cdn` | a fixed or `che` hit ratio (or none: every read misses), misses fetched from its `origin`, see [`cdn`](#cdn); with a byte `capacity` it counts megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)) |
 | `blob_store` | every op, counting megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)): its queue waits for whole objects, a write (`write_ops`) is answered at its last byte, a read at its first megabyte; `then` steps as asynchronous event notifications (see [Node types](#node-types)) |
 | `id_generator` | as a `service` whose capacity and service time its `algorithm` supplies, see [`id_generator`](#id_generator) |
+| `message_queue` | the broker's append, every message copied to each consumer group, the publisher answered at the append (phase 2c, see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
+| `worker_pool` | M/M/c over consumption, `workers / cost` jobs a second, its room its queue's `retention`; **without** `then` steps (phase 2c, same section) |
 
 Everything else is refused before the first step, with exit code 1:
 
 | what | message | runs from |
 |---|---|---|
-| `message_queue`, `worker_pool`, `external_sink` | `node 'x' has type 'message_queue', which run/estimate do not support yet (phase 2)` | 2c |
+| `external_sink` | `node 'x' has type 'external_sink', which run/estimate do not support yet (phase 2)` | 2c |
+| a `worker_pool` with `then` steps | `node 'w': a worker pool's then steps run in phase 2c's next step` | 2c (Task 7) |
 | `kv_cluster`, `ws_gateway`, `service_discovery` | the same message | 3 |
 | `search_index`, `notification_fanout`, `frontier` | the same message | not yet assigned to a phase |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
 | `faults` | none: the list is accepted and nothing happens | 3 |
 
-The type message says "(phase 2)" for every type; the last column is the plan. The first
-node in file order that cannot run is the one named, and the type check comes before the CDN
-check. Of the 14 shipped scenarios six run: `tutorial/hello`, `tutorial/chain`,
+The type message says "(phase 2)" for every type; the last column is the plan. The type check
+runs over the whole file first, and names the first node in file order whose type cannot run;
+only then are the nodes of runnable types checked (the CDN's `keys`, a pool's `then` steps), in
+file order: google-drive is refused at its `ws_gateway`, `long_poll`, although its worker pools,
+declared earlier, have `then` steps. Of the 14 shipped scenarios six run: `tutorial/hello`, `tutorial/chain`,
 `labs/rate-limiter`, `labs/consistent-hashing`, `labs/unique-id` (which fails its `drop_rate` SLO
 on purpose, exit 2) and `book/url-shortener`.
 
@@ -118,7 +123,7 @@ caches and CDNs (their misses, their store, a cache's `then`) and along a `blob_
 the `then` of a `notification_fanout` or a `frontier`. A node whose load can only come through one of those
 gets 0 on paper: a number that is missing, not zero. Its check line therefore has no
 percentage and no zone, but a mark naming each such type on the way to it, nearest first:
-`transcoders  peak offered 0/s vs 1k/s total capacity  (load not propagated: message_queue is
+`transcoders  peak offered 0/s vs 6.667/s total capacity  (load not propagated: message_queue is
 phase 2c)`, or `dns ... (load not propagated: worker_pool is phase 2c, frontier is not modelled
 yet)`. The mark follows such a node's `then` steps (a message queue's links, which is all it
 has), not every link it has. A node that also receives load the checks do follow gets its
@@ -135,7 +140,7 @@ copy): they would be lower bounds too.
 
 | kind | grammar | examples |
 |---|---|---|
-| duration | non-negative number + `ns us ms s m h`; rounded to whole nanoseconds (below 1 ns is an error) | `250us`, `0.5ms`, `2m` |
+| duration | non-negative number + `ns us ms s m h d` (`d`, a day of 24 h, from phase 2c: a queue's `retention` is quoted in days); rounded to whole nanoseconds (below 1 ns is an error) | `250us`, `0.5ms`, `2m`, `7d` |
 | rate | number + optional `k M G` (decimal) + `/s` | `1.5k/s`, `500/s` |
 | byte rate | number + optional `K M G` (decimal, capital K) + `B/s`; or, as a network is rated, number + optional `k M G` + `bit/s`, read as bytes ÷ 8 | `500MB/s`, `40Gbit/s` (= 5e9 B/s) |
 | size | non-negative number + `B KB MB GB`, decimal (1 KB = 1000 B, as the book and cloud vendors count; `KiB` and `kB` are errors), at most 1e15 B | `200B`, `2KB`, `1.5GB` |
@@ -208,7 +213,7 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 | `latency` | duration | all but `client` | read | service time of one request; default per type (50 µs for `load_balancer` and `rate_limiter`, 250 µs for `cache`: the spec's memory read). An error on a `leaky_bucket` limiter |
 | `advanced` | map | all but `client` | read | see next table |
 | `ops` | map | `client`, `service`, `ws_gateway` | read (client, service); checked (ws_gateway) | client: op → share; otherwise op → step list (below) |
-| `cost` | map op → number | `service`, `cache`, `sql_db` | read | **new in v1.2**: the capacity units one request of that op consumes; an op not listed costs 1. Each value is a positive finite number (`cost 'write' must be a positive finite number`, also for a quoted `"3"`) of at most 1e6 (`cost 'write' must be at most 1e6`); anything but a map is `cost must be a map of op to units`, a bare `cost:` is `cost must not be empty (write {} for none)`. `capacity` is then a rate of units: demand is `Σ rate_op × cost_op`, and the node's demand, drops and backlog are reported in units. What it forwards stays requests (a drained `write` of cost 3 is one `write` downstream). A `sql_db` charges its write ops 5 unless `cost` lists them (see [`sql_db`](#sql_db)). A load balancer and a rate limiter charge 1 per request, and `cost` is not a key of theirs. A `worker_pool`'s `cost` is a different key (a duration per job, phase 2c) |
+| `cost` | map op → number | `service`, `cache`, `sql_db` | read | **new in v1.2**: the capacity units one request of that op consumes; an op not listed costs 1. Each value is a positive finite number (`cost 'write' must be a positive finite number`, also for a quoted `"3"`) of at most 1e6 (`cost 'write' must be at most 1e6`); anything but a map is `cost must be a map of op to units`, a bare `cost:` is `cost must not be empty (write {} for none)`. `capacity` is then a rate of units: demand is `Σ rate_op × cost_op`, and the node's demand, drops and backlog are reported in units. What it forwards stays requests (a drained `write` of cost 3 is one `write` downstream). A `sql_db` charges its write ops 5 unless `cost` lists them (see [`sql_db`](#sql_db)). A load balancer and a rate limiter charge 1 per request, and `cost` is not a key of theirs. A `worker_pool`'s `cost` is a different key, a duration per job (see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
 | `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | read (cache, blob_store); checked (others) | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step; a cache's `then` steps run (an unconditional one carries everything the cache answered, an `on: miss` one `1 − h` of the reads and none of the writes; see [`then` steps on a cache](#then-steps-on-a-cache)), and `explain`'s paper load follows them the same way; a `blob_store`'s run as asynchronous event notifications, one per write it serves and none per read (see [Node types](#node-types)) |
 
 A key outside its row is an error, e.g. `key 'capacity' is not valid for type 'client'`
@@ -270,8 +275,8 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `cache` | `hit_ratio`, `strategy`, `write_ops`, `backend`, `keys`, `eviction`, `ttl`, `then`, `cost` | read and run (fixed or `che` hit ratio), see [`cache`](#cache) |
 | `sql_db` | `replication_lag`, `shards` (int), `pool` (int connections), `write_ops`, `cost` | read and run (phase 2b), see [`sql_db`](#sql_db) |
 | `kv_cluster` | `nodes` (int), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp` | ignored; phase 3 |
-| `message_queue` | `partitions`, `retention` † | ignored; phase 2c |
-| `worker_pool` | `consumes` (queue node id), `workers`, `cost` (duration per job), `then` | `consumes` checked; others ignored; phase 2c |
+| `message_queue` | `partitions`, `retention` | read and run (phase 2c), see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool); `partitions` printed, not modelled |
+| `worker_pool` | `consumes` (queue node id), `workers`, `cost` (duration per job), `then` | `consumes`, `workers` and `cost` read and run (phase 2c), same section; `then` checked, run from Task 7 (a pool with `then` steps is refused by `run`/`estimate` until then) |
 | `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every **write** the store serves (an op in its `write_ops`; not one it drops) sends `factor` requests of the step's op to its target, and a read sends nothing (S3 notifies on ObjectCreated and ObjectRemoved, never on a GET: 1000 views/s of a video start no transcode; notifying on reads is phase 3). They are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. A step `on: miss` (`node 'store': a blob store's then steps fire for every write it stores (on: miss needs a cache)`) or `on: failure` (`... (on: failure: an event reports no failure before phase 3)`) is refused, and so is any `mode` (`node 'store': a blob store's then steps are event notifications nobody waits for (mode orders the calls a request waits for)`); an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, the delivery delay (an event arrives after the link's latency), failed notifications |
 | `search_index` | `build_interval` | ignored |
 | `ws_gateway` | `max_connections`, `heartbeat` (duration), `fanout` (avg recipients per message), `ops` | `ops` checked as step lists; others ignored; phase 3 |
@@ -696,6 +701,49 @@ writes)`), and checks the peak load against replicas × capacity (`vs 12.29M/s t
 capacity` for three snowflake machines). The [unique-id lab](../scenarios/labs/unique-id/)
 compares the ticket server with snowflake.
 
+### `message_queue` and `worker_pool`
+
+Book ch. 1 ("Message queue"), the transcoding queue of ch. 14 and the notification queue of
+ch. 15, Kafka in practice (plan 2c refinements 4-6). A `message_queue` is the **broker**: its own
+queue is the append (spec §6: 1M messages/s; 100 µs chosen, so `c = 1M/s × 100 µs = 100` by
+Little's law), and a publisher is answered **when its message is appended**, whatever happens to
+it later. Every link out of a queue must go to a `worker_pool` that `consumes` it (a consumer
+group), and every group receives **every** message (Kafka's consumer groups each read the whole
+log; google-drive's two groups on `notify_q` each get all of it), as the same op. The hop from a
+queue to a pool is **asynchronous**: the publisher's response and answered rate end at the append,
+and what a pool loses counts in its own drop rate only. A `worker_pool` is **M/M/c over
+consumption** (spec §7: "capacity = workers / job cost"): `c = workers`, service time `cost`,
+rate `workers / cost` (youtube's 400 transcoders at `cost: 60s` drain 400 / 60 s = 6.667
+videos/s). What a group has not drained waits in **its pool's queue**, whose waiting room is the
+queue's `retention` × the pool's rate (a message older than `retention` is deleted unconsumed:
+those are the pool's drops); each group's room is its own. Worked: 1k messages/s into 4 workers
+at 3.333 ms: rho = 1000 / 1200 = 0.8333, Erlang C(4, 3.333 erlangs) = 0.6577, Wq = 0.6577 ×
+3.333 ms / (4 × 0.1667) = 3.289 ms, sojourn 6.622 ms, while the publisher is answered in the
+append's 100 µs plus its link's round trip. A 1.5k/s burst into 1.2k/s grows the backlog by
+300 messages a second; with `retention: 10s` the room is 12,000 messages, full after 40 s, and the
+pool then drops 300/s while the publisher is still answered 1.5k/s.
+
+| key | on | rule | message |
+|---|---|---|---|
+| `retention` | `message_queue` | a positive [duration](#values) (`7d` = 168 h); default **7 days**, Kafka's `log.retention.hours = 168` (an industry default: the book gives none) | `node 'q': retention must be positive` |
+| `partitions` | `message_queue` | a positive integer, printed by `explain` and **not modelled** (it would cap a group's parallelism: phase 3) | `node 'q': partitions must be a positive integer` |
+| `consumes` | `worker_pool` | the queue (or URL `frontier`) the pool drains; *(graph)* it must be a `message_queue` or a `frontier` and link to the pool | `node 'w': consumes 'svc' (type service); a worker pool consumes a message_queue or a frontier`, `node 'w': consumes 'q', but no link from 'q' delivers its messages to it` |
+| `workers` | `worker_pool` | required, a positive integer, at most 100000 (Erlang C costs O(c) per step) | `node 'w': worker_pool needs workers`, `workers must be a positive integer`, `workers must be at most 100000` |
+| `cost` | `worker_pool` | required, a positive duration: the time one worker spends on one job (a service's `cost` is a map of capacity units; same spelling, read by type) | `node 'w': worker_pool needs cost`, `cost must be positive` |
+| `capacity`, `latency`, `replicas`, `advanced.concurrency` | `worker_pool` | refused: each would restate `workers` or `cost` | `node 'w': a worker pool's rate is workers / cost` |
+| `advanced.queue_limit` | `worker_pool` | refused: the pool waits in its queue | `node 'w': a worker pool waits in its queue: set the queue's retention` |
+
+*(graph)* A link from a queue to anything but a pool that consumes it is refused: `node 'q': a
+message queue delivers only to the worker pools that consume it ('svc' does not)`. `explain` says
+what each number is: `retention=7d (default: Kafka's 168 h) partitions=32 (not modelled)` on the
+queue (a retention of whole days in days, any other as other durations), `capacity=6.667/s
+(workers / cost)  service_time=1m (cost)  c=400 (workers)  queue_limit=4.032e+06 (retention ×
+capacity) ... workers=400 cost=1m (capacity 6.667/s: workers / cost)` on the pool. A group's
+**queue lag**, the age of its oldest unread message, is measured in Task 8 (the `queue_lag` SLO).
+Ignored: ordering, delivery guarantees and redelivery, a consumer's commit interval, the broker's
+disk; a worker blocked on a slow downstream call (an external sink's 150 ms would hold a worker:
+phase 3), autoscaling, poison messages.
+
 ## Rate curve (`client.rate`)
 
 ```yaml
@@ -813,7 +861,7 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 | `drop_rate` | optional | not allowed | number in [0, 1] | the node's dropped / the work sent to it, after warmup; without `node`, the worst node's or bandwidth link pipe's (a `node` names a node only) |
 | `reject_rate` | optional | not allowed | number in [0, 1] | **new in v1.2**: the node's rejected (a rate limiter's refusals, a leaky bucket's overflow included) / the requests sent to it, after warmup; without `node`, the worst node's |
 | `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup |
-| `queue_lag` | optional | not allowed | duration | reported `skipped` until `message_queue` runs (phase 2c) |
+| `queue_lag` | optional | not allowed | duration | reported `skipped` until a queue's lag is measured (phase 2c Task 8; queues run since Task 6) |
 | `staleness` | optional; name a `sql_db` | not allowed | duration | phase 2b: the named database's mean staleness after warmup, its write sojourn at the primary + `replication_lag` + its sojourn at a replica (see [`sql_db`](#sql_db)); fails whatever that mean when a replica misses committed writes (it falls behind without bound; the note says how many per replica, of how many committed); `skipped` without a `node` or on a node that keeps no replicated data (any type but `sql_db`); a `sql_db` with `replicas: 1` reports 0 |
 
 The kind of `max` follows the metric, so `0.01` can never be read as 0.01 seconds

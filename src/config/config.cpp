@@ -1097,7 +1097,7 @@ CheckResult read_advanced(const Site& site, const YAML::Node& body, model::NodeS
 
 // The types whose `cost` is a map op -> capacity units (a SQL database's writes default to
 // defaults::sql_write_cost; a stated cost replaces it). A worker_pool's `cost` is a
-// different key with the same spelling (a duration per job, read in phase 2c), so the
+// different key with the same spelling (a duration per job, read_job_cost), so the
 // reader is chosen by type, not by the key alone.
 bool has_cost_map(model::NodeType type) {
   return type == model::NodeType::service || type == model::NodeType::cache ||
@@ -2484,6 +2484,105 @@ CheckResult read_blob_store_keys(const Site& site, const YAML::Node& body, model
   });
 }
 
+// ---- Message queue and worker pool keys (plan 2c refinements 4-5) ----
+//
+// A message queue is a broker whose own numbers are the type's (an append); what it adds is
+// `retention`, how long a message waits for its consumer groups before it is deleted unread, and
+// `partitions`, printed and not modelled. A worker pool is M/M/c over consumption: `workers` is
+// its c and `cost` the time one worker spends on one job, so its rate is workers / cost and its
+// waiting room is its queue's retention. Every key that would state one of those a second time is
+// refused with the reason (refused_worker_pool_keys).
+
+// `retention: 7d`: positive (a retention of 0 would delete every message before any group read
+// it). Absent stays absent: the graph applies defaults::default_retention, explain says "default".
+CheckResult read_retention(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (!body["retention"]) return {};
+  auto retention = parse_duration_key(site, body, "retention");
+  if (!retention) return std::unexpected(retention.error());
+  if (retention->count() <= 0) return site.fail(body["retention"], "retention must be positive");
+  node.retention = *retention;
+  return {};
+}
+
+// `partitions: 32`: a positive integer, printed by explain and not modelled (phase 3: a partition
+// is read by one worker of a group at a time, which would cap a group's c).
+CheckResult read_partitions(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (!body["partitions"]) return {};
+  if (auto checked = check_not_null(site, body, "partitions", "partitions"); !checked) {
+    return checked;
+  }
+  return read_positive_int(site, body["partitions"], "partitions")
+      .transform(store_in(node.partitions));
+}
+
+CheckResult read_message_queue_keys(const Site& site, const YAML::Node& body,
+                                    model::NodeSpec& node) {
+  if (node.type != model::NodeType::message_queue) return {};
+  const auto this_node = node_site(site, node.id);
+  return read_retention(this_node, body, node).and_then([&] {
+    return read_partitions(this_node, body, node);
+  });
+}
+
+// `workers: 400`, required: the pool's c, a positive integer with the bound of every c
+// (defaults::max_concurrency: Erlang C costs O(c) per step, as advanced.concurrency).
+CheckResult read_workers(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (!body["workers"]) return site.fail(body, "worker_pool needs workers");
+  if (auto checked = check_not_null(site, body, "workers", "workers"); !checked) return checked;
+  auto workers = read_positive_int(site, body["workers"], "workers");
+  if (!workers) return std::unexpected(workers.error());
+  if (*workers > defaults::max_concurrency) {
+    return site.fail(body["workers"],
+                     std::format("workers must be at most {}", defaults::max_concurrency));
+  }
+  node.workers = *workers;
+  return {};
+}
+
+// `cost: 60s`, required: the time one worker spends on one job, a positive duration. The same
+// key on a service is a map of op to capacity units (read_cost): has_cost_map leaves a pool's
+// alone, and this reads it as what it is here.
+CheckResult read_job_cost(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (!body["cost"]) return site.fail(body, "worker_pool needs cost");
+  auto cost = parse_duration_key(site, body, "cost");
+  if (!cost) return std::unexpected(cost.error());
+  if (cost->count() <= 0) return site.fail(body["cost"], "cost must be positive");
+  node.job_cost = *cost;
+  return {};
+}
+
+// The keys that would state a pool's numbers a second time. Its rate is workers / cost, its c
+// `workers` and its service time `cost`, so `capacity`, `latency`, `replicas` (more workers are
+// more `workers`) and `advanced.concurrency` could only contradict them; and its waiting room is
+// the part of its queue it has not read, which the queue's `retention` bounds, so
+// `advanced.queue_limit` is refused in favour of that.
+CheckResult refused_worker_pool_keys(const Site& site, const YAML::Node& body) {
+  for (const auto* key : {"capacity", "latency", "replicas"}) {
+    if (body[key]) return site.fail(body[key], "a worker pool's rate is workers / cost");
+  }
+  const auto advanced = body["advanced"];
+  if (!advanced || !advanced.IsMap()) return {};
+  if (advanced["concurrency"]) {
+    return site.fail(advanced["concurrency"], "a worker pool's rate is workers / cost");
+  }
+  if (advanced["queue_limit"]) {
+    return site.fail(advanced["queue_limit"],
+                     "a worker pool waits in its queue: set the queue's retention");
+  }
+  return {};
+}
+
+// `consumes: transcode_q`: read_node_routing has checked that the node exists; whether it is a
+// queue that links to the pool is Graph::build's to check (a scenario built in code needs it too).
+CheckResult read_worker_pool_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (node.type != model::NodeType::worker_pool) return {};
+  const auto this_node = node_site(site, node.id);
+  if (body["consumes"]) node.consumes = scalar_text(body["consumes"]);
+  return read_workers(this_node, body, node)
+      .and_then([&] { return read_job_cost(this_node, body, node); })
+      .and_then([&] { return refused_worker_pool_keys(this_node, body); });
+}
+
 // ---- Node bodies: the second pass -----------------------------------------------------
 
 // A client offers traffic (its `ops` are shares of its rate); every other node forwards
@@ -2532,6 +2631,8 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
     if (auto read = read_cdn_keys(site, entry.second, *node, declared); !read) return read;
     if (auto read = read_blob_store_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_id_generator_keys(site, entry.second, *node); !read) return read;
+    if (auto read = read_message_queue_keys(site, entry.second, *node); !read) return read;
+    if (auto read = read_worker_pool_keys(site, entry.second, *node); !read) return read;
     ++node;
   }
   return {};

@@ -1117,6 +1117,11 @@ struct QueueProvenance {
 
 [[nodiscard]] QueueProvenance queue_provenance(const graph::ResolvedNode& node) {
   if (is_leaky_bucket(node.spec)) return {"(limit)", "(limit)", "(leak slot)", "(burst)"};
+  // A worker pool's four numbers all follow from `workers`, `cost` and its queue's retention
+  // (defaults::worker_pool_rate, graph::Graph::connect_consumer).
+  if (defaults::worker_pool_rate(node.spec)) {
+    return {"(workers / cost)", "(cost)", "(workers)", "(retention × capacity)"};
+  }
   if (graph::pool_binds(node)) return pool_provenance(node);
   const auto& spec = node.spec;
   // The graph keeps no provenance for queue_limit, so it is read off the spec: provenance
@@ -1175,6 +1180,45 @@ struct QueueProvenance {
   return " " + write_ops_summary(g, node);
 }
 
+// A worker pool's model (plan 2c refinement 5): "  consumes=transcode_q workers=400 cost=1m
+// (capacity 6.667/s: workers / cost)": the capacity is no number the scenario states but its
+// workers over the time one of them spends on a job, and the line says so. Nothing for a pool
+// built in code without both numbers (it runs on the type's, which server_details shows).
+[[nodiscard]] std::string worker_pool_summary(const graph::ResolvedNode& node) {
+  const auto& spec = node.spec;
+  if (!defaults::worker_pool_rate(spec)) return {};
+  const double capacity = node.capacity.service_rate.per_second * spec.replicas;
+  const std::string consumes = spec.consumes ? "  consumes=" + *spec.consumes : "";
+  return consumes + "  workers=" + std::to_string(*spec.workers) +
+         " cost=" + fmt_duration(*spec.job_cost) + " (capacity " + fmt_rate(capacity) +
+         ": workers / cost)";
+}
+
+// A retention as a queue's is quoted: in whole days when it is some ("7d", Kafka's default of
+// 168 h), else as explain writes any duration ("10s", "36h"). Only here: every other duration
+// keeps fmt_duration's hours ("ttl=24h"), so this rule changes no other line.
+[[nodiscard]] std::string fmt_retention(SimTime retention) {
+  constexpr SimTime::rep ns_per_day = 86'400'000'000'000;
+  const auto ticks = retention.count();
+  if (ticks > 0 && ticks % ns_per_day == 0) return std::to_string(ticks / ns_per_day) + "d";
+  return fmt_duration(retention);
+}
+
+// A message queue's model (plan 2c refinement 4): "  retention=7d (default: Kafka's 168 h)
+// partitions=32 (not modelled)". The retention sets each consumer group's waiting room
+// (retention × the pool's capacity: see the pools' queue_limit); the book gives no figure, so an
+// absent one is Kafka's `log.retention.hours`, and the line says whose default it is. Partitions
+// are accepted and printed, not simulated (phase 3).
+[[nodiscard]] std::string message_queue_summary(const model::NodeSpec& spec) {
+  if (spec.type != model::NodeType::message_queue) return {};
+  std::string text =
+      "  retention=" + fmt_retention(spec.retention.value_or(defaults::default_retention));
+  if (!spec.retention) text += " (default: Kafka's 168 h)";
+  if (spec.partitions)
+    text += " partitions=" + std::to_string(*spec.partitions) + " (not modelled)";
+  return text;
+}
+
 [[nodiscard]] std::string explain_nodes(const graph::Graph& g) {
   std::vector<Row> rows;
   for (std::size_t i = 0; i < g.nodes().size(); ++i) {
@@ -1187,7 +1231,8 @@ struct QueueProvenance {
                  : server_details(node) + cost_summary(g, i) + size_summary(g, i) +
                        blob_store_summary(g, i) + balancing_summary(g, i) +
                        limiter_summary(node.spec) + cache_summary(g, i) + cdn_summary(g, i) +
-                       database_summary(node) + id_generator_summary(node.spec)}});
+                       database_summary(node) + id_generator_summary(node.spec) +
+                       message_queue_summary(node.spec) + worker_pool_summary(node)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }
@@ -1668,14 +1713,14 @@ constexpr std::string_view unknown_hit_ratio_note =
 // (or any node's) `ops` steps, through load balancers and rate limiters over their links
 // (graph::forwards_by_link), from caches and CDNs on their misses (graph::hits_or_misses) and
 // along a blob store's `then` steps, its event notifications (plan 2c Task 4).
-// It does not follow a worker pool's `then`, nor a message queue's consumers (phase 2c; a
-// worker pool's work comes from the queue it consumes, over a link, not along a step), nor the
-// `then` of a notification fan-out or a URL frontier (types without a phase yet). A node fed
-// through one of those misses that part of its load: with nothing else it shows 0 offered load, a
-// missing number, not a zero, and a verdict on it ("0%, green") would read as "this tier is idle";
-// with some load from elsewhere its percentage is a lower bound, and a green or yellow verdict on
-// it would read as "this tier has room" (review of 3e23477, I1: a node fed 1/s by a client and
-// 10k/s through a blob store printed "(0.05%, green)"). Its check line says so instead.
+// It does not follow a worker pool's `then`, nor a message queue's deliveries to its consumer
+// groups (plan 2c Task 7; the engine runs a queue and a pool without `then` steps since Task 6),
+// nor the `then` of a notification fan-out or a URL frontier (types without a phase yet). A node
+// fed through one of those misses that part of its load: with nothing else it shows 0 offered load,
+// a missing number, not a zero, and a verdict on it ("0%, green") would read as "this tier is
+// idle"; with some load from elsewhere its percentage is a lower bound, and a green or yellow
+// verdict on it would read as "this tier has room" (review of 3e23477, I1: a node fed 1/s by a
+// client and 10k/s through a blob store printed "(0.05%, green)"). Its check line says so instead.
 
 // Until when the paper load leaves unfollowed what a node of `type` sends on: "phase 2c", "not
 // modelled yet", or nothing for a type it follows (or that sends nothing on).
@@ -1688,8 +1733,8 @@ constexpr std::string_view unknown_hit_ratio_note =
 
 // Where `from` sends on what it receives. For a type the paper load does not follow: the targets
 // of its `then` steps, the flow it would send; for one with none (a message queue, whose
-// consumers are only linked to it: `consumes` is checked by the loader but not kept), the nodes
-// its links carry demand to. For every other node: its demand edges (steps, client routes, a
+// consumers are the pools its links deliver to, graph::Graph::route_queue), the nodes its links
+// carry demand to. For every other node: its demand edges (steps, client routes, a
 // balancer's links, a cache's backend, a blob store's events), what the paper load follows from
 // it.
 [[nodiscard]] std::vector<std::size_t> onward_targets(const graph::Graph& g, std::size_t from) {

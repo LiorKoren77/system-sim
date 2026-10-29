@@ -14,6 +14,7 @@ module;
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -106,6 +107,14 @@ inline constexpr double byte_unit = 1e6;
                          .service_variability = 0.0};
 }
 
+// How long a message queue keeps a message its consumer groups have not read (plan 2c refinement
+// 4) when the scenario states no `retention`: 7 days. The book gives no figure (ch. 1 and the
+// later designs draw a queue, never its retention); this is an industry default, Kafka's
+// `log.retention.hours = 168`. It sets each consumer group's waiting room, retention × the pool's
+// capacity (graph::Graph::build): 7 days are 604,800 s, so a pool of 1.2k jobs/s may fall
+// 725.76 million messages behind before the oldest are deleted unconsumed.
+inline constexpr SimTime default_retention = 168_h;
+
 // Spec §6's QPS line: "blob 500 MB/s", one blob store machine's throughput.
 inline constexpr ByteRate blob_store_byte_rate{500e6};
 
@@ -164,7 +173,9 @@ struct TypeDefaults {
     case message_queue:
       return {Rate{1'000'000}, 100_us};  // rate spec "queue 1M msg/s"; time chosen: an append
     case worker_pool:
-      return {Rate{1'000}, 2_ms};  // chosen: a 2 ms background job
+      // chosen: a 2 ms background job. Never what a pool from a scenario runs on: the loader
+      // requires `workers` and `cost`, which replace both numbers (worker_pool_rate below).
+      return {Rate{1'000}, 2_ms};
     case blob_store:
       // rate spec "blob 500 MB/s" in units of 1 MB (byte_unit) = 500 units/s; time spec §6
       // "blob store per-MB cost" (disk, 30 ms) + "per-MB transfer" (network, 10 ms) = 40 ms per
@@ -290,11 +301,22 @@ struct Resolved {
   Source source;
 };
 
+// A worker pool's rate (plan 2c refinement 5; spec §7: "capacity = workers / job cost"): its c
+// workers each finish one job per `cost`, so together `workers / cost` jobs a second, Little's law
+// read the other way round (c = rate × service time): youtube's 400 transcoders at 60 s a video
+// drain 400 / 60 s = 6.667 videos/s, news-feed's 32 fan-out workers at 5 ms 6.4k posts/s. Empty
+// for any other node, and for a pool built in code without both numbers (the type's then).
+[[nodiscard]] std::optional<Rate> worker_pool_rate(const model::NodeSpec& n) {
+  if (n.type != model::NodeType::worker_pool || !n.workers || !n.job_cost) return std::nullopt;
+  return Rate{*n.workers / seconds(*n.job_cost)};
+}
+
 // Pattern: Layered configuration (override over default, like a CSS cascade);
 // Resolved<T> records which layer answered.
 // A capacity stated in bytes is still the scenario's value, read in megabytes per second
 // (byte_unit): `capacity: 100GB/s` is 100k units/s.
 [[nodiscard]] Resolved<Rate> resolve_service_rate(const model::NodeSpec& n) {
+  if (const auto pool = worker_pool_rate(n)) return {*pool, Source::scenario};
   if (n.capacity) return {*n.capacity, Source::scenario};
   if (n.byte_capacity) {
     return {Rate{n.byte_capacity->bytes_per_second / byte_unit}, Source::scenario};
@@ -327,7 +349,9 @@ struct Resolved {
   return defaults_of(n).service_variability;
 }
 
+// A worker pool's service time is its `cost`, the time one worker spends on one job.
 [[nodiscard]] Resolved<SimTime> resolve_service_time(const model::NodeSpec& n) {
+  if (worker_pool_rate(n)) return {*n.job_cost, Source::scenario};
   if (n.latency) return {*n.latency, Source::scenario};
   return {defaults_of(n).service_time, Source::type_default};
 }
@@ -361,7 +385,10 @@ inline constexpr int max_concurrency = 100'000;
 // growing like 1/(1-rho), climbs steeply past ~70% and turns dangerous past ~90%), so
 // the numbers live in exactly one place. Only concurrency is derived instead, and the
 // variability comes from the type (external sinks are erratic) or, at a byte-sized node, is 0
-// (default_service_variability).
+// (default_service_variability). A worker pool's c is its `workers`, stated, not implied (Little's
+// law would give the same number, workers / cost × cost, but through a division that may round
+// up to one worker too many). Its waiting room is its queue's retention, which the graph sets
+// (graph::Graph::build): this function does not know which queue the pool reads.
 // A client is a source, not a queue: asking for its capacity is a programmer error.
 [[nodiscard]] fluid::Capacity resolve_capacity(const model::NodeSpec& n) {
   if (n.type == model::NodeType::client) {
@@ -374,7 +401,9 @@ inline constexpr int max_concurrency = 100'000;
   return fluid::Capacity{
       .service_rate = rate,
       .service_time_s = seconds(time),
-      .concurrency = a.concurrency.value_or(implied_concurrency(rate, time)),
+      .concurrency = n.type == model::NodeType::worker_pool && n.workers
+                         ? *n.workers
+                         : a.concurrency.value_or(implied_concurrency(rate, time)),
       .queue_limit = a.queue_limit.value_or(base.queue_limit),
       .yellow = a.yellow.value_or(base.yellow),
       .red = a.red.value_or(base.red),

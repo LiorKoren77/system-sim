@@ -51,6 +51,14 @@
 // write it serves (an op in its `write_ops`; a read fires nothing, Graph::then_fraction), and
 // asynchronous hops by design (detail::blob_store_events); a step on miss or on failure, or in
 // parallel mode, is refused, since an event is none of those (invalid_blob_store).
+// A message queue (plan 2c refinements 4-6; book ch. 1's message queue, Kafka in ch. 14's
+// transcoding and ch. 15's notification pipelines) COPIES: each link out of it goes to a worker
+// pool that `consumes` it (a consumer group), and every group receives every message, so the
+// queue's routes are one per group, each of share 1 (route_queue); the hops along them are
+// asynchronous by design (detail::consumer_deliveries: the publisher is answered at the append).
+// A worker pool is M/M/c over consumption: c = workers, service time = cost, rate workers / cost
+// (defaults::worker_pool_rate), and a waiting room of the messages its queue keeps,
+// retention × that rate (connect_consumers).
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -216,6 +224,13 @@ inline constexpr std::string_view counter_op = "counter";
 // than by per-op steps: load balancers and rate limiters (Graph::route_forwarder).
 [[nodiscard]] constexpr bool forwards_by_link(model::NodeType type) {
   return type == model::NodeType::load_balancer || type == model::NodeType::rate_limiter;
+}
+
+// Does a node of `type` copy what it receives to every node behind it, rather than split it? A
+// message queue does: each of its consumer groups (worker pools) reads every message (Kafka's
+// consumer groups), so each route has share 1 (Graph::route_queue, Graph::routes_for).
+[[nodiscard]] constexpr bool copies_to_consumers(model::NodeType type) {
+  return type == model::NodeType::message_queue;
 }
 
 // The node types that hit or miss: a cache and a CDN. Their hit ratio h decides the share of
@@ -398,16 +413,18 @@ class Graph {
   [[nodiscard]] std::optional<std::size_t> index_of(std::string_view id) const;
   // The link that carries demand from `from` to `to`: (from,to,out|inout) or (to,from,in).
   [[nodiscard]] std::optional<std::size_t> demand_link(std::size_t from, std::size_t to) const;
-  // Empty for a node that does not split flow (anything but a client, a load balancer or a
-  // rate limiter; a limiter's backend link is not a route). An index past the last node is
-  // a programmer error (std::out_of_range).
+  // Empty for a node that does not split flow (anything but a client, a load balancer, a rate
+  // limiter or a message queue; a limiter's backend link is not a route). A message queue's
+  // routes copy: one per consumer group, each of share 1 (route_queue). An index past the last
+  // node is a programmer error (std::out_of_range).
   [[nodiscard]] std::span<const Route> routes(std::size_t node) const { return routes_.at(node); }
   [[nodiscard]] std::span<const Route> client_routes(std::size_t client) const {
     return routes(client);
   }
   // The routes of `node` that `op` takes, each with `op` filled in and its share of THAT
   // op: a client's routes for the op as they are; a load balancer's routes whose link
-  // carries the op, their shares renormalised to sum to 1 over those links.
+  // carries the op, their shares renormalised to sum to 1 over those links; a message queue's
+  // routes whose link carries the op, each of share 1 still (a copy, not a split).
   [[nodiscard]] std::vector<Route> routes_for(std::size_t node, std::string_view op) const;
   // Every op some flow can bring to `node`, sorted: client routes that carry flow (not a
   // drained one, weight 0) and the steps targeting it that carry flow (unconditional ones, and
@@ -454,8 +471,9 @@ class Graph {
                                      std::string_view op) const;
   // Does node `from`, handling `op`, hand `target_op` off to node `to` without waiting?
   // True exactly for the hops that close a call cycle (see detail::find_async_hops), for a
-  // write_back cache's flushes to its store (detail::write_back_flushes) and for a blob store's
-  // `then` steps, its event notifications (detail::blob_store_events).
+  // write_back cache's flushes to its store (detail::write_back_flushes), for a blob store's
+  // `then` steps, its event notifications (detail::blob_store_events), and for a message queue's
+  // deliveries to its consumer groups (detail::consumer_deliveries).
   [[nodiscard]] bool is_async_hop(std::size_t from, std::string_view op, std::size_t to,
                                   std::string_view target_op) const;
   // Every asynchronous hop, sorted by (from, op, to, target_op).
@@ -486,6 +504,9 @@ class Graph {
   Result check_cache_backend_ops(std::size_t cache);
   Result check_cache_backend_calls() const;
   Result route_splitters();
+  Result route_queue(std::size_t queue);
+  Result connect_consumers();
+  Result connect_consumer(std::size_t pool);
   Result resolve_hit_ratios();
   Result resolve_hit_ratio(std::size_t cache, const model::HitRatio& stated,
                            const detail::HitRatioInputs& inputs);
@@ -964,6 +985,46 @@ void apply_database_keys(ResolvedNode& node) {
   return std::nullopt;
 }
 
+// Graph::build also takes worker pools written in code, which the loader never checked (config's
+// read_worker_pool_keys): `workers` positive and at most max_concurrency, `cost` positive, with the
+// loader's messages. (A pool without them runs on the type's numbers: the loader requires them, a
+// test may leave them out.)
+[[nodiscard]] std::optional<EngineError> invalid_worker_pool(const model::NodeSpec& spec) {
+  const std::string name = "node '" + spec.id + "': ";
+  if (spec.workers && *spec.workers < 1) {
+    return EngineError{name + "workers must be a positive integer"};
+  }
+  if (spec.workers && *spec.workers > defaults::max_concurrency) {
+    return EngineError{name + "workers must be at most " +
+                       std::to_string(defaults::max_concurrency)};
+  }
+  if (spec.job_cost && spec.job_cost->count() <= 0) {
+    return EngineError{name + "cost must be positive"};
+  }
+  return std::nullopt;
+}
+
+// Graph::build also takes message queues written in code: `retention` and `partitions` obey the
+// loader's rules (config's read_message_queue_keys), with its messages.
+[[nodiscard]] std::optional<EngineError> invalid_message_queue(const model::NodeSpec& spec) {
+  const std::string name = "node '" + spec.id + "': ";
+  if (spec.retention && spec.retention->count() <= 0) {
+    return EngineError{name + "retention must be positive"};
+  }
+  if (spec.partitions && *spec.partitions < 1) {
+    return EngineError{name + "partitions must be a positive integer"};
+  }
+  return std::nullopt;
+}
+
+// What a worker pool may consume (plan 2c refinement 4): a message queue, or a URL frontier,
+// which is a queue of URLs (book ch. 9: the web crawler's downloaders take URLs from it). The
+// frontier is not simulated before phase 3, so its wiring is checked here and the engine still
+// refuses the type.
+[[nodiscard]] bool can_be_consumed(model::NodeType type) {
+  return type == model::NodeType::message_queue || type == model::NodeType::frontier;
+}
+
 // Graph::build also takes clients written in code: their `keys` obey the loader's rules
 // (config's read_client_keys), which simsys.caching's Popularity factories also assume (they
 // throw on a negative exponent or an empty key space: programmer errors there).
@@ -1238,8 +1299,26 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
   return events;
 }
 
-// The call-cycle hops, the write-back flushes and the blob stores' events, sorted and without
-// duplicates, as Graph::is_async_hop's binary search needs them.
+// The deliveries of every message queue to its consumer groups (plan 2c refinement 6): (queue,
+// op) -> (pool, op) for each op that reaches the queue and each route that carries it. Asynchronous
+// BY DESIGN, as a blob store's events are: the broker answers its publisher once the message is
+// appended (Kafka's acks), and the publisher never waits for the worker that reads it later, so
+// a pool's backlog and drops reach neither its response nor its answered rate.
+[[nodiscard]] std::vector<AsyncHop> consumer_deliveries(const Graph& g) {
+  std::vector<AsyncHop> deliveries;
+  for (std::size_t queue = 0; queue < g.nodes().size(); ++queue) {
+    if (!copies_to_consumers(g.nodes()[queue].spec.type)) continue;
+    for (const auto& op : g.arriving_ops(queue)) {
+      for (const auto& route : g.routes_for(queue, op)) {
+        if (route.share > 0.0) deliveries.push_back({queue, op, route.target, op});
+      }
+    }
+  }
+  return deliveries;
+}
+
+// The call-cycle hops, the write-back flushes, the blob stores' events and the queues' deliveries,
+// sorted and without duplicates, as Graph::is_async_hop's binary search needs them.
 [[nodiscard]] std::vector<AsyncHop> async_hops(const Graph& g) {
   auto hops = find_async_hops(g);
   // (C++23's std::vector::append_range would say this in one call; GCC 14's library lacks it.)
@@ -1247,6 +1326,8 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
   hops.insert(hops.end(), flushes.begin(), flushes.end());
   const auto events = blob_store_events(g);
   hops.insert(hops.end(), events.begin(), events.end());
+  const auto deliveries = consumer_deliveries(g);
+  hops.insert(hops.end(), deliveries.begin(), deliveries.end());
   std::ranges::sort(hops);
   const auto duplicates = std::ranges::unique(hops);
   hops.erase(duplicates.begin(), duplicates.end());
@@ -1567,12 +1648,9 @@ void add_size_only_hops(const Graph& g, std::size_t node, std::string_view op,
   if (resolved.spec.type == model::NodeType::rate_limiter && resolved.backend) {
     hops.push_back({.to = *resolved.backend, .op = std::string{counter_op}});
   }
-  if (resolved.spec.type != model::NodeType::message_queue) return;
-  for (const auto& link : g.links()) {
-    const auto consumer = demand_target(link, node);
-    if (!consumer || !carries_op(link, op)) continue;
-    if (g.nodes()[*consumer].spec.type != model::NodeType::worker_pool) continue;
-    hops.push_back({.to = *consumer, .op = std::string{op}});
+  if (!copies_to_consumers(resolved.spec.type)) return;
+  for (const auto& route : g.routes_for(node, op)) {
+    if (route.share > 0.0) hops.push_back({.to = route.target, .op = std::string{op}});
   }
 }
 
@@ -2143,6 +2221,7 @@ std::expected<Graph, EngineError> Graph::build(model::Scenario scenario) {
   // `if (!r) return std::unexpected(r.error());` between every pair of steps.
   const auto built = graph.resolve_nodes()
                          .and_then([&] { return graph.resolve_links(); })
+                         .and_then([&] { return graph.connect_consumers(); })
                          .and_then([&] { return graph.connect_steps(); })
                          .and_then([&] { return graph.connect_backends(); })
                          .and_then([&] { return graph.route_splitters(); })
@@ -2220,6 +2299,12 @@ Graph::Result Graph::resolve_nodes() {
     }
     if (spec.type == model::NodeType::blob_store) {
       if (auto invalid = invalid_blob_store(spec)) return std::unexpected{std::move(*invalid)};
+    }
+    if (spec.type == model::NodeType::worker_pool) {
+      if (auto invalid = invalid_worker_pool(spec)) return std::unexpected{std::move(*invalid)};
+    }
+    if (spec.type == model::NodeType::message_queue) {
+      if (auto invalid = invalid_message_queue(spec)) return std::unexpected{std::move(*invalid)};
     }
     // An id generator needs nothing more here: its algorithm's numbers are type defaults
     // (defaults::defaults_of), resolved below like any node's.
@@ -2777,9 +2862,88 @@ Graph::Result Graph::connect_backend(std::size_t limiter) {
 Graph::Result Graph::route_splitters() {
   if (auto routed = route_clients(); !routed) return routed;
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
+    if (copies_to_consumers(nodes_[node].spec.type)) {
+      if (auto routed = route_queue(node); !routed) return routed;
+    }
     if (!forwards_by_link(nodes_[node].spec.type)) continue;
     if (auto routed = route_forwarder(node); !routed) return routed;
   }
+  return {};
+}
+
+// A message queue delivers to its consumer groups (plan 2c refinement 4): every link it sends
+// demand on must reach a worker pool that `consumes` it, since a broker hands a message only to
+// the groups subscribed to it (anything else behind it would be a service the scenario believes
+// is fed and is not); a link to anything else is refused, naming it. Each such link is one
+// Route of share 1: every group reads EVERY message (a load balancer splits, shares summing to 1;
+// a queue copies), as the same op. A drained link (weight 0) is a group that reads nothing
+// (share 0), as everywhere a weight of 0 means a route nobody takes; any other weight changes
+// nothing, a group cannot read part of the log. A queue with no link holds its messages for
+// nobody: no route, and it answers its publishers all the same.
+Graph::Result Graph::route_queue(std::size_t queue) {
+  const auto& id = nodes_[queue].spec.id;
+  for (std::size_t i = 0; i < links_.size(); ++i) {
+    const auto target = demand_target(links_[i], queue);
+    if (!target) continue;
+    const auto& consumer = nodes_[*target].spec;
+    if (consumer.type != model::NodeType::worker_pool || consumer.consumes != id) {
+      return std::unexpected{EngineError{"node '" + id +
+                                         "': a message queue delivers only to the worker pools "
+                                         "that consume it ('" +
+                                         consumer.id + "' does not)"}};
+    }
+    const double share = links_[i].weight > 0.0 ? 1.0 : 0.0;
+    routes_[queue].push_back(Route{.target = *target, .link = i, .share = share});
+    add_edge(DemandEdge{.from = queue, .to = *target, .link = i});
+  }
+  return {};
+}
+
+// Each worker pool's queue (plan 2c refinements 4-5), checked from the pool's side: the node it
+// `consumes` exists, is a message queue or a URL frontier (can_be_consumed), and links to the
+// pool, or the pool would sit idle while the scenario says it drains the queue. The pool's
+// waiting room is then the messages its queue keeps for it (connect_consumer).
+Graph::Result Graph::connect_consumers() {
+  for (std::size_t pool = 0; pool < nodes_.size(); ++pool) {
+    if (nodes_[pool].spec.type != model::NodeType::worker_pool) continue;
+    if (auto connected = connect_consumer(pool); !connected) return connected;
+  }
+  return {};
+}
+
+// A pool's room (plan 2c refinement 4): Kafka deletes a message older than the queue's
+// `retention`, so at most the messages that `retention` seconds of draining would have read can
+// wait for the group: queue_limit = retention × the pool's capacity (workers / cost),
+//   10 s × 1200 jobs/s = 12,000 messages; the default 7 d × 1200/s = 725.76 million.
+// A message older than that is deleted unconsumed: the fluid queue drops what overflows the room,
+// and the drops are the pool's. Each group's room is its own (retention × ITS capacity). The
+// retention is the queue's, or defaults::default_retention when it states none, when the pool
+// reads a frontier (which has no retention) or names no queue at all (a pool built in code).
+// Assumed: the backlog drains first in, first out, so the oldest message waits backlog / drain
+// (Little's law) and the room in messages is the room in seconds of draining.
+Graph::Result Graph::connect_consumer(std::size_t pool) {
+  auto& resolved = nodes_[pool];
+  const auto& spec = resolved.spec;
+  SimTime retention = defaults::default_retention;
+  if (spec.consumes) {
+    const std::string name = "node '" + spec.id + "': consumes ";
+    const auto queue = index_of(*spec.consumes);
+    if (!queue) {
+      return std::unexpected{EngineError{name + "refers to unknown node '" + *spec.consumes + "'"}};
+    }
+    const auto& source = nodes_[*queue].spec;
+    if (!can_be_consumed(source.type)) {
+      return std::unexpected{EngineError{
+          name + "'" + source.id + "' (type " + std::string{model::to_string(source.type)} +
+          "); a worker pool consumes a message_queue or a frontier"}};
+    }
+    if (!demand_link(*queue, pool)) {
+      return std::unexpected{EngineError{name + "'" + source.id + "', but no link from '" +
+                                         source.id + "' delivers its messages to it"}};
+    }
+    retention = source.retention.value_or(defaults::default_retention);
+  }
+  resolved.capacity.queue_limit = seconds(retention) * resolved.capacity.service_rate.per_second;
   return {};
 }
 
@@ -2905,6 +3069,7 @@ std::vector<Route> Graph::routes_for(std::size_t node, std::string_view op) cons
         .op = std::string{op}, .target = route.target, .link = route.link, .share = route.share});
     total += route.share;
   }
+  if (copies_to_consumers(nodes_[node].spec.type)) return taken;  // copies: each share stays 1
   for (auto& route : taken) route.share = total > 0 ? route.share / total : 0;
   return taken;
 }
@@ -2918,8 +3083,9 @@ std::vector<Route> Graph::routes_for(std::size_t node, std::string_view op) cons
 // is not drained (weight 0: no flow takes it), through caches, which pass each op they receive
 // on along every `then` step that carries some of THAT op (carries_flow: an `on: miss` step
 // carries the read misses, so a cache that only ever receives writes sends nothing along it),
-// and through caches and CDNs, which pass an op on to their backend (a CDN's origin) when some
-// of it goes there (backend_fraction). Each pair enters the list once, so a loop ends; the
+// through caches and CDNs, which pass an op on to their backend (a CDN's origin) when some
+// of it goes there (backend_fraction), and through message queues, which pass every op on to
+// every consumer group whose link carries it. Each pair enters the list once, so a loop ends; the
 // first node seen sending it is kept for messages (first_sender_).
 void Graph::collect_arriving_ops() {
   std::vector<std::map<std::string, std::size_t, std::less<>>> arriving(nodes_.size());
@@ -2945,7 +3111,7 @@ void Graph::collect_arriving_ops() {
     // A cache's then steps depend on the op (a miss step carries no write), and so do a blob
     // store's (an event fires for a write only): they follow each op that arrives, below. (A CDN
     // has none.) Every other node's unconditional ones fire whatever it receives (a worker pool's
-    // work comes from the queue it consumes, not along an edge).
+    // too: they fire for every job it drains, whichever op its queue brought).
     if (!then_steps_follow_the_op(spec.type)) {
       for (const model::Step& step : spec.then) {
         if (step.on == model::StepCondition::always) arrive(*index_of(step.to), step.op);
@@ -2970,7 +3136,8 @@ void Graph::collect_arriving_ops() {
       if (backend_fraction(node, op) > 0.0) arrive(*nodes_[node].backend, op);
       continue;
     }
-    if (!forwards_by_link(nodes_[node].spec.type)) continue;
+    const auto type = nodes_[node].spec.type;
+    if (!forwards_by_link(type) && !copies_to_consumers(type)) continue;
     for (const auto& route : routes_[node]) {
       if (route.share > 0.0 && carries_op(links_[route.link], op)) arrive(route.target, op);
     }
