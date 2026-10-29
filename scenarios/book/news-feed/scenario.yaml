@@ -31,11 +31,12 @@ nodes:
   lb: {type: load_balancer, dc: us-east, policy: least_connections}
 
   # Sized for the day's peak, the 12:00 spike (3x the curve for 10 minutes: 21.6k/s, more than
-  # 20:00's 16k/s), as every number below. Stateless web tier scaled out (ch. 1 "stateless web
-  # tier"; ch. 11 "web servers"): the feed reads and posts, 70 % of 21.6k/s = 15.13k/s (media goes
-  # to the CDN), over 12 x 2k/s (the back-of-the-envelope "web 2k QPS") = 63 %, about two-thirds
-  # like every tier below (11 would be 69 %, at the edge of yellow). At 8 replicas it was 94.6 %,
-  # red.
+  # 20:00's 16k/s), as every number below, by one rule: the smallest count whose peak is at most
+  # two-thirds of its capacity (capacity 1.5x the peak: room for noise and bursts the smooth sine
+  # lacks). Stateless web tier scaled out (ch. 1 "stateless web tier"; ch. 11 "web servers"): the
+  # feed reads and posts, 70 % of 21.6k/s = 15.13k/s (media goes to the CDN), over 12 x 2k/s (the
+  # back-of-the-envelope "web 2k QPS") = 63 %. 11 would be 68.8 %, over two-thirds (it still
+  # passes every SLO, less than a point from yellow's 70 %). At 8 replicas it was 94.6 %, red.
   web:
     type: service
     dc: us-east
@@ -56,8 +57,8 @@ nodes:
   # Fan-out on write (ch. 11 "fanout service") multiplies every post by the ~300 friends whose
   # feed it is written into: at the peak 2.162k posts/s x 300 = 648.6k writes/s, plus 12.97k feed
   # reads/s, 661.5k/s in all, over 10 replicas x 100k/s (the "cache 100k QPS" line) = 66.2 %. One
-  # replica, as first shipped, was offered 662 %. This is the chapter's lesson in one number: the
-  # feed cache is sized by the writes the fan-out makes, not by the reads.
+  # replica, as first shipped, was offered 662 %; 9 would be 73.5 %. This is the chapter's lesson in
+  # one number: the feed cache is sized by the writes the fan-out makes, not by the reads.
   feed_cache: {type: cache, replicas: 10, eviction: lru, keys: 10M, hit_ratio: che, strategy: cache_aside}
   # A fixed ratio, not che: Che reads the key distribution of the client whose requests reach the
   # cache, and `users.keys` describes user ids (whose feed is read), not the post ids this cache
@@ -78,8 +79,9 @@ nodes:
   # replicas cannot help (as in the URL shortener, ch. 8). The data is sharded (ch. 1 "sharding"):
   # 6 shards, each a primary + 2 read replicas. Per copy at the peak: primary 10.81k / 6 = 1.802k
   # units/s (36 %); replica the post_cache misses, 5 % x 259.4k = 12.97k reads/s over 12 replicas,
-  # + 1.802k replayed = 2.883k units/s (57.7 %). With 5 shards a replica would be at 69 %, at the
-  # edge of yellow, with 4 at 86 %, with 3 at 115 %, red.
+  # + 1.802k replayed = 2.883k units/s (57.7 %). With 5 shards a replica would be at 69.2 %, over
+  # two-thirds (it still passes every SLO, less than a point from yellow's 70 %), with 4 at 86 %,
+  # with 3 at 115 %, red.
   post_db:
     type: sql_db
     replicas: 3                                          # 1 primary + 2 read replicas per shard
@@ -88,6 +90,8 @@ nodes:
     capacity: 5k/s
     advanced: {queue_limit: 500, service_variability: 1.5}
 
+  # partitions are printed, not modelled: in Kafka the 32 workers below would read as 16 consumers
+  # (README "What it abstracts away"; 16 workers still keep the spike's lag at 101 us).
   fanout_q: {type: message_queue, partitions: 16}
 
   fanout:

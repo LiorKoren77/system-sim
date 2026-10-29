@@ -28,10 +28,12 @@ nodes:
     keys: {zipf: 1.0, space: 10M}
     # Upload timeout. The book's uploads are resumable (ch. 14): the file goes up in chunks and a
     # client that gives up gives up on a chunk, retrying it, never on the whole file. The model has
-    # one timeout per client, not one per chunk, so it is sized for the largest request: a 300 MB
-    # upload is acknowledged at its last byte, about 12 s after its wait (300 MB at 40 ms per MB),
-    # so 30 s is the chunk-level patience scaled up to the whole file. At 10 s every upload timed
-    # out. Streams are judged by their own p99 SLO below, not by this timeout.
+    # one timeout per client, not one per chunk, so it must exceed the whole file's
+    # acknowledgement: a 300 MB upload is acknowledged at its last byte, 12 s after its wait (300 MB
+    # at 40 ms per MB; 12.15 s from Europe), and any timeout above that loses no upload (12.5 s and
+    # 13 s measured). 30 s, 2.5 times that, is a margin chosen so that no upload is ever abandoned
+    # whole, which is what resumable uploads achieve. At 10 s every upload timed out. Streams are
+    # judged by their own p99 SLO below, not by this timeout.
     timeout: 30s
 
   viewers_eu:
@@ -78,6 +80,8 @@ nodes:
     write_ops: [upload]
     then: [{to: transcode_q, op: publish}]
 
+  # partitions are printed, not modelled: a real Kafka would let only 32 of the 600 transcoders
+  # read at once (one consumer per partition; README "What it abstracts away").
   transcode_q: {type: message_queue, dc: us-east, partitions: 32}
 
   transcoders:                                 # DAG: inspect → encode (several resolutions) → thumbnails → watermark
@@ -87,7 +91,10 @@ nodes:
     # 600 workers: 600 / 60 s = 10 videos/s, above the 9.6 uploads/s of the 21:00 peak (480
     # requests/s x 2 % uploads), so rho = 0.96 and nothing backs up. Erlang C(600, 0.96) = 0.229,
     # so a video waits 0.229 x 60 s / (600 x 0.04) = 0.57 s on average. At 400 (6.667/s) the
-    # uploads outran the pool from 15:43 and transcode_q fell 2.66 h behind by midnight.
+    # uploads outran the pool from 15:43 and transcode_q fell 2.66 h behind by midnight. A pool fed
+    # by a queue is sized by its lag budget (README): 600 is the smallest round pool above 9.6/s,
+    # and its red 96 % means a burst becomes lag, not drops: 1,000 extra uploads at the peak add
+    # 1,000 / 10/s = 100 s of lag, against the 30-minute SLO.
     workers: 600
     cost: 60s                                  # per 300 MB video
     then:

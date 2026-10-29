@@ -39,8 +39,12 @@
   50 MB / 5 GB/s = 10 ms). At 21:00 it carries 140.8 × (1 − 0.594) × 50 MB = 2.856k MB/s,
   rho 0.571, and adds its wait, 0.5 × 0.571 / 0.429 × 10 ms = 6.66 ms (Pollaczek–Khinchine for
   deterministic service: half the M/M/1 wait), plus 0.2 ms for the first megabyte: the run's
-  series prints 6.86 ms on the link at 21:00. That is what moves the European stream p99 from
-  455 ms (no bandwidth stated: the link is never a bottleneck) to 465 ms.
+  series prints 6.86 ms on the link at 21:00. The pipe adds those 6.86 ms to the miss path, and
+  10 ms to the fitted p99 (from 455 ms with no bandwidth stated, where the link is never a
+  bottleneck, to 465 ms; "The day's run" says why that p99 is a fit, not a path). Real links
+  interleave their flows packet by packet instead of sending one object at a time: a stream's first
+  megabyte would then take about 0.2 ms / (1 − 0.571) ≈ 0.47 ms in all (processor sharing
+  stretches a transfer by 1 / (1 − rho)), so the model's whole-object wait is an upper bound.
 - `original_store`'s `then` is an S3-style event notification (phase 2c): each upload it stores
   publishes one message to `transcode_q`, asynchronously (the uploader is answered by the store
   alone). Only a write fires an event (`upload`, the store's `write_ops`), as S3 notifies on
@@ -68,9 +72,19 @@
   verdict (from 90 %), not a failure: the pool keeps up, nothing backs up, and a video waits only
   the Erlang C wait, C(600, 0.96) × 60 s / (600 × 0.04) = 0.229 × 2.5 s = 0.57 s, which is
   `transcode_q`'s peak lag in the run (573 ms). The run counts the transcoders red for 16.11k s
-  (4.5 h, 18:46 to 23:14), the hours the uploads are above 9/s. That is the price of sizing a
-  60-second job pool close to its peak: 600 slots at 96 % wait under a second, where the same 96 %
-  at 4 slots would wait minutes (Erlang C falls fast as c grows: the pooling effect).
+  (4.5 h, 18:46 to 23:14), the hours the uploads are above 9/s.
+
+  **How a queue-fed pool is sized** (the same rule as the search-autocomplete aggregators'): by
+  its lag budget, not by a utilization colour. Nobody waits on the pool in a request, so red
+  does not mean drops or slow answers; it means a burst becomes lag. 600 is the smallest round
+  pool above the 9.6 uploads/s of the peak (500 drain 8.333/s and fall behind, "Things to try");
+  at 96 % it has 0.4 videos/s to spare, so a burst queues and drains slowly, and the lag it adds
+  is the backlog over the pool's rate: 1,000 extra uploads at the peak add 1,000 / 10/s ≈ 100 s
+  of lag, against a 30-minute budget. (Measured: doubling the traffic for 2 minutes at 21:00
+  queues 803 extra videos, as `original_store` passes 16.67 uploads/s of the 19.2 offered, and
+  `transcode_q`'s lag peaks at 80.3 s = 803 / 10/s.) The pooling effect is why 96 % is safe here:
+  600 slots at 96 % wait under a second, where the same 96 % at 4 slots would wait minutes
+  (Erlang C falls fast as c grows).
 - Fan-out of one upload into four output renditions: each video the transcoders drain (not each
   one that arrives) writes four 50 MB renditions to `transcoded_store` and publishes one message
   to `completion_q`, whose `completion_handler` updates `metadata_db` and `metadata_cache`
@@ -81,17 +95,21 @@
 
 ## Uploads and the timeout
 A 300 MB upload is a write, acknowledged at its last byte: 300 MB × 40 ms per MB = 12 s at
-`original_store`, plus the EU's 75 ms crossing. Until plan 2c Task 16 the clients had
-`timeout: 10s`, so **every** upload timed out (`timed out/s` equal to `offered/s`, `>10s` in its
-percentiles) although the store stored each one. The book's answer is resumable uploads: the
-file goes up in chunks, and a client that gives up gives up on a chunk and retries it, never on
-the whole file. The model has one timeout per client, not one per chunk, so the viewers'
-`timeout` is now `30s`: the chunk-level patience scaled to the whole file. In the run nothing
-times out: the US uploads are answered at 12 s (mean and p99), the European ones at 12.1 s
-(p99 12.2 s). Streams are judged by their own p99 SLO, not by this timeout (a stream answers at
-its first megabyte, in milliseconds). Still abstracted: the chunks themselves (a chunk lost is
-retried, not the file) and every retry; a request that times out is simply counted, nobody
-sends it again.
+`original_store`, plus the link there and back (0.5 ms in the US, 150 ms across the Atlantic).
+Before the phase 2c sizing the clients had `timeout: 10s`, so **every** upload timed out (`timed
+out/s` equal to `offered/s`, `>10s` in its percentiles) although the store stored each one. The
+book's answer is resumable uploads: the file goes up in chunks, and a client that gives up gives up
+on a chunk and retries it, never on the whole file. The model has one timeout per client, not one
+per chunk, so that timeout must exceed the whole file's acknowledgement: 12 s in the US, 12.15 s in
+Europe. Anything above that passes (measured: at `12.5s` and at `13s` no upload times out). The
+viewers' `30s`, 2.5 times the acknowledgement, is a margin chosen so that an upload is never
+abandoned whole, which is what resumable uploads achieve. In the run no upload times out: the US
+uploads are answered at 12 s (mean and p99), the European ones at 12.15 s (mean and p99, which the
+table rounds to 12.1 s and 12.2 s). Streams are judged by their own p99 SLO, not by this timeout (a
+stream answers at its first megabyte, in milliseconds); the European stream row's `timed out/s`,
+5.6e-11, is the fitted lognormal's tail past 30 s (below), not a stream anyone waited 30 s for.
+Still abstracted: the chunks themselves (a chunk lost is retried, not the file) and every retry; a
+request that times out is simply counted, nobody sends it again.
 
 ## The day's run
 `simsys run` steps 24 h at 100 ms (861,000 steps observed after the 5 m warmup, about a minute
@@ -105,8 +123,20 @@ slo
   PASS    utilization  cdn_us       -       0.1403    0.8  (worst 1h from 20:05)
 ```
 
-- The European stream p99, 465 ms against 2 s: a miss (40.6 % of streams) crosses the Atlantic
-  twice and waits for the pipe; a hit is answered in about 10 ms.
+- The European stream p99, 465 ms against 2 s, is the lognormal fit's, not a path's. A European
+  stream takes one of two times: a hit, answered at the edge's first megabyte in 10.5 ms (10 ms
+  plus the two 0.25 ms links; 59.4 % of streams), or a miss, which crosses the Atlantic and back
+  (150 ms), waits for the pipe (6.86 ms) and reads its first megabyte at `transcoded_store`
+  (40 ms): 10.5 + 150 + 6.86 + 40 = 207 ms (40.6 %). Their mean, 0.594 × 10.5 + 0.406 × 207 =
+  90.4 ms, is the run's (90.35 ms at 21:00), but the report's percentiles come from a lognormal
+  fitted to each op's mean and variance, and a lognormal stretched over two spikes has a long
+  tail: its p99 lands at 465 ms, more than twice the slowest European stream, a miss at about
+  207 ms. The SLO passes with room either way. The US streams show the same: hit or miss inside
+  one region, at most 10.5 + 0.5 (the link to the store and back) + 40 = 51 ms, reported p99
+  97.6 ms. (The search-autocomplete
+  README shows the fit's other face, a p99 that *falls* when its two populations merge into one;
+  whether percentiles should respect a path's hard bound is an open item of the phase 2c
+  review.)
 - `transcode_q`'s lag, 573 ms against 30 minutes: the Erlang wait above.
 - `cdn_us` with `over: 1h`: the SLO is checked on every hour of the day (aligned from the end of
   the warmup), and the worst, 20:05 to 21:05, is 0.1403. Without `over` the SLO judged the
@@ -144,7 +174,9 @@ diurnal scenario with a pool, `run` is the verdict.
   used).
 - `transcode_q`'s 32 partitions (`partitions=32 (not modelled)`): Kafka would let at most one
   consumer per partition read in parallel, which would cap 600 transcoders at 32 readers unless
-  each hands jobs to a local pool; the model lets all 600 consume.
+  each hands jobs to a local pool; the model lets all 600 consume. The file's own `partitions:
+  32` therefore contradicts its 600 workers in a real Kafka: a deployment would need at least
+  600 partitions, or 32 consumers each feeding a local pool of about 19 transcoders.
 - The other renditions' and thumbnails' work in the DAG: one 60 s cost per video stands for it.
 
 ## Things to try
