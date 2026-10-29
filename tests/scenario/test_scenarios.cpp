@@ -133,8 +133,14 @@ TEST_CASE("scenarios whose node types all exist run in under five seconds and pa
     //    exempt from its SLOs until Task 17: 24 h at 100 ms is 864k steps, far over the five
     //    seconds, and its drop_rate and queue_lag SLOs are Task 17's to meet. The "book/news-feed
     //    runs" test below runs its first steps instead.
+    //  - search-autocomplete runs since plan 2c Task 11 (its search_index is a service) and MEETS
+    //    its SLOs (measured 2026-10-29, Release, full day at 100 ms: p99 of suggest 6.86 ms
+    //    against 100 ms, drop rate 0), so Task 18 has nothing to fix; it is exempt here only for
+    //    time: 24 h at 100 ms is 862.8k steps, 8.3 s in Release (measured), over the five seconds
+    //    below. Its own test below runs the day at a 1 s step (86.4k steps, as the url-shortener's
+    //    does) and pins both SLOs passing.
     if (s.name == "lab-unique-id" || s.name == "url-shortener" || s.name == "youtube" ||
-        s.name == "news-feed") {
+        s.name == "news-feed" || s.name == "search-autocomplete") {
       continue;  // not run here
     }
     ++ran;
@@ -249,13 +255,14 @@ TEST_CASE("book scenarios are refused by run until their node types exist", "[sc
 // the pool with its `then` steps (Task 7): youtube (clients, CDNs, blob stores, balancer, service,
 // cache, SQL database, message queues, worker pools) is the first book scenario of 2c that runs;
 // the kv_cluster (Task 10) adds the kv-store lab and the book's news feed (its graph_db is the one
-// node type it lacked). Every other lab and book scenario still needs a later task's node types
+// node type it lacked); the search index (Task 11, a service with no steps) adds the book's search
+// autocomplete. Every other lab and book scenario still needs a later task's node types
 // (google-drive's ws_gateway, chat-system's service_discovery, ...), so the set of runnable
 // scenarios is pinned by name: a node type added later makes this fail and forces whoever adds it
 // to update the list on purpose.
 TEST_CASE(
     "scenarios that run today are: chain, hello, consistent-hashing, kv-store, news-feed, "
-    "rate-limiter, unique-id, url-shortener, youtube",
+    "rate-limiter, search-autocomplete, unique-id, url-shortener, youtube",
     "[scenario]") {
   std::vector<std::string> runnable;
   for (const auto& file : scenario_files()) {
@@ -269,7 +276,8 @@ TEST_CASE(
   std::ranges::sort(runnable);
   REQUIRE(runnable == std::vector<std::string>{"chain", "hello", "lab-consistent-hashing",
                                                "lab-kv-store", "lab-rate-limiter", "lab-unique-id",
-                                               "news-feed", "url-shortener", "youtube"});
+                                               "news-feed", "search-autocomplete", "url-shortener",
+                                               "youtube"});
 }
 
 TEST_CASE("a refused scenario's message names the first unsupported node and the phase",
@@ -998,4 +1006,85 @@ TEST_CASE("explain on labs/kv-store checks the store at 16 nodes", "[scenario]")
               .contains("peak offered 90k/s (30k/s × N 3) vs 160k/s (16 nodes)  "
                         "(hottest 60.8%, green)"));
   REQUIRE(node_line(text, "store").contains("nodes=16 N=3 W=2 R=2 mode=ap (partitions: phase 3)"));
+}
+
+// ---- Search autocomplete runs: the search index serves like a service (plan 2c Task 11) --------
+//
+// Ch. 13's trie database is a search_index: a service with no steps (spec section 7), here 4
+// replicas of 2k/s at 5 ms behind a read_through cache. Every node type the scenario uses is now
+// simulated (the queue, the pool and the blob store since 2c Tasks 4 and 6-7), so the engine
+// accepts it.
+
+TEST_CASE(
+    "book/search-autocomplete is accepted by the engine now that its search_index is simulated",
+    "[scenario]") {
+  const auto g = build_or_fail(load_scenario("/book/search-autocomplete/scenario.yaml"));
+  const auto sim = simsys::engine::Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+}
+
+// The peak is 20:00, where the client's wave is at its top: 24k/s x (1 + amplitude 0.5) = 36k/s.
+// Following the paper load down the graph (explain's checks, no queueing):
+//  - the client splits 95 % suggest and 5 % search. The browser cache sees the suggests, 36k x
+//    0.95 = 34.2k/s, and its fixed hit ratio 0.4 lets 0.6 x 34.2k = 20.52k/s through to lb; the
+//    searches go to lb directly, 36k x 0.05 = 1.8k/s; lb and api are offered 20.52k + 1.8k =
+//    22.32k/s;
+//  - the api sends each suggest to trie_cache (20.52k/s) and each search to query_log_q (1.8k/s);
+//  - trie_cache is read_through with a che hit ratio h (explain prints 0.995), so the misses it
+//    forwards to trie_db are (1 - h) x 20.52k = 103.1/s (the exact h is read from the graph below,
+//    for h = 0.995 itself would say 102.6), against 4 replicas x 2k/s = 8k/s: 103.1 / 8000 =
+//    1.29 %, green;
+//  - query_log_q passes the 1.8k searches/s to the aggregators: 4 workers at 2 ms drain
+//    4 / 2 ms = 2k/s, so 1.8k / 2k = 90 %, red (the red zone starts at the engine's 90 % default);
+//  - the aggregators write one 1 KB row per search (the `size: 1KB` step): 1.8k/s x 1 KB = 1.8 MB/s
+//    (decimal megabytes) against aggregated_store's 100 MB/s, 1.8 %, green.
+TEST_CASE("explain on book/search-autocomplete checks the index, the aggregators and the store",
+          "[scenario]") {
+  const auto g = build_or_fail(load_scenario("/book/search-autocomplete/scenario.yaml"));
+  const auto text = simsys::report::render_explain(g);
+  CAPTURE(text);
+  const double h = *g.hit_ratio(*g.index_of("trie_cache"));
+  REQUIRE_THAT(peak_offered_per_s(text, "trie_db"),
+               Catch::Matchers::WithinRel(20'520.0 * (1.0 - h), 1e-3));
+  REQUIRE(check_line(text, "trie_db")
+              .contains("peak offered 103.1/s vs 8k/s total capacity  (1.29%, green)"));
+  REQUIRE(check_line(text, "aggregators")
+              .contains("peak offered 1.8k/s vs 2k/s total capacity  (90%, red)"));
+  REQUIRE(
+      check_line(text, "aggregated_store")
+          .contains("peak offered 1.8 MB/s (1.8k/s) vs 100 MB/s total capacity  (1.8%, green)"));
+}
+
+// The index's own line: its numbers are the scenario's (2k/s and 5 ms per replica, so Little's law
+// gives c = 2000 x 5 ms = 10 per replica) and it says its `build_interval` is stored, not modelled.
+TEST_CASE("explain on book/search-autocomplete prints the index's numbers and its build_interval",
+          "[scenario]") {
+  const auto g = build_or_fail(load_scenario("/book/search-autocomplete/scenario.yaml"));
+  const auto text = simsys::report::render_explain(g);
+  CAPTURE(text);
+  const auto line = node_line(text, "trie_db");
+  REQUIRE(line.contains("capacity=2k/s (scenario)  service_time=5ms (scenario)  c=10 (implied)"));
+  REQUIRE(line.contains("build_interval=24h (rebuild load not modelled)"));
+}
+
+// Measured 2026-10-29 (Release, the shipped 100 ms step, the whole day): p99 of suggest 6.86 ms
+// against its 100 ms and a drop rate of 0 against 0.0005; the busiest node is the aggregators at
+// 90 % of peak and never above it (no red second, no drop). Both SLOs PASS on the shipped
+// numbers. Here the day runs at a 1 s step, as the url-shortener's test does (86.4k steps, a few
+// seconds in Debug, where 862.8k steps at 100 ms would take minutes): the fluid model's averages do
+// not depend on the step, and a pass with a wide margin (6.86 ms of 100 ms) does not hinge on it.
+TEST_CASE("book/search-autocomplete meets both SLOs over its day at a one second step",
+          "[scenario]") {
+  using namespace std::chrono_literals;
+  auto s = load_scenario("/book/search-autocomplete/scenario.yaml");
+  s.step = 1s;
+  const auto results = run_slos(std::move(s));
+  REQUIRE(results.size() == 2);
+  const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
+  const auto& drops = slo_of(results, simsys::model::SloMetric::drop_rate);
+  CAPTURE(p99.observed.value_or(-1.0), drops.observed.value_or(-1.0));
+  REQUIRE(p99.status == simsys::report::SloStatus::pass);
+  REQUIRE(drops.status == simsys::report::SloStatus::pass);
+  REQUIRE(drops.observed == 0.0);
 }

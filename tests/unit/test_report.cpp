@@ -2331,3 +2331,45 @@ TEST_CASE("explain prints no politeness note for a sink that states none", "[rep
   REQUIRE(line.contains("failure_rate=5%"));
   REQUIRE_FALSE(line.contains("politeness"));
 }
+
+// ---- Search index as service sugar (plan 2c refinement 10, Task 11; book ch. 13) ----
+//
+// A search index's `build_interval` is how often the index is rebuilt from the aggregated logs. The
+// model does not load the index with that rebuild and does not age its answers, and explain says so
+// where it prints the interval, so a student does not read the number as modelled.
+
+namespace {
+// u (10/s of `suggest`) -> trie_db: a search_index of 4 replicas, 2k/s and 5 ms, with the
+// `build_interval` only when given.
+Scenario search_reported(std::optional<simsys::SimTime> build_interval) {
+  Scenario s{.name = "search-report", .version = 1, .duration = 1min};
+  NodeSpec index{.id = "trie_db",
+                 .type = NodeType::search_index,
+                 .replicas = 4,
+                 .capacity = Rate{2000},
+                 .latency = 5ms};
+  index.build_interval = build_interval;
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{10}}, .op_shares = {{"suggest", 1.0}}}},
+      std::move(index)};
+  s.links = {LinkSpec{.from = "u", .to = "trie_db", .dir = simsys::model::Direction::inout}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("explain prints a search index's build_interval and says the rebuild is not modelled",
+          "[report]") {
+  const auto text = explain_of(search_reported(24h));
+  CAPTURE(text);
+  REQUIRE(node_line(text, "trie_db").contains("build_interval=24h (rebuild load not modelled)"));
+}
+
+TEST_CASE("explain prints no build_interval for a search index that states none", "[report]") {
+  const auto text = explain_of(search_reported(std::nullopt));
+  CAPTURE(text);
+  const auto line = node_line(text, "trie_db");
+  REQUIRE_FALSE(line.contains("build_interval"));
+  REQUIRE_FALSE(line.contains("rebuild"));
+}

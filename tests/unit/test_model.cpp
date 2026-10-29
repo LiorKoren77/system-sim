@@ -260,3 +260,20 @@ TEST_CASE("an external sink's failure rate is a number and its politeness a rate
   REQUIRE(sink.failure_rate == 0.05);
   REQUIRE(sink.politeness->per_second == 1.0);
 }
+
+// ---- Search indexes (plan 2c refinement 10, Task 11) ----
+//
+// A search index serves like a service (read-mostly, spec section 7), and the one key it owns,
+// `build_interval`, says how often the index is rebuilt from the logs (ch. 13: the trie is rebuilt
+// weekly from aggregated query logs; search-autocomplete's lab says 24h). It is stored and
+// printed, not modelled, and absent means "not stated", never zero.
+TEST_CASE("a default NodeSpec states no build interval", "[model]") {
+  const simsys::model::NodeSpec n{.id = "trie_db", .type = NodeType::search_index};
+  REQUIRE_FALSE(n.build_interval.has_value());
+}
+
+TEST_CASE("a search index's build interval is a typed duration", "[model]") {
+  simsys::model::NodeSpec index{.id = "trie_db", .type = NodeType::search_index};
+  index.build_interval = 24h;  // search-autocomplete's lab: rebuilt every day
+  REQUIRE(*index.build_interval == 24h);
+}

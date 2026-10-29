@@ -4116,3 +4116,53 @@ TEST_CASE("a kv_cluster refuses replicas: its machines are nodes") {
   require_rejected("simsys_kv_replicas.yaml", kv_scenario("nodes: 3, replicas: 3"),
                    "node 'store': a kv_cluster's machines are nodes; replicas is not a key here");
 }
+
+// ---- Search indexes (plan 2c refinement 10, Task 11) ----
+//
+// A search index (ch. 13's trie database) serves like a service, and `build_interval` is the one
+// key it owns: how often the index is rebuilt from the aggregated logs. Until now the loader
+// accepted it and dropped it; it is now a typed, positive duration, stored for explain to print
+// (the rebuild's load and the index's freshness are not modelled). `ops` stays refused: an index
+// answers a query, it calls nobody, so it has no steps to list.
+
+namespace {
+std::string search_index_scenario(std::string_view keys) {
+  return scenario_with("  trie_db: {type: search_index" +
+                       (keys.empty() ? std::string{} : ", " + std::string{keys}) + "}\n");
+}
+}  // namespace
+
+TEST_CASE("a search index's build_interval loads as a duration") {
+  const auto path = write_temp("simsys_search_build_interval.yaml",
+                               search_index_scenario("replicas: 4, build_interval: 24h"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->nodes[0].type == simsys::model::NodeType::search_index);
+  REQUIRE(s->nodes[0].build_interval == 24h);
+  REQUIRE(s->nodes[0].replicas == 4);  // the service keys are read as on a service
+}
+
+// Absent stays absent: explain prints the line only for a stated interval, and the type has no
+// default one to apply.
+TEST_CASE("a search index that states no build_interval leaves it absent") {
+  const auto path = write_temp("simsys_search_no_build_interval.yaml", search_index_scenario(""));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE_FALSE(s->nodes[0].build_interval.has_value());
+}
+
+TEST_CASE("a search index's build_interval must be positive") {
+  require_rejected("simsys_search_build_interval_zero.yaml",
+                   search_index_scenario("build_interval: 0s"),
+                   "node 'trie_db': build_interval must be positive");
+}
+
+// The refusal that already stands, pinned so that serving like a service does not turn `ops` on:
+// the key is not valid for the type.
+TEST_CASE("a search index still refuses ops") {
+  require_rejected("simsys_search_ops.yaml",
+                   search_index_scenario("ops: {suggest: [{to: other, op: read}]}"),
+                   "node 'trie_db': key 'ops' is not valid for type 'search_index'");
+}
