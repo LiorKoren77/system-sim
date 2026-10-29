@@ -99,9 +99,9 @@ $ simsys sweep scenarios/tutorial/hello/scenario.yaml --param nodes.users.rate.b
       --metric users.ping.mean --metric api.mean_rho
 nodes.users.rate.base  users.ping.mean  api.mean_rho
 ----------------------------------------------------
-100/s                          1.61 ms           0.1
-500/s                           2.5 ms           0.5
-900/s                          10.5 ms           0.9
+100/s                           1.61ms           0.1
+500/s                            2.5ms           0.5
+900/s                           10.5ms           0.9
 ```
 
 `explain` on the [chain tutorial](scenarios/tutorial/chain/) (trimmed):

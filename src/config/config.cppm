@@ -22,6 +22,7 @@ module;
 #include <expected>
 #include <span>
 #include <string>
+#include <string_view>
 
 export module simsys.config;
 
@@ -57,6 +58,8 @@ struct ConfigError {
 // One replaced value (`simsys sweep`, plan 2c Task 15): the scalar at the dot path `path`
 // (`nodes.users.rate.base`: map keys from the document's root down, never a list index) is
 // replaced by the text `value` (`500/s`, in the file's own unit syntax) before validation.
+// A value under a YAML anchor (`&a`) is one node shared with every alias (`*a`) to it: replacing
+// it through either path replaces it everywhere the anchor is used.
 struct Override {
   std::string path;
   std::string value;
@@ -72,5 +75,21 @@ struct Override {
 // vector, an array or `{}` without a copy and without making `load` a template.
 [[nodiscard]] std::expected<model::Scenario, ConfigError> load(const std::string& path,
                                                                std::span<const Override> overrides);
+
+// Whether `override_path` leads to one scalar of the file at `path`, without validating the
+// scenario: the path's mistake once, before any value is tried (`simsys sweep`). The same errors
+// as `load` with an Override of that path.
+[[nodiscard]] std::expected<void, ConfigError> check_override_path(const std::string& path,
+                                                                   std::string_view override_path);
+
+// Whether the loader reads the key at `override_path` as a whole number (`version`, `seed`, a
+// node's `workers`, `replicas`, `keys`, ..., an `advanced` block's `concurrency` or `queue_limit`,
+// a client's `keys.space`), judged by where the key sits, not by its name alone: an op share
+// called `workers` is still a fraction.
+[[nodiscard]] bool counts_whole_things(std::string_view override_path);
+
+// Compiler-style `file:line:column: error: message`, so editors can jump to it; without the
+// position when the line is unknown (0: a missing file, an override's path).
+[[nodiscard]] std::string describe(const ConfigError& error);
 
 }  // namespace simsys::config

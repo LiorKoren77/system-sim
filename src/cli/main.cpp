@@ -57,16 +57,9 @@ namespace engine = simsys::engine;
 namespace graph = simsys::graph;
 namespace report = simsys::report;
 
-// Compiler-style `file:line:column: error: message`, so editors can jump to it. Line 0
-// means the location is unknown (e.g. an empty file), so there is no position to print.
-// C++20 std::format: type-safe formatting into a std::string, with `{}` placeholders
-// checked against the arguments at compile time. Replaces snprintf (buffer sizes, format
-// and argument mismatches) and std::ostringstream chains. Strings and integers only here
-// (see the note above on doubles).
-std::string describe(const simsys::config::ConfigError& error) {
-  if (error.line == 0) return std::format("{}: error: {}", error.file, error.message);
-  return std::format("{}:{}:{}: error: {}", error.file, error.line, error.column, error.message);
-}
+// Compiler-style `file:line:column: error: message`, so editors can jump to it (simsys.config
+// writes it, one rule for every command and for `sweep`).
+using simsys::config::describe;
 
 void print_error(const std::string& message) {
   // C++23 std::println: type-safe formatted output (here to stderr), replacing
@@ -92,6 +85,9 @@ std::expected<graph::Graph, std::string> load_graph(const std::filesystem::path&
         if (seed) scenario.seed = *seed;
         return graph::Graph::build(std::move(scenario))
             .transform_error([&](const graph::EngineError& error) {
+              // C++20 std::format: type-safe formatting into a std::string, with `{}`
+              // placeholders checked against the arguments at compile time. Replaces snprintf
+              // and std::ostringstream chains. Strings and integers only here (see above).
               return std::format("{}: error: {}", file.string(), error.message);
             });
       });
@@ -584,7 +580,7 @@ int main(int argc, char** argv) {
   sweep
       ->add_option("--jobs", sweep_args.jobs,
                    "worker threads (default: the machine's hardware threads)")
-      ->check(CLI::PositiveNumber);
+      ->check(CLI::Range(std::size_t{1}, simsys::sweep::max_jobs));
   sweep->add_option("--format", sweep_args.format, "output format: table (default) or csv")
       ->check(CLI::IsMember({"table", "csv"}));
   add_report_options(*estimate, report_options);

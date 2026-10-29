@@ -1216,21 +1216,27 @@ step, warmup and seed), with one key replaced, and prints one row per point.
 
 - `--param`: the key is a dot path through **maps only** (`nodes.users.rate.base`,
   `nodes.transcoders.workers`); a path through a list (`links.0.latency`) is refused, since list
-  entries have no names. The key must exist in the file and hold a single value. The range gives
-  `n` (at least 2) evenly spaced points from `from` to `to`, both included; both ends are a number
-  and the same unit text (`100/s..900/s`, `1ms..5ms`, `400..600`), so `100/s..900/s:3` is 100/s,
-  500/s and 900/s. A key that counts whole things (`workers`, `replicas`, `partitions`, ...) must
-  get a whole number at every point (`400..600:4` is refused: it gives 466.67). Each point's value
-  replaces the file's text **before** the loader's checks, so it is validated like a value written
-  in the file; a refused point is reported as `point 2 (nodes.users.rate.base=-1/s): ...`.
+  entries have no names. A node whose id contains a dot cannot be swept or measured: the dot
+  splits the path. The key must exist in the file and hold a single value. The range gives
+  `n` (at least 2, at most 10000) evenly spaced points from `from` to `to`, both included; both
+  ends are a number (starting with a digit or `-`) and the same unit text (`100/s..900/s`,
+  `1ms..5ms`, `400..600`), so `100/s..900/s:3` is 100/s, 500/s and 900/s. A key the loader reads
+  as a whole number (a node's `workers`, `replicas`, `partitions`, `keys`, ..., an `advanced`
+  block's `concurrency`) must get a whole number at every point (`400..600:4` is refused: it gives
+  466.67). Each point's value replaces the file's text **before** the loader's checks, so it is
+  validated like a value written in the file; a refused point is reported as
+  `point 2 (nodes.users.rate.base=-1/s): ...`. A value under a YAML anchor (`&a`) is shared with
+  every alias (`*a`): sweeping it through either path sweeps it everywhere the anchor is used.
 - `--metric`: `<client>.<op>.mean` (the op's mean latency as the client sees it),
   `<node>.mean_rho` (a server's time-averaged utilization) or `<queue>.lag` (a message queue's peak
   lag after warmup, what the `queue_lag` SLO observes). They are the numbers `run --report json`
   prints, after warmup.
 - `--jobs`: worker threads (default: the machine's hardware threads). Each point is its own
   simulation, so the output is the same, byte for byte, for any `--jobs`.
-- `--format`: `table` (latencies in readable units) or `csv` (seconds and ratios, each number the
-  shortest text that reads back to the same double).
+- `--format`: `table` (latencies and lags as the report's tables print them: `1.61ms`, `<1us`)
+  or `csv` (seconds and ratios, each number the shortest text that reads back to the same double).
+  A number a run did not produce (the mean latency of an op of which nothing was answered) is `-`
+  in the table and an empty cell in the CSV.
 
 A sweep reports numbers and judges none: it exits 0 when every point ran, even if an SLO fails at
 some point, and 1 on any error (the file, `--param`, `--metric`, or a point the loader refuses),
