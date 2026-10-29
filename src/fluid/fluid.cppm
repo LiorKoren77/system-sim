@@ -172,13 +172,14 @@ Zone zone_of(double rho, const Capacity& c) {
 //   room   = queue_limit/cap                               the full waiting room's drain time
 //   stoch  = min(k * mmc_wait(c, min(rho, 0.99), s).mean, room)
 //                                                          random bunching of arrivals, never
-//                                                          longer than the room (M/M/c/K bound)
+//                                                          longer than the room (the room-drain
+//                                                          bound, see wait())
 //   latency.mean = max(fluid, stoch) + s                   OUR HEURISTIC blend, see sojourn()
 //   latency.var  = min(k^2 * mmc_wait(...).variance, room^2/4) + service_variability * s^2
 //                  (always). Allen–Cunneen scales the MEAN wait by k. Applying k^2 to the
 //                  variance is OUR OWN HEURISTIC (a scaled random variable has k^2 times the
-//                  variance); no published result is claimed for it. The room^2/4 cap is
-//                  Popoviciu's inequality, see wait().
+//                  variance); no published result is claimed for it. The room^2/4 cap is our
+//                  heuristic too (the room's scale), see wait().
 //   zone   = zone_of(rho, capacity_)
 //
 // Conservation: demand*dt = (drain + dropped)*dt + (backlog_after - backlog_before).
@@ -297,17 +298,29 @@ double FluidQueue::room_drain_s() const {
 //          shows below saturation; k is the Allen–Cunneen factor (formula block above
 //          advance()). Assumes steady state at that rho. Bounded by the room (below).
 //
-// The room bound (review of plan 2c Task 3's fix round, C1) is the M/M/c/K one: a queue with a
-// waiting room of K units turns away whoever finds it full, so a request it admits has at most K
-// units ahead of it and waits at most T = K / cap, the full room's drain time; stoch is
-// min(k * Wq, T). Erlang C at the 0.99 clamp knows no room: with 2 s objects at a 20-slot blob
-// store it says 9.48 s where the 1000 MB room drains in 2 s. It never binds at a node that counts
-// requests with the default room: 1000 requests, ten times the ~100 Erlang C queues at the clamp
-// (Lq = rho^2 / (1 - rho) = 98 at one server; with k = 1, T / clamp >= (1000 s/c) / (100 s/c) =
-// 10), so only a small `queue_limit` or objects of many units meet it. Its variance is bounded the
-// same way: a wait in [0, T] has a variance of at most T^2 / 4 (Popoviciu's inequality on
-// variances), which keeps a bounded wait from carrying the clamp's spread (99.7 s^2 for that blob
-// store, against 1 s^2); at the default room it binds only where k > 5.
+// The room-drain bound (review of plan 2c Task 3's fix round, C1; named in the review of its
+// second fix round, I-2): a queue with a waiting room of K units turns away whoever finds it full,
+// so a request it admits has at most K units ahead of it and waits at most T = K / cap, the full
+// room's drain time; stoch is min(k * Wq, T). For a deterministic drain (the fluid backlog, a
+// leaky bucket's regular leak) T is exact: the last one admitted to a full room waits exactly
+// that. For random arrivals and service it is conservative: T bounds the WORST admitted wait, so
+// it is above M/M/c/K's MEAN wait, about twice it near rho = 1 (M/M/1 with a room of 10 at rho
+// 0.98 waits 4.8 ms on average where T says 10 ms). Erlang C at the 0.99 clamp knows no room:
+// with 2 s objects at a 20-slot blob store the engine's stochastic term would be (1 + 0) / 2 x
+// C(20, 0.99) x 2 s / (20 x 0.01) = 4.74 s (9.48 s with exponential service), where the 1000 MB
+// room drains in 2 s. At a node that counts requests with the default room it binds only for
+// very bursty arrivals: the room holds 1000 requests, ten times the ~100 Erlang C queues at the
+// clamp (Lq = rho^2 / (1 - rho) = 98 at one server; T / clamp >= (1000 s/c) / (100 s/c) = 10),
+// so the mean binds only when the arrivals' variability factor k exceeds 10, and the variance
+// cap below when k exceeds 5; otherwise only a small `queue_limit` or objects of many units meet
+// it.
+// Its variance is capped at T^2 / 4, OUR HEURISTIC: the room's scale, which keeps a bounded wait
+// from carrying the clamp's spread (99.7 s^2 for that blob store, against 1 s^2). It is not a
+// theorem: a wait in [0, T] whose mean sits at T has no spread at all (Bhatia–Davis), and the
+// tight bound for a given mean would make the spread, and so the p99, fall as the load rises.
+// What it does not do is bound the percentiles: the reports fit a lognormal to the mean and
+// variance (queueing::lognormal_quantile), which knows no bound, so an estimated p99 can exceed
+// T + s (a blob store fed 12 writes/s of 50 MB: p99 6.88 s against T + s = 4 s).
 //
 // Why max and not the sum: by Little's law (L = lambda * W) the M/M/1 wait at rho 0.99
 // corresponds to a stochastic queue of ~99 requests (Lq = rho^2/(1 - rho) = 98). Once the fluid

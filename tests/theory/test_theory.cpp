@@ -925,6 +925,30 @@ TEST_CASE("a leaky bucket's wait below the limit is M/D/1", "[theory]") {
   REQUIRE_THAT(r.nodes[*g.index_of("limiter")].latency.mean_s, WithinRel(wait + 0.001, 1e-9));
 }
 
+// A leaky bucket is one deterministic slot leaking a request every 1/limit with a room of `burst`
+// (graph::leaky_bucket_capacity), so a request it admits finds at most `burst` ahead of it and
+// waits at most burst / limit: 20 / 1000/s = 20 ms (the room-drain bound, exact for a drain this
+// regular; review of plan 2c Task 3's second fix round, M-2). Erlang C knows no room: at 990/s
+// its M/D/1 wait is (1 + 0) / 2 x 0.99 / 0.01 x 1 ms = 49.5 ms, so there the bound is what the
+// wait is. At every load, below the limit, at it and above it (where the fluid backlog fills the
+// room and its drain time is the bound itself), the mean wait never passes 20 ms.
+TEST_CASE("a leaky bucket's mean wait never exceeds burst over limit, at any load", "[theory]") {
+  constexpr double bound_s = 20.0 / 1000.0;  // burst / limit
+  constexpr double leak_s = 0.001;           // the slot's service time, 1 / limit
+  for (const double demand : {500.0, 900.0, 990.0, 1000.0, 1500.0}) {
+    const auto g = *Graph::build(limited(LimiterAlgorithm::leaky_bucket, 1000, 20, demand));
+    const auto limiter = *g.index_of("limiter");
+    auto sim = *Simulation::create(g);
+    double last_wait = 0.0;
+    sim.run({.duration = 2s, .step = 100ms}, [&](const auto& r) {
+      last_wait = r.nodes[limiter].latency.mean_s - leak_s;
+      CAPTURE(demand, last_wait);
+      REQUIRE(last_wait <= bound_s + 1e-12);
+    });
+    if (demand >= 990.0) REQUIRE_THAT(last_wait, WithinRel(bound_s, 1e-9));  // the bound binds
+  }
+}
+
 // Rejections are policy, drops are failures (D5 of the rate-limiter review): a limiter that
 // refuses 3000 of the 4000 requests it is offered each second has a reject rate of 0.75 and
 // a drop rate of 0, and the api it protects drops nothing either. Both rates are per node
@@ -1659,7 +1683,8 @@ TEST_CASE("a che cdn without a keys size builds but the engine refuses to run it
 //   c_s^2  = E[S^2] / E[S]^2 - 1
 // so a single size with Poisson arrivals waits (1 + 0) / 2 = HALF the M/M/c wait (M/D/c), and the
 // answer adds no variance of its own: the response's variance is the wait's. And the stochastic
-// wait is bounded by the room (C1): never longer than queue_limit / capacity, the M/M/c/K bound.
+// wait is bounded by the room (C1): never longer than queue_limit / capacity, the room-drain
+// bound.
 
 namespace {
 // u (`rate`/s of `op`, each `size` long) -> store, a zero-latency link, so the client's response
@@ -1772,7 +1797,8 @@ TEST_CASE("a 300 MB upload is answered at its last byte, 12 s after its wait", "
 // response's variance is the wait's alone, (1/2)^2 x Var(Wq of M/M/c) (the Allen-Cunneen factor
 // applied to the variance, the engine's heuristic) = 0.25 x P (2 - P) theta^2 with P = 0.024134
 // and theta = 12 s / (20 x 0.4) = 1.5 s: 0.026824 s^2, a standard deviation of 0.16 s. The
-// lognormal fit then puts the p99 at 12.40 s and the p1 at 11.64 s: every upload takes more than
+// lognormal fit then puts the p99 at 12.40 s and the p1 at 11.64 s (below the 12 s no upload can
+// beat: an artefact of the fit, whose left tail knows no floor): every upload takes more than
 // 10 s, so youtube's `timeout: 10s` (plan Task 13) would time out all of them, not the ~42 % an
 // exponential transfer (CV 1: variance 144 s^2 more, a p99 of 58.9 s) suggested. Task 16 sizes that
 // timeout per the book (resumable uploads).
@@ -1908,8 +1934,8 @@ simsys::engine::StepRecord step_until(const Graph& g, int steps) {
 // the 0.99 clamp with 2 s objects would add C(20, 0.99) x 2 s / (20 x 0.01) x 1/2 = 4.74 s (9.48 s
 // with exponential service, what the first fix round reported: an 11.48 s response). But the
 // store's waiting room holds 1000 MB and drains at 500 MB/s, so nobody admitted waits more than
-// 1000 / 500 = 2 s (the M/M/c/K bound); the full room's fluid wait is exactly that. A write is then
-// answered at its last byte, 2 s later: 4 s. The excess, 100 MB/s, is dropped.
+// 1000 / 500 = 2 s (the room-drain bound); the full room's fluid wait is exactly that. A write is
+// then answered at its last byte, 2 s later: 4 s. The excess, 100 MB/s, is dropped.
 TEST_CASE("twelve 50 MB writes per second wait at most the 2 s their room drains in: about 4 s",
           "[theory]") {
   const auto g = *Graph::build(blob_store_chain("write", 12, simsys::Bytes{50e6}));
@@ -1919,6 +1945,28 @@ TEST_CASE("twelve 50 MB writes per second wait at most the 2 s their room drains
   REQUIRE_THAT(store.dropped_per_s, WithinRel(100.0, 1e-6));
   REQUIRE(last.responses[0].response.mean_s - 2.0 <= 2.0 + 1e-9);  // the wait
   REQUIRE_THAT(last.responses[0].response.mean_s, WithinRel(4.0, 1e-9));
+}
+
+// What the room-drain bound does NOT bound: the estimated percentiles (review of plan 2c Task 3's
+// second fix round, I-1). The same twelve 50 MB writes per second over a run: every admitted write
+// waits at most the room's 2 s and is answered 2 s after it, so none takes longer than 4 s. The
+// report's percentiles are a lognormal fitted to the mean (4 s) and the variance (the wait's,
+// capped at the room's scale, T^2 / 4 = 1 s^2), and a lognormal has no upper bound: its p99 is
+// 6.88 s. A characterisation test: it pins what the model reports today, beyond the hard bound,
+// for the comprehensive 2c review ("percentiles respect a hard bound") to change on purpose.
+TEST_CASE("a saturated blob store's estimated p99 is 6.88 s, beyond its 4 s hard bound",
+          "[theory]") {
+  Scenario s = blob_store_chain("write", 12, simsys::Bytes{50e6});
+  s.duration = 60s;
+  const auto g = *Graph::build(s);
+  simsys::report::Summary summary{g, s.warmup};
+  (*Simulation::create(g)).run({.duration = s.duration, .step = s.step}, [&](const auto& r) {
+    summary.observe(r);
+  });
+  const auto op = summary.ops().front();
+  REQUIRE_THAT(op.mean_s, WithinAbs(4.0, 0.01));
+  REQUIRE_THAT(op.p99_s, WithinAbs(6.88, 0.005));
+  REQUIRE(op.p99_s > 2.0 + 2.0);  // the room's drain time plus the write's own 2 s
 }
 
 // The review's stop transient: 24 requests/s, half 50 MB writes and half 10 MB reads, overload a
