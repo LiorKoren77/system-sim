@@ -2439,3 +2439,83 @@ TEST_CASE("explain prints no build_interval for a search index that states none"
   REQUIRE_FALSE(line.contains("build_interval"));
   REQUIRE_FALSE(line.contains("rebuild"));
 }
+
+// ---- A client's timeout in the reports (plan 2c Task 13) ----
+//
+// mm1(990): one M/M/1 server at rho 0.99 answers in 100 ms on average with variance 0.01 s^2 (an
+// exponential sojourn: the standard deviation is the mean). A client `timeout` of 200 ms answers
+// the lognormal's share below it, 0.894137, so of the 990 requests per second 885.2 are answered
+// and 0.105863 x 990 = 104.8 per second time out; the answered mean is 73.97 ms. Percentiles are
+// capped at the timeout: the p99 of the answered part would be 236.7 ms by the refitted lognormal,
+// but no answered request took longer than 200 ms. (The theory tests derive the same numbers
+// through the engine; these pin what the report prints.)
+
+namespace {
+// mm1(990) whose client has the given timeout (none: the client waits for ever).
+Scenario timing_out(std::optional<simsys::SimTime> timeout) {
+  auto s = mm1(990);
+  s.nodes[0].workload->timeout = timeout;
+  return s;
+}
+}  // namespace
+
+TEST_CASE("the JSON op reports 0 timed out requests per second for a client without a timeout",
+          "[report]") {
+  const auto s = timing_out(std::nullopt);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto json = simsys::report::render_json(summarize(s, g), {});
+  CAPTURE(json);
+  REQUIRE(json.find("\"timed_out_per_s\": 0") != std::string::npos);
+  REQUIRE(json_value(json, "timed_out_per_s") == 0.0);
+}
+
+TEST_CASE("the JSON op reports the requests that outlast the timeout: 104.8 of 990 per second",
+          "[report]") {
+  const auto s = timing_out(200ms);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto json = simsys::report::render_json(summarize(s, g), {});
+  CAPTURE(json);
+  const double offered = json_value(json, "offered_per_s");
+  const double answered = json_value(json, "answered_per_s");
+  const double timed_out = json_value(json, "timed_out_per_s");
+  REQUIRE_THAT(timed_out, WithinRel(0.105863 * 990.0, 1e-5));
+  REQUIRE_THAT(answered, WithinRel(0.894137 * 990.0, 1e-5));
+  REQUIRE_THAT(answered + timed_out, WithinRel(offered, 1e-9));
+  REQUIRE_THAT(json_value(json, "mean_s"), WithinRel(0.073970, 1e-5));
+}
+
+TEST_CASE(
+    "the JSON p99 of a client with a timeout is the timeout when the answered tail reaches it",
+    "[report]") {
+  const auto s = timing_out(200ms);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto json = simsys::report::render_json(summarize(s, g), {});
+  CAPTURE(json);
+  REQUIRE_THAT(json_value(json, "p99_s"), WithinRel(0.2, 1e-12));
+}
+
+TEST_CASE("an op's percentiles never exceed the client's timeout, whatever its size", "[report]") {
+  for (const auto timeout : {50ms, 200ms, 1000ms}) {
+    CAPTURE(timeout.count());
+    const auto s = timing_out(timeout);
+    const auto g = *simsys::graph::Graph::build(s);
+    const auto ops = summarize(s, g).ops();
+    REQUIRE(ops.size() == 1);
+    const double limit = std::chrono::duration<double>(timeout).count();
+    REQUIRE(ops[0].p50_s <= limit);
+    REQUIRE(ops[0].p95_s <= limit);
+    REQUIRE(ops[0].p99_s <= limit);
+  }
+}
+
+TEST_CASE("the op table's p99 is the timeout, 200ms, not the 490ms the uncapped fit gives",
+          "[report]") {
+  const auto s = timing_out(200ms);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto table = simsys::report::render_table(summarize(s, g), {}, /*color=*/false);
+  CAPTURE(table);
+  // Words of the row: `c.op offered mean p50 p95 p99`.
+  const auto row = words_of_line_starting(table, "c.op");
+  REQUIRE(row.size() == 6);
+  REQUIRE(row.back() == "200ms");
+}

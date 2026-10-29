@@ -436,3 +436,84 @@ TEST_CASE("a lognormal quorum beyond its replicas is a programmer error", "[queu
   REQUIRE_THROWS_AS(lognormal_order_statistic(two, 3), std::invalid_argument);
   REQUIRE_THROWS_AS(lognormal_order_statistic(two, 0), std::invalid_argument);
 }
+
+// ---- lognormal_below: a client's timeout cuts the slow tail (plan 2c Task 13) ----
+//
+// A client that gives up after `limit` turns every response slower than that into an unanswered
+// request. With the response time fitted as a lognormal (the same fit the reports use), the share
+// answered in time and the moments of that share follow in closed form. Derivation, for a
+// lognormal X with mean m and variance v:
+//   sigma^2 = ln(1 + v/m^2),  mu = ln m - sigma^2/2                 (lognormal_fit)
+//   P(X < L) = Phi(z),  z = (ln L - mu) / sigma                      (Phi = normal_cdf)
+//   E[X^k 1{X<L}] = exp(k mu + k^2 sigma^2 / 2) Phi(z - k sigma)    (k = 1, 2: the partial moments)
+//   E[X | X<L] = E[X 1{X<L}] / Phi(z),   Var[X | X<L] = E[X^2 | X<L] - E[X | X<L]^2
+// Worked for m = 100 ms, v = 0.01 s^2 (an exponential: v/m^2 = 1), so sigma^2 = ln 2 = 0.693147,
+// sigma = 0.832555, mu = ln 0.1 - 0.346574 = -2.649159:
+//   L = 200 ms: z = (ln 0.2 + 2.649159) / 0.832555 = 1.24883, Phi = 0.894137,
+//     E[X 1{X<L}] = 0.1 Phi(z - sigma) = 0.1 Phi(0.416277) = 0.066140  ->  mean 0.073970 s,
+//     E[X^2 1{X<L}] = exp(2 mu + 2 sigma^2) Phi(z - 2 sigma) = 0.0200 Phi(-0.416277) = 0.0067721
+//     -> E[X^2 | X<L] = 0.0067721 / 0.894137 = 0.0075739, variance 0.0075739 - 0.073970^2 =
+//     0.0021022 s^2.
+//   L = 1 s: z = 3.18196, Phi = 0.99927;   L = 50 ms: z = -0.41628, Phi = 0.33860.
+// All three recomputed independently with Python's math.erfc and agree with the plan to the digits
+// the plan prints (checked 2026-10-29: fraction 0.8941367, mean 0.07397039, variance 0.002102246).
+// Assumption: the response is lognormal, which it only approximates; the engine applies the same
+// fit to the percentiles it reports.
+TEST_CASE("a lognormal with mean 100 ms and variance 0.01 s2 answers 89.4 percent below 200 ms",
+          "[queueing]") {
+  const auto below = lognormal_below(0.1, 0.01, 0.2);
+  REQUIRE_THAT(below.fraction, WithinAbs(0.89414, 5e-6));
+  REQUIRE_THAT(below.mean_s, WithinAbs(0.073970, 5e-7));
+  REQUIRE_THAT(below.variance_s2, WithinAbs(0.0021022, 5e-8));
+  // Truncating can only shorten the mean, and the part that is left spreads less.
+  REQUIRE(below.mean_s < 0.1);
+  REQUIRE(below.variance_s2 < 0.01);
+}
+
+TEST_CASE(
+    "the share below a limit grows with the limit: 33.86 percent at 50 ms, 99.927 percent at 1 s",
+    "[queueing]") {
+  REQUIRE_THAT(lognormal_below(0.1, 0.01, 0.05).fraction, WithinAbs(0.33860, 5e-6));
+  REQUIRE_THAT(lognormal_below(0.1, 0.01, 1.0).fraction, WithinAbs(0.99927, 5e-6));
+  // A limit far above the mean cuts almost nothing: the truncated moments approach the input's.
+  const auto loose = lognormal_below(0.1, 0.01, 1.0);
+  REQUIRE_THAT(loose.mean_s, WithinAbs(0.099132, 5e-7));
+  REQUIRE_THAT(loose.variance_s2, WithinAbs(0.0088934, 5e-8));
+}
+
+TEST_CASE("an infinite limit answers everything and leaves the moments as they were",
+          "[queueing]") {
+  const auto below = lognormal_below(0.1, 0.01, std::numeric_limits<double>::infinity());
+  REQUIRE(below.fraction == 1.0);
+  REQUIRE_THAT(below.mean_s, WithinRel(0.1, 1e-12));
+  REQUIRE_THAT(below.variance_s2, WithinRel(0.01, 1e-12));
+}
+
+// A response with no spread (a deterministic 100 ms: sigma = 0) is either wholly below the limit or
+// wholly above it: the step function the lognormal tends to as v goes to 0.
+TEST_CASE("a response with no variance is answered whole below the limit and not at all above it",
+          "[queueing]") {
+  const auto fast = lognormal_below(0.1, 0.0, 0.2);
+  REQUIRE(fast.fraction == 1.0);
+  REQUIRE_THAT(fast.mean_s, WithinRel(0.1, 1e-12));
+  REQUIRE(fast.variance_s2 == 0.0);
+  REQUIRE(lognormal_below(0.1, 0.0, 0.05).fraction == 0.0);
+}
+
+// youtube's 300 MB uploads take 12 s with almost no spread (sigma of ln X = 0.0137 at variance
+// 0.027 s^2, 2.9e-4 at 1e-6 s^2) against a 10 s timeout: z = (ln 10 - mu) / sigma = -13.3, or
+// -630, and Phi(-630) underflows to exactly 0. The truncated moments are then 0 / 0; they must stay
+// finite numbers, because the reports weigh every moment by the requests answered (0 x NaN is NaN
+// and would poison the sums of the steps that did answer something).
+TEST_CASE("a limit far below a path that never beats it answers nothing and keeps finite moments",
+          "[queueing]") {
+  const auto near = lognormal_below(12.0, 0.027, 10.0);
+  REQUIRE(near.fraction < 1e-30);
+  REQUIRE(near.fraction >= 0.0);
+  REQUIRE(std::isfinite(near.mean_s));
+  const auto far = lognormal_below(12.0, 1e-6, 10.0);
+  REQUIRE(far.fraction == 0.0);
+  REQUIRE(std::isfinite(far.mean_s));
+  REQUIRE(std::isfinite(far.variance_s2));
+  REQUIRE(far.variance_s2 >= 0.0);
+}
