@@ -42,8 +42,8 @@ simsys curve    scenario.yaml <client> [--step 1m] [--until 1h] [--seed N] [--no
 value there, without noise (its first line says so); `explain`'s static load checks use the
 curve's peak instead. `run` steps through the scenario and,
 with `--series`, writes one CSV row per node per step
-(`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`),
-the file a plot or GUI reads; demand, drain, drops and backlog balance, so the fluid queue's
+(`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone,queue_lag_s`,
+the last a message queue's lag in seconds, empty on other rows), the file a plot or GUI reads; demand, drain, drops and backlog balance, so the fluid queue's
 conservation law, Σ demand·dt = Σ (drain + drops)·dt + backlog, can be checked from the file (a
 token bucket's or a window's refusals are inside drain; a leaky bucket's overflow is in
 `rejected_per_s`, in the drops' place). A link with a `bandwidth` is a pipe that queues and drops
@@ -108,10 +108,10 @@ noise), the number a back-of-the-envelope estimate sizes for. Here the rate is c
 $ simsys run scenarios/tutorial/chain/scenario.yaml
 scenario chain  1100 steps observed  drop rate 0%
 nodes
-  node   mean_rho  peak_rho  peak_backlog  dropped  rejected  red_s
-  users         -         -             -        -         -      -
-  api        0.75      0.75             0        0         0      0
-  db         0.36      0.36             0        0         0      0
+  node   mean_rho  peak_rho  peak_backlog  dropped  rejected  red_s  peak_lag
+  users         -         -             -        -         -      -         -
+  api        0.75      0.75             0        0         0      0         -
+  db         0.36      0.36             0        0         0      0         -
 ops (percentiles estimated: lognormal fit to the response moments)
   client.op    offered/s   mean     p50     p95     p99  (estimated)
   users.read        1.2k    5ms  4.35ms  10.4ms  14.8ms
@@ -133,11 +133,11 @@ book's 429), never forwarded, and reported apart from drops:
 $ simsys run scenarios/labs/rate-limiter/scenario.yaml
 scenario lab-rate-limiter  17400 steps observed  drop rate 0%  reject rate 14.3% (worst: limiter)
 nodes
-  node      mean_rho  peak_rho  peak_backlog  dropped  rejected  red_s
-  clients          -         -             -        -         -      -
-  limiter    0.00954      0.16             0        0    236.7k      0
-  counters   0.00954      0.16             0        0         0      0
-  api         0.6817         1            80        0         0    1.5
+  node      mean_rho  peak_rho  peak_backlog  dropped  rejected  red_s  peak_lag
+  clients          -         -             -        -         -      -         -
+  limiter    0.00954      0.16             0        0    236.7k      0         -
+  counters   0.00954      0.16             0        0         0      0         -
+  api         0.6817         1            80        0         0    1.5         -
 ops (percentiles estimated: lognormal fit to the response moments)
   client.op     offered/s    mean     p50     p95     p99  (estimated)
   clients.call        954  5.79ms  3.93ms  16.7ms  30.5ms
@@ -192,7 +192,8 @@ Che hit ratio), SQL databases (primary, read replicas, shards), CDNs and blob st
 bytes, they count megabytes, wait for whole objects and answer a write at its last byte, a read
 at its first megabyte; a blob store's `then` steps are asynchronous event notifications, fired by
 its writes only), id generators, message queues (the publisher answered at the append, every
-message copied to each consumer group) and worker pools (M/M/c at workers / cost, waiting in their
+message copied to each consumer group, the slowest group's lag reported and checked by the
+`queue_lag` SLO) and worker pools (M/M/c at workers / cost, waiting in their
 queue's retention; their `then` steps fire for every job they drain, and nobody waits for them).
 These seven scenarios run end to end:
 
@@ -208,10 +209,10 @@ These seven scenarios run end to end:
   and a SQL database in 3 shards; both SLOs pass (redirect p99 7.49 ms, nothing dropped).
 - [`book/youtube`](scenarios/book/youtube/): ch. 14 over 24 hours in bytes: two CDNs, blob
   stores, the transcoding queue and workers, the metadata tier. It runs to the end and passes
-  its two checked SLOs (exit 0); from 15:43 the 400 transcoders fall behind (63.76k videos wait
-  at midnight, where the run ends, and the backlog is still growing: the day's peak, about
-  71.9k, comes near 02:18) and the `queue_lag` SLO that would say so is still skipped (phase 2c
-  Task 8); the README's sizing is Task 16's.
+  its stream-latency and CDN-utilization SLOs, but from 15:43 the 400 transcoders fall behind
+  (63.76k videos wait at midnight, where the run ends, and the backlog is still growing: the
+  day's peak, about 71.9k, comes near 02:18), so `transcode_q` is 2.66 h behind and its
+  `queue_lag` SLO (30 m) fails (exit 2) until the README's sizing (plan 2c Task 16).
 
 Every other node type (external sinks, key-value clusters, ...) already validates and appears in
 `explain` with its resolved numbers, but `estimate` and `run` stop with "which run/estimate do

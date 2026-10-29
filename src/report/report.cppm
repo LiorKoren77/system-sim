@@ -62,6 +62,12 @@ struct NodeSummary {
   // (engine::NodeSample::committed_writes_per_s), time-averaged the same way: what the missed
   // writes above are a share of. Empty for every node that is not a database.
   std::optional<double> mean_committed_writes_per_s{};
+  // A message queue's peak lag over the observed steps, in seconds (engine::NodeSample::
+  // queue_lag_s: its slowest consumer group's wait, max(k × Wq, backlog / capacity)): the PEAK,
+  // not the mean, since a lag bound is a promise about the worst moment (a notification an hour
+  // late is late whatever the day's average was). What the `queue_lag` SLO observes (plan 2c
+  // refinement 14). Empty for every node that is not a message queue.
+  std::optional<double> peak_queue_lag_s{};
 };
 
 // One bandwidth link's pipe over the observed part of a run (plan 2c Task 5;
@@ -103,11 +109,13 @@ struct OpSummary {
 
 enum class SloStatus { pass, fail, skipped };
 
-// An SLO and its verdict. `observed` is in seconds for latency SLOs and a plain ratio
-// otherwise; it is empty when the metric is not modelled yet (skipped). `note` says why a
-// verdict is not what `observed` against `max` alone would give: a staleness SLO fails on a
-// database whose replicas fall behind without bound ("each replica misses 66.67/s of 400/s
-// committed writes (16.7%)"), whatever its mean staleness. Empty otherwise.
+// An SLO and its verdict. `observed` is in seconds for the time SLOs (latency, staleness, queue
+// lag) and a plain ratio otherwise; it is empty when the run has nothing to measure it on (a
+// queue lag without a message queue, a staleness on a node that is no database) or observed no
+// step: skipped.
+// `note` says why a verdict is not what `observed` against `max` alone would give: a staleness SLO
+// fails on a database whose replicas fall behind without bound ("each replica misses 66.67/s of
+// 400/s committed writes (16.7%)"), whatever its mean staleness. Empty otherwise.
 struct SloResult {
   model::SloSpec slo{};
   std::optional<double> observed{};
@@ -177,6 +185,7 @@ class Summary {
     double replication_dropped{};  // Σ replication_dropped_per_s·dt (writes, per replica)
     double committed_writes{};     // Σ committed_writes_per_s·dt (writes, per shard)
     double replication_seen_s{};   // Σ dt over the steps that report the two above
+    std::optional<double> peak_queue_lag_s{};  // the largest queue_lag_s: message queues only
     void add(const engine::NodeSample& sample, double dt_s);
     [[nodiscard]] double drop_rate() const;
     [[nodiscard]] double reject_rate() const;
@@ -247,8 +256,9 @@ class Summary {
 [[nodiscard]] std::string render_explain(const graph::Graph& g);
 
 // For plotting: one CSV row per node per step,
-// `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`,
-// then one per link with a bandwidth, its `from->to` in the node column, in megabytes.
+// `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone,
+// queue_lag_s` (the last empty except on a message queue's rows), then one per link with a
+// bandwidth, its `from->to` in the node column, in megabytes.
 // The header is written on construction; the column rules are at SeriesWriter::observe in
 // report.cpp.
 // Pattern: Observer, like Summary. `out` and `g` must outlive the writer.

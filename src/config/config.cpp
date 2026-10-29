@@ -2935,6 +2935,22 @@ CheckResult check_utilization_target(const Site& site, const YAML::Node& entry,
                    std::format("utilization needs a server node, '{}' is a client", node.id));
 }
 
+// A queue lag is a message queue's (plan 2c refinement 14): how far its slowest consumer group
+// trails it, read off the worker pools behind it, so on a service, a client or any other node the
+// SLO could never be observed. A frontier is accepted too: it is the web crawler's queue (ch. 9),
+// drained by worker pools as a message queue is, and simulated in phase 3 (until then its SLO is
+// skipped). Without `node` the SLO bounds every message queue of the run: the worst one decides.
+CheckResult check_queue_lag_target(const Site& site, const YAML::Node& entry,
+                                   const model::SloSpec& slo, const Declarations& declared) {
+  if (slo.metric != model::SloMetric::queue_lag || !slo.node) return {};
+  const auto& node = declared.nodes[declared.ids.find(*slo.node)->second];
+  if (node.type == model::NodeType::message_queue || node.type == model::NodeType::frontier) {
+    return {};
+  }
+  return site.fail(entry["node"], std::format("queue_lag needs a message_queue node ('{}' is a {})",
+                                              node.id, model::to_string(node.type)));
+}
+
 // Only latency is measured per op (a client's response time for each op it sends); every
 // other metric is node-wide, so an `op` on it would be silently ignored.
 CheckResult check_op_is_for_latency(const Site& site, const YAML::Node& entry,
@@ -2950,6 +2966,7 @@ CheckResult check_slo_shape(const Site& site, const YAML::Node& entry, const mod
   if (auto checked = check_utilization_target(site, entry, slo, declared); !checked) {
     return checked;
   }
+  if (auto checked = check_queue_lag_target(site, entry, slo, declared); !checked) return checked;
   return check_op_is_for_latency(site, entry, slo);
 }
 

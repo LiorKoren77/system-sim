@@ -74,17 +74,29 @@
   (`completion_handler  peak offered 9.6/s vs 800/s total capacity  (1.2%, green)`). Nobody
   waits for the pool, so none of this is in any viewer's response time.
 - The whole day runs: `simsys run` steps 24 h at 100 ms (861,000 steps observed after the
-  warmup, about 19 s in a Release build) and exits 0. The EU stream p99 (456 ms against 2 s) and
-  `cdn_us`'s mean utilization (0.0879 against 0.8) pass; the `queue_lag` SLO is skipped, since
-  queue lag is not measured yet (plan 2c Task 8). From 15:43 the uploads outrun the transcoders'
-  6.667 videos/s, so they run saturated (peak rho 1) and their backlog grows into the night: the
-  run's `peak_backlog`, 63.76k videos, is its last step's, at midnight, with the inflow (8.55/s)
-  still above their capacity. It is not the day's peak, which comes after the run ends: about
-  71.9k videos (3.0 h of lag) near 02:18 (`--duration 27h` shows it). Their 48.27k s (13.4 h) in
-  the red zone counts 00:00 to 02:18 as well, when the run's queue fills from empty where the real
-  one would still be working off the evening before. `transcoded_store` is red for 10.79k s
-  (3.0 h) around the evening peak (peak rho 0.9225: the CDNs' misses and the renditions, 98.1 %
-  on paper). (Uploads take 12 s, past the clients' 10 s timeout that is not applied yet: above.)
+  warmup, about 19 s in a Release build) and exits 2, one SLO failing:
+
+  ```
+  slo
+    status  metric       node         op      observed  max
+    PASS    p99_latency  viewers_eu   stream  456ms     2s
+    FAIL    queue_lag    transcode_q  -       2.66h     30m
+    PASS    utilization  cdn_us       -       0.08787   0.8
+  ```
+
+  From 15:43 the uploads outrun the transcoders' 6.667 videos/s, so they run saturated (peak
+  rho 1) and their backlog grows into the night: the run's `peak_backlog`, 63.76k videos, is its
+  last step's, at midnight, with the inflow (8.55/s) still above their capacity. `transcode_q`'s
+  lag is that backlog's FIFO drain time, 63.76k / 6.667/s = 9,564 s = 2.66 h (the node table's
+  `peak_lag`), against the 30 minutes the SLO allows: the 400 transcoders are too few on purpose
+  until plan 2c Task 16 sizes them. (`completion_q`'s lag is its handlers' Erlang wait alone, a
+  fraction of a nanosecond.) Midnight is not the day's peak, which comes after the run ends:
+  about 71.9k videos (3.0 h of lag) near 02:18 (`--duration 27h` shows it), so the SLO's 2.66 h
+  understates the worst lag of a day. The transcoders' 48.27k s (13.4 h) in the red zone counts
+  00:00 to 02:18 as well, when the run's queue fills from empty where the real one would still
+  be working off the evening before. `transcoded_store` is red for 10.79k s (3.0 h) around the
+  evening peak (peak rho 0.9225: the CDNs' misses and the renditions, 98.1 % on paper). (Uploads
+  take 12 s, past the clients' 10 s timeout that is not applied yet: above.)
 
 ## What it abstracts away
 - Adaptive bitrate selection, chunked upload resume, DRM.

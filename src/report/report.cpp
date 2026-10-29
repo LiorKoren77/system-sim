@@ -326,6 +326,23 @@ struct Overloaded : Fs... {
   return found->mean_staleness_s;
 }
 
+// The peak lag after warmup (NodeSummary::peak_queue_lag_s) of the named message queue, or of the
+// worst queue when the SLO names none (every queue must keep the bound, so the worst decides; plan
+// 2c refinement 14); empty when no message queue ran (a frontier's lag is phase 3's), and the SLO
+// is skipped.
+[[nodiscard]] std::optional<double> peak_queue_lag(std::span<const NodeSummary> nodes,
+                                                   const model::SloSpec& slo) {
+  if (slo.node) {
+    const auto found = std::ranges::find(nodes, *slo.node, &NodeSummary::id);
+    return found == nodes.end() ? std::nullopt : found->peak_queue_lag_s;
+  }
+  std::optional<double> worst;
+  for (const auto& node : nodes) {
+    if (node.peak_queue_lag_s) worst = std::max(worst.value_or(0.0), *node.peak_queue_lag_s);
+  }
+  return worst;
+}
+
 // What the run observed for the SLO's metric; empty when the model does not observe it.
 [[nodiscard]] std::optional<double> observe_metric(const Summary& summary,
                                                    std::span<const NodeSummary> nodes,
@@ -347,8 +364,8 @@ struct Overloaded : Fs... {
       return mean_utilization(nodes, slo);
     case staleness:
       return mean_staleness(nodes, slo);
-    case queue_lag:  // consumer lag of a message queue: phase 2c
-      return std::nullopt;
+    case queue_lag:  // the peak, not the mean: a lag bound is a bound on the worst moment
+      return peak_queue_lag(nodes, slo);
   }
   std::unreachable();
 }
@@ -370,7 +387,9 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
   if (committed_per_s > 0.0) result.note += " (" + percent(missed_per_s / committed_per_s) + ")";
 }
 
-// An SLO with nothing observed: phase 1 does not model the metric, or no step was observed.
+// An SLO with nothing observed: the run has nothing the metric is measured on (a staleness on a
+// node that is no database, a queue lag with no message queue, a frontier's before phase 3), or
+// no step was observed.
 [[nodiscard]] SloResult skipped(const model::SloSpec& slo) {
   // C++20 designated initializers: name the fields being set, so `observed` and `status`
   // cannot be swapped unnoticed; a field left out keeps its default member initializer.
@@ -395,9 +414,11 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
 
 // ---- table ----
 
-// A latency or a staleness is a time, printed with its unit; every other metric a ratio.
+// A latency, a staleness or a queue lag is a time, printed with its unit; every other metric a
+// ratio.
 [[nodiscard]] std::string fmt_slo_value(model::SloMetric metric, double value) {
-  const bool is_time = is_latency(metric) || metric == model::SloMetric::staleness;
+  const bool is_time = is_latency(metric) || metric == model::SloMetric::staleness ||
+                       metric == model::SloMetric::queue_lag;
   return is_time ? fmt_duration(value) : num(value);
 }
 
@@ -425,9 +446,10 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
          "\n";
 }
 
-// A queue's row (a node's, or a bandwidth link's pipe's), its rho cells coloured by the queue's
-// own zone thresholds.
-[[nodiscard]] Row queue_row(const NodeSummary& node, const fluid::Capacity& capacity, bool color) {
+// A queue's cells (a node's, or a bandwidth link's pipe's), its rho cells coloured by the queue's
+// own zone thresholds; the tables add what follows them.
+[[nodiscard]] Row queue_cells(const NodeSummary& node, const fluid::Capacity& capacity,
+                              bool color) {
   const auto colour_of = [&](double rho) {
     return color ? ansi_for(fluid::zone_of(rho, capacity)) : std::string_view{};
   };
@@ -437,16 +459,25 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
           {with_si_prefix(node.peak_backlog)},
           {with_si_prefix(node.total_dropped)},
           {with_si_prefix(node.total_rejected)},
-          {num(node.red_time_s)},
-          {node.unavailable ? "unavailable" : ""}};
+          {num(node.red_time_s)}};
 }
 
-// Clients are sources with no queue: their queue columns show "-".
+// The last, unlabelled cell of a queue's row: why its figures are not to be trusted, if they are
+// not.
+[[nodiscard]] Cell unavailable_cell(const NodeSummary& node) {
+  return {node.unavailable ? "unavailable" : ""};
+}
+
+// Clients are sources with no queue: their queue columns show "-". A message queue's `peak_lag`
+// is its peak lag after warmup (NodeSummary::peak_queue_lag_s), "-" on every other row.
 [[nodiscard]] Row node_row(const NodeSummary& node, const graph::ResolvedNode& resolved,
                            bool color) {
   if (resolved.spec.type == model::NodeType::client)
-    return {{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}};
-  return queue_row(node, resolved.capacity, color);
+    return {{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}};
+  Row row = queue_cells(node, resolved.capacity, color);
+  row.push_back({node.peak_queue_lag_s ? fmt_duration(*node.peak_queue_lag_s) : "-"});
+  row.push_back(unavailable_cell(node));
+  return row;
 }
 
 [[nodiscard]] std::string node_table(const Summary& summary, bool color) {
@@ -456,7 +487,8 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
                          {"peak_backlog"},
                          {"dropped"},
                          {"rejected"},
-                         {"red_s"}}};
+                         {"red_s"},
+                         {"peak_lag"}}};
   const auto nodes = summary.nodes();
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     rows.push_back(node_row(nodes[i], summary.graph().nodes()[i], color));
@@ -480,7 +512,10 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
                          {"red_s"}}};
   std::size_t next = 0;  // links() follows Graph::links(), pipes only
   for (const auto& link : summary.graph().links()) {
-    if (link.pipe) rows.push_back(queue_row(links[next++].queue, *link.pipe, color));
+    if (!link.pipe) continue;
+    Row row = queue_cells(links[next].queue, *link.pipe, color);
+    row.push_back(unavailable_cell(links[next++].queue));
+    rows.push_back(std::move(row));
   }
   return "links (bandwidth pipes, in megabytes: peak_backlog and dropped are MB)\n" + aligned(rows);
 }
@@ -613,7 +648,9 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
       // per replica and per shard; null for every node that is not a database
       json_field("replication_dropped_per_s",
                  json_optional_number(n.mean_replication_dropped_per_s)),
-      json_field("committed_writes_per_s", json_optional_number(n.mean_committed_writes_per_s))};
+      json_field("committed_writes_per_s", json_optional_number(n.mean_committed_writes_per_s)),
+      // seconds; null for every node that is not a message queue
+      json_field("peak_queue_lag_s", json_optional_number(n.peak_queue_lag_s))};
   return json_object(fields);
 }
 
@@ -646,7 +683,8 @@ void fail_if_replica_falls_behind(SloResult& result, std::span<const NodeSummary
   return json_object(fields);
 }
 
-// `observed` and `max` are in seconds for latency SLOs, plain ratios otherwise.
+// `observed` and `max` are in seconds for the time SLOs (latency, staleness, queue lag), plain
+// ratios otherwise.
 [[nodiscard]] std::string json_slo(const SloResult& r) {
   const std::array fields{json_field("metric", json_string(model::to_string(r.slo.metric))),
                           json_field("node", json_optional_string(r.slo.node)),
@@ -2175,12 +2213,13 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
                           num(n.dropped_per_s, 6),
                           num(n.rejected_per_s, 6),
                           num(n.latency.mean_s * 1000.0, 6),
-                          std::string{zone_name(n.zone)}};
+                          std::string{zone_name(n.zone)},
+                          n.queue_lag_s ? num(*n.queue_lag_s, 6) : std::string{}};
   return join(fields, ",") + "\n";
 }
 
-// A bandwidth link's pipe, in the same ten columns as a node's, in megabytes; `rejected_per_s` is
-// 0 (a pipe refuses nothing by policy).
+// A bandwidth link's pipe, in the same eleven columns as a node's, in megabytes; `rejected_per_s`
+// is 0 (a pipe refuses nothing by policy) and `queue_lag_s` empty (a pipe is no message queue).
 [[nodiscard]] std::string csv_link_row(const std::string& t_s, const std::string& name,
                                        const engine::LinkSample& l) {
   const std::array fields{t_s,
@@ -2192,13 +2231,14 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
                           num(l.dropped_per_s, 6),
                           std::string{"0"},
                           num(l.latency.mean_s * 1000.0, 6),
-                          std::string{zone_name(l.zone)}};
+                          std::string{zone_name(l.zone)},
+                          std::string{}};
   return join(fields, ",") + "\n";
 }
 
-// A client is a source: no queue, so zeros where a server has numbers and zone `none`.
+// A client is a source: no queue, so zeros where a server has numbers, zone `none` and no lag.
 [[nodiscard]] std::string csv_client_row(const std::string& t_s, const std::string& id) {
-  return t_s + "," + id + ",0,0,0,0,0,0,0,none\n";
+  return t_s + "," + id + ",0,0,0,0,0,0,0,none,\n";
 }
 
 // One (client, op) of a step: what it offered, what came back answered, and the mean
@@ -2248,6 +2288,9 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
     replication_dropped += *sample.replication_dropped_per_s * dt_s;
     committed_writes += sample.committed_writes_per_s.value_or(0.0) * dt_s;
     replication_seen_s += dt_s;
+  }
+  if (sample.queue_lag_s) {  // a message queue: its worst moment is what a lag bound bounds
+    peak_queue_lag_s = std::max(peak_queue_lag_s.value_or(0.0), *sample.queue_lag_s);
   }
 }
 
@@ -2349,7 +2392,8 @@ std::vector<NodeSummary> Summary::nodes() const {
                               .total_dropped = t.dropped,
                               .total_rejected = t.rejected,
                               .red_time_s = t.red_time_s,
-                              .unavailable = t.unavailable});
+                              .unavailable = t.unavailable,
+                              .peak_queue_lag_s = t.peak_queue_lag_s});
     if (t.staleness_seen_s > 0.0)
       out.back().mean_staleness_s = t.staleness_time / t.staleness_seen_s;
     if (t.replication_seen_s > 0.0) {
@@ -2555,7 +2599,7 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
     if (link.pipe) link_names_.push_back(graph::link_label(g.nodes(), link));
   }
   *out_ << "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,"
-           "latency_ms,zone\n";
+           "latency_ms,zone,queue_lag_s\n";
 }
 
 // CSV is for machines, so every numeric column always holds a number:
@@ -2577,6 +2621,9 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
 // - an infinite latency is written as `inf` (which spreadsheet and plotting tools parse),
 //   unlike the table ("unavailable") and JSON (null), read by people or by parsers
 //   without an infinity;
+// - `queue_lag_s` (plan 2c Task 8, engine::NodeSample::queue_lag_s) is a message queue's lag in
+//   SECONDS (a lag is minutes or hours, plotted against the backlog), and EMPTY on every other
+//   row, clients' and links' included: a 0 would claim a lag the node cannot have;
 // - after the nodes, a row per link with a bandwidth (plan 2c Task 5), `from->to` in the node
 //   column, in MEGABYTES (engine::LinkSample): the pipe is a queue, so the same identity holds on
 //   its rows, `rejected_per_s` is 0 and `latency_ms` is a request's wait plus its answer time on

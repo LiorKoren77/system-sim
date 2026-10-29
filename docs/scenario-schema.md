@@ -773,8 +773,9 @@ Kafka group lags, it loses nothing before `retention`); leave queue → pool lin
 modelled)` on the queue (a retention of whole days in days, any other as other durations),
 `capacity=6.667/s (workers / cost)  service_time=1m (cost)  c=400 (workers)  queue_limit=4.032M
 (retention × capacity) ... consumes=transcode_q  workers=400 cost=1m` on the pool (a room of a
-million or more with an SI prefix, as a count). A group's
-**queue lag**, the age of its oldest unread message, is measured in Task 8 (the `queue_lag` SLO).
+million or more with an SI prefix, as a count). A queue's
+**lag**, how long its slowest group's next message has waited, is read off its pools every step
+(see [Queue lag](#queue-lag), the `queue_lag` SLO).
 Ignored: ordering, delivery guarantees and redelivery, a consumer's commit interval, the broker's
 disk; a worker blocked on a slow downstream call (an external sink's 150 ms would hold a worker:
 phase 3), autoscaling, poison messages, the end-to-end completion time of the asynchronous work.
@@ -903,13 +904,44 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 | `drop_rate` | optional | not allowed | number in [0, 1] | the node's dropped / the work sent to it, after warmup; without `node`, the worst node's or bandwidth link pipe's (a `node` names a node only) |
 | `reject_rate` | optional | not allowed | number in [0, 1] | **new in v1.2**: the node's rejected (a rate limiter's refusals, a leaky bucket's overflow included) / the requests sent to it, after warmup; without `node`, the worst node's |
 | `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup |
-| `queue_lag` | optional | not allowed | duration | reported `skipped` until a queue's lag is measured (phase 2c Task 8; queues run since Task 6) |
+| `queue_lag` | optional; a `message_queue` | not allowed | duration | phase 2c: the named message queue's **peak** lag after warmup, its slowest consumer group's wait (see [Queue lag](#queue-lag)); without `node`, the worst queue's; `skipped` when no message queue ran. A `frontier` is accepted (the web crawler's queue) and skipped until it runs (phase 3); any other node is refused (`slo: queue_lag needs a message_queue node ('svc' is a service)`) |
 | `staleness` | optional; name a `sql_db` | not allowed | duration | phase 2b: the named database's mean staleness after warmup, its write sojourn at the primary + `replication_lag` + its sojourn at a replica (see [`sql_db`](#sql_db)); fails whatever that mean when a replica misses committed writes (it falls behind without bound; the note says how many per replica, of how many committed); `skipped` without a `node` or on a node that keeps no replicated data (any type but `sql_db`); a `sql_db` with `replicas: 1` reports 0 |
 
 The kind of `max` follows the metric, so `0.01` can never be read as 0.01 seconds
 (`slo: reject_rate max must be between 0 and 1`).
 `op` is only valid for latency metrics (`slo: op is only valid for latency metrics`): drop
 rate, reject rate and utilization are measured per node, not per op.
+
+### Queue lag
+
+A message queue's **lag** (phase 2c) is how long the message its slowest consumer group reads
+next has waited. The broker holds nothing back (it appends at 1M/s); what a group has not read
+waits in its worker pool's queue, so every step the lag is read off the pools:
+
+```
+lag(group) = max(min(k × Wq, retention), backlog / capacity)      lag(queue) = its worst group's
+```
+
+`backlog / capacity` is the FIFO drain time: the oldest unread message is read after everything
+ahead of it, which the pool works off at its capacity (`workers / cost`) while it is behind.
+`k × Wq` is the stochastic part: the pool's Erlang C (M/M/c) wait scaled by Allen–Cunneen's `k`,
+at rho clamped to 0.99, what a message waits with no backlog because every worker happens to be
+busy. Neither passes the retention: an older message is deleted unconsumed. It is the wait alone,
+the job's `cost` is not lag (a message is read once a worker takes it). Worked: 1k msgs/s into 4
+workers at 3.333 ms lag 3.289 ms (no backlog); a 1.5k/s burst for 200 s into 12 workers at 10 ms
+(1.2k/s) leaves 60,000 messages waiting and the queue **50 s** behind at t = 200 s (60,000 /
+1200), 33.3 s at 300 s as the backlog drains; a pool saturated for the whole run climbs to its
+retention and stays there. Two groups on one queue: the slower one's lag.
+
+The `queue_lag` SLO observes the **peak** lag after warmup, not the mean or the last step's: a lag
+bound is a promise about the worst moment (`PASS queue_lag q - 50s 1m`, `FAIL queue_lag q - 50s
+30s`). The node table's `peak_lag` column shows each queue's (`-` on other rows), JSON's nodes
+carry `peak_queue_lag_s` in seconds (`null` on other nodes), and `run --series` ends each row with
+`queue_lag_s`, the step's lag in seconds (empty on every other row, clients and links included).
+youtube's 400 transcoders fall 2.66 h behind by midnight (63.76k videos at 6.667/s = 9,564 s), so
+its 30-minute `queue_lag` SLO fails; a run that stops while the backlog still grows understates
+the day's peak (about 3.0 h near 02:18 there). Ignored: ordering across partitions, a consumer's
+commit interval (a group's lag counts from the message's append, not from its last commit).
 
 ### Drops and rejections
 
@@ -945,7 +977,8 @@ some node refused anything; the node table has `dropped` and `rejected` columns;
 `rejected` and (phase 2b) `staleness_s`, a database's mean staleness in seconds,
 `replication_dropped_per_s`, the committed writes one replica missed per second, and
 `committed_writes_per_s`, the writes one shard's primary committed per second, all three `null`
-for other nodes. Each SLO object has a `note`: `null`, or why the verdict is not `observed`
+for other nodes, and (phase 2c) `peak_queue_lag_s`, a message queue's peak lag in seconds
+([Queue lag](#queue-lag)), `null` for other nodes. Each SLO object has a `note`: `null`, or why the verdict is not `observed`
 against `max` alone (a replica that falls behind without bound).
 At a node that counts megabytes (a byte `capacity`, see [Node (common keys)](#node-common-keys))
 the node's own numbers are in MB: the table's `dropped`, JSON's `dropped`, and the series'
@@ -955,10 +988,11 @@ the node's own numbers are in MB: the table's `dropped`, JSON's `dropped`, and t
 rates, each answered at its last byte (a write) or its first megabyte (a read).
 
 `run --series` writes one CSV row per node per step:
-`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone`
-(`rejected_per_s` new in v1.2, `demand_per_s` and `drain_per_s` in phase 2b; demand, drain,
-drops and backlog in capacity units, megabytes at a byte-sized node; a client row has zeros and
-zone `none`), then one row per [bandwidth link](#links) and step, its `from->to` in the `node`
+`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone,queue_lag_s`
+(`rejected_per_s` new in v1.2, `demand_per_s` and `drain_per_s` in phase 2b, `queue_lag_s` in
+phase 2c: a message queue's lag in seconds, empty on every other row; demand, drain, drops and
+backlog in capacity units, megabytes at a byte-sized node; a client row has zeros, zone `none` and
+no lag), then one row per [bandwidth link](#links) and step, its `from->to` in the `node`
 column, in megabytes, `rejected_per_s` 0 and `latency_ms` a request's wait plus its answer time
 on the wire (a write's whole serialisation, any other op's first megabyte; with no request in the
 step, the ops the link carries weighed alike).
