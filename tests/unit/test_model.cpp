@@ -37,6 +37,21 @@ TEST_CASE("the node type table is complete at compile time", "[model]") {
   SUCCEED();
 }
 
+// The node-type table's third column says which types run/estimate can step today: every type but
+// the four whose models phase 3 adds. Simulation::create reads it (model::simulated), and the
+// scenario tests pin the shipped scenarios it lets run.
+TEST_CASE("every node type runs but the four that phase 3 models", "[model]") {
+  for (const auto& row : simsys::model::node_type_table) {
+    CAPTURE(row.name);
+    const bool phase_3 =
+        row.value == NodeType::ws_gateway || row.value == NodeType::service_discovery ||
+        row.value == NodeType::notification_fanout || row.value == NodeType::frontier;
+    REQUIRE(simsys::model::simulated(row.value) == !phase_3);
+  }
+  static_assert(simsys::model::simulated(NodeType::service));
+  static_assert(!simsys::model::simulated(NodeType::frontier));
+}
+
 namespace {
 // Two broken tables, to show that round_trips catches both ways a table can be wrong.
 enum class Colour { red, green };

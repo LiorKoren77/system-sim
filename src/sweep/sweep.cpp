@@ -43,13 +43,6 @@ namespace simsys::sweep {
 
 namespace {
 
-// ---- numbers as text ------------------------------------------------------------------------
-
-// `value` with at most `digits` significant digits, trailing zeros dropped (0.1, 500, 1.61).
-std::string significant(double value, int digits) {
-  return to_chars_text(value, std::chars_format::general, digits);
-}
-
 // ---- --param: <dot.path>=<from>..<to>:<n> ------------------------------------------------------
 
 constexpr std::string_view param_grammar = "<dot.path>=<from>..<to>:<n>";

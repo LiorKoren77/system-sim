@@ -181,6 +181,26 @@ class NoiseProcess {
   std::normal_distribution<double> normal_{0.0, 1.0};  // xi ~ N(0, 1)
 };
 
+// The seed of client `index`'s noise process (spec §17 entry 3): one std::mt19937_64 per client, so
+// appending a node (client or not) at the end of the file never changes another client's noise. The
+// seed is the node index, so a node inserted before a client moves that client's index, and so its
+// noise. Formula: (seed × 0x9E3779B97F4A7C15) XOR index, all mod 2^64. The constant is 2^64 divided
+// by the golden ratio (splitmix64's increment); what matters is that it is odd and large. The
+// multiply is there to keep (seed, index) pairs apart, not to decorrelate neighbouring seeds
+// (std::mt19937_64's own seeding already does that): a plain seed XOR index collides, 1^0 == 0^1,
+// while seed × K moves each seed's block of indices far into the high bits, so for the seeds and
+// client counts a scenario uses no two pairs share an engine seed (tests/unit/test_workload.cpp
+// checks seeds -100..100 × 64 clients). A negative seed converts to std::uint64_t modulo 2^64, so
+// it is as deterministic as a positive one: signed-to-unsigned conversion has always been defined
+// that way; what C++20's two's-complement rule fixed is the other direction (unsigned to signed).
+// The engine (engine::Simulation::make_node) and `simsys curve --noise` both call this, so the
+// curve command prints exactly the noise a run will use.
+inline constexpr std::uint64_t golden_ratio_increment = 0x9E3779B97F4A7C15;
+
+[[nodiscard]] constexpr std::uint64_t client_seed(int seed, std::size_t index) {
+  return (static_cast<std::uint64_t>(seed) * golden_ratio_increment) ^ std::uint64_t{index};
+}
+
 // One point of a sampled curve: the time (offset from t = 0) and the rate at that time.
 struct Sample {
   SimTime t{};

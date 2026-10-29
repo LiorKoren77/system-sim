@@ -14,6 +14,7 @@ module;
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -24,6 +25,7 @@ module;
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 
 export module simsys.core;
@@ -46,8 +48,8 @@ using SimTime = std::chrono::duration<std::int64_t, std::nano>;
 // resolution parse_duration uses; a plain duration_cast would truncate and bias every
 // step low. Ties go to EVEN (2.5ns -> 2ns), unlike parse_duration's half away from zero
 // (std::llround: "2.5ns" -> 3ns). NaN, infinite or out-of-int64-range input is undefined
-// behaviour (the double -> int64 conversion overflows); callers pass engine-computed,
-// finite step lengths.
+// behaviour (the double -> int64 conversion overflows); callers pass finite durations.
+// test helper: no caller in src (tests/unit/test_units.cpp pins the rounding).
 [[nodiscard]] constexpr SimTime from_seconds(double s) {
   return std::chrono::round<SimTime>(std::chrono::duration<double>(s));
 }
@@ -493,6 +495,12 @@ export namespace simsys {
   return std::string{first, written.ptr};
 }
 
+// `value` with at most `digits` significant digits, trailing zeros dropped (0.5, 1.61, 1000): how
+// the reports (four digits unless they say otherwise) and the sweep's rows print a number.
+[[nodiscard]] inline std::string significant(double value, int digits = 4) {
+  return to_chars_text(value, std::chars_format::general, digits);
+}
+
 // Bytes{5e7} -> "50MB": the inverse of parse_size, for messages and explain, so a size reads
 // back in the scenario's own grammar. The largest unit that keeps the number at least 1 (200B,
 // 2KB, 50MB, 1.5GB; 0B), the number in its shortest round-trip form in fixed notation, so a
@@ -532,10 +540,19 @@ struct EnumName {
   std::string_view name;
 };
 
+// C++20 concept: a named compile-time predicate on a type, checked where a template is used.
+// Replaces std::enable_if (SFINAE) and its unreadable errors: a type that does not fit fails at
+// the call, naming the concept. Here: any row with an enumerator `value` and a word `name`, so a
+// table whose rows carry more per enumerator (simsys.model's node types: whether the engine runs
+// the type) is read by the same lookups as a plain EnumName table.
+template <typename Row>
+concept NameRow = std::is_enum_v<decltype(Row::value)> &&
+                  std::convertible_to<decltype(Row::name), std::string_view>;
+
 // Row i of `table` must hold the enumerator whose value is i, so a lookup by
 // std::to_underlying is correct. consteval: a build-time proof, used in static_asserts.
-template <typename E, std::size_t N>
-[[nodiscard]] consteval bool follows_enum_order(const std::array<EnumName<E>, N>& table) {
+template <NameRow Row, std::size_t N>
+[[nodiscard]] consteval bool follows_enum_order(const std::array<Row, N>& table) {
   for (std::size_t i = 0; i < N; ++i) {
     // C++23 std::to_underlying: the enum's integer value without a static_cast that could
     // silently accept the wrong type (it always yields exactly the underlying type).
@@ -550,8 +567,9 @@ template <typename E, std::size_t N>
 // The word for `value`, by index (see follows_enum_order). An enumerator without a row (a
 // value cast from an integer) is a programmer error: the loader only produces cataloged
 // values.
-template <typename E, std::size_t N>
-[[nodiscard]] constexpr std::string_view name_in(const std::array<EnumName<E>, N>& table, E value) {
+template <NameRow Row, std::size_t N>
+[[nodiscard]] constexpr std::string_view name_in(const std::array<Row, N>& table,
+                                                 decltype(Row::value) value) {
   const auto index = std::to_underlying(value);
   // C++20 std::in_range<T>(x): "does x fit in T?", correct for any mix of signed and
   // unsigned types (a negative int does not fit in std::size_t). Replaces a hand-written
@@ -563,9 +581,9 @@ template <typename E, std::size_t N>
 }
 
 // The inverse of name_in; std::nullopt for a word not in the table.
-template <typename E, std::size_t N>
-[[nodiscard]] constexpr std::optional<E> parse_in(const std::array<EnumName<E>, N>& table,
-                                                  std::string_view name) {
+template <NameRow Row, std::size_t N>
+[[nodiscard]] constexpr std::optional<decltype(Row::value)> parse_in(
+    const std::array<Row, N>& table, std::string_view name) {
   for (const auto& row : table) {
     if (row.name == name) return row.value;
   }
@@ -578,8 +596,8 @@ template <typename E, std::size_t N>
 // value). C++20 consteval: an immediate function, evaluated only during compilation, so
 // the proof costs nothing at run time and a broken table is a build error at its
 // static_assert, next to the table (model.cppm, workload.cppm).
-template <typename E, std::size_t N>
-[[nodiscard]] consteval bool round_trips(const std::array<EnumName<E>, N>& table) {
+template <NameRow Row, std::size_t N>
+[[nodiscard]] consteval bool round_trips(const std::array<Row, N>& table) {
   for (std::size_t i = 0; i < N; ++i) {
     for (std::size_t j = i + 1; j < N; ++j) {
       if (table[i].name == table[j].name) return false;
@@ -591,5 +609,19 @@ template <typename E, std::size_t N>
   }
   return true;
 }
+
+// ---- The "overloaded" visitor ------------------------------------------------------------------
+//
+// One object whose operator() is overloaded by every lambda it is built from, so std::visit picks
+// the lambda matching the alternative the variant holds (engine and report visit with it).
+// C++17 pack expansion in a using-declaration (`using Fs::operator()...`) merges the lambdas' call
+// operators into one overload set. C++20 class template argument deduction for aggregates deduces
+// `Overloaded<L1, L2>` from the braces at the point of use, so the deduction guide C++17 needed
+// (`Overloaded(Fs...) -> Overloaded<Fs...>`) is gone; the struct itself is still the idiom, since
+// the standard library offers no ready-made overload set.
+template <class... Fs>
+struct Overloaded : Fs... {
+  using Fs::operator()...;
+};
 
 }  // namespace simsys::core

@@ -543,26 +543,6 @@ class ServiceBehaviour {
   std::map<std::string, double, std::less<>> cost_by_op_;  // only the ops listed in `cost`
 };
 
-// The seed of client `index`'s noise process (spec §17 entry 3): one std::mt19937_64 per client, so
-// appending a node (client or not) at the end of the file never changes another client's noise. The
-// seed is the node index, so a node inserted before a client moves that client's index, and so its
-// noise. Formula: (seed × 0x9E3779B97F4A7C15) XOR index, all mod 2^64. The constant is 2^64 divided
-// by the golden ratio (splitmix64's increment); what matters is that it is odd and large. The
-// multiply is there to keep (seed, index) pairs apart, not to decorrelate neighbouring seeds
-// (std::mt19937_64's own seeding already does that): a plain seed XOR index collides, 1^0 == 0^1,
-// while seed × K moves each seed's block of indices far into the high bits, so for the seeds and
-// client counts a scenario uses no two pairs share an engine seed (tests/unit/test_behaviours.cpp
-// checks seeds -100..100 × 64 clients). A negative seed converts to std::uint64_t modulo 2^64, so
-// it is as deterministic as a positive one: signed-to-unsigned conversion has always been defined
-// that way; what C++20's two's-complement rule fixed is the other direction (unsigned to signed).
-// The engine (Simulation::make_node) and `simsys curve --noise` both call this, so the curve
-// command prints exactly the noise a run will use.
-inline constexpr std::uint64_t golden_ratio_increment = 0x9E3779B97F4A7C15;
-
-[[nodiscard]] constexpr std::uint64_t client_seed(int seed, std::size_t index) {
-  return (static_cast<std::uint64_t>(seed) * golden_ratio_increment) ^ std::uint64_t{index};
-}
-
 // Models: the "User" box at the top of every System Design Interview diagram — web and mobile
 // clients as one aggregate source of load (ch. 1; the ch. 2 back-of-the-envelope estimates give its
 // rate, e.g. 300M DAU -> QPS). Captured: a request rate that follows the scenario's rate curve over
@@ -575,7 +555,7 @@ inline constexpr std::uint64_t golden_ratio_increment = 0x9E3779B97F4A7C15;
 // leave), and retries (a timed-out request is not sent again).
 class ClientBehaviour {
  public:
-  // `seed` seeds this client's noise process; the engine passes client_seed(scenario
+  // `seed` seeds this client's noise process; the engine passes workload::client_seed(scenario
   // seed, node index). It defaults to 0 for clients built without noise (tests): a client
   // whose workload has no noise never draws a random number, so its seed is unused.
   ClientBehaviour(const graph::Graph& g, std::size_t self, std::uint64_t seed = 0);
@@ -1103,8 +1083,8 @@ class CacheBehaviour {
   // Per op that can reach the cache (graph::Graph::arriving_ops): the store hop as a block
   // taken by graph::Graph::backend_fraction of the requests (absent under cache_aside, which
   // has no backend edge), then the then-steps' blocks. A store hop is waited for unless it is
-  // a write-back flush: a store makes no call back into its cache (graph::Graph refuses one
-  // that does, check_cache_backend_calls).
+  // a write-back flush: no call cycle runs through it (graph::Graph refuses one that does,
+  // check_backend_calls).
   detail::HopBlocks hops_;
   std::map<std::string, double, std::less<>> cost_by_op_;  // only the ops listed in `cost`
 };
@@ -1928,8 +1908,7 @@ ServiceBehaviour::ServiceBehaviour(const graph::Graph& g, std::size_t self)
 }
 
 double ServiceBehaviour::cost(std::string_view op) const {
-  const auto found = cost_by_op_.find(op);
-  return found == cost_by_op_.end() ? 1.0 : found->second;
+  return detail::cost_in(cost_by_op_, op);
 }
 
 // The graph's resolved hops (graph::Graph::service_hops), minus those no request takes: an
@@ -2220,8 +2199,7 @@ CacheBehaviour::CacheBehaviour(const graph::Graph& g, std::size_t self)
 }
 
 double CacheBehaviour::cost(std::string_view op) const {
-  const auto found = cost_by_op_.find(op);
-  return found == cost_by_op_.end() ? 1.0 : found->second;
+  return detail::cost_in(cost_by_op_, op);
 }
 
 detail::Hop detail::hop_to(const graph::Graph& g, std::size_t self, std::string_view incoming_op,
@@ -2296,8 +2274,7 @@ SqlDbBehaviour::SqlDbBehaviour(const graph::Graph& g, std::size_t self)
 }
 
 double SqlDbBehaviour::cost(std::string_view op) const {
-  const auto found = cost_by_op_.find(op);
-  return found == cost_by_op_.end() ? 1.0 : found->second;
+  return detail::cost_in(cost_by_op_, op);
 }
 
 bool SqlDbBehaviour::is_write(std::string_view op) const {

@@ -17,10 +17,11 @@
 #include <utility>
 #include <vector>
 
+#include "../support/scenario_helpers.hpp"
+
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
-import simsys.behaviours; // client_seed: the noise seed the engine gives each client
 import simsys.caching;
 import simsys.core;
 import simsys.engine;
@@ -55,6 +56,7 @@ using simsys::model::Scenario;
 using simsys::model::Step;
 using simsys::model::StepCondition;
 using simsys::model::Workload;
+using simsys::test_support::ring_factor;  // shared with test_scenarios
 
 namespace {
 // One client, one M/M/1 server: 1000/s capacity, 1 ms service, zero-latency link.
@@ -712,7 +714,7 @@ TEST_CASE("the curve command's noisy samples at the scenario step are the run's 
   const auto g = *Graph::build(s);
   auto sim = *Simulation::create(g);
   auto samples = simsys::workload::samples(s.nodes[0].workload->curve, 100ms, 2s, noise,
-                                           simsys::behaviours::client_seed(s.seed, 0));
+                                           simsys::workload::client_seed(s.seed, 0));
   int k = 0;
   for (const auto& sample : samples)
     REQUIRE(sim.step(k++ * 100ms, 100ms).responses[0].offered.per_second == sample.rate.per_second);
@@ -749,21 +751,9 @@ TEST_CASE("least connections pools the replicas: one M/M/c queue with c = replic
   REQUIRE(a.latency.mean_s < round_robin.nodes[2].latency.mean_s);
 }
 
-// The ring's imbalance k, the hottest machine's load over the average: each of M machines holds the
-// keys of its v virtual nodes' arcs, N copies of each key (N = 1 behind a balancer), so its share
-// is a sum of N v arc lengths whose relative spread is about 1/sqrt(N v) (book ch. 5: about 10 % at
-// 100 virtual nodes). The hottest of M such shares sits z_M standard deviations above the mean, z_M
-// the expected maximum of M standard normals (Blom: queueing::expected_normal_maximum, unit-tested
-// against its own figures):
-//   k = min(1 + z_M / sqrt(N v), M / N)        (M / N: a machine holds at most every key once)
-// v = 100, M = 4: 1 + 1.0491 / 10 = 1.1049;  v = 150, M = 4: 1.0857;  v = 1, M = 4: 2.0491.
-namespace {
-double ring_factor(int machines, int copies_per_key, int vnodes) {
-  const double spread = 1.0 / std::sqrt(static_cast<double>(copies_per_key) * vnodes);
-  return std::min(1.0 + simsys::queueing::expected_normal_maximum(machines) * spread,
-                  static_cast<double>(machines) / copies_per_key);
-}
-}  // namespace
+// The ring's imbalance k, the hottest machine's load over the average:
+// test_support::ring_factor (tests/support/scenario_helpers.hpp), k = min(1 + z_M / sqrt(N v),
+// M / N); v = 100, M = 4: 1.1049;  v = 150, M = 4: 1.0857;  v = 1, M = 4: 2.0491.
 
 // A hash ring with v virtual nodes per server spreads keys unevenly: the busiest of the 4 servers
 // holds k = 1 + z_4/sqrt(v) times the average share (ring_factor). With v = 100, k = 1.1049: the

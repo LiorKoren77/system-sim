@@ -258,8 +258,10 @@ void normalise(std::vector<Bucket>& buckets) {
   for (auto& bucket : buckets) bucket.key_probability /= total;
 }
 
-// 1 − e^{−x} for x ≥ 0 via expm1: exact to the last bit even when x is ~1e-12 (a cold key
-// over a short characteristic time), where 1 − exp(−x) would round to 0.
+// 1 − e^{−x} for x ≥ 0 via expm1: correct to the last bit even when x is ~1e-12 (a cold key over
+// a short characteristic time). 1 − exp(−x) subtracts two numbers next to 1, whose doubles are
+// 1.1e-16 apart, so it keeps only the difference's leading digits: at x = 1e-12 a relative error
+// of 2.2e-5, and below x ≈ 1e-16 exactly 0.
 [[nodiscard]] double one_minus_exp_neg(double x) {
   return -std::expm1(-x);
 }
