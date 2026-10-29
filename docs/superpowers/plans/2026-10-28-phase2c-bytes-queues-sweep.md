@@ -435,8 +435,39 @@
 
 **Files:** `src/model/model.cppm` (`SloSpec::over`), `src/config/config.cpp` (`over` a duration ≥ step and ≤ duration − warmup), `src/report/report.cppm`, `src/report/report.cpp` (per-SLO window accumulators fed by `Summary::observe`; the SLO table prints `(worst 10m from 00:20)`; JSON `window_start_s`), `scenarios/book/url-shortener/scenario.yaml` + `README.md` (`{metric: utilization, node: url_db, max: 0.9, over: 1h}`: the hour the whole-day SLOs could not see), tests in `test_config.cpp`, `test_report.cpp`, `test_scenarios.cpp`.
 
-- [ ] Tests: a 2k/s, 1 ms service fed 1k/s for an hour (step 1 s) with a 1.8× spike from 00:20 for 10 minutes: whole-hour utilization **0.5667**, `over: 10m` observes **0.9** (window 00:20–00:30) and fails `max: 0.8`, `over: 15m` observes 0.7667; a p99 SLO with `over: 10m` observes the spike window's p99; a last window shorter than `over` is evaluated; a window with nothing offered is skipped; `over: 50ms` at `step: 100ms` and `over: 2h` on a one-hour run are refused with the rule in the message. url-shortener passes the new SLO as shipped (worst hour measured, README), and `shards: 2` on `url_db` fails it at about 0.966 (the 96.8 % peak of its README, averaged over the aligned hour around 14:00).
-- [ ] Commit `report: SLOs checked per window with over`
+- [x] Tests: a 2k/s, 1 ms service fed 1k/s for an hour (step 1 s) with a 1.8× spike from 00:20 for 10 minutes: whole-hour utilization **0.5667**, `over: 10m` observes **0.9** (window 00:20–00:30) and fails `max: 0.8`, `over: 15m` observes 0.7667; a p99 SLO with `over: 10m` observes the spike window's p99; a last window shorter than `over` is evaluated; a window with nothing offered is skipped; `over: 50ms` at `step: 100ms` and `over: 2h` on a one-hour run are refused with the rule in the message. url-shortener passes the new SLO as shipped (worst hour measured, README), and `shards: 2` on `url_db` fails it at about 0.966 (the 96.8 % peak of its README, averaged over the aligned hour around 14:00).
+- [x] Commit `report: SLOs checked per window with over`
+  Resolution notes: red tests from `dc8ec40`, test-writer's decisions as recorded in the status
+  section. Model `SloSpec::over` (`std::optional<SimTime>`; no defaulted `operator==`: SimTime's
+  `==` is not reachable through the model interface, so the report matches SLOs with its own
+  `same_slo`, tick counts compared; no `emit_special_members` line was needed, the Release link is
+  clean). Loader `read_slo_over` (`slo_keys` gains `over`; `collect_slos` gets the header):
+  `slo: over (a duration: 10m, 1h): <parser's reason>`, `slo: over must be at least one step (50ms
+  < step 100ms)`, `slo: over must fit in the run after warmup (2h > duration 1h - warmup 0s)`.
+  Report: a window is a `Summary` itself (no window tracking of its own, a private constructor):
+  `Summary` keeps one `WindowedSlo` per scenario SLO with `over` (read from the summary's graph's
+  scenario, so `Summary{g, warmup}` is unchanged), feeds the current window's Summary every
+  observed step (window k = (t − warmup) / over, a step in the window its start falls in), and when
+  a step opens the next window judges the finished one with `evaluate_slo` (so every metric, the
+  C-1 timeout rule and the cap included, is computed by the whole run's code; one shared function)
+  and keeps the worst verdict (`keep_if_worse`: fail before pass, then the higher observed, the
+  earlier on a tie). `Summary::windowed_verdict` adds the still-open last window, however short;
+  a window in which nothing the SLO is about was offered (`offered_in`: the latency SLO's client
+  op(s), any client for the other metrics) is skipped, all skipped → `skipped`.
+  `SloResult::window_start` (from the run's start); table: the trailing cell `(worst 10m from
+  00:20)` (`describe_duration(over)` and explain's `clock_or_duration`), before a note when there
+  is one; JSON `window_start_s` only on an SLO with `over` (`null` when skipped). Deviation: the
+  red commit pinned url-shortener's `window_start_s` at 47520 with the comment "13 x 3600 + 120 =
+  47520"; 13 × 3600 + 120 = 46920 (13:02, which the same test's table check names), so both pins
+  are 46920 and the comment says so. url-shortener ships `{metric: utilization, node: url_db, max:
+  0.9, over: 1h}` with its comment: PASS 0.6433 `(worst 1h from 13:02)` (day mean of the same copy
+  0.4306); `shards: 2` FAIL 0.965; its README says both and re-measures the variants under the new
+  SLO (limiter spike 0.6442, without the limiter 0.651 `from 14:02`, no cache 1 `from 11:02`,
+  `keys: 1M` 0.7564); `test_scenarios.cpp`'s url-shortener test checks three SLOs. `estimate`
+  evaluates a windowed SLO on its one record (`(worst 1h from 00:00)`, 0.244 on url-shortener).
+  Schema: the SLO section's `over` paragraph. Output against the Task 13 fix round: only
+  url-shortener's `run`/`estimate` (table and JSON: the new SLO line); explain unchanged for all
+  14. 1086 tests, all green in Debug and Release, warning-free, clang-format-18 clean.
 
 ---
 
@@ -501,17 +532,18 @@ Schema v1.4, spec §19, study notes, README. Commit `docs: schema v1.4, spec §1
 The owner stopped the session ("stop now the background processes. make sure to push everything that
 was completed. document what is in progress and what is left to do"). State pushed to `origin/main`:
 
-**Done (committed, reviewed where a review section exists above):** Tasks 1–13. Task 13 landed
-after this stop (see its resolution notes; not yet reviewed). Task 12 landed as
-`dd9213b` (1049 tests green in both presets at that commit, with `tests/unit/test_queueing.cpp`
-taken from `6aa78ac`; see below). Its review (REQUEST_CHANGES, section "Review of Task 12 at
-dd9213b" above) is recorded but **not yet fixed**.
+**Done (committed, reviewed where a review section exists above):** Tasks 1–14. Task 13 landed
+after this stop; its review (section "Review of Task 13 at 691a3ef") and the Task 12 review's fix
+rounds are committed, each as its own commit, then Task 14 (SLOs per window). `main` builds
+warning-free and its 1086 tests are green in Debug and Release (update of 2026-10-29, after the
+stop). Task 14 still needs its adversarial review, and the two fix rounds a check by it.
 
-**Red commits on main, not yet implemented (so `main`'s tests are not all green):**
+**Red commits on main:** none left. (Task 14's, kept for the record:)
 - `dc8ec40` Task 14 (`over:` windows): `tests/theory/test_windows.cpp`, `over` tests in
   `test_config.cpp` and at the end of `test_report.cpp`; they fail at load with
   `slo: unknown key 'over'`. Test-writer's decisions to honour: windows align from the end of warmup
-  (url-shortener's worst hour is 13:02–14:02, `window_start_s` 47520, observed 0.6433 as shipped and
+  (url-shortener's worst hour is 13:02–14:02, `window_start_s` 46920 (47520 in the red commit, an
+  arithmetic slip), observed 0.6433 as shipped and
   0.965 with `shards: 2`); an SLO without `over` has no `window_start_s` key; a windowed SLO whose
   windows are all empty is `skipped`; the table prints `(worst 10m from 00:20)` with `HH:MM`; the YAML
   key is `slo:`.
@@ -526,10 +558,9 @@ named in that section.
 
 **Left to do, in order (each with the test-writer → implementer → adversarial reviewer loop):**
 1. Finish the kv/search review fix round (above) and commit it.
-2. ~~Task 13 implementation~~ done; its adversarial review is still to do.
-3. The Task 12 review fix round (section "Review of Task 12 at dd9213b": averaging in settle mode,
-   adjacent parallel steps refused, limiter fails closed, README/comment nits), then Task 14's
-   implementation; review both.
+2. ~~Task 13 implementation~~ done, reviewed, its fix round committed.
+3. ~~The Task 12 review fix round, then Task 14's implementation~~ done; the adversarial review of
+   Task 14 (and of the two fix rounds) is still to do.
 4. Task 15 `simsys sweep`; Tasks 16–18 (youtube, news-feed, search-autocomplete end to end; note that
    Task 12 changed news-feed's numbers: drop rate 0.5987, read_feed p99 90.3 ms, fanout capped at
    1k jobs/s by post_db's primary, so Task 17's sizing starts from those); Task 19 docs.

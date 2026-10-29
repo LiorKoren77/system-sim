@@ -724,6 +724,11 @@ struct SloSpec {
   // SLOs carry a duration, ratio SLOs a plain number; the variant keeps "0.01" from being
   // read as 0.01 seconds, which a single double field could not prevent.
   std::variant<SimTime, double> max{};
+  // `over: 1h` (plan 2c Task 14; book ch. 3: a non-functional requirement holds at every hour
+  // of the day, not on the day's average): check the SLO on every window of this length,
+  // aligned from the end of warmup, and let the worst window decide. Absent: the whole run
+  // after warmup, as before. The loader keeps it between one step and duration − warmup.
+  std::optional<SimTime> over{};
 };
 
 struct Scenario {

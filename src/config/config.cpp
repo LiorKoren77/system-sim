@@ -3004,7 +3004,7 @@ std::expected<std::vector<model::LinkSpec>, ConfigError> collect_links(
 // op; drop rate and utilization are ratios; queue lag (how far consumers trail producers)
 // and staleness (the age of the data served) are times.
 
-constexpr std::string_view slo_keys = "metric node op max";
+constexpr std::string_view slo_keys = "metric node op max over";
 
 using SloMaximum = decltype(model::SloSpec::max);
 
@@ -3134,8 +3134,35 @@ CheckResult check_slo_shape(const Site& site, const YAML::Node& entry, const mod
   return check_op_is_for_latency(site, entry, slo);
 }
 
+// `over: 10m` (plan 2c Task 14): the SLO is checked on every window of that length after warmup,
+// and the worst window decides (report::Summary). A window must hold at least one step (a shorter
+// one would observe nothing: the run moves a step at a time) and at most the observed run,
+// duration − warmup (a longer one would never complete, so the SLO would check nothing).
+CheckResult read_slo_over(const Site& site, const YAML::Node& entry, const model::Scenario& run,
+                          std::optional<SimTime>& over) {
+  if (!entry["over"]) return {};
+  auto window = parse_key(site, entry, "over", "over (a duration: 10m, 1h)", parse_duration);
+  if (!window) return std::unexpected(window.error());
+  if (window->count() < run.step.count()) {
+    return site.fail(entry["over"],
+                     std::format("over must be at least one step ({} < step {})",
+                                 describe_duration(*window), describe_duration(run.step)));
+  }
+  const SimTime observed{run.duration.count() - run.warmup.count()};
+  if (window->count() > observed.count()) {
+    return site.fail(entry["over"],
+                     std::format("over must fit in the run after warmup ({} > duration {} - "
+                                 "warmup {})",
+                                 describe_duration(*window), describe_duration(run.duration),
+                                 describe_duration(run.warmup)));
+  }
+  over = *window;
+  return {};
+}
+
 std::expected<model::SloSpec, ConfigError> read_slo(const Site& site, const YAML::Node& entry,
-                                                    const Declarations& declared) {
+                                                    const Declarations& declared,
+                                                    const model::Scenario& run) {
   if (!entry.IsMap()) return site.fail(entry, "entry must be a map");
   if (auto checked = check_known_keys(site, entry, slo_keys, "key"); !checked) {
     return std::unexpected(checked.error());
@@ -3150,18 +3177,23 @@ std::expected<model::SloSpec, ConfigError> read_slo(const Site& site, const YAML
   if (auto read = read_slo_max(site, entry, slo.metric).transform(store_in(slo.max)); !read) {
     return std::unexpected(read.error());
   }
+  if (auto read = read_slo_over(site, entry, run, slo.over); !read) {
+    return std::unexpected(read.error());
+  }
   return check_slo_shape(site, entry, slo, declared).transform([&] { return std::move(slo); });
 }
 
+// `run`: the scenario's header (duration, step, warmup), which bounds an SLO's `over`.
 std::expected<std::vector<model::SloSpec>, ConfigError> collect_slos(const Site& site,
                                                                      const YAML::Node& root,
-                                                                     const Declarations& declared) {
+                                                                     const Declarations& declared,
+                                                                     const model::Scenario& run) {
   const auto list = root["slo"];
   if (!list) return std::vector<model::SloSpec>{};
   if (!list.IsSequence()) return site.fail(list, "slo must be a list");
   const auto entry_site = site.within("slo");
   return collect_each(
-      list, [&](const YAML::Node& entry) { return read_slo(entry_site, entry, declared); });
+      list, [&](const YAML::Node& entry) { return read_slo(entry_site, entry, declared, run); });
 }
 
 // Pattern: Pipeline with early exit (railway-oriented error handling) — each stage returns
@@ -3185,7 +3217,7 @@ std::expected<model::Scenario, ConfigError> validate(const std::string& file,
   }
   auto links = collect_links(site, root["links"], *declared);
   if (!links) return std::unexpected(links.error());
-  auto slos = collect_slos(site, root, *declared);
+  auto slos = collect_slos(site, root, *declared, scenario);
   if (!slos) return std::unexpected(slos.error());
   scenario.nodes = std::move(declared->nodes);
   scenario.links = std::move(*links);

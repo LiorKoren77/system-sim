@@ -84,3 +84,8 @@ links:
 slo:
   - {metric: p99_latency, node: users, op: redirect, max: 50ms}
   - {metric: drop_rate, max: 0.001}
+  # The hour the whole-day SLOs cannot see (plan 2c Task 14): url_db's busiest copy averages
+  # 0.43 over the day but 0.6433 in its worst hour (13:02-14:02, around the 14:00 peak). Checked
+  # per hour, a design whose peak hour runs the database hot fails here (`shards: 2`: 0.965)
+  # while its day-long numbers still pass.
+  - {metric: utilization, node: url_db, max: 0.9, over: 1h}

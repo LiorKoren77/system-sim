@@ -65,9 +65,16 @@ warmup).
   Most of it is wire: five round trips of 2 × 250 µs (users → limiter, limiter →
   rules_cache, limiter → lb, lb → web, web → url_cache) are 2.5 ms of the redirect's 4.10 ms;
   the rest is service times and the web tier's queueing (80 % at the peak, 53 % on average).
-  Both SLOs pass: `PASS p99_latency users redirect 7.49ms 50ms`, `PASS drop_rate 0 0.001`,
-  exit 0. No node drops anything; the busiest are the web tier (peak rho 0.8) and the
-  database's replicas (0.6455).
+  All three SLOs pass: `PASS p99_latency users redirect 7.49ms 50ms`, `PASS drop_rate 0 0.001`
+  and `PASS utilization url_db - 0.6433 0.9 (worst 1h from 13:02)`, exit 0. No node drops
+  anything; the busiest are the web tier (peak rho 0.8) and the database's replicas (0.6455).
+- **The hour the day hides** (plan 2c Task 14). The third SLO, `{metric: utilization, node:
+  url_db, max: 0.9, over: 1h}`, is checked on every hour of the run, the hours aligned from the
+  end of the 2-minute warmup (00:02-01:02, 01:02-02:02, ...), and the worst hour decides. The
+  busiest database copy averages 0.4306 over the day, which a whole-day utilization SLO would
+  report; its worst hour is 13:02-14:02, the hour that ends just after the 14:00 peak, at
+  **0.6433** (0.9966 of the peak's 0.6455: the sine is nearly flat around its top). With
+  `shards: 2` that hour is 0.965 and the SLO fails while the day-long ones still pass (below).
 - **The step size.** The scenario runs at `step: 1s` (86,280 observed steps; 0.4 s in a
   Release build, 6.4 s in Debug) where the first draft ran at 100 ms (862,800 steps; 4.4 s in
   Release, 65 s in Debug). The fluid step is exact while demand is constant within it, and the
@@ -80,13 +87,14 @@ warmup).
   is a ceiling just above the 19.2k/s peak. Its job shows with a spike, `spikes: [{at:
   14:00, for: 5m, factor: 5}]` under `users.rate` (96k/s for 5 minutes): the limiter rejects
   22.8M requests (76k/s × 300 s), what passes is 20k/s plus the 2000-token burst, the web
-  tier touches red for 1 s (0.5 s at 100 ms steps) and nothing drops: both SLOs still pass
-  (p99 7.52 ms). The limiter itself and its `rules_cache` are not spared: every request of the
-  spike reaches both, 96k/s against their 100k/s default capacity, so each runs at rho 0.96,
-  red for the 300 s (`red_s 300`) without dropping. A limiter is sized for the flood it
+  tier touches red for 1 s (0.5 s at 100 ms steps) and nothing drops: the three SLOs still pass
+  (p99 7.52 ms; url_db's worst hour 0.6442). The limiter itself and its `rules_cache` are not
+  spared: every request of the spike reaches both, 96k/s against their 100k/s default
+  capacity, so each runs at rho 0.96, red for the 300 s (`red_s 300`) without dropping. A limiter is sized for the flood it
   refuses, not for the traffic it lets through. Without the limiter (users → lb directly) the
   same spike hits the web tier head-on: red for 302 s, 21.59M dropped, drop rate 0.01914 and
-  redirect p99 66.4 ms: both SLOs fail.
+  redirect p99 66.4 ms: both day-long SLOs fail (url_db's hourly one passes at 0.651: the web
+  tier, not the database, sheds the spike).
 
 ## What it abstracts away
 - Base-62 encoding, 301 vs 302 semantics, collision handling.
@@ -100,20 +108,21 @@ warmup).
   flow, worked out from the fraction the earlier step delivered in the PREVIOUS simulation step
   (1 s here), so a change of loss reaches the database one step late (plus the delay of the link
   to the failing step's target, in whole steps: none here, a link of 0.25 ms rounds to zero
-  steps), and the steps are assumed
-  to fail independently of one another. A failed request costs nothing more: no retry, no
-  timeout spent waiting.
+  steps), and the steps are assumed to fail independently of one another. A failed request
+  costs nothing more: no retry, no timeout spent waiting.
 - The client's 1 s timeout, partly (plan 2c Task 13). Each step, the response time of an op is
   a lognormal fitted to its mean and variance; the share of it slower than 1 s is counted as
   timed out (JSON's `timed_out_per_s`, the table's `timed out/s`), not answered, the latency
   columns describe the requests answered in time, and no percentile is printed above 1 s (one
-  more than whose share of the requests timed out prints `>1s` and fails its SLO). The shipped day never comes near it
+  more than whose share of the requests timed out prints `>1s` and fails its SLO). The shipped
+  day never comes near it
   (`timed_out_per_s` 0 for both ops). What it ignores: the servers still do a timed-out
   request's work (nothing cancels it), the client does not retry it, and a timed-out request is
   in no node's `drop_rate` (no node failed it).
-- Percentiles are estimated (a lognormal fitted to the mean and variance), and the SLOs are
-  checked over the whole day, not per minute: a few minutes of red at the peak can hide in
-  the day's p99.
+- Percentiles are estimated (a lognormal fitted to the mean and variance), and an SLO without
+  `over:` is checked over the whole day: a few minutes of red at the peak can hide in the day's
+  p99. The hourly utilization SLO checks hours on a fixed grid, so a peak that straddles two
+  hours is split between them (a sliding window would find a slightly worse hour).
 
 ## Things to try
 - **Remove the cache** (delete `url_cache` and its link, and make `redirect: [{to: url_db,
@@ -122,13 +131,14 @@ warmup).
   redirect is now a database read, 17.47k/s at the peak. In the run (`--series`), url_db
   turns yellow at 07:16, red at 09:17, starts dropping at 10:26 when its queues are full,
   and stays red until 18:42. It drops 40.55M requests: drop rate 0.02698, redirect p99 474
-  ms (mean 85.5 ms); both SLOs fail (exit 2). Writes still commit (the primaries are at 58 %),
+  ms (mean 85.5 ms); all three SLOs fail (exit 2; the hourly utilization at 1, first reached in
+  the hour from 11:02). Writes still commit (the primaries are at 58 %),
   but the overloaded replicas fall behind: staleness 111 ms and 15.49 missed writes/s per
   replica. Every other node is unchanged: the cache was the database's protection.
 - Set `url_cache.keys` to `1M`: the hit ratio falls to 0.686 and the replicas go yellow at
   the afternoon peak (`3.795k units/s vs 5k/s (75.9%, yellow)`); the run still passes
-  (redirect p99 7.92 ms, nothing dropped). The cache can shrink 20× before the database
-  notices, because the Zipf head is what matters.
+  (redirect p99 7.92 ms, nothing dropped, url_db's worst hour 0.7564). The cache can shrink 20×
+  before the database notices, because the Zipf head is what matters.
 - Change `id_gen` to `{type: id_generator, algorithm: ticket_server, replicas: 1}` (one
   auto-increment database, ch. 7; the loader refuses `replicas: 2` for a ticket server): the
   write path gets a hot spot. `explain`: `id_gen  peak offered 1.728k/s vs 1k/s total
@@ -149,8 +159,9 @@ warmup).
   4.096M ids/s per machine is why the book picks it.
 - Remove the `limiter` and add a spike `{at: 14:00, for: 5m, factor: 5}`: the two runs are
   in "The rate limiter's role" above.
-- `shards: 2` on `url_db`: the replicas go red at the peak (96.8 %), yet the SLOs pass (p99
-  9.02 ms): the fluid queue only drops above 100 %, and the day's p99 hides the hours near
-  the peak. The zones say what the SLOs do not: no margin left.
+- `shards: 2` on `url_db`: the replicas go red at the peak (96.8 %), yet the day-long SLOs pass
+  (p99 9.02 ms): the fluid queue only drops above 100 %, and the day's p99 hides the hours near
+  the peak. The hourly utilization SLO does not: `FAIL utilization url_db - 0.965 0.9 (worst 1h
+  from 13:02)`, exit 2. It says what the zones say: no margin left.
 - `web.replicas: 7`: `(91.4%, red)` in explain, p99 11.8 ms in the run, nothing dropped, for
   the same reason.

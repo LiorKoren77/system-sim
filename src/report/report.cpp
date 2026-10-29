@@ -511,6 +511,52 @@ void fail_if_quantile_timed_out(SloResult& result, std::span<const OpSummary> op
   return SloResult{.slo = slo, .observed = std::nullopt, .status = SloStatus::skipped};
 }
 
+// ---- SLOs per window (plan 2c Task 14) ----
+
+// Was anything the SLO is about offered in `window`? For a latency SLO, its client's op (or ops);
+// for any other, any client's. A window without it has nothing to judge (an idle service's p99
+// is its service time's, a bound no request met), so it is skipped.
+[[nodiscard]] bool offered_in(const Summary& window, const model::SloSpec& slo) {
+  for (const auto& op : window.ops()) {
+    const bool concerned = !is_latency(slo.metric) ||
+                           (op.client == slo.node.value_or("") && (!slo.op || op.op == *slo.op));
+    if (concerned && op.offered_per_s > 0.0) return true;
+  }
+  return false;
+}
+
+// Are `a` and `b` the same SLO, every key alike? Written out rather than a defaulted
+// SloSpec::operator==: SimTime's == (std::chrono's) is not reachable through the model module's
+// interface (CLAUDE.md §3), so the tick counts are compared.
+[[nodiscard]] bool same_slo(const model::SloSpec& a, const model::SloSpec& b) {
+  // C++23 std::optional::transform: maps a present value and passes an empty optional through,
+  // replacing `t ? std::optional{t->count()} : std::nullopt`.
+  const auto ticks = [](const std::optional<SimTime>& t) {
+    return t.transform([](SimTime d) { return d.count(); });
+  };
+  return a.metric == b.metric && a.node == b.node && a.op == b.op &&
+         a.max.index() == b.max.index() && limit_value(a.max) == limit_value(b.max) &&
+         ticks(a.over) == ticks(b.over);
+}
+
+// The order of verdicts by badness: a fail before a pass, then the higher observed value (every
+// SLO bounds its metric from above), the earlier window on a tie. A skipped window never counts.
+[[nodiscard]] int badness(SloStatus status) {
+  return status == SloStatus::fail ? 2 : status == SloStatus::pass ? 1 : 0;
+}
+
+[[nodiscard]] bool worse(const SloResult& candidate, const SloResult& than) {
+  if (badness(candidate.status) != badness(than.status)) {
+    return badness(candidate.status) > badness(than.status);
+  }
+  return candidate.observed.value_or(-infinity) > than.observed.value_or(-infinity);
+}
+
+void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
+  if (candidate.status == SloStatus::skipped) return;
+  if (!worst || worse(candidate, *worst)) worst = std::move(candidate);
+}
+
 // A metric passes when it is at most its limit. An infinite latency (a node that never
 // answers) and NaN both fail. No data is an error, not a pass: with no observed step every
 // average would be a 0 that passes any limit, so nothing is evaluated (the CLI exits 1).
@@ -705,6 +751,24 @@ void fail_if_quantile_timed_out(SloResult& result, std::span<const OpSummary> op
   std::unreachable();
 }
 
+[[nodiscard]] std::string clock_or_duration(SimTime t);  // defined with explain's rate curve
+
+// Which window decided an SLO with `over`: `(worst 10m from 00:20)`, its length as `over` reads
+// and its start on the run's clock (explain's form: HH:MM in the first day). Empty otherwise.
+[[nodiscard]] std::string window_text(const SloResult& r) {
+  if (!r.slo.over || !r.window_start) return {};
+  return "(worst " + describe_duration(*r.slo.over) + " from " +
+         clock_or_duration(*r.window_start) + ")";
+}
+
+// The trailing, unlabelled cell of an SLO's row: the window that decided it and why the verdict
+// is not what `observed` against `max` alone would give, each when there is one.
+[[nodiscard]] std::string slo_remark(const SloResult& r) {
+  const std::string window = window_text(r);
+  if (window.empty() || r.note.empty()) return window + r.note;
+  return window + "  " + r.note;
+}
+
 [[nodiscard]] std::string slo_table(std::span<const SloResult> slos, bool color) {
   if (slos.empty()) return {};
   std::vector<Row> rows{{{"status"}, {"metric"}, {"node"}, {"op"}, {"observed"}, {"max"}}};
@@ -716,7 +780,8 @@ void fail_if_quantile_timed_out(SloResult& result, std::span<const OpSummary> op
     Row row{status_cell(r.status, color), {std::string{model::to_string(r.slo.metric)}},
             {r.slo.node.value_or("-")},   {r.slo.op.value_or("-")},
             {observed.value_or("-")},     {fmt_limit(r.slo.max)}};
-    if (!r.note.empty()) row.push_back({r.note});  // a seventh, unlabelled column: why
+    // A seventh, unlabelled column: which window, and why.
+    if (const auto remark = slo_remark(r); !remark.empty()) row.push_back({remark});
     rows.push_back(std::move(row));
   }
   return "slo\n" + aligned(rows, Align::all_left);
@@ -836,7 +901,13 @@ void fail_if_quantile_timed_out(SloResult& result, std::span<const OpSummary> op
                           json_field("max", json_number(limit_value(r.slo.max))),
                           json_field("status", json_string(status_name(r.status))),
                           json_field("note", r.note.empty() ? "null" : json_string(r.note))};
-  return json_object(fields);
+  if (!r.slo.over) return json_object(fields);
+  // Only an SLO with `over` has the key: its worst window's start, in seconds from the start of
+  // the run; null when no window had anything offered.
+  std::vector<std::string> windowed{fields.begin(), fields.end()};
+  windowed.push_back(json_field("window_start_s",
+                                r.window_start ? json_number(seconds(*r.window_start)) : "null"));
+  return json_object(windowed);
 }
 
 // C++20 std::views::transform + C++23 std::ranges::to: map every element through `f` and
@@ -2659,7 +2730,9 @@ void Summary::LinkTotals::add(const engine::LinkSample& sample, double dt_s) {
   worst_zone = std::max(worst_zone, sample.zone);  // green < yellow < red, as declared
 }
 
-Summary::Summary(const graph::Graph& g, SimTime warmup)
+Summary::Summary(const graph::Graph& g, SimTime warmup) : Summary{g, warmup, true} {}
+
+Summary::Summary(const graph::Graph& g, SimTime warmup, bool track_windows)
     : graph_{&g}, warmup_{warmup}, nodes_(g.nodes().size()) {
   for (const auto& link : g.links()) {
     if (link.pipe) links_.push_back(LinkTotals{.name = graph::link_label(g.nodes(), link)});
@@ -2672,6 +2745,10 @@ Summary::Summary(const graph::Graph& g, SimTime warmup)
     for (const auto& [op, share] : workload->op_shares) ops.push_back(op);
     std::ranges::sort(ops);
     for (auto& op : ops) ops_.push_back(OpTotals{.client = client, .op = std::move(op)});
+  }
+  if (!track_windows) return;
+  for (const auto& slo : g.scenario().slos) {
+    if (slo.over) windows_.push_back(WindowedSlo{.slo = slo});
   }
 }
 
@@ -2707,6 +2784,44 @@ void Summary::observe(const engine::StepRecord& record) {
     const auto& sample = record.responses[k];
     totals_for(sample, k).add(sample, dt_s);
   }
+  observe_windows(record);
+}
+
+// Feeds each windowed SLO's current window, after judging and closing the one before when this
+// step starts a new window (see the class comment). Window k is [warmup + k·over, warmup +
+// (k + 1)·over); `.count()` arithmetic on the tick counts (nanoseconds), exact.
+void Summary::observe_windows(const engine::StepRecord& record) {
+  for (auto& windowed : windows_) {
+    const long long index = (record.t.count() - warmup_.count()) / windowed.slo.over->count();
+    if (index != windowed.index) {
+      if (!windowed.current.empty()) keep_if_worse(windowed.worst, judge_window(windowed));
+      windowed.current.clear();
+      windowed.current.push_back(Summary{*graph_, warmup_, false});
+      windowed.index = index;
+    }
+    windowed.current.front().observe(record);
+  }
+}
+
+// The current window of `windowed` judged like a whole run (evaluate_slo), with where it starts;
+// skipped when nothing the SLO is about was offered in it (offered_in).
+SloResult Summary::judge_window(const WindowedSlo& windowed) const {
+  const Summary& window = windowed.current.front();
+  if (!offered_in(window, windowed.slo)) return skipped(windowed.slo);
+  SloResult result = evaluate_slo(window, window.nodes(), window.ops(), windowed.slo);
+  if (result.status != SloStatus::skipped) {
+    result.window_start = SimTime{warmup_.count() + windowed.index * windowed.slo.over->count()};
+  }
+  return result;
+}
+
+SloResult Summary::windowed_verdict(const model::SloSpec& slo) const {
+  const auto found = std::ranges::find_if(
+      windows_, [&](const WindowedSlo& windowed) { return same_slo(windowed.slo, slo); });
+  if (found == windows_.end() || found->current.empty()) return skipped(slo);
+  std::optional<SloResult> worst = found->worst;
+  keep_if_worse(worst, judge_window(*found));  // the last window, however short
+  return worst.value_or(skipped(slo));
 }
 
 std::vector<NodeSummary> Summary::nodes() const {
@@ -2878,7 +2993,10 @@ std::vector<SloResult> evaluate_slos(const Summary& summary, std::span<const mod
   const auto nodes = summary.nodes();
   const auto ops = summary.ops();
   std::vector<SloResult> results;
-  for (const auto& slo : slos) results.push_back(evaluate_slo(summary, nodes, ops, slo));
+  for (const auto& slo : slos) {
+    results.push_back(slo.over ? summary.windowed_verdict(slo)
+                               : evaluate_slo(summary, nodes, ops, slo));
+  }
   return results;
 }
 

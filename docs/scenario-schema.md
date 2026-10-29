@@ -1034,7 +1034,7 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 
 ## SLO
 
-`{metric, node, op, max}`; `metric` and `max` are required.
+`{metric, node, op, max, over}`; `metric` and `max` are required.
 
 | metric | `node` | `op` | `max` | evaluates |
 |---|---|---|---|---|
@@ -1049,6 +1049,21 @@ The kind of `max` follows the metric, so `0.01` can never be read as 0.01 second
 (`slo: reject_rate max must be between 0 and 1`).
 `op` is only valid for latency metrics (`slo: op is only valid for latency metrics`): drop
 rate, reject rate and utilization are measured per node, not per op.
+
+**`over`** *(phase 2c)*: a duration; the SLO is checked on every window of that length instead of
+the whole run, and the **worst** window decides (a fail before a pass, then the highest observed
+value). The windows are aligned from the end of warmup and follow one another (`warmup: 2m`,
+`over: 1h`: 00:02-01:02, 01:02-02:02, ...); a step belongs to the window its start falls in; a
+last window shorter than `over` is still checked; a window in which nothing was offered (by the
+latency SLO's client op, or by any client for the other metrics) is skipped, and an SLO all of
+whose windows are skipped is `skipped`. Each window is measured exactly as a whole run is (its
+percentiles capped at, or set to, a client's timeout by the same rule). The table names the
+window that decided, `(worst 10m from 00:20)` (its start on the run's clock, warmup included);
+JSON gives it as `window_start_s` (seconds from the start of the run; `null` when skipped), a key
+only an SLO with `over` has. `over` must be at least one step and at most duration − warmup:
+`slo: over must be at least one step (50ms < step 100ms)`, `slo: over must fit in the run after
+warmup (2h > duration 1h - warmup 0s)`. Fixed windows split a burst that straddles two of them
+(a sliding window would find a slightly worse one).
 
 ### Queue lag
 
