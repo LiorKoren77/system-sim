@@ -439,8 +439,10 @@ TEST_CASE("book/youtube runs: the transcoders hand on what they drained, 6.667 j
 // 63,759 here, 63,750 at the 10 s steps below). The queue's lag is the FIFO drain time of its one
 // group, backlog / drain, the pool draining its whole capacity while saturated:
 //   63,760 / 6.667/s = 9,564 s = 2.66 h  >  30 m = 1,800 s    -> FAIL
-// (the Erlang wait of refinement 5, 0.57 s at rho 0.96, is the smaller term at every step). It
-// FAILS on purpose until Task 16 resizes the transcoders to 600 workers (backlog 0, lag 0.57 s).
+// (the Erlang wait of refinement 5 is the smaller term at every step: the saturated pool's, at rho
+// clamped to 0.99, is Wq(400, 0.99, 60 s) = C(400, 0.99) x 60 s / (400 x 0.01) = 11.6 s). It FAILS
+// on purpose until Task 16 resizes the transcoders to 600 workers (backlog 0, lag 0.57 s: the
+// Erlang wait at rho 0.96).
 // The run uses 10 s steps, not the scenario's 100 ms: the fluid backlog is the same to 0.02 %
 // (checked at both) and 8,640 steps, not 864k, keep the test in seconds; hence the 1 % tolerance.
 // (The 24 h run stops before the daily peak: the inflow still exceeds the capacity at midnight and

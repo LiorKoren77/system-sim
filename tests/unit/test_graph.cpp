@@ -2379,17 +2379,17 @@ const std::string no_size_advice = "has no size: add size: to the step or sizes:
 
 // Nothing feeds the pool, yet its `then` step counts as arriving at the store (an unconditional
 // `then` fires for whatever the node receives). Before this fix the store took `write` with no
-// size and charged it one unit; now the step must say how big a write is. The sender is a pool,
-// so the message says how its step lost the size (review of plan 2c Task 7, minor 2).
+// size and charged it one unit; now the step must say how big a write is. No job arrives at the
+// pool as `write`, so the step renames every job: the message gives the plain advice, without the
+// note on a pool's same-op steps (review of plan 2c Task 8, minor 4: that note is for a step whose
+// op is one of the pool's arriving ops, the case of the test below with `upload` and `reupload`).
 TEST_CASE("a worker pool's then step that no queue feeds still needs a size at a byte-sized store",
           "[graph]") {
   const auto built = Graph::build(unfed_pool(Step{.to = "store", .op = "write"}));
   REQUIRE_FALSE(built.has_value());
   REQUIRE(built.error().message ==
           "node 'store' counts bytes (capacity 500MB/s, default), but op 'write' from 'pool' " +
-              no_size_advice +
-              " (a worker pool's then step keeps the size of the jobs that arrive as 'write' "
-              "only: it renames every other job, and a renamed job has no size)");
+              no_size_advice);
 }
 
 // The step's own size holds wherever the step fires, fed or not: 50 MB = 5e7 B.

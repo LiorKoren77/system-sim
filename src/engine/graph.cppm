@@ -340,8 +340,9 @@ struct ResolvedLink {
   // The ops this pipe carries that are WRITES for whoever receives them (review of plan 2c Task 5,
   // I-2, and of Task 6, I-2): an op is a write on the link if a node its payload reaches, the
   // receiver or any node behind it, lists it in its `write_ops` (model::write_ops_of), under its
-  // own name or under the name a step that states its own `size:` gives it (review of Task 7, I-2:
-  // such a step forwards a body). So a 10 MB `upload` through a load balancer into a blob store
+  // own name or under the name a step gives it that states a `size:` equal to the incoming one
+  // (review of Task 7, I-2, and of Task 8, I-2: such a step forwards the body itself; a step of
+  // another size is a new request). So a 10 MB `upload` through a load balancer into a blob store
   // that lists `upload` is a write on the client's link too: the balancer forwards the body once
   // all of it has arrived, as the store would; and so is one a service sends on as
   // `{op: put, size: 10MB}` to a store that writes `put`. The engine pays a write's whole
@@ -1828,23 +1829,28 @@ struct SizeWalk {
 // Why a worker pool's step can send an op unsized although its jobs are sized (review of plan 2c
 // Task 7, minor 2): every job fires every step, so a same-op step `{op: upload}` carries the size
 // of the jobs that arrived as `upload` and renames the jobs of every other op, and a renamed
-// request has no size (refinement 1). Empty for any other sender, whose steps are per op.
-[[nodiscard]] std::string pool_renaming_hint(std::span<const ResolvedNode> nodes,
-                                             std::string_view op, std::size_t from) {
-  if (nodes[from].spec.type != model::NodeType::worker_pool) return {};
+// request has no size (refinement 1). Only when `op` is one of the ops the pool's jobs arrive as
+// (review of Task 8, minor 4): a step that renames every job (youtube's `{op: write}` after
+// `transcode` jobs) is a plain rename, which the message's own advice covers. Empty for any other
+// sender, whose steps are per op.
+[[nodiscard]] std::string pool_renaming_hint(const Graph& g, std::string_view op,
+                                             std::size_t from) {
+  if (g.nodes()[from].spec.type != model::NodeType::worker_pool) return {};
+  if (!std::ranges::binary_search(g.arriving_ops(from), op)) return {};
   return " (a worker pool's then step keeps the size of the jobs that arrive as '" +
          std::string{op} + "' only: it renames every other job, and a renamed job has no size)";
 }
 
 // "node 'store' counts bytes (capacity 500MB/s, default), but op 'fetch' from 'svc' has no size:
 // ...": a byte-sized node's error for an unsized op, naming where to add the size.
-[[nodiscard]] EngineError no_size_error(std::span<const ResolvedNode> nodes, std::size_t node,
-                                        std::string_view op, std::size_t from) {
+[[nodiscard]] EngineError no_size_error(const Graph& g, std::size_t node, std::string_view op,
+                                        std::size_t from) {
+  const auto nodes = g.nodes();
   const auto& spec = nodes[node].spec;
   return EngineError{"node '" + spec.id + "' counts bytes (" + byte_capacity_text(spec) +
                      "), but op '" + std::string{op} + "' from '" + nodes[from].spec.id +
                      "' has no size: add size: to the step or sizes: to the client" +
-                     pool_renaming_hint(nodes, op, from)};
+                     pool_renaming_hint(g, op, from)};
 }
 
 // Is the arrival a rate limiter's `counter` request to `node`, its backend (plan 2a refinement
@@ -1859,9 +1865,9 @@ struct SizeWalk {
 // A byte-sized node's error for an op one of whose arrivals (sorted by origin) has no size,
 // naming the first such origin and what to add; a limiter's counter, which no size can fix, gets
 // its own message.
-[[nodiscard]] std::optional<EngineError> unsized_bytes(std::span<const ResolvedNode> nodes,
-                                                       std::size_t node,
+[[nodiscard]] std::optional<EngineError> unsized_bytes(const Graph& g, std::size_t node,
                                                        std::span<const SizeArrival> arrivals) {
+  const auto nodes = g.nodes();
   const auto& spec = nodes[node].spec;
   if (!defaults::is_byte_sized(spec)) return std::nullopt;
   for (const SizeArrival& arrival : arrivals) {
@@ -1872,7 +1878,7 @@ struct SizeWalk {
                          "' sends it its counter: a limiter's counter carries no size; its "
                          "backend must count requests"};
     }
-    return no_size_error(nodes, node, arrival.op, arrival.origin);
+    return no_size_error(g, node, arrival.op, arrival.origin);
   }
   return std::nullopt;
 }
@@ -1901,10 +1907,10 @@ struct SizeWalk {
 // needs no size, and a byte-sized node further on then reports the unsized path rather than
 // inherit a size that only some of the requests have.
 [[nodiscard]] std::expected<std::optional<Bytes>, EngineError> resolved_size(
-    std::span<const ResolvedNode> nodes, std::size_t node, std::span<const SizeArrival> arrivals) {
-  if (auto conflict = two_sizes(nodes, node, arrivals)) return std::unexpected{*conflict};
-  if (auto zero = zero_bytes(nodes, node, arrivals)) return std::unexpected{*zero};
-  if (auto unsized = unsized_bytes(nodes, node, arrivals)) return std::unexpected{*unsized};
+    const Graph& g, std::size_t node, std::span<const SizeArrival> arrivals) {
+  if (auto conflict = two_sizes(g.nodes(), node, arrivals)) return std::unexpected{*conflict};
+  if (auto zero = zero_bytes(g.nodes(), node, arrivals)) return std::unexpected{*zero};
+  if (auto unsized = unsized_bytes(g, node, arrivals)) return std::unexpected{*unsized};
   const auto has_no_size = [](const SizeArrival& arrival) { return !arrival.size; };
   if (std::ranges::any_of(arrivals, has_no_size)) return std::nullopt;
   return arrivals.front().size;
@@ -1915,10 +1921,10 @@ struct SizeWalk {
 // byte-sized node): an unsized one, naming the client or step that set or dropped its size and
 // what to add, a limiter's counter (no size can fix it), or one of 0 bytes (it would cost nothing,
 // and the engine divides by its megabytes). Nothing for a link without a bandwidth.
-[[nodiscard]] std::optional<EngineError> unpriced_on_pipe(std::span<const ResolvedNode> nodes,
-                                                          const ResolvedLink& link,
+[[nodiscard]] std::optional<EngineError> unpriced_on_pipe(const Graph& g, const ResolvedLink& link,
                                                           std::span<const SizeArrival> arrivals) {
   if (!link.pipe) return std::nullopt;
+  const auto nodes = g.nodes();
   const std::string name = "link " + link_label(nodes, link, "'") + " has a bandwidth, but ";
   for (const SizeArrival& arrival : arrivals) {
     const std::string& origin = nodes[arrival.origin].spec.id;
@@ -1930,7 +1936,7 @@ struct SizeWalk {
     if (!arrival.size) {
       return EngineError{name + "op '" + arrival.op + "' from '" + origin +
                          "' has no size: add size: to the step or sizes: to the client" +
-                         pool_renaming_hint(nodes, arrival.op, arrival.origin)};
+                         pool_renaming_hint(g, arrival.op, arrival.origin)};
     }
     if (!(arrival.size->count > 0.0)) {
       return EngineError{name + "op '" + arrival.op + "' from '" + origin + "' has size " +
@@ -1940,27 +1946,38 @@ struct SizeWalk {
   return std::nullopt;
 }
 
-// Does a hop for `op` carry the request's payload on? While the op keeps its name it does; a
-// renamed step that states its own `size:` does too (review of plan 2c Task 7, I-2): it forwards
-// a body, which the node had to take in whole before sending it on, so the receiver far down
-// writing it makes the first hop a write as well. A renamed step without a size is a new request
-// of its own (a lookup, a notification), whose sender had read the incoming bytes already.
-[[nodiscard]] bool carries_payload(std::string_view op, const CallHop& hop) {
-  return hop.op == op || hop.size.has_value();
+// Does a hop for `op`, whose requests weigh `incoming` at the sender (Graph::request_bytes; empty
+// when unsized), carry the request's payload on? While the op keeps its name it does. A renamed
+// step does only when it states a `size:` equal to the incoming one (review of plan 2c Task 7,
+// I-2, narrowed by the review of Task 8, I-2): that is the body itself relabelled (a service that
+// takes an `upload` of 10 MB and stores it as `{op: put, size: 10MB}`), which the node had to take
+// in whole before sending it on, so the receiver far down writing it makes the first hop a write
+// as well. A renamed step of another size, or of none, is a new request of its own (a lookup, a
+// 1 KB metadata write, a notification), whose sender had read the incoming bytes already: a 10 MB
+// upload whose service writes `{op: put_meta, size: 1KB}` stays a read on the client's wire.
+[[nodiscard]] bool carries_payload(std::string_view op, const std::optional<Bytes>& incoming,
+                                   const CallHop& hop) {
+  if (hop.op == op) return true;
+  return hop.size.has_value() && incoming.has_value() && *hop.size == *incoming;
 }
 
 // Is `op` a write at `node`, or at a node the request's payload reaches from there
 // (ResolvedLink::write_ops)? The size walk's hops (call_hops and the size-only hops) that carry
-// the payload on (carries_payload), under its name or under the name a sized step gives it.
-// `seen` holds the (node, op) pairs already asked, so a loop ends.
+// the payload on (carries_payload), under its name or under the name a step of the same size
+// gives it. Runs after every (node, op)'s size is resolved (Graph::resolve_request_sizes), so
+// the incoming size is Graph::request_bytes. `seen` holds the (node, op) pairs already asked, so
+// a loop ends.
 [[nodiscard]] bool written_downstream(const Graph& g, std::size_t node, const std::string& op,
                                       std::set<std::pair<std::size_t, std::string>>& seen) {
   if (!seen.emplace(node, op).second) return false;
   if (is_write(g.nodes()[node].spec, op)) return true;
+  const auto incoming = g.request_bytes(node, op);
   auto hops = call_hops(g, node, op);
   add_size_only_hops(g, node, op, hops);
   for (const CallHop& hop : hops) {
-    if (carries_payload(op, hop) && written_downstream(g, hop.to, hop.op, seen)) return true;
+    if (carries_payload(op, incoming, hop) && written_downstream(g, hop.to, hop.op, seen)) {
+      return true;
+    }
   }
   return false;
 }
@@ -2673,14 +2690,14 @@ Graph::Result Graph::resolve_request_sizes() {
   for (std::size_t node = 0; node < nodes_.size(); ++node) {
     for (const auto op_arrivals : walk.at_nodes[node] | std::views::chunk_by(detail::same_op)) {
       const std::span<const detail::SizeArrival> one_op{op_arrivals};
-      auto size = detail::resolved_size(nodes_, node, one_op);
+      auto size = detail::resolved_size(*this, node, one_op);
       if (!size) return std::unexpected{std::move(size.error())};
       if (*size) request_bytes_[node].emplace(one_op.front().op, **size);
     }
     if (auto checked = check_sized_arrivals(node); !checked) return checked;
   }
   for (std::size_t link = 0; link < links_.size(); ++link) {
-    if (auto unpriced = detail::unpriced_on_pipe(nodes_, links_[link], walk.over_links[link])) {
+    if (auto unpriced = detail::unpriced_on_pipe(*this, links_[link], walk.over_links[link])) {
       return std::unexpected{std::move(*unpriced)};
     }
     links_[link].write_ops = detail::pipe_write_ops(*this, links_[link], walk.over_links[link]);
@@ -2697,7 +2714,7 @@ Graph::Result Graph::check_sized_arrivals(std::size_t node) const {
   if (!defaults::is_byte_sized(nodes_[node].spec)) return {};
   for (const auto& op : arriving_ops_[node]) {
     if (request_bytes_[node].contains(op)) continue;
-    return std::unexpected{detail::no_size_error(nodes_, node, op, first_sender_[node].at(op))};
+    return std::unexpected{detail::no_size_error(*this, node, op, first_sender_[node].at(op))};
   }
   return {};
 }
@@ -3072,8 +3089,9 @@ Graph::Result Graph::connect_consumers() {
 // frontier (which has no retention). A pool built in code without `consumes` is refused in the
 // loader's words (review of plan 2c Task 7, minor 4): it could never receive a job, since
 // check_pool_senders refuses every sender but its queue.
-// Assumed: the backlog drains first in, first out, so the oldest message waits the FIFO drain time
-// (backlog over drain rate) and the room in messages is the room in seconds of draining.
+// Assumed: the backlog drains first in, first out, so a message published now waits the FIFO drain
+// time of the backlog ahead of it (backlog over drain rate: its queue lag, engine::NodeSample::
+// queue_lag_s) and the room in messages is the room in seconds of draining.
 Graph::Result Graph::connect_consumer(std::size_t pool) {
   auto& resolved = nodes_[pool];
   const auto& spec = resolved.spec;

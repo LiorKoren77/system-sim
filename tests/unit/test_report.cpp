@@ -391,6 +391,35 @@ TEST_CASE("explain prints the nodes of a loop of gain >= 1 as unbounded, not as 
   REQUIRE_FALSE(text.contains("e+30"));
 }
 
+// A bandwidth link out of such a loop carries what its sender sends, which has no figure either
+// (review of plan 2c Task 8, minor 1: its line printed "8.988e+307 MB/s"). a sends b `job`s of
+// 1 MB over 1 GB/s; the line says unbounded, as the nodes' do.
+TEST_CASE("explain prints a bandwidth link fed by a loop of gain >= 1 as unbounded", "[report]") {
+  auto s = loop(2.0);
+  s.nodes[1].ops.at("msg").front().size = simsys::Bytes{1e6};
+  s.links[1].bandwidth = simsys::ByteRate{1e9};
+  const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(s));
+  CAPTURE(text);
+  REQUIRE(check_line(text, "a->b")
+              .ends_with("peak offered unbounded vs 1k MB/s  (no steady state, red)"));
+  REQUIRE_FALSE(text.contains("e+30"));
+}
+
+// A loop of gain 0.9999 has a fixed point, a = 100 / (1 - 0.9999) = 1M/s, but the passes reach it
+// only after about log(1e-12) / log(0.9999) = 276,000 laps, beyond the 100,000-pass cap. Its
+// increments still shrink by 0.9999 a pass, so the paper load sums the rest of the geometric
+// series instead of calling the loop unbounded (review of plan 2c Task 8, minor 2): a is offered
+// 1M/s, b 0.9999 x that, and no "no steady state" note.
+TEST_CASE("explain sums a slowly converging loop to its fixed point rather than call it unbounded",
+          "[report]") {
+  const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(loop(0.9999)));
+  CAPTURE(text);
+  REQUIRE(check_line(text, "a").contains("peak offered 1M/s vs 10k/s total capacity"));
+  REQUIRE(check_line(text, "b").contains("peak offered 999.9k/s vs 10k/s total capacity"));
+  REQUIRE_FALSE(text.contains("unbounded"));
+  REQUIRE_FALSE(text.contains("no steady state"));
+}
+
 TEST_CASE("explain summarises the client's curve and checks the peak offered load", "[report]") {
   // A daily sine around 1k/s peaking at noon offers 1.5k/s at 12:00: a service of 1.2k/s
   // looks fine at t = 0 (500/s, midnight's trough) and is overloaded at the peak, which is
@@ -2036,9 +2065,11 @@ TEST_CASE("a node behind a notification fan-out and a queue and pool is marked b
 //
 // Picture: u publishes 1000/s to the queue q, one group w of 12 workers at 10 ms (exactly 1200
 // jobs/s). For the first 200 s u bursts to 1500/s, so w falls behind by 300 messages a second:
-// after the burst's 200 s there are 60,000 waiting, and the oldest of them waits for all the
-// others to drain, 60,000 / 1200 = 50 s: the peak lag. Afterwards w drains 200 a second faster
-// than the inflow, so the lag falls (40,000 / 1200 = 33.3 s at t = 300 s).
+// after the burst's 200 s there are 60,000 waiting, and a message published then waits for all of
+// them to drain, 60,000 / 1200 = 50 s: the peak lag (the oldest unread message reaches that age
+// one lag later, at 250 s; the SLO bounds the wait of every message published after warmup).
+// Afterwards w drains 200 a second faster than the inflow, so the lag falls (40,000 / 1200 = 33.3 s
+// at t = 300 s).
 
 namespace {
 // Adds a publisher u<tag> (1000/s of `publish`, 1500/s for the first 200 s when `bursting`), its
@@ -2217,6 +2248,30 @@ TEST_CASE("the node table has a peak_lag column holding the queue's peak lag", "
   const auto at = static_cast<std::size_t>(column - header.begin());
   REQUIRE(queue_row.size() > at);
   REQUIRE(queue_row[at] == "50s");
+}
+
+// A group that is almost never busy waits a vanishing time: 1 message/s into the 12 workers of
+// 1200 jobs/s is rho 1/1200, and Erlang C's chance that all 12 are busy is about 1e-33, so the lag
+// is a tiny fraction of a nanosecond. The node table and the SLO line print it as "<1us" rather
+// than such a figure (review of plan 2c Task 8, minor 6: youtube's completion_q printed
+// "0.0632ns"); the summary, the JSON and the CSV keep the number.
+TEST_CASE("a queue lag below a microsecond prints as under one microsecond", "[report]") {
+  Scenario s{.name = "quiet", .version = 1, .duration = 10s};
+  add_lane(s, "", false);
+  s.nodes[0].workload->curve.base = Rate{1};
+  s.slos = {queue_lag_slo("q", 1s)};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  const auto lag = node_summary(summary.nodes(), "q").peak_queue_lag_s;
+  REQUIRE(lag.has_value());
+  REQUIRE(*lag > 0.0);
+  REQUIRE(*lag < 1e-9);
+  const auto results = simsys::report::evaluate_slos(summary, s.slos);
+  const auto table = simsys::report::render_table(summary, results, false);
+  CAPTURE(table);
+  REQUIRE(words_of_line_starting(table, "q").back() == "<1us");
+  const auto slo_line = words_of_line_starting(table, "PASS");
+  REQUIRE(std::ranges::contains(slo_line, std::string{"<1us"}));
 }
 
 TEST_CASE("the JSON nodes carry peak_queue_lag_s: the queue's peak, null on every other node",

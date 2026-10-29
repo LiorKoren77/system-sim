@@ -2772,6 +2772,24 @@ TEST_CASE("an upload a service sends on as a sized put pays the client's wire as
                WithinRel(response_to(same_op, "upload").response.mean_s, 1e-12));
 }
 
+// Only the body itself, relabelled, makes the client's hop a write (review of plan 2c Task 8,
+// I-2): a step of another size is a new request. The same 10 MB uploads, but the service writes a
+// 1 KB `put_meta` (the object's metadata) to a store that lists `put_meta`: the store writes 1 KB,
+// not the client's 10 MB, so the client's hop stays a read on the wire, answered at its first
+// megabyte: 26.67 + 8 = 34.67 ms, not the 106.67 ms of a forwarded body. (Before the fix any
+// sized rename counted as forwarding the body, 72 ms too much.)
+TEST_CASE("an upload whose service writes a 1 KB put_meta stays a read on the client's wire",
+          "[theory]") {
+  auto s = upload_relayed_as("put_meta");
+  s.nodes[1].ops.at("upload").front().size = simsys::Bytes{1e3};
+  const auto g = *Graph::build(s);
+  REQUIRE(g.links()[0].write_ops.empty());
+  const auto r = first_step(g);
+  const double wait = 0.5 * simsys::queueing::mmc_wait(1, 0.4, 0.080).mean_s;  // 26.67 ms
+  REQUIRE_THAT(only_link(r).latency.mean_s, WithinRel(wait + 0.008, 1e-9));
+  REQUIRE_THAT(only_link(r).latency.mean_s, WithinAbs(0.034667, 1e-6));
+}
+
 // Two ops of different sizes share one pipe: 20/s of `get` (1 MB, 8 ms, a read) and 20/s of `write`
 // (4 MB, 32 ms, a write at b) are 20 + 80 = 100 MB/s, rho 0.8 again, but the objects are NOT
 // alike. With p = 1/2 each:
@@ -3162,10 +3180,11 @@ TEST_CASE("the engine runs a worker pool that has then steps", "[theory]") {
 //
 // A pool of 12 workers at 10 ms is exactly 1200 jobs/s. The client publishes 1000/s with a spike
 // of x1.5 for the first 200 s: 1500/s, so the pool's backlog grows by 1500 - 1200 = 300 messages
-// a second to 200 s x 300 = 60,000 messages (Little's law: the oldest message waits 60,000 / 1200
-// = 50 s). The default 7-day retention keeps all of them (a room of 725.76 million). Then the
-// inflow falls to 1000/s and the pool drains the backlog at 1200 - 1000 = 200/s: empty after
-// 60,000 / 200 = 300 s more, at t = 500 s. Steps of 100 ms: record i ends at t = (i + 1) x 0.1 s.
+// a second to 200 s x 300 = 60,000 messages (the FIFO drain time: a message published at 200 s
+// waits 60,000 / 1200 = 50 s for the ones ahead of it). The default 7-day retention keeps all of
+// them (a room of 725.76 million). Then the inflow falls to 1000/s and the pool drains the backlog
+// at 1200 - 1000 = 200/s: empty after 60,000 / 200 = 300 s more, at t = 500 s. Steps of 100 ms:
+// record i ends at t = (i + 1) x 0.1 s.
 
 namespace {
 Scenario burst_then_calm() {
@@ -3609,11 +3628,12 @@ TEST_CASE("an on-miss then step on a worker pool is refused", "[theory]") {
 
 // ---- Queue lag: how far a message queue trails its consumers (plan 2c refinement 4, Task 8) ----
 //
-// A message queue's lag is the wait of the message a consumer group would read next: the queue's
-// own broker never waits (it appends at 1M/s), the messages wait in each group's pool, so the lag
-// is read off the pool. For one group,
-//   lag = max(backlog / drain, k x Wq)
-//   backlog / drain  the FIFO drain time: the oldest waiting message is served after everything
+// A message queue's lag is how long a message published now waits until its consumer group reads
+// it (Kafka's records-lag divided by the group's consume rate): the queue's own broker never waits
+// (it appends at 1M/s), the messages wait in each group's pool, so the lag is read off the pool.
+// For one group,
+//   lag = max(backlog / drain, k x Wq)            (the max of the two: our heuristic, FluidQueue)
+//   backlog / drain  the FIFO drain time: a message published now is served after everything
 //                    ahead of it, which the pool drains at `drain` a second (the "fluid" part,
 //                    exact when the pool is saturated, since then drain = capacity);
 //   k x Wq           the stochastic part: Allen-Cunneen's scaling k of the M/M/c wait Wq (Erlang
