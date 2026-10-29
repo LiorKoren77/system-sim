@@ -92,6 +92,12 @@ inline constexpr double byte_unit = 1e6;
 //   burstiness      = 1                      Poisson arrivals, as everywhere by default
 // The zone thresholds are the generic 70 % / 90 %. A link has no `advanced` block: these are
 // the pipe's numbers whatever the scenario.
+// Ignored: TCP's slow start and congestion window (a new connection does not get the whole
+// bandwidth at once), packet loss and retransmission, protocol headers (the stated size is all
+// that crosses), the propagation delay growing with load (the link's one-way latency stays
+// fixed), the true direction of each byte (every request is charged its whole size in the
+// direction its demand travels, and a reply adds none: engine::Simulation::pass_through_pipe), and
+// a router buffer's real size (the 1000 MB room is the model's).
 [[nodiscard]] constexpr fluid::Capacity pipe_capacity(ByteRate bandwidth) {
   const double megabytes_per_s = bandwidth.bytes_per_second / byte_unit;
   return fluid::Capacity{.service_rate = Rate{megabytes_per_s},

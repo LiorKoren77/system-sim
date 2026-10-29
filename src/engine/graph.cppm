@@ -330,9 +330,14 @@ struct ResolvedLink {
   return link.dir == model::Direction::in ? link.to : link.from;
 }
 
-// "a->b": a link as the scenario writes it, from and to, the name its pipe's rows carry in the
-// reports (plan 2c Task 5) and its errors quote ("link 'a'->'b' has a bandwidth, ...").
-[[nodiscard]] std::string link_label(std::span<const ResolvedNode> nodes, const ResolvedLink& link);
+// "a->b": a link as the scenario writes it, `from` then `to`, the name its pipe's rows carry in
+// the reports (plan 2c Task 5); with `quote` "'", "'a'->'b'", the form its errors quote ("link
+// 'a'->'b' has a bandwidth, ..."). Always the scenario's `from` and `to`, also for a link written
+// from the receiver's side (`dir: in`): `{from: a, to: b, dir: in}` is named `a->b` although its
+// demand, and so its pipe's megabytes, travel from b to a, so a reader finds the row under the
+// link as the file writes it.
+[[nodiscard]] std::string link_label(std::span<const ResolvedNode> nodes, const ResolvedLink& link,
+                                     std::string_view quote = "");
 
 // Where a splitter (a client, a load balancer or a rate limiter) sends flow and which share
 // goes there. A client's route is per op: `op` names it and `share` is that op's fraction on
@@ -1769,13 +1774,6 @@ struct SizeWalk {
   return arrivals.front().size;
 }
 
-// "link 'svc'->'store'": a link as the scenario writes it (link_label), quoted, for a pipe's
-// errors.
-[[nodiscard]] std::string quoted_link(std::span<const ResolvedNode> nodes,
-                                      const ResolvedLink& link) {
-  return "link '" + nodes[link.from].spec.id + "'->'" + nodes[link.to].spec.id + "'";
-}
-
 // A pipe's error for the first request (its arrivals sorted by op, then origin) it cannot price in
 // megabytes (plan 2c refinement 1: an unsized op on a bandwidth link is refused like one at a
 // byte-sized node): an unsized one, naming the client or step that set or dropped its size and
@@ -1785,12 +1783,13 @@ struct SizeWalk {
                                                           const ResolvedLink& link,
                                                           std::span<const SizeArrival> arrivals) {
   if (!link.pipe) return std::nullopt;
-  const std::string name = quoted_link(nodes, link) + " has a bandwidth, but ";
+  const std::string name = "link " + link_label(nodes, link, "'") + " has a bandwidth, but ";
   for (const SizeArrival& arrival : arrivals) {
     const std::string& origin = nodes[arrival.origin].spec.id;
     if (!arrival.size && is_limiter_counter(nodes, demand_receiver(link), arrival)) {
       return EngineError{name + "'" + origin +
-                         "' sends its counter over it: a limiter's counter carries no size"};
+                         "' sends its counter over it: a limiter's counter carries no size, so its "
+                         "backend link cannot have a bandwidth; remove it"};
     }
     if (!arrival.size) {
       return EngineError{name + "op '" + arrival.op + "' from '" + origin +
@@ -2177,8 +2176,10 @@ bool Graph::is_async_hop(std::size_t from, std::string_view op, std::size_t to,
                                     AsyncHop{from, std::string{op}, to, std::string{target_op}});
 }
 
-std::string link_label(std::span<const ResolvedNode> nodes, const ResolvedLink& link) {
-  return nodes[link.from].spec.id + "->" + nodes[link.to].spec.id;
+std::string link_label(std::span<const ResolvedNode> nodes, const ResolvedLink& link,
+                       std::string_view quote) {
+  const std::string q{quote};
+  return q + nodes[link.from].spec.id + q + "->" + q + nodes[link.to].spec.id + q;
 }
 
 std::optional<std::size_t> Graph::demand_link(std::size_t from, std::size_t to) const {

@@ -2544,23 +2544,30 @@ TEST_CASE("a ticket server with the algorithm's default capacity saturates at 1k
 // excess like a node"): ONE server (c = 1) whose unit is 1 MB, served in 1 MB / bandwidth. At
 // 1 Gbit/s = 125 MB/s that is 8 ms per MB, deterministic (service SCV 0 per object; the SCV of
 // the size mix when several ops share the pipe, as at a byte-sized node), with a waiting room of
-// 1000 MB (the generic queue_limit default read in megabytes) beyond which it drops. Both
-// directions share the one pipe (an upper bound on contention: the response's bytes are not
-// modelled and the pipe is fed by the requests only).
+// 1000 MB (the generic queue_limit default read in megabytes) beyond which it drops. The pipe is
+// fed by the DEMAND that crosses the link: each request is charged its whole stated size in the
+// direction it is sent, whichever way its bytes really travel, and a reply adds no bytes (so an
+// `inout` link is one pipe, and `a->b` and `b->a` with a bandwidth each are two).
 //
-// What a hop over the pipe adds to the round trip, once (decision superseding the plan's "one
-// megabyte's serialisation"): the pipe's WAIT plus the WHOLE request's serialisation, size x
-// 1 MB / bandwidth, because the receiver cannot act before the last byte has arrived. For a 1 MB
-// request that is the plan's 8 ms. The pipe's losses multiply the hop's delivered fraction.
+// What a hop over the pipe adds to the round trip, once (review of Task 5, I-2): the pipe's WAIT
+// plus the request's answer time on the wire, by refinement 2's rule for the node behind it:
+//  - a WRITE (an op in the receiver's write_ops; a service's is `write`) its WHOLE serialisation,
+//    size x 1 MB / bandwidth: the receiver acts after the last byte;
+//  - any other op its FIRST megabyte, min(size, 1 MB) x 1 MB / bandwidth: the rest streams in
+//    while the receiver answers at its first megabyte.
+// For a 1 MB request both are 8 ms. The pipe's queue waits for whole requests either way (each
+// holds the one server for its whole serialisation). The pipe's losses multiply the hop's
+// delivered fraction.
 //
 // Interfaces these tests propose (the implementer may adjust the shape, not the numbers):
 //  - `engine::StepRecord::links`: a std::vector<engine::LinkSample>, ONE entry per link that has
 //    a bandwidth, in Graph::links() order (empty for a graph without any bandwidth);
 //  - `engine::LinkSample{demand_per_s, drain_per_s, dropped_per_s, backlog, rho, latency, zone}`,
 //    as NodeSample's fields of those names, in MEGABYTES (per second for the rates); `latency` is
-//    the request-weighted mean of what a request waits in the pipe plus its own serialisation.
+//    the request-weighted mean of what a request waits in the pipe plus its answer time on the
+//    wire (above).
 //
-// Every number below is derived on paper from one picture: client `a` sends `put`s of 1 MB at
+// Every number below is derived on paper from one picture: client `a` sends `get`s of 1 MB at
 // 100/s to service `b` (capacity 1M/s, 1 ms: no queue of its own) over a one-way 250 us link of
 // 1 Gbit/s:
 //   demand      = 100/s x 1 MB = 100 MB/s;  capacity = 125 MB/s (1e9 bit/s / 8 bit per byte)
@@ -2576,8 +2583,8 @@ TEST_CASE("a ticket server with the algorithm's default capacity saturates at 1k
 namespace {
 constexpr simsys::ByteRate one_gbit{125e6};  // 1 Gbit/s = 1e9 / 8 bytes per second
 
-// a(`rate`/s of `put`, each `size` long) -> b (1M/s, 1 ms) over a 250 us link with the given
-// bandwidth, in the given direction. Node indices: a 0, b 1. Steps of 100 ms (the default).
+// a(`rate`/s of `get`, each `size` long: a read at b) -> b (1M/s, 1 ms) over a 250 us link with the
+// given bandwidth, in the given direction. Node indices: a 0, b 1. Steps of 100 ms (the default).
 Scenario pipe_over(double rate, simsys::Bytes size,
                    std::optional<simsys::ByteRate> bandwidth = one_gbit,
                    Direction dir = Direction::out) {
@@ -2585,8 +2592,8 @@ Scenario pipe_over(double rate, simsys::Bytes size,
   s.nodes = {NodeSpec{.id = "a",
                       .type = NodeType::client,
                       .workload = Workload{.curve = {.base = Rate{rate}},
-                                           .op_shares = {{"put", 1.0}},
-                                           .sizes = {{"put", size}}}},
+                                           .op_shares = {{"get", 1.0}},
+                                           .sizes = {{"get", size}}}},
              NodeSpec{.id = "b", .type = NodeType::service, .capacity = Rate{1e6}, .latency = 1ms}};
   s.links = {
       LinkSpec{.from = "a", .to = "b", .dir = dir, .latency = 250us, .bandwidth = bandwidth}};
@@ -2613,7 +2620,7 @@ constexpr double step_s = 0.1;         // the scenario's step in seconds
 constexpr double pipe_mb_per_s = 125;  // 1 Gbit/s in megabytes per second
 }  // namespace
 
-TEST_CASE("1 MB puts at 100 per second over 1 Gbit/s run the pipe at rho 0.8 and wait 16 ms",
+TEST_CASE("1 MB gets at 100 per second over 1 Gbit/s run the pipe at rho 0.8 and wait 16 ms",
           "[theory]") {
   const auto g = *Graph::build(pipe_over(100, simsys::Bytes{1e6}));
   const auto r = first_step(g);
@@ -2650,11 +2657,13 @@ TEST_CASE("the pipe adds its 24 ms sojourn once to the round trip beside the lin
 
 // A 10 MB request at 10/s fills the pipe as much as 1 MB at 100/s (100 MB/s, rho 0.8 again) but
 // holds it ten times longer: s_obj = 10 x 8 ms = 80 ms, one whole object at a time.
-//   Wq (M/D/1) = 0.5 x 0.8 / 0.2 x 80 ms = 160 ms    (= 10 x (80 ms)^2 / 0.4 by
-//   Pollaczek-Khinchine) sojourn    = Wq + the WHOLE request's serialisation = 160 ms + 80 ms = 240
-//   ms
-// (the receiver cannot act before the last byte; not the 168 ms of one megabyte's time).
-TEST_CASE("a 10 MB request waits 160 ms and is serialised for 80 ms: a 240 ms hop", "[theory]") {
+//   Wq (M/D/1) = 0.5 x 0.8 / 0.2 x 80 ms = 160 ms     (= 10 x (80 ms)^2 / 0.4 by
+//                                                     Pollaczek-Khinchine)
+// What the hop adds after that wait depends on what b does with the request:
+//   a read  (`get`)   = 160 ms + its first megabyte, 8 ms = 168 ms: b answers at its first MB
+//                       while the other 9 MB stream in behind it;
+//   a write (`write`) = 160 ms + the WHOLE request, 80 ms = 240 ms: b acts after the last byte.
+TEST_CASE("a 10 MB read waits 160 ms and its first megabyte takes 8 ms: a 168 ms hop", "[theory]") {
   const auto g = *Graph::build(pipe_over(10, simsys::Bytes{10e6}));
   const auto r = first_step(g);
   const auto& pipe = only_link(r);
@@ -2662,30 +2671,45 @@ TEST_CASE("a 10 MB request waits 160 ms and is serialised for 80 ms: a 240 ms ho
   REQUIRE_THAT(pipe.rho, WithinRel(0.8, 1e-12));
   const double wait = 0.5 * simsys::queueing::mmc_wait(1, 0.8, 0.080).mean_s;
   REQUIRE_THAT(wait, WithinAbs(0.160, 1e-12));
-  REQUIRE_THAT(pipe.latency.mean_s, WithinRel(wait + 0.080, 1e-9));
-  REQUIRE_THAT(pipe.latency.mean_s, WithinAbs(0.240, 1e-9));
+  REQUIRE_THAT(pipe.latency.mean_s, WithinRel(wait + 0.008, 1e-9));
+  REQUIRE_THAT(pipe.latency.mean_s, WithinAbs(0.168, 1e-9));
   const double b_sojourn = r.nodes[1].latency.mean_s;
   REQUIRE_THAT(r.nodes[1].demand_per_s, WithinRel(10.0, 1e-12));  // b counts requests
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(0.0005 + 0.168 + b_sojourn, 1e-9));
+}
+
+TEST_CASE("a 10 MB write waits 160 ms and is serialised whole for 80 ms: a 240 ms hop",
+          "[theory]") {
+  auto s = pipe_over(10, simsys::Bytes{10e6});
+  s.nodes[0].workload->op_shares = {{"write", 1.0}};
+  s.nodes[0].workload->sizes = {{"write", simsys::Bytes{10e6}}};
+  const auto g = *Graph::build(s);
+  const auto r = first_step(g);
+  const auto& pipe = only_link(r);
+  REQUIRE_THAT(pipe.rho, WithinRel(0.8, 1e-12));  // the same queue as the read's
+  REQUIRE_THAT(pipe.latency.mean_s, WithinAbs(0.240, 1e-9));
+  const double b_sojourn = r.nodes[1].latency.mean_s;
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(0.0005 + 0.240 + b_sojourn, 1e-9));
 }
 
-// Two ops of different sizes share one pipe: 20/s of `small` (1 MB, 8 ms) and 20/s of `large`
-// (4 MB, 32 ms) are 20 + 80 = 100 MB/s, rho 0.8 again, but the objects are NOT alike. With
-// p = 1/2 each:
+// Two ops of different sizes share one pipe: 20/s of `get` (1 MB, 8 ms, a read) and 20/s of `write`
+// (4 MB, 32 ms, a write at b) are 20 + 80 = 100 MB/s, rho 0.8 again, but the objects are NOT
+// alike. With p = 1/2 each:
 //   E[S]   = 0.5 x 8 ms + 0.5 x 32 ms = 20 ms
 //   E[S^2] = 0.5 x (8 ms)^2 + 0.5 x (32 ms)^2 = 544e-6 s^2     (each object's own SCV is 0)
 //   c_s^2  = E[S^2] / E[S]^2 - 1 = 544e-6 / 400e-6 - 1 = 0.36  (the mixture's SCV)
 //   Wq     = (1 + 0.36) / 2 x rho / (1 - rho) x E[S] = 0.68 x 4 x 20 ms = 54.4 ms
 //            = lambda E[S^2] / (2 (1 - rho)) = 40 x 544e-6 / 0.4  (Pollaczek-Khinchine, exact for
 //            one server): more than the 16 ms of 1 MB alone at the same rho. Both ops wait the
-//            same Wq in the one queue, then each is serialised for its own size:
-//   small  = 0.5 ms + 54.4 ms + 8 ms + b;   large = 0.5 ms + 54.4 ms + 32 ms + b
+//            same Wq in the one queue; the read is then answered at its first (and only)
+//            megabyte, the write after its whole 4 MB:
+//   get    = 0.5 ms + 54.4 ms + 8 ms + b;   write = 0.5 ms + 54.4 ms + 32 ms + b
 // and the pipe's own latency is the request-weighted mean, 54.4 + 0.5 x 8 + 0.5 x 32 = 74.4 ms.
 TEST_CASE("two sizes on one pipe wait 54.4 ms, more than one size at the same rho: the mixture",
           "[theory]") {
   auto s = pipe_over(40, simsys::Bytes{1e6});
-  s.nodes[0].workload->op_shares = {{"large", 0.5}, {"small", 0.5}};
-  s.nodes[0].workload->sizes = {{"small", simsys::Bytes{1e6}}, {"large", simsys::Bytes{4e6}}};
+  s.nodes[0].workload->op_shares = {{"get", 0.5}, {"write", 0.5}};
+  s.nodes[0].workload->sizes = {{"get", simsys::Bytes{1e6}}, {"write", simsys::Bytes{4e6}}};
   const auto g = *Graph::build(s);
   const auto r = first_step(g);
   const auto& pipe = only_link(r);
@@ -2701,9 +2725,9 @@ TEST_CASE("two sizes on one pipe wait 54.4 ms, more than one size at the same rh
   REQUIRE_THAT(40.0 * second_moment / (2.0 * (1.0 - 0.8)), WithinAbs(0.0544, 1e-12));  // P-K
   REQUIRE_THAT(pipe.latency.mean_s, WithinAbs(0.0544 + 0.020, 1e-9));
   const double b_sojourn = r.nodes[1].latency.mean_s;
-  REQUIRE_THAT(response_to(r, "small").response.mean_s,
+  REQUIRE_THAT(response_to(r, "get").response.mean_s,
                WithinRel(0.0005 + 0.0544 + 0.008 + b_sojourn, 1e-9));
-  REQUIRE_THAT(response_to(r, "large").response.mean_s,
+  REQUIRE_THAT(response_to(r, "write").response.mean_s,
                WithinRel(0.0005 + 0.0544 + 0.032 + b_sojourn, 1e-9));
   // The same 100 MB/s as one size waits 16 ms: the spread of sizes is what lengthens the wait.
   const auto alone = first_step(*Graph::build(pipe_over(100, simsys::Bytes{1e6})));
@@ -2857,10 +2881,11 @@ TEST_CASE("estimate and run agree on the pipe, below capacity and above it", "[t
   }
 }
 
-// Both directions share the one pipe, and only the requests feed it (the response's bytes are
-// not modelled): an `inout` link is the same pipe, not two, and not a doubled load.
-TEST_CASE("an inout link has the same one pipe as an out link: its load is not doubled",
-          "[theory]") {
+// The pipe is fed by the requests alone, each charged its stated size in the direction it is
+// sent: a reply adds no bytes, so an `inout` link (requests out, replies back on the same link) is
+// ONE pipe with the same load as an `out` link, not two and not a doubled load. (Two links `a->b`
+// and `b->a` that each state a bandwidth are two pipes, each fed by its own direction's demand.)
+TEST_CASE("an inout link is one pipe fed by its requests alone: replies add no bytes", "[theory]") {
   const auto out = first_step(*Graph::build(pipe_over(100, simsys::Bytes{1e6})));
   const auto both =
       first_step(*Graph::build(pipe_over(100, simsys::Bytes{1e6}, one_gbit, Direction::inout)));

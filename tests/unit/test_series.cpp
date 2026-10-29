@@ -994,7 +994,10 @@ TEST_CASE("the JSON has an empty links array when no link has a bandwidth", "[se
 // minutes and its node series and op series hashed (64-bit FNV-1a over the bytes of each file);
 // the hashes were taken from the output at 0097309, the commit before the pipe, with the same
 // seed. A pipe's code path that leaks into a link without one changes a number, a row or a
-// delay-line slot, and with it the hash.
+// delay-line slot, and with it the hash. It guards Task 5 (and every later change to the pipe)
+// against touching plain links; a later task that changes `chain`'s numbers ON PURPOSE (a new
+// default, a model change that reaches services or databases) re-pins both hashes in the same
+// commit and says why.
 namespace {
 std::uint64_t fnv1a(const std::string& text) {
   std::uint64_t hash = 0xcbf29ce484222325ULL;  // the 64-bit FNV offset basis

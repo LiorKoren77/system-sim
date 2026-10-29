@@ -66,11 +66,12 @@ struct NodeSummary {
 
 // One bandwidth link's pipe over the observed part of a run (plan 2c Task 5;
 // engine::LinkSample), in MEGABYTES (per second for the rates). `name` is the link as written,
-// `from->to` (graph::link_label), how every report names its row. The node table's columns
-// (`queue`: its id is the name, and a pipe never rejects nor goes unavailable) and, for JSON, the
-// time-averaged rates and backlog of the pipe, its mean latency (a request's wait plus its whole
-// serialisation, weighted by the megabytes offered in each step; by time when none were) and the
-// worst zone of any observed step.
+// `from->to` (graph::link_label), how every report names its row, also for a `dir: in` link,
+// whose demand travels from `to` to `from`. The node table's columns (`queue`: its id is the name,
+// and a pipe never rejects nor goes unavailable) and, for JSON, the time-averaged rates and
+// backlog of the pipe, its mean latency (a request's wait plus its answer time on the wire, a
+// write's whole serialisation and any other op's first megabyte, weighted by the megabytes offered
+// in each step; by time when none were) and the worst zone of any observed step.
 struct LinkSummary {
   NodeSummary queue{};
   double demand_per_s{};

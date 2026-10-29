@@ -1032,22 +1032,30 @@ class SqlDbBehaviour {
 // Each object's time is deterministic by default (cs² = 0, defaults::default_service_variability:
 // a fixed size at a fixed rate), so the spread the queue sees is the size mix's.
 // A CDN takes no writes (graph::Graph::build refuses them), so all its answers are first
-// megabytes. A bandwidth link's pipe times its requests with this class too, every one at its
-// last byte (serialising).
+// megabytes. A bandwidth link's pipe times its requests with this class too (serialising): a
+// write at its last byte, any other op at its first megabyte.
 class MegabyteService {
  public:
   MegabyteService(const graph::Graph& g, std::size_t self);
 
   // A bandwidth link's pipe (plan 2c refinement 3, engine::Simulation::pass_through_pipe): one
-  // megabyte takes `megabyte_s` (1 MB / bandwidth), a request of op o is `megabytes_by_op[o]` long
-  // and is timed at its LAST byte, MB_o × s_MB, both as the object time the pipe's queue waits for
-  // and as its answer: the receiver cannot act on a request before all of it has arrived. No floor
-  // of one megabyte (a store's unit of service; a link serialises bytes) and no per-object spread
-  // (cs² = 0: a fixed size at a fixed rate).
+  // megabyte takes `megabyte_s` (1 MB / bandwidth) and a request of op o is `megabytes_by_op[o]`
+  // long. The pipe's queue waits for whole requests (object time MB_o × s_MB: a request holds the
+  // one server for its whole serialisation); the hop's answer (review of plan 2c Task 5, I-2)
+  // follows refinement 2's rule for the node behind it:
+  //   a write (an op in the receiver's `write_ops`, model::write_ops_of)   MB_o × s_MB
+  //        the receiver acts after the LAST byte (a PUT is stored once all of it arrived);
+  //   any other op                                                        min(MB_o, 1) × s_MB
+  //        the receiver answers at its first megabyte while the rest streams in behind it.
+  // For a streamed PUT into a blob store the wire's and the disk's whole-object times then add in
+  // series (an upper bound: real pipelining overlaps them). No floor of one megabyte (a store's
+  // unit of service; a link serialises bytes, so a 2 KB read is on the wire 16 µs at 1 Gbit/s)
+  // and no per-object spread (cs² = 0: a fixed size at a fixed rate).
   // Pattern: Static factory (named constructor) — the same timing, built from a link's numbers
   // rather than a node's, under a name that says so.
   [[nodiscard]] static MegabyteService serialising(
-      double megabyte_s, const std::map<std::string, double, std::less<>>& megabytes_by_op);
+      double megabyte_s, const std::map<std::string, double, std::less<>>& megabytes_by_op,
+      std::span<const std::string> write_ops);
 
   // The moments of the object time over this step's arrivals `requests` (requests per second per
   // op), a mixture whose branch o is taken with probability p_o = rate_o / Σ rate and lasts
@@ -1836,13 +1844,17 @@ MegabyteService::MegabyteService(const graph::Graph& g, std::size_t self)
 }
 
 MegabyteService MegabyteService::serialising(
-    double megabyte_s, const std::map<std::string, double, std::less<>>& megabytes_by_op) {
+    double megabyte_s, const std::map<std::string, double, std::less<>>& megabytes_by_op,
+    std::span<const std::string> write_ops) {
   MegabyteService pipe;
   pipe.megabyte_s_ = megabyte_s;
   pipe.service_variability_ = 0.0;
   for (const auto& [op, megabytes] : megabytes_by_op) {
     const double last_byte_s = megabytes * megabyte_s;
-    pipe.times_by_op_.emplace(op, Times{.object_s = last_byte_s, .answer_s = last_byte_s});
+    const double first_megabyte_s = std::min(megabytes, 1.0) * megabyte_s;
+    const bool write = std::ranges::contains(write_ops, op);
+    pipe.times_by_op_.emplace(
+        op, Times{.object_s = last_byte_s, .answer_s = write ? last_byte_s : first_megabyte_s});
   }
   return pipe;
 }

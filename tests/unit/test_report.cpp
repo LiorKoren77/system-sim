@@ -1643,7 +1643,9 @@ TEST_CASE("a scenario without a bandwidth has no link rows in its table", "[repo
 // A pipe above its capacity fills its 1000 MB room and drops: 1000 puts/s of 1 MB offer 1000 MB/s
 // to a 125 MB/s pipe, whose backlog grows by 875 x 0.1 s = 87.5 MB per step and overflows in the
 // 12th step (1.1 s), inside the observed part of a 5 s run. The row shows a saturated pipe (rho 1),
-// a backlog and dropped megabytes, in the node table's columns.
+// a backlog and dropped megabytes, in the node table's columns; and since a pipe's losses fail
+// requests as a node's drops do, the header's worst drop rate names the pipe (b, at 1M/s, drops
+// nothing).
 TEST_CASE("a pipe that overflows shows its dropped megabytes in its row and the header",
           "[report]") {
   auto s = piped(1000, simsys::ByteRate{125e6});
@@ -1656,6 +1658,9 @@ TEST_CASE("a pipe that overflows shows its dropped megabytes in its row and the 
   REQUIRE(row[1] == "1");  // mean_rho: the pipe is saturated, 125 MB/s drained of 125
   REQUIRE(row[3] != "0");  // peak_backlog: the room filled
   REQUIRE(row[4] != "0");  // dropped
+  const auto header = text.substr(0, text.find('\n'));
+  REQUIRE(header.contains("drop rate "));
+  REQUIRE(header.contains("(worst: a->b)"));
 }
 
 TEST_CASE("explain prints a link's bandwidth in bits with the bytes after it", "[report]") {
@@ -1668,6 +1673,17 @@ TEST_CASE("explain prints a link's bandwidth in bits with the bytes after it", "
     const auto text = explain_of(piped(100, simsys::ByteRate{5e9}));
     CAPTURE(text);
     REQUIRE(text.contains("bandwidth=40Gbit/s (5GB/s)"));
+  }
+  SECTION("1.5 Gbit/s has no whole number of Gbit/s, so it is written in Mbit/s") {
+    const auto text = explain_of(piped(100, simsys::ByteRate{187.5e6}));
+    CAPTURE(text);
+    REQUIRE(text.contains("bandwidth=1500Mbit/s (187.5MB/s)"));
+  }
+  SECTION("a rate no bit prefix writes whole is given in bytes alone") {
+    const auto text = explain_of(piped(100, simsys::ByteRate{1000.5}));  // 8004 bit/s
+    CAPTURE(text);
+    REQUIRE(text.contains("bandwidth=1.0005KB/s"));
+    REQUIRE_FALSE(text.contains("bit/s"));
   }
   SECTION("no bandwidth, nothing said") {
     const auto text = explain_of(piped(100, std::nullopt));
