@@ -5,19 +5,25 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>  // getpid
 
 #include "../support/explain_lines.hpp"
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
+import simsys.config;
 import simsys.core;
 import simsys.engine;
 import simsys.graph;
@@ -2518,4 +2524,139 @@ TEST_CASE("the op table's p99 is the timeout, 200ms, not the 490ms the uncapped 
   const auto row = words_of_line_starting(table, "c.op");
   REQUIRE(row.size() == 6);
   REQUIRE(row.back() == "200ms");
+}
+
+// ---- SLOs per window: what the report prints (plan 2c Task 14) ----
+//
+// An SLO with `over: <duration>` is checked on every window of that length, aligned from the end
+// of warmup, and the worst window decides (test_windows.cpp derives the numbers). The report must
+// say WHICH window decided, or a failing SLO leaves the reader guessing which hour to look at:
+//   table: the SLO's line ends with `(worst 10m from 00:20)`: the window's length (`over`) and its
+//          start as a clock time of the first day, the form `explain` already prints times in;
+//   JSON:  `"window_start_s": 1200`, the start in seconds from the start of the run (not from
+//          the end of warmup), a key that only an SLO with `over` has (absent, not null, on the
+//          others). Built through the loader, the one way to spell `over` today.
+//
+// The scenario: a client offering 1k/s to a service of 2k/s (rho 0.5) with a 1.8x spike from
+// 00:20 (rho 0.9), step 1 s, as in test_windows.cpp.
+
+namespace {
+Scenario windowed(std::string_view timing, std::string_view rate, std::string_view slos) {
+  const auto path = std::filesystem::temp_directory_path() /
+                    (std::to_string(::getpid()) + "_simsys_report_windows.yaml");
+  std::ofstream(path) << "version: 1\nname: windowed\n"
+                      << timing << "nodes:\n  u: {type: client, rate: " << rate
+                      << ", ops: {get: 1}}\n  s: {type: service, capacity: 2k/s, latency: 1ms}\n"
+                         "links:\n  - {from: u, to: s, dir: inout, latency: 0s}\nslo:\n"
+                      << slos;
+  auto loaded = simsys::config::load(path.string());
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
+  if (!loaded) FAIL(loaded.error().message);
+  return std::move(*loaded);
+}
+
+struct Printed {
+  std::string table;
+  std::string json;
+  std::vector<simsys::report::SloResult> results;
+};
+
+Printed printed(const Scenario& s) {
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  auto results = simsys::report::evaluate_slos(summary, s.slos);
+  return {simsys::report::render_table(summary, results, /*color=*/false),
+          simsys::report::render_json(summary, results), std::move(results)};
+}
+
+// The first line of `text` that contains `needle`.
+std::string line_containing(const std::string& text, std::string_view needle) {
+  std::istringstream lines{text};
+  std::string line;
+  while (std::getline(lines, line)) {
+    if (line.contains(needle)) return line;
+  }
+  FAIL("no line contains " << needle << " in:\n" << text);
+  return {};
+}
+
+constexpr std::string_view the_spike = "{base: 1k/s, spikes: [{at: 00:20, for: 10m, factor: 1.8}]}";
+constexpr std::string_view an_hour = "duration: 1h\nstep: 1s\n";
+}  // namespace
+
+TEST_CASE("the SLO table says which window was the worst: (worst 10m from 00:20)", "[report]") {
+  const auto out = printed(
+      windowed(an_hour, the_spike, "  - {metric: utilization, node: s, max: 0.8, over: 10m}\n"));
+  CAPTURE(out.table);
+  const auto line = line_containing(out.table, "utilization");
+  REQUIRE(line.contains("FAIL"));
+  REQUIRE(line.contains("(worst 10m from 00:20)"));
+}
+
+// 15 m windows: the spike straddles 00:15-00:30 and 00:30-00:45 (see test_windows.cpp); the worst
+// starts at 00:15, which the line names in the same form.
+TEST_CASE("the SLO table names the window's length as written in over and its start as a clock",
+          "[report]") {
+  const auto out = printed(
+      windowed(an_hour, the_spike, "  - {metric: utilization, node: s, max: 0.8, over: 15m}\n"));
+  CAPTURE(out.table);
+  const auto line = line_containing(out.table, "utilization");
+  REQUIRE(line.contains("PASS"));
+  REQUIRE(line.contains("(worst 15m from 00:15)"));
+}
+
+// With 5 m of warmup the windows start at 00:05, 00:15, ...; the worst of a spike over 00:20-00:28
+// is 00:15-00:25. The table and the JSON both count from the START OF THE RUN (00:15, 900 s), the
+// same clock as the spike's `at`, not from the end of warmup (which would say 10 m, 600 s).
+TEST_CASE("the window's start is counted from the start of the run, warmup included", "[report]") {
+  const auto out = printed(windowed("duration: 1h\nstep: 1s\nwarmup: 5m\n",
+                                    "{base: 1k/s, spikes: [{at: 00:20, for: 8m, factor: 1.8}]}",
+                                    "  - {metric: utilization, node: s, max: 0.8, over: 10m}\n"));
+  CAPTURE(out.table, out.json);
+  REQUIRE(line_containing(out.table, "utilization").contains("(worst 10m from 00:15)"));
+  REQUIRE(
+      line_containing(out.json, "\"metric\": \"utilization\"").contains("\"window_start_s\": 900"));
+}
+
+TEST_CASE("the JSON gives an SLO with over its window_start_s, in seconds from the run's start",
+          "[report]") {
+  const auto out = printed(
+      windowed(an_hour, the_spike, "  - {metric: utilization, node: s, max: 0.8, over: 10m}\n"));
+  CAPTURE(out.json);
+  const auto line = line_containing(out.json, "\"metric\": \"utilization\"");
+  REQUIRE(line.contains("\"window_start_s\": 1200"));
+  // The other fields of the entry are the ones every SLO has.
+  REQUIRE(line.contains("\"status\": \"fail\""));
+  REQUIRE(line.contains("\"max\": 0.8"));
+}
+
+// What does not change: an SLO without `over` prints as before, with no window text and no key.
+// This one passes today and must keep passing.
+TEST_CASE("an SLO without over prints no window: no worst text in the table, no key in the JSON",
+          "[report]") {
+  const auto out =
+      printed(windowed(an_hour, the_spike, "  - {metric: utilization, node: s, max: 0.8}\n"));
+  CAPTURE(out.table, out.json);
+  // The whole hour: PASS at (0.5 x 50 + 0.9 x 10) / 60 = 0.5667.
+  REQUIRE(out.results.size() == 1);
+  REQUIRE(out.results[0].status == simsys::report::SloStatus::pass);
+  REQUIRE_THAT(*out.results[0].observed, WithinRel(34.0 / 60.0, 1e-9));
+  REQUIRE_FALSE(line_containing(out.table, "PASS").contains("worst"));
+  REQUIRE_FALSE(
+      line_containing(out.json, "\"metric\": \"utilization\"").contains("window_start_s"));
+}
+
+// An SLO whose every window offered nothing is skipped (test_windows.cpp), and a skipped verdict
+// names no window: the table prints SKIP with the observed `-` and no "worst".
+TEST_CASE("a windowed SLO that was skipped names no window in the table", "[report]") {
+  const auto s = windowed("duration: 10m\nstep: 1s\n", "{points: [[0s, 0/s], [10m, 0/s]]}",
+                          "  - {metric: p99_latency, node: u, max: 50ms, over: 5m}\n");
+  const auto out = printed(s);
+  CAPTURE(out.table);
+  REQUIRE(out.results.size() == 1);
+  REQUIRE(out.results[0].status == simsys::report::SloStatus::skipped);
+  const auto line = line_containing(out.table, "p99_latency");
+  REQUIRE(line.contains("SKIP"));
+  REQUIRE_FALSE(line.contains("worst"));
 }
