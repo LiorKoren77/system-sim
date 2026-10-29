@@ -74,8 +74,9 @@ plus `run --report json` and `sweep` on hello, and `ctest` in both presets (the 
 
 **Files:** create `src/engine/graph.cpp`; modify `src/engine/graph.cppm`, `CMakeLists.txt`.
 
-- [ ] Tests: none new. Acceptance as Task 1; measure and record the rebuild time of `engine.cppm` after a one-line change in a `Graph` member body before and after (the point of the move), and the BMI size of `simsys.graph`.
-- [ ] Commit `graph: declarations in the interface, definitions in graph.cpp`.
+- [x] Tests: none new. Acceptance as Task 1; measure and record the rebuild time of `engine.cppm` after a one-line change in a `Graph` member body before and after (the point of the move), and the BMI size of `simsys.graph`.
+  *Measured* (a comment edited inside `Graph::order_nodes`, `cmake --build build/gcc14-debug`, default `-j`, a shared 14-core machine, two samples each): with the system CMake 3.28.3, **93.5 / 100.5 s before, 61.5 / 64.3 s after**: 3.28's collation rewrites every `.modmap` file after any edit and the compiles record it as an input, so the whole library and every test unit recompile in both cases (41 compiles after); the gain is each importer reading the smaller BMI. With CMake 3.31.6 (same tree, a scratch build dir), which leaves an unchanged module map alone: **60.1 / 78.0 s and 18 compiles before** (graph.cppm and every unit importing simsys.graph), **13.5 / 15.5 s and 1 compile after** (graph.cpp, then the links). BMI `simsys.graph.gcm`: **16.94 MB → 8.00 MB** (Debug), **16.89 MB → 8.02 MB** (Release). Byte-identity (14 scenarios × validate, explain, estimate, run, run --report json, and the hello sweep): identical; `ctest` 1163 in both presets, names unchanged; Release link clean, no `emit_special_members` line and no new `detail::` function needed.
+- [x] Commit `graph: declarations in the interface, definitions in graph.cpp`.
 
 ### Task 4: `test_theory.cpp` into nine files with a fixtures module
 
