@@ -1057,11 +1057,12 @@ struct QueueProvenance {
   return defaults::is_byte_sized(spec) ? " per MB" : "";
 }
 
-// " MB slots" after a byte-sized node's c: each of its servers moves one megabyte at a time
-// (c = MB/s × the time of one MB, Little's law), and an object holds one for its whole transfer
-// (behaviours::MegabyteService). Nothing after a count of servers.
+// " slots (1 object each)" after a byte-sized node's c: c = MB/s × the time of one MB (Little's
+// law) counts transfers in flight, and each one is an object holding its slot for its whole
+// transfer (behaviours::MegabyteService), whatever its size: 20 slots move 20 objects at once, not
+// 20 MB. Nothing after a count of servers.
 [[nodiscard]] std::string_view per_slot(const model::NodeSpec& spec) {
-  return defaults::is_byte_sized(spec) ? " MB slots" : "";
+  return defaults::is_byte_sized(spec) ? " slots (1 object each)" : "";
 }
 
 // " MB" after a byte-sized node's queue_limit: its waiting room holds capacity units, here

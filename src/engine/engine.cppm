@@ -394,7 +394,7 @@ class Simulation {
   [[nodiscard]] static flow::LatencyEstimate request_weighted_sojourn(const Node& node);
   static void time_whole_objects(Node& node);
   [[nodiscard]] static flow::LatencyEstimate request_weighted_megabyte_sojourn(
-      const Node& node, const behaviours::MegabyteService& megabytes);
+      const Node& node, const behaviours::MegabyteService& megabyte_service);
   static void record_replication(const Node& node, std::span<const flow::LatencyEstimate> sojourns,
                                  const ReplicationTally& tally, NodeSample& sample);
   [[nodiscard]] static flow::Flow take_drained(CopyGroup& group, const flow::Flow& content,
@@ -545,16 +545,17 @@ inline constexpr std::size_t max_copy_groups = 2;
 
 // How a node times its requests in megabytes (behaviours::MegabyteService) when it counts them:
 // a blob store or a CDN sized in bytes (defaults::is_byte_sized). Null for every other node.
-[[nodiscard]] const behaviours::MegabyteService* megabytes_of(
+[[nodiscard]] const behaviours::MegabyteService* megabyte_service_of(
     const behaviours::Behaviour& behaviour) {
   return std::visit(
       [](const auto& node) -> const behaviours::MegabyteService* {
-        // C++20 requires-expression as a compile-time condition: `requires { node.megabytes(); }`
-        // is true exactly for the alternatives that have such a member. Replaces the C++17
-        // detection idiom (a std::void_t trait written for the purpose) with one line, so only
-        // the behaviours that may count megabytes need to know about them.
-        if constexpr (requires { node.megabytes(); }) {
-          return node.megabytes();
+        // C++20 requires-expression as a compile-time condition:
+        // `requires { node.megabyte_service(); }` is true exactly for the alternatives that have
+        // such a member. Replaces the C++17 detection idiom (a std::void_t trait written for the
+        // purpose) with one line, so only the behaviours that may count megabytes need to know
+        // about them.
+        if constexpr (requires { node.megabyte_service(); }) {
+          return node.megabyte_service();
         } else {
           return nullptr;
         }
@@ -1134,8 +1135,8 @@ void Simulation::receive(std::size_t index, Mode mode) {
 // Ignored: FIFO order, tail drop (a full real queue rejects the newest arrivals),
 // priorities and per-op service times (a costly op uses more capacity, not a longer
 // sojourn: see ServiceBehaviour). The one exception is a byte-sized node, whose ops are the
-// megabytes they move: its queue waits for the mean whole object (time_whole_objects) and each
-// op is answered at its own time after that wait (own_sojourn).
+// megabytes they move: its queue waits for whole objects, fed their size mix's moments
+// (time_whole_objects), and each op is answered at its own time after that wait (own_sojourn).
 flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSample& sample) {
   auto& node = nodes_[index];
   time_whole_objects(node);
@@ -1256,9 +1257,9 @@ void Simulation::record_sojourns(Node& node, std::span<const flow::LatencyEstima
   const auto read_share = [](const CopyGroup& g) { return g.request_share; };
   node.read_sojourn = mixed(sojourns, read_share);
   node.wait = mixed(waits, read_share);
-  if (const auto* megabytes = megabytes_of(node.behaviour)) {
+  if (const auto* megabyte_service = megabyte_service_of(node.behaviour)) {
     node.write_sojourn = node.read_sojourn;
-    sample.latency = request_weighted_megabyte_sojourn(node, *megabytes);
+    sample.latency = request_weighted_megabyte_sojourn(node, *megabyte_service);
     return;
   }
   if (!node.replication) {
@@ -1273,37 +1274,54 @@ void Simulation::record_sojourns(Node& node, std::span<const flow::LatencyEstima
 }
 
 // A byte-sized node's queue waits for whole objects (plan 2c refinement 2; review of Task 3 at
-// a8b6cb4, I1): each request holds one of its c megabyte slots for its whole transfer, so the
-// time Erlang C is fed is the rate-weighted mean OBJECT time of this step's arrivals,
-//   s_obj = Σ_op rate_op × MB_op × s_MB / Σ_op rate_op    (behaviours::MegabyteService)
-// recomputed every step as the op mix moves, like the per-op costs. c and the rate stay those of
-// the megabytes (c = MB/s × s_MB), so rho is unchanged (Little's law: objects/s × s_obj / c =
-// MB/s / capacity) and only the wait becomes a whole object's: 5 uploads/s of 50 MB at a default
-// store wait C(20, 0.5) × 2 s / (20 × 0.5) = 0.746 ms, not the 0.0149 ms of 1 MB units. A step
-// in which nothing arrives keeps the last mix's time (it was one megabyte's before any).
+// a8b6cb4, I1, and of its fix round at 0248a47, I1): each request holds one of its c megabyte
+// slots for its whole transfer, so the queue is fed the moments of this step's arrivals' object
+// times (behaviours::MegabyteService::object_time_moments):
+//   s_obj = Σ_op p_op × MB_op × s_MB          the mean, what Erlang C is fed (p_op = rate share)
+//   c_s²  = Σ_op p_op (1 + cs²) s_op² / s_obj² − 1     the size mix's SCV, what the Allen–Cunneen
+//                                                      factor (c_a² + c_s²) / 2 is fed
+// recomputed every step as the op mix moves, like the per-op costs, in one call
+// (fluid::FluidQueue::set_service) so mean and spread always belong together. c and the rate stay
+// those of the megabytes (c = MB/s × s_MB), so rho is unchanged (Little's law: objects/s × s_obj /
+// c = MB/s / capacity) and only the wait becomes a whole object's: 5 uploads/s of 50 MB at a
+// default store wait (1 + 0) / 2 × C(20, 0.5) × 2 s / (20 × 0.5) = 0.373 ms (one size: c_s² = 0),
+// not the 0.0149 ms of 1 MB units. A step in which nothing arrives keeps the last mix's moments
+// (it was one megabyte's time, at the node's per-object SCV, before any).
 void Simulation::time_whole_objects(Node& node) {
-  const auto* megabytes = megabytes_of(node.behaviour);
-  if (megabytes == nullptr) return;
-  const auto object_time_s = megabytes->mean_object_time_s(node.inflow);
-  if (!object_time_s) return;
-  for (auto& group : node.copy_groups) group.queue.set_service_time(*object_time_s);
+  const auto* megabyte_service = megabyte_service_of(node.behaviour);
+  if (megabyte_service == nullptr) return;
+  const auto moments = megabyte_service->object_time_moments(node.inflow);
+  if (!moments) return;
+  for (auto& group : node.copy_groups) group.queue.set_service(*moments);
 }
 
 // A byte-sized node's latency: each op's own sojourn (own_sojourn) mixed by the requests of it
 // that arrived this step, what an average request saw, as a database mixes its reads and writes
 // (request_weighted_sojourn). Nothing arrived: what a read arriving now would see, the wait plus
-// one megabyte.
+// one megabyte. The mixture of behaviours::mixture, accumulated in place over the inflow (two
+// passes, no allocation per step), with p_op = rate_op / Σ rate and op o's sojourn of mean m_o and
+// variance v_o:
+//   mean     = Σ_o p_o m_o
+//   variance = Σ_o p_o (v_o + (m_o − mean)²)       (law of total variance: within + between)
+// equal to Σ p (v + m²) − mean² but written as a sum of non-negative terms, so it cannot come out
+// negative when the two nearly cancel (one op: a 12 s upload with a variance of 0.03 s²).
 flow::LatencyEstimate Simulation::request_weighted_megabyte_sojourn(
-    const Node& node, const behaviours::MegabyteService& megabytes) {
+    const Node& node, const behaviours::MegabyteService& megabyte_service) {
   const double total_per_s = node.inflow.total().per_second;
-  if (total_per_s <= 0.0) return megabytes.first_megabyte(node.wait);
-  std::vector<behaviours::Branch> branches;
+  if (total_per_s <= 0.0) return megabyte_service.first_megabyte(node.wait);
+  double mean_s = 0.0;
   for (const auto& [op, rate] : node.inflow.entries()) {
     if (rate.per_second <= 0.0) continue;
-    branches.push_back(
-        {.share = rate.per_second / total_per_s, .latency = megabytes.sojourn(op, node.wait)});
+    mean_s += rate.per_second / total_per_s * megabyte_service.sojourn(op, node.wait).mean_s;
   }
-  return behaviours::mixture(branches);
+  double variance_s2 = 0.0;
+  for (const auto& [op, rate] : node.inflow.entries()) {
+    if (rate.per_second <= 0.0) continue;
+    const auto own = megabyte_service.sojourn(op, node.wait);
+    const double apart_s = own.mean_s - mean_s;
+    variance_s2 += rate.per_second / total_per_s * (own.variance_s2 + apart_s * apart_s);
+  }
+  return flow::LatencyEstimate{.mean_s = mean_s, .variance_s2 = variance_s2};
 }
 
 // A database's latency: its read and its write sojourns mixed by the requests of each that
@@ -1484,8 +1502,8 @@ std::vector<ResponseSample> Simulation::client_responses(SimTime now) const {
 // read at its first megabyte after the same wait (behaviours::MegabyteService::sojourn); any
 // other node has one sojourn for every op.
 flow::LatencyEstimate Simulation::own_sojourn(const Node& node, std::string_view op) {
-  if (const auto* megabytes = megabytes_of(node.behaviour)) {
-    return megabytes->sojourn(op, node.wait);
+  if (const auto* megabyte_service = megabyte_service_of(node.behaviour)) {
+    return megabyte_service->sojourn(op, node.wait);
   }
   return is_write_at(node.behaviour, op) ? node.write_sojourn : node.read_sojourn;
 }

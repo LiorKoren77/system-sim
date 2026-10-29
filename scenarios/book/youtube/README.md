@@ -15,8 +15,8 @@
   API).
 - The CDNs and the two blob stores count megabytes (phase 2c): a 50 MB stream costs 50 units of
   1 MB, the service time is one megabyte's (10 ms at a CDN, 40 ms at a blob store, the book's
-  per-MB rows), so `cdn_us` at 100GB/s has 1000 megabyte slots (`c=1000 MB slots`) and
-  saturates at 2k streams/s. `explain` checks them in MB/s with the requests beside (the evening
+  per-MB rows), so `cdn_us` at 100GB/s has 1000 slots that each move one stream at a time
+  (`c=1000 slots (1 object each)`) and saturates at 2k streams/s. `explain` checks them in MB/s with the requests beside (the evening
   peak, 21:00):
 
   ```
@@ -38,13 +38,23 @@
 - Each request is a batch of megabytes that holds one slot for its whole transfer (a stream
   0.5 s at a CDN, an upload 300 MB × 40 ms = 12 s at `original_store`), so the queues wait for
   whole objects: Erlang C is fed the mean object's time, with the slots as servers (rho is the
-  same as in MB/s, by Little's law). It matters near saturation: at rho 0.9, 50 MB objects at a
-  default blob store (20 slots) wait 0.55 s, where 1 MB units would say 11 ms. When a request is
-  answered depends on its direction: a stream is a read, answered at its first megabyte (its
-  wait plus 10 ms; the rest is read as it arrives), and an upload is a write
-  (`original_store` lists `write_ops: [upload]`), acknowledged at its last byte, 12 s after its
-  wait. The clients' `timeout: 10s` is read but not applied yet (plan 2c Task 13); applied to a
-  12 s upload it will cut a large share of them.
+  same as in MB/s, by Little's law). A fixed size at a fixed rate takes a fixed time, so the
+  transfers are deterministic (`variability=0` in `explain`) and the spread of service times is
+  the size mix's alone, which Kingman's correction (Allen–Cunneen) adds to the wait: one size
+  waits like M/D/c, half the M/M/c wait, and small requests beside large ones lengthen the large
+  ones' wait. It matters near saturation: at rho 0.9, 50 MB objects at a default blob store
+  (20 slots) wait 0.28 s, where 1 MB units would say 11 ms. And no wait outlasts the waiting room:
+  `original_store`'s 1000 MB drain at 5 GB/s in 0.2 s, so an upload waits at most 0.2 s there
+  even past saturation (Erlang C at its 0.99 clamp would say 2.5 s). At the 21:00 peak (rho
+  0.576 over 200 slots) it waits nothing measurable. When a request is answered depends on its
+  direction: a stream is a read, answered at its first megabyte (its wait plus 10 ms; the rest
+  is read as it arrives), and an upload is a write (`original_store` lists `write_ops: [upload]`),
+  acknowledged at its last byte, 12 s after its wait.
+- Every 300 MB upload therefore takes at least 12 s (300 MB at 25 MB/s per slot), with no spread
+  but its wait's. The clients' `timeout: 10s` is read but not applied yet: applied as it stands
+  it would time out **every** upload (plan 2c Task 13 honours the timeout). The book's uploads
+  are resumable (chunked, each chunk retried on its own), so plan Task 16 sizes the timeout per
+  the book (a timeout per chunk, or a longer one for `upload`) before Task 13 applies it.
 - Two regions with a cross-DC origin fetch (150 ms) for European misses. Each CDN is a
   read-only cache in front of `transcoded_store`: its hit ratio comes from the Che approximation
   over the viewers' Zipf(1) popularity of 10M videos and the edge's size in videos (`keys: 100k`
@@ -57,9 +67,10 @@
 
 ## What it abstracts away
 - Adaptive bitrate selection, chunked upload resume, DRM.
-- The spread of object sizes in one queue (each queue waits as M/M/c at the mean object's time;
-  mixed sizes wait longer), and a large read needed whole (a stream answers at its first
-  megabyte, which understates a download that must finish before it is used).
+- The jitter of real disks and networks (each transfer takes exactly its size's time;
+  `advanced.service_variability` can put a spread back), and a large read needed whole (a stream
+  answers at its first megabyte, which understates a download that must finish before it is
+  used).
 - Error handling in the DAG (retry per stage).
 
 ## Things to try

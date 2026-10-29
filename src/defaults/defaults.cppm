@@ -281,6 +281,19 @@ struct Resolved {
   return n.type == model::NodeType::cdn && n.byte_capacity.has_value();
 }
 
+// The squared coefficient of variation (SCV) of ONE request's service time when the scenario
+// states none: the type's (1, exponential, M/M/c's assumption; 2 for an erratic external sink),
+// except at a byte-sized node, where it is 0 (review of plan 2c Task 3's fix round, I2): a
+// transfer of a fixed number of megabytes at a fixed time per megabyte (one slot's share of the
+// node's bandwidth) takes a fixed time, size × s_MB, so the spread of service times there is the
+// size mix's alone (behaviours::MegabyteService) and a single size waits like M/D/c, half the
+// M/M/c wait with Poisson arrivals. Chosen, not from the book: a real disk and network add jitter
+// (seeks, retransmissions) that `advanced.service_variability` can put back.
+[[nodiscard]] double default_service_variability(const model::NodeSpec& n) {
+  if (is_byte_sized(n)) return 0.0;
+  return defaults_of(n).service_variability;
+}
+
 [[nodiscard]] Resolved<SimTime> resolve_service_time(const model::NodeSpec& n) {
   if (n.latency) return {*n.latency, Source::scenario};
   return {defaults_of(n).service_time, Source::type_default};
@@ -314,7 +327,8 @@ inline constexpr int max_concurrency = 100'000;
 // yellow 0.70 / red 0.90 are the spec §3.3 zones, the ops rule of thumb that the M/M/1 wait,
 // growing like 1/(1-rho), climbs steeply past ~70% and turns dangerous past ~90%), so
 // the numbers live in exactly one place. Only concurrency is derived instead, and the
-// variability comes from the type (external sinks are erratic).
+// variability comes from the type (external sinks are erratic) or, at a byte-sized node, is 0
+// (default_service_variability).
 // A client is a source, not a queue: asking for its capacity is a programmer error.
 [[nodiscard]] fluid::Capacity resolve_capacity(const model::NodeSpec& n) {
   if (n.type == model::NodeType::client) {
@@ -331,7 +345,7 @@ inline constexpr int max_concurrency = 100'000;
       .queue_limit = a.queue_limit.value_or(base.queue_limit),
       .yellow = a.yellow.value_or(base.yellow),
       .red = a.red.value_or(base.red),
-      .service_variability = a.service_variability.value_or(defaults_of(n).service_variability),
+      .service_variability = a.service_variability.value_or(default_service_variability(n)),
       .burstiness = a.burstiness.value_or(base.burstiness),
   };
 }
