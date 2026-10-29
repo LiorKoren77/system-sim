@@ -3673,3 +3673,29 @@ TEST_CASE("a byte capacity is refused on a type that counts requests") {
                    "node 'api': an external_sink counts requests; a byte capacity belongs on a "
                    "cdn or blob_store");
 }
+
+// A blob store's `then` steps are event notifications nobody waits for (plan 2c Task 4), so a step
+// `mode` (sequential latencies add, parallel ones overlap) means nothing there. The graph refuses
+// `mode: parallel`; only the loader sees `mode: sequential` written (the model's default), so it
+// refuses the key itself, at the key, whatever its value.
+TEST_CASE("a blob store's then step may not state a mode") {
+  for (const auto* mode : {"sequential", "parallel"}) {
+    CAPTURE(mode);
+    require_rejected_at("simsys_blob_event_mode.yaml", std::string{R"(
+version: 1
+name: t
+duration: 1m
+nodes:
+  b:
+    type: blob_store
+    then:
+      - {to: svc, op: notify, mode: )"} + mode + R"(}
+  svc: {type: service}
+links:
+  - {from: b, to: svc}
+)",
+                        "node 'b': a blob store's then steps are event notifications nobody "
+                        "waits for (mode orders the calls a request waits for)",
+                        9);
+  }
+}

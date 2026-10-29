@@ -2135,8 +2135,10 @@ TEST_CASE("the engine runs a blob store that has then steps", "[theory]") {
 // ----
 //
 // S3 event notifications (book ch. 14: "transcoding starts when the upload completes"): for every
-// request the store SERVED, each `then` step sends its op to its target, and nobody waits for it.
-// So the uploader's response and answered rate end at the store, and the target only receives load.
+// WRITE the store SERVED (an op in its `write_ops`, default `[write]`: S3's ObjectCreated), each
+// `then` step sends its op to its target, and nobody waits for it. A read fires nothing: S3 has
+// no event for a GET. So the uploader's response and answered rate end at the store, and the
+// target only receives load.
 //
 // The numbers below come from one picture: a client sends 2 uploads/s of 100 MB to a default blob
 // store (spec section 6: 500 MB/s, 40 ms per MB), over a 250 us link (0.5 ms round trip):
@@ -2147,9 +2149,10 @@ TEST_CASE("the engine runs a blob store that has then steps", "[theory]") {
 //   would be C x s_obj / (c (1 - rho)) = 0.00026495 x 4 s / (20 x 0.6) = 0.0883 ms, and every
 //   upload holding a slot the same 4 s (a deterministic transfer, M/D/c) halves it:
 //   Wq       = (1 + 0) / 2 x 0.0883 ms = 0.0442 ms.
-// An op that is not in the store's `write_ops` is a read, answered at its first megabyte:
-//   response = Wq + 40 ms + 0.5 ms = 40.544 ms.
-// Listed in `write_ops`, the upload is answered at its last byte: Wq + 4 s + 0.5 ms = 4.000544 s.
+// Listed in `write_ops` (as youtube's original_store lists `upload`), the upload is a write,
+// answered at its last byte and notifying svc: Wq + 4 s + 0.5 ms = 4.000544 s.
+// An op that is not in the store's `write_ops` is a read, answered at its first megabyte and
+// notifying nobody: response = Wq + 40 ms + 0.5 ms = 40.544 ms.
 // Either way `svc`, which takes 500 ms per notification, adds nothing to the client's response.
 
 namespace {
@@ -2159,17 +2162,21 @@ constexpr double upload_mmc_wait_s = 8.8316e-5;  // M/M/c's wait above, to the d
   return simsys::queueing::mmc_wait(20, 0.4, 4.0).mean_s / 2.0;
 }
 
-// The service the store notifies: fast to the client's eyes if it counted (500 ms), so that a
+// The service the store notifies: slow to the client's eyes if it counted (500 ms), so that a
 // response that waited for it would be unmistakable.
 NodeSpec notified_service() {
   return NodeSpec{.id = "svc", .type = NodeType::service, .capacity = Rate{1000}, .latency = 500ms};
 }
 
+// The store's `write_ops` in most tests below: the upload is a write, so it fires the events.
+const std::optional<std::vector<std::string>> upload_is_a_write =
+    std::vector<std::string>{"upload"};
+
 // u (`rate` uploads/s of 100 MB, 250 us link) -> store (a default blob store) -> svc over a 1 ms
-// link, the store's `then` being `then`. `write_ops` is the store's, when given. Node indices:
-// u 0, store 1, svc 2.
+// link, the store's `then` being `then`. `write_ops` is the store's (std::nullopt: the default
+// `[write]`, so the upload is a read). Node indices: u 0, store 1, svc 2.
 Scenario upload_with_events(std::vector<Step> then,
-                            std::optional<std::vector<std::string>> write_ops = {},
+                            std::optional<std::vector<std::string>> write_ops = upload_is_a_write,
                             NodeSpec svc = notified_service(), double rate = 2.0) {
   Scenario s{.name = "blob-events", .version = 1, .duration = 10s};
   s.nodes = {NodeSpec{.id = "u",
@@ -2202,32 +2209,69 @@ TEST_CASE("a blob store sends its then target one notification per upload it ser
 }
 
 // The upload is a read to this store (`write_ops` does not list it): answered at its first
-// megabyte, 0.0442 ms + 40 ms after the wait, plus the 0.5 ms round trip: 40.544 ms. The 500 ms
-// svc is not in it: the hop to svc is asynchronous.
-TEST_CASE("a notified blob store answers a read-style upload in 40.54 ms, svc not included",
+// megabyte, 0.0442 ms + 40 ms after the wait, plus the 0.5 ms round trip: 40.544 ms. A read fires
+// no event (S3 has none for a GET), so svc is sent nothing.
+TEST_CASE("a read-style upload at a blob store does not notify and is answered in 40.54 ms",
           "[theory]") {
-  const auto g = *Graph::build(upload_with_events(notify_step));
+  const auto g = *Graph::build(upload_with_events(notify_step, std::nullopt));
   const auto r = first_step(g);
   const double wait = upload_wait_s();
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(wait + 0.040 + 0.0005, 1e-9));
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.040544, 1e-6));
   // The store's own sojourn is the response minus the link round trip.
   REQUIRE_THAT(r.nodes[*g.index_of("store")].latency.mean_s, WithinRel(wait + 0.040, 1e-9));
+  REQUIRE(r.nodes[*g.index_of("svc")].demand_per_s == 0.0);
 }
 
-// The same upload counted as a write is answered at its last byte: 4 s + Wq + 0.5 ms.
-TEST_CASE("a notified blob store answers a write-listed upload at its last byte, svc not included",
+// The same upload counted as a write is answered at its last byte, 4 s + Wq + 0.5 ms, and notifies
+// svc 2/s. The 500 ms svc is not in the response: the hop to svc is asynchronous.
+TEST_CASE("a write-listed upload notifies and is answered at its last byte, svc not included",
           "[theory]") {
-  const auto g = *Graph::build(upload_with_events(notify_step, std::vector<std::string>{"upload"}));
+  const auto g = *Graph::build(upload_with_events(notify_step));
   const auto r = first_step(g);
   const double wait = upload_wait_s();
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinRel(wait + 4.0 + 0.0005, 1e-9));
   REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(4.000544, 1e-6));
+  REQUIRE_THAT(r.nodes[*g.index_of("svc")].demand_per_s, WithinRel(2.0, 1e-12));
+}
+
+// The reviewer's probe of Task 4 (I1): 1000 viewers/s read 1 MB videos from the store and one
+// uploader/s writes a 100 MB one; the store's `then` asks a transcoder for one job per event. The
+// transcoder must see 1 job/s, the uploads, not 1001/s: S3 notifies on ObjectCreated, never on a
+// GET. (With reads included, the transcoder of 10 jobs/s was offered 1001/s, 100x its capacity.)
+TEST_CASE("1000 reads/s and 1 upload/s at a blob store send its transcoder 1 job/s", "[theory]") {
+  Scenario s{.name = "views-and-uploads", .version = 1, .duration = 10s};
+  s.nodes = {
+      NodeSpec{.id = "viewers",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1000}},
+                                    .op_shares = {{"get", 1.0}},
+                                    .sizes = {{"get", simsys::Bytes{1e6}}}}},
+      NodeSpec{.id = "uploader",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1}},
+                                    .op_shares = {{"upload", 1.0}},
+                                    .sizes = {{"upload", simsys::Bytes{100e6}}}}},
+      NodeSpec{.id = "store",
+               .type = NodeType::blob_store,
+               .byte_capacity = simsys::ByteRate{5e9},
+               .then = {Step{.to = "transcode", .op = "job"}},
+               .write_ops = std::vector<std::string>{"upload"}},
+      NodeSpec{.id = "transcode", .type = NodeType::service, .capacity = Rate{10}, .latency = 1s}};
+  s.links = {LinkSpec{.from = "viewers", .to = "store"},
+             LinkSpec{.from = "uploader", .to = "store"},
+             LinkSpec{.from = "store", .to = "transcode"}};
+  const auto g = *Graph::build(s);
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const auto e = sim->estimate();
+  REQUIRE_THAT(e.nodes[*g.index_of("transcode")].demand_per_s, WithinRel(1.0, 1e-9));
 }
 
 // svc is a 1/s service with a waiting room of 1, offered 2 notify/s: in the long run it drains
 // 1/s and drops the other 1/s, a drop rate of 1 / 2 = 0.5. The client never hears of it: its
-// uploads are answered at the store, 2/s of 2/s, at the same 40.544 ms.
+// uploads are answered at the store, 2/s of 2/s, at the same 4.000544 s.
 TEST_CASE(
     "an undersized notified service drops half its notifications and the uploader still "
     "gets every answer",
@@ -2237,7 +2281,7 @@ TEST_CASE(
                                    .capacity = Rate{1},
                                    .latency = 10ms,
                                    .advanced = {.queue_limit = 1}};
-  const auto g = *Graph::build(upload_with_events(notify_step, {}, undersized));
+  const auto g = *Graph::build(upload_with_events(notify_step, upload_is_a_write, undersized));
   const auto sim = Simulation::create(g);
   INFO((sim ? "" : sim.error().message));
   REQUIRE(sim.has_value());
@@ -2249,7 +2293,7 @@ TEST_CASE(
   REQUIRE(e.nodes[*g.index_of("store")].dropped_per_s == 0.0);
   REQUIRE_THAT(e.responses[0].answered.per_second, WithinRel(2.0, 1e-9));
   const double wait = upload_wait_s();
-  REQUIRE_THAT(e.responses[0].response.mean_s, WithinRel(wait + 0.040 + 0.0005, 1e-9));
+  REQUIRE_THAT(e.responses[0].response.mean_s, WithinRel(wait + 4.0 + 0.0005, 1e-9));
 }
 
 // `factor` multiplies a notification: one upload, four events (say four renditions to make).
@@ -2261,7 +2305,7 @@ TEST_CASE("a notification's factor multiplies the notifications sent: 4 per uplo
   REQUIRE_THAT(r.nodes[*g.index_of("svc")].demand_per_s, WithinRel(8.0, 1e-12));
   // The store is untouched by what it sends: same rho, same answer.
   REQUIRE_THAT(r.nodes[*g.index_of("store")].rho, WithinRel(0.4, 1e-12));
-  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(0.040544, 1e-6));
+  REQUIRE_THAT(r.responses[0].response.mean_s, WithinAbs(4.000544, 1e-6));
 }
 
 // The size walk (plan 2c refinement 1) is how the graph resolves it, and the engine must accept
@@ -2293,7 +2337,8 @@ TEST_CASE(
 // other half is dropped. A notification fires for a request the store SERVED, so svc is sent 5/s,
 // not the 10/s offered.
 TEST_CASE("an overloaded blob store notifies only for the uploads it served", "[theory]") {
-  const auto g = *Graph::build(upload_with_events(notify_step, {}, notified_service(), 10.0));
+  const auto g =
+      *Graph::build(upload_with_events(notify_step, upload_is_a_write, notified_service(), 10.0));
   const auto sim = Simulation::create(g);
   INFO((sim ? "" : sim.error().message));
   REQUIRE(sim.has_value());

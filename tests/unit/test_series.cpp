@@ -110,8 +110,10 @@ Scenario spike_into_big_queue() {
 // over a client route, which the paper load follows; `uploader` sends 10k/s of `put` to `blobs`,
 // a blob store whose `then` writes each upload's metadata to db (an event notification: the paper
 // load follows it since plan 2c Task 4; before, it did not and db's load was only the reader's
-// part: the probe of the review of 3e23477, I1). `blobs` also has a link to `audit` but no step
-// along it: nothing flows there.
+// part: the probe of the review of 3e23477, I1). A blob store notifies only for its writes (review
+// of Task 4, I1), so `blobs` lists `put` in its `write_ops` (S3's PUT, ObjectCreated): with the
+// default `[write]` a put would be a read and notify nobody. `blobs` also has a link to `audit`
+// but no step along it: nothing flows there.
 Scenario partly_behind_blob_store(double read_rate) {
   Scenario s{.name = "partial", .version = 1, .duration = 1s, .step = 100ms};
   s.nodes = {
@@ -125,11 +127,36 @@ Scenario partly_behind_blob_store(double read_rate) {
       NodeSpec{.id = "blobs",
                .type = NodeType::blob_store,
                .capacity = Rate{1e6},
-               .then = {simsys::model::Step{.to = "db", .op = "write"}}},
+               .then = {simsys::model::Step{.to = "db", .op = "write"}},
+               .write_ops = std::vector<std::string>{"put"}},
       NodeSpec{.id = "db", .type = NodeType::service, .capacity = Rate{2000}},
       NodeSpec{.id = "audit", .type = NodeType::service, .capacity = Rate{2000}}};
   s.links = {LinkSpec{.from = "reader", .to = "db"}, LinkSpec{.from = "uploader", .to = "blobs"},
              LinkSpec{.from = "blobs", .to = "db"}, LinkSpec{.from = "blobs", .to = "audit"}};
+  return s;
+}
+
+// The same two clients and db, but the 10k/s of `post` go to `fanout`, a notification fan-out
+// (ch. 10) whose `then` sends each post to db as a `write`: a type the paper load does not follow
+// ("not modelled yet"), so db's load is only the reader's part, a lower bound. `fanout` also has
+// a link to `audit` but no step along it: nothing would flow there.
+Scenario partly_behind_fanout(double read_rate) {
+  Scenario s{.name = "partial-fanout", .version = 1, .duration = 1s, .step = 100ms};
+  s.nodes = {
+      NodeSpec{
+          .id = "reader",
+          .type = NodeType::client,
+          .workload = Workload{.curve = {.base = Rate{read_rate}}, .op_shares = {{"read", 1.0}}}},
+      NodeSpec{.id = "poster",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{10'000}}, .op_shares = {{"post", 1.0}}}},
+      NodeSpec{.id = "fanout",
+               .type = NodeType::notification_fanout,
+               .then = {simsys::model::Step{.to = "db", .op = "write"}}},
+      NodeSpec{.id = "db", .type = NodeType::service, .capacity = Rate{2000}},
+      NodeSpec{.id = "audit", .type = NodeType::service, .capacity = Rate{2000}}};
+  s.links = {LinkSpec{.from = "reader", .to = "db"}, LinkSpec{.from = "poster", .to = "fanout"},
+             LinkSpec{.from = "fanout", .to = "db"}, LinkSpec{.from = "fanout", .to = "audit"}};
   return s;
 }
 
@@ -724,14 +751,31 @@ TEST_CASE("a blob store's notifications add to the load a node gets from elsewhe
   REQUIRE_FALSE(line.contains("load not propagated"));
 }
 
-// The paper load follows the blob store's `then` steps, not its bare links: audit is linked but
-// sent nothing, so its 0 % is a real 0 and keeps its verdict.
-TEST_CASE("a node linked from a blob store but sent no step keeps its verdict", "[series]") {
-  const auto text = explain_of(partly_behind_blob_store(1.0));
+// A red lower bound is a true verdict: 3000/s of reads alone against 2k/s is 150 %, so db is
+// overloaded whatever else the fan-out adds. Its line keeps the percentage as a lower bound
+// ("≥"), keeps "red", and names the type whose flow is missing. (Re-pinned on a type that stays
+// blocking: the blob store this test used before is followed since plan 2c Task 4.)
+TEST_CASE("a red lower bound stays red", "[series]") {
+  const auto text = explain_of(partly_behind_fanout(3000.0));
+  CAPTURE(text);
+  REQUIRE(
+      check_line(text, "db")
+          .contains("(≥150%, red; load not propagated: notification_fanout is not modelled yet)"));
+}
+
+// The mark follows a blocking type's `then` steps, not its bare links: audit is linked from the
+// fan-out but sent no step, so its 0 % is a real 0 and keeps its verdict, while db, which a step
+// reaches, is marked. (Rebased from the blob store, which no longer blocks, onto a type that does,
+// so the test still separates a step from a link.)
+TEST_CASE("a node linked from a notification fan-out but sent no step keeps its verdict",
+          "[series]") {
+  const auto text = explain_of(partly_behind_fanout(1.0));
   CAPTURE(text);
   const auto line = check_line(text, "audit");
   REQUIRE(line.contains("(0%, green)"));
   REQUIRE_FALSE(line.contains("load not propagated"));
+  REQUIRE(check_line(text, "db")
+              .contains("(≥0.05%; load not propagated: notification_fanout is not modelled yet)"));
 }
 
 TEST_CASE("explain gives youtube's metadata_db a lower bound: the completion handler writes too",
