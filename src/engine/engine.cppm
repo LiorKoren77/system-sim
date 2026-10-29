@@ -235,8 +235,9 @@ struct StepRecord {
   // Only Simulation::estimate clears it: false means the settle passes hit their cap
   // before the numbers stopped changing, so the record is the last pass, not a steady
   // state. A loop that returns as much as it receives (gain >= 1) and that no capacity
-  // stops within reach climbs for ever: it has no steady state. Every step of `run`
-  // leaves it true.
+  // stops within reach climbs for ever: it has no steady state. So do delivered fractions
+  // that never settle (a step after a failed step, see estimate). Every step of `run` leaves it
+  // true.
   bool converged{true};
 };
 
@@ -311,6 +312,9 @@ class Simulation {
   struct Answer {
     flow::LatencyEstimate latency{};
     double delivered{1.0};  // 1 until the first backward pass: nothing lost yet
+    // Settle mode only: the running average d̄ ← (d̄ + delivered) / 2 that estimate()'s passes
+    // thin later steps by instead of `delivered` (see estimate). 1 before any pass.
+    double settling_delivered{1.0};
   };
   // Per-op answers of one node, kept across steps: a feedback target reads the previous
   // step's entry. std::less<> (transparent) lets find() take a string_view.
@@ -427,6 +431,7 @@ class Simulation {
     std::size_t slot{};            // its sample's index in StepRecord::links
     flow::LatencyEstimate wait{};  // this step's queueing wait
     double passed{1.0};            // the share of this step's arriving megabytes not dropped
+    double settling_passed{1.0};   // settle mode only: `passed` averaged as Answer's d̄ is
   };
 
   struct Link {
@@ -520,6 +525,9 @@ class Simulation {
                                                    std::string_view op) const;
   [[nodiscard]] double hop_delivered(std::size_t caller, std::size_t target,
                                      std::string_view op) const;
+  [[nodiscard]] double hop_delivered_for_thinning(std::size_t caller, std::size_t target,
+                                                  std::string_view op, Mode mode) const;
+  void average_settling_fractions();
 
   std::vector<Node> nodes_;
   std::vector<Link> links_;
@@ -1242,16 +1250,25 @@ void Simulation::require_scenario_step(SimTime dt) const {
 // it receives), and what a loop sends round is bounded by the drain of its nodes, which
 // capacity caps. A rising, bounded sequence converges, here to the smallest steady state.
 // One mechanism breaks the "only rise": a step after a failed step does not run (plan 2c
-// refinement 11, behaviours::detail::HopBlocks::forward), and each pass thins a later step by
-// the delivered fractions of the PREVIOUS pass, which the backward pass measures after the
-// forward one. So the first pass sends every step the full flow, and the passes after it carry
-// each loss one step further down an op's steps: a chain of k lossy steps settles in about k + 1
-// passes more. A loss that feeds back on itself (a node called twice by one op, [a, b, a], whose
-// later call is thinned by its own earlier loss, or two ops whose losses load each other's
-// nodes) is a fixed-point iteration of its own, d ← f(d); it converges when |f'| < 1 at the fixed
-// point, and passes that oscillate for ever end at the cap with `converged` false. The estimate
-// of every shipped scenario that runs converges (news-feed's, the one with losses before later
-// steps, included).
+// refinement 11, behaviours::detail::HopBlocks::forward), and a pass can thin a later step only by
+// delivered fractions measured in an earlier pass (the backward pass runs after the forward one).
+// So the first pass sends every step the full flow, and the passes after it carry each loss one
+// step further down an op's steps: a chain of k lossy steps settles in about k + 1 passes more.
+// A loss that feeds back on itself (a node called several times by one op, [a, a, a, a, a], whose
+// later calls are thinned by its own loss, or two ops whose losses load each other's nodes) is a
+// fixed-point iteration of its own, d = f(d): the more a delivers, the more its later calls are
+// sent, the less it delivers, so f is decreasing. Fed back raw (d ← f(d)), a steep f (|f'| > 1)
+// never settles: the fractions flip between a high and a low value every pass. So settle mode
+// thins by a running average instead (average_settling_fractions):
+//   d̄ ← (d̄ + f(d̄)) / 2                       (damped fixed-point iteration, "averaging")
+// whose fixed point is the same, d̄ = f(d̄), and which converges whenever f' > −3 there (its slope
+// is (1 + f') / 2); f decreasing and continuous has exactly one fixed point. Five calls to `a`
+// (3686/s, a room of one) at 1k/s settle at d = 0.9: load 4095, 10 % dropped. `run` cannot settle
+// there in that case: its steps thin by the raw last step's fraction (the one-step lag), so it
+// shows a sawtooth, a step at 5000 offered and red alternating with one at 2988 and yellow, for the
+// whole run; its averages over many steps are not the fixed point either. The estimate of every
+// shipped scenario that runs converges (news-feed's, the one with losses before later steps,
+// included); passes that still oscillate end at the cap with `converged` false.
 //
 // A loop of gain >= 1 climbs until a node on it saturates; that state is steady (the node
 // drops the excess) and is reported. If saturation is further away than the cap allows
@@ -1310,6 +1327,7 @@ Simulation Simulation::settling_copy() const {
     pipe.group.waiting.clear();
     pipe.wait = flow::LatencyEstimate{};
     pipe.passed = 1.0;
+    pipe.settling_passed = 1.0;
   }
   return scratch;
 }
@@ -1321,8 +1339,25 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
   forward_pass(now, dt, mode, record);
   record_queue_lags(record.nodes);
   backward_pass();
+  if (mode == Mode::settle) average_settling_fractions();
   record.responses = client_responses(now);
   return record;
+}
+
+// The damping of estimate()'s thinning (see estimate): after each settle pass every delivered
+// fraction later steps are thinned by, a node's per op and a pipe's kept share, moves halfway to
+// what the pass measured, d̄ ← (d̄ + d) / 2. Exactly 1 stays 1 (a lossless path is untouched), and
+// at the fixed point d̄ = d.
+void Simulation::average_settling_fractions() {
+  for (auto& node : nodes_) {
+    for (auto& [op, answer] : node.responses) {
+      answer.settling_delivered = (answer.settling_delivered + answer.delivered) / 2.0;
+    }
+  }
+  for (auto& link : links_) {
+    if (link.pipe)
+      link.pipe->settling_passed = (link.pipe->settling_passed + link.pipe->passed) / 2.0;
+  }
 }
 
 // Each message queue's lag (NodeSample::queue_lag_s has the formula): the largest of its consumer
@@ -1366,8 +1401,8 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
     // pass that fills the response tables runs after this one, and a pipe on the way has not
     // passed this step's flow yet (send, below), so every target reads one step stale. Before the
     // first backward pass every table says 1 (Answer), so the first step thins nothing.
-    const auto delivered_last_step = [this, index](std::size_t target, std::string_view op) {
-      return hop_delivered(index, target, op);
+    const auto delivered_last_step = [this, index, mode](std::size_t target, std::string_view op) {
+      return hop_delivered_for_thinning(index, target, op, mode);
     };
     // A client's sample stays all zeros, green: a source has no queue.
     const behaviours::Routed routed =
@@ -2016,6 +2051,20 @@ double Simulation::hop_delivered(std::size_t caller, std::size_t target,
   const Pipe* pipe = pipe_between(caller, target);
   if (pipe == nullptr) return delivered_of(target, op);
   return pipe->passed * delivered_of(target, op);
+}
+
+// What the forward pass thins `caller`'s later calls by (behaviours::detail::HopBlocks::forward):
+// in advance mode the hop's delivered fraction of the last step (hop_delivered); in settle mode
+// its running average d̄, the target's settling_delivered times a pipe's settling_passed (the
+// damping estimate() needs to settle, see there).
+double Simulation::hop_delivered_for_thinning(std::size_t caller, std::size_t target,
+                                              std::string_view op, Mode mode) const {
+  if (mode == Mode::advance) return hop_delivered(caller, target, op);
+  const auto& table = nodes_[target].responses;
+  const auto found = table.find(op);
+  const double settled = found == table.end() ? 1.0 : found->second.settling_delivered;
+  const Pipe* pipe = pipe_between(caller, target);
+  return pipe == nullptr ? settled : pipe->settling_passed * settled;
 }
 
 }  // namespace simsys::engine

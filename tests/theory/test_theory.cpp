@@ -4798,22 +4798,52 @@ constexpr auto parallel = simsys::model::StepMode::parallel;
 
 // a delivers 0.5, so the request that fails at a never reaches b:
 //   b's demand = 1000 x 0.5 = 500/s            (before: 1000/s, as if no request ever failed)
-// The first step still sends 1000/s: nothing was reported yet (the lag); the long run is
-// `estimate`.
+// The lag, exactly (100 ms steps, zero-latency links): the first step still sends b 1000/s,
+// nothing was reported yet. In it a, starting empty, drains 50 of the 100 requests it is sent and
+// keeps one waiting, so it delivers (50 + 1) / 100 = 0.51, and the second step sends b
+// 1000 x 0.51 = 510/s. From then on a's room stays full and it drops exactly half: b gets 500/s.
+// The long run is `estimate`.
 TEST_CASE("a second step is sent only what the first step delivered: 500 of 1000 a second",
           "[theory]") {
   const auto g = *Graph::build(steps_chain({Step{.to = "a", .op = "x"}, Step{.to = "b", .op = "x"}},
                                            {lossy_target("a", 500), plain_target("b")}));
   const auto records = records_of(g, 20);
-  REQUIRE_THAT(demand_at(records.front(), g, "b"), WithinRel(1000.0, 1e-9));  // one step late
-  for (std::size_t i = 3; i < records.size(); ++i) {
+  REQUIRE_THAT(demand_at(records[0], g, "b"), WithinRel(1000.0, 1e-9));  // nothing reported yet
+  REQUIRE_THAT(demand_at(records[1], g, "b"), WithinRel(510.0, 1e-9));   // step 0's 0.51
+  for (std::size_t i = 2; i < records.size(); ++i) {
     CAPTURE(i);
     REQUIRE_THAT(dropped_share_at(records[i], g, "a"), WithinRel(0.5, 1e-9));  // a delivers 0.5
     REQUIRE_THAT(demand_at(records[i], g, "a"), WithinRel(1000.0, 1e-9));  // the first step: whole
-    REQUIRE_THAT(demand_at(records[i], g, "b"), WithinRel(500.0, 1e-3));   // 1000 x 0.5
+    REQUIRE_THAT(demand_at(records[i], g, "b"), WithinRel(500.0, 1e-9));   // 1000 x 0.5
   }
   const auto estimate = simulation_of(g).estimate();
   REQUIRE_THAT(estimate.nodes[*g.index_of("b")].demand_per_s, WithinRel(500.0, 1e-4));
+}
+
+// An op that calls one overloaded node five times, x: [a, a, a, a, a] at 1k/s, each call sent only
+// the requests the calls before it got through (review of plan 2c Task 12, I-1). With d the share
+// a delivers, a is offered
+//   L(d) = 1000 × (1 + d + d² + d³ + d⁴)          (call k is sent 1000 × d^(k-1))
+// and with 3686/s of capacity and a room of one it drops what is over capacity, so d = 3686 / L(d).
+// The fixed point is d = 0.9: L = 4095.1, 3686 / 4095.1 = 0.9001 (10 % dropped). The map
+// d ↦ 3686 / L(d) is decreasing with slope about −1.79 there, steeper than −1, so feeding each
+// d straight back never settles: d = 1 offers 5000 (drops 26 %), d = 0.74 offers 2988 (drops
+// nothing), d = 1 again... `run` thins every step by the raw fraction of the step before (it
+// cannot know this step's before serving it), so it shows exactly that sawtooth for the whole run:
+// the fixed point is not a state any step passes through. `estimate` thins by the average of its
+// passes' fractions, d̄ ← (d̄ + d) / 2, whose slope there is (1 − 1.79) / 2 ≈ −0.4, and settles.
+TEST_CASE("five calls to one overloaded node settle at d = 0.9 under estimate: 4095 offered",
+          "[theory]") {
+  const Step call_a{.to = "a", .op = "x"};
+  const auto g = *Graph::build(
+      steps_chain({call_a, call_a, call_a, call_a, call_a}, {lossy_target("a", 3686)}));
+  const auto estimate = simulation_of(g).estimate();
+  REQUIRE(estimate.converged);
+  REQUIRE_THAT(demand_at(estimate, g, "a"), WithinRel(4095.1, 1e-3));
+  REQUIRE_THAT(dropped_share_at(estimate, g, "a"), WithinRel(0.1, 1e-3));  // d = 0.9
+  // The client is answered only when all five calls are: d⁵ = 0.59 of its 1000/s.
+  REQUIRE_THAT(estimate.responses[0].answered.per_second,
+               WithinRel(1000.0 * std::pow(0.9, 5), 1e-3));
 }
 
 // Survival multiplies down the chain. a delivers 0.5, so b is offered 1000 x 0.5 = 500/s; b can

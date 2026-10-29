@@ -1180,6 +1180,53 @@ TEST_CASE("a service miss step after a cache whose own then step fetches the mis
   }
 }
 
+// All the parallel steps of a step list form one group, and the steps after it are sent only the
+// requests the whole group answered. [a ∥, s, b ∥] leaves it unclear whether s runs before b or
+// after the group, so the group must be listed where it runs, its members side by side (review of
+// plan 2c Task 12, I-4). The same rule holds for `then` steps.
+TEST_CASE("parallel steps that are not adjacent are refused, in an op and in then steps",
+          "[graph]") {
+  Scenario s{.name = "group", .version = 1, .duration = 1min};
+  s.nodes = {
+      NodeSpec{.id = "users",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"get", 1.0}}}},
+      NodeSpec{.id = "web",
+               .type = NodeType::service,
+               .ops = {{"get",
+                        {Step{.to = "a", .op = "get", .mode = StepMode::parallel},
+                         Step{.to = "s", .op = "get"},
+                         Step{.to = "b", .op = "get", .mode = StepMode::parallel}}}}},
+      NodeSpec{.id = "a", .type = NodeType::service},
+      NodeSpec{.id = "s", .type = NodeType::service},
+      NodeSpec{.id = "b", .type = NodeType::service}};
+  s.links = {LinkSpec{.from = "users", .to = "web"}};
+  for (const char* target : {"a", "s", "b"})
+    s.links.push_back(LinkSpec{.from = "web", .to = target});
+  const auto built = Graph::build(s);
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'web': the parallel steps of op 'get' must be adjacent (they form one group)");
+
+  auto c = cache("c", 0.4, CacheStrategy::cache_aside);
+  c.then = {Step{.to = "a", .op = "get", .mode = StepMode::parallel}, Step{.to = "s", .op = "get"},
+            Step{.to = "b", .op = "get", .mode = StepMode::parallel}};
+  s.nodes[1].ops = {{"get", {Step{.to = "c", .op = "get"}}}};
+  s.nodes.push_back(std::move(c));
+  s.links = {LinkSpec{.from = "users", .to = "web"}, LinkSpec{.from = "web", .to = "c"}};
+  for (const char* target : {"a", "s", "b"}) s.links.push_back(LinkSpec{.from = "c", .to = target});
+  const auto then_built = Graph::build(s);
+  REQUIRE_FALSE(then_built.has_value());
+  REQUIRE(then_built.error().message ==
+          "node 'c': the parallel then steps must be adjacent (they form one group)");
+
+  // Side by side, before or after the sequential steps, the same steps build.
+  s.nodes.back().then = {Step{.to = "s", .op = "get"},
+                         Step{.to = "a", .op = "get", .mode = StepMode::parallel},
+                         Step{.to = "b", .op = "get", .mode = StepMode::parallel}};
+  REQUIRE(Graph::build(s).has_value());
+}
+
 // A miss waits for what its miss steps fetch: the cache answers a miss only after the next
 // tier has. A parallel miss step would be timed beside the lookup instead of after it, the
 // reason a service's miss step must be sequential too, so it is refused.

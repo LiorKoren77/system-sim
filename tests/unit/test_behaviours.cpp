@@ -716,6 +716,31 @@ TEST_CASE("a limiter with a backend asks the counter store about every request i
   REQUIRE_THAT(limited.rejected.total().per_second, WithinRel(3000.0, 1e-12));
 }
 
+// The counter check comes before the request is passed on, so a check the store lost fails the
+// request closed (review of plan 2c Task 12, I-3): of 800 admitted calls a second, with the store
+// having answered 0.75 of its checks last step, the api is sent 800 x 0.75 = 600, the share
+// `delivered` also counts answered. The store is still asked about all 800: the check is made.
+TEST_CASE("a limiter whose counter check was lost forwards only the checked share: 600 of 800",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(
+      limiter_front(limiter_spec(LimiterAlgorithm::token_bucket, 1000, 500, "counters")));
+  RateLimiterBehaviour lim{g, *g.index_of("limiter")};
+  const auto counters = *g.index_of("counters");
+  const auto api = *g.index_of("api");
+  const auto check_lost_a_quarter = [&](std::size_t target, std::string_view /*op*/) {
+    return target == counters ? 0.75 : 1.0;
+  };
+  const auto routed = lim.route(flow_of("call", 800), 0s, 100ms, check_lost_a_quarter);
+  const auto to_counters = std::ranges::find(routed.outgoing, counters, &Outgoing::target);
+  const auto to_api = std::ranges::find(routed.outgoing, api, &Outgoing::target);
+  REQUIRE(to_counters != routed.outgoing.end());
+  REQUIRE(to_api != routed.outgoing.end());
+  REQUIRE_THAT(to_counters->flow.rate_of("counter").per_second, WithinRel(800.0, 1e-12));
+  REQUIRE_THAT(to_api->flow.rate_of("call").per_second, WithinRel(600.0, 1e-12));
+  REQUIRE(routed.rejected.total().per_second == 0.0);  // a lost check is no policy refusal
+  REQUIRE_THAT(lim.delivered("call", 1.0, check_lost_a_quarter), WithinRel(0.75, 1e-12));
+}
+
 TEST_CASE("a limiter's response adds the counter store hop and the api hop to its own sojourn",
           "[behaviours]") {
   // Links: limiter -> counters 1 ms one way, limiter -> api 3 ms one way. The counter check
@@ -2158,16 +2183,16 @@ TEST_CASE("an external sink prices each op by the graph's op cost", "[behaviours
 
 // ---- A step after a failed step does not run (plan 2c Task 12) ----
 //
-// The theory tests run the engine; this one pins where a parallel group sits among sequential
-// steps, which only a route with a hand-made lookup shows exactly. web's get is
-//   [a (parallel), s (sequential), b (parallel), c (sequential)]
-// and every parallel step of an op is one group (the schema's rule), which starts where its
-// first member sits: a and b are both sent what is alive there, the whole 100/s, and every step
-// after that point is thinned by the group as a whole, d_a × d_b = 0.5 × 0.8 = 0.4. So
+// The theory tests run the engine; this one pins how a parallel group thins the steps after it,
+// which only a route with a hand-made lookup shows exactly. web's get is
+//   [a (parallel), b (parallel), s (sequential), c (sequential)]
+// (the parallel steps of an op must be adjacent: Graph::build refuses [a ∥, s, b ∥], see
+// test_graph.cpp). a and b start together, so both are sent the whole 100/s, and every step after
+// the group is thinned by the group as a whole, d_a × d_b = 0.5 × 0.8 = 0.4. So
 //   a: 100, b: 100            (the group: they start together and do not thin each other)
-//   s: 100 × 0.4 = 40         (after the group's first member: the group's survivors)
+//   s: 100 × 0.4 = 40         (the group's survivors)
 //   c: 40 × d_s = 40 × 0.9 = 36
-TEST_CASE("a parallel group starts where its first member sits and thins every step after it",
+TEST_CASE("a parallel group is sent the whole flow and thins every step after it as a whole",
           "[behaviours]") {
   Scenario s{.name = "group", .version = 1, .duration = 1min};
   s.nodes = {
@@ -2178,9 +2203,8 @@ TEST_CASE("a parallel group starts where its first member sits and thins every s
                .type = NodeType::service,
                .ops = {{"get",
                         {Step{.to = "a", .op = "get", .mode = StepMode::parallel},
-                         Step{.to = "s", .op = "get"},
                          Step{.to = "b", .op = "get", .mode = StepMode::parallel},
-                         Step{.to = "c", .op = "get"}}}}},
+                         Step{.to = "s", .op = "get"}, Step{.to = "c", .op = "get"}}}}},
       NodeSpec{.id = "a", .type = NodeType::service},
       NodeSpec{.id = "s", .type = NodeType::service},
       NodeSpec{.id = "b", .type = NodeType::service},

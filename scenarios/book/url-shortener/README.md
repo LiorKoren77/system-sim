@@ -98,7 +98,9 @@ warmup).
   that drops ids, below, url_db's writes fall by its drop rate), and a redirect's miss step goes
   only to the cache's misses (`on: miss`). But the model is a fluid: "did not run" is a smaller
   flow, worked out from the fraction the earlier step delivered in the PREVIOUS simulation step
-  (1 s here), so a change of loss reaches the database one step late, and the steps are assumed
+  (1 s here), so a change of loss reaches the database one step late (plus the delay of the link
+  to the failing step's target, in whole steps: none here, a link of 0.25 ms rounds to zero
+  steps), and the steps are assumed
   to fail independently of one another. A failed request costs nothing more: no retry, no
   timeout spent waiting.
 - The client's 1 s timeout, partly (plan 2c Task 13). Each step, the response time of an op is
