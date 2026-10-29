@@ -830,3 +830,55 @@ TEST_CASE("explain on book/youtube prints the stream size on the byte-sized cdn"
   CAPTURE(text);
   REQUIRE(node_line(text, "cdn_us").contains("sizes: stream 50MB"));
 }
+
+// ---- The two shipped scenarios with external sinks (plan 2c Task 9) ----
+//
+// External sinks run since Task 9, but no scenario that runs after phase 2c reaches one:
+// notification-system (apns, fcm, sms_provider, email_provider: its workers' `then` steps) and
+// chat-system (push) each also need a type of a later phase, so the engine still refuses them,
+// and at the same node as before: Simulation::create checks every node's TYPE over the whole file
+// and names the first unsupported one in file order. Giving the sinks a model changes neither
+// refusal; their `failure_rate` shows in explain instead.
+
+// notification-system's nodes in file order: services, lb, notification_svc, user_cache,
+// user_db, user_limiter (all simulated), then `fanout`, a notification_fanout: the first node of
+// a type with no model.
+TEST_CASE("book/notification-system is still refused at fanout, its notification_fanout",
+          "[scenario]") {
+  const auto g = build_or_fail(load_scenario("/book/notification-system/scenario.yaml"));
+  const auto sim = simsys::engine::Simulation::create(g);
+  REQUIRE_FALSE(sim.has_value());
+  REQUIRE(sim.error().message ==
+          "node 'fanout' has type 'notification_fanout', which run/estimate do not support yet "
+          "(phase 2)");
+}
+
+// chat-system's nodes in file order: users, lb, the chat API service, then `discovery`, a
+// service_discovery, which comes before the `chat_servers` ws_gateway after it.
+TEST_CASE("book/chat-system is still refused at discovery, its service_discovery", "[scenario]") {
+  const auto g = build_or_fail(load_scenario("/book/chat-system/scenario.yaml"));
+  const auto sim = simsys::engine::Simulation::create(g);
+  REQUIRE_FALSE(sim.has_value());
+  REQUIRE(sim.error().message ==
+          "node 'discovery' has type 'service_discovery', which run/estimate do not support yet "
+          "(phase 2)");
+}
+
+// The books' providers' failure rates are the numbers in the YAML: APNs and FCM 2 %, the SMS
+// provider 5 %, the e-mail provider 1 % (ch. 10: third-party services are the unreliable part of
+// the pipeline), and chat-system's push gateway 2 %.
+TEST_CASE("explain on the shipped scenarios prints each external sink's failure rate",
+          "[scenario]") {
+  const auto notification = build_or_fail(load_scenario("/book/notification-system/scenario.yaml"));
+  const auto notification_text = simsys::report::render_explain(notification);
+  CAPTURE(notification_text);
+  REQUIRE(node_line(notification_text, "apns").contains("failure_rate=2%"));
+  REQUIRE(node_line(notification_text, "fcm").contains("failure_rate=2%"));
+  REQUIRE(node_line(notification_text, "sms_provider").contains("failure_rate=5%"));
+  REQUIRE(node_line(notification_text, "email_provider").contains("failure_rate=1%"));
+
+  const auto chat = build_or_fail(load_scenario("/book/chat-system/scenario.yaml"));
+  const auto chat_text = simsys::report::render_explain(chat);
+  CAPTURE(chat_text);
+  REQUIRE(node_line(chat_text, "push").contains("failure_rate=2%"));
+}

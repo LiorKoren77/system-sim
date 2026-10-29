@@ -237,3 +237,26 @@ TEST_CASE(
   // The pool's `cost` is a duration here and a map of capacity units on a service: two members.
   REQUIRE(pool.cost.empty());
 }
+
+// ---- External sinks (plan 2c refinement 8, Task 9) ----
+//
+// An external sink is a third party's API (APNs, an SMS provider): a queue of the type's numbers
+// that fails a share of what it serves. Two typed keys describe it:
+//   failure_rate  the share, in [0, 1], of the requests it serves that fail (a 5xx); a plain
+//                 double because "no failures" is a real value, 0, not an absent one: a sink that
+//                 states none behaves as the queue it always was;
+//   politeness    a rate (the crawler's "one request per host per second"), stored and printed,
+//                 not modelled (phase 3, it needs per-host state); absent when not stated.
+TEST_CASE("a default NodeSpec fails nothing and states no politeness", "[model]") {
+  const simsys::model::NodeSpec n{.id = "apns", .type = NodeType::external_sink};
+  REQUIRE(n.failure_rate == 0.0);
+  REQUIRE_FALSE(n.politeness.has_value());
+}
+
+TEST_CASE("an external sink's failure rate is a number and its politeness a rate", "[model]") {
+  simsys::model::NodeSpec sink{.id = "sms_provider", .type = NodeType::external_sink};
+  sink.failure_rate = 0.05;  // the notification system's SMS provider: 5 % of sends fail
+  sink.politeness = simsys::Rate{1.0};
+  REQUIRE(sink.failure_rate == 0.05);
+  REQUIRE(sink.politeness->per_second == 1.0);
+}

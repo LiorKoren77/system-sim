@@ -2173,3 +2173,46 @@ TEST_CASE("the JSON nodes carry peak_queue_lag_s: the queue's peak, null on ever
   }
   REQUIRE(nulls == 2);  // u and w; q's is the number
 }
+
+// ---- External sinks in explain (plan 2c refinement 8, Task 9) ----
+//
+// explain says what the two keys of an external sink mean for the model:
+//  - `failure_rate=2%`: the share of what the sink serves that fails (a 5xx), which the engine
+//    counts as drops;
+//  - `politeness=1/s (not modelled: phase 3)`: stored and printed, never simulated (it needs a
+//    per-host state, which arrives with the crawler's frontier).
+// A sink that states no politeness prints no note about one.
+
+namespace {
+// u -> apns: a client calling an external sink with the given failure rate and politeness.
+Scenario sink_reported(double failure_rate, std::optional<Rate> politeness) {
+  Scenario s{.name = "sink-report", .version = 1, .duration = 1min};
+  NodeSpec sink{.id = "apns", .type = NodeType::external_sink};
+  sink.failure_rate = failure_rate;
+  sink.politeness = politeness;
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{100}}, .op_shares = {{"send", 1.0}}}},
+      std::move(sink)};
+  s.links = {LinkSpec{.from = "u", .to = "apns"}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("explain prints a sink's failure rate as a percentage and its politeness as not modelled",
+          "[report]") {
+  const auto text = explain_of(sink_reported(0.02, Rate{1.0}));
+  CAPTURE(text);
+  const auto line = node_line(text, "apns");
+  REQUIRE(line.contains("failure_rate=2%"));
+  REQUIRE(line.contains("politeness=1/s (not modelled: phase 3)"));
+}
+
+TEST_CASE("explain prints no politeness note for a sink that states none", "[report]") {
+  const auto text = explain_of(sink_reported(0.05, std::nullopt));
+  CAPTURE(text);
+  const auto line = node_line(text, "apns");
+  REQUIRE(line.contains("failure_rate=5%"));
+  REQUIRE_FALSE(line.contains("politeness"));
+}

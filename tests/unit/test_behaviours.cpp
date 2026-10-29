@@ -35,6 +35,7 @@ using simsys::behaviours::BlobStoreBehaviour;
 using simsys::behaviours::CacheBehaviour;
 using simsys::behaviours::CdnBehaviour;
 using simsys::behaviours::ClientBehaviour;
+using simsys::behaviours::ExternalSinkBehaviour;
 using simsys::behaviours::LoadBalancerBehaviour;
 using simsys::behaviours::MessageQueueBehaviour;
 using simsys::behaviours::Outgoing;
@@ -2065,4 +2066,77 @@ TEST_CASE("a worker pool with no jobs sends nothing on", "[behaviours]") {
   const WorkerPoolBehaviour pool{g, *g.index_of("w")};
   const auto routed = pool.route(Flow{}, 0s, 100ms);
   REQUIRE(sent_to(routed, *g.index_of("svc")).total().per_second == 0.0);
+}
+
+// ---- ExternalSinkBehaviour (plan 2c refinement 8, Task 9) ----
+//
+// A third party's API (book ch. 10: APNs, FCM, an SMS provider) is a leaf: it answers the request
+// itself and calls nobody. Its queue is the type's (1k/s, 100 ms, service SCV 2.0) and the share
+// `failure_rate` of what that queue serves fails. The ENGINE counts the failures, moving them from
+// the node's drain to its drops, so the `own` share it hands `delivered` (1 - (dropped + rejected)
+// / inflow) already lacks them; the behaviour must hand that share back unchanged, or a failure
+// would be charged twice.
+
+namespace {
+// u -> api, zero-latency link: a client sending `call`s to an external sink that fails
+// `failure_rate` of what it serves. Node indices: u 0, api 1.
+Scenario sink_front(double failure_rate) {
+  Scenario s{.name = "sink", .version = 1, .duration = 1min};
+  NodeSpec api{.id = "api", .type = NodeType::external_sink};
+  api.failure_rate = failure_rate;
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload = Workload{.curve = {.base = Rate{100}},
+                                           .op_shares = {{"call", 0.75}, {"status", 0.25}}}},
+             std::move(api)};
+  s.links = {LinkSpec{.from = "u", .to = "api", .latency = 0s}};
+  return s;
+}
+}  // namespace
+
+static_assert(simsys::behaviours::NodeBehaviour<ExternalSinkBehaviour>);
+
+TEST_CASE("an external sink serves every incoming op and forwards nothing", "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(sink_front(0.02));
+  ExternalSinkBehaviour api{g, *g.index_of("api")};
+  Flow in;
+  in.add("call", Rate{75});
+  in.add("status", Rate{25});
+  const auto routed = api.route(in, 0s, 100ms);
+  REQUIRE(routed.outgoing.empty());
+  REQUIRE(routed.rejected.empty());  // a failure is a drop (a 5xx), never a policy's rejection
+  // `served` is the whole input: the failures are subtracted by the engine, from the queue's
+  // drain, not by the behaviour.
+  REQUIRE_THAT(routed.served.rate_of("call").per_second, WithinRel(75.0, 1e-12));
+  REQUIRE_THAT(routed.served.rate_of("status").per_second, WithinRel(25.0, 1e-12));
+  REQUIRE_THAT(routed.served.total().per_second, WithinRel(100.0, 1e-12));
+}
+
+TEST_CASE("an external sink's response is its own sojourn and it asks nobody downstream",
+          "[behaviours]") {
+  const auto g = *simsys::graph::Graph::build(sink_front(0.02));
+  const ExternalSinkBehaviour api{g, *g.index_of("api")};
+  const LatencyEstimate own{0.1, 0.02};
+  bool asked = false;
+  const auto lookup = [&](std::size_t, std::string_view) {
+    asked = true;
+    return LatencyEstimate{99.0, 99.0};
+  };
+  REQUIRE(api.response("call", own, lookup) == own);
+  REQUIRE(api.response("status", own, lookup) == own);
+  REQUIRE_FALSE(asked);
+}
+
+// 0.98 is the engine's own share for a sink that failed 2 % of what it served (1 - 10 / 500);
+// the behaviour returns it as it is, whatever its failure_rate says (0.98 x 0.98 = 0.9604 would
+// count each failure twice) and whatever a lookup would answer: a sink has no downstream.
+TEST_CASE("an external sink's delivered share is the engine's own, with failures counted once",
+          "[behaviours]") {
+  for (const double failure_rate : {0.0, 0.02, 1.0}) {
+    CAPTURE(failure_rate);
+    const auto g = *simsys::graph::Graph::build(sink_front(failure_rate));
+    const ExternalSinkBehaviour api{g, *g.index_of("api")};
+    REQUIRE_THAT(api.delivered("call", 0.98, [](std::size_t, std::string_view) { return 0.1; }),
+                 WithinRel(0.98, 1e-12));
+  }
 }
