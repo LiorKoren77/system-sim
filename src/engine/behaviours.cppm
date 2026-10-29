@@ -221,8 +221,9 @@ struct Hop {
   std::size_t link;    // link index the demand travels on
   double factor;       // downstream requests per request that takes the hop (graph::ServiceHop)
   double link_leg_s;   // one-way link latency in seconds
-  // Not waited for: the hop closes a call cycle, or is a write-back flush
-  // (graph::Graph::is_async_hop). It forwards flow but adds no latency and fails no request.
+  // Not waited for: the hop closes a call cycle, or is a write-back flush or a blob store's event
+  // notification (graph::Graph::is_async_hop). It forwards flow but adds no latency and fails no
+  // request.
   bool asynchronous;
 };
 
@@ -1206,21 +1207,27 @@ class CdnBehaviour {
 // Event notifications (plan 2c refinements 6-7): its `then` steps are S3 event notifications, the
 // way the book's event-driven pipelines start: ch. 14's "transcoding starts when the upload
 // completes" (the original storage tells the transcoding queue), ch. 15's upload that notifies
-// the metadata service. Every request the store SERVED (not one it dropped: the engine routes
-// what the queue drained) fires every step, rate × factor of the step's op, reads included (the
-// model does not filter events by kind, as S3 can by prefix or event type). A same-op step keeps
-// the request's size, a renamed one carries its `size:` or none (plan 2c refinement 1). Nobody
-// waits for an event (graph::Graph::is_async_hop): the uploader's response and delivered share end
-// at the store, as a write_back cache's flush is not waited for, and what the notified node drops
-// counts in that node's drop rate, never in the uploader's answered rate. Ignored: event batching
-// and the delivery delay (S3 sends an event within seconds, the model at once), failed or
-// duplicated notifications (S3 delivers at least once and may retry), and filters by event type.
+// the metadata service. Every WRITE the store SERVED (an op in its `write_ops`, default `[write]`:
+// youtube's original_store lists `upload`; not one it dropped: the engine routes what the queue
+// drained) fires every step, rate × factor of the step's op. A read fires nothing: S3 notifies on
+// ObjectCreated and ObjectRemoved, never on a GET, so 1000 views of a video start no transcode
+// (graph::Graph::then_fraction is 0 for a read; notifying on reads is phase 3). A same-op step
+// keeps the request's size, a renamed one carries its `size:` or none (plan 2c refinement 1).
+// Nobody waits for an event (graph::Graph::is_async_hop): the uploader's response and delivered
+// share end at the store, as a write_back cache's flush is not waited for, and what the notified
+// node drops counts in that node's drop rate, never in the uploader's answered rate. A step can be
+// neither `on: miss` nor `on: failure` nor in a `mode` (graph::Graph::build and the loader refuse
+// them: an event never misses, reports no failure, and is waited for by nobody). Ignored: event
+// batching and the delivery delay (S3 sends an event within seconds, the model after the link's
+// latency), failed or duplicated notifications (S3 delivers at least once and may retry), and
+// filters by key prefix.
 class BlobStoreBehaviour {
  public:
   BlobStoreBehaviour(const graph::Graph& g, std::size_t self);
 
-  // Serves every incoming op and sends rate × factor of each `then` step's op for it (the class
-  // comment's events). `now` and `dt` are unused (a store holds no state between steps).
+  // Serves every incoming op and sends rate × factor of each `then` step's op for each write it
+  // served (the class comment's events; a read sends nothing). `now` and `dt` are unused (a store
+  // holds no state between steps).
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
 
   // Capacity units one request of `op` uses (graph::op_cost): its megabytes, or 1 for a store
@@ -1249,8 +1256,9 @@ class BlobStoreBehaviour {
  private:
   std::map<std::string, double, std::less<>> cost_by_op_;  // every op that reaches the store
   std::optional<MegabyteService> megabyte_service_;        // sized in bytes only
-  // Per op that can reach the store, one block per `then` step, every hop asynchronous
-  // (graph::Graph::is_async_hop): only HopBlocks::forward is ever asked of them.
+  // Per write op that can reach the store, one block per `then` step, every hop asynchronous
+  // (graph::Graph::is_async_hop): only HopBlocks::forward is ever asked of them. A read op has no
+  // blocks, so it forwards nothing.
   detail::HopBlocks events_;
 };
 
@@ -1726,8 +1734,9 @@ void CacheBehaviour::add_backend_block(const graph::Graph& g, const std::string&
 // Each `on: always` then-step is a block of its own, in its declared mode; the `on: miss` ones
 // share one sequential block, taken by the miss fraction graph::Graph::then_fraction gives
 // (1 − h of a read; 0 of a write, which adds no block). A step no request takes (`on:
-// failure` before phase 2c, a miss step on a write) is left out, as in ServiceBehaviour. A blob
-// store's steps are all unconditional (graph::Graph refuses one on miss): a block each.
+// failure` before phase 3, a miss step on a write) is left out, as in ServiceBehaviour. A blob
+// store's steps are all unconditional (graph::Graph refuses one on miss or on failure): a block
+// each for a write, none for a read (then_fraction 0: an event fires for a write only).
 void detail::add_then_blocks(const graph::Graph& g, std::size_t self, const std::string& op,
                              HopBlocks& hops) {
   auto& blocks = hops.blocks_for(op);

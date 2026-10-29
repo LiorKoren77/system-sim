@@ -46,8 +46,9 @@
 // write may reach it (Graph::check_reads_only), and no service `on: miss` step may follow it.
 // A blob store's `then` steps (plan 2c refinements 6-7) are its event notifications (S3 event
 // notifications, ch. 14 and 15): demand edges like a cache's unconditional steps, fired by every
-// request it serves, and asynchronous hops by design (detail::blob_store_events); a step on miss
-// is refused, since a blob store never misses (invalid_blob_store).
+// write it serves (an op in its `write_ops`; a read fires nothing, Graph::then_fraction), and
+// asynchronous hops by design (detail::blob_store_events); a step on miss or on failure, or in
+// parallel mode, is refused, since an event is none of those (invalid_blob_store).
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -416,10 +417,12 @@ class Graph {
   // as h = 0 (every read misses), as in service_hops.
   [[nodiscard]] double backend_fraction(std::size_t node, std::string_view op) const;
   // The share of the requests of `op` that node `node` has handled which go on to its `then`
-  // step `step`: 1 for an unconditional step; for an `on: miss` step after a cache, 1 - h of a
-  // read (an unknown h counts as 0, as in service_hops) and 0 of a write (writes do not miss);
-  // 0 for an `on: failure` step (phase 2c) and for a miss step anywhere else. (A CDN has no
-  // `then` steps: it fetches its misses from its origin, backend_fraction.)
+  // step `step`: 1 for an unconditional step, except at a blob store, whose steps are event
+  // notifications that fire for its writes only (1 of a write, 0 of a read: S3 notifies on
+  // ObjectCreated, never on a GET); for an `on: miss` step after a cache, 1 - h of a read (an
+  // unknown h counts as 0, as in service_hops) and 0 of a write (writes do not miss); 0 for an
+  // `on: failure` step (phase 3) and for a miss step anywhere else. (A CDN has no `then` steps:
+  // it fetches its misses from its origin, backend_fraction.)
   [[nodiscard]] double then_fraction(std::size_t node, const model::Step& step,
                                      std::string_view op) const;
   // Does node `from`, handling `op`, hand `target_op` off to node `to` without waiting?
@@ -680,18 +683,31 @@ namespace {
                      "'s write_ops"};
 }
 
-// Has the node a `then` step on miss?
-[[nodiscard]] bool has_then_step_on_miss(const model::NodeSpec& spec) {
+// Has the node a `then` step taken on `condition`?
+[[nodiscard]] bool has_then_step_on(const model::NodeSpec& spec, model::StepCondition condition) {
   // C++20 ranges algorithm: std::ranges::any_of takes the container itself instead of a
   // begin/end pair (and a projection if wanted), replacing std::any_of(v.begin(), v.end(), p).
+  return std::ranges::any_of(spec.then,
+                             [&](const model::Step& step) { return step.on == condition; });
+}
+
+// Has the node a `then` step in parallel mode?
+[[nodiscard]] bool has_parallel_then_step(const model::NodeSpec& spec) {
   return std::ranges::any_of(
-      spec.then, [](const model::Step& step) { return step.on == model::StepCondition::miss; });
+      spec.then, [](const model::Step& step) { return step.mode == model::StepMode::parallel; });
 }
 
 // Does the cache forward its own misses (a `then` step on miss)? Then nothing after it may fetch
 // them again (Graph::invalid_miss_step). (A CDN has no `then` steps: invalid_cdn.)
 [[nodiscard]] bool forwards_own_misses(const model::NodeSpec& spec) {
-  return has_then_step_on_miss(spec);
+  return has_then_step_on(spec, model::StepCondition::miss);
+}
+
+// Do the `then` steps of a node of `type` carry some ops that arrive and not others
+// (Graph::then_fraction)? A cache's do (a miss step carries no write) and a blob store's do (an
+// event fires for a write only); every other type's unconditional steps fire whatever arrives.
+[[nodiscard]] bool then_steps_follow_the_op(model::NodeType type) {
+  return hits_or_misses(type) || type == model::NodeType::blob_store;
 }
 
 // Would `step`, a `then` step of `cache`, send its store the very request its backend hop sends
@@ -895,14 +911,30 @@ void apply_database_keys(ResolvedNode& node) {
 
 // A blob store's `then` steps are event notifications (plan 2c refinement 7; S3 event
 // notifications, book ch. 14's "transcoding starts when the upload completes"): each fires for
-// every request the store serves. A blob store never misses, so an `on: miss` step, which only a
-// cache can take (Graph::then_fraction), would never fire; the scenario means something else, and
-// is told what the steps do instead of being run without them.
+// every write the store serves (Graph::then_fraction). Three step keys would ask for something an
+// event never does, so the scenario is told what the steps do instead of being run without them:
+//  - `on: miss`: a blob store never misses (only a cache can take a miss step);
+//  - `on: failure`: an event reports no failure before phase 3 (failed or retried notifications
+//    are ignored), so the step would never fire;
+//  - `mode: parallel`: a mode orders the calls a request waits for, and nobody waits for an
+//    event. (`mode: sequential` is the model's default, so only the loader, which sees the key
+//    written, can refuse it: config's read_blob_store_keys.)
 [[nodiscard]] std::optional<EngineError> invalid_blob_store(const model::NodeSpec& spec) {
-  if (!has_then_step_on_miss(spec)) return std::nullopt;
-  return EngineError{"node '" + spec.id +
-                     "': a blob store's then steps fire for every request it serves "
-                     "(on: miss needs a cache)"};
+  const auto refused = [&](std::string_view why) {
+    return EngineError{"node '" + spec.id + "': a blob store's then steps " + std::string{why}};
+  };
+  if (has_then_step_on(spec, model::StepCondition::miss)) {
+    return refused("fire for every write it stores (on: miss needs a cache)");
+  }
+  if (has_then_step_on(spec, model::StepCondition::failure)) {
+    return refused(
+        "fire for every write it stores (on: failure: an event reports no failure before phase 3)");
+  }
+  if (has_parallel_then_step(spec)) {
+    return refused(
+        "are event notifications nobody waits for (mode orders the calls a request waits for)");
+  }
+  return std::nullopt;
 }
 
 // Graph::build also takes clients written in code: their `keys` obey the loader's rules
@@ -1159,11 +1191,11 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
 }
 
 // The event notifications of every blob store (plan 2c refinements 6-7): (store, op) ->
-// (target, step.op) for each op that reaches it and each `then` step (Graph::build refuses an
-// `on: miss` one, invalid_blob_store). Asynchronous BY DESIGN, as a write-back flush is: S3 sends
-// the event once the object is stored (book ch. 14: transcoding starts when the upload completes),
-// and the uploader, answered by then, never waits for whoever receives it. Every op fires every
-// step, a read as much as an upload, since the model does not filter events by kind.
+// (target, step.op) for each write op that reaches it and each `then` step (Graph::build refuses
+// an `on: miss` or `on: failure` one, invalid_blob_store). Asynchronous BY DESIGN, as a write-back
+// flush is: S3 sends the event once the object is stored (book ch. 14: transcoding starts when the
+// upload completes), and the uploader, answered by then, never waits for whoever receives it. A
+// read fires no step (Graph::then_fraction is 0: S3 has no event for a GET), so it has no hop.
 [[nodiscard]] std::vector<AsyncHop> blob_store_events(const Graph& g) {
   std::vector<AsyncHop> events;
   for (std::size_t store = 0; store < g.nodes().size(); ++store) {
@@ -1171,6 +1203,7 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
     if (spec.type != model::NodeType::blob_store) continue;
     for (const auto& op : g.arriving_ops(store)) {
       for (const model::Step& step : spec.then) {
+        if (g.then_fraction(store, step, op) <= 0.0) continue;         // a read: no event
         events.push_back({store, op, *g.index_of(step.to), step.op});  // connect_step resolved it
       }
     }
@@ -1286,14 +1319,14 @@ void add_backend_hop(const ResolvedNode& cache, std::size_t node, std::string_vi
   hops.push_back({.to = *cache.backend, .op = std::string{op}, .misses_of = misses_of});
 }
 
-// `then` steps (Graph::then_fraction): an unconditional one carries everything, an `on: miss`
-// one the read misses of a cache (and nothing of a write, or of any other node; a CDN has no
-// `then` steps).
+// `then` steps (Graph::then_fraction): an unconditional one carries everything (at a blob store,
+// every write and no read), an `on: miss` one the read misses of a cache (and nothing of a write,
+// or of any other node; a CDN has no `then` steps).
 void add_then_hops(const Graph& g, const model::NodeSpec& spec, std::size_t node,
                    std::string_view op, std::vector<CallHop>& hops) {
   for (const model::Step& step : spec.then) {
     const auto target = *g.index_of(step.to);
-    if (step.on == model::StepCondition::always) {
+    if (step.on == model::StepCondition::always && g.then_fraction(node, step, op) > 0.0) {
       hops.push_back({.to = target, .op = step.op, .size = step.size});
     } else if (step.on == model::StepCondition::miss && hits_or_misses(spec.type) &&
                !is_write(spec, op)) {
@@ -2434,6 +2467,7 @@ double Graph::then_fraction(std::size_t node, const model::Step& step, std::stri
   using enum model::StepCondition;  // see hop_fraction
   switch (step.on) {
     case always:
+      if (spec.type == model::NodeType::blob_store) return is_write(spec, op) ? 1.0 : 0.0;
       return 1.0;
     case failure:
       return 0.0;
@@ -2819,10 +2853,11 @@ void Graph::collect_arriving_ops() {
         if (hop.fraction > 0.0) arrive(hop.target, hop.op);
       }
     }
-    // A cache's then steps depend on the op (a miss step carries no write): they follow each op
-    // that arrives, below. (A CDN has none.) Every other node's unconditional ones fire whatever
-    // it receives (a worker pool's work comes from the queue it consumes, not along an edge).
-    if (!hits_or_misses(spec.type)) {
+    // A cache's then steps depend on the op (a miss step carries no write), and so do a blob
+    // store's (an event fires for a write only): they follow each op that arrives, below. (A CDN
+    // has none.) Every other node's unconditional ones fire whatever it receives (a worker pool's
+    // work comes from the queue it consumes, not along an edge).
+    if (!then_steps_follow_the_op(spec.type)) {
       for (const model::Step& step : spec.then) {
         if (step.on == model::StepCondition::always) arrive(*index_of(step.to), step.op);
       }
@@ -2837,7 +2872,7 @@ void Graph::collect_arriving_ops() {
     const auto arrive = [&](std::size_t target, const std::string& sent) {
       arrive_from(node, target, sent);
     };
-    if (hits_or_misses(nodes_[node].spec.type)) {
+    if (then_steps_follow_the_op(nodes_[node].spec.type)) {
       for (const model::Step& step : nodes_[node].spec.then) {
         if (carries_flow(node, step, op)) arrive(*index_of(step.to), step.op);
       }
@@ -2858,10 +2893,10 @@ void Graph::collect_arriving_ops() {
   }
 }
 
-// Does a `then` step of cache `node` carry some of the requests of `op` that arrive at it?
-// then_fraction says: an unconditional one all of them, an `on: miss` one the misses of a read
-// (none if the cache never misses) and nothing of a write, an `on: failure` one nothing before
-// phase 2c.
+// Does a `then` step of cache or blob store `node` carry some of the requests of `op` that arrive
+// at it? then_fraction says: an unconditional one all of them (a blob store's, all of a write and
+// none of a read), an `on: miss` one the misses of a read (none if the cache never misses) and
+// nothing of a write, an `on: failure` one nothing before phase 3.
 bool Graph::carries_flow(std::size_t node, const model::Step& step, std::string_view op) const {
   return then_fraction(node, step, op) > 0.0;
 }
