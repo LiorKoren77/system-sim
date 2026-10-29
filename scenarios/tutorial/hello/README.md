@@ -10,8 +10,9 @@
   smoke test for both.
 
 ## What the model captures
-- Utilization: rho = offered / capacity = 100 / 1000 = 0.1, i.e. 10 %, green
-  (`explain`: `offered 100/s vs 1k/s total capacity (10%, green)`).
+- Utilization: rho = offered / capacity = 100 / 1000 = 0.1, i.e. 10 %, green. `explain`
+  prints it as `api  peak offered 100/s vs 1k/s total capacity  (10%, green)`: the peak
+  of the client's rate (a constant 100/s here), with two spaces before the bracket.
 - Implied concurrency: with no `advanced.concurrency`, `c = max(1, ceil(1000/s × 1 ms))
   = 1` (Little's law at full load: busy servers = throughput × time in service), so
   `api` is a single-server queue.

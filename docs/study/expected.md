@@ -2,14 +2,24 @@
 
 ## Used in
 
-- `src/core/core.cppm`: `parse_duration`, `parse_rate`, `parse_byte_rate` return
-  `std::expected<SimTime | Rate | ByteRate, ParseError>`; the `simsys::detail` helpers
+- `src/core/core.cppm`: `parse_duration`, `parse_rate`, `parse_byte_rate`, `parse_size` return
+  `std::expected<SimTime | Rate | ByteRate | Bytes, ParseError>`; the `simsys::detail` helpers
   (`split_number`, `require_non_negative_finite`, `split_non_negative_number`,
   `nanoseconds_per`, `to_sim_time`, `parse_scaled_number`) chain the same type.
 - `src/config/config.cpp`: `simsys::config::load` returns `std::expected<Scenario, ConfigError>`;
-  the validator pipeline is a set of `check_*` functions returning
-  `CheckResult = std::expected<void, ConfigError>`.
-- `src/cli/main.cpp`: `run_validate` is the consumer (`if (!scenario) { scenario.error() ... }`).
+  every reader and check returns `std::expected<T, ConfigError>`, with
+  `CheckResult = std::expected<void, ConfigError>` for a check that produces no value
+  (`check_top_level`, `read_version`, `read_capacity`, ...), and `validate` chains them.
+- `src/engine/graph.cppm` and `src/engine/engine.cppm`: `Graph::build` returns
+  `std::expected<Graph, EngineError>` (the refusals the loader cannot see, such as a step with
+  no link) and `Simulation::create` returns `std::expected<Simulation, EngineError>` (a node
+  type the engine does not run yet).
+- `src/session/session.cpp`: `load_graph`, `build_graph`, `create_simulation` and
+  `run_summary(graph, path)` turn those errors into the finished message
+  (`std::expected<T, std::string>`) for the CLI and the sweep; `src/sweep/sweep.cpp` adds the
+  point's label in front of it.
+- `src/cli/main.cpp`: the consumer (`run_validate`: `if (!scenario) { print_error(describe(
+  scenario.error())); ... }`).
 
 ## What
 
@@ -33,25 +43,36 @@ Monadic operations (C++23) act on the value or the error without an `if`:
 | `transform_error(f)` | a plain error | value passes through; error `E` -> `G` |
 | `or_else(f)` | an `expected<T,G>` | recover from or replace an error |
 
-Two uses in this code base, and why they were the right ones:
+Three uses in this code base, and why they were the right ones:
 
 ```cpp
 // core.cppm, parse_rate: the last step, wrapping the double in a Rate, cannot fail
 return detail::parse_scaled_number(number_text, text, detail::rate_prefixes)
     .transform([](double v) { return Rate{v}; });
 
-// config.cpp, parse_duration_key: re-prefix the error with the key name and add a location
-return parse_duration(value.Scalar()).transform_error([&](const ParseError& error) {
-  return unit_error(file, value, key, error);
+// config.cpp, parse_scalar: give the unit parser's error a location and the key's name
+return parse(value.Scalar()).transform_error([&](const ParseError& error) {
+  return unit_error(site, value, label, error);
 });
+
+// session.cpp, load_graph: two fallible stages, one error type at the end
+return config::load(path, overrides)
+    .transform_error(config::describe)   // ConfigError -> its message
+    .and_then([&](model::Scenario scenario) { return build_graph(path, std::move(scenario)); });
 ```
 
 `transform` fits `parse_rate` because the final step is infallible, so there is no second error
-to merge (`and_then` would only add noise). `transform_error` fits `parse_duration_key` because
-the value needs no change and only the error type must change, `ParseError` -> `ConfigError`
-(with file, line, column and a `duration: ` prefix). `parse_capacity` combines both:
-`parse_byte_rate(text).transform([](ByteRate) {})` discards the value to get an
-`expected<void, ParseError>`. Steps that can fail still use early return (below).
+to merge (`and_then` would only add noise). `transform_error` fits `parse_scalar` because the
+value needs no change and only the error type must change, `ParseError` -> `ConfigError` (with
+file, line, column and the key's name in front). `load_graph` uses both: the loader's error
+becomes a string first, so that the graph builder's stage, which fails with a string too, can be
+chained with `and_then`, which requires the same error type on both sides.
+
+`transform` also turns "read a value" into "read it into this field". `store_in(target)`
+(`config.cpp`) returns a lambda that assigns its argument and returns nothing, so
+`parse_rate(text).transform(store_in(node.capacity))` is an `expected<void, ParseError>`:
+stored, or why not. `read_capacity` chains such steps with `and_then`. Steps whose value the
+next line needs still use early return (below).
 
 ## Why
 
@@ -80,27 +101,29 @@ auto [value, unit] = *split;
 
 ```cpp
 using CheckResult = std::expected<void, ConfigError>;
-CheckResult check_version(const std::string& file, const YAML::Node& root) {
+CheckResult read_version(const Site& site, const YAML::Node& root, int& version) {
   ...
-  if (version.as<int>(0) != 1) return std::unexpected(error_at(file, version, "version must be 1"));
+  if (!number || *number != 1) return site.fail(value, "version must be 1");
+  version = *number;
   return {};   // {} = "fine"
 }
 ```
 
-`// Pattern: Validator pipeline` (`config.cpp`, `validate`): each check is a function
-returning an `expected`; they run in order and the first failure is returned. Chains of
-`if (auto checked = check_x(...); !checked) return checked;` forward a `CheckResult` unchanged
-(`check_step_list`), while `validate` converts to `expected<Scenario, ConfigError>` with
-`std::unexpected(checked.error())`.
+`// Pattern: Pipeline with early exit (railway-oriented error handling)` (`config.cpp`,
+`validate`): each stage returns an `expected`; they run in order and the first failure is
+returned. Chains of `if (auto checked = check_x(...); !checked) return checked;` forward a
+`CheckResult` unchanged (`check_top_level`), while `validate` converts to
+`expected<Scenario, ConfigError>` with `std::unexpected(checked.error())`.
 
 The **single exception boundary** is `config::load`: yaml-cpp throws `YAML::Exception` on syntax
-and shape errors, so `load` wraps `validate(file, YAML::LoadFile(file))` in one `try`/`catch` and
-returns `std::unexpected(detail::error_at_mark(file, e.mark, e.msg))`. Callers never need `try`.
+and shape errors, so `load` wraps `YAML::LoadFile(file)`, the overrides and `validate` in one
+`try`/`catch` and returns `std::unexpected(detail::error_at_mark(file, e.mark, e.msg))`. Callers
+never need `try`.
 
 ## Pitfalls
 
 - **`*e` on an error is UB**, with no diagnostic. Always test (`if (!e) ...`) first; note that
-  the code above dereferences only after the check (`*split`, `*nodes`).
+  the code above dereferences only after the check (`*split`, `*number`).
 - **`value()` throws** `std::bad_expected_access<E>` on an error. That is a hidden exception
   path; prefer an explicit check, or `value_or` when a default is meaningful.
 - **`E` must be copyable or movable**: `std::unexpected(split.error())` copies the error. Fine

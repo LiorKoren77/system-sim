@@ -62,7 +62,8 @@ run's peaks are 69.0 % and 69.4 %), less than a point from yellow (70 %); the ru
 
 ## What the model captures
 All numbers are from `simsys explain` and `simsys run` on `scenario.yaml` (24 h at 100 ms
-steps, 5 min warmup: 861,000 observed steps, about 20 s in a Release build).
+steps, 5 min warmup: 861,000 observed steps; about 20 s in a Release build on the author's
+machine).
 
 - **The day passes.** `run` exits 0: `PASS p99_latency users read_feed 5.99ms 200ms`, `PASS
   drop_rate - - 0 0.001`, `PASS queue_lag fanout_q - <1us 2m`. Nothing is dropped anywhere.
@@ -120,7 +121,7 @@ steps, 5 min warmup: 861,000 observed steps, about 20 s in a Release build).
 ## Things to try
 - **Fewer fan-out workers.** `simsys sweep scenarios/book/news-feed/scenario.yaml --param
   nodes.fanout.workers=8..32:4 --metric fanout_q.lag --metric fanout.mean_rho` (the four
-  points in parallel, about 25 s):
+  points in parallel; about 25 s on the author's machine):
 
   ```
   nodes.fanout.workers  fanout_q.lag  fanout.mean_rho

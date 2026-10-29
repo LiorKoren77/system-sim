@@ -13,9 +13,10 @@
 - The 100 ms latency budget against a 5 ms index read on misses.
 
 ## What the model shows
-`simsys run` plays the whole day at the shipped 100 ms step (862.8k steps, about 5 s in Release)
-and exits 0. At the 20:00 peak the users send 24k/s × 1.5 = 36k keystrokes/s, 95 % suggests and
-5 % searches. The numbers below are `explain`'s peak checks and the run's `peak_rho`:
+`simsys run` plays the whole day at the shipped 100 ms step (862.8k steps; about 5 s in a Release
+build on the author's machine) and exits 0. At the 20:00 peak the users send 24k/s × 1.5 = 36k
+keystrokes/s, 95 % suggests and 5 % searches. The numbers below are `explain`'s peak checks and
+the run's `peak_rho`:
 
 | node | peak load | of | utilization |
 |---|---|---|---|
@@ -103,7 +104,7 @@ for the same machines, and a new trending query is invisible until the next one.
 - **A smaller trie cache, `trie_cache.keys: 1M`** (50× smaller): the Che hit ratio falls from
   0.995 to 0.952, so `trie_db` is offered 982.9/s at the peak instead of 103.1/s (12.3 %, still
   green), and the suggest p99 rises from 6.86 to 9.27 ms, which still passes the 100 ms SLO. The
-  Zipf head carries the cache: at `keys: 1k` h is still 0.727 (`trie_db` at 70.2 %, p99 16.6 ms,
+  Zipf head carries the cache: at `keys: 1k` h is still 0.727 (`trie_db` at 70.2 %, p99 16.7 ms,
   both SLOs pass). Only at `keys: 100` (h = 0.551) is `trie_db` offered 9.211k/s, 115 % of its
   8k/s: it drops (drop rate 3.8 %), 16.1 % of the delivered suggests time out at 100 ms, and both
   SLOs fail (exit 2). On this skew, cache size is about the database's load long before it is

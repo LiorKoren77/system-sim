@@ -100,7 +100,7 @@ into bytes, so two threads writing "different elements" write the same byte: a d
 Every point loads the file with its value in place (`config::load(path, overrides)`), builds its
 own `Graph`, creates its own `Simulation` and feeds its own `report::Summary`. A simulation is
 deterministic: the same scenario and seed give the same numbers, bit for bit (the clients' noise
-is seeded from the scenario, `behaviours::client_seed`). Nothing in one point depends on another
+is seeded from the scenario, `workload::client_seed`). Nothing in one point depends on another
 or on which thread ran it, and row `i` is stored at index `i`, not in the order the points
 finish. So the rows, and the bytes printed from them, are the same for any `--jobs`: the CLI test
 compares `--jobs 1` with `--jobs 3` byte for byte, and the unit test compares the doubles exactly.

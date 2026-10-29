@@ -114,8 +114,8 @@ Still abstracted: the chunks themselves (a chunk lost is retried, not the file) 
 request that times out is simply counted, nobody sends it again.
 
 ## The day's run
-`simsys run` steps 24 h at 100 ms (861,000 steps observed after the 5 m warmup, about a minute
-of CPU in a Release build) and exits 0, every SLO passing:
+`simsys run` steps 24 h at 100 ms (861,000 steps observed after the 5 m warmup; about a minute
+of CPU in a Release build on the author's machine) and exits 0, every SLO passing:
 
 ```
 slo

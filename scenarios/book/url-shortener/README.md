@@ -76,9 +76,10 @@ warmup).
   report; its worst hour is 13:02-14:02, the hour that ends just after the 14:00 peak, at
   **0.6433** (0.9966 of the peak's 0.6455: the sine is nearly flat around its top). With
   `shards: 2` that hour is 0.965 and the SLO fails while the day-long ones still pass (below).
-- **The step size.** The scenario runs at `step: 1s` (86,280 observed steps; 0.4 s in a
-  Release build, 6.4 s in Debug) where the first draft ran at 100 ms (862,800 steps; 4.4 s in
-  Release, 65 s in Debug). The fluid step is exact while demand is constant within it, and the
+- **The step size.** The scenario runs at `step: 1s` (86,280 observed steps) where the first
+  draft ran at 100 ms (862,800 steps), ten times fewer steps and so about a tenth of the time
+  (on the author's machine 0.4 s against 4.4 s in a Release build, 6.4 s against 65 s in
+  Debug). The fluid step is exact while demand is constant within it, and the
   daily sine moves at most 0.003 % of its peak in a second. Compared field by field in
   `run --report json`, the two runs agree to 1.1e-8 (the day's utilizations, offered rates,
   committed writes), 2e-9 (every latency percentile; the p99 is 7.48975 ms in both) and 1.3e-6
