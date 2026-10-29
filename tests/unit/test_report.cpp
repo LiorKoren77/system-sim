@@ -1332,8 +1332,9 @@ TEST_CASE("explain still renders a cdn that has a byte capacity", "[report]") {
 // node's. The check line says both: "peak offered 90k/s (30k/s x N 3) vs 80k/s (8 nodes)", the
 // requests beside the replica-requests, the machines beside the total. Behind a ring (N < nodes)
 // the average hides the node that breaks first, so the verdict is the HOTTEST node's, k = 1 +
-// 1/sqrt(vnodes) times the average (the balancer's ring, 1.0816 at the default 150 virtual
-// nodes): "(hottest 122%, red)"; with N = nodes every node holds every key and the verdict is the
+// z_M/sqrt(N vnodes) times the average (the balancer's ring heuristic, z_M the expected maximum of
+// M standard normals: 1.0676 for 8 machines at N = 3 and the default 150 virtual nodes, 1.0834
+// for 16): "(hottest 120%, red)"; with N = nodes every node holds every key and the verdict is the
 // plain average. This replaces the phase-2c "not checked: kv_cluster nodes, replication and
 // quorums: phase 3" note, which said the numbers had no model to be checked against.
 
@@ -1355,26 +1356,37 @@ Scenario kv_explained(int nodes, double rate) {
 }  // namespace
 
 // nodes = 8: 30k requests/s x N 3 = 90k replica-requests/s over 8 x 10k = 80k/s: 112.5 % on
-// average, and the hottest node k = 1.0816 x 11.25k = 12.17k/s: 121.7 %, printed to three digits
-// as 122 %, red.
+// average, and the hottest node k = 1.0676 x 11.25k = 12.01k/s: 120.1 %, printed to three digits
+// as 120 %, red.
 TEST_CASE("explain checks eight kv nodes at 30k requests a second: the hottest node is red",
           "[report]") {
   const auto text = explain_of(kv_explained(8, 30'000));
   CAPTURE(text);
   const auto line = check_line(text, "store");
   REQUIRE(
-      line.contains("peak offered 90k/s (30k/s × N 3) vs 80k/s (8 nodes)  (hottest 122%, red)"));
+      line.contains("peak offered 90k/s (30k/s × N 3) vs 80k/s (8 nodes)  (hottest 120%, red)"));
   REQUIRE_FALSE(line.contains("not checked"));
 }
 
-// nodes = 16: the same 90k/s over 160k/s, 56.25 % on average, the hottest 60.84 %: 60.8 %, green.
+// nodes = 16: the same 90k/s over 160k/s, 56.25 % on average, the hottest 1.0834 x that = 60.94 %:
+// 60.9 %, green.
 TEST_CASE("explain checks sixteen kv nodes at 30k requests a second: the hottest node is green",
           "[report]") {
   const auto text = explain_of(kv_explained(16, 30'000));
   CAPTURE(text);
   REQUIRE(check_line(text, "store")
               .contains("peak offered 90k/s (30k/s × N 3) vs 160k/s (16 nodes)  "
-                        "(hottest 60.8%, green)"));
+                        "(hottest 60.9%, green)"));
+}
+
+// A paper load far beyond capacity prints its percentage in full, not in exponent notation
+// (review of plan 2c Tasks 9-10, minor 11): 1M requests/s x 3 over 3 x 10k = 30k/s is 10000 %,
+// which three significant digits used to print as "1e+04%".
+TEST_CASE("explain prints a percentage beyond a thousand in full", "[report]") {
+  const auto text = explain_of(kv_explained(3, 1'000'000));
+  CAPTURE(text);
+  REQUIRE(check_line(text, "store").contains("(10000%, red)"));
+  REQUIRE_FALSE(text.contains("e+0"));
 }
 
 // N = nodes = 3: every node holds every key, so the verdict is the plain average and no node is
@@ -1389,12 +1401,15 @@ TEST_CASE("explain gives a kv_cluster that replicates to every node a plain perc
 }
 
 // The node line prints the resolved shape and what it does not yet model. Defaults applied
-// (N = 3, W = 2, R = 2, ap: Dynamo's classic quorum, ch. 6), without "(default)" marks.
+// (N = 3, W = 2, R = 2, ap: Dynamo's classic quorum, ch. 6), each marked "(default)" as explain
+// marks every number the scenario did not state (review of plan 2c Tasks 9-10, minor 9).
 TEST_CASE("explain prints a kv_cluster's nodes, replication, quorums and mode", "[report]") {
   SECTION("defaults for everything but the nodes") {
     const auto text = explain_of(kv_explained(3, 1000));
     CAPTURE(text);
-    REQUIRE(node_line(text, "store").contains("nodes=3 N=3 W=2 R=2 mode=ap (partitions: phase 3)"));
+    REQUIRE(node_line(text, "store")
+                .contains("nodes=3 N=3 (default) W=2 (default) R=2 (default) mode=ap (default; "
+                          "partitions: phase 3)"));
   }
   SECTION("stated values, cp mode") {
     auto s = kv_explained(5, 1000);
@@ -1405,6 +1420,42 @@ TEST_CASE("explain prints a kv_cluster's nodes, replication, quorums and mode", 
     const auto text = explain_of(s);
     CAPTURE(text);
     REQUIRE(node_line(text, "store").contains("nodes=5 N=5 W=3 R=3 mode=cp (partitions: phase 3)"));
+    REQUIRE_FALSE(node_line(text, "store").contains("default"));
+  }
+}
+
+// W + R > N is what makes a quorum read see the latest write (ch. 6: a read quorum and a write
+// quorum must share a replica). explain says when a scenario's quorums do not overlap, and that
+// `mode: cp` (consistency over availability) asks for exactly that overlap, so cp with W + R <= N
+// contradicts itself (review of plan 2c Tasks 9-10, minor 6). Nothing is modelled about it: the
+// model has no versions of a key, only the time and the loss of a quorum.
+TEST_CASE("explain warns when the read and write quorums do not overlap", "[report]") {
+  auto s = kv_explained(3, 1000);
+  s.nodes[1].replication = 3;
+  s.nodes[1].write_quorum = 1;
+  s.nodes[1].read_quorum = 2;
+  s.nodes[1].kv_mode = simsys::model::KvMode::ap;
+  SECTION("ap: the note alone") {
+    const auto text = explain_of(s);
+    CAPTURE(text);
+    REQUIRE(node_line(text, "store")
+                .contains("N=3 W=1 R=2 (W + R ≤ N: a read may miss the latest write) mode=ap "
+                          "(partitions: phase 3)"));
+  }
+  SECTION("cp: and the contradiction") {
+    s.nodes[1].kv_mode = simsys::model::KvMode::cp;
+    const auto text = explain_of(s);
+    CAPTURE(text);
+    REQUIRE(
+        node_line(text, "store")
+            .contains(
+                "mode=cp (partitions: phase 3; cp needs W + R > N: these quorums contradict it)"));
+  }
+  SECTION("overlapping quorums: no note") {
+    s.nodes[1].read_quorum = 3;
+    const auto text = explain_of(s);
+    CAPTURE(text);
+    REQUIRE_FALSE(node_line(text, "store").contains("W + R"));
   }
 }
 
@@ -2322,6 +2373,22 @@ TEST_CASE("explain prints a sink's failure rate as a percentage and its politene
   const auto line = node_line(text, "apns");
   REQUIRE(line.contains("failure_rate=2%"));
   REQUIRE(line.contains("politeness=1/s (not modelled: phase 3)"));
+}
+
+// A sink that fails everything it serves answers nobody: there is no latency to report, and the op
+// table prints `-` rather than the sojourn of requests that all failed (review of plan 2c Tasks
+// 9-10, minor 8).
+TEST_CASE("the op table prints no latency for an op nobody answered", "[report]") {
+  const auto s = sink_reported(1.0, std::nullopt);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  REQUIRE(summary.ops().front().answered_per_s == 0.0);
+  const auto text = simsys::report::render_table(summary, {}, /*color=*/false);
+  CAPTURE(text);
+  const auto row = text.substr(text.find("u.send"));
+  const auto line = row.substr(0, row.find('\n'));
+  REQUIRE_FALSE(line.contains("ms"));
+  REQUIRE(line.contains(" -"));
 }
 
 TEST_CASE("explain prints no politeness note for a sink that states none", "[report]") {

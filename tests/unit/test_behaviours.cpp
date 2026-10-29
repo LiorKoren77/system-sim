@@ -2140,3 +2140,18 @@ TEST_CASE("an external sink's delivered share is the engine's own, with failures
                  WithinRel(0.98, 1e-12));
   }
 }
+
+// A sink's price per request comes from the one rule every behaviour and explain's paper load
+// share (graph::op_cost, through detail::arriving_op_costs), not from a hard-coded 1 (review of
+// plan 2c Tasks 9-10, minor 7): the loader gives a sink no `cost` key, so from a file every op
+// costs 1, but a scenario built in code may state one, and the engine and explain must then agree.
+TEST_CASE("an external sink prices each op by the graph's op cost", "[behaviours]") {
+  auto s = sink_front(0.0);
+  s.nodes[1].cost = {{"call", 2.0}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto api = *g.index_of("api");
+  const ExternalSinkBehaviour sink{g, api};
+  REQUIRE(sink.cost("call") == simsys::graph::op_cost(g, api, "call"));
+  REQUIRE(sink.cost("call") == 2.0);
+  REQUIRE(sink.cost("status") == 1.0);
+}

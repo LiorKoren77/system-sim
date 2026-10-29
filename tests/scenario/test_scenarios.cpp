@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -27,6 +28,7 @@ import simsys.defaults;
 import simsys.engine;
 import simsys.graph;
 import simsys.model;
+import simsys.queueing;
 import simsys.report;
 
 // explain's lines, shared with test_report and test_series (review of plan 2c Task 7, minor 7).
@@ -925,15 +927,38 @@ TEST_CASE("explain on the shipped scenarios prints each external sink's failure 
 // The lab ships with `nodes: 16`: 30k requests/s from the clients, 3 x 30k = 90k replica-requests/s
 // (N = 3: the coordinator sends each read and write to three replicas) over 16 nodes of 10k/s.
 //   average node  90k / 16 = 5.625k/s   = 56.25 %
-//   hottest node  k x 5.625k, k = 1 + 1/sqrt(150) = 1.08165 (150 vnodes), = 6.084k/s = 60.84 %
-// The `utilization` SLO (max 0.8) is read at the hottest node, so it observes 0.6084 and passes;
+//   hottest node  k x 5.625k, k = 1 + z_16/sqrt(3 x 150) = 1.08338 (z_16 = 1.7688, the expected
+//                 maximum of 16 standard normals; 150 vnodes), = 6.094k/s = 60.94 %
+// The `utilization` SLO (max 0.8) is read at the hottest node, so it observes 0.6094 and passes;
 // the `drop_rate` SLO (max 0.01) sees nothing dropped; the put's p99 (max 20 ms) is far below it:
 // a put crosses four 0.25 ms link legs (1 ms), the coordinator (0.2 ms of service, utilization 0.5
-// over 4 x 15k/s) and the W = 2 quorum of three 0.3 ms store nodes (5/6 of their mean sojourn,
-// about 0.3 ms), so its mean is a little over 1.5 ms and the lognormal fit's p99 lies between that
-// and 5 ms.
+// over 4 x 15k/s: 0.232 ms with its Erlang wait) and the W = 2 quorum over its key's real replicas
+// (with probability p_hot = 3k/16 = 0.203 the hot machine and two cool ones, otherwise three cool
+// ones; each machine's sojourn a lognormal of its own moments: 0.313 ms), so its mean is 1.544 ms
+// and the lognormal fit's p99 2.31 ms (re-derived for the review of Tasks 9-10, C-1: 2.41 ms
+// before, when every replica was an exponential of the machines' mean sojourn).
+namespace {
+// k = min(1 + z_M / sqrt(N v), M / N), z_M by Blom (queueing::expected_normal_maximum).
+double ring_factor(int machines, int replication, int vnodes) {
+  return std::min(1.0 + simsys::queueing::expected_normal_maximum(machines) /
+                            std::sqrt(static_cast<double>(replication) * vnodes),
+                  static_cast<double>(machines) / replication);
+}
+
+// The lab with its store at `nodes` machines of `vnodes` virtual nodes each, `minutes` long.
+simsys::model::Scenario kv_lab(int nodes, int vnodes, std::chrono::minutes minutes) {
+  auto s = load_scenario("/labs/kv-store/scenario.yaml");
+  const auto store = std::ranges::find(s.nodes, "store", &simsys::model::NodeSpec::id);
+  REQUIRE(store != s.nodes.end());
+  store->kv_nodes = nodes;
+  store->vnodes = vnodes;
+  s.duration = minutes;
+  return s;
+}
+}  // namespace
+
 TEST_CASE(
-    "labs/kv-store at sixteen nodes runs and passes its SLOs with the hottest node at 60.8 percent",
+    "labs/kv-store at sixteen nodes runs and passes its SLOs with the hottest node at 60.9 percent",
     "[scenario]") {
   const auto s = load_scenario("/labs/kv-store/scenario.yaml");
   const auto store = std::ranges::find(s.nodes, "store", &simsys::model::NodeSpec::id);
@@ -947,33 +972,33 @@ TEST_CASE(
   }
   const auto& utilization = slo_of(results, simsys::model::SloMetric::utilization);
   REQUIRE(utilization.observed.has_value());
-  REQUIRE_THAT(*utilization.observed,
-               Catch::Matchers::WithinRel(
-                   90'000.0 / 16.0 / 10'000.0 * (1.0 + 1.0 / std::sqrt(150.0)), 1e-3));
-  REQUIRE_THAT(*utilization.observed, Catch::Matchers::WithinAbs(0.6084, 5e-4));
+  REQUIRE_THAT(
+      *utilization.observed,
+      Catch::Matchers::WithinRel(90'000.0 / 16.0 / 10'000.0 * ring_factor(16, 3, 150), 1e-3));
+  REQUIRE_THAT(*utilization.observed, Catch::Matchers::WithinAbs(0.6094, 5e-4));
   const auto& drops = slo_of(results, simsys::model::SloMetric::drop_rate);
   REQUIRE(drops.observed == 0.0);
   const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
   REQUIRE(p99.observed.has_value());
-  REQUIRE(*p99.observed > 1.5e-3);
-  REQUIRE(*p99.observed < 5e-3);
+  REQUIRE_THAT(*p99.observed, Catch::Matchers::WithinAbs(2.31e-3, 0.01e-3));
 }
 
 // The lesson the lab's comment states: the same lab at the book's eight nodes is over capacity.
-// 90k replica-requests/s over 8 x 10k = 80k/s: 11.25k per node (112.5 %), the hottest 1.0816 x that
-// = 12.17k (121.7 %). Every node's queue fills, so the cluster serves 80k of the 90k and drops one
-// ninth: drop_rate 1/9 = 0.1111 against its 0.01, and the hottest node's rho saturates at 1.0
-// against the utilization SLO's 0.8. Both fail. (5 minutes of the 30, 1 of them warmup: the
-// queues fill in under a second.)
-TEST_CASE("labs/kv-store at eight nodes drops a ninth of the replica-requests and fails two SLOs",
-          "[scenario]") {
-  using namespace std::chrono_literals;
-  auto s = load_scenario("/labs/kv-store/scenario.yaml");
-  const auto store = std::ranges::find(s.nodes, "store", &simsys::model::NodeSpec::id);
-  REQUIRE(store != s.nodes.end());
-  store->kv_nodes = 8;
-  s.duration = 5min;
-  const auto results = run_slos(std::move(s));
+// 90k replica-requests/s over 8 x 10k = 80k/s: 11.25k per node (112.5 %), the hottest
+// k = 1.0676 x that = 12.01k (120.1 %). Every node's queue fills, so the cluster serves 80k of the
+// 90k and drops one ninth: drop_rate 1/9 = 0.1111 against its 0.01, and the hottest node's rho
+// saturates at 1.0 against the utilization SLO's 0.8. The put's p99 fails too: every replica now
+// waits for its full room, 1000 requests drained at 10k/s = 100 ms, with the spread the fluid
+// gives a full queue (the Erlang wait's at the 0.99 clamp, sd 10 ms: three servers per machine);
+// the second of three such replies is 100.03 ms (sd 6.7 ms), and the client's p99 117.8 ms. (The
+// 306 ms the lab showed before the review of Tasks 9-10 came from treating each replica as an
+// exponential of mean 100 ms, sd 100 ms, not from the room.) Three SLOs fail. (5 minutes of the
+// 30, 1 of them warmup: the queues fill in under a second.)
+TEST_CASE(
+    "labs/kv-store at eight nodes drops a ninth of the replica-requests and fails all three "
+    "SLOs",
+    "[scenario]") {
+  const auto results = run_slos(kv_lab(8, 150, std::chrono::minutes{5}));
   const auto& drops = slo_of(results, simsys::model::SloMetric::drop_rate);
   REQUIRE(drops.status == simsys::report::SloStatus::fail);
   REQUIRE(drops.observed.has_value());
@@ -982,6 +1007,52 @@ TEST_CASE("labs/kv-store at eight nodes drops a ninth of the replica-requests an
   REQUIRE(utilization.status == simsys::report::SloStatus::fail);
   REQUIRE(utilization.observed.has_value());
   REQUIRE_THAT(*utilization.observed, Catch::Matchers::WithinRel(1.0, 1e-3));
+  const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
+  REQUIRE(p99.status == simsys::report::SloStatus::fail);
+  REQUIRE(p99.observed.has_value());
+  REQUIRE_THAT(*p99.observed, Catch::Matchers::WithinRel(117.8e-3, 0.01));
+}
+
+// The lab's "try vnodes: 1" at 16 machines (review of Tasks 9-10, C-1): the ring is at its most
+// uneven, k = 1 + z_16/sqrt(3) = 2.021, so the hot machine is sent 11.37k/s against its 10k/s and
+// drops 1.37k of the 90k replica-requests/s (drop rate 1.52 %, the SLO's 1 % fails) at rho 1 (the
+// utilization SLO fails). The put's p99 PASSES: a key's three replicas hold the hot machine with
+// probability 3k/16 = 0.379, and then the two cool replicas (rho 0.524) answer a W = R = 2 quorum
+// first, so the store answers in 0.378 ms and nothing is lost; the client's p99 is 2.65 ms. (The
+// old model put the quorum over the machines' mean sojourn, 10.7 ms, and failed it at 39.7 ms.)
+TEST_CASE("labs/kv-store with one virtual node passes its p99: the quorum hides the hot machine",
+          "[scenario]") {
+  const auto results = run_slos(kv_lab(16, 1, std::chrono::minutes{5}));
+  const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
+  REQUIRE(p99.status == simsys::report::SloStatus::pass);
+  REQUIRE(p99.observed.has_value());
+  REQUIRE_THAT(*p99.observed, Catch::Matchers::WithinRel(2.65e-3, 0.01));
+  REQUIRE(slo_of(results, simsys::model::SloMetric::utilization).status ==
+          simsys::report::SloStatus::fail);
+  const auto& drops = slo_of(results, simsys::model::SloMetric::drop_rate);
+  REQUIRE(drops.status == simsys::report::SloStatus::fail);
+  REQUIRE(drops.observed.has_value());
+  REQUIRE_THAT(*drops.observed,
+               Catch::Matchers::WithinRel(
+                   (90'000.0 * ring_factor(16, 3, 1) / 16.0 - 10'000.0) / 90'000.0, 1e-3));
+}
+
+// The consistent-hashing lab's balancer ring uses the same heuristic (review of Tasks 9-10, I-2),
+// with N = 1 copy of each key over its M = 4 cache servers: k = 1 + z_4/sqrt(150) = 1.0857
+// (z_4 = 1.0491). 40k/s over 4 x 15k/s is 66.7 % on average, so the hottest server, which the
+// utilization SLO reads, runs at 2/3 x 1.0857 = 0.7238 (0.7211 with the old 1 + 1/sqrt(150)).
+TEST_CASE("the consistent-hashing lab's hottest server runs at the ring factor over four servers",
+          "[scenario]") {
+  const auto results = run_slos(load_scenario("/labs/consistent-hashing/scenario.yaml"));
+  const auto caches = std::ranges::find_if(results, [](const auto& r) {
+    return r.slo.metric == simsys::model::SloMetric::utilization &&
+           r.slo.node == std::optional<std::string>{"cache_servers"};
+  });
+  REQUIRE(caches != results.end());
+  REQUIRE(caches->observed.has_value());
+  REQUIRE_THAT(*caches->observed,
+               Catch::Matchers::WithinRel(40'000.0 / 60'000.0 * ring_factor(4, 1, 150), 1e-6));
+  REQUIRE_THAT(*caches->observed, Catch::Matchers::WithinAbs(0.7238, 1e-4));
 }
 
 // The "not checked: kv_cluster ..." note of phase 2c's first half is gone from every shipped
@@ -1004,7 +1075,7 @@ TEST_CASE("explain on labs/kv-store checks the store at 16 nodes", "[scenario]")
   CAPTURE(text);
   REQUIRE(check_line(text, "store")
               .contains("peak offered 90k/s (30k/s × N 3) vs 160k/s (16 nodes)  "
-                        "(hottest 60.8%, green)"));
+                        "(hottest 60.9%, green)"));
   REQUIRE(node_line(text, "store").contains("nodes=16 N=3 W=2 R=2 mode=ap (partitions: phase 3)"));
 }
 

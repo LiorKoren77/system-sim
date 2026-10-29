@@ -803,9 +803,10 @@ TEST_CASE("explain follows google-drive's notify_q into its consumers and the ba
 // its 12.97k/s of reads, far over its 100k/s: red, complete (no lower bound, no mark).
 // graph_db is a kv_cluster of 6 nodes of 30k/s keeping N = 3 copies (plan 2c Task 10): each read
 // goes to 3 replicas, 3 x 2.162k = 6.486k replica-requests/s over 6 x 30k = 180k/s, 3.6 % on
-// average; behind the ring (default 150 virtual nodes, k = 1 + 1/sqrt(150) = 1.0816) the hottest
-// node is sent 1.0816 x 1.081k = 1.169k/s of its 30k/s: 3.897 %, printed as 3.9 %, green. The
-// "not checked" note of the phase before the model is gone.
+// average; behind the ring (default 150 virtual nodes, k = 1 + z_6/sqrt(3 x 150) = 1.0604, z_6 =
+// 1.2816 the expected maximum of 6 standard normals) the hottest node is sent 1.0604 x 1.081k =
+// 1.146k/s of its 30k/s: 3.821 %, printed as 3.82 %, green. The "not checked" note of the phase
+// before the model is gone. The node line marks the mode, which the scenario leaves to its default.
 TEST_CASE("explain follows news-feed's fanout pool into graph_db and the feed caches", "[series]") {
   const auto text = explain_shipped("news-feed");
   CAPTURE(text);
@@ -814,12 +815,12 @@ TEST_CASE("explain follows news-feed's fanout pool into graph_db and the feed ca
   REQUIRE_FALSE(fanout.contains("load not propagated"));
   const auto graph_db = check_line(text, "graph_db");
   REQUIRE(graph_db.contains(
-      "peak offered 6.486k/s (2.162k/s × N 3) vs 180k/s (6 nodes)  (hottest 3.9%, green)"));
+      "peak offered 6.486k/s (2.162k/s × N 3) vs 180k/s (6 nodes)  (hottest 3.82%, green)"));
   REQUIRE_FALSE(graph_db.contains("not checked"));
   REQUIRE_FALSE(graph_db.contains("worker_pool"));
   REQUIRE_FALSE(graph_db.contains("message_queue"));
-  REQUIRE(
-      node_line(text, "graph_db").contains("nodes=6 N=3 W=2 R=2 mode=ap (partitions: phase 3)"));
+  REQUIRE(node_line(text, "graph_db")
+              .contains("nodes=6 N=3 W=2 R=2 mode=ap (default; partitions: phase 3)"));
   const auto feed_cache = check_line(text, "feed_cache");
   REQUIRE(feed_cache.contains("%, red)"));
   REQUIRE_FALSE(feed_cache.contains("load not propagated"));
@@ -934,11 +935,12 @@ TEST_CASE("explain gives youtube's metadata_db and metadata_cache the completion
 
 // chat-system's two kv_clusters are checked since plan 2c Task 10 (they printed "not checked"
 // before):
-//  - message_store, 12 nodes of 10k/s, N = 3, vnodes 256 (k = 1 + 1/sqrt(256) = 1.0625): the
-//    peak 31.5k writes/s x 3 = 94.5k replica-requests/s over 120k/s, 78.75 % on average, the
-//    hottest node 1.0625 x 7.875k = 8.367k/s = 83.7 %: yellow (from 70 %);
-//  - presence, 4 nodes of the type's default 50k/s, N = 2, default vnodes (k = 1.0816): 81k/s x 2 =
-//    162k over 200k/s, 81 % on average, the hottest 1.0816 x 40.5k = 43.8k = 87.6 %: yellow.
+//  - message_store, 12 nodes of 10k/s, N = 3, vnodes 256 (k = 1 + z_12/sqrt(3 x 256) = 1.0590,
+//    z_12 = 1.6350): the peak 31.5k writes/s x 3 = 94.5k replica-requests/s over 120k/s, 78.75 %
+//    on average, the hottest node 1.0590 x 7.875k = 8.340k/s = 83.4 %: yellow (from 70 %);
+//  - presence, 4 nodes of the type's default 50k/s, N = 2, default vnodes (k = 1 + z_4/sqrt(2 x
+//    150) = 1.0606): 81k/s x 2 = 162k over 200k/s, 81 % on average, the hottest 1.0606 x 40.5k =
+//    42.95k = 85.9 %: yellow (red from 90 %).
 // Behind the message queue and the pools the paper load follows since Task 7, so nothing says
 // "load not propagated" and nothing blames a queue or a pool.
 TEST_CASE("explain checks chat-system's two kv_clusters at their hottest node", "[series]") {
@@ -946,10 +948,10 @@ TEST_CASE("explain checks chat-system's two kv_clusters at their hottest node", 
   CAPTURE(text);
   const auto store = check_line(text, "message_store");
   REQUIRE(store.contains(
-      "peak offered 94.5k/s (31.5k/s × N 3) vs 120k/s (12 nodes)  (hottest 83.7%, yellow)"));
+      "peak offered 94.5k/s (31.5k/s × N 3) vs 120k/s (12 nodes)  (hottest 83.4%, yellow)"));
   const auto presence = check_line(text, "presence");
   REQUIRE(presence.contains(
-      "peak offered 162k/s (81k/s × N 2) vs 200k/s (4 nodes)  (hottest 87.6%, yellow)"));
+      "peak offered 162k/s (81k/s × N 2) vs 200k/s (4 nodes)  (hottest 85.9%, yellow)"));
   for (const auto& line : {store, presence}) {
     REQUIRE_FALSE(line.contains("not checked"));
     REQUIRE_FALSE(line.contains("worker_pool"));

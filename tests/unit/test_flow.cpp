@@ -142,3 +142,18 @@ TEST_CASE("LatencyEstimate equality is member-wise and has no ordering", "[flow]
   REQUIRE(LatencyEstimate{1.0, 2.0} == LatencyEstimate{1.0, 2.0});
   REQUIRE(LatencyEstimate{1.0, 2.0} != LatencyEstimate{1.0, 3.0});
 }
+
+// The engine's and the report's running maxima (a queue's lag over its consumer groups, the worst
+// queue's lag, a node's peak lag over the steps) fold one value at a time. "The NaN first" in
+// std::max only helps on the step that meets it: the NEXT finite value, compared with the NaN
+// held so far, wins again and the NaN is lost (review of plan 2c Tasks 9-10, minor 2). Folded
+// with nan_propagating_max, a NaN met anywhere stays to the end.
+TEST_CASE("A running maximum stays NaN once a NaN has entered it", "[flow]") {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  double running = 0.0;
+  for (const double value : {1.0, nan, 2.0}) {
+    running = simsys::flow::nan_propagating_max(value, running);
+  }
+  REQUIRE(std::isnan(running));
+  REQUIRE(simsys::flow::nan_propagating_max(2.0, 1.0) == 2.0);
+}

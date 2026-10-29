@@ -4,9 +4,13 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <array>
 #include <cmath>
 #include <limits>
+#include <numbers>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
@@ -233,4 +237,202 @@ TEST_CASE("a quorum beyond the replicas or below one is a programmer error", "[q
   REQUIRE_THROWS_AS(exponential_order_statistic(3, 4, 0.001), std::invalid_argument);
   REQUIRE_THROWS_AS(exponential_order_statistic(3, 0, 0.001), std::invalid_argument);
   REQUIRE_THROWS_AS(exponential_order_statistic(0, 1, 0.001), std::invalid_argument);
+}
+
+// The moment pair the order statistics return is the project's TimeMoments, the same type
+// mmc_wait returns for a wait: a sojourn is a time like a wait, and the old name WaitMoments
+// read wrong at a quorum's reply (review of plan 2c Tasks 9-10, minor 10).
+TEST_CASE("an order statistic and a wait share one moment pair, TimeMoments", "[queueing]") {
+  STATIC_REQUIRE(std::is_same_v<decltype(exponential_order_statistic(3, 2, 0.001)), TimeMoments>);
+  STATIC_REQUIRE(std::is_same_v<decltype(mmc_wait(1, 0.5, 0.001)), TimeMoments>);
+}
+
+// ---- The standard normal (review of plan 2c Tasks 9-10, I-2 and C-1) ----
+//
+// Phi(z) = P(Z <= z) for a standard normal Z, and its inverse. Phi is erfc in disguise:
+// Phi(z) = erfc(-z / sqrt 2) / 2. The inverse has no closed form; the reference values below are
+// the textbook quantiles to 16 digits (Phi^-1(0.975) = 1.959963984540054, the "1.96" of every
+// 95 % confidence interval).
+TEST_CASE("normal_cdf is one half at zero and the tables' values elsewhere", "[queueing]") {
+  REQUIRE(normal_cdf(0.0) == 0.5);
+  REQUIRE_THAT(normal_cdf(1.959963984540054), WithinAbs(0.975, 1e-15));
+  REQUIRE_THAT(normal_cdf(-z_p99), WithinAbs(0.01, 1e-15));
+}
+
+TEST_CASE("normal_quantile inverts normal_cdf to full double precision", "[queueing]") {
+  REQUIRE(normal_quantile(0.5) == 0.0);
+  REQUIRE_THAT(normal_quantile(0.975), WithinRel(1.959963984540054, 1e-13));
+  REQUIRE_THAT(normal_quantile(0.95), WithinRel(z_p95, 1e-13));
+  REQUIRE_THAT(normal_quantile(0.99), WithinRel(z_p99, 1e-13));
+  REQUIRE_THAT(normal_quantile(0.01), WithinRel(-z_p99, 1e-13));
+  // Deep in the tails, where a rational approximation alone loses digits: 1e-10 below.
+  REQUIRE_THAT(normal_quantile(1e-10), WithinRel(-6.361340902404056, 1e-12));
+}
+
+TEST_CASE("normal_quantile outside the open interval from 0 to 1 is a programmer error",
+          "[queueing]") {
+  REQUIRE_THROWS_AS(normal_quantile(0.0), std::invalid_argument);
+  REQUIRE_THROWS_AS(normal_quantile(1.0), std::invalid_argument);
+  REQUIRE_THROWS_AS(normal_quantile(std::numeric_limits<double>::quiet_NaN()),
+                    std::invalid_argument);
+}
+
+// ---- The expected maximum of M standard normals: the ring's hottest machine (I-2) ----
+//
+// A consistent-hash ring gives each of M machines a share of the keys that varies around the
+// average; the hottest machine is the MAXIMUM of M such shares, and the maximum of M standard
+// normals grows with M (about sqrt(2 ln M) for large M). Its mean has no closed form beyond M = 5;
+// Blom's approximation (1958) puts it at the plotting position
+//   z_M = Phi^-1((M - 0.375) / (M + 0.25))
+// M = 1 gives Phi^-1(0.5) = 0 (one machine IS the average). Exact values for comparison: M = 2,
+// 1/sqrt(pi) = 0.5642 (Blom 0.5895, 4.5 % high); M = 4, 1.0294 (Blom 1.0491, 1.9 % high). Blom's
+// error shrinks as M grows, and the ring heuristic built on it is checked against Monte Carlo in
+// docs/study/numerics.md.
+TEST_CASE("the expected maximum of M normals follows Blom's plotting position", "[queueing]") {
+  REQUIRE(expected_normal_maximum(1) == 0.0);
+  REQUIRE_THAT(expected_normal_maximum(2), WithinRel(0.5894557978497785, 1e-12));
+  REQUIRE_THAT(expected_normal_maximum(4), WithinRel(1.0491313979639711, 1e-12));
+  REQUIRE_THAT(expected_normal_maximum(15), WithinRel(1.7393841569195554, 1e-12));
+  REQUIRE_THAT(expected_normal_maximum(16), WithinRel(1.7688250385187059, 1e-12));
+  REQUIRE_THAT(expected_normal_maximum(128), WithinRel(2.5846924742431137, 1e-12));
+  // Close to the exact expected maxima: within 5 % at M = 2, 2 % at M = 4.
+  // C++20 std::numbers::pi (<numbers>): the constant as a typed double, replacing the
+  // non-standard M_PI macro or a hand-typed literal.
+  REQUIRE_THAT(expected_normal_maximum(2), WithinRel(1.0 / std::sqrt(std::numbers::pi), 0.05));
+  REQUIRE_THAT(expected_normal_maximum(4), WithinRel(1.0293753730039641, 0.02));
+}
+
+TEST_CASE("the expected maximum of no machines is a programmer error", "[queueing]") {
+  REQUIRE_THROWS_AS(expected_normal_maximum(0), std::invalid_argument);
+}
+
+// ---- The Poisson-binomial: how many of a quorum's replicas succeed (I-1, C-1) ----
+//
+// N independent trials, the ones of a group sharing one success probability: how likely are FEWER
+// than q successes? With one group it is the binomial, P(Bin(N, p) < q). A kv_cluster whose
+// machines each drop a ninth of what they are sent (p = 8/9 kept) loses a request whose quorum q
+// of N = 3 replica-requests does not come back:
+//   q = 1  (1/9)^3                          = 0.001372   (0.14 %: every replica must fail)
+//   q = 2  (1/9)^3 + 3 (8/9)(1/9)^2         = 0.034294   (3.4 %)
+//   q = 3  1 - (8/9)^3                      = 0.297668   (29.8 %: any one failure loses it)
+// against the one ninth (11.1 %) that "the share of its replica-requests dropped" gives at every q.
+TEST_CASE("fewer than q of N replicas succeed with the binomial's probability", "[queueing]") {
+  // C++20 designated initializers: `.trials = 3` names the member it sets, replacing positional
+  // `{3, 8.0 / 9.0}`, where a count and a probability could be swapped unnoticed.
+  const std::array kept{TrialGroup{.trials = 3, .success = 8.0 / 9.0}};
+  REQUIRE_THAT(probability_fewer_than(kept, 1), WithinRel(1.0 / 729.0, 1e-12));
+  REQUIRE_THAT(probability_fewer_than(kept, 2), WithinRel(25.0 / 729.0, 1e-12));
+  REQUIRE_THAT(probability_fewer_than(kept, 3), WithinRel(1.0 - 512.0 / 729.0, 1e-12));
+  REQUIRE_THAT(probability_fewer_than(kept, 2), WithinAbs(0.034294, 1e-6));
+}
+
+// Two groups of different probabilities: one hot replica that succeeds half the time and two
+// that always do. Three successes need the hot one (1/2); two always happen (0); one always does.
+TEST_CASE("a Poisson-binomial over two groups counts their successes together", "[queueing]") {
+  const std::array groups{TrialGroup{.trials = 1, .success = 0.5},
+                          TrialGroup{.trials = 2, .success = 1.0}};
+  REQUIRE(probability_fewer_than(groups, 3) == 0.5);
+  REQUIRE(probability_fewer_than(groups, 2) == 0.0);
+  REQUIRE(probability_fewer_than(groups, 1) == 0.0);
+  // At least zero successes always happen; more successes than trials never do.
+  REQUIRE(probability_fewer_than(groups, 0) == 0.0);
+  REQUIRE(probability_fewer_than(groups, 4) == 1.0);
+}
+
+// ---- A quorum's reply time by quadrature (C-1) ----
+//
+// The k-th fastest of N replies, X, is later than t exactly when fewer than k replicas have
+// answered by t: P(X > t) = S_k(t), the Poisson-binomial above with each replica's success
+// probability its F(t) = P(reply by t). Its moments follow from the survival function:
+//   E[X] = integral of S_k(t) dt,    E[X^2] = integral of 2 t S_k(t) dt     (t from 0 to infinity)
+// moments_from_survival integrates them on a grid even in ln t. The cross-check: N exponential
+// replicas of mean m must give Renyi's closed form (exponential_order_statistic), to 1e-9.
+TEST_CASE("the survival-function quadrature reproduces Renyi for exponential replicas",
+          "[queueing]") {
+  constexpr double m = 0.001;
+  // From m e^-30 (no replica has answered: S = 1 below) to m e^4 (e^-e^4 = 2e-24: all have).
+  const LogGrid grid{.first_log_s = std::log(m) - 30.0, .step = 0.25, .points = 137};
+  for (const auto& [n, k] :
+       {std::pair{1, 1}, std::pair{3, 1}, std::pair{3, 2}, std::pair{3, 3}, std::pair{5, 3}}) {
+    CAPTURE(n, k);
+    const auto quadrature = moments_from_survival(grid, [&](double log_t) {
+      const std::array replicas{
+          TrialGroup{.trials = n, .success = -std::expm1(-std::exp(log_t) / m)}};
+      return probability_fewer_than(replicas, k);
+    });
+    const auto renyi = exponential_order_statistic(n, k, m);
+    REQUIRE_THAT(quadrature.mean_s, WithinRel(renyi.mean_s, 1e-9));
+    REQUIRE_THAT(quadrature.variance_s2, WithinRel(renyi.variance_s2, 1e-9));
+  }
+}
+
+// One replica is its own order statistic: the lognormal fitted to its moments, integrated back,
+// returns them. This is the quadrature's documented error bound (docs/study/numerics.md): below
+// 1e-8 relative for any sojourn SCV up to 10.
+TEST_CASE("one lognormal replica's order statistic returns its own moments", "[queueing]") {
+  for (const double scv : {1e-4, 0.01, 0.5, 1.0, 2.0, 10.0}) {
+    CAPTURE(scv);
+    const double m = 0.37e-3;
+    const std::array one{
+        ReplicaGroup{.replicas = 1, .sojourn = {.mean_s = m, .variance_s2 = scv * m * m}}};
+    const auto answer = lognormal_order_statistic(one, 1);
+    REQUIRE_THAT(answer.mean_s, WithinRel(m, 1e-8));
+    REQUIRE_THAT(answer.variance_s2, WithinRel(scv * m * m, 1e-8));
+  }
+}
+
+// Three replicas of mean 1 ms and SCV 1 (an M/M/c sojourn at light load), each a lognormal with
+// sigma^2 = ln 2: the k-th fastest, computed independently (a Python quadrature of the same
+// integrals). Next to Renyi's exponentials of the same mean (1/3, 5/6, 11/6 ms) the lognormal's
+// lighter left tail makes the fastest slower (0.4210 ms) and its lighter right tail the slowest
+// faster (1.7528 ms); the quorum of two barely moves (0.8262 against 0.8333 ms).
+TEST_CASE("the k-th fastest of three lognormal replicas of SCV one", "[queueing]") {
+  const std::array three{
+      ReplicaGroup{.replicas = 3, .sojourn = {.mean_s = 1e-3, .variance_s2 = 1e-6}}};
+  const auto first = lognormal_order_statistic(three, 1);
+  REQUIRE_THAT(first.mean_s, WithinRel(4.2099631630e-4, 1e-8));
+  REQUIRE_THAT(first.variance_s2, WithinRel(7.3174194295e-8, 1e-7));
+  const auto second = lognormal_order_statistic(three, 2);
+  REQUIRE_THAT(second.mean_s, WithinRel(8.2618489437e-4, 1e-8));
+  REQUIRE_THAT(second.variance_s2, WithinRel(2.5078568374e-7, 1e-7));
+  const auto third = lognormal_order_statistic(three, 3);
+  REQUIRE_THAT(third.mean_s, WithinRel(1.7528187893e-3, 1e-8));
+  REQUIRE_THAT(third.variance_s2, WithinRel(1.7438470357e-6, 1e-7));
+}
+
+// A request whose replicas are one hot machine (100 ms, sd 10 ms: a full queue) and two cool ones
+// (1 ms, SCV 1): the quorum of two is the slower of the two cool replies (1.4439 ms), the hot one
+// almost never among the first two; the fastest is a cool one, a little sooner than either
+// (0.5561 ms); the third reply is the hot machine's own 100 ms. The hot replica is hidden unless
+// the quorum needs every replica.
+TEST_CASE("a quorum of two hides a hot replica behind two cool ones", "[queueing]") {
+  const std::array replicas{
+      ReplicaGroup{.replicas = 1, .sojourn = {.mean_s = 0.1, .variance_s2 = 1e-4}},
+      ReplicaGroup{.replicas = 2, .sojourn = {.mean_s = 1e-3, .variance_s2 = 1e-6}}};
+  REQUIRE_THAT(lognormal_order_statistic(replicas, 1).mean_s, WithinRel(5.5605917566e-4, 1e-7));
+  REQUIRE_THAT(lognormal_order_statistic(replicas, 2).mean_s, WithinRel(1.4439407717e-3, 1e-7));
+  REQUIRE_THAT(lognormal_order_statistic(replicas, 3).mean_s, WithinRel(0.1, 1e-7));
+}
+
+// A machine with no capacity never answers (an infinite sojourn): a quorum the others can fill
+// still answers, one that needs it never does. A NaN anywhere is an upstream bug and stays NaN.
+TEST_CASE("a replica that never answers delays only a quorum that needs it", "[queueing]") {
+  constexpr double inf = std::numeric_limits<double>::infinity();
+  const std::array replicas{
+      ReplicaGroup{.replicas = 1, .sojourn = {.mean_s = inf, .variance_s2 = inf}},
+      ReplicaGroup{.replicas = 2, .sojourn = {.mean_s = 1e-3, .variance_s2 = 1e-6}}};
+  REQUIRE_THAT(lognormal_order_statistic(replicas, 2).mean_s, WithinRel(1.4439408243e-3, 1e-7));
+  REQUIRE(lognormal_order_statistic(replicas, 3).mean_s == inf);
+  const std::array poisoned{ReplicaGroup{
+      .replicas = 3,
+      .sojourn = {.mean_s = std::numeric_limits<double>::quiet_NaN(), .variance_s2 = 1e-6}}};
+  REQUIRE(std::isnan(lognormal_order_statistic(poisoned, 2).mean_s));
+}
+
+// A quorum larger than the replicas is a programmer error here too (Graph::build refuses it).
+TEST_CASE("a lognormal quorum beyond its replicas is a programmer error", "[queueing]") {
+  const std::array two{
+      ReplicaGroup{.replicas = 2, .sojourn = {.mean_s = 1e-3, .variance_s2 = 1e-6}}};
+  REQUIRE_THROWS_AS(lognormal_order_statistic(two, 3), std::invalid_argument);
+  REQUIRE_THROWS_AS(lognormal_order_statistic(two, 0), std::invalid_argument);
 }
