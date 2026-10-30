@@ -1895,3 +1895,24 @@ TEST_CASE("explain on notification-system follows the fanout into its four queue
     REQUIRE_THAT(offered_in(line), WithinRel(fanout * share, 5e-3));
   }
 }
+
+// ---- Web crawler: the frontier's `then` is followed (phase 3 Task 18) ----
+//
+// The URL frontier runs now, so explain's paper load follows its `then` steps like a worker pool's,
+// and the last "load not propagated" mark of the shipped scenarios goes: no node of the web crawler
+// is marked on account of the frontier, in particular not the downloader it hands URLs to. (The
+// tests above, written while the frontier was a type with no phase, pin the marks this one
+// removes, and are to be deleted with the implementation.)
+TEST_CASE("explain follows the web crawler's frontier: no node of it is marked as not propagated",
+          "[series]") {
+  const auto text = explain_shipped("web-crawler");
+  CAPTURE(text);
+  for (const auto* id : {"frontier", "downloader", "dns", "content_store", "url_seen"}) {
+    CAPTURE(id);
+    const auto line = check_line(text, id);
+    REQUIRE_FALSE(line.empty());  // the node has a check line, so the absence below is not vacuous
+    REQUIRE_FALSE(line.contains("load not propagated"));
+  }
+  REQUIRE_FALSE(text.contains("load not propagated"));
+  REQUIRE_FALSE(text.contains("frontier is not modelled yet"));
+}

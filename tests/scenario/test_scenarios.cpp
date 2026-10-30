@@ -1893,3 +1893,71 @@ TEST_CASE(
   CHECK(blast_peak_lag_s > 0.0);
   CHECK(blast_peak_lag_s < 3600.0);
 }
+
+// ---- web-crawler runs end to end (phase 3 Task 18) ----
+//
+// The frontier is the last type the crawler lacked, so the book's ch. 9 scenario runs: the
+// simulated set grows from ten shipped scenarios to eleven. (The test of ten above is to be deleted
+// with the implementation, and the generic "run under five seconds" test above must exempt
+// web-crawler for time and SLO verdict, as it exempts youtube: 6 h at 1 s is 21,600 steps.)
+TEST_CASE("exactly eleven shipped scenarios use only simulated node types: the ten and web-crawler",
+          "[scenario]") {
+  std::vector<std::string> runnable;
+  for (const auto& file : scenario_files()) {
+    CAPTURE(file);
+    const auto loaded = simsys::config::load(file);
+    if (!loaded) FAIL(loaded.error().message);
+    const auto& s = *loaded;
+    const bool every_type_runs = std::ranges::all_of(
+        s.nodes, [](const auto& node) { return simsys::model::simulated(node.type); });
+    const auto g = build_or_fail(s);
+    REQUIRE(simsys::engine::Simulation::create(g).has_value() == every_type_runs);
+    if (every_type_runs) runnable.push_back(s.name);
+  }
+  std::ranges::sort(runnable);
+  REQUIRE(runnable == std::vector<std::string>{"chain", "hello", "lab-consistent-hashing",
+                                               "lab-kv-store", "lab-rate-limiter", "lab-unique-id",
+                                               "news-feed", "search-autocomplete", "url-shortener",
+                                               "web-crawler", "youtube"});
+}
+
+// What the plan promises of the shipped crawler, and no more: the engine accepts it (`run` no
+// longer exits 1 with "node 'frontier' has type 'frontier', which run/estimate do not support
+// yet"; whether it then exits 0 or 2 is the README's to say, with the SLOs' verdicts and the
+// numbers), the frontier reports a queue lag above zero, and the queue_lag SLO on it is judged
+// instead of skipped. The day runs at a 60 s step (360 steps for the 6 h) to keep the test in
+// seconds.
+TEST_CASE("book/web-crawler runs its day and its frontier reports a positive queue lag",
+          "[scenario]") {
+  using namespace std::chrono_literals;
+  auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/web-crawler/scenario.yaml");
+  s.step = 60s;
+  const auto g = build_or_fail(s);
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  simsys::report::Summary summary{g, s.warmup};
+  sim->run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
+  const auto nodes = summary.nodes();
+  const auto frontier = std::ranges::find(nodes, "frontier", &simsys::report::NodeSummary::id);
+  REQUIRE(frontier != nodes.end());
+  REQUIRE(frontier->peak_queue_lag_s.has_value());
+  REQUIRE(*frontier->peak_queue_lag_s > 0.0);
+  const auto results = simsys::report::evaluate_slos(summary, s.slos);
+  const auto lag = std::ranges::find(results, simsys::model::SloMetric::queue_lag,
+                                     [](const auto& r) { return r.slo.metric; });
+  REQUIRE(lag != results.end());
+  REQUIRE(lag->slo.node == "frontier");
+  REQUIRE(lag->status != simsys::report::SloStatus::skipped);
+  REQUIRE(lag->observed.has_value());
+  REQUIRE_THAT(*lag->observed, Catch::Matchers::WithinRel(*frontier->peak_queue_lag_s, 1e-9));
+}
+
+// The internet fails 5 % of its calls (`failure_rate: 0.05`); the downloader sends a failed call
+// again, twice at most, instead of losing the page: the one scenario edit the plan states.
+TEST_CASE("book/web-crawler's downloader retries a failed fetch twice", "[scenario]") {
+  const auto s =
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/web-crawler/scenario.yaml");
+  const auto downloader = std::ranges::find(s.nodes, "downloader", &simsys::model::NodeSpec::id);
+  REQUIRE(downloader != s.nodes.end());
+  REQUIRE(downloader->retries == 2);
+}

@@ -359,3 +359,16 @@ TEST_CASE("the notification_fanout node type runs", "[model]") {
   // The other type of this family that still waits for its model: the frontier (Task 18).
   REQUIRE_FALSE(simsys::model::simulated(NodeType::frontier));
 }
+
+// Phase 3 Task 18 removes the frontier from the list of types not simulated yet: the URL frontier
+// is modelled (a queue whose pool drains at hosts x politeness), so run/estimate accept it. The
+// three types still without a model are the ones that remain refused. (The test above, written when
+// all four were refused, and its static_assert, say the opposite and are to be deleted with this
+// task's implementation; a runtime check here, not a static_assert, so this file still compiles
+// while both exist.)
+TEST_CASE("a frontier is a simulated node type; the other three phase 3 types are not", "[model]") {
+  REQUIRE(simsys::model::simulated(NodeType::frontier));
+  REQUIRE_FALSE(simsys::model::simulated(NodeType::ws_gateway));
+  REQUIRE_FALSE(simsys::model::simulated(NodeType::service_discovery));
+  REQUIRE_FALSE(simsys::model::simulated(NodeType::notification_fanout));
+}
