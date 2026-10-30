@@ -1,6 +1,8 @@
 // Whole-simulation checks against closed-form queueing theory (spec §12).
-// Spec entries pinned here: §19 entry 11 (a step after a failed step does not run).
-// This file: a step after a failed step does not run. One of the nine files the theory tests are
+// Spec entries pinned here: §19 entry 11 (a step after a failed step does not run) and §5
+// (`on: failure` steps fire).
+// This file: a step after a failed step does not run, and the `on: failure` step that reports it.
+// One of the nine files the theory tests are
 // split into by topic; the scenario builders more than one of them needs live in
 // tests/support/fixtures.cppm (module simsys.test_fixtures).
 #include <catch2/catch_test_macros.hpp>
@@ -28,6 +30,7 @@ import simsys.test_fixtures;
 // margin can only loosen a check, never tighten it. For a tight check use WithinAbs /
 // WithinRel, which apply only the tolerance you give them.
 using namespace std::chrono_literals;
+using Catch::Matchers::WithinAbs;
 using Catch::Matchers::WithinRel;
 using simsys::Rate;
 using simsys::graph::Graph;
@@ -306,4 +309,191 @@ TEST_CASE(
   REQUIRE_THAT(demand_at(last, g, "render"), WithinRel(8.0, 1e-9));  // the first step: every job
   REQUIRE_THAT(dropped_share_at(last, g, "render"), WithinRel(0.5, 1e-9));  // 4 of the 8
   REQUIRE_THAT(demand_at(last, g, "done"), WithinRel(4.0, 1e-3));           // 8 x 0.5
+}
+
+// ---- `on: failure` steps fire (spec §5) ------------------------------------------------
+//
+// A step list [{to: db, op: write}, {to: log, op: write, on: failure}] sends `log` the share of
+// the requests whose db write failed, the way `on: miss` carries a cache's miss share. With d the
+// delivered fraction of the step it follows (what db answered, losses inside its own calls
+// included), that share is 1 - d. The rules the tests below pin:
+//  - the failure step belongs to the nearest unconditional step before it, and after a parallel
+//    group to the whole group: its share is 1 - (product of the members' d);
+//  - it is a sequential hop, sent  rate x S x (1 - d)  with S the survival of the steps BEFORE the
+//    one it reports on, but not thinned by that step itself: a request that failed there is
+//    exactly the one that comes here;
+//  - what it does to the steps after it is nothing: the requests it serves had failed already, so
+//    its own losses (a lossy log) thin nothing and are not in the client's answered rate;
+//  - after a step that loses nothing it sends nothing.
+// The same lag as above: a step reads the fraction the targets reported at the end of the LAST
+// simulation step. At step 0 nothing is reported yet and every fraction is read as 1 (nothing
+// lost), so the failure share is 0 and log is sent nothing; the failure share lags like any other.
+// With 100 ms steps and the probe's room of one request (`lossy_target`):
+//   capacity 500/s, offered 1000/s:  step 0 delivers (50 + 1) / 100 = 0.51, every later step 0.5
+// so log is sent 0 at step 0, 1000 x (1 - 0.51) = 490/s at step 1 and 1000 x 0.5 = 500/s from
+// step 2 on. (Node indices: u 0, svc 1, then the targets in the order given.)
+
+namespace {
+// A `write` to `to`: the step a failure step reports on.
+Step write_step(std::string to) {
+  return Step{.to = std::move(to), .op = "write"};
+}
+
+// A `write` to `to`, taken only by the requests the step before it failed.
+Step failure_step(std::string to) {
+  return Step{.to = std::move(to), .op = "write", .on = StepCondition::failure};
+}
+
+constexpr double no_flow_tolerance = 1e-9;  // a share of 0 is compared in absolute requests/s
+}  // namespace
+
+// db delivers 0.5 (500/s of 1000 offered), so half the writes failed and `log` is sent them:
+//   log's demand = 1000 x (1 - 0.5) = 500/s
+// Pinned from step 2 on, where db has settled; step 1 still reads step 0's 0.51 (490/s) and step 0
+// reads nothing (0/s). The client is answered only the 500/s that db answered: the failure step
+// adds nothing to that. The long run is `estimate`, with the same 500/s.
+TEST_CASE("a failure step is sent the share its step failed: 500 of 1000 a second at d = 0.5",
+          "[theory]") {
+  const auto g = *Graph::build(steps_chain({write_step("db"), failure_step("log")},
+                                           {lossy_target("db", 500), plain_target("log")}));
+  const auto records = records_of(g, 20);
+  REQUIRE_THAT(demand_at(records[0], g, "log"),
+               WithinAbs(0.0, no_flow_tolerance));  // nothing reported yet
+  for (std::size_t i = 2; i < records.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE_THAT(demand_at(records[i], g, "db"), WithinRel(1000.0, 1e-9));  // not thinned by log
+    REQUIRE_THAT(dropped_share_at(records[i], g, "db"), WithinRel(0.5, 1e-9));  // db delivers 0.5
+    REQUIRE_THAT(demand_at(records[i], g, "log"), WithinRel(500.0, 1e-9));      // 1000 x (1 - 0.5)
+    REQUIRE_THAT(records[i].responses[0].answered.per_second, WithinRel(500.0, 1e-3));
+  }
+  REQUIRE_THAT(demand_at(records[1], g, "log"), WithinRel(490.0, 1e-9));  // 1000 x (1 - 0.51)
+  const auto estimate = simulation_of(g).estimate();
+  REQUIRE(estimate.converged);
+  REQUIRE_THAT(estimate.nodes[*g.index_of("log")].demand_per_s, WithinRel(500.0, 1e-4));
+  REQUIRE_THAT(estimate.responses[0].answered.per_second, WithinRel(500.0, 1e-4));
+}
+
+// db loses nothing (capacity 100k/s against 1000/s), so no write failed and log is sent nothing:
+// 1000 x (1 - 1) = 0/s at every step. A guard against a failure step that fires for every request
+// (true today as well, where a failure step never fires: this one stays green).
+TEST_CASE("a failure step after a step that loses nothing is sent nothing", "[theory]") {
+  const auto g = *Graph::build(steps_chain({write_step("db"), failure_step("log")},
+                                           {plain_target("db"), plain_target("log")}));
+  const auto records = records_of(g, 20);
+  for (const auto& record : records) {
+    REQUIRE_THAT(demand_at(record, g, "db"), WithinRel(1000.0, 1e-9));
+    REQUIRE_THAT(demand_at(record, g, "log"), WithinAbs(0.0, no_flow_tolerance));
+  }
+  const auto estimate = simulation_of(g).estimate();
+  REQUIRE_THAT(estimate.nodes[*g.index_of("log")].demand_per_s, WithinAbs(0.0, no_flow_tolerance));
+}
+
+// [a, db, log on failure]: a delivers 0.5, so db is offered 1000 x 0.5 = 500/s (capacity 250/s:
+// it delivers 0.5 of those), and log reports on db, the nearest unconditional step before it. A
+// request reaches log if it got through a (0.5) and then failed at db (1 - 0.5): log is thinned
+// by the step BEFORE the one it follows, not by that step itself:
+//   log's demand = 1000 x 0.5 x (1 - 0.5) = 250/s       (not 1000 x (1 - 0.5) = 500: the half
+//                                                         that failed at a never reached db)
+// The settle is one step later than for a single step. a reads 0.51 at step 0 and 0.5 from step 1;
+// db is sent 1000/s at step 0 (nothing reported yet), 510/s at step 1 and 500/s from step 2 on, so
+// it delivers 0.5 from step 2; log reads both one step late and settles at step 3. Pinned from 3.
+// The client is answered the requests that got through both: 1000 x 0.5 x 0.5 = 250/s.
+TEST_CASE("a failure step is thinned by the steps before its own: 1000 x 0.5 x 0.5 = 250",
+          "[theory]") {
+  const auto g = *Graph::build(
+      steps_chain({write_step("a"), write_step("db"), failure_step("log")},
+                  {lossy_target("a", 500), lossy_target("db", 250), plain_target("log")}));
+  const auto records = records_of(g, 20);
+  for (std::size_t i = 3; i < records.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE_THAT(dropped_share_at(records[i], g, "a"), WithinRel(0.5, 1e-9));
+    REQUIRE_THAT(demand_at(records[i], g, "db"), WithinRel(500.0, 1e-9));  // 1000 x 0.5
+    REQUIRE_THAT(dropped_share_at(records[i], g, "db"), WithinRel(0.5, 1e-9));
+    REQUIRE_THAT(demand_at(records[i], g, "log"), WithinRel(250.0, 1e-9));  // 1000 x 0.5 x 0.5
+    REQUIRE_THAT(records[i].responses[0].answered.per_second, WithinRel(250.0, 1e-3));
+  }
+  const auto estimate = simulation_of(g).estimate();
+  REQUIRE(estimate.converged);
+  REQUIRE_THAT(estimate.nodes[*g.index_of("log")].demand_per_s, WithinRel(250.0, 1e-4));
+  REQUIRE_THAT(estimate.responses[0].answered.per_second, WithinRel(250.0, 1e-4));
+}
+
+// [a || b, log on failure]: the group fails as a whole, so a failure step after it reports the
+// group's failure share, a request lost by EITHER member:
+//   1 - d_a x d_b = 1 - 0.5 x 0.5 = 0.75,       log's demand = 1000 x 0.75 = 750/s
+// (not 1000 x (1 - 0.5) = 500, the failure of one member alone). Both members are sent the whole
+// 1000/s, capacity 500/s each. Both read 0.51 at step 0 and 0.5 from step 1, so log is sent 0 at
+// step 0, 1000 x (1 - 0.51 x 0.51) = 739.9/s at step 1 and 750/s from step 2 on.
+TEST_CASE("a failure step after a parallel group reports its failure share: 1 - 0.5 x 0.5 = 0.75",
+          "[theory]") {
+  const auto g = *Graph::build(
+      steps_chain({Step{.to = "a", .op = "x", .mode = parallel},
+                   Step{.to = "b", .op = "x", .mode = parallel}, failure_step("log")},
+                  {lossy_target("a", 500), lossy_target("b", 500), plain_target("log")}));
+  const auto records = records_of(g, 20);
+  for (std::size_t i = 2; i < records.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE_THAT(demand_at(records[i], g, "a"), WithinRel(1000.0, 1e-9));  // members of a group
+    REQUIRE_THAT(demand_at(records[i], g, "b"), WithinRel(1000.0, 1e-9));  // are not thinned
+    REQUIRE_THAT(dropped_share_at(records[i], g, "a"), WithinRel(0.5, 1e-9));
+    REQUIRE_THAT(dropped_share_at(records[i], g, "b"), WithinRel(0.5, 1e-9));
+    REQUIRE_THAT(demand_at(records[i], g, "log"), WithinRel(750.0, 1e-9));  // 1000 x (1 - 0.25)
+    REQUIRE_THAT(records[i].responses[0].answered.per_second, WithinRel(250.0, 1e-3));
+  }
+  REQUIRE_THAT(demand_at(records[1], g, "log"), WithinRel(1000.0 * (1.0 - 0.51 * 0.51), 1e-9));
+  const auto estimate = simulation_of(g).estimate();
+  REQUIRE(estimate.converged);
+  REQUIRE_THAT(estimate.nodes[*g.index_of("log")].demand_per_s, WithinRel(750.0, 1e-4));
+}
+
+// [db, log on failure, tail]: log is lossy (capacity 100/s against the 500/s it is sent: it
+// delivers 0.2, drops 0.8), but its losses feed nothing back. The requests it serves had failed at
+// db already, so a loss at log changes neither the step after it nor the client's answer:
+//   tail's demand = 1000 x d_db = 500/s        (not 500 x ..., log's 0.2 does not thin it)
+//   answered      = 1000 x d_db = 500/s        (the 500 that failed stay failed, log or no log)
+// and log is sent exactly the failure share, 500/s, whatever it does with it.
+TEST_CASE("a failure step's own losses do not thin the steps after it or the answered rate",
+          "[theory]") {
+  const auto g = *Graph::build(
+      steps_chain({write_step("db"), failure_step("log"), Step{.to = "tail", .op = "x"}},
+                  {lossy_target("db", 500), lossy_target("log", 100), plain_target("tail")}));
+  const auto records = records_of(g, 20);
+  for (std::size_t i = 3; i < records.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE_THAT(dropped_share_at(records[i], g, "db"), WithinRel(0.5, 1e-9));
+    REQUIRE_THAT(demand_at(records[i], g, "log"), WithinRel(500.0, 1e-9));       // 1000 x (1 - 0.5)
+    REQUIRE_THAT(dropped_share_at(records[i], g, "log"), WithinRel(0.8, 1e-9));  // 400 of 500
+    REQUIRE_THAT(demand_at(records[i], g, "tail"), WithinRel(500.0, 1e-9));      // thinned by db
+    REQUIRE_THAT(records[i].responses[0].answered.per_second, WithinRel(500.0, 1e-3));
+  }
+  const auto estimate = simulation_of(g).estimate();
+  REQUIRE(estimate.converged);
+  REQUIRE_THAT(estimate.nodes[*g.index_of("log")].demand_per_s, WithinRel(500.0, 1e-4));
+  REQUIRE_THAT(estimate.nodes[*g.index_of("tail")].demand_per_s, WithinRel(500.0, 1e-4));
+  REQUIRE_THAT(estimate.responses[0].answered.per_second, WithinRel(500.0, 1e-4));
+}
+
+// [db, log1 on failure, log2 on failure]: both belong to the nearest UNCONDITIONAL step before
+// them, db, so both see the same failure share 1 - 0.5 = 0.5 and each is sent 500/s. log1 is lossy
+// (it delivers 0.2) and that does not thin log2: a failure step is not a step log2 reports on.
+// db delivers 0.5 from step 1, and log1 and log2 read it one step late; pinned from step 3, which
+// leaves a step of margin. log2's 500/s is the check that matters: it would be 100/s if log1's
+// 0.2 wrongly thinned it.
+TEST_CASE("two failure steps in a row both report the step before them: 500 a second each",
+          "[theory]") {
+  const auto g = *Graph::build(
+      steps_chain({write_step("db"), failure_step("log1"), failure_step("log2")},
+                  {lossy_target("db", 500), lossy_target("log1", 100), plain_target("log2")}));
+  const auto records = records_of(g, 20);
+  for (std::size_t i = 3; i < records.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE_THAT(dropped_share_at(records[i], g, "db"), WithinRel(0.5, 1e-9));
+    REQUIRE_THAT(demand_at(records[i], g, "log1"), WithinRel(500.0, 1e-9));  // 1000 x (1 - 0.5)
+    REQUIRE_THAT(dropped_share_at(records[i], g, "log1"), WithinRel(0.8, 1e-9));
+    REQUIRE_THAT(demand_at(records[i], g, "log2"), WithinRel(500.0, 1e-9));  // the same share
+    REQUIRE_THAT(records[i].responses[0].answered.per_second, WithinRel(500.0, 1e-3));
+  }
+  const auto estimate = simulation_of(g).estimate();
+  REQUIRE_THAT(estimate.nodes[*g.index_of("log1")].demand_per_s, WithinRel(500.0, 1e-4));
+  REQUIRE_THAT(estimate.nodes[*g.index_of("log2")].demand_per_s, WithinRel(500.0, 1e-4));
 }

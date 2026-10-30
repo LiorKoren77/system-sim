@@ -752,6 +752,33 @@ TEST_CASE("an on-miss step must follow a cache step", "[graph]") {
   }
 }
 
+// An `on: failure` step reports the failure of the step before it (spec §5: it belongs to the
+// nearest unconditional step before it), so one with nothing before it reports nothing: refused at
+// build, naming the node. Phase 2 parsed such a step and ignored it, so the mistake went unseen.
+TEST_CASE("an on-failure step needs a step before it", "[graph]") {
+  const std::string expected = "node 'web': an on: failure step needs a step before it";
+  SECTION("as the first step") {
+    const auto g = Graph::build(cached_web(
+        service("log"), {Step{.to = "log", .op = "write", .on = StepCondition::failure}}));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == expected);
+  }
+  SECTION("as the first step of several failure steps, none of which has a step to report on") {
+    const auto g = Graph::build(cached_web(
+        service("log"), {Step{.to = "log", .op = "write", .on = StepCondition::failure},
+                         Step{.to = "db", .op = "write", .on = StepCondition::failure}}));
+    REQUIRE_FALSE(g.has_value());
+    REQUIRE(g.error().message == expected);
+  }
+  SECTION("after an unconditional step it builds") {
+    const auto g = Graph::build(cached_web(
+        service("log"), {Step{.to = "db", .op = "write"},
+                         Step{.to = "log", .op = "write", .on = StepCondition::failure}}));
+    INFO((g ? "" : g.error().message));
+    REQUIRE(g.has_value());
+  }
+}
+
 // Read-through as this model names it (the cache-driven fetch): on a miss the CACHE fetches the
 // value from its backend and answers with it, so the application never sees a miss to act on.
 // A miss step after it would fetch every miss a second time.
@@ -3130,6 +3157,59 @@ TEST_CASE("an unsized op on a bandwidth link is an error that says where to add 
     REQUIRE(built.error().message ==
             "link 'u'->'lb' has a bandwidth, but op 'get' from 'u' " + advice);
   }
+}
+
+namespace {
+// u (100/s of `put`, 1 MB each) -> web, whose `put` runs `steps`; web -> db and web -> log, the
+// link to log with a 1 Gbit/s bandwidth: its pipe prices every request web sends to log in
+// megabytes, so each needs a size (db and log count requests and never mind one).
+Scenario failure_web(std::vector<Step> steps) {
+  Scenario s{.name = "failure-web", .version = 1, .duration = 1min};
+  s.nodes = {sized_client("u", "put", simsys::Bytes{1e6}),
+             service("web", {{"put", std::move(steps)}}), service("db"), service("log")};
+  s.links = {LinkSpec{.from = "u", .to = "web"}, LinkSpec{.from = "web", .to = "db"},
+             LinkSpec{.from = "web", .to = "log", .bandwidth = one_gbit}};
+  return s;
+}
+}  // namespace
+
+// An `on: failure` step is priced like any step (spec §5): the size walk follows it, so an unsized
+// one over a bandwidth link is refused with the refusal every unsized step gets (the same words as
+// the test above: the link, the op, the sender and what to add). Phase 2's walk skipped failure
+// steps, so this scenario used to build and the engine would have thrown at the first request.
+TEST_CASE("an unsized on-failure step over a bandwidth link is refused like any unsized step",
+          "[graph]") {
+  const std::string unsized =
+      "link 'web'->'log' has a bandwidth, but op 'write' from 'web' has no "
+      "size: add size: to the step or sizes: to the client";
+  SECTION("on: failure") {
+    const auto built =
+        Graph::build(failure_web({Step{.to = "db", .op = "write"},
+                                  Step{.to = "log", .op = "write", .on = StepCondition::failure}}));
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message == unsized);
+  }
+  SECTION("on: always, the same step, is refused in the same words") {
+    const auto built = Graph::build(
+        failure_web({Step{.to = "db", .op = "write"}, Step{.to = "log", .op = "write"}}));
+    REQUIRE_FALSE(built.has_value());
+    REQUIRE(built.error().message == unsized);
+  }
+}
+
+// The same step with a `size:` builds, and the graph knows the size of what log is sent: 2 MB
+// (a failure step states its own size like any step: it is a new request, not the client's put).
+TEST_CASE("a sized on-failure step over a bandwidth link builds and prices its 2 MB", "[graph]") {
+  const auto built = Graph::build(failure_web(
+      {Step{.to = "db", .op = "write"},
+       Step{
+           .to = "log", .op = "write", .on = StepCondition::failure, .size = simsys::Bytes{2e6}}}));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  REQUIRE(built->links()[2].pipe.has_value());  // web -> log
+  const auto size = request_bytes_at(*built, "log", "write");
+  REQUIRE(size.has_value());
+  REQUIRE_THAT(*size, WithinRel(2e6, 1e-12));
 }
 
 TEST_CASE("a step's size makes a renamed op acceptable on a bandwidth link", "[graph]") {
