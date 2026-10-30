@@ -1069,16 +1069,21 @@ TEST_CASE("explain gives youtube's metadata_db and metadata_cache the completion
 
 // chat-system's two kv_clusters are checked (they once printed "not checked"):
 //  - message_store, 12 nodes of 10k/s, N = 3, vnodes 256 (k = 1 + z_12/sqrt(3 x 256) = 1.0590,
-//    z_12 = 1.6350): the peak 31.5k sends/s, each written 1.4 times since phase 3 Task 14 (the
-//    gateway's `fanout: 1.4` multiplies every step of its `send`, a message op), are 44.1k
-//    writes/s x 3 = 132.3k replica-requests/s over 120k/s, 110.25 % on average, the hottest node
-//    1.0590 x 11.025k = 11.68k/s = 116.8 %: red (it was 94.5k, 83.4 %, yellow, before the fan-out;
-//    the scenario's own task revisits where chat-system fans out);
-//  - presence, 4 nodes of the type's default 50k/s, N = 2, default vnodes (k = 1 + z_4/sqrt(2 x
-//    150) = 1.0606): the users' 49.5k heartbeats/s and sync_workers' read of every message the
-//    queue holds, 44.1k/s with the fan-out above (31.5k before it), 93.6k/s x 2 = 187.2k over
-//    200k/s, 93.6 % on average, the hottest 1.0606 x 46.8k = 49.64k = 99.3 %: red (it was 81k/s,
-//    85.9 %, yellow). The gateway states no level yet, so it adds no heartbeats of its own.
+//    z_12 = 1.6350): the peak 31.5k sends/s (90k/s at the 21:00 peak x 0.35), each written ONCE
+//    (phase 3 Task 15's decision, from the Task 14 review: the gateway's `fanout: 1.4` multiplies
+//    only the steps of a message op that target a message queue, where ch. 12 copies a message once
+//    per recipient into the sync queues; id_gen and message_store see the message once), are 31.5k
+//    writes/s x 3 = 94.5k replica-requests/s over 120k/s, 78.75 % on average, the hottest node
+//    1.0590 x 7.875k = 8.34k/s = 83.4 %: yellow (Task 14 had it at 132.3k, 117 %, red, with the
+//    fan-out on every step). The numbers are the shipped scenario's sizing as Task 15 leaves it
+//    (12 nodes of 10k/s, the sends' 35 % of 90k/s): a re-sized store changes them, and whoever
+//    does says why in the scenario's README;
+//  - id_gen, offered the same 31.5k/s (it was 44.1k/s), and message_q, which is where the fan-out
+//    is: 31.5k x 1.4 = 44.1k/s published, one copy per recipient;
+//  - presence, 4 nodes of the type's default 50k/s, N = 2: the users' heartbeats, sync_workers'
+//    read of every message copy the queue holds (44.1k/s) and, since the gateway states a level in
+//    Task 15, the gateway's own heartbeats C / 5 s, so at least the 93.6k/s that Task 14 printed
+//    (49.5k users' heartbeats + 44.1k reads): how much more is the scenario's sizing, not pinned.
 // Behind the message queue and the pools the paper load follows, so nothing says "load not
 // propagated" and nothing blames a queue or a pool.
 TEST_CASE("explain checks chat-system's two kv_clusters at their hottest node", "[series]") {
@@ -1086,10 +1091,18 @@ TEST_CASE("explain checks chat-system's two kv_clusters at their hottest node", 
   CAPTURE(text);
   const auto store = check_line(text, "message_store");
   REQUIRE(store.contains(
-      "peak offered 132.3k/s (44.1k/s × N 3) vs 120k/s (12 nodes)  (hottest 117%, red)"));
+      "peak offered 94.5k/s (31.5k/s × N 3) vs 120k/s (12 nodes)  (hottest 83.4%, yellow)"));
+  REQUIRE(check_line(text, "id_gen").contains("peak offered 31.5k/s vs "));
+  REQUIRE(check_line(text, "message_q").contains("peak offered 44.1k/s vs "));
   const auto presence = check_line(text, "presence");
-  REQUIRE(presence.contains(
-      "peak offered 187.2k/s (93.6k/s × N 2) vs 200k/s (4 nodes)  (hottest 99.3%, red)"));
+  REQUIRE(presence.contains("× N 2)"));
+  // "peak offered 187.2k/s (93.6k/s × N 2)": the per-copy figure in the parentheses, in thousands
+  // (its k or M suffix applied), is at least what the users and the queue's readers alone offer.
+  const auto per_copy_at = presence.find('(', presence.find("peak offered ")) + 1;
+  std::size_t digits = 0;
+  double per_copy_k = std::stod(presence.substr(per_copy_at), &digits);
+  if (presence[per_copy_at + digits] == 'M') per_copy_k *= 1000.0;
+  REQUIRE(per_copy_k >= 93.6);
   for (const auto& line : {store, presence}) {
     REQUIRE_FALSE(line.contains("not checked"));
     REQUIRE_FALSE(line.contains("worker_pool"));
@@ -1900,4 +1913,29 @@ TEST_CASE(
   REQUIRE_FALSE(text.contains("not modelled yet"));
   const auto gateway = check_line(text, "long_poll");
   REQUIRE(gateway.contains("peak offered 33.93k/s vs 80k/s total capacity  (42.4%, green)"));
+}
+
+// Task 15's fan-out decision at its source: chat-system's sync_workers hand each message copy the
+// queue holds to its recipient's gateway (`deliver`) and 0.3 of them to the push gateway, but do
+// not multiply them again: the 1.4 recipients per message are already the copies in the queue
+// (the gateway's `fanout` at its publish step), so a `factor: 1.4` on the deliver step would count
+// the fan-out twice (Task 14 left it, and explain printed the message store at 117 %).
+TEST_CASE("chat-system's sync_workers deliver each queued message copy once: no factor above 1",
+          "[series]") {
+  const auto loaded =
+      simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/chat-system/scenario.yaml");
+  INFO((loaded ? "" : loaded.error().message));
+  REQUIRE(loaded.has_value());
+  // C++20 std::ranges::find with a projection: the node whose `id` member equals "sync_workers",
+  // replacing std::find_if with a lambda that reads the member by hand.
+  const auto workers =
+      std::ranges::find(loaded->nodes, "sync_workers", &simsys::model::NodeSpec::id);
+  REQUIRE(workers != loaded->nodes.end());
+  bool delivers = false;
+  for (const auto& step : workers->then) {
+    if (step.to != "chat_servers") continue;
+    delivers = true;
+    REQUIRE(step.factor == 1.0);
+  }
+  REQUIRE(delivers);
 }

@@ -32,6 +32,7 @@ import simsys.graph;
 import simsys.model;
 import simsys.queueing;
 import simsys.report;
+import simsys.session;
 import simsys.test_fixtures;
 
 // explain's lines, shared with test_report and test_series.
@@ -183,9 +184,13 @@ TEST_CASE(
     //    backup pool sized at 3 workers; it is exempt here only for time: 24 h at 100 ms is 864k
     //    steps, about 20 s of CPU in Release (measured 2026-10-30), far over the five seconds. Its
     //    own tests below run the day at 10 s steps and pin the SLOs passing.
+    //  - chat-system runs (phase 3 Task 15) and MEETS its SLOs with its 21:30 gateway fault; it is
+    //    exempt here only for time: 24 h at 100 ms is 864k steps over twenty nodes and a twin (the
+    //    scenario has a fault). Its own test at the end of this file runs the day at 10 s steps.
     if (s.name == "lab-unique-id" || s.name == "url-shortener" || s.name == "youtube" ||
         s.name == "news-feed" || s.name == "search-autocomplete" ||
-        s.name == "notification-system" || s.name == "web-crawler" || s.name == "google-drive") {
+        s.name == "notification-system" || s.name == "web-crawler" || s.name == "google-drive" ||
+        s.name == "chat-system") {
       continue;  // not run here
     }
     ++ran;
@@ -1056,21 +1061,21 @@ TEST_CASE("explain on book/youtube prints the stream size on the byte-sized cdn"
 //
 // External sinks run: notification-system (apns, fcm, sms_provider, email_provider: its workers'
 // `then` steps) runs end to end since its fanout has a model (phase 3 Task 17, its tests at the end
-// of this file). chat-system (push) is still refused, at its gateway, which states no connection
-// level yet (the test below). Giving the sinks a model changed no refusal; their `failure_rate`
-// shows in explain instead.
+// of this file), and chat-system (push) since its gateway states a connection level (phase 3 Task
+// 15, the test below). Giving the sinks a model changed no refusal; their `failure_rate` shows in
+// explain instead.
 
-// chat-system's nodes in file order: users, lb, the chat API service, `discovery`, a
-// service_discovery (simulated since phase 3's Task 13: the engine used to stop there), then the
-// `chat_servers` ws_gateway (simulated since Task 14), which states no connection level yet.
-TEST_CASE("book/chat-system is refused at chat_servers, its ws_gateway, past the discovery",
+// chat-system runs since phase 3 Task 15: its service_discovery (Task 13) and ws_gateway (Task 14)
+// are simulated, and the scenario now gives the gateway a level, so Simulation::create accepts it
+// (it used to refuse it at chat_servers: "a ws_gateway needs a client op named 'connect' or a
+// fixed 'connections'"). The level is a `connect` op the clients send or a fixed `connections`;
+// which one is the scenario's design, documented in its README, and not pinned here.
+TEST_CASE("book/chat-system is accepted by run: its gateway states a connection level",
           "[scenario]") {
   const auto g = build_or_fail(load_scenario("/book/chat-system/scenario.yaml"));
   const auto sim = simsys::engine::Simulation::create(g);
-  REQUIRE_FALSE(sim.has_value());
-  REQUIRE(sim.error().message ==
-          "node 'chat_servers': a ws_gateway needs a client op named 'connect' or a fixed "
-          "'connections'");
+  if (!sim) FAIL(sim.error().message);
+  REQUIRE(sim.has_value());
 }
 
 // The books' providers' failure rates are the numbers in the YAML: APNs and FCM 2 %, the SMS
@@ -1818,14 +1823,14 @@ TEST_CASE(
 // 18), the book's ch. 9 scenario: twelve shipped scenarios run. Since Task 18 every node type has
 // a model (model::simulated is true for all), so no scenario is refused for its types any more.
 // Task 16 gives google-drive's websocket gateway a fixed level (`connections: 2M`): thirteen run.
-// The one still refused, chat-system, is refused at a websocket gateway that states no level
-// until its own task. The set of runnable scenarios is pinned by name: whoever
+// Task 15 gives chat-system's gateway a level (a `connect` op its users send): fourteen, every
+// shipped scenario. The set of runnable scenarios is pinned by name: whoever
 // makes one more run updates the list on purpose. (The generic "run under five seconds" test above
 // exempts web-crawler for time and SLO verdict, as it exempts youtube: 6 h at 1 s is 21,600
 // steps.)
 TEST_CASE(
-    "exactly thirteen shipped scenarios run: the eleven before Task 18, web-crawler and "
-    "google-drive",
+    "exactly fourteen shipped scenarios run: the eleven before Task 18, web-crawler, google-drive "
+    "and chat-system",
     "[scenario]") {
   std::vector<std::string> runnable;
   for (const auto& file : scenario_files()) {
@@ -1841,7 +1846,7 @@ TEST_CASE(
     if (created) runnable.push_back(s.name);
   }
   std::ranges::sort(runnable);
-  REQUIRE(runnable == std::vector<std::string>{"chain", "google-drive", "hello",
+  REQUIRE(runnable == std::vector<std::string>{"chain", "chat-system", "google-drive", "hello",
                                                "lab-consistent-hashing", "lab-kv-store",
                                                "lab-rate-limiter", "lab-unique-id", "news-feed",
                                                "notification-system", "search-autocomplete",
@@ -2188,4 +2193,103 @@ TEST_CASE("book/google-drive's peaks match the README: block servers 64.8 percen
   const auto day = run_google_drive_day(10s);
   CHECK_THAT(day.node("block_servers").peak_rho, WithinRel(0.648, 0.02));
   CHECK_THAT(day.node("cloud_storage").peak_rho, WithinRel(0.777, 0.02));
+}
+
+// ---- chat-system end to end (phase 3 Task 15)
+// ----------------------------------------------------
+//
+// chat-system runs the day, 24 h at 10 s steps here (8,640 steps and a twin beside them, not 864k:
+// the scenario's own 100 ms would take minutes in Debug; the storm is three steps at this size and
+// the 21:30 fault six), and its scripted fault is the lesson: at 21:30 the whole gateway tier,
+// `chat_servers` (20 replicas), is down for a minute and every connection it holds drops at once;
+// the users come back over `reconnect_within` (30 s, the default) from 21:31.
+//
+// What is pinned, and what the scenario's sizing decides (the implementer sizes the gateway, the
+// clients' `connect` share and the session so that all of this holds, and the README says how):
+//  - the three SLOs (p99 of users' `send` under 300 ms, message_q's lag under 10 s, drop_rate under
+//    0.1 %) PASS over the whole day, the fault included: `simsys run` exits 0 (the plan's intent;
+//    the plan also allows "the exit the README states on purpose", in which case this test and the
+//    README change together, on purpose). The drop_rate has the least room: the minute of lost
+//    sends and connects is about 5M requests of the day's 5.2G;
+//  - the storm's size is the tier's level at 21:30, `C x 1` for the whole tier (r = R = 20): the
+//    JSON's `reconnect_storm_connections` is the gateway's `connections` of the step before the
+//    fault within 1 % (the level changes by well under that in 10 s: the fault-free run's record at
+//    21:29:50, the same run as the faulted one's up to the fault, is read);
+//  - its length is the default 30 s; the peak (the gateway's offered utilisation) is first reached
+//    in the five minutes after the fault clears at 21:31 (loose: where in the storm it lands
+//    depends on how the heartbeats compare with the storm's connects, i.e. on the sizing); and the
+//    run recovers (every op's p99 and every node's rho within 1 % of the twin's) before 22:00, a
+//    generous 29 minutes after the fault clears.
+namespace {
+
+double number_after_key(const std::string& text, std::string_view key) {
+  const auto at = text.find(key);
+  CAPTURE(key);
+  REQUIRE(at != std::string::npos);
+  return std::stod(text.substr(at + key.size()));
+}
+
+// The open connections of chat_servers in the step that starts at `when` of the scenario `s` run
+// WITHOUT its faults (up to and including that step): the fault-free run's level, which the
+// faulted run has until the fault starts.
+double chat_servers_level_at(simsys::model::Scenario s, simsys::SimTime when) {
+  using namespace std::chrono_literals;
+  s.faults.clear();
+  s.duration = when + 10s;
+  const auto g = build_or_fail(s);
+  const auto gateway = *g.index_of("chat_servers");
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  std::optional<double> level;
+  sim->run({.duration = s.duration, .step = s.step}, [&](const simsys::engine::StepRecord& r) {
+    if (r.t == when) level = r.nodes[gateway].connections;
+  });
+  REQUIRE(level.has_value());
+  return *level;
+}
+
+}  // namespace
+
+TEST_CASE("book/chat-system runs the day, passes its three SLOs and storms back after 21:30",
+          "[scenario]") {
+  using namespace std::chrono_literals;
+  using Catch::Matchers::WithinRel;
+  auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/chat-system/scenario.yaml");
+  s.step = 10s;
+  const auto g = build_or_fail(s);
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  const auto summary = simsys::session::run_summary(g, *sim);
+  const auto verdicts = simsys::report::evaluate_slos(summary, s.slos);
+  REQUIRE(verdicts.size() == 3);
+  for (const auto& r : verdicts) {
+    CAPTURE(r.slo.node, static_cast<int>(r.slo.metric), r.observed.value_or(-1.0), r.note);
+    REQUIRE(r.status == simsys::report::SloStatus::pass);
+  }
+
+  const auto json = simsys::report::render_json(summary, verdicts);
+  const auto faults = json.find("\"faults\": [");
+  REQUIRE(faults != std::string::npos);
+  const auto fault = json.substr(faults);
+  CAPTURE(fault);
+  REQUIRE(fault.contains("\"kind\": \"node_down\""));
+  const auto after = fault.substr(fault.find("\"after\": {"));
+
+  // The storm is the tier's whole level at 21:30 (the record of 21:29:50 is the last before it).
+  const double level = chat_servers_level_at(s, simsys::SimTime{21h + 29min + 50s});
+  REQUIRE(level > 0.0);
+  REQUIRE_THAT(number_after_key(after, "\"reconnect_storm_connections\": "),
+               WithinRel(level, 0.01));
+  REQUIRE_THAT(number_after_key(after, "\"reconnect_storm_over_s\": "), WithinRel(30.0, 1e-9));
+
+  // The peak is first reached once the gateway is back (21:31:00) and within five minutes of it.
+  const double peak_at_s = number_after_key(after, "\"peak_rho_at_s\": ");
+  REQUIRE(peak_at_s >= 21 * 3600 + 31 * 60);
+  REQUIRE(peak_at_s <= 21 * 3600 + 35 * 60);
+
+  // The run is back to its twin before 22:00.
+  REQUIRE_FALSE(after.contains("\"recovered_at_s\": null"));
+  const double recovered_at_s = number_after_key(after, "\"recovered_at_s\": ");
+  REQUIRE(recovered_at_s > 21 * 3600 + 31 * 60);
+  REQUIRE(recovered_at_s < 22 * 3600);
 }

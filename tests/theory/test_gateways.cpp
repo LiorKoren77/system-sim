@@ -71,6 +71,7 @@ import simsys.engine;
 import simsys.graph;
 import simsys.model;
 import simsys.report;
+import simsys.session;
 import simsys.test_fixtures;
 
 // A note for test authors: `Approx(x).margin(m)` passes when the value is within the
@@ -852,4 +853,586 @@ TEST_CASE("explain's checks include the heartbeat load and the fan-out", "[theor
   REQUIRE(check_line(text, "gw").contains("peak offered 20.2k/s vs 1M/s total capacity"));
   REQUIRE(check_line(text, "presence").contains("peak offered 20k/s vs 1M/s total capacity"));
   REQUIRE(check_line(text, "q").contains("peak offered 140/s vs 1M/s total capacity"));
+}
+
+// ---- The reconnect storm (phase 3 Task 15, spec §8.2) -------------------------------------------
+//
+// A `node_down` of r of a gateway's R replicas drops the connections those replicas held, C r / R,
+// AT ONCE (a dead server's sockets are gone, ch. 12), and their users come back spread evenly over
+// `reconnect_within` from the moment the fault CLEARS: the storm,
+//
+//     connects(t) = lambda + dropped / reconnect_within     for reconnect_within after at + for
+//
+// on top of the clients' own `connect` rate lambda. The gateway then serves, per second, its sends,
+// its connects (34 times the usual ones in the probe below) and the heartbeats of the level as it
+// recovers. The fault block's `after:` line names the storm (its size, how long, the gateway's peak
+// UTILISATION), and the JSON's `after` object holds the same numbers.
+//
+// THE PROBE. Task 14's, run to its fixed point first: client 200/s (connect 100/s, send 100/s),
+// `session: 1000s`, `heartbeat: 5s`, so C* = 100k; 1 s steps (the Euler recurrence at the top of
+// this file); the fault starts at t = 5000 s, once the level is within 1 % of 100k:
+//
+//     C0 = C(5000 s) = 100k (1 - 0.999^5000) = 99,327.8888 (the recurrence, not the exponential)
+//
+// (100k would need 4700 s only to be within 1 %; at 5000 s the level is 0.67 % short of it.) The
+// fault is `node_down` of the gateway for 60 s (every replica), `reconnect_within: 30s`, and the
+// run goes on past the storm. Differences from Task 14's probe, each for a reason:
+//  - the gateway's capacity is 32k/s (c = 16 servers of 500 us), not 1M/s: at the fixed point it
+//    serves 200 + C / 5 = 20.2k/s (rho 0.63) and in the storm up to 23.0k/s (0.72), so nothing is
+//    ever refused for want of capacity and the recurrence below holds exactly. (The plan's "peak
+//    343 %" assumed a gateway of 1k/s: with the heartbeats at the fixed point that gateway would be
+//    at 2000 % all the time.) Probe B below overloads a gateway on purpose;
+//  - `queue_limit: 1` on the gateway: while the gateway is down its room (1000 by default) would
+//    hold the fault's first seconds of requests, and the first step after the fault would drain
+//    them, connects included, which adds up to a thousand to the level (1 %) and has nothing to do
+//    with the storm. The room is tested elsewhere; here it is one request, and the level is pinned
+//    to within 2 connections of the recurrence.
+//
+// WHAT IS PINNED (and what is the implementer's choice):
+//  - the discretisation of Task 14 holds: record k shows the level step k STARTED with. The fault's
+//    first step, k = 5000, starts with the level already dropped, so record 5000 shows 0 (the plan:
+//    "C falls to 0 at the first fault step"); record 4999 still shows C(4999). The dropped
+//    connections are the level the fault-free recurrence gives at k = 5000: C0 (the twin's level);
+//  - while the gateway is down it serves nothing, so connects are not admitted and the level stays
+//    0, and every `send` and `connect` the clients offer is lost (answered 0). Not pinned: the
+//    first fault step (the room of one request may hold one) and what happens to a request that
+//    the room holds;
+//  - after the fault the gateway's `connect` DEMAND is 100 + C0 / 30 = 3410.93/s for the 30 steps
+//    from t = 5060 s (34.1 times its usual 100/s; the plan's 34.3 assumed C0 = 100k), then 100/s
+//    again. The gateway's demand is read as sends 100 + connects + heartbeats (level / 5), so the
+//    connect demand of a step is demand - 100 - level / 5;
+//  - the level follows the same recurrence with the storm's inflow: C(k+1) = C(k) + 100 + C0 / 30
+//    - C(k) / 1000 for the 30 storm steps, from 0. At the storm's end C(5090) = 100,857.9, a little
+//    ABOVE C0 and the fixed point: the storm brings all the dropped connections back and the 30
+//    s of regular connects come on top, while only half the storm's span of disconnects is repaid.
+//    The plan's "~97k" (C0 minus 30 s of disconnects) forgets those 3000 connects; 97.5k is the
+//    level the LAST storm step starts with, C(5089), which is what the peak heartbeats are read
+//    off;
+//  - the report's PEAK is the gateway's offered utilisation, demand / total capacity, the number
+//    explain's checks call "peak offered ... (148%)": NOT the node table's rho, which is the busy
+//    fraction and never passes 100 %. It is taken over the steps from the fault's end to the end of
+//    the run (not inside the fault: capacity 0 there), and the step it is first reached at is the
+//    one `peak_rho_at_s` names. In this probe it is the LAST storm step (k = 5089: demand 200 +
+//    C0 / 30 + C(5089) / 5 = 23,019.8/s, 71.9 % of 32k/s), NOT the first: the heartbeat load
+//    grows with the recovering level faster than the storm's own connects fall away, and the first
+//    step after the storm is 20.37k/s. Probe B has no heartbeats, so there the storm is a plateau;
+//  - the text: `reconnect storm 99.33k connections over 30s, gw peak 71.9% at 01:24:49` closes the
+//    `after:` line (after the backlog and retries parts, if any); the amount is written as the
+//    block writes any count (4 digits, k suffix), the percent as the node table's, the clock as
+//    the block's (5089 s is 01:24:49);
+//  - the JSON `after` object ends, just before `recovered_at_s`, with
+//  `reconnect_storm_connections`,
+//    `reconnect_storm_over_s`, `peak_rho` (a fraction: 0.719) and `peak_rho_at_s`, in that order,
+//    only for a node_down of a gateway (a fault on any other node has no such keys: one more key
+//    on every fault of every report would change reports that have no gateway). ASSUMED NAMES:
+//    exactly these four;
+//  - the recovery rule is the block's own (every op's p99 and every node's rho within 1 % of the
+//    twin's same step, which keeps its level on the recurrence): the run is not back while the
+//    storm lasts, and in this probe the level gap to the twin (+1.47 % at the storm's end, closing
+//    with the 1000 s time constant) is under 1 % at about t = 5530 s. Only "after the storm, before
+//    5990 s" is pinned.
+// A PARTIAL node_down (2 of 4 replicas) drops C0 / 2 at once (the record of step 5000 shows half
+// the recurrence's level), the storm is that half over 30 s, and a message sent over a dropped
+// connection is lost: half the `send`s are answered during the fault (the plan: "messages to
+// dropped connections are lost"). The level during the fault, what the surviving replicas admit
+// meanwhile, is not pinned.
+namespace {
+
+constexpr int fault_step = 5000;      // t = 5000 s
+constexpr int fault_end_step = 5060;  // 5000 s + 60 s
+constexpr double regular_connects_per_s = 100.0;
+constexpr double regular_sends_per_s = 100.0;
+
+// The probe's knobs (C++20 designated initializers at every call, as in Shape above).
+struct StormProbe {
+  SimTime reconnect_within{30s};
+  int replicas{1};
+  std::optional<int> replicas_down{};  // absent: the fault names no `replicas`, so every replica
+  std::optional<SimTime> heartbeat{5s};
+  Rate capacity{32'000};  // per replica
+  std::int64_t max_connections{200'000};
+  SimTime duration{6500s};
+  std::string faulted{"gw"};
+  SimTime fault_at{5000s};
+  SimTime fault_for{60s};
+};
+
+Scenario storm_scenario(const StormProbe& p) {
+  auto s = gateway_scenario(Shape{.heartbeat = p.heartbeat,
+                                  .max_connections = p.max_connections,
+                                  .replicas = p.replicas,
+                                  .step = 1s,
+                                  .capacity = p.capacity});
+  s.duration = p.duration;
+  auto& gateway = s.nodes[gateway_index];
+  gateway.reconnect_within = p.reconnect_within;
+  gateway.advanced.queue_limit = 1.0;  // see THE PROBE above
+  s.faults = {simsys::model::Fault{.kind = simsys::model::FaultKind::node_down,
+                                   .at = p.fault_at,
+                                   .duration = p.fault_for,
+                                   .node = p.faulted,
+                                   .replicas = p.replicas_down}};
+  return s;
+}
+
+// A run of the probe, seen the three ways the tests read it: every step's record, the table
+// `simsys run` prints and its JSON (session::run_summary: the run, its fault-free twin, and the
+// fault block set from both).
+struct StormRun {
+  std::vector<StepRecord> records;
+  std::string table;
+  std::string json;
+};
+
+StormRun run_storm(const StormProbe& p) {
+  const auto s = storm_scenario(p);
+  const auto g = graph_of(s);
+  StormRun run;
+  run.records = run_steps(g, static_cast<int>(p.duration / 1s), 1s);
+  auto sim = simulation_of(g);
+  const auto summary = simsys::session::run_summary(g, sim);
+  const auto verdicts = simsys::report::evaluate_slos(summary, s.slos);
+  run.table = simsys::report::render_table(summary, verdicts, /*color=*/false);
+  run.json = simsys::report::render_json(summary, verdicts);
+  return run;
+}
+
+// Each run is built once and shared by the tests that read it (a run is 6500 steps and its twin).
+// A function-local static: initialised the first time the function is called, in a thread-safe
+// way, so a test that needs the run only when it is selected does not pay for it otherwise.
+const StormRun& whole_gateway_down() {
+  static const StormRun run = run_storm(StormProbe{});
+  return run;
+}
+
+const StormRun& slow_storm() {
+  static const StormRun run = run_storm(StormProbe{.reconnect_within = 300s, .duration = 5500s});
+  return run;
+}
+
+// 2 of 4 replicas of 16k/s each (the same 64k/s in all; the two that stay, 32k/s, still serve the
+// 20.2k/s of the fixed point), 50k connections each (the cap, 200k, is out of the level's reach).
+const StormRun& half_the_gateway_down() {
+  static const StormRun run = run_storm(StormProbe{.replicas = 4,
+                                                   .replicas_down = 2,
+                                                   .capacity = Rate{16'000},
+                                                   .max_connections = 50'000,
+                                                   .duration = 7500s});
+  return run;
+}
+
+// The level a fault-free gateway has at record k: Task 14's recurrence.
+double fault_free_level(int k) {
+  return euler_levels(k + 1, 1.0)[static_cast<std::size_t>(k)];
+}
+
+// C0: the connections the fault drops, the level the recurrence gives at the fault's first step.
+double level_dropped_by_the_fault() {
+  return fault_free_level(fault_step);
+}
+
+// The level of record k of the whole-gateway-down probe, by the recurrence with the fault: the
+// level at the fault's first step is dropped to 0 and stays there while the gateway admits nothing,
+// then the storm adds dropped / within_s to the clients' 100 connects a second for within_s steps.
+std::vector<double> levels_with_whole_gateway_down(int steps, double within_s) {
+  std::vector<double> levels;
+  double level = 0.0;
+  double dropped = 0.0;
+  for (int k = 0; k < steps; ++k) {
+    if (k == fault_step) {
+      dropped = level;
+      level = 0.0;
+    }
+    levels.push_back(level);
+    const bool in_fault = k >= fault_step && k < fault_end_step;
+    const bool in_storm = k >= fault_end_step && k < fault_end_step + within_s;
+    double connects = in_fault ? 0.0 : regular_connects_per_s;
+    if (in_storm) connects += dropped / within_s;
+    level += connects - level / 1000.0;
+  }
+  return levels;
+}
+
+// What the gateway was offered in step k as connects: its demand less the sends and the heartbeats
+// of the level the step started with (C / 5). Valid for a probe with heartbeats.
+double connect_demand_of(const StepRecord& r) {
+  return demand_of(r, gateway_index) - regular_sends_per_s - level_of(r) / 5.0;
+}
+
+const StepRecord& record_at(const StormRun& run, int k) {
+  return run.records.at(static_cast<std::size_t>(k));
+}
+
+// The number after `key` (written `"name": `) in `text`.
+double number_after(const std::string& text, std::string_view key) {
+  const auto at = text.find(key);
+  CAPTURE(key);
+  REQUIRE(at != std::string::npos);
+  return std::stod(text.substr(at + key.size()));
+}
+
+// The keys in the order given, each after the one before (the layout of an object, without
+// pinning the numbers between them).
+void require_in_order(const std::string& text, std::initializer_list<std::string_view> keys) {
+  std::size_t from = 0;
+  for (const auto key : keys) {
+    CAPTURE(key);
+    const auto at = text.find(key, from);
+    REQUIRE(at != std::string::npos);
+    from = at + key.size();
+  }
+}
+
+// The line of `text` that starts with `prefix` (a block's `  after:    `), without its newline.
+std::string line_beginning(const std::string& text, std::string_view prefix) {
+  const auto at = text.find("\n" + std::string{prefix});
+  CAPTURE(prefix);
+  REQUIRE(at != std::string::npos);
+  return text.substr(at + 1, text.find('\n', at + 1) - at - 1);
+}
+
+// The JSON from the fault's `after` object on: where the storm's keys live, apart from the nodes'
+// own `peak_rho`, which come earlier in the report.
+std::string after_object_of(const std::string& json) {
+  const auto at = json.find("\"after\": {");
+  REQUIRE(at != std::string::npos);
+  return json.substr(at);
+}
+
+}  // namespace
+
+// The closed form of C0 itself, so that every number below can be traced to the recurrence: at
+// 5000 s the level is 100k (1 - 0.999^5000) = 99,327.8888, 0.67 % below the fixed point.
+TEST_CASE(
+    "the probe's level at the fault's start is 99,327.89, within 1 percent of its fixed point",
+    "[theory]") {
+  const double c0 = level_dropped_by_the_fault();
+  require_close(c0, 99'327.88880401333);
+  REQUIRE_THAT(c0, WithinRel(100'000.0 * (1.0 - std::pow(0.999, 5000.0)), 1e-9));
+  REQUIRE_THAT(c0, WithinRel(100'000.0, 0.01));
+}
+
+// ---- The level: dropped at once, empty for the minute -----------------------------------------
+
+// The record of step 4999 is the last with the level the recurrence gives; step 5000 starts with
+// every connection gone, and the level stays 0 for the 60 fault steps (the gateway serves nothing,
+// so no connect is admitted). The step that starts at 5060 s, the fault's end, starts with 0 too.
+TEST_CASE("a node_down of the whole gateway drops every connection at its first step: level 0",
+          "[theory]") {
+  const auto& run = whole_gateway_down();
+  const auto expected = levels_with_whole_gateway_down(6500, 30.0);
+  require_close(expected[4999], fault_free_level(4999));  // the recurrence, by hand
+  for (int k = 0; k < fault_step; ++k) {
+    CAPTURE(k);
+    require_close(level_of(record_at(run, k)), expected[static_cast<std::size_t>(k)]);
+  }
+  for (int k = fault_step; k <= fault_end_step; ++k) {
+    CAPTURE(k);
+    require_close(level_of(record_at(run, k)), 0.0);
+  }
+  // No connection, no heartbeat: what the gateway is offered in the fault is the clients' 100
+  // sends and 100 connects, not the 20k a second the 100k connections ping.
+  for (int k = fault_step; k < fault_end_step; ++k) {
+    CAPTURE(k);
+    REQUIRE_THAT(demand_of(record_at(run, k), gateway_index), WithinRel(200.0, 1e-9));
+  }
+}
+
+// What the clients see while it is down: no send is answered and no connect either (the room of
+// one request is full from the second fault step on), and q (behind the gateway) gets nothing.
+// (Today's engine, which derates a node_down's capacity to 0, already does this: a guard for the
+// storm's implementation, which must not undo it.)
+TEST_CASE("while the whole gateway is down its clients' sends and connects are all lost",
+          "[theory]") {
+  const auto& run = whole_gateway_down();
+  REQUIRE_THAT(response_of(record_at(run, fault_step - 1), "send").answered.per_second,
+               WithinRel(100.0, 1e-9));
+  for (int k = fault_step + 1; k < fault_end_step; ++k) {
+    CAPTURE(k);
+    const auto& record = record_at(run, k);
+    for (const auto* op : {"send", "connect"}) {
+      CAPTURE(op);
+      const auto& response = response_of(record, op);
+      REQUIRE_THAT(response.offered.per_second, WithinRel(100.0, 1e-9));
+      REQUIRE_THAT(response.answered.per_second, WithinAbs(0.0, 1e-9));
+      REQUIRE_THAT(response.lost.per_second, WithinRel(100.0, 1e-9));
+    }
+    REQUIRE_THAT(demand_of(record, q_index), WithinAbs(0.0, 1e-9));
+  }
+}
+
+// The twin is the run without the fault (the block's baseline): it keeps filling on the recurrence
+// through the fault minute, C0 at 5000 s and the same level after it, while the run's own level
+// is 0. (The twin half passes before the storm exists; the run's half is the drop.)
+TEST_CASE(
+    "the fault-free twin of a gateway run keeps its level on the recurrence through the fault",
+    "[theory]") {
+  const auto g = graph_of(storm_scenario(StormProbe{.duration = 5200s}));
+  auto sim = simulation_of(g);
+  for (int k = 0; k < 5200; ++k) {
+    const auto record = sim.step(k * 1s, 1s);
+    const auto* twin = sim.twin_record();
+    REQUIRE(twin != nullptr);
+    const auto& twin_level = twin->nodes[gateway_index].connections;
+    REQUIRE(twin_level.has_value());
+    CAPTURE(k);
+    require_close(*twin_level, fault_free_level(k));
+    if (k >= fault_step && k < fault_end_step) require_close(level_of(record), 0.0);
+  }
+}
+
+// ---- The storm: the gateway's connect demand ---------------------------------------------------
+
+// Before the fault the gateway is offered the clients' 100 connects a second; during it the same
+// 100 (offered, and lost); for the 30 steps from 5060 s they are 100 + C0 / 30 = 3410.93/s, 34.1
+// times the usual, and from 5090 s on 100 again. The heartbeats on top follow the level (below).
+TEST_CASE("after the fault the gateway's connect demand is 100 plus C0 over 30 for 30 seconds",
+          "[theory]") {
+  const auto& run = whole_gateway_down();
+  const double storm_rate = regular_connects_per_s + level_dropped_by_the_fault() / 30.0;
+  REQUIRE_THAT(storm_rate, WithinRel(3410.9296268, 1e-9));
+  for (int k = 4000; k < 5300; ++k) {
+    CAPTURE(k);
+    const bool in_storm = k >= fault_end_step && k < fault_end_step + 30;
+    REQUIRE_THAT(connect_demand_of(record_at(run, k)),
+                 WithinRel(in_storm ? storm_rate : regular_connects_per_s, 1e-6));
+  }
+}
+
+// The multiple the plan quotes: the storm's connect demand against its steady value, 1 + C0 / (30
+// x 100) = 34.11 (34.3 would be C0 = 100k exactly), at its peak; with `reconnect_within: 300s` the
+// sweep's point, 1 + C0 / (300 x 100) = 4.31 (the plan's 4.3), held for 300 steps.
+TEST_CASE("the connect demand peaks at 34.1 times its steady value, and at 4.3 over 300 seconds",
+          "[theory]") {
+  const auto& fast = whole_gateway_down();
+  double peak = 0.0;
+  for (int k = fault_end_step; k < 5300; ++k) {
+    peak = std::max(peak, connect_demand_of(record_at(fast, k)));
+  }
+  REQUIRE_THAT(peak / regular_connects_per_s, WithinRel(1.0 + 99'327.88880401333 / 3000.0, 1e-6));
+  REQUIRE_THAT(peak / regular_connects_per_s, WithinAbs(34.1, 0.05));
+
+  const auto& slow = slow_storm();
+  const double slow_rate = regular_connects_per_s + level_dropped_by_the_fault() / 300.0;
+  for (int k = fault_end_step - 5; k < 5500; ++k) {
+    CAPTURE(k);
+    const bool in_storm = k >= fault_end_step && k < fault_end_step + 300;
+    REQUIRE_THAT(connect_demand_of(record_at(slow, k)),
+                 WithinRel(in_storm ? slow_rate : regular_connects_per_s, 1e-6));
+  }
+  REQUIRE_THAT(slow_rate / regular_connects_per_s, WithinAbs(4.31, 0.005));
+}
+
+// The heartbeats are those of the level as it recovers: presence is offered C(k) / 5 at every step
+// of the storm (0 at its first step, the level's 97.5k / 5 = 19.5k at its last), not the 20k of
+// the fixed point.
+TEST_CASE("during the storm the heartbeats presence is offered follow the recovering level",
+          "[theory]") {
+  const auto& run = whole_gateway_down();
+  for (int k = fault_end_step - 2; k < 5200; ++k) {
+    CAPTURE(k);
+    const auto& record = record_at(run, k);
+    REQUIRE_THAT(demand_of(record, presence_index), WithinAbs(level_of(record) / 5.0, 1e-6));
+  }
+  REQUIRE_THAT(demand_of(record_at(run, fault_end_step), presence_index), WithinAbs(0.0, 1e-6));
+}
+
+// ---- The storm: the level it rebuilds ---------------------------------------------------------
+
+// The level during and after the storm is the recurrence with the storm's inflow, to within 2
+// connections (the room of one request). At the storm's end it is 100,857.9: above C0 (see the
+// header), not the plan's 97k.
+TEST_CASE("the storm rebuilds the level along the recurrence: 100,858 connections at its end",
+          "[theory]") {
+  const auto& run = whole_gateway_down();
+  const auto expected = levels_with_whole_gateway_down(6500, 30.0);
+  require_close(expected[5090], 100'857.88979817306);  // the recurrence, by hand
+  for (int k = fault_end_step; k < 6500; ++k) {
+    CAPTURE(k);
+    REQUIRE_THAT(level_of(record_at(run, k)),
+                 WithinAbs(expected[static_cast<std::size_t>(k)], 2.0));
+  }
+  REQUIRE(level_of(record_at(run, 5090)) > level_dropped_by_the_fault());
+  // The level passes 97k at the storm's last step but is not at its end (the plan's mistake).
+  REQUIRE_THAT(level_of(record_at(run, 5089)), WithinAbs(97'544.50467604866, 2.0));
+}
+
+// ---- The fault block names the storm -----------------------------------------------------------
+
+// `after:` ends with the storm: its size (the connections dropped, C0 = 99.33k), how long (30 s)
+// and the gateway's peak utilisation with the moment it is first reached (the last storm second,
+// 5089 s = 01:24:49, at demand / capacity = 23,019.8 / 32,000 = 71.9 %).
+TEST_CASE("the fault block's after line names the storm's size, length, gateway peak and time",
+          "[theory]") {
+  const auto& run = whole_gateway_down();
+  const auto after = line_beginning(run.table, "  after:");
+  CAPTURE(run.table);
+  REQUIRE(
+      after.ends_with("reconnect storm 99.33k connections over 30s, gw peak 71.9% at 01:24:49"));
+  REQUIRE(run.table.contains("fault 01:23:20 node_down gw for 1m\n"));
+}
+
+TEST_CASE("the JSON after object has the storm's size, length, peak and its time", "[theory]") {
+  const auto& run = whole_gateway_down();
+  const auto after = after_object_of(run.json);
+  CAPTURE(after);
+  require_in_order(
+      after, {"\"after\": {", "\"reconnect_storm_connections\": ", "\"reconnect_storm_over_s\": ",
+              "\"peak_rho\": ", "\"peak_rho_at_s\": ", "\"recovered_at_s\": "});
+  REQUIRE_THAT(number_after(after, "\"reconnect_storm_connections\": "),
+               WithinRel(99'327.88880401333, 1e-6));
+  REQUIRE_THAT(number_after(after, "\"reconnect_storm_over_s\": "), WithinAbs(30.0, 1e-9));
+  const double peak_demand = 200.0 + 99'327.88880401333 / 30.0 + 97'544.50467604866 / 5.0;
+  REQUIRE_THAT(number_after(after, "\"peak_rho\": "), WithinRel(peak_demand / 32'000.0, 1e-6));
+  REQUIRE_THAT(number_after(after, "\"peak_rho_at_s\": "), WithinAbs(5089.0, 1e-6));
+}
+
+// The recovery is the block's own rule against the twin: not while the storm lasts, and (about
+// 5530 s here) once the level's gap to the twin's has closed to 1 %. Loose on purpose: after the
+// storm's end at 5090 s and long before the run's end.
+TEST_CASE("the gateway run is back to its twin after the storm ends, not during it", "[theory]") {
+  const auto& run = whole_gateway_down();
+  REQUIRE_FALSE(run.json.contains("\"recovered_at_s\": null"));
+  const double recovered_at = number_after(after_object_of(run.json), "\"recovered_at_s\": ");
+  REQUIRE(recovered_at > 5090.0);
+  REQUIRE(recovered_at < 5990.0);
+}
+
+// A storm over 300 s is a quarter-size one a tenth as steep: the same C0 dropped, over 300 s.
+TEST_CASE("with reconnect_within 300s the block names the storm over 300s", "[theory]") {
+  const auto& run = slow_storm();
+  const auto after = after_object_of(run.json);
+  REQUIRE_THAT(number_after(after, "\"reconnect_storm_connections\": "),
+               WithinRel(99'327.88880401333, 1e-6));
+  REQUIRE_THAT(number_after(after, "\"reconnect_storm_over_s\": "), WithinAbs(300.0, 1e-9));
+  REQUIRE(line_beginning(run.table, "  after:")
+              .contains("reconnect storm 99.33k connections over 5m, gw peak "));
+}
+
+// ---- A partial node_down -----------------------------------------------------------------------
+
+// 2 of 4 replicas: half the connections go at once (the record of the fault's first step shows
+// C0 / 2), half the messages are lost (those on the dropped connections: 50 of the 100 a second
+// are answered), and after the fault the storm is C0 / 2 / 30 = 1655.46 connects a second on top
+// of the clients' 100, for 30 s.
+TEST_CASE("a node_down of 2 of 4 gateway replicas drops half the connections and storms half back",
+          "[theory]") {
+  const auto& run = half_the_gateway_down();
+  const double dropped = level_dropped_by_the_fault() / 2.0;
+  require_close(level_of(record_at(run, fault_step)), dropped);
+  require_close(level_of(record_at(run, fault_step - 1)) / fault_free_level(fault_step - 1), 1.0);
+  for (int k = fault_step + 1; k < fault_end_step; ++k) {
+    CAPTURE(k);
+    REQUIRE_THAT(response_of(record_at(run, k), "send").answered.per_second, WithinRel(50.0, 1e-6));
+  }
+  for (int k = 4000; k < 5300; ++k) {
+    CAPTURE(k);
+    const bool in_storm = k >= fault_end_step && k < fault_end_step + 30;
+    REQUIRE_THAT(connect_demand_of(record_at(run, k)),
+                 WithinRel(regular_connects_per_s + (in_storm ? dropped / 30.0 : 0.0), 1e-6));
+  }
+  const auto after = after_object_of(run.json);
+  REQUIRE_THAT(number_after(after, "\"reconnect_storm_connections\": "), WithinRel(dropped, 1e-6));
+  REQUIRE_THAT(number_after(after, "\"reconnect_storm_over_s\": "), WithinAbs(30.0, 1e-9));
+  REQUIRE(line_beginning(run.table, "  after:")
+              .contains("reconnect storm 49.66k connections over 30s, gw peak "));
+}
+
+// Recovery after a partial fault: the level is back to its twin's within 1 % only some time after
+// the storm ends (the storm refills what 60 s of fewer connects and disconnects left apart; the
+// gap to the twin, a few percent, closes with the 1000 s time constant), 5882 to 6413 s by the
+// recurrence for the two ways the survivors may treat connects during the fault.
+TEST_CASE("after a partial node_down the run is back within 1 percent of its twin after the storm",
+          "[theory]") {
+  const auto& run = half_the_gateway_down();
+  REQUIRE_FALSE(run.json.contains("\"recovered_at_s\": null"));
+  const double recovered_at = number_after(after_object_of(run.json), "\"recovered_at_s\": ");
+  REQUIRE(recovered_at > 5090.0);
+  REQUIRE(recovered_at < 7400.0);
+}
+
+// ---- Probe B: a storm that overloads the gateway -----------------------------------------------
+
+// The block's peak is OFFERED utilisation, which passes 100 % (the book's reconnect storm is the
+// overload): no heartbeats, a gateway of 2k/s (c = 1), steady demand 200/s (10 %); at the storm
+// the demand is 200 + C0 / 30 = 3510.9/s, 175.5 % of the 2k/s, a plateau for the 30 storm steps
+// (so only "inside the storm" is pinned for the time). The node table's rho is the busy fraction
+// and does not pass 1.
+TEST_CASE("a storm over a gateway's capacity shows a peak above 100 percent: 176 percent",
+          "[theory]") {
+  const auto run =
+      run_storm(StormProbe{.heartbeat = std::nullopt, .capacity = Rate{2000}, .duration = 5200s});
+  const auto after = after_object_of(run.json);
+  const double peak = number_after(after, "\"peak_rho\": ");
+  REQUIRE_THAT(peak, WithinRel((200.0 + 99'327.88880401333 / 30.0) / 2000.0, 1e-6));
+  REQUIRE(peak > 1.0);
+  const double at_s = number_after(after, "\"peak_rho_at_s\": ");
+  REQUIRE(at_s >= 5060.0);
+  REQUIRE(at_s < 5090.0);
+  REQUIRE(line_beginning(run.table, "  after:")
+              .contains("reconnect storm 99.33k connections over 30s, gw peak 176% at "));
+  for (const auto& record : run.records) REQUIRE(record.nodes[gateway_index].rho <= 1.0);
+}
+
+// ---- Only a gateway has a storm ---------------------------------------------------------------
+
+// A node_down of the service behind the gateway (q, 10 s from 100 s) has no connections to drop:
+// no storm in the block, no storm keys in the JSON.
+TEST_CASE("a node_down of a node that is not a gateway prints no reconnect storm", "[theory]") {
+  const auto run =
+      run_storm(StormProbe{.duration = 200s, .faulted = "q", .fault_at = 100s, .fault_for = 10s});
+  CAPTURE(run.table);
+  REQUIRE(run.table.contains("fault 00:01:40 node_down q for 10s\n"));
+  REQUIRE_FALSE(run.table.contains("reconnect storm"));
+  REQUIRE_FALSE(run.json.contains("reconnect_storm"));
+  REQUIRE_FALSE(after_object_of(run.json).contains("peak_rho_at_s"));
+}
+
+// ---- Fan-out stops at the message queue (ch. 12) -----------------------------------------------
+
+// The Task 14 review's decision: `fanout` (1.4 recipients per message) multiplies a message op's
+// steps that TARGET A MESSAGE QUEUE, where ch. 12 copies a message once per recipient into the
+// sync queues; the steps to anything else (an id generator, the message store: here the service q)
+// see ONE request per message. The tests above in this file that give q a factor of 1.4 pin the
+// rule Task 15 replaces (the implementer changes them): a message queue is behind this probe's
+// gateway beside q, and a step's own factor still multiplies on the queue's step.
+namespace {
+constexpr std::size_t mq_index = 4;
+
+Scenario gateway_with_message_queue(Shape shape) {
+  shape.send_steps = {Step{.to = "q", .op = "publish"}, Step{.to = "mq", .op = "publish"}};
+  auto s = gateway_scenario(shape);
+  s.nodes.push_back(NodeSpec{.id = "mq", .type = NodeType::message_queue});
+  s.links.push_back(LinkSpec{.from = "gw", .to = "mq", .latency = 0s});
+  // A queue needs a pool that consumes it (Graph::build refuses one nobody reads): the chat
+  // design's sync_workers, here 1000 workers of 1 ms (1M/s: nothing backs up).
+  NodeSpec workers{.id = "sync", .type = NodeType::worker_pool};
+  workers.consumes = "mq";
+  workers.workers = 1000;
+  workers.job_cost = 1ms;
+  s.nodes.push_back(std::move(workers));
+  s.links.push_back(LinkSpec{.from = "mq", .to = "sync", .latency = 0s});
+  return s;
+}
+}  // namespace
+
+TEST_CASE("fanout 1.4 sends the message queue 1.4 times the sends and a service one times",
+          "[theory]") {
+  const auto g = graph_of(gateway_with_message_queue(Shape{.fanout = 1.4, .step = 1s}));
+  const auto records = run_steps(g, 10, 1s);
+  for (std::size_t k = 0; k < records.size(); ++k) {
+    CAPTURE(k);
+    require_close(demand_of(records[k], q_index), 100.0);
+    require_close(demand_of(records[k], mq_index), 140.0);
+  }
+}
+
+TEST_CASE("fanout multiplies with the queue step's own factor and leaves a service's alone",
+          "[theory]") {
+  auto s = gateway_with_message_queue(Shape{.fanout = 1.4, .step = 1s});
+  s.nodes[gateway_index].ops["send"][1].factor = 2.0;  // the queue step: x 2 x 1.4 = 280
+  s.nodes[gateway_index].ops["send"][0].factor = 3.0;  // the service step: x 3, no fan-out
+  const auto records = run_steps(graph_of(s), 3, 1s);
+  require_close(demand_of(records.front(), q_index), 300.0);
+  require_close(demand_of(records.front(), mq_index), 280.0);
 }
