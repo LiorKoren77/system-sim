@@ -34,6 +34,7 @@ add_executable(theory_tests
   theory/test_database_cdn.cpp
   theory/test_bytes_pipes.cpp
   theory/test_service_sugar.cpp
+  theory/test_gateways.cpp
   theory/test_queues_pools.cpp
   theory/test_sinks.cpp
   theory/test_kv.cpp

@@ -494,17 +494,20 @@ TEST_CASE("book/youtube at 400 transcoders fails its queue_lag SLO: 2.66 h of la
 
 // Ch. 15's Google Drive built its graph with the new queue wiring (notify_q's two consumer groups,
 // notification_svc and backup_workers, each consume it and are linked from it), and its queue and
-// pools are simulated. The engine stops at long_poll, its ws_gateway: Simulation::create checks
-// every node's TYPE over the whole file, so the first unsimulated type, long_poll (declared after
-// the pools), is the one it names. Phase 3 brings ws_gateway.
-TEST_CASE("book/google-drive is refused at long_poll, its ws_gateway", "[scenario]") {
+// pools are simulated. Since phase 3 Task 14 the ws_gateway is simulated too, but a gateway needs
+// a level: a `connect` op that reaches it or a fixed `connections`, and long_poll, the book's
+// notification long polls held open by devices no client here simulates, states neither yet
+// (a later task gives it `connections: 2M`). The loader and the graph accept it, explain describes
+// it, and Simulation::create refuses it, naming the node.
+TEST_CASE("book/google-drive is refused at long_poll until it states a connections level",
+          "[scenario]") {
   const auto g = build_or_fail(
       load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/google-drive/scenario.yaml"));
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
-          "node 'long_poll' has type 'ws_gateway', which run/estimate do not support yet "
-          "(phase 3)");
+          "node 'long_poll': a ws_gateway needs a client op named 'connect' or a fixed "
+          "'connections'");
 }
 
 // Ch. 11's news feed: its fan-out queue and pool are simulated, and so is graph_db, its kv_cluster,

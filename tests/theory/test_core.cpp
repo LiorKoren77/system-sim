@@ -236,16 +236,17 @@ TEST_CASE("dropped flow does not propagate downstream", "[theory]") {
   REQUIRE(r.nodes[2].demand_per_s == Approx(1000).epsilon(1e-6));
 }
 
-// (The example used to be a kv_cluster; it is simulated, so the refusal is shown on a ws_gateway,
-// which waits for phase 3.)
+// (The example used to be a kv_cluster, then a ws_gateway; both are simulated, so the refusal is
+// shown on a notification_fanout, which waits for phase 3.)
 TEST_CASE("a simulation refuses node types the phase does not support yet", "[theory]") {
   Scenario s = mm1(1);
-  s.nodes[1].type = NodeType::ws_gateway;
+  s.nodes[1].type = NodeType::notification_fanout;
   const auto g = *simsys::graph::Graph::build(s);
   const auto sim = Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
-          "node 's' has type 'ws_gateway', which run/estimate do not support yet (phase 3)");
+          "node 's' has type 'notification_fanout', which run/estimate do not support yet "
+          "(phase 3)");
 }
 
 TEST_CASE("run emits one record per step from 0 to duration, exclusive", "[theory]") {
