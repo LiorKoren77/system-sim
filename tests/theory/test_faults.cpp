@@ -55,6 +55,7 @@ import simsys.graph;
 import simsys.model;
 import simsys.queueing;
 import simsys.report;
+import simsys.session;
 import simsys.test_fixtures;
 
 using namespace std::chrono_literals;
@@ -173,14 +174,13 @@ double mm1_mean_s(double service_time_s, double rho) {
   return service_time_s / (1.0 - rho);
 }
 
-// The whole scenario run for its duration and rendered as JSON, the report a run prints.
+// The whole scenario run for its duration and rendered as JSON, the report a run prints: the run
+// of `simsys run` (session::run_summary: the Summary, the fault-free twin's beside it, and the
+// fault blocks set from both).
 std::string run_json(const Scenario& s) {
   const auto g = graph_of(s);
-  simsys::report::Summary summary{g, s.warmup};
   auto sim = simulation_of(g);
-  sim.run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
-  summary.set_faults(
-      sim.fault_records());  // as session::run_summary does: the report's fault block
+  const auto summary = simsys::session::run_summary(g, sim);
   return simsys::report::render_json(summary, {});
 }
 
@@ -1547,63 +1547,76 @@ TEST_CASE("a node_down of two of a kv_cluster's six machines loses the reads who
 // §4.4; the lines are the same for every kind of fault):
 //   fault <at> <kind> <node> for <for>        the clock time `at` as the SLO windows print it
 //     during:   offered, served, lost, backlog   what the faulted node was sent, what it served
-//     after:    what followed                    (means over the fault), the requests its room
-//     recovery: when everything was back         dropped, its backlog's peak, SLOs that flipped
-// Model under test (phase 3 Task 8), the engine's FaultRecord per fault, read by the report:
-//   offered, served  the faulted node's demand and drain, per second, averaged over [at, at + for)
-//   lost             the requests its full room dropped over the fault (sum of dropped x dt)
-//   backlog, room    the peak backlog over the fault, and the room (queue_limit) it filled
-//   flipped          an SLO that held at the step before the fault and is broken at some step
-//                    inside it, judged on that step alone (a p99_latency SLO: the op's p99 at the
-//                    step, from the moments the step answered with)
-//   after            a node_down's backlog drained: from the end of the fault to the end of the
-//                    first step whose backlog is empty; a flushed cache's warm-up time: keys read
-//                    off the same curve as Task 7 (t_c / rate for a che cache, keys / rate for a
-//                    fixed ratio)
+//     after:    what followed                    (means over the fault), what the fault cost,
+//     recovery: when everything was back         its backlog's peak, what it did to the SLOs
+// Model under test (phase 3 Task 8 and its review): every number is measured against a TWIN, the
+// same scenario with its faults stripped, stepped in lockstep with the run (the counterfactual an
+// incident report compares the incident against: the day that would have been). Its noise is the
+// run's (the same seeds), so before the first fault the two are one run, bit for bit.
+//   offered, served  the faulted node's demand and drain, per second, averaged over [at, at + for),
+//                    in the node's own unit (MB/s on a byte-sized node, as its capacity)
+//   lost             the faulted node's drops minus the twin's, summed from `at` to the recovery
+//                    step (the end of the run when there is none): the drain's losses included,
+//                    the node's own drops of an overload the twin has too excluded; in the node's
+//                    unit (`lost 24k MB` on a byte-sized node), and for a dc_down the links it
+//                    cuts apart, in requests (`lost 24k MB at its nodes and 500 requests on cut
+//                    links`)
+//   backlog, room    the peak backlog over the fault, and `(room N dropped the rest)` only when
+//                    that backlog reached the room and the node itself dropped
+//   SLOs             `<slo> over its max for 300ms`: the time, during the fault, of the steps at
+//                    which the run breaks the SLO and the twin's same step does not (each step
+//                    judged alone by the report's own SLO rules); `flipped to FAIL`: the run's
+//                    verdict (the SLO table's) differs from the twin's
+//   after            the backlog the fault left above the twin's, drained: from the end of the
+//                    fault to the end of the first step at which it is back at the twin's (a
+//                    traffic_spike names the downstream node that drained); a flushed cache's
+//                    warm-up time (keys read off Task 7's curve)
 //   recovery         the first step starting at or after the end of the fault at which every
-//                    client op's p99 and every node's rho are within 1 % of the step before `at`
-//                    (relative to it): the time of the START of that step. Measured, not
-//                    estimated: on the M/M/1 probe below the third step after the fault is the
-//                    first with rho back at 0.4 (steps 20.0 and 20.1 s have rho 1 and 0.8), so
-//                    recovery is at 20.2 s, 0.2 s after the fault cleared. (The plan estimated
-//                    20.3 s; its 20.3 is the END of that step. The tests pin the start: the system
-//                    IS back from 20.2 s, the backlog having been empty since that instant, and it
-//                    agrees with the drain time of the line above.)
-// Formats chosen here: the clock is window_clock's (a whole minute `00:10`, a whole second
-// `00:00:10`) and, for a time that is not a whole second, HH:MM:SS with a tenth (`00:00:20.2`:
-// window_clock would print the exact duration, `20200ms`); durations after `in`, `for` and `after`
-// are seconds with at most one decimal (`0.2s`, `12.1s`, `0s`), except the header's `for`, which is
-// the scenario's own (`10s`, `200ms`). Ignored on purpose: the follow-ons of Tasks 10 and 15 (the
-// client's extra attempts, a reconnect storm), which add their own `after:` text.
+//                    client op's p99 and every node's rho are within 1 % of the twin's same step
+//                    (relative to it, with 1e-9 of absolute slack): the time of the START of that
+//                    step. On the M/M/1 probe below the third step after the fault is the first
+//                    with rho back at the twin's 0.4 (steps 20.0 and 20.1 s have rho 1 and 0.8),
+//                    so recovery is at 20.2 s, 0.2 s after the fault cleared.
+// Formats: the clock is window_clock's (a whole minute `00:10`, a whole second `00:00:10`) and,
+// for a time that is not a whole second, HH:MM:SS with a tenth (`00:00:20.2`); durations after
+// `in`, `for` and `after` are seconds with at most one decimal (`0.2s`, `12.1s`, `0s`), except the
+// header's `for`, which is the scenario's own (`10s`, `200ms`). Ignored on purpose: the follow-ons
+// of Tasks 10 and 15 (the client's extra attempts, a reconnect storm), which add their own text.
 
 namespace {
-// What a run reports with the fault records its engine kept (session::run_summary does the same).
+// What a run reports, as `simsys run` builds it (session::run_summary: the run, its fault-free
+// twin, and the fault blocks set from both).
 struct FaultRun {
   std::string table;
   std::string json;
   std::vector<simsys::engine::FaultRecord> faults;
+  std::vector<simsys::report::FaultBlock> blocks;
 };
 
 FaultRun fault_run(const Scenario& s) {
   const auto g = graph_of(s);
-  simsys::report::Summary summary{g, s.warmup};
   auto sim = simulation_of(g);
-  sim.run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
+  const auto summary = simsys::session::run_summary(g, sim);
   const auto records = sim.fault_records();
-  summary.set_faults(records);
+  const auto blocks = summary.faults();
   const auto verdicts = simsys::report::evaluate_slos(summary, s.slos);
   return {simsys::report::render_table(summary, verdicts, /*color=*/false),
           simsys::report::render_json(summary, verdicts),
-          std::vector<simsys::engine::FaultRecord>{records.begin(), records.end()}};
+          std::vector<simsys::engine::FaultRecord>{records.begin(), records.end()},
+          std::vector<simsys::report::FaultBlock>{blocks.begin(), blocks.end()}};
 }
 
+// The recovery line's words, before the clock time.
+constexpr std::string_view back_within =
+    "  recovery: back within 1% (every op's p99, every node's rho) at ";
+
 // The probe's ten second node_down, whose block is pinned in full by the tests below.
-constexpr std::string_view node_down_block =
+const std::string node_down_block =
     "fault 00:00:10 node_down s for 10s\n"
     "  during:   offered 400/s, served 0/s, lost 3.9k requests, backlog 100 (room 100 dropped the "
     "rest)\n"
-    "  after:    backlog drained in 0.2s\n"
-    "  recovery: op p99 back within 1% at 00:00:20.2 (0.2s after the fault cleared)\n";
+    "  after:    backlog drained in 0.2s\n" +
+    std::string{back_within} + "00:00:20.2 (0.2s after the fault cleared)\n";
 
 // Three p99 SLOs on the op: one the outage breaks (100 ms; the probe's p99 is 8.2 ms before it),
 // one that already fails before it (1 ms), one it never breaks (1 h).
@@ -1632,12 +1645,22 @@ void require_in_order(const std::string& text, std::initializer_list<std::string
     from = at + key.size();
   }
 }
+
+// The line of `text` that starts with `prefix` (a block's `  during:   `), without its newline.
+std::string line_starting(const std::string& text, std::string_view prefix) {
+  const auto at = text.find("\n" + std::string{prefix});
+  CAPTURE(prefix);
+  REQUIRE(at != std::string::npos);
+  const auto end = text.find('\n', at + 1);
+  return text.substr(at + 1, end - at - 1);
+}
 }  // namespace
 
 // The probe's outage, whole: 400/s offered and nothing served for 10 s, the room (100) kept the
-// first 100 of the 4000 and dropped 3900 (above), the backlog was the room, drained in two steps
-// (0.2 s) once the capacity was back, and from the step at 20.2 s the op's p99 and every rho are
-// the pre-fault ones. The block is the last thing in the table when there is no SLO.
+// first 100 of the 4000 and dropped 3900 (above), the twin dropped nothing, the backlog was the
+// room, drained in two steps (0.2 s) once the capacity was back, and from the step at 20.2 s the
+// op's p99 and every rho are the twin's. The block is the last thing in the table when there is no
+// SLO.
 TEST_CASE("a ten second node_down prints its block: lost 3.9k, drained in 0.2s, recovered at 20.2",
           "[theory]") {
   const auto run = fault_run(probe({.faults = one_fault(ten_seconds_from_ten)}));
@@ -1661,20 +1684,49 @@ TEST_CASE("the fault block comes after the SLO table", "[theory]") {
   REQUIRE(run.table.contains("  after:    backlog drained in 0.2s\n"));
 }
 
-// The SLO the outage breaks is named at the end of the during line, in the words of the SLO table's
-// columns (metric, node, op) and its verdict strings: `p99_latency c op flipped to FAIL`. The one
-// that already failed before the fault (1 ms) and the one it never broke (1 h) are not named.
-TEST_CASE("the during line ends with the SLO the outage flipped to FAIL and names no other",
+// The SLO the outage breaks closes the during line, in the words of the SLO table's columns
+// (metric, node, op) and its verdict strings. Judged step by step against the twin's same step,
+// the 100 ms p99 is over its max at three steps: 10.0, 10.1 and 10.2 s admit 40, 40 and 20
+// requests to the room, each waiting about 10 s for the node to come back (Condition::back_in_s);
+// from 10.3 s every arrival is dropped, nothing of the step is answered, and a step that answers
+// nothing has no latency to judge (as the SLO table leaves such an op out). So 300 ms. Over the
+// whole run the 100 requests that waited 10 s are 0.8 % of the 12,000 answered, enough for the
+// lognormal fit's p99 to pass 100 ms: the run's verdict is FAIL where the twin's is PASS, so it
+// also `flipped to FAIL`. The 1 ms SLO fails in the twin at every step and over the run: the fault
+// changes nothing about it, and it is not named; the 1 h one never breaks.
+TEST_CASE("the during line names the SLO the outage broke, for how long, and that it flipped",
           "[theory]") {
   const auto run = fault_run(
       probe({.faults = one_fault(ten_seconds_from_ten), .slos = std::string{three_p99_slos}}));
   CAPTURE(run.table);
   REQUIRE(run.table.contains(
       "  during:   offered 400/s, served 0/s, lost 3.9k requests, backlog 100 (room 100 dropped "
-      "the rest), p99_latency c op flipped to FAIL\n"));
+      "the rest), p99_latency c op over its max for 300ms, flipped to FAIL\n"));
   REQUIRE(run.table.find("flipped to FAIL") == run.table.rfind("flipped to FAIL"));  // only one
-  REQUIRE(run.faults.size() == 1);
-  REQUIRE(run.faults[0].flipped == std::vector<std::size_t>{0});  // the first SLO of the list
+  REQUIRE(run.blocks.size() == 1);
+  REQUIRE(run.blocks[0].slos.size() == 1);
+  REQUIRE(run.blocks[0].slos[0].slo == 0);  // the first SLO of the list
+  REQUIRE_THAT(run.blocks[0].slos[0].over_max_s, WithinAbs(0.3, 1e-9));
+  REQUIRE(run.blocks[0].slos[0].flipped_to == simsys::report::SloStatus::fail);
+}
+
+// Finding 5 of the review: `flipped` is the SLO table's verdict, not a step's. A drop_rate of at
+// most 0.6 judged over the whole 30 s run (`over: 30s`, one window): 3900 dropped of 12,000 sent is
+// 0.325, a PASS, as in the twin, so nothing flipped. Step by step it is broken at every step the
+// room drops all 40 arrivals, 10.3 to 19.9 s, 97 steps: 9.7 s (the step at 10.2 s drops 20 of 40,
+// 0.5, under 0.6). The during line says the second and not the first.
+TEST_CASE("a windowed SLO that passes its window is over its max during the fault but not flipped",
+          "[theory]") {
+  const auto run =
+      fault_run(probe({.faults = one_fault(ten_seconds_from_ten),
+                       .slos = "slo:\n  - {metric: drop_rate, max: 0.6, over: 30s}\n"}));
+  CAPTURE(run.table);
+  REQUIRE(
+      run.table.contains("backlog 100 (room 100 dropped the rest), drop_rate over its max for "
+                         "9.7s\n"));
+  REQUIRE_FALSE(run.table.contains("flipped"));
+  REQUIRE(run.blocks.at(0).slos.size() == 1);
+  REQUIRE_FALSE(run.blocks[0].slos[0].flipped_to.has_value());
 }
 
 // An outage shorter than the room: 200 ms is two steps of 40 arrivals, so 80 wait (below the room
@@ -1682,7 +1734,7 @@ TEST_CASE("the during line ends with the SLO the outage flipped to FAIL and name
 // and says `lost 0 requests`. After the fault, drain = min(400 + backlog / 0.1 s, 1000)/s:
 //   10.2 s: min(400 + 800, 1000) = 1000, backlog 80 + (400 - 1000) 0.1 = 20
 //   10.3 s: min(400 + 200, 1000) =  600, backlog 20 + (400 -  600) 0.1 = 0     rho 1, then 0.6
-//   10.4 s: drain 400, rho 0.4: the first step with every rho back, 0.2 s after the fault.
+//   10.4 s: drain 400, rho 0.4: the first step with every rho the twin's, 0.2 s after the fault.
 // The backlog is empty from 10.4 s: drained in 0.2 s.
 TEST_CASE("a 200 ms node_down loses nothing: backlog 80 stays under the room of 100", "[theory]") {
   const auto run = fault_run(probe({.faults = one_fault("at: 10s, kind: node_down, node: s, "
@@ -1691,42 +1743,42 @@ TEST_CASE("a 200 ms node_down loses nothing: backlog 80 stays under the room of 
   REQUIRE(run.table.ends_with(
       "fault 00:00:10 node_down s for 200ms\n"
       "  during:   offered 400/s, served 0/s, lost 0 requests, backlog 80\n"
-      "  after:    backlog drained in 0.2s\n"
-      "  recovery: op p99 back within 1% at 00:00:10.4 (0.2s after the fault cleared)\n"));
+      "  after:    backlog drained in 0.2s\n" +
+      std::string{back_within} + "00:00:10.4 (0.2s after the fault cleared)\n"));
 }
 
 // Nothing is lost to a latency spike or a capacity fault: a latency_spike of 1 ms makes the
 // service time 2 ms (capacity 500/s, rho 0.8) and a capacity factor of 0.5 does the same to the
 // capacity (500/s, rho 0.8), both above the 400/s offered, so the node serves everything and keeps
 // no backlog. The line keeps its shape, with `lost 0 requests` and `backlog 0`, and `after` says
-// there was nothing to drain. The first step after the fault is the pre-fault step again (rho 0.4,
+// there was nothing to drain. The first step after the fault is the twin's step again (rho 0.4,
 // the same p99), so the system is recovered at the instant the fault ends, 0s after it cleared.
 TEST_CASE("a latency_spike loses nothing: lost 0 requests, nothing to drain, recovered at once",
           "[theory]") {
   const auto run = fault_run(
       probe({.faults = one_fault("at: 20s, kind: latency_spike, node: s, extra: 1ms, for: 5s")}));
   CAPTURE(run.table);
-  REQUIRE(run.table.ends_with(
-      "fault 00:00:20 latency_spike s for 5s\n"
-      "  during:   offered 400/s, served 400/s, lost 0 requests, backlog 0\n"
-      "  after:    no backlog to drain\n"
-      "  recovery: op p99 back within 1% at 00:00:25 (0s after the fault cleared)\n"));
+  REQUIRE(
+      run.table.ends_with("fault 00:00:20 latency_spike s for 5s\n"
+                          "  during:   offered 400/s, served 400/s, lost 0 requests, backlog 0\n"
+                          "  after:    no backlog to drain\n" +
+                          std::string{back_within} + "00:00:25 (0s after the fault cleared)\n"));
 }
 
 TEST_CASE("a capacity fault loses nothing either: same lines, served 400 per second", "[theory]") {
   const auto run = fault_run(
       probe({.faults = one_fault("at: 20s, kind: capacity, node: s, factor: 0.5, for: 5s")}));
   CAPTURE(run.table);
-  REQUIRE(run.table.ends_with(
-      "fault 00:00:20 capacity s for 5s\n"
-      "  during:   offered 400/s, served 400/s, lost 0 requests, backlog 0\n"
-      "  after:    no backlog to drain\n"
-      "  recovery: op p99 back within 1% at 00:00:25 (0s after the fault cleared)\n"));
+  REQUIRE(
+      run.table.ends_with("fault 00:00:20 capacity s for 5s\n"
+                          "  during:   offered 400/s, served 400/s, lost 0 requests, backlog 0\n"
+                          "  after:    no backlog to drain\n" +
+                          std::string{back_within} + "00:00:25 (0s after the fault cleared)\n"));
 }
 
 // A run that ends before the system is back: the same outage, 20.1 s of run. The fault clears at
 // 20 s and the one step left (20.0 s) is the first of the drain: 40 requests still waiting (above),
-// rho 1. The backlog is not empty and the rho is not back by the end of the run.
+// rho 1. The backlog is not empty and the rho is not the twin's by the end of the run.
 TEST_CASE("a node_down that ends 0.1 s before the run does is not recovered by the end of the run",
           "[theory]") {
   const auto run = fault_run(probe(
@@ -1746,26 +1798,28 @@ TEST_CASE("a node_down that ends 0.1 s before the run does is not recovered by t
 // A traffic_spike's block reads the client, in requests: 400 x 3 = 1200/s offered for 5 s from
 // 10 s, 6000 requests. The service (1k/s, room 100) keeps 20 a step (120 in, 100 out) until its
 // room is full at the end of the fifth step (10.4 s), then drops 200/s for the other 45 steps:
-// lost 45 x 20 = 900. Answered = offered - lost (nothing times out): (6000 - 900) / 5 s = 1020/s,
-// more than the service drains, because the 100 still waiting at 15 s count as answered (later).
-// The client has no queue, so `backlog 0`, no room to name and nothing to drain; the service's
-// backlog of 100 drains in the steps at 15.0 and 15.1 s (min(400 + 1000, 1000): 40 left, then 0),
-// and from 15.2 s rho is 0.4 again: recovered 0.2 s after the spike.
-TEST_CASE("a traffic_spike prints the client's block: offered 1.2k, served 1.02k, lost 900",
-          "[theory]") {
+// lost 45 x 20 = 900 (the twin loses none). Answered = offered - lost (nothing times out):
+// (6000 - 900) / 5 s = 1020/s, more than the service drains, because the 100 still waiting at 15 s
+// count as answered (later). The client has no queue, so `backlog 0` and no room to name. The
+// backlog the spike left is downstream, at the service, whose 100 drain in the steps at 15.0 and
+// 15.1 s (min(400 + 1000, 1000): 40 left, then 0): `after` names it, `s backlog drained in 0.2s`
+// (finding 10 of the review: before, it said `no backlog to drain`), and from 15.2 s rho is the
+// twin's 0.4 again: recovered 0.2 s after the spike.
+TEST_CASE("a traffic_spike prints the client's block and the downstream node's drain", "[theory]") {
   const auto run = fault_run(
       probe({.faults = one_fault("at: 10s, kind: traffic_spike, node: c, factor: 3, for: 5s")}));
   CAPTURE(run.table, run.json);
   REQUIRE(run.table.ends_with(
       "fault 00:00:10 traffic_spike c for 5s\n"
       "  during:   offered 1.2k/s, served 1.02k/s, lost 900 requests, backlog 0\n"
-      "  after:    no backlog to drain\n"
-      "  recovery: op p99 back within 1% at 00:00:15.2 (0.2s after the fault cleared)\n"));
+      "  after:    s backlog drained in 0.2s\n" +
+      std::string{back_within} + "00:00:15.2 (0.2s after the fault cleared)\n"));
   REQUIRE(run.faults.size() == 1);
   REQUIRE_THAT(run.faults[0].offered_per_s, WithinRel(1200.0, 1e-9));
   REQUIRE_THAT(run.faults[0].served_per_s, WithinRel(1020.0, 1e-9));
   REQUIRE_THAT(run.faults[0].lost, WithinRel(900.0, 1e-9));
   REQUIRE(run.faults[0].room == 0.0);
+  REQUIRE(run.faults[0].after.backlog_node == "s");
   REQUIRE(run.json.contains("\"kind\": \"traffic_spike\", \"node\": \"c\", \"for_s\": 5"));
 }
 
@@ -1782,29 +1836,228 @@ TEST_CASE("two faults declared out of order print in at order, one block each", 
       "fault 00:00:10 node_down s for 5s\n"
       "  during:   offered 400/s, served 0/s, lost 1.9k requests, backlog 100 (room 100 dropped "
       "the rest)\n"
-      "  after:    backlog drained in 0.2s\n"
-      "  recovery: op p99 back within 1% at 00:00:15.2 (0.2s after the fault cleared)\n"
+      "  after:    backlog drained in 0.2s\n" +
+      std::string{back_within} +
+      "00:00:15.2 (0.2s after the fault cleared)\n"
       "fault 00:00:20 latency_spike s for 5s\n"
       "  during:   offered 400/s, served 400/s, lost 0 requests, backlog 0\n"
-      "  after:    no backlog to drain\n"
-      "  recovery: op p99 back within 1% at 00:00:25 (0s after the fault cleared)\n"));
+      "  after:    no backlog to drain\n" +
+      std::string{back_within} + "00:00:25 (0s after the fault cleared)\n"));
   REQUIRE(run.faults.size() == 2);
   require_in_order(run.json,
                    {"\"faults\": [", "\"at_s\": 10", "node_down", "\"at_s\": 20", "latency_spike"});
 }
 
+// Finding 2 of the review: a fault at the run's first step had no step before it to return to and
+// printed `not recovered` although the system was back 0.2 s after it. The twin needs no step
+// before: from t = 0 the node is down for 5 s (the same staircase, 40, 80, then the room), drains
+// in two steps once back, and from 5.2 s its rho is the twin's 0.4.
+TEST_CASE("a node_down at the run's first step recovers 0.2 s after it, like any other",
+          "[theory]") {
+  const auto run = fault_run(probe({.faults = one_fault("at: 0s, kind: node_down, node: s, "
+                                                        "for: 5s")}));
+  CAPTURE(run.table);
+  REQUIRE(run.table.ends_with(std::string{back_within} +
+                              "00:00:05.2 (0.2s after the fault cleared)\n"));
+  REQUIRE(run.faults.at(0).recovered_at == simsys::SimTime{5200ms});
+}
+
+// Finding 4 of the review: on a rate that moves, the step before the fault is no baseline (the
+// system is never again where it was), while the twin's same step is. The client ramps from 200/s
+// at 0 to 600/s at 1 h (points, linear); a node_down of 1 min at 10 min. When it clears at 11 min
+// the rate is 200 + 400 x 11/60 = 273.3/s and the room's 100 drain in two steps (1000/s for one
+// step, 100 + (273.3 - 1000) x 0.1 = 27.3 left; then 27.3 + 27.3 - 54.7 = 0), so at 11:00.2 rho
+// and p99 are the twin's: recovered 0.2 s after the fault cleared. (Against the step before the
+// fault, rho 0.267, it would never have recovered: the ramp keeps rho rising.)
+TEST_CASE("on a ramping rate a node_down recovers against the twin, 0.2 s after it", "[theory]") {
+  const auto run = fault_run(
+      load_yaml("version: 1\nname: ramp\nduration: 12m\nstep: 100ms\n"
+                "nodes:\n"
+                "  c: {type: client, rate: {points: [[0s, 200/s], [1h, 600/s]]}, ops: {op: 1.0}}\n"
+                "  s: {type: service, capacity: 1k/s, latency: 1ms, advanced: {queue_limit: 100}}\n"
+                "links:\n  - {from: c, to: s, dir: inout, latency: 0s}\n"
+                "faults:\n  - {at: 10m, kind: node_down, node: s, for: 1m}\n"));
+  CAPTURE(run.table);
+  REQUIRE(run.table.ends_with(std::string{back_within} +
+                              "00:11:00.2 (0.2s after the fault cleared)\n"));
+}
+
+// Finding 3 of the review: two node_downs on one node that overlap, 10 to 20 s and 15 to 25 s, keep
+// it down from 10 to 25 s: 6000 arrive, the room keeps 100, 5900 are dropped (the node table's
+// figure), the room drains in 0.2 s and the system is the twin's from 25.2 s. Each block counts
+// from its own `at` to that recovery, and the two split nothing: the first loses 5900, the second
+// the 4000 of 15 to 25 s, and its header says it overlaps the first (so a reader does not add
+// them). The first fault's backlog drains when the node is back, 5.2 s after the first fault
+// cleared.
+TEST_CASE("an overlapping fault on the same node says so and counts from its own at", "[theory]") {
+  const auto run =
+      fault_run(probe({.faults = "faults:\n"
+                                 "  - {at: 10s, kind: node_down, node: s, for: 10s}\n"
+                                 "  - {at: 15s, kind: node_down, node: s, for: 10s}\n"}));
+  CAPTURE(run.table);
+  REQUIRE(run.table.ends_with(
+      "fault 00:00:10 node_down s for 10s\n"
+      "  during:   offered 400/s, served 0/s, lost 5.9k requests, backlog 100 (room 100 dropped "
+      "the rest)\n"
+      "  after:    backlog drained in 5.2s\n" +
+      std::string{back_within} +
+      "00:00:25.2 (5.2s after the fault cleared)\n"
+      "fault 00:00:15 node_down s for 10s (overlaps fault 00:00:10)\n"
+      "  during:   offered 400/s, served 0/s, lost 4k requests, backlog 100 (room 100 dropped the "
+      "rest)\n"
+      "  after:    backlog drained in 0.2s\n" +
+      std::string{back_within} + "00:00:25.2 (0.2s after the fault cleared)\n"));
+  REQUIRE(run.json.contains("\"overlaps_at_s\": [10]"));
+}
+
+// Finding 12 of the review: the requests lost while the backlog drains belong to the fault. A
+// datacenter `eu` holds the client c (400/s, which keeps emitting: a client has no capacity), a
+// (1k/s, room 1000) and behind it s (500/s, room 100); dc_down eu for 1 s from 10 s. During it a
+// keeps the 400 that arrive (under its room) and s receives nothing: nothing is lost while the
+// fault lasts. When it clears a drains its backlog at its capacity, 100 a step (40 in): 340, 280,
+// 220, 160, 100, 40, then 80 out (40 + 40) and empty from 11.7 s. s receives those 100s, drains
+// 50 a step, and its room of 100 fills at the end of 11.1 s:
+//   11.2 .. 11.5 s  100 in + 100 waiting - 50 out = 150: 50 over the room, dropped      4 x 50
+//   11.6 s           80 in + 100 waiting - 50 out = 130: 30 dropped                    + 30 = 230
+// The twin's s is sent 40 a step (rho 0.8) and drops nothing, so the fault cost 230, all of it
+// after it cleared. Then s works off its 100 at 10 a step (40 in, 50 out) and is empty at the end
+// of 12.6 s; from 12.7 s every rho is the twin's: recovered 1.7 s after the fault cleared, and the
+// datacenter's backlog drained in 1.7 s. The peak backlog during the fault, 400, never reached
+// the room (1100): no parenthesis.
+TEST_CASE("the requests lost while the backlog drains count in lost: 230 after the fault",
+          "[theory]") {
+  const auto run = fault_run(load_yaml(
+      "version: 1\nname: drain\nduration: 30s\nstep: 100ms\n"
+      "datacenters:\n  eu: {}\n"
+      "nodes:\n"
+      "  c: {type: client, dc: eu, rate: {base: 400/s}, ops: {op: 1.0}}\n"
+      "  a: {type: service, dc: eu, capacity: 1k/s, latency: 1ms, advanced: {queue_limit: 1000}, "
+      "ops: {op: [{to: s}]}}\n"
+      "  s: {type: service, dc: eu, capacity: 500/s, latency: 1ms, advanced: {queue_limit: 100}}\n"
+      "links:\n"
+      "  - {from: c, to: a, dir: inout, latency: 0s}\n"
+      "  - {from: a, to: s, dir: inout, latency: 0s}\n"
+      "faults:\n  - {at: 10s, kind: dc_down, datacenter: eu, for: 1s}\n"));
+  CAPTURE(run.table);
+  REQUIRE(run.table.ends_with(
+      "fault 00:00:10 dc_down eu for 1s\n"
+      "  during:   offered 400/s, served 0/s, lost 230 requests at its nodes and 0 requests on cut "
+      "links, backlog 400\n"
+      "  after:    backlog drained in 1.7s\n" +
+      std::string{back_within} + "00:00:12.7 (1.7s after the fault cleared)\n"));
+}
+
+// The twin's own losses are not the fault's. 1100/s into the 1k/s node: overloaded with or without
+// the fault, its room is full and it drops 100/s throughout (the twin too). A node_down of 200 ms
+// drops the whole 1100/s for two steps: 220 against the twin's 20, so the fault cost 200. After it
+// the two runs are the same (full room, 100/s dropped): recovered at once.
+TEST_CASE("a node_down on an overloaded node counts only the drops the twin does not have",
+          "[theory]") {
+  const auto run = fault_run(probe(
+      {.rate_per_s = 1100, .faults = one_fault("at: 10s, kind: node_down, node: s, for: 200ms")}));
+  CAPTURE(run.table);
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE_THAT(run.faults[0].lost, WithinRel(200.0, 1e-9));
+  REQUIRE(run.table.contains("lost 200 requests"));
+  REQUIRE(
+      run.table.ends_with(std::string{back_within} + "00:00:10.2 (0s after the fault cleared)\n"));
+}
+
+// ---- Units: a byte-sized node counts megabytes (finding 1 of the review) ----------------------
+//
+// A CDN sized in bytes (`capacity: 10GB/s`, defaults::is_byte_sized) counts megabytes: 100/s of
+// 50 MB streams are 5000 MB/s into its 10,000 MB/s (rho 0.5), its room is 1000 MB. A node_down of
+// 5 s from 10 s: 25,000 MB arrive, the room keeps 1000 MB (500 MB a step: 500, 1000, then full) and
+// 24,000 MB are dropped. The block reads them as megabytes, as the node's capacity is written, and
+// the rates as MB/s: `offered 5k MB/s, served 0 MB/s, lost 24k MB, backlog 1k MB (room 1k MB ...)`.
+// Before the review it printed `lost 24k requests`: 480 requests of 50 MB were lost, not 24,000.
+namespace {
+constexpr std::string_view cdn_nodes =
+    "  cdn: {type: cdn, origin: origin, capacity: 10GB/s, hit_ratio: {fixed: 0.9}, advanced: "
+    "{queue_limit: 1000}}\n"
+    "  origin: {type: service, capacity: 1k/s, latency: 1ms}\n";
+}  // namespace
+
+TEST_CASE("a node_down on a byte-sized CDN prints its loss and rates in MB", "[theory]") {
+  const auto run = fault_run(load_yaml(
+      "version: 1\nname: cdn\nduration: 30s\nstep: 100ms\n"
+      "nodes:\n"
+      "  u: {type: client, rate: {base: 100/s}, ops: {stream: 1.0}, sizes: {stream: 50MB}}\n" +
+      std::string{cdn_nodes} +
+      "links:\n"
+      "  - {from: u, to: cdn, dir: inout, latency: 0s}\n"
+      "  - {from: cdn, to: origin, dir: inout, latency: 0s}\n" +
+      one_fault("at: 10s, kind: node_down, node: cdn, for: 5s")));
+  CAPTURE(run.table, run.json);
+  REQUIRE(line_starting(run.table, "  during:   ") ==
+          "  during:   offered 5k MB/s, served 0 MB/s, lost 24k MB, backlog 1k MB (room 1k MB "
+          "dropped the rest)");
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE(run.faults[0].lost_unit == "MB");
+  REQUIRE_THAT(run.faults[0].lost, WithinRel(24'000.0, 1e-9));
+  REQUIRE_THAT(number_after(run.json, "\"lost\": "), WithinRel(24'000.0, 1e-9));
+  REQUIRE(run.json.contains("\"lost_unit\": \"MB\", \"lost_on_cut_links\": null"));
+}
+
+// A dc_down whose datacenter holds the byte-sized CDN (and a client, which has no queue): the CDN
+// loses its 24,000 MB as above (c_eu's 5000 MB/s, 5 s), and the link from c_us in the other
+// datacenter, which the cut drops at once, loses c_us's 100/s x 5 s = 500 requests. The two are
+// not added (megabytes and requests): `lost 24k MB at its nodes and 500 requests on cut links`.
+// `offered` is the nodes' alone (the cut links' requests are in the second figure).
+TEST_CASE("a dc_down with a byte-sized node counts MB at its nodes and requests on cut links",
+          "[theory]") {
+  const auto run = fault_run(load_yaml(
+      "version: 1\nname: dc\nduration: 30s\nstep: 100ms\n"
+      "datacenters:\n  us: {}\n  eu: {}\n"
+      "nodes:\n"
+      "  c_us: {type: client, dc: us, rate: {base: 100/s}, ops: {stream: 1.0}, sizes: {stream: "
+      "50MB}}\n"
+      "  c_eu: {type: client, dc: eu, rate: {base: 100/s}, ops: {stream: 1.0}, sizes: {stream: "
+      "50MB}}\n"
+      "  cdn: {type: cdn, dc: eu, origin: origin, capacity: 20GB/s, hit_ratio: {fixed: 0.9}, "
+      "advanced: {queue_limit: 1000}}\n"
+      "  origin: {type: service, dc: us, capacity: 1k/s, latency: 1ms}\n"
+      "links:\n"
+      "  - {from: c_us, to: cdn, dir: inout, latency: 0s}\n"
+      "  - {from: c_eu, to: cdn, dir: inout, latency: 0s}\n"
+      "  - {from: cdn, to: origin, dir: inout, latency: 0s}\n"
+      "faults:\n  - {at: 10s, kind: dc_down, datacenter: eu, for: 5s}\n"));
+  CAPTURE(run.table, run.json);
+  REQUIRE(line_starting(run.table, "  during:   ") ==
+          "  during:   offered 5k MB/s, served 0 MB/s, lost 24k MB at its nodes and 500 requests "
+          "on cut links, backlog 1k MB (room 1k MB dropped the rest)");
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE_THAT(run.faults[0].lost, WithinRel(24'000.0, 1e-9));
+  REQUIRE_THAT(run.faults[0].lost_on_cut_links, WithinRel(500.0, 1e-9));
+  REQUIRE(run.json.contains("\"lost_unit\": \"MB\", \"lost_on_cut_links\": "));
+  REQUIRE_THAT(number_after(run.json, "\"lost_on_cut_links\": "), WithinRel(500.0, 1e-9));
+}
+
+// Finding 6 of the review: the parenthesis says the ROOM dropped the rest, so it needs the room to
+// have filled and the node itself to have dropped. A dc_down of 200 ms on eu (two_datacenters):
+// s_eu keeps c_eu's 40 + 40 = 80 (under its room of 100) and drops nothing; the cut link from
+// c_us loses its 200/s x 0.2 s = 40 requests. No parenthesis (before, it printed one).
+TEST_CASE("a dc_down whose losses are on its cut links prints no room parenthesis", "[theory]") {
+  const auto run = fault_run(
+      two_datacenters("faults:\n  - {at: 10s, kind: dc_down, datacenter: eu, for: 200ms}\n"));
+  CAPTURE(run.table);
+  REQUIRE(line_starting(run.table, "  during:   ") ==
+          "  during:   offered 400/s, served 0/s, lost 0 requests at its nodes and 40 requests on "
+          "cut links, backlog 80");
+}
+
 // A flushed cache: the block's header has no `for` (a flush is an instant: model::lasts), and the
 // after line is the warm-up time of Task 7's curve, t_c / rate = 12,106 requests / 1000/s = 12.1 s
 // on the che probe above (the flush at 10 minutes, `00:10` on the clock: a whole minute). The
-// during and recovery lines are there, and their numbers are not pinned (what a flush costs is
-// the hit ratio, which the origin's demand carries, not a loss).
+// recovery is timed from the flush (`after the flush`, finding 9: a flush does not clear).
 TEST_CASE("a cache_flush on the che probe prints: cache warm again in 12.1s", "[theory]") {
   const auto run = fault_run(flush_probe({}));
   CAPTURE(run.table);
   REQUIRE(run.table.contains("fault 00:10 cache_flush edge\n"));
   REQUIRE(run.table.contains("  during:   "));
   REQUIRE(run.table.contains("  after:    cache warm again in 12.1s\n"));
-  REQUIRE(run.table.contains("  recovery: "));
+  REQUIRE(run.table.contains(std::string{back_within}));
+  REQUIRE(run.table.contains(" after the flush)\n"));
   REQUIRE(run.faults.size() == 1);
   REQUIRE(run.faults[0].duration == simsys::SimTime{0});
   REQUIRE(run.faults[0].after.cache_warm_in_s.has_value());
@@ -1813,8 +2066,13 @@ TEST_CASE("a cache_flush on the che probe prints: cache warm again in 12.1s", "[
 }
 
 // A fixed-ratio cache refills linearly in keys / rate = 1000 / 100/s = 10 s (above), so its block
-// reads `cache warm again in 10s`: a whole number of seconds prints without a decimal.
-TEST_CASE("a fixed-ratio cache_flush prints: cache warm again in 10s", "[theory]") {
+// reads `cache warm again in 10s`: a whole number of seconds prints without a decimal. Finding 7 of
+// the review: what a flush costs is the reads its empty cache sends the origin. At the step k steps
+// after the flush (k = 0 .. 99, the warm-up) the hit ratio is 0.9 x k / 100, so the origin is sent
+// 100 x (1 - 0.009 k)/s against the twin's 10/s: 90 x (1 - 0.01 k)/s more, 9 x (1 - 0.01 k) a
+// step, and over the 100 steps 9 x (100 - 49.5) = 454.5 extra misses. The during line names them
+// and the origin, and says nothing of a backlog (a flush builds none of its own).
+TEST_CASE("a fixed-ratio cache_flush prints its extra misses to the origin: 454.5", "[theory]") {
   const auto run =
       fault_run(flush_probe({.rate_per_s = 100,
                              .client_keys = "",
@@ -1822,32 +2080,61 @@ TEST_CASE("a fixed-ratio cache_flush prints: cache warm again in 10s", "[theory]
                                      "keys: 1000, hit_ratio: {fixed: 0.9}",
                              .flush_at = "10s",
                              .duration = "30s"}));
-  CAPTURE(run.table);
+  CAPTURE(run.table, run.json);
   REQUIRE(run.table.contains("fault 00:00:10 cache_flush edge\n"));
   REQUIRE(run.table.contains("  after:    cache warm again in 10s\n"));
+  const auto during = line_starting(run.table, "  during:   ");
+  REQUIRE(during.ends_with(", extra misses 454.5 to origin"));
+  REQUIRE_FALSE(during.contains("backlog"));
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE_THAT(run.faults[0].extra_misses, WithinRel(454.5, 1e-9));
+  REQUIRE(run.faults[0].origin == "origin");
+  REQUIRE(run.json.contains("\"room\": null"));
+  REQUIRE_THAT(number_after(run.json, "\"extra_misses\": "), WithinRel(454.5, 1e-9));
+  REQUIRE(run.json.contains("\"origin\": \"origin\""));
 }
 
 // ---- The fault block in the JSON
 // ------------------------------------------------------------------
 
 // `faults` is the last key (after `slo`): one object per fault in at order,
-//   {at_s, kind, node, for_s, during: {offered_per_s, served_per_s, lost, backlog_peak, room,
-//    flipped: [text of the table's words]}, after: {backlog_drained_in_s, cache_warm_in_s},
+//   {at_s, kind, node, for_s, overlaps_at_s, during: {offered_per_s, served_per_s, lost, lost_unit,
+//    lost_on_cut_links, backlog_peak, room, extra_misses, origin, flipped: [the table's words],
+//    over_max: [{slo, for_s}]}, after: {backlog_node, backlog_drained_in_s, cache_warm_in_s},
 //    recovered_at_s}
 // seconds as doubles (the same numbers as the text, unrounded), null where the text says there is
-// none: `recovered_at_s` when not recovered, `for_s` for a flush, and each `after` entry that does
-// not apply.
+// none: `recovered_at_s` when not recovered, `for_s` for a flush, each `after` entry that does not
+// apply, `lost_on_cut_links` but for a dc_down, `room` for a flush, `extra_misses` and `origin` but
+// for a flush.
 TEST_CASE("the JSON has a faults array with the node_down's numbers in seconds", "[theory]") {
   const auto run = fault_run(
       probe({.faults = one_fault(ten_seconds_from_ten), .slos = std::string{three_p99_slos}}));
   const auto& json = run.json;
   CAPTURE(json);
-  require_in_order(
-      json,
-      {"\"slo\": [", "\"faults\": [", "\"at_s\": 10", "\"kind\": \"node_down\"", "\"node\": \"s\"",
-       "\"for_s\": 10", "\"during\": {", "\"offered_per_s\": ", "\"served_per_s\": ", "\"lost\": ",
-       "\"backlog_peak\": ", "\"room\": ", "\"flipped\": [\"p99_latency c op\"]", "\"after\": {",
-       "\"backlog_drained_in_s\": ", "\"cache_warm_in_s\": null", "\"recovered_at_s\": "});
+  require_in_order(json, {"\"slo\": [",
+                          "\"faults\": [",
+                          "\"at_s\": 10",
+                          "\"kind\": \"node_down\"",
+                          "\"node\": \"s\"",
+                          "\"for_s\": 10",
+                          "\"overlaps_at_s\": []",
+                          "\"during\": {",
+                          "\"offered_per_s\": ",
+                          "\"served_per_s\": ",
+                          "\"lost\": ",
+                          "\"lost_unit\": \"requests\"",
+                          "\"lost_on_cut_links\": null",
+                          "\"backlog_peak\": ",
+                          "\"room\": ",
+                          "\"extra_misses\": null",
+                          "\"origin\": null",
+                          "\"flipped\": [\"p99_latency c op\"]",
+                          "\"over_max\": [{\"slo\": \"p99_latency c op\", \"for_s\": 0.3",
+                          "\"after\": {",
+                          "\"backlog_node\": \"s\"",
+                          "\"backlog_drained_in_s\": ",
+                          "\"cache_warm_in_s\": null",
+                          "\"recovered_at_s\": "});
   REQUIRE_THAT(number_after(json, "\"offered_per_s\": "), WithinRel(400.0, 1e-9));
   REQUIRE_THAT(number_after(json, "\"served_per_s\": "), WithinAbs(0.0, 1e-9));
   REQUIRE_THAT(number_after(json, "\"lost\": "), WithinRel(3900.0, 1e-9));
@@ -1866,6 +2153,7 @@ TEST_CASE("the JSON of a fault never recovered has recovered_at_s null and no dr
   REQUIRE(run.json.contains("\"recovered_at_s\": null"));
   REQUIRE(run.json.contains("\"backlog_drained_in_s\": null"));
   REQUIRE(run.json.contains("\"flipped\": []"));  // no SLO in this scenario
+  REQUIRE(run.json.contains("\"over_max\": []"));
 }
 
 TEST_CASE("the JSON of a cache_flush has for_s null and the warm-up time in seconds", "[theory]") {

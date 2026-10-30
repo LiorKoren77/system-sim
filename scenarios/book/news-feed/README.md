@@ -126,21 +126,25 @@ every run is without it.
   so each replica misses a few replayed writes (`missed writes/s per replica 6.349e-05`, about
   5.5 writes over the day). Everything else, the peaks included, is the day above.
   The report closes with the outage's own block (the JSON's `faults` array has the same numbers),
-  an incident report in three lines: what it cost, what followed, when the system was itself again:
+  an incident report in three lines: what it cost, what followed, when the system was itself again.
+  Every figure in it is measured against a twin, the same day without the outage, stepped beside
+  the run (the scenario has a fault, so `run` steps it twice: about twice the time):
 
   ```
   fault 15:00 node_down post_db for 30s
-    during:   offered 12.72k/s, served 0/s, lost 372.5k requests, backlog 9k (room 9k dropped the rest), p99_latency users read_feed flipped to FAIL, drop_rate flipped to FAIL
+    during:   offered 12.72k/s, served 0/s, lost 372.8k requests, backlog 9k (room 9k dropped the rest), p99_latency users read_feed over its max for 29.9s, drop_rate over its max for 29.5s
     after:    backlog drained in 0.3s
-    recovery: op p99 back within 1% at 15:00:30.3 (0.3s after the fault cleared)
+    recovery: back within 1% (every op's p99, every node's rho) at 15:00:30.3 (0.3s after the fault cleared)
   ```
 
-  The 372.5k are the 30 s themselves; the node table's 372.8k adds the 366 dropped in the first
-  step after it, when the 9k waiting and the new arrivals meet rooms that are not yet empty. The
-  two flipped SLOs held at 14:59:59.9 and fail on the outage's steps taken alone (a 30 s wait in a
-  step's fit, 12.72k/s dropped of 12.72k/s); over the day they pass. Three steps after 15:00:30
-  the backlog is gone and every op's p99 and every node's rho are back within 1 % of the step
-  before the outage: the system recovered **0.3 s** after `post_db` did.
+  `lost` is `post_db`'s drops beyond the twin's from 15:00 to the recovery: the node table's
+  372.8k, the 366 dropped in the first step after the outage included (the 9k waiting and the new
+  arrivals meet rooms that are not yet empty: what the outage left behind is its cost too). Taken
+  step by step, the `read_feed` p99 is over its 200 ms for 29.9 s of the 30 (a 30 s wait in each
+  step's fit) and the drop rate over its 0.1 % for 29.5 s, where the twin's same steps hold both;
+  over the day both still pass, as in the twin, so neither flipped. Three steps after 15:00:30 the
+  backlog is gone and every op's p99 and every node's rho are back within 1 % of the twin's: the
+  system recovered **0.3 s** after `post_db` did.
 
 ## What it abstracts away
 - **Faults**, beyond capacity: the 15:00 outage takes `post_db`'s capacity and nothing else.

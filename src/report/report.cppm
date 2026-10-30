@@ -178,6 +178,36 @@ struct SloResult {
   bool at_one_instant{};
 };
 
+// What a scripted fault did to one of the scenario's SLOs, judged against the fault-free twin run
+// (engine::FaultRecord's header has the twin; Summary::set_faults fills it):
+//   over_max_s  the seconds, inside the fault's window "during", of the steps at which this run
+//               breaks the SLO and the twin's same step does not, each step judged alone by the
+//               same rules as a whole run (evaluate_slos on a Summary of that one step; an SLO with
+//               `over` judged on the step as if it had none). A step the twin breaks too is the
+//               SLO's own trouble, not the fault's. A step with nothing to observe (a latency SLO
+//               on an op nothing answered at that step) breaks nothing.
+//   flipped_to  the run's verdict (the SLO table's: the run, or for an SLO with `over` its worst
+//               window) when it differs from the twin's; empty when the two agree. A flip belongs
+//               to the run, not to one fault: it is named on each fault that broke the SLO during
+//               its window, or, when none did (the drops of a drain after the fault tipped a run
+//               total), on every fault.
+struct FaultSlo {
+  std::size_t slo{};  // index into Scenario::slos
+  double over_max_s{};
+  std::optional<SloStatus> flipped_to{};
+};
+
+// One fault's block (spec §4.4): the engine's record, what the fault did to the SLOs (only those
+// with something to say, in the scenario's order), and the `at` of every earlier fault on the same
+// target (the same node, or the same datacenter) whose counting span, from its `at` to its
+// recovery (the end of the run when it never recovered), contains this fault's `at`: both blocks
+// count the steps they share, and the later one says so.
+struct FaultBlock {
+  engine::FaultRecord record{};
+  std::vector<FaultSlo> slos{};
+  std::vector<SimTime> overlaps{};
+};
+
 // Running aggregates over the StepRecords of a run, from `warmup` on (earlier records only fix the
 // step length). Keeps a handful of sums per node and per op, never the records. Pattern: Observer —
 // pass `[&](const auto& r) { summary.observe(r); }` to engine::Simulation::run. The Summary refers
@@ -238,12 +268,20 @@ class Summary {
   // scenario's SLOs with `over` (evaluate_slos asks for exactly those); another is `skipped`.
   [[nodiscard]] SloResult windowed_verdict(const model::SloSpec& slo) const;
 
-  // The scripted faults' records (engine::Simulation::fault_records, in `at` order), replacing any
-  // held: the renderers print one block per fault after the SLO table, and a `faults` array in the
-  // JSON (none without faults). session::run_summary sets them once the run is over; a Summary
-  // only ever sees step records, which do not say what a fault cost.
-  void set_faults(std::span<const engine::FaultRecord> records);
-  [[nodiscard]] std::span<const engine::FaultRecord> faults() const { return faults_; }
+  // Before a run with faults: the windows "during" each fault of `records` (engine::FaultRecord:
+  // [at, at + for), a cache_flush's warm-up [at, at + warm_up_s), to the end of the run when it
+  // never warms). From then on `observe` judges every SLO of the scenario on each step that starts
+  // in one of them, that step alone (FaultSlo::over_max_s), and keeps the verdicts: a few per step
+  // of the windows, nothing outside them. The run's Summary and its twin's both watch the same
+  // records (session::run_summary), so that set_faults can compare them step by step.
+  void watch_faults(std::span<const engine::FaultRecord> records);
+  // After the run: one block per record (engine::Simulation::fault_records, in `at` order),
+  // replacing any held, each with what the fault did to the SLOs against `twin`, the Summary of the
+  // fault-free twin run over the same steps (engine::Simulation::twin_record), and the faults it
+  // overlaps. The renderers print one block per fault after the SLO table, and a `faults` array in
+  // the JSON (none without faults).
+  void set_faults(std::span<const engine::FaultRecord> records, const Summary& twin);
+  [[nodiscard]] std::span<const FaultBlock> faults() const { return faults_; }
 
  private:
   // Weighted first and second moments of a latency, accumulated across steps.
@@ -347,7 +385,29 @@ class Summary {
   std::vector<LinkTotals> links_;     // one per link with a bandwidth, in Graph::links() order
   std::vector<WindowedSlo> windows_;  // one per scenario SLO with `over`, in the scenario's order
   bool estimate_{};                   // made by of_estimate: SLOs with `over` judged at t = 0
-  std::vector<engine::FaultRecord> faults_{};  // set_faults
+  // One step judged alone inside a watched window (watch_faults): its start, its length, and each
+  // scenario SLO's verdict on it, in the scenario's order.
+  struct JudgedStep {
+    SimTime t{};
+    SimTime dt{};
+    std::vector<SloStatus> verdicts{};
+  };
+  // A watched window: [start, end), to the end of the run when `end` is empty.
+  struct FaultWindow {
+    SimTime start{};
+    std::optional<SimTime> end{};
+  };
+  [[nodiscard]] static FaultWindow window_of(const engine::FaultRecord& record);
+  [[nodiscard]] bool in_watched_window(SimTime t) const;
+  void judge_step(const engine::StepRecord& record);
+  [[nodiscard]] FaultBlock block_of(const engine::FaultRecord& record, const Summary& twin) const;
+  [[nodiscard]] SimTime over_max(std::size_t slo, const FaultWindow& window,
+                                 const Summary& twin) const;
+  [[nodiscard]] bool twin_breaks(std::size_t slo, SimTime t) const;
+
+  std::vector<FaultWindow> watched_{};  // watch_faults
+  std::vector<JudgedStep> judged_{};    // the steps observed inside a watched window
+  std::vector<FaultBlock> faults_{};    // set_faults
 };
 
 // C++20 std::span<const T>: a non-owning view of contiguous elements, so callers can pass

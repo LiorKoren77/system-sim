@@ -18,6 +18,7 @@
 // model type in the release build? Add one more `template void emit_special_members`
 // line below. Verified 2026-10-28 with the gcc14-release preset.
 module;
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <optional>
@@ -64,5 +65,9 @@ template void emit_special_members(std::optional<std::string>*, std::optional<st
 // std::optional<std::vector<std::string>> went missing from the release link of unit_tests.
 template void emit_special_members(std::optional<std::vector<std::string>>*,
                                    std::optional<std::vector<std::string>>&);
+// engine::FaultLog (phase 3 Task 8 review: the fault log's node index lists, moved with the
+// Simulation that holds it): the move constructor of std::vector<std::size_t>'s base went missing
+// from the release link of scenario_tests.
+template void emit_special_members(std::vector<std::size_t>*, std::vector<std::size_t>&);
 
 }  // namespace simsys::model::detail

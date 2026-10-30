@@ -60,18 +60,25 @@ report::Summary run_summary(const graph::Graph& g, engine::Simulation& sim,
                             RunObservers observers) {
   const auto& scenario = g.scenario();
   report::Summary summary{g, scenario.warmup};
+  // The fault-free twin's Summary (engine::FaultRecord's header: the counterfactual every fault
+  // block is measured against). It observes nothing without faults, whose run has no twin.
+  report::Summary twin{g, scenario.warmup};
+  summary.watch_faults(sim.fault_records());
+  twin.watch_faults(sim.fault_records());
   // Pattern: Observer — the step loop hands each record to one callable; this lambda fans it out
-  // to the summary and the optional series writers, so none of them knows of another.
+  // to the summaries and the optional series writers, so none of them knows of another.
   const auto observe = [&](const engine::StepRecord& record) {
     summary.observe(record);
+    if (const auto* twin_record = sim.twin_record()) twin.observe(*twin_record);
     if (observers.series != nullptr) observers.series->observe(record);
     if (observers.series_ops != nullptr) observers.series_ops->observe(record);
   };
   // C++20 designated initializers: the members named at the call site, in declaration order,
   // replacing a positional `{duration, step}` where a reader must remember which is which.
   sim.run({.duration = scenario.duration, .step = scenario.step}, observe);
-  // What each scripted fault cost, for the reports' block per fault (none without faults).
-  summary.set_faults(sim.fault_records());
+  // What each scripted fault cost, against the twin, for the reports' block per fault (none
+  // without faults).
+  summary.set_faults(sim.fault_records(), twin);
   return summary;
 }
 

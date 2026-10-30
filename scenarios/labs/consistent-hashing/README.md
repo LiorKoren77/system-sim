@@ -58,15 +58,16 @@ recommended setting. 15k/s gives 67 % on average and room for the spread.
   p99 over the run rises from 2.22 ms to 4.08 ms (mean 1.37 → 1.54 ms). Not modelled yet: that
   the removed server's arcs go to the servers after it on the ring, which then carry more than
   the even 3/4 share says, and that its keys arrive there cold (the hit ratio is resolved once,
-  at build). The run's fault block (after the SLO table) shows what the run's mean hides: at
-  0.965 the utilization SLO of 0.85 fails on every step of the 5 minutes taken alone, though it
-  held before them and passes over the run:
+  at build). The run's fault block (after the SLO table) shows what the run's mean hides: taken
+  step by step against a twin of the run without the fault (stepped beside it), the hottest
+  server is at 0.965 for the whole 5 minutes, over the utilization SLO's 0.85 where the twin's
+  same steps hold it, though the SLO still passes over the run, as in the twin (so it did not flip):
 
   ```
   fault 00:10 node_down cache_servers for 5m
-    during:   offered 40k/s, served 40k/s, lost 0 requests, backlog 0, utilization cache_servers flipped to FAIL
+    during:   offered 40k/s, served 40k/s, lost 0 requests, backlog 0, utilization cache_servers over its max for 5m
     after:    no backlog to drain
-    recovery: op p99 back within 1% at 00:15 (0s after the fault cleared)
+    recovery: back within 1% (every op's p99, every node's rho) at 00:15 (0s after the fault cleared)
   ```
 
 ## What it abstracts away

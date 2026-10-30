@@ -221,31 +221,55 @@ class FaultSchedule {
 // was the system itself again. One record per fault, filled by the engine step by step
 // (engine::FaultLog), printed by the report as three lines:
 //   during    the blast radius: what the faulted node was sent and what it served (means over the
-//             fault), the requests its full room dropped, the backlog it built, and the SLOs the
-//             fault broke that held before it (`flipped`)
+//             fault), what the fault cost (`lost`, a flush's `extra_misses`), the backlog it built;
+//             the report adds what it did to the SLOs (report::FaultBlock)
 //   after     the follow-on, the work a fault leaves behind once it has cleared: the backlog to
 //             drain (the requests that waited for the node to come back), a flushed cache's
 //             warm-up (ch. 1: every read misses an empty cache and goes to the database until it
 //             is full again); later a gateway's reconnect storm (Task 15) and a client's extra
 //             attempts (Task 10)
-//   recovery  the time to recover, the number an incident report and a scenario's README quote:
-//             the first step after the fault clears at which every client op's p99 and every
-//             node's utilisation (rho) are within 1 % of the step before the fault
-// Why "within 1 % of before" and not "the SLOs pass again": an SLO with room to spare passes
+//   recovery  the time to recover, the number an incident report and a scenario's README quote
+//
+// The baseline is a counterfactual: a TWIN run, the same scenario with every fault stripped,
+// stepped in lockstep with the run (engine::Simulation owns it when the scenario has faults). An
+// incident report compares the day of the incident with the day that would have been, not with
+// the minute before: on a diurnal curve the minute before is a different load, at the run's first
+// step there is none, and inside another fault it is itself broken. The twin's same step is the
+// system as it would be at that moment without the faults, so:
+//   lost         the faulted part's drops minus the twin's, summed over the steps from `at` until
+//                the recovery step (to the end of the run when it never recovers): the drops of the
+//                drain after the fault included, the drops of an overload the twin has too excluded
+//   recovery     the first step that starts once the fault has cleared (at + for; a flush's `at`)
+//                at which every client op's p99 and every node's utilisation (rho) are within 1 %
+//                of the twin's same step (relative, with 1e-9 of absolute slack for float residue)
+// Why "within 1 % of the twin" and not "the SLOs pass again": an SLO with room to spare passes
 // while a backlog is still draining and the system is far from its normal state, and one that
-// already failed before the fault never passes again; neither tells when the fault is over. Every
-// system has a state it was in before the fault, and being back in it is the question. 1 % is
-// tight enough that a queue still draining (rho 1 while it works off the backlog) does not count,
-// and loose enough that a fluid model's last digits do not delay it for ever.
+// fails without the fault never passes again; neither tells when the fault is over. The twin is
+// the normal state, at every moment. 1 % is tight enough that a queue still draining (rho 1 while
+// it works off the backlog) does not count, and loose enough that a fluid model's last digits do
+// not delay it for ever. The cost: a run with faults steps the scenario twice (a run without
+// faults has no twin, and is the run it was).
+// Overlapping faults on one target split nothing: each record counts from its own `at` to its own
+// recovery, so two outages of one node that overlap both count the steps they share (the report
+// says `(overlaps fault 00:00:10)` on the later block, so that nobody adds them).
+// Units: the faulted part counts in its own unit (engine::NodeSample: capacity units, which are
+// requests when every cost is 1, and MEGABYTES on a byte-sized node, defaults::is_byte_sized):
+// `lost_unit` says which, and the rates, the backlog and the room are in it too. A dc_down's links
+// across the datacenter's edge lose requests, counted apart (`lost_on_cut_links`), never added to
+// its nodes' figure. A datacenter whose nodes mix the two units counts its request-counting nodes
+// only, in requests (the megabytes of its byte-sized nodes are in the node table): one unit per
+// record. A traffic_spike's faulted part is the client, in requests.
 // Ignored: anything the run does not show (the time to detect the failure, the failover itself:
-// FaultSchedule's header), a rate curve's own drift (a diurnal curve moves rho too; over seconds it
-// is far under 1 %, over hours it is not, and a fault whose system never returns to the numbers
-// of the step before it is reported "not recovered"), and a fault at the run's first step, which
-// has no step before it to return to: no SLO can flip and no recovery is judged.
+// FaultSchedule's header).
 struct FaultAfter {
-  // Seconds from the end of the fault to the end of the first step whose backlog at the faulted
-  // node is empty (0 when it was empty as the fault ended); empty when the fault built no backlog
-  // or the backlog was not drained by the end of the run.
+  // Whose backlog the fault left above the twin's: the faulted node, a dc_down's datacenter, a
+  // traffic_spike's downstream node with the most work left (backlog / capacity, in seconds, over
+  // the twin's). Empty when the fault left none, and for a cache_flush (whose follow-on is its
+  // warm-up).
+  std::string backlog_node{};
+  // Seconds from the end of the fault to the end of the first step at which that backlog is back
+  // at the twin's (0 when it was as the fault ended); empty when there is none, or it was not
+  // back by the end of the run.
   std::optional<double> backlog_drained_in_s{};
   // A cache_flush only: seconds from the flush until the cache is full again (its hit ratio
   // factor back at 1: FaultSchedule::warm_up_s), once the run got that far; empty otherwise.
@@ -253,34 +277,41 @@ struct FaultAfter {
 };
 
 // One fault's record. The faulted part is the node the fault names; for a dc_down it is the
-// datacenter: its nodes (but its clients) summed, plus the links the cut crosses (their requests
-// sent and lost, in requests, beside the nodes' capacity units); for a traffic_spike it is the
-// client, whose numbers are its requests (engine::ResponseSample): offered (the spiked rate),
-// served = answered, lost = offered − answered (lost on the way or timed out), and no backlog or
-// room of its own (the backlog the spike builds downstream is in the node table). Rates and
-// amounts are in the node's capacity units (engine::NodeSample), requests when every cost is 1. The
+// datacenter: its nodes (but its clients) summed, and the links the cut crosses apart; for a
+// traffic_spike it is the client, whose numbers are its requests (engine::ResponseSample): offered
+// (the spiked rate), served = answered, lost = offered − answered (lost on the way or timed out),
+// and no backlog or room of its own (the backlog the spike builds is downstream: `after`). The
 // window "during" is [at, at + for); for a cache_flush, an instant, it is the warm-up [at, at +
-// cache_warm_in_s) (to the end of the run if the cache never warms), the time the flush costs
-// anything.
+// warm_up_s) (to the end of the run if the cache never warms): the time the flush costs anything.
+// What a flush costs is not a loss (its cache drops nothing) but the reads its empty cache sends
+// on: `extra_misses`, the origin's demand minus the twin's, summed over the warm-up.
 struct FaultRecord {
   model::FaultKind kind{};
   std::string node{};  // as the fault names it (empty for a dc_down: see `datacenter`)
   SimTime at{};
   SimTime duration{};      // `for`; 0 for a cache_flush (model::lasts)
-  double offered_per_s{};  // the faulted node's demand, the mean over the steps "during"
+  double offered_per_s{};  // the faulted part's demand, the mean over the steps "during"
   double served_per_s{};   // ... and its drain
-  double lost{};           // Σ dropped × dt over them: what its full room dropped
-  double backlog_peak{};   // the most that waited at the end of any of them
-  double room{};           // queue_limit × copies: the room the backlog fills
-  std::vector<std::size_t> flipped{};  // indexes into Scenario::slos: held at the step before
-                                       // `at`, broken at some step "during" (FaultLog's rule)
+  double lost{};           // Σ (dropped − the twin's dropped) × dt from `at` to the recovery
+  std::string lost_unit{"requests"};  // the faulted part's unit: "requests" or "MB"
+  double lost_on_cut_links{};         // a dc_down: the same over the links it cuts, in requests
+  double backlog_peak{};              // the most that waited at the end of any step "during"
+  double room{};                      // queue_limit × copies: the room the backlog fills
+  // A cache_flush: Σ (the origin's demand − the twin's) × dt over the warm-up, in the origin's
+  // unit; the origin is the node the cache's misses go to (its backend, a CDN's origin, or the
+  // `on: miss` steps after a lookup of it), its id (several joined by ", ").
+  double extra_misses{};
+  std::string origin{};
+  std::string origin_unit{"requests"};
+  // A cache_flush: its window "during", the warm-up FaultSchedule::warm_up_s gives, known from
+  // the start; empty for every other kind and for a cache that never warms.
+  std::optional<double> warm_up_s{};
   FaultAfter after{};
-  // The start of the first step at or after at + for, inside no fault, with every client op's p99
-  // and every node's rho within 1 % of the step before `at`; empty when the run ended first.
+  // The start of the first step at or after at + for with every client op's p99 and every node's
+  // rho within 1 % of the twin's same step; empty when the run ended first.
   std::optional<SimTime> recovered_at{};
   std::string datacenter{};  // a dc_down's datacenter; empty for every other kind
 };
-
 }  // namespace simsys::engine
 
 namespace simsys::engine {

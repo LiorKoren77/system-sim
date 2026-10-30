@@ -108,7 +108,10 @@ TEST_CASE("every shipped scenario resolves into a graph that explain can print",
 // phase ("... do not support yet (phase 3)") and is skipped; every other one is run to its end and
 // must meet its own SLOs. A scenario the engine refuses for any other reason is a failure, not a
 // skip. The time limit's point is "no shipped scenario takes minutes", not a benchmark: each one
-// run here costs at most 0.6 s of CPU in Debug and 0.04 s in Release (measured 2026-10-29). It is
+// run here costs at most 0.6 s of CPU in Debug and 0.04 s in Release (measured 2026-10-29), but
+// for the two with faults (kv-store, consistent-hashing), which step a fault-free twin beside the
+// run (engine::FaultRecord's header) and cost more: a whole Debug `simsys run` of kv-store, its
+// twin and its fault block included, takes 2.9 s of CPU (measured 2026-10-30). It is
 // CPU time, not wall-clock time: under `ctest -j` on a loaded machine this test took 4.61 s of wall
 // clock in Debug and its wall-clock limit was flaky, while the CPU time a single-threaded run
 // spends is what the scenario costs, whoever else shares the machine.
