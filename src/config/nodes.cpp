@@ -3,7 +3,8 @@
 // `latency`, `advanced`), a per-op `cost` and a load balancer's keys. The second reads each
 // body's references and traffic (its steps: steps.cpp; a client's workload: workload.cpp) and
 // every other type's own keys: rate limiter, id generator, cache, SQL database, CDN, blob store,
-// message queue, worker pool, search index, external sink, key-value cluster, websocket gateway.
+// message queue, worker pool, search index, external sink, key-value cluster, websocket gateway,
+// notification fanout.
 module;
 #include <yaml-cpp/yaml.h>
 
@@ -1216,6 +1217,96 @@ CheckResult read_gateway_keys(const Site& site, const YAML::Node& body, model::N
       .and_then([&] { return check_deliver_terminal(this_node, body, node); });
 }
 
+// ---- Notification fanout keys (phase 3 spec §8.3; book ch. 10) ----
+//
+// A notification fanout is a service whose `then` steps fire for each routed notification that its
+// dedup step lets through (behaviours::NotificationFanoutBehaviour). `dedup` is the share it drops
+// as duplicates; `channels` names the message queue behind each channel. Which queues the `then`
+// steps publish to must agree with `channels`, in both directions: that is Graph::build's check,
+// since a scenario built in code skips the loader.
+
+// `dedup: 0.02`, in [0, 1): 0 drops no duplicate (absent means the same), and 1 would drop every
+// notification, a fanout that publishes nothing, which a missing link says more plainly, so the
+// interval is half-open. The message gives the bounds as people say them.
+CheckResult read_dedup(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (!body["dedup"]) return {};
+  const auto share = number_value(body["dedup"]);
+  if (!share || *share < 0.0 || *share >= 1.0) {
+    return site.fail(body["dedup"], "dedup must be between 0 and 1");
+  }
+  node.dedup = *share;
+  return {};
+}
+
+// One `channels` entry, `sms: sms_q`: a channel name and the declared message queue behind it. A
+// value that names no node, or a node of another type, is refused with the type it has (a channel
+// is a queue the channel's workers drain).
+std::expected<std::pair<std::string, std::string>, ConfigError> read_channel(
+    const Site& site, const YamlElement& entry, const Declarations& declared) {
+  auto name = key_name(site, entry.first, "channel name");
+  if (!name) return std::unexpected(name.error());
+  if (name->empty()) return site.fail(entry.first, "a channel name must not be empty");
+  const auto channel = std::format("channel '{}'", *name);
+  if (auto checked = check_entry_not_null(site, entry, channel); !checked) {
+    return std::unexpected(checked.error());
+  }
+  if (!entry.second.IsScalar()) {
+    return site.fail(entry.second, std::format("{} must name a message queue", channel));
+  }
+  const auto& queue = entry.second.Scalar();
+  const auto found = declared.ids.find(queue);
+  if (found == declared.ids.end()) {
+    return site.fail(entry.second,
+                     std::format("{} names '{}', which is not declared", channel, queue));
+  }
+  const auto type = declared.nodes[found->second].type;
+  if (type != model::NodeType::message_queue) {
+    return site.fail(entry.second,
+                     std::format("{} names '{}', which is {} (channels name message queues)",
+                                 channel, queue, type_with_article(type)));
+  }
+  return std::pair{*name, queue};
+}
+
+// `channels: {ios: ios_q, sms: sms_q}`: a map, possibly empty (`{}`) or absent (a fanout whose
+// steps publish to no queue; Graph::build refuses the file when one does).
+CheckResult read_channels(const Site& site, const YAML::Node& body, model::NodeSpec& node,
+                          const Declarations& declared) {
+  if (!body["channels"]) return {};
+  if (auto checked = check_not_null(site, body, "channels", "channels", empty_map); !checked) {
+    return checked;
+  }
+  const auto channels = body["channels"];
+  if (!channels.IsMap()) {
+    return site.fail(channels, "channels must be a map of channel names to message queues");
+  }
+  auto read = collect_each(
+      channels, [&](const YamlElement& entry) { return read_channel(site, entry, declared); });
+  if (!read) return std::unexpected(read.error());
+  // One queue per channel: two channels on one queue would be one channel under two names, and
+  // which `then` step carries whose share could no longer be told.
+  std::map<std::string, std::string> channel_of_queue;
+  for (const auto& [name, queue] : *read) {
+    const auto [first, added] = channel_of_queue.try_emplace(queue, name);
+    if (!added) {
+      return site.fail(channels[name], std::format("channel '{}' names '{}', which channel '{}' "
+                                                   "names too",
+                                                   name, queue, first->second));
+    }
+  }
+  node.channels.insert(read->begin(), read->end());
+  return {};
+}
+
+CheckResult read_notification_fanout_keys(const Site& site, const YAML::Node& body,
+                                          model::NodeSpec& node, const Declarations& declared) {
+  if (node.type != model::NodeType::notification_fanout) return {};
+  const auto this_node = node_site(site, node.id);
+  return read_dedup(this_node, body, node).and_then([&] {
+    return read_channels(this_node, body, node, declared);
+  });
+}
+
 // ---- Node bodies: the second pass -----------------------------------------------------
 
 // A client offers traffic (its `ops` are shares of its rate); every other node forwards
@@ -1275,6 +1366,9 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
     if (auto read = read_search_index_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_gateway_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_discovery_keys(site, entry.second, *node); !read) return read;
+    if (auto read = read_notification_fanout_keys(site, entry.second, *node, declared); !read) {
+      return read;
+    }
     ++node;
   }
   return {};

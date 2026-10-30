@@ -74,5 +74,9 @@ template void emit_special_members(std::vector<std::size_t>*, std::vector<std::s
 // missing from the release link of the test support library (fixtures.cpp).
 template void emit_special_members(std::vector<std::vector<std::string>>*,
                                    std::vector<std::vector<std::string>>&);
+// NodeSpec::channels (phase 3 Task 17, a notification fanout's channel -> queue map): its
+// destructor went missing from the release link of the CLI (session.cpp, sweep.cpp).
+template void emit_special_members(std::map<std::string, std::string>*,
+                                   std::map<std::string, std::string>&);
 
 }  // namespace simsys::model::detail

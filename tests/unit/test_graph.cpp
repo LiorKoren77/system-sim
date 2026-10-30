@@ -4249,3 +4249,56 @@ TEST_CASE("a fanout without capacity or latency takes the type's 20k/s and 1 ms,
   REQUIRE(fanout.service_rate_source == simsys::defaults::Source::type_default);
   REQUIRE(fanout.service_time_source == simsys::defaults::Source::type_default);
 }
+
+// A fanout's `then` steps fire for every notification its dedup step lets through, so a step `on:
+// miss` (no lookup to miss) or `on: failure` (no step to report on) could never fire; the graph
+// refuses both, as at a worker pool, rather than run the file without them. The loader reads them
+// as steps; only the graph knows the type's rule.
+TEST_CASE("a fanout then step on miss or on failure is refused", "[graph]") {
+  REQUIRE(
+      fanout_refusal(fanout_file("    channels: {sms: sms_q}",
+                                 std::string{sms_step} + ", {to: audit, op: write, on: miss}")) ==
+      "node 'fanout': a fanout's then steps fire for every notification it routes (on: miss "
+      "needs a cache)");
+  REQUIRE(fanout_refusal(fanout_file("    channels: {sms: sms_q}", std::string{sms_step} +
+                                                                       ", {to: audit, op: write, "
+                                                                       "on: failure}"))
+              .starts_with("node 'fanout': a fanout's then steps fire for every notification it "
+                           "routes (on: failure"));
+}
+
+// A scenario built in code skips the loader, so the graph applies the loader's rules to a fanout
+// in its words: dedup in [0, 1), and a channel naming a declared message queue.
+TEST_CASE("a fanout built in code with dedup 1 or a channel on a service is refused", "[graph]") {
+  using simsys::model::NodeSpec;
+  using simsys::model::NodeType;
+  using simsys::model::Scenario;
+  using simsys::model::Step;
+  const auto scenario_with_fanout = [](NodeSpec fanout) {
+    Scenario s{.name = "fanout-in-code", .version = 1, .duration = 1s};
+    s.nodes = {NodeSpec{.id = "u",
+                        .type = NodeType::client,
+                        .workload = simsys::model::Workload{.curve = {.base = Rate{10}},
+                                                            .op_shares = {{"route", 1.0}}}},
+               std::move(fanout), NodeSpec{.id = "audit", .type = NodeType::service}};
+    s.links = {simsys::model::LinkSpec{.from = "u", .to = "fanout"},
+               simsys::model::LinkSpec{.from = "fanout", .to = "audit"}};
+    return s;
+  };
+  const auto refused = [](const Scenario& s) {
+    const auto built = Graph::build(s);
+    REQUIRE_FALSE(built.has_value());
+    return built.error().message;
+  };
+  REQUIRE(refused(scenario_with_fanout(NodeSpec{.id = "fanout",
+                                                .type = NodeType::notification_fanout,
+                                                .then = {Step{.to = "audit", .op = "write"}},
+                                                .dedup = 1.0})) ==
+          "node 'fanout': dedup must be between 0 and 1");
+  REQUIRE(refused(scenario_with_fanout(NodeSpec{.id = "fanout",
+                                                .type = NodeType::notification_fanout,
+                                                .then = {Step{.to = "audit", .op = "write"}},
+                                                .channels = {{"sms", "audit"}}})) ==
+          "node 'fanout': channel 'sms' names 'audit', which is a service (channels name message "
+          "queues)");
+}

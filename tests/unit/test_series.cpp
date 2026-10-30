@@ -153,12 +153,13 @@ Scenario partly_behind_blob_store(double read_rate) {
   return s;
 }
 
-// The same two clients and db, but the 10k/s of `post` go to `fanout`, a notification fan-out
-// (ch. 10) whose `then` sends each post to db as a `write`: a type the paper load does not follow
-// ("not modelled yet"), so db's load is only the reader's part, a lower bound. `fanout` also has
-// a link to `audit` but no step along it: nothing would flow there.
-Scenario partly_behind_fanout(double read_rate) {
-  Scenario s{.name = "partial-fanout", .version = 1, .duration = 1s, .step = 100ms};
+// The same two clients and db, but the 10k/s of `post` go to `seeds`, a URL frontier (ch. 9) whose
+// `then` sends each post to db as a `write`: a type the paper load does not follow ("not modelled
+// yet"), so db's load is only the reader's part, a lower bound. `seeds` also has a link to `audit`
+// but no step along it: nothing would flow there. (A notification fan-out stood here until phase 3
+// Task 17 gave it a model; the frontier is the one blocking type left.)
+Scenario partly_behind_frontier(double read_rate) {
+  Scenario s{.name = "partial-frontier", .version = 1, .duration = 1s, .step = 100ms};
   s.nodes = {
       NodeSpec{
           .id = "reader",
@@ -167,13 +168,13 @@ Scenario partly_behind_fanout(double read_rate) {
       NodeSpec{.id = "poster",
                .type = NodeType::client,
                .workload = Workload{.curve = {.base = Rate{10'000}}, .op_shares = {{"post", 1.0}}}},
-      NodeSpec{.id = "fanout",
-               .type = NodeType::notification_fanout,
+      NodeSpec{.id = "seeds",
+               .type = NodeType::frontier,
                .then = {simsys::model::Step{.to = "db", .op = "write"}}},
       NodeSpec{.id = "db", .type = NodeType::service, .capacity = Rate{2000}},
       NodeSpec{.id = "audit", .type = NodeType::service, .capacity = Rate{2000}}};
-  s.links = {LinkSpec{.from = "reader", .to = "db"}, LinkSpec{.from = "poster", .to = "fanout"},
-             LinkSpec{.from = "fanout", .to = "db"}, LinkSpec{.from = "fanout", .to = "audit"}};
+  s.links = {LinkSpec{.from = "reader", .to = "db"}, LinkSpec{.from = "poster", .to = "seeds"},
+             LinkSpec{.from = "seeds", .to = "db"}, LinkSpec{.from = "seeds", .to = "audit"}};
   return s;
 }
 
@@ -861,12 +862,12 @@ TEST_CASE("the JSON's answered_per_s equals offered_per_s when nothing is droppe
 // The paper load (explain.cpp: paper_pass / forward_steps) forwards load from a client's routes,
 // from a service or worker over its `ops` steps, through load balancers and rate limiters over
 // their links (graph::forwards_by_link) and from caches and CDNs on misses (hits_or_misses). A
-// notification fan-out's and a URL frontier's `then` are not followed (types with no phase yet), so
-// the nodes that only they feed show 0 offered load: before this change, `0%, green`, a verdict on
+// URL frontier's `then` is not followed (a type with no model yet), so
+// the nodes that only it feeds show 0 offered load: before this change, `0%, green`, a verdict on
 // a number that is missing, not zero. A blob store's `then` is followed (its steps are event
 // notifications that fire for every request it serves, and its capacity counts megabytes), and a
-// message queue's deliveries and a worker pool's `then` too: what they feed has its load and its
-// verdict.
+// message queue's deliveries, a worker pool's `then` and a notification fan-out's `then` (phase 3
+// Task 17) too: what they feed has its load and its verdict.
 
 // Peak (21:00) of youtube: both clients at base x 1.6 (200 -> 320/s, 100 -> 160/s), 480/s in all,
 // of which 2 % are uploads: 9.6/s. original_store's event publishes one message per upload to
@@ -1016,30 +1017,29 @@ TEST_CASE("a blob store's notifications add to the load a node gets from elsewhe
 }
 
 // A red lower bound is a true verdict: 3000/s of reads alone against 2k/s is 150 %, so db is
-// overloaded whatever else the fan-out adds. Its line keeps the percentage as a lower bound ("≥"),
+// overloaded whatever else the frontier adds. Its line keeps the percentage as a lower bound ("≥"),
 // keeps "red", and names the type whose flow is missing. (Re-pinned on a type that stays blocking:
-// the blob store this test used before is followed.)
+// the blob store this test used first is followed, and so is the notification fan-out it used
+// next.)
 TEST_CASE("a red lower bound stays red", "[series]") {
-  const auto text = explain_of(partly_behind_fanout(3000.0));
+  const auto text = explain_of(partly_behind_frontier(3000.0));
   CAPTURE(text);
-  REQUIRE(
-      check_line(text, "db")
-          .contains("(≥150%, red; load not propagated: notification_fanout is not modelled yet)"));
+  REQUIRE(check_line(text, "db")
+              .contains("(≥150%, red; load not propagated: frontier is not modelled yet)"));
 }
 
 // The mark follows a blocking type's `then` steps, not its bare links: audit is linked from the
-// fan-out but sent no step, so its 0 % is a real 0 and keeps its verdict, while db, which a step
-// reaches, is marked. (Rebased from the blob store, which no longer blocks, onto a type that does,
-// so the test still separates a step from a link.)
-TEST_CASE("a node linked from a notification fan-out but sent no step keeps its verdict",
-          "[series]") {
-  const auto text = explain_of(partly_behind_fanout(1.0));
+// frontier but sent no step, so its 0 % is a real 0 and keeps its verdict, while db, which a step
+// reaches, is marked. (Rebased from the blob store, then from the notification fan-out, which no
+// longer block, onto a type that does, so the test still separates a step from a link.)
+TEST_CASE("a node linked from a URL frontier but sent no step keeps its verdict", "[series]") {
+  const auto text = explain_of(partly_behind_frontier(1.0));
   CAPTURE(text);
   const auto line = check_line(text, "audit");
   REQUIRE(line.contains("(0%, green)"));
   REQUIRE_FALSE(line.contains("load not propagated"));
   REQUIRE(check_line(text, "db")
-              .contains("(≥0.05%; load not propagated: notification_fanout is not modelled yet)"));
+              .contains("(≥0.05%; load not propagated: frontier is not modelled yet)"));
 }
 
 // metadata_db at the peak: api's metadata reads that miss the cache and its upload_meta writes
@@ -1128,11 +1128,15 @@ TEST_CASE("explain names only the frontier on the way to a web-crawler node", "[
               .contains("(≥1%; load not propagated: frontier is not modelled yet)"));
 }
 
-// Two types with no phase yet on the way to one node are both named, nearest first, each once, in
-// one group as they stay unfollowed for the same reason (the web crawler no longer shows it: it has
-// one such type, since pools are followed). A
-// notification fan-out feeds a frontier that hands URLs to db, and nothing else reaches db.
-TEST_CASE("explain names every blocking type on the way to a node, nearest first", "[series]") {
+// A blocking type on the way to a node is named once, however many nodes of it lie on the way, and
+// a type the paper load follows is not named at all. A notification fan-out (followed since phase 3
+// Task 17, which also took away the second blocking type this test used to name: with only the
+// frontier left, "every blocking type, nearest first" is one type) feeds a frontier that hands
+// URLs to a second frontier, which hands them to db; nothing else reaches db. The fan-out's load
+// is followed into `seeds`, which shows its 10/s with no mark.
+TEST_CASE(
+    "explain names a blocking type on the way to a node once, and a followed fanout not at all",
+    "[series]") {
   Scenario s{.name = "two-blockers", .version = 1, .duration = 1s, .step = 100ms};
   s.nodes = {
       NodeSpec{.id = "u",
@@ -1143,15 +1147,19 @@ TEST_CASE("explain names every blocking type on the way to a node, nearest first
                .then = {simsys::model::Step{.to = "seeds", .op = "url"}}},
       NodeSpec{.id = "seeds",
                .type = NodeType::frontier,
+               .then = {simsys::model::Step{.to = "more_seeds", .op = "url"}}},
+      NodeSpec{.id = "more_seeds",
+               .type = NodeType::frontier,
                .then = {simsys::model::Step{.to = "db", .op = "write"}}},
       NodeSpec{.id = "db", .type = NodeType::service, .capacity = Rate{2000}}};
   s.links = {LinkSpec{.from = "u", .to = "fan"}, LinkSpec{.from = "fan", .to = "seeds"},
-             LinkSpec{.from = "seeds", .to = "db"}};
+             LinkSpec{.from = "seeds", .to = "more_seeds"},
+             LinkSpec{.from = "more_seeds", .to = "db"}};
   const auto text = explain_of(s);
   CAPTURE(text);
-  REQUIRE(check_line(text, "db")
-              .contains("(load not propagated: frontier and notification_fanout are not modelled "
-                        "yet)"));
+  REQUIRE(check_line(text, "db").contains("(load not propagated: frontier is not modelled yet)"));
+  REQUIRE_FALSE(text.contains("notification_fanout is"));
+  REQUIRE(check_line(text, "seeds").contains("peak offered 10/s"));
 }
 
 // ---- `on: failure` steps on paper (spec §5) ----

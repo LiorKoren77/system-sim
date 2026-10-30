@@ -598,19 +598,51 @@ constexpr std::size_t dead_letter_column = 5;
   });
 }
 
-// Which optional columns the node table has (some_pool_retries, some_gateway).
+// Does the run have a notification fanout? Only then has the node table its `deduplicated/s`
+// column (phase 3 spec §8.3), so a run without one prints the table it always did.
+[[nodiscard]] bool has_fanout(const graph::Graph& g) {
+  return std::ranges::any_of(g.nodes(), [](const graph::ResolvedNode& node) {
+    return node.spec.type == model::NodeType::notification_fanout;
+  });
+}
+
+// Where the `deduplicated/s` column sits before the `dead_lettered/s` one is inserted: right after
+// `rejected` (node, mean_rho, peak_rho, peak_backlog, dropped, rejected), since a duplicate is a
+// request the fanout turned away on purpose, a refusal of a kind beside the limiter's. Inserting
+// the dead letters' column after it, further left, moves it one place right: the table reads
+// dropped, dead_lettered/s, rejected, deduplicated/s.
+constexpr std::size_t dedup_column = 6;
+
+// Which optional columns the node table has (some_pool_retries, some_gateway, has_fanout).
 struct NodeColumns {
   bool dead_letters{};
   bool connections{};
+  bool deduplicated{};
 };
+
+// Puts `value` at `column` of a row of cells or of numbers, the cells after it moving one place
+// right. std::next over a difference_type: the column index is a size_t, the iterator's offset
+// signed.
+template <typename Cells, typename Value>
+void insert_at(Cells& cells, std::size_t column, Value value) {
+  cells.insert(std::next(cells.begin(), static_cast<std::ptrdiff_t>(column)), std::move(value));
+}
+
+// A rate cell of an optional column: the node's mean rate, or "-" where the node has no such
+// count.
+[[nodiscard]] Cell optional_rate_cell(const std::optional<double>& rate) {
+  return Cell{rate ? with_si_prefix(*rate) : "-"};
+}
 
 // Clients are sources with no queue: their queue columns show "-". A message queue's `peak_lag`
 // is its peak lag after warmup (NodeSummary::peak_queue_lag_s), "-" on every other row. With
-// `dead_letters` the row has the `dead_lettered/s` cell too: a worker pool's mean rate of dead
-// letters (NodeSummary::mean_dead_lettered_per_s, 0 without retries), "-" on every other row. With
-// `connections` the row has the `connections` cell after `peak_lag`: a ws_gateway's open
+// `columns.connections` the row has the `connections` cell after `peak_lag`: a ws_gateway's open
 // connections at the END of the run (NodeSummary::connections, a level, not a rate), "-" on every
-// other row.
+// other row. With `columns.dead_letters` the row has the `dead_lettered/s` cell too: a worker
+// pool's mean rate of dead letters (NodeSummary::mean_dead_lettered_per_s, 0 without retries), "-"
+// on every other row; with `columns.deduplicated` the `deduplicated/s` cell: a notification
+// fanout's mean rate of duplicates (NodeSummary::mean_deduplicated_per_s, 0 with `dedup: 0`), "-"
+// on every other row.
 [[nodiscard]] Row node_row(const NodeSummary& node, const graph::ResolvedNode& resolved, bool color,
                            NodeColumns columns) {
   const bool client = resolved.spec.type == model::NodeType::client;
@@ -621,33 +653,35 @@ struct NodeColumns {
     row.push_back({node.connections ? with_si_prefix(*node.connections) : "-"});
   }
   if (!client) row.push_back(unavailable_cell(node));
-  const bool dead_letters = columns.dead_letters;
-  if (dead_letters) {
-    const auto rate = node.mean_dead_lettered_per_s;
-    // std::next over a difference_type: the column index is a size_t, the iterator's offset signed.
-    row.insert(std::next(row.begin(), static_cast<std::ptrdiff_t>(dead_letter_column)),
-               Cell{rate ? with_si_prefix(*rate) : "-"});
+  // The column further right first: inserting the other one before it moves it into place.
+  if (columns.deduplicated) {
+    insert_at(row, dedup_column, optional_rate_cell(node.mean_deduplicated_per_s));
+  }
+  if (columns.dead_letters) {
+    insert_at(row, dead_letter_column, optional_rate_cell(node.mean_dead_lettered_per_s));
   }
   return row;
 }
 
-// The numbers of node_row, cell by cell: none on a client's row. With `dead_letters`, the pool's
-// dead-letter rate at dead_letter_column, as node_row puts its cell there (text on other rows).
+// The numbers of node_row, cell by cell: none on a client's row. The optional columns' numbers
+// where node_row puts their cells (text on the rows without the count).
 [[nodiscard]] std::vector<double> node_numbers(const NodeSummary& node,
                                                const graph::ResolvedNode& resolved,
                                                NodeColumns columns) {
-  const bool dead_letters = columns.dead_letters;
   if (resolved.spec.type == model::NodeType::client) {
-    const std::size_t cells = 8 + std::size_t{dead_letters} + std::size_t{columns.connections};
+    const std::size_t cells = 8 + std::size_t{columns.dead_letters} +
+                              std::size_t{columns.connections} + std::size_t{columns.deduplicated};
     return std::vector<double>(cells, text_cell);
   }
   auto numbers = queue_numbers(node);
   numbers.push_back(node.peak_queue_lag_s.value_or(text_cell));
   if (columns.connections) numbers.push_back(node.connections.value_or(text_cell));
   numbers.push_back(text_cell);
-  if (dead_letters) {
-    numbers.insert(std::next(numbers.begin(), static_cast<std::ptrdiff_t>(dead_letter_column)),
-                   node.mean_dead_lettered_per_s.value_or(text_cell));
+  if (columns.deduplicated) {
+    insert_at(numbers, dedup_column, node.mean_deduplicated_per_s.value_or(text_cell));
+  }
+  if (columns.dead_letters) {
+    insert_at(numbers, dead_letter_column, node.mean_dead_lettered_per_s.value_or(text_cell));
   }
   return numbers;
 }
@@ -662,13 +696,11 @@ struct NodeColumns {
                               {"red_s"},
                               {"peak_lag"}}};
   const NodeColumns columns{.dead_letters = some_pool_retries(summary.graph()),
-                            .connections = some_gateway(summary.graph())};
+                            .connections = some_gateway(summary.graph()),
+                            .deduplicated = has_fanout(summary.graph())};
   if (columns.connections) parts.header.push_back(Cell{"connections"});
-  if (columns.dead_letters) {
-    parts.header.insert(
-        std::next(parts.header.begin(), static_cast<std::ptrdiff_t>(dead_letter_column)),
-        Cell{"dead_lettered/s"});
-  }
+  if (columns.deduplicated) insert_at(parts.header, dedup_column, Cell{"deduplicated/s"});
+  if (columns.dead_letters) insert_at(parts.header, dead_letter_column, Cell{"dead_lettered/s"});
   const auto nodes = summary.nodes();
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto& resolved = summary.graph().nodes()[i];
@@ -1159,6 +1191,8 @@ constexpr std::string_view op_title =
           json_field("dead_lettered", json_optional_number(n.total_dead_lettered)),
           json_field("dead_lettered_per_s", json_optional_number(n.mean_dead_lettered_per_s)),
           json_field("rejected", json_number(n.total_rejected)),
+          // a notification fanout's mean rate (0 with dedup 0); null for every other node
+          json_field("deduplicated_per_s", json_optional_number(n.mean_deduplicated_per_s)),
           json_field("red_s", json_number(n.red_time_s)),
           json_field("unavailable", n.unavailable ? "true" : "false"),
           // null for a node with no lagging copies, and for an infinite one
@@ -1893,6 +1927,7 @@ constexpr std::array op_numbers{
       significant(n.dropped_per_s, 6),
       n.dead_lettered_per_s ? significant(*n.dead_lettered_per_s, 6) : std::string{},
       significant(n.rejected_per_s, 6),
+      n.deduplicated_per_s ? significant(*n.deduplicated_per_s, 6) : std::string{},
       significant(n.latency.mean_s * 1000.0, 6),
       std::string{zone_name(n.zone)},
       n.queue_lag_s ? significant(*n.queue_lag_s, 6) : std::string{},
@@ -1900,10 +1935,10 @@ constexpr std::array op_numbers{
   return join(fields, ",") + "\n";
 }
 
-// A bandwidth link's pipe, in the same thirteen columns as a node's, in megabytes;
+// A bandwidth link's pipe, in the same fourteen columns as a node's, in megabytes;
 // `dead_lettered_per_s` empty (a pipe is no worker pool), `rejected_per_s` 0 (a pipe refuses
-// nothing by policy), `queue_lag_s` empty (a pipe is no message queue) and `connections` empty (a
-// pipe is no websocket gateway).
+// nothing by policy), `deduplicated_per_s` empty (a pipe is no fanout), `queue_lag_s` empty (a pipe
+// is no message queue) and `connections` empty (a pipe is no websocket gateway).
 [[nodiscard]] std::string csv_link_row(const std::string& t_s, const std::string& name,
                                        const engine::LinkSample& l) {
   const std::array fields{t_s,
@@ -1915,6 +1950,7 @@ constexpr std::array op_numbers{
                           significant(l.dropped_per_s, 6),
                           std::string{},
                           std::string{"0"},
+                          std::string{},
                           significant(l.latency.mean_s * 1000.0, 6),
                           std::string{zone_name(l.zone)},
                           std::string{},
@@ -1923,9 +1959,10 @@ constexpr std::array op_numbers{
 }
 
 // A client is a source: no queue, so zeros where a server has numbers, zone `none`, and no dead
-// letters (a pool's), no lag (a queue's) and no connections (a gateway's).
+// letters (a pool's), no duplicates (a fanout's), no lag (a queue's) and no connections (a
+// gateway's).
 [[nodiscard]] std::string csv_client_row(const std::string& t_s, const std::string& id) {
-  return t_s + "," + id + ",0,0,0,0,0,,0,0,none,,\n";
+  return t_s + "," + id + ",0,0,0,0,0,,0,,0,none,,\n";
 }
 
 // One (client, op) of a step: what it offered, what it sent (its retries included), what came back
@@ -2016,6 +2053,9 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
   }
   if (sample.dead_lettered_per_s) {  // a worker pool: 0 without retries
     dead_lettered = dead_lettered.value_or(0.0) + *sample.dead_lettered_per_s * dt_s;
+  }
+  if (sample.deduplicated_per_s) {  // a notification fanout: 0 with dedup 0
+    deduplicated = deduplicated.value_or(0.0) + *sample.deduplicated_per_s * dt_s;
   }
   if (sample.republished_per_s) {  // a message queue: 0 when its groups retry nothing
     republished = republished.value_or(0.0) + *sample.republished_per_s * dt_s;
@@ -2348,6 +2388,9 @@ std::vector<NodeSummary> Summary::nodes() const {
       out.back().mean_dead_lettered_per_s =
           observed_s_ > 0.0 ? *t.dead_lettered / observed_s_ : 0.0;
     }
+    if (t.deduplicated) {
+      out.back().mean_deduplicated_per_s = observed_s_ > 0.0 ? *t.deduplicated / observed_s_ : 0.0;
+    }
     if (t.staleness_seen_s > 0.0)
       out.back().mean_staleness_s = t.staleness_time / t.staleness_seen_s;
     if (t.replication_seen_s > 0.0) {
@@ -2674,12 +2717,12 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
     if (link.pipe) link_names_.push_back(graph::link_label(g.nodes(), link));
   }
   *out_ << "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,"
-           "rejected_per_s,latency_ms,zone,queue_lag_s,connections\n";
+           "rejected_per_s,deduplicated_per_s,latency_ms,zone,queue_lag_s,connections\n";
 }
 
 // CSV is for machines, so every numeric column holds a number on every row the quantity exists
-// for, and is empty where it does not (only `dead_lettered_per_s`, `queue_lag_s` and
-// `connections`, below):
+// for, and is empty where it does not (only `dead_lettered_per_s`, `deduplicated_per_s`,
+// `queue_lag_s` and `connections`, below):
 // - `t_s` is the shortest form that reads back to the same double (0.1, 2, 0.35), not a
 //   fixed number of decimals that would round a fine step away; the other numbers have 6
 //   significant digits;
@@ -2693,14 +2736,19 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
 //   `rejected_per_s` says how much of it); a leaky bucket's are its queue's overflow, written
 //   in `rejected_per_s` instead of `drops_per_s`, so for one the identity takes them in the
 //   drops' place;
-// - a client row writes 0 in every numeric column but `dead_lettered_per_s`, `queue_lag_s` and
-//   `connections` (a source has no queue), which it leaves empty, and `none` as its zone, so a
-//   plot can filter clients out by zone;
+// - a client row writes 0 in every numeric column but `dead_lettered_per_s`, `deduplicated_per_s`,
+//   `queue_lag_s` and `connections` (a source has no queue), which it leaves empty, and `none` as
+//   its zone, so a plot can filter clients out by zone;
 // - `dead_lettered_per_s` (engine::NodeSample::dead_lettered_per_s) is a worker pool's jobs whose
 //   last retry failed, right after `drops_per_s` because they are not drops (the identity above
 //   does not include them: the pool drained those jobs); 0 on a pool without retries and EMPTY on
 //   every other row, clients' and links' included. A sink's rows keep the failures a pool retries
 //   in `drops_per_s`: its books balance whatever its callers do with them;
+// - `deduplicated_per_s` (engine::NodeSample::deduplicated_per_s) is a notification fanout's
+//   notifications its dedup step dropped, drain × dedup, right after `rejected_per_s` because a
+//   duplicate is turned away on purpose, like a rejection, and counted apart from it. They are part
+//   of `drain_per_s` (the fanout served them), so the identity above holds without them. 0 on a
+//   fanout with `dedup: 0` and EMPTY on every other row, clients' and links' included;
 // - an infinite latency is written as `inf` (which spreadsheet and plotting tools parse),
 //   unlike the table ("unavailable") and JSON (null), read by people or by parsers
 //   without an infinity;

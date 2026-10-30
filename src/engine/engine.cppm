@@ -498,6 +498,8 @@ class Simulation {
   void feed_back_retries(std::span<const ResponseSample> responses, Mode mode);
   void feed_back_pool_retries(std::span<NodeSample> samples, Mode mode);
   void note_pool_jobs(std::size_t index, const behaviours::Routed& routed);
+  void count_deduplicated(std::size_t index, const behaviours::Routed& routed,
+                          NodeSample& sample) const;
   [[nodiscard]] double answered_share(const behaviours::ClientBehaviour& client,
                                       const ResponseSample& sample, Mode mode) const;
   [[nodiscard]] flow::LatencyEstimate response_of(std::size_t node, std::string_view op) const;
@@ -1127,9 +1129,14 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index,
     // (behaviours::WsGatewayBehaviour).
     case model::NodeType::ws_gateway:
       return make_server(behaviours::WsGatewayBehaviour{g, index}, resolved);
-    // The two types with no model yet (phase 3): create() refused every scenario that has one
-    // (model::simulated), so no Simulation is ever constructed over them.
+    // A notification fanout's queue is the fanout's own work, a service's (the type's 20k/s at
+    // 1 ms, or the scenario's numbers); it publishes 1 − dedup of what it drained along its `then`
+    // steps (behaviours::NotificationFanoutBehaviour) and counts the rest as deduplicated
+    // (count_deduplicated).
     case model::NodeType::notification_fanout:
+      return make_server(behaviours::NotificationFanoutBehaviour{g, index}, resolved);
+    // The one type with no model yet (phase 3): create() refused every scenario that has one
+    // (model::simulated), so no Simulation is ever constructed over it.
     case model::NodeType::frontier:
       break;
   }
@@ -1786,6 +1793,7 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
     keep_retries_in_their_group(index, routed);
     account_rejections(index, routed, samples[index]);
     book_failover(index, samples[index]);
+    count_deduplicated(index, routed, samples[index]);
     note_pool_jobs(index, routed);
     send(index, routed, now, dt, mode, record.links);
   }
@@ -2616,6 +2624,16 @@ void Simulation::feed_back_pool_retries(std::span<NodeSample> samples, Mode mode
     }
     samples[index].dead_lettered_per_s = pool->dead_lettered_per_s();
   }
+}
+
+// A notification fanout's duplicates this step (NodeSample::deduplicated_per_s): what its queue
+// drained, `routed.served` (a fanout refuses nothing), times its dedup share, drain × dedup. Set on
+// every fanout, 0 when it drops none; left empty on every other node, which has no dedup step.
+void Simulation::count_deduplicated(std::size_t index, const behaviours::Routed& routed,
+                                    NodeSample& sample) const {
+  const auto* fanout =
+      std::get_if<behaviours::NotificationFanoutBehaviour>(&nodes_[index].behaviour);
+  if (fanout != nullptr) sample.deduplicated_per_s = fanout->deduplicated_per_s(routed.served);
 }
 
 // What a worker pool drained this step (the jobs its route was handed) and what arrived at it,

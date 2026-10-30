@@ -208,7 +208,12 @@ struct TypeDefaults {
       // (variability 2.0, i.e. more irregular than exponential).
       return {Rate{1'000}, t.third_party_api, 2.0};
     case notification_fanout:
-      return {Rate{10'000}, 1_ms};  // chosen
+      // chosen (phase 3 spec §8.3): a dedup lookup and a few publishes per notification, the
+      // 1 ms of CPU a service is given; 20k/s, ten times a service's 2k/s, since the fanout's own
+      // work is in memory (the queues and the log store do the writing, as nodes of their own). It
+      // was a 10k/s placeholder until the type ran (Task 17). c = 20k/s × 1 ms = 20 servers
+      // (Little's law).
+      return {Rate{20'000}, 1_ms};
     case frontier:
       return {Rate{10'000}, 1_ms};  // chosen
   }

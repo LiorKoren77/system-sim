@@ -358,9 +358,10 @@ TEST_CASE("the series writer emits a header and one row per node per step; clien
   REQUIRE(std::ranges::count(text, '\n') == 1 + 3 * 2);
   REQUIRE(text.find("\n0.1,s,") != std::string::npos);  // shortest round-trip form of 0.1 s
   // A client is a source: its numeric columns are 0 (machines keep a number) and its zone
-  // is `none` (it has no queue to colour). No dead letters (a pool's), no lag (a queue's) and no
-  // connections (a gateway's): the three empty cells.
-  REQUIRE(text.find("\n0,c,0,0,0,0,0,,0,0,none,,\n") != std::string::npos);
+  // is `none` (it has no queue to colour). No dead letters (a pool's), no duplicates (a fanout's,
+  // the column phase 3 Task 17 added after rejected_per_s), no lag (a queue's) and no connections
+  // (a gateway's): the four empty cells.
+  REQUIRE(text.find("\n0,c,0,0,0,0,0,,0,,0,none,,\n") != std::string::npos);
 }
 
 TEST_CASE("render_explain lists every node with its resolved numbers and provenance", "[report]") {
@@ -1935,24 +1936,25 @@ TEST_CASE("a pipe behind a cdn of unknown hit ratio is checked as an upper bound
                         "counted as 0 — an upper bound)"));
 }
 
+// Re-pinned on the frontier (phase 3 Task 17): the notification fan-out this test used is followed
+// now, and the URL frontier is the one blocking type left.
 TEST_CASE("a pipe that a blocking type sends nothing on paper has no percentage", "[report]") {
   Scenario s{.name = "pipe-unloaded", .version = 1, .duration = 1min};
   s.nodes = {
       NodeSpec{.id = "u",
                .type = NodeType::client,
                .workload = Workload{.curve = {.base = Rate{10}}, .op_shares = {{"fire", 1.0}}}},
-      NodeSpec{.id = "fan",
-               .type = NodeType::notification_fanout,
+      NodeSpec{.id = "seeds",
+               .type = NodeType::frontier,
                .then = {Step{.to = "svc", .op = "push", .size = simsys::Bytes{1e6}}}},
       NodeSpec{.id = "svc", .type = NodeType::service}};
-  s.links = {LinkSpec{.from = "u", .to = "fan"},
-             LinkSpec{.from = "fan", .to = "svc", .bandwidth = simsys::ByteRate{125e6}}};
+  s.links = {LinkSpec{.from = "u", .to = "seeds"},
+             LinkSpec{.from = "seeds", .to = "svc", .bandwidth = simsys::ByteRate{125e6}}};
   const auto text = explain_of(s);
   CAPTURE(text);
-  const auto line = check_line(text, "fan->svc");
+  const auto line = check_line(text, "seeds->svc");
   REQUIRE(line.contains(
-      "peak offered 0 MB/s vs 125 MB/s  (load not propagated: notification_fanout is not "
-      "modelled yet)"));
+      "peak offered 0 MB/s vs 125 MB/s  (load not propagated: frontier is not modelled yet)"));
   REQUIRE_FALSE(line.contains("%"));
 }
 
@@ -2117,25 +2119,26 @@ TEST_CASE("explain passes a saturated pool's whole arrival on: the paper load do
   REQUIRE(check_line(text, "w2").contains("peak offered 2k/s vs 2k/s total capacity"));
 }
 
-// The mark that remains is for the types with no phase yet: a pool's target behind a notification
-// fan-out is marked by the fan-out alone, and the mark does not name the queue or the pool on the
-// way (they are followed now). The fixture is the one the lower-bound cases use: the fan-out's
-// `then` sends to q, whose pool w sends on to svc.
-TEST_CASE("a node behind a notification fan-out and a queue and pool is marked by the fan-out only",
+// The mark that remains is for the types with no model yet: a pool's target behind a URL frontier
+// is marked by the frontier alone, and the mark does not name the queue or the pool on the way
+// (they are followed now). The fixture is the one the lower-bound cases use: the frontier's `then`
+// sends to q, whose pool w sends on to svc. (Re-pinned on the frontier in phase 3 Task 17: the
+// notification fan-out it used is followed now.)
+TEST_CASE("a node behind a URL frontier and a queue and pool is marked by the frontier only",
           "[report]") {
   auto s = queue_pool_chain(100);
   s.nodes[0].workload->op_shares = {{"fire", 1.0}};
-  s.nodes.insert(s.nodes.begin() + 1, NodeSpec{.id = "fan",
-                                               .type = NodeType::notification_fanout,
+  s.nodes.insert(s.nodes.begin() + 1, NodeSpec{.id = "seeds",
+                                               .type = NodeType::frontier,
                                                .then = {Step{.to = "q", .op = "publish"}}});
-  s.links[0] = LinkSpec{.from = "u", .to = "fan"};
-  s.links.push_back(LinkSpec{.from = "fan", .to = "q"});
+  s.links[0] = LinkSpec{.from = "u", .to = "seeds"};
+  s.links.push_back(LinkSpec{.from = "seeds", .to = "q"});
   const auto text = explain_of(s);
   CAPTURE(text);
   for (const auto* id : {"q", "w", "svc", "done_q", "w2"}) {
     CAPTURE(id);
     const auto line = check_line(text, id);
-    REQUIRE(line.contains("(load not propagated: notification_fanout is not modelled yet)"));
+    REQUIRE(line.contains("(load not propagated: frontier is not modelled yet)"));
     REQUIRE_FALSE(line.contains("worker_pool"));
     REQUIRE_FALSE(line.contains("message_queue"));
   }

@@ -571,6 +571,47 @@ void apply_database_keys(ResolvedNode& node) {
   return invalid_worker_then_steps(spec);
 }
 
+// "a service", "an external_sink": a node type with its article, as the loader's messages say it
+// (config's type_with_article).
+[[nodiscard]] std::string with_article(model::NodeType type) {
+  const auto name = model::to_string(type);
+  // C++23 std::string_view::contains: "is this character among those?" in one call, replacing
+  // `find(c) != npos`.
+  const bool vowel = std::string_view{"aeiou"}.contains(name.front());
+  return (vowel ? "an " : "a ") + std::string{name};
+}
+
+// A notification fanout's `then` steps are the publishes each routed notification makes once the
+// dedup step has let it through (phase 3 spec §8.3; book ch. 10), every step for 1 − dedup of what
+// it serves (Graph::then_fraction). Graph::build also takes fanouts written in code, which the
+// loader never checked (config's read_notification_fanout_keys): `dedup` in [0, 1), with the
+// loader's message. Two step keys ask for something a publish never does, refused in the worker
+// pool's words (invalid_worker_then_steps):
+//  - `on: miss`: a fanout has no lookup to miss (only a cache can take a miss step);
+//  - `on: failure`: its `then` steps follow no step a failure step could report on.
+// A `mode: parallel` group is fine: the fanout publishes to its channels at once and waits for the
+// slowest append. Whether `channels` and the steps name the same queues is checked once the nodes
+// are resolved (Graph::check_fanout_channels).
+[[nodiscard]] std::optional<EngineError> invalid_notification_fanout(const model::NodeSpec& spec) {
+  const std::string name = "node '" + spec.id + "': ";
+  if (!(spec.dedup >= 0.0 && spec.dedup < 1.0)) {
+    return EngineError{name + "dedup must be between 0 and 1"};
+  }
+  const auto refused = [&](std::string_view why) {
+    return EngineError{name + "a fanout's then steps fire for every notification it routes " +
+                       std::string{why}};
+  };
+  if (has_then_step_on(spec, model::StepCondition::miss)) {
+    return refused("(on: miss needs a cache)");
+  }
+  if (has_then_step_on(spec, model::StepCondition::failure)) {
+    return refused(
+        "(on: failure: a notification's then steps follow no step to report on; failure steps "
+        "fire in an op's step list)");
+  }
+  return std::nullopt;
+}
+
 // Graph::build also takes message queues written in code: `retention` and `partitions` obey the
 // loader's rules (config's read_message_queue_keys), with its messages.
 [[nodiscard]] std::optional<EngineError> invalid_message_queue(const model::NodeSpec& spec) {
@@ -725,6 +766,8 @@ void apply_kv_ring(ResolvedNode& node) {
       return invalid_message_queue(spec);
     case kv_cluster:
       return invalid_kv_cluster(spec);
+    case notification_fanout:
+      return invalid_notification_fanout(spec);
     default:  // a type with no check of its own
       return std::nullopt;
   }
@@ -858,12 +901,15 @@ void add_backend_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls)
 }
 
 // A cache's `then` steps (spec §18 entry 5) fire per request the cache handles: every one for an
-// `on: always` step, the read misses for an `on: miss` one (Graph::then_fraction).
-void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
-  for (const auto& op : g.arriving_ops(cache)) {
-    for (const model::Step& step : g.nodes()[cache].spec.then) {
-      if (g.then_fraction(cache, step, op) <= 0.0) continue;  // never fires: no call
-      calls[Call{cache, op}].push_back(model::Step{.to = step.to, .op = step.op});
+// `on: always` step, the read misses for an `on: miss` one (Graph::then_fraction). A notification
+// fanout's fire for the notifications its dedup step lets through, and the fanout waits for them as
+// a service waits for its steps, so they are calls too: one that closes a call cycle is an
+// asynchronous hand-off like any other.
+void add_then_steps(const Graph& g, std::size_t node, ForwardedSteps& calls) {
+  for (const auto& op : g.arriving_ops(node)) {
+    for (const model::Step& step : g.nodes()[node].spec.then) {
+      if (g.then_fraction(node, step, op) <= 0.0) continue;  // never fires: no call
+      calls[Call{node, op}].push_back(model::Step{.to = step.to, .op = step.op});
     }
   }
 }
@@ -875,6 +921,9 @@ void add_then_steps(const Graph& g, std::size_t cache, ForwardedSteps& calls) {
     add_hop_steps(g, node, forwarded);
     if (hits_or_misses(resolved.spec.type)) {
       add_backend_steps(g, node, forwarded);
+      add_then_steps(g, node, forwarded);
+    }
+    if (resolved.spec.type == model::NodeType::notification_fanout) {
       add_then_steps(g, node, forwarded);
     }
     if (!forwards_by_link(resolved.spec.type)) continue;
@@ -2145,6 +2194,7 @@ std::expected<Graph, EngineError> Graph::build(model::Scenario scenario) {
                          .and_then([&] { return graph.resolve_links(); })
                          .and_then([&] { return graph.connect_consumers(); })
                          .and_then([&] { return graph.connect_steps(); })
+                         .and_then([&] { return graph.check_fanout_channels(); })
                          .and_then([&] { return graph.connect_backends(); })
                          .and_then([&] { return graph.route_splitters(); })
                          .and_then([&] { return graph.check_pool_senders(); })
@@ -2611,6 +2661,8 @@ double Graph::then_fraction(std::size_t node, const model::Step& step, std::stri
   switch (step.on) {
     case always:
       if (spec.type == model::NodeType::blob_store) return is_write(spec, op) ? 1.0 : 0.0;
+      // The share the dedup step lets through: a duplicate is published to no channel.
+      if (spec.type == model::NodeType::notification_fanout) return 1.0 - spec.dedup;
       return 1.0;
     case failure:
       return 0.0;
@@ -2900,6 +2952,59 @@ Graph::Result Graph::route_queue(std::size_t queue) {
         EngineError{"node '" + id +
                     "': no worker pool consumes this message queue (its messages would be "
                     "kept for nobody)"}};
+  }
+  return {};
+}
+
+// A notification fanout's `channels` and its `then` steps name the same message queues (phase 3
+// spec §8.3), in both directions, so that the map is the student-facing list of the channels and no
+// step publishes to a queue the list leaves out:
+//   node 'fanout': channel 'email' names email_q, which no then step publishes to
+//   node 'fanout': then step publishes to email_q, which no channel names
+// A step to a node that is not a message queue (the notification log, a kv_cluster) is no channel
+// and is not checked; a fanout with no channels is fine while no step publishes to a queue. A
+// channel that names an undeclared node or one of another type is refused in the loader's words,
+// for a fanout written in code. Run after connect_steps, which refuses a step to an unknown node.
+Graph::Result Graph::check_fanout_channels() const {
+  for (const auto& node : nodes_) {
+    if (node.spec.type != model::NodeType::notification_fanout) continue;
+    if (auto checked = check_channels_named(node.spec); !checked) return checked;
+    if (auto checked = check_steps_named(node.spec); !checked) return checked;
+  }
+  return {};
+}
+
+// Each channel names a declared message queue that some `then` step publishes to.
+Graph::Result Graph::check_channels_named(const model::NodeSpec& fanout) const {
+  const std::string name = "node '" + fanout.id + "': ";
+  for (const auto& [channel, queue] : fanout.channels) {
+    const std::string named = "channel '" + channel + "' names ";
+    const auto index = index_of(queue);
+    if (!index) {
+      return std::unexpected{EngineError{name + named + "'" + queue + "', which is not declared"}};
+    }
+    const auto type = nodes_[*index].spec.type;
+    if (type != model::NodeType::message_queue) {
+      return std::unexpected{EngineError{name + named + "'" + queue + "', which is " +
+                                         with_article(type) + " (channels name message queues)"}};
+    }
+    // std::ranges::contains with a projection: each step is compared by its `to`, no lambda.
+    if (!std::ranges::contains(fanout.then, queue, &model::Step::to)) {
+      return std::unexpected{
+          EngineError{name + named + queue + ", which no then step publishes to"}};
+    }
+  }
+  return {};
+}
+
+// Each `then` step to a message queue publishes to a queue some channel names.
+Graph::Result Graph::check_steps_named(const model::NodeSpec& fanout) const {
+  for (const model::Step& step : fanout.then) {
+    const auto target = index_of(step.to);
+    if (!target || nodes_[*target].spec.type != model::NodeType::message_queue) continue;
+    if (std::ranges::contains(fanout.channels | std::views::values, step.to)) continue;
+    return std::unexpected{EngineError{"node '" + fanout.id + "': then step publishes to " +
+                                       step.to + ", which no channel names"}};
   }
   return {};
 }

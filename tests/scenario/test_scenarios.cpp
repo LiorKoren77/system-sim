@@ -169,8 +169,13 @@ TEST_CASE(
     //    below and far over them in Debug. Its own tests below run the day at a 1 s step (86.4k
     //    steps, as the url-shortener's does) and pin both SLOs passing and the README's headline
     //    numbers.
+    //  - notification-system runs (phase 3 Task 17 gave its fanout a model) and MEETS its drop_rate
+    //    SLO with the pools' retries; it is exempt here only for time: 24 h at 100 ms is 864k
+    //    steps, far over the five seconds. Its own test below runs the day at a 1 s step and pins
+    //    the SLO passing, the dead letters and the 09:00 blast's lag.
     if (s.name == "lab-unique-id" || s.name == "url-shortener" || s.name == "youtube" ||
-        s.name == "news-feed" || s.name == "search-autocomplete") {
+        s.name == "news-feed" || s.name == "search-autocomplete" ||
+        s.name == "notification-system") {
       continue;  // not run here
     }
     ++ran;
@@ -250,11 +255,12 @@ TEST_CASE("the consistent-hashing lab under write_through needs set in db's writ
 TEST_CASE("book scenarios are refused by run until their node types exist", "[scenario]") {
   // Phase 1 runs only client and service nodes; the book scenarios use more. The message must
   // name the node and the phase so a student knows what is missing, not that the file is wrong.
-  // notification-system is the one used here: it needs a notification_fanout, which phase 3 has yet
-  // to model. (url-shortener used to stand here, then chat-system, until its service_discovery and
-  // websocket gateway got their models in phase 3: see the pinned list below.)
+  // web-crawler is the one used here: it needs a frontier, which phase 3 has yet to model.
+  // (url-shortener used to stand here, then chat-system, until its service_discovery and websocket
+  // gateway got their models in phase 3, then notification-system, until its notification_fanout
+  // got its model in Task 17: see the pinned list below.)
   const auto s =
-      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/notification-system/scenario.yaml");
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/web-crawler/scenario.yaml");
   const auto g = build_or_fail(s);
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
@@ -268,17 +274,19 @@ TEST_CASE("book scenarios are refused by run until their node types exist", "[sc
 // with its `then` steps: youtube (clients, CDNs, blob stores, balancer, service, cache, SQL
 // database, message queues, worker pools) is the first book scenario of 2c that runs; the
 // kv_cluster adds the kv-store lab and the book's news feed (its graph_db is the one node type it
-// lacked); the search index (a service with no steps) adds the book's search autocomplete. Every
+// lacked); the search index (a service with no steps) adds the book's search autocomplete. Phase
+// 3's notification fan-out (Task 17) adds the book's notification system. Every
 // other lab and book scenario still needs a later task (google-drive's gateway level, chat-system's
-// service_discovery, ...), so the set of runnable scenarios is pinned by name: a node
+// gateway level, ...), so the set of runnable scenarios is pinned by name: a node
 // type added later makes this fail and forces whoever adds it to update the list on purpose. A
 // scenario counts as runnable when Simulation::create accepts it: it refuses every scenario with a
 // type the node-type table says does not run (model::simulated), and, since phase 3 Task 14
-// simulates the ws_gateway, google-drive too, whose gateway states no level until its own task.
+// simulates the ws_gateway, google-drive and chat-system too, whose gateways state no level until
+// their own tasks.
 TEST_CASE(
-    "exactly ten shipped scenarios use only simulated node types: chain, hello, "
-    "consistent-hashing, kv-store, news-feed, rate-limiter, search-autocomplete, unique-id, "
-    "url-shortener, youtube",
+    "exactly eleven shipped scenarios use only simulated node types: chain, hello, "
+    "consistent-hashing, kv-store, news-feed, notification-system, rate-limiter, "
+    "search-autocomplete, unique-id, url-shortener, youtube",
     "[scenario]") {
   std::vector<std::string> runnable;
   for (const auto& file : scenario_files()) {
@@ -301,14 +309,15 @@ TEST_CASE(
   std::ranges::sort(runnable);
   REQUIRE(runnable == std::vector<std::string>{"chain", "hello", "lab-consistent-hashing",
                                                "lab-kv-store", "lab-rate-limiter", "lab-unique-id",
-                                               "news-feed", "search-autocomplete", "url-shortener",
-                                               "youtube"});
+                                               "news-feed", "notification-system",
+                                               "search-autocomplete", "url-shortener", "youtube"});
 }
 
 TEST_CASE("a refused scenario's message names the first unsupported node and the phase",
           "[scenario]") {
+  // web-crawler: notification-system stood here until its fanout got a model (phase 3 Task 17).
   const auto s =
-      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/notification-system/scenario.yaml");
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/web-crawler/scenario.yaml");
   const auto g = build_or_fail(s);
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
@@ -804,7 +813,7 @@ TEST_CASE("byte-sized capacities are checked in MB per second", "[scenario]") {
 
 // explain's paper load follows a message queue into its consumers and a worker pool's `then` steps,
 // so no shipped scenario is marked "load not propagated" on account of a queue or a pool: whatever
-// mark remains names a type with no phase yet (notification_fanout, frontier). The check reads each
+// mark remains names a type with no model yet (frontier). The check reads each
 // mark, the text from "load not propagated:" to the end of its line.
 TEST_CASE("no shipped scenario's explain blames a message queue or a worker pool for missing load",
           "[scenario]") {
@@ -1131,24 +1140,11 @@ TEST_CASE("explain on book/youtube prints the stream size on the byte-sized cdn"
 
 // ---- The two shipped scenarios with external sinks ----
 //
-// External sinks run, but no scenario that runs after phase 2c reaches one: notification-system
-// (apns, fcm, sms_provider, email_provider: its workers' `then` steps) and chat-system (push) each
-// also need a type of a later phase, so the engine still refuses them, and at the same node as
-// before: Simulation::create checks every node's TYPE over the whole file and names the first
-// unsupported one in file order. Giving the sinks a model changes neither refusal; their
-// `failure_rate` shows in explain instead.
-
-// notification-system's nodes in file order: services, lb, notification_svc, user_cache,
-// user_db, user_limiter (all simulated), then `fanout`, a notification_fanout: the first node of
-// a type with no model.
-TEST_CASE("book/notification-system is refused at fanout, its notification_fanout", "[scenario]") {
-  const auto g = build_or_fail(load_scenario("/book/notification-system/scenario.yaml"));
-  const auto sim = simsys::engine::Simulation::create(g);
-  REQUIRE_FALSE(sim.has_value());
-  REQUIRE(sim.error().message ==
-          "node 'fanout' has type 'notification_fanout', which run/estimate do not support yet "
-          "(phase 3)");
-}
+// External sinks run: notification-system (apns, fcm, sms_provider, email_provider: its workers'
+// `then` steps) runs end to end since its fanout has a model (phase 3 Task 17, its tests at the end
+// of this file). chat-system (push) is still refused, at its gateway, which states no connection
+// level yet (the test below). Giving the sinks a model changed no refusal; their `failure_rate`
+// shows in explain instead.
 
 // chat-system's nodes in file order: users, lb, the chat API service, `discovery`, a
 // service_discovery (simulated since phase 3's Task 13: the engine used to stop there), then the
@@ -1444,7 +1440,8 @@ TEST_CASE("the consistent-hashing lab's hottest server runs at the ring factor o
 // The "not checked: kv_cluster ..." note of phase 2c's first half is gone from every shipped
 // scenario: each kv_cluster (the lab's store, news-feed's graph_db, chat-system's message_store
 // and presence, notification-system's log_db) is modelled now, so explain checks it, or, where
-// its load is behind a type with no model yet (notification-system's fanout), marks that.
+// its load is behind a type with no model yet, marks that (none of them is since the
+// notification fan-out has its model: notification-system's log_db is checked too).
 TEST_CASE("no shipped scenario's explain says a kv_cluster is not checked", "[scenario]") {
   for (const auto& file : scenario_files()) {
     CAPTURE(file);
