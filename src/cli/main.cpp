@@ -655,8 +655,8 @@ CLI::App* add_sweep_command(CLI::App& app, SweepArgs& args, std::filesystem::pat
   sweep
       ->add_option("--metric", args.metrics,
                    "a column: <client>.<op>.mean|p50|p95|p99|attempts|answered, "
-                   "<node>.mean_rho|peak_rho|drop_rate, <queue>.lag, <pool>.dead_lettered or "
-                   "<gateway>.connections (repeatable)")
+                   "<node>.mean_rho|peak_rho|drop_rate, <queue>.lag, <pool>.dead_lettered, "
+                   "<fanout>.deduplicated or <gateway>.connections (repeatable)")
       ->required();
   sweep->add_option("--jobs", args.jobs, "worker threads (default: the machine's hardware threads)")
       ->check(CLI::Range(std::size_t{1}, simsys::sweep::max_jobs));

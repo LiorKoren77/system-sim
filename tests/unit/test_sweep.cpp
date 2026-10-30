@@ -645,6 +645,57 @@ TEST_CASE("sweeping a gateway's session reads its connections: 1k then 2k") {
   REQUIRE(split_words(table[3]) == std::vector<std::string>{"20s", "2k"});
 }
 
+namespace {
+// u sends 1k/s to the notification fanout `fanout` (the type's 20k/s, far from full), which serves
+// every notification and publishes the share its dedup step lets through to `log`; the rest,
+// drain x dedup, is its duplicates (behaviours::NotificationFanoutBehaviour).
+std::string fanout_path() {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("simsys-sweep-fanout-" + std::to_string(getpid()) + ".yaml");
+  std::ofstream{path} << "version: 1\nname: fanout\nduration: 1m\nnodes:\n"
+                         "  u: {type: client, rate: {base: 1k/s}, ops: {route: 1.0}}\n"
+                         "  fanout: {type: notification_fanout, dedup: 0.02, "
+                         "then: [{to: log, op: write}]}\n"
+                         "  log: {type: service}\n"
+                         "links:\n  - {from: u, to: fanout, latency: 0s}\n"
+                         "  - {from: fanout, to: log, latency: 0s}\n";
+  return path.string();
+}
+}  // namespace
+
+// A fanout's duplicates per second (JSON's deduplicated_per_s, the node table's deduplicated/s):
+// what it serves times its dedup share, 1000 x 0.02 = 20/s, then 1000 x 0.1 = 100/s. The table
+// prints a rate, as it does a pool's dead letters.
+TEST_CASE("sweeping a fanout's dedup reads its duplicates: 20/s then 100/s") {
+  using simsys::sweep::MetricKind;
+  const auto metric = parse_metric("fanout.deduplicated");
+  INFO((metric ? "" : metric.error()));
+  REQUIRE(metric.has_value());
+  REQUIRE(metric->kind == MetricKind::deduplicated_rate);
+  const auto path = fanout_path();
+  const std::vector<SweepMetric> metrics{*metric};
+  const SweepParam param{.path = "nodes.fanout.dedup", .values = {"0.02", "0.1"}};
+  const auto rows = run_sweep(path, param, metrics, 1);
+  std::filesystem::remove(path);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  REQUIRE_THAT((*rows)[0].metrics[0], WithinRel(20.0, 1e-9));
+  REQUIRE_THAT((*rows)[1].metrics[0], WithinRel(100.0, 1e-9));
+  const auto table = split(render_sweep(param, metrics, *rows, SweepFormat::table), '\n');
+  CAPTURE(table);
+  REQUIRE(split_words(table[2]) == std::vector<std::string>{"0.02", "20/s"});
+  REQUIRE(split_words(table[3]) == std::vector<std::string>{"0.1", "100/s"});
+}
+
+TEST_CASE("a deduplicated metric on a node that is not a fanout is an error naming its type") {
+  const std::vector<SweepMetric> metrics{*parse_metric("api.deduplicated")};
+  const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1);
+  REQUIRE_FALSE(rows.has_value());
+  REQUIRE(rows.error() == std::string{hello_path} +
+                              ": error: --metric: api.deduplicated: 'api' has type service, "
+                              "not notification_fanout: only a notification fanout has duplicates");
+}
+
 TEST_CASE("a connections metric on a node that is not a gateway is an error naming its type") {
   const std::vector<SweepMetric> metrics{*parse_metric("api.connections")};
   const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1);

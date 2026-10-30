@@ -212,10 +212,9 @@ more. Until then a node whose load could only come through a type without a mode
 a number that is missing, not zero, and its check line had no percentage and no zone but a mark
 naming each such type on the way to it, nearest first (`(load not propagated: frontier is not
 modelled yet)`); a node that also received load the checks did follow got its percentage as a
-**lower bound** (`(≥1%; ...)`, `(≥150%, red; ...)`). The machinery stays for a type added later
-without a model.
-A lower-bound line has no per-copy figures (a database's primary/replica split, a ring's hottest
-copy or machine): they would be lower bounds too.
+**lower bound** (`(≥1%; ...)`, `(≥150%, red; ...)`), with no per-copy figures. With no type left
+to mark, the marking code was removed (phase 3, the Task 17 review): a type added later gets its
+paper model with it.
 
 ## Values
 
@@ -1232,8 +1231,8 @@ shares and prints `dedup=2% channels: ios=ios_q sms=sms_q` on the node's line.
 | `then` | [steps](#steps), each fired for `1 − dedup` of what the fan-out serves; `on: miss` and `on: failure` refused *(graph)*, a parallel group allowed (it publishes to its channels at once) | `node 'fanout': a fanout's then steps fire for every notification it routes (on: miss needs a cache)` |
 
 *(graph)* `channels` and the `then` steps that publish to a `message_queue` name the same queues,
-in both directions: `node 'fanout': channel 'email' names email_q, which no then step publishes to`,
-`node 'fanout': then step publishes to email_q, which no channel names`. A step to anything else
+in both directions: `node 'fanout': channel 'email' names 'email_q', which no then step publishes
+to`, `node 'fanout': then step publishes to 'email_q', which no channel names`. A step to anything else
 (the notification log, an audit service) is no channel and is not checked; a fan-out with no
 `channels` (absent or `{}`) is accepted as long as no step publishes to a queue. Retries and the
 dead letters live on the channels' worker pools (`retries`, see
@@ -1243,11 +1242,12 @@ dead letters live on the channels' worker pools (`retries`, see
 column right after `rejected` (and after `dead_lettered/s`, beside `dropped`, when a pool
 retries): the fan-out's mean rate, `-` on every other row; a run without one prints the table it
 always did. JSON gives every node a `deduplicated_per_s` (the mean rate over the observed steps;
-0 on a fan-out with `dedup: 0`, `null` on every other node), and `run --series` a
+0 on a fan-out with `dedup: 0`, `null` on every other node; swept as `<fanout>.deduplicated`, see
+[`simsys sweep`](#command-line-simsys-sweep-phase-2c)), and `run --series` a
 `deduplicated_per_s` column after `rejected_per_s`, empty on every row but a fan-out's:
 
 ```
-t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,deduplicated_per_s,latency_ms,zone,queue_lag_s
+t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,deduplicated_per_s,latency_ms,zone,queue_lag_s,connections
 ```
 
 A fan-out's `drain_per_s` includes its duplicates (it served them), so the series' balance holds
@@ -1446,9 +1446,8 @@ per pipe (the link as written, `from->to`, also for a `dir: in` link, whose dema
 megabytes travel from `to` to `from`), JSON a `links` array (`name`, `demand_per_s`, `drain_per_s`, `dropped_per_s`,
 `backlog`, `rho`, `latency_s`, `zone`, `peak_rho`, `peak_backlog`, `red_s`; `[]` without a
 bandwidth), `--series` a row per pipe and step; `explain` checks it on paper: `a->b  peak offered
-100 MB/s vs 125 MB/s  (80%, yellow)`, with the node lines' marks when its sender's load is
-incomplete (`load not propagated: ...`, no percentage when none reached it) or rests on an unknown
-hit ratio (`(hit ratio unknown: counted as 0 — an upper bound)`).
+100 MB/s vs 125 MB/s  (80%, yellow)`, with the node lines' note when its sender's load rests on
+an unknown hit ratio (`(hit ratio unknown: counted as 0 — an upper bound)`).
 
 **Delay lines** *(graph)*: a link delays its flow by `round(one_way / step)` steps, halves
 rounded away from zero (this replaces the spec's original `ceil` rule, see spec §16).
@@ -2117,7 +2116,7 @@ a design review asks after `explain`: *how much of this do I need?*
 | option | rule | refused with |
 |---|---|---|
 | `--param` | required. `<dot.path>=<from>..<to>:<n>`: the key is a dot path through **maps only** (`nodes.users.rate.base`, `nodes.transcoders.workers`), which must exist in the file and hold a single value; a path through a list (`links.0.latency`) is refused, since list entries have no names, and a node whose id contains a dot cannot be swept or measured (the dot splits the path). The range gives `n` points, at least 2 and at most 10,000, evenly spaced from `from` to `to`, both included; both ends are numbers (each starts with a digit or `-`, so a third dot is an error) with the same unit text (`100/s..900/s`, `1ms..5ms`, `400..600`; `100/s..1k/s` is refused, not converted): `100/s..900/s:3` is 100/s, 500/s and 900/s. A key the loader reads as a whole number (a node's `workers`, `replicas`, `partitions`, `keys`, ..., an `advanced` block's `concurrency`) must get a whole number at every point, whole as written: the number before a `k`, `M` or `G` must be whole, as in a [count](#values) (`keys=1k..2k:3` gives 1.5k and is refused although 1500 keys are whole; write `1000..2000:3`) | (each after `<file>: error: `, as every refusal of an option) `--param: nodes.users.rate.bse: no such key in the scenario`; `--param: links.0.latency: '0' would index a list; a dot path goes through maps only (a list entry has no name)`; `--param: workers must be whole (400..600:4 gives 466.67)`; `--param: 1/s..2/s:20000: at most 10000 points`; `--param: 100/s..1k/s:2: both ends must be the same kind of value in the same unit (100/s and 1k/s)`; `--param: '.5ms' is not a number followed by a unit` (for `1ms...5ms`) |
-| `--metric` | required, repeatable (`--metric a --metric b`, or several names after one: `--metric a b`): `<client>.<op>.mean` (the op's mean latency as the client sees it, over the answered requests), `<client>.<op>.p50`, `.p95` or `.p99` (the op table's estimated percentiles; where more than 1 − q of the delivered requests timed out, the timeout itself, printed `>1s` in the table as in `run`'s), `<client>.<op>.attempts` (what the client sent per second, its [`retries`](#node-types) included: JSON's `attempts_per_s`, printed `1.75k/s`) or `.answered` (the part answered per second: `answered_per_s`), `<node>.mean_rho` (a server's time-averaged utilization), `<node>.peak_rho` (its highest utilization of any observed step), `<node>.drop_rate` (the share of the work sent to it that it dropped, the node's own `drop_rate`), `<queue>.lag` (a message queue's or a frontier's peak lag after warmup, what the `queue_lag` SLO observes), `<pool>.dead_lettered` (phase 3: a worker pool's dead letters per second, JSON's `dead_lettered_per_s`, printed as a rate: `62.5/s`) or `<gateway>.connections` (phase 3: a [`ws_gateway`](#ws_gateway)'s open connections at the **end** of the run, the node table's and JSON's `connections`, printed as a count: `2k`; the end, not JSON's `connections_peak`, so that one name is one number: under a steady connect rate the level only rises and the two agree). They are the numbers `run --report json` prints, after warmup. Each name is checked against the file before any point runs | after `<file>: error: `, a name outside the grammar, `--metric: bogus: not a metric (write <client>.<op>.mean\|p50\|p95\|p99\|attempts\|answered, <node>.mean_rho\|peak_rho\|drop_rate, <queue>.lag, <pool>.dead_lettered or <gateway>.connections)`, or one that does not fit the file: `--metric: api.lag: 'api' has type service, not message_queue: only a message queue has a lag`; `--metric: api.connections: 'api' has type service, not ws_gateway: only a ws_gateway has connections`; `--metric: api.dead_lettered: 'api' has type service, not worker_pool: only a worker pool has dead letters`; `--metric: users.drop_rate: 'users' is a client, which serves nothing, so it has no drop rate`; `--metric: nope.mean_rho: the scenario has no node 'nope'` |
+| `--metric` | required, repeatable (`--metric a --metric b`, or several names after one: `--metric a b`): `<client>.<op>.mean` (the op's mean latency as the client sees it, over the answered requests), `<client>.<op>.p50`, `.p95` or `.p99` (the op table's estimated percentiles; where more than 1 − q of the delivered requests timed out, the timeout itself, printed `>1s` in the table as in `run`'s), `<client>.<op>.attempts` (what the client sent per second, its [`retries`](#node-types) included: JSON's `attempts_per_s`, printed `1.75k/s`) or `.answered` (the part answered per second: `answered_per_s`), `<node>.mean_rho` (a server's time-averaged utilization), `<node>.peak_rho` (its highest utilization of any observed step), `<node>.drop_rate` (the share of the work sent to it that it dropped, the node's own `drop_rate`), `<queue>.lag` (a message queue's or a frontier's peak lag after warmup, what the `queue_lag` SLO observes), `<pool>.dead_lettered` (phase 3: a worker pool's dead letters per second, JSON's `dead_lettered_per_s`, printed as a rate: `62.5/s`), `<fanout>.deduplicated` (phase 3: a [`notification_fanout`](#notification_fanout)'s duplicates per second, JSON's `deduplicated_per_s`, printed as a rate: `20/s`) or `<gateway>.connections` (phase 3: a [`ws_gateway`](#ws_gateway)'s open connections at the **end** of the run, the node table's and JSON's `connections`, printed as a count: `2k`; the end, not JSON's `connections_peak`, so that one name is one number: under a steady connect rate the level only rises and the two agree). They are the numbers `run --report json` prints, after warmup. Each name is checked against the file before any point runs | after `<file>: error: `, a name outside the grammar, `--metric: bogus: not a metric (write <client>.<op>.mean\|p50\|p95\|p99\|attempts\|answered, <node>.mean_rho\|peak_rho\|drop_rate, <queue>.lag, <pool>.dead_lettered, <fanout>.deduplicated or <gateway>.connections)`, or one that does not fit the file: `--metric: api.lag: 'api' has type service, not message_queue: only a message queue has a lag`; `--metric: api.connections: 'api' has type service, not ws_gateway: only a ws_gateway has connections`; `--metric: api.dead_lettered: 'api' has type service, not worker_pool: only a worker pool has dead letters`; `--metric: api.deduplicated: 'api' has type service, not notification_fanout: only a notification fanout has duplicates`; `--metric: users.drop_rate: 'users' is a client, which serves nothing, so it has no drop rate`; `--metric: nope.mean_rho: the scenario has no node 'nope'` |
 | `--jobs` | worker threads, 1 to 1024; default: the machine's hardware threads | CLI11's range message |
 | `--format` | `table` (latencies and lags as the report's tables print them: `1.61ms`, `<1us`, `>1s`; ratios to three significant digits) or `csv` (seconds and ratios, each number the shortest text that reads back to the same double) | |
 

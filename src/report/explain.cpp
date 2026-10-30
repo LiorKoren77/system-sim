@@ -14,7 +14,6 @@ module;
 #include <charconv>
 #include <cmath>
 #include <cstddef>
-#include <deque>
 #include <functional>
 #include <map>
 #include <optional>
@@ -1595,117 +1594,6 @@ constexpr std::string_view unknown_hit_ratio_note =
   return flagged;
 }
 
-// ---- load the paper pass cannot follow yet ----
-//
-// The paper load (paper_pass, forward_steps) forwards from a client's routes, along a service's (or
-// any node's) `ops` steps, through load balancers and rate limiters over their links
-// (graph::forwards_by_link), from caches and CDNs on their misses (graph::hits_or_misses), along a
-// blob store's `then` steps, its event notifications, from a message queue into each of its
-// consumer groups, and along a worker pool's, a notification fanout's and (phase 3 Task 18) a URL
-// frontier's `then` steps: since then it follows every node type. The machinery below stays for a
-// type added later without a model, whose onward flow the paper load would not follow. A node fed
-// through one would miss that part of its load: with nothing else it would show 0 offered load, a
-// missing number, not a zero, and a verdict on it ("0%, green") would read as "this tier is idle";
-// with some load from elsewhere its percentage would be a lower bound, and a green or yellow
-// verdict on it would read as "this tier has room" (a node fed 1/s by a client and 10k/s through a
-// blob store once printed "(0.05%, green)"). Its check line says so instead.
-
-// Until when the paper load leaves unfollowed what a node of `type` sends on: "not modelled yet",
-// or nothing for a type it follows (or that sends nothing on). Nothing for every type since phase 3
-// Task 18 gave the frontier, the last one, its model: a type added later without one gets a line
-// here.
-[[nodiscard]] std::optional<std::string_view> unfollowed_until(model::NodeType /*type*/) {
-  return std::nullopt;
-}
-
-// Where `from` sends on what it receives. For a type the paper load does not follow: the targets
-// of its `then` steps, the flow it would send; for one with none (a fan-out that only feeds its
-// targets over its links), the nodes its links carry demand to. For every other node: its demand
-// edges (steps, client routes, a balancer's links, a cache's backend, a blob store's events, a
-// queue's consumer groups, a pool's hand-offs), what the paper load follows from it.
-[[nodiscard]] std::vector<std::size_t> onward_targets(const graph::Graph& g, std::size_t from) {
-  std::vector<std::size_t> targets;
-  const auto& spec = g.nodes()[from].spec;
-  if (!unfollowed_until(spec.type)) {
-    for (const graph::DemandEdge& edge : g.edges()) {
-      if (edge.from == from) targets.push_back(edge.to);
-    }
-    return targets;
-  }
-  for (const model::Step& step : spec.then) targets.push_back(*g.index_of(step.to));
-  if (!targets.empty()) return targets;
-  for (std::size_t to = 0; to < g.nodes().size(); ++to) {
-    if (to != from && g.demand_link(from, to)) targets.push_back(to);
-  }
-  return targets;
-}
-
-// Adds each of `types` that `into` does not hold yet, in order; true when one was added.
-bool add_missing(std::vector<model::NodeType>& into, std::span<const model::NodeType> types) {
-  bool added = false;
-  for (const model::NodeType type : types) {
-    if (std::ranges::contains(into, type)) continue;
-    into.push_back(type);
-    added = true;
-  }
-  return added;
-}
-
-// Per node, the types on its way in whose onward flow the paper load does not follow, each once,
-// nearest first (a node behind two such types gets both, nearest first: the list holds as many as
-// there are; none is left today, see unfollowed_until). Empty for a node whose load the paper pass
-// has in full. A node passes on its own type (if it is such a type) and everything on its way, so
-// the mark crosses ordinary nodes too. A node in a loop through such a type has it on its way as
-// well: the load that comes round is missing too. Breadth-first from every such node at once, which
-// puts the nearest types first; a node is visited again only when its list grows, which happens at
-// most once per type, so a loop ends.
-[[nodiscard]] std::vector<std::vector<model::NodeType>> blocked_on_the_way(const graph::Graph& g) {
-  const auto count = g.nodes().size();
-  std::vector<std::vector<model::NodeType>> blocked(count);
-  std::deque<std::size_t> work;
-  for (std::size_t node = 0; node < count; ++node) {
-    if (unfollowed_until(g.nodes()[node].spec.type)) work.push_back(node);
-  }
-  while (!work.empty()) {
-    const auto from = work.front();
-    work.pop_front();
-    std::vector<model::NodeType> passed_on;
-    const auto type = g.nodes()[from].spec.type;
-    if (unfollowed_until(type)) passed_on.push_back(type);
-    add_missing(passed_on, blocked[from]);
-    for (const std::size_t to : onward_targets(g, from)) {
-      if (add_missing(blocked[to], passed_on)) work.push_back(to);
-    }
-  }
-  return blocked;
-}
-
-// "a", "a and b", "a, b and c".
-[[nodiscard]] std::string spoken_list(std::span<const std::string> items) {
-  if (items.size() <= 1) return items.empty() ? std::string{} : items.front();
-  return join(items.first(items.size() - 1), ", ") + " and " + items.back();
-}
-
-// "load not propagated: x is not modelled yet)" or, with several types, grouped by how long each
-// stays unfollowed, in the order they come ("... a and b are not modelled yet)"). (No type is left
-// unfollowed since phase 3 Task 18; the grouping will hold a later phase's types apart.)
-[[nodiscard]] std::string unpropagated_mark(std::span<const model::NodeType> blocked) {
-  std::vector<std::pair<std::string_view, std::vector<std::string>>> groups;
-  for (const model::NodeType type : blocked) {
-    const auto until = *unfollowed_until(type);
-    auto group = std::ranges::find(groups, until, [](const auto& g) { return g.first; });
-    if (group == groups.end())
-      group = groups.emplace(groups.end(), until, std::vector<std::string>{});
-    group->second.emplace_back(model::to_string(type));
-  }
-  std::vector<std::string> reasons;
-  for (const auto& [until, types] : groups) {
-    reasons.push_back(spoken_list(types) + (types.size() == 1 ? " is " : " are ") +
-                      std::string{until});
-  }
-  return "load not propagated: " + join(reasons, ", ") + ")";
-}
-
 // Behind a hash ring (imbalance k > 1) the group's average hides the copy that breaks
 // first: the hottest of N copies is sent k / N of the offered load against ONE copy's
 // capacity (engine::Simulation::make_server models it apart). The consistent-hashing lab's
@@ -1853,31 +1741,6 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
          hottest_copy_check(node, offered);
 }
 
-// The check of a node whose paper load misses what comes through `blocked` (blocked_on_the_way):
-//  - nothing reached it: the head and the mark, no percentage and no zone,
-//    "(load not propagated: notification_fanout is not modelled yet)";
-//  - some load reached it: that load's percentage as a lower bound, "(≥0.05%; load not
-//    propagated: ...)". No zone below red: the real load is higher, so green or yellow might not
-//    hold, but a red lower bound is red for certain, "(≥150%, red; ...)" (a database's at the
-//    busiest copy, headline_zone);
-// No per-copy checks: each would be a verdict on the same partial number.
-[[nodiscard]] std::string partial_check(const graph::ResolvedNode& node, double offered,
-                                        const OpLoad& arriving,
-                                        std::span<const model::NodeType> blocked) {
-  const std::string head = check_head(node, offered, arriving);
-  const std::string mark = unpropagated_mark(blocked);
-  const bool reached = offered > 0.0 || !std::isfinite(offered);
-  if (!reached) return head + "(" + mark;
-  const double capacity = total_capacity(node);
-  if (capacity <= 0.0) return head + "(no capacity, red; " + mark;
-  const double rho = offered / capacity;
-  const std::string zone = headline_zone(node, rho, database_loads(node, arriving));
-  // C++20 std::string::starts_with: a prefix test in one call, replacing
-  // `compare(0, prefix.size(), prefix) == 0` or `rfind(prefix, 0) == 0`.
-  const std::string red = zone.starts_with("red") ? ", " + zone : "";
-  return head + "(≥" + percent(rho) + red + "; " + mark;
-}
-
 // A node a loop of gain >= 1 feeds (PaperLoad::unbounded): its load has no figure, and no
 // capacity holds it. The footer of the checks names the loop.
 [[nodiscard]] std::string unbounded_check(const graph::ResolvedNode& node) {
@@ -1912,15 +1775,16 @@ constexpr std::string_view failure_fed_note =
   return note;
 }
 
-// One node's check line: the head and its verdict, or, for a node part or all of whose load the
-// paper load could not follow (blocked_on_the_way), partial_check's lower bound or mark.
+// One node's check line: the head and its verdict. The paper load (paper_pass, forward_steps)
+// follows every node type's onward flow since phase 3 Task 18 gave the URL frontier, the last type
+// without one, its paper model, so each node's load is complete and its verdict holds. A type added
+// later comes with its paper model: a node only it fed would show 0 offered load, a missing number
+// that "(0%, green)" would present as an idle tier.
 [[nodiscard]] std::string check_line(const graph::Graph& g, std::size_t i, const PaperLoad& load,
-                                     const std::vector<bool>& upper_bound,
-                                     std::span<const model::NodeType> blocked) {
+                                     const std::vector<bool>& upper_bound) {
   const auto& node = g.nodes()[i];
   if (!load.converged && load.unbounded[i]) return unbounded_check(node);
   const std::string note = check_notes(g, i, load, upper_bound);
-  if (!blocked.empty()) return partial_check(node, load.totals[i], load.by_op[i], blocked) + note;
   const auto loads = database_loads(node, load.by_op[i]);
   return check_details(node, load.totals[i], load.by_op[i], loads) + database_check(node, loads) +
          note;
@@ -1976,18 +1840,14 @@ constexpr std::string_view failure_fed_note =
 
 // A bandwidth link's check: the megabytes its sender puts on it at the paper load against the
 // pipe's bandwidth in MB/s, "peak offered 100 MB/s vs 125 MB/s  (80%, yellow)", with the generic
-// zones of a pipe (defaults::pipe_capacity). When the sender's own load is incomplete
-// (blocked_on_the_way, or the sender is a type the paper load does not follow) it is marked as a
-// node's is (partial_check): no percentage when nothing reached the link, a lower bound otherwise.
-// When the sender's load rests on an unknown hit ratio (it is behind such a cache, or it is one,
-// whose misses are what it sends on: counts_unknown_hit_ratio, unknown_misses) the line carries the
-// node lines' upper-bound note: every read counted as a miss. When a loop of gain >= 1 feeds the
-// sender (PaperLoad::unbounded), what it puts on the link has no figure either, and the line says
-// so as a node's does (unbounded_check; a link behind a gain-2 loop printed "8.988e+307 MB/s").
+// zones of a pipe (defaults::pipe_capacity). When the sender's load rests on an unknown hit ratio
+// (it is behind such a cache, or it is one, whose misses are what it sends on:
+// counts_unknown_hit_ratio, unknown_misses) the line carries the node lines' upper-bound note:
+// every read counted as a miss. When a loop of gain >= 1 feeds the sender (PaperLoad::unbounded),
+// what it puts on the link has no figure either, and the line says so as a node's does
+// (unbounded_check; a link behind a gain-2 loop printed "8.988e+307 MB/s").
 [[nodiscard]] std::string link_check(const graph::Graph& g, const ForwardRoutes& table,
-                                     const PaperLoad& load, std::size_t link,
-                                     std::span<const model::NodeType> blocked_at_sender,
-                                     bool upper_bound) {
+                                     const PaperLoad& load, std::size_t link, bool upper_bound) {
   const auto& resolved = g.links()[link];
   const auto sender = graph::demand_sender(resolved);
   if (!load.converged && load.unbounded[sender]) {
@@ -2003,26 +1863,18 @@ constexpr std::string_view failure_fed_note =
   const std::string zone{zone_name(fluid::zone_of(rho, *resolved.pipe))};
   const std::string head = "peak offered " + with_si_prefix(offered) + " MB/s vs " +
                            with_si_prefix(capacity) + " MB/s  ";
-  std::vector<model::NodeType> blocked{blocked_at_sender.begin(), blocked_at_sender.end()};
-  if (unfollowed_until(g.nodes()[sender].spec.type)) {
-    add_missing(blocked, std::array{g.nodes()[sender].spec.type});
-  }
   const std::string note{upper_bound ? unknown_hit_ratio_note : std::string_view{}};
-  if (blocked.empty()) return head + "(" + percent(rho) + ", " + zone + ")" + note;
-  if (!(offered > 0.0)) return head + "(" + unpropagated_mark(blocked) + note;
-  const std::string red = zone == "red" ? ", red" : "";
-  return head + "(≥" + percent(rho) + red + "; " + unpropagated_mark(blocked) + note;
+  return head + "(" + percent(rho) + ", " + zone + ")" + note;
 }
 
 [[nodiscard]] std::string explain_checks(const graph::Graph& g) {
   const auto load = paper_load(g);
   const auto upper_bound = counts_unknown_hit_ratio(g);
-  const auto blocked = blocked_on_the_way(g);
   std::vector<Row> rows;
   for (std::size_t i = 0; i < g.nodes().size(); ++i) {
     const auto& node = g.nodes()[i];
     if (node.spec.type == model::NodeType::client) continue;  // a source: see its offered=
-    rows.push_back({{node.spec.id}, {check_line(g, i, load, upper_bound, blocked[i])}});
+    rows.push_back({{node.spec.id}, {check_line(g, i, load, upper_bound)}});
   }
   const auto table = forward_routes(g);
   for (std::size_t link = 0; link < g.links().size(); ++link) {
@@ -2030,8 +1882,8 @@ constexpr std::string_view failure_fed_note =
     if (!resolved.pipe) continue;
     const auto sender = graph::demand_sender(resolved);
     const bool upper = upper_bound[sender] || unknown_misses(g, sender);
-    rows.push_back({{graph::link_label(g.nodes(), resolved)},
-                    {link_check(g, table, load, link, blocked[sender], upper)}});
+    rows.push_back(
+        {{graph::link_label(g.nodes(), resolved)}, {link_check(g, table, load, link, upper)}});
   }
   const std::string note = load.converged ? "" : "  (no steady state: a loop of gain >= 1)\n";
   const std::string header = "checks (peak offered load over the first " +
