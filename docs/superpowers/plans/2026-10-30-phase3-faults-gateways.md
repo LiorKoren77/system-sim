@@ -113,6 +113,18 @@ plus `run --report json` and `sweep` on hello, and `ctest` in both presets (the 
 - [ ] Tests (loader; every message verbatim from spec §4.1): each kind loads with its keys; `at` as a clock time (`21:30`) or a duration (`1h30m`) inside the run, else `faults[0]: at must fall inside the run (24h)`; `for` positive and required except for `cache_flush` (`faults[2]: cache_flush takes no for`); `node` a declared node (`faults[0]: node 'x' is not declared`), a client only for `traffic_spike` (`faults[0]: node_down cannot name a client (clients emit, they do not serve)`), a cache or cdn for `cache_flush`; `replicas` only with `node_down`, a positive count at most the node's replicas, `primary` only on a sql_db; `factor` required by `capacity` (in (0, 1): `faults[3]: capacity factor must be between 0 and 1 (a gain is the scenario's capacity)`) and `traffic_spike` (positive); `extra` a positive duration for `latency_spike`; `datacenter` declared for `dc_down`; `kind: partition` → `faults[0]: partition is not modelled in phase 3 (see the backlog)`; unknown keys refused like every map. Model: `Fault` fields and `Scenario::faults` default empty; a scenario without `faults` loads as before. Explain: the line above on chat-system; `faults: none` is not printed.
 - [ ] Commit `config: the faults list, typed`.
 
+Red at `ffe50dd` (2026-10-30). Notes from the test-writer: `1h30m` is not a duration the parser
+takes (one number, one unit), so the test uses `90m`; the spec gives six message texts and the
+tests pin the rest in the same style (`faults[0]: node_down needs a for`, `… needs a node`,
+`… traffic_spike needs a client, 'api' is a service`, `… cache_flush needs a cache or cdn, 'api'
+is a service`, `… replicas applies to node_down only`, `… replicas 5 is more than node 'api' has
+(4)`, `… replicas must be at least 1`, `… primary applies to a sql_db only`, `… capacity needs a
+factor`, `… traffic_spike needs a factor` / `factor must be positive`, `… latency_spike needs an
+extra` / `extra must be positive`, `… dc_down needs a datacenter` / `datacenter 'mars' is not
+declared`, `… unknown key 'nod'`); `replicas: primary` lands in `Fault::primary`. The typed loader
+refuses kv-store's `partition` fault (dropped, noted as backlog in its README) and both labs'
+`node_down` meant one replica without saying so (`replicas: 1` added).
+
 ### Task 6: `FaultSchedule` and the conditions the engine applies
 
 **Files:** create `src/engine/faults.cppm` (`Condition`, `FaultSchedule`, `FaultRecord` skeleton); modify `src/engine/engine.cppm` (`Simulation` owns a schedule; `forward_pass` asks `condition_at(node, now)` and hands it to the node before its step), `src/engine/behaviours.cppm` (`ServiceBehaviour` and every M/M/c-based behaviour take `capacity_factor` and `extra_latency` into their `FluidQueue::set_service`/capacity for the step; `ClientBehaviour` multiplies its rate by `rate_factor`; the hit-ratio factor waits for Task 7), `src/report/report.cpp` (`estimate` prints `faults: 3 scripted (estimate shows the steady state without them; run applies them)`), `CMakeLists.txt`, tests in a new `tests/theory/test_faults.cpp` (registered in `theory_tests`) and `tests/unit/test_engine.cpp`.
@@ -127,6 +139,15 @@ plus `run --report json` and `sweep` on hello, and `ctest` in both presets (the 
   - `estimate` ignores faults and prints the note; `dc_down` is refused for now with `dc_down lands in Task 7` (a stub refusal in `Simulation::create`, replaced in Task 7).
 - [ ] Tests (unit, `FaultSchedule`): `condition_at` is the identity outside every fault, a fault is active on `[at, at + for)`, overlapping faults compose, a fault on replica `r` of `R` gives `(R − r) / R`.
 - [ ] Commit `engine: scripted faults as per-step conditions on capacity, latency and rate`.
+
+Red at `fbc7750` (2026-10-30). Notes from the test-writer: `at: 00:10` is a clock time (ten
+minutes from midnight), so the probe uses `at: 10s`; `capacity` is per replica with an even split
+over independent M/M/1 copies, so the replicas pin is 1600/s on 4 replicas (rho 0.4 → 0.5333, W
+1.667 → 2.143 ms), not 400/s; the backlog after the fault is 100 → 40 → 0 with drain 1000/s then
+800/s; answered is 0 only once the room is full (from 10.3 s); the mean is within 1 % again at
+20.1 s (the stochastic wait reads the arrivals' rho, not the backlog), pinned as elevated at 20.0
+and back at 20.2; the `traffic_spike` ≡ `spikes` JSON comparison must drop the `faults` key once
+Task 8 adds it.
 
 ### Task 7: cache flush and `dc_down`
 
