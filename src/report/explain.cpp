@@ -755,15 +755,54 @@ struct QueueProvenance {
   return "  failover=" + format_duration(*spec.failover);
 }
 
-// An external sink's model (spec §19 entry 8): "  failure_rate=2% politeness=1/s (not modelled:
-// phase 3)". The failure rate is always printed (0% is the plain queue): the share of what the sink
-// serves that fails, which a run counts as drops. Politeness only when the scenario states it, and
-// marked as what it is: stored, never simulated (it needs per-host state).
-[[nodiscard]] std::string external_sink_summary(const model::NodeSpec& spec) {
+// The cap politeness puts on a drain (spec §8.4, behaviours::politeness_cap): " (drain cap
+// 10M/s: 10M hosts x 1/s)", or why there is none: a frontier that states no `hosts` caps nothing.
+[[nodiscard]] std::string politeness_cap_note(std::optional<int> hosts, Rate per_host) {
+  if (!hosts) return " (no cap: no hosts)";
+  const double hosts_count = static_cast<double>(*hosts);
+  return " (drain cap " + fmt_rate(hosts_count * per_host.per_second) + ": " +
+         fmt_count(hosts_count) + " hosts x " + fmt_rate(per_host.per_second) + ")";
+}
+
+// The URL frontiers of the scenario, in file order.
+[[nodiscard]] std::vector<std::size_t> frontiers_in(const graph::Graph& g) {
+  std::vector<std::size_t> frontiers;
+  for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+    if (g.nodes()[node].spec.type == model::NodeType::frontier) frontiers.push_back(node);
+  }
+  return frontiers;
+}
+
+// An external sink's model (spec §19 entry 8): "  failure_rate=2% politeness=1/s (drain cap
+// 10M/s: 10M hosts x 1/s)". The failure rate is always printed (0% is the plain queue): the share
+// of what the sink serves that fails, which a run counts as drops. Politeness only when the
+// scenario states it, with the cap it puts on the sink's drain over the hosts of the scenario's
+// one frontier (engine::Simulation::make_node), or the reason run and estimate refuse it.
+[[nodiscard]] std::string external_sink_summary(const graph::Graph& g, std::size_t i) {
+  const auto& spec = g.nodes()[i].spec;
   if (spec.type != model::NodeType::external_sink) return {};
   std::string text = "  failure_rate=" + percent(spec.failure_rate);
+  if (!spec.politeness) return text;
+  text += " politeness=" + fmt_rate(spec.politeness->per_second);
+  const auto frontiers = frontiers_in(g);
+  if (frontiers.size() != 1) {
+    return text + " (needs exactly one frontier, found " + std::to_string(frontiers.size()) +
+           ": run refuses it)";
+  }
+  return text + politeness_cap_note(g.nodes()[frontiers.front()].spec.hosts, *spec.politeness);
+}
+
+// A URL frontier's politeness (spec §8.4, book ch. 9): "  hosts=10M politeness=1/s (drain cap
+// 10M/s: 10M hosts x 1/s)", the most URLs a second its consumer pools are handed
+// (behaviours::FrontierBehaviour). Each key only when stated; the cap needs both.
+[[nodiscard]] std::string frontier_summary(const model::NodeSpec& spec) {
+  if (spec.type != model::NodeType::frontier) return {};
+  std::string text;
+  if (spec.hosts) text += "  hosts=" + fmt_count(static_cast<double>(*spec.hosts));
   if (spec.politeness) {
-    text += " politeness=" + fmt_rate(spec.politeness->per_second) + " (not modelled: phase 3)";
+    text += (text.empty() ? "  " : " ") + std::string{"politeness="} +
+            fmt_rate(spec.politeness->per_second) +
+            politeness_cap_note(spec.hosts, *spec.politeness);
   }
   return text;
 }
@@ -800,9 +839,9 @@ struct QueueProvenance {
                        limiter_summary(node.spec) + cache_summary(g, i) + cdn_summary(g, i) +
                        database_summary(node) + id_generator_summary(node.spec) +
                        message_queue_summary(node.spec) + worker_pool_summary(node) +
-                       external_sink_summary(node.spec) + search_index_summary(node.spec) +
+                       external_sink_summary(g, i) + search_index_summary(node.spec) +
                        gateway_summary(g, i) + discovery_summary(node.spec) +
-                       notification_fanout_summary(node.spec)}});
+                       notification_fanout_summary(node.spec) + frontier_summary(node.spec)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }
@@ -1045,15 +1084,16 @@ void forward_to_backend(const graph::Graph& g, std::size_t from, const OpLoad& a
   }
 }
 
-// Forwards along a cache's, a blob store's, a worker pool's or a notification fanout's `then` steps
-// (what happens after it answers: ch. 13's browser cache sends its misses on to the servers; an
-// upload's event starts transcoding; a transcoder writes its renditions; ch. 10's fanout publishes
-// a notification to each of its channels): rate × factor × Graph::then_fraction, the whole flow for
-// an unconditional step (at a blob store, every write and no read; at a pool, every job whatever
-// its op; at a fanout, the 1 − dedup its dedup step lets through) and the misses (1 − h of a read)
-// for an `on: miss` one. A share of 0 sends nothing, not a 0/s entry. The same multiplications as
-// CacheBehaviour::route (spec §18 entry 5), BlobStoreBehaviour::route, WorkerPoolBehaviour::route
-// and NotificationFanoutBehaviour::route.
+// Forwards along a cache's, a blob store's, a worker pool's, a notification fanout's or a URL
+// frontier's `then` steps (what happens after it answers: ch. 13's browser cache sends its misses
+// on to the servers; an upload's event starts transcoding; a transcoder writes its renditions;
+// ch. 10's fanout publishes a notification to each of its channels; ch. 9's frontier hands URLs to
+// the downloaders): rate × factor × Graph::then_fraction, the whole flow for an unconditional step
+// (at a blob store, every write and no read; at a pool or a frontier, every job or URL whatever its
+// op; at a fanout, the 1 − dedup its dedup step lets through) and the misses (1 − h of a read) for
+// an `on: miss` one. A share of 0 sends nothing, not a 0/s entry. The same multiplications as
+// CacheBehaviour::route (spec §18 entry 5), BlobStoreBehaviour::route, WorkerPoolBehaviour::route,
+// NotificationFanoutBehaviour::route and FrontierBehaviour::route.
 void forward_then_steps(const graph::Graph& g, std::size_t from, const OpLoad& arriving,
                         std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   for (const model::Step& step : g.nodes()[from].spec.then) {
@@ -1142,19 +1182,20 @@ void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_
     forward_cached(g, from, load, fed_back);
     return;
   }
-  // What a blob store or a worker pool sends on along its `then` steps: a store one event per
-  // write, rate × factor, and nothing for a read (spec §19 entries 6-7, as
+  // What a blob store, a worker pool or a URL frontier sends on along its `then` steps: a store one
+  // event per write, rate × factor, and nothing for a read (spec §19 entries 6-7, as
   // BlobStoreBehaviour::route does; S3 has no event for a GET); a pool every step for every job it
-  // is OFFERED. On paper nothing queues or is dropped: every write that arrives is served and
-  // notifies, and a pool offered more than its workers / cost passes all of it on (its own line is
-  // red; what the engine forwards is what the pool drains, at most its capacity). The paper load
-  // answers "can this ever fit", not "what goes through". A pool with retries drains each job
-  // A(f, n) times (add_pool_retries).
+  // is OFFERED; a frontier every URL it is offered, to its downloaders (FrontierBehaviour::route).
+  // On paper nothing queues or is dropped: every write that arrives is served and notifies, and a
+  // pool or a frontier offered more than its capacity passes all of it on (its own line is red;
+  // what the engine forwards is what it drains, at most its capacity, and a frontier's pool at
+  // most hosts x politeness). The paper load answers "can this ever fit", not "what goes through".
+  // A pool with retries drains each job A(f, n) times (add_pool_retries).
   // A notification fanout publishes each notification its dedup step lets through, rate × (1 −
   // dedup) × factor per step (phase 3 spec §8.3; NotificationFanoutBehaviour::route), and is
   // offered every notification, duplicates included (finding one is work too).
   if (spec.type == model::NodeType::blob_store || spec.type == model::NodeType::worker_pool ||
-      spec.type == model::NodeType::notification_fanout) {
+      spec.type == model::NodeType::notification_fanout || spec.type == model::NodeType::frontier) {
     if (spec.type == model::NodeType::worker_pool) add_pool_retries(g, from, load);
     const OpLoad arriving = load[from];  // a copy: a step may target `from` itself
     forward_then_steps(g, from, arriving, load, fed_back);
@@ -1560,25 +1601,26 @@ constexpr std::string_view unknown_hit_ratio_note =
 // any node's) `ops` steps, through load balancers and rate limiters over their links
 // (graph::forwards_by_link), from caches and CDNs on their misses (graph::hits_or_misses), along a
 // blob store's `then` steps, its event notifications, from a message queue into each of its
-// consumer groups and along a worker pool's and a notification fanout's `then` steps. It does not
-// follow the `then` of a URL frontier (a type without a model yet). A node fed through one
-// misses that part of its load: with nothing else it shows 0 offered load, a missing number,
-// not a zero, and a verdict on it ("0%, green") would read as "this tier is idle"; with some load
-// from elsewhere its percentage is a lower bound, and a green or yellow verdict on it would read as
-// "this tier has room" (a node fed 1/s by a client and 10k/s through a blob store once printed
-// "(0.05%, green)"). Its check line says so instead.
+// consumer groups, and along a worker pool's, a notification fanout's and (phase 3 Task 18) a URL
+// frontier's `then` steps: since then it follows every node type. The machinery below stays for a
+// type added later without a model, whose onward flow the paper load would not follow. A node fed
+// through one would miss that part of its load: with nothing else it would show 0 offered load, a
+// missing number, not a zero, and a verdict on it ("0%, green") would read as "this tier is idle";
+// with some load from elsewhere its percentage would be a lower bound, and a green or yellow
+// verdict on it would read as "this tier has room" (a node fed 1/s by a client and 10k/s through a
+// blob store once printed "(0.05%, green)"). Its check line says so instead.
 
 // Until when the paper load leaves unfollowed what a node of `type` sends on: "not modelled yet",
-// or nothing for a type it follows (or that sends nothing on).
-[[nodiscard]] std::optional<std::string_view> unfollowed_until(model::NodeType type) {
-  using enum model::NodeType;  // C++20, as in provenance
-  if (type == frontier) return "not modelled yet";
+// or nothing for a type it follows (or that sends nothing on). Nothing for every type since phase 3
+// Task 18 gave the frontier, the last one, its model: a type added later without one gets a line
+// here.
+[[nodiscard]] std::optional<std::string_view> unfollowed_until(model::NodeType /*type*/) {
   return std::nullopt;
 }
 
 // Where `from` sends on what it receives. For a type the paper load does not follow: the targets
-// of its `then` steps, the flow it would send; for one with none (a frontier that only feeds its
-// consumers over its links), the nodes its links carry demand to. For every other node: its demand
+// of its `then` steps, the flow it would send; for one with none (a fan-out that only feeds its
+// targets over its links), the nodes its links carry demand to. For every other node: its demand
 // edges (steps, client routes, a balancer's links, a cache's backend, a blob store's events, a
 // queue's consumer groups, a pool's hand-offs), what the paper load follows from it.
 [[nodiscard]] std::vector<std::size_t> onward_targets(const graph::Graph& g, std::size_t from) {
@@ -1610,15 +1652,13 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 }
 
 // Per node, the types on its way in whose onward flow the paper load does not follow, each once,
-// nearest first: the web crawler's dns, behind the frontier and the downloader, has [frontier].
-// (Two such types, as a notification fan-out feeding a frontier was until the fan-out got its
-// model, give [frontier, notification_fanout]: the list holds as many as there are.)
-// Empty for a node whose load the paper pass has in full. A node passes on its own type (if it is
-// such a type) and everything on its way, so the mark crosses ordinary nodes too (the web
-// crawler's parser, behind the downloader). A node in a loop through such a type has it on its way
-// as well: the load that comes round is missing too. Breadth-first from every such node at once,
-// which puts the nearest types first; a node is visited again only when its list grows, which
-// happens at most once per type, so a loop ends.
+// nearest first (a node behind two such types gets both, nearest first: the list holds as many as
+// there are; none is left today, see unfollowed_until). Empty for a node whose load the paper pass
+// has in full. A node passes on its own type (if it is such a type) and everything on its way, so
+// the mark crosses ordinary nodes too. A node in a loop through such a type has it on its way as
+// well: the load that comes round is missing too. Breadth-first from every such node at once, which
+// puts the nearest types first; a node is visited again only when its list grows, which happens at
+// most once per type, so a loop ends.
 [[nodiscard]] std::vector<std::vector<model::NodeType>> blocked_on_the_way(const graph::Graph& g) {
   const auto count = g.nodes().size();
   std::vector<std::vector<model::NodeType>> blocked(count);
@@ -1646,10 +1686,9 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
   return join(items.first(items.size() - 1), ", ") + " and " + items.back();
 }
 
-// "load not propagated: frontier is not modelled yet)" or, with several types, grouped by how long
-// each stays unfollowed, in the order they come ("... a and b are not modelled yet)"). (The
-// frontier is the one type left unfollowed now; the grouping will hold the next phase's types
-// apart.)
+// "load not propagated: x is not modelled yet)" or, with several types, grouped by how long each
+// stays unfollowed, in the order they come ("... a and b are not modelled yet)"). (No type is left
+// unfollowed since phase 3 Task 18; the grouping will hold a later phase's types apart.)
 [[nodiscard]] std::string unpropagated_mark(std::span<const model::NodeType> blocked) {
   std::vector<std::pair<std::string_view, std::vector<std::string>>> groups;
   for (const model::NodeType type : blocked) {
@@ -1816,7 +1855,7 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 
 // The check of a node whose paper load misses what comes through `blocked` (blocked_on_the_way):
 //  - nothing reached it: the head and the mark, no percentage and no zone,
-//    "(load not propagated: frontier is not modelled yet)";
+//    "(load not propagated: notification_fanout is not modelled yet)";
 //  - some load reached it: that load's percentage as a lower bound, "(≥0.05%; load not
 //    propagated: ...)". No zone below red: the real load is higher, so green or yellow might not
 //    hold, but a red lower bound is red for certain, "(≥150%, red; ...)" (a database's at the

@@ -125,7 +125,10 @@ struct NodeSample {
   // after warmup, so it reads "every message published after warmup was read within `max`".
   // The wait only: the job's `cost` is not lag (a message is read once a worker takes it), so the
   // lag is the pool's latency minus its cost. Assumes the backlog is read first in, first out (a
-  // Kafka partition is). Empty for every node that is not a message queue (a 0 would be a claim).
+  // Kafka partition is). A URL frontier (phase 3 Task 18) has one the same way: its consumer pool's
+  // wait, at the pool's capacity capped by politeness (behaviours::FrontierBehaviour), so 30,000
+  // URLs drained 1000 a second under the cap are 30 s. Empty for every node that is neither (a 0
+  // would be a claim).
   std::optional<double> queue_lag_s{};
   // A worker pool's dead letters, per second (phase 3 spec §6.2; book ch. 10's dead-letter queue):
   // the jobs whose LAST attempt at an external sink failed this step, which a pool with `retries`

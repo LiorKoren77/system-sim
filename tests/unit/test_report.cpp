@@ -1908,13 +1908,13 @@ TEST_CASE("explain checks a bandwidth link's peak offered MB per second against 
   }
 }
 
-// Two marks on a pipe's check that the node lines carry too:
+// A pipe's check reads the paper load as the node lines do:
 //  - behind a che CDN with no `keys` size (no hit ratio to resolve, so every read counts as a miss
 //    on paper) the pipe to its origin is checked against its worst case, and says so: 10 streams/s
 //    of 50 MB, all of them missing, are 500 MB/s of 5k MB/s, 10 %, an upper bound;
-//  - a pipe whose sender is a type the paper load does not follow (a notification fan-out) and
-//    that it therefore sends nothing on paper prints the mark without a percentage, as a node
-//    line does: no "0%, green" verdict on a load that is missing, not zero.
+//  - a pipe behind a URL frontier carries the frontier's hand-offs on paper (followed since phase 3
+//    Task 18; until then the frontier was a type the paper load did not follow, and the pipe
+//    printed the "load not propagated" mark without a percentage).
 TEST_CASE("a pipe behind a cdn of unknown hit ratio is checked as an upper bound", "[report]") {
   Scenario s{.name = "pipe-upper", .version = 1, .duration = 1min};
   s.nodes = {NodeSpec{.id = "u",
@@ -1936,9 +1936,9 @@ TEST_CASE("a pipe behind a cdn of unknown hit ratio is checked as an upper bound
                         "counted as 0 — an upper bound)"));
 }
 
-// Re-pinned on the frontier (phase 3 Task 17): the notification fan-out this test used is followed
-// now, and the URL frontier is the one blocking type left.
-TEST_CASE("a pipe that a blocking type sends nothing on paper has no percentage", "[report]") {
+// Re-pinned on the frontier (phase 3 Task 17), then on the frontier followed (Task 18: no blocking
+// type is left): 10 URLs/s, each handed on as one `push` of 1 MB, are 10 MB/s of 125 MB/s, 8 %.
+TEST_CASE("a pipe behind a URL frontier carries its hand-offs on paper", "[report]") {
   Scenario s{.name = "pipe-unloaded", .version = 1, .duration = 1min};
   s.nodes = {
       NodeSpec{.id = "u",
@@ -1953,9 +1953,8 @@ TEST_CASE("a pipe that a blocking type sends nothing on paper has no percentage"
   const auto text = explain_of(s);
   CAPTURE(text);
   const auto line = check_line(text, "seeds->svc");
-  REQUIRE(line.contains(
-      "peak offered 0 MB/s vs 125 MB/s  (load not propagated: frontier is not modelled yet)"));
-  REQUIRE_FALSE(line.contains("%"));
+  REQUIRE(line.contains("peak offered 10 MB/s vs 125 MB/s  (8%, green)"));
+  REQUIRE_FALSE(line.contains("load not propagated"));
 }
 
 // ---- Message queues and worker pools in explain (spec §19 entries 4-5) ----
@@ -2119,12 +2118,12 @@ TEST_CASE("explain passes a saturated pool's whole arrival on: the paper load do
   REQUIRE(check_line(text, "w2").contains("peak offered 2k/s vs 2k/s total capacity"));
 }
 
-// The mark that remains is for the types with no model yet: a pool's target behind a URL frontier
-// is marked by the frontier alone, and the mark does not name the queue or the pool on the way
-// (they are followed now). The fixture is the one the lower-bound cases use: the frontier's `then`
-// sends to q, whose pool w sends on to svc. (Re-pinned on the frontier in phase 3 Task 17: the
-// notification fan-out it used is followed now.)
-TEST_CASE("a node behind a URL frontier and a queue and pool is marked by the frontier only",
+// A pool's target behind a URL frontier, a queue and a pool gets its whole load on paper: the
+// frontier's `then` sends 100/s to q, whose pool w sends on to svc (4 calls a job) and done_q, as
+// in the chain above. (This test pinned the "load not propagated" mark of the frontier alone, the
+// last type the paper load did not follow, until phase 3 Task 18 followed it too; re-pinned on
+// the frontier in Task 17 when the notification fan-out it used was followed.)
+TEST_CASE("a node behind a URL frontier and a queue and pool gets its whole load on paper",
           "[report]") {
   auto s = queue_pool_chain(100);
   s.nodes[0].workload->op_shares = {{"fire", 1.0}};
@@ -2135,13 +2134,14 @@ TEST_CASE("a node behind a URL frontier and a queue and pool is marked by the fr
   s.links.push_back(LinkSpec{.from = "seeds", .to = "q"});
   const auto text = explain_of(s);
   CAPTURE(text);
-  for (const auto* id : {"q", "w", "svc", "done_q", "w2"}) {
-    CAPTURE(id);
-    const auto line = check_line(text, id);
-    REQUIRE(line.contains("(load not propagated: frontier is not modelled yet)"));
-    REQUIRE_FALSE(line.contains("worker_pool"));
-    REQUIRE_FALSE(line.contains("message_queue"));
-  }
+  REQUIRE_FALSE(text.contains("load not propagated"));
+  REQUIRE(check_line(text, "q").contains("peak offered 100/s vs 1M/s total capacity"));
+  REQUIRE(check_line(text, "w").contains(
+      "peak offered 100/s vs 1.2k/s total capacity  (8.33%, green)"));
+  REQUIRE(
+      check_line(text, "svc").contains("peak offered 400/s vs 10k/s total capacity  (4%, green)"));
+  REQUIRE(
+      check_line(text, "w2").contains("peak offered 100/s vs 2k/s total capacity  (5%, green)"));
 }
 
 // ---- Queue lag: the queue_lag SLO and its columns (spec §19 entries 4 and 14) ----
@@ -2387,8 +2387,9 @@ TEST_CASE("the JSON nodes carry peak_queue_lag_s: the queue's peak, null on ever
 // explain says what the two keys of an external sink mean for the model:
 //  - `failure_rate=2%`: the share of what the sink serves that fails (a 5xx), which the engine
 //    counts as drops;
-//  - `politeness=1/s (not modelled: phase 3)`: stored and printed, never simulated (it needs a
-//    per-host state, which arrives with the crawler's frontier).
+//  - `politeness=1/s (...)`: a cap of hosts x politeness on the sink's drain, the hosts of the
+//    scenario's one frontier (phase 3 Task 18). This sink has no frontier to take hosts from, so
+//    the note says run and estimate refuse it (test_frontier.cpp pins the refusal and the cap).
 // A sink that states no politeness prints no note about one.
 
 namespace {
@@ -2408,13 +2409,13 @@ Scenario sink_reported(double failure_rate, std::optional<Rate> politeness) {
 }
 }  // namespace
 
-TEST_CASE("explain prints a sink's failure rate as a percentage and its politeness as not modelled",
+TEST_CASE("explain prints a sink's failure rate as a percentage and why its politeness cannot run",
           "[report]") {
   const auto text = explain_of(sink_reported(0.02, Rate{1.0}));
   CAPTURE(text);
   const auto line = node_line(text, "apns");
   REQUIRE(line.contains("failure_rate=2%"));
-  REQUIRE(line.contains("politeness=1/s (not modelled: phase 3)"));
+  REQUIRE(line.contains("politeness=1/s (needs exactly one frontier, found 0: run refuses it)"));
 }
 
 // A sink that fails everything it serves answers nobody: there is no latency to report, and the op

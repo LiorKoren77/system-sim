@@ -39,19 +39,18 @@ TEST_CASE("the node type table is complete at compile time", "[model]") {
   SUCCEED();
 }
 
-// The node-type table's third column says which types run/estimate can step today: every type but
-// the one whose model phase 3 still has to add (a service_discovery runs since Task 13: a
-// service that answers `lookup`; a ws_gateway since Task 14; a notification_fanout since Task 17,
-// which the test appended at the end of this file pins alone). Simulation::create reads it
-// (model::simulated), and the scenario tests pin the shipped scenarios it lets run.
-TEST_CASE("every node type runs but the one that phase 3 has still to model", "[model]") {
+// The node-type table's third column says which types run/estimate can step today: since phase 3
+// Task 18 every type (a service_discovery runs since Task 13: a service that answers `lookup`; a
+// ws_gateway since Task 14; a notification_fanout since Task 17; the frontier, the last, since
+// Task 18). Simulation::create reads it (model::simulated), and the scenario tests pin the shipped
+// scenarios it lets run: all of them.
+TEST_CASE("every node type runs", "[model]") {
   for (const auto& row : simsys::model::node_type_table) {
     CAPTURE(row.name);
-    const bool still_to_model = row.value == NodeType::frontier;
-    REQUIRE(simsys::model::simulated(row.value) == !still_to_model);
+    REQUIRE(simsys::model::simulated(row.value));
   }
   static_assert(simsys::model::simulated(NodeType::service));
-  static_assert(!simsys::model::simulated(NodeType::frontier));
+  static_assert(simsys::model::simulated(NodeType::frontier));
 }
 
 TEST_CASE("a service discovery is a node type the engine runs", "[model]") {
@@ -356,19 +355,11 @@ TEST_CASE("a Fault carries what breaks, where, when and for how long", "[model]"
 TEST_CASE("the notification_fanout node type runs", "[model]") {
   REQUIRE(simsys::model::simulated(NodeType::notification_fanout));
   REQUIRE(simsys::model::to_string(NodeType::notification_fanout) == "notification_fanout");
-  // The other type of this family that still waits for its model: the frontier (Task 18).
-  REQUIRE_FALSE(simsys::model::simulated(NodeType::frontier));
 }
 
 // Phase 3 Task 18 removes the frontier from the list of types not simulated yet: the URL frontier
-// is modelled (a queue whose pool drains at hosts x politeness), so run/estimate accept it. The
-// three types still without a model are the ones that remain refused. (The test above, written when
-// all four were refused, and its static_assert, say the opposite and are to be deleted with this
-// task's implementation; a runtime check here, not a static_assert, so this file still compiles
-// while both exist.)
-TEST_CASE("a frontier is a simulated node type; the other three phase 3 types are not", "[model]") {
+// is modelled (a queue whose pool drains at hosts x politeness), so run/estimate accept it. It was
+// the last such type (the test of the whole table, above, says every type runs).
+TEST_CASE("a frontier is a simulated node type", "[model]") {
   REQUIRE(simsys::model::simulated(NodeType::frontier));
-  REQUIRE_FALSE(simsys::model::simulated(NodeType::ws_gateway));
-  REQUIRE_FALSE(simsys::model::simulated(NodeType::service_discovery));
-  REQUIRE_FALSE(simsys::model::simulated(NodeType::notification_fanout));
 }

@@ -718,8 +718,8 @@ void apply_kv_ring(ResolvedNode& node) {
       ring_imbalance(machines, replication, spec.vnodes.value_or(model::default_vnodes));
 }
 // What a worker pool may consume (spec §19 entry 4): a message queue, or a URL frontier, which is a
-// queue of URLs (book ch. 9: the web crawler's downloaders take URLs from it). The frontier is not
-// simulated before phase 3, so its wiring is checked here and the engine still refuses the type.
+// queue of URLs (book ch. 9: the web crawler's downloaders take URLs from it; phase 3 Task 18 runs
+// it, behaviours::FrontierBehaviour).
 [[nodiscard]] bool can_be_consumed(model::NodeType type) {
   return type == model::NodeType::message_queue || type == model::NodeType::frontier;
 }
@@ -971,8 +971,10 @@ void add_then_steps(const Graph& g, std::size_t node, ForwardedSteps& calls) {
 // unconditional step, or an `on: miss` step after a cache that misses; of the `then` steps
 // only a cache's: a blob store's are no calls, nobody waits for them (blob_store_events); a worker
 // pool's are calls, but no call reaches a pool (only its queue's asynchronous deliveries do,
-// Graph::check_pool_senders), so no call cycle can pass through one; a notification fan-out's and
-// a frontier's do not run yet), an edge (lb, op) ->
+// Graph::check_pool_senders), so no call cycle can pass through one; a frontier's are hand-offs
+// to its downloaders that nobody waits for, as a queue's deliveries are, so a call that reaches a
+// frontier ends there (behaviours::FrontierBehaviour); a notification fan-out's are calls it
+// waits for, as a service's steps, forwarder_steps), an edge (lb, op) ->
 // (target, op) for every route of a load balancer that carries the op, and (cache, op) ->
 // (backend, op) for what a cache passes on synchronously (forwarder_steps). Same white/grey/black
 // classification as Graph::order_nodes, one level finer: there the vertices are boxes, here they

@@ -27,6 +27,7 @@ nodes:
     consumes: frontier
     workers: 1000
     cost: 500ms                               # dominated by the remote site, see internet
+    retries: 2                                # a failed fetch (internet: 5 %) goes back on the frontier
     then:
       - {to: dns, op: resolve}
       - {to: internet, op: get}

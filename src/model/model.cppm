@@ -65,11 +65,12 @@ enum class NodeType : std::uint8_t {
 };
 
 // One row of the node-type catalogue: the enumerator, the word the schema spells it with, and
-// whether run/estimate can step a node of the type today (`runs`). The one type without a model
-// yet (frontier: phase 3; the ws_gateway got its model in phase 3 Task 14, the service_discovery
-// in Task 13, the notification_fanout in Task 17) has it false; explain and validate take every
-// type. A row like core::EnumName with one more column, which core's lookups read through their
-// NameRow concept.
+// whether run/estimate can step a node of the type today (`runs`). Every type has a model since
+// phase 3 (the service_discovery got its model in Task 13, the ws_gateway in Task 14, the
+// notification_fanout in Task 17, the frontier in Task 18), so every row says true; the column
+// stays, so a type added later without a model has a place to say so. explain and validate take
+// every type. A row like core::EnumName with one more column, which core's lookups read through
+// their NameRow concept.
 struct NodeTypeRow {
   NodeType value;
   std::string_view name;
@@ -106,7 +107,7 @@ inline constexpr auto node_type_table = std::to_array<NodeTypeRow>({
     {NodeType::id_generator, "id_generator", true},
     {NodeType::external_sink, "external_sink", true},
     {NodeType::notification_fanout, "notification_fanout", true},
-    {NodeType::frontier, "frontier", false},
+    {NodeType::frontier, "frontier", true},
 });
 
 // The names alone, derived from the table at compile time (an immediately invoked
@@ -602,11 +603,13 @@ struct NodeSpec {
   // that fail (a 5xx from the provider), which the engine moves from the node's drain to its drops
   // (engine.cppm's fail_share). A plain double, not an optional: "fails nothing" is the real value
   // 0, and a sink that states none is the plain queue it was before. `politeness` is how often one
-  // host may be called (the crawler's "1/s per host"), stored and printed, not modelled (phase 3:
-  // it needs per-host state); absent when not stated. A failed call is sent again by a client's
-  // `retries` (Workload) or a worker pool's (`retries` above), which the sink sees as more demand.
-  // Ignored: a provider's latency rising with OUR load (its queue is the type's 1k/s quota, not the
-  // provider's real fleet), and per-host politeness.
+  // host may be called (the crawler's "1/s per host"; absent when not stated), on an external sink
+  // and on a URL frontier (phase 3 Task 18, spec §8.4): a rate cap of `hosts` x politeness on the
+  // node's drain, `hosts` the frontier's own (below) or, for a sink, the one frontier's of the
+  // scenario (engine::Simulation::create refuses a sink's politeness with none or two). A failed
+  // call is sent again by a client's `retries` (Workload) or a worker pool's (`retries` above),
+  // which the sink sees as more demand. Ignored: a provider's latency rising with OUR load (its
+  // queue is the type's 1k/s quota, not the provider's real fleet).
   double failure_rate{0.0};
   std::optional<Rate> politeness{};
   // Key-value clusters only (spec §19 entry 9; declared after the external sink's keys, for
@@ -681,6 +684,12 @@ struct NodeSpec {
   // ignores are at behaviours::NotificationFanoutBehaviour.
   double dedup{0.0};
   std::map<std::string, std::string> channels{};
+  // URL frontiers only (phase 3 Task 18, spec §8.4; declared after the fan-out's keys, for
+  // designated initializers): how many distinct hosts the crawl touches (book ch. 9: "10M+ hosts").
+  // With `politeness` above, each host fetched at most that often, the frontier hands out at most
+  // hosts x politeness URLs a second (behaviours::FrontierBehaviour has the model). A count (the
+  // loader takes "10M"); absent when not stated, and then nothing is capped.
+  std::optional<int> hosts{};
   std::optional<Workload> workload{};  // clients only
 };
 

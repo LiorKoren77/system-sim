@@ -5,8 +5,9 @@
 // notify along its `then` steps for each write; message queue: append, and copy every message to
 // each consumer group; worker pool: drain its jobs and hand each one on along its `then` steps;
 // external sink: answer, calling nobody, while the engine fails a share of what it served;
-// notification fanout: serve, drop the duplicates and publish the rest along its `then` steps) and
-// how it composes response latency from its own sojourn plus link legs and downstream responses.
+// notification fanout: serve, drop the duplicates and publish the rest along its `then` steps; URL
+// frontier: file each URL and hand it to its downloaders along its `then` steps) and how it
+// composes response latency from its own sojourn plus link legs and downstream responses.
 //
 // Latency composes on the reply path. A hop to a downstream node costs two link legs
 // (request out, reply back) plus that node's own response; sequential hops add, parallel
@@ -2076,10 +2077,12 @@ class WorkerPoolBehaviour {
 // second time. A failure is the provider failing, not a policy working: nothing is ever counted as
 // rejected. A client's `retries` send a failed request again (ClientBehaviour), and so do a worker
 // pool's (WorkerPoolBehaviour: the job goes back on the pool's queue), which this queue sees as
-// more demand. Ignored: the provider's latency rising with our load (its queue is our account's
-// quota, not its fleet),
-// failures that cost a different time than a success, and `politeness` (printed, not modelled: it
-// needs per-host state, phase 3).
+// more demand. A sink's `politeness` (the web a crawler calls, ch. 9) caps its drain at hosts x
+// politeness, the hosts of the scenario's one frontier (politeness_cap, applied to its queue by
+// the engine): what the cap leaves over waits in the sink's room and is shed once it is full, and
+// the callers are not slowed by it (a worker is busy for `cost` only). Ignored: the provider's
+// latency rising with our load (its queue is our account's quota, not its fleet), and failures
+// that cost a different time than a success.
 class ExternalSinkBehaviour {
  public:
   ExternalSinkBehaviour(const graph::Graph& g, std::size_t self);
@@ -2195,6 +2198,93 @@ class NotificationFanoutBehaviour {
   // requests (detail::add_then_blocks over graph::Graph::then_fraction).
   detail::HopBlocks publishes_;
 };
+
+// Models: the URL frontier of System Design Interview (Alex Xu, vol. 1) ch. 9, "Design a web
+// crawler": the store of URLs still to download, fed by the seed URLs and by the links the crawler
+// extracts and has not seen before (the "URL seen?" filter's misses, the crawl's feedback edge),
+// and drained by the HTML downloaders. Phase 3 spec §8.4. The book draws it as two banks of
+// queues: front queues where a PRIORITISER orders URLs by importance, and back queues, one per
+// host, from which each host is fetched by one worker at a time with a pause between two fetches
+// (POLITENESS: a crawler must not hammer a site). Captured, as three parts:
+//  - the prioritiser: the node's own queue, a service stage of `capacity` URLs a second (the
+//    type's 10k/s at 1 ms when the scenario states none). What it cannot pass waits in its room
+//    and is dropped once the room is full: the frontier's own drops (a crawler that discovers URLs
+//    faster than it can even file them loses some);
+//  - the frontier proper: what the prioritiser passes is handed, along the `then` steps, to the
+//    consumer pool (the downloaders: a worker pool that `consumes` the frontier), and what the
+//    pool has not read waits in the POOL's queue, as a message queue's backlog does
+//    (MessageQueueBehaviour). Nothing is deleted unconsumed by the frontier: it has no retention,
+//    so the pool's room is defaults::default_retention's 7 days of its draining
+//    (graph::Graph::connect_consumer), a room no crawl of hours fills. Its lag is that pool's wait
+//    (engine::NodeSample::queue_lag_s): backlog / drain once a backlog builds;
+//  - politeness as a RATE CAP: if the crawl touches `hosts` distinct hosts and each may be fetched
+//    `politeness` times a second, the pool can be handed at most
+//      cap   = hosts x politeness                 (URLs/s; politeness_cap below)
+//      drain = min(pool capacity, cap)            (pool capacity = workers / cost, Little's law)
+//    URLs a second, however many URLs wait and however many workers are free: 1000 hosts at 1/s
+//    drain 1000 URLs/s through 2000 workers at 500 ms (whose own 4000/s never binds), 10M hosts
+//    leave the pool's 4000/s binding. The engine applies the cap to the pool's queue
+//    (engine::Simulation::make_node). It assumes the URLs are spread EVENLY over the hosts: the
+//    cap is the crawl's whole politeness budget, every host's back queue busy at once.
+// The hand-off is asynchronous like a message queue's: whoever sent the frontier a URL (a seed
+// injector, url_seen) is answered when the prioritiser has filed it, and waits for no download, so
+// the response is the prioritiser's own sojourn and the delivered share its own. Ignored: the
+// priority ORDER itself (a fluid has no individual URLs, so which URL goes first changes no rate),
+// a skewed spread of URLs over hosts (a few big sites hold most of a real crawl's URLs, and their
+// back queues, not the average, set the pace: the even spread is the optimistic case), robots.txt
+// and the per-host pause beyond its rate, DNS-based host grouping, and the frontier's disk (the
+// book keeps most of it on disk with in-memory buffers: here it never fills).
+class FrontierBehaviour {
+ public:
+  FrontierBehaviour(const graph::Graph& g, std::size_t self);
+
+  // Files every URL it is sent (`served` is what the prioritiser drained, nothing is refused) and
+  // hands each one to every `then` step, `factor` requests of the step's op per URL, whatever op
+  // the URL came in under (a seed's `crawl`, url_seen's miss, a downloader's retry). `now` and
+  // `dt` are unused: the frontier keeps no state between steps (the backlog is its pool's).
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt) const;
+  // The engine's call (see NodeBehaviour): nobody waits for a hand-off, so none is thinned.
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt,
+                             FractionLookup auto&& /*delivered_last_step*/) const {
+    return route(in, now, dt);
+  }
+
+  // One capacity unit per URL, whatever its op: the prioritiser files one URL at a time.
+  [[nodiscard]] double cost(std::string_view /*op*/) const { return 1.0; }
+
+  // The prioritiser's sojourn: the sender waits for no download.
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view /*op*/, flow::LatencyEstimate own,
+                                               ResponseLookup auto&& /*downstream*/) const {
+    return own;
+  }
+
+  // The share the prioritiser filed: a URL the downloader later fails fails no sender.
+  [[nodiscard]] double delivered(std::string_view /*op*/, double own,
+                                 FractionLookup auto&& /*downstream*/) const {
+    return own;
+  }
+
+ private:
+  // One `then` step resolved against the graph: whom it hands URLs to, on which link, as which
+  // op, and how many requests per URL.
+  struct HandOff {
+    std::size_t target;
+    std::size_t link;
+    std::string op;
+    double factor;
+  };
+  std::vector<HandOff> hand_offs_;
+};
+
+// The politeness cap of spec §8.4: `hosts` hosts each fetched at most `per_host` times a second
+// hand out at most
+//   cap = hosts x per_host          (URLs/s; 1000 hosts at 1/s: 1000/s, 10M hosts at 1/s: 10M/s)
+// Empty when either number is missing: a crawl of unknown breadth, or hosts fetched as often as
+// asked, has no cap to apply. The frontier's own `politeness` caps its consumer pool's drain; an
+// external sink's `politeness` caps the sink's drain over the hosts of the scenario's one frontier
+// (the web the crawler calls: engine::Simulation::make_node applies both).
+[[nodiscard]] std::optional<Rate> politeness_cap(std::optional<int> hosts,
+                                                 std::optional<Rate> per_host);
 
 // One kind of machine of a kv_cluster this step, as the engine served it (engine::Simulation::serve
 // hands one per copy group): the sojourn ONE replica-request sees on one such machine, the share of
@@ -2479,15 +2569,15 @@ class WsGatewayBehaviour {
 // balancer, the rate limiter and the cache, phase 2b the SQL database and the CDN, phase 2c the
 // blob store, the message queue, the worker pool, the external sink and the kv cluster, phase 3 the
 // websocket gateway (a service discovery needs none: it runs as a ServiceBehaviour), the
-// notification fanout; later tasks append the rest (frontier).
+// notification fanout and the URL frontier.
 // C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
 // it holds) dispatched with std::visit. Closed: adding an alternative means editing this
 // line, and every std::visit that does not handle it then fails to compile.
-using Behaviour =
-    std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour, RateLimiterBehaviour,
-                 CacheBehaviour, SqlDbBehaviour, CdnBehaviour, BlobStoreBehaviour,
-                 MessageQueueBehaviour, WorkerPoolBehaviour, ExternalSinkBehaviour,
-                 KvClusterBehaviour, WsGatewayBehaviour, NotificationFanoutBehaviour>;
+using Behaviour = std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour,
+                               RateLimiterBehaviour, CacheBehaviour, SqlDbBehaviour, CdnBehaviour,
+                               BlobStoreBehaviour, MessageQueueBehaviour, WorkerPoolBehaviour,
+                               ExternalSinkBehaviour, KvClusterBehaviour, WsGatewayBehaviour,
+                               NotificationFanoutBehaviour, FrontierBehaviour>;
 
 }  // namespace simsys::behaviours
 
@@ -2508,6 +2598,7 @@ static_assert(NodeBehaviour<ExternalSinkBehaviour>);
 static_assert(NodeBehaviour<KvClusterBehaviour>);
 static_assert(NodeBehaviour<WsGatewayBehaviour>);
 static_assert(NodeBehaviour<NotificationFanoutBehaviour>);
+static_assert(NodeBehaviour<FrontierBehaviour>);
 static_assert(RequestSource<ClientBehaviour>);
 
 namespace detail {
@@ -3481,6 +3572,39 @@ NotificationFanoutBehaviour::NotificationFanoutBehaviour(const graph::Graph& g, 
 
 double NotificationFanoutBehaviour::cost(std::string_view op) const {
   return detail::cost_in(cost_by_op_, op);
+}
+
+// ---- FrontierBehaviour ----
+
+// One hand-off per `then` step. Graph::build resolved each step's target and link (connect_step)
+// and refused a step to a pool that does not consume this frontier (check_pool_senders).
+FrontierBehaviour::FrontierBehaviour(const graph::Graph& g, std::size_t self) {
+  for (const model::Step& step : g.nodes()[self].spec.then) {
+    const std::size_t target = *g.index_of(step.to);
+    hand_offs_.push_back(HandOff{.target = target,
+                                 .link = *g.demand_link(self, target),
+                                 .op = step.op,
+                                 .factor = step.factor});
+  }
+}
+
+// Every filed URL goes to every step, renamed to the step's op: a copy per step, as a message
+// queue copies to each consumer group, and nothing when nothing was filed.
+Routed FrontierBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
+  Routed routed = detail::serve_everything(in);
+  const double urls_per_s = routed.served.total().per_second;
+  if (urls_per_s <= 0.0) return routed;
+  for (const HandOff& hand_off : hand_offs_) {
+    detail::flow_towards(routed.outgoing, hand_off.target, hand_off.link)
+        .add(hand_off.op, Rate{urls_per_s * hand_off.factor});
+  }
+  detail::sort_by_destination(routed.outgoing);
+  return routed;
+}
+
+std::optional<Rate> politeness_cap(std::optional<int> hosts, std::optional<Rate> per_host) {
+  if (!hosts || !per_host) return std::nullopt;
+  return Rate{static_cast<double>(*hosts) * per_host->per_second};
 }
 
 // ---- KvClusterBehaviour ----

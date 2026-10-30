@@ -153,8 +153,9 @@ CheckResult check_utilization_target(const Site& site, const YAML::Node& entry,
 // A queue lag is a message queue's (spec §19 entry 14): how far its slowest consumer group trails
 // it, read off the worker pools behind it, so on a service, a client or any other node the SLO
 // could never be observed. A frontier is accepted too: it is the web crawler's queue (ch. 9),
-// drained by worker pools as a message queue is, and simulated in phase 3 (until then its SLO is
-// skipped). Without `node` the SLO bounds every message queue of the run: the worst one decides.
+// drained by worker pools as a message queue is, and its lag is read off them the same way (phase
+// 3 Task 18). Without `node` the SLO bounds every queue of the run, frontiers included: the worst
+// one decides.
 CheckResult check_queue_lag_target(const Site& site, const YAML::Node& entry,
                                    const model::SloSpec& slo, const Declarations& declared) {
   if (slo.metric != model::SloMetric::queue_lag || !slo.node) return {};

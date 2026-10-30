@@ -21,16 +21,16 @@ algorithms of ch. 4, with a counter store), caches (a fixed hit ratio or one com
 approximation from the clients' keys; every write strategy including write-back; `then` steps),
 SQL databases (a primary and read replicas, shards, a connection pool, replication lag and
 staleness), CDNs and blob stores sized in bytes, links with a `bandwidth` (a pipe that queues and
-drops megabytes), message queues and the worker pools that consume them, external sinks,
+drops megabytes), message queues and the worker pools that consume them, external sinks, URL
+frontiers (per-host politeness as a cap on the downloaders' drain),
 key-value clusters (ring, replication and quorums), search indexes and id generators. A step after
 a failed step does not run, refused, dropped and timed-out requests are counted apart
 (`reject_rate`, `drop_rate`, `timed_out_per_s`), and an SLO can be checked per window (`over: 1h`).
-`simsys sweep` runs a scenario over a range of one key, the points in parallel. Eleven scenarios
-run end to end, five of the eight book systems among them (list below); chat-system, google-drive
-and web-crawler validate and `explain`, and wait for phase 3's last type and levels (`frontier`;
-`ws_gateway` and `service_discovery` run since phase 3, but chat-system's and google-drive's
-gateways state no connection level yet). 1610 tests (Catch2, via
-`ctest`). The scenario language is
+`simsys sweep` runs a scenario over a range of one key, the points in parallel. Twelve scenarios
+run end to end, six of the eight book systems among them (list below); chat-system and
+google-drive validate and `explain`, and wait for their gateways' levels (every node type runs
+since phase 3, but chat-system's and google-drive's gateways state no connection level yet). 1163
+tests (Catch2, via `ctest`). The scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.4).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
@@ -229,9 +229,8 @@ $ simsys explain scenarios/book/youtube/scenario.yaml
   cdn_eu->transcoded_store  peak offered 2.856k MB/s vs 5k MB/s  (57.1%, green)
 ```
 
-Only a URL frontier's onward load is still left out (a phase 3 type with no model yet): what
-lies behind it is marked `(load not propagated: frontier is not modelled
-yet)`, with no percentage when nothing else reaches it and a lower bound (`≥1%`) otherwise.
+The paper load follows every node type's onward load since phase 3 (the URL frontier was the
+last it did not): no check line is marked `(load not propagated: ...)` any more.
 
 What runs today: clients, services, load balancers, rate limiters, caches (a fixed or a
 Che hit ratio), SQL databases (primary, read replicas, shards), CDNs and blob stores (sized in
@@ -247,7 +246,10 @@ machines on a ring whose hottest machine is its own queue, every request sent to
 answered at the W-th or R-th fastest of its own replica set and lost when fewer answer), search indexes (ch. 13's trie database, served like a
 service at the type's 5k/s and 5 ms; its rebuild is not modelled) and notification fan-outs (ch.
 10: a service that drops a `dedup` share as duplicates, counted apart as `deduplicated/s`, and
-publishes the rest to its channels' queues). These eleven scenarios run end to end:
+publishes the rest to its channels' queues) and URL frontiers (ch. 9's: a prioritiser at its
+`capacity`, the URLs handed to the downloaders' pool, which drains at most `hosts × politeness`,
+and the frontier's lag read off that pool; an external sink's `politeness` caps it the same way
+over the frontier's hosts). These twelve scenarios run end to end:
 
 - [`tutorial/hello`](scenarios/tutorial/hello/), [`tutorial/chain`](scenarios/tutorial/chain/):
   one service, then two in a chain: the queueing basics.
@@ -289,16 +291,21 @@ publishes the rest to its channels' queues). These eleven scenarios run end to e
   sizing (the notification servers from 140 %, the user database's replicas from 173 %, the iOS
   pool to 260 workers to drain the blast within 5 minutes, the providers' quotas).
 
-The one phase 3 type still to model (URL frontiers) already validates and appears in `explain`
-with its resolved numbers, but `estimate`, `run` and `sweep` stop with "which run/estimate do not
-support yet" and exit 1, as do the book systems that need it (a WebSocket gateway, a service
-discovery and a notification fan-out run since phase 3; chat-system and google-drive now stop at a
-gateway that states no connection level). The READMEs of the three book systems that do not run yet
-(chat-system, google-drive, web-crawler) open with their status: the exact refusal, what `explain` shows today (its red checks and the nodes it cannot reach
-yet) and what phase 3 will model. Scripted faults run (`faults:`: a node or some of its replicas down, a capacity loss, a
-latency spike, a traffic spike, a cache flush, a datacenter down; `estimate` shows the steady
-state without them); retries and `on: failure` steps are phase 3 too; kv partitions are a phase 4
-backlog item.
+- [`book/web-crawler`](scenarios/book/web-crawler/): ch. 9's crawl loop over 6 hours: seeds, the
+  URL frontier (a 5k/s prioritiser, 10M hosts at one request a host a second), 1000 downloaders
+  that retry a failed fetch twice, DNS, the content and URL-seen filters. It fails both SLOs **on
+  purpose** (exit 2): each fetched page brings back 0.7 × 50 × 0.1 = 3.5 new URLs, a loop of gain
+  above 1, so the frontier is offered 4.38k URLs/s against the downloaders' 2000, their
+  utilization is 1 and the frontier's lag reaches 7.13 h against 30 minutes.
+
+Every node type has a model since phase 3 (a WebSocket gateway, a service discovery, a
+notification fan-out and a URL frontier were its last four). chat-system and google-drive validate
+and appear in `explain`, but `estimate`, `run` and `sweep` stop at a gateway that states no
+connection level yet and exit 1; each of those two READMEs opens with its status: the exact
+refusal, what `explain` shows today and what is still to come. Scripted faults run (`faults:`: a
+node or some of its replicas down, a capacity loss, a latency spike, a traffic spike, a cache
+flush, a datacenter down; `estimate` shows the steady state without them); retries and `on:
+failure` steps are phase 3 too; kv partitions are a phase 4 backlog item.
 
 ## Toolchain
 
