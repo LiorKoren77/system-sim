@@ -9,6 +9,9 @@
 // CMake 3.28 rewrites every module map file after any edit and so recompiles the whole library
 // regardless; the split still pays there, each importer reading a BMI half the size. Numbers:
 // the phase 3 plan, Task 3.)
+// C++20 global module fragment: `module;` opens the part of the unit before the module declaration,
+// where the std headers are #included, so that their declarations stay in the global module
+// instead of being attached to simsys.graph (src/core/core.cppm has the longer note).
 module;
 // No <chrono> although an implementation unit may include it (CLAUDE.md §3's first defect binds
 // interfaces only): these definitions moved here from graph.cppm unchanged, and compare SimTime
@@ -873,9 +876,10 @@ struct Call {
 // along each `then` step that carries a share of the op. A node with `ops` steps calls what its
 // resolved hops (Graph::service_hops) say with a positive fraction: an `on: miss` step is a
 // call for the requests that miss, one that never fires (fraction 0) is none.
-// Pattern: Adapter — the forwarders' routes, the caches' backend shares and the resolved
-// hops are re-expressed as the steps the search below walks, keyed by the call they belong
-// to, so the search needs no case per node type.
+// A normalisation into one common representation (no interface is wrapped, so no pattern label):
+// the forwarders' routes, the caches' backend shares and the resolved hops are re-expressed as
+// the steps the search below walks, keyed by the call they belong to, so the search needs no case
+// per node type.
 using ForwardedSteps = std::map<Call, std::vector<model::Step>>;
 
 void add_hop_steps(const Graph& g, std::size_t node, ForwardedSteps& calls) {

@@ -68,11 +68,13 @@ struct NodeSummary {
   // (engine::NodeSample::committed_writes_per_s), time-averaged the same way: what the missed
   // writes above are a share of. Empty for every node that is not a database.
   std::optional<double> mean_committed_writes_per_s{};
-  // A message queue's peak lag over the observed steps, in seconds (engine::NodeSample::
-  // queue_lag_s: its slowest consumer group's wait, max(k × Wq, backlog / capacity)): the PEAK, not
-  // the mean, since a lag bound is a promise about the worst moment (a notification an hour late is
-  // late whatever the day's average was). What the `queue_lag` SLO observes (spec §19 entry 14).
-  // Empty for every node that is not a message queue.
+  // A message queue's or a frontier's peak lag over the observed steps, in seconds
+  // (engine::NodeSample::queue_lag_s: its slowest consumer group's wait, max(k × Wq, backlog /
+  // capacity)): the PEAK, not the mean, since a lag bound is a promise about the worst moment (a
+  // notification an hour late is late whatever the day's average was). What the `queue_lag` SLO
+  // observes (spec §19 entry 14). Infinite for an unbounded lag (estimate's, a backlog that grows
+  // for ever); empty for every node that is neither. The JSON writes null for both, an infinity
+  // having no JSON number (the schema's key table says how to tell them apart: by the node's type).
   std::optional<double> peak_queue_lag_s{};
   // A worker pool's dead letters (engine::NodeSample::dead_lettered_per_s: the jobs whose last
   // retry at an external sink failed, phase 3 spec §6.2): their total over the observed steps
@@ -309,6 +311,8 @@ class Summary {
   // cache is full again, which only the run finds out, so session::run_summary hands the records
   // again at every step; the run's Summary and its twin's both watch the same records, so that
   // set_faults can compare them step by step.
+  // C++20 std::span<const T>: a non-owning view of contiguous elements, so callers can pass a
+  // vector, an array or `{}` without a copy and without a template.
   void watch_faults(std::span<const engine::FaultRecord> records);
   // After the run: one block per record (engine::Simulation::fault_records, in `at` order),
   // replacing any held, each with what the fault did to the SLOs against `twin`, the Summary of the
@@ -343,7 +347,7 @@ class Summary {
     double replication_dropped{};  // Σ replication_dropped_per_s·dt (writes, per replica)
     double committed_writes{};     // Σ committed_writes_per_s·dt (writes, per shard)
     double replication_seen_s{};   // Σ dt over the steps that report the two above
-    std::optional<double> peak_queue_lag_s{};  // the largest queue_lag_s: message queues only
+    std::optional<double> peak_queue_lag_s{};  // the largest queue_lag_s: queues and frontiers
     std::optional<double> dead_lettered{};     // Σ dead_lettered_per_s·dt: worker pools only
     std::optional<double> deduplicated{};  // Σ deduplicated_per_s·dt: notification fanouts only
     std::optional<double> republished{};   // Σ republished_per_s·dt: message queues only
@@ -453,8 +457,7 @@ class Summary {
   std::vector<FaultBlock> faults_{};    // set_faults
 };
 
-// C++20 std::span<const T>: a non-owning view of contiguous elements, so callers can pass
-// a vector, an array or `{}` (no SLOs) without a copy and without a template.
+// The SLOs as a std::span (watch_faults has the note): a vector, an array or `{}` (no SLOs).
 [[nodiscard]] std::vector<SloResult> evaluate_slos(const Summary& summary,
                                                    std::span<const model::SloSpec> slos);
 [[nodiscard]] bool all_pass(std::span<const SloResult> results);  // skipped counts as pass
@@ -535,8 +538,8 @@ struct OpBands {
 };
 
 // One node: the node table's numbers across the runs (NodeSummary's fields), `dead_lettered_per_s`
-// only for a worker pool, `peak_queue_lag_s` only for a message queue, and in how many runs the
-// node was unavailable at some step.
+// only for a worker pool, `peak_queue_lag_s` only for a message queue or a frontier, and in how
+// many runs the node was unavailable at some step.
 struct NodeBands {
   std::string id{};
   Band mean_rho{};
@@ -627,8 +630,8 @@ struct ReplicationSummary {
 // `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,
 // deduplicated_per_s,latency_ms,zone,queue_lag_s,connections` (`dead_lettered_per_s` empty except
 // on a worker pool's rows, `deduplicated_per_s` except on a notification fanout's, `queue_lag_s`
-// except on a message queue's, `connections` except on a ws_gateway's), then one per link with a
-// bandwidth, its `from->to` in the node column, in megabytes.
+// except on a message queue's or a frontier's, `connections` except on a ws_gateway's), then one
+// per link with a bandwidth, its `from->to` in the node column, in megabytes.
 // The header is written on construction; the column rules are at SeriesWriter::observe in
 // report.cpp.
 // Pattern: Observer, like Summary. `out` and `g` must outlive the writer.

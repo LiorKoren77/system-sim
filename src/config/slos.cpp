@@ -163,8 +163,9 @@ CheckResult check_queue_lag_target(const Site& site, const YAML::Node& entry,
   if (node.type == model::NodeType::message_queue || node.type == model::NodeType::frontier) {
     return {};
   }
-  return site.fail(entry["node"], std::format("queue_lag needs a message_queue node ('{}' is a {})",
-                                              node.id, model::to_string(node.type)));
+  return site.fail(entry["node"],
+                   std::format("queue_lag needs a message_queue or frontier node ('{}' is a {})",
+                               node.id, model::to_string(node.type)));
 }
 
 // A dead-letter rate is a worker pool's (phase 3 spec §6.2): its dead letters over the jobs

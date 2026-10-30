@@ -2497,17 +2497,28 @@ class KvClusterBehaviour {
 //    fault with the dropped ones (the app tries again once the tier is back).
 // When a fault clears, its waiting users come back. Each client notices its socket is gone and
 // tries again after a backoff; the backoffs spread the D waiting users EVENLY over
-// `reconnect_within` W (30 s by default, chosen), so for W seconds from the fault's end
-//   connects = λ + D / W                                   (the storm: the dropped users' return)
-// on top of the users' own connects λ (the engine adds D / W to the gateway's `connect` arrivals
-// each step, as it adds the heartbeats). That is the thundering herd: a whole tier's level, which
-// built up over a session, asks to come back within W. 100k connections over 30 s are 3.3k
-// connects a second, 34 times a usual 100/s; and as the level refills, its heartbeats come back
-// with it, so the gateway's load peaks where the storm and the recovered level's pings meet. A
-// shorter W is a steeper storm (D / 10 s is three times D / 30 s): why clients spread their
-// reconnects with a jittered backoff instead of all retrying at once. A storm still running when
-// another fault clears hands its connects not yet back to the new one, spread over its W. Two
-// rules keep every user:
+// `reconnect_within` W (30 s by default, chosen), and a user still waiting for their turn goes on
+// ending the session meanwhile, at the same rate 1 / session, so the one whose turn is u seconds
+// into the window is still there to reconnect with probability e^{−u / session} (the phase 3
+// review's decision 1: before it, a user waiting their turn ended no session, and the level stood
+// above the fault-free run's by about D × W / (2 × session) after every storm). For W seconds from
+// the fault's end
+//   connects(u) = λ + D / W × e^{−u / session}            (the storm: the dropped users' return,
+//                                                          thinned by the sessions that end first)
+// on top of the users' own connects λ (the engine adds the storm's to the gateway's `connect`
+// arrivals each step, as it adds the heartbeats: a step gets the integral of the storm over the
+// part of it the window covers, storm_in_step), so the users who come back are
+//   back = ∫₀^W D / W × e^{−u / session} du = D × session / W × (1 − e^{−W / session})
+// (97.9k of 99.4k at W = 30 s and a session of 1000 s; the fault block prints `back`:
+// users_back). That is the thundering herd: a whole tier's level, which built up over a session,
+// asks to come back within W. 100k connections over 30 s are 3.3k connects a second, 34 times a
+// usual 100/s; and as the level refills, its heartbeats come back with it, so the gateway's load
+// peaks where the storm and the recovered level's pings meet. A shorter W is a steeper storm
+// (D / 10 s is three times D / 30 s): why clients spread their reconnects with a jittered backoff
+// instead of all retrying at once. A storm still running when another fault clears hands its users
+// not yet back (and still there) to the new one, spread over its W; each fault keeps its share of
+// the storm's connects, which the fault block counts as its users back. Two rules keep every
+// user:
 //  - a storm running when every replica goes down again STOPS: its connects not yet back, and the
 //    users retrying (below), wait for that outage like the users it drops;
 //  - a reconnect the gateway refuses (the cap) or drops (its room full) is not a user lost: the
@@ -2521,11 +2532,8 @@ class KvClusterBehaviour {
 // (every dropped user comes back unless the session ends first), users of dead replicas who
 // reconnect to the survivors before the fault clears (they wait for its end), the users' own
 // connects that the survivors' smaller cap refuses (refused as at a full tier: only a reconnect
-// is retried), a fixed level (its devices are nobody's to reconnect: it is not dropped), a
-// capacity fault (its servers are slow, not dead: no socket closes), and that the storm's own
-// users end no session while they wait their turn within W (W / 2 on average: after the storm
-// the level stands above the fault-free run's by about D × W / (2 × session), 1.5 % at 30 s and
-// 1000 s, closing with the session's time constant).
+// is retried; on the phase 4 backlog), a fixed level (its devices are nobody's to reconnect: it
+// is not dropped), and a capacity fault (its servers are slow, not dead: no socket closes).
 //
 // What it ignores: the memory a connection costs (the book's 10 KB per connection, so 100k
 // connections are 1 GB: the cap stands for it); which server a user is on (the service-discovery
@@ -2544,6 +2552,14 @@ class KvClusterBehaviour {
 struct Outage {
   std::size_t fault{};
   double share{};
+};
+
+// The users one fault's storm brought back in a step (WsGatewayBehaviour::users_back): which fault
+// (an Outage's), and how many of the storm's connects of the step are its users'. The engine hands
+// them to the fault log, whose block names each fault's users back (engine::FaultAfter).
+struct UsersBack {
+  std::size_t fault{};
+  double users{};
 };
 
 class WsGatewayBehaviour {
@@ -2625,13 +2641,19 @@ class WsGatewayBehaviour {
   void take_back_lost_connects(const ConnectTally& connects, SimTime dt);
 
   // The storm's connects in this step, per second: what the engine adds to the gateway's `connect`
-  // arrivals (0 outside a storm). Its part of the step [now, now + dt) that the storm covers, so a
-  // `reconnect_within` that is not a whole number of steps still brings back exactly D, and the
-  // retrying users who come back in the step.
+  // arrivals (0 outside a storm). The storm's integral over the part of the step [now, now + dt)
+  // it covers (storm_in_step), so a `reconnect_within` that is not a whole number of steps still
+  // brings back exactly D × session / W × (1 − e^{−W / session}), and the retrying users who come
+  // back in the step.
   [[nodiscard]] double storm_connects_per_s() const { return storm_now_; }
 
-  // The connections the faults dropped at the start of this step (0 on every other step): the
-  // storm's size, which the record shows (engine::NodeSample::connections_dropped).
+  // The users the running storm brought back in this step, per fault (the storm's own connects ×
+  // dt, each fault's share of them; not the retried reconnects, which are users already counted):
+  // what the fault block adds up as each fault's users back. Empty outside a storm.
+  [[nodiscard]] std::span<const UsersBack> users_back() const { return back_now_; }
+
+  // The connections the faults dropped at the start of this step (0 on every other step), which
+  // the record shows (engine::NodeSample::connections_dropped).
   [[nodiscard]] double dropped_connections() const { return dropped_now_; }
 
   // The share of `op`'s arrivals the faults lose: r / R for a message or a delivery (it travels
@@ -2671,6 +2693,12 @@ class WsGatewayBehaviour {
     double share{};
     double users{};
   };
+  // A fault whose users the running storm carries, and its share of the storm (the shares of the
+  // faults whose storms ran into one another add up to 1: start_storm).
+  struct StormOwner {
+    std::size_t fault{};
+    double share{};
+  };
 
   [[nodiscard]] double admit(double connects, double dt_s);
   [[nodiscard]] double steady_admit(double connects);
@@ -2682,9 +2710,11 @@ class WsGatewayBehaviour {
   void hold_storm_for_outage(double now_s);
   [[nodiscard]] Waiting* whole_outage();
   [[nodiscard]] double share_down() const;
-  void start_storm(double users, double now_s);
+  void start_storm(double users, std::size_t fault, double now_s);
+  void stop_storm();
   [[nodiscard]] double storm_left(double now_s) const;
   [[nodiscard]] double storm_in_step(double now_s, double dt_s) const;
+  void share_out_users_back(double users);
   [[nodiscard]] double retries_in_step(double dt_s);
 
   ServiceBehaviour service_;
@@ -2698,15 +2728,19 @@ class WsGatewayBehaviour {
   bool steady_{false};                 // use_steady_level
   // The faults (follow_outages): the users each one dropped that wait for it to clear, the share
   // of the replicas down now, 1 − Π (1 − r_i / R), the connections dropped at the start of this
-  // step, the running storm, `storm_rate_` connects a second over [storm_from_s_, storm_until_s_),
-  // the users whose reconnect was refused or dropped and who try again (`retrying_`), this step's
-  // storm connects, both together (storm_now_), and the connects route refused this step.
+  // step, the running storm, `storm_rate_` connects a second over [storm_from_s_, storm_until_s_)
+  // before the thinning (D / W) and the faults whose users it carries, the users it brought back
+  // this step per fault, the users whose reconnect was refused or dropped and who try again
+  // (`retrying_`), this step's storm connects, both together (storm_now_), and the connects route
+  // refused this step.
   std::vector<Waiting> waiting_{};
   double down_share_{};
   double dropped_now_{};
   double storm_rate_{};
   double storm_from_s_{};
   double storm_until_s_{};
+  std::vector<StormOwner> storm_owners_{};
+  std::vector<UsersBack> back_now_{};
   double retrying_{};
   double storm_now_{};
   double refused_now_{};
@@ -3932,14 +3966,16 @@ void WsGatewayBehaviour::use_steady_level() {
   admitted_share_ = 1.0;
   // The long run has no fault (estimate's copy runs none): no outage, no storm.
   waiting_.clear();
-  down_share_ = dropped_now_ = storm_rate_ = retrying_ = storm_now_ = refused_now_ = 0.0;
+  stop_storm();
+  back_now_.clear();
+  down_share_ = dropped_now_ = retrying_ = storm_now_ = refused_now_ = 0.0;
 }
 
 // One step's news of the faults (the class comment's reconnect storm), in this order: the users
 // waiting end their sessions for the step that has passed; a fault new in `active` drops its
 // share of the live connections; a fault no longer in it releases its users; with every replica
-// down a running storm stops; then the step's storm connects are set. Outside every fault the list
-// is empty, nothing waits and nothing here moves.
+// down a running storm stops; then the step's storm connects are set, and each fault's share of
+// them (users_back). Outside every fault the list is empty, nothing waits and nothing here moves.
 void WsGatewayBehaviour::follow_outages(std::span<const Outage> active, SimTime now, SimTime dt) {
   const double now_s = seconds(now);
   const double dt_s = seconds(dt);
@@ -3953,7 +3989,9 @@ void WsGatewayBehaviour::follow_outages(std::span<const Outage> active, SimTime 
   release_cleared(active, now_s);
   down_share_ = share_down();
   if (down_share_ >= 1.0) hold_storm_for_outage(now_s);
-  storm_now_ = storm_in_step(now_s, dt_s) + retries_in_step(dt_s);
+  const double storm = storm_in_step(now_s, dt_s);
+  share_out_users_back(storm * dt_s);
+  storm_now_ = storm + retries_in_step(dt_s);
 }
 
 // The engine's tally of the step's connects (ConnectTally), after route: the storm's share of
@@ -4008,23 +4046,25 @@ void WsGatewayBehaviour::release_cleared(std::span<const Outage> active, double 
       continue;
     }
     const double users = waiting_[i].users;
+    const std::size_t fault = waiting_[i].fault;
     waiting_.erase(waiting_.begin() + static_cast<std::ptrdiff_t>(i));
     if (Waiting* outage = whole_outage()) {
       outage->users += users;
     } else if (users > 0.0) {
-      start_storm(users, now_s);
+      start_storm(users, fault, now_s);
     }
   }
 }
 
-// Every replica is down (decision 1 of the Task 15 review): the storm's connects not yet back and
+// Every replica is down (decision 1 of the Task 15 review): the storm's users not yet back and
 // the retrying users have no server, so they wait for the outage that holds the tier, and the storm
-// stops.
+// stops. They are that outage's users now: its storm brings them back, and its block counts them.
 void WsGatewayBehaviour::hold_storm_for_outage(double now_s) {
   Waiting* outage = whole_outage();
   if (outage == nullptr) return;
   outage->users += storm_left(now_s) + retrying_;
-  storm_rate_ = retrying_ = 0.0;
+  stop_storm();
+  retrying_ = 0.0;
 }
 
 // A fault that holds every replica down (its share is 1), the first such; nullptr when none does.
@@ -4043,27 +4083,60 @@ double WsGatewayBehaviour::share_down() const {
   return 1.0 - survivors;
 }
 
-// `users` come back from `now_s`, evenly over W, users / W connects a second. A storm still running
-// (an earlier fault's) hands its connects not yet back to this one, so that none is lost or counted
-// twice.
-void WsGatewayBehaviour::start_storm(double users, double now_s) {
-  storm_rate_ = (users + storm_left(now_s)) / reconnect_within_s_;
+// `users` of `fault` come back from `now_s`, evenly over W, users / W connects a second before the
+// thinning (storm_in_step). A storm still running (an earlier fault's) hands its users not yet back
+// to this one, so that none is lost or counted twice, and with them its faults' shares: the
+// storm's connects are theirs in proportion, carried / (users + carried) to the earlier faults
+// (scaled down from what they had) and users / (users + carried) to this one.
+void WsGatewayBehaviour::start_storm(double users, std::size_t fault, double now_s) {
+  const double carried = storm_left(now_s);
+  const double total = users + carried;
+  if (carried <= 0.0) storm_owners_.clear();
+  for (auto& owner : storm_owners_) owner.share *= carried / total;
+  storm_owners_.push_back(StormOwner{.fault = fault, .share = users / total});
+  storm_rate_ = total / reconnect_within_s_;
   storm_from_s_ = now_s;
   storm_until_s_ = now_s + reconnect_within_s_;
 }
 
-// The running storm's connects not yet sent at `now_s`: its rate × the time it has left.
-double WsGatewayBehaviour::storm_left(double now_s) const {
-  return storm_rate_ * std::max(storm_until_s_ - now_s, 0.0);
+// No storm running: no rate, no faults whose users it carries.
+void WsGatewayBehaviour::stop_storm() {
+  storm_rate_ = 0.0;
+  storm_owners_.clear();
 }
 
-// The storm's connects in the step [now_s, now_s + dt_s), per second: its rate times the part of
-// the step it covers, overlap / dt (1 inside it, 0 outside, a fraction at its end when W is not a
-// whole number of steps).
+// The running storm's users not yet back at `now_s` and still there: those whose turn is in the
+// time it has left, rate × (until − now), each of whom has gone on ending the session since the
+// storm started, × e^{−(now − from) / session} (the same thinning as storm_in_step's).
+double WsGatewayBehaviour::storm_left(double now_s) const {
+  const double waited_s = std::max(now_s - storm_from_s_, 0.0);
+  return storm_rate_ * std::max(storm_until_s_ - now_s, 0.0) * std::exp(-waited_s / session_s_);
+}
+
+// The storm's connects in the step [now_s, now_s + dt_s), per second (the class comment): the
+// integral of rate × e^{−u / session} over the part [a, b) of the step the window covers, u
+// measured from the storm's start,
+//   rate × session × (e^{−a / session} − e^{−b / session}) / dt
+// (all of the step inside the window, none outside it, a part at its end when W is not a whole
+// number of steps). Written e^{−a / session} × −expm1(−(b − a) / session): the difference of two
+// close exponentials loses digits that std::expm1 keeps (docs/study/numerics.md).
 double WsGatewayBehaviour::storm_in_step(double now_s, double dt_s) const {
   if (storm_rate_ <= 0.0) return 0.0;
-  const double overlap = std::min(now_s + dt_s, storm_until_s_) - std::max(now_s, storm_from_s_);
-  return overlap > 0.0 ? storm_rate_ * overlap / dt_s : 0.0;
+  const double a = std::max(now_s, storm_from_s_) - storm_from_s_;
+  const double b = std::min(now_s + dt_s, storm_until_s_) - storm_from_s_;
+  if (b <= a) return 0.0;
+  const double users =
+      storm_rate_ * session_s_ * std::exp(-a / session_s_) * -std::expm1(-(b - a) / session_s_);
+  return users / dt_s;
+}
+
+// The step's `users` back (the storm's own connects × dt), each fault's share of them (users_back).
+void WsGatewayBehaviour::share_out_users_back(double users) {
+  back_now_.clear();
+  if (users <= 0.0) return;
+  for (const auto& owner : storm_owners_) {
+    back_now_.push_back(UsersBack{.fault = owner.fault, .users = users * owner.share});
+  }
 }
 
 // The retrying users who come back in this step, per second: each waits an exponential time of

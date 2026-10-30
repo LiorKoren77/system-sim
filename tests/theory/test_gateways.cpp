@@ -121,6 +121,9 @@ struct Shape {
   int replicas{1};
   std::optional<std::int64_t> connections{};  // a fixed level (spec: the google-drive case)
   std::optional<double> fanout{};
+  // C++20 designated initializers: `.name = ...` names each member being set, in declaration
+  // order, and leaves the rest at their defaults. Replaces positional braces (which break
+  // silently when members are reordered); here a step reads like the YAML it stands for.
   std::vector<Step> send_steps{Step{.to = "q", .op = "publish"}};
   SimTime step{100ms};
   Rate capacity{1'000'000};
@@ -131,9 +134,7 @@ constexpr std::size_t gateway_index = 1;
 constexpr std::size_t q_index = 2;
 constexpr std::size_t presence_index = 3;
 
-// C++20 designated initializers: `.name = ...` names each member being set, in declaration
-// order, and leaves the rest at their defaults. Replaces positional braces (which break
-// silently when members are reordered); here a scenario reads like the YAML it stands for.
+// Designated initializers again (Shape has the note): a scenario reads like its YAML.
 Scenario gateway_scenario(const Shape& shape) {
   Scenario s{.name = "gateway", .version = 1, .duration = 60s, .step = shape.step};
   auto client_ops = shape.client_ops;

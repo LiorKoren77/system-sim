@@ -13,6 +13,9 @@
 // interface (Simulation fills them) and the partition :fault_log (FaultLog reads them), and a
 // partition cannot import the primary interface that re-exports it (an import cycle): the records
 // must live below both.
+// C++20 global module fragment: `module;` opens the part of the unit before the module declaration,
+// where the std headers are #included, so that their declarations stay in the global module
+// instead of being attached to simsys.engine (src/core/core.cppm has the longer note).
 module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this unit imports other modules (GCC 14.2 'Bad
 // file data' bug, CLAUDE.md §3).
@@ -166,9 +169,10 @@ struct NodeSample {
   std::optional<double> connections{};
   // The connections the faults that struck a ws_gateway at the start of this step dropped (a
   // node_down of it, a dc_down of its datacenter: its dead servers' sockets, gone at once: the
-  // reconnect storm, behaviours::WsGatewayBehaviour), which `connections` above no longer holds;
-  // the storm's size (FaultAfter::reconnect_storm_connections, each fault's part of it). Empty on
-  // every step without a drop, and on every other node.
+  // reconnect storm, behaviours::WsGatewayBehaviour), which `connections` above no longer holds.
+  // Not the storm's size: the users who come back are fewer, those whose sessions end while they
+  // wait do not (FaultAfter::reconnect_storm_connections). Empty on every step without a drop, and
+  // on every other node.
   std::optional<double> connections_dropped{};
   // The requests sent this step to the node's DEAD replicas by callers a service discovery still
   // hands their addresses (engine::FaultSchedule's header: the failover after a node_down of a node

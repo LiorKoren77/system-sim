@@ -175,7 +175,11 @@ class Simulation {
   // What each scripted fault has cost so far (FaultRecord): one record per fault of the scenario,
   // in `at` order, filled by every `step` (a fault that has not started yet has a record of
   // zeros). session::run_summary hands them to the report after the run (Summary::set_faults).
-  // Empty without faults, and in estimate()'s steady state, which has none.
+  // Empty without faults, and in estimate()'s steady state, which has none. Final at the end of the
+  // run: a recovery is the step after the last one outside 1 % of the twin (FaultRecord's header).
+  // C++20 std::span<const T>: a non-owning view of contiguous elements (here the log's vector),
+  // replacing a `const std::vector<T>&` that would tie every caller to the container the class
+  // happens to keep, or a (pointer, count) pair.
   [[nodiscard]] std::span<const FaultRecord> fault_records() const { return fault_log_.records(); }
 
   // The fault-free twin's record of the latest `step` (FaultRecord's header: the same scenario
@@ -440,9 +444,8 @@ class Simulation {
 
   [[nodiscard]] StepRecord evaluate(SimTime now, SimTime dt, Mode mode);
   void forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& record);
-  // C++20 std::span<T>: a non-owning view of contiguous elements (a whole array or vector, or
-  // the front of one), replacing a (pointer, count) pair or a `std::vector&` that would force the
-  // caller to own a vector. Here the step's node samples, which this fills in place.
+  // A std::span<T> of mutable elements (fault_records has the note): the step's node samples, which
+  // this fills in place.
   void mark_unbounded_backlogs(std::span<NodeSample> samples) const;
   void record_queue_lags(std::span<NodeSample> samples) const;
   void record_retry_flows(std::span<NodeSample> samples) const;
@@ -545,6 +548,10 @@ class Simulation {
   // step (send). Both empty in estimate()'s scratch copy, whose steps are no run's.
   FaultLog fault_log_{};
   std::vector<FaultLog::LinkTally> link_tallies_{};
+  // The users each fault's reconnect storm brought back in the latest step, per gateway
+  // (follow_gateway_outages, from behaviours::WsGatewayBehaviour::users_back), for the fault log.
+  // Empty outside a storm.
+  std::vector<FaultLog::UsersBack> users_back_{};
   // The fault-free twin (twin_record) and its latest record; empty without faults, in the twin
   // itself and in estimate()'s scratch copy. A vector used as an optional, the one way to hold a
   // member of the class's own, still incomplete, type here: std::vector accepts an incomplete
@@ -725,6 +732,9 @@ namespace {
 // latency in seconds and the time until it is back from an outage. The identity condition gives the
 // identity derating (seconds(0) is 0, 1 × 1 is 1).
 [[nodiscard]] fluid::Derating derating_of(const Condition& condition, double part_factor = 1.0) {
+  // C++20 designated initializers: `Derating{.capacity_factor = ...}` names the member it sets and
+  // leaves the others at their defaults, replacing positional braces where a reader must count
+  // members against the struct (and same-typed doubles, as here, could swap silently).
   return fluid::Derating{.capacity_factor = condition.capacity_factor * part_factor,
                          .extra_service_s = seconds(condition.extra_latency),
                          .back_in_s = condition.back_in_s};
@@ -1070,9 +1080,7 @@ std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Gr
 Simulation::Simulation(const graph::Graph& g, int seed, Faults faults)
     : order_{g.topological_order().begin(), g.topological_order().end()}, step_{g.scenario().step} {
   for (std::size_t i = 0; i < g.nodes().size(); ++i) nodes_.push_back(make_node(g, i, seed));
-  // C++20 designated initializers: `Link{.line = ...}` names the member it sets and leaves
-  // the others at their defaults, replacing positional braces where a reader must count
-  // members against the struct (and same-typed doubles, as in CopyGroup, could swap silently).
+  // Designated initializers again (derating_of has the note): `Link{.line = ..., .pipe = ...}`.
   for (std::size_t i = 0; i < g.links().size(); ++i) {
     links_.push_back(
         Link{.line = DelayLine{line_steps(g.links()[i])}, .pipe = make_pipe(g, i, pipe_count_)});
@@ -1209,6 +1217,13 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index,
     // ZooKeeper) is one more: a service answering `lookup` at the type's 50k/s and 0.5 ms. What
     // makes it more than a service is what its lookups do to the callers when a node they looked
     // up loses replicas (the failover: FaultSchedule's header, fail_over_callers), not its queue.
+    // The baseline it is measured against, said plainly: a replicated node reached WITHOUT a
+    // lookup (and without a load_balancer in front) is routed as if an ideal, health-checked
+    // router stood in front of it, which sends nothing to a dead replica from the fault's first
+    // step. So adding a service_discovery to a scenario ADDS the failover's loss (the dead share
+    // for `failover`) to a node_down that the bare replicas absorbed; the discovery is not worse
+    // than "no discovery", the bare replicas are optimistic. A default detection delay for plain
+    // replicas is on the phase 4 backlog (the phase 3 review).
     case model::NodeType::service:
     case model::NodeType::service_discovery:
     case model::NodeType::search_index:
@@ -1492,7 +1507,8 @@ StepRecord Simulation::step(SimTime now, SimTime dt) {
   fault_log_.observe({.run = record,
                       .twin = twin_record_,
                       .run_links = link_tallies_,
-                      .twin_links = twin.link_tallies_},
+                      .twin_links = twin.link_tallies_,
+                      .users_back = users_back_},
                      dt, faults_);
   return record;
 }
@@ -1688,8 +1704,10 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
 // its datacenter): a new one drops that share of its connections, one gone releases their
 // reconnect storm (behaviours::WsGatewayBehaviour::follow_outages). Advance mode only: a storm is a
 // moment of the run, and estimate's copy has no faults. The list is empty without such a fault,
-// and then nothing moves.
+// and then nothing moves. What each fault's storm brings back in the step is kept for the fault
+// log (users_back_).
 void Simulation::follow_gateway_outages(SimTime now, SimTime dt) {
+  users_back_.clear();
   for (std::size_t index = 0; index < nodes_.size(); ++index) {
     auto* gateway = std::get_if<behaviours::WsGatewayBehaviour>(&nodes_[index].behaviour);
     if (gateway == nullptr) continue;
@@ -1698,6 +1716,10 @@ void Simulation::follow_gateway_outages(SimTime now, SimTime dt) {
       outages.push_back(behaviours::Outage{.fault = down.fault, .share = down.share});
     }
     gateway->follow_outages(outages, now, dt);
+    for (const auto& back : gateway->users_back()) {
+      users_back_.push_back(
+          FaultLog::UsersBack{.gateway = index, .fault = back.fault, .users = back.users});
+    }
   }
 }
 

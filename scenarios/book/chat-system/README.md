@@ -85,11 +85,11 @@ author's machine).
     status  metric       node       op    observed   max
     PASS    p99_latency  users      send  4.82ms     300ms
     PASS    queue_lag    message_q  -     <1us       10s
-    PASS    drop_rate    -          -     9.326e-05  0.001
+    PASS    drop_rate    -          -     9.328e-05  0.001
   ```
 
-  The busiest copies: `chat_servers` 0.5384 on average and 1 at its peak (red for 61.9 s: the
-  minute it is down and 1.9 s of the storm); `message_store` 0.834, `presence` 0.8299, `sync_workers` 0.7031,
+  The busiest copies: `chat_servers` 0.5383 on average and 1 at its peak (red for 60.3 s: the
+  minute it is down and 0.3 s of the storm); `message_store` 0.834, `presence` 0.8038, `sync_workers` 0.7031,
   `push` 0.675.
 
   | op | offered/s (day mean) | mean | p50 | p95 | p99 |
@@ -110,58 +110,63 @@ author's machine).
   ended a session in the minute are as many as those who would have started one (`C × (1 −
   e^(−for/session))` against `λ × session × (1 − e^(−for/session))`, with `C = λ × session`). So
   the storm is 1.617M users again, spread over `reconnect_within` (30 s): 53.9k connects a second
-  on top of the users' own 4.5k, twelve times the usual. As the level refills, its pings come back
-  with it, and the gateway's offered load peaks at the storm's last moment, 93.9 % of the tier,
-  against the 81 % of the 21:00 peak:
+  at first on top of the users' own 4.5k, twelve times the usual. While a user waits for their
+  turn in the window their session goes on ending as it would have, so the one whose turn is `u`
+  seconds in is still there with probability `e^(−u / 6 min)`: the connects fall to 49.6k a second
+  by the window's end, and `1.617M × 6 min / 30 s × (1 − e^(−30 s / 6 min))` = 95.9 % of them,
+  1.551M users, come back. As the level refills, its pings come back with it, and the gateway's
+  offered load peaks at the storm's last moment, 90.5 % of the tier, against the 81 % of the
+  21:00 peak:
 
   ```
   fault 21:30 node_down chat_servers for 1m
     during:   offered 35.98k/s, served 0/s, lost 2.159M attempts (2.154M requests lost for good), backlog 0, drop_rate over its max for 1m
-    after:    no backlog to drain, reconnect storm 1.617M connections over 30s, chat_servers peak 93.9% at 21:31:29.9
-    recovery: back within 1% (every op's p99, every node's rho) at 21:38:58.7 (478.7s after the fault cleared)
+    after:    no backlog to drain, reconnect storm 1.551M users back over 30s, chat_servers peak 90.5% at 21:31:29.9
+    recovery: back within 1% (every op's p99, every node's rho) at 21:31:30 (30s after the fault cleared)
   ```
 
-  (The block's count is the connections the fault dropped; the storm is the users still waiting
-  when it clears, here the same 1.617M to four digits.) The run is back within 1 % of its twin 8
-  minutes after the fault: the storm's users come back with fresh sessions, and while each waits
-  its turn within the 30 s (15 s on average) none of their sessions ends, where the twin's
-  connected users' do: about `15 s / 6 min` = 4 % of them too many, so the level overshoots the
-  twin's and the extra pings decay with the 6-minute session. The day's highest level is that
-  overshoot, 1.680M connections (`simsys run --report json`'s `connections_peak`), above the 1.617M
-  the tier held at 21:30; the JSON's fault object has the storm's numbers unrounded
-  (`"reconnect_storm_connections": 1616857.59...`, `"reconnect_storm_over_s": 30`,
-  `"peak_offered_rho": 0.9392...`, `"peak_offered_rho_at_s": 77489.9`, `"recovered_at_s":
-  77938.7`).
+  (The block's count is the users who come back, the storm's connects.) The run is back within
+  1 % of its twin as the storm ends: as many users come back as the twin still has connected (the
+  sessions that would have ended in the minute and in the window have ended), so the level and
+  its pings are the twin's again. (Before the phase 3 review the
+  storm's users ended no session while they waited their turn, about `15 s / 6 min` = 4 % of them
+  too many: the level overshot the twin's to 1.680M, and the "recovery" at 21:38:58.7 was that
+  overshoot's decay.) The day's highest level is now the evening's own, 1.620M connections
+  (`simsys run --report json`'s `connections_peak`); the JSON's fault object has the storm's
+  numbers unrounded (`"reconnect_storm_connections": 1551047.38...`, `"reconnect_storm_over_s":
+  30`, `"peak_offered_rho": 0.9053...`, `"peak_offered_rho_at_s": 77489.9`, `"recovered_at_s":
+  77490`).
 - **The window is the lesson.** The same day for six values of `reconnect_within` (one `simsys
   run` each: `simsys sweep`'s columns do not read the fault block, and the node table's
   `peak_rho` is the busy fraction, 1 in the fault minute whatever follows):
 
-  | `reconnect_within` | storm connects/s | gateway peak (offered) | at | dropped by `chat_servers` | back within 1 % |
-  |---|---|---|---|---|---|
-  | 10 s | 161.7k | **112 %** | 21:31:09.9 | 2.205M (room 20k full) | 21:31:10.4 |
-  | 20 s | 80.8k | 98.4 % | 21:31:19.9 | 2.159M | 21:36:29.7 |
-  | 30 s (default) | 53.9k | 93.9 % | 21:31:29.9 | 2.159M | 21:38:58.7 |
-  | 40 s | 40.4k | 92.1 % | 21:31:39.9 | 2.159M | 21:40:45.5 |
-  | 50 s | 32.3k | 91.2 % | 21:31:49.9 | 2.159M | 21:42:09.2 |
-  | 60 s | 26.9k | 90.9 % | 21:31:59.9 | 2.159M | 21:43:18.2 |
+  | `reconnect_within` | storm connects/s at first | users back | gateway peak (offered) | at | dropped by `chat_servers` | back within 1 % |
+  |---|---|---|---|---|---|---|
+  | 10 s | 161.7k | 1.594M | **110 %** | 21:31:09.9 | 2.191M (room 20k full) | 21:31:10.3 |
+  | 20 s | 80.8k | 1.572M | 95.8 % | 21:31:19.9 | 2.159M | 21:31:20 |
+  | 30 s (default) | 53.9k | 1.551M | 90.5 % | 21:31:29.9 | 2.159M | 21:31:30 |
+  | 40 s | 40.4k | 1.53M | 87.9 % | 21:31:39.9 | 2.159M | 21:31:40 |
+  | 50 s | 32.3k | 1.509M | 86.3 % | 21:31:49.9 | 2.159M | 21:31:50 |
+  | 60 s | 26.9k | 1.489M | 85.3 % | 21:31:59.9 | 2.159M | 21:32 |
 
-  (Storm connects/s: the 1.617M users still waiting at 21:31, above, over the window; the other
-  columns are each run's fault block and node table.) With every client back within 10 s the
-  tier is offered 112 % of what it can serve: its rooms (1000 requests × 20 servers) fill and it
-  drops 46k more requests than at 30 s, the thundering herd of ch. 12's question. About a third
-  of them are reconnects (the rest pings and messages), and a dropped reconnect is not a user
-  lost: the app tries again after another backoff (the model: a wait of mean
-  `reconnect_within`, 10 s here), so they come back in the seconds after the storm and the level
-  loses nobody (before the Task 15 review they were
-  lost for good, uncounted, which is part of how this row recovered "at once"). Spreading the same
-  1.617M reconnects over 20 s keeps the tier just under 100 %, and every second beyond buys less,
-  because the pings of the refilling level, not the reconnects, are most of the peak (at 60 s the
-  storm adds 27k/s to about 428k/s of pings and messages). The longer windows recover later: the
-  storm's users wait half the window on average without ending a session, so the level
-  overshoots the twin's by about `window / 2 ÷ 6 min` of them (1.4 % at 10 s, 8.3 % at 60 s) and
-  the larger overshoot takes longer to decay; at 10 s it is the smallest. All three SLOs pass at
-  every point. To reproduce one point, edit `reconnect_within` and `simsys run` the file (the table: six such
-  runs, `simsys run` and `simsys run --report json` each).
+  (Storm connects/s at first: the 1.617M users still waiting at 21:31, above, over the window,
+  before the sessions that end in it thin them; users back: the block's count, `1.617M × 6 min ÷
+  window × (1 − e^(−window / 6 min))`, 98.6 % at 10 s and 92.1 % at 60 s; the other columns are
+  each run's fault block and node table.) With every client back within 10 s the tier is offered
+  110 % of what it can serve: its rooms (1000 requests × 20 servers) fill and it drops 32k more
+  requests than at 30 s, the thundering herd of ch. 12's question. About a third of them are
+  reconnects (the rest pings and messages), and a dropped reconnect is not a user lost: the app
+  tries again after another backoff (the model: a wait of mean `reconnect_within`, 10 s here), so
+  they come back in the seconds after the storm and the level loses nobody (before the Task 15 review
+  they were lost for good, uncounted, which is part of how this row recovered "at once").
+  Spreading the reconnects over 20 s keeps the tier under 100 %, and every second beyond buys
+  less, because the pings of the refilling level, not the reconnects, are most of the peak (at
+  60 s the storm adds 27k/s at first to about 428k/s of pings and messages). Every window
+  recovers as its storm ends: the users who come back are the twin's connected users, the
+  longer window losing more of them to sessions that end while they wait (7.9 % at 60 s), as
+  the twin's users end theirs. All three SLOs pass at every point. To reproduce one point, edit
+  `reconnect_within` and `simsys run` the file (the table: six such runs, `simsys run` and
+  `simsys run --report json` each).
 - **Fan-out and the queue.** 31.5k messages/s at the peak are 44.1k copies/s through
   `message_q` and 64 sync workers (70 % busy on paper with the retried pushes); the queue never
   falls behind (`<1us`).
@@ -192,7 +197,7 @@ author's machine).
 - Message ordering, end-to-end encryption, media attachments, the bytes of a frame.
 
 ## Things to try
-- `reconnect_within: 10s`: the table's first row, the tier at 112 % and its rooms full.
+- `reconnect_within: 10s`: the table's first row, the tier at 110 % and its rooms full.
 - `capacity: 10k/s` on `chat_servers` (the file's first number): `explain` reads `peak offered
   405k/s vs 200k/s total capacity  (202%, red)`.
 - `heartbeat: 1s`: five times the pings, without a single message changing: `explain` puts the

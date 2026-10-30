@@ -258,13 +258,16 @@ CheckResult check_factor_is_number(const Site& site, const YAML::Node& entry,
 }
 
 // A capacity fault scales the node's service rate by `factor` in (0, 1): 0 would be a node_down,
-// and 1 or more is no fault (a node that is faster is a different scenario's `capacity`).
+// and 1 or more is no fault (a node that is faster is a different scenario's `capacity`). The
+// message names the open interval and what to write at either end (the phase 3 review: "between
+// 0 and 1" read as if 0 were allowed).
 CheckResult read_capacity_factor(const Site& site, const YAML::Node& entry, model::Fault& fault) {
   if (auto checked = check_factor_is_number(site, entry, fault.kind); !checked) return checked;
   const auto factor = number_value(entry["factor"]);
   if (!factor || !(*factor > 0.0 && *factor < 1.0)) {
     return site.fail(entry["factor"],
-                     "capacity factor must be between 0 and 1 (a gain is the scenario's capacity)");
+                     "capacity factor must be in (0, 1); use node_down for 0 (a "
+                     "gain is the scenario's capacity)");
   }
   fault.factor = *factor;
   return {};

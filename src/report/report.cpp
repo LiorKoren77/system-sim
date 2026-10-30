@@ -644,15 +644,15 @@ void insert_at(Cells& cells, std::size_t column, Value value) {
   return Cell{rate ? with_si_prefix(*rate) : "-"};
 }
 
-// Clients are sources with no queue: their queue columns show "-". A message queue's `peak_lag`
-// is its peak lag after warmup (NodeSummary::peak_queue_lag_s), "-" on every other row. With
-// `columns.connections` the row has the `connections` cell after `peak_lag`: a ws_gateway's open
-// connections at the END of the run (NodeSummary::connections, a level, not a rate), "-" on every
-// other row. With `columns.dead_letters` the row has the `dead_lettered/s` cell too: a worker
-// pool's mean rate of dead letters (NodeSummary::mean_dead_lettered_per_s, 0 without retries), "-"
-// on every other row; with `columns.deduplicated` the `deduplicated/s` cell: a notification
-// fanout's mean rate of duplicates (NodeSummary::mean_deduplicated_per_s, 0 with `dedup: 0`), "-"
-// on every other row.
+// Clients are sources with no queue: their queue columns show "-". A message queue's or a
+// frontier's `peak_lag` is its peak lag after warmup (NodeSummary::peak_queue_lag_s), "-" on every
+// other row. With `columns.connections` the row has the `connections` cell after `peak_lag`: a
+// ws_gateway's open connections at the END of the run (NodeSummary::connections, a level, not a
+// rate), "-" on every other row. With `columns.dead_letters` the row has the `dead_lettered/s` cell
+// too: a worker pool's mean rate of dead letters (NodeSummary::mean_dead_lettered_per_s, 0 without
+// retries), "-" on every other row; with `columns.deduplicated` the `deduplicated/s` cell: a
+// notification fanout's mean rate of duplicates (NodeSummary::mean_deduplicated_per_s, 0 with
+// `dedup: 0`), "-" on every other row.
 [[nodiscard]] Row node_row(const NodeSummary& node, const graph::ResolvedNode& resolved, bool color,
                            NodeColumns columns) {
   const bool client = resolved.spec.type == model::NodeType::client;
@@ -1071,17 +1071,17 @@ constexpr std::string_view op_title =
 }
 
 // The reconnect storm of a fault that killed a ws_gateway's servers (a node_down of it, a dc_down
-// of its datacenter; engine::FaultRecord's header): the connections it dropped, how long they take
-// to come back, and the gateway's peak offered utilisation over the storm with when it was first
-// reached, `reconnect storm 99.33k connections over 30s, gw peak 72% at 01:24:49` (the amount as
-// the block's counts, the percent as the node table's, the time as the block's clock; several
-// gateways of a datacenter named together). Without a step after the fault (the run ended first)
-// the peak is left out.
+// of its datacenter; engine::FaultRecord's header): the users who came back (the storm's connects,
+// not the connections the fault dropped: the users whose sessions ended while they waited do not
+// come back), how long the storm lasts, and the gateway's peak offered utilisation over it with
+// when it was first reached, `reconnect storm 97.89k users back over 30s, gw peak 70.8% at
+// 01:24:49` (the amount as the block's counts, the percent as the node table's, the time as the
+// block's clock; several gateways of a datacenter named together). Without a step after the fault
+// (the run ended first) the peak is left out.
 [[nodiscard]] std::string storm_text(const engine::FaultRecord& r) {
   const auto& after = r.after;
-  std::string text = "reconnect storm " +
-                     amount_text(*after.reconnect_storm_connections, "connections") + " over " +
-                     format_duration(seconds(after.reconnect_storm_over));
+  std::string text = "reconnect storm " + amount_text(*after.reconnect_storm_connections, "users") +
+                     " back over " + format_duration(seconds(after.reconnect_storm_over));
   if (!after.peak_offered_rho || !after.peak_offered_rho_at) return text;
   return text + ", " + after.reconnect_storm_gateways + " peak " +
          percent(*after.peak_offered_rho) + " at " + fault_clock(*after.peak_offered_rho_at);
@@ -1233,7 +1233,8 @@ constexpr std::string_view op_title =
           json_field("replication_dropped_per_s",
                      json_optional_number(n.mean_replication_dropped_per_s)),
           json_field("committed_writes_per_s", json_optional_number(n.mean_committed_writes_per_s)),
-          // seconds; null for every node that is not a message queue
+          // seconds; null for every node that is not a message queue or a frontier, and on one
+          // for an unbounded lag (estimate's, infinite: the schema's JSON key table)
           json_field("peak_queue_lag_s", json_optional_number(n.peak_queue_lag_s))};
 }
 
@@ -1374,7 +1375,8 @@ constexpr std::string_view op_title =
 }
 
 // A gateway's reconnect storm in a fault's `after` (the text's storm_text, unrounded, in seconds):
-// `reconnect_storm_connections`, `reconnect_storm_over_s`, `peak_offered_rho` (the offered
+// `reconnect_storm_connections` (the users who came back: the storm's connects, since the phase 3
+// review; the key keeps its name), `reconnect_storm_over_s`, `peak_offered_rho` (the offered
 // utilisation, a fraction that may pass 1: not a node's `peak_rho`, the busy fraction, hence its
 // own name since the Task 15 review) and `peak_offered_rho_at_s`, the two last null when no step
 // followed the fault.
@@ -1614,7 +1616,7 @@ template <class Item>
                  .p99_s = band(&OpSummary::p99_s)};
 }
 
-// The band of a field only some node types have (a message queue's peak lag, a worker pool's dead
+// The band of a field only some node types have (a queue's or a frontier's peak lag, a pool's dead
 // letters) across the runs; none for another node (no run has one).
 [[nodiscard]] std::optional<Band> optional_band(std::span<const std::vector<NodeSummary>> nodes,
                                                 std::size_t i,
@@ -1886,6 +1888,7 @@ constexpr std::array op_numbers{
       optional("dead_lettered", &NodeSummary::total_dead_lettered),
       optional("dead_lettered_per_s", &NodeSummary::mean_dead_lettered_per_s),
       plain("rejected", &NodeSummary::total_rejected),
+      optional("deduplicated_per_s", &NodeSummary::mean_deduplicated_per_s),
       plain("red_s", &NodeSummary::red_time_s),
       json_per_seed("unavailable", unavailable),
       optional("staleness_s", &NodeSummary::mean_staleness_s),
@@ -2096,7 +2099,7 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
     committed_writes += sample.committed_writes_per_s.value_or(0.0) * dt_s;
     replication_seen_s += dt_s;
   }
-  if (sample.queue_lag_s) {  // a message queue: its worst moment is what a lag bound bounds
+  if (sample.queue_lag_s) {  // a queue or a frontier: its worst moment is what a lag bound bounds
     // flow::nan_propagating_max: a NaN step stays NaN for the run, where std::max would let the
     // next step's finite lag replace it.
     peak_queue_lag_s =
@@ -2803,7 +2806,7 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
 // - an infinite latency is written as `inf` (which spreadsheet and plotting tools parse),
 //   unlike the table ("unavailable") and JSON (null), read by people or by parsers
 //   without an infinity;
-// - `queue_lag_s` (engine::NodeSample::queue_lag_s) is a message queue's lag in
+// - `queue_lag_s` (engine::NodeSample::queue_lag_s) is a message queue's or a frontier's lag in
 //   SECONDS (a lag is minutes or hours, plotted against the backlog), and EMPTY on every other
 //   row, clients' and links' included: a 0 would claim a lag the node cannot have;
 // - `connections` (engine::NodeSample::connections, phase 3 spec §8.2) is a ws_gateway's level of

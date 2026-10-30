@@ -172,7 +172,7 @@ CheckResult read_capacity(const Site& site, const YAML::Node& body, model::NodeS
 }
 
 const AdvancedNumber* find_advanced_number(std::string_view key) {
-  // A ranges algorithm with a projection: `&AdvancedNumber::key` makes find compare each
+  // C++20 std::ranges::find with a projection: `&AdvancedNumber::key` makes find compare each
   // row's key with `key`, replacing a hand-written lambda comparing one member.
   const auto row = std::ranges::find(advanced_numbers, key, &AdvancedNumber::key);
   return row == advanced_numbers.end() ? nullptr : &*row;

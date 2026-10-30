@@ -4185,13 +4185,14 @@ constexpr std::string_view email_step = "{to: email_q, op: publish, factor: 0.5}
 constexpr std::string_view audit_step = "{to: audit, op: write}";
 
 // Loads `yaml` (the test fails with the loader's message if it does not load) and builds it.
+// C++23 std::expected<T, E>: a value or an error, which the caller must look at. Graph::build
+// returns a Graph or an EngineError, and the loader below a Scenario or a ConfigError; it replaces
+// exceptions and error codes, and the error carries what went wrong (the file, line and message),
+// so a test that cannot load its scenario says why.
 std::expected<Graph, simsys::graph::EngineError> build_fanout_file(const std::string& yaml) {
   const GraphScratchFile file{std::filesystem::temp_directory_path() /
                               (std::to_string(::getpid()) + "_simsys_fanout_graph.yaml")};
   std::ofstream(file.path) << yaml;
-  // C++23 std::expected<T, E>: the loader returns a Scenario or a ConfigError, and the caller
-  // must look at which. It replaces exceptions and error codes; the error carries the file, line
-  // and message, so a test that cannot load its scenario says why.
   auto loaded = simsys::config::load(file.path.string());
   if (!loaded) {
     FAIL(loaded.error().file << ":" << loaded.error().line << ": " << loaded.error().message);

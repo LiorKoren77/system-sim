@@ -534,6 +534,8 @@ TEST_CASE("a traffic_spike fault of factor 3 equals a spikes entry of factor 3 o
       "  s: {type: service, capacity: 1k/s, latency: 1ms, advanced: {queue_limit: 100}}\n"
       "links:\n  - {from: c, to: s, dir: inout, latency: 0s}\n");
   const auto json_with_faults_key = run_json(by_fault);
+  // C++23 std::string::contains(sv): "is this text in the string?" in one call. Replaces
+  // `find(x) != npos`, whose npos comparison is easy to write backwards.
   REQUIRE(json_with_faults_key.contains("\"faults\": ["));
   const auto json_by_fault = without_faults_key(json_with_faults_key);
   REQUIRE(json_by_fault == run_json(by_curve));
@@ -635,8 +637,6 @@ TEST_CASE("estimate ignores the faults, prints the note and equals the estimate 
   REQUIRE(faulted.responses.at(0).answered.per_second == plain.responses.at(0).answered.per_second);
   REQUIRE(faulted.responses.at(0).response.mean_s == plain.responses.at(0).response.mean_s);
 
-  // C++23 std::string::contains(sv): "is this text in the string?" in one call. Replaces
-  // `find(x) != npos`, whose npos comparison is easy to write backwards.
   const auto table = simsys::report::render_table(
       simsys::report::Summary::of_estimate(with_fault, faulted), {}, /*color=*/false);
   CAPTURE(table);
@@ -2007,7 +2007,10 @@ TEST_CASE(
 
 // Two faults declared latest first print earliest first. The node_down of 5 s at 10 s: the room
 // keeps 100 of 2000 offered, 1900 are lost, the block is as the probe's with the 5 s shifted; the
-// latency spike at 20 s is the one above.
+// latency spike at 20 s is the one above. The node_down is back at 15.2 s and still back when the
+// spike strikes at 20 s, so its recovery is settled there: the spike's steps outside 1 % of the
+// twin (which has neither fault) are the spike's, not the node_down's (the recovery rule's last
+// step outside 1 % is looked for up to the next fault only; FaultRecord's header).
 TEST_CASE("two faults declared out of order print in at order, one block each", "[theory]") {
   const auto run = fault_run(
       probe({.faults = "faults:\n"

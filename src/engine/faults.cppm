@@ -354,9 +354,17 @@ class FaultSchedule {
 //   lost         the faulted part's drops minus the twin's, summed over the steps from `at` until
 //                the recovery step (to the end of the run when it never recovers): the drops of the
 //                drain after the fault included, the drops of an overload the twin has too excluded
-//   recovery     the first step that starts once the fault has cleared (at + for; a flush's `at`)
-//                at which every client op's p99 and every node's utilisation (rho) are within 1 %
-//                of the twin's same step (relative, with 1e-9 of absolute slack for float residue)
+//   recovery     the step after the LAST step, from the fault's clearing (at + for; a flush's `at`)
+//                on, at which some client op's p99 or some node's utilisation (rho) is outside 1 %
+//                of the twin's same step (relative, with 1e-9 of absolute slack for float residue);
+//                the clearing step itself when none is, and no recovery when the run's last step
+//                is outside. The block is written at the end of the run, so the whole run is known:
+//                a step that crosses back within 1 % and leaves it again counts for nothing (the
+//                phase 3 review: the first step within 1 % had a gateway "recovered" 0 s after the
+//                fault, before its storm's overshoot). The steps are judged up to the scenario's
+//                next fault: a record back within 1 % when that one strikes is settled there (the
+//                twin has no fault at all, so the later fault's steps outside 1 % are its own); one
+//                still outside goes on with it, the two overlapping (below)
 // Why "within 1 % of the twin" and not "the SLOs pass again": an SLO with room to spare passes
 // while a backlog is still draining and the system is far from its normal state, and one that
 // fails without the fault never passes again; neither tells when the fault is over. The twin is
@@ -403,10 +411,14 @@ class FaultSchedule {
 // failure: FaultSchedule's header).
 // The reconnect storm (behaviours::WsGatewayBehaviour has the model): a node_down of a ws_gateway,
 // or a dc_down of its datacenter, drops the connections its dead servers held, and they reconnect
-// over `reconnect_within` from the fault's end. `after` names the storm's size (the connections
-// THIS fault dropped, at its first step: a fault that strikes while another is on drops its share
-// of what the survivors hold, and two that strike in the same step share that step's drop as the
-// gateway took it, in the scenario's order), how long it lasts, and the gateway's PEAK OFFERED
+// over `reconnect_within` from the fault's end. `after` names the users the storm brought back
+// (the storm's connects that are THIS fault's users: the connections it dropped, less the users
+// whose sessions ended while they waited for the fault and for their turn in the storm, plus the
+// users whose connects a dead tier lost meanwhile; a fault that strikes while another is on drops
+// its share of what the survivors hold, two that strike in the same step share that step's drop
+// as the gateway took it, in the scenario's order, and a storm that carries several faults' users
+// counts each fault's share of its connects to that fault), how long it lasts, and the gateway's
+// PEAK OFFERED
 // UTILISATION over the storm, demand / total capacity (capacity per replica × replicas), the
 // number explain's checks print as "peak offered ... (148%)", uncapped: the node table's rho is
 // the busy fraction and stops at 100 %, which would hide by how much a storm overloads the tier.
@@ -455,8 +467,9 @@ struct FaultAfter {
   SimTime failover{};
   int dead_replicas{};
   // A node_down of a ws_gateway, or a dc_down of a datacenter that holds one, only (the reconnect
-  // storm, FaultRecord's header): the gateways' ids (", " between several), the connections the
-  // fault dropped (its share of NodeSample::connections_dropped at its first step),
+  // storm, FaultRecord's header): the gateways' ids (", " between several), the users the fault's
+  // storm brought back (the sum of its connects that are this fault's users, Σ of
+  // behaviours::WsGatewayBehaviour::users_back; the name says connections, for the reconnects),
   // `reconnect_within` (they come back evenly over it from the fault's end), and the gateways'
   // peak OFFERED utilisation over the storm, demand / total capacity (a fraction that passes 1
   // when the storm overloads them; not a node's `peak_rho`, the busy fraction), with the start of
@@ -511,8 +524,10 @@ struct FaultRecord {
   // every other kind. A cache without a hit ratio loses nothing to a flush: 0 from the start.
   std::optional<double> flush_window_s{};
   FaultAfter after{};
-  // The start of the first step at or after at + for with every client op's p99 and every node's
-  // rho within 1 % of the twin's same step; empty when the run ended first.
+  // The start of the step after the last step from at + for on with some client op's p99 or some
+  // node's rho outside 1 % of the twin's same step (at + for's own step when none is; the header's
+  // rule); empty when the run's last step was outside. Final at the end of the run only: until
+  // then it is the recovery so far.
   std::optional<SimTime> recovered_at{};
   std::string datacenter{};  // a dc_down's datacenter; empty for every other kind
 };

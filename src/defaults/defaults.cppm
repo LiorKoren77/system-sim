@@ -216,7 +216,7 @@ struct TypeDefaults {
       return {Rate{20'000}, 1_ms};
     case frontier:
       // chosen: the prioritiser's own rate (behaviours::FrontierBehaviour), filing one URL in 1 ms
-      // on c = 10 servers; the scenario's `capacity` replaces it (web-crawler: 5k/s).
+      // on c = 10 servers; the scenario's `capacity` replaces it (web-crawler states 10k/s).
       return {Rate{10'000}, 1_ms};
   }
   // C++23 std::unreachable(): tells the compiler this point cannot be reached, which

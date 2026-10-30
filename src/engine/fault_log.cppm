@@ -14,6 +14,9 @@
 // partition imports the two partitions it reads, `:records` (StepRecord) and `:faults`
 // (FaultRecord, FaultSchedule), never the primary interface, which re-exports it: that would be an
 // import cycle.
+// C++20 global module fragment: `module;` opens the part of the unit before the module declaration,
+// where the std headers are #included, so that their declarations stay in the global module
+// instead of being attached to simsys.engine (src/core/core.cppm has the longer note).
 module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this unit imports other modules (GCC 14.2 'Bad
 // file data' bug, CLAUDE.md §3). Like every unit from simsys.behaviours on, it is compiled with
@@ -55,6 +58,14 @@ class FaultLog {
     double sent_per_s{};
     double lost_per_s{};
   };
+  // What one fault's reconnect storm brought back at one gateway in one step (Simulation's, from
+  // behaviours::WsGatewayBehaviour::users_back): the gateway, the fault (its place in the
+  // scenario's `faults` list) and the users, the storm's connects × dt that are that fault's.
+  struct UsersBack {
+    std::size_t gateway{};
+    std::size_t fault{};
+    double users{};
+  };
   // One step of the run and the twin's same step, each with its links' tallies (one per link of
   // the graph). A view: it holds references to what Simulation::step has just produced.
   // C++20 std::span<const T>: a non-owning view of contiguous elements (here a vector the
@@ -64,6 +75,7 @@ class FaultLog {
     const StepRecord& twin;
     std::span<const LinkTally> run_links;
     std::span<const LinkTally> twin_links;
+    std::span<const UsersBack> users_back{};  // the run's; the twin has no storm
   };
 
   FaultLog() = default;  // no faults: no records, and observe does nothing
@@ -107,6 +119,18 @@ class FaultLog {
     // What its nodes' failover sent to dead replicas (NodeSample::failover_lost_per_s), requests.
     double failover_lost_per_s{};
   };
+  // What one step cost beyond the twin's, in the record's figures (cost_of): its drops, a dc_down's
+  // cut links' losses, the failover's, the requests lost for good, the retries' extra attempts and
+  // the pools' re-published jobs. A sum of steps with +=.
+  struct Cost {
+    double lost{};
+    double lost_on_cut_links{};
+    double failover_lost{};
+    double lost_requests{};
+    double retries_added_attempts{};
+    double pool_republished_jobs{};
+    Cost& operator+=(const Cost& other);
+  };
   // A part whose backlog may outlast the fault: its nodes, its name in the block (`s backlog
   // drained`), its capacity (to compare parts in seconds of work), and the backlog above the
   // twin's at the end of the latest step and at its worst during the fault.
@@ -132,19 +156,21 @@ class FaultLog {
     // A cache_flush's: the `at` of the next flush of the same cache, which ends this one's window
     // if the cache is not full by then (FaultAfter::interrupted_by_flush_at). Empty if none.
     std::optional<SimTime> next_flush{};
+    // The `at` of the next fault of the scenario, of any kind and node: the earliest later one,
+    // empty if none. The recovery rule judges this record's steps up to it (follow_recovery):
+    // from then on the twin, which has no fault at all, differs from the run by the next fault
+    // too. `settled`: back within 1 % from the recovery up to that fault, so the record is final.
+    std::optional<SimTime> next_fault{};
+    bool settled{};
     // Its place in the scenario's `faults` list (the order a gateway takes faults of one step in).
     std::size_t fault{};
     // A node_down of a ws_gateway's, or a dc_down's of a datacenter with gateways (add_storm): the
-    // gateways, each one's share of the connections dropped in the fault's first step that are
-    // this fault's (share_simultaneous_drops: 1 unless another fault struck it in that step), their
-    // total capacity (per replica × replicas), what the peak offered utilisation over the storm
-    // divides by (FaultAfter::peak_offered_rho), and their `reconnect_within` (the largest), the
-    // storm's length. Empty capacity for every other fault: no storm to follow.
+    // gateways, their total capacity (per replica × replicas), what the peak offered utilisation
+    // over the storm divides by (FaultAfter::peak_offered_rho), and their `reconnect_within` (the
+    // largest), the storm's length. Empty capacity for every other fault: no storm to follow.
     std::vector<std::size_t> storm_gateways{};
-    std::vector<double> storm_drop_shares{};
     std::optional<double> storm_capacity_per_s{};
     SimTime storm_within{};
-    bool storm_drop_counted{};  // the fault's first step has been read
     // Whose backlog may need draining: the faulted part, or for a traffic_spike every node
     // downstream (any node but a client), the worst of which is named once the spike is over.
     std::vector<Backlogged> backlogged{};
@@ -153,14 +179,10 @@ class FaultLog {
     double offered{};                      // Σ offered × dt over them
     double served{};                       // Σ served × dt
     bool past_window{};                    // a step after "during" was observed
+    // What the steps since the last one outside 1 % of the twin cost (observe_one): theirs only if
+    // a later step is outside too, since the recovery is the step after the LAST one outside.
+    Cost pending{};
   };
-  // What the recovery rule compares (FaultRecord's header): every node's rho and every client op's
-  // p99 (StepRecord::responses' order) of one step.
-  struct Snapshot {
-    std::vector<double> rho{};
-    std::vector<double> p99_s{};
-  };
-
   [[nodiscard]] Tracker tracker_of(const graph::Graph& g, const model::Fault& fault) const;
   [[nodiscard]] Tracker faulted_part(const graph::Graph& g, const model::Fault& fault) const;
   [[nodiscard]] static FaultRecord record_of(const graph::Graph& g, const model::Fault& fault,
@@ -172,30 +194,29 @@ class FaultLog {
   static void add_retry_figures(Part& part, const Tracker& tracker, const StepRecord& record);
   [[nodiscard]] static Part part_of(const Tracker& tracker, const StepRecord& record,
                                     std::span<const LinkTally> links);
-  [[nodiscard]] bool needs_snapshot(const FaultRecord& r, SimTime t) const;
   void observe_one(FaultRecord& r, Tracker& tracker, const StepPair& step, SimTime dt,
                    const std::optional<bool>& back_to_twin) const;
+  static void follow_recovery(FaultRecord& r, Tracker& tracker, const Cost& cost, SimTime t,
+                              bool back_to_twin);
   static void observe_during(FaultRecord& r, Tracker& tracker, const Part& run,
                              const StepPair& step, double dt_s);
   static void observe_backlogs(Tracker& tracker, const StepPair& step, bool during);
   static void observe_drain(FaultRecord& r, Tracker& tracker, SimTime t, SimTime dt);
   static void choose_drained(FaultRecord& r, Tracker& tracker);
-  static void count_losses(FaultRecord& r, const Part& run, const Part& twin, double dt_s);
-  static void count_retries(FaultRecord& r, const Part& run, const Part& twin, double dt_s);
+  [[nodiscard]] static Cost cost_of(const Part& run, const Part& twin, double dt_s);
+  static void add_cost(FaultRecord& r, const Cost& cost);
   static void end_flush_window(FaultRecord& r, const Tracker& tracker,
                                const FaultSchedule& schedule, SimTime t);
   static void add_failover(const graph::Graph& g, std::span<const FailoverRoute> routes,
                            const model::Fault& fault, std::size_t node, FaultRecord& r);
   static void observe_warm_up(FaultRecord& r, SimTime t, SimTime dt);
-  static void observe_storm(FaultRecord& r, Tracker& tracker, const StepRecord& run, bool during,
-                            SimTime dt);
+  static void observe_storm(FaultRecord& r, const Tracker& tracker, const StepPair& step,
+                            bool during, SimTime dt);
   static void add_storm(const graph::Graph& g, const model::Fault& fault, Tracker& tracker);
-  void share_simultaneous_drops(const graph::Graph& g);
   [[nodiscard]] static bool in_window(const FaultRecord& r, SimTime t);
   [[nodiscard]] static bool cleared(const FaultRecord& r, SimTime t);
   [[nodiscard]] static std::optional<double> window_length_s(const FaultRecord& r);
-  [[nodiscard]] static Snapshot snapshot_of(const StepRecord& record);
-  [[nodiscard]] static bool back_to(const Snapshot& run, const Snapshot& twin);
+  [[nodiscard]] static bool back_to(const StepRecord& run, const StepRecord& twin);
 
   std::vector<FaultRecord> records_{};
   std::vector<Tracker> trackers_{};   // one per record, in the same order
@@ -276,6 +297,18 @@ constexpr double recovery_tolerance = 0.01;
   for (const auto& other : faults) {
     if (other.kind != model::FaultKind::cache_flush || other.node != flush.node) continue;
     if (other.at.count() <= flush.at.count()) continue;
+    if (!next || other.at.count() < next->count()) next = other.at;
+  }
+  return next;
+}
+
+// The `at` of the next fault after `fault`, whatever its kind and node: the earliest later one,
+// empty if none (Tracker::next_fault).
+[[nodiscard]] std::optional<SimTime> next_fault_of(std::span<const model::Fault> faults,
+                                                   const model::Fault& fault) {
+  std::optional<SimTime> next;
+  for (const auto& other : faults) {
+    if (other.at.count() <= fault.at.count()) continue;
     if (!next || other.at.count() < next->count()) next = other.at;
   }
   return next;
@@ -385,7 +418,6 @@ FaultLog::FaultLog(const graph::Graph& g, std::span<const double> rooms,
     trackers_.push_back(tracker_of(g, faults[i]));
     trackers_.back().fault = i;
   }
-  share_simultaneous_drops(g);
   for (const auto& tracker : trackers_) {
     records_.push_back(record_of(g, faults[tracker.fault], tracker, rooms, failover_routes));
   }
@@ -396,6 +428,7 @@ FaultLog::Tracker FaultLog::tracker_of(const graph::Graph& g, const model::Fault
   Tracker tracker = faulted_part(g, fault);
   add_retry_parties(g, tracker);
   add_storm(g, fault, tracker);
+  tracker.next_fault = next_fault_of(g.scenario().faults, fault);
   return tracker;
 }
 
@@ -450,42 +483,11 @@ void FaultLog::add_storm(const graph::Graph& g, const model::Fault& fault, Track
     if (gateway_share(g, fault, node) <= 0.0) continue;
     const auto& gateway = nodes[node];
     tracker.storm_gateways.push_back(node);
-    tracker.storm_drop_shares.push_back(1.0);
     capacity += gateway.capacity.service_rate.per_second * model::copies_of(gateway.spec);
     const SimTime within = defaults::reconnect_within_of(gateway.spec);
     if (within.count() > tracker.storm_within.count()) tracker.storm_within = within;
   }
   if (!tracker.storm_gateways.empty()) tracker.storm_capacity_per_s = capacity;
-}
-
-// Faults that strike one gateway in the same step share that step's drop
-// (NodeSample::connections_dropped, the gateway's total) as the gateway took them, in the
-// scenario's order (behaviours::WsGatewayBehaviour::follow_outages): the first s1 of the level,
-// the next s2 of what was left, and so on. So fault j's part of the step's drop is
-//   s_j × Π_{i before j} (1 − s_i) / (1 − Π_i (1 − s_i))       (s: the share it killed, r / R)
-// over the faults of that step, 1 for a fault alone in its step: two 1-of-4 faults take 4/7 and
-// 3/7 of the 7/16 of the level dropped. A step is the scenario's: the first one at or after `at`.
-void FaultLog::share_simultaneous_drops(const graph::Graph& g) {
-  const auto& faults = g.scenario().faults;
-  const auto step = g.scenario().step.count();
-  const auto first_step = [&](std::size_t fault) {
-    return (faults[fault].at.count() + step - 1) / step;
-  };
-  for (auto& tracker : trackers_) {
-    for (std::size_t k = 0; k < tracker.storm_gateways.size(); ++k) {
-      const std::size_t gateway = tracker.storm_gateways[k];
-      double survivors_before = 1.0;  // Π (1 − s_i) over the step's faults before this one
-      double survivors_all = 1.0;     // ... and over all of them
-      for (const auto& other : trackers_) {
-        if (first_step(other.fault) != first_step(tracker.fault)) continue;
-        const double share = gateway_share(g, faults[other.fault], gateway);
-        survivors_all *= 1.0 - share;
-        if (other.fault < tracker.fault) survivors_before *= 1.0 - share;
-      }
-      const double mine = gateway_share(g, faults[tracker.fault], gateway);
-      tracker.storm_drop_shares[k] = mine * survivors_before / (1.0 - survivors_all);
-    }
-  }
 }
 
 // Whose retries the record follows (FaultRecord::lost_requests, FaultAfter): a traffic_spike's
@@ -583,32 +585,28 @@ void FaultLog::add_failover(const graph::Graph& g, std::span<const FailoverRoute
   r.after.dead_replicas = fault.replicas.value_or(model::copies_of(spec));
 }
 
-// The recovery rule's snapshots (the run's step and the twin's) only when some record reads them:
-// a step at or after a fault has cleared that has not recovered yet. A 24 h run with one 30 s fault
-// takes a few hundred, not 864,000.
+// The recovery rule compares the step with the twin's (back_to) once some fault has cleared, at
+// every step to the end of the run: the recovery is the step after the LAST one outside 1 %, so a
+// step back within it decides nothing until the run is over (FaultRecord's header). Compared once
+// per step for all the records, without a copy of either record.
 void FaultLog::observe(const StepPair& step, SimTime dt, const FaultSchedule& schedule) {
   if (records_.empty()) return;
   for (std::size_t i = 0; i < records_.size(); ++i) {
     end_flush_window(records_[i], trackers_[i], schedule, step.run.t);
   }
   std::optional<bool> back_to_twin;
-  for (std::size_t i = 0; i < records_.size() && !back_to_twin; ++i) {
-    if (needs_snapshot(records_[i], step.run.t)) {
-      back_to_twin = back_to(snapshot_of(step.run), snapshot_of(step.twin));
-    }
+  // C++20 std::ranges::any_of: the range itself rather than a begin/end pair.
+  if (std::ranges::any_of(records_, [&](const FaultRecord& r) { return cleared(r, step.run.t); })) {
+    back_to_twin = back_to(step.run, step.twin);
   }
   for (std::size_t i = 0; i < records_.size(); ++i) {
     observe_one(records_[i], trackers_[i], step, dt, back_to_twin);
   }
 }
 
-bool FaultLog::needs_snapshot(const FaultRecord& r, SimTime t) const {
-  return cleared(r, t) && !r.recovered_at;
-}
-
 // One record's share of the step, from `at` on: a step during the fault adds to the means, a step
-// after it may end the drain, and every step until the recovery adds its losses over the twin's,
-// unless it is the recovery step itself.
+// after it may end the drain, and the step's cost over the twin's counts up to the recovery
+// (follow_recovery).
 void FaultLog::observe_one(FaultRecord& r, Tracker& tracker, const StepPair& step, SimTime dt,
                            const std::optional<bool>& back_to_twin) const {
   const SimTime t = step.run.t;
@@ -617,21 +615,44 @@ void FaultLog::observe_one(FaultRecord& r, Tracker& tracker, const StepPair& ste
   const Part twin = part_of(tracker, step.twin, step.twin_links);
   const bool during = in_window(r, t);
   observe_backlogs(tracker, step, during);
-  observe_storm(r, tracker, step.run, during, dt);
+  observe_storm(r, tracker, step, during, dt);
   if (during) {
     observe_during(r, tracker, run, step, seconds(dt));
   } else {
     observe_drain(r, tracker, t, dt);
   }
-  if (!r.recovered_at) {
-    if (cleared(r, t) && back_to_twin.value_or(false)) {
-      r.recovered_at = t;
-    } else {
-      count_losses(r, run, twin, seconds(dt));
-      count_retries(r, run, twin, seconds(dt));
-    }
+  const Cost cost = cost_of(run, twin, seconds(dt));
+  if (cleared(r, t)) {
+    follow_recovery(r, tracker, cost, t, back_to_twin.value_or(false));
+  } else {
+    add_cost(r, cost);
   }
   observe_warm_up(r, t, dt);
+}
+
+// The recovery rule, one step at or after the fault cleared (FaultRecord's header): the recovery is
+// the step after the LAST one outside 1 % of the twin. A step within it is the recovery for now
+// (the first of the latest run of such steps) and its cost is kept apart (`pending`); a step
+// outside it ends that: no recovery yet, and everything kept apart counts, with its own cost. So at
+// the end of the run the record counts every step before the recovery, and a run that ends outside
+// is not recovered. A record that is back when the next fault strikes is settled there: the twin
+// has no fault at all, so a later fault's steps outside 1 % are that fault's, not this one's (a
+// record still outside then goes on, the two overlapping, until the run is back for both).
+void FaultLog::follow_recovery(FaultRecord& r, Tracker& tracker, const Cost& cost, SimTime t,
+                               bool back_to_twin) {
+  if (tracker.settled) return;
+  if (r.recovered_at && tracker.next_fault && t.count() >= tracker.next_fault->count()) {
+    tracker.settled = true;
+    return;
+  }
+  if (back_to_twin) {
+    if (!r.recovered_at) r.recovered_at = t;
+    tracker.pending += cost;
+    return;
+  }
+  r.recovered_at.reset();
+  tracker.pending += cost;
+  add_cost(r, std::exchange(tracker.pending, Cost{}));
 }
 
 // The faulted part's numbers in one step of one run (FaultRecord's comment: a dc_down's cut links
@@ -740,24 +761,39 @@ void FaultLog::choose_drained(FaultRecord& r, Tracker& tracker) {
 }
 
 // What the step cost beyond the twin's: the faulted part's drops (a traffic_spike's client: its
-// unanswered requests), a dc_down's cut links' apart, and the part of the drops a failover sent to
-// dead replicas (the twin, without faults, has none).
-void FaultLog::count_losses(FaultRecord& r, const Part& run, const Part& twin, double dt_s) {
-  r.lost += (run.lost_per_s - twin.lost_per_s) * dt_s;
-  r.lost_on_cut_links += (run.cut_lost_per_s - twin.cut_lost_per_s) * dt_s;
-  if (r.after.failover_lost) {
-    *r.after.failover_lost += (run.failover_lost_per_s - twin.failover_lost_per_s) * dt_s;
-  }
+// unanswered requests), a dc_down's cut links' apart, the part of the drops a failover sent to
+// dead replicas (the twin, without faults, has none), and what the retries did
+// (FaultRecord::lost_requests, FaultAfter): the requests lost for good, when the drops count
+// attempts, and the attempts and the jobs sent again.
+FaultLog::Cost FaultLog::cost_of(const Part& run, const Part& twin, double dt_s) {
+  return Cost{
+      .lost = (run.lost_per_s - twin.lost_per_s) * dt_s,
+      .lost_on_cut_links = (run.cut_lost_per_s - twin.cut_lost_per_s) * dt_s,
+      .failover_lost = (run.failover_lost_per_s - twin.failover_lost_per_s) * dt_s,
+      .lost_requests = (run.lost_for_good_per_s - twin.lost_for_good_per_s) * dt_s,
+      .retries_added_attempts = (run.extra_attempts_per_s - twin.extra_attempts_per_s) * dt_s,
+      .pool_republished_jobs = (run.republished_per_s - twin.republished_per_s) * dt_s};
 }
 
-// What the retries did in the step beyond the twin's (FaultRecord::lost_requests, FaultAfter): the
-// requests lost for good, when the drops count attempts, and the attempts and the jobs sent again.
-void FaultLog::count_retries(FaultRecord& r, const Part& run, const Part& twin, double dt_s) {
-  if (r.lost_requests) {
-    *r.lost_requests += (run.lost_for_good_per_s - twin.lost_for_good_per_s) * dt_s;
-  }
-  r.after.retries_added_attempts += (run.extra_attempts_per_s - twin.extra_attempts_per_s) * dt_s;
-  r.after.pool_republished_jobs += (run.republished_per_s - twin.republished_per_s) * dt_s;
+FaultLog::Cost& FaultLog::Cost::operator+=(const Cost& other) {
+  lost += other.lost;
+  lost_on_cut_links += other.lost_on_cut_links;
+  failover_lost += other.failover_lost;
+  lost_requests += other.lost_requests;
+  retries_added_attempts += other.retries_added_attempts;
+  pool_republished_jobs += other.pool_republished_jobs;
+  return *this;
+}
+
+// `cost` counted in the record: the figures it has (a failover's and the requests lost for good
+// only where they apply: FaultAfter::failover_lost, FaultRecord::lost_requests).
+void FaultLog::add_cost(FaultRecord& r, const Cost& cost) {
+  r.lost += cost.lost;
+  r.lost_on_cut_links += cost.lost_on_cut_links;
+  if (r.after.failover_lost) *r.after.failover_lost += cost.failover_lost;
+  if (r.lost_requests) *r.lost_requests += cost.lost_requests;
+  r.after.retries_added_attempts += cost.retries_added_attempts;
+  r.after.pool_republished_jobs += cost.pool_republished_jobs;
 }
 
 // A flush's window ends once the run finds where (FaultRecord::flush_window_s): at the step during
@@ -788,24 +824,21 @@ void FaultLog::observe_warm_up(FaultRecord& r, SimTime t, SimTime dt) {
   }
 }
 
-// A gateway's reconnect storm (FaultRecord's header): at the fault's first step, its part of the
-// connections the gateways dropped (the step that starts at or after `at` drops them,
-// NodeSample::connections_dropped; share_simultaneous_drops has its part); over the storm,
+// A gateway's reconnect storm (FaultRecord's header): at every step, the users this fault's storm
+// brought back at its gateways (StepPair::users_back: the gateway hands each fault its share of the
+// storm's connects, so a storm that carries several faults' users splits them); over the storm,
 // [at + for, at + for + reconnect_within + dt], the gateways' offered utilisation, their demand /
 // their total capacity, and the first step that reaches its peak. Nothing for any other fault.
-void FaultLog::observe_storm(FaultRecord& r, Tracker& tracker, const StepRecord& run, bool during,
-                             SimTime dt) {
+void FaultLog::observe_storm(FaultRecord& r, const Tracker& tracker, const StepPair& step,
+                             bool during, SimTime dt) {
   if (!tracker.storm_capacity_per_s || *tracker.storm_capacity_per_s <= 0.0) return;
-  if (during) {
-    if (tracker.storm_drop_counted) return;
-    tracker.storm_drop_counted = true;
-    for (std::size_t k = 0; k < tracker.storm_gateways.size(); ++k) {
-      const auto& gateway = run.nodes[tracker.storm_gateways[k]];
-      *r.after.reconnect_storm_connections +=
-          gateway.connections_dropped.value_or(0.0) * tracker.storm_drop_shares[k];
-    }
-    return;
+  for (const auto& back : step.users_back) {
+    if (back.fault != tracker.fault) continue;
+    if (!std::ranges::contains(tracker.storm_gateways, back.gateway)) continue;
+    *r.after.reconnect_storm_connections += back.users;
   }
+  if (during) return;
+  const StepRecord& run = step.run;
   const auto since_end = run.t.count() - r.at.count() - r.duration.count();
   if (since_end > tracker.storm_within.count() + dt.count()) return;
   const double offered = sum_of(run, tracker.storm_gateways, &NodeSample::demand_per_s) /
@@ -835,27 +868,22 @@ std::optional<double> FaultLog::window_length_s(const FaultRecord& r) {
   return r.flush_window_s;
 }
 
-// The step as the recovery rule reads it: the p99 of each client op is read off the lognormal fit
-// to the moments of its delivered requests (the reports' percentiles, on one step).
-FaultLog::Snapshot FaultLog::snapshot_of(const StepRecord& record) {
-  Snapshot snapshot;
-  for (const auto& node : record.nodes) snapshot.rho.push_back(node.rho);
-  for (const auto& sample : record.responses) {
+// Every node's rho and every client op's p99 within 1 % of the twin's same step. The p99 of a
+// client op is read off the lognormal fit to the moments of its delivered requests (the reports'
+// percentiles, on one step).
+bool FaultLog::back_to(const StepRecord& run, const StepRecord& twin) {
+  if (run.nodes.size() != twin.nodes.size() || run.responses.size() != twin.responses.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < run.nodes.size(); ++i) {
+    if (!within_tolerance(run.nodes[i].rho, twin.nodes[i].rho)) return false;
+  }
+  const auto p99_s = [](const ResponseSample& sample) {
     const auto& fit = sample.delivered_response;
-    snapshot.p99_s.push_back(
-        queueing::lognormal_quantile(fit.mean_s, fit.variance_s2, queueing::z_p99));
-  }
-  return snapshot;
-}
-
-// Every node's rho and every client op's p99 within 1 % of the twin's same step.
-bool FaultLog::back_to(const Snapshot& run, const Snapshot& twin) {
-  if (run.rho.size() != twin.rho.size() || run.p99_s.size() != twin.p99_s.size()) return false;
-  for (std::size_t i = 0; i < run.rho.size(); ++i) {
-    if (!within_tolerance(run.rho[i], twin.rho[i])) return false;
-  }
-  for (std::size_t i = 0; i < run.p99_s.size(); ++i) {
-    if (!within_tolerance(run.p99_s[i], twin.p99_s[i])) return false;
+    return queueing::lognormal_quantile(fit.mean_s, fit.variance_s2, queueing::z_p99);
+  };
+  for (std::size_t i = 0; i < run.responses.size(); ++i) {
+    if (!within_tolerance(p99_s(run.responses[i]), p99_s(twin.responses[i]))) return false;
   }
   return true;
 }

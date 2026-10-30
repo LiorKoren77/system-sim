@@ -31,7 +31,7 @@ key-value clusters (ring, replication and quorums), search indexes and id genera
 a failed step does not run, refused, dropped and timed-out requests are counted apart
 (`reject_rate`, `drop_rate`, `timed_out_per_s`), and an SLO can be checked per window (`over: 1h`).
 `simsys sweep` runs a scenario over a range of one key, the points in parallel. All fourteen
-shipped scenarios run end to end, the eight book systems among them (list below). 1681 tests
+shipped scenarios run end to end, the eight book systems among them (list below). 1686 tests
 (Catch2, via `ctest`). The scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.5).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
@@ -100,17 +100,19 @@ scenario chat-system  861000 steps observed  drop rate 0.00933% (worst: chat_ser
 nodes
   node           mean_rho  peak_rho  peak_backlog  dropped  dead_lettered/s  rejected  red_s  peak_lag  connections
   ...
-  chat_servers     0.5384         1             0   2.159M                -         0   61.9         -       1.472M
+  chat_servers     0.5383         1             0   2.159M                -         0   60.3         -       1.472M
   ...
 fault 21:30 node_down chat_servers for 1m
   during:   offered 35.98k/s, served 0/s, lost 2.159M attempts (2.154M requests lost for good), backlog 0, drop_rate over its max for 1m
-  after:    no backlog to drain, reconnect storm 1.617M connections over 30s, chat_servers peak 93.9% at 21:31:29.9
-  recovery: back within 1% (every op's p99, every node's rho) at 21:38:58.7 (478.7s after the fault cleared)
+  after:    no backlog to drain, reconnect storm 1.551M users back over 30s, chat_servers peak 90.5% at 21:31:29.9
+  recovery: back within 1% (every op's p99, every node's rho) at 21:31:30 (30s after the fault cleared)
 ```
 
 The 1.617M open connections drop at once and their users come back over `reconnect_within`
-(30 s, a default chosen, not from the book): 93.9 % of the tier at the storm's last second, 112 %
-if they all come back within 10 s (its README runs the window from 10 to 60 s). `lost` counts
+(30 s, a default chosen, not from the book), 1.551M of them: the others' sessions end while they
+wait. The tier is at 90.5 % at the storm's last second (110 % if they all come back within 10 s:
+its README runs the window from 10 to 60 s), and back at its fault-free twin as the storm ends.
+`lost` counts
 attempts, the servers' work, because the sync workers retry; the requests the users lost for
 good are beside it.
 
@@ -360,10 +362,11 @@ fourteen scenarios run end to end:
 - [`book/chat-system`](scenarios/book/chat-system/): ch. 12 over 24 hours: 50M daily users, 1.08M
   connections open on average (1.62M at 21:00), whose 5 s heartbeats (324k/s at the peak) size
   the 20 chat servers and the presence store; messages fanned out 1.4 times into the sync queue.
-  At 21:30 the whole gateway tier is down for a minute: 1.617M connections drop at once and storm
-  back over 30 s, the tier peaking at 93.9 % of its capacity (112 % if they all come back within
-  10 s: its README sweeps the window). All three SLOs pass (send p99 4.82 ms, the queue's lag under
-  a microsecond, 0.0093 % dropped), and the run is back at its fault-free twin 8 minutes later.
+  At 21:30 the whole gateway tier is down for a minute: 1.617M connections drop at once and 1.551M
+  users storm back over 30 s, the tier peaking at 90.5 % of its capacity (110 % if they all come
+  back within 10 s: its README sweeps the window). All three SLOs pass (send p99 4.82 ms, the
+  queue's lag under a microsecond, 0.0093 % dropped), and the run is back at its fault-free twin
+  as the storm ends, 30 s after the fault.
 
 Every node type has a model since phase 3 (a WebSocket gateway, a service discovery, a
 notification fan-out and a URL frontier were its last four), and every shipped scenario runs.

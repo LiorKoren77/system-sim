@@ -644,12 +644,14 @@ struct QueueProvenance {
   return text;
 }
 
-// "mode=ap (default; partitions: phase 3)": the mode only a partition would show (faults are
-// phase 3), marked when defaulted; `cp` (consistency first) with quorums that do not overlap asks
-// for what the quorums do not give, and the line says so.
+// "mode=ap (default; partitions: phase 4 backlog)": the mode only a partition would show (the
+// `partition` fault kind did not make phase 3: it is on the phase 4 backlog), marked when
+// defaulted; `cp` (consistency first) with quorums that do not overlap asks for what the quorums
+// do not give, and the line says so.
 [[nodiscard]] std::string kv_mode_summary(const model::NodeSpec& spec) {
   const auto mode = model::kv_mode_of(spec);
-  std::string notes = spec.kv_mode ? "partitions: phase 3" : "default; partitions: phase 3";
+  std::string notes =
+      spec.kv_mode ? "partitions: phase 4 backlog" : "default; partitions: phase 4 backlog";
   if (mode == model::KvMode::cp && !kv_quorums_overlap(spec)) {
     notes += "; cp needs W + R > N: these quorums contradict it";
   }
@@ -657,7 +659,7 @@ struct QueueProvenance {
 }
 
 // A kv_cluster's shape (spec §19 entry 9; book ch. 6): "  nodes=6 N=3 W=2 R=2 mode=ap (partitions:
-// phase 3)", the machines on its ring (`nodes`, which graph::apply_kv_ring also copies into
+// phase 4 backlog)", the machines on its ring (`nodes`, which graph::apply_kv_ring also copies into
 // `replicas`), the copies of each key and the two quorums (kv_quorums) and the mode
 // (kv_mode_summary). Nothing on any other type.
 [[nodiscard]] std::string kv_cluster_summary(const model::NodeSpec& spec) {

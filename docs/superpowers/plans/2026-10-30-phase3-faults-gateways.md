@@ -787,6 +787,10 @@ whole run is known), schema and spec §20 updated; the per-seed JSON under `--re
 - A large read's last byte; batch arrivals; full-duplex links.
 - Sweep SLO columns and `reject_rate`; sweeps over seeds or two keys; geometric spacing; `estimate --at`.
 - One series file per seed under `--replications`.
+- A `queue_lag_unbounded` boolean in the JSON node objects: `peak_queue_lag_s` is `null` both for an unbounded lag (a message queue or frontier that falls behind for good in `estimate`) and for a node without a lag; the schema's key table says so for now (phase 3 review, decision 2).
+- A default detection delay for plain replicas: a replicated node reached without a balancer or a discovery is routed as by an ideal health-checked router, so adding a `service_discovery` adds the failover's loss to a `node_down` the bare replicas absorbed (documented in `engine.cppm` and the schema; phase 3 review, decision 7).
+- A gateway's users' own connects that the survivors' smaller cap refuses during a partial outage are not retried (only the storm's reconnects are); retry them as the storm's are (phase 3 review, decision 8).
+- `estimate --report json`'s node `dropped` is one step's worth (`steps` is 1); give it a per-second figure (phase 3 review, decision 11; documented in the schema's JSON table).
 - Cutting node cycles at the asynchronous queue → pool edge (unblocked by phase 2's C-1).
 - The 2a leftovers still open: M7 unit labels with a `cost`, M9 duplicate `write_ops`, M10 the diurnal table, M12 `estimate`'s table shape, M13 `curve --seed` without `--noise`.
 

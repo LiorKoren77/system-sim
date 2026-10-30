@@ -218,8 +218,9 @@ struct Site {
 
   [[nodiscard]] ConfigError error(const YAML::Node& at, std::string_view what) const;
 
-  // The error as the failed outcome of any reader: std::unexpected<ConfigError> converts
-  // to every std::expected<T, ConfigError>.
+  // The error as the failed outcome of any reader. C++23 std::unexpected<E>: the error side of a
+  // std::expected, written alone; std::unexpected<ConfigError> converts to every
+  // std::expected<T, ConfigError>, so one `fail` serves readers of any value type.
   [[nodiscard]] std::unexpected<ConfigError> fail(const YAML::Node& at,
                                                   std::string_view what) const;
 

@@ -562,6 +562,8 @@ TEST_CASE(
     "[theory]") {
   const auto out = reports_of(storm_probe());
   CAPTURE(out.table);
+  // C++20 std::string::ends_with: a suffix test in one call, replacing
+  // `s.size() >= n && s.compare(s.size() - n, n, x) == 0`; the block is the table's last part.
   REQUIRE(out.table.ends_with(
       "fault 00:00:10 node_down s for 10s\n"
       "  during:   offered 890.8/s, served 0/s, lost 8.907k attempts (2.939k requests lost for "
@@ -576,6 +578,8 @@ TEST_CASE(
   const auto json = reports_of(storm_probe()).json;
   CAPTURE(json);
   REQUIRE_THAT(json_number(json, "lost"), WithinRel(8907.0, 1e-9));
+  // C++23 std::string::contains: a substring test in one call, replacing
+  // `find(...) != std::string::npos`, so the assertion reads as what it checks.
   REQUIRE(json.contains("\"lost_unit\": \"attempts\", \"lost_requests\": "));
   REQUIRE_THAT(json_number(json, "lost_requests"), WithinRel(2939.0, 1e-9));
   REQUIRE_THAT(json_number(json, "retries_added_attempts"), WithinRel(5968.0, 1e-9));

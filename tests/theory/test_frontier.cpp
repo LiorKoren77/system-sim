@@ -344,10 +344,10 @@ TEST_CASE("explain follows the frontier's then and sums the loop at F = 8: 250 a
           "[theory]") {
   const auto text = explain_of(crawl_loop(8));
   CAPTURE(text);
-  REQUIRE(check_line(text, "frontier")
-              .contains("peak offered 250/s vs 5k/s total capacity  (5%, green)"));
   // C++23 std::string::contains: a substring test in one call, replacing
   // `find(...) != std::string::npos`, so the assertion reads as what it checks.
+  REQUIRE(check_line(text, "frontier")
+              .contains("peak offered 250/s vs 5k/s total capacity  (5%, green)"));
   REQUIRE_FALSE(text.contains("load not propagated"));
   REQUIRE_FALSE(text.contains("no steady state"));
 }
