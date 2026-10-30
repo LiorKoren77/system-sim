@@ -264,9 +264,10 @@ struct Hop {
 
 // The hops a request takes together or skips together: one unconditional step (fraction 1);
 // the miss steps after one lookup (graph::ServiceHop::lookup) or a cache's own `on: miss`
-// `then` steps, which a miss takes all of in turn; or a cache's store hop (fraction = its
-// graph::Graph::backend_fraction). `fraction` is the share of the requests that take the
-// block, in (0, 1].
+// `then` steps, which a miss takes all of in turn; a cache's store hop (fraction = its
+// graph::Graph::backend_fraction); or one `on: failure` step (a failure block, `reports_on` set:
+// see HopBlocks). `fraction` is the share of the requests that take the block, in (0, 1] (of the
+// failed ones for a failure block: 1).
 //
 // The cache whose misses a block carries (a service's `on: miss` steps after a lookup of it, a
 // read_through cache's or a CDN's store hop for a read, a cache's own `on: miss` then-steps), and
@@ -282,10 +283,36 @@ struct Block {
   std::optional<std::size_t> lookup;  // the lookup a service's miss block follows; else empty
   std::vector<Hop> hops{};  // `{}`: -Wmissing-field-initializers (see model::Step's comment)
   std::optional<MissesOf> misses{};  // a miss block's cache; empty for a block every request takes
+  // A failure block's anchor: the position, in the op's blocks, of the block whose failures it is
+  // sent, or of the first member of the parallel group it reports on as a whole (HopBlocks); empty
+  // for every other block.
+  std::optional<std::size_t> reports_on{};
 };
 
 // The blocks of hops a node makes for each incoming op, and the three things the engine asks
 // of them: the flow they forward, the latency they add and the share of requests they answer.
+//
+// Failure blocks (spec §5, `on: failure` steps; a service's op steps only). Models the
+// dead-letter or compensation path of the book's designs (ch. 1's and ch. 4's: a request that
+// failed is logged, or queued to be handled later), [{to: db, op: write}, {to: log, op: write,
+// on: failure}]. A
+// failure block reports on its ANCHOR, the nearest unconditional step before it (or the parallel
+// group that step belongs to, as a whole), and carries the requests the anchor failed:
+//   sent = rate × S_anchor × (1 − d_anchor) × factor
+// with S_anchor the survival where the anchor starts (the steps BEFORE it thin the failure step
+// too: a request lost earlier never reached the anchor, so it cannot fail there) and d_anchor the
+// anchor's delivered fraction (Π d over a parallel group: a request any member lost failed), read
+// one simulation step late like every thinning (`forward`). It is not thinned by its anchor (a
+// request that failed there is exactly the one sent on), nor by another failure block (two in a
+// row report on the same anchor, each the same share). What it does is not fed back: its requests
+// had failed already, so its own losses fail no request (it adds nothing to `delivered` and does
+// not thin the steps after it), and its latency is not in the op's response: `response` is the
+// time of a request that goes through every step it waits for, and no such request takes a
+// failure step (an `on: miss` block, by contrast, is taken by requests that are still answered, so
+// its legs are in the response, weighted by its share). Ignored: the failed request's own latency
+// (how long it waited before failing: a timeout's worth, say) and anything the failure step does
+// to the request itself (it is not answered after all: no retry here, a client's or pool's
+// `retries` are that). After a step that loses nothing it sends nothing: 1 − 1 = 0.
 // Pattern: Delegation (composition over inheritance) — ServiceBehaviour (its `ops` steps),
 // CacheBehaviour (its store hop and its `then` steps), BlobStoreBehaviour (its events) and
 // WorkerPoolBehaviour (its hand-offs) each hold one HopBlocks, as the forwarding behaviours hold a
@@ -333,6 +360,9 @@ class HopBlocks {
   // late (behind a 500 ms link at 100 ms steps the later calls are sent the full flow until
   // 0.6 s). Calls that load one another's losses can lock `run` into a sawtooth (the engine's
   // estimate() says when, and how settle mode avoids it).
+  //
+  // A failure block (see the class comment) is sent rate × S_anchor × (1 − d_anchor) and changes S
+  // in no way: the steps after it are thinned as if it were not there.
   void forward(std::string_view op, Rate rate, std::vector<Outgoing>& outgoing,
                FractionLookup auto&& delivered_last_step) const {
     const auto blocks = blocks_of(op);
@@ -340,6 +370,11 @@ class HopBlocks {
     double alive = 1.0;                // S: the share no earlier call has failed
     std::optional<double> group_sent;  // the S every member of the parallel group is sent
     for (const Block& block : blocks) {
+      if (block.reports_on) {
+        forward_failed(blocks, block, rate.per_second, group_survival, outgoing,
+                       delivered_last_step);
+        continue;
+      }
       if (block.mode == model::StepMode::sequential) {
         forward_block(block, rate.per_second * alive, outgoing, delivered_last_step);
         alive *= survival(block, delivered_last_step);
@@ -366,6 +401,7 @@ class HopBlocks {
     flow::LatencyEstimate total = own;
     flow::LatencyEstimate slowest_parallel{};  // running max: no buffer of branches
     for (const Block& block : blocks_of(op)) {
+      if (block.reports_on) continue;  // taken by failed requests only (the class comment)
       const auto legs = waited_legs(block, downstream);
       if (!legs) continue;  // every hop is asynchronous: adds no latency to the caller
       // A block taken by a share of the requests only (the miss steps of a lookup) is the
@@ -387,11 +423,14 @@ class HopBlocks {
   // `mixture`); asynchronous hops are hand-offs that cannot fail the caller and are skipped.
   // A block taken by a share f of the requests only fails those: a request gets through it
   // with probability (1 − f) + f · Π d_i (a split between "not taken", which always passes,
-  // and "taken", which passes only if every hop of the block answers).
+  // and "taken", which passes only if every hop of the block answers). A failure block fails
+  // nothing: its requests had failed already (the class comment).
   [[nodiscard]] double delivered(std::string_view op, double own,
                                  FractionLookup auto&& downstream) const {
     double fraction = own;
-    for (const Block& block : blocks_of(op)) fraction *= survival(block, downstream);
+    for (const Block& block : blocks_of(op)) {
+      if (!block.reports_on) fraction *= survival(block, downstream);
+    }
     return fraction;
   }
 
@@ -417,6 +456,43 @@ class HopBlocks {
       if (block.mode == model::StepMode::parallel) through *= survival(block, downstream);
     }
     return through;
+  }
+
+  // Sends failure block `failed` the requests its anchor failed (the class comment):
+  //   rate × S_anchor × (1 − d_anchor), d_anchor = the group's Π d when the anchor is a group.
+  // Nothing at all when the anchor lost nothing, not even an empty flow entry: a failure step
+  // behind a lossless step routes exactly as if it were not there.
+  static void forward_failed(std::span<const Block> blocks, const Block& failed, double rate_per_s,
+                             double group_survival, std::vector<Outgoing>& outgoing,
+                             FractionLookup auto&& downstream) {
+    const Block& anchor = blocks[*failed.reports_on];
+    const double got_through =
+        anchor.mode == model::StepMode::parallel ? group_survival : survival(anchor, downstream);
+    const double failed_share = 1.0 - got_through;
+    if (failed_share <= 0.0) return;
+    const double reached_anchor =
+        alive_before(blocks, *failed.reports_on, group_survival, downstream);
+    forward_block(failed, rate_per_s * reached_anchor * failed_share, outgoing, downstream);
+  }
+
+  // S where block `anchor` starts (a sequential block, or the first member of the parallel group):
+  // the survivals of the blocks before it, the parallel group's once as a whole, failure blocks
+  // none (they thin nothing). The same product, in the same order, as `forward`'s running S.
+  [[nodiscard]] static double alive_before(std::span<const Block> blocks, std::size_t anchor,
+                                           double group_survival,
+                                           FractionLookup auto&& downstream) {
+    double alive = 1.0;
+    bool group_counted = false;
+    for (const Block& block : blocks.first(anchor)) {
+      if (block.reports_on) continue;
+      if (block.mode == model::StepMode::sequential) {
+        alive *= survival(block, downstream);
+      } else if (!group_counted) {
+        alive *= group_survival;
+        group_counted = true;
+      }
+    }
+    return alive;
   }
 
   // Sends each hop of `block` its part of `requests_per_s`, the requests alive when the block
@@ -489,21 +565,22 @@ export namespace simsys::behaviours {
 // own sojourn is the node's one service time: the queue is not a multi-class one), the burstiness a
 // cost adds (a cost-c request arrives as a batch of c units at once, so Kingman's `burstiness`, the
 // SCV of arrivals taken unit by unit, understates its arrival variability and the queueing wait
-// with it), retries and timeouts, and `on: failure` steps: phase 2a models no failures, so those
-// never fire here. A service has no `then` steps either (the loader rejects them for this type):
-// everything it sends is per op. Hops that close a call cycle are asynchronous hand-offs (see
-// `response`). A step after a failed step does not run (spec §19 entry 11; ch. 8's shorten: a URL
-// whose id was not issued is never written): each step is sent only the requests every step before
-// it answered, and the parallel group fails as a whole (route, detail::HopBlocks::forward), with
-// the fractions of the previous simulation step. Cache-aside (spec §17 entry 7; the pattern ch. 1
-// draws, which the book calls read-through: the application reads the cache and fetches a miss
-// itself): a step `{to: db, on: miss}` after a step to a cache is taken by the cache's miss
-// fraction 1 − h of the requests only (graph::Graph::service_hops resolves that `fraction` once):
-// it forwards rate × factor × (1 − h) (the factor counting every missed lookup), costs the response
-// (1 − h) × the hop on average plus the spread between hit and miss (conditional_hop), and fails a
-// request only when it is taken (`delivered`). The miss steps after one lookup form one Block: a
-// miss takes all of them, one after another, so the block is one conditional hop over the sum of
-// their legs, and a miss is answered only if every fetch is.
+// with it), retries and timeouts. An `on: failure` step is sent the requests the step it reports
+// on failed and fails none itself (spec §5; detail::HopBlocks, failure blocks: the dead-letter or
+// compensation path of a write that failed). A service has no `then` steps either (the loader
+// rejects them for this type): everything it sends is per op. Hops that close a call cycle are
+// asynchronous hand-offs (see `response`). A step after a failed step does not run (spec §19 entry
+// 11; ch. 8's shorten: a URL whose id was not issued is never written): each step is sent only the
+// requests every step before it answered, and the parallel group fails as a whole (route,
+// detail::HopBlocks::forward), with the fractions of the previous simulation step. Cache-aside
+// (spec §17 entry 7; the pattern ch. 1 draws, which the book calls read-through: the application
+// reads the cache and fetches a miss itself): a step `{to: db, on: miss}` after a step to a cache
+// is taken by the cache's miss fraction 1 − h of the requests only (graph::Graph::service_hops
+// resolves that `fraction` once): it forwards rate × factor × (1 − h) (the factor counting every
+// missed lookup), costs the response (1 − h) × the hop on average plus the spread between hit and
+// miss (conditional_hop), and fails a request only when it is taken (`delivered`). The miss steps
+// after one lookup form one Block: a miss takes all of them, one after another, so the block is one
+// conditional hop over the sum of their legs, and a miss is answered only if every fetch is.
 class ServiceBehaviour {
  public:
   ServiceBehaviour(const graph::Graph& g, std::size_t self);
@@ -563,6 +640,13 @@ class ServiceBehaviour {
 
  private:
   void add_hops(const graph::Graph& g, const std::string& op);
+  [[nodiscard]] static detail::Block* open_miss_block(std::vector<detail::Block>& blocks,
+                                                      std::size_t lookup);
+  [[nodiscard]] static std::optional<std::size_t> anchor_block(
+      std::span<const detail::Block> blocks, std::span<const std::size_t> block_of_hop,
+      std::optional<std::size_t> reports_on);
+  [[nodiscard]] detail::Hop hop_of(const graph::Graph& g, std::string_view op,
+                                   const graph::ServiceHop& resolved) const;
   [[nodiscard]] std::optional<detail::MissesOf> misses_of_lookup(
       const graph::Graph& g, const std::string& op, std::optional<std::size_t> lookup) const;
 
@@ -1670,10 +1754,11 @@ class WorkerPoolBehaviour {
 // the node's drop rate like a full queue's overflow, and the `own` share it hands `delivered`
 // already lacks them: this behaviour forwards nothing, composes nothing and must not apply f a
 // second time. A failure is the provider failing, not a policy working: nothing is ever counted as
-// rejected. Ignored: retries (an `on: failure` step never fires before phase 3, so a failed push is
-// simply lost), the provider's latency rising with our load (its queue is our account's quota, not
-// its fleet), failures that cost a different time than a success, and `politeness` (printed, not
-// modelled: it needs per-host state, phase 3).
+// rejected. Ignored: retries (an `on: failure` step after the call to the sink sends its failed
+// share on, detail::HopBlocks, but nothing sends a failed push again: it is lost), the provider's
+// latency rising with our load (its queue is our account's quota, not its fleet), failures that
+// cost a different time than a success, and `politeness` (printed, not modelled: it needs per-host
+// state, phase 3).
 class ExternalSinkBehaviour {
  public:
   ExternalSinkBehaviour(const graph::Graph& g, std::size_t self);
@@ -2000,35 +2085,75 @@ double ServiceBehaviour::cost(std::string_view op) const {
 }
 
 // The graph's resolved hops (graph::Graph::service_hops), minus those no request takes: an
-// `on: failure` step (taken by no request: only an external sink fails, and nothing reacts to
-// a failure before phase 3) and an `on: miss` step after a cache
-// that always hits. Such a hop forwards nothing and adds nothing, so it is left out rather
-// than carried as a zero branch. Each unconditional hop opens a block of its own; a miss hop
-// joins the block of the miss hops of the same lookup before it (detail::Block).
+// `on: miss` step after a cache that always hits. Such a hop forwards nothing and adds nothing, so
+// it is left out rather than carried as a zero branch. Each unconditional hop opens a block of its
+// own, and so does each `on: failure` hop, anchored at the block of the step it reports on (the
+// group's first member if that step is in the parallel group: detail::HopBlocks reports on the
+// group as a whole); a miss hop joins the block of the miss hops of the same lookup before it
+// (detail::Block), failure blocks between them notwithstanding.
 void ServiceBehaviour::add_hops(const graph::Graph& g, const std::string& op) {
   using detail::Block;
-  using detail::Hop;
   auto& blocks = hops_.blocks_for(op);
-  for (const graph::ServiceHop& resolved : g.service_hops(self_, op)) {
+  const auto resolved_hops = g.service_hops(self_, op);
+  // Which block each resolved hop went into: what a failure hop's `reports_on` (a hop position)
+  // becomes. Unconditional hops, the only ones a failure hop reports on, are never left out.
+  std::vector<std::size_t> block_of_hop(resolved_hops.size());
+  for (std::size_t position = 0; position < resolved_hops.size(); ++position) {
+    const graph::ServiceHop& resolved = resolved_hops[position];
     if (resolved.fraction <= 0.0) continue;
-    const bool same_miss_block =
-        resolved.lookup && !blocks.empty() && blocks.back().lookup == resolved.lookup;
-    if (!same_miss_block) {
-      blocks.push_back(Block{.fraction = resolved.fraction,
-                             .mode = resolved.mode,
-                             .lookup = resolved.lookup,
-                             .misses = misses_of_lookup(g, op, resolved.lookup)});
+    auto* block = resolved.lookup ? open_miss_block(blocks, *resolved.lookup) : nullptr;
+    if (block == nullptr) {
+      blocks.push_back(
+          Block{.fraction = resolved.fraction,
+                .mode = resolved.mode,
+                .lookup = resolved.lookup,
+                .misses = misses_of_lookup(g, op, resolved.lookup),
+                .reports_on = anchor_block(blocks, block_of_hop, resolved.reports_on)});
+      block = &blocks.back();
     }
-    // Graph::build already proved a link carries the demand.
-    const auto link = *g.demand_link(self_, resolved.target);
-    blocks.back().hops.push_back(
-        Hop{.op = resolved.op,
-            .target = resolved.target,
-            .link = link,
-            .factor = resolved.factor,
-            .link_leg_s = seconds(g.links()[link].one_way),
-            .asynchronous = g.is_async_hop(self_, op, resolved.target, resolved.op)});
+    block_of_hop[position] = static_cast<std::size_t>(block - blocks.data());
+    block->hops.push_back(hop_of(g, op, resolved));
   }
+}
+
+// The block of the miss hops after lookup `lookup` if one is open (the last block that is not a
+// failure block), else none: a new one starts.
+detail::Block* ServiceBehaviour::open_miss_block(std::vector<detail::Block>& blocks,
+                                                 std::size_t lookup) {
+  // C++20 std::views::reverse: the blocks from the last one back, lazily, replacing a reverse
+  // iterator loop (rbegin/rend) or an index counting down.
+  for (detail::Block& block : blocks | std::views::reverse) {
+    if (block.reports_on) continue;
+    return block.lookup == lookup ? &block : nullptr;
+  }
+  return nullptr;
+}
+
+// The block a failure hop reports on (`reports_on`, the position of its step among the op's hops),
+// moved back to the first member of the parallel group if that block is in it; empty for any other
+// hop.
+std::optional<std::size_t> ServiceBehaviour::anchor_block(std::span<const detail::Block> blocks,
+                                                          std::span<const std::size_t> block_of_hop,
+                                                          std::optional<std::size_t> reports_on) {
+  if (!reports_on) return std::nullopt;
+  std::size_t anchor = block_of_hop[*reports_on];
+  while (anchor > 0 && blocks[anchor].mode == model::StepMode::parallel &&
+         blocks[anchor - 1].mode == model::StepMode::parallel) {
+    --anchor;
+  }
+  return anchor;
+}
+
+// The hop `resolved` makes, over the link Graph::build already proved carries its demand.
+detail::Hop ServiceBehaviour::hop_of(const graph::Graph& g, std::string_view op,
+                                     const graph::ServiceHop& resolved) const {
+  const auto link = *g.demand_link(self_, resolved.target);
+  return detail::Hop{.op = resolved.op,
+                     .target = resolved.target,
+                     .link = link,
+                     .factor = resolved.factor,
+                     .link_leg_s = seconds(g.links()[link].one_way),
+                     .asynchronous = g.is_async_hop(self_, op, resolved.target, resolved.op)};
 }
 
 // The cache a miss block's lookup asks (graph::ServiceHop::lookup, a position among the op's hops)
@@ -2340,10 +2465,11 @@ void CacheBehaviour::add_backend_block(const graph::Graph& g, const std::string&
 
 // Each `on: always` then-step is a block of its own, in its declared mode; the `on: miss` ones
 // share one sequential block, taken by the miss fraction graph::Graph::then_fraction gives
-// (1 − h of a read; 0 of a write, which adds no block). A step no request takes (`on:
-// failure` before phase 3, a miss step on a write) is left out, as in ServiceBehaviour. A blob
-// store's steps are all unconditional (graph::Graph refuses one on miss or on failure): a block
-// each for a write, none for a read (then_fraction 0: an event fires for a write only).
+// (1 − h of a read; 0 of a write, which adds no block). A step no request takes (a miss step on a
+// write) is left out, as in ServiceBehaviour; an `on: failure` step is refused in a `then` list
+// (graph::Graph::then_fraction). A blob store's steps are all unconditional (graph::Graph refuses
+// one on miss or on failure): a block each for a write, none for a read (then_fraction 0: an event
+// fires for a write only).
 std::optional<detail::MissesOf> detail::own_misses(const graph::Graph& g, std::size_t self,
                                                    std::string_view op) {
   if (graph::is_write(g.nodes()[self].spec, op)) return std::nullopt;

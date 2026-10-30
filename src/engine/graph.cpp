@@ -267,10 +267,18 @@ namespace {
 //  - a step on miss in parallel: a miss waits for its then steps (the cache answers it only once
 //    the next tier has), so the step cannot be timed beside the lookup, as a service's miss step
 //    cannot (Graph::invalid_miss_step);
-//  - a step that duplicates the backend hop (duplicates_backend_hop).
+//  - a step that duplicates the backend hop (duplicates_backend_hop);
+//  - a step on failure: an `on: failure` step reports on a step of an op's step list, the nearest
+//    unconditional one before it (Graph::resolve_service_hop), and a cache's `then` list follows no
+//    such step. Phase 2 kept it and never fired it; refused since failure steps fire (spec §5).
 [[nodiscard]] std::optional<EngineError> invalid_then_steps(const model::NodeSpec& spec) {
   const std::string name = "node '" + spec.id + "': ";
   for (const model::Step& step : spec.then) {
+    if (step.on == model::StepCondition::failure) {
+      return EngineError{name +
+                         "a then step on failure is not modelled at a cache (an on: failure step "
+                         "reports on a step of an op's step list)"};
+    }
     const bool on_miss = step.on == model::StepCondition::miss;
     if (on_miss && fetches_read_misses(spec)) {
       return EngineError{name +
@@ -1209,10 +1217,12 @@ struct CallHop {
   std::optional<Bytes> size{};
 };
 
-// A service's (or any node's) `ops` steps for `op`: every step but `on: failure` (only an external
-// sink fails, and nothing reacts to a failure before phase 3). An `on: miss` step carries the
-// misses of its lookup, the nearest unconditional step before it (as Graph::resolve_service_hops
-// pairs them; a miss step after something that is no cache is refused there, and inherits here).
+// A service's (or any node's) `ops` steps for `op`, every one of them. An `on: miss` step carries
+// the misses of its lookup, the nearest unconditional step before it (as
+// Graph::resolve_service_hops pairs them; a miss step after something that is no cache is refused
+// there, and inherits here). An `on: failure` step carries the requests the step it reports on
+// failed (spec §5): any of the requests, so the keys and the size travel on it as on an
+// unconditional step, and it is no lookup for a miss step after it.
 void add_op_step_hops(const Graph& g, const model::NodeSpec& spec, std::string_view op,
                       std::vector<CallHop>& hops) {
   const auto steps = spec.ops.find(std::string{op});
@@ -1222,7 +1232,8 @@ void add_op_step_hops(const Graph& g, const model::NodeSpec& spec, std::string_v
     const auto target = *g.index_of(step.to);  // connect_step resolved every target
     switch (step.on) {
       case model::StepCondition::failure:
-        continue;  // never fires before phase 3; see the size walk's phase 3 note
+        hops.push_back({.to = target, .op = step.op, .size = step.size});
+        break;
       case model::StepCondition::always:
         lookup = hits_or_misses(g.nodes()[target].spec.type) ? std::optional{target} : std::nullopt;
         hops.push_back({.to = target, .op = step.op, .size = step.size});
@@ -1421,12 +1432,12 @@ void walk_client_keys(const Graph& g, std::size_t client,
 // Assumed: one size per (node, op) (spec §19 entry 1: each op's size is its mean; a flow that
 // carries bytes per op is phase 3).
 //
-// Phase 3 note: the walk skips `on: failure` steps (call_hops leaves them out through
-// add_op_step_hops, and add_sized_step_seed seeds none), because they never fire before phase 3. So
-// an unsized `on: failure` step over a bandwidth link is never priced: its (node, op) has no size,
-// and the link's pipe has no megabytes for the op. Once failure steps fire, engine::megabytes_of
-// would throw on the first such request. Whoever makes them fire walks them for sizes too (or
-// refuses them over a pipe).
+// `on: failure` steps are walked like any step (spec §5: they fire since phase 3): call_hops
+// follows them through add_op_step_hops and add_sized_step_seed seeds a sized one, so an unsized
+// failure step over a bandwidth link is refused with every unsized step's message
+// (unpriced_on_pipe), and a sized one is priced at its `size:`. (Phase 2 skipped them, since they
+// never fired; an unsized one over a pipe would have made engine::megabytes_of throw once they
+// did.)
 
 // A vertex of the size walk: `op` at `node`, `size` bytes long (unsized when empty), its size
 // set (or left unset) by `origin`, a client or the node of a step.
@@ -1519,7 +1530,7 @@ void add_client_seeds(const Graph& g, std::size_t client, std::vector<Seed<SizeS
 // comment): the size holds wherever the step fires.
 void add_sized_step_seed(const Graph& g, std::size_t node, const model::Step& step,
                          std::vector<Seed<SizeStream>>& seeds) {
-  if (!step.size || step.on == model::StepCondition::failure) return;
+  if (!step.size) return;
   const SizeStream stream{
       .node = *g.index_of(step.to), .op = step.op, .size = step.size, .origin = node};
   seeds.push_back({.sender = node, .vertex = stream});
@@ -2282,9 +2293,10 @@ double Graph::miss_fraction(std::size_t cache) const {
 }
 
 // The share of requests that take `step` (ServiceHop's `fraction`): every request for an
-// unconditional step, none for an `on: failure` step (external sinks fail, but no step reacts to
-// a failure before phase 3), the miss fraction of `looked_up`, the cache the step's lookup asked,
-// for an `on: miss` step (invalid_miss_step has made sure there is one).
+// unconditional step, every request the step it reports on failed for an `on: failure` step (how
+// many failed is the engine's to measure, behaviours::detail::HopBlocks), the miss fraction of
+// `looked_up`, the cache the step's lookup asked, for an `on: miss` step (invalid_miss_step has
+// made sure there is one).
 double Graph::hop_fraction(const model::Step& step, std::optional<std::size_t> looked_up) const {
   // `using enum` (see replica_model_of): the conditions by their short names.
   using enum model::StepCondition;
@@ -2292,7 +2304,7 @@ double Graph::hop_fraction(const model::Step& step, std::optional<std::size_t> l
     case always:
       return 1.0;
     case failure:
-      return 0.0;
+      return 1.0;
     case miss:
       return miss_fraction(*looked_up);
   }
@@ -2341,34 +2353,67 @@ std::optional<EngineError> Graph::invalid_miss_step(std::size_t node, const mode
   return std::nullopt;
 }
 
+// Why an `on: failure` step cannot report on `last_unconditional` (the nearest unconditional step
+// before it, or nothing), if it cannot. It needs a step to report on, and it runs once that step
+// has failed (spec §5: a sequential hop), so it cannot be timed beside it in a parallel group.
+std::optional<EngineError> Graph::invalid_failure_step(
+    std::size_t node, const model::Step& step,
+    std::optional<std::size_t> last_unconditional) const {
+  const std::string name = "node '" + nodes_[node].spec.id + "': an on: failure step ";
+  if (!last_unconditional) return EngineError{name + "needs a step before it"};
+  if (step.mode == model::StepMode::parallel) {
+    return EngineError{name +
+                       "must be sequential (it runs after the step it reports on has failed)"};
+  }
+  return std::nullopt;
+}
+
 // Each op's steps in order, with the share of requests that take each and the requests each
-// sends (ServiceHop). An `on: miss` step belongs to the nearest unconditional step before it,
-// its lookup, which must ask a cache for a read (invalid_miss_step):
-// [cache.get, db.read on miss, cache.set on miss] is one lookup and what follows its miss.
+// sends (ServiceHop). A conditional step belongs to the nearest unconditional step before it: an
+// `on: miss` step to its lookup, which must ask a cache for a read (invalid_miss_step), and an
+// `on: failure` step to the step whose failures it is sent (invalid_failure_step):
+// [cache.get, db.read on miss, cache.set on miss] is one lookup and what follows its miss, and in
+// [db.write, log.write on failure, audit.write on failure] both failure steps report on db.write.
 // connect_step has already resolved every target.
 Graph::Result Graph::resolve_service_hops(std::size_t node) {
   for (const auto& [op, steps] : nodes_[node].spec.ops) {
     auto& hops = service_hops_[node][op];
-    std::optional<std::size_t> lookup;  // position in `hops` of the last unconditional step
+    std::optional<std::size_t> last_unconditional;  // its position in `hops`
     for (const model::Step& step : steps) {
-      ServiceHop hop{
-          .target = *index_of(step.to), .op = step.op, .mode = step.mode, .factor = step.factor};
-      std::optional<std::size_t> looked_up;  // the cache a miss step's lookup asked
-      if (step.on == model::StepCondition::miss) {
-        const ServiceHop* asked = lookup ? &hops[*lookup] : nullptr;
-        if (auto invalid = invalid_miss_step(node, step, asked)) {
-          return std::unexpected{std::move(*invalid)};
-        }
-        looked_up = asked->target;
-        hop.factor *= asked->factor;  // every missed lookup is fetched (ServiceHop)
-        hop.lookup = lookup;
-      }
-      hop.fraction = hop_fraction(step, looked_up);
-      if (step.on == model::StepCondition::always) lookup = hops.size();
-      hops.push_back(std::move(hop));
+      auto hop = resolve_service_hop(node, step, hops, last_unconditional);
+      if (!hop) return std::unexpected{std::move(hop.error())};
+      if (step.on == model::StepCondition::always) last_unconditional = hops.size();
+      hops.push_back(std::move(*hop));
     }
   }
   return {};
+}
+
+// One step of node `node`'s op, resolved against the op's hops before it (`hops`, the last
+// unconditional one at `last_unconditional`), or why it cannot be.
+std::expected<ServiceHop, EngineError> Graph::resolve_service_hop(
+    std::size_t node, const model::Step& step, std::span<const ServiceHop> hops,
+    std::optional<std::size_t> last_unconditional) const {
+  ServiceHop hop{
+      .target = *index_of(step.to), .op = step.op, .mode = step.mode, .factor = step.factor};
+  std::optional<std::size_t> looked_up;  // the cache a miss step's lookup asked
+  if (step.on == model::StepCondition::miss) {
+    const ServiceHop* asked = last_unconditional ? &hops[*last_unconditional] : nullptr;
+    if (auto invalid = invalid_miss_step(node, step, asked)) {
+      return std::unexpected{std::move(*invalid)};
+    }
+    looked_up = asked->target;
+    hop.factor *= asked->factor;  // every missed lookup is fetched (ServiceHop)
+    hop.lookup = last_unconditional;
+  }
+  if (step.on == model::StepCondition::failure) {
+    if (auto invalid = invalid_failure_step(node, step, last_unconditional)) {
+      return std::unexpected{std::move(*invalid)};
+    }
+    hop.reports_on = last_unconditional;
+  }
+  hop.fraction = hop_fraction(step, looked_up);
+  return hop;
 }
 
 // Every cache's and CDN's hit ratio, once, before anything reads one (resolve_hops' miss
@@ -3092,7 +3137,7 @@ void Graph::pass_on(std::size_t node, const std::string& op, const Arrive& arriv
 // Does a `then` step of cache or blob store `node` carry some of the requests of `op` that arrive
 // at it? then_fraction says: an unconditional one all of them (a blob store's, all of a write and
 // none of a read), an `on: miss` one the misses of a read (none if the cache never misses) and
-// nothing of a write, an `on: failure` one nothing before phase 3.
+// nothing of a write, an `on: failure` one nothing (refused in a then list: then_fraction).
 bool Graph::carries_flow(std::size_t node, const model::Step& step, std::string_view op) const {
   return then_fraction(node, step, op) > 0.0;
 }

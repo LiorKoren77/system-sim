@@ -1415,7 +1415,11 @@ void Simulation::require_scenario_step(SimTime dt) const {
 // behaviours::detail::HopBlocks::forward), and a pass can thin a later step only by delivered
 // fractions measured in an earlier pass (the backward pass runs after the forward one). So the
 // first pass sends every step the full flow, and the passes after it carry each loss one step
-// further down an op's steps: a chain of k lossy steps settles in about k + 1 passes more. A loss
+// further down an op's steps: a chain of k lossy steps settles in about k + 1 passes more. An `on:
+// failure` step reads the same fractions the other way round (it is sent 1 − d of the step it
+// reports on: HopBlocks' failure blocks), so its flow starts at 0 in the first pass and rises as
+// the losses arrive; it feeds nothing back (its own losses fail no request), so it settles one
+// pass after the d it reads and makes no loop of its own. A loss
 // that feeds back on itself (a node called several times by one op, [a, a, a, a, a], whose later
 // calls are thinned by its own loss, or two ops whose losses load each other's nodes) is a
 // fixed-point iteration of its own, d = f(d): the more a delivers, the more its later calls are

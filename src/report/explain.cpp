@@ -1048,7 +1048,10 @@ void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_
   const OpLoad arriving = load[from];  // a copy: a step may target `from` itself
   for (const auto& [op, rate] : arriving) {
     for (const graph::ServiceHop& hop : g.service_hops(from, op)) {
-      if (hop.fraction <= 0.0) continue;  // never taken (on: failure, or a cache that always hits)
+      if (hop.fraction <= 0.0) continue;  // never taken (a cache that always hits)
+      // An `on: failure` step is sent what the step it reports on failed (graph::ServiceHop), and
+      // on paper nothing fails: it adds nothing to the load.
+      if (hop.reports_on) continue;
       const auto link = g.demand_link(from, hop.target);
       if (!link) continue;  // Graph::build proved it exists; skip defensively
       auto& destination = g.links()[*link].feedback ? fed_back : load;
