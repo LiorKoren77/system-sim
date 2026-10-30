@@ -700,6 +700,27 @@ states 10k/s; `tests/theory/test_gateways.cpp`'s header says Euler at 1 s is "0.
 within 1 % of the twin, so a crossing counts (a gateway probe reported recovery 0 s after the
 fault, before its overshoot); the per-seed JSON under `--replications` lacks `deduplicated_per_s`.
 
+**Review of Task 19 at `df1c988`** (adversarial, bounded, 2026-10-30): REQUEST_CHANGES. The README's
+chat-system block and `--replications` excerpt, the schema's retry sweep, the warm-up and Euler
+tables, every refusal message, the JSON key table against real output (both directions), the CSV
+header, anchors and links, §20's entries 5, 7, 8, 9, 11, 12, 15 against the plan all verified.
+1. Important: `numerics.md`'s storm recovery "01:31:35, 435 s after" does not reproduce (01:31:45,
+   445 s in four probe variants); the same probe is under-specified (its peak 46.1 % needs the
+   type's default 50k/s; the theory test's 32k/s gives 72 %; `heartbeat`, the step, the cap and
+   the hops are unstated).
+2. Minor: three schema probes (pool `retry_after`, `session`, `failover`) do not say the swept key
+   must be in the file (`sweep` refuses "no such key"); with the key, digit for digit.
+3. Minor: §20 entry 12 omits three Task 15 fix notes (refused own connects not retried, same-step
+   faults split in scenario order, storming users end no session while waiting); entry 15 omits
+   two Task 18 ones (a sink's politeness uses the same drain cap; the crawler's resizing).
+4. Minor: the schema's recovery-rule sentence on the gateway does not parse. 5. Minor: the Euler
+   stability claim is wrong (dt > session oscillates, dt > 2 × session diverges). 6. Minor: two
+   kv_cluster/id_generator table rows are ragged (an unescaped `|` inside backticks). 7. Minor:
+   terms undefined for a book reader: "fixed point", "damped", "thinning" (§12), "exponential
+   wait", "memoryless" (§13), `down_share` (§20). 8. Nit: `explain`'s `partitions: phase 3` is a
+   code string (the code round).
+Decisions: 1–7 fixed in a docs fix round (every probe shown as YAML; the storm figure re-measured);
+8 in the code fix round after the comprehensive review.
 ## Comprehensive phase 3 review, then push
 
 - [ ] An adversarial reviewer (fresh context, own worktree, both presets) checks: warning-free builds and the whole suite; clang-format as CI runs it; conservation from `--series` on all fourteen scenarios (node, link and client rows, `attempts`, `dead_lettered`, `deduplicated`, `connections` included); answered ≤ offered and attempts ≥ offered everywhere; `estimate` = `run` on steady probes with retries, failure steps, fanouts, frontiers and gateways; every fault kind's identity when absent (phase 2 bytes); every README number of the four new scenarios and of the eight that moved; `--replications` byte-identical across `--jobs`; the 3a splits' byte-identity still holds; first-use comments; `Pattern:` labels; test names; functions over ~50 lines; the ten GCC 14.2 workarounds of CLAUDE.md §3; the schema's "chosen" list complete.
