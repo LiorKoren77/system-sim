@@ -13,13 +13,18 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>  // getpid
 
 #include "../support/explain_lines.hpp"
 
@@ -233,7 +238,7 @@ double number(const std::string& cell) {
 
 constexpr std::string_view node_header =
     "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,"
-    "latency_ms,zone,queue_lag_s,connections";
+    "deduplicated_per_s,latency_ms,zone,queue_lag_s,connections";
 constexpr std::string_view op_header =
     "t_s,client,op,offered_per_s,attempts_per_s,answered_per_s,timed_out_per_s,mean_ms";
 
@@ -304,7 +309,7 @@ TEST_CASE("a node series row carries the demand and drain of the NodeSample it w
   const auto rows = data_rows(out.str());
   REQUIRE(rows.size() == 2);  // one row per node: the client's and the server's
   const auto& server = rows[1];
-  REQUIRE(server.size() == 13);
+  REQUIRE(server.size() == 14);
   REQUIRE(server[0] == "0.1");
   REQUIRE(server[1] == "s");
   REQUIRE(server[2] == "1234.5");   // demand_per_s
@@ -314,10 +319,11 @@ TEST_CASE("a node series row carries the demand and drain of the NodeSample it w
   REQUIRE(server[6] == "200");      // drops_per_s
   REQUIRE(server[7] == "");         // dead_lettered_per_s: a service has none, the cell is empty
   REQUIRE(server[8] == "7");        // rejected_per_s
-  REQUIRE(server[9] == "12.5");     // latency_ms: 0.0125 s
-  REQUIRE(server[10] == "green");   // the NodeSample's default zone
-  REQUIRE(server[11] == "");        // queue_lag_s: a service has no lag, the cell is empty
-  REQUIRE(server[12] == "");        // connections: a service holds none, the cell is empty
+  REQUIRE(server[9] == "");         // deduplicated_per_s: a service is no fanout, the cell is empty
+  REQUIRE(server[10] == "12.5");    // latency_ms: 0.0125 s
+  REQUIRE(server[11] == "green");   // the NodeSample's default zone
+  REQUIRE(server[12] == "");        // queue_lag_s: a service has no lag, the cell is empty
+  REQUIRE(server[13] == "");        // connections: a service holds none, the cell is empty
 }
 
 TEST_CASE("a client row has zeros for demand and drain: a source queues and serves nothing",
@@ -329,16 +335,16 @@ TEST_CASE("a client row has zeros for demand and drain: a source queues and serv
   run_into(s, g, [&](const auto& r) { writer.observe(r); });
   const auto text = out.str();
   CAPTURE(text);
-  // t, node, demand, drain, rho, backlog, drops, dead_lettered, rejected, latency, zone,
-  // queue_lag_s, connections: a client's engine sample is all zeros (engine.cppm: "a source has no
-  // queue"), its zone is `none` and its dead_lettered and last two cells (a pool's count, a message
-  // queue's lag, a gateway's level) are empty.
-  // C++23 std::string::contains: a substring test in one call, replacing
-  // `find(...) != std::string::npos`.
-  REQUIRE(text.contains("\n0,c,0,0,0,0,0,,0,0,none,,\n"));
+  // t, node, demand, drain, rho, backlog, drops, dead_lettered, rejected, deduplicated, latency,
+  // zone, queue_lag_s, connections: a client's engine sample is all zeros (engine.cppm: "a source
+  // has no queue"), its zone is `none` and its dead_lettered and deduplicated cells and its last
+  // two (a pool's count, a fanout's count, a message queue's lag, a gateway's level) are empty.
+  // C++23 std::string::contains: a substring test in one call, replacing `find(...) !=
+  // std::string::npos`.
+  REQUIRE(text.contains("\n0,c,0,0,0,0,0,,0,,0,none,,\n"));
 }
 
-TEST_CASE("every row of a run has thirteen fields, one row per node per step", "[series]") {
+TEST_CASE("every row of a run has fourteen fields, one row per node per step", "[series]") {
   const auto s = mm1(500);  // 500 ms at 100 ms steps: 5 steps
   const auto g = graph_of(s);
   std::ostringstream out;
@@ -348,7 +354,7 @@ TEST_CASE("every row of a run has thirteen fields, one row per node per step", "
   REQUIRE(rows.size() == 5 * 2);  // 5 steps x 2 nodes (the client and the server)
   // C++20 std::ranges::all_of: the algorithm takes the whole range and a predicate, replacing
   // the begin()/end() pair of std::all_of.
-  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 13; }));
+  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 14; }));
 }
 
 // ---- node series: queue_lag_s ----
@@ -389,10 +395,10 @@ TEST_CASE("the node series header has queue_lag_s after zone and connections las
   std::ostringstream out;
   simsys::report::SeriesWriter writer{out, g};
   const auto header = split_commas(header_of(out.str()));
-  REQUIRE(header.size() == 13);
-  REQUIRE(header[11] == "queue_lag_s");
+  REQUIRE(header.size() == 14);
+  REQUIRE(header[12] == "queue_lag_s");
   REQUIRE(header.back() == "connections");  // phase 3 Task 14: a ws_gateway's level
-  REQUIRE(header[10] == "zone");            // the ten columns before it keep their places
+  REQUIRE(header[11] == "zone");            // the eleven columns before them keep their places
 }
 
 TEST_CASE("a message queue's row ends with the lag of its sample and every other row ends empty",
@@ -407,12 +413,12 @@ TEST_CASE("a message queue's row ends with the lag of its sample and every other
   const auto rows = data_rows(out.str());
   REQUIRE(rows.size() == 3);
   REQUIRE(rows[1][1] == "q");
-  REQUIRE(rows[1].size() == 13);
-  REQUIRE(rows[1][11] == "1.5");
+  REQUIRE(rows[1].size() == 14);
+  REQUIRE(rows[1][12] == "1.5");
   for (const auto i : {std::size_t{0}, std::size_t{2}}) {
     CAPTURE(rows[i][1]);
-    REQUIRE(rows[i].size() == 13);
-    REQUIRE(rows[i][11] == "");  // the client's and the pool's: no lag, not a lag of 0
+    REQUIRE(rows[i].size() == 14);
+    REQUIRE(rows[i][12] == "");  // the client's and the pool's: no lag, not a lag of 0
   }
 }
 
@@ -427,12 +433,12 @@ TEST_CASE("a run's queue rows hold the lag in seconds and the client and pool ro
   REQUIRE(rows.size() == 10 * 3);  // 10 steps x (u, q, w)
   for (const auto& row : rows) {
     CAPTURE(row[0], row[1]);
-    REQUIRE(row.size() == 13);
+    REQUIRE(row.size() == 14);
     if (row[1] == "q") {
-      REQUIRE_FALSE(row[11].empty());
-      REQUIRE(number(row[11]) >= 0.0);
+      REQUIRE_FALSE(row[12].empty());
+      REQUIRE(number(row[12]) >= 0.0);
     } else {
-      REQUIRE(row[11].empty());
+      REQUIRE(row[12].empty());
     }
   }
   // C++20 std::ranges::find_if: the range itself and a predicate, replacing std::find_if's
@@ -440,7 +446,7 @@ TEST_CASE("a run's queue rows hold the lag in seconds and the client and pool ro
   const auto last_q =
       std::ranges::find_if(rows, [](const auto& row) { return row[0] == "0.9" && row[1] == "q"; });
   REQUIRE(last_q != rows.end());
-  REQUIRE_THAT(number((*last_q)[11]), WithinAbs(0.25, 1e-6));  // 300 waiting / 1200 a second
+  REQUIRE_THAT(number((*last_q)[12]), WithinAbs(0.25, 1e-6));  // 300 waiting / 1200 a second
 }
 
 // The fluid queue's balance, step by step: demand·dt = (drain + dropped)·dt + Δbacklog. Summed
@@ -1201,7 +1207,7 @@ TEST_CASE("explain notes that a node fed by failure steps only is sized by run o
 // ---- A link's bandwidth is a pipe: its rows in the series and the JSON ----
 //
 // A link with a bandwidth is a queue of megabytes and is plotted like a node: one CSV row per
-// step with the link's name, `from->to`, in the `node` column, the same thirteen columns, in
+// step with the link's name, `from->to`, in the `node` column, the same fourteen columns, in
 // MEGABYTES (a rate of MB/s; engine::StepRecord::links, one LinkSample per bandwidth link). So
 // the conservation law holds on those rows too, and a student checks the pipe from the file.
 // The JSON gets `links`: one object per bandwidth link (an empty array without any).
@@ -1233,7 +1239,7 @@ double number_of_key(const std::string& object, std::string_view key_prefix) {
 }  // namespace
 
 TEST_CASE(
-    "a link row of the node series carries the LinkSample it was fed, in the same thirteen columns",
+    "a link row of the node series carries the LinkSample it was fed, in the same fourteen columns",
     "[series]") {
   const auto s = piped(100);
   const auto g = graph_of(s);
@@ -1259,7 +1265,7 @@ TEST_CASE(
   const auto found = std::ranges::find_if(rows, [](const auto& row) { return row[1] == "a->b"; });
   REQUIRE(found != rows.end());
   const auto& row = *found;
-  REQUIRE(row.size() == 13);
+  REQUIRE(row.size() == 14);
   REQUIRE(row[0] == "0.1");
   REQUIRE(row[2] == "100.5");   // demand_per_s, MB/s
   REQUIRE(row[3] == "100.25");  // drain_per_s
@@ -1268,10 +1274,11 @@ TEST_CASE(
   REQUIRE(row[6] == "5");       // drops_per_s
   REQUIRE(row[7] == "");        // dead_lettered_per_s: a pipe is not a worker pool
   REQUIRE(row[8] == "0");       // rejected_per_s: a pipe refuses nothing by policy
-  REQUIRE(row[9] == "12.5");    // latency_ms: 0.0125 s
-  REQUIRE(row[10] == "yellow");
-  REQUIRE(row[11] == "");  // queue_lag_s: a pipe is not a message queue
-  REQUIRE(row[12] == "");  // connections: a pipe is not a websocket gateway
+  REQUIRE(row[9] == "");        // deduplicated_per_s: a pipe is no fanout
+  REQUIRE(row[10] == "12.5");   // latency_ms: 0.0125 s
+  REQUIRE(row[11] == "yellow");
+  REQUIRE(row[12] == "");  // queue_lag_s: a pipe is not a message queue
+  REQUIRE(row[13] == "");  // connections: a pipe is not a websocket gateway
 }
 
 // 1000 puts/s of 1 MB offer the pipe 1000 MB/s against 125 MB/s: the backlog grows by
@@ -1288,7 +1295,7 @@ TEST_CASE("the conservation identity holds on the link rows read back from the s
   const auto rows = data_rows(out.str());
   CAPTURE(out.str());
   REQUIRE(rows.size() == 30 * 3);  // 30 steps x (the client, b and the link)
-  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 13; }));
+  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 14; }));
   constexpr double dt = 0.1;
   double demand = 0.0;
   double drain = 0.0;
@@ -1370,6 +1377,14 @@ TEST_CASE("the JSON has an empty links array when no link has a bandwidth", "[se
 // 61e047c (which reproduces the previous hash, 0xd0b4c7d05759bd57) with that header and that empty
 // cell inserted, hashed with this function: 0x6e28178622e2c40f.
 //
+// Re-pinned on purpose (phase 3 Task 17): the node series gained a `deduplicated_per_s` column
+// right after `rejected_per_s` (a notification fanout's count of notifications its dedup step
+// dropped; empty on every row of a node that is not a fanout, so on every row of the chain), and
+// nothing else changed: the header has `,deduplicated_per_s` after `rejected_per_s` and each of the
+// 3,600 rows an empty cell (`,,`) in the same place. Derived like the ones above: the series of the
+// binary at 35a5f3f (which reproduces the previous hash, 0x6e28178622e2c40f) with that header and
+// that empty cell inserted, hashed with this function: 0xcd39f2a0b1120785.
+//
 // Re-pinned on purpose: the op series gained a `timed_out_per_s` column after `answered_per_s`, 0
 // on every row of the chain (its client has no timeout), and nothing else changed. Derived the same
 // way: the op series of the binary at 691a3ef (which reproduces the old hash, 0x9dfc7de84e1afe59)
@@ -1383,6 +1398,11 @@ TEST_CASE("the JSON has an empty links array when no link has a bandwidth", "[se
 // at a145019 (which reproduces the previous hash, 0x6e28178622e2c40f) with `,connections` appended
 // to its header and `,` to each of its rows, hashed with this function: 0xebb414ef9f9cb564; the
 // binary with the column writes exactly that. The op series has no new column: its hash stays.
+//
+// Both columns together (Task 17 rebased onto Task 14): the node series of the Task 17 binary
+// (which reproduces 0xcd39f2a0b1120785) with `,connections` appended to its header and `,` to each
+// of its rows, hashed with this function: 0xb3c6f37ad04aa3ca; the binary with both columns writes
+// exactly that.
 namespace {
 std::uint64_t fnv1a(const std::string& text) {
   std::uint64_t hash = 0xcbf29ce484222325ULL;  // the 64-bit FNV offset basis
@@ -1414,8 +1434,10 @@ TEST_CASE("the tutorial chain's series are byte for byte what they were before l
   REQUIRE(header_of(nodes_out.str()) == node_header);
   // re-pinned for queue_lag_s, then for dead_lettered_per_s (phase 3 Task 11: an empty cell after
   // drops_per_s on every row, since chain has no worker pool), then for connections (phase 3 Task
-  // 14: an empty last cell on every row, since chain has no websocket gateway)
-  REQUIRE(fnv1a(nodes_out.str()) == 0xebb414ef9f9cb564ULL);
+  // 14: an empty last cell on every row, since chain has no websocket gateway), then for
+  // deduplicated_per_s (Task 17: an empty cell after rejected_per_s on every row, since chain has
+  // no fanout)
+  REQUIRE(fnv1a(nodes_out.str()) == 0xb3c6f37ad04aa3caULL);
   // re-pinned for timed_out_per_s, then for attempts_per_s (phase 3 Task 10: the column after
   // offered_per_s, equal to it on every row, since chain has no retries)
   REQUIRE(fnv1a(ops_out.str()) == 0x66f6670d063b5f6fULL);
@@ -1508,7 +1530,7 @@ TEST_CASE("the node series header has dead_lettered_per_s right after drops_per_
   std::ostringstream out;
   simsys::report::SeriesWriter writer{out, g};
   const auto header = split_commas(header_of(out.str()));
-  REQUIRE(header.size() == 13);
+  REQUIRE(header.size() == 14);
   REQUIRE(header[6] == "drops_per_s");
   REQUIRE(header[7] == "dead_lettered_per_s");
   REQUIRE(header[8] == "rejected_per_s");
@@ -1529,7 +1551,7 @@ TEST_CASE("a pool's row carries the dead letters of its sample and every other r
   REQUIRE(rows[2][7] == "0.25");
   for (const auto i : {std::size_t{0}, std::size_t{1}}) {
     CAPTURE(rows[i][1]);
-    REQUIRE(rows[i].size() == 13);
+    REQUIRE(rows[i].size() == 14);
     REQUIRE(rows[i][7] == "");  // the client's and the queue's: not a count of 0
   }
 }
@@ -1570,7 +1592,7 @@ TEST_CASE("a run's pool rows hold the dead letters, 1.6e-4 a second, and the oth
   const auto s = retrying_pool_series(3);
   const auto pool = rows_of_node(s, "w");
   REQUIRE(pool.size() == 50);
-  REQUIRE(pool[0].size() == 13);
+  REQUIRE(pool[0].size() == 14);
   REQUIRE(number(pool[0][7]) == 0.0);  // nobody has used 3 retries at the first step
   REQUIRE_THAT(number(pool.back()[7]), WithinRel(1.6e-4, 1e-6));
   REQUIRE(number(pool.back()[6]) == 0.0);  // drops_per_s: a dead letter is not a drop
@@ -1736,4 +1758,132 @@ TEST_CASE("explain prints failover on the service discovery's line alone", "[ser
     REQUIRE_FALSE(node_line(text, id).contains("failover"));
   }
   REQUIRE(node_line(text, "disc").contains("failover=10s"));
+}
+
+// ---- explain follows a notification fanout's then steps (phase 3 spec §8.3, §10) ----
+//
+// The fanout was one of the two types whose `then` the paper load could not follow, and every node
+// behind it carried `(load not propagated: notification_fanout is not modelled yet)`. It is
+// modelled now: the paper load sends each `then` target `factor x (1 - dedup)` of what the fanout
+// is offered, the same shares the run applies, and the mark for it is gone.
+//
+// The probe (as test_queues_pools.cpp's): u routes 1000/s to `fanout` (dedup 0.02, the type's
+// 20k/s and 1 ms), whose steps are q1 x 0.6, q2 x 0.3 and log_db x 1 (a kv_cluster, N = 2):
+//   q1 1000 x 0.98 x 0.6 = 588/s      q2 1000 x 0.98 x 0.3 = 294/s
+//   log_db 980 writes/s, 1960/s of replica requests (980/s x N 2)
+
+namespace {
+struct SeriesScratchFile {
+  std::filesystem::path path;
+  explicit SeriesScratchFile(std::filesystem::path p) : path(std::move(p)) {}
+  SeriesScratchFile(const SeriesScratchFile&) = delete;
+  SeriesScratchFile& operator=(const SeriesScratchFile&) = delete;
+  ~SeriesScratchFile() {
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+  }
+};
+
+constexpr std::string_view fanout_explain_yaml =
+    "version: 1\nname: fanout-explain\nduration: 10s\nnodes:\n"
+    "  u: {type: client, rate: {base: 1k/s}, ops: {route: 1.0}}\n"
+    "  fanout:\n    type: notification_fanout\n    dedup: 0.02\n    channels: {a: q1, b: q2}\n"
+    "    then:\n"
+    "      - {to: q1, op: publish, factor: 0.6}\n"
+    "      - {to: q2, op: publish, factor: 0.3}\n"
+    "      - {to: log_db, op: write}\n"
+    "  q1: {type: message_queue}\n"
+    "  q2: {type: message_queue}\n"
+    "  w1: {type: worker_pool, consumes: q1, workers: 100, cost: 10ms}\n"
+    "  w2: {type: worker_pool, consumes: q2, workers: 100, cost: 10ms}\n"
+    "  log_db: {type: kv_cluster, nodes: 3, replication: 2, write_quorum: 1, read_quorum: 1, "
+    "capacity: 20k/s}\n"
+    "links:\n"
+    "  - {from: u, to: fanout, latency: 0s}\n"
+    "  - {from: fanout, to: q1, latency: 0s}\n"
+    "  - {from: fanout, to: q2, latency: 0s}\n"
+    "  - {from: fanout, to: log_db, latency: 0s}\n"
+    "  - {from: q1, to: w1, latency: 0s}\n"
+    "  - {from: q2, to: w2, latency: 0s}\n";
+
+std::string explain_of_fanout_probe() {
+  const SeriesScratchFile file{std::filesystem::temp_directory_path() /
+                               (std::to_string(::getpid()) + "_simsys_series_fanout.yaml")};
+  std::ofstream(file.path) << fanout_explain_yaml;
+  const auto loaded = simsys::config::load(file.path.string());
+  INFO((loaded ? "" : loaded.error().message));
+  REQUIRE(loaded.has_value());
+  return simsys::report::render_explain(graph_of(*loaded));
+}
+
+// The number after "peak offered " on a check line, with its k or M suffix applied.
+double offered_in(const std::string& line) {
+  const std::string key = "peak offered ";
+  const auto at = line.find(key);
+  INFO("check line: " << line);
+  REQUIRE(at != std::string::npos);
+  std::size_t used = 0;
+  double value = std::stod(line.substr(at + key.size()), &used);
+  const char suffix = line[at + key.size() + used];
+  if (suffix == 'k') value *= 1e3;
+  if (suffix == 'M') value *= 1e6;
+  return value;
+}
+}  // namespace
+
+TEST_CASE("explain gives a fanout the type's 20k/s and 1 ms, marked as defaults", "[series]") {
+  const auto text = explain_of_fanout_probe();
+  CAPTURE(text);
+  REQUIRE(node_line(text, "fanout")
+              .contains("capacity=20k/s (default)  service_time=1ms (default)  c=20 (implied)"));
+  REQUIRE(check_line(text, "fanout")
+              .contains("peak offered 1k/s vs 20k/s total capacity  (5%, green)"));
+}
+
+TEST_CASE("explain sends a fanout's then targets factor x (1 - dedup): 588/s, 294/s, 980 x N 2",
+          "[series]") {
+  const auto text = explain_of_fanout_probe();
+  CAPTURE(text);
+  REQUIRE(check_line(text, "q1").contains("peak offered 588/s vs 1M/s total capacity"));
+  REQUIRE(check_line(text, "q2").contains("peak offered 294/s vs 1M/s total capacity"));
+  REQUIRE(
+      check_line(text, "log_db").contains("peak offered 1.96k/s (980/s × N 2) vs 60k/s (3 nodes)"));
+  // The pools behind the queues follow too: their jobs are the queues' messages.
+  REQUIRE(check_line(text, "w1").contains("peak offered 588/s vs 10k/s total capacity"));
+}
+
+TEST_CASE("explain marks no load as not propagated behind a fanout", "[series]") {
+  const auto text = explain_of_fanout_probe();
+  CAPTURE(text);
+  REQUIRE_FALSE(text.contains("load not propagated"));
+  REQUIRE_FALSE(text.contains("not modelled yet"));
+}
+
+// notification-system (ch. 10): the shipped file's fanout has dedup 0.02 and shares 0.6, 0.3, 0.05
+// and 0.3 for ios_q, android_q, sms_q and email_q, then `log_db` (the shares sum to 1.25: a
+// notification goes to several channels). explain no longer says "not modelled yet" anywhere in
+// the file, and each target's paper load is the fanout's own peak times factor x 0.98 (explain
+// prints three or four significant digits, so the ratio is checked to 0.5 %). log_db's replica
+// requests are its writes times N = 2. The numbers themselves (the 09:00 blast through the fanout)
+// are the scenario's README's and not pinned here: they follow the file's sizing.
+TEST_CASE("explain on notification-system follows the fanout into its four queues and log_db",
+          "[series]") {
+  const auto text = explain_shipped("notification-system");
+  CAPTURE(text);
+  REQUIRE_FALSE(text.contains("load not propagated"));
+  REQUIRE_FALSE(text.contains("notification_fanout is not modelled yet"));
+  REQUIRE_FALSE(check_line(text, "fanout").contains("load not propagated"));
+  const double fanout = offered_in(check_line(text, "fanout"));
+  REQUIRE(fanout > 0.0);
+  const std::vector<std::pair<std::string, double>> targets{{"ios_q", 0.6 * 0.98},
+                                                            {"android_q", 0.3 * 0.98},
+                                                            {"sms_q", 0.05 * 0.98},
+                                                            {"email_q", 0.3 * 0.98},
+                                                            {"log_db", 2.0 * 0.98}};
+  for (const auto& [id, share] : targets) {
+    CAPTURE(id, share);
+    const auto line = check_line(text, id);
+    REQUIRE_FALSE(line.contains("load not propagated"));
+    REQUIRE_THAT(offered_in(line), WithinRel(fanout * share, 5e-3));
+  }
 }

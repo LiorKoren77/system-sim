@@ -5405,3 +5405,76 @@ TEST_CASE("the gateway's keys are refused on other node types") {
                          "' is not valid for type 'service'");
   }
 }
+
+// ---- notification_fanout: `dedup` and `channels` are typed (phase 3 spec §8.3; book ch. 10) ----
+//
+// `dedup` is the share of routed notifications the dedup step drops as duplicates, in [0, 1): 0
+// drops none, and 1 would drop everything, a fanout that publishes nothing (which a missing link
+// says more plainly), so the interval is half-open. `channels` maps a channel's name to the
+// message queue behind it: every value must name a node the file declares, and a message queue
+// (a channel is a queue the channel's workers drain). That each queue a `then` step publishes to is
+// in the map, and the reverse, is the graph's check (test_graph.cpp). Both keys were accepted by
+// name and ignored; now they are read.
+
+namespace {
+// A fanout line plus the nodes its channels may name: `sms_q` a message queue, `api` a service.
+std::string fanout_nodes(std::string_view keys) {
+  return "  fanout: {type: notification_fanout, " + std::string{keys} +
+         ", then: [{to: sms_q, op: publish}]}\n"
+         "  sms_q: {type: message_queue}\n"
+         "  api: {type: service}\n";
+}
+}  // namespace
+
+TEST_CASE("a fanout's dedup of 0, 0.02 or 0.999 is accepted") {
+  for (const auto* dedup : {"0", "0.02", "0.999"}) {
+    CAPTURE(dedup);
+    require_loaded(
+        "simsys_fanout_dedup_ok.yaml",
+        scenario_with(fanout_nodes("dedup: " + std::string{dedup} + ", channels: {sms: sms_q}")));
+  }
+}
+
+TEST_CASE("a fanout's dedup of 1, 1.5 or minus 0.1 is refused") {
+  for (const auto* dedup : {"1", "1.5", "-0.1"}) {
+    CAPTURE(dedup);
+    require_rejected(
+        "simsys_fanout_dedup_range.yaml",
+        scenario_with(fanout_nodes("dedup: " + std::string{dedup} + ", channels: {sms: sms_q}")),
+        "node 'fanout': dedup must be between 0 and 1");
+  }
+}
+
+TEST_CASE("a fanout's channels may name declared message queues") {
+  require_loaded("simsys_fanout_channels_ok.yaml",
+                 scenario_with(fanout_nodes("dedup: 0.02, channels: {sms: sms_q}")));
+}
+
+// The decision (the graph enforces the rest): a fanout may leave `channels` out, or empty, in the
+// file; whether that is consistent with its steps is the graph's question.
+TEST_CASE("a fanout may leave channels out or empty") {
+  require_loaded("simsys_fanout_no_channels.yaml", scenario_with(fanout_nodes("dedup: 0.02")));
+  require_loaded("simsys_fanout_empty_channels.yaml",
+                 scenario_with(fanout_nodes("dedup: 0.02, channels: {}")));
+}
+
+TEST_CASE("a fanout channel naming an undeclared node is refused") {
+  require_rejected("simsys_fanout_channel_undeclared.yaml",
+                   scenario_with(fanout_nodes("channels: {sms: x}")),
+                   "node 'fanout': channel 'sms' names 'x', which is not declared");
+}
+
+TEST_CASE("a fanout channel naming a service is refused: channels name message queues") {
+  require_rejected("simsys_fanout_channel_service.yaml",
+                   scenario_with(fanout_nodes("channels: {sms: api}")),
+                   "node 'fanout': channel 'sms' names 'api', which is a service (channels name "
+                   "message queues)");
+}
+
+TEST_CASE("a fanout channel names its target's actual type when it is not a service") {
+  require_rejected("simsys_fanout_channel_client.yaml",
+                   scenario_with("  fanout: {type: notification_fanout, channels: {sms: u}}\n"
+                                 "  u: {type: client, rate: {base: 1/s}, ops: {x: 1.0}}\n"),
+                   "node 'fanout': channel 'sms' names 'u', which is a client (channels name "
+                   "message queues)");
+}

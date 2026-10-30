@@ -1820,3 +1820,79 @@ TEST_CASE("book/youtube runs the day and passes its three SLOs", "[scenario]") {
   REQUIRE_THAT(*utilization.observed, WithinRel(0.1403, 1e-3));
   REQUIRE(utilization.window_start == simsys::SimTime{20h + 5min});
 }
+
+// ---- notification-system runs end to end (phase 3 Task 17; book ch. 10) ----
+//
+// The notification_fanout was the one type the book's notification system lacked; the engine
+// accepts the file now (the refusal pinned further up, "is refused at fanout", is the test this
+// replaces; it goes when the type runs).
+
+TEST_CASE("book/notification-system uses only node types the engine simulates, its fanout included",
+          "[scenario]") {
+  const auto s =
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/notification-system/scenario.yaml");
+  REQUIRE(std::ranges::all_of(
+      s.nodes, [](const auto& node) { return simsys::model::simulated(node.type); }));
+  const auto sim = simsys::engine::Simulation::create(build_or_fail(s));
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+}
+
+// The day at 1 s steps (86,400 steps, as the url-shortener's day; the shipped 100 ms is 864k; not
+// 10 s as the news-feed tests: user_limiter's default 1 s window must be a whole number of steps),
+// with the four channel pools retrying (`retries: 3` in the file) and the 09:00 marketing blast
+// (x20 for 15 minutes) going through the fanout into the four channel queues. What the plan
+// promises, and so what is pinned (the numbers are the README's, measured, and follow the sizing
+// of the file):
+//  - the drop_rate SLO (max 0.001) passes: the providers' failures (2 %, 2 %, 5 %, 1 %) are retried
+//    by the pools, which is why the SLO counts what is lost for good and not the sink's failed
+//    calls (report::Summary::drop_rate), and a dead letter is parked, not dropped;
+//  - each channel pool's dead letters are counted and positive: a job whose fourth attempt fails
+//    (f^4 of the jobs: 1.6e-7 for a 2 % provider, 1e-8 for e-mail's 1 %), which is a tiny but
+//    never zero rate; the pools drop nothing themselves (their room is the queue's retention);
+//  - the blast's backlog is finite: ios_q's peak lag between 09:00 and 10:00 is positive and
+//    below an hour. The bound is loose on purpose: a lag cannot pass the queue's retention (7 d),
+//    which is no bound at all, and 1 h is what an operator would call the blast not draining; the
+//    exact lag is the sizing of the pools, which the README quotes and the SLO `queue_lag` bounds.
+TEST_CASE(
+    "book/notification-system's day: drop_rate passes with retries, the four channel pools "
+    "dead-letter, the 09:00 blast backs ios_q up for under an hour",
+    "[scenario]") {
+  using namespace std::chrono_literals;
+  auto s =
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/notification-system/scenario.yaml");
+  s.step = 1s;
+  const auto g = build_or_fail(s);
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  const auto ios_q = *g.index_of("ios_q");
+  simsys::report::Summary summary{g, s.warmup};
+  double blast_peak_lag_s = 0.0;
+  sim->run({.duration = s.duration, .step = s.step}, [&](const simsys::engine::StepRecord& r) {
+    summary.observe(r);
+    if (r.t >= 9h && r.t < 10h) {
+      REQUIRE(r.nodes[ios_q].queue_lag_s.has_value());
+      blast_peak_lag_s = std::max(blast_peak_lag_s, *r.nodes[ios_q].queue_lag_s);
+    }
+  });
+  const NewsFeedDay day{summary.nodes(), summary.drop_rate(),
+                        simsys::report::evaluate_slos(summary, s.slos)};
+
+  const auto& drops = day.slo(simsys::model::SloMetric::drop_rate);
+  CAPTURE(day.drop_rate, drops.observed.value_or(-1.0));
+  CHECK(drops.status == simsys::report::SloStatus::pass);
+
+  for (const auto* pool : {"ios_workers", "android_workers", "sms_workers", "email_workers"}) {
+    CAPTURE(pool);
+    const auto& node = day.node(pool);
+    REQUIRE(node.mean_dead_lettered_per_s.has_value());
+    CHECK(*node.mean_dead_lettered_per_s > 0.0);
+    CHECK(node.total_dropped == 0.0);  // a dead letter is parked, not a drop
+  }
+  // The failures of the calls the pools retried stay in the provider's own books.
+  CHECK(day.node("apns").total_dropped > 0.0);
+
+  CAPTURE(blast_peak_lag_s);
+  CHECK(blast_peak_lag_s > 0.0);
+  CHECK(blast_peak_lag_s < 3600.0);
+}

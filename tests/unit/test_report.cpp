@@ -351,8 +351,8 @@ TEST_CASE("the series writer emits a header and one row per node per step; clien
   // replacing `compare(0, prefix.size(), prefix) == 0` and its length bookkeeping.
   REQUIRE(
       text.starts_with("t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,"
-                       "dead_lettered_per_s,rejected_per_s,latency_ms,zone,queue_lag_s,"
-                       "connections\n"));
+                       "dead_lettered_per_s,rejected_per_s,deduplicated_per_s,latency_ms,zone,"
+                       "queue_lag_s,connections\n"));
   // C++20 std::ranges::count: counts the matches in a whole range (here the characters of
   // the string), replacing std::count(text.begin(), text.end(), '\n').
   REQUIRE(std::ranges::count(text, '\n') == 1 + 3 * 2);
@@ -525,12 +525,13 @@ TEST_CASE("the series writer emits rejected_per_s", "[report]") {
   std::string field;
   std::istringstream cells{line};
   while (std::getline(cells, field, ',')) fields.push_back(field);
-  // thirteen cells: demand_per_s and drain_per_s after node (spec §18 entry 13),
+  // fourteen cells: demand_per_s and drain_per_s after node (spec §18 entry 13),
   // dead_lettered_per_s after drops_per_s (a pool's: empty on a limiter's row, and getline keeps an
-  // empty cell between two commas), queue_lag_s and connections last. getline drops the last cell,
-  // which is empty on a limiter's row, so the comma count is what says there are thirteen.
-  REQUIRE(std::ranges::count(line, ',') == 12);
-  REQUIRE(fields.size() == 12);
+  // empty cell between two commas), deduplicated_per_s after rejected_per_s (a fanout's: empty here
+  // too), queue_lag_s and connections last. getline drops the last cell, which is empty on a
+  // limiter's row, so the comma count is what says there are fourteen.
+  REQUIRE(std::ranges::count(line, ',') == 13);
+  REQUIRE(fields.size() == 13);
   REQUIRE(fields[6] == "0");     // drops_per_s
   REQUIRE(fields[7] == "");      // dead_lettered_per_s: a limiter has no dead letters
   REQUIRE(fields[8] == "3000");  // rejected_per_s
@@ -739,7 +740,7 @@ TEST_CASE("the CSV series has the rejected_per_s column after drops_per_s and de
   const auto text = out.str();  // the header is written on construction, before any step
   REQUIRE(text.substr(0, text.find('\n') + 1) ==
           "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,"
-          "rejected_per_s,latency_ms,zone,queue_lag_s,connections\n");
+          "rejected_per_s,deduplicated_per_s,latency_ms,zone,queue_lag_s,connections\n");
 }
 
 namespace {
@@ -3772,4 +3773,194 @@ TEST_CASE("the aligner counts the band's en dash as one column, not three bytes"
         "a  1.62ms [1.61–1.63]\n"
         "b  1.62ms [1.61-1.63]\n"
         "c                   0\n");
+}
+
+// ---- A fanout's deduplicated notifications in the reports (phase 3 spec §8.3, §10) ----
+//
+// The share a notification_fanout's dedup step drops is counted apart from drops and rejections
+// (engine::NodeSample::deduplicated_per_s: drain x dedup, only on a fanout). What the reports say:
+//  - the table: a `deduplicated/s` column right after `rejected` (a dedup is a refusal of a kind,
+//    so it sits beside the other refusal, and after `dead_lettered/s` when a pool retries), `-` on
+//    every row but the fanout's, there only when the run has a fanout (a scenario without one
+//    prints the table it always did);
+//  - the JSON: `deduplicated_per_s` (the mean over the observed steps) on a fanout's object, null
+//    on every other node;
+//  - the CSV series: a `deduplicated_per_s` column right after `rejected_per_s`, empty on every row
+//    but the fanout's (like `dead_lettered_per_s` it is a count only one type has).
+// The probe: u routes 1000/s to `fanout` (dedup 0.02, one channel, q1 at factor 0.6), which pool
+// w1 drains; with `retrying`, w1 calls an external sink `api` that fails 2 %, `retries: 3`.
+// Deduplicated: 1000 x 0.02 = 20 a second.
+
+namespace {
+std::string fanout_report_yaml(bool retrying) {
+  return std::string{
+             "version: 1\nname: dedup-report\nduration: 10s\nstep: 100ms\nwarmup: 2s\nnodes:\n"
+             "  u: {type: client, rate: {base: 1k/s}, ops: {route: 1.0}}\n"
+             "  fanout:\n    type: notification_fanout\n    dedup: 0.02\n"
+             "    channels: {a: q1}\n    then: [{to: q1, op: publish, factor: 0.6}]\n"
+             "  q1: {type: message_queue}\n"} +
+         (retrying ? "  w1: {type: worker_pool, consumes: q1, workers: 100, cost: 10ms, "
+                     "then: [{to: api, op: send}], retries: 3, retry_after: 1s}\n"
+                     "  api: {type: external_sink, capacity: 5k/s, failure_rate: 0.02}\n"
+                   : "  w1: {type: worker_pool, consumes: q1, workers: 100, cost: 10ms}\n") +
+         "links:\n"
+         "  - {from: u, to: fanout, latency: 0s}\n"
+         "  - {from: fanout, to: q1, latency: 0s}\n"
+         "  - {from: q1, to: w1, latency: 0s}\n" +
+         (retrying ? "  - {from: w1, to: api, latency: 0s}\n" : "");
+}
+
+Scenario load_fanout_report(bool retrying) {
+  const auto path = std::filesystem::temp_directory_path() /
+                    (std::to_string(::getpid()) + "_simsys_report_fanout.yaml");
+  std::ofstream(path) << fanout_report_yaml(retrying);
+  auto loaded = simsys::config::load(path.string());
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
+  if (!loaded) FAIL(loaded.error().message);
+  return std::move(*loaded);
+}
+
+// The run of `s` summarised, failing the test with the engine's message when it refuses the
+// scenario (summarize() above would dereference the refusal).
+Summary summarize_or_fail(const Scenario& s, const simsys::graph::Graph& g) {
+  Summary summary{g, s.warmup};
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  sim->run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
+  return summary;
+}
+
+std::string fanout_table_of(const Scenario& s) {
+  const auto g = *simsys::graph::Graph::build(s);
+  return simsys::report::render_table(summarize_or_fail(s, g), {}, false);
+}
+
+std::string fanout_json_of(const Scenario& s) {
+  const auto g = *simsys::graph::Graph::build(s);
+  return simsys::report::render_json(summarize_or_fail(s, g), {});
+}
+
+// The cells of a CSV line, empty cells and a trailing one included (std::getline would drop it).
+std::vector<std::string> csv_cells(std::string_view line) {
+  std::vector<std::string> cells(1);
+  for (const char c : line) {
+    if (c == ',') {
+      cells.emplace_back();
+    } else {
+      cells.back() += c;
+    }
+  }
+  return cells;
+}
+}  // namespace
+
+TEST_CASE("the node table has a deduplicated/s column after rejected, holding the fanout's rate",
+          "[report]") {
+  const auto s = load_fanout_report(false);
+  const auto table = fanout_table_of(s);
+  CAPTURE(table);
+  const std::vector<std::string> header{"node",           "mean_rho", "peak_rho",
+                                        "peak_backlog",   "dropped",  "rejected",
+                                        "deduplicated/s", "red_s",    "peak_lag"};
+  REQUIRE(words_of_line_starting(table, "node") == header);
+  const auto at =
+      static_cast<std::size_t>(std::ranges::find(header, "deduplicated/s") - header.begin());
+  const auto fanout = words_of_line_starting(table, "fanout");
+  REQUIRE(fanout.size() >= at + 1);
+  REQUIRE(fanout[at] == "20");
+  REQUIRE(fanout[at - 1] == "0");  // rejected: a deduplicated notification is not a rejection
+  REQUIRE(fanout[at - 2] == "0");  // dropped
+  for (const auto* id : {"u", "q1", "w1"}) {
+    CAPTURE(id);
+    const auto row = words_of_line_starting(table, id);
+    REQUIRE(row.size() >= at + 1);
+    REQUIRE(row[at] == "-");
+  }
+}
+
+// With a retrying pool both optional columns are there, in the order the table gives them: the
+// dead letters beside the drops, the deduplicated beside the rejections.
+TEST_CASE("the node table puts dead_lettered/s before rejected and deduplicated/s after it",
+          "[report]") {
+  const auto s = load_fanout_report(true);
+  const auto table = fanout_table_of(s);
+  CAPTURE(table);
+  const std::vector<std::string> header{"node",    "mean_rho",        "peak_rho", "peak_backlog",
+                                        "dropped", "dead_lettered/s", "rejected", "deduplicated/s",
+                                        "red_s",   "peak_lag"};
+  REQUIRE(words_of_line_starting(table, "node") == header);
+  const auto fanout = words_of_line_starting(table, "fanout");
+  REQUIRE(fanout.size() >= 8);
+  REQUIRE(fanout[5] == "-");   // dead_lettered/s: only a pool has them
+  REQUIRE(fanout[7] == "20");  // deduplicated/s
+  const auto pool = words_of_line_starting(table, "w1");
+  REQUIRE(pool.size() >= 8);
+  REQUIRE(pool[5] != "-");
+  REQUIRE(pool[7] == "-");  // deduplicated/s: only a fanout has them
+}
+
+// What does not change: a run with no fanout prints the table (and, in the JSON, the null) it did.
+TEST_CASE("a run without a fanout has no deduplicated/s column and null deduplicated_per_s",
+          "[report]") {
+  const auto table = table_of_probe(retrying_probe(3, 1s));
+  CAPTURE(table);
+  REQUIRE_FALSE(table.contains("deduplicated"));
+  const auto json = json_of_probe(retrying_probe(3, 1s));
+  for (const auto* id : {"u", "q", "w", "api"}) {
+    CAPTURE(id);
+    REQUIRE(json_node_object(json, id).contains("\"deduplicated_per_s\": null"));
+  }
+}
+
+TEST_CASE("the JSON fanout object carries deduplicated_per_s, 20, and every other node null",
+          "[report]") {
+  const auto s = load_fanout_report(false);
+  const auto json = fanout_json_of(s);
+  CAPTURE(json);
+  REQUIRE_THAT(json_value(json_node_object(json, "fanout"), "deduplicated_per_s"),
+               WithinRel(20.0, 1e-9));
+  for (const auto* id : {"u", "q1", "w1"}) {
+    CAPTURE(id);
+    REQUIRE(json_node_object(json, id).contains("\"deduplicated_per_s\": null"));
+  }
+}
+
+// The header is pinned whole (a new column in the middle moves the ones after it), and the
+// fanout's row at t = 0.1 s holds 20 in the new column, a fanout is a service: no dead letters, no
+// lag, no connections (the gateway's column, last).
+TEST_CASE("the CSV series has the deduplicated_per_s column after rejected_per_s, 20 on the fanout",
+          "[report]") {
+  const auto s = load_fanout_report(false);
+  const auto g = *simsys::graph::Graph::build(s);
+  std::ostringstream out;
+  simsys::report::SeriesWriter writer{out, g};
+  auto created = simsys::engine::Simulation::create(g);
+  if (!created) FAIL(created.error().message);
+  created->run({.duration = s.duration, .step = s.step}, [&](const auto& r) { writer.observe(r); });
+  const auto text = out.str();
+  CAPTURE(text);
+  REQUIRE(text.substr(0, text.find('\n') + 1) ==
+          "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,"
+          "rejected_per_s,deduplicated_per_s,latency_ms,zone,queue_lag_s,connections\n");
+  const auto start = text.find("\n0.1,fanout,");
+  REQUIRE(start != std::string::npos);
+  const auto line = text.substr(start + 1, text.find('\n', start + 1) - start - 1);
+  const auto cells = csv_cells(line);
+  REQUIRE(cells.size() == 14);
+  REQUIRE(cells[2] == "1000");  // demand_per_s: every notification is routed through it
+  REQUIRE(cells[7] == "");      // dead_lettered_per_s
+  REQUIRE(cells[8] == "0");     // rejected_per_s
+  REQUIRE(cells[9] == "20");    // deduplicated_per_s
+  REQUIRE(cells[12] == "");     // queue_lag_s
+  REQUIRE(cells[13] == "");     // connections
+  for (const auto* id : {"u", "q1", "w1"}) {
+    const auto other = text.find(std::string{"\n0.1,"} + id + ",");
+    REQUIRE(other != std::string::npos);
+    const auto other_cells =
+        csv_cells(text.substr(other + 1, text.find('\n', other + 1) - other - 1));
+    CAPTURE(id);
+    REQUIRE(other_cells.size() == 14);
+    REQUIRE(other_cells[9] == "");  // only a fanout has the counter: empty, not 0
+  }
 }

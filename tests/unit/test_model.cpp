@@ -347,3 +347,15 @@ TEST_CASE("a Fault carries what breaks, where, when and for how long", "[model]"
   REQUIRE(f.duration == 1min);
   REQUIRE(f.node == "chat_servers");
 }
+
+// Task 17 of phase 3: notification_fanout has a model (a service whose then steps fire per routed
+// notification times 1 - dedup). The test above, which says the four types of phase 3 do not run,
+// is the one each type's task shrinks; this one is appended instead of editing it (it is the line
+// the sibling tasks edit too) and pins the fanout alone: its table row says it runs, and the row
+// still spells it the way the schema does.
+TEST_CASE("the notification_fanout node type runs", "[model]") {
+  REQUIRE(simsys::model::simulated(NodeType::notification_fanout));
+  REQUIRE(simsys::model::to_string(NodeType::notification_fanout) == "notification_fanout");
+  // The other type of this family that still waits for its model: the frontier (Task 18).
+  REQUIRE_FALSE(simsys::model::simulated(NodeType::frontier));
+}

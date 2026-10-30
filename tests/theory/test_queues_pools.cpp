@@ -10,18 +10,26 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>  // getpid
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
+import simsys.config;
 import simsys.core;
 import simsys.engine;
 import simsys.graph;
 import simsys.model;
 import simsys.queueing;
+import simsys.report;
 import simsys.test_fixtures;
 import simsys.workload;
 
@@ -793,4 +801,220 @@ TEST_CASE("estimate reports the steady lag: 3.289 ms below capacity, the retenti
   const auto settled = (*Simulation::create(overloaded)).estimate();
   REQUIRE(settled.converged);
   REQUIRE_THAT(*settled.nodes[*overloaded.index_of("q")].queue_lag_s, WithinAbs(10.0, 1e-6));
+}
+
+// ---- notification_fanout: routes to its channels after the dedup step (phase 3 spec §8.3) ----
+//
+// Book ch. 10's notification system: the notification servers hand each notification to a fan-out
+// that drops the duplicates ("dedupe"), then publishes one message per channel to that channel's
+// queue (iOS, Android, SMS, e-mail), where the channel's workers pick it up. The model: a service
+// (the type's defaults, 20k/s at 1 ms) whose `then` steps fire per routed notification times
+// (1 - dedup), the share the dedup step lets through; the dropped share is counted as neither a
+// drop nor a rejection but as `deduplicated_per_s`. Ignored: what makes two notifications
+// duplicates (an id cache with a TTL in the book), and the cost of looking the id up.
+//
+// The probe: u routes 1000 notifications/s to `fanout` (dedup 0.02), whose steps are
+//   q1 x 0.6 (channel a),  q2 x 0.3 (channel b),  log_db x 1 (not a channel: a kv_cluster)
+// and each queue has a pool of 100 workers at 10 ms (10k jobs/s) behind it. Numbers, per second:
+//   fanout   demand 1000 = drain 1000        rho = 1000 / 20k = 0.05        (it serves them all)
+//   dedup    1000 x 0.02 = 20                (deduplicated_per_s)
+//   q1       1000 x 0.98 x 0.6 = 588         q2   1000 x 0.98 x 0.3 = 294
+//   log_db   1000 x 0.98 = 980 writes, each to N = 2 replicas: 1960 units of its demand
+// The probes are YAML text, loaded through the loader: the file the student writes is the unit
+// under test, and the cases below fail today because the engine refuses the type.
+
+namespace {
+constexpr double fanout_rate = 1000.0;
+constexpr double dedup_share = 0.02;
+
+// A scenario file in the system temp directory that removes itself when the object goes out of
+// scope (RAII: also when a REQUIRE unwinds the test). The process id is part of the name, so two
+// test processes never collide.
+struct FanoutScratchFile {
+  std::filesystem::path path;
+  explicit FanoutScratchFile(std::filesystem::path p) : path(std::move(p)) {}
+  FanoutScratchFile(const FanoutScratchFile&) = delete;
+  FanoutScratchFile& operator=(const FanoutScratchFile&) = delete;
+  ~FanoutScratchFile() {
+    std::error_code ignored;  // the non-throwing overload: a destructor must not throw
+    std::filesystem::remove(path, ignored);
+  }
+};
+
+Scenario load_fanout_yaml(const std::string& yaml) {
+  const FanoutScratchFile file{std::filesystem::temp_directory_path() /
+                               (std::to_string(::getpid()) + "_simsys_fanout_theory.yaml")};
+  std::ofstream(file.path) << yaml;
+  // C++23 std::expected<T, E>: a value-or-error return type. Replaces the old choice between
+  // exceptions and out-parameters; the caller must look at which one it got, and the error
+  // carries structured data (here: file, line, column and message of the loader's complaint).
+  auto loaded = simsys::config::load(file.path.string());
+  if (!loaded)
+    FAIL(loaded.error().file << ":" << loaded.error().line << ": " << loaded.error().message);
+  return std::move(*loaded);
+}
+
+// The probe above, `dedup` spelled as the YAML value (the key is left out when empty).
+std::string fanout_probe_yaml(std::string_view dedup) {
+  const std::string dedup_line = dedup.empty() ? "" : "    dedup: " + std::string{dedup} + "\n";
+  return "version: 1\nname: fanout-probe\nduration: 10s\nstep: 100ms\nnodes:\n"
+         "  u: {type: client, rate: {base: 1k/s}, ops: {route: 1.0}}\n"
+         "  fanout:\n    type: notification_fanout\n" +
+         dedup_line +
+         "    channels: {a: q1, b: q2}\n"
+         "    then:\n"
+         "      - {to: q1, op: publish, factor: 0.6}\n"
+         "      - {to: q2, op: publish, factor: 0.3}\n"
+         "      - {to: log_db, op: write}\n"
+         "  q1: {type: message_queue}\n"
+         "  q2: {type: message_queue}\n"
+         "  w1: {type: worker_pool, consumes: q1, workers: 100, cost: 10ms}\n"
+         "  w2: {type: worker_pool, consumes: q2, workers: 100, cost: 10ms}\n"
+         "  log_db: {type: kv_cluster, nodes: 3, replication: 2, write_quorum: 1, read_quorum: 1, "
+         "capacity: 20k/s}\n"
+         "links:\n"
+         "  - {from: u, to: fanout, latency: 0s}\n"
+         "  - {from: fanout, to: q1, latency: 0s}\n"
+         "  - {from: fanout, to: q2, latency: 0s}\n"
+         "  - {from: fanout, to: log_db, latency: 0s}\n"
+         "  - {from: q1, to: w1, latency: 0s}\n"
+         "  - {from: q2, to: w2, latency: 0s}\n";
+}
+
+Graph fanout_graph(std::string_view dedup) {
+  auto g = Graph::build(load_fanout_yaml(fanout_probe_yaml(dedup)));
+  if (!g) FAIL(g.error().message);
+  return std::move(*g);
+}
+
+// The probe's whole run, summarised, as the JSON `simsys run --report json` prints it.
+std::string fanout_json(const Graph& g) {
+  simsys::report::Summary summary{g, 0s};
+  simulation_of(g).run({.duration = 10s, .step = 100ms},
+                       [&](const simsys::engine::StepRecord& r) { summary.observe(r); });
+  return simsys::report::render_json(summary, {});
+}
+
+// The text of the JSON object of node `id`, from its `{"id": ...` to its closing brace (a node's
+// object has no nested braces).
+std::string fanout_json_node(const std::string& json, std::string_view id) {
+  const auto start = json.find("{\"id\": \"" + std::string{id} + "\"");
+  REQUIRE(start != std::string::npos);
+  return json.substr(start, json.find('}', start) - start);
+}
+
+// The number after `"key": ` in a node's JSON object; the test fails when the key is absent or
+// null (null is not a number: stod would throw, so it is refused first).
+double fanout_json_number(const std::string& object, std::string_view key) {
+  const std::string field = "\"" + std::string{key} + "\": ";
+  const auto at = object.find(field);
+  INFO("key " << key << " in " << object);
+  REQUIRE(at != std::string::npos);
+  REQUIRE(object.substr(at + field.size(), 4) != "null");
+  return std::stod(object.substr(at + field.size()));
+}
+}  // namespace
+
+TEST_CASE("a fanout at 1k/s with dedup 0.02 publishes 588/s and 294/s to its two channel queues",
+          "[theory]") {
+  const auto g = fanout_graph("0.02");
+  const auto records = records_of(g, 5);
+  REQUIRE(records.size() == 5);
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    CAPTURE(i);
+    const auto& q1 = records[i].nodes[*g.index_of("q1")];
+    const auto& q2 = records[i].nodes[*g.index_of("q2")];
+    REQUIRE_THAT(q1.demand_per_s, WithinRel(fanout_rate * (1.0 - dedup_share) * 0.6, 1e-9));
+    REQUIRE_THAT(q1.demand_per_s, WithinRel(588.0, 1e-9));
+    REQUIRE_THAT(q2.demand_per_s, WithinRel(294.0, 1e-9));
+    // The queues hand every message to their pool in the same step (zero-latency links).
+    REQUIRE_THAT(records[i].nodes[*g.index_of("w1")].demand_per_s, WithinRel(588.0, 1e-9));
+    REQUIRE_THAT(records[i].nodes[*g.index_of("w2")].demand_per_s, WithinRel(294.0, 1e-9));
+  }
+}
+
+// The fanout itself serves every notification it is routed (the dedup step happens inside it, so
+// the duplicates cost it work): demand = drain = 1000, rho = 1000 / 20k = 0.05, which also pins the
+// type's default capacity (20k/s, 1 ms: c = 20 servers). Its sojourn is the service time plus the
+// Erlang C wait of an M/M/20 queue at rho 0.05 (a few 1e-27 s: the 1 ms alone, to 9 digits).
+TEST_CASE("the fanout serves all 1000 notifications at the type defaults: rho 0.05, mean 1 ms",
+          "[theory]") {
+  const auto g = fanout_graph("0.02");
+  const auto r = first_step(g);
+  const auto& fanout = r.nodes[*g.index_of("fanout")];
+  REQUIRE_THAT(fanout.demand_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(fanout.drain_per_s, WithinRel(1000.0, 1e-9));  // dedup is not a drop
+  REQUIRE_THAT(fanout.dropped_per_s, WithinAbs(0.0, 1e-12));
+  REQUIRE_THAT(fanout.rejected_per_s, WithinAbs(0.0, 1e-12));
+  REQUIRE_THAT(fanout.rho, WithinRel(1000.0 / 20'000.0, 1e-9));
+  const double wait = simsys::queueing::mmc_wait(20, fanout.rho, 1e-3).mean_s;
+  REQUIRE_THAT(fanout.latency.mean_s, WithinRel(1e-3 + wait, 1e-9));
+  REQUIRE_THAT(fanout.latency.mean_s, WithinRel(1e-3, 1e-9));
+}
+
+// 1000 x 0.02 = 20 a second are deduplicated, a number of their own: the fanout's drops and
+// rejections stay 0, and only a fanout has the counter (every other node reports null, a dedup of
+// 0 would be a claim). Read from the JSON, the mean over the run.
+TEST_CASE("the fanout counts 20 deduplicated a second, apart from drops and rejections",
+          "[theory]") {
+  const auto g = fanout_graph("0.02");
+  const auto json = fanout_json(g);
+  CAPTURE(json);
+  const auto fanout = fanout_json_node(json, "fanout");
+  REQUIRE_THAT(fanout_json_number(fanout, "deduplicated_per_s"), WithinRel(20.0, 1e-9));
+  REQUIRE_THAT(fanout_json_number(fanout, "dropped"), WithinAbs(0.0, 1e-12));
+  REQUIRE_THAT(fanout_json_number(fanout, "rejected"), WithinAbs(0.0, 1e-12));
+  for (const auto* id : {"u", "q1", "q2", "w1", "w2", "log_db"}) {
+    CAPTURE(id);
+    // C++23 std::string::contains: a substring test in one call. Replaces
+    // `find(...) != std::string::npos`, so the assertion reads as the property it checks.
+    REQUIRE(fanout_json_node(json, id).contains("\"deduplicated_per_s\": null"));
+  }
+}
+
+// A then step to something that is not a message queue is no channel (the channels map lists the
+// queues), and it still fires once per routed notification that survived the dedup step: 980
+// writes a second, each to N = 2 replicas of the kv_cluster, 1960 units of demand.
+TEST_CASE("a then step to a kv_cluster is no channel but fires 1 - dedup of 1000: 980 writes",
+          "[theory]") {
+  const auto g = fanout_graph("0.02");
+  const auto records = records_of(g, 5);
+  for (const auto& r : records) {
+    REQUIRE_THAT(r.nodes[*g.index_of("log_db")].demand_per_s,
+                 WithinRel(fanout_rate * (1.0 - dedup_share) * 2.0, 1e-9));
+  }
+  REQUIRE_THAT(records[0].nodes[*g.index_of("log_db")].demand_per_s, WithinRel(1960.0, 1e-9));
+}
+
+// dedup 0 lets everything through: the factors alone (600/s and 300/s, the log 1000 writes = 2000
+// units) and a deduplicated count of 0, present (a fanout reports the counter) and not null.
+TEST_CASE("a fanout with dedup 0 deduplicates nothing and reports 0, not null", "[theory]") {
+  const auto g = fanout_graph("0");
+  const auto r = first_step(g);
+  REQUIRE_THAT(r.nodes[*g.index_of("q1")].demand_per_s, WithinRel(600.0, 1e-9));
+  REQUIRE_THAT(r.nodes[*g.index_of("q2")].demand_per_s, WithinRel(300.0, 1e-9));
+  REQUIRE_THAT(r.nodes[*g.index_of("log_db")].demand_per_s, WithinRel(2000.0, 1e-9));
+  const auto fanout = fanout_json_node(fanout_json(g), "fanout");
+  REQUIRE_THAT(fanout_json_number(fanout, "deduplicated_per_s"), WithinAbs(0.0, 1e-12));
+}
+
+// A fanout that leaves `dedup` out lets everything through, like dedup 0 (the key is optional).
+TEST_CASE("a fanout without a dedup key deduplicates nothing", "[theory]") {
+  const auto g = fanout_graph("");
+  const auto r = first_step(g);
+  REQUIRE_THAT(r.nodes[*g.index_of("q1")].demand_per_s, WithinRel(600.0, 1e-9));
+  const auto fanout = fanout_json_node(fanout_json(g), "fanout");
+  REQUIRE_THAT(fanout_json_number(fanout, "deduplicated_per_s"), WithinAbs(0.0, 1e-12));
+}
+
+// estimate() is the long-run state of the same picture: below capacity it settles at once on the
+// run's numbers.
+TEST_CASE("estimate agrees with the run: 588/s and 294/s to the channels, rho 0.05", "[theory]") {
+  const auto g = fanout_graph("0.02");
+  const auto e = simulation_of(g).estimate();
+  REQUIRE(e.converged);
+  REQUIRE_THAT(e.nodes[*g.index_of("q1")].demand_per_s, WithinRel(588.0, 1e-9));
+  REQUIRE_THAT(e.nodes[*g.index_of("q2")].demand_per_s, WithinRel(294.0, 1e-9));
+  REQUIRE_THAT(e.nodes[*g.index_of("log_db")].demand_per_s, WithinRel(1960.0, 1e-9));
+  REQUIRE_THAT(e.nodes[*g.index_of("fanout")].rho, WithinRel(0.05, 1e-9));
 }

@@ -739,7 +739,8 @@ TEST_CASE("the per-seed JSON of a run with no gateway has no connections", "[the
   REQUIRE_FALSE(json.contains("connections"));
 }
 
-// The CSV column is the last, so a plot script that reads columns by position loses nothing:
+// The CSV column is the last (after Task 17's deduplicated_per_s, inserted before latency_ms, it is
+// still the last), so a plot script that reads columns by position loses nothing:
 // the header is pinned whole, and the cell is the level at 6 significant digits on the gateway's
 // row, empty on every other row (a 0 would claim a level a service cannot have). A real run, so
 // that the cell is the engine's number: the record of step 3 at 1 s steps holds 299.7001.
@@ -754,7 +755,7 @@ TEST_CASE("the node series ends with a connections column, filled on the gateway
   CAPTURE(text);
   REQUIRE(text.substr(0, text.find('\n')) ==
           "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,"
-          "rejected_per_s,latency_ms,zone,queue_lag_s,connections");
+          "rejected_per_s,deduplicated_per_s,latency_ms,zone,queue_lag_s,connections");
   std::istringstream lines{text};
   std::string line;
   std::getline(lines, line);  // the header
@@ -762,13 +763,13 @@ TEST_CASE("the node series ends with a connections column, filled on the gateway
   while (std::getline(lines, line)) {
     const auto cells = split_commas(line);
     CAPTURE(line);
-    REQUIRE(cells.size() == 13);
+    REQUIRE(cells.size() == 14);
     if (cells[1] != "gw") {
-      REQUIRE(cells[12] == "");
+      REQUIRE(cells[13] == "");
       continue;
     }
-    REQUIRE(cells[11] == "");  // queue_lag_s: a gateway has no lag
-    REQUIRE_THAT(std::stod(cells[12]),
+    REQUIRE(cells[12] == "");  // queue_lag_s: a gateway has no lag
+    REQUIRE_THAT(std::stod(cells[13]),
                  WithinRel(euler_levels(4, 1.0)[gateway_rows], 1e-5));  // 6 significant digits
     ++gateway_rows;
   }

@@ -8,19 +8,26 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>  // getpid
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
 import simsys.caching;
+import simsys.config;
 import simsys.core;
 import simsys.defaults;
 import simsys.graph;
@@ -4097,4 +4104,148 @@ TEST_CASE("the lookup rule is per op: another op of the same node, or the target
   REQUIRE_FALSE(looked_up_before(*g, "api", "read", "svc"));
   REQUIRE_FALSE(looked_up_before(*g, "svc", "call", "svc"));
   REQUIRE_FALSE(looked_up_before(*g, "disc", "lookup", "svc"));
+}
+
+// ---- notification_fanout: the channels map and the then steps name the same queues (phase 3 spec
+// §8.3; book ch. 10) ----
+//
+// `channels` maps a channel's name to the message queue behind it; the `then` steps carry the
+// shares (`factor`) that go to each. Graph::build keeps the two in step, in both directions, so
+// that the map is the student-facing list of channels and no step quietly publishes to a queue the
+// list leaves out (or the list promises a channel nothing feeds):
+//   a channel whose queue no then step publishes to:  node 'fanout': channel 'email' names
+//                                                     email_q, which no then step publishes to
+//   a then step to a queue no channel names:          node 'fanout': then step publishes to
+//                                                     email_q, which no channel names
+// A then step to a node that is not a message queue (an audit log) is no channel and is not
+// checked. A fanout with no channels at all (key absent, or `channels: {}`) is accepted when its
+// steps publish to no queue; the check is the two directions above and nothing more.
+// The scenarios are YAML text through the loader (the one way to spell `channels` and `dedup`).
+
+namespace {
+// A scenario file in the system temp directory that removes itself when the object goes out of
+// scope (RAII: also when a REQUIRE unwinds the test).
+struct GraphScratchFile {
+  std::filesystem::path path;
+  explicit GraphScratchFile(std::filesystem::path p) : path(std::move(p)) {}
+  GraphScratchFile(const GraphScratchFile&) = delete;
+  GraphScratchFile& operator=(const GraphScratchFile&) = delete;
+  ~GraphScratchFile() {
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+  }
+};
+
+// u routes 100/s to `fanout`, which has the given `channels:` line (empty: no key) and `then`
+// steps (the inside of a YAML list); two channel queues with a pool each, and `audit`, a service.
+// Every link a step could use exists, so only the fanout's own checks can refuse the file.
+std::string fanout_file(std::string_view channels_line, std::string_view then_steps) {
+  return "version: 1\nname: fanout-checks\nduration: 10s\nnodes:\n"
+         "  u: {type: client, rate: {base: 100/s}, ops: {route: 1.0}}\n"
+         "  fanout:\n    type: notification_fanout\n    dedup: 0.02\n" +
+         std::string{channels_line} + (channels_line.empty() ? "" : "\n") + "    then: [" +
+         std::string{then_steps} +
+         "]\n"
+         "  sms_q: {type: message_queue}\n"
+         "  email_q: {type: message_queue}\n"
+         "  sms_w: {type: worker_pool, consumes: sms_q, workers: 10, cost: 10ms}\n"
+         "  email_w: {type: worker_pool, consumes: email_q, workers: 10, cost: 10ms}\n"
+         "  audit: {type: service, capacity: 1k/s}\n"
+         "links:\n"
+         "  - {from: u, to: fanout}\n"
+         "  - {from: fanout, to: sms_q}\n"
+         "  - {from: fanout, to: email_q}\n"
+         "  - {from: fanout, to: audit}\n"
+         "  - {from: sms_q, to: sms_w}\n"
+         "  - {from: email_q, to: email_w}\n";
+}
+
+constexpr std::string_view sms_step = "{to: sms_q, op: publish, factor: 0.5}";
+constexpr std::string_view email_step = "{to: email_q, op: publish, factor: 0.5}";
+constexpr std::string_view audit_step = "{to: audit, op: write}";
+
+// Loads `yaml` (the test fails with the loader's message if it does not load) and builds it.
+std::expected<Graph, simsys::graph::EngineError> build_fanout_file(const std::string& yaml) {
+  const GraphScratchFile file{std::filesystem::temp_directory_path() /
+                              (std::to_string(::getpid()) + "_simsys_fanout_graph.yaml")};
+  std::ofstream(file.path) << yaml;
+  // C++23 std::expected<T, E>: the loader returns a Scenario or a ConfigError, and the caller
+  // must look at which. It replaces exceptions and error codes; the error carries the file, line
+  // and message, so a test that cannot load its scenario says why.
+  auto loaded = simsys::config::load(file.path.string());
+  if (!loaded) {
+    FAIL(loaded.error().file << ":" << loaded.error().line << ": " << loaded.error().message);
+  }
+  return Graph::build(std::move(*loaded));
+}
+
+std::string fanout_refusal(const std::string& yaml) {
+  const auto built = build_fanout_file(yaml);
+  INFO(yaml);
+  REQUIRE_FALSE(built.has_value());
+  return built.error().message;
+}
+}  // namespace
+
+TEST_CASE("a fanout channel naming a queue no then step publishes to is refused", "[graph]") {
+  const auto yaml = fanout_file("    channels: {sms: sms_q, email: email_q}", sms_step);
+  REQUIRE(fanout_refusal(yaml) ==
+          "node 'fanout': channel 'email' names email_q, which no then step publishes to");
+}
+
+TEST_CASE("a fanout then step publishing to a queue no channel names is refused", "[graph]") {
+  const auto yaml = fanout_file("    channels: {sms: sms_q}",
+                                std::string{sms_step} + ", " + std::string{email_step});
+  REQUIRE(fanout_refusal(yaml) ==
+          "node 'fanout': then step publishes to email_q, which no channel names");
+}
+
+TEST_CASE("a fanout whose channels and queue steps agree builds", "[graph]") {
+  const auto yaml = fanout_file("    channels: {sms: sms_q, email: email_q}",
+                                std::string{sms_step} + ", " + std::string{email_step});
+  const auto built = build_fanout_file(yaml);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+}
+
+TEST_CASE("a fanout then step to a service is no channel and is not checked", "[graph]") {
+  const auto yaml = fanout_file("    channels: {sms: sms_q}",
+                                std::string{sms_step} + ", " + std::string{audit_step});
+  const auto built = build_fanout_file(yaml);
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+}
+
+// The decision: no channels is fine as long as no step publishes to a queue (nothing to list).
+TEST_CASE("a fanout with no channels builds when its steps publish to no queue", "[graph]") {
+  for (const auto* channels_line : {"", "    channels: {}"}) {
+    CAPTURE(channels_line);
+    const auto built = build_fanout_file(fanout_file(channels_line, audit_step));
+    INFO((built ? "" : built.error().message));
+    REQUIRE(built.has_value());
+  }
+}
+
+TEST_CASE("a fanout with no channels is refused for the queue its step publishes to", "[graph]") {
+  for (const auto* channels_line : {"", "    channels: {}"}) {
+    CAPTURE(channels_line);
+    REQUIRE(fanout_refusal(fanout_file(channels_line, sms_step)) ==
+            "node 'fanout': then step publishes to sms_q, which no channel names");
+  }
+}
+
+// Spec §8.3: the type's defaults are 20k/s and 1 ms (a chosen number, like the other service-like
+// types), so Little's law gives c = 20000/s x 1 ms = 20 servers; nothing is stated in the file, so
+// both are tagged as the type's.
+TEST_CASE("a fanout without capacity or latency takes the type's 20k/s and 1 ms, c 20", "[graph]") {
+  const auto built = build_fanout_file(fanout_file(
+      "    channels: {sms: sms_q}", std::string{sms_step} + ", " + std::string{audit_step}));
+  INFO((built ? "" : built.error().message));
+  REQUIRE(built.has_value());
+  const auto& fanout = built->nodes()[*built->index_of("fanout")];
+  REQUIRE(fanout.capacity.service_rate == Rate{20'000});
+  REQUIRE_THAT(fanout.capacity.service_time_s, WithinRel(1e-3, 1e-12));
+  REQUIRE(fanout.capacity.concurrency == 20);
+  REQUIRE(fanout.service_rate_source == simsys::defaults::Source::type_default);
+  REQUIRE(fanout.service_time_source == simsys::defaults::Source::type_default);
 }
