@@ -572,8 +572,13 @@ class ClientBehaviour {
   // far a run has got. The running simulation's client is a separate object, untouched.
   void reset_noise();
 
-  // The total rate offered at `now`: curve.rate_at(now) × the multiplier of the last tick
-  // (1 before any tick, and always 1 without noise).
+  // The factor a scripted traffic_spike puts on the rate for the following `offer`s
+  // (engine::Condition::rate_factor; 1 outside every fault). The engine sets it every step before
+  // the client offers, as `tick` sets the noise.
+  void set_rate_factor(double factor) { rate_factor_ = factor; }
+
+  // The total rate offered at `now`: curve.rate_at(now) × the traffic_spike factor × the
+  // multiplier of the last tick (1 before any tick, and always 1 without noise).
   [[nodiscard]] Rate rate(SimTime now) const;
 
   // The rate offered per op at `now`, rate(now) × op share, sorted by op name: what the
@@ -651,6 +656,7 @@ class ClientBehaviour {
   // nothing per step and owns no random engine.
   std::optional<workload::NoiseProcess> noise_{};
   double noise_multiplier_{1.0};  // max(0, 1 + x) from the last tick; 1 until the first
+  double rate_factor_{1.0};       // set_rate_factor: the active traffic_spike faults' product
   std::vector<std::pair<std::string, double>> op_shares_;  // sorted by op
   std::vector<RouteLeg> legs_;
   std::vector<std::string> ops_;
@@ -1975,8 +1981,13 @@ void ClientBehaviour::reset_noise() {
   if (noise_spec_) noise_.emplace(*noise_spec_, seed_);
 }
 
+// A traffic_spike fault (book ch. 4 and ch. 11: a flash crowd) multiplies the curve the way one
+// more `spikes` entry would: a dimensionless factor on the deterministic rate, before the noise
+// (workload::RateCurve: level × wave × Π spikes, × noise here). A fault of factor 3 on [at, at +
+// for) and a spike {at, for, factor: 3} give the same rate. Outside every fault the factor is 1,
+// and x × 1 is x exactly, so a run without faults is unchanged.
 Rate ClientBehaviour::rate(SimTime now) const {
-  return Rate{curve_.rate_at(now).per_second * noise_multiplier_};
+  return Rate{curve_.rate_at(now).per_second * rate_factor_ * noise_multiplier_};
 }
 
 std::vector<std::pair<std::string, Rate>> ClientBehaviour::offered(SimTime now) const {

@@ -798,6 +798,15 @@ struct Fault {
   std::optional<SimTime> extra{};  // latency_spike: added to the node's service time
 };
 
+// How many copies of `node` a node_down counts (`Fault::replicas` is a number of them): its
+// replicas, or for a kv_cluster its machines (`kv_nodes`; the loader refuses `replicas` on a
+// cluster, and graph::apply_kv_ring makes the two equal only in the graph). The loader bounds
+// `replicas` by it; engine::FaultSchedule divides by it.
+[[nodiscard]] constexpr int copies_of(const NodeSpec& node) {
+  if (node.type == NodeType::kv_cluster) return node.kv_nodes.value_or(node.replicas);
+  return node.replicas;
+}
+
 struct Scenario {
   std::string name{};
   int version{};

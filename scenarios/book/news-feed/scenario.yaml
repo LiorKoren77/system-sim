@@ -124,6 +124,7 @@ slo:
   - {metric: drop_rate, max: 0.001}
   - {metric: queue_lag, node: fanout_q, max: 2m}
 
-# Accepted and ignored: `run` applies no fault before phase 3 (see the README).
+# Every copy of post_db down for 30 s at 15:00: what it costs is in the README ("The 15:00
+# outage"). Delete the entry to see the day as sized.
 faults:
   - {at: 15:00, kind: node_down, node: post_db, for: 30s}

@@ -567,8 +567,10 @@ TEST_CASE("book/news-feed runs: graph_db is sent three replica-requests per fan-
 
 namespace {
 
-// The whole day of book/news-feed at `step` with `workers` fan-out workers: every node's summary,
-// the drop rate and the three SLO verdicts.
+// The whole day of book/news-feed at `step` with `workers` fan-out workers, without its scripted
+// 15:00 post_db outage: every node's summary, the drop rate and the three SLO verdicts. The sizing
+// tests below are about the noon spike; what the outage costs, now that the engine applies faults
+// (phase 3), is pinned on its own after them.
 struct NewsFeedDay {
   std::vector<simsys::report::NodeSummary> nodes;
   double drop_rate{};
@@ -590,6 +592,7 @@ NewsFeedDay run_news_feed_day(int workers, simsys::SimTime step) {
   auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml");
   s.step = step;
   std::ranges::find(s.nodes, "fanout", &simsys::model::NodeSpec::id)->workers = workers;
+  s.faults.clear();
   const auto g = build_or_fail(s);
   auto sim = simsys::engine::Simulation::create(g);
   if (!sim) FAIL(sim.error().message);
@@ -656,6 +659,55 @@ TEST_CASE("book/news-feed with 8 fan-out workers falls 200 s behind in the spike
   CHECK_THAT(day.node("fanout").peak_backlog, Catch::Matchers::WithinRel(backlog, 1e-9));
   CHECK(day.slo(simsys::model::SloMetric::p99_latency).status == simsys::report::SloStatus::pass);
   CHECK(day.drop_rate == 0.0);
+}
+
+// The shipped day's scripted outage (phase 3 Task 6; the README's "Faults"): every copy of
+// `post_db` down for 30 s from 15:00 (no `replicas`: the whole node), so its capacity is 0 for
+// those 30 s. Nothing drains; what reaches it waits in its rooms or is dropped:
+//   rooms    queue_limit 500 x 3 copies per shard x 6 shards = 9,000 units, full within the
+//            outage's first step (every copy is sent more than its 500 in 10 s)
+//   dropped  = what arrived during the outage - 9,000          (fluid conservation, drain 0)
+// and nothing is dropped outside it: once back, post_db drains the 9,000 at its full capacity. The
+// day runs at 10 s steps (8,640; the outage is the three steps from 15:00), which changes none of
+// this. What waits in the rooms is answered when post_db is back, but a node of capacity 0 has no
+// finite wait (fluid::FluidQueue::backlog_wait_s, backlog / 0), so the requests it still admitted
+// give the ops whose path reaches it an infinite latency that step: the day's `read_feed` is
+// unavailable and its p99 SLO fails on it, while the drop_rate SLO passes (0.039 % of 0.1 %).
+TEST_CASE("book/news-feed's 30 second post_db outage drops what reaches it beyond its rooms",
+          "[scenario]") {
+  using namespace std::chrono_literals;
+  auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml");
+  s.step = 10s;
+  const auto g = build_or_fail(s);
+  const auto post_db = *g.index_of("post_db");
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  simsys::report::Summary summary{g, s.warmup};
+  double arrived_in_outage = 0.0;
+  double dropped_in_outage = 0.0;
+  double dropped_elsewhere = 0.0;
+  sim->run({.duration = s.duration, .step = s.step}, [&](const simsys::engine::StepRecord& r) {
+    summary.observe(r);
+    const auto& node = r.nodes[post_db];
+    const bool in_outage = r.t >= 15h && r.t < 15h + 30s;
+    (in_outage ? dropped_in_outage : dropped_elsewhere) += node.dropped_per_s * 10.0;
+    if (in_outage) arrived_in_outage += node.demand_per_s * 10.0;
+  });
+  constexpr double rooms = 500.0 * 3.0 * 6.0;
+  REQUIRE(arrived_in_outage > rooms);
+  REQUIRE_THAT(dropped_in_outage, Catch::Matchers::WithinRel(arrived_in_outage - rooms, 1e-9));
+  REQUIRE_THAT(dropped_elsewhere, Catch::Matchers::WithinAbs(0.0, 1e-6));
+  const NewsFeedDay day{summary.nodes(), summary.drop_rate(),
+                        simsys::report::evaluate_slos(summary, s.slos)};
+  REQUIRE_THAT(day.node("post_db").peak_backlog, Catch::Matchers::WithinRel(rooms, 1e-9));
+  REQUIRE(day.node("post_db").peak_rho == 1.0);  // capacity 0 counts as saturated (utilization)
+  const auto& drops = day.slo(simsys::model::SloMetric::drop_rate);
+  REQUIRE(drops.status == simsys::report::SloStatus::pass);
+  REQUIRE_THAT(*drops.observed, Catch::Matchers::WithinRel(day.drop_rate, 1e-12));
+  const auto& p99 = day.slo(simsys::model::SloMetric::p99_latency);
+  REQUIRE(p99.status == simsys::report::SloStatus::fail);
+  REQUIRE(p99.observed.has_value());
+  REQUIRE(std::isinf(*p99.observed));
 }
 
 // Spec §19 entry 2: byte-sized nodes count megabytes, so the capacities the 2b scenarios gave no
@@ -1089,7 +1141,11 @@ TEST_CASE("explain on the shipped scenarios prints each external sink's failure 
 //   average node  90k / 16 = 5.625k/s   = 56.25 %
 //   hottest node  k x 5.625k, k = 1 + z_16/sqrt(3 x 150) = 1.08338 (z_16 = 1.7688, the expected
 //                 maximum of 16 standard normals; 150 vnodes), = 6.094k/s = 60.94 %
-// The `utilization` SLO (max 0.8) is read at the hottest node, so it observes 0.6094 and passes;
+// The `utilization` SLO (max 0.8) is read at the hottest node, whose mean over the run is 0.6094
+// but for the lab's scripted fault (phase 3 Task 6): one machine of 16 down for 3 minutes from 10 m
+// leaves 15/16 of every machine's capacity (the survivors share the load evenly), so the hot
+// machine runs at 0.6094 x 16/15 = 0.6500 for 3 of the 29 observed minutes (30, 1 of warmup):
+//   mean = 0.6094 x (26 + 3 x 16/15) / 29 = 0.6094 x 29.2 / 29 = 0.6136, and passes;
 // the `drop_rate` SLO (max 0.01) sees nothing dropped; the put's p99 (max 20 ms) is far below it: a
 // put crosses four 0.25 ms link legs (1 ms), the coordinator (0.2 ms of service, utilization 0.5
 // over 4 x 15k/s: 0.232 ms with its Erlang wait) and the W = 2 quorum over its key's real replicas
@@ -1125,10 +1181,10 @@ TEST_CASE(
   }
   const auto& utilization = slo_of(results, simsys::model::SloMetric::utilization);
   REQUIRE(utilization.observed.has_value());
-  REQUIRE_THAT(
-      *utilization.observed,
-      Catch::Matchers::WithinRel(90'000.0 / 16.0 / 10'000.0 * ring_factor(16, 3, 150), 1e-3));
-  REQUIRE_THAT(*utilization.observed, Catch::Matchers::WithinAbs(0.6094, 5e-4));
+  const double hottest = 90'000.0 / 16.0 / 10'000.0 * ring_factor(16, 3, 150);  // no fault
+  REQUIRE_THAT(*utilization.observed,
+               Catch::Matchers::WithinRel(hottest * (26.0 + 3.0 * 16.0 / 15.0) / 29.0, 1e-3));
+  REQUIRE_THAT(*utilization.observed, Catch::Matchers::WithinAbs(0.6136, 5e-4));
   const auto& drops = slo_of(results, simsys::model::SloMetric::drop_rate);
   REQUIRE(drops.observed == 0.0);
   const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
@@ -1285,7 +1341,11 @@ TEST_CASE(
 // The consistent-hashing lab's balancer ring uses the same heuristic, with N = 1 copy of each key
 // over its M = 4 cache servers: k = 1 + z_4/sqrt(150) = 1.0857 (z_4 = 1.0491). 40k/s over 4 x 15k/s
 // is 66.7 % on average, so the hottest server, which the utilization SLO reads, runs at 2/3 x
-// 1.0857 = 0.7238 (0.7211 with the old 1 + 1/sqrt(150)).
+// 1.0857 = 0.7238 (0.7211 with the old 1 + 1/sqrt(150)). The SLO reads its mean over the 19
+// observed minutes (20, 1 of warmup), and the lab scripts one of the four servers down for 5
+// minutes from 10 m (phase 3 Task 6): the survivors share its load evenly, every server at 3/4 of
+// its capacity, so the hottest runs at 0.7238 / 0.75 = 0.9651 for those 5 minutes:
+//   mean = 0.7238 x (14 + 5 / 0.75) / 19 = 0.7873.
 TEST_CASE("the consistent-hashing lab's hottest server runs at the ring factor over four servers",
           "[scenario]") {
   const auto results = run_slos(load_scenario("/labs/consistent-hashing/scenario.yaml"));
@@ -1295,9 +1355,10 @@ TEST_CASE("the consistent-hashing lab's hottest server runs at the ring factor o
   });
   REQUIRE(caches != results.end());
   REQUIRE(caches->observed.has_value());
+  const double hottest = 40'000.0 / 60'000.0 * ring_factor(4, 1, 150);  // without the fault
   REQUIRE_THAT(*caches->observed,
-               Catch::Matchers::WithinRel(40'000.0 / 60'000.0 * ring_factor(4, 1, 150), 1e-6));
-  REQUIRE_THAT(*caches->observed, Catch::Matchers::WithinAbs(0.7238, 1e-4));
+               Catch::Matchers::WithinRel(hottest * (14.0 + 5.0 / 0.75) / 19.0, 1e-6));
+  REQUIRE_THAT(*caches->observed, Catch::Matchers::WithinAbs(0.7873, 1e-4));
 }
 
 // The "not checked: kv_cluster ..." note of phase 2c's first half is gone from every shipped

@@ -16,8 +16,11 @@
 // saturation spreading downstream as reduced throughput (dropped flow never reaches the
 // next box), propagation delay, fan-out and the feedback loops of ch. 12 (chat). Ignored:
 // individual requests (flow is a fluid), retries, and anything that changes within a step
-// (demand is constant across one step). A client's timeout is applied to the fitted response
-// time it sees (Simulation::give_up_after), not request by request.
+// (demand is constant across one step). A scripted fault (the scenario's `faults:`, FaultSchedule)
+// changes a node's numbers for the steps it covers: forward_pass asks the schedule for the node's
+// Condition and the node steps under it (serve, ClientBehaviour::set_rate_factor). A client's
+// timeout is applied to the fitted response time it sees (Simulation::give_up_after), not request
+// by request.
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers).
@@ -45,6 +48,12 @@ module;
 #include <vector>
 
 export module simsys.engine;
+
+// C++20 `export import` of a partition: brings the interface partition simsys.engine:faults (the
+// fault schedule, src/engine/faults.cppm) into this unit and re-exports it, so every importer of
+// simsys.engine sees engine::Condition and engine::FaultSchedule with no import of its own. The
+// partition's name is relative (`:faults`): only units of simsys.engine can name it.
+export import :faults;
 
 import simsys.core;
 import simsys.behaviours;
@@ -488,11 +497,14 @@ class Simulation {
   void receive(std::size_t index, Mode mode);
   // Any queueing node (service, load balancer, rate limiter): runs its queues and returns
   // what they drained, in requests per second, for the behaviour to route.
-  [[nodiscard]] flow::Flow serve(std::size_t index, SimTime dt, Mode mode, NodeSample& sample);
+  [[nodiscard]] flow::Flow serve(std::size_t index, SimTime dt, Mode mode,
+                                 const Condition& condition, NodeSample& sample);
   [[nodiscard]] static GroupStep advance_group(CopyGroup& group, const flow::Flow& arrivals,
-                                               SimTime dt, Mode mode);
+                                               SimTime dt, Mode mode,
+                                               const fluid::Derating& derating);
   [[nodiscard]] static GroupStep serve_copies(CopyGroup& group, const flow::Flow& arrivals,
                                               SimTime dt, Mode mode,
+                                              const fluid::Derating& derating,
                                               const behaviours::Behaviour& behaviour,
                                               NodeSample& sample);
   [[nodiscard]] static flow::Flow group_arrivals(const CopyGroup& group, const flow::Flow& reads,
@@ -546,6 +558,9 @@ class Simulation {
   std::size_t pipe_count_{};  // the links with a bandwidth: StepRecord::links has one each
   std::vector<std::size_t> order_;
   SimTime step_{};
+  // The scenario's faults (empty without any). estimate()'s scratch copy (settling_copy) leaves it
+  // empty: the steady state is the one without faults.
+  FaultSchedule faults_{};
 };
 
 }  // namespace simsys::engine
@@ -588,6 +603,24 @@ namespace {
   if (spec.type == model::NodeType::cache) return cache_not_runnable(spec);
   if (spec.type == model::NodeType::cdn) return cdn_not_runnable(spec);
   return std::nullopt;
+}
+
+// Why a scripted fault cannot run yet, if one cannot: a dc_down, whose datacenter's nodes and links
+// Task 7 of phase 3 takes down (a temporary refusal, replaced there). Every other kind runs
+// (FaultSchedule; a cache_flush changes nothing until Task 7 either, but refusing it would refuse
+// the scenarios that script one).
+[[nodiscard]] std::optional<std::string> fault_not_runnable_yet(const model::Scenario& scenario) {
+  for (const auto& fault : scenario.faults) {
+    if (fault.kind == model::FaultKind::dc_down) return "dc_down lands in Task 7";
+  }
+  return std::nullopt;
+}
+
+// The fluid queue's view of a node's condition (fluid::Derating): its capacity factor and its
+// extra latency in seconds. The identity condition gives the identity derating (seconds(0) is 0).
+[[nodiscard]] fluid::Derating derating_of(const Condition& condition) {
+  return fluid::Derating{.capacity_factor = condition.capacity_factor,
+                         .extra_service_s = seconds(condition.extra_latency)};
 }
 
 void add_once(std::vector<std::size_t>& links, std::size_t link) {
@@ -716,6 +749,22 @@ void fail_share(double failure_rate, flow::Flow& drained, flow::Flow& dropped, N
         }
       },
       behaviour);
+}
+
+// A latency spike at a byte-sized node (a blob store, a CDN counting megabytes): its queue's wait
+// already reflects the slower service (fluid::Derating), but each op is answered at its own time
+// after that wait (own_sojourn, behaviours::MegabyteService::sojourn), which knows nothing of the
+// extra. The extra holds every request before its bytes move, so it is added to the wait every op
+// pays. Every other node needs nothing: its sojourn is its queue's, whose service time is already
+// s + extra; and its wait must stay the wait (a worker pool's is its queue's lag,
+// record_queue_lags).
+[[nodiscard]] flow::LatencyEstimate with_extra_before_bytes(flow::LatencyEstimate wait,
+                                                            const behaviours::Behaviour& behaviour,
+                                                            const fluid::Derating& derating) {
+  if (derating.extra_service_s > 0.0 && megabyte_service_of(behaviour) != nullptr) {
+    wait.mean_s += derating.extra_service_s;
+  }
+  return wait;
 }
 
 // `units` split into its reads and its writes (is_write_at): every op of a node that is not a
@@ -897,13 +946,18 @@ std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Gr
       return std::unexpected{graph::EngineError{std::move(*refused)}};
     }
   }
+  if (auto refused = fault_not_runnable_yet(g.scenario())) {
+    return std::unexpected{graph::EngineError{std::move(*refused)}};
+  }
   return Simulation{g};
 }
 
 // Copies what a step needs out of the graph, so the Simulation does not outlive a
 // reference to it.
 Simulation::Simulation(const graph::Graph& g)
-    : order_{g.topological_order().begin(), g.topological_order().end()}, step_{g.scenario().step} {
+    : order_{g.topological_order().begin(), g.topological_order().end()},
+      step_{g.scenario().step},
+      faults_{g.scenario()} {
   for (std::size_t i = 0; i < g.nodes().size(); ++i) nodes_.push_back(make_node(g, i));
   // C++20 designated initializers: `Link{.line = ...}` names the member it sets and leaves
   // the others at their defaults, replacing positional braces where a reader must count
@@ -1327,6 +1381,8 @@ Simulation Simulation::settling_copy() const {
   scratch.order_ = order_;
   scratch.step_ = step_;
   scratch.pipe_count_ = pipe_count_;
+  // faults_ stays empty: estimate is the steady state without the scripted faults (every node in
+  // the identity condition), which `simsys estimate` says above its table.
   scratch.nodes_ = nodes_;
   for (auto& node : scratch.nodes_) {
     node.inflow.clear();
@@ -1414,11 +1470,14 @@ void Simulation::record_queue_lags(std::span<NodeSample> samples) const {
 
 // Forward pass (spec §3.2-3.4), nodes in topological order. For each node:
 //   1. receive: pop every incoming link into the node's inflow;
-//   2. a client offers its load (in advance mode it first ticks its noise by dt; settle
-//      mode never ticks, so estimate sees the curve without noise at the time it passes,
-//      t = 0); any other node (service, load balancer, rate limiter) runs its fluid queue
-//      on the inflow and routes the part it drained (backlog included, with the queue's op
-//      mix: see serve) for the step [now, now + dt), each call after another sent only what
+//   2. the node's condition at `now` (FaultSchedule::condition_at: the identity outside every
+//      scripted fault, and always in estimate, whose copy has no faults) is handed to it: a
+//      client offers its load times the condition's rate factor (in advance mode it first ticks
+//      its noise by dt; settle mode never ticks, so estimate sees the curve without noise at the
+//      time it passes, t = 0); any other node (service, load balancer, rate limiter) runs its
+//      fluid queue, derated by the condition (serve), on the inflow and routes the part it
+//      drained (backlog included, with the queue's op mix: see serve) for the step
+//      [now, now + dt), each call after another sent only what
 //      the calls before it delivered at the end of the previous step (delivered_last_step);
 //      what the route rejects is recorded and goes nowhere (account_rejections);
 //   3. send: accumulate the routed flow per link, pass it through the link's pipe if the link
@@ -1439,20 +1498,22 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
     const auto delivered_last_step = [this, index, mode](std::size_t target, std::string_view op) {
       return hop_delivered_for_thinning(index, target, op, mode);
     };
+    const Condition condition = faults_.condition_at(index, now);
     // A client's sample stays all zeros, green: a source has no queue.
-    const behaviours::Routed routed =
-        std::visit(core::Overloaded{[&](behaviours::ClientBehaviour& client) {
-                                      if (mode == Mode::advance) client.tick(now, dt);
-                                      return client.offer(now);
-                                    },
-                                    // A generic lambda: every other alternative is a queueing node.
-                                    // Overload resolution prefers the non-template ClientBehaviour&
-                                    // lambda for a client, so this one sees only servers.
-                                    [&](auto& server) {
-                                      return server.route(serve(index, dt, mode, samples[index]),
-                                                          now, dt, delivered_last_step);
-                                    }},
-                   nodes_[index].behaviour);
+    const behaviours::Routed routed = std::visit(
+        core::Overloaded{[&](behaviours::ClientBehaviour& client) {
+                           if (mode == Mode::advance) client.tick(now, dt);
+                           client.set_rate_factor(condition.rate_factor);
+                           return client.offer(now);
+                         },
+                         // A generic lambda: every other alternative is a queueing node.
+                         // Overload resolution prefers the non-template ClientBehaviour&
+                         // lambda for a client, so this one sees only servers.
+                         [&](auto& server) {
+                           return server.route(serve(index, dt, mode, condition, samples[index]),
+                                               now, dt, delivered_last_step);
+                         }},
+        nodes_[index].behaviour);
     account_rejections(index, routed, samples[index]);
     send(index, routed, dt, mode, record.links);
   }
@@ -1554,9 +1615,20 @@ void Simulation::receive(std::size_t index, Mode mode) {
 // sojourn: see ServiceBehaviour). The one exception is a byte-sized node, whose ops are the
 // megabytes they move: its queue waits for whole objects, fed their size mix's moments
 // (time_whole_objects), and each op is answered at its own time after that wait (own_sojourn).
-flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSample& sample) {
+//
+// A scripted fault (FaultSchedule) enters here and nowhere else for a queueing node: every copy
+// group steps on its capacity derated by the node's `condition` (fluid::Derating: capacity ×
+// capacity_factor, service time + extra_latency), which is the identity outside every fault. Every
+// queueing type (a service, a balancer, a limiter's gate or leaky bucket, a cache's or a CDN's
+// lookup, a database's primaries and replicas, a kv_cluster's machines, a worker pool, a broker, a
+// sink) is derated alike, because its queues are built here; its behaviour sees only what drained.
+// A node_down of every copy is capacity 0: nothing drains, the room fills to queue_limit and the
+// rest is dropped, and when the fault ends the backlog drains at the restored capacity.
+flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, const Condition& condition,
+                             NodeSample& sample) {
   auto& node = nodes_[index];
   time_whole_objects(node);
+  const fluid::Derating derating = derating_of(condition);
   // Not const: `writes` becomes the primaries' committed writes below.
   auto [reads, writes] = split_writes(in_units(node.inflow, node.behaviour), node.behaviour);
   flow::Flow drained;
@@ -1570,7 +1642,7 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSampl
   for (std::size_t i = 0; i < node.copy_groups.size(); ++i) {
     auto& group = node.copy_groups[i];
     const flow::Flow arrivals = group_arrivals(group, reads, writes);
-    GroupStep step = serve_copies(group, arrivals, dt, mode, node.behaviour, sample);
+    GroupStep step = serve_copies(group, arrivals, dt, mode, derating, node.behaviour, sample);
     // The busiest kind of copy speaks for the node's load: the hottest copy behind a ring (it
     // takes the largest share), the busier of a database's primary and replicas.
     if (i == 0 || step.copy.rho > sample.rho) {
@@ -1578,7 +1650,7 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, NodeSampl
       sample.zone = step.copy.zone;
     }
     sojourns[i] = step.copy.latency;
-    waits[i] = step.copy.wait;
+    waits[i] = with_extra_before_bytes(step.copy.wait, node.behaviour, derating);
     // One machine's sojourn, and the share the group's copies kept of what they were sent (the
     // arrivals are one copy's; step.dropped is the group's): a kv_cluster's quorum reads both.
     machines[i] = {.sojourn = step.copy.latency,
@@ -1797,9 +1869,10 @@ void Simulation::record_replication(const Node& node,
 // of their totals to `sample` (add_copies).
 Simulation::GroupStep Simulation::serve_copies(CopyGroup& group, const flow::Flow& arrivals,
                                                SimTime dt, Mode mode,
+                                               const fluid::Derating& derating,
                                                const behaviours::Behaviour& behaviour,
                                                NodeSample& sample) {
-  GroupStep step = advance_group(group, arrivals, dt, mode);
+  GroupStep step = advance_group(group, arrivals, dt, mode, derating);
   // The queue is well-mixed (see serve): what it drains, drops and holds has the content's op
   // mix, so the clients' share of the content is their share of each of those.
   add_copies(sample, step.copy, group.copies, clients_share(group, arrivals, behaviour),
@@ -1808,18 +1881,21 @@ Simulation::GroupStep Simulation::serve_copies(CopyGroup& group, const flow::Flo
 }
 
 // The fluid step of one copy of `group`, sent `arrivals` (per op, in capacity units per second),
+// derated by the node's condition (fluid::Derating: every copy of the group alike, the survivors of
+// a node_down sharing its load evenly; the identity outside every fault and when estimating),
 // settled first when estimating, and what the group's copies drained and dropped of it, per op,
 // in the content's mix (the queue is well-mixed, see serve). Every copy group of a node runs
 // through here (serve_copies), and so does a bandwidth link's pipe (pass_through_pipe).
 Simulation::GroupStep Simulation::advance_group(CopyGroup& group, const flow::Flow& arrivals,
-                                                SimTime dt, Mode mode) {
+                                                SimTime dt, Mode mode,
+                                                const fluid::Derating& derating) {
   const Rate per_copy = arrivals.total();
   if (mode == Mode::settle) {
     group.queue.settle(per_copy);
     group.waiting = settled_waiting(arrivals, group.queue.backlog());
   }
   GroupStep step{.content = queue_content(group.waiting, arrivals, dt)};
-  step.copy = group.queue.advance(per_copy, dt);
+  step.copy = group.queue.advance(per_copy, dt, derating);
   step.drained = take_drained(group, step.content, step.copy);
   // Every group's drops, per op: a replica's replayed writes it missed (replay_committed) and,
   // on every node, the requests lost (account_rejections).
@@ -1903,7 +1979,8 @@ void Simulation::pass_through_pipe(Link& link, SimTime dt, Mode mode,
   }
   const flow::Flow megabytes = to_megabytes(requests, pipe.megabytes_by_op);
   const bool idle = requests.total().per_second <= 0.0;
-  const GroupStep step = advance_group(pipe.group, megabytes, dt, mode);
+  // A link has no condition yet (dc_down's links are Task 7's): the identity derating.
+  const GroupStep step = advance_group(pipe.group, megabytes, dt, mode, fluid::Derating{});
   pipe.wait = step.copy.wait;
   pipe.passed = kept_share(step.dropped, megabytes);
   link_samples[pipe.slot] =

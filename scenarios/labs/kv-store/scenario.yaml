@@ -1,7 +1,8 @@
 # Lab: System Design Interview vol. 1, ch. 6 — Key-value store (Dynamo-style).
 # N=3 replicas, W=2, R=2 quorum, consistent hashing with virtual nodes, hinted handoff,
-# vector clocks, gossip failure detection. One fault: a node failure (read and validated, not yet
-# applied: faults run later in phase 3; hinted handoff, vector clocks and gossip are not modelled).
+# vector clocks, gossip failure detection. One fault: a machine down for 3 minutes, which takes
+# its sixteenth of the cluster's capacity while it lasts (README); hinted handoff, vector clocks
+# and gossip are not modelled.
 # A network partition, the fault that tells `mode: ap` from `cp`, is a phase 4 backlog item: not
 # modelled, and the loader refuses `kind: partition`.
 version: 1

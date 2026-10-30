@@ -133,7 +133,7 @@ Everything else is refused before the first step, with exit code 1:
 | `ws_gateway`, `service_discovery` | `node 'x' has type 'ws_gateway', which run/estimate do not support yet (phase 3)` | 3 |
 | `notification_fanout`, `frontier` | the same message | 3 |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
-| `faults` | none: the list is read and validated (see [`faults`](#faults)), and nothing happens | 3 |
+| a `dc_down` fault | `dc_down lands in Task 7` (the other kinds run: see [`faults`](#faults)) | 3 |
 
 The type message names the phase that plans the type's model, phase 3 for all four. The type
 check runs over the whole file first, and names the first node
@@ -261,7 +261,7 @@ copy or machine): they would be lower bounds too.
 | `nodes` | map id → node | yes | read | non-empty; ids are non-empty and unique |
 | `links` | list | yes | read | `[]` for none |
 | `slo` | list | no | read | |
-| `faults` | list | no | read | scripted failures, see [`faults`](#faults); typed and validated, applied by the engine later in phase 3 |
+| `faults` | list | no | read | scripted failures, see [`faults`](#faults); `run` applies them (but `dc_down`, refused until phase 3 Task 7), `estimate` leaves them out |
 
 ## `datacenters`
 
@@ -1384,9 +1384,25 @@ latency SLO on it fails. The mean stays the answered requests' mean (the truncat
 
 ## Faults
 
-A list of scripted failures (spec §4.1), each typed into a `model::Fault` by `src/config/faults.cpp`.
-The engine applies them later in phase 3; until then they are read, validated and listed by
-`explain` (`faults: 1 scripted (node_down chat_servers 21:30 for 1m)`; no line without faults).
+A list of scripted failures (spec §4.1), each typed into a `model::Fault` by `src/config/faults.cpp`
+and listed by `explain` (`faults: 1 scripted (node_down chat_servers 21:30 for 1m)`; no line
+without faults). `run` applies them (phase 3 spec §4.2, `engine::FaultSchedule`): for the steps a
+fault covers, from the step that starts at `at` to the last one that starts before `at + for`, it
+changes the numbers the node's queue is built from, and nothing else:
+
+| kind | while it lasts |
+|---|---|
+| `node_down` | the node's capacity × (R − r) / R, r of its R replicas down (a kv_cluster's machines; `primary` counts as one); every replica down: capacity 0, so nothing drains, the room fills to `queue_limit` and the rest is dropped, and the backlog drains when the fault ends. A request waiting in that room has an infinite wait (backlog / 0): an op whose path reaches it is `unavailable` for the run |
+| `capacity` | capacity × `factor`; a request still takes its service time |
+| `latency_spike` | service time + `extra`, so the node's servers drain c / (s + extra) a second |
+| `traffic_spike` | the client's rate × `factor`, exactly as a `spikes` entry on its rate curve |
+| `cache_flush` | nothing yet (the hit ratio warming back is phase 3 Task 7) |
+| `dc_down` | refused by `run` and `estimate`: `dc_down lands in Task 7` |
+
+Faults on one node compose: factors multiply, extra latencies add. The survivors of a `node_down`
+share the node's load evenly (every replica's capacity is scaled); the node comes back at full
+capacity the instant the fault ends. `estimate` is the steady state without the faults and says
+so: `faults: 1 scripted (estimate shows the steady state without them; run applies them)`.
 
 ```yaml
 faults:

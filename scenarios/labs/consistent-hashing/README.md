@@ -50,15 +50,25 @@ recommended setting. 15k/s gives 67 % on average and room for the spread.
   the primary idles and the replica carries the misses: `explain` prints `primary 0 units/s vs
   5k/s (0%, green), each replica 1.345k units/s vs 5k/s (26.9%, green)` (capacity units: a read
   costs 1, so here they are reads).
-- The fault at 10 m (one server removed, `replicas: 1`) is read and validated, not yet applied:
-  faults run later in phase 3. Then the server's capacity will go and the hit ratio, resolved
-  once at build today, will be re-evaluated (the keys that move to the next server arrive cold).
+- **A server down.** The lab scripts one of the four servers down for 5 minutes from 10 m
+  (`replicas: 1`). The model takes its quarter of the tier's capacity: every server serves 3/4 of
+  its 15k/s while it lasts, the survivors sharing the load evenly, so the hottest runs at 0.7238 /
+  0.75 = **0.965** for those 5 minutes (red: `red_s 300`), and the SLO's mean over the 19 observed
+  minutes is 0.7238 × (14 + 5 / 0.75) / 19 = **0.7873**, still a PASS against 0.85. The gets'
+  p99 over the run rises from 2.22 ms to 4.08 ms (mean 1.37 → 1.54 ms). Not modelled yet: that
+  the removed server's arcs go to the servers after it on the ring, which then carry more than
+  the even 3/4 share says, and that its keys arrive there cold (the hit ratio is resolved once,
+  at build).
 
 ## What it abstracts away
 - The hash function, ring data structure and lookup (binary search).
 - Replication across neighbours on the ring (see the KV store lab).
 
 ## Results (`simsys run`, 20 min, after the 1 min warmup)
+
+The rows are runs without the fault (delete the `faults` entry), so that each shows its `vnodes`
+alone; as shipped, the fault raises the first row's hottest server to a mean of 0.787 and the get
+to 1.54 ms / 4.08 ms, still PASS (exit 0).
 
 | setting | imbalance k | hit ratio | hottest cache server rho | cache drops | db rho | get mean / p99 (est.) | SLOs |
 |---|---|---|---|---|---|---|---|
