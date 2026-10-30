@@ -566,6 +566,10 @@ to the pool model's documented simplification, identity, §1–§4 all verified.
 list lacks priority and per-user rate limits.
 Decisions: all seven fixed in a fix round after Task 18 lands (same explain code); the README's test
 count is refreshed at the 3c push.
+Fixed at `f9f2bb9` (1662 tests; the README now quotes the with-blast napkin and the under-count's
+growth with the backlog, the `<fanout>.deduplicated` sweep metric, sequential publishes stated,
+`connections` in the schema's header, `unpropagated_mark`'s grouping gone, queue ids quoted,
+priority and per-user rate limits in the Ignored list).
 
 ### Task 18: `frontier`; web-crawler runs end to end
 
