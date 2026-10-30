@@ -12,6 +12,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include <unistd.h>  // getpid
 
@@ -28,6 +29,7 @@ import simsys.model;
 import simsys.test_fixtures;
 
 using namespace std::chrono_literals;
+using Catch::Matchers::WithinAbs;
 using Catch::Matchers::WithinRel;
 using simsys::Rate;
 using simsys::SimTime;
@@ -567,4 +569,130 @@ TEST_CASE("a node_down of r of a kv_cluster's machines counts r machines down an
   REQUIRE(all.machines_down == 0);
   REQUIRE(all.back_in_s == 3.0);
   require_identity(x.at("store", 25s));
+}
+
+// ---- FaultRecord: what the engine keeps per fault, for the report's block
+// ------------------------
+//
+// What the tests below assume of the engine's API (Task 8 of the phase 3 plan):
+//   struct FaultAfter {                       // what followed the fault; each entry empty when it
+//     std::optional<double> backlog_drained_in_s;  // does not apply or never happened in the run:
+//     std::optional<double> cache_warm_in_s;       // seconds from the end of the fault
+//   };
+//   struct FaultRecord {                      // a value type, members in this order (designated
+//     model::FaultKind kind;                  // initializers need it)
+//     std::string node;                       // as the fault names it (empty for a dc_down)
+//     SimTime at, duration;                   // duration 0 for a cache_flush
+//     double offered_per_s, served_per_s;     // the faulted node's demand and drain, means over
+//                                             // [at, at + for) (over the steps seen so far)
+//     double lost;                            // requests its full room dropped, summed over it
+//     double backlog_peak, room;              // the peak backlog, the room (queue_limit) it fills
+//     std::vector<std::size_t> flipped;       // indexes into Scenario::slos of the SLOs that held
+//                                             // at the step before `at` and are broken at some
+//                                             // step inside the fault
+//     FaultAfter after;
+//     std::optional<SimTime> recovered_at;    // start of the first step at or after the end of
+//   };                                        // the fault with p99 and rho within 1 % of before
+//   std::span<const FaultRecord> Simulation::fault_records() const   // (or a vector), in `at`
+//                                                                    // order, one per fault
+// A fault that has not started when the records are read has none yet or a record of zeros; the
+// tests read only faults that have.
+namespace {
+// The M/M/1 probe of tests/theory/test_faults.cpp (client c 400/s -> service s 1k/s, 1 ms, room
+// 100, zero-latency link; 30 s at 100 ms), with the SLOs and faults the caller gives.
+Scenario fault_probe(std::string_view slos_and_faults) {
+  return load_yaml(
+      "version: 1\nname: records\nduration: 30s\nstep: 100ms\n"
+      "nodes:\n"
+      "  c: {type: client, rate: {base: 400/s}, ops: {op: 1.0}}\n"
+      "  s: {type: service, capacity: 1k/s, latency: 1ms, advanced: {queue_limit: 100}}\n"
+      "links:\n  - {from: c, to: s, dir: inout, latency: 0s}\n" +
+      std::string{slos_and_faults});
+}
+
+// The records after `steps` steps (100 ms each) of the scenario.
+std::vector<simsys::engine::FaultRecord> records_after(const Scenario& s, int steps) {
+  const auto g = simsys::graph::Graph::build(s);
+  if (!g) FAIL(g.error().message);
+  auto sim = simsys::test_support::simulation_of(*g);
+  for (int i = 0; i < steps; ++i) (void)sim.step(SimTime{100ms} * i, SimTime{100ms});
+  const auto records = sim.fault_records();
+  return {records.begin(), records.end()};
+}
+}  // namespace
+
+// The probe's ten second node_down at 10 s, whole run (every number derived in test_faults.cpp):
+// 400/s offered and 0/s served over the 10 s, 3900 lost (the room of 100 kept 100 of the 4000), a
+// backlog peaking at the room, the backlog drained 0.2 s after the fault, the system recovered at
+// 20.2 s, and the p99 SLO of 100 ms (8.2 ms before the fault) flipped; the 1 ms SLO failed before
+// the fault and the 1 h one holds throughout, so neither flipped.
+TEST_CASE("the engine keeps one record per fault: lost 3900, backlog peak 100, recovered at 20.2",
+          "[engine]") {
+  const auto records =
+      records_after(fault_probe("slo:\n"
+                                "  - {metric: p99_latency, node: c, op: op, max: 100ms}\n"
+                                "  - {metric: p99_latency, node: c, op: op, max: 1ms}\n"
+                                "  - {metric: p99_latency, node: c, op: op, max: 1h}\n"
+                                "faults:\n  - {at: 10s, kind: node_down, node: s, for: 10s}\n"),
+                    300);
+  REQUIRE(records.size() == 1);
+  const auto& r = records[0];
+  REQUIRE(r.kind == simsys::model::FaultKind::node_down);
+  REQUIRE(r.node == "s");
+  REQUIRE(r.at == SimTime{10s});
+  REQUIRE(r.duration == SimTime{10s});
+  REQUIRE_THAT(r.offered_per_s, WithinRel(400.0, 1e-9));
+  REQUIRE_THAT(r.served_per_s, WithinAbs(0.0, 1e-9));
+  REQUIRE_THAT(r.lost, WithinRel(3900.0, 1e-9));
+  REQUIRE_THAT(r.backlog_peak, WithinRel(100.0, 1e-9));
+  REQUIRE_THAT(r.room, WithinRel(100.0, 1e-9));
+  REQUIRE(r.flipped == std::vector<std::size_t>{0});
+  REQUIRE(r.after.backlog_drained_in_s.has_value());
+  REQUIRE_THAT(*r.after.backlog_drained_in_s, WithinAbs(0.2, 1e-9));
+  REQUIRE_FALSE(r.after.cache_warm_in_s.has_value());
+  REQUIRE(r.recovered_at.has_value());
+  REQUIRE(*r.recovered_at == SimTime{20200ms});
+}
+
+// Read while the fault is still on (15 s of the run seen, 5 s of the 10 s outage: steps 100 to
+// 149): 5 s x 400 offered, 100 kept, 1900 lost so far; nothing has cleared, so there is no drain
+// time and no recovery yet.
+TEST_CASE("a fault still on when the records are read has no drain time and no recovery yet",
+          "[engine]") {
+  const auto records = records_after(
+      fault_probe("faults:\n  - {at: 10s, kind: node_down, node: s, for: 10s}\n"), 150);
+  REQUIRE(records.size() == 1);
+  REQUIRE_THAT(records[0].lost, WithinRel(1900.0, 1e-9));
+  REQUIRE_THAT(records[0].backlog_peak, WithinRel(100.0, 1e-9));
+  REQUIRE_FALSE(records[0].after.backlog_drained_in_s.has_value());
+  REQUIRE_FALSE(records[0].recovered_at.has_value());
+}
+
+// Without faults there is nothing to keep.
+TEST_CASE("a simulation without faults keeps no fault records", "[engine]") {
+  REQUIRE(records_after(fault_probe(""), 50).empty());
+}
+
+// Two faults give two records in at order, whatever the order they were declared in: the plan's
+// "two faults, two blocks in `at` order" starts here.
+TEST_CASE("fault records come in at order, whatever the order the faults were declared in",
+          "[engine]") {
+  const auto records =
+      records_after(fault_probe("faults:\n"
+                                "  - {at: 20s, kind: latency_spike, node: s, extra: 1ms, for: 5s}\n"
+                                "  - {at: 10s, kind: node_down, node: s, for: 5s}\n"),
+                    300);
+  REQUIRE(records.size() == 2);
+  REQUIRE(records[0].kind == simsys::model::FaultKind::node_down);
+  REQUIRE(records[0].at == SimTime{10s});
+  REQUIRE(records[1].kind == simsys::model::FaultKind::latency_spike);
+  REQUIRE(records[1].at == SimTime{20s});
+  // The spike loses nothing and queues nothing: rho 0.8 against 400/s offered.
+  REQUIRE(records[1].lost == 0.0);
+  REQUIRE(records[1].backlog_peak == 0.0);
+  REQUIRE_THAT(records[1].served_per_s, WithinRel(400.0, 1e-9));
+  REQUIRE(records[1].flipped.empty());
+  // Back at the instant it ends: the first step after it is the step before it, again.
+  REQUIRE(records[1].recovered_at.has_value());
+  REQUIRE(*records[1].recovered_at == SimTime{25s});
 }
