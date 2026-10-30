@@ -28,7 +28,7 @@ a failed step does not run, refused, dropped and timed-out requests are counted 
 `simsys sweep` runs a scenario over a range of one key, the points in parallel. Ten scenarios run
 end to end, four of the eight book systems among them (list below); chat-system, google-drive,
 notification-system and web-crawler validate and `explain`, and wait for phase 3's types
-(`ws_gateway`, `service_discovery`, `notification_fanout`, `frontier`). 1163 tests (Catch2, via
+(`notification_fanout`, `frontier`; `ws_gateway` and `service_discovery` run since phase 3). 1163 tests (Catch2, via
 `ctest`). The scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.4).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
@@ -279,12 +279,13 @@ end:
   100 ms, nothing dropped); the busiest node is on the data-gathering side, the log aggregators at
   60 % at the peak (6 workers; at 4 they sit on the red threshold, 90 %).
 
-The four phase 3 types (WebSocket gateways, service discovery, notification fan-outs and URL
-frontiers) already validate and appear in `explain` with their resolved numbers, but `estimate`,
-`run` and `sweep` stop with "which run/estimate do not support yet" and exit 1, as do the four book
-systems that need them. Each of those four READMEs opens with its status: the exact refusal, what
-`explain` shows today (its red checks and the nodes it cannot reach yet) and what phase 3 will
-model. Scripted faults run (`faults:`: a node or some of its replicas down, a capacity loss, a
+The two phase 3 types still to model (notification fan-outs and URL frontiers) already validate
+and appear in `explain` with their resolved numbers, but `estimate`, `run` and `sweep` stop with
+"which run/estimate do not support yet" and exit 1, as do the book systems that need them (a
+WebSocket gateway and a service discovery run since phase 3; chat-system and google-drive now stop
+at a gateway that states no connection level). Each of those four READMEs opens with its
+status: the exact refusal, what `explain` shows today (its red checks and the nodes it cannot reach
+yet) and what phase 3 will model. Scripted faults run (`faults:`: a node or some of its replicas down, a capacity loss, a
 latency spike, a traffic spike, a cache flush, a datacenter down; `estimate` shows the steady
 state without them); retries and `on: failure` steps are phase 3 too; kv partitions are a phase 4
 backlog item.

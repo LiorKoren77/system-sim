@@ -3979,121 +3979,122 @@ TEST_CASE("a gateway's deliver has no hops, its send and heartbeat one each", "[
   REQUIRE(g->service_hops(1, "send")[0].target == 2);
   REQUIRE(g->service_hops(1, "heartbeat").size() == 1);
   REQUIRE(g->service_hops(1, "heartbeat")[0].target == 3);
+}
 
-  // ---- Service discovery as service sugar, and the lookup rule (phase 3 spec §8.1; book ch. 12)
-  // ----
-  //
-  // A service_discovery resolves exactly as a service with the type's numbers: 50k/s and 0.5 ms (a
-  // lookup is one round trip within the data centre, the latency table's 500 us), so Little's law
-  // gives c = 50,000/s x 0.5 ms = 25 servers per copy. Its one rule is the graph's to answer, for
-  // the engine's failover: does an op reach a node THROUGH a lookup? `lookup_before(node, op,
-  // target)` says whether the steps `node` runs for `op` have a step to a service_discovery node
-  // asking `lookup` before the step to `target` (anywhere before it, not only right before).
-  // Proposed signature: Graph::lookup_before(std::size_t node, std::string_view op,
-  // std::size_t target) const -> bool; the plan's `lookup_before(op, target)` leaves out the node
-  // whose step list it reads, which an op name alone does not identify.
+// ---- Service discovery as service sugar, and the lookup rule (phase 3 spec §8.1; book ch. 12)
+// ----
+//
+// A service_discovery resolves exactly as a service with the type's numbers: 50k/s and 0.5 ms (a
+// lookup is one round trip within the data centre, the latency table's 500 us), so Little's law
+// gives c = 50,000/s x 0.5 ms = 25 servers per copy. Its one rule is the graph's to answer, for
+// the engine's failover: does an op reach a node THROUGH a lookup? `lookup_before(node, op,
+// target)` says whether the steps `node` runs for `op` have a step to a service_discovery node
+// asking `lookup` before the step to `target` (anywhere before it, not only right before).
+// Proposed signature: Graph::lookup_before(std::size_t node, std::string_view op,
+// std::size_t target) const -> bool; the plan's `lookup_before(op, target)` leaves out the node
+// whose step list it reads, which an op name alone does not identify.
 
-  namespace {
-  // u (50/s of `call`, 50/s of `read`) -> api, whose `call` steps are `steps` and whose `read` goes
-  // to svc alone; disc is a service_discovery, svc and other plain services.
-  // Node indices: u 0, api 1, disc 2, svc 3, other 4.
-  Scenario discovered(std::vector<Step> steps) {
-    Scenario s{.name = "discovered", .version = 1, .duration = 1min};
-    s.nodes = {
-        client("u", Rate{100}, {{"call", 0.5}, {"read", 0.5}}),
-        service("api", {{"call", std::move(steps)}, {"read", {Step{.to = "svc", .op = "read"}}}}),
-        NodeSpec{.id = "disc", .type = NodeType::service_discovery}, service("svc"),
-        service("other")};
-    s.links = {LinkSpec{.from = "u", .to = "api", .dir = Direction::inout},
-               LinkSpec{.from = "api", .to = "disc", .dir = Direction::inout},
-               LinkSpec{.from = "api", .to = "svc", .dir = Direction::inout},
-               LinkSpec{.from = "api", .to = "other", .dir = Direction::inout}};
-    return s;
-  }
+namespace {
+// u (50/s of `call`, 50/s of `read`) -> api, whose `call` steps are `steps` and whose `read` goes
+// to svc alone; disc is a service_discovery, svc and other plain services.
+// Node indices: u 0, api 1, disc 2, svc 3, other 4.
+Scenario discovered(std::vector<Step> steps) {
+  Scenario s{.name = "discovered", .version = 1, .duration = 1min};
+  s.nodes = {
+      client("u", Rate{100}, {{"call", 0.5}, {"read", 0.5}}),
+      service("api", {{"call", std::move(steps)}, {"read", {Step{.to = "svc", .op = "read"}}}}),
+      NodeSpec{.id = "disc", .type = NodeType::service_discovery}, service("svc"),
+      service("other")};
+  s.links = {LinkSpec{.from = "u", .to = "api", .dir = Direction::inout},
+             LinkSpec{.from = "api", .to = "disc", .dir = Direction::inout},
+             LinkSpec{.from = "api", .to = "svc", .dir = Direction::inout},
+             LinkSpec{.from = "api", .to = "other", .dir = Direction::inout}};
+  return s;
+}
 
-  bool looked_up_before(const Graph& g, std::string_view node, std::string_view op,
-                        std::string_view target) {
-    return g.lookup_before(*g.index_of(node), op, *g.index_of(target));
-  }
-  }  // namespace
+bool looked_up_before(const Graph& g, std::string_view node, std::string_view op,
+                      std::string_view target) {
+  return g.lookup_before(*g.index_of(node), op, *g.index_of(target));
+}
+}  // namespace
 
-  TEST_CASE("a service discovery with no numbers takes the type's 50k/s and 0.5 ms, c 25",
-            "[graph]") {
-    const auto g = Graph::build(discovered({Step{.to = "disc", .op = "lookup"}}));
-    INFO((g ? "" : g.error().message));
-    REQUIRE(g.has_value());
-    const auto& disc = g->nodes()[2];
-    REQUIRE(disc.capacity.service_rate == Rate{50'000});
-    REQUIRE_THAT(disc.capacity.service_time_s, WithinRel(500e-6, 1e-12));
-    REQUIRE(disc.capacity.concurrency == 25);
-    REQUIRE(disc.service_rate_source == simsys::defaults::Source::type_default);
-    REQUIRE(disc.service_time_source == simsys::defaults::Source::type_default);
-  }
+TEST_CASE("a service discovery with no numbers takes the type's 50k/s and 0.5 ms, c 25",
+          "[graph]") {
+  const auto g = Graph::build(discovered({Step{.to = "disc", .op = "lookup"}}));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto& disc = g->nodes()[2];
+  REQUIRE(disc.capacity.service_rate == Rate{50'000});
+  REQUIRE_THAT(disc.capacity.service_time_s, WithinRel(500e-6, 1e-12));
+  REQUIRE(disc.capacity.concurrency == 25);
+  REQUIRE(disc.service_rate_source == simsys::defaults::Source::type_default);
+  REQUIRE(disc.service_time_source == simsys::defaults::Source::type_default);
+}
 
-  TEST_CASE("an op that asks the discovery before calling a node reaches it through a lookup",
-            "[graph]") {
-    const auto g = Graph::build(
-        discovered({Step{.to = "disc", .op = "lookup"}, Step{.to = "svc", .op = "call"}}));
-    REQUIRE(g.has_value());
-    REQUIRE(looked_up_before(*g, "api", "call", "svc"));
-  }
+TEST_CASE("an op that asks the discovery before calling a node reaches it through a lookup",
+          "[graph]") {
+  const auto g = Graph::build(
+      discovered({Step{.to = "disc", .op = "lookup"}, Step{.to = "svc", .op = "call"}}));
+  REQUIRE(g.has_value());
+  REQUIRE(looked_up_before(*g, "api", "call", "svc"));
+}
 
-  // "Before" is anywhere earlier in the list: another step may sit between the lookup and the call.
-  TEST_CASE("a lookup earlier in the steps than other steps still comes before the target",
-            "[graph]") {
-    const auto g = Graph::build(
-        discovered({Step{.to = "disc", .op = "lookup"}, Step{.to = "other", .op = "call"},
-                    Step{.to = "svc", .op = "call"}}));
-    REQUIRE(g.has_value());
-    REQUIRE(looked_up_before(*g, "api", "call", "svc"));
-    REQUIRE(looked_up_before(*g, "api", "call", "other"));
-  }
+// "Before" is anywhere earlier in the list: another step may sit between the lookup and the call.
+TEST_CASE("a lookup earlier in the steps than other steps still comes before the target",
+          "[graph]") {
+  const auto g = Graph::build(
+      discovered({Step{.to = "disc", .op = "lookup"}, Step{.to = "other", .op = "call"},
+                  Step{.to = "svc", .op = "call"}}));
+  REQUIRE(g.has_value());
+  REQUIRE(looked_up_before(*g, "api", "call", "svc"));
+  REQUIRE(looked_up_before(*g, "api", "call", "other"));
+}
 
-  TEST_CASE("an op that calls a node with no lookup before it does not reach it through one",
-            "[graph]") {
-    const auto g = Graph::build(discovered({Step{.to = "svc", .op = "call"}}));
-    REQUIRE(g.has_value());
-    REQUIRE_FALSE(looked_up_before(*g, "api", "call", "svc"));
-  }
+TEST_CASE("an op that calls a node with no lookup before it does not reach it through one",
+          "[graph]") {
+  const auto g = Graph::build(discovered({Step{.to = "svc", .op = "call"}}));
+  REQUIRE(g.has_value());
+  REQUIRE_FALSE(looked_up_before(*g, "api", "call", "svc"));
+}
 
-  // The lookup answers for the nodes called after it, not for those called before: the caller
-  // already had the address of the one it called first.
-  TEST_CASE("a lookup after the step to a node is not a lookup before it", "[graph]") {
-    const auto g = Graph::build(
-        discovered({Step{.to = "svc", .op = "call"}, Step{.to = "disc", .op = "lookup"}}));
-    REQUIRE(g.has_value());
-    REQUIRE_FALSE(looked_up_before(*g, "api", "call", "svc"));
-  }
+// The lookup answers for the nodes called after it, not for those called before: the caller
+// already had the address of the one it called first.
+TEST_CASE("a lookup after the step to a node is not a lookup before it", "[graph]") {
+  const auto g = Graph::build(
+      discovered({Step{.to = "svc", .op = "call"}, Step{.to = "disc", .op = "lookup"}}));
+  REQUIRE(g.has_value());
+  REQUIRE_FALSE(looked_up_before(*g, "api", "call", "svc"));
+}
 
-  // The rule is per target: a lookup before one node says nothing of a node called ahead of it.
-  TEST_CASE("a lookup is before only the targets called after it", "[graph]") {
-    const auto g = Graph::build(
-        discovered({Step{.to = "other", .op = "call"}, Step{.to = "disc", .op = "lookup"},
-                    Step{.to = "svc", .op = "call"}}));
-    REQUIRE(g.has_value());
-    REQUIRE(looked_up_before(*g, "api", "call", "svc"));
-    REQUIRE_FALSE(looked_up_before(*g, "api", "call", "other"));
-  }
+// The rule is per target: a lookup before one node says nothing of a node called ahead of it.
+TEST_CASE("a lookup is before only the targets called after it", "[graph]") {
+  const auto g = Graph::build(
+      discovered({Step{.to = "other", .op = "call"}, Step{.to = "disc", .op = "lookup"},
+                  Step{.to = "svc", .op = "call"}}));
+  REQUIRE(g.has_value());
+  REQUIRE(looked_up_before(*g, "api", "call", "svc"));
+  REQUIRE_FALSE(looked_up_before(*g, "api", "call", "other"));
+}
 
-  // A `lookup` is the discovery's op: a service that merely has an op of that name is no registry
-  // (a cache's `lookup` is the cache's own business, ServiceHop::lookup).
-  TEST_CASE("a step asking a plain service for a lookup is not a discovery lookup", "[graph]") {
-    const auto g = Graph::build(
-        discovered({Step{.to = "other", .op = "lookup"}, Step{.to = "svc", .op = "call"}}));
-    REQUIRE(g.has_value());
-    REQUIRE_FALSE(looked_up_before(*g, "api", "call", "svc"));
-  }
+// A `lookup` is the discovery's op: a service that merely has an op of that name is no registry
+// (a cache's `lookup` is the cache's own business, ServiceHop::lookup).
+TEST_CASE("a step asking a plain service for a lookup is not a discovery lookup", "[graph]") {
+  const auto g = Graph::build(
+      discovered({Step{.to = "other", .op = "lookup"}, Step{.to = "svc", .op = "call"}}));
+  REQUIRE(g.has_value());
+  REQUIRE_FALSE(looked_up_before(*g, "api", "call", "svc"));
+}
 
-  // The rule is read from the steps of one (node, op): the same node's other op, and the
-  // discovery or the target themselves (which list no steps), have no lookup before anything.
-  TEST_CASE("the lookup rule is per op: another op of the same node, or the targets, have none",
-            "[graph]") {
-    const auto g = Graph::build(
-        discovered({Step{.to = "disc", .op = "lookup"}, Step{.to = "svc", .op = "call"}}));
-    INFO((g ? "" : g.error().message));
-    REQUIRE(g.has_value());
-    REQUIRE(looked_up_before(*g, "api", "call", "svc"));
-    REQUIRE_FALSE(looked_up_before(*g, "api", "read", "svc"));
-    REQUIRE_FALSE(looked_up_before(*g, "svc", "call", "svc"));
-    REQUIRE_FALSE(looked_up_before(*g, "disc", "lookup", "svc"));
-  }
+// The rule is read from the steps of one (node, op): the same node's other op, and the
+// discovery or the target themselves (which list no steps), have no lookup before anything.
+TEST_CASE("the lookup rule is per op: another op of the same node, or the targets, have none",
+          "[graph]") {
+  const auto g = Graph::build(
+      discovered({Step{.to = "disc", .op = "lookup"}, Step{.to = "svc", .op = "call"}}));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE(looked_up_before(*g, "api", "call", "svc"));
+  REQUIRE_FALSE(looked_up_before(*g, "api", "read", "svc"));
+  REQUIRE_FALSE(looked_up_before(*g, "svc", "call", "svc"));
+  REQUIRE_FALSE(looked_up_before(*g, "disc", "lookup", "svc"));
+}

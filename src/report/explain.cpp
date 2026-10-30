@@ -746,6 +746,15 @@ struct QueueProvenance {
          " (rebuild load not modelled)";
 }
 
+// A service discovery's failover (phase 3 spec §8.1, book ch. 12): "  failover=10s", always (the
+// loader fills in the chosen 10 s when the scenario states none, so the line shows the window the
+// engine uses): how long, after some replicas of a node its callers look up have died, the
+// registry still hands their addresses out, and the requests sent to them are lost.
+[[nodiscard]] std::string discovery_summary(const model::NodeSpec& spec) {
+  if (spec.type != model::NodeType::service_discovery || !spec.failover) return {};
+  return "  failover=" + format_duration(*spec.failover);
+}
+
 // An external sink's model (spec §19 entry 8): "  failure_rate=2% politeness=1/s (not modelled:
 // phase 3)". The failure rate is always printed (0% is the plain queue): the share of what the sink
 // serves that fails, which a run counts as drops. Politeness only when the scenario states it, and
@@ -778,7 +787,7 @@ struct QueueProvenance {
                        database_summary(node) + id_generator_summary(node.spec) +
                        message_queue_summary(node.spec) + worker_pool_summary(node) +
                        external_sink_summary(node.spec) + search_index_summary(node.spec) +
-                       gateway_summary(g, i)}});
+                       gateway_summary(g, i) + discovery_summary(node.spec)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }

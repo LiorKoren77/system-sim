@@ -306,6 +306,11 @@ class Simulation {
     std::vector<std::size_t> incoming_links{};  // links delivering demand here
     std::vector<std::size_t> outgoing_links{};  // links this node sends demand on
     flow::Flow inflow{};                        // this step's arrivals
+    // A node some caller looks up through a service discovery while a node_down of it is
+    // scheduled (FaultSchedule::failover_routes): the requests per op that arrived this step for
+    // its DEAD replicas (behaviours::Outgoing::doomed), not in `inflow`: they are never served,
+    // only booked as demand and drops (book_failover). Empty on every other node.
+    std::optional<flow::Flow> doomed_inflow{};
     // What the node's queues dropped this step, per op, in requests: the clients' part only (a
     // replica's replayed writes answer no client). Filled by serve, read by account_rejections.
     flow::Flow dropped{};
@@ -376,6 +381,12 @@ class Simulation {
     // A plain link that a dc_down cuts this step (send): it dropped all it was sent, and every hop
     // over it delivers nothing (hop_delivered). A pipe is cut through its queue instead.
     bool cut{false};
+    // A link from a caller to a node it looks up through a service discovery, while a node_down
+    // of that node is scheduled (connect_failover): what the caller sent this step to the node's
+    // dead replicas (behaviours::Outgoing::doomed), and its own delay line, of the same length,
+    // which carries it to the node apart from `sent`. Empty on every other link.
+    flow::Flow doomed{};
+    std::optional<DelayLine> doomed_line{};
   };
 
   Simulation() = default;  // only for settling_copy(), which fills every member
@@ -404,6 +415,7 @@ class Simulation {
   void connect(const graph::Graph& g);
   void connect_pipes(const graph::Graph& g);
   void connect_cuttable(const graph::Graph& g);
+  void connect_failover(const graph::Graph& g);
   void connect_consumer_groups(const graph::Graph& g);
   void connect_retrying_callers(const graph::Graph& g);
   void register_reachable_ops(const graph::Graph& g);
@@ -412,6 +424,8 @@ class Simulation {
   [[nodiscard]] std::vector<double> rooms() const;
   void warm_flushed_caches(SimTime now);
   void count_flushed_reads(SimTime now, SimTime dt);
+  void fail_over_callers(SimTime now);
+  static void fail_over(Simulation& simulation, const FailoverRoute& route, double share);
   void set_hit_ratio_factor(std::size_t cache, double factor);
 
   [[nodiscard]] StepRecord evaluate(SimTime now, SimTime dt, Mode mode);
@@ -474,6 +488,7 @@ class Simulation {
   static void pass_through_pipe(Link& link, SimTime dt, Mode mode, const Condition& condition,
                                 std::span<LinkSample> link_samples);
   void account_rejections(std::size_t index, const behaviours::Routed& routed, NodeSample& sample);
+  void book_failover(std::size_t index, NodeSample& sample) const;
   void backward_pass();
   [[nodiscard]] std::vector<ResponseSample> client_responses(SimTime now) const;
   // Applies a client's `timeout` to one of its samples (see the definition).
@@ -937,11 +952,9 @@ flow::Flow DelayLine::pop() {
 // Two passes over the nodes, in file order: first every node's TYPE, then what a node of a
 // simulated type still lacks (not_runnable_yet: a cache without a hit ratio, a che CDN without a
 // `keys` size; gateway_not_runnable: a ws_gateway with no level or two). So a type the engine has
-// no model for is named before a node that only lacks a number: chat-system is refused at its
-// service_discovery before its gateway is looked at. The message names the phase that plans a
-// model for the type: phase 3 for each of the three left (service_discovery, notification_fanout,
-// frontier), the types whose row in model::node_type_table does not say `runs`
-// (model::simulated).
+// no model for is named before a node that only lacks a number. The message names the phase that
+// plans a model for the type: phase 3 for each of the two left (notification_fanout, frontier),
+// the types whose row in model::node_type_table does not say `runs` (model::simulated).
 std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Graph& g) {
   return create(g, g.scenario().seed);
 }
@@ -1002,7 +1015,8 @@ void Simulation::add_faults(const graph::Graph& g, int seed) {
     flushed_write_ops_.push_back(model::write_ops_of(g.nodes()[cache].spec));
   }
   connect_cuttable(g);
-  fault_log_ = FaultLog{g, rooms()};
+  connect_failover(g);
+  fault_log_ = FaultLog{g, rooms(), faults_.failover_routes()};
   link_tallies_.assign(links_.size(), FaultLog::LinkTally{});
   twin_.push_back(Simulation{g, seed, Faults::stripped});
   twin_.front().link_tallies_.assign(links_.size(), FaultLog::LinkTally{});
@@ -1098,8 +1112,12 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index,
     // (spec §19 entry 10; book ch. 13's trie database) is service sugar in the same way: a service
     // with no steps and the type's numbers (5k/s, 5 ms) unless the scenario states its own. Serving
     // is read-mostly, so nothing else is modelled; its `build_interval` is stored and printed, and
-    // the rebuild's load is ignored.
+    // the rebuild's load is ignored. A service discovery (phase 3 spec §8.1; book ch. 12's
+    // ZooKeeper) is one more: a service answering `lookup` at the type's 50k/s and 0.5 ms. What
+    // makes it more than a service is what its lookups do to the callers when a node they looked
+    // up loses replicas (the failover: FaultSchedule's header, fail_over_callers), not its queue.
     case model::NodeType::service:
+    case model::NodeType::service_discovery:
     case model::NodeType::search_index:
     case model::NodeType::id_generator:
       return make_server(behaviours::ServiceBehaviour{g, index}, resolved);
@@ -1109,9 +1127,8 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index,
     // (behaviours::WsGatewayBehaviour).
     case model::NodeType::ws_gateway:
       return make_server(behaviours::WsGatewayBehaviour{g, index}, resolved);
-    // The three types with no model yet (phase 3): create() refused every scenario that has one
+    // The two types with no model yet (phase 3): create() refused every scenario that has one
     // (model::simulated), so no Simulation is ever constructed over them.
-    case model::NodeType::service_discovery:
     case model::NodeType::notification_fanout:
     case model::NodeType::frontier:
       break;
@@ -1329,6 +1346,18 @@ void Simulation::connect_cuttable(const graph::Graph& g) {
   }
 }
 
+// Gives each failover route's link (caller to target, graph::Graph::demand_link: the one its hops
+// travel on) a line for the doomed demand, as long as the link's own, and the target a place to
+// receive it (Node::doomed_inflow): what a failover sends the dead replicas reaches the node the
+// same step the rest of the caller's demand does.
+void Simulation::connect_failover(const graph::Graph& g) {
+  for (const auto& route : faults_.failover_routes()) {
+    const std::size_t link = *g.demand_link(route.caller, route.target);
+    if (!links_[link].doomed_line) links_[link].doomed_line.emplace(line_steps(g.links()[link]));
+    nodes_[route.target].doomed_inflow.emplace();
+  }
+}
+
 // Tells each message queue which worker pools consume it (Node::consumer_groups): every pool whose
 // `consumes` names the queue (Graph::build checked that it links to it). A pool reading a frontier
 // is no message queue's group: a frontier is not simulated yet.
@@ -1499,8 +1528,11 @@ Simulation Simulation::settling_copy() const {
   // warm-up lives in the behaviours that route its misses, so the copy's go back to steady.
   scratch.nodes_ = nodes_;
   for (const std::size_t cache : faults_.flushed_caches()) scratch.set_hit_ratio_factor(cache, 1.0);
+  // ... and a caller held on a dead replica (fail_over_callers) goes back to the live ones.
+  for (const auto& route : faults_.failover_routes()) fail_over(scratch, route, 0.0);
   for (auto& node : scratch.nodes_) {
     node.inflow.clear();
+    node.doomed_inflow.reset();  // the copy's links have no doomed lines: nothing arrives there
     for (auto& group : node.copy_groups) group.waiting.clear();
     for (auto& [op, answer] : node.responses) answer = Answer{};
     node.dropped.clear();
@@ -1542,6 +1574,7 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
                     .nodes = std::vector<NodeSample>(nodes_.size()),
                     .links = std::vector<LinkSample>(pipe_count_)};
   warm_flushed_caches(now);
+  fail_over_callers(now);
   forward_pass(now, dt, mode, record);
   if (mode == Mode::advance) count_flushed_reads(now, dt);
   record_queue_lags(record.nodes);
@@ -1552,6 +1585,32 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
   feed_back_retries(record.responses, mode);
   feed_back_pool_retries(record.nodes, mode);
   return record;
+}
+
+// Each failover route's dead share at `now` (FaultSchedule::dead_share: r / R inside the window of
+// a node_down of its target, min(failover, for) from the fault's start, else 0) handed to its
+// caller, before any node routes this step: the caller's lookup is what sends the share to the dead
+// replicas, and the backward pass of the same step counts it lost (behaviours::ServiceBehaviour::
+// fail_over). Nothing to do without such a route, and in a settling copy, whose schedule is empty.
+void Simulation::fail_over_callers(SimTime now) {
+  for (const auto& route : faults_.failover_routes()) {
+    fail_over(*this, route, faults_.dead_share(route.target, now, route.failover));
+  }
+}
+
+// One route's share handed to its caller's behaviour in `simulation` (this run, or estimate's
+// settling copy, which resets every route to 0). Only `ops` steps look anything up
+// (graph::Graph::service_hops), and the behaviours that run them (a service and its sugar, a
+// ws_gateway around its service) have fail_over: a requires-expression as a compile-time condition
+// (see record_level) skips every other alternative, which no route names.
+void Simulation::fail_over(Simulation& simulation, const FailoverRoute& route, double share) {
+  std::visit(
+      [&](auto& caller) {
+        if constexpr (requires { caller.fail_over(route.target, route.discovery, share); }) {
+          caller.fail_over(route.target, route.discovery, share);
+        }
+      },
+      simulation.nodes_[route.caller].behaviour);
 }
 
 // A flushed cache's hit ratio factor at `now` (FaultSchedule::condition_at: h(n) / h, 0 at the
@@ -1726,6 +1785,7 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
         nodes_[index].behaviour);
     keep_retries_in_their_group(index, routed);
     account_rejections(index, routed, samples[index]);
+    book_failover(index, samples[index]);
     note_pool_jobs(index, routed);
     send(index, routed, now, dt, mode, record.links);
   }
@@ -1794,6 +1854,21 @@ void Simulation::record_level(const auto& behaviour, NodeSample& sample) {
   if constexpr (requires { behaviour.connections(); }) sample.connections = behaviour.connections();
 }
 
+// The requests sent to the node's dead replicas this step (Node::doomed_inflow; FaultSchedule's
+// header has the model) in its books: they arrived, so they are demand, and they were lost at the
+// node, so they are drops, but they never entered its queue, so they are not drain, backlog or
+// load (rho, latency and the node's own delivered fraction are the survivors'). In capacity units,
+// as the rest of the sample; `failover_lost_per_s` keeps them in requests, for the fault block.
+// Booked after account_rejections, so that a leaky bucket does not count them as its refusals.
+void Simulation::book_failover(std::size_t index, NodeSample& sample) const {
+  const auto& node = nodes_[index];
+  if (!node.doomed_inflow) return;
+  const double units = in_units(*node.doomed_inflow, node.behaviour).total().per_second;
+  sample.demand_per_s += units;
+  sample.dropped_per_s += units;
+  sample.failover_lost_per_s = node.doomed_inflow->total().per_second;
+}
+
 // In settle mode the links have no delay: in the long run a link delivers exactly what
 // it is sent, so the target reads its source's latest output directly. A message queue also
 // receives the jobs its consumer groups re-publish this step (a worker pool's retries,
@@ -1806,7 +1881,11 @@ void Simulation::receive(std::size_t index, Mode mode) {
   auto& node = nodes_[index];
   node.inflow.clear();
   node.retrying_inflow_per_s = 0.0;
+  if (node.doomed_inflow) node.doomed_inflow->clear();
   for (const std::size_t link : node.incoming_links) {
+    // A doomed line exists only in a run with a failover route (connect_failover), never in a
+    // settling copy (its links have none), so settle mode never gets here.
+    if (auto& doomed = links_[link].doomed_line) *node.doomed_inflow += doomed->pop();
     const flow::Flow arrived = mode == Mode::advance ? links_[link].line.pop() : links_[link].sent;
     if (std::ranges::contains(node.retrying_links, link)) {
       node.retrying_inflow_per_s += arrived.total().per_second;
@@ -2280,24 +2359,41 @@ flow::Flow Simulation::take_drained(CopyGroup& group, double copies, const flow:
 void Simulation::send(std::size_t index, const behaviours::Routed& routed, SimTime now, SimTime dt,
                       Mode mode, std::span<LinkSample> link_samples) {
   const auto& outgoing_links = nodes_[index].outgoing_links;
-  for (const std::size_t link : outgoing_links) links_[link].sent.clear();
-  for (const auto& out : routed.outgoing) links_[out.link].sent += out.flow;
+  for (const std::size_t link : outgoing_links) {
+    links_[link].sent.clear();
+    links_[link].doomed.clear();
+  }
+  for (const auto& out : routed.outgoing) {
+    links_[out.link].sent += out.flow;
+    links_[out.link].doomed += out.doomed;  // empty outside a failover
+  }
   for (const std::size_t link : outgoing_links) {
     const Condition condition = faults_.link_condition_at(link, now);
     const bool cut = condition.capacity_factor <= 0.0;
     const double sent_per_s = links_[link].sent.total().per_second;
     if (links_[link].pipe) {
       pass_through_pipe(links_[link], dt, mode, condition, link_samples);
-      // A cut pipe drains nothing: what it does not keep in its room is lost.
+      // A cut pipe drains nothing: what it does not keep in its room is lost. The doomed demand
+      // does not load the pipe (ignored: a dead replica's requests are few and short-lived), but
+      // loses its share as the rest does.
       note_link(link, sent_per_s, sent_per_s * (1.0 - links_[link].pipe->passed));
+      if (links_[link].doomed_line) {
+        links_[link].doomed = links_[link].doomed.scaled(links_[link].pipe->passed);
+      }
       continue;
     }
     links_[link].cut = cut;
-    if (links_[link].cut) links_[link].sent.clear();
+    if (links_[link].cut) {
+      links_[link].sent.clear();
+      links_[link].doomed.clear();  // lost on the cut link before it reaches the dead replicas
+    }
     note_link(link, sent_per_s, cut ? sent_per_s : 0.0);
   }
   if (mode == Mode::settle) return;  // estimate reads `sent` directly; lines stay untouched
-  for (const std::size_t link : outgoing_links) links_[link].line.push(links_[link].sent);
+  for (const std::size_t link : outgoing_links) {
+    links_[link].line.push(links_[link].sent);
+    if (auto& doomed = links_[link].doomed_line) doomed->push(links_[link].doomed);
+  }
 }
 
 // What a link did this step, for the fault log (FaultLog::LinkTally): what was put on it and what

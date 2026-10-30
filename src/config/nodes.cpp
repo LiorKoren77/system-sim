@@ -35,8 +35,8 @@ module simsys.config;
 
 import simsys.core;
 // Only for defaults::max_concurrency (the cap the engine's defaults apply is the cap the loader
-// enforces, one number in one place) and defaults::pool_retry_after (the wait a pool with `retries`
-// and no `retry_after` gets).
+// enforces, one number in one place), defaults::pool_retry_after (the wait a pool with `retries`
+// and no `retry_after` gets) and defaults::failover (a service discovery's, when it states none).
 import simsys.defaults;
 // Only for fluid::Capacity's default zone thresholds (detail.hpp): one source of truth for
 // 0.7 / 0.9.
@@ -880,6 +880,28 @@ CheckResult read_search_index_keys(const Site& site, const YAML::Node& body,
   return {};
 }
 
+// ---- Service discovery keys (phase 3 spec §8.1; book ch. 12) ----
+//
+// A service discovery (ch. 12's ZooKeeper, which hands the chat client a server) answers `lookup`
+// like a service, so its capacity, latency and replicas are read as a service's; `failover` is the
+// one key it owns.
+
+// `failover: 10s`: how long the registry still hands out a replica that has died (it learns of the
+// death when the replica's health check or session times out), a positive duration (0 would be a
+// registry that knows of a death before it happens: nothing to model). Absent, it is
+// defaults::failover, filled in here so that explain prints the window the engine uses.
+CheckResult read_discovery_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (node.type != model::NodeType::service_discovery) return {};
+  node.failover = defaults::failover;
+  if (!body["failover"]) return {};
+  const auto this_node = node_site(site, node.id);
+  auto failover = parse_duration_key(this_node, body, "failover");
+  if (!failover) return std::unexpected(failover.error());
+  if (failover->count() <= 0) return this_node.fail(body["failover"], "failover must be positive");
+  node.failover = *failover;
+  return {};
+}
+
 // `workers: 400`, required: the pool's c, a positive integer with the bound of every c
 // (defaults::max_concurrency: Erlang C costs O(c) per step, as advanced.concurrency).
 CheckResult read_workers(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
@@ -1237,6 +1259,7 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
     if (auto read = read_kv_cluster_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_search_index_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_gateway_keys(site, entry.second, *node); !read) return read;
+    if (auto read = read_discovery_keys(site, entry.second, *node); !read) return read;
     ++node;
   }
   return {};

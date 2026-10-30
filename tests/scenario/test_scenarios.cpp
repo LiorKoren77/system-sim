@@ -250,11 +250,11 @@ TEST_CASE("the consistent-hashing lab under write_through needs set in db's writ
 TEST_CASE("book scenarios are refused by run until their node types exist", "[scenario]") {
   // Phase 1 runs only client and service nodes; the book scenarios use more. The message must
   // name the node and the phase so a student knows what is missing, not that the file is wrong.
-  // chat-system is the one used here: it needs a service_discovery, which phase 3 has yet to model
-  // (its websocket gateway, queue and worker pool run since). (url-shortener used to stand here;
-  // with the id generator, the last node type it lacked, it runs: see the pinned list below.)
+  // notification-system is the one used here: it needs a notification_fanout, which phase 3 has yet
+  // to model. (url-shortener used to stand here, then chat-system, until its service_discovery and
+  // websocket gateway got their models in phase 3: see the pinned list below.)
   const auto s =
-      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/chat-system/scenario.yaml");
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/notification-system/scenario.yaml");
   const auto g = build_or_fail(s);
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
@@ -308,7 +308,7 @@ TEST_CASE(
 TEST_CASE("a refused scenario's message names the first unsupported node and the phase",
           "[scenario]") {
   const auto s =
-      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/chat-system/scenario.yaml");
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/notification-system/scenario.yaml");
   const auto g = build_or_fail(s);
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
@@ -1152,15 +1152,15 @@ TEST_CASE("book/notification-system is refused at fanout, its notification_fanou
 
 // chat-system's nodes in file order: users, lb, the chat API service, `discovery`, a
 // service_discovery (simulated since phase 3's Task 13: the engine used to stop there), then the
-// `chat_servers` ws_gateway, which has no model yet and is now the first node of a type it refuses.
+// `chat_servers` ws_gateway (simulated since Task 14), which states no connection level yet.
 TEST_CASE("book/chat-system is refused at chat_servers, its ws_gateway, past the discovery",
           "[scenario]") {
   const auto g = build_or_fail(load_scenario("/book/chat-system/scenario.yaml"));
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
-          "node 'chat_servers' has type 'ws_gateway', which run/estimate do not support yet "
-          "(phase 3)");
+          "node 'chat_servers': a ws_gateway needs a client op named 'connect' or a fixed "
+          "'connections'");
 }
 
 // The books' providers' failure rates are the numbers in the YAML: APNs and FCM 2 %, the SMS

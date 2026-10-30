@@ -6,11 +6,16 @@ This scenario validates (`OK: chat-system (13 nodes, 14 links)`) and `simsys exp
 whole resolved graph, but `run` and `estimate` refuse it with exit code 1:
 
 ```
-scenarios/book/chat-system/scenario.yaml: error: node 'discovery' has type 'service_discovery', which run/estimate do not support yet (phase 3)
+scenarios/book/chat-system/scenario.yaml: error: node 'chat_servers': a ws_gateway needs a client op named 'connect' or a fixed 'connections'
 ```
 
-Two of its node types have no model yet: `discovery` (`service_discovery`) and `chat_servers`
-(`ws_gateway`). The type check names the first one in file order (see
+Both its phase 3 types now have a model. `discovery` (`service_discovery`, phase 3 Task 13) is a
+service answering `lookup` (the API servers' first step), whose `failover: 10s` holds the callers on
+a dead replica of a node they looked up (see
+[`service_discovery`](../../../docs/scenario-schema.md#service_discovery)); `explain` ends its line
+with `failover=10s`. `chat_servers` (`ws_gateway`, Task 14) holds a level of open connections,
+filled by a client op named `connect` or fixed by `connections`, and this file states neither yet,
+so `run` stops there (see
 [What runs in phase 2c](../../../docs/scenario-schema.md#what-runs-in-phase-2c)).
 
 What `explain` shows today. Its checks compare each node's peak offered load with its capacity,
@@ -53,7 +58,7 @@ What is accepted today but does nothing:
 - Presence servers with heartbeats; group chats (≤100) fan out one queue entry per member.
 
 ## What phase 3 will model
-Once `ws_gateway` and `service_discovery` run, the scenario is meant to show the following.
+Once `chat_servers` has a connection level, the scenario is meant to show the following.
 Where `explain` already shows a point today, the bullet says so.
 
 - Heartbeat traffic dominating request counts (55 % of all ops) while messages dominate bytes.

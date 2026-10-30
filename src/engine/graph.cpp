@@ -2567,6 +2567,33 @@ std::span<const ServiceHop> Graph::service_hops(std::size_t node, std::string_vi
   return found->second;
 }
 
+// The first step of (node, op) to `target` decides: a discovery lookup before it hands out the
+// address it calls (a later step to the same node, after a lookup, does not make the first one
+// looked up).
+bool Graph::lookup_before(std::size_t node, std::string_view op, std::size_t target) const {
+  const auto hops = service_hops(node, op);
+  for (std::size_t position = 0; position < hops.size(); ++position) {
+    if (hops[position].target == target) {
+      return discovery_before_step(node, op, position).has_value();
+    }
+  }
+  return false;
+}
+
+// A step is a discovery lookup when it calls a service_discovery and asks `lookup`: a plain
+// service with an op of that name is no registry. The nearest one before `position` wins.
+std::optional<std::size_t> Graph::discovery_before_step(std::size_t node, std::string_view op,
+                                                        std::size_t position) const {
+  const auto hops = service_hops(node, op);
+  std::optional<std::size_t> discovery;
+  for (std::size_t before = 0; before < position && before < hops.size(); ++before) {
+    const ServiceHop& hop = hops[before];
+    const bool registry = nodes_[hop.target].spec.type == model::NodeType::service_discovery;
+    if (registry && hop.op == "lookup") discovery = hop.target;
+  }
+  return discovery;
+}
+
 // Which ops go to the store is sends_to_store's answer (the strategy dispatch; a CDN is
 // read_through towards its origin); this adds how many: every write that goes, the misses of a
 // read that goes. CacheBehaviour (and so CdnBehaviour), the paper load and the call-cycle search
