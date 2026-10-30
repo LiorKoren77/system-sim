@@ -2293,7 +2293,7 @@ TEST_CASE("book/chat-system runs the day, passes its three SLOs and storms back 
   REQUIRE_THAT(number_after_key(after, "\"reconnect_storm_over_s\": "), WithinRel(30.0, 1e-9));
 
   // The peak is first reached once the gateway is back (21:31:00) and within five minutes of it.
-  const double peak_at_s = number_after_key(after, "\"peak_rho_at_s\": ");
+  const double peak_at_s = number_after_key(after, "\"peak_offered_rho_at_s\": ");
   REQUIRE(peak_at_s >= 21 * 3600 + 31 * 60);
   REQUIRE(peak_at_s <= 21 * 3600 + 35 * 60);
 
