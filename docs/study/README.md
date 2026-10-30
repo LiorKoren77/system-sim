@@ -8,17 +8,17 @@ for the planned list.
 
 | Note | Feature | Standard | Main uses in the code |
 |---|---|---|---|
-| [modules.md](modules.md) | named modules, interface vs implementation units, the global module fragment, module linkage; the six GCC 14.2 module defects | C++20 | the 15 modules of `src/` (a table of all of them) |
+| [modules.md](modules.md) | named modules, interface vs implementation units, the global module fragment, module linkage, partitions (interface and implementation kinds, `export import`); the ten GCC 14.2 defects | C++20 | the 15 modules of `src/` and the tests' `simsys.test_fixtures` (a table of all of them); the partitions `simsys.engine:records`, `:faults`, `:fault_log` and `simsys.report:shared` |
 | [expected.md](expected.md) | `std::expected`, monadic `and_then` / `transform` / `transform_error` | C++23 | `core.cppm` unit parsers, `config::load`, `Graph::build`, `Simulation::create`, `session::load_graph`, `main.cpp` |
 | [concepts.md](concepts.md) | concepts, requires-expressions, constrained `auto` parameters, constrained template parameters (`template <C T>`) | C++20 | `NodeBehaviour`, `RequestSource`, `ResponseLookup`, `FractionLookup` (`behaviours.cppm`), `HitRatioModel` (`caching.cppm`), `StepObserver` (`engine.cppm`) |
-| [ranges.md](ranges.md) | range algorithms with projections, views; `contains`, `fold_left`, `to`, `zip`, `join_with`, `chunk_by` (and the GCC defect it met) | C++20 / C++23 | `Flow::position_of`, `Graph::connect_steps`, `Graph::resolve_request_sizes`, the loader's table lookups, report renderers |
-| [variant-visit.md](variant-visit.md) | `std::variant`, `std::visit`, the `Overloaded` set, CTAD for aggregates; keeping a 12-alternative variant and the `NodeType` switch exhaustive | C++17 / C++20 | `behaviours::Behaviour`, `SloSpec::max`, `Simulation::forward_pass`, `Simulation::make_node`, `limit_value` |
+| [ranges.md](ranges.md) | range algorithms with projections, views; `contains`, `fold_left`, `to`, `zip`, `join_with`, `chunk_by` (and the GCC defect it met), `iota`, `stable_sort` | C++20 / C++23 | `Flow::position_of`, `Graph::connect_steps`, `Graph::resolve_request_sizes`, the loader's table lookups, report renderers, `rank_order` (`run --replications`) |
+| [variant-visit.md](variant-visit.md) | `std::variant`, `std::visit`, the `Overloaded` set, CTAD for aggregates; keeping a 15-alternative variant and the `NodeType` switch exhaustive | C++17 / C++20 | `behaviours::Behaviour`, `SloSpec::max`, `Simulation::forward_pass`, `Simulation::make_node`, `limit_value` |
 | [format-print.md](format-print.md) | `std::format`, `std::print` / `std::println`, `std::to_chars`; two GCC 14.2 defects | C++20 / C++23 | loader messages, `session.cpp`, `main.cpp`, `simsys::to_chars_text` and every number of `simsys.report` (`shared.cppm`, `report.cpp`, `explain.cpp`) |
 | [generator.md](generator.md) | coroutines, `co_yield`, `std::generator` (lazy single-pass ranges) | C++20 / C++23 | `workload::samples`, `curve_samples` and `print_samples` in `main.cpp` (`simsys curve`) |
 | [random.md](random.md) | `<random>` engines vs distributions, `std::mt19937_64`, seeding; the Ornstein–Uhlenbeck noise | C++11 | `workload::NoiseProcess`, `workload::client_seed`, `ClientBehaviour::tick` |
-| [numerics.md](numerics.md) | `expm1` / `log1p`, bisection vs Newton, sums kept in [0, 1], latency moments, fluid steps and choosing the step, a quorum's order statistics by quadrature, the ring's hottest machine, the truncated lognormal of a client's timeout (floating point, not a language feature) | C++11 `<cmath>` | `caching.cppm` (`power_integral`, `characteristic_time`), `queueing.cppm` (`erlang_c`, `lognormal_quantile`, `lognormal_below`, `lognormal_order_statistic`), `flow.cppm`, `fluid.cppm` |
+| [numerics.md](numerics.md) | `expm1` / `log1p`, bisection vs Newton, sums kept in [0, 1], latency moments, fluid steps and choosing the step, a quorum's order statistics by quadrature, the ring's hottest machine, the truncated lognormal of a client's timeout, a flushed cache's warm-up, retries as a geometric series and their fixed point, a gateway's connection level (Euler vs the exponential) and its reconnect storm (floating point and models, not a language feature) | C++11 `<cmath>` | `caching.cppm` (`power_integral`, `characteristic_time`, `refill_hit_ratio`), `queueing.cppm` (`erlang_c`, `lognormal_quantile`, `lognormal_below`, `lognormal_order_statistic`), `flow.cppm`, `fluid.cppm`, `faults.cppm` (`count_reads`), `behaviours.cppm` (`ClientBehaviour`'s retries, `WsGatewayBehaviour`) |
 | [threads.md](threads.md) | `std::jthread`, `std::stop_token`, `std::atomic` as a work queue, data races | C++20 / C++11 | `run_in_parallel` (`src/session/session.cpp`, `simsys sweep` and `run --replications`), `PerPoint` (`src/sweep/sweep.cpp`) |
-| [small-features.md](small-features.md) | designated initializers, `std::span`, `<=>` and defaulted `==`, `using enum`, `consteval`, `std::to_array`, `std::to_underlying`, `std::unreachable`, `std::chrono` durations, deducing `this`, `static operator()` | C++20 / C++23 | everywhere; each section names its main uses |
+| [small-features.md](small-features.md) | designated initializers, `std::span`, `<=>` and defaulted `==`, `using enum`, `consteval`, `std::to_array`, `std::to_underlying`, `std::unreachable`, `std::chrono` durations, deducing `this`, `static operator()`, `std::erase_if` | C++20 / C++23 | everywhere; each section names its main uses |
 
 ## Where to look: design patterns
 
@@ -74,3 +74,28 @@ Phase 2c added these:
   `FractionLookup auto&&` because a default argument needs a type to default to
   ([concepts.md](concepts.md)); and C++20 `std::jthread`, a thread that joins in its destructor
   ([threads.md](threads.md)).
+
+Phase 3 added these:
+
+- `Pattern: Decorator (static, over the NodeBehaviour concept)` on `WsGatewayBehaviour`
+  (`src/engine/behaviours.cppm`): the gateway wraps a `ServiceBehaviour`, has the same interface
+  (`route`, `cost`, `response`, `delivered`) and adds the connection level around it, with no base
+  class and no virtual call: the concept checks the interface at compile time.
+- `Pattern: Circular buffer` on the worker pool's `RepublishRing` (`src/engine/behaviours.cppm`),
+  "like `engine::DelayLine`": the jobs a pool re-publishes wait in slots a head index moves over,
+  as a link's delay line does, so nothing is shifted as the steps go by.
+- `Pattern: Table-driven method` on `kind_keys` (`src/config/faults.cpp`): which fault kinds read
+  `replicas`, `factor`, `extra` and `datacenter` is one row per key, so one loop refuses each on
+  every other kind; and on `fault_kind_table` (`src/model/model.cppm`), the kind names read by the
+  loader and printed by `explain`.
+- Not a pattern but a design choice worth reading: the fault-free **twin** (`Simulation::twin_`,
+  `src/engine/engine.cppm`), a second `Simulation` of the same scenario without its faults,
+  stepped in lockstep, so that every fault block compares a run with the run that would have been
+  (spec §20 entry 5). Held in a `std::vector<Simulation>` used as an optional because of the ninth
+  GCC 14.2 defect ([modules.md](modules.md)).
+- Two C++20/23 constructs met for the first time in phase 3: C++20 `std::erase_if`
+  (`in_one_unit`, `src/engine/fault_log.cppm`; [small-features.md](small-features.md#stderase_if))
+  and C++23 `std::ranges::iota` beside C++20 `std::ranges::stable_sort` with a projection
+  (`rank_order`, `src/report/report.cpp`; [ranges.md](ranges.md)); and C++20 module partitions of
+  the interface kind, `export module simsys.engine:faults;` re-exported by `export import
+  :faults;` ([modules.md](modules.md)).

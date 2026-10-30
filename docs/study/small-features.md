@@ -19,6 +19,7 @@ comment of its own (`CLAUDE.md` §1).
 | `std::chrono` durations for `SimTime` | C++11 / C++17 | [`std::chrono` for `SimTime`](#stdchrono-for-simtime) |
 | deducing `this` | C++23 | [Deducing `this`](#deducing-this) |
 | `static operator()` | C++23 | [`static operator()`](#static-operator) |
+| `std::erase_if` | C++20 | [`std::erase_if`](#stderase_if) |
 
 ## Designated initializers
 
@@ -182,10 +183,11 @@ missing case), or the compiler builtin `__builtin_unreachable()`.
 **Where.** After a `switch` without a `default:` that returns from every case:
 `defaults::for_type` and `report`'s `zone_name`. `-Wswitch` (an error here, under `-Werror`)
 proves that every enumerator has a case, and the guards before the `switch` prove that the value
-is one of them. `Simulation::make_node` ends its four phase-3 cases (`ws_gateway`,
-`service_discovery`, `notification_fanout`, `frontier`) in `std::unreachable()`:
-`Simulation::create` refused those types before any node is made
-([variant-visit.md](variant-visit.md) has the story).
+is one of them. `Simulation::make_node` (`src/engine/engine.cppm`) has a case for every node type
+and no `default:`, and ends in `std::unreachable()` after its `switch`; until phase 3 gave the last
+four types a model, those four cases ended in it themselves, behind a refusal in
+`Simulation::create` that phase 3 deleted ([variant-visit.md](variant-visit.md) has the story).
+The fault schedule's switch over `FaultKind` (`src/engine/faults.cppm`) ends the same way.
 
 **Pitfall: it is a promise, not a check.** If the promise is wrong, the program has
 undefined behaviour, with no message. So it goes only where a proof sits right before it.
@@ -244,6 +246,30 @@ optimiser has to see that it is unused.
 whoever asks. `BlobStoreBehaviour` passes `NothingLost{}` to its event notifications, which
 nothing waits for.
 
+## `std::erase_if`
+
+**What (C++20).** `std::erase_if(container, predicate)` removes every element for which the
+predicate holds and returns how many it removed. It is a free function overloaded for each
+standard container (`<vector>`, `<string>`, `<deque>`, `<list>`, the maps and sets), so the same
+call is right for each: on a `std::list` or a map it erases node by node, on a `std::vector` it
+shifts the survivors down.
+
+**Before.** The erase-remove idiom, `v.erase(std::remove_if(v.begin(), v.end(), p), v.end())`:
+two algorithms and three iterators for one intent. `std::remove_if` alone erases nothing (it moves
+the survivors to the front and returns where the leftovers start), and forgetting the `erase`
+around it, or its second argument, compiles and leaves the vector the same size. For a map the
+idiom does not even apply; one wrote the loop `it = m.erase(it)` by hand.
+
+**Where.** `in_one_unit` (`src/engine/fault_log.cppm`): a `dc_down`'s block counts its
+datacenter's nodes in one unit, so when they mix request-counting and byte-sized nodes it drops
+the byte-sized ones from its list, `std::erase_if(nodes, [&](std::size_t node) { return
+defaults::is_byte_sized(...); })`, and keeps the rest in order.
+
+**Pitfall.** The lambda is handed to an algorithm, not to a range adaptor, so CLAUDE.md §3's fifth
+GCC 14.2 defect (a lambda passed to `std::views::chunk_by` and friends in a module function,
+defined twice at link time) does not apply. The predicate must not modify the elements it is
+asked about.
+
 ## Further reading
 
 - P0329R4, *Designated initialization wording*.
@@ -257,6 +283,7 @@ nothing waits for.
 - P0092R1, *Polishing `<chrono>`* (`round`, `floor`, `ceil`).
 - P0847R7, *Deducing this*.
 - P1169R4, *static operator()*.
+- P1209R0, *Adopt consistent container erasure from Library Fundamentals 2 for C++20*.
 - cppreference: [aggregate initialization](https://en.cppreference.com/w/cpp/language/aggregate_initialization),
   [`std::span`](https://en.cppreference.com/w/cpp/container/span),
   [default comparisons](https://en.cppreference.com/w/cpp/language/default_comparisons),

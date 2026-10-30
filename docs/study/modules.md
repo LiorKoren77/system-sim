@@ -272,8 +272,9 @@ definition it does not need: a helper one unit uses stays in that unit.
 
 ## The other GCC 14.2 module defects met while building
 
-`CLAUDE.md` §3 lists seven GCC 14.2 defects, each verified (the first six on 2026-10-28, the
-seventh on 2026-10-30) and each with its workaround in the tree. The first is the "Bad file data" one above. The second, a format width
+`CLAUDE.md` §3 lists ten GCC 14.2 defects, each verified (the first six on 2026-10-28, the
+seventh to tenth on 2026-10-30, while phase 3 was built) and each with its workaround in the tree.
+The first is the "Bad file data" one above. The second, a format width
 or precision that throws at run time, is in [format-print.md](format-print.md). The rest:
 
 - **Third: an internal compiler error at -O2/-O3** (`ipa_comdats`) when `Graph::build`,
@@ -310,12 +311,33 @@ or precision that throws at run time, is in [format-print.md](format-print.md). 
   `export constexpr ByteRate one_gbit{125e6};` keeps external linkage (it is exported; a
   namespace-scope `const` that is not exported would be internal) and the interface's object
   file defines it once (`tests/support/fixtures.cppm`).
+- **Eighth: a standard header `#include`d after an `import` is compiled twice.** The header is
+  compiled again against the library internals the imported module's global module fragment
+  already brought in, and the two clash (`bits/cpp_type_traits.h:81:12: error: redefinition of
+  'struct std::__truth_type<true>'`, or one in `bits/node_handle.h`), even for a header the
+  importer had not seen: `import simsys.graph;` then `#include <set>` fails, the two lines swapped
+  compile. The workaround is the order: every standard-library or third-party header before the
+  first `import` of a file. `src/config/detail.hpp` is the one deliberate exception: it includes
+  no header itself, and the ten `src/config/*.cpp` units include it after their imports so that
+  its declarations belong to `simsys.config` (its comment says why).
+- **Ninth: `<memory>` in `engine.cppm`'s global module fragment breaks every importer** of
+  `simsys.engine` ("ignoring attributes applied to 'std::auto_ptr' after definition", the first
+  defect's family). So `Simulation` holds no `std::unique_ptr`: its fault-free twin, a member of
+  the class's own, still incomplete type, is a `std::vector<Simulation>` used as an optional
+  (`Simulation::twin_`, whose comment says why).
+- **Tenth: an internal compiler error in Release** ("in finish_function", `stl_vector.h`) when an
+  importer instantiates the implicit move constructor of `FaultLog` (its `std::vector` members),
+  the fourth defect's family. The workaround declares the special members in the class and
+  defaults them after it, out of line, so they are not inline: the partition's object file
+  defines them once and importers call them (`src/engine/fault_log.cppm`).
 
 ## Rules of thumb used here
 
 - **One module per layer**, named `simsys.<layer>` (the table at the top).
-- In a **non-module file**, `#include` first and `import` last. GCC 14 reports redefinition
-  errors in the other order (see the comments above the imports in `main.cpp` and the tests).
+- In every file, module unit or not, `#include` first and `import` last. GCC 14 reports
+  redefinition errors in the other order (the eighth defect above; see the comments above the
+  imports in `main.cpp` and the tests). `src/config/detail.hpp`, which includes nothing, is the
+  one header included after the imports.
 - **CMake 3.28** (`CMakeLists.txt`): interface units go in `FILE_SET CXX_MODULES`,
   implementation units are plain `PRIVATE` sources, and `CMAKE_CXX_SCAN_FOR_MODULES ON` lets
   the build discover `export module` / `import` edges and order compilation (Ninja required).

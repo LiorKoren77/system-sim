@@ -1,18 +1,58 @@
-# Scenario schema v1.4 (phase 2c)
+# Scenario schema v1.5 (phase 3)
 
 v1 was fitted to the 12 book and lab drafts plus the first tutorial; v1.1 wrote down the
 rules the phase 1 loader enforces; v1.2 added phase 2a's rate curves, balancers, limiters and
-fixed-ratio caches; v1.3 phase 2b's Che caches, SQL databases, CDNs and id generators.
-**v1.4** is the language as phase 2c reads it: the loader (`src/config/`, one implementation
+fixed-ratio caches; v1.3 phase 2b's Che caches, SQL databases, CDNs and id generators; v1.4
+phase 2c's bytes, queues, worker pools, external sinks, key-value clusters and the sweep.
+**v1.5** is the language as phase 3 reads it: the loader (`src/config/`, one implementation
 unit per concern: `header.cpp`, `nodes.cpp`, `steps.cpp`, `workload.cpp`, `links.cpp`,
-`slos.cpp`, `faults.cpp`, `overrides.cpp`), the graph builder (`src/engine/graph.cpp`), the node behaviours
-(`src/engine/behaviours.cppm`), the reports (`src/report/report.cpp`, `explain.cpp`) and the
-sweep (`src/sweep/sweep.cpp`). All 14 files under
-`scenarios/` load under it, and twelve of them run end to end ([below](#what-runs-in-phase-2c)):
-the ten of phase 2c and, since phase 3's [`notification_fanout`](#notification_fanout),
-`book/notification-system` and, since its [`frontier`](#frontier), `book/web-crawler`.
-The design decisions behind the new rules, with what each ignores, are spec §18 (phase 2b) and
-§19 (phase 2c) (`docs/superpowers/specs/2026-10-27-system-sim-design.md`).
+`slos.cpp`, `faults.cpp`, `overrides.cpp`), the graph builder (`src/engine/graph.cpp`), the node
+behaviours (`src/engine/behaviours.cppm`), the fault schedule and the fault log
+(`src/engine/faults.cppm`, `fault_log.cppm`), the reports (`src/report/report.cpp`,
+`explain.cpp`), the replications (`src/session/session.cpp`) and the sweep
+(`src/sweep/sweep.cpp`). All 14 files under `scenarios/` load under it and all 14 run end to end
+([below](#what-runs)); every node type has a model. The design decisions behind the rules, with
+what each ignores, are spec §18 (phase 2b), §19 (phase 2c) and §20 (phase 3)
+(`docs/superpowers/specs/2026-10-27-system-sim-design.md`), with the phase 3 design in
+`docs/superpowers/specs/2026-10-30-phase3-faults-gateways-design.md`. Where a phase 3 rule differs
+from what that design first said, this file and spec §20 have the rule as built.
+
+New in v1.5:
+
+- [`faults`](#faults): a scripted list of `node_down` (all or `replicas` of a node, a sql_db's
+  `primary`, a kv_cluster's machines), `capacity`, `latency_spike`, `traffic_spike`, `cache_flush`
+  (the cache warms back along the Che curve on the reads it is sent) and `dc_down` (a datacenter's
+  nodes and the links that cross its border). `run` applies them step by step; `estimate` leaves
+  them out and says so. After the SLO table `run` prints one block per fault (`during`, `after`,
+  `recovery`), every figure measured against a **fault-free twin** run in lockstep, and JSON a
+  `faults` array;
+- [`on: failure`](#steps) steps fire: they are sent the share of the requests that the step they
+  report on failed;
+- a client's [`retries` and `retry_after`](#node-types): retries are feedback demand, shown in
+  `run`'s `attempts/s` column, JSON's `attempts_per_s` and `timed_out_attempts_per_s` and the op
+  series' `attempts_per_s`; the sweep metrics `<client>.<op>.attempts` and `.answered`;
+- a worker pool's [`retries` and `retry_after`](#message_queue-and-worker_pool): the jobs whose
+  call to an external sink failed go back on the queue, and the last attempt's failures are
+  **dead letters**, never drops (the `dead_lettered/s` column, JSON's `dead_lettered` and
+  `dead_lettered_per_s`, the series' `dead_lettered_per_s`, the [`dead_letter_rate`](#slo) SLO and
+  the sweep metric `<pool>.dead_lettered`); a sink's `drop_rate` leaves out the failures its
+  retrying callers send again;
+- the last four node types: [`service_discovery`](#service_discovery) (`lookup`, `failover`),
+  [`ws_gateway`](#ws_gateway) (connections as a level filled by a client op named `connect` or a
+  fixed `connections`, `session`, `heartbeat`, `max_connections`, `fanout`, the reconnect storm
+  after a fault paced by `reconnect_within`; the `connections` column, JSON's `connections` and
+  `connections_peak`, the series' `connections`, the sweep metric `<gateway>.connections`),
+  [`notification_fanout`](#notification_fanout) (`dedup`, `channels`; the `deduplicated/s`
+  column, JSON's and the series' `deduplicated_per_s`, the sweep metric
+  `<fanout>.deduplicated`) and [`frontier`](#frontier) (`hosts`, `politeness`, its lag under the
+  `queue_lag` SLO and the sweep's `<queue>.lag`; an external sink's `politeness`);
+- [`simsys run --replications N`](#command-line-simsys-run---replications-phase-3): N seeds of
+  the rate noise, every number as its median and 10–90 % band, each SLO judged by its own median
+  run;
+- the [defaults chosen, not from the book](#defaults-chosen-not-from-the-book), in one place;
+- the runnable set: all fourteen scenarios, `book/chat-system`, `book/google-drive`,
+  `book/notification-system` and `book/web-crawler` among them; `book/web-crawler` and
+  `labs/unique-id` exit 2 on purpose ([What runs](#what-runs)).
 
 New in v1.4:
 
@@ -81,7 +121,7 @@ New in v1.3:
   (dropped or rejected), so a request waiting in a growing queue still counts;
 - `explain`'s marks: a node whose load comes only through a type that does not propagate it yet
   is marked `(load not propagated: ...)` with no percentage, a node that is partly fed so gets
-  its percentage as a lower bound `(≥p%; ...)` ([below](#what-runs-in-phase-2c)), and a node
+  its percentage as a lower bound `(≥p%; ...)` ([below](#what-runs)), and a node
   whose capacity is a byte rate is checked in MB/s (from phase 2c; see `capacity` in
   [Node (common keys)](#node-common-keys));
 - the runnable set: `tutorial/hello`, `tutorial/chain`, `labs/rate-limiter`,
@@ -106,13 +146,14 @@ Two kinds of marks:
   **checked** means the loader validates it but nothing uses it yet; **ignored** means the
   key is accepted (a misspelt key is still an error) and its value is not looked at.
 
-## What runs in phase 2c
+## What runs
 
 `simsys validate` runs the loader only. `explain`, `estimate` and `run` also build the
 graph, which adds the checks marked *(graph)* below. `explain` works for every node type.
-`estimate` and `run` (and so `sweep`) step these types:
+`estimate` and `run` (and so `sweep`) step all eighteen node types (`model::NodeType`; fifteen
+behaviours, since a service discovery, a search index and an id generator run as a service):
 
-| type | runs in phase 2c |
+| type | how it runs |
 |---|---|
 | `client` | the whole rate curve, with its seeded noise |
 | `service` | ops, steps, per-op `cost` |
@@ -218,6 +259,116 @@ modelled yet)`); a node that also received load the checks did follow got its pe
 **lower bound** (`(≥1%; ...)`, `(≥150%, red; ...)`), with no per-copy figures. With no type left
 to mark, the marking code was removed (phase 3, the Task 17 review): a type added later gets its
 paper model with it.
+
+## Defaults chosen, not from the book
+
+Phase 3 needed numbers the book does not give. Each is a constant in `src/defaults/defaults.cppm`
+whose comment says why it was chosen, and each is filled in by the loader (or by the type's
+defaults), so `explain` prints the value a run uses. A scenario that cares states its own. Keys
+whose absence means "none" (no `retries`, no `heartbeat` load, no `max_connections` cap,
+`fanout: 1`, `dedup: 0`, a frontier without `hosts`) are not choices and are not listed. The
+earlier phases' chosen numbers (a waiting room of 1000, a cache's 100k/s, ...) are marked
+`chosen` in spec §6 and in the same file.
+
+| default | value | constant | why this number | where its effect is shown |
+|---|---|---|---|---|
+| a client's `retry_after` | 100 ms | `defaults::retry_after` | one default `step`, the shortest wait the engine can show, and about the latency table's cross-continent round trip (150 ms): a retry waits about as long as a far answer would have taken | no shipped scenario has a client with `retries`; the probe below |
+| a worker pool's `retry_after` | 1 s | `defaults::pool_retry_after` | long enough for a provider's blip to pass, short beside an outage's minutes, the first wait of the usual exponential backoff (1 s, 2 s, 4 s, ...); ten times a client's, since a worker is not a user waiting | notification-system's four channel pools, chat-system's `sync_workers` and web-crawler's `downloader` run on it; no README sweeps it; the probe below |
+| a `ws_gateway`'s `session` | 30 min | `defaults::default_session` | ch. 12 never says how long a connection lasts; half an hour is a typical mobile chat session | chat-system states 6 minutes and says why ([its README](../scenarios/book/chat-system/README.md), "How it is sized"); google-drive's level is fixed, so it has none; the probe below |
+| a `ws_gateway`'s `reconnect_within` | 30 s | `defaults::default_reconnect_within` | ch. 12's client reconnects after a lost heartbeat; 30 s is a few of its 5 s heartbeats of backoff | [chat-system's README](../scenarios/book/chat-system/README.md) runs the day at 10, 20, 30, 40, 50 and 60 s: the tier peaks at 112 % of its capacity at 10 s, 93.9 % at 30 s, 90.9 % at 60 s |
+| a `service_discovery`'s `failover` | 10 s | `defaults::failover` | a registry learns of a death when the dead server's session or health check times out, which ZooKeeper's session timeouts and the usual health-check settings put at about ten seconds | chat-system states 10 s, but its lookup is the last step of its `api` op, so nobody is held on a dead replica; the probe below |
+| a `service_discovery`'s capacity and latency | 50k/s, 500 µs | `defaults::for_type` | the rate is the phase 3 design's (§8.1: a lookup is a small read from an in-memory registry, so one registry answers a tier); the time is the book's round trip within a datacenter | chat-system states the same two numbers |
+| a `ws_gateway`'s capacity and latency | 50k/s, 100 µs | `defaults::for_type` | relaying one frame over an open websocket; the numbers the type had since phase 1 (the phase 3 plan's 10k/s and 0.5 ms were not adopted) | chat-system states 25k/s and 0.5 ms (its pings size the tier), google-drive 20k/s |
+| a `notification_fanout`'s capacity and latency | 20k/s, 1 ms | `defaults::for_type` | a dedup lookup and a few in-memory publishes, a service's 1 ms of CPU; ten times a service's 2k/s, since the queues and the log store do the writing | notification-system runs on it with `replicas: 2`: `fanout  peak offered 27.93k/s vs 40k/s total capacity  (69.8%, green)` at the 09:00 blast |
+| a `frontier`'s capacity and latency (its prioritiser) | 10k/s, 1 ms | `defaults::for_type` | filing one URL in 1 ms on c = 10 servers | web-crawler states 10k/s, above the ~6.8k URLs/s its loop offers |
+
+The probes are small files that isolate one default; every number below is `simsys sweep`'s on
+them (Release build).
+
+**A client's `retry_after` decides whether its retries land inside an outage.** One client of
+100/s with `timeout: 100ms` and `retries: 2` into a service of 1k/s at 1 ms, down for 10 s from
+20 s in a 1-minute run:
+
+```yaml
+users: {type: client, rate: {base: 100/s}, ops: {ping: 1.0}, timeout: 100ms, retries: 2, retry_after: 100ms}
+api:   {type: service, capacity: 1k/s, latency: 1ms}
+faults: [{at: 20s, kind: node_down, node: api, for: 10s}]
+```
+
+```
+$ simsys sweep retry.yaml --param nodes.users.retry_after=100ms..5100ms:6 --metric users.ping.attempts users.ping.answered api.drop_rate
+nodes.users.retry_after  users.ping.attempts  users.ping.answered  api.drop_rate
+--------------------------------------------------------------------------------
+100ms                                137.2/s              81.67/s          0.239
+1100ms                               135.5/s                 85/s          0.205
+2100ms                               133.8/s              88.33/s          0.171
+3100ms                               132.2/s              91.67/s          0.135
+4100ms                               130.5/s                 95/s         0.0983
+5100ms                               128.8/s              98.33/s         0.0634
+```
+
+At the default both retries of a request sent in the outage fall inside it too; past 5 s the
+second retry of every such request comes after the service is back.
+
+**A pool's `retry_after` decides how much of an outage becomes dead letters.** A queue fed
+100 jobs/s, a pool of 10 workers at 10 ms with `retries: 3` calling a provider of 1k/s that fails
+2 % and has a room of 10 (`advanced: {queue_limit: 10}`), the provider down for 10 s from 30 s
+in a 2-minute run:
+
+```
+$ simsys sweep pool.yaml --param nodes.w.retry_after=1s..6s:6 --metric w.dead_lettered q.lag w.mean_rho
+nodes.w.retry_after  w.dead_lettered   q.lag  w.mean_rho
+--------------------------------------------------------
+1s                           5.784/s  14.7us       0.124
+2s                           3.318/s  14.7us       0.122
+3s                          0.8525/s  14.7us       0.119
+4s                         0.06679/s  14.7us       0.117
+5s                         0.00498/s  1.74us       0.114
+6s                        0.004019/s  1.74us       0.114
+```
+
+With 3 retries 1 s apart a job is given up 3 s after its first failure, inside the 10 s outage:
+the outage becomes dead letters. Once the retries span the outage (3 × 4 s = 12 s) almost every
+job lands; without the outage the same pool dead-letters 1.56e-5 jobs/s, its provider's steady
+2 % run out of retries (0.02⁴ of the jobs).
+
+**A gateway's `session` sets its level by Little's law.** 200/s, half of it `connect`, into a
+gateway with `heartbeat: 30s` and no cap, a 4-hour run at 1 s steps:
+
+```
+$ simsys sweep session.yaml --param nodes.gw.session=10m..50m:5 --metric gw.connections gw.mean_rho
+nodes.gw.session  gw.connections  gw.mean_rho
+---------------------------------------------
+10m                          60k       0.0423
+20m                         120k       0.0773
+30m                       179.9k        0.109
+40m                       239.4k        0.137
+50m                       297.5k        0.163
+```
+
+C* = 100 connects/s × session (60k at 10 minutes); at 50 minutes the run is 4.8 sessions long and
+the level is still below the 300k that `simsys estimate` reports as its fixed point. A shorter
+session gives the same level only with more connects (chat-system's 6 minutes at 3k connects/s).
+
+**A discovery's `failover` is how long callers keep losing requests to a dead replica.** The
+theory test's probe (1k/s through `[{to: disc, op: lookup}, {to: svc, op: call}]` into 4 replicas
+of 1k/s, one down for 30 s from 10 s, a 60-second run):
+
+```
+$ simsys sweep failover.yaml --param nodes.disc.failover=5s..30s:6 --metric c.call.answered svc.drop_rate
+nodes.disc.failover  c.call.answered  svc.drop_rate
+---------------------------------------------------
+5s                           979.2/s         0.0208
+10s                          958.3/s         0.0417
+15s                          937.5/s         0.0625
+20s                          916.7/s         0.0833
+25s                          895.8/s          0.104
+30s                            875/s          0.125
+```
+
+Each 5 s of failover costs the client about 20.8 answered requests a second over the minute (a quarter
+of 1k/s for 5 s); the fault block of the 10 s point says `failover 10s: 2.5k requests sent to the
+dead replica`, and at 30 s the window is the whole fault.
 
 ## Values
 
@@ -376,17 +527,17 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 
 | type | own keys | status |
 |---|---|---|
-| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries`, `retry_after` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `keys` read by the [`che` caches](#che-hit-ratios) downstream (`keys must be a map`, `keys needs zipf and space, or uniform`, `keys takes zipf+space or uniform, not both`, `keys.zipf must be a finite non-negative number`, `keys.space must be a positive count (a whole number, optionally with k, M or G: 500, 10k, 100M)`, likewise `keys.uniform`; `space` and `uniform` are [counts](#values): `100M`); `timeout` read (a duration; absent: the client waits for ever): each step the client's response to an op is fitted as a lognormal, and the share slower than the timeout is timed out instead of answered (`timed_out_per_s` in JSON and in `run`'s `timed out/s` column, see [Drops and rejections](#drops-and-rejections)), the mean is the answered share's (the lognormal's truncated moments), a percentile at q is the fit to every delivered request's latency (the moments before the cut, the fit that decided who timed out) read at q and capped at the timeout, or is the timeout itself (`>1s` in the table) when more than its share of the requests timed out; it must be positive (`node 'u': timeout must be positive`); the servers still do a timed-out request's work, and only `retries` sends it again; `sizes` checked: each names an op the client sends and is a [size](#values) (`sizes names op 'x', which the client does not send`, `sizes 'stream' must be a size (B, KB, MB or GB: 50MB): size must be at most 1e15B`, the parser's reason after the colon; `sizes 'stream' must be positive` for `0B`, a size but no request), read by byte-sized nodes (each request costs its size in MB); `retries` read (phase 3; a whole number from 0 to 10, default 0: `node 'u': retries must be a non-negative integer` for -1, 1.5, a word or a quoted `"2"`, `node 'u': retries must be at most 10`) with `retry_after` (a positive duration, `node 'u': retry_after must be positive`, and only beside `retries`: `node 'u': retry_after needs retries`; absent: 100 ms, **chosen, not from the book**: one default step, about the latency table's cross-continent round trip): every request the client lost on its path or timed out is sent again `retry_after` later, up to `retries` more times; the engine moves in whole steps, so the wait is `retry_after` / `step` rounded **up**, at least one step (a retry never fires before the stated wait: 150 ms at 100 ms steps waits 2 steps, 200 ms; 250 ms waits 3), and `explain` prints the steps after a wait that is not whole (`retries=2 after 150ms (2 steps)`); each attempt fails at the share the path fails in the step it is sent, so a path that fails a share q is sent 1 + q + … + q^n attempts per request and answers 1 − q^(n+1) of the requests (n = 2 at q = 0.5: 1.75 attempts, 87.5 % answered); the servers do every attempt's work; `offered/s` stays the rate curve and `run`'s `attempts/s` column (JSON's and the op series' `attempts_per_s`) shows the retries above it; a request is answered once, and a request whose last attempt failed is lost (or timed out) once (`timed_out_per_s`), while the share of timed-out responses a percentile reads counts every attempt (`timed_out_attempts_per_s` ÷ the attempts delivered: a client that retried a 10.6 % tail still waited past its timeout on 10.6 % of its attempts, so its p99 prints `>200ms` and a p99 SLO fails); `estimate` iterates the retries to their fixed point and warns if they do not settle; ignored: jitter, exponential backoff, retry budgets and idempotency (a retried write that had succeeded), and the time a retried request spent on its failed attempts: its latency is its last attempt's, without the k failed attempts' waits (τ for a timed-out one, ~0 for a lost one) and the k backoffs before it; a proper model would make the response a mixture over the attempt a request is answered on (attempt k + 1 with probability q^k (1 − q), taking k × (τ or 0) + k × `retry_after` more), phase 4 material |
+| `client` | `rate` (rate curve), `ops` (map op → share), `keys` `{zipf: s, space: N}` or `{uniform: N}`, `sizes` (map op → size), `timeout`, `retries` †, `retry_after` † | `rate` (every term, see [Rate curve](#rate-curve-clientrate)) and `ops` read; `keys` read by the [`che` caches](#che-hit-ratios) downstream (`keys must be a map`, `keys needs zipf and space, or uniform`, `keys takes zipf+space or uniform, not both`, `keys.zipf must be a finite non-negative number`, `keys.space must be a positive count (a whole number, optionally with k, M or G: 500, 10k, 100M)`, likewise `keys.uniform`; `space` and `uniform` are [counts](#values): `100M`); `timeout` read (a duration; absent: the client waits for ever): each step the client's response to an op is fitted as a lognormal, and the share slower than the timeout is timed out instead of answered (`timed_out_per_s` in JSON and in `run`'s `timed out/s` column, see [Drops and rejections](#drops-and-rejections)), the mean is the answered share's (the lognormal's truncated moments), a percentile at q is the fit to every delivered request's latency (the moments before the cut, the fit that decided who timed out) read at q and capped at the timeout, or is the timeout itself (`>1s` in the table) when more than its share of the requests timed out; it must be positive (`node 'u': timeout must be positive`); the servers still do a timed-out request's work, and only `retries` sends it again; `sizes` checked: each names an op the client sends and is a [size](#values) (`sizes names op 'x', which the client does not send`, `sizes 'stream' must be a size (B, KB, MB or GB: 50MB): size must be at most 1e15B`, the parser's reason after the colon; `sizes 'stream' must be positive` for `0B`, a size but no request), read by byte-sized nodes (each request costs its size in MB); `retries` read (phase 3; a whole number from 0 to 10, default 0: `node 'u': retries must be a non-negative integer` for -1, 1.5, a word or a quoted `"2"`, `node 'u': retries must be at most 10`) with `retry_after` (a positive duration, `node 'u': retry_after must be positive`, and only beside `retries`: `node 'u': retry_after needs retries`; absent: 100 ms, **chosen, not from the book**: one default step, about the latency table's cross-continent round trip): every request the client lost on its path or timed out is sent again `retry_after` later, up to `retries` more times; the engine moves in whole steps, so the wait is `retry_after` / `step` rounded **up**, at least one step (a retry never fires before the stated wait: 150 ms at 100 ms steps waits 2 steps, 200 ms; 250 ms waits 3), and `explain` prints the steps after a wait that is not whole (`retries=2 after 150ms (2 steps)`); each attempt fails at the share the path fails in the step it is sent, so a path that fails a share q is sent 1 + q + … + q^n attempts per request and answers 1 − q^(n+1) of the requests (n = 2 at q = 0.5: 1.75 attempts, 87.5 % answered); the servers do every attempt's work; `offered/s` stays the rate curve and `run`'s `attempts/s` column (JSON's and the op series' `attempts_per_s`) shows the retries above it; a request is answered once, and a request whose last attempt failed is lost (or timed out) once (`timed_out_per_s`), while the share of timed-out responses a percentile reads counts every attempt (`timed_out_attempts_per_s` ÷ the attempts delivered: a client that retried a 10.6 % tail still waited past its timeout on 10.6 % of its attempts, so its p99 prints `>200ms` and a p99 SLO fails); `estimate` iterates the retries to their fixed point and warns if they do not settle; ignored: jitter, exponential backoff, retry budgets and idempotency (a retried write that had succeeded), and the time a retried request spent on its failed attempts: its latency is its last attempt's, without the k failed attempts' waits (τ for a timed-out one, ~0 for a lost one) and the k backoffs before it; a proper model would make the response a mixture over the attempt a request is answered on (attempt k + 1 with probability q^k (1 − q), taking k × (τ or 0) + k × `retry_after` more), phase 4 material |
 | `cdn` | `origin` (node id, required), `hit_ratio` (`{fixed: h}` or `che`, optional), `keys`, `ttl`, `write_ops` | read and run (phase 2b), see [`cdn`](#cdn) |
 | `load_balancer` | `policy`, `vnodes` | read and run, see [`load_balancer`](#load_balancer) |
 | `rate_limiter` | `algorithm`, `limit`, `burst`, `window`, `backend` | read and run, see [`rate_limiter`](#rate_limiter) |
 | `service` | `ops`, `cost` | read and run |
 | `cache` | `hit_ratio`, `strategy`, `write_ops`, `backend`, `keys`, `eviction`, `ttl`, `then`, `cost` | read and run (fixed or `che` hit ratio), see [`cache`](#cache) |
 | `sql_db` | `replication_lag`, `shards` (int), `pool` (int connections), `write_ops`, `cost` | read and run (phase 2b), see [`sql_db`](#sql_db) |
-| `kv_cluster` | `nodes` (int, required), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp`, `write_ops` | read and run (phase 2c), see [`kv_cluster`](#kv_cluster); `mode` printed, not modelled (partitions are phase 3) |
+| `kv_cluster` | `nodes` (int, required), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp`, `write_ops` | read and run (phase 2c), see [`kv_cluster`](#kv_cluster); `mode` printed, not modelled (partitions are in the phase 4 backlog); a `node_down` of some of its machines runs since phase 3 ([Faults](#faults)) |
 | `message_queue` | `partitions`, `retention` | read and run (phase 2c), see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool); `partitions` printed, not modelled |
 | `worker_pool` | `consumes` (queue node id, required), `workers`, `cost` (duration per job), `then`, `retries`, `retry_after` | `consumes`, `workers`, `cost` and `then` read and run (phase 2c), same section: the steps fire for every job it drains, `on: miss` and `on: failure` refused; `retries` and `retry_after` read and run (phase 3), same section: the jobs whose call to an external sink failed go back on the pool's queue, read again by this pool only, and the last attempt's failures are dead letters (the `dead_letter_rate` SLO) |
-| `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every **write** the store serves (an op in its `write_ops`; not one it drops) sends `factor` requests of the step's op to its target, and a read sends nothing (S3 notifies on ObjectCreated and ObjectRemoved, never on a GET: 1000 views/s of a video start no transcode; notifying on reads is phase 3). They are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. A step `on: miss` (`node 'store': a blob store's then steps fire for every write it stores (on: miss needs a cache)`) or `on: failure` (`... (on: failure: an event reports no failure before phase 3)`) is refused, and so is any `mode` (`node 'store': a blob store's then steps are event notifications nobody waits for (mode orders the calls a request waits for)`); an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, the delivery delay (an event arrives after the link's latency), failed notifications |
+| `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every **write** the store serves (an op in its `write_ops`; not one it drops) sends `factor` requests of the step's op to its target, and a read sends nothing (S3 notifies on ObjectCreated and ObjectRemoved, never on a GET: 1000 views/s of a video start no transcode; notifying on reads is not modelled). They are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. A step `on: miss` (`node 'store': a blob store's then steps fire for every write it stores (on: miss needs a cache)`) or `on: failure` (`... (on: failure: an event follows no step to report on; failure steps fire in an op's step list)`) is refused, and so is any `mode` (`node 'store': a blob store's then steps are event notifications nobody waits for (mode orders the calls a request waits for)`); an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, the delivery delay (an event arrives after the link's latency), failed notifications |
 | `search_index` | `build_interval` (positive duration) | read and run (phase 2c), see [`search_index`](#search_index); `build_interval` printed, not modelled |
 | `ws_gateway` | `max_connections` (count), `heartbeat` (duration), `fanout` (avg recipients per message, ≥ 1), `connections` (count: a fixed level), `session` (duration), `reconnect_within` (duration), `ops` | read and run (phase 3), see [`ws_gateway`](#ws_gateway); `reconnect_within` paces the reconnect storm after a `node_down` or a `dc_down` (phase 3 Task 15) |
 | `service_discovery` | `failover` (positive duration) | read and run (phase 3), see [`service_discovery`](#service_discovery): a service answering `lookup`; `failover` (default 10 s, chosen) is how long its callers stay on a dead replica after a `node_down`; `node 'disc': failover must be positive`; on any other type `node 'api': key 'failover' is not valid for type 'service'` |
@@ -619,8 +770,9 @@ less than one cache of `keys × M`: the consistent-hashing lab's four 2M-key ser
 must be reached through rings only: *(graph)* `node 'c': keys are partitioned by ring 'lb' but
 'web' also sends to it directly`. Behind any other policy, or with no balancer, every replica can
 see every key and fills itself with the same hot keys, so the cache size is `keys`. A replica
-lost to a `node_down` fault does not change the hit ratio before phase 3 (it is resolved once,
-at build; phase 3 will re-evaluate it from the same inputs).
+lost to a `node_down` fault does not change the hit ratio either (it is resolved once, at build;
+phase 3's faults take the replica's capacity, not its share of the keys, and only a
+`cache_flush` moves a hit ratio, see [Faults](#faults)).
 
 `explain` prints the number and where it came from: `hit_ratio=0.881 (che: zipf 1 over 100M keys
 from users)`; behind another che cache `(che: zipf 0.9 over 10M keys from u, filtered by l1)`;
@@ -765,7 +917,7 @@ replica, sent 800 + 1000 units/s, misses 88.89 of them:
 node table (`database  staleness  committed writes/s per shard  missed writes/s per replica`).
 
 A copy at **exactly** rho = 1 (its load equal to its capacity) keeps its queue empty in both
-commands (see [a node at exactly rho = 1](#what-runs-in-phase-2c)) and waits the stochastic wait at
+commands (see [a node at exactly rho = 1](#what-runs)) and waits the stochastic wait at
 the 0.99 clamp: 200 inserts/s on 2 copies of 1k/s puts both the primary and the replica at exactly
 1, and `estimate` and `run` both report a staleness of 250 ms (a 100 ms sojourn at each, + 50 ms).
 A real database there would wander anywhere up to two full queues (2.05 s): size a database off
@@ -806,7 +958,7 @@ once W = `write_quorum` of them have acknowledged it and a read once R = `read_q
 | `vnodes` | a positive integer; default 150 (the balancer's, ch. 5) | `vnodes must be a positive integer` |
 | `replication` | a positive integer of at most `nodes`; default **3** (ch. 6's N) | `replication must be a positive integer`, `replication must be at most nodes (3 > 2)` (the default counts: a two-node cluster must lower it) |
 | `write_quorum`, `read_quorum` | positive integers of at most `replication`; default **min(2, N)**: ch. 6's W = R = 2, lowered to 1 when `replication: 1`. W + R ≤ N is accepted: it is the eventually consistent end of ch. 6's dial (W = 1 a fast write, R = 1 a fast read; a read may miss the latest write) | `write_quorum must be a positive integer`, `write_quorum must be at most replication (4 > 3)`, the same for `read_quorum` |
-| `mode` | `ap` (default) or `cp`: what a partition costs, staleness or unavailability (ch. 6, "CAP theorem"). Read and printed; it changes nothing until partitions exist (phase 3) | `mode must be ap or cp` |
+| `mode` | `ap` (default) or `cp`: what a partition costs, staleness or unavailability (ch. 6, "CAP theorem"). Read and printed; it changes nothing until partitions exist (the phase 4 backlog) | `mode must be ap or cp` |
 | `replicas` | refused: a cluster scales by `nodes` and keeps `replication` copies of a key, two things `replicas` could mean | `node 'store': a kv_cluster's machines are nodes; replicas is not a key here` |
 | `write_ops` | a list of op names, as on a [cache](#cache): the ops that wait for the **write** quorum W; every other op waits for R. Default `[write]` (the default of every node but a database). A client that sends `put` straight to the cluster lists it here | `write_ops must be a list of op names`, `write_ops must name at least one op` |
 
@@ -876,7 +1028,8 @@ W = R = 2 requests (0.14 % at q = 1, 29.8 % at q = N), not the ninth that "the s
 replica-requests dropped" gives at every q: that rule over-counted a forgiving quorum and
 under-counted a strict one.
 
-`explain` prints the shape, `nodes=16 N=3 W=2 R=2 mode=ap (partitions: phase 3)  imbalance=1.08
+`explain` prints the shape (its "phase 3" for partitions predates their move to the phase 4
+backlog), `nodes=16 N=3 W=2 R=2 mode=ap (partitions: phase 3)  imbalance=1.08
 (vnodes 150)` (no `replicas=`), each of N, W, R and the mode marked `(default)` when the scenario
 left it (`N=3 (default) W=2 (default) R=2 (default) mode=ap (default; partitions: phase 3)`).
 Quorums that do not overlap add `(W + R ≤ N: a read may miss the latest write)` after R, and
@@ -887,7 +1040,8 @@ N = `nodes`, the plain average, `peak offered 3k/s (1k/s × N 3) vs 30k/s (3 nod
 green)`.
 
 Not modelled: network partitions and what `ap` or `cp` does under them, sloppy quorum and hinted
-handoff, node failures (faults: phase 3), read repair and anti-entropy (Merkle tree) traffic,
+handoff (the phase 4 backlog; a machine down is a `node_down` with `replicas`, see
+[Faults](#faults)), read repair and anti-entropy (Merkle tree) traffic,
 vector clocks and conflict resolution, gossip, the storage engine (commit log, memtable,
 SSTables, compaction), the latency of a request that lost a replica-request but still met its
 quorum (timed as if all N replied), the replicas' reply times being exactly lognormal (a Monte
@@ -1183,7 +1337,7 @@ retries load the quota further: `dead_letter_rate` is what shows it).
 | key | on | rule | message |
 |---|---|---|---|
 | `retention` | `message_queue` | a positive [duration](#values) (`7d` = 168 h); default **7 days**, Kafka's `log.retention.hours = 168` (an industry default: the book gives none) | `node 'q': retention must be positive` |
-| `partitions` | `message_queue` | a positive integer, printed by `explain` and **not modelled** (it would cap a group's parallelism: phase 3) | `node 'q': partitions must be a positive integer` |
+| `partitions` | `message_queue` | a positive integer, printed by `explain` and **not modelled** (it would cap a group's parallelism: the phase 4 backlog) | `node 'q': partitions must be a positive integer` |
 | `consumes` | `worker_pool` | **required**: the queue (or URL `frontier`) the pool drains, its only source of jobs; *(graph)* it must be a `message_queue` or a `frontier` and link to the pool, and no other node may send to the pool (a client, a service's step, another pool's `then`: a pool is no server anyone calls) | `node 'w': worker_pool needs consumes`, `node 'w': consumes 'svc' (type service); a worker pool consumes a message_queue or a frontier`, `node 'w': consumes 'q', but no link from 'q' delivers its messages to it`, `node 'w': a worker pool takes jobs only from the queue it consumes ('svc' sends to it)` |
 | `workers` | `worker_pool` | required, a positive integer, at most 100000 (Erlang C costs O(c) per step) | `node 'w': worker_pool needs workers`, `workers must be a positive integer`, `workers must be at most 100000` |
 | `cost` | `worker_pool` | required, a positive duration: the time one worker spends on one job (a service's `cost` is a map of capacity units; same spelling, read by type) | `node 'w': worker_pool needs cost`, `cost must be positive` |
@@ -1211,7 +1365,8 @@ pools every step
 (see [Queue lag](#queue-lag), the `queue_lag` SLO).
 Ignored: ordering, delivery guarantees and redelivery, a consumer's commit interval, the broker's
 disk; a worker blocked on a slow downstream call (an external sink's 150 ms would hold a worker:
-phase 3), autoscaling, poison messages, the end-to-end completion time of the asynchronous work.
+the phase 4 backlog), autoscaling, poison messages, the end-to-end completion time of the
+asynchronous work.
 
 ### `notification_fanout`
 
@@ -1385,7 +1540,7 @@ rate:
 ```
 All keys are **read**: the loader types them, `explain` and `simsys curve` print them, and
 `run` offers the curve (with its noise) at every step. `estimate` evaluates it once, at t = 0, without noise
-(see [What runs](#what-runs-in-phase-2c)).
+(see [What runs](#what-runs)).
 
 Composition: `rate(t) = level(t) × wave(t) × Π active spike factors × noise(t)`, where
 `level` is the ramp's rate `from + (to − from) × min(t / over, 1)` when there is a ramp,
@@ -1665,9 +1820,11 @@ the observed seconds (`steps` × `step`).
 | `slo[]` | `window_start_s` | seconds from the start of the run; only an SLO with `over` that `run` judged |
 | `faults[]` | `at_s`, `kind`, `node`, `for_s` | seconds from the start of the run; the kind; the node (`null` for a `dc_down`, which has `datacenter` after it); seconds, `null` for a `cache_flush` |
 | `faults[]` | `overlaps_at_s` | the `at_s` of every earlier fault on the same node (or datacenter) still counting when this one struck; `[]` for none. Overlapping faults' `failover_lost` overlap like their `lost` does: each counts the dead-replica share over the other's window too |
-| `faults[]` | `during` | `offered_per_s`, `served_per_s` (means over the fault), `lost` (against the twin, from `at` to the recovery) in `lost_unit` (`"requests"` or `"MB"`), `lost_on_cut_links` (a `dc_down`'s, in requests; `null` for every other kind), `backlog_peak`, `room` (in `lost_unit`; `room` `null` for a `cache_flush`), `extra_misses` and `origin` (a `cache_flush`'s, in the origin's unit; `null` for every other kind), `flipped`, the SLOs whose verdict differs from the twin's, as the text names them (`["p99_latency c op"]`; the verdict is the `slo` array's), and `over_max`, each SLO broken during the fault where the twin held it, `[{"slo": "p99_latency c op", "for_s": 0.3}]` |
-| `faults[]` | `after` | `backlog_node` (whose backlog: the node, the datacenter, a `traffic_spike`'s downstream node; `null` when the fault left none), `backlog_drained_in_s`, `cache_warm_in_s`: seconds, `null` where the text says there is none; a `cache_flush`'s also has `interrupted_by_flush_at_s` after `cache_warm_in_s` (seconds from the start of the run of the next flush that emptied its cache first; `null` when none did), a key no other kind has; a `ws_gateway`'s `node_down` (or a `dc_down` of its datacenter) ends with `reconnect_storm_connections`, `reconnect_storm_over_s`, `peak_offered_rho` and `peak_offered_rho_at_s` (the reconnect storm: [Faults](#faults)) |
+| `faults[]` | `during` | `offered_per_s`, `served_per_s` (means over the fault), `lost` (against the twin, from `at` to the recovery) in `lost_unit` (`"requests"`, `"MB"` or `"attempts"`), `lost_requests` (the requests lost for good when retries reach the faulted part, else `null`), `lost_on_cut_links` (a `dc_down`'s, in requests; `null` for every other kind), `backlog_peak`, `room` (in `lost_unit`; `room` `null` for a `cache_flush`), `extra_misses` and `origin` (a `cache_flush`'s, in the origin's unit; `null` for every other kind), `flipped`, the SLOs whose verdict differs from the twin's, as the text names them (`["p99_latency c op"]`; the verdict is the `slo` array's), and `over_max`, each SLO broken during the fault where the twin held it, `[{"slo": "p99_latency c op", "for_s": 0.3}]` |
+| `faults[]` | `after` | `backlog_node` (whose backlog: the node, the datacenter, a `traffic_spike`'s downstream node; `null` when the fault left none), `backlog_drained_in_s`, `cache_warm_in_s`: seconds, `null` where the text says there is none; `retries_added_attempts` and `pool_republished_jobs` (`null` when the text prints none); `failover_lost` (only in a scenario with a `service_discovery`; `null` when the fault has no failover); a `cache_flush`'s also has `interrupted_by_flush_at_s` after `cache_warm_in_s` (seconds from the start of the run of the next flush that emptied its cache first; `null` when none did), a key no other kind has; a `ws_gateway`'s `node_down` (or a `dc_down` of its datacenter) ends with `reconnect_storm_connections`, `reconnect_storm_over_s`, `peak_offered_rho` and `peak_offered_rho_at_s` (the reconnect storm: [Faults](#faults)) |
 | `faults[]` | `recovered_at_s` | seconds from the start of the run; `null` when not recovered by the end of the run |
+| `slo[]` | `median_seed` | under `run --replications` only: the seed of the run that judged this SLO, its median run |
+| top level | `replications` | under `run --replications` only, the last key: `seeds`, `median_seed` (the run the report around it is), `per_seed` (`ops`, `nodes`, `slo`, each number a list over the seeds); see [`simsys run --replications`](#command-line-simsys-run---replications-phase-3) |
 
 `faults` is the last key, after `slo`, and only a run with faults has it (`estimate`, which leaves
 the faults out, never does): one object per fault in `at` order with the numbers of its text block
@@ -1871,14 +2028,33 @@ faults:
 | `kind` | yes | `node_down`, `capacity`, `latency_spike`, `cache_flush`, `traffic_spike` or `dc_down`; `partition` is refused (`partition is not modelled in phase 3 (see the backlog)`); a list or map is `kind must be a scalar` |
 | `for` | all kinds but `cache_flush` | a positive duration; the fault ends at `at + for`, and may run past the end of the run (it is cut there: the run ends with the fault still on). A flush is an instant: `cache_flush takes no for` |
 | `node` | all kinds but `dc_down` | a declared node; `traffic_spike` needs a client, `cache_flush` a cache or cdn, the others any node but a client (`node_down cannot name a client (clients emit, they do not serve)`) |
-| `replicas` | `node_down` only, optional | how many of the node's copies go down (default: all), 1 up to its `replicas` (beyond: `replicas must be at most 4`); for a kv_cluster, of its `nodes`. On a sql_db a count of copies per shard (each shard is a primary and `replicas - 1` read replicas: news-feed's `post_db` has `shards: 6`): `replicas: r` below `replicas` takes r of the read replicas and leaves the primary (all of them: the whole node), and `primary` takes the writer, whose writes stop while the reads go on (the engine tells the two apart; the primary comes back at `at + for`, no replica is promoted). On a sql_db of one copy `primary` and `replicas: 1` are both the whole node, like a `node_down` without `replicas` |
+| `replicas` | `node_down` only, optional | how many of the node's copies go down (default: all), 1 up to its `replicas` (beyond: `replicas 5 is more than node 'api' has (4)`); for a kv_cluster, of its `nodes`. On a sql_db a count of copies per shard (each shard is a primary and `replicas - 1` read replicas: news-feed's `post_db` has `shards: 6`): `replicas: r` below `replicas` takes r of the read replicas and leaves the primary (all of them: the whole node), and `primary` takes the writer, whose writes stop while the reads go on (the engine tells the two apart; the primary comes back at `at + for`, no replica is promoted). On a sql_db of one copy `primary` and `replicas: 1` are both the whole node, like a `node_down` without `replicas` |
 | `factor` | `capacity`, `traffic_spike` | a number (`three`, `"3"`, `2k`, `50%`: `factor must be a number`); `capacity`: strictly between 0 and 1; `traffic_spike`: positive, at most 1e6 |
 | `extra` | `latency_spike` | a positive duration added to the node's service time |
 | `datacenter` | `dc_down` | a declared datacenter |
 
 A key the entry's kind does not read is refused (`replicas applies to node_down only`), and so is
 a misspelt one (`faults[0]: unknown key 'nod'`). Every message names the entry by its position in
-the list.
+the list, after the file, line and column: `scenario.yaml:12:53: error: faults[0]: replicas 5 is
+more than node 'api' has (1)`. The loader's refusals, all from `src/config/faults.cpp`:
+
+| key | refused with |
+|---|---|
+| the list | `faults must be a list`; an entry that is not a map: `faults[0]: must be a map` |
+| `kind` | `needs a kind`, `kind must be a scalar`, `unknown kind 'x'`, `partition is not modelled in phase 3 (see the backlog)` (partitions are in the phase 4 backlog) |
+| any key | `unknown key 'nod'`; a key another kind reads: `replicas applies to node_down only`, `factor applies to capacity and traffic_spike only`, `extra applies to latency_spike only`, `datacenter applies to dc_down only` |
+| `at` | `needs an at`, `at must fall inside the run (1m)` (the run's `duration`), or the time parser's reason |
+| `node` | `node_down needs a node` (each kind but `dc_down` by its name), `dc_down takes no node (it names a datacenter)`, `node 'x' is not declared`, `traffic_spike needs a client, 'api' is a service`, `cache_flush needs a cache or cdn, 'api' is a service`, `node_down cannot name a client (clients emit, they do not serve)` (also `capacity` and `latency_spike`) |
+| `for` | `node_down needs a for` (each kind that lasts), `cache_flush takes no for`, `for must be positive` |
+| `replicas` | `primary applies to a sql_db only`, `replicas must be a whole number or primary`, `replicas must be at least 1`, `replicas 5 is more than node 'api' has (4)`; a count beyond an `int` (`99999999999`): `replicas must be at most 4` (the node's copies) |
+| `factor` | `capacity needs a factor` (`traffic_spike needs a factor`), `factor must be a number`, `capacity factor must be between 0 and 1 (a gain is the scenario's capacity)`, `traffic_spike factor must be positive`, `traffic_spike factor must be at most 1e6`, and across entries `overlapping traffic_spike factors on 'users' multiply to more than 1e6` |
+| `extra` | `latency_spike needs an extra`, `extra must be positive` |
+| `datacenter` | `dc_down needs a datacenter`, `datacenter 'mars' is not declared` |
+
+Two refusals need the built graph and the engine, so `run`, `estimate` and `sweep` give them
+(exit 1; `estimate` too, although it leaves the faults out) and `validate` and `explain` do not: `node 'x': cache_flush needs keys (a fixed hit ratio is back once keys
+requests have refilled it)` and `node 'x': cache_flush on a cache that always hits (hit ratio 1):
+it has no miss path to warm through` (`Simulation::create`, `src/engine/engine.cppm`).
 
 Faults that overlap in time on one target combine: their `factor`s multiply (two capacity faults of
 0.5 leave a quarter; two traffic spikes of 3 send nine times the rate) and their `extra`s add. The
@@ -2014,8 +2190,12 @@ fault has these keys.
 
 `recovery` is the start of the first step after the fault clears (a `cache_flush`: from the flush)
 at which every client op's p99 (the step's lognormal fit) and every node's rho are within 1 % of
-the twin's same step, with how long after the end of the fault (`after the flush`) that was, or
-`not recovered by the end of the run`. Durations in the body are seconds with at most one decimal
+the twin's same step (relative to the twin's value), with how long after the end of the fault
+(`after the flush`) that was, or `not recovered by the end of the run`. It is the first such
+step, not the first of a run of them: numbers that cross the twin's on their way elsewhere meet
+the rule there (a gateway whose storm connects, in the first step after the fault, happen to load
+it as much as the lost connections' heartbeats would have reads as back at once, although the
+storm's overshoot follows). Durations in the body are seconds with at most one decimal
 (`0.2s`, `10s`), but `over its max for`, a duration as the tables print one (`300ms`), and a
 `failover`, as `explain` prints it. The
 criterion is "back where it would have been", not "the SLOs pass again": an SLO with room to spare
@@ -2169,7 +2349,7 @@ node 'users': rate.base: expected a non-negative finite number`; a missing key o
 value under a YAML anchor (`&a`) is shared with every alias (`*a`): sweeping it through either path
 sweeps it everywhere the anchor is used. A number a run did not produce (a latency of an op of
 which nothing was answered) is `-` in the table and an empty cell in the CSV. A sweep has no SLO
-columns and no exit code per point (planned for phase 3).
+columns and no exit code per point (the phase 4 backlog).
 
 **Parallel, and the same bytes for any `--jobs`.** The points run on `std::jthread` workers that
 take the next point index from one atomic counter; each point owns its YAML tree, graph,
@@ -2196,4 +2376,5 @@ nodes.transcoders.workers  transcode_q.lag  viewers_eu.stream.mean  transcoders.
 Only 600 keeps the queue within its 30-minute SLO; the viewers never notice, since nobody waits
 for a transcoder (the hop from the queue to the pool is asynchronous).
 
-Ignored: grids over two keys, geometric spacing, list values, replications per point (phase 3).
+Ignored: grids over two keys, geometric spacing, list values, replications per point (all in the
+phase 4 backlog; `run --replications` replicates one run, not a sweep).

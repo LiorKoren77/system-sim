@@ -10,9 +10,13 @@ reproducible. Built to practise the systems in
 *System Design Interview* (Alex Xu, vol. 1) and, at the same time, to study and teach
 C++20/23: modules, concepts, ranges, coroutines, `std::expected` and friends.
 
-Status: phase 2 is done; its last part, 2c, added bytes, queues and workers, external sinks and
-the sweep. Phase 3 is under way: scripted faults run (`faults:`, below); retries and the four
-node types still missing come next.
+Status: phase 3 is built. Phase 2 added the node types, rate curves, bytes, queues and the sweep;
+phase 3 added scripted faults (a node or some of its replicas down, a capacity loss, a latency or
+traffic spike, a cache flush, a datacenter down), each reported as an incident block measured
+against a fault-free twin of the run, client and worker-pool retries (`attempts/s`, dead letters),
+`on: failure` steps, `run --replications N` (medians and 10–90 % bands over seeds of the rate
+noise), and the last four node types: service discovery, WebSocket gateways (open connections as
+a level, heartbeats, the reconnect storm), notification fan-outs and URL frontiers.
 Clients follow rate curves (daily waves, ramps, scripted spikes, replayed points) with seeded
 Ornstein–Uhlenbeck noise, state the key popularity they ask for (Zipf or uniform) and the size
 of each op (`sizes: {stream: 50MB}`), and may give up after a `timeout`; nodes charge a per-op
@@ -29,7 +33,7 @@ a failed step does not run, refused, dropped and timed-out requests are counted 
 `simsys sweep` runs a scenario over a range of one key, the points in parallel. All fourteen
 shipped scenarios run end to end, the eight book systems among them (list below). 1681 tests
 (Catch2, via `ctest`). The scenario language is
-[`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.4).
+[`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.5).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
 
@@ -83,6 +87,50 @@ run's observed value and seed (each SLO is judged by its own median run); it exi
 SLO's median run fails. A scenario without noise runs once,
 after a line that says so; `--series` needs a single run
 ([schema](docs/scenario-schema.md#command-line-simsys-run---replications-phase-3)).
+
+A scenario's `faults:` list runs in `run` (`estimate` shows the steady state without it), and
+after the SLO table each fault gets a block: what it cost while it lasted, what followed, and when
+every op's p99 and every node's utilization were back within 1 % of a fault-free twin run in
+lockstep. The [chat system](scenarios/book/chat-system/) (ch. 12) loses its whole gateway tier for
+a minute at 21:30, just past the evening peak (trimmed):
+
+```
+$ simsys run scenarios/book/chat-system/scenario.yaml
+scenario chat-system  861000 steps observed  drop rate 0.00933% (worst: chat_servers)
+nodes
+  node           mean_rho  peak_rho  peak_backlog  dropped  dead_lettered/s  rejected  red_s  peak_lag  connections
+  ...
+  chat_servers     0.5384         1             0   2.159M                -         0   61.9         -       1.472M
+  ...
+fault 21:30 node_down chat_servers for 1m
+  during:   offered 35.98k/s, served 0/s, lost 2.159M attempts (2.154M requests lost for good), backlog 0, drop_rate over its max for 1m
+  after:    no backlog to drain, reconnect storm 1.617M connections over 30s, chat_servers peak 93.9% at 21:31:29.9
+  recovery: back within 1% (every op's p99, every node's rho) at 21:38:58.7 (478.7s after the fault cleared)
+```
+
+The 1.617M open connections drop at once and their users come back over `reconnect_within`
+(30 s, a default chosen, not from the book): 93.9 % of the tier at the storm's last second, 112 %
+if they all come back within 10 s (its README runs the window from 10 to 60 s). `lost` counts
+attempts, the servers' work, because the sync workers retry; the requests the users lost for
+good are beside it.
+
+`run --replications N` repeats a run over N seeds of the clients' rate noise. On the hello
+tutorial with `rate: {base: 100/s, noise: {sigma: 0.2, correlation: 10s}}` and a p99 SLO of
+5.7 ms (the shipped scenarios have no noise, so for them it runs once and says so):
+
+```
+$ simsys run probe.yaml --replications 5
+replications: 5 runs, seeds 1..5; a cell is the median across the runs [its 10–90 % band], nearest rank
+each SLO is judged by its own median run; the summary line and the fault blocks are seed 2's
+scenario hello  600 steps observed  drop rate 0%
+...
+ops (percentiles estimated: lognormal fit to the response moments)
+  client.op           offered/s         attempts/s                mean                 p50                 p95                 p99  (estimated)
+  users.ping  103 [93.77–112.4]  103 [93.77–112.4]  1.62ms [1.61–1.63]  1.33ms [1.32–1.34]  3.72ms [3.69–3.75]  5.69ms [5.64–5.75]
+slo (each: its median run's verdict and observed value, and the runs that passed it)
+  status          metric       node   op    observed  max
+  PASS in 3 of 5  p99_latency  users  ping  5.69ms    5.7ms  median run: seed 2
+```
 
 `curve` prints one client's offered rate over time as CSV (`t_s,rate_per_s`), sampled every
 `--step` from t = 0 (midnight) up to `--until` (default: the scenario's duration), so the
@@ -321,8 +369,10 @@ Every node type has a model since phase 3 (a WebSocket gateway, a service discov
 notification fan-out and a URL frontier were its last four), and every shipped scenario runs.
 Scripted faults run (`faults:`: a node or some of its replicas down, a capacity loss, a latency
 spike, a traffic spike, a cache flush, a datacenter down; `estimate` shows the steady state
-without them); retries and `on: failure` steps are phase 3 too; kv partitions are a phase 4
-backlog item.
+without them), and so do client and pool retries, `on: failure` steps and replications. kv
+partitions, random faults and the rest of the phase 4 backlog are in the
+[phase 3 plan](docs/superpowers/plans/2026-10-30-phase3-faults-gateways.md)'s last section; the
+rules as built are spec §20.
 
 ## Toolchain
 

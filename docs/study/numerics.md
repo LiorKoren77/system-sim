@@ -585,8 +585,8 @@ part loses digits in E[X²] − E[X]² (section 5's cancellation).
 **What it ignores.** The response is not exactly lognormal (a cache's hit/miss mixture is
 bimodal, section 5), so the share timed out is the fit's tail, not the requests'; the timeout is
 the client's alone (nothing cancels the request at the servers, whose demand and utilization
-still include it, and nothing retries it before phase 3); and a timed-out request is in no
-`drop_rate`, since no node failed it.
+still include it; since phase 3 a client's `retries` send it again, section 12); and a timed-out
+request is in no `drop_rate`, since no node failed it.
 
 (Numbers from a Release build of this tree; every run is deterministic.)
 
@@ -610,3 +610,138 @@ n / `keys`: full after `keys` reads. That is optimistic: once h(n) = h · n / K 
 an entry, and the consistent model, dE/dn = 1 − h · E / K, gives E(n) = (K / h)(1 − e^{−hn/K}),
 full at n = −(K / h) ln(1 − h), 2.56 K at h = 0.9. The linear case is kept because a fixed ratio
 says nothing of which keys repeat, and the tests pin it (0.45 at half the fill of a 0.9 cache).
+
+**Checked against the binary.** The theory tests' probe: a client of 1000 reads/s over Zipf 0.8
+of 1M keys into a `read_through` cache of `keys: 10k` with `hit_ratio: che`, flushed at 10 minutes
+(`tests/theory/test_faults.cpp`, `flush_probe`). `explain` gives the steady ratio,
+`hit_ratio=0.232 (che: zipf 0.8 over 1M keys from u)`, and `run --series` the origin's demand, the
+cache's misses, from which h = 1 − demand / 1000:
+
+| t (s) | origin demand (/s) | h |
+|---|---|---|
+| 599.9 | 768.095 | 0.23191 (steady) |
+| 600.0 | 1000 | 0 (the flush) |
+| 600.1 | 970.994 | 0.02901 |
+| 602.0 | 873.225 | 0.12677 |
+| 605.0 | 825.504 | 0.17450 |
+| 610.0 | 781.568 | 0.21843 |
+| 612.1 | 768.131 | 0.23187 |
+| 612.2 | 768.095 | 0.23191 (full) |
+
+The curve is steep at first and flat at the end: the hot keys come back within the first second,
+the last few thousand entries are cold keys that each add little. The fault block says the same
+in two numbers, `extra misses 713.3 to origin` and `cache warm again in 12.1s`; its `recovery`
+line comes earlier, at 10.9 s, because it asks only that the op's p99 and every node's rho be
+within 1 % of the fault-free twin's, and the origin's rho is within 1 % before the hit ratio is.
+
+## 12. A client's retries: a geometric series and its fixed point
+
+A client with `retries: n` sends every request it lost or timed out again `retry_after` later, up
+to n times (spec §20 entry 7; the model is in `ClientBehaviour`'s comment, `src/engine/behaviours.cppm`).
+If the path fails a share q of what it is sent, a request is sent once, again with probability q,
+a third time with probability q², and so on, n + 1 times at most:
+
+    attempts per request = 1 + q + q² + ... + qⁿ = (1 − q^(n+1)) / (1 − q)     (a cut geometric series)
+    answered             = 1 − q^(n+1)                                          (some attempt got through)
+    lost for good        = q^(n+1)                                              (the last one failed too)
+
+It is a sum, not a closed form the code evaluates: the engine keeps, per op, a ring of n buckets
+per backoff slot (`ClientBehaviour::RetryRing`), and after each step puts the failed share of
+each attempt into the next attempt's bucket, b = ⌈`retry_after` / `step`⌉ steps later
+(`backoff_steps`: rounded **up** in integer nanoseconds, at least one step, so a retry never fires
+before its stated wait). The series builds itself one term per backoff. On a probe of 1000/s
+with `retries: 2` into an external sink that fails half of what it serves (q = 0.5, b = 1 step),
+`run --series-ops` shows the terms arriving:
+
+```
+t_s,client,op,offered_per_s,attempts_per_s,answered_per_s,timed_out_per_s,mean_ms
+0,c,call,1000,1000,500,0,100
+0.1,c,call,1000,1500,750,0,100
+0.2,c,call,1000,1750,875,0,100
+0.3,c,call,1000,1750,875,0,100
+```
+
+1000, 1000 + 500, 1000 + 500 + 250, then 1.75 attempts per request for ever, 875 of the 1000
+requests a second answered (the series' `answered_per_s` counts the attempts the path delivered,
+which at the fixed point are the requests answered). The q here is the same in every step; in an
+outage it is 1 while the outage lasts, every attempt fails, and the attempts climb to (n + 1) times
+the curve: the retry storm, capped by n.
+
+**Why q is not a constant.** More attempts load the path more, and a loaded path loses more: q
+depends on the attempts, which depend on q. `run` does not solve that: each step reads the share
+the path failed in the step it was sent (the feedback is one step late, like every thinning of
+section 6), and the storm shows as it happens. `estimate` wants the fixed point, the attempts A
+with A = curve × (1 − q(A)^(n+1)) / (1 − q(A)). It iterates: each pass sends again what the pass
+before failed (`settling_copy` makes every backoff one pass, since at a fixed point the wait
+changes nothing), with q read off the **damped** delivered fractions of section 6, d̄ ← (1 − w) d̄ +
+w d, whose weight halves each time an average overshoots. More attempts can only raise q, so the
+feedback climbs monotonically to the smallest fixed point; one that no capacity stops within the
+pass cap ends with `converged` false and `estimate` warns (`no steady state (... a retry storm that
+no capacity stops ...)`). The same probe at q = 0.5 settles at `1.75k` attempts a second; at
+q = 0.9 at `2.71k` (1 + 0.9 + 0.81); at q = 0.9 with `retries: 10` at `6.862k`
+((1 − 0.9¹¹) / 0.1 = 6.862). The `run` of the q = 0.5 probe over 10 s prints `1.74k`: its two
+first steps were the series still building.
+
+**A worker pool's retries** are the same series over the jobs that reached an external sink and
+failed there, f instead of q (spec §20 entry 8): 1 + f + … + fⁿ calls per job and fⁿ⁺¹ of the jobs
+dead-lettered, 1.020408 calls and 1.6e-7 of the jobs at f = 0.02, n = 3 (`tests/theory/test_sinks.cpp`),
+`explain`'s paper load multiplied by the same A(f, n).
+
+## 13. A gateway's connections: an exponential approach, a storm and a decay
+
+A `ws_gateway` holds a **level** C of open connections, not a queue (spec §20 entries 11 and 12;
+`WsGatewayBehaviour`, `src/engine/behaviours.cppm`). Connects arrive at λ, and each connection
+ends at rate 1 / session (sessions exponential with mean `session`), so
+
+    dC/dt = λ − C / session        C(t) = λ · session · (1 − e^(−t / session))     C* = λ · session
+
+a first-order lag with time constant `session`, rising to the fixed point C* (Little's law: λ
+connects a second that stay `session` seconds hold λ · session open; `estimate` reports C*
+directly, `use_steady_level`). It is 63.2 % of the way after one session, 95 % after three
+(1 − e⁻³), which is why `explain` warns when a run is shorter than three sessions.
+
+**The step: explicit Euler.** `run` moves the level one step at a time, `C ← C + (λ − C /
+session) dt` (`WsGatewayBehaviour::admit`), so after k steps C = C* (1 − (1 − dt / session)^k):
+(1 − dt/s)^k is below e^(−k dt / s), so Euler rises a little **faster** than the exponential. The
+fixed point is exact at any step (λ − C* / session = 0 is the same equation). On the probe of
+the theory tests (λ = 100/s, `session: 1000s`, so C* = 100k and C(1000 s) = 100k (1 − e⁻¹) =
+63.21k), the level `run --series` gives at t = 1000 s:
+
+| step | C at 1000 s |
+|---|---|
+| 100 ms | 63,213.9 |
+| 1 s | 63,230.5 |
+| 10 s | 63,396.8 |
+| 100 s | 65,132.2 |
+
+At the default step the error is invisible; at a tenth of the session it is 3 %. A step of more
+than twice the session would make the level oscillate (|1 − dt/s| > 1), and one longer than the
+session would overshoot below 0, which `admit` clamps; keep `step` far below `session` (a chat
+session is minutes, the default step 100 ms). The cap is applied inside the same step: the
+connects admitted are those that bring the level exactly to `max_connections × replicas`, and at
+the cap the connects that get in are the disconnects, C / session.
+
+**The storm: users waiting, decaying, then paced.** A `node_down` of the whole tier drops C₀ to 0
+at once. The dropped users wait for the tier, and a waiting user's session would still have
+ended, so the waiting crowd decays at the same rate 1 / session, but **exactly**, not by Euler:
+`end_waiting_sessions` multiplies it by e^(−dt / session) each step, so after a fault of length
+`for` there are C₀ e^(−for / session) left whatever the step. The users who tried to connect
+during the outage join them, each decaying from the moment it tried. When the fault clears the D
+still waiting come back evenly over W = `reconnect_within`:
+
+    connects = λ + D / W    for W seconds from the fault's end
+
+On the probe (C₀ = 99,327.89 at 5000 s, the tier down for 60 s, W = 30 s) the binary's series
+shows the gateway offered 3,512.14/s at the step that starts at 5060 s: the users' 100 sends and
+100 + D / 30 = 3,412.14 connects, 34.1 times the usual connect rate (the theory test pins D =
+99,364.12); the fault block says `reconnect storm 99.33k connections over 30s, gw peak 46.1% at
+01:24:49`, the connections it dropped, not the users who came back. Over W = 300 s the same storm
+peaks at 4.3 times. A reconnect the gateway refuses (the cap) or drops (its room full) is tried
+again after an exponential wait of mean W: of R users retrying, R (1 − e^(−dt / W)) come back in a
+step (`retries_in_step`), memoryless, so R is one number whatever the moment each was refused.
+
+What the storm ignores, and the numbers above show: the storm's users end no session while they
+wait their turn within W, so after the storm the level stands above the fault-free twin's (on the
+probe 100,894 at 5090 s against C* = 100k), by about D · W / (2 · session), and decays back with
+the session's time constant; that is what the fault block's `recovery` waits for (01:31:35 on the
+probe, 435 s after the fault cleared).
