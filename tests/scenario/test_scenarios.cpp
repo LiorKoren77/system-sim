@@ -2226,10 +2226,15 @@ TEST_CASE("book/google-drive's peaks match the README: block servers 64.8 percen
 //    fault within 1 % (the level changes by well under that in 10 s: the fault-free run's record at
 //    21:29:50, the same run as the faulted one's up to the fault, is read);
 //  - its length is the default 30 s; the peak (the gateway's offered utilisation) is first reached
-//    in the five minutes after the fault clears at 21:31 (loose: where in the storm it lands
-//    depends on how the heartbeats compare with the storm's connects, i.e. on the sizing); and the
-//    run recovers (every op's p99 and every node's rho within 1 % of the twin's) before 22:00, a
-//    generous 29 minutes after the fault clears.
+//    inside the storm's window, from the fault's end at 21:31 to 30 s and one 10 s step after it
+//    (the Task 15 review's decision 4; the 100 ms run of the README puts it at 21:31:29.9, the
+//    storm's last moment); and the run recovers (every op's p99 and every node's rho within 1 % of
+//    the twin's) before 22:00, a generous 29 minutes after the fault clears (the README's 100 ms
+//    run: 21:38:58.7).
+//  The review's other decisions leave these pins as they were: the users whose sessions end while
+//  they wait for the tier (e^(-1/6) of the dropped are left) are as many as those whose connects
+//  the dead tier lost and who wait with them (the README: 1.617M either way), so the storm, its
+//  peak and the recovery moved by less than the pins' slack.
 namespace {
 
 double number_after_key(const std::string& text, std::string_view key) {
@@ -2292,10 +2297,10 @@ TEST_CASE("book/chat-system runs the day, passes its three SLOs and storms back 
                WithinRel(level, 0.01));
   REQUIRE_THAT(number_after_key(after, "\"reconnect_storm_over_s\": "), WithinRel(30.0, 1e-9));
 
-  // The peak is first reached once the gateway is back (21:31:00) and within five minutes of it.
+  // The peak is first reached once the gateway is back (21:31:00), within the storm's window.
   const double peak_at_s = number_after_key(after, "\"peak_offered_rho_at_s\": ");
   REQUIRE(peak_at_s >= 21 * 3600 + 31 * 60);
-  REQUIRE(peak_at_s <= 21 * 3600 + 35 * 60);
+  REQUIRE(peak_at_s <= 21 * 3600 + 31 * 60 + 30 + 10);
 
   // The run is back to its twin before 22:00.
   REQUIRE_FALSE(after.contains("\"recovered_at_s\": null"));

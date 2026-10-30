@@ -1070,19 +1070,21 @@ constexpr std::string_view op_title =
          amount_text(without_residue(*after.failover_lost), unit) + " sent to " + std::string{dead};
 }
 
-// A node_down of a ws_gateway's reconnect storm (engine::FaultRecord's header): the connections it
-// dropped, how long they take to come back, and the gateway's peak offered utilisation from the
-// fault's end with when it was first reached, `reconnect storm 99.33k connections over 30s, gw peak
-// 71.9% at 01:24:49` (the amount as the block's counts, the percent as the node table's, the time
-// as the block's clock). Without a step after the fault (the run ended first) the peak is left out.
+// The reconnect storm of a fault that killed a ws_gateway's servers (a node_down of it, a dc_down
+// of its datacenter; engine::FaultRecord's header): the connections it dropped, how long they take
+// to come back, and the gateway's peak offered utilisation over the storm with when it was first
+// reached, `reconnect storm 99.33k connections over 30s, gw peak 72% at 01:24:49` (the amount as
+// the block's counts, the percent as the node table's, the time as the block's clock; several
+// gateways of a datacenter named together). Without a step after the fault (the run ended first)
+// the peak is left out.
 [[nodiscard]] std::string storm_text(const engine::FaultRecord& r) {
   const auto& after = r.after;
   std::string text = "reconnect storm " +
                      amount_text(*after.reconnect_storm_connections, "connections") + " over " +
                      format_duration(seconds(after.reconnect_storm_over));
-  if (!after.peak_rho || !after.peak_rho_at) return text;
-  return text + ", " + r.node + " peak " + percent(*after.peak_rho) + " at " +
-         fault_clock(*after.peak_rho_at);
+  if (!after.peak_offered_rho || !after.peak_offered_rho_at) return text;
+  return text + ", " + after.reconnect_storm_gateways + " peak " +
+         percent(*after.peak_offered_rho) + " at " + fault_clock(*after.peak_offered_rho_at);
 }
 
 // The follow-on, then what the failover sent to dead replicas, then what the retries added, then a
@@ -1372,16 +1374,19 @@ constexpr std::string_view op_title =
 }
 
 // A gateway's reconnect storm in a fault's `after` (the text's storm_text, unrounded, in seconds):
-// `reconnect_storm_connections`, `reconnect_storm_over_s`, `peak_rho` (the offered utilisation, a
-// fraction that may pass 1) and `peak_rho_at_s`, the two last null when no step followed the fault.
+// `reconnect_storm_connections`, `reconnect_storm_over_s`, `peak_offered_rho` (the offered
+// utilisation, a fraction that may pass 1: not a node's `peak_rho`, the busy fraction, hence its
+// own name since the Task 15 review) and `peak_offered_rho_at_s`, the two last null when no step
+// followed the fault.
 void json_storm(const engine::FaultAfter& after, std::vector<std::string>& fields) {
   fields.push_back(json_field("reconnect_storm_connections",
                               json_number(without_residue(*after.reconnect_storm_connections))));
   fields.push_back(
       json_field("reconnect_storm_over_s", json_number(seconds(after.reconnect_storm_over))));
-  fields.push_back(json_field("peak_rho", json_optional_number(after.peak_rho)));
-  fields.push_back(json_field("peak_rho_at_s", json_optional_number(after.peak_rho_at.transform(
-                                                   [](SimTime t) { return seconds(t); }))));
+  fields.push_back(json_field("peak_offered_rho", json_optional_number(after.peak_offered_rho)));
+  fields.push_back(
+      json_field("peak_offered_rho_at_s", json_optional_number(after.peak_offered_rho_at.transform(
+                                              [](SimTime t) { return seconds(t); }))));
 }
 
 // A fault's `after` as JSON: each entry null where it does not apply or did not happen. A flush's
@@ -1390,7 +1395,8 @@ void json_storm(const engine::FaultAfter& after, std::vector<std::string>& field
 // ones written before it existed. `failover_lost` (the requests a failover sent to dead replicas,
 // null when none applied) is there only in a scenario with a service discovery (`discovers`), as
 // `datacenter` is only on a dc_down: a report of a scenario without one is what it was before.
-// A node_down of a ws_gateway ends with its reconnect storm (json_storm), on no other fault.
+// A fault that killed a ws_gateway's servers (a node_down of it, a dc_down of its datacenter) ends
+// with its reconnect storm (json_storm), on no other fault.
 [[nodiscard]] std::string json_after(const engine::FaultRecord& r, bool discovers) {
   std::vector<std::string> after{
       json_field("backlog_node",

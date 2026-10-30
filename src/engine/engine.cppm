@@ -434,6 +434,7 @@ class Simulation {
   void count_flushed_reads(SimTime now, SimTime dt);
   void fail_over_callers(SimTime now);
   void follow_gateway_outages(SimTime now, SimTime dt);
+  static void take_back_lost_connects(Node& node, SimTime dt);
   static void fail_over(Simulation& simulation, const FailoverRoute& route, double share);
   void set_hit_ratio_factor(std::size_t cache, double factor);
 
@@ -1682,17 +1683,38 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
   return record;
 }
 
-// Every ws_gateway hears, before any node receives this step, the share of its replicas the
-// node_downs active at `now` take (FaultSchedule::down_share): a rise drops that share of its
-// connections, a fall starts their reconnect storm (behaviours::WsGatewayBehaviour::follow_outage).
-// Advance mode only: a storm is a moment of the run, and estimate's copy has no faults. Every
-// share is 0 without a node_down of a gateway, and then nothing moves.
+// Every ws_gateway hears, before any node receives this step, which faults have killed its servers
+// at `now` and the share each took (FaultSchedule::down_faults: its node_downs, and a dc_down of
+// its datacenter): a new one drops that share of its connections, one gone releases their
+// reconnect storm (behaviours::WsGatewayBehaviour::follow_outages). Advance mode only: a storm is a
+// moment of the run, and estimate's copy has no faults. The list is empty without such a fault,
+// and then nothing moves.
 void Simulation::follow_gateway_outages(SimTime now, SimTime dt) {
   for (std::size_t index = 0; index < nodes_.size(); ++index) {
-    if (auto* gateway = std::get_if<behaviours::WsGatewayBehaviour>(&nodes_[index].behaviour)) {
-      gateway->follow_outage(faults_.down_share(index, now), now, dt);
+    auto* gateway = std::get_if<behaviours::WsGatewayBehaviour>(&nodes_[index].behaviour);
+    if (gateway == nullptr) continue;
+    std::vector<behaviours::Outage> outages;
+    for (const auto& down : faults_.down_faults(index, now)) {
+      outages.push_back(behaviours::Outage{.fault = down.fault, .share = down.share});
     }
+    gateway->follow_outages(outages, now, dt);
   }
+}
+
+// What a ws_gateway lost of this step's connects, handed back to it after route
+// (behaviours::WsGatewayBehaviour::take_back_lost_connects): the connects that arrived (its storm's
+// among them, add_connection_arrivals), those its queue dropped (serve) and those cut off with
+// every replica down (cut_off_dropped_connections), so that the users behind a lost reconnect try
+// again and those behind a connect sent to a dead tier wait for it. Advance mode only, as
+// follow_gateway_outages; nothing on any other node.
+void Simulation::take_back_lost_connects(Node& node, SimTime dt) {
+  auto* gateway = std::get_if<behaviours::WsGatewayBehaviour>(&node.behaviour);
+  if (gateway == nullptr) return;
+  gateway->take_back_lost_connects(
+      {.arrived_per_s = node.inflow.rate_of(model::connect_op).per_second,
+       .dropped_per_s = node.dropped.rate_of(model::connect_op).per_second,
+       .cut_off_per_s = node.cut_off.rate_of(model::connect_op).per_second},
+      dt);
 }
 
 // Each failover route's dead share at `now` (FaultSchedule::dead_share: r / R inside the window of
@@ -1920,6 +1942,7 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
     book_failover(index, samples[index]);
     count_deduplicated(index, routed, samples[index]);
     book_cut_off(index, samples[index]);
+    if (mode == Mode::advance) take_back_lost_connects(nodes_[index], dt);
     note_pool_jobs(index, routed);
     send(index, routed, now, dt, mode, record.links);
   }
