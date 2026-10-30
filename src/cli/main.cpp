@@ -166,8 +166,9 @@ int run_estimate(const std::filesystem::path& file, const ReportOptions& options
   const auto record = sim->estimate();
   if (!record.converged) {
     print_error(file.string() +
-                ": warning: no steady state (a loop of gain >= 1, or delivered fractions "
-                "that did not settle: a step after a failed step); "
+                ": warning: no steady state (a loop of gain >= 1 or a retry storm that no "
+                "capacity stops, or delivered fractions that did not settle: a step after a "
+                "failed step); "
                 "the numbers below are the last settle pass");
   }
   if (options.format == "table") {

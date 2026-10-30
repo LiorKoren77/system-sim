@@ -28,7 +28,8 @@
 // or warm-up of its own: a sql_db's primary comes back at `at + for` rather than a replica being
 // promoted), which copies go down (the survivors share the load evenly: a copy's capacity is
 // scaled, see fluid::Derating; a kv_cluster's down machines are cool ones, see
-// behaviours::KvClusterBehaviour), what clients do about it (retries are phase 3's Task 10), and
+// behaviours::KvClusterBehaviour), what clients do about it (a client's `retries` are its own
+// model, behaviours::ClientBehaviour: the schedule only takes the capacity away), and
 // ch. 1's geoDNS failover: a dc_down cuts the datacenter off, and only the scenario's own links (a
 // second route the client splits its requests over) send anything elsewhere.
 //

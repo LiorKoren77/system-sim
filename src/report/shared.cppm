@@ -95,6 +95,11 @@ constexpr double rounds_to_one = 0.9995;
 // From here on the largest prefix, G, would need an exponent itself ("1e+04G").
 constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
 
+// 0.99995 of a prefix already prints as "1" at four significant digits, so it is shown with that
+// prefix: 999.99 reads "1k", not "1000" (rounds_to_one's rule for durations, one digit more). A
+// rate summed over steps of 0.1 s lands there: 20 steps of 1000/s average 999.9999999999998/s.
+constexpr double rounds_to_one_at_four_digits = 0.99995;
+
 // A count with an SI prefix and four significant digits: 500, 1.5k, 2M. Past 9999G it is
 // written in plain scientific notation (1e+15), which parse_rate reads back too; G stays
 // the largest prefix, as in the scenario grammar (core's rate_prefixes stop at G).
@@ -102,7 +107,7 @@ constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
   if (!std::isfinite(value)) return "unavailable";
   if (std::abs(value) >= beyond_prefixes) return significant(value);
   for (const auto& prefix : si_prefixes) {
-    if (std::abs(value) >= prefix.size) {
+    if (std::abs(value) >= prefix.size * rounds_to_one_at_four_digits) {
       return significant(value / prefix.size) + std::string{prefix.name};
     }
   }

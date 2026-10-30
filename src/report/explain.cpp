@@ -166,7 +166,16 @@ namespace {
   return join(terms, ", ");
 }
 
-// A client's datacenter, its rate curve and its op mix (fixed shares of the rate).
+// "retries=2 after 100ms": how often a client sends a failed request again and how long it waits
+// first (the loader filled in defaults::retry_after when the scenario gave no wait). Empty without
+// retries, so a client without them keeps the line it had.
+[[nodiscard]] std::string retries_summary(const model::Workload& workload) {
+  if (workload.retries == 0) return {};
+  return "retries=" + std::to_string(workload.retries) + " after " +
+         format_duration(workload.retry_after.value_or(defaults::retry_after));
+}
+
+// A client's datacenter, its rate curve, its op mix (fixed shares of the rate) and its retries.
 [[nodiscard]] std::string client_details(const model::NodeSpec& spec) {
   std::vector<std::string> parts{"dc=" + spec.dc};
   if (!spec.workload) return join(parts, "  ");
@@ -175,6 +184,9 @@ namespace {
     shares.push_back(op + " " + percent(share));
   parts.push_back("rate: " + curve_summary(*spec.workload));
   parts.push_back("ops: " + join(shares, ", "));
+  if (auto retries = retries_summary(*spec.workload); !retries.empty()) {
+    parts.push_back(std::move(retries));
+  }
   return join(parts, "  ");
 }
 

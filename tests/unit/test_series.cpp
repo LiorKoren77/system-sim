@@ -1347,7 +1347,9 @@ TEST_CASE("the tutorial chain's series are byte for byte what they were before l
   REQUIRE(data_rows(nodes_out.str()).size() == 1200 * 3);    // 2 min of 100 ms steps x 3 nodes
   REQUIRE(header_of(nodes_out.str()) == node_header);
   REQUIRE(fnv1a(nodes_out.str()) == 0xd0b4c7d05759bd57ULL);  // re-pinned for queue_lag_s, above
-  REQUIRE(fnv1a(ops_out.str()) == 0xa2e246b7176cc3f3ULL);    // re-pinned for timed_out_per_s
+  // re-pinned for timed_out_per_s, then for attempts_per_s (phase 3 Task 10: the column after
+  // offered_per_s, equal to it on every row, since chain has no retries)
+  REQUIRE(fnv1a(ops_out.str()) == 0x66f6670d063b5f6fULL);
 }
 
 // ---- explain on youtube: a pool's capacity is workers / cost ----
