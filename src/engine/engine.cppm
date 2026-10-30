@@ -22,7 +22,8 @@
 // changes a node's numbers for the steps it covers: forward_pass asks the schedule for the node's
 // Condition and the node steps under it (serve, ClientBehaviour::set_rate_factor); a flushed
 // cache's warm-up reaches the behaviours that route its misses (warm_flushed_caches) and counts
-// the reads the cache is sent each step (count_flushed_reads), and a
+// the reads the cache is sent each step (count_flushed_reads), a node_down of a ws_gateway drops
+// its connections and storms them back once it clears (follow_gateway_outages), and a
 // dc_down's cut links drop what crosses them (send). A scenario with faults also steps a TWIN, the
 // same scenario with its faults stripped, beside the run: every step of both goes to the fault log
 // (FaultLog), which keeps what each fault cost against the twin for the report's block per fault
@@ -311,6 +312,11 @@ class Simulation {
     // its DEAD replicas (behaviours::Outgoing::doomed), not in `inflow`: they are never served,
     // only booked as demand and drops (book_failover). Empty on every other node.
     std::optional<flow::Flow> doomed_inflow{};
+    // A ws_gateway during a node_down: the requests per op that arrived this step over the
+    // connections the fault dropped (behaviours::WsGatewayBehaviour::lost_share), taken out of
+    // `inflow` before the queue (cut_off_dropped_connections) and, like the doomed inflow, only
+    // booked as demand and drops (book_cut_off). Empty on every other node and step.
+    flow::Flow cut_off{};
     // What the node's queues dropped this step, per op, in requests: the clients' part only (a
     // replica's replayed writes answer no client). Filled by serve, read by account_rejections.
     flow::Flow dropped{};
@@ -426,6 +432,7 @@ class Simulation {
   void warm_flushed_caches(SimTime now);
   void count_flushed_reads(SimTime now, SimTime dt);
   void fail_over_callers(SimTime now);
+  void follow_gateway_outages(SimTime now, SimTime dt);
   static void fail_over(Simulation& simulation, const FailoverRoute& route, double share);
   void set_hit_ratio_factor(std::size_t cache, double factor);
 
@@ -437,7 +444,8 @@ class Simulation {
   void record_queue_lags(std::span<NodeSample> samples) const;
   void record_retry_flows(std::span<NodeSample> samples) const;
   void receive(std::size_t index, Mode mode);
-  static void add_heartbeats(Node& node);
+  static void add_connection_arrivals(Node& node);
+  static void cut_off_dropped_connections(Node& node);
   static void record_level(const auto& behaviour, NodeSample& sample);
   void keep_retries_in_their_group(std::size_t queue, behaviours::Routed& routed) const;
   [[nodiscard]] flow::Flow republished_by_others(std::size_t queue, std::size_t group) const;
@@ -490,6 +498,7 @@ class Simulation {
                                 std::span<LinkSample> link_samples);
   void account_rejections(std::size_t index, const behaviours::Routed& routed, NodeSample& sample);
   void book_failover(std::size_t index, NodeSample& sample) const;
+  void book_cut_off(std::size_t index, NodeSample& sample) const;
   void backward_pass();
   [[nodiscard]] std::vector<ResponseSample> client_responses(SimTime now) const;
   // Applies a client's `timeout` to one of its samples (see the definition).
@@ -1662,6 +1671,7 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
                     .links = std::vector<LinkSample>(pipe_count_)};
   warm_flushed_caches(now);
   fail_over_callers(now);
+  if (mode == Mode::advance) follow_gateway_outages(now, dt);
   forward_pass(now, dt, mode, record);
   if (mode == Mode::advance) count_flushed_reads(now, dt);
   record_queue_lags(record.nodes);
@@ -1672,6 +1682,19 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
   feed_back_retries(record.responses, mode);
   feed_back_pool_retries(record.nodes, mode);
   return record;
+}
+
+// Every ws_gateway hears, before any node receives this step, the share of its replicas the
+// node_downs active at `now` take (FaultSchedule::down_share): a rise drops that share of its
+// connections, a fall starts their reconnect storm (behaviours::WsGatewayBehaviour::follow_outage).
+// Advance mode only: a storm is a moment of the run, and estimate's copy has no faults. Every
+// share is 0 without a node_down of a gateway, and then nothing moves.
+void Simulation::follow_gateway_outages(SimTime now, SimTime dt) {
+  for (std::size_t index = 0; index < nodes_.size(); ++index) {
+    if (auto* gateway = std::get_if<behaviours::WsGatewayBehaviour>(&nodes_[index].behaviour)) {
+      gateway->follow_outage(faults_.down_share(index, now), now, dt);
+    }
+  }
 }
 
 // Each failover route's dead share at `now` (FaultSchedule::dead_share: r / R inside the window of
@@ -1875,6 +1898,7 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
     account_rejections(index, routed, samples[index]);
     book_failover(index, samples[index]);
     count_deduplicated(index, routed, samples[index]);
+    book_cut_off(index, samples[index]);
     note_pool_jobs(index, routed);
     send(index, routed, now, dt, mode, record.links);
   }
@@ -1921,18 +1945,44 @@ void Simulation::account_rejections(std::size_t index, const behaviours::Routed&
   node.passed_writes = kept_share(lost_writes, arrived_writes);
 }
 
-// A ws_gateway's heartbeats (behaviours::WsGatewayBehaviour): its open connections ping C /
-// heartbeat times a second, C the level this step starts with, and those pings arrive at the
-// gateway like any request of its `heartbeat` op, added to what the clients send under that name.
-// So they load its queue (its demand and rho count them) and go on along its `heartbeat` steps
-// (to a presence service) as the clients' do. Nothing on any other node, and nothing on a
-// gateway that states no heartbeat.
-void Simulation::add_heartbeats(Node& node) {
+// What a ws_gateway's connections bring it beside the clients' requests
+// (behaviours::WsGatewayBehaviour):
+//  - heartbeats: its open connections ping C / heartbeat times a second, C the level this step
+//    starts with, and those pings arrive like any request of its `heartbeat` op, added to what the
+//    clients send under that name. So they load its queue (its demand and rho count them) and go
+//    on along its `heartbeat` steps (to a presence service) as the clients' do;
+//  - the reconnect storm: after a node_down, the dropped users' connects, D / reconnect_within a
+//    second, arrive as its `connect` op beside the clients' own, and raise the level as theirs do.
+// Nothing on any other node; nothing is added at 0 (no heartbeat stated, no storm), so a run
+// without them has the arrivals it had before.
+void Simulation::add_connection_arrivals(Node& node) {
   const auto* gateway = std::get_if<behaviours::WsGatewayBehaviour>(&node.behaviour);
   if (gateway == nullptr) return;
   if (const double beats = gateway->heartbeats_per_s(); beats > 0.0) {
     node.inflow.add(model::heartbeat_op, Rate{beats});
   }
+  if (const double storm = gateway->storm_connects_per_s(); storm > 0.0) {
+    node.inflow.add(model::connect_op, Rate{storm});
+  }
+}
+
+// A ws_gateway during a node_down loses the requests that arrive over the connections the fault
+// dropped (behaviours::WsGatewayBehaviour::lost_share: r / R of every op but connect and
+// heartbeat, and all of them when every replica is down): they are taken out of the inflow before
+// the queue into `cut_off`, so the survivors serve only the rest (and a dead gateway's room holds
+// nothing to serve when it is back), and are booked as demand and drops (book_cut_off). Nothing
+// outside a node_down of a gateway (the share is 0).
+void Simulation::cut_off_dropped_connections(Node& node) {
+  node.cut_off.clear();
+  const auto* gateway = std::get_if<behaviours::WsGatewayBehaviour>(&node.behaviour);
+  if (gateway == nullptr) return;
+  flow::Flow kept;
+  for (const auto& [op, rate] : node.inflow.entries()) {
+    const double lost = rate.per_second * gateway->lost_share(op);
+    if (lost > 0.0) node.cut_off.add(op, Rate{lost});
+    kept.add(op, Rate{rate.per_second - lost});
+  }
+  if (node.cut_off.total().per_second > 0.0) node.inflow = std::move(kept);
 }
 
 // A ws_gateway's level at the start of the step (NodeSample::connections), read after serve reset
@@ -1940,7 +1990,13 @@ void Simulation::add_heartbeats(Node& node) {
 // condition (see megabyte_service_of): only a gateway has a level, and every other node's
 // `connections` stays empty.
 void Simulation::record_level(const auto& behaviour, NodeSample& sample) {
-  if constexpr (requires { behaviour.connections(); }) sample.connections = behaviour.connections();
+  if constexpr (requires { behaviour.connections(); }) {
+    sample.connections = behaviour.connections();
+    // What a node_down dropped as this step began (the reconnect storm's size), only then.
+    if (const double dropped = behaviour.dropped_connections(); dropped > 0.0) {
+      sample.connections_dropped = dropped;
+    }
+  }
 }
 
 // The requests sent to the node's dead replicas this step (Node::doomed_inflow; FaultSchedule's
@@ -1956,6 +2012,19 @@ void Simulation::book_failover(std::size_t index, NodeSample& sample) const {
   sample.demand_per_s += units;
   sample.dropped_per_s += units;
   sample.failover_lost_per_s = node.doomed_inflow->total().per_second;
+}
+
+// The requests a ws_gateway lost over the connections a node_down dropped (Node::cut_off,
+// cut_off_dropped_connections) in its books, as book_failover books a failover's: they arrived, so
+// they are demand, and they were lost at the node, so they are drops (the drop rate and the fault
+// block's `lost` count them), but they never entered its queue, so they are not drain, backlog or
+// load. In capacity units, as the rest of the sample.
+void Simulation::book_cut_off(std::size_t index, NodeSample& sample) const {
+  const auto& node = nodes_[index];
+  if (node.cut_off.total().per_second <= 0.0) return;
+  const double units = in_units(node.cut_off, node.behaviour).total().per_second;
+  sample.demand_per_s += units;
+  sample.dropped_per_s += units;
 }
 
 // In settle mode the links have no delay: in the long run a link delivers exactly what
@@ -1981,7 +2050,8 @@ void Simulation::receive(std::size_t index, Mode mode) {
     }
     node.inflow += arrived;
   }
-  add_heartbeats(node);
+  add_connection_arrivals(node);
+  cut_off_dropped_connections(node);
   node.republished_per_s = 0.0;
   for (const std::size_t pool : node.consumer_groups) {
     const auto& group = std::get<behaviours::WorkerPoolBehaviour>(nodes_[pool].behaviour);

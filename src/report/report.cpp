@@ -1059,8 +1059,24 @@ constexpr std::string_view op_title =
          amount_text(without_residue(*after.failover_lost), unit) + " sent to " + std::string{dead};
 }
 
-// The follow-on, then what the failover sent to dead replicas, then what the retries added, each
-// when there was some (ch. 1's retry storm, ch. 12's registry that learns of a death late):
+// A node_down of a ws_gateway's reconnect storm (engine::FaultRecord's header): the connections it
+// dropped, how long they take to come back, and the gateway's peak offered utilisation from the
+// fault's end with when it was first reached, `reconnect storm 99.33k connections over 30s, gw peak
+// 71.9% at 01:24:49` (the amount as the block's counts, the percent as the node table's, the time
+// as the block's clock). Without a step after the fault (the run ended first) the peak is left out.
+[[nodiscard]] std::string storm_text(const engine::FaultRecord& r) {
+  const auto& after = r.after;
+  std::string text = "reconnect storm " +
+                     amount_text(*after.reconnect_storm_connections, "connections") + " over " +
+                     format_duration(seconds(after.reconnect_storm_over));
+  if (!after.peak_rho || !after.peak_rho_at) return text;
+  return text + ", " + r.node + " peak " + percent(*after.peak_rho) + " at " +
+         fault_clock(*after.peak_rho_at);
+}
+
+// The follow-on, then what the failover sent to dead replicas, then what the retries added, then a
+// gateway's reconnect storm, each when there was some (ch. 1's retry storm, ch. 12's registry that
+// learns of a death late and its chat servers' users who all come back at once):
 // `backlog drained in 0.1s, retries added 5.968k attempts, pool w re-published 999 jobs`.
 [[nodiscard]] std::string after_text(const engine::FaultRecord& r) {
   std::vector<std::string> parts{follow_on_text(r)};
@@ -1076,6 +1092,7 @@ constexpr std::string_view op_title =
     parts.push_back((several ? "pools " : "pool ") + after.republishing_pools + " re-published " +
                     amount_text(after.pool_republished_jobs, "jobs"));
   }
+  if (after.reconnect_storm_connections) parts.push_back(storm_text(r));
   return join(parts, ", ");
 }
 
@@ -1343,12 +1360,26 @@ constexpr std::string_view op_title =
   });
 }
 
+// A gateway's reconnect storm in a fault's `after` (the text's storm_text, unrounded, in seconds):
+// `reconnect_storm_connections`, `reconnect_storm_over_s`, `peak_rho` (the offered utilisation, a
+// fraction that may pass 1) and `peak_rho_at_s`, the two last null when no step followed the fault.
+void json_storm(const engine::FaultAfter& after, std::vector<std::string>& fields) {
+  fields.push_back(json_field("reconnect_storm_connections",
+                              json_number(without_residue(*after.reconnect_storm_connections))));
+  fields.push_back(
+      json_field("reconnect_storm_over_s", json_number(seconds(after.reconnect_storm_over))));
+  fields.push_back(json_field("peak_rho", json_optional_number(after.peak_rho)));
+  fields.push_back(json_field("peak_rho_at_s", json_optional_number(after.peak_rho_at.transform(
+                                                   [](SimTime t) { return seconds(t); }))));
+}
+
 // A fault's `after` as JSON: each entry null where it does not apply or did not happen. A flush's
 // also has `interrupted_by_flush_at_s` after `cache_warm_in_s` (the next flush of its cache that
 // emptied it first, null when none did); no other kind has that key, so their objects are the
 // ones written before it existed. `failover_lost` (the requests a failover sent to dead replicas,
 // null when none applied) is there only in a scenario with a service discovery (`discovers`), as
 // `datacenter` is only on a dc_down: a report of a scenario without one is what it was before.
+// A node_down of a ws_gateway ends with its reconnect storm (json_storm), on no other fault.
 [[nodiscard]] std::string json_after(const engine::FaultRecord& r, bool discovers) {
   std::vector<std::string> after{
       json_field("backlog_node",
@@ -1368,6 +1399,7 @@ constexpr std::string_view op_title =
     after.push_back(json_field(
         "failover_lost", json_optional_number(r.after.failover_lost.transform(without_residue))));
   }
+  if (r.after.reconnect_storm_connections) json_storm(r.after, after);
   return json_object(after);
 }
 

@@ -1,6 +1,7 @@
 # System Design Interview vol. 1, ch. 12 — Chat system.
 # Book numbers: 50M DAU, 40 messages/user/day → ~23k messages/s average; 1:1 and small
-# group chats (≤100 members); online presence with 5-second heartbeats; push for offline.
+# group chats (≤100 members); online presence with 5-second heartbeats; push for offline;
+# ~1M concurrent users (10 KB a connection: 10 GB on one box). README.md explains the sizing.
 version: 1
 name: chat-system
 seed: 1
@@ -12,9 +13,10 @@ nodes:
   users:
     type: client
     rate:
-      base: 60k/s                              # messages + heartbeats + API calls
+      base: 30k/s                              # messages + connects + API calls (pings: the gateway's level)
       wave: {shape: sine, period: 24h, amplitude: 0.5, peak_at: 21:00}
-    ops: {send: 0.35, heartbeat: 0.55, api: 0.10}
+    # send 21k/s (the book's ~23k/s), api 6k/s, connect 3k/s = 50M DAU x 5.2 sessions/day / 86,400 s
+    ops: {send: 0.70, api: 0.20, connect: 0.10}
     keys: {zipf: 0.8, space: 50M}             # one key per user (50M DAU); kv_cache's hit ratio follows from it
     sizes: {send: 1KB}
     timeout: 2s
@@ -37,10 +39,12 @@ nodes:
   chat_servers:                                # stateful websocket servers
     type: ws_gateway
     replicas: 20
-    max_connections: 100k
-    heartbeat: 5s
-    fanout: 1.4                                # avg recipients per message (1:1 + groups)
-    capacity: 10k/s
+    max_connections: 100k                      # cap 2M: 100k x 10 KB = 1 GB a server
+    heartbeat: 5s                              # the book's presence heartbeat
+    session: 6m                                # chosen: 3k connects/s x 6 min = 1.08M open (the book's 1M)
+    reconnect_within: 30s                      # the default, stated: the README sweeps it 10s..60s
+    fanout: 1.4                                # avg recipients per message: copies into message_q only
+    capacity: 25k/s                            # frames/s per server: the pings of 1.62M connections at 21:00 are 324k/s
     latency: 0.5ms
     ops:
       send:
@@ -60,9 +64,10 @@ nodes:
     consumes: message_q
     workers: 64
     cost: 1ms
+    retries: 3                                 # a failed push goes back on the queue (ch. 10), not dropped
     then:
       - {to: presence, op: read}
-      - {to: chat_servers, op: deliver, factor: 1.4}
+      - {to: chat_servers, op: deliver}
       - {to: push, op: notify, factor: 0.3}    # 30% of recipients offline
 
   message_store:                               # Cassandra-like: write-heavy, time-series keys
@@ -76,21 +81,21 @@ nodes:
 
   presence:
     type: kv_cluster
-    nodes: 4
+    nodes: 10                                  # sized for the gateway's heartbeats: 369k/s x N 2 at 21:00
     replication: 2
     write_quorum: 1
     read_quorum: 1
-    capacity: 50k/s
+    capacity: 100k/s
 
   kv_cache: {type: cache, eviction: lru, keys: 20M, hit_ratio: che, strategy: cache_aside}
   user_db: {type: sql_db, replicas: 3, capacity: 4k/s}
 
-  push: {type: external_sink, latency: 150ms, failure_rate: 0.02}
+  push: {type: external_sink, capacity: 20k/s, latency: 150ms, failure_rate: 0.02}   # APNs/FCM: 30% of 44.1k/s copies
 
 links:
   - {from: users, to: lb, dir: inout}
   - {from: lb, to: api_servers, dir: inout, ops: [api]}
-  - {from: lb, to: chat_servers, dir: inout, ops: [send, heartbeat]}
+  - {from: lb, to: chat_servers, dir: inout, ops: [send, connect]}
   - {from: api_servers, to: kv_cache, dir: inout}
   - {from: api_servers, to: user_db, dir: inout}
   - {from: api_servers, to: discovery, dir: inout}

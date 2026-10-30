@@ -5371,8 +5371,9 @@ TEST_CASE("a gateway's connections must be a positive integer") {
 }
 
 // The loader does not decide whether a connect op REACHES the gateway (that is the graph's fact,
-// and the shipped chat-system states neither level today): a file with a gateway
-// that has no level loads, and Simulation::create is what refuses it.
+// and every shipped gateway states one since phase 3: google-drive's fixed 2M, chat-system's
+// users' `connect`): a file with a gateway that has no level loads, and Simulation::create is
+// what refuses it.
 TEST_CASE("a gateway with neither a connect op nor connections still loads") {
   require_loaded("simsys_gateway_no_level.yaml",
                  gateway_scenario("max_connections: 100k, heartbeat: 5s", "{send: 1}"));
