@@ -471,6 +471,7 @@ sweep over `failover`, identity on nine scenarios).
 9. Minor: README's test count (1163) and a stale sentence about the four refused READMEs.
 Decisions: 1 (one sentence now; Task 15 rewires), 2 (per-step rule in `lookup_before` and the
 schema), 3, 4, 6, 7, 9 fixed in a fix round; 5 documented beside `overlaps_at_s`.
+Fixed at `5838016` (1610 tests).
 
 ### Task 14: `ws_gateway`: connections as a level
 
@@ -530,8 +531,8 @@ until Task 16 gives `long_poll` `connections: 2M`.
 
 **Files:** `src/engine/behaviours.cppm` (`NotificationFanoutBehaviour`: a service (20k/s, 1 ms) whose `then` steps fire per routed notification × `1 − dedup`; `deduplicated_per_s`), `src/engine/graph.cppm` (`channels` ↔ `then` targets that are queues: `node 'fanout': channel 'sms' names sms_q, which no then step publishes to` / `… then step publishes to email_q, which no channel names`), `src/model/model.cppm`, `src/config/nodes.cpp` (`dedup` in [0, 1), `channels` a map of names to declared message queues), `src/engine/engine.cppm` (`NodeSample::deduplicated_per_s`; `make_node`), `src/report/*` (`deduplicated/s`, JSON; explain follows a fanout's `then` and the `load not propagated` mark for it goes), `scenarios/book/notification-system/{scenario.yaml,README.md}` (pool `retries: 3` on the four channel pools, the 09:00 blast ×20 through the queues, `user_db` 173 % and `notification_svc` 140 % sized or explained, dead letters vs drops), `tests/theory/test_queues_pools.cpp`, `test_graph.cpp`, `tests/scenario/test_scenarios.cpp`, `test_series.cpp`, `README.md`.
 
-- [ ] Tests: a fanout at 1k/s with `dedup: 0.02` and `then: [{to: q1, factor: 0.6}, {to: q2, factor: 0.3}]`: `q1` receives **588/s**, `q2` **294/s**, `deduplicated/s` **20**; the channels checks' messages; the explain lines on notification-system no longer carry `load not propagated`; the day test pins the blast's queue lags and that the `drop_rate` SLO passes with retries while the dead-letter rate is *measured*.
-- [ ] Commit `nodes: notification_fanout routes per channel after dedup; notification-system runs end to end`.
+- [x] Tests: a fanout at 1k/s with `dedup: 0.02` and `then: [{to: q1, factor: 0.6}, {to: q2, factor: 0.3}]`: `q1` receives **588/s**, `q2` **294/s**, `deduplicated/s` **20**; the channels checks' messages; the explain lines on notification-system no longer carry `load not propagated`; the day test pins the blast's queue lags and that the `drop_rate` SLO passes with retries while the dead-letter rate is *measured*.
+- [x] Commit `nodes: notification_fanout routes per channel after dedup; notification-system runs end to end` (green `1da0e87`, 1605 tests; notification-system resized: notification_svc 8 replicas, user_db 4, fanout × 2, log_db 3 × 30k/s, pools 260/50/45/60 workers with `retries: 3`, provider quotas 15k/3k/1.2k/2.5k; all three SLOs pass).
 
 ### Task 18: `frontier`; web-crawler runs end to end
 
