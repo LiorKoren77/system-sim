@@ -567,6 +567,7 @@ class Graph {
   Result check_consumer_links(std::size_t queue) const;
   Result connect_consumers();
   Result connect_consumer(std::size_t pool);
+  [[nodiscard]] static double room_of(const model::NodeSpec& source, Rate pool_rate);
   Result resolve_hit_ratios();
   Result resolve_hit_ratio(std::size_t cache, const model::HitRatio& stated,
                            const detail::HitRatioInputs& inputs);
@@ -623,5 +624,31 @@ class Graph {
 // one place the engine (behaviours::ClientBehaviour, which applies it) and the reports (which cap
 // and judge percentiles by it) read it from.
 [[nodiscard]] std::optional<double> client_timeout_s(const model::NodeSpec& client);
+
+// ---- politeness (phase 3 Task 18, spec §8.4; book ch. 9) ----
+
+// The politeness cap of book ch. 9's URL frontier: if a crawl touches `hosts` distinct hosts and
+// each may be fetched at most `per_host` times a second, the crawler is handed at most
+//   cap = hosts x per_host          (URLs/s; 1000 hosts at 1/s: 1000/s, 10M hosts at 1/s: 10M/s)
+// URLs a second. It assumes the URLs are spread EVENLY over the hosts (every host's back queue busy
+// at once: the optimistic case). Empty when either number is missing: a crawl of unknown breadth,
+// or hosts fetched as often as asked, has no cap to apply. The one place the product is taken:
+// the engine's drain bound (drain_cap_of) and explain's lines read it from here.
+[[nodiscard]] std::optional<Rate> politeness_cap(std::optional<int> hosts,
+                                                 std::optional<Rate> per_host);
+
+// The URL frontiers of the scenario, in file order.
+[[nodiscard]] std::vector<std::size_t> frontiers_of(const Graph& g);
+
+// The politeness cap on node `node`'s drain, a bound in front of its queue (fluid::Capacity::
+// drain_cap_per_s, set by engine::Simulation::make_node), if it has one:
+//  - a worker pool that consumes a frontier: that frontier's hosts x its politeness, the most URLs
+//    a second the frontier may hand its downloaders (behaviours::FrontierBehaviour);
+//  - an external sink with `politeness` (the web the crawler calls): the hosts of the scenario's
+//    ONE frontier x the sink's own politeness; empty when the scenario has no frontier or two
+//    (engine::Simulation::create refuses those).
+// Empty for every other node, the frontier itself included (its prioritiser files every URL; the
+// cap is on the hand-off to the pool), and when a number is missing (a frontier without `hosts`).
+[[nodiscard]] std::optional<Rate> drain_cap_of(const Graph& g, std::size_t node);
 
 }  // namespace simsys::graph

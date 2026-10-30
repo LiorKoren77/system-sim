@@ -543,8 +543,8 @@ struct EnumName {
 // C++20 concept: a named compile-time predicate on a type, checked where a template is used.
 // Replaces std::enable_if (SFINAE) and its unreadable errors: a type that does not fit fails at
 // the call, naming the concept. Here: any row with an enumerator `value` and a word `name`, so a
-// table whose rows carry more per enumerator (simsys.model's node types: whether the engine runs
-// the type) is read by the same lookups as a plain EnumName table.
+// table whose rows carry more per enumerator is read by the same lookups as a plain EnumName
+// table (simsys.model's node types once carried whether the engine ran the type).
 template <typename Row>
 concept NameRow = std::is_enum_v<decltype(Row::value)> &&
                   std::convertible_to<decltype(Row::name), std::string_view>;

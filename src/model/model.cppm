@@ -64,50 +64,39 @@ enum class NodeType : std::uint8_t {
   frontier
 };
 
-// One row of the node-type catalogue: the enumerator, the word the schema spells it with, and
-// whether run/estimate can step a node of the type today (`runs`). Every type has a model since
-// phase 3 (the service_discovery got its model in Task 13, the ws_gateway in Task 14, the
-// notification_fanout in Task 17, the frontier in Task 18), so every row says true; the column
-// stays, so a type added later without a model has a place to say so. explain and validate take
-// every type. A row like core::EnumName with one more column, which core's lookups read through
-// their NameRow concept.
-struct NodeTypeRow {
-  NodeType value;
-  std::string_view name;
-  bool runs;
-};
-
 // Pattern: Table-driven method — one constant table drives both directions of the
-// enum <-> string mapping (core::name_in, core::parse_in) and says which types the engine
-// runs (simulated), so adding a node type is one enumerator plus one row here (plus its
-// defaults: -Wswitch in defaults::for_type and engine::Simulation::make_node is what catches a
-// NEW enumerator, since nothing can count the enumerators; the static_assert on the last row at
-// the end of this file catches an enumerator appended without a row).
+// enum <-> string mapping (core::name_in, core::parse_in), so adding a node type is one
+// enumerator plus one row here (plus its defaults and its model: -Wswitch in defaults::for_type and
+// engine::Simulation::make_node is what catches a NEW enumerator, since nothing can count the
+// enumerators; the static_assert on the last row at the end of this file catches an enumerator
+// appended without a row). Every type has a model since phase 3 Task 18, so the table no longer
+// says which ones run (its `runs` column, model::simulated and the engine's refusal of a type
+// without a model went in Task 18's review round).
 // C++20 std::to_array: builds a std::array from a braced list and deduces its size, so
-// the 18 is never written by hand. Replaces `std::array<NodeTypeRow, 18>{...}`,
+// the 18 is never written by hand. Replaces `std::array<core::EnumName<NodeType>, 18>{...}`,
 // whose count must be kept in sync manually (CTAD alone cannot deduce from nested braces).
 // `inline` is not needed for linkage: a const variable in a module interface's purview
 // already has external linkage in C++20 ([basic.link]/3.2), unlike a header constant.
 // It is kept so the declaration reads like the C++17 header-style constants students know.
-inline constexpr auto node_type_table = std::to_array<NodeTypeRow>({
-    {NodeType::client, "client", true},
-    {NodeType::cdn, "cdn", true},
-    {NodeType::load_balancer, "load_balancer", true},
-    {NodeType::rate_limiter, "rate_limiter", true},
-    {NodeType::service, "service", true},
-    {NodeType::cache, "cache", true},
-    {NodeType::sql_db, "sql_db", true},
-    {NodeType::kv_cluster, "kv_cluster", true},
-    {NodeType::message_queue, "message_queue", true},
-    {NodeType::worker_pool, "worker_pool", true},
-    {NodeType::blob_store, "blob_store", true},
-    {NodeType::search_index, "search_index", true},
-    {NodeType::ws_gateway, "ws_gateway", true},
-    {NodeType::service_discovery, "service_discovery", true},
-    {NodeType::id_generator, "id_generator", true},
-    {NodeType::external_sink, "external_sink", true},
-    {NodeType::notification_fanout, "notification_fanout", true},
-    {NodeType::frontier, "frontier", true},
+inline constexpr auto node_type_table = std::to_array<core::EnumName<NodeType>>({
+    {NodeType::client, "client"},
+    {NodeType::cdn, "cdn"},
+    {NodeType::load_balancer, "load_balancer"},
+    {NodeType::rate_limiter, "rate_limiter"},
+    {NodeType::service, "service"},
+    {NodeType::cache, "cache"},
+    {NodeType::sql_db, "sql_db"},
+    {NodeType::kv_cluster, "kv_cluster"},
+    {NodeType::message_queue, "message_queue"},
+    {NodeType::worker_pool, "worker_pool"},
+    {NodeType::blob_store, "blob_store"},
+    {NodeType::search_index, "search_index"},
+    {NodeType::ws_gateway, "ws_gateway"},
+    {NodeType::service_discovery, "service_discovery"},
+    {NodeType::id_generator, "id_generator"},
+    {NodeType::external_sink, "external_sink"},
+    {NodeType::notification_fanout, "notification_fanout"},
+    {NodeType::frontier, "frontier"},
 });
 
 // The names alone, derived from the table at compile time (an immediately invoked
@@ -136,14 +125,6 @@ inline constexpr auto node_type_names = [] {
 // The inverse of to_string; std::nullopt for a name not in the catalogue.
 [[nodiscard]] constexpr std::optional<NodeType> parse_node_type(std::string_view name) {
   return core::parse_in(node_type_table, name);
-}
-
-// Can run/estimate step a node of type `t` today? Its row's `runs` (engine::Simulation::create
-// refuses a scenario with any other type, naming the phase that plans its model). An uncataloged
-// value is a programmer error, as for to_string.
-[[nodiscard]] constexpr bool simulated(NodeType t) {
-  if (!is_cataloged(t)) throw std::invalid_argument{"unknown NodeType"};
-  return node_type_table[std::to_underlying(t)].runs;
 }
 
 enum class StepCondition { always, miss, failure };

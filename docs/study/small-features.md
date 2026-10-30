@@ -122,7 +122,7 @@ up the scoped `enum class` (and its protection against silent conversion to `int
 unscoped `enum`.
 
 **Where.** Always at function scope, so nothing leaks: `defaults::for_type`,
-`engine`'s `simulated`, `fluid::zone_of`, `report`'s `zone_name`, `graph`'s
+`fluid::zone_of`, `report`'s `zone_name`, `graph`'s
 `replica_model_of`, `workload::wave_multiplier`, `RateLimiterBehaviour::admit`, and two tests.
 
 ## `consteval`

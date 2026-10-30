@@ -293,11 +293,12 @@ fourteen scenarios run end to end:
   pool to 260 workers to drain the blast within 5 minutes, the providers' quotas).
 
 - [`book/web-crawler`](scenarios/book/web-crawler/): ch. 9's crawl loop over 6 hours: seeds, the
-  URL frontier (a 5k/s prioritiser, 10M hosts at one request a host a second), 1000 downloaders
+  URL frontier (a 10k/s prioritiser, 10M hosts at one request a host a second), 1000 downloaders
   that retry a failed fetch twice, DNS, the content and URL-seen filters. It fails both SLOs **on
   purpose** (exit 2): each fetched page brings back 0.7 × 50 × 0.1 = 3.5 new URLs, a loop of gain
-  above 1, so the frontier is offered 4.38k URLs/s against the downloaders' 2000, their
-  utilization is 1 and the frontier's lag reaches 7.13 h against 30 minutes.
+  above 1, so the frontier is offered 6.8k URLs/s against the downloaders' 2000, their
+  utilization is 1 and the frontier's lag reaches 14.4 h against 30 minutes; its README sweeps
+  `hosts` (politeness caps the downloaders, the lag hardly moves) and the URL-seen filter.
 
 - [`book/google-drive`](scenarios/book/google-drive/): ch. 15 over 24 hours at 3k/s (peak 4.26k/s
   at 11:00): block servers, cloud and cold blob stores, a sharded metadata database behind a Che

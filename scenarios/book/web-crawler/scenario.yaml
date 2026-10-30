@@ -19,7 +19,8 @@ nodes:
     type: frontier
     politeness: 1/s                           # per host
     hosts: 10M
-    capacity: 5k/s
+    capacity: 10k/s                           # the prioritiser: above the ~6.8k URLs/s the loop
+                                              # brings back, so the frontier files them all
     then: [{to: downloader, op: fetch}]
 
   downloader:
@@ -45,13 +46,15 @@ nodes:
 
   internet:
     type: external_sink
+    capacity: 1M/s                            # the web, not one provider account: the type's
+                                              # default 1k/s is a quota (see the README's exercise)
     latency: 300ms
     failure_rate: 0.05
     politeness: 1/s                           # per host
 
   parser:
     type: service
-    replicas: 20
+    replicas: 25                              # 2.5k pages/s, above the ~1.9k the downloaders fetch
     capacity: 100/s
     latency: 8ms
     ops:
@@ -68,7 +71,7 @@ nodes:
     keys: 1G
     hit_ratio: {fixed: 0.30}
 
-  content_store: {type: blob_store, capacity: 400MB/s}
+  content_store: {type: blob_store, capacity: 1GB/s}  # ~1.33k new pages/s x 500 KB = 665 MB/s
 
   link_extractor:
     type: service

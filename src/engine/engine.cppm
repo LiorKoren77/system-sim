@@ -45,6 +45,7 @@ module;
 #include <cstddef>
 #include <expected>
 #include <functional>
+#include <limits>
 #include <map>
 #include <optional>
 #include <ranges>
@@ -441,6 +442,7 @@ class Simulation {
   // C++20 std::span<T>: a non-owning view of contiguous elements (a whole array or vector, or
   // the front of one), replacing a (pointer, count) pair or a `std::vector&` that would force the
   // caller to own a vector. Here the step's node samples, which this fills in place.
+  void mark_unbounded_backlogs(std::span<NodeSample> samples) const;
   void record_queue_lags(std::span<NodeSample> samples) const;
   void record_retry_flows(std::span<NodeSample> samples) const;
   void receive(std::size_t index, Mode mode);
@@ -651,71 +653,69 @@ namespace {
 
 // ---- politeness (phase 3 Task 18, spec §8.4; book ch. 9) ----
 
-// The URL frontiers of the scenario, in file order.
-[[nodiscard]] std::vector<std::size_t> frontiers_of(const graph::Graph& g) {
-  std::vector<std::size_t> frontiers;
-  for (std::size_t node = 0; node < g.nodes().size(); ++node) {
-    if (g.nodes()[node].spec.type == model::NodeType::frontier) frontiers.push_back(node);
+// The names `ids` as a message lists them: 'a', 'a' and 'b', 'a', 'b' and 'c'.
+[[nodiscard]] std::string quoted_list(const std::vector<std::string>& ids) {
+  std::string text;
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    if (i > 0) text += i + 1 == ids.size() ? " and " : ", ";
+    text += "'" + ids[i] + "'";
   }
-  return frontiers;
+  return text;
+}
+
+// Why a frontier cannot run, if one cannot: it is consumed by more than one worker pool. A
+// frontier hands every URL to each of its `then` steps (behaviours::FrontierBehaviour), so two
+// pools would each fetch every URL, and each would be granted the whole politeness budget
+// (graph::drain_cap_of): twice the fetches per host the cap allows. A crawl has one bank of
+// downloaders; more workers are one pool's `workers`.
+[[nodiscard]] std::optional<std::string> frontier_not_runnable(const graph::Graph& g) {
+  for (const std::size_t frontier : graph::frontiers_of(g)) {
+    const auto& id = g.nodes()[frontier].spec.id;
+    std::vector<std::string> pools;
+    for (const auto& node : g.nodes()) {
+      if (node.spec.type == model::NodeType::worker_pool && node.spec.consumes == id) {
+        pools.push_back(node.spec.id);
+      }
+    }
+    if (pools.size() <= 1) continue;
+    return "node '" + id + "': a frontier hands its URLs to one consumer pool (" +
+           quoted_list(pools) + " consume it)";
+  }
+  return std::nullopt;
 }
 
 // Why an external sink's `politeness` cannot run, if one cannot: its cap is hosts x politeness
-// (behaviours::politeness_cap), the hosts those of THE frontier of the scenario, the web the
-// crawler holds URLs of. With no frontier there are no hosts to count, and with two there are two
-// host counts and nothing says which one the sink's callers fetch from.
+// (graph::drain_cap_of), the hosts those of THE frontier of the scenario, the web the crawler holds
+// URLs of. With no frontier there are no hosts to count, with two there are two host counts and
+// nothing says which one the sink's callers fetch from, and a frontier that states no `hosts` has
+// none to multiply: the sink would silently cap nothing.
 [[nodiscard]] std::optional<std::string> politeness_not_runnable(const graph::Graph& g) {
-  const std::size_t frontiers = frontiers_of(g).size();
-  if (frontiers == 1) return std::nullopt;
+  const auto frontiers = graph::frontiers_of(g);
   for (const auto& node : g.nodes()) {
     if (node.spec.type != model::NodeType::external_sink || !node.spec.politeness) continue;
-    return "node '" + node.spec.id +
-           "': politeness needs exactly one frontier in the scenario (found " +
-           std::to_string(frontiers) + ")";
+    const std::string name = "node '" + node.spec.id + "': politeness needs ";
+    if (frontiers.size() != 1) {
+      return name + "exactly one frontier in the scenario (found " +
+             std::to_string(frontiers.size()) + ")";
+    }
+    const auto& frontier = g.nodes()[frontiers.front()].spec;
+    if (!frontier.hosts) return name + "the frontier's hosts ('" + frontier.id + "' states none)";
   }
   return std::nullopt;
 }
 
-// The cap politeness puts on node `index`'s drain, if any (behaviours::politeness_cap):
-//  - a worker pool that consumes a frontier: that frontier's hosts x its politeness, the most URLs
-//    a second the frontier may hand it (behaviours::FrontierBehaviour);
-//  - an external sink with politeness: the hosts of the scenario's one frontier (create refused
-//    any other count, politeness_not_runnable) x the sink's own politeness.
-// Empty for every other node, and when a number is missing (a frontier without `hosts`).
-[[nodiscard]] std::optional<Rate> politeness_cap_of(const graph::Graph& g, std::size_t index) {
-  const auto& spec = g.nodes()[index].spec;
-  if (spec.type == model::NodeType::worker_pool && spec.consumes) {
-    const auto& queue = g.nodes()[*g.index_of(*spec.consumes)].spec;
-    if (queue.type != model::NodeType::frontier) return std::nullopt;
-    return behaviours::politeness_cap(queue.hosts, queue.politeness);
-  }
-  if (spec.type == model::NodeType::external_sink && spec.politeness) {
-    const auto frontiers = frontiers_of(g);
-    if (frontiers.size() != 1) return std::nullopt;  // refused by create before any node is made
-    return behaviours::politeness_cap(g.nodes()[frontiers.front()].spec.hosts, spec.politeness);
-  }
-  return std::nullopt;
-}
-
-// Node `index` as the engine queues it: the graph's resolved node, its capacity lowered to the
-// politeness cap when one binds. The cap is on the WHOLE node, so every copy is scaled alike by
-//   f     = cap / (rate x copies)    the share of the node's capacity the cap leaves (< 1)
-//   rate' = rate x f                 each copy drains its share of the cap
-//   c'    = ceil(c x f), at least 1  Little's law: the servers busy at once are drain x service
-//                                    time, so 2000 workers at 500 ms under a cap of 1000/s keep
-//                                    only 500 busy (the others wait for a polite slot)
-// keeping the service time, and so fluid::Capacity's invariant rate = c / service time. The room is
-// left as the graph resolved it (a pool's: retention x its OWN capacity, the 7 days of draining of
-// a frontier's pool). A cap at or above the capacity changes nothing: the copy is the graph's.
+// Node `index` as the engine queues it: the graph's resolved node, with the politeness cap
+// (graph::drain_cap_of) as a bound IN FRONT of its queue, a token bucket handing it at most
+//   cap = hosts x politeness      URLs a second (fluid::Capacity::drain_cap_per_s)
+// The node keeps its own rate and servers, so a pool of 2000 workers at 500 ms under a cap of
+// 1000/s drains 1000/s with rho = 1000 x 0.5 / 2000 = 0.25 (Little's law: 500 workers busy), and
+// the backlog the cap holds back waits in its room. The cap is the WHOLE node's, so each of its
+// replicas is handed its share, cap / replicas (the demand is split the same way). Every other
+// node is the graph's as it is.
 [[nodiscard]] graph::ResolvedNode politely_capped(const graph::Graph& g, std::size_t index) {
   graph::ResolvedNode node = g.nodes()[index];
-  const auto cap = politeness_cap_of(g, index);
-  const double total = node.capacity.service_rate.per_second * node.spec.replicas;
-  if (!cap || !(cap->per_second < total)) return node;
-  const double f = cap->per_second / total;
-  node.capacity.service_rate = Rate{node.capacity.service_rate.per_second * f};
-  node.capacity.concurrency =
-      std::max(1, static_cast<int>(std::ceil(static_cast<double>(node.capacity.concurrency) * f)));
+  const auto cap = graph::drain_cap_of(g, index);
+  if (cap) node.capacity.drain_cap_per_s = cap->per_second / node.spec.replicas;
   return node;
 }
 
@@ -1031,33 +1031,28 @@ flow::Flow DelayLine::pop() {
 
 // ---- Simulation: construction ----
 
-// Two passes over the nodes, in file order: first every node's TYPE, then what a node of a
-// simulated type still lacks (not_runnable_yet: a cache without a hit ratio, a che CDN without a
-// `keys` size; gateway_not_runnable: a ws_gateway with no level or two). So a type the engine has
-// no model for is named before a node that only lacks a number. Since phase 3 Task 18 every row of
-// model::node_type_table says `runs` (model::simulated), so the type check refuses nothing a
-// scenario can name today; it stays for a type added later without a model, whose message names
-// the phase that plans it. Then the scenario as a whole: an external sink's politeness without
-// exactly one frontier (politeness_not_runnable), and a fault the engine cannot model
-// (fault_not_runnable).
+// Every node type has a model since phase 3 Task 18, so what create refuses is a scenario that
+// lacks a number or states two that contradict each other. First each node, in file order
+// (not_runnable_yet: a cache without a hit ratio, a che CDN without a `keys` size;
+// gateway_not_runnable: a ws_gateway with no level or two). Then the scenario as a whole: a
+// frontier with two consumer pools (frontier_not_runnable), an external sink's politeness without
+// exactly one frontier, or over one without `hosts` (politeness_not_runnable), and a fault the
+// engine cannot model (fault_not_runnable).
 std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Graph& g) {
   return create(g, g.scenario().seed);
 }
 
 std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Graph& g, int seed) {
-  for (const auto& node : g.nodes()) {
-    if (model::simulated(node.spec.type)) continue;
-    // C++23 std::unexpected<E>: wraps an error so it converts to the error side of a
-    // std::expected (a bare EngineError would be taken as a value, and fail to convert).
-    // Replaces throwing or returning a sentinel; the caller must look at the result.
-    return std::unexpected{graph::EngineError{
-        "node '" + node.spec.id + "' has type '" + std::string{model::to_string(node.spec.type)} +
-        "', which run/estimate do not support yet (phase 3)"}};
-  }
   for (std::size_t node = 0; node < g.nodes().size(); ++node) {
     auto refused = not_runnable_yet(g.nodes()[node].spec);
     if (!refused) refused = gateway_not_runnable(g, node);
+    // C++23 std::unexpected<E>: wraps an error so it converts to the error side of a
+    // std::expected (a bare EngineError would be taken as a value, and fail to convert).
+    // Replaces throwing or returning a sentinel; the caller must look at the result.
     if (refused) return std::unexpected{graph::EngineError{std::move(*refused)}};
+  }
+  if (auto refused = frontier_not_runnable(g)) {
+    return std::unexpected{graph::EngineError{std::move(*refused)}};
   }
   if (auto refused = politeness_not_runnable(g)) {
     return std::unexpected{graph::EngineError{std::move(*refused)}};
@@ -1178,13 +1173,15 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index,
       return make_server(behaviours::MessageQueueBehaviour{g, index}, resolved);
     // A worker pool's queue is one M/M/c of `workers` servers at `cost` a job, its room the
     // retention of the queue it reads (graph::Graph::connect_consumer): a backlog of unread
-    // messages, and what overflows it deleted unconsumed.
-    // A pool that consumes a URL frontier drains at most hosts x politeness (politely_capped).
+    // messages, and what overflows it deleted unconsumed (behind a frontier, no end: room_of).
+    // A pool that consumes a URL frontier is handed at most hosts x politeness, a bound in front
+    // of its queue (politely_capped).
     case model::NodeType::worker_pool:
       return make_server(behaviours::WorkerPoolBehaviour{g, index}, politely_capped(g, index));
     // An external sink's queue is the provider answering (the type's 1k/s at 100 ms, service SCV
-    // 2.0); serve fails `failure_rate` of what it served (fail_share). With `politeness` it drains
-    // at most the frontier's hosts x that politeness (politely_capped).
+    // 2.0); serve fails `failure_rate` of what it served (fail_share). With `politeness` it is
+    // handed at most the frontier's hosts x that politeness, a bound in front of its queue
+    // (politely_capped).
     case model::NodeType::external_sink:
       return make_server(behaviours::ExternalSinkBehaviour{g, index}, politely_capped(g, index));
     // A URL frontier's queue is its prioritiser (`capacity`, or the type's 10k/s at 1 ms); what its
@@ -1674,6 +1671,7 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
   if (mode == Mode::advance) follow_gateway_outages(now, dt);
   forward_pass(now, dt, mode, record);
   if (mode == Mode::advance) count_flushed_reads(now, dt);
+  if (mode == Mode::settle) mark_unbounded_backlogs(record.nodes);
   record_queue_lags(record.nodes);
   record_retry_flows(record.nodes);
   backward_pass();
@@ -1807,10 +1805,31 @@ void Simulation::connect_retrying_callers(const graph::Graph& g) {
   }
 }
 
+// In a settle pass (`estimate`), each node whose queue has a room without end (a URL frontier's
+// pool: graph::Graph::room_of) and is offered more than it drains has no long-run backlog, only one
+// that grows for ever: FluidQueue::settle leaves it empty so that the step's numbers stay finite,
+// and here its sample's backlog becomes +infinity, and with it the lag of the queue it reads
+// (record_queue_lags). The report prints both "unbounded". In a settle pass nothing waits, so the
+// drain is min(demand, the drain limit) and equals the demand exactly when it is not above the
+// limit: the strict > marks only a queue that falls behind. A run never comes here: its backlog is
+// the one it has reached.
+void Simulation::mark_unbounded_backlogs(std::span<NodeSample> samples) const {
+  constexpr double unbounded = std::numeric_limits<double>::infinity();
+  for (std::size_t index = 0; index < nodes_.size(); ++index) {
+    bool endless_room = false;
+    for (const auto& group : nodes_[index].copy_groups) {
+      if (!(group.queue.capacity().queue_limit < unbounded)) endless_room = true;
+    }
+    auto& sample = samples[index];
+    if (endless_room && sample.demand_per_s > sample.drain_per_s) sample.backlog = unbounded;
+  }
+}
+
 // Each message queue's and URL frontier's lag (NodeSample::queue_lag_s has the formula): the
-// largest of its consumer groups' waits this step (a frontier's pool's at its politeness cap).
-// After the forward pass, since a queue comes before its pools in the order and their waits are
-// this step's only once they have served.
+// largest of its consumer groups' waits this step (a frontier's pool's behind its politeness cap),
+// or +infinity for a group whose backlog grows for ever (mark_unbounded_backlogs). After the
+// forward pass, since a queue comes before its pools in the order and their waits are this step's
+// only once they have served.
 void Simulation::record_queue_lags(std::span<NodeSample> samples) const {
   for (std::size_t queue = 0; queue < nodes_.size(); ++queue) {
     const auto& groups = nodes_[queue].consumer_groups;
@@ -1819,7 +1838,9 @@ void Simulation::record_queue_lags(std::span<NodeSample> samples) const {
     // flow::nan_propagating_max, not std::max: a NaN wait met at any group stays in the fold
     // (std::max would let the next finite wait replace it).
     for (const std::size_t pool : groups) {
-      lag = flow::nan_propagating_max(nodes_[pool].wait.mean_s, lag);
+      const double backlog = samples[pool].backlog;
+      const double wait = std::isinf(backlog) ? backlog : nodes_[pool].wait.mean_s;
+      lag = flow::nan_propagating_max(wait, lag);
     }
     samples[queue].queue_lag_s = lag;
   }

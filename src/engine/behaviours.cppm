@@ -2078,9 +2078,10 @@ class WorkerPoolBehaviour {
 // rejected. A client's `retries` send a failed request again (ClientBehaviour), and so do a worker
 // pool's (WorkerPoolBehaviour: the job goes back on the pool's queue), which this queue sees as
 // more demand. A sink's `politeness` (the web a crawler calls, ch. 9) caps its drain at hosts x
-// politeness, the hosts of the scenario's one frontier (politeness_cap, applied to its queue by
-// the engine): what the cap leaves over waits in the sink's room and is shed once it is full, and
-// the callers are not slowed by it (a worker is busy for `cost` only). Ignored: the provider's
+// politeness, the hosts of the scenario's one frontier (graph::drain_cap_of, a bound the engine
+// puts in front of its queue: the provider keeps its own rate, so its rho is the drain over that
+// rate): what the cap leaves over waits in the sink's room and is shed once it is full, and the
+// callers are not slowed by it (a worker is busy for `cost` only). Ignored: the provider's
 // latency rising with our load (its queue is our account's quota, not its fleet), and failures
 // that cost a different time than a success.
 class ExternalSinkBehaviour {
@@ -2217,26 +2218,35 @@ class NotificationFanoutBehaviour {
 //    consumer pool (the downloaders: a worker pool that `consumes` the frontier), and what the
 //    pool has not read waits in the POOL's queue, as a message queue's backlog does
 //    (MessageQueueBehaviour). Nothing is deleted unconsumed by the frontier: it has no retention,
-//    so the pool's room is defaults::default_retention's 7 days of its draining
-//    (graph::Graph::connect_consumer), a room no crawl of hours fills. Its lag is that pool's wait
-//    (engine::NodeSample::queue_lag_s): backlog / drain once a backlog builds;
+//    so the pool's room has no end (graph::Graph::room_of): a URL waits until a downloader takes
+//    it, `run` drops none however long the backlog, and `estimate` reports a backlog that grows
+//    for ever as an unbounded lag. Its lag is that pool's wait (engine::NodeSample::queue_lag_s):
+//    backlog / drain once a backlog builds;
 //  - politeness as a RATE CAP: if the crawl touches `hosts` distinct hosts and each may be fetched
 //    `politeness` times a second, the pool can be handed at most
-//      cap   = hosts x politeness                 (URLs/s; politeness_cap below)
+//      cap   = hosts x politeness                 (URLs/s; graph::politeness_cap)
 //      drain = min(pool capacity, cap)            (pool capacity = workers / cost, Little's law)
+//      rho   = drain x cost / workers             (the pool's workers busy, Little's law again)
 //    URLs a second, however many URLs wait and however many workers are free: 1000 hosts at 1/s
-//    drain 1000 URLs/s through 2000 workers at 500 ms (whose own 4000/s never binds), 10M hosts
-//    leave the pool's 4000/s binding. The engine applies the cap to the pool's queue
-//    (engine::Simulation::make_node). It assumes the URLs are spread EVENLY over the hosts: the
-//    cap is the crawl's whole politeness budget, every host's back queue busy at once.
+//    drain 1000 URLs/s through 2000 workers at 500 ms (whose own 4000/s never binds), and keep 500
+//    of them busy (rho 0.25); 10M hosts leave the pool's 4000/s binding (rho 1). The cap is a
+//    token bucket IN FRONT of the pool, refilled at the cap: the engine sets it as the pool
+//    queue's drain bound (fluid::Capacity::drain_cap_per_s, engine::Simulation::make_node), and
+//    the pool keeps its real rate and its `workers` servers, so more workers lower its rho and
+//    drain nothing more. It assumes the URLs are spread EVENLY over the hosts: the cap is the
+//    crawl's whole politeness budget, every host's back queue busy at once. One pool per frontier
+//    (engine::Simulation::create refuses a second: each would be handed every URL and the whole
+//    budget).
 // The hand-off is asynchronous like a message queue's: whoever sent the frontier a URL (a seed
 // injector, url_seen) is answered when the prioritiser has filed it, and waits for no download, so
 // the response is the prioritiser's own sojourn and the delivered share its own. Ignored: the
 // priority ORDER itself (a fluid has no individual URLs, so which URL goes first changes no rate),
 // a skewed spread of URLs over hosts (a few big sites hold most of a real crawl's URLs, and their
 // back queues, not the average, set the pace: the even spread is the optimistic case), robots.txt
-// and the per-host pause beyond its rate, DNS-based host grouping, and the frontier's disk (the
-// book keeps most of it on disk with in-memory buffers: here it never fills).
+// and the per-host pause beyond its rate, DNS-based host grouping, the frontier's disk (the book
+// keeps most of it on disk with in-memory buffers: here it never fills), and FRESHNESS (ch. 9's
+// re-crawl of pages that change: a crawl here fetches each URL it is handed once, and no page
+// comes back to the frontier because it aged).
 class FrontierBehaviour {
  public:
   FrontierBehaviour(const graph::Graph& g, std::size_t self);
@@ -2278,16 +2288,6 @@ class FrontierBehaviour {
   };
   std::vector<HandOff> hand_offs_;
 };
-
-// The politeness cap of spec §8.4: `hosts` hosts each fetched at most `per_host` times a second
-// hand out at most
-//   cap = hosts x per_host          (URLs/s; 1000 hosts at 1/s: 1000/s, 10M hosts at 1/s: 10M/s)
-// Empty when either number is missing: a crawl of unknown breadth, or hosts fetched as often as
-// asked, has no cap to apply. The frontier's own `politeness` caps its consumer pool's drain; an
-// external sink's `politeness` caps the sink's drain over the hosts of the scenario's one frontier
-// (the web the crawler calls: engine::Simulation::make_node applies both).
-[[nodiscard]] std::optional<Rate> politeness_cap(std::optional<int> hosts,
-                                                 std::optional<Rate> per_host);
 
 // One kind of machine of a kv_cluster this step, as the engine served it (engine::Simulation::serve
 // hands one per copy group): the sojourn ONE replica-request sees on one such machine, the share of
@@ -3677,11 +3677,6 @@ Routed FrontierBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /
   }
   detail::sort_by_destination(routed.outgoing);
   return routed;
-}
-
-std::optional<Rate> politeness_cap(std::optional<int> hosts, std::optional<Rate> per_host) {
-  if (!hosts || !per_host) return std::nullopt;
-  return Rate{static_cast<double>(*hosts) * per_host->per_second};
 }
 
 // ---- KvClusterBehaviour ----

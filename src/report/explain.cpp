@@ -574,8 +574,12 @@ struct QueueProvenance {
   if (is_leaky_bucket(node.spec)) return {"(limit)", "(limit)", "(leak slot)", "(burst)"};
   // A worker pool's four numbers all follow from `workers`, `cost` and its queue's retention
   // (defaults::worker_pool_rate, graph::Graph::connect_consumer).
+  // Behind a URL frontier the room has no end (graph::Graph::room_of): "queue_limit=unbounded (a
+  // frontier deletes nothing)".
   if (defaults::worker_pool_rate(node.spec)) {
-    return {"(workers / cost)", "(cost)", "(workers)", "(retention × capacity)"};
+    const bool endless = std::isinf(node.capacity.queue_limit);
+    return {"(workers / cost)", "(cost)", "(workers)",
+            endless ? "(a frontier deletes nothing)" : "(retention × capacity)"};
   }
   if (graph::pool_binds(node)) return pool_provenance(node);
   const auto& spec = node.spec;
@@ -754,41 +758,40 @@ struct QueueProvenance {
   return "  failover=" + format_duration(*spec.failover);
 }
 
-// The cap politeness puts on a drain (spec §8.4, behaviours::politeness_cap): " (drain cap
-// 10M/s: 10M hosts x 1/s)", or why there is none: a frontier that states no `hosts` caps nothing.
-[[nodiscard]] std::string politeness_cap_note(std::optional<int> hosts, Rate per_host) {
-  if (!hosts) return " (no cap: no hosts)";
-  const double hosts_count = static_cast<double>(*hosts);
-  return " (drain cap " + fmt_rate(hosts_count * per_host.per_second) + ": " +
-         fmt_count(hosts_count) + " hosts x " + fmt_rate(per_host.per_second) + ")";
+// "1k hosts x 1/s": the two numbers a politeness cap is the product of (graph::politeness_cap, the
+// one place the product is taken).
+[[nodiscard]] std::string cap_factors(int hosts, Rate per_host) {
+  return fmt_count(static_cast<double>(hosts)) + " hosts x " + fmt_rate(per_host.per_second);
 }
 
-// The URL frontiers of the scenario, in file order.
-[[nodiscard]] std::vector<std::size_t> frontiers_in(const graph::Graph& g) {
-  std::vector<std::size_t> frontiers;
-  for (std::size_t node = 0; node < g.nodes().size(); ++node) {
-    if (g.nodes()[node].spec.type == model::NodeType::frontier) frontiers.push_back(node);
-  }
-  return frontiers;
+// The cap politeness puts on a drain (spec §8.4): " (drain cap 10M/s: 10M hosts x 1/s)", or why
+// there is none: a frontier that states no `hosts` caps nothing.
+[[nodiscard]] std::string politeness_cap_note(std::optional<int> hosts, Rate per_host) {
+  const auto cap = graph::politeness_cap(hosts, per_host);
+  if (!cap) return " (no cap: no hosts)";
+  return " (drain cap " + fmt_rate(cap->per_second) + ": " + cap_factors(*hosts, per_host) + ")";
 }
 
 // An external sink's model (spec §19 entry 8): "  failure_rate=2% politeness=1/s (drain cap
 // 10M/s: 10M hosts x 1/s)". The failure rate is always printed (0% is the plain queue): the share
 // of what the sink serves that fails, which a run counts as drops. Politeness only when the
 // scenario states it, with the cap it puts on the sink's drain over the hosts of the scenario's
-// one frontier (engine::Simulation::make_node), or the reason run and estimate refuse it.
+// one frontier (graph::drain_cap_of), or the reason run and estimate refuse it: no frontier, two,
+// or one without `hosts` (engine::Simulation::create's politeness refusal).
 [[nodiscard]] std::string external_sink_summary(const graph::Graph& g, std::size_t i) {
   const auto& spec = g.nodes()[i].spec;
   if (spec.type != model::NodeType::external_sink) return {};
   std::string text = "  failure_rate=" + percent(spec.failure_rate);
   if (!spec.politeness) return text;
   text += " politeness=" + fmt_rate(spec.politeness->per_second);
-  const auto frontiers = frontiers_in(g);
+  const auto frontiers = graph::frontiers_of(g);
   if (frontiers.size() != 1) {
     return text + " (needs exactly one frontier, found " + std::to_string(frontiers.size()) +
            ": run refuses it)";
   }
-  return text + politeness_cap_note(g.nodes()[frontiers.front()].spec.hosts, *spec.politeness);
+  const auto hosts = g.nodes()[frontiers.front()].spec.hosts;
+  if (!hosts) return text + " (the frontier states no hosts: run refuses it)";
+  return text + politeness_cap_note(hosts, *spec.politeness);
 }
 
 // A URL frontier's politeness (spec §8.4, book ch. 9): "  hosts=10M politeness=1/s (drain cap
@@ -1705,13 +1708,36 @@ constexpr std::string_view unknown_hit_ratio_note =
          fmt_rate(total_capacity(node)) + " (" + std::to_string(*node.spec.kv_nodes) + " nodes)  ";
 }
 
+// A URL frontier's drain cap when it binds (spec §8.4; book ch. 9): its politeness cap,
+// hosts x politeness, when that is below its prioritiser's capacity. The frontier's backlog grows
+// once it is offered more than it can hand its pool, which is the smaller of the two, so its check
+// is held against that (a check against the prioritiser alone stayed green while the backlog grew
+// without bound). Empty for every other node, for a frontier without a cap, and for one whose
+// prioritiser is the smaller (its line is the plain "total capacity" one).
+[[nodiscard]] std::optional<Rate> binding_drain_cap(const graph::ResolvedNode& node) {
+  if (node.spec.type != model::NodeType::frontier) return std::nullopt;
+  const auto cap = graph::politeness_cap(node.spec.hosts, node.spec.politeness);
+  if (!cap || !(cap->per_second < total_capacity(node))) return std::nullopt;
+  return cap;
+}
+
+// What a check line holds the offered load against: "2k/s total capacity", or a frontier's
+// binding cap with its factors, "1k/s drain cap (1k hosts x 1/s, below the prioritiser's 5k/s)".
+[[nodiscard]] std::string capacity_text(const graph::ResolvedNode& node) {
+  const auto cap = binding_drain_cap(node);
+  if (!cap) return fmt_units(node.spec, total_capacity(node)) + " total capacity";
+  return fmt_rate(cap->per_second) + " drain cap (" +
+         cap_factors(*node.spec.hosts, *node.spec.politeness) + ", below the prioritiser's " +
+         fmt_rate(total_capacity(node)) + ")";
+}
+
 // "peak offered 1.5k/s vs 2k/s total capacity  ": what every check line opens with (a
 // kv_cluster's says what its numbers are made of: kv_check_head).
 [[nodiscard]] std::string check_head(const graph::ResolvedNode& node, double offered,
                                      const OpLoad& arriving) {
   if (node.spec.type == model::NodeType::kv_cluster) return kv_check_head(node, offered, arriving);
-  return "peak offered " + offered_text(node, offered, arriving) + " vs " +
-         fmt_units(node.spec, total_capacity(node)) + " total capacity  ";
+  return "peak offered " + offered_text(node, offered, arriving) + " vs " + capacity_text(node) +
+         "  ";
 }
 
 // A kv_cluster's verdict: behind its ring (N < nodes, imbalance k > 1) the average hides the
@@ -1732,7 +1758,8 @@ constexpr std::string_view unknown_hit_ratio_note =
 [[nodiscard]] std::string check_details(const graph::ResolvedNode& node, double offered,
                                         const OpLoad& arriving,
                                         const std::optional<graph::DatabaseCopyLoads>& loads) {
-  const double capacity = total_capacity(node);
+  const auto cap = binding_drain_cap(node);
+  const double capacity = cap ? cap->per_second : total_capacity(node);
   const std::string head = check_head(node, offered, arriving);
   if (node.spec.type == model::NodeType::kv_cluster) return head + kv_verdict(node, offered);
   if (capacity <= 0.0) return head + "(no capacity, red)" + hottest_copy_check(node, offered);
@@ -1744,8 +1771,7 @@ constexpr std::string_view unknown_hit_ratio_note =
 // A node a loop of gain >= 1 feeds (PaperLoad::unbounded): its load has no figure, and no
 // capacity holds it. The footer of the checks names the loop.
 [[nodiscard]] std::string unbounded_check(const graph::ResolvedNode& node) {
-  return "peak offered unbounded vs " + fmt_units(node.spec, total_capacity(node)) +
-         " total capacity  (no steady state, red)";
+  return "peak offered unbounded vs " + capacity_text(node) + "  (no steady state, red)";
 }
 
 // A node only `on: failure` steps reach on paper: its paper load is 0 (nothing fails there, see

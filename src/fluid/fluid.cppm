@@ -60,6 +60,18 @@ struct Capacity {
   double service_variability{
       1};                // squared coefficient of variation of service time (1 = exponential)
   double burstiness{1};  // squared coefficient of variation of inter-arrival times (1 = Poisson)
+  // A bound IN FRONT of the servers, in units per second: whatever waits, at most this many are
+  // handed to them a second (a token bucket refilled at this rate, one token per unit). A URL
+  // frontier's politeness puts one in front of its downloaders (hosts x politeness, book ch. 9;
+  // engine::Simulation::make_node). The servers keep their rate and their c: the queue drains
+  //   drain = min(demand + backlog / dt, service_rate, drain_cap)
+  // and rho stays drain / service_rate, the share of the servers busy (Little's law), so 2000
+  // workers at 500 ms behind a cap of 1000/s read 0.25, not 1. What the cap holds back waits in
+  // the room and drains at the cap (the fluid wait is backlog / min(service_rate, cap)). Ignored:
+  // a unit's wait for a token when arrivals bunch below the cap (the bucket's own queueing); the
+  // stochastic wait is the servers' Erlang C one. +infinity (no bound) everywhere else, and
+  // min(x, +inf) is x exactly: a queue without a cap steps as it always did.
+  double drain_cap_per_s{std::numeric_limits<double>::infinity()};
 };
 
 // The first two moments of the time one request holds a server, as Kingman's formula reads them:
@@ -131,9 +143,13 @@ class FluidQueue {
   // identity it is advance(demand, dt), bit for bit.
   [[nodiscard("the drained flow must be routed downstream")]] FluidStep advance(
       Rate demand, SimTime dt, const Derating& derating);
-  // Jumps to the long-run state: empty at or below capacity, full (queue_limit) above it.
-  // At exactly rho = 1 it keeps the room empty, as advance() does from an empty backlog
-  // (drain = demand = capacity), so `estimate` and `run` agree there (the strict > in the body).
+  // Jumps to the long-run state: empty at or below what it can drain (drain_limit_per_s), full
+  // (queue_limit) above it. At exactly rho = 1 it keeps the room empty, as advance() does from an
+  // empty backlog (drain = demand = capacity), so `estimate` and `run` agree there (the strict > in
+  // the body). A room without end (queue_limit +infinity: a URL frontier's pool, which deletes
+  // nothing) has no long-run backlog above it, only one that grows for ever: it is left empty, so
+  // the step drains what it can and its numbers stay finite, and the caller says the backlog is
+  // unbounded (engine::Simulation::mark_unbounded_backlogs).
   void settle(Rate demand);
 
   // Replaces the moments of the time one request occupies a server: the mean feeds the Erlang C
@@ -149,6 +165,9 @@ class FluidQueue {
   [[nodiscard]] const Capacity& capacity() const { return capacity_; }
 
  private:
+  // The most this queue can drain a second: min(service_rate, drain_cap_per_s), the servers' rate
+  // or the bound in front of them, whichever is lower (Capacity::drain_cap_per_s).
+  [[nodiscard]] double drain_limit_per_s() const;
   // One short method per line of the §3.3 formula; see advance().
   [[nodiscard]] double drain_for(double demand_per_s, double dt_s) const;
   void grow_backlog(double demand_per_s, double drain_per_s, double dt_s);
@@ -195,7 +214,9 @@ Zone zone_of(double rho, const Capacity& c) {
 // The §3.3 step, one named helper per line:
 //
 //   dt_s   = seconds(dt);  cap = service_rate.per_second;  demand = demand.per_second
-//   drain  = min(demand + backlog_/dt_s, cap)              serve what we can: new demand
+//   limit  = min(cap, drain_cap)                           the servers' rate, or the bound in
+//                                                          front of them (a token bucket) if lower
+//   drain  = min(demand + backlog_/dt_s, limit)            serve what we can: new demand
 //                                                          plus everything that waited
 //   backlog_ += (demand - drain) * dt_s                    grows past capacity, shrinks below
 //   overflow = max(0, backlog_ - queue_limit) / dt_s;  backlog_ = min(backlog_, queue_limit)
@@ -204,8 +225,8 @@ Zone zone_of(double rho, const Capacity& c) {
 //   rho    = cap > 0 ? drain/cap : 1                       busy fraction; a node with no
 //                                                          capacity counts as saturated
 //   k      = variability_factor(burstiness, service_variability)
-//   fluid  = backlog_/cap                                  deterministic drain time
-//   room   = queue_limit/cap                               the full waiting room's drain time
+//   fluid  = backlog_/limit                                deterministic drain time
+//   room   = queue_limit/limit                             the full waiting room's drain time
 //   rho_st = min(demand, drain)/cap                        the load the NEW arrivals bring
 //   stoch  = min(k * mmc_wait(c, min(rho_st, 0.99), s).mean, room)
 //                                                          random bunching of arrivals, never
@@ -285,8 +306,9 @@ FluidStep FluidQueue::advance(Rate demand, SimTime dt, const Derating& derating)
       Rate{slowed_rate_per_s(nominal, derating.extra_service_s) * derating.capacity_factor};
   capacity_.service_time_s = nominal.service_time_s + derating.extra_service_s;
   if (capacity_.service_rate.per_second <= 0.0) {
-    outage_ = Outage{.back_in_s = derating.back_in_s,
-                     .nominal_rate_per_s = nominal.service_rate.per_second};
+    outage_ = Outage{
+        .back_in_s = derating.back_in_s,
+        .nominal_rate_per_s = std::min(nominal.service_rate.per_second, nominal.drain_cap_per_s)};
   }
   const FluidStep step = advance(demand, dt);
   capacity_ = nominal;
@@ -313,7 +335,14 @@ double FluidQueue::slowed_rate_per_s(const Capacity& capacity, double extra_s) {
 // rho 1 is the clamp's (max_stochastic_rho), not a full room's. A real queue at rho 1 is
 // null-recurrent and holds about half its room on average: size off rho 1.
 void FluidQueue::settle(Rate demand) {
-  backlog_ = demand.per_second > capacity_.service_rate.per_second ? capacity_.queue_limit : 0.0;
+  const bool above = demand.per_second > drain_limit_per_s();
+  const bool bounded_room = capacity_.queue_limit < std::numeric_limits<double>::infinity();
+  backlog_ = above && bounded_room ? capacity_.queue_limit : 0.0;
+}
+
+// std::min with the servers' rate first: equal to it, bit for bit, when the cap is +infinity.
+double FluidQueue::drain_limit_per_s() const {
+  return std::min(capacity_.service_rate.per_second, capacity_.drain_cap_per_s);
 }
 
 // `!(x > 0)` and `!(x >= 0)` rather than `x <= 0` and `x < 0` so that a NaN is refused too.
@@ -343,7 +372,7 @@ void FluidQueue::require_positive_step(SimTime dt) {
 // its first argument when the comparison is false) instead of being "served" at full
 // capacity. With cap = 0 the node drains nothing and all demand piles up.
 double FluidQueue::drain_for(double demand_per_s, double dt_s) const {
-  return std::min(demand_per_s + backlog_ / dt_s, capacity_.service_rate.per_second);
+  return std::min(demand_per_s + backlog_ / dt_s, drain_limit_per_s());
 }
 
 // The max(.., 0.0) only removes floating-point residue when a backlog drains exactly to
@@ -366,6 +395,9 @@ double FluidQueue::spill_overflow(double dt_s) {
 // backlog is empty this equals the textbook lambda/mu capped at 1 (drain = min(demand,
 // cap)); the difference is a node working off a backlog: demand may be 50% of capacity
 // but every server is busy, so it is red, not green. Never exceeds 1 because drain <= cap.
+// Behind a drain cap (Capacity::drain_cap_per_s) the backlog waits in front of the servers, not
+// at them: rho is still drain / cap, below 1 while the cap binds (Little's law: drain x service
+// time servers are busy, 1000/s x 0.5 s = 500 of 2000).
 // A NaN drain propagates (division keeps NaN).
 double FluidQueue::utilization(double drain_per_s) const {
   const double cap = capacity_.service_rate.per_second;
@@ -374,9 +406,11 @@ double FluidQueue::utilization(double drain_per_s) const {
 }
 
 // Fluid (virtual) waiting time: a request joining behind `backlog_` requests at a server
-// draining `cap`/s waits backlog_/cap. Agrees with Little's law W = L/lambda only when
-// saturated (lambda = cap); it is a deterministic drain time, not a long-run average.
-// Uses the end-of-step backlog, so it is pessimistic by up to half a step's growth.
+// draining `cap`/s waits backlog_/cap, where cap is what the queue drains at most
+// (drain_limit_per_s: behind a drain cap, the cap: 30,000 URLs at 1000/s wait 30 s). Agrees with
+// Little's law W = L/lambda only when saturated (lambda = cap); it is a deterministic drain time,
+// not a long-run average. Uses the end-of-step backlog, so it is pessimistic by up to half a step's
+// growth.
 //
 // With no capacity: during an outage (a fault derated the node to 0, Derating) the time until the
 // node is back plus the backlog's drain at its nominal capacity (drain_time_s); a node with no
@@ -384,7 +418,7 @@ double FluidQueue::utilization(double drain_per_s) const {
 // Engine contract: never multiply a latency by a zero weight (inf * 0 = NaN), skip branches that
 // carry no flow, and the report layer prints inf as "unavailable".
 double FluidQueue::backlog_wait_s() const {
-  const double cap = capacity_.service_rate.per_second;
+  const double cap = drain_limit_per_s();
   if (cap <= 0.0) return drain_time_s(backlog_);
   return backlog_ / cap;
 }
@@ -393,7 +427,7 @@ double FluidQueue::backlog_wait_s() const {
 // request that finds the room full is dropped (spill_overflow), so one that gets in finds at most
 // queue_limit units ahead of it, drained at cap per second. With no capacity, as above.
 double FluidQueue::room_drain_s() const {
-  const double cap = capacity_.service_rate.per_second;
+  const double cap = drain_limit_per_s();
   if (cap <= 0.0) return drain_time_s(capacity_.queue_limit);
   return capacity_.queue_limit / cap;
 }

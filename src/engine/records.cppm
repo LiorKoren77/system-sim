@@ -126,9 +126,12 @@ struct NodeSample {
   // The wait only: the job's `cost` is not lag (a message is read once a worker takes it), so the
   // lag is the pool's latency minus its cost. Assumes the backlog is read first in, first out (a
   // Kafka partition is). A URL frontier (phase 3 Task 18) has one the same way: its consumer pool's
-  // wait, at the pool's capacity capped by politeness (behaviours::FrontierBehaviour), so 30,000
-  // URLs drained 1000 a second under the cap are 30 s. Empty for every node that is neither (a 0
-  // would be a claim).
+  // wait, the backlog drained at the pool's capacity or the politeness cap in front of it if lower
+  // (behaviours::FrontierBehaviour), so 30,000 URLs drained 1000 a second under the cap are 30 s.
+  // A frontier deletes nothing (its pool's room has no end, so no T bounds the lag), and in
+  // `estimate` a pool that falls behind has a lag of +infinity, a backlog that grows for ever
+  // (engine::Simulation::mark_unbounded_backlogs; printed "unbounded"). Empty for every node that
+  // is neither (a 0 would be a claim).
   std::optional<double> queue_lag_s{};
   // A worker pool's dead letters, per second (phase 3 spec §6.2; book ch. 10's dead-letter queue):
   // the jobs whose LAST attempt at an external sink failed this step, which a pool with `retries`

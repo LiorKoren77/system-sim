@@ -288,7 +288,7 @@ std::optional<std::string> lag_problem(const model::NodeSpec& node) {
     return std::nullopt;
   }
   return "'" + node.id + "' has type " + std::string{model::to_string(node.type)} +
-         ", not message_queue: only a message queue has a lag";
+         ", not message_queue or frontier: only a message queue or a frontier has a lag";
 }
 
 std::optional<std::string> dead_letter_problem(const model::NodeSpec& node) {

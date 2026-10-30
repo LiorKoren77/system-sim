@@ -20,6 +20,7 @@ module;
 #include <expected>
 #include <functional>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <optional>
 #include <ranges>
@@ -3076,12 +3077,13 @@ Graph::Result Graph::connect_consumers() {
 //   10 s × 1200 jobs/s = 12,000 messages; the default 7 d × 1200/s = 725.76 million.
 // A message older than that is deleted unconsumed: the fluid queue drops what overflows the room,
 // and the drops are the pool's. Each group's room is its own (retention × ITS capacity). The
-// retention is the queue's, or defaults::default_retention when it states none or the pool reads a
-// frontier (which has no retention). A pool built in code without `consumes` is refused in the
-// loader's words: it could never receive a job, since check_pool_senders refuses every sender but
-// its queue. Assumed: the backlog drains first in, first out, so a message published now waits the
-// FIFO drain time of the backlog ahead of it (backlog over drain rate: its queue lag,
-// engine::NodeSample:: queue_lag_s) and the room in messages is the room in seconds of draining.
+// retention is the queue's, or defaults::default_retention when it states none; a pool that reads a
+// frontier (which has no retention) has a room without end (room_of). A pool built in code without
+// `consumes` is refused in the loader's words: it could never receive a job, since
+// check_pool_senders refuses every sender but its queue. Assumed: the backlog drains first in,
+// first out, so a message published now waits the FIFO drain time of the backlog ahead of it
+// (backlog over drain rate: its queue lag, engine::NodeSample:: queue_lag_s) and the room in
+// messages is the room in seconds of draining.
 Graph::Result Graph::connect_consumer(std::size_t pool) {
   auto& resolved = nodes_[pool];
   const auto& spec = resolved.spec;
@@ -3103,9 +3105,19 @@ Graph::Result Graph::connect_consumer(std::size_t pool) {
     return std::unexpected{EngineError{name + "'" + source.id + "', but no link from '" +
                                        source.id + "' delivers its messages to it"}};
   }
-  const SimTime retention = source.retention.value_or(defaults::default_retention);
-  resolved.capacity.queue_limit = seconds(retention) * resolved.capacity.service_rate.per_second;
+  resolved.capacity.queue_limit = room_of(source, resolved.capacity.service_rate);
   return {};
+}
+
+// The room of a pool that reads `source`: retention x the pool's rate behind a message queue (its
+// retention, or defaults::default_retention), and no end at all behind a URL frontier, which has no
+// retention and deletes nothing: a URL waits until a downloader takes it, however long the backlog
+// (+infinity: the fluid queue drops nothing, and `estimate` reports a backlog that grows for ever
+// as unbounded, fluid::FluidQueue::settle).
+double Graph::room_of(const model::NodeSpec& source, Rate pool_rate) {
+  if (source.type == model::NodeType::frontier) return std::numeric_limits<double>::infinity();
+  const SimTime retention = source.retention.value_or(defaults::default_retention);
+  return seconds(retention) * pool_rate.per_second;
 }
 
 // What follows from the splits and the resolved hops: which ops reach each node (through any
@@ -3498,6 +3510,36 @@ void Graph::order_nodes() {
   // Reverse post-order: a node finishes only after everything it sends to, so the
   // last to finish is the first in topological order.
   order_.assign(post_order.rbegin(), post_order.rend());
+}
+
+// ---- politeness (phase 3 Task 18, spec §8.4; book ch. 9) ----
+
+std::optional<Rate> politeness_cap(std::optional<int> hosts, std::optional<Rate> per_host) {
+  if (!hosts || !per_host) return std::nullopt;
+  return Rate{static_cast<double>(*hosts) * per_host->per_second};
+}
+
+std::vector<std::size_t> frontiers_of(const Graph& g) {
+  std::vector<std::size_t> frontiers;
+  for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+    if (g.nodes()[node].spec.type == model::NodeType::frontier) frontiers.push_back(node);
+  }
+  return frontiers;
+}
+
+std::optional<Rate> drain_cap_of(const Graph& g, std::size_t node) {
+  const auto& spec = g.nodes()[node].spec;
+  if (spec.type == model::NodeType::worker_pool && spec.consumes) {
+    const auto& source = g.nodes()[*g.index_of(*spec.consumes)].spec;  // connect_consumer checked
+    if (source.type != model::NodeType::frontier) return std::nullopt;
+    return politeness_cap(source.hosts, source.politeness);
+  }
+  if (spec.type == model::NodeType::external_sink && spec.politeness) {
+    const auto frontiers = frontiers_of(g);
+    if (frontiers.size() != 1) return std::nullopt;
+    return politeness_cap(g.nodes()[frontiers.front()].spec.hosts, spec.politeness);
+  }
+  return std::nullopt;
 }
 
 }  // namespace simsys::graph
