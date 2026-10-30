@@ -226,6 +226,30 @@ lognormal moment fit (post p50 194 µs, p99 58 ms): a limit of the fit, reported
 - [ ] Tests: a `che` cache of 10k keys over a Zipf 0.8 of 1M keys at 1k/s (steady hit ratio h from `caching::che_hit_ratio`, the value the test computes): flushed at 00:10, its hit ratio at the next step is **0**; at `t` = 2 s it is the Che hit ratio of a cache of **min(10k, distinct keys of 2k requests)** entries (the test computes the distinct-keys count from the popularity model's coupon-collector sum, which `caching` exports for this); back within 1 % of h once the cache is full, and the fault record says when (*the warm-up time is a model output; the test pins it against the same closed form*). A fixed-ratio cache (`hit_ratio: {fixed: 0.9}`, `keys: 1000`) warms linearly: 0.45 after half its fill time. `dc_down` on a two-datacenter chain: the cross-DC link passes 0 during the fault (link row `dropped_per_s` = its inflow), every node of the datacenter has capacity 0, the client's answered is the share that stays in its own datacenter.
 - [ ] Commit `engine: cache_flush warms back along the Che curve; dc_down takes a datacenter's nodes and links`.
 
+**Review of Task 7 at `9cfb1bc`** (adversarial, bounded, 2026-10-30; a first reviewer at `051d44e`
+ran four hours without delivering and was stopped): REQUEST_CHANGES. The Che curve matches the
+closed form at every step; `estimate` ignores and `sweep` applies the flush; refusals, §1, §3 fine.
+1. Critical: the warm-up reads are settled at `at` and frozen, so a cache flushed while nothing
+   reads it (the quiet hours: ch. 1's own case) stays cold for the whole run.
+2. Important: on a moving rate curve the frozen rate is 3.9× slow (100/s → 2000/s ramp).
+3. Important: a `dc_down` overlapping a `node_down` inside the datacenter is not flagged as
+   overlapping and both blocks count the shared losses (39k for 24k lost).
+4. Important: the linear fixed-ratio warm-up's comment claims every request adds an entry; once
+   `h(n) = h·n/K` only misses do (the consistent model fills at `−(K/h) ln(1 − h)`: 2.56 K at 0.9).
+5. Minor: a flush superseded by a second one still reports itself warm and counts the second's misses.
+6. Minor: a cache in a down datacenter comes back warm: undocumented.
+7. Minor: ch. 1's data synchronisation missing from the `dc_down` ignored list.
+8. Minor: a stale comment names `fault_schedule_of` for `reads_at_flushes`.
+9. Minor: no `docs/study/numerics.md` warm-up note (spec §12).
+Decisions: 1, 2 → integrate the reads the cache actually receives (`n += inflow × dt / copies`), warm
+when `n` reaches the full point; 3 → `overlaps()` matches a `dc_down` against later faults on nodes
+of its datacenter and the reverse; 4 → keep the linear simple case, documented as optimistic with the
+consistent model's figure; 5 → the earlier flush's window ends at the next flush, `cache_warm_in_s`
+null, `interrupted by the flush at …`; 6–9 documented (the note's five sentences as the reviewer wrote
+them). Not checked by the review: the cache_aside/CDN paths at run time, a ring-partitioned cache's
+per-replica share, a client inside a down datacenter calling a service outside: the 3b comprehensive
+review covers them.
+
 ### Task 8: the fault block in the report
 
 **Files:** `src/engine/faults.cppm` (`FaultRecord` filled by the engine each step: lost, backlog peak, SLO verdicts during; the follow-on (reconnect storm: Task 15, warm-up time, extra attempts: Task 10) and the recovery time: the first step after the fault clears at which every client op's p99 and every node's utilisation are within 1 % of the step before `at`), `src/report/report.cppm`, `report.cpp` (the three-line block per fault after the SLO table; JSON `faults: [{at_s, kind, node, for_s, during: {...}, after: {...}, recovered_at_s | null}]`), tests in `test_report.cpp` and `test_faults.cpp`.
