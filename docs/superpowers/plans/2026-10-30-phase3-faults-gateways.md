@@ -788,7 +788,7 @@ at 21:31:29.9, back within 1 % at 21:31:30 (30 s after, the storm's end; was 478
 peak rho 0.8038, connections peak 1.620M; the `reconnect_within` sweep's rows from 20 s on recover
 at their storm's end (peaks 95.8..85.3 %), 10 s peaks at 110 %; the numerics probe 97.89k users
 back, peak 70.8 %, back 30 s after.
-- [x] Fix round at `e9ff8fa`; push; CI (below).
+- [x] Fix round at `e9ff8fa`; pushed at `0487387` (2026-10-30, CI run 41098774380 green: build-test, build-test-release, format; 1686 tests). **Phase 3 complete.**
 
 ## Phase 4 backlog
 
