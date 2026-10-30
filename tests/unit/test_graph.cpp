@@ -3891,3 +3891,92 @@ TEST_CASE("a search index states one number and takes the other from the type", 
   REQUIRE(index.service_rate_source == simsys::defaults::Source::type_default);
   REQUIRE(index.service_time_source == simsys::defaults::Source::scenario);
 }
+
+// ---- A ws_gateway in the graph (phase 3 Task 14; spec §8.2; book ch. 12 and ch. 15)
+// ---------------
+//
+// A gateway holds its connections as a level that either a `connect` op reaching it fills or a
+// fixed `connections` states. The graph's part is to say which ops reach a node (arriving_ops),
+// and that is all the engine's rule reads: Simulation::create refuses a gateway that no `connect`
+// reaches and that states no `connections`, and one that has both (tests/theory/test_gateways.cpp).
+// Graph::build itself accepts such a gateway on purpose: the shipped chat-system and google-drive
+// have neither until their own tasks give them one, and explain, the series and the scenario
+// tests still build and describe them.
+
+namespace {
+// u (client: `connect`, `send`) -> gw (ws_gateway: send -> q, heartbeat -> presence, deliver
+// terminal) -> q, presence. `connect_link_ops` filters what u -> gw carries (empty: everything).
+// Node indices: u 0, gw 1, q 2, presence 3.
+Scenario gateway_front(std::vector<std::string> connect_link_ops = {}) {
+  Scenario s{.name = "gateway-front", .version = 1, .duration = 1min};
+  NodeSpec gateway{.id = "gw",
+                   .type = NodeType::ws_gateway,
+                   .ops = {{"deliver", {}},
+                           {"heartbeat", {Step{.to = "presence", .op = "beat"}}},
+                           {"send", {Step{.to = "q", .op = "publish"}}}}};
+  gateway.max_connections = 100'000;
+  gateway.heartbeat = 5s;
+  s.nodes = {client("u", Rate{200}, {{"connect", 0.5}, {"send", 0.5}}), std::move(gateway),
+             service("q"), service("presence")};
+  s.links = {LinkSpec{.from = "u", .to = "gw", .ops = std::move(connect_link_ops)},
+             LinkSpec{.from = "gw", .to = "q"}, LinkSpec{.from = "gw", .to = "presence"}};
+  return s;
+}
+
+bool arrives(const Graph& g, std::size_t node, std::string_view op) {
+  // Is `op` among the ops that reach the node?
+  return std::ranges::find(g.arriving_ops(node), op) != g.arriving_ops(node).end();
+}
+}  // namespace
+
+TEST_CASE("a connect op sent straight to a gateway arrives at it, with the sends", "[graph]") {
+  const auto g = Graph::build(gateway_front());
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE(arrives(*g, 1, "connect"));
+  REQUIRE(arrives(*g, 1, "send"));
+  REQUIRE(arrives(*g, 3, "beat"));  // the gateway's own heartbeat step, whoever sends heartbeats
+}
+
+TEST_CASE("a connect op sent only to another node does not arrive at the gateway", "[graph]") {
+  auto s = gateway_front({"send"});  // u -> gw carries the sends only
+  s.nodes.push_back(service("edge"));
+  s.links.push_back(LinkSpec{.from = "u", .to = "edge", .ops = {"connect"}});
+  const auto g = Graph::build(s);
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE_FALSE(arrives(*g, 1, "connect"));
+  REQUIRE(arrives(*g, 4, "connect"));
+  REQUIRE(arrives(*g, 1, "send"));
+}
+
+TEST_CASE("a connect op reaches a gateway through a load balancer", "[graph]") {
+  auto s = gateway_front();
+  s.nodes.push_back(load_balancer("lb", LbPolicy::round_robin));
+  s.links[0] = LinkSpec{.from = "u", .to = "lb"};
+  s.links.push_back(LinkSpec{.from = "lb", .to = "gw"});
+  const auto g = Graph::build(s);
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE(arrives(*g, 1, "connect"));
+}
+
+TEST_CASE("Graph::build accepts a gateway with neither a connect op nor connections", "[graph]") {
+  auto s = gateway_front();
+  s.nodes[0] = client("u", Rate{200}, {{"send", 1.0}});
+  const auto g = Graph::build(s);
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+}
+
+// `deliver: []` is terminal: the op is served and sends nothing on; `send` and `heartbeat` have
+// their steps, one hop each.
+TEST_CASE("a gateway's deliver has no hops, its send and heartbeat one each", "[graph]") {
+  const auto g = Graph::build(gateway_front());
+  REQUIRE(g.has_value());
+  REQUIRE(g->service_hops(1, "deliver").empty());
+  REQUIRE(g->service_hops(1, "send").size() == 1);
+  REQUIRE(g->service_hops(1, "send")[0].target == 2);
+  REQUIRE(g->service_hops(1, "heartbeat").size() == 1);
+  REQUIRE(g->service_hops(1, "heartbeat")[0].target == 3);
+}

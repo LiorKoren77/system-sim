@@ -5166,3 +5166,151 @@ TEST_CASE("faults written as one map instead of a list of them is refused") {
                    faults_scenario("{at: 01:00, kind: node_down, node: api, for: 1m}"),
                    "faults must be a list");
 }
+
+// ---- A ws_gateway's own keys (phase 3 Task 14; spec §8.2)
+// -----------------------------------------
+//
+// `max_connections` (a count: 100k, 2M), `heartbeat` (a positive duration), `fanout` (the average
+// recipients per message, at least 1), `session` (the mean session length) and `reconnect_within`
+// (how long a dropped tier takes to come back), both positive durations, and `connections` (a
+// fixed level, a positive count). The first three were read and ignored before; `connections`,
+// `session` and `reconnect_within` were unknown keys. An absent `session` or `reconnect_within`
+// stays absent in the loaded node (explain can then say "(default)"): the defaults, 30 minutes
+// and 30 seconds, both chosen and not from the book, are applied where the numbers are used.
+// Whether a `connect` op reaches the gateway is a fact of the graph, not of the file, so the loader
+// leaves "a gateway needs a level" to Simulation::create (tests/theory/test_gateways.cpp).
+
+namespace {
+// u (the clients) -> gw (a ws_gateway with `gateway_keys`) -> q and presence.
+std::string gateway_scenario(std::string_view gateway_keys,
+                             std::string_view client_ops = "{connect: 0.5, send: 0.5}") {
+  return scenario_with(
+      "  u: {type: client, rate: {base: 200/s}, ops: " + std::string{client_ops} +
+          "}\n"
+          "  gw: {type: ws_gateway, " +
+          std::string{gateway_keys} +
+          ", ops: {send: [{to: q, op: publish}], heartbeat: [{to: presence, op: beat}], "
+          "deliver: []}}\n"
+          "  q: {type: service}\n"
+          "  presence: {type: service}\n",
+      "links:\n"
+      "  - {from: u, to: gw}\n"
+      "  - {from: gw, to: q}\n"
+      "  - {from: gw, to: presence}\n");
+}
+}  // namespace
+
+TEST_CASE(
+    "a gateway's max_connections, heartbeat, fanout, session and reconnect_within are typed") {
+  const auto path = write_temp(
+      "simsys_gateway_typed.yaml",
+      gateway_scenario("max_connections: 200k, heartbeat: 5s, fanout: 1.4, session: 1000s, "
+                       "reconnect_within: 20s"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  const auto& gateway = s->nodes[1];
+  REQUIRE(gateway.type == simsys::model::NodeType::ws_gateway);
+  CHECK(gateway.max_connections == 200'000);
+  CHECK(gateway.heartbeat == 5s);
+  CHECK(gateway.fanout == 1.4);
+  CHECK(gateway.session == 1000s);
+  CHECK(gateway.reconnect_within == 20s);
+  CHECK_FALSE(gateway.connections.has_value());  // no fixed level: the connect op fills it
+}
+
+// google-drive's long poll: `max_connections: 2M`, a count with the grammar of every count
+// (500, 10k, 2M), and a fixed level of 2M.
+TEST_CASE("a gateway's fixed connections and its max_connections are counts: 2M") {
+  const auto path = write_temp(
+      "simsys_gateway_fixed.yaml",
+      gateway_scenario("connections: 2M, max_connections: 2M, heartbeat: 60s", "{send: 1}"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  CHECK(s->nodes[1].connections == 2'000'000);
+  CHECK(s->nodes[1].max_connections == 2'000'000);
+  CHECK(s->nodes[1].heartbeat == 60s);
+}
+
+TEST_CASE("a gateway that states no session or reconnect_within leaves them absent") {
+  const auto path = write_temp("simsys_gateway_defaults.yaml",
+                               gateway_scenario("max_connections: 100k, heartbeat: 5s"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  CHECK_FALSE(s->nodes[1].session.has_value());
+  CHECK_FALSE(s->nodes[1].reconnect_within.has_value());
+}
+
+// A fan-out below 1 would mean a message reaches fewer than one recipient, which is a lost
+// message, not a fan-out: the model refuses it. Exactly 1 (the google-drive long poll's) is fine.
+TEST_CASE("a gateway's fanout must be at least 1") {
+  SECTION("0.5") {
+    require_rejected("simsys_gateway_fanout_half.yaml",
+                     gateway_scenario("max_connections: 100k, fanout: 0.5"),
+                     "node 'gw': fanout must be at least 1");
+  }
+  SECTION("0") {
+    require_rejected("simsys_gateway_fanout_zero.yaml",
+                     gateway_scenario("max_connections: 100k, fanout: 0"),
+                     "node 'gw': fanout must be at least 1");
+  }
+  SECTION("1 is accepted") {
+    require_loaded("simsys_gateway_fanout_one.yaml",
+                   gateway_scenario("max_connections: 100k, fanout: 1"));
+  }
+}
+
+// A zero heartbeat would be an infinite load, a zero session an instant disconnect, a zero
+// reconnect_within an instant storm: each is a positive duration, in the words of `timeout`,
+// `ttl` and `retry_after`.
+TEST_CASE("a gateway's heartbeat, session and reconnect_within must be positive durations") {
+  SECTION("heartbeat 0s") {
+    require_rejected("simsys_gateway_heartbeat_zero.yaml",
+                     gateway_scenario("max_connections: 100k, heartbeat: 0s"),
+                     "node 'gw': heartbeat must be positive");
+  }
+  SECTION("session 0s") {
+    require_rejected("simsys_gateway_session_zero.yaml",
+                     gateway_scenario("max_connections: 100k, session: 0s"),
+                     "node 'gw': session must be positive");
+  }
+  SECTION("reconnect_within 0ms") {
+    require_rejected("simsys_gateway_reconnect_zero.yaml",
+                     gateway_scenario("max_connections: 100k, reconnect_within: 0ms"),
+                     "node 'gw': reconnect_within must be positive");
+  }
+}
+
+// The fixed level is a count of at least one, in the words of the other counts with a k/M/G suffix
+// (a cache's `keys`).
+TEST_CASE("a gateway's connections must be a positive integer") {
+  SECTION("0") {
+    require_rejected("simsys_gateway_connections_zero.yaml",
+                     gateway_scenario("connections: 0, max_connections: 100k", "{send: 1}"),
+                     "node 'gw': connections must be a positive integer");
+  }
+  SECTION("a fraction") {
+    require_rejected("simsys_gateway_connections_fraction.yaml",
+                     gateway_scenario("connections: 1.5, max_connections: 100k", "{send: 1}"),
+                     "node 'gw': connections must be a positive integer");
+  }
+}
+
+// The loader does not decide whether a connect op REACHES the gateway (that is the graph's fact,
+// and the shipped chat-system and google-drive state neither level today): a file with a gateway
+// that has no level loads, and Simulation::create is what refuses it.
+TEST_CASE("a gateway with neither a connect op nor connections still loads") {
+  require_loaded("simsys_gateway_no_level.yaml",
+                 gateway_scenario("max_connections: 100k, heartbeat: 5s", "{send: 1}"));
+}
+
+TEST_CASE("the gateway's keys are refused on other node types") {
+  for (const std::string_view key : {"connections: 5", "session: 1m", "reconnect_within: 1m"}) {
+    require_rejected("simsys_gateway_key_elsewhere.yaml",
+                     scenario_with("  svc: {type: service, " + std::string{key} + "}\n"),
+                     "node 'svc': key '" + std::string{key.substr(0, key.find(':'))} +
+                         "' is not valid for type 'service'");
+  }
+}
