@@ -94,10 +94,11 @@ namespace {
   return fault.node.empty() ? fault.datacenter : fault.node;
 }
 
-// The key that sizes a fault, when its kind has one: " replicas=1", " replicas=primary",
-// " factor=0.5", " extra=50ms"; "" for a whole node_down, a cache_flush or a dc_down.
+// The key that sizes a fault, when its kind has one: " replicas=1", " primary" (a sql_db's
+// primary, the scenario's `replicas: primary`), " factor=0.5", " extra=50ms"; "" for a whole
+// node_down, a cache_flush or a dc_down.
 [[nodiscard]] std::string fault_size(const model::Fault& fault) {
-  if (fault.primary) return " replicas=primary";
+  if (fault.primary) return " primary";
   if (fault.replicas) return " replicas=" + std::to_string(*fault.replicas);
   if (fault.factor) return " factor=" + significant(*fault.factor);
   if (fault.extra) return " extra=" + format_duration(*fault.extra);
@@ -105,11 +106,11 @@ namespace {
 }
 
 // "node_down chat_servers 21:30 for 1m": kind, target, start on the run's clock and length (a
-// cache_flush is an instant and has none), then its size.
+// cache_flush is an instant and has none: model::lasts), then its size.
 [[nodiscard]] std::string fault_summary(const model::Fault& fault) {
-  const bool lasts = fault.kind != model::FaultKind::cache_flush;
   return std::string{model::to_string(fault.kind)} + " " + fault_target(fault) + " " +
-         clock_or_duration(fault.at) + (lasts ? " for " + format_duration(fault.duration) : "") +
+         clock_or_duration(fault.at) +
+         (model::lasts(fault.kind) ? " for " + format_duration(fault.duration) : "") +
          fault_size(fault);
 }
 

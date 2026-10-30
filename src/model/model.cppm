@@ -783,9 +783,27 @@ inline constexpr auto fault_kind_table = std::to_array<core::EnumName<FaultKind>
   return core::parse_in(fault_kind_table, name);
 }
 
+// Does a fault of `kind` last (`for:`), or is it an instant? A cache flush is an instant: the
+// cache is empty from `at` on and refills from its own misses, so there is nothing to mend and no
+// length. Every other kind breaks something until `at + for`. The one place the rule lives: the
+// loader refuses a `for` on a flush and requires one on the others, explain prints a length only
+// for a fault that lasts.
+[[nodiscard]] constexpr bool lasts(FaultKind kind) {
+  return kind != FaultKind::cache_flush;
+}
+
 // One scripted fault. The members are the schema's keys, except `duration`, which is `for:` (a C++
 // keyword), and `primary`, which is `replicas: primary`. Only the members of the fault's kind are
 // set; the loader refuses a key another kind reads.
+//
+// `replicas` and `primary` on a node_down count copies of the node. On a service or a cache that is
+// its `replicas`; on a kv_cluster its machines (`nodes:`). On a sql_db (book ch. 1, "database
+// replication") each of its `shards` is a set of R = `replicas` copies, one primary (the writer)
+// and R - 1 read replicas: `replicas: k` takes k copies down in every shard (news-feed's post_db
+// has `shards: 6`), and `primary` takes the writer down. Phase 3 models a primary down as one copy
+// of R down, its share of the capacity; what a failed-over primary does to writes (they stop until
+// a replica is promoted) is a phase 4 backlog item. On a sql_db of one copy the primary is the
+// whole node, like a node_down without `replicas`.
 struct Fault {
   FaultKind kind{};
   SimTime at{};              // from the start of the run (t = 0 is midnight); inside the run

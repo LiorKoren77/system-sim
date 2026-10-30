@@ -1267,6 +1267,20 @@ TEST_CASE("explain lists chat-system's scripted fault", "[series]") {
   REQUIRE(text.contains("faults: 1 scripted (node_down chat_servers 21:30 for 1m)"));
 }
 
+// news-feed's fault with its database's primary down instead of the whole node: the size reads
+// `primary`, as the scenario writes it (`replicas: primary`), not `replicas=primary`.
+TEST_CASE("explain names a sql_db's primary down as primary", "[series]") {
+  auto loaded =
+      simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml");
+  INFO((loaded ? "" : loaded.error().message));
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->faults.size() == 1);
+  loaded->faults[0].primary = true;
+  const auto text = simsys::report::render_explain(graph_of(*loaded));
+  CAPTURE(text);
+  REQUIRE(text.contains("faults: 1 scripted (node_down post_db 15:00 for 30s primary)"));
+}
+
 TEST_CASE("explain prints no faults line for a scenario without faults", "[series]") {
   const auto loaded =
       simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/tutorial/hello/scenario.yaml");

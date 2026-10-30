@@ -1417,18 +1417,28 @@ faults:
 
 | key | required | meaning |
 |---|---|---|
-| `at` | yes | a clock time (`21:30`) or a duration from the run's start (`90m`), the rate curve's syntax; must fall inside the run (`faults[0]: at must fall inside the run (24h)`) |
-| `kind` | yes | `node_down`, `capacity`, `latency_spike`, `cache_flush`, `traffic_spike` or `dc_down`; `partition` is refused (`partition is not modelled in phase 3 (see the backlog)`) |
-| `for` | all kinds but `cache_flush` | a positive duration; the fault ends at `at + for`. A flush is an instant: `cache_flush takes no for` |
+| `at` | yes | a clock time (`21:30`) or a duration from the run's start (`90m`), the rate curve's syntax; must fall inside the run (`faults[0]: at must fall inside the run (24h)`); missing: `faults[0]: needs an at`. A clock time names the first day only (t = 0 is midnight): a 48 h run reaches its second day with a duration (`30h` is 06:00 on day two) |
+| `kind` | yes | `node_down`, `capacity`, `latency_spike`, `cache_flush`, `traffic_spike` or `dc_down`; `partition` is refused (`partition is not modelled in phase 3 (see the backlog)`); a list or map is `kind must be a scalar` |
+| `for` | all kinds but `cache_flush` | a positive duration; the fault ends at `at + for`, and may run past the end of the run (it is cut there: the run ends with the fault still on). A flush is an instant: `cache_flush takes no for` |
 | `node` | all kinds but `dc_down` | a declared node; `traffic_spike` needs a client, `cache_flush` a cache or cdn, the others any node but a client (`node_down cannot name a client (clients emit, they do not serve)`) |
-| `replicas` | `node_down` only, optional | how many of the node's replicas go down (default: all), 1 up to its `replicas`; for a kv_cluster, of its `nodes`; for a sql_db also `primary` |
-| `factor` | `capacity`, `traffic_spike` | `capacity`: strictly between 0 and 1; `traffic_spike`: positive, at most 1e6 |
+| `replicas` | `node_down` only, optional | how many of the node's copies go down (default: all), 1 up to its `replicas` (beyond: `replicas must be at most 4`); for a kv_cluster, of its `nodes`. On a sql_db a count of copies per shard (each shard is a primary and `replicas - 1` read replicas: news-feed's `post_db` has `shards: 6`), or `primary`, the writer, which phase 3 takes as one copy of the shard's R down (its share of the capacity; what a failed-over primary does to writes is a phase 4 backlog item). On a sql_db of one copy `primary` is the whole node, like a `node_down` without `replicas` |
+| `factor` | `capacity`, `traffic_spike` | a number (`three`, `"3"`, `2k`, `50%`: `factor must be a number`); `capacity`: strictly between 0 and 1; `traffic_spike`: positive, at most 1e6 |
 | `extra` | `latency_spike` | a positive duration added to the node's service time |
 | `datacenter` | `dc_down` | a declared datacenter |
 
 A key the entry's kind does not read is refused (`replicas applies to node_down only`), and so is
 a misspelt one (`faults[0]: unknown key 'nod'`). Every message names the entry by its position in
 the list.
+
+Faults that overlap in time on one target combine: their `factor`s multiply (two capacity faults of
+0.5 leave a quarter; two traffic spikes of 3 send nine times the rate) and their `extra`s add. The
+traffic spikes of one client may multiply to at most 1e6 at any moment, the rate curve's cap on its
+own `rate.spikes`: `faults[2]: overlapping traffic_spike factors on 'users' multiply to more than
+1e6`, naming the later entry. The two caps are checked separately: a fault's factor is not
+multiplied with the client's curve spikes.
+
+A fault that lies wholly inside `warmup` (it ends before the warmup does) is accepted, but the
+report leaves the warmup out, so nothing it did is ever reported.
 
 ## Command line: `simsys sweep` (phase 2c)
 

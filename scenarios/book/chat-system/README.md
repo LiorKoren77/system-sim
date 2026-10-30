@@ -37,9 +37,11 @@ presence       peak offered 162k/s (81k/s × N 2) vs 200k/s (4 nodes)  (hottest 
 
 What is accepted today but does nothing:
 
-- the `faults` entry (`node_down` of `chat_servers` at 21:30 for 1 minute). The loader checks
-  only that `faults` is a list; faults are simulated from phase 3 (see
-  [Faults](../../../docs/scenario-schema.md#faults));
+- the `faults` entry (`node_down` of `chat_servers` at 21:30 for 1 minute). The list is typed and
+  validated: every key is checked (`at` inside the run, a declared node of a type the kind can act
+  on, `for` positive, ...) and a wrong one is refused with a message naming the entry
+  (`faults[0]: ...`), and `explain` lists it. The engine applies faults from Task 6 of phase 3 on
+  (see [Faults](../../../docs/scenario-schema.md#faults));
 - the gateway's `max_connections`, `heartbeat` and `fanout`. They are stored but not modelled:
   `fanout: 20` or `heartbeat: 1s` leave every `explain` check unchanged.
 

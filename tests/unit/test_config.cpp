@@ -4568,6 +4568,14 @@ TEST_CASE("a fault that starts outside the run is refused") {
   }
 }
 
+// Like a missing kind ("faults[0]: needs a kind"), a missing `at` is named without the kind: every
+// kind needs one, so the kind adds nothing to the message.
+TEST_CASE("a fault without an at is refused, whatever its kind") {
+  require_rejected("simsys_fault_no_at.yaml",
+                   faults_scenario("[{kind: node_down, node: api, for: 1m}]"),
+                   "faults[0]: needs an at");
+}
+
 // ---- `for`: positive, and required except for cache_flush -------------------------------------
 
 TEST_CASE("a fault that lasts needs a for, and a for must be positive") {
@@ -4646,6 +4654,22 @@ TEST_CASE("replicas is a positive count at most the node's replicas") {
         faults_scenario("[{at: 01:00, kind: node_down, node: api, replicas: 0, for: 1m}]"),
         "faults[0]: replicas must be at least 1");
   }
+  // A count beyond an int is still a count: the message says the bound it breaks, not that it is
+  // no whole number.
+  SECTION("a count too large for an int") {
+    require_rejected(
+        "simsys_fault_replicas_huge.yaml",
+        faults_scenario(
+            "[{at: 01:00, kind: node_down, node: api, replicas: 99999999999, for: 1m}]"),
+        "faults[0]: replicas must be at most 4");
+  }
+  SECTION("a count too negative for an int") {
+    require_rejected(
+        "simsys_fault_replicas_huge_negative.yaml",
+        faults_scenario(
+            "[{at: 01:00, kind: node_down, node: api, replicas: -99999999999, for: 1m}]"),
+        "faults[0]: replicas must be at least 1");
+  }
 }
 
 TEST_CASE("the primary is a sql_db's: on any other node it is refused") {
@@ -4653,6 +4677,21 @@ TEST_CASE("the primary is a sql_db's: on any other node it is refused") {
       "simsys_fault_primary_service.yaml",
       faults_scenario("[{at: 01:00, kind: node_down, node: api, replicas: primary, for: 1m}]"),
       "faults[0]: primary applies to a sql_db only");
+}
+
+// A sql_db of one copy has only its primary: `replicas: primary` takes the whole node down, as a
+// node_down without `replicas` would. It is accepted, not refused as a redundant spelling.
+TEST_CASE("the primary of a sql_db with one copy may go down: it is the whole node") {
+  const auto faults =
+      load_faults("simsys_fault_primary_one_copy.yaml",
+                  "version: 1\nname: t\nduration: 24h\n"
+                  "nodes:\n"
+                  "  db: {type: sql_db}\n"
+                  "links: []\n"
+                  "faults: [{at: 01:00, kind: node_down, node: db, replicas: primary, for: 1m}]\n");
+  REQUIRE(faults.size() == 1);
+  CHECK(faults[0].primary);
+  CHECK_FALSE(faults[0].replicas.has_value());
 }
 
 // ---- `factor` ---------------------------------------------------------------------------------
@@ -4710,6 +4749,122 @@ TEST_CASE("a traffic_spike needs a positive factor") {
   }
 }
 
+// A factor is a number written as one: text, a quoted number, a size, a percentage or a list is
+// refused as no number, before any range rule could call it "not positive". The rate curve's spike
+// reader answers the same way (read_curve_number).
+TEST_CASE("a fault's factor written as anything but a number is refused as no number") {
+  for (const auto factor : {"three", "\"3\"", "2k", "50%", "[2]"}) {
+    CAPTURE(factor);
+    require_rejected("simsys_fault_spike_factor_text.yaml",
+                     faults_scenario(std::string{"[{at: 01:00, kind: traffic_spike, node: users, "
+                                                 "factor: "} +
+                                     factor + ", for: 1m}]"),
+                     "faults[0]: factor must be a number");
+  }
+  SECTION("on a capacity fault too") {
+    require_rejected(
+        "simsys_fault_capacity_factor_text.yaml",
+        faults_scenario("[{at: 01:00, kind: capacity, node: api, factor: \"0.5\", for: 1m}]"),
+        "faults[0]: factor must be a number");
+  }
+}
+
+// 1e400 is a number beyond a double's range, read as infinity (parse_yaml_double), as the rate
+// curve reads it: the range rule refuses it, not the "is it a number" one.
+TEST_CASE("a fault's factor beyond a double's range is refused by the range rule") {
+  SECTION("traffic_spike") {
+    require_rejected(
+        "simsys_fault_spike_factor_huge.yaml",
+        faults_scenario("[{at: 01:00, kind: traffic_spike, node: users, factor: 1e400, for: 1m}]"),
+        "faults[0]: traffic_spike factor must be at most 1e6");
+  }
+  SECTION("capacity") {
+    require_rejected(
+        "simsys_fault_capacity_factor_huge.yaml",
+        faults_scenario("[{at: 01:00, kind: capacity, node: api, factor: 1e400, for: 1m}]"),
+        "faults[0]: capacity factor must be between 0 and 1 (a gain is the scenario's capacity)");
+  }
+}
+
+namespace {
+
+// Three clients, so spikes on different clients can be told from spikes on one. `faults` as in
+// faults_scenario.
+std::string three_clients_scenario(std::string_view faults) {
+  return "version: 1\nname: t\nduration: 24h\n"
+         "nodes:\n"
+         "  users: {type: client, rate: {base: 100/s}, ops: {read: 1}}\n"
+         "  mobile: {type: client, rate: {base: 100/s}, ops: {read: 1}}\n"
+         "  partners: {type: client, rate: {base: 100/s}, ops: {read: 1}}\n"
+         "links: []\n"
+         "faults: " +
+         std::string{faults} + "\n";
+}
+
+}  // namespace
+
+// Overlapping spikes on one client multiply, so bounding each factor by 1e6 is not enough: three
+// spikes of 1e6 at once would send 1e18 times the rate. The product over every moment is held to
+// 1e6, the rule the rate curve applies to its own spikes; the message names the later entry, the
+// one that tips the product over.
+TEST_CASE("overlapping traffic_spike faults on one client may multiply to at most 1e6") {
+  constexpr auto message = "overlapping traffic_spike factors on 'users' multiply to more than 1e6";
+  SECTION("three spikes of 1e6 at once on one client") {
+    require_rejected("simsys_fault_spike_product.yaml",
+                     faults_scenario("[{at: 01:00, kind: traffic_spike, node: users, factor: 1e6, "
+                                     "for: 1h}, "
+                                     "{at: 01:00, kind: traffic_spike, node: users, factor: 1e6, "
+                                     "for: 1h}, "
+                                     "{at: 01:00, kind: traffic_spike, node: users, factor: 1e6, "
+                                     "for: 1h}]"),
+                     std::string{"faults[1]: "} + message);
+  }
+  SECTION("1000 x 1000 is exactly 1e6 and loads; a third spike of 2 is refused") {
+    const auto two =
+        "{at: 01:00, kind: traffic_spike, node: users, factor: 1000, for: 1h}, "
+        "{at: 01:30, kind: traffic_spike, node: users, factor: 1000, for: 1h}";
+    REQUIRE(load_faults("simsys_fault_spike_product_bound.yaml",
+                        faults_scenario(std::string{"["} + two + "]"))
+                .size() == 2);
+    require_rejected(
+        "simsys_fault_spike_product_third.yaml",
+        faults_scenario(std::string{"["} + two +
+                        ", {at: 01:59, kind: traffic_spike, node: users, factor: 2, for: 1m}]"),
+        std::string{"faults[2]: "} + message);
+  }
+  SECTION("three spikes of 1e6 at once on three clients load") {
+    const auto faults =
+        load_faults("simsys_fault_spike_three_clients.yaml",
+                    three_clients_scenario(
+                        "[{at: 01:00, kind: traffic_spike, node: users, factor: 1e6, for: 1h}, "
+                        "{at: 01:00, kind: traffic_spike, node: mobile, factor: 1e6, for: 1h}, "
+                        "{at: 01:00, kind: traffic_spike, node: partners, factor: 1e6, for: 1h}]"));
+    CHECK(faults.size() == 3);
+  }
+  // A fault covers [at, at + for): the second starts the moment the first ends, so they never
+  // overlap.
+  SECTION("two spikes of 1e6 one after the other load") {
+    const auto faults = load_faults(
+        "simsys_fault_spike_sequential.yaml",
+        faults_scenario("[{at: 01:00, kind: traffic_spike, node: users, factor: 1e6, for: 1h}, "
+                        "{at: 02:00, kind: traffic_spike, node: users, factor: 1e6, for: 1h}]"));
+    CHECK(faults.size() == 2);
+  }
+  // The rate curve bounds its own spikes, the fault list its own: the two caps are checked
+  // separately, so a curve spike of 1e6 and a fault of 1e6 at the same moment both load.
+  SECTION("a fault does not count the client's own rate.spikes") {
+    const auto faults = load_faults(
+        "simsys_fault_spike_and_curve.yaml",
+        "version: 1\nname: t\nduration: 24h\n"
+        "nodes:\n"
+        "  users: {type: client, rate: {base: 1/s, spikes: [{at: 01:00, for: 1h, factor: 1e6}]}, "
+        "ops: {read: 1}}\n"
+        "links: []\n"
+        "faults: [{at: 01:00, kind: traffic_spike, node: users, factor: 1e6, for: 1h}]\n");
+    CHECK(faults.size() == 1);
+  }
+}
+
 // ---- `extra` and `datacenter` -----------------------------------------------------------------
 
 TEST_CASE("a latency_spike needs an extra that is a positive duration") {
@@ -4745,6 +4900,12 @@ TEST_CASE("a partition fault is refused: phase 3 does not model partitions") {
   require_rejected("simsys_fault_partition.yaml",
                    faults_scenario("[{at: 01:00, kind: partition, node: api, for: 1m}]"),
                    "faults[0]: partition is not modelled in phase 3 (see the backlog)");
+}
+
+TEST_CASE("a fault's kind written as a list is refused as no scalar, not as an unknown kind") {
+  require_rejected("simsys_fault_kind_list.yaml",
+                   faults_scenario("[{at: 01:00, kind: [node_down], node: api, for: 1m}]"),
+                   "faults[0]: kind must be a scalar");
 }
 
 TEST_CASE("a misspelt key in a fault is refused, like in every other map") {
