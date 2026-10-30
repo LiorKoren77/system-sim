@@ -233,6 +233,44 @@ lognormal moment fit (post p50 194 µs, p99 58 ms): a limit of the fit, reported
 - [x] Tests: on Task 6's `node_down` probe the block reads `fault 00:10 node_down svc for 10s` / `during:   offered 400/s, served 0/s, lost 3.9k requests, backlog 100 (room 100 dropped the rest)` / `after:    backlog drained in 0.2s` / `recovery: op p99 back within 1% at 00:20:00.3 (0.3s after the fault cleared)` (the exact strings pinned, numbers from Task 6's derivations); JSON `recovered_at_s` **1200.3**; a fault that never recovers in the run prints `not recovered by the end of the run` and JSON `null`; two faults → two blocks in `at` order; no faults → no block and no `faults` key.
 - [x] Commit `report: one block per fault: what it cost, what followed, when the system recovered` (red `7de28f4`, green `98e0e36`; the probe's fault is at 10 s so the pins read `00:00:10`/`00:00:20.2`/`recovered_at_s` 20.2: the recovery step's start; `FaultLog` lives in `engine.cppm` because a partition cannot import its primary; a `traffic_spike` reports the client's numbers; the Task 6 JSON-equality test strips the `faults` key).
 
+**Review of Task 8 at `98e0e36`** (adversarial, 2026-10-30): REQUEST_CHANGES. The three READMEs'
+blocks, the JSON schema, the `without_faults_key` strip, the #1261 fix, §1/§3 all verified.
+1. Critical: on byte-sized nodes `lost N requests` and `offered N/s` are megabytes; a `dc_down` adds
+   MB at its nodes to requests on its cut links.
+2. Critical: a fault at `at: 0s` prints `not recovered by the end of the run` (no step before it).
+3. Critical: overlapping faults on one node take the second fault's baseline from inside the first
+   outage (never "back") and the blocks' `lost` sum to 5.5k against 3.9k in the node table.
+4. Important: on any diurnal curve "within 1 % of the step before `at`" never holds (a 5 m outage at
+   15:00 on a sine wave: `not recovered` 47 minutes after it was back): the spec's own example
+   (chat-system at 21:30) would print nothing useful.
+5. Important: `flipped to FAIL` is judged per step and contradicts the SLO table (a window SLO that
+   passes its worst window; news-feed's README admits both "flipped" SLOs pass).
+6. Important: the `(room N dropped the rest)` parenthesis prints for a `dc_down` whose losses are on
+   its cut links.
+7. Important: a `cache_flush`'s during line says nothing happened (`lost 0, backlog 0`); the cost is
+   the extra misses to the origin.
+8. Important (§4): `FaultLog` (420 lines in `engine.cppm`, now 2968 lines) re-implements the
+   report's SLO rules (`quantile_of`, named-node-else-worst) a second time.
+9. Minor: "op p99 back within 1%" omits the nodes' rho; "after the fault cleared" on a flush.
+10. Minor: a `traffic_spike` says `no backlog to drain` while the downstream service drains.
+11. Minor: `// Pattern: Observer` on a hard-wired accumulator; a hand-written insertion sort.
+12. Minor: the 366 requests news-feed loses while draining appear in no block.
+Decisions: the baseline is a **fault-free twin run** stepped in lockstep (the same scenario with the
+faults stripped; only when the scenario has faults, so the identity holds and the cost is 2× there):
+recovery is the first step after the fault clears at which every client op's p99 and every node's
+rho are within 1 % of the twin's same step (fixes 2, 3's baseline, 4); `lost` is the faulted run's
+drops minus the twin's from `at` to the recovery step (fixes 12; overlapping faults split nothing:
+the second block says `(overlaps fault 00:00:10)` and counts from its own `at`); `lost` and
+`offered` carry the node's own unit (`lost 24k MB`) and cut links are a separate figure (`and 500
+requests on cut links`; JSON `lost`, `lost_unit`, `lost_on_cut_links`) (1); the parenthesis only
+when the backlog reached the room and the node dropped (6); a flush's during line reports the extra
+origin reads vs the twin (`extra misses 1.4k to origin`) and no backlog (7); "flipped" means the
+run-level (or window) verdict differs from the twin's, computed in the report from the two
+summaries, and the during line also says `over its max for 300ms` for an SLO breached during the
+fault (5, and 8's duplicate SLO rules go); the record types move to a `simsys.engine:records`
+partition and `FaultLog` to `simsys.engine:fault_log` (8); wording of 9 and 10; 11 fixed. Spec §4.4's
+"step before the fault" is amended to "the same step of a fault-free run" in Task 19's spec update.
+
 ### Task 9: `on: failure` steps fire
 
 **Files:** `src/engine/behaviours.cppm` (`HopBlocks`: a failure block carries `1 − d` of the step it follows, sequential, not thinned by that step, thinned by earlier ones), `src/engine/graph.cppm` (the rule "belongs to the nearest unconditional step before it"; an unsized `on: failure` step over a bandwidth link refused like any unsized step: `node 'web': step to 'log' over bandwidth link web → log needs a size (on: failure steps are priced like any step)`), `src/engine/engine.cppm` (the size walk no longer skips failure steps), tests in `test_failed_steps.cpp` (3a's file) and `test_graph.cpp`.
