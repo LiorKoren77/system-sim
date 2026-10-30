@@ -293,26 +293,34 @@ struct Block {
 // of them: the flow they forward, the latency they add and the share of requests they answer.
 //
 // Failure blocks (spec §5, `on: failure` steps; a service's op steps only). Models the
-// dead-letter or compensation path of the book's designs (ch. 1's and ch. 4's: a request that
-// failed is logged, or queued to be handled later), [{to: db, op: write}, {to: log, op: write,
-// on: failure}]. A
-// failure block reports on its ANCHOR, the nearest unconditional step before it (or the parallel
-// group that step belongs to, as a whole), and carries the requests the anchor failed:
+// dead-letter path of the book's ch. 10 (notification system: a notification that failed is kept
+// in the notification log and put back on a queue to be retried), [{to: db, op: write}, {to: log,
+// op: write, on: failure}]. A failure block reports on its ANCHOR, the nearest unconditional step
+// before it (or the parallel group that step belongs to, as a whole), and carries the requests
+// the anchor failed:
 //   sent = rate × S_anchor × (1 − d_anchor) × factor
 // with S_anchor the survival where the anchor starts (the steps BEFORE it thin the failure step
 // too: a request lost earlier never reached the anchor, so it cannot fail there) and d_anchor the
 // anchor's delivered fraction (Π d over a parallel group: a request any member lost failed), read
-// one simulation step late like every thinning (`forward`). It is not thinned by its anchor (a
-// request that failed there is exactly the one sent on), nor by another failure block (two in a
-// row report on the same anchor, each the same share). What it does is not fed back: its requests
-// had failed already, so its own losses fail no request (it adds nothing to `delivered` and does
-// not thin the steps after it), and its latency is not in the op's response: `response` is the
-// time of a request that goes through every step it waits for, and no such request takes a
-// failure step (an `on: miss` block, by contrast, is taken by requests that are still answered, so
-// its legs are in the response, weighted by its share). Ignored: the failed request's own latency
-// (how long it waited before failing: a timeout's worth, say) and anything the failure step does
-// to the request itself (it is not answered after all: no retry here, a client's or pool's
-// `retries` are that). After a step that loses nothing it sends nothing: 1 − 1 = 0.
+// one simulation step late like every thinning (`forward`). An anchor that is a cache lookup with
+// `on: miss` steps after it is the lookup TOGETHER WITH its miss block (a read whose miss the
+// database failed is a failed read): d_anchor = d_lookup × ((1 − f) + f × Π d_miss), f the miss
+// share, the block's survival; the whole miss block counts, miss steps after the failure step
+// included, since they are one block a miss takes. It is not thinned by its anchor (a request
+// that failed there is exactly the one sent on), nor by another failure block (two in a row report
+// on the same anchor, each the same share). What it does is not fed back: its requests had failed
+// already, so its own losses fail no request (it adds nothing to `delivered` and does not thin the
+// steps after it), and its latency is not in the op's response: `response` is the time of a
+// request that goes through every step it waits for, and no such request takes a failure step (an
+// `on: miss` block, by contrast, is taken by requests that are still answered, so its legs are in
+// the response, weighted by its share). Ignored: the failed request's own latency (how long it
+// waited before failing: a timeout's worth, say) and anything the failure step does to the
+// request itself (it is not answered after all: no retry here). A retry is a client's `retries`,
+// or a pool's (phase 3, Task 11): a failure step that calls back into its own op is refused at
+// build (graph::Graph::check_failure_steps, an unbounded retry storm), and one that publishes to a
+// message queue whose pool calls the op again builds (the queue ends the call cycle) but retries
+// every failure for ever, with no limit and no backoff: the pool's `retries` is the modelled form.
+// After a step that loses nothing it sends nothing: 1 − 1 = 0.
 // Pattern: Delegation (composition over inheritance) — ServiceBehaviour (its `ops` steps),
 // CacheBehaviour (its store hop and its `then` steps), BlobStoreBehaviour (its events) and
 // WorkerPoolBehaviour (its hand-offs) each hold one HopBlocks, as the forwarding behaviours hold a
@@ -459,20 +467,48 @@ class HopBlocks {
   }
 
   // Sends failure block `failed` the requests its anchor failed (the class comment):
-  //   rate × S_anchor × (1 − d_anchor), d_anchor = the group's Π d when the anchor is a group.
+  //   rate × S_anchor × (1 − d_anchor), d_anchor = anchor_survival.
   // Nothing at all when the anchor lost nothing, not even an empty flow entry: a failure step
   // behind a lossless step routes exactly as if it were not there.
   static void forward_failed(std::span<const Block> blocks, const Block& failed, double rate_per_s,
                              double group_survival, std::vector<Outgoing>& outgoing,
                              FractionLookup auto&& downstream) {
-    const Block& anchor = blocks[*failed.reports_on];
     const double got_through =
-        anchor.mode == model::StepMode::parallel ? group_survival : survival(anchor, downstream);
+        anchor_survival(blocks, *failed.reports_on, group_survival, downstream);
     const double failed_share = 1.0 - got_through;
     if (failed_share <= 0.0) return;
     const double reached_anchor =
         alive_before(blocks, *failed.reports_on, group_survival, downstream);
     forward_block(failed, rate_per_s * reached_anchor * failed_share, outgoing, downstream);
+  }
+
+  // d_anchor, the share of the requests that reach block `anchor` and get through it: the
+  // parallel group's Π d when the anchor is a group; else the anchor's survival, times its miss
+  // block's (1 − f) + f × Π d_miss when it is a lookup that `on: miss` steps follow (the class
+  // comment). Exactly 1 when nothing is lost (each survival is).
+  [[nodiscard]] static double anchor_survival(std::span<const Block> blocks, std::size_t anchor,
+                                              double group_survival,
+                                              FractionLookup auto&& downstream) {
+    if (blocks[anchor].mode == model::StepMode::parallel) return group_survival;
+    double through = survival(blocks[anchor], downstream);
+    if (const Block* misses = miss_block_after(blocks, anchor)) {
+      through *= survival(*misses, downstream);
+    }
+    return through;
+  }
+
+  // The miss block of the lookup at block `anchor`, if `on: miss` steps follow it: the first block
+  // after it that is not a failure block, when that one follows a lookup. A miss step's lookup is
+  // the nearest unconditional step before it, as a failure step's anchor is, so a miss block right
+  // after the anchor (failure blocks aside) is the anchor's own; ServiceBehaviour::add_hops keeps
+  // the miss steps of one lookup in one block across failure steps.
+  [[nodiscard]] static const Block* miss_block_after(std::span<const Block> blocks,
+                                                     std::size_t anchor) {
+    for (const Block& block : blocks.subspan(anchor + 1)) {
+      if (block.reports_on) continue;
+      return block.lookup ? &block : nullptr;
+    }
+    return nullptr;
   }
 
   // S where block `anchor` starts (a sequential block, or the first member of the parallel group):
@@ -566,12 +602,12 @@ export namespace simsys::behaviours {
 // cost adds (a cost-c request arrives as a batch of c units at once, so Kingman's `burstiness`, the
 // SCV of arrivals taken unit by unit, understates its arrival variability and the queueing wait
 // with it), retries and timeouts. An `on: failure` step is sent the requests the step it reports
-// on failed and fails none itself (spec §5; detail::HopBlocks, failure blocks: the dead-letter or
-// compensation path of a write that failed). A service has no `then` steps either (the loader
-// rejects them for this type): everything it sends is per op. Hops that close a call cycle are
-// asynchronous hand-offs (see `response`). A step after a failed step does not run (spec §19 entry
-// 11; ch. 8's shorten: a URL whose id was not issued is never written): each step is sent only the
-// requests every step before it answered, and the parallel group fails as a whole (route,
+// on failed and fails none itself (spec §5; detail::HopBlocks, failure blocks: the dead-letter
+// path of a request that failed, ch. 10's notification log). A service has no `then` steps either
+// (the loader rejects them for this type): everything it sends is per op. Hops that close a call
+// cycle are asynchronous hand-offs (see `response`). A step after a failed step does not run (spec
+// §19 entry 11; ch. 8's shorten: a URL whose id was not issued is never written): each step is sent
+// only the requests every step before it answered, and the parallel group fails as a whole (route,
 // detail::HopBlocks::forward), with the fractions of the previous simulation step. Cache-aside
 // (spec §17 entry 7; the pattern ch. 1 draws, which the book calls read-through: the application
 // reads the cache and fetches a miss itself): a step `{to: db, on: miss}` after a step to a cache
@@ -1546,9 +1582,10 @@ class CdnBehaviour {
 // at the store, as a write_back cache's flush is not waited for, and what the notified node drops
 // counts in that node's drop rate, never in the uploader's answered rate. A step can be neither
 // `on: miss` nor `on: failure` nor in a `mode` (graph::Graph::build and the loader refuse them: an
-// event never misses, reports no failure, and is waited for by nobody). Ignored: event batching and
-// the delivery delay (S3 sends an event within seconds, the model after the link's latency), failed
-// or duplicated notifications (S3 delivers at least once and may retry), and filters by key prefix.
+// event never misses, follows no step a failure step could report on, and is waited for by nobody).
+// Ignored: event batching and the delivery delay (S3 sends an event within seconds, the model after
+// the link's latency), failed or duplicated notifications (S3 delivers at least once and may
+// retry), and filters by key prefix.
 class BlobStoreBehaviour {
  public:
   BlobStoreBehaviour(const graph::Graph& g, std::size_t self);

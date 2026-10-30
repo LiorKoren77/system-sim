@@ -12,7 +12,8 @@
 //    an asynchronous hand-off and adds no latency to its caller. A hop that is always waited
 //    for (a cache's or a CDN's fetch from its store, a rate limiter's counter request) can be
 //    no such hand-off, so a call cycle through one is refused, wherever the cycle is entered
-//    (detail::call_components, Graph::check_backend_calls).
+//    (detail::call_components, Graph::check_backend_calls). So is an `on: failure` step that
+//    closes a call cycle, a retry with no bound (Graph::check_failure_steps).
 // A node cycle need not be a call cycle: with A.x -> B.y and B.z -> A.w the boxes loop
 // but no call does. A hop over a node-level feedback link that closes no call cycle is
 // counted in latency like any other, one step stale: the backward pass reads the
@@ -95,7 +96,8 @@ import simsys.model;
 
 // What resolving one cache's hit ratio reads (defined in graph.cpp with the hit-ratio code), and
 // which calls lie on a common call cycle (defined there with the call-graph search); declared
-// here for Graph::resolve_hit_ratio and Graph::check_backend_calls. Not exported: module linkage,
+// here for Graph::resolve_hit_ratio, Graph::check_backend_calls and Graph::check_failure_steps.
+// Not exported: module linkage,
 // like everything in detail.
 namespace simsys::graph::detail {
 struct HitRatioInputs;
@@ -296,11 +298,12 @@ inline constexpr auto replica_model_table = std::to_array<core::EnumName<Replica
 //     time, the safe side for a capacity check on paper. (A CDN fetches its own misses from its
 //     origin, so no miss step may follow one: Graph::invalid_miss_step.)
 //   - 1 for an `on: failure` step, of the requests the step it `reports_on` failed: every failed
-//     request takes it (spec §5; the dead-letter or compensation path of ch. 1's and ch. 4's
-//     designs: a write that failed is logged or queued for a retry). How many failed is known only
-//     while the engine runs (1 − d, d the delivered fraction of that step, one simulation step
-//     late: behaviours::detail::HopBlocks), so readers that size the graph on paper, where
-//     nothing is lost, count such a hop as sending nothing (explain's paper load);
+//     request takes it (spec §5; the dead-letter path of ch. 10's notification system: a
+//     notification that failed is kept in the notification log and queued again for a retry).
+//     How many failed is known only while the engine runs (1 − d, d the delivered fraction of
+//     that step, with its miss steps when it is a lookup, one simulation step late:
+//     behaviours::detail::HopBlocks), so readers that size the graph on paper, where nothing is
+//     lost, count such a hop as sending nothing (explain's paper load);
 //   `factor`, the requests the hop sends per request that takes it: the step's own fan-out
 //   (one post -> 100 feed writes), times the lookup's for an `on: miss` step. A request
 //   that looks up k keys misses k(1 - h) of them on average (linearity of expectation, true
@@ -534,6 +537,7 @@ class Graph {
   [[nodiscard]] std::string sender_of(std::size_t node, std::string_view op) const;
   Result check_cache_backend_ops(std::size_t cache);
   Result check_backend_calls(const detail::CallComponents& components) const;
+  Result check_failure_steps(const detail::CallComponents& components) const;
   Result route_splitters();
   Result route_queue(std::size_t queue);
   Result check_pool_senders() const;

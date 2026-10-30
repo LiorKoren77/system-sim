@@ -19,8 +19,10 @@
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
+import simsys.behaviours; // ServiceBehaviour: a failure step's flow entry, seen from its node
 import simsys.core;
 import simsys.engine;
+import simsys.flow; // Flow: what the service is handed
 import simsys.graph;
 import simsys.model;
 import simsys.test_fixtures;
@@ -496,4 +498,157 @@ TEST_CASE("two failure steps in a row both report the step before them: 500 a se
   const auto estimate = simulation_of(g).estimate();
   REQUIRE_THAT(estimate.nodes[*g.index_of("log1")].demand_per_s, WithinRel(500.0, 1e-4));
   REQUIRE_THAT(estimate.nodes[*g.index_of("log2")].demand_per_s, WithinRel(500.0, 1e-4));
+}
+
+// ---- What a failure step reports on, and what it leaves alone ---------------------------
+//
+// The probes below are the shapes a review of Task 9 tried by hand. A cache lookup with its miss
+// steps is one step for the failure step after them: a miss that the db failed is a failed lookup.
+// (Node indices as above: u 0, svc 1, then the targets in the order given.)
+
+namespace {
+// A cache_aside cache that hits `hit_ratio` of the reads and loses nothing (100k/s): the lookup a
+// service's `on: miss` steps follow.
+NodeSpec lookup_cache(std::string id, double hit_ratio) {
+  return NodeSpec{.id = std::move(id),
+                  .type = NodeType::cache,
+                  .capacity = Rate{100'000},
+                  .latency = 100us,
+                  .hit_ratio = HitRatio{.fixed = hit_ratio},
+                  .strategy = CacheStrategy::cache_aside};
+}
+
+// A read of `to`, taken only by the requests the lookup before it missed.
+Step miss_step(std::string to) {
+  return Step{.to = std::move(to), .op = "read", .on = StepCondition::miss};
+}
+
+const Step read_c{.to = "c", .op = "read"};
+}  // namespace
+
+// [c.read, db.read on miss, log.write on failure], c hitting 0.5 of the reads, db draining 250/s
+// with a room of one. The failure step reports on the lookup TOGETHER WITH its miss block (a
+// request whose miss db failed is a failed read), so with f = 0.5 the miss share and d_db what db
+// delivers, the lookup lets through
+//   d = d_c × ((1 − f) + f × d_db) = 1 × (0.5 + 0.5 × d_db)
+// db is offered the misses alone, 1000 × 0.5 = 500/s, and drains 250 of them: d_db = 0.5, so
+//   d = 0.75,   log's demand = 1000 × (1 − 0.75) = 1000 × 0.5 × (1 − 0.5) = 250/s
+// (before: 0/s, the cache alone, which loses nothing, was the step reported on). db reports 0.52
+// at step 0 ((25 + 1) / 50 with its room of one) and 0.5 from step 1, so log is sent 0/s at step 0,
+// 1000 × 0.5 × 0.48 = 240/s at step 1 and 250/s from step 2 on, the fixed point.
+TEST_CASE("a failure step after a lookup's miss steps reports the failed misses: 250 of 1000",
+          "[theory]") {
+  const auto g = *Graph::build(
+      steps_chain({read_c, miss_step("db"), failure_step("log")},
+                  {lookup_cache("c", 0.5), lossy_target("db", 250), plain_target("log")}));
+  const auto records = records_of(g, 20);
+  REQUIRE_THAT(demand_at(records[0], g, "log"), WithinAbs(0.0, no_flow_tolerance));
+  REQUIRE_THAT(demand_at(records[1], g, "log"), WithinRel(240.0, 1e-9));  // 1000 x 0.5 x 0.48
+  for (std::size_t i = 2; i < records.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE_THAT(demand_at(records[i], g, "db"), WithinRel(500.0, 1e-9));  // the misses alone
+    REQUIRE_THAT(dropped_share_at(records[i], g, "db"), WithinRel(0.5, 1e-9));
+    REQUIRE_THAT(demand_at(records[i], g, "log"), WithinRel(250.0, 1e-9));  // 1000 x 0.5 x 0.5
+    REQUIRE_THAT(records[i].responses[0].answered.per_second, WithinRel(750.0, 1e-3));
+  }
+  const auto estimate = simulation_of(g).estimate();
+  REQUIRE(estimate.converged);
+  REQUIRE_THAT(demand_at(estimate, g, "log"), WithinRel(250.0, 1e-4));
+}
+
+// [c.read, db.read on miss, log.write on failure, db2.read on miss]: the miss steps on both sides
+// of the failure step are ONE miss block (the failure step is taken by failed requests and splits
+// nothing), so a miss fetches from db and then db2, and db2 is sent the misses db answered:
+//   db2's demand = 1000 × 0.5 × d_db = 1000 × 0.5 × 0.5 = 250/s
+// not the 1000 × (0.5 + 0.5 × 0.5) × 0.5 = 375/s of a second block, which would send db2 half of
+// every request db's block let through, hits included. The failure step reports on the lookup and
+// its whole block: 1000 × 0.5 × (1 − d_db × d_db2) = 1000 × 0.5 × (1 − 0.5 × 1) = 250/s.
+TEST_CASE("a miss block stays one block across a failure step: db2 is sent 250 of 1000, not 375",
+          "[theory]") {
+  const auto g = *Graph::build(steps_chain(
+      {read_c, miss_step("db"), failure_step("log"), miss_step("db2")},
+      {lookup_cache("c", 0.5), lossy_target("db", 250), plain_target("log"), plain_target("db2")}));
+  const auto last = records_of(g, 20).back();
+  REQUIRE_THAT(demand_at(last, g, "db"), WithinRel(500.0, 1e-9));
+  REQUIRE_THAT(dropped_share_at(last, g, "db"), WithinRel(0.5, 1e-9));
+  REQUIRE_THAT(demand_at(last, g, "db2"), WithinRel(250.0, 1e-9));  // 1000 x 0.5 x 0.5
+  REQUIRE_THAT(demand_at(last, g, "log"), WithinRel(250.0, 1e-9));  // 1000 x 0.5 x (1 - 0.5)
+}
+
+// [db.write, log.write on failure], db delivering 0.5: log is sent 500/s, yet no answered request
+// takes it (its requests had failed already), so its latency is not in the op's response. The same
+// probe with a log of 1 ms and of 10 ms gives the same mean, to the last bit; a log on the answered
+// path would add the 9 ms difference (× 0.5 for the share that took it).
+TEST_CASE("a failure step's latency is not in the op's response: a 10 ms log moves no mean",
+          "[theory]") {
+  const auto response_with_log_of = [](std::chrono::microseconds log_latency) {
+    auto log = plain_target("log");
+    log.latency = log_latency;
+    const auto g = *Graph::build(steps_chain({write_step("db"), failure_step("log")},
+                                             {lossy_target("db", 500), std::move(log)}));
+    const auto last = records_of(g, 20).back();
+    REQUIRE_THAT(demand_at(last, g, "log"), WithinRel(500.0, 1e-9));  // log is taken: not vacuous
+    return last.responses[0].response;
+  };
+  const auto fast_log = response_with_log_of(1ms);
+  const auto slow_log = response_with_log_of(10ms);
+  REQUIRE(slow_log.mean_s == fast_log.mean_s);
+  REQUIRE(slow_log.variance_s2 == fast_log.variance_s2);
+}
+
+// [api.x, log.write on failure], where api's own op calls db (draining 500/s of the 1000 it is
+// sent): api loses nothing itself, but a request whose db call failed failed at api too (d counts
+// the losses inside a step's own calls), so
+//   d_api = 1 × d_db = 0.5,   log's demand = 1000 × (1 − 0.5) = 500/s
+// db reports at the end of a step what api's d includes in that step, so log settles a step after
+// db: pinned from step 3.
+TEST_CASE("a failure step counts the losses deeper in the call tree: 500 of 1000 lost at db",
+          "[theory]") {
+  auto api = plain_target("api");
+  api.ops = {{"x", {Step{.to = "db", .op = "x"}}}};
+  Scenario s = steps_chain({Step{.to = "api", .op = "x"}, failure_step("log")},
+                           {std::move(api), plain_target("log")});
+  s.nodes.push_back(lossy_target("db", 500));
+  s.links.push_back(LinkSpec{.from = "api", .to = "db", .latency = 0s});
+  const auto g = *Graph::build(s);
+  const auto records = records_of(g, 20);
+  for (std::size_t i = 3; i < records.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE_THAT(dropped_share_at(records[i], g, "api"), WithinAbs(0.0, no_flow_tolerance));
+    REQUIRE_THAT(dropped_share_at(records[i], g, "db"), WithinRel(0.5, 1e-9));
+    REQUIRE_THAT(demand_at(records[i], g, "log"), WithinRel(500.0, 1e-9));  // 1000 x (1 - 0.5)
+  }
+  const auto estimate = simulation_of(g).estimate();
+  REQUIRE_THAT(demand_at(estimate, g, "log"), WithinRel(500.0, 1e-4));
+}
+
+// [db.write, log.write on failure ×3]: `factor` is the requests the step sends per request that
+// takes it, as for any step, so each failed write sends three: 1000 × (1 − 0.5) × 3 = 1500/s.
+TEST_CASE("a failure step's factor multiplies its share: factor 3 sends 3 x 500 = 1500 a second",
+          "[theory]") {
+  auto three_logs = failure_step("log");
+  three_logs.factor = 3.0;
+  const auto g = *Graph::build(steps_chain({write_step("db"), std::move(three_logs)},
+                                           {lossy_target("db", 500), plain_target("log")}));
+  const auto records = records_of(g, 20);
+  for (std::size_t i = 2; i < records.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE_THAT(demand_at(records[i], g, "log"), WithinRel(1500.0, 1e-9));  // 1000 x 0.5 x 3
+  }
+}
+
+// [db.write, log.write on failure] with a db that loses nothing: the failure share is 1 − 1 = 0,
+// and the failure step adds no flow entry at all (not one of 0/s): a failure step behind a lossless
+// step routes exactly as if it were not there. Seen from the service, its route has no flow towards
+// log; seen from the run, log's demand is 0 exactly, not a rounding residue.
+TEST_CASE("a zero failure share adds no flow towards the failure step's target", "[theory]") {
+  const auto g = *Graph::build(steps_chain({write_step("db"), failure_step("log")},
+                                           {plain_target("db"), plain_target("log")}));
+  simsys::flow::Flow in;
+  in.add("x", Rate{1000});
+  const auto routed =
+      simsys::behaviours::ServiceBehaviour{g, *g.index_of("svc")}.route(in, 0s, 100ms);
+  REQUIRE(routed.outgoing.size() == 1);  // db alone
+  REQUIRE(routed.outgoing[0].target == *g.index_of("db"));
+  for (const auto& record : records_of(g, 20)) REQUIRE(demand_at(record, g, "log") == 0.0);
 }
