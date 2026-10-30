@@ -125,6 +125,28 @@ declared`, `… unknown key 'nod'`); `replicas: primary` lands in `Fault::primar
 refuses kv-store's `partition` fault (dropped, noted as backlog in its README) and both labs'
 `node_down` meant one replica without saying so (`replicas: 1` added).
 
+**Review of Task 5 at `242b5b7`** (adversarial, 2026-10-30): REQUEST_CHANGES, no Critical.
+1. Important: overlapping `traffic_spike` faults on one client multiply without the 1e6 product cap
+   the rate curve's spikes have (`workload.cpp`), while the comment claims "the same reason".
+2. Important: `kind: [node_down]` says `unknown kind ''` instead of `kind must be a scalar`; a
+   factor written as text (`three`, `"3"`, `2k`, `50%`) is reported as out of range instead of
+   `must be a number`; `replicas: 99999999999` says "must be a whole number or primary".
+3. Important: chat-system's README still says the loader only checks that `faults` is a list; the
+   top-level README says kv partitions are phase 3; news-feed's YAML says "accepted and ignored".
+4. Important (§2): what `replicas`/`primary` mean on a sql_db is undocumented (a count of read
+   replicas per shard; `primary` is the writer; `primary` on a single-copy sql_db is the whole node).
+5. Minor: `copies_of`'s `kv_nodes.value_or(node.replicas)` fallback can never run.
+6. Minor: "a cache_flush has no length" lives in `faults.cpp` and `explain.cpp`: one `model::lasts`.
+7. Minor: `kind_keys` relies on "and" never being a kind name; two factor readers repeat
+   `read_optional_number`.
+8. Minor: a missing `at` is reported as `<kind> needs an at`; `faults[0]: needs an at` reads better.
+9. Minor: the schema leaves out that `for` may run past the run's end, that a clock time reaches
+   the first day only, that overlapping factors multiply, and that a fault inside `warmup` is
+   accepted but never reported.
+10. Minor: explain prints `replicas=primary` (just `primary`), `at: 10m` as `00:10`.
+Decisions: 1–6, 8, 9 (sentences, no warmup refusal) and the `primary` nit of 10 fixed; 7 left (the
+comment stands); 10's other nits left.
+
 ### Task 6: `FaultSchedule` and the conditions the engine applies
 
 **Files:** create `src/engine/faults.cppm` (`Condition`, `FaultSchedule`, `FaultRecord` skeleton); modify `src/engine/engine.cppm` (`Simulation` owns a schedule; `forward_pass` asks `condition_at(node, now)` and hands it to the node before its step), `src/engine/behaviours.cppm` (`ServiceBehaviour` and every M/M/c-based behaviour take `capacity_factor` and `extra_latency` into their `FluidQueue::set_service`/capacity for the step; `ClientBehaviour` multiplies its rate by `rate_factor`; the hit-ratio factor waits for Task 7), `src/report/report.cpp` (`estimate` prints `faults: 3 scripted (estimate shows the steady state without them; run applies them)`), `CMakeLists.txt`, tests in a new `tests/theory/test_faults.cpp` (registered in `theory_tests`) and `tests/unit/test_engine.cpp`.
