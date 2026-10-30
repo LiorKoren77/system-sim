@@ -4131,9 +4131,11 @@ TEST_CASE("the lookup rule is per op: another op of the same node, or the target
 // that the map is the student-facing list of channels and no step quietly publishes to a queue the
 // list leaves out (or the list promises a channel nothing feeds):
 //   a channel whose queue no then step publishes to:  node 'fanout': channel 'email' names
-//                                                     email_q, which no then step publishes to
+//                                                     'email_q', which no then step publishes to
 //   a then step to a queue no channel names:          node 'fanout': then step publishes to
-//                                                     email_q, which no channel names
+//                                                     'email_q', which no channel names
+// The queue's id is quoted, as in the sibling refusals ("channel 'sms' names 'audit', which is a
+// service ...").
 // A then step to a node that is not a message queue (an audit log) is no channel and is not
 // checked. A fanout with no channels at all (key absent, or `channels: {}`) is accepted when its
 // steps publish to no queue; the check is the two directions above and nothing more.
@@ -4207,14 +4209,14 @@ std::string fanout_refusal(const std::string& yaml) {
 TEST_CASE("a fanout channel naming a queue no then step publishes to is refused", "[graph]") {
   const auto yaml = fanout_file("    channels: {sms: sms_q, email: email_q}", sms_step);
   REQUIRE(fanout_refusal(yaml) ==
-          "node 'fanout': channel 'email' names email_q, which no then step publishes to");
+          "node 'fanout': channel 'email' names 'email_q', which no then step publishes to");
 }
 
 TEST_CASE("a fanout then step publishing to a queue no channel names is refused", "[graph]") {
   const auto yaml = fanout_file("    channels: {sms: sms_q}",
                                 std::string{sms_step} + ", " + std::string{email_step});
   REQUIRE(fanout_refusal(yaml) ==
-          "node 'fanout': then step publishes to email_q, which no channel names");
+          "node 'fanout': then step publishes to 'email_q', which no channel names");
 }
 
 TEST_CASE("a fanout whose channels and queue steps agree builds", "[graph]") {
@@ -4247,7 +4249,7 @@ TEST_CASE("a fanout with no channels is refused for the queue its step publishes
   for (const auto* channels_line : {"", "    channels: {}"}) {
     CAPTURE(channels_line);
     REQUIRE(fanout_refusal(fanout_file(channels_line, sms_step)) ==
-            "node 'fanout': then step publishes to sms_q, which no channel names");
+            "node 'fanout': then step publishes to 'sms_q', which no channel names");
   }
 }
 

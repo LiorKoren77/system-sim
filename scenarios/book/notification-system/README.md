@@ -41,6 +41,8 @@ The providers' `dropped` are their failed calls (2 %, 2 %, 5 % and 1 % of what t
 the pools retry: the drop rate leaves them out and counts what is lost for good, here nothing.
 `notify` is answered in 8.68 ms on average (p99 12.8 ms): the notification service, its cache
 lookup, the limiter's counter and the fan-out's publishes, which a queue answers at the append.
+The fan-out's five round trips (four queues and the log's write) are sequential: `mode: parallel`
+on the channel steps would make it the slowest append.
 
 ## Book design
 - Services call a notification service, which looks up user devices/preferences, applies
@@ -65,9 +67,14 @@ lookup, the limiter's counter and the fan-out's publishes, which a queue answers
 - **One queue and one pool per channel**, the pool retrying a send its provider failed
   (`retries: 3`, 1 s apart): a job whose fourth attempt fails too is a **dead letter**, counted in
   `dead_lettered/s` and never as a drop. Without the blast the four rates are the napkin's
-  rate × f⁴ to seven digits (iOS 1.117k jobs/s × 0.02⁴ = 1.79e-4/s); the blast's backlog shaves about
-  5 % off them, because a retried job that waits in the backlog is counted as a first attempt when
-  it is drained (behaviours::WorkerPoolBehaviour, "Ignored").
+  rate × f⁴ to seven digits (iOS 1.117k jobs/s × 0.02⁴ = 1.79e-4/s). With it the run measures
+  1.937e-4/s, 5.3 % below the napkin over the day's mean (iOS 1.278k jobs/s × 0.02⁴ =
+  2.045e-4/s; 3 to 6 % on the four pools), because a retried job that waits in the blast's
+  backlog is counted as a first attempt when it is drained (behaviours::WorkerPoolBehaviour,
+  "Ignored"). The under-count grows with how long the backlog lasts: a 1k/s probe with a 20×
+  blast at 00:15 in a 1 h run (pool 100 × 10 ms, `retries: 3`, sink `failure_rate: 0.1`) measures
+  1353 dead letters against the napkin's 2070 for a 15-minute blast, 35 % fewer, and 26 % fewer
+  for a 5-minute one.
 - **The providers' quotas**: an `external_sink` serves at most its `capacity` (the type's 1k/s
   by default) and sheds the rest, which the pool retries like a failure.
 - The `user_cache` hit ratio (devices and preferences), computed with the Che approximation
@@ -176,4 +183,6 @@ Each was run at the shipped 100 ms step (Release build, `simsys run`).
 - Remove the four pools' `retries`: the SMS gateway's 5 % failures are lost for good and the
   drop rate fails at 0.05 (the queues, without the retries' extra attempts, run a little faster:
   iOS 3.73 min).
-- Raise the fan-out's `dedup` and watch `deduplicated/s` and every channel's load move with it.
+- Raise the fan-out's `dedup` and watch `deduplicated/s` and every channel's load move with it:
+  `simsys sweep scenario.yaml --param nodes.fanout.dedup=0.02..0.2:4 --metric fanout.deduplicated
+  ios_workers.mean_rho` prints one row per value.

@@ -173,7 +173,7 @@ std::expected<std::vector<std::string>, std::string> expand(const SpecParts& par
 
 constexpr std::string_view metric_grammar =
     "<client>.<op>.mean|p50|p95|p99|attempts|answered, <node>.mean_rho|peak_rho|drop_rate, "
-    "<queue>.lag, <pool>.dead_lettered or <gateway>.connections";
+    "<queue>.lag, <pool>.dead_lettered, <fanout>.deduplicated or <gateway>.connections";
 
 // A metric's last word and what it reads (sweep.cppm's MetricKind); one row each.
 struct MetricWord {
@@ -194,6 +194,7 @@ constexpr std::array node_metric_words{MetricWord{"mean_rho", MetricKind::mean_r
                                        MetricWord{"drop_rate", MetricKind::drop_rate},
                                        MetricWord{"lag", MetricKind::peak_queue_lag},
                                        MetricWord{"dead_lettered", MetricKind::dead_lettered_rate},
+                                       MetricWord{"deduplicated", MetricKind::deduplicated_rate},
                                        MetricWord{"connections", MetricKind::connections}};
 
 // C++20 std::span<const T>: a non-owning view of contiguous elements (pointer + size), so a
@@ -243,6 +244,7 @@ std::optional<report::OpLatency> latency_column(MetricKind kind) {
     case MetricKind::attempts_rate:
     case MetricKind::answered_rate:
     case MetricKind::dead_lettered_rate:
+    case MetricKind::deduplicated_rate:
     case MetricKind::connections:
       return std::nullopt;
   }
@@ -295,6 +297,12 @@ std::optional<std::string> dead_letter_problem(const model::NodeSpec& node) {
          ", not worker_pool: only a worker pool has dead letters";
 }
 
+std::optional<std::string> deduplicated_problem(const model::NodeSpec& node) {
+  if (node.type == model::NodeType::notification_fanout) return std::nullopt;
+  return "'" + node.id + "' has type " + std::string{model::to_string(node.type)} +
+         ", not notification_fanout: only a notification fanout has duplicates";
+}
+
 std::optional<std::string> connections_problem(const model::NodeSpec& node) {
   if (node.type == model::NodeType::ws_gateway) return std::nullopt;
   return "'" + node.id + "' has type " + std::string{model::to_string(node.type)} +
@@ -322,6 +330,8 @@ std::optional<std::string> problem_with_node(const model::NodeSpec& node,
       return lag_problem(node);
     case MetricKind::connections:
       return connections_problem(node);
+    case MetricKind::deduplicated_rate:
+      return deduplicated_problem(node);
   }
   return std::nullopt;
 }
@@ -384,6 +394,8 @@ double node_metric(const report::Summary& summary, std::span<const report::NodeS
       return node->mean_dead_lettered_per_s.value_or(no_value);
     case MetricKind::connections:  // the level at the end of the run, the table's `connections`
       return node->connections.value_or(no_value);
+    case MetricKind::deduplicated_rate:  // JSON's deduplicated_per_s, 0 with `dedup: 0`
+      return node->mean_deduplicated_per_s.value_or(no_value);
     case MetricKind::mean_latency:  // an op's, read by read_metrics
     case MetricKind::p50_latency:
     case MetricKind::p95_latency:
@@ -514,7 +526,8 @@ std::string human_cell(const SweepMetric& metric, double value, bool beyond_time
   if (std::isnan(value)) return "-";
   if (beyond_timeout) return ">" + report::format_duration(value);
   if (latency_column(metric.kind)) return report::format_duration(value);
-  if (rate_column(metric.kind) || metric.kind == MetricKind::dead_lettered_rate) {
+  if (rate_column(metric.kind) || metric.kind == MetricKind::dead_lettered_rate ||
+      metric.kind == MetricKind::deduplicated_rate) {
     return report::format_rate(value);
   }
   if (metric.kind == MetricKind::peak_queue_lag) return report::format_lag(value);

@@ -60,6 +60,7 @@ enum class MetricKind {
   attempts_rate,   // `<client>.<op>.attempts`: what the client sent, retries included, per second
   answered_rate,   // `<client>.<op>.answered`: the part of its requests answered, per second
   dead_lettered_rate,  // `<pool>.dead_lettered`: a worker pool's dead letters, per second
+  deduplicated_rate,   // `<fanout>.deduplicated`: a notification fanout's duplicates, per second
   // `<gateway>.connections`: a ws_gateway's open connections at the END of the run, a count: the
   // `connections` of the node table and of the JSON, so one name means one number. Not the peak
   // (JSON's `connections_peak`): under a steady connect rate the level only rises and the two are

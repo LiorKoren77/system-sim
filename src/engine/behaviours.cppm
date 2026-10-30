@@ -2146,7 +2146,10 @@ class ExternalSinkBehaviour {
 // sent only what survived, as at a service. Ignored: what makes two notifications duplicates and
 // how long the ids are kept (the book's dedup cache with its TTL: the share is a stated number,
 // not derived from the traffic), the cost of the lookup apart from the fanout's service time,
-// per-user settings that turn a channel off (folded into the factors), and ordering.
+// per-user settings that turn a channel off (folded into the factors), notification priority (one
+// queue, first come first served: a password reset waits behind a marketing blast), per-user rate
+// limits (a rate_limiter in front of the fanout stands in for them: the notification-system
+// scenario's `user_limiter`), and ordering.
 class NotificationFanoutBehaviour {
  public:
   NotificationFanoutBehaviour(const graph::Graph& g, std::size_t self);

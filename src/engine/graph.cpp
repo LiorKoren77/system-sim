@@ -2969,8 +2969,8 @@ Graph::Result Graph::route_queue(std::size_t queue) {
 // A notification fanout's `channels` and its `then` steps name the same message queues (phase 3
 // spec §8.3), in both directions, so that the map is the student-facing list of the channels and no
 // step publishes to a queue the list leaves out:
-//   node 'fanout': channel 'email' names email_q, which no then step publishes to
-//   node 'fanout': then step publishes to email_q, which no channel names
+//   node 'fanout': channel 'email' names 'email_q', which no then step publishes to
+//   node 'fanout': then step publishes to 'email_q', which no channel names
 // A step to a node that is not a message queue (the notification log, a kv_cluster) is no channel
 // and is not checked; a fanout with no channels is fine while no step publishes to a queue. A
 // channel that names an undeclared node or one of another type is refused in the loader's words,
@@ -3001,7 +3001,7 @@ Graph::Result Graph::check_channels_named(const model::NodeSpec& fanout) const {
     // std::ranges::contains with a projection: each step is compared by its `to`, no lambda.
     if (!std::ranges::contains(fanout.then, queue, &model::Step::to)) {
       return std::unexpected{
-          EngineError{name + named + queue + ", which no then step publishes to"}};
+          EngineError{name + named + "'" + queue + "', which no then step publishes to"}};
     }
   }
   return {};
@@ -3013,8 +3013,8 @@ Graph::Result Graph::check_steps_named(const model::NodeSpec& fanout) const {
     const auto target = index_of(step.to);
     if (!target || nodes_[*target].spec.type != model::NodeType::message_queue) continue;
     if (std::ranges::contains(fanout.channels | std::views::values, step.to)) continue;
-    return std::unexpected{EngineError{"node '" + fanout.id + "': then step publishes to " +
-                                       step.to + ", which no channel names"}};
+    return std::unexpected{EngineError{"node '" + fanout.id + "': then step publishes to '" +
+                                       step.to + "', which no channel names"}};
   }
   return {};
 }
