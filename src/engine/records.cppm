@@ -144,6 +144,12 @@ struct NodeSample {
   // calls whose failures are attempted again, so the drop rate leaves their share of the drops out
   // (report::Summary::drop_rate). Empty on every other node and on a sink no retrying pool calls.
   std::optional<double> retried_demand_per_s{};
+  // A worker pool's re-published jobs this step, per second (behaviours::WorkerPoolBehaviour::
+  // republished: its retries due now, which its queue appends): the pool's part of its queue's
+  // `republished_per_s`, kept per pool so that a fault block can name the pool whose retries a
+  // fault set off (FaultAfter::pool_republished_jobs). Empty on a pool without retries and on
+  // every other node.
+  std::optional<double> republished_jobs_per_s{};
 };
 
 // What a client sees for one op: the rate it offers, the part of it that comes back answered, and
@@ -181,6 +187,12 @@ struct ResponseSample {
   Rate offered{};
   Rate attempts{};
   Rate answered{};
+  // Requests lost for good on the way: the step's LAST attempts (ClientBehaviour::last_attempts:
+  // attempt n's, every attempt without retries) times the share the path did not deliver,
+  // last × (1 − delivered). A request whose earlier attempt was lost is sent again, not lost; so
+  // lost + timed_out are the requests the users lost this step, what a fault block counts as lost
+  // for good (engine::FaultRecord::lost_requests). Without retries it is offered × (1 − delivered).
+  Rate lost{};
   Rate timed_out{};           // requests given up on for good: their last attempt timed out
   Rate timed_out_attempts{};  // every attempt that timed out, retried or not
   flow::LatencyEstimate response{};

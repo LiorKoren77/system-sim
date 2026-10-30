@@ -226,8 +226,8 @@ class FaultSchedule {
 //   after     the follow-on, the work a fault leaves behind once it has cleared: the backlog to
 //             drain (the requests that waited for the node to come back), a flushed cache's
 //             warm-up (ch. 1: every read misses an empty cache and goes to the database until it
-//             is full again); later a gateway's reconnect storm (Task 15) and a client's extra
-//             attempts (Task 10)
+//             is full again), the attempts the clients' retries added and the jobs the worker
+//             pools re-published (below); later a gateway's reconnect storm (Task 15)
 //   recovery  the time to recover, the number an incident report and a scenario's README quote
 //
 // The baseline is a counterfactual: a TWIN run, the same scenario with every fault stripped,
@@ -259,6 +259,26 @@ class FaultSchedule {
 // its nodes' figure. A datacenter whose nodes mix the two units counts its request-counting nodes
 // only, in requests (the megabytes of its byte-sized nodes are in the node table): one unit per
 // record. A traffic_spike's faulted part is the client, in requests.
+// Retries (a client's `retries`, Task 10; a worker pool's, Task 11): ch. 1's retry storm, where a
+// failing server is sent every request several times. A node's drops then count ATTEMPTS, not
+// requests: a request sent three times and dropped three times is three drops, and a request
+// dropped twice and answered on its third attempt is two drops and no loss to its user. Both
+// sides are true and an incident report needs both: the attempts are the servers' work (what the
+// faulted node turned away, what the backlog, the room and the rates beside them count), the
+// requests lost for good are what the users saw. So when a retrying client's paths reach the
+// faulted part, or a retrying pool calls into it, `lost_unit` is "attempts" (MB stays MB) and
+// `lost_requests` holds the requests lost for good: Σ over the clients whose paths reach the part
+// of their final losses (the last attempts lost on the way or timed out, ResponseSample::lost +
+// timed_out), minus the twin's, over the same span as `lost`. A pool's failed calls are not a
+// user's loss (its client's publish was answered by the queue): they come back as re-published
+// jobs, `after`'s `pool_republished_jobs`, and the last attempt's failures are dead letters (the
+// node table's). A traffic_spike's `lost` is already the client's requests lost for good (not
+// offered − answered: in a step with retries the client answers attempts of earlier requests and
+// leaves unanswered requests it will send again). `after` adds what the retries cost beyond the
+// twin's, from `at` to the recovery: the clients' attempts minus their offered load
+// (`retries_added_attempts`) and the pools' re-published jobs. Without any retrying client or
+// pool nothing of this appears (`lost_requests` empty, both figures 0): the block is the one
+// written before retries existed.
 // Ignored: anything the run does not show (the time to detect the failure, the failover itself:
 // FaultSchedule's header).
 struct FaultAfter {
@@ -274,17 +294,27 @@ struct FaultAfter {
   // A cache_flush only: seconds from the flush until the cache is full again (its hit ratio
   // factor back at 1: FaultSchedule::warm_up_s), once the run got that far; empty otherwise.
   std::optional<double> cache_warm_in_s{};
+  // The retries the fault set off (ch. 1's retry storm), each over the twin's from `at` to the
+  // recovery, 0 when there were none. `retries_added_attempts`: Σ (attempts − offered) of every
+  // client whose paths reach the faulted part (a traffic_spike: its client), the requests sent
+  // again. `pool_republished_jobs`: Σ of the jobs the retrying worker pools that call into it
+  // re-published to their queues (NodeSample::republished_jobs_per_s), those pools' ids joined by
+  // ", " in `republishing_pools`.
+  double retries_added_attempts{};
+  std::string republishing_pools{};
+  double pool_republished_jobs{};
 };
 
 // One fault's record. The faulted part is the node the fault names; for a dc_down it is the
 // datacenter: its nodes (but its clients) summed, and the links the cut crosses apart; for a
 // traffic_spike it is the client, whose numbers are its requests (engine::ResponseSample): offered
-// (the spiked rate), served = answered, lost = offered − answered (lost on the way or timed out),
-// and no backlog or room of its own (the backlog the spike builds is downstream: `after`). The
-// window "during" is [at, at + for); for a cache_flush, an instant, it is the warm-up [at, at +
-// warm_up_s) (to the end of the run if the cache never warms): the time the flush costs anything.
-// What a flush costs is not a loss (its cache drops nothing) but the reads its empty cache sends
-// on: `extra_misses`, the origin's demand minus the twin's, summed over the warm-up.
+// (the spiked rate), served = answered, lost = the requests lost for good (their last attempt lost
+// on the way or timed out: offered − answered without retries), and no backlog or room of its own
+// (the backlog the spike builds is downstream: `after`). The window "during" is [at, at + for); for
+// a cache_flush, an instant, it is the warm-up [at, at + warm_up_s) (to the end of the run if the
+// cache never warms): the time the flush costs anything. What a flush costs is not a loss (its
+// cache drops nothing) but the reads its empty cache sends on: `extra_misses`, the origin's demand
+// minus the twin's, summed over the warm-up.
 struct FaultRecord {
   model::FaultKind kind{};
   std::string node{};  // as the fault names it (empty for a dc_down: see `datacenter`)
@@ -293,10 +323,15 @@ struct FaultRecord {
   double offered_per_s{};  // the faulted part's demand, the mean over the steps "during"
   double served_per_s{};   // ... and its drain
   double lost{};           // Σ (dropped − the twin's dropped) × dt from `at` to the recovery
-  std::string lost_unit{"requests"};  // the faulted part's unit: "requests" or "MB"
-  double lost_on_cut_links{};         // a dc_down: the same over the links it cuts, in requests
-  double backlog_peak{};              // the most that waited at the end of any step "during"
-  double room{};                      // queue_limit × copies: the room the backlog fills
+  std::string lost_unit{"requests"};  // the faulted part's unit: "requests", "attempts" or "MB"
+  // With retries involved (lost_unit "attempts"; FaultRecord's header): the requests lost for good,
+  // Σ over the clients whose paths reach the faulted part of their final losses
+  // (ResponseSample::lost + timed_out) minus the twin's, from `at` to the recovery. Empty when no
+  // retrying client or pool reaches the faulted part.
+  std::optional<double> lost_requests{};
+  double lost_on_cut_links{};  // a dc_down: the same over the links it cuts, in requests
+  double backlog_peak{};       // the most that waited at the end of any step "during"
+  double room{};               // queue_limit × copies: the room the backlog fills
   // A cache_flush: Σ (the origin's demand − the twin's) × dt over the warm-up, in the origin's
   // unit; the origin is the node the cache's misses go to (its backend, a CDN's origin, or the
   // `on: miss` steps after a lookup of it), its id (several joined by ", ").

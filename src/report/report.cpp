@@ -892,10 +892,15 @@ constexpr std::string_view op_title =
   return "  " + std::string{label} + std::string(label_width - label.size(), ' ') + text + "\n";
 }
 
-// `lost 3.9k requests`, `lost 24k MB`; a dc_down keeps its cut links' requests apart, never added
-// to its nodes' figure: `lost 24k MB at its nodes and 500 requests on cut links`.
+// `lost 3.9k requests`, `lost 24k MB`; with retries the drops are attempts and the requests lost
+// for good follow them (engine::FaultRecord::lost_requests): `lost 8.907k attempts (2.939k requests
+// lost for good)`. A dc_down keeps its cut links' requests apart, never added to its nodes'
+// figure: `lost 24k MB at its nodes and 500 requests on cut links`.
 [[nodiscard]] std::string lost_text(const engine::FaultRecord& r) {
-  const std::string at_nodes = "lost " + amount_text(r.lost, r.lost_unit);
+  std::string at_nodes = "lost " + amount_text(r.lost, r.lost_unit);
+  if (r.lost_requests) {
+    at_nodes += " (" + amount_text(*r.lost_requests, "requests") + " lost for good)";
+  }
   if (r.kind != model::FaultKind::dc_down) return at_nodes;
   return at_nodes + " at its nodes and " + amount_text(r.lost_on_cut_links, "requests") +
          " on cut links";
@@ -953,7 +958,7 @@ constexpr std::string_view op_title =
 
 // What followed: a flush's warm-up, any other fault's backlog to drain (a traffic_spike's is
 // downstream, and names the node: `s backlog drained in 0.2s`).
-[[nodiscard]] std::string after_text(const engine::FaultRecord& r) {
+[[nodiscard]] std::string follow_on_text(const engine::FaultRecord& r) {
   if (r.kind == model::FaultKind::cache_flush) {
     return r.after.cache_warm_in_s
                ? "cache warm again in " + tenths_of_seconds(*r.after.cache_warm_in_s)
@@ -966,6 +971,30 @@ constexpr std::string_view op_title =
   return r.after.backlog_drained_in_s
              ? backlog + " drained in " + tenths_of_seconds(*r.after.backlog_drained_in_s)
              : backlog + " not drained by the end of the run";
+}
+
+// A retries figure of the fault (engine::FaultAfter) worth printing: more than float residue, and
+// more than the twin's (a fault that saved retries has nothing to add).
+[[nodiscard]] bool retries_added(double figure) {
+  return without_residue(figure) > 0.0;
+}
+
+// The follow-on, then what the retries added, each when there was some (ch. 1's retry storm):
+// `backlog drained in 0.1s, retries added 5.968k attempts, pool w re-published 999 jobs`.
+[[nodiscard]] std::string after_text(const engine::FaultRecord& r) {
+  std::vector<std::string> parts{follow_on_text(r)};
+  const auto& after = r.after;
+  if (retries_added(after.retries_added_attempts)) {
+    parts.push_back("retries added " + amount_text(after.retries_added_attempts, "attempts"));
+  }
+  if (retries_added(after.pool_republished_jobs)) {
+    // C++23 std::string::contains: "is this substring in the string" in one call, replacing
+    // `find(x) != std::string::npos`. The ids are joined by ", " (FaultAfter::republishing_pools).
+    const bool several = after.republishing_pools.contains(", ");
+    parts.push_back((several ? "pools " : "pool ") + after.republishing_pools + " re-published " +
+                    amount_text(after.pool_republished_jobs, "jobs"));
+  }
+  return join(parts, ", ");
 }
 
 // When the system was itself again (engine::FaultRecord's recovery rule, in its words), on the
@@ -1174,6 +1203,7 @@ constexpr std::string_view op_title =
       json_field("served_per_s", json_number(without_residue(r.served_per_s))),
       json_field("lost", json_number(without_residue(r.lost))),
       json_field("lost_unit", json_string(r.lost_unit)),
+      json_field("lost_requests", json_optional_number(r.lost_requests.transform(without_residue))),
       json_field("lost_on_cut_links",
                  dc_down ? json_number(without_residue(r.lost_on_cut_links)) : "null"),
       json_field("backlog_peak", json_number(without_residue(r.backlog_peak))),
@@ -1183,6 +1213,12 @@ constexpr std::string_view op_title =
       flipped,
       over_max};
   return json_object(during);
+}
+
+// A retries figure of `after` (engine::FaultAfter) as JSON: the number when the text prints it
+// (retries_added), else null.
+[[nodiscard]] std::string json_retries_figure(double figure) {
+  return retries_added(figure) ? json_number(figure) : "null";
 }
 
 // A fault's block as JSON (the text's numbers, unrounded, in seconds): `for_s` null for a flush,
@@ -1198,7 +1234,9 @@ constexpr std::string_view op_title =
       json_field("backlog_node",
                  r.after.backlog_node.empty() ? "null" : json_string(r.after.backlog_node)),
       json_field("backlog_drained_in_s", json_optional_number(r.after.backlog_drained_in_s)),
-      json_field("cache_warm_in_s", json_optional_number(r.after.cache_warm_in_s))};
+      json_field("cache_warm_in_s", json_optional_number(r.after.cache_warm_in_s)),
+      json_field("retries_added_attempts", json_retries_figure(r.after.retries_added_attempts)),
+      json_field("pool_republished_jobs", json_retries_figure(r.after.pool_republished_jobs))};
   const bool dc_down = r.kind == model::FaultKind::dc_down;
   std::vector<std::string> fields{json_field("at_s", json_number(seconds(r.at))),
                                   json_field("kind", json_string(model::to_string(r.kind))),

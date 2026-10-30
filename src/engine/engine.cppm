@@ -1623,11 +1623,17 @@ void Simulation::record_queue_lags(std::span<NodeSample> samples) const {
 // jobs its groups re-published (NodeSample::republished_per_s: the queue's demand less them is
 // what was published to it, the dead_letter_rate's denominator); on an external sink called by a
 // retrying pool the part of its demand those calls are (NodeSample::retried_demand_per_s: the
-// drops the drop_rate leaves out), demand × the share of its arrivals they were, in requests.
+// drops the drop_rate leaves out), demand × the share of its arrivals they were, in requests. And
+// for the fault blocks, on a pool that retries, its own part of its queue's re-published jobs
+// (NodeSample::republished_jobs_per_s: the retries due this step, which receive appended).
 void Simulation::record_retry_flows(std::span<NodeSample> samples) const {
   for (std::size_t index = 0; index < nodes_.size(); ++index) {
     const auto& node = nodes_[index];
     if (!node.consumer_groups.empty()) samples[index].republished_per_s = node.republished_per_s;
+    const auto* pool = std::get_if<behaviours::WorkerPoolBehaviour>(&node.behaviour);
+    if (pool != nullptr && pool->retries() > 0) {
+      samples[index].republished_jobs_per_s = pool->republished().total().per_second;
+    }
     if (node.retrying_links.empty()) continue;
     const double arrived = node.inflow.total().per_second;
     const double retrying_share = arrived > 0.0 ? node.retrying_inflow_per_s / arrived : 0.0;
@@ -2356,11 +2362,15 @@ std::vector<ResponseSample> Simulation::client_responses(SimTime now) const {
     };
     for (const auto& [op, offered] : client->offered(now)) {
       const Rate attempts = client->attempts(op, offered);
+      const double delivered = client->delivered(op, fraction);
+      // Only the last attempts' losses are for good: the others are sent again (ResponseSample).
+      const double last = client->last_attempts(op, offered).per_second;
       ResponseSample sample{.client = index,
                             .op = op,
                             .offered = offered,
                             .attempts = attempts,
-                            .answered = Rate{attempts.per_second * client->delivered(op, fraction)},
+                            .answered = Rate{attempts.per_second * delivered},
+                            .lost = Rate{last * (1.0 - delivered)},
                             .response = client->response(op, lookup)};
       sample.delivered_response = sample.response;  // before give_up_after cuts `response`
       if (const auto timeout_s = client->timeout_s()) {

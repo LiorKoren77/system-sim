@@ -90,9 +90,15 @@ class FaultLog {
   struct Part {
     double offered_per_s{};
     double served_per_s{};
-    double lost_per_s{};      // at its nodes (a traffic_spike: the client's unanswered requests)
+    double lost_per_s{};      // at its nodes (a traffic_spike: the client's requests lost for good)
     double cut_lost_per_s{};  // on a dc_down's cut links, in requests
     double backlog{};
+    // The retries around it (FaultRecord::lost_requests, FaultAfter): what the clients that reach
+    // it lost for good, the attempts they sent beyond their offered load, and the jobs the
+    // retrying pools that call into it re-published.
+    double lost_for_good_per_s{};
+    double extra_attempts_per_s{};
+    double republished_per_s{};
   };
   // A part whose backlog may outlast the fault: its nodes, its name in the block (`s backlog
   // drained`), its capacity (to compare parts in seconds of work), and the backlog above the
@@ -110,7 +116,12 @@ class FaultLog {
     std::vector<std::size_t> nodes{};      // the faulted nodes (a dc_down: its datacenter's)
     std::vector<std::size_t> cut_links{};  // a dc_down's cut links
     std::optional<std::size_t> client{};   // a traffic_spike's client
-    std::vector<std::size_t> origins{};    // a cache_flush's: where its misses go
+    // Whose retries the record follows (add_retry_parties): the clients whose paths reach the
+    // faulted nodes (a traffic_spike: its client), and the worker pools with `retries` that call
+    // into them.
+    std::vector<std::size_t> clients{};
+    std::vector<std::size_t> retrying_pools{};
+    std::vector<std::size_t> origins{};  // a cache_flush's: where its misses go
     // Whose backlog may need draining: the faulted part, or for a traffic_spike every node
     // downstream (any node but a client), the worst of which is named once the spike is over.
     std::vector<Backlogged> backlogged{};
@@ -128,10 +139,14 @@ class FaultLog {
   };
 
   [[nodiscard]] Tracker tracker_of(const graph::Graph& g, const model::Fault& fault) const;
+  [[nodiscard]] Tracker faulted_part(const graph::Graph& g, const model::Fault& fault) const;
   [[nodiscard]] static FaultRecord record_of(const graph::Graph& g, const FaultSchedule& schedule,
                                              const model::Fault& fault, const Tracker& tracker,
                                              std::span<const double> rooms);
   void add_backlogged(Tracker& tracker, std::vector<std::size_t> nodes, std::string name) const;
+  static void add_retry_parties(const graph::Graph& g, Tracker& tracker);
+  [[nodiscard]] static bool retries_reach(const graph::Graph& g, const Tracker& tracker);
+  static void add_retry_figures(Part& part, const Tracker& tracker, const StepRecord& record);
   [[nodiscard]] static Part part_of(const Tracker& tracker, const StepRecord& record,
                                     std::span<const LinkTally> links);
   [[nodiscard]] bool needs_snapshot(const FaultRecord& r, SimTime t) const;
@@ -143,6 +158,7 @@ class FaultLog {
   static void observe_drain(FaultRecord& r, Tracker& tracker, SimTime t, SimTime dt);
   static void choose_drained(FaultRecord& r, Tracker& tracker);
   static void count_losses(FaultRecord& r, const Part& run, const Part& twin, double dt_s);
+  static void count_retries(FaultRecord& r, const Part& run, const Part& twin, double dt_s);
   static void observe_warm_up(FaultRecord& r, SimTime t, SimTime dt);
   [[nodiscard]] static bool in_window(const FaultRecord& r, SimTime t);
   [[nodiscard]] static bool cleared(const FaultRecord& r, SimTime t);
@@ -260,6 +276,39 @@ constexpr double recovery_tolerance = 0.01;
   return sum;
 }
 
+// Every node `from` sends demand to, directly or through other nodes, `from` included: a walk
+// along the graph's demand edges (graph::DemandEdge: a client's routes, every step, a queue's
+// deliveries to its consumer groups), breadth first.
+[[nodiscard]] std::vector<bool> reached_from(const graph::Graph& g, std::size_t from) {
+  std::vector<bool> reached(g.nodes().size(), false);
+  std::vector<std::size_t> frontier{from};
+  reached[from] = true;
+  while (!frontier.empty()) {
+    const std::size_t node = frontier.back();
+    frontier.pop_back();
+    for (const auto& edge : g.edges()) {
+      if (edge.from != node || reached[edge.to]) continue;
+      reached[edge.to] = true;
+      frontier.push_back(edge.to);
+    }
+  }
+  return reached;
+}
+
+// Whether the demand of `from` reaches one of `targets`.
+[[nodiscard]] bool reaches(const graph::Graph& g, std::size_t from,
+                           std::span<const std::size_t> targets) {
+  const auto reached = reached_from(g, from);
+  return std::ranges::any_of(targets, [&](std::size_t target) { return reached[target]; });
+}
+
+// A client that sends a failed request again (Workload::retries), or a worker pool that
+// re-publishes a job whose call failed (NodeSpec::retries).
+[[nodiscard]] bool retries_failures(const model::NodeSpec& spec) {
+  if (spec.type == model::NodeType::client) return spec.workload && spec.workload->retries > 0;
+  return spec.type == model::NodeType::worker_pool && spec.retries.value_or(0) > 0;
+}
+
 }  // namespace
 
 FaultLog::FaultLog(const FaultLog& other) = default;
@@ -282,12 +331,19 @@ FaultLog::FaultLog(const graph::Graph& g, const FaultSchedule& schedule,
   }
 }
 
+// What a record follows: the faulted part, and whose retries reach it.
+FaultLog::Tracker FaultLog::tracker_of(const graph::Graph& g, const model::Fault& fault) const {
+  Tracker tracker = faulted_part(g, fault);
+  add_retry_parties(g, tracker);
+  return tracker;
+}
+
 // The faulted part (FaultRecord's comment): the named node; a dc_down's datacenter, its nodes but
 // its clients, in one unit, and the links that cross its edge (FaultSchedule::add_dc_down's
 // choice); a traffic_spike's client, with every node but a client as a candidate for the backlog
 // it leaves (one the spike does not reach is never above the twin's); a flush's cache and the
 // origins its misses go to.
-FaultLog::Tracker FaultLog::tracker_of(const graph::Graph& g, const model::Fault& fault) const {
+FaultLog::Tracker FaultLog::faulted_part(const graph::Graph& g, const model::Fault& fault) const {
   Tracker tracker;
   const auto nodes = g.nodes();
   if (fault.kind == model::FaultKind::dc_down) {
@@ -321,6 +377,35 @@ FaultLog::Tracker FaultLog::tracker_of(const graph::Graph& g, const model::Fault
   return tracker;
 }
 
+// Whose retries the record follows (FaultRecord::lost_requests, FaultAfter): a traffic_spike's
+// client itself, else every client whose paths reach a faulted node, and every worker pool with
+// `retries` that calls into one (its calls' failures are what it re-publishes).
+void FaultLog::add_retry_parties(const graph::Graph& g, Tracker& tracker) {
+  if (tracker.client) {
+    tracker.clients.push_back(*tracker.client);
+    return;
+  }
+  const auto nodes = g.nodes();
+  for (std::size_t node = 0; node < nodes.size(); ++node) {
+    const auto& spec = nodes[node].spec;
+    const bool client = spec.type == model::NodeType::client;
+    if (!client && !retries_failures(spec)) continue;
+    if (!reaches(g, node, tracker.nodes)) continue;
+    (client ? tracker.clients : tracker.retrying_pools).push_back(node);
+  }
+}
+
+// Whether the faulted nodes' drops count attempts (FaultRecord's header): a retrying client or
+// pool reaches them. Never for a traffic_spike, whose faulted part is the client and its loss the
+// requests it lost for good.
+bool FaultLog::retries_reach(const graph::Graph& g, const Tracker& tracker) {
+  if (tracker.client) return false;
+  return !tracker.retrying_pools.empty() ||
+         std::ranges::any_of(tracker.clients, [&](std::size_t client) {
+           return retries_failures(g.nodes()[client].spec);
+         });
+}
+
 void FaultLog::add_backlogged(Tracker& tracker, std::vector<std::size_t> nodes,
                               std::string name) const {
   double capacity = 0.0;
@@ -338,15 +423,20 @@ FaultRecord FaultLog::record_of(const graph::Graph& g, const FaultSchedule& sche
                                 std::span<const double> rooms) {
   double room = 0.0;
   for (const std::size_t node : tracker.nodes) room += rooms[node];
+  const bool attempts = retries_reach(g, tracker);
+  std::string unit = tracker.client ? "requests" : unit_of(g, tracker.nodes);
+  if (attempts && unit == "requests") unit = "attempts";
   FaultRecord r{.kind = fault.kind,
                 .node = fault.node,
                 .at = fault.at,
                 .duration = fault.duration,
-                .lost_unit = tracker.client ? "requests" : unit_of(g, tracker.nodes),
+                .lost_unit = std::move(unit),
+                .lost_requests = attempts ? std::optional{0.0} : std::nullopt,
                 .room = tracker.client ? 0.0 : room,
                 .origin = ids_of(g, tracker.origins),
                 .origin_unit = unit_of(g, tracker.origins),
                 .datacenter = fault.datacenter};
+  r.after.republishing_pools = ids_of(g, tracker.retrying_pools);
   if (fault.kind == model::FaultKind::cache_flush) {
     // A cache without a hit ratio loses nothing to a flush: its window is empty.
     const std::size_t cache = tracker.nodes.front();
@@ -396,14 +486,16 @@ void FaultLog::observe_one(FaultRecord& r, Tracker& tracker, const StepPair& ste
       r.recovered_at = t;
     } else {
       count_losses(r, run, twin, seconds(dt));
+      count_retries(r, run, twin, seconds(dt));
     }
   }
   observe_warm_up(r, t, dt);
 }
 
 // The faulted part's numbers in one step of one run (FaultRecord's comment: a dc_down's cut links
-// lose requests, apart; a traffic_spike's client counts its requests, offered and answered, the
-// rest lost or timed out: answered = offered − lost − timed out, ResponseSample).
+// lose requests, apart; a traffic_spike's client counts its requests, offered and answered, and
+// loses the ones it lost for good, its last attempts lost or timed out, ResponseSample), and the
+// retries around it.
 FaultLog::Part FaultLog::part_of(const Tracker& tracker, const StepRecord& record,
                                  std::span<const LinkTally> links) {
   Part part{.offered_per_s = sum_of(record, tracker.nodes, &NodeSample::demand_per_s),
@@ -413,14 +505,31 @@ FaultLog::Part FaultLog::part_of(const Tracker& tracker, const StepRecord& recor
   for (const std::size_t link : tracker.cut_links) {
     if (link < links.size()) part.cut_lost_per_s += links[link].lost_per_s;
   }
+  add_retry_figures(part, tracker, record);
   if (!tracker.client) return part;
   for (const auto& sample : record.responses) {
     if (sample.client != *tracker.client) continue;
     part.offered_per_s += sample.offered.per_second;
     part.served_per_s += sample.answered.per_second;
-    part.lost_per_s += std::max(0.0, sample.offered.per_second - sample.answered.per_second);
   }
+  // Not offered − answered: with retries a step answers attempts of requests offered earlier, and
+  // leaves unanswered requests whose next attempt is still to come.
+  part.lost_per_s = part.lost_for_good_per_s;
   return part;
+}
+
+// The requests the followed clients lost for good this step (their last attempts lost on the way
+// or timed out, ResponseSample::lost + timed_out), the attempts they sent beyond their offered
+// load (their retries), and the jobs the retrying pools re-published.
+void FaultLog::add_retry_figures(Part& part, const Tracker& tracker, const StepRecord& record) {
+  for (const auto& sample : record.responses) {
+    if (!std::ranges::contains(tracker.clients, sample.client)) continue;
+    part.lost_for_good_per_s += sample.lost.per_second + sample.timed_out.per_second;
+    part.extra_attempts_per_s += sample.attempts.per_second - sample.offered.per_second;
+  }
+  for (const std::size_t pool : tracker.retrying_pools) {
+    part.republished_per_s += record.nodes[pool].republished_jobs_per_s.value_or(0.0);
+  }
 }
 
 // During the fault: the run's means of offered and served so far, its backlog's peak, and for a
@@ -490,6 +599,16 @@ void FaultLog::choose_drained(FaultRecord& r, Tracker& tracker) {
 void FaultLog::count_losses(FaultRecord& r, const Part& run, const Part& twin, double dt_s) {
   r.lost += (run.lost_per_s - twin.lost_per_s) * dt_s;
   r.lost_on_cut_links += (run.cut_lost_per_s - twin.cut_lost_per_s) * dt_s;
+}
+
+// What the retries did in the step beyond the twin's (FaultRecord::lost_requests, FaultAfter): the
+// requests lost for good, when the drops count attempts, and the attempts and the jobs sent again.
+void FaultLog::count_retries(FaultRecord& r, const Part& run, const Part& twin, double dt_s) {
+  if (r.lost_requests) {
+    *r.lost_requests += (run.lost_for_good_per_s - twin.lost_for_good_per_s) * dt_s;
+  }
+  r.after.retries_added_attempts += (run.extra_attempts_per_s - twin.extra_attempts_per_s) * dt_s;
+  r.after.pool_republished_jobs += (run.republished_per_s - twin.republished_per_s) * dt_s;
 }
 
 // A flushed cache is warm again from the step during which its warm-up ends, once the run gets

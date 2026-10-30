@@ -1580,8 +1580,12 @@ TEST_CASE("a node_down of two of a kv_cluster's six machines loses the reads who
 // Formats: the clock is window_clock's (a whole minute `00:10`, a whole second `00:00:10`) and,
 // for a time that is not a whole second, HH:MM:SS with a tenth (`00:00:20.2`); durations after
 // `in`, `for` and `after` are seconds with at most one decimal (`0.2s`, `12.1s`, `0s`), except the
-// header's `for`, which is the scenario's own (`10s`, `200ms`). Ignored on purpose: the follow-ons
-// of Tasks 10 and 15 (the client's extra attempts, a reconnect storm), which add their own text.
+// header's `for`, which is the scenario's own (`10s`, `200ms`). Retries (Tasks 10 and 11) change
+// what `lost` counts: the drops of a node that retrying clients or pools reach are ATTEMPTS
+// (`lost 999 attempts (0 requests lost for good)`), and `after` adds what the retries cost
+// (`retries added 5.968k attempts`, `pool w re-published 999 jobs`); the tests below and
+// test_retries.cpp pin them. Ignored on purpose: Task 15's reconnect storm, which adds its own
+// text.
 
 namespace {
 // What a run reports, as `simsys run` builds it (session::run_summary: the run, its fault-free
@@ -1823,6 +1827,92 @@ TEST_CASE("a traffic_spike prints the client's block and the downstream node's d
   REQUIRE(run.json.contains("\"kind\": \"traffic_spike\", \"node\": \"c\", \"for_s\": 5"));
 }
 
+// The same spike from a client with `retries: 2` (after 100 ms, one step). The room fills by 10.4 s
+// as above; from then on the service answers 1000/s of whatever it is sent and drops the rest, and
+// every dropped attempt comes back a step later, so the attempts climb to the fixed point
+// a = 1200 (1 + q + q^2) with q = 1 - 1000 / a: 2223.8/s, q = 0.5503. A request is lost for good
+// only when its LAST attempt (attempt 2) is dropped: 1200 q^3 = 200/s at the fixed point, the 200/s
+// the service cannot take, as without retries. The old block counted offered - answered per step
+// (900, as without retries), which is not what the users lost: the retries of the last two steps of
+// the spike (15.0 and 15.1 s) are answered once the rate is back to 400/s, so some requests the
+// spike's steps had not answered yet were answered after it. What the client lost for good is the
+// conservation of requests: every request is answered once or lost for good once, so the requests
+// lost for good over the run are the run's offered - answered, summed over every step (808.4: the
+// twin loses none, and nothing is lost before 10 s or after 15.2 s, the recovery). The block's
+// `lost` is the client's final losses (ResponseSample::lost + timed_out) over the twin's, from `at`
+// to the recovery: that same 808.4, in requests (a spike's faulted part is the client, which
+// counts requests; no parenthesis). `after` adds the attempts the retries cost over the twin's.
+TEST_CASE(
+    "a traffic_spike on a retrying client counts the requests lost for good, not offered "
+    "minus answered",
+    "[theory]") {
+  const auto s =
+      probe({.faults = one_fault("at: 10s, kind: traffic_spike, node: c, factor: 3, for: 5s"),
+             .client = ", retries: 2, retry_after: 100ms"});
+  const auto run = fault_run(s);
+  CAPTURE(run.table, run.json);
+  const auto g = graph_of(s);
+  const auto records = records_of(g, 300);
+  double unanswered = 0.0;  // offered - answered over the whole run: the requests lost for good
+  double extra_attempts = 0.0;
+  for (const auto& record : records) {
+    const auto& op = record.responses.at(0);
+    unanswered += (op.offered.per_second - op.answered.per_second) * 0.1;
+    extra_attempts += (op.attempts.per_second - op.offered.per_second) * 0.1;
+  }
+  REQUIRE_THAT(unanswered, WithinAbs(808.44, 0.01));
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE_THAT(run.faults[0].lost, WithinRel(unanswered, 1e-9));
+  REQUIRE(run.faults[0].lost_unit == "requests");
+  REQUIRE_FALSE(run.faults[0].lost_requests.has_value());
+  REQUIRE_THAT(run.faults[0].after.retries_added_attempts, WithinRel(extra_attempts, 1e-9));
+  REQUIRE(line_starting(run.table, "  during:   ") ==
+          "  during:   offered 1.2k/s, served 1.02k/s, lost 808.4 requests, backlog 0");
+  REQUIRE(line_starting(run.table, "  after:    ")
+              .starts_with("  after:    s backlog drained in 0.4s, retries added "));
+}
+
+// Finding of the Task 11 review: a worker pool that retries makes a sink's drops attempts too.
+// u (1k/s) publishes to q, consumed by pool w (100 workers at 10 ms), which calls the sink api
+// (5k/s, a room of ONE call) and re-publishes a job whose call failed once, 1 s later (`retries:
+// 1`). api is down for 1 s from 10 s: of the 100 calls a step it keeps 1 in its room at the first
+// step and drops 99, then drops all 100 at each of the next nine: 999 calls failed, and the twin
+// (api never down, failure_rate 0) fails none. Each failed call's job is re-published 10 steps
+// later, at 11.0 to 11.9 s, when api is back and serves it (1990/s of its 5k/s): the pool
+// re-published 999 jobs, the retries answered every one, and nothing was dead-lettered. So the
+// sink's 999 drops are ATTEMPTS, and the requests lost for good are 0: u's publishes were all
+// accepted by q (ch. 10: the queue decouples the user from the provider's outage). The recovery is
+// at 12 s, once the wave of retries is over.
+TEST_CASE(
+    "a sink's node_down under a retrying pool counts attempts, 0 requests lost for good, and "
+    "the jobs the pool re-published",
+    "[theory]") {
+  const auto run = fault_run(
+      load_yaml("version: 1\nname: pool\nduration: 20s\nstep: 100ms\n"
+                "nodes:\n"
+                "  u: {type: client, rate: {base: 1k/s}, ops: {publish: 1.0}}\n"
+                "  q: {type: message_queue}\n"
+                "  w: {type: worker_pool, consumes: q, workers: 100, cost: 10ms, retries: 1, "
+                "retry_after: 1s, "
+                "then: [{to: api, op: send}]}\n"
+                "  api: {type: external_sink, capacity: 5k/s, advanced: {queue_limit: 1}}\n"
+                "links:\n"
+                "  - {from: u, to: q, latency: 0s}\n"
+                "  - {from: q, to: w, latency: 0s}\n"
+                "  - {from: w, to: api, latency: 0s}\n" +
+                one_fault("at: 10s, kind: node_down, node: api, for: 1s")));
+  CAPTURE(run.table, run.json);
+  REQUIRE(run.table.ends_with(
+      "fault 00:00:10 node_down api for 1s\n"
+      "  during:   offered 1k/s, served 0/s, lost 999 attempts (0 requests lost for good), "
+      "backlog 1 (room 1 dropped the rest)\n"
+      "  after:    backlog drained in 0.1s, pool w re-published 999 jobs\n" +
+      std::string{back_within} + "00:00:12 (1s after the fault cleared)\n"));
+  REQUIRE(run.json.contains("\"lost_unit\": \"attempts\", \"lost_requests\": 0"));
+  REQUIRE_THAT(number_after(run.json, "\"pool_republished_jobs\": "), WithinRel(999.0, 1e-9));
+  REQUIRE(run.json.contains("\"retries_added_attempts\": null"));
+}
+
 // Two faults declared latest first print earliest first. The node_down of 5 s at 10 s: the room
 // keeps 100 of 2000 offered, 1900 are lost, the block is as the probe's with the 5 s shifted; the
 // latency spike at 20 s is the one above.
@@ -1996,7 +2086,8 @@ TEST_CASE("a node_down on a byte-sized CDN prints its loss and rates in MB", "[t
   REQUIRE(run.faults[0].lost_unit == "MB");
   REQUIRE_THAT(run.faults[0].lost, WithinRel(24'000.0, 1e-9));
   REQUIRE_THAT(number_after(run.json, "\"lost\": "), WithinRel(24'000.0, 1e-9));
-  REQUIRE(run.json.contains("\"lost_unit\": \"MB\", \"lost_on_cut_links\": null"));
+  REQUIRE(run.json.contains(
+      "\"lost_unit\": \"MB\", \"lost_requests\": null, \"lost_on_cut_links\": null"));
 }
 
 // A dc_down whose datacenter holds the byte-sized CDN (and a client, which has no queue): the CDN
@@ -2029,7 +2120,8 @@ TEST_CASE("a dc_down with a byte-sized node counts MB at its nodes and requests 
   REQUIRE(run.faults.size() == 1);
   REQUIRE_THAT(run.faults[0].lost, WithinRel(24'000.0, 1e-9));
   REQUIRE_THAT(run.faults[0].lost_on_cut_links, WithinRel(500.0, 1e-9));
-  REQUIRE(run.json.contains("\"lost_unit\": \"MB\", \"lost_on_cut_links\": "));
+  REQUIRE(
+      run.json.contains("\"lost_unit\": \"MB\", \"lost_requests\": null, \"lost_on_cut_links\": "));
   REQUIRE_THAT(number_after(run.json, "\"lost_on_cut_links\": "), WithinRel(500.0, 1e-9));
 }
 
