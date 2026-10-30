@@ -642,6 +642,19 @@ compares against `min(prioritiser, cap)`; 4 → `internet` gets `capacity: 1M/s`
 quota the exercise; 5 → more than one consumer pool on a frontier refused; 6 → refused like
 `found 0`; 7 → deleted (Task 17's fix round removes `unpropagated_mark`'s grouping first); 9–11
 fixed; 8 at the push. The fix round runs after the Task 17 fix round lands.
+Fixed at `d9dbbbe` (1671 tests; identity on the thirteen other scenarios byte-identical). Beyond the
+decisions: the sink's `politeness` uses the same in-front cap (a sink capped at 1000/s with 5k/s
+of its own reads rho 0.2, pinned); the crawler's prioritiser 5k → 10k/s and the parser 20 → 25
+replicas so that the frontier's lag is the lesson (with only `internet` and `content_store`
+resized the prioritiser dropped 26 % and the parser sat at 95 %); the "type not simulated"
+refusal, `model::simulated()`, the table's `runs` column and the tests' `waits_for_a_later_task`
+scaffolding went with finding 7. Measured: `run` exits 2 on purpose, downloader rho 1 with its
+real 1000 workers, frontier lag 14.4 h after 6 h, `estimate` prints the lag `unbounded` and drops
+nothing; the `hosts` sweep 500..4000 moves rho 0.25..1 while the lag stays 14.8..14.4 h (the gain
+above 1 is the lesson); the `url_seen` hit-ratio sweep 0.9..0.98 brings the lag 14.4 h → 0.
+Carried to the phase review: an unbounded lag or backlog is written as JSON `null`, the same as
+"no lag"; the loader's `slo: queue_lag needs a message_queue node` message leaves out the
+frontier.
 
 - [ ] **3c push.** Twelve scenarios run; CI green.
 
