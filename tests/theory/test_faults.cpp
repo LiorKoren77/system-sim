@@ -2422,3 +2422,356 @@ TEST_CASE("a run without faults prints no fault block and no faults key", "[theo
     REQUIRE(run.faults.empty());
   }
 }
+
+// ---- service_discovery: callers are held on a dead replica for `failover` ----------------------
+//
+// Book ch. 1 says the load balancer routes around a server that went offline, and ch. 12's chat
+// system keeps a service discovery in front of its stateful servers. A registry learns of a death
+// late (its health checks must time out), so a caller that LOOKED UP the node keeps using the
+// address the registry gave it. Model under test (phase 3 spec §8.1, Task 13): when an op reaches a
+// node through a lookup (its step list has a step to a service_discovery asking `lookup` before the
+// step to the node: Graph::lookup_before) and a node_down takes r of the node's R replicas, then
+// for `failover` seconds from the fault's start the share r / R of that op's requests keep going to
+// the dead replicas and are LOST at the node; after that they route to the survivors, whose
+// capacity is already down by r / R, so they queue. A node_down with no lookup before it just
+// removes capacity: the balancer in front spreads the load over the survivors (the model of
+// "node_down of some replicas" above). The share is of that op's requests only, and it lasts
+// min(failover, the fault's own `for`): a replica that is back is not a dead one.
+//
+// The probe: a client c (1k/s of `call`) -> api (a service of 100k/s, nothing of its own to
+// mind) -> [disc.lookup, svc.call], svc being 4 replicas of 1k/s and 1 ms (c = 1 server each,
+// M/M/1 copies, queue_limit 100), all links of zero latency. A node_down of 1 replica of svc for
+// 30 s from 10 s, `failover: 10s`: the failover window is the 100 steps from 10.0 to 19.9 s.
+//   before the fault   rho = 1000 / 4000 = 0.25
+//   in the window      1/4 of the 1000/s goes to the dead replica: 250/s lost, 750/s reach the 3
+//                      survivors (capacity 3000/s): rho = 750 / 3000 = 0.25
+//   after the window   all 1000/s on the 3 survivors: rho = 1000 / 3000 = 0.3333 = 0.25 x 4/3
+// The numbers pinned about the dead share's place in the books (assumed, the plan says "lost at the
+// target"): the node's demand counts it, its drops do (250/s), its drain does not (750/s).
+
+namespace {
+struct DiscoveryProbe {
+  int rate_per_s = 1000;
+  int replicas = 4;
+  std::string client_ops = "{call: 1.0}";
+  std::string api_ops = "{call: [{to: disc, op: lookup}, {to: svc, op: call}]}";
+  std::string discovery_keys = ", failover: 10s";
+  std::string faults = one_fault("at: 10s, kind: node_down, node: svc, replicas: 1, for: 30s");
+  std::string timing = "duration: 60s\nstep: 100ms\n";
+};
+
+Scenario discovery_probe(const DiscoveryProbe& p) {
+  return load_yaml("version: 1\nname: discovery\n" + p.timing +
+                   "nodes:\n"
+                   "  c: {type: client, rate: {base: " +
+                   std::to_string(p.rate_per_s) + "/s}, ops: " + p.client_ops +
+                   "}\n"
+                   "  api: {type: service, capacity: 100k/s, latency: 1ms, ops: " +
+                   p.api_ops +
+                   "}\n"
+                   "  disc: {type: service_discovery" +
+                   p.discovery_keys +
+                   "}\n"
+                   "  svc: {type: service, capacity: 1k/s, latency: 1ms, replicas: " +
+                   std::to_string(p.replicas) +
+                   ", advanced: {queue_limit: 100}}\n"
+                   "links:\n"
+                   "  - {from: c, to: api, dir: inout, latency: 0s}\n"
+                   "  - {from: api, to: disc, dir: inout, latency: 0s}\n"
+                   "  - {from: api, to: svc, dir: inout, latency: 0s}\n" +
+                   p.faults);
+}
+
+// The probe's nodes in declaration order: c 0, api 1, disc 2, svc 3.
+constexpr std::size_t discovery_svc = 3;
+
+const simsys::engine::NodeSample& svc_of(const StepRecord& r) {
+  return r.nodes[discovery_svc];
+}
+
+// The steps of the 100 ms run that matter: record i starts at i / 10 s. The fault starts at 10 s,
+// step 100; a failover of 10 s closes at step 200; the 30 s fault ends at 40 s, step 400.
+constexpr std::size_t fault_start = 100;
+constexpr std::size_t failover_end = 200;
+constexpr std::size_t fault_end = 400;
+
+// What the client lost of `op` (index in the sorted ops) at a step, in requests per second.
+double client_lost(const StepRecord& r, std::size_t op = 0) {
+  return r.responses.at(op).lost.per_second;
+}
+}  // namespace
+
+// The lost share, step by step: 0.25 of 1000/s is 250/s lost while the registry still points at
+// the dead replica, and the other 750/s are answered by the survivors at the same rho as before
+// the fault (750 / 3000 = 0.25 = 1000 / 4000): the survivors do not feel it yet.
+TEST_CASE("during the failover a quarter of the looked-up requests is lost at the dead replica",
+          "[theory]") {
+  const auto records = records_of(graph_of(discovery_probe({})), 600);
+  for (std::size_t i = fault_start; i < failover_end; ++i) {
+    CAPTURE(i);
+    const auto& r = records.at(i);
+    REQUIRE_THAT(r.responses.at(0).offered.per_second, WithinRel(1000.0, 1e-9));
+    REQUIRE_THAT(client_lost(r), WithinRel(250.0, 1e-9));  // 0.25 of 1k/s
+    REQUIRE_THAT(r.responses.at(0).answered.per_second, WithinRel(750.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).demand_per_s, WithinRel(1000.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).dropped_per_s, WithinRel(250.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).drain_per_s, WithinRel(750.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).backlog, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).rho, WithinRel(750.0 / 3000.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).latency.mean_s, WithinRel(mm1_mean_s(0.001, 0.25), 1e-9));
+  }
+  // the step before the fault is the plain probe: rho 0.25, nothing lost
+  const auto& before = records.at(fault_start - 1);
+  REQUIRE_THAT(client_lost(before), WithinAbs(0.0, 1e-9));
+  REQUIRE_THAT(svc_of(before).rho, WithinRel(0.25, 1e-9));
+  REQUIRE_THAT(svc_of(before).drain_per_s, WithinRel(1000.0, 1e-9));
+}
+
+// From 10 s into the fault the requests route to the survivors: nothing is sent to the dead replica
+// any more, and the 3 copies of 1k/s carry all 1000/s, at rho = 1000 / 3000 = 0.3333 = 0.25 x 4/3
+// (a copy's load was 250/s, it is now 1000 / 3 = 333.3/s). An M/M/1 copy at that rho answers in
+// 1 ms / (1 - 1/3) = 1.5 ms. When the fault ends at 40 s the fourth replica is back: rho 0.25.
+TEST_CASE("after the failover nothing is lost and the three survivors run at rho 0.25 x 4/3",
+          "[theory]") {
+  const auto records = records_of(graph_of(discovery_probe({})), 600);
+  for (std::size_t i = failover_end; i < fault_end; ++i) {
+    CAPTURE(i);
+    const auto& r = records.at(i);
+    REQUIRE_THAT(client_lost(r), WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(r.responses.at(0).answered.per_second, WithinRel(1000.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).dropped_per_s, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).drain_per_s, WithinRel(1000.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).rho, WithinRel(0.25 * 4.0 / 3.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).latency.mean_s, WithinRel(mm1_mean_s(0.001, 1.0 / 3.0), 1e-9));
+    REQUIRE_THAT(svc_of(r).latency.mean_s, WithinRel(1.5e-3, 1e-9));
+  }
+  const auto& after = records.at(fault_end);
+  REQUIRE_THAT(svc_of(after).rho, WithinRel(0.25, 1e-9));
+  REQUIRE_THAT(client_lost(after), WithinAbs(0.0, 1e-9));
+}
+
+// The failover is a node_down's consequence for callers that looked the node up. Without a lookup
+// step before the step to svc (none at all, or one only AFTER the call: the caller had svc's
+// address already) the balancer spreads the load over the survivors from the first step of the
+// fault: rho = 1000 / 3000 = 0.3333 throughout, no drop, nothing lost, and the fault block has no
+// failover to report. (`disc` stays in the scenario, so these runs stop only for want of the model
+// until the type is simulated.)
+TEST_CASE("without a lookup before the node the balancer spreads the load: lost 0 throughout",
+          "[theory]") {
+  for (const auto* steps :
+       {"{call: [{to: svc, op: call}]}", "{call: [{to: svc, op: call}, {to: disc, op: lookup}]}"}) {
+    CAPTURE(steps);
+    const auto s = discovery_probe({.api_ops = steps});
+    const auto records = records_of(graph_of(s), 600);
+    for (std::size_t i = fault_start; i < fault_end; ++i) {
+      CAPTURE(i);
+      const auto& r = records.at(i);
+      REQUIRE_THAT(client_lost(r), WithinAbs(0.0, 1e-9));
+      REQUIRE_THAT(svc_of(r).dropped_per_s, WithinAbs(0.0, 1e-9));
+      REQUIRE_THAT(svc_of(r).drain_per_s, WithinRel(1000.0, 1e-9));
+      REQUIRE_THAT(svc_of(r).rho, WithinRel(1000.0 / 3000.0, 1e-9));
+      REQUIRE_THAT(svc_of(r).latency.mean_s, WithinRel(mm1_mean_s(0.001, 1.0 / 3.0), 1e-9));
+    }
+    const auto run = fault_run(s);
+    CAPTURE(run.table, run.json);
+    REQUIRE_FALSE(run.table.contains("failover"));
+    REQUIRE(run.json.contains("\"failover_lost\": null"));
+    REQUIRE_THAT(run.faults.at(0).lost, WithinAbs(0.0, 1e-9));
+  }
+}
+
+// The fault block's numbers for the probe: the fault is 30 s at 1000/s offered; the node serves
+// 750/s for the first 10 s and 1000/s for the other 20 (the drain mean (10 x 750 + 20 x 1000) / 30
+// = 916.67/s); it LOST 250/s x 10 s = 2500 requests, all of them to the dead replica (the twin has
+// none): `lost 2.5k requests`, and the after line says where they went. The backlog is nothing
+// all along (the survivors have 3000/s for 1000/s), so there is none to drain; the system is the
+// twin's the moment the fault ends: from the step at 40 s every rho is its twin's 0.25.
+// JSON (assumed name): `after.failover_lost`, the requests sent to the dead replicas, null when the
+// fault has no failover (no lookup before the node, or not a node_down).
+TEST_CASE("the fault block says how many requests failover sent to the dead replica: 2.5k",
+          "[theory]") {
+  const auto run = fault_run(discovery_probe({}));
+  CAPTURE(run.table, run.json);
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE_THAT(run.faults[0].offered_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(run.faults[0].served_per_s, WithinRel(27'500.0 / 30.0, 1e-9));
+  REQUIRE_THAT(run.faults[0].lost, WithinRel(2500.0, 1e-9));
+  REQUIRE(run.faults[0].lost_unit == "requests");
+  REQUIRE(run.faults[0].recovered_at == simsys::SimTime{40s});
+  REQUIRE(line_starting(run.table, "  during:   ").contains("lost 2.5k requests"));
+  const auto after = line_starting(run.table, "  after:    ");
+  CAPTURE(after);
+  REQUIRE(after.contains("failover 10s: 2.5k requests sent to the dead replica"));
+  REQUIRE_THAT(number_after(run.json, "\"failover_lost\": "), WithinRel(2500.0, 1e-9));
+}
+
+// r / R is the share, whatever r and R are: 2 of 4 replicas down send half of the requests to the
+// dead ones. 500/s are lost for the 10 s window (5000 requests), and the 500/s the 2 survivors
+// (capacity 2000/s) receive are rho = 500 / 2000 = 0.25 again; after the window all 1000/s fall on
+// them: rho = 0.5, M/M/1 mean 2 ms.
+TEST_CASE("two of four replicas down send half of the looked-up requests to the dead ones",
+          "[theory]") {
+  const auto s = discovery_probe(
+      {.faults = one_fault("at: 10s, kind: node_down, node: svc, replicas: 2, for: 30s")});
+  const auto records = records_of(graph_of(s), 600);
+  for (std::size_t i = fault_start; i < failover_end; ++i) {
+    CAPTURE(i);
+    const auto& r = records.at(i);
+    REQUIRE_THAT(client_lost(r), WithinRel(500.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).dropped_per_s, WithinRel(500.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).rho, WithinRel(500.0 / 2000.0, 1e-9));
+  }
+  for (std::size_t i = failover_end; i < fault_end; ++i) {
+    CAPTURE(i);
+    const auto& r = records.at(i);
+    REQUIRE_THAT(client_lost(r), WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).rho, WithinRel(0.5, 1e-9));
+    REQUIRE_THAT(svc_of(r).latency.mean_s, WithinRel(mm1_mean_s(0.001, 0.5), 1e-9));  // 2 ms
+  }
+  REQUIRE_THAT(number_after(fault_run(s).json, "\"failover_lost\": "), WithinRel(5000.0, 1e-9));
+}
+
+// The window is `failover`: 5 s loses 250/s x 5 s = 1250 requests, 20 s loses 5000, and a scenario
+// that states no failover gets the chosen 10 s (the loader's default, defaults.cppm): 2500, the
+// same run as `failover: 10s`. At the step the window closes the share is 0.
+TEST_CASE("the failover window is the discovery's failover: 5 s, 10 s by default, 20 s",
+          "[theory]") {
+  struct Case {
+    std::string keys;
+    std::size_t window_steps;
+    double lost_requests;
+  };
+  for (const auto& [keys, window_steps, lost_requests] :
+       {Case{", failover: 5s", 50, 1250.0}, Case{"", 100, 2500.0},
+        Case{", failover: 20s", 200, 5000.0}}) {
+    CAPTURE(keys);
+    const auto s = discovery_probe({.discovery_keys = keys});
+    const auto records = records_of(graph_of(s), 600);
+    REQUIRE_THAT(client_lost(records.at(fault_start + window_steps - 1)), WithinRel(250.0, 1e-9));
+    REQUIRE_THAT(client_lost(records.at(fault_start + window_steps)), WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(svc_of(records.at(fault_start + window_steps)).rho,
+                 WithinRel(1000.0 / 3000.0, 1e-9));
+    REQUIRE_THAT(number_after(fault_run(s).json, "\"failover_lost\": "),
+                 WithinRel(lost_requests, 1e-9));
+  }
+}
+
+// The dead replica is dead only while the fault lasts. A node_down of 4 s with a failover of 10 s
+// loses the quarter for the 4 s (250/s x 4 s = 1000 requests): when the replica is back at 14 s
+// the registry's stale address is a live one, nothing is lost and rho is the plain 0.25 again.
+TEST_CASE("a fault shorter than the failover loses only its own span: 1000 requests in 4 s",
+          "[theory]") {
+  const auto s = discovery_probe(
+      {.faults = one_fault("at: 10s, kind: node_down, node: svc, replicas: 1, for: 4s")});
+  const auto records = records_of(graph_of(s), 600);
+  REQUIRE_THAT(client_lost(records.at(139)), WithinRel(250.0, 1e-9));
+  for (const std::size_t i : {140u, 160u, 199u, 250u}) {
+    CAPTURE(i);
+    const auto& r = records.at(i);
+    REQUIRE_THAT(client_lost(r), WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).rho, WithinRel(0.25, 1e-9));
+    REQUIRE_THAT(svc_of(r).dropped_per_s, WithinAbs(0.0, 1e-9));
+  }
+  const auto run = fault_run(s);
+  CAPTURE(run.table, run.json);
+  REQUIRE_THAT(run.faults.at(0).lost, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(number_after(run.json, "\"failover_lost\": "), WithinRel(1000.0, 1e-9));
+}
+
+// The lost share is the looked-up op's, not the node's: `call` (500/s) looks svc up, `other`
+// (500/s) calls it without. During the window 0.25 x 500 = 125/s of `call` are lost and nothing of
+// `other`; the survivors get 375 + 500 = 875/s of their 3000: rho = 0.2917. After it 1000/3000.
+TEST_CASE("the lost share is taken from the looked-up op alone, not from the node's other traffic",
+          "[theory]") {
+  const auto s =
+      discovery_probe({.client_ops = "{call: 0.5, other: 0.5}",
+                       .api_ops = "{call: [{to: disc, op: lookup}, {to: svc, op: call}], "
+                                  "other: [{to: svc, op: call}]}"});
+  const auto records = records_of(graph_of(s), 600);
+  for (std::size_t i = fault_start; i < failover_end; ++i) {
+    CAPTURE(i);
+    const auto& r = records.at(i);
+    REQUIRE_THAT(client_lost(r, 0), WithinRel(125.0, 1e-9));  // call
+    REQUIRE_THAT(r.responses.at(0).answered.per_second, WithinRel(375.0, 1e-9));
+    REQUIRE_THAT(client_lost(r, 1), WithinAbs(0.0, 1e-9));  // other
+    REQUIRE_THAT(r.responses.at(1).answered.per_second, WithinRel(500.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).dropped_per_s, WithinRel(125.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).drain_per_s, WithinRel(875.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).rho, WithinRel(875.0 / 3000.0, 1e-9));
+  }
+  for (std::size_t i = failover_end; i < fault_end; ++i) {
+    CAPTURE(i);
+    const auto& r = records.at(i);
+    REQUIRE_THAT(client_lost(r, 0), WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(client_lost(r, 1), WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).rho, WithinRel(1000.0 / 3000.0, 1e-9));
+  }
+  REQUIRE_THAT(number_after(fault_run(s).json, "\"failover_lost\": "), WithinRel(1250.0, 1e-9));
+}
+
+// The dead share comes on top of what the survivors cannot take. At 3600/s the 4 copies are at
+// rho = 0.9 and drop nothing. In the window 900/s are sent to the dead replica (0.25 x 3600) and
+// the 2700/s left fit the survivors' 3000/s (rho 0.9 again, no drop): the client loses exactly the
+// 900/s. After it 3600/s meet 3000/s: the survivors drain 3000/s and drop the 600/s over, once
+// their room has filled (well within 5 s): the client then loses 600/s.
+TEST_CASE("the share sent to the dead replica comes on top of what the survivors cannot take",
+          "[theory]") {
+  const auto records = records_of(graph_of(discovery_probe({.rate_per_s = 3600})), 600);
+  for (std::size_t i = fault_start; i < failover_end; ++i) {
+    CAPTURE(i);
+    const auto& r = records.at(i);
+    REQUIRE_THAT(client_lost(r), WithinRel(900.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).dropped_per_s, WithinRel(900.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).rho, WithinRel(0.9, 1e-9));
+  }
+  for (std::size_t i = failover_end + 50; i < fault_end; ++i) {
+    CAPTURE(i);
+    const auto& r = records.at(i);
+    REQUIRE_THAT(svc_of(r).drain_per_s, WithinRel(3000.0, 1e-6));
+    REQUIRE_THAT(svc_of(r).dropped_per_s, WithinRel(600.0, 1e-6));
+    REQUIRE_THAT(client_lost(r), WithinRel(600.0, 1e-6));
+  }
+}
+
+// Failover is a node_down's. A capacity fault of 0.75 (a degraded tier: the service time stays)
+// on the looked-up node takes the same capacity but kills no replica: nothing is sent to a dead
+// one, the node loses nothing, rho = 1000 / 3000 from the first step, and the block has no
+// failover.
+TEST_CASE("a capacity fault on a looked-up node sends nothing to a dead replica", "[theory]") {
+  const auto s = discovery_probe(
+      {.faults = one_fault("at: 10s, kind: capacity, node: svc, factor: 0.75, for: 30s")});
+  const auto records = records_of(graph_of(s), 600);
+  for (std::size_t i = fault_start; i < fault_end; ++i) {
+    CAPTURE(i);
+    const auto& r = records.at(i);
+    REQUIRE_THAT(client_lost(r), WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).dropped_per_s, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(svc_of(r).rho, WithinRel(1000.0 / 3000.0, 1e-9));
+  }
+  const auto run = fault_run(s);
+  CAPTURE(run.table, run.json);
+  REQUIRE_FALSE(run.table.contains("failover"));
+  REQUIRE(run.json.contains("\"failover_lost\": null"));
+}
+
+// `estimate` is the steady state without the faults, failover included: a node_down active at the
+// instant it evaluates changes nothing in it, field for field, as for every other fault.
+TEST_CASE("estimate ignores the failover like every fault: the steady state without it",
+          "[theory]") {
+  const auto with_fault = graph_of(discovery_probe(
+      {.faults = one_fault("at: 0s, kind: node_down, node: svc, replicas: 1, for: 10s")}));
+  const auto without = graph_of(discovery_probe({.faults = ""}));
+  const auto faulted = simulation_of(with_fault).estimate();
+  const auto plain = simulation_of(without).estimate();
+  REQUIRE(faulted.nodes.size() == plain.nodes.size());
+  for (std::size_t i = 0; i < plain.nodes.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE(faulted.nodes[i].demand_per_s == plain.nodes[i].demand_per_s);
+    REQUIRE(faulted.nodes[i].drain_per_s == plain.nodes[i].drain_per_s);
+    REQUIRE(faulted.nodes[i].dropped_per_s == plain.nodes[i].dropped_per_s);
+    REQUIRE(faulted.nodes[i].rho == plain.nodes[i].rho);
+  }
+  REQUIRE_THAT(faulted.nodes[discovery_svc].rho, WithinRel(0.25, 1e-9));  // 1000 / 4000
+  REQUIRE(faulted.responses.at(0).lost.per_second == plain.responses.at(0).lost.per_second);
+  REQUIRE_THAT(faulted.responses.at(0).answered.per_second, WithinRel(1000.0, 1e-9));
+}

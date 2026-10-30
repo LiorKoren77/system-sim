@@ -1150,14 +1150,16 @@ TEST_CASE("book/notification-system is refused at fanout, its notification_fanou
           "(phase 3)");
 }
 
-// chat-system's nodes in file order: users, lb, the chat API service, then `discovery`, a
-// service_discovery, which comes before the `chat_servers` ws_gateway after it.
-TEST_CASE("book/chat-system is refused at discovery, its service_discovery", "[scenario]") {
+// chat-system's nodes in file order: users, lb, the chat API service, `discovery`, a
+// service_discovery (simulated since phase 3's Task 13: the engine used to stop there), then the
+// `chat_servers` ws_gateway, which has no model yet and is now the first node of a type it refuses.
+TEST_CASE("book/chat-system is refused at chat_servers, its ws_gateway, past the discovery",
+          "[scenario]") {
   const auto g = build_or_fail(load_scenario("/book/chat-system/scenario.yaml"));
   const auto sim = simsys::engine::Simulation::create(g);
   REQUIRE_FALSE(sim.has_value());
   REQUIRE(sim.error().message ==
-          "node 'discovery' has type 'service_discovery', which run/estimate do not support yet "
+          "node 'chat_servers' has type 'ws_gateway', which run/estimate do not support yet "
           "(phase 3)");
 }
 

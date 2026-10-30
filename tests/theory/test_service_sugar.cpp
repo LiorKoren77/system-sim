@@ -1,10 +1,10 @@
 // Whole-simulation checks against closed-form queueing theory (spec §12).
 // Spec entries pinned here: §18 entry 12 and §19 entry 10 (the id generator and the search index as
 // service sugar).
-// This file: the id generator and the search index, two node types that are a service with their
-// own defaults (service sugar). One of the nine files the theory tests are split into by topic; the
-// scenario builders more than one of them needs live in tests/support/fixtures.cppm (module
-// simsys.test_fixtures).
+// This file: the id generator, the search index and the service discovery, three node types that
+// are a service with their own defaults (service sugar). One of the nine files the theory tests are
+// split into by topic; the scenario builders more than one of them needs live in
+// tests/support/fixtures.cppm (module simsys.test_fixtures).
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <optional>
 #include <utility>
+#include <vector>
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
@@ -40,6 +41,7 @@ using simsys::model::LinkSpec;
 using simsys::model::NodeSpec;
 using simsys::model::NodeType;
 using simsys::model::Scenario;
+using simsys::model::Step;
 using simsys::model::Workload;
 
 // ---- ID generator as service sugar (spec §18 entry 12; book ch. 7) ----
@@ -243,4 +245,139 @@ TEST_CASE("a search index steps exactly as the service of the same keys", "[theo
     REQUIRE(a.responses[0].response.mean_s == b.responses[0].response.mean_s);
     REQUIRE(a.responses[0].answered.per_second == b.responses[0].answered.per_second);
   }
+}
+
+// ---- Service discovery as service sugar (phase 3 spec §8.1; book ch. 12) ----
+//
+// A service_discovery answers the `lookup` ops its callers send before they call a node, and
+// runs exactly as a service of the type's numbers: 50k/s and 0.5 ms (one round trip within the
+// data centre), so c = 50,000/s x 0.5 ms = 25 servers (Little's law). Its failover rule only
+// matters under a node_down and is pinned in test_faults.cpp; here it is a queue like any other.
+
+namespace {
+// u (1k/s of `call`) -> api (100k/s, 1 ms: c = 100) -> [disc.lookup, svc.call] -> svc (4k/s, 1 ms:
+// c = 4, rho = 0.25). `discovery_type` is a service_discovery with the type's numbers or the
+// service that must equal it (50k/s, 0.5 ms stated); `with_lookup` false leaves out the lookup
+// step and the discovery node: the same path without the detour. Every link has `link` of
+// one-way latency. Node indices: u 0, api 1, svc 2, disc 3 (last, so the others keep their place).
+Scenario discovery_chain(NodeType discovery_type, bool with_lookup = true,
+                         simsys::SimTime link = 0s) {
+  Scenario s{.name = "discovery-chain", .version = 1, .duration = 10s, .warmup = 2s};
+  std::vector<Step> steps;
+  if (with_lookup) steps.push_back(Step{.to = "disc", .op = "lookup"});
+  steps.push_back(Step{.to = "svc", .op = "call"});
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"call", 1.0}}}},
+      NodeSpec{.id = "api",
+               .type = NodeType::service,
+               .capacity = Rate{100'000},
+               .latency = 1ms,
+               .ops = {{"call", std::move(steps)}}},
+      NodeSpec{.id = "svc", .type = NodeType::service, .capacity = Rate{4000}, .latency = 1ms}};
+  s.links = {LinkSpec{.from = "u", .to = "api", .dir = Direction::inout, .latency = link},
+             LinkSpec{.from = "api", .to = "svc", .dir = Direction::inout, .latency = link}};
+  if (with_lookup) {
+    NodeSpec disc{.id = "disc", .type = discovery_type};
+    if (discovery_type == NodeType::service) {
+      disc.capacity = Rate{50'000};
+      disc.latency = 500us;
+    }
+    s.nodes.push_back(std::move(disc));
+    s.links.push_back(
+        LinkSpec{.from = "api", .to = "disc", .dir = Direction::inout, .latency = link});
+  }
+  return s;
+}
+
+// The M/M/c mean sojourn at c servers, per-server utilization rho and service time s: the wait of
+// Erlang C plus the service (queueing::mmc_wait), the closed form every latency below is made of.
+double sojourn_s(int servers, double rho, double service_s) {
+  return simsys::queueing::mmc_wait(servers, rho, service_s).mean_s + service_s;
+}
+}  // namespace
+
+// "Sugar": a service_discovery with no numbers stated steps bit for bit as the service of 50k/s
+// and 0.5 ms: the engine runs one behaviour for both (== on doubles, not a tolerance).
+TEST_CASE("a service discovery steps exactly as the service of its type's numbers", "[theory]") {
+  const auto as_discovery = *Graph::build(discovery_chain(NodeType::service_discovery));
+  const auto as_service = *Graph::build(discovery_chain(NodeType::service));
+  auto discovery_created = Simulation::create(as_discovery);
+  INFO((discovery_created ? "" : discovery_created.error().message));
+  REQUIRE(discovery_created.has_value());  // checked before the dereference, so a refusal fails
+  auto service_created = Simulation::create(as_service);
+  REQUIRE(service_created.has_value());
+  auto& discovery_sim = *discovery_created;
+  auto& service_sim = *service_created;
+  for (int i = 0; i < 5; ++i) {
+    const auto a = discovery_sim.step(i * 100ms, 100ms);
+    const auto b = service_sim.step(i * 100ms, 100ms);
+    for (std::size_t node = 0; node < a.nodes.size(); ++node) {
+      CAPTURE(i, node);
+      REQUIRE(a.nodes[node].demand_per_s == b.nodes[node].demand_per_s);
+      REQUIRE(a.nodes[node].rho == b.nodes[node].rho);
+      REQUIRE(a.nodes[node].drain_per_s == b.nodes[node].drain_per_s);
+      REQUIRE(a.nodes[node].latency.mean_s == b.nodes[node].latency.mean_s);
+      REQUIRE(a.nodes[node].latency.variance_s2 == b.nodes[node].latency.variance_s2);
+    }
+    REQUIRE(a.responses[0].response.mean_s == b.responses[0].response.mean_s);
+    REQUIRE(a.responses[0].answered.per_second == b.responses[0].answered.per_second);
+  }
+}
+
+// Every request of `call` sends one lookup: 1000/s into 50k/s, c = 25 servers, rho = 1000 / 50,000
+// = 0.02. Erlang C at that rho is nothing (P(wait) of the order (c rho)^c / c! = 0.5^25 / 25!
+// ~ 2e-33), so the discovery answers in its 0.5 ms and drops nothing.
+TEST_CASE("a service discovery at 1k lookups a second is almost idle: rho 0.02, 0.5 ms",
+          "[theory]") {
+  const auto g = *Graph::build(discovery_chain(NodeType::service_discovery));
+  const auto sim = Simulation::create(g);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const auto r = (*Simulation::create(g)).step(0s, 100ms);
+  const auto& disc = r.nodes[*g.index_of("disc")];
+  REQUIRE_THAT(disc.demand_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(disc.rho, WithinRel(0.02, 1e-9));
+  REQUIRE_THAT(disc.latency.mean_s, WithinRel(sojourn_s(25, 0.02, 0.5e-3), 1e-9));
+  REQUIRE_THAT(disc.latency.mean_s, WithinRel(0.5e-3, 1e-6));  // the napkin number: no queue
+  REQUIRE(disc.dropped_per_s == 0.0);
+}
+
+// The lookup is a hop the op waits for (sequential, like any step): it adds the discovery's
+// sojourn, 0.5 ms with no queue, plus the round trip of the link to it, 2 x one-way. Links of 2 ms
+// make that 0.5 + 4 = 4.5 ms on top of the same path without the lookup, which pays only what is
+// left: u -> api, api -> svc (each 2 x 2 ms), api's 1 ms (rho 0.01) and svc's 1 ms (rho 0.25).
+TEST_CASE("a lookup adds the discovery's 0.5 ms and its link's round trip to the op's mean",
+          "[theory]") {
+  const auto link = 2ms;
+  const auto with = *Graph::build(discovery_chain(NodeType::service_discovery, true, link));
+  const auto without = *Graph::build(discovery_chain(NodeType::service_discovery, false, link));
+  const auto sim = Simulation::create(with);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const double with_mean = (*Simulation::create(with)).step(0s, 100ms).responses[0].response.mean_s;
+  const double without_mean =
+      (*Simulation::create(without)).step(0s, 100ms).responses[0].response.mean_s;
+  const double link_s = 2e-3;
+  const double api = sojourn_s(100, 0.01, 1e-3);
+  const double svc = sojourn_s(4, 0.25, 1e-3);
+  const double disc = sojourn_s(25, 0.02, 0.5e-3);
+  REQUIRE_THAT(without_mean, WithinRel(2 * link_s + api + 2 * link_s + svc, 1e-9));
+  REQUIRE_THAT(with_mean,
+               WithinRel(2 * link_s + api + (2 * link_s + disc) + 2 * link_s + svc, 1e-9));
+  REQUIRE_THAT(with_mean - without_mean, WithinRel(0.5e-3 + 2 * link_s, 1e-6));  // 4.5 ms
+}
+
+// With zero-latency links the lookup costs the discovery's sojourn and nothing else.
+TEST_CASE("on zero-latency links a lookup adds exactly the discovery's sojourn", "[theory]") {
+  const auto with = *Graph::build(discovery_chain(NodeType::service_discovery));
+  const auto without = *Graph::build(discovery_chain(NodeType::service_discovery, false));
+  const auto sim = Simulation::create(with);
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+  const double with_mean = (*Simulation::create(with)).step(0s, 100ms).responses[0].response.mean_s;
+  const double without_mean =
+      (*Simulation::create(without)).step(0s, 100ms).responses[0].response.mean_s;
+  REQUIRE_THAT(with_mean - without_mean, WithinRel(sojourn_s(25, 0.02, 0.5e-3), 1e-9));
 }

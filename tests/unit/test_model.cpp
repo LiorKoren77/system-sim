@@ -40,19 +40,22 @@ TEST_CASE("the node type table is complete at compile time", "[model]") {
 }
 
 // The node-type table's third column says which types run/estimate can step today: every type but
-// the ones whose models phase 3 has yet to add (the ws_gateway is modelled by Task 14).
-// Simulation::create reads it (model::simulated), and the scenario tests pin the shipped scenarios
-// it lets run.
-TEST_CASE("every node type runs but the three that phase 3 has yet to model", "[model]") {
+// the two whose models phase 3 still has to add (a service_discovery runs since Task 13: a
+// service that answers `lookup`; a ws_gateway since Task 14). Simulation::create reads it
+// (model::simulated), and the scenario tests pin the shipped scenarios it lets run.
+TEST_CASE("every node type runs but the two that phase 3 has still to model", "[model]") {
   for (const auto& row : simsys::model::node_type_table) {
     CAPTURE(row.name);
-    const bool phase_3 = row.value == NodeType::service_discovery ||
-                         row.value == NodeType::notification_fanout ||
-                         row.value == NodeType::frontier;
-    REQUIRE(simsys::model::simulated(row.value) == !phase_3);
+    const bool still_to_model =
+        row.value == NodeType::notification_fanout || row.value == NodeType::frontier;
+    REQUIRE(simsys::model::simulated(row.value) == !still_to_model);
   }
   static_assert(simsys::model::simulated(NodeType::service));
   static_assert(!simsys::model::simulated(NodeType::frontier));
+}
+
+TEST_CASE("a service discovery is a node type the engine runs", "[model]") {
+  REQUIRE(simsys::model::simulated(NodeType::service_discovery));
 }
 
 namespace {
