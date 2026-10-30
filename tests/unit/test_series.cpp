@@ -22,7 +22,6 @@
 #include <vector>
 
 #include "../support/explain_lines.hpp"
-#include "../support/scenario_helpers.hpp"
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions when a
@@ -34,6 +33,7 @@ import simsys.fluid; // Zone: a hand-made LinkSample's
 import simsys.graph;
 import simsys.model;
 import simsys.report;
+import simsys.test_fixtures;
 import simsys.workload; // Spike: the probe's 20 s of triple load
 
 using namespace std::chrono_literals;
@@ -48,7 +48,7 @@ using simsys::model::Scenario;
 using simsys::model::Workload;
 using simsys::test_support::check_line;
 using simsys::test_support::node_line;
-// Shared with test_series / test_report (tests/support/scenario_helpers.hpp).
+// Shared with test_series / test_report (tests/support/fixtures.cppm, simsys.test_fixtures).
 using simsys::test_support::explain_of;
 using simsys::test_support::piped;
 
@@ -1034,7 +1034,7 @@ TEST_CASE("explain names every blocking type on the way to a node, nearest first
 // Picture: client `a` sends `rate` puts/s of 1 MB to service `b` over a 1 Gbit/s = 125 MB/s link.
 
 namespace {
-// The scenario: test_support::piped (tests/support/scenario_helpers.hpp), a(`rate`/s of 1 MB
+// The scenario: test_support::piped (tests/support/fixtures.cppm), a(`rate`/s of 1 MB
 // `put`s) -> b over a 250 us link of 1 Gbit/s, 3 s at 100 ms steps, the first 500 ms warmup.
 
 // The text of the JSON object that starts at the first `"name": "<name>"` (up to its closing
@@ -1141,7 +1141,7 @@ TEST_CASE("the conservation identity holds on the link rows read back from the s
 // The JSON `links`: one object per bandwidth link. Constant load, so every step of the run has
 // the same numbers and any way of summarising them (mean, peak, last) reads the same:
 // 100 MB/s offered and drained, nothing dropped or waiting, rho 0.8 (yellow), a sojourn of 24 ms
-// (Wq 16 ms + 8 ms, see test_theory). The latency's key is `latency_s` if it follows the other
+// (Wq 16 ms + 8 ms, see test_bytes_pipes). The latency's key is `latency_s` if it follows the other
 // `_s` keys, `latency` as the plan words it: either is read here; its value is in seconds.
 TEST_CASE("the JSON has links with the pipe's demand, drain, drops, backlog, rho, latency and zone",
           "[series]") {

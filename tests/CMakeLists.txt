@@ -2,20 +2,46 @@
 list(APPEND CMAKE_MODULE_PATH ${Catch2_SOURCE_DIR}/extras)
 include(Catch)
 
+# The builders more than one test file needs (an M/M/1 probe, the pipe and message-queue pictures,
+# a fresh simulation, explain of a scenario built in code), as the named module
+# simsys.test_fixtures: compiled once here instead of once per test file that would include them.
+add_library(simsys_test_support)
+target_sources(simsys_test_support
+  PUBLIC FILE_SET CXX_MODULES FILES support/fixtures.cppm
+  PRIVATE support/fixtures.cpp)
+# Catch2::Catch2 (not ...WithMain): the fixtures call REQUIRE and FAIL; main() is the tests'.
+target_link_libraries(simsys_test_support PUBLIC simsys Catch2::Catch2 PRIVATE simsys_warnings)
+# GCC 14.2's fourth defect (CLAUDE.md §3), release link: fixtures.cpp emits the special members of
+# std templates over model types that a test executable calls but no object defines; -fno-inline
+# keeps its calls to them out of line, so its object file defines them (as for src/model/model.cpp).
+set_source_files_properties(support/fixtures.cpp PROPERTIES COMPILE_OPTIONS -fno-inline)
+
 add_executable(unit_tests unit/test_units.cpp unit/test_config.cpp unit/test_queueing.cpp unit/test_flow.cpp unit/test_fluid.cpp unit/test_workload.cpp unit/test_caching.cpp unit/test_model.cpp unit/test_defaults.cpp unit/test_graph.cpp unit/test_behaviours.cpp unit/test_engine.cpp unit/test_report.cpp unit/test_series.cpp unit/test_sweep.cpp)
-target_link_libraries(unit_tests PRIVATE simsys Catch2::Catch2WithMain simsys_warnings)
+target_link_libraries(unit_tests PRIVATE simsys simsys_test_support Catch2::Catch2WithMain simsys_warnings)
 # test_series.cpp explains shipped scenarios and test_sweep.cpp sweeps tutorial/hello, so they need
 # the directory, like scenario_tests.
 target_compile_definitions(unit_tests PRIVATE SIMSYS_SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios")
 catch_discover_tests(unit_tests)
 
 add_executable(scenario_tests scenario/test_scenarios.cpp)
-target_link_libraries(scenario_tests PRIVATE simsys Catch2::Catch2WithMain simsys_warnings)
+target_link_libraries(scenario_tests PRIVATE simsys simsys_test_support Catch2::Catch2WithMain simsys_warnings)
 target_compile_definitions(scenario_tests PRIVATE SIMSYS_SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios")
 catch_discover_tests(scenario_tests)
 
-add_executable(theory_tests theory/test_theory.cpp theory/test_timeout.cpp theory/test_windows.cpp)
-target_link_libraries(theory_tests PRIVATE simsys Catch2::Catch2WithMain simsys_warnings)
+# The theory tests, one file per topic (closed forms checked against whole simulations).
+add_executable(theory_tests
+  theory/test_core.cpp
+  theory/test_database_cdn.cpp
+  theory/test_bytes_pipes.cpp
+  theory/test_service_sugar.cpp
+  theory/test_queues_pools.cpp
+  theory/test_sinks.cpp
+  theory/test_kv.cpp
+  theory/test_failed_steps.cpp
+  theory/test_rho_one.cpp
+  theory/test_timeout.cpp
+  theory/test_windows.cpp)
+target_link_libraries(theory_tests PRIVATE simsys simsys_test_support Catch2::Catch2WithMain simsys_warnings)
 # test_timeout.cpp pins the shipped youtube scenario's uploads and test_windows.cpp the shipped
 # url-shortener's hours, so they need the directory too.
 target_compile_definitions(theory_tests PRIVATE SIMSYS_SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios")
