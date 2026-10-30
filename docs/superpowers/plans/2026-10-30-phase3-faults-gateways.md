@@ -552,6 +552,24 @@ ended do not reconnect), documented; 7 → the fault's key renamed `peak_offered
 9 → the storm follows the gateway's capacity derating from any fault kind, so a `dc_down` drops
 the replicas in that datacenter like a `node_down` (schema, `faults.cppm`, README updated);
 8 at the push. The fix round runs on its own branch beside the Task 18 fix round.
+Fixed at `2272f2b` (1681 tests; seven scenarios byte-identical, google-drive included; only
+chat-system's storm numbers move). Narrower than decided, each for a stated reason: 1 → the storm
+stops only when every replica goes down (a new partial fault during a storm keeps the storm going
+to the survivors, which already receive connects); 9 → only `node_down` and `dc_down` drop
+connections (a `capacity` fault leaves the servers alive, and per-fault waiting needs each
+fault's identity, which the combined derating does not carry); a `dc_down` gets the storm line.
+Added: connects sent while the whole tier is down wait and come back with the storm (without it
+decay alone leaves every full outage λ × `for` below the twin); retried reconnects return at an
+exponential rate `1 / reconnect_within` (memoryless, so one number holds them); two faults
+hitting one gateway in one step split that step's drop in scenario order (pinned). Measured:
+storm 1.617M (84.6 % of the dropped users left after the minute's decay, plus the 248k users whose
+connects were lost during it: equal at the level's fixed point, the README says why), offered
+peak 93.9 % at 21:31:29.9, back within 1 % at 21:38:58.7; 10 s row 161.7k connects/s, peak 112 %,
+2.205M dropped, back at 21:31:10.4; 30 s row 53.9k/s. Carried to the phase review: the block's
+storm count is the connections dropped, not the users who come back (overstated after a long
+fault; schema and README say so); the storm's own users do not end sessions while they wait
+their turn in the window (overshoot ≈ window / 2 / session, 1.6 % in the back-to-back probe);
+users' own connects refused by the survivors' smaller cap are not retried (documented as ignored).
 
 ### Task 16: google-drive runs end to end
 
@@ -656,7 +674,7 @@ Carried to the phase review: an unbounded lag or backlog is written as JSON `nul
 "no lag"; the loader's `slo: queue_lag needs a message_queue node` message leaves out the
 frontier.
 
-- [ ] **3c push.** Twelve scenarios run; CI green.
+- [ ] **3c push.** All fourteen scenarios run; CI green. The five-second-CPU scenario test is registered with `RUN_SERIAL` (`6173f62`, Task 16's note).
 
 ---
 

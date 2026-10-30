@@ -27,7 +27,7 @@ key-value clusters (ring, replication and quorums), search indexes and id genera
 a failed step does not run, refused, dropped and timed-out requests are counted apart
 (`reject_rate`, `drop_rate`, `timed_out_per_s`), and an SLO can be checked per window (`over: 1h`).
 `simsys sweep` runs a scenario over a range of one key, the points in parallel. All fourteen
-shipped scenarios run end to end, the eight book systems among them (list below). 1659 tests
+shipped scenarios run end to end, the eight book systems among them (list below). 1681 tests
 (Catch2, via `ctest`). The scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.4).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
