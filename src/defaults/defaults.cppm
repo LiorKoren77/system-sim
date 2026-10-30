@@ -373,6 +373,14 @@ struct Resolved {
 // tier of the book's designs; more is a sign the rate and latency describe different things.
 inline constexpr int max_concurrency = 100'000;
 
+// How long a client with `retries` waits before it sends a lost or timed-out request again, when
+// the scenario does not say (model::Workload::retry_after). Chosen, not from the book: ch. 1 and
+// ch. 10 say to retry with a backoff but give no number; 100 ms is one default step of the engine
+// (model::Scenario::step), the shortest wait the time-stepped engine can show, and of the order of
+// the latency table's cross-continent round trip (150 ms), so a retry waits about as long as an
+// answer from far away would have taken.
+inline constexpr SimTime retry_after = 100_ms;
+
 // The number of servers c that makes a node one consistent machine. Little's law
 // (L = lambda * W) applied to the servers at full load: the requests in service equal
 // throughput times time in service, so c = service_rate * service_time. Rounded up

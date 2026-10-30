@@ -553,8 +553,8 @@ percentile. Today the lab cuts 3.5e-7 of its calls and prints a p99 of 24.8 ms w
 time and 1k/s (c = 100, so no wait: the sojourn is exponential, m = 100 ms, v = 0.01 s², SCV 1)
 over a link of `latency: 0s`, with `timeout: 200ms` (σ = 0.8326, μ = −2.6492, z = 1.2488):
 
-    client.op  offered/s  timed out/s  mean     p50     p95     p99  (estimated)
-    users.get         10        1.059  74ms  70.7ms  >200ms  >200ms
+    client.op  offered/s  attempts/s  timed out/s  mean     p50     p95     p99  (estimated)
+    users.get         10          10        1.059  74ms  70.7ms  >200ms  >200ms
 
 89.41 % answered (JSON `answered_per_s` 8.941367), 10.59 % timed out, and the answered mean
 73.97 ms (`mean_s` 0.0739704), as the formulas give. At `timeout: 1s` 99.927 % are answered, at

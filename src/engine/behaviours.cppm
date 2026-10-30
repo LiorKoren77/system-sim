@@ -700,9 +700,28 @@ class ServiceBehaviour {
 // multiplier (workload::NoiseProcess), split into ops by fixed shares, each op split over the links
 // that carry it by link weight (DNS round-robin, CDN vs origin), and a `timeout` after which the
 // client gives up on a request (the engine counts the slow tail of each response as timed out
-// instead of answered: engine::Simulation::give_up_after). Ignored: think time and closed-loop
-// clients (offered load never reacts to latency: a slow site does not make these users send less or
-// leave), and retries (a timed-out request is not sent again).
+// instead of answered: engine::Simulation::give_up_after), and `retries` (below). Ignored: think
+// time and closed-loop clients (offered load never reacts to latency: a slow site does not make
+// these users send less or leave).
+//
+// Retries (phase 3 spec §6.1): the retry storm of ch. 1's and ch. 10's advice to retry a failed
+// call with a backoff. A client with `retries: n` sends every request it lost (a node on the path
+// dropped, refused or failed it) or timed out again, `retry_after` later, up to n extra attempts.
+// In a fluid model that is FEEDBACK DEMAND: with b = retry_after / step rounded to whole steps (at
+// least one) and q_t the share of step t's attempts the path loses or times out,
+//   attempts_t = curve_t + Σ_{k=1..n} r_k(t)      r_k(t) = r_{k−1}(t − b) × q_(t−b),  r_0 = curve
+// r_k(t) being attempt k of the requests first sent at t − k·b: every attempt fails at the share
+// the path fails in the step it is sent (RetryRing keeps the r_k in flight). On a path that
+// fails a steady q, a request is sent 1 + q + q² + ... + q^n = (1 − q^(n+1)) / (1 − q) times (a
+// geometric series that `retries` caps), is answered with probability 1 − q^(n+1) and is lost for
+// good, its last attempt failed too, with probability q^(n+1). Why `offered` stays the curve: the
+// retries are the clients' own doing, not more users, so a storm shows as `attempts/s` above
+// `offered/s`. Why the servers do every attempt's work: nothing cancels a failed attempt (a
+// dropped one cost its queue a place, a failed one its service, a timed-out one was served after
+// the client left), and the retries pile on top, which is what turns an outage into a storm.
+// Ignored: jitter (every retry waits exactly `retry_after`), exponential backoff (the wait does not
+// grow from one attempt to the next), retry budgets and circuit breakers, idempotency (a retried
+// write that had in fact succeeded is not counted twice), and a user who gives up between attempts.
 class ClientBehaviour {
  public:
   // `seed` seeds this client's noise process; the engine passes workload::client_seed(scenario
@@ -786,7 +805,54 @@ class ClientBehaviour {
   // The client's `timeout` in seconds; empty when it waits for ever.
   [[nodiscard]] std::optional<double> timeout_s() const { return timeout_s_; }
 
+  // The client's `retries` n: how many more times it sends a request that failed (0: never).
+  [[nodiscard]] int retries() const { return retries_; }
+
+  // What the client sends of `op` this step, retries included: `offered` (rate × op share, see
+  // `offered`) plus the retries due now. `offered` itself without retries.
+  [[nodiscard]] Rate attempts(std::string_view op, Rate offered) const;
+
+  // The part of this step's attempts of `op` that are their request's last (attempt n's, the
+  // first attempt's when n = 0): a request whose last attempt fails is lost for good.
+  [[nodiscard]] Rate last_attempts(std::string_view op, Rate offered) const;
+
+  // After the step: of every attempt of `op` sent this step but the last ones, `failed_share` (the
+  // share the path lost or that timed out) is sent again `retry_after` later as the next attempt.
+  // `offered` is the step's first attempts (the `offered` the step's attempts were made of). A
+  // no-op for a client without retries.
+  void retry_failed(std::string_view op, Rate offered, double failed_share);
+
+  // Every retry in flight forgotten, and from now on each retry sent at the next evaluation: what
+  // estimate()'s scratch copy needs, where every pass is the same instant and a backoff is no
+  // more than a delay on the way to the fixed point (engine::Simulation::settling_copy).
+  void settle_retries();
+
  private:
+  // One op's retries in flight: the rate of each attempt k = 1..n that will be sent in each of the
+  // next `backoff` steps. A ring of `backoff` slots, one per step until it is due, each holding
+  // the n attempts' rates (attempt k at index k − 1). The current slot is what this step sends;
+  // after the step it is refilled with the retries of this step's failures, which come round
+  // again `backoff` steps later, and the ring moves on one slot.
+  class RetryRing {
+   public:
+    RetryRing(int retries, int backoff_steps);
+    [[nodiscard]] double due() const;  // Σ of the attempts due this step
+    [[nodiscard]] double last_attempts(double first) const;
+    void fail(double first, double failed_share);
+
+   private:
+    [[nodiscard]] std::span<double> current();
+    [[nodiscard]] std::span<const double> current() const;
+    std::size_t retries_;
+    std::size_t slots_;
+    std::size_t slot_{0};
+    std::vector<double> rates_;  // slots_ × retries_, slot by slot
+  };
+
+  [[nodiscard]] std::optional<std::size_t> ring_index(std::string_view op) const;
+  [[nodiscard]] double retries_due(std::string_view op) const;
+  void start_retries(int backoff_steps);
+
   // One graph::ClientRoute plus what the behaviour needs per step.
   struct RouteLeg {
     std::string op;
@@ -811,6 +877,8 @@ class ClientBehaviour {
   std::vector<RouteLeg> legs_;
   std::vector<std::string> ops_;
   std::optional<double> timeout_s_{};
+  int retries_{0};
+  std::vector<RetryRing> retry_rings_;  // like ops_; empty without retries
 };
 
 }  // namespace simsys::behaviours
@@ -1791,11 +1859,12 @@ class WorkerPoolBehaviour {
 // the node's drop rate like a full queue's overflow, and the `own` share it hands `delivered`
 // already lacks them: this behaviour forwards nothing, composes nothing and must not apply f a
 // second time. A failure is the provider failing, not a policy working: nothing is ever counted as
-// rejected. Ignored: retries (an `on: failure` step after the call to the sink sends its failed
-// share on, detail::HopBlocks, but nothing sends a failed push again: it is lost), the provider's
-// latency rising with our load (its queue is our account's quota, not its fleet), failures that
-// cost a different time than a success, and `politeness` (printed, not modelled: it needs per-host
-// state, phase 3).
+// rejected. A client's `retries` send a failed request again (ClientBehaviour), which this queue
+// sees as more demand. Ignored: a pool's retries (an `on: failure` step after the call to the sink
+// sends its failed share on, detail::HopBlocks, but no pool sends a failed push again yet), the
+// provider's latency rising with our load (its queue is our account's quota, not its fleet),
+// failures that cost a different time than a success, and `politeness` (printed, not modelled: it
+// needs per-host state, phase 3).
 class ExternalSinkBehaviour {
  public:
   ExternalSinkBehaviour(const graph::Graph& g, std::size_t self);
@@ -2204,6 +2273,18 @@ std::optional<detail::MissesOf> ServiceBehaviour::misses_of_lookup(
 
 // ---- ClientBehaviour ----
 
+namespace detail {
+
+// A client's backoff in whole steps (phase 3 spec §6.1): retry_after / step rounded to the nearest
+// step, and at least one, because the engine can send a retry no sooner than the step after the
+// failure it repeats (a retry_after shorter than half a step waits one step all the same).
+[[nodiscard]] int backoff_steps(SimTime retry_after, SimTime step) {
+  const auto steps = std::llround(seconds(retry_after) / seconds(step));
+  return static_cast<int>(std::max<long long>(steps, 1));
+}
+
+}  // namespace detail
+
 ClientBehaviour::ClientBehaviour(const graph::Graph& g, std::size_t self, std::uint64_t seed)
     : seed_{seed} {
   const auto& workload = g.nodes()[self].spec.workload;
@@ -2215,6 +2296,9 @@ ClientBehaviour::ClientBehaviour(const graph::Graph& g, std::size_t self, std::u
   op_shares_ = workload->op_shares;
   std::ranges::sort(op_shares_, {}, &std::pair<std::string, double>::first);
   for (const auto& [op, share] : op_shares_) ops_.push_back(op);
+  retries_ = workload->retries;
+  start_retries(detail::backoff_steps(workload->retry_after.value_or(defaults::retry_after),
+                                      g.scenario().step));
   for (const auto& route : g.client_routes(self)) {
     const auto op_share =
         std::ranges::find(workload->op_shares, route.op, &std::pair<std::string, double>::first);
@@ -2252,16 +2336,93 @@ std::vector<std::pair<std::string, Rate>> ClientBehaviour::offered(SimTime now) 
   return per_op;  // sorted by op, as op_shares_ is
 }
 
+// Each route of an op carries its share of the op's retries as it does of its first attempts.
+// Without retries due the sum adds 0.0, which leaves total × share_of_rate exactly as it was.
 Routed ClientBehaviour::offer(SimTime now) const {
   Routed routed;
   const double total = rate(now).per_second;
   for (const RouteLeg& leg : legs_) {
-    const double leg_rate = total * leg.share_of_rate;
+    const double leg_rate = total * leg.share_of_rate + retries_due(leg.op) * leg.route_share;
     if (leg_rate <= 0.0) continue;  // no empty branches (see ServiceBehaviour::route)
     detail::flow_towards(routed.outgoing, leg.target, leg.link).add(leg.op, Rate{leg_rate});
   }
   detail::sort_by_destination(routed.outgoing);
   return routed;
+}
+
+Rate ClientBehaviour::attempts(std::string_view op, Rate offered) const {
+  return Rate{offered.per_second + retries_due(op)};
+}
+
+Rate ClientBehaviour::last_attempts(std::string_view op, Rate offered) const {
+  const auto ring = ring_index(op);
+  return ring ? Rate{retry_rings_[*ring].last_attempts(offered.per_second)} : offered;
+}
+
+void ClientBehaviour::retry_failed(std::string_view op, Rate offered, double failed_share) {
+  if (const auto ring = ring_index(op)) {
+    retry_rings_[*ring].fail(offered.per_second, failed_share);
+  }
+}
+
+void ClientBehaviour::settle_retries() {
+  start_retries(1);
+}
+
+// One empty ring per op, or none at all for a client without retries (it never pays for them).
+void ClientBehaviour::start_retries(int backoff_steps) {
+  retry_rings_.clear();
+  if (retries_ == 0) return;
+  for (std::size_t i = 0; i < ops_.size(); ++i) retry_rings_.emplace_back(retries_, backoff_steps);
+}
+
+// Where `op`'s ring is in retry_rings_ (indexed like ops_, which is sorted); empty without retries.
+std::optional<std::size_t> ClientBehaviour::ring_index(std::string_view op) const {
+  if (retry_rings_.empty()) return std::nullopt;
+  const auto found = std::ranges::lower_bound(ops_, op);
+  if (found == ops_.end() || *found != op) return std::nullopt;
+  return static_cast<std::size_t>(found - ops_.begin());
+}
+
+double ClientBehaviour::retries_due(std::string_view op) const {
+  const auto ring = ring_index(op);
+  return ring ? retry_rings_[*ring].due() : 0.0;
+}
+
+ClientBehaviour::RetryRing::RetryRing(int retries, int backoff_steps)
+    : retries_{static_cast<std::size_t>(retries)},
+      slots_{static_cast<std::size_t>(backoff_steps)},
+      rates_(retries_ * slots_, 0.0) {}
+
+std::span<double> ClientBehaviour::RetryRing::current() {
+  return std::span{rates_}.subspan(slot_ * retries_, retries_);
+}
+
+std::span<const double> ClientBehaviour::RetryRing::current() const {
+  return std::span{rates_}.subspan(slot_ * retries_, retries_);
+}
+
+double ClientBehaviour::RetryRing::due() const {
+  // C++23 std::ranges::fold_left: a fold over the range itself, replacing std::accumulate's
+  // iterator pair and its init-type pitfall (accumulate(b, e, 0) sums doubles as ints).
+  return std::ranges::fold_left(current(), 0.0, std::plus<>{});
+}
+
+double ClientBehaviour::RetryRing::last_attempts(double first) const {
+  return retries_ == 0 ? first : current().back();
+}
+
+// The retries of this step's failures replace what this step sent, attempt by attempt: attempt
+// k + 1 of `backoff` steps from now is attempt k's failed share, from the last but one attempt
+// down to the first (so each slot is read before it is overwritten); attempt n's failures are
+// final and go nowhere. Then the ring moves on one step.
+void ClientBehaviour::RetryRing::fail(double first, double failed_share) {
+  const auto attempts = current();
+  for (std::size_t k = attempts.size() - 1; k > 0; --k) {
+    attempts[k] = attempts[k - 1] * failed_share;
+  }
+  attempts[0] = first * failed_share;
+  slot_ = (slot_ + 1) % slots_;
 }
 
 // ---- detail::Forwarding ----

@@ -598,20 +598,24 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   return op_latency_cell(op, seconds_value);
 }
 
-// The `timed out/s` column is there when some client has a timeout: without one nothing can time
-// out, and the table keeps its old shape.
+// The `attempts/s` column, right after `offered/s`, is always there: what the clients sent,
+// retries included (equal to offered/s for a client without retries, so a storm stands out as the
+// row where it is higher). The `timed out/s` column is there when some client has a timeout:
+// without one nothing can time out, and the table keeps its old shape.
 [[nodiscard]] std::string op_table(const Summary& summary) {
   const auto ops = summary.ops();
   // C++20 std::ranges::any_of: the range itself instead of a begin/end pair (std::any_of), so it
   // cannot be paired with another container's end by mistake.
   const bool any_timeout =
       std::ranges::any_of(ops, [](const OpSummary& op) { return op.timeout_s.has_value(); });
-  Row header{{"client.op"}, {"offered/s"}};
+  Row header{{"client.op"}, {"offered/s"}, {"attempts/s"}};
   if (any_timeout) header.push_back({"timed out/s"});
   header.insert(header.end(), {{"mean"}, {"p50"}, {"p95"}, {"p99"}, {"(estimated)"}});
   std::vector<Row> rows{std::move(header)};
   for (const auto& op : ops) {
-    Row row{{op.client + "." + op.op}, {with_si_prefix(op.offered_per_s)}};
+    Row row{{op.client + "." + op.op},
+            {with_si_prefix(op.offered_per_s)},
+            {with_si_prefix(op.attempts_per_s)}};
     if (any_timeout) row.push_back({with_si_prefix(op.timed_out_per_s)});
     row.insert(row.end(), {{op_latency_cell(op, op.mean_s)},
                            {op_percentile_cell(op, op.p50_s, median)},
@@ -875,6 +879,7 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   const std::array fields{json_field("client", json_string(op.client)),
                           json_field("op", json_string(op.op)),
                           json_field("offered_per_s", json_number(op.offered_per_s)),
+                          json_field("attempts_per_s", json_number(op.attempts_per_s)),
                           json_field("answered_per_s", json_number(op.answered_per_s)),
                           json_field("timed_out_per_s", json_number(op.timed_out_per_s)),
                           json_field("mean_s", latency(op.mean_s)),
@@ -982,15 +987,16 @@ template <class T, class F>
   return t_s + "," + id + ",0,0,0,0,0,0,0,none,\n";
 }
 
-// One (client, op) of a step: what it offered, what came back answered, what came back after the
-// client's timeout (0 without one), and the mean response of an answered request in milliseconds
-// (`inf` when the path never answers).
+// One (client, op) of a step: what it offered, what it sent (its retries included), what came back
+// answered, what came back after the client's timeout (0 without one), and the mean response of an
+// answered request in milliseconds (`inf` when the path never answers).
 [[nodiscard]] std::string csv_op_row(const std::string& t_s, const std::string& client,
                                      const engine::ResponseSample& r) {
   const std::array fields{t_s,
                           client,
                           r.op,
                           significant(r.offered.per_second, 6),
+                          significant(r.attempts.per_second, 6),
                           significant(r.answered.per_second, 6),
                           significant(r.timed_out.per_second, 6),
                           significant(r.response.mean_s * 1000.0, 6)};
@@ -1078,6 +1084,7 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
 // cannot hold, and those steps must not decide the op's latency for the whole run).
 void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
   offered += sample.offered.per_second * dt_s;
+  attempts += sample.attempts.per_second * dt_s;
   answered += sample.answered.per_second * dt_s;
   timed_out += sample.timed_out.per_second * dt_s;
   if (!(sample.answered.per_second + sample.timed_out.per_second > 0.0)) return;
@@ -1295,6 +1302,7 @@ std::vector<OpSummary> Summary::ops() const {
     OpSummary op{.client = client.id,
                  .op = t.op,
                  .offered_per_s = observed_s_ > 0.0 ? t.offered / observed_s_ : 0.0,
+                 .attempts_per_s = observed_s_ > 0.0 ? t.attempts / observed_s_ : 0.0,
                  .answered_per_s = observed_s_ > 0.0 ? t.answered / observed_s_ : 0.0,
                  .timed_out_per_s = observed_s_ > 0.0 ? t.timed_out / observed_s_ : 0.0,
                  .timeout_s = graph::client_timeout_s(client),
@@ -1567,15 +1575,17 @@ void SeriesWriter::observe(const engine::StepRecord& record) {
 
 OpSeriesWriter::OpSeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out} {
   for (const auto& node : g.nodes()) ids_.push_back(node.spec.id);
-  *out_ << "t_s,client,op,offered_per_s,answered_per_s,timed_out_per_s,mean_ms\n";
+  *out_ << "t_s,client,op,offered_per_s,attempts_per_s,answered_per_s,timed_out_per_s,mean_ms\n";
 }
 
 // One row per response sample, in the record's order (clients by node index, ops by name), with
 // the node series' conventions (SeriesWriter::observe): `t_s` in its shortest form, 6
 // significant digits, `inf` for a mean of a path that never answers. answered = offered × the
 // fraction the path delivered (engine::ResponseSample): offered minus what a limiter refused or
-// a queue dropped on the way this step, never above offered; a request still waiting in a
-// growing queue is not lost, so a backlog alone leaves answered = offered. A sample whose client is
+// a queue dropped on the way this step, never above offered for a client without retries; a
+// request still waiting in a growing queue is not lost, so a backlog alone leaves answered =
+// offered. A client with retries answers attempts × that fraction, which a wave of retries can
+// lift above offered for a step (engine::ResponseSample). A sample whose client is
 // not a node of the writer's graph is a programmer error (a record of another simulation): `at`
 // throws.
 void OpSeriesWriter::observe(const engine::StepRecord& record) {

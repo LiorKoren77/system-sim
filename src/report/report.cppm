@@ -100,8 +100,10 @@ struct LinkSummary {
 // is the fraction the path delivered. A client with a `timeout` also gives up on the delivered
 // requests slower than it: `timed_out_per_s` counts them (0 without a timeout), `answered_per_s`
 // leaves them out (offered − lost − timed out), and the mean describes the requests answered in
-// time. A percentile is what the client sees at its quantile q (report.cpp's
-// percentile_seen_by_client): when more than 1 − q of the delivered
+// time. `attempts_per_s` is what the client SENT, its offered load plus its retries (a client with
+// `retries`, behaviours::ClientBehaviour): equal to `offered_per_s` without retries or with nothing
+// to retry, above it by the retry storm when its path fails. A percentile is what the client sees
+// at its quantile q (report.cpp's percentile_seen_by_client): when more than 1 − q of the delivered
 // requests timed out (`timed_out_share` > 1 − q: more than 1 % for a p99), no request at that
 // quantile was answered, and the percentile IS the timeout (the table prints `>1s`, a latency SLO
 // on it fails whatever its max); otherwise it is the fit to every DELIVERED request's latency,
@@ -115,6 +117,7 @@ struct OpSummary {
   std::string client{};
   std::string op{};
   double offered_per_s{};
+  double attempts_per_s{};
   double answered_per_s{};
   double timed_out_per_s{};
   double mean_s{};
@@ -281,6 +284,7 @@ class Summary {
     std::size_t client{};
     std::string op{};
     double offered{};       // Σ offered·dt, requests
+    double attempts{};      // Σ attempts·dt, requests sent: `offered` and the retries
     double answered{};      // Σ answered·dt, requests: the part of `offered` that came back
     double timed_out{};     // Σ timed_out·dt, requests: delivered, but after the client gave up
     Moments by_answered{};  // weighted by requests answered: what an average answer sees
@@ -390,11 +394,11 @@ class SeriesWriter {
 };
 
 // For plotting what the clients see: one CSV row per (client, op) per step,
-// `t_s,client,op,offered_per_s,answered_per_s,timed_out_per_s,mean_ms` (spec §18 entry 13;
-// `timed_out_per_s` spec §19 entry 12). The header is written on construction; the column rules are
-// at OpSeriesWriter::observe in report.cpp. Pattern: Observer, like SeriesWriter:
-// session::run_summary hands each step record to both, and neither knows of the other. `out` and
-// `g` must outlive the writer.
+// `t_s,client,op,offered_per_s,attempts_per_s,answered_per_s,timed_out_per_s,mean_ms` (spec §18
+// entry 13; `timed_out_per_s` spec §19 entry 12; `attempts_per_s` phase 3 spec §6.1). The header is
+// written on construction; the column rules are at OpSeriesWriter::observe in report.cpp. Pattern:
+// Observer, like SeriesWriter: session::run_summary hands each step record to both, and neither
+// knows of the other. `out` and `g` must outlive the writer.
 class OpSeriesWriter {
  public:
   OpSeriesWriter(std::ostream& out, const graph::Graph& g);

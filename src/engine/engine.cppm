@@ -14,8 +14,9 @@
 // built up on the way back: each box's own wait and service time plus the hops it made (a
 // pipe's wait and serialisation with them, Simulation::hop_response). Captured:
 // saturation spreading downstream as reduced throughput (dropped flow never reaches the
-// next box), propagation delay, fan-out and the feedback loops of ch. 12 (chat). Ignored:
-// individual requests (flow is a fluid), retries, and anything that changes within a step
+// next box), propagation delay, fan-out, the feedback loops of ch. 12 (chat) and a client's
+// retries, which are feedback demand too (Simulation::feed_back_retries). Ignored:
+// individual requests (flow is a fluid), and anything that changes within a step
 // (demand is constant across one step). A scripted fault (the scenario's `faults:`, FaultSchedule)
 // changes a node's numbers for the steps it covers: forward_pass asks the schedule for the node's
 // Condition and the node steps under it (serve, ClientBehaviour::set_rate_factor); a flushed
@@ -204,10 +205,21 @@ struct NodeSample {
 // 0 for a client that waits for ever. `delivered_response` is the latency of every delivered
 // request, answered or timed out, before the client gave up (the untruncated fit the timeout cut):
 // the reports read a timed-out client's percentiles off it. Without a timeout the two are equal.
+//
+// A client with `retries` (behaviours::ClientBehaviour has the model) sends more than it offers:
+// `attempts` is what it sent this step, `offered` (its curve) plus the retries due now, and it is
+// `offered` exactly without retries or with nothing to retry. Then `answered` = attempts × the
+// delivered fraction (× the share in time): an attempt answered is a request answered, once, since
+// a request is not sent again after an answer. `timed_out` counts the LAST attempts that timed out
+// only (Simulation::count_final_timeouts), requests given up on for good; every other failed
+// attempt is sent again, not lost. Within one step `answered` may then exceed `offered` (a wave of
+// retries answered as an outage ends); at a fixed point answered = offered − lost − timed_out
+// still holds, `lost` being the requests whose last attempt was lost.
 struct ResponseSample {
   std::size_t client{};
   std::string op{};
   Rate offered{};
+  Rate attempts{};
   Rate answered{};
   Rate timed_out{};
   flow::LatencyEstimate response{};
@@ -681,6 +693,11 @@ class Simulation {
   [[nodiscard]] std::vector<ResponseSample> client_responses(SimTime now) const;
   // Applies a client's `timeout` to one of its samples (see the definition).
   static void give_up_after(double timeout_s, ResponseSample& sample);
+  static void count_final_timeouts(const behaviours::ClientBehaviour& client,
+                                   ResponseSample& sample);
+  void feed_back_retries(std::span<const ResponseSample> responses, Mode mode);
+  [[nodiscard]] double answered_share(const behaviours::ClientBehaviour& client,
+                                      const ResponseSample& sample, Mode mode) const;
   [[nodiscard]] flow::LatencyEstimate response_of(std::size_t node, std::string_view op) const;
   [[nodiscard]] static flow::LatencyEstimate own_sojourn(const Node& node, std::string_view op);
   [[nodiscard]] static double own_passed(const Node& node, std::string_view op);
@@ -888,7 +905,8 @@ void report_machines(behaviours::Behaviour& behaviour,
 // Conservation is untouched: drain' + dropped' = drain + dropped, so demand·dt = (drain +
 // dropped)·dt + Δbacklog still holds, and the node's own delivered share 1 − (dropped + rejected)
 // / inflow (account_rejections) loses the failures once: 500/s at f = 0.02 is answered 490/s.
-// Assumes every op fails alike and that a failure is final (no retries before phase 3).
+// Assumes every op fails alike. A failure is final here; a client with `retries` sends the request
+// again, which the sink sees as more demand in a later step (Simulation::feed_back_retries).
 void fail_share(double failure_rate, flow::Flow& drained, flow::Flow& dropped, NodeSample& sample) {
   if (failure_rate <= 0.0) return;  // fails nothing: the plain queue, bit for bit
   dropped += drained.scaled(failure_rate);
@@ -985,8 +1003,8 @@ void add_copies(NodeSample& sample, const fluid::FluidStep& copy_step, double co
 }
 
 // estimate()'s stopping rule: a pass changed nothing that matters when every node's
-// demand and every response (and answered rate) a client sees moved by at most this
-// fraction of its value.
+// demand and every response (and answered rate, and attempts rate) a client sees moved by at most
+// this fraction of its value.
 // 1e-12 is a few thousand ulps of a double: as close to "exactly equal" as rounding allows.
 inline constexpr double settle_tolerance = 1e-12;
 // ...and the most passes it tries. Each pass costs microseconds per node, so the cap
@@ -1017,7 +1035,9 @@ inline constexpr double min_settling_weight = 1.0 / 1024.0;
   for (std::size_t i = 0; i < after.responses.size(); ++i) {
     if (!unchanged(before.responses[i].response.mean_s, after.responses[i].response.mean_s) ||
         !unchanged(before.responses[i].answered.per_second,
-                   after.responses[i].answered.per_second)) {
+                   after.responses[i].answered.per_second) ||
+        !unchanged(before.responses[i].attempts.per_second,
+                   after.responses[i].attempts.per_second)) {
       return false;
     }
   }
@@ -1588,6 +1608,18 @@ void Simulation::require_scenario_step(SimTime dt) const {
 // shipped scenario that runs converges (news-feed's, the one with losses before later steps,
 // included); passes that still oscillate end at the cap with `converged` false.
 //
+// A client's retries are a loop of the same kind (behaviours::ClientBehaviour has the model):
+// what a pass failed is sent again in the next pass (settling_copy makes every backoff one pass:
+// at a fixed point the wait changes nothing), so with a steady failed share q the attempts climb
+// 1, 1 + q, 1 + q + q², ... and stop after n + 1 passes at the capped series, (1 − q^(n+1)) /
+// (1 − q) times the curve. The share each pass retries is read off the DAMPED delivered fractions
+// d̄ (hop_delivered_for_thinning, as the steps after a call are thinned), so the retries reach
+// their fixed point as d̄ reaches d, with the damping above, and q = 1 − d × (the share answered
+// in time) is the same at the fixed point as in `run`. More attempts can only load the path more,
+// so q grows with them: the feedback rises monotonically to the smallest fixed point, like any
+// loop of positive gain, and a storm that no capacity stops within the cap ends with `converged`
+// false, which `simsys estimate` warns about.
+//
 // A loop of gain >= 1 climbs until a node on it saturates; that state is steady (the node
 // drops the excess) and is reported. If saturation is further away than the cap allows
 // (each pass adds the loop's input once, so it takes about capacity / input passes), or
@@ -1641,6 +1673,7 @@ Simulation Simulation::settling_copy() const {
     node.passed_writes = 1.0;
     if (auto* client = std::get_if<behaviours::ClientBehaviour>(&node.behaviour)) {
       client->reset_noise();
+      client->settle_retries();
     }
     // Every settle pass starts at t = 0, so a window would never close and a full bucket
     // would take burst / ((in - limit) x dt) passes to drain: the scratch limiter admits
@@ -1671,6 +1704,7 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
   backward_pass();
   if (mode == Mode::settle) average_settling_fractions();
   record.responses = client_responses(now);
+  feed_back_retries(record.responses, mode);
   return record;
 }
 
@@ -2411,13 +2445,18 @@ std::vector<ResponseSample> Simulation::client_responses(SimTime now) const {
       return hop_delivered(index, target, op);
     };
     for (const auto& [op, offered] : client->offered(now)) {
+      const Rate attempts = client->attempts(op, offered);
       ResponseSample sample{.client = index,
                             .op = op,
                             .offered = offered,
-                            .answered = Rate{offered.per_second * client->delivered(op, fraction)},
+                            .attempts = attempts,
+                            .answered = Rate{attempts.per_second * client->delivered(op, fraction)},
                             .response = client->response(op, lookup)};
       sample.delivered_response = sample.response;  // before give_up_after cuts `response`
-      if (const auto timeout_s = client->timeout_s()) give_up_after(*timeout_s, sample);
+      if (const auto timeout_s = client->timeout_s()) {
+        give_up_after(*timeout_s, sample);
+        count_final_timeouts(*client, sample);
+      }
       responses.push_back(std::move(sample));
     }
   }
@@ -2432,8 +2471,9 @@ std::vector<ResponseSample> Simulation::client_responses(SimTime now) const {
 // (behaviours::MegabyteService::sojourn), and that is already in `response`, so an upload is timed
 // out on its whole transfer. Only the client gives up: nothing cancels the request at the servers,
 // which still queue and serve it, so their demand and utilisation do not change (the work of a
-// timed-out request is wasted, not saved). Ignored: retries (phase 3) and a request answered after
-// the client left (it counts as timed out, never as answered late).
+// timed-out request is wasted, not saved). A client with `retries` sends a timed-out request again
+// like a lost one (count_final_timeouts, feed_back_retries). Ignored: a request answered after the
+// client left (it counts as timed out, never as answered late).
 void Simulation::give_up_after(double timeout_s, ResponseSample& sample) {
   const auto below =
       queueing::lognormal_below(sample.response.mean_s, sample.response.variance_s2, timeout_s);
@@ -2445,6 +2485,51 @@ void Simulation::give_up_after(double timeout_s, ResponseSample& sample) {
   sample.timed_out = Rate{delivered_per_s * (1.0 - below.fraction)};
   sample.answered = Rate{delivered_per_s - sample.timed_out.per_second};
   sample.response = {.mean_s = below.mean_s, .variance_s2 = below.variance_s2};
+}
+
+// give_up_after timed out the same share of every attempt. With retries only a request's LAST
+// attempt that timed out is given up on for good; the others are sent again (feed_back_retries).
+// So the timed-out rate keeps the last attempts' part of it, timed_out × last / attempts: at a
+// fixed point of steady share q timed out, 400/s with 2 retries times out 400 q³, not
+// 400 (1 + q + q²) q. Without retries every attempt is the last: nothing changes.
+void Simulation::count_final_timeouts(const behaviours::ClientBehaviour& client,
+                                      ResponseSample& sample) {
+  if (client.retries() == 0 || sample.attempts.per_second <= 0.0) return;
+  const double last = client.last_attempts(sample.op, sample.offered).per_second;
+  sample.timed_out = Rate{sample.timed_out.per_second * last / sample.attempts.per_second};
+}
+
+// A client's retries as feedback demand (behaviours::ClientBehaviour has the model): after the
+// step, every op of a client with retries hands its ring the share of this step's attempts that
+// failed, lost on the way or timed out,
+//   failed = 1 − delivered × in_time
+// which the client sends again `retry_after` later (ClientBehaviour::retry_failed). It reads the
+// path of THIS step: the backward pass has run, so a sink that fails half of what it serves
+// fails half of this step's attempts, with no lag. In settle mode the share is read off the damped
+// fractions (answered_share; see estimate for why).
+void Simulation::feed_back_retries(std::span<const ResponseSample> responses, Mode mode) {
+  for (const auto& sample : responses) {
+    auto& client = std::get<behaviours::ClientBehaviour>(nodes_[sample.client].behaviour);
+    if (client.retries() == 0) continue;
+    client.retry_failed(sample.op, sample.offered, 1.0 - answered_share(client, sample, mode));
+  }
+}
+
+// The share of a client's attempts of one op that come back answered in time this step: the
+// delivered fraction of its routes (in settle mode the damped d̄, hop_delivered_for_thinning) times,
+// with a timeout, the share of the delivered responses faster than it (the lognormal fit
+// give_up_after cuts, queueing::lognormal_below).
+double Simulation::answered_share(const behaviours::ClientBehaviour& client,
+                                  const ResponseSample& sample, Mode mode) const {
+  const auto fraction = [this, &sample, mode](std::size_t target, std::string_view op) {
+    return hop_delivered_for_thinning(sample.client, target, op, mode);
+  };
+  const double delivered = client.delivered(sample.op, fraction);
+  const auto timeout_s = client.timeout_s();
+  if (!timeout_s) return delivered;
+  const auto& response = sample.delivered_response;
+  return delivered *
+         queueing::lognormal_below(response.mean_s, response.variance_s2, *timeout_s).fraction;
 }
 
 // The node's own sojourn for `op` this step (record_sojourns): a database's write waits at

@@ -94,7 +94,7 @@ struct OwnKeys {
 // `ops` (what a node does with each incoming op) belongs to client, service and ws_gateway;
 // `then` (steps after processing) to the five types the schema lists for it.
 inline constexpr std::array<OwnKeys, model::node_type_names.size()> own_keys_by_type{{
-    {model::NodeType::client, "rate ops keys sizes timeout retries"},
+    {model::NodeType::client, "rate ops keys sizes timeout retries retry_after"},
     {model::NodeType::cdn, "ttl hit_ratio origin keys write_ops"},
     {model::NodeType::load_balancer, "policy vnodes"},
     {model::NodeType::rate_limiter, "algorithm limit burst window backend"},
@@ -195,7 +195,7 @@ inline constexpr std::string_view advanced_integer_keys = "concurrency queue_lim
 inline constexpr std::string_view top_level_integer_keys = "version seed";
 inline constexpr std::string_view node_integer_keys =
     "replicas vnodes burst shards pool partitions workers nodes replication write_quorum "
-    "read_quorum keys";
+    "read_quorum keys retries";
 inline constexpr std::string_view client_keys_integer_keys = "space uniform";
 
 // How a scenario writes an empty list or map, for the messages about a key left without a

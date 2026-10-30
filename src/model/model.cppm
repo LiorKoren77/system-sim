@@ -470,6 +470,14 @@ struct Workload {
   // size is the op's mean: the model ignores a size distribution, headers and protocol overhead,
   // and compression. Sorted by op, like op_shares.
   std::map<std::string, Bytes> sizes{};
+  // A client's retries (phase 3 spec §6.1; book ch. 1 and ch. 10's retries with backoff): how
+  // many more times it sends a request it lost or timed out (0: never; the loader allows at most
+  // 10), each after waiting `retry_after`. Absent `retry_after`: defaults::retry_after; the loader
+  // fills it in whenever `retries` is stated, so explain prints the wait the engine uses (a
+  // scenario built in code may leave it absent). The model and what it ignores are at
+  // behaviours::ClientBehaviour. Declared last, for designated initializers.
+  int retries{0};
+  std::optional<SimTime> retry_after{};
 };
 
 struct NodeSpec {
