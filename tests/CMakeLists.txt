@@ -26,7 +26,13 @@ catch_discover_tests(unit_tests)
 add_executable(scenario_tests scenario/test_scenarios.cpp)
 target_link_libraries(scenario_tests PRIVATE simsys simsys_test_support Catch2::Catch2WithMain simsys_warnings)
 target_compile_definitions(scenario_tests PRIVATE SIMSYS_SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios")
-catch_discover_tests(scenario_tests)
+# Two registrations of one binary: the cases tagged [serial] (the five-second-CPU run of every
+# scenario, whose CPU time grows when seven other test processes share the cores) get ctest's
+# RUN_SERIAL property, so `ctest -j` runs them with nothing alongside; every other case runs in
+# parallel as before. Catch2 names each registration's files after a hash of its TEST_SPEC, so the
+# two calls do not collide. `~[serial]` is Catch2's tag negation.
+catch_discover_tests(scenario_tests TEST_SPEC "~[serial]")
+catch_discover_tests(scenario_tests TEST_SPEC "[serial]" TEST_PREFIX "serial." PROPERTIES RUN_SERIAL TRUE)
 
 # The theory tests, one file per topic (closed forms checked against whole simulations).
 add_executable(theory_tests
