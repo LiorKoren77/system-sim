@@ -23,6 +23,7 @@ export module simsys.test_fixtures;
 
 // C++20 `import`: the compiled interfaces of the modules whose types the declarations below
 // name, read without re-parsing any header text.
+import simsys.caching;
 import simsys.core;
 import simsys.engine;
 import simsys.graph;
@@ -94,6 +95,19 @@ model::Scenario published(double rate, std::vector<model::NodeSpec> groups,
 //   k = min(1 + z_M / sqrt(N v), M / N)        (M / N: a machine holds at most every key once)
 // v = 100, M = 4: 1 + 1.0491 / 10 = 1.1049;  v = 150, M = 4: 1.0857;  v = 1, M = 4: 2.0491.
 double ring_factor(int machines, int copies_per_key, int vnodes);
+
+// ---- A cache warming back after a flush ---------------------------------------------------------
+
+// D(n) = sum_i (1 - e^{-p_i n}): the expected number of DISTINCT keys among `requests` requests
+// that draw keys independently with the popularity's probabilities p_i (the coupon-collector
+// sum; Che's equation for the characteristic time is D(t_c) = cache size, with t_c counted in
+// requests). 1820.3 for 2000 requests over Zipf 0.8 of 1M keys. test_faults.cpp has the model.
+double distinct_keys(const caching::Popularity& popularity, double requests);
+
+// h = che_hit_ratio(min(cache_keys, D(requests)), popularity): the hit ratio of a flushed cache
+// that has seen `requests` requests since the flush. 0 for 0 requests; the steady Che hit ratio of
+// `cache_keys` entries once D(requests) >= cache_keys.
+double warm_hit_ratio(const caching::Popularity& popularity, double cache_keys, double requests);
 
 // ---- explain ------------------------------------------------------------------------------------
 

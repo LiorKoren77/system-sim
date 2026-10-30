@@ -18,12 +18,14 @@
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
+import simsys.caching;
 import simsys.config;
 import simsys.core;
 import simsys.engine;
 import simsys.flow;
 import simsys.graph;
 import simsys.model;
+import simsys.test_fixtures;
 
 using namespace std::chrono_literals;
 using Catch::Matchers::WithinRel;
@@ -227,4 +229,184 @@ TEST_CASE("a traffic_spike gives the client its rate factor and leaves the other
   REQUIRE(during.extra_latency == SimTime{0});
   REQUIRE(during.hit_ratio_factor == 1.0);
   require_identity(x.at("c", 20s));
+}
+
+// ---- cache_flush and dc_down (phase 3 Task 7) ---------------------------------------------------
+//
+// What the tests below assume of the engine's API, beyond Task 6's (above):
+//   FaultSchedule(const model::Scenario&) stays the constructor. A che warm-up needs the cache's
+//   popularity, which the scenario states (the client's `keys`) and the graph resolves, so Task 7
+//   may well need the Graph too: `ScheduledScenario` below is the one place that builds a schedule,
+//   and the one line to change then.
+//   Condition::hit_ratio_factor is h(t) / h, the warm hit ratio over the steady one:
+//     che cache   warm_hit_ratio(popularity, keys, rate x t) / che_hit_ratio(keys, popularity)
+//     fixed ratio min(1, t / (keys / rate))                     (linear over the fill time)
+//   0 at the flush instant `at`, 1 before it and from the moment the cache is full on; the other
+//   three fields stay the identity throughout. A flush has no `for`, so the factor is not a
+//   window of [at, at + for): it is 0 at `at` itself.
+//   There is no `FaultSchedule::link_condition_at`: a dc_down's factor 0 on the links across the
+//   datacenter's edge is tested through the run (tests/theory/test_faults.cpp), not here.
+namespace {
+// A graph and the schedule of its scenario, from a whole scenario text.
+struct ScheduledScenario {
+  Graph graph;
+  FaultSchedule schedule;
+
+  explicit ScheduledScenario(std::string_view yaml) : ScheduledScenario{load_yaml(yaml)} {}
+
+  std::size_t node(std::string_view id) const { return *graph.index_of(id); }
+  Condition at(std::string_view id, SimTime now) const {
+    return schedule.condition_at(node(id), now);
+  }
+
+ private:
+  explicit ScheduledScenario(Scenario s)
+      : graph{[&] {
+          auto built = Graph::build(s);
+          if (!built) FAIL(built.error().message);
+          return std::move(*built);
+        }()},
+        schedule{s} {}
+};
+
+// u (`rate`/s of `get`, with the client's `keys` text) -> cache -> origin, with `cache` the node
+// entry's text and the flush at 10 min.
+std::string flushed_cache(std::string_view rate, std::string_view client_keys,
+                          std::string_view cache) {
+  return "version: 1\nname: flush\nduration: 11m\nstep: 100ms\n"
+         "nodes:\n"
+         "  u: {type: client, rate: {base: " +
+         std::string{rate} + "}, ops: {get: 1.0}" + std::string{client_keys} +
+         "}\n"
+         "  cache: {" +
+         std::string{cache} +
+         "}\n"
+         "  origin: {type: service, capacity: 100k/s, latency: 1ms}\n"
+         "links:\n"
+         "  - {from: u, to: cache, dir: inout, latency: 0s}\n"
+         "  - {from: cache, to: origin, dir: inout, latency: 0s}\n"
+         "faults:\n  - {at: 10m, kind: cache_flush, node: cache}\n";
+}
+
+// Only the hit ratio is touched: the three other fields are the identity.
+void require_only_hit_ratio_changes(const Condition& c) {
+  REQUIRE(c.capacity_factor == 1.0);
+  REQUIRE(c.extra_latency == SimTime{0});
+  REQUIRE(c.rate_factor == 1.0);
+}
+}  // namespace
+
+// 1k/s over Zipf 0.8 of 1M keys into a 10k-key cache, flushed at 10 min:
+//   before the flush  1 (the cache is warm: the identity)
+//   at the flush      0 (a step that starts at `at` finds it empty)
+//   2 s after         warm_hit_ratio(2000 requests) / h = che(1820.3 keys) / che(10k keys) = 0.1268
+//   / 0.2319 = 0.547 13 s after        1 (t_c = 12,106 requests = 12.1 s: D(rate t) has reached the
+//   10k keys)
+// The factor is a ratio of two Che hit ratios, so it lies strictly between 0 and 1 while the cache
+// fills, and rises with t.
+TEST_CASE(
+    "a cache_flush gives hit ratio factor 0 at the flush, the Che warm-up ratio while "
+    "filling, 1 once full",
+    "[engine]") {
+  const ScheduledScenario x{flushed_cache(
+      "1k/s", ", keys: {zipf: 0.8, space: 1M}",
+      "type: cache, strategy: read_through, backend: origin, keys: 10k, hit_ratio: che")};
+  const auto popularity = simsys::caching::Popularity::zipf(0.8, 1e6);
+  const double steady = simsys::caching::che_hit_ratio(10'000, popularity);
+
+  const SimTime at{10min};
+  REQUIRE(x.at("cache", at - 1ns).hit_ratio_factor == 1.0);  // before the flush
+  REQUIRE(x.at("cache", 0s).hit_ratio_factor == 1.0);
+  REQUIRE(x.at("cache", at).hit_ratio_factor == 0.0);
+  require_only_hit_ratio_changes(x.at("cache", at));
+
+  double previous = 0.0;
+  for (const double after_s : {0.1, 0.5, 2.0, 5.0, 10.0, 12.0}) {
+    CAPTURE(after_s);
+    const auto now = at + SimTime{std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::duration<double>(after_s))};
+    const auto c = x.at("cache", now);
+    const double expected =
+        simsys::test_support::warm_hit_ratio(popularity, 10'000, 1000.0 * after_s) / steady;
+    REQUIRE(c.hit_ratio_factor > 0.0);
+    REQUIRE(c.hit_ratio_factor < 1.0);
+    REQUIRE_THAT(c.hit_ratio_factor, WithinRel(expected, 1e-9));
+    REQUIRE(c.hit_ratio_factor > previous);
+    previous = c.hit_ratio_factor;
+    require_only_hit_ratio_changes(c);
+  }
+  for (const SimTime later : {SimTime{at + 13s}, SimTime{at + 1min}, SimTime{at + 30s}}) {
+    CAPTURE(later.count());
+    REQUIRE_THAT(x.at("cache", later).hit_ratio_factor, WithinRel(1.0, 1e-12));
+    require_only_hit_ratio_changes(x.at("cache", later));
+  }
+  require_identity(x.at("u", at + 2s));  // the flush acts on the cache alone
+  require_identity(x.at("origin", at + 2s));
+}
+
+// A fixed hit ratio has no curve: the cache is full after keys / rate seconds (1000 keys at
+// 100/s: 10 s) and warms linearly, so the factor is t / 10 s: 0, 0.25 at 2.5 s, 0.5 at 5 s, 1 at
+// 10 s and for ever after. The ratio 0.9 itself is the engine's to multiply in (the factor is
+// relative to it), so it does not appear here.
+TEST_CASE(
+    "a cache_flush on a fixed-ratio cache gives a hit ratio factor rising linearly over keys "
+    "divided by rate",
+    "[engine]") {
+  const ScheduledScenario x{flushed_cache(
+      "100/s", "",
+      "type: cache, strategy: read_through, backend: origin, keys: 1000, hit_ratio: {fixed: 0.9}")};
+  const SimTime at{10min};
+  REQUIRE(x.at("cache", at - 1ns).hit_ratio_factor == 1.0);
+  REQUIRE(x.at("cache", at).hit_ratio_factor == 0.0);
+  const std::pair<SimTime, double> points[] = {
+      {SimTime{2500ms}, 0.25}, {SimTime{5s}, 0.5}, {SimTime{7500ms}, 0.75}};
+  for (const auto& [after, expected] : points) {
+    CAPTURE(after.count());
+    REQUIRE_THAT(x.at("cache", at + after).hit_ratio_factor, WithinRel(expected, 1e-12));
+    require_only_hit_ratio_changes(x.at("cache", at + after));
+  }
+  REQUIRE_THAT(x.at("cache", at + 10s).hit_ratio_factor, WithinRel(1.0, 1e-12));
+  REQUIRE_THAT(x.at("cache", at + 1min).hit_ratio_factor, WithinRel(1.0, 1e-12));
+}
+
+// dc_down eu: every node whose `dc` is eu is in a node_down (capacity factor 0) from 10 s for
+// 10 s, as an interval [at, at + for); the nodes of us never see it. The rest of the condition is
+// the identity: a datacenter going down changes capacity and nothing else on the node.
+TEST_CASE(
+    "a dc_down gives capacity factor 0 to every node of the datacenter and leaves the others "
+    "alone",
+    "[engine]") {
+  const ScheduledScenario x{
+      "version: 1\nname: dc\nduration: 1m\nstep: 100ms\n"
+      "datacenters:\n  us: {}\n  eu: {}\n"
+      "nodes:\n"
+      "  c: {type: client, dc: us, rate: {base: 100/s}, ops: {op: 1.0}}\n"
+      "  a: {type: service, dc: us, capacity: 1k/s, latency: 1ms}\n"
+      "  x: {type: service, dc: eu, capacity: 1k/s, latency: 1ms, replicas: 2}\n"
+      "  y: {type: service, dc: eu, capacity: 1k/s, latency: 1ms}\n"
+      "links:\n"
+      "  - {from: c, to: a, dir: inout, latency: 0s}\n"
+      "  - {from: c, to: x, dir: inout, latency: 0s}\n"
+      "  - {from: c, to: y, dir: inout, latency: 0s}\n"
+      "faults:\n  - {at: 10s, kind: dc_down, datacenter: eu, for: 10s}\n"};
+  for (const auto* eu_node : {"x", "y"}) {  // x has two replicas: all of them go down, not one
+    CAPTURE(eu_node);
+    require_identity(x.at(eu_node, SimTime{10s} - 1ns));
+    for (const SimTime now : {SimTime{10s}, SimTime{15s}, SimTime{20s} - 1ns}) {
+      CAPTURE(now.count());
+      const auto c = x.at(eu_node, now);
+      REQUIRE(c.capacity_factor == 0.0);
+      REQUIRE(c.extra_latency == SimTime{0});
+      REQUIRE(c.rate_factor == 1.0);
+      REQUIRE(c.hit_ratio_factor == 1.0);
+    }
+    require_identity(x.at(eu_node, 20s));
+  }
+  for (const auto* us_node : {"c", "a"}) {
+    CAPTURE(us_node);
+    for (const SimTime now : {SimTime{0s}, SimTime{10s}, SimTime{15s}, SimTime{20s}}) {
+      CAPTURE(now.count());
+      require_identity(x.at(us_node, now));
+    }
+  }
 }

@@ -22,6 +22,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -38,6 +39,7 @@
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
+import simsys.caching;
 import simsys.config;
 import simsys.core;
 import simsys.engine;
@@ -520,12 +522,582 @@ TEST_CASE("a run's table does not carry estimate's note about scripted faults", 
   REQUIRE_FALSE(simsys::report::render_table(summary, {}, /*color=*/false).contains("scripted"));
 }
 
-// ---- dc_down waits for Task 7
-// ---------------------------------------------------------------------
+// ---- cache_flush: a cold cache warming back along the Che curve ---------------------------------
+//
+// Book ch. 1 (the cache tier) and ch. 8, 11 and 14 (the caches those designs lean on): what happens
+// when the cache is lost, a restart or a deploy, and every read goes to the store behind it until
+// the cache has refilled. Model under test (phase 3 Task 7): a flush empties the cache at `at`;
+// from then on it refills from the requests it sees. After t seconds at `rate` requests a second
+// it has seen n = rate x t requests and holds the distinct keys among them,
+//   D(n) = sum_i (1 - e^{-p_i n})      (the expected number of distinct keys in n requests: Che's
+//                                       own sum with t read as a count of requests)
+// and its hit ratio is the Che hit ratio of a cache with that many entries:
+//   h(t) = che_hit_ratio(min(keys, D(rate t)), popularity)
+// The cache is full, and h back at its steady value, when D reaches `keys`: at n = t_c requests,
+// t_c = che_characteristic_time(keys, popularity) (the definition of the characteristic time is
+// D(t_c) = keys), t_c / rate seconds after the flush. Ignored on purpose: that real LRU caches
+// refill in recency order (the warm keys are the recent ones, a little better than "distinct"),
+// the thundering herd on the store, and the writes a flush loses.
+//
+// The numbers: 1k/s over Zipf 0.8 of 1M keys into a cache of 10k keys (computed here from
+// caching::, and cross-checked once by a dense sum over all 1M ranks in plain Python, 2026-10-30):
+//   steady hit ratio h = 0.23191        characteristic time t_c = 12,106 requests = 12.11 s
+//   D(2000) = 1820.3 keys (fewer than the 10k, so the cache is still filling at 2 s)
+// The test helpers distinct_keys and warm_hit_ratio (tests/support/fixtures.cppm) are D(n) and h(t)
+// above.
+//
+// What the run exposes. A StepRecord has no per-cache hit ratio, so the tests read it off the
+// origin behind the cache: the cache (strategy read_through) or cdn sends the misses, 1 - h of
+// the reads, on to its origin as the same op, so
+//   origin.demand_per_s = rate x (1 - h(t))      and so      h(t) = 1 - origin.demand_per_s / rate
+// at a step that starts at t after the flush (a link of zero latency delivers within the step).
+// The step that STARTS at `at` is the first one in the flush: its hit ratio is 0. (The flush is
+// written `at: 10m`, a duration from the start of the run: `at: 00:10` would be a clock time,
+// ten minutes past midnight, which is the same instant, but the duration form cannot be misread.)
 
-// A temporary refusal: Simulation::create says dc_down is not run yet. Task 7 replaces this test
-// with the datacenter's real behaviour.
-TEST_CASE("Simulation::create refuses a dc_down fault with a message naming Task 7", "[theory]") {
+namespace {
+
+// The origin behind the cache or cdn `edge`: u -> edge -> origin, links of zero latency. The origin
+// (100k/s, 1 ms: c = 100 servers) is nowhere near saturated at the loads used. Node indices: u 0,
+// edge 1, origin 2.
+struct FlushProbe {
+  int rate_per_s = 1000;
+  std::string client_keys = ", keys: {zipf: 0.8, space: 1M}";
+  std::string edge =
+      "type: cache, strategy: read_through, backend: origin, keys: 10k, hit_ratio: che";
+  std::string flush_at = "10m";
+  std::string duration = "11m";
+};
+
+constexpr std::size_t origin_node = 2;
+
+Scenario flush_probe(const FlushProbe& p) {
+  return load_yaml("version: 1\nname: flush\nduration: " + p.duration +
+                   "\nstep: 100ms\n"
+                   "nodes:\n"
+                   "  u: {type: client, rate: {base: " +
+                   std::to_string(p.rate_per_s) + "/s}, ops: {get: 1.0}" + p.client_keys +
+                   "}\n"
+                   "  edge: {" +
+                   p.edge +
+                   "}\n"
+                   "  origin: {type: service, capacity: 100k/s, latency: 1ms}\n"
+                   "links:\n"
+                   "  - {from: u, to: edge, dir: inout, latency: 0s}\n"
+                   "  - {from: edge, to: origin, dir: inout, latency: 0s}\n"
+                   "faults:\n  - {at: " +
+                   p.flush_at + ", kind: cache_flush, node: edge}\n");
+}
+
+double origin_demand(const StepRecord& r) {
+  return r.nodes[origin_node].demand_per_s;
+}
+
+// The cache's hit ratio at a step, read off the origin's demand (see the section header).
+double hit_ratio_at(const StepRecord& r, double rate_per_s) {
+  return 1.0 - origin_demand(r) / rate_per_s;
+}
+
+constexpr double che_rate = 1000;  // requests per second reaching the che cache
+constexpr double che_keys = 10'000;
+constexpr std::size_t flush_step = 6000;  // the step that starts at 10 min = 600 s, at 100 ms
+constexpr int run_steps = 6300;           // 630 s: ten minutes steady, the flush, 30 s of warming
+
+// Zipf 0.8 over 1M keys: the popularity the che cache's hit ratio is computed from.
+const simsys::caching::Popularity& zipf_popularity() {
+  static const auto popularity = simsys::caching::Popularity::zipf(0.8, 1e6);
+  return popularity;
+}
+
+// h: the cache's steady hit ratio, the Che hit ratio of its 10k keys.
+double steady_hit_ratio() {
+  return simsys::caching::che_hit_ratio(che_keys, zipf_popularity());
+}
+
+// h(t) of the model above, t seconds after the flush.
+double expected_hit_ratio_after(double seconds) {
+  return simsys::test_support::warm_hit_ratio(zipf_popularity(), che_keys, che_rate * seconds);
+}
+
+// The che cache's whole run, computed once for the tests that read it (6300 steps).
+const std::vector<StepRecord>& che_cache_run() {
+  static const auto records = records_of(graph_of(flush_probe({})), run_steps);
+  return records;
+}
+
+// The record of the step that starts `k` steps after the flush.
+const StepRecord& after_flush(const std::vector<StepRecord>& records, std::size_t k) {
+  return records.at(flush_step + k);
+}
+}  // namespace
+
+// Precondition of the tests below: before the flush the cache holds its 10k hottest-enough keys and
+// the origin sees the miss share, 1000 x (1 - 0.23191) = 768.09/s. h is pinned twice: against
+// caching::che_hit_ratio (what the engine is built on) and against a dense sum over all 1M ranks
+// done once outside the suite (0.231905), so a wrong popularity cannot hide behind a shared helper.
+TEST_CASE("a che cache of 10k keys over Zipf 0.8 hits 23.2 percent before the flush", "[theory]") {
+  const double h = steady_hit_ratio();
+  REQUIRE_THAT(h, WithinAbs(0.2319, 5e-4));
+  const auto& records = che_cache_run();
+  for (const double t : {1.0, 300.0, 599.9}) {
+    CAPTURE(t);
+    REQUIRE_THAT(hit_ratio_at(step_at(records, t), che_rate), WithinRel(h, 1e-9));
+  }
+  REQUIRE_THAT(origin_demand(step_at(records, 300.0)), WithinRel(1000.0 * (1.0 - h), 1e-9));
+}
+
+// The flush at 10 min: the step that starts at 600.0 s finds an empty cache, so every read misses
+// and the origin is offered the whole 1000/s (hit ratio 0). The step before is untouched.
+TEST_CASE("a cache_flush drops the che cache's hit ratio to 0 at the step that starts at the flush",
+          "[theory]") {
+  const auto& records = che_cache_run();
+  REQUIRE_THAT(hit_ratio_at(step_at(records, 599.9), che_rate),
+               WithinRel(steady_hit_ratio(), 1e-9));
+  REQUIRE_THAT(origin_demand(step_at(records, 600.0)), WithinRel(1000.0, 1e-12));
+  REQUIRE_THAT(hit_ratio_at(step_at(records, 600.0), che_rate), WithinAbs(0.0, 1e-12));
+}
+
+// Two seconds after the flush the cache has seen 1000 x 2 = 2000 requests, which hold
+// D(2000) = 1820.3 distinct keys (fewer than 2000: the hot keys repeat), well under the 10k it can
+// hold, so its hit ratio is the Che hit ratio of a cache of 1820.3 entries (the equation is
+// continuous in the capacity, so a fractional one is fine): 0.12677, about half of
+// h = 0.23191.
+TEST_CASE(
+    "two seconds after a flush the che cache hits like a cache of the distinct keys of 2000 "
+    "requests",
+    "[theory]") {
+  const double distinct = simsys::test_support::distinct_keys(zipf_popularity(), 2000);
+  REQUIRE_THAT(distinct, WithinAbs(1820.3, 0.1));  // dense sum, plain Python, 2026-10-30
+  REQUIRE(distinct < che_keys);                    // so min(keys, D) is D: still filling
+  const double expected = simsys::caching::che_hit_ratio(distinct, zipf_popularity());
+  REQUIRE(expected > 0.0);
+  REQUIRE(expected < steady_hit_ratio());
+  REQUIRE_THAT(hit_ratio_at(step_at(che_cache_run(), 602.0), che_rate), WithinRel(expected, 1e-9));
+  REQUIRE_THAT(origin_demand(step_at(che_cache_run(), 602.0)),
+               WithinRel(1000.0 * (1.0 - expected), 1e-9));
+}
+
+// Every step of the warm-up, from the flush to a little after the characteristic time, follows the
+// curve h(t) = che_hit_ratio(min(keys, D(rate t))): not just the points above. The hit ratio never
+// falls while the cache fills.
+TEST_CASE("the che cache's hit ratio follows the warm-up curve at every step until it is full",
+          "[theory]") {
+  const auto& records = che_cache_run();
+  double previous = -1.0;
+  for (std::size_t k = 0; k <= 125; ++k) {
+    CAPTURE(k);
+    const double seconds = 0.1 * static_cast<double>(k);
+    const double observed = hit_ratio_at(after_flush(records, k), che_rate);
+    REQUIRE_THAT(observed, WithinRel(expected_hit_ratio_after(seconds), 1e-9) ||
+                               WithinAbs(expected_hit_ratio_after(seconds), 1e-12));
+    REQUIRE(observed >= previous);
+    previous = observed;
+  }
+}
+
+// Full: D(n) reaches the 10k keys at n = t_c = che_characteristic_time(10k, popularity) = 12,106
+// requests (the definition of the characteristic time), 12.1 s at 1k/s. From the first step that
+// starts at or after it the hit ratio is exactly the steady h, and it stays there.
+TEST_CASE(
+    "the che cache is back at its steady hit ratio once the keys of rate times t requests "
+    "fill it",
+    "[theory]") {
+  const double t_c = simsys::caching::che_characteristic_time(che_keys, zipf_popularity());
+  REQUIRE_THAT(t_c, WithinAbs(12106.0, 2.0));  // requests; plain Python bisection, 2026-10-30
+  const double full_after_s =
+      t_c / che_rate;  // 12.106 s: the first step to start after it is 12.2 s
+  const auto& records = che_cache_run();
+  for (std::size_t k = 122; k < 300; ++k) {
+    CAPTURE(k);
+    REQUIRE(0.1 * static_cast<double>(k) >= full_after_s);
+    REQUIRE_THAT(hit_ratio_at(after_flush(records, k), che_rate),
+                 WithinRel(steady_hit_ratio(), 1e-9));
+  }
+  // and just before it (12.0 s: 12,000 requests, 106 short) it is below h by a hair, not at h
+  REQUIRE(hit_ratio_at(after_flush(records, 120), che_rate) < steady_hit_ratio());
+}
+
+// When is the cache "back"? The first step at which its hit ratio is within 1 % of h. The curve
+// h(t) is concave and flattens as D approaches 10k, so it gets within 1 % of h BEFORE the cache is
+// full: the answer is a model output, pinned against the closed form (the scan below, over the same
+// h(t) the engine must follow) and bracketed: after the flush, before the full time of 12.11 s,
+// and the step before it is outside the band.
+TEST_CASE(
+    "the che cache first returns within 1 percent of its steady hit ratio at the step the "
+    "closed form names",
+    "[theory]") {
+  const double h = steady_hit_ratio();
+  const auto within_one_percent = [h](double hit) { return std::abs(hit - h) <= 0.01 * h; };
+  std::size_t expected_step = 0;
+  for (std::size_t k = 0; k <= 125; ++k) {
+    if (within_one_percent(expected_hit_ratio_after(0.1 * static_cast<double>(k)))) {
+      expected_step = k;
+      break;
+    }
+  }
+  CAPTURE(expected_step);
+  // 11.8 s after the flush: h(11.8 s) / h = 0.99206, the step before (11.7 s) is 0.98943. Pinned as
+  // a number too, so a change of the closed form is noticed (the scan above is the model; this is
+  // its answer, from caching:: on 2026-10-30), and it is before the characteristic time (12.11 s).
+  REQUIRE(expected_step == 118);
+
+  const auto& records = che_cache_run();
+  std::size_t observed_step = 0;
+  for (std::size_t k = 0; k <= 125; ++k) {
+    if (within_one_percent(hit_ratio_at(after_flush(records, k), che_rate))) {
+      observed_step = k;
+      break;
+    }
+  }
+  REQUIRE(observed_step == expected_step);
+  REQUIRE_FALSE(
+      within_one_percent(hit_ratio_at(after_flush(records, expected_step - 1), che_rate)));
+}
+
+// A fixed hit ratio is a number, not a function of the cache's size, so the model has no curve to
+// follow: the simple case. The cache refills at one key per request, so it is full after
+// keys / rate seconds (1000 keys at 100/s: 10 s), and its hit ratio warms LINEARLY from 0 to the
+// stated 0.9 over that time:
+//   h(t) = 0.9 x min(1, t / 10 s)      0, 0.09 at 1 s, 0.225 at 2.5 s, 0.45 at 5 s (half), 0.9 at
+//   10 s
+// The origin sees 100 x (1 - h(t)): 100, 91, 77.5, 55, 10 per second.
+TEST_CASE("a fixed-ratio cache warms linearly to its ratio over keys divided by rate: 0.45 at half",
+          "[theory]") {
+  const auto records = records_of(
+      graph_of(flush_probe({.rate_per_s = 100,
+                            .client_keys = "",
+                            .edge = "type: cache, strategy: read_through, backend: origin, "
+                                    "keys: 1000, hit_ratio: {fixed: 0.9}",
+                            .flush_at = "10s",
+                            .duration = "30s"})),
+      300);
+  REQUIRE_THAT(hit_ratio_at(step_at(records, 9.9), 100.0), WithinRel(0.9, 1e-9));  // before: 0.9
+  const double fill_time_s = 1000.0 / 100.0;
+  for (const double after : {0.0, 1.0, 2.5, 5.0, 7.5, 10.0, 12.0, 19.9}) {
+    CAPTURE(after);
+    const double expected = 0.9 * std::min(1.0, after / fill_time_s);
+    const auto& r = step_at(records, 10.0 + after);
+    REQUIRE_THAT(origin_demand(r), WithinRel(100.0 * (1.0 - expected), 1e-9));
+  }
+  REQUIRE_THAT(hit_ratio_at(step_at(records, 15.0), 100.0),
+               WithinRel(0.45, 1e-9));  // half the fill
+  REQUIRE_THAT(origin_demand(step_at(records, 15.0)), WithinRel(55.0, 1e-9));
+  REQUIRE_THAT(origin_demand(step_at(records, 10.0)), WithinRel(100.0, 1e-12));  // empty: all miss
+}
+
+// A cdn is a read-only cache in front of its origin (ch. 1, ch. 14), so a flush acts on it the same
+// way: hit ratio 0 at the step that starts at the flush, the steady h before it, and the same
+// warm-up curve after it (checked at 2 s).
+TEST_CASE("a cache_flush on a cdn drops its hit ratio to 0 and warms it back like a cache's",
+          "[theory]") {
+  const auto records = records_of(
+      graph_of(flush_probe({.edge = "type: cdn, origin: origin, keys: 10k, hit_ratio: che"})),
+      6030);
+  REQUIRE_THAT(hit_ratio_at(step_at(records, 599.9), che_rate),
+               WithinRel(steady_hit_ratio(), 1e-9));
+  REQUIRE_THAT(origin_demand(step_at(records, 600.0)), WithinRel(1000.0, 1e-12));
+  REQUIRE_THAT(hit_ratio_at(step_at(records, 602.0), che_rate),
+               WithinRel(expected_hit_ratio_after(2.0), 1e-9));
+}
+
+// ---- dc_down: a datacenter's nodes and the links across its edge
+// ---------------------------------
+//
+// Book ch. 1 ("data center" and "geoDNS": if a data center goes offline, all traffic is routed to
+// the healthy one) and ch. 14's multi-region CDN. Model under test (phase 3 Task 7): dc_down names
+// a datacenter and is, while it lasts,
+//   node_down on every node whose `dc` it is              capacity x 0: nothing drains, the room
+//                                                         fills, the rest is dropped
+//   capacity factor 0 on every link that crosses its edge  a link with one end in the datacenter
+//                                                         and one outside, either direction
+// A pipe (a link with a bandwidth) is a fluid queue of megabytes, so factor 0 makes it drain
+// nothing: it fills its 1000 MB room and then drops everything that arrives, so its `passed` is 0.
+// A plain link has no queue, so it drops what crosses it at once. A link with both ends inside the
+// datacenter is not cut (its nodes are down anyway), and a client has no capacity, so a client in
+// the datacenter keeps emitting.
+// Assumed, where the plan text is silent: "every link leaving it" is read as "every link crossing
+// its edge" (the plan's own probe sends a us client's requests INTO eu over the cross-DC link and
+// expects it to pass 0); the two directions are pinned in separate tests below.
+//
+// The probe, 400/s per client, every service 1k/s with a room of 100 and zero-latency links:
+//   c_us (us): `local` 200/s -> s_us (us),  `remote` 200/s -> s_eu (eu) over the cross-DC link
+//   c_eu (eu): `eu_op` 400/s -> s_eu inside eu
+// dc_down eu for 10 s from 10 s. s_eu is offered 400/s by c_eu alone (the 200/s of `remote` is cut
+// on the link before it arrives), drains 0, so its backlog is the node_down staircase of the
+// existing node_down test: 40, 80, then the room 100, dropping 0, 0, 200/s (20 of 40 spill), then
+// 400/s. The only way the backlog reaches the room at exactly that pace is if 400/s arrives, which
+// is what tells a cut link from an uncut one (an uncut one would make it 60, 100).
+
+namespace {
+
+constexpr std::string_view eu_down_for_ten_seconds =
+    "faults:\n  - {at: 10s, kind: dc_down, datacenter: eu, for: 10s}\n";
+
+Scenario two_datacenters(std::string_view faults) {
+  return load_yaml(
+      "version: 1\nname: dc\nduration: 30s\nstep: 100ms\n"
+      "datacenters:\n  us: {}\n  eu: {}\n"
+      "nodes:\n"
+      "  c_us: {type: client, dc: us, rate: {base: 400/s}, ops: {local: 0.5, remote: 0.5}}\n"
+      "  s_us: {type: service, dc: us, capacity: 1k/s, latency: 1ms, advanced: {queue_limit: "
+      "100}}\n"
+      "  s_eu: {type: service, dc: eu, capacity: 1k/s, latency: 1ms, advanced: {queue_limit: "
+      "100}}\n"
+      "  c_eu: {type: client, dc: eu, rate: {base: 400/s}, ops: {eu_op: 1.0}}\n"
+      "links:\n"
+      "  - {from: c_us, to: s_us, ops: [local], dir: inout, latency: 0s}\n"
+      "  - {from: c_us, to: s_eu, ops: [remote], dir: inout, latency: 0s}\n"  // crosses us -> eu
+      "  - {from: c_eu, to: s_eu, dir: inout, latency: 0s}\n" +               // inside eu
+      std::string{faults});
+}
+
+// The probe's nodes, in declaration order.
+constexpr std::size_t s_us_node = 1;
+constexpr std::size_t s_eu_node = 2;
+
+const simsys::engine::NodeSample& node_of(const StepRecord& r, std::size_t node) {
+  return r.nodes.at(node);
+}
+
+// The client's sample for `op` (the ops of the probes are unique across their clients).
+const simsys::engine::ResponseSample& response_of(const StepRecord& r, std::string_view op) {
+  for (const auto& response : r.responses) {
+    if (response.op == op) return response;
+  }
+  FAIL("no client offers op " << op);
+  // C++23 std::unreachable(): tells the compiler control never gets here (FAIL throws), so the
+  // function needs no return value after the loop. Replaces __builtin_unreachable(), GCC's own
+  // spelling; reaching it is undefined behaviour.
+  std::unreachable();
+}
+
+const std::vector<StepRecord>& dc_down_run() {
+  static const auto records = records_of(graph_of(two_datacenters(eu_down_for_ten_seconds)), 300);
+  return records;
+}
+}  // namespace
+
+// The node half: every node of eu has capacity 0 for the ten seconds. The one service in eu drains
+// nothing, its backlog climbs the staircase to the room, and it drops once the room is full; its
+// own client keeps offering 400/s and is answered 0 once the room is full (as at a node_down). The
+// service in us is not touched.
+TEST_CASE(
+    "during a dc_down every node of the datacenter drains nothing and its backlog is the room",
+    "[theory]") {
+  const auto& records = dc_down_run();
+  for (double t = 10.0; t < 19.95; t += 0.1) {
+    CAPTURE(t);
+    const auto& s_eu = node_of(step_at(records, t), s_eu_node);
+    REQUIRE_THAT(s_eu.drain_per_s, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(s_eu.demand_per_s, WithinRel(400.0, 1e-9));  // c_eu's; `remote` is cut on the link
+  }
+  REQUIRE_THAT(node_of(step_at(records, 10.0), s_eu_node).backlog, WithinRel(40.0, 1e-9));
+  REQUIRE_THAT(node_of(step_at(records, 10.1), s_eu_node).backlog, WithinRel(80.0, 1e-9));
+  for (double t = 10.2; t < 19.95; t += 0.1) {
+    CAPTURE(t);
+    REQUIRE_THAT(node_of(step_at(records, t), s_eu_node).backlog, WithinRel(100.0, 1e-9));
+  }
+  REQUIRE_THAT(node_of(step_at(records, 10.1), s_eu_node).dropped_per_s, WithinAbs(0.0, 1e-9));
+  REQUIRE_THAT(node_of(step_at(records, 10.2), s_eu_node).dropped_per_s, WithinRel(200.0, 1e-9));
+  REQUIRE_THAT(node_of(step_at(records, 10.3), s_eu_node).dropped_per_s, WithinRel(400.0, 1e-9));
+  for (double t = 10.3; t < 19.95; t += 0.1) {  // c_eu offers 400/s and is answered nothing
+    CAPTURE(t);
+    REQUIRE_THAT(response_of(step_at(records, t), "eu_op").offered.per_second,
+                 WithinRel(400.0, 1e-12));
+    REQUIRE_THAT(response_of(step_at(records, t), "eu_op").answered.per_second,
+                 WithinAbs(0.0, 1e-9));
+  }
+  // before the fault: all 600/s (400 + the cross-DC 200) are served, nothing waits
+  const auto& before = node_of(step_at(records, 9.9), s_eu_node);
+  REQUIRE_THAT(before.demand_per_s, WithinRel(600.0, 1e-9));
+  REQUIRE_THAT(before.drain_per_s, WithinRel(600.0, 1e-9));
+  REQUIRE(before.backlog == 0.0);
+}
+
+// The link half, seen from the client in us: the cross-DC link passes 0, so of the 400/s it
+// offers, the 200/s of `local` that stays in us is answered (the service in us never notices) and
+// the 200/s of `remote` that crosses to eu is not, from the first step of the fault to the last.
+// A plain link has no queue, so it drops at once, with no staircase. After the fault both are
+// answered again.
+TEST_CASE("during a dc_down the client in us is answered only the share that stays in us",
+          "[theory]") {
+  const auto& records = dc_down_run();
+  for (double t = 10.0; t < 19.95; t += 0.1) {
+    CAPTURE(t);
+    const auto& r = step_at(records, t);
+    REQUIRE_THAT(response_of(r, "local").offered.per_second, WithinRel(200.0, 1e-12));
+    REQUIRE_THAT(response_of(r, "local").answered.per_second, WithinRel(200.0, 1e-9));
+    REQUIRE_THAT(response_of(r, "remote").offered.per_second, WithinRel(200.0, 1e-12));
+    REQUIRE_THAT(response_of(r, "remote").answered.per_second, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(node_of(r, s_us_node).demand_per_s, WithinRel(200.0, 1e-9));
+    REQUIRE_THAT(node_of(r, s_us_node).drain_per_s, WithinRel(200.0, 1e-9));
+    REQUIRE(node_of(r, s_us_node).backlog == 0.0);
+  }
+  const auto& before = step_at(records, 9.9);
+  REQUIRE_THAT(response_of(before, "local").answered.per_second, WithinRel(200.0, 1e-9));
+  REQUIRE_THAT(response_of(before, "remote").answered.per_second, WithinRel(200.0, 1e-9));
+  for (double t = 20.0; t < 29.95; t += 0.1) {
+    CAPTURE(t);
+    REQUIRE_THAT(response_of(step_at(records, t), "remote").answered.per_second,
+                 WithinRel(200.0, 1e-9));
+  }
+}
+
+// Recovery: the capacity is back at 1000/s the instant the fault ends, the cross-DC link passes
+// again, so s_eu is offered 400 + 200 = 600/s plus the 100 waiting in its room. By the fluid queue,
+// drain = min(demand + backlog / dt, capacity) and backlog' = backlog + (demand - drain) dt:
+//   step 20.0: drain min(600 + 1000, 1000) = 1000   backlog 100 + (600 - 1000) 0.1 = 60
+//   step 20.1: drain min(600 +  600, 1000) = 1000   backlog  60 + (600 - 1000) 0.1 = 20
+//   step 20.2: drain min(600 +  200, 1000) =  800   backlog  20 + (600 -  800) 0.1 =  0
+//   step 20.3: drain 600, nothing left.       Nothing is dropped after the fault.
+TEST_CASE(
+    "after a dc_down the datacenter's backlog drains in three steps and the link passes again",
+    "[theory]") {
+  const auto& records = dc_down_run();
+  const double drains[] = {1000.0, 1000.0, 800.0, 600.0};
+  const double backlogs[] = {60.0, 20.0, 0.0, 0.0};
+  for (std::size_t i = 0; i < 4; ++i) {
+    CAPTURE(i);
+    const auto& s_eu = node_of(step_at(records, 20.0 + 0.1 * static_cast<double>(i)), s_eu_node);
+    REQUIRE_THAT(s_eu.demand_per_s, WithinRel(600.0, 1e-9));  // the cross-DC 200/s are back
+    REQUIRE_THAT(s_eu.drain_per_s, WithinRel(drains[i], 1e-9));
+    REQUIRE_THAT(s_eu.backlog, WithinAbs(backlogs[i], 1e-9));
+  }
+  for (double t = 20.0; t < 29.95; t += 0.1) {
+    CAPTURE(t);
+    REQUIRE_THAT(node_of(step_at(records, t), s_eu_node).dropped_per_s, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(response_of(step_at(records, t), "eu_op").answered.per_second,
+                 WithinRel(400.0, 1e-9));
+  }
+}
+
+// The other direction: a client INSIDE the datacenter sending to a service outside it crosses the
+// edge going out. Read as "a link leaving the datacenter", the plan's own wording: it drops what
+// the client puts on it, so the service in us receives nothing from eu for the ten seconds and the
+// client is answered 0 from the first step. Before and after, 400/s flow.
+TEST_CASE(
+    "during a dc_down a link leaving the datacenter drops what a client inside sends across it",
+    "[theory]") {
+  const auto s = load_yaml(
+      "version: 1\nname: dc\nduration: 30s\nstep: 100ms\n"
+      "datacenters:\n  us: {}\n  eu: {}\n"
+      "nodes:\n"
+      "  c_eu: {type: client, dc: eu, rate: {base: 400/s}, ops: {op: 1.0}}\n"
+      "  s_us: {type: service, dc: us, capacity: 1k/s, latency: 1ms, advanced: {queue_limit: "
+      "100}}\n"
+      "links:\n  - {from: c_eu, to: s_us, dir: inout, latency: 0s}\n" +
+      std::string{eu_down_for_ten_seconds});
+  const auto records = records_of(graph_of(s), 300);
+  for (double t = 10.0; t < 19.95; t += 0.1) {
+    CAPTURE(t);
+    const auto& r = step_at(records, t);
+    REQUIRE_THAT(node_of(r, 1).demand_per_s, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(response_of(r, "op").offered.per_second, WithinRel(400.0, 1e-12));
+    REQUIRE_THAT(response_of(r, "op").answered.per_second, WithinAbs(0.0, 1e-9));
+  }
+  for (const double t : {9.9, 20.0, 25.0}) {
+    CAPTURE(t);
+    REQUIRE_THAT(node_of(step_at(records, t), 1).demand_per_s, WithinRel(400.0, 1e-9));
+    REQUIRE_THAT(response_of(step_at(records, t), "op").answered.per_second,
+                 WithinRel(400.0, 1e-9));
+  }
+}
+
+// A pipe is a link with a bandwidth: a fluid queue in megabytes. Two pipes cross eu's edge, one
+// each way: c_us -> s_eu (into eu, link row 0) and c_eu -> s_us (out of eu, link row 1), each
+// carrying 15k/s of 1 MB requests = 15,000 MB/s over 400 Gbit/s = 50,000 MB/s (rho 0.3), with the
+// 1000 MB room of every pipe (the rows come in the order of the links in the file). Factor 0 on a
+// pipe: it drains nothing, so each step's 1500 MB arrive on a pipe that
+//   step 10.0: keeps 1000 MB (the room), drops 500 MB = 5000 MB/s, drains 0
+//   step 10.1 on: is full: drops everything that arrives, 15,000 MB/s = its demand, drains 0
+// ("its inflow" in the plan's words), and from then on a request over it never gets through: its
+// `passed` is 0, which the client sees as answered 0. After the fault the backlog of 1000 MB drains
+// at once: drain = min(15,000 + 1000 / 0.1, 50,000) = 25,000 MB/s, backlog 0; then 15,000 again.
+namespace {
+Scenario pipes_across_eu() {
+  return load_yaml(
+      "version: 1\nname: dc\nduration: 30s\nstep: 100ms\n"
+      "datacenters:\n  us: {}\n  eu: {}\n"
+      "nodes:\n"
+      "  c_us: {type: client, dc: us, rate: {base: 15k/s}, ops: {to_eu: 1.0}, sizes: {to_eu: "
+      "1MB}}\n"
+      "  s_eu: {type: service, dc: eu, capacity: 1M/s, latency: 1ms}\n"
+      "  c_eu: {type: client, dc: eu, rate: {base: 15k/s}, ops: {to_us: 1.0}, sizes: {to_us: "
+      "1MB}}\n"
+      "  s_us: {type: service, dc: us, capacity: 1M/s, latency: 1ms}\n"
+      "links:\n"
+      "  - {from: c_us, to: s_eu, latency: 0s, bandwidth: 400Gbit/s}\n"
+      "  - {from: c_eu, to: s_us, latency: 0s, bandwidth: 400Gbit/s}\n" +
+      std::string{eu_down_for_ten_seconds});
+}
+}  // namespace
+
+TEST_CASE(
+    "during a dc_down a pipe across the datacenter's edge drains nothing, fills its room and "
+    "drops everything",
+    "[theory]") {
+  const auto records = records_of(graph_of(pipes_across_eu()), 300);
+  for (const std::size_t link : {std::size_t{0}, std::size_t{1}}) {  // into eu, out of eu
+    CAPTURE(link);
+    const auto& before = step_at(records, 9.9).links.at(link);
+    REQUIRE_THAT(before.demand_per_s, WithinRel(15000.0, 1e-9));
+    REQUIRE_THAT(before.drain_per_s, WithinRel(15000.0, 1e-9));
+    REQUIRE_THAT(before.dropped_per_s, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(before.backlog, WithinAbs(0.0, 1e-9));
+
+    const auto& first = step_at(records, 10.0).links.at(link);
+    REQUIRE_THAT(first.drain_per_s, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(first.backlog, WithinRel(1000.0, 1e-9));  // the room
+    REQUIRE_THAT(first.dropped_per_s, WithinRel(5000.0, 1e-9));
+    for (double t = 10.1; t < 19.95; t += 0.1) {
+      CAPTURE(t);
+      const auto& row = step_at(records, t).links.at(link);
+      REQUIRE_THAT(row.demand_per_s, WithinRel(15000.0, 1e-9));
+      REQUIRE_THAT(row.drain_per_s, WithinAbs(0.0, 1e-9));
+      REQUIRE_THAT(row.dropped_per_s, WithinRel(row.demand_per_s, 1e-9));  // dropped = its inflow
+      REQUIRE_THAT(row.backlog, WithinRel(1000.0, 1e-9));
+    }
+  }
+}
+
+// `passed` 0: with the room full, no request gets across, so neither client is answered anything
+// while it keeps offering 15k/s; the pipe's recovery step drains the 1000 MB backlog in one step.
+TEST_CASE(
+    "a pipe across the datacenter's edge passes nothing during a dc_down and recovers after it",
+    "[theory]") {
+  const auto records = records_of(graph_of(pipes_across_eu()), 300);
+  for (const auto* op : {"to_eu", "to_us"}) {
+    CAPTURE(op);
+    REQUIRE_THAT(response_of(step_at(records, 9.9), op).answered.per_second,
+                 WithinRel(15000.0, 1e-9));
+    for (double t = 10.1; t < 19.95; t += 0.1) {
+      CAPTURE(t);
+      REQUIRE_THAT(response_of(step_at(records, t), op).offered.per_second,
+                   WithinRel(15000.0, 1e-12));
+      REQUIRE_THAT(response_of(step_at(records, t), op).answered.per_second, WithinAbs(0.0, 1e-9));
+    }
+    REQUIRE_THAT(response_of(step_at(records, 20.0), op).answered.per_second,
+                 WithinRel(15000.0, 1e-9));
+  }
+  for (const std::size_t link : {std::size_t{0}, std::size_t{1}}) {
+    CAPTURE(link);
+    const auto& recovering = step_at(records, 20.0).links.at(link);
+    REQUIRE_THAT(recovering.drain_per_s, WithinRel(25000.0, 1e-9));
+    REQUIRE_THAT(recovering.backlog, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(recovering.dropped_per_s, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(step_at(records, 20.1).links.at(link).drain_per_s, WithinRel(15000.0, 1e-9));
+    REQUIRE_THAT(step_at(records, 20.1).links.at(link).backlog, WithinAbs(0.0, 1e-9));
+  }
+}
+
+// ---- dc_down is run, no longer refused ----------------------------------------------------------
+
+// Phase 3 Task 6 refused dc_down (`dc_down lands in Task 7`); Task 7 runs it. The scenario of the
+// refusal's test, with every node in `a` (a client and a service of 1k/s, default room 1000):
+// Simulation::create accepts it, the service drains nothing for the 5 s from 10 s, and its backlog
+// starts up the staircase 400/s x 0.1 s = 40, 80 per step (the client, in `a`, keeps emitting).
+TEST_CASE("Simulation::create accepts a dc_down fault and the datacenter's service serves nothing",
+          "[theory]") {
   const auto s = load_yaml(
       "version: 1\nname: faults\nduration: 30s\nstep: 100ms\n"
       "datacenters:\n  a: {}\n  b: {}\n"
@@ -536,7 +1108,16 @@ TEST_CASE("Simulation::create refuses a dc_down fault with a message naming Task
       "faults:\n  - {at: 10s, kind: dc_down, datacenter: a, for: 5s}\n");
   const auto g = graph_of(s);
   const auto sim = Simulation::create(g);
-  REQUIRE_FALSE(sim.has_value());
-  CAPTURE(sim.error().message);
-  REQUIRE(sim.error().message.contains("dc_down lands in Task 7"));
+  INFO((sim ? "" : sim.error().message));
+  REQUIRE(sim.has_value());
+
+  const auto records = records_of(g, 300);
+  REQUIRE_THAT(service_of(step_at(records, 9.9)).drain_per_s, WithinRel(400.0, 1e-12));
+  for (double t = 10.0; t < 14.95; t += 0.1) {
+    CAPTURE(t);
+    REQUIRE_THAT(service_of(step_at(records, t)).drain_per_s, WithinAbs(0.0, 1e-9));
+  }
+  REQUIRE_THAT(service_of(step_at(records, 10.0)).backlog, WithinRel(40.0, 1e-9));
+  REQUIRE_THAT(service_of(step_at(records, 10.1)).backlog, WithinRel(80.0, 1e-9));
+  REQUIRE_THAT(service_of(step_at(records, 15.0)).drain_per_s, WithinRel(1000.0, 1e-9));  // back
 }
