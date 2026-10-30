@@ -4443,6 +4443,74 @@ TEST_CASE("a search index still refuses ops") {
                    "node 'trie_db': key 'ops' is not valid for type 'search_index'");
 }
 
+// ---- Service discovery (phase 3 spec §8.1; book ch. 12) ----
+//
+// A service_discovery answers `lookup` ops like a service, and `failover` is the one key it owns:
+// how long, after a node_down of some replicas of a node its callers look up, those callers keep
+// sending requests to the dead replicas (a registry only learns of a failure after its health
+// checks time out). The loader accepted the key by name and dropped it; it is now a typed,
+// positive duration (NodeSpec::failover; no field for any other type). Absent, it is 10 s, CHOSEN
+// (the book gives none; defaults.cppm says why), and the loader fills the default in, as it does
+// a client's retry_after, so every reader finds the number in the model and explain prints it.
+
+namespace {
+std::string discovery_scenario(std::string_view keys) {
+  return scenario_with("  disc: {type: service_discovery" +
+                       (keys.empty() ? std::string{} : ", " + std::string{keys}) + "}\n");
+}
+}  // namespace
+
+TEST_CASE("a service discovery's failover loads as a duration") {
+  const auto path =
+      write_temp("simsys_discovery_failover.yaml", discovery_scenario("failover: 30s"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->nodes[0].type == simsys::model::NodeType::service_discovery);
+  REQUIRE(s->nodes[0].failover == 30s);
+}
+
+TEST_CASE("a service discovery that states no failover gets the chosen default of 10 s") {
+  const auto path = write_temp("simsys_discovery_default.yaml", discovery_scenario(""));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->nodes[0].failover == 10s);
+}
+
+// The numbers the type keeps for itself are still the scenario's to state (chat-system's file
+// does).
+TEST_CASE("a service discovery's capacity, latency and failover load together") {
+  const auto path =
+      write_temp("simsys_discovery_all.yaml",
+                 discovery_scenario("failover: 10s, capacity: 50k/s, latency: 0.5ms, replicas: 2"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->nodes[0].failover == 10s);
+  REQUIRE(s->nodes[0].capacity == simsys::Rate{50'000});
+  REQUIRE(s->nodes[0].latency == 500us);
+  REQUIRE(s->nodes[0].replicas == 2);
+}
+
+// Zero would be a registry that learns of the failure before it happens: nothing to hold callers
+// on, which leaving the node without a lookup step says more plainly.
+TEST_CASE("a service discovery's failover must be positive") {
+  require_rejected("simsys_discovery_failover_zero.yaml", discovery_scenario("failover: 0s"),
+                   "node 'disc': failover must be positive");
+}
+
+// The key belongs to service_discovery alone: on any other type the loader's message for a key
+// the type does not take applies.
+TEST_CASE("failover is refused on every type but service_discovery") {
+  require_rejected("simsys_service_failover.yaml",
+                   scenario_with("  api: {type: service, failover: 10s}\n"),
+                   "node 'api': key 'failover' is not valid for type 'service'");
+  require_rejected("simsys_search_failover.yaml",
+                   scenario_with("  trie_db: {type: search_index, failover: 10s}\n"),
+                   "node 'trie_db': key 'failover' is not valid for type 'search_index'");
+}
+
 // ---- SLOs per window ----
 //
 // An SLO may carry `over: <duration>`: the report then checks it on every window of that length

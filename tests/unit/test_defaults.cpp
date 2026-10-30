@@ -49,6 +49,17 @@ TEST_CASE("the web tier default is 2k/s with 1 ms service (spec table)", "[defau
   REQUIRE(d.service_time == 1ms);
 }
 
+// A service discovery (spec §8.1; book ch. 12's chat system) is a service of its own numbers: a
+// lookup is a small read from an in-memory registry, so the type takes 50k/s (one such registry
+// answers a whole tier's lookups) at 0.5 ms, one round trip within the data centre (the latency
+// table's intra_dc_rtt, 500 us). The rate is the spec's; the time is the book's.
+TEST_CASE("a service discovery defaults to 50k/s at 0.5 ms: one lookup round trip", "[defaults]") {
+  const auto d = simsys::defaults::for_type(NodeType::service_discovery);
+  REQUIRE(d.service_rate == Rate{50'000});
+  REQUIRE(d.service_time == 500us);
+  REQUIRE(d.service_time == simsys::defaults::latency_numbers.intra_dc_rtt);
+}
+
 TEST_CASE("a scenario capacity wins over the type default and says so", "[defaults]") {
   // C++20 designated initializers: `.id = ...` names each member being set, in declaration
   // order, and leaves the rest at their defaults. Replaces positional braces, which break

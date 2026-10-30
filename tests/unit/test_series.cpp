@@ -1666,3 +1666,74 @@ TEST_CASE("explain retries a pool calling two sinks at their combined failure sh
   CAPTURE(text);
   REQUIRE(check_line(text, "w").contains("(51.2%, green)"));
 }
+
+// ---- explain: a service discovery's numbers and its failover (phase 3 spec §8.1) ----
+//
+// A service_discovery is a service whose own key is `failover`, how long callers keep sending to a
+// dead replica of a node they looked up (book ch. 12's registry learns of a failure late). Its
+// explain line is a service's, the type's numbers marked (default), then `failover=<duration>`
+// closing the line the way a search index's `build_interval` does. The default failover, 10 s, is
+// filled in by the loader, so every line prints the number the engine uses.
+
+namespace {
+// u (1k/s of `call`) -> api -> [disc.lookup, svc.call]; disc states no numbers but its failover
+// (set after the designated initializers, so that the field's place in NodeSpec does not matter).
+Scenario discovered_scenario(simsys::SimTime failover) {
+  Scenario s{.name = "discovered", .version = 1, .duration = 1s, .step = 100ms};
+  NodeSpec disc{.id = "disc", .type = NodeType::service_discovery};
+  disc.failover = failover;
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"call", 1.0}}}},
+      NodeSpec{
+          .id = "api",
+          .type = NodeType::service,
+          .capacity = Rate{100'000},
+          .ops = {{"call", {Step{.to = "disc", .op = "lookup"}, Step{.to = "svc", .op = "call"}}}}},
+      std::move(disc), NodeSpec{.id = "svc", .type = NodeType::service, .capacity = Rate{4000}}};
+  s.links = {LinkSpec{.from = "u", .to = "api", .latency = 0s},
+             LinkSpec{.from = "api", .to = "disc", .latency = 0s},
+             LinkSpec{.from = "api", .to = "svc", .latency = 0s}};
+  return s;
+}
+}  // namespace
+
+// With nothing stated the type's numbers stand, each marked (default): 50k/s and 0.5 ms (book:
+// one round trip within the data centre), c = 50,000/s x 0.5 ms = 25 servers (Little's law); and
+// the 1k lookups a second of the checks block are 1000 / 50,000 = 2 % of the registry.
+TEST_CASE("explain prints a service discovery's defaults, 50k/s and 0.5 ms, and its failover",
+          "[series]") {
+  const auto text = explain_of(discovered_scenario(30s));
+  CAPTURE(text);
+  REQUIRE(node_line(text, "disc")
+              .contains("dc=main  replicas=1  capacity=50k/s (default)  service_time=500us "
+                        "(default)  c=25 (implied)  queue_limit=1000 (default)  variability=1  "
+                        "burstiness=1  failover=30s"));
+  REQUIRE(node_line(text, "disc").ends_with("failover=30s"));
+  REQUIRE(
+      check_line(text, "disc").contains("peak offered 1k/s vs 50k/s total capacity  (2%, green)"));
+}
+
+// The shipped chat-system's discovery states the book's numbers and failover 10s: the line ends
+// with it.
+TEST_CASE("explain on chat-system prints its discovery's failover=10s", "[series]") {
+  const auto text = explain_shipped("chat-system");
+  CAPTURE(text);
+  REQUIRE(node_line(text, "discovery")
+              .contains("dc=main  replicas=1  capacity=50k/s (scenario)  service_time=500us "
+                        "(scenario)  c=25 (implied)  queue_limit=1000 (default)  variability=1  "
+                        "burstiness=1  failover=10s"));
+  REQUIRE(node_line(text, "discovery").ends_with("burstiness=1  failover=10s"));
+}
+
+// A failover is the registry's own: no other node's line carries one.
+TEST_CASE("explain prints failover on the service discovery's line alone", "[series]") {
+  const auto text = explain_of(discovered_scenario(10s));
+  CAPTURE(text);
+  for (const auto* id : {"u", "api", "svc"}) {
+    CAPTURE(id);
+    REQUIRE_FALSE(node_line(text, id).contains("failover"));
+  }
+  REQUIRE(node_line(text, "disc").contains("failover=10s"));
+}
