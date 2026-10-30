@@ -249,6 +249,9 @@ null, `interrupted by the flush at …`; 6–9 documented (the note's five sente
 them). Not checked by the review: the cache_aside/CDN paths at run time, a ring-partitioned cache's
 per-replica share, a client inside a down datacenter calling a service outside: the 3b comprehensive
 review covers them.
+Fixed at `90efcfb` (1486 tests): the schedule counts the reads each flushed cache receives per step
+(`count_reads`), the warm time is found inside the step where the count reaches the full point;
+`FaultRecord::warm_up_s` became `flush_window_s`; `docs/study/numerics.md` §11 has the derivation.
 
 ### Task 8: the fault block in the report
 
