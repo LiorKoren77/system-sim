@@ -3996,7 +3996,9 @@ TEST_CASE("a gateway's deliver has no hops, its send and heartbeat one each", "[
 // gives c = 50,000/s x 0.5 ms = 25 servers per copy. Its one rule is the graph's to answer, for
 // the engine's failover: does an op reach a node THROUGH a lookup? `lookup_before(node, op,
 // target)` says whether the steps `node` runs for `op` have a step to a service_discovery node
-// asking `lookup` before the step to `target` (anywhere before it, not only right before).
+// asking `lookup` before a step to `target` (anywhere before it, not only right before). The rule
+// is per step, as the engine's failover reads it (Graph::discovery_before_step): when `target` is
+// called twice, a lookup before either call is enough.
 // Proposed signature: Graph::lookup_before(std::size_t node, std::string_view op,
 // std::size_t target) const -> bool; the plan's `lookup_before(op, target)` leaves out the node
 // whose step list it reads, which an op name alone does not identify.
@@ -4071,6 +4073,21 @@ TEST_CASE("a lookup after the step to a node is not a lookup before it", "[graph
       discovered({Step{.to = "svc", .op = "call"}, Step{.to = "disc", .op = "lookup"}}));
   REQUIRE(g.has_value());
   REQUIRE_FALSE(looked_up_before(*g, "api", "call", "svc"));
+}
+
+// The rule is per step: a node called once before the lookup and once after it is reached through
+// the lookup by its second call (the engine holds that call on a dead replica, not the first), so
+// the answer for the node is yes. Review finding of Task 13: the first call alone decided.
+TEST_CASE("a node called both before and after a lookup is reached through it by the later call",
+          "[graph]") {
+  const auto g =
+      Graph::build(discovered({Step{.to = "svc", .op = "call"}, Step{.to = "disc", .op = "lookup"},
+                               Step{.to = "svc", .op = "call"}}));
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  REQUIRE(looked_up_before(*g, "api", "call", "svc"));
+  REQUIRE_FALSE(g->discovery_before_step(1, "call", 0).has_value());
+  REQUIRE(g->discovery_before_step(1, "call", 2) == std::optional<std::size_t>{2});
 }
 
 // The rule is per target: a lookup before one node says nothing of a node called ahead of it.

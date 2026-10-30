@@ -1006,12 +1006,14 @@ unless the scenario states its own `capacity` and `latency`; `c = 50,000/s × 0.
 by Little's law. It answers the **`lookup`** op its callers send, and a lookup is a step like any
 other: it adds the discovery's sojourn and the link's round trip to the caller's response.
 
-**The lookup rule.** An op reaches a node *through a lookup* when its step list has a step to a
-`service_discovery` asking `lookup` anywhere before its (first) step to that node:
+**The lookup rule.** A step reaches its node *through a lookup* when the step list has a step to a
+`service_discovery` asking `lookup` anywhere before it:
 `api: {ops: {call: [{to: disc, op: lookup}, {to: svc, op: call}]}}` looks `svc` up; `[{to: svc,
 op: call}, {to: disc, op: lookup}]` does not (the caller had the address already), and neither does
 a step asking a plain service for an op named `lookup` (a cache's lookup is the cache's business).
-The rule is per op: another op of `api` that calls `svc` without a lookup is not held.
+The rule is per step and per op: in `[{to: svc, op: call}, {to: disc, op: lookup}, {to: svc, op:
+call}]` the second call is held on a dead replica and the first is not (the probe below loses 2.5k
+requests through it), and another op of `api` that calls `svc` without a lookup is not held.
 
 **`failover`** (a positive duration, default **10 s, chosen, not from the book**: a registry learns
 of a death when the dead server's session or health check times out, which ZooKeeper's session
@@ -1042,8 +1044,11 @@ Ignored: the registry's own availability (a `node_down` of the discovery itself 
 its capacity: its lookups queue or are dropped like any service's),
 partial knowledge (every caller learns of the death at the same moment, `failover` after it), a
 client sending a failed request to another server (that is the client's `retries`, which see the
-lost share like any loss), and the link's delay for the dead share (whether a request goes to a
-dead replica is decided when it is sent).
+lost share like any loss), the link's delay for the dead share (whether a request goes to a
+dead replica is decided when it is sent), a registry with no live replica to hand out (when every
+replica is down, the requests after the window wait in the node's room for it to come back, where a
+real registry would fail them at once), and a lookup in a `then` list (only the steps of an op's
+own list fail over).
 
 ### `message_queue` and `worker_pool`
 
@@ -1521,7 +1526,7 @@ the observed seconds (`steps` × `step`).
 | `slo[]` | `observed`, `max` | seconds for a latency, `staleness` or `queue_lag` SLO, a ratio otherwise |
 | `slo[]` | `window_start_s` | seconds from the start of the run; only an SLO with `over` that `run` judged |
 | `faults[]` | `at_s`, `kind`, `node`, `for_s` | seconds from the start of the run; the kind; the node (`null` for a `dc_down`, which has `datacenter` after it); seconds, `null` for a `cache_flush` |
-| `faults[]` | `overlaps_at_s` | the `at_s` of every earlier fault on the same node (or datacenter) still counting when this one struck; `[]` for none |
+| `faults[]` | `overlaps_at_s` | the `at_s` of every earlier fault on the same node (or datacenter) still counting when this one struck; `[]` for none. Overlapping faults' `failover_lost` overlap like their `lost` does: each counts the dead-replica share over the other's window too |
 | `faults[]` | `during` | `offered_per_s`, `served_per_s` (means over the fault), `lost` (against the twin, from `at` to the recovery) in `lost_unit` (`"requests"` or `"MB"`), `lost_on_cut_links` (a `dc_down`'s, in requests; `null` for every other kind), `backlog_peak`, `room` (in `lost_unit`; `room` `null` for a `cache_flush`), `extra_misses` and `origin` (a `cache_flush`'s, in the origin's unit; `null` for every other kind), `flipped`, the SLOs whose verdict differs from the twin's, as the text names them (`["p99_latency c op"]`; the verdict is the `slo` array's), and `over_max`, each SLO broken during the fault where the twin held it, `[{"slo": "p99_latency c op", "for_s": 0.3}]` |
 | `faults[]` | `after` | `backlog_node` (whose backlog: the node, the datacenter, a `traffic_spike`'s downstream node; `null` when the fault left none), `backlog_drained_in_s`, `cache_warm_in_s`: seconds, `null` where the text says there is none; a `cache_flush`'s also has `interrupted_by_flush_at_s` after `cache_warm_in_s` (seconds from the start of the run of the next flush that emptied its cache first; `null` when none did), a key no other kind has |
 | `faults[]` | `recovered_at_s` | seconds from the start of the run; `null` when not recovered by the end of the run |
@@ -1841,7 +1846,8 @@ several), the jobs the retrying pools that call into it put back on their queues
 a node that some op reaches through a [service discovery](#service_discovery) adds what its
 failover cost, the requests sent to the dead replicas from `at` to the recovery (they are in `lost`
 too): `failover 10s: 2.5k requests sent to the dead replica` (`replicas` when the fault took
-several).
+several; `attempts` when retries reach the node, as in `lost`). The window printed is the one that
+applied, `min(failover, for)`: a 5 s `node_down` under `failover: 10s` prints `failover 5s`.
 
 In `run --report json` each fault's `during` has `lost_unit` (`"requests"`, `"MB"` or
 `"attempts"`) and `lost_requests` (the requests lost for good; `null` when no retries are

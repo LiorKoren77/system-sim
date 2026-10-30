@@ -2617,15 +2617,13 @@ std::span<const ServiceHop> Graph::service_hops(std::size_t node, std::string_vi
   return found->second;
 }
 
-// The first step of (node, op) to `target` decides: a discovery lookup before it hands out the
-// address it calls (a later step to the same node, after a lookup, does not make the first one
-// looked up).
+// Per step, as the engine's failover reads it (engine::FaultSchedule::add_failover_routes): any
+// step of (node, op) to `target` with a discovery lookup before it is reached through the lookup,
+// so `[svc, disc.lookup, svc]` reaches svc through it by its second call (the first is not held).
 bool Graph::lookup_before(std::size_t node, std::string_view op, std::size_t target) const {
   const auto hops = service_hops(node, op);
   for (std::size_t position = 0; position < hops.size(); ++position) {
-    if (hops[position].target == target) {
-      return discovery_before_step(node, op, position).has_value();
-    }
+    if (hops[position].target == target && discovery_before_step(node, op, position)) return true;
   }
   return false;
 }

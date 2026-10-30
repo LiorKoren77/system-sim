@@ -1048,13 +1048,16 @@ constexpr std::string_view op_title =
 }
 
 // A node_down's failover behind a service discovery (engine::FaultSchedule's header), when one
-// applied: the discovery's window and the requests it still sent to the dead replicas,
-// `failover 10s: 2.5k requests sent to the dead replica` (`replicas` when the fault took several).
-[[nodiscard]] std::string failover_text(const engine::FaultAfter& after) {
+// applied: the window that applied (min(failover, for)) and the requests it still sent to the
+// dead replicas, `failover 10s: 2.5k requests sent to the dead replica` (`replicas` when the fault
+// took several). With retries involved (`lost_requests` set) they are attempts, as `lost` is: a
+// dropped attempt is sent again, and its retry is looked up like the first.
+[[nodiscard]] std::string failover_text(const engine::FaultRecord& r) {
+  const auto& after = r.after;
   const std::string_view dead = after.dead_replicas == 1 ? "the dead replica" : "the dead replicas";
+  const std::string_view unit = r.lost_requests ? "attempts" : "requests";
   return "failover " + format_duration(seconds(after.failover)) + ": " +
-         amount_text(without_residue(*after.failover_lost), "requests") + " sent to " +
-         std::string{dead};
+         amount_text(without_residue(*after.failover_lost), unit) + " sent to " + std::string{dead};
 }
 
 // The follow-on, then what the failover sent to dead replicas, then what the retries added, each
@@ -1063,7 +1066,7 @@ constexpr std::string_view op_title =
 [[nodiscard]] std::string after_text(const engine::FaultRecord& r) {
   std::vector<std::string> parts{follow_on_text(r)};
   const auto& after = r.after;
-  if (after.failover_lost) parts.push_back(failover_text(after));
+  if (after.failover_lost) parts.push_back(failover_text(r));
   if (retries_added(after.retries_added_attempts)) {
     parts.push_back("retries added " + amount_text(after.retries_added_attempts, "attempts"));
   }

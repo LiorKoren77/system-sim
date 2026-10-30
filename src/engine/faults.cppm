@@ -43,9 +43,9 @@
 // (ZooKeeper) for one and then talks to the server it was handed. A registry learns that a server
 // died only when the server's session or health check times out; until then it keeps handing out
 // the dead address, and every request sent there is lost. The model: when an op reaches a node
-// THROUGH a lookup (its steps ask a service_discovery `lookup` before the step to the node:
-// graph::Graph::lookup_before; a FailoverRoute below) and a node_down takes r of the node's R
-// replicas, then for min(failover, the fault's `for`) from the fault's start the share r / R of
+// THROUGH a lookup (its steps ask a service_discovery `lookup` before a step to the node, per step:
+// graph::Graph::discovery_before_step; a FailoverRoute below) and a node_down takes r of the node's
+// R replicas, then for min(failover, the fault's `for`) from the fault's start the share r / R of
 // that op's requests still goes to the dead replicas (dead_share; `failover` is the discovery's,
 // NodeSpec::failover, 10 s by default). Those requests count at the node as demand and as drops,
 // never as drain, and the caller's op loses them (behaviours::detail::HopBlocks::fail_over); the
@@ -63,8 +63,11 @@
 // its capacity like any service's, and the addresses its callers hold stay good), partial
 // knowledge (every caller learns of the death at the same moment, `failover` after it), the client
 // sending a failed request to another server (that is a client's `retries`, which see the lost
-// share like any loss), and the link delay of the dead share (a request handed a dead address at
-// `t` is lost at the node when it arrives there, but whether it was is decided at `t`).
+// share like any loss), the link delay of the dead share (a request handed a dead address at
+// `t` is lost at the node when it arrives there, but whether it was is decided at `t`), a registry
+// with no live replica to hand out (with every replica down, the requests after the window wait in
+// the node's room for it to come back, where a real registry would fail them at once), and a
+// lookup in a `then` list (add_failover_routes walks the steps of each op's own list only).
 //
 // C++20 module partition, interface kind: `export module simsys.engine:faults;` names a piece of
 // the module simsys.engine whose exports become part of the module's interface once the primary
@@ -339,7 +342,8 @@ class FaultSchedule {
 // faults has no twin, and is the run it was).
 // Overlapping faults on one target split nothing: each record counts from its own `at` to its own
 // recovery, so two outages of one node that overlap both count the steps they share (the report
-// says `(overlaps fault 00:00:10)` on the later block, so that nobody adds them).
+// says `(overlaps fault 00:00:10)` on the later block, so that nobody adds them). The failover's
+// after lines overlap the same way: each counts the dead-replica share over the other's window too.
 // Units: the faulted part counts in its own unit (engine::NodeSample: capacity units, which are
 // requests when every cost is 1, and MEGABYTES on a byte-sized node, defaults::is_byte_sized):
 // `lost_unit` says which, and the rates, the backlog and the room are in it too. A dc_down's links
@@ -370,8 +374,9 @@ class FaultSchedule {
 // Failover (FaultSchedule's header): a node_down on a node that some op reaches through a service
 // discovery keeps that op's callers on the dead replicas for the discovery's `failover`; what they
 // sent there is part of `lost` (the node's drops), and `after` says how much of it (failover_lost:
-// `failover 10s: 2.5k requests sent to the dead replica`). Ignored: anything the run does not show
-// (how a load balancer detects the failure: FaultSchedule's header).
+// `failover 10s: 2.5k requests sent to the dead replica`, in `attempts` when retries reach the
+// node, as `lost` is). Ignored: anything the run does not show (how a load balancer detects the
+// failure: FaultSchedule's header).
 struct FaultAfter {
   // Whose backlog the fault left above the twin's: the faulted node, a dc_down's datacenter, a
   // traffic_spike's downstream node with the most work left (backlog / capacity, in seconds, over
@@ -404,8 +409,9 @@ struct FaultAfter {
   // the requests the registry sent to the dead replicas before it noticed, Σ over the faulted
   // node's dead-replica losses (NodeSample::failover_lost_per_s) × dt from `at` to the recovery
   // (the twin has none). Empty when the fault has no failover (another kind, or no lookup before
-  // the node). `failover` is the discovery's window (the first route's, when several discoveries
-  // hand the node out), and `dead_replicas` the replicas the fault took (r, or all R).
+  // the node). `failover` is the window that applied: the discovery's (the first route's, when
+  // several discoveries hand the node out) cut to the fault's `for`, min(failover, for); and
+  // `dead_replicas` the replicas the fault took (r, or all R).
   std::optional<double> failover_lost{};
   SimTime failover{};
   int dead_replicas{};
