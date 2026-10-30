@@ -213,5 +213,5 @@ diurnal scenario with a pool, `run` is the verdict.
   run it is red for 18.62k s around the evening, its peak rho 0.9811; the European p99 rises to
   498 ms, still within 2 s.
 - Lower `cdn_eu.capacity` to `5GB/s`: `explain` puts `cdn_eu` at 141 %, red (7.04k MB/s of 5k).
-- Add `{at: 21:00, kind: dc_down, dc: eu-west, for: 5m}` in `faults` (phase 3: faults are
-  accepted and ignored today).
+- Add `{at: 21:00, kind: dc_down, datacenter: eu-west, for: 5m}` in `faults` (`dc_down` is
+  refused until Task 7 of phase 3 lands; the other kinds run).

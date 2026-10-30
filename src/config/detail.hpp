@@ -294,6 +294,11 @@ std::optional<double> parse_yaml_double(std::string_view text);
 // The value of a numeric key, or nothing when it is no number (see number_text).
 std::optional<double> number_value(const YAML::Node& node);
 
+// Is `node` written as a number at all, finite or not, in range or not (1e309 and `.nan` are;
+// a quoted "0.5", a word, "2k", a list or a map are not)? Lets a reader answer "must be a
+// number" before its range rule, as the rate curve and the faults list do.
+bool is_written_as_number(const YAML::Node& node);
+
 // The key node of `parent[key]`, for messages about the key itself. yaml-cpp's lookup
 // returns only the value.
 YAML::Node key_node(const YAML::Node& parent, std::string_view key);

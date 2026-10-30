@@ -145,6 +145,26 @@ std::optional<double> number_value(const YAML::Node& node) {
   return parse_yaml_double(number_text(node));
 }
 
+// YAML's spellings of not-a-number and infinity (YAML 1.2 core schema). They are numbers in
+// YAML, just not finite ones, so a key answers them with its range message, not "must be a
+// number".
+constexpr std::array<std::string_view, 12> yaml_special_floats{".nan",  ".NaN",  ".NAN",  ".inf",
+                                                               ".Inf",  ".INF",  "+.inf", "+.Inf",
+                                                               "+.INF", "-.inf", "-.Inf", "-.INF"};
+
+// Is `node` written as a number at all, finite or not, in range or not? A plain scalar
+// that reads whole as a decimal (1e309 included, which is out of range, not "no number"),
+// or one of YAML's NaN/infinity spellings. A quoted "0.5", a word, a list or a map is not.
+bool is_written_as_number(const YAML::Node& node) {
+  const auto text = number_text(node);
+  if (text.empty()) return false;
+  const auto parsed = parse_whole<double>(text);
+  // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
+  // `std::ranges::find(r, v) != r.end()`, which spells the question as an iterator comparison.
+  return parsed || parsed.error() == NumberFault::out_of_range ||
+         std::ranges::contains(yaml_special_floats, std::string_view{text});
+}
+
 YAML::Node key_node(const YAML::Node& parent, std::string_view key) {
   for (const auto& entry : parent) {
     if (entry.first.IsScalar() && entry.first.Scalar() == key) return entry.first;

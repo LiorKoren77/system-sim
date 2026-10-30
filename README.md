@@ -271,7 +271,8 @@ frontiers) already validate and appear in `explain` with their resolved numbers,
 `run` and `sweep` stop with "which run/estimate do not support yet" and exit 1, as do the four book
 systems that need them. Each of those four READMEs opens with its status: the exact refusal, what
 `explain` shows today (its red checks and the nodes it cannot reach yet) and what phase 3 will
-model. Faults, retries, `on: failure` steps and kv partitions are phase 3 too.
+model. Faults, retries and `on: failure` steps are phase 3 too; kv partitions are a phase 4
+backlog item.
 
 ## Toolchain
 
