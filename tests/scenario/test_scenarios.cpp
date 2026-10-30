@@ -132,10 +132,15 @@ TEST_CASE("every shipped scenario resolves into a graph that explain can print",
 // 2026-10-30). It is CPU time, not wall-clock time: under `ctest -j` on a loaded machine this test
 // took 4.61 s of wall clock in Debug and its wall-clock limit was flaky, while the CPU time a
 // single-threaded run spends is what the scenario costs, whoever else shares the machine.
+// The [serial] tag: tests/CMakeLists.txt registers this case with ctest's RUN_SERIAL property, so
+// `ctest -j8` runs it alone. The limit is CPU time, but eight test processes sharing the cores'
+// caches and hyperthreads slow each one's CPU time too: with the day tests alongside, kv-store
+// took 5.25 s and consistent-hashing 5.9 s of CPU (measured 2026-10-30, Debug), against under 4 s
+// alone. The limit stays a property of the scenario, not of the machine's load.
 TEST_CASE(
     "scenarios whose node types all exist run in under five seconds of CPU and pass their "
     "SLOs",
-    "[scenario]") {
+    "[scenario][serial]") {
   int ran = 0;
   for (const auto& file : scenario_files()) {
     CAPTURE(file);
