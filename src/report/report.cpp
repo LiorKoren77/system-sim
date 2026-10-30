@@ -707,22 +707,35 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   return words;
 }
 
-// The SLOs a fault flipped, in the scenario's order (indexes the engine kept).
-[[nodiscard]] std::vector<std::string> flipped_words(const engine::FaultRecord& r,
-                                                     std::span<const model::SloSpec> slos) {
-  std::vector<std::string> words;
-  for (const std::size_t i : r.flipped) {
-    if (i < slos.size()) words.push_back(slo_words(slos[i]));
-  }
-  return words;
+// An amount of the faulted part's unit (engine::FaultRecord::lost_unit) as the node table prints
+// one, with its unit: `3.9k requests`, `24k MB`.
+[[nodiscard]] std::string amount_text(double value, std::string_view unit) {
+  return with_si_prefix(without_residue(value)) + " " + std::string{unit};
+}
+
+// A backlog or a room: a count of requests as the node table's peak_backlog prints it (`100`), a
+// megabyte figure with its unit (`1k MB`).
+[[nodiscard]] std::string waiting_text(double value, std::string_view unit) {
+  return with_si_prefix(without_residue(value)) + (unit == "MB" ? " MB" : "");
+}
+
+// A rate of the faulted part: `400/s`, or on a byte-sized node `5k MB/s`, its capacity's unit.
+[[nodiscard]] std::string rate_text(double per_second, std::string_view unit) {
+  if (unit == "MB") return with_si_prefix(without_residue(per_second)) + " MB/s";
+  return fmt_rate(without_residue(per_second));
 }
 
 // `fault 00:00:10 node_down s for 10s`: when (fault_clock), what, where, and how long, which a
-// cache_flush, an instant, does not have (model::lasts); `for` as the scenario writes it.
-[[nodiscard]] std::string fault_header(const engine::FaultRecord& r) {
+// cache_flush, an instant, does not have (model::lasts); `for` as the scenario writes it. A fault
+// that overlaps earlier ones on its target names them: `(overlaps fault 00:00:10)`.
+[[nodiscard]] std::string fault_header(const FaultBlock& block) {
+  const auto& r = block.record;
   std::string header = "fault " + fault_clock(r.at) + " " + std::string{model::to_string(r.kind)} +
                        " " + fault_target(r);
   if (model::lasts(r.kind)) header += " for " + describe_duration(r.duration);
+  std::vector<std::string> earlier;
+  for (const SimTime at : block.overlaps) earlier.push_back(fault_clock(at));
+  if (!earlier.empty()) header += " (overlaps fault " + join(earlier, ", ") + ")";
   return header + "\n";
 }
 
@@ -732,61 +745,117 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   return "  " + std::string{label} + std::string(label_width - label.size(), ' ') + text + "\n";
 }
 
-// `backlog 100 (room 100 dropped the rest)`: the parenthesis only when the room filled and dropped
-// (a traffic_spike's client has no room: what it lost was lost downstream). Both numbers as the
-// node table's peak_backlog (with an SI prefix), so that `backlog 9k` and its `room 9k` read alike.
-[[nodiscard]] std::string backlog_text(const engine::FaultRecord& r) {
-  const std::string backlog = "backlog " + with_si_prefix(without_residue(r.backlog_peak));
-  if (without_residue(r.lost) <= 0.0 || r.room <= 0.0) return backlog;
-  return backlog + " (room " + with_si_prefix(r.room) + " dropped the rest)";
+// `lost 3.9k requests`, `lost 24k MB`; a dc_down keeps its cut links' requests apart, never added
+// to its nodes' figure: `lost 24k MB at its nodes and 500 requests on cut links`.
+[[nodiscard]] std::string lost_text(const engine::FaultRecord& r) {
+  const std::string at_nodes = "lost " + amount_text(r.lost, r.lost_unit);
+  if (r.kind != model::FaultKind::dc_down) return at_nodes;
+  return at_nodes + " at its nodes and " + amount_text(r.lost_on_cut_links, "requests") +
+         " on cut links";
 }
 
-// What the fault cost while it lasted: the faulted node's demand and drain, the requests lost, the
-// backlog, then each SLO it flipped.
-[[nodiscard]] std::string during_line(const engine::FaultRecord& r,
+// Whether the room filled: the backlog reached it (to float residue) and the node itself dropped.
+[[nodiscard]] bool room_filled(const engine::FaultRecord& r) {
+  constexpr double residue = 1e-9;
+  return r.room > 0.0 && r.backlog_peak >= r.room - residue && without_residue(r.lost) > 0.0;
+}
+
+// `backlog 100 (room 100 dropped the rest)`: the parenthesis only when the room filled and dropped
+// (room_filled; a dc_down that lost only on its cut links, or a traffic_spike's client, which has
+// no room, prints none). Both numbers as the node table's peak_backlog, so that `backlog 9k` and
+// its `room 9k` read alike.
+[[nodiscard]] std::string backlog_text(const engine::FaultRecord& r) {
+  const std::string backlog = "backlog " + waiting_text(r.backlog_peak, r.lost_unit);
+  if (!room_filled(r)) return backlog;
+  return backlog + " (room " + waiting_text(r.room, r.lost_unit) + " dropped the rest)";
+}
+
+// A flush's cost (engine::FaultRecord): the reads its empty cache sent its origin beyond the
+// twin's, `extra misses 454.5 to origin`.
+[[nodiscard]] std::string extra_misses_text(const engine::FaultRecord& r) {
+  std::string text = "extra misses " + waiting_text(r.extra_misses, r.origin_unit);
+  return r.origin.empty() ? text : text + " to " + r.origin;
+}
+
+// What the fault did to one SLO (FaultSlo): `p99_latency c op over its max for 300ms`, `drop_rate
+// flipped to FAIL`, or both, `..., flipped to FAIL`.
+[[nodiscard]] std::string fault_slo_text(const FaultSlo& effect,
+                                         std::span<const model::SloSpec> slos) {
+  std::vector<std::string> parts;
+  if (effect.over_max_s > 0.0) {
+    parts.push_back("over its max for " + format_duration(effect.over_max_s));
+  }
+  if (effect.flipped_to) {
+    parts.push_back("flipped to " + std::string{status_cell(*effect.flipped_to, false).text});
+  }
+  return slo_words(slos[effect.slo]) + " " + join(parts, ", ");
+}
+
+// What the fault cost while it lasted: the faulted node's demand and drain, what it lost, its
+// backlog (a flush: its extra misses instead, having no backlog of its own), then what it did to
+// each SLO.
+[[nodiscard]] std::string during_line(const FaultBlock& block,
                                       std::span<const model::SloSpec> slos) {
-  std::vector<std::string> parts{"offered " + fmt_rate(without_residue(r.offered_per_s)),
-                                 "served " + fmt_rate(without_residue(r.served_per_s)),
-                                 "lost " + with_si_prefix(without_residue(r.lost)) + " requests",
-                                 backlog_text(r)};
-  for (const auto& words : flipped_words(r, slos)) parts.push_back(words + " flipped to FAIL");
+  const auto& r = block.record;
+  std::vector<std::string> parts{"offered " + rate_text(r.offered_per_s, r.lost_unit),
+                                 "served " + rate_text(r.served_per_s, r.lost_unit), lost_text(r)};
+  parts.push_back(r.kind == model::FaultKind::cache_flush ? extra_misses_text(r) : backlog_text(r));
+  for (const auto& effect : block.slos) parts.push_back(fault_slo_text(effect, slos));
   return fault_line("during:", join(parts, ", "));
 }
 
-// What followed: a flush's warm-up, any other fault's backlog to drain.
+// What followed: a flush's warm-up, any other fault's backlog to drain (a traffic_spike's is
+// downstream, and names the node: `s backlog drained in 0.2s`).
 [[nodiscard]] std::string after_text(const engine::FaultRecord& r) {
   if (r.kind == model::FaultKind::cache_flush) {
     return r.after.cache_warm_in_s
                ? "cache warm again in " + tenths_of_seconds(*r.after.cache_warm_in_s)
                : "cache not warm again by the end of the run";
   }
-  if (without_residue(r.backlog_peak) <= 0.0) return "no backlog to drain";
+  if (r.after.backlog_node.empty()) return "no backlog to drain";
+  const std::string backlog = r.kind == model::FaultKind::traffic_spike
+                                  ? r.after.backlog_node + " backlog"
+                                  : std::string{"backlog"};
   return r.after.backlog_drained_in_s
-             ? "backlog drained in " + tenths_of_seconds(*r.after.backlog_drained_in_s)
-             : "backlog not drained by the end of the run";
+             ? backlog + " drained in " + tenths_of_seconds(*r.after.backlog_drained_in_s)
+             : backlog + " not drained by the end of the run";
 }
 
-// When the system was itself again, on the clock and after the fault cleared (at + for).
+// When the system was itself again (engine::FaultRecord's recovery rule, in its words), on the
+// clock and after the fault cleared (at + for), or after the flush, an instant that clears nothing.
 [[nodiscard]] std::string recovery_text(const engine::FaultRecord& r) {
   if (!r.recovered_at) return "not recovered by the end of the run";
   const SimTime since_cleared{r.recovered_at->count() - r.at.count() - r.duration.count()};
-  return "op p99 back within 1% at " + fault_clock(*r.recovered_at) + " (" +
-         tenths_of_seconds(seconds(since_cleared)) + " after the fault cleared)";
+  const std::string_view since = model::lasts(r.kind) ? "the fault cleared" : "the flush";
+  return "back within 1% (every op's p99, every node's rho) at " + fault_clock(*r.recovered_at) +
+         " (" + tenths_of_seconds(seconds(since_cleared)) + " after " + std::string{since} + ")";
 }
 
-[[nodiscard]] std::string fault_block(const engine::FaultRecord& r,
+[[nodiscard]] std::string fault_block(const FaultBlock& block,
                                       std::span<const model::SloSpec> slos) {
-  return fault_header(r) + during_line(r, slos) + fault_line("after:", after_text(r)) +
-         fault_line("recovery:", recovery_text(r));
+  return fault_header(block) + during_line(block, slos) +
+         fault_line("after:", after_text(block.record)) +
+         fault_line("recovery:", recovery_text(block.record));
 }
 
 // One block per fault, in `at` order; nothing without faults.
 [[nodiscard]] std::string fault_blocks(const Summary& summary) {
   std::string blocks;
-  for (const auto& r : summary.faults()) {
-    blocks += fault_block(r, summary.graph().scenario().slos);
+  for (const auto& block : summary.faults()) {
+    blocks += fault_block(block, summary.graph().scenario().slos);
   }
   return blocks;
+}
+
+// Whether `earlier` was still counting when `later` struck (FaultBlock::overlaps): the same target
+// (the same node, or the same datacenter), and `later`'s `at` inside `earlier`'s span from its
+// `at` to its recovery (to the end of the run when it never recovered).
+[[nodiscard]] bool overlaps(const engine::FaultRecord& later, const engine::FaultRecord& earlier) {
+  const bool dc_down = later.kind == model::FaultKind::dc_down;
+  if (dc_down != (earlier.kind == model::FaultKind::dc_down)) return false;
+  if (fault_target(later) != fault_target(earlier)) return false;
+  if (later.at.count() < earlier.at.count()) return false;
+  return !earlier.recovered_at || later.at.count() < earlier.recovered_at->count();
 }
 
 // ---- JSON ----
@@ -916,21 +985,62 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   return json_object(windowed);
 }
 
-// A fault's block as JSON (the text's numbers, unrounded, in seconds): `for_s` null for a flush,
-// each `after` entry null where it does not apply or did not happen, `recovered_at_s` null when the
-// run ended first; a dc_down names its datacenter (`node` null).
-[[nodiscard]] std::string json_fault(const engine::FaultRecord& r,
-                                     std::span<const model::SloSpec> slos) {
+// What a fault did to the SLOs, as JSON: `flipped`, the words of each SLO whose verdict differs
+// from the twin's (the run's verdict is the `slo` array's), and `over_max`, each SLO broken during
+// the fault with the seconds it was.
+[[nodiscard]] std::array<std::string, 2> json_fault_slos(const FaultBlock& block,
+                                                         std::span<const model::SloSpec> slos) {
   std::vector<std::string> flipped;
-  for (const auto& words : flipped_words(r, slos)) flipped.push_back(json_string(words));
+  std::vector<std::string> over_max;
+  for (const auto& effect : block.slos) {
+    const std::string words = json_string(slo_words(slos[effect.slo]));
+    if (effect.flipped_to) flipped.push_back(words);
+    if (effect.over_max_s <= 0.0) continue;
+    const std::array fields{json_field("slo", words),
+                            json_field("for_s", json_number(effect.over_max_s))};
+    over_max.push_back(json_object(fields));
+  }
+  return {json_field("flipped", "[" + join(flipped, ", ") + "]"),
+          json_field("over_max", "[" + join(over_max, ", ") + "]")};
+}
+
+// The during object: the text's numbers, unrounded, in the faulted part's unit (`lost_unit`); null
+// where the kind has none (`lost_on_cut_links` but for a dc_down; `room` for a flush, which builds
+// no backlog of its own; `extra_misses` and `origin` but for a flush).
+[[nodiscard]] std::string json_during(const FaultBlock& block,
+                                      std::span<const model::SloSpec> slos) {
+  const auto& r = block.record;
+  const bool dc_down = r.kind == model::FaultKind::dc_down;
+  const bool flush = r.kind == model::FaultKind::cache_flush;
+  const auto [flipped, over_max] = json_fault_slos(block, slos);
   const std::array during{
       json_field("offered_per_s", json_number(without_residue(r.offered_per_s))),
       json_field("served_per_s", json_number(without_residue(r.served_per_s))),
       json_field("lost", json_number(without_residue(r.lost))),
+      json_field("lost_unit", json_string(r.lost_unit)),
+      json_field("lost_on_cut_links",
+                 dc_down ? json_number(without_residue(r.lost_on_cut_links)) : "null"),
       json_field("backlog_peak", json_number(without_residue(r.backlog_peak))),
-      json_field("room", json_number(r.room)),
-      json_field("flipped", "[" + join(flipped, ", ") + "]")};
+      json_field("room", flush ? "null" : json_number(r.room)),
+      json_field("extra_misses", flush ? json_number(without_residue(r.extra_misses)) : "null"),
+      json_field("origin", flush ? json_string(r.origin) : "null"),
+      flipped,
+      over_max};
+  return json_object(during);
+}
+
+// A fault's block as JSON (the text's numbers, unrounded, in seconds): `for_s` null for a flush,
+// `overlaps_at_s` the earlier faults it overlaps, each `after` entry null where it does not apply
+// or did not happen, `recovered_at_s` null when the run ended first; a dc_down names its
+// datacenter (`node` null).
+[[nodiscard]] std::string json_fault(const FaultBlock& block,
+                                     std::span<const model::SloSpec> slos) {
+  const auto& r = block.record;
+  std::vector<std::string> overlaps;
+  for (const SimTime at : block.overlaps) overlaps.push_back(json_number(seconds(at)));
   const std::array after{
+      json_field("backlog_node",
+                 r.after.backlog_node.empty() ? "null" : json_string(r.after.backlog_node)),
       json_field("backlog_drained_in_s", json_optional_number(r.after.backlog_drained_in_s)),
       json_field("cache_warm_in_s", json_optional_number(r.after.cache_warm_in_s))};
   const bool dc_down = r.kind == model::FaultKind::dc_down;
@@ -940,7 +1050,8 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   if (dc_down) fields.push_back(json_field("datacenter", json_string(r.datacenter)));
   fields.push_back(
       json_field("for_s", model::lasts(r.kind) ? json_number(seconds(r.duration)) : "null"));
-  fields.push_back(json_field("during", json_object(during)));
+  fields.push_back(json_field("overlaps_at_s", "[" + join(overlaps, ", ") + "]"));
+  fields.push_back(json_field("during", json_during(block, slos)));
   fields.push_back(json_field("after", json_object(after)));
   fields.push_back(json_field("recovered_at_s", json_optional_number(r.recovered_at.transform(
                                                     [](SimTime t) { return seconds(t); }))));
@@ -1183,12 +1294,135 @@ Summary::OpTotals& Summary::totals_for(const engine::ResponseSample& sample, std
   return ops_.emplace_back(OpTotals{.client = sample.client, .op = sample.op});
 }
 
-void Summary::set_faults(std::span<const engine::FaultRecord> records) {
-  faults_.assign(records.begin(), records.end());
+// A fault's window "during" (engine::FaultRecord): [at, at + for), a flush's warm-up [at, at +
+// warm_up_s), or from `at` to the end of the run when its cache never warms.
+Summary::FaultWindow Summary::window_of(const engine::FaultRecord& record) {
+  if (model::lasts(record.kind)) {
+    return {.start = record.at, .end = SimTime{record.at.count() + record.duration.count()}};
+  }
+  if (!record.warm_up_s) return {.start = record.at, .end = std::nullopt};
+  return {.start = record.at,
+          .end = SimTime{record.at.count() + from_seconds(*record.warm_up_s).count()}};
+}
+
+void Summary::watch_faults(std::span<const engine::FaultRecord> records) {
+  watched_.clear();
+  for (const auto& record : records) watched_.push_back(window_of(record));
+}
+
+// `.count()` comparisons: SimTime's own operators are std::chrono's (the tick counts are in the
+// same unit, nanoseconds).
+bool Summary::in_watched_window(SimTime t) const {
+  return std::ranges::any_of(watched_, [&](const FaultWindow& window) {
+    return t.count() >= window.start.count() && (!window.end || t.count() < window.end->count());
+  });
+}
+
+// One step judged alone, by the very rules that judge a run (evaluate_slo on a Summary of that
+// step only): an SLO with `over` as if it had none, since one step is no window. The one
+// definition of "the SLO holds", applied to a step.
+void Summary::judge_step(const engine::StepRecord& record) {
+  Summary step{*graph_, SimTime{0}, false};
+  step.observe(record);
+  const auto nodes = step.nodes();
+  const auto ops = step.ops();
+  JudgedStep judged{.t = record.t, .dt = graph_->scenario().step};
+  for (const auto& slo : graph_->scenario().slos) {
+    model::SloSpec alone = slo;
+    alone.over.reset();
+    judged.verdicts.push_back(evaluate_slo(step, nodes, ops, alone).status);
+  }
+  judged_.push_back(std::move(judged));
+}
+
+namespace {
+
+// A flip belongs to the run (FaultSlo): it is named on every block that broke the SLO during its
+// window, or on every block when none did. `flipped[k]` is SLO k's run verdict when it differs from
+// the twin's.
+void attribute_flips(std::span<FaultBlock> blocks,
+                     std::span<const std::optional<SloStatus>> flipped) {
+  for (std::size_t k = 0; k < flipped.size(); ++k) {
+    if (!flipped[k]) continue;
+    const auto broke = [&](const FaultBlock& block) {
+      return std::ranges::any_of(block.slos, [&](const FaultSlo& e) { return e.slo == k; });
+    };
+    const bool any_broke = std::ranges::any_of(blocks, broke);
+    for (auto& block : blocks) {
+      if (any_broke && !broke(block)) continue;
+      auto found = std::ranges::find(block.slos, k, &FaultSlo::slo);
+      if (found == block.slos.end()) {
+        // The list's order: before the first entry of a later SLO.
+        found = block.slos.insert(
+            std::ranges::find_if(block.slos, [&](const FaultSlo& e) { return e.slo > k; }),
+            FaultSlo{.slo = k});
+      }
+      found->flipped_to = flipped[k];
+    }
+  }
+}
+
+}  // namespace
+
+void Summary::set_faults(std::span<const engine::FaultRecord> records, const Summary& twin) {
+  const auto& slos = graph_->scenario().slos;
+  const auto verdicts = evaluate_slos(*this, slos);
+  const auto twin_verdicts = evaluate_slos(twin, slos);
+  std::vector<std::optional<SloStatus>> flipped;
+  for (std::size_t k = 0; k < verdicts.size(); ++k) {
+    const bool differs = verdicts[k].status != twin_verdicts[k].status;
+    flipped.push_back(differs ? std::optional{verdicts[k].status} : std::nullopt);
+  }
+  std::vector<FaultBlock> blocks;
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    blocks.push_back(block_of(records[i], twin));
+    for (std::size_t j = 0; j < i; ++j) {
+      if (overlaps(records[i], records[j])) blocks.back().overlaps.push_back(records[j].at);
+    }
+  }
+  attribute_flips(blocks, flipped);
+  faults_ = std::move(blocks);
+}
+
+// The record and every SLO it broke during its window where the twin did not (FaultSlo).
+FaultBlock Summary::block_of(const engine::FaultRecord& record, const Summary& twin) const {
+  FaultBlock block{.record = record};
+  const FaultWindow window = window_of(record);
+  for (std::size_t k = 0; k < graph_->scenario().slos.size(); ++k) {
+    const SimTime over = over_max(k, window, twin);
+    if (over.count() > 0) block.slos.push_back(FaultSlo{.slo = k, .over_max_s = seconds(over)});
+  }
+  return block;
+}
+
+// Σ dt over the judged steps in `window` at which SLO `slo` fails here and not in the twin.
+SimTime Summary::over_max(std::size_t slo, const FaultWindow& window, const Summary& twin) const {
+  SimTime total{0};
+  for (const auto& step : judged_) {
+    const bool inside = step.t.count() >= window.start.count() &&
+                        (!window.end || step.t.count() < window.end->count());
+    if (!inside || step.verdicts[slo] != SloStatus::fail || twin.twin_breaks(slo, step.t)) continue;
+    total += step.dt;
+  }
+  return total;
+}
+
+// Whether this Summary (a twin's) judged SLO `slo` broken at the step that starts at `t`; a step
+// it did not judge breaks nothing.
+bool Summary::twin_breaks(std::size_t slo, SimTime t) const {
+  // C++20 std::ranges::lower_bound with a projection: the binary search over the judged steps by
+  // the tick count each projects to (they are in time order), without a comparator on both sides.
+  const auto found = std::ranges::lower_bound(judged_, t.count(), {},
+                                              [](const JudgedStep& s) { return s.t.count(); });
+  if (found == judged_.end() || found->t.count() != t.count()) return false;
+  return found->verdicts[slo] == SloStatus::fail;
 }
 
 void Summary::observe(const engine::StepRecord& record) {
   const double dt_s = step_length_s(record.t);
+  // A step of a fault's window is judged alone (watch_faults), in the warmup too: it is the step's
+  // own verdict, not the run's.
+  if (in_watched_window(record.t)) judge_step(record);
   if (record.t.count() < warmup_.count()) return;  // warmup: the queues are still filling
   ++observed_steps_;
   observed_s_ += dt_s;
@@ -1482,8 +1716,8 @@ std::string render_json(const Summary& summary, std::span<const SloResult> slos)
   // The faults array, last and only with faults: a report without them is what it was before.
   std::vector<std::string> with_faults{lines.begin(), lines.end()};
   std::vector<std::string> faults;
-  for (const auto& r : summary.faults()) {
-    faults.push_back(json_fault(r, summary.graph().scenario().slos));
+  for (const auto& block : summary.faults()) {
+    faults.push_back(json_fault(block, summary.graph().scenario().slos));
   }
   with_faults.push_back(json_array("faults", faults));
   return "{\n" + join(with_faults, ",\n") + "\n}";

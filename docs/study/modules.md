@@ -20,7 +20,7 @@ interface units and partitions in `FILE_SET CXX_MODULES` (`CMakeLists.txt`). The
 | `simsys.defaults` | `src/defaults/defaults.cppm` | interface only | core, fluid, model |
 | `simsys.graph` | `src/engine/graph.cppm`, `graph.cpp` | interface + implementation unit (declarations in the interface, definitions in `graph.cpp`) | caching, core, defaults, fluid, model, queueing |
 | `simsys.behaviours` | `src/engine/behaviours.cppm` | interface only | core, defaults, flow, fluid, graph, model, queueing, workload |
-| `simsys.engine` | `src/engine/engine.cppm`, `faults.cppm` | interface + interface partition `:faults` (the fault schedule), which the interface re-exports | core, behaviours, defaults, flow, fluid, graph, model, queueing; the partition imports caching, core, graph, model |
+| `simsys.engine` | `src/engine/engine.cppm`, `records.cppm`, `faults.cppm`, `fault_log.cppm` | interface + three interface partitions, which the interface re-exports: `:records` (the step records), `:faults` (the fault schedule and the fault records), `:fault_log` (what each fault cost, filled step by step) | core, behaviours, defaults, flow, fluid, graph, model, queueing, workload; `:records` imports core, flow, fluid; `:faults` caching, core, graph, model; `:fault_log` the partitions `:records` and `:faults`, and core, defaults, graph, model, queueing |
 | `simsys.report` | `src/report/report.cppm`, `shared.cppm`, `report.cpp`, `explain.cpp` | interface + implementation partition `:shared` + two implementation units (the run's renderers; `simsys explain`) | core, engine, fluid, graph, model; the partition imports core, fluid; the implementation units add defaults, flow, queueing, workload |
 | `simsys.session` | `src/session/session.cppm`, `session.cpp` | interface + implementation unit | config, engine, graph, model, report |
 | `simsys.sweep` | `src/sweep/sweep.cppm`, `sweep.cpp` | interface + implementation unit | none in the interface; the implementation unit imports config, core, graph, model, report, session |
@@ -196,18 +196,48 @@ The three large modules show three layouts, and `simsys.engine` a fourth.
   `simsys.core` and `simsys.fluid` but not the module's own interface (next paragraph), so it
   cannot see `format_duration(double)`; that is why the body lives in the partition and the
   exported function forwards to it, not the other way round.
-- **`simsys.engine`: interface + an interface partition.** `faults.cppm` (`export module
-  simsys.engine:faults;`) holds `engine::Condition` and `engine::FaultSchedule`, which the tests
-  read too, so they are exported; `engine.cppm` writes `export import :faults;`, and an
-  importer of `simsys.engine` sees them as if `engine.cppm` declared them. The partition imports
-  `simsys.caching`, `simsys.core`, `simsys.graph` and `simsys.model` (the schedule is resolved
-  against the graph, and a flushed cache's warm-up reads its key popularity), never the module's
-  own interface: the primary interface re-exports the partition (`export import :faults;`), so
-  the partition importing the primary would be an import cycle, which the standard forbids
-  ([module.import]: "a translation unit shall not have an interface dependency on itself", and
-  the partition would depend on the primary, which depends on the partition). The one
-  number it needs from the engine, the reads a flushed cache is handed, the engine passes to its
-  constructor (`Simulation::fault_schedule_of`).
+- **`simsys.engine`: interface + three interface partitions.** `faults.cppm` (`export module
+  simsys.engine:faults;`) holds `engine::Condition`, `engine::FaultSchedule` and the per-fault
+  `engine::FaultRecord`, which the tests read too, so they are exported; `engine.cppm` writes
+  `export import :faults;`, and an importer of `simsys.engine` sees them as if `engine.cppm`
+  declared them. The partition imports `simsys.caching`, `simsys.core`, `simsys.graph` and
+  `simsys.model` (the schedule is resolved against the graph, and a flushed cache's warm-up reads
+  its key popularity), never the module's own interface: the primary interface re-exports the
+  partition (`export import :faults;`), so the partition importing the primary would be an
+  import cycle, which the standard forbids ([module.import]: "a translation unit shall not have
+  an interface dependency on itself", and the partition would depend on the primary, which
+  depends on the partition). The one number it needs from the engine, the reads a flushed cache
+  is handed, the engine passes to its constructor (`Simulation::fault_schedule_of`).
+
+  The same rule lays out the two other partitions. `FaultLog`, which fills one `FaultRecord` per
+  fault from every step, reads `StepRecord`; so does `Simulation`, which holds a `FaultLog`. Were
+  `StepRecord` declared in `engine.cppm`, `FaultLog` would have to live there too (it did, at
+  first: 420 lines of a 2968-line interface), since its partition could not import the primary.
+  So the records move down into a partition of their own, `records.cppm` (`export module
+  simsys.engine:records;`: `NodeSample`, `ResponseSample`, `LinkSample`, `StepRecord`), and
+  `fault_log.cppm` (`export module simsys.engine:fault_log;`) imports the partitions it reads by
+  their relative names, `import :records;` and `import :faults;`, which a partition may do: the
+  import graph `records ← fault_log → faults`, all three ← `engine.cppm`, has no cycle. Every
+  interface partition must be re-exported by the primary interface ([module.unit]/3), so
+  `engine.cppm` writes `export import :records;` and `export import :fault_log;` too. `FaultLog`
+  itself is not exported: an importer of `simsys.engine` can REACH its definition (it needs it to
+  know the size of the exported `Simulation` that holds one) but cannot NAME it, which is the
+  difference between reachable and visible ([module.reach]). GCC 14.2 builds the three partitions
+  in Debug and Release (verified 2026-10-30): the source-location limit of the sixth defect is not
+  reached, the library's `-flarge-source-files` covering them as it covers `engine.cppm`. Three
+  traps met on the way, each a relative of a defect of `CLAUDE.md` §3:
+  - `#include <memory>` (for a `std::unique_ptr` to the fault-free twin) in `engine.cppm`'s global
+    module fragment made every importer fail with "ignoring attributes applied to
+    'std::auto_ptr' after definition" (the first defect's family); the twin is held in a
+    `std::vector` used as an optional instead, as `report::Summary` holds a window's Summary.
+  - In Release, a test importing `simsys.engine` crashed GCC ("internal compiler error: in
+    finish_function", in `std::vector`'s move constructor, required from `FaultLog`) while
+    instantiating `FaultLog`'s implicit move constructor itself. `FaultLog` now declares its five
+    special members and defaults them out of the class in the partition: defined there, not
+    inline, so the partition's object file has them and an importer only calls them.
+  - The fourth defect once more: the move constructor of `std::vector<std::size_t>`'s base was
+    left undefined in the Release link of `scenario_tests`; `src/model/model.cpp` got one more
+    `emit_special_members` line.
 - **`simsys.config`: interface + ten implementation units + a header in the purview.** The
   loader is cut by concern: `config.cpp` (`load`, the pipeline), `header.cpp`, `nodes.cpp`,
   `steps.cpp`, `workload.cpp`, `links.cpp`, `slos.cpp`, `faults.cpp`, `overrides.cpp`, and

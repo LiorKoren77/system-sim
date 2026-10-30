@@ -42,7 +42,9 @@ target_sources(simsys
     src/defaults/defaults.cppm
     src/engine/graph.cppm
     src/engine/behaviours.cppm
+    src/engine/records.cppm              # interface partition simsys.engine:records (engine.cppm re-exports it)
     src/engine/faults.cppm               # interface partition simsys.engine:faults (engine.cppm re-exports it)
+    src/engine/fault_log.cppm            # interface partition simsys.engine:fault_log (engine.cppm re-exports it)
     src/engine/engine.cppm
     src/report/report.cppm
     src/report/shared.cppm               # implementation partition simsys.report:shared: a BMI too

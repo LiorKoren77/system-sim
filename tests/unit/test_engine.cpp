@@ -574,10 +574,11 @@ TEST_CASE("a node_down of r of a kv_cluster's machines counts r machines down an
 // ---- FaultRecord: what the engine keeps per fault, for the report's block
 // ------------------------
 //
-// What the tests below assume of the engine's API (Task 8 of the phase 3 plan):
+// What the tests below assume of the engine's API (Task 8 of the phase 3 plan and its review):
 //   struct FaultAfter {                       // what followed the fault; each entry empty when it
-//     std::optional<double> backlog_drained_in_s;  // does not apply or never happened in the run:
-//     std::optional<double> cache_warm_in_s;       // seconds from the end of the fault
+//     std::string backlog_node;               // does not apply or never happened in the run:
+//     std::optional<double> backlog_drained_in_s;  // whose backlog, and seconds from the end of
+//     std::optional<double> cache_warm_in_s;       // the fault until it is the twin's again
 //   };
 //   struct FaultRecord {                      // a value type, members in this order (designated
 //     model::FaultKind kind;                  // initializers need it)
@@ -585,18 +586,21 @@ TEST_CASE("a node_down of r of a kv_cluster's machines counts r machines down an
 //     SimTime at, duration;                   // duration 0 for a cache_flush
 //     double offered_per_s, served_per_s;     // the faulted node's demand and drain, means over
 //                                             // [at, at + for) (over the steps seen so far)
-//     double lost;                            // requests its full room dropped, summed over it
+//     double lost; std::string lost_unit;     // its drops minus the twin's, from `at` to the
+//     double lost_on_cut_links;               // recovery, in its unit; a dc_down's cut links'
 //     double backlog_peak, room;              // the peak backlog, the room (queue_limit) it fills
-//     std::vector<std::size_t> flipped;       // indexes into Scenario::slos of the SLOs that held
-//                                             // at the step before `at` and are broken at some
-//                                             // step inside the fault
+//     double extra_misses; std::string origin, origin_unit;  // a cache_flush's: vs the twin
+//     std::optional<double> warm_up_s;        // a cache_flush's "during", known from the start
 //     FaultAfter after;
 //     std::optional<SimTime> recovered_at;    // start of the first step at or after the end of
-//   };                                        // the fault with p99 and rho within 1 % of before
-//   std::span<const FaultRecord> Simulation::fault_records() const   // (or a vector), in `at`
-//                                                                    // order, one per fault
-// A fault that has not started when the records are read has none yet or a record of zeros; the
-// tests read only faults that have.
+//     std::string datacenter;                 // the fault with p99 and rho within 1 % of the
+//   };                                        // twin's same step
+//   std::span<const FaultRecord> Simulation::fault_records() const   // in `at` order, one per
+//                                                                    // fault
+//   const StepRecord* Simulation::twin_record() const  // the fault-free twin's latest step; null
+//                                                      // without faults
+// A fault that has not started when the records are read has a record of zeros; the tests read
+// only faults that have. Which SLOs a fault flipped is the report's (report::FaultBlock).
 namespace {
 // The M/M/1 probe of tests/theory/test_faults.cpp (client c 400/s -> service s 1k/s, 1 ms, room
 // 100, zero-latency link; 30 s at 100 ms), with the SLOs and faults the caller gives.
@@ -622,10 +626,10 @@ std::vector<simsys::engine::FaultRecord> records_after(const Scenario& s, int st
 }  // namespace
 
 // The probe's ten second node_down at 10 s, whole run (every number derived in test_faults.cpp):
-// 400/s offered and 0/s served over the 10 s, 3900 lost (the room of 100 kept 100 of the 4000), a
-// backlog peaking at the room, the backlog drained 0.2 s after the fault, the system recovered at
-// 20.2 s, and the p99 SLO of 100 ms (8.2 ms before the fault) flipped; the 1 ms SLO failed before
-// the fault and the 1 h one holds throughout, so neither flipped.
+// 400/s offered and 0/s served over the 10 s, 3900 requests lost (the room of 100 kept 100 of the
+// 4000; the twin lost none), a backlog peaking at the room, the backlog drained 0.2 s after the
+// fault, the system recovered at 20.2 s. (The SLOs are the report's business: the engine keeps no
+// verdict.)
 TEST_CASE("the engine keeps one record per fault: lost 3900, backlog peak 100, recovered at 20.2",
           "[engine]") {
   const auto records =
@@ -644,9 +648,11 @@ TEST_CASE("the engine keeps one record per fault: lost 3900, backlog peak 100, r
   REQUIRE_THAT(r.offered_per_s, WithinRel(400.0, 1e-9));
   REQUIRE_THAT(r.served_per_s, WithinAbs(0.0, 1e-9));
   REQUIRE_THAT(r.lost, WithinRel(3900.0, 1e-9));
+  REQUIRE(r.lost_unit == "requests");
+  REQUIRE(r.lost_on_cut_links == 0.0);
   REQUIRE_THAT(r.backlog_peak, WithinRel(100.0, 1e-9));
   REQUIRE_THAT(r.room, WithinRel(100.0, 1e-9));
-  REQUIRE(r.flipped == std::vector<std::size_t>{0});
+  REQUIRE(r.after.backlog_node == "s");
   REQUIRE(r.after.backlog_drained_in_s.has_value());
   REQUIRE_THAT(*r.after.backlog_drained_in_s, WithinAbs(0.2, 1e-9));
   REQUIRE_FALSE(r.after.cache_warm_in_s.has_value());
@@ -691,8 +697,49 @@ TEST_CASE("fault records come in at order, whatever the order the faults were de
   REQUIRE(records[1].lost == 0.0);
   REQUIRE(records[1].backlog_peak == 0.0);
   REQUIRE_THAT(records[1].served_per_s, WithinRel(400.0, 1e-9));
-  REQUIRE(records[1].flipped.empty());
-  // Back at the instant it ends: the first step after it is the step before it, again.
+  REQUIRE(records[1].after.backlog_node.empty());  // no backlog: nothing to drain
+  // Back at the instant it ends: the first step after it is the twin's same step.
   REQUIRE(records[1].recovered_at.has_value());
   REQUIRE(*records[1].recovered_at == SimTime{25s});
+}
+
+// The baseline of every record (FaultRecord's header: the counterfactual) is a twin: the same
+// scenario with its faults stripped, stepped with the run. Its record of each step is the record
+// of a run of the scenario without the `faults:` key, bit for bit (the same seeds, so the same
+// noise), and a scenario without faults has none (no twin: the run costs what it did).
+TEST_CASE("a simulation with faults steps a fault-free twin whose records are the run without them",
+          "[engine]") {
+  const auto with_faults = simsys::graph::Graph::build(
+      fault_probe("faults:\n  - {at: 1s, kind: node_down, node: s, for: 1s}\n"));
+  const auto without = simsys::graph::Graph::build(fault_probe(""));
+  REQUIRE(with_faults.has_value());
+  REQUIRE(without.has_value());
+  auto faulted = simsys::test_support::simulation_of(*with_faults);
+  auto plain = simsys::test_support::simulation_of(*without);
+  REQUIRE(plain.twin_record() == nullptr);
+  for (int i = 0; i < 30; ++i) {
+    CAPTURE(i);
+    const SimTime now = SimTime{100ms} * i;
+    const auto run = faulted.step(now, SimTime{100ms});
+    const auto expected = plain.step(now, SimTime{100ms});
+    REQUIRE(plain.twin_record() == nullptr);
+    const auto* twin = faulted.twin_record();
+    REQUIRE(twin != nullptr);
+    REQUIRE(twin->t == expected.t);
+    REQUIRE(twin->nodes.at(1).drain_per_s == expected.nodes.at(1).drain_per_s);
+    REQUIRE(twin->nodes.at(1).backlog == expected.nodes.at(1).backlog);
+    REQUIRE(twin->responses.at(0).response.mean_s == expected.responses.at(0).response.mean_s);
+    if (i >= 10 && i < 20) REQUIRE(run.nodes.at(1).drain_per_s == 0.0);  // the run is down
+  }
+}
+
+// Finding 2 of the review: a fault at the run's first step had no step before it and was never
+// judged recovered. Against the twin it is: down from 0 to 5 s, the room's 100 drain in two steps,
+// back at 5.2 s.
+TEST_CASE("a fault at the run's first step is judged recovered against the twin", "[engine]") {
+  const auto records =
+      records_after(fault_probe("faults:\n  - {at: 0s, kind: node_down, node: s, for: 5s}\n"), 100);
+  REQUIRE(records.size() == 1);
+  REQUIRE(records[0].recovered_at.has_value());
+  REQUIRE(*records[0].recovered_at == SimTime{5200ms});
 }

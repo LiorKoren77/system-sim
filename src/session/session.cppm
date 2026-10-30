@@ -56,8 +56,10 @@ struct RunObservers {
 };
 
 // `sim` run over the scenario's duration at its step, every record observed by a Summary that
-// starts at the scenario's warmup and by the given observers, and the faults' records attached to
-// it at the end (report::Summary::set_faults). `sim` must be a simulation of `g`.
+// starts at the scenario's warmup and by the given observers, and the faults' blocks set on it at
+// the end (report::Summary::set_faults), judged against a second Summary of the fault-free twin's
+// records (engine::Simulation::twin_record; none without faults). `sim` must be a simulation of
+// `g`. `simsys sweep` reaches it too (each point); its rows show no fault block.
 [[nodiscard]] report::Summary run_summary(const graph::Graph& g, engine::Simulation& sim,
                                           RunObservers observers = {});
 

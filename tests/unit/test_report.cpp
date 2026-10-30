@@ -2932,11 +2932,13 @@ TEST_CASE("a windowed SLO that was skipped names no window in the table", "[repo
 // ---- The fault block, from records built by hand
 // --------------------------------------------------
 //
-// The renderers read the engine's FaultRecords through the Summary (Summary::set_faults(records),
-// replacing any it held; tests/unit/test_engine.cpp has the record's assumed layout and
+// The renderers read the engine's FaultRecords through the Summary (Summary::set_faults(records,
+// twin): the records, and the Summary of the fault-free twin run that the SLO verdicts are
+// compared with; tests/unit/test_engine.cpp has the record's assumed layout and
 // tests/theory/test_faults.cpp the whole-run blocks derived from the engine). Here the records are
 // literals, so the wording and the JSON are pinned apart from the engine: the Summary of an
-// ordinary mm1 run with the records of a ten second node_down set on it.
+// ordinary mm1 run with the records of a ten second node_down set on it, and the same run as its
+// twin (nothing flipped) unless a test says otherwise.
 namespace {
 using simsys::SimTime;
 using simsys::engine::FaultRecord;
@@ -2953,10 +2955,10 @@ FaultRecord node_down_record() {
           .offered_per_s = 400,
           .served_per_s = 0,
           .lost = 3900,
+          .lost_unit = "requests",
           .backlog_peak = 100,
           .room = 100,
-          .flipped = {},
-          .after = {.backlog_drained_in_s = 0.2, .cache_warm_in_s = std::nullopt},
+          .after = {.backlog_node = "s", .backlog_drained_in_s = 0.2, .cache_warm_in_s = {}},
           .recovered_at = SimTime{20200ms}};
 }
 
@@ -2965,18 +2967,28 @@ struct Rendered {
   std::string json;
 };
 
-// An mm1 run (no faults of its own: the records are the test's) with `records` set on its Summary.
+// An mm1 run at `rate` (no faults of its own: the records are the test's) with `records` set on its
+// Summary, and the mm1 run at `twin_rate` as its twin: the same rate unless a test wants the
+// verdicts to differ.
 Rendered rendered_with(std::vector<FaultRecord> records,
-                       std::vector<simsys::model::SloSpec> slos = {}) {
-  auto s = mm1(400);
-  s.slos = std::move(slos);
+                       std::vector<simsys::model::SloSpec> slos = {}, double rate = 400,
+                       double twin_rate = 400) {
+  auto s = mm1(rate, 100);
+  s.slos = slos;
+  auto twin_s = mm1(twin_rate, 100);
+  twin_s.slos = std::move(slos);
   const auto g = *simsys::graph::Graph::build(s);
+  const auto twin_g = *simsys::graph::Graph::build(twin_s);
   auto summary = summarize(s, g);
-  summary.set_faults(records);
+  const auto twin = summarize(twin_s, twin_g);
+  summary.set_faults(records, twin);
   const auto verdicts = simsys::report::evaluate_slos(summary, s.slos);
   return {simsys::report::render_table(summary, verdicts, /*color=*/false),
           simsys::report::render_json(summary, verdicts)};
 }
+
+constexpr std::string_view back_within =
+    "  recovery: back within 1% (every op's p99, every node's rho) at ";
 }  // namespace
 
 TEST_CASE("a node_down record renders as the four line block, the numbers as the SLO table's units",
@@ -2987,8 +2999,8 @@ TEST_CASE("a node_down record renders as the four line block, the numbers as the
       "fault 00:00:10 node_down s for 10s\n"
       "  during:   offered 400/s, served 0/s, lost 3.9k requests, backlog 100 (room 100 dropped "
       "the rest)\n"
-      "  after:    backlog drained in 0.2s\n"
-      "  recovery: op p99 back within 1% at 00:00:20.2 (0.2s after the fault cleared)\n"));
+      "  after:    backlog drained in 0.2s\n" +
+      std::string{back_within} + "00:00:20.2 (0.2s after the fault cleared)\n"));
 }
 
 // A record that says it never recovered (recovered_at empty) and whose backlog was never drained
@@ -3005,37 +3017,51 @@ TEST_CASE("a record without recovered_at prints not recovered by the end of the 
   REQUIRE(out.json.contains("\"backlog_drained_in_s\": null"));
 }
 
-// With no backlog at all there is nothing to drain: `after` says so rather than `drained in 0s`.
+// With no backlog left above the twin's there is nothing to drain (backlog_node empty): `after`
+// says so rather than `drained in 0s`.
 TEST_CASE("a record with no backlog prints: no backlog to drain, and lost 0 requests", "[report]") {
   auto record = node_down_record();
   record.kind = FaultKind::latency_spike;
   record.offered_per_s = record.served_per_s = 400;
   record.lost = record.backlog_peak = 0;
-  record.after.backlog_drained_in_s.reset();
+  record.after = {};
   record.recovered_at = SimTime{20s};
   const auto out = rendered_with({record});
   CAPTURE(out.table);
-  REQUIRE(out.table.ends_with(
-      "fault 00:00:10 latency_spike s for 10s\n"
-      "  during:   offered 400/s, served 400/s, lost 0 requests, backlog 0\n"
-      "  after:    no backlog to drain\n"
-      "  recovery: op p99 back within 1% at 00:00:20 (0s after the fault cleared)\n"));
+  REQUIRE(
+      out.table.ends_with("fault 00:00:10 latency_spike s for 10s\n"
+                          "  during:   offered 400/s, served 400/s, lost 0 requests, backlog 0\n"
+                          "  after:    no backlog to drain\n" +
+                          std::string{back_within} + "00:00:20 (0s after the fault cleared)\n"));
 }
 
-// The flipped SLOs close the during line, in the order of the scenario's SLO list, each as the
-// words of the SLO table's columns that it has (metric, node, op: an SLO with no node or op prints
-// neither), then `flipped to FAIL`: the same word as the table's verdict.
+// Finding 6 of the review: `(room N dropped the rest)` only when the backlog reached the room and
+// something was lost at the node. A backlog of 80 under a room of 100 prints no parenthesis even
+// with requests lost (here: the drops of the drain, after the fault).
+TEST_CASE("the room parenthesis needs a backlog that reached the room", "[report]") {
+  auto record = node_down_record();
+  record.backlog_peak = 80;
+  const auto out = rendered_with({record});
+  CAPTURE(out.table);
+  REQUIRE(out.table.contains("lost 3.9k requests, backlog 80\n"));
+}
+
+// The SLOs a fault flipped close the during line, in the order of the scenario's SLO list, each as
+// the words of the SLO table's columns that it has (metric, node, op: an SLO with no node or op
+// prints neither), then `flipped to FAIL`: the SLO table's verdict, which differs from the twin's.
+// The run is mm1 at 1500/s into 1k/s (a full room of 100, a third of the requests dropped, a p99 of
+// about 100 ms of queue), its twin mm1 at 400/s (no drops, p99 a few ms): both SLOs pass in the
+// twin and fail in the run.
 TEST_CASE("the during line names each flipped SLO by metric, node and op, in the list's order",
           "[report]") {
-  auto record = node_down_record();
-  record.flipped = {0, 1};
   const auto out = rendered_with(
-      {record},
+      {node_down_record()},
       {simsys::model::SloSpec{.metric = simsys::model::SloMetric::p99_latency,
                               .node = "c",
                               .op = "op",
-                              .max = SimTime{100ms}},
-       simsys::model::SloSpec{.metric = simsys::model::SloMetric::drop_rate, .max = 0.01}});
+                              .max = SimTime{50ms}},
+       simsys::model::SloSpec{.metric = simsys::model::SloMetric::drop_rate, .max = 0.01}},
+      /*rate=*/1500, /*twin_rate=*/400);
   CAPTURE(out.table, out.json);
   REQUIRE(
       out.table.contains("backlog 100 (room 100 dropped the rest), p99_latency c op flipped to "
@@ -3043,41 +3069,125 @@ TEST_CASE("the during line names each flipped SLO by metric, node and op, in the
   REQUIRE(out.json.contains("\"flipped\": [\"p99_latency c op\", \"drop_rate\"]"));
 }
 
-// A cache_flush record: no `for` (an instant) in the header or the JSON, the warm-up in `after`.
-// The clock prints a whole minute as HH:MM, as an SLO window's start does.
-TEST_CASE("a cache_flush record prints no for, its warm-up time and the clock as HH:MM",
-          "[report]") {
+// Finding 1 of the review: a byte-sized node's numbers are megabytes, and the block says so. Its
+// rates are `MB/s`, its loss and backlog `MB`.
+TEST_CASE("a record in MB prints its rates, loss, backlog and room in MB", "[report]") {
+  auto record = node_down_record();
+  record.node = "cdn";
+  record.offered_per_s = 5000;
+  record.lost = 24'000;
+  record.lost_unit = "MB";
+  record.backlog_peak = record.room = 1000;
+  const auto out = rendered_with({record});
+  CAPTURE(out.table, out.json);
+  REQUIRE(
+      out.table.contains("  during:   offered 5k MB/s, served 0 MB/s, lost 24k MB, backlog 1k "
+                         "MB (room 1k MB dropped the rest)\n"));
+  REQUIRE(out.json.contains("\"lost\": 24000, \"lost_unit\": \"MB\", \"lost_on_cut_links\": null"));
+}
+
+// A dc_down names its datacenter and keeps its cut links' requests apart from its nodes' loss.
+TEST_CASE("a dc_down record prints its nodes' loss and its cut links' requests apart", "[report]") {
+  auto record = node_down_record();
+  record.kind = FaultKind::dc_down;
+  record.node = "";
+  record.datacenter = "eu";
+  record.lost_on_cut_links = 500;
+  record.after.backlog_node = "eu";
+  const auto out = rendered_with({record});
+  CAPTURE(out.table, out.json);
+  REQUIRE(
+      out.table.contains("fault 00:00:10 dc_down eu for 10s\n"
+                         "  during:   offered 400/s, served 0/s, lost 3.9k requests at its "
+                         "nodes and 500 requests on cut links, backlog 100 (room 100 dropped "
+                         "the rest)\n"));
+  REQUIRE(out.json.contains("\"node\": null, \"datacenter\": \"eu\""));
+  REQUIRE(out.json.contains("\"lost_on_cut_links\": 500"));
+}
+
+// A cache_flush record: no `for` (an instant) in the header or the JSON, the warm-up in `after`,
+// its extra misses to the origin in `during` and no backlog there (finding 7), `room` null in the
+// JSON, and the recovery timed from the flush (finding 9). The clock prints a whole minute as
+// HH:MM, as an SLO window's start does.
+TEST_CASE(
+    "a cache_flush record prints no for, its extra misses, its warm-up and the clock as HH:MM",
+    "[report]") {
   auto record = node_down_record();
   record.kind = FaultKind::cache_flush;
   record.node = "edge";
   record.at = SimTime{10min};
   record.duration = SimTime{0};
-  record.after = {.backlog_drained_in_s = std::nullopt, .cache_warm_in_s = 12.106};
+  record.offered_per_s = record.served_per_s = 1000;
+  record.lost = 0;
+  record.backlog_peak = 0;
+  record.extra_misses = 1400;
+  record.origin = "origin";
+  record.after = {.backlog_node = {}, .backlog_drained_in_s = {}, .cache_warm_in_s = 12.106};
   record.recovered_at = SimTime{10min + 11800ms};
   const auto out = rendered_with({record});
   CAPTURE(out.table, out.json);
-  REQUIRE(out.table.contains("fault 00:10 cache_flush edge\n"));
-  REQUIRE(out.table.contains("  after:    cache warm again in 12.1s\n"));
-  REQUIRE(out.table.ends_with(
-      "  recovery: op p99 back within 1% at 00:10:11.8 (11.8s after the fault cleared)\n"));
+  REQUIRE(
+      out.table.contains("fault 00:10 cache_flush edge\n"
+                         "  during:   offered 1k/s, served 1k/s, lost 0 requests, extra misses "
+                         "1.4k to origin\n"
+                         "  after:    cache warm again in 12.1s\n"));
+  REQUIRE(out.table.ends_with(std::string{back_within} + "00:10:11.8 (11.8s after the flush)\n"));
   REQUIRE(out.json.contains("\"at_s\": 600"));
   REQUIRE(out.json.contains("\"for_s\": null"));
+  REQUIRE(out.json.contains("\"room\": null"));
+  REQUIRE(out.json.contains("\"extra_misses\": 1400, \"origin\": \"origin\""));
   REQUIRE(out.json.contains("\"cache_warm_in_s\": 12.106"));
   REQUIRE(out.json.contains("\"backlog_drained_in_s\": null"));
 }
 
+// Finding 10 of the review: a traffic_spike's backlog is downstream, and `after` names the node
+// whose backlog drained.
+TEST_CASE("a traffic_spike record names the downstream node whose backlog drained", "[report]") {
+  auto record = node_down_record();
+  record.kind = FaultKind::traffic_spike;
+  record.node = "c";
+  record.backlog_peak = record.room = 0;
+  record.lost = 900;
+  record.after.backlog_node = "s";
+  const auto out = rendered_with({record});
+  CAPTURE(out.table);
+  REQUIRE(out.table.contains("  after:    s backlog drained in 0.2s\n"));
+}
+
+// Finding 3 of the review: a fault that starts while an earlier fault on the same node is still
+// counting (from its `at` to its recovery) says so after its header's `for`, naming the earlier
+// one's `at`, and the JSON lists it. A fault on another node overlaps nothing.
+TEST_CASE("a fault that starts inside an earlier one on the same node says it overlaps it",
+          "[report]") {
+  auto second = node_down_record();
+  second.at = SimTime{15s};
+  auto elsewhere = node_down_record();
+  elsewhere.node = "t";
+  elsewhere.at = SimTime{16s};
+  const auto out = rendered_with({node_down_record(), second, elsewhere});
+  CAPTURE(out.table, out.json);
+  REQUIRE(out.table.contains("fault 00:00:15 node_down s for 10s (overlaps fault 00:00:10)\n"));
+  REQUIRE(out.table.contains("fault 00:00:16 node_down t for 10s\n"));
+  REQUIRE(out.json.contains("\"overlaps_at_s\": [10]"));
+}
+
 // The JSON of one record, key by key, in seconds; `recovered_at_s` is the same number as the text's
 // `00:00:20.2`, as a double.
-TEST_CASE("the JSON of a record is at_s, kind, node, for_s, during, after, recovered_at_s",
-          "[report]") {
+TEST_CASE(
+    "the JSON of a record is at_s, kind, node, for_s, overlaps, during, after, recovered_at_s",
+    "[report]") {
   const auto out = rendered_with({node_down_record()});
   CAPTURE(out.json);
   REQUIRE(out.json.ends_with(
       "  \"faults\": [\n"
       "    {\"at_s\": 10, \"kind\": \"node_down\", \"node\": \"s\", \"for_s\": 10, "
+      "\"overlaps_at_s\": [], "
       "\"during\": {\"offered_per_s\": 400, \"served_per_s\": 0, \"lost\": 3900, "
-      "\"backlog_peak\": 100, \"room\": 100, \"flipped\": []}, "
-      "\"after\": {\"backlog_drained_in_s\": 0.2, \"cache_warm_in_s\": null}, "
+      "\"lost_unit\": \"requests\", \"lost_on_cut_links\": null, "
+      "\"backlog_peak\": 100, \"room\": 100, \"extra_misses\": null, \"origin\": null, "
+      "\"flipped\": [], \"over_max\": []}, "
+      "\"after\": {\"backlog_node\": \"s\", \"backlog_drained_in_s\": 0.2, "
+      "\"cache_warm_in_s\": null}, "
       "\"recovered_at_s\": 20.2}\n"
       "  ]\n}"));
 }

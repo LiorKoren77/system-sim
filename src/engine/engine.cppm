@@ -21,8 +21,10 @@
 // changes a node's numbers for the steps it covers: forward_pass asks the schedule for the node's
 // Condition and the node steps under it (serve, ClientBehaviour::set_rate_factor); a flushed
 // cache's warm-up reaches the behaviours that route its misses (warm_flushed_caches), and a
-// dc_down's cut links drop what crosses them (send). Every step also goes to the fault log
-// (FaultLog), which keeps what each fault cost for the report's block per fault. A client's
+// dc_down's cut links drop what crosses them (send). A scenario with faults also steps a TWIN, the
+// same scenario with its faults stripped, beside the run: every step of both goes to the fault log
+// (FaultLog), which keeps what each fault cost against the twin for the report's block per fault
+// (FaultRecord has the model; the twin doubles the cost of such a run). A client's
 // timeout is applied to the fitted response time it sees (Simulation::give_up_after), not request
 // by request.
 //
@@ -58,6 +60,13 @@ export module simsys.engine;
 // simsys.engine sees engine::Condition and engine::FaultSchedule with no import of its own. The
 // partition's name is relative (`:faults`): only units of simsys.engine can name it.
 export import :faults;
+// The two other partitions, re-exported the same way (a module's every interface partition must
+// be): :records (src/engine/records.cppm), the step records every observer reads, and :fault_log
+// (src/engine/fault_log.cppm), the per-fault bookkeeping this unit's Simulation holds. :fault_log
+// exports nothing: importers reach FaultLog's definition (Simulation's size needs it) without
+// being able to name it.
+export import :records;
+export import :fault_log;
 
 import simsys.core;
 import simsys.behaviours;
@@ -95,184 +104,6 @@ class DelayLine {
   std::size_t head_{0};
 };
 
-// One node's numbers for one step. Rates and backlog are summed over replicas (spec §16 entry 4);
-// rho and zone are per copy, which all copies share — or, behind a consistent-hash balancer, those
-// of the hottest copy, the one that breaks an SLO first, and for a SQL database those of the busier
-// of its primary and its replicas — and latency is the sojourn a request sees: one copy's, or
-// behind a hash ring the share-weighted mixture of the hot and the cool copies' (see
-// Simulation::make_server), or for a database the mixture of its writes' (primary) and its reads'
-// (replica) sojourns, weighted by their request rates (Simulation::make_database), and for a
-// byte-sized node the mixture of its ops' sojourns, each answered at its own time, by their request
-// rates (Simulation::request_weighted_megabyte_sojourn). Demand, drain, drops and backlog are in
-// CAPACITY UNITS (per second for the rates), the unit `capacity` is a rate of (spec §17 entry 4): a
-// request of an op with `cost` 3 counts three times. With every cost at its default of 1, units are
-// requests, as in phase 1. The drop ratio dropped / demand is therefore the share of the node's
-// work it shed. A kv_cluster's every request costs N units (spec §19 entry 9, defaults::op_cost):
-// its demand, drain, drops and backlog are REPLICA-REQUESTS, N times the requests its clients sent
-// (30k requests/s at N = 3 are 90k/s), the work its machines do; the clients' offered and answered
-// rates (ResponseSample) stay in requests. `rejected_per_s` is a second way to shed (spec §17 entry
-// 6): requests a rate limiter refused by POLICY, never forwarded. For the token bucket and the
-// windowed algorithms they are refused after the limiter's queue drained them, so they are part of
-// `drain_per_s` too; for a leaky bucket they are its queue's overflow ("bucket full"), which is
-// then reported here and not in `dropped_per_s`. Drops are failures, rejections are the policy
-// working: report::Summary keeps a drop rate and a reject rate apart. A limiter's every op costs 1,
-// so these units are requests. Conservation, per node and per step (the fluid queue's balance,
-// summed over copies):
-//   demand·dt = (drain + dropped)·dt + Δbacklog
-// whatever comes in is served, shed or left waiting. Rejections do not appear as a term of
-// their own: a token-family limiter's (token bucket, windowed) are inside `drain` (its
-// queue looked at them), and a leaky bucket's are the `dropped` term, moved to `rejected`. An
-// external sink's failed requests are moved from `drain` to `dropped` (fail_share): the sum, and
-// with it the balance, does not change.
-// A database's replicas also replay every write the primary committed (replication); that
-// work answers no client, so demand, drain, drops and backlog count the CLIENTS' queries only
-// (the balance above holds for them: a replica full of replayed writes therefore drops while
-// the backlog shown is below queue_limit × copies), and the replication load shows where it
-// bites: in the replicas' rho, zone and the reads' sojourn (Simulation::clients_part), and in
-// the replayed writes a replica drops (`replication_dropped_per_s`, one replica's, beside
-// `committed_writes_per_s`, what one replica must replay).
-struct NodeSample {
-  double demand_per_s{};
-  double drain_per_s{};
-  double dropped_per_s{};
-  double rejected_per_s{};
-  double backlog{};
-  double rho{};
-  flow::LatencyEstimate latency;  // own sojourn; zero for a client (a source has no queue)
-  fluid::Zone zone{fluid::Zone::green};
-  // How old the data a read may return is, in seconds (spec §18 entry 6): for a SQL database, the
-  // write's sojourn at the primary (wait + service, until it is committed) + the replication lag
-  // (shipping it) + its sojourn at a replica (waiting behind the reads and the other replayed
-  // writes, then applied): a replica shows a write that long after the client sent it. 0 for a
-  // database without replicas (every read is served by the primary, which has the latest write);
-  // empty for every other node, which keeps no copies of data that could lag. Infinite when the
-  // primary or the replica never answers. Finite while a replica drops replayed writes (below): the
-  // model's queue is bounded, so this is the bounded-queue figure, while a real replica's lag grows
-  // without bound (see replication_dropped_per_s).
-  std::optional<double> staleness_s{};
-  // The committed writes ONE replica failed to replay, per second, in REQUESTS (writes), not
-  // capacity units: the replicas' total / ((N − 1) · S), every replica being alike. A replica
-  // whose queue is full drops replayed writes with the rest: it falls behind without bound (the
-  // model drops the excess at queue_limit; a real replica keeps it in its relay log/WAL until it
-  // is rebuilt), and the `staleness` SLO fails on any. Per replica, so that it compares with
-  // `committed_writes_per_s` (a sum over replicas could exceed every write committed). Counted
-  // apart from `dropped_per_s`, which is the clients' queries. Same convention as
-  // `staleness_s`: 0 for a database whose replicas keep up (or that has none), empty for every
-  // other node.
-  std::optional<double> replication_dropped_per_s{};
-  // The writes ONE shard's primary committed, per second, in requests: the primaries' total / S,
-  // and so the writes each replica of that shard must replay. Every database has it (0 when no
-  // write arrives); empty for every other node.
-  std::optional<double> committed_writes_per_s{};
-  // A message queue's lag, in seconds (spec §19 entries 4 and 14; the queue between producers and
-  // workers of ch. 10 and ch. 14): how long a message published at this step waits until its
-  // slowest consumer group reads it. Kafka reports a group's lag as the records it has not read;
-  // divided by the rate the group consumes them, that is this time. The broker holds nothing back
-  // (it appends at 1M/s); the unread messages wait in each group's worker pool, so the lag is read
-  // off the pools (Simulation::record_queue_lags):
-  //   lag(group) = the pool's queueing wait this step (fluid::FluidQueue::wait)
-  //              = max(min(k × Wq, T), backlog / capacity)
-  //     backlog / capacity  the FIFO drain time: a message published now is read after everything
-  //                         ahead of it, which the pool works off at its capacity (workers / cost)
-  //                         while it is behind: 60,000 messages at 1200/s are 50 s;
-  //     k × Wq              the stochastic part: Allen–Cunneen's factor k times the Erlang C wait
-  //                         of an M/M/c queue (c = workers, service time = cost, rho clamped at
-  //                         0.99): what a message waits with no backlog because every worker is
-  //                         busy, 3.289 ms for 1k/s into 4 workers at 3.333 ms;
-  //     T                   the room's drain time, = the queue's retention: a message older than
-  //                         that is deleted unconsumed, so no lag passes it.
-  //   The larger of the two terms is our heuristic (FluidQueue::wait), not a published result.
-  //   lag(queue) = the largest over its groups: a queue is as far behind as its slowest reader.
-  // It is not the age of the oldest unread message, which a dashboard may show instead: under
-  // FIFO the message published now becomes the oldest one lag later, so the age trails this lag
-  // by one lag and reaches the same peak that much later. The `queue_lag` SLO bounds the peak
-  // after warmup, so it reads "every message published after warmup was read within `max`".
-  // The wait only: the job's `cost` is not lag (a message is read once a worker takes it), so the
-  // lag is the pool's latency minus its cost. Assumes the backlog is read first in, first out (a
-  // Kafka partition is). Empty for every node that is not a message queue (a 0 would be a claim).
-  std::optional<double> queue_lag_s{};
-};
-
-// What a client sees for one op: the rate it offers, the part of it that comes back answered, and
-// the response time an answered request gets. `answered` = offered × the delivered fraction the
-// backward pass composes along the op's path (spec §17 entry 8,
-// behaviours::NodeBehaviour::delivered): a request a limiter refused or a full queue dropped is not
-// answered (one still waiting in a queue is: later, see Simulation::account_rejections), and
-// reports weigh latency by `answered` so that those requests, which never saw the path's latency,
-// do not dilute it. A client with a `timeout` (Simulation::give_up_after) also gives up on the
-// delivered requests slower than it: those are `timed_out`, not answered, and `response` is the
-// latency of the ones answered in time. So answered = offered − lost − timed_out, and timed_out is
-// 0 for a client that waits for ever. `delivered_response` is the latency of every delivered
-// request, answered or timed out, before the client gave up (the untruncated fit the timeout cut):
-// the reports read a timed-out client's percentiles off it. Without a timeout the two are equal.
-//
-// A client with `retries` (behaviours::ClientBehaviour has the model) sends more than it offers:
-// `attempts` is what it sent this step, `offered` (its curve) plus the retries due now, and it is
-// `offered` exactly without retries or with nothing to retry. Then `answered` = attempts × the
-// delivered fraction (× the share in time): an attempt answered is a request answered, once, since
-// a request is not sent again after an answer. `timed_out` counts the LAST attempts that timed out
-// only (Simulation::count_final_timeouts), requests given up on for good; every other failed
-// attempt is sent again, not lost. Within one step `answered` may then exceed `offered` (a wave of
-// retries answered as an outage ends); at a fixed point answered = offered − lost − timed_out
-// still holds, `lost` being the requests whose last attempt was lost. `timed_out_attempts` counts
-// EVERY attempt that timed out, the last ones and the retried ones: the client waited past its
-// timeout on each, so the share of slow responses a percentile reads is
-// timed_out_attempts / (answered + timed_out_attempts), the attempts delivered (report.cpp's
-// percentile_seen_by_client). Counting the final ones alone would hide the timeouts a retry
-// covered: 10.6 % of the attempts past a 200 ms timeout, retried twice, are 0.12 % of the
-// requests, and a p99 SLO would pass on responses the client never got. Without retries the two
-// counts are equal.
-struct ResponseSample {
-  std::size_t client{};
-  std::string op{};
-  Rate offered{};
-  Rate attempts{};
-  Rate answered{};
-  Rate timed_out{};           // requests given up on for good: their last attempt timed out
-  Rate timed_out_attempts{};  // every attempt that timed out, retried or not
-  flow::LatencyEstimate response{};
-  flow::LatencyEstimate delivered_response{};
-};
-
-// One bandwidth link's pipe for one step (spec §19 entry 3; Simulation::pass_through_pipe):
-// NodeSample's fields of the same names, in MEGABYTES (per second for the rates), the pipe being a
-// queue of megabytes like a byte-sized node. `demand_per_s` is what the sender put on the link,
-// `drain_per_s` what the pipe passed on to the receiver, `dropped_per_s` what overflowed its 1000
-// MB room; they balance as a node's do,
-//   demand·dt = (drain + dropped)·dt + Δbacklog.
-// `rho` and `zone` are the one server's; `latency` is what a hop over the pipe adds, its wait plus
-// the request's answer time on the wire (a write's whole serialisation, size × 1 MB / bandwidth;
-// any other op's first megabyte), mixed over the ops that arrived by their requests, over the ops
-// it carries alike in a step when none arrived (the link's fixed one-way delay is not in it). A
-// pipe refuses nothing by policy, so it has no `rejected_per_s`.
-struct LinkSample {
-  double demand_per_s{};
-  double drain_per_s{};
-  double dropped_per_s{};
-  double backlog{};
-  double rho{};
-  flow::LatencyEstimate latency{};
-  fluid::Zone zone{fluid::Zone::green};
-};
-
-// Everything one step produced: one NodeSample per node (indexed like Graph::nodes()), one
-// ResponseSample per (client, op), clients in node order, ops sorted by name, and one LinkSample
-// per link that has a bandwidth, in Graph::links() order (none without a bandwidth: such a link
-// only delays its flow).
-struct StepRecord {
-  SimTime t{};
-  std::vector<NodeSample> nodes{};
-  std::vector<ResponseSample> responses{};
-  std::vector<LinkSample> links{};
-  // Only Simulation::estimate clears it: false means the settle passes hit their cap
-  // before the numbers stopped changing, so the record is the last pass, not a steady
-  // state. A loop that returns as much as it receives (gain >= 1) and that no capacity
-  // stops within reach climbs for ever: it has no steady state. So do delivered fractions
-  // that never settle (a step after a failed step, see estimate). Every step of `run` leaves it
-  // true.
-  bool converged{true};
-};
-
 // How long to run and how far to advance per step.
 struct RunOptions {
   SimTime duration{};
@@ -288,110 +119,19 @@ concept StepObserver = std::invocable<F, const StepRecord&>;
 
 }  // namespace simsys::engine
 
-// Not exported: the Simulation's own bookkeeping, read through Simulation::fault_records.
-namespace simsys::engine {
-
-// The scripted faults' records (FaultRecord, src/engine/faults.cppm has the model), filled from
-// every step the Simulation advances. It keeps a few sums per fault and the numbers of the step
-// before each fault, never the records: a 24 h run keeps as little as a 1 s one.
-// Pattern: Observer — Simulation::step hands it each StepRecord, as `run` hands one to its
-// observer; nothing else in the engine knows it is there.
-class FaultLog {
- public:
-  // What one link a dc_down cuts did in one step (Simulation::send), in requests per second: what
-  // the sender put on it, and what the cut dropped (all of it on a plain link; a pipe's overflow).
-  struct CutLink {
-    double sent_per_s{};
-    double lost_per_s{};
-  };
-
-  FaultLog() = default;  // no faults: no records, and observe does nothing
-  // One record per fault of `g`'s scenario, in `at` order (the list's order among equal `at`s).
-  // `rooms[i]` is node i's room, queue_limit × copies over its copy groups (Simulation's).
-  FaultLog(const graph::Graph& g, const FaultSchedule& schedule, std::vector<double> rooms);
-
-  // The step that starts at `record.t` and lasts `dt`; `cut_links` per link of the graph.
-  void observe(const StepRecord& record, SimTime dt, std::span<const CutLink> cut_links);
-
-  [[nodiscard]] std::span<const FaultRecord> records() const { return records_; }
-
- private:
-  // What one step looked like, as the recovery rule and the flipped SLOs read it: every node's rho,
-  // every client op's p99 (StepRecord::responses' order) and every SLO's verdict on the step alone
-  // (empty: nothing to observe, which neither holds nor breaks).
-  struct Snapshot {
-    std::vector<double> rho{};
-    std::vector<double> p99_s{};
-    std::vector<std::optional<bool>> slo_holds{};
-  };
-  // The faulted part's numbers in one step (FaultRecord's comment says what is summed).
-  struct TargetStep {
-    double offered_per_s{};
-    double served_per_s{};
-    double lost_per_s{};
-    double backlog{};
-  };
-  // What a record is built from, beside it: the faulted part and the running sums.
-  struct Tracker {
-    std::vector<std::size_t> nodes{};      // the faulted nodes (a dc_down: its datacenter's)
-    std::vector<std::size_t> cut_links{};  // a dc_down's cut links
-    std::optional<std::size_t> client{};   // a traffic_spike's client
-    std::optional<double> window_s{};      // a flush's "during": its warm-up (empty: never warm)
-    double observed_s{};                   // Σ dt over the steps "during"
-    double offered{};                      // Σ offered × dt over them
-    double served{};                       // Σ served × dt
-    double last_backlog{};                 // at the end of the latest step observed
-    bool past_window{};                    // a step after "during" was observed
-    std::optional<Snapshot> before{};      // the step before `at`
-  };
-
-  [[nodiscard]] static Tracker tracker_of(const graph::Graph& g, const FaultSchedule& schedule,
-                                          const model::Fault& fault);
-  [[nodiscard]] static FaultRecord record_of(const model::Fault& fault, const Tracker& tracker,
-                                             std::span<const double> rooms);
-  [[nodiscard]] static TargetStep target_step(const Tracker& tracker, const StepRecord& record,
-                                              std::span<const CutLink> cut_links);
-  [[nodiscard]] Snapshot snapshot_of(const StepRecord& record) const;
-  [[nodiscard]] std::optional<bool> holds(const model::SloSpec& slo,
-                                          std::optional<std::size_t> node,
-                                          const StepRecord& record) const;
-  [[nodiscard]] bool needs_snapshot(const FaultRecord& r, const Tracker& tracker, SimTime t,
-                                    SimTime dt) const;
-  void observe_one(FaultRecord& r, Tracker& tracker, const StepRecord& record, SimTime dt,
-                   std::span<const CutLink> cut_links, const std::optional<Snapshot>& snapshot);
-  void observe_during(FaultRecord& r, Tracker& tracker, const TargetStep& step, double dt_s,
-                      const std::optional<Snapshot>& snapshot) const;
-  static void observe_drain(FaultRecord& r, Tracker& tracker, const TargetStep& step, SimTime t,
-                            SimTime dt);
-  void observe_recovery(FaultRecord& r, const Tracker& tracker, SimTime t,
-                        const std::optional<Snapshot>& snapshot) const;
-  static void observe_warm_up(FaultRecord& r, const Tracker& tracker, SimTime t, SimTime dt);
-  static void note_flipped(FaultRecord& r, std::span<const std::optional<bool>> before,
-                           std::span<const std::optional<bool>> now);
-  [[nodiscard]] static std::optional<double> window_length_s(const FaultRecord& r,
-                                                             const Tracker& tracker);
-  [[nodiscard]] static bool in_window(const FaultRecord& r, const Tracker& tracker, SimTime t);
-  [[nodiscard]] bool inside_any_fault(SimTime t) const;
-  [[nodiscard]] static bool back_to(const Snapshot& now, const Snapshot& before);
-
-  std::vector<FaultRecord> records_{};
-  std::vector<Tracker> trackers_{};  // one per record, in the same order
-  // When each fault of the scenario is on (model::active_at): what inside_any_fault reads.
-  struct Window {
-    SimTime at{};
-    SimTime duration{};
-  };
-  std::vector<Window> windows_{};
-  std::vector<model::SloSpec> slos_{};                   // the scenario's, in its order
-  std::vector<std::optional<std::size_t>> slo_nodes_{};  // each SLO's node index, if it names one
-};
-
-}  // namespace simsys::engine
-
 export namespace simsys::engine {
 
 class Simulation {
  public:
+  // Move-only, said out loud: a Simulation holds its fault-free twin (twin_), and a copy would
+  // either share nothing with it or drag a whole second run along. Nobody copies one: estimate()
+  // builds its scratch copy member by member (settling_copy), and callers move.
+  Simulation(const Simulation&) = delete;
+  Simulation& operator=(const Simulation&) = delete;
+  Simulation(Simulation&&) = default;
+  Simulation& operator=(Simulation&&) = default;
+  ~Simulation() = default;
+
   // C++23 std::expected<T, E>: a runnable Simulation or the reason the graph cannot be
   // run yet. Replaces a throwing constructor: an unsupported node type is user input
   // (a valid scenario for `explain`), not a programmer error.
@@ -427,6 +167,15 @@ class Simulation {
   // zeros). session::run_summary hands them to the report after the run (Summary::set_faults).
   // Empty without faults, and in estimate()'s steady state, which has none.
   [[nodiscard]] std::span<const FaultRecord> fault_records() const { return fault_log_.records(); }
+
+  // The fault-free twin's record of the latest `step` (FaultRecord's header: the same scenario
+  // with its faults stripped, stepped with this one, the same seeds and so the same noise): what
+  // the run would have been without the faults. session::run_summary hands it to a second
+  // Summary, against which the report judges what each fault did to the SLOs. Null without
+  // faults (no twin: a run without faults costs what it did) and before the first step.
+  [[nodiscard]] const StepRecord* twin_record() const {
+    return !twin_.empty() && stepped_ ? &twin_record_ : nullptr;
+  }
 
   // Steps from t = 0 while t < duration and hands every record to `observer`: that is
   // ceil(duration / step) records, the last at the largest multiple of step below
@@ -612,10 +361,14 @@ class Simulation {
   };
 
   Simulation() = default;  // only for settling_copy(), which fills every member
-  // Copying a Simulation works only inside this module under GCC 14: an importer that
-  // copies one gets undefined references to its implicit special members. settling_copy,
-  // a member compiled in this module, is where estimate() copies; callers only move.
-  explicit Simulation(const graph::Graph& g);
+  // settling_copy, a member compiled in this module, is where estimate() builds its copy (an
+  // importer that copied a Simulation got undefined references to its implicit special members
+  // under GCC 14, before the copy was deleted); callers only move.
+  // `scripted`: the scenario's faults, their log and the twin; `stripped`: the twin itself, the
+  // scenario as if it had no faults.
+  enum class Faults { scripted, stripped };
+  explicit Simulation(const graph::Graph& g, Faults faults = Faults::scripted);
+  void add_faults(const graph::Graph& g);
   void require_valid(const RunOptions& options) const;
   void require_scenario_step(SimTime dt) const;
   [[nodiscard]] static Node make_node(const graph::Graph& g, std::size_t index);
@@ -693,7 +446,7 @@ class Simulation {
                                                const fluid::FluidStep& copy_step);
   void send(std::size_t index, const behaviours::Routed& routed, SimTime now, SimTime dt, Mode mode,
             std::span<LinkSample> link_samples);
-  void note_cut(std::size_t link, bool cut, double sent_per_s, double lost_per_s);
+  void note_link(std::size_t link, double sent_per_s, double lost_per_s);
   static void pass_through_pipe(Link& link, SimTime dt, Mode mode, const Condition& condition,
                                 std::span<LinkSample> link_samples);
   void account_rejections(std::size_t index, const behaviours::Routed& routed, NodeSample& sample);
@@ -731,7 +484,17 @@ class Simulation {
   // The faults' records (fault_records), and what each link a dc_down may cut did in the latest
   // step (send). Both empty in estimate()'s scratch copy, whose steps are no run's.
   FaultLog fault_log_{};
-  std::vector<FaultLog::CutLink> cut_links_{};
+  std::vector<FaultLog::LinkTally> link_tallies_{};
+  // The fault-free twin (twin_record) and its latest record; empty without faults, in the twin
+  // itself and in estimate()'s scratch copy. A vector used as an optional, the one way to hold a
+  // member of the class's own, still incomplete, type here: std::vector accepts an incomplete
+  // element type (since C++17), std::optional does not, and std::unique_ptr would need <memory>
+  // in this interface's global module fragment, which GCC 14.2 rejects in every importer ("ignoring
+  // attributes applied to 'std::auto_ptr' after definition", verified 2026-10-30, the family of
+  // the first defect of CLAUDE.md §3).
+  std::vector<Simulation> twin_{};
+  StepRecord twin_record_{};
+  bool stepped_{};
 };
 
 }  // namespace simsys::engine
@@ -1148,8 +911,9 @@ std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Gr
 }
 
 // Copies what a step needs out of the graph, so the Simulation does not outlive a
-// reference to it.
-Simulation::Simulation(const graph::Graph& g)
+// reference to it. The twin (Faults::stripped) stops before the faults: it steps every node in the
+// identity condition, as a scenario without `faults:` would.
+Simulation::Simulation(const graph::Graph& g, Faults faults)
     : order_{g.topological_order().begin(), g.topological_order().end()}, step_{g.scenario().step} {
   for (std::size_t i = 0; i < g.nodes().size(); ++i) nodes_.push_back(make_node(g, i));
   // C++20 designated initializers: `Link{.line = ...}` names the member it sets and leaves
@@ -1164,12 +928,22 @@ Simulation::Simulation(const graph::Graph& g)
   connect_pipes(g);
   connect_consumer_groups(g);
   register_reachable_ops(g);
-  // Last: a flush's read rate is a settle of this very simulation (reads_at_flushes).
+  if (faults == Faults::stripped || g.scenario().faults.empty()) return;  // the run before faults
+  add_faults(g);
+}
+
+// The scenario's faults: their schedule, the cuts a dc_down makes, the log of what each costs, and
+// the fault-free twin it is measured against (FaultRecord's header), stepped by `step` with this
+// one. Last in the constructor: a flush's read rate is a settle of this very simulation
+// (reads_at_flushes). The twin is built inside the class (its constructor is private) and moved
+// into its vector.
+void Simulation::add_faults(const graph::Graph& g) {
   faults_ = FaultSchedule{g, reads_at_flushes(g)};
   connect_cuttable(g);
-  if (g.scenario().faults.empty()) return;  // no records to keep: a run is the run before faults
   fault_log_ = FaultLog{g, faults_, rooms()};
-  cut_links_.assign(links_.size(), FaultLog::CutLink{});
+  link_tallies_.assign(links_.size(), FaultLog::LinkTally{});
+  twin_.push_back(Simulation{g, Faults::stripped});
+  twin_.front().link_tallies_.assign(links_.size(), FaultLog::LinkTally{});
 }
 
 // Each node's room: the queue_limit of each of its copy groups times the copies in it (a pooled
@@ -1538,11 +1312,20 @@ void Simulation::register_reachable_ops(const graph::Graph& g) {
 
 // ---- Simulation: one evaluation ----
 
-// Every advanced step also goes to the fault log (FaultLog: one record per scripted fault).
+// With faults, the twin steps too (the same `now` and `dt`), and both records go to the fault log
+// (FaultLog: one record per scripted fault, each measured against the twin).
 StepRecord Simulation::step(SimTime now, SimTime dt) {
   require_scenario_step(dt);
   StepRecord record = evaluate(now, dt, Mode::advance);
-  fault_log_.observe(record, dt, cut_links_);
+  if (twin_.empty()) return record;
+  Simulation& twin = twin_.front();
+  twin_record_ = twin.step(now, dt);
+  stepped_ = true;
+  fault_log_.observe({.run = record,
+                      .twin = twin_record_,
+                      .run_links = link_tallies_,
+                      .twin_links = twin.link_tallies_},
+                     dt);
   return record;
 }
 
@@ -2318,23 +2101,24 @@ void Simulation::send(std::size_t index, const behaviours::Routed& routed, SimTi
     if (links_[link].pipe) {
       pass_through_pipe(links_[link], dt, mode, condition, link_samples);
       // A cut pipe drains nothing: what it does not keep in its room is lost.
-      note_cut(link, cut, sent_per_s, sent_per_s * (1.0 - links_[link].pipe->passed));
+      note_link(link, sent_per_s, sent_per_s * (1.0 - links_[link].pipe->passed));
       continue;
     }
     links_[link].cut = cut;
     if (links_[link].cut) links_[link].sent.clear();
-    note_cut(link, cut, sent_per_s, sent_per_s);
+    note_link(link, sent_per_s, cut ? sent_per_s : 0.0);
   }
   if (mode == Mode::settle) return;  // estimate reads `sent` directly; lines stay untouched
   for (const std::size_t link : outgoing_links) links_[link].line.push(links_[link].sent);
 }
 
-// What a cut link did this step, for the fault log (FaultLog::CutLink): nothing when it is not cut.
-// Only a run with faults keeps the tally (cut_links_ is empty otherwise, and in a settling copy).
-void Simulation::note_cut(std::size_t link, bool cut, double sent_per_s, double lost_per_s) {
-  if (link >= cut_links_.size()) return;
-  cut_links_[link] = cut ? FaultLog::CutLink{.sent_per_s = sent_per_s, .lost_per_s = lost_per_s}
-                         : FaultLog::CutLink{};
+// What a link did this step, for the fault log (FaultLog::LinkTally): what was put on it and what
+// it lost there (a cut plain link all of it, an uncut one nothing; a pipe its overflow, cut or
+// not, which the twin's tally then has too). Only a run with faults and its twin keep the tally
+// (link_tallies_ is empty otherwise, and in a settling copy).
+void Simulation::note_link(std::size_t link, double sent_per_s, double lost_per_s) {
+  if (link >= link_tallies_.size()) return;
+  link_tallies_[link] = FaultLog::LinkTally{.sent_per_s = sent_per_s, .lost_per_s = lost_per_s};
 }
 
 // A bandwidth link's pipe for one step (spec §19 entry 3), between the sender and the delay line: a
@@ -2630,439 +2414,6 @@ double Simulation::hop_delivered_for_thinning(std::size_t caller, std::size_t ta
   const double settled = found == table.end() ? 1.0 : found->second.settling_delivered.value;
   const Pipe* pipe = pipe_between(caller, target);
   return pipe == nullptr ? settled : pipe->settling_passed.value * settled;
-}
-
-// ---- FaultLog: what each scripted fault cost (FaultRecord) ----
-
-namespace {
-
-// Below this a backlog, a loss or a rate is float residue of the fluid arithmetic, not requests (a
-// drained queue can end at 1e-13 rather than 0).
-constexpr double fault_residue = 1e-9;
-
-// The recovery rule's tolerance (FaultRecord's header): within 1 % of the step before the fault.
-constexpr double recovery_tolerance = 0.01;
-
-[[nodiscard]] bool empty_backlog(double backlog) {
-  return backlog <= fault_residue;
-}
-
-// `now` within 1 % of `before`, relative to it. Equal values always are (an infinite p99 that is
-// still infinite included); the residue's slack lets a 0 before accept float residue after. NaN
-// never is.
-[[nodiscard]] bool within_tolerance(double now, double before) {
-  return now == before ||
-         std::abs(now - before) <= recovery_tolerance * std::abs(before) + fault_residue;
-}
-
-// The step that starts at `t` and lasts `dt` is the step before `at`: the last one to start before
-// it (t < at <= t + dt), the system as it was when the fault struck.
-[[nodiscard]] bool step_before(SimTime at, SimTime t, SimTime dt) {
-  return t.count() < at.count() && at.count() - t.count() <= dt.count();
-}
-
-// The faults in `at` order, the list's order among equal `at`s (a stable insertion sort: a
-// scenario lists a handful of faults).
-[[nodiscard]] std::vector<std::size_t> in_at_order(std::span<const model::Fault> faults) {
-  std::vector<std::size_t> order;
-  for (std::size_t i = 0; i < faults.size(); ++i) {
-    auto position = order.begin();
-    while (position != order.end() && faults[*position].at.count() <= faults[i].at.count()) {
-      ++position;
-    }
-    order.insert(position, i);
-  }
-  return order;
-}
-
-// An SLO's `max` as a number: seconds for a time, the ratio itself otherwise (report.cpp's
-// limit_value, which this engine module cannot import: the report imports the engine).
-[[nodiscard]] double limit_of(const std::variant<SimTime, double>& max) {
-  if (const auto* time = std::get_if<SimTime>(&max)) return seconds(*time);
-  return std::get<double>(max);
-}
-
-// The standard-normal quantile and the tail share above it of a latency metric's percentile.
-struct Quantile {
-  double z{};
-  double tail{};  // 1 − q: more than this share timed out means the quantile timed out
-};
-[[nodiscard]] Quantile quantile_of(model::SloMetric metric) {
-  if (metric == model::SloMetric::p50_latency) return {.z = queueing::z_p50, .tail = 0.5};
-  if (metric == model::SloMetric::p95_latency) return {.z = queueing::z_p95, .tail = 0.05};
-  return {.z = queueing::z_p99, .tail = 0.01};
-}
-
-// A ratio of a node's step, `part` of its demand (0 when nothing reached it).
-[[nodiscard]] double share_of_demand(double part_per_s, double demand_per_s) {
-  return demand_per_s > 0.0 ? part_per_s / demand_per_s : 0.0;
-}
-
-// The worst drop share of any node or bandwidth link in the step (report::Summary::drop_rate's
-// rule for an SLO without a node, on one step).
-[[nodiscard]] double worst_drop_share(const StepRecord& record) {
-  double worst = 0.0;
-  for (const auto& node : record.nodes) {
-    worst = std::max(worst, share_of_demand(node.dropped_per_s, node.demand_per_s));
-  }
-  for (const auto& link : record.links) {
-    worst = std::max(worst, share_of_demand(link.dropped_per_s, link.demand_per_s));
-  }
-  return worst;
-}
-
-[[nodiscard]] double worst_reject_share(const StepRecord& record) {
-  double worst = 0.0;
-  for (const auto& node : record.nodes) {
-    worst = std::max(worst, share_of_demand(node.rejected_per_s, node.demand_per_s));
-  }
-  return worst;
-}
-
-// The worst queue lag of the step, the named queue's when `node` is set; empty when no message
-// queue reports one.
-[[nodiscard]] std::optional<double> step_queue_lag(const StepRecord& record,
-                                                   std::optional<std::size_t> node) {
-  if (node) return record.nodes[*node].queue_lag_s;
-  std::optional<double> worst;
-  for (const auto& sample : record.nodes) {
-    if (sample.queue_lag_s) {
-      worst = flow::nan_propagating_max(*sample.queue_lag_s, worst.value_or(0.0));
-    }
-  }
-  return worst;
-}
-
-// A value at most its limit (NaN is not).
-[[nodiscard]] bool at_most(double value, double max) {
-  return value <= max;
-}
-
-// A latency SLO on one step: every op of its client it reads (the named op, or all of them) at the
-// quantile of the step's lognormal fit to the delivered requests' moments (report.cpp's
-// percentile_seen_by_client on one step). An op nobody sent, or whose requests were all lost, has
-// no latency and is left out; an op more than 1 − q of whose delivered attempts timed out (every
-// attempt, the retried ones too: ResponseSample::timed_out_attempts) breaks it whatever its max.
-// Empty when it reads no op.
-[[nodiscard]] std::optional<bool> latency_holds(const model::SloSpec& slo,
-                                                std::optional<std::size_t> client,
-                                                const StepRecord& record, double max) {
-  if (!client) return std::nullopt;
-  const Quantile q = quantile_of(slo.metric);
-  std::optional<bool> verdict;
-  for (const auto& sample : record.responses) {
-    if (sample.client != *client || (slo.op && sample.op != *slo.op)) continue;
-    const double answered = sample.answered.per_second;
-    const double timed_out = sample.timed_out_attempts.per_second;
-    const auto& fit = sample.delivered_response;
-    if (sample.offered.per_second <= 0.0) continue;
-    if (answered + timed_out > 0.0 && timed_out / (answered + timed_out) > q.tail) return false;
-    if (answered <= 0.0 && timed_out <= 0.0 && std::isfinite(fit.mean_s)) continue;
-    if (!at_most(queueing::lognormal_quantile(fit.mean_s, fit.variance_s2, q.z), max)) return false;
-    verdict = true;
-  }
-  return verdict;
-}
-
-// A staleness SLO on one step: the database's staleness against the bound, and broken whatever it
-// is while a replica misses committed writes (report.cpp's fail_if_replica_falls_behind). Empty for
-// a node with no lagging copies.
-[[nodiscard]] std::optional<bool> staleness_holds(const NodeSample& sample, double max) {
-  if (!sample.staleness_s) return std::nullopt;
-  if (sample.replication_dropped_per_s.value_or(0.0) > 0.0) return false;
-  return at_most(*sample.staleness_s, max);
-}
-
-}  // namespace
-
-FaultLog::FaultLog(const graph::Graph& g, const FaultSchedule& schedule, std::vector<double> rooms)
-    : slos_{g.scenario().slos} {
-  const auto& faults = g.scenario().faults;
-  for (const auto& fault : faults) {
-    windows_.push_back(Window{.at = fault.at, .duration = fault.duration});
-  }
-  for (const auto& slo : slos_) {
-    slo_nodes_.push_back(slo.node ? g.index_of(*slo.node) : std::nullopt);
-  }
-  for (const std::size_t i : in_at_order(faults)) {
-    trackers_.push_back(tracker_of(g, schedule, faults[i]));
-    records_.push_back(record_of(faults[i], trackers_.back(), rooms));
-  }
-}
-
-// The faulted part (FaultRecord's comment): the named node; a dc_down's datacenter, its nodes but
-// its clients and the links that cross its edge (FaultSchedule::add_dc_down's choice); a
-// traffic_spike's client. A flush's window is its warm-up: none for a cache without a hit ratio,
-// whose flush changes nothing.
-FaultLog::Tracker FaultLog::tracker_of(const graph::Graph& g, const FaultSchedule& schedule,
-                                       const model::Fault& fault) {
-  Tracker tracker;
-  if (fault.kind == model::FaultKind::dc_down) {
-    const auto nodes = g.nodes();
-    const auto inside = [&](std::size_t node) { return nodes[node].spec.dc == fault.datacenter; };
-    for (std::size_t node = 0; node < nodes.size(); ++node) {
-      if (inside(node) && nodes[node].spec.type != model::NodeType::client) {
-        tracker.nodes.push_back(node);
-      }
-    }
-    const auto links = g.links();
-    for (std::size_t link = 0; link < links.size(); ++link) {
-      if (inside(links[link].from) != inside(links[link].to)) tracker.cut_links.push_back(link);
-    }
-    return tracker;
-  }
-  const std::size_t node = *g.index_of(fault.node);
-  if (fault.kind == model::FaultKind::traffic_spike) {
-    tracker.client = node;
-    return tracker;
-  }
-  tracker.nodes.push_back(node);
-  if (fault.kind == model::FaultKind::cache_flush) {
-    tracker.window_s = g.nodes()[node].hit_ratio ? schedule.warm_up_s(node, fault.at) : 0.0;
-  }
-  return tracker;
-}
-
-// A record of zeros until the fault starts: what it is, and the room its backlog can fill.
-FaultRecord FaultLog::record_of(const model::Fault& fault, const Tracker& tracker,
-                                std::span<const double> rooms) {
-  double room = 0.0;
-  for (const std::size_t node : tracker.nodes) room += rooms[node];
-  return FaultRecord{.kind = fault.kind,
-                     .node = fault.node,
-                     .at = fault.at,
-                     .duration = fault.duration,
-                     .room = room,
-                     .datacenter = fault.datacenter};
-}
-
-// A snapshot of the step only when some record reads it (the step before a fault, a step during
-// one with SLOs to judge, a step after one not recovered yet): a 24 h run with one 30 s fault
-// computes a few hundred, not 864,000.
-void FaultLog::observe(const StepRecord& record, SimTime dt, std::span<const CutLink> cut_links) {
-  if (records_.empty()) return;
-  std::optional<Snapshot> snapshot;
-  for (std::size_t i = 0; i < records_.size() && !snapshot; ++i) {
-    if (needs_snapshot(records_[i], trackers_[i], record.t, dt)) snapshot = snapshot_of(record);
-  }
-  for (std::size_t i = 0; i < records_.size(); ++i) {
-    observe_one(records_[i], trackers_[i], record, dt, cut_links, snapshot);
-  }
-}
-
-bool FaultLog::needs_snapshot(const FaultRecord& r, const Tracker& tracker, SimTime t,
-                              SimTime dt) const {
-  if (step_before(r.at, t, dt)) return true;
-  if (!tracker.before) return false;
-  if (in_window(r, tracker, t)) return !slos_.empty();
-  return t.count() >= r.at.count() && !r.recovered_at;
-}
-
-// One record's share of the step: the step before the fault is kept, a step during it adds to the
-// sums, a step after it may end the drain, and any step after it may be the recovery.
-void FaultLog::observe_one(FaultRecord& r, Tracker& tracker, const StepRecord& record, SimTime dt,
-                           std::span<const CutLink> cut_links,
-                           const std::optional<Snapshot>& snapshot) {
-  const SimTime t = record.t;
-  if (step_before(r.at, t, dt)) tracker.before = snapshot;
-  const TargetStep step = target_step(tracker, record, cut_links);
-  if (in_window(r, tracker, t)) {
-    observe_during(r, tracker, step, seconds(dt), snapshot);
-  } else if (t.count() >= r.at.count()) {
-    observe_drain(r, tracker, step, t, dt);
-  }
-  observe_recovery(r, tracker, t, snapshot);
-  observe_warm_up(r, tracker, t, dt);
-  tracker.last_backlog = step.backlog;
-}
-
-// The faulted part's numbers in this step (FaultRecord's comment: a dc_down's cut links add the
-// requests sent over them and lost; a traffic_spike's client counts its requests, offered and
-// answered, the rest lost or timed out: answered = offered − lost − timed out, ResponseSample).
-FaultLog::TargetStep FaultLog::target_step(const Tracker& tracker, const StepRecord& record,
-                                           std::span<const CutLink> cut_links) {
-  TargetStep step;
-  for (const std::size_t node : tracker.nodes) {
-    const auto& sample = record.nodes[node];
-    step.offered_per_s += sample.demand_per_s;
-    step.served_per_s += sample.drain_per_s;
-    step.lost_per_s += sample.dropped_per_s;
-    step.backlog += sample.backlog;
-  }
-  for (const std::size_t link : tracker.cut_links) {
-    if (link >= cut_links.size()) continue;
-    step.offered_per_s += cut_links[link].sent_per_s;
-    step.lost_per_s += cut_links[link].lost_per_s;
-  }
-  if (!tracker.client) return step;
-  for (const auto& sample : record.responses) {
-    if (sample.client != *tracker.client) continue;
-    step.offered_per_s += sample.offered.per_second;
-    step.served_per_s += sample.answered.per_second;
-    step.lost_per_s += std::max(0.0, sample.offered.per_second - sample.answered.per_second);
-  }
-  return step;
-}
-
-// During the fault: the means of offered and served so far, Σ lost × dt, the backlog's peak, and
-// every SLO that held at the step before the fault and breaks at this one (judged on this step
-// alone, as on the step before: a windowed SLO too, since the engine has no window, so "flipped"
-// says the fault broke it at some moment, not that its worst window failed).
-void FaultLog::observe_during(FaultRecord& r, Tracker& tracker, const TargetStep& step, double dt_s,
-                              const std::optional<Snapshot>& snapshot) const {
-  tracker.observed_s += dt_s;
-  tracker.offered += step.offered_per_s * dt_s;
-  tracker.served += step.served_per_s * dt_s;
-  r.offered_per_s = tracker.offered / tracker.observed_s;
-  r.served_per_s = tracker.served / tracker.observed_s;
-  r.lost += step.lost_per_s * dt_s;
-  r.backlog_peak = std::max(r.backlog_peak, step.backlog);
-  if (snapshot && tracker.before && !slos_.empty()) {
-    note_flipped(r, tracker.before->slo_holds, snapshot->slo_holds);
-  }
-}
-
-// Adds each SLO that held before and breaks now to `flipped`, kept in the list's order.
-void FaultLog::note_flipped(FaultRecord& r, std::span<const std::optional<bool>> before,
-                            std::span<const std::optional<bool>> now) {
-  for (std::size_t i = 0; i < before.size() && i < now.size(); ++i) {
-    const bool flips = before[i] == true && now[i] == false;
-    if (!flips || std::ranges::contains(r.flipped, i)) continue;
-    // C++20 std::ranges::upper_bound: the binary search over the whole range, replacing
-    // std::upper_bound(v.begin(), v.end(), i); inserting there keeps `flipped` sorted, the SLO
-    // list's order, whatever step each SLO broke at.
-    r.flipped.insert(std::ranges::upper_bound(r.flipped, i), i);
-  }
-}
-
-// After the fault: the backlog it built is drained at the end of the first step that leaves it
-// empty, timed from the end of the fault (0 when it was empty as the fault ended). Exact tick
-// arithmetic for a fault that lasts (0.2 s, not 0.19999999999999929); a flush's window is seconds.
-void FaultLog::observe_drain(FaultRecord& r, Tracker& tracker, const TargetStep& step, SimTime t,
-                             SimTime dt) {
-  const bool first_after = !std::exchange(tracker.past_window, true);
-  if (empty_backlog(r.backlog_peak) || r.after.backlog_drained_in_s) return;
-  if (first_after && empty_backlog(tracker.last_backlog)) {
-    r.after.backlog_drained_in_s = 0.0;
-    return;
-  }
-  if (!empty_backlog(step.backlog)) return;
-  const SimTime since_at{t.count() + dt.count() - r.at.count()};
-  if (model::lasts(r.kind)) {
-    r.after.backlog_drained_in_s = seconds(SimTime{since_at.count() - r.duration.count()});
-  } else {
-    r.after.backlog_drained_in_s = seconds(since_at) - window_length_s(r, tracker).value_or(0.0);
-  }
-}
-
-// Recovery (FaultRecord's header): the first step that starts once the fault has cleared, inside no
-// fault of the scenario, with every client op's p99 and every node's rho within 1 % of the step
-// before the fault. Nothing to return to without a step before it (a fault at the first step).
-void FaultLog::observe_recovery(FaultRecord& r, const Tracker& tracker, SimTime t,
-                                const std::optional<Snapshot>& snapshot) const {
-  if (r.recovered_at || !tracker.before || !snapshot) return;
-  if (t.count() - r.at.count() < r.duration.count()) return;  // before it ends (or it starts)
-  if (inside_any_fault(t)) return;
-  if (back_to(*snapshot, *tracker.before)) r.recovered_at = t;
-}
-
-// A flushed cache is warm again from the step during which its warm-up ends, once the run gets
-// there: the warm-up time itself, not the step's end (Task 7's curve, FaultSchedule::warm_up_s).
-void FaultLog::observe_warm_up(FaultRecord& r, const Tracker& tracker, SimTime t, SimTime dt) {
-  if (r.kind != model::FaultKind::cache_flush || !tracker.window_s || r.after.cache_warm_in_s) {
-    return;
-  }
-  if (seconds(SimTime{t.count() + dt.count() - r.at.count()}) >= *tracker.window_s) {
-    r.after.cache_warm_in_s = *tracker.window_s;
-  }
-}
-
-// Inside the fault's window: [at, at + for) (model::active_at), or a flush's warm-up from `at` on
-// (for ever when the cache never warms).
-bool FaultLog::in_window(const FaultRecord& r, const Tracker& tracker, SimTime t) {
-  if (model::lasts(r.kind)) return model::active_at(r.at, r.duration, t);
-  if (t.count() < r.at.count()) return false;
-  return !tracker.window_s || seconds(SimTime{t.count() - r.at.count()}) < *tracker.window_s;
-}
-
-// The window's length in seconds: `for`, or a flush's warm-up (empty: it never warms).
-std::optional<double> FaultLog::window_length_s(const FaultRecord& r, const Tracker& tracker) {
-  if (model::lasts(r.kind)) return seconds(r.duration);
-  return tracker.window_s;
-}
-
-// C++20 std::ranges::any_of: the range itself rather than a begin/end pair (std::any_of), so the
-// pair cannot be mismatched.
-bool FaultLog::inside_any_fault(SimTime t) const {
-  return std::ranges::any_of(
-      windows_, [&](const Window& w) { return model::active_at(w.at, w.duration, t); });
-}
-
-// Every node's rho and every client op's p99 back within 1 % of the step before the fault.
-bool FaultLog::back_to(const Snapshot& now, const Snapshot& before) {
-  if (now.rho.size() != before.rho.size() || now.p99_s.size() != before.p99_s.size()) return false;
-  for (std::size_t i = 0; i < now.rho.size(); ++i) {
-    if (!within_tolerance(now.rho[i], before.rho[i])) return false;
-  }
-  for (std::size_t i = 0; i < now.p99_s.size(); ++i) {
-    if (!within_tolerance(now.p99_s[i], before.p99_s[i])) return false;
-  }
-  return true;
-}
-
-// The step as the recovery rule and the flipped SLOs read it: the p99 of each client op is read off
-// the lognormal fit to the moments of its delivered requests (the reports' percentiles, on one
-// step).
-FaultLog::Snapshot FaultLog::snapshot_of(const StepRecord& record) const {
-  Snapshot snapshot;
-  for (const auto& node : record.nodes) snapshot.rho.push_back(node.rho);
-  for (const auto& sample : record.responses) {
-    const auto& fit = sample.delivered_response;
-    snapshot.p99_s.push_back(
-        queueing::lognormal_quantile(fit.mean_s, fit.variance_s2, queueing::z_p99));
-  }
-  for (std::size_t i = 0; i < slos_.size(); ++i) {
-    snapshot.slo_holds.push_back(holds(slos_[i], slo_nodes_[i], record));
-  }
-  return snapshot;
-}
-
-// An SLO judged on one step's values, as report::evaluate_slos judges a whole run's (the same
-// metric, the same "the named node's, else the worst one's"): true when it holds, false when the
-// step breaks it, empty when the step has nothing to observe (a latency SLO on no op, a staleness
-// on a node that is no database, a queue lag with no message queue).
-std::optional<bool> FaultLog::holds(const model::SloSpec& slo, std::optional<std::size_t> node,
-                                    const StepRecord& record) const {
-  if (slo.node && !node) return std::nullopt;  // a node the graph does not know (loader-checked)
-  const double max = limit_of(slo.max);
-  switch (slo.metric) {
-    case model::SloMetric::p50_latency:
-    case model::SloMetric::p95_latency:
-    case model::SloMetric::p99_latency:
-      return latency_holds(slo, node, record, max);
-    case model::SloMetric::drop_rate:
-      return at_most(node ? share_of_demand(record.nodes[*node].dropped_per_s,
-                                            record.nodes[*node].demand_per_s)
-                          : worst_drop_share(record),
-                     max);
-    case model::SloMetric::reject_rate:
-      return at_most(node ? share_of_demand(record.nodes[*node].rejected_per_s,
-                                            record.nodes[*node].demand_per_s)
-                          : worst_reject_share(record),
-                     max);
-    case model::SloMetric::utilization:
-      if (!node) return std::nullopt;
-      return at_most(record.nodes[*node].rho, max);
-    case model::SloMetric::staleness:
-      if (!node) return std::nullopt;
-      return staleness_holds(record.nodes[*node], max);
-    case model::SloMetric::queue_lag: {
-      const auto lag = step_queue_lag(record, node);
-      if (!lag) return std::nullopt;
-      return at_most(*lag, max);
-    }
-  }
-  std::unreachable();
 }
 
 }  // namespace simsys::engine
