@@ -534,6 +534,22 @@ until Task 16 gives `long_poll` `connections: 2M`.
 - [x] Tests: a fanout at 1k/s with `dedup: 0.02` and `then: [{to: q1, factor: 0.6}, {to: q2, factor: 0.3}]`: `q1` receives **588/s**, `q2` **294/s**, `deduplicated/s` **20**; the channels checks' messages; the explain lines on notification-system no longer carry `load not propagated`; the day test pins the blast's queue lags and that the `drop_rate` SLO passes with retries while the dead-letter rate is *measured*.
 - [x] Commit `nodes: notification_fanout routes per channel after dedup; notification-system runs end to end` (green `1da0e87`, 1605 tests; notification-system resized: notification_svc 8 replicas, user_db 4, fanout × 2, log_db 3 × 30k/s, pools 260/50/45/60 workers with `retries: 3`, provider quotas 15k/3k/1.2k/2.5k; all three SLOs pass).
 
+**Review of Task 17 at `1da0e87`** (adversarial, bounded, 2026-10-30): APPROVE, seven minors. The
+fixed point, replicas, saturation (dedup on what was drained, documented order), sequential
+publishes in the latency, `log_db × (1 − dedup)`, call cycles as hand-offs, the refusals, sweep over
+`dedup`, the day's numbers to the digit, the sizing formula, the ~5 % dead-letter under-count traced
+to the pool model's documented simplification, identity, §1–§4 all verified.
+1. The README's dead-letter sentence compares against the no-blast napkin (1.79e-4) so the measured
+   1.937e-4 reads higher, not 5 % lower (the with-blast napkin is 2.045e-4); the under-count grows
+   with the backlog's length (34 % on a 20× blast probe).
+2. No `<fanout>.deduplicated` sweep metric. 3. The publishes are sequential, unsaid in the README
+(a parallel group would make it the slowest append). 4. The schema's CSV header example omits
+`connections`. 5. `unpropagated_mark`'s multi-type grouping is unreachable with one type left.
+6. The channel messages leave the queue id unquoted, unlike their siblings. 7. The fanout's Ignored
+list lacks priority and per-user rate limits.
+Decisions: all seven fixed in a fix round after Task 18 lands (same explain code); the README's test
+count is refreshed at the 3c push.
+
 ### Task 18: `frontier`; web-crawler runs end to end
 
 **Files:** `src/engine/behaviours.cppm` (`FrontierBehaviour`: a message queue without retention whose consumer pool drains at `min(pool capacity, hosts × politeness)`; `capacity` the prioritiser's own rate in front), `src/engine/engine.cppm` (`connect_consumer_groups` includes a frontier's pools; `queue_lag` on a frontier evaluated; the `internet` sink's `politeness` capped over the one frontier's `hosts`: `node 'internet': politeness needs exactly one frontier in the scenario (found 0)`), `src/model/model.cppm` (`hosts`), `src/config/nodes.cpp` (`hosts` a positive count; `politeness` positive), `src/report/*` (explain follows a frontier's `then`; the last `load not propagated` mark goes), `scenarios/book/web-crawler/{scenario.yaml,README.md}` (`downloader` `retries: 2` for the internet's 5 % failures; the lesson: the frontier's lag under the ×50 link fan-out at 10 % new URLs, politeness as a cap by lowering `hosts`), `tests/theory/test_queues_pools.cpp`, `tests/scenario/test_scenarios.cpp`, `test_series.cpp`, `README.md`.
