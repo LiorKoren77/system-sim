@@ -16,6 +16,7 @@ module;
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <ostream>
 #include <ranges>
@@ -511,6 +512,37 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
          " scripted (estimate shows the steady state without them; run applies them)\n";
 }
 
+// A table before it is aligned: its header, its body rows and, for every body cell, the number
+// that cell prints (`text_cell` for a cell that prints text: a name, a client's `-`, the
+// `unavailable` mark). A run's report prints the rows as they are (table_text); `run
+// --replications` builds one per run and prints each cell as the band of its numbers across the
+// runs (banded_parts). Row builders shared by both keep the two reports' cells alike.
+struct TableParts {
+  Row header{};
+  std::vector<Row> rows{};
+  std::vector<std::vector<double>> numbers{};
+
+  void add(Row row, std::vector<double> row_numbers) {
+    rows.push_back(std::move(row));
+    numbers.push_back(std::move(row_numbers));
+  }
+};
+
+// The number of a cell that prints text: NaN, which no number equals.
+constexpr double text_cell = std::numeric_limits<double>::quiet_NaN();
+
+// `title`, then the header and the rows aligned under it.
+[[nodiscard]] std::string table_text(std::string_view title, const TableParts& parts) {
+  std::vector<Row> rows{parts.header};
+  rows.insert(rows.end(), parts.rows.begin(), parts.rows.end());
+  return std::string{title} + "\n" + aligned(rows);
+}
+
+// The same, or nothing for a table without rows (no bandwidth link, no database).
+[[nodiscard]] std::string table_text_if_any(std::string_view title, const TableParts& parts) {
+  return parts.rows.empty() ? std::string{} : table_text(title, parts);
+}
+
 // A queue's cells (a node's, or a bandwidth link's pipe's), its rho cells coloured by the queue's
 // own zone thresholds; the tables add what follows them.
 [[nodiscard]] Row queue_cells(const NodeSummary& node, const fluid::Capacity& capacity,
@@ -525,6 +557,12 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
           {with_si_prefix(node.total_dropped)},
           {with_si_prefix(node.total_rejected)},
           {significant(node.red_time_s)}};
+}
+
+// The numbers of queue_cells, cell by cell.
+[[nodiscard]] std::vector<double> queue_numbers(const NodeSummary& node) {
+  return {text_cell,          node.mean_rho,       node.peak_rho,  node.peak_backlog,
+          node.total_dropped, node.total_rejected, node.red_time_s};
 }
 
 // The last, unlabelled cell of a queue's row: why its figures are not to be trusted, if they are
@@ -569,69 +607,113 @@ constexpr std::size_t dead_letter_column = 5;
   return row;
 }
 
-[[nodiscard]] std::string node_table(const Summary& summary, bool color) {
-  std::vector<Row> rows{{{"node"},
-                         {"mean_rho"},
-                         {"peak_rho"},
-                         {"peak_backlog"},
-                         {"dropped"},
-                         {"rejected"},
-                         {"red_s"},
-                         {"peak_lag"}}};
+// The numbers of node_row, cell by cell: none on a client's row. With `dead_letters`, the pool's
+// dead-letter rate at dead_letter_column, as node_row puts its cell there (text on other rows).
+[[nodiscard]] std::vector<double> node_numbers(const NodeSummary& node,
+                                               const graph::ResolvedNode& resolved,
+                                               bool dead_letters) {
+  if (resolved.spec.type == model::NodeType::client) {
+    return std::vector<double>(dead_letters ? 9 : 8, text_cell);
+  }
+  auto numbers = queue_numbers(node);
+  numbers.push_back(node.peak_queue_lag_s.value_or(text_cell));
+  numbers.push_back(text_cell);
+  if (dead_letters) {
+    numbers.insert(std::next(numbers.begin(), static_cast<std::ptrdiff_t>(dead_letter_column)),
+                   node.mean_dead_lettered_per_s.value_or(text_cell));
+  }
+  return numbers;
+}
+
+[[nodiscard]] TableParts node_parts(const Summary& summary, bool color) {
+  TableParts parts{.header = {{"node"},
+                              {"mean_rho"},
+                              {"peak_rho"},
+                              {"peak_backlog"},
+                              {"dropped"},
+                              {"rejected"},
+                              {"red_s"},
+                              {"peak_lag"}}};
   const bool dead_letters = some_pool_retries(summary.graph());
   if (dead_letters) {
-    rows.front().insert(
-        std::next(rows.front().begin(), static_cast<std::ptrdiff_t>(dead_letter_column)),
+    parts.header.insert(
+        std::next(parts.header.begin(), static_cast<std::ptrdiff_t>(dead_letter_column)),
         Cell{"dead_lettered/s"});
   }
   const auto nodes = summary.nodes();
   for (std::size_t i = 0; i < nodes.size(); ++i) {
-    rows.push_back(node_row(nodes[i], summary.graph().nodes()[i], color, dead_letters));
+    const auto& resolved = summary.graph().nodes()[i];
+    parts.add(node_row(nodes[i], resolved, color, dead_letters),
+              node_numbers(nodes[i], resolved, dead_letters));
   }
-  return "nodes\n" + aligned(rows);
+  return parts;
+}
+
+constexpr std::string_view node_title = "nodes";
+
+[[nodiscard]] std::string node_table(const Summary& summary, bool color) {
+  return table_text(node_title, node_parts(summary, color));
 }
 
 // The bandwidth links' pipes, in the node table's columns but a table of their own, since their
 // numbers are megabytes: `a->b`, its utilization, the most megabytes it held and the megabytes it
 // dropped (a pipe refuses nothing, so `rejected` is 0). Nothing without a bandwidth link.
-[[nodiscard]] std::string link_table(const Summary& summary, bool color) {
+[[nodiscard]] TableParts link_parts(const Summary& summary, bool color) {
+  TableParts parts{.header = {{"link"},
+                              {"mean_rho"},
+                              {"peak_rho"},
+                              {"peak_backlog"},
+                              {"dropped"},
+                              {"rejected"},
+                              {"red_s"}}};
   const auto links = summary.links();
-  if (links.empty()) return {};
-  std::vector<Row> rows{{{"link"},
-                         {"mean_rho"},
-                         {"peak_rho"},
-                         {"peak_backlog"},
-                         {"dropped"},
-                         {"rejected"},
-                         {"red_s"}}};
   std::size_t next = 0;  // links() follows Graph::links(), pipes only
   for (const auto& link : summary.graph().links()) {
     if (!link.pipe) continue;
-    Row row = queue_cells(links[next].queue, *link.pipe, color);
-    row.push_back(unavailable_cell(links[next++].queue));
-    rows.push_back(std::move(row));
+    const auto& queue = links[next++].queue;
+    Row row = queue_cells(queue, *link.pipe, color);
+    row.push_back(unavailable_cell(queue));
+    auto numbers = queue_numbers(queue);
+    numbers.push_back(text_cell);
+    parts.add(std::move(row), std::move(numbers));
   }
-  return "links (bandwidth pipes, in megabytes: peak_backlog and dropped are MB)\n" + aligned(rows);
+  return parts;
+}
+
+constexpr std::string_view link_title =
+    "links (bandwidth pipes, in megabytes: peak_backlog and dropped are MB)";
+
+[[nodiscard]] std::string link_table(const Summary& summary, bool color) {
+  return table_text_if_any(link_title, link_parts(summary, color));
 }
 
 // A database's replication, which the node table has no columns for: the mean staleness, the
 // writes one shard's primary committed per second (what each of its replicas must replay) and
 // the share of them one replica missed (a replica that misses any falls behind without bound).
 // Only when the run has a database.
-[[nodiscard]] std::string replication_table(const Summary& summary) {
-  std::vector<Row> rows{{{"database"},
-                         {"staleness"},
-                         {"committed writes/s per shard"},
-                         {"missed writes/s per replica"}}};
+[[nodiscard]] TableParts replication_parts(const Summary& summary) {
+  TableParts parts{.header = {{"database"},
+                              {"staleness"},
+                              {"committed writes/s per shard"},
+                              {"missed writes/s per replica"}}};
   for (const auto& node : summary.nodes()) {
     if (!node.mean_replication_dropped_per_s) continue;
-    rows.push_back({{node.id},
-                    {format_duration(node.mean_staleness_s.value_or(0.0))},
-                    {with_si_prefix(node.mean_committed_writes_per_s.value_or(0.0))},
-                    {with_si_prefix(*node.mean_replication_dropped_per_s)}});
+    const double staleness = node.mean_staleness_s.value_or(0.0);
+    const double committed = node.mean_committed_writes_per_s.value_or(0.0);
+    const double missed = *node.mean_replication_dropped_per_s;
+    parts.add({{node.id},
+               {format_duration(staleness)},
+               {with_si_prefix(committed)},
+               {with_si_prefix(missed)}},
+              {text_cell, staleness, committed, missed});
   }
-  if (rows.size() == 1) return {};
-  return "replication\n" + aligned(rows);
+  return parts;
+}
+
+constexpr std::string_view replication_title = "replication";
+
+[[nodiscard]] std::string replication_table(const Summary& summary) {
+  return table_text_if_any(replication_title, replication_parts(summary));
 }
 
 // An op's latency cell: `-` when nobody was answered (a sink that fails everything it serves has no
@@ -652,28 +734,39 @@ constexpr std::size_t dead_letter_column = 5;
 // retries included (equal to offered/s for a client without retries, so a storm stands out as the
 // row where it is higher). The `timed out/s` column is there when some client has a timeout:
 // without one nothing can time out, and the table keeps its old shape.
-[[nodiscard]] std::string op_table(const Summary& summary) {
+[[nodiscard]] TableParts op_parts(const Summary& summary) {
   const auto ops = summary.ops();
   // C++20 std::ranges::any_of: the range itself instead of a begin/end pair (std::any_of), so it
   // cannot be paired with another container's end by mistake.
   const bool any_timeout =
       std::ranges::any_of(ops, [](const OpSummary& op) { return op.timeout_s.has_value(); });
-  Row header{{"client.op"}, {"offered/s"}, {"attempts/s"}};
-  if (any_timeout) header.push_back({"timed out/s"});
-  header.insert(header.end(), {{"mean"}, {"p50"}, {"p95"}, {"p99"}, {"(estimated)"}});
-  std::vector<Row> rows{std::move(header)};
+  TableParts parts{.header = {{"client.op"}, {"offered/s"}, {"attempts/s"}}};
+  if (any_timeout) parts.header.push_back({"timed out/s"});
+  parts.header.insert(parts.header.end(), {{"mean"}, {"p50"}, {"p95"}, {"p99"}, {"(estimated)"}});
   for (const auto& op : ops) {
     Row row{{op.client + "." + op.op},
             {with_si_prefix(op.offered_per_s)},
             {with_si_prefix(op.attempts_per_s)}};
-    if (any_timeout) row.push_back({with_si_prefix(op.timed_out_per_s)});
+    std::vector<double> numbers{text_cell, op.offered_per_s, op.attempts_per_s};
+    if (any_timeout) {
+      row.push_back({with_si_prefix(op.timed_out_per_s)});
+      numbers.push_back(op.timed_out_per_s);
+    }
     row.insert(row.end(), {{op_latency_cell(op, op.mean_s)},
                            {op_percentile_cell(op, op.p50_s, median)},
                            {op_percentile_cell(op, op.p95_s, ninety_fifth)},
                            {op_percentile_cell(op, op.p99_s, ninety_ninth)}});
-    rows.push_back(std::move(row));
+    numbers.insert(numbers.end(), {op.mean_s, op.p50_s, op.p95_s, op.p99_s});
+    parts.add(std::move(row), std::move(numbers));
   }
-  return "ops (percentiles estimated: lognormal fit to the response moments)\n" + aligned(rows);
+  return parts;
+}
+
+constexpr std::string_view op_title =
+    "ops (percentiles estimated: lognormal fit to the response moments)";
+
+[[nodiscard]] std::string op_table(const Summary& summary) {
+  return table_text(op_title, op_parts(summary));
 }
 
 [[nodiscard]] Cell status_cell(SloStatus status, bool color) {
@@ -713,19 +806,26 @@ constexpr std::size_t dead_letter_column = 5;
   return window + "  " + r.note;
 }
 
+// One SLO's row under the status cell given.
+[[nodiscard]] Row slo_row(const SloResult& r, Cell status) {
+  const auto observed =
+      r.observed.transform([&](double v) { return fmt_slo_value(r.slo.metric, v); });
+  Row row{std::move(status),          {std::string{model::to_string(r.slo.metric)}},
+          {r.slo.node.value_or("-")}, {r.slo.op.value_or("-")},
+          {observed.value_or("-")},   {fmt_limit(r.slo.max)}};
+  // A seventh, unlabelled column: which window, and why.
+  if (const auto remark = slo_remark(r); !remark.empty()) row.push_back({remark});
+  return row;
+}
+
+[[nodiscard]] Row slo_header() {
+  return {{"status"}, {"metric"}, {"node"}, {"op"}, {"observed"}, {"max"}};
+}
+
 [[nodiscard]] std::string slo_table(std::span<const SloResult> slos, bool color) {
   if (slos.empty()) return {};
-  std::vector<Row> rows{{{"status"}, {"metric"}, {"node"}, {"op"}, {"observed"}, {"max"}}};
-  for (const auto& r : slos) {
-    const auto observed =
-        r.observed.transform([&](double v) { return fmt_slo_value(r.slo.metric, v); });
-    Row row{status_cell(r.status, color), {std::string{model::to_string(r.slo.metric)}},
-            {r.slo.node.value_or("-")},   {r.slo.op.value_or("-")},
-            {observed.value_or("-")},     {fmt_limit(r.slo.max)}};
-    // A seventh, unlabelled column: which window, and why.
-    if (const auto remark = slo_remark(r); !remark.empty()) row.push_back({remark});
-    rows.push_back(std::move(row));
-  }
+  std::vector<Row> rows{slo_header()};
+  for (const auto& r : slos) rows.push_back(slo_row(r, status_cell(r.status, color)));
   return "slo\n" + aligned(rows, Align::all_left);
 }
 
@@ -1110,6 +1210,481 @@ constexpr std::size_t dead_letter_column = 5;
 template <class T, class F>
 [[nodiscard]] std::vector<std::string> map_to_strings(std::span<const T> items, F f) {
   return items | std::views::transform(f) | std::ranges::to<std::vector<std::string>>();
+}
+
+// The top-level lines of a run's JSON report, one key each. With no observed step the drop and
+// reject rates are null: there is no data, not a rate of 0.
+[[nodiscard]] std::vector<std::string> json_report_lines(const Summary& summary,
+                                                         std::span<const SloResult> slos) {
+  const auto nodes = summary.nodes();
+  const auto ops = summary.ops();
+  const auto links = summary.links();
+  const bool observed = summary.observed_steps() > 0;
+  const auto worst = summary.worst_drop_node();
+  const auto worst_rejecting = summary.worst_reject_node();
+  std::vector<std::string> lines{
+      "  " + json_field("scenario", json_string(summary.scenario_name())),
+      "  " + json_field("steps", std::to_string(summary.observed_steps())),
+      "  " + json_field("drop_rate", observed ? json_number(summary.drop_rate()) : "null"),
+      "  " + json_field("worst_drop_node", worst.empty() ? "null" : json_string(worst)),
+      "  " + json_field("reject_rate", observed ? json_number(summary.reject_rate()) : "null"),
+      "  " + json_field("worst_reject_node",
+                        worst_rejecting.empty() ? "null" : json_string(worst_rejecting)),
+      json_array("nodes", map_to_strings(std::span<const NodeSummary>{nodes}, json_node)),
+      json_array("links", map_to_strings(std::span<const LinkSummary>{links}, json_link)),
+      json_array("ops", map_to_strings(std::span<const OpSummary>{ops}, json_op)),
+      json_array("slo", map_to_strings(slos, json_slo))};
+  if (summary.faults().empty()) return lines;
+  // The faults array, last and only with faults: a report without them is what it was before.
+  std::vector<std::string> faults;
+  for (const auto& block : summary.faults()) {
+    faults.push_back(json_fault(block, summary.graph().scenario().slos));
+  }
+  lines.push_back(json_array("faults", faults));
+  return lines;
+}
+
+// The lines as one JSON object, a key per line.
+[[nodiscard]] std::string json_document(std::span<const std::string> lines) {
+  return "{\n" + join(lines, ",\n") + "\n}";
+}
+
+// ---- replications (`run --replications`: report.cppm says what the cells and the verdicts are) --
+
+// The band's dash, U+2013 EN DASH in UTF-8: the typographic sign of a range (`1.61–1.63`). Three
+// bytes and one column, which the aligner counts as one (display_width).
+constexpr std::string_view en_dash = "–";
+
+// A cell's number split from its unit: `1.62ms` is 1.62 and `ms`, `0.105` is 0.105 and nothing,
+// `1.5k` is 1.5 and `k`. Empty for a text that does not start with a number (`unavailable`, `-`,
+// `>1s`, `<1us`).
+struct NumberAndUnit {
+  std::string_view number;
+  std::string_view unit;
+};
+
+[[nodiscard]] std::optional<NumberAndUnit> split_unit(std::string_view text) {
+  double ignored{};
+  // std::from_chars (C++17): reads the longest number at the start of the text, locale-free, and
+  // says where it stopped: what follows is the unit the formatters appended.
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), ignored);
+  if (error != std::errc{} || end == text.data()) return std::nullopt;
+  const auto length = static_cast<std::size_t>(end - text.data());
+  return NumberAndUnit{.number = text.substr(0, length), .unit = text.substr(length)};
+}
+
+// 1-based rank of the nearest-rank `percent` quantile of n values: ceil(percent·n / 100), at least
+// 1. Integer arithmetic, so no float rounding can move a rank (0.1 × 10 is not exactly 1 in
+// binary floating point).
+[[nodiscard]] std::size_t nearest_rank(std::size_t percent, std::size_t n) {
+  return std::max<std::size_t>((percent * n + 99) / 100, 1);
+}
+
+// Does a run's value `a` rank before another's `b`? Ascending, and NaN (a run that observed
+// nothing, or a cell of text) after every number.
+[[nodiscard]] bool ranks_before(double a, double b) {
+  return !std::isnan(a) && (std::isnan(b) || a < b);
+}
+
+// The runs' indices in ascending order of their values, equal values in run order.
+[[nodiscard]] std::vector<std::size_t> rank_order(std::span<const double> values) {
+  std::vector<std::size_t> order(values.size());
+  // C++23 std::ranges::iota: fills the range with 0, 1, 2, ..., the range itself instead of
+  // std::iota's begin/end pair.
+  std::ranges::iota(order, std::size_t{0});
+  // std::ranges::stable_sort: stable, so runs with equal values keep their order and a tie always
+  // names the lower seed, whatever the threads did.
+  std::ranges::stable_sort(
+      order, [&](std::size_t a, std::size_t b) { return ranks_before(values[a], values[b]); });
+  return order;
+}
+
+// The median and the 10-90 % band of `values` (one per run), nearest rank (report.cppm).
+[[nodiscard]] Band band_of(std::span<const double> values) {
+  const auto order = rank_order(values);
+  const auto run_at = [&](std::size_t percent) {
+    return order[nearest_rank(percent, order.size()) - 1];
+  };
+  const std::size_t low = run_at(10);
+  const std::size_t middle = run_at(50);
+  const std::size_t high = run_at(90);
+  return Band{.median = values[middle],
+              .low = values[low],
+              .high = values[high],
+              .median_run = middle,
+              .low_run = low,
+              .high_run = high};
+}
+
+// What a run's report is made of, computed once per run: its ops, its nodes and its SLO verdicts.
+struct RunFigures {
+  std::vector<std::vector<OpSummary>> ops{};
+  std::vector<std::vector<NodeSummary>> nodes{};
+  std::vector<std::vector<SloResult>> slos{};
+};
+
+// Throws std::invalid_argument unless every run has the first run's ops, nodes and SLOs: runs of
+// different scenarios cannot be ranked against each other (a programmer error).
+void require_one_scenario(const RunFigures& figures) {
+  for (std::size_t run = 1; run < figures.ops.size(); ++run) {
+    if (figures.ops[run].size() != figures.ops[0].size() ||
+        figures.nodes[run].size() != figures.nodes[0].size() ||
+        figures.slos[run].size() != figures.slos[0].size()) {
+      throw std::invalid_argument{"report: replications of different scenarios"};
+    }
+  }
+}
+
+[[nodiscard]] RunFigures figures_of(std::span<const Summary> runs) {
+  RunFigures figures;
+  for (const auto& run : runs) {
+    figures.ops.push_back(run.ops());
+    figures.nodes.push_back(run.nodes());
+    figures.slos.push_back(evaluate_slos(run, run.graph().scenario().slos));
+  }
+  require_one_scenario(figures);
+  return figures;
+}
+
+// The band of one field of item `index` across the runs (`per_run[r][index].*field`).
+// A pointer to a data member (`double OpSummary::*`, C++98) names a field of a type, not of an
+// object: `item.*field` reads that field of `item`, so one function serves every column.
+template <class Item>
+[[nodiscard]] Band band_across(std::span<const std::vector<Item>> per_run, std::size_t index,
+                               double Item::*field) {
+  std::vector<double> values;
+  for (const auto& run : per_run) values.push_back(run[index].*field);
+  return band_of(values);
+}
+
+[[nodiscard]] OpBands op_bands(std::span<const std::vector<OpSummary>> ops, std::size_t i) {
+  const auto band = [&](double OpSummary::*field) { return band_across(ops, i, field); };
+  return OpBands{.client = ops.front()[i].client,
+                 .op = ops.front()[i].op,
+                 .offered_per_s = band(&OpSummary::offered_per_s),
+                 .attempts_per_s = band(&OpSummary::attempts_per_s),
+                 .answered_per_s = band(&OpSummary::answered_per_s),
+                 .timed_out_per_s = band(&OpSummary::timed_out_per_s),
+                 .timed_out_attempts_per_s = band(&OpSummary::timed_out_attempts_per_s),
+                 .mean_s = band(&OpSummary::mean_s),
+                 .p50_s = band(&OpSummary::p50_s),
+                 .p95_s = band(&OpSummary::p95_s),
+                 .p99_s = band(&OpSummary::p99_s)};
+}
+
+// The band of a field only some node types have (a message queue's peak lag, a worker pool's dead
+// letters) across the runs; none for another node (no run has one).
+[[nodiscard]] std::optional<Band> optional_band(std::span<const std::vector<NodeSummary>> nodes,
+                                                std::size_t i,
+                                                std::optional<double> NodeSummary::*field) {
+  if (!(nodes.front()[i].*field)) return std::nullopt;
+  std::vector<double> values;
+  for (const auto& run : nodes) values.push_back((run[i].*field).value_or(text_cell));
+  return band_of(values);
+}
+
+[[nodiscard]] NodeBands node_bands(std::span<const std::vector<NodeSummary>> nodes, std::size_t i) {
+  const auto band = [&](double NodeSummary::*field) { return band_across(nodes, i, field); };
+  // C++20 std::ranges::count_if: counts over the whole range, replacing a begin/end pair.
+  const auto unavailable = std::ranges::count_if(
+      nodes, [&](const std::vector<NodeSummary>& run) { return run[i].unavailable; });
+  return NodeBands{
+      .id = nodes.front()[i].id,
+      .mean_rho = band(&NodeSummary::mean_rho),
+      .peak_rho = band(&NodeSummary::peak_rho),
+      .peak_backlog = band(&NodeSummary::peak_backlog),
+      .dropped = band(&NodeSummary::total_dropped),
+      .rejected = band(&NodeSummary::total_rejected),
+      .red_s = band(&NodeSummary::red_time_s),
+      .dead_lettered_per_s = optional_band(nodes, i, &NodeSummary::mean_dead_lettered_per_s),
+      .peak_queue_lag_s = optional_band(nodes, i, &NodeSummary::peak_queue_lag_s),
+      .unavailable_in = static_cast<std::size_t>(unavailable)};
+}
+
+// SLO `j` across the runs: its median run is the run of the median observed value (a run that
+// observed nothing ranks last), and the replicated verdict is that run's.
+[[nodiscard]] SloReplication slo_replication(std::span<const std::vector<SloResult>> slos,
+                                             std::size_t j) {
+  std::vector<double> observed;
+  std::size_t passes = 0;
+  for (const auto& run : slos) {
+    observed.push_back(run[j].observed.value_or(text_cell));
+    if (run[j].status == SloStatus::pass) ++passes;
+  }
+  const std::size_t median_run = band_of(observed).median_run;
+  return SloReplication{
+      .result = slos[median_run][j], .passes_in = passes, .median_run = median_run};
+}
+
+// The run that stands for all (ReplicationSummary::median_run): the first SLO's median run, else
+// the first op's mean latency's, else the middle seed.
+[[nodiscard]] std::size_t standing_run(const ReplicationSummary& replicated) {
+  if (!replicated.slos.empty()) return replicated.slos.front().median_run;
+  if (!replicated.ops.empty()) return replicated.ops.front().mean_s.median_run;
+  return nearest_rank(50, replicated.seeds.size()) - 1;
+}
+
+// The median run's Summary; `runs` must be the runs `replicated` summarises.
+[[nodiscard]] const Summary& median_summary(const ReplicationSummary& replicated,
+                                            std::span<const Summary> runs) {
+  if (runs.size() != replicated.seeds.size()) {
+    throw std::invalid_argument{"report: the runs are not the replications summarised"};
+  }
+  return runs[replicated.median_run];
+}
+
+// ---- replications: the table ----
+
+// The runs' numbers in one cell of one table.
+[[nodiscard]] std::vector<double> cell_numbers(std::span<const TableParts> runs, std::size_t row,
+                                               std::size_t cell) {
+  std::vector<double> numbers;
+  for (const auto& run : runs) numbers.push_back(run.numbers[row][cell]);
+  return numbers;
+}
+
+[[nodiscard]] bool is_text(double number) {
+  return std::isnan(number);
+}
+
+// A cell that prints text in every run: that text when every run printed the same (a name, a
+// client's `-`); else the first mark that is not blank and how many runs printed it (`unavailable
+// in 2 of 5`), the one text cell that varies.
+[[nodiscard]] Cell text_band(std::span<const TableParts> runs, std::size_t row, std::size_t cell) {
+  const std::string* mark = nullptr;
+  for (const auto& run : runs) {
+    const auto& text = run.rows[row][cell].text;
+    if (!text.empty() && mark == nullptr) mark = &text;
+  }
+  const auto& first = runs.front().rows[row][cell];
+  if (mark == nullptr) return first;
+  std::size_t shown = 0;
+  for (const auto& run : runs) {
+    if (run.rows[row][cell].text == *mark) ++shown;
+  }
+  if (shown == runs.size()) return first;
+  return {*mark + " in " + std::to_string(shown) + " of " + std::to_string(runs.size())};
+}
+
+// A cell across the runs: format_band of the texts the median, the 10 % and the 90 % runs printed
+// in it (each run's own text, so a `>1s` or a `-` shows as that run printed it), coloured as the
+// median run's.
+[[nodiscard]] Cell banded_cell(std::span<const TableParts> runs, std::size_t row,
+                               std::size_t cell) {
+  const auto numbers = cell_numbers(runs, row, cell);
+  if (std::ranges::all_of(numbers, is_text)) return text_band(runs, row, cell);
+  const Band band = band_of(numbers);
+  const Cell& median = runs[band.median_run].rows[row][cell];
+  return {format_band(median.text, runs[band.low_run].rows[row][cell].text,
+                      runs[band.high_run].rows[row][cell].text),
+          median.colour};
+}
+
+// Throws std::invalid_argument unless every run's table has the first one's rows and cells.
+void require_same_shape(std::span<const TableParts> runs) {
+  for (const auto& run : runs) {
+    bool same = run.rows.size() == runs.front().rows.size();
+    for (std::size_t row = 0; same && row < run.rows.size(); ++row) {
+      same = run.rows[row].size() == runs.front().rows[row].size();
+    }
+    if (!same) throw std::invalid_argument{"report: replications of different scenarios"};
+  }
+}
+
+// One table of every run made one: the same header, each cell banded across the runs.
+[[nodiscard]] TableParts banded_parts(std::span<const TableParts> runs) {
+  require_same_shape(runs);
+  TableParts banded{.header = runs.front().header};
+  for (std::size_t row = 0; row < runs.front().rows.size(); ++row) {
+    Row cells;
+    for (std::size_t cell = 0; cell < runs.front().rows[row].size(); ++cell) {
+      cells.push_back(banded_cell(runs, row, cell));
+    }
+    banded.add(std::move(cells), runs.front().numbers[row]);
+  }
+  return banded;
+}
+
+// `build(run)` for every run, banded.
+template <class Build>
+[[nodiscard]] TableParts banded_over(std::span<const Summary> runs, const Build& build) {
+  std::vector<TableParts> per_run;
+  for (const auto& run : runs) per_run.push_back(build(run));
+  return banded_parts(per_run);
+}
+
+// The node, link, database and op tables of a run, every number a band.
+[[nodiscard]] std::string banded_tables(std::span<const Summary> runs, bool color) {
+  const auto nodes = [&](const Summary& run) { return node_parts(run, color); };
+  const auto links = [&](const Summary& run) { return link_parts(run, color); };
+  return table_text(node_title, banded_over(runs, nodes)) +
+         table_text_if_any(link_title, banded_over(runs, links)) +
+         table_text_if_any(replication_title, banded_over(runs, replication_parts)) +
+         table_text(op_title, banded_over(runs, op_parts));
+}
+
+// What the cells are, and which seed the median run is.
+[[nodiscard]] std::string replications_intro(const ReplicationSummary& replicated) {
+  const auto& seeds = replicated.seeds;
+  return "replications: " + std::to_string(seeds.size()) + " runs, seeds " +
+         std::to_string(seeds.front()) + ".." + std::to_string(seeds.back()) +
+         "; a cell is the median across the runs [its 10" + std::string{en_dash} +
+         "90 % band], nearest rank\n" + "median run: seed " +
+         std::to_string(seeds[replicated.median_run]) +
+         " (the line below and the fault blocks are its own)\n";
+}
+
+// `PASS in 3 of 5`: the median run passed, as did 3 of the 5 runs. `FAIL (passed in 2 of 5)`: the
+// median run failed, 2 runs passed. The count is always of the runs that passed.
+[[nodiscard]] Cell replicated_status_cell(const SloReplication& slo, std::size_t runs, bool color) {
+  Cell cell = status_cell(slo.result.status, color);
+  const std::string count = std::to_string(slo.passes_in) + " of " + std::to_string(runs);
+  cell.text += slo.result.status == SloStatus::pass ? " in " + count : " (passed in " + count + ")";
+  return cell;
+}
+
+[[nodiscard]] std::string replicated_slo_table(const ReplicationSummary& replicated, bool color) {
+  if (replicated.slos.empty()) return {};
+  std::vector<Row> rows{slo_header()};
+  for (const auto& slo : replicated.slos) {
+    rows.push_back(
+        slo_row(slo.result, replicated_status_cell(slo, replicated.seeds.size(), color)));
+  }
+  return "slo (each: its median run's verdict and observed value, and the runs that passed it)\n" +
+         aligned(rows, Align::all_left);
+}
+
+// ---- replications: the JSON ----
+
+// `"name": [v0, v1, ...]`, one entry per seed.
+[[nodiscard]] std::string json_per_seed(std::string_view name,
+                                        std::span<const std::string> values) {
+  return json_field(name, "[" + join(values, ", ") + "]");
+}
+
+// `"name": [ ... ]` nested at `indent`, one object per line.
+[[nodiscard]] std::string json_nested_array(std::string_view name,
+                                            std::span<const std::string> objects,
+                                            const std::string& indent) {
+  if (objects.empty()) return indent + json_field(name, "[]");
+  const std::string inner = indent + "  ";
+  return indent +
+         json_field(name, "[\n" + inner + join(objects, ",\n" + inner) + "\n" + indent + "]");
+}
+
+// The numbers of json_op, in its order, and whether each is a latency (null when nothing was
+// answered, as json_op writes it).
+struct OpNumber {
+  std::string_view name;
+  double OpSummary::*field;
+  bool latency;
+};
+constexpr std::array op_numbers{
+    OpNumber{"offered_per_s", &OpSummary::offered_per_s, false},
+    OpNumber{"attempts_per_s", &OpSummary::attempts_per_s, false},
+    OpNumber{"answered_per_s", &OpSummary::answered_per_s, false},
+    OpNumber{"timed_out_per_s", &OpSummary::timed_out_per_s, false},
+    OpNumber{"timed_out_attempts_per_s", &OpSummary::timed_out_attempts_per_s, false},
+    OpNumber{"mean_s", &OpSummary::mean_s, true},
+    OpNumber{"p50_s", &OpSummary::p50_s, true},
+    OpNumber{"p95_s", &OpSummary::p95_s, true},
+    OpNumber{"p99_s", &OpSummary::p99_s, true}};
+
+[[nodiscard]] std::string json_op_per_seed(std::span<const std::vector<OpSummary>> ops,
+                                           std::size_t i) {
+  std::vector<std::string> fields{json_field("client", json_string(ops.front()[i].client)),
+                                  json_field("op", json_string(ops.front()[i].op))};
+  for (const auto& number : op_numbers) {
+    std::vector<std::string> values;
+    for (const auto& run : ops) {
+      const auto& op = run[i];
+      values.push_back(number.latency && nothing_answered(op) ? "null"
+                                                              : json_number(op.*number.field));
+    }
+    fields.push_back(json_per_seed(number.name, values));
+  }
+  return json_object(fields);
+}
+
+// One node's numbers per seed, in json_node's order: each a list with an entry per seed, written as
+// json_node writes it (a number; null where an optional field has none, as it is for the node types
+// that do not have it).
+[[nodiscard]] std::string json_node_per_seed(std::span<const std::vector<NodeSummary>> nodes,
+                                             std::size_t i) {
+  const auto plain = [&](std::string_view name, double NodeSummary::*field) {
+    std::vector<std::string> values;
+    for (const auto& run : nodes) values.push_back(json_number(run[i].*field));
+    return json_per_seed(name, values);
+  };
+  const auto optional = [&](std::string_view name, std::optional<double> NodeSummary::*field) {
+    std::vector<std::string> values;
+    for (const auto& run : nodes) values.push_back(json_optional_number(run[i].*field));
+    return json_per_seed(name, values);
+  };
+  std::vector<std::string> unavailable;
+  for (const auto& run : nodes) unavailable.emplace_back(run[i].unavailable ? "true" : "false");
+  const std::array fields{
+      json_field("id", json_string(nodes.front()[i].id)),
+      plain("mean_rho", &NodeSummary::mean_rho),
+      plain("peak_rho", &NodeSummary::peak_rho),
+      plain("peak_backlog", &NodeSummary::peak_backlog),
+      plain("dropped", &NodeSummary::total_dropped),
+      optional("dead_lettered", &NodeSummary::total_dead_lettered),
+      optional("dead_lettered_per_s", &NodeSummary::mean_dead_lettered_per_s),
+      plain("rejected", &NodeSummary::total_rejected),
+      plain("red_s", &NodeSummary::red_time_s),
+      json_per_seed("unavailable", unavailable),
+      optional("staleness_s", &NodeSummary::mean_staleness_s),
+      optional("replication_dropped_per_s", &NodeSummary::mean_replication_dropped_per_s),
+      optional("committed_writes_per_s", &NodeSummary::mean_committed_writes_per_s),
+      optional("peak_queue_lag_s", &NodeSummary::peak_queue_lag_s)};
+  return json_object(fields);
+}
+
+[[nodiscard]] std::string json_slo_per_seed(std::span<const std::vector<SloResult>> slos,
+                                            std::size_t j) {
+  const auto& slo = slos.front()[j].slo;
+  std::vector<std::string> observed;
+  std::vector<std::string> status;
+  for (const auto& run : slos) {
+    observed.push_back(json_optional_number(run[j].observed));
+    status.push_back(json_string(status_name(run[j].status)));
+  }
+  const std::array fields{json_field("metric", json_string(model::to_string(slo.metric))),
+                          json_field("node", json_optional_string(slo.node)),
+                          json_field("op", json_optional_string(slo.op)),
+                          json_per_seed("observed", observed), json_per_seed("status", status)};
+  return json_object(fields);
+}
+
+// `per_seed`'s three lists, one object per op, node and SLO.
+[[nodiscard]] std::string json_per_seed_lists(const RunFigures& figures) {
+  std::vector<std::string> ops;
+  for (std::size_t i = 0; i < figures.ops.front().size(); ++i) {
+    ops.push_back(json_op_per_seed(figures.ops, i));
+  }
+  std::vector<std::string> nodes;
+  for (std::size_t i = 0; i < figures.nodes.front().size(); ++i) {
+    nodes.push_back(json_node_per_seed(figures.nodes, i));
+  }
+  std::vector<std::string> slos;
+  for (std::size_t j = 0; j < figures.slos.front().size(); ++j) {
+    slos.push_back(json_slo_per_seed(figures.slos, j));
+  }
+  const std::string indent = "      ";
+  return "{\n" + json_nested_array("ops", ops, indent) + ",\n" +
+         json_nested_array("nodes", nodes, indent) + ",\n" +
+         json_nested_array("slo", slos, indent) + "\n    }";
+}
+
+// The `replications` key: the seeds, and every op's, node's and SLO's numbers per seed.
+[[nodiscard]] std::string json_replications(const ReplicationSummary& replicated,
+                                            const RunFigures& figures) {
+  std::vector<std::string> seeds;
+  for (const int seed : replicated.seeds) seeds.push_back(std::to_string(seed));
+  return "  " + json_field("replications",
+                           "{\n    " + json_per_seed("seeds", seeds) + ",\n    " +
+                               json_field("per_seed", json_per_seed_lists(figures)) + "\n  }");
 }
 
 // ---- CSV ----
@@ -1778,35 +2353,67 @@ std::string render_table(const Summary& summary, std::span<const SloResult> slos
          slo_table(slos, color) + fault_blocks(summary);
 }
 
-// With no observed step the drop and reject rates are null: there is no data, not a rate of 0.
 std::string render_json(const Summary& summary, std::span<const SloResult> slos) {
-  const auto nodes = summary.nodes();
-  const auto ops = summary.ops();
-  const auto links = summary.links();
-  const bool observed = summary.observed_steps() > 0;
-  const auto worst = summary.worst_drop_node();
-  const auto worst_rejecting = summary.worst_reject_node();
-  const std::array lines{
-      "  " + json_field("scenario", json_string(summary.scenario_name())),
-      "  " + json_field("steps", std::to_string(summary.observed_steps())),
-      "  " + json_field("drop_rate", observed ? json_number(summary.drop_rate()) : "null"),
-      "  " + json_field("worst_drop_node", worst.empty() ? "null" : json_string(worst)),
-      "  " + json_field("reject_rate", observed ? json_number(summary.reject_rate()) : "null"),
-      "  " + json_field("worst_reject_node",
-                        worst_rejecting.empty() ? "null" : json_string(worst_rejecting)),
-      json_array("nodes", map_to_strings(std::span<const NodeSummary>{nodes}, json_node)),
-      json_array("links", map_to_strings(std::span<const LinkSummary>{links}, json_link)),
-      json_array("ops", map_to_strings(std::span<const OpSummary>{ops}, json_op)),
-      json_array("slo", map_to_strings(slos, json_slo))};
-  if (summary.faults().empty()) return "{\n" + join(lines, ",\n") + "\n}";
-  // The faults array, last and only with faults: a report without them is what it was before.
-  std::vector<std::string> with_faults{lines.begin(), lines.end()};
-  std::vector<std::string> faults;
-  for (const auto& block : summary.faults()) {
-    faults.push_back(json_fault(block, summary.graph().scenario().slos));
+  return json_document(json_report_lines(summary, slos));
+}
+
+// ---- replications ----
+
+ReplicationSummary summarize_replications(std::span<const Summary> runs,
+                                          std::span<const int> seeds) {
+  if (runs.empty() || seeds.size() != runs.size()) {
+    throw std::invalid_argument{"report::summarize_replications: one seed per run, at least one"};
   }
-  with_faults.push_back(json_array("faults", faults));
-  return "{\n" + join(with_faults, ",\n") + "\n}";
+  const RunFigures figures = figures_of(runs);
+  ReplicationSummary replicated{.seeds = {seeds.begin(), seeds.end()}};
+  for (std::size_t i = 0; i < figures.ops.front().size(); ++i) {
+    replicated.ops.push_back(op_bands(figures.ops, i));
+  }
+  for (std::size_t i = 0; i < figures.nodes.front().size(); ++i) {
+    replicated.nodes.push_back(node_bands(figures.nodes, i));
+  }
+  for (std::size_t j = 0; j < figures.slos.front().size(); ++j) {
+    replicated.slos.push_back(slo_replication(figures.slos, j));
+  }
+  replicated.median_run = standing_run(replicated);
+  return replicated;
+}
+
+std::vector<SloResult> replicated_verdicts(const ReplicationSummary& replicated) {
+  std::vector<SloResult> verdicts;
+  for (const auto& slo : replicated.slos) verdicts.push_back(slo.result);
+  return verdicts;
+}
+
+std::string format_band(std::string_view median, std::string_view low, std::string_view high) {
+  if (low == median && high == median) return std::string{median};
+  const auto m = split_unit(median);
+  const auto l = split_unit(low);
+  const auto h = split_unit(high);
+  const bool one_unit = m && l && h && l->unit == m->unit && h->unit == m->unit;
+  const auto low_text = one_unit ? l->number : low;
+  const auto high_text = one_unit ? h->number : high;
+  return std::string{median} + " [" + std::string{low_text} + std::string{en_dash} +
+         std::string{high_text} + "]";
+}
+
+// A run with no observed step has no figures to band: the summary line, the replicated SLO
+// verdicts (all skipped) and the faults, as render_table prints such a run.
+std::string render_replications_table(const ReplicationSummary& replicated,
+                                      std::span<const Summary> runs, bool color) {
+  const Summary& median = median_summary(replicated, runs);
+  const std::string head = replications_intro(replicated) + table_header(median);
+  const std::string verdicts = replicated_slo_table(replicated, color) + fault_blocks(median);
+  if (median.observed_steps() == 0) return head + verdicts;
+  return head + banded_tables(runs, color) + verdicts;
+}
+
+std::string render_replications_json(const ReplicationSummary& replicated,
+                                     std::span<const Summary> runs) {
+  const Summary& median = median_summary(replicated, runs);
+  auto lines = json_report_lines(median, replicated_verdicts(replicated));
+  lines.push_back(json_replications(replicated, figures_of(runs)));
+  return json_document(lines);
 }
 
 double op_latency_s(const OpSummary& op, OpLatency column) {

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -156,4 +157,23 @@ TEST_CASE("one replication is the plain run of that seed") {
   const auto replications = simsys::session::run_replications(g, 5, 1, 1);
   REQUIRE(replications.size() == 1);
   REQUIRE(rendered(replications[0]) == rendered(plain_run(g)));
+}
+
+TEST_CASE("the replication seeds count up from the first one") {
+  CHECK(simsys::session::replication_seeds(7, 3) == std::vector<int>{7, 8, 9});
+  CHECK(simsys::session::replication_seeds(-1, 3) == std::vector<int>{-1, 0, 1});
+  CHECK(simsys::session::replication_seeds(1, 0).empty());
+}
+
+TEST_CASE("the replication seeds wrap around past the largest int instead of overflowing") {
+  // Signed overflow is undefined behaviour; the seeds are counted in unsigned arithmetic and
+  // converted back, which C++20 defines as modular.
+  constexpr int largest = std::numeric_limits<int>::max();
+  CHECK(simsys::session::replication_seeds(largest, 2) ==
+        std::vector<int>{largest, std::numeric_limits<int>::min()});
+}
+
+TEST_CASE("a scenario has rate noise when some client's rate has a noise block") {
+  CHECK(simsys::session::has_rate_noise(graph_of(noisy(1))));
+  CHECK_FALSE(simsys::session::has_rate_noise(graph_of(noiseless(1))));
 }

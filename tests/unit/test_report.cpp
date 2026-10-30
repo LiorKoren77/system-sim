@@ -3574,3 +3574,45 @@ TEST_CASE("a scenario without SLOs has no SLO replications") {
   const Runs runs{five_demands};
   CHECK(simsys::report::summarize_replications(runs.summaries, five_seeds).slos.empty());
 }
+
+// ---- How a band is printed (format_band): the implementer's decision, pinned
+// ---------------------
+//
+// The median's text, then the band's ends in brackets with an en dash. The ends drop their unit
+// when both share the median's, and keep it, both of them, when either does not: a bare number in
+// the brackets is always in the median's unit. Three equal texts print once.
+
+TEST_CASE("a band whose ends share the median's unit prints the ends without it") {
+  CHECK(simsys::report::format_band("5.69ms", "5.64ms", "5.75ms") == "5.69ms [5.64–5.75]");
+  CHECK(simsys::report::format_band("0.105", "0.0938", "0.112") == "0.105 [0.0938–0.112]");
+  CHECK(simsys::report::format_band("1.5k", "1.4k", "1.6k") == "1.5k [1.4–1.6]");
+}
+
+TEST_CASE("a band with an end in another unit prints both ends with their units") {
+  CHECK(simsys::report::format_band("1.2ms", "998us", "1.4ms") == "1.2ms [998us–1.4ms]");
+  CHECK(simsys::report::format_band("999", "998", "1k") == "999 [998–1k]");
+}
+
+TEST_CASE("a band with an end that is no number prints both ends whole") {
+  CHECK(simsys::report::format_band("1.2ms", "1.1ms", "unavailable") ==
+        "1.2ms [1.1ms–unavailable]");
+  CHECK(simsys::report::format_band("1s", "900ms", ">1s") == "1s [900ms–>1s]");
+}
+
+TEST_CASE("a band whose three texts are the same prints one value") {
+  CHECK(simsys::report::format_band("0", "0", "0") == "0");
+  CHECK(simsys::report::format_band("-", "-", "-") == "-");
+  CHECK(simsys::report::format_band("1.62ms", "1.62ms", "1.62ms") == "1.62ms");
+}
+
+TEST_CASE("the aligner counts the band's en dash as one column, not three bytes") {
+  // Two right-aligned cells of the same width on screen, one with an en dash (3 bytes in UTF-8):
+  // padded by bytes, the dashed one would sit two columns to the left.
+  const std::vector<std::vector<std::string>> rows{
+      {"a", "1.62ms [1.61–1.63]"}, {"b", "1.62ms [1.61-1.63]"}, {"c", "0"}};
+  const auto text = simsys::report::align_columns(rows, "");
+  CHECK(text ==
+        "a  1.62ms [1.61–1.63]\n"
+        "b  1.62ms [1.61-1.63]\n"
+        "c                   0\n");
+}

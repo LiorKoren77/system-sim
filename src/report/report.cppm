@@ -468,6 +468,123 @@ class Summary {
 [[nodiscard]] std::string align_columns(std::span<const std::vector<std::string>> rows,
                                         std::string_view indent);
 
+// ---- replications: one scenario run over several seeds of its rate noise (`run --replications`)
+//
+// Why: session::run_replications (session.cpp) says what replications are for; here is how N runs
+// become one report. Every number a run's tables print becomes, across the runs, its median and
+// its 10-90 % band, and every SLO the verdict of its median run with the number of runs it passed
+// in.
+//
+// The quantile rule is NEAREST-RANK: the p-quantile of n sorted values is the value of rank
+// ceil(p·n), counted from 1. For n = 5 the 10 % quantile is the 1st value, the median the 3rd and
+// the 90 % quantile the 5th: the band is the smallest and the largest run. For even n the median is
+// the lower of the two middle values (n = 10: the 5th). Why nearest rank and not an interpolation
+// between two runs: with the handful of runs a replication has (5, 10, 20), an interpolated median
+// is a number no run printed, and its digits would claim a precision five samples cannot give. A
+// value of rank k is always some run's own number, so the median run can be named and its report
+// shown (the JSON around `replications`, the fault blocks, each SLO's observed value).
+// What this deliberately is not: a confidence interval. The band says how far the runs made spread,
+// not where the true mean lies with 90 % confidence (that needs a t-distribution or batch means
+// over many more runs).
+
+// One number across the runs: its median and its 10-90 % band by the nearest-rank rule, and
+// which run holds each of the three (indexes into the runs). Runs with equal values keep their
+// order, so the ranks, and the runs named, do not depend on anything but the values.
+struct Band {
+  double median{};
+  double low{};   // the 10 % quantile
+  double high{};  // the 90 % quantile
+  std::size_t median_run{};
+  std::size_t low_run{};
+  std::size_t high_run{};
+};
+
+// One (client, op): the op table's numbers across the runs (OpSummary's fields of the same names).
+struct OpBands {
+  std::string client{};
+  std::string op{};
+  Band offered_per_s{};
+  Band attempts_per_s{};
+  Band answered_per_s{};
+  Band timed_out_per_s{};
+  Band timed_out_attempts_per_s{};
+  Band mean_s{};
+  Band p50_s{};
+  Band p95_s{};
+  Band p99_s{};
+};
+
+// One node: the node table's numbers across the runs (NodeSummary's fields), `dead_lettered_per_s`
+// only for a worker pool, `peak_queue_lag_s` only for a message queue, and in how many runs the
+// node was unavailable at some step.
+struct NodeBands {
+  std::string id{};
+  Band mean_rho{};
+  Band peak_rho{};
+  Band peak_backlog{};
+  Band dropped{};
+  Band rejected{};
+  Band red_s{};
+  std::optional<Band> dead_lettered_per_s{};
+  std::optional<Band> peak_queue_lag_s{};
+  std::size_t unavailable_in{};
+};
+
+// One SLO across the runs: the verdict of its MEDIAN RUN, the run whose observed value for this
+// SLO is the median of the runs' observed values (a run that observed nothing ranks last), and the
+// number of runs that passed it. A replicated SLO passes when its median run passes: "half the
+// afternoons or more meet it", whatever the few that do not.
+struct SloReplication {
+  SloResult result{};
+  std::size_t passes_in{};
+  std::size_t median_run{};
+};
+
+// N runs of one scenario summarised. `seeds[k]` is run k's seed. `median_run` is the run whose
+// report stands for all of them where one run's figures are needed (the JSON around
+// `replications`, the table's summary line and its fault blocks): the first SLO's median run, so
+// that its verdict, its observed value and the report around them come from one run; without SLOs
+// the median run of the first op's mean latency; without either, the middle seed's.
+struct ReplicationSummary {
+  std::vector<int> seeds{};
+  std::vector<OpBands> ops{};
+  std::vector<NodeBands> nodes{};
+  std::vector<SloReplication> slos{};
+  std::size_t median_run{};
+};
+
+// `runs[k]` is the run of `seeds[k]`; every run must be of the same scenario (the same nodes, ops
+// and SLOs): a mismatch, no run, or a seed count other than the run count is a programmer error,
+// std::invalid_argument. The SLOs are each run's evaluate_slos of its scenario's SLOs.
+[[nodiscard]] ReplicationSummary summarize_replications(std::span<const Summary> runs,
+                                                        std::span<const int> seeds);
+
+// Each SLO's replicated verdict (SloReplication::result), in the scenario's order: what all_pass
+// turns into `run --replications`' exit code.
+[[nodiscard]] std::vector<SloResult> replicated_verdicts(const ReplicationSummary& replicated);
+
+// A table cell across the runs: the median's text, then the band's ends in brackets with an en
+// dash, `1.62ms [1.61–1.63]`. The ends leave out their unit when both have the median's
+// (`5.69ms [5.64–5.75]`, `0.105 [0.0938–0.112]`); when either is in another unit, or is no number
+// at all, both ends are printed whole (`1.2ms [998us–1.4ms]`, `1.2ms [1.1ms–unavailable]`), so a
+// bare number in the brackets always has the median's unit. When the three texts are the same the
+// cell is that text alone (`0`, `-`): a band that prints as one value says nothing more.
+[[nodiscard]] std::string format_band(std::string_view median, std::string_view low,
+                                      std::string_view high);
+
+// For people: two lines saying what the cells are and which seed is the median run, the median
+// run's summary line, the node, link, database and op tables of a run with every number a
+// format_band cell, the SLO table with `PASS in 3 of 5` or `FAIL (passed in 2 of 5)` and each
+// SLO's median run's observed value, and the median run's fault blocks (scripted faults are the
+// same in every run). `runs` are the runs summarize_replications summarised.
+[[nodiscard]] std::string render_replications_table(const ReplicationSummary& replicated,
+                                                    std::span<const Summary> runs, bool color);
+// For programs: the median run's JSON report with the replicated SLO verdicts, and one more key,
+// `replications`: `seeds` and `per_seed`, where each op's, node's and SLO's numbers are lists with
+// one entry per seed, each written exactly as that seed's own `run --report json` writes it.
+[[nodiscard]] std::string render_replications_json(const ReplicationSummary& replicated,
+                                                   std::span<const Summary> runs);
+
 // `simsys explain`: every resolved number with its provenance, the links, the step order
 // and a static load check (offered load vs capacity, no queueing).
 [[nodiscard]] std::string render_explain(const graph::Graph& g);

@@ -1,6 +1,7 @@
 // Module `simsys.sweep`, implementation unit: the `--param` and `--metric` grammars, the two
 // phases of a sweep (load every point, then simulate every point) on worker threads, and the two
-// renderings. <thread> and <atomic> are included here and nowhere else (docs/study/threads.md).
+// renderings. The worker threads are session::run_in_parallel's (session.cpp,
+// docs/study/threads.md); <thread> is included here only for default_jobs.
 //
 // Numbers are written with std::to_chars (simsys::to_chars_text), never with a std::format width or
 // precision: this unit imports simsys.core, whose <chrono> brings <format>, and GCC 14.2 then
@@ -9,12 +10,11 @@
 module;
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <expected>
-#include <functional>
+#include <functional>  // std::function: session::run_in_parallel's parameter
 #include <limits>
 #include <optional>
 #include <span>
@@ -447,40 +447,8 @@ std::expected<Measured, std::string> measure_point(const std::string& path, cons
 
 // ---- the points in parallel --------------------------------------------------------------------
 
-// One worker: takes the next unclaimed index until none is left. fetch_add returns the old value
-// and increments in one indivisible step, so no two workers ever get the same index and none is
-// skipped, without a lock.
-void pull_indices(std::atomic<std::size_t>& next, std::size_t count,
-                  const std::function<void(std::size_t)>& work) {
-  for (auto index = next.fetch_add(1); index < count; index = next.fetch_add(1)) work(index);
-}
-
-// Calls work(0) ... work(count - 1), each exactly once, on `jobs` threads (at least 1, at most
-// one per index), and returns when all are done.
-// Pattern: Thread pool / work queue — a fixed set of workers pulls tasks from one shared queue;
-// the queue here is just an atomic counter over the indices 0..count-1, since the tasks are known
-// up front and need no other state. A worker that finishes a short point takes the next one, so a
-// slow point does not hold back a whole share of them (as a static split into `jobs` slices
-// would). The pool lives for one phase only: its workers start here and are joined before this
-// function returns, so each phase of a sweep (load every point, then run every point) gets a
-// fresh pool; nothing is submitted to it later, unlike a long-lived pool of a server.
-void run_in_parallel(std::size_t count, std::size_t jobs,
-                     const std::function<void(std::size_t)>& work) {
-  // C++11 std::atomic<T>: a value that threads read and modify without a data race; fetch_add is
-  // one indivisible read-modify-write. A plain std::size_t incremented by several threads would
-  // be a data race: undefined behaviour, in practice two workers running one point.
-  std::atomic<std::size_t> next{0};
-  // C++20 std::jthread: a std::thread that joins in its destructor (and carries a stop_token).
-  // A std::thread still joinable at destruction calls std::terminate, so every exit path had to
-  // join by hand; here leaving the scope is the join. The joins also publish each worker's
-  // writes to this thread: everything a worker did happens-before its join returns.
-  std::vector<std::jthread> workers;
-  const auto threads = std::clamp<std::size_t>(jobs, 1, std::max<std::size_t>(count, 1));
-  workers.reserve(threads);
-  for (std::size_t t = 0; t < threads; ++t) {
-    workers.emplace_back(pull_indices, std::ref(next), count, std::cref(work));
-  }
-}  // the jthreads join here
+// The worker pool is session::run_in_parallel (simsys.session), shared with `run --replications`:
+// each phase of a sweep (load every point, then run every point) hands it the point indices.
 
 // What a phase produced for every point: a value, or the message of its failure. Slot i is
 // written only by the worker that claimed index i, and only read after the joins: distinct
@@ -515,7 +483,8 @@ struct PerPoint {
 template <typename T, typename Stage>
 PerPoint<T> for_each_point(std::size_t count, std::size_t jobs, const Stage& stage) {
   PerPoint<T> results{count};
-  run_in_parallel(count, jobs, [&](std::size_t index) { results.store(index, stage(index)); });
+  session::run_in_parallel(count, jobs,
+                           [&](std::size_t index) { results.store(index, stage(index)); });
   return results;
 }
 

@@ -141,6 +141,12 @@ class Simulation {
   // Pattern: Static factory (named constructor) — `create` validates first, then calls
   // the private constructor, so a Simulation over an unsupported graph cannot exist.
   [[nodiscard]] static std::expected<Simulation, graph::EngineError> create(const graph::Graph& g);
+  // The same with the clients' noise seeded from `seed` instead of the scenario's: what `run
+  // --replications` runs once per seed (session::run_replications). The graph does not depend on
+  // the seed (only the clients' noise reads it), so N seeds share one graph, and the Summary of
+  // every replication names the caller's `g`.
+  [[nodiscard]] static std::expected<Simulation, graph::EngineError> create(const graph::Graph& g,
+                                                                            int seed);
 
   // Advances every node by `dt` from simulated time `now`. `dt` must be the scenario's
   // step: Graph sized every delay line in steps of it, so another dt would silently
@@ -376,13 +382,13 @@ class Simulation {
   // importer that copied a Simulation got undefined references to its implicit special members
   // under GCC 14, before the copy was deleted); callers only move.
   // `scripted`: the scenario's faults, their log and the twin; `stripped`: the twin itself, the
-  // scenario as if it had no faults.
+  // scenario as if it had no faults. `seed` seeds the clients' noise (create's), the twin's too.
   enum class Faults { scripted, stripped };
-  explicit Simulation(const graph::Graph& g, Faults faults = Faults::scripted);
-  void add_faults(const graph::Graph& g);
+  Simulation(const graph::Graph& g, int seed, Faults faults = Faults::scripted);
+  void add_faults(const graph::Graph& g, int seed);
   void require_valid(const RunOptions& options) const;
   void require_scenario_step(SimTime dt) const;
-  [[nodiscard]] static Node make_node(const graph::Graph& g, std::size_t index);
+  [[nodiscard]] static Node make_node(const graph::Graph& g, std::size_t index, int seed);
   [[nodiscard]] static Node make_server(behaviours::Behaviour behaviour,
                                         const graph::ResolvedNode& resolved);
   [[nodiscard]] static CopyGroup independent_copies(const graph::ResolvedNode& resolved);
@@ -907,6 +913,10 @@ flow::Flow DelayLine::pop() {
 // (ws_gateway, service_discovery, notification_fanout, frontier), the types whose row in
 // model::node_type_table does not say `runs` (model::simulated).
 std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Graph& g) {
+  return create(g, g.scenario().seed);
+}
+
+std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Graph& g, int seed) {
   for (const auto& node : g.nodes()) {
     if (model::simulated(node.spec.type)) continue;
     // C++23 std::unexpected<E>: wraps an error so it converts to the error side of a
@@ -924,15 +934,15 @@ std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Gr
   if (auto refused = fault_not_runnable(g)) {
     return std::unexpected{graph::EngineError{std::move(*refused)}};
   }
-  return Simulation{g};
+  return Simulation{g, seed};
 }
 
 // Copies what a step needs out of the graph, so the Simulation does not outlive a
 // reference to it. The twin (Faults::stripped) stops before the faults: it steps every node in the
 // identity condition, as a scenario without `faults:` would.
-Simulation::Simulation(const graph::Graph& g, Faults faults)
+Simulation::Simulation(const graph::Graph& g, int seed, Faults faults)
     : order_{g.topological_order().begin(), g.topological_order().end()}, step_{g.scenario().step} {
-  for (std::size_t i = 0; i < g.nodes().size(); ++i) nodes_.push_back(make_node(g, i));
+  for (std::size_t i = 0; i < g.nodes().size(); ++i) nodes_.push_back(make_node(g, i, seed));
   // C++20 designated initializers: `Link{.line = ...}` names the member it sets and leaves
   // the others at their defaults, replacing positional braces where a reader must count
   // members against the struct (and same-typed doubles, as in CopyGroup, could swap silently).
@@ -947,20 +957,21 @@ Simulation::Simulation(const graph::Graph& g, Faults faults)
   connect_retrying_callers(g);
   register_reachable_ops(g);
   if (faults == Faults::stripped || g.scenario().faults.empty()) return;  // the run before faults
-  add_faults(g);
+  add_faults(g, seed);
 }
 
 // The scenario's faults: their schedule, the cuts a dc_down makes, the log of what each costs, and
 // the fault-free twin it is measured against (FaultRecord's header), stepped by `step` with this
 // one. Last in the constructor: a flush's read rate is a settle of this very simulation
 // (reads_at_flushes). The twin is built inside the class (its constructor is private) and moved
-// into its vector.
-void Simulation::add_faults(const graph::Graph& g) {
+// into its vector, with this run's seed: the twin's clients draw the same noise, so the only
+// difference between the two runs is the faults.
+void Simulation::add_faults(const graph::Graph& g, int seed) {
   faults_ = FaultSchedule{g, reads_at_flushes(g)};
   connect_cuttable(g);
   fault_log_ = FaultLog{g, faults_, rooms()};
   link_tallies_.assign(links_.size(), FaultLog::LinkTally{});
-  twin_.push_back(Simulation{g, Faults::stripped});
+  twin_.push_back(Simulation{g, seed, Faults::stripped});
   twin_.front().link_tallies_.assign(links_.size(), FaultLog::LinkTally{});
 }
 
@@ -1017,16 +1028,17 @@ std::vector<double> Simulation::reads_at_flushes(const graph::Graph& g) const {
 // failure_rate_of, report_machines, split_writes) for what only one or two node types have, a
 // database's writes, a sink's failures, a kv cluster's machines. That is a type test, the opposite
 // of Strategy; it is kept where the alternative would be a member every other behaviour implements
-// to do nothing. A client's noise seed is client_seed(scenario seed, node index): one random engine
+// to do nothing. A client's noise seed is client_seed(seed, node index), `seed` the scenario's or
+// the replication's (create(g, seed)): one random engine
 // per client, so appending a node at the end of the file never changes another client's noise (the
 // seed is the node index; inserting a node earlier shifts the clients after it; spec §17 entry 3),
 // and `simsys curve --noise` derives the same seed.
-Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index) {
+Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index, int seed) {
   const auto& resolved = g.nodes()[index];
   switch (resolved.spec.type) {
     case model::NodeType::client:
-      return Node{.behaviour = behaviours::ClientBehaviour{
-                      g, index, workload::client_seed(g.scenario().seed, index)}};
+      return Node{.behaviour =
+                      behaviours::ClientBehaviour{g, index, workload::client_seed(seed, index)}};
     case model::NodeType::load_balancer:
       return make_server(behaviours::LoadBalancerBehaviour{g, index}, resolved);
     // A rate limiter's queue is built like any server's from the resolved capacity: for the
