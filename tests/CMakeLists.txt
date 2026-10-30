@@ -38,6 +38,7 @@ add_executable(theory_tests
   theory/test_sinks.cpp
   theory/test_kv.cpp
   theory/test_failed_steps.cpp
+  theory/test_retries.cpp
   theory/test_rho_one.cpp
   theory/test_timeout.cpp
   theory/test_faults.cpp

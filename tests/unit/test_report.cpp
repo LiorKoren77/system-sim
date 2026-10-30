@@ -2599,13 +2599,14 @@ TEST_CASE("the op table prints >200ms for a p99 more than 1 percent of whose req
   const auto table = simsys::report::render_table(summarize(s, g), {}, /*color=*/false);
   CAPTURE(table);
   REQUIRE(table.contains("timed out/s"));
-  // Words of the row: `c.op offered timed_out mean p50 p95 p99`.
+  // Words of the row: `c.op offered attempts timed_out mean p50 p95 p99` (the attempts/s column
+  // sits right after offered/s: phase 3 Task 10).
   const auto row = words_of_line_starting(table, "c.op");
-  REQUIRE(row.size() == 7);
-  REQUIRE(row[2] == "104.8");
-  REQUIRE_FALSE(row[4].starts_with(">"));
-  REQUIRE(row[5] == ">200ms");
+  REQUIRE(row.size() == 8);
+  REQUIRE(row[3] == "104.8");
+  REQUIRE_FALSE(row[5].starts_with(">"));
   REQUIRE(row[6] == ">200ms");
+  REQUIRE(row[7] == ">200ms");
 }
 
 // The p50 that was answered is the client's p50, read off the fit to every DELIVERED request's
@@ -2624,14 +2625,145 @@ TEST_CASE("the p50 behind a 200 ms timeout is the delivered fit's median, 70.71 
   REQUIRE_THAT(ops[0].p50_s, WithinRel(0.1 / std::sqrt(2.0), 1e-9));
 }
 
-// Without a timeout nothing times out, and the op table keeps its old six columns.
+// Without a timeout nothing times out, and the op table has no timed out column: its six old
+// columns and the attempts/s column after offered/s.
 TEST_CASE("the op table has no timed out column when no client has a timeout", "[report]") {
   const auto s = timing_out(std::nullopt);
   const auto g = *simsys::graph::Graph::build(s);
   const auto table = simsys::report::render_table(summarize(s, g), {}, /*color=*/false);
   CAPTURE(table);
   REQUIRE_FALSE(table.contains("timed out"));
-  REQUIRE(words_of_line_starting(table, "c.op").size() == 6);
+  REQUIRE(words_of_line_starting(table, "c.op").size() == 7);
+}
+
+// ---- A client's retries: the attempts/s column, attempts_per_s, and explain's retries=... -------
+//
+// Picture (the theory test's, tests/theory/test_retries.cpp): u sends 1000/s of `call` with
+// `retries: 2` after 100 ms into an external sink that fails half of what it serves (room to
+// spare: 100k/s). At 100 ms steps the attempts per second are 1000, 1500, then 1750 for ever
+// (1 + 0.5 + 0.25 per request), so over a 2 s run of 20 steps the report's average is
+//   (1000 + 1500 + 18 x 1750) / 20 = 34000 / 20 = 1700 attempts per second
+// against 1000 offered per second: the retry storm shows as attempts/s above offered/s.
+
+namespace {
+Scenario retrying_into_a_lossy_sink() {
+  Scenario s{.name = "retrying", .version = 1, .duration = 2s};
+  NodeSpec api{
+      .id = "api", .type = NodeType::external_sink, .capacity = Rate{100'000}, .latency = 1ms};
+  api.failure_rate = 0.5;
+  Workload workload{.curve = {.base = Rate{1000}}, .op_shares = {{"call", 1.0}}};
+  // ASSUMED names: `Workload::retries` (a count) and `Workload::retry_after` (a duration).
+  workload.retries = static_cast<decltype(workload.retries)>(2);
+  workload.retry_after = 100ms;
+  s.nodes = {NodeSpec{.id = "u", .type = NodeType::client, .workload = std::move(workload)},
+             std::move(api)};
+  s.links = {LinkSpec{.from = "u", .to = "api", .latency = 0s}};
+  return s;
+}
+}  // namespace
+
+// The header: the new column right after offered/s, before the (conditional) timed out column.
+TEST_CASE("the op table has an attempts/s column right after offered/s", "[report]") {
+  const auto s = retrying_into_a_lossy_sink();
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto table = simsys::report::render_table(summarize(s, g), {}, /*color=*/false);
+  CAPTURE(table);
+  REQUIRE(words_of_line_starting(table, "client.op") ==
+          std::vector<std::string>{"client.op", "offered/s", "attempts/s", "mean", "p50", "p95",
+                                   "p99", "(estimated)"});
+}
+
+TEST_CASE("the op table's row shows 1k offered and 1.7k attempts for the retrying client",
+          "[report]") {
+  const auto s = retrying_into_a_lossy_sink();
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto table = simsys::report::render_table(summarize(s, g), {}, /*color=*/false);
+  CAPTURE(table);
+  const auto row = words_of_line_starting(table, "u.call");
+  REQUIRE(row.size() == 7);  // u.call offered attempts mean p50 p95 p99
+  REQUIRE(row[1] == "1k");
+  REQUIRE(row[2] == "1.7k");
+}
+
+TEST_CASE("a client without retries has attempts/s equal to offered/s in the table", "[report]") {
+  const auto s = mm1(500);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto table = simsys::report::render_table(summarize(s, g), {}, /*color=*/false);
+  CAPTURE(table);
+  const auto row = words_of_line_starting(table, "c.op");
+  REQUIRE(row.size() == 7);
+  REQUIRE(row[1] == "500");
+  REQUIRE(row[2] == "500");
+}
+
+TEST_CASE("the op summary carries attempts_per_s: 1700 offered 1000 for the retrying client",
+          "[report]") {
+  const auto s = retrying_into_a_lossy_sink();
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto ops = summarize(s, g).ops();
+  REQUIRE(ops.size() == 1);
+  REQUIRE_THAT(ops[0].offered_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(ops[0].attempts_per_s, WithinRel(1700.0, 1e-9));
+}
+
+TEST_CASE("the JSON op has attempts_per_s right after offered_per_s", "[report]") {
+  const auto s = retrying_into_a_lossy_sink();
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto json = simsys::report::render_json(summarize(s, g), {});
+  CAPTURE(json);
+  REQUIRE_THAT(json_value(json, "offered_per_s"), WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(json_value(json, "attempts_per_s"), WithinRel(1700.0, 1e-9));
+  const auto offered_at = json.find("\"offered_per_s\": ");
+  const auto attempts_at = json.find("\"attempts_per_s\": ");
+  const auto answered_at = json.find("\"answered_per_s\": ");
+  REQUIRE(offered_at < attempts_at);
+  REQUIRE(attempts_at < answered_at);
+  // Adjacent: the next key after offered_per_s is attempts_per_s.
+  REQUIRE(json.find(", \"attempts_per_s\": ", offered_at) == json.find(',', offered_at));
+}
+
+TEST_CASE("the JSON op of a client without retries has attempts_per_s equal to offered_per_s",
+          "[report]") {
+  const auto s = mm1(500);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto json = simsys::report::render_json(summarize(s, g), {});
+  CAPTURE(json);
+  REQUIRE(json_value(json, "attempts_per_s") == json_value(json, "offered_per_s"));
+}
+
+// With a timeout the table has both optional-looking columns in the order offered, attempts,
+// timed out (the timed out column is still only there when some client has a timeout).
+TEST_CASE("a client with a timeout has attempts/s before timed out/s in the table", "[report]") {
+  const auto s = timing_out(200ms);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto table = simsys::report::render_table(summarize(s, g), {}, /*color=*/false);
+  CAPTURE(table);
+  REQUIRE(words_of_line_starting(table, "client.op") ==
+          std::vector<std::string>{"client.op", "offered/s", "attempts/s", "timed", "out/s", "mean",
+                                   "p50", "p95", "p99",
+                                   "(estimated)"});  // "timed out/s": two words
+}
+
+// explain prints a client's retries after its op mix: "retries=2 after 100ms". The whole line is
+// pinned (the columns are padded to the widest id and type of the nodes block: c, s and client,
+// service), and the line of a client without retries stays what it was, so every earlier
+// scenario's explain is unchanged.
+TEST_CASE("explain prints retries=2 after 100ms on the client's line", "[report]") {
+  auto s = mm1(1000);
+  s.nodes[0].workload->retries = static_cast<decltype(s.nodes[0].workload->retries)>(2);
+  s.nodes[0].workload->retry_after = 100ms;
+  const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(s));
+  CAPTURE(text);
+  REQUIRE(simsys::test_support::node_line(text, "c") ==
+          "  c  client   dc=main  rate: base 1k/s  ops: op 100%  retries=2 after 100ms");
+}
+
+TEST_CASE("explain prints no retries on the line of a client without them", "[report]") {
+  const auto s = mm1(1000);
+  const auto text = simsys::report::render_explain(*simsys::graph::Graph::build(s));
+  CAPTURE(text);
+  REQUIRE(simsys::test_support::node_line(text, "c") ==
+          "  c  client   dc=main  rate: base 1k/s  ops: op 100%");
 }
 
 // ---- SLOs per window: what the report prints ----

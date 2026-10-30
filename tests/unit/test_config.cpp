@@ -990,6 +990,95 @@ std::string client_with(std::string_view extra) {
 }
 }  // namespace
 
+// ---- A client's retries: how often it sends a lost or timed-out request again --------------
+//
+// `retries: n` (default 0, at most 10) and `retry_after` (a positive duration; absent: 100 ms,
+// defaults::retry_after, CHOSEN and not from the book). `retries` was read and ignored before
+// (it was in the client's key list, the schema said "ignored"); `retry_after` was an unknown key.
+// The refusals are worded like their neighbours: `timeout must be positive`, `replicas must be a
+// positive integer`, `workers must be at most N`, `worker_pool needs workers`.
+
+TEST_CASE("a client's retries and retry_after are typed: 2 retries after 250 ms") {
+  const auto path =
+      write_temp("simsys_retries_typed.yaml", client_with("retries: 2, retry_after: 250ms"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  const auto& workload = s->nodes[0].workload;
+  REQUIRE(workload.has_value());
+  CHECK(workload->retries == 2);
+  CHECK(workload->retry_after == 250ms);
+}
+
+// The default is visible through the model, not only inside the engine: the loader fills it in,
+// so explain and the engine read one number.
+TEST_CASE("a client with retries and no retry_after gets the default of 100 ms") {
+  const auto path = write_temp("simsys_retries_default.yaml", client_with("retries: 1"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  const auto& workload = s->nodes[0].workload;
+  REQUIRE(workload.has_value());
+  CHECK(workload->retries == 1);
+  CHECK(workload->retry_after == 100ms);
+}
+
+TEST_CASE("a client that states no retries has none") {
+  const auto path = write_temp("simsys_retries_absent.yaml", client_with("timeout: 1s"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  CHECK(s->nodes[0].workload->retries == 0);
+}
+
+TEST_CASE("retries of 0 and of 10 are accepted: the bounds are inclusive") {
+  for (const std::string_view count : {"0", "10"}) {
+    const auto path =
+        write_temp("simsys_retries_bounds.yaml", client_with("retries: " + std::string{count}));
+    const auto s = simsys::config::load(path.string());
+    INFO(count << ": " << (s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    if (count == "0") {
+      CHECK(s->nodes[0].workload->retries == 0);
+    } else {
+      CHECK(s->nodes[0].workload->retries == 10);
+    }
+  }
+}
+
+// Ten extra attempts is a client that multiplies a failing path's load by up to 11: more is a
+// typo, and the engine keeps one bucket per retry. A count beyond an int names the same bound.
+TEST_CASE("retries above 10 are refused") {
+  for (const std::string_view count : {"11", "1000000", "99999999999"}) {
+    require_rejected("simsys_retries_many.yaml", client_with("retries: " + std::string{count}),
+                     "node 'u': retries must be at most 10");
+  }
+}
+
+TEST_CASE("retries must be a non-negative integer") {
+  for (const std::string_view value : {"-1", "1.5", "two", "\"2\""}) {
+    CAPTURE(value);
+    require_rejected("simsys_retries_not_a_count.yaml",
+                     client_with("retries: " + std::string{value}),
+                     "node 'u': retries must be a non-negative integer");
+  }
+}
+
+TEST_CASE("a client's retry_after of zero is refused: a backoff is a positive wait") {
+  for (const std::string_view wait : {"0s", "0ms"}) {
+    require_rejected("simsys_retry_after_zero.yaml",
+                     client_with("retries: 2, retry_after: " + std::string{wait}),
+                     "node 'u': retry_after must be positive");
+  }
+}
+
+// A backoff with nothing to wait for is a mistake the scenario's author should hear about, as a
+// `worker_pool` without `workers` is.
+TEST_CASE("retry_after without retries is refused") {
+  require_rejected("simsys_retry_after_alone.yaml", client_with("retry_after: 100ms"),
+                   "node 'u': retry_after needs retries");
+}
+
 TEST_CASE("a client's keys are typed: zipf with a space, or uniform") {
   SECTION("zipf with a space") {
     const auto path =
