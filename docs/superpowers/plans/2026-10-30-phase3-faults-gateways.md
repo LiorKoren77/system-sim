@@ -558,6 +558,37 @@ count is refreshed at the 3c push.
 - [x] Scenario: `run` exits 0 or the exit the README states; numbers *measured*.
 - [x] Commit `nodes: frontier drains under per-host politeness; web-crawler runs end to end` (green `4c07b3a`, 1629 tests; web-crawler exits 2 on purpose: the loop's gain 3.5 (0.7 × 50 × 0.1) saturates the downloaders and the frontier's lag reaches 7.13 h, the README's lesson; every node type now runs).
 
+**Review of Task 18 at `4c07b3a`** (adversarial, bounded, 2026-10-30): REQUEST_CHANGES. The cap, the
+prioritiser binding, URLs counted once, the README's table to the digit, the `hosts` sweep, the
+identity, §1–§4 verified.
+1. Critical: `politely_capped` lowers the pool's rate AND its concurrency by the cap's factor, so the
+   downloader reads rho 1 at the cap (0.9 at 900/s below a 1000/s cap) while only 500 of 2000 workers
+   are busy; more workers change nothing; the utilisation SLO fails for the wrong reason; the M/M/c
+   wait is computed for c′ = 500.
+2. Important: `estimate` drops URLs (54 % drop rate on the shipped crawler) although a frontier has
+   no retention; the pool's room is retention × the uncapped rate.
+3. Important: `explain`'s checks are green while the backlog grows without bound (the frontier is
+   checked against the prioritiser, not `min(prioritiser, cap)`).
+4. Important: the shipped crawler's first bottleneck is `internet`'s default 1k/s quota, not the
+   plan's lesson (the frontier's lag under the ×50 fan-out, politeness via `hosts`).
+5. Important: a frontier with two consumer pools hands every URL to both and gives each the full
+   politeness budget.
+6. Minor: a sink's `politeness` over a frontier without `hosts` silently caps nothing.
+7. Minor: the refused-type machinery (`unfollowed_until`, `blocked_on_the_way`, `unpropagated_mark`,
+   the `create` refusal) is dead and untested.
+8. Minor: README's test count. 9. Minor: a stale sweep message ("only a message queue has a lag").
+10. Minor: `frontiers_of`/`frontiers_in` duplicated; `politeness_cap_note` recomputes the cap.
+11. Minor: ch. 9's freshness/re-crawl missing from the Ignored lists.
+Decisions: 1 → the cap is a drain bound in front of the pool (a token bucket at `hosts × politeness`),
+the pool keeps its real rate and `c`, rho = drain × cost / workers (pins: 0.25 at the cap with 2000
+workers, 0.225 at 900/s); 2 → a frontier's pool room is unbounded (nothing deleted unconsumed) and
+`estimate` reports an unbounded lag when demand exceeds the drain; 3 → the frontier's check line
+compares against `min(prioritiser, cap)`; 4 → `internet` gets `capacity: 1M/s` (commented) and
+`content_store` is sized, the README re-measured so the frontier's lag is the lesson and the 1k/s
+quota the exercise; 5 → more than one consumer pool on a frontier refused; 6 → refused like
+`found 0`; 7 → deleted (Task 17's fix round removes `unpropagated_mark`'s grouping first); 9–11
+fixed; 8 at the push. The fix round runs after the Task 17 fix round lands.
+
 - [ ] **3c push.** Twelve scenarios run; CI green.
 
 ---
