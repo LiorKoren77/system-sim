@@ -11,7 +11,8 @@ reproducible. Built to practise the systems in
 C++20/23: modules, concepts, ranges, coroutines, `std::expected` and friends.
 
 Status: phase 2 is done; its last part, 2c, added bytes, queues and workers, external sinks and
-the sweep. Phase 3 (faults, retries and the four node types still missing) is next.
+the sweep. Phase 3 is under way: scripted faults run (`faults:`, below); retries and the four
+node types still missing come next.
 Clients follow rate curves (daily waves, ramps, scripted spikes, replayed points) with seeded
 Ornstein–Uhlenbeck noise, state the key popularity they ask for (Zipf or uniform) and the size
 of each op (`sizes: {stream: 50MB}`), and may give up after a `timeout`; nodes charge a per-op
@@ -259,7 +260,9 @@ end:
   (21.6k/s): fan-out on write through a queue and 32 workers, feed, post and user caches, a SQL
   database in 6 shards and the friendship graph as a key-value cluster. Each post's 300 feed
   writes make the feed cache the biggest tier (10 replicas, 66 % at the peak); all three SLOs
-  pass (feed p99 5.99 ms, nothing dropped, fan-out lag under a microsecond).
+  pass, through a scripted 30 s outage of the database at 15:00 (feed p99 66.1 ms, 5.99 ms
+  without the outage; 0.039 % dropped, all of it in the outage; fan-out lag under a
+  microsecond).
 - [`book/search-autocomplete`](scenarios/book/search-autocomplete/): ch. 13 over 24 hours at
   24k keystrokes/s (peak 36k/s): browser cache, a Che-sized trie cache (h = 0.995) in front of a
   4-replica search index, and the query-log pipeline. Both SLOs pass (suggest p99 6.86 ms of
@@ -271,7 +274,9 @@ frontiers) already validate and appear in `explain` with their resolved numbers,
 `run` and `sweep` stop with "which run/estimate do not support yet" and exit 1, as do the four book
 systems that need them. Each of those four READMEs opens with its status: the exact refusal, what
 `explain` shows today (its red checks and the nodes it cannot reach yet) and what phase 3 will
-model. Faults, retries and `on: failure` steps are phase 3 too; kv partitions are a phase 4
+model. Scripted faults run (`faults:`: a node or some of its replicas down, a capacity loss, a
+latency spike, a traffic spike, a cache flush, a datacenter down; `estimate` shows the steady
+state without them); retries and `on: failure` steps are phase 3 too; kv partitions are a phase 4
 backlog item.
 
 ## Toolchain

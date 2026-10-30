@@ -8,7 +8,10 @@
 //   curve
 // Faults on one node compose: factors multiply, extra latencies add. A fault is active on
 // [at, at + for): the step that STARTS inside the interval sees it. Outside every fault a node
-// gets the identity condition, so a run without faults is the run of phase 2, bit for bit.
+// gets the identity condition, so a run without faults is the run of phase 2, bit for bit. A
+// request in the room of a node at capacity 0 waits until the node is back, then for the backlog
+// ahead of it at the node's own capacity (Task 6's review); a sql_db's primary and read replicas go
+// down apart, and a kv_cluster's down machines cost the quorum of the keys they held.
 //
 // Ignored on purpose: partitions (refused by the loader), a real node's restart time (a node comes
 // back at full capacity the instant the fault ends), and what the clients do about failures
@@ -23,11 +26,13 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -39,12 +44,15 @@
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
 // when a std header is included after a module that included it in its global module fragment.
+import simsys.behaviours;
 import simsys.caching;
 import simsys.config;
 import simsys.core;
 import simsys.engine;
+import simsys.flow;
 import simsys.graph;
 import simsys.model;
+import simsys.queueing;
 import simsys.report;
 import simsys.test_fixtures;
 
@@ -98,6 +106,8 @@ Scenario load_yaml(std::string_view yaml) {
 //               records_of (tests/support/fixtures.cppm has the fixture; its mm1 builds the
 //               probe in code, which has no room for `queue_limit` or `faults`, so the probe is
 //               text here)
+//   client      more keys of the client's flow map (", timeout: 50ms"); empty: none
+//   slos        the YAML text of an `slo:` block; empty: none
 // C++20 designated initializers: `{.faults = "..."}` names the members a call sets, in
 // declaration order, the rest keep their defaults. Replaces a call with five positional
 // arguments (which compiles when two ints are swapped) or a builder class: the call site
@@ -107,19 +117,21 @@ struct Probe {
   int replicas = 1;
   std::string faults{};
   std::string timing = "duration: 30s\nstep: 100ms\n";
+  std::string client{};
+  std::string slos{};
 };
 
 Scenario probe(const Probe& p) {
   return load_yaml("version: 1\nname: faults\n" + p.timing +
                    "nodes:\n"
                    "  c: {type: client, rate: {base: " +
-                   std::to_string(p.rate_per_s) +
-                   "/s}, ops: {op: 1.0}}\n"
+                   std::to_string(p.rate_per_s) + "/s}, ops: {op: 1.0}" + p.client +
+                   "}\n"
                    "  s: {type: service, capacity: 1k/s, latency: 1ms, replicas: " +
                    std::to_string(p.replicas) +
                    ", advanced: {queue_limit: 100}}\n"
                    "links:\n  - {from: c, to: s, dir: inout, latency: 0s}\n" +
-                   p.faults);
+                   p.slos + p.faults);
 }
 
 // One `faults:` block with a single entry, the entry's text as the flow map between the braces.
@@ -167,6 +179,20 @@ std::string run_json(const Scenario& s) {
   auto sim = simulation_of(g);
   sim.run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
   return simsys::report::render_json(summary, {});
+}
+
+// What a whole run reports: every op's summary and every SLO's verdict.
+struct RunReport {
+  std::vector<simsys::report::OpSummary> ops;
+  std::vector<simsys::report::SloResult> slos;
+};
+
+RunReport run_report(const Scenario& s) {
+  const auto g = graph_of(s);
+  simsys::report::Summary summary{g, s.warmup};
+  auto sim = simulation_of(g);
+  sim.run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
+  return {summary.ops(), simsys::report::evaluate_slos(summary, s.slos)};
 }
 }  // namespace
 
@@ -280,6 +306,102 @@ TEST_CASE("the op's mean latency is back within 1 percent by the third step afte
   REQUIRE(mean_s_of(step_at(records, 20.0)) > 1.01 * before);     // not instantaneous
   REQUIRE_THAT(mean_s_of(step_at(records, 20.2)), WithinRel(before, 0.01));
   REQUIRE_THAT(mean_s_of(step_at(records, 25.0)), WithinRel(before, 1e-9));
+}
+
+// ---- A down node is waited for: the wait of a request in its room ------------------------------
+//
+// Phase 3 Task 6's review (finding 1): a node at capacity 0 still admits requests to its room
+// (40, 80, then 100 above), and those requests are answered once it is back, so what one of them
+// experiences is the rest of the outage and then the backlog ahead of it, drained at the node's
+// nominal capacity:
+//   wait = back_in + backlog / 1000/s       back_in = (at + for) − t = 20 s − t
+// (the fluid rule backlog / capacity read an infinite wait at capacity 0, which made the op
+// `unavailable` for a whole run over a 10 s outage). The sojourn adds the 1 ms service:
+//   step 10.0  10 s + 40 / 1000 + 1 ms  = 10.041 s
+//   step 10.1  9.9 s + 80 / 1000 + 1 ms =  9.981 s
+//   step 15.0  5 s + 100 / 1000 + 1 ms  =  5.101 s
+//   step 19.9  0.1 s + 100 / 1000 + 1 ms = 0.201 s
+// (the Erlang term at the 0.99 clamp, 99 ms, is below each). The client's link has no latency, so
+// the client's mean response is the node's sojourn.
+TEST_CASE(
+    "a request in the room of a down node waits until the node is back and the backlog ahead of it "
+    "drains",
+    "[theory]") {
+  const auto records =
+      records_of(graph_of(probe({.faults = one_fault(ten_seconds_from_ten)})), 300);
+  const std::pair<double, double> expected[] = {{10.0, 10.0 + 0.040 + 0.001},
+                                                {10.1, 9.9 + 0.080 + 0.001},
+                                                {15.0, 5.0 + 0.100 + 0.001},
+                                                {19.9, 0.1 + 0.100 + 0.001}};
+  for (const auto& [t, sojourn_s] : expected) {
+    CAPTURE(t);
+    REQUIRE(std::isfinite(service_of(step_at(records, t)).latency.mean_s));
+    REQUIRE_THAT(service_of(step_at(records, t)).latency.mean_s, WithinRel(sojourn_s, 1e-9));
+    REQUIRE_THAT(mean_s_of(step_at(records, t)), WithinRel(sojourn_s, 1e-9));
+  }
+}
+
+// The same outage seen by a client that gives up after 50 ms (`timeout: 50ms`). What the path
+// delivered over the run (answered or timed out: a request is lost only where it is dropped):
+//   outside the outage  400/s x 20 s                            = 8000
+//   in the outage       the room's 40, 40 and 20 of its first three steps = 100 (the rest dropped)
+// The 100 wait about 10 s (above): every one times out. Outside the outage the response is the
+// M/M/1 one, 1.667 ms with an exponential's spread, whose lognormal fit puts 3.4e-6 of it past
+// 50 ms: 0.03 of the 8000 (and after the outage the 40 left drain in 41 ms, under the timeout). So
+//   timed-out share = 100.03 / 8100 = 1.235 %    (100 / 8100 to 3e-4)
+// more than 1 % of the delivered requests, so no request at the 99th percentile was answered: the
+// p99 is the timeout itself, 50 ms (the table's `>50ms`), finite. The op is not unavailable.
+TEST_CASE(
+    "with a 50 ms timeout a ten second node_down times out the 100 requests in the room and caps "
+    "the p99 at the timeout",
+    "[theory]") {
+  const auto report =
+      run_report(probe({.faults = one_fault(ten_seconds_from_ten), .client = ", timeout: 50ms"}));
+  REQUIRE(report.ops.size() == 1);
+  const auto& op = report.ops[0];
+  REQUIRE_THAT(op.timed_out_share, WithinRel(100.0 / 8100.0, 1e-3));
+  REQUIRE_THAT(op.timed_out_per_s, WithinRel(100.0 / 30.0, 1e-3));  // 100 over the 30 s observed
+  REQUIRE_THAT(op.answered_per_s, WithinRel(8000.0 / 30.0, 1e-3));
+  REQUIRE(op.p99_s == 0.05);
+  REQUIRE(std::isfinite(op.mean_s));
+  REQUIRE(op.mean_s < 0.05);  // the answered requests' mean: each was answered within the timeout
+}
+
+// The two ways to state the p99 SLO agree on the outage: over the whole run, and over 10 s windows
+// (the worst of [0, 10), [10, 20), [20, 30) s). The window of the outage delivered its 100 requests
+// and timed every one out, so both fail at the timeout, 50 ms (a quantile no answered request
+// reached). Before the fix the whole run read an infinite latency (`unavailable`).
+TEST_CASE("the whole run's p99 SLO and its 10 s windows both fail a node_down at the timeout",
+          "[theory]") {
+  const auto report = run_report(
+      probe({.faults = one_fault(ten_seconds_from_ten),
+             .client = ", timeout: 50ms",
+             .slos = "slo:\n"
+                     "  - {metric: p99_latency, node: c, op: op, max: 1s}\n"
+                     "  - {metric: p99_latency, node: c, op: op, max: 1s, over: 10s}\n"}));
+  REQUIRE(report.slos.size() == 2);
+  for (const auto& slo : report.slos) {
+    CAPTURE(slo.slo.over.has_value());
+    REQUIRE(slo.status == simsys::report::SloStatus::fail);
+    REQUIRE(slo.observed.has_value());
+    REQUIRE(*slo.observed == 0.05);
+  }
+}
+
+// The identity's other side: a service whose nominal capacity is 0 by configuration (the loader
+// accepts `capacity: 0/s`) has no capacity to come back to, so its requests still wait for ever:
+// the op is `unavailable` (an infinite latency), as before the fix, which touches only a node
+// derated to 0 by a fault.
+TEST_CASE("a service configured with capacity 0 still makes its op unavailable", "[theory]") {
+  const auto s = load_yaml(
+      "version: 1\nname: zero\nduration: 10s\nstep: 100ms\n"
+      "nodes:\n"
+      "  c: {type: client, rate: {base: 100/s}, ops: {op: 1.0}}\n"
+      "  s: {type: service, capacity: 0/s, latency: 1ms}\n"
+      "links:\n  - {from: c, to: s, dir: inout, latency: 0s}\n");
+  const auto report = run_report(s);
+  REQUIRE(std::isinf(report.ops.at(0).p99_s));
+  REQUIRE(std::isinf(report.ops.at(0).mean_s));
 }
 
 // ---- node_down of some replicas -----------------------------------------------------------------
@@ -1090,6 +1212,26 @@ TEST_CASE(
   }
 }
 
+// The wait during a dc_down is finite (Task 6's review, finding 1): a request admitted to a room
+// that will drain once the datacenter is back waits for the rest of the outage, then for the
+// backlog ahead of it at the nominal capacity. At 15.0 s, 5 s before the end:
+//   s_eu (two_datacenters)   5 s + 100 / 1000/s, then its 1 ms service    = 5.101 s
+//   a pipe across the edge   5 s + 1000 MB / 50,000 MB/s = 5.02 s of wait, then the request's first
+//                            megabyte, 1 / 50,000 s: the link's latency    = 5.02002 s
+// (Before, both were infinite: backlog / 0.) The pins of the dc_down tests above are unchanged.
+TEST_CASE("during a dc_down a request waits for the datacenter's node and the cut pipe to be back",
+          "[theory]") {
+  const auto& s_eu = node_of(step_at(dc_down_run(), 15.0), s_eu_node);
+  REQUIRE_THAT(s_eu.latency.mean_s, WithinRel(5.0 + 0.1 + 0.001, 1e-9));
+  const auto records = records_of(graph_of(pipes_across_eu()), 300);
+  for (const std::size_t link : {std::size_t{0}, std::size_t{1}}) {
+    CAPTURE(link);
+    const auto& row = step_at(records, 15.0).links.at(link);
+    REQUIRE(std::isfinite(row.latency.mean_s));
+    REQUIRE_THAT(row.latency.mean_s, WithinRel(5.0 + 1000.0 / 50'000.0 + 1.0 / 50'000.0, 1e-9));
+  }
+}
+
 // ---- dc_down is run, no longer refused ----------------------------------------------------------
 
 // Phase 3 Task 6 refused dc_down (`dc_down lands in Task 7`); Task 7 runs it. The scenario of the
@@ -1120,4 +1262,265 @@ TEST_CASE("Simulation::create accepts a dc_down fault and the datacenter's servi
   REQUIRE_THAT(service_of(step_at(records, 10.0)).backlog, WithinRel(40.0, 1e-9));
   REQUIRE_THAT(service_of(step_at(records, 10.1)).backlog, WithinRel(80.0, 1e-9));
   REQUIRE_THAT(service_of(step_at(records, 15.0)).drain_per_s, WithinRel(1000.0, 1e-9));  // back
+}
+
+// ---- A sql_db's primary and its read replicas (Task 6's review, finding 2) ---------------------
+//
+// Book ch. 1, "database replication": writes go to the primary, reads to the read replicas, and
+// "if the master database goes offline, a slave database will be promoted". The probe: c sends
+// 1k/s, 800 reads and 200 writes, to `db`, a sql_db of N = 3 copies (a primary and 2 read
+// replicas), each 10k units/s with a 1 ms service (c = 10 servers) and a room of 100 units. A write
+// costs 5 units (defaults::sql_write_cost). Before any fault:
+//   primary        200 writes x 5 = 1000 units/s                         rho 1000 / 10k = 0.10
+//   each replica   800 / 2 = 400 reads + the 1000 replayed write units  rho 1400 / 10k = 0.14
+// (the node's rho is its busiest group's: 0.14).
+namespace {
+Scenario database_probe(std::string_view fault) {
+  return load_yaml(
+      "version: 1\nname: db\nduration: 30s\nstep: 100ms\n"
+      "nodes:\n"
+      "  c: {type: client, rate: {base: 1k/s}, ops: {read: 0.8, write: 0.2}}\n"
+      "  db: {type: sql_db, capacity: 10k/s, latency: 1ms, replicas: 3, advanced: {queue_limit: "
+      "100}}\n"
+      "links:\n  - {from: c, to: db, dir: inout, latency: 0s}\n" +
+      one_fault(fault));
+}
+}  // namespace
+
+// `replicas: primary` for 10 s from 10 s: the primary's capacity is 0, its replicas untouched.
+// The writes fill the primary's room in one step (200 writes/s x 5 units x 0.1 s = 100 units, the
+// room exactly) and from 10.1 s every write is dropped: answered 0. A write the room took waits
+// until the primary is back, then for the room's 100 units at 10k/s, then 1 ms: at 15.0 s 5 s +
+// 0.01 s + 1 ms = 5.011 s. The reads go on: answered 800/s at the replicas, whose load falls to
+// their 400 reads (the primary commits nothing, so they replay nothing): rho 0.04, a read's mean
+// 1 ms (Erlang C at c = 10, rho 0.04 waits nothing measurable). Before the fix a `primary` was one
+// copy of three down, every group at 2/3 of its capacity, and the writes were all answered.
+TEST_CASE("replicas primary on a sql_db stops its writes and leaves its reads answered",
+          "[theory]") {
+  const auto records =
+      records_of(graph_of(database_probe("at: 10s, kind: node_down, node: db, replicas: primary, "
+                                         "for: 10s")),
+                 300);
+  const auto& before = step_at(records, 9.9);
+  REQUIRE_THAT(response_of(before, "write").answered.per_second, WithinRel(200.0, 1e-9));
+  REQUIRE_THAT(response_of(before, "read").answered.per_second, WithinRel(800.0, 1e-9));
+  for (double t = 10.1; t < 19.95; t += 0.1) {
+    CAPTURE(t);
+    const auto& r = step_at(records, t);
+    REQUIRE_THAT(response_of(r, "write").offered.per_second, WithinRel(200.0, 1e-9));
+    REQUIRE_THAT(response_of(r, "write").answered.per_second, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(response_of(r, "read").answered.per_second, WithinRel(800.0, 1e-9));
+    REQUIRE_THAT(response_of(r, "read").response.mean_s, WithinRel(0.001, 1e-6));
+    REQUIRE_THAT(node_of(r, 1).committed_writes_per_s.value_or(-1.0), WithinAbs(0.0, 1e-9));
+  }
+  REQUIRE_THAT(response_of(step_at(records, 15.0), "write").response.mean_s,
+               WithinRel(5.0 + 0.01 + 0.001, 1e-9));
+  REQUIRE_THAT(response_of(step_at(records, 25.0), "write").answered.per_second,
+               WithinRel(200.0, 1e-9));
+}
+
+// `replicas: 1` for 10 s from 10 s: one of the 2 read replicas down, the primary untouched. Each
+// replica copy keeps its share of the load (400 reads and the 1000 replayed units) on (3 − 1 − 1)
+// / (3 − 1) = half its capacity, the survivors sharing the load evenly as fluid::Derating scales
+// them: rho = 1400 / 5000 = 0.28, twice 0.14 (the reads' 2/1 survivors' ratio; the replay is scaled
+// with them, though in fact each replica replays its shard's writes once, see Derating), while the
+// primary stays at 0.10. Nothing is lost: reads and writes are all answered. Before the fix every
+// group ran at 2/3 of its capacity (primary 0.15, replicas 0.21).
+TEST_CASE("replicas 1 on a sql_db of 3 halves its read replicas and leaves its primary",
+          "[theory]") {
+  const auto records = records_of(
+      graph_of(database_probe("at: 10s, kind: node_down, node: db, replicas: 1, for: 10s")), 300);
+  REQUIRE_THAT(node_of(step_at(records, 9.9), 1).rho, WithinRel(0.14, 1e-9));
+  for (const double t : {10.0, 15.0, 19.9}) {
+    CAPTURE(t);
+    const auto& r = step_at(records, t);
+    REQUIRE_THAT(node_of(r, 1).rho, WithinRel(1400.0 / 5000.0, 1e-9));
+    REQUIRE_THAT(node_of(r, 1).dropped_per_s, WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(response_of(r, "read").answered.per_second, WithinRel(800.0, 1e-9));
+    REQUIRE_THAT(response_of(r, "write").answered.per_second, WithinRel(200.0, 1e-9));
+    // the write's sojourn is the primary's, still at rho 0.1: about its 1 ms service
+    REQUIRE_THAT(response_of(r, "write").response.mean_s, WithinRel(0.001, 1e-6));
+  }
+  REQUIRE_THAT(node_of(step_at(records, 20.0), 1).rho, WithinRel(0.14, 1e-9));
+}
+
+// ---- A kv_cluster's quorum loss under machine failure (Task 6's review, finding 5) --------------
+//
+// Book ch. 6 (key-value store, "handling failures"): every key lives on N of the cluster's M
+// machines, and a request is answered once W (a write) or R (a read) of its key's N replicas
+// reply. When r machines are down, the keys whose replica set holds j of them have N − j live
+// replicas. A request on such a key is LOST when N − j is below its quorum (strict quorum: the
+// coordinator waits for no other machine), and otherwise answered by the quorum's fastest replies
+// among the live ones: the q-th of N − j, not of N. The share of the keys with j of the r down
+// machines in their set is hypergeometric (the set is N distinct machines of the M):
+//   P(j) = C(r, j) C(M − r, N − j) / C(M, N)
+// so one machine is in N / M of the sets, and two machines are both in (N / M)(N − 1)/(M − 1) of
+// them. With N < M the ring has one hot machine (k times the average load), and the machines that
+// go down are taken from the cool ones: a set is {hot, N − 1 cool} with probability p_hot = N k / M
+// and {N cool} otherwise, its cool slots drawn from the M − 1 cool machines.
+namespace {
+// u -> store: a kv_cluster of `machines` machines, N = 3, W = R = 2 (the defaults), 10k/s and 1 ms
+// each (c = 10). u sends 1k reads/s.
+Scenario kv_probe(int machines, std::string_view faults) {
+  return load_yaml(
+      "version: 1\nname: kv\nduration: 30s\nstep: 100ms\n"
+      "nodes:\n"
+      "  u: {type: client, rate: {base: 1k/s}, ops: {read: 1.0}}\n"
+      "  store: {type: kv_cluster, nodes: " +
+      std::to_string(machines) +
+      ", capacity: 10k/s, latency: 1ms}\n"
+      "links:\n  - {from: u, to: store, dir: inout, latency: 0s}\n" +
+      std::string{faults});
+}
+
+using simsys::behaviours::KvClusterBehaviour;
+using simsys::behaviours::MachineGroup;
+using simsys::flow::LatencyEstimate;
+
+// The q = 2nd fastest reply of `hot` replicas on the hot machine and `cool` on cool ones.
+LatencyEstimate second_of(const MachineGroup& hot_machine, int hot,
+                          const MachineGroup& cool_machine, int cool) {
+  using simsys::queueing::ReplicaGroup;
+  const std::array set{ReplicaGroup{.replicas = hot,
+                                    .sojourn = {.mean_s = hot_machine.sojourn.mean_s,
+                                                .variance_s2 = hot_machine.sojourn.variance_s2}},
+                       ReplicaGroup{.replicas = cool,
+                                    .sojourn = {.mean_s = cool_machine.sojourn.mean_s,
+                                                .variance_s2 = cool_machine.sojourn.variance_s2}}};
+  const auto reply = simsys::queueing::lognormal_order_statistic(set, 2);
+  return {reply.mean_s, reply.variance_s2};
+}
+
+// A mixture of latencies by share (the shares sum to 1), by the law of total variance: the mean of
+// the means, and the mean of the variances plus the variance of the means.
+// C++20 std::span<const T>: a read-only view of contiguous (share, latency) pairs, so the caller
+// passes a std::array of any length without a template or a (pointer, count) pair.
+LatencyEstimate mixed(std::span<const std::pair<double, LatencyEstimate>> parts) {
+  double mean = 0.0;
+  for (const auto& [share, latency] : parts) mean += share * latency.mean_s;
+  double variance = 0.0;
+  for (const auto& [share, latency] : parts) {
+    const double apart = latency.mean_s - mean;
+    variance += share * (latency.variance_s2 + apart * apart);
+  }
+  return {mean, variance};
+}
+
+LatencyEstimate kv_read_response(const KvClusterBehaviour& kv) {
+  return kv.response("read", LatencyEstimate{},
+                     [](std::size_t, std::string_view) { return LatencyEstimate{}; });
+}
+
+double kv_read_delivered(const KvClusterBehaviour& kv) {
+  return kv.delivered("read", 1.0, [](std::size_t, std::string_view) { return 1.0; });
+}
+
+// A hot machine slower than the cool ones, both keeping all they are sent.
+const MachineGroup slow_hot{.sojourn = {0.002, 4e-6}, .kept = 1.0};
+const MachineGroup fast_cool{.sojourn = {0.001, 1e-6}, .kept = 1.0};
+}  // namespace
+
+// The behaviour's formula, driven by hand. M = 6, N = 3, W = R = 2: the cool pool is the 5 cool
+// machines. Two of them down (MachineGroup::down = 2):
+//   {hot, 2 cool}  (p_hot)       j = 0: C(3,2)/C(5,2) = 3/10   live {hot, 2 cool}: the 2nd of 3
+//                                j = 1: C(2,1)C(3,1)/10 = 6/10 live {hot, 1 cool}: the 2nd of 2
+//                                j = 2: C(2,2)/10 = 1/10       live {hot}: 1 < 2, LOST
+//   {3 cool}       (1 − p_hot)   j = 0: C(3,3)/C(5,3) = 1/10   live 3 cool: the 2nd of 3
+//                                j = 1: C(2,1)C(3,2)/10 = 6/10 live 2 cool: the 2nd of 2
+//                                j = 2: C(2,2)C(3,1)/10 = 3/10 live 1 cool: LOST
+// so the loss is L = p_hot / 10 + 3 (1 − p_hot) / 10 (two machines both in a set of 3 cool slots
+// of 5: (3/5)(2/4) = 3/10, the formula of the comment above with M − 1 = 5), and the response is
+// the four answered branches mixed by their shares over 1 − L. One machine down: every set keeps
+// at least 2 live replicas, nothing is lost (j = 1 of a {3 cool} set: C(1,1)C(4,2)/C(5,3) = 6/10).
+TEST_CASE("a kv_cluster with machines down answers from the live replicas and loses below quorum",
+          "[theory]") {
+  const auto g = graph_of(kv_probe(6, ""));
+  const std::size_t store = *g.index_of("store");
+  const double p_hot = 3.0 * g.nodes()[store].imbalance / 6.0;
+  REQUIRE(p_hot > 0.5);  // k = 1.0604 (ring_factor(6, 3, 150))
+  REQUIRE(p_hot < 0.54);
+  KvClusterBehaviour kv{g, store};
+
+  MachineGroup two_down = fast_cool;
+  two_down.down = 2;
+  kv.observe(std::array{slow_hot, two_down});
+  const double loss = p_hot * 0.1 + (1.0 - p_hot) * 0.3;
+  REQUIRE_THAT(kv_read_delivered(kv), WithinRel(1.0 - loss, 1e-12));
+  const std::array answered{
+      std::pair{p_hot * 0.3 / (1.0 - loss), second_of(slow_hot, 1, fast_cool, 2)},
+      std::pair{p_hot * 0.6 / (1.0 - loss), second_of(slow_hot, 1, fast_cool, 1)},
+      std::pair{(1.0 - p_hot) * 0.1 / (1.0 - loss), second_of(slow_hot, 0, fast_cool, 3)},
+      std::pair{(1.0 - p_hot) * 0.6 / (1.0 - loss), second_of(slow_hot, 0, fast_cool, 2)}};
+  const auto expected = mixed(answered);
+  REQUIRE_THAT(kv_read_response(kv).mean_s, WithinRel(expected.mean_s, 1e-9));
+  REQUIRE_THAT(kv_read_response(kv).variance_s2, WithinRel(expected.variance_s2, 1e-9));
+
+  MachineGroup one_down = fast_cool;
+  one_down.down = 1;
+  kv.observe(std::array{slow_hot, one_down});
+  REQUIRE(kv_read_delivered(kv) == 1.0);
+  const std::array all_answered{
+      std::pair{p_hot * 0.6, second_of(slow_hot, 1, fast_cool, 2)},  // C(4,2)/C(5,2)
+      std::pair{p_hot * 0.4, second_of(slow_hot, 1, fast_cool, 1)},
+      std::pair{(1.0 - p_hot) * 0.4, second_of(slow_hot, 0, fast_cool, 3)},  // C(4,3)/C(5,3)
+      std::pair{(1.0 - p_hot) * 0.6, second_of(slow_hot, 0, fast_cool, 2)}};
+  REQUIRE_THAT(kv_read_response(kv).mean_s, WithinRel(mixed(all_answered).mean_s, 1e-9));
+}
+
+// With N = M = 3 the ring is even (every machine holds every key, no hot machine) and every set is
+// the three machines. One down: every key keeps 2 live replicas, W = R = 2 still met, each read
+// answered at the 2nd of 2. Two down: 1 live replica, below the quorum: every read lost (N/M (N −
+// 1)/(M − 1) = 1: both down machines are in every set).
+TEST_CASE("a kv_cluster of three machines keeping three copies loses every read with two down",
+          "[theory]") {
+  const auto g = graph_of(kv_probe(3, ""));
+  KvClusterBehaviour kv{g, *g.index_of("store")};
+  MachineGroup one_down = fast_cool;
+  one_down.down = 1;
+  kv.observe(std::array{one_down});
+  REQUIRE(kv_read_delivered(kv) == 1.0);
+  REQUIRE_THAT(kv_read_response(kv).mean_s,
+               WithinRel(second_of(slow_hot, 0, fast_cool, 2).mean_s, 1e-12));
+  MachineGroup two_down = fast_cool;
+  two_down.down = 2;
+  kv.observe(std::array{two_down});
+  REQUIRE(kv_read_delivered(kv) == 0.0);
+}
+
+// The same in a run. M = 6, two machines down for 10 s from 10 s (`replicas: 2`): the client is
+// answered 1 − L of its 1k reads/s (L above, the machines keep all they are sent at this load), and
+// the coordinator sends nothing to a down machine while the survivors keep their own share: the
+// store's demand, in replica-requests, is the hot machine's 3000 k / 6 plus 3 of its 5 cool
+// machines' 3000 (6 − k) / 30 each, against all 5 before (3000 in all). One machine down
+// (`replicas: 1`): nothing lost. Before the fix a node_down of r machines scaled every machine to
+// (M − r) / M of its capacity and lost nothing.
+TEST_CASE("a node_down of two of a kv_cluster's six machines loses the reads whose quorum is gone",
+          "[theory]") {
+  const auto two = graph_of(
+      kv_probe(6, one_fault("at: 10s, kind: node_down, node: store, replicas: 2, for: 10s")));
+  const double k = two.nodes()[*two.index_of("store")].imbalance;
+  const double p_hot = 3.0 * k / 6.0;
+  const double loss = p_hot * 0.1 + (1.0 - p_hot) * 0.3;
+  const auto records = records_of(two, 300);
+  REQUIRE_THAT(response_of(step_at(records, 9.9), "read").answered.per_second,
+               WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(node_of(step_at(records, 9.9), 1).demand_per_s, WithinRel(3000.0, 1e-9));
+  for (const double t : {10.0, 15.0, 19.9}) {
+    CAPTURE(t);
+    const auto& r = step_at(records, t);
+    REQUIRE_THAT(response_of(r, "read").answered.per_second,
+                 WithinRel(1000.0 * (1.0 - loss), 1e-9));
+    REQUIRE_THAT(node_of(r, 1).demand_per_s,
+                 WithinRel(3000.0 * k / 6.0 + 3.0 * 3000.0 * (6.0 - k) / 30.0, 1e-9));
+    REQUIRE_THAT(node_of(r, 1).dropped_per_s, WithinAbs(0.0, 1e-9));
+  }
+  REQUIRE_THAT(response_of(step_at(records, 20.0), "read").answered.per_second,
+               WithinRel(1000.0, 1e-9));
+
+  const auto one = records_of(
+      graph_of(kv_probe(6, one_fault("at: 10s, kind: node_down, node: store, replicas: 1, "
+                                     "for: 10s"))),
+      300);
+  REQUIRE_THAT(response_of(step_at(one, 15.0), "read").answered.per_second,
+               WithinRel(1000.0, 1e-9));
 }

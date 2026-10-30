@@ -202,8 +202,12 @@ The three large modules show three layouts, and `simsys.engine` a fourth.
   importer of `simsys.engine` sees them as if `engine.cppm` declared them. The partition imports
   `simsys.caching`, `simsys.core`, `simsys.graph` and `simsys.model` (the schedule is resolved
   against the graph, and a flushed cache's warm-up reads its key popularity), never the module's
-  own interface (GCC's refusal below): the one number it needs from the engine, the reads a
-  flushed cache is handed, the engine passes to its constructor (`Simulation::fault_schedule_of`).
+  own interface: the primary interface re-exports the partition (`export import :faults;`), so
+  the partition importing the primary would be an import cycle, which the standard forbids
+  ([module.import]: "a translation unit shall not have an interface dependency on itself", and
+  the partition would depend on the primary, which depends on the partition). The one
+  number it needs from the engine, the reads a flushed cache is handed, the engine passes to its
+  constructor (`Simulation::fault_schedule_of`).
 - **`simsys.config`: interface + ten implementation units + a header in the purview.** The
   loader is cut by concern: `config.cpp` (`load`, the pipeline), `header.cpp`, `nodes.cpp`,
   `steps.cpp`, `workload.cpp`, `links.cpp`, `slos.cpp`, `faults.cpp`, `overrides.cpp`, and

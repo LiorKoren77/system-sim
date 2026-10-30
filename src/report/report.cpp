@@ -914,6 +914,8 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
   dropped += sample.dropped_per_s * dt_s;
   rejected += sample.rejected_per_s * dt_s;
   if (sample.zone == fluid::Zone::red) red_time_s += dt_s;
+  // Infinite only at a node with no capacity of its own (nominal 0): one that a fault took down
+  // waits finitely for it to come back (fluid::Derating), so an outage never flags it.
   if (!std::isfinite(sample.latency.mean_s)) unavailable = true;
   if (sample.staleness_s) {
     staleness_time += *sample.staleness_s * dt_s;  // an infinite staleness stays infinite
@@ -934,11 +936,16 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
 
 // A step whose response is infinite (a node on the path never answers) poisons the whole
 // op: no finite average describes it. It is flagged instead of accumulated, so no
-// 0 × inf = NaN can reach the sums.
+// 0 × inf = NaN can reach the sums. A step that delivered nothing (answered + timed out = 0: every
+// request it sent was dropped or refused, or it sent none) adds its counts and nothing else: no
+// request saw its latency, so it weighs no moment and flags nothing, whatever the latency a
+// request WOULD have seen (phase 3 Task 6's review: a node that is down drops what its full room
+// cannot hold, and those steps must not decide the op's latency for the whole run).
 void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
   offered += sample.offered.per_second * dt_s;
   answered += sample.answered.per_second * dt_s;
   timed_out += sample.timed_out.per_second * dt_s;
+  if (!(sample.answered.per_second + sample.timed_out.per_second > 0.0)) return;
   const auto& response = sample.response;
   if (!std::isfinite(response.mean_s) || !std::isfinite(response.variance_s2)) {
     unavailable = true;

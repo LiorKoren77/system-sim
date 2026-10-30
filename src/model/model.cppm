@@ -800,10 +800,11 @@ inline constexpr auto fault_kind_table = std::to_array<core::EnumName<FaultKind>
 // its `replicas`; on a kv_cluster its machines (`nodes:`). On a sql_db (book ch. 1, "database
 // replication") each of its `shards` is a set of R = `replicas` copies, one primary (the writer)
 // and R - 1 read replicas: `replicas: k` takes k copies down in every shard (news-feed's post_db
-// has `shards: 6`), and `primary` takes the writer down. Phase 3 models a primary down as one copy
-// of R down, its share of the capacity; what a failed-over primary does to writes (they stop until
-// a replica is promoted) is a phase 4 backlog item. On a sql_db of one copy the primary is the
-// whole node, like a node_down without `replicas`.
+// has `shards: 6`), and `primary` takes the writer down. The engine tells the two apart
+// (engine::FaultSchedule::database_down): `primary` stops the primaries, so the writes stop (the
+// book promotes a replica; the model's primary is back at `at + for`) while the reads go on, and
+// `replicas: k` (k < R) takes k of the R − 1 read replicas, the primary untouched. On a sql_db of
+// one copy the primary is the whole node, like a node_down without `replicas`.
 struct Fault {
   FaultKind kind{};
   SimTime at{};              // from the start of the run (t = 0 is midnight); inside the run
@@ -823,6 +824,34 @@ struct Fault {
 [[nodiscard]] constexpr int copies_of(const NodeSpec& node) {
   if (node.type == NodeType::kv_cluster) return node.kv_nodes.value_or(node.replicas);
   return node.replicas;
+}
+
+// Whether a fault that starts at `at` and lasts `duration` is on at `now`: at <= now < at + for,
+// written as now − at < for (the loader does not require a fault to end inside the run, and at +
+// for overflows int64 for a huge `for`; now − at, with at <= now checked first, lies in [0, now]).
+// The step that starts at `at` is in the fault, the one that starts at `at + for` is out. The same
+// test as a rate curve's spike (workload's `active`), and the one rule engine::FaultSchedule and
+// traffic_factor_at share.
+[[nodiscard]] constexpr bool active_at(SimTime at, SimTime duration, SimTime now) {
+  return at.count() <= now.count() && now.count() - at.count() < duration.count();
+}
+
+// The factor the traffic_spike faults on client `client` put on its rate at `now`: the product of
+// the factors of those on at `now`, in the list's order (1 outside every one), the product
+// engine::FaultSchedule composes into Condition::rate_factor for `run`. `simsys curve` multiplies
+// the client's curve by it, so the curve it prints is the rate `run` offers: a traffic_spike acts
+// exactly as the same `spikes` entry on the curve (rate_at × factor, the order
+// ClientBehaviour::rate multiplies in).
+[[nodiscard]] constexpr double traffic_factor_at(const std::vector<Fault>& faults,
+                                                 std::string_view client, SimTime now) {
+  double factor = 1.0;
+  for (const auto& fault : faults) {
+    if (fault.kind == FaultKind::traffic_spike && fault.node == client &&
+        active_at(fault.at, fault.duration, now)) {
+      factor *= fault.factor.value_or(1.0);
+    }
+  }
+  return factor;
 }
 
 struct Scenario {

@@ -139,6 +139,10 @@ struct Scheduled {
 // The condition that changes nothing: what a node gets outside every fault.
 void require_identity(const Condition& c) {
   REQUIRE(c.capacity_factor == 1.0);
+  REQUIRE(c.primary_factor == 1.0);
+  REQUIRE(c.replica_factor == 1.0);
+  REQUIRE(c.machines_down == 0);
+  REQUIRE(c.back_in_s == 0.0);
   REQUIRE(c.extra_latency == SimTime{0});
   REQUIRE(c.rate_factor == 1.0);
   REQUIRE(c.hit_ratio_factor == 1.0);
@@ -373,7 +377,8 @@ TEST_CASE(
 
 // dc_down eu: every node whose `dc` is eu is in a node_down (capacity factor 0) from 10 s for
 // 10 s, as an interval [at, at + for); the nodes of us never see it. The rest of the condition is
-// the identity: a datacenter going down changes capacity and nothing else on the node.
+// the identity, but for the time until the node is back (back_in_s, 20 s − now): a datacenter going
+// down changes capacity and nothing else on the node.
 TEST_CASE(
     "a dc_down gives capacity factor 0 to every node of the datacenter and leaves the others "
     "alone",
@@ -398,6 +403,8 @@ TEST_CASE(
       CAPTURE(now.count());
       const auto c = x.at(eu_node, now);
       REQUIRE(c.capacity_factor == 0.0);
+      // an outage: the node is back at 20 s (finding 1 of Task 6's review)
+      REQUIRE_THAT(c.back_in_s, WithinRel(simsys::seconds(SimTime{20s} - now), 1e-12));
       REQUIRE(c.extra_latency == SimTime{0});
       REQUIRE(c.rate_factor == 1.0);
       REQUIRE(c.hit_ratio_factor == 1.0);
@@ -411,4 +418,153 @@ TEST_CASE(
       require_identity(x.at(us_node, now));
     }
   }
+}
+
+// ---- When a down node is back (phase 3 Task 6's review, finding 1) ------------------------------
+//
+// A node at capacity 0 still admits requests to its room, and they are served once it is back: a
+// request admitted at `now` waits until the zero-capacity faults on the node end. The condition
+// carries that time, back_in_s = (at + for) − now, for a fault that takes all of a node's capacity
+// (a node_down without `replicas`, every copy of a dc_down; on a sql_db a `primary` or every read
+// replica down). Faults that overlap or touch chain into one outage: the latest end of the chain.
+// A fault that leaves some capacity (1 of 4 replicas down, a capacity factor) is not an outage:
+// back_in_s stays 0.
+TEST_CASE("a node_down of every copy gives back_in_s, the seconds until the node is back",
+          "[engine]") {
+  const Scheduled x{
+      "faults:\n"
+      "  - {at: 10s, kind: node_down, node: t, for: 10s}\n"
+      "  - {at: 10s, kind: node_down, node: s, replicas: 1, for: 10s}\n"};
+  REQUIRE(x.at("t", 10s).back_in_s == 10.0);
+  REQUIRE(x.at("t", 12s).back_in_s == 8.0);
+  REQUIRE_THAT(x.at("t", 19500ms).back_in_s, WithinRel(0.5, 1e-12));
+  REQUIRE(x.at("t", 12s).capacity_factor == 0.0);
+  require_identity(x.at("t", 20s));
+  REQUIRE(x.at("s", 12s).back_in_s == 0.0);  // 3 of 4 replicas still serve: no outage
+  REQUIRE_THAT(x.at("s", 12s).capacity_factor, WithinRel(0.75, 1e-12));
+}
+
+// t down over [10 s, 20 s) and again over [15 s, 30 s): one outage from 10 s to 30 s, so at 12 s
+// (only the first is on yet) the node is back in 30 − 12 = 18 s, at 17 s in 13 s, at 25 s in 5 s.
+// A capacity fault over [10 s, 40 s) leaves capacity (0.5): it does not stretch the outage. u down
+// over [10 s, 20 s) and [25 s, 30 s): a gap between them, so at 12 s it is back in 8 s.
+TEST_CASE("overlapping zero-capacity faults give back_in_s up to the latest end of the chain",
+          "[engine]") {
+  const Scheduled x{
+      "faults:\n"
+      "  - {at: 10s, kind: node_down, node: t, for: 10s}\n"
+      "  - {at: 15s, kind: node_down, node: t, for: 15s}\n"
+      "  - {at: 10s, kind: capacity, node: t, factor: 0.5, for: 30s}\n"
+      "  - {at: 10s, kind: node_down, node: u, for: 10s}\n"
+      "  - {at: 25s, kind: node_down, node: u, for: 5s}\n"};
+  REQUIRE(x.at("t", 12s).back_in_s == 18.0);
+  REQUIRE(x.at("t", 17s).back_in_s == 13.0);
+  REQUIRE(x.at("t", 25s).back_in_s == 5.0);
+  REQUIRE(x.at("t", 35s).back_in_s == 0.0);  // only the capacity fault is left
+  REQUIRE(x.at("t", 35s).capacity_factor == 0.5);
+  REQUIRE(x.at("u", 12s).back_in_s == 8.0);
+  REQUIRE(x.at("u", 26s).back_in_s == 4.0);
+}
+
+// ---- A sql_db's primary and its read replicas (finding 2) ---------------------------------------
+//
+// Book ch. 1, "database replication": the primary takes every write, the read replicas every read.
+// A node_down on a sql_db of N = `replicas` copies per shard therefore says which of them:
+//   replicas: primary   the primaries' capacity x 0: writes stop (until a replica is promoted,
+//   which
+//                       the model leaves out: the primary is back at `at + for`), reads go on
+//   replicas: r < N     the read replicas' capacity x (N − 1 − r) / (N − 1), the primary untouched
+//   replicas: N         every copy: the whole node x 0, like a node_down without `replicas`
+// On a sql_db of one copy the primary is the whole node, so `primary` and `replicas: 1` are both
+// capacity x 0.
+namespace {
+const ScheduledScenario& databases() {
+  static const ScheduledScenario x{
+      "version: 1\nname: dbs\nduration: 1m\nstep: 100ms\n"
+      "nodes:\n"
+      "  c: {type: client, rate: {base: 100/s}, ops: {read: 0.8, write: 0.2}}\n"
+      "  db3: {type: sql_db, capacity: 10k/s, latency: 1ms, replicas: 3}\n"
+      "  db1: {type: sql_db, capacity: 10k/s, latency: 1ms}\n"
+      "links:\n"
+      "  - {from: c, to: db3, dir: inout, latency: 0s}\n"
+      "  - {from: c, to: db1, dir: inout, latency: 0s}\n"
+      "faults:\n"
+      "  - {at: 10s, kind: node_down, node: db3, replicas: primary, for: 5s}\n"
+      "  - {at: 20s, kind: node_down, node: db3, replicas: 1, for: 5s}\n"
+      "  - {at: 30s, kind: node_down, node: db3, replicas: 2, for: 5s}\n"
+      "  - {at: 40s, kind: node_down, node: db3, replicas: 3, for: 5s}\n"
+      "  - {at: 10s, kind: node_down, node: db1, replicas: primary, for: 5s}\n"
+      "  - {at: 20s, kind: node_down, node: db1, replicas: 1, for: 5s}\n"};
+  return x;
+}
+}  // namespace
+
+TEST_CASE("replicas primary on a sql_db stops its primaries and leaves its read replicas",
+          "[engine]") {
+  const auto c = databases().at("db3", 12s);
+  REQUIRE(c.primary_factor == 0.0);
+  REQUIRE(c.replica_factor == 1.0);
+  REQUIRE(c.capacity_factor == 1.0);
+  REQUIRE(c.back_in_s == 3.0);  // the primaries are an outage: back at 15 s
+  require_identity(databases().at("db3", 15s));
+}
+
+TEST_CASE("replicas r on a sql_db of N copies leaves its read replicas (N - 1 - r) over (N - 1)",
+          "[engine]") {
+  const auto one = databases().at("db3", 22s);  // 1 of the 2 read replicas down
+  REQUIRE_THAT(one.replica_factor, WithinRel(0.5, 1e-12));
+  REQUIRE(one.primary_factor == 1.0);
+  REQUIRE(one.capacity_factor == 1.0);
+  REQUIRE(one.back_in_s == 0.0);                // one read replica still serves the reads
+  const auto two = databases().at("db3", 32s);  // both read replicas: reads stop, writes go on
+  REQUIRE(two.replica_factor == 0.0);
+  REQUIRE(two.primary_factor == 1.0);
+  REQUIRE(two.back_in_s == 3.0);
+  const auto all = databases().at("db3", 42s);  // every copy: the whole node
+  REQUIRE(all.capacity_factor == 0.0);
+  REQUIRE(all.back_in_s == 3.0);
+}
+
+TEST_CASE("on a sql_db of one copy replicas primary and replicas 1 are both the whole node",
+          "[engine]") {
+  for (const SimTime now : {SimTime{12s}, SimTime{22s}}) {
+    CAPTURE(now.count());
+    const auto c = databases().at("db1", now);
+    REQUIRE(c.capacity_factor == 0.0);
+    REQUIRE(c.primary_factor == 1.0);
+    REQUIRE(c.replica_factor == 1.0);
+    REQUIRE(c.back_in_s == 3.0);
+  }
+}
+
+// ---- A kv_cluster's machines (finding 5) --------------------------------------------------------
+//
+// A node_down of r of a kv_cluster's M machines counts the machines down (Condition::machines_down)
+// instead of scaling every machine's capacity: the survivors keep their own keys and load (strict
+// quorum: no machine takes over a dead one's replicas, ch. 6), and the requests whose replica set
+// held a dead machine meet their quorum among fewer replicas (behaviours::KvClusterBehaviour). All
+// M down is the whole node, capacity x 0. Overlapping faults add their machines.
+TEST_CASE("a node_down of r of a kv_cluster's machines counts r machines down and keeps capacity",
+          "[engine]") {
+  const ScheduledScenario x{
+      "version: 1\nname: kv\nduration: 1m\nstep: 100ms\n"
+      "nodes:\n"
+      "  c: {type: client, rate: {base: 100/s}, ops: {read: 1.0}}\n"
+      "  store: {type: kv_cluster, nodes: 6, capacity: 10k/s, latency: 1ms}\n"
+      "links:\n  - {from: c, to: store, dir: inout, latency: 0s}\n"
+      "faults:\n"
+      "  - {at: 10s, kind: node_down, node: store, replicas: 1, for: 10s}\n"
+      "  - {at: 15s, kind: node_down, node: store, replicas: 1, for: 10s}\n"
+      "  - {at: 30s, kind: node_down, node: store, replicas: 6, for: 5s}\n"};
+  const auto one = x.at("store", 12s);
+  REQUIRE(one.machines_down == 1);
+  REQUIRE(one.capacity_factor == 1.0);
+  REQUIRE(one.back_in_s == 0.0);
+  REQUIRE(x.at("store", 17s).machines_down == 2);
+  REQUIRE(x.at("store", 22s).machines_down == 1);
+  const auto all = x.at("store", 32s);
+  REQUIRE(all.capacity_factor == 0.0);
+  REQUIRE(all.machines_down == 0);
+  REQUIRE(all.back_in_s == 3.0);
+  require_identity(x.at("store", 25s));
 }

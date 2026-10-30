@@ -216,7 +216,7 @@ CheckResult refuse_replicas_beyond_int(const Site& site, const YAML::Node& value
   return site.fail(value, std::format("replicas must be at most {}", model::copies_of(node)));
 }
 
-// `replicas: primary` (a sql_db's primary, ch. 1, taken as one copy down: model::Fault) or a
+// `replicas: primary` (a sql_db's primary, ch. 1: its writes stop, model::Fault) or a
 // count, 1 up to the node's copies; absent, the whole node goes down.
 CheckResult read_fault_replicas(const Site& site, const YAML::Node& entry,
                                 const Declarations& declared, model::Fault& fault) {

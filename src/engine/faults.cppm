@@ -10,7 +10,11 @@
 // to the database; ch. 6 loses a node of a key-value store, and ch. 4 and ch. 11 meet a flash
 // crowd. A fault changes, for the steps it covers, the numbers a node's queue is built from, and
 // nothing else:
-//   node_down      capacity × (R − r) / R   r of the node's R copies down (all of them: × 0)
+//   node_down      capacity × (R − r) / R   r of the node's R copies down (all of them: × 0); on a
+//                                           sql_db the primaries × 0 (`primary`) or the read
+//                                           replicas × (N − 1 − r) / (N − 1); on a kv_cluster r
+//                                           machines down, their keys' quorums met among fewer
+//                                           replicas (Condition::machines_down)
 //   capacity       capacity × factor        a degraded tier; a request still takes its service time
 //   latency_spike  service time + extra     a slow dependency (its servers drain c / (s + extra))
 //   traffic_spike  a client's rate × factor a flash crowd, as a `spikes` entry on its rate curve
@@ -18,12 +22,15 @@
 //   dc_down        node_down on every node of the datacenter, and capacity × 0 on every link that
 //                  crosses its edge (link_condition_at)
 // Captured: when a fault starts and ends, how much capacity it takes, that faults on one node add
-// up, and how fast a flushed cache refills. Ignored: how the failure is detected and how long
-// failover takes (a node is down from `at` exactly and back at full capacity at `at + for`, with no
-// restart or warm-up of its own), which copies go down (the survivors share the load evenly: a
-// copy's capacity is scaled, see fluid::Derating), what clients do about it (retries are phase 3's
-// Task 10), and ch. 1's geoDNS failover: a dc_down cuts the datacenter off, and only the scenario's
-// own links (a second route the client splits its requests over) send anything elsewhere.
+// up, that a request waiting at a node that is down waits until it is back (Condition::back_in_s),
+// and how fast a flushed cache refills. Ignored: how the failure is detected and how long failover
+// takes (a node is down from `at` exactly and back at full capacity at `at + for`, with no restart
+// or warm-up of its own: a sql_db's primary comes back at `at + for` rather than a replica being
+// promoted), which copies go down (the survivors share the load evenly: a copy's capacity is
+// scaled, see fluid::Derating; a kv_cluster's down machines are cool ones, see
+// behaviours::KvClusterBehaviour), what clients do about it (retries are phase 3's Task 10), and
+// ch. 1's geoDNS failover: a dc_down cuts the datacenter off, and only the scenario's own links (a
+// second route the client splits its requests over) send anything elsewhere.
 //
 // C++20 module partition, interface kind: `export module simsys.engine:faults;` names a piece of
 // the module simsys.engine whose exports become part of the module's interface once the primary
@@ -31,12 +38,18 @@
 // sees engine::FaultSchedule as if engine.cppm declared it; nobody outside the module can import
 // the partition by name. It replaces one more section in a 2000-line interface (or a header that
 // belongs to no module): the fault schedule is a part of the engine with its own file.
+//
+// C++20 global module fragment: `module;` opens the part of the unit before the module declaration,
+// where the std headers are #included. Their declarations stay in the global module, shared with
+// every other unit that includes them, instead of being attached to simsys.engine as an #include
+// after `export module` would do (src/core/core.cppm has the longer note).
 module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this unit imports other modules (GCC 14.2 'Bad
 // file data' bug, CLAUDE.md §3). SimTime's member operators (+=) work without <chrono>; its
 // comparisons and differences go through .count().
-#include <algorithm>  // std::ranges::contains
+#include <algorithm>  // std::ranges::contains, std::max
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -46,21 +59,39 @@ module;
 
 export module simsys.engine:faults;
 
+// C++20 `import`: the compiled interfaces of the modules this partition reads (the Che warm-up
+// from caching, SimTime from core, the resolved graph, the typed faults from model), replacing
+// #includes of their headers; their names are visible here, their macros and includes are not.
+// The partition does not import simsys.engine itself: the primary interface re-exports it, so
+// that import would be a cycle, which the standard forbids.
 import simsys.caching;
 import simsys.core;
 import simsys.graph;
 import simsys.model;
 
+// C++20 `export namespace`: every declaration in the block is exported (part of the module's
+// interface), replacing an `export` keyword on each one; the block below, with no `export`, holds
+// what only this unit sees.
 export namespace simsys::engine {
 
 // What a node (or a link) is in at one time: the factors and the extra latency its active faults
 // put on the numbers its queueing model is built from. The default is the identity, which changes
 // nothing: what a node gets outside every fault, so a run without faults is the run before faults
-// existed. A link reads only capacity_factor (a dc_down's 0).
+// existed. A link reads only capacity_factor (a dc_down's 0) and back_in_s.
 struct Condition {
   double capacity_factor = 1;  // × capacity: node_down (R − r) / R, all copies 0; capacity: factor
-  SimTime extra_latency{};     // + service time: latency_spike's extra
-  double rate_factor = 1;      // × a client's rate: traffic_spike's factor
+  // A sql_db's two kinds of copy (book ch. 1, "database replication"), apart from the factor above:
+  double primary_factor = 1;  // × its primaries' capacity: `replicas: primary`, 0
+  double replica_factor = 1;  // × its read replicas': `replicas: r`, (N − 1 − r) / (N − 1)
+  int machines_down = 0;      // a kv_cluster's machines down: `replicas: r` (behaviours::
+                              // KvClusterBehaviour meets each quorum among the live replicas)
+  // The seconds until the node serves again when a fault took all its capacity, or all of a
+  // sql_db's primaries or read replicas: the latest end of the zero-capacity faults on it, chained
+  // when one starts before another ends; 0 outside such a fault. What a request admitted to its
+  // room waits before the backlog ahead of it starts to drain (fluid::Derating).
+  double back_in_s = 0;
+  SimTime extra_latency{};      // + service time: latency_spike's extra
+  double rate_factor = 1;       // × a client's rate: traffic_spike's factor
   double hit_ratio_factor = 1;  // × a cache's hit ratio: cache_flush's warm-up, h(t) / h
 };
 
@@ -153,11 +184,17 @@ class FaultSchedule {
   [[nodiscard]] static WarmUp warm_up_of(const graph::Graph& g, std::size_t cache, SimTime at,
                                          double reads);
   [[nodiscard]] static Condition effect_of(const model::Fault& fault, const model::NodeSpec& node);
-  [[nodiscard]] static double surviving_share(const model::Fault& fault,
-                                              const model::NodeSpec& node);
+  [[nodiscard]] static Condition down_effect(const model::Fault& fault,
+                                             const model::NodeSpec& node);
+  [[nodiscard]] static Condition database_down(const model::Fault& fault, int copies);
+  [[nodiscard]] static double surviving_share(int down, int copies);
   [[nodiscard]] static bool changes_nothing(const Condition& c);
+  [[nodiscard]] static bool is_outage(const Condition& effect);
   [[nodiscard]] static bool active(SimTime at, SimTime duration, SimTime now);
   static void compose(Condition& into, const Condition& effect);
+  void whole_cluster_down(std::size_t node, Condition& condition) const;
+  [[nodiscard]] double back_in_s(std::size_t node, SimTime now) const;
+  [[nodiscard]] double link_back_in_s(std::size_t link, SimTime now) const;
   [[nodiscard]] double warmth_at(std::size_t node, SimTime now) const;
   [[nodiscard]] static double warmth(const WarmUp& warm_up, SimTime now);
 
@@ -165,6 +202,7 @@ class FaultSchedule {
   std::vector<Cut> cuts_;             // dc_down's links, in the scenario's order
   std::vector<WarmUp> warm_ups_;      // in the scenario's order
   std::vector<std::size_t> flushed_;  // flushed_caches()
+  std::vector<int> kv_machines_;      // per node: a kv_cluster's machines, 0 for any other node
 };
 
 }  // namespace simsys::engine
@@ -194,11 +232,54 @@ namespace {
   return popularity_seen_by(nodes, upstream).filtered_by(upstream.shards);
 }
 
+// a + b for two non-negative tick counts, at most the largest count: a fault's `for` may be huge
+// (the loader does not require it to end inside the run), and the sum must not overflow.
+[[nodiscard]] SimTime::rep saturating_sum(SimTime::rep a, SimTime::rep b) {
+  const auto most = std::numeric_limits<SimTime::rep>::max();
+  return b > most - a ? most : a + b;
+}
+
+// The ticks from `now` until the outage made of `windows` ends, 0 when none is on at `now`. A
+// window is an outage fault's {at, duration} (FaultSchedule's Scheduled or Cut), and `in_outage`
+// says which of `windows` count. The outage is the latest end of those on at `now`, then of every
+// later one that starts before that end (it begins while the target is still down, so it stretches
+// the outage), until none does: two node_downs over [10 s, 20 s) and [15 s, 30 s) are one outage
+// from 10 s to 30 s. Remaining times, not ends (at + for), so that a huge `for` cannot overflow
+// (FaultSchedule::active has the same reason).
+template <class Window, class Predicate>
+[[nodiscard]] SimTime::rep outage_left(const std::vector<Window>& windows, Predicate in_outage,
+                                       SimTime now) {
+  SimTime::rep left = 0;
+  for (const auto& w : windows) {
+    const auto since = now.count() - w.at.count();
+    if (in_outage(w) && since >= 0 && since < w.duration.count()) {
+      left = std::max(left, w.duration.count() - since);
+    }
+  }
+  for (bool stretched = left > 0; stretched;) {
+    stretched = false;
+    for (const auto& w : windows) {
+      const auto starts_in = w.at.count() - now.count();
+      if (!in_outage(w) || starts_in <= 0 || starts_in > left) continue;
+      const auto ends_in = saturating_sum(starts_in, w.duration.count());
+      if (ends_in > left) {
+        left = ends_in;
+        stretched = true;
+      }
+    }
+  }
+  return left;
+}
+
 }  // namespace
 
 // Each fault's effect is worked out here, once; a fault that changes nothing is left out, so
 // condition_at never meets it.
 FaultSchedule::FaultSchedule(const graph::Graph& g, std::span<const double> flush_reads) {
+  for (const auto& node : g.nodes()) {
+    kv_machines_.push_back(
+        node.spec.type == model::NodeType::kv_cluster ? model::copies_of(node.spec) : 0);
+  }
   const auto& faults = g.scenario().faults;
   for (std::size_t i = 0; i < faults.size(); ++i) {
     switch (faults[i].kind) {
@@ -297,7 +378,8 @@ FaultSchedule::WarmUp FaultSchedule::warm_up_of(const graph::Graph& g, std::size
                 .steady = steady};
 }
 
-// Every active fault on the node composed (see compose), and the warm-up of its latest flush.
+// Every active fault on the node composed (see compose), the time until it is back from an outage
+// (back_in_s), and the warm-up of its latest flush.
 Condition FaultSchedule::condition_at(std::size_t node, SimTime now) const {
   Condition condition;
   for (const auto& fault : faults_) {
@@ -305,17 +387,45 @@ Condition FaultSchedule::condition_at(std::size_t node, SimTime now) const {
       compose(condition, fault.effect);
     }
   }
+  whole_cluster_down(node, condition);
+  condition.back_in_s = back_in_s(node, now);
   condition.hit_ratio_factor = warmth_at(node, now);
   return condition;
 }
 
+// Overlapping node_downs that together take every machine of a kv_cluster leave it nothing: the
+// whole node at capacity 0, as one node_down without `replicas` would. No single fault takes it
+// all, so back_in_s stays 0: its room drains from the moment the first of them ends.
+void FaultSchedule::whole_cluster_down(std::size_t node, Condition& condition) const {
+  if (condition.machines_down == 0) return;  // also the empty schedule, which knows no nodes
+  if (condition.machines_down < kv_machines_[node]) return;
+  condition.capacity_factor = 0.0;
+  condition.machines_down = 0;
+}
+
+// Capacity 0 while a dc_down cuts the link, and when the cut ends (a pipe's room drains then).
 Condition FaultSchedule::link_condition_at(std::size_t link, SimTime now) const {
   for (const auto& cut : cuts_) {
     if (cut.link == link && active(cut.at, cut.duration, now)) {
-      return Condition{.capacity_factor = 0.0};
+      return Condition{.capacity_factor = 0.0, .back_in_s = link_back_in_s(link, now)};
     }
   }
   return Condition{};
+}
+
+// The seconds until node `node` is back from the outage it is in (outage_left over its faults that
+// take all of its capacity or all of a sql_db's primaries or read replicas, is_outage), 0 outside
+// one.
+double FaultSchedule::back_in_s(std::size_t node, SimTime now) const {
+  const auto left = outage_left(
+      faults_, [&](const Scheduled& f) { return f.node == node && is_outage(f.effect); }, now);
+  return seconds(SimTime{left});
+}
+
+// The same for a link a dc_down cuts.
+double FaultSchedule::link_back_in_s(std::size_t link, SimTime now) const {
+  const auto left = outage_left(cuts_, [&](const Cut& cut) { return cut.link == link; }, now);
+  return seconds(SimTime{left});
 }
 
 bool FaultSchedule::may_cut(std::size_t link) const {
@@ -349,7 +459,7 @@ double FaultSchedule::warmth(const WarmUp& warm_up, SimTime now) {
 Condition FaultSchedule::effect_of(const model::Fault& fault, const model::NodeSpec& node) {
   switch (fault.kind) {
     case model::FaultKind::node_down:
-      return Condition{.capacity_factor = surviving_share(fault, node)};
+      return down_effect(fault, node);
     case model::FaultKind::capacity:
       return Condition{.capacity_factor = fault.factor.value_or(1.0)};
     case model::FaultKind::latency_spike:
@@ -366,40 +476,80 @@ Condition FaultSchedule::effect_of(const model::Fault& fault, const model::NodeS
   std::unreachable();
 }
 
-// The share of a node's capacity left when `fault.replicas` of its R copies (model::copies_of: a
-// kv_cluster's machines) are down: (R − r) / R. Capacity is per copy, and the copies split the load
-// evenly, so the survivors serve (R − r) / R of it: 1 of 4 leaves 0.75. No `replicas`: every copy,
-// 0. `replicas: primary` (a sql_db) counts as one copy of R: the capacity is all this task models;
-// that writes stop until a replica is promoted (ch. 1) is not modelled yet.
-double FaultSchedule::surviving_share(const model::Fault& fault, const model::NodeSpec& node) {
-  const auto copies = static_cast<double>(model::copies_of(node));
-  if (fault.primary) return (copies - 1.0) / copies;
-  if (!fault.replicas) return 0.0;
-  return (copies - static_cast<double>(*fault.replicas)) / copies;
+// A node_down by the kind of node it takes copies from (R = model::copies_of, its copies; the
+// loader keeps `replicas` in 1..R):
+//   every copy (no `replicas`, r = R, or a node of one copy)   capacity × 0
+//   a sql_db                                                   database_down
+//   a kv_cluster, r of its M machines                          machines_down r: the survivors keep
+//                       their own load and the requests on the down machines' keys meet their
+//                       quorum among fewer replicas (behaviours::KvClusterBehaviour), ch. 6
+//   any other node, r of R                                     capacity × (R − r) / R
+Condition FaultSchedule::down_effect(const model::Fault& fault, const model::NodeSpec& node) {
+  const int copies = model::copies_of(node);
+  const bool every_copy = !fault.primary && (!fault.replicas || *fault.replicas >= copies);
+  if (every_copy || copies == 1) return Condition{.capacity_factor = 0.0};
+  if (node.type == model::NodeType::sql_db) return database_down(fault, copies);
+  if (node.type == model::NodeType::kv_cluster) return Condition{.machines_down = *fault.replicas};
+  return Condition{.capacity_factor = surviving_share(*fault.replicas, copies)};
+}
+
+// A sql_db of N copies per shard, a primary and N − 1 read replicas (book ch. 1, "database
+// replication"), with some of them down in every shard:
+//   `primary`   the primaries × 0: the writes wait in the primary's room and are dropped once it
+//               is full, until it is back (the book promotes a replica instead; the model's
+//               primary simply returns at `at + for`); the reads go on at the replicas
+//   r of N      the read replicas × (N − 1 − r) / (N − 1), the primary untouched: 1 of 3 copies
+//               leaves each replica copy half its capacity (the survivors share the reads evenly,
+//               fluid::Derating), and r = N − 1 leaves no replica (reads wait, writes go on)
+// Before Task 6's review a `primary` was one copy of N down, every copy at (N − 1) / N, and the
+// writes were all still answered.
+Condition FaultSchedule::database_down(const model::Fault& fault, int copies) {
+  if (fault.primary) return Condition{.primary_factor = 0.0};
+  const auto replicas = static_cast<double>(copies - 1);
+  return Condition{.replica_factor = (replicas - static_cast<double>(*fault.replicas)) / replicas};
+}
+
+// The share of a node's capacity left when `down` of its R copies are down: (R − r) / R. Capacity
+// is per copy, and the copies split the load evenly, so the survivors serve (R − r) / R of it: 1 of
+// 4 leaves 0.75.
+double FaultSchedule::surviving_share(int down, int copies) {
+  const auto r = static_cast<double>(copies);
+  return (r - static_cast<double>(down)) / r;
 }
 
 bool FaultSchedule::changes_nothing(const Condition& c) {
-  return c.capacity_factor == 1.0 && c.extra_latency.count() == 0 && c.rate_factor == 1.0 &&
+  return c.capacity_factor == 1.0 && c.primary_factor == 1.0 && c.replica_factor == 1.0 &&
+         c.machines_down == 0 && c.extra_latency.count() == 0 && c.rate_factor == 1.0 &&
          c.hit_ratio_factor == 1.0;
 }
 
-// Active at `now` when at <= now < at + for, written as now − at < for: the loader does not require
-// a fault to end inside the run, and at + for overflows int64 for a huge `for` (the fault would
-// switch off at once), while now − at, with at <= now checked first, lies in [0, now]. The same
-// test as a rate curve's spike (workload's `active`).
+// A fault that takes all of a node's capacity, or all of a sql_db's primaries or read replicas: an
+// outage, whose end a request in the room waits for (back_in_s).
+bool FaultSchedule::is_outage(const Condition& effect) {
+  return effect.capacity_factor == 0.0 || effect.primary_factor == 0.0 ||
+         effect.replica_factor == 0.0;
+}
+
+// Active at `now` when at <= now < at + for (model::active_at, which `simsys curve` reads a
+// traffic_spike's window with too).
 bool FaultSchedule::active(SimTime at, SimTime duration, SimTime now) {
-  return at.count() <= now.count() && now.count() - at.count() < duration.count();
+  return model::active_at(at, duration, now);
 }
 
 // Faults on one node compose: factors multiply (two capacity faults of 0.5 leave 0.25 of the
-// capacity; a node_down of 1 of 4 copies under a capacity fault of 0.5 leaves 0.375) and extra
-// latencies add (1 ms and 2 ms spikes make a service time 3 ms longer). Overlapping traffic_spike
-// faults multiply without a cap: a curve's `spikes` cap their product at 1e6 (the loader's bound,
-// workload::RateCurve), the faults list has no such bound, as a flash crowd on a flash crowd is the
-// scenario's to state. A dc_down composes like the node_down it is. The hit ratio factor is not
-// composed: the latest flush sets it (warmth_at).
+// capacity; a node_down of 1 of 4 copies under a capacity fault of 0.5 leaves 0.375), a
+// kv_cluster's down machines add (two faults of 1 machine: 2 down; all of them: whole_cluster_down)
+// and extra latencies add (1 ms and 2 ms spikes make a service time 3 ms longer). Overlapping
+// traffic_spike faults multiply without a cap: a curve's `spikes` cap their product at 1e6 (the
+// loader's bound, workload::RateCurve), the faults list has no such bound, as a flash crowd on a
+// flash crowd is the scenario's to state. A dc_down composes like the node_down it is. The hit
+// ratio factor is not composed: the latest flush sets it (warmth_at); nor is back_in_s, which
+// condition_at reads off the outages (back_in_s).
 void FaultSchedule::compose(Condition& into, const Condition& effect) {
   into.capacity_factor *= effect.capacity_factor;
+  into.primary_factor *= effect.primary_factor;
+  into.replica_factor *= effect.replica_factor;
+  into.machines_down += effect.machines_down;
   into.extra_latency += effect.extra_latency;
   into.rate_factor *= effect.rate_factor;
 }
