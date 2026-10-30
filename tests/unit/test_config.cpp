@@ -3986,6 +3986,129 @@ TEST_CASE("a worker pool waits in its queue: advanced.queue_limit is refused for
                    "node 'w': a worker pool waits in its queue: set the queue's retention");
 }
 
+// ---- A worker pool's retries and retry_after (phase 3 spec §6.2) ----
+//
+// `retries: n` (book ch. 10: a notification worker puts a failed call back on the queue and tries
+// again later) is how many times the pool calls its sink again for a job whose call failed, a
+// whole number from 0 to 10; `retry_after` how long after the failure the job is back on the
+// queue, a positive duration. The loader reads both into typed fields, leaves an absent `retries`
+// absent (the phase 2 pool), and fills in the default `retry_after` of 1 s when `retries` is
+// stated: that default is CHOSEN, not from the book (which says "retry" and gives no backoff): long
+// enough for a provider's blip to pass, short beside the minutes a real outage lasts, and the
+// first step of the usual exponential backoff. The words of every refusal are the client's
+// (spec §6.1), so a reader meets the same sentence on both.
+// A pool retries what its `then` step to an EXTERNAL SINK failed: a pool with no such step has
+// nothing to retry, so `retries` there is refused rather than silently ignored.
+
+namespace {
+// A queue q, a pool w that drains it with `pool_keys` after its workers and cost, `then` as given
+// (a step to the sink api by default), and a sink and a service for a then step to name.
+std::string retrying_pool_scenario(std::string_view pool_keys,
+                                   std::string_view then = "then: [{to: api, op: send}]") {
+  return scenario_with(
+      "  q: {type: message_queue}\n"
+      "  w: {type: worker_pool, consumes: q, workers: 4, cost: 5ms" +
+      (pool_keys.empty() ? std::string{} : ", " + std::string{pool_keys}) +
+      (then.empty() ? std::string{} : ", " + std::string{then}) +
+      "}\n"
+      "  api: {type: external_sink}\n"
+      "  svc: {type: service}\n");
+}
+}  // namespace
+
+TEST_CASE("a worker pool's retries and retry_after are typed") {
+  const auto path = write_temp("simsys_pool_retries_typed.yaml",
+                               retrying_pool_scenario("retries: 3, retry_after: 2s"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  const auto& pool = s->nodes[1];
+  CHECK(pool.retries == 3);
+  CHECK(pool.retry_after == 2s);
+}
+
+TEST_CASE("a pool that states retries and no retry_after gets the chosen default of 1 s") {
+  const auto path =
+      write_temp("simsys_pool_retries_default.yaml", retrying_pool_scenario("retries: 3"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  CHECK(s->nodes[1].retries == 3);
+  CHECK(s->nodes[1].retry_after == 1s);  // the default is in the model, where every reader finds it
+}
+
+TEST_CASE("a pool that states no retries leaves retries and retry_after absent: phase 2's pool") {
+  const auto path = write_temp("simsys_pool_no_retries.yaml", retrying_pool_scenario(""));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  CHECK_FALSE(s->nodes[1].retries.has_value());
+  CHECK_FALSE(s->nodes[1].retry_after.has_value());
+}
+
+// The closed interval [0, 10]: 0 is a pool that retries nothing (accepted, and stored), 10 the
+// most.
+TEST_CASE("retries of exactly 0 or exactly 10 are accepted") {
+  for (const auto* retries : {"0", "10"}) {
+    CAPTURE(retries);
+    const auto path = write_temp("simsys_pool_retries_bounds.yaml",
+                                 retrying_pool_scenario("retries: " + std::string{retries}));
+    const auto s = simsys::config::load(path.string());
+    INFO((s ? "" : s.error().message));
+    REQUIRE(s.has_value());
+    CHECK(s->nodes[1].retries == std::stoi(retries));
+  }
+}
+
+TEST_CASE("a pool's retries must be a whole number from 0 to 10") {
+  SECTION("11") {
+    require_rejected("simsys_pool_retries_11.yaml", retrying_pool_scenario("retries: 11"),
+                     "node 'w': retries must be at most 10");
+  }
+  SECTION("negative") {
+    require_rejected("simsys_pool_retries_negative.yaml", retrying_pool_scenario("retries: -1"),
+                     "node 'w': retries must be a non-negative integer");
+  }
+  SECTION("not a whole number") {
+    require_rejected("simsys_pool_retries_half.yaml", retrying_pool_scenario("retries: 2.5"),
+                     "node 'w': retries must be a non-negative integer");
+  }
+}
+
+TEST_CASE("a pool's retry_after must be positive") {
+  require_rejected("simsys_pool_retry_after_zero.yaml",
+                   retrying_pool_scenario("retries: 3, retry_after: 0s"),
+                   "node 'w': retry_after must be positive");
+}
+
+TEST_CASE("a pool's retry_after without retries is refused") {
+  require_rejected("simsys_pool_retry_after_alone.yaml", retrying_pool_scenario("retry_after: 2s"),
+                   "node 'w': retry_after needs retries");
+}
+
+TEST_CASE("retries on a pool with no then step to an external sink is refused") {
+  const std::string reason = "node 'w': retries need a then step to an external sink";
+  SECTION("no then steps at all") {
+    require_rejected("simsys_pool_retries_no_then.yaml", retrying_pool_scenario("retries: 3", ""),
+                     reason);
+  }
+  SECTION("a then step to a service only") {
+    require_rejected("simsys_pool_retries_then_service.yaml",
+                     retrying_pool_scenario("retries: 3", "then: [{to: svc, op: send}]"), reason);
+  }
+}
+
+// One sink among the steps is enough: the pool retries that call's failures and none other's.
+TEST_CASE("retries are accepted when one of several then steps goes to an external sink") {
+  const auto path = write_temp(
+      "simsys_pool_retries_two_thens.yaml",
+      retrying_pool_scenario("retries: 3", "then: [{to: svc, op: log}, {to: api, op: send}]"));
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  CHECK(s->nodes[1].retries == 3);
+}
+
 // ---- External sinks are typed (spec §19 entry 8) ----
 //
 // An external sink is a third party's API: the type's numbers (1k/s, 100 ms, service SCV 2.0) plus

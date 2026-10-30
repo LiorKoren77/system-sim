@@ -346,15 +346,16 @@ TEST_CASE("the series writer emits a header and one row per node per step; clien
   // C++20 std::string::starts_with (and its twin ends_with): a prefix test in one call,
   // replacing `compare(0, prefix.size(), prefix) == 0` and its length bookkeeping.
   REQUIRE(
-      text.starts_with("t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,"
-                       "latency_ms,zone,queue_lag_s\n"));
+      text.starts_with("t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,"
+                       "dead_lettered_per_s,rejected_per_s,latency_ms,zone,queue_lag_s\n"));
   // C++20 std::ranges::count: counts the matches in a whole range (here the characters of
   // the string), replacing std::count(text.begin(), text.end(), '\n').
   REQUIRE(std::ranges::count(text, '\n') == 1 + 3 * 2);
   REQUIRE(text.find("\n0.1,s,") != std::string::npos);  // shortest round-trip form of 0.1 s
   // A client is a source: its numeric columns are 0 (machines keep a number) and its zone
-  // is `none` (it has no queue to colour).
-  REQUIRE(text.find("\n0,c,0,0,0,0,0,0,0,none,\n") != std::string::npos);  // no lag: empty cell
+  // is `none` (it has no queue to colour). No dead letters (a pool's) and no lag (a queue's): the
+  // two empty cells.
+  REQUIRE(text.find("\n0,c,0,0,0,0,0,,0,0,none,\n") != std::string::npos);
 }
 
 TEST_CASE("render_explain lists every node with its resolved numbers and provenance", "[report]") {
@@ -519,13 +520,15 @@ TEST_CASE("the series writer emits rejected_per_s", "[report]") {
   std::string field;
   std::istringstream cells{line};
   while (std::getline(cells, field, ',')) fields.push_back(field);
-  // eleven cells: demand_per_s and drain_per_s after node (spec §18 entry 13), queue_lag_s last.
-  // getline drops the last one, which is empty on a limiter's row, so the comma count is what says
-  // there are eleven.
-  REQUIRE(std::ranges::count(line, ',') == 10);
-  REQUIRE(fields.size() == 10);
+  // twelve cells: demand_per_s and drain_per_s after node (spec §18 entry 13), dead_lettered_per_s
+  // after drops_per_s (a pool's: empty on a limiter's row, and getline keeps an empty cell between
+  // two commas), queue_lag_s last. getline drops the last cell, which is empty on a limiter's row,
+  // so the comma count is what says there are twelve.
+  REQUIRE(std::ranges::count(line, ',') == 11);
+  REQUIRE(fields.size() == 11);
   REQUIRE(fields[6] == "0");     // drops_per_s
-  REQUIRE(fields[7] == "3000");  // rejected_per_s
+  REQUIRE(fields[7] == "");      // dead_lettered_per_s: a limiter has no dead letters
+  REQUIRE(fields[8] == "3000");  // rejected_per_s
 }
 
 // Spec §17 entry 8: a request that was rejected or dropped is not answered and sees no latency, so
@@ -722,15 +725,16 @@ TEST_CASE("the JSON always carries reject_rate and worst_reject_node", "[report]
   REQUIRE(json.find("\"worst_reject_node\": null") != std::string::npos);
 }
 
-TEST_CASE("the CSV series has the rejected_per_s column right after drops_per_s", "[report]") {
+TEST_CASE("the CSV series has the rejected_per_s column after drops_per_s and dead_lettered_per_s",
+          "[report]") {
   const auto s = mm1(500);
   const auto g = *simsys::graph::Graph::build(s);
   std::ostringstream out;
   simsys::report::SeriesWriter writer{out, g};
   const auto text = out.str();  // the header is written on construction, before any step
   REQUIRE(text.substr(0, text.find('\n') + 1) ==
-          "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,"
-          "zone,queue_lag_s\n");
+          "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,"
+          "rejected_per_s,latency_ms,zone,queue_lag_s\n");
 }
 
 namespace {
@@ -3210,4 +3214,156 @@ TEST_CASE("a scenario without faults has no fault block and no faults key in eit
   REQUIRE_FALSE(table.contains("fault "));
   REQUIRE_FALSE(table.contains("recovery:"));
   REQUIRE_FALSE(json.contains("\"faults\""));
+}
+
+// ---- A pool's dead letters in the reports (phase 3 spec §6.2, §10) ----
+//
+// A pool that retries its sink's failures counts the jobs whose last attempt failed apart from its
+// drops (engine::NodeSample::dead_lettered_per_s): "printed in the pool's row and the JSON, never
+// as a drop". The probe is the retry picture of tests/theory/test_sinks.cpp: u publishes 1000/s to
+// q, pool w (100 workers at 10 ms) calls the sink api (5k/s, fails 2 %), `retries: 3` a second
+// apart: at the fixed point w dead-letters 1000 x 0.02^4 = 1.6e-4 jobs a second, 15 s of which the
+// summary observes after 5 s of warmup (the transient is three backoffs long): 2.4e-3 jobs.
+// What the reports say:
+//  - the table: a `dead_lettered/s` column right after `dropped`, `-` on every row but a pool's,
+//    there only when some pool in the run retries (a scenario of phase 2's pools prints the table
+//    it always did);
+//  - the JSON: `dead_lettered` (the total over the observed steps) and `dead_lettered_per_s`
+//    (their mean) on a pool's object, 0 for a pool that retries nothing, null on every other node;
+//  - explain: `retries=3 after 1s, then dead-letter` at the end of the pool's line.
+
+namespace {
+Scenario retrying_probe(std::optional<int> retries,
+                        std::optional<simsys::SimTime> retry_after = std::nullopt) {
+  Scenario s{.name = "dead-letters", .version = 1, .duration = 20s, .warmup = 5s};
+  NodeSpec pool{
+      .id = "w", .type = NodeType::worker_pool, .then = {Step{.to = "api", .op = "send"}}};
+  pool.consumes = "q";
+  pool.workers = 100;
+  pool.job_cost = 10ms;
+  if (retries) pool.retries = *retries;
+  if (retry_after) pool.retry_after = *retry_after;
+  NodeSpec api{.id = "api", .type = NodeType::external_sink, .capacity = Rate{5000}};
+  api.failure_rate = 0.02;
+  s.nodes = {NodeSpec{.id = "u",
+                      .type = NodeType::client,
+                      .workload =
+                          Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"publish", 1.0}}}},
+             NodeSpec{.id = "q", .type = NodeType::message_queue}, std::move(pool), std::move(api)};
+  s.links = {LinkSpec{.from = "u", .to = "q", .latency = 250us},
+             LinkSpec{.from = "q", .to = "w", .latency = 0s},
+             LinkSpec{.from = "w", .to = "api", .latency = 0s}};
+  return s;
+}
+
+// The text of the JSON object of node `id`, from its `{"id": ...` to its closing brace.
+std::string json_node_object(const std::string& json, std::string_view id) {
+  const auto start = json.find("{\"id\": \"" + std::string{id} + "\"");
+  REQUIRE(start != std::string::npos);
+  return json.substr(start, json.find('}', start) - start);
+}
+
+std::string json_of_probe(const Scenario& s) {
+  const auto g = *simsys::graph::Graph::build(s);
+  return simsys::report::render_json(summarize(s, g), {});
+}
+
+std::string table_of_probe(const Scenario& s) {
+  const auto g = *simsys::graph::Graph::build(s);
+  return simsys::report::render_table(summarize(s, g), {}, false);
+}
+}  // namespace
+
+// The column's place and the cells: the pool's row holds its mean rate after warmup, 1.6e-4, which
+// the table writes with four significant digits (0.00016); every other row has a dash, a client's
+// row included.
+TEST_CASE("the node table has a dead_lettered/s column after dropped, holding the pool's rate",
+          "[report]") {
+  const auto table = table_of_probe(retrying_probe(3, 1s));
+  CAPTURE(table);
+  const std::vector<std::string> header{"node",         "mean_rho", "peak_rho",
+                                        "peak_backlog", "dropped",  "dead_lettered/s",
+                                        "rejected",     "red_s",    "peak_lag"};
+  REQUIRE(words_of_line_starting(table, "node") == header);
+  const auto at = std::ranges::find(header, "dead_lettered/s") - header.begin();
+  const auto pool = words_of_line_starting(table, "w");
+  REQUIRE(pool.size() == header.size());
+  REQUIRE(pool[static_cast<std::size_t>(at)] == "0.00016");
+  REQUIRE(pool[static_cast<std::size_t>(at) - 1] == "0");  // dropped: a dead letter is not a drop
+  for (const auto* id : {"u", "q", "api"}) {
+    CAPTURE(id);
+    const auto row = words_of_line_starting(table, id);
+    REQUIRE(row.size() >= static_cast<std::size_t>(at) + 1);
+    REQUIRE(row[static_cast<std::size_t>(at)] == "-");
+  }
+}
+
+// What does not change: a run whose pools retry nothing prints the table of phase 2.
+TEST_CASE("the node table has no dead_lettered/s column when no pool retries", "[report]") {
+  const auto table = table_of_probe(retrying_probe(std::nullopt));
+  CAPTURE(table);
+  const std::vector<std::string> header{"node",    "mean_rho", "peak_rho", "peak_backlog",
+                                        "dropped", "rejected", "red_s",    "peak_lag"};
+  REQUIRE(words_of_line_starting(table, "node") == header);
+  REQUIRE_FALSE(table.contains("dead_lettered"));
+}
+
+TEST_CASE("the JSON pool object carries dead_lettered, 2.4e-3, and dead_lettered_per_s, 1.6e-4",
+          "[report]") {
+  const auto json = json_of_probe(retrying_probe(3, 1s));
+  CAPTURE(json);
+  const auto pool = json_node_object(json, "w");
+  REQUIRE_THAT(json_value(pool, "dead_lettered_per_s"), WithinRel(1.6e-4, 1e-6));
+  REQUIRE_THAT(json_value(pool, "dead_lettered"), WithinRel(1.6e-4 * 15.0, 1e-6));
+  REQUIRE_THAT(json_value(pool, "dropped"), Catch::Matchers::WithinAbs(0.0, 1e-12));
+}
+
+TEST_CASE("the JSON gives every node that is not a worker pool null dead letters", "[report]") {
+  const auto json = json_of_probe(retrying_probe(3, 1s));
+  CAPTURE(json);
+  for (const auto* id : {"u", "q", "api"}) {
+    CAPTURE(id);
+    const auto object = json_node_object(json, id);
+    REQUIRE(object.contains("\"dead_lettered\": null"));
+    REQUIRE(object.contains("\"dead_lettered_per_s\": null"));
+  }
+}
+
+// A pool that retries nothing has the counters, at 0: the same report, byte for byte, whether
+// `retries` is absent or 0.
+TEST_CASE("a pool without retries reports 0 dead letters, the same JSON as retries 0", "[report]") {
+  const auto absent = json_of_probe(retrying_probe(std::nullopt));
+  const auto zero = json_of_probe(retrying_probe(0));
+  const auto pool = json_node_object(absent, "w");
+  CAPTURE(pool);
+  REQUIRE(json_value(pool, "dead_lettered") == 0.0);
+  REQUIRE(json_value(pool, "dead_lettered_per_s") == 0.0);
+  REQUIRE(absent == zero);
+}
+
+// The whole line (as node_line returns it, with the block's two-space indent), so that its place
+// and its words are pinned: after the pool's workers and cost, two spaces, `retries=3 after 1s,
+// then dead-letter`. A pool that retries nothing prints no such words (the line stays what it was).
+TEST_CASE("explain prints retries=3 after 1s, then dead-letter at the end of the pool's line",
+          "[report]") {
+  const auto text = explain_of(retrying_probe(3, 1s));
+  CAPTURE(text);
+  REQUIRE(node_line(text, "w") ==
+          "  w    worker_pool    dc=main  replicas=1  capacity=10k/s (workers / cost)  "
+          "service_time=10ms (cost)  c=100 (workers)  queue_limit=6.048G (retention × capacity)  "
+          "variability=1  burstiness=1  consumes=q  workers=100 cost=10ms  "
+          "retries=3 after 1s, then dead-letter");
+}
+
+TEST_CASE("explain prints the backoff as stated: retries=2 after 500ms", "[report]") {
+  const auto text = explain_of(retrying_probe(2, 500ms));
+  CAPTURE(text);
+  REQUIRE(node_line(text, "w").ends_with("  retries=2 after 500ms, then dead-letter"));
+}
+
+TEST_CASE("explain prints no retries on a pool that states none", "[report]") {
+  const auto text = explain_of(retrying_probe(std::nullopt));
+  CAPTURE(text);
+  REQUIRE(node_line(text, "w").ends_with("consumes=q  workers=100 cost=10ms"));
+  REQUIRE_FALSE(text.contains("retries="));
 }
