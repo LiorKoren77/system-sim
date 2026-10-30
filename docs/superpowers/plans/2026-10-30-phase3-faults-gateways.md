@@ -409,8 +409,8 @@ through the `then` steps, as `run` replays the whole list).
 
 **Files:** `src/session/session.cppm`, `session.cpp` (`run_replications(const Graph&, seed, N, jobs)` → `std::vector<Summary>` on the sweep's pool: one `Simulation` per seed; `ReplicationSummary` with per-metric median and 10–90 % band and per-SLO `passes_in`), `src/report/report.cppm`, `report.cpp` (the table prints `p99 212ms [198–231]`, `PASS in 9 of 10` with the median run's observed value; JSON `replications: {seeds: [...], per_seed: {...}}`), `src/cli/main.cpp` (`--replications N` (1–1000), `--jobs`; `--series`/`--series-ops` with `--replications` refused: `--series needs a single run (one series file per seed is phase 4 material)`; exit code of the median run), `tests/unit/test_session.cpp` (new), `test_report.cpp`, `tests/cli/replications.cmake` (byte-identical across `--jobs`, the noiseless note).
 
-- [ ] Tests: hello with `noise: {sigma: 0.2}` on its client and `--replications 5`: five different `users.ping.mean` values (the seeds differ), the printed median equals the sorted third value, the band the 10 % and 90 % quantiles by the report's quantile rule (nearest-rank, pinned), `--jobs 1` and `--jobs 4` byte-identical; a scenario without noise prints `replications: the scenario has no noise, so every seed gives the same run` and runs once; `--replications 1` is the plain run byte for byte; an SLO failing in 2 of 5 seeds prints `PASS in 3 of 5`; `--replications 0` and `1001` refused.
-- [ ] Commit `cli: run --replications N repeats a run over seeds of the rate noise and prints bands`.
+- [x] Tests: hello with `noise: {sigma: 0.2}` on its client and `--replications 5`: five different `users.ping.mean` values (the seeds differ), the printed median equals the sorted third value, the band the 10 % and 90 % quantiles by the report's quantile rule (nearest-rank, pinned), `--jobs 1` and `--jobs 4` byte-identical; a scenario without noise prints `replications: the scenario has no noise, so every seed gives the same run` and runs once; `--replications 1` is the plain run byte for byte; an SLO failing in 2 of 5 seeds prints `PASS in 3 of 5`; `--replications 0` and `1001` refused.
+- [x] Commit `cli: run --replications N repeats a run over seeds of the rate noise and prints bands` (red `a9c78db`, green `d2a5d04`, review fixes `9cfb1bc`, 1466 tests; hello lives in `scenarios/tutorial`, noise is `rate: {noise: {sigma, correlation}}`, there is no `--report csv`).
 
 **Review of Task 12 at `d3fc14b`** (adversarial, 2026-10-30): APPROVE with fixes before merge.
 Per-seed JSON digit-identical to single runs, bands by hand sort, even-n rule, seeds, refusals,
@@ -430,6 +430,10 @@ is false (`0.1 × 10` is exact; `0.07 × 100` is not). 6. Minor: `ranges::stable
 `--replications` is silently ignored. 10. Minor: `figures_of(runs)` evaluated twice; a raw pointer
 search in `text_band`; `banded_parts` copies meaningless numbers.
 Decisions: all fixed in the fix round (9 → "ignored without --replications" in the help text).
+Fixed at `9cfb1bc`. The fault block under retries (Task 10 item 2, Task 11 item 9) landed at
+`759920b` (1478 tests): `lost 8.907k attempts (2.939k requests lost for good)`, `retries added 5.968k
+attempts`, `pool w re-published 999 jobs`; JSON `lost_requests`, `after.retries_added_attempts`,
+`after.pool_republished_jobs` (null when no retries are involved; the keys are always present).
 
 - [ ] **3b push.** CI green; the ten runnable scenarios byte-identical to the 3a push except the new columns (`attempts/s`, `dead_lettered/s`) and the chain hash.
 
