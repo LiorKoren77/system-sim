@@ -675,6 +675,110 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   return "slo\n" + aligned(rows, Align::all_left);
 }
 
+// ---- the fault block (spec §4.4; engine::FaultRecord says what each line models) ----
+
+// Float residue of the fluid arithmetic printed as the 0 it is (a served rate of 1e-14/s).
+[[nodiscard]] double without_residue(double value) {
+  constexpr double residue = 1e-9;
+  return std::abs(value) < residue ? 0.0 : value;
+}
+
+// The faulted part as the block names it: the node, or a dc_down's datacenter.
+[[nodiscard]] std::string fault_target(const engine::FaultRecord& r) {
+  return r.kind == model::FaultKind::dc_down ? r.datacenter : r.node;
+}
+
+// An SLO in the words of the SLO table's columns, each only when the SLO has it:
+// `p99_latency c op`, `drop_rate`.
+[[nodiscard]] std::string slo_words(const model::SloSpec& slo) {
+  std::string words{model::to_string(slo.metric)};
+  if (slo.node) words += " " + *slo.node;
+  if (slo.op) words += " " + *slo.op;
+  return words;
+}
+
+// The SLOs a fault flipped, in the scenario's order (indexes the engine kept).
+[[nodiscard]] std::vector<std::string> flipped_words(const engine::FaultRecord& r,
+                                                     std::span<const model::SloSpec> slos) {
+  std::vector<std::string> words;
+  for (const std::size_t i : r.flipped) {
+    if (i < slos.size()) words.push_back(slo_words(slos[i]));
+  }
+  return words;
+}
+
+// `fault 00:00:10 node_down s for 10s`: when (fault_clock), what, where, and how long, which a
+// cache_flush, an instant, does not have (model::lasts); `for` as the scenario writes it.
+[[nodiscard]] std::string fault_header(const engine::FaultRecord& r) {
+  std::string header = "fault " + fault_clock(r.at) + " " + std::string{model::to_string(r.kind)} +
+                       " " + fault_target(r);
+  if (model::lasts(r.kind)) header += " for " + describe_duration(r.duration);
+  return header + "\n";
+}
+
+// One body line: two spaces, the label padded so that the three values start in one column.
+[[nodiscard]] std::string fault_line(std::string_view label, const std::string& text) {
+  constexpr std::size_t label_width = std::string_view{"recovery: "}.size();
+  return "  " + std::string{label} + std::string(label_width - label.size(), ' ') + text + "\n";
+}
+
+// `backlog 100 (room 100 dropped the rest)`: the parenthesis only when the room filled and dropped
+// (a traffic_spike's client has no room: what it lost was lost downstream). Both numbers as the
+// node table's peak_backlog (with an SI prefix), so that `backlog 9k` and its `room 9k` read alike.
+[[nodiscard]] std::string backlog_text(const engine::FaultRecord& r) {
+  const std::string backlog = "backlog " + with_si_prefix(without_residue(r.backlog_peak));
+  if (without_residue(r.lost) <= 0.0 || r.room <= 0.0) return backlog;
+  return backlog + " (room " + with_si_prefix(r.room) + " dropped the rest)";
+}
+
+// What the fault cost while it lasted: the faulted node's demand and drain, the requests lost, the
+// backlog, then each SLO it flipped.
+[[nodiscard]] std::string during_line(const engine::FaultRecord& r,
+                                      std::span<const model::SloSpec> slos) {
+  std::vector<std::string> parts{"offered " + fmt_rate(without_residue(r.offered_per_s)),
+                                 "served " + fmt_rate(without_residue(r.served_per_s)),
+                                 "lost " + with_si_prefix(without_residue(r.lost)) + " requests",
+                                 backlog_text(r)};
+  for (const auto& words : flipped_words(r, slos)) parts.push_back(words + " flipped to FAIL");
+  return fault_line("during:", join(parts, ", "));
+}
+
+// What followed: a flush's warm-up, any other fault's backlog to drain.
+[[nodiscard]] std::string after_text(const engine::FaultRecord& r) {
+  if (r.kind == model::FaultKind::cache_flush) {
+    return r.after.cache_warm_in_s
+               ? "cache warm again in " + tenths_of_seconds(*r.after.cache_warm_in_s)
+               : "cache not warm again by the end of the run";
+  }
+  if (without_residue(r.backlog_peak) <= 0.0) return "no backlog to drain";
+  return r.after.backlog_drained_in_s
+             ? "backlog drained in " + tenths_of_seconds(*r.after.backlog_drained_in_s)
+             : "backlog not drained by the end of the run";
+}
+
+// When the system was itself again, on the clock and after the fault cleared (at + for).
+[[nodiscard]] std::string recovery_text(const engine::FaultRecord& r) {
+  if (!r.recovered_at) return "not recovered by the end of the run";
+  const SimTime since_cleared{r.recovered_at->count() - r.at.count() - r.duration.count()};
+  return "op p99 back within 1% at " + fault_clock(*r.recovered_at) + " (" +
+         tenths_of_seconds(seconds(since_cleared)) + " after the fault cleared)";
+}
+
+[[nodiscard]] std::string fault_block(const engine::FaultRecord& r,
+                                      std::span<const model::SloSpec> slos) {
+  return fault_header(r) + during_line(r, slos) + fault_line("after:", after_text(r)) +
+         fault_line("recovery:", recovery_text(r));
+}
+
+// One block per fault, in `at` order; nothing without faults.
+[[nodiscard]] std::string fault_blocks(const Summary& summary) {
+  std::string blocks;
+  for (const auto& r : summary.faults()) {
+    blocks += fault_block(r, summary.graph().scenario().slos);
+  }
+  return blocks;
+}
+
 // ---- JSON ----
 
 // Quotes and backslashes are escaped, control characters become \u00XX; everything
@@ -797,6 +901,37 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   windowed.push_back(json_field("window_start_s",
                                 r.window_start ? json_number(seconds(*r.window_start)) : "null"));
   return json_object(windowed);
+}
+
+// A fault's block as JSON (the text's numbers, unrounded, in seconds): `for_s` null for a flush,
+// each `after` entry null where it does not apply or did not happen, `recovered_at_s` null when the
+// run ended first; a dc_down names its datacenter (`node` null).
+[[nodiscard]] std::string json_fault(const engine::FaultRecord& r,
+                                     std::span<const model::SloSpec> slos) {
+  std::vector<std::string> flipped;
+  for (const auto& words : flipped_words(r, slos)) flipped.push_back(json_string(words));
+  const std::array during{
+      json_field("offered_per_s", json_number(without_residue(r.offered_per_s))),
+      json_field("served_per_s", json_number(without_residue(r.served_per_s))),
+      json_field("lost", json_number(without_residue(r.lost))),
+      json_field("backlog_peak", json_number(without_residue(r.backlog_peak))),
+      json_field("room", json_number(r.room)),
+      json_field("flipped", "[" + join(flipped, ", ") + "]")};
+  const std::array after{
+      json_field("backlog_drained_in_s", json_optional_number(r.after.backlog_drained_in_s)),
+      json_field("cache_warm_in_s", json_optional_number(r.after.cache_warm_in_s))};
+  const bool dc_down = r.kind == model::FaultKind::dc_down;
+  std::vector<std::string> fields{json_field("at_s", json_number(seconds(r.at))),
+                                  json_field("kind", json_string(model::to_string(r.kind))),
+                                  json_field("node", dc_down ? "null" : json_string(r.node))};
+  if (dc_down) fields.push_back(json_field("datacenter", json_string(r.datacenter)));
+  fields.push_back(
+      json_field("for_s", model::lasts(r.kind) ? json_number(seconds(r.duration)) : "null"));
+  fields.push_back(json_field("during", json_object(during)));
+  fields.push_back(json_field("after", json_object(after)));
+  fields.push_back(json_field("recovered_at_s", json_optional_number(r.recovered_at.transform(
+                                                    [](SimTime t) { return seconds(t); }))));
+  return json_object(fields);
 }
 
 // C++20 std::views::transform + C++23 std::ranges::to: map every element through `f` and
@@ -1030,6 +1165,10 @@ Summary::OpTotals& Summary::totals_for(const engine::ResponseSample& sample, std
   const auto found = std::ranges::find_if(ops_, matches);
   if (found != ops_.end()) return *found;
   return ops_.emplace_back(OpTotals{.client = sample.client, .op = sample.op});
+}
+
+void Summary::set_faults(std::span<const engine::FaultRecord> records) {
+  faults_.assign(records.begin(), records.end());
 }
 
 void Summary::observe(const engine::StepRecord& record) {
@@ -1292,10 +1431,12 @@ bool all_pass(std::span<const SloResult> results) {
 
 // With no observed step there are no node or op figures to show, only the skipped SLOs.
 std::string render_table(const Summary& summary, std::span<const SloResult> slos, bool color) {
-  if (summary.observed_steps() == 0) return table_header(summary) + slo_table(slos, color);
+  if (summary.observed_steps() == 0) {
+    return table_header(summary) + slo_table(slos, color) + fault_blocks(summary);
+  }
   return table_header(summary) + faults_note(summary) + node_table(summary, color) +
          link_table(summary, color) + replication_table(summary) + op_table(summary) +
-         slo_table(slos, color);
+         slo_table(slos, color) + fault_blocks(summary);
 }
 
 // With no observed step the drop and reject rates are null: there is no data, not a rate of 0.
@@ -1318,7 +1459,15 @@ std::string render_json(const Summary& summary, std::span<const SloResult> slos)
       json_array("links", map_to_strings(std::span<const LinkSummary>{links}, json_link)),
       json_array("ops", map_to_strings(std::span<const OpSummary>{ops}, json_op)),
       json_array("slo", map_to_strings(slos, json_slo))};
-  return "{\n" + join(lines, ",\n") + "\n}";
+  if (summary.faults().empty()) return "{\n" + join(lines, ",\n") + "\n}";
+  // The faults array, last and only with faults: a report without them is what it was before.
+  std::vector<std::string> with_faults{lines.begin(), lines.end()};
+  std::vector<std::string> faults;
+  for (const auto& r : summary.faults()) {
+    faults.push_back(json_fault(r, summary.graph().scenario().slos));
+  }
+  with_faults.push_back(json_array("faults", faults));
+  return "{\n" + join(with_faults, ",\n") + "\n}";
 }
 
 double op_latency_s(const OpSummary& op, OpLatency column) {

@@ -58,7 +58,16 @@ recommended setting. 15k/s gives 67 % on average and room for the spread.
   p99 over the run rises from 2.22 ms to 4.08 ms (mean 1.37 → 1.54 ms). Not modelled yet: that
   the removed server's arcs go to the servers after it on the ring, which then carry more than
   the even 3/4 share says, and that its keys arrive there cold (the hit ratio is resolved once,
-  at build).
+  at build). The run's fault block (after the SLO table) shows what the run's mean hides: at
+  0.965 the utilization SLO of 0.85 fails on every step of the 5 minutes taken alone, though it
+  held before them and passes over the run:
+
+  ```
+  fault 00:10 node_down cache_servers for 5m
+    during:   offered 40k/s, served 40k/s, lost 0 requests, backlog 0, utilization cache_servers flipped to FAIL
+    after:    no backlog to drain
+    recovery: op p99 back within 1% at 00:15 (0s after the fault cleared)
+  ```
 
 ## What it abstracts away
 - The hash function, ring data structure and lookup (binary search).

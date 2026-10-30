@@ -184,6 +184,14 @@ std::string run_json(const Scenario& s) {
   return simsys::report::render_json(summary, {});
 }
 
+// The JSON report without its `faults` key. The key is the report's last (render_json), so the
+// text from `,\n  "faults": [` on is cut and the closing brace put back: what the report would be
+// without fault records. Unchanged when there is no such key.
+std::string without_faults_key(const std::string& json) {
+  const auto key = json.find(",\n  \"faults\": [");
+  return key == std::string::npos ? json : json.substr(0, key) + "\n}";
+}
+
 // What a whole run reports: every op's summary and every SLO's verdict.
 struct RunReport {
   std::vector<simsys::report::OpSummary> ops;
@@ -508,9 +516,9 @@ TEST_CASE("the latency spike and the capacity fault of equal rho differ by the s
 // A traffic_spike of factor 3 on the client for 10 m from 10 m is, by the plan's definition, the
 // code path of `rate: {spikes: [{at, for, factor}]}`: the client's rate x 3 on [10 m, 20 m).
 // At 400 x 3 = 1200/s the service (1k/s) saturates and drops, so the two JSON reports are not
-// trivially equal: identical bytes mean the same numbers on every node and op. (When the fault
-// block lands in the report, a `faults` key appears in the first report: compare without it
-// then; the numbers are what this pins.)
+// trivially equal: identical bytes mean the same numbers on every node and op. The fault's run
+// also has the fault block's `faults` key (Task 8), which the curve's run, without a fault, has
+// not: the two are compared without it (without_faults_key), and the key is checked to be there.
 TEST_CASE("a traffic_spike fault of factor 3 equals a spikes entry of factor 3 on the rate curve",
           "[theory]") {
   const std::string long_run = "duration: 30m\nstep: 1s\n";
@@ -525,7 +533,9 @@ TEST_CASE("a traffic_spike fault of factor 3 equals a spikes entry of factor 3 o
       "ops: {op: 1.0}}\n"
       "  s: {type: service, capacity: 1k/s, latency: 1ms, advanced: {queue_limit: 100}}\n"
       "links:\n  - {from: c, to: s, dir: inout, latency: 0s}\n");
-  const auto json_by_fault = run_json(by_fault);
+  const auto json_with_faults_key = run_json(by_fault);
+  REQUIRE(json_with_faults_key.contains("\"faults\": ["));
+  const auto json_by_fault = without_faults_key(json_with_faults_key);
   REQUIRE(json_by_fault == run_json(by_curve));
   // not vacuous: the spike is in the report (a run without it is not the same bytes)
   REQUIRE(json_by_fault != run_json(probe({.timing = long_run})));
@@ -1635,7 +1645,9 @@ TEST_CASE("a ten second node_down prints its block: lost 3.9k, drained in 0.2s, 
   // C++20 std::string::ends_with: a suffix test in one call, replacing
   // `s.size() >= n && s.compare(s.size() - n, n, x) == 0`.
   REQUIRE(run.table.ends_with(node_down_block));
-  REQUIRE(run.table.find("fault ") == run.table.rfind("fault "));  // one block, not two
+  // one block, not two: one line starting `fault ` (the block's own text says "the fault cleared")
+  REQUIRE(run.table.find("\nfault ") == run.table.rfind("\nfault "));
+  REQUIRE(run.table.contains("\nfault "));
 }
 
 // The block follows the SLO table (the table's last section), not the op table.
@@ -1729,6 +1741,32 @@ TEST_CASE("a node_down that ends 0.1 s before the run does is not recovered by t
   REQUIRE(run.faults.size() == 1);
   REQUIRE_FALSE(run.faults[0].recovered_at.has_value());
   REQUIRE_FALSE(run.faults[0].after.backlog_drained_in_s.has_value());
+}
+
+// A traffic_spike's block reads the client, in requests: 400 x 3 = 1200/s offered for 5 s from
+// 10 s, 6000 requests. The service (1k/s, room 100) keeps 20 a step (120 in, 100 out) until its
+// room is full at the end of the fifth step (10.4 s), then drops 200/s for the other 45 steps:
+// lost 45 x 20 = 900. Answered = offered - lost (nothing times out): (6000 - 900) / 5 s = 1020/s,
+// more than the service drains, because the 100 still waiting at 15 s count as answered (later).
+// The client has no queue, so `backlog 0`, no room to name and nothing to drain; the service's
+// backlog of 100 drains in the steps at 15.0 and 15.1 s (min(400 + 1000, 1000): 40 left, then 0),
+// and from 15.2 s rho is 0.4 again: recovered 0.2 s after the spike.
+TEST_CASE("a traffic_spike prints the client's block: offered 1.2k, served 1.02k, lost 900",
+          "[theory]") {
+  const auto run = fault_run(
+      probe({.faults = one_fault("at: 10s, kind: traffic_spike, node: c, factor: 3, for: 5s")}));
+  CAPTURE(run.table, run.json);
+  REQUIRE(run.table.ends_with(
+      "fault 00:00:10 traffic_spike c for 5s\n"
+      "  during:   offered 1.2k/s, served 1.02k/s, lost 900 requests, backlog 0\n"
+      "  after:    no backlog to drain\n"
+      "  recovery: op p99 back within 1% at 00:00:15.2 (0.2s after the fault cleared)\n"));
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE_THAT(run.faults[0].offered_per_s, WithinRel(1200.0, 1e-9));
+  REQUIRE_THAT(run.faults[0].served_per_s, WithinRel(1020.0, 1e-9));
+  REQUIRE_THAT(run.faults[0].lost, WithinRel(900.0, 1e-9));
+  REQUIRE(run.faults[0].room == 0.0);
+  REQUIRE(run.json.contains("\"kind\": \"traffic_spike\", \"node\": \"c\", \"for_s\": 5"));
 }
 
 // Two faults declared latest first print earliest first. The node_down of 5 s at 10 s: the room

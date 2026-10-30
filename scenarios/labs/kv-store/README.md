@@ -41,7 +41,16 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   takes **1.58 ms** during the fault instead of 1.54 ms, and the run's p99 is 2.33 ms (2.31 ms
   without the fault). Take two machines down (`replicas: 2`) and a key whose set held both has
   one live replica, below the quorum: those requests are lost (the closed form is pinned in
-  `tests/theory/test_faults.cpp`).
+  `tests/theory/test_faults.cpp`). The run's fault block (after the SLO table) says it in three
+  lines: nothing lost, no backlog, and every op's p99 and every machine's rho back within 1 % of
+  the step before the fault at the first step after it (the slower quorum ends with the fault):
+
+  ```
+  fault 00:10 node_down store for 3m
+    during:   offered 84.41k/s, served 84.41k/s, lost 0 requests, backlog 0
+    after:    no backlog to drain
+    recovery: op p99 back within 1% at 00:13 (0s after the fault cleared)
+  ```
 - **Quorum latency over the real replica set.** A read is answered when the R-th fastest of its
   key's three replicas replies, a write when the W-th does. The three are three DIFFERENT
   machines, so at most one is the hot one: it is in a request's set with probability

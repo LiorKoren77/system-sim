@@ -125,6 +125,22 @@ every run is without it.
   primaries commit what their rooms held in one burst onto replicas whose rooms are still full,
   so each replica misses a few replayed writes (`missed writes/s per replica 6.349e-05`, about
   5.5 writes over the day). Everything else, the peaks included, is the day above.
+  The report closes with the outage's own block (the JSON's `faults` array has the same numbers),
+  an incident report in three lines: what it cost, what followed, when the system was itself again:
+
+  ```
+  fault 15:00 node_down post_db for 30s
+    during:   offered 12.72k/s, served 0/s, lost 372.5k requests, backlog 9k (room 9k dropped the rest), p99_latency users read_feed flipped to FAIL, drop_rate flipped to FAIL
+    after:    backlog drained in 0.3s
+    recovery: op p99 back within 1% at 15:00:30.3 (0.3s after the fault cleared)
+  ```
+
+  The 372.5k are the 30 s themselves; the node table's 372.8k adds the 366 dropped in the first
+  step after it, when the 9k waiting and the new arrivals meet rooms that are not yet empty. The
+  two flipped SLOs held at 14:59:59.9 and fail on the outage's steps taken alone (a 30 s wait in a
+  step's fit, 12.72k/s dropped of 12.72k/s); over the day they pass. Three steps after 15:00:30
+  the backlog is gone and every op's p99 and every node's rho are back within 1 % of the step
+  before the outage: the system recovered **0.3 s** after `post_db` did.
 
 ## What it abstracts away
 - **Faults**, beyond capacity: the 15:00 outage takes `post_db`'s capacity and nothing else.

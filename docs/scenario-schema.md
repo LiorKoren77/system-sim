@@ -1271,6 +1271,16 @@ the observed seconds (`steps` × `step`).
 | `slo[]` | `metric`, `node`, `op`, `status`, `note` | as written (`null` when absent); `pass`, `fail` or `skipped`; `null` or the reason |
 | `slo[]` | `observed`, `max` | seconds for a latency, `staleness` or `queue_lag` SLO, a ratio otherwise |
 | `slo[]` | `window_start_s` | seconds from the start of the run; only an SLO with `over` that `run` judged |
+| `faults[]` | `at_s`, `kind`, `node`, `for_s` | seconds from the start of the run; the kind; the node (`null` for a `dc_down`, which has `datacenter` after it); seconds, `null` for a `cache_flush` |
+| `faults[]` | `during` | `offered_per_s`, `served_per_s` (means over the fault), `lost`, `backlog_peak`, `room` (totals, in the node's capacity units) and `flipped`, the flipped SLOs as the text names them (`["p99_latency c op"]`) |
+| `faults[]` | `after` | `backlog_drained_in_s`, `cache_warm_in_s`: seconds, `null` where the text says there is none |
+| `faults[]` | `recovered_at_s` | seconds from the start of the run; `null` when not recovered by the end of the run |
+
+`faults` is the last key, after `slo`, and only a run with faults has it (`estimate`, which leaves
+the faults out, never does): one object per fault in `at` order with the numbers of its text block
+(see [Faults](#faults)), unrounded and in seconds, so that a tool can read the recovery time a
+README quotes (`"recovered_at_s": 20.2` is the text's `00:00:20.2`).
+
 At a node that counts megabytes (a byte `capacity`, see [Node (common keys)](#node-common-keys))
 the node's own numbers are in MB: the table's `dropped`, JSON's `dropped`, and the series'
 `demand_per_s`, `drain_per_s`, `drops_per_s` (MB/s) and `backlog` (MB), as its capacity and
@@ -1456,8 +1466,44 @@ own `rate.spikes`: `faults[2]: overlapping traffic_spike factors on 'users' mult
 1e6`, naming the later entry. The two caps are checked separately: a fault's factor is not
 multiplied with the client's curve spikes.
 
-A fault that lies wholly inside `warmup` (it ends before the warmup does) is accepted, but the
-report leaves the warmup out, so nothing it did is ever reported.
+A fault that lies wholly inside `warmup` (it ends before the warmup does) is accepted; the node,
+op and SLO tables leave the warmup out, so only its fault block (below) says what it did.
+
+**What `run` reports per fault** (phase 3 spec §4.4; `engine::FaultRecord`, `engine::FaultLog`).
+After the SLO table, one block per fault in `at` order, the same three lines for every kind, an
+incident report: what the fault cost while it lasted, what followed, when the system was itself
+again:
+
+```
+fault 00:00:10 node_down s for 10s
+  during:   offered 400/s, served 0/s, lost 3.9k requests, backlog 100 (room 100 dropped the rest), p99_latency c op flipped to FAIL
+  after:    backlog drained in 0.2s
+  recovery: op p99 back within 1% at 00:00:20.2 (0.2s after the fault cleared)
+```
+
+The header has the fault's clock time (`HH:MM` on a whole minute, `HH:MM:SS` on a whole second,
+else to the tenth: `00:00:20.2`), its kind, its node (a `dc_down`'s datacenter) and `for` as
+written (none for a `cache_flush`, an instant). `during` reads the faulted node over the fault's
+steps (a `dc_down`: its datacenter's nodes, clients excepted, plus what was sent over the links it
+cut and lost there; a `cache_flush`: the cache over its warm-up; a `traffic_spike`: the client,
+in requests, offered at the spiked rate, served as answered, lost as not answered, lost on the way
+or timed out, with no backlog of its own): the means of its demand and
+drain, the work its full room dropped (`lost`, in the node's capacity units: requests when every
+cost is 1), its peak backlog and, when the room filled and dropped, the room
+(`queue_limit` × copies), then every SLO that held at the step before the fault and breaks at one
+of its steps judged on that step alone, named by the SLO table's metric, node and op (a windowed
+SLO too: the run's verdict may still pass). `after` is a flushed cache's warm-up (`cache warm
+again in 12.1s`, the time its hit ratio is whole again) or, for every other kind, the time from the
+end of the fault to the end of the first step that leaves the backlog empty (`no backlog to drain`
+without one, `backlog not drained by the end of the run`). `recovery` is the start of the first
+step after the fault clears, inside no fault, at which every client op's p99 (the step's lognormal
+fit) and every node's rho are within 1 % of the step before the fault, with how long after the end
+of the fault that was, or `not recovered by the end of the run`. Durations in the body are seconds
+with at most one decimal (`0.2s`, `10s`). The criterion is "back where it was", not "the SLOs pass
+again": an SLO with room to spare passes while the backlog still drains, and one that failed
+before the fault never passes. A fault at the run's first step has no step before it: nothing
+flips and no recovery is judged. Without faults there is no block, and the report is byte for
+byte what it was before blocks existed.
 
 ## Command line: `simsys sweep` (phase 2c)
 
