@@ -16,6 +16,7 @@
 module;
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 export module simsys.fluid;
@@ -72,12 +73,24 @@ struct ServiceMoments {
 
 // What a scripted fault does to one replica's queue for one step (engine::Condition, phase 3 spec
 // §4.2): the replica serves `capacity_factor` of its service rate, and every request holds a server
-// `extra_service_s` longer. The identity (1, 0) changes nothing. The room and the backlog are not
-// touched: requests that were waiting keep waiting while the node is down, and drain when it is
-// back. See FluidQueue::advance(Rate, SimTime, const Derating&) for the arithmetic.
+// `extra_service_s` longer. The identity (1, 0, 0) changes nothing. The room and the backlog are
+// not touched: requests that were waiting keep waiting while the node is down, and drain when it
+// is back. See FluidQueue::advance(Rate, SimTime, const Derating&) for the arithmetic.
+//
+// `back_in_s` matters only at capacity_factor 0, an outage: the seconds until the node serves again
+// (engine::FaultSchedule: the latest end of the zero-capacity faults on it). What a request the
+// room still admits experiences is: nothing happens until the node is back, then the backlog ahead
+// of it drains at the node's NOMINAL capacity, so its wait is
+//   wait = back_in_s + backlog / nominal capacity        (the room's drain time likewise)
+// The fluid rule backlog / capacity reads that as backlog / 0 = infinity, which is right for a node
+// that never serves (a capacity of 0 by configuration keeps it), but wrong for a temporary fault: a
+// 30 s outage made every op whose path reached the node `unavailable` for the whole run, though its
+// requests were served 30 s later (or timed out at the client). Ignored: a node that comes back at
+// less than its nominal capacity (another fault still on), and the order the room is served in.
 struct Derating {
   double capacity_factor{1};
   double extra_service_s{0};
+  double back_in_s{0};
 };
 
 enum class Zone { green, yellow, red };
@@ -147,9 +160,18 @@ class FluidQueue {
   [[nodiscard]] flow::LatencyEstimate sojourn(const flow::LatencyEstimate& waited) const;
   static void require_positive_step(SimTime dt);
   [[nodiscard]] static double slowed_rate_per_s(const Capacity& capacity, double extra_s);
+  [[nodiscard]] double drain_time_s(double units) const;
+
+  // While a derated step runs at capacity 0 (an outage, see Derating): when the node serves again
+  // and the rate it then drains at. Empty in every other step.
+  struct Outage {
+    double back_in_s{};
+    double nominal_rate_per_s{};
+  };
 
   Capacity capacity_;
   double backlog_{};
+  std::optional<Outage> outage_{};
 };
 
 }  // namespace simsys::fluid
@@ -237,16 +259,23 @@ FluidStep FluidQueue::advance(Rate demand, SimTime dt) {
 //                    for independent copies (one queue per replica) that is exact, each copy
 //                    sees demand / R at a capacity × (R − r) / R, the rho of R − r copies seeing
 //                    demand / (R − r). For a pooled group it keeps c·R servers where R − r are
-//                    left: the Erlang C wait at that rho is then a little optimistic.
+//                    left: the Erlang C wait at that rho is then a little optimistic. For a
+//                    database's read replicas (a sql_db's `replicas: r`) it scales the replayed
+//                    writes too, which each surviving replica in fact replays once, whole: 1 of
+//                    2 replicas down doubles their whole rho (0.14 to 0.28 with 400 reads and 1000
+//                    replayed units at 10k/s each) where the one survivor carries 800 + 1000 units
+//                    at 10k/s, 0.18; the model is pessimistic for a replay-heavy replica.
 //   extra            a slower request: c servers each holding a request s + extra drain
 //                    c / (s + extra) per second, which is the rate × s / (s + extra) (Little's law,
 //                    the Capacity invariant rate = c / s). The service time keeps its shape (its
 //                    SCV), so an exponential service stays exponential with the longer mean: the
 //                    M/M/1 closed form W = s' / (1 − rho') holds during a latency spike. A constant
 //                    added delay would have a smaller SCV and a slightly shorter wait (ignored).
-// capacity_factor 0 is a replica that serves nothing: drain 0, the room fills and the rest is
-// dropped, the wait is infinite (backlog_wait_s), rho 1. With the identity the nominal step is
-// taken directly, so a run without faults is bit-identical to one before faults existed.
+// capacity_factor 0 is a replica that serves nothing for now (an outage): drain 0, the room fills
+// and the rest is dropped, rho 1, and a request in the room waits until the node is back, then for
+// the backlog ahead of it at the nominal capacity (Derating, drain_time_s). With the identity the
+// nominal step is taken directly, so a run without faults is bit-identical to one before faults
+// existed.
 FluidStep FluidQueue::advance(Rate demand, SimTime dt, const Derating& derating) {
   if (derating.capacity_factor == 1.0 && derating.extra_service_s == 0.0) {
     return advance(demand, dt);
@@ -255,14 +284,22 @@ FluidStep FluidQueue::advance(Rate demand, SimTime dt, const Derating& derating)
   capacity_.service_rate =
       Rate{slowed_rate_per_s(nominal, derating.extra_service_s) * derating.capacity_factor};
   capacity_.service_time_s = nominal.service_time_s + derating.extra_service_s;
+  if (capacity_.service_rate.per_second <= 0.0) {
+    outage_ = Outage{.back_in_s = derating.back_in_s,
+                     .nominal_rate_per_s = nominal.service_rate.per_second};
+  }
   const FluidStep step = advance(demand, dt);
   capacity_ = nominal;
+  outage_.reset();
   return step;
 }
 
 // The rate of servers that hold every request `extra_s` longer: rate × s / (s + extra) (see
 // above). A capacity that states no service time (s = 0: its rate is all it says) gets the rate of
-// c servers each busy `extra_s` per request, c / extra, if that is the lower.
+// c servers each busy `extra_s` per request, c / extra, if that is the lower. A node whose servers
+// come from the defaults has few short ones, and an extra of a different scale collapses it: a load
+// balancer's c = 5 at 50 µs (100k/s) drains 100k × 0.05 / 1.05 = 4.76k/s under a 1 ms spike, 95 %
+// of its capacity gone.
 double FluidQueue::slowed_rate_per_s(const Capacity& capacity, double extra_s) {
   const double rate = capacity.service_rate.per_second;
   if (!(extra_s > 0.0)) return rate;
@@ -341,29 +378,44 @@ double FluidQueue::utilization(double drain_per_s) const {
 // saturated (lambda = cap); it is a deterministic drain time, not a long-run average.
 // Uses the end-of-step backlog, so it is pessimistic by up to half a step's growth.
 //
-// With no capacity the wait never ends: +inf. Engine contract: never multiply a latency
-// by a zero weight (inf * 0 = NaN), skip branches that carry no flow, and the report
-// layer prints inf as "unavailable".
+// With no capacity: during an outage (a fault derated the node to 0, Derating) the time until the
+// node is back plus the backlog's drain at its nominal capacity (drain_time_s); a node with no
+// capacity of its own (nominal 0, by configuration) never drains, and the wait never ends: +inf.
+// Engine contract: never multiply a latency by a zero weight (inf * 0 = NaN), skip branches that
+// carry no flow, and the report layer prints inf as "unavailable".
 double FluidQueue::backlog_wait_s() const {
   const double cap = capacity_.service_rate.per_second;
-  if (cap <= 0.0) return std::numeric_limits<double>::infinity();
+  if (cap <= 0.0) return drain_time_s(backlog_);
   return backlog_ / cap;
 }
 
 // The longest anyone admitted can wait: a FULL waiting room's drain time, queue_limit / cap. A
 // request that finds the room full is dropped (spill_overflow), so one that gets in finds at most
-// queue_limit units ahead of it, drained at cap per second. +inf with no capacity, as above.
+// queue_limit units ahead of it, drained at cap per second. With no capacity, as above.
 double FluidQueue::room_drain_s() const {
   const double cap = capacity_.service_rate.per_second;
-  if (cap <= 0.0) return std::numeric_limits<double>::infinity();
+  if (cap <= 0.0) return drain_time_s(capacity_.queue_limit);
   return capacity_.queue_limit / cap;
+}
+
+// The wait of `units` ahead of a request at a node with no capacity this step: during an outage,
+// back_in_s + units / nominal capacity (Derating: nothing moves until the node is back, then it
+// drains at its own rate); +inf when there is nothing to come back to (no outage, or a nominal
+// capacity of 0 too).
+double FluidQueue::drain_time_s(double units) const {
+  if (!outage_ || !(outage_->nominal_rate_per_s > 0.0)) {
+    return std::numeric_limits<double>::infinity();
+  }
+  return outage_->back_in_s + units / outage_->nominal_rate_per_s;
 }
 
 // Sojourn time (what the book calls latency) = queueing wait (wait()) + service time
 // (sojourn()), where the queueing wait is the LARGER of two estimates (our heuristic, not a
 // published result):
 //
-//   fluid  backlog_/cap: the deterministic drain time of the backlog (backlog_wait_s()).
+//   fluid  backlog_/cap: the deterministic drain time of the backlog (backlog_wait_s()); at a
+//          node a fault took down (cap 0 for now), the time until it is back plus the backlog
+//          at its nominal capacity (Derating), and the room's bound below likewise.
 //   stoch  k * M/M/c Wq at min(rho_st, 0.99): the random bunching of arrivals that a node
 //          shows below saturation; k is the Allen–Cunneen factor (formula block above
 //          advance()), rho_st the arrivals' utilization min(demand, drain)/cap (advance()).

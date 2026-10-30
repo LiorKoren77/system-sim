@@ -434,12 +434,18 @@ std::expected<std::generator<simsys::workload::Sample>, std::string> curve_sampl
 }
 
 // One CSV row per sample, numbers in their shortest round-trip form (simsys.report: this
-// file never formats doubles itself, see the note at the top).
-void print_samples(std::generator<simsys::workload::Sample>& samples) {
+// file never formats doubles itself, see the note at the top). Each rate is times the client's
+// traffic_spike faults active at its time (model::traffic_factor_at, the product `run` offers by),
+// so a fault shows on the curve exactly as the same `spikes` entry does. With --noise the noise
+// multiplies before the factor, where `run` multiplies after it: the two orders may differ in the
+// last bit.
+void print_samples(std::generator<simsys::workload::Sample>& samples,
+                   const simsys::model::Scenario& scenario, std::string_view client) {
   std::println("t_s,rate_per_s");
   for (const auto& sample : samples) {
+    const double factor = simsys::model::traffic_factor_at(scenario.faults, client, sample.t);
     std::println("{},{}", report::format_number(simsys::seconds(sample.t)),
-                 report::format_number(sample.rate.per_second));
+                 report::format_number(sample.rate.per_second * factor));
   }
 }
 
@@ -465,7 +471,7 @@ int run_curve(const std::filesystem::path& file, const CurveArgs& args) {
     print_error(samples.error());
     return 1;
   }
-  print_samples(*samples);
+  print_samples(*samples, *scenario, client->spec->id);
   return 0;
 }
 

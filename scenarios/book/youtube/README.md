@@ -213,5 +213,11 @@ diurnal scenario with a pool, `run` is the verdict.
   run it is red for 18.62k s around the evening, its peak rho 0.9811; the European p99 rises to
   498 ms, still within 2 s.
 - Lower `cdn_eu.capacity` to `5GB/s`: `explain` puts `cdn_eu` at 141 %, red (7.04k MB/s of 5k).
-- Add `{at: 21:00, kind: dc_down, datacenter: eu-west, for: 5m}` in `faults` (`dc_down` is
-  refused until Task 7 of phase 3 lands; the other kinds run).
+- Add `faults: [{at: 21:00, kind: dc_down, datacenter: eu-west, for: 5m}]`: for 5 minutes at the
+  evening peak `cdn_eu` serves nothing, keeps 1000 MB (20 streams, which wait the outage out and
+  time out at 30 s) and drops the rest, 2.111M MB (42.2k streams: `drop rate 0.558% (worst:
+  cdn_eu)`), while the plain links that leave eu-west are cut and lose every European metadata,
+  upload_meta and upload request of those minutes (3.84k, 960 and 960); the cross-DC pipe drops
+  nothing (the CDN behind it sends it nothing) but shows red for the 300 s at capacity 0. Every
+  SLO still passes, the European stream p99 rising from 465 ms to 1.3 s (the outage's waits widen
+  the fitted lognormal).

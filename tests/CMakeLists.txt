@@ -96,3 +96,10 @@ foreach(check warmup over)
                    -DSCENARIO=${CMAKE_SOURCE_DIR}/scenarios/book/url-shortener/scenario.yaml
                    -DCHECK=${check} -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/run_duration.cmake)
 endforeach()
+
+# simsys curve, run as a process: a traffic_spike fault shows on the client's curve exactly as the
+# same `spikes` entry does (phase 3 Task 6's review).
+add_test(NAME "simsys curve applies a traffic_spike fault exactly as a spikes entry"
+         COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
+                 -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-curve-faults
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/curve_faults.cmake)

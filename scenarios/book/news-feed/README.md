@@ -113,17 +113,25 @@ every run is without it.
   within the first second, and the rest of what reaches it is dropped, **372.8k** requests, the
   day's only loss: `drop rate 0.039% (worst: post_db)`, `PASS drop_rate - - 0.0003902 0.001`.
   When it is back the 9k drain at its full capacity. The writes of `post` reach it directly, the
-  `read_feed` hydrations on a post cache miss (5 %); media reads never do. The requests the rooms
-  hold are answered once `post_db` is back, but the model gives a node of capacity 0 an infinite
-  wait (the fluid wait is backlog / capacity), so the steps that still admitted requests leave
-  `post` and `read_feed` `unavailable` for the whole day, the replication's staleness too, and
-  `run` exits 2: `FAIL p99_latency users read_feed unavailable 200ms`. Everything else, the
-  peaks included, is the day above.
+  `read_feed` hydrations on a post cache miss (5 %); media reads never do. A request the rooms
+  admitted waits for `post_db` to come back and then for the backlog ahead of it (30 s at 15:00
+  sharp, the series' `latency_ms 30012.8`), far past the users' 500 ms timeout, so it times out;
+  the steps after the rooms are full deliver nothing to `post_db`'s callers and weigh no latency.
+  The day's `read_feed` times out 0.5669 requests a second (0.0094 % of those delivered), and
+  the outage's 30 s waits widen the delivered requests' moments, so the lognormal fit's p99 rises
+  from 5.99 ms to **66.1 ms** (`post` 58 ms), still under the SLO's 200 ms: `run` exits 0, `PASS
+  p99_latency users read_feed 66.1ms 200ms`. The replication pays too: the staleness is `61ms`
+  over the day (the primaries' outage waits count in it), and when `post_db` is back its
+  primaries commit what their rooms held in one burst onto replicas whose rooms are still full,
+  so each replica misses a few replayed writes (`missed writes/s per replica 6.349e-05`, about
+  5.5 writes over the day). Everything else, the peaks included, is the day above.
 
 ## What it abstracts away
 - **Faults**, beyond capacity: the 15:00 outage takes `post_db`'s capacity and nothing else.
-  The promotion of a replica (ch. 1), clients retrying, and a post failing fast instead of
-  waiting in a room are not modelled.
+  The promotion of a replica (ch. 1: a `replicas: primary` fault stops the writes until the
+  primary is back at `at + for`), clients retrying, and a post failing fast instead of waiting in
+  a room are not modelled. A `capacity` fault derates every queue of its node alike, a
+  leaky-bucket limiter's leak (`limit`) included, were one placed in front of `post_db`.
 - Celebrity handling (fan-out on read) — model as a second client with its own op in a variant.
 - Ranking, pagination, inactive-user skipping (which the book uses to shrink fan-out).
 - The queue's partitions (`partitions: 16`, printed, not modelled) and the order of feed entries.

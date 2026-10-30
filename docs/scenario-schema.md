@@ -1393,9 +1393,9 @@ changes the numbers the node's queue is built from, and nothing else:
 
 | kind | while it lasts |
 |---|---|
-| `node_down` | the node's capacity × (R − r) / R, r of its R replicas down (a kv_cluster's machines; `primary` counts as one); every replica down: capacity 0, so nothing drains, the room fills to `queue_limit` and the rest is dropped, and the backlog drains when the fault ends. A request waiting in that room has an infinite wait (backlog / 0): an op whose path reaches it is `unavailable` for the run |
-| `capacity` | capacity × `factor`; a request still takes its service time |
-| `latency_spike` | service time + `extra`, so the node's servers drain c / (s + extra) a second |
+| `node_down` | the node's capacity × (R − r) / R, r of its R replicas down; every replica down: capacity 0, so nothing drains, the room fills to `queue_limit` and the rest is dropped, and the backlog drains when the fault ends. A request waiting in that room waits for the node to come back, then for the backlog ahead of it at the node's own capacity: `(at + for − now) + backlog / capacity` (10 s left and 40 requests at 1k/s: 10.04 s), so a client `timeout` counts it timed out and a step that delivered nothing weighs no latency (a node whose `capacity` is 0 by configuration never comes back: its ops stay `unavailable`). On a `sql_db` the two kinds of copy apart: `primary` stops the primaries (the writes wait and are dropped, the reads go on at the replicas), `replicas: r` leaves its N − 1 read replicas (N − 1 − r) / (N − 1) of their capacity and the primary whole. On a `kv_cluster` r of its machines are down: the survivors keep their own load, the coordinator sends nothing to a down machine, and a request whose key had j of its N replicas there is answered by its quorum among the N − j live ones, or lost when N − j is below W (writes) or R (reads) |
+| `capacity` | capacity × `factor`; a request still takes its service time. Every queue of the node is derated, a leaky-bucket limiter's leak (`limit`) included: `limit: 50/s` at `factor: 0.5` passes 25/s |
+| `latency_spike` | service time + `extra`, so the node's servers drain c / (s + extra) a second. On a node sized by its defaults the servers are few and short: a load balancer's c = 5 at 50 µs (100k/s) drains 5 / 1.05 ms = 4.76k/s under a 1 ms spike, 95 % of its capacity gone |
 | `traffic_spike` | the client's rate × `factor`, exactly as a `spikes` entry on its rate curve |
 | `cache_flush` | an instant, not a window: the cache's hit ratio is 0 at the step that starts at `at` and warms back (below) |
 | `dc_down` | a `node_down` of every node whose `dc` is the datacenter (clients excepted: they keep sending), and capacity 0 on every link with one end inside it and the other outside, either way. A link with a `bandwidth` is a queue of megabytes: it drains nothing, fills its room (1000 MB) and drops the rest, so nothing crosses it once the room is full. A plain link has no queue: it drops at once what it is sent, and every request over it is lost (it has no row in the link table to count them in). A link with both ends inside is not cut. Requests already in flight on a link when the cut begins still arrive |
@@ -1416,9 +1416,11 @@ the service's `on: miss` steps do. A later flush of the same cache restarts the 
 that an LRU cache refills in recency order, the thundering herd on the store, and what writes put
 back.
 
-Faults on one node compose: factors multiply, extra latencies add. The survivors of a `node_down`
-share the node's load evenly (every replica's capacity is scaled); the node comes back at full
-capacity the instant the fault ends. `estimate` is the steady state without the faults and says
+Faults on one node compose: factors multiply, extra latencies add, a kv_cluster's down machines
+add. The survivors of a `node_down` share the node's load evenly (every replica's capacity is
+scaled; a kv_cluster's survivors keep their own); the node comes back at full capacity the instant
+the fault ends, and overlapping faults that each take all of it make one outage that ends with the
+last of them. `estimate` is the steady state without the faults and says
 so: `faults: 1 scripted (estimate shows the steady state without them; run applies them)`.
 
 ```yaml
@@ -1438,7 +1440,7 @@ faults:
 | `kind` | yes | `node_down`, `capacity`, `latency_spike`, `cache_flush`, `traffic_spike` or `dc_down`; `partition` is refused (`partition is not modelled in phase 3 (see the backlog)`); a list or map is `kind must be a scalar` |
 | `for` | all kinds but `cache_flush` | a positive duration; the fault ends at `at + for`, and may run past the end of the run (it is cut there: the run ends with the fault still on). A flush is an instant: `cache_flush takes no for` |
 | `node` | all kinds but `dc_down` | a declared node; `traffic_spike` needs a client, `cache_flush` a cache or cdn, the others any node but a client (`node_down cannot name a client (clients emit, they do not serve)`) |
-| `replicas` | `node_down` only, optional | how many of the node's copies go down (default: all), 1 up to its `replicas` (beyond: `replicas must be at most 4`); for a kv_cluster, of its `nodes`. On a sql_db a count of copies per shard (each shard is a primary and `replicas - 1` read replicas: news-feed's `post_db` has `shards: 6`), or `primary`, the writer, which phase 3 takes as one copy of the shard's R down (its share of the capacity; what a failed-over primary does to writes is a phase 4 backlog item). On a sql_db of one copy `primary` is the whole node, like a `node_down` without `replicas` |
+| `replicas` | `node_down` only, optional | how many of the node's copies go down (default: all), 1 up to its `replicas` (beyond: `replicas must be at most 4`); for a kv_cluster, of its `nodes`. On a sql_db a count of copies per shard (each shard is a primary and `replicas - 1` read replicas: news-feed's `post_db` has `shards: 6`): `replicas: r` below `replicas` takes r of the read replicas and leaves the primary (all of them: the whole node), and `primary` takes the writer, whose writes stop while the reads go on (the engine tells the two apart; the primary comes back at `at + for`, no replica is promoted). On a sql_db of one copy `primary` and `replicas: 1` are both the whole node, like a `node_down` without `replicas` |
 | `factor` | `capacity`, `traffic_spike` | a number (`three`, `"3"`, `2k`, `50%`: `factor must be a number`); `capacity`: strictly between 0 and 1; `traffic_spike`: positive, at most 1e6 |
 | `extra` | `latency_spike` | a positive duration added to the node's service time |
 | `datacenter` | `dc_down` | a declared datacenter |

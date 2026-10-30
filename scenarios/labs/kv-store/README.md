@@ -26,17 +26,22 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   16 such shares sits z_16 = 1.77 spreads above it (the expected maximum of 16 normals), so it
   carries 1 + 1.77/sqrt(450) = **1.0834** times the average: 5.625k/s on average (56.25 %),
   **6.094k/s (60.9 %)** on the hottest. The simulator runs that machine as its own queue, so the
-  `utilization` SLO reads it: 0.6094 outside the fault below. (A heuristic checked against
+  `utilization` SLO reads it: 0.6094, the fault below included. (A heuristic checked against
   Monte Carlo rings: [numerics, section 8](../../../docs/study/numerics.md).)
-- **A machine down.** The lab scripts one of the 16 machines down for 3 minutes from 10 m
-  (`replicas: 1`). The model takes its share of the capacity: every machine serves 15/16 of its
-  10k/s while it lasts, the survivors sharing the load evenly, so the hot machine runs at 0.6094
-  × 16/15 = **0.65** for those 3 minutes (`peak_rho 0.65`), and the SLO's mean over the 29
-  observed minutes is 0.6094 × (26 + 3 × 16/15) / 29 = **0.6136**. Nothing is dropped and the
-  quorum barely notices: the mean request takes 1.55 ms instead of 1.54 ms, the p99 stays 2.31
-  ms. Only the capacity is modelled: the replica sets the down machine was in still count it
-  (the quorum's loss of a replica is later in phase 3), and its keys do not move to the next
-  machines on the ring.
+- **A machine down: quorum loss under machine failure** (ch. 6, "handling failures"). The lab
+  scripts one of the 16 machines down for 3 minutes from 10 m (`replicas: 1`). The coordinator
+  sends nothing to it, and the 15 live machines keep their own keys and load: no sloppy quorum or
+  hinted handoff moves its replicas to the next machines (strict quorum). So the store is sent one
+  cool machine's share less, 90k − 90k × (16 − k)/(16 × 15) = **84.41k** replica-requests/s, the
+  hot machine stays at 0.6094 (the down machine is taken from the cool ones), and the SLO's mean
+  is **0.6094**. The keys whose replica set held the down machine (2 of the 15 cool machines are in
+  a set with the hot one, 3 of 15 in a set of three cool ones: the hypergeometric share, N/M of
+  the keys on an even ring) have 2 live replicas instead of 3. W = R = 2 is still met, so nothing
+  is lost, but their quorum is the 2nd of 2 replies, slower than the 2nd of 3: the mean request
+  takes **1.58 ms** during the fault instead of 1.54 ms, and the run's p99 is 2.33 ms (2.31 ms
+  without the fault). Take two machines down (`replicas: 2`) and a key whose set held both has
+  one live replica, below the quorum: those requests are lost (the closed form is pinned in
+  `tests/theory/test_faults.cpp`).
 - **Quorum latency over the real replica set.** A read is answered when the R-th fastest of its
   key's three replicas replies, a write when the W-th does. The three are three DIFFERENT
   machines, so at most one is the hot one: it is in a request's set with probability
@@ -54,14 +59,16 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
 - `run` (30 minutes, 1 minute of warmup, the fault included) passes all three SLOs, exit 0:
 
   ```
-  PASS    p99_latency  clients  put  2.31ms    20ms
-  PASS    utilization  store    -    0.6136    0.8
+  PASS    p99_latency  clients  put  2.33ms    20ms
+  PASS    utilization  store    -    0.6094    0.8
   PASS    drop_rate    -        -    0         0.01
   ```
 
 ## What it abstracts away
-- A machine down costs capacity only (above): sloppy quorum and hinted handoff are not modelled,
-  nor is a down machine's place in its keys' replica sets.
+- A machine down loses its replicas (above), and nothing takes them over: sloppy quorum and
+  hinted handoff are not modelled, so a key that lost its quorum is lost rather than written to
+  the next machine on the ring. Which machine goes down is not chosen either: it is always a cool
+  one, never the hot machine.
 - Network partitions are not modelled: they are a phase 4 backlog item, and the loader refuses
   `kind: partition` (`partition is not modelled in phase 3 (see the backlog)`), so what `mode: ap`
   or `cp` does under a partition (stale versus unavailable) cannot be shown. `mode` is printed,

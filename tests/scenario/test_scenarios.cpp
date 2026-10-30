@@ -669,11 +669,16 @@ TEST_CASE("book/news-feed with 8 fan-out workers falls 200 s behind in the spike
 //   dropped  = what arrived during the outage - 9,000          (fluid conservation, drain 0)
 // and nothing is dropped outside it: once back, post_db drains the 9,000 at its full capacity. The
 // day runs at 10 s steps (8,640; the outage is the three steps from 15:00), which changes none of
-// this. What waits in the rooms is answered when post_db is back, but a node of capacity 0 has no
-// finite wait (fluid::FluidQueue::backlog_wait_s, backlog / 0), so the requests it still admitted
-// give the ops whose path reaches it an infinite latency that step: the day's `read_feed` is
-// unavailable and its p99 SLO fails on it, while the drop_rate SLO passes (0.039 % of 0.1 %).
-TEST_CASE("book/news-feed's 30 second post_db outage drops what reaches it beyond its rooms",
+// this. What waits in the rooms is answered when post_db is back: a request the rooms admitted
+// waits the rest of the outage, then the backlog ahead of it (fluid::Derating; Task 6's review),
+// 30 s at the first step, far past the users' 500 ms timeout, so those requests time out. The steps
+// after the rooms are full deliver nothing to post_db's callers and weigh no latency. So the day's
+// `read_feed` is answered with a finite latency: its timed-out share is the outage's few (a reader
+// reaches post_db only on a post-cache miss), well under 1 % of what was delivered, so its p99 is
+// the lognormal fit's and not the timeout (`>500ms`), at most the timeout and under the SLO's 200
+// ms: the p99 SLO passes, as does the drop_rate SLO (0.039 % of 0.1 %). Before the review the
+// capacity 0 gave an infinite wait and the whole day's `read_feed` was `unavailable`.
+TEST_CASE("book/news-feed's 30 second post_db outage drops beyond its rooms and times out the rest",
           "[scenario]") {
   using namespace std::chrono_literals;
   auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/news-feed/scenario.yaml");
@@ -700,14 +705,29 @@ TEST_CASE("book/news-feed's 30 second post_db outage drops what reaches it beyon
   const NewsFeedDay day{summary.nodes(), summary.drop_rate(),
                         simsys::report::evaluate_slos(summary, s.slos)};
   REQUIRE_THAT(day.node("post_db").peak_backlog, Catch::Matchers::WithinRel(rooms, 1e-9));
-  REQUIRE(day.node("post_db").peak_rho == 1.0);  // capacity 0 counts as saturated (utilization)
+  REQUIRE(day.node("post_db").peak_rho == 1.0);    // capacity 0 counts as saturated (utilization)
+  REQUIRE_FALSE(day.node("post_db").unavailable);  // its wait is finite: it comes back
   const auto& drops = day.slo(simsys::model::SloMetric::drop_rate);
   REQUIRE(drops.status == simsys::report::SloStatus::pass);
   REQUIRE_THAT(*drops.observed, Catch::Matchers::WithinRel(day.drop_rate, 1e-12));
+
+  const auto ops = summary.ops();
+  const auto read_feed = std::ranges::find(ops, "read_feed", &simsys::report::OpSummary::op);
+  REQUIRE(read_feed != ops.end());
+  CAPTURE(read_feed->timed_out_share, read_feed->timed_out_per_s, read_feed->p99_s);
+  REQUIRE(read_feed->timeout_s == 0.5);
+  REQUIRE(read_feed->timed_out_share > 0.0);   // the outage's requests timed out ...
+  REQUIRE(read_feed->timed_out_share < 0.01);  // ... under 1 % of those delivered: the p99 is a fit
+  REQUIRE(std::isfinite(read_feed->p99_s));
+  REQUIRE(read_feed->p99_s < 0.5);  // capped at the timeout, and not the timeout itself
+  // Measured at these 10 s steps (the shipped 100 ms day: 0.5669 timed out/s, p99 66.1 ms): 0.0118
+  // % of the delivered reads timed out, and the outage's 30 s waits spread the delivered requests'
+  // moments, so the lognormal fit's p99 is 67.0 ms (5.99 ms on the day without the outage).
+  REQUIRE_THAT(read_feed->timed_out_share, Catch::Matchers::WithinRel(1.1790522614748e-4, 1e-6));
+  REQUIRE_THAT(read_feed->p99_s, Catch::Matchers::WithinRel(0.0669896985948232, 1e-6));
   const auto& p99 = day.slo(simsys::model::SloMetric::p99_latency);
-  REQUIRE(p99.status == simsys::report::SloStatus::fail);
-  REQUIRE(p99.observed.has_value());
-  REQUIRE(std::isinf(*p99.observed));
+  REQUIRE(p99.status == simsys::report::SloStatus::pass);
+  REQUIRE(p99.observed == read_feed->p99_s);
 }
 
 // Spec §19 entry 2: byte-sized nodes count megabytes, so the capacities the 2b scenarios gave no
@@ -1141,18 +1161,21 @@ TEST_CASE("explain on the shipped scenarios prints each external sink's failure 
 //   average node  90k / 16 = 5.625k/s   = 56.25 %
 //   hottest node  k x 5.625k, k = 1 + z_16/sqrt(3 x 150) = 1.08338 (z_16 = 1.7688, the expected
 //                 maximum of 16 standard normals; 150 vnodes), = 6.094k/s = 60.94 %
-// The `utilization` SLO (max 0.8) is read at the hottest node, whose mean over the run is 0.6094
-// but for the lab's scripted fault (phase 3 Task 6): one machine of 16 down for 3 minutes from 10 m
-// leaves 15/16 of every machine's capacity (the survivors share the load evenly), so the hot
-// machine runs at 0.6094 x 16/15 = 0.6500 for 3 of the 29 observed minutes (30, 1 of warmup):
-//   mean = 0.6094 x (26 + 3 x 16/15) / 29 = 0.6094 x 29.2 / 29 = 0.6136, and passes;
-// the `drop_rate` SLO (max 0.01) sees nothing dropped; the put's p99 (max 20 ms) is far below it: a
-// put crosses four 0.25 ms link legs (1 ms), the coordinator (0.2 ms of service, utilization 0.5
-// over 4 x 15k/s: 0.232 ms with its Erlang wait) and the W = 2 quorum over its key's real replicas
-// (with probability p_hot = 3k/16 = 0.203 the hot machine and two cool ones, otherwise three cool
-// ones; each machine's sojourn a lognormal of its own moments: 0.313 ms), so its mean is 1.544 ms
-// and the lognormal fit's p99 2.31 ms (2.41 ms before, when every replica was an exponential of the
-// machines' mean sojourn).
+// The `utilization` SLO (max 0.8) is read at the hottest node: 0.6094 over the whole run, the lab's
+// scripted fault included (phase 3 Task 6): one machine of 16 down for 3 minutes from 10 m is a
+// cool one, and the survivors keep their own load (strict quorum: nothing moves a dead machine's
+// replicas to the next machines, Task 6's review), so the coordinator sends the store
+//   90k − 90k x (16 − k) / (16 x 15) = 84.41k replica-requests/s   (one cool machine's share less)
+// while the fault lasts, every live machine at its own rho; the `drop_rate` SLO (max 0.01) sees
+// nothing dropped; the put's p99 (max 20 ms) is far below it: a put crosses four 0.25 ms link legs
+// (1 ms), the coordinator (0.2 ms of service, utilization 0.5 over 4 x 15k/s: 0.232 ms with its
+// Erlang wait) and the W = 2 quorum over its key's real replicas (with probability p_hot = 3k/16 =
+// 0.203 the hot machine and two cool ones, otherwise three cool ones; each machine's sojourn a
+// lognormal of its own moments: 0.313 ms), so its mean is 1.544 ms. During the fault the keys whose
+// set holds the down machine (2/15 of the {hot, 2 cool} sets, 3/15 of the {3 cool} ones) are
+// answered by the 2nd of their 2 live replicas, slower than the 2nd of 3: the mean is 1.584 ms
+// then, and the lognormal fit's p99 over the run 2.33 ms (2.31 ms without the fault; 2.41 ms before
+// every replica had its own lognormal).
 namespace {
 // The lab with its store at `nodes` machines of `vnodes` virtual nodes each, `minutes` long.
 simsys::model::Scenario kv_lab(int nodes, int vnodes, std::chrono::minutes minutes) {
@@ -1181,15 +1204,44 @@ TEST_CASE(
   }
   const auto& utilization = slo_of(results, simsys::model::SloMetric::utilization);
   REQUIRE(utilization.observed.has_value());
-  const double hottest = 90'000.0 / 16.0 / 10'000.0 * ring_factor(16, 3, 150);  // no fault
-  REQUIRE_THAT(*utilization.observed,
-               Catch::Matchers::WithinRel(hottest * (26.0 + 3.0 * 16.0 / 15.0) / 29.0, 1e-3));
-  REQUIRE_THAT(*utilization.observed, Catch::Matchers::WithinAbs(0.6136, 5e-4));
+  const double hottest = 90'000.0 / 16.0 / 10'000.0 * ring_factor(16, 3, 150);  // the fault too
+  REQUIRE_THAT(*utilization.observed, Catch::Matchers::WithinRel(hottest, 1e-3));
+  REQUIRE_THAT(*utilization.observed, Catch::Matchers::WithinAbs(0.6094, 5e-4));
   const auto& drops = slo_of(results, simsys::model::SloMetric::drop_rate);
   REQUIRE(drops.observed == 0.0);
   const auto& p99 = slo_of(results, simsys::model::SloMetric::p99_latency);
   REQUIRE(p99.observed.has_value());
-  REQUIRE_THAT(*p99.observed, Catch::Matchers::WithinAbs(2.31e-3, 0.01e-3));
+  REQUIRE_THAT(*p99.observed, Catch::Matchers::WithinAbs(2.33e-3, 0.01e-3));
+}
+
+// The lab's fault seen at the store (comment above): one of 16 machines down for 3 minutes from
+// 10 m. The coordinator sends nothing to it and the 15 live machines keep their own share, so the
+// store is sent one cool machine's share less, 90k − 90k (16 − k) / 240 = 84.41k
+// replica-requests/s, and drops nothing; with two live replicas still meeting W = R = 2, every
+// request is answered.
+TEST_CASE(
+    "labs/kv-store with one machine down is sent one cool machine's share less and loses "
+    "nothing",
+    "[scenario]") {
+  using namespace std::chrono_literals;
+  auto s = load_scenario("/labs/kv-store/scenario.yaml");
+  s.duration = 12min;
+  const auto g = build_or_fail(s);
+  const auto store = *g.index_of("store");
+  const double k = ring_factor(16, 3, 150);
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  sim->run({.duration = s.duration, .step = s.step}, [&](const simsys::engine::StepRecord& r) {
+    if (r.t != 9min && r.t != 11min) return;
+    CAPTURE(r.t.count());
+    const double expected = r.t == 9min ? 90'000.0 : 90'000.0 - 90'000.0 * (16.0 - k) / 240.0;
+    REQUIRE_THAT(r.nodes[store].demand_per_s, Catch::Matchers::WithinRel(expected, 1e-6));
+    REQUIRE_THAT(r.nodes[store].dropped_per_s, Catch::Matchers::WithinAbs(0.0, 1e-9));
+    for (const auto& response : r.responses) {
+      REQUIRE_THAT(response.answered.per_second,
+                   Catch::Matchers::WithinRel(response.offered.per_second, 1e-12));
+    }
+  });
 }
 
 // The lesson the lab's comment states: the same lab at the book's eight nodes is over capacity. 90k

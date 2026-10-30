@@ -521,14 +521,19 @@ class Simulation {
   // what they drained, in requests per second, for the behaviour to route.
   [[nodiscard]] flow::Flow serve(std::size_t index, SimTime dt, Mode mode,
                                  const Condition& condition, NodeSample& sample);
-  [[nodiscard]] static GroupStep advance_group(CopyGroup& group, const flow::Flow& arrivals,
-                                               SimTime dt, Mode mode,
+  [[nodiscard]] static GroupStep advance_group(CopyGroup& group, double copies,
+                                               const flow::Flow& arrivals, SimTime dt, Mode mode,
                                                const fluid::Derating& derating);
-  [[nodiscard]] static GroupStep serve_copies(CopyGroup& group, const flow::Flow& arrivals,
-                                              SimTime dt, Mode mode,
+  [[nodiscard]] static GroupStep serve_copies(CopyGroup& group, double copies,
+                                              const flow::Flow& arrivals, SimTime dt, Mode mode,
                                               const fluid::Derating& derating,
                                               const behaviours::Behaviour& behaviour,
                                               NodeSample& sample);
+  [[nodiscard]] static double part_factor(const Condition& condition, CopyRole role);
+  [[nodiscard]] static double serving_copies(const Node& node, std::size_t group,
+                                             const Condition& condition);
+  [[nodiscard]] static int machines_down(const Node& node, std::size_t group,
+                                         const Condition& condition);
   [[nodiscard]] static flow::Flow group_arrivals(const CopyGroup& group, const flow::Flow& reads,
                                                  const flow::Flow& writes);
   static void replay_committed(const CopyGroup& group, const GroupStep& step,
@@ -551,7 +556,8 @@ class Simulation {
       const behaviours::MegabyteService& megabyte_service);
   static void record_replication(const Node& node, std::span<const flow::LatencyEstimate> sojourns,
                                  const ReplicationTally& tally, NodeSample& sample);
-  [[nodiscard]] static flow::Flow take_drained(CopyGroup& group, const flow::Flow& content,
+  [[nodiscard]] static flow::Flow take_drained(CopyGroup& group, double copies,
+                                               const flow::Flow& content,
                                                const fluid::FluidStep& copy_step);
   void send(std::size_t index, const behaviours::Routed& routed, SimTime now, SimTime dt, Mode mode,
             std::span<LinkSample> link_samples);
@@ -657,11 +663,14 @@ namespace {
   return std::nullopt;
 }
 
-// The fluid queue's view of a node's condition (fluid::Derating): its capacity factor and its
-// extra latency in seconds. The identity condition gives the identity derating (seconds(0) is 0).
-[[nodiscard]] fluid::Derating derating_of(const Condition& condition) {
-  return fluid::Derating{.capacity_factor = condition.capacity_factor,
-                         .extra_service_s = seconds(condition.extra_latency)};
+// The fluid queue's view of a node's condition (fluid::Derating): its capacity factor (times
+// `part_factor`, a sql_db's primaries' or read replicas' own: Simulation::part_factor), its extra
+// latency in seconds and the time until it is back from an outage. The identity condition gives the
+// identity derating (seconds(0) is 0, 1 × 1 is 1).
+[[nodiscard]] fluid::Derating derating_of(const Condition& condition, double part_factor = 1.0) {
+  return fluid::Derating{.capacity_factor = condition.capacity_factor * part_factor,
+                         .extra_service_s = seconds(condition.extra_latency),
+                         .back_in_s = condition.back_in_s};
 }
 
 void add_once(std::vector<std::size_t>& links, std::size_t link) {
@@ -1744,13 +1753,17 @@ void Simulation::receive(std::size_t index, Mode mode) {
 // queueing type (a service, a balancer, a limiter's gate or leaky bucket, a cache's or a CDN's
 // lookup, a database's primaries and replicas, a kv_cluster's machines, a worker pool, a broker, a
 // sink) is derated alike, because its queues are built here; its behaviour sees only what drained.
-// A node_down of every copy is capacity 0: nothing drains, the room fills to queue_limit and the
-// rest is dropped, and when the fault ends the backlog drains at the restored capacity.
+// Two kinds of node are told apart further: a sql_db's primaries and read replicas take their own
+// factor too (part_factor: `replicas: primary` stops the writes, `replicas: r` the share of the
+// reads' copies), and a kv_cluster's down machines leave its cool group (serving_copies: the
+// survivors keep their own load; the quorum over the live replicas is its behaviour's, told by
+// machines_down). A node_down of every copy is capacity 0: nothing drains, the room fills to
+// queue_limit and the rest is dropped, a request in the room waits until the node is back
+// (Condition::back_in_s) and when the fault ends the backlog drains at the restored capacity.
 flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, const Condition& condition,
                              NodeSample& sample) {
   auto& node = nodes_[index];
   time_whole_objects(node);
-  const fluid::Derating derating = derating_of(condition);
   // Not const: `writes` becomes the primaries' committed writes below.
   auto [reads, writes] = split_writes(in_units(node.inflow, node.behaviour), node.behaviour);
   flow::Flow drained;
@@ -1763,8 +1776,11 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, const Con
   std::array<behaviours::MachineGroup, max_copy_groups> machines{};
   for (std::size_t i = 0; i < node.copy_groups.size(); ++i) {
     auto& group = node.copy_groups[i];
+    const fluid::Derating derating = derating_of(condition, part_factor(condition, group.role));
+    const double serving = serving_copies(node, i, condition);
     const flow::Flow arrivals = group_arrivals(group, reads, writes);
-    GroupStep step = serve_copies(group, arrivals, dt, mode, derating, node.behaviour, sample);
+    GroupStep step =
+        serve_copies(group, serving, arrivals, dt, mode, derating, node.behaviour, sample);
     // The busiest kind of copy speaks for the node's load: the hottest copy behind a ring (it
     // takes the largest share), the busier of a database's primary and replicas.
     if (i == 0 || step.copy.rho > sample.rho) {
@@ -1773,11 +1789,13 @@ flow::Flow Simulation::serve(std::size_t index, SimTime dt, Mode mode, const Con
     }
     sojourns[i] = step.copy.latency;
     waits[i] = with_extra_before_bytes(step.copy.wait, node.behaviour, derating);
-    // One machine's sojourn, and the share the group's copies kept of what they were sent (the
-    // arrivals are one copy's; step.dropped is the group's): a kv_cluster's quorum reads both.
+    // One machine's sojourn, the share the group's serving copies kept of what they were sent
+    // (the arrivals are one copy's; step.dropped is the group's) and how many of its machines are
+    // down: a kv_cluster's quorum reads all three.
     machines[i] = {.sojourn = step.copy.latency,
                    .kept = kept_fraction(step.dropped.total().per_second,
-                                         arrivals.total().per_second * group.copies)};
+                                         arrivals.total().per_second * serving),
+                   .down = machines_down(node, i, condition)};
     replay_committed(group, step, node.behaviour, writes, replication);
     drained += clients_part(group, std::move(step.drained), node.behaviour);
     dropped += clients_part(group, std::move(step.dropped), node.behaviour);
@@ -1986,30 +2004,71 @@ void Simulation::record_replication(const Node& node,
 }
 
 // One copy group's step (replicas, spec §16 entry 4): `waiting` and the queue describe one copy,
-// which is sent `arrivals` (group_arrivals). Returns one copy's fluid step and what the group's
-// copies drained (and, at a database replica, dropped), and adds the clients' part (clients_share)
-// of their totals to `sample` (add_copies).
-Simulation::GroupStep Simulation::serve_copies(CopyGroup& group, const flow::Flow& arrivals,
-                                               SimTime dt, Mode mode,
+// which is sent `arrivals` (group_arrivals), and `copies` of the group serve this step (its
+// copies, but for a kv_cluster's down machines: serving_copies). Returns one copy's fluid step and
+// what the serving copies drained (and, at a database replica, dropped), and adds the clients'
+// part (clients_share) of their totals to `sample` (add_copies).
+Simulation::GroupStep Simulation::serve_copies(CopyGroup& group, double copies,
+                                               const flow::Flow& arrivals, SimTime dt, Mode mode,
                                                const fluid::Derating& derating,
                                                const behaviours::Behaviour& behaviour,
                                                NodeSample& sample) {
-  GroupStep step = advance_group(group, arrivals, dt, mode, derating);
+  GroupStep step = advance_group(group, copies, arrivals, dt, mode, derating);
   // The queue is well-mixed (see serve): what it drains, drops and holds has the content's op
   // mix, so the clients' share of the content is their share of each of those.
-  add_copies(sample, step.copy, group.copies, clients_share(group, arrivals, behaviour),
+  add_copies(sample, step.copy, copies, clients_share(group, arrivals, behaviour),
              clients_share(group, step.content, behaviour));
   return step;
+}
+
+// A sql_db's primaries and read replicas each take their own factor beside the node's
+// (Condition::primary_factor, replica_factor: FaultSchedule::database_down); every other group,
+// a server, takes the node's alone (1 here).
+double Simulation::part_factor(const Condition& condition, CopyRole role) {
+  switch (role) {
+    case CopyRole::primary:
+      return condition.primary_factor;
+    case CopyRole::replica:
+      return condition.replica_factor;
+    case CopyRole::server:
+      return 1.0;
+  }
+  std::unreachable();  // every role has its case (-Wswitch names a new one)
+}
+
+// The copies of group `group` that serve this step: all of them, but on a kv_cluster with machines
+// down (Condition::machines_down, book ch. 6) those machines come out of its cool group, the last
+// one (the only one on an even ring): the hot machine stays up, so the utilization its SLO reads
+// is unchanged. The coordinator sends nothing to a down machine and the survivors keep their own
+// keys (strict quorum: no sloppy quorum or hinted handoff moves a dead machine's replicas to the
+// next ones), so each live machine is sent what it was before and the cluster's demand, drain and
+// backlog count the live ones only. Which requests lose their quorum is the behaviour's
+// (KvClusterBehaviour, told the down machines by machines_down).
+double Simulation::serving_copies(const Node& node, std::size_t group, const Condition& condition) {
+  const double copies = node.copy_groups[group].copies;
+  const int down = machines_down(node, group, condition);
+  return down == 0 ? copies : copies - static_cast<double>(down);
+}
+
+// How many of group `group`'s machines are down (serving_copies): a kv_cluster's cool group takes
+// them all, at most its copies; 0 for every other group and node.
+int Simulation::machines_down(const Node& node, std::size_t group, const Condition& condition) {
+  if (condition.machines_down == 0 || group + 1 != node.copy_groups.size() ||
+      !std::holds_alternative<behaviours::KvClusterBehaviour>(node.behaviour)) {
+    return 0;
+  }
+  const auto copies = static_cast<int>(node.copy_groups[group].copies);
+  return std::min(condition.machines_down, copies);
 }
 
 // The fluid step of one copy of `group`, sent `arrivals` (per op, in capacity units per second),
 // derated by the node's condition (fluid::Derating: every copy of the group alike, the survivors of
 // a node_down sharing its load evenly; the identity outside every fault and when estimating),
-// settled first when estimating, and what the group's copies drained and dropped of it, per op,
-// in the content's mix (the queue is well-mixed, see serve). Every copy group of a node runs
-// through here (serve_copies), and so does a bandwidth link's pipe (pass_through_pipe).
-Simulation::GroupStep Simulation::advance_group(CopyGroup& group, const flow::Flow& arrivals,
-                                                SimTime dt, Mode mode,
+// settled first when estimating, and what its `copies` serving copies drained and dropped of it,
+// per op, in the content's mix (the queue is well-mixed, see serve). Every copy group of a node
+// runs through here (serve_copies), and so does a bandwidth link's pipe (pass_through_pipe).
+Simulation::GroupStep Simulation::advance_group(CopyGroup& group, double copies,
+                                                const flow::Flow& arrivals, SimTime dt, Mode mode,
                                                 const fluid::Derating& derating) {
   const Rate per_copy = arrivals.total();
   if (mode == Mode::settle) {
@@ -2018,10 +2077,10 @@ Simulation::GroupStep Simulation::advance_group(CopyGroup& group, const flow::Fl
   }
   GroupStep step{.content = queue_content(group.waiting, arrivals, dt)};
   step.copy = group.queue.advance(per_copy, dt, derating);
-  step.drained = take_drained(group, step.content, step.copy);
+  step.drained = take_drained(group, copies, step.content, step.copy);
   // Every group's drops, per op: a replica's replayed writes it missed (replay_committed) and,
   // on every node, the requests lost (account_rejections).
-  step.dropped = dropped_part(step.content, step.copy, group.copies);
+  step.dropped = dropped_part(step.content, step.copy, copies);
   return step;
 }
 
@@ -2037,9 +2096,9 @@ flow::Flow Simulation::dropped_part(const flow::Flow& content, const fluid::Flui
 // Splits one copy's content (see serve) by the totals of its fluid step: keeps the
 // still-waiting part in `group.waiting` and returns the drained part as the group's
 // forwarded rate per op in units, content × (drain_per_s × copies) / content_total: the
-// drained units per copy (drain × dt) over dt, times the copies. An empty queue with no
+// drained units per copy (drain × dt) over dt, times the serving copies. An empty queue with no
 // arrivals has nothing to split.
-flow::Flow Simulation::take_drained(CopyGroup& group, const flow::Flow& content,
+flow::Flow Simulation::take_drained(CopyGroup& group, double copies, const flow::Flow& content,
                                     const fluid::FluidStep& copy_step) {
   const double content_total = content.total().per_second;  // units, see CopyGroup::waiting
   if (content_total <= 0.0) {
@@ -2047,7 +2106,7 @@ flow::Flow Simulation::take_drained(CopyGroup& group, const flow::Flow& content,
     return flow::Flow{};
   }
   group.waiting = content.scaled(copy_step.backlog / content_total);
-  return content.scaled(copy_step.drain_per_s * group.copies / content_total);
+  return content.scaled(copy_step.drain_per_s * copies / content_total);
 }
 
 // What node `index` routed goes onto its links: summed per link (one push per link and step,
@@ -2113,8 +2172,9 @@ void Simulation::pass_through_pipe(Link& link, SimTime dt, Mode mode, const Cond
   }
   const flow::Flow megabytes = to_megabytes(requests, pipe.megabytes_by_op);
   const bool idle = requests.total().per_second <= 0.0;
-  // The link's condition (send): the identity, or a dc_down's capacity 0.
-  const GroupStep step = advance_group(pipe.group, megabytes, dt, mode, derating_of(condition));
+  // The link's condition (send): the identity, or a dc_down's capacity 0 until the cut ends.
+  const GroupStep step =
+      advance_group(pipe.group, pipe.group.copies, megabytes, dt, mode, derating_of(condition));
   pipe.wait = step.copy.wait;
   pipe.passed = kept_share(step.dropped, megabytes);
   link_samples[pipe.slot] =
