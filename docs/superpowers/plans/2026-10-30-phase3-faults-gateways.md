@@ -386,6 +386,25 @@ and the sink's paper load by `A(f, n) = Σ f^k`; 9 → with Task 10's item 2 aft
 - [ ] Tests: hello with `noise: {sigma: 0.2}` on its client and `--replications 5`: five different `users.ping.mean` values (the seeds differ), the printed median equals the sorted third value, the band the 10 % and 90 % quantiles by the report's quantile rule (nearest-rank, pinned), `--jobs 1` and `--jobs 4` byte-identical; a scenario without noise prints `replications: the scenario has no noise, so every seed gives the same run` and runs once; `--replications 1` is the plain run byte for byte; an SLO failing in 2 of 5 seeds prints `PASS in 3 of 5`; `--replications 0` and `1001` refused.
 - [ ] Commit `cli: run --replications N repeats a run over seeds of the rate noise and prints bands`.
 
+**Review of Task 12 at `d3fc14b`** (adversarial, 2026-10-30): APPROVE with fixes before merge.
+Per-seed JSON digit-identical to single runs, bands by hand sort, even-n rule, seeds, refusals,
+`--jobs` independence, timing (1000 noiseless replications 0.12 s), noiseless JSON, column
+alignment, the fault block once, the eighth GCC defect reproduced, identity on 14 scenarios + sweep.
+1. Important: each SLO is judged by its own median run (the better reading of §7), but the table
+   names one "median run" and the exit code may come from another: show each SLO's median seed in
+   its row and the JSON (`median_seed`), reword the intro ("the summary line and the fault blocks are
+   seed 2's"), README's singular wording, spec §7 amended in Task 19.
+2. Important: `docs/study/threads.md` says the threads share nothing; replications share the `Graph`
+   read-only.
+3. Minor: `sigma: 0` counts as noise. 4. Minor: the eighth-defect entry cites a file with no `<set>`
+and claims an include order the config units do not follow. 5. Minor: `nearest_rank`'s float example
+is false (`0.1 × 10` is exact; `0.07 × 100` is not). 6. Minor: `ranges::stable_sort` labelled C++23.
+7. Minor: `display_width`'s comment overclaims (a wide character in a node id misaligns its row).
+8. Minor: no test pins the stderr note under `--report json`. 9. Minor: `run --jobs` without
+`--replications` is silently ignored. 10. Minor: `figures_of(runs)` evaluated twice; a raw pointer
+search in `text_band`; `banded_parts` copies meaningless numbers.
+Decisions: all fixed in the fix round (9 → "ignored without --replications" in the help text).
+
 - [ ] **3b push.** CI green; the ten runnable scenarios byte-identical to the 3a push except the new columns (`attempts/s`, `dead_lettered/s`) and the chain hash.
 
 ---
