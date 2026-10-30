@@ -501,6 +501,8 @@ identity vs the parent, §2 and §3 verified.
    20 × 10k/s: the scenario's sizing lesson.
 Decisions: 1, 3–8 fixed in a fix round after Task 13 merges (same files); 2 and 9 to Task 15 with the
 recommendation above.
+Fixed at `6aac614` (1570 tests; the sweep metric reads the end-of-run level; the settling note is
+left out when the cap stops the rise).
 
 Note for Task 15 (from Task 14's implementer, 2026-10-30): chat-system's gateway has `fanout: 1.4` and
 its `sync_workers` deliver with `factor: 1.4`, so the scenario now fans out twice on paper (message_store
