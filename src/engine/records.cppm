@@ -134,6 +134,16 @@ struct NodeSample {
   // failed was its call), and nothing is lost from any node's books. 0 on a pool that retries
   // nothing (it has the counter, at 0); empty on every other node, which has no dead-letter queue.
   std::optional<double> dead_lettered_per_s{};
+  // A message queue's jobs re-published to it this step by its consumer groups (a worker pool's
+  // retries, behaviours::WorkerPoolBehaviour), per second: a part of `demand_per_s`, so that
+  // demand − republished is what the producers published (report::Summary::dead_letter_rate's
+  // denominator). 0 on a queue whose groups retry nothing; empty on every other node.
+  std::optional<double> republished_per_s{};
+  // An external sink's demand that came from worker pools with `retries`, per second, in the
+  // sink's units like `demand_per_s` (demand × the share of its arrivals those calls were): the
+  // calls whose failures are attempted again, so the drop rate leaves their share of the drops out
+  // (report::Summary::drop_rate). Empty on every other node and on a sink no retrying pool calls.
+  std::optional<double> retried_demand_per_s{};
 };
 
 // What a client sees for one op: the rate it offers, the part of it that comes back answered, and

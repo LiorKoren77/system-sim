@@ -54,18 +54,25 @@ Once `notification_fanout` runs, the scenario is meant to show the following.
   pool's `retries` exist now too (phase 3, see
   [`message_queue` and `worker_pool`](../../../docs/scenario-schema.md#message_queue-and-worker_pool)):
   a pool with `retries: 3` puts a send its provider failed back on its queue a second later
-  (`retry_after`, default 1 s), up to three times, and the job whose fourth attempt fails too is a
-  **dead letter**, counted in the pool's `dead_lettered/s` and never as a drop; a provider called
-  only by such pools has a drop rate of 0. This file's pools do not state `retries` yet (the
-  scenario does not run before `notification_fanout` does), so as written the 1–5 % provider
-  failures alone would keep the `drop_rate` SLO (0.001) from passing. With `retries: 3` on the four
-  pools, at the average 1.9k notifications/s (dedup left aside), each pool would dead-letter its
-  rate × f⁴: iOS 1140 × 0.02⁴ = 1.82e-4/s, Android 570 × 0.02⁴ = 9.1e-5/s, SMS 95 × 0.05⁴ =
-  5.94e-4/s, e-mail 570 × 0.01⁴ = 5.7e-6/s, 8.7e-4 a second in all (about 75 a day, one every 19
-  minutes): the number the on-call team would watch, while the SLO reads 0 (the providers are sent
-  1 + f + f² + f³ times their messages, 1.02× for APNs). One caveat for sizing: APNs at its type's
-  1k/s quota sheds part of 1140/s on its own, and a pool retries a call the provider shed for
-  being busy as it retries an error, which adds to that load.
+  (`retry_after`, default 1 s), up to three times (only the pool that failed it reads it again),
+  and the job whose fourth attempt fails too is a **dead letter**, counted in the pool's
+  `dead_lettered/s` and never as a drop; a provider's failures on the calls of such pools leave
+  its drop rate, and the `dead_letter_rate` SLO judges the jobs that run out of retries instead.
+  This file's pools do not state `retries` yet (the scenario does not run before
+  `notification_fanout` does), so as written the 1–5 % provider failures alone would keep the
+  `drop_rate` SLO (0.001) from passing. The napkin figure for retries is rate × f⁴ dead letters a
+  second (iOS 1140 × 0.02⁴ = 1.82e-4/s), but that is not what the model gives with this file's
+  numbers: APNs keeps its type's default quota of 1k/s, which 1140/s overflows, and a call the
+  quota sheds is a failure to the pool like a 5xx, so the pool retries it and its retries load the
+  quota further. A probe with the iOS channel alone (1140/s into `ios_q`, 50 workers at 20 ms,
+  `retries: 3`, `apns` failing 2 % at the default capacity) settles with `ios_workers` saturated
+  (rho 1: the retries fill its 2.5k/s), APNs answering at most 980/s (its quota less 2 %), and
+  about **154 dead letters a second**, a `dead_letter_rate` of 0.135, while the drop rate reads 0.
+  Sizing the providers' quotas is Task 16's, when the scenario runs. The other three channels
+  already fit under their 1k/s quotas and give the napkin figures (Android 570 × 0.02⁴ =
+  9.1e-5/s, SMS 95 × 0.05⁴ = 5.94e-4/s, e-mail 570 × 0.01⁴ = 5.7e-6/s; each provider is sent
+  1 + f + f² + f³ times its messages), and so would iOS (1.82e-4/s) with a quota above
+  1140 × 1.02 = 1163/s.
 - Dedup (2%) and the fan-out ratio: one notification becomes 1.25 channel messages on average
   (the `factor`s 0.6 + 0.3 + 0.05 + 0.3).
 - The `user_cache` hit ratio (devices and preferences), computed with the Che approximation

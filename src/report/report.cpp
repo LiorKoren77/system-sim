@@ -321,6 +321,17 @@ struct SeenPercentile {
   return worst;
 }
 
+// The named worker pool's dead-letter rate (Summary::dead_letter_rate); empty for a node that is no
+// worker pool (the loader refuses one; built in code, the SLO is skipped).
+[[nodiscard]] std::optional<double> pool_dead_letter_rate(const Summary& summary,
+                                                          const model::SloSpec& slo) {
+  const auto index = slo.node ? summary.graph().index_of(*slo.node) : std::nullopt;
+  if (!index || summary.graph().nodes()[*index].spec.type != model::NodeType::worker_pool) {
+    return std::nullopt;
+  }
+  return summary.dead_letter_rate(*slo.node);
+}
+
 // What the run observed for the SLO's metric; empty when the model does not observe it.
 [[nodiscard]] std::optional<double> observe_metric(const Summary& summary,
                                                    std::span<const NodeSummary> nodes,
@@ -344,6 +355,8 @@ struct SeenPercentile {
       return mean_staleness(nodes, slo);
     case queue_lag:  // the peak, not the mean: a lag bound is a bound on the worst moment
       return peak_queue_lag(nodes, slo);
+    case dead_letter_rate:  // a worker pool's (the loader refuses any other node)
+      return pool_dead_letter_rate(summary, slo);
   }
   std::unreachable();
 }
@@ -1234,6 +1247,15 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
   if (sample.dead_lettered_per_s) {  // a worker pool: 0 without retries
     dead_lettered = dead_lettered.value_or(0.0) + *sample.dead_lettered_per_s * dt_s;
   }
+  if (sample.republished_per_s) {  // a message queue: 0 when its groups retry nothing
+    republished = republished.value_or(0.0) + *sample.republished_per_s * dt_s;
+  }
+  // A sink's drops fall on every caller alike (it fails a share of all it serves), so the
+  // retrying callers' part of them is their part of its demand, this step.
+  if (sample.retried_demand_per_s && sample.demand_per_s > 0.0) {
+    retried_dropped +=
+        sample.dropped_per_s * (*sample.retried_demand_per_s / sample.demand_per_s) * dt_s;
+  }
 }
 
 // A step whose response is infinite (a node on the path never answers) poisons the whole op: no
@@ -1286,32 +1308,6 @@ void Summary::LinkTotals::add(const engine::LinkSample& sample, double dt_s) {
   worst_zone = std::max(worst_zone, sample.zone);  // green < yellow < red, as declared
 }
 
-namespace {
-
-// Does a worker pool with `retries` send demand on `link`? Its links out carry only its `then`
-// steps (a pool calls nobody else), so every call on such a link is one it retries when it fails.
-[[nodiscard]] bool from_retrying_pool(const graph::Graph& g, const graph::ResolvedLink& link) {
-  const auto& sender = g.nodes()[graph::demand_sender(link)].spec;
-  return sender.type == model::NodeType::worker_pool && sender.retries.value_or(0) > 0;
-}
-
-}  // namespace
-
-// An external sink called by worker pools with `retries` and by nobody else (phase 3 spec §6.2):
-// every call it fails is attempted again or ends as a pool's dead letter, so none of its drops is
-// a loss (NodeTotals::losses_retried). The pool's failure share is the sink's whole loss, its
-// quota's overflow included (behaviours::WorkerPoolBehaviour), so this holds for every drop.
-bool Summary::losses_retried_by_pools(const graph::Graph& g, std::size_t node) {
-  if (g.nodes()[node].spec.type != model::NodeType::external_sink) return false;
-  bool called = false;
-  for (const auto& link : g.links()) {
-    if (graph::demand_receiver(link) != node) continue;
-    if (!from_retrying_pool(g, link)) return false;
-    called = true;
-  }
-  return called;
-}
-
 Summary::Summary(const graph::Graph& g, SimTime warmup) : Summary{g, warmup, true} {}
 
 Summary Summary::of_estimate(const graph::Graph& g, const engine::StepRecord& record) {
@@ -1323,9 +1319,6 @@ Summary Summary::of_estimate(const graph::Graph& g, const engine::StepRecord& re
 
 Summary::Summary(const graph::Graph& g, SimTime warmup, bool track_windows)
     : graph_{&g}, warmup_{warmup}, nodes_(g.nodes().size()) {
-  for (std::size_t node = 0; node < nodes_.size(); ++node) {
-    nodes_[node].losses_retried = losses_retried_by_pools(g, node);
-  }
   for (const auto& link : g.links()) {
     if (link.pipe) links_.push_back(LinkTotals{.name = graph::link_label(g.nodes(), link)});
   }
@@ -1664,10 +1657,10 @@ void Summary::fill_latencies(const OpTotals& totals, OpSummary& op) {
 // ratio stays in [0, 1] even when fan-out (ch. 11) multiplies the client's requests 100
 // times before they reach it. Dividing by what the clients offered would not be a ratio.
 // Drops only: a rate limiter's refusals are its policy, not a failure (reject_rate), and the failed
-// calls a pool retries are attempts, not losses (losses_retried, Summary::drop_rate).
+// calls a pool retries are attempts, not losses (retried_dropped, Summary::drop_rate). The max
+// keeps a rounding error from making a sink called only by retrying pools lose −1e-17.
 double Summary::NodeTotals::drop_rate() const {
-  if (losses_retried) return 0.0;
-  return demand > 0.0 ? dropped / demand : 0.0;
+  return demand > 0.0 ? std::max(0.0, dropped - retried_dropped) / demand : 0.0;
 }
 
 // The same ratio for refusals. Rejections are part of the demand (a token-family limiter
@@ -1690,6 +1683,21 @@ double Summary::node_rate(std::string_view node, double (NodeTotals::*rate)() co
     throw std::invalid_argument{"Summary: unknown node '" + std::string{node} + "'"};
   }
   return (nodes_[*index].*rate)();
+}
+
+// Σ dead letters of the pool over Σ (demand − re-published) of the queue it consumes: what the
+// producers published, the retries left out (they are the same jobs again).
+double Summary::dead_letter_rate(std::string_view pool) const {
+  const auto index = graph_->index_of(pool);
+  if (!index) {
+    throw std::invalid_argument{"Summary: unknown node '" + std::string{pool} + "'"};
+  }
+  const auto& consumes = graph_->nodes()[*index].spec.consumes;
+  const auto queue = consumes ? graph_->index_of(*consumes) : std::nullopt;
+  if (!queue) return 0.0;
+  const auto& published = nodes_[*queue];
+  const double jobs = published.demand - published.republished.value_or(0.0);
+  return jobs > 0.0 ? nodes_[*index].dead_lettered.value_or(0.0) / jobs : 0.0;
 }
 
 double Summary::drop_rate(std::string_view node) const {

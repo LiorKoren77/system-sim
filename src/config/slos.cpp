@@ -166,6 +166,21 @@ CheckResult check_queue_lag_target(const Site& site, const YAML::Node& entry,
                                               node.id, model::to_string(node.type)));
 }
 
+// A dead-letter rate is a worker pool's (phase 3 spec §6.2): its dead letters over the jobs
+// published to the queue it consumes (report::Summary::dead_letter_rate). Only a pool parks jobs
+// that ran out of retries, so the SLO names one: on any other node it could never be observed, and
+// unlike queue_lag it has no "worst of the run" form (each pool's retries are its own design).
+CheckResult check_dead_letter_target(const Site& site, const YAML::Node& entry,
+                                     const model::SloSpec& slo, const Declarations& declared) {
+  if (slo.metric != model::SloMetric::dead_letter_rate) return {};
+  if (!slo.node) return site.fail(entry, "dead_letter_rate needs a node");
+  const auto& node = declared.nodes[declared.ids.find(*slo.node)->second];
+  if (node.type == model::NodeType::worker_pool) return {};
+  return site.fail(entry["node"],
+                   std::format("dead_letter_rate needs a worker_pool node ('{}' is a {})", node.id,
+                               model::to_string(node.type)));
+}
+
 // Only latency is measured per op (a client's response time for each op it sends); every
 // other metric is node-wide, so an `op` on it would be silently ignored.
 CheckResult check_op_is_for_latency(const Site& site, const YAML::Node& entry,
@@ -182,6 +197,9 @@ CheckResult check_slo_shape(const Site& site, const YAML::Node& entry, const mod
     return checked;
   }
   if (auto checked = check_queue_lag_target(site, entry, slo, declared); !checked) return checked;
+  if (auto checked = check_dead_letter_target(site, entry, slo, declared); !checked) {
+    return checked;
+  }
   return check_op_is_for_latency(site, entry, slo);
 }
 

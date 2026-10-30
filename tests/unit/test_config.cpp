@@ -1880,6 +1880,39 @@ TEST_CASE("a queue_lag SLO must name a message queue, or no node at all") {
   }
 }
 
+// A dead-letter rate is a worker pool's (phase 3 spec §6.2): its dead letters over the jobs
+// published to its queue, so the SLO names the pool, and on any other node it could never be
+// observed. Unlike queue_lag it has no "worst of the run" form: `node` is required. The words are
+// queue_lag's: "needs a <type> node ('<id>' is a <type>)".
+TEST_CASE("a dead_letter_rate SLO must name a worker pool") {
+  const auto with_slo = [](std::string_view entry) {
+    return scenario_with(
+        "  u: {type: client, rate: {base: 1/s}, ops: {a: 1}}\n"
+        "  q: {type: message_queue}\n"
+        "  w: {type: worker_pool, consumes: q, workers: 1, cost: 1ms}\n",
+        "links: [{from: u, to: q}, {from: q, to: w}]\nslo: [" + std::string{entry} + "]\n");
+  };
+  SECTION("a message queue has no dead letters") {
+    require_rejected("simsys_slo_dead_queue.yaml",
+                     with_slo("{metric: dead_letter_rate, node: q, max: 0.01}"),
+                     "slo: dead_letter_rate needs a worker_pool node ('q' is a message_queue)");
+  }
+  SECTION("nor does a client") {
+    require_rejected("simsys_slo_dead_client.yaml",
+                     with_slo("{metric: dead_letter_rate, node: u, max: 0.01}"),
+                     "slo: dead_letter_rate needs a worker_pool node ('u' is a client)");
+  }
+  SECTION("the node is required") {
+    require_rejected("simsys_slo_dead_no_node.yaml",
+                     with_slo("{metric: dead_letter_rate, max: 0.01}"),
+                     "slo: dead_letter_rate needs a node");
+  }
+  SECTION("a worker pool is accepted, its max a ratio") {
+    require_loaded("simsys_slo_dead_pool.yaml",
+                   with_slo("{metric: dead_letter_rate, node: w, max: 0.01}"));
+  }
+}
+
 TEST_CASE("a node may not send to itself and a link may not loop") {
   SECTION("a step to its own node") {
     require_rejected("simsys_step_self.yaml",

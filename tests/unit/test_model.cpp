@@ -85,7 +85,7 @@ TEST_CASE("every enum name table round-trips and ends at its last enumerator", "
   static_assert(simsys::model::node_type_table.back().value == NodeType::frontier);
   static_assert(simsys::model::direction_table.back().value == simsys::model::Direction::inout);
   static_assert(simsys::model::slo_metric_table.back().value ==
-                simsys::model::SloMetric::staleness);
+                simsys::model::SloMetric::dead_letter_rate);
   static_assert(simsys::model::step_condition_table.back().value ==
                 simsys::model::StepCondition::failure);
   static_assert(simsys::model::step_mode_table.back().value == simsys::model::StepMode::parallel);

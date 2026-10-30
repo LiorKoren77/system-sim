@@ -3367,3 +3367,39 @@ TEST_CASE("explain prints no retries on a pool that states none", "[report]") {
   REQUIRE(node_line(text, "w").ends_with("consumes=q  workers=100 cost=10ms"));
   REQUIRE_FALSE(text.contains("retries="));
 }
+
+// ---- The dead_letter_rate SLO (phase 3 spec §6.2): a pool's dead letters over the jobs published
+// ----
+//
+// drop_rate does not count the failures a pool retries, so something else must judge the jobs that
+// run out of retries: `dead_letter_rate`, the named pool's dead letters over the jobs published to
+// its queue in the observed time (the re-published ones are not new jobs: they are left out of the
+// denominator, which is why it is not the queue's demand). On the probe: 1.6e-4 dead letters a
+// second over 1000 jobs a second published, 1.6e-7 = 0.02^4, a ratio like drop_rate.
+TEST_CASE("the dead_letter_rate SLO observes 1.6e-7 on the probe and prints it as a ratio",
+          "[report]") {
+  auto s = retrying_probe(3, 1s);
+  s.slos = {simsys::model::SloSpec{
+      .metric = simsys::model::SloMetric::dead_letter_rate, .node = "w", .max = 1e-6}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary = summarize(s, g);
+  const auto results = simsys::report::evaluate_slos(summary, s.slos);
+  REQUIRE(results.size() == 1);
+  REQUIRE(results[0].observed.has_value());
+  REQUIRE_THAT(*results[0].observed, WithinRel(1.6e-7, 1e-6));
+  REQUIRE(results[0].status == simsys::report::SloStatus::pass);
+  const auto json = simsys::report::render_json(summary, results);
+  CAPTURE(json);
+  REQUIRE(json.contains("\"metric\": \"dead_letter_rate\""));
+  const auto table = simsys::report::render_table(summary, results, false);
+  CAPTURE(table);
+  REQUIRE(table.contains("dead_letter_rate"));
+  REQUIRE(table.contains("1.6e-07"));
+}
+
+// A pool that retries nothing dead-letters nothing: the rate is 0 and passes any bound.
+TEST_CASE("a pool without retries has a dead_letter_rate of 0", "[report]") {
+  auto s = retrying_probe(std::nullopt);
+  const auto g = *simsys::graph::Graph::build(s);
+  REQUIRE(summarize(s, g).dead_letter_rate("w") == 0.0);
+}

@@ -556,6 +556,61 @@ TEST_CASE("sweeping a client's retries reads its attempts and answered rates: 1k
   REQUIRE(split_words(table[3]) == std::vector<std::string>{"2", "1.75k/s", "875/s"});
 }
 
+namespace {
+// u publishes 1000/s to q; pool w (100 workers at 1 ms) sends each job to an external sink that
+// fails half of what it serves (room to spare: 100k/s), retrying `retries` (swept) a step later.
+// Observed after a 2 s warmup, past the retry ramp.
+std::string retrying_pool_path() {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("simsys-sweep-dead-" + std::to_string(getpid()) + ".yaml");
+  std::ofstream{path} << "version: 1\nname: retrying-pool\nduration: 10s\nstep: 100ms\n"
+                         "warmup: 2s\nnodes:\n"
+                         "  u: {type: client, rate: {base: 1k/s}, ops: {publish: 1.0}}\n"
+                         "  q: {type: message_queue}\n"
+                         "  w: {type: worker_pool, consumes: q, workers: 100, cost: 1ms, "
+                         "retries: 1, retry_after: 100ms, then: [{to: api, op: send}]}\n"
+                         "  api: {type: external_sink, capacity: 100k/s, latency: 1ms, "
+                         "failure_rate: 0.5}\n"
+                         "links:\n  - {from: u, to: q, latency: 0s}\n"
+                         "  - {from: q, to: w, latency: 0s}\n"
+                         "  - {from: w, to: api, dir: inout, latency: 0s}\n";
+  return path.string();
+}
+}  // namespace
+
+// A pool's dead letters per second (JSON's dead_lettered_per_s): the jobs whose last attempt
+// failed, 1000 x 0.5^(n+1): 250/s with 1 retry, 62.5/s with 3. The table prints a rate.
+TEST_CASE("sweeping a pool's retries reads its dead letters: 250/s then 62.5/s") {
+  using simsys::sweep::MetricKind;
+  const auto metric = parse_metric("w.dead_lettered");
+  INFO((metric ? "" : metric.error()));
+  REQUIRE(metric.has_value());
+  REQUIRE(metric->kind == MetricKind::dead_lettered_rate);
+  const auto path = retrying_pool_path();
+  const std::vector<SweepMetric> metrics{*metric};
+  const SweepParam param{.path = "nodes.w.retries", .values = {"1", "3"}};
+  const auto rows = run_sweep(path, param, metrics, 1);
+  std::filesystem::remove(path);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  REQUIRE_THAT((*rows)[0].metrics[0], WithinRel(250.0, 1e-9));
+  REQUIRE_THAT((*rows)[1].metrics[0], WithinRel(62.5, 1e-9));
+  const auto table = split(render_sweep(param, metrics, *rows, SweepFormat::table), '\n');
+  CAPTURE(table);
+  REQUIRE(split_words(table[2]) == std::vector<std::string>{"1", "250/s"});
+  REQUIRE(split_words(table[3]) == std::vector<std::string>{"3", "62.5/s"});
+}
+
+TEST_CASE(
+    "a dead_lettered metric on a node that is not a worker pool is an error naming its type") {
+  const std::vector<SweepMetric> metrics{*parse_metric("api.dead_lettered")};
+  const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1);
+  REQUIRE_FALSE(rows.has_value());
+  REQUIRE(rows.error() == std::string{hello_path} +
+                              ": error: --metric: api.dead_lettered: 'api' has type service, "
+                              "not worker_pool: only a worker pool has dead letters");
+}
+
 TEST_CASE("an attempts metric on a node that is not a client is an error naming its type") {
   const std::vector<SweepMetric> metrics{*parse_metric("api.ping.attempts")};
   const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1);

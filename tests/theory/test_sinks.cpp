@@ -861,3 +861,144 @@ TEST_CASE("notification-system's shape: drop_rate max 0.001 passes with retries,
   REQUIRE(fails.size() == 1);
   REQUIRE(fails[0].status == simsys::report::SloStatus::fail);
 }
+
+// ---- Only the sink's failures are retried: a job lost at an earlier step is that step's loss ----
+//
+// The picture: q fed 1000 jobs/s; pool w (retries 3, retry_after 1 s) writes each job to `db`, a
+// service of 800/s, then sends it to `api`, a sink that fails 10 % of what it serves. db is
+// saturated: once its room is full it serves 800/s and drops the rest, so a job reaches api with
+// the survival S = 800 / D (D the jobs the pool drains a second, re-published ones included). The
+// pool retries the jobs that reached the sink AND failed there, S × 0.1 of its jobs, f = 80 / D:
+//   the sink is sent D × S = 800/s, answers 720/s and fails 80/s; of those 80/s every attempt but
+//   the last is re-published, R = 80 − dead, and D = 1000 + R = 1000 × (1 + f + f² + f³) ≈ 1080.
+// A job db dropped is db's loss and is not retried (the pool's class comment): retrying the share
+// 1 − d_api = 0.1 of EVERY drained job would re-publish 111/s and make D ≈ 1111, more outcomes
+// (answered + lost + dead) than jobs published. So every job has exactly one outcome:
+//   answered at api (720/s) + lost at db (D − 800) + dead-lettered = 1000/s.
+// (Node indices: u 0, q 1, w 2, db 3, api 4.)
+
+namespace {
+constexpr std::size_t db_index = 3;
+constexpr std::size_t api_behind_db_index = 4;
+
+Scenario retrying_past_a_lossy_step() {
+  auto pool = group_of("w", 100, 10ms);
+  pool.then = {Step{.to = "db", .op = "write"}, Step{.to = "api", .op = "send"}};
+  pool.retries = 3;
+  pool.retry_after = 1s;
+  auto s = published(publish_rate, {std::move(pool)});
+  s.nodes.push_back(NodeSpec{.id = "db", .type = NodeType::service, .capacity = Rate{800}});
+  s.nodes.push_back(provider("api", 0.1));
+  s.links.push_back(LinkSpec{.from = "w", .to = "db", .latency = 0s});
+  s.links.push_back(LinkSpec{.from = "w", .to = "api", .latency = 0s});
+  return s;
+}
+}  // namespace
+
+TEST_CASE("a job lost before the sink is not retried: answered + lost + dead letters = published",
+          "[theory]") {
+  const auto g = *Graph::build(retrying_past_a_lossy_step());
+  const auto records = records_of(g, 300);  // db's room is full and the retries settled long ago
+  const auto& last = records.back();
+  const auto& db = last.nodes[db_index];
+  const auto& api = last.nodes[api_behind_db_index];
+  const double dead = last.nodes[w_index].dead_lettered_per_s.value_or(-1.0);
+  REQUIRE(dead > 0.0);
+  REQUIRE_THAT(api.demand_per_s, WithinRel(800.0, 1e-6));  // what got past db
+  REQUIRE_THAT(api.drain_per_s + db.dropped_per_s + dead, WithinRel(publish_rate, 1e-6));
+  const double republished = last.nodes[q_index].demand_per_s - publish_rate;
+  REQUIRE_THAT(republished, WithinRel(api.dropped_per_s - dead, 1e-6));  // 80/s less the dead
+  // D = 1000 x A(f, 3) with f = 80 / D, the sink's failures over the jobs drained.
+  const double drained = last.nodes[w_index].demand_per_s;
+  REQUIRE_THAT(drained, WithinRel(publish_rate * attempts_per_job(80.0 / drained, 3), 1e-6));
+  REQUIRE_THAT(drained, WithinRel(1080.0, 1e-3));
+}
+
+// ---- The re-published jobs go back to the group that failed them, not to every group ----
+//
+// q has two consumer groups: w (retries 3, calling a sink that fails half of what it serves) and
+// w2, which calls nobody. w re-publishes its failed jobs to q, so q's demand and w's are
+// 1000 × A(0.5, 3) = 1000 × (1 + 0.5 + 0.25 + 0.125) = 1875/s; but w2 already read those jobs once
+// and handled them, so it is not sent them again: its demand stays 1000/s. (Kafka's groups each
+// read the whole log, so a real design puts the retries on a retry topic per consumer group, or
+// gives each channel its own queue as ch. 10 does; reading them in every group would be 875/s of
+// duplicate work at w2.) (Node indices: u 0, q 1, w 2, w2 3, api 4.)
+TEST_CASE("re-published jobs reach only the group that failed them: w2 stays at 1000/s",
+          "[theory]") {
+  auto failing = group_of("w", 100, 10ms);
+  failing.then = {Step{.to = "api", .op = "send"}};
+  failing.retries = 3;
+  failing.retry_after = 1s;
+  auto s = published(publish_rate, {std::move(failing), group_of("w2", 100, 10ms)});
+  s.nodes.push_back(provider("api", 0.5));
+  s.links.push_back(LinkSpec{.from = "w", .to = "api", .latency = 0s});
+  const auto g = *Graph::build(s);
+  const auto records = records_of(g, 60);
+  const auto& last = records.back();
+  REQUIRE_THAT(last.nodes[q_index].demand_per_s, WithinRel(1875.0, 1e-9));
+  REQUIRE_THAT(last.nodes[w_index].demand_per_s, WithinRel(1875.0, 1e-9));
+  REQUIRE_THAT(last.nodes[3].demand_per_s, WithinRel(publish_rate, 1e-9));
+}
+
+// ---- drop_rate counts a sink's failures per caller: only the callers that do not retry lose ----
+//
+// The retry picture (1000 jobs/s, retries 3, f = 0.02) plus a client c that calls `api` directly at
+// 10/s and does not retry. api's demand is 1020.408 + 10 = 1030.408/s and it fails 2 % of all of
+// it; the pool's share of those failures is retried (not a loss), c's is lost. So the losses the
+// SLO counts are api's drops × (c's demand / api's demand) = 0.02 × 10 = 0.2/s, a drop rate of
+// 0.2 / 1030.408 = 1.94e-4: a 1 % second caller does not turn every failure into a loss (0.02).
+TEST_CASE("a sink's drop rate counts only the drops of callers that do not retry: 1.94e-4",
+          "[theory]") {
+  auto s = retrying_pool(0.02, 3, 1s);
+  s.nodes.push_back(
+      NodeSpec{.id = "c",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{10}}, .op_shares = {{"send", 1.0}}}});
+  s.links.push_back(LinkSpec{.from = "c", .to = "api", .latency = 0s});
+  const auto g = *Graph::build(s);
+  const auto summary = summarised(g);
+  const double api_demand = publish_rate * attempts_per_job(0.02, 3) + 10.0;
+  REQUIRE_THAT(summary.drop_rate("api"), WithinRel(0.02 * 10.0 / api_demand, 1e-6));
+  REQUIRE_THAT(summary.drop_rate(), WithinRel(1.94e-4, 1e-2));
+  const auto results = verdict_of(summary, drop_rate_at_most(0.001));
+  REQUIRE(results.size() == 1);
+  REQUIRE(results[0].status == simsys::report::SloStatus::pass);
+}
+
+// ---- dead_letter_rate judges what drop_rate no longer counts ----
+//
+// A sink that cannot keep up: 1000 jobs/s published, the sink's capacity 900/s (failing 2 % of
+// what it serves, with a room of 10 calls, so it sheds from the first second), the pool retrying
+// 10 times a step later. Every overflowing call counts as a
+// failure to the pool and is retried, so the drop rate reads 0; but the sink answers at most
+// 0.98 × 900 = 882/s, so in the steady state 1000 − 882 = 118 jobs/s run out of retries:
+//   dead_letter_rate = dead-lettered / published = 118 / 1000 = 0.118
+// and an SLO of 0.01 on it fails where the drop_rate SLO passes. (The modelled fixed point: the
+// pool drains 4995 attempts a second, 1000 × A(f, 10) with f = 1 − 882 / 4995 = 0.8234.)
+TEST_CASE("an overflowing sink behind a retrying pool fails dead_letter_rate at 0.118",
+          "[theory]") {
+  auto s = retrying_pool(0.02, 10, 100ms);
+  s.nodes[api_index].capacity = Rate{900};
+  s.nodes[api_index].advanced.queue_limit = 10.0;  // a room that fills at once
+  const auto g = *Graph::build(s);
+  // The ten retries build up over about 10 s (each attempt's failures feed the next one): observe
+  // 15 s after a 15 s warmup.
+  simsys::report::Summary summary{g, 15s};
+  simulation_of(g).run({.duration = 30s, .step = 100ms},
+                       [&](const simsys::engine::StepRecord& r) { summary.observe(r); });
+  REQUIRE_THAT(summary.drop_rate(), WithinAbs(0.0, 1e-12));
+  REQUIRE_THAT(summary.dead_letter_rate("w"), WithinRel(0.118, 1e-3));
+  const auto results =
+      verdict_of(summary, SloSpec{.metric = SloMetric::dead_letter_rate, .node = "w", .max = 0.01});
+  REQUIRE(results.size() == 1);
+  REQUIRE(results[0].status == simsys::report::SloStatus::fail);
+  REQUIRE(results[0].observed.has_value());
+  REQUIRE_THAT(*results[0].observed, WithinRel(0.118, 1e-3));
+}
+
+// With a sink that keeps up, the rate is the closed form's f^(n+1): 0.02^4 = 1.6e-7.
+TEST_CASE("dead_letter_rate is f^(n+1) of the published jobs: 1.6e-7 at f 0.02 and 3 retries",
+          "[theory]") {
+  const auto g = *Graph::build(retrying_pool(0.02, 3, 1s));
+  REQUIRE_THAT(summarised(g).dead_letter_rate("w"), WithinRel(1.6e-7, 1e-6));
+}
