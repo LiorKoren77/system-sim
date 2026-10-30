@@ -584,9 +584,10 @@ struct NodeSpec {
   // (engine.cppm's fail_share). A plain double, not an optional: "fails nothing" is the real value
   // 0, and a sink that states none is the plain queue it was before. `politeness` is how often one
   // host may be called (the crawler's "1/s per host"), stored and printed, not modelled (phase 3:
-  // it needs per-host state); absent when not stated. Ignored: retries (an `on: failure` step never
-  // fires before phase 3), a provider's latency rising with OUR load (its queue is the type's 1k/s
-  // quota, not the provider's real fleet), and per-host politeness.
+  // it needs per-host state); absent when not stated. Ignored: retries (an `on: failure` step after
+  // the call is sent the failed share, but nothing calls the sink again), a provider's latency
+  // rising with OUR load (its queue is the type's 1k/s quota, not the provider's real fleet), and
+  // per-host politeness.
   double failure_rate{0.0};
   std::optional<Rate> politeness{};
   // Key-value clusters only (spec §19 entry 9; declared after the external sink's keys, for

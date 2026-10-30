@@ -779,6 +779,33 @@ TEST_CASE("an on-failure step needs a step before it", "[graph]") {
   }
 }
 
+// An `on: failure` step runs once the step it reports on has failed (spec §5: a sequential hop),
+// so it cannot be timed beside that step in a parallel group: refused, as a parallel miss step is.
+TEST_CASE("a parallel on-failure step is refused", "[graph]") {
+  const auto g = Graph::build(cached_web(
+      service("log"),
+      {Step{.to = "db", .op = "write"},
+       Step{
+           .to = "log", .op = "write", .on = StepCondition::failure, .mode = StepMode::parallel}}));
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message ==
+          "node 'web': an on: failure step must be sequential (it runs after the step it reports "
+          "on has failed)");
+}
+
+// An `on: failure` step reports on a step of an op's step list (the nearest unconditional one
+// before it); a cache's `then` list follows no such step. Phase 2 kept such a step and never fired
+// it; now that failure steps fire, the scenario is told instead of running without it.
+TEST_CASE("a cache's then step on failure is refused", "[graph]") {
+  auto c = cache("c", 0.5, CacheStrategy::write_through, "db");
+  c.then = {Step{.to = "db", .op = "audit", .on = StepCondition::failure}};
+  const auto built = Graph::build(cached_web(std::move(c), {Step{.to = "c", .op = "write"}}));
+  REQUIRE_FALSE(built.has_value());
+  REQUIRE(built.error().message ==
+          "node 'c': a then step on failure is not modelled at a cache (an on: failure step "
+          "reports on a step of an op's step list)");
+}
+
 // Read-through as this model names it (the cache-driven fetch): on a miss the CACHE fetches the
 // value from its backend and answers with it, so the application never sees a miss to act on.
 // A miss step after it would fetch every miss a second time.

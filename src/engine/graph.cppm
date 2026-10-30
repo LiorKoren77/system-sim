@@ -295,8 +295,12 @@ inline constexpr auto replica_model_table = std::to_array<core::EnumName<Replica
 //     cache with no number (one built in code without a hit ratio) counts as missing every
 //     time, the safe side for a capacity check on paper. (A CDN fetches its own misses from its
 //     origin, so no miss step may follow one: Graph::invalid_miss_step.)
-//   - 0 for an `on: failure` step: external sinks fail since phase 2c (the engine counts their
-//     failures as drops), but nothing reacts to a failure before phase 3 (retries);
+//   - 1 for an `on: failure` step, of the requests the step it `reports_on` failed: every failed
+//     request takes it (spec §5; the dead-letter or compensation path of ch. 1's and ch. 4's
+//     designs: a write that failed is logged or queued for a retry). How many failed is known only
+//     while the engine runs (1 − d, d the delivered fraction of that step, one simulation step
+//     late: behaviours::detail::HopBlocks), so readers that size the graph on paper, where
+//     nothing is lost, count such a hop as sending nothing (explain's paper load);
 //   `factor`, the requests the hop sends per request that takes it: the step's own fan-out
 //   (one post -> 100 feed writes), times the lookup's for an `on: miss` step. A request
 //   that looks up k keys misses k(1 - h) of them on average (linearity of expectation, true
@@ -316,6 +320,10 @@ struct ServiceHop {
   // For an `on: miss` step, the position in the op's hops of the lookup it follows; empty for
   // every other step.
   std::optional<std::size_t> lookup{};
+  // For an `on: failure` step, the position in the op's hops of the step whose failures it is sent:
+  // the nearest unconditional step before it (Graph::resolve_service_hop), as a miss step's lookup
+  // is; empty for every other step.
+  std::optional<std::size_t> reports_on{};
 };
 
 // A scenario link with node indices instead of ids, and its resolved timing.
@@ -480,9 +488,10 @@ class Graph {
   // its queue brought), except at a blob store, whose steps are event notifications that fire for
   // its writes only (1 of a write, 0 of a read: S3 notifies on ObjectCreated, never on a GET); for
   // an `on: miss` step after a cache, 1 - h of a read (an unknown h counts as 0, as in
-  // service_hops) and 0 of a write (writes do not miss); 0 for an `on: failure` step (phase 3) and
-  // for a miss step anywhere else. (A CDN has no `then` steps: it fetches its misses from its
-  // origin, backend_fraction.)
+  // service_hops) and 0 of a write (writes do not miss); 0 for an `on: failure` step (refused in
+  // a then list: invalid_then_steps, invalid_blob_store, invalid_worker_then_steps; failure steps
+  // fire in an op's step list, service_hops) and for a miss step anywhere else. (A CDN has no
+  // `then` steps: it fetches its misses from its origin, backend_fraction.)
   [[nodiscard]] double then_fraction(std::size_t node, const model::Step& step,
                                      std::string_view op) const;
   // Does node `from`, handling `op`, hand `target_op` off to node `to` without waiting?
@@ -505,9 +514,15 @@ class Graph {
   Result connect_steps();
   Result connect_step(std::size_t from, const model::Step& step);
   Result resolve_service_hops(std::size_t node);
+  [[nodiscard]] std::expected<ServiceHop, EngineError> resolve_service_hop(
+      std::size_t node, const model::Step& step, std::span<const ServiceHop> hops,
+      std::optional<std::size_t> last_unconditional) const;
   [[nodiscard]] std::optional<EngineError> invalid_miss_step(std::size_t node,
                                                              const model::Step& step,
                                                              const ServiceHop* lookup) const;
+  [[nodiscard]] std::optional<EngineError> invalid_failure_step(
+      std::size_t node, const model::Step& step,
+      std::optional<std::size_t> last_unconditional) const;
   [[nodiscard]] double hop_fraction(const model::Step& step,
                                     std::optional<std::size_t> looked_up) const;
   [[nodiscard]] double miss_fraction(std::size_t cache) const;
