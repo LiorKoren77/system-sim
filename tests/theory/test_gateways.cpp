@@ -42,7 +42,7 @@
 // the disconnects (the room each frees), so rejected = connects - C / session
 // (100 - 50k / 1000 = 50/s at a cap of 50k).
 //
-// Not modelled here (and not pinned): the reconnect storm of a `node_down` (phase 3 Task 15).
+// The reconnect storm of a `node_down` (phase 3 Task 15) has its own section below.
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
@@ -463,12 +463,14 @@ TEST_CASE("estimate reports a fixed level as it is", "[theory]") {
 
 // ---- Fan-out and deliveries -------------------------------------------------------------------
 
-// `fanout` is the average recipients per message (1:1 and small groups: 1.4 in the chat design):
-// each message the gateway accepts sends `fanout` requests down each of the `send` op's steps,
-// as a `factor` of the step. 100 messages/s x 1.4 = 140/s reach q, whatever the level is; a step
-// that already has a factor multiplies with it (x 2 x 1.4 = 280); no fanout stated is a factor of
-// 1. The heartbeat step is not a message: presence is not multiplied.
-TEST_CASE("fanout multiplies a message op's steps: 1.4 sends q 1.4 times the send rate",
+// `fanout` is the average recipients per message (1:1 and small groups: 1.4 in the chat design).
+// Since phase 3 Task 15 it multiplies only a message op's steps to a MESSAGE QUEUE (ch. 12 copies a
+// message once per recipient into the sync queues; the tests at the end of this file pin that):
+// here every step of `send` goes to q, a service (the message store, the id generator), which sees
+// one request per message, 100/s, whatever the fanout; a step's own factor still applies (x 2 =
+// 200); no fanout stated changes nothing either. The heartbeat step is not a message: presence is
+// not multiplied. (Task 14 pinned 140/s and 280/s here, the fan-out on every step.)
+TEST_CASE("fanout leaves a message op's steps to a service alone: q gets the send rate once",
           "[theory]") {
   SECTION("fanout 1.4") {
     const auto g = graph_of(gateway_scenario(Shape{.fanout = 1.4, .step = 1s}));
@@ -476,15 +478,15 @@ TEST_CASE("fanout multiplies a message op's steps: 1.4 sends q 1.4 times the sen
     const auto levels = euler_levels(20, 1.0);
     for (std::size_t k = 0; k < records.size(); ++k) {
       CAPTURE(k);
-      require_close(demand_of(records[k], q_index), 140.0);
+      require_close(demand_of(records[k], q_index), 100.0);
       require_close(demand_of(records[k], presence_index), levels[k] / 5.0);  // not multiplied
     }
   }
-  SECTION("the step's own factor multiplies with it") {
+  SECTION("the step's own factor applies, the fanout does not") {
     const auto g = graph_of(gateway_scenario(
         Shape{.fanout = 1.4, .send_steps = {Step{.to = "q", .op = "publish", .factor = 2.0}}}));
     const auto first = records_of(g, 1).front();
-    REQUIRE_THAT(demand_of(first, q_index), WithinRel(280.0, 1e-9));
+    REQUIRE_THAT(demand_of(first, q_index), WithinRel(200.0, 1e-9));
   }
   SECTION("no fanout stated: a factor of 1") {
     const auto g = graph_of(gateway_scenario(Shape{}));
@@ -515,11 +517,10 @@ TEST_CASE("a deliver makes no hops: q gets nothing and presence only the heartbe
 // A gateway needs a level: either a `connect` op that reaches it (the level is then a balance of
 // connects and disconnects) or a fixed `connections`, not both (two sources of the one number).
 // Whether a `connect` op REACHES a gateway is a fact of the graph (through links, balancers and
-// steps), known only once the graph is built, and the shipped chat-system has neither today (its
-// phase-3 task gives it one; google-drive's got a fixed 2M in Task 16), so the loader and
-// Graph::build accept such a
-// gateway, explain still describes it, and the refusal is Simulation::create's, in the words of
-// its other "cannot run this" messages.
+// steps), known only once the graph is built (every shipped gateway has a level since phase 3:
+// google-drive's fixed 2M in Task 16, chat-system's users' `connect` in Task 15), so the loader
+// and Graph::build accept such a gateway, explain still describes it, and the refusal is
+// Simulation::create's, in the words of its other "cannot run this" messages.
 
 namespace {
 std::string refusal_of(const Scenario& s) {
@@ -845,14 +846,16 @@ TEST_CASE("explain marks a session left to the default of 30 minutes", "[theory]
 
 // Beyond the gateway's own line: the paper-load checks follow the gateway's flows, as the engine
 // does. Heartbeats at the fixed point load the gateway (100 + 100 + 20k = 20.2k/s) and presence
-// (20k/s), and the fan-out multiplies q's share (100 x 1.4 = 140/s); without it explain would
-// call presence idle ("peak offered 0/s").
-TEST_CASE("explain's checks include the heartbeat load and the fan-out", "[theory]") {
+// (20k/s); without them explain would call presence idle ("peak offered 0/s"). q, a service, is
+// sent each message once, 100/s, whatever the fan-out (Task 15; Task 14 pinned 140/s): the fan-out
+// on paper is the message queue's, at the end of this file.
+TEST_CASE("explain's checks include the heartbeat load and send a service each message once",
+          "[theory]") {
   const auto text = explain_of(gateway_scenario(Shape{.fanout = 1.4}));
   CAPTURE(text);
   REQUIRE(check_line(text, "gw").contains("peak offered 20.2k/s vs 1M/s total capacity"));
   REQUIRE(check_line(text, "presence").contains("peak offered 20k/s vs 1M/s total capacity"));
-  REQUIRE(check_line(text, "q").contains("peak offered 140/s vs 1M/s total capacity"));
+  REQUIRE(check_line(text, "q").contains("peak offered 100/s vs 1M/s total capacity"));
 }
 
 // ---- The reconnect storm (phase 3 Task 15, spec §8.2) -------------------------------------------
@@ -1393,9 +1396,9 @@ TEST_CASE("a node_down of a node that is not a gateway prints no reconnect storm
 // The Task 14 review's decision: `fanout` (1.4 recipients per message) multiplies a message op's
 // steps that TARGET A MESSAGE QUEUE, where ch. 12 copies a message once per recipient into the
 // sync queues; the steps to anything else (an id generator, the message store: here the service q)
-// see ONE request per message. The tests above in this file that give q a factor of 1.4 pin the
-// rule Task 15 replaces (the implementer changes them): a message queue is behind this probe's
-// gateway beside q, and a step's own factor still multiplies on the queue's step.
+// see ONE request per message. The tests above in this file that gave q a factor of 1.4 pinned the
+// rule Task 15 replaced, and now give it one request per message: a message queue is behind this
+// probe's gateway beside q, and a step's own factor still multiplies on the queue's step.
 namespace {
 constexpr std::size_t mq_index = 4;
 
@@ -1435,4 +1438,14 @@ TEST_CASE("fanout multiplies with the queue step's own factor and leaves a servi
   const auto records = run_steps(graph_of(s), 3, 1s);
   require_close(demand_of(records.front(), q_index), 300.0);
   require_close(demand_of(records.front(), mq_index), 280.0);
+}
+
+// explain's paper load follows the same rule: the message queue is offered 100 x 1.4 = 140
+// copies/s, the service beside it 100 messages/s.
+TEST_CASE("explain's checks give the message queue the fan-out and the service one copy",
+          "[theory]") {
+  const auto text = explain_of(gateway_with_message_queue(Shape{.fanout = 1.4}));
+  CAPTURE(text);
+  REQUIRE(check_line(text, "mq").contains("peak offered 140/s vs "));
+  REQUIRE(check_line(text, "q").contains("peak offered 100/s vs "));
 }

@@ -2458,27 +2458,57 @@ class KvClusterBehaviour {
 // heartbeats rather than for messages.
 //
 // Messages fan out: every op that is not connect, heartbeat or deliver is a MESSAGE
-// (model::message_op), and each of its steps sends `fanout` × its own factor requests (1.4: the
-// average recipients of a 1:1 or small-group message). graph::Graph::resolve_service_hops applies
-// it, so the hops held here have it already. `deliver` is terminal: a message pushed to a recipient
-// over its open connection, served and sent nowhere.
+// (model::message_op), and each of its steps to a message queue sends `fanout` × its own factor
+// copies (1.4: the average recipients of a 1:1 or small-group message), one per recipient, as
+// ch. 12 puts a copy into each recipient's sync queue; its other steps (the id generator, the
+// message store) see the message once. graph::Graph::resolve_service_hops applies it, so the hops
+// held here have it already. `deliver` is terminal: a message pushed to a recipient over its open
+// connection, served and sent nowhere.
 //
 // A fixed level (`connections: 2M`): a gateway no client connects to, whose connections belong to
 // devices nobody here simulates (google-drive's long polls). C is that number on every step, with
 // no connects, no disconnects and no refusals; only its heartbeats load anything.
 //
+// The reconnect storm (phase 3 Task 15; ch. 12's question "what happens when a chat server goes
+// offline?"). A server that dies takes its open sockets with it, all at once. So a node_down of r
+// of the gateway's R replicas drops C × r / R connections at its first step (the users are spread
+// evenly over the replicas), and while it lasts:
+//  - the dead replicas serve nothing (the fault derates the capacity, as on any node);
+//  - every message that would travel over a dropped connection is lost: the share r / R of every
+//    op but `connect` and `heartbeat` (lost_share), booked by the engine as the gateway's demand
+//    and drops, never served. The heartbeats need no such share: they are C / heartbeat, and C
+//    has lost those connections already. Connects go to the survivors (the balancer in front
+//    routes around the dead ones), and with every replica down there is no survivor: every
+//    request is lost at once, a connect refused rather than queued for a server that is gone, so
+//    no connect is admitted and the level stays 0 until the fault clears.
+// When the fault clears, the dropped users come back. Each client notices its socket is gone and
+// tries again after a backoff; the backoffs spread the D dropped connections EVENLY over
+// `reconnect_within` W (30 s by default, chosen), so for W seconds from the fault's end
+//   connects = λ + D / W                                   (the storm: the dropped users' return)
+// on top of the users' own connects λ (the engine adds D / W to the gateway's `connect` arrivals
+// each step, as it adds the heartbeats). That is the thundering herd: a whole tier's level, which
+// built up over a session, asks to come back within W. 100k connections over 30 s are 3.3k
+// connects a second, 34 times a usual 100/s; and as the level refills, its heartbeats come back
+// with it, so the gateway's load peaks where the storm and the recovered level's pings meet. A
+// shorter W is a steeper storm (D / 10 s is three times D / 30 s): why clients spread their
+// reconnects with a jittered backoff instead of all retrying at once.
+// What the storm ignores: that a reconnect costs more than a message (a TLS handshake, the login
+// and the discovery lookup of ch. 12: here one request like any other), clients that give up
+// (every dropped user comes back), users of dead replicas who reconnect to the survivors before
+// the fault clears (they wait for its end), a fixed level (its devices are nobody's to reconnect:
+// it is not dropped), and a dc_down (only a node_down drops connections).
+//
 // What it ignores: the memory a connection costs (the book's 10 KB per connection, so 100k
 // connections are 1 GB: the cap stands for it); which server a user is on (the service-discovery
-// hand-off of ch. 12, phase 3 Task 13), so every replica holds the same share; the reconnect storm
-// after a gateway falls (phase 3 Task 15: here a node_down derates its capacity as any node's, and
-// the level is untouched); users who go offline without a disconnect (the heartbeat timeout of
-// ch. 12's presence: every session simply ends at rate 1 / session); and the bandwidth of a
-// websocket frame.
+// hand-off of ch. 12, phase 3 Task 13), so every replica holds the same share; users who go
+// offline without a disconnect (the heartbeat timeout of ch. 12's presence: every session simply
+// ends at rate 1 / session); and the bandwidth of a websocket frame.
 // Pattern: Decorator (static, over the NodeBehaviour concept) — the gateway wraps a
 // ServiceBehaviour and has the same interface (route, cost, response, delivered), forwarding each
 // call to it and adding the level around it: route admits the connects the cap leaves room for and
 // rejects the rest before the service routes them, delivered thins the connects by the admitted
-// share, and connections / heartbeats_per_s expose the level the service knows nothing of.
+// share and the messages by a node_down's lost share, and connections / heartbeats_per_s /
+// storm_connects_per_s expose the level and its storm, which the service knows nothing of.
 class WsGatewayBehaviour {
  public:
   WsGatewayBehaviour(const graph::Graph& g, std::size_t self);
@@ -2515,11 +2545,13 @@ class WsGatewayBehaviour {
   // The service's delivered fraction, a connect's times the share of the connects admitted: a
   // refused connect is not answered (spec §17 entry 8), and only connects are refused, so the
   // engine leaves the rejections out of the node's own share (account_rejections) and they are
-  // applied here, to the one op they fall on.
+  // applied here, to the one op they fall on. During a node_down the messages over the dropped
+  // connections are lost too (lost_share), and the engine took them out before the queue, so the
+  // node's own share is the survivors'.
   [[nodiscard]] double delivered(std::string_view op, double own,
                                  FractionLookup auto&& downstream) const {
     const double admitted = op == model::connect_op ? admitted_share_ : 1.0;
-    return service_.delivered(op, own * admitted, downstream);
+    return service_.delivered(op, own * admitted * (1.0 - lost_share(op)), downstream);
   }
 
   // The level C the next step starts with (the record shows it: engine::NodeSample::connections).
@@ -2528,6 +2560,33 @@ class WsGatewayBehaviour {
   // The heartbeat load of the open connections, C / heartbeat pings a second (0 without a stated
   // heartbeat): what the engine adds to the gateway's `heartbeat` arrivals each step.
   [[nodiscard]] double heartbeats_per_s() const;
+
+  // The node_downs on the gateway (the reconnect storm in the class comment), told by the engine
+  // at the start of every step, before the gateway receives anything: `down_share` is r / R of
+  // the node_downs active at `now` (FaultSchedule::down_share; 0 outside them). A rise drops that
+  // share of the live connections at once and keeps them for the storm; a fall starts the storm,
+  // D / W connects a second for W from `now`. Then the step [now, now + dt)'s storm connects are
+  // set (storm_connects_per_s). A fixed level drops nothing.
+  void follow_outage(double down_share, SimTime now, SimTime dt);
+
+  // The storm's connects in this step, per second: what the engine adds to the gateway's `connect`
+  // arrivals (0 outside a storm). Its part of the step [now, now + dt) that the storm covers, so a
+  // `reconnect_within` that is not a whole number of steps still brings back exactly D.
+  [[nodiscard]] double storm_connects_per_s() const { return storm_now_; }
+
+  // The connections a node_down dropped at the start of this step (0 on every other step): the
+  // storm's size, which the record shows (engine::NodeSample::connections_dropped).
+  [[nodiscard]] double dropped_connections() const { return dropped_now_; }
+
+  // The share of `op`'s arrivals a node_down loses: r / R for a message or a delivery (it travels
+  // over a connection the fault dropped); for a connect (it goes to a survivor) and a heartbeat
+  // (the dropped connections send none: the level has lost them) 0, unless every replica is down
+  // and there is no survivor to go to: then 1.
+  [[nodiscard]] double lost_share(std::string_view op) const {
+    const bool to_a_survivor = op == model::connect_op || op == model::heartbeat_op;
+    if (!to_a_survivor) return down_share_;
+    return down_share_ >= 1.0 ? 1.0 : 0.0;
+  }
 
   // estimate()'s mode: every settle pass is the same instant, so the level jumps to its fixed point
   // C* = min(λ × session, cap) of the connects it is handed, which admits min(λ, cap / session)
@@ -2552,15 +2611,30 @@ class WsGatewayBehaviour {
   [[nodiscard]] double admit(double connects, double dt_s);
   [[nodiscard]] double steady_admit(double connects);
   [[nodiscard]] static flow::Flow with_connects(const flow::Flow& in, double admitted);
+  void drop_connections(double down_share);
+  void start_storm(double now_s);
+  [[nodiscard]] double storm_in_step(double now_s, double dt_s) const;
 
   ServiceBehaviour service_;
   std::optional<double> fixed_{};      // a stated `connections`: the level, for good
   std::optional<double> cap_{};        // max_connections × replicas; empty: no cap
   double session_s_{};                 // the stated session, or defaults::default_session
   std::optional<double> heartbeat_s_;  // the stated heartbeat; empty: no heartbeat load
+  double reconnect_within_s_{};        // W: the stated reconnect_within, or the default 30 s
   double level_{};                     // C, the open connections
   double admitted_share_{1.0};         // this step's admitted / offered connects
   bool steady_{false};                 // use_steady_level
+  // The node_downs (follow_outage): the share r / R of the replicas down now, the connections
+  // they dropped that wait for the fault to clear, those dropped at the start of this step, and
+  // the running storm, `storm_rate_` connects a second over [storm_from_s_, storm_until_s_), with
+  // its part of this step (storm_now_).
+  double down_share_{};
+  double waiting_{};
+  double dropped_now_{};
+  double storm_rate_{};
+  double storm_from_s_{};
+  double storm_until_s_{};
+  double storm_now_{};
 };
 
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
@@ -3774,6 +3848,7 @@ WsGatewayBehaviour::WsGatewayBehaviour(const graph::Graph& g, std::size_t self)
   cap_ = model::connection_cap(spec);
   session_s_ = seconds(defaults::session_of(spec));
   if (spec.heartbeat) heartbeat_s_ = seconds(*spec.heartbeat);
+  reconnect_within_s_ = seconds(defaults::reconnect_within_of(spec));
   level_ = fixed_.value_or(0.0);  // a gateway starts empty, or at its fixed level
 }
 
@@ -3785,6 +3860,50 @@ void WsGatewayBehaviour::use_steady_level() {
   steady_ = true;
   level_ = fixed_.value_or(0.0);
   admitted_share_ = 1.0;
+  // The long run has no fault (estimate's copy runs none): no outage, no storm.
+  down_share_ = waiting_ = dropped_now_ = storm_rate_ = storm_now_ = 0.0;
+}
+
+// One step's news of the node_downs (the class comment's reconnect storm): more replicas down drop
+// their connections, fewer start the storm of those waiting, and the step's storm connects are
+// set. Outside every node_down the share stays 0 and nothing here moves.
+void WsGatewayBehaviour::follow_outage(double down_share, SimTime now, SimTime dt) {
+  dropped_now_ = 0.0;
+  if (down_share > down_share_) drop_connections(down_share);
+  if (down_share < down_share_) start_storm(seconds(now));
+  down_share_ = down_share;
+  storm_now_ = storm_in_step(seconds(now), seconds(dt));
+}
+
+// The replicas that went down since the last step held their share of the live connections: of the
+// (1 − s_before) of the replicas that were alive, (s_now − s_before) died, so that share of the
+// level goes, at once (r / R of C for the first node_down). A fixed level is not dropped.
+void WsGatewayBehaviour::drop_connections(double down_share) {
+  if (fixed_) return;
+  const double share_of_live = (down_share - down_share_) / (1.0 - down_share_);
+  dropped_now_ = level_ * share_of_live;
+  level_ -= dropped_now_;
+  waiting_ += dropped_now_;
+}
+
+// The fault cleared at `now_s`: every dropped connection waiting comes back, evenly over W from
+// now, D / W connects a second. A storm still running (an earlier fault's) hands its connects not
+// yet back to this one, so that none is lost or counted twice.
+void WsGatewayBehaviour::start_storm(double now_s) {
+  const double not_back_yet = storm_rate_ * std::max(storm_until_s_ - now_s, 0.0);
+  storm_rate_ = (waiting_ + not_back_yet) / reconnect_within_s_;
+  storm_from_s_ = now_s;
+  storm_until_s_ = now_s + reconnect_within_s_;
+  waiting_ = 0.0;
+}
+
+// The storm's connects in the step [now_s, now_s + dt_s), per second: its rate times the part of
+// the step it covers, overlap / dt (1 inside it, 0 outside, a fraction at its end when W is not a
+// whole number of steps).
+double WsGatewayBehaviour::storm_in_step(double now_s, double dt_s) const {
+  if (storm_rate_ <= 0.0) return 0.0;
+  const double overlap = std::min(now_s + dt_s, storm_until_s_) - std::max(now_s, storm_from_s_);
+  return overlap > 0.0 ? storm_rate_ * overlap / dt_s : 0.0;
 }
 
 // One step of the level (the class comment): of `connects` per second, the ones admitted, the level

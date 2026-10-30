@@ -207,6 +207,13 @@ class FaultSchedule {
   // 1 when every replica is down; 0 outside every window.
   [[nodiscard]] double dead_share(std::size_t node, SimTime now, SimTime failover) const;
 
+  // The share of `node`'s replicas the node_downs active at `now` take, 1 − Π (R − r_i) / R over
+  // them (r / R for one, 1 when every replica is down; 0 outside every node_down): the share of a
+  // ws_gateway's connections they drop and of its messages they lose (behaviours::
+  // WsGatewayBehaviour::follow_outage, the reconnect storm). A dc_down is not counted: it cuts the
+  // datacenter off rather than killing replicas (the class header).
+  [[nodiscard]] double down_share(std::size_t node, SimTime now) const;
+
   // The share r / R that `fault` sends to dead replicas of `node` during its failover: its
   // node_down effect's lost capacity, 1 − (R − r) / R; 0 for every other kind, and for a sql_db's
   // or a kv_cluster's partial node_down, which leave the capacity factor alone (the header
@@ -288,6 +295,8 @@ class FaultSchedule {
   [[nodiscard]] static bool changes_nothing(const Condition& c);
   [[nodiscard]] static bool is_outage(const Condition& effect);
   [[nodiscard]] static bool active(SimTime at, SimTime duration, SimTime now);
+  [[nodiscard]] double killed_share(std::size_t node, SimTime now,
+                                    std::optional<SimTime> window) const;
   static void compose(Condition& into, const Condition& effect);
   void whole_cluster_down(std::size_t node, Condition& condition) const;
   [[nodiscard]] double back_in_s(std::size_t node, SimTime now) const;
@@ -318,7 +327,8 @@ class FaultSchedule {
 //             drain (the requests that waited for the node to come back), a flushed cache's
 //             warm-up (ch. 1: every read misses an empty cache and goes to the database until it
 //             is full again), the attempts the clients' retries added and the jobs the worker
-//             pools re-published (below); later a gateway's reconnect storm (Task 15)
+//             pools re-published (below), and a gateway's reconnect storm (ch. 12: every
+//             connection a dead chat server held comes back at once; below)
 //   recovery  the time to recover, the number an incident report and a scenario's README quote
 //
 // The baseline is a counterfactual: a TWIN run, the same scenario with every fault stripped,
@@ -377,6 +387,15 @@ class FaultSchedule {
 // `failover 10s: 2.5k requests sent to the dead replica`, in `attempts` when retries reach the
 // node, as `lost` is). Ignored: anything the run does not show (how a load balancer detects the
 // failure: FaultSchedule's header).
+// The reconnect storm (behaviours::WsGatewayBehaviour has the model): a node_down of a ws_gateway
+// drops the connections its dead replicas held, and they reconnect over `reconnect_within` from the
+// fault's end. `after` names the storm's size (the connections dropped), how long it lasts, and
+// the gateway's PEAK OFFERED UTILISATION from the fault's end to the end of the run, demand /
+// total capacity (capacity per replica × replicas), the number explain's checks print as "peak
+// offered ... (148%)", uncapped: the node table's rho is the busy fraction and stops at 100 %,
+// which would hide by how much a storm overloads the tier. With the moment it is first reached:
+// where the storm and the heartbeats of the refilling level meet. The peak is read from the fault's
+// end and not inside it, where the capacity is 0 and every arrival is "over 100 %".
 struct FaultAfter {
   // Whose backlog the fault left above the twin's: the faulted node, a dc_down's datacenter, a
   // traffic_spike's downstream node with the most work left (backlog / capacity, in seconds, over
@@ -415,6 +434,16 @@ struct FaultAfter {
   std::optional<double> failover_lost{};
   SimTime failover{};
   int dead_replicas{};
+  // A node_down of a ws_gateway only (the reconnect storm, FaultRecord's header): the connections
+  // the fault dropped (Σ NodeSample::connections_dropped over its window), `reconnect_within`
+  // (they come back evenly over it from the fault's end), and the gateway's peak offered
+  // utilisation from the fault's end on, demand / total capacity, with the start of the step that
+  // first reached it. The storm's size is empty for every other fault; the peak, until a step
+  // after the fault has been observed.
+  std::optional<double> reconnect_storm_connections{};
+  SimTime reconnect_storm_over{};
+  std::optional<double> peak_rho{};
+  std::optional<SimTime> peak_rho_at{};
 };
 
 // One fault's record. The faulted part is the node the fault names; for a dc_down it is the
@@ -712,14 +741,27 @@ void FaultSchedule::whole_cluster_down(std::size_t node, Condition& condition) c
   condition.machines_down = 0;
 }
 
-// The surviving share Π (R − r_i) / R of the node_downs whose failover window holds `now` is each
-// one's capacity factor, so the dead share is exactly what those faults took (0.25 for 1 of 4).
+// The failover window of each node_down is min(failover, for) from its start.
 double FaultSchedule::dead_share(std::size_t node, SimTime now, SimTime failover) const {
+  return killed_share(node, now, failover);
+}
+
+// The whole of each node_down, [at, at + for).
+double FaultSchedule::down_share(std::size_t node, SimTime now) const {
+  return killed_share(node, now, std::nullopt);
+}
+
+// The surviving share Π (R − r_i) / R of the node_downs on `node` active at `now`, each over its
+// first `window` (all of it when empty), is each one's capacity factor, so the share killed is
+// exactly what those faults took (0.25 for 1 of 4).
+double FaultSchedule::killed_share(std::size_t node, SimTime now,
+                                   std::optional<SimTime> window) const {
   double survivors = 1.0;
   for (const auto& fault : faults_) {
     if (fault.node != node || !fault.kills_replicas) continue;
-    const SimTime window{std::min(failover.count(), fault.duration.count())};
-    if (active(fault.at, window, now)) survivors *= fault.effect.capacity_factor;
+    const SimTime span{window ? std::min(window->count(), fault.duration.count())
+                              : fault.duration.count()};
+    if (active(fault.at, span, now)) survivors *= fault.effect.capacity_factor;
   }
   return 1.0 - survivors;
 }

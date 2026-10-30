@@ -419,7 +419,8 @@ constexpr SimTime default_session = 30_min;
 // (model::NodeSpec::reconnect_within): 30 seconds. Chosen, not from the book: ch. 12 has the
 // client reconnect after a lost heartbeat but gives no number; 30 s is a few heartbeats (the
 // book's 5 s each) of a client's backoff before it tries again. Read by the reconnect storm of a
-// node_down (phase 3 Task 15); stored and printed until then.
+// node_down (behaviours::WsGatewayBehaviour); scenarios/book/chat-system/README.md sweeps it from
+// 10 s to 60 s.
 constexpr SimTime default_reconnect_within = 30_s;
 
 // The session a gateway's connections last (the stated one, else default_session) and how soon

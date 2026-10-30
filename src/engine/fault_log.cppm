@@ -132,6 +132,10 @@ class FaultLog {
     // A cache_flush's: the `at` of the next flush of the same cache, which ends this one's window
     // if the cache is not full by then (FaultAfter::interrupted_by_flush_at). Empty if none.
     std::optional<SimTime> next_flush{};
+    // A node_down of a ws_gateway's: the gateway's total capacity (per replica × replicas), what
+    // its peak offered utilisation after the fault divides by (FaultAfter::peak_rho). Empty for
+    // every other fault: no storm to follow.
+    std::optional<double> storm_capacity_per_s{};
     // Whose backlog may need draining: the faulted part, or for a traffic_spike every node
     // downstream (any node but a client), the worst of which is named once the spike is over.
     std::vector<Backlogged> backlogged{};
@@ -174,6 +178,9 @@ class FaultLog {
   static void add_failover(const graph::Graph& g, std::span<const FailoverRoute> routes,
                            const model::Fault& fault, std::size_t node, FaultRecord& r);
   static void observe_warm_up(FaultRecord& r, SimTime t, SimTime dt);
+  static void observe_storm(FaultRecord& r, const Tracker& tracker, const StepRecord& run,
+                            bool during);
+  static void add_storm(const graph::Graph& g, const model::Fault& fault, Tracker& tracker);
   [[nodiscard]] static bool in_window(const FaultRecord& r, SimTime t);
   [[nodiscard]] static bool cleared(const FaultRecord& r, SimTime t);
   [[nodiscard]] static std::optional<double> window_length_s(const FaultRecord& r);
@@ -401,7 +408,18 @@ FaultLog::Tracker FaultLog::faulted_part(const graph::Graph& g, const model::Fau
   } else {
     add_backlogged(tracker, tracker.nodes, fault.node);
   }
+  add_storm(g, fault, tracker);
   return tracker;
+}
+
+// A node_down of a ws_gateway has a reconnect storm to follow (FaultRecord's header): the record
+// keeps the gateway's total capacity, what its peak offered utilisation divides by.
+void FaultLog::add_storm(const graph::Graph& g, const model::Fault& fault, Tracker& tracker) {
+  if (fault.kind != model::FaultKind::node_down) return;
+  const auto& gateway = g.nodes()[tracker.nodes.front()];
+  if (gateway.spec.type != model::NodeType::ws_gateway) return;
+  tracker.storm_capacity_per_s =
+      gateway.capacity.service_rate.per_second * model::copies_of(gateway.spec);
 }
 
 // Whose retries the record follows (FaultRecord::lost_requests, FaultAfter): a traffic_spike's
@@ -467,6 +485,11 @@ FaultRecord FaultLog::record_of(const graph::Graph& g, const model::Fault& fault
   if (fault.kind == model::FaultKind::node_down) {
     add_failover(g, failover_routes, fault, tracker.nodes.front(), r);
   }
+  if (tracker.storm_capacity_per_s) {
+    r.after.reconnect_storm_connections = 0.0;
+    r.after.reconnect_storm_over =
+        defaults::reconnect_within_of(g.nodes()[tracker.nodes.front()].spec);
+  }
   // A cache without a hit ratio loses nothing to a flush: its window is empty from the start.
   if (fault.kind == model::FaultKind::cache_flush && !g.nodes()[tracker.nodes.front()].hit_ratio) {
     r.flush_window_s = 0.0;
@@ -528,6 +551,7 @@ void FaultLog::observe_one(FaultRecord& r, Tracker& tracker, const StepPair& ste
   const Part twin = part_of(tracker, step.twin, step.twin_links);
   const bool during = in_window(r, t);
   observe_backlogs(tracker, step, during);
+  observe_storm(r, tracker, step.run, during);
   if (during) {
     observe_during(r, tracker, run, step, seconds(dt));
   } else {
@@ -695,6 +719,25 @@ void FaultLog::observe_warm_up(FaultRecord& r, SimTime t, SimTime dt) {
   }
   if (seconds(SimTime{t.count() + dt.count() - r.at.count()}) >= *r.flush_window_s) {
     r.after.cache_warm_in_s = *r.flush_window_s;
+  }
+}
+
+// A gateway's reconnect storm (FaultRecord's header): during the fault, the connections it dropped
+// (the step that starts at `at` drops them, NodeSample::connections_dropped); from its end to the
+// end of the run, the gateway's offered utilisation, demand / total capacity, and the first step
+// that reaches its peak. Nothing for any other fault.
+void FaultLog::observe_storm(FaultRecord& r, const Tracker& tracker, const StepRecord& run,
+                             bool during) {
+  if (!tracker.storm_capacity_per_s || *tracker.storm_capacity_per_s <= 0.0) return;
+  const auto& gateway = run.nodes[tracker.nodes.front()];
+  if (during) {
+    *r.after.reconnect_storm_connections += gateway.connections_dropped.value_or(0.0);
+    return;
+  }
+  const double offered = gateway.demand_per_s / *tracker.storm_capacity_per_s;
+  if (!r.after.peak_rho || offered > *r.after.peak_rho) {
+    r.after.peak_rho = offered;
+    r.after.peak_rho_at = run.t;
   }
 }
 

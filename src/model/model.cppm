@@ -647,14 +647,17 @@ struct NodeSpec {
   //    pings a second on its `heartbeat` op (the book's presence heartbeat: every 5 s). Absent:
   //    no heartbeat load.
   //  - `fanout`: the average recipients of one message, a factor (at least 1) on the steps of the
-  //    gateway's message ops (message_op below). Absent: 1.
+  //    gateway's message ops (message_op below) that target a message_queue: ch. 12 stores a
+  //    message once and copies it once per recipient into the sync queues. Absent: 1.
   //  - `connections`: a FIXED level, for a gateway no client op connects to (google-drive's 2M
   //    long polls, held by devices nobody here simulates). Absent: the level is filled by the
   //    clients' `connect` op, and Simulation::create refuses a gateway that has neither or both.
   //  - `session`: how long a user stays connected on average, so each open connection ends at
   //    rate 1 / session. Absent: defaults::default_session (30 min, chosen).
-  //  - `reconnect_within`: how long the users of a fallen gateway take to come back (the reconnect
-  //    storm of phase 3 Task 15). Absent: defaults::default_reconnect_within (30 s, chosen).
+  //  - `reconnect_within`: how long the users of a fallen gateway take to come back: the
+  //    connections a node_down dropped reconnect evenly over it from the fault's end (the reconnect
+  //    storm, behaviours::WsGatewayBehaviour). Absent: defaults::default_reconnect_within (30 s,
+  //    chosen).
   // The loader leaves an absent one absent, so explain can mark "(default)".
   std::optional<std::int64_t> max_connections{};
   std::optional<SimTime> heartbeat{};
@@ -698,8 +701,8 @@ struct NodeSpec {
 // is the op the open connections' pings arrive under (the gateway adds C / heartbeat of them to
 // what the clients send under that name); `deliver` is a message pushed to a recipient over its
 // open connection (terminal: no hops). Every other op the gateway receives is a MESSAGE, whose
-// steps the `fanout` multiplies. `constexpr` without `inline` (CLAUDE.md §3's seventh GCC 14.2
-// defect): exported, so still one definition, in this interface's object file.
+// steps to a message queue the `fanout` multiplies. `constexpr` without `inline` (CLAUDE.md §3's
+// seventh GCC 14.2 defect): exported, so still one definition, in this interface's object file.
 constexpr std::string_view connect_op = "connect";
 constexpr std::string_view heartbeat_op = "heartbeat";
 constexpr std::string_view deliver_op = "deliver";
@@ -717,7 +720,8 @@ constexpr std::string_view deliver_op = "deliver";
   return static_cast<double>(*spec.max_connections) * spec.replicas;
 }
 
-// The `fanout` a gateway's message steps are multiplied by: the stated one, else 1.
+// The `fanout` a gateway's message steps to a message queue are multiplied by: the stated one,
+// else 1.
 [[nodiscard]] constexpr double fanout_of(const NodeSpec& spec) {
   return spec.fanout.value_or(1.0);
 }

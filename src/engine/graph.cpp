@@ -2437,11 +2437,15 @@ std::optional<EngineError> Graph::invalid_failure_step(
 // connect_step has already resolved every target.
 //
 // A ws_gateway's message ops fan out (phase 3 spec §8.2; book ch. 12: a message to a group reaches
-// each member): every step of an op that is a message (model::message_op: not connect, heartbeat
-// or deliver) sends `fanout` times its own factor, fanout × factor requests per message, and the
+// each member) WHERE THE BOOK COPIES THEM: ch. 12's chat server stores a message once (one id from
+// the id generator, one row in the message store) and puts one copy per recipient into the
+// message sync queues, which the workers deliver. So a step of a message op (model::message_op:
+// not connect, heartbeat or deliver) that targets a message_queue sends `fanout` times its own
+// factor, fanout × factor copies per message, and every other step of it one request per message
+// (the Task 14 review's correction: multiplying every step stored each message 1.4 times). The
 // engine (the behaviours read these hops) and explain's paper load both see it. An `on: miss` step
-// is not multiplied again: its factor is its lookup's times its own, and the lookup's has the
-// fan-out already.
+// to a queue is multiplied too: its lookup asks a cache, which no fan-out multiplies, so the
+// fan-out enters its factor once.
 Graph::Result Graph::resolve_service_hops(std::size_t node) {
   const auto& spec = nodes_[node].spec;
   for (const auto& [op, steps] : spec.ops) {
@@ -2451,12 +2455,18 @@ Graph::Result Graph::resolve_service_hops(std::size_t node) {
     for (const model::Step& step : steps) {
       auto hop = resolve_service_hop(node, step, hops, last_unconditional);
       if (!hop) return std::unexpected{std::move(hop.error())};
-      if (fans_out && step.on != model::StepCondition::miss) hop->factor *= model::fanout_of(spec);
+      if (fans_out && copies_per_recipient(hop->target)) hop->factor *= model::fanout_of(spec);
       if (step.on == model::StepCondition::always) last_unconditional = hops.size();
       hops.push_back(std::move(*hop));
     }
   }
   return {};
+}
+
+// Whether a gateway's message step to `target` carries one copy per recipient
+// (resolve_service_hops): it does when `target` is a message queue, ch. 12's message sync queue.
+bool Graph::copies_per_recipient(std::size_t target) const {
+  return nodes_[target].spec.type == model::NodeType::message_queue;
 }
 
 // One step of node `node`'s op, resolved against the op's hops before it (`hops`, the last

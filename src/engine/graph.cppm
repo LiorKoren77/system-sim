@@ -539,6 +539,7 @@ class Graph {
   [[nodiscard]] std::expected<ServiceHop, EngineError> resolve_service_hop(
       std::size_t node, const model::Step& step, std::span<const ServiceHop> hops,
       std::optional<std::size_t> last_unconditional) const;
+  [[nodiscard]] bool copies_per_recipient(std::size_t target) const;
   [[nodiscard]] std::optional<EngineError> invalid_miss_step(std::size_t node,
                                                              const model::Step& step,
                                                              const ServiceHop* lookup) const;

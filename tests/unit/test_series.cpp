@@ -1084,6 +1084,9 @@ TEST_CASE("explain gives youtube's metadata_db and metadata_cache the completion
 //    read of every message copy the queue holds (44.1k/s) and, since the gateway states a level in
 //    Task 15, the gateway's own heartbeats C / 5 s, so at least the 93.6k/s that Task 14 printed
 //    (49.5k users' heartbeats + 44.1k reads): how much more is the scenario's sizing, not pinned.
+//    (The implementation of Task 15 left the heartbeats to the gateway's level alone, the users
+//    send none, and sized presence at 10 nodes of 100k/s: 369k/s per copy at the 21:00 peak, the
+//    scenario's README says why.)
 // Behind the message queue and the pools the paper load follows, so nothing says "load not
 // propagated" and nothing blames a queue or a pool.
 TEST_CASE("explain checks chat-system's two kv_clusters at their hottest node", "[series]") {
@@ -1114,15 +1117,17 @@ TEST_CASE("explain checks chat-system's two kv_clusters at their hottest node", 
 // chat-system's presence and notification-system's log_db keep N = 2 copies and answer at the first
 // reply for reads and writes alike (W = R = 1): fast, and the quorums do not overlap, so a read may
 // miss the latest write, which explain now says beside the mode the scenarios leave to its default.
-// Their rings: 4 machines, k = 1 + z_4 / sqrt(2 x 150) = 1.0606, printed 1.06; 3 machines, 1 + z_3
-// / sqrt(300) = 1.0502, printed 1.05 (1.08 for both with the old 1 + 1/sqrt(150)).
+// Their rings: 10 machines, k = 1 + z_10 / sqrt(2 x 150) = 1.0897, printed 1.09 (chat-system's
+// presence grew from 4 machines, k = 1.0606, in phase 3 Task 15, to carry the gateway's heartbeats:
+// its README says why); 3 machines, 1 + z_3 / sqrt(300) = 1.0502, printed 1.05 (1.08 for both
+// with the old 1 + 1/sqrt(150)).
 TEST_CASE("explain notes the non-overlapping quorums of chat's presence and notification's log_db",
           "[series]") {
   const auto chat = explain_shipped("chat-system");
   CAPTURE(chat);
   REQUIRE(node_line(chat, "presence")
-              .contains("nodes=4 N=2 W=1 R=1 (W + R ≤ N: a read may miss the latest write) "
-                        "mode=ap (default; partitions: phase 3)  imbalance=1.06 (vnodes 150)"));
+              .contains("nodes=10 N=2 W=1 R=1 (W + R ≤ N: a read may miss the latest write) "
+                        "mode=ap (default; partitions: phase 3)  imbalance=1.09 (vnodes 150)"));
   const auto notification = explain_shipped("notification-system");
   CAPTURE(notification);
   REQUIRE(node_line(notification, "log_db")
