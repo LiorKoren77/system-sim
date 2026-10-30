@@ -2768,3 +2768,176 @@ TEST_CASE("a windowed SLO that was skipped names no window in the table", "[repo
   REQUIRE(line.contains("SKIP"));
   REQUIRE_FALSE(line.contains("worst"));
 }
+
+// ---- The fault block, from records built by hand
+// --------------------------------------------------
+//
+// The renderers read the engine's FaultRecords through the Summary (Summary::set_faults(records),
+// replacing any it held; tests/unit/test_engine.cpp has the record's assumed layout and
+// tests/theory/test_faults.cpp the whole-run blocks derived from the engine). Here the records are
+// literals, so the wording and the JSON are pinned apart from the engine: the Summary of an
+// ordinary mm1 run with the records of a ten second node_down set on it.
+namespace {
+using simsys::SimTime;
+using simsys::engine::FaultRecord;
+using simsys::model::FaultKind;
+
+// The probe's node_down of tests/theory/test_faults.cpp, recovered at 20.2 s.
+// C++20 designated initializers again, on a type with many members of one kind (doubles): each
+// number names itself.
+FaultRecord node_down_record() {
+  return {.kind = FaultKind::node_down,
+          .node = "s",
+          .at = SimTime{10s},
+          .duration = SimTime{10s},
+          .offered_per_s = 400,
+          .served_per_s = 0,
+          .lost = 3900,
+          .backlog_peak = 100,
+          .room = 100,
+          .flipped = {},
+          .after = {.backlog_drained_in_s = 0.2, .cache_warm_in_s = std::nullopt},
+          .recovered_at = SimTime{20200ms}};
+}
+
+struct Rendered {
+  std::string table;
+  std::string json;
+};
+
+// An mm1 run (no faults of its own: the records are the test's) with `records` set on its Summary.
+Rendered rendered_with(std::vector<FaultRecord> records,
+                       std::vector<simsys::model::SloSpec> slos = {}) {
+  auto s = mm1(400);
+  s.slos = std::move(slos);
+  const auto g = *simsys::graph::Graph::build(s);
+  auto summary = summarize(s, g);
+  summary.set_faults(records);
+  const auto verdicts = simsys::report::evaluate_slos(summary, s.slos);
+  return {simsys::report::render_table(summary, verdicts, /*color=*/false),
+          simsys::report::render_json(summary, verdicts)};
+}
+}  // namespace
+
+TEST_CASE("a node_down record renders as the four line block, the numbers as the SLO table's units",
+          "[report]") {
+  const auto out = rendered_with({node_down_record()});
+  CAPTURE(out.table);
+  REQUIRE(out.table.ends_with(
+      "fault 00:00:10 node_down s for 10s\n"
+      "  during:   offered 400/s, served 0/s, lost 3.9k requests, backlog 100 (room 100 dropped "
+      "the rest)\n"
+      "  after:    backlog drained in 0.2s\n"
+      "  recovery: op p99 back within 1% at 00:00:20.2 (0.2s after the fault cleared)\n"));
+}
+
+// A record that says it never recovered (recovered_at empty) and whose backlog was never drained
+// prints both facts, and the JSON says null.
+TEST_CASE("a record without recovered_at prints not recovered by the end of the run", "[report]") {
+  auto record = node_down_record();
+  record.recovered_at.reset();
+  record.after.backlog_drained_in_s.reset();
+  const auto out = rendered_with({record});
+  CAPTURE(out.table, out.json);
+  REQUIRE(out.table.contains("  after:    backlog not drained by the end of the run\n"));
+  REQUIRE(out.table.ends_with("  recovery: not recovered by the end of the run\n"));
+  REQUIRE(out.json.contains("\"recovered_at_s\": null"));
+  REQUIRE(out.json.contains("\"backlog_drained_in_s\": null"));
+}
+
+// With no backlog at all there is nothing to drain: `after` says so rather than `drained in 0s`.
+TEST_CASE("a record with no backlog prints: no backlog to drain, and lost 0 requests", "[report]") {
+  auto record = node_down_record();
+  record.kind = FaultKind::latency_spike;
+  record.offered_per_s = record.served_per_s = 400;
+  record.lost = record.backlog_peak = 0;
+  record.after.backlog_drained_in_s.reset();
+  record.recovered_at = SimTime{20s};
+  const auto out = rendered_with({record});
+  CAPTURE(out.table);
+  REQUIRE(out.table.ends_with(
+      "fault 00:00:10 latency_spike s for 10s\n"
+      "  during:   offered 400/s, served 400/s, lost 0 requests, backlog 0\n"
+      "  after:    no backlog to drain\n"
+      "  recovery: op p99 back within 1% at 00:00:20 (0s after the fault cleared)\n"));
+}
+
+// The flipped SLOs close the during line, in the order of the scenario's SLO list, each as the
+// words of the SLO table's columns that it has (metric, node, op: an SLO with no node or op prints
+// neither), then `flipped to FAIL`: the same word as the table's verdict.
+TEST_CASE("the during line names each flipped SLO by metric, node and op, in the list's order",
+          "[report]") {
+  auto record = node_down_record();
+  record.flipped = {0, 1};
+  const auto out = rendered_with(
+      {record},
+      {simsys::model::SloSpec{.metric = simsys::model::SloMetric::p99_latency,
+                              .node = "c",
+                              .op = "op",
+                              .max = SimTime{100ms}},
+       simsys::model::SloSpec{.metric = simsys::model::SloMetric::drop_rate, .max = 0.01}});
+  CAPTURE(out.table, out.json);
+  REQUIRE(
+      out.table.contains("backlog 100 (room 100 dropped the rest), p99_latency c op flipped to "
+                         "FAIL, drop_rate flipped to FAIL\n"));
+  REQUIRE(out.json.contains("\"flipped\": [\"p99_latency c op\", \"drop_rate\"]"));
+}
+
+// A cache_flush record: no `for` (an instant) in the header or the JSON, the warm-up in `after`.
+// The clock prints a whole minute as HH:MM, as an SLO window's start does.
+TEST_CASE("a cache_flush record prints no for, its warm-up time and the clock as HH:MM",
+          "[report]") {
+  auto record = node_down_record();
+  record.kind = FaultKind::cache_flush;
+  record.node = "edge";
+  record.at = SimTime{10min};
+  record.duration = SimTime{0};
+  record.after = {.backlog_drained_in_s = std::nullopt, .cache_warm_in_s = 12.106};
+  record.recovered_at = SimTime{10min + 11800ms};
+  const auto out = rendered_with({record});
+  CAPTURE(out.table, out.json);
+  REQUIRE(out.table.contains("fault 00:10 cache_flush edge\n"));
+  REQUIRE(out.table.contains("  after:    cache warm again in 12.1s\n"));
+  REQUIRE(out.table.ends_with(
+      "  recovery: op p99 back within 1% at 00:10:11.8 (11.8s after the fault cleared)\n"));
+  REQUIRE(out.json.contains("\"at_s\": 600"));
+  REQUIRE(out.json.contains("\"for_s\": null"));
+  REQUIRE(out.json.contains("\"cache_warm_in_s\": 12.106"));
+  REQUIRE(out.json.contains("\"backlog_drained_in_s\": null"));
+}
+
+// The JSON of one record, key by key, in seconds; `recovered_at_s` is the same number as the text's
+// `00:00:20.2`, as a double.
+TEST_CASE("the JSON of a record is at_s, kind, node, for_s, during, after, recovered_at_s",
+          "[report]") {
+  const auto out = rendered_with({node_down_record()});
+  CAPTURE(out.json);
+  REQUIRE(out.json.ends_with(
+      "  \"faults\": [\n"
+      "    {\"at_s\": 10, \"kind\": \"node_down\", \"node\": \"s\", \"for_s\": 10, "
+      "\"during\": {\"offered_per_s\": 400, \"served_per_s\": 0, \"lost\": 3900, "
+      "\"backlog_peak\": 100, \"room\": 100, \"flipped\": []}, "
+      "\"after\": {\"backlog_drained_in_s\": 0.2, \"cache_warm_in_s\": null}, "
+      "\"recovered_at_s\": 20.2}\n"
+      "  ]\n}"));
+}
+
+// What does not change: a Summary with no fault records prints no block and no key. hello is the
+// tutorial's first scenario, with no faults: neither report mentions any. This passes today and
+// must keep passing.
+TEST_CASE("a scenario without faults has no fault block and no faults key in either report",
+          "[report]") {
+  const auto loaded =
+      simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/tutorial/hello/scenario.yaml");
+  INFO((loaded ? "" : loaded.error().message));
+  REQUIRE(loaded.has_value());
+  const auto g = *simsys::graph::Graph::build(*loaded);
+  const auto summary = summarize(*loaded, g);
+  const auto slos = simsys::report::evaluate_slos(summary, loaded->slos);
+  const auto table = simsys::report::render_table(summary, slos, /*color=*/false);
+  const auto json = simsys::report::render_json(summary, slos);
+  CAPTURE(table, json);
+  REQUIRE_FALSE(table.contains("fault "));
+  REQUIRE_FALSE(table.contains("recovery:"));
+  REQUIRE_FALSE(json.contains("\"faults\""));
+}

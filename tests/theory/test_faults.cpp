@@ -32,6 +32,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <span>
 #include <string>
 #include <string_view>
@@ -178,6 +179,8 @@ std::string run_json(const Scenario& s) {
   simsys::report::Summary summary{g, s.warmup};
   auto sim = simulation_of(g);
   sim.run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
+  summary.set_faults(
+      sim.fault_records());  // as session::run_summary does: the report's fault block
   return simsys::report::render_json(summary, {});
 }
 
@@ -1523,4 +1526,330 @@ TEST_CASE("a node_down of two of a kv_cluster's six machines loses the reads who
       300);
   REQUIRE_THAT(response_of(step_at(one, 15.0), "read").answered.per_second,
                WithinRel(1000.0, 1e-9));
+}
+
+// ---- The fault block: what the fault cost, what followed, when the system recovered
+// --------------
+//
+// Book ch. 1 and ch. 12 ask of every failure three things: what did it cost while it lasted, what
+// came after it (the backlog to work off, the cache to refill), and when was the system itself
+// again. The report answers them in a block of four lines per fault, after the SLO table (spec
+// §4.4; the lines are the same for every kind of fault):
+//   fault <at> <kind> <node> for <for>        the clock time `at` as the SLO windows print it
+//     during:   offered, served, lost, backlog   what the faulted node was sent, what it served
+//     after:    what followed                    (means over the fault), the requests its room
+//     recovery: when everything was back         dropped, its backlog's peak, SLOs that flipped
+// Model under test (phase 3 Task 8), the engine's FaultRecord per fault, read by the report:
+//   offered, served  the faulted node's demand and drain, per second, averaged over [at, at + for)
+//   lost             the requests its full room dropped over the fault (sum of dropped x dt)
+//   backlog, room    the peak backlog over the fault, and the room (queue_limit) it filled
+//   flipped          an SLO that held at the step before the fault and is broken at some step
+//                    inside it, judged on that step alone (a p99_latency SLO: the op's p99 at the
+//                    step, from the moments the step answered with)
+//   after            a node_down's backlog drained: from the end of the fault to the end of the
+//                    first step whose backlog is empty; a flushed cache's warm-up time: keys read
+//                    off the same curve as Task 7 (t_c / rate for a che cache, keys / rate for a
+//                    fixed ratio)
+//   recovery         the first step starting at or after the end of the fault at which every
+//                    client op's p99 and every node's rho are within 1 % of the step before `at`
+//                    (relative to it): the time of the START of that step. Measured, not
+//                    estimated: on the M/M/1 probe below the third step after the fault is the
+//                    first with rho back at 0.4 (steps 20.0 and 20.1 s have rho 1 and 0.8), so
+//                    recovery is at 20.2 s, 0.2 s after the fault cleared. (The plan estimated
+//                    20.3 s; its 20.3 is the END of that step. The tests pin the start: the system
+//                    IS back from 20.2 s, the backlog having been empty since that instant, and it
+//                    agrees with the drain time of the line above.)
+// Formats chosen here: the clock is window_clock's (a whole minute `00:10`, a whole second
+// `00:00:10`) and, for a time that is not a whole second, HH:MM:SS with a tenth (`00:00:20.2`:
+// window_clock would print the exact duration, `20200ms`); durations after `in`, `for` and `after`
+// are seconds with at most one decimal (`0.2s`, `12.1s`, `0s`), except the header's `for`, which is
+// the scenario's own (`10s`, `200ms`). Ignored on purpose: the follow-ons of Tasks 10 and 15 (the
+// client's extra attempts, a reconnect storm), which add their own `after:` text.
+
+namespace {
+// What a run reports with the fault records its engine kept (session::run_summary does the same).
+struct FaultRun {
+  std::string table;
+  std::string json;
+  std::vector<simsys::engine::FaultRecord> faults;
+};
+
+FaultRun fault_run(const Scenario& s) {
+  const auto g = graph_of(s);
+  simsys::report::Summary summary{g, s.warmup};
+  auto sim = simulation_of(g);
+  sim.run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
+  const auto records = sim.fault_records();
+  summary.set_faults(records);
+  const auto verdicts = simsys::report::evaluate_slos(summary, s.slos);
+  return {simsys::report::render_table(summary, verdicts, /*color=*/false),
+          simsys::report::render_json(summary, verdicts),
+          std::vector<simsys::engine::FaultRecord>{records.begin(), records.end()}};
+}
+
+// The probe's ten second node_down, whose block is pinned in full by the tests below.
+constexpr std::string_view node_down_block =
+    "fault 00:00:10 node_down s for 10s\n"
+    "  during:   offered 400/s, served 0/s, lost 3.9k requests, backlog 100 (room 100 dropped the "
+    "rest)\n"
+    "  after:    backlog drained in 0.2s\n"
+    "  recovery: op p99 back within 1% at 00:00:20.2 (0.2s after the fault cleared)\n";
+
+// Three p99 SLOs on the op: one the outage breaks (100 ms; the probe's p99 is 8.2 ms before it),
+// one that already fails before it (1 ms), one it never breaks (1 h).
+constexpr std::string_view three_p99_slos =
+    "slo:\n"
+    "  - {metric: p99_latency, node: c, op: op, max: 100ms}\n"
+    "  - {metric: p99_latency, node: c, op: op, max: 1ms}\n"
+    "  - {metric: p99_latency, node: c, op: op, max: 1h}\n";
+
+// The text of the JSON from `key` on, and the number after `key` (a key written `"name": `).
+double number_after(const std::string& text, std::string_view key) {
+  const auto at = text.find(key);
+  CAPTURE(key);
+  REQUIRE(at != std::string::npos);
+  return std::stod(text.substr(at + key.size()));
+}
+
+// The keys in the order given, each after the one before (the layout of an object, without
+// pinning the numbers between them).
+void require_in_order(const std::string& text, std::initializer_list<std::string_view> keys) {
+  std::size_t from = 0;
+  for (const auto key : keys) {
+    CAPTURE(key);
+    const auto at = text.find(key, from);
+    REQUIRE(at != std::string::npos);
+    from = at + key.size();
+  }
+}
+}  // namespace
+
+// The probe's outage, whole: 400/s offered and nothing served for 10 s, the room (100) kept the
+// first 100 of the 4000 and dropped 3900 (above), the backlog was the room, drained in two steps
+// (0.2 s) once the capacity was back, and from the step at 20.2 s the op's p99 and every rho are
+// the pre-fault ones. The block is the last thing in the table when there is no SLO.
+TEST_CASE("a ten second node_down prints its block: lost 3.9k, drained in 0.2s, recovered at 20.2",
+          "[theory]") {
+  const auto run = fault_run(probe({.faults = one_fault(ten_seconds_from_ten)}));
+  CAPTURE(run.table);
+  // C++20 std::string::ends_with: a suffix test in one call, replacing
+  // `s.size() >= n && s.compare(s.size() - n, n, x) == 0`.
+  REQUIRE(run.table.ends_with(node_down_block));
+  REQUIRE(run.table.find("fault ") == run.table.rfind("fault "));  // one block, not two
+}
+
+// The block follows the SLO table (the table's last section), not the op table.
+TEST_CASE("the fault block comes after the SLO table", "[theory]") {
+  const auto run = fault_run(
+      probe({.faults = one_fault(ten_seconds_from_ten), .slos = std::string{three_p99_slos}}));
+  CAPTURE(run.table);
+  const auto slo_header = run.table.find("\nslo\n");
+  REQUIRE(slo_header != std::string::npos);
+  REQUIRE(run.table.find("fault 00:00:10 node_down s for 10s\n") > slo_header);
+  REQUIRE(run.table.contains("  after:    backlog drained in 0.2s\n"));
+}
+
+// The SLO the outage breaks is named at the end of the during line, in the words of the SLO table's
+// columns (metric, node, op) and its verdict strings: `p99_latency c op flipped to FAIL`. The one
+// that already failed before the fault (1 ms) and the one it never broke (1 h) are not named.
+TEST_CASE("the during line ends with the SLO the outage flipped to FAIL and names no other",
+          "[theory]") {
+  const auto run = fault_run(
+      probe({.faults = one_fault(ten_seconds_from_ten), .slos = std::string{three_p99_slos}}));
+  CAPTURE(run.table);
+  REQUIRE(run.table.contains(
+      "  during:   offered 400/s, served 0/s, lost 3.9k requests, backlog 100 (room 100 dropped "
+      "the rest), p99_latency c op flipped to FAIL\n"));
+  REQUIRE(run.table.find("flipped to FAIL") == run.table.rfind("flipped to FAIL"));  // only one
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE(run.faults[0].flipped == std::vector<std::size_t>{0});  // the first SLO of the list
+}
+
+// An outage shorter than the room: 200 ms is two steps of 40 arrivals, so 80 wait (below the room
+// of 100) and nothing is dropped. The during line then has no parenthesis (the room did not fill),
+// and says `lost 0 requests`. After the fault, drain = min(400 + backlog / 0.1 s, 1000)/s:
+//   10.2 s: min(400 + 800, 1000) = 1000, backlog 80 + (400 - 1000) 0.1 = 20
+//   10.3 s: min(400 + 200, 1000) =  600, backlog 20 + (400 -  600) 0.1 = 0     rho 1, then 0.6
+//   10.4 s: drain 400, rho 0.4: the first step with every rho back, 0.2 s after the fault.
+// The backlog is empty from 10.4 s: drained in 0.2 s.
+TEST_CASE("a 200 ms node_down loses nothing: backlog 80 stays under the room of 100", "[theory]") {
+  const auto run = fault_run(probe({.faults = one_fault("at: 10s, kind: node_down, node: s, "
+                                                        "for: 200ms")}));
+  CAPTURE(run.table);
+  REQUIRE(run.table.ends_with(
+      "fault 00:00:10 node_down s for 200ms\n"
+      "  during:   offered 400/s, served 0/s, lost 0 requests, backlog 80\n"
+      "  after:    backlog drained in 0.2s\n"
+      "  recovery: op p99 back within 1% at 00:00:10.4 (0.2s after the fault cleared)\n"));
+}
+
+// Nothing is lost to a latency spike or a capacity fault: a latency_spike of 1 ms makes the
+// service time 2 ms (capacity 500/s, rho 0.8) and a capacity factor of 0.5 does the same to the
+// capacity (500/s, rho 0.8), both above the 400/s offered, so the node serves everything and keeps
+// no backlog. The line keeps its shape, with `lost 0 requests` and `backlog 0`, and `after` says
+// there was nothing to drain. The first step after the fault is the pre-fault step again (rho 0.4,
+// the same p99), so the system is recovered at the instant the fault ends, 0s after it cleared.
+TEST_CASE("a latency_spike loses nothing: lost 0 requests, nothing to drain, recovered at once",
+          "[theory]") {
+  const auto run = fault_run(
+      probe({.faults = one_fault("at: 20s, kind: latency_spike, node: s, extra: 1ms, for: 5s")}));
+  CAPTURE(run.table);
+  REQUIRE(run.table.ends_with(
+      "fault 00:00:20 latency_spike s for 5s\n"
+      "  during:   offered 400/s, served 400/s, lost 0 requests, backlog 0\n"
+      "  after:    no backlog to drain\n"
+      "  recovery: op p99 back within 1% at 00:00:25 (0s after the fault cleared)\n"));
+}
+
+TEST_CASE("a capacity fault loses nothing either: same lines, served 400 per second", "[theory]") {
+  const auto run = fault_run(
+      probe({.faults = one_fault("at: 20s, kind: capacity, node: s, factor: 0.5, for: 5s")}));
+  CAPTURE(run.table);
+  REQUIRE(run.table.ends_with(
+      "fault 00:00:20 capacity s for 5s\n"
+      "  during:   offered 400/s, served 400/s, lost 0 requests, backlog 0\n"
+      "  after:    no backlog to drain\n"
+      "  recovery: op p99 back within 1% at 00:00:25 (0s after the fault cleared)\n"));
+}
+
+// A run that ends before the system is back: the same outage, 20.1 s of run. The fault clears at
+// 20 s and the one step left (20.0 s) is the first of the drain: 40 requests still waiting (above),
+// rho 1. The backlog is not empty and the rho is not back by the end of the run.
+TEST_CASE("a node_down that ends 0.1 s before the run does is not recovered by the end of the run",
+          "[theory]") {
+  const auto run = fault_run(probe(
+      {.faults = one_fault(ten_seconds_from_ten), .timing = "duration: 20100ms\nstep: 100ms\n"}));
+  CAPTURE(run.table);
+  REQUIRE(run.table.ends_with(
+      "fault 00:00:10 node_down s for 10s\n"
+      "  during:   offered 400/s, served 0/s, lost 3.9k requests, backlog 100 (room 100 dropped "
+      "the rest)\n"
+      "  after:    backlog not drained by the end of the run\n"
+      "  recovery: not recovered by the end of the run\n"));
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE_FALSE(run.faults[0].recovered_at.has_value());
+  REQUIRE_FALSE(run.faults[0].after.backlog_drained_in_s.has_value());
+}
+
+// Two faults declared latest first print earliest first. The node_down of 5 s at 10 s: the room
+// keeps 100 of 2000 offered, 1900 are lost, the block is as the probe's with the 5 s shifted; the
+// latency spike at 20 s is the one above.
+TEST_CASE("two faults declared out of order print in at order, one block each", "[theory]") {
+  const auto run = fault_run(
+      probe({.faults = "faults:\n"
+                       "  - {at: 20s, kind: latency_spike, node: s, extra: 1ms, for: 5s}\n"
+                       "  - {at: 10s, kind: node_down, node: s, for: 5s}\n"}));
+  CAPTURE(run.table);
+  REQUIRE(run.table.ends_with(
+      "fault 00:00:10 node_down s for 5s\n"
+      "  during:   offered 400/s, served 0/s, lost 1.9k requests, backlog 100 (room 100 dropped "
+      "the rest)\n"
+      "  after:    backlog drained in 0.2s\n"
+      "  recovery: op p99 back within 1% at 00:00:15.2 (0.2s after the fault cleared)\n"
+      "fault 00:00:20 latency_spike s for 5s\n"
+      "  during:   offered 400/s, served 400/s, lost 0 requests, backlog 0\n"
+      "  after:    no backlog to drain\n"
+      "  recovery: op p99 back within 1% at 00:00:25 (0s after the fault cleared)\n"));
+  REQUIRE(run.faults.size() == 2);
+  require_in_order(run.json,
+                   {"\"faults\": [", "\"at_s\": 10", "node_down", "\"at_s\": 20", "latency_spike"});
+}
+
+// A flushed cache: the block's header has no `for` (a flush is an instant: model::lasts), and the
+// after line is the warm-up time of Task 7's curve, t_c / rate = 12,106 requests / 1000/s = 12.1 s
+// on the che probe above (the flush at 10 minutes, `00:10` on the clock: a whole minute). The
+// during and recovery lines are there, and their numbers are not pinned (what a flush costs is
+// the hit ratio, which the origin's demand carries, not a loss).
+TEST_CASE("a cache_flush on the che probe prints: cache warm again in 12.1s", "[theory]") {
+  const auto run = fault_run(flush_probe({}));
+  CAPTURE(run.table);
+  REQUIRE(run.table.contains("fault 00:10 cache_flush edge\n"));
+  REQUIRE(run.table.contains("  during:   "));
+  REQUIRE(run.table.contains("  after:    cache warm again in 12.1s\n"));
+  REQUIRE(run.table.contains("  recovery: "));
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE(run.faults[0].duration == simsys::SimTime{0});
+  REQUIRE(run.faults[0].after.cache_warm_in_s.has_value());
+  REQUIRE_THAT(*run.faults[0].after.cache_warm_in_s, WithinAbs(12.106, 0.01));
+  REQUIRE_FALSE(run.faults[0].after.backlog_drained_in_s.has_value());
+}
+
+// A fixed-ratio cache refills linearly in keys / rate = 1000 / 100/s = 10 s (above), so its block
+// reads `cache warm again in 10s`: a whole number of seconds prints without a decimal.
+TEST_CASE("a fixed-ratio cache_flush prints: cache warm again in 10s", "[theory]") {
+  const auto run =
+      fault_run(flush_probe({.rate_per_s = 100,
+                             .client_keys = "",
+                             .edge = "type: cache, strategy: read_through, backend: origin, "
+                                     "keys: 1000, hit_ratio: {fixed: 0.9}",
+                             .flush_at = "10s",
+                             .duration = "30s"}));
+  CAPTURE(run.table);
+  REQUIRE(run.table.contains("fault 00:00:10 cache_flush edge\n"));
+  REQUIRE(run.table.contains("  after:    cache warm again in 10s\n"));
+}
+
+// ---- The fault block in the JSON
+// ------------------------------------------------------------------
+
+// `faults` is the last key (after `slo`): one object per fault in at order,
+//   {at_s, kind, node, for_s, during: {offered_per_s, served_per_s, lost, backlog_peak, room,
+//    flipped: [text of the table's words]}, after: {backlog_drained_in_s, cache_warm_in_s},
+//    recovered_at_s}
+// seconds as doubles (the same numbers as the text, unrounded), null where the text says there is
+// none: `recovered_at_s` when not recovered, `for_s` for a flush, and each `after` entry that does
+// not apply.
+TEST_CASE("the JSON has a faults array with the node_down's numbers in seconds", "[theory]") {
+  const auto run = fault_run(
+      probe({.faults = one_fault(ten_seconds_from_ten), .slos = std::string{three_p99_slos}}));
+  const auto& json = run.json;
+  CAPTURE(json);
+  require_in_order(
+      json,
+      {"\"slo\": [", "\"faults\": [", "\"at_s\": 10", "\"kind\": \"node_down\"", "\"node\": \"s\"",
+       "\"for_s\": 10", "\"during\": {", "\"offered_per_s\": ", "\"served_per_s\": ", "\"lost\": ",
+       "\"backlog_peak\": ", "\"room\": ", "\"flipped\": [\"p99_latency c op\"]", "\"after\": {",
+       "\"backlog_drained_in_s\": ", "\"cache_warm_in_s\": null", "\"recovered_at_s\": "});
+  REQUIRE_THAT(number_after(json, "\"offered_per_s\": "), WithinRel(400.0, 1e-9));
+  REQUIRE_THAT(number_after(json, "\"served_per_s\": "), WithinAbs(0.0, 1e-9));
+  REQUIRE_THAT(number_after(json, "\"lost\": "), WithinRel(3900.0, 1e-9));
+  REQUIRE_THAT(number_after(json, "\"backlog_peak\": "), WithinRel(100.0, 1e-9));
+  REQUIRE_THAT(number_after(json, "\"room\": "), WithinRel(100.0, 1e-9));
+  REQUIRE_THAT(number_after(json, "\"backlog_drained_in_s\": "), WithinAbs(0.2, 1e-9));
+  REQUIRE_THAT(number_after(json, "\"recovered_at_s\": "), WithinAbs(20.2, 1e-9));
+  REQUIRE(json.ends_with("}\n  ]\n}"));  // the faults array is the last thing in the report
+}
+
+TEST_CASE("the JSON of a fault never recovered has recovered_at_s null and no drain time",
+          "[theory]") {
+  const auto run = fault_run(probe(
+      {.faults = one_fault(ten_seconds_from_ten), .timing = "duration: 20100ms\nstep: 100ms\n"}));
+  CAPTURE(run.json);
+  REQUIRE(run.json.contains("\"recovered_at_s\": null"));
+  REQUIRE(run.json.contains("\"backlog_drained_in_s\": null"));
+  REQUIRE(run.json.contains("\"flipped\": []"));  // no SLO in this scenario
+}
+
+TEST_CASE("the JSON of a cache_flush has for_s null and the warm-up time in seconds", "[theory]") {
+  const auto run = fault_run(flush_probe({}));
+  CAPTURE(run.json);
+  REQUIRE(run.json.contains("\"kind\": \"cache_flush\""));
+  REQUIRE(run.json.contains("\"for_s\": null"));
+  REQUIRE(run.json.contains("\"backlog_drained_in_s\": null"));
+  REQUIRE_THAT(number_after(run.json, "\"cache_warm_in_s\": "), WithinAbs(12.106, 0.01));
+  REQUIRE_THAT(number_after(run.json, "\"at_s\": "), WithinAbs(600.0, 1e-9));
+}
+
+// No faults, no block and no key: a report without faults is what it was before the block existed.
+// (The probe's JSON without faults and with `faults: []` are one text; neither has the key.)
+TEST_CASE("a run without faults prints no fault block and no faults key", "[theory]") {
+  for (const auto* faults : {"", "faults: []\n"}) {
+    CAPTURE(faults);
+    const auto run = fault_run(probe({.faults = faults, .slos = std::string{three_p99_slos}}));
+    REQUIRE_FALSE(run.table.contains("fault "));
+    REQUIRE_FALSE(run.table.contains("during:"));
+    REQUIRE_FALSE(run.json.contains("\"faults\": "));  // (the probe's scenario is named faults)
+    REQUIRE(run.json.ends_with("  ]\n}"));             // `slo` is still the last key
+    REQUIRE(run.faults.empty());
+  }
 }
