@@ -172,7 +172,8 @@ std::expected<std::vector<std::string>, std::string> expand(const SpecParts& par
 // ---- --metric --------------------------------------------------------------------------------
 
 constexpr std::string_view metric_grammar =
-    "<client>.<op>.mean|p50|p95|p99, <node>.mean_rho|peak_rho|drop_rate or <queue>.lag";
+    "<client>.<op>.mean|p50|p95|p99|attempts|answered, <node>.mean_rho|peak_rho|drop_rate or "
+    "<queue>.lag";
 
 // A metric's last word and what it reads (sweep.cppm's MetricKind); one row each.
 struct MetricWord {
@@ -182,9 +183,12 @@ struct MetricWord {
 
 // Pattern: Table-driven method — a new metric is one row here (and one case in read_metric), not
 // another `if`.
-constexpr std::array op_metric_words{
-    MetricWord{"mean", MetricKind::mean_latency}, MetricWord{"p50", MetricKind::p50_latency},
-    MetricWord{"p95", MetricKind::p95_latency}, MetricWord{"p99", MetricKind::p99_latency}};
+constexpr std::array op_metric_words{MetricWord{"mean", MetricKind::mean_latency},
+                                     MetricWord{"p50", MetricKind::p50_latency},
+                                     MetricWord{"p95", MetricKind::p95_latency},
+                                     MetricWord{"p99", MetricKind::p99_latency},
+                                     MetricWord{"attempts", MetricKind::attempts_rate},
+                                     MetricWord{"answered", MetricKind::answered_rate}};
 constexpr std::array node_metric_words{
     MetricWord{"mean_rho", MetricKind::mean_rho}, MetricWord{"peak_rho", MetricKind::peak_rho},
     MetricWord{"drop_rate", MetricKind::drop_rate}, MetricWord{"lag", MetricKind::peak_queue_lag}};
@@ -233,13 +237,26 @@ std::optional<report::OpLatency> latency_column(MetricKind kind) {
     case MetricKind::peak_rho:
     case MetricKind::drop_rate:
     case MetricKind::peak_queue_lag:
+    case MetricKind::attempts_rate:
+    case MetricKind::answered_rate:
       return std::nullopt;
   }
   return std::nullopt;
 }
 
+// Which of a client op's rates a rate metric reads (OpSummary's attempts_per_s or
+// answered_per_s); empty for the others. A pointer to data member (`double OpSummary::*`, C++98)
+// names a field without an object: `op->*column` reads that field of one op, so the two rates
+// share one reader instead of a switch per kind.
+std::optional<double report::OpSummary::*> rate_column(MetricKind kind) {
+  if (kind == MetricKind::attempts_rate) return &report::OpSummary::attempts_per_s;
+  if (kind == MetricKind::answered_rate) return &report::OpSummary::answered_per_s;
+  return std::nullopt;
+}
+
 // Why `metric` cannot be read off `node`, one check per kind of metric; nothing when it can.
-std::optional<std::string> latency_problem(const model::NodeSpec& node, const SweepMetric& metric) {
+std::optional<std::string> client_op_problem(const model::NodeSpec& node,
+                                             const SweepMetric& metric) {
   if (node.type != model::NodeType::client || !node.workload) {
     return "'" + node.id + "' has type " + std::string{model::to_string(node.type)} +
            ", not client";
@@ -271,7 +288,9 @@ std::optional<std::string> problem_with_node(const model::NodeSpec& node,
     case MetricKind::p50_latency:
     case MetricKind::p95_latency:
     case MetricKind::p99_latency:
-      return latency_problem(node, metric);
+    case MetricKind::attempts_rate:
+    case MetricKind::answered_rate:
+      return client_op_problem(node, metric);
     case MetricKind::mean_rho:
     case MetricKind::peak_rho:
       return serving_problem(node, "utilization");
@@ -316,7 +335,7 @@ struct Measured {
   std::vector<std::size_t> beyond_timeout;
 };
 
-// A latency metric's op, or nothing when the run has no row for it.
+// A client op metric's op, or nothing when the run has no row for it.
 const report::OpSummary* op_of(std::span<const report::OpSummary> ops, const SweepMetric& metric) {
   const auto found = std::ranges::find_if(ops, [&](const report::OpSummary& op) {
     return op.client == metric.node && op.op == metric.op;
@@ -341,9 +360,19 @@ double node_metric(const report::Summary& summary, std::span<const report::NodeS
     case MetricKind::p50_latency:
     case MetricKind::p95_latency:
     case MetricKind::p99_latency:
+    case MetricKind::attempts_rate:  // ... and an op's rate
+    case MetricKind::answered_rate:
       return no_value;
   }
   return no_value;
+}
+
+// A client op's rate, read as the JSON prints it: what the client sent (`attempts_per_s`, its
+// retries included) or what came back answered (`answered_per_s`). A NaN when the run has no row.
+double op_rate(std::span<const report::OpSummary> ops, const SweepMetric& metric,
+               double report::OpSummary::*column) {
+  const auto* op = op_of(ops, metric);
+  return op != nullptr ? op->*column : no_value;
 }
 
 // Every metric of one point's summary, in the order asked.
@@ -352,6 +381,10 @@ Measured read_metrics(const report::Summary& summary, std::span<const SweepMetri
   const auto ops = summary.ops();
   Measured measured;
   for (const auto& metric : metrics) {
+    if (const auto rate = rate_column(metric.kind)) {
+      measured.numbers.push_back(op_rate(ops, metric, *rate));
+      continue;
+    }
     const auto column = latency_column(metric.kind);
     if (!column) {
       measured.numbers.push_back(node_metric(summary, nodes, metric));
@@ -476,13 +509,14 @@ PerPoint<T> for_each_point(std::size_t count, std::size_t jobs, const Stage& sta
 
 // ---- rendering ---------------------------------------------------------------------------------
 
-// A cell for people, as the report's tables print the same number (report::format_duration and
-// format_lag: "1.61ms", "<1us"; `>1s` for a percentile that is the client's timeout, as the op
-// table prints it); "-" for a number the run did not produce.
+// A cell for people, as the report's tables print the same number (report::format_duration,
+// format_lag and format_rate: "1.61ms", "<1us", "1.75k/s"; `>1s` for a percentile that is the
+// client's timeout, as the op table prints it); "-" for a number the run did not produce.
 std::string human_cell(const SweepMetric& metric, double value, bool beyond_timeout) {
   if (std::isnan(value)) return "-";
   if (beyond_timeout) return ">" + report::format_duration(value);
   if (latency_column(metric.kind)) return report::format_duration(value);
+  if (rate_column(metric.kind)) return report::format_rate(value);
   if (metric.kind == MetricKind::peak_queue_lag) return report::format_lag(value);
   return significant(value, 3);  // a utilization or a drop rate: a ratio
 }

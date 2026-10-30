@@ -38,6 +38,7 @@ import :shared;
 
 // C++20 `import`: the compiled interfaces of the modules this unit reads from. The
 // interface's own imports would be visible anyway; listing them says what is used here.
+import simsys.behaviours; // ClientBehaviour::backoff_steps: the wait a retry really waits
 import simsys.core;
 import simsys.defaults;
 import simsys.engine;
@@ -166,17 +167,29 @@ namespace {
   return join(terms, ", ");
 }
 
-// "retries=2 after 100ms": how often a client sends a failed request again and how long it waits
-// first (the loader filled in defaults::retry_after when the scenario gave no wait). Empty without
-// retries, so a client without them keeps the line it had.
-[[nodiscard]] std::string retries_summary(const model::Workload& workload) {
-  if (workload.retries == 0) return {};
-  return "retries=" + std::to_string(workload.retries) + " after " +
-         format_duration(workload.retry_after.value_or(defaults::retry_after));
+// " (2 steps)" after a retry_after that is not a whole number of steps: the engine rounds the wait
+// UP to whole steps (behaviours::ClientBehaviour::backoff_steps), so at 100 ms steps 150 ms waits
+// 200 ms and 50 ms waits one step, 100 ms. Empty when the wait is whole: it is what is written.
+[[nodiscard]] std::string effective_backoff(SimTime retry_after, SimTime step) {
+  const int steps = behaviours::ClientBehaviour::backoff_steps(retry_after, step);
+  if (step.count() * steps == retry_after.count()) return {};  // in nanoseconds: exact
+  return " (" + std::to_string(steps) + (steps == 1 ? " step)" : " steps)");
 }
 
-// A client's datacenter, its rate curve, its op mix (fixed shares of the rate) and its retries.
-[[nodiscard]] std::string client_details(const model::NodeSpec& spec) {
+// "retries=2 after 100ms": how often a client sends a failed request again and how long it waits
+// first (the loader filled in defaults::retry_after when the scenario gave no wait), with the
+// steps it really waits when they differ, "after 150ms (2 steps)". Empty without retries, so a
+// client without them keeps the line it had.
+[[nodiscard]] std::string retries_summary(const model::Workload& workload, SimTime step) {
+  if (workload.retries == 0) return {};
+  const SimTime retry_after = workload.retry_after.value_or(defaults::retry_after);
+  return "retries=" + std::to_string(workload.retries) + " after " + format_duration(retry_after) +
+         effective_backoff(retry_after, step);
+}
+
+// A client's datacenter, its rate curve, its op mix (fixed shares of the rate) and its retries
+// (`step`: the scenario's, which the retries wait in).
+[[nodiscard]] std::string client_details(const model::NodeSpec& spec, SimTime step) {
   std::vector<std::string> parts{"dc=" + spec.dc};
   if (!spec.workload) return join(parts, "  ");
   std::vector<std::string> shares;
@@ -184,7 +197,7 @@ namespace {
     shares.push_back(op + " " + percent(share));
   parts.push_back("rate: " + curve_summary(*spec.workload));
   parts.push_back("ops: " + join(shares, ", "));
-  if (auto retries = retries_summary(*spec.workload); !retries.empty()) {
+  if (auto retries = retries_summary(*spec.workload, step); !retries.empty()) {
     parts.push_back(std::move(retries));
   }
   return join(parts, "  ");
@@ -741,7 +754,7 @@ struct QueueProvenance {
     rows.push_back(
         {{node.spec.id},
          {std::string{model::to_string(node.spec.type)}},
-         {client ? client_details(node.spec)
+         {client ? client_details(node.spec, g.scenario().step)
                  : server_details(node) + kv_cluster_summary(node.spec) + cost_summary(g, i) +
                        size_summary(g, i) + blob_store_summary(g, i) + balancing_summary(g, i) +
                        limiter_summary(node.spec) + cache_summary(g, i) + cdn_summary(g, i) +

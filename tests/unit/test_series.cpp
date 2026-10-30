@@ -700,6 +700,39 @@ TEST_CASE("a retrying client's attempts column climbs 1000, 1500, 1750 while off
   }
 }
 
+// explain prints the wait a retry really waits. The engine moves in whole steps and rounds the
+// backoff UP (a retry never fires before the stated wait), so at 100 ms steps a retry_after of
+// 150 ms waits 2 steps, 200 ms, and explain says so after the stated wait; a wait that is a whole
+// number of steps prints as before.
+TEST_CASE(
+    "explain prints a retry_after that is not a whole number of steps with the steps it waits",
+    "[series]") {
+  auto s = retrying_into_a_lossy_sink();
+  s.nodes[0].workload->retry_after = 150ms;
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  // C++20 std::string::ends_with: a suffix test in one call, replacing a compare() on the tail
+  // (the line's columns before the retries are padded and pinned elsewhere).
+  REQUIRE(node_line(text, "u").ends_with("retries=2 after 150ms (2 steps)"));
+}
+
+TEST_CASE("explain prints a retry_after shorter than a step with the one step it waits",
+          "[series]") {
+  auto s = retrying_into_a_lossy_sink();
+  s.nodes[0].workload->retry_after = 50ms;
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  REQUIRE(node_line(text, "u").ends_with("retries=2 after 50ms (1 step)"));
+}
+
+TEST_CASE("explain prints a retry_after of whole steps as it is written", "[series]") {
+  auto s = retrying_into_a_lossy_sink();
+  s.nodes[0].workload->retry_after = 200ms;
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  REQUIRE(node_line(text, "u").ends_with("retries=2 after 200ms"));
+}
+
 // Without retries the client sends its curve and nothing else, whatever its path sheds: the
 // 1500/s into a 1000/s server with a room of 100 sheds a third, and attempts_per_s is still
 // offered_per_s on every row.

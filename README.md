@@ -59,8 +59,8 @@ token bucket's or a window's refusals are inside drain; a leaky bucket's overflo
 megabytes: it gets a row of its own, named `from->to`, after the nodes in the series (same
 columns, in MB), in the table's `links` section and in JSON's `links`, and a check line in
 `explain`. With `--series-ops`, it writes one CSV row per client op
-per step (`t_s,client,op,offered_per_s,answered_per_s,timed_out_per_s,mean_ms`): what each client
-sent, the part of it that came back answered (a limiter's refusals and a queue's drops are not;
+per step (`t_s,client,op,offered_per_s,attempts_per_s,answered_per_s,timed_out_per_s,mean_ms`):
+what each client offered, what it sent with its `retries` (equal without them), the part of it that came back answered (a limiter's refusals and a queue's drops are not;
 a request waiting in a queue is answered later), the part that came back after the client's
 `timeout`, and the mean response in milliseconds (`inf` when the path never answers). The JSON report's ops
 carry `answered_per_s` beside `offered_per_s` too, and `timed_out_per_s`: the requests the
@@ -145,9 +145,9 @@ nodes
   api        0.75      0.75             0        0         0      0         -
   db         0.36      0.36             0        0         0      0         -
 ops (percentiles estimated: lognormal fit to the response moments)
-  client.op    offered/s  timed out/s   mean     p50     p95     p99  (estimated)
-  users.read        1.2k            0    5ms  4.35ms  10.4ms  14.8ms
-  users.write        300            0  7.5ms  6.81ms    14ms  18.9ms
+  client.op    offered/s  attempts/s  timed out/s   mean     p50     p95     p99  (estimated)
+  users.read        1.2k        1.2k            0    5ms  4.35ms  10.4ms  14.8ms
+  users.write        300         300            0  7.5ms  6.81ms    14ms  18.9ms
 slo
   status  metric       node   op     observed  max
   PASS    p99_latency  users  read   14.8ms    20ms
@@ -171,8 +171,8 @@ nodes
   counters   0.00954      0.16             0        0         0      0         -
   api         0.6817         1            80        0         0    1.5         -
 ops (percentiles estimated: lognormal fit to the response moments)
-  client.op     offered/s  timed out/s    mean     p50     p95     p99  (estimated)
-  clients.call        954    0.0002833  5.73ms  4.32ms  14.9ms  24.8ms
+  client.op     offered/s  attempts/s  timed out/s    mean     p50     p95     p99  (estimated)
+  clients.call        954         954    0.0002833  5.73ms  4.32ms  14.9ms  24.8ms
 slo
   status  metric       node     op    observed  max
   PASS    utilization  api      -     0.6817    0.9
@@ -191,9 +191,9 @@ api's queue and the p99 SLO fails.
 ```
 $ simsys run scenarios/book/url-shortener/scenario.yaml --series nodes.csv --series-ops ops.csv
 $ head -3 ops.csv
-t_s,client,op,offered_per_s,answered_per_s,timed_out_per_s,mean_ms
-0,users,redirect,6604.27,6604.27,0,3.61342
-0,users,shorten,653.169,653.169,0,3.98179
+t_s,client,op,offered_per_s,attempts_per_s,answered_per_s,timed_out_per_s,mean_ms
+0,users,redirect,6604.27,6604.27,6604.27,0,3.61342
+0,users,shorten,653.169,653.169,653.169,0,3.98179
 ```
 
 `explain` follows the load through every tier the engine runs. On

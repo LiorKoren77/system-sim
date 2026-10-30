@@ -102,17 +102,23 @@ struct LinkSummary {
 // leaves them out (offered − lost − timed out), and the mean describes the requests answered in
 // time. `attempts_per_s` is what the client SENT, its offered load plus its retries (a client with
 // `retries`, behaviours::ClientBehaviour): equal to `offered_per_s` without retries or with nothing
-// to retry, above it by the retry storm when its path fails. A percentile is what the client sees
-// at its quantile q (report.cpp's percentile_seen_by_client): when more than 1 − q of the delivered
-// requests timed out (`timed_out_share` > 1 − q: more than 1 % for a p99), no request at that
-// quantile was answered, and the percentile IS the timeout (the table prints `>1s`, a latency SLO
-// on it fails whatever its max); otherwise it is the fit to every DELIVERED request's latency,
-// before the timeout cut it, read at q and capped at the timeout (the engine times out exactly the
-// requests that fit puts past the timeout, so its fastest q are all answered). A timed-out request
-// is not a drop: no node failed it, so it is in no node's drop rate. An infinite mean makes every
-// latency infinite, which the renderers print as "unavailable" (table) or null (JSON); an op of
-// which nothing was answered in time but something timed out has no latency of its own either (the
-// JSON's null).
+// to retry, above it by the retry storm when its path fails. With retries `timed_out_per_s` counts
+// the requests given up on for good (their last attempt timed out) and `timed_out_attempts_per_s`
+// every attempt that timed out (engine::ResponseSample::timed_out_attempts); without retries they
+// are equal. A retried request's latency is its last attempt's: the time its failed attempts took
+// (the timeout τ of each one that timed out, about nothing for a lost one) and the backoffs before
+// each retry are not added (ignored; a proper model would read the response as a mixture over the
+// attempt that is answered, attempt k + 1 adding k × (τ or 0) + k × backoff: phase 4 material). A
+// percentile is what the client sees at its quantile q (report.cpp's percentile_seen_by_client):
+// when more than 1 − q of the delivered attempts timed out (`timed_out_share` > 1 − q: more than
+// 1 % for a p99), no request at that quantile was answered, and the percentile IS the timeout (the
+// table prints `>1s`, a latency SLO on it fails whatever its max); otherwise it is the fit to every
+// DELIVERED request's latency, before the timeout cut it, read at q and capped at the timeout (the
+// engine times out exactly the requests that fit puts past the timeout, so its fastest q are all
+// answered). A timed-out request is not a drop: no node failed it, so it is in no node's drop rate.
+// An infinite mean makes every latency infinite, which the renderers print as "unavailable" (table)
+// or null (JSON); an op of which nothing was answered in time but something timed out has no
+// latency of its own either (the JSON's null).
 struct OpSummary {
   std::string client{};
   std::string op{};
@@ -120,13 +126,15 @@ struct OpSummary {
   double attempts_per_s{};
   double answered_per_s{};
   double timed_out_per_s{};
+  double timed_out_attempts_per_s{};
   double mean_s{};
   double p50_s{};
   double p95_s{};
   double p99_s{};
   // The client's timeout in seconds (graph::client_timeout_s), empty when it waits for ever, and
-  // timed_out / (answered + timed_out) over the observed steps: 0 without a timeout or with
-  // nothing delivered.
+  // timed_out_attempts / (answered + timed_out_attempts) over the observed steps, the share of the
+  // delivered attempts that came back after the timeout: 0 without a timeout or with nothing
+  // delivered.
   std::optional<double> timeout_s{};
   double timed_out_share{};
 };
@@ -283,15 +291,16 @@ class Summary {
   struct OpTotals {
     std::size_t client{};
     std::string op{};
-    double offered{};       // Σ offered·dt, requests
-    double attempts{};      // Σ attempts·dt, requests sent: `offered` and the retries
-    double answered{};      // Σ answered·dt, requests: the part of `offered` that came back
-    double timed_out{};     // Σ timed_out·dt, requests: delivered, but after the client gave up
-    Moments by_answered{};  // weighted by requests answered: what an average answer sees
-    Moments by_time{};      // weighted by time: the fallback when nothing was answered
+    double offered{};    // Σ offered·dt, requests
+    double attempts{};   // Σ attempts·dt, requests sent: `offered` and the retries
+    double answered{};   // Σ answered·dt, requests: the part of `offered` that came back
+    double timed_out{};  // Σ timed_out·dt, requests: delivered, but after the client gave up
+    double timed_out_attempts{};  // Σ timed_out_attempts·dt: every attempt that timed out
+    Moments by_answered{};        // weighted by requests answered: what an average answer sees
+    Moments by_time{};            // weighted by time: the fallback when nothing was answered
     // The delivered requests' latency before the client gave up (ResponseSample::
-    // delivered_response), weighted by the requests delivered, answered + timed out: what a
-    // timed-out client's percentiles are read off (percentile_seen_by_client).
+    // delivered_response), weighted by the attempts delivered, answered + timed out (every
+    // attempt): what a timed-out client's percentiles are read off (percentile_seen_by_client).
     Moments by_delivered{};
     bool unavailable{};
     void add(const engine::ResponseSample& sample, double dt_s);
@@ -360,6 +369,9 @@ class Summary {
 // number >= 1, three significant digits ("1.61ms", "2.66h"); "unavailable" for infinity.
 // `simsys sweep` prints its latencies with it.
 [[nodiscard]] std::string format_duration(double seconds);
+// A rate as the tables print one, with an SI prefix and four significant digits and the unit:
+// "1.75k/s", "500/s". `simsys sweep` prints its rates with it.
+[[nodiscard]] std::string format_rate(double per_second);
 // A queue lag as the tables print one: format_duration, but "<1us" below a microsecond (an idle
 // consumer group's lag is a vanishing Erlang C figure, not a measurement).
 [[nodiscard]] std::string format_lag(double seconds);

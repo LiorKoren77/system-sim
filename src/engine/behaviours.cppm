@@ -707,8 +707,8 @@ class ServiceBehaviour {
 // Retries (phase 3 spec §6.1): the retry storm of ch. 1's and ch. 10's advice to retry a failed
 // call with a backoff. A client with `retries: n` sends every request it lost (a node on the path
 // dropped, refused or failed it) or timed out again, `retry_after` later, up to n extra attempts.
-// In a fluid model that is FEEDBACK DEMAND: with b = retry_after / step rounded to whole steps (at
-// least one) and q_t the share of step t's attempts the path loses or times out,
+// In a fluid model that is FEEDBACK DEMAND: with b = retry_after / step rounded UP to whole steps
+// (at least one: backoff_steps) and q_t the share of step t's attempts the path loses or times out,
 //   attempts_t = curve_t + Σ_{k=1..n} r_k(t)      r_k(t) = r_{k−1}(t − b) × q_(t−b),  r_0 = curve
 // r_k(t) being attempt k of the requests first sent at t − k·b: every attempt fails at the share
 // the path fails in the step it is sent (RetryRing keeps the r_k in flight). On a path that
@@ -719,9 +719,15 @@ class ServiceBehaviour {
 // `offered/s`. Why the servers do every attempt's work: nothing cancels a failed attempt (a
 // dropped one cost its queue a place, a failed one its service, a timed-out one was served after
 // the client left), and the retries pile on top, which is what turns an outage into a storm.
-// Ignored: jitter (every retry waits exactly `retry_after`), exponential backoff (the wait does not
-// grow from one attempt to the next), retry budgets and circuit breakers, idempotency (a retried
-// write that had in fact succeeded is not counted twice), and a user who gives up between attempts.
+// Ignored: jitter (every retry waits exactly `retry_after`, rounded up to whole steps), exponential
+// backoff (the wait does not grow from one attempt to the next), retry budgets and circuit
+// breakers, idempotency (a retried write that had in fact succeeded is not counted twice), a user
+// who gives up between attempts, and the time a retried request lost on its failed attempts: its
+// latency is its LAST attempt's (engine::Simulation::client_responses composes one response per
+// step, the path's), so the timeout τ each timed-out attempt waited (about nothing for a lost one)
+// and the backoffs before each retry are not added. A proper model would make the response a
+// mixture over the attempt that is answered: attempt k + 1, with probability q^k (1 − q), takes
+// k × (τ or 0) + k × backoff more than one attempt does. That is phase 4 material.
 class ClientBehaviour {
  public:
   // `seed` seeds this client's noise process; the engine passes workload::client_seed(scenario
@@ -807,6 +813,10 @@ class ClientBehaviour {
 
   // The client's `retries` n: how many more times it sends a request that failed (0: never).
   [[nodiscard]] int retries() const { return retries_; }
+
+  // The wait before a retry in whole steps: `retry_after` / `step` rounded UP, and at least one.
+  // explain prints it beside a retry_after that is not a whole number of steps.
+  [[nodiscard]] static int backoff_steps(SimTime retry_after, SimTime step);
 
   // What the client sends of `op` this step, retries included: `offered` (rate × op share, see
   // `offered`) plus the retries due now. `offered` itself without retries.
@@ -2273,17 +2283,19 @@ std::optional<detail::MissesOf> ServiceBehaviour::misses_of_lookup(
 
 // ---- ClientBehaviour ----
 
-namespace detail {
-
-// A client's backoff in whole steps (phase 3 spec §6.1): retry_after / step rounded to the nearest
-// step, and at least one, because the engine can send a retry no sooner than the step after the
-// failure it repeats (a retry_after shorter than half a step waits one step all the same).
-[[nodiscard]] int backoff_steps(SimTime retry_after, SimTime step) {
-  const auto steps = std::llround(seconds(retry_after) / seconds(step));
-  return static_cast<int>(std::max<long long>(steps, 1));
+// A client's backoff in whole steps (phase 3 spec §6.1): retry_after / step rounded UP, so that a
+// retry never fires before the wait the scenario states (150 ms at 100 ms steps waits 2 steps,
+// 200 ms; 250 ms waits 3), and at least one, because the engine can send a retry no sooner than
+// the step after the failure it repeats. In integer nanoseconds, not doubles: 0.15 / 0.1 is
+// 1.4999999999999998 in binary floating point, which rounding to the nearest step read as 1.
+// ⌈a / b⌉ for positive integers is (a + b − 1) / b; written as the quotient plus one for a
+// remainder, which is the same number and cannot overflow near the int64 limit.
+int ClientBehaviour::backoff_steps(SimTime retry_after, SimTime step) {
+  const SimTime::rep wait = retry_after.count();
+  const SimTime::rep length = step.count();
+  const SimTime::rep steps = wait / length + (wait % length == 0 ? 0 : 1);
+  return static_cast<int>(std::max<SimTime::rep>(steps, 1));
 }
-
-}  // namespace detail
 
 ClientBehaviour::ClientBehaviour(const graph::Graph& g, std::size_t self, std::uint64_t seed)
     : seed_{seed} {
@@ -2297,8 +2309,8 @@ ClientBehaviour::ClientBehaviour(const graph::Graph& g, std::size_t self, std::u
   std::ranges::sort(op_shares_, {}, &std::pair<std::string, double>::first);
   for (const auto& [op, share] : op_shares_) ops_.push_back(op);
   retries_ = workload->retries;
-  start_retries(detail::backoff_steps(workload->retry_after.value_or(defaults::retry_after),
-                                      g.scenario().step));
+  start_retries(
+      backoff_steps(workload->retry_after.value_or(defaults::retry_after), g.scenario().step));
   for (const auto& route : g.client_routes(self)) {
     const auto op_share =
         std::ranges::find(workload->op_shares, route.op, &std::pair<std::string, double>::first);
