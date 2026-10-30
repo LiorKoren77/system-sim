@@ -663,7 +663,9 @@ TEST_CASE("a run's table does not carry estimate's note about scripted faults", 
 // when the cache is lost, a restart or a deploy, and every read goes to the store behind it until
 // the cache has refilled. Model under test (phase 3 Task 7): a flush empties the cache at `at`;
 // from then on it refills from the requests it sees. After t seconds at `rate` requests a second
-// it has seen n = rate x t requests and holds the distinct keys among them,
+// it has seen n = rate x t requests (the probe's rate is constant; on a curve n is the sum of the
+// reads it was sent, step by step: the section after the fault block's flush tests) and holds the
+// distinct keys among them,
 //   D(n) = sum_i (1 - e^{-p_i n})      (the expected number of distinct keys in n requests: Che's
 //                                       own sum with t read as a count of requests)
 // and its hit ratio is the Che hit ratio of a cache with that many entries:
@@ -694,7 +696,8 @@ namespace {
 
 // The origin behind the cache or cdn `edge`: u -> edge -> origin, links of zero latency. The origin
 // (100k/s, 1 ms: c = 100 servers) is nowhere near saturated at the loads used. Node indices: u 0,
-// edge 1, origin 2.
+// edge 1, origin 2. `rate`, when given, is the client's whole rate map in place of
+// `{base: rate_per_s/s}` (a curve of `points`); `more_faults`, more entries of the `faults:` list.
 struct FlushProbe {
   int rate_per_s = 1000;
   std::string client_keys = ", keys: {zipf: 0.8, space: 1M}";
@@ -702,6 +705,8 @@ struct FlushProbe {
       "type: cache, strategy: read_through, backend: origin, keys: 10k, hit_ratio: che";
   std::string flush_at = "10m";
   std::string duration = "11m";
+  std::string rate{};
+  std::string more_faults{};
 };
 
 constexpr std::size_t origin_node = 2;
@@ -710,8 +715,9 @@ Scenario flush_probe(const FlushProbe& p) {
   return load_yaml("version: 1\nname: flush\nduration: " + p.duration +
                    "\nstep: 100ms\n"
                    "nodes:\n"
-                   "  u: {type: client, rate: {base: " +
-                   std::to_string(p.rate_per_s) + "/s}, ops: {get: 1.0}" + p.client_keys +
+                   "  u: {type: client, rate: " +
+                   (p.rate.empty() ? "{base: " + std::to_string(p.rate_per_s) + "/s}" : p.rate) +
+                   ", ops: {get: 1.0}" + p.client_keys +
                    "}\n"
                    "  edge: {" +
                    p.edge +
@@ -721,7 +727,7 @@ Scenario flush_probe(const FlushProbe& p) {
                    "  - {from: u, to: edge, dir: inout, latency: 0s}\n"
                    "  - {from: edge, to: origin, dir: inout, latency: 0s}\n"
                    "faults:\n  - {at: " +
-                   p.flush_at + ", kind: cache_flush, node: edge}\n");
+                   p.flush_at + ", kind: cache_flush, node: edge}\n" + p.more_faults);
 }
 
 double origin_demand(const StepRecord& r) {
@@ -890,9 +896,10 @@ TEST_CASE(
 }
 
 // A fixed hit ratio is a number, not a function of the cache's size, so the model has no curve to
-// follow: the simple case. The cache refills at one key per request, so it is full after
-// keys / rate seconds (1000 keys at 100/s: 10 s), and its hit ratio warms LINEARLY from 0 to the
-// stated 0.9 over that time:
+// follow: the simple case. The cache is taken to refill at one key per request, so it is full
+// after keys / rate seconds (1000 keys at 100/s: 10 s), and its hit ratio warms LINEARLY from 0 to
+// the stated 0.9 over that time (optimistic: once it hits, only its misses add keys; a consistent
+// model fills at -(keys / h) ln(1 - h) requests, 2.56 x keys at h = 0.9, FaultSchedule::WarmUp):
 //   h(t) = 0.9 x min(1, t / 10 s)      0, 0.09 at 1 s, 0.225 at 2.5 s, 0.45 at 5 s (half), 0.9 at
 //   10 s
 // The origin sees 100 x (1 - h(t)): 100, 91, 77.5, 55, 10 per second.
@@ -2000,6 +2007,34 @@ TEST_CASE("an overlapping fault on the same node says so and counts from its own
   REQUIRE(run.json.contains("\"overlaps_at_s\": [10]"));
 }
 
+// Task 7's review, finding 3 (the reviewer's p5): a dc_down of eu over [60 s, 90 s) takes cache_eu
+// down with the rest of eu, and a node_down of cache_eu over [80 s, 110 s) starts inside it. Both
+// blocks count cache_eu's losses from 80 s to the recovery, so the later one says it overlaps the
+// dc_down: a dc_down overlaps a fault on any node of its datacenter, not only another dc_down.
+TEST_CASE("a node_down inside a dc_down of its node's datacenter says it overlaps it", "[theory]") {
+  const auto run = fault_run(load_yaml(
+      "version: 1\nname: dc\nduration: 3m\nstep: 100ms\n"
+      "datacenters: {us: {}, eu: {}}\n"
+      "nodes:\n"
+      "  ueu: {type: client, dc: eu, rate: {base: 500/s}, ops: {get: 1.0}, keys: {zipf: 0.8, "
+      "space: 1M}}\n"
+      "  uus: {type: client, dc: us, rate: {base: 500/s}, ops: {get: 1.0}, keys: {zipf: 0.8, "
+      "space: 1M}}\n"
+      "  cache_eu: {type: cache, dc: eu, strategy: read_through, backend: db, keys: 10k, "
+      "hit_ratio: che}\n"
+      "  db: {type: service, dc: us, capacity: 100k/s, latency: 1ms}\n"
+      "links:\n"
+      "  - {from: ueu, to: cache_eu, dir: inout, latency: 0s}\n"
+      "  - {from: uus, to: db, dir: inout, latency: 0s}\n"
+      "  - {from: cache_eu, to: db, dir: inout, latency: 0s}\n"
+      "faults:\n"
+      "  - {at: 60s, kind: dc_down, datacenter: eu, for: 30s}\n"
+      "  - {at: 80s, kind: node_down, node: cache_eu, for: 30s}\n"));
+  CAPTURE(run.table, run.json);
+  REQUIRE(run.table.contains("fault 00:01:20 node_down cache_eu for 30s (overlaps fault 00:01)\n"));
+  REQUIRE(run.json.contains("\"overlaps_at_s\": [60]"));
+}
+
 // Finding 12 of the review: the requests lost while the backlog drains belong to the fault. A
 // datacenter `eu` holds the client c (400/s, which keeps emitting: a client has no capacity), a
 // (1k/s, room 1000) and behind it s (500/s, room 100); dc_down eu for 1 s from 10 s. During it a
@@ -2184,6 +2219,122 @@ TEST_CASE("a fixed-ratio cache_flush prints its extra misses to the origin: 454.
   REQUIRE(run.json.contains("\"room\": null"));
   REQUIRE_THAT(number_after(run.json, "\"extra_misses\": "), WithinRel(454.5, 1e-9));
   REQUIRE(run.json.contains("\"origin\": \"origin\""));
+}
+
+// ---- A flushed cache warms on the reads it gets (Task 7's review, findings 1, 2 and 5) ----------
+//
+// The warm-up counts n, the reads the cache has been sent since the flush, step by step: the engine
+// hands the schedule each step's reads (FaultSchedule::count_reads), and the hit ratio of the next
+// step is h(n). At a constant rate that is n = rate x t, the curve the tests above pin; on any
+// other curve it is the curve's integral (a left Riemann sum: a step's reads are its rate at the
+// step's start times dt, the rate the client offers for the step). Before the review the schedule
+// froze the rate at the flush, so a cache flushed while nobody read it never warmed, and one
+// flushed on a rising curve warmed at the old rate. The helpers below sum the same steps.
+namespace {
+
+// Che's characteristic time of the probe's cache: the reads that fill it (12,106).
+double probe_t_c() {
+  return simsys::caching::che_characteristic_time(che_keys, zipf_popularity());
+}
+
+// The seconds after the flush at which the reads handed since it, `reads_per_step(k)` in the
+// k-th 100 ms step, reach t_c: inside the step that crosses it, at the share of the step's reads
+// still needed.
+template <class Reads>
+double full_after_s(Reads reads_per_step) {
+  double seen = 0.0;
+  for (int k = 0;; ++k) {
+    const double reads = reads_per_step(k);
+    if (seen + reads >= probe_t_c()) return 0.1 * k + 0.1 * (probe_t_c() - seen) / reads;
+    seen += reads;
+  }
+}
+
+// The reads the origin is sent beyond the twin's while the cache warms: at the k-th step it misses
+// h - h(n) more of its reads than the steady cache would (h(n) the warm-up curve at the reads seen
+// before the step), until the step during which n reaches t_c, or for `steps` steps.
+template <class Reads>
+double extra_misses_over(Reads reads_per_step, int steps) {
+  double seen = 0.0;
+  double extra = 0.0;
+  for (int k = 0; k < steps && seen < probe_t_c(); ++k) {
+    const double reads = reads_per_step(k);
+    const double warm = simsys::test_support::warm_hit_ratio(zipf_popularity(), che_keys, seen);
+    extra += reads * (steady_hit_ratio() - warm);
+    seen += reads;
+  }
+  return extra;
+}
+}  // namespace
+
+// Finding 1 (the reviewer's p3): nobody reads the cache before the flush at 600 s, and the rate
+// then rises from 0 to 1000/s over one second (points [600 s, 0/s], [601 s, 1000/s]). The steps
+// from 600.0 to 600.9 s hand the cache 0, 10, ..., 90 reads (rate x 0.1 s), 450 in all; from
+// 601 s on 100 a step. It is full when the sum reaches t_c = 12,106: 1 s + (12,106 − 450) / 1000
+// = 12.66 s after the flush, 11.66 s after the traffic arrived at full rate (about 13 s, as the
+// review expected). The frozen rate (0/s at the flush) left it cold for the whole run: 69.4k
+// extra misses and no warm time. Now the extra misses are one warm-up's, 713 at 1k/s (the second
+// flush of the p4 test below costs the same 713.3), a little less here because the first second
+// is slower (the review's 713 within 1 %).
+TEST_CASE("a cache flushed while nothing reads it warms on the reads that come later: 12.66 s",
+          "[theory]") {
+  const auto run = fault_run(flush_probe(
+      {.duration = "15m", .rate = "{points: [[0s, 0/s], [600s, 0/s], [601s, 1000/s]]}"}));
+  CAPTURE(run.table);
+  const auto reads = [](int k) { return k < 10 ? 10.0 * k : 100.0; };
+  REQUIRE_THAT(full_after_s(reads), WithinAbs(12.656, 1e-3));
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE(run.faults[0].after.cache_warm_in_s.has_value());
+  REQUIRE_THAT(*run.faults[0].after.cache_warm_in_s, WithinRel(full_after_s(reads), 1e-9));
+  REQUIRE_THAT(run.faults[0].extra_misses, WithinRel(extra_misses_over(reads, 1000), 1e-9));
+  REQUIRE_THAT(run.faults[0].extra_misses, WithinRel(713.0, 0.01));
+  REQUIRE(run.table.contains("  after:    cache warm again in 12.7s\n"));
+  REQUIRE(run.faults[0].recovered_at.has_value());
+}
+
+// Finding 2 (the reviewer's p2): the rate climbs from 100/s at the flush (600 s) to 2000/s at
+// 700 s, 100 + 19 t at t seconds after the flush. The cache has then seen 100 t + 9.5 t² reads,
+// which reach t_c = 12,106 at t = 30.8 s; the step sums give 30.85 s (each step's reads are its
+// starting rate's, a little under the integral's). The frozen rate of 100/s gave 121.06 s, 3.9
+// times too slow.
+TEST_CASE("a cache flushed on a rising curve is full when the integral of its reads reaches t_c",
+          "[theory]") {
+  const auto run = fault_run(flush_probe(
+      {.duration = "15m", .rate = "{points: [[0s, 100/s], [600s, 100/s], [700s, 2000/s]]}"}));
+  const auto reads = [](int k) { return (100.0 + 1.9 * k) * 0.1; };
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE(run.faults[0].after.cache_warm_in_s.has_value());
+  REQUIRE_THAT(*run.faults[0].after.cache_warm_in_s, WithinRel(full_after_s(reads), 1e-9));
+  REQUIRE_THAT(*run.faults[0].after.cache_warm_in_s, WithinAbs(30.8, 0.1));
+}
+
+// Finding 5 (the reviewer's p4): a second flush of the same cache at 605 s, 5 s into the first's
+// 12.1 s warm-up, empties it again. The first flush's window ends there: it never got warm (its
+// `cache_warm_in_s` is null, its after line says which flush interrupted it, the JSON
+// `interrupted_by_flush_at_s`), and its extra misses are those of its own 5 s, the 50 steps from
+// 0 to 4,900 reads seen; the second is a whole warm-up, the 713.3 of a single flush at 1k/s.
+// Before the fix the first claimed 12.1 s and counted the second's misses too (1.16k).
+TEST_CASE(
+    "a flush interrupted by the next flush of its cache is not warm and counts its own misses",
+    "[theory]") {
+  const auto run =
+      fault_run(flush_probe({.more_faults = "  - {at: 605s, kind: cache_flush, node: edge}\n"}));
+  CAPTURE(run.table, run.json);
+  REQUIRE(run.faults.size() == 2);
+  const auto& first = run.faults[0];
+  REQUIRE_FALSE(first.after.cache_warm_in_s.has_value());
+  REQUIRE(first.after.interrupted_by_flush_at == simsys::SimTime{605s});
+  const auto reads = [](int) { return 100.0; };
+  REQUIRE_THAT(first.extra_misses, WithinRel(extra_misses_over(reads, 50), 1e-9));
+  REQUIRE(run.table.contains("fault 00:10 cache_flush edge\n"));
+  REQUIRE(run.table.contains("  after:    interrupted by the flush at 00:10:05\n"));
+  REQUIRE(run.json.contains("\"cache_warm_in_s\": null, \"interrupted_by_flush_at_s\": 605"));
+  const auto& second = run.faults[1];
+  REQUIRE_FALSE(second.after.interrupted_by_flush_at.has_value());
+  REQUIRE(second.after.cache_warm_in_s.has_value());
+  REQUIRE_THAT(*second.after.cache_warm_in_s, WithinRel(probe_t_c() / 1000.0, 1e-9));
+  const auto single = fault_run(flush_probe({}));
+  REQUIRE_THAT(second.extra_misses, WithinRel(single.faults[0].extra_misses, 1e-9));
 }
 
 // ---- The fault block in the JSON

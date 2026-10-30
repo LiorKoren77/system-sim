@@ -45,7 +45,8 @@ namespace simsys::engine {
 
 // The scripted faults' records, filled from every step the Simulation advances, each measured
 // against the fault-free twin's same step (FaultRecord's header). Simulation::step hands it both
-// records; Simulation::fault_records reads the result.
+// records and the fault schedule, whose warm-ups say when a flushed cache is full again;
+// Simulation::fault_records reads the result.
 class FaultLog {
  public:
   // What one link did in one step (Simulation::send), in requests per second: what the sender put
@@ -78,10 +79,12 @@ class FaultLog {
   ~FaultLog();
   // One record per fault of `g`'s scenario, in `at` order (the list's order among equal `at`s).
   // `rooms[i]` is node i's room, queue_limit × copies over its copy groups (Simulation's).
-  FaultLog(const graph::Graph& g, const FaultSchedule& schedule, std::span<const double> rooms);
+  FaultLog(const graph::Graph& g, std::span<const double> rooms);
 
-  // The step that starts at `step.run.t` and lasts `dt`.
-  void observe(const StepPair& step, SimTime dt);
+  // The step that starts at `step.run.t` and lasts `dt`. `schedule` is the run's, after the step:
+  // its warm-ups have counted the step's reads (FaultSchedule::count_reads), so a flushed cache
+  // that got full during it has its warm-up time (FaultSchedule::warm_up_s).
+  void observe(const StepPair& step, SimTime dt, const FaultSchedule& schedule);
 
   [[nodiscard]] std::span<const FaultRecord> records() const { return records_; }
 
@@ -122,6 +125,9 @@ class FaultLog {
     std::vector<std::size_t> clients{};
     std::vector<std::size_t> retrying_pools{};
     std::vector<std::size_t> origins{};  // a cache_flush's: where its misses go
+    // A cache_flush's: the `at` of the next flush of the same cache, which ends this one's window
+    // if the cache is not full by then (FaultAfter::interrupted_by_flush_at). Empty if none.
+    std::optional<SimTime> next_flush{};
     // Whose backlog may need draining: the faulted part, or for a traffic_spike every node
     // downstream (any node but a client), the worst of which is named once the spike is over.
     std::vector<Backlogged> backlogged{};
@@ -140,9 +146,8 @@ class FaultLog {
 
   [[nodiscard]] Tracker tracker_of(const graph::Graph& g, const model::Fault& fault) const;
   [[nodiscard]] Tracker faulted_part(const graph::Graph& g, const model::Fault& fault) const;
-  [[nodiscard]] static FaultRecord record_of(const graph::Graph& g, const FaultSchedule& schedule,
-                                             const model::Fault& fault, const Tracker& tracker,
-                                             std::span<const double> rooms);
+  [[nodiscard]] static FaultRecord record_of(const graph::Graph& g, const model::Fault& fault,
+                                             const Tracker& tracker, std::span<const double> rooms);
   void add_backlogged(Tracker& tracker, std::vector<std::size_t> nodes, std::string name) const;
   static void add_retry_parties(const graph::Graph& g, Tracker& tracker);
   [[nodiscard]] static bool retries_reach(const graph::Graph& g, const Tracker& tracker);
@@ -159,6 +164,8 @@ class FaultLog {
   static void choose_drained(FaultRecord& r, Tracker& tracker);
   static void count_losses(FaultRecord& r, const Part& run, const Part& twin, double dt_s);
   static void count_retries(FaultRecord& r, const Part& run, const Part& twin, double dt_s);
+  static void end_flush_window(FaultRecord& r, const Tracker& tracker,
+                               const FaultSchedule& schedule, SimTime t);
   static void observe_warm_up(FaultRecord& r, SimTime t, SimTime dt);
   [[nodiscard]] static bool in_window(const FaultRecord& r, SimTime t);
   [[nodiscard]] static bool cleared(const FaultRecord& r, SimTime t);
@@ -236,6 +243,18 @@ constexpr double recovery_tolerance = 0.01;
     }
   }
   return origins;
+}
+
+// The `at` of the next cache_flush of `flush`'s cache: the earliest later one, empty if none.
+[[nodiscard]] std::optional<SimTime> next_flush_of(std::span<const model::Fault> faults,
+                                                   const model::Fault& flush) {
+  std::optional<SimTime> next;
+  for (const auto& other : faults) {
+    if (other.kind != model::FaultKind::cache_flush || other.node != flush.node) continue;
+    if (other.at.count() <= flush.at.count()) continue;
+    if (!next || other.at.count() < next->count()) next = other.at;
+  }
+  return next;
 }
 
 // The unit of the nodes' numbers (engine::NodeSample): megabytes when every one of them is
@@ -317,8 +336,7 @@ FaultLog& FaultLog::operator=(const FaultLog& other) = default;
 FaultLog& FaultLog::operator=(FaultLog&& other) noexcept = default;
 FaultLog::~FaultLog() = default;
 
-FaultLog::FaultLog(const graph::Graph& g, const FaultSchedule& schedule,
-                   std::span<const double> rooms) {
+FaultLog::FaultLog(const graph::Graph& g, std::span<const double> rooms) {
   for (const auto& node : g.nodes()) {
     capacities_.push_back(node.capacity.service_rate.per_second);
     ids_.push_back(node.spec.id);
@@ -327,7 +345,7 @@ FaultLog::FaultLog(const graph::Graph& g, const FaultSchedule& schedule,
   const auto& faults = g.scenario().faults;
   for (const std::size_t i : in_at_order(faults)) {
     trackers_.push_back(tracker_of(g, faults[i]));
-    records_.push_back(record_of(g, schedule, faults[i], trackers_.back(), rooms));
+    records_.push_back(record_of(g, faults[i], trackers_.back(), rooms));
   }
 }
 
@@ -341,8 +359,8 @@ FaultLog::Tracker FaultLog::tracker_of(const graph::Graph& g, const model::Fault
 // The faulted part (FaultRecord's comment): the named node; a dc_down's datacenter, its nodes but
 // its clients, in one unit, and the links that cross its edge (FaultSchedule::add_dc_down's
 // choice); a traffic_spike's client, with every node but a client as a candidate for the backlog
-// it leaves (one the spike does not reach is never above the twin's); a flush's cache and the
-// origins its misses go to.
+// it leaves (one the spike does not reach is never above the twin's); a flush's cache, the
+// origins its misses go to, and the next flush of the cache.
 FaultLog::Tracker FaultLog::faulted_part(const graph::Graph& g, const model::Fault& fault) const {
   Tracker tracker;
   const auto nodes = g.nodes();
@@ -371,6 +389,7 @@ FaultLog::Tracker FaultLog::faulted_part(const graph::Graph& g, const model::Fau
   tracker.nodes.push_back(node);
   if (fault.kind == model::FaultKind::cache_flush) {
     tracker.origins = origins_of(g, node);
+    tracker.next_flush = next_flush_of(g.scenario().faults, fault);
   } else {
     add_backlogged(tracker, tracker.nodes, fault.node);
   }
@@ -417,10 +436,9 @@ void FaultLog::add_backlogged(Tracker& tracker, std::vector<std::size_t> nodes,
 }
 
 // A record of zeros until the fault starts: what it is, its unit, the room its backlog can fill,
-// and a flush's window and origin.
-FaultRecord FaultLog::record_of(const graph::Graph& g, const FaultSchedule& schedule,
-                                const model::Fault& fault, const Tracker& tracker,
-                                std::span<const double> rooms) {
+// and a flush's origin (its window is the run's to find: end_flush_window).
+FaultRecord FaultLog::record_of(const graph::Graph& g, const model::Fault& fault,
+                                const Tracker& tracker, std::span<const double> rooms) {
   double room = 0.0;
   for (const std::size_t node : tracker.nodes) room += rooms[node];
   const bool attempts = retries_reach(g, tracker);
@@ -437,10 +455,9 @@ FaultRecord FaultLog::record_of(const graph::Graph& g, const FaultSchedule& sche
                 .origin_unit = unit_of(g, tracker.origins),
                 .datacenter = fault.datacenter};
   r.after.republishing_pools = ids_of(g, tracker.retrying_pools);
-  if (fault.kind == model::FaultKind::cache_flush) {
-    // A cache without a hit ratio loses nothing to a flush: its window is empty.
-    const std::size_t cache = tracker.nodes.front();
-    r.warm_up_s = g.nodes()[cache].hit_ratio ? schedule.warm_up_s(cache, fault.at) : 0.0;
+  // A cache without a hit ratio loses nothing to a flush: its window is empty from the start.
+  if (fault.kind == model::FaultKind::cache_flush && !g.nodes()[tracker.nodes.front()].hit_ratio) {
+    r.flush_window_s = 0.0;
   }
   return r;
 }
@@ -448,8 +465,11 @@ FaultRecord FaultLog::record_of(const graph::Graph& g, const FaultSchedule& sche
 // The recovery rule's snapshots (the run's step and the twin's) only when some record reads them:
 // a step at or after a fault has cleared that has not recovered yet. A 24 h run with one 30 s fault
 // takes a few hundred, not 864,000.
-void FaultLog::observe(const StepPair& step, SimTime dt) {
+void FaultLog::observe(const StepPair& step, SimTime dt, const FaultSchedule& schedule) {
   if (records_.empty()) return;
+  for (std::size_t i = 0; i < records_.size(); ++i) {
+    end_flush_window(records_[i], trackers_[i], schedule, step.run.t);
+  }
   std::optional<bool> back_to_twin;
   for (std::size_t i = 0; i < records_.size() && !back_to_twin; ++i) {
     if (needs_snapshot(records_[i], step.run.t)) {
@@ -611,21 +631,40 @@ void FaultLog::count_retries(FaultRecord& r, const Part& run, const Part& twin, 
   r.after.pool_republished_jobs += (run.republished_per_s - twin.republished_per_s) * dt_s;
 }
 
-// A flushed cache is warm again from the step during which its warm-up ends, once the run gets
-// there: the warm-up time itself, not the step's end (Task 7's curve, FaultSchedule::warm_up_s).
-void FaultLog::observe_warm_up(FaultRecord& r, SimTime t, SimTime dt) {
-  if (r.kind != model::FaultKind::cache_flush || !r.warm_up_s || r.after.cache_warm_in_s) return;
-  if (seconds(SimTime{t.count() + dt.count() - r.at.count()}) >= *r.warm_up_s) {
-    r.after.cache_warm_in_s = *r.warm_up_s;
+// A flush's window ends once the run finds where (FaultRecord::flush_window_s): at the step during
+// which its cache got full (the schedule counted the step's reads before this), or at the step
+// that starts at or after the next flush of the cache when that came first, which the record
+// names (FaultAfter::interrupted_by_flush_at). Until then it is open.
+void FaultLog::end_flush_window(FaultRecord& r, const Tracker& tracker,
+                                const FaultSchedule& schedule, SimTime t) {
+  if (r.kind != model::FaultKind::cache_flush || r.flush_window_s) return;
+  if (const auto warm = schedule.warm_up_s(tracker.nodes.front(), r.at)) {
+    r.flush_window_s = *warm;
+  } else if (tracker.next_flush && t.count() >= tracker.next_flush->count()) {
+    r.flush_window_s = seconds(SimTime{tracker.next_flush->count() - r.at.count()});
+    r.after.interrupted_by_flush_at = tracker.next_flush;
   }
 }
 
-// Inside the fault's window: [at, at + for) (model::active_at), or a flush's warm-up from `at` on
-// (for ever when the cache never warms).
+// A flushed cache is warm again from the step during which its warm-up ends, once the run gets
+// there: the warm-up time itself, not the step's end (Task 7's curve, FaultSchedule::warm_up_s).
+// A window the next flush cut short never ends warm.
+void FaultLog::observe_warm_up(FaultRecord& r, SimTime t, SimTime dt) {
+  if (r.kind != model::FaultKind::cache_flush || !r.flush_window_s || r.after.cache_warm_in_s ||
+      r.after.interrupted_by_flush_at) {
+    return;
+  }
+  if (seconds(SimTime{t.count() + dt.count() - r.at.count()}) >= *r.flush_window_s) {
+    r.after.cache_warm_in_s = *r.flush_window_s;
+  }
+}
+
+// Inside the fault's window: [at, at + for) (model::active_at), or a flush's from `at` on, until
+// its end once the run has found it (end_flush_window; for ever when the cache never warms).
 bool FaultLog::in_window(const FaultRecord& r, SimTime t) {
   if (model::lasts(r.kind)) return model::active_at(r.at, r.duration, t);
   if (t.count() < r.at.count()) return false;
-  return !r.warm_up_s || seconds(SimTime{t.count() - r.at.count()}) < *r.warm_up_s;
+  return !r.flush_window_s || seconds(SimTime{t.count() - r.at.count()}) < *r.flush_window_s;
 }
 
 // The fault has cleared by `t`: at + for (a flush, an instant, at `at`).
@@ -633,10 +672,10 @@ bool FaultLog::cleared(const FaultRecord& r, SimTime t) {
   return t.count() - r.at.count() >= r.duration.count();
 }
 
-// The window's length in seconds: `for`, or a flush's warm-up (empty: it never warms).
+// The window's length in seconds: `for`, or a flush's (empty: not ended yet, or never).
 std::optional<double> FaultLog::window_length_s(const FaultRecord& r) {
   if (model::lasts(r.kind)) return seconds(r.duration);
-  return r.warm_up_s;
+  return r.flush_window_s;
 }
 
 // The step as the recovery rule reads it: the p99 of each client op is read off the lognormal fit

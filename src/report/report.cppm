@@ -207,9 +207,10 @@ struct FaultSlo {
 
 // One fault's block (spec §4.4): the engine's record, what the fault did to the SLOs (only those
 // with something to say, in the scenario's order), and the `at` of every earlier fault on the same
-// target (the same node, or the same datacenter) whose counting span, from its `at` to its
-// recovery (the end of the run when it never recovered), contains this fault's `at`: both blocks
-// count the steps they share, and the later one says so.
+// target (the same node, the same datacenter, or a dc_down and a fault on a node of its
+// datacenter, whichever came first) whose counting span, from its `at` to its recovery (the end of
+// the run when it never recovered), contains this fault's `at`: both blocks count the steps they
+// share, and the later one says so.
 struct FaultBlock {
   engine::FaultRecord record{};
   std::vector<FaultSlo> slos{};
@@ -289,12 +290,14 @@ class Summary {
   // scenario's SLOs with `over` (evaluate_slos asks for exactly those); another is `skipped`.
   [[nodiscard]] SloResult windowed_verdict(const model::SloSpec& slo) const;
 
-  // Before a run with faults: the windows "during" each fault of `records` (engine::FaultRecord:
-  // [at, at + for), a cache_flush's warm-up [at, at + warm_up_s), to the end of the run when it
-  // never warms). From then on `observe` judges every SLO of the scenario on each step that starts
-  // in one of them, that step alone (FaultSlo::over_max_s), and keeps the verdicts: a few per step
-  // of the windows, nothing outside them. The run's Summary and its twin's both watch the same
-  // records (session::run_summary), so that set_faults can compare them step by step.
+  // During a run with faults, before each step is observed: the windows "during" each fault of
+  // `records` (engine::FaultRecord: [at, at + for), a cache_flush's [at, at + flush_window_s), to
+  // the end of the run while that end is unknown). `observe` judges every SLO of the scenario on
+  // each step that starts in one of them, that step alone (FaultSlo::over_max_s), and keeps the
+  // verdicts: a few per step of the windows, nothing outside them. A flush's window ends when its
+  // cache is full again, which only the run finds out, so session::run_summary hands the records
+  // again at every step; the run's Summary and its twin's both watch the same records, so that
+  // set_faults can compare them step by step.
   void watch_faults(std::span<const engine::FaultRecord> records);
   // After the run: one block per record (engine::Simulation::fault_records, in `at` order),
   // replacing any held, each with what the fault did to the SLOs against `twin`, the Summary of the
