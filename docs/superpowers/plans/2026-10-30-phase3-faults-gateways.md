@@ -727,7 +727,55 @@ to return; the four sweeps reproduce from their YAML; the Euler factor `(1 − d
 ## Comprehensive phase 3 review, then push
 
 - [ ] An adversarial reviewer (fresh context, own worktree, both presets) checks: warning-free builds and the whole suite; clang-format as CI runs it; conservation from `--series` on all fourteen scenarios (node, link and client rows, `attempts`, `dead_lettered`, `deduplicated`, `connections` included); answered ≤ offered and attempts ≥ offered everywhere; `estimate` = `run` on steady probes with retries, failure steps, fanouts, frontiers and gateways; every fault kind's identity when absent (phase 2 bytes); every README number of the four new scenarios and of the eight that moved; `--replications` byte-identical across `--jobs`; the 3a splits' byte-identity still holds; first-use comments; `Pattern:` labels; test names; functions over ~50 lines; the ten GCC 14.2 workarounds of CLAUDE.md §3; the schema's "chosen" list complete.
-- [ ] Fix round recorded here as "Comprehensive phase 3 review at <sha>"; commit; push; CI.
+**Comprehensive phase 3 review at `9ac36bd`** (adversarial, bounded, 2026-10-30; the docs reviewed
+apart, above): REQUEST_CHANGES, nothing critical. Verified: both presets warning-free, 1681/1681,
+clang-format as CI; conservation per step on every node and link row of all fourteen scenarios
+within 2e-3 (`demand·dt = (drain + drops)·dt + Δbacklog`), dead letters and dedup within drain,
+answered ≤ offered and attempts ≥ offered on every op row, connections in [0, cap]; `estimate` =
+`run` on steady probes for client retries (failure and overload), pool retries, `on: failure`, a
+fanout, a frontier, a discovery (gaps < 1e-9, closed forms matched) and a gateway (0.05 %, the
+level still approaching); identity against the pre-phase-3 commit `0e37886` on the seven fault-free
+scenarios (every common column and key equal; only `attempts/s` added); `--replications 5`
+byte-identical across `--jobs 1`/`8`; every README headline number but one; the ten GCC 14.2
+workarounds in place; `make_node` the only function over 50 lines (acceptable); test names clean.
+1. Important: the storm's waiting users never end their sessions inside the window, so chat-system's
+   level overshoots by 3.9 % (1.6804M vs 1.6169M) and the "back within 1 % at 21:38:58.7, 478.7 s
+   after" is that overshoot's decay; without the simplification recovery is about the window.
+2. Minor: JSON writes an unbounded lag as `null`, as for a node without a lag. 3. Minor: the
+`queue_lag` SLO refusal says "needs a message_queue node" (the check accepts a frontier). 4. Minor:
+comments in `report.cppm`/`report.cpp` still say a lag exists only on a message queue (the CSV
+fills frontier rows). 5. Minor: first-use comments missing or late in phase 3 hunks:
+`engine.cppm:179` (`std::span`), `:728` (designated initializers), `report.cppm:312` (`std::span`),
+`test_faults.cpp:537` (`contains`), `test_gateways.cpp:124` (designated initializers),
+`test_retries.cpp:565` (`ends_with`, and `contains` from 579), `test_graph.cpp:4188`
+(`std::expected`); borderline: `test_frontier.cpp:348` (comment one line after), `nodes.cpp:177`
+and `detail.hpp:221` (no standard named), `module;` uncommented in `graph.cpp`, `records.cppm`,
+`fault_log.cppm`; the config units rely on `detail.hpp`'s comments. 6. Minor: news-feed README's
+sweep cell 0.631 (the file without the outage) vs 0.63 printed. 7. Minor: adding a
+`service_discovery` loses requests a bare replicated target does not (the baseline is an
+implicit ideal router). 8. Minor: the storm count is the connections dropped, not the users who
+return; users' own connects refused by the survivors' smaller cap are not retried.
+9. Nit: `capacity factor must be between 0 and 1` printed for `factor: 0`. 10. Nit: a pool's
+`retry_after: -1s` gets the generic non-negative message while `0s` gets "must be positive".
+11. Nit: `estimate --report json`'s node `dropped` is one step's worth, not a rate (predates
+phase 3). 12. Nit: `graph.cpp:876`'s "Adapter" label wraps no interface.
+Decisions: 1 → fixed: a user reconnecting `u` seconds into the window survives with probability
+`e^(−u/session)` (closed form; the storm's connects thinned), the block prints the users who come
+back (the sum of the storm's connects, finding 8's first half), the chat-system README and day
+test re-measured; 2 → documented now ("on a message_queue or frontier, null means unbounded"), a
+`queue_lag_unbounded` boolean to the backlog; 3, 4, 5 (all, the borderline ones too: name the
+standard, a `module;` comment at the first use in each of the three files, and CLAUDE.md §1 gains
+one sentence: a header included first in a TU carries that TU's first-use comments), 6 (print
+0.63), 9, 10, 12 fixed; 7 → documented at `service_discovery` in `engine.cppm` and in the schema
+(the baseline is an ideal health-checked router), a default detection delay for plain replicas to
+the backlog; 8's second half → the backlog; 11 → documented, per-second to the backlog. With them,
+the Task 19 review's item 8 and the Task 19 notes: `explain`'s `(partitions: phase 3)` →
+"phase 4 backlog"; `defaults.cppm`'s frontier comment says 10k/s; `test_gateways.cpp`'s header
+says Euler at 1 s is high, not low; the recovery rule → the step after the LAST step outside 1 %
+of the twin (a crossing no longer counts; the block is written at the end of the run, so the
+whole run is known), schema and spec §20 updated; the per-seed JSON under `--replications` gains
+`deduplicated_per_s`.
+- [ ] Fix round; commit; push; CI.
 
 ## Phase 4 backlog
 
