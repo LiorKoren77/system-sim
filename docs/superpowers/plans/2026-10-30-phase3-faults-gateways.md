@@ -542,6 +542,7 @@ lines, the 2-worker and 4-block-server variants, the backlog window 07:03–13:2
 The design calls (a fixed 2M level marked chosen; heartbeat as the poll timeout, ≈0.75 % off a real
 long poll's re-poll rate, stated; 3 workers with the 2-worker day as the exercise) endorsed.
 Decisions: all fixed in a fix round (5 at the push).
+Fixed at `07264c5` (1639 tests).
 
 ### Task 17: `notification_fanout`; notification-system runs end to end
 
