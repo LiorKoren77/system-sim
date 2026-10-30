@@ -85,8 +85,12 @@ std::string format_count(double value) {
 // A queue lag as the node table and the SLO lines print it: a duration, or "<1us" for a lag that
 // would print below one microsecond. An idle consumer group's stochastic wait is Erlang C's tiny
 // chance of waiting times a job (youtube's completion_q: 6.3e-11 s, "0.0632ns"), a figure below
-// anything a queue's lag is ever measured in; the JSON and the CSV keep the number.
+// anything a queue's lag is ever measured in; the JSON and the CSV keep the number. An infinite
+// lag is a backlog that grows for ever (`estimate` of a URL frontier offered more than its pool
+// drains: engine::Simulation::mark_unbounded_backlogs): "unbounded", not format_duration's
+// "unavailable", since every URL is fetched in the end, only later and later.
 std::string format_lag(double seconds_value) {
+  if (std::isinf(seconds_value)) return "unbounded";
   const double below = rounds_to_one * 1e-6;  // what format_duration would print under "1us"
   if (seconds_value > 0.0 && seconds_value < below) return "<1us";
   return format_duration(seconds_value);
@@ -546,6 +550,13 @@ constexpr double text_cell = std::numeric_limits<double>::quiet_NaN();
   return parts.rows.empty() ? std::string{} : table_text(title, parts);
 }
 
+// A peak backlog as the tables print it: a count (with_si_prefix), or "unbounded" for one that
+// grows for ever (`estimate` of a URL frontier's pool offered more than it drains:
+// engine::Simulation::mark_unbounded_backlogs).
+[[nodiscard]] std::string peak_backlog_text(double backlog) {
+  return std::isinf(backlog) ? "unbounded" : with_si_prefix(backlog);
+}
+
 // A queue's cells (a node's, or a bandwidth link's pipe's), its rho cells coloured by the queue's
 // own zone thresholds; the tables add what follows them.
 [[nodiscard]] Row queue_cells(const NodeSummary& node, const fluid::Capacity& capacity,
@@ -556,7 +567,7 @@ constexpr double text_cell = std::numeric_limits<double>::quiet_NaN();
   return {{node.id},
           {significant(node.mean_rho), colour_of(node.mean_rho)},
           {significant(node.peak_rho), colour_of(node.peak_rho)},
-          {with_si_prefix(node.peak_backlog)},
+          {peak_backlog_text(node.peak_backlog)},
           {with_si_prefix(node.total_dropped)},
           {with_si_prefix(node.total_rejected)},
           {significant(node.red_time_s)}};

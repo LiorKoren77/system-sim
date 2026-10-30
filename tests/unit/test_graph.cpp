@@ -3662,9 +3662,11 @@ TEST_CASE("a weight-0 consumer link is a group that reads nothing: share 0", "[g
       std::ranges::equal(g.arriving_ops(*g.index_of("w1")), std::vector<std::string>{"publish"}));
 }
 
-// A URL frontier has no `retention`, so a pool draining one gets the default room: Kafka's 7 days
-// of its own rate, 604,800 s x (4 workers / 5 ms = 800/s) = 483.84 million URLs.
-TEST_CASE("a pool consuming a frontier gets the default room: 7 days of its rate", "[graph]") {
+// A URL frontier has no `retention` and deletes nothing: a URL waits until a downloader takes it.
+// So a pool draining one has a room without end (+infinity), where a pool behind a message queue
+// gets retention x its rate (7 days x 800/s = 483.84 million by default). Until the Task 18 review
+// it got that default room too, and `estimate`, which fills a room, dropped URLs a frontier keeps.
+TEST_CASE("a pool consuming a frontier has a room without end", "[graph]") {
   Scenario s{.name = "frontier-pool", .version = 1, .duration = 1min};
   s.nodes = {
       client("u", Rate{100}, {{"url", 1.0}}),
@@ -3675,8 +3677,7 @@ TEST_CASE("a pool consuming a frontier gets the default room: 7 days of its rate
   const auto g = Graph::build(s);
   INFO((g ? "" : g.error().message));
   REQUIRE(g.has_value());
-  REQUIRE_THAT(g->nodes()[*g->index_of("w")].capacity.queue_limit,
-               WithinRel(604'800.0 * 800.0, 1e-9));
+  REQUIRE(std::isinf(g->nodes()[*g->index_of("w")].capacity.queue_limit));
 }
 
 // ---- kv_cluster: a ring of nodes, N replicas per key (spec §19 entry 9) ----

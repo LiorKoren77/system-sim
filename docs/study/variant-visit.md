@@ -102,10 +102,12 @@ warns about an enumerator without a case, so a new node type would silently have
 service. The whole-of-phase-2 review changed both. `make_node` names every enumerator, with
 `case service:` explicit, and the four phase-3 types end in `std::unreachable()`, with a comment
 that `Simulation::create` refused them before `make_node` runs
-([small-features.md](small-features.md#stdunreachable)). `simulated()` now reads a column of
-`model::node_type_table`, the one table that names every type, so adding a type is one row
-that says whether it runs. The lesson is the same as for `visit`: a fallback branch turns a
-compile error you want into a run-time behaviour you did not choose.
+([small-features.md](small-features.md#stdunreachable)). `simulated()` then read a column of
+`model::node_type_table`, the one table that names every type, so adding a type was one row
+that said whether it ran; once phase 3 gave every type a model, the column, `simulated()` and
+`Simulation::create`'s refusal of a type without one were deleted (Task 18's review round), and
+`make_node`'s switch names a case for every enumerator. The lesson is the same as for `visit`: a
+fallback branch turns a compile error you want into a run-time behaviour you did not choose.
 
 ## Pitfalls met while building
 

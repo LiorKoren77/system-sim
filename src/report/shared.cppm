@@ -127,8 +127,10 @@ constexpr double rounds_to_one_at_four_digits = 0.99995;
 // A queue's waiting room: as written up to six digits (1000, 12000, 500000), and from a million on
 // with an SI prefix, four digits (a pool's room is retention × its rate: 7 days of 6.667/s is
 // 4.032M, of 1.2k/s 725.8M), where six digits would print "4.032e+06". Six digits round [999,999.5,
-// 1e6) up to that million too, so such a room is printed as the million it rounds to, "1M".
+// 1e6) up to that million too, so such a room is printed as the million it rounds to, "1M". A
+// room without end (+infinity: the pool of a URL frontier, graph::Graph::room_of) is "unbounded".
 [[nodiscard]] std::string fmt_room(double units) {
+  if (std::isinf(units)) return "unbounded";
   constexpr double million = 1e6;
   constexpr double rounds_to_a_million = million - 0.5;
   if (std::abs(units) < rounds_to_a_million) return significant(units, 6);

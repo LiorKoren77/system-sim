@@ -1846,6 +1846,11 @@ TEST_CASE(
 //    (below 85 %), so the frontier drops no URL;
 //  - the frontier's lag grows past 10 hours by the end of the run (about 4.8k new URLs a second
 //    more than the 2000 the pool drains), and both SLOs fail on purpose: `run` exits 2.
+// The measured figures, at this 60 s step (Release, 2026-10-30): the frontier offered 6797 URLs/s
+// (rho 0.6797 of 10k/s), parser 0.7596, content_store 0.6647, internet 0.001999, and a peak lag of
+// 51,252 s (14.2 h; the README's 14.4 h is the 1 s step's: the feedback edge url_seen -> frontier
+// delays each lap of the loop by one step, so at a minute a step the URL flow takes some minutes
+// longer to climb to its level, and the backlog starts later).
 TEST_CASE("book/web-crawler's day: every downloader busy and the frontier's lag past 10 hours",
           "[scenario]") {
   using namespace std::chrono_literals;
@@ -1869,9 +1874,13 @@ TEST_CASE("book/web-crawler's day: every downloader busy and the frontier's lag 
     REQUIRE(node(sized).peak_rho < 0.85);
   }
   REQUIRE(node("frontier").total_dropped == 0.0);
+  REQUIRE_THAT(node("frontier").mean_rho, Catch::Matchers::WithinRel(0.6797, 1e-3));
+  REQUIRE_THAT(node("parser").mean_rho, Catch::Matchers::WithinRel(0.7596, 1e-3));
+  REQUIRE_THAT(node("content_store").mean_rho, Catch::Matchers::WithinRel(0.6647, 1e-3));
   const auto frontier = node("frontier");
   REQUIRE(frontier.peak_queue_lag_s.has_value());
   REQUIRE(*frontier.peak_queue_lag_s > 10.0 * 3600.0);
+  REQUIRE_THAT(*frontier.peak_queue_lag_s, Catch::Matchers::WithinRel(51'252.0, 1e-3));
   const auto results = simsys::report::evaluate_slos(summary, s.slos);
   REQUIRE(results.size() == 2);
   for (const auto& result : results) {
