@@ -181,7 +181,7 @@ TEST_CASE(
     //    step.
     //  - google-drive runs (long_poll holds a fixed 2M connections) and MEETS its four SLOs, its
     //    backup pool sized at 3 workers; it is exempt here only for time: 24 h at 100 ms is 864k
-    //    steps, about 24 s of CPU in Release (measured 2026-10-30), far over the five seconds. Its
+    //    steps, about 20 s of CPU in Release (measured 2026-10-30), far over the five seconds. Its
     //    own tests below run the day at 10 s steps and pin the SLOs passing.
     if (s.name == "lab-unique-id" || s.name == "url-shortener" || s.name == "youtube" ||
         s.name == "news-feed" || s.name == "search-autocomplete" ||
@@ -1966,10 +1966,24 @@ struct GoogleDriveDay {
   }
 };
 
-GoogleDriveDay run_google_drive_day(simsys::SimTime step) {
+simsys::model::Scenario google_drive_as_shipped() {
+  return load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/google-drive/scenario.yaml");
+}
+
+// The shipped file with the backup pool at the 2 workers it first had (the README's first
+// exercise, "Things to try"), changed in code as youtube_with_400_transcoders does.
+simsys::model::Scenario google_drive_with_2_backup_workers() {
+  auto s = google_drive_as_shipped();
+  const auto pool = std::ranges::find(s.nodes, "backup_workers", &simsys::model::NodeSpec::id);
+  REQUIRE(pool != s.nodes.end());
+  REQUIRE(pool->workers == 3);  // as shipped
+  pool->workers = 2;
+  return s;
+}
+
+GoogleDriveDay run_google_drive_day(simsys::model::Scenario scenario, simsys::SimTime step) {
   GoogleDriveDay day;
-  day.scenario =
-      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/google-drive/scenario.yaml");
+  day.scenario = std::move(scenario);
   day.scenario.step = step;
   const auto g = build_or_fail(day.scenario);
   auto sim = simsys::engine::Simulation::create(g);
@@ -1996,17 +2010,23 @@ GoogleDriveDay run_google_drive_day(simsys::SimTime step) {
   return day;
 }
 
+GoogleDriveDay run_google_drive_day(simsys::SimTime step) {
+  return run_google_drive_day(google_drive_as_shipped(), step);
+}
+
 }  // namespace
 
-// `simsys run scenarios/book/google-drive/scenario.yaml` exits 0 when every SLO passes. The three
-// SLOs are the book's: a download (500 KB through the api, the cache and the block servers) in
-// 2 s at p99, a metadata read in 100 ms at p99, and at most 0.1 % of requests dropped anywhere.
+// `simsys run scenarios/book/google-drive/scenario.yaml` exits 0 when every SLO passes. Three of
+// the four SLOs bound what the book's users see: a download (500 KB through the api, the cache and
+// the block servers) in 2 s at p99, a metadata read in 100 ms at p99, and at most 0.1 % of
+// requests dropped anywhere. The fourth, notify_q's lag at most 10 minutes, is the scenario's own
+// recovery-point choice (README, "How it is sized"); the loop checks it passes with the others.
 // The day runs at 10 s steps (8,610 observed, 2.7 s in Debug) instead of the shipped 100 ms
 // (864k steps); the 11:00 peak is a multiple of 10 s, so the step only blurs the sine's shape
 // slightly. Measured on a scratch copy of the YAML with only `connections: 2M` added and 3
 // backup workers (2026-10-30): download p99 125 ms, metadata p99 6.6 ms, drop rate 0. The
 // implementer re-measures on the shipped file; the verdicts, not those numbers, are pinned here.
-TEST_CASE("book/google-drive runs the day and passes its three SLOs", "[scenario]") {
+TEST_CASE("book/google-drive runs the day and passes all four of its SLOs", "[scenario]") {
   using namespace std::chrono_literals;
   const auto day = run_google_drive_day(10s);
   for (const auto& r : day.slos) {
@@ -2014,8 +2034,8 @@ TEST_CASE("book/google-drive runs the day and passes its three SLOs", "[scenario
             r.observed.value_or(-1.0), r.note);
     REQUIRE(r.status == simsys::report::SloStatus::pass);
   }
-  // The three of the book (a fourth, on the notification queue's lag, may join them).
-  REQUIRE(day.slos.size() >= 3);
+  // The three on what users see, and the fourth on notify_q's lag.
+  REQUIRE(day.slos.size() == 4);
   const auto& download = day.slo(simsys::model::SloMetric::p99_latency, "download");
   REQUIRE(std::get<simsys::SimTime>(download.slo.max) == simsys::SimTime{2s});
   REQUIRE(download.observed.has_value());
@@ -2044,10 +2064,11 @@ TEST_CASE("book/google-drive's long_poll holds 2M connections on every step, fro
 }
 
 // Ch. 15's notification service keeps 2M devices connected (long poll, so no websocket
-// heartbeat in the book, but the model's `heartbeat: 60s` stands for the keep-alive each open
-// connection sends: the scenario states it, the README says why). The heartbeat load is
+// heartbeat in the book, but the model's `heartbeat: 60s` stands for the poll's timeout: an idle
+// device's poll is answered empty after a minute and sent again at once; the scenario states it,
+// the README says why). The re-poll load is
 //   connections / heartbeat = 2,000,000 / 60 s = 33,333.33 requests/s      (Little's law read
-//   backwards: C open connections that each ping every T seconds send C / T pings a second)
+//   backwards: C open polls that each time out and are re-sent every T seconds send C / T a second)
 // and long_poll has no `heartbeat` op, so the gateway carries it alone, on top of the pushes
 // (notification_svc's 2 per upload, 511/s at the peak) and the api's sync polls (60/s). The
 // gateway's demand is therefore never below 33,333.33/s and, once the pushes and polls arrive,
@@ -2082,9 +2103,10 @@ TEST_CASE(
 // are busy a fraction of the time) and bounded. If the scenario states a `queue_lag` SLO on
 // notify_q, the bound is that SLO's own `max`; if it does not, the bound is 10 minutes: a
 // "file changed" push that reaches the other devices later than that is not a sync any more, and
-// a scenario that lets the lag grow past it (backup_workers at the book's 2 workers: rho 1.28, an
-// hour of lag at the peak, measured) must state that as a SLO and say in its README that the
-// backlog is the lesson. The unsized pool without such an SLO fails this test on purpose.
+// a scenario that lets the lag grow past it (backup_workers at the 2 workers it first shipped
+// with: rho 1.28, an hour of lag at the peak, measured) must state that as a SLO and say in its
+// README that the backlog is the lesson. The unsized pool without such an SLO fails this test on
+// purpose.
 TEST_CASE("book/google-drive's notify_q lag is positive and bounded by its SLO, else by 10 minutes",
           "[scenario]") {
   using namespace std::chrono_literals;
@@ -2123,6 +2145,33 @@ TEST_CASE(
   REQUIRE(backup.peak_rho <= 1.0 + 1e-9);
   REQUIRE(day.slo(simsys::model::SloMetric::drop_rate).status == simsys::report::SloStatus::pass);
   REQUIRE(day.drop_rate <= 0.001);
+}
+
+// The README's first exercise: the backup pool at the 2 workers it first shipped with. 2 workers
+// at 10 ms a job drain 2 / 10 ms = 200 jobs/s, below the 255.6 uploads/s of the 11:00 peak, so
+// from 07:03 to 13:28 notify_q's backlog for the backup group grows (the pool's rho clamped at 1)
+// to 773.9k jobs, which drain at 200/s: the queue's lag, the FIFO drain time of its slowest group,
+//   backlog / drain = 773.9k / 200/s = 3,870 s = 1.07 h  >  10 m = 600 s     -> FAIL
+// and `simsys run` exits 2 (report::all_pass is false). Nothing is dropped: notify_q keeps 7 days
+// (121M jobs at 200/s), so the backlog is lag, not loss, and the drop_rate SLO passes. The run
+// uses 10 s steps, as the other google-drive day tests do.
+TEST_CASE("book/google-drive at 2 backup workers fails its queue_lag SLO and drops nothing",
+          "[scenario]") {
+  using namespace std::chrono_literals;
+  const auto day = run_google_drive_day(google_drive_with_2_backup_workers(), 10s);
+  const auto lag = std::ranges::find_if(day.slos, [](const auto& r) {
+    return r.slo.metric == simsys::model::SloMetric::queue_lag && r.slo.node == "notify_q";
+  });
+  REQUIRE(lag != day.slos.end());
+  REQUIRE(lag->status == simsys::report::SloStatus::fail);  // not skipped, not passing
+  REQUIRE(lag->observed.has_value());
+  CAPTURE(*lag->observed);
+  REQUIRE(*lag->observed > 600.0);  // the SLO's 10 m
+  REQUIRE_THAT(*lag->observed, Catch::Matchers::WithinRel(3870.0, 0.01));
+  const auto& drops = day.slo(simsys::model::SloMetric::drop_rate);
+  REQUIRE(drops.status == simsys::report::SloStatus::pass);
+  REQUIRE(day.node("backup_workers").total_dropped == 0.0);
+  REQUIRE_FALSE(simsys::report::all_pass(day.slos));  // `simsys run` exits 2
 }
 
 // The headline peaks the README quotes today as `explain`'s paper numbers, which the run must
