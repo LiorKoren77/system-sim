@@ -1023,6 +1023,56 @@ TEST_CASE("explain names every blocking type on the way to a node, nearest first
                         "yet)"));
 }
 
+// ---- `on: failure` steps on paper (spec §5) ----
+//
+// u (1000 writes/s) -> web, whose write is [db.write, log.write on failure]; db holds 500/s, log
+// 2000/s. explain's paper load answers "can this ever fit" with nothing queued or dropped, so no
+// write fails on paper and the failure step sends nothing: db is offered the whole 1k/s (red), log
+// 0/s. How much reaches log is what db fails, which only `run` and `estimate` measure.
+namespace {
+Scenario failure_logged() {
+  Scenario s{.name = "failure-logged", .version = 1, .duration = 1s, .step = 100ms};
+  s.nodes = {
+      NodeSpec{.id = "u",
+               .type = NodeType::client,
+               .workload = Workload{.curve = {.base = Rate{1000}}, .op_shares = {{"write", 1.0}}}},
+      NodeSpec{.id = "web",
+               .type = NodeType::service,
+               .capacity = Rate{10'000},
+               .ops = {{"write",
+                        {simsys::model::Step{.to = "db", .op = "write"},
+                         simsys::model::Step{.to = "log",
+                                             .op = "write",
+                                             .on = simsys::model::StepCondition::failure}}}}},
+      NodeSpec{.id = "db", .type = NodeType::service, .capacity = Rate{500}},
+      NodeSpec{.id = "log", .type = NodeType::service, .capacity = Rate{2000}}};
+  s.links = {LinkSpec{.from = "u", .to = "web"}, LinkSpec{.from = "web", .to = "db"},
+             LinkSpec{.from = "web", .to = "log"}};
+  return s;
+}
+
+constexpr std::string_view failure_fed_note =
+    "fed by on: failure steps only: sized by run/estimate";
+}  // namespace
+
+TEST_CASE("explain's paper load sends nothing along a failure step: db 1k/s, log 0/s", "[series]") {
+  const auto text = explain_of(failure_logged());
+  CAPTURE(text);
+  REQUIRE(
+      check_line(text, "db").contains("peak offered 1k/s vs 500/s total capacity  (200%, red)"));
+  REQUIRE(check_line(text, "log").contains("peak offered 0/s vs 2k/s total capacity  (0%, green)"));
+}
+
+// A 0 % green line for log would read as "log is idle", when log carries whatever db fails: the
+// line says the paper load cannot size it. A node an ordinary step reaches (db) gets no note.
+TEST_CASE("explain notes that a node fed by failure steps only is sized by run or estimate",
+          "[series]") {
+  const auto text = explain_of(failure_logged());
+  CAPTURE(text);
+  REQUIRE(check_line(text, "log").contains(failure_fed_note));
+  REQUIRE_FALSE(check_line(text, "db").contains(failure_fed_note));
+}
+
 // ---- A link's bandwidth is a pipe: its rows in the series and the JSON ----
 //
 // A link with a bandwidth is a queue of megabytes and is plotted like a node: one CSV row per

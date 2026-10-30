@@ -2585,6 +2585,57 @@ TEST_CASE("a cache whose store hands work to a queue that reaches the cache agai
   REQUIRE(g.has_value());
 }
 
+// An `on: failure` step that calls back into its own op (web.write fails at db, the failure step
+// asks `retrier`, which writes to web again) is a retry with no bound: every retried write that
+// fails again is retried again, and nothing in the model stops it (the review's probe answered
+// 21/s of 1000, `estimate` dropping 99.5 % with no word on why). The failure step's call and the
+// op it reports from share a call cycle (one strongly connected component of the call graph, the
+// test the backend hops use), so the scenario is refused and pointed at the bounded form.
+TEST_CASE("an on-failure step that closes a call cycle is refused: an unbounded retry", "[graph]") {
+  Scenario s{.name = "retry-loop", .version = 1, .duration = 1min};
+  s.nodes = {
+      client("u", Rate{1000}, {{"write", 1.0}}),
+      service("web", {{"write",
+                       {Step{.to = "db", .op = "write"},
+                        Step{.to = "retrier", .op = "retry", .on = StepCondition::failure}}}}),
+      service("db"), service("retrier", {{"retry", {Step{.to = "web", .op = "write"}}}})};
+  s.links = {LinkSpec{.from = "u", .to = "web", .dir = Direction::inout},
+             LinkSpec{.from = "web", .to = "db", .dir = Direction::inout},
+             LinkSpec{.from = "web", .to = "retrier", .dir = Direction::inout},
+             LinkSpec{.from = "retrier", .to = "web", .dir = Direction::inout}};
+  const auto g = Graph::build(s);
+  REQUIRE_FALSE(g.has_value());
+  REQUIRE(g.error().message ==
+          "node 'web': an on: failure step to 'retrier' closes a call cycle (an unbounded retry: "
+          "use the client's retries)");
+}
+
+// The same retry through a message queue: the failure step publishes the failed write to
+// `retry_q`, whose pool writes to web again. A queue answers its publisher at the append
+// (detail::consumer_deliveries), so the call cycle ends at the queue and the scenario builds. It
+// still retries for ever (a job that fails again is published again: the dead-letter queue of
+// ch. 10's notification system, without its retry limit); a pool's `retries` is the bounded form.
+TEST_CASE(
+    "an on-failure step that retries through a message queue builds: the queue ends the calls",
+    "[graph]") {
+  Scenario s{.name = "queued-retry", .version = 1, .duration = 1min};
+  s.nodes = {
+      client("u", Rate{1000}, {{"write", 1.0}}),
+      service("web", {{"write",
+                       {Step{.to = "db", .op = "write"},
+                        Step{.to = "retry_q", .op = "write", .on = StepCondition::failure}}}}),
+      service("db"), message_queue("retry_q"),
+      worker_pool("retrier", {Step{.to = "web", .op = "write"}}, "retry_q")};
+  s.links = {LinkSpec{.from = "u", .to = "web", .dir = Direction::inout},
+             LinkSpec{.from = "web", .to = "db", .dir = Direction::inout},
+             LinkSpec{.from = "web", .to = "retry_q", .dir = Direction::inout},
+             LinkSpec{.from = "retry_q", .to = "retrier"},
+             LinkSpec{.from = "retrier", .to = "web", .dir = Direction::inout}};
+  const auto g = Graph::build(s);
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+}
+
 // Nothing feeds the pool, yet its `then` step counts as arriving at the store (an unconditional
 // `then` fires for whatever the node receives). Before this fix the store took `write` with no size
 // and charged it one unit; now the step must say how big a write is. No job arrives at the pool as
@@ -2735,7 +2786,7 @@ TEST_CASE("a queue's pool keeps a same-op size on its then step and uses a renam
 // steps: demand edges to their targets, a share of 1 whatever op the pool's queue brought (every
 // drained job fires every step), the step's own `size:` or, for a same-op step, the job's size.
 // `on: miss` and `on: failure` are refused as a blob store's are: a pool has no lookup to miss, and
-// a job reports no failure before phase 3.
+// a pool's `then` steps follow no step a failure step could report on.
 
 namespace {
 // u (publishes `publish`, 8/s) -> q -> w (consumes q; `then`) -> {store (a default blob store),
@@ -2869,15 +2920,18 @@ TEST_CASE("an on-miss step after an always step on a worker pool is refused too"
           "(on: miss needs a cache)");
 }
 
-// `on: failure` names a failed job's branch. A job reports no failure before phase 3 (external
-// sinks that fail and retries), so the step would never fire: refused at build, as `on: miss` is.
+// `on: failure` reports on a step of an op's step list (the nearest unconditional one before it,
+// spec §5), and a pool's `then` steps follow none: every one fires for every job drained, and a
+// failed hand-off is the target's drop. Refused at build, as a cache's then step on failure is,
+// with a message that says where failure steps do fire.
 TEST_CASE("an on-failure then step on a worker pool is refused", "[graph]") {
   const auto built = Graph::build(
       pool_handing_on({Step{.to = "done_q", .op = "publish", .on = StepCondition::failure}}));
   REQUIRE_FALSE(built.has_value());
   REQUIRE(built.error().message ==
           "node 'w': a worker pool's then steps fire for every job it drains "
-          "(on: failure: a job reports no failure before phase 3)");
+          "(on: failure: a job's then steps follow no step to report on; failure steps fire in an "
+          "op's step list)");
 }
 
 // Parallel is fine on a pool (unlike a blob store's event): nobody waits for either, but a
@@ -3045,16 +3099,18 @@ TEST_CASE("a blob store's then step carries every write and no read", "[graph]")
   REQUIRE(built->then_fraction(store, step, "read") == 0.0);
 }
 
-// `on: failure` names a failed request's branch. An event reports no failure before phase 3 (S3
-// delivers at least once and the model never loses a notification), so the step would never fire:
-// refused at build, as `on: miss` is.
+// `on: failure` reports on a step of an op's step list (the nearest unconditional one before it,
+// spec §5), and a blob store's events follow none: each fires for every write stored (S3 delivers
+// at least once). Refused at build, as a cache's then step on failure is, with a message that says
+// where failure steps do fire.
 TEST_CASE("an on-failure then step on a blob store is refused", "[graph]") {
   const auto built = Graph::build(
       store_with_notifications({Step{.to = "svc", .op = "notify", .on = StepCondition::failure}}));
   REQUIRE_FALSE(built.has_value());
   REQUIRE(built.error().message ==
           "node 'store': a blob store's then steps fire for every write it stores "
-          "(on: failure: an event reports no failure before phase 3)");
+          "(on: failure: an event follows no step to report on; failure steps fire in an op's "
+          "step list)");
 }
 
 // `mode` orders the calls a request waits for (sequential latencies add, parallel ones overlap).

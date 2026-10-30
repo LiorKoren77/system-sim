@@ -1556,8 +1556,12 @@ void Simulation::require_scenario_step(SimTime dt) const {
 // further down an op's steps: a chain of k lossy steps settles in about k + 1 passes more. An `on:
 // failure` step reads the same fractions the other way round (it is sent 1 − d of the step it
 // reports on: HopBlocks' failure blocks), so its flow starts at 0 in the first pass and rises as
-// the losses arrive; it feeds nothing back (its own losses fail no request), so it settles one
-// pass after the d it reads and makes no loop of its own. A loss
+// the losses arrive; its own losses fail no request, so it settles one pass after the d it reads.
+// It closes no loop of calls (one that calls back into its own op, an unbounded retry, is refused
+// at build: graph::Graph::check_failure_steps), but one that publishes to a message queue whose
+// pool calls the op again is a loop of flow: every failure is retried, and fails again with the
+// same share, so the retried flow is a geometric series of ratio 1 − d that settles while d > 0
+// (and climbs for ever once d = 0, a loop of gain 1: estimate's no-steady-state warning). A loss
 // that feeds back on itself (a node called several times by one op, [a, a, a, a, a], whose later
 // calls are thinned by its own loss, or two ops whose losses load each other's nodes) is a
 // fixed-point iteration of its own, d = f(d): the more a delivers, the more its later calls are

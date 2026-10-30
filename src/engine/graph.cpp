@@ -500,8 +500,9 @@ void apply_database_keys(ResolvedNode& node) {
 // store serves (Graph::then_fraction). Three step keys would ask for something an event never does,
 // so the scenario is told what the steps do instead of being run without them:
 //  - `on: miss`: a blob store never misses (only a cache can take a miss step);
-//  - `on: failure`: an event reports no failure before phase 3 (failed or retried notifications
-//    are ignored), so the step would never fire;
+//  - `on: failure`: a failure step reports on a step of an op's step list (the nearest
+//    unconditional one before it, Graph::resolve_service_hop), and an event follows no such step
+//    (it fires for every write stored), so the step would have nothing to report on;
 //  - `mode: parallel`: a mode orders the calls a request waits for, and nobody waits for an
 //    event. (`mode: sequential` is the model's default, so only the loader, which sees the key
 //    written, can refuse it: config's read_blob_store_keys.)
@@ -514,7 +515,8 @@ void apply_database_keys(ResolvedNode& node) {
   }
   if (has_then_step_on(spec, model::StepCondition::failure)) {
     return refused(
-        "fire for every write it stores (on: failure: an event reports no failure before phase 3)");
+        "fire for every write it stores (on: failure: an event follows no step to report on; "
+        "failure steps fire in an op's step list)");
   }
   if (has_parallel_then_step(spec)) {
     return refused(
@@ -528,8 +530,8 @@ void apply_database_keys(ResolvedNode& node) {
 // job (Graph::then_fraction is 1, whatever op the queue brought). Two step keys ask for something a
 // job never does, so they are refused in the blob store's words (invalid_blob_store):
 //  - `on: miss`: a pool has no lookup to miss (only a cache can take a miss step);
-//  - `on: failure`: a job reports no failure before phase 3 (failed or retried jobs are ignored),
-//    so the step would never fire.
+//  - `on: failure`: a pool's `then` steps follow no step a failure step could report on (each
+//    fires for every job drained; a failed hand-off is the target's drop), as a blob store's.
 // A `mode: parallel` group is fine, unlike a blob store's: nobody waits for a pool (the hop from
 // its queue is asynchronous), so the mode changes no one's latency, and a scenario may group a
 // transcoder's renditions beside its completion message as the book draws them.
@@ -543,7 +545,9 @@ void apply_database_keys(ResolvedNode& node) {
     return refused("(on: miss needs a cache)");
   }
   if (has_then_step_on(spec, model::StepCondition::failure)) {
-    return refused("(on: failure: a job reports no failure before phase 3)");
+    return refused(
+        "(on: failure: a job's then steps follow no step to report on; failure steps fire in an "
+        "op's step list)");
   }
   return std::nullopt;
 }
@@ -2155,7 +2159,11 @@ std::expected<Graph, EngineError> Graph::build(model::Scenario scenario) {
   // waits for may lie on one of its cycles.
   const detail::ForwardedSteps calls = detail::forwarder_steps(graph);
   graph.async_hops_ = detail::async_hops(graph, calls);
-  if (auto checked = graph.check_backend_calls(detail::call_components(graph, calls)); !checked) {
+  const auto components = detail::call_components(graph, calls);
+  if (auto checked = graph.check_backend_calls(components); !checked) {
+    return std::unexpected{checked.error()};
+  }
+  if (auto checked = graph.check_failure_steps(components); !checked) {
     return std::unexpected{checked.error()};
   }
   return graph;
@@ -2751,6 +2759,33 @@ Graph::Result Graph::check_backend_calls(const detail::CallComponents& component
       return std::unexpected{EngineError{"node '" + resolved.spec.id + "': " + role + " '" +
                                          nodes_[*resolved.backend].spec.id +
                                          "' closes a call cycle"}};
+    }
+  }
+  return {};
+}
+
+// An `on: failure` step whose call lies on a call cycle with the op it reports from (web.write ->
+// retrier.retry -> web.write) sends every failed request back into the op that failed it: a retry
+// with no bound, each retry that fails again retried again, with no limit and no backoff. Real
+// systems bound it (ch. 10's notification system retries a failed notification a few times, then
+// gives up), and the model's bounded forms are a client's `retries` and a pool's (phase 3). The
+// call-cycle search would make the hop asynchronous and the run would show a drop rate with no
+// word on its cause, so the scenario is refused instead, the components asked as for the backend
+// hops (check_backend_calls). A failure step that publishes to a message queue ends the call at the
+// queue (its deliveries are asynchronous, detail::consumer_deliveries) and is no call cycle.
+Graph::Result Graph::check_failure_steps(const detail::CallComponents& components) const {
+  for (std::size_t node = 0; node < nodes_.size(); ++node) {
+    for (const auto& [op, hops] : service_hops_[node]) {
+      for (const ServiceHop& hop : hops) {
+        if (!hop.reports_on || !components.on_common_cycle({node, op}, {hop.target, hop.op})) {
+          continue;
+        }
+        return std::unexpected{EngineError{"node '" + nodes_[node].spec.id +
+                                           "': an on: failure step to '" +
+                                           nodes_[hop.target].spec.id +
+                                           "' closes a call cycle (an unbounded retry: use the "
+                                           "client's retries)"}};
+      }
     }
   }
   return {};

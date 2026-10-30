@@ -1050,7 +1050,8 @@ void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_
     for (const graph::ServiceHop& hop : g.service_hops(from, op)) {
       if (hop.fraction <= 0.0) continue;  // never taken (a cache that always hits)
       // An `on: failure` step is sent what the step it reports on failed (graph::ServiceHop), and
-      // on paper nothing fails: it adds nothing to the load.
+      // on paper nothing fails: it adds nothing to the load (its target's check line says so when
+      // nothing else reaches it: failure_fed_note).
       if (hop.reports_on) continue;
       const auto link = g.demand_link(from, hop.target);
       if (!link) continue;  // Graph::build proved it exists; skip defensively
@@ -1621,6 +1622,33 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
          " total capacity  (no steady state, red)";
 }
 
+// A node only `on: failure` steps reach on paper: its paper load is 0 (nothing fails there, see
+// forward_steps), yet it carries whatever the steps it reports on fail, which only `run` and
+// `estimate` measure. A bare "(0%, green)" would read as an idle node, so its line says so.
+constexpr std::string_view failure_fed_note =
+    " (fed by on: failure steps only: sized by run/estimate)";
+
+// Is `target` sent an `on: failure` step (graph::ServiceHop::reports_on) by any node's op?
+[[nodiscard]] bool is_failure_step_target(const graph::Graph& g, std::size_t target) {
+  for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+    for (const auto& op : g.nodes()[node].spec.ops | std::views::keys) {
+      for (const graph::ServiceHop& hop : g.service_hops(node, op)) {
+        if (hop.reports_on && hop.target == target) return true;
+      }
+    }
+  }
+  return false;
+}
+
+// What node `i`'s check line ends with: the unknown hit ratio's upper bound, and the failure-fed
+// note for a node the paper load sends nothing that failure steps reach.
+[[nodiscard]] std::string check_notes(const graph::Graph& g, std::size_t i, const PaperLoad& load,
+                                      const std::vector<bool>& upper_bound) {
+  std::string note{upper_bound[i] ? unknown_hit_ratio_note : std::string_view{}};
+  if (load.totals[i] == 0.0 && is_failure_step_target(g, i)) note += failure_fed_note;
+  return note;
+}
+
 // One node's check line: the head and its verdict, or, for a node part or all of whose load the
 // paper load could not follow (blocked_on_the_way), partial_check's lower bound or mark.
 [[nodiscard]] std::string check_line(const graph::Graph& g, std::size_t i, const PaperLoad& load,
@@ -1628,7 +1656,7 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
                                      std::span<const model::NodeType> blocked) {
   const auto& node = g.nodes()[i];
   if (!load.converged && load.unbounded[i]) return unbounded_check(node);
-  const std::string note{upper_bound[i] ? unknown_hit_ratio_note : std::string_view{}};
+  const std::string note = check_notes(g, i, load, upper_bound);
   if (!blocked.empty()) return partial_check(node, load.totals[i], load.by_op[i], blocked) + note;
   const auto loads = database_loads(node, load.by_op[i]);
   return check_details(node, load.totals[i], load.by_op[i], loads) + database_check(node, loads) +
