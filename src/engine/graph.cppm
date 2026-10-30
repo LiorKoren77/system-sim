@@ -473,6 +473,20 @@ class Graph {
   // or lists without steps.
   [[nodiscard]] std::span<const ServiceHop> service_hops(std::size_t node,
                                                          std::string_view op) const;
+  // Service discovery (phase 3 spec §8.1; book ch. 12: the client asks the discovery, ZooKeeper,
+  // for a server, then talks to the server it was handed). A DISCOVERY LOOKUP is a step to a
+  // service_discovery node asking `lookup`; it is not ServiceHop::lookup, which is the position of
+  // the CACHE lookup an `on: miss` step follows. Does node `node`, handling `op`, ask a discovery
+  // for `target`'s address before it calls it: is there a discovery lookup anywhere before its
+  // first step to `target`? The engine's failover rule reads it: a node_down of some of `target`'s
+  // replicas holds such callers on the dead ones (engine::FaultSchedule::dead_share).
+  [[nodiscard]] bool lookup_before(std::size_t node, std::string_view op, std::size_t target) const;
+  // The discovery whose lookup comes last before step `position` of (node, op) (a position in
+  // service_hops), the one that handed out the address that step calls; empty when no discovery
+  // lookup comes before it.
+  [[nodiscard]] std::optional<std::size_t> discovery_before_step(std::size_t node,
+                                                                 std::string_view op,
+                                                                 std::size_t position) const;
   // The share of the requests of `op` arriving at cache `node` that the cache passes on to its
   // backend (spec §17 entry 7), as the same op (for a CDN: 1 - h of a read, to its origin, spec §18
   // entry 10; it takes no writes):

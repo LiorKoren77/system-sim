@@ -57,11 +57,15 @@ import simsys.workload;
 
 export namespace simsys::behaviours {
 
-// Demand a node sends to one neighbour over one link during a step.
+// Demand a node sends to one neighbour over one link during a step. `doomed` is demand sent to
+// the neighbour's DEAD replicas, apart from `flow`: the requests a service discovery still hands
+// a dead address during a failover (engine::FaultSchedule's header; detail::HopBlocks::fail_over),
+// which the neighbour books as demand and drops and never serves. Empty outside a failover.
 struct Outgoing {
   std::size_t target{};
   std::size_t link{};
   flow::Flow flow{};
+  flow::Flow doomed{};
 };
 
 // What a behaviour does with one step's flow: what it forwards (one Outgoing per (target, link),
@@ -244,6 +248,8 @@ namespace simsys::behaviours::detail {
 // (target, link), so the engine adds them in the same order on every run; and what a node that
 // rejects nothing accepts of a step's flow, all of it. Defined further down; declared here for
 // the route templates below.
+[[nodiscard]] Outgoing& outgoing_towards(std::vector<Outgoing>& outgoing, std::size_t target,
+                                         std::size_t link);
 [[nodiscard]] flow::Flow& flow_towards(std::vector<Outgoing>& outgoing, std::size_t target,
                                        std::size_t link);
 void sort_by_destination(std::vector<Outgoing>& outgoing);
@@ -260,6 +266,13 @@ struct Hop {
   // notification (graph::Graph::is_async_hop). It forwards flow but adds no latency and fails no
   // request.
   bool asynchronous;
+  // The service discovery whose lookup handed out the address this hop calls (a step to it asking
+  // `lookup` comes before this one: graph::Graph::discovery_before_step); empty for a hop whose
+  // address the caller had (a load balancer in front, or no registry at all).
+  std::optional<std::size_t> discovery{};
+  // The share of this hop's requests the discovery sends to the target's dead replicas this step
+  // (HopBlocks::fail_over), lost there; 0 outside a failover, and always on a hop without one.
+  double dead_share{0.0};
 };
 
 // The hops a request takes together or skips together: one unconditional step (fraction 1);
@@ -337,6 +350,16 @@ class HopBlocks {
   // delivered fraction all read the new share, so a cold cache sends more to its store, waits for
   // it more often and fails more of its reads when the store does.
   void warm(std::size_t cache, double factor);
+
+  // Every hop to `target` whose address `discovery` handed out (Hop::discovery) sends the share
+  // `share` of its requests to the target's dead replicas from now on: the engine's call, every
+  // step, while a node_down of the target is inside the discovery's failover window
+  // (engine::FaultSchedule::dead_share; 0 again once it closes). A hop's dead share is sent
+  // (forward: as Outgoing::doomed), and fails: it multiplies the hop's delivered fraction by
+  // 1 − share (answered_by), so it thins the steps after it and the op's delivered fraction like a
+  // loss at the target, and it adds no latency (a lost request has none; the share that reaches
+  // the survivors waits there as usual).
+  void fail_over(std::size_t target, std::size_t discovery, double share);
 
   // std::span<const Block> rather than `const std::vector<Block>&`: a span can also say "no
   // blocks" (an empty view) without a static empty vector to point at.
@@ -450,9 +473,17 @@ class HopBlocks {
   [[nodiscard]] static double survival(const Block& block, FractionLookup auto&& downstream) {
     double every_hop_answers = 1.0;
     for (const Hop& hop : block.hops) {
-      if (!hop.asynchronous) every_hop_answers *= downstream(hop.target, hop.op);
+      if (!hop.asynchronous) every_hop_answers *= answered_by(hop, downstream);
     }
     return 1.0 - block.fraction * (1.0 - every_hop_answers);
+  }
+
+  // d, the share of a hop's requests that come back answered: the target's delivered fraction
+  // (`downstream`), times 1 − the dead share during a failover (fail_over). Outside one the
+  // target's fraction exactly, untouched by a multiplication.
+  [[nodiscard]] static double answered_by(const Hop& hop, FractionLookup auto&& downstream) {
+    const double delivered = downstream(hop.target, hop.op);
+    return hop.dead_share > 0.0 ? (1.0 - hop.dead_share) * delivered : delivered;
   }
 
   // Π survival over the parallel blocks of an op: the share its parallel group lets through
@@ -540,10 +571,21 @@ class HopBlocks {
     for (const Hop& hop : block.hops) {
       // rate × factor × fraction first, the survivals last: on a path with no losses every
       // survival is exactly 1, so the product is rate × factor × fraction to the last bit.
-      flow_towards(outgoing, hop.target, hop.link)
-          .add(hop.op, Rate{requests_per_s * hop.factor * block.fraction * alive_in_block});
-      if (!hop.asynchronous) alive_in_block *= downstream(hop.target, hop.op);
+      send_hop(outgoing, hop, requests_per_s * hop.factor * block.fraction * alive_in_block);
+      if (!hop.asynchronous) alive_in_block *= answered_by(hop, downstream);
     }
+  }
+
+  // What a hop is sent goes to its target, the dead share of it (fail_over) apart, as doomed
+  // demand: requests that reach the node and are lost there.
+  static void send_hop(std::vector<Outgoing>& outgoing, const Hop& hop, double requests_per_s) {
+    if (hop.dead_share <= 0.0) {
+      flow_towards(outgoing, hop.target, hop.link).add(hop.op, Rate{requests_per_s});
+      return;
+    }
+    Outgoing& out = outgoing_towards(outgoing, hop.target, hop.link);
+    out.flow.add(hop.op, Rate{requests_per_s * (1.0 - hop.dead_share)});
+    out.doomed.add(hop.op, Rate{requests_per_s * hop.dead_share});
   }
 
   // The block's legs a request waits for, added up (two link legs plus the downstream's
@@ -673,6 +715,13 @@ class ServiceBehaviour {
   // on (detail::HopBlocks::warm): the engine's call while that cache warms back after a
   // cache_flush, the cache-aside case of the warm-up (the service, not the cache, fetches a miss).
   void set_hit_ratio_factor(std::size_t cache, double factor) { hops_.warm(cache, factor); }
+
+  // The share of the requests sent to `target` through a lookup of `discovery` that go to its
+  // dead replicas from now on (detail::HopBlocks::fail_over): the engine's call during a failover
+  // (engine::FaultSchedule's header), 0 outside one.
+  void fail_over(std::size_t target, std::size_t discovery, double share) {
+    hops_.fail_over(target, discovery, share);
+  }
 
  private:
   void add_hops(const graph::Graph& g, const std::string& op);
@@ -2321,6 +2370,12 @@ class WsGatewayBehaviour {
     service_.set_hit_ratio_factor(cache, factor);
   }
 
+  // Forwarded too: a gateway's steps that call a node a discovery handed out send the dead share
+  // to its dead replicas during a failover (ServiceBehaviour::fail_over).
+  void fail_over(std::size_t target, std::size_t discovery, double share) {
+    service_.fail_over(target, discovery, share);
+  }
+
  private:
   [[nodiscard]] double admit(double connects, double dt_s);
   [[nodiscard]] double steady_admit(double connects);
@@ -2341,7 +2396,8 @@ class WsGatewayBehaviour {
 // value (no heap allocation, no virtual calls, copyable). Phase 2a appended the load
 // balancer, the rate limiter and the cache, phase 2b the SQL database and the CDN, phase 2c the
 // blob store, the message queue, the worker pool, the external sink and the kv cluster, phase 3 the
-// websocket gateway; later tasks append the rest (service_discovery, ...).
+// websocket gateway (a service discovery needs none: it runs as a ServiceBehaviour); later tasks
+// append the rest (notification_fanout, frontier).
 // C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
 // it holds) dispatched with std::visit. Closed: adding an alternative means editing this
 // line, and every std::visit that does not handle it then fails to compile.
@@ -2374,12 +2430,18 @@ namespace detail {
 
 // The outgoing flow towards (target, link), created on first use. std::ranges::find_if:
 // the predicate form of the ranges algorithms introduced in ClientBehaviour::response.
-[[nodiscard]] flow::Flow& flow_towards(std::vector<Outgoing>& outgoing, std::size_t target,
-                                       std::size_t link) {
+[[nodiscard]] Outgoing& outgoing_towards(std::vector<Outgoing>& outgoing, std::size_t target,
+                                         std::size_t link) {
   const auto found = std::ranges::find_if(
       outgoing, [&](const Outgoing& o) { return o.target == target && o.link == link; });
-  if (found != outgoing.end()) return found->flow;
-  return outgoing.emplace_back(Outgoing{.target = target, .link = link}).flow;
+  if (found != outgoing.end()) return *found;
+  return outgoing.emplace_back(Outgoing{.target = target, .link = link});
+}
+
+// Its flow alone: what every behaviour but a failing-over service sends.
+[[nodiscard]] flow::Flow& flow_towards(std::vector<Outgoing>& outgoing, std::size_t target,
+                                       std::size_t link) {
+  return outgoing_towards(outgoing, target, link).flow;
 }
 
 // Sorted by (target, link) so the engine adds flows in the same order on every run.
@@ -2472,6 +2534,18 @@ void detail::HopBlocks::warm(std::size_t cache, double factor) {
   }
 }
 
+// Only the hops a lookup of `discovery` addressed: a hop to the same target without one keeps its
+// dead share at 0 (the balancer in front of it routes around the dead replicas).
+void detail::HopBlocks::fail_over(std::size_t target, std::size_t discovery, double share) {
+  for (auto& blocks : blocks_by_op_ | std::views::values) {
+    for (Block& block : blocks) {
+      for (Hop& hop : block.hops) {
+        if (hop.target == target && hop.discovery == discovery) hop.dead_share = share;
+      }
+    }
+  }
+}
+
 // ---- ServiceBehaviour ----
 
 // Only `ops` steps: a service has no `then` (loader-enforced, see the class comment).
@@ -2515,6 +2589,7 @@ void ServiceBehaviour::add_hops(const graph::Graph& g, const std::string& op) {
     }
     block_of_hop[position] = static_cast<std::size_t>(block - blocks.data());
     block->hops.push_back(hop_of(g, op, resolved));
+    block->hops.back().discovery = g.discovery_before_step(self_, op, position);
   }
 }
 

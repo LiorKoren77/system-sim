@@ -121,6 +121,7 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `blob_store` | every op, counting megabytes (phase 2c, see `capacity` in [Node (common keys)](#node-common-keys)): its queue waits for whole objects, a write (`write_ops`) is answered at its last byte, a read at its first megabyte; `then` steps as asynchronous event notifications (see [Node types](#node-types)). A store whose `capacity` is a request rate (`capacity: 1k/s`) counts **requests** instead, as a service does: unsized ops are accepted and each takes the type's 40 ms (`c=40` at 1k/s) |
 | `id_generator` | as a `service` whose capacity and service time its `algorithm` supplies, see [`id_generator`](#id_generator) |
 | `search_index` | as a `service` with no steps and the type's 5k/s and 5 ms unless stated; `build_interval` stored and printed, see [`search_index`](#search_index) (phase 2c) |
+| `service_discovery` | as a `service` answering `lookup` at the type's 50k/s and 0.5 ms unless stated; a `node_down` of a node its callers look up holds them on the dead replicas for `failover`, see [`service_discovery`](#service_discovery) (phase 3) |
 | `message_queue` | the broker's append, every message copied to each consumer group, the publisher answered at the append (phase 2c, see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
 | `worker_pool` | M/M/c over consumption, `workers / cost` jobs a second, its room its queue's `retention`; its `then` steps fire for every job it drains, nobody waiting for them (phase 2c, same section) |
 | `external_sink` | a third party's API: a queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) that fails `failure_rate` of what it serves, counted as drops (phase 2c, see [Node types](#node-types)) |
@@ -131,20 +132,20 @@ Everything else is refused before the first step, with exit code 1:
 
 | what | message | runs from |
 |---|---|---|
-| `service_discovery` | `node 'x' has type 'service_discovery', which run/estimate do not support yet (phase 3)` | 3 |
-| `notification_fanout`, `frontier` | the same message | 3 |
+| `notification_fanout`, `frontier` | `node 'x' has type 'frontier', which run/estimate do not support yet (phase 3)` | 3 |
 | a `ws_gateway` that no `connect` op reaches and that states no `connections` | `node 'x': a ws_gateway needs a client op named 'connect' or a fixed 'connections'` | now, once it has one |
 | a `ws_gateway` with both | `node 'x': a ws_gateway takes a 'connect' op or a fixed 'connections', not both` | now, with one |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
 | a `cache_flush` on a cache with a fixed `hit_ratio` and no `keys` | `node 'x': cache_flush needs keys (a fixed hit ratio is back once keys requests have refilled it)` | now, once it states `keys` |
 | a `cache_flush` on a cache whose hit ratio is 1 | `node 'x': cache_flush on a cache that always hits (hit ratio 1): it has no miss path to warm through` | now, with a hit ratio below 1 |
 
-The type message names the phase that plans the type's model, phase 3 for all three. The type
+The type message names the phase that plans the type's model, phase 3 for both. The type
 check runs over the whole file first, and names the first node
 in file order whose type cannot run; only then are the nodes of runnable types checked (a CDN's
 `keys`, a gateway's level), in file order: google-drive is refused at its `ws_gateway`,
 `long_poll`, which states no level yet (`node 'long_poll': a ws_gateway needs a client op named
-'connect' or a fixed 'connections'`), chat-system at its `service_discovery`, notification-system at its
+'connect' or a fixed 'connections'`), chat-system at its `ws_gateway`, `chat_servers`, for the
+same reason (its `service_discovery` runs since phase 3), notification-system at its
 `notification_fanout` and web-crawler at its `frontier`. Of the 14 shipped scenarios ten run
 (`exit` is `simsys run`'s exit code, Release build):
 
@@ -385,7 +386,7 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every **write** the store serves (an op in its `write_ops`; not one it drops) sends `factor` requests of the step's op to its target, and a read sends nothing (S3 notifies on ObjectCreated and ObjectRemoved, never on a GET: 1000 views/s of a video start no transcode; notifying on reads is phase 3). They are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. A step `on: miss` (`node 'store': a blob store's then steps fire for every write it stores (on: miss needs a cache)`) or `on: failure` (`... (on: failure: an event reports no failure before phase 3)`) is refused, and so is any `mode` (`node 'store': a blob store's then steps are event notifications nobody waits for (mode orders the calls a request waits for)`); an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, the delivery delay (an event arrives after the link's latency), failed notifications |
 | `search_index` | `build_interval` (positive duration) | read and run (phase 2c), see [`search_index`](#search_index); `build_interval` printed, not modelled |
 | `ws_gateway` | `max_connections` (count), `heartbeat` (duration), `fanout` (avg recipients per message, ≥ 1), `connections` (count: a fixed level), `session` (duration), `reconnect_within` (duration), `ops` | read and run (phase 3), see [`ws_gateway`](#ws_gateway); `reconnect_within` printed and stored for the reconnect storm (phase 3 Task 15) |
-| `service_discovery` | `failover` (duration) | ignored; phase 3 |
+| `service_discovery` | `failover` (positive duration) | read and run (phase 3), see [`service_discovery`](#service_discovery): a service answering `lookup`; `failover` (default 10 s, chosen) is how long its callers stay on a dead replica after a `node_down`; `node 'disc': failover must be positive`; on any other type `node 'api': key 'failover' is not valid for type 'service'` |
 | `id_generator` | `algorithm` `snowflake|ticket_server|uuid` (required) | read and run (phase 2b), see [`id_generator`](#id_generator) |
 | `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) | read and run (phase 2c): a third party's API (ch. 10's APNs, FCM, SMS and e-mail providers), a leaf queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) whose served requests fail at `failure_rate` f (default 0; outside [0, 1]: `node 's': failure_rate must be between 0 and 1`): `dropped += f × served`, `drain = (1 − f) × served`, so 500/s at f = 0.02 is answered 490/s and the failures count in the node's drop rate, never as rejections. `politeness` (a positive rate) is printed by `explain` as `politeness=1/s (not modelled: phase 3)`: it needs per-host state. `then` and `ops` stay refused; a client's `retries` and a [worker pool's](#message_queue-and-worker_pool) send a failure again (the sink's drop rate leaves out the share of its drops that came from retrying pools) |
 | `notification_fanout` | `channels` (map name → node id), `dedup` (0–1), `then` | `then` checked as [steps](#steps) (`node 'fan': step refers to unknown node 'ghost'`); the others ignored; phase 3 |
@@ -987,6 +988,56 @@ a user is on (the service-discovery hand-off of ch. 12, phase 3 Task 13: every r
 equal share), the reconnect storm (Task 15), users who vanish without a disconnect (every session
 ends at rate `1 / session`) and the bytes of a frame.
 
+### `service_discovery`
+
+Book ch. 12, "Design a chat system" (phase 3 spec §8.1). The chat client does not reach a chat
+server through a load balancer: it asks the **service discovery** (ZooKeeper) for one, and then
+talks to the server it was handed. A service discovery is **served like a service**: `replicas`
+copies of the type's 50k/s (spec: a lookup is a small read from an in-memory registry, so one
+registry answers a whole tier) and 0.5 ms (the latency table's round trip within the data centre)
+unless the scenario states its own `capacity` and `latency`; `c = 50,000/s × 0.5 ms = 25` servers
+by Little's law. It answers the **`lookup`** op its callers send, and a lookup is a step like any
+other: it adds the discovery's sojourn and the link's round trip to the caller's response.
+
+**The lookup rule.** An op reaches a node *through a lookup* when its step list has a step to a
+`service_discovery` asking `lookup` anywhere before its (first) step to that node:
+`api: {ops: {call: [{to: disc, op: lookup}, {to: svc, op: call}]}}` looks `svc` up; `[{to: svc,
+op: call}, {to: disc, op: lookup}]` does not (the caller had the address already), and neither does
+a step asking a plain service for an op named `lookup` (a cache's lookup is the cache's business).
+The rule is per op: another op of `api` that calls `svc` without a lookup is not held.
+
+**`failover`** (a positive duration, default **10 s, chosen, not from the book**: a registry learns
+of a death when the dead server's session or health check times out, which ZooKeeper's session
+timeouts and the usual health-check settings put at about ten seconds; filled in by the loader, so
+`explain` ends the line with `failover=10s`). When a `node_down` takes r of the R replicas of a
+node that some op reaches through a lookup, the registry still hands out the dead replicas for
+`min(failover, for)` from the fault's start: the share **r / R of that op's requests** is sent to
+them and **lost at the node**, where it counts as demand and as drops, never as drain, on top of
+whatever the survivors cannot take. The other (R − r) / R reach the survivors, which keep the load
+per copy they had (their capacity is (R − r) / R too). When the window closes, every request goes
+to the survivors, which then carry R / (R − r) times the load per copy and queue. The probe of
+`tests/theory/test_faults.cpp`: 1k/s through `[{to: disc, op: lookup}, {to: svc, op: call}]` into
+4 replicas of 1k/s at 1 ms, one replica down from 10 s for 30 s, `failover: 10s`: for 10 s 250/s
+are lost (svc: demand 1000/s, dropped 250/s, drain 750/s, rho 0.25), then nothing is lost and rho is
+1/3 (1.5 ms instead of 1.33 ms), and when the replica is back rho is 0.25 again. A node_down of
+**every** replica makes the share 1: for the window each looked-up request is lost at once rather
+than waiting in the node's room for it to come back.
+
+No failover without a lookup: a `node_down` of a node reached directly (a load balancer in front,
+or no registry) just removes capacity, and the balancer spreads the load over the survivors from
+the first step. Nor for a `capacity` fault (every copy stays alive), a `dc_down` (its links are
+cut), or a `sql_db`'s or `kv_cluster`'s partial `node_down` (their clients find the live copies by
+the database's own replication and quorums). The fault's block says what the failover cost (see
+[Faults](#faults)): `after:    no backlog to drain, failover 10s: 2.5k requests sent to the dead
+replica`.
+
+Ignored: the registry's own availability (a `node_down` of the discovery itself is a plain loss of
+its capacity: its lookups queue or are dropped like any service's),
+partial knowledge (every caller learns of the death at the same moment, `failover` after it), a
+client sending a failed request to another server (that is the client's `retries`, which see the
+lost share like any loss), and the link's delay for the dead share (whether a request goes to a
+dead replica is decided when it is sent).
+
 ### `message_queue` and `worker_pool`
 
 Book ch. 1 ("Message queue"), the transcoding queue of ch. 14 and the notification queue of
@@ -1547,7 +1598,7 @@ changes the numbers the node's queue is built from, and nothing else:
 
 | kind | while it lasts |
 |---|---|
-| `node_down` | the node's capacity × (R − r) / R, r of its R replicas down; every replica down: capacity 0, so nothing drains, the room fills to `queue_limit` and the rest is dropped, and the backlog drains when the fault ends. A request waiting in that room waits for the node to come back, then for the backlog ahead of it at the node's own capacity: `(at + for − now) + backlog / capacity` (10 s left and 40 requests at 1k/s: 10.04 s), so a client `timeout` counts it timed out and a step that delivered nothing weighs no latency (a node whose `capacity` is 0 by configuration never comes back: its ops stay `unavailable`). On a `sql_db` the two kinds of copy apart: `primary` stops the primaries (the writes wait and are dropped, the reads go on at the replicas), `replicas: r` leaves its N − 1 read replicas (N − 1 − r) / (N − 1) of their capacity and the primary whole. On a `kv_cluster` r of its machines are down: the survivors keep their own load, the coordinator sends nothing to a down machine, and a request whose key had j of its N replicas there is answered by its quorum among the N − j live ones, or lost when N − j is below W (writes) or R (reads) |
+| `node_down` | the node's capacity × (R − r) / R, r of its R replicas down (a node some op reaches through a service discovery's lookup also loses r / R of that op's requests for the discovery's `failover`: see [`service_discovery`](#service_discovery)); every replica down: capacity 0, so nothing drains, the room fills to `queue_limit` and the rest is dropped, and the backlog drains when the fault ends. A request waiting in that room waits for the node to come back, then for the backlog ahead of it at the node's own capacity: `(at + for − now) + backlog / capacity` (10 s left and 40 requests at 1k/s: 10.04 s), so a client `timeout` counts it timed out and a step that delivered nothing weighs no latency (a node whose `capacity` is 0 by configuration never comes back: its ops stay `unavailable`). On a `sql_db` the two kinds of copy apart: `primary` stops the primaries (the writes wait and are dropped, the reads go on at the replicas), `replicas: r` leaves its N − 1 read replicas (N − 1 − r) / (N − 1) of their capacity and the primary whole. On a `kv_cluster` r of its machines are down: the survivors keep their own load, the coordinator sends nothing to a down machine, and a request whose key had j of its N replicas there is answered by its quorum among the N − j live ones, or lost when N − j is below W (writes) or R (reads) |
 | `capacity` | capacity × `factor`; a request still takes its service time. Every queue of the node is derated, a leaky-bucket limiter's leak (`limit`) included: `limit: 50/s` at `factor: 0.5` passes 25/s |
 | `latency_spike` | service time + `extra`, so the node's servers drain c / (s + extra) a second. On a node sized by its defaults the servers are few and short: a load balancer's c = 5 at 50 µs (100k/s) drains 5 / 1.05 ms = 4.76k/s under a 1 ms spike, 95 % of its capacity gone |
 | `traffic_spike` | the client's rate × `factor`, exactly as a `spikes` entry on its rate curve |
@@ -1711,18 +1762,25 @@ the node with the most work left (`s backlog drained in 0.2s`). Then what the re
 the twin's from `at` to the recovery, each only when there was some: `retries added 5.968k
 attempts`, the attempts the clients whose paths reach the faulted part (a `traffic_spike`: its
 client) sent beyond their offered load, and `pool w re-published 999 jobs` (`pools v, w ...` for
-several), the jobs the retrying pools that call into it put back on their queues.
+several), the jobs the retrying pools that call into it put back on their queues. A `node_down` on
+a node that some op reaches through a [service discovery](#service_discovery) adds what its
+failover cost, the requests sent to the dead replicas from `at` to the recovery (they are in `lost`
+too): `failover 10s: 2.5k requests sent to the dead replica` (`replicas` when the fault took
+several).
 
 In `run --report json` each fault's `during` has `lost_unit` (`"requests"`, `"MB"` or
 `"attempts"`) and `lost_requests` (the requests lost for good; `null` when no retries are
 involved), and its `after` has `retries_added_attempts` and `pool_republished_jobs` (`null` when
-the text prints none).
+the text prints none) and, in a scenario with a `service_discovery`, `failover_lost` (the requests
+sent to dead replicas; `null` when the fault has no failover). A scenario without a discovery has
+no `failover_lost` key, as its report had none before.
 
 `recovery` is the start of the first step after the fault clears (a `cache_flush`: from the flush)
 at which every client op's p99 (the step's lognormal fit) and every node's rho are within 1 % of
 the twin's same step, with how long after the end of the fault (`after the flush`) that was, or
 `not recovered by the end of the run`. Durations in the body are seconds with at most one decimal
-(`0.2s`, `10s`), but `over its max for`, a duration as the tables print one (`300ms`). The
+(`0.2s`, `10s`), but `over its max for`, a duration as the tables print one (`300ms`), and a
+`failover`, as `explain` prints it. The
 criterion is "back where it would have been", not "the SLOs pass again": an SLO with room to spare
 passes while the backlog still drains, and one that fails without the fault never passes.
 

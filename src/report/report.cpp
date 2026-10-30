@@ -1011,11 +1011,23 @@ constexpr std::string_view op_title =
   return without_residue(figure) > 0.0;
 }
 
-// The follow-on, then what the retries added, each when there was some (ch. 1's retry storm):
+// A node_down's failover behind a service discovery (engine::FaultSchedule's header), when one
+// applied: the discovery's window and the requests it still sent to the dead replicas,
+// `failover 10s: 2.5k requests sent to the dead replica` (`replicas` when the fault took several).
+[[nodiscard]] std::string failover_text(const engine::FaultAfter& after) {
+  const std::string_view dead = after.dead_replicas == 1 ? "the dead replica" : "the dead replicas";
+  return "failover " + format_duration(seconds(after.failover)) + ": " +
+         amount_text(without_residue(*after.failover_lost), "requests") + " sent to " +
+         std::string{dead};
+}
+
+// The follow-on, then what the failover sent to dead replicas, then what the retries added, each
+// when there was some (ch. 1's retry storm, ch. 12's registry that learns of a death late):
 // `backlog drained in 0.1s, retries added 5.968k attempts, pool w re-published 999 jobs`.
 [[nodiscard]] std::string after_text(const engine::FaultRecord& r) {
   std::vector<std::string> parts{follow_on_text(r)};
   const auto& after = r.after;
+  if (after.failover_lost) parts.push_back(failover_text(after));
   if (retries_added(after.retries_added_attempts)) {
     parts.push_back("retries added " + amount_text(after.retries_added_attempts, "attempts"));
   }
@@ -1283,11 +1295,21 @@ constexpr std::string_view op_title =
   return retries_added(figure) ? json_number(figure) : "null";
 }
 
+// Whether a fault of the scenario can fail over (engine::FaultSchedule's header): only behind a
+// service discovery, so a scenario with none has no `failover_lost` to report.
+[[nodiscard]] bool has_service_discovery(const graph::Graph& g) {
+  return std::ranges::any_of(g.nodes(), [](const graph::ResolvedNode& node) {
+    return node.spec.type == model::NodeType::service_discovery;
+  });
+}
+
 // A fault's `after` as JSON: each entry null where it does not apply or did not happen. A flush's
 // also has `interrupted_by_flush_at_s` after `cache_warm_in_s` (the next flush of its cache that
 // emptied it first, null when none did); no other kind has that key, so their objects are the
-// ones written before it existed.
-[[nodiscard]] std::string json_after(const engine::FaultRecord& r) {
+// ones written before it existed. `failover_lost` (the requests a failover sent to dead replicas,
+// null when none applied) is there only in a scenario with a service discovery (`discovers`), as
+// `datacenter` is only on a dc_down: a report of a scenario without one is what it was before.
+[[nodiscard]] std::string json_after(const engine::FaultRecord& r, bool discovers) {
   std::vector<std::string> after{
       json_field("backlog_node",
                  r.after.backlog_node.empty() ? "null" : json_string(r.after.backlog_node)),
@@ -1302,14 +1324,18 @@ constexpr std::string_view op_title =
       json_field("retries_added_attempts", json_retries_figure(r.after.retries_added_attempts)));
   after.push_back(
       json_field("pool_republished_jobs", json_retries_figure(r.after.pool_republished_jobs)));
+  if (discovers) {
+    after.push_back(json_field(
+        "failover_lost", json_optional_number(r.after.failover_lost.transform(without_residue))));
+  }
   return json_object(after);
 }
 
 // A fault's block as JSON (the text's numbers, unrounded, in seconds): `for_s` null for a flush,
 // `overlaps_at_s` the earlier faults it overlaps, `after` (json_after), `recovered_at_s` null when
 // the run ended first; a dc_down names its datacenter (`node` null).
-[[nodiscard]] std::string json_fault(const FaultBlock& block,
-                                     std::span<const model::SloSpec> slos) {
+[[nodiscard]] std::string json_fault(const FaultBlock& block, std::span<const model::SloSpec> slos,
+                                     bool discovers) {
   const auto& r = block.record;
   std::vector<std::string> overlaps;
   for (const SimTime at : block.overlaps) overlaps.push_back(json_number(seconds(at)));
@@ -1322,7 +1348,7 @@ constexpr std::string_view op_title =
       json_field("for_s", model::lasts(r.kind) ? json_number(seconds(r.duration)) : "null"));
   fields.push_back(json_field("overlaps_at_s", "[" + join(overlaps, ", ") + "]"));
   fields.push_back(json_field("during", json_during(block, slos)));
-  fields.push_back(json_field("after", json_after(r)));
+  fields.push_back(json_field("after", json_after(r, discovers)));
   fields.push_back(json_field("recovered_at_s", json_optional_number(r.recovered_at.transform(
                                                     [](SimTime t) { return seconds(t); }))));
   return json_object(fields);
@@ -1363,8 +1389,9 @@ template <class T, class F>
   if (summary.faults().empty()) return lines;
   // The faults array, last and only with faults: a report without them is what it was before.
   std::vector<std::string> faults;
+  const bool discovers = has_service_discovery(summary.graph());
   for (const auto& block : summary.faults()) {
-    faults.push_back(json_fault(block, summary.graph().scenario().slos));
+    faults.push_back(json_fault(block, summary.graph().scenario().slos, discovers));
   }
   lines.push_back(json_array("faults", faults));
   return lines;

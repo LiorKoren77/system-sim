@@ -65,10 +65,11 @@ enum class NodeType : std::uint8_t {
 };
 
 // One row of the node-type catalogue: the enumerator, the word the schema spells it with, and
-// whether run/estimate can step a node of the type today (`runs`). The three types without a
-// model yet (service_discovery, notification_fanout, frontier: phase 3; the ws_gateway got its
-// model in phase 3 Task 14) have it false; explain and validate take every type. A row like
-// core::EnumName with one more column, which core's lookups read through their NameRow concept.
+// whether run/estimate can step a node of the type today (`runs`). The two types without a
+// model yet (notification_fanout, frontier: phase 3; the ws_gateway got its model in phase 3
+// Task 14, the service_discovery in Task 13) have it false; explain and validate take every type.
+// A row like core::EnumName with one more column, which core's lookups read through their NameRow
+// concept.
 struct NodeTypeRow {
   NodeType value;
   std::string_view name;
@@ -101,7 +102,7 @@ inline constexpr auto node_type_table = std::to_array<NodeTypeRow>({
     {NodeType::blob_store, "blob_store", true},
     {NodeType::search_index, "search_index", true},
     {NodeType::ws_gateway, "ws_gateway", true},
-    {NodeType::service_discovery, "service_discovery", false},
+    {NodeType::service_discovery, "service_discovery", true},
     {NodeType::id_generator, "id_generator", true},
     {NodeType::external_sink, "external_sink", true},
     {NodeType::notification_fanout, "notification_fanout", false},
@@ -658,6 +659,14 @@ struct NodeSpec {
   std::optional<std::int64_t> connections{};
   std::optional<SimTime> session{};
   std::optional<SimTime> reconnect_within{};
+  // Service discoveries only (phase 3 spec §8.1; declared after the gateway's keys, for
+  // designated initializers): book ch. 12's service discovery (ZooKeeper), which hands a client the
+  // address of a server. `failover` is how long, after r of the R replicas of a node its callers
+  // look up have died, the registry still hands out the dead ones: for min(failover, the fault's
+  // `for`) the share r / R of the looked-up requests is lost at the node
+  // (engine::FaultSchedule::dead_share). The loader fills in defaults::failover (10 s) when the
+  // scenario states none, so it is empty only on other types and on a discovery built in code.
+  std::optional<SimTime> failover{};
   std::optional<Workload> workload{};  // clients only
 };
 

@@ -195,8 +195,10 @@ struct TypeDefaults {
       // always printed for it (the book's chat servers state their own: 10k/s, 0.5 ms).
       return {Rate{50'000}, 100_us};
     case service_discovery:
-      // rate chosen; time book "round trip within the same datacenter" (one lookup)
-      return {Rate{10'000}, t.intra_dc_rtt};
+      // rate spec §8.1 (50k/s: a lookup is a small read from an in-memory registry, so one
+      // registry answers a whole tier's lookups); time book "round trip within the same
+      // datacenter" (500 us: one lookup is one such round trip)
+      return {Rate{50'000}, t.intra_dc_rtt};
     case id_generator:
       // chosen, and never what a generator runs on: its `algorithm` (required by the loader
       // and Graph::build) supplies the numbers instead, for_id_algorithm below.
@@ -420,6 +422,17 @@ inline constexpr SimTime default_reconnect_within = 30_s;
 [[nodiscard]] constexpr SimTime reconnect_within_of(const model::NodeSpec& spec) {
   return spec.reconnect_within.value_or(default_reconnect_within);
 }
+
+// ---- Service discovery (phase 3 spec §8.1; book ch. 12) ----
+
+// How long a service discovery keeps handing out the address of a replica that has died, when the
+// scenario does not say (model::NodeSpec::failover; book ch. 12: the chat client asks the
+// discovery, ZooKeeper, for a chat server and connects to the one it is given). Chosen, not from
+// the book, which gives no number: a registry learns of a death when the dead server's session or
+// health check times out, and ZooKeeper's session timeouts and the usual health-check settings
+// (a probe every few seconds, a server declared dead after two or three misses) put that at about
+// ten seconds. Filled in by the loader, so explain prints the window the engine uses.
+inline constexpr SimTime failover = 10_s;
 
 // The number of servers c that makes a node one consistent machine. Little's law
 // (L = lambda * W) applied to the servers at full load: the requests in service equal

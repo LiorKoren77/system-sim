@@ -24,10 +24,11 @@
 //                  crosses its edge (link_condition_at)
 // Captured: when a fault starts and ends, how much capacity it takes, that faults on one node add
 // up, that a request waiting at a node that is down waits until it is back (Condition::back_in_s),
-// and how fast a flushed cache refills. Ignored: how the failure is detected and how long failover
-// takes (a node is down from `at` exactly and back at full capacity at `at + for`, with no restart
-// or warm-up of its own: a sql_db's primary comes back at `at + for` rather than a replica being
-// promoted), which copies go down (the survivors share the load evenly: a copy's capacity is
+// how fast a flushed cache refills, and the failover of a node its callers find through a service
+// discovery (below). Ignored: how a load balancer detects the failure (it routes around a dead copy
+// from `at` exactly), restarts and warm-ups (a node is back at full capacity at `at + for`: a
+// sql_db's primary comes back at `at + for` rather than a replica being promoted), which copies go
+// down (the survivors share the load evenly: a copy's capacity is
 // scaled, see fluid::Derating; a kv_cluster's down machines are cool ones, see
 // behaviours::KvClusterBehaviour), what clients do about it (a client's `retries` are its own
 // model, behaviours::ClientBehaviour: the schedule only takes the capacity away), ch. 1's geoDNS
@@ -36,6 +37,34 @@
 // between datacenters: a dc_down has no replication lag and loses no writes, the other
 // datacenter's stores are assumed current (and its caches come back warm at `at + for`: a cold
 // restart is a cache_flush the scenario scripts at that time).
+//
+// Failover behind a service discovery (phase 3 spec §8.1; book ch. 12). In ch. 12's chat system
+// the client does not reach a chat server through a load balancer: it asks the service discovery
+// (ZooKeeper) for one and then talks to the server it was handed. A registry learns that a server
+// died only when the server's session or health check times out; until then it keeps handing out
+// the dead address, and every request sent there is lost. The model: when an op reaches a node
+// THROUGH a lookup (its steps ask a service_discovery `lookup` before the step to the node:
+// graph::Graph::lookup_before; a FailoverRoute below) and a node_down takes r of the node's R
+// replicas, then for min(failover, the fault's `for`) from the fault's start the share r / R of
+// that op's requests still goes to the dead replicas (dead_share; `failover` is the discovery's,
+// NodeSpec::failover, 10 s by default). Those requests count at the node as demand and as drops,
+// never as drain, and the caller's op loses them (behaviours::detail::HopBlocks::fail_over); the
+// other (R − r) / R reach the survivors, which have their own (R − r) / R of the capacity, so
+// they see the load per copy they had before the fault. Once the window closes the registry knows,
+// every request goes to the survivors and they queue (the node_down above: R / (R − r) times the
+// load per copy). r = R (every replica down) makes the share 1: for the window each looked-up
+// request is lost at once instead of waiting in the room for the node to come back. A node_down
+// on a node reached WITHOUT a lookup has no failover: the load balancer in front (ch. 1) spreads
+// the load over the survivors from the first step. Only a node_down kills replicas: a capacity
+// fault degrades a tier whose copies all stay alive, so nothing is sent to a dead one, and a
+// dc_down is cut off by its links. A sql_db's or a kv_cluster's partial node_down has no failover
+// either: their clients find the live copies by the database's own replication and quorums, not
+// through a registry. Ignored: the registry's own availability (a node_down of the discovery takes
+// its capacity like any service's, and the addresses its callers hold stay good), partial
+// knowledge (every caller learns of the death at the same moment, `failover` after it), the client
+// sending a failed request to another server (that is a client's `retries`, which see the lost
+// share like any loss), and the link delay of the dead share (a request handed a dead address at
+// `t` is lost at the node when it arrives there, but whether it was is decided at `t`).
 //
 // C++20 module partition, interface kind: `export module simsys.engine:faults;` names a piece of
 // the module simsys.engine whose exports become part of the module's interface once the primary
@@ -56,6 +85,7 @@ module;
 #include <cstddef>
 #include <limits>
 #include <optional>
+#include <ranges>  // std::views::keys: a caller's op names (add_failover_routes)
 #include <span>
 #include <stdexcept>
 #include <string>  // the == of the node ids: a std header's operators are not exported by an import
@@ -71,6 +101,7 @@ export module simsys.engine:faults;
 // that import would be a cycle, which the standard forbids.
 import simsys.caching;
 import simsys.core;
+import simsys.defaults; // failover: a service discovery's, when a scenario built in code has none
 import simsys.graph;
 import simsys.model;
 
@@ -98,6 +129,17 @@ struct Condition {
   SimTime extra_latency{};      // + service time: latency_spike's extra
   double rate_factor = 1;       // × a client's rate: traffic_spike's factor
   double hit_ratio_factor = 1;  // × a cache's hit ratio: cache_flush's warm-up, h(n) / h
+};
+
+// One way a caller reaches a node through a service discovery (FaultSchedule's failover, the
+// header comment): node `caller` has an op whose steps ask `discovery` for `target` before calling
+// it (graph::Graph::discovery_before_step), and the discovery hands out a dead replica for
+// `failover` (its NodeSpec::failover).
+struct FailoverRoute {
+  std::size_t caller{};
+  std::size_t discovery{};
+  std::size_t target{};
+  SimTime failover{};
 };
 
 // The scenario's faults, resolved once against its graph: which node or link each acts on, when,
@@ -151,6 +193,23 @@ class FaultSchedule {
   // changes anything (a cache without a hit ratio).
   [[nodiscard]] std::optional<double> warm_up_s(std::size_t cache, SimTime at) const;
 
+  // Every way a caller reaches, through a discovery lookup, a node that some node_down of the
+  // scenario takes replicas from (FailoverRoute), each once, in (caller, op, step) order: the
+  // routes whose dead share the engine hands the callers every step. Empty without such a fault.
+  [[nodiscard]] std::span<const FailoverRoute> failover_routes() const { return routes_; }
+
+  // The share of the requests a caller that looked `node` up sends to its dead replicas at `now`
+  // (the header comment), with a discovery of failover `failover`: 1 − Π (R − r_i) / R over the
+  // node_downs i on the node whose window [at, at + min(failover, for)) holds `now`: r / R for one,
+  // 1 when every replica is down; 0 outside every window.
+  [[nodiscard]] double dead_share(std::size_t node, SimTime now, SimTime failover) const;
+
+  // The share r / R that `fault` sends to dead replicas of `node` during its failover: its
+  // node_down effect's lost capacity, 1 − (R − r) / R; 0 for every other kind, and for a sql_db's
+  // or a kv_cluster's partial node_down, which leave the capacity factor alone (the header
+  // comment).
+  [[nodiscard]] static double dead_share_of(const model::Fault& fault, const model::NodeSpec& node);
+
  private:
   // One fault that changes something on one node (a dc_down is one per node of the datacenter):
   // the node, when, and its effect alone.
@@ -159,6 +218,7 @@ class FaultSchedule {
     SimTime at{};
     SimTime duration{};
     Condition effect{};
+    bool kills_replicas{};  // a node_down: callers that looked the node up fail over (dead_share)
   };
 
   // A link a dc_down cuts, and for how long.
@@ -212,6 +272,8 @@ class FaultSchedule {
   void add_dc_down(const graph::Graph& g, const model::Fault& fault);
   void add_flush(const graph::Graph& g, const model::Fault& fault);
   void end_at_next_flushes();
+  void add_failover_routes(const graph::Graph& g);
+  void add_route(FailoverRoute route);
   [[nodiscard]] static WarmUp warm_up_of(const graph::Graph& g, std::size_t cache, SimTime at);
   [[nodiscard]] static double counted_s(const WarmUp& warm_up, SimTime now, SimTime dt);
   static void add_reads(WarmUp& warm_up, SimTime now, double reads_per_s, double counted_s);
@@ -230,11 +292,12 @@ class FaultSchedule {
   [[nodiscard]] double warmth_at(std::size_t node, SimTime now) const;
   [[nodiscard]] static double warmth(const WarmUp& warm_up);
 
-  std::vector<Scheduled> faults_;     // in the scenario's order
-  std::vector<Cut> cuts_;             // dc_down's links, in the scenario's order
-  std::vector<WarmUp> warm_ups_;      // in the scenario's order
-  std::vector<std::size_t> flushed_;  // flushed_caches()
-  std::vector<int> kv_machines_;      // per node: a kv_cluster's machines, 0 for any other node
+  std::vector<Scheduled> faults_;      // in the scenario's order
+  std::vector<Cut> cuts_;              // dc_down's links, in the scenario's order
+  std::vector<WarmUp> warm_ups_;       // in the scenario's order
+  std::vector<std::size_t> flushed_;   // flushed_caches()
+  std::vector<int> kv_machines_;       // per node: a kv_cluster's machines, 0 for any other node
+  std::vector<FailoverRoute> routes_;  // failover_routes()
 };
 
 // ---- What a fault cost: the record behind the report's block per fault (spec §4.4) ----
@@ -304,8 +367,11 @@ class FaultSchedule {
 // (`retries_added_attempts`) and the pools' re-published jobs. Without any retrying client or
 // pool nothing of this appears (`lost_requests` empty, both figures 0): the block is the one
 // written before retries existed.
-// Ignored: anything the run does not show (the time to detect the failure, the failover itself:
-// FaultSchedule's header).
+// Failover (FaultSchedule's header): a node_down on a node that some op reaches through a service
+// discovery keeps that op's callers on the dead replicas for the discovery's `failover`; what they
+// sent there is part of `lost` (the node's drops), and `after` says how much of it (failover_lost:
+// `failover 10s: 2.5k requests sent to the dead replica`). Ignored: anything the run does not show
+// (how a load balancer detects the failure: FaultSchedule's header).
 struct FaultAfter {
   // Whose backlog the fault left above the twin's: the faulted node, a dc_down's datacenter, a
   // traffic_spike's downstream node with the most work left (backlog / capacity, in seconds, over
@@ -334,6 +400,15 @@ struct FaultAfter {
   double retries_added_attempts{};
   std::string republishing_pools{};
   double pool_republished_jobs{};
+  // A node_down on a node some op reaches through a service discovery (FaultSchedule's failover):
+  // the requests the registry sent to the dead replicas before it noticed, Σ over the faulted
+  // node's dead-replica losses (NodeSample::failover_lost_per_s) × dt from `at` to the recovery
+  // (the twin has none). Empty when the fault has no failover (another kind, or no lookup before
+  // the node). `failover` is the discovery's window (the first route's, when several discoveries
+  // hand the node out), and `dead_replicas` the replicas the fault took (r, or all R).
+  std::optional<double> failover_lost{};
+  SimTime failover{};
+  int dead_replicas{};
 };
 
 // One fault's record. The faulted part is the node the fault names; for a dc_down it is the
@@ -476,6 +551,7 @@ FaultSchedule::FaultSchedule(const graph::Graph& g) {
     }
   }
   end_at_next_flushes();
+  add_failover_routes(g);
 }
 
 void FaultSchedule::add_node_fault(const graph::Graph& g, const model::Fault& fault) {
@@ -485,8 +561,49 @@ void FaultSchedule::add_node_fault(const graph::Graph& g, const model::Fault& fa
   // C++20 designated initializers: `Scheduled{.node = ..., .at = ...}` names each member it sets,
   // in declaration order. Replaces positional braces, where the two SimTimes (at, for) could be
   // swapped without a compiler error.
-  faults_.push_back(
-      Scheduled{.node = node, .at = fault.at, .duration = fault.duration, .effect = effect});
+  faults_.push_back(Scheduled{.node = node,
+                              .at = fault.at,
+                              .duration = fault.duration,
+                              .effect = effect,
+                              .kills_replicas = fault.kind == model::FaultKind::node_down});
+}
+
+// Every (caller, discovery, target) whose target a node_down of the schedule takes replicas from
+// (dead_share_of > 0): each step of each op, with the discovery whose lookup comes last before it.
+void FaultSchedule::add_failover_routes(const graph::Graph& g) {
+  const auto nodes = g.nodes();
+  for (std::size_t caller = 0; caller < nodes.size(); ++caller) {
+    // C++20 std::views::keys: a lazy view of each map entry's key (an op name), replacing a loop
+    // over the pairs that ignores `.second`; nothing is copied. No lambda goes into the adaptor
+    // (CLAUDE.md §3's fifth GCC 14.2 defect).
+    for (const auto& op : nodes[caller].spec.ops | std::views::keys) {
+      const auto hops = g.service_hops(caller, op);
+      for (std::size_t position = 0; position < hops.size(); ++position) {
+        const auto discovery = g.discovery_before_step(caller, op, position);
+        if (!discovery) continue;
+        add_route(FailoverRoute{
+            .caller = caller,
+            .discovery = *discovery,
+            .target = hops[position].target,
+            .failover = nodes[*discovery].spec.failover.value_or(defaults::failover)});
+      }
+    }
+  }
+}
+
+// A route once, and only when a fault on its target kills replicas: the engine hands the caller
+// nothing for any other, every step.
+void FaultSchedule::add_route(FailoverRoute route) {
+  const auto same = [&](const FailoverRoute& r) {
+    return r.caller == route.caller && r.discovery == route.discovery && r.target == route.target;
+  };
+  const auto kills = [&](const Scheduled& f) {
+    return f.node == route.target && f.kills_replicas && f.effect.capacity_factor < 1.0;
+  };
+  // C++20 std::ranges::any_of: the range itself rather than a begin/end pair (std::any_of), so
+  // the pair cannot be mismatched; a lambda handed to an ALGORITHM is safe under GCC 14.2.
+  if (std::ranges::any_of(routes_, same) || !std::ranges::any_of(faults_, kills)) return;
+  routes_.push_back(route);
 }
 
 // dc_down (ch. 1's data center outage): node_down on every node whose `dc` is the datacenter (a
@@ -587,6 +704,23 @@ void FaultSchedule::whole_cluster_down(std::size_t node, Condition& condition) c
   if (condition.machines_down < kv_machines_[node]) return;
   condition.capacity_factor = 0.0;
   condition.machines_down = 0;
+}
+
+// The surviving share Π (R − r_i) / R of the node_downs whose failover window holds `now` is each
+// one's capacity factor, so the dead share is exactly what those faults took (0.25 for 1 of 4).
+double FaultSchedule::dead_share(std::size_t node, SimTime now, SimTime failover) const {
+  double survivors = 1.0;
+  for (const auto& fault : faults_) {
+    if (fault.node != node || !fault.kills_replicas) continue;
+    const SimTime window{std::min(failover.count(), fault.duration.count())};
+    if (active(fault.at, window, now)) survivors *= fault.effect.capacity_factor;
+  }
+  return 1.0 - survivors;
+}
+
+double FaultSchedule::dead_share_of(const model::Fault& fault, const model::NodeSpec& node) {
+  if (fault.kind != model::FaultKind::node_down) return 0.0;
+  return 1.0 - down_effect(fault, node).capacity_factor;
 }
 
 // Capacity 0 while a dc_down cuts the link, and when the cut ends (a pipe's room drains then).

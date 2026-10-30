@@ -158,6 +158,13 @@ struct NodeSample {
   // C(k) / heartbeat, read off this same level. A fixed `connections` is that number on every step.
   // Empty on every other node: only a gateway holds connections (a 0 would claim it held none).
   std::optional<double> connections{};
+  // The requests sent this step to the node's DEAD replicas by callers a service discovery still
+  // hands their addresses (engine::FaultSchedule's header: the failover after a node_down of a node
+  // reached through a lookup), per second, in requests: a part of `demand_per_s` and of
+  // `dropped_per_s` (in capacity units there), never of the drain. 0 outside the failover window;
+  // empty on a node that no failover can reach (no lookup before it, or no node_down of it), so
+  // that a fault block can say whether a failover applied (FaultAfter::failover_lost).
+  std::optional<double> failover_lost_per_s{};
 };
 
 // What a client sees for one op: the rate it offers, the part of it that comes back answered, and

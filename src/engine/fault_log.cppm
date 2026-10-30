@@ -78,8 +78,10 @@ class FaultLog {
   FaultLog& operator=(FaultLog&& other) noexcept;
   ~FaultLog();
   // One record per fault of `g`'s scenario, in `at` order (the list's order among equal `at`s).
-  // `rooms[i]` is node i's room, queue_limit × copies over its copy groups (Simulation's).
-  FaultLog(const graph::Graph& g, std::span<const double> rooms);
+  // `rooms[i]` is node i's room, queue_limit × copies over its copy groups (Simulation's), and
+  // `failover_routes` the schedule's (FaultSchedule::failover_routes): which node_downs fail over.
+  FaultLog(const graph::Graph& g, std::span<const double> rooms,
+           std::span<const FailoverRoute> failover_routes);
 
   // The step that starts at `step.run.t` and lasts `dt`. `schedule` is the run's, after the step:
   // its warm-ups have counted the step's reads (FaultSchedule::count_reads), so a flushed cache
@@ -102,6 +104,8 @@ class FaultLog {
     double lost_for_good_per_s{};
     double extra_attempts_per_s{};
     double republished_per_s{};
+    // What its nodes' failover sent to dead replicas (NodeSample::failover_lost_per_s), requests.
+    double failover_lost_per_s{};
   };
   // A part whose backlog may outlast the fault: its nodes, its name in the block (`s backlog
   // drained`), its capacity (to compare parts in seconds of work), and the backlog above the
@@ -147,7 +151,8 @@ class FaultLog {
   [[nodiscard]] Tracker tracker_of(const graph::Graph& g, const model::Fault& fault) const;
   [[nodiscard]] Tracker faulted_part(const graph::Graph& g, const model::Fault& fault) const;
   [[nodiscard]] static FaultRecord record_of(const graph::Graph& g, const model::Fault& fault,
-                                             const Tracker& tracker, std::span<const double> rooms);
+                                             const Tracker& tracker, std::span<const double> rooms,
+                                             std::span<const FailoverRoute> failover_routes);
   void add_backlogged(Tracker& tracker, std::vector<std::size_t> nodes, std::string name) const;
   static void add_retry_parties(const graph::Graph& g, Tracker& tracker);
   [[nodiscard]] static bool retries_reach(const graph::Graph& g, const Tracker& tracker);
@@ -166,6 +171,8 @@ class FaultLog {
   static void count_retries(FaultRecord& r, const Part& run, const Part& twin, double dt_s);
   static void end_flush_window(FaultRecord& r, const Tracker& tracker,
                                const FaultSchedule& schedule, SimTime t);
+  static void add_failover(const graph::Graph& g, std::span<const FailoverRoute> routes,
+                           const model::Fault& fault, std::size_t node, FaultRecord& r);
   static void observe_warm_up(FaultRecord& r, SimTime t, SimTime dt);
   [[nodiscard]] static bool in_window(const FaultRecord& r, SimTime t);
   [[nodiscard]] static bool cleared(const FaultRecord& r, SimTime t);
@@ -336,7 +343,8 @@ FaultLog& FaultLog::operator=(const FaultLog& other) = default;
 FaultLog& FaultLog::operator=(FaultLog&& other) noexcept = default;
 FaultLog::~FaultLog() = default;
 
-FaultLog::FaultLog(const graph::Graph& g, std::span<const double> rooms) {
+FaultLog::FaultLog(const graph::Graph& g, std::span<const double> rooms,
+                   std::span<const FailoverRoute> failover_routes) {
   for (const auto& node : g.nodes()) {
     capacities_.push_back(node.capacity.service_rate.per_second);
     ids_.push_back(node.spec.id);
@@ -345,7 +353,7 @@ FaultLog::FaultLog(const graph::Graph& g, std::span<const double> rooms) {
   const auto& faults = g.scenario().faults;
   for (const std::size_t i : in_at_order(faults)) {
     trackers_.push_back(tracker_of(g, faults[i]));
-    records_.push_back(record_of(g, faults[i], trackers_.back(), rooms));
+    records_.push_back(record_of(g, faults[i], trackers_.back(), rooms, failover_routes));
   }
 }
 
@@ -438,7 +446,8 @@ void FaultLog::add_backlogged(Tracker& tracker, std::vector<std::size_t> nodes,
 // A record of zeros until the fault starts: what it is, its unit, the room its backlog can fill,
 // and a flush's origin (its window is the run's to find: end_flush_window).
 FaultRecord FaultLog::record_of(const graph::Graph& g, const model::Fault& fault,
-                                const Tracker& tracker, std::span<const double> rooms) {
+                                const Tracker& tracker, std::span<const double> rooms,
+                                std::span<const FailoverRoute> failover_routes) {
   double room = 0.0;
   for (const std::size_t node : tracker.nodes) room += rooms[node];
   const bool attempts = retries_reach(g, tracker);
@@ -455,11 +464,31 @@ FaultRecord FaultLog::record_of(const graph::Graph& g, const model::Fault& fault
                 .origin_unit = unit_of(g, tracker.origins),
                 .datacenter = fault.datacenter};
   r.after.republishing_pools = ids_of(g, tracker.retrying_pools);
+  if (fault.kind == model::FaultKind::node_down) {
+    add_failover(g, failover_routes, fault, tracker.nodes.front(), r);
+  }
   // A cache without a hit ratio loses nothing to a flush: its window is empty from the start.
   if (fault.kind == model::FaultKind::cache_flush && !g.nodes()[tracker.nodes.front()].hit_ratio) {
     r.flush_window_s = 0.0;
   }
   return r;
+}
+
+// A node_down's failover, when one applies (FaultSchedule's header): some caller looks the node up
+// through a service discovery (a failover route to it) and the fault kills replicas the capacity
+// counts (dead_share_of: not a sql_db's or a kv_cluster's partial one). The record then counts what
+// was sent to the dead replicas from 0, with the first route's window and the replicas it took.
+void FaultLog::add_failover(const graph::Graph& g, std::span<const FailoverRoute> routes,
+                            const model::Fault& fault, std::size_t node, FaultRecord& r) {
+  const auto& spec = g.nodes()[node].spec;
+  if (FaultSchedule::dead_share_of(fault, spec) <= 0.0) return;
+  // C++20 std::ranges::find with a projection (&FailoverRoute::target): the first route whose
+  // member equals `node`, without a lambda that names the member.
+  const auto route = std::ranges::find(routes, node, &FailoverRoute::target);
+  if (route == routes.end()) return;
+  r.after.failover_lost = 0.0;
+  r.after.failover = route->failover;
+  r.after.dead_replicas = fault.replicas.value_or(model::copies_of(spec));
 }
 
 // The recovery rule's snapshots (the run's step and the twin's) only when some record reads them:
@@ -522,6 +551,9 @@ FaultLog::Part FaultLog::part_of(const Tracker& tracker, const StepRecord& recor
             .served_per_s = sum_of(record, tracker.nodes, &NodeSample::drain_per_s),
             .lost_per_s = sum_of(record, tracker.nodes, &NodeSample::dropped_per_s),
             .backlog = sum_of(record, tracker.nodes, &NodeSample::backlog)};
+  for (const std::size_t node : tracker.nodes) {
+    part.failover_lost_per_s += record.nodes[node].failover_lost_per_s.value_or(0.0);
+  }
   for (const std::size_t link : tracker.cut_links) {
     if (link < links.size()) part.cut_lost_per_s += links[link].lost_per_s;
   }
@@ -615,10 +647,14 @@ void FaultLog::choose_drained(FaultRecord& r, Tracker& tracker) {
 }
 
 // What the step cost beyond the twin's: the faulted part's drops (a traffic_spike's client: its
-// unanswered requests), and a dc_down's cut links' apart.
+// unanswered requests), a dc_down's cut links' apart, and the part of the drops a failover sent to
+// dead replicas (the twin, without faults, has none).
 void FaultLog::count_losses(FaultRecord& r, const Part& run, const Part& twin, double dt_s) {
   r.lost += (run.lost_per_s - twin.lost_per_s) * dt_s;
   r.lost_on_cut_links += (run.cut_lost_per_s - twin.cut_lost_per_s) * dt_s;
+  if (r.after.failover_lost) {
+    *r.after.failover_lost += (run.failover_lost_per_s - twin.failover_lost_per_s) * dt_s;
+  }
 }
 
 // What the retries did in the step beyond the twin's (FaultRecord::lost_requests, FaultAfter): the
