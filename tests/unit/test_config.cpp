@@ -1064,8 +1064,11 @@ TEST_CASE("retries must be a non-negative integer") {
   }
 }
 
-TEST_CASE("a client's retry_after of zero is refused: a backoff is a positive wait") {
-  for (const std::string_view wait : {"0s", "0ms"}) {
+// A negative wait gets the same message as 0 (the phase 3 review's nit 10: before, `-1s` got the
+// duration reader's generic "expected a non-negative finite number"): the sign is checked first.
+TEST_CASE("a client's retry_after of zero or below is refused: a backoff is a positive wait") {
+  for (const std::string_view wait : {"0s", "0ms", "-1s", "-250ms"}) {
+    CAPTURE(wait);
     require_rejected("simsys_retry_after_zero.yaml",
                      client_with("retries: 2, retry_after: " + std::string{wait}),
                      "node 'u': retry_after must be positive");
@@ -1854,26 +1857,33 @@ TEST_CASE("latency SLOs must name a client and one of its ops; ratio maxima lie 
 // groups, so on a service, a client or any other node the SLO could never be observed. `node` may
 // be left out, which bounds the worst queue of the run. The message is the latency rule's, in the
 // same words: "needs a <type> node, '<id>' is a <type>".
-TEST_CASE("a queue_lag SLO must name a message queue, or no node at all") {
+// A frontier is a queue too (phase 3 Task 18, the web crawler's): the check accepts it, and since
+// the phase 3 review the message says so.
+TEST_CASE("a queue_lag SLO must name a message queue or a frontier, or no node at all") {
   const auto with_slo = [](std::string_view entry) {
     return scenario_with(
         "  u: {type: client, rate: {base: 1/s}, ops: {a: 1}}\n"
         "  svc: {type: service}\n"
-        "  q: {type: message_queue}\n",
+        "  q: {type: message_queue}\n"
+        "  f: {type: frontier}\n",
         "links: []\nslo: [" + std::string{entry} + "]\n");
   };
   SECTION("a service has no queue lag") {
     require_rejected("simsys_slo_lag_service.yaml",
                      with_slo("{metric: queue_lag, node: svc, max: 1m}"),
-                     "slo: queue_lag needs a message_queue node ('svc' is a service)");
+                     "slo: queue_lag needs a message_queue or frontier node ('svc' is a service)");
   }
   SECTION("a client has none either") {
     require_rejected("simsys_slo_lag_client.yaml",
                      with_slo("{metric: queue_lag, node: u, max: 1m}"),
-                     "slo: queue_lag needs a message_queue node ('u' is a client)");
+                     "slo: queue_lag needs a message_queue or frontier node ('u' is a client)");
   }
   SECTION("a message queue is accepted") {
     require_loaded("simsys_slo_lag_queue.yaml", with_slo("{metric: queue_lag, node: q, max: 1m}"));
+  }
+  SECTION("a frontier is accepted") {
+    require_loaded("simsys_slo_lag_frontier.yaml",
+                   with_slo("{metric: queue_lag, node: f, max: 1m}"));
   }
   SECTION("no node is accepted: the worst queue is bounded") {
     require_loaded("simsys_slo_lag_worst.yaml", with_slo("{metric: queue_lag, max: 1m}"));
@@ -4108,10 +4118,14 @@ TEST_CASE("a pool's retries must be a whole number from 0 to 10") {
   }
 }
 
-TEST_CASE("a pool's retry_after must be positive") {
-  require_rejected("simsys_pool_retry_after_zero.yaml",
-                   retrying_pool_scenario("retries: 3, retry_after: 0s"),
-                   "node 'w': retry_after must be positive");
+// 0 and a negative wait in the same words (the phase 3 review's nit 10), as on a client.
+TEST_CASE("a pool's retry_after must be positive: 0s and -1s get the same message") {
+  for (const std::string_view wait : {"0s", "-1s"}) {
+    CAPTURE(wait);
+    require_rejected("simsys_pool_retry_after_zero.yaml",
+                     retrying_pool_scenario("retries: 3, retry_after: " + std::string{wait}),
+                     "node 'w': retry_after must be positive");
+  }
 }
 
 TEST_CASE("a pool's retry_after without retries is refused") {
@@ -5009,9 +5023,12 @@ TEST_CASE("the primary of a sql_db with one copy may go down: it is the whole no
 
 // ---- `factor` ---------------------------------------------------------------------------------
 
+// The message names the open interval and what to write instead at either end (the phase 3
+// review's nit 9: "between 0 and 1" read as if 0 were allowed, for `factor: 0` above all).
 TEST_CASE("a capacity fault needs a factor strictly between 0 and 1") {
   const auto capacity_message =
-      "faults[3]: capacity factor must be between 0 and 1 (a gain is the scenario's capacity)";
+      "faults[3]: capacity factor must be in (0, 1); use node_down for 0 "
+      "(a gain is the scenario's capacity)";
   const auto three_valid = {valid_node_down, valid_latency_spike, valid_traffic_spike};
   SECTION("no factor") {
     require_rejected(
@@ -5095,7 +5112,8 @@ TEST_CASE("a fault's factor beyond a double's range is refused by the range rule
     require_rejected(
         "simsys_fault_capacity_factor_huge.yaml",
         faults_scenario("[{at: 01:00, kind: capacity, node: api, factor: 1e400, for: 1m}]"),
-        "faults[0]: capacity factor must be between 0 and 1 (a gain is the scenario's capacity)");
+        "faults[0]: capacity factor must be in (0, 1); use node_down for 0 (a gain is the "
+        "scenario's capacity)");
   }
 }
 

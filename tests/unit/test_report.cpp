@@ -1424,7 +1424,7 @@ TEST_CASE("explain prints a kv_cluster's nodes, replication, quorums and mode", 
     CAPTURE(text);
     REQUIRE(node_line(text, "store")
                 .contains("nodes=3 N=3 (default) W=2 (default) R=2 (default) mode=ap (default; "
-                          "partitions: phase 3)"));
+                          "partitions: phase 4 backlog)"));
   }
   SECTION("stated values, cp mode") {
     auto s = kv_explained(5, 1000);
@@ -1434,7 +1434,8 @@ TEST_CASE("explain prints a kv_cluster's nodes, replication, quorums and mode", 
     s.nodes[1].kv_mode = simsys::model::KvMode::cp;
     const auto text = explain_of(s);
     CAPTURE(text);
-    REQUIRE(node_line(text, "store").contains("nodes=5 N=5 W=3 R=3 mode=cp (partitions: phase 3)"));
+    REQUIRE(node_line(text, "store")
+                .contains("nodes=5 N=5 W=3 R=3 mode=cp (partitions: phase 4 backlog)"));
   }
 }
 
@@ -1454,16 +1455,15 @@ TEST_CASE("explain warns when the read and write quorums do not overlap", "[repo
     CAPTURE(text);
     REQUIRE(node_line(text, "store")
                 .contains("N=3 W=1 R=2 (W + R ≤ N: a read may miss the latest write) mode=ap "
-                          "(partitions: phase 3)"));
+                          "(partitions: phase 4 backlog)"));
   }
   SECTION("cp: and the contradiction") {
     s.nodes[1].kv_mode = simsys::model::KvMode::cp;
     const auto text = explain_of(s);
     CAPTURE(text);
-    REQUIRE(
-        node_line(text, "store")
-            .contains(
-                "mode=cp (partitions: phase 3; cp needs W + R > N: these quorums contradict it)"));
+    REQUIRE(node_line(text, "store")
+                .contains("mode=cp (partitions: phase 4 backlog; cp needs W + R > N: these quorums "
+                          "contradict it)"));
   }
   SECTION("overlapping quorums: no note") {
     s.nodes[1].read_quorum = 3;
@@ -3753,6 +3753,31 @@ TEST_CASE("each SLO row and each SLO of the JSON name the seed of that SLO's med
 TEST_CASE("a scenario without SLOs has no SLO replications") {
   const Runs runs{five_demands};
   CHECK(simsys::report::summarize_replications(runs.summaries, five_seeds).slos.empty());
+}
+
+// The per-seed node objects follow the run's own JSON node object (json_node_fields), so a
+// notification fanout's `deduplicated_per_s` is among them, after `rejected`, as a list with an
+// entry per seed; null on every other node, as in the run's JSON (Task 19's carry-over: it was
+// missing). Three runs of one step whose service reports 10, 20 and 30 duplicates a second.
+TEST_CASE("the per-seed JSON of replications lists each node's deduplicated_per_s") {
+  const auto g = *simsys::graph::Graph::build(simsys::test_support::mm1(500));
+  std::vector<Summary> runs;
+  for (const double duplicates : {10.0, 20.0, 30.0}) {
+    std::vector<simsys::engine::NodeSample> nodes(2);
+    nodes[1].deduplicated_per_s = duplicates;
+    runs.emplace_back(g, simsys::SimTime{0});
+    runs.back().observe(
+        simsys::engine::StepRecord{.t = simsys::SimTime{0}, .nodes = nodes, .responses = {}});
+  }
+  constexpr std::array<int, 3> seeds{1, 2, 3};
+  const auto json = simsys::report::render_replications_json(
+      simsys::report::summarize_replications(runs, seeds), runs);
+  CAPTURE(json);
+  const auto per_seed = json.substr(json.find("\"per_seed\""));
+  CHECK(json_node_object(per_seed, "s")
+            .contains("\"rejected\": [0, 0, 0], "
+                      "\"deduplicated_per_s\": [10, 20, 30], "));
+  CHECK(json_node_object(per_seed, "c").contains("\"deduplicated_per_s\": [null, null, null]"));
 }
 
 // ---- How a band is printed (format_band): the implementer's decision, pinned
