@@ -2428,7 +2428,8 @@ TEST_CASE("the JSON gives an op nobody answered null latencies", "[report]") {
   const auto json = simsys::report::render_json(summarize(s, g), {});
   CAPTURE(json);
   REQUIRE(
-      json.contains("\"answered_per_s\": 0, \"timed_out_per_s\": 0, \"mean_s\": null, "
+      json.contains("\"answered_per_s\": 0, \"timed_out_per_s\": 0, "
+                    "\"timed_out_attempts_per_s\": 0, \"mean_s\": null, "
                     "\"p50_s\": null, \"p95_s\": null, \"p99_s\": null"));
 }
 
@@ -2729,6 +2730,33 @@ TEST_CASE("the JSON op of a client without retries has attempts_per_s equal to o
   const auto json = simsys::report::render_json(summarize(s, g), {});
   CAPTURE(json);
   REQUIRE(json_value(json, "attempts_per_s") == json_value(json, "offered_per_s"));
+}
+
+// timed_out_attempts_per_s, right after timed_out_per_s: every attempt that came back after the
+// timeout, the share a percentile reads (tests/theory/test_retries.cpp pins it with retries).
+// Without retries every attempt is its request's last, so it equals timed_out_per_s: 0.105863 of
+// the 990/s that time out behind 200 ms.
+TEST_CASE(
+    "the JSON op has timed_out_attempts_per_s right after timed_out_per_s, equal without "
+    "retries",
+    "[report]") {
+  const auto s = timing_out(200ms);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto json = simsys::report::render_json(summarize(s, g), {});
+  CAPTURE(json);
+  REQUIRE_THAT(json_value(json, "timed_out_attempts_per_s"), WithinRel(0.105863 * 990.0, 1e-5));
+  REQUIRE(json_value(json, "timed_out_attempts_per_s") == json_value(json, "timed_out_per_s"));
+  const auto timed_out_at = json.find("\"timed_out_per_s\": ");
+  REQUIRE(json.find(", \"timed_out_attempts_per_s\": ", timed_out_at) ==
+          json.find(',', timed_out_at));
+}
+
+TEST_CASE("the JSON op of a client without a timeout has 0 timed out attempts", "[report]") {
+  const auto s = mm1(500);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto json = simsys::report::render_json(summarize(s, g), {});
+  CAPTURE(json);
+  REQUIRE(json_value(json, "timed_out_attempts_per_s") == 0.0);
 }
 
 // With a timeout the table has both optional-looking columns in the order offered, attempts,

@@ -327,6 +327,50 @@ TEST_CASE("n retries cap the attempts per request at 1 + q + ... + q^n: 1, 1.5, 
   }
 }
 
+// ---- The backoff in whole steps, rounded up
+// ------------------------------------------------------------
+//
+// The engine moves in steps, so a backoff is a whole number of them: retry_after / step rounded UP
+// (at least one), so that a retry never fires before the wait the scenario states. At 100 ms steps
+// 150 ms waits 2 steps (200 ms) and 250 ms 3 steps (300 ms). The first failures happen at t = 0,
+// so the first retries are sent at t = 0.2 s and t = 0.3 s: the attempts stay 1000 until then and
+// rise to 1500 (1000 + half of the first step's 1000) at that step.
+
+namespace {
+std::vector<StepRecord> run_sink_with_backoff(simsys::SimTime retry_after) {
+  auto s = retried_sink(0.5, 2);
+  s.nodes[0].workload->retry_after = retry_after;
+  return records_of(graph_of(std::move(s)), 10);
+}
+
+// The time of the first step whose attempts exceed the curve: when the first retries are sent.
+double first_retry_at(const std::vector<StepRecord>& records) {
+  for (const auto& record : records) {
+    if (attempts_of(op_of(record)) > 1000.0 * (1.0 + 1e-9)) return simsys::seconds(record.t);
+  }
+  return -1.0;
+}
+}  // namespace
+
+TEST_CASE("a retry_after of 150 ms at 100 ms steps waits 2 steps: the retries start at t = 0.2 s",
+          "[theory]") {
+  const auto records = run_sink_with_backoff(150ms);
+  REQUIRE_THAT(first_retry_at(records), WithinAbs(0.2, 1e-12));
+  REQUIRE_THAT(attempts_of(op_of(records[2])), WithinRel(1500.0, 1e-9));
+}
+
+TEST_CASE("a retry_after of 250 ms at 100 ms steps waits 3 steps: the retries start at t = 0.3 s",
+          "[theory]") {
+  const auto records = run_sink_with_backoff(250ms);
+  REQUIRE_THAT(first_retry_at(records), WithinAbs(0.3, 1e-12));
+  REQUIRE_THAT(attempts_of(op_of(records[3])), WithinRel(1500.0, 1e-9));
+}
+
+TEST_CASE("a retry_after of exactly one step waits that step: the retries start at t = 0.1 s",
+          "[theory]") {
+  REQUIRE_THAT(first_retry_at(run_sink_with_backoff(100ms)), WithinAbs(0.1, 1e-12));
+}
+
 // ---- A node_down: the retry storm
 // ---------------------------------------------------------------------
 //
@@ -500,6 +544,114 @@ TEST_CASE(
     REQUIRE_THAT(op.timed_out.per_second, WithinRel(400.0 * q * q * q, 1e-6));
     REQUIRE_THAT(lost_of(op), WithinAbs(0.0, 1e-6));  // offered - answered - timed out
   }
+}
+
+// ---- The timed-out share a percentile reads counts every attempt
+// ----------------------------------------
+//
+// The same probe observed after a 1 s warmup (the ramp of steps 0 and 1 left out), so every
+// observed step is the fixed point above. Of the attempts the service delivered, 1 + q + q^2 per
+// request, the share q = 10.6 % timed out, as without retries: the path does not care which
+// attempt a request is on. That is the share a percentile asks about (a p95 at more than 5 %, a
+// p99 at more than 1 %: report.cpp's percentile_seen_by_client): every delivered attempt is a
+// response the client waited for, and more than 1 − q of them came back after the 200 ms timeout,
+// so the client never saw its p95 or p99 answered. Counting only the requests given up on for good
+// (q^3 = 0.12 % of the offered load) would read p99 = 200 ms and pass a p99 SLO of 250 ms on
+// responses the client never got: the retries hide the timeouts from the verdict, not from the
+// user. So the engine keeps both: `timed_out` (final, q^3) for the answered + timed out + lost =
+// offered balance, and `timed_out_attempts` (every attempt, q × attempts) for the percentiles.
+
+namespace {
+Scenario timing_out_with_retries_after_warmup() {
+  auto s = timing_out_with_retries();
+  s.duration = 10s;
+  s.warmup = 1s;
+  s.slos = {simsys::model::SloSpec{.metric = simsys::model::SloMetric::p99_latency,
+                                   .node = "c",
+                                   .op = "op",
+                                   .max = simsys::SimTime{250ms}}};
+  return s;
+}
+
+struct ObservedRun {
+  simsys::report::Summary summary;
+  std::vector<simsys::report::SloResult> slos;
+};
+
+ObservedRun observe(const Graph& g) {
+  ObservedRun run{.summary = simsys::report::Summary{g, g.scenario().warmup}, .slos = {}};
+  auto sim = simulation_of(g);
+  sim.run({.duration = g.scenario().duration, .step = g.scenario().step},
+          [&](const auto& r) { run.summary.observe(r); });
+  run.slos = simsys::report::evaluate_slos(run.summary, g.scenario().slos);
+  return run;
+}
+
+// The words of the table line that starts with `start` (the op table's row of one client op).
+std::vector<std::string> words_of_row(const std::string& table, std::string_view start) {
+  std::istringstream lines{table};
+  for (std::string line; std::getline(lines, line);) {
+    std::istringstream words{line};
+    std::vector<std::string> row;
+    for (std::string word; words >> word;) row.push_back(word);
+    if (!row.empty() && row[0] == start) return row;
+  }
+  return {};
+}
+}  // namespace
+
+TEST_CASE("each step counts the attempts that timed out, q of every attempt, beside the final ones",
+          "[theory]") {
+  const double q = timed_out_share();
+  const auto g = graph_of(timing_out_with_retries());
+  const auto records = records_of(g, 20);
+  for (std::size_t i = 2; i < records.size(); ++i) {
+    CAPTURE(i);
+    const auto& op = op_of(records[i]);
+    REQUIRE_THAT(op.timed_out_attempts.per_second, WithinRel(attempts_of(op) * q, 1e-6));
+    REQUIRE_THAT(op.timed_out.per_second, WithinRel(400.0 * q * q * q, 1e-6));
+  }
+}
+
+TEST_CASE(
+    "with retries 2 a p99 SLO of 250 ms fails: 10.6 percent of the delivered attempts time out",
+    "[theory]") {
+  const auto g = graph_of(timing_out_with_retries_after_warmup());
+  const auto run = observe(g);
+  REQUIRE(run.slos.size() == 1);
+  CAPTURE(run.slos[0].note);
+  REQUIRE(run.slos[0].status == simsys::report::SloStatus::fail);
+  REQUIRE(run.slos[0].observed == 0.2);  // the timeout: the p99 was never seen answered
+  REQUIRE(run.slos[0].note == "10.6% of delivered requests timed out (more than 1%)");
+}
+
+TEST_CASE("with retries 2 the op table prints the p95 and the p99 as beyond the 200 ms timeout",
+          "[theory]") {
+  const auto g = graph_of(timing_out_with_retries_after_warmup());
+  const auto run = observe(g);
+  const auto table = simsys::report::render_table(run.summary, run.slos, /*color=*/false);
+  CAPTURE(table);
+  const auto row = words_of_row(table, "c.op");
+  // c.op, offered, attempts, timed out, mean, p50, p95, p99
+  REQUIRE(row.size() == 8);
+  REQUIRE(row[6] == ">200ms");
+  REQUIRE(row[7] == ">200ms");
+  REQUIRE(row[5] != ">200ms");  // the median was answered: 89.4 % of the attempts were in time
+}
+
+// The JSON keeps both counts: `timed_out_per_s` the requests given up on for good, 400 q^3, so that
+// answered + timed out = offered still balances, and `timed_out_attempts_per_s` every attempt that
+// timed out, 400 (q + q^2 + q^3) = the attempts 400 (1 + q + q^2) times q.
+TEST_CASE("the JSON op has the final timeouts, 400 q cubed, and the timed out attempts beside them",
+          "[theory]") {
+  const double q = timed_out_share();
+  const auto json = run_json(timing_out_with_retries_after_warmup());
+  CAPTURE(json);
+  REQUIRE_THAT(json_number(json, "timed_out_per_s"), WithinRel(400.0 * q * q * q, 1e-6));
+  REQUIRE_THAT(json_number(json, "timed_out_attempts_per_s"),
+               WithinRel(400.0 * (q + q * q + q * q * q), 1e-6));
+  REQUIRE_THAT(json_number(json, "answered_per_s") + json_number(json, "timed_out_per_s"),
+               WithinRel(400.0, 1e-9));
 }
 
 TEST_CASE("estimate settles a timing out client at 1 + q + q^2 attempts a request", "[theory]") {

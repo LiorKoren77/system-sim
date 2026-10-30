@@ -214,14 +214,22 @@ struct NodeSample {
 // only (Simulation::count_final_timeouts), requests given up on for good; every other failed
 // attempt is sent again, not lost. Within one step `answered` may then exceed `offered` (a wave of
 // retries answered as an outage ends); at a fixed point answered = offered − lost − timed_out
-// still holds, `lost` being the requests whose last attempt was lost.
+// still holds, `lost` being the requests whose last attempt was lost. `timed_out_attempts` counts
+// EVERY attempt that timed out, the last ones and the retried ones: the client waited past its
+// timeout on each, so the share of slow responses a percentile reads is
+// timed_out_attempts / (answered + timed_out_attempts), the attempts delivered (report.cpp's
+// percentile_seen_by_client). Counting the final ones alone would hide the timeouts a retry
+// covered: 10.6 % of the attempts past a 200 ms timeout, retried twice, are 0.12 % of the
+// requests, and a p99 SLO would pass on responses the client never got. Without retries the two
+// counts are equal.
 struct ResponseSample {
   std::size_t client{};
   std::string op{};
   Rate offered{};
   Rate attempts{};
   Rate answered{};
-  Rate timed_out{};
+  Rate timed_out{};           // requests given up on for good: their last attempt timed out
+  Rate timed_out_attempts{};  // every attempt that timed out, retried or not
   flow::LatencyEstimate response{};
   flow::LatencyEstimate delivered_response{};
 };
@@ -2483,6 +2491,7 @@ void Simulation::give_up_after(double timeout_s, ResponseSample& sample) {
   // nothing at all rather than a few requests a year that the table would print latencies for.
   const double delivered_per_s = sample.answered.per_second;
   sample.timed_out = Rate{delivered_per_s * (1.0 - below.fraction)};
+  sample.timed_out_attempts = sample.timed_out;  // count_final_timeouts keeps the last ones apart
   sample.answered = Rate{delivered_per_s - sample.timed_out.per_second};
   sample.response = {.mean_s = below.mean_s, .variance_s2 = below.variance_s2};
 }
@@ -2491,7 +2500,8 @@ void Simulation::give_up_after(double timeout_s, ResponseSample& sample) {
 // attempt that timed out is given up on for good; the others are sent again (feed_back_retries).
 // So the timed-out rate keeps the last attempts' part of it, timed_out × last / attempts: at a
 // fixed point of steady share q timed out, 400/s with 2 retries times out 400 q³, not
-// 400 (1 + q + q²) q. Without retries every attempt is the last: nothing changes.
+// 400 (1 + q + q²) q. `timed_out_attempts` keeps all 400 (1 + q + q²) q: the percentiles read
+// them. Without retries every attempt is the last: nothing changes.
 void Simulation::count_final_timeouts(const behaviours::ClientBehaviour& client,
                                       ResponseSample& sample) {
   if (client.retries() == 0 || sample.attempts.per_second <= 0.0) return;
@@ -2731,8 +2741,9 @@ struct Quantile {
 // A latency SLO on one step: every op of its client it reads (the named op, or all of them) at the
 // quantile of the step's lognormal fit to the delivered requests' moments (report.cpp's
 // percentile_seen_by_client on one step). An op nobody sent, or whose requests were all lost, has
-// no latency and is left out; an op more than 1 − q of whose delivered requests timed out breaks
-// it whatever its max. Empty when it reads no op.
+// no latency and is left out; an op more than 1 − q of whose delivered attempts timed out (every
+// attempt, the retried ones too: ResponseSample::timed_out_attempts) breaks it whatever its max.
+// Empty when it reads no op.
 [[nodiscard]] std::optional<bool> latency_holds(const model::SloSpec& slo,
                                                 std::optional<std::size_t> client,
                                                 const StepRecord& record, double max) {
@@ -2742,7 +2753,7 @@ struct Quantile {
   for (const auto& sample : record.responses) {
     if (sample.client != *client || (slo.op && sample.op != *slo.op)) continue;
     const double answered = sample.answered.per_second;
-    const double timed_out = sample.timed_out.per_second;
+    const double timed_out = sample.timed_out_attempts.per_second;
     const auto& fit = sample.delivered_response;
     if (sample.offered.per_second <= 0.0) continue;
     if (answered + timed_out > 0.0 && timed_out / (answered + timed_out) > q.tail) return false;

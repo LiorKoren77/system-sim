@@ -72,6 +72,10 @@ std::string format_duration(double seconds_value) {
   return duration_text(seconds_value);
 }
 
+std::string format_rate(double per_second) {
+  return fmt_rate(per_second);
+}
+
 // A queue lag as the node table and the SLO lines print it: a duration, or "<1us" for a lag that
 // would print below one microsecond. An idle consumer group's stochastic wait is Erlang C's tiny
 // chance of waiting times a job (youtube's completion_q: 6.3e-11 s, "0.0632ns"), a figure below
@@ -141,8 +145,10 @@ constexpr Quantile median{.level = 0.50, .z = queueing::z_p50};
 constexpr Quantile ninety_fifth{.level = 0.95, .z = queueing::z_p95};
 constexpr Quantile ninety_ninth{.level = 0.99, .z = queueing::z_p99};
 
-// timed_out / (answered + timed_out): the share of the requests the path delivered that came back
-// after the client had given up; 0 when nothing was delivered.
+// timed_out / (answered + timed_out): the share of the attempts the path delivered that came back
+// after the client had given up; 0 when nothing was delivered. `timed_out` counts every attempt
+// that timed out (OpTotals::timed_out_attempts), the retried ones too: the client waited past its
+// timeout on each, and that is the share a percentile asks about.
 [[nodiscard]] double timed_out_share(double answered, double timed_out) {
   const double delivered = answered + timed_out;
   return delivered > 0.0 ? timed_out / delivered : 0.0;
@@ -220,7 +226,7 @@ struct SeenPercentile {
 // One that timed out fails at the timeout (fail_if_quantile_timed_out), an unavailable one at
 // infinity.
 [[nodiscard]] bool every_request_lost(const OpSummary& op) {
-  return !nothing_offered(op) && nothing_answered(op) && op.timed_out_per_s <= 0.0 &&
+  return !nothing_offered(op) && nothing_answered(op) && op.timed_out_attempts_per_s <= 0.0 &&
          std::isfinite(op.mean_s);
 }
 
@@ -876,16 +882,18 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
 [[nodiscard]] std::string json_op(const OpSummary& op) {
   const bool no_latency = nothing_answered(op);
   const auto latency = [&](double value) { return no_latency ? "null" : json_number(value); };
-  const std::array fields{json_field("client", json_string(op.client)),
-                          json_field("op", json_string(op.op)),
-                          json_field("offered_per_s", json_number(op.offered_per_s)),
-                          json_field("attempts_per_s", json_number(op.attempts_per_s)),
-                          json_field("answered_per_s", json_number(op.answered_per_s)),
-                          json_field("timed_out_per_s", json_number(op.timed_out_per_s)),
-                          json_field("mean_s", latency(op.mean_s)),
-                          json_field("p50_s", latency(op.p50_s)),
-                          json_field("p95_s", latency(op.p95_s)),
-                          json_field("p99_s", latency(op.p99_s))};
+  const std::array fields{
+      json_field("client", json_string(op.client)),
+      json_field("op", json_string(op.op)),
+      json_field("offered_per_s", json_number(op.offered_per_s)),
+      json_field("attempts_per_s", json_number(op.attempts_per_s)),
+      json_field("answered_per_s", json_number(op.answered_per_s)),
+      json_field("timed_out_per_s", json_number(op.timed_out_per_s)),
+      json_field("timed_out_attempts_per_s", json_number(op.timed_out_attempts_per_s)),
+      json_field("mean_s", latency(op.mean_s)),
+      json_field("p50_s", latency(op.p50_s)),
+      json_field("p95_s", latency(op.p95_s)),
+      json_field("p99_s", latency(op.p99_s))};
   return json_object(fields);
 }
 
@@ -1075,19 +1083,21 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
   }
 }
 
-// A step whose response is infinite (a node on the path never answers) poisons the whole
-// op: no finite average describes it. It is flagged instead of accumulated, so no
-// 0 × inf = NaN can reach the sums. A step that delivered nothing (answered + timed out = 0: every
-// request it sent was dropped or refused, or it sent none) adds its counts and nothing else: no
-// request saw its latency, so it weighs no moment and flags nothing, whatever the latency a
-// request WOULD have seen (phase 3 Task 6's review: a node that is down drops what its full room
-// cannot hold, and those steps must not decide the op's latency for the whole run).
+// A step whose response is infinite (a node on the path never answers) poisons the whole op: no
+// finite average describes it. It is flagged instead of accumulated, so no 0 × inf = NaN can reach
+// the sums. A step that delivered nothing (answered + timed-out attempts = 0: every request it sent
+// was dropped or refused, or it sent none) adds its counts and nothing else: no request saw its
+// latency, so it weighs no moment and flags nothing, whatever the latency a request WOULD have seen
+// (phase 3 Task 6's review: a node that is down drops what its full room cannot hold, and those
+// steps must not decide the op's latency for the whole run).
 void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
   offered += sample.offered.per_second * dt_s;
   attempts += sample.attempts.per_second * dt_s;
   answered += sample.answered.per_second * dt_s;
   timed_out += sample.timed_out.per_second * dt_s;
-  if (!(sample.answered.per_second + sample.timed_out.per_second > 0.0)) return;
+  timed_out_attempts += sample.timed_out_attempts.per_second * dt_s;
+  const double delivered_per_s = sample.answered.per_second + sample.timed_out_attempts.per_second;
+  if (!(delivered_per_s > 0.0)) return;
   const auto& response = sample.response;
   if (!std::isfinite(response.mean_s) || !std::isfinite(response.variance_s2)) {
     unavailable = true;
@@ -1101,8 +1111,7 @@ void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
   // Weighted by the requests DELIVERED: the client's quantiles range over every request that came
   // back, the ones it gave up on included.
   const auto& delivered = sample.delivered_response;
-  by_delivered.add((sample.answered.per_second + sample.timed_out.per_second) * dt_s,
-                   delivered.mean_s, delivered.variance_s2);
+  by_delivered.add(delivered_per_s * dt_s, delivered.mean_s, delivered.variance_s2);
 }
 
 // A bandwidth link's pipe is a queue like a node's (engine::LinkSample has NodeSample's fields of
@@ -1299,14 +1308,16 @@ std::vector<OpSummary> Summary::ops() const {
   std::vector<OpSummary> out;
   for (const auto& t : ops_) {
     const auto& client = graph_->nodes()[t.client].spec;
-    OpSummary op{.client = client.id,
-                 .op = t.op,
-                 .offered_per_s = observed_s_ > 0.0 ? t.offered / observed_s_ : 0.0,
-                 .attempts_per_s = observed_s_ > 0.0 ? t.attempts / observed_s_ : 0.0,
-                 .answered_per_s = observed_s_ > 0.0 ? t.answered / observed_s_ : 0.0,
-                 .timed_out_per_s = observed_s_ > 0.0 ? t.timed_out / observed_s_ : 0.0,
-                 .timeout_s = graph::client_timeout_s(client),
-                 .timed_out_share = timed_out_share(t.answered, t.timed_out)};
+    OpSummary op{
+        .client = client.id,
+        .op = t.op,
+        .offered_per_s = observed_s_ > 0.0 ? t.offered / observed_s_ : 0.0,
+        .attempts_per_s = observed_s_ > 0.0 ? t.attempts / observed_s_ : 0.0,
+        .answered_per_s = observed_s_ > 0.0 ? t.answered / observed_s_ : 0.0,
+        .timed_out_per_s = observed_s_ > 0.0 ? t.timed_out / observed_s_ : 0.0,
+        .timed_out_attempts_per_s = observed_s_ > 0.0 ? t.timed_out_attempts / observed_s_ : 0.0,
+        .timeout_s = graph::client_timeout_s(client),
+        .timed_out_share = timed_out_share(t.answered, t.timed_out_attempts)};
     if (t.unavailable) {
       op.mean_s = op.p50_s = op.p95_s = op.p99_s = infinity;
     } else {

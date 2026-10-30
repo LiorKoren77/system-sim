@@ -289,6 +289,23 @@ TEST_CASE("a client op's p50, p95 and p99 and a node's peak_rho and drop_rate ar
   REQUIRE(parse_metric("users.ping.p99")->op == "ping");
 }
 
+// A client op's rates: what it sent, retries included (`attempts`, the op table's attempts/s), and
+// what came back answered (`answered`, JSON's answered_per_s).
+TEST_CASE("a client op's attempts and answered rates are metrics") {
+  using simsys::sweep::MetricKind;
+  const std::array expected{std::pair{"users.ping.attempts", MetricKind::attempts_rate},
+                            std::pair{"users.ping.answered", MetricKind::answered_rate}};
+  for (const auto& [name, kind] : expected) {
+    CAPTURE(name);
+    const auto metric = parse_metric(name);
+    INFO((metric ? "" : metric.error()));
+    REQUIRE(metric.has_value());
+    REQUIRE(metric->kind == kind);
+    REQUIRE(metric->node == "users");
+    REQUIRE(metric->op == "ping");
+  }
+}
+
 TEST_CASE("a client has no drop rate to sweep, as it has no utilization") {
   const auto drops = parse_metric("users.drop_rate");
   REQUIRE(drops.has_value());
@@ -498,6 +515,54 @@ TEST_CASE("a percentile that is the client's timeout prints as the op table prin
   REQUIRE(split_words(table[3]) == std::vector<std::string>{"45ms", "7.6ms", ">45ms"});
   const auto csv = split(render_sweep(param, metrics, *rows, SweepFormat::csv), '\n');
   REQUIRE(csv[1] == "5ms,0.005,0.005");
+}
+
+namespace {
+// u sends 1000/s into an external sink that fails half of what it serves (room to spare: 100k/s),
+// with `retries` to sweep. Observed after a 1 s warmup, so the retry ramp is left out.
+std::string retrying_sink_path() {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("simsys-sweep-retries-" + std::to_string(getpid()) + ".yaml");
+  std::ofstream{path} << "version: 1\nname: retrying-sink\nduration: 10s\nstep: 100ms\n"
+                         "warmup: 1s\nnodes:\n"
+                         "  u: {type: client, rate: {base: 1k/s}, ops: {call: 1.0}, retries: 0}\n"
+                         "  api: {type: external_sink, capacity: 100k/s, latency: 1ms, "
+                         "failure_rate: 0.5}\n"
+                         "links:\n  - {from: u, to: api, dir: inout, latency: 0s}\n";
+  return path.string();
+}
+}  // namespace
+
+// The retry storm as a sweep: a path that fails half of what it is sent, swept from no retries to
+// two. Without retries u sends its 1000/s once and half is answered; with 2 it sends each request
+// 1 + 0.5 + 0.25 = 1.75 times (1750/s) and answers 1 − 0.5^3 = 87.5 % of them (875/s)
+// (tests/theory/test_retries.cpp derives both). The table prints the rates as the op table does.
+TEST_CASE("sweeping a client's retries reads its attempts and answered rates: 1k then 1.75k sent") {
+  const auto path = retrying_sink_path();
+  const std::vector<SweepMetric> metrics{*parse_metric("u.call.attempts"),
+                                         *parse_metric("u.call.answered")};
+  const SweepParam param{.path = "nodes.u.retries", .values = {"0", "2"}};
+  const auto rows = run_sweep(path, param, metrics, 1);
+  std::filesystem::remove(path);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  REQUIRE_THAT((*rows)[0].metrics[0], WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT((*rows)[0].metrics[1], WithinRel(500.0, 1e-9));
+  REQUIRE_THAT((*rows)[1].metrics[0], WithinRel(1750.0, 1e-9));
+  REQUIRE_THAT((*rows)[1].metrics[1], WithinRel(875.0, 1e-9));
+  const auto table = split(render_sweep(param, metrics, *rows, SweepFormat::table), '\n');
+  CAPTURE(table);
+  REQUIRE(split_words(table[2]) == std::vector<std::string>{"0", "1k/s", "500/s"});
+  REQUIRE(split_words(table[3]) == std::vector<std::string>{"2", "1.75k/s", "875/s"});
+}
+
+TEST_CASE("an attempts metric on a node that is not a client is an error naming its type") {
+  const std::vector<SweepMetric> metrics{*parse_metric("api.ping.attempts")};
+  const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1);
+  REQUIRE_FALSE(rows.has_value());
+  REQUIRE(rows.error() == std::string{hello_path} +
+                              ": error: --metric: api.ping.attempts: 'api' has type service, "
+                              "not client");
 }
 
 TEST_CASE("the rows do not depend on how many workers ran the points") {
