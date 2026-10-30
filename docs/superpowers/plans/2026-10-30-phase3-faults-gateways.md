@@ -300,7 +300,8 @@ scenarios) and eleven probes (replicas, pipe anchor, nested losses, sinks, `fact
    failures only: sized by run/estimate".
 7. Minor/backlog: the time to error of a failed request is reported nowhere (`error_latency` per
    client op): Phase 4 backlog.
-Decisions: 1–6 fixed in the fix round; 7 to the backlog. Suggestion kept for Task 19: give
+Decisions: 1–6 fixed in the fix round; 7 to the backlog. Fixed at `8fa2efc` (1312 tests; a miss step placed after
+the failure step still counts toward its share, stated in the schema). Suggestion kept for Task 19: give
 notification-system an `on: failure` step once Task 11's pool retries exist.
 
 ### Task 10: client retries as feedback, `attempts/s`
