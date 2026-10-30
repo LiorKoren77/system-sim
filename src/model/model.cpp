@@ -69,5 +69,10 @@ template void emit_special_members(std::optional<std::vector<std::string>>*,
 // Simulation that holds it): the move constructor of std::vector<std::size_t>'s base went missing
 // from the release link of scenario_tests.
 template void emit_special_members(std::vector<std::size_t>*, std::vector<std::size_t>&);
+// engine::Simulation::flushed_write_ops_ (phase 3 Task 7 review: each flushed cache's write ops,
+// moved with the Simulation): the move constructor of std::vector<std::vector<std::string>> went
+// missing from the release link of the test support library (fixtures.cpp).
+template void emit_special_members(std::vector<std::vector<std::string>>*,
+                                   std::vector<std::vector<std::string>>&);
 
 }  // namespace simsys::model::detail

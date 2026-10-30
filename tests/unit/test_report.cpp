@@ -3258,6 +3258,63 @@ TEST_CASE("a fault that starts inside an earlier one on the same node says it ov
   REQUIRE(out.json.contains("\"overlaps_at_s\": [10]"));
 }
 
+// Task 7's review, finding 3: a dc_down takes every node of its datacenter down, so a fault on one
+// of them that starts while the dc_down counts overlaps it, and a dc_down that starts while a fault
+// on one of its nodes counts overlaps that fault. The mm1 probe's nodes are in the default
+// datacenter `main`; a dc_down of another datacenter overlaps nothing on them.
+TEST_CASE("a dc_down and a fault on a node of its datacenter overlap, whichever comes first",
+          "[report]") {
+  auto dc_down = node_down_record();
+  dc_down.kind = FaultKind::dc_down;
+  dc_down.node = "";
+  dc_down.datacenter = "main";
+  auto node_down_later = node_down_record();
+  node_down_later.at = SimTime{15s};
+  const auto node_after_dc = rendered_with({dc_down, node_down_later});
+  CAPTURE(node_after_dc.table);
+  REQUIRE(node_after_dc.table.contains(
+      "fault 00:00:15 node_down s for 10s (overlaps fault 00:00:10)\n"));
+  REQUIRE(node_after_dc.json.contains("\"overlaps_at_s\": [10]"));
+
+  auto dc_down_later = dc_down;
+  dc_down_later.at = SimTime{15s};
+  const auto dc_after_node = rendered_with({node_down_record(), dc_down_later});
+  CAPTURE(dc_after_node.table);
+  REQUIRE(dc_after_node.table.contains(
+      "fault 00:00:15 dc_down main for 10s (overlaps fault 00:00:10)\n"));
+
+  auto elsewhere = dc_down_later;
+  elsewhere.datacenter = "eu";
+  const auto other_dc = rendered_with({node_down_record(), elsewhere});
+  CAPTURE(other_dc.table);
+  REQUIRE(other_dc.table.contains("fault 00:00:15 dc_down eu for 10s\n"));
+}
+
+// Task 7's review, finding 5: a flush whose warm-up the next flush of its cache cut short was never
+// warm: the after line names that flush on the clock, and the JSON has `cache_warm_in_s` null and
+// `interrupted_by_flush_at_s`, a key only a cache_flush's `after` has.
+TEST_CASE("a flush interrupted by the next flush says so in its after line and its JSON",
+          "[report]") {
+  auto record = node_down_record();
+  record.kind = FaultKind::cache_flush;
+  record.node = "edge";
+  record.at = SimTime{10min};
+  record.duration = SimTime{0};
+  record.backlog_peak = 0;
+  record.after = {.backlog_node = {},
+                  .backlog_drained_in_s = {},
+                  .cache_warm_in_s = {},
+                  .interrupted_by_flush_at = SimTime{605s}};
+  const auto out = rendered_with({record});
+  CAPTURE(out.table, out.json);
+  REQUIRE(out.table.contains("  after:    interrupted by the flush at 00:10:05\n"));
+  REQUIRE(
+      out.json.contains("\"cache_warm_in_s\": null, \"interrupted_by_flush_at_s\": 605, "
+                        "\"retries_added_attempts\": null"));
+  const auto plain = rendered_with({node_down_record()});
+  REQUIRE_FALSE(plain.json.contains("interrupted_by_flush_at_s"));
+}
+
 // The JSON of one record, key by key, in seconds; `recovered_at_s` is the same number as the text's
 // `00:00:20.2`, as a double.
 TEST_CASE(

@@ -18,7 +18,8 @@
 //   capacity       capacity × factor        a degraded tier; a request still takes its service time
 //   latency_spike  service time + extra     a slow dependency (its servers drain c / (s + extra))
 //   traffic_spike  a client's rate × factor a flash crowd, as a `spikes` entry on its rate curve
-//   cache_flush    hit ratio × h(t) / h     the cache emptied at `at`, warming back (WarmUp below)
+//   cache_flush    hit ratio × h(n) / h     the cache emptied at `at`, warming back on the n reads
+//                                           it gets from then on (WarmUp below)
 //   dc_down        node_down on every node of the datacenter, and capacity × 0 on every link that
 //                  crosses its edge (link_condition_at)
 // Captured: when a fault starts and ends, how much capacity it takes, that faults on one node add
@@ -29,9 +30,12 @@
 // promoted), which copies go down (the survivors share the load evenly: a copy's capacity is
 // scaled, see fluid::Derating; a kv_cluster's down machines are cool ones, see
 // behaviours::KvClusterBehaviour), what clients do about it (a client's `retries` are its own
-// model, behaviours::ClientBehaviour: the schedule only takes the capacity away), and
-// ch. 1's geoDNS failover: a dc_down cuts the datacenter off, and only the scenario's own links (a
-// second route the client splits its requests over) send anything elsewhere.
+// model, behaviours::ClientBehaviour: the schedule only takes the capacity away), ch. 1's geoDNS
+// failover: a dc_down cuts the datacenter off, and only the scenario's own links (a second route
+// the client splits its requests over) send anything elsewhere, and ch. 1's data synchronisation
+// between datacenters: a dc_down has no replication lag and loses no writes, the other
+// datacenter's stores are assumed current (and its caches come back warm at `at + for`: a cold
+// restart is a cache_flush the scenario scripts at that time).
 //
 // C++20 module partition, interface kind: `export module simsys.engine:faults;` names a piece of
 // the module simsys.engine whose exports become part of the module's interface once the primary
@@ -48,7 +52,7 @@ module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this unit imports other modules (GCC 14.2 'Bad
 // file data' bug, CLAUDE.md §3). SimTime's member operators (+=) work without <chrono>; its
 // comparisons and differences go through .count().
-#include <algorithm>  // std::ranges::contains, std::max
+#include <algorithm>  // std::ranges::contains, std::max, std::min
 #include <cstddef>
 #include <limits>
 #include <optional>
@@ -93,27 +97,21 @@ struct Condition {
   double back_in_s = 0;
   SimTime extra_latency{};      // + service time: latency_spike's extra
   double rate_factor = 1;       // × a client's rate: traffic_spike's factor
-  double hit_ratio_factor = 1;  // × a cache's hit ratio: cache_flush's warm-up, h(t) / h
+  double hit_ratio_factor = 1;  // × a cache's hit ratio: cache_flush's warm-up, h(n) / h
 };
 
 // The scenario's faults, resolved once against its graph: which node or link each acts on, when,
-// and the Condition it puts it in while it lasts. Built by engine::Simulation, which also supplies
-// the one number the graph cannot: how many reads a flushed cache is handed at the flush.
+// and the Condition it puts it in while it lasts. Built by engine::Simulation, which also hands it,
+// after every step, the one thing the graph cannot tell: the reads each flushed cache was sent in
+// that step (count_reads), which its warm-up counts.
 class FaultSchedule {
  public:
   FaultSchedule() = default;  // no faults: the identity for every node and link, at every time
 
-  // `g.scenario().faults` resolved against `g`. `flush_reads[i]` is, for a cache_flush at position
-  // i of the faults list, the reads per second the flushed cache (all its copies together) is
-  // handed at the flush, which the warm-up turns into "requests seen" (WarmUp); entries for the
-  // other kinds are not read, and a list without a cache_flush may pass none. The engine computes
-  // them (Simulation::fault_schedule_of). Throws std::invalid_argument for a cache_flush without
-  // its entry, or on a fixed-ratio cache without `keys` (Simulation::create refuses that scenario
-  // first): programmer errors.
-  // C++20 std::span<const double>: a non-owning read-only view of contiguous doubles, so the caller
-  // may pass a vector, an array or `{}` (no flush) without this class owning or copying them;
-  // replaces a `const std::vector<double>&`, which would force the caller to build a vector.
-  FaultSchedule(const graph::Graph& g, std::span<const double> flush_reads);
+  // `g.scenario().faults` resolved against `g`, every flushed cache still empty (it has been sent
+  // no reads yet: count_reads). Throws std::invalid_argument for a cache_flush on a fixed-ratio
+  // cache without `keys` (Simulation::create refuses that scenario first): a programmer error.
+  explicit FaultSchedule(const graph::Graph& g);
 
   // The condition of node `node` (its index in Scenario::nodes, which is Graph::index_of's) at
   // `now`: every fault on it active at `now` composed, the identity when none is. A fault is
@@ -131,13 +129,26 @@ class FaultSchedule {
 
   // The nodes a cache_flush acts on, each once, in the order of their first flush: the caches
   // whose hit ratio factor the engine hands, every step, to the behaviours that route their
-  // misses (Simulation::warm_flushed_caches). Empty without a flush.
+  // misses (Simulation::warm_flushed_caches), and whose reads it counts (count_reads). Empty
+  // without a flush.
+  // C++20 std::span<const std::size_t>: a non-owning read-only view of contiguous elements (here
+  // the schedule's own vector), so the caller iterates them without a copy and without being tied
+  // to the container; replaces returning a `const std::vector<std::size_t>&`.
   [[nodiscard]] std::span<const std::size_t> flushed_caches() const { return flushed_; }
 
-  // The seconds the flush of cache `cache` at `at` takes to warm back: until its hit ratio factor
-  // is 1 again, full_at / reads_per_copy (WarmUp: t_c / rate for a che cache, keys / rate for a
-  // fixed ratio). Empty when no such flush changes anything (a cache without a hit ratio) or the
-  // cache is handed no reads, so that it never fills.
+  // The reads cache `cache` (all its copies together, its write ops left out) was sent in the step
+  // [now, now + dt), at `reads_per_s`: what its warm-up counts (WarmUp). Each flush of the cache
+  // counts the part of the step from its `at` to the next flush of the cache, if any, and nothing
+  // once the cache is full again. The engine calls it after every step's forward pass
+  // (Simulation::count_flushed_reads), so the hit ratio of the next step is h(n) at the reads
+  // seen so far. Nothing to count on a node never flushed.
+  void count_reads(std::size_t cache, SimTime now, SimTime dt, double reads_per_s);
+
+  // The seconds the flush of cache `cache` at `at` took to warm back: from `at` to the moment
+  // inside the step during which the reads counted since the flush reached the full point
+  // (WarmUp), once count_reads has got there. Empty before that, for ever when the cache never
+  // fills (it is sent too few reads, or the next flush empties it first), and when no such flush
+  // changes anything (a cache without a hit ratio).
   [[nodiscard]] std::optional<double> warm_up_s(std::size_t cache, SimTime at) const;
 
  private:
@@ -157,27 +168,39 @@ class FaultSchedule {
     SimTime duration{};
   };
 
-  // A flushed cache refilling (spec §4.3). At t after the flush ONE copy of the cache has seen
-  // n = reads_per_copy × t requests, at the reads per second it was handed at the flush (kept for
-  // the whole warm-up: a rate curve that rises or falls meanwhile is not followed). Each of its R
-  // copies sees 1/R of the reads and fills its own entries (a ring's copies hold different keys,
-  // so a partitioned che cache counts as one cache of keys × R seeing every read). Its hit ratio
-  // is then, relative to the steady h it had before the flush:
+  // A flushed cache refilling (spec §4.3; docs/study/numerics.md, "warm-up", has the derivation).
+  // ONE copy of the cache has seen n requests since the flush: the sum of the reads the engine
+  // counted, step by step (count_reads), each step's reads × `share_per_copy`. Each of its R copies
+  // sees 1/R of the reads and fills its own entries (a ring's copies hold different keys, so a
+  // partitioned che cache counts as one cache of keys × R seeing every read: partitions / R). n is
+  // the integral of the reads the cache actually gets, so a cache flushed while nothing reads it
+  // stays empty until the reads come, and one flushed on a rising curve fills faster as it rises
+  // (at a constant rate n = rate × t). Its hit ratio for a step is then, at the n of the steps
+  // before it and relative to the steady h it had before the flush:
   //   che       h(n) / h = refill_hit_ratio(C, popularity, n) / che_hit_ratio(C, popularity)
-  //             (caching::refill_hit_ratio: the Che hit ratio of a cache of min(C, D(n)) entries,
-  //             D(n) the distinct keys among n requests), full at n = t_c, Che's characteristic
-  //             time of C, where D(t_c) = C by definition
-  //   fixed     n / keys: one new entry per request (every request misses an empty cache), so the
-  //             cache is full after keys requests, keys / rate seconds, and a ratio that is a
-  //             number, not a function of the size, warms linearly: the simple case
+  //             (caching::refill_hit_ratio: Σ p_i (1 − e^{−p_i n}), the hit ratio of an LRU cache
+  //             whose characteristic time is n, while its D(n) = Σ (1 − e^{−p_i n}) distinct keys
+  //             are fewer than C), full at n = t_c, Che's characteristic time of C, where
+  //             D(t_c) = C by definition
+  //   fixed     n / keys: linear in the reads, full after `keys` of them. The simple case, and an
+  //             optimistic one: it has every read add an entry, but once h(n) = h · n / keys only
+  //             the misses do. The consistent model, dE/dn = 1 − h · E / K for K = keys entries,
+  //             gives E(n) = (K / h)(1 − e^{−h n / K}), full at n = −(K / h) ln(1 − h): 2.56 K at
+  //             h = 0.9, not K. A fixed ratio has no popularity to say which, so the simple case
+  //             is kept (and pinned: 0.45 at half the fill of a 0.9 cache)
   // and exactly 1 from the moment it is full (`full_at`, in requests per copy). 0 at the flush.
   // Ignored: that an LRU cache refills in recency order (the recent keys are a little hotter than
   // "distinct"), the thundering herd of misses on the store, and the keys a write would put back.
   struct WarmUp {
     std::size_t cache{};
     SimTime at{};
-    double reads_per_copy{};  // per second
+    // The next flush of the same cache, which empties it again: this warm-up counts no reads from
+    // then on (warmth_at reads the later one). Empty when there is none.
+    std::optional<SimTime> until{};
+    double share_per_copy{};  // × the cache's reads: one copy's share (partitions / R, 1 / R)
     double full_at{};         // requests per copy: keys (fixed) or t_c (che)
+    double seen{};            // n: the requests one copy has seen since the flush (count_reads)
+    std::optional<double> warm_in_s{};  // warm_up_s, once `seen` reaches `full_at`
     // che only: the popularity the cache's reads draw from, its capacity C in keys and its steady
     // Che hit ratio. Empty for a fixed ratio.
     std::optional<caching::Popularity> popularity{};
@@ -187,9 +210,11 @@ class FaultSchedule {
 
   void add_node_fault(const graph::Graph& g, const model::Fault& fault);
   void add_dc_down(const graph::Graph& g, const model::Fault& fault);
-  void add_flush(const graph::Graph& g, const model::Fault& fault, double reads);
-  [[nodiscard]] static WarmUp warm_up_of(const graph::Graph& g, std::size_t cache, SimTime at,
-                                         double reads);
+  void add_flush(const graph::Graph& g, const model::Fault& fault);
+  void end_at_next_flushes();
+  [[nodiscard]] static WarmUp warm_up_of(const graph::Graph& g, std::size_t cache, SimTime at);
+  [[nodiscard]] static double counted_s(const WarmUp& warm_up, SimTime now, SimTime dt);
+  static void add_reads(WarmUp& warm_up, SimTime now, double reads_per_s, double counted_s);
   [[nodiscard]] static Condition effect_of(const model::Fault& fault, const model::NodeSpec& node);
   [[nodiscard]] static Condition down_effect(const model::Fault& fault,
                                              const model::NodeSpec& node);
@@ -203,7 +228,7 @@ class FaultSchedule {
   [[nodiscard]] double back_in_s(std::size_t node, SimTime now) const;
   [[nodiscard]] double link_back_in_s(std::size_t link, SimTime now) const;
   [[nodiscard]] double warmth_at(std::size_t node, SimTime now) const;
-  [[nodiscard]] static double warmth(const WarmUp& warm_up, SimTime now);
+  [[nodiscard]] static double warmth(const WarmUp& warm_up);
 
   std::vector<Scheduled> faults_;     // in the scenario's order
   std::vector<Cut> cuts_;             // dc_down's links, in the scenario's order
@@ -292,8 +317,14 @@ struct FaultAfter {
   // back by the end of the run.
   std::optional<double> backlog_drained_in_s{};
   // A cache_flush only: seconds from the flush until the cache is full again (its hit ratio
-  // factor back at 1: FaultSchedule::warm_up_s), once the run got that far; empty otherwise.
+  // factor back at 1: FaultSchedule::warm_up_s), once the run got that far; empty otherwise, and
+  // when the next flush of the cache emptied it first (below).
   std::optional<double> cache_warm_in_s{};
+  // A cache_flush only: the `at` of the next flush of the same cache when it struck before this
+  // one's cache was full again. That flush empties the cache and starts a warm-up of its own, so
+  // this one's window ends there: it never got warm, and the misses from then on are the later
+  // flush's. Empty otherwise.
+  std::optional<SimTime> interrupted_by_flush_at{};
   // The retries the fault set off (ch. 1's retry storm), each over the twin's from `at` to the
   // recovery, 0 when there were none. `retries_added_attempts`: Σ (attempts − offered) of every
   // client whose paths reach the faulted part (a traffic_spike: its client), the requests sent
@@ -311,10 +342,13 @@ struct FaultAfter {
 // (the spiked rate), served = answered, lost = the requests lost for good (their last attempt lost
 // on the way or timed out: offered − answered without retries), and no backlog or room of its own
 // (the backlog the spike builds is downstream: `after`). The window "during" is [at, at + for); for
-// a cache_flush, an instant, it is the warm-up [at, at + warm_up_s) (to the end of the run if the
-// cache never warms): the time the flush costs anything. What a flush costs is not a loss (its
-// cache drops nothing) but the reads its empty cache sends on: `extra_misses`, the origin's demand
-// minus the twin's, summed over the warm-up.
+// a cache_flush, an instant, it is the warm-up [at, at + flush_window_s): until the cache is full
+// again, or until the next flush of the same cache empties it first (FaultAfter's
+// interrupted_by_flush_at), to the end of the run if neither happens: the time the flush costs
+// anything. The run alone finds out when that is (the warm-up counts the reads the cache gets:
+// FaultSchedule::count_reads). What a flush costs is not a loss (its cache drops nothing) but the
+// reads its empty cache sends on: `extra_misses`, the origin's demand minus the twin's, summed
+// over the window.
 struct FaultRecord {
   model::FaultKind kind{};
   std::string node{};  // as the fault names it (empty for a dc_down: see `datacenter`)
@@ -338,9 +372,11 @@ struct FaultRecord {
   double extra_misses{};
   std::string origin{};
   std::string origin_unit{"requests"};
-  // A cache_flush: its window "during", the warm-up FaultSchedule::warm_up_s gives, known from
-  // the start; empty for every other kind and for a cache that never warms.
-  std::optional<double> warm_up_s{};
+  // A cache_flush: the length of its window "during" (above), in seconds, set at the step at which
+  // the run finds it: the warm-up FaultSchedule::warm_up_s gives, or the time to the next flush
+  // of the cache when that one strikes first. Empty while the cache is still warming, and for
+  // every other kind. A cache without a hit ratio loses nothing to a flush: 0 from the start.
+  std::optional<double> flush_window_s{};
   FaultAfter after{};
   // The start of the first step at or after at + for with every client op's p99 and every node's
   // rho within 1 % of the twin's same step; empty when the run ended first.
@@ -417,7 +453,7 @@ template <class Window, class Predicate>
 
 // Each fault's effect is worked out here, once; a fault that changes nothing is left out, so
 // condition_at never meets it.
-FaultSchedule::FaultSchedule(const graph::Graph& g, std::span<const double> flush_reads) {
+FaultSchedule::FaultSchedule(const graph::Graph& g) {
   for (const auto& node : g.nodes()) {
     kv_machines_.push_back(
         node.spec.type == model::NodeType::kv_cluster ? model::copies_of(node.spec) : 0);
@@ -429,11 +465,7 @@ FaultSchedule::FaultSchedule(const graph::Graph& g, std::span<const double> flus
         add_dc_down(g, faults[i]);
         break;
       case model::FaultKind::cache_flush:
-        if (i >= flush_reads.size()) {
-          throw std::invalid_argument{"FaultSchedule: no read rate for the cache_flush of faults[" +
-                                      std::to_string(i) + "]"};
-        }
-        add_flush(g, faults[i], flush_reads[i]);
+        add_flush(g, faults[i]);
         break;
       case model::FaultKind::node_down:
       case model::FaultKind::capacity:
@@ -443,6 +475,7 @@ FaultSchedule::FaultSchedule(const graph::Graph& g, std::span<const double> flus
         break;
     }
   }
+  end_at_next_flushes();
 }
 
 void FaultSchedule::add_node_fault(const graph::Graph& g, const model::Fault& fault) {
@@ -480,30 +513,41 @@ void FaultSchedule::add_dc_down(const graph::Graph& g, const model::Fault& fault
 }
 
 // A flush of a cache with no hit ratio (a CDN that misses every read) changes nothing: h × 0 = h.
-void FaultSchedule::add_flush(const graph::Graph& g, const model::Fault& fault, double reads) {
+void FaultSchedule::add_flush(const graph::Graph& g, const model::Fault& fault) {
   const std::size_t cache = node_named(g, fault);
   if (!g.nodes()[cache].hit_ratio) return;
-  warm_ups_.push_back(warm_up_of(g, cache, fault.at, reads));
+  warm_ups_.push_back(warm_up_of(g, cache, fault.at));
   // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
   // `std::find(begin, end, value) != end`. may_cut uses its projection form (`&Cut::link`: compare
   // each element's member, not the element).
   if (!std::ranges::contains(flushed_, cache)) flushed_.push_back(cache);
 }
 
-// The warm-up's numbers (WarmUp's comment has the model), resolved once.
+// Each flush's warm-up ends where the next flush of the same cache (the earliest later `at`)
+// empties it again (WarmUp::until).
+void FaultSchedule::end_at_next_flushes() {
+  for (auto& warm_up : warm_ups_) {
+    for (const auto& later : warm_ups_) {
+      if (later.cache != warm_up.cache || later.at.count() <= warm_up.at.count()) continue;
+      if (!warm_up.until || later.at.count() < warm_up.until->count()) warm_up.until = later.at;
+    }
+  }
+}
+
+// The warm-up's numbers (WarmUp's comment has the model), resolved once; it has seen no reads yet.
 FaultSchedule::WarmUp FaultSchedule::warm_up_of(const graph::Graph& g, std::size_t cache,
-                                                SimTime at, double reads) {
+                                                SimTime at) {
   const auto& node = g.nodes()[cache];
   const auto& resolved = *node.hit_ratio;
   const double copies = static_cast<double>(model::copies_of(node.spec));
-  if (!resolved.keys) {  // a fixed ratio: linear over keys / rate
+  if (!resolved.keys) {  // a fixed ratio: linear in n / keys
     if (!node.spec.keys) {
       throw std::invalid_argument{"FaultSchedule: cache_flush on '" + node.spec.id +
                                   "', a fixed ratio without keys (Simulation::create refuses it)"};
     }
     return WarmUp{.cache = cache,
                   .at = at,
-                  .reads_per_copy = reads / copies,
+                  .share_per_copy = 1.0 / copies,
                   .full_at = static_cast<double>(*node.spec.keys)};
   }
   // che: a ring's partitions hold different keys, one cache of `capacity` seeing every read; any
@@ -513,7 +557,7 @@ FaultSchedule::WarmUp FaultSchedule::warm_up_of(const graph::Graph& g, std::size
   const double steady = caching::che_hit_ratio(resolved.capacity, popularity);
   return WarmUp{.cache = cache,
                 .at = at,
-                .reads_per_copy = reads * static_cast<double>(resolved.partitions) / copies,
+                .share_per_copy = static_cast<double>(resolved.partitions) / copies,
                 .full_at = full_at,
                 .popularity = std::move(popularity),
                 .capacity = resolved.capacity,
@@ -582,25 +626,52 @@ double FaultSchedule::warmth_at(std::size_t node, SimTime now) const {
     if (warm_up.cache != node || warm_up.at.count() > now.count()) continue;
     if (latest == nullptr || warm_up.at.count() >= latest->at.count()) latest = &warm_up;
   }
-  return latest == nullptr ? 1.0 : warmth(*latest, now);
+  return latest == nullptr ? 1.0 : warmth(*latest);
 }
 
-// The step at which warmth reaches 1, as a time from the flush: n = reads_per_copy × t reaches
-// full_at at t = full_at / reads_per_copy.
+// Every warm-up of the cache still filling counts its part of the step (counted_s).
+void FaultSchedule::count_reads(std::size_t cache, SimTime now, SimTime dt, double reads_per_s) {
+  for (auto& warm_up : warm_ups_) {
+    if (warm_up.cache != cache || warm_up.warm_in_s) continue;
+    const double counted = counted_s(warm_up, now, dt);
+    if (counted > 0.0) add_reads(warm_up, now, reads_per_s * warm_up.share_per_copy, counted);
+  }
+}
+
+// The seconds of the step [now, now + dt) inside the warm-up's span [at, until): all of a step
+// after the flush, the part after `at` of the step the flush falls in, none before it or once the
+// next flush has emptied the cache again. Tick arithmetic, exact.
+double FaultSchedule::counted_s(const WarmUp& warm_up, SimTime now, SimTime dt) {
+  const auto start = std::max(now.count(), warm_up.at.count());
+  auto end = now.count() + dt.count();
+  if (warm_up.until) end = std::min(end, warm_up.until->count());
+  return end > start ? seconds(SimTime{end - start}) : 0.0;
+}
+
+// n += the copy's reads over the counted seconds. The step in which n reaches full_at holds the
+// moment the cache is full: at the share of those seconds its last reads took, counted from the
+// start of the counted part, so a constant rate gives full_at / rate exactly, whatever the step.
+void FaultSchedule::add_reads(WarmUp& warm_up, SimTime now, double reads_per_s, double counted_s) {
+  const double reads = reads_per_s * counted_s;
+  if (reads > 0.0 && warm_up.seen + reads >= warm_up.full_at) {
+    const double from_at_s =
+        seconds(SimTime{std::max(now.count(), warm_up.at.count()) - warm_up.at.count()});
+    warm_up.warm_in_s = from_at_s + (warm_up.full_at - warm_up.seen) / reads_per_s;
+  }
+  warm_up.seen += reads;
+}
+
 std::optional<double> FaultSchedule::warm_up_s(std::size_t cache, SimTime at) const {
   for (const auto& warm_up : warm_ups_) {
-    if (warm_up.cache != cache || warm_up.at.count() != at.count()) continue;
-    if (warm_up.reads_per_copy <= 0.0) return std::nullopt;
-    return warm_up.full_at / warm_up.reads_per_copy;
+    if (warm_up.cache == cache && warm_up.at.count() == at.count()) return warm_up.warm_in_s;
   }
   return std::nullopt;
 }
 
-// h(n) / h at n requests per copy since the flush (WarmUp's comment): exactly 1 once n reaches
-// full_at, so a warm cache is bit for bit the cache before the flush.
-double FaultSchedule::warmth(const WarmUp& warm_up, SimTime now) {
-  const double requests =
-      warm_up.reads_per_copy * seconds(SimTime{now.count() - warm_up.at.count()});
+// h(n) / h at the n requests per copy counted since the flush (WarmUp's comment): exactly 1 once n
+// reaches full_at, so a warm cache is bit for bit the cache before the flush.
+double FaultSchedule::warmth(const WarmUp& warm_up) {
+  const double requests = warm_up.seen;
   if (requests >= warm_up.full_at) return 1.0;
   if (!warm_up.popularity) return requests / warm_up.full_at;
   return caching::refill_hit_ratio(warm_up.capacity, *warm_up.popularity, requests) /

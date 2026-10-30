@@ -1337,7 +1337,7 @@ the observed seconds (`steps` × `step`).
 | `faults[]` | `at_s`, `kind`, `node`, `for_s` | seconds from the start of the run; the kind; the node (`null` for a `dc_down`, which has `datacenter` after it); seconds, `null` for a `cache_flush` |
 | `faults[]` | `overlaps_at_s` | the `at_s` of every earlier fault on the same node (or datacenter) still counting when this one struck; `[]` for none |
 | `faults[]` | `during` | `offered_per_s`, `served_per_s` (means over the fault), `lost` (against the twin, from `at` to the recovery) in `lost_unit` (`"requests"` or `"MB"`), `lost_on_cut_links` (a `dc_down`'s, in requests; `null` for every other kind), `backlog_peak`, `room` (in `lost_unit`; `room` `null` for a `cache_flush`), `extra_misses` and `origin` (a `cache_flush`'s, in the origin's unit; `null` for every other kind), `flipped`, the SLOs whose verdict differs from the twin's, as the text names them (`["p99_latency c op"]`; the verdict is the `slo` array's), and `over_max`, each SLO broken during the fault where the twin held it, `[{"slo": "p99_latency c op", "for_s": 0.3}]` |
-| `faults[]` | `after` | `backlog_node` (whose backlog: the node, the datacenter, a `traffic_spike`'s downstream node; `null` when the fault left none), `backlog_drained_in_s`, `cache_warm_in_s`: seconds, `null` where the text says there is none |
+| `faults[]` | `after` | `backlog_node` (whose backlog: the node, the datacenter, a `traffic_spike`'s downstream node; `null` when the fault left none), `backlog_drained_in_s`, `cache_warm_in_s`: seconds, `null` where the text says there is none; a `cache_flush`'s also has `interrupted_by_flush_at_s` after `cache_warm_in_s` (seconds from the start of the run of the next flush that emptied its cache first; `null` when none did), a key no other kind has |
 | `faults[]` | `recovered_at_s` | seconds from the start of the run; `null` when not recovered by the end of the run |
 
 `faults` is the last key, after `slo`, and only a run with faults has it (`estimate`, which leaves
@@ -1487,21 +1487,29 @@ changes the numbers the node's queue is built from, and nothing else:
 | `latency_spike` | service time + `extra`, so the node's servers drain c / (s + extra) a second. On a node sized by its defaults the servers are few and short: a load balancer's c = 5 at 50 µs (100k/s) drains 5 / 1.05 ms = 4.76k/s under a 1 ms spike, 95 % of its capacity gone |
 | `traffic_spike` | the client's rate × `factor`, exactly as a `spikes` entry on its rate curve |
 | `cache_flush` | an instant, not a window: the cache's hit ratio is 0 at the step that starts at `at` and warms back (below) |
-| `dc_down` | a `node_down` of every node whose `dc` is the datacenter (clients excepted: they keep sending), and capacity 0 on every link with one end inside it and the other outside, either way. A link with a `bandwidth` is a queue of megabytes: it drains nothing, fills its room (1000 MB) and drops the rest, so nothing crosses it once the room is full. A plain link has no queue: it drops at once what it is sent, and every request over it is lost (it has no row in the link table to count them in). A link with both ends inside is not cut. Requests already in flight on a link when the cut begins still arrive |
+| `dc_down` | a `node_down` of every node whose `dc` is the datacenter (clients excepted: they keep sending), and capacity 0 on every link with one end inside it and the other outside, either way. A link with a `bandwidth` is a queue of megabytes: it drains nothing, fills its room (1000 MB) and drops the rest, so nothing crosses it once the room is full. A plain link has no queue: it drops at once what it is sent, and every request over it is lost (it has no row in the link table to count them in). A link with both ends inside is not cut. Requests already in flight on a link when the cut begins still arrive. Its caches come back warm at `at + for` (the outage takes their capacity, not their contents); script a `cache_flush` at `at + for` for a cold restart |
 
-**The warm-up after a `cache_flush`** (phase 3 spec §4.3; `engine::FaultSchedule`). A flush empties
-the cache at `at`; it then refills from the reads it is handed, at the rate it was handed them at
-the flush in the long run (what `estimate` would show at that time: one rate for the whole warm-up,
-so a rate curve that rises or falls meanwhile is not followed; each of its replicas sees its share).
-After t seconds one copy has seen n = rate × t reads. A `che` cache then holds the D(n) distinct
-keys among them, D(n) = Σᵢ (1 − e^(−pᵢ n)) (the coupon-collector sum over the clients' key
-popularity), and hits like a Che cache of min(`keys`, D(n)) entries; it is full again, and back at
-its steady hit ratio exactly, once D(n) reaches `keys`, at n = t_c, Che's characteristic time (1k
-reads/s over Zipf 0.8 of 1M keys into 10k keys: h 0.232 steady, 0.127 after 2 s, within 1 % at
-11.8 s, full at 12.1 s). A fixed ratio is a number, not a curve: the cache gains one entry per
-read and warms linearly, h × min(1, n / `keys`), full after `keys` / rate seconds. While it is
-cold, a read_through cache or a CDN sends its store the extra misses, and for a `cache_aside` cache
-the service's `on: miss` steps do. A later flush of the same cache restarts the warm-up. Ignored:
+**The warm-up after a `cache_flush`** (phase 3 spec §4.3; `engine::FaultSchedule`;
+[the derivation](study/numerics.md#11-a-flushed-caches-warm-up)). A flush empties the cache at
+`at`; it then refills from the reads it is actually sent: after every step the engine adds that
+step's reads (its arrivals, write ops left out) to n, the reads one copy has seen since the flush
+(each of its replicas sees its share), and the next step's hit ratio is read at that n. At a
+constant rate n = rate × t; on a curve it is the curve's integral, so a cache flushed while nobody
+reads it stays empty until the reads come (a client whose rate rises from 0/s at 600 s to 1k/s
+at 601 s fills a cache flushed at 600 s by 612.7 s), and one flushed as the rate climbs fills faster as it climbs (100/s
+rising to 2000/s over 100 s: full 30.9 s after the flush, not the 121 s of a rate held at 100/s).
+A `che` cache then holds the D(n) distinct keys among them, D(n) = Σᵢ (1 − e^(−pᵢ n)) (the
+coupon-collector sum over the clients' key popularity), and hits like a Che cache of
+min(`keys`, D(n)) entries; it is full again, and back at its steady hit ratio exactly, once D(n)
+reaches `keys`, at n = t_c, Che's characteristic time (1k reads/s over Zipf 0.8 of 1M keys into
+10k keys: h 0.232 steady, 0.127 after 2 s, within 1 % at 11.8 s, full at 12.1 s). A fixed ratio is
+a number, not a curve: the warm-up is the simple case, linear in the reads, h × min(1, n / `keys`),
+full after `keys` reads. It is optimistic: it has every read add an entry, but once the cache hits
+h · n / `keys` only its misses do, and the consistent model fills at n = −(`keys` / h) ln(1 − h),
+2.56 × `keys` at h = 0.9 (the derivation above has it). While it is cold, a read_through cache or
+a CDN sends its store the extra misses, and for a `cache_aside` cache the service's `on: miss`
+steps do. A later flush of the same cache empties it again and starts its own warm-up: the earlier
+flush's ends there, never warm (its block says `interrupted by the flush at 00:10:05`). Ignored:
 that an LRU cache refills in recency order, the thundering herd on the store, and what writes put
 back.
 
@@ -1572,9 +1580,12 @@ run and its reports are byte for byte what they were before blocks existed.
 The header has the fault's clock time (`HH:MM` on a whole minute, `HH:MM:SS` on a whole second,
 else to the tenth: `00:00:20.2`), its kind, its node (a `dc_down`'s datacenter) and `for` as
 written (none for a `cache_flush`, an instant), and, when it strikes while an earlier fault on the
-same node (or datacenter) is still counting (from that fault's `at` to its recovery), `(overlaps
-fault 00:00:10)`: each block counts from its own `at` and the two split nothing, so their `lost`
-both hold the steps they share and are not to be added.
+same target is still counting (from that fault's `at` to its recovery), `(overlaps fault
+00:00:10)`: each block counts from its own `at` and the two split nothing, so their `lost` both
+hold the steps they share and are not to be added. The same target is the same node, the same
+datacenter, or a `dc_down` and a fault on a node whose `dc` is its datacenter, whichever came
+first (a `node_down cache_eu` inside a `dc_down eu` counts cache_eu's losses that the `dc_down`
+counts too).
 
 `during` reads the faulted part over the fault's steps (a `dc_down`: its datacenter's nodes,
 clients excepted; a `cache_flush`: the cache over its warm-up; a `traffic_spike`: the client, in
@@ -1626,7 +1637,9 @@ attempts. A scenario where no retrying client or pool reaches the faulted node p
 without either figure, as before retries existed.
 
 `after` is a flushed cache's warm-up (`cache warm again in 12.1s`, the time its hit ratio is whole
-again) or, for every other kind, the time from the end of the fault to the end of the first step
+again; `interrupted by the flush at 00:10:05` when the next flush of the cache emptied it first,
+which ends this flush's window there: its extra misses are those up to that flush) or, for every
+other kind, the time from the end of the fault to the end of the first step
 at which the backlog it left is back at the twin's (`no backlog to drain` without one, `backlog
 not drained by the end of the run`); a `traffic_spike`'s backlog is downstream, and the line names
 the node with the most work left (`s backlog drained in 0.2s`). Then what the retries cost beyond

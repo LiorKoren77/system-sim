@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -73,8 +74,8 @@ TEST_CASE("a delay line that is popped before any push yields nothing", "[engine
 //   struct Condition { double capacity_factor = 1; SimTime extra_latency{};
 //                      double rate_factor = 1; double hit_ratio_factor = 1; };
 //   FaultSchedule(const model::Scenario&)                 // built from the scenario's typed faults
-//     (Task 7 made it FaultSchedule(const graph::Graph&, flush reads), which the engine builds:
-//     the helpers below take it from Simulation::fault_schedule_of(graph))
+//     (Task 7 made it FaultSchedule(const graph::Graph&), which the engine builds: the helpers
+//     below take it from Simulation::fault_schedule_of(graph))
 //   Condition FaultSchedule::condition_at(std::size_t node, SimTime now) const
 // where `node` is the index the graph gives the node (Graph::index_of), the engine's own.
 //
@@ -246,9 +247,12 @@ TEST_CASE("a traffic_spike gives the client its rate factor and leaves the other
 //   popularity, which the scenario states (the client's `keys`) and the graph resolves, so Task 7
 //   may well need the Graph too: `ScheduledScenario` below is the one place that builds a schedule,
 //   and the one line to change then.
-//   Condition::hit_ratio_factor is h(t) / h, the warm hit ratio over the steady one:
-//     che cache   warm_hit_ratio(popularity, keys, rate x t) / che_hit_ratio(keys, popularity)
-//     fixed ratio min(1, t / (keys / rate))                     (linear over the fill time)
+//   Condition::hit_ratio_factor is h(n) / h, the warm hit ratio over the steady one, n the reads
+//   the cache was handed since the flush (FaultSchedule::count_reads, every step: Task 7's review
+//   replaced a read rate frozen at the flush by the reads the cache actually gets; at a constant
+//   rate n = rate x t, the curve of before):
+//     che cache   warm_hit_ratio(popularity, keys, n) / che_hit_ratio(keys, popularity)
+//     fixed ratio min(1, n / keys)                              (linear over the fill)
 //   0 at the flush instant `at`, 1 before it and from the moment the cache is full on; the other
 //   three fields stay the identity throughout. A flush has no `for`, so the factor is not a
 //   window of [at, at + for): it is 0 at `at` itself.
@@ -265,6 +269,24 @@ struct ScheduledScenario {
   std::size_t node(std::string_view id) const { return *graph.index_of(id); }
   Condition at(std::string_view id, SimTime now) const {
     return schedule.condition_at(node(id), now);
+  }
+
+  // The schedule as the engine leaves it at `now` after handing it, at every 100 ms step from
+  // t = 0 that ends by `now`, the reads cache `id` (all its copies) received in that step:
+  // reads_per_s(t) at the step that starts at t (Simulation::count_flushed_reads does this after
+  // each step's forward pass, from the cache's arrivals). A copy: the scenario's schedule stays
+  // unfed, so each call starts from the flush.
+  FaultSchedule fed_schedule(std::string_view id, SimTime now,
+                             const std::function<double(SimTime)>& reads_per_s) const {
+    FaultSchedule fed = schedule;
+    for (SimTime t{0}; t + SimTime{100ms} <= now; t += SimTime{100ms}) {
+      fed.count_reads(node(id), t, SimTime{100ms}, reads_per_s(t));
+    }
+    return fed;
+  }
+  // The condition of cache `id` at `now`, fed `reads_per_s` reads a second at every step before.
+  Condition fed(std::string_view id, SimTime now, double reads_per_s) const {
+    return fed_schedule(id, now, [=](SimTime) { return reads_per_s; }).condition_at(node(id), now);
   }
 
  private:
@@ -333,7 +355,7 @@ TEST_CASE(
     CAPTURE(after_s);
     const auto now = at + SimTime{std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::duration<double>(after_s))};
-    const auto c = x.at("cache", now);
+    const auto c = x.fed("cache", now, 1000.0);
     const double expected =
         simsys::test_support::warm_hit_ratio(popularity, 10'000, 1000.0 * after_s) / steady;
     REQUIRE(c.hit_ratio_factor > 0.0);
@@ -345,17 +367,17 @@ TEST_CASE(
   }
   for (const SimTime later : {SimTime{at + 13s}, SimTime{at + 1min}, SimTime{at + 30s}}) {
     CAPTURE(later.count());
-    REQUIRE_THAT(x.at("cache", later).hit_ratio_factor, WithinRel(1.0, 1e-12));
-    require_only_hit_ratio_changes(x.at("cache", later));
+    REQUIRE_THAT(x.fed("cache", later, 1000.0).hit_ratio_factor, WithinRel(1.0, 1e-12));
+    require_only_hit_ratio_changes(x.fed("cache", later, 1000.0));
   }
   require_identity(x.at("u", at + 2s));  // the flush acts on the cache alone
   require_identity(x.at("origin", at + 2s));
 }
 
-// A fixed hit ratio has no curve: the cache is full after keys / rate seconds (1000 keys at
-// 100/s: 10 s) and warms linearly, so the factor is t / 10 s: 0, 0.25 at 2.5 s, 0.5 at 5 s, 1 at
-// 10 s and for ever after. The ratio 0.9 itself is the engine's to multiply in (the factor is
-// relative to it), so it does not appear here.
+// A fixed hit ratio has no curve: the cache is full after `keys` reads, keys / rate seconds at a
+// constant rate (1000 keys at 100/s: 10 s), and warms linearly, so the factor is n / 1000 =
+// t / 10 s: 0, 0.25 at 2.5 s, 0.5 at 5 s, 1 at 10 s and for ever after. The ratio 0.9 itself is the
+// engine's to multiply in (the factor is relative to it), so it does not appear here.
 TEST_CASE(
     "a cache_flush on a fixed-ratio cache gives a hit ratio factor rising linearly over keys "
     "divided by rate",
@@ -370,11 +392,65 @@ TEST_CASE(
       {SimTime{2500ms}, 0.25}, {SimTime{5s}, 0.5}, {SimTime{7500ms}, 0.75}};
   for (const auto& [after, expected] : points) {
     CAPTURE(after.count());
-    REQUIRE_THAT(x.at("cache", at + after).hit_ratio_factor, WithinRel(expected, 1e-12));
-    require_only_hit_ratio_changes(x.at("cache", at + after));
+    REQUIRE_THAT(x.fed("cache", at + after, 100.0).hit_ratio_factor, WithinRel(expected, 1e-12));
+    require_only_hit_ratio_changes(x.fed("cache", at + after, 100.0));
   }
-  REQUIRE_THAT(x.at("cache", at + 10s).hit_ratio_factor, WithinRel(1.0, 1e-12));
-  REQUIRE_THAT(x.at("cache", at + 1min).hit_ratio_factor, WithinRel(1.0, 1e-12));
+  REQUIRE_THAT(x.fed("cache", at + 10s, 100.0).hit_ratio_factor, WithinRel(1.0, 1e-12));
+  REQUIRE_THAT(x.fed("cache", at + 1min, 100.0).hit_ratio_factor, WithinRel(1.0, 1e-12));
+}
+
+// ---- The warm-up counts the reads the cache gets (Task 7's review, findings 1 and 2) ------------
+//
+// The schedule used to turn one number, the read rate at the flush, into "reads seen" for the
+// whole warm-up: a cache flushed while nobody read it stayed cold for ever, and one flushed on a
+// rising curve warmed at the rate of the flush. Now the engine hands it, every step, the reads the
+// cache received (FaultSchedule::count_reads), and n is their sum since the flush.
+
+// Nobody reads the cache for five minutes after the flush: it has seen nothing, so it is still
+// empty (factor 0), and it has no warm-up time yet.
+TEST_CASE("a flushed cache that is handed no reads stays cold and has no warm-up time",
+          "[engine]") {
+  const ScheduledScenario x{flushed_cache(
+      "1k/s", ", keys: {zipf: 0.8, space: 1M}",
+      "type: cache, strategy: read_through, backend: origin, keys: 10k, hit_ratio: che")};
+  const SimTime at{10min};
+  const SimTime later = at + SimTime{5min};
+  const auto idle = x.fed_schedule("cache", later, [](SimTime) { return 0.0; });
+  REQUIRE(idle.condition_at(x.node("cache"), later).hit_ratio_factor == 0.0);
+  REQUIRE_FALSE(idle.warm_up_s(x.node("cache"), at).has_value());
+}
+
+// No reads for the first 10 s after the flush, then 1k/s: at 12 s the cache has seen 2000 reads,
+// not 12,000, so its factor is warm_hit_ratio(2000) / h = 0.547 (the first test's 2 s point); it
+// is full when the reads since the flush reach t_c = 12,106, 10 s + 12.106 s after it. The time
+// falls inside a step (between 22.1 and 22.2 s): the schedule finds it within the step, where the
+// sum crosses t_c, so a constant rate gives t_c / rate exactly.
+TEST_CASE(
+    "the warm-up follows the reads handed since the flush: a cache idle for 10 s is full "
+    "10 s later",
+    "[engine]") {
+  const ScheduledScenario x{flushed_cache(
+      "1k/s", ", keys: {zipf: 0.8, space: 1M}",
+      "type: cache, strategy: read_through, backend: origin, keys: 10k, hit_ratio: che")};
+  const auto popularity = simsys::caching::Popularity::zipf(0.8, 1e6);
+  const double steady = simsys::caching::che_hit_ratio(10'000, popularity);
+  const double t_c = simsys::caching::che_characteristic_time(10'000, popularity);
+  const SimTime at{10min};
+  const auto idle_then_busy = [at](SimTime t) { return t < at + SimTime{10s} ? 0.0 : 1000.0; };
+
+  const auto at_12s = x.fed_schedule("cache", at + SimTime{12s}, idle_then_busy);
+  REQUIRE_THAT(
+      at_12s.condition_at(x.node("cache"), at + SimTime{12s}).hit_ratio_factor,
+      WithinRel(simsys::test_support::warm_hit_ratio(popularity, 10'000, 2000) / steady, 1e-9));
+  REQUIRE_FALSE(at_12s.warm_up_s(x.node("cache"), at).has_value());  // not full yet
+
+  const auto at_30s = x.fed_schedule("cache", at + SimTime{30s}, idle_then_busy);
+  REQUIRE(at_30s.condition_at(x.node("cache"), at + SimTime{30s}).hit_ratio_factor == 1.0);
+  REQUIRE(at_30s.warm_up_s(x.node("cache"), at).has_value());
+  REQUIRE_THAT(*at_30s.warm_up_s(x.node("cache"), at), WithinRel(10.0 + t_c / 1000.0, 1e-9));
+
+  const auto constant = x.fed_schedule("cache", at + SimTime{30s}, [](SimTime) { return 1000.0; });
+  REQUIRE_THAT(*constant.warm_up_s(x.node("cache"), at), WithinRel(t_c / 1000.0, 1e-9));
 }
 
 // dc_down eu: every node whose `dc` is eu is in a node_down (capacity factor 0) from 10 s for
@@ -590,7 +666,7 @@ TEST_CASE("a node_down of r of a kv_cluster's machines counts r machines down an
 //     double lost_on_cut_links;               // recovery, in its unit; a dc_down's cut links'
 //     double backlog_peak, room;              // the peak backlog, the room (queue_limit) it fills
 //     double extra_misses; std::string origin, origin_unit;  // a cache_flush's: vs the twin
-//     std::optional<double> warm_up_s;        // a cache_flush's "during", known from the start
+//     std::optional<double> flush_window_s;   // a cache_flush's "during", once the run finds it
 //     FaultAfter after;
 //     std::optional<SimTime> recovered_at;    // start of the first step at or after the end of
 //     std::string datacenter;                 // the fault with p99 and rho within 1 % of the

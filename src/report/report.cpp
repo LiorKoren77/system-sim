@@ -956,14 +956,21 @@ constexpr std::string_view op_title =
   return fault_line("during:", join(parts, ", "));
 }
 
+// What followed a flush: its warm-up, or the next flush of the cache that emptied it first
+// (`interrupted by the flush at 00:10:05`, engine::FaultAfter::interrupted_by_flush_at).
+[[nodiscard]] std::string warm_up_text(const engine::FaultRecord& r) {
+  if (r.after.interrupted_by_flush_at) {
+    return "interrupted by the flush at " + fault_clock(*r.after.interrupted_by_flush_at);
+  }
+  return r.after.cache_warm_in_s
+             ? "cache warm again in " + tenths_of_seconds(*r.after.cache_warm_in_s)
+             : "cache not warm again by the end of the run";
+}
+
 // What followed: a flush's warm-up, any other fault's backlog to drain (a traffic_spike's is
 // downstream, and names the node: `s backlog drained in 0.2s`).
 [[nodiscard]] std::string follow_on_text(const engine::FaultRecord& r) {
-  if (r.kind == model::FaultKind::cache_flush) {
-    return r.after.cache_warm_in_s
-               ? "cache warm again in " + tenths_of_seconds(*r.after.cache_warm_in_s)
-               : "cache not warm again by the end of the run";
-  }
+  if (r.kind == model::FaultKind::cache_flush) return warm_up_text(r);
   if (r.after.backlog_node.empty()) return "no backlog to drain";
   const std::string backlog = r.kind == model::FaultKind::traffic_spike
                                   ? r.after.backlog_node + " backlog"
@@ -1023,13 +1030,31 @@ constexpr std::string_view op_title =
   return blocks;
 }
 
+// Whether `dc_down` takes down the node `other` acts on: that node's `dc` is its datacenter.
+[[nodiscard]] bool in_datacenter_of(const graph::Graph& g, const engine::FaultRecord& dc_down,
+                                    const engine::FaultRecord& other) {
+  return g.nodes()[*g.index_of(other.node)].spec.dc == dc_down.datacenter;
+}
+
+// Whether two faults act on one target: the same node, the same datacenter, or a datacenter and a
+// node in it (a dc_down is a node_down of every node of its datacenter, so a fault on one of them
+// counts the same steps there).
+[[nodiscard]] bool same_target(const graph::Graph& g, const engine::FaultRecord& a,
+                               const engine::FaultRecord& b) {
+  const bool a_dc = a.kind == model::FaultKind::dc_down;
+  const bool b_dc = b.kind == model::FaultKind::dc_down;
+  if (a_dc && b_dc) return a.datacenter == b.datacenter;
+  if (a_dc) return in_datacenter_of(g, a, b);
+  if (b_dc) return in_datacenter_of(g, b, a);
+  return a.node == b.node;
+}
+
 // Whether `earlier` was still counting when `later` struck (FaultBlock::overlaps): the same target
-// (the same node, or the same datacenter), and `later`'s `at` inside `earlier`'s span from its
-// `at` to its recovery (to the end of the run when it never recovered).
-[[nodiscard]] bool overlaps(const engine::FaultRecord& later, const engine::FaultRecord& earlier) {
-  const bool dc_down = later.kind == model::FaultKind::dc_down;
-  if (dc_down != (earlier.kind == model::FaultKind::dc_down)) return false;
-  if (fault_target(later) != fault_target(earlier)) return false;
+// (same_target), and `later`'s `at` inside `earlier`'s span from its `at` to its recovery (to the
+// end of the run when it never recovered).
+[[nodiscard]] bool overlaps(const graph::Graph& g, const engine::FaultRecord& later,
+                            const engine::FaultRecord& earlier) {
+  if (!same_target(g, later, earlier)) return false;
   if (later.at.count() < earlier.at.count()) return false;
   return !earlier.recovered_at || later.at.count() < earlier.recovered_at->count();
 }
@@ -1221,22 +1246,36 @@ constexpr std::string_view op_title =
   return retries_added(figure) ? json_number(figure) : "null";
 }
 
+// A fault's `after` as JSON: each entry null where it does not apply or did not happen. A flush's
+// also has `interrupted_by_flush_at_s` after `cache_warm_in_s` (the next flush of its cache that
+// emptied it first, null when none did); no other kind has that key, so their objects are the
+// ones written before it existed.
+[[nodiscard]] std::string json_after(const engine::FaultRecord& r) {
+  std::vector<std::string> after{
+      json_field("backlog_node",
+                 r.after.backlog_node.empty() ? "null" : json_string(r.after.backlog_node)),
+      json_field("backlog_drained_in_s", json_optional_number(r.after.backlog_drained_in_s)),
+      json_field("cache_warm_in_s", json_optional_number(r.after.cache_warm_in_s))};
+  if (r.kind == model::FaultKind::cache_flush) {
+    after.push_back(json_field("interrupted_by_flush_at_s",
+                               json_optional_number(r.after.interrupted_by_flush_at.transform(
+                                   [](SimTime t) { return seconds(t); }))));
+  }
+  after.push_back(
+      json_field("retries_added_attempts", json_retries_figure(r.after.retries_added_attempts)));
+  after.push_back(
+      json_field("pool_republished_jobs", json_retries_figure(r.after.pool_republished_jobs)));
+  return json_object(after);
+}
+
 // A fault's block as JSON (the text's numbers, unrounded, in seconds): `for_s` null for a flush,
-// `overlaps_at_s` the earlier faults it overlaps, each `after` entry null where it does not apply
-// or did not happen, `recovered_at_s` null when the run ended first; a dc_down names its
-// datacenter (`node` null).
+// `overlaps_at_s` the earlier faults it overlaps, `after` (json_after), `recovered_at_s` null when
+// the run ended first; a dc_down names its datacenter (`node` null).
 [[nodiscard]] std::string json_fault(const FaultBlock& block,
                                      std::span<const model::SloSpec> slos) {
   const auto& r = block.record;
   std::vector<std::string> overlaps;
   for (const SimTime at : block.overlaps) overlaps.push_back(json_number(seconds(at)));
-  const std::array after{
-      json_field("backlog_node",
-                 r.after.backlog_node.empty() ? "null" : json_string(r.after.backlog_node)),
-      json_field("backlog_drained_in_s", json_optional_number(r.after.backlog_drained_in_s)),
-      json_field("cache_warm_in_s", json_optional_number(r.after.cache_warm_in_s)),
-      json_field("retries_added_attempts", json_retries_figure(r.after.retries_added_attempts)),
-      json_field("pool_republished_jobs", json_retries_figure(r.after.pool_republished_jobs))};
   const bool dc_down = r.kind == model::FaultKind::dc_down;
   std::vector<std::string> fields{json_field("at_s", json_number(seconds(r.at))),
                                   json_field("kind", json_string(model::to_string(r.kind))),
@@ -1246,7 +1285,7 @@ constexpr std::string_view op_title =
       json_field("for_s", model::lasts(r.kind) ? json_number(seconds(r.duration)) : "null"));
   fields.push_back(json_field("overlaps_at_s", "[" + join(overlaps, ", ") + "]"));
   fields.push_back(json_field("during", json_during(block, slos)));
-  fields.push_back(json_field("after", json_object(after)));
+  fields.push_back(json_field("after", json_after(r)));
   fields.push_back(json_field("recovered_at_s", json_optional_number(r.recovered_at.transform(
                                                     [](SimTime t) { return seconds(t); }))));
   return json_object(fields);
@@ -2008,15 +2047,16 @@ Summary::OpTotals& Summary::totals_for(const engine::ResponseSample& sample, std
   return ops_.emplace_back(OpTotals{.client = sample.client, .op = sample.op});
 }
 
-// A fault's window "during" (engine::FaultRecord): [at, at + for), a flush's warm-up [at, at +
-// warm_up_s), or from `at` to the end of the run when its cache never warms.
+// A fault's window "during" (engine::FaultRecord): [at, at + for), a flush's [at, at +
+// flush_window_s), or from `at` to the end of the run while its end is not known (the cache has
+// not warmed yet, or never does).
 Summary::FaultWindow Summary::window_of(const engine::FaultRecord& record) {
   if (model::lasts(record.kind)) {
     return {.start = record.at, .end = SimTime{record.at.count() + record.duration.count()}};
   }
-  if (!record.warm_up_s) return {.start = record.at, .end = std::nullopt};
+  if (!record.flush_window_s) return {.start = record.at, .end = std::nullopt};
   return {.start = record.at,
-          .end = SimTime{record.at.count() + from_seconds(*record.warm_up_s).count()}};
+          .end = SimTime{record.at.count() + from_seconds(*record.flush_window_s).count()}};
 }
 
 void Summary::watch_faults(std::span<const engine::FaultRecord> records) {
@@ -2091,7 +2131,9 @@ void Summary::set_faults(std::span<const engine::FaultRecord> records, const Sum
   for (std::size_t i = 0; i < records.size(); ++i) {
     blocks.push_back(block_of(records[i], twin));
     for (std::size_t j = 0; j < i; ++j) {
-      if (overlaps(records[i], records[j])) blocks.back().overlaps.push_back(records[j].at);
+      if (overlaps(*graph_, records[i], records[j])) {
+        blocks.back().overlaps.push_back(records[j].at);
+      }
     }
   }
   attribute_flips(blocks, flipped);

@@ -206,8 +206,8 @@ The three large modules show three layouts, and `simsys.engine` a fourth.
   partition (`export import :faults;`), so the partition importing the primary would be an
   import cycle, which the standard forbids ([module.import]: "a translation unit shall not have
   an interface dependency on itself", and the partition would depend on the primary, which
-  depends on the partition). The one number it needs from the engine, the reads a flushed cache
-  is handed, the engine passes to its constructor (`Simulation::fault_schedule_of`).
+  depends on the partition). What it needs from the engine as the run goes, the reads each
+  flushed cache is sent, the engine hands it after every step (`FaultSchedule::count_reads`).
 
   The same rule lays out the two other partitions. `FaultLog`, which fills one `FaultRecord` per
   fault from every step, reads `StepRecord`; so does `Simulation`, which holds a `FaultLog`. Were

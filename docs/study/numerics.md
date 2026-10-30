@@ -589,3 +589,24 @@ still include it, and nothing retries it before phase 3); and a timed-out reques
 `drop_rate`, since no node failed it.
 
 (Numbers from a Release build of this tree; every run is deterministic.)
+
+## 11. A flushed cache's warm-up
+
+After a `cache_flush` the cache has seen n reads: the integral of the reads it is actually sent,
+summed step by step (`FaultSchedule::count_reads`, `src/engine/faults.cppm`), so a cache flushed
+while nobody reads it stays empty until the reads come, and on a rising curve it fills faster as
+the curve rises. Each key i, read with probability pᵢ, was requested at least once with probability
+1 − e^{−pᵢn}, so the cache holds D(n) = Σᵢ (1 − e^{−pᵢn}) keys, the coupon-collector sum
+(`caching::keys_requested`). Until D(n) reaches the capacity C nothing was evicted, so the cache
+holds exactly the keys of the last n reads: it is an LRU cache whose characteristic time is n, and
+h(n) = Σᵢ pᵢ (1 − e^{−pᵢn}) with no equation to solve (`caching::refill_hit_ratio`). It is full
+at n = t_c where D(t_c) = C, which is Che's own equation, so the curve meets the steady hit ratio
+continuously, with no jump at the moment the cache fills. Each term goes through
+`one_minus_exp_neg` (section 2), so 1 − e^{−x} keeps its precision for the cold keys, whose pᵢn is
+tiny early in the warm-up.
+
+A fixed hit ratio has no popularity behind it, so its warm-up is the simple case, linear in
+n / `keys`: full after `keys` reads. That is optimistic: once h(n) = h · n / K only the misses add
+an entry, and the consistent model, dE/dn = 1 − h · E / K, gives E(n) = (K / h)(1 − e^{−hn/K}),
+full at n = −(K / h) ln(1 − h), 2.56 K at h = 0.9. The linear case is kept because a fixed ratio
+says nothing of which keys repeat, and the tests pin it (0.45 at half the fill of a 0.9 cache).

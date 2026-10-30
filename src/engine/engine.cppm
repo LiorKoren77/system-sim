@@ -21,7 +21,8 @@
 // (demand is constant across one step). A scripted fault (the scenario's `faults:`, FaultSchedule)
 // changes a node's numbers for the steps it covers: forward_pass asks the schedule for the node's
 // Condition and the node steps under it (serve, ClientBehaviour::set_rate_factor); a flushed
-// cache's warm-up reaches the behaviours that route its misses (warm_flushed_caches), and a
+// cache's warm-up reaches the behaviours that route its misses (warm_flushed_caches) and counts
+// the reads the cache is sent each step (count_flushed_reads), and a
 // dc_down's cut links drop what crosses them (send). A scenario with faults also steps a TWIN, the
 // same scenario with its faults stripped, beside the run: every step of both goes to the fault log
 // (FaultLog), which keeps what each fault cost against the twin for the report's block per fault
@@ -162,8 +163,8 @@ class Simulation {
   [[nodiscard]] StepRecord estimate() const;
 
   // The fault schedule a Simulation of `g` steps by (FaultSchedule): the scenario's faults resolved
-  // against the graph, each cache_flush with the reads its cache is handed at the flush in the
-  // long run (reads_at_flushes). For tests and tools that read the schedule without running it.
+  // against the graph, before any step (every flushed cache has been sent no reads yet:
+  // FaultSchedule::count_reads). For tests and tools that read the schedule without running it.
   // Throws std::invalid_argument when `g` cannot run (Simulation::create's refusal, as its
   // message): the caller asked for the schedule of a scenario it has not checked, a programmer
   // error.
@@ -408,9 +409,9 @@ class Simulation {
   void register_reachable_ops(const graph::Graph& g);
   [[nodiscard]] Simulation settling_copy() const;
   [[nodiscard]] StepRecord settle(SimTime at);
-  [[nodiscard]] std::vector<double> reads_at_flushes(const graph::Graph& g) const;
   [[nodiscard]] std::vector<double> rooms() const;
   void warm_flushed_caches(SimTime now);
+  void count_flushed_reads(SimTime now, SimTime dt);
   void set_hit_ratio_factor(std::size_t cache, double factor);
 
   [[nodiscard]] StepRecord evaluate(SimTime now, SimTime dt, Mode mode);
@@ -504,6 +505,10 @@ class Simulation {
   // The scenario's faults (empty without any). estimate()'s scratch copy (settling_copy) leaves it
   // empty: the steady state is the one without faults.
   FaultSchedule faults_{};
+  // Per flushed cache (FaultSchedule::flushed_caches, in its order): its write ops
+  // (model::write_ops_of), which neither hit nor miss and so do not refill it
+  // (count_flushed_reads). Empty without a flush.
+  std::vector<std::vector<std::string>> flushed_write_ops_{};
   // The faults' records (fault_records), and what each link a dc_down may cut did in the latest
   // step (send). Both empty in estimate()'s scratch copy, whose steps are no run's.
   FaultLog fault_log_{};
@@ -960,16 +965,19 @@ Simulation::Simulation(const graph::Graph& g, int seed, Faults faults)
   add_faults(g, seed);
 }
 
-// The scenario's faults: their schedule, the cuts a dc_down makes, the log of what each costs, and
-// the fault-free twin it is measured against (FaultRecord's header), stepped by `step` with this
-// one. Last in the constructor: a flush's read rate is a settle of this very simulation
-// (reads_at_flushes). The twin is built inside the class (its constructor is private) and moved
+// The scenario's faults: their schedule, the write ops of each flushed cache, the cuts a dc_down
+// makes, the log of what each costs, and the fault-free twin it is measured against
+// (FaultRecord's header), stepped by `step` with this one. Last in the constructor: the log reads
+// the nodes' rooms. The twin is built inside the class (its constructor is private) and moved
 // into its vector, with this run's seed: the twin's clients draw the same noise, so the only
 // difference between the two runs is the faults.
 void Simulation::add_faults(const graph::Graph& g, int seed) {
-  faults_ = FaultSchedule{g, reads_at_flushes(g)};
+  faults_ = FaultSchedule{g};
+  for (const std::size_t cache : faults_.flushed_caches()) {
+    flushed_write_ops_.push_back(model::write_ops_of(g.nodes()[cache].spec));
+  }
   connect_cuttable(g);
-  fault_log_ = FaultLog{g, faults_, rooms()};
+  fault_log_ = FaultLog{g, rooms()};
   link_tallies_.assign(links_.size(), FaultLog::LinkTally{});
   twin_.push_back(Simulation{g, seed, Faults::stripped});
   twin_.front().link_tallies_.assign(links_.size(), FaultLog::LinkTally{});
@@ -996,29 +1004,6 @@ FaultSchedule Simulation::fault_schedule_of(const graph::Graph& g) {
     throw std::invalid_argument{"Simulation::fault_schedule_of: " + simulation.error().message};
   }
   return std::move(simulation->faults_);
-}
-
-// For each fault of the scenario, the reads per second its cache is handed at the flush, a
-// cache_flush's warm-up rate (0 for every other kind): the reads among the cache's arrivals in the
-// long-run state at the flush's time `at` (settle: estimate's passes, evaluated at `at`), what the
-// fluid model hands the cache at that moment once everything upstream has settled, saturation and
-// lost requests included, scripted faults not (the copy has none). Writes are left out: they
-// neither hit nor miss (graph::is_write), and the Che popularity is the reads'. The run's actual
-// arrivals at the flush step can differ (a backlog upstream, noise, another fault); the settled
-// rate keeps the schedule a function of the graph alone, which the tests read without running.
-std::vector<double> Simulation::reads_at_flushes(const graph::Graph& g) const {
-  const auto& faults = g.scenario().faults;
-  std::vector<double> reads(faults.size(), 0.0);
-  for (std::size_t i = 0; i < faults.size(); ++i) {
-    if (faults[i].kind != model::FaultKind::cache_flush) continue;
-    const std::size_t cache = *g.index_of(faults[i].node);
-    Simulation scratch = settling_copy();
-    static_cast<void>(scratch.settle(faults[i].at));
-    for (const auto& [op, rate] : scratch.nodes_[cache].inflow.entries()) {
-      if (!graph::is_write(g.nodes()[cache].spec, op)) reads[i] += rate.per_second;
-    }
-  }
-  return reads;
 }
 
 // Pattern: Strategy — each node gets the behaviour of its type, held by value in the
@@ -1355,7 +1340,7 @@ StepRecord Simulation::step(SimTime now, SimTime dt) {
                       .twin = twin_record_,
                       .run_links = link_tallies_,
                       .twin_links = twin.link_tallies_},
-                     dt);
+                     dt, faults_);
   return record;
 }
 
@@ -1452,8 +1437,7 @@ StepRecord Simulation::estimate() const {
 }
 
 // estimate()'s passes, on this simulation (a settling_copy), with the clients offering their curves
-// at time `at`: the long-run state at that moment. estimate() asks for t = 0; a cache_flush's
-// warm-up for the flush's time (reads_at_flushes).
+// at time `at`: the long-run state at that moment. estimate() asks for t = 0.
 StepRecord Simulation::settle(SimTime at) {
   StepRecord previous = evaluate(at, step_, Mode::settle);
   for (int pass = 2; pass <= max_settle_passes; ++pass) {
@@ -1524,6 +1508,7 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
                     .links = std::vector<LinkSample>(pipe_count_)};
   warm_flushed_caches(now);
   forward_pass(now, dt, mode, record);
+  if (mode == Mode::advance) count_flushed_reads(now, dt);
   record_queue_lags(record.nodes);
   record_retry_flows(record.nodes);
   backward_pass();
@@ -1534,7 +1519,7 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
   return record;
 }
 
-// A flushed cache's hit ratio factor at `now` (FaultSchedule::condition_at: h(t) / h, 0 at the
+// A flushed cache's hit ratio factor at `now` (FaultSchedule::condition_at: h(n) / h, 0 at the
 // flush, 1 once full and before any flush) handed to every behaviour that routes its misses, before
 // any node routes this step: the cache itself (a read_through cache's or a CDN's store hop, its
 // `on: miss` then-steps) and every service whose miss steps follow a lookup of it (cache-aside).
@@ -1544,6 +1529,22 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
 void Simulation::warm_flushed_caches(SimTime now) {
   for (const std::size_t cache : faults_.flushed_caches()) {
     set_hit_ratio_factor(cache, faults_.condition_at(cache, now).hit_ratio_factor);
+  }
+}
+
+// The reads each flushed cache was sent this step, its arrivals but its write ops (a write neither
+// hits nor misses, and the Che popularity is the reads'), handed to the schedule, whose warm-up
+// counts them (FaultSchedule::count_reads): the next step's hit ratio is h(n) at the reads the
+// cache has actually had since its flush, whatever the rate curve did meanwhile. Advance mode
+// only: a settle pass is no step of the run. Nothing to do without a flush.
+void Simulation::count_flushed_reads(SimTime now, SimTime dt) {
+  const auto caches = faults_.flushed_caches();
+  for (std::size_t i = 0; i < caches.size(); ++i) {
+    double reads_per_s = 0.0;
+    for (const auto& [op, rate] : nodes_[caches[i]].inflow.entries()) {
+      if (!std::ranges::contains(flushed_write_ops_[i], op)) reads_per_s += rate.per_second;
+    }
+    faults_.count_reads(caches[i], now, dt, reads_per_s);
   }
 }
 
