@@ -188,8 +188,9 @@ void run_into(const Scenario& s, const simsys::graph::Graph& g, Observer&& obser
 }
 
 // The text of one CSV line split at commas: `line` is a row, with no newline. A trailing empty
-// cell is a field ("a,b," has three): the node series' last column, queue_lag_s, is empty on
-// every row but a message queue's, its dead_lettered_per_s empty on every row but a worker pool's,
+// cell is a field ("a,b," has three): the node series' last column, connections, is empty on
+// every row but a ws_gateway's, the queue_lag_s before it on every row but a message queue's, its
+// dead_lettered_per_s empty on every row but a worker pool's,
 // and std::getline(cells, field, ',') would drop a trailing one silently, so that a row with and
 // without the column would count the same.
 std::vector<std::string> split_commas(const std::string& line) {
@@ -232,7 +233,7 @@ double number(const std::string& cell) {
 
 constexpr std::string_view node_header =
     "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,"
-    "latency_ms,zone,queue_lag_s";
+    "latency_ms,zone,queue_lag_s,connections";
 constexpr std::string_view op_header =
     "t_s,client,op,offered_per_s,attempts_per_s,answered_per_s,timed_out_per_s,mean_ms";
 
@@ -303,7 +304,7 @@ TEST_CASE("a node series row carries the demand and drain of the NodeSample it w
   const auto rows = data_rows(out.str());
   REQUIRE(rows.size() == 2);  // one row per node: the client's and the server's
   const auto& server = rows[1];
-  REQUIRE(server.size() == 12);
+  REQUIRE(server.size() == 13);
   REQUIRE(server[0] == "0.1");
   REQUIRE(server[1] == "s");
   REQUIRE(server[2] == "1234.5");   // demand_per_s
@@ -316,6 +317,7 @@ TEST_CASE("a node series row carries the demand and drain of the NodeSample it w
   REQUIRE(server[9] == "12.5");     // latency_ms: 0.0125 s
   REQUIRE(server[10] == "green");   // the NodeSample's default zone
   REQUIRE(server[11] == "");        // queue_lag_s: a service has no lag, the cell is empty
+  REQUIRE(server[12] == "");        // connections: a service holds none, the cell is empty
 }
 
 TEST_CASE("a client row has zeros for demand and drain: a source queues and serves nothing",
@@ -328,15 +330,15 @@ TEST_CASE("a client row has zeros for demand and drain: a source queues and serv
   const auto text = out.str();
   CAPTURE(text);
   // t, node, demand, drain, rho, backlog, drops, dead_lettered, rejected, latency, zone,
-  // queue_lag_s: a client's engine sample is all zeros (engine.cppm: "a source has no queue"), its
-  // zone is `none` and its dead_lettered and last cells (a pool's count, a message queue's lag) are
-  // empty.
+  // queue_lag_s, connections: a client's engine sample is all zeros (engine.cppm: "a source has no
+  // queue"), its zone is `none` and its dead_lettered and last two cells (a pool's count, a message
+  // queue's lag, a gateway's level) are empty.
   // C++23 std::string::contains: a substring test in one call, replacing
   // `find(...) != std::string::npos`.
-  REQUIRE(text.contains("\n0,c,0,0,0,0,0,,0,0,none,\n"));
+  REQUIRE(text.contains("\n0,c,0,0,0,0,0,,0,0,none,,\n"));
 }
 
-TEST_CASE("every row of a run has twelve fields, one row per node per step", "[series]") {
+TEST_CASE("every row of a run has thirteen fields, one row per node per step", "[series]") {
   const auto s = mm1(500);  // 500 ms at 100 ms steps: 5 steps
   const auto g = graph_of(s);
   std::ostringstream out;
@@ -346,13 +348,14 @@ TEST_CASE("every row of a run has twelve fields, one row per node per step", "[s
   REQUIRE(rows.size() == 5 * 2);  // 5 steps x 2 nodes (the client and the server)
   // C++20 std::ranges::all_of: the algorithm takes the whole range and a predicate, replacing
   // the begin()/end() pair of std::all_of.
-  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 12; }));
+  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 13; }));
 }
 
 // ---- node series: queue_lag_s ----
 //
 // A message queue's lag (engine::NodeSample::queue_lag_s: its worst consumer group's wait,
-// max(backlog / drain, k x Wq)) is the node series' last column, `queue_lag_s`, in SECONDS (not
+// max(backlog / drain, k x Wq)) is the node series' column `queue_lag_s`, the last but one (a
+// ws_gateway's `connections` came after it in phase 3 Task 14), in SECONDS (not
 // ms: the lag of a queue is minutes, hours: the column is for plotting it against the backlog). It
 // is empty, not 0, on every row of a node that is not a message queue (a 0 lag would be a claim),
 // clients, services and bandwidth links' pipes included: the header is one for the whole file.
@@ -381,14 +384,15 @@ Scenario queue_and_group() {
 }
 }  // namespace
 
-TEST_CASE("the node series header ends with the queue_lag_s column", "[series]") {
+TEST_CASE("the node series header has queue_lag_s after zone and connections last", "[series]") {
   const auto g = graph_of(queue_and_group());
   std::ostringstream out;
   simsys::report::SeriesWriter writer{out, g};
   const auto header = split_commas(header_of(out.str()));
-  REQUIRE(header.size() == 12);
-  REQUIRE(header.back() == "queue_lag_s");
-  REQUIRE(header[10] == "zone");  // the ten columns before it keep their places
+  REQUIRE(header.size() == 13);
+  REQUIRE(header[11] == "queue_lag_s");
+  REQUIRE(header.back() == "connections");  // phase 3 Task 14: a ws_gateway's level
+  REQUIRE(header[10] == "zone");            // the ten columns before it keep their places
 }
 
 TEST_CASE("a message queue's row ends with the lag of its sample and every other row ends empty",
@@ -403,11 +407,11 @@ TEST_CASE("a message queue's row ends with the lag of its sample and every other
   const auto rows = data_rows(out.str());
   REQUIRE(rows.size() == 3);
   REQUIRE(rows[1][1] == "q");
-  REQUIRE(rows[1].size() == 12);
+  REQUIRE(rows[1].size() == 13);
   REQUIRE(rows[1][11] == "1.5");
   for (const auto i : {std::size_t{0}, std::size_t{2}}) {
     CAPTURE(rows[i][1]);
-    REQUIRE(rows[i].size() == 12);
+    REQUIRE(rows[i].size() == 13);
     REQUIRE(rows[i][11] == "");  // the client's and the pool's: no lag, not a lag of 0
   }
 }
@@ -423,7 +427,7 @@ TEST_CASE("a run's queue rows hold the lag in seconds and the client and pool ro
   REQUIRE(rows.size() == 10 * 3);  // 10 steps x (u, q, w)
   for (const auto& row : rows) {
     CAPTURE(row[0], row[1]);
-    REQUIRE(row.size() == 12);
+    REQUIRE(row.size() == 13);
     if (row[1] == "q") {
       REQUIRE_FALSE(row[11].empty());
       REQUIRE(number(row[11]) >= 0.0);
@@ -1054,11 +1058,16 @@ TEST_CASE("explain gives youtube's metadata_db and metadata_cache the completion
 
 // chat-system's two kv_clusters are checked (they once printed "not checked"):
 //  - message_store, 12 nodes of 10k/s, N = 3, vnodes 256 (k = 1 + z_12/sqrt(3 x 256) = 1.0590,
-//    z_12 = 1.6350): the peak 31.5k writes/s x 3 = 94.5k replica-requests/s over 120k/s, 78.75 %
-//    on average, the hottest node 1.0590 x 7.875k = 8.340k/s = 83.4 %: yellow (from 70 %);
+//    z_12 = 1.6350): the peak 31.5k sends/s, each written 1.4 times since phase 3 Task 14 (the
+//    gateway's `fanout: 1.4` multiplies every step of its `send`, a message op), are 44.1k
+//    writes/s x 3 = 132.3k replica-requests/s over 120k/s, 110.25 % on average, the hottest node
+//    1.0590 x 11.025k = 11.68k/s = 116.8 %: red (it was 94.5k, 83.4 %, yellow, before the fan-out;
+//    the scenario's own task revisits where chat-system fans out);
 //  - presence, 4 nodes of the type's default 50k/s, N = 2, default vnodes (k = 1 + z_4/sqrt(2 x
-//    150) = 1.0606): 81k/s x 2 = 162k over 200k/s, 81 % on average, the hottest 1.0606 x 40.5k =
-//    42.95k = 85.9 %: yellow (red from 90 %).
+//    150) = 1.0606): the users' 49.5k heartbeats/s and sync_workers' read of every message the
+//    queue holds, 44.1k/s with the fan-out above (31.5k before it), 93.6k/s x 2 = 187.2k over
+//    200k/s, 93.6 % on average, the hottest 1.0606 x 46.8k = 49.64k = 99.3 %: red (it was 81k/s,
+//    85.9 %, yellow). The gateway states no level yet, so it adds no heartbeats of its own.
 // Behind the message queue and the pools the paper load follows, so nothing says "load not
 // propagated" and nothing blames a queue or a pool.
 TEST_CASE("explain checks chat-system's two kv_clusters at their hottest node", "[series]") {
@@ -1066,10 +1075,10 @@ TEST_CASE("explain checks chat-system's two kv_clusters at their hottest node", 
   CAPTURE(text);
   const auto store = check_line(text, "message_store");
   REQUIRE(store.contains(
-      "peak offered 94.5k/s (31.5k/s × N 3) vs 120k/s (12 nodes)  (hottest 83.4%, yellow)"));
+      "peak offered 132.3k/s (44.1k/s × N 3) vs 120k/s (12 nodes)  (hottest 117%, red)"));
   const auto presence = check_line(text, "presence");
   REQUIRE(presence.contains(
-      "peak offered 162k/s (81k/s × N 2) vs 200k/s (4 nodes)  (hottest 85.9%, yellow)"));
+      "peak offered 187.2k/s (93.6k/s × N 2) vs 200k/s (4 nodes)  (hottest 99.3%, red)"));
   for (const auto& line : {store, presence}) {
     REQUIRE_FALSE(line.contains("not checked"));
     REQUIRE_FALSE(line.contains("worker_pool"));
@@ -1192,7 +1201,7 @@ TEST_CASE("explain notes that a node fed by failure steps only is sized by run o
 // ---- A link's bandwidth is a pipe: its rows in the series and the JSON ----
 //
 // A link with a bandwidth is a queue of megabytes and is plotted like a node: one CSV row per
-// step with the link's name, `from->to`, in the `node` column, the same twelve columns, in
+// step with the link's name, `from->to`, in the `node` column, the same thirteen columns, in
 // MEGABYTES (a rate of MB/s; engine::StepRecord::links, one LinkSample per bandwidth link). So
 // the conservation law holds on those rows too, and a student checks the pipe from the file.
 // The JSON gets `links`: one object per bandwidth link (an empty array without any).
@@ -1224,7 +1233,7 @@ double number_of_key(const std::string& object, std::string_view key_prefix) {
 }  // namespace
 
 TEST_CASE(
-    "a link row of the node series carries the LinkSample it was fed, in the same twelve columns",
+    "a link row of the node series carries the LinkSample it was fed, in the same thirteen columns",
     "[series]") {
   const auto s = piped(100);
   const auto g = graph_of(s);
@@ -1250,7 +1259,7 @@ TEST_CASE(
   const auto found = std::ranges::find_if(rows, [](const auto& row) { return row[1] == "a->b"; });
   REQUIRE(found != rows.end());
   const auto& row = *found;
-  REQUIRE(row.size() == 12);
+  REQUIRE(row.size() == 13);
   REQUIRE(row[0] == "0.1");
   REQUIRE(row[2] == "100.5");   // demand_per_s, MB/s
   REQUIRE(row[3] == "100.25");  // drain_per_s
@@ -1262,6 +1271,7 @@ TEST_CASE(
   REQUIRE(row[9] == "12.5");    // latency_ms: 0.0125 s
   REQUIRE(row[10] == "yellow");
   REQUIRE(row[11] == "");  // queue_lag_s: a pipe is not a message queue
+  REQUIRE(row[12] == "");  // connections: a pipe is not a websocket gateway
 }
 
 // 1000 puts/s of 1 MB offer the pipe 1000 MB/s against 125 MB/s: the backlog grows by
@@ -1278,7 +1288,7 @@ TEST_CASE("the conservation identity holds on the link rows read back from the s
   const auto rows = data_rows(out.str());
   CAPTURE(out.str());
   REQUIRE(rows.size() == 30 * 3);  // 30 steps x (the client, b and the link)
-  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 12; }));
+  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 13; }));
   constexpr double dt = 0.1;
   double demand = 0.0;
   double drain = 0.0;
@@ -1365,6 +1375,14 @@ TEST_CASE("the JSON has an empty links array when no link has a bandwidth", "[se
 // way: the op series of the binary at 691a3ef (which reproduces the old hash, 0x9dfc7de84e1afe59)
 // with `timed_out_per_s` inserted in its header and `0` in each of its rows before `mean_ms`,
 // hashed with this function.
+//
+// Re-pinned on purpose: the node series gained a last column, `connections` (a ws_gateway's level
+// of open connections, phase 3 Task 14; empty on every row of a node that is no gateway, so on
+// every row of the chain), and nothing else changed: the header ends in `,connections` and each of
+// the 3,600 rows in one more empty cell. Derived like the ones above: the node series of the binary
+// at a145019 (which reproduces the previous hash, 0x6e28178622e2c40f) with `,connections` appended
+// to its header and `,` to each of its rows, hashed with this function: 0xebb414ef9f9cb564; the
+// binary with the column writes exactly that. The op series has no new column: its hash stays.
 namespace {
 std::uint64_t fnv1a(const std::string& text) {
   std::uint64_t hash = 0xcbf29ce484222325ULL;  // the 64-bit FNV offset basis
@@ -1395,8 +1413,9 @@ TEST_CASE("the tutorial chain's series are byte for byte what they were before l
   REQUIRE(data_rows(nodes_out.str()).size() == 1200 * 3);    // 2 min of 100 ms steps x 3 nodes
   REQUIRE(header_of(nodes_out.str()) == node_header);
   // re-pinned for queue_lag_s, then for dead_lettered_per_s (phase 3 Task 11: an empty cell after
-  // drops_per_s on every row, since chain has no worker pool)
-  REQUIRE(fnv1a(nodes_out.str()) == 0x6e28178622e2c40fULL);
+  // drops_per_s on every row, since chain has no worker pool), then for connections (phase 3 Task
+  // 14: an empty last cell on every row, since chain has no websocket gateway)
+  REQUIRE(fnv1a(nodes_out.str()) == 0xebb414ef9f9cb564ULL);
   // re-pinned for timed_out_per_s, then for attempts_per_s (phase 3 Task 10: the column after
   // offered_per_s, equal to it on every row, since chain has no retries)
   REQUIRE(fnv1a(ops_out.str()) == 0x66f6670d063b5f6fULL);
@@ -1489,7 +1508,7 @@ TEST_CASE("the node series header has dead_lettered_per_s right after drops_per_
   std::ostringstream out;
   simsys::report::SeriesWriter writer{out, g};
   const auto header = split_commas(header_of(out.str()));
-  REQUIRE(header.size() == 12);
+  REQUIRE(header.size() == 13);
   REQUIRE(header[6] == "drops_per_s");
   REQUIRE(header[7] == "dead_lettered_per_s");
   REQUIRE(header[8] == "rejected_per_s");
@@ -1510,7 +1529,7 @@ TEST_CASE("a pool's row carries the dead letters of its sample and every other r
   REQUIRE(rows[2][7] == "0.25");
   for (const auto i : {std::size_t{0}, std::size_t{1}}) {
     CAPTURE(rows[i][1]);
-    REQUIRE(rows[i].size() == 12);
+    REQUIRE(rows[i].size() == 13);
     REQUIRE(rows[i][7] == "");  // the client's and the queue's: not a count of 0
   }
 }
@@ -1551,7 +1570,7 @@ TEST_CASE("a run's pool rows hold the dead letters, 1.6e-4 a second, and the oth
   const auto s = retrying_pool_series(3);
   const auto pool = rows_of_node(s, "w");
   REQUIRE(pool.size() == 50);
-  REQUIRE(pool[0].size() == 12);
+  REQUIRE(pool[0].size() == 13);
   REQUIRE(number(pool[0][7]) == 0.0);  // nobody has used 3 retries at the first step
   REQUIRE_THAT(number(pool.back()[7]), WithinRel(1.6e-4, 1e-6));
   REQUIRE(number(pool.back()[6]) == 0.0);  // drops_per_s: a dead letter is not a drop

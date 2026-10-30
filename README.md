@@ -52,9 +52,9 @@ simsys sweep    scenario.yaml --param <dot.path>=<from>..<to>:<n> --metric <m>..
 value there, without noise (its first line says so); `explain`'s static load checks use the
 curve's peak instead. `run` steps through the scenario and,
 with `--series`, writes one CSV row per node per step
-(`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,latency_ms,zone,queue_lag_s`,
-`dead_lettered_per_s` a worker pool's dead letters, the last a message queue's lag in seconds,
-each empty on other rows), the file a plot or GUI reads; demand, drain, drops and backlog balance, so the fluid queue's
+(`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,latency_ms,zone,queue_lag_s,connections`,
+`dead_lettered_per_s` a worker pool's dead letters, `queue_lag_s` a message queue's lag in
+seconds, the last a websocket gateway's open connections, each empty on other rows), the file a plot or GUI reads; demand, drain, drops and backlog balance, so the fluid queue's
 conservation law, Σ demand·dt = Σ (drain + drops)·dt + backlog, can be checked from the file (a
 token bucket's or a window's refusals are inside drain; a leaky bucket's overflow is in
 `rejected_per_s`, in the drops' place). A link with a `bandwidth` is a pipe that queues and drops

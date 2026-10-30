@@ -80,6 +80,12 @@ struct NodeSummary {
   // empty on every other node. Never in total_dropped: a dead letter is parked, not lost.
   std::optional<double> total_dead_lettered{};
   std::optional<double> mean_dead_lettered_per_s{};
+  // A ws_gateway's open connections (engine::NodeSample::connections, a LEVEL, phase 3 spec §8.2):
+  // `connections` the level of the last observed step, where the run ended, and `connections_peak`
+  // the largest of any observed step (a gateway at its cap, or a level still rising, tells the two
+  // apart). Empty for every node that is not a gateway.
+  std::optional<double> connections{};
+  std::optional<double> connections_peak{};
 };
 
 // One bandwidth link's pipe over the observed part of a run (engine::LinkSample), in MEGABYTES (per
@@ -335,6 +341,8 @@ class Summary {
     std::optional<double> peak_queue_lag_s{};  // the largest queue_lag_s: message queues only
     std::optional<double> dead_lettered{};     // Σ dead_lettered_per_s·dt: worker pools only
     std::optional<double> republished{};       // Σ republished_per_s·dt: message queues only
+    std::optional<double> last_connections{};  // the latest step's level: ws_gateways only
+    std::optional<double> peak_connections{};  // the largest level of any step: ws_gateways only
     // Σ dropped_per_s × (retried_demand_per_s / demand_per_s) · dt: an external sink's drops of
     // the calls from pools with retries, which are attempted again, not lost (drop_rate).
     double retried_dropped{};
@@ -608,9 +616,9 @@ struct ReplicationSummary {
 
 // For plotting: one CSV row per node per step,
 // `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,
-// latency_ms,zone,queue_lag_s` (`dead_lettered_per_s` empty except on a worker pool's rows, the
-// last except on a message queue's), then one per link with a bandwidth, its `from->to` in the
-// node column, in megabytes.
+// latency_ms,zone,queue_lag_s,connections` (`dead_lettered_per_s` empty except on a worker pool's
+// rows, `queue_lag_s` except on a message queue's, `connections` except on a ws_gateway's), then
+// one per link with a bandwidth, its `from->to` in the node column, in megabytes.
 // The header is written on construction; the column rules are at SeriesWriter::observe in
 // report.cpp.
 // Pattern: Observer, like Summary. `out` and `g` must outlive the writer.

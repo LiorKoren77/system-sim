@@ -759,6 +759,10 @@ struct QueueProvenance {
   return text;
 }
 
+// A ws_gateway's level, its heartbeat load and its cap (defined below, after the paper load whose
+// connect rate it reads).
+[[nodiscard]] std::string gateway_summary(const graph::Graph& g, std::size_t node);
+
 [[nodiscard]] std::string explain_nodes(const graph::Graph& g) {
   std::vector<Row> rows;
   for (std::size_t i = 0; i < g.nodes().size(); ++i) {
@@ -773,7 +777,8 @@ struct QueueProvenance {
                        limiter_summary(node.spec) + cache_summary(g, i) + cdn_summary(g, i) +
                        database_summary(node) + id_generator_summary(node.spec) +
                        message_queue_summary(node.spec) + worker_pool_summary(node) +
-                       external_sink_summary(node.spec) + search_index_summary(node.spec)}});
+                       external_sink_summary(node.spec) + search_index_summary(node.spec) +
+                       gateway_summary(g, i)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }
@@ -1141,6 +1146,46 @@ void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_
   }
 }
 
+// ---- a websocket gateway on paper (phase 3 spec §8.2) ----
+
+// The level of open connections a ws_gateway holds on paper, `connects` the connect requests a
+// second that reach it: a fixed `connections` as stated; else the fixed point of the level,
+//   C* = connects × session            (Little's law: L = λW, the connections open at once)
+// capped at max_connections × replicas (behaviours::WsGatewayBehaviour, which `estimate` reports
+// too); nothing for a gateway with neither (the engine refuses it to run, and explain says so).
+[[nodiscard]] std::optional<double> paper_level(const model::NodeSpec& spec, double connects) {
+  if (spec.connections) return static_cast<double>(*spec.connections);
+  if (!(connects > 0.0)) return std::nullopt;
+  const double level = connects * seconds(defaults::session_of(spec));
+  const auto cap = model::connection_cap(spec);
+  return cap ? std::min(level, *cap) : level;
+}
+
+// The heartbeats of a gateway's open connections, C / heartbeat a second (0 without a stated
+// heartbeat or a level): the load its connections put on it and on what its `heartbeat` steps call.
+[[nodiscard]] double paper_heartbeats(const model::NodeSpec& spec, std::optional<double> level) {
+  if (!level || !spec.heartbeat) return 0.0;
+  return *level / seconds(*spec.heartbeat);
+}
+
+// The connect requests a second in one node's load of a pass (its `connect` op).
+[[nodiscard]] double connects_in(const OpLoad& load) {
+  const auto found = load.find(model::connect_op);
+  return found == load.end() ? 0.0 : found->second;
+}
+
+// Adds a ws_gateway's heartbeats to its own load before it forwards (paper_pass): they arrive as
+// its `heartbeat` op beside what the clients send under that name, as engine::Simulation::receive
+// adds them in a run, so the gateway's check counts them and its `heartbeat` steps carry them on (a
+// presence service is checked against the 20k/s that 100k connections at 5 s send, not against
+// nothing). In place: each pass rebuilds `load` from the clients, so nothing compounds.
+void add_paper_heartbeats(const graph::Graph& g, std::size_t node, std::vector<OpLoad>& load) {
+  const auto& spec = g.nodes()[node].spec;
+  if (spec.type != model::NodeType::ws_gateway) return;
+  const double beats = paper_heartbeats(spec, paper_level(spec, connects_in(load[node])));
+  if (beats > 0.0) load[node][std::string{model::heartbeat_op}] += beats;
+}
+
 // The paper load's stopping rule, the same as engine::Simulation::estimate's (whose
 // constants are internal to the engine, so the numbers are restated here): stop when no
 // node's total moved by more than 1e-12 of its value (a few thousand ulps of a double, as
@@ -1182,6 +1227,7 @@ struct PaperPass {
   }
   std::vector<OpLoad> next_fed_back(g.nodes().size());
   for (const auto index : g.topological_order()) {
+    add_paper_heartbeats(g, index, load);
     forward_steps(g, table, index, load, next_fed_back);
   }
   fed_back = std::move(next_fed_back);
@@ -1342,6 +1388,49 @@ constexpr double shrink_margin = 1e-6;
   PaperPass next = next_pass(g, table, offered, fed_back);
   if (!all_finite(next.totals)) return overflowed(std::move(last), next.totals);
   return at_pass_cap(before, last, std::move(next));
+}
+
+// A ws_gateway's line ends with what its connections will be and cost (phase 3 spec §8.2;
+// behaviours::WsGatewayBehaviour): "  connections: C*=100k (connect 100/s × session 16.7m),
+// heartbeat 20k/s, cap 200k". C* is the fixed point connect rate × session (Little's law), the
+// connect rate the clients' peak `connect` requests that reach the gateway (the paper load's), the
+// session marked "(default)" when the scenario left it to defaults::default_session; then the
+// heartbeat load at C* (C* / heartbeat) and the cap, max_connections × replicas. A capped fixed
+// point says what it would have been: "C*=50k (connect 100/s × session 16.7m = 100k, capped)". A
+// fixed level reads "connections: 2M (fixed)". A gateway with neither level, or both, is one run
+// and estimate refuse (engine::Simulation::create), and its line says so. Nothing on any other
+// type.
+[[nodiscard]] std::string gateway_level_text(const model::NodeSpec& spec, double connects) {
+  if (spec.connections) {
+    const std::string fixed = with_si_prefix(static_cast<double>(*spec.connections)) + " (fixed)";
+    if (connects > 0.0) return fixed + " and a connect op: run refuses both";
+    return fixed;
+  }
+  if (!(connects > 0.0)) {
+    return "none (no connect op reaches it, no fixed connections: run refuses it)";
+  }
+  const SimTime session = defaults::session_of(spec);
+  const double unbounded = connects * seconds(session);
+  const double level = *paper_level(spec, connects);
+  const std::string capped =
+      level < unbounded ? " = " + with_si_prefix(unbounded) + ", capped" : "";
+  return "C*=" + with_si_prefix(level) + " (connect " + fmt_rate(connects) + " × session " +
+         format_duration(session) + (spec.session ? "" : " (default)") + capped + ")";
+}
+
+std::string gateway_summary(const graph::Graph& g, std::size_t node) {
+  const auto& spec = g.nodes()[node].spec;
+  if (spec.type != model::NodeType::ws_gateway) return {};
+  const double connects = connects_in(paper_load(g).by_op[node]);
+  const auto level = paper_level(spec, connects);
+  std::vector<std::string> parts{gateway_level_text(spec, connects)};
+  if (level) {  // without a level there is nothing to beat: no heartbeat figure
+    parts.push_back(spec.heartbeat ? "heartbeat " + fmt_rate(paper_heartbeats(spec, level))
+                                   : "no heartbeat");
+  }
+  const auto cap = model::connection_cap(spec);
+  parts.push_back(cap ? "cap " + with_si_prefix(*cap) : "no cap");
+  return "  connections: " + join(parts, ", ");
 }
 
 // ---- loads that rest on an unknown hit ratio ----

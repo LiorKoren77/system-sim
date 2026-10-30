@@ -585,19 +585,39 @@ constexpr double text_cell = std::numeric_limits<double>::quiet_NaN();
 // peak_backlog, dropped), since a dead letter is the pool's count beside the drops it is not.
 constexpr std::size_t dead_letter_column = 5;
 
+// Does the run have a websocket gateway? Only then have the node table its `connections` column
+// and the JSON node objects their `connections` and `connections_peak` (phase 3 spec §8.2), so a
+// run without one prints the reports it always did.
+[[nodiscard]] bool some_gateway(const graph::Graph& g) {
+  return std::ranges::any_of(g.nodes(), [](const graph::ResolvedNode& node) {
+    return node.spec.type == model::NodeType::ws_gateway;
+  });
+}
+
+// Which optional columns the node table has (some_pool_retries, some_gateway).
+struct NodeColumns {
+  bool dead_letters{};
+  bool connections{};
+};
+
 // Clients are sources with no queue: their queue columns show "-". A message queue's `peak_lag`
 // is its peak lag after warmup (NodeSummary::peak_queue_lag_s), "-" on every other row. With
 // `dead_letters` the row has the `dead_lettered/s` cell too: a worker pool's mean rate of dead
-// letters (NodeSummary::mean_dead_lettered_per_s, 0 without retries), "-" on every other row.
+// letters (NodeSummary::mean_dead_lettered_per_s, 0 without retries), "-" on every other row. With
+// `connections` the row has the `connections` cell after `peak_lag`: a ws_gateway's open
+// connections at the END of the run (NodeSummary::connections, a level, not a rate), "-" on every
+// other row.
 [[nodiscard]] Row node_row(const NodeSummary& node, const graph::ResolvedNode& resolved, bool color,
-                           bool dead_letters) {
-  Row row = resolved.spec.type == model::NodeType::client
-                ? Row{{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}}
-                : queue_cells(node, resolved.capacity, color);
-  if (resolved.spec.type != model::NodeType::client) {
-    row.push_back({node.peak_queue_lag_s ? format_lag(*node.peak_queue_lag_s) : "-"});
-    row.push_back(unavailable_cell(node));
+                           NodeColumns columns) {
+  const bool client = resolved.spec.type == model::NodeType::client;
+  Row row = client ? Row{{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}}
+                   : queue_cells(node, resolved.capacity, color);
+  if (!client) row.push_back({node.peak_queue_lag_s ? format_lag(*node.peak_queue_lag_s) : "-"});
+  if (columns.connections) {
+    row.push_back({node.connections ? with_si_prefix(*node.connections) : "-"});
   }
+  if (!client) row.push_back(unavailable_cell(node));
+  const bool dead_letters = columns.dead_letters;
   if (dead_letters) {
     const auto rate = node.mean_dead_lettered_per_s;
     // std::next over a difference_type: the column index is a size_t, the iterator's offset signed.
@@ -611,12 +631,15 @@ constexpr std::size_t dead_letter_column = 5;
 // dead-letter rate at dead_letter_column, as node_row puts its cell there (text on other rows).
 [[nodiscard]] std::vector<double> node_numbers(const NodeSummary& node,
                                                const graph::ResolvedNode& resolved,
-                                               bool dead_letters) {
+                                               NodeColumns columns) {
+  const bool dead_letters = columns.dead_letters;
   if (resolved.spec.type == model::NodeType::client) {
-    return std::vector<double>(dead_letters ? 9 : 8, text_cell);
+    const std::size_t cells = 8 + std::size_t{dead_letters} + std::size_t{columns.connections};
+    return std::vector<double>(cells, text_cell);
   }
   auto numbers = queue_numbers(node);
   numbers.push_back(node.peak_queue_lag_s.value_or(text_cell));
+  if (columns.connections) numbers.push_back(node.connections.value_or(text_cell));
   numbers.push_back(text_cell);
   if (dead_letters) {
     numbers.insert(std::next(numbers.begin(), static_cast<std::ptrdiff_t>(dead_letter_column)),
@@ -634,8 +657,10 @@ constexpr std::size_t dead_letter_column = 5;
                               {"rejected"},
                               {"red_s"},
                               {"peak_lag"}}};
-  const bool dead_letters = some_pool_retries(summary.graph());
-  if (dead_letters) {
+  const NodeColumns columns{.dead_letters = some_pool_retries(summary.graph()),
+                            .connections = some_gateway(summary.graph())};
+  if (columns.connections) parts.header.push_back(Cell{"connections"});
+  if (columns.dead_letters) {
     parts.header.insert(
         std::next(parts.header.begin(), static_cast<std::ptrdiff_t>(dead_letter_column)),
         Cell{"dead_lettered/s"});
@@ -643,8 +668,8 @@ constexpr std::size_t dead_letter_column = 5;
   const auto nodes = summary.nodes();
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto& resolved = summary.graph().nodes()[i];
-    parts.add(node_row(nodes[i], resolved, color, dead_letters),
-              node_numbers(nodes[i], resolved, dead_letters));
+    parts.add(node_row(nodes[i], resolved, color, columns),
+              node_numbers(nodes[i], resolved, columns));
   }
   return parts;
 }
@@ -1109,26 +1134,38 @@ constexpr std::string_view op_title =
   return "  " + json_field(name, "[\n    " + join(objects, ",\n    ") + "\n  ]");
 }
 
+[[nodiscard]] std::vector<std::string> json_node_fields(const NodeSummary& n) {
+  return {json_field("id", json_string(n.id)), json_field("mean_rho", json_number(n.mean_rho)),
+          json_field("peak_rho", json_number(n.peak_rho)),
+          json_field("peak_backlog", json_number(n.peak_backlog)),
+          json_field("dropped", json_number(n.total_dropped)),
+          // a worker pool's (0 without retries); null for every other node
+          json_field("dead_lettered", json_optional_number(n.total_dead_lettered)),
+          json_field("dead_lettered_per_s", json_optional_number(n.mean_dead_lettered_per_s)),
+          json_field("rejected", json_number(n.total_rejected)),
+          json_field("red_s", json_number(n.red_time_s)),
+          json_field("unavailable", n.unavailable ? "true" : "false"),
+          // null for a node with no lagging copies, and for an infinite one
+          json_field("staleness_s", n.mean_staleness_s ? json_number(*n.mean_staleness_s) : "null"),
+          // per replica and per shard; null for every node that is not a database
+          json_field("replication_dropped_per_s",
+                     json_optional_number(n.mean_replication_dropped_per_s)),
+          json_field("committed_writes_per_s", json_optional_number(n.mean_committed_writes_per_s)),
+          // seconds; null for every node that is not a message queue
+          json_field("peak_queue_lag_s", json_optional_number(n.peak_queue_lag_s))};
+}
+
 [[nodiscard]] std::string json_node(const NodeSummary& n) {
-  const std::array fields{
-      json_field("id", json_string(n.id)), json_field("mean_rho", json_number(n.mean_rho)),
-      json_field("peak_rho", json_number(n.peak_rho)),
-      json_field("peak_backlog", json_number(n.peak_backlog)),
-      json_field("dropped", json_number(n.total_dropped)),
-      // a worker pool's (0 without retries); null for every other node
-      json_field("dead_lettered", json_optional_number(n.total_dead_lettered)),
-      json_field("dead_lettered_per_s", json_optional_number(n.mean_dead_lettered_per_s)),
-      json_field("rejected", json_number(n.total_rejected)),
-      json_field("red_s", json_number(n.red_time_s)),
-      json_field("unavailable", n.unavailable ? "true" : "false"),
-      // null for a node with no lagging copies, and for an infinite one
-      json_field("staleness_s", n.mean_staleness_s ? json_number(*n.mean_staleness_s) : "null"),
-      // per replica and per shard; null for every node that is not a database
-      json_field("replication_dropped_per_s",
-                 json_optional_number(n.mean_replication_dropped_per_s)),
-      json_field("committed_writes_per_s", json_optional_number(n.mean_committed_writes_per_s)),
-      // seconds; null for every node that is not a message queue
-      json_field("peak_queue_lag_s", json_optional_number(n.peak_queue_lag_s))};
+  return json_object(json_node_fields(n));
+}
+
+// A node of a run that has a ws_gateway (some_gateway): json_node's fields, then the gateway's
+// level of open connections, `connections` at the end of the run and `connections_peak` the
+// largest of any observed step (NodeSummary), null on every node that is not a gateway.
+[[nodiscard]] std::string json_node_with_connections(const NodeSummary& n) {
+  auto fields = json_node_fields(n);
+  fields.push_back(json_field("connections", json_optional_number(n.connections)));
+  fields.push_back(json_field("connections_peak", json_optional_number(n.connections_peak)));
   return json_object(fields);
 }
 
@@ -1317,7 +1354,9 @@ template <class T, class F>
       "  " + json_field("reject_rate", observed ? json_number(summary.reject_rate()) : "null"),
       "  " + json_field("worst_reject_node",
                         worst_rejecting.empty() ? "null" : json_string(worst_rejecting)),
-      json_array("nodes", map_to_strings(std::span<const NodeSummary>{nodes}, json_node)),
+      json_array("nodes", map_to_strings(std::span<const NodeSummary>{nodes},
+                                         some_gateway(summary.graph()) ? json_node_with_connections
+                                                                       : json_node)),
       json_array("links", map_to_strings(std::span<const LinkSummary>{links}, json_link)),
       json_array("ops", map_to_strings(std::span<const OpSummary>{ops}, json_op)),
       json_array("slo", slo_objects)};
@@ -1817,13 +1856,15 @@ constexpr std::array op_numbers{
       significant(n.rejected_per_s, 6),
       significant(n.latency.mean_s * 1000.0, 6),
       std::string{zone_name(n.zone)},
-      n.queue_lag_s ? significant(*n.queue_lag_s, 6) : std::string{}};
+      n.queue_lag_s ? significant(*n.queue_lag_s, 6) : std::string{},
+      n.connections ? significant(*n.connections, 6) : std::string{}};
   return join(fields, ",") + "\n";
 }
 
-// A bandwidth link's pipe, in the same twelve columns as a node's, in megabytes;
+// A bandwidth link's pipe, in the same thirteen columns as a node's, in megabytes;
 // `dead_lettered_per_s` empty (a pipe is no worker pool), `rejected_per_s` 0 (a pipe refuses
-// nothing by policy) and `queue_lag_s` empty (a pipe is no message queue).
+// nothing by policy), `queue_lag_s` empty (a pipe is no message queue) and `connections` empty (a
+// pipe is no websocket gateway).
 [[nodiscard]] std::string csv_link_row(const std::string& t_s, const std::string& name,
                                        const engine::LinkSample& l) {
   const std::array fields{t_s,
@@ -1837,14 +1878,15 @@ constexpr std::array op_numbers{
                           std::string{"0"},
                           significant(l.latency.mean_s * 1000.0, 6),
                           std::string{zone_name(l.zone)},
+                          std::string{},
                           std::string{}};
   return join(fields, ",") + "\n";
 }
 
 // A client is a source: no queue, so zeros where a server has numbers, zone `none`, and no dead
-// letters (a pool's) and no lag (a queue's).
+// letters (a pool's), no lag (a queue's) and no connections (a gateway's).
 [[nodiscard]] std::string csv_client_row(const std::string& t_s, const std::string& id) {
-  return t_s + "," + id + ",0,0,0,0,0,,0,0,none,\n";
+  return t_s + "," + id + ",0,0,0,0,0,,0,0,none,,\n";
 }
 
 // One (client, op) of a step: what it offered, what it sent (its retries included), what came back
@@ -1938,6 +1980,10 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
   }
   if (sample.republished_per_s) {  // a message queue: 0 when its groups retry nothing
     republished = republished.value_or(0.0) + *sample.republished_per_s * dt_s;
+  }
+  if (sample.connections) {  // a ws_gateway: a level, kept as it was and at its highest
+    last_connections = *sample.connections;
+    peak_connections = std::max(*sample.connections, peak_connections.value_or(0.0));
   }
   // A sink's drops fall on every caller alike (it fails a share of all it serves), so the
   // retrying callers' part of them is their part of its demand, this step.
@@ -2255,7 +2301,9 @@ std::vector<NodeSummary> Summary::nodes() const {
                               .total_rejected = without_residue(t.rejected, capacity),
                               .red_time_s = t.red_time_s,
                               .unavailable = t.unavailable,
-                              .peak_queue_lag_s = t.peak_queue_lag_s});
+                              .peak_queue_lag_s = t.peak_queue_lag_s,
+                              .connections = t.last_connections,
+                              .connections_peak = t.peak_connections});
     if (t.dead_lettered) {
       out.back().total_dead_lettered = *t.dead_lettered;
       out.back().mean_dead_lettered_per_s =
@@ -2587,11 +2635,12 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
     if (link.pipe) link_names_.push_back(graph::link_label(g.nodes(), link));
   }
   *out_ << "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,"
-           "rejected_per_s,latency_ms,zone,queue_lag_s\n";
+           "rejected_per_s,latency_ms,zone,queue_lag_s,connections\n";
 }
 
 // CSV is for machines, so every numeric column holds a number on every row the quantity exists
-// for, and is empty where it does not (only `dead_lettered_per_s` and `queue_lag_s`, below):
+// for, and is empty where it does not (only `dead_lettered_per_s`, `queue_lag_s` and
+// `connections`, below):
 // - `t_s` is the shortest form that reads back to the same double (0.1, 2, 0.35), not a
 //   fixed number of decimals that would round a fine step away; the other numbers have 6
 //   significant digits;
@@ -2605,9 +2654,9 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
 //   `rejected_per_s` says how much of it); a leaky bucket's are its queue's overflow, written
 //   in `rejected_per_s` instead of `drops_per_s`, so for one the identity takes them in the
 //   drops' place;
-// - a client row writes 0 in every numeric column but `dead_lettered_per_s` and `queue_lag_s` (a
-//   source has no queue), which it leaves empty, and `none` as its zone, so a plot can filter
-//   clients out by zone;
+// - a client row writes 0 in every numeric column but `dead_lettered_per_s`, `queue_lag_s` and
+//   `connections` (a source has no queue), which it leaves empty, and `none` as its zone, so a
+//   plot can filter clients out by zone;
 // - `dead_lettered_per_s` (engine::NodeSample::dead_lettered_per_s) is a worker pool's jobs whose
 //   last retry failed, right after `drops_per_s` because they are not drops (the identity above
 //   does not include them: the pool drained those jobs); 0 on a pool without retries and EMPTY on
@@ -2619,6 +2668,10 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
 // - `queue_lag_s` (engine::NodeSample::queue_lag_s) is a message queue's lag in
 //   SECONDS (a lag is minutes or hours, plotted against the backlog), and EMPTY on every other
 //   row, clients' and links' included: a 0 would claim a lag the node cannot have;
+// - `connections` (engine::NodeSample::connections, phase 3 spec §8.2) is a ws_gateway's level of
+//   open connections at the START of the step, a count, not a rate (6 significant digits), and
+//   EMPTY on every other row, clients' and links' included. The last column, so a script that
+//   reads the columns before it by position reads what it always did;
 // - after the nodes, a row per link with a bandwidth, `from->to` in the node
 //   column, in MEGABYTES (engine::LinkSample): the pipe is a queue, so the same identity holds on
 //   its rows, `rejected_per_s` is 0 and `latency_ms` is a request's wait plus its answer time on

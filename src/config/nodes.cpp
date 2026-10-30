@@ -3,7 +3,7 @@
 // `latency`, `advanced`), a per-op `cost` and a load balancer's keys. The second reads each
 // body's references and traffic (its steps: steps.cpp; a client's workload: workload.cpp) and
 // every other type's own keys: rate limiter, id generator, cache, SQL database, CDN, blob store,
-// message queue, worker pool, search index, external sink, key-value cluster.
+// message queue, worker pool, search index, external sink, key-value cluster, websocket gateway.
 module;
 #include <yaml-cpp/yaml.h>
 
@@ -1116,6 +1116,69 @@ CheckResult read_kv_cluster_keys(const Site& site, const YAML::Node& body, model
       .and_then([&] { return read_write_ops(this_node, body, node); });
 }
 
+// ---- Websocket gateway keys (phase 3 spec §8.2; book ch. 12) ----
+//
+// A ws_gateway holds its open connections as a level (behaviours::WsGatewayBehaviour): the counts
+// that bound or fix it (`max_connections`, `connections`), the durations that drain and load it
+// (`session`, `heartbeat`) or bring it back after a fall (`reconnect_within`), and the fan-out of
+// its messages (`fanout`). Each is optional and an absent one stays absent (model::NodeSpec has
+// the defaults). Whether a `connect` op reaches the gateway is a fact of the graph, not of the
+// file: Simulation::create, not the loader, refuses a gateway with neither level or with both.
+
+// A count of connections ("max_connections: 100k", "connections: 2M"): a positive integer with the
+// k/M/G grammar of every count (parse_count, as a cache's `keys`).
+CheckResult read_connection_count(const Site& site, const YAML::Node& body, std::string_view key,
+                                  std::optional<std::int64_t>& target) {
+  const auto value = body[std::string{key}];
+  if (!value) return {};
+  const auto count = parse_count(number_text(value));
+  if (!count) return site.fail(value, std::string{key} + " must be a positive integer");
+  target = *count;
+  return {};
+}
+
+// A positive duration ("heartbeat: 5s", "session: 30m", "reconnect_within: 30s"): a zero heartbeat
+// would be an infinite load, a zero session an instant disconnect, a zero reconnect_within an
+// instant storm. In the words of `ttl` and `build_interval`.
+CheckResult read_gateway_duration(const Site& site, const YAML::Node& body, std::string_view key,
+                                  std::optional<SimTime>& target) {
+  if (!body[std::string{key}]) return {};
+  auto duration = parse_duration_key(site, body, key);
+  if (!duration) return std::unexpected(duration.error());
+  if (duration->count() <= 0) {
+    return site.fail(body[std::string{key}], std::string{key} + " must be positive");
+  }
+  target = *duration;
+  return {};
+}
+
+// `fanout: 1.4`, the average recipients of a message (ch. 12: 1:1 chats and small groups): at
+// least 1. Below 1 a message would reach fewer than one recipient, a lost message, not a fan-out;
+// exactly 1 (google-drive's long poll) is a message to its one device.
+CheckResult read_fanout(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (!body["fanout"]) return {};
+  const auto fanout = number_value(body["fanout"]);
+  if (!fanout || !(*fanout >= 1.0)) return site.fail(body["fanout"], "fanout must be at least 1");
+  // A step's own factor's bound (max_step_factor): the fan-out multiplies it.
+  if (*fanout > max_step_factor) return site.fail(body["fanout"], "fanout must be at most 1e6");
+  node.fanout = *fanout;
+  return {};
+}
+
+CheckResult read_gateway_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (node.type != model::NodeType::ws_gateway) return {};
+  const auto this_node = node_site(site, node.id);
+  return read_connection_count(this_node, body, "max_connections", node.max_connections)
+      .and_then(
+          [&] { return read_connection_count(this_node, body, "connections", node.connections); })
+      .and_then([&] { return read_gateway_duration(this_node, body, "heartbeat", node.heartbeat); })
+      .and_then([&] { return read_gateway_duration(this_node, body, "session", node.session); })
+      .and_then([&] {
+        return read_gateway_duration(this_node, body, "reconnect_within", node.reconnect_within);
+      })
+      .and_then([&] { return read_fanout(this_node, body, node); });
+}
+
 // ---- Node bodies: the second pass -----------------------------------------------------
 
 // A client offers traffic (its `ops` are shares of its rate); every other node forwards
@@ -1173,6 +1236,7 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
     if (auto read = read_external_sink_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_kv_cluster_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_search_index_keys(site, entry.second, *node); !read) return read;
+    if (auto read = read_gateway_keys(site, entry.second, *node); !read) return read;
     ++node;
   }
   return {};

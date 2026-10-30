@@ -150,6 +150,14 @@ struct NodeSample {
   // fault set off (FaultAfter::pool_republished_jobs). Empty on a pool without retries and on
   // every other node.
   std::optional<double> republished_jobs_per_s{};
+  // A ws_gateway's open connections (phase 3 spec §8.2; book ch. 12's websocket servers): the LEVEL
+  // C the step STARTED with, not a rate. Connects raise it and C / session lowers it, one Euler
+  // step at a time, C(k+1) = C(k) + (connects − C(k) / session) dt, capped at max_connections ×
+  // replicas (behaviours::WsGatewayBehaviour has the model), so record k holds C(k) and the first
+  // record of a gateway that starts empty 0. The heartbeat load the step puts on the gateway is
+  // C(k) / heartbeat, read off this same level. A fixed `connections` is that number on every step.
+  // Empty on every other node: only a gateway holds connections (a 0 would claim it held none).
+  std::optional<double> connections{};
 };
 
 // What a client sees for one op: the rate it offers, the part of it that comes back answered, and

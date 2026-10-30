@@ -2203,19 +2203,152 @@ class KvClusterBehaviour {
   QuorumAnswer write_answer_{};
 };
 
+// Models: the chat servers of System Design Interview (Alex Xu, vol. 1) ch. 12 ("Design a chat
+// system"): STATEFUL websocket servers that every online user keeps one connection open to, which
+// relay the users' messages, carry their presence heartbeats and push messages to the recipients;
+// and ch. 15's notification long polls (google-drive), connections held open by devices that wait
+// for a change. Phase 3 spec §8.2.
+//
+// The level. A request leaves a node once it is served; a CONNECTION stays. So what a gateway
+// holds is not a queue of work but a stock of open connections, a LEVEL C, that connects raise
+// and disconnects lower:
+//   C' = connects − disconnects,   disconnects = C / session
+// (a user stays `session` on average, so each of the C open connections ends at rate 1 / session).
+// That is a first-order lag: from empty, C(t) = λ session (1 − e^{−t / session}), 63 % of the way
+// after one session, settling at the fixed point
+//   C* = λ × session                                   (Little's law, L = λW, read for connections)
+// (100 connects/s that stay 1000 s hold 100k connections). The engine steps it by Euler, once per
+// step of length dt, the record of step k holding the level the step STARTED with:
+//   C(k+1) = min(C(k) + (λ − C(k) / session) dt, cap)
+// stable for dt < session (a session of minutes against steps of 100 ms). `estimate` jumps to C*.
+// `connects` are the requests of the clients' op named `connect` that the gateway's queue served
+// this step (a connect still waiting has not connected yet). A level is not a backlog: a full
+// gateway does not make connects wait, it refuses them (below).
+//
+// The cap: max_connections × replicas (each replica holds at most max_connections open sockets,
+// what its memory allows: ch. 12 counts about 10 KB a connection). A connect that would take the
+// level past it is REFUSED, a rejection like a rate limiter's 429 (a policy, not a failure: no
+// drop), and is not answered (spec §17 entry 8). At the cap the connects that get in are the room
+// the disconnects free each second, so rejected = λ − cap / session.
+//
+// Heartbeats are load: every open connection pings every `heartbeat` seconds, so the gateway serves
+// C / heartbeat pings a second on its `heartbeat` op beside the users' own requests (the engine
+// adds them to its arrivals, engine::Simulation::receive), and its `heartbeat` steps (to a presence
+// service) carry them on. At 100k connections and the book's 5 s that is 20k/s, a hundred times
+// what 200 users/s send: why a chat system sizes its gateway tier and its presence service for
+// heartbeats rather than for messages.
+//
+// Messages fan out: every op that is not connect, heartbeat or deliver is a MESSAGE
+// (model::message_op), and each of its steps sends `fanout` × its own factor requests (1.4: the
+// average recipients of a 1:1 or small-group message). graph::Graph::resolve_service_hops applies
+// it, so the hops held here have it already. `deliver` is terminal: a message pushed to a recipient
+// over its open connection, served and sent nowhere.
+//
+// A fixed level (`connections: 2M`): a gateway no client connects to, whose connections belong to
+// devices nobody here simulates (google-drive's long polls). C is that number on every step, with
+// no connects, no disconnects and no refusals; only its heartbeats load anything.
+//
+// What it ignores: the memory a connection costs (the book's 10 KB per connection, so 100k
+// connections are 1 GB: the cap stands for it); which server a user is on (the service-discovery
+// hand-off of ch. 12, phase 3 Task 13), so every replica holds the same share; the reconnect storm
+// after a gateway falls (phase 3 Task 15: here a node_down derates its capacity as any node's, and
+// the level is untouched); users who go offline without a disconnect (the heartbeat timeout of
+// ch. 12's presence: every session simply ends at rate 1 / session); and the bandwidth of a
+// websocket frame.
+// Pattern: Delegation (composition over inheritance) — the per-op steps, their latency and their
+// delivered fractions are a service's, so the gateway holds a ServiceBehaviour and adds the level
+// around it, instead of inheriting from it.
+class WsGatewayBehaviour {
+ public:
+  WsGatewayBehaviour(const graph::Graph& g, std::size_t self);
+
+  // What the gateway's queue drained this step, routed: the connects that find room are admitted
+  // (admit: the level takes its Euler step, refusing those above the cap) and the refused ones are
+  // `rejected`; everything admitted goes along the op's steps as a service's would (messages
+  // fanned out, heartbeats to presence, deliveries nowhere), each step thinned by what the steps
+  // before it delivered last step. `now` is unused; `dt` is the Euler step.
+  // An explicit template head rather than `FractionLookup auto&&`, as in ServiceBehaviour::route: a
+  // default argument needs a type to default to.
+  template <FractionLookup Lookup = NothingLost>
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime now, SimTime dt,
+                             Lookup&& delivered_last_step = {}) {
+    const double connects = in.rate_of(model::connect_op).per_second;
+    const double admitted = admit(connects, seconds(dt));
+    const double refused = connects - admitted;
+    Routed routed = service_.route(refused > 0.0 ? with_connects(in, admitted) : in, now, dt,
+                                   delivered_last_step);
+    if (refused > 0.0) routed.rejected.add(model::connect_op, Rate{refused});
+    return routed;
+  }
+
+  // Capacity units one request of `op` uses: the service's (1 unless `cost` says otherwise).
+  [[nodiscard]] double cost(std::string_view op) const { return service_.cost(op); }
+
+  // The service's response: own sojourn plus the op's waited steps. A refused connect is answered
+  // at once and is not in it: the latency is an answered request's.
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view op, flow::LatencyEstimate own,
+                                               ResponseLookup auto&& downstream) const {
+    return service_.response(op, own, downstream);
+  }
+
+  // The service's delivered fraction, a connect's times the share of the connects admitted: a
+  // refused connect is not answered (spec §17 entry 8), and only connects are refused, so the
+  // engine leaves the rejections out of the node's own share (account_rejections) and they are
+  // applied here, to the one op they fall on.
+  [[nodiscard]] double delivered(std::string_view op, double own,
+                                 FractionLookup auto&& downstream) const {
+    const double admitted = op == model::connect_op ? admitted_share_ : 1.0;
+    return service_.delivered(op, own * admitted, downstream);
+  }
+
+  // The level C the next step starts with (the record shows it: engine::NodeSample::connections).
+  [[nodiscard]] double connections() const { return level_; }
+
+  // The heartbeat load of the open connections, C / heartbeat pings a second (0 without a stated
+  // heartbeat): what the engine adds to the gateway's `heartbeat` arrivals each step.
+  [[nodiscard]] double heartbeats_per_s() const;
+
+  // estimate()'s mode: every settle pass is the same instant, so the level jumps to its fixed point
+  // C* = min(λ × session, cap) of the connects it is handed, which admits min(λ, cap / session)
+  // (engine::Simulation::settling_copy calls it, as it does the limiter's use_long_run_rate). The
+  // level starts again from empty (or the fixed level), so an estimate is the same before and
+  // after a run.
+  void use_steady_level();
+
+  // Forwarded to the service's steps: the miss steps after a lookup of `cache` are taken by
+  // 1 − h × factor of the requests while that cache warms back (ServiceBehaviour).
+  void set_hit_ratio_factor(std::size_t cache, double factor) {
+    service_.set_hit_ratio_factor(cache, factor);
+  }
+
+ private:
+  [[nodiscard]] double admit(double connects, double dt_s);
+  [[nodiscard]] double steady_admit(double connects);
+  [[nodiscard]] static flow::Flow with_connects(const flow::Flow& in, double admitted);
+
+  ServiceBehaviour service_;
+  std::optional<double> fixed_{};      // a stated `connections`: the level, for good
+  std::optional<double> cap_{};        // max_connections × replicas; empty: no cap
+  double session_s_{};                 // the stated session, or defaults::default_session
+  std::optional<double> heartbeat_s_;  // the stated heartbeat; empty: no heartbeat load
+  double level_{};                     // C, the open connections
+  double admitted_share_{1.0};         // this step's admitted / offered connects
+  bool steady_{false};                 // use_steady_level
+};
+
 // Pattern: Strategy — the engine holds one Behaviour per node and dispatches with
 // std::visit; a std::variant instead of an abstract base keeps every behaviour a plain
 // value (no heap allocation, no virtual calls, copyable). Phase 2a appended the load
 // balancer, the rate limiter and the cache, phase 2b the SQL database and the CDN, phase 2c the
-// blob store, the message queue, the worker pool, the external sink and the kv cluster; later
-// phases append the rest (ws_gateway, ...).
+// blob store, the message queue, the worker pool, the external sink and the kv cluster, phase 3 the
+// websocket gateway; later tasks append the rest (service_discovery, ...).
 // C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
 // it holds) dispatched with std::visit. Closed: adding an alternative means editing this
 // line, and every std::visit that does not handle it then fails to compile.
 using Behaviour = std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour,
                                RateLimiterBehaviour, CacheBehaviour, SqlDbBehaviour, CdnBehaviour,
                                BlobStoreBehaviour, MessageQueueBehaviour, WorkerPoolBehaviour,
-                               ExternalSinkBehaviour, KvClusterBehaviour>;
+                               ExternalSinkBehaviour, KvClusterBehaviour, WsGatewayBehaviour>;
 
 }  // namespace simsys::behaviours
 
@@ -2234,6 +2367,7 @@ static_assert(NodeBehaviour<MessageQueueBehaviour>);
 static_assert(NodeBehaviour<WorkerPoolBehaviour>);
 static_assert(NodeBehaviour<ExternalSinkBehaviour>);
 static_assert(NodeBehaviour<KvClusterBehaviour>);
+static_assert(NodeBehaviour<WsGatewayBehaviour>);
 static_assert(RequestSource<ClientBehaviour>);
 
 namespace detail {
@@ -3333,6 +3467,70 @@ double KvClusterBehaviour::loss(ReplicaSet set, int quorum) const {
   const std::array kept{queueing::TrialGroup{.trials = set.hot, .success = hot_.kept},
                         queueing::TrialGroup{.trials = set.cool, .success = cool_.kept}};
   return queueing::probability_fewer_than(kept, quorum);
+}
+
+// ---- WsGatewayBehaviour ----
+
+WsGatewayBehaviour::WsGatewayBehaviour(const graph::Graph& g, std::size_t self)
+    : service_{g, self} {
+  const auto& spec = g.nodes()[self].spec;
+  if (spec.connections) fixed_ = static_cast<double>(*spec.connections);
+  cap_ = model::connection_cap(spec);
+  session_s_ = seconds(defaults::session_of(spec));
+  if (spec.heartbeat) heartbeat_s_ = seconds(*spec.heartbeat);
+  level_ = fixed_.value_or(0.0);  // a gateway starts empty, or at its fixed level
+}
+
+double WsGatewayBehaviour::heartbeats_per_s() const {
+  return heartbeat_s_ ? level_ / *heartbeat_s_ : 0.0;
+}
+
+void WsGatewayBehaviour::use_steady_level() {
+  steady_ = true;
+  level_ = fixed_.value_or(0.0);
+  admitted_share_ = 1.0;
+}
+
+// One step of the level (the class comment): of `connects` per second, the ones admitted, the level
+// moved on by its Euler step
+//   C' = C + (admitted − C / session) dt,   admitted = connects unless C' would pass the cap,
+// where the connects that fit are those that bring C' to the cap exactly:
+//   admitted = connects − (C + (connects − C / session) dt − cap) / dt
+// (at the cap, the C / session room the disconnects free). The level is set to the cap itself
+// rather than recomputed, so it never passes it by a rounding. Never below 0 (a step longer than
+// the session would overshoot: dt < session keeps Euler on the lag). A fixed level admits every
+// connect and does not move.
+double WsGatewayBehaviour::admit(double connects, double dt_s) {
+  if (fixed_) return connects;
+  if (steady_) return steady_admit(connects);
+  const double disconnects = level_ / session_s_;
+  double next = level_ + (connects - disconnects) * dt_s;
+  double admitted = connects;
+  if (cap_ && next > *cap_) {
+    admitted = std::max(connects - (next - *cap_) / dt_s, 0.0);
+    next = admitted > 0.0 ? *cap_ : level_ - disconnects * dt_s;
+  }
+  level_ = std::max(next, 0.0);
+  admitted_share_ = connects > 0.0 ? admitted / connects : 1.0;
+  return admitted;
+}
+
+// estimate()'s fixed point (use_steady_level): C* = λ × session (Little's law), capped, and the
+// connects it admits are those that hold it there, C* / session = min(λ, cap / session).
+double WsGatewayBehaviour::steady_admit(double connects) {
+  const double admitted = cap_ ? std::min(connects, *cap_ / session_s_) : connects;
+  level_ = cap_ ? std::min(connects * session_s_, *cap_) : connects * session_s_;
+  admitted_share_ = connects > 0.0 ? admitted / connects : 1.0;
+  return admitted;
+}
+
+// `in` with its connects cut to the `admitted` ones, every other op untouched.
+flow::Flow WsGatewayBehaviour::with_connects(const flow::Flow& in, double admitted) {
+  flow::Flow passed;
+  for (const auto& [op, rate] : in.entries()) {
+    passed.add(op, op == model::connect_op ? Rate{admitted} : rate);
+  }
+  return passed;
 }
 
 }  // namespace simsys::behaviours
