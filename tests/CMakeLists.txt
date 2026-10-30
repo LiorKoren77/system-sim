@@ -16,7 +16,7 @@ target_link_libraries(simsys_test_support PUBLIC simsys Catch2::Catch2 PRIVATE s
 # keeps its calls to them out of line, so its object file defines them (as for src/model/model.cpp).
 set_source_files_properties(support/fixtures.cpp PROPERTIES COMPILE_OPTIONS -fno-inline)
 
-add_executable(unit_tests unit/test_units.cpp unit/test_config.cpp unit/test_queueing.cpp unit/test_flow.cpp unit/test_fluid.cpp unit/test_workload.cpp unit/test_caching.cpp unit/test_model.cpp unit/test_defaults.cpp unit/test_graph.cpp unit/test_behaviours.cpp unit/test_engine.cpp unit/test_report.cpp unit/test_series.cpp unit/test_sweep.cpp)
+add_executable(unit_tests unit/test_units.cpp unit/test_config.cpp unit/test_queueing.cpp unit/test_flow.cpp unit/test_fluid.cpp unit/test_workload.cpp unit/test_caching.cpp unit/test_model.cpp unit/test_defaults.cpp unit/test_graph.cpp unit/test_behaviours.cpp unit/test_engine.cpp unit/test_report.cpp unit/test_series.cpp unit/test_sweep.cpp unit/test_session.cpp)
 target_link_libraries(unit_tests PRIVATE simsys simsys_test_support Catch2::Catch2WithMain simsys_warnings)
 # test_series.cpp explains shipped scenarios and test_sweep.cpp sweeps tutorial/hello, so they need
 # the directory, like scenario_tests.
@@ -104,3 +104,34 @@ add_test(NAME "simsys curve applies a traffic_spike fault exactly as a spikes en
          COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
                  -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-curve-faults
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/curve_faults.cmake)
+
+# simsys run --replications, run as a process: the median and the 10-90 % band across seeds, the
+# refusals, the exit code of the median run, and that --jobs cannot show in the output. One scratch
+# directory per check, so `ctest -j` runs them side by side.
+foreach(check bands same_bytes json exit_codes noiseless one_is_plain refusals series_refused
+              fault_once)
+  if(check STREQUAL "bands")
+    set(name "simsys run --replications prints each metric's median and band and PASS in k of N")
+  elseif(check STREQUAL "same_bytes")
+    set(name "simsys run --replications gives the same bytes with --jobs 1, 3 and 4")
+  elseif(check STREQUAL "json")
+    set(name "simsys run --replications adds the seeds and the per-seed values to the JSON")
+  elseif(check STREQUAL "exit_codes")
+    set(name "simsys run --replications exits with the median run's code")
+  elseif(check STREQUAL "noiseless")
+    set(name "simsys run --replications runs a scenario without noise once and says so first")
+  elseif(check STREQUAL "one_is_plain")
+    set(name "simsys run --replications 1 is the plain run byte for byte")
+  elseif(check STREQUAL "refusals")
+    set(name "simsys run refuses a replication count outside 1 to 1000")
+  elseif(check STREQUAL "series_refused")
+    set(name "simsys run refuses a series file with more than one replication")
+  else()
+    set(name "simsys run --replications prints a scripted fault's block once")
+  endif()
+  add_test(NAME "${name}"
+           COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
+                   -DSCENARIO=${CMAKE_SOURCE_DIR}/scenarios/tutorial/hello/scenario.yaml
+                   -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-replications-${check} -DCHECK=${check}
+                   -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/replications.cmake)
+endforeach()

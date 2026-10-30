@@ -7,10 +7,14 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -3402,4 +3406,171 @@ TEST_CASE("a pool without retries has a dead_letter_rate of 0", "[report]") {
   auto s = retrying_probe(std::nullopt);
   const auto g = *simsys::graph::Graph::build(s);
   REQUIRE(summarize(s, g).dead_letter_rate("w") == 0.0);
+}
+
+// ---- Replications: the median and the 10-90 % band of several runs of one scenario
+// ---------------
+//
+// Names assumed (the plan's `ReplicationSummary`, made concrete; the implementer may change them
+// and these tests with them if the reason is stated):
+//   struct Band { double median, low, high; };  // low: the 10 % quantile, high: the 90 % quantile
+//   struct OpBands { std::string client, op; Band offered_per_s, mean_s, p50_s, p95_s, p99_s; };
+//   struct SloReplication { SloResult result; std::size_t passes_in; };  // the median run's result
+//   struct ReplicationSummary { std::vector<int> seeds; std::vector<OpBands> ops;
+//                               std::vector<SloReplication> slos; ... };
+//   ReplicationSummary summarize_replications(std::span<const Summary> runs,
+//                                             std::span<const int> seeds);
+// The quantile rule is NEAREST-RANK: the p-quantile of n sorted values is the value of rank
+// ceil(p n), counted from 1. The report had no rule for a sample of runs (its percentiles are a
+// lognormal fit to one run's moments, not quantiles of a sample), so this one is pinned here: it
+// always returns one of the runs' values, so the printed median is a number some run printed. For
+// n = 5 the band is the smallest and the largest value and the median the 3rd; for n = 10 the band
+// is the 1st and the 9th and the median the 5th (the lower of the two middle ones).
+namespace {
+
+// The value of rank ceil(percent n / 100) of `values`, sorted ascending; integer arithmetic, so
+// that no float rounding can move a rank (0.1 * 10 is not always exactly 1).
+double nearest_rank(std::vector<double> values, std::size_t percent) {
+  // C++20 std::ranges::sort: sorts the whole container, so the begin/end pair of std::sort (which
+  // can be mismatched) goes away; `values` is a copy, so the caller's order survives.
+  std::ranges::sort(values);
+  const std::size_t rank = (percent * values.size() + 99) / 100;
+  return values.at(std::max<std::size_t>(rank, 1) - 1);
+}
+
+// One run of the M/M/1 probe `mm1` per demand, in the order given, each with the SLO "p99 of c.op
+// at most p99_max" when one is given. A Summary points at its graph, so the graphs live in a
+// deque, whose elements never move, next to the summaries.
+struct Runs {
+  std::deque<simsys::graph::Graph> graphs;
+  std::vector<Summary> summaries;
+
+  // C++20 std::span<const T>: a non-owning view of contiguous elements, so the caller passes a
+  // std::array or a vector of demands without a copy and without this being a template.
+  explicit Runs(std::span<const double> demands,
+                std::optional<simsys::SimTime> p99_max = std::nullopt) {
+    for (const double demand : demands) {
+      auto s = mm1(demand);
+      if (p99_max) {
+        s.slos = {simsys::model::SloSpec{.metric = simsys::model::SloMetric::p99_latency,
+                                         .node = "c",
+                                         .op = "op",
+                                         .max = *p99_max}};
+      }
+      graphs.push_back(*simsys::graph::Graph::build(s));
+      summaries.push_back(summarize(s, graphs.back()));
+    }
+  }
+
+  // The runs' p99 values, in the order of the runs (not sorted).
+  [[nodiscard]] std::vector<double> p99s() const {
+    std::vector<double> values;
+    for (const auto& summary : summaries) values.push_back(summary.ops().at(0).p99_s);
+    return values;
+  }
+  [[nodiscard]] std::vector<double> means() const {
+    std::vector<double> values;
+    for (const auto& summary : summaries) values.push_back(summary.ops().at(0).mean_s);
+    return values;
+  }
+};
+
+// Five demands in no order, so that the median is not the run in the middle of the list; the mean
+// and the p99 grow with the demand (rho 0.1 to 0.5), so the median run is the demand-300 one.
+constexpr std::array<double, 5> five_demands{300, 100, 500, 200, 400};
+constexpr std::array<int, 5> five_seeds{1, 2, 3, 4, 5};
+// Ten, shuffled: the even count shows which of the two middle values is the median.
+constexpr std::array<double, 10> ten_demands{250, 50, 500, 150, 400, 100, 350, 200, 450, 300};
+constexpr std::array<int, 10> ten_seeds{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+
+// The SLO limit halfway between the `rank`th and the next larger p99 of `runs`, as the
+// SLO spells it: a duration in whole nanoseconds. `rank` counts from 1 in ascending order: runs of
+// rank 1..rank pass, the others fail.
+simsys::SimTime limit_between_ranks(const Runs& runs, std::size_t rank) {
+  auto sorted = runs.p99s();
+  std::ranges::sort(sorted);
+  const double halfway = (sorted.at(rank - 1) + sorted.at(rank)) / 2;
+  return simsys::SimTime{static_cast<std::int64_t>(halfway * 1e9)};
+}
+
+}  // namespace
+
+TEST_CASE("the median of five runs is their third value and the band their smallest and largest") {
+  const Runs runs{five_demands};
+  const auto replicated = simsys::report::summarize_replications(runs.summaries, five_seeds);
+  REQUIRE(replicated.ops.size() == 1);
+  const auto& op = replicated.ops[0];
+  CHECK(op.client == "c");
+  CHECK(op.op == "op");
+  for (const auto& [band, values] :
+       {std::pair{op.mean_s, runs.means()}, std::pair{op.p99_s, runs.p99s()}}) {
+    auto sorted = values;
+    std::ranges::sort(sorted);
+    CHECK(band.median == sorted[2]);
+    CHECK(band.low == sorted[0]);
+    CHECK(band.high == sorted[4]);
+  }
+  // The runs grow with the demand, so the median is the demand-300 run's own number.
+  CHECK(op.mean_s.median == runs.summaries[0].ops().at(0).mean_s);
+}
+
+TEST_CASE("the band of ten runs is nearest-rank: the 1st and the 9th value, not an interpolation") {
+  const Runs runs{ten_demands};
+  const auto replicated = simsys::report::summarize_replications(runs.summaries, ten_seeds);
+  const auto p99 = runs.p99s();
+  const auto& band = replicated.ops.at(0).p99_s;
+  CHECK(band.low == nearest_rank(p99, 10));
+  CHECK(band.high == nearest_rank(p99, 90));
+  CHECK(band.median == nearest_rank(p99, 50));
+  // The same by position, so that the helper above is not the only witness: ranks 1, 5 and 9 of 10.
+  auto sorted = p99;
+  std::ranges::sort(sorted);
+  CHECK(band.low == sorted[0]);
+  CHECK(band.median == sorted[4]);
+  CHECK(band.high == sorted[8]);
+}
+
+TEST_CASE("one run is its own median and its own band") {
+  const Runs runs{std::array<double, 1>{300}};
+  const auto replicated =
+      simsys::report::summarize_replications(runs.summaries, std::array<int, 1>{9});
+  const auto& band = replicated.ops.at(0).mean_s;
+  const double mean = runs.summaries[0].ops().at(0).mean_s;
+  CHECK(band.median == mean);
+  CHECK(band.low == mean);
+  CHECK(band.high == mean);
+}
+
+TEST_CASE("the seeds of a replication summary are kept as given, in order") {
+  const Runs runs{five_demands};
+  const auto replicated = simsys::report::summarize_replications(runs.summaries, five_seeds);
+  CHECK(replicated.seeds == std::vector<int>{1, 2, 3, 4, 5});
+}
+
+TEST_CASE("an SLO passes in as many runs as pass it, and shows the median run's observed value") {
+  // Limit between the 3rd and 4th smallest p99: the three smallest pass, two fail, and the median
+  // run (the 3rd smallest) passes. The plan's `PASS in 3 of 5`.
+  const Runs probe{five_demands};
+  const Runs runs{five_demands, limit_between_ranks(probe, 3)};
+  const auto replicated = simsys::report::summarize_replications(runs.summaries, five_seeds);
+  REQUIRE(replicated.slos.size() == 1);
+  CHECK(replicated.slos[0].passes_in == 3);
+  CHECK(replicated.slos[0].result.status == simsys::report::SloStatus::pass);
+  CHECK(replicated.slos[0].result.observed == replicated.ops.at(0).p99_s.median);
+}
+
+TEST_CASE("an SLO the median run fails fails, whatever the few runs that pass it") {
+  // Limit between the 1st and 2nd smallest p99: one run passes, the median run (3rd) fails.
+  const Runs probe{five_demands};
+  const Runs runs{five_demands, limit_between_ranks(probe, 1)};
+  const auto replicated = simsys::report::summarize_replications(runs.summaries, five_seeds);
+  REQUIRE(replicated.slos.size() == 1);
+  CHECK(replicated.slos[0].passes_in == 1);
+  CHECK(replicated.slos[0].result.status == simsys::report::SloStatus::fail);
+  CHECK(replicated.slos[0].result.observed == replicated.ops.at(0).p99_s.median);
+}
+
+TEST_CASE("a scenario without SLOs has no SLO replications") {
+  const Runs runs{five_demands};
+  CHECK(simsys::report::summarize_replications(runs.summaries, five_seeds).slos.empty());
 }
