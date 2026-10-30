@@ -20,7 +20,7 @@ interface units and partitions in `FILE_SET CXX_MODULES` (`CMakeLists.txt`). The
 | `simsys.defaults` | `src/defaults/defaults.cppm` | interface only | core, fluid, model |
 | `simsys.graph` | `src/engine/graph.cppm`, `graph.cpp` | interface + implementation unit (declarations in the interface, definitions in `graph.cpp`) | caching, core, defaults, fluid, model, queueing |
 | `simsys.behaviours` | `src/engine/behaviours.cppm` | interface only | core, defaults, flow, fluid, graph, model, queueing, workload |
-| `simsys.engine` | `src/engine/engine.cppm`, `faults.cppm` | interface + interface partition `:faults` (the fault schedule), which the interface re-exports | core, behaviours, defaults, flow, fluid, graph, model, queueing; the partition imports core, model |
+| `simsys.engine` | `src/engine/engine.cppm`, `faults.cppm` | interface + interface partition `:faults` (the fault schedule), which the interface re-exports | core, behaviours, defaults, flow, fluid, graph, model, queueing; the partition imports caching, core, graph, model |
 | `simsys.report` | `src/report/report.cppm`, `shared.cppm`, `report.cpp`, `explain.cpp` | interface + implementation partition `:shared` + two implementation units (the run's renderers; `simsys explain`) | core, engine, fluid, graph, model; the partition imports core, fluid; the implementation units add defaults, flow, queueing, workload |
 | `simsys.session` | `src/session/session.cppm`, `session.cpp` | interface + implementation unit | config, engine, graph, model, report |
 | `simsys.sweep` | `src/sweep/sweep.cppm`, `sweep.cpp` | interface + implementation unit | none in the interface; the implementation unit imports config, core, graph, model, report, session |
@@ -200,7 +200,10 @@ The three large modules show three layouts, and `simsys.engine` a fourth.
   simsys.engine:faults;`) holds `engine::Condition` and `engine::FaultSchedule`, which the tests
   read too, so they are exported; `engine.cppm` writes `export import :faults;`, and an
   importer of `simsys.engine` sees them as if `engine.cppm` declared them. The partition imports
-  `simsys.core` and `simsys.model` only (not the module's own interface: GCC's refusal below).
+  `simsys.caching`, `simsys.core`, `simsys.graph` and `simsys.model` (the schedule is resolved
+  against the graph, and a flushed cache's warm-up reads its key popularity), never the module's
+  own interface (GCC's refusal below): the one number it needs from the engine, the reads a
+  flushed cache is handed, the engine passes to its constructor (`Simulation::fault_schedule_of`).
 - **`simsys.config`: interface + ten implementation units + a header in the purview.** The
   loader is cut by concern: `config.cpp` (`load`, the pipeline), `header.cpp`, `nodes.cpp`,
   `steps.cpp`, `workload.cpp`, `links.cpp`, `slos.cpp`, `faults.cpp`, `overrides.cpp`, and

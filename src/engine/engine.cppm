@@ -18,7 +18,9 @@
 // individual requests (flow is a fluid), retries, and anything that changes within a step
 // (demand is constant across one step). A scripted fault (the scenario's `faults:`, FaultSchedule)
 // changes a node's numbers for the steps it covers: forward_pass asks the schedule for the node's
-// Condition and the node steps under it (serve, ClientBehaviour::set_rate_factor). A client's
+// Condition and the node steps under it (serve, ClientBehaviour::set_rate_factor); a flushed
+// cache's warm-up reaches the behaviours that route its misses (warm_flushed_caches), and a
+// dc_down's cut links drop what crosses them (send). A client's
 // timeout is applied to the fitted response time it sees (Simulation::give_up_after), not request
 // by request.
 //
@@ -287,6 +289,14 @@ class Simulation {
   // says whether a steady state was found.
   [[nodiscard]] StepRecord estimate() const;
 
+  // The fault schedule a Simulation of `g` steps by (FaultSchedule): the scenario's faults resolved
+  // against the graph, each cache_flush with the reads its cache is handed at the flush in the
+  // long run (reads_at_flushes). For tests and tools that read the schedule without running it.
+  // Throws std::invalid_argument when `g` cannot run (Simulation::create's refusal, as its
+  // message): the caller asked for the schedule of a scenario it has not checked, a programmer
+  // error.
+  [[nodiscard]] static FaultSchedule fault_schedule_of(const graph::Graph& g);
+
   // Steps from t = 0 while t < duration and hands every record to `observer`: that is
   // ceil(duration / step) records, the last at the largest multiple of step below
   // duration (1 s at 300 ms steps gives 0, 300, 600, 900 ms, so the last step simulates
@@ -431,6 +441,10 @@ class Simulation {
     // (receiver, link) of every bandwidth link this node sends demand on (connect_pipes): where
     // its hop lookups find a pipe (hop_response, hop_delivered). Empty for most nodes.
     std::vector<std::pair<std::size_t, std::size_t>> pipes_out{};
+    // (receiver, link) of every link a dc_down may cut that this node sends demand on
+    // (connect_cuttable): where hop_delivered finds that a hop's link drops everything. Empty
+    // without a dc_down.
+    std::vector<std::pair<std::size_t, std::size_t>> cuttable_out{};
     // A message queue's consumer groups (connect_consumer_groups): the worker pools whose waits
     // are its lag (record_queue_lags). Empty for every other node; a queue has at least one
     // (Graph::build refuses a queue nobody consumes).
@@ -461,6 +475,9 @@ class Simulation {
     // carries it to the receiver.
     flow::Flow sent{};
     std::optional<Pipe> pipe{};  // a link with a bandwidth only
+    // A plain link that a dc_down cuts this step (send): it dropped all it was sent, and every hop
+    // over it delivers nothing (hop_delivered). A pipe is cut through its queue instead.
+    bool cut{false};
   };
 
   Simulation() = default;  // only for settling_copy(), which fills every member
@@ -484,9 +501,14 @@ class Simulation {
                                                      std::size_t slot);
   void connect(const graph::Graph& g);
   void connect_pipes(const graph::Graph& g);
+  void connect_cuttable(const graph::Graph& g);
   void connect_consumer_groups(const graph::Graph& g);
   void register_reachable_ops(const graph::Graph& g);
   [[nodiscard]] Simulation settling_copy() const;
+  [[nodiscard]] StepRecord settle(SimTime at);
+  [[nodiscard]] std::vector<double> reads_at_flushes(const graph::Graph& g) const;
+  void warm_flushed_caches(SimTime now);
+  void set_hit_ratio_factor(std::size_t cache, double factor);
 
   [[nodiscard]] StepRecord evaluate(SimTime now, SimTime dt, Mode mode);
   void forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& record);
@@ -531,9 +553,9 @@ class Simulation {
                                  const ReplicationTally& tally, NodeSample& sample);
   [[nodiscard]] static flow::Flow take_drained(CopyGroup& group, const flow::Flow& content,
                                                const fluid::FluidStep& copy_step);
-  void send(std::size_t index, const behaviours::Routed& routed, SimTime dt, Mode mode,
+  void send(std::size_t index, const behaviours::Routed& routed, SimTime now, SimTime dt, Mode mode,
             std::span<LinkSample> link_samples);
-  static void pass_through_pipe(Link& link, SimTime dt, Mode mode,
+  static void pass_through_pipe(Link& link, SimTime dt, Mode mode, const Condition& condition,
                                 std::span<LinkSample> link_samples);
   void account_rejections(std::size_t index, const behaviours::Routed& routed, NodeSample& sample);
   void backward_pass();
@@ -545,6 +567,7 @@ class Simulation {
   [[nodiscard]] static double own_passed(const Node& node, std::string_view op);
   [[nodiscard]] double delivered_of(std::size_t node, std::string_view op) const;
   [[nodiscard]] const Pipe* pipe_between(std::size_t caller, std::size_t target) const;
+  [[nodiscard]] bool cut_between(std::size_t caller, std::size_t target) const;
   [[nodiscard]] flow::LatencyEstimate hop_response(std::size_t caller, std::size_t target,
                                                    std::string_view op) const;
   [[nodiscard]] double hop_delivered(std::size_t caller, std::size_t target,
@@ -605,13 +628,31 @@ namespace {
   return std::nullopt;
 }
 
-// Why a scripted fault cannot run yet, if one cannot: a dc_down, whose datacenter's nodes and links
-// Task 7 of phase 3 takes down (a temporary refusal, replaced there). Every other kind runs
-// (FaultSchedule; a cache_flush changes nothing until Task 7 either, but refusing it would refuse
-// the scenarios that script one).
-[[nodiscard]] std::optional<std::string> fault_not_runnable_yet(const model::Scenario& scenario) {
-  for (const auto& fault : scenario.faults) {
-    if (fault.kind == model::FaultKind::dc_down) return "dc_down lands in Task 7";
+// Why a cache_flush on `cache` cannot run, if it cannot (FaultSchedule's WarmUp has the model):
+//  - a fixed hit ratio without `keys`: the cache is full again after keys requests, and without a
+//    size the warm-up has no end;
+//  - a hit ratio of 1: the graph built no path for its misses (a cache that always hits sends its
+//    store nothing, Graph::build leaves the hop out), so a cold cache would have nowhere to send
+//    them. A hit ratio just below 1 runs.
+// A cache or CDN with no hit ratio misses every read already, and a flush changes nothing there.
+[[nodiscard]] std::optional<std::string> flush_not_runnable(const graph::ResolvedNode& cache) {
+  if (!cache.hit_ratio) return std::nullopt;
+  const std::string name = "node '" + cache.spec.id + "': cache_flush ";
+  if (!cache.hit_ratio->keys && !cache.spec.keys) {
+    return name + "needs keys (a fixed hit ratio is back once keys requests have refilled it)";
+  }
+  if (cache.hit_ratio->value >= 1.0) {
+    return name + "on a cache that always hits (hit ratio 1): it has no miss path to warm through";
+  }
+  return std::nullopt;
+}
+
+// Why a scripted fault cannot run, if one cannot: a cache_flush the warm-up cannot model
+// (flush_not_runnable). Every other kind runs (FaultSchedule).
+[[nodiscard]] std::optional<std::string> fault_not_runnable(const graph::Graph& g) {
+  for (const auto& fault : g.scenario().faults) {
+    if (fault.kind != model::FaultKind::cache_flush) continue;
+    if (auto refused = flush_not_runnable(g.nodes()[*g.index_of(fault.node)])) return refused;
   }
   return std::nullopt;
 }
@@ -946,7 +987,7 @@ std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Gr
       return std::unexpected{graph::EngineError{std::move(*refused)}};
     }
   }
-  if (auto refused = fault_not_runnable_yet(g.scenario())) {
+  if (auto refused = fault_not_runnable(g)) {
     return std::unexpected{graph::EngineError{std::move(*refused)}};
   }
   return Simulation{g};
@@ -955,9 +996,7 @@ std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Gr
 // Copies what a step needs out of the graph, so the Simulation does not outlive a
 // reference to it.
 Simulation::Simulation(const graph::Graph& g)
-    : order_{g.topological_order().begin(), g.topological_order().end()},
-      step_{g.scenario().step},
-      faults_{g.scenario()} {
+    : order_{g.topological_order().begin(), g.topological_order().end()}, step_{g.scenario().step} {
   for (std::size_t i = 0; i < g.nodes().size(); ++i) nodes_.push_back(make_node(g, i));
   // C++20 designated initializers: `Link{.line = ...}` names the member it sets and leaves
   // the others at their defaults, replacing positional braces where a reader must count
@@ -971,6 +1010,40 @@ Simulation::Simulation(const graph::Graph& g)
   connect_pipes(g);
   connect_consumer_groups(g);
   register_reachable_ops(g);
+  // Last: a flush's read rate is a settle of this very simulation (reads_at_flushes).
+  faults_ = FaultSchedule{g, reads_at_flushes(g)};
+  connect_cuttable(g);
+}
+
+FaultSchedule Simulation::fault_schedule_of(const graph::Graph& g) {
+  auto simulation = create(g);
+  if (!simulation) {
+    throw std::invalid_argument{"Simulation::fault_schedule_of: " + simulation.error().message};
+  }
+  return std::move(simulation->faults_);
+}
+
+// For each fault of the scenario, the reads per second its cache is handed at the flush, a
+// cache_flush's warm-up rate (0 for every other kind): the reads among the cache's arrivals in the
+// long-run state at the flush's time `at` (settle: estimate's passes, evaluated at `at`), what the
+// fluid model hands the cache at that moment once everything upstream has settled, saturation and
+// lost requests included, scripted faults not (the copy has none). Writes are left out: they
+// neither hit nor miss (graph::is_write), and the Che popularity is the reads'. The run's actual
+// arrivals at the flush step can differ (a backlog upstream, noise, another fault); the settled
+// rate keeps the schedule a function of the graph alone, which the tests read without running.
+std::vector<double> Simulation::reads_at_flushes(const graph::Graph& g) const {
+  const auto& faults = g.scenario().faults;
+  std::vector<double> reads(faults.size(), 0.0);
+  for (std::size_t i = 0; i < faults.size(); ++i) {
+    if (faults[i].kind != model::FaultKind::cache_flush) continue;
+    const std::size_t cache = *g.index_of(faults[i].node);
+    Simulation scratch = settling_copy();
+    static_cast<void>(scratch.settle(faults[i].at));
+    for (const auto& [op, rate] : scratch.nodes_[cache].inflow.entries()) {
+      if (!graph::is_write(g.nodes()[cache].spec, op)) reads[i] += rate.per_second;
+    }
+  }
+  return reads;
 }
 
 // Pattern: Strategy — each node gets the behaviour of its type, held by value in the
@@ -1254,6 +1327,17 @@ void Simulation::connect_pipes(const graph::Graph& g) {
   }
 }
 
+// Tells each sender which of its links a dc_down may cut, and to whom (Node::cuttable_out), as
+// connect_pipes does for pipes: what hop_delivered searches when a hop's link drops everything.
+void Simulation::connect_cuttable(const graph::Graph& g) {
+  for (std::size_t link = 0; link < g.links().size(); ++link) {
+    if (!faults_.may_cut(link)) continue;
+    const auto& resolved = g.links()[link];
+    nodes_[graph::demand_sender(resolved)].cuttable_out.emplace_back(
+        graph::demand_receiver(resolved), link);
+  }
+}
+
 // Tells each message queue which worker pools consume it (Node::consumer_groups): every pool whose
 // `consumes` names the queue (Graph::build checked that it links to it). A pool reading a frontier
 // is no message queue's group: a frontier is not simulated yet.
@@ -1356,9 +1440,16 @@ void Simulation::require_scenario_step(SimTime dt) const {
 // the last pass with `converged` false: no steady state in reach.
 StepRecord Simulation::estimate() const {
   Simulation scratch = settling_copy();  // estimate must not move a running simulation
-  StepRecord previous = scratch.evaluate(SimTime{0}, step_, Mode::settle);
+  return scratch.settle(SimTime{0});
+}
+
+// estimate()'s passes, on this simulation (a settling_copy), with the clients offering their curves
+// at time `at`: the long-run state at that moment. estimate() asks for t = 0; a cache_flush's
+// warm-up for the flush's time (reads_at_flushes).
+StepRecord Simulation::settle(SimTime at) {
+  StepRecord previous = evaluate(at, step_, Mode::settle);
   for (int pass = 2; pass <= max_settle_passes; ++pass) {
-    StepRecord current = scratch.evaluate(SimTime{0}, step_, Mode::settle);
+    StepRecord current = evaluate(at, step_, Mode::settle);
     if (settled(previous, current)) return current;
     previous = std::move(current);
   }
@@ -1382,8 +1473,10 @@ Simulation Simulation::settling_copy() const {
   scratch.step_ = step_;
   scratch.pipe_count_ = pipe_count_;
   // faults_ stays empty: estimate is the steady state without the scripted faults (every node in
-  // the identity condition), which `simsys estimate` says above its table.
+  // the identity condition), which `simsys estimate` says above its table. A flushed cache's
+  // warm-up lives in the behaviours that route its misses, so the copy's go back to steady.
   scratch.nodes_ = nodes_;
+  for (const std::size_t cache : faults_.flushed_caches()) scratch.set_hit_ratio_factor(cache, 1.0);
   for (auto& node : scratch.nodes_) {
     node.inflow.clear();
     for (auto& group : node.copy_groups) group.waiting.clear();
@@ -1417,12 +1510,41 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
   StepRecord record{.t = now,
                     .nodes = std::vector<NodeSample>(nodes_.size()),
                     .links = std::vector<LinkSample>(pipe_count_)};
+  warm_flushed_caches(now);
   forward_pass(now, dt, mode, record);
   record_queue_lags(record.nodes);
   backward_pass();
   if (mode == Mode::settle) average_settling_fractions();
   record.responses = client_responses(now);
   return record;
+}
+
+// A flushed cache's hit ratio factor at `now` (FaultSchedule::condition_at: h(t) / h, 0 at the
+// flush, 1 once full and before any flush) handed to every behaviour that routes its misses, before
+// any node routes this step: the cache itself (a read_through cache's or a CDN's store hop, its
+// `on: miss` then-steps) and every service whose miss steps follow a lookup of it (cache-aside).
+// The factor belongs to the step, not to the node's turn in the order, because a service that
+// looks the cache up routes before it. Nothing to do without a flush, and in a settling copy,
+// whose schedule is empty.
+void Simulation::warm_flushed_caches(SimTime now) {
+  for (const std::size_t cache : faults_.flushed_caches()) {
+    set_hit_ratio_factor(cache, faults_.condition_at(cache, now).hit_ratio_factor);
+  }
+}
+
+// Every behaviour that carries `cache`'s misses takes them at 1 − h × factor from now on.
+void Simulation::set_hit_ratio_factor(std::size_t cache, double factor) {
+  for (auto& node : nodes_) {
+    std::visit(
+        [&](auto& behaviour) {
+          // A requires-expression as a compile-time condition (see megabyte_service_of): only the
+          // behaviours that route a cache's misses have the member.
+          if constexpr (requires { behaviour.set_hit_ratio_factor(cache, factor); }) {
+            behaviour.set_hit_ratio_factor(cache, factor);
+          }
+        },
+        node.behaviour);
+  }
 }
 
 // The damping of estimate()'s thinning (see estimate): after each settle pass every delivered
@@ -1515,7 +1637,7 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
                          }},
         nodes_[index].behaviour);
     account_rejections(index, routed, samples[index]);
-    send(index, routed, dt, mode, record.links);
+    send(index, routed, now, dt, mode, record.links);
   }
 }
 
@@ -1930,14 +2052,26 @@ flow::Flow Simulation::take_drained(CopyGroup& group, const flow::Flow& content,
 
 // What node `index` routed goes onto its links: summed per link (one push per link and step,
 // see DelayLine), through the link's pipe first when it has a bandwidth (pass_through_pipe, whose
-// sample lands in `link_samples`), then into the delay line.
-void Simulation::send(std::size_t index, const behaviours::Routed& routed, SimTime dt, Mode mode,
-                      std::span<LinkSample> link_samples) {
+// sample lands in `link_samples`), then into the delay line. A link's condition at `now`
+// (FaultSchedule::link_condition_at: the identity, or a dc_down's capacity 0) derates its pipe like
+// a node's queue: it drains nothing, fills its room and drops the rest. A plain link has no queue,
+// so capacity 0 drops everything it is sent at once (`cut`): the receiver gets nothing, and every
+// hop over it delivers nothing (hop_delivered). What was already in flight when the cut began still
+// arrives; a cut drops at the sender's end. A plain link's loss has no sample: plain links have no
+// row in StepRecord::links.
+void Simulation::send(std::size_t index, const behaviours::Routed& routed, SimTime now, SimTime dt,
+                      Mode mode, std::span<LinkSample> link_samples) {
   const auto& outgoing_links = nodes_[index].outgoing_links;
   for (const std::size_t link : outgoing_links) links_[link].sent.clear();
   for (const auto& out : routed.outgoing) links_[out.link].sent += out.flow;
   for (const std::size_t link : outgoing_links) {
-    if (links_[link].pipe) pass_through_pipe(links_[link], dt, mode, link_samples);
+    const Condition condition = faults_.link_condition_at(link, now);
+    if (links_[link].pipe) {
+      pass_through_pipe(links_[link], dt, mode, condition, link_samples);
+      continue;
+    }
+    links_[link].cut = condition.capacity_factor <= 0.0;
+    if (links_[link].cut) links_[link].sent.clear();
   }
   if (mode == Mode::settle) return;  // estimate reads `sent` directly; lines stay untouched
   for (const std::size_t link : outgoing_links) links_[link].line.push(links_[link].sent);
@@ -1970,7 +2104,7 @@ void Simulation::send(std::size_t index, const behaviours::Routed& routed, SimTi
 // Ignored: TCP's slow start and windows, packet loss and retransmission, the propagation delay
 // changing with load (the link's one-way latency stays fixed), and the true direction of each
 // byte (above).
-void Simulation::pass_through_pipe(Link& link, SimTime dt, Mode mode,
+void Simulation::pass_through_pipe(Link& link, SimTime dt, Mode mode, const Condition& condition,
                                    std::span<LinkSample> link_samples) {
   Pipe& pipe = *link.pipe;
   const flow::Flow& requests = link.sent;
@@ -1979,8 +2113,8 @@ void Simulation::pass_through_pipe(Link& link, SimTime dt, Mode mode,
   }
   const flow::Flow megabytes = to_megabytes(requests, pipe.megabytes_by_op);
   const bool idle = requests.total().per_second <= 0.0;
-  // A link has no condition yet (dc_down's links are Task 7's): the identity derating.
-  const GroupStep step = advance_group(pipe.group, megabytes, dt, mode, fluid::Derating{});
+  // The link's condition (send): the identity, or a dc_down's capacity 0.
+  const GroupStep step = advance_group(pipe.group, megabytes, dt, mode, derating_of(condition));
   pipe.wait = step.copy.wait;
   pipe.passed = kept_share(step.dropped, megabytes);
   link_samples[pipe.slot] =
@@ -2157,8 +2291,17 @@ flow::LatencyEstimate Simulation::hop_response(std::size_t caller, std::size_t t
 double Simulation::hop_delivered(std::size_t caller, std::size_t target,
                                  std::string_view op) const {
   const Pipe* pipe = pipe_between(caller, target);
-  if (pipe == nullptr) return delivered_of(target, op);
+  if (pipe == nullptr) return cut_between(caller, target) ? 0.0 : delivered_of(target, op);
   return pipe->passed * delivered_of(target, op);
+}
+
+// Whether the plain link from `caller` to `target` is cut this step (send, a dc_down): none is
+// without a dc_down, an empty list.
+bool Simulation::cut_between(std::size_t caller, std::size_t target) const {
+  for (const auto& [receiver, link] : nodes_[caller].cuttable_out) {
+    if (receiver == target) return links_[link].cut;
+  }
+  return false;
 }
 
 // What the forward pass thins `caller`'s later calls by (behaviours::detail::HopBlocks::forward):
