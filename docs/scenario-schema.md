@@ -130,7 +130,7 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `external_sink` | a third party's API: a queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) that fails `failure_rate` of what it serves, counted as drops (phase 2c, see [Node types](#node-types)); `politeness` caps its drain at the frontier's `hosts` × politeness (phase 3, see [`frontier`](#frontier)) |
 | `frontier` | the URL frontier (phase 3): its prioritiser at `capacity`, its URLs handed along its `then` steps to the pool that consumes it, which drains at most `hosts × politeness`; its lag evaluated like a queue's (see [`frontier`](#frontier)) |
 | `kv_cluster` | `nodes` machines on a ring, every request sent to `replication` N of them, answered at the W-th (write) or R-th (read) fastest of its own replica set and lost when fewer come back; the ring's hottest machine as its own queue (phase 2c, see [`kv_cluster`](#kv_cluster)) |
-| `ws_gateway` | its open connections as a **level** that a client op named `connect` fills or a fixed `connections` states, capped at `max_connections × replicas`, loaded by `C / heartbeat` pings, its message ops' steps to a message queue fanned out by `fanout`; a `node_down` drops its connections and they storm back over `reconnect_within` (phase 3, see [`ws_gateway`](#ws_gateway)) |
+| `ws_gateway` | its open connections as a **level** that a client op named `connect` fills or a fixed `connections` states, capped at `max_connections × replicas`, loaded by `C / heartbeat` pings, its message ops' steps to a message queue fanned out by `fanout`; a `node_down` (or a `dc_down` of its datacenter) drops its connections and they storm back over `reconnect_within` (phase 3, see [`ws_gateway`](#ws_gateway)) |
 | `notification_fanout` | a service (the type's 20k/s at 1 ms) whose `then` steps fire for the `1 − dedup` of what it serves that its dedup step lets through, the rest counted as `deduplicated_per_s`; `channels` names the queue behind each channel (phase 3, see [`notification_fanout`](#notification_fanout)) |
 
 Everything else is refused before the first step, with exit code 1:
@@ -388,7 +388,7 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `worker_pool` | `consumes` (queue node id, required), `workers`, `cost` (duration per job), `then`, `retries`, `retry_after` | `consumes`, `workers`, `cost` and `then` read and run (phase 2c), same section: the steps fire for every job it drains, `on: miss` and `on: failure` refused; `retries` and `retry_after` read and run (phase 3), same section: the jobs whose call to an external sink failed go back on the pool's queue, read again by this pool only, and the last attempt's failures are dead letters (the `dead_letter_rate` SLO) |
 | `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every **write** the store serves (an op in its `write_ops`; not one it drops) sends `factor` requests of the step's op to its target, and a read sends nothing (S3 notifies on ObjectCreated and ObjectRemoved, never on a GET: 1000 views/s of a video start no transcode; notifying on reads is phase 3). They are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. A step `on: miss` (`node 'store': a blob store's then steps fire for every write it stores (on: miss needs a cache)`) or `on: failure` (`... (on: failure: an event reports no failure before phase 3)`) is refused, and so is any `mode` (`node 'store': a blob store's then steps are event notifications nobody waits for (mode orders the calls a request waits for)`); an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, the delivery delay (an event arrives after the link's latency), failed notifications |
 | `search_index` | `build_interval` (positive duration) | read and run (phase 2c), see [`search_index`](#search_index); `build_interval` printed, not modelled |
-| `ws_gateway` | `max_connections` (count), `heartbeat` (duration), `fanout` (avg recipients per message, ≥ 1), `connections` (count: a fixed level), `session` (duration), `reconnect_within` (duration), `ops` | read and run (phase 3), see [`ws_gateway`](#ws_gateway); `reconnect_within` paces the reconnect storm after a `node_down` (phase 3 Task 15) |
+| `ws_gateway` | `max_connections` (count), `heartbeat` (duration), `fanout` (avg recipients per message, ≥ 1), `connections` (count: a fixed level), `session` (duration), `reconnect_within` (duration), `ops` | read and run (phase 3), see [`ws_gateway`](#ws_gateway); `reconnect_within` paces the reconnect storm after a `node_down` or a `dc_down` (phase 3 Task 15) |
 | `service_discovery` | `failover` (positive duration) | read and run (phase 3), see [`service_discovery`](#service_discovery): a service answering `lookup`; `failover` (default 10 s, chosen) is how long its callers stay on a dead replica after a `node_down`; `node 'disc': failover must be positive`; on any other type `node 'api': key 'failover' is not valid for type 'service'` |
 | `id_generator` | `algorithm` `snowflake|ticket_server|uuid` (required) | read and run (phase 2b), see [`id_generator`](#id_generator) |
 | `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) | read and run (phase 2c): a third party's API (ch. 10's APNs, FCM, SMS and e-mail providers), a leaf queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) whose served requests fail at `failure_rate` f (default 0; outside [0, 1]: `node 's': failure_rate must be between 0 and 1`): `dropped += f × served`, `drain = (1 − f) × served`, so 500/s at f = 0.02 is answered 490/s and the failures count in the node's drop rate, never as rejections. `politeness` (a positive rate, `node 's': politeness must be positive`) caps the sink's drain at hosts × politeness, the `hosts` of the scenario's one [`frontier`](#frontier) (phase 3; `explain` prints `politeness=1/s (drain cap 10M/s: 10M hosts x 1/s)`). `then` and `ops` stay refused; a client's `retries` and a [worker pool's](#message_queue-and-worker_pool) send a failure again (the sink's drop rate leaves out the share of its drops that came from retrying pools) |
@@ -955,13 +955,13 @@ with (0 at the first step). The keys:
 
 | key | type | meaning |
 |---|---|---|
-| `max_connections` | count (`100k`, `2M`) | the connections one replica holds at most; the **cap** is `max_connections × replicas`. A connect that would take the level past it is **refused**: a rejection (`rejected_per_s`, the node table's `rejected`), not a drop, and not answered, so the client's `connect` is answered for the ones that got in (at the cap: `connects − cap / session`, 50 of 100 a second at a cap of 50k and a session of 1000 s). Absent: no cap. `node 'gw': max_connections must be a positive integer` |
+| `max_connections` | count (`100k`, `2M`) | the connections one replica holds at most; the **cap** is `max_connections × replicas`, and while a fault has killed some replicas the survivors' alone, `max_connections × replicas × (1 − share down)` (two survivors of 30k hold 60k; the reconnect storm, below). A connect that would take the level past it is **refused**: a rejection (`rejected_per_s`, the node table's `rejected`), not a drop, and not answered, so the client's `connect` is answered for the ones that got in (at the cap: `connects − cap / session`, 50 of 100 a second at a cap of 50k and a session of 1000 s). Absent: no cap. `node 'gw': max_connections must be a positive integer` |
 | `heartbeat` | positive duration | every open connection pings this often, so the gateway serves **`C / heartbeat`** pings a second on its `heartbeat` op, added to what the clients send under that name, and its `heartbeat` steps (to a presence service) carry them on: 100k connections at the book's 5 s are 20k/s. Absent: no heartbeat load. `node 'gw': heartbeat must be positive` |
 | `fanout` | number ≥ 1 | the average recipients of a message: every step of a **message op** (every op but `connect`, `heartbeat` and `deliver`) **that targets a `message_queue`** sends `fanout` × its own `factor` copies, one per recipient (1.4: 100 sends/s are 140/s published), as ch. 12 puts a copy into each recipient's sync queue; the op's other steps (an id generator, a message store) see each message once (since phase 3 Task 15; Task 14 multiplied every step, which stored each message 1.4 times). `deliver` is terminal (see `ops`). Absent: 1. `node 'gw': fanout must be at least 1` (also for 0), `node 'gw': fanout must be at most 1e6` |
 | `connections` | count | a **fixed** level, for a gateway no client connects to (google-drive's 2M long polls, held by devices nobody here simulates): C is that number on every step, with no connects, disconnects or refusals; only its heartbeats load anything. `node 'gw': connections must be a positive integer` (also for `1.5`) |
 | `ops` | map | a service's op → step list, three names with a meaning of their own: `connect` (raises the level; no steps needed), `heartbeat` (the open connections' pings arrive under it; its steps, to a presence service, carry them on) and `deliver`, a message pushed to its recipient over the open connection, which ends there: write `deliver: []`. Every other op is a message, fanned out. `node 'gw': op 'deliver' is terminal on a ws_gateway (write deliver: [])` for a `deliver` with steps (on any other type `deliver` is an ordinary op) |
 | `session` | positive duration | how long a user stays connected on average. Absent: **30 minutes, chosen, not from the book** (ch. 12 never says how long a connection lasts; half an hour is a typical mobile chat session). `node 'gw': session must be positive` |
-| `reconnect_within` | positive duration | how long the users of a fallen gateway take to come back: after a `node_down` the connections it dropped reconnect **evenly over it** from the fault's end (the reconnect storm, below). Absent: **30 seconds, chosen, not from the book** (a few of ch. 12's 5 s heartbeats of a client's backoff); [chat-system's README](../scenarios/book/chat-system/README.md) sweeps it from 10 s to 60 s. `node 'gw': reconnect_within must be positive` |
+| `reconnect_within` | positive duration | how long the users of a fallen gateway take to come back: after a `node_down` or a `dc_down` the users still waiting reconnect **evenly over it** from the fault's end, and a reconnect refused or dropped is tried again after a wait of mean `reconnect_within` (the reconnect storm, below). Absent: **30 seconds, chosen, not from the book** (a few of ch. 12's 5 s heartbeats of a client's backoff); [chat-system's README](../scenarios/book/chat-system/README.md) sweeps it from 10 s to 60 s. `node 'gw': reconnect_within must be positive` |
 
 `connections`, `session` and `reconnect_within` on any other type are refused like every key
 outside its row (`node 'svc': key 'session' is not valid for type 'service'`). The loader does not
@@ -978,26 +978,43 @@ any node's queue.
 **The reconnect storm** (phase 3 Task 15; ch. 12, what happens when a chat server goes offline). A
 server that dies takes its open sockets with it, so a `node_down` of `r` of the gateway's `R`
 replicas drops **`C × r / R`** connections at its first step (the record of that step shows the
-level without them), and while it lasts the share `r / R` of every op but `connect` and
-`heartbeat` (the messages and deliveries that would travel over a dropped connection) is **lost**:
-booked as the gateway's demand and drops, never served (a `send` is answered 50 of 100 a second
-with 2 of 4 replicas down). Connects go to the surviving replicas; with every replica down there is
-none, so every request is lost at once (a connect is refused, not queued for a server that is
-gone), no connect is admitted and the level stays **0**. The heartbeats follow the level: the
-dropped connections ping no more. When the fault clears the dropped users come back, spread evenly
-over `reconnect_within` W:
+level without them), and a `dc_down` of the gateway's datacenter drops all of them, as a
+`node_down` of every replica does (a `capacity` fault drops none: its servers are slow, not
+dead). A fault that strikes while another is on drops `r / R` of what the survivors hold. While it
+lasts the share `r / R` of every op but `connect` and `heartbeat` (the messages and deliveries that
+would travel over a dropped connection) is **lost**: booked as the gateway's demand and drops,
+never served (a `send` is answered 50 of 100 a second with 2 of 4 replicas down), and the cap is
+the survivors' (`max_connections` above). Connects go to the surviving replicas; with every replica
+down there is none, so every request is lost at once (a connect is refused, not queued for a
+server that is gone), no connect is admitted and the level stays **0**. The heartbeats follow the
+level: the dropped connections ping no more.
 
-    connects = λ + D / W    for W seconds from the fault's end      D: the connections dropped
+The dropped users **wait** for their fault to clear, each fault its own (two faults that overlap
+release theirs at their own ends), and while they wait they end their sessions as connected users
+do, at rate `1 / session`: of `D0` dropped, **`D0 × e^(−for / session)`** are still waiting when the
+fault clears (a user whose session would have ended does not come back: 18.9 % of them after 600 s
+at a 6-minute session). With every replica down a connect the clients send is lost, and its user
+waits with them (the app tries again once the tier is back). When the fault clears the `D` users
+still waiting come back, spread evenly over `reconnect_within` W:
+
+    connects = λ + D / W    for W seconds from the fault's end      D: the users still waiting
 
 on top of the clients' own `connect` rate λ, arriving at the gateway as its `connect` op (its
-demand and rho count them) and raising the level as the users' connects do. 99.3k connections back
+demand and rho count them) and raising the level as the users' connects do. 99.4k connections back
 over 30 s are 3.3k connects a second, 34 times the probe's usual 100/s; over 300 s, 4.3 times. As
 the level refills its heartbeats come back too, so the gateway's load peaks where the storm and
-the recovered pings meet, often at the storm's last second; a shorter W is a steeper storm.
-Ignored: that a reconnect costs more than a message (TLS, login, the discovery lookup), clients
-that give up, users of dead replicas who reconnect to the survivors before the fault clears, a
-fixed `connections` level (not dropped: its devices are nobody's to reconnect) and a `dc_down`
-(only a `node_down` drops connections). The fault block names the storm (see [Faults](#faults)).
+the recovered pings meet, often at the storm's last second; a shorter W is a steeper storm. A
+storm still running when every replica goes down again **stops**: its connects not yet back wait
+for that outage too. A reconnect the gateway **refuses** (the cap) or **drops** (its room full) is
+not a user lost: the user tries again after a wait of mean W (each retrying user comes back at rate
+`1 / W`, a memoryless backoff), so every user the fault dropped comes back unless their session
+ends first. Ignored: that a reconnect costs more than a message (TLS, login, the discovery
+lookup), clients that give up, users of dead replicas who reconnect to the survivors before the
+fault clears, the users' own connects the survivors' smaller cap refuses (refused as at a full
+tier), a fixed `connections` level (not dropped: its devices are nobody's to reconnect), and that
+the storm's own users end no session while they wait their turn within W (after the storm the level
+stands above the fault-free run's by about `D × W / (2 × session)`: 1.5 % at 30 s and 1000 s). The
+fault block names the storm (see [Faults](#faults)).
 
 `explain` ends the gateway's line with its level, heartbeat load and cap:
 `  connections: C*=100k at the peak connect rate (connect 100/s × session 16.7m), heartbeat 20k/s,
@@ -1649,7 +1666,7 @@ the observed seconds (`steps` × `step`).
 | `faults[]` | `at_s`, `kind`, `node`, `for_s` | seconds from the start of the run; the kind; the node (`null` for a `dc_down`, which has `datacenter` after it); seconds, `null` for a `cache_flush` |
 | `faults[]` | `overlaps_at_s` | the `at_s` of every earlier fault on the same node (or datacenter) still counting when this one struck; `[]` for none. Overlapping faults' `failover_lost` overlap like their `lost` does: each counts the dead-replica share over the other's window too |
 | `faults[]` | `during` | `offered_per_s`, `served_per_s` (means over the fault), `lost` (against the twin, from `at` to the recovery) in `lost_unit` (`"requests"` or `"MB"`), `lost_on_cut_links` (a `dc_down`'s, in requests; `null` for every other kind), `backlog_peak`, `room` (in `lost_unit`; `room` `null` for a `cache_flush`), `extra_misses` and `origin` (a `cache_flush`'s, in the origin's unit; `null` for every other kind), `flipped`, the SLOs whose verdict differs from the twin's, as the text names them (`["p99_latency c op"]`; the verdict is the `slo` array's), and `over_max`, each SLO broken during the fault where the twin held it, `[{"slo": "p99_latency c op", "for_s": 0.3}]` |
-| `faults[]` | `after` | `backlog_node` (whose backlog: the node, the datacenter, a `traffic_spike`'s downstream node; `null` when the fault left none), `backlog_drained_in_s`, `cache_warm_in_s`: seconds, `null` where the text says there is none; a `cache_flush`'s also has `interrupted_by_flush_at_s` after `cache_warm_in_s` (seconds from the start of the run of the next flush that emptied its cache first; `null` when none did), a key no other kind has; a `ws_gateway`'s `node_down` ends with `reconnect_storm_connections`, `reconnect_storm_over_s`, `peak_rho` and `peak_rho_at_s` (the reconnect storm: [Faults](#faults)) |
+| `faults[]` | `after` | `backlog_node` (whose backlog: the node, the datacenter, a `traffic_spike`'s downstream node; `null` when the fault left none), `backlog_drained_in_s`, `cache_warm_in_s`: seconds, `null` where the text says there is none; a `cache_flush`'s also has `interrupted_by_flush_at_s` after `cache_warm_in_s` (seconds from the start of the run of the next flush that emptied its cache first; `null` when none did), a key no other kind has; a `ws_gateway`'s `node_down` (or a `dc_down` of its datacenter) ends with `reconnect_storm_connections`, `reconnect_storm_over_s`, `peak_offered_rho` and `peak_offered_rho_at_s` (the reconnect storm: [Faults](#faults)) |
 | `faults[]` | `recovered_at_s` | seconds from the start of the run; `null` when not recovered by the end of the run |
 
 `faults` is the last key, after `slo`, and only a run with faults has it (`estimate`, which leaves
@@ -1804,7 +1821,7 @@ changes the numbers the node's queue is built from, and nothing else:
 | `latency_spike` | service time + `extra`, so the node's servers drain c / (s + extra) a second. On a node sized by its defaults the servers are few and short: a load balancer's c = 5 at 50 µs (100k/s) drains 5 / 1.05 ms = 4.76k/s under a 1 ms spike, 95 % of its capacity gone |
 | `traffic_spike` | the client's rate × `factor`, exactly as a `spikes` entry on its rate curve |
 | `cache_flush` | an instant, not a window: the cache's hit ratio is 0 at the step that starts at `at` and warms back (below) |
-| `dc_down` | a `node_down` of every node whose `dc` is the datacenter (clients excepted: they keep sending), and capacity 0 on every link with one end inside it and the other outside, either way. A link with a `bandwidth` is a queue of megabytes: it drains nothing, fills its room (1000 MB) and drops the rest, so nothing crosses it once the room is full. A plain link has no queue: it drops at once what it is sent, and every request over it is lost (it has no row in the link table to count them in). A link with both ends inside is not cut. Requests already in flight on a link when the cut begins still arrive. Its caches come back warm at `at + for` (the outage takes their capacity, not their contents); script a `cache_flush` at `at + for` for a cold restart |
+| `dc_down` | a `node_down` of every node whose `dc` is the datacenter (clients excepted: they keep sending; a `ws_gateway` there drops its connections, which storm back when it clears: [`ws_gateway`](#ws_gateway)), and capacity 0 on every link with one end inside it and the other outside, either way. A link with a `bandwidth` is a queue of megabytes: it drains nothing, fills its room (1000 MB) and drops the rest, so nothing crosses it once the room is full. A plain link has no queue: it drops at once what it is sent, and every request over it is lost (it has no row in the link table to count them in). A link with both ends inside is not cut. Requests already in flight on a link when the cut begins still arrive. Its caches come back warm at `at + for` (the outage takes their capacity, not their contents); script a `cache_flush` at `at + for` for a cold restart |
 
 **The warm-up after a `cache_flush`** (phase 3 spec §4.3; `engine::FaultSchedule`;
 [the derivation](study/numerics.md#11-a-flushed-caches-warm-up)). A flush empties the cache at
@@ -1969,24 +1986,31 @@ failover cost, the requests sent to the dead replicas from `at` to the recovery 
 too): `failover 10s: 2.5k requests sent to the dead replica` (`replicas` when the fault took
 several; `attempts` when retries reach the node, as in `lost`). The window printed is the one that
 applied, `min(failover, for)`: a 5 s `node_down` under `failover: 10s` prints `failover 5s`.
-A `node_down` of a [`ws_gateway`](#ws_gateway) ends the line with its reconnect storm:
-`reconnect storm 99.33k connections over 30s, gw peak 71.9% at 01:24:49`, the connections it
-dropped, the `reconnect_within` they come back over, and the gateway's **peak offered
-utilisation** from the fault's end to the end of the run, demand ÷ total capacity (capacity per
+A `node_down` of a [`ws_gateway`](#ws_gateway), or a `dc_down` of a datacenter that holds one,
+ends the line with its reconnect storm: `reconnect storm 99.33k connections over 30s, gw peak 72%
+at 01:24:49`, the connections this fault dropped (at its first step: a fault that strikes while
+another is on counts its share of what the survivors held, and two that strike in the same step
+share that step's drop in the scenario's order), the `reconnect_within` they come back over, and
+the gateway's **peak offered utilisation** over the storm, demand ÷ total capacity (capacity per
 replica × replicas), uncapped (the number `explain`'s checks print, which passes 100 % when the
 storm overloads the tier; the node table's rho is the busy fraction and stops at 1), with the
-moment it is first reached. It is read from the fault's end, not inside it, where the capacity is
-0.
+moment it is first reached. It is read from the fault's end to `reconnect_within` and one step
+after it: not inside the fault, where the capacity is 0, and not later, where a flash crowd or
+another fault is not this storm's. The count is the connections dropped; those whose session ends
+while they wait do not come back (the storm itself is `D0 × e^(−for / session)` and the clients'
+connects of the outage, see [`ws_gateway`](#ws_gateway)).
 
 In `run --report json` each fault's `during` has `lost_unit` (`"requests"`, `"MB"` or
 `"attempts"`) and `lost_requests` (the requests lost for good; `null` when no retries are
 involved), and its `after` has `retries_added_attempts` and `pool_republished_jobs` (`null` when
 the text prints none) and, in a scenario with a `service_discovery`, `failover_lost` (the requests
 sent to dead replicas; `null` when the fault has no failover). A scenario without a discovery has
-no `failover_lost` key, as its report had none before. A `node_down` of a `ws_gateway` ends its
-`after` with `reconnect_storm_connections`, `reconnect_storm_over_s`, `peak_rho` (the offered
-utilisation, a fraction: `0.719`) and `peak_rho_at_s` (`null` both when no step followed the
-fault), just before the fault's `recovered_at_s`; no other fault has these keys.
+no `failover_lost` key, as its report had none before. A `node_down` of a `ws_gateway`, or a
+`dc_down` of a datacenter that holds one, ends its `after` with `reconnect_storm_connections`,
+`reconnect_storm_over_s`, `peak_offered_rho` (the offered utilisation, a fraction: `0.720`; named
+apart from a node's `peak_rho`, the busy fraction, which stops at 1) and `peak_offered_rho_at_s`
+(`null` both when no step followed the fault), just before the fault's `recovered_at_s`; no other
+fault has these keys.
 
 `recovery` is the start of the first step after the fault clears (a `cache_flush`: from the flush)
 at which every client op's p99 (the step's lognormal fit) and every node's rho are within 1 % of

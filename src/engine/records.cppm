@@ -164,11 +164,11 @@ struct NodeSample {
   // C(k) / heartbeat, read off this same level. A fixed `connections` is that number on every step.
   // Empty on every other node: only a gateway holds connections (a 0 would claim it held none).
   std::optional<double> connections{};
-  // The connections a node_down of a ws_gateway dropped at the start of this step (its replicas'
-  // sockets, gone at once: the reconnect storm, behaviours::WsGatewayBehaviour), which
-  // `connections` above no longer holds; the storm's size
-  // (FaultAfter::reconnect_storm_connections). Empty on every step without a drop, and on every
-  // other node.
+  // The connections the faults that struck a ws_gateway at the start of this step dropped (a
+  // node_down of it, a dc_down of its datacenter: its dead servers' sockets, gone at once: the
+  // reconnect storm, behaviours::WsGatewayBehaviour), which `connections` above no longer holds;
+  // the storm's size (FaultAfter::reconnect_storm_connections, each fault's part of it). Empty on
+  // every step without a drop, and on every other node.
   std::optional<double> connections_dropped{};
   // The requests sent this step to the node's DEAD replicas by callers a service discovery still
   // hands their addresses (engine::FaultSchedule's header: the failover after a node_down of a node

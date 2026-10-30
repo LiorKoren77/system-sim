@@ -89,7 +89,7 @@ author's machine).
   ```
 
   The busiest copies: `chat_servers` 0.5384 on average and 1 at its peak (red for 61.9 s: the
-  minute it is down and 1.9 s of the storm); `message_store` 0.834, `presence` 0.83, `sync_workers` 0.7031,
+  minute it is down and 1.9 s of the storm); `message_store` 0.834, `presence` 0.8299, `sync_workers` 0.7031,
   `push` 0.675.
 
   | op | offered/s (day mean) | mean | p50 | p95 | p99 |
@@ -102,50 +102,66 @@ author's machine).
   socket with it: the level, 1.617M connections, drops to 0 at once. For the minute nothing is
   served: the users' sends and connects and the sync workers' deliveries are lost (2.154M
   requests lost for good; the drops count attempts because the retrying sync workers reach the
-  gateway), and no connection is open, so nothing pings. At 21:31 the servers are back, and the
-  1.617M users whose socket died all reconnect, spread over `reconnect_within` (30 s): 53.9k
-  connects a second on top of the users' own 4.5k, twelve times the usual. As the level refills,
-  its pings come back with it, and the gateway's offered load peaks at the storm's last moment,
-  93.9 % of the tier, against the 81 % of the 21:00 peak:
+  gateway), and no connection is open, so nothing pings. The dropped users wait for the tier, and
+  while they wait their sessions end as they would have: of the 1.617M, `e^(−1 min / 6 min)` =
+  84.6 % (1.369M) are still waiting at 21:31; the users who tried to connect during the minute
+  (4.5k a second, their connects lost) wait with them, 248k of them still there at 21:31. The
+  two nearly cancel, and not by chance: at the level's fixed point the users who would have
+  ended a session in the minute are as many as those who would have started one (`C × (1 −
+  e^(−for/session))` against `λ × session × (1 − e^(−for/session))`, with `C = λ × session`). So
+  the storm is 1.617M users again, spread over `reconnect_within` (30 s): 53.9k connects a second
+  on top of the users' own 4.5k, twelve times the usual. As the level refills, its pings come back
+  with it, and the gateway's offered load peaks at the storm's last moment, 93.9 % of the tier,
+  against the 81 % of the 21:00 peak:
 
   ```
   fault 21:30 node_down chat_servers for 1m
     during:   offered 35.98k/s, served 0/s, lost 2.159M attempts (2.154M requests lost for good), backlog 0, drop_rate over its max for 1m
     after:    no backlog to drain, reconnect storm 1.617M connections over 30s, chat_servers peak 93.9% at 21:31:29.9
-    recovery: back within 1% (every op's p99, every node's rho) at 21:39:00.2 (480.2s after the fault cleared)
+    recovery: back within 1% (every op's p99, every node's rho) at 21:38:58.7 (478.7s after the fault cleared)
   ```
 
-  The run is back within 1 % of its twin 8 minutes after the fault: the storm brings every
-  dropped user back with a fresh session, the ones the twin lost to ordinary disconnects during
-  that minute and a half included, so the level overshoots the twin's by a few percent and the
-  extra pings decay with the 6-minute session. The day's highest level is that overshoot,
-  1.681M connections (`run --report json`'s `connections_peak`), above the 1.617M the tier held
-  at 21:30; the JSON's fault object has the storm's numbers unrounded
-  (`"reconnect_storm_connections": 1616857.59...`, `"reconnect_storm_over_s": 30`, `"peak_rho":
-  0.9394...`, `"peak_rho_at_s": 77489.9`, `"recovered_at_s": 77940.2`).
+  (The block's count is the connections the fault dropped; the storm is the users still waiting
+  when it clears, here the same 1.617M to four digits.) The run is back within 1 % of its twin 8
+  minutes after the fault: the storm's users come back with fresh sessions, and while each waits
+  its turn within the 30 s (15 s on average) none of their sessions ends, where the twin's
+  connected users' do: about `15 s / 6 min` = 4 % of them too many, so the level overshoots the
+  twin's and the extra pings decay with the 6-minute session. The day's highest level is that
+  overshoot, 1.680M connections (`simsys run --report json`'s `connections_peak`), above the 1.617M
+  the tier held at 21:30; the JSON's fault object has the storm's numbers unrounded
+  (`"reconnect_storm_connections": 1616857.59...`, `"reconnect_storm_over_s": 30`,
+  `"peak_offered_rho": 0.9392...`, `"peak_offered_rho_at_s": 77489.9`, `"recovered_at_s":
+  77938.7`).
 - **The window is the lesson.** The same day for six values of `reconnect_within` (one `simsys
   run` each: `simsys sweep`'s columns do not read the fault block, and the node table's
   `peak_rho` is the busy fraction, 1 in the fault minute whatever follows):
 
   | `reconnect_within` | storm connects/s | gateway peak (offered) | at | dropped by `chat_servers` | back within 1 % |
   |---|---|---|---|---|---|
-  | 10 s | 161.7k | **112 %** | 21:31:09.9 | 2.204M (room 20k full) | 21:31:10.3 |
-  | 20 s | 80.9k | 98.4 % | 21:31:19.9 | 2.159M | 21:36:32 |
-  | 30 s (default) | 53.9k | 93.9 % | 21:31:29.9 | 2.159M | 21:39:00.2 |
-  | 40 s | 40.4k | 92.1 % | 21:31:39.9 | 2.159M | 21:40:46.6 |
-  | 50 s | 32.3k | 91.3 % | 21:31:49.9 | 2.159M | 21:42:10.1 |
-  | 60 s | 27k | 90.9 % | 21:31:59.9 | 2.159M | 21:43:19 |
+  | 10 s | 161.7k | **112 %** | 21:31:09.9 | 2.205M (room 20k full) | 21:31:10.4 |
+  | 20 s | 80.8k | 98.4 % | 21:31:19.9 | 2.159M | 21:36:29.7 |
+  | 30 s (default) | 53.9k | 93.9 % | 21:31:29.9 | 2.159M | 21:38:58.7 |
+  | 40 s | 40.4k | 92.1 % | 21:31:39.9 | 2.159M | 21:40:45.5 |
+  | 50 s | 32.3k | 91.2 % | 21:31:49.9 | 2.159M | 21:42:09.2 |
+  | 60 s | 26.9k | 90.9 % | 21:31:59.9 | 2.159M | 21:43:18.2 |
 
-  With every client back within 10 s the tier is offered 112 % of what it can serve: its rooms
-  (1000 requests × 20 servers) fill and it drops 45k more requests than at 30 s, the thundering
-  herd of ch. 12's question. Spreading the same 1.617M
-  reconnects over 20 s keeps it just under 100 %, and every second beyond buys less, because the
-  pings of the refilling level, not the reconnects, are most of the peak (at 60 s the storm adds
-  27k/s to about 428k/s of pings and messages). The longer windows recover later: the
-  reconnecting users start fresh sessions, and the longer they take, the more of them the twin
-  had lost to ordinary disconnects meanwhile, so the overshoot is larger and takes longer to
-  decay (at 10 s it is the smallest, inside the rule's 1 % almost at once). All three SLOs
-  pass at every point. To reproduce one point, edit `reconnect_within` and `simsys run` the file.
+  (Storm connects/s: the 1.617M users still waiting at 21:31, above, over the window; the other
+  columns are each run's fault block and node table.) With every client back within 10 s the
+  tier is offered 112 % of what it can serve: its rooms (1000 requests × 20 servers) fill and it
+  drops 46k more requests than at 30 s, the thundering herd of ch. 12's question. About a third
+  of them are reconnects (the rest pings and messages), and a dropped reconnect is not a user
+  lost: the app tries again after another backoff (the model: a wait of mean
+  `reconnect_within`, 10 s here), so they come back in the seconds after the storm and the level
+  loses nobody (before the Task 15 review they were
+  lost for good, uncounted, which is part of how this row recovered "at once"). Spreading the same
+  1.617M reconnects over 20 s keeps the tier just under 100 %, and every second beyond buys less,
+  because the pings of the refilling level, not the reconnects, are most of the peak (at 60 s the
+  storm adds 27k/s to about 428k/s of pings and messages). The longer windows recover later: the
+  storm's users wait half the window on average without ending a session, so the level
+  overshoots the twin's by about `window / 2 ÷ 6 min` of them (1.4 % at 10 s, 8.3 % at 60 s) and
+  the larger overshoot takes longer to decay; at 10 s it is the smallest. All three SLOs pass at
+  every point. To reproduce one point, edit `reconnect_within` and `simsys run` the file (the table: six such
+  runs, `simsys run` and `simsys run --report json` each).
 - **Fan-out and the queue.** 31.5k messages/s at the peak are 44.1k copies/s through
   `message_q` and 64 sync workers (70 % busy on paper with the retried pushes); the queue never
   falls behind (`<1us`).
@@ -166,8 +182,11 @@ author's machine).
   handshake, a login through the API servers and a discovery lookup, which would make the storm
   heavier than the table says, and land part of it on `api_servers` and `discovery`.
 - **Clients that give up, or come back early.** Every dropped user comes back, evenly over
-  `reconnect_within` from the fault's end; nobody reconnects to another server while the tier is
-  down (there is none), and nobody gives up.
+  `reconnect_within` from the fault's end, unless the session they would have had ends while
+  they wait; a user who tried to connect during the minute comes back with them, and a reconnect
+  the tier drops is tried again after another backoff. Nobody reconnects to another server while
+  the tier is down (there is none), and nobody gives up. A `dc_down` of the gateway's datacenter
+  would drop the connections as the `node_down` does (this file has one datacenter).
 - **Presence as the book draws it.** The presence servers there keep each user's heartbeat timer
   in memory and write the store when a user goes online or offline; here every ping is a write.
 - Message ordering, end-to-end encryption, media attachments, the bytes of a frame.

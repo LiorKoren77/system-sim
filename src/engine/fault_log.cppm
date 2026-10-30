@@ -132,10 +132,19 @@ class FaultLog {
     // A cache_flush's: the `at` of the next flush of the same cache, which ends this one's window
     // if the cache is not full by then (FaultAfter::interrupted_by_flush_at). Empty if none.
     std::optional<SimTime> next_flush{};
-    // A node_down of a ws_gateway's: the gateway's total capacity (per replica × replicas), what
-    // its peak offered utilisation after the fault divides by (FaultAfter::peak_rho). Empty for
-    // every other fault: no storm to follow.
+    // Its place in the scenario's `faults` list (the order a gateway takes faults of one step in).
+    std::size_t fault{};
+    // A node_down of a ws_gateway's, or a dc_down's of a datacenter with gateways (add_storm): the
+    // gateways, each one's share of the connections dropped in the fault's first step that are
+    // this fault's (share_simultaneous_drops: 1 unless another fault struck it in that step), their
+    // total capacity (per replica × replicas), what the peak offered utilisation over the storm
+    // divides by (FaultAfter::peak_offered_rho), and their `reconnect_within` (the largest), the
+    // storm's length. Empty capacity for every other fault: no storm to follow.
+    std::vector<std::size_t> storm_gateways{};
+    std::vector<double> storm_drop_shares{};
     std::optional<double> storm_capacity_per_s{};
+    SimTime storm_within{};
+    bool storm_drop_counted{};  // the fault's first step has been read
     // Whose backlog may need draining: the faulted part, or for a traffic_spike every node
     // downstream (any node but a client), the worst of which is named once the spike is over.
     std::vector<Backlogged> backlogged{};
@@ -178,9 +187,10 @@ class FaultLog {
   static void add_failover(const graph::Graph& g, std::span<const FailoverRoute> routes,
                            const model::Fault& fault, std::size_t node, FaultRecord& r);
   static void observe_warm_up(FaultRecord& r, SimTime t, SimTime dt);
-  static void observe_storm(FaultRecord& r, const Tracker& tracker, const StepRecord& run,
-                            bool during);
+  static void observe_storm(FaultRecord& r, Tracker& tracker, const StepRecord& run, bool during,
+                            SimTime dt);
   static void add_storm(const graph::Graph& g, const model::Fault& fault, Tracker& tracker);
+  void share_simultaneous_drops(const graph::Graph& g);
   [[nodiscard]] static bool in_window(const FaultRecord& r, SimTime t);
   [[nodiscard]] static bool cleared(const FaultRecord& r, SimTime t);
   [[nodiscard]] static std::optional<double> window_length_s(const FaultRecord& r);
@@ -342,6 +352,19 @@ constexpr double recovery_tolerance = 0.01;
   return spec.type == model::NodeType::worker_pool && spec.retries.value_or(0) > 0;
 }
 
+// The share of node `node`'s servers `fault` kills if `node` is a ws_gateway, the share of its
+// connections it drops (FaultSchedule's "servers that die with what they hold"): r / R for a
+// node_down of it (1 for every replica), 1 for a dc_down of its datacenter, 0 for any other fault
+// and any other node.
+[[nodiscard]] double gateway_share(const graph::Graph& g, const model::Fault& fault,
+                                   std::size_t node) {
+  const auto& spec = g.nodes()[node].spec;
+  if (spec.type != model::NodeType::ws_gateway) return 0.0;
+  if (fault.kind == model::FaultKind::dc_down) return spec.dc == fault.datacenter ? 1.0 : 0.0;
+  if (fault.node != spec.id) return 0.0;
+  return FaultSchedule::dead_share_of(fault, spec);  // 0 unless a node_down
+}
+
 }  // namespace
 
 FaultLog::FaultLog(const FaultLog& other) = default;
@@ -360,14 +383,19 @@ FaultLog::FaultLog(const graph::Graph& g, std::span<const double> rooms,
   const auto& faults = g.scenario().faults;
   for (const std::size_t i : in_at_order(faults)) {
     trackers_.push_back(tracker_of(g, faults[i]));
-    records_.push_back(record_of(g, faults[i], trackers_.back(), rooms, failover_routes));
+    trackers_.back().fault = i;
+  }
+  share_simultaneous_drops(g);
+  for (const auto& tracker : trackers_) {
+    records_.push_back(record_of(g, faults[tracker.fault], tracker, rooms, failover_routes));
   }
 }
 
-// What a record follows: the faulted part, and whose retries reach it.
+// What a record follows: the faulted part, whose retries reach it, and the gateways it storms.
 FaultLog::Tracker FaultLog::tracker_of(const graph::Graph& g, const model::Fault& fault) const {
   Tracker tracker = faulted_part(g, fault);
   add_retry_parties(g, tracker);
+  add_storm(g, fault, tracker);
   return tracker;
 }
 
@@ -408,18 +436,56 @@ FaultLog::Tracker FaultLog::faulted_part(const graph::Graph& g, const model::Fau
   } else {
     add_backlogged(tracker, tracker.nodes, fault.node);
   }
-  add_storm(g, fault, tracker);
   return tracker;
 }
 
-// A node_down of a ws_gateway has a reconnect storm to follow (FaultRecord's header): the record
-// keeps the gateway's total capacity, what its peak offered utilisation divides by.
+// A fault that kills a ws_gateway's servers has a reconnect storm to follow (FaultRecord's
+// header): a node_down of the gateway, or a dc_down of its datacenter (gateway_share). The record
+// keeps the gateways, their total capacity, what the peak offered utilisation divides by, and
+// their longest `reconnect_within`.
 void FaultLog::add_storm(const graph::Graph& g, const model::Fault& fault, Tracker& tracker) {
-  if (fault.kind != model::FaultKind::node_down) return;
-  const auto& gateway = g.nodes()[tracker.nodes.front()];
-  if (gateway.spec.type != model::NodeType::ws_gateway) return;
-  tracker.storm_capacity_per_s =
-      gateway.capacity.service_rate.per_second * model::copies_of(gateway.spec);
+  const auto nodes = g.nodes();
+  double capacity = 0.0;
+  for (std::size_t node = 0; node < nodes.size(); ++node) {
+    if (gateway_share(g, fault, node) <= 0.0) continue;
+    const auto& gateway = nodes[node];
+    tracker.storm_gateways.push_back(node);
+    tracker.storm_drop_shares.push_back(1.0);
+    capacity += gateway.capacity.service_rate.per_second * model::copies_of(gateway.spec);
+    const SimTime within = defaults::reconnect_within_of(gateway.spec);
+    if (within.count() > tracker.storm_within.count()) tracker.storm_within = within;
+  }
+  if (!tracker.storm_gateways.empty()) tracker.storm_capacity_per_s = capacity;
+}
+
+// Faults that strike one gateway in the same step share that step's drop
+// (NodeSample::connections_dropped, the gateway's total) as the gateway took them, in the
+// scenario's order (behaviours::WsGatewayBehaviour::follow_outages): the first s1 of the level,
+// the next s2 of what was left, and so on. So fault j's part of the step's drop is
+//   s_j × Π_{i before j} (1 − s_i) / (1 − Π_i (1 − s_i))       (s: the share it killed, r / R)
+// over the faults of that step, 1 for a fault alone in its step: two 1-of-4 faults take 4/7 and
+// 3/7 of the 7/16 of the level dropped. A step is the scenario's: the first one at or after `at`.
+void FaultLog::share_simultaneous_drops(const graph::Graph& g) {
+  const auto& faults = g.scenario().faults;
+  const auto step = g.scenario().step.count();
+  const auto first_step = [&](std::size_t fault) {
+    return (faults[fault].at.count() + step - 1) / step;
+  };
+  for (auto& tracker : trackers_) {
+    for (std::size_t k = 0; k < tracker.storm_gateways.size(); ++k) {
+      const std::size_t gateway = tracker.storm_gateways[k];
+      double survivors_before = 1.0;  // Π (1 − s_i) over the step's faults before this one
+      double survivors_all = 1.0;     // ... and over all of them
+      for (const auto& other : trackers_) {
+        if (first_step(other.fault) != first_step(tracker.fault)) continue;
+        const double share = gateway_share(g, faults[other.fault], gateway);
+        survivors_all *= 1.0 - share;
+        if (other.fault < tracker.fault) survivors_before *= 1.0 - share;
+      }
+      const double mine = gateway_share(g, faults[tracker.fault], gateway);
+      tracker.storm_drop_shares[k] = mine * survivors_before / (1.0 - survivors_all);
+    }
+  }
 }
 
 // Whose retries the record follows (FaultRecord::lost_requests, FaultAfter): a traffic_spike's
@@ -486,9 +552,9 @@ FaultRecord FaultLog::record_of(const graph::Graph& g, const model::Fault& fault
     add_failover(g, failover_routes, fault, tracker.nodes.front(), r);
   }
   if (tracker.storm_capacity_per_s) {
+    r.after.reconnect_storm_gateways = ids_of(g, tracker.storm_gateways);
     r.after.reconnect_storm_connections = 0.0;
-    r.after.reconnect_storm_over =
-        defaults::reconnect_within_of(g.nodes()[tracker.nodes.front()].spec);
+    r.after.reconnect_storm_over = tracker.storm_within;
   }
   // A cache without a hit ratio loses nothing to a flush: its window is empty from the start.
   if (fault.kind == model::FaultKind::cache_flush && !g.nodes()[tracker.nodes.front()].hit_ratio) {
@@ -551,7 +617,7 @@ void FaultLog::observe_one(FaultRecord& r, Tracker& tracker, const StepPair& ste
   const Part twin = part_of(tracker, step.twin, step.twin_links);
   const bool during = in_window(r, t);
   observe_backlogs(tracker, step, during);
-  observe_storm(r, tracker, step.run, during);
+  observe_storm(r, tracker, step.run, during, dt);
   if (during) {
     observe_during(r, tracker, run, step, seconds(dt));
   } else {
@@ -722,22 +788,31 @@ void FaultLog::observe_warm_up(FaultRecord& r, SimTime t, SimTime dt) {
   }
 }
 
-// A gateway's reconnect storm (FaultRecord's header): during the fault, the connections it dropped
-// (the step that starts at `at` drops them, NodeSample::connections_dropped); from its end to the
-// end of the run, the gateway's offered utilisation, demand / total capacity, and the first step
-// that reaches its peak. Nothing for any other fault.
-void FaultLog::observe_storm(FaultRecord& r, const Tracker& tracker, const StepRecord& run,
-                             bool during) {
+// A gateway's reconnect storm (FaultRecord's header): at the fault's first step, its part of the
+// connections the gateways dropped (the step that starts at or after `at` drops them,
+// NodeSample::connections_dropped; share_simultaneous_drops has its part); over the storm,
+// [at + for, at + for + reconnect_within + dt], the gateways' offered utilisation, their demand /
+// their total capacity, and the first step that reaches its peak. Nothing for any other fault.
+void FaultLog::observe_storm(FaultRecord& r, Tracker& tracker, const StepRecord& run, bool during,
+                             SimTime dt) {
   if (!tracker.storm_capacity_per_s || *tracker.storm_capacity_per_s <= 0.0) return;
-  const auto& gateway = run.nodes[tracker.nodes.front()];
   if (during) {
-    *r.after.reconnect_storm_connections += gateway.connections_dropped.value_or(0.0);
+    if (tracker.storm_drop_counted) return;
+    tracker.storm_drop_counted = true;
+    for (std::size_t k = 0; k < tracker.storm_gateways.size(); ++k) {
+      const auto& gateway = run.nodes[tracker.storm_gateways[k]];
+      *r.after.reconnect_storm_connections +=
+          gateway.connections_dropped.value_or(0.0) * tracker.storm_drop_shares[k];
+    }
     return;
   }
-  const double offered = gateway.demand_per_s / *tracker.storm_capacity_per_s;
-  if (!r.after.peak_rho || offered > *r.after.peak_rho) {
-    r.after.peak_rho = offered;
-    r.after.peak_rho_at = run.t;
+  const auto since_end = run.t.count() - r.at.count() - r.duration.count();
+  if (since_end > tracker.storm_within.count() + dt.count()) return;
+  const double offered = sum_of(run, tracker.storm_gateways, &NodeSample::demand_per_s) /
+                         *tracker.storm_capacity_per_s;
+  if (!r.after.peak_offered_rho || offered > *r.after.peak_offered_rho) {
+    r.after.peak_offered_rho = offered;
+    r.after.peak_offered_rho_at = run.t;
   }
 }
 

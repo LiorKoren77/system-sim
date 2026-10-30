@@ -1415,16 +1415,19 @@ TEST_CASE("a node_down of 2 of 4 gateway replicas drops half the connections and
               .contains("reconnect storm 49.66k connections over 30s, gw peak "));
 }
 
-// Recovery after a partial fault: the level is back to its twin's within 1 % only some time after
-// the storm ends (the storm refills what 60 s of fewer connects and disconnects left apart; the
-// gap to the twin, a few percent, closes with the 1000 s time constant), 5882 to 6413 s by the
-// recurrence for the two ways the survivors may treat connects during the fault.
+// Recovery after a partial fault: the level is back to its twin's within 1 % once the storm is
+// over, not during it, and long before the run's end. Since the Task 15 review (decision 6) the
+// waiting users end their sessions as the twin's connected ones do, so the run's users are the
+// twin's but for the storm's own (half the level here) not ending a session within their 30 s:
+// 0.75 % over the twin at the storm's end, already within the rule's 1 %. The first step after
+// the storm, 5090 s, is back (5882 s and later before the review, when the waiting users kept
+// their sessions through the fault).
 TEST_CASE("after a partial node_down the run is back within 1 percent of its twin after the storm",
           "[theory]") {
   const auto& run = half_the_gateway_down();
   REQUIRE_FALSE(run.json.contains("\"recovered_at_s\": null"));
   const double recovered_at = number_after(after_object_of(run.json), "\"recovered_at_s\": ");
-  REQUIRE(recovered_at > 5090.0);
+  REQUIRE(recovered_at >= 5090.0);
   REQUIRE(recovered_at < 7400.0);
 }
 
