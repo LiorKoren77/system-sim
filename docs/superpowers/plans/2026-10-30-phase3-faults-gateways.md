@@ -240,6 +240,31 @@ lognormal moment fit (post p50 194 µs, p99 58 ms): a limit of the fit, reported
 - [x] Tests: `[{to: db, op: write}, {to: log, op: write, on: failure}]` with `db` delivering 0.5 (capacity 500/s, room 1, offered 1k/s): `log` receives **500/s** from the second step on; with `db` lossless `log` receives **0**; after a lossy step before the pair (`a` delivering 0.5 first): `log` receives **0.5 × 0.5 × 1000 = 250/s**; a failure step after a parallel group reports the group's failure share `1 − Π d`; `estimate` settles at the same numbers; the size-walk refusal message; the schema's `on` row updated in Task 19.
 - [x] Commit `nodes: on: failure steps carry the failed share of the step before them` (red `18fff8c`, green `465343c`; the unsized-step refusal keeps the existing `unpriced_on_pipe` text; two refusals added: a parallel failure step, a failure step in a cache's `then`; a failure step's latency is not in the response).
 
+**Review of Task 9 at `465343c`** (adversarial, 2026-10-30): REQUEST_CHANGES. Pins, identity (14
+scenarios) and eleven probes (replicas, pipe anchor, nested losses, sinks, `factor`, sweep) verified.
+1. Important: a failure step after a cache lookup's `on: miss` steps reports on the lookup alone
+   (the literal "nearest unconditional" rule): `[c, db on miss, log on failure]` with `db` lossy sends
+   `log` nothing. Decision: anchor on the lookup together with its miss block,
+   `d = d_c × ((1 − f) + f · Π d_miss)`, pinned.
+2. Important: a failure step that closes a call cycle (`web.write: [db, retrier on failure]`,
+   `retrier → web.write`) is an unbounded retry storm (answered 21/s of 1000, `estimate` 99.5 % drop
+   with no note) while the docs say it feeds nothing back. Decision: refuse in `Graph::build` with
+   `node 'web': an on: failure step to 'retrier' closes a call cycle (an unbounded retry: use the
+   client's retries)`; a queue-backed loop ends the cycle at the queue and is documented as
+   retrying forever (pool `retries` of Task 11 is the modelled form).
+3. Important: the blob-store and worker-pool `then` refusals and the schema still say "no failure
+   before phase 3". Reworded (a job's then steps follow no step to report on); pinned tests updated.
+4. Important (TDD): six decisions had no test: the failure step's latency left out of the response,
+   a miss block staying one block across a failure step, `explain`'s paper load skipping failure
+   steps, nested losses counting, `factor` multiplying the share, a zero share adding no entry.
+5. Minor: the comments cite ch. 1 and 4; the dead-letter path is ch. 10 (notification-system).
+6. Minor: `explain` shows a failure-fed node as `peak offered 0/s (0 %, green)`: a note "fed by
+   failures only: sized by run/estimate".
+7. Minor/backlog: the time to error of a failed request is reported nowhere (`error_latency` per
+   client op): Phase 4 backlog.
+Decisions: 1–6 fixed in the fix round; 7 to the backlog. Suggestion kept for Task 19: give
+notification-system an `on: failure` step once Task 11's pool retries exist.
+
 ### Task 10: client retries as feedback, `attempts/s`
 
 **Files:** `src/model/model.cppm` (`Workload::retries` count, `retry_after` duration), `src/config/workload.cpp` (`retries` a non-negative count ≤ 10: `node 'u': retries must be at most 10`; `retry_after` a positive duration, default `defaults::retry_after` = 100 ms `// chosen, not from the book`; `retry_after` without `retries` refused), `src/engine/behaviours.cppm` (`ClientBehaviour`: a ring of `retries` buckets per op holding the share to resend `k` backoffs later; `offered = curve + Σ pending`), `src/engine/engine.cppm` (`client_responses`: `attempts_per_s` in `ResponseSample`; answered counts a request once; the failed share of attempt `k` feeds bucket `k + 1`; settle mode damps the feedback with the delivered-fraction scheme), `src/report/*` (`attempts/s` column after `offered/s`; JSON `attempts_per_s`; CSV `attempts_per_s`; `explain` prints `retries=2 after 100ms`), tests in `test_failed_steps.cpp`, `test_report.cpp`, `test_series.cpp` (chain's hash re-pinned for the column).
@@ -330,7 +355,9 @@ lognormal moment fit (post p50 194 µs, p99 58 ms): a limit of the fit, reported
 - [ ] An adversarial reviewer (fresh context, own worktree, both presets) checks: warning-free builds and the whole suite; clang-format as CI runs it; conservation from `--series` on all twelve scenarios (node, link and client rows, `attempts`, `dead_lettered`, `deduplicated`, `connections` included); answered ≤ offered and attempts ≥ offered everywhere; `estimate` = `run` on steady probes with retries, failure steps, fanouts, frontiers and gateways; every fault kind's identity when absent (phase 2 bytes); every README number of the four new scenarios and of the eight that moved; `--replications` byte-identical across `--jobs`; the 3a splits' byte-identity still holds; first-use comments; `Pattern:` labels; test names; functions over ~50 lines; the five GCC workarounds; the schema's "chosen" list complete.
 - [ ] Fix round recorded here as "Comprehensive phase 3 review at <sha>"; commit; push; CI.
 
-## Phase 4 backlog (left out of phase 3)
+## Phase 4 backlog
+
+- `error_latency` per client op: the time a failed request takes to come back (the wait before the failing hop plus any `on: failure` hop); phase 3 reports served latency only (Task 9 review). (left out of phase 3)
 
 - kv_cluster partitions (`mode: ap|cp`, sloppy quorum, hinted handoff, read repair) and the `partition` fault kind.
 - Random faults (`mtbf`/`mttr`, chaos mode) as a second generator feeding `FaultSchedule`.
