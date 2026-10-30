@@ -655,7 +655,7 @@ TEST_CASE("below its limit every windowed algorithm admits everything", "[behavi
 // Leaky bucket (ch. 4): requests join a FIFO queue that drains at a fixed rate; only a full
 // queue rejects. That is a queue with capacity `limit` and room `burst`, which the engine's
 // FluidQueue already is, so the behaviour itself rejects nothing and forwards what it is
-// given; the engine's queue shapes the output (see the leaky-bucket case in test_theory.cpp).
+// given; the engine's queue shapes the output (see the leaky-bucket case in test_core.cpp).
 TEST_CASE("a leaky bucket queues the excess instead of rejecting it", "[behaviours]") {
   const auto g = *simsys::graph::Graph::build(
       limiter_front(limiter_spec(LimiterAlgorithm::leaky_bucket, 1000, 500)));

@@ -21,7 +21,6 @@
 #include <unistd.h>  // getpid
 
 #include "../support/explain_lines.hpp"
-#include "../support/scenario_helpers.hpp"
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion; placed after the #includes because GCC 14 reports redefinitions
@@ -32,6 +31,7 @@ import simsys.engine;
 import simsys.graph;
 import simsys.model;
 import simsys.report;
+import simsys.test_fixtures;
 import simsys.workload;
 
 using namespace std::chrono_literals;
@@ -49,7 +49,7 @@ using simsys::model::Workload;
 using simsys::report::Summary;
 using simsys::test_support::check_line;
 using simsys::test_support::node_line;
-// Shared with test_series / test_report (tests/support/scenario_helpers.hpp).
+// Shared with test_series / test_report (tests/support/fixtures.cppm, simsys.test_fixtures).
 using simsys::test_support::explain_of;
 using simsys::test_support::piped;
 
@@ -1741,7 +1741,7 @@ TEST_CASE("explain lists a blob store's write ops", "[report]") {
 //  - explain, checks block: `a->b  peak offered 100 MB/s vs 125 MB/s  (80%, yellow)`.
 
 namespace {
-// The scenario: test_support::piped (tests/support/scenario_helpers.hpp), a(`rate`/s of 1 MB
+// The scenario: test_support::piped (tests/support/fixtures.cppm), a(`rate`/s of 1 MB
 // `put`s) -> b (a service of 1M/s) over a link of the given bandwidth (none: a plain link).
 
 // The cells of the first line of `text` whose first cell is `first`, split at whitespace; empty

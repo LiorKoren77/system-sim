@@ -422,9 +422,10 @@ TEST_CASE(
 // ---- The shipped youtube scenario: 300 MB uploads and the clients' timeout ----
 //
 // An upload is a write: the blob store acknowledges it at its last byte, 300 MB x 40 ms per MB =
-// 12 s after its wait (response p99 12.40 s, see test_theory.cpp's "a 300 MB upload's p99 is 12.4
-// s"), and the transfer is deterministic, so its response has almost no spread (variance 0.027 s^2:
-// sigma = 0.0137). Against a timeout T the share answered in time is Phi((ln T - mu) / sigma):
+// 12 s after its wait (response p99 12.40 s, see test_bytes_pipes.cpp's "a 300 MB upload's p99 is
+// 12.4 s"), and the transfer is deterministic, so its response has almost no spread (variance
+// 0.027 s^2: sigma = 0.0137). Against a timeout T the share answered in time is
+// Phi((ln T - mu) / sigma):
 //   T = 10 s: Phi(-13.5) ~ 1e-41: no upload is answered in time;
 //   T = 30 s: Phi((ln 30 - ln 12.1) / 0.0137) = Phi(66) ~ 1: every upload is.
 // The shipped timeout is 30 s: the book's uploads are resumable, so a client gives up on a chunk,

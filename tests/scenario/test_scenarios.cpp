@@ -19,7 +19,6 @@
 #include <vector>
 
 #include "../support/explain_lines.hpp"
-#include "../support/scenario_helpers.hpp"
 
 // C++20 `import`: brings the module's exported names into this translation unit without
 // textual inclusion. It comes after the #includes because GCC 14 reports redefinitions
@@ -33,11 +32,12 @@ import simsys.graph;
 import simsys.model;
 import simsys.queueing;
 import simsys.report;
+import simsys.test_fixtures;
 
 // explain's lines, shared with test_report and test_series.
 using simsys::test_support::check_line;
 using simsys::test_support::node_line;
-// The ring imbalance formula, shared with test_theory.
+// The ring imbalance formula, shared with test_core (tests/support/fixtures.cppm).
 using simsys::test_support::ring_factor;
 
 namespace {

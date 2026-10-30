@@ -3516,7 +3516,7 @@ TEST_CASE("a pool consuming a frontier gets the default room: 7 days of its rate
 // times the average, M the machines, N the copies of a key). With N = nodes every node holds every
 // key, so no node is hotter than another. The demand a cluster is sent is N times its requests
 // (every request goes to N replicas); that is a number the paper load and the engine compute,
-// pinned in test_report.cpp and test_theory.cpp, not a field of the graph.
+// pinned in test_report.cpp and test_kv.cpp, not a field of the graph.
 //
 // Proposed shape: Graph::build resolves the copies into ResolvedNode::spec.replicas (the count
 // that explain's capacity, the engine's copy groups and the balancer's ring already read) and
