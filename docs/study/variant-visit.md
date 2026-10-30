@@ -7,7 +7,7 @@
 | `std::variant<SimTime, double>` | `src/model/model.cppm`: `SloSpec::max`, an SLO limit that is a duration or a ratio |
 | building the right alternative | `src/config/slos.cpp`: `read_slo_max` (`SloMaximum{*time}` or `SloMaximum{*number}`, `using SloMaximum = decltype(model::SloSpec::max)`) |
 | `std::visit` + overload set | `src/report/report.cpp`: `limit_value`, `fmt_limit` |
-| `using Behaviour = std::variant<...>`, twelve alternatives | `src/engine/behaviours.cppm`, end of the exported namespace: `ClientBehaviour`, `ServiceBehaviour`, `LoadBalancerBehaviour`, `RateLimiterBehaviour`, `CacheBehaviour`, `SqlDbBehaviour`, `CdnBehaviour`, `BlobStoreBehaviour`, `MessageQueueBehaviour`, `WorkerPoolBehaviour`, `ExternalSinkBehaviour`, `KvClusterBehaviour` |
+| `using Behaviour = std::variant<...>`, fifteen alternatives | `src/engine/behaviours.cppm`, end of the exported namespace: `ClientBehaviour`, `ServiceBehaviour`, `LoadBalancerBehaviour`, `RateLimiterBehaviour`, `CacheBehaviour`, `SqlDbBehaviour`, `CdnBehaviour`, `BlobStoreBehaviour`, `MessageQueueBehaviour`, `WorkerPoolBehaviour`, `ExternalSinkBehaviour`, `KvClusterBehaviour`, `WsGatewayBehaviour`, `NotificationFanoutBehaviour`, `FrontierBehaviour` |
 | `std::visit` + overload set (a client lambda and one generic lambda for every server) | `src/engine/engine.cppm`: `Simulation::forward_pass`, `Simulation::backward_pass` |
 | `std::visit` with one generic lambda and `if constexpr (requires ...)` | `engine.cppm`: `megabyte_service_of` |
 | `std::get_if`, `std::holds_alternative` | `engine.cppm`: `Simulation::client_responses`, `is_write_at`, `failure_rate_of`, `report_machines`, `split_writes` |
@@ -78,11 +78,12 @@ is still needed, because the standard library offers no ready-made `overloaded`.
 
 The node catalogue is fixed by the schema, so a closed sum type is the right trade. Phase 1
 had two alternatives; phases 2a to 2c appended ten, from `LoadBalancerBehaviour` to
-`KvClusterBehaviour`, and each time the compiler listed the places the new type had to be
-handled. (Spec §5 planned "a small type-erased wrapper"; phase 1 found the variant enough.)
+`KvClusterBehaviour`, and phase 3 three (`WsGatewayBehaviour`, `NotificationFanoutBehaviour`,
+`FrontierBehaviour`; a service discovery runs as a `ServiceBehaviour`, like a search index and an
+id generator), and each time the compiler listed the places the new type had to be handled. (Spec §5 planned "a small type-erased wrapper"; phase 1 found the variant enough.)
 
-**How the engine keeps twelve alternatives exhaustive.** Twelve lambdas per `visit` would be
-noise: eleven of the twelve are servers that route, cost, respond and deliver the same way at
+**How the engine keeps fifteen alternatives exhaustive.** Fifteen lambdas per `visit` would be
+noise: fourteen of the fifteen are servers that route, cost, respond and deliver the same way at
 the call site. So `forward_pass` and `backward_pass` pass two lambdas, one for
 `ClientBehaviour` and one generic `[&](auto& server)` for the rest. Overload resolution prefers
 the non-template client lambda for a client, so the generic one sees only servers. That generic
