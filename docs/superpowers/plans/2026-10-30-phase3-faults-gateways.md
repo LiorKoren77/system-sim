@@ -435,7 +435,7 @@ Fixed at `9cfb1bc`. The fault block under retries (Task 10 item 2, Task 11 item 
 attempts`, `pool w re-published 999 jobs`; JSON `lost_requests`, `after.retries_added_attempts`,
 `after.pool_republished_jobs` (null when no retries are involved; the keys are always present).
 
-- [ ] **3b push.** CI green; the ten runnable scenarios byte-identical to the 3a push except the new columns (`attempts/s`, `dead_lettered/s`) and the chain hash.
+- [x] **3b push** at `912e5c1` (2026-10-30, CI run 41018475972 green, 1478 tests). The ten runnable scenarios are byte-identical to the 3a push except the `attempts/s` column, the chain hashes, and the fault blocks the three faulted scenarios now print (news-feed, kv-store, consistent-hashing: their faults run). The Task 7 fix round (warm-up on actual reads) follows as its own push.
 
 ---
 
