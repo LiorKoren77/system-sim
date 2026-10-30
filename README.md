@@ -300,9 +300,10 @@ over the frontier's hosts). These thirteen scenarios run end to end:
 
 - [`book/google-drive`](scenarios/book/google-drive/): ch. 15 over 24 hours at 3k/s (peak 4.26k/s
   at 11:00): block servers, cloud and cold blob stores, a sharded metadata database behind a Che
-  cache, and `notify_q` read by two consumer groups, the notification pushes and the backups. The
-  long polls are a websocket gateway holding a fixed 2M connections whose re-polls (2M / 60 s =
-  33.33k/s) are 98 % of its work. All four SLOs pass (download p99 125 ms of 2 s, metadata p99
+  cache, and `notify_q` read by two consumer groups, the notification pushes and an archive copy
+  of each upload to cold storage (a modelling addition, not the book's). The long polls are a
+  websocket gateway holding a fixed 2M connections whose re-polls (2M / 60 s = 33.33k/s) are 98 %
+  of its work. All four SLOs pass (download p99 125 ms of 2 s, metadata p99
   6.6 ms of 100 ms, nothing dropped, `notify_q` 16.5 ms behind at worst); the backup pool is sized
   at 3 workers, since at the 2 it first had it falls 1.07 h behind by 13:28.
 

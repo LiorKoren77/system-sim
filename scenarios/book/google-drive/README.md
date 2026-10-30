@@ -2,18 +2,32 @@
 
 ## Book design
 - Block servers split files into 4 MB blocks, compress and encrypt them, and store only
-  changed/unique blocks (delta sync + dedup) in cloud storage; cold storage for backups.
+  changed/unique blocks (delta sync + dedup) in cloud storage, which is itself replicated; cold
+  storage holds inactive files, those nobody has opened for a long time.
 - Metadata DB (sharded, replicated) holds users, files, blocks, versions, devices;
   a metadata cache in front.
 - Notification service pushes "file changed" to other devices via long polling.
-- Upload flow and download flow are separate paths; offline backup queue decouples storage.
+- Upload flow and download flow are separate paths. The offline backup queue holds the "file
+  changed" events of a client that is offline, so that it syncs when it reconnects.
 
 The scenario's clients offer 3k requests/s on an office-hours curve (`diurnal`, amplitude 0.7)
 that tops at 11:00 with 4.26k/s (`explain`'s peak), as 70 % `download`, 16 % `metadata`, 6 %
 `upload` (the 500 KB file, straight to the block servers), 6 % `upload_meta` (the metadata write,
 through the API, which publishes a "file changed" event to `notify_q`) and 2 % `sync_poll`. Two
 consumer groups read `notify_q`, each a copy of every event: `notification_svc` pushes it to two
-other devices on average (`factor: 2`), and `backup_workers` copies the file to cold storage.
+other devices on average (`factor: 2`), and `backup_workers` copies the file to cold storage, a
+modelling addition (next section).
+
+### The backup pool is a modelling addition, not the book's
+Ch. 15 has no pool that copies every upload to cold storage. Its *offline backup queue* is
+something else: it keeps the "file changed" events of a device that is offline, so that the device
+catches up when it reconnects. Its cold storage holds inactive files, and its cloud storage is
+replicated, so an upload is safe in more than one place without a second copy. `backup_workers →
+cold_storage` is the scenario's **choice**: an archive copy of each upload, made off the queue by a
+second consumer group. It is there because it gives ch. 15 a queue-fed pool that does real work per
+event (10 ms and a 500 KB write, against the push's 1 ms), the kind of pool that is sized by its
+lag; the archive's recovery point, below, is chosen too. The book's offline queue is not modelled
+(see "What it abstracts away").
 
 ### The notification long polls: a fixed level, not a `connect` op
 In long polling a device sends a request that the server holds open until something changes or
@@ -62,16 +76,18 @@ is gone at 17:26. Nothing is dropped, since `notify_q` keeps 7 days (121M jobs a
 
 The scenario ships with **3 workers**: 300 jobs/s, `backup_workers  peak offered 255.6/s vs 300/s
 total capacity  (85.2%, yellow)`. Why size it, rather than ship the backlog as the lesson:
-- The book's design has the backup keep up. A file that exists for an hour in only one store is a
-  recovery point a storage product would not accept, and the scenario now says so with a fourth
-  SLO, not from the book: `queue_lag` on `notify_q`, at most **10 minutes**. A queue's lag is its
-  slowest consumer group's (here the backups; the pushes are far faster), so the SLO bounds the
-  "file changed" notifications too.
+- The archive's lag is its recovery point: an upload made at 13:28 at 2 workers has no archive
+  copy for 1.07 h. The scenario **chooses** a recovery-point objective (RPO, the most recent data
+  a recovery may lose) of **10 minutes**, minutes rather than hours since the archive runs
+  continuously off the queue rather than as a nightly batch, and states it as a fourth SLO, not
+  from the book (which has no archive): `queue_lag` on `notify_q`, at most 10 minutes. A queue's
+  lag is its slowest consumer group's (here the archive; the pushes are far faster), so the SLO
+  bounds the "file changed" notifications too.
 - A queue-fed pool is sized by its lag budget, not by a utilization colour (as youtube's
   transcoders and search-autocomplete's aggregators are). 3 is the smallest pool above the peak,
   and at rho 0.852 a job waits the Erlang C wait, `C(3, 2.556) / (300/s − 255.6/s)` = 0.734 /
-  44.4/s = **16.5 ms**: `notify_q`'s peak lag in the run, against 10 minutes. 4 workers would buy
-  2.35 ms of lag for a pool 64 % busy; nothing needs it.
+  44.4/s = **16.5 ms**: `notify_q`'s peak lag in the run, against 10 minutes. 4 workers would cut
+  the lag to 2.35 ms with a pool 64 % busy; nothing needs it.
 - Keeping 2 would make the shipped file fail its own SLO (`exit 2`); the 2-worker day is the
   first thing to try (below), one key away.
 
@@ -79,7 +95,7 @@ The other nodes need no sizing: everything else is green at the peak but `cloud_
 yellow, and it passes).
 
 ## The day's run
-`simsys run` steps 24 h at 100 ms (861,000 steps observed after the 5 m warmup; about 24 s of CPU in
+`simsys run` steps 24 h at 100 ms (861,000 steps observed after the 5 m warmup; about 20 s of CPU in
 a Release build on the author's machine) and exits 0, every SLO passing:
 
 ```
@@ -142,6 +158,14 @@ constant load, which the uploads only ripple.
   poll costs is the cap's business.
 - Which device a push reaches: a push is one request to the gateway, not a lookup of the user's
   devices; there is no presence service.
+- The book's offline backup queue: no device here ever goes offline (the 2M are online all day),
+  so no event waits for a reconnect and no device catches up on one. `notify_q` is the scenario's
+  queue of upload events, read by the pushes and by the archive copy, which is itself a modelling
+  addition (above); the archive's restores and cold storage's tiering of inactive files are not
+  modelled either.
+- The client's own side: its local cache of files and of metadata, the changes it detects and
+  splits before an upload, and the download a device makes after a push (the clients' downloads
+  are their fixed 70 % share, not driven by the pushes).
 - `notify_q`'s 8 partitions (`partitions=8 (not modelled)`): Kafka would let at most 8 consumers
   of a group read in parallel, which the 8 notification workers and 3 backup workers fit.
 - One lag per queue: the model reports the slowest group's, so the notification path's own lag

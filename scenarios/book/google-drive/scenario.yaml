@@ -1,8 +1,11 @@
 # System Design Interview vol. 1, ch. 15 — Google Drive.
 # Book numbers: 50M signed-up, 10M DAU, 10 GB free space, 2 uploads/user/day of ~500 KB
 # → ~240 uploads/s, 10:1 read:write. Block servers split files into 4 MB blocks,
-# compress, encrypt, dedup; cloud storage holds blocks; metadata DB holds the tree;
-# notification service pushes sync events over long polling.
+# compress, encrypt, dedup; cloud storage (replicated) holds blocks; metadata DB holds the tree;
+# notification service pushes sync events over long polling. Not the book's: backup_workers
+# copies each upload to cold storage, an archive the scenario chooses (ch. 15's cold storage holds
+# inactive files, and its offline backup queue holds the events of offline clients, which this
+# file does not model). README: "The backup pool is a modelling addition".
 version: 1
 name: google-drive
 seed: 1
@@ -111,7 +114,8 @@ slo:
   - {metric: p99_latency, node: clients, op: download, max: 2s}
   - {metric: p99_latency, node: clients, op: metadata, max: 100ms}
   - {metric: drop_rate, max: 0.001}
-  # Not the book's: notify_q's lag is its slowest consumer group's, here the backups. An upload
-  # not yet copied to cold storage 10 minutes after it was made is a recovery point the scenario
-  # does not accept (README, "How it is sized"; at 2 workers this fails: the lesson).
+  # Not the book's (it has no archive): notify_q's lag is its slowest consumer group's, here the
+  # archive copy to cold storage. The bound is a chosen recovery-point objective of 10 minutes: an
+  # archive that runs off the queue should be minutes behind, not a nightly batch's hours
+  # (README, "How it is sized"; at 2 workers this fails: the lesson).
   - {metric: queue_lag, node: notify_q, max: 10m}
