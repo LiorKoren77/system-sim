@@ -3,18 +3,24 @@
 // resolved graph (the loader's checks, then the graph builder's), and `run` and `sweep` run it
 // into a report::Summary. Before this module the sweep had its own copy of the CLI's loading and
 // running; now both call the functions below, so a point of a sweep
-// is exactly a `simsys run` of the scenario with one value replaced.
+// is exactly a `simsys run` of the scenario with one value replaced. The worker pool that runs
+// the points of a sweep side by side lives here too (run_in_parallel), so that `run
+// --replications` runs its seeds on the same pool (run_replications).
 //
-// Models: nothing from the book; this is plumbing between the layers.
+// Models: nothing from the book; this is plumbing between the layers. Replications are the one
+// piece of method: see run_replications.
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer explanation). Lean
 // on purpose, like every interface that imports another module: no <chrono>, <format>,
 // <filesystem> or <print> here (the GCC 14.2 'Bad file data' defect, CLAUDE.md §3); the messages
 // are formatted in session.cpp.
 module;
+#include <cstddef>
 #include <expected>
+#include <functional>
 #include <span>
 #include <string>
+#include <vector>
 
 export module simsys.session;
 
@@ -66,5 +72,28 @@ struct RunObservers {
 // The same from the graph alone: create_simulation, then the run (a point of `simsys sweep`).
 [[nodiscard]] std::expected<report::Summary, std::string> run_summary(const graph::Graph& g,
                                                                       const std::string& path);
+
+// Calls work(0) ... work(count - 1), each exactly once, on `jobs` worker threads (at least 1, at
+// most one per index), and returns when every call has returned. `work` must be safe to call from
+// several threads at once: each call should write only what belongs to its own index. The pool of
+// `simsys sweep`'s points and of `run --replications`' seeds (docs/study/threads.md).
+void run_in_parallel(std::size_t count, std::size_t jobs,
+                     const std::function<void(std::size_t)>& work);
+
+// Does some client's rate carry noise (`rate: {noise: ...}`)? The noise is the only random input of
+// a run, so without it every seed gives the same run, and `run --replications` runs once.
+[[nodiscard]] bool has_rate_noise(const graph::Graph& g);
+
+// The seeds of `count` replications from `seed`: seed, seed + 1, ..., wrapping around past INT_MAX
+// to INT_MIN instead of overflowing (see session.cpp).
+[[nodiscard]] std::vector<int> replication_seeds(int seed, std::size_t count);
+
+// `count` runs of `g`, replication k (from 0) with the clients' noise seeded from `seed + k`
+// (engine::Simulation::create(g, seed)), on `jobs` workers (run_in_parallel), returned in seed
+// order: the summaries do not depend on `jobs`. Every summary names `g`, which must outlive them.
+// `g` must be runnable (create_simulation accepted it): a graph the engine refuses is a programmer
+// error here, std::invalid_argument. Replication k's seed is replication_seeds(seed, count)[k].
+[[nodiscard]] std::vector<report::Summary> run_replications(const graph::Graph& g, int seed,
+                                                            std::size_t count, std::size_t jobs);
 
 }  // namespace simsys::session

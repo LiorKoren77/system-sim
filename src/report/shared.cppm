@@ -191,19 +191,32 @@ enum class Align { first_left_rest_right, all_left };
 
 constexpr std::string_view ansi_reset = "\x1b[0m";
 
+// Does `c` start a UTF-8 character? Every byte does but a continuation byte, 0b10xxxxxx.
+[[nodiscard]] bool starts_a_character(char c) {
+  return (static_cast<unsigned char>(c) & 0xC0U) != 0x80U;
+}
+
+// How many columns `text` takes on a terminal: its UTF-8 code points, not its bytes. The en dash
+// of a replication's band (`1.62ms [1.61–1.63]`) is three bytes and one column. Every character
+// the tables print is one column wide (no CJK, no combining marks), so code points are columns.
+[[nodiscard]] std::size_t display_width(std::string_view text) {
+  // C++20 std::ranges::count_if: counts over the whole range, replacing a begin/end pair.
+  return static_cast<std::size_t>(std::ranges::count_if(text, starts_a_character));
+}
+
 [[nodiscard]] std::vector<std::size_t> column_widths(std::span<const Row> rows) {
   std::vector<std::size_t> widths;
   for (const auto& row : rows) {
     if (widths.size() < row.size()) widths.resize(row.size());
     for (std::size_t i = 0; i < row.size(); ++i) {
-      widths[i] = std::max(widths[i], row[i].text.size());
+      widths[i] = std::max(widths[i], display_width(row[i].text));
     }
   }
   return widths;
 }
 
 [[nodiscard]] std::string padded(const std::string& text, std::size_t width, bool right) {
-  const std::string fill(width - text.size(), ' ');
+  const std::string fill(width - display_width(text), ' ');
   return right ? fill + text : text + fill;
 }
 

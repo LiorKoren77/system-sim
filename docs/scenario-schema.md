@@ -1613,6 +1613,106 @@ the twin's same step, with how long after the end of the fault (`after the flush
 criterion is "back where it would have been", not "the SLOs pass again": an SLO with room to spare
 passes while the backlog still drains, and one that fails without the fault never passes.
 
+## Command line: `simsys run --replications` (phase 3)
+
+```
+simsys run scenario.yaml --replications N [--jobs J] [--seed S] [--duration D] [--report table|json]
+```
+
+A run is deterministic for its seed, and the clients' [`rate.noise`](#rate-curve-clientrate) is its
+one random input, so one run is one sample of the noise: its p99 says what that afternoon of
+traffic did. `--replications N` runs the scenario N times with seeds `seed`, `seed + 1`, ...,
+`seed + N − 1` (`seed` is the file's, or `--seed`'s; past 2147483647 the seeds wrap around to
+-2147483648) and prints, for every number of the report, how far the N runs spread: the "how sure
+are we" of a capacity plan (spec §7).
+
+| option | rule | refused with |
+|---|---|---|
+| `--replications` | 1 to 1000; default 1. 1 is the plain run, byte for byte, `--series` included | `<file>: error: --replications must be between 1 and 1000` |
+| `--jobs` | worker threads for the replications, 1 to 1024; default: the machine's hardware threads. Each replication is its own simulation, written into its own slot, so the output is the same bytes whatever `--jobs` says (the pool is `simsys sweep`'s, [threads](study/threads.md)) | CLI11's range message |
+| `--series`, `--series-ops` | a single run's file: refused with more than one replication, before anything runs or any file is opened | `<file>: error: --series needs a single run (one series file per seed is phase 4 material)` (`--series-ops` likewise) |
+
+**The cells.** Every number of the node, link, database and op tables becomes the median of the N
+runs' values, then the 10–90 % band in brackets: `5.69ms [5.64–5.75]`. The band's ends leave out
+their unit when both have the median's; when either is in another unit, or is not a number, both
+are printed whole (`1.2ms [998us–1.4ms]`, `1.2ms [1.1ms–unavailable]`). A cell whose three texts
+are the same prints once (`0`, `-`), and a node's `unavailable` mark becomes `unavailable in 2 of
+5` when only some runs had it. The quantiles are **nearest rank**: the p-quantile of n values is
+the value of rank ceil(p·n) in ascending order, so for 5 runs the band is the smallest and the
+largest value and the median the 3rd, for 10 runs the 1st, the 9th and the 5th (for an even count
+the lower of the two middle values). Every cell is therefore a number some run printed, which
+interpolation would not give; with the handful of runs a replication has, an interpolated
+quantile's extra digits would be precision the sample does not have. The band is the spread of
+the runs, not a confidence interval of their mean.
+
+**The SLOs.** Each SLO is judged by its **median run**, the run whose observed value for it is the
+median: `PASS in 3 of 5` (the median run passed, and 3 of the 5 runs did) or `FAIL (passed in 2
+of 5)`, with the median run's observed value. The exit code is the median runs': 2 when some SLO's
+median run fails, whatever the seeds that passed; 0 when every one passes, 1 on an error (or a run
+that observed no step).
+
+**The median run** stands for the N runs where one run's report is needed: the summary line
+(steps, drop rate), the fault blocks and, in JSON, everything around `replications`. It is the
+first SLO's median run (so that verdict, its observed value and the report around them are one
+run's); without SLOs the median run of the first op's mean latency. The table's first two lines
+say what the cells are and which seed it is. Scripted [faults](#faults) are the same in every
+replication (they are part of the scenario, not of the noise), so their block is printed once,
+with the median run's numbers.
+
+**Without noise** every seed gives the same run: `--replications N` runs once and prints
+`replications: the scenario has no noise, so every seed gives the same run` as its first line,
+then the plain run's table, byte for byte, with its exit code. Under `--report json` stdout is the
+plain run's JSON alone and the note goes to stderr.
+
+On hello with `rate: {base: 100/s, noise: {sigma: 0.2, correlation: 10s}}` and an SLO `p99_latency
+users ping max 5.7ms` (seeds 1 and 3 fail it):
+
+```
+$ simsys run probe.yaml --replications 5
+replications: 5 runs, seeds 1..5; a cell is the median across the runs [its 10–90 % band], nearest rank
+median run: seed 2 (the line below and the fault blocks are its own)
+scenario hello  600 steps observed  drop rate 0%
+nodes
+  node                 mean_rho                peak_rho  peak_backlog  dropped  rejected  red_s  peak_lag
+  users                       -                       -             -        -         -      -         -
+  api    0.103 [0.09377–0.1124]  0.1388 [0.1305–0.1477]             0        0         0      0         -
+ops (percentiles estimated: lognormal fit to the response moments)
+  client.op           offered/s                mean                 p50                 p95                 p99  (estimated)
+  users.ping  103 [93.77–112.4]  1.62ms [1.61–1.63]  1.33ms [1.32–1.34]  3.72ms [3.69–3.75]  5.69ms [5.64–5.75]
+slo (each: its median run's verdict and observed value, and the runs that passed it)
+  status          metric       node   op    observed  max
+  PASS in 3 of 5  p99_latency  users  ping  5.69ms    5.7ms
+```
+
+**JSON** (`--report json`) is the median run's report, its `slo` array holding the replicated
+verdicts (each SLO's median run's), plus one key, `replications`: `seeds`, the N seeds in order,
+and `per_seed`, with one object per op (`client`, `op`, then `offered_per_s`, `answered_per_s`,
+`timed_out_per_s`, `mean_s`, `p50_s`, `p95_s`, `p99_s`), per node (`id`, then `mean_rho`,
+`peak_rho`, `peak_backlog`, `dropped`, `rejected`, `red_s`, `unavailable`, `staleness_s`,
+`replication_dropped_per_s`, `committed_writes_per_s`, `peak_queue_lag_s`) and per SLO (`metric`,
+`node`, `op`, `observed`, `status`), each number a list with one entry per seed, in the order of
+`seeds`, written exactly as that seed's own `run --seed S --report json` writes it (null where it
+writes null). The bandwidth links' per-seed numbers are not in it (the median run's `links` are).
+
+```
+  "replications": {
+    "seeds": [1, 2, 3, 4, 5],
+    "per_seed": {
+      "ops": [
+        {"client": "users", "op": "ping", "offered_per_s": [104.97255928866007, ...], ..., "p99_s": [0.005712278457367183, 0.005693737870385378, ...]}
+      ],
+      "nodes": [ ... ],
+      "slo": [
+        {"metric": "p99_latency", "node": "users", "op": "ping", "observed": [...], "status": ["fail", "pass", "fail", "pass", "pass"]}
+      ]
+    }
+  }
+```
+
+Ignored: confidence intervals proper (a t-interval of the mean, batch means), random or
+correlated faults across replications, a series file per seed (phase 4), and replications of a
+sweep's points.
+
 ## Command line: `simsys sweep` (phase 2c)
 
 ```

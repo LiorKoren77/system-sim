@@ -4,16 +4,19 @@
 
 | Construct | File | Function |
 |---|---|---|
-| `std::jthread` workers, joined when the vector goes out of scope | `src/sweep/sweep.cpp` | `run_in_parallel` |
-| `std::atomic<std::size_t>` handing out point indices (`fetch_add`) | `src/sweep/sweep.cpp` | `run_in_parallel`, `pull_indices` |
-| results stored by index in a preallocated vector, no lock | `src/sweep/sweep.cpp` | `PerPoint`, `for_each_point` |
+| `std::jthread` workers, joined when the vector goes out of scope | `src/session/session.cpp` | `run_in_parallel` |
+| `std::atomic<std::size_t>` handing out point indices (`fetch_add`) | `src/session/session.cpp` | `run_in_parallel`, `pull_indices` |
+| results stored by index in a preallocated vector, no lock | `src/sweep/sweep.cpp`, `src/session/session.cpp` | `PerPoint`, `for_each_point`; `run_replications` (a `std::optional<Summary>` per seed) |
 | the lowest failing point wins, whatever the threads did | `src/sweep/sweep.cpp` | `PerPoint::first_error` |
 | `std::thread::hardware_concurrency` as the default `--jobs` | `src/sweep/sweep.cpp` | `default_jobs` |
-| the property, from outside: same bytes with `--jobs 1` and `--jobs 3` | `tests/cli/sweep_jobs.cmake`, `tests/unit/test_sweep.cpp` | `same_bytes`; "the rows do not depend on how many workers ran the points" |
+| the property, from outside: same bytes with `--jobs 1` and `--jobs 3` | `tests/cli/sweep_jobs.cmake`, `tests/unit/test_sweep.cpp`, `tests/cli/replications.cmake`, `tests/unit/test_session.cpp` | `same_bytes`; "the rows do not depend on how many workers ran the points"; "the summaries do not depend on how many workers ran the replications" |
 
 `simsys sweep` runs one scenario once per value of one key (`--param
 nodes.users.rate.base=100/s..900/s:3`), and the runs are independent, so they run side by side:
 three 24-hour youtube simulations take 28 s with `--jobs 3` instead of 62 s with `--jobs 1`.
+`simsys run --replications N` runs its N seeds on the same pool: `run_in_parallel` lives in
+`simsys.session`, which both commands import (the sweep could not host it: session cannot import
+sweep, which imports session).
 
 ## What
 
@@ -126,12 +129,14 @@ cross into the thread that joins it). That is acceptable here because the projec
 for programmer errors (CLAUDE.md §3); user mistakes come back as `std::expected` values and are
 stored per point.
 
-## Why `<thread>` lives in `sweep.cpp`
+## Why `<thread>` lives in the implementation units
 
-`sweep.cppm`, the interface, declares what a sweep *is* (`SweepParam`, `run_sweep`, ...); how the
-points are spread over threads is an implementation detail no importer needs to see, so
-`<thread>` and `<atomic>` are included only in the implementation unit, `sweep.cpp`, and an
-importer (the CLI, the tests) does not pay to parse them. This is a design choice, a lean
+`sweep.cppm` and `session.cppm`, the interfaces, declare what a sweep and a session *are*
+(`SweepParam`, `run_sweep`, `run_replications`, ...); how the runs are spread over threads is an
+implementation detail no importer needs to see, so `<thread>` and `<atomic>` are included only in
+the implementation units, `session.cpp` (the pool) and `sweep.cpp` (`default_jobs`), and an
+importer (the CLI, the tests) does not pay to parse them; `session.cppm` declares
+`run_in_parallel` with `<functional>` alone. This is a design choice, a lean
 interface, not a compiler workaround: the GCC 14.2 "Bad file data" defect (CLAUDE.md §3) needs
 `<chrono>`, `<format>`, `<filesystem>` or `<print>` in the global module fragment of an interface
 that imports another module, and `sweep.cppm` imports none, so it would not bite here. Even

@@ -98,6 +98,16 @@ Write for a reader who has read the book but has not studied queueing theory.
   exported namespace-scope constant in a module interface is `constexpr` without `inline`: it
   keeps external linkage (it is exported) and the interface's object file defines it once
   (`tests/support/fixtures.cppm`).
+- Eighth GCC 14.2 defect (2026-10-30): a standard header `#include`d AFTER an `import` is compiled
+  a second time against the library internals the imported module's global module fragment
+  already brought in, and clashes with them, even when the header itself is new to the importer.
+  `#include <set>` after `import simsys.graph;` (whose fragment has `<map>`, `<functional>`, ...)
+  fails with `bits/node_handle.h:67:56: error: template definition of non-template 'using
+  std::_Node_handle_common<_Val, _NodeAlloc>::_AllocTraits = ...'`; after `import simsys.core;`
+  with `ext/aligned_buffer.h:96:67: error: redeclaration of '... __aligned_buffer<_Tp>::_M_storage'`
+  (the test-writer saw a `_Hashtable` conflict: same cause, another shared internal). Workaround:
+  every `#include` before the first `import` of the file, the order every unit already follows;
+  `<set>` there compiles and works (verified with tests/unit/test_session.cpp).
 
 ## 4. Clean code, named patterns, TDD
 

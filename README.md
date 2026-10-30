@@ -42,6 +42,7 @@ simsys explain  scenario.yaml        # every resolved number and where it came f
 simsys estimate scenario.yaml [--report table|json] [--no-color]
 simsys run      scenario.yaml [--duration 30s] [--seed N] [--report table|json]
                               [--series out.csv] [--series-ops ops.csv] [--no-color]
+                              [--replications N [--jobs J]]
 simsys curve    scenario.yaml <client> [--step 1m] [--until 1h] [--seed N] [--noise]
 simsys sweep    scenario.yaml --param <dot.path>=<from>..<to>:<n> --metric <m>...
                               [--jobs N] [--format table|csv]
@@ -74,6 +75,13 @@ Exit codes: 0 every SLO passed, 2 an SLO failed, 1 an error.
 Colour is on when stdout is a terminal; `--no-color` turns it off and JSON never has it.
 `run --seed N` replaces the scenario's `seed`, which seeds every client's `rate.noise`
 process: the same seed gives the same run, byte for byte; without a noise block it changes nothing.
+`run --replications N` (1 to 1000) runs the scenario N times, with seeds `seed`, `seed + 1`, ...,
+`seed + N − 1` of that noise, on `--jobs` worker threads (the output does not depend on them), and
+prints every number as its median across the runs with its 10–90 % band, nearest rank
+(`5.69ms [5.64–5.75]`), each SLO as `PASS in 3 of 5` or `FAIL (passed in 2 of 5)` with its median
+run's observed value; it exits with the median run's code. A scenario without noise runs once,
+after a line that says so; `--series` needs a single run
+([schema](docs/scenario-schema.md#command-line-simsys-run---replications-phase-3)).
 
 `curve` prints one client's offered rate over time as CSV (`t_s,rate_per_s`), sampled every
 `--step` from t = 0 (midnight) up to `--until` (default: the scenario's duration), so the

@@ -3,8 +3,10 @@
 //
 // Exit codes: 0 the run worked and every SLO passed, 2 it worked but an SLO failed, 1 an
 // error (bad file, bad option, a scenario the engine cannot run yet, or a run that observed
-// no step: no data is an error, not a pass). `sweep` reports numbers and judges none: 0 when
-// every point ran, whatever its SLOs, 1 on an error.
+// no step: no data is an error, not a pass). `run --replications N` exits with its median run's
+// code: 2 when some SLO's median run fails it (report::SloReplication), whatever the seeds that
+// passed. `sweep` reports numbers and judges none: 0 when every point ran, whatever its SLOs, 1 on
+// an error.
 #include <unistd.h>  // isatty, STDOUT_FILENO: POSIX, which is fine for this project
 #include <CLI/CLI.hpp>
 
@@ -184,7 +186,15 @@ struct RunArgs {
   std::optional<std::string> series{};      // CSV output path, one row per node per step
   std::optional<std::string> series_ops{};  // CSV output path, one row per client op per step
   std::optional<int> seed{};                // overrides the scenario's (see load_for_run)
+  std::optional<int> replications{};        // runs over seeds seed .. seed + N - 1 (run_replicated)
+  std::size_t jobs{simsys::sweep::default_jobs()};  // the replications' worker threads
 };
+
+// The largest --replications. Chosen, not from the book: a nearest-rank 10-90 % band needs ten
+// runs to move off the extremes and a hundred to be smooth, so a thousand is far past any useful
+// band, while each replication keeps its Summary until the report is printed and a day-long
+// scenario takes seconds per run.
+constexpr int max_replications = 1000;
 
 // `--duration`'s text, checked as a duration before anything is loaded, so its message echoes
 // what the user typed.
@@ -284,14 +294,77 @@ std::optional<std::string> series_paths_refused(const std::optional<std::string>
   return std::nullopt;
 }
 
+// Why `--replications` cannot run as given, before anything is loaded or written: a count out of
+// range, or a series file, which is one run's (a file per seed is phase 4 material). Nothing for
+// one replication: that is the plain run, series included.
+std::optional<std::string> replications_refused(const std::filesystem::path& file,
+                                                const RunArgs& args) {
+  if (!args.replications) return std::nullopt;
+  if (*args.replications < 1 || *args.replications > max_replications) {
+    return std::format("{}: error: --replications must be between 1 and {}", file.string(),
+                       max_replications);
+  }
+  if (*args.replications == 1) return std::nullopt;
+  for (const auto& [option, path] :
+       {std::pair{"--series", args.series}, std::pair{"--series-ops", args.series_ops}}) {
+    if (path) {
+      return std::format(
+          "{}: error: {} needs a single run (one series file per seed is phase 4 "
+          "material)",
+          file.string(), option);
+    }
+  }
+  return std::nullopt;
+}
+
+// What `run --replications` says before the table of a scenario whose clients have no noise: its
+// one random input is missing, so N seeds would print N identical runs, and it runs once.
+constexpr std::string_view noiseless_note =
+    "replications: the scenario has no noise, so every seed gives the same run";
+
+// The note goes first on stdout for a person; a JSON reader gets the plain run's JSON alone on
+// stdout (a line of prose would break its parser), and the note on stderr.
+void print_noiseless_note(const ReportOptions& options) {
+  if (options.format == "json") {
+    print_error(std::string{noiseless_note});
+  } else {
+    std::println("{}", noiseless_note);
+  }
+}
+
+// `simsys run <file> --replications N`, N > 1, on a scenario with noise: N runs over the seeds
+// from the scenario's (or --seed's), on --jobs workers, printed as their median and band. The
+// exit code is the median run's (see the top of the file).
+int run_replicated(const graph::Graph& g, int count, const RunArgs& args,
+                   const ReportOptions& options) {
+  const auto replications = static_cast<std::size_t>(count);
+  const int first_seed = g.scenario().seed;
+  const auto runs = simsys::session::run_replications(g, first_seed, replications, args.jobs);
+  const auto replicated = report::summarize_replications(
+      runs, simsys::session::replication_seeds(first_seed, replications));
+  if (options.format == "json") {
+    std::println("{}", report::render_replications_json(replicated, runs));
+  } else {
+    std::print("{}", report::render_replications_table(replicated, runs, use_color(options)));
+  }
+  if (runs[replicated.median_run].observed_steps() == 0) return 1;
+  return report::all_pass(report::replicated_verdicts(replicated)) ? 0 : 2;
+}
+
 // `simsys run <file>`: steps through the scenario, feeding every record to the summary
 // and, when asked, to the CSV series (the contract a GUI plots from).
 // `--seed` reaches the engine through the scenario (load_for_run); a process-level test of
 // that would need to spawn simsys, so it is checked by hand (two seeds, two outputs) and
 // the engine half is pinned in tests/theory ("two runs with the same seed are identical
 // and a different seed is not").
+// With `--replications N`, N > 1, the scenario runs N times (run_replicated), or once with a note
+// when nothing in it is random.
 int run_scenario(const std::filesystem::path& file, const RunArgs& args,
                  const ReportOptions& options) {
+  if (const auto refused = replications_refused(file, args)) {
+    print_error(*refused);
+    return 1;
+  }
   const auto g = load_for_run(file, args);
   if (!g) {
     print_error(g.error());
@@ -301,6 +374,11 @@ int run_scenario(const std::filesystem::path& file, const RunArgs& args,
   if (!sim) {
     print_error(sim.error());
     return 1;
+  }
+  const int replications = args.replications.value_or(1);
+  if (replications > 1) {
+    if (simsys::session::has_rate_noise(*g)) return run_replicated(*g, replications, args, options);
+    print_noiseless_note(options);
   }
 
   // Both paths are checked, then both files open, before the run: a bad path stops it before
@@ -542,6 +620,12 @@ void add_run_options(CLI::App& run, RunArgs& args) {
   run.add_option("--series", args.series, "write one CSV row per node per step to this file");
   run.add_option("--series-ops", args.series_ops,
                  "write one CSV row per client op per step to this file");
+  run.add_option("--replications", args.replications,
+                 "run N times over seeds seed .. seed+N-1 of the rate noise and print each "
+                 "number's median and 10-90 % band (1 to 1000; default 1)");
+  run.add_option("--jobs", args.jobs,
+                 "worker threads for --replications (default: the machine's hardware threads)")
+      ->check(CLI::Range(std::size_t{1}, simsys::sweep::max_jobs));
 }
 
 CLI::App* add_curve_command(CLI::App& app, CurveArgs& args, std::filesystem::path& file) {

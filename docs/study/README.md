@@ -17,7 +17,7 @@ for the planned list.
 | [generator.md](generator.md) | coroutines, `co_yield`, `std::generator` (lazy single-pass ranges) | C++20 / C++23 | `workload::samples`, `curve_samples` and `print_samples` in `main.cpp` (`simsys curve`) |
 | [random.md](random.md) | `<random>` engines vs distributions, `std::mt19937_64`, seeding; the Ornstein–Uhlenbeck noise | C++11 | `workload::NoiseProcess`, `workload::client_seed`, `ClientBehaviour::tick` |
 | [numerics.md](numerics.md) | `expm1` / `log1p`, bisection vs Newton, sums kept in [0, 1], latency moments, fluid steps and choosing the step, a quorum's order statistics by quadrature, the ring's hottest machine, the truncated lognormal of a client's timeout (floating point, not a language feature) | C++11 `<cmath>` | `caching.cppm` (`power_integral`, `characteristic_time`), `queueing.cppm` (`erlang_c`, `lognormal_quantile`, `lognormal_below`, `lognormal_order_statistic`), `flow.cppm`, `fluid.cppm` |
-| [threads.md](threads.md) | `std::jthread`, `std::stop_token`, `std::atomic` as a work queue, data races | C++20 / C++11 | `run_in_parallel`, `PerPoint` (`src/sweep/sweep.cpp`, `simsys sweep`) |
+| [threads.md](threads.md) | `std::jthread`, `std::stop_token`, `std::atomic` as a work queue, data races | C++20 / C++11 | `run_in_parallel` (`src/session/session.cpp`, `simsys sweep` and `run --replications`), `PerPoint` (`src/sweep/sweep.cpp`) |
 | [small-features.md](small-features.md) | designated initializers, `std::span`, `<=>` and defaulted `==`, `using enum`, `consteval`, `std::to_array`, `std::to_underlying`, `std::unreachable`, `std::chrono` durations, deducing `this`, `static operator()` | C++20 / C++23 | everywhere; each section names its main uses |
 
 ## Where to look: design patterns
@@ -54,8 +54,8 @@ Phase 2c added these:
 - `Pattern: Delegation` on `detail::HopBlocks` (`src/engine/behaviours.cppm`): the blob store's
   event notifications and the worker pool's `then` steps hold the same blocks of hops a service and
   a cache hold, built by one shared `detail::add_then_blocks`, instead of a base class.
-- `Pattern: Thread pool / work queue` on `run_in_parallel` (`src/sweep/sweep.cpp`): `simsys sweep`'s
-  points on `std::jthread` workers that pull indices from one `std::atomic<std::size_t>`
+- `Pattern: Thread pool / work queue` on `run_in_parallel` (`src/session/session.cpp`): `simsys
+  sweep`'s points and `run --replications`' seeds on `std::jthread` workers that pull indices from one `std::atomic<std::size_t>`
   ([threads.md](threads.md)); and `Pattern: Pipeline with early exit` on the sweep's stages (the
   file, the metrics, every point loaded, then every point run).
 - `Pattern: Static factory (named constructor)` on `MegabyteService::serialising`

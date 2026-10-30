@@ -9,8 +9,9 @@
 // 100 ms"), no interpolation between points and no statistics across points: n points are n
 // independent runs, and the table shows them side by side.
 //
-// Lean by design: <thread> and <atomic> live in sweep.cpp, not here. The threads are how the
-// points run, not part of what a sweep is, so no importer should parse those headers. (The GCC
+// Lean by design: <thread> lives in sweep.cpp (default_jobs) and the worker pool in session.cpp,
+// not here. The threads are how the points run, not part of what a sweep is, so no importer
+// should parse those headers. (The GCC
 // 14.2 'Bad file data' defect of CLAUDE.md §3 would not bite here: it needs <chrono>, <format>,
 // <filesystem> or <print> in an interface that imports another module, and this one imports
 // none.)
