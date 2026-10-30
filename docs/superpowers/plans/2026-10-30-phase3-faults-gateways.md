@@ -524,8 +524,8 @@ until Task 16 gives `long_poll` `connections: 2M`.
 
 **Files:** `scenarios/book/google-drive/{scenario.yaml,README.md}` (`long_poll` with `connections: 2M`, `heartbeat: 60s`, `fanout: 1`; `backup_workers` sized or kept as the lesson (today rho 1.28 at the peak: the README decides and says why); download p99 vs 2 s, metadata p99 vs 100 ms, drop rate), `tests/scenario/test_scenarios.cpp`, `test_series.cpp`, `README.md`.
 
-- [ ] `run` exits 0; README numbers *measured*; the day test at a coarser step pins the headline peaks and the SLO verdicts.
-- [ ] Commit `scenarios: google-drive runs end to end`.
+- [x] `run` exits 0; README numbers *measured* (download p99 125 ms, metadata p99 6.6 ms, drop rate 0, `notify_q` lag 16.5 ms against a new 10 m `queue_lag` SLO; `long_poll` `connections: 2M` fixed, `backup_workers` 2 → 3 with the 2-worker day as the exercise); the day test pins the peaks and verdicts.
+- [x] Commit `scenarios: google-drive runs end to end` (green `c81d5c7` rebased, 1638 tests). Note: the five-second-CPU scenario test is flaky under `ctest -j8` with the day tests (kv-store 5.25 s, consistent-hashing 5.9 s): mark it `RUN_SERIAL` at the 3c push.
 
 ### Task 17: `notification_fanout`; notification-system runs end to end
 
