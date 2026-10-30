@@ -189,7 +189,11 @@ struct TypeDefaults {
     case search_index:
       return {Rate{5'000}, 5_ms};  // chosen: a prefix lookup in a trie, top k read (ch. 13)
     case ws_gateway:
-      return {Rate{50'000}, 100_us};  // chosen: relaying one frame
+      // chosen: relaying one frame (a message, a ping, a connect's handshake) over an open
+      // websocket. The phase 3 plan said 10k/s and 0.5 ms; the 50k/s and 100 us this table had
+      // since phase 1 are kept, so a gateway that states no capacity runs on the numbers explain
+      // always printed for it (the book's chat servers state their own: 10k/s, 0.5 ms).
+      return {Rate{50'000}, 100_us};
     case service_discovery:
       // rate chosen; time book "round trip within the same datacenter" (one lookup)
       return {Rate{10'000}, t.intra_dc_rtt};
@@ -389,6 +393,33 @@ inline constexpr SimTime retry_after = 100_ms;
 // 4 s, ...), of which the model keeps only the first. Ten times a client's retry_after: a worker is
 // not a user waiting for an answer.
 inline constexpr SimTime pool_retry_after = 1_s;
+
+// ---- Websocket gateways (phase 3 spec §8.2; book ch. 12) ----
+
+// How long a user stays connected to a ws_gateway on average, when the scenario does not say
+// (model::NodeSpec::session): 30 minutes. Chosen, not from the book: ch. 12 sizes the chat system
+// by daily active users and messages, and never says how long a connection lasts; half an hour is
+// a typical mobile chat session (an app kept open through a commute or an evening, then
+// backgrounded). Each open connection ends at rate 1 / session, so the level settles at
+// connect rate × session (Little's law, behaviours::WsGatewayBehaviour).
+inline constexpr SimTime default_session = 30_min;
+
+// How long the users of a fallen gateway take to come back, when the scenario does not say
+// (model::NodeSpec::reconnect_within): 30 seconds. Chosen, not from the book: ch. 12 has the
+// client reconnect after a lost heartbeat but gives no number; 30 s is a few heartbeats (the
+// book's 5 s each) of a client's backoff before it tries again. Read by the reconnect storm of a
+// node_down (phase 3 Task 15); stored and printed until then.
+inline constexpr SimTime default_reconnect_within = 30_s;
+
+// The session a gateway's connections last (the stated one, else default_session) and how soon
+// its users reconnect (the stated one, else default_reconnect_within): the one place the defaults
+// are applied, so the behaviour and explain agree.
+[[nodiscard]] constexpr SimTime session_of(const model::NodeSpec& spec) {
+  return spec.session.value_or(default_session);
+}
+[[nodiscard]] constexpr SimTime reconnect_within_of(const model::NodeSpec& spec) {
+  return spec.reconnect_within.value_or(default_reconnect_within);
+}
 
 // The number of servers c that makes a node one consistent machine. Little's law
 // (L = lambda * W) applied to the servers at full load: the requests in service equal

@@ -351,15 +351,16 @@ TEST_CASE("the series writer emits a header and one row per node per step; clien
   // replacing `compare(0, prefix.size(), prefix) == 0` and its length bookkeeping.
   REQUIRE(
       text.starts_with("t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,"
-                       "dead_lettered_per_s,rejected_per_s,latency_ms,zone,queue_lag_s\n"));
+                       "dead_lettered_per_s,rejected_per_s,latency_ms,zone,queue_lag_s,"
+                       "connections\n"));
   // C++20 std::ranges::count: counts the matches in a whole range (here the characters of
   // the string), replacing std::count(text.begin(), text.end(), '\n').
   REQUIRE(std::ranges::count(text, '\n') == 1 + 3 * 2);
   REQUIRE(text.find("\n0.1,s,") != std::string::npos);  // shortest round-trip form of 0.1 s
   // A client is a source: its numeric columns are 0 (machines keep a number) and its zone
-  // is `none` (it has no queue to colour). No dead letters (a pool's) and no lag (a queue's): the
-  // two empty cells.
-  REQUIRE(text.find("\n0,c,0,0,0,0,0,,0,0,none,\n") != std::string::npos);
+  // is `none` (it has no queue to colour). No dead letters (a pool's), no lag (a queue's) and no
+  // connections (a gateway's): the three empty cells.
+  REQUIRE(text.find("\n0,c,0,0,0,0,0,,0,0,none,,\n") != std::string::npos);
 }
 
 TEST_CASE("render_explain lists every node with its resolved numbers and provenance", "[report]") {
@@ -524,12 +525,12 @@ TEST_CASE("the series writer emits rejected_per_s", "[report]") {
   std::string field;
   std::istringstream cells{line};
   while (std::getline(cells, field, ',')) fields.push_back(field);
-  // twelve cells: demand_per_s and drain_per_s after node (spec §18 entry 13), dead_lettered_per_s
-  // after drops_per_s (a pool's: empty on a limiter's row, and getline keeps an empty cell between
-  // two commas), queue_lag_s last. getline drops the last cell, which is empty on a limiter's row,
-  // so the comma count is what says there are twelve.
-  REQUIRE(std::ranges::count(line, ',') == 11);
-  REQUIRE(fields.size() == 11);
+  // thirteen cells: demand_per_s and drain_per_s after node (spec §18 entry 13),
+  // dead_lettered_per_s after drops_per_s (a pool's: empty on a limiter's row, and getline keeps an
+  // empty cell between two commas), queue_lag_s and connections last. getline drops the last cell,
+  // which is empty on a limiter's row, so the comma count is what says there are thirteen.
+  REQUIRE(std::ranges::count(line, ',') == 12);
+  REQUIRE(fields.size() == 12);
   REQUIRE(fields[6] == "0");     // drops_per_s
   REQUIRE(fields[7] == "");      // dead_lettered_per_s: a limiter has no dead letters
   REQUIRE(fields[8] == "3000");  // rejected_per_s
@@ -738,7 +739,7 @@ TEST_CASE("the CSV series has the rejected_per_s column after drops_per_s and de
   const auto text = out.str();  // the header is written on construction, before any step
   REQUIRE(text.substr(0, text.find('\n') + 1) ==
           "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,"
-          "rejected_per_s,latency_ms,zone,queue_lag_s\n");
+          "rejected_per_s,latency_ms,zone,queue_lag_s,connections\n");
 }
 
 namespace {

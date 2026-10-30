@@ -65,10 +65,10 @@ enum class NodeType : std::uint8_t {
 };
 
 // One row of the node-type catalogue: the enumerator, the word the schema spells it with, and
-// whether run/estimate can step a node of the type today (`runs`). The four types without a
-// model yet (ws_gateway, service_discovery, notification_fanout, frontier: phase 3) have it
-// false; explain and validate take every type. A row like core::EnumName with one more column,
-// which core's lookups read through their NameRow concept.
+// whether run/estimate can step a node of the type today (`runs`). The three types without a
+// model yet (service_discovery, notification_fanout, frontier: phase 3; the ws_gateway got its
+// model in phase 3 Task 14) have it false; explain and validate take every type. A row like
+// core::EnumName with one more column, which core's lookups read through their NameRow concept.
 struct NodeTypeRow {
   NodeType value;
   std::string_view name;
@@ -100,7 +100,7 @@ inline constexpr auto node_type_table = std::to_array<NodeTypeRow>({
     {NodeType::worker_pool, "worker_pool", true},
     {NodeType::blob_store, "blob_store", true},
     {NodeType::search_index, "search_index", true},
-    {NodeType::ws_gateway, "ws_gateway", false},
+    {NodeType::ws_gateway, "ws_gateway", true},
     {NodeType::service_discovery, "service_discovery", false},
     {NodeType::id_generator, "id_generator", true},
     {NodeType::external_sink, "external_sink", true},
@@ -633,8 +633,61 @@ struct NodeSpec {
   // load on the index and on the aggregators, and the freshness of the answers (a query typed after
   // the last rebuild still finds the old trie).
   std::optional<SimTime> build_interval{};
+  // Websocket gateways only (phase 3 spec §8.2; book ch. 12, "Design a chat system": the stateful
+  // chat servers every online user keeps a websocket open to; ch. 15's notification long polls
+  // too). Declared after the search index's key, for designated initializers. The model is at
+  // behaviours::WsGatewayBehaviour; here, what each key states:
+  //  - `max_connections`: the open connections ONE replica holds at most, so the gateway's cap is
+  //    max_connections × replicas; a connect above it is refused. Absent: no cap.
+  //  - `heartbeat`: how often every open connection pings, so the gateway serves C / heartbeat
+  //    pings a second on its `heartbeat` op (the book's presence heartbeat: every 5 s). Absent:
+  //    no heartbeat load.
+  //  - `fanout`: the average recipients of one message, a factor (at least 1) on the steps of the
+  //    gateway's message ops (message_op below). Absent: 1.
+  //  - `connections`: a FIXED level, for a gateway no client op connects to (google-drive's 2M
+  //    long polls, held by devices nobody here simulates). Absent: the level is filled by the
+  //    clients' `connect` op, and Simulation::create refuses a gateway that has neither or both.
+  //  - `session`: how long a user stays connected on average, so each open connection ends at
+  //    rate 1 / session. Absent: defaults::default_session (30 min, chosen).
+  //  - `reconnect_within`: how long the users of a fallen gateway take to come back (the reconnect
+  //    storm of phase 3 Task 15). Absent: defaults::default_reconnect_within (30 s, chosen).
+  // The loader leaves an absent one absent, so explain can mark "(default)".
+  std::optional<std::int64_t> max_connections{};
+  std::optional<SimTime> heartbeat{};
+  std::optional<double> fanout{};
+  std::optional<std::int64_t> connections{};
+  std::optional<SimTime> session{};
+  std::optional<SimTime> reconnect_within{};
   std::optional<Workload> workload{};  // clients only
 };
+
+// The op names a ws_gateway gives a meaning of its own (phase 3 spec §8.2; book ch. 12). A client
+// op named `connect` that reaches the gateway opens connections (it raises the level); `heartbeat`
+// is the op the open connections' pings arrive under (the gateway adds C / heartbeat of them to
+// what the clients send under that name); `deliver` is a message pushed to a recipient over its
+// open connection (terminal: no hops). Every other op the gateway receives is a MESSAGE, whose
+// steps the `fanout` multiplies.
+inline constexpr std::string_view connect_op = "connect";
+inline constexpr std::string_view heartbeat_op = "heartbeat";
+inline constexpr std::string_view deliver_op = "deliver";
+
+// Is `op` a message at a ws_gateway (above): every op but connect, heartbeat and deliver.
+[[nodiscard]] constexpr bool message_op(std::string_view op) {
+  return op != connect_op && op != heartbeat_op && op != deliver_op;
+}
+
+// A gateway's cap, max_connections × replicas (the room of every replica together); empty when it
+// states no max_connections (no cap). A double: 2M × 20 replicas is no int, and the level it bounds
+// is a double.
+[[nodiscard]] constexpr std::optional<double> connection_cap(const NodeSpec& spec) {
+  if (!spec.max_connections) return std::nullopt;
+  return static_cast<double>(*spec.max_connections) * spec.replicas;
+}
+
+// The `fanout` a gateway's message steps are multiplied by: the stated one, else 1.
+[[nodiscard]] constexpr double fanout_of(const NodeSpec& spec) {
+  return spec.fanout.value_or(1.0);
+}
 
 // A kv_cluster's replication factor N and its quorums W and R with the defaults applied: N = 3
 // (default_replication), W = R = min(2, N) (default_quorum, lowered for a cluster of N = 1). The

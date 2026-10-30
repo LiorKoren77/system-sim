@@ -2383,13 +2383,23 @@ std::optional<EngineError> Graph::invalid_failure_step(
 // [cache.get, db.read on miss, cache.set on miss] is one lookup and what follows its miss, and in
 // [db.write, log.write on failure, audit.write on failure] both failure steps report on db.write.
 // connect_step has already resolved every target.
+//
+// A ws_gateway's message ops fan out (phase 3 spec §8.2; book ch. 12: a message to a group reaches
+// each member): every step of an op that is a message (model::message_op: not connect, heartbeat
+// or deliver) sends `fanout` times its own factor, fanout × factor requests per message, and the
+// engine (the behaviours read these hops) and explain's paper load both see it. An `on: miss` step
+// is not multiplied again: its factor is its lookup's times its own, and the lookup's has the
+// fan-out already.
 Graph::Result Graph::resolve_service_hops(std::size_t node) {
-  for (const auto& [op, steps] : nodes_[node].spec.ops) {
+  const auto& spec = nodes_[node].spec;
+  for (const auto& [op, steps] : spec.ops) {
     auto& hops = service_hops_[node][op];
+    const bool fans_out = spec.type == model::NodeType::ws_gateway && model::message_op(op);
     std::optional<std::size_t> last_unconditional;  // its position in `hops`
     for (const model::Step& step : steps) {
       auto hop = resolve_service_hop(node, step, hops, last_unconditional);
       if (!hop) return std::unexpected{std::move(hop.error())};
+      if (fans_out && step.on != model::StepCondition::miss) hop->factor *= model::fanout_of(spec);
       if (step.on == model::StepCondition::always) last_unconditional = hops.size();
       hops.push_back(std::move(*hop));
     }

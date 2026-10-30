@@ -125,22 +125,26 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `worker_pool` | M/M/c over consumption, `workers / cost` jobs a second, its room its queue's `retention`; its `then` steps fire for every job it drains, nobody waiting for them (phase 2c, same section) |
 | `external_sink` | a third party's API: a queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) that fails `failure_rate` of what it serves, counted as drops (phase 2c, see [Node types](#node-types)) |
 | `kv_cluster` | `nodes` machines on a ring, every request sent to `replication` N of them, answered at the W-th (write) or R-th (read) fastest of its own replica set and lost when fewer come back; the ring's hottest machine as its own queue (phase 2c, see [`kv_cluster`](#kv_cluster)) |
+| `ws_gateway` | its open connections as a **level** that a client op named `connect` fills or a fixed `connections` states, capped at `max_connections × replicas`, loaded by `C / heartbeat` pings, its message ops fanned out by `fanout` (phase 3, see [`ws_gateway`](#ws_gateway)) |
 
 Everything else is refused before the first step, with exit code 1:
 
 | what | message | runs from |
 |---|---|---|
-| `ws_gateway`, `service_discovery` | `node 'x' has type 'ws_gateway', which run/estimate do not support yet (phase 3)` | 3 |
+| `service_discovery` | `node 'x' has type 'service_discovery', which run/estimate do not support yet (phase 3)` | 3 |
 | `notification_fanout`, `frontier` | the same message | 3 |
+| a `ws_gateway` that no `connect` op reaches and that states no `connections` | `node 'x': a ws_gateway needs a client op named 'connect' or a fixed 'connections'` | now, once it has one |
+| a `ws_gateway` with both | `node 'x': a ws_gateway takes a 'connect' op or a fixed 'connections', not both` | now, with one |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
 | a `cache_flush` on a cache with a fixed `hit_ratio` and no `keys` | `node 'x': cache_flush needs keys (a fixed hit ratio is back once keys requests have refilled it)` | now, once it states `keys` |
 | a `cache_flush` on a cache whose hit ratio is 1 | `node 'x': cache_flush on a cache that always hits (hit ratio 1): it has no miss path to warm through` | now, with a hit ratio below 1 |
 
-The type message names the phase that plans the type's model, phase 3 for all four. The type
+The type message names the phase that plans the type's model, phase 3 for all three. The type
 check runs over the whole file first, and names the first node
 in file order whose type cannot run; only then are the nodes of runnable types checked (a CDN's
-`keys`), in file order: google-drive is refused at its `ws_gateway`, `long_poll`, the first type
-it has no model of, chat-system at its `service_discovery`, notification-system at its
+`keys`, a gateway's level), in file order: google-drive is refused at its `ws_gateway`,
+`long_poll`, which states no level yet (`node 'long_poll': a ws_gateway needs a client op named
+'connect' or a fixed 'connections'`), chat-system at its `service_discovery`, notification-system at its
 `notification_fanout` and web-crawler at its `frontier`. Of the 14 shipped scenarios ten run
 (`exit` is `simsys run`'s exit code, Release build):
 
@@ -287,7 +291,7 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 | `capacity` | rate or byte rate | all but `client` and `worker_pool` (a pool's rate is `workers / cost`: `node 'w': a worker pool's rate is workers / cost`) | read | service rate **per replica**; default per type (§6 of the spec; 100k/s for `load_balancer`, `rate_limiter` and `cache`). A byte rate (`100GB/s`, or in bits as a network is rated: `40Gbit/s` = 5 GB/s, printed `5GB/s`) on a `cdn` or `blob_store`, and a `blob_store`'s default (spec §6's 500 MB/s), makes the node count **megabytes**: its capacity is that many MB/s, a request costs its size in MB (the client's `sizes:` or the step's `size:`), and its service time is one megabyte's (10 ms at a CDN, 40 ms at a blob store), so by Little's law it has `c = MB/s × that time` slots, each moving one object at a time: `capacity=100k MB/s (scenario)  service_time=10ms per MB (default)  c=1000 slots (1 object each) (implied)  queue_limit=1000 MB (default)  variability=0`. Each request is a **batch** of megabytes that holds one slot for its whole transfer (size × the time of one MB: a 50 MB object 2 s at a blob store), a fixed time for a fixed size (so `service_variability` defaults to **0** there: deterministic transfers), and the node's queue waits for whole objects: Erlang C is fed the mean object time `s_obj = Σ p_op × MB_op × time per MB` (`p_op` = the op's share of the requests, recomputed every step from the arrivals) with the same `c`, which leaves `rho` as in MB/s and makes the wait a whole object's, and the Allen–Cunneen factor `(burstiness + c_s²) / 2` is fed the size mix's squared coefficient of variation `c_s² = Σ p_op (1 + service_variability) s_op² / s_obj² − 1`. One size waits like M/D/c, half the M/M/c wait: at `rho` 0.9, 50 MB objects at a default blob store (20 slots) wait `0.5 × C(20, 0.9) × 2 s / (20 × 0.1)` = 0.28 s (0.55 s with `service_variability: 1`), where counting 1 MB units as independent requests, as the first version of the model did, said 11 ms; small requests beside large ones raise `c_s²` and so lengthen the large ones' wait (1000 reads/s of 2 KB beside 8 writes/s of 50 MB: 67 ms against 64 ms alone). Like every queue's, the wait is never longer than the waiting room takes to drain, `queue_limit / capacity` (1000 MB at 500 MB/s: 2 s). A request is then answered after that wait at its **last byte** if it is a write (an op in a blob store's `write_ops`, default `write`): its whole transfer, so every 300 MB upload takes at least 12 s at 25 MB/s per slot (40 ms per MB), and a client `timeout` under that cuts all of them; and at its **first megabyte** otherwise (a read or a stream, which the client consumes as it arrives; this understates a large read needed whole before use). Either way a request under 1 MB takes one megabyte's time (an upper bound for small objects: a 2 KB read holds its slot 80 µs but is answered in 40 ms). `explain` checks it in MB/s with the requests beside: `cdn_us  peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)`. A byte rate on any other type is an error, since those types count requests: `a service counts requests; a byte capacity belongs on a cdn or blob_store`. At most `1e15/s` (`1e15B/s` for a byte rate). An error on a `leaky_bucket` limiter |
 | `latency` | duration | all but `client` and `worker_pool` (its `cost` is the time per job) | read | service time of one request; default per type (50 µs for `load_balancer` and `rate_limiter`, 250 µs for `cache`: the spec's memory read). An error on a `leaky_bucket` limiter |
 | `advanced` | map | all but `client` | read | see next table |
-| `ops` | map | `client`, `service`, `ws_gateway` | read (client, service); checked (ws_gateway) | client: op → share; otherwise op → step list (below) |
+| `ops` | map | `client`, `service`, `ws_gateway` | read | client: op → share; otherwise op → step list (below; a `ws_gateway`'s message ops fanned out, see [`ws_gateway`](#ws_gateway)) |
 | `cost` | map op → number | `service`, `cache`, `sql_db` | read | **new in v1.2**: the capacity units one request of that op consumes; an op not listed costs 1. Each value is a positive finite number (`cost 'write' must be a positive finite number`, also for a quoted `"3"`) of at most 1e6 (`cost 'write' must be at most 1e6`); anything but a map is `cost must be a map of op to units`, a bare `cost:` is `cost must not be empty (write {} for none)`. `capacity` is then a rate of units: demand is `Σ rate_op × cost_op`, and the node's demand, drops and backlog are reported in units. What it forwards stays requests (a drained `write` of cost 3 is one `write` downstream). A `sql_db` charges its write ops 5 unless `cost` lists them (see [`sql_db`](#sql_db)). A load balancer and a rate limiter charge 1 per request, and `cost` is not a key of theirs. A `worker_pool`'s `cost` is a different key, a duration per job (see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
 | `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | read (cache, blob_store, worker_pool); checked (others) | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step; a cache's `then` steps run (an unconditional one carries everything the cache answered, an `on: miss` one `1 − h` of the reads and none of the writes; see [`then` steps on a cache](#then-steps-on-a-cache)), and `explain`'s paper load follows them the same way; a `blob_store`'s run as asynchronous event notifications, one per write it serves and none per read (see [Node types](#node-types)); a `worker_pool`'s fire for every job it drains (see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
 
@@ -380,7 +384,7 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `worker_pool` | `consumes` (queue node id, required), `workers`, `cost` (duration per job), `then`, `retries`, `retry_after` | `consumes`, `workers`, `cost` and `then` read and run (phase 2c), same section: the steps fire for every job it drains, `on: miss` and `on: failure` refused; `retries` and `retry_after` read and run (phase 3), same section: the jobs whose call to an external sink failed go back on the pool's queue, read again by this pool only, and the last attempt's failures are dead letters (the `dead_letter_rate` SLO) |
 | `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every **write** the store serves (an op in its `write_ops`; not one it drops) sends `factor` requests of the step's op to its target, and a read sends nothing (S3 notifies on ObjectCreated and ObjectRemoved, never on a GET: 1000 views/s of a video start no transcode; notifying on reads is phase 3). They are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. A step `on: miss` (`node 'store': a blob store's then steps fire for every write it stores (on: miss needs a cache)`) or `on: failure` (`... (on: failure: an event reports no failure before phase 3)`) is refused, and so is any `mode` (`node 'store': a blob store's then steps are event notifications nobody waits for (mode orders the calls a request waits for)`); an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, the delivery delay (an event arrives after the link's latency), failed notifications |
 | `search_index` | `build_interval` (positive duration) | read and run (phase 2c), see [`search_index`](#search_index); `build_interval` printed, not modelled |
-| `ws_gateway` | `max_connections`, `heartbeat` (duration), `fanout` (avg recipients per message), `ops` | `ops` checked as step lists; others ignored; phase 3 |
+| `ws_gateway` | `max_connections` (count), `heartbeat` (duration), `fanout` (avg recipients per message, ≥ 1), `connections` (count: a fixed level), `session` (duration), `reconnect_within` (duration), `ops` | read and run (phase 3), see [`ws_gateway`](#ws_gateway); `reconnect_within` printed and stored for the reconnect storm (phase 3 Task 15) |
 | `service_discovery` | `failover` (duration) | ignored; phase 3 |
 | `id_generator` | `algorithm` `snowflake|ticket_server|uuid` (required) | read and run (phase 2b), see [`id_generator`](#id_generator) |
 | `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) | read and run (phase 2c): a third party's API (ch. 10's APNs, FCM, SMS and e-mail providers), a leaf queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) whose served requests fail at `failure_rate` f (default 0; outside [0, 1]: `node 's': failure_rate must be between 0 and 1`): `dropped += f × served`, `drain = (1 − f) × served`, so 500/s at f = 0.02 is answered 490/s and the failures count in the node's drop rate, never as rejections. `politeness` (a positive rate) is printed by `explain` as `politeness=1/s (not modelled: phase 3)`: it needs per-host state. `then` and `ops` stay refused; a client's `retries` and a [worker pool's](#message_queue-and-worker_pool) send a failure again (the sink's drop rate leaves out the share of its drops that came from retrying pools) |
@@ -927,6 +931,62 @@ duration, `build_interval: 168h`) is stored and printed by `explain` as
 freshness of its answers between rebuilds are ignored. `ops` stays refused: an index answers a
 query and calls nobody.
 
+### `ws_gateway`
+
+Book ch. 12, "Design a chat system" (phase 3 spec §8.2): the **stateful** chat servers every
+online user keeps one websocket open to, which relay messages, carry the presence heartbeats and
+push messages to their recipients; and ch. 15's notification long polls (google-drive). A request
+leaves a node once served; a connection **stays**, so a gateway holds a **level** C of open
+connections, not a queue of work:
+
+    C(k+1) = min(C(k) + (connects − C(k) / session) × dt, cap)       one Euler step per step
+
+`connects` are the requests of the clients' op named **`connect`** that reach the gateway (its
+share of the client's rate, directly or through a load balancer) and that its queue served;
+each open connection ends at rate `1 / session`, so C is a first-order lag that rises from 0
+(`C(t) = λ × session × (1 − e^(−t / session))`, 63 % of the way after one session) to the fixed
+point **`C* = connect rate × session`** (Little's law: 100 connects/s that stay 1000 s hold 100k
+connections), which `estimate` reports. The record of a step holds the level the step **started**
+with (0 at the first step). The keys:
+
+| key | type | meaning |
+|---|---|---|
+| `max_connections` | count (`100k`, `2M`) | the connections one replica holds at most; the **cap** is `max_connections × replicas`. A connect that would take the level past it is **refused**: a rejection (`rejected_per_s`, the node table's `rejected`), not a drop, and not answered, so the client's `connect` is answered for the ones that got in (at the cap: `connects − cap / session`, 50 of 100 a second at a cap of 50k and a session of 1000 s). Absent: no cap. `node 'gw': max_connections must be a positive integer` |
+| `heartbeat` | positive duration | every open connection pings this often, so the gateway serves **`C / heartbeat`** pings a second on its `heartbeat` op, added to what the clients send under that name, and its `heartbeat` steps (to a presence service) carry them on: 100k connections at the book's 5 s are 20k/s. Absent: no heartbeat load. `node 'gw': heartbeat must be positive` |
+| `fanout` | number ≥ 1 | the average recipients of a message: every step of a **message op** (every op but `connect`, `heartbeat` and `deliver`) sends `fanout` × its own `factor` requests (1.4: 100 sends/s are 140/s to the step's target). `deliver` is terminal (pushed over the open connection: write `deliver: []`). Absent: 1. `node 'gw': fanout must be at least 1` (also for 0), `node 'gw': fanout must be at most 1e6` |
+| `connections` | count | a **fixed** level, for a gateway no client connects to (google-drive's 2M long polls, held by devices nobody here simulates): C is that number on every step, with no connects, disconnects or refusals; only its heartbeats load anything. `node 'gw': connections must be a positive integer` (also for `1.5`) |
+| `session` | positive duration | how long a user stays connected on average. Absent: **30 minutes, chosen, not from the book** (ch. 12 never says how long a connection lasts; half an hour is a typical mobile chat session). `node 'gw': session must be positive` |
+| `reconnect_within` | positive duration | how long the users of a fallen gateway take to come back. Absent: **30 seconds, chosen, not from the book** (a few of ch. 12's 5 s heartbeats of a client's backoff). Stored and printed for the reconnect storm of a `node_down` (phase 3 Task 15); nothing reads it yet. `node 'gw': reconnect_within must be positive` |
+
+`connections`, `session` and `reconnect_within` on any other type are refused like every key
+outside its row (`node 'svc': key 'session' is not valid for type 'service'`). The loader does not
+decide whether a `connect` op reaches a gateway, which is the graph's fact: `run` and `estimate`
+refuse a gateway with **neither** level (`node 'gw': a ws_gateway needs a client op named 'connect'
+or a fixed 'connections'`) or with **both** (`node 'gw': a ws_gateway takes a 'connect' op or a
+fixed 'connections', not both`), while `validate` and `explain` take it.
+
+Its queue is the gateway relaying frames: the type's 50k/s and 100 µs unless stated (the phase 3
+plan said 10k/s and 0.5 ms; the numbers the type had since phase 1 were kept), and its demand is
+every request that reaches it: connects, messages, deliveries and heartbeats. A fault derates it as
+any node's queue; the reconnect storm after a `node_down` is phase 3 Task 15.
+
+`explain` ends the gateway's line with its level, heartbeat load and cap:
+`  connections: C*=100k (connect 100/s × session 16.7m), heartbeat 20k/s, cap 200k` (the connect
+rate the clients' peak `connect` that reaches it; `session 30m (default)` when left out; `= 100k,
+capped` after a fixed point the cap holds below it), `  connections: 2M (fixed), heartbeat
+33.33k/s, cap 2M` for a fixed level, and says so for a gateway `run` refuses. Its checks count the
+heartbeats in the gateway's and in its presence service's paper load, and the fan-out on the
+message steps' targets.
+
+`run`'s node table gets a **`connections`** column after `peak_lag` when the scenario has a
+gateway (the level at the end of the run on the gateway's row, `-` elsewhere); JSON's node objects
+get `connections` (the level at the end) and `connections_peak` (the highest of any observed step),
+`null` off gateways, also only when the scenario has one; the series' last column is
+`connections` (below). Ignored: the memory a connection costs (the cap stands for it), which server
+a user is on (the service-discovery hand-off of ch. 12, phase 3 Task 13: every replica holds an
+equal share), the reconnect storm (Task 15), users who vanish without a disconnect (every session
+ends at rate `1 / session`) and the bytes of a frame.
+
 ### `message_queue` and `worker_pool`
 
 Book ch. 1 ("Message queue"), the transcoding queue of ch. 14 and the notification queue of
@@ -1305,7 +1365,9 @@ for other nodes, and (phase 2c) `peak_queue_lag_s`, a message queue's peak lag i
 `dead_lettered_per_s`, a worker pool's [dead letters](#message_queue-and-worker_pool), `null` for
 other nodes. When some pool has `retries`, the node table has a `dead_lettered/s` column right
 after `dropped` (the pool's mean rate, `-` on every other row); without one the table is the one
-it always was. Each SLO object has a `note`: `null`, or why the verdict is not `observed`
+it always was. Likewise a scenario with a [`ws_gateway`](#ws_gateway) gets a `connections` column
+after `peak_lag` and the JSON keys `connections` and `connections_peak`; a gateway's refused
+connects are its `rejected`. Each SLO object has a `note`: `null`, or why the verdict is not `observed`
 against `max` alone (a replica that falls behind without bound).
 
 **`run --report json` (and `estimate --report json`), key by key.** Every figure is over the
@@ -1325,6 +1387,7 @@ the observed seconds (`steps` × `step`).
 | `nodes[]` | `red_s`, `unavailable` | seconds spent red; `true` when the node's latency was infinite in some step |
 | `nodes[]` | `staleness_s`, `replication_dropped_per_s`, `committed_writes_per_s` | seconds; writes per second per replica; writes per second per shard (a `sql_db` only, else `null`) |
 | `nodes[]` | `peak_queue_lag_s` | seconds (a `message_queue` only, else `null`) |
+| `nodes[]` | `connections`, `connections_peak` | open connections (a level, not a rate): at the end of the run, and the highest of any observed step (phase 3: a `ws_gateway` only, else `null`; both keys only when the scenario has a gateway) |
 | `links[]` | `name` | `from->to` as written |
 | `links[]` | `demand_per_s`, `drain_per_s`, `dropped_per_s` | MB per second, **time-averaged rates** |
 | `links[]` | `backlog`, `peak_backlog` | MB, time-averaged and highest |
@@ -1354,13 +1417,15 @@ the node's own numbers are in MB: the table's `dropped`, JSON's `dropped`, and t
 rates, each answered at its last byte (a write) or its first megabyte (a read).
 
 `run --series` writes one CSV row per node per step:
-`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,latency_ms,zone,queue_lag_s`
+`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,latency_ms,zone,queue_lag_s,connections`
 (`rejected_per_s` new in v1.2, `demand_per_s` and `drain_per_s` in phase 2b, `queue_lag_s` in
 phase 2c: a message queue's lag in seconds, empty on every other row; `dead_lettered_per_s` in
 phase 3: a worker pool's dead letters per second, 0 without `retries`, empty on every other row and
 outside the balance below, since the pool drained those jobs; demand, drain, drops and backlog in
 capacity units, megabytes at a byte-sized node; a sink's `drops_per_s` keeps the failures a pool
-retries; a client row has zeros, zone `none`, and no dead letters and no lag), then one row per [bandwidth link](#links) and step, its `from->to` in the `node`
+retries; `connections` in phase 3: a [`ws_gateway`](#ws_gateway)'s level of open connections at
+the start of the step, 6 significant digits, empty on every other row; a client row has zeros, zone
+`none`, and no dead letters, no lag and no connections), then one row per [bandwidth link](#links) and step, its `from->to` in the `node`
 column, in megabytes, `rejected_per_s` 0 and `latency_ms` a request's wait plus its answer time
 on the wire (a write's whole serialisation, any other op's first megabyte; with no request in the
 step, the ops the link carries weighed alike).

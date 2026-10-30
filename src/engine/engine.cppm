@@ -422,6 +422,8 @@ class Simulation {
   void record_queue_lags(std::span<NodeSample> samples) const;
   void record_retry_flows(std::span<NodeSample> samples) const;
   void receive(std::size_t index, Mode mode);
+  static void add_heartbeats(Node& node);
+  static void record_level(const auto& behaviour, NodeSample& sample);
   void keep_retries_in_their_group(std::size_t queue, behaviours::Routed& routed) const;
   [[nodiscard]] flow::Flow republished_by_others(std::size_t queue, std::size_t group) const;
   // Any queueing node (service, load balancer, rate limiter): runs its queues and returns
@@ -551,6 +553,28 @@ namespace {
 [[nodiscard]] std::optional<std::string> cdn_not_runnable(const model::NodeSpec& spec) {
   if (spec.hit_ratio && spec.hit_ratio->che && !spec.keys) {
     return "node '" + spec.id + "': hit_ratio che needs keys (the cdn's size in objects)";
+  }
+  return std::nullopt;
+}
+
+// Why a ws_gateway cannot run, if it cannot (phase 3 spec §8.2; behaviours::WsGatewayBehaviour): a
+// gateway's state is its level of open connections, which either the clients' `connect` op fills
+// (an op of that name that reaches the gateway: Graph's arriving ops, directly or through a load
+// balancer) or a fixed `connections` states. With neither the level has no source; with both it
+// has two, which would contradict each other. Simulation::create's, not the loader's: whether a
+// `connect` reaches the gateway is known only once the graph is built, and explain still describes
+// such a gateway (the shipped chat-system and google-drive had neither before their own tasks).
+[[nodiscard]] std::optional<std::string> gateway_not_runnable(const graph::Graph& g,
+                                                              std::size_t node) {
+  const auto& spec = g.nodes()[node].spec;
+  if (spec.type != model::NodeType::ws_gateway) return std::nullopt;
+  const bool connected = std::ranges::contains(g.arriving_ops(node), model::connect_op);
+  const std::string name = "node '" + spec.id + "': a ws_gateway ";
+  if (!connected && !spec.connections) {
+    return name + "needs a client op named 'connect' or a fixed 'connections'";
+  }
+  if (connected && spec.connections) {
+    return name + "takes a 'connect' op or a fixed 'connections', not both";
   }
   return std::nullopt;
 }
@@ -912,11 +936,12 @@ flow::Flow DelayLine::pop() {
 
 // Two passes over the nodes, in file order: first every node's TYPE, then what a node of a
 // simulated type still lacks (not_runnable_yet: a cache without a hit ratio, a che CDN without a
-// `keys` size). So a type the engine has no model for is named before a node that only lacks a
-// number: google-drive is refused at its ws_gateway, long_poll, the first type it has no model of.
-// The message names the phase that plans a model for the type: phase 3 for each of the four left
-// (ws_gateway, service_discovery, notification_fanout, frontier), the types whose row in
-// model::node_type_table does not say `runs` (model::simulated).
+// `keys` size; gateway_not_runnable: a ws_gateway with no level or two). So a type the engine has
+// no model for is named before a node that only lacks a number: chat-system is refused at its
+// service_discovery before its gateway is looked at. The message names the phase that plans a
+// model for the type: phase 3 for each of the three left (service_discovery, notification_fanout,
+// frontier), the types whose row in model::node_type_table does not say `runs`
+// (model::simulated).
 std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Graph& g) {
   return create(g, g.scenario().seed);
 }
@@ -931,10 +956,10 @@ std::expected<Simulation, graph::EngineError> Simulation::create(const graph::Gr
         "node '" + node.spec.id + "' has type '" + std::string{model::to_string(node.spec.type)} +
         "', which run/estimate do not support yet (phase 3)"}};
   }
-  for (const auto& node : g.nodes()) {
-    if (auto refused = not_runnable_yet(node.spec)) {
-      return std::unexpected{graph::EngineError{std::move(*refused)}};
-    }
+  for (std::size_t node = 0; node < g.nodes().size(); ++node) {
+    auto refused = not_runnable_yet(g.nodes()[node].spec);
+    if (!refused) refused = gateway_not_runnable(g, node);
+    if (refused) return std::unexpected{graph::EngineError{std::move(*refused)}};
   }
   if (auto refused = fault_not_runnable(g)) {
     return std::unexpected{graph::EngineError{std::move(*refused)}};
@@ -1078,9 +1103,14 @@ Simulation::Node Simulation::make_node(const graph::Graph& g, std::size_t index,
     case model::NodeType::search_index:
     case model::NodeType::id_generator:
       return make_server(behaviours::ServiceBehaviour{g, index}, resolved);
-    // The four types with no model yet (phase 3): create() refused every scenario that has one
-    // (model::simulated), so no Simulation is ever constructed over them.
+    // A websocket gateway's queue relays frames (the type's 50k/s at 100 us, or the scenario's
+    // numbers: the book's chat servers state 10k/s at 0.5 ms), heartbeats included (receive adds
+    // them); its behaviour holds the level of open connections around a service's steps
+    // (behaviours::WsGatewayBehaviour).
     case model::NodeType::ws_gateway:
+      return make_server(behaviours::WsGatewayBehaviour{g, index}, resolved);
+    // The three types with no model yet (phase 3): create() refused every scenario that has one
+    // (model::simulated), so no Simulation is ever constructed over them.
     case model::NodeType::service_discovery:
     case model::NodeType::notification_fanout:
     case model::NodeType::frontier:
@@ -1489,6 +1519,11 @@ Simulation Simulation::settling_copy() const {
     if (auto* limiter = std::get_if<behaviours::RateLimiterBehaviour>(&node.behaviour)) {
       limiter->use_long_run_rate();
     }
+    // Every pass is the same instant, so a gateway's level jumps to its fixed point, connect rate
+    // × session capped, instead of taking an Euler step per pass (WsGatewayBehaviour).
+    if (auto* gateway = std::get_if<behaviours::WsGatewayBehaviour>(&node.behaviour)) {
+      gateway->use_steady_level();
+    }
   }
   scratch.links_.assign(links_.size(), Link{.line = DelayLine{0}});
   for (std::size_t i = 0; i < links_.size(); ++i) {
@@ -1684,8 +1719,9 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
                          // Overload resolution prefers the non-template ClientBehaviour&
                          // lambda for a client, so this one sees only servers.
                          [&](auto& server) {
-                           return server.route(serve(index, dt, mode, condition, samples[index]),
-                                               now, dt, delivered_last_step);
+                           flow::Flow drained = serve(index, dt, mode, condition, samples[index]);
+                           record_level(server, samples[index]);  // before route moves it
+                           return server.route(drained, now, dt, delivered_last_step);
                          }},
         nodes_[index].behaviour);
     keep_retries_in_their_group(index, routed);
@@ -1719,9 +1755,13 @@ void Simulation::account_rejections(std::size_t index, const behaviours::Routed&
     sample.rejected_per_s += std::exchange(sample.dropped_per_s, 0.0);
   }
   // A leaky bucket's overflow is in `dropped` (its queue's) and not in `rejected` (its
-  // behaviour refuses nothing): the sum counts it once.
+  // behaviour refuses nothing): the sum counts it once. A ws_gateway refuses connects only, so its
+  // rejections are no share of every op: its behaviour applies them to the connects alone
+  // (WsGatewayBehaviour::delivered), and the node's own share counts its drops.
   flow::Flow lost = node.dropped;
-  lost += routed.rejected;
+  if (!std::holds_alternative<behaviours::WsGatewayBehaviour>(node.behaviour)) {
+    lost += routed.rejected;
+  }
   if (!node.replication) {
     node.passed = kept_share(lost, node.inflow);
     return;
@@ -1730,6 +1770,28 @@ void Simulation::account_rejections(std::size_t index, const behaviours::Routed&
   const auto [arrived_reads, arrived_writes] = split_writes(node.inflow, node.behaviour);
   node.passed = kept_share(lost_reads, arrived_reads);
   node.passed_writes = kept_share(lost_writes, arrived_writes);
+}
+
+// A ws_gateway's heartbeats (behaviours::WsGatewayBehaviour): its open connections ping C /
+// heartbeat times a second, C the level this step starts with, and those pings arrive at the
+// gateway like any request of its `heartbeat` op, added to what the clients send under that name.
+// So they load its queue (its demand and rho count them) and go on along its `heartbeat` steps
+// (to a presence service) as the clients' do. Nothing on any other node, and nothing on a
+// gateway that states no heartbeat.
+void Simulation::add_heartbeats(Node& node) {
+  const auto* gateway = std::get_if<behaviours::WsGatewayBehaviour>(&node.behaviour);
+  if (gateway == nullptr) return;
+  if (const double beats = gateway->heartbeats_per_s(); beats > 0.0) {
+    node.inflow.add(model::heartbeat_op, Rate{beats});
+  }
+}
+
+// A ws_gateway's level at the start of the step (NodeSample::connections), read after serve reset
+// the sample and before route takes the level's Euler step. A requires-expression as a compile-time
+// condition (see megabyte_service_of): only a gateway has a level, and every other node's
+// `connections` stays empty.
+void Simulation::record_level(const auto& behaviour, NodeSample& sample) {
+  if constexpr (requires { behaviour.connections(); }) sample.connections = behaviour.connections();
 }
 
 // In settle mode the links have no delay: in the long run a link delivers exactly what
@@ -1751,6 +1813,7 @@ void Simulation::receive(std::size_t index, Mode mode) {
     }
     node.inflow += arrived;
   }
+  add_heartbeats(node);
   node.republished_per_s = 0.0;
   for (const std::size_t pool : node.consumer_groups) {
     const auto& group = std::get<behaviours::WorkerPoolBehaviour>(nodes_[pool].behaviour);

@@ -74,6 +74,17 @@ simsys::graph::Graph build_or_fail(const simsys::model::Scenario& s) {
   return std::move(*built);
 }
 
+// What Simulation::create says of a websocket gateway that neither a `connect` op reaches nor a
+// fixed `connections` fills (phase 3 Task 14): google-drive's long_poll until its own task.
+constexpr std::string_view gateway_without_level =
+    "a ws_gateway needs a client op named 'connect' or a fixed 'connections'";
+
+// Does Simulation::create's refusal wait for a later task of phase 3: a node type it has no model
+// of yet ("... (phase 3)"), or a gateway whose level the scenario does not state yet?
+bool waits_for_a_later_task(const std::string& refusal) {
+  return refusal.contains("phase 3") || refusal.contains(gateway_without_level);
+}
+
 }  // namespace
 
 TEST_CASE("every shipped scenario validates", "[scenario]") {
@@ -105,16 +116,18 @@ TEST_CASE("every shipped scenario resolves into a graph that explain can print",
 
 // Which scenarios run grows with each phase, so the test does not name them: a scenario whose node
 // types the engine does not simulate yet is refused by Simulation::create with a message naming the
-// phase ("... do not support yet (phase 3)") and is skipped; every other one is run to its end and
-// must meet its own SLOs. A scenario the engine refuses for any other reason is a failure, not a
-// skip. The time limit's point is "no shipped scenario takes minutes", not a benchmark: each one
-// run here costs at most 0.6 s of CPU in Debug and 0.04 s in Release (measured 2026-10-29), but
-// for the two with faults (kv-store, consistent-hashing), which step a fault-free twin beside the
-// run (engine::FaultRecord's header) and cost more: a whole Debug `simsys run` of kv-store, its
-// twin and its fault block included, takes 2.9 s of CPU (measured 2026-10-30). It is
-// CPU time, not wall-clock time: under `ctest -j` on a loaded machine this test took 4.61 s of wall
-// clock in Debug and its wall-clock limit was flaky, while the CPU time a single-threaded run
-// spends is what the scenario costs, whoever else shares the machine.
+// phase ("... do not support yet (phase 3)") and is skipped; so is one whose websocket gateway
+// states no level yet (google-drive until its own task gives long_poll `connections: 2M`: a
+// gateway is simulated since phase 3 Task 14, but needs a `connect` op or a fixed level); every
+// other one is run to its end and must meet its own SLOs. A scenario the engine refuses for any
+// other reason is a failure, not a skip. The time limit's point is "no shipped scenario takes
+// minutes", not a benchmark: each one run here costs at most 0.6 s of CPU in Debug and 0.04 s in
+// Release (measured 2026-10-29), but for the two with faults (kv-store, consistent-hashing), which
+// step a fault-free twin beside the run (engine::FaultRecord's header) and cost more: a whole Debug
+// `simsys run` of kv-store, its twin and its fault block included, takes 2.9 s of CPU (measured
+// 2026-10-30). It is CPU time, not wall-clock time: under `ctest -j` on a loaded machine this test
+// took 4.61 s of wall clock in Debug and its wall-clock limit was flaky, while the CPU time a
+// single-threaded run spends is what the scenario costs, whoever else shares the machine.
 TEST_CASE(
     "scenarios whose node types all exist run in under five seconds of CPU and pass their "
     "SLOs",
@@ -128,8 +141,8 @@ TEST_CASE(
     const auto g = build_or_fail(s);
     auto created = simsys::engine::Simulation::create(g);
     if (!created) {
-      REQUIRE(created.error().message.find("phase 3") != std::string::npos);
-      continue;  // a node type of a later phase: nothing to run yet
+      REQUIRE(waits_for_a_later_task(created.error().message));
+      continue;  // a node type, or a gateway's level, of a later task: nothing to run yet
     }
     // Two runnable scenarios are checked by their own tests below instead, each for a stated
     // reason:
@@ -237,9 +250,9 @@ TEST_CASE("the consistent-hashing lab under write_through needs set in db's writ
 TEST_CASE("book scenarios are refused by run until their node types exist", "[scenario]") {
   // Phase 1 runs only client and service nodes; the book scenarios use more. The message must
   // name the node and the phase so a student knows what is missing, not that the file is wrong.
-  // chat-system is the one used here: it needs a websocket gateway, a queue and a worker pool,
-  // none of which exist yet. (url-shortener used to stand here; with the id generator, the last
-  // node type it lacked, it runs: see the pinned list below.)
+  // chat-system is the one used here: it needs a service_discovery, which phase 3 has yet to model
+  // (its websocket gateway, queue and worker pool run since). (url-shortener used to stand here;
+  // with the id generator, the last node type it lacked, it runs: see the pinned list below.)
   const auto s =
       load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/chat-system/scenario.yaml");
   const auto g = build_or_fail(s);
@@ -256,11 +269,12 @@ TEST_CASE("book scenarios are refused by run until their node types exist", "[sc
 // database, message queues, worker pools) is the first book scenario of 2c that runs; the
 // kv_cluster adds the kv-store lab and the book's news feed (its graph_db is the one node type it
 // lacked); the search index (a service with no steps) adds the book's search autocomplete. Every
-// other lab and book scenario still needs a later task's node types (google-drive's ws_gateway,
-// chat-system's service_discovery, ...), so the set of runnable scenarios is pinned by name: a node
+// other lab and book scenario still needs a later task (google-drive's gateway level, chat-system's
+// service_discovery, ...), so the set of runnable scenarios is pinned by name: a node
 // type added later makes this fail and forces whoever adds it to update the list on purpose. A
-// scenario counts as runnable when the node-type table says every type in it runs
-// (model::simulated), and Simulation::create must agree: it refuses exactly the others.
+// scenario counts as runnable when Simulation::create accepts it: it refuses every scenario with a
+// type the node-type table says does not run (model::simulated), and, since phase 3 Task 14
+// simulates the ws_gateway, google-drive too, whose gateway states no level until its own task.
 TEST_CASE(
     "exactly ten shipped scenarios use only simulated node types: chain, hello, "
     "consistent-hashing, kv-store, news-feed, rate-limiter, search-autocomplete, unique-id, "
@@ -275,8 +289,14 @@ TEST_CASE(
     const bool every_type_runs = std::ranges::all_of(
         s.nodes, [](const auto& node) { return simsys::model::simulated(node.type); });
     const auto g = build_or_fail(s);
-    REQUIRE(simsys::engine::Simulation::create(g).has_value() == every_type_runs);
-    if (every_type_runs) runnable.push_back(s.name);
+    const auto created = simsys::engine::Simulation::create(g);
+    if (!every_type_runs) REQUIRE_FALSE(created.has_value());
+    // Every type simulated, yet refused: only for a websocket gateway without a level (google-drive
+    // until its own task states `connections: 2M`; the scenario test of google-drive pins it).
+    if (every_type_runs && !created) {
+      REQUIRE(created.error().message.contains(gateway_without_level));
+    }
+    if (created) runnable.push_back(s.name);
   }
   std::ranges::sort(runnable);
   REQUIRE(runnable == std::vector<std::string>{"chain", "hello", "lab-consistent-hashing",

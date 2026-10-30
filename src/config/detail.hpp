@@ -107,7 +107,8 @@ inline constexpr std::array<OwnKeys, model::node_type_names.size()> own_keys_by_
     {model::NodeType::worker_pool, "consumes workers cost then retries retry_after"},
     {model::NodeType::blob_store, "then write_ops"},
     {model::NodeType::search_index, "build_interval"},
-    {model::NodeType::ws_gateway, "max_connections heartbeat fanout ops"},
+    {model::NodeType::ws_gateway,
+     "max_connections heartbeat fanout ops connections session reconnect_within"},
     {model::NodeType::service_discovery, "failover"},
     {model::NodeType::id_generator, "algorithm"},
     {model::NodeType::external_sink, "failure_rate politeness"},
@@ -195,7 +196,7 @@ inline constexpr std::string_view advanced_integer_keys = "concurrency queue_lim
 inline constexpr std::string_view top_level_integer_keys = "version seed";
 inline constexpr std::string_view node_integer_keys =
     "replicas vnodes burst shards pool partitions workers nodes replication write_quorum "
-    "read_quorum keys retries";
+    "read_quorum keys retries max_connections connections";
 inline constexpr std::string_view client_keys_integer_keys = "space uniform";
 
 // How a scenario writes an empty list or map, for the messages about a key left without a
