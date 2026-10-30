@@ -772,6 +772,20 @@ struct QueueProvenance {
 // connect rate it reads).
 [[nodiscard]] std::string gateway_summary(const graph::Graph& g, std::size_t node);
 
+// A notification fanout's model (phase 3 spec §8.3, book ch. 10): "  dedup=2% channels:
+// android=android_q email=email_q ios=ios_q sms=sms_q", the share its dedup step drops (always
+// printed: 0% is a fanout that drops none) and its channels, each name with the queue behind it,
+// in name order. The shares each channel gets are its `then` steps' factors, which the paper load
+// below applies (and the `then` targets' check lines show).
+[[nodiscard]] std::string notification_fanout_summary(const model::NodeSpec& spec) {
+  if (spec.type != model::NodeType::notification_fanout) return {};
+  std::string text = "  dedup=" + percent(spec.dedup);
+  if (spec.channels.empty()) return text;
+  text += " channels:";
+  for (const auto& [channel, queue] : spec.channels) text += " " + channel + "=" + queue;
+  return text;
+}
+
 [[nodiscard]] std::string explain_nodes(const graph::Graph& g) {
   std::vector<Row> rows;
   for (std::size_t i = 0; i < g.nodes().size(); ++i) {
@@ -787,7 +801,8 @@ struct QueueProvenance {
                        database_summary(node) + id_generator_summary(node.spec) +
                        message_queue_summary(node.spec) + worker_pool_summary(node) +
                        external_sink_summary(node.spec) + search_index_summary(node.spec) +
-                       gateway_summary(g, i) + discovery_summary(node.spec)}});
+                       gateway_summary(g, i) + discovery_summary(node.spec) +
+                       notification_fanout_summary(node.spec)}});
   }
   return "nodes:\n" + aligned(rows, Align::all_left);
 }
@@ -1030,13 +1045,15 @@ void forward_to_backend(const graph::Graph& g, std::size_t from, const OpLoad& a
   }
 }
 
-// Forwards along a cache's, a blob store's or a worker pool's `then` steps (what happens after it
-// answers: ch. 13's browser cache sends its misses on to the servers; an upload's event starts
-// transcoding; a transcoder writes its renditions): rate × factor × Graph::then_fraction, the whole
-// flow for an unconditional step (at a blob store, every write and no read; at a pool, every job
-// whatever its op) and the misses (1 − h of a read) for an `on: miss` one. A share of 0 sends
-// nothing, not a 0/s entry. The same multiplications as CacheBehaviour::route (spec §18 entry 5),
-// BlobStoreBehaviour::route and WorkerPoolBehaviour::route.
+// Forwards along a cache's, a blob store's, a worker pool's or a notification fanout's `then` steps
+// (what happens after it answers: ch. 13's browser cache sends its misses on to the servers; an
+// upload's event starts transcoding; a transcoder writes its renditions; ch. 10's fanout publishes
+// a notification to each of its channels): rate × factor × Graph::then_fraction, the whole flow for
+// an unconditional step (at a blob store, every write and no read; at a pool, every job whatever
+// its op; at a fanout, the 1 − dedup its dedup step lets through) and the misses (1 − h of a read)
+// for an `on: miss` one. A share of 0 sends nothing, not a 0/s entry. The same multiplications as
+// CacheBehaviour::route (spec §18 entry 5), BlobStoreBehaviour::route, WorkerPoolBehaviour::route
+// and NotificationFanoutBehaviour::route.
 void forward_then_steps(const graph::Graph& g, std::size_t from, const OpLoad& arriving,
                         std::vector<OpLoad>& load, std::vector<OpLoad>& fed_back) {
   for (const model::Step& step : g.nodes()[from].spec.then) {
@@ -1133,7 +1150,11 @@ void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_
   // red; what the engine forwards is what the pool drains, at most its capacity). The paper load
   // answers "can this ever fit", not "what goes through". A pool with retries drains each job
   // A(f, n) times (add_pool_retries).
-  if (spec.type == model::NodeType::blob_store || spec.type == model::NodeType::worker_pool) {
+  // A notification fanout publishes each notification its dedup step lets through, rate × (1 −
+  // dedup) × factor per step (phase 3 spec §8.3; NotificationFanoutBehaviour::route), and is
+  // offered every notification, duplicates included (finding one is work too).
+  if (spec.type == model::NodeType::blob_store || spec.type == model::NodeType::worker_pool ||
+      spec.type == model::NodeType::notification_fanout) {
     if (spec.type == model::NodeType::worker_pool) add_pool_retries(g, from, load);
     const OpLoad arriving = load[from];  // a copy: a step may target `from` itself
     forward_then_steps(g, from, arriving, load, fed_back);
@@ -1538,10 +1559,10 @@ constexpr std::string_view unknown_hit_ratio_note =
 // The paper load (paper_pass, forward_steps) forwards from a client's routes, along a service's (or
 // any node's) `ops` steps, through load balancers and rate limiters over their links
 // (graph::forwards_by_link), from caches and CDNs on their misses (graph::hits_or_misses), along a
-// blob store's `then` steps, its event notifications, and from a message queue into each of its
-// consumer groups and along a worker pool's `then` steps. It does not follow the `then` of a
-// notification fan-out or a URL frontier (types without a phase yet). A node fed through one of
-// those misses that part of its load: with nothing else it shows 0 offered load, a missing number,
+// blob store's `then` steps, its event notifications, from a message queue into each of its
+// consumer groups and along a worker pool's and a notification fanout's `then` steps. It does not
+// follow the `then` of a URL frontier (a type without a model yet). A node fed through one
+// misses that part of its load: with nothing else it shows 0 offered load, a missing number,
 // not a zero, and a verdict on it ("0%, green") would read as "this tier is idle"; with some load
 // from elsewhere its percentage is a lower bound, and a green or yellow verdict on it would read as
 // "this tier has room" (a node fed 1/s by a client and 10k/s through a blob store once printed
@@ -1551,7 +1572,7 @@ constexpr std::string_view unknown_hit_ratio_note =
 // or nothing for a type it follows (or that sends nothing on).
 [[nodiscard]] std::optional<std::string_view> unfollowed_until(model::NodeType type) {
   using enum model::NodeType;  // C++20, as in provenance
-  if (type == notification_fanout || type == frontier) return "not modelled yet";
+  if (type == frontier) return "not modelled yet";
   return std::nullopt;
 }
 
@@ -1589,8 +1610,9 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 }
 
 // Per node, the types on its way in whose onward flow the paper load does not follow, each once,
-// nearest first: the web crawler's dns, behind the frontier and the downloader, has [frontier];
-// a node fed by a frontier that a notification fan-out feeds, [frontier, notification_fanout].
+// nearest first: the web crawler's dns, behind the frontier and the downloader, has [frontier].
+// (Two such types, as a notification fan-out feeding a frontier was until the fan-out got its
+// model, give [frontier, notification_fanout]: the list holds as many as there are.)
 // Empty for a node whose load the paper pass has in full. A node passes on its own type (if it is
 // such a type) and everything on its way, so the mark crosses ordinary nodes too (the web
 // crawler's parser, behind the downloader). A node in a loop through such a type has it on its way
@@ -1625,9 +1647,9 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 }
 
 // "load not propagated: frontier is not modelled yet)" or, with several types, grouped by how long
-// each stays unfollowed, in the order they come: "... frontier and notification_fanout are not
-// modelled yet)". (Every type left unfollowed now waits for the same thing, phase 3, so there is
-// one group; the grouping will hold the next phase's types apart.)
+// each stays unfollowed, in the order they come ("... a and b are not modelled yet)"). (The
+// frontier is the one type left unfollowed now; the grouping will hold the next phase's types
+// apart.)
 [[nodiscard]] std::string unpropagated_mark(std::span<const model::NodeType> blocked) {
   std::vector<std::pair<std::string_view, std::vector<std::string>>> groups;
   for (const model::NodeType type : blocked) {

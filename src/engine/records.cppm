@@ -165,6 +165,13 @@ struct NodeSample {
   // empty on a node that no failover can reach (no lookup before it, or no node_down of it), so
   // that a fault block can say whether a failover applied (FaultAfter::failover_lost).
   std::optional<double> failover_lost_per_s{};
+  // A notification fanout's duplicates, per second (phase 3 spec §8.3; book ch. 10's dedup step):
+  // the notifications it served this step that its dedup step dropped instead of publishing them,
+  // drain × dedup (behaviours::NotificationFanoutBehaviour). Neither a drop nor a rejection: the
+  // fanout did its work on them and was meant not to send them on, so `dropped_per_s`,
+  // `rejected_per_s` and the balance above do not include them (they are part of `drain`). 0 on a
+  // fanout with `dedup: 0`; empty on every other node, which has no dedup step.
+  std::optional<double> deduplicated_per_s{};
 };
 
 // What a client sees for one op: the rate it offers, the part of it that comes back answered, and

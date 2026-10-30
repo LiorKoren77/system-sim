@@ -4,7 +4,8 @@
 // cache: answer, and pass to its store what its strategy sends there; blob store: answer, and
 // notify along its `then` steps for each write; message queue: append, and copy every message to
 // each consumer group; worker pool: drain its jobs and hand each one on along its `then` steps;
-// external sink: answer, calling nobody, while the engine fails a share of what it served) and
+// external sink: answer, calling nobody, while the engine fails a share of what it served;
+// notification fanout: serve, drop the duplicates and publish the rest along its `then` steps) and
 // how it composes response latency from its own sojourn plus link legs and downstream responses.
 //
 // Latency composes on the reply path. A hop to a downstream node costs two link legs
@@ -335,9 +336,10 @@ struct Block {
 // every failure for ever, with no limit and no backoff: the pool's `retries` is the modelled form.
 // After a step that loses nothing it sends nothing: 1 − 1 = 0.
 // Pattern: Delegation (composition over inheritance) — ServiceBehaviour (its `ops` steps),
-// CacheBehaviour (its store hop and its `then` steps), BlobStoreBehaviour (its events) and
-// WorkerPoolBehaviour (its hand-offs) each hold one HopBlocks, as the forwarding behaviours hold a
-// Forwarding, instead of sharing the arithmetic through a base.
+// CacheBehaviour (its store hop and its `then` steps), BlobStoreBehaviour (its events),
+// WorkerPoolBehaviour (its hand-offs) and NotificationFanoutBehaviour (its publishes) each hold one
+// HopBlocks, as the forwarding behaviours hold a Forwarding, instead of sharing the arithmetic
+// through a base.
 class HopBlocks {
  public:
   // The blocks of `op`, created empty on first use: the owner fills them at construction.
@@ -619,7 +621,9 @@ class HopBlocks {
 
 // Adds to `hops` the blocks of node `self`'s `then` steps for incoming `op`, each taken by the
 // share graph::Graph::then_fraction gives (a cache's, CacheBehaviour; a blob store's events,
-// BlobStoreBehaviour). A worker pool builds its own (WorkerPoolBehaviour): one set for every op.
+// BlobStoreBehaviour; a notification fanout's publishes, 1 − dedup each,
+// NotificationFanoutBehaviour). A worker pool builds its own (WorkerPoolBehaviour): one set for
+// every op.
 void add_then_blocks(const graph::Graph& g, std::size_t self, const std::string& op,
                      HopBlocks& hops);
 
@@ -2116,6 +2120,82 @@ class ExternalSinkBehaviour {
   double failure_rate_{};
 };
 
+// Models: the notification fan-out of System Design Interview (Alex Xu, vol. 1) ch. 10 ("Design a
+// notification system"), the step between the notification servers and the per-channel message
+// queues: each notification is checked against the ones already sent (the book's dedup step,
+// which drops an event id seen before, since a distributed system may deliver it twice), then
+// published once to the queue of every channel it goes out on (iOS, Android, SMS, e-mail), whose
+// workers call the third-party providers, and recorded in the notification log. Phase 3 spec §8.3.
+// Captured: the node is a SERVICE (its own queue, the type's 20k/s at 1 ms, c = 20, or the
+// scenario's numbers) that serves every notification it is routed, duplicates included (finding a
+// duplicate is work too), and whose `then` steps fire for the share the dedup step lets through:
+//   step i is sent   drain × (1 − dedup) × factor_i     (graph::Graph::then_fraction: 1 − dedup)
+//   deduplicated  =  drain × dedup                       (deduplicated_per_s)
+// The factors are the channel mix (a notification goes out on several channels, so they may sum
+// above 1: 0.6 + 0.3 + 0.05 + 0.3 in the book's scenario); a step without one (the log's write)
+// fires once per notification. A duplicate is neither a drop nor a rejection: the fanout answered
+// it (the notification servers' request succeeded) and it was meant not to go out, so it is
+// counted apart, as engine::NodeSample::deduplicated_per_s. The fanout waits for its publishes like
+// a service for its steps (a message queue answers at the append), so its response is its own
+// sojourn plus each step's round trip taken by 1 − dedup of the requests (detail::HopBlocks:
+// conditional_hop per step; the mean is exact, the spread treats each step's skip as its own coin
+// flip, where in truth a duplicate skips all of them together), and a step after a failed one is
+// sent only what survived, as at a service. Ignored: what makes two notifications duplicates and
+// how long the ids are kept (the book's dedup cache with its TTL: the share is a stated number,
+// not derived from the traffic), the cost of the lookup apart from the fanout's service time,
+// per-user settings that turn a channel off (folded into the factors), and ordering.
+class NotificationFanoutBehaviour {
+ public:
+  NotificationFanoutBehaviour(const graph::Graph& g, std::size_t self);
+
+  // Serves every notification it is routed and publishes along each `then` step rate × (1 − dedup)
+  // × factor (the class comment), each step sent only what the steps before it delivered last step
+  // (detail::HopBlocks::forward). `now` and `dt` are unused: the fanout keeps no state between
+  // steps. An explicit template head for the default argument, as ServiceBehaviour::route has.
+  template <FractionLookup Lookup = NothingLost>
+  [[nodiscard]] Routed route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/,
+                             Lookup&& delivered_last_step = {}) const {
+    Routed routed = detail::serve_everything(in);
+    for (const auto& [op, rate] : routed.served.entries()) {
+      if (rate.per_second <= 0.0) continue;  // forwards nothing: no empty branch
+      publishes_.forward(op, rate, routed.outgoing, delivered_last_step);
+    }
+    detail::sort_by_destination(routed.outgoing);
+    return routed;
+  }
+
+  // The capacity units one notification of `op` uses (graph::op_cost): 1 for every op of a
+  // scenario file, whose fanouts take no `cost` key.
+  [[nodiscard]] double cost(std::string_view op) const;
+
+  // Own sojourn plus the publishes it waits for, each taken by 1 − dedup of the requests
+  // (detail::HopBlocks::response).
+  [[nodiscard]] flow::LatencyEstimate response(std::string_view op, flow::LatencyEstimate own,
+                                               ResponseLookup auto&& downstream) const {
+    return publishes_.response(op, own, downstream);
+  }
+
+  // own × what its publishes deliver (detail::HopBlocks::delivered): a duplicate, which takes no
+  // step, is delivered as far as the fanout goes.
+  [[nodiscard]] double delivered(std::string_view op, double own,
+                                 FractionLookup auto&& downstream) const {
+    return publishes_.delivered(op, own, downstream);
+  }
+
+  // The notifications of `served` (what the fanout's queue drained this step) that its dedup step
+  // dropped, per second: drain × dedup (engine::NodeSample::deduplicated_per_s).
+  [[nodiscard]] double deduplicated_per_s(const flow::Flow& served) const {
+    return served.total().per_second * dedup_;
+  }
+
+ private:
+  std::map<std::string, double, std::less<>> cost_by_op_;  // every op that reaches the fanout
+  double dedup_{};
+  // Per op that can reach the fanout, one block per `then` step, each taken by 1 − dedup of the
+  // requests (detail::add_then_blocks over graph::Graph::then_fraction).
+  detail::HopBlocks publishes_;
+};
+
 // One kind of machine of a kv_cluster this step, as the engine served it (engine::Simulation::serve
 // hands one per copy group): the sojourn ONE replica-request sees on one such machine, the share of
 // the replica-requests sent to those machines that they did not drop, and how many of them are
@@ -2398,15 +2478,16 @@ class WsGatewayBehaviour {
 // value (no heap allocation, no virtual calls, copyable). Phase 2a appended the load
 // balancer, the rate limiter and the cache, phase 2b the SQL database and the CDN, phase 2c the
 // blob store, the message queue, the worker pool, the external sink and the kv cluster, phase 3 the
-// websocket gateway (a service discovery needs none: it runs as a ServiceBehaviour); later tasks
-// append the rest (notification_fanout, frontier).
+// websocket gateway (a service discovery needs none: it runs as a ServiceBehaviour), the
+// notification fanout; later tasks append the rest (frontier).
 // C++17 std::variant: a closed sum type (a type-safe union that knows which alternative
 // it holds) dispatched with std::visit. Closed: adding an alternative means editing this
 // line, and every std::visit that does not handle it then fails to compile.
-using Behaviour = std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour,
-                               RateLimiterBehaviour, CacheBehaviour, SqlDbBehaviour, CdnBehaviour,
-                               BlobStoreBehaviour, MessageQueueBehaviour, WorkerPoolBehaviour,
-                               ExternalSinkBehaviour, KvClusterBehaviour, WsGatewayBehaviour>;
+using Behaviour =
+    std::variant<ClientBehaviour, ServiceBehaviour, LoadBalancerBehaviour, RateLimiterBehaviour,
+                 CacheBehaviour, SqlDbBehaviour, CdnBehaviour, BlobStoreBehaviour,
+                 MessageQueueBehaviour, WorkerPoolBehaviour, ExternalSinkBehaviour,
+                 KvClusterBehaviour, WsGatewayBehaviour, NotificationFanoutBehaviour>;
 
 }  // namespace simsys::behaviours
 
@@ -2426,6 +2507,7 @@ static_assert(NodeBehaviour<WorkerPoolBehaviour>);
 static_assert(NodeBehaviour<ExternalSinkBehaviour>);
 static_assert(NodeBehaviour<KvClusterBehaviour>);
 static_assert(NodeBehaviour<WsGatewayBehaviour>);
+static_assert(NodeBehaviour<NotificationFanoutBehaviour>);
 static_assert(RequestSource<ClientBehaviour>);
 
 namespace detail {
@@ -3386,6 +3468,19 @@ double ExternalSinkBehaviour::cost(std::string_view op) const {
 
 Routed ExternalSinkBehaviour::route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/) const {
   return detail::serve_everything(in);
+}
+
+// ---- NotificationFanoutBehaviour ----
+
+// Graph::build resolved the `then` steps' targets and links, refused a step on miss or on failure
+// (graph's invalid_notification_fanout) and checked `channels` against the steps.
+NotificationFanoutBehaviour::NotificationFanoutBehaviour(const graph::Graph& g, std::size_t self)
+    : cost_by_op_{detail::arriving_op_costs(g, self)}, dedup_{g.nodes()[self].spec.dedup} {
+  for (const auto& op : g.arriving_ops(self)) detail::add_then_blocks(g, self, op, publishes_);
+}
+
+double NotificationFanoutBehaviour::cost(std::string_view op) const {
+  return detail::cost_in(cost_by_op_, op);
 }
 
 // ---- KvClusterBehaviour ----

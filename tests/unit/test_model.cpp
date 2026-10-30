@@ -40,14 +40,14 @@ TEST_CASE("the node type table is complete at compile time", "[model]") {
 }
 
 // The node-type table's third column says which types run/estimate can step today: every type but
-// the two whose models phase 3 still has to add (a service_discovery runs since Task 13: a
-// service that answers `lookup`; a ws_gateway since Task 14). Simulation::create reads it
+// the one whose model phase 3 still has to add (a service_discovery runs since Task 13: a
+// service that answers `lookup`; a ws_gateway since Task 14; a notification_fanout since Task 17,
+// which the test appended at the end of this file pins alone). Simulation::create reads it
 // (model::simulated), and the scenario tests pin the shipped scenarios it lets run.
-TEST_CASE("every node type runs but the two that phase 3 has still to model", "[model]") {
+TEST_CASE("every node type runs but the one that phase 3 has still to model", "[model]") {
   for (const auto& row : simsys::model::node_type_table) {
     CAPTURE(row.name);
-    const bool still_to_model =
-        row.value == NodeType::notification_fanout || row.value == NodeType::frontier;
+    const bool still_to_model = row.value == NodeType::frontier;
     REQUIRE(simsys::model::simulated(row.value) == !still_to_model);
   }
   static_assert(simsys::model::simulated(NodeType::service));

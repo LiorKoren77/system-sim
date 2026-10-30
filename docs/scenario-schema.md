@@ -8,7 +8,9 @@ unit per concern: `header.cpp`, `nodes.cpp`, `steps.cpp`, `workload.cpp`, `links
 `slos.cpp`, `faults.cpp`, `overrides.cpp`), the graph builder (`src/engine/graph.cpp`), the node behaviours
 (`src/engine/behaviours.cppm`), the reports (`src/report/report.cpp`, `explain.cpp`) and the
 sweep (`src/sweep/sweep.cpp`). All 14 files under
-`scenarios/` load under it, and ten of them run end to end ([below](#what-runs-in-phase-2c)).
+`scenarios/` load under it, and eleven of them run end to end ([below](#what-runs-in-phase-2c)):
+the ten of phase 2c and, since phase 3's [`notification_fanout`](#notification_fanout),
+`book/notification-system`.
 The design decisions behind the new rules, with what each ignores, are spec §18 (phase 2b) and
 §19 (phase 2c) (`docs/superpowers/specs/2026-10-27-system-sim-design.md`).
 
@@ -127,27 +129,27 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `external_sink` | a third party's API: a queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) that fails `failure_rate` of what it serves, counted as drops (phase 2c, see [Node types](#node-types)) |
 | `kv_cluster` | `nodes` machines on a ring, every request sent to `replication` N of them, answered at the W-th (write) or R-th (read) fastest of its own replica set and lost when fewer come back; the ring's hottest machine as its own queue (phase 2c, see [`kv_cluster`](#kv_cluster)) |
 | `ws_gateway` | its open connections as a **level** that a client op named `connect` fills or a fixed `connections` states, capped at `max_connections × replicas`, loaded by `C / heartbeat` pings, its message ops fanned out by `fanout` (phase 3, see [`ws_gateway`](#ws_gateway)) |
+| `notification_fanout` | a service (the type's 20k/s at 1 ms) whose `then` steps fire for the `1 − dedup` of what it serves that its dedup step lets through, the rest counted as `deduplicated_per_s`; `channels` names the queue behind each channel (phase 3, see [`notification_fanout`](#notification_fanout)) |
 
 Everything else is refused before the first step, with exit code 1:
 
 | what | message | runs from |
 |---|---|---|
-| `notification_fanout`, `frontier` | `node 'x' has type 'frontier', which run/estimate do not support yet (phase 3)` | 3 |
+| `frontier` | `node 'x' has type 'frontier', which run/estimate do not support yet (phase 3)` | 3 |
 | a `ws_gateway` that no `connect` op reaches and that states no `connections` | `node 'x': a ws_gateway needs a client op named 'connect' or a fixed 'connections'` | now, once it has one |
 | a `ws_gateway` with both | `node 'x': a ws_gateway takes a 'connect' op or a fixed 'connections', not both` | now, with one |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
 | a `cache_flush` on a cache with a fixed `hit_ratio` and no `keys` | `node 'x': cache_flush needs keys (a fixed hit ratio is back once keys requests have refilled it)` | now, once it states `keys` |
 | a `cache_flush` on a cache whose hit ratio is 1 | `node 'x': cache_flush on a cache that always hits (hit ratio 1): it has no miss path to warm through` | now, with a hit ratio below 1 |
 
-The type message names the phase that plans the type's model, phase 3 for both. The type
+The type message names the phase that plans the type's model, phase 3 for the one left. The type
 check runs over the whole file first, and names the first node
 in file order whose type cannot run; only then are the nodes of runnable types checked (a CDN's
 `keys`, a gateway's level), in file order: google-drive is refused at its `ws_gateway`,
 `long_poll`, which states no level yet (`node 'long_poll': a ws_gateway needs a client op named
 'connect' or a fixed 'connections'`), chat-system at its `ws_gateway`, `chat_servers`, for the
-same reason (its `service_discovery` runs since phase 3), notification-system at its
-`notification_fanout` and web-crawler at its `frontier`. Of the 14 shipped scenarios ten run
-(`exit` is `simsys run`'s exit code, Release build):
+same reason (its `service_discovery` runs since phase 3), and web-crawler at its `frontier`. Of the
+14 shipped scenarios eleven run (`exit` is `simsys run`'s exit code, Release build):
 
 | scenario | exit | what it shows |
 |---|---|---|
@@ -161,6 +163,7 @@ same reason (its `service_discovery` runs since phase 3), notification-system at
 | `book/youtube` | 0 | ch. 14 in bytes: CDNs, blob stores, a bandwidth link, a transcoding queue and pool |
 | `book/news-feed` | 0 | ch. 11's fan-out on write through a queue, with a kv_cluster for the graph |
 | `book/search-autocomplete` | 0 | ch. 13's trie cache, search index and query-log pipeline |
+| `book/notification-system` | 0 | ch. 10's fan-out with dedup into four channel queues, pools that retry their providers and dead-letter the rest, a 20× marketing blast drained within the lag SLOs |
 
 **`estimate` versus `explain`.** `estimate` evaluates the long-run state once, at
 t = 0 (00:00): the rate curve's value there, without noise. Its first line says so:
@@ -198,21 +201,20 @@ youtube's 600 transcoders are offered 9.6 uploads/s at the 21:00 peak, `9.6/s vs
 red)`, and their renditions bring `transcoded_store` to `9.811k MB/s (196.2/s) vs 20k MB/s
 (49.1%, green)`; at the 400 workers of its README's sweep the pool reads `9.6/s vs 6.667/s
 (144%, red)` and still hands on all 9.6/s on paper, while the engine forwards what a pool drains,
-at most its capacity). They do **not** follow the `then` of a
-`notification_fanout` or a `frontier` (types of phase 3). A node whose load can only come
-through one of those gets 0 on paper: a number that is missing, not zero. Its check line therefore
+at most its capacity) and along a `notification_fanout`'s `then` (phase 3: each target is sent
+the fan-out's peak × `factor` × (1 − `dedup`), a `kv_cluster` that times N, as the engine
+publishes). They do **not** follow the `then` of a `frontier` (a type of phase 3 with no model
+yet). A node whose load can only come
+through one gets 0 on paper: a number that is missing, not zero. Its check line therefore
 has no percentage and no zone, but a mark naming each such type on the way to it, nearest first:
 `dns  peak offered 0/s vs 100k/s total capacity  (load not propagated: frontier is not modelled
-yet)`, or, behind both, `(load not propagated: frontier and notification_fanout are not modelled
 yet)`. The mark follows such a node's `then` steps (a frontier's links when it has none), not
 every link it has. A node that also receives load the checks do follow gets its percentage as a
 **lower bound**, with no zone unless even that is red (the real load is higher, so green or yellow
 might not hold, but red does): `frontier  peak offered 50/s vs 5k/s total capacity  (≥1%; load
 not propagated: frontier is not modelled yet)` (the web crawler's frontier, fed back through
 itself), `(≥150%, red; ...)`. A `kv_cluster` behind such a type keeps its own head (see
-[`kv_cluster`](#kv_cluster)) and takes the mark like any node: notification-system's `log_db`,
-`peak offered 0/s (0/s × N 2) vs 60k/s (3 nodes)  (load not propagated: notification_fanout is not
-modelled yet)`.
+[`kv_cluster`](#kv_cluster)) and takes the mark like any node.
 A lower-bound line has no per-copy figures (a database's primary/replica split, a ring's hottest
 copy or machine): they would be lower bounds too.
 
@@ -294,7 +296,7 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 | `advanced` | map | all but `client` | read | see next table |
 | `ops` | map | `client`, `service`, `ws_gateway` | read | client: op → share; otherwise op → step list (below; a `ws_gateway`'s message ops fanned out, see [`ws_gateway`](#ws_gateway)) |
 | `cost` | map op → number | `service`, `cache`, `sql_db` | read | **new in v1.2**: the capacity units one request of that op consumes; an op not listed costs 1. Each value is a positive finite number (`cost 'write' must be a positive finite number`, also for a quoted `"3"`) of at most 1e6 (`cost 'write' must be at most 1e6`); anything but a map is `cost must be a map of op to units`, a bare `cost:` is `cost must not be empty (write {} for none)`. `capacity` is then a rate of units: demand is `Σ rate_op × cost_op`, and the node's demand, drops and backlog are reported in units. What it forwards stays requests (a drained `write` of cost 3 is one `write` downstream). A `sql_db` charges its write ops 5 unless `cost` lists them (see [`sql_db`](#sql_db)). A load balancer and a rate limiter charge 1 per request, and `cost` is not a key of theirs. A `worker_pool`'s `cost` is a different key, a duration per job (see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
-| `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | read (cache, blob_store, worker_pool); checked (others) | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step; a cache's `then` steps run (an unconditional one carries everything the cache answered, an `on: miss` one `1 − h` of the reads and none of the writes; see [`then` steps on a cache](#then-steps-on-a-cache)), and `explain`'s paper load follows them the same way; a `blob_store`'s run as asynchronous event notifications, one per write it serves and none per read (see [Node types](#node-types)); a `worker_pool`'s fire for every job it drains (see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
+| `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | read (cache, blob_store, worker_pool, notification_fanout); checked (frontier) | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step; a cache's `then` steps run (an unconditional one carries everything the cache answered, an `on: miss` one `1 − h` of the reads and none of the writes; see [`then` steps on a cache](#then-steps-on-a-cache)), and `explain`'s paper load follows them the same way; a `blob_store`'s run as asynchronous event notifications, one per write it serves and none per read (see [Node types](#node-types)); a `worker_pool`'s fire for every job it drains (see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)); a `notification_fanout`'s fire for the `1 − dedup` of what it serves (see [`notification_fanout`](#notification_fanout)) |
 
 A key outside its row is an error, e.g. `key 'capacity' is not valid for type 'client'`
 (a client is a traffic source with no service rate, service time or waiting room) or
@@ -389,7 +391,7 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `service_discovery` | `failover` (positive duration) | read and run (phase 3), see [`service_discovery`](#service_discovery): a service answering `lookup`; `failover` (default 10 s, chosen) is how long its callers stay on a dead replica after a `node_down`; `node 'disc': failover must be positive`; on any other type `node 'api': key 'failover' is not valid for type 'service'` |
 | `id_generator` | `algorithm` `snowflake|ticket_server|uuid` (required) | read and run (phase 2b), see [`id_generator`](#id_generator) |
 | `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) | read and run (phase 2c): a third party's API (ch. 10's APNs, FCM, SMS and e-mail providers), a leaf queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) whose served requests fail at `failure_rate` f (default 0; outside [0, 1]: `node 's': failure_rate must be between 0 and 1`): `dropped += f × served`, `drain = (1 − f) × served`, so 500/s at f = 0.02 is answered 490/s and the failures count in the node's drop rate, never as rejections. `politeness` (a positive rate) is printed by `explain` as `politeness=1/s (not modelled: phase 3)`: it needs per-host state. `then` and `ops` stay refused; a client's `retries` and a [worker pool's](#message_queue-and-worker_pool) send a failure again (the sink's drop rate leaves out the share of its drops that came from retrying pools) |
-| `notification_fanout` | `channels` (map name → node id), `dedup` (0–1), `then` | `then` checked as [steps](#steps) (`node 'fan': step refers to unknown node 'ghost'`); the others ignored; phase 3 |
+| `notification_fanout` | `channels` (map channel name → message queue id), `dedup` (in [0, 1)), `then` | read and run (phase 3), see [`notification_fanout`](#notification_fanout) |
 | `frontier` | `politeness` (rate per host), `hosts` (int), `then` | `then` checked as [steps](#steps); the others ignored; phase 3 |
 
 "Ignored" own keys are still checked by name, so a misspelling is caught today; their
@@ -1164,6 +1166,68 @@ Ignored: ordering, delivery guarantees and redelivery, a consumer's commit inter
 disk; a worker blocked on a slow downstream call (an external sink's 150 ms would hold a worker:
 phase 3), autoscaling, poison messages, the end-to-end completion time of the asynchronous work.
 
+### `notification_fanout`
+
+Book ch. 10, "Design a notification system" (phase 3 spec §8.3). The step between the
+notification servers and the per-channel queues: it drops the duplicates (the book's dedup on the
+event id) and publishes each remaining notification once to the queue of every channel it goes
+out on, then records it in the notification log.
+
+```yaml
+fanout:
+  type: notification_fanout
+  dedup: 0.02
+  channels: {ios: ios_q, sms: sms_q}
+  then:
+    - {to: ios_q, op: publish, factor: 0.6}
+    - {to: sms_q, op: publish, factor: 0.05}
+    - {to: log_db, op: write}
+```
+
+The fan-out is a **service**: `replicas` copies of the type's **20k/s at 1 ms** (chosen: a dedup
+lookup and a few in-memory publishes, a service's 1 ms; c = 20 by Little's law) unless the
+scenario states `capacity` and `latency`. It serves every notification it is routed, duplicates
+included (finding one is work too), and its `then` steps fire for the share its dedup step lets
+through: at 1k/s with `dedup: 0.02`, `ios_q` is sent 1000 × 0.98 × 0.6 = 588/s, `sms_q`
+1000 × 0.98 × 0.05 = 49/s and `log_db` 980 writes/s (1960/s of replica requests at N = 2). The
+2 % it drops, **20 a second, are deduplicated**: neither dropped nor rejected (the caller's request
+succeeded; the duplicate was meant not to go out), so they stay out of `drop_rate` and
+`reject_rate` and are reported on their own. The fan-out waits for its publishes as a service waits
+for its steps (a queue answers at the append), each step taken by `1 − dedup` of the requests; a
+step after a failed one is sent only what survived. `explain` follows the steps with the same
+shares and prints `dedup=2% channels: ios=ios_q sms=sms_q` on the node's line.
+
+| key | rule | refusals |
+|---|---|---|
+| `dedup` | optional, a number in [0, 1): the share dropped as duplicates (absent: 0, none). 1 would publish nothing, which a missing link says more plainly | `node 'fanout': dedup must be between 0 and 1` |
+| `channels` | optional map of channel name → message queue: the student-facing list of the channels, while the `then` steps carry each one's share (`factor`). Each value must be a declared `message_queue`, and two channels may not name one queue | `node 'fanout': channel 'sms' names 'x', which is not declared`, `node 'fanout': channel 'sms' names 'api', which is a service (channels name message queues)` (the node's own type: `which is a client`, ...), `channels must be a map of channel names to message queues`, `channel 'b' names 'q', which channel 'a' names too` |
+| `then` | [steps](#steps), each fired for `1 − dedup` of what the fan-out serves; `on: miss` and `on: failure` refused *(graph)*, a parallel group allowed (it publishes to its channels at once) | `node 'fanout': a fanout's then steps fire for every notification it routes (on: miss needs a cache)` |
+
+*(graph)* `channels` and the `then` steps that publish to a `message_queue` name the same queues,
+in both directions: `node 'fanout': channel 'email' names email_q, which no then step publishes to`,
+`node 'fanout': then step publishes to email_q, which no channel names`. A step to anything else
+(the notification log, an audit service) is no channel and is not checked; a fan-out with no
+`channels` (absent or `{}`) is accepted as long as no step publishes to a queue. Retries and the
+dead letters live on the channels' worker pools (`retries`, see
+[`message_queue` and `worker_pool`](#message_queue-and-worker_pool)).
+
+**What the reports add.** When the run has a fan-out, the node table has a `deduplicated/s`
+column right after `rejected` (and after `dead_lettered/s`, beside `dropped`, when a pool
+retries): the fan-out's mean rate, `-` on every other row; a run without one prints the table it
+always did. JSON gives every node a `deduplicated_per_s` (the mean rate over the observed steps;
+0 on a fan-out with `dedup: 0`, `null` on every other node), and `run --series` a
+`deduplicated_per_s` column after `rejected_per_s`, empty on every row but a fan-out's:
+
+```
+t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,deduplicated_per_s,latency_ms,zone,queue_lag_s
+```
+
+A fan-out's `drain_per_s` includes its duplicates (it served them), so the series' balance holds
+without the new column. Ignored: what makes two notifications duplicates and how long the ids are
+kept (the book's dedup cache with a TTL: the share is stated, not derived from the traffic), the
+lookup's own cost beyond the service time, per-user settings that turn a channel off (fold them
+into the `factor`s), ordering.
+
 ## Rate curve (`client.rate`)
 
 ```yaml
@@ -1419,11 +1483,13 @@ some node refused anything; the node table has `dropped` and `rejected` columns;
 for other nodes, and (phase 2c) `peak_queue_lag_s`, a message queue's peak lag in seconds
 ([Queue lag](#queue-lag)), `null` for other nodes, and (phase 3) `dead_lettered` and
 `dead_lettered_per_s`, a worker pool's [dead letters](#message_queue-and-worker_pool), `null` for
-other nodes. When some pool has `retries`, the node table has a `dead_lettered/s` column right
-after `dropped` (the pool's mean rate, `-` on every other row); without one the table is the one
-it always was. Likewise a scenario with a [`ws_gateway`](#ws_gateway) gets a `connections` column
-after `peak_lag` and the JSON keys `connections` and `connections_peak`; a gateway's refused
-connects are its `rejected`. Each SLO object has a `note`: `null`, or why the verdict is not `observed`
+other nodes, and (phase 3) `deduplicated_per_s`, a notification fan-out's
+[duplicates](#notification_fanout) per second, `null` for other nodes. When some pool has
+`retries`, the node table has a `dead_lettered/s` column right after `dropped` (the pool's mean
+rate, `-` on every other row), and when the run has a fan-out a `deduplicated/s` column right after
+`rejected`; without them the table is the one it always was. Likewise a scenario with a
+[`ws_gateway`](#ws_gateway) gets a `connections` column after `peak_lag` and the JSON keys
+`connections` and `connections_peak`; a gateway's refused connects are its `rejected`. Each SLO object has a `note`: `null`, or why the verdict is not `observed`
 against `max` alone (a replica that falls behind without bound).
 
 **`run --report json` (and `estimate --report json`), key by key.** Every figure is over the
@@ -1440,6 +1506,7 @@ the observed seconds (`steps` × `step`).
 | `nodes[]` | `peak_backlog` | the most work waiting at the end of any step: requests, cost units at a node with a `cost`, MB at a byte-sized node |
 | `nodes[]` | `dropped`, `rejected` | **totals** over the observed steps, in the same units as `peak_backlog` (`rejected` in requests) |
 | `nodes[]` | `dead_lettered`, `dead_lettered_per_s` | jobs: the **total** over the observed steps and its mean rate per second (phase 3: a `worker_pool`'s jobs whose last retry failed; 0 on a pool without `retries`, `null` on every other node) |
+| `nodes[]` | `deduplicated_per_s` | notifications per second, the mean over the observed steps (phase 3: a `notification_fanout`'s duplicates, drain × `dedup`; 0 with `dedup: 0`, `null` on every other node) |
 | `nodes[]` | `red_s`, `unavailable` | seconds spent red; `true` when the node's latency was infinite in some step |
 | `nodes[]` | `staleness_s`, `replication_dropped_per_s`, `committed_writes_per_s` | seconds; writes per second per replica; writes per second per shard (a `sql_db` only, else `null`) |
 | `nodes[]` | `peak_queue_lag_s` | seconds (a `message_queue` only, else `null`) |
@@ -1473,16 +1540,19 @@ the node's own numbers are in MB: the table's `dropped`, JSON's `dropped`, and t
 rates, each answered at its last byte (a write) or its first megabyte (a read).
 
 `run --series` writes one CSV row per node per step:
-`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,latency_ms,zone,queue_lag_s,connections`
+`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,deduplicated_per_s,latency_ms,zone,queue_lag_s,connections`
 (`rejected_per_s` new in v1.2, `demand_per_s` and `drain_per_s` in phase 2b, `queue_lag_s` in
 phase 2c: a message queue's lag in seconds, empty on every other row; `dead_lettered_per_s` in
 phase 3: a worker pool's dead letters per second, 0 without `retries`, empty on every other row and
-outside the balance below, since the pool drained those jobs; demand, drain, drops and backlog in
-capacity units, megabytes at a byte-sized node; a sink's `drops_per_s` keeps the failures a pool
-retries; `connections` in phase 3: a [`ws_gateway`](#ws_gateway)'s level of open connections at
-the start of the step, 6 significant digits, empty on every other row; a client row has zeros, zone
-`none`, and no dead letters, no lag and no connections), then one row per [bandwidth link](#links) and step, its `from->to` in the `node`
-column, in megabytes, `rejected_per_s` 0 and `latency_ms` a request's wait plus its answer time
+outside the balance below, since the pool drained those jobs; `deduplicated_per_s` in phase 3: a
+[notification fan-out's](#notification_fanout) duplicates per second, 0 with `dedup: 0`, empty on
+every other row and inside `drain_per_s`, since the fan-out served them; demand, drain, drops and
+backlog in capacity units, megabytes at a byte-sized node; a sink's `drops_per_s` keeps the
+failures a pool retries; `connections` in phase 3: a [`ws_gateway`](#ws_gateway)'s level of open
+connections at the start of the step, 6 significant digits, empty on every other row; a client row
+has zeros, zone `none`, and no dead letters, no duplicates, no lag and no connections), then one
+row per [bandwidth link](#links) and step, its `from->to` in the `node`
+column, in megabytes, `rejected_per_s` 0, `deduplicated_per_s` empty and `latency_ms` a request's wait plus its answer time
 on the wire (a write's whole serialisation, any other op's first megabyte; with no request in the
 step, the ops the link carries weighed alike).
 `run --series-ops` writes one CSV row per client op per step (phase 2b):

@@ -1,6 +1,12 @@
 # System Design Interview vol. 1, ch. 10 — Notification system.
 # Book numbers: 10M mobile push, 1M SMS, 5M email per day. Here scaled 10x for a busier
 # system (~1.9k/s average) with a marketing-blast spike.
+#
+# Sized for the day's peak, the 09:00 blast (20x the curve for 15 minutes: 27.93k
+# notifications/s, `explain`'s peak, against 2.66k/s at the 18:00 crest of the wave). The front
+# (notification_svc, user_db, fanout) is sized to serve the blast as it comes, at most about
+# 70 % busy; the channels behind the queues are sized to drain it within their lag SLOs, which is
+# what the queues are for (ch. 10: "decouple the components"). README.md has the arithmetic.
 version: 1
 name: notification-system
 seed: 1
@@ -21,9 +27,11 @@ nodes:
 
   lb: {type: load_balancer, policy: round_robin}
 
+  # 27.93k/s over 8 x 5k/s = 69.8 % at the blast. The 4 replicas first shipped were offered 140 %:
+  # they dropped a quarter of the blast, 3.65 % of the day, the worst drop rate of the file.
   notification_svc:
     type: service
-    replicas: 4
+    replicas: 8
     capacity: 5k/s
     latency: 1ms
     ops:
@@ -36,7 +44,9 @@ nodes:
   # Also user_limiter's counter store: its `counter` (an INCR, ch. 4) is a write, the cache's
   # only one; the notification service's `read`s are what the Che hit ratio is about.
   user_cache: {type: cache, eviction: lru, keys: 5M, hit_ratio: che, strategy: cache_aside, write_ops: [counter]}
-  user_db: {type: sql_db, replicas: 2, capacity: 3k/s}
+  # The misses, 18.6 % of 27.93k/s = 5.184k reads/s, go to the read replicas: 3 of them (replicas 4
+  # = the primary + 3) at 3k/s each, 57.6 % each. With 2 (one read replica) it was 173 %.
+  user_db: {type: sql_db, replicas: 4, capacity: 3k/s}
 
   user_limiter:                               # per-user rate limit
     type: rate_limiter
@@ -44,8 +54,12 @@ nodes:
     limit: 100k/s                             # aggregate; per-user rules are in the backend
     backend: user_cache
 
+  # Drops the 2 % duplicates and publishes the rest once per channel: 0.6 + 0.3 + 0.05 + 0.3 =
+  # 1.25 channel messages per notification, and one log write. 2 x the type's 20k/s: 69.8 % at the
+  # blast (one copy would be offered 140 %).
   fanout:
     type: notification_fanout
+    replicas: 2
     dedup: 0.02
     channels: {ios: ios_q, android: android_q, sms: sms_q, email: email_q}
     then:
@@ -60,17 +74,32 @@ nodes:
   sms_q:     {type: message_queue, partitions: 4}
   email_q:   {type: message_queue, partitions: 8}
 
-  ios_workers:     {type: worker_pool, consumes: ios_q, workers: 50, cost: 20ms, then: [{to: apns, op: send}]}
-  android_workers: {type: worker_pool, consumes: android_q, workers: 50, cost: 20ms, then: [{to: fcm, op: send}]}
-  sms_workers:     {type: worker_pool, consumes: sms_q, workers: 20, cost: 50ms, then: [{to: sms_provider, op: send}]}
-  email_workers:   {type: worker_pool, consumes: email_q, workers: 20, cost: 30ms, then: [{to: email_provider, op: send}]}
+  # Each pool retries a send its provider failed (or its quota shed) 3 times, 1 s apart (the
+  # default `retry_after`); the 4th failure is a dead letter, not a drop. The two channels with a
+  # lag SLO are sized to drain the blast within it: a 15-minute blast of λ messages/s into a pool
+  # of capacity μ ends (λ/μ − 1) × 15 min behind, so a lag of at most L needs μ ≥ λ × 15/(15 + L).
+  #   iOS: λ = 16.42k/s × 1.02 attempts, L = 5 min: μ ≥ 12.6k/s; 260 x 20 ms = 13k/s
+  #   SMS: λ = 1.368k/s × 1.05 attempts, L = 10 min: μ ≥ 865/s; 45 x 50 ms = 900/s
+  # Android and e-mail have no lag SLO: Android keeps its 50 x 20 ms = 2.5k/s, three times the
+  # 18:00 crest (782/s); e-mail's 20 x 30 ms = 667/s did not keep up even with the crest and grows to
+  # 60 (2k/s). The blast puts them 34 and 46 minutes behind at worst (README.md).
+  ios_workers:     {type: worker_pool, consumes: ios_q, workers: 260, cost: 20ms, then: [{to: apns, op: send}], retries: 3}
+  android_workers: {type: worker_pool, consumes: android_q, workers: 50, cost: 20ms, then: [{to: fcm, op: send}], retries: 3}
+  sms_workers:     {type: worker_pool, consumes: sms_q, workers: 45, cost: 50ms, then: [{to: sms_provider, op: send}], retries: 3}
+  email_workers:   {type: worker_pool, consumes: email_q, workers: 60, cost: 30ms, then: [{to: email_provider, op: send}], retries: 3}
 
-  apns:           {type: external_sink, latency: 150ms, failure_rate: 0.02}
-  fcm:            {type: external_sink, latency: 150ms, failure_rate: 0.02}
-  sms_provider:   {type: external_sink, latency: 500ms, failure_rate: 0.05}
-  email_provider: {type: external_sink, latency: 300ms, failure_rate: 0.01}
+  # The providers' quotas (the type's 1k/s by default) must stay above what their pool sends at
+  # full speed, its workers / cost, or the quota sheds what the pool then retries: APNs 15k/s for
+  # 13k/s, FCM 3k/s for 2.5k/s, the SMS gateway 1.2k/s for 900/s, the e-mail service 2.5k/s for 2k/s.
+  apns:           {type: external_sink, capacity: 15k/s, latency: 150ms, failure_rate: 0.02}
+  fcm:            {type: external_sink, capacity: 3k/s, latency: 150ms, failure_rate: 0.02}
+  sms_provider:   {type: external_sink, capacity: 1.2k/s, latency: 500ms, failure_rate: 0.05}
+  email_provider: {type: external_sink, capacity: 2.5k/s, latency: 300ms, failure_rate: 0.01}
 
-  log_db: {type: kv_cluster, nodes: 3, replication: 2, write_quorum: 1, read_quorum: 1, capacity: 20k/s}
+  # The notification log: 27.37k writes/s at the blast, each to N = 2 replicas, 54.74k/s over
+  # 3 machines of 30k/s (still under the type's 50k/s, "KV 50k QPS"). At the 20k/s first shipped the
+  # ring's hottest machine was 96 % at the blast, red.
+  log_db: {type: kv_cluster, nodes: 3, replication: 2, write_quorum: 1, read_quorum: 1, capacity: 30k/s}
 
 links:
   - {from: services, to: lb, dir: inout}

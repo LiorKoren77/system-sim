@@ -25,10 +25,11 @@ drops megabytes), message queues and the worker pools that consume them, externa
 key-value clusters (ring, replication and quorums), search indexes and id generators. A step after
 a failed step does not run, refused, dropped and timed-out requests are counted apart
 (`reject_rate`, `drop_rate`, `timed_out_per_s`), and an SLO can be checked per window (`over: 1h`).
-`simsys sweep` runs a scenario over a range of one key, the points in parallel. Ten scenarios run
-end to end, four of the eight book systems among them (list below); chat-system, google-drive,
-notification-system and web-crawler validate and `explain`, and wait for phase 3's types
-(`notification_fanout`, `frontier`; `ws_gateway` and `service_discovery` run since phase 3). 1163 tests (Catch2, via
+`simsys sweep` runs a scenario over a range of one key, the points in parallel. Eleven scenarios
+run end to end, five of the eight book systems among them (list below); chat-system, google-drive
+and web-crawler validate and `explain`, and wait for phase 3's last type and levels (`frontier`;
+`ws_gateway` and `service_discovery` run since phase 3, but chat-system's and google-drive's
+gateways state no connection level yet). 1163 tests (Catch2, via
 `ctest`). The scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.4).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
@@ -52,9 +53,10 @@ simsys sweep    scenario.yaml --param <dot.path>=<from>..<to>:<n> --metric <m>..
 value there, without noise (its first line says so); `explain`'s static load checks use the
 curve's peak instead. `run` steps through the scenario and,
 with `--series`, writes one CSV row per node per step
-(`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,latency_ms,zone,queue_lag_s,connections`,
-`dead_lettered_per_s` a worker pool's dead letters, `queue_lag_s` a message queue's lag in
-seconds, the last a websocket gateway's open connections, each empty on other rows), the file a plot or GUI reads; demand, drain, drops and backlog balance, so the fluid queue's
+(`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,deduplicated_per_s,latency_ms,zone,queue_lag_s,connections`,
+`dead_lettered_per_s` a worker pool's dead letters, `deduplicated_per_s` a notification fan-out's
+duplicates, `queue_lag_s` a message queue's lag in seconds, the last a websocket gateway's open
+connections, each empty on other rows), the file a plot or GUI reads; demand, drain, drops and backlog balance, so the fluid queue's
 conservation law, Σ demand·dt = Σ (drain + drops)·dt + backlog, can be checked from the file (a
 token bucket's or a window's refusals are inside drain; a leaky bucket's overflow is in
 `rejected_per_s`, in the drops' place). A link with a `bandwidth` is a pipe that queues and drops
@@ -227,8 +229,8 @@ $ simsys explain scenarios/book/youtube/scenario.yaml
   cdn_eu->transcoded_store  peak offered 2.856k MB/s vs 5k MB/s  (57.1%, green)
 ```
 
-Only a URL frontier's and a notification fan-out's onward load is still left out (phase 3
-types): what lies behind them is marked `(load not propagated: frontier is not modelled
+Only a URL frontier's onward load is still left out (a phase 3 type with no model yet): what
+lies behind it is marked `(load not propagated: frontier is not modelled
 yet)`, with no percentage when nothing else reaches it and a lower bound (`≥1%`) otherwise.
 
 What runs today: clients, services, load balancers, rate limiters, caches (a fixed or a
@@ -242,9 +244,10 @@ queue's retention; their `then` steps fire for every job they drain, and nobody 
 external sinks (a third party's API at the type's 1k/s and 100 ms, failing its `failure_rate`
 of what it serves, counted as drops), key-value clusters (ch. 6's Dynamo-style store: `nodes`
 machines on a ring whose hottest machine is its own queue, every request sent to N replicas,
-answered at the W-th or R-th fastest of its own replica set and lost when fewer answer) and search indexes (ch. 13's trie database, served like a
-service at the type's 5k/s and 5 ms; its rebuild is not modelled). These ten scenarios run end to
-end:
+answered at the W-th or R-th fastest of its own replica set and lost when fewer answer), search indexes (ch. 13's trie database, served like a
+service at the type's 5k/s and 5 ms; its rebuild is not modelled) and notification fan-outs (ch.
+10: a service that drops a `dedup` share as duplicates, counted apart as `deduplicated/s`, and
+publishes the rest to its channels' queues). These eleven scenarios run end to end:
 
 - [`tutorial/hello`](scenarios/tutorial/hello/), [`tutorial/chain`](scenarios/tutorial/chain/):
   one service, then two in a chain: the queueing basics.
@@ -278,12 +281,19 @@ end:
   4-replica search index, and the query-log pipeline. Both SLOs pass (suggest p99 6.86 ms of
   100 ms, nothing dropped); the busiest node is on the data-gathering side, the log aggregators at
   60 % at the peak (6 workers; at 4 they sit on the red threshold, 90 %).
+- [`book/notification-system`](scenarios/book/notification-system/): ch. 10 over 24 hours at
+  1.9k notifications/s with a 20× marketing blast at 09:00 (27.93k/s): a fan-out that drops 2 % as
+  duplicates and publishes to four channel queues, one worker pool per channel retrying its
+  provider (`retries: 3`) and dead-lettering the rest. All three SLOs pass (nothing dropped, `ios_q`
+  4.03 min and `sms_q` 8.3 min behind at worst); its README shows what had to grow from the first
+  sizing (the notification servers from 140 %, the user database's replicas from 173 %, the iOS
+  pool to 260 workers to drain the blast within 5 minutes, the providers' quotas).
 
-The two phase 3 types still to model (notification fan-outs and URL frontiers) already validate
-and appear in `explain` with their resolved numbers, but `estimate`, `run` and `sweep` stop with
-"which run/estimate do not support yet" and exit 1, as do the book systems that need them (a
-WebSocket gateway and a service discovery run since phase 3; chat-system and google-drive now stop
-at a gateway that states no connection level). Each of those four READMEs opens with its
+The one phase 3 type still to model (URL frontiers) already validates and appears in `explain`
+with its resolved numbers, but `estimate`, `run` and `sweep` stop with "which run/estimate do not
+support yet" and exit 1, as do the book systems that need it (a WebSocket gateway, a service
+discovery and a notification fan-out run since phase 3; chat-system and google-drive now stop at a
+gateway that states no connection level). Each of those three READMEs opens with its
 status: the exact refusal, what `explain` shows today (its red checks and the nodes it cannot reach
 yet) and what phase 3 will model. Scripted faults run (`faults:`: a node or some of its replicas down, a capacity loss, a
 latency spike, a traffic spike, a cache flush, a datacenter down; `estimate` shows the steady

@@ -61,7 +61,10 @@
 // is M/M/c over consumption: c = workers, service time = cost, rate workers / cost
 // (defaults::worker_pool_rate), and a waiting room of the messages its queue keeps, retention ×
 // that rate (connect_consumers). It takes jobs from the queue it consumes and from nobody else
-// (check_pool_senders).
+// (check_pool_senders). A notification fanout (phase 3 spec §8.3; book ch. 10) is a service whose
+// `then` steps carry 1 − dedup of what it serves (Graph::then_fraction: its dedup step drops the
+// rest as duplicates), waited for like a service's steps; its `channels` map and the steps that
+// publish to a message queue must name the same queues (check_fanout_channels).
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers). It declares; the definitions live in the
@@ -503,7 +506,8 @@ class Graph {
   // The share of the requests of `op` that node `node` has handled which go on to its `then`
   // step `step`: 1 for an unconditional step (a worker pool's: every job it drains, whatever op
   // its queue brought), except at a blob store, whose steps are event notifications that fire for
-  // its writes only (1 of a write, 0 of a read: S3 notifies on ObjectCreated, never on a GET); for
+  // its writes only (1 of a write, 0 of a read: S3 notifies on ObjectCreated, never on a GET), and
+  // at a notification fanout, whose steps fire for the 1 − dedup its dedup step lets through; for
   // an `on: miss` step after a cache, 1 - h of a read (an unknown h counts as 0, as in
   // service_hops) and 0 of a write (writes do not miss); 0 for an `on: failure` step (refused in
   // a then list: invalid_then_steps, invalid_blob_store, invalid_worker_then_steps; failure steps
@@ -554,6 +558,9 @@ class Graph {
   Result check_failure_steps(const detail::CallComponents& components) const;
   Result route_splitters();
   Result route_queue(std::size_t queue);
+  Result check_fanout_channels() const;
+  Result check_channels_named(const model::NodeSpec& fanout) const;
+  Result check_steps_named(const model::NodeSpec& fanout) const;
   Result check_pool_senders() const;
   Result check_consumer_links(std::size_t queue) const;
   Result connect_consumers();

@@ -5478,3 +5478,11 @@ TEST_CASE("a fanout channel names its target's actual type when it is not a serv
                    "node 'fanout': channel 'sms' names 'u', which is a client (channels name "
                    "message queues)");
 }
+
+// One queue per channel (implementation's addition, Task 17): two channels on one queue would be
+// one channel under two names, and which `then` step carries whose share could not be told.
+TEST_CASE("two fanout channels naming one queue are refused") {
+  require_rejected("simsys_fanout_channel_twice.yaml",
+                   scenario_with(fanout_nodes("channels: {sms: sms_q, text: sms_q}")),
+                   "node 'fanout': channel 'text' names 'sms_q', which channel 'sms' names too");
+}
