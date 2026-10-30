@@ -451,6 +451,27 @@ attempts`, `pool w re-published 999 jobs`; JSON `lost_requests`, `after.retries_
 - [x] Tests: a client → api (`[{to: disc, op: lookup}, {to: svc, op: call}]`), svc `replicas: 4`, `node_down` `replicas: 1` for 30 s, `failover: 10s`: for the first 10 s of the fault the client's lost share is **0.25** (250/s of 1k/s) on top of what the 3 survivors drop, from 10 s on it is **0** (the survivors at rho × 4/3), and the fault block's `after:` line says `failover 10s: 2.5k requests sent to the dead replica`; without the lookup step the lost share is 0 throughout (the balancer spreads it); `lookup` latency adds 0.5 ms + 2 × link to the op's mean (closed form on a zero-load path); `failover` refused on other types.
 - [x] Commit `nodes: service_discovery answers lookups and holds callers on a dead replica for failover` (red `37cc347`, green `b7a1bc7`, 1563 tests; the dead share is decided per caller hop and travels as doomed demand beside the link; the type's default rate 10k/s → 50k/s).
 
+**Review of Task 13 at `b7a1bc7`** (adversarial, bounded, 2026-10-30): REQUEST_CHANGES on docs; every
+probed number matches the spec (the pinned 2.5k, `min(failover, for)`, per-op loss, no failover on a
+sql_db primary / `dc_down` / behind a balancer (a step names a direct neighbour: the registry hands
+out a server, a balancer routes around a dead one), retries through the lookup, the fluid balance,
+sweep over `failover`, identity on nine scenarios).
+1. Important: chat-system's README says `lookup` is the API servers' first step; it is the last, so
+   nothing is called after it and the failover never fires there (Task 15 rewires the scenario).
+2. Important: `Graph::lookup_before` and the schema say the first call decides; the engine decides
+   per step (`discovery_before_step`): `[svc.call, disc.lookup, svc.call]` loses 2.5k.
+3. Minor: the after line prints the discovery's window, not `min(failover, for)`.
+4. Minor: with retries the after line says "requests" for attempts.
+5. Minor: overlapping faults double-count the failover in the after lines.
+6. Minor: with every replica down, after the window the requests wait in the room again (a real
+   registry would fail fast): document as ignored.
+7. Minor: lookups in `then` lists never fail over: document.
+8. The red commit's `test_graph.cpp` was ill-formed (my merge resolution lost a brace); the green
+   commit's brace fix is the only test change beyond the three merge-driven scenario expectations.
+9. Minor: README's test count (1163) and a stale sentence about the four refused READMEs.
+Decisions: 1 (one sentence now; Task 15 rewires), 2 (per-step rule in `lookup_before` and the
+schema), 3, 4, 6, 7, 9 fixed in a fix round; 5 documented beside `overlaps_at_s`.
+
 ### Task 14: `ws_gateway`: connections as a level
 
 **Files:** `src/engine/behaviours.cppm` (`WsGatewayBehaviour`: the level `C`, connects from a `connect` op reaching the gateway or a fixed `connections`, disconnects `C / session`, the cap `max_connections × replicas` with the excess rejected, heartbeat load `C / heartbeat` on the `heartbeat` op, `fanout` as a factor on a message op's `then` steps, `deliver` terminal), `src/model/model.cppm` (`max_connections`, `heartbeat`, `fanout`, `connections`, `session`, `reconnect_within`), `src/config/nodes.cpp` (keys and refusals: a gateway with neither a `connect` op reaching it nor `connections` → `node 'gw': a ws_gateway needs a client op named 'connect' or a fixed 'connections'`; both → refused; `fanout` ≥ 1; `heartbeat`, `session`, `reconnect_within` positive durations), `src/defaults/defaults.cppm` (`session` 30 min, `reconnect_within` 30 s, both `// chosen`), `src/engine/engine.cppm` (`NodeSample::connections`; `make_node`), `src/report/*` (`connections` peak/end in the gateway row and JSON; CSV `connections`), `src/report/explain.cpp` (the gateway's line with the level's steady value `C* = connect rate × session`, the heartbeat load, the cap), tests in a new `tests/theory/test_gateways.cpp`, `test_graph.cpp`, `test_config.cpp`.
