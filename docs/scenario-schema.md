@@ -5,7 +5,7 @@ rules the phase 1 loader enforces; v1.2 added phase 2a's rate curves, balancers,
 fixed-ratio caches; v1.3 phase 2b's Che caches, SQL databases, CDNs and id generators.
 **v1.4** is the language as phase 2c reads it: the loader (`src/config/`, one implementation
 unit per concern: `header.cpp`, `nodes.cpp`, `steps.cpp`, `workload.cpp`, `links.cpp`,
-`slos.cpp`, `overrides.cpp`), the graph builder (`src/engine/graph.cpp`), the node behaviours
+`slos.cpp`, `faults.cpp`, `overrides.cpp`), the graph builder (`src/engine/graph.cpp`), the node behaviours
 (`src/engine/behaviours.cppm`), the reports (`src/report/report.cpp`, `explain.cpp`) and the
 sweep (`src/sweep/sweep.cpp`). All 14 files under
 `scenarios/` load under it, and ten of them run end to end ([below](#what-runs-in-phase-2c)).
@@ -133,7 +133,7 @@ Everything else is refused before the first step, with exit code 1:
 | `ws_gateway`, `service_discovery` | `node 'x' has type 'ws_gateway', which run/estimate do not support yet (phase 3)` | 3 |
 | `notification_fanout`, `frontier` | the same message | 3 |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
-| `faults` | none: the list is accepted and nothing happens | 3 |
+| `faults` | none: the list is read and validated (see [`faults`](#faults)), and nothing happens | 3 |
 
 The type message names the phase that plans the type's model, phase 3 for all four. The type
 check runs over the whole file first, and names the first node
@@ -261,7 +261,7 @@ copy or machine): they would be lower bounds too.
 | `nodes` | map id → node | yes | read | non-empty; ids are non-empty and unique |
 | `links` | list | yes | read | `[]` for none |
 | `slo` | list | no | read | |
-| `faults` | list | no | ignored | must be a list; contents are typed in phase 3 |
+| `faults` | list | no | read | scripted failures, see [`faults`](#faults); typed and validated, applied by the engine later in phase 3 |
 
 ## `datacenters`
 
@@ -1384,13 +1384,35 @@ latency SLO on it fails. The mean stays the answered requests' mean (the truncat
 
 ## Faults
 
-`{at: clock-or-duration, for: duration, kind: node_down|dc_down †|partition|latency_spike †|traffic_spike †|cache_flush †, node|dc|between †, fraction, factor †}`.
+A list of scripted failures (spec §4.1), each typed into a `model::Fault` by `src/config/faults.cpp`.
+The engine applies them later in phase 3; until then they are read, validated and listed by
+`explain` (`faults: 1 scripted (node_down chat_servers 21:30 for 1m)`; no line without faults).
 
-`partition` takes either `between: [dc-a, dc-b]` † (cut two datacenters apart) or `node: <id>, fraction: <0–1>`
-(split a clustered node into two groups of the given proportion that cannot see each other;
-`fraction: 0.5` is two halves).
+```yaml
+faults:
+  - {at: 21:30, kind: node_down, node: chat_servers, for: 1m}
+  - {at: 15:00, kind: node_down, node: post_db, replicas: 1, for: 30s}
+  - {at: 12:00, kind: latency_spike, node: user_db, extra: 50ms, for: 5m}
+  - {at: 03:00, kind: capacity, node: cdn_us, factor: 0.5, for: 20m}
+  - {at: 09:00, kind: cache_flush, node: feed_cache}
+  - {at: 18:00, kind: traffic_spike, node: users, factor: 3, for: 10m}
+  - {at: 02:00, kind: dc_down, datacenter: eu, for: 2m}
+```
 
-The loader checks only that `faults` is a list; faults are typed and simulated in phase 3.
+| key | required | meaning |
+|---|---|---|
+| `at` | yes | a clock time (`21:30`) or a duration from the run's start (`90m`), the rate curve's syntax; must fall inside the run (`faults[0]: at must fall inside the run (24h)`) |
+| `kind` | yes | `node_down`, `capacity`, `latency_spike`, `cache_flush`, `traffic_spike` or `dc_down`; `partition` is refused (`partition is not modelled in phase 3 (see the backlog)`) |
+| `for` | all kinds but `cache_flush` | a positive duration; the fault ends at `at + for`. A flush is an instant: `cache_flush takes no for` |
+| `node` | all kinds but `dc_down` | a declared node; `traffic_spike` needs a client, `cache_flush` a cache or cdn, the others any node but a client (`node_down cannot name a client (clients emit, they do not serve)`) |
+| `replicas` | `node_down` only, optional | how many of the node's replicas go down (default: all), 1 up to its `replicas`; for a kv_cluster, of its `nodes`; for a sql_db also `primary` |
+| `factor` | `capacity`, `traffic_spike` | `capacity`: strictly between 0 and 1; `traffic_spike`: positive, at most 1e6 |
+| `extra` | `latency_spike` | a positive duration added to the node's service time |
+| `datacenter` | `dc_down` | a declared datacenter |
+
+A key the entry's kind does not read is refused (`replicas applies to node_down only`), and so is
+a misspelt one (`faults[0]: unknown key 'nod'`). Every message names the entry by its position in
+the list.
 
 ## Command line: `simsys sweep` (phase 2c)
 

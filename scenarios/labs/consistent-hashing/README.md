@@ -50,9 +50,9 @@ recommended setting. 15k/s gives 67 % on average and room for the spread.
   the primary idles and the replica carries the misses: `explain` prints `primary 0 units/s vs
   5k/s (0%, green), each replica 1.345k units/s vs 5k/s (26.9%, green)` (capacity units: a read
   costs 1, so here they are reads).
-- The fault at 10 m (one server removed) is accepted and ignored: faults are typed in phase 3.
-  Then the server's capacity will go and the hit ratio, resolved once at build today, will be
-  re-evaluated (the keys that move to the next server arrive cold).
+- The fault at 10 m (one server removed, `replicas: 1`) is read and validated, not yet applied:
+  faults run later in phase 3. Then the server's capacity will go and the hit ratio, resolved
+  once at build today, will be re-evaluated (the keys that move to the next server arrive cold).
 
 ## What it abstracts away
 - The hash function, ring data structure and lookup (binary search).

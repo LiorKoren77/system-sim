@@ -246,13 +246,6 @@ CheckResult check_root_is_map(const Site& site, const YAML::Node& root) {
   return {};
 }
 
-// `faults` is typed in phase 3; its shape is checked now, so a scalar is not silently kept.
-CheckResult check_faults_is_list(const Site& site, const YAML::Node& root) {
-  const auto faults = root["faults"];
-  if (!faults || faults.IsSequence()) return {};
-  return site.fail(faults, "faults must be a list");
-}
-
 // A top-level key whose value is a list or map, and how it is written empty when that is
 // valid ("" when it is not: a scenario needs nodes, and `datacenters` declares at least one).
 struct Section {
@@ -286,8 +279,7 @@ CheckResult check_top_level(const Site& site, const YAML::Node& root) {
   if (auto checked = check_keys_and_expansion(site, root); !checked) return checked;
   if (auto checked = check_required_top_level_keys(site, root); !checked) return checked;
   if (auto checked = check_known_top_level_keys(site, root); !checked) return checked;
-  if (auto checked = check_sections_not_null(site, root); !checked) return checked;
-  return check_faults_is_list(site, root);
+  return check_sections_not_null(site, root);
 }
 
 // ---- Header ---------------------------------------------------------------------------

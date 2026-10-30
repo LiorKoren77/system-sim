@@ -2019,8 +2019,8 @@ TEST_CASE("nested aliases are checked once and cheaply") {
   // file describe a huge tree: nested_aliases(8, 10) reaches the one `base` map 10^8 times. A
   // walk that followed every path took minutes here (about 4 in a Debug build); the loader's
   // walk meets each shared node once and remembers its expanded size, so it takes
-  // milliseconds whether the expansion is accepted or over the cap. `faults` is only checked
-  // to be a list until phase 3 types it, which is why nested lists are accepted inside it.
+  // milliseconds whether the expansion is under the cap or over it. The nested lists sit in
+  // `faults`, which the walk sees before any typed reader runs.
   const auto load_timed = [](std::string_view file_name, int levels) {
     const auto path = write_temp(
         file_name, scenario_with("  a: {type: service}\n",
@@ -2031,13 +2031,15 @@ TEST_CASE("nested aliases are checked once and cheaply") {
     CHECK(elapsed < 200ms);
     return s;
   };
-  SECTION("an expansion under the cap loads") {
+  SECTION("an expansion under the cap passes the walk and reaches the typed readers") {
     // An entry is a map, a list or a scalar value. The fault map counts 4 (itself and its
     // three values) and each list 1 plus its ten copies, so 5 levels expand to 411 111
-    // entries; the rest of the scenario adds 9.
+    // entries; the rest of the scenario adds 9. Under the cap the walk lets the document
+    // through, and the typed faults reader refuses its first entry, a list where a fault map
+    // belongs: the refusal is the reader's, not the cap's.
     const auto s = load_timed("simsys_nested_aliases_small.yaml", 5);
-    INFO((s ? "" : s.error().message));
-    REQUIRE(s.has_value());
+    REQUIRE_FALSE(s.has_value());
+    CHECK(s.error().message == "faults[0]: must be a map");
   }
   SECTION("an expansion far over the cap is rejected without following every path") {
     const auto s = load_timed("simsys_nested_aliases.yaml", 8);

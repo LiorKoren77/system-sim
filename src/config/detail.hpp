@@ -27,7 +27,7 @@
 //
 // What this costs, said plainly: a deliberate departure from the standard, forced by GCC 14.2.
 // The structs (Site, Declarations, OwnKeys, ...), the `inline constexpr` tables and the
-// templates below are definitions attached to simsys.config, and each of the nine units that
+// templates below are definitions attached to simsys.config, and each of the ten units that
 // includes this header defines them again. [basic.def.odr] allows such repeated definitions
 // only for entities attached to the global module (the reason headers work); for an entity
 // attached to a named module it requires one definition, in one unit, and repeating it is
@@ -512,6 +512,12 @@ std::expected<std::vector<model::SloSpec>, ConfigError> collect_slos(const Site&
                                                                      const YAML::Node& root,
                                                                      const Declarations& declared,
                                                                      const model::Scenario& run);
+
+// faults.cpp: the `faults` list (spec §4.1), after the nodes and datacenters it names.
+std::expected<std::vector<model::Fault>, ConfigError> read_faults(const Site& site,
+                                                                  const YAML::Node& root,
+                                                                  const Declarations& declared,
+                                                                  const model::Scenario& run);
 
 // overrides.cpp: `simsys sweep`'s replaced values.
 std::expected<YAML::Node, ConfigError> find_override_target(const std::string& file,

@@ -51,9 +51,12 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   ```
 
 ## What it abstracts away
-- The two faults in the YAML (a node down at 10 m, a partition at 20 m) are accepted and do
-  nothing: faults, sloppy quorum, hinted handoff and what `mode: ap` or `cp` does under a
-  partition (stale versus unavailable) wait for phase 3. `mode` is printed, nothing more.
+- The fault in the YAML (one node down at 10 m, `replicas: 1`) is read and validated but does
+  nothing yet: faults run later in phase 3. Sloppy quorum and hinted handoff are not modelled.
+- Network partitions are not modelled: they are a phase 4 backlog item, and the loader refuses
+  `kind: partition` (`partition is not modelled in phase 3 (see the backlog)`), so what `mode: ap`
+  or `cp` does under a partition (stale versus unavailable) cannot be shown. `mode` is printed,
+  nothing more.
 - Vector clocks and conflict resolution, read repair and Merkle-tree anti-entropy traffic,
   gossip, the storage engine (commit log, memtable, SSTables, compaction).
 - The replicas' reply times are taken as independent lognormals of their machine's mean and
@@ -112,7 +115,7 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   `write_quorum: 1, read_quorum: 3` swaps them. The load does not change. `explain` marks either
   with `(W + R ≤ N: a read may miss the latest write)` only when the two quorums stop overlapping
   (W + R = 4 > 3 here: they still do).
-- `mode: cp`: no difference until partitions exist (phase 3). With quorums that do not overlap
+- `mode: cp`: no difference until partitions exist (phase 4 backlog). With quorums that do not overlap
   (say `write_quorum: 1, read_quorum: 1`) `explain` says that cp contradicts them.
 - `nodes: 4`: 22.5k/s per machine; the cluster drops 55.6 % of the replica-requests and delivers
   41.7 % of the requests (the binomial again: a request needs two of its three); the 100 ms

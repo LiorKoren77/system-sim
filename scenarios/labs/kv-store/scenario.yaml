@@ -1,7 +1,9 @@
 # Lab: System Design Interview vol. 1, ch. 6 — Key-value store (Dynamo-style).
 # N=3 replicas, W=2, R=2 quorum, consistent hashing with virtual nodes, hinted handoff,
-# vector clocks, gossip failure detection. Two faults: a node failure and a partition (accepted
-# and ignored until faults run, phase 3; so are hinted handoff, vector clocks and gossip).
+# vector clocks, gossip failure detection. One fault: a node failure (read and validated, not yet
+# applied: faults run later in phase 3; hinted handoff, vector clocks and gossip are not modelled).
+# A network partition, the fault that tells `mode: ap` from `cp`, is a phase 4 backlog item: not
+# modelled, and the loader refuses `kind: partition`.
 version: 1
 name: lab-kv-store
 seed: 1
@@ -67,5 +69,4 @@ slo:
   - {metric: drop_rate, max: 0.01}
 
 faults:
-  - {at: 10m, kind: node_down, node: store, for: 3m}            # one of the nodes
-  - {at: 20m, kind: partition, node: store, fraction: 0.5, for: 2m}   # split the ring in two halves that cannot see each other
+  - {at: 10m, kind: node_down, node: store, replicas: 1, for: 3m}   # one of the nodes

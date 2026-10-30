@@ -2,7 +2,7 @@
 # A load balancer hashes keys onto a ring of cache servers. The shipped `vnodes: 150` (even
 # partitions) meets the SLOs; try `vnodes: 1` (uneven: the hottest server takes just over
 # half the load and fails the cache servers' SLO; the database's still passes). The fault below
-# (a server removed) is typed in phase 3 and ignored until then.
+# (a server removed) is read and validated, and applied once faults run later in phase 3.
 version: 1
 name: lab-consistent-hashing
 seed: 1
@@ -52,4 +52,4 @@ slo:
   - {metric: utilization, node: db, max: 0.7}
 
 faults:
-  - {at: 10m, kind: node_down, node: cache_servers, for: 5m}    # one of the four replicas
+  - {at: 10m, kind: node_down, node: cache_servers, replicas: 1, for: 5m}   # one of the four replicas

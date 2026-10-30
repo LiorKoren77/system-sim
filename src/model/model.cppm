@@ -283,7 +283,7 @@ inline constexpr auto id_algorithm_table = std::to_array<core::EnumName<IdAlgori
 // What a Dynamo-style key-value store gives up when a network partition splits it (System Design
 // Interview ch. 6, "CAP theorem"): `ap` keeps answering on both sides and returns stale data
 // (Dynamo, Cassandra), `cp` refuses what cannot reach a quorum (unavailable instead of stale).
-// Read and printed only: without partitions (faults are phase 3) the two behave alike.
+// Read and printed only: without partitions (a phase 4 backlog item) the two behave alike.
 enum class KvMode { ap, cp };
 
 // Pattern: Table-driven method — the mode names, read by the loader (`mode:`) and printed by
@@ -598,8 +598,8 @@ struct NodeSpec {
   // cluster without one); the others default (default_replication, default_quorum: the book's N =
   // 3, W = R = 2) through kv_replication, kv_write_quorum and kv_read_quorum. The loader leaves an
   // absent one absent. `kv_mode` is ap or cp, what a partition would cost (KvMode): read and
-  // printed, not modelled before faults (phase 3); absent means ap (kv_mode_of), kept absent so
-  // explain can mark it "(default)" as it marks N, W and R.
+  // printed, not modelled without partitions (a phase 4 backlog item); absent means ap
+  // (kv_mode_of), kept absent so explain can mark it "(default)" as it marks N, W and R.
   std::optional<int> kv_nodes{};
   std::optional<int> replication{};
   std::optional<int> write_quorum{};
@@ -742,6 +742,62 @@ struct SloSpec {
   std::optional<SimTime> over{};
 };
 
+// ---- Scripted faults (spec §4.1) ----
+//
+// A fault is an event the scenario scripts under `faults:`: at a time on the run's clock something
+// breaks, and (all but a cache flush) mends `for` later. Models the failure scenarios System Design
+// Interview walks a design through: a web server or a database going offline (ch. 1, "if the
+// master database goes offline, a slave database will be promoted"), a whole data center lost (ch.
+// 1, "Data centers": GeoDNS sends its users to the healthy one), a cache restarted cold (ch. 1,
+// "Considerations for using cache": a single cache server is a single point of failure), a slow or
+// degraded dependency, and a flash crowd (ch. 4: the burst a rate limiter exists for). The model
+// only carries the script; the loader fills it and the engine applies it. Captured: what breaks
+// (one node, some of its replicas, or a datacenter), when, for how long, and by how much.
+// Deliberately ignored: how the failure is detected (heartbeats, gossip: ch. 6), random failures
+// (every fault is scripted, so a run stays deterministic for its seed), and network partitions
+// (ch. 6's CAP trade-off, a phase 4 backlog item: `kind: partition` is refused).
+enum class FaultKind : std::uint8_t {
+  node_down,      // the node, or `replicas` of its replicas, serves nothing
+  capacity,       // the node serves at `factor` (< 1) of its capacity: a degraded tier
+  latency_spike,  // the node's service time grows by `extra`: a slow dependency
+  cache_flush,    // a cache or CDN loses its contents at once and refills from its misses
+  traffic_spike,  // a client sends `factor` times its rate: a flash crowd
+  dc_down         // every node of `datacenter` is down
+};
+
+// Pattern: Table-driven method — the fault kind names, read by the loader (`kind:`) and printed by
+// explain from this one table.
+inline constexpr auto fault_kind_table = std::to_array<core::EnumName<FaultKind>>({
+    {FaultKind::node_down, "node_down"},
+    {FaultKind::capacity, "capacity"},
+    {FaultKind::latency_spike, "latency_spike"},
+    {FaultKind::cache_flush, "cache_flush"},
+    {FaultKind::traffic_spike, "traffic_spike"},
+    {FaultKind::dc_down, "dc_down"},
+});
+
+[[nodiscard]] constexpr std::string_view to_string(FaultKind k) {
+  return core::name_in(fault_kind_table, k);
+}
+[[nodiscard]] constexpr std::optional<FaultKind> parse_fault_kind(std::string_view name) {
+  return core::parse_in(fault_kind_table, name);
+}
+
+// One scripted fault. The members are the schema's keys, except `duration`, which is `for:` (a C++
+// keyword), and `primary`, which is `replicas: primary`. Only the members of the fault's kind are
+// set; the loader refuses a key another kind reads.
+struct Fault {
+  FaultKind kind{};
+  SimTime at{};              // from the start of the run (t = 0 is midnight); inside the run
+  SimTime duration{};        // the fault ends at `at + duration`; 0 for a cache_flush, an instant
+  std::string node{};        // the node it acts on; empty for a dc_down
+  std::string datacenter{};  // dc_down only
+  std::optional<int> replicas{};  // node_down only: how many replicas go down; absent: all of them
+  bool primary{false};  // node_down on a sql_db: the primary goes down (`replicas: primary`)
+  std::optional<double> factor{};  // capacity: in (0, 1); traffic_spike: positive
+  std::optional<SimTime> extra{};  // latency_spike: added to the node's service time
+};
+
 struct Scenario {
   std::string name{};
   int version{};
@@ -756,6 +812,7 @@ struct Scenario {
   std::vector<NodeSpec> nodes{};
   std::vector<LinkSpec> links{};
   std::vector<SloSpec> slos{};
+  std::vector<Fault> faults{};  // in document order; empty: the run breaks nothing
 };
 
 }  // namespace simsys::model
@@ -788,3 +845,5 @@ static_assert(simsys::core::round_trips(simsys::model::id_algorithm_table));
 static_assert(simsys::model::id_algorithm_table.back().value == simsys::model::IdAlgorithm::uuid);
 static_assert(simsys::core::round_trips(simsys::model::kv_mode_table));
 static_assert(simsys::model::kv_mode_table.back().value == simsys::model::KvMode::cp);
+static_assert(simsys::core::round_trips(simsys::model::fault_kind_table));
+static_assert(simsys::model::fault_kind_table.back().value == simsys::model::FaultKind::dc_down);

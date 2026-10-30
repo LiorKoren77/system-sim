@@ -56,6 +56,7 @@ target_sources(simsys
     src/config/workload.cpp
     src/config/links.cpp
     src/config/slos.cpp
+    src/config/faults.cpp
     src/config/overrides.cpp
     src/engine/graph.cpp
     src/model/model.cpp
