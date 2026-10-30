@@ -455,8 +455,31 @@ attempts`, `pool w re-published 999 jobs`; JSON `lost_requests`, `after.retries_
 
 **Files:** `src/engine/behaviours.cppm` (`WsGatewayBehaviour`: the level `C`, connects from a `connect` op reaching the gateway or a fixed `connections`, disconnects `C / session`, the cap `max_connections × replicas` with the excess rejected, heartbeat load `C / heartbeat` on the `heartbeat` op, `fanout` as a factor on a message op's `then` steps, `deliver` terminal), `src/model/model.cppm` (`max_connections`, `heartbeat`, `fanout`, `connections`, `session`, `reconnect_within`), `src/config/nodes.cpp` (keys and refusals: a gateway with neither a `connect` op reaching it nor `connections` → `node 'gw': a ws_gateway needs a client op named 'connect' or a fixed 'connections'`; both → refused; `fanout` ≥ 1; `heartbeat`, `session`, `reconnect_within` positive durations), `src/defaults/defaults.cppm` (`session` 30 min, `reconnect_within` 30 s, both `// chosen`), `src/engine/engine.cppm` (`NodeSample::connections`; `make_node`), `src/report/*` (`connections` peak/end in the gateway row and JSON; CSV `connections`), `src/report/explain.cpp` (the gateway's line with the level's steady value `C* = connect rate × session`, the heartbeat load, the cap), tests in a new `tests/theory/test_gateways.cpp`, `test_graph.cpp`, `test_config.cpp`.
 
-- [ ] Tests: a client with `ops: {connect: 0.5, send: 0.5}` at 200/s (connect 100/s) → gateway `session: 1000s`, `heartbeat: 5s`, `max_connections: 200k`, `replicas: 1`: the level follows `C' = 100 − C / 1000`, so `C(t) = 100k (1 − e^{−t/1000})`: **63.2k** at t = 1000 s, **100k** at the fixed point (within 1 % at 4600 s); the heartbeat load is **C / 5** (20k/s at the fixed point) on the gateway's `heartbeat` op (visible as its demand); with `max_connections: 50k` the level stops at **50k** and connects are rejected at **100 − 50k / 1000 = 50/s** (`rejected_per_s`); `connections: 2M` fixed → C is 2M from the first step, heartbeat 60 s → **33.33k/s**; a `send` op with `then: [{to: q, op: publish}]` and `fanout: 1.4` sends `q` **1.4 ×** the send rate; `deliver` ops make no hops; `estimate` reports the fixed-point level; the explain line.
-- [ ] Commit `nodes: ws_gateway holds connections as a level and fans messages out`.
+- [x] Tests: a client with `ops: {connect: 0.5, send: 0.5}` at 200/s (connect 100/s) → gateway `session: 1000s`, `heartbeat: 5s`, `max_connections: 200k`, `replicas: 1`: the level follows `C' = 100 − C / 1000`, so `C(t) = 100k (1 − e^{−t/1000})`: **63.2k** at t = 1000 s, **100k** at the fixed point (within 1 % at 4600 s); the heartbeat load is **C / 5** (20k/s at the fixed point) on the gateway's `heartbeat` op (visible as its demand); with `max_connections: 50k` the level stops at **50k** and connects are rejected at **100 − 50k / 1000 = 50/s** (`rejected_per_s`); `connections: 2M` fixed → C is 2M from the first step, heartbeat 60 s → **33.33k/s**; a `send` op with `then: [{to: q, op: publish}]` and `fanout: 1.4` sends `q` **1.4 ×** the send rate; `deliver` ops make no hops; `estimate` reports the fixed-point level; the explain line.
+- [x] Commit `nodes: ws_gateway holds connections as a level and fans messages out` (red `15b5333`, green `261a568`, 1530 tests; the level refusals live in `Simulation::create`; type defaults kept at 50k/s, 100 µs).
+
+**Review of Task 14 at `261a568`** (adversarial, bounded, 2026-10-30): REQUEST_CHANGES. The Euler
+level vs the closed form, the cap and its rejections (`reject_rate`, not drops), heartbeats added to
+the client's, fan-out per target, the level as a total behind a balancer, the fault's derating,
+identity vs the parent, §2 and §3 verified.
+1. Important: `deliver` with `then` steps is accepted and routed; the spec says `deliver` is terminal.
+2. Important (spec, → Task 15): `fanout` multiplies every step of a message op, so chat-system stores
+   each message 1.4 times and mints 1.4 ids; with `sync_workers`' `factor: 1.4` it delivers 1.96 per
+   message. Ch. 12 copies a message once per recipient into the sync queues: limit `fanout` to the
+   steps that target a `message_queue`, drop the workers' factor.
+3. Minor (§1): `std::ranges::contains`' and `std::string::contains`' first-use comments sit after
+   their first use (`engine.cppm:571`, `test_scenarios.cpp:85`).
+4. Minor: `--replications` per-seed JSON lacks `connections`/`connections_peak`.
+5. Minor: explain's `C*` line uses the peak connect rate and does not say when a run is too short to
+   settle (3 sessions).
+6. Minor: `// Pattern: Delegation` on `WsGatewayBehaviour` is a static Decorator over the behaviour concept.
+7. Minor: new exported constants are `inline constexpr` (the seventh defect's rule: `constexpr` alone).
+8. Minor: no `<gateway>.connections` sweep metric.
+9. Notes for Task 15: during a gateway `node_down` the open connections keep pinging it (11.7M lost,
+   mostly heartbeats); chat-system's 2M connections at a 5 s heartbeat are 400k/s of pings against
+   20 × 10k/s: the scenario's sizing lesson.
+Decisions: 1, 3–8 fixed in a fix round after Task 13 merges (same files); 2 and 9 to Task 15 with the
+recommendation above.
 
 Note for Task 15 (from Task 14's implementer, 2026-10-30): chat-system's gateway has `fanout: 1.4` and
 its `sync_workers` deliver with `factor: 1.4`, so the scenario now fans out twice on paper (message_store
