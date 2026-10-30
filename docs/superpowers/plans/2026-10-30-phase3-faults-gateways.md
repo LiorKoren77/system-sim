@@ -682,11 +682,23 @@ frontier.
 
 ### Task 19: Docs
 
-- [ ] Schema **v1.5**: "New in v1.5"; "What runs" (fourteen types, all fourteen scenarios, exit codes: web-crawler and lab-unique-id exit 2 on purpose); the `faults` table (§4.1 of the spec verbatim with the refusal messages); `retries`/`retry_after` on clients and pools; `on: failure`; the four types' sections with their keys; `connect` ops and `connections`; `--replications`; the fault block, `attempts/s`, `dead_lettered/s`, `deduplicated/s`, `connections`; the JSON key table extended; the CSV columns; one section "Defaults chosen, not from the book" listing `retry_after`, pool `retry_after`, `session`, `reconnect_within`, `failover` with the README sweeps that show their effect.
-- [ ] Spec **§20**: the rules as finally implemented with each review's corrections; §7's rows for the four types revised; §9.3 says what `--replications` does and that random faults wait; §13's row closed.
-- [ ] Study notes: whatever new constructs the tasks introduce (first-use comments list them; `docs/study/small-features.md` gains sections as needed); `numerics.md` gains the retry series, the connection level's exponential approach and the cache warm-up curve; `modules.md` gains the 3a layout (implementation units, the shared-helper choice).
-- [ ] Root README: phase 3 status, fourteen runnable scenarios, a fault example with its block, `--replications` example, the test count.
-- [ ] Commit `docs: schema v1.5, spec §20 phase 3, study notes, README for the fourteen scenarios`.
+- [x] Schema **v1.5**: "New in v1.5"; "What runs" (fourteen types, all fourteen scenarios, exit codes: web-crawler and lab-unique-id exit 2 on purpose); the `faults` table (§4.1 of the spec verbatim with the refusal messages); `retries`/`retry_after` on clients and pools; `on: failure`; the four types' sections with their keys; `connect` ops and `connections`; `--replications`; the fault block, `attempts/s`, `dead_lettered/s`, `deduplicated/s`, `connections`; the JSON key table extended; the CSV columns; one section "Defaults chosen, not from the book" listing `retry_after`, pool `retry_after`, `session`, `reconnect_within`, `failover` with the README sweeps that show their effect.
+- [x] Spec **§20**: the rules as finally implemented with each review's corrections; §7's rows for the four types revised; §9.3 says what `--replications` does and that random faults wait; §13's row closed.
+- [x] Study notes: whatever new constructs the tasks introduce (first-use comments list them; `docs/study/small-features.md` gains sections as needed); `numerics.md` gains the retry series, the connection level's exponential approach and the cache warm-up curve; `modules.md` gains the 3a layout (implementation units, the shared-helper choice).
+- [x] Root README: phase 3 status, fourteen runnable scenarios, a fault example with its block, `--replications` example, the test count.
+- [x] Commit `docs: schema v1.5, spec §20 phase 3, study notes, README for the fourteen scenarios`.
+
+Done at `df1c988` (docs only; 1681 tests). §20 sits in the main design spec
+(`2026-10-27-system-sim-design.md`, after §19's phase 2c refinements), sixteen entries for 3a and
+Tasks 5–18 with pointers from §7's rows, the faults line, §9.3/§9.4 and §13. The schema counts
+eighteen node types (`model::NodeType`), not fourteen. "Defaults chosen, not from the book" quotes
+chat-system's `reconnect_within` sweep and four small probe sweeps for the other defaults.
+Carried to the phase review's fix round: `explain` prints `(partitions: phase 3)` for a kv_cluster
+(phase 4 now); `defaults.cppm`'s frontier comment says "web-crawler: 5k/s" while the scenario
+states 10k/s; `tests/theory/test_gateways.cpp`'s header says Euler at 1 s is "0.03 % low" at
+1000 s while the binary is high (63,230.5 vs 63,212); the recovery rule takes the first step
+within 1 % of the twin, so a crossing counts (a gateway probe reported recovery 0 s after the
+fault, before its overshoot); the per-seed JSON under `--replications` lacks `deduplicated_per_s`.
 
 ## Comprehensive phase 3 review, then push
 
