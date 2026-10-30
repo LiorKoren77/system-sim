@@ -75,20 +75,6 @@ simsys::graph::Graph build_or_fail(const simsys::model::Scenario& s) {
   return std::move(*built);
 }
 
-// What Simulation::create says of a websocket gateway that neither a `connect` op reaches nor a
-// fixed `connections` fills (phase 3 Task 14): chat-system's chat_servers until its own task
-// (google-drive's long_poll states a fixed 2M since Task 16).
-constexpr std::string_view gateway_without_level =
-    "a ws_gateway needs a client op named 'connect' or a fixed 'connections'";
-
-// Does Simulation::create's refusal wait for a later task of phase 3: a node type it has no model
-// of yet ("... (phase 3)"), or a gateway whose level the scenario does not state yet?
-bool waits_for_a_later_task(const std::string& refusal) {
-  // C++23 std::string::contains: a substring test in one call, replacing
-  // `find(...) != std::string::npos`, so the test reads as what it checks.
-  return refusal.contains("phase 3") || refusal.contains(gateway_without_level);
-}
-
 }  // namespace
 
 TEST_CASE("every shipped scenario validates", "[scenario]") {
@@ -118,20 +104,17 @@ TEST_CASE("every shipped scenario resolves into a graph that explain can print",
   }
 }
 
-// Which scenarios run grows with each phase, so the test does not name them: a scenario whose node
-// types the engine does not simulate yet is refused by Simulation::create with a message naming the
-// phase ("... do not support yet (phase 3)") and is skipped; so is one whose websocket gateway
-// states no level yet (chat-system until its own task: a gateway is simulated since phase 3
-// Task 14, but needs a `connect` op or a fixed level, which google-drive states since Task 16);
-// every other one is run to its end and must meet its own SLOs. A scenario the engine refuses for
-// any other reason is a failure, not a skip. The time limit's point is "no shipped scenario takes
-// minutes", not a benchmark: each one run here costs at most 0.6 s of CPU in Debug and 0.04 s in
-// Release (measured 2026-10-29), but for the two with faults (kv-store, consistent-hashing), which
-// step a fault-free twin beside the run (engine::FaultRecord's header) and cost more: a whole Debug
-// `simsys run` of kv-store, its twin and its fault block included, takes 2.9 s of CPU (measured
-// 2026-10-30). It is CPU time, not wall-clock time: under `ctest -j` on a loaded machine this test
-// took 4.61 s of wall clock in Debug and its wall-clock limit was flaky, while the CPU time a
-// single-threaded run spends is what the scenario costs, whoever else shares the machine.
+// Every shipped scenario runs since phase 3 (Task 15 made the last one, chat-system, runnable), so
+// a scenario Simulation::create refuses is a failure here, never a skip; each one is run to its end
+// and must meet its own SLOs, but for the ones exempted by name below. The time limit's point is
+// "no shipped scenario takes minutes", not a benchmark: each one run here costs at most 0.6 s of
+// CPU in Debug and 0.04 s in Release (measured 2026-10-29), but for the two with faults (kv-store,
+// consistent-hashing), which step a fault-free twin beside the run (engine::FaultRecord's header)
+// and cost more: a whole Debug `simsys run` of kv-store, its twin and its fault block included,
+// takes 2.9 s of CPU (measured 2026-10-30). It is CPU time, not wall-clock time: under `ctest -j`
+// on a loaded machine this test took 4.61 s of wall clock in Debug and its wall-clock limit was
+// flaky, while the CPU time a single-threaded run spends is what the scenario costs, whoever else
+// shares the machine.
 // The [serial] tag: tests/CMakeLists.txt registers this case with ctest's RUN_SERIAL property, so
 // `ctest -j8` runs it alone. The limit is CPU time, but eight test processes sharing the cores'
 // caches and hyperthreads slow each one's CPU time too: with the day tests alongside, kv-store
@@ -149,10 +132,7 @@ TEST_CASE(
     const auto& s = *loaded;
     const auto g = build_or_fail(s);
     auto created = simsys::engine::Simulation::create(g);
-    if (!created) {
-      REQUIRE(waits_for_a_later_task(created.error().message));
-      continue;  // a node type, or a gateway's level, of a later task: nothing to run yet
-    }
+    if (!created) FAIL(created.error().message);
     // Two runnable scenarios are checked by their own tests below instead, each for a stated
     // reason:
     //  - lab-unique-id ships with the ticket server carrying the load, to FAIL its drop_rate SLO
@@ -1748,12 +1728,10 @@ TEST_CASE("book/youtube runs the day and passes its three SLOs", "[scenario]") {
 // accepts the file now (the refusal pinned further up, "is refused at fanout", is the test this
 // replaces; it goes when the type runs).
 
-TEST_CASE("book/notification-system uses only node types the engine simulates, its fanout included",
+TEST_CASE("book/notification-system is accepted by Simulation::create, its fanout included",
           "[scenario]") {
   const auto s =
       load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/notification-system/scenario.yaml");
-  REQUIRE(std::ranges::all_of(
-      s.nodes, [](const auto& node) { return simsys::model::simulated(node.type); }));
   const auto sim = simsys::engine::Simulation::create(build_or_fail(s));
   INFO((sim ? "" : sim.error().message));
   REQUIRE(sim.has_value());
@@ -1826,7 +1804,8 @@ TEST_CASE(
 // the kv-store lab, the news feed and search autocomplete. Phase 3's notification fan-out (Task 17)
 // adds the book's notification system, and the frontier, the last type the crawler lacked (Task
 // 18), the book's ch. 9 scenario: twelve shipped scenarios run. Since Task 18 every node type has
-// a model (model::simulated is true for all), so no scenario is refused for its types any more.
+// a model, so no scenario is refused for its types any more (the refusal and the table column that
+// fed it went in Task 18's review round).
 // Task 16 gives google-drive's websocket gateway a fixed level (`connections: 2M`): thirteen run.
 // Task 15 gives chat-system's gateway a level (a `connect` op its users send): fourteen, every
 // shipped scenario. The set of runnable scenarios is pinned by name: whoever
@@ -1843,12 +1822,9 @@ TEST_CASE(
     const auto loaded = simsys::config::load(file);
     if (!loaded) FAIL(loaded.error().message);
     const auto& s = *loaded;
-    REQUIRE(std::ranges::all_of(
-        s.nodes, [](const auto& node) { return simsys::model::simulated(node.type); }));
     const auto created = simsys::engine::Simulation::create(build_or_fail(s));
-    // Refused although every type runs: only a websocket gateway without a level.
-    if (!created) REQUIRE(created.error().message.contains(gateway_without_level));
-    if (created) runnable.push_back(s.name);
+    if (!created) FAIL(created.error().message);
+    runnable.push_back(s.name);
   }
   std::ranges::sort(runnable);
   REQUIRE(runnable == std::vector<std::string>{"chain", "chat-system", "google-drive", "hello",
@@ -1858,13 +1834,19 @@ TEST_CASE(
                                                "url-shortener", "web-crawler", "youtube"});
 }
 
-// What the plan promises of the shipped crawler, and no more: the engine accepts it (`run` no
-// longer exits 1 with "node 'frontier' has type 'frontier', which run/estimate do not support
-// yet"; whether it then exits 0 or 2 is the README's to say, with the SLOs' verdicts and the
-// numbers), the frontier reports a queue lag above zero, and the queue_lag SLO on it is judged
-// instead of skipped. The day runs at a 60 s step (360 steps for the 6 h) to keep the test in
-// seconds.
-TEST_CASE("book/web-crawler runs its day and its frontier reports a positive queue lag",
+// The shipped crawler's day, re-measured after the Task 18 review (the README's table, `simsys run`
+// at the shipped 1 s step; here at a 60 s step, 360 steps for the 6 h, to keep the test in
+// seconds). The lesson the plan asks for: the crawl loop discovers URLs faster than the
+// downloaders fetch them, so the frontier's backlog, and its lag, grow for the whole run. Pinned:
+//  - the downloaders are the bottleneck, with their real 1000 workers every one of them busy
+//    (rho 1: 2000 fetches a second, workers / cost), and more fetches out would need more of them;
+//  - nothing else is: the internet's quota is lifted (`capacity: 1M/s`, so its default 1k/s, the
+//    README's exercise, is not the first wall), and the parser, the content store and the
+//    frontier's prioritiser are sized for the pages and URLs 2000 fetches a second bring
+//    (below 85 %), so the frontier drops no URL;
+//  - the frontier's lag grows past 10 hours by the end of the run (about 4.8k new URLs a second
+//    more than the 2000 the pool drains), and both SLOs fail on purpose: `run` exits 2.
+TEST_CASE("book/web-crawler's day: every downloader busy and the frontier's lag past 10 hours",
           "[scenario]") {
   using namespace std::chrono_literals;
   auto s = load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/web-crawler/scenario.yaml");
@@ -1875,18 +1857,32 @@ TEST_CASE("book/web-crawler runs its day and its frontier reports a positive que
   simsys::report::Summary summary{g, s.warmup};
   sim->run({.duration = s.duration, .step = s.step}, [&](const auto& r) { summary.observe(r); });
   const auto nodes = summary.nodes();
-  const auto frontier = std::ranges::find(nodes, "frontier", &simsys::report::NodeSummary::id);
-  REQUIRE(frontier != nodes.end());
-  REQUIRE(frontier->peak_queue_lag_s.has_value());
-  REQUIRE(*frontier->peak_queue_lag_s > 0.0);
+  const auto node = [&](std::string_view id) {
+    const auto found = std::ranges::find(nodes, id, &simsys::report::NodeSummary::id);
+    REQUIRE(found != nodes.end());
+    return *found;
+  };
+  REQUIRE_THAT(node("downloader").mean_rho, Catch::Matchers::WithinRel(1.0, 1e-9));
+  REQUIRE(node("internet").peak_rho < 0.01);  // 2000 calls a second of a 1M/s quota
+  for (const std::string_view sized : {"frontier", "parser", "content_store"}) {
+    CAPTURE(sized);
+    REQUIRE(node(sized).peak_rho < 0.85);
+  }
+  REQUIRE(node("frontier").total_dropped == 0.0);
+  const auto frontier = node("frontier");
+  REQUIRE(frontier.peak_queue_lag_s.has_value());
+  REQUIRE(*frontier.peak_queue_lag_s > 10.0 * 3600.0);
   const auto results = simsys::report::evaluate_slos(summary, s.slos);
+  REQUIRE(results.size() == 2);
+  for (const auto& result : results) {
+    CAPTURE(simsys::model::to_string(result.slo.metric));
+    REQUIRE(result.status == simsys::report::SloStatus::fail);
+  }
   const auto lag = std::ranges::find(results, simsys::model::SloMetric::queue_lag,
                                      [](const auto& r) { return r.slo.metric; });
   REQUIRE(lag != results.end());
-  REQUIRE(lag->slo.node == "frontier");
-  REQUIRE(lag->status != simsys::report::SloStatus::skipped);
   REQUIRE(lag->observed.has_value());
-  REQUIRE_THAT(*lag->observed, Catch::Matchers::WithinRel(*frontier->peak_queue_lag_s, 1e-9));
+  REQUIRE_THAT(*lag->observed, Catch::Matchers::WithinRel(*frontier.peak_queue_lag_s, 1e-9));
 }
 
 // The internet fails 5 % of its calls (`failure_rate: 0.05`); the downloader sends a failed call
