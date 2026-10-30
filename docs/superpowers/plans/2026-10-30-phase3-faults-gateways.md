@@ -527,6 +527,22 @@ until Task 16 gives `long_poll` `connections: 2M`.
 - [x] `run` exits 0; README numbers *measured* (download p99 125 ms, metadata p99 6.6 ms, drop rate 0, `notify_q` lag 16.5 ms against a new 10 m `queue_lag` SLO; `long_poll` `connections: 2M` fixed, `backup_workers` 2 → 3 with the 2-worker day as the exercise); the day test pins the peaks and verdicts.
 - [x] Commit `scenarios: google-drive runs end to end` (green `c81d5c7` rebased, 1638 tests). Note: the five-second-CPU scenario test is flaky under `ctest -j8` with the day tests (kv-store 5.25 s, consistent-hashing 5.9 s): mark it `RUN_SERIAL` at the 3c push.
 
+**Review of Task 16 at `dded7e4`** (adversarial, bounded, 2026-10-30): REQUEST_CHANGES on wording;
+every quoted number reproduces (the four SLOs, the per-op table, eight peaks, staleness, `explain`'s
+lines, the 2-worker and 4-block-server variants, the backlog window 07:03–13:28, Erlang C by hand).
+1. Important: the README says the book's design has the backup-to-cold-storage pool; ch. 15's offline
+   backup queue holds change events for offline clients and cold storage holds inactive files: the
+   pool is a modelling addition (an archive copy of each upload, chosen); the abstractions list lacks
+   the real offline queue and the client's cache; the 10 m SLO rests on a stated recovery-point
+   choice, not the book (YAML header and a comment too).
+2. Minor: a red-test comment calls `heartbeat: 60s` a keep-alive; the README says the poll timeout.
+3. Minor: no test covers the 2-worker exercise (exit 2, 1.07 h lag, no drops) any more.
+4. Minor: the day test is named "three SLOs" and checks four. 5. Minor: README's test count.
+6. Nit: "about 24 s of CPU" (17.5 s measured). 7. Nit: "4 workers would buy 2.35 ms of lag".
+The design calls (a fixed 2M level marked chosen; heartbeat as the poll timeout, ≈0.75 % off a real
+long poll's re-poll rate, stated; 3 workers with the 2-worker day as the exercise) endorsed.
+Decisions: all fixed in a fix round (5 at the push).
+
 ### Task 17: `notification_fanout`; notification-system runs end to end
 
 **Files:** `src/engine/behaviours.cppm` (`NotificationFanoutBehaviour`: a service (20k/s, 1 ms) whose `then` steps fire per routed notification × `1 − dedup`; `deduplicated_per_s`), `src/engine/graph.cppm` (`channels` ↔ `then` targets that are queues: `node 'fanout': channel 'sms' names sms_q, which no then step publishes to` / `… then step publishes to email_q, which no channel names`), `src/model/model.cppm`, `src/config/nodes.cpp` (`dedup` in [0, 1), `channels` a map of names to declared message queues), `src/engine/engine.cppm` (`NodeSample::deduplicated_per_s`; `make_node`), `src/report/*` (`deduplicated/s`, JSON; explain follows a fanout's `then` and the `load not propagated` mark for it goes), `scenarios/book/notification-system/{scenario.yaml,README.md}` (pool `retries: 3` on the four channel pools, the 09:00 blast ×20 through the queues, `user_db` 173 % and `notification_svc` 140 % sized or explained, dead letters vs drops), `tests/theory/test_queues_pools.cpp`, `test_graph.cpp`, `tests/scenario/test_scenarios.cpp`, `test_series.cpp`, `README.md`.
