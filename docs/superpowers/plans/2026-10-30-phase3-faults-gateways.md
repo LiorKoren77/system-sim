@@ -311,6 +311,32 @@ notification-system an `on: failure` step once Task 11's pool retries exist.
 - [ ] Tests: a client at 1k/s with `retries: 2`, `retry_after: 100ms`, step 100 ms, whose path loses 50 % (a sink at `failure_rate: 0.5`): at the fixed point attempts per request **1 + 0.5 + 0.25 = 1.75** (`attempts/s` **1750**), answered **1 − 0.5³ = 0.875** (875/s), lost **125/s**; the sink's demand **1750/s**; `offered/s` stays **1000**; the first step sends 1000 (no history), the second 1500, the third 1750 (the backoff is one step); with `retries: 0` or no losses `attempts/s = offered/s`; `estimate` settles at the same 1.75 (and at 1 + Σ for a 90 % loss: `1 + 0.9 + 0.81 = 2.71`); a `node_down` for 10 s on the path with `retries: 2`: `attempts/s` rises to the retry storm's **3× the curve** during the fault (every attempt fails), falls back to the curve within `2 × retry_after` after the fault clears (the recovery pin), and the fault block's `after:` line says `retries added 20.0k attempts`; a timed-out request retries like a lost one (the client's `timeout` share feeds the same buckets).
 - [ ] Commit `nodes: a client's retries are feedback demand, shown as attempts/s`.
 
+**Review of Task 10 at `91195f7`** (adversarial, 2026-10-30): REQUEST_CHANGES. The fixed points
+(1.75; 6861.89 for ten retries at 90 %), losses from rooms, links and sinks, spikes × storms, fan-out,
+the storm's decay, the accounting identity, sweep, identity on 10 scenarios all verified.
+1. Critical: with retries the `>τ` mark and the timed-out share come from last-attempt timeouts
+   only: a p99 SLO at 250 ms that fails without retries passes with `retries: 2` at a 200 ms
+   timeout (10.6 % of requests needed a second attempt).
+2. Important: the fault block counts attempts as "requests" (`lost 8.9k` on a storm that lost 2.94k
+   for good); a `traffic_spike`'s `offered − answered` counts retries in flight; the plan's
+   `after: retries added N attempts` line is missing.
+3. Important: a retried request's latency is its last attempt's (the failed attempts, timeouts and
+   backoffs are not added): undocumented.
+4. Important: `README.md`'s chain and rate-limiter op tables lack the `attempts/s` column.
+5. Minor: the backoff rounds with `llround` on doubles (150 ms at 100 ms steps → 1 step, 250 → 3);
+   `explain` prints the stated wait.
+6. Minor: `on: failure` steps fire per failed attempt (875/s at 1750 attempts), the schema says "requests".
+7. Minor: `sweep --metric` has no `attempts` column.
+8. Minor: no test produces the "no steady state" warning with retries (nothing made it miss).
+Decisions: 1 → `ResponseSample::timed_out_attempts` beside the final count; the `>τ` rule and the
+timed-out share use attempts timed out ÷ delivered attempts; JSON `timed_out_attempts_per_s`;
+pinned FAIL. 3, 4, 6 documented; 5 → integer arithmetic on `SimTime`, rounded up, at least one
+step, `explain` prints `after 150ms (2 steps)` when it differs; 7 → `attempts` and `answered`
+sweep metrics; 8 → the schema's claim softened to "warns if it does not settle"; 2 → after Task
+8's twin lands (same code): node-side `lost N attempts` when any client reaching the node retries,
+`traffic_spike` counts last-attempt failures, and the `after:` line `retries added N attempts`
+(the storm probe's 5968).
+
 ### Task 11: pool retries and the dead-letter count
 
 **Files:** `src/model/model.cppm` (`NodeSpec::retries`, `retry_after` on a `worker_pool`), `src/config/nodes.cpp` (keys; default `retry_after` 1 s `// chosen`), `src/engine/behaviours.cppm` (`WorkerPoolBehaviour`: the `then` step's sink failure share re-published to the pool's own queue after the backoff, up to `retries` times; the last attempt's failures → `dead_lettered_per_s`), `src/engine/engine.cppm` (`NodeSample::dead_lettered_per_s`, totals), `src/report/*` (pool row `dead_lettered/s`, JSON `dead_lettered`, `dead_lettered_per_s`, CSV column; the `drop_rate` SLO ignores dead letters; `explain` prints `retries=3 after 1s, then dead-letter`), tests in `test_sinks.cpp` (3a's file), `test_report.cpp`.
