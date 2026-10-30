@@ -1187,6 +1187,20 @@ CheckResult read_fanout(const Site& site, const YAML::Node& body, model::NodeSpe
   return {};
 }
 
+// `deliver` is a message pushed to its recipient over the open connection (model::deliver_op): it
+// ends at the gateway, so its step list is empty. Steps under it would be routed as a service's (a
+// review found `deliver: [{to: d, op: deliverx}]` sending d 50/s), a hop the model gives no
+// meaning, so they are refused here, with what to write instead. read_node_routing read the ops
+// before this runs.
+CheckResult check_deliver_terminal(const Site& site, const YAML::Node& body,
+                                   const model::NodeSpec& node) {
+  const std::string name{model::deliver_op};
+  const auto deliver = node.ops.find(name);
+  if (deliver == node.ops.end() || deliver->second.empty()) return {};
+  return site.fail(body["ops"][name],
+                   "op 'deliver' is terminal on a ws_gateway (write deliver: [])");
+}
+
 CheckResult read_gateway_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   if (node.type != model::NodeType::ws_gateway) return {};
   const auto this_node = node_site(site, node.id);
@@ -1198,7 +1212,8 @@ CheckResult read_gateway_keys(const Site& site, const YAML::Node& body, model::N
       .and_then([&] {
         return read_gateway_duration(this_node, body, "reconnect_within", node.reconnect_within);
       })
-      .and_then([&] { return read_fanout(this_node, body, node); });
+      .and_then([&] { return read_fanout(this_node, body, node); })
+      .and_then([&] { return check_deliver_terminal(this_node, body, node); });
 }
 
 // ---- Node bodies: the second pass -----------------------------------------------------

@@ -675,10 +675,11 @@ struct NodeSpec {
 // is the op the open connections' pings arrive under (the gateway adds C / heartbeat of them to
 // what the clients send under that name); `deliver` is a message pushed to a recipient over its
 // open connection (terminal: no hops). Every other op the gateway receives is a MESSAGE, whose
-// steps the `fanout` multiplies.
-inline constexpr std::string_view connect_op = "connect";
-inline constexpr std::string_view heartbeat_op = "heartbeat";
-inline constexpr std::string_view deliver_op = "deliver";
+// steps the `fanout` multiplies. `constexpr` without `inline` (CLAUDE.md §3's seventh GCC 14.2
+// defect): exported, so still one definition, in this interface's object file.
+constexpr std::string_view connect_op = "connect";
+constexpr std::string_view heartbeat_op = "heartbeat";
+constexpr std::string_view deliver_op = "deliver";
 
 // Is `op` a message at a ws_gateway (above): every op but connect, heartbeat and deliver.
 [[nodiscard]] constexpr bool message_op(std::string_view op) {

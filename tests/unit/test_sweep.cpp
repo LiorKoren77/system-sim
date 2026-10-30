@@ -601,6 +601,59 @@ TEST_CASE("sweeping a pool's retries reads its dead letters: 250/s then 62.5/s")
   REQUIRE(split_words(table[3]) == std::vector<std::string>{"3", "62.5/s"});
 }
 
+namespace {
+// u sends 200/s, half of it `connect`, to the gateway gw, so 100 connects/s; each connection lasts
+// `session` (swept), so the level rises as a first-order lag to C* = 100/s × session (Little's
+// law: 1k at 10 s, 2k at 20 s). 600 s at 100 ms steps are 30 time constants of the 20 s session:
+// the Euler level is C*(1 − 0.995^6000), within 1e-13 of C*, by the end of the run.
+std::string gateway_path() {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("simsys-sweep-gateway-" + std::to_string(getpid()) + ".yaml");
+  std::ofstream{path}
+      << "version: 1\nname: gateway\nduration: 10m\nstep: 100ms\nnodes:\n"
+         "  u: {type: client, rate: {base: 200/s}, ops: {connect: 0.5, send: 0.5}}\n"
+         "  gw: {type: ws_gateway, session: 10s, "
+         "ops: {send: [{to: q, op: publish}]}}\n"
+         "  q: {type: service}\n"
+         "links:\n  - {from: u, to: gw, latency: 0s}\n"
+         "  - {from: gw, to: q, latency: 0s}\n";
+  return path.string();
+}
+}  // namespace
+
+// A gateway's open connections at the END of the run, the `connections` of the node table and of
+// the JSON (the same name, the same number); with a steady connect rate the level only rises, so
+// the end is also its peak. The table prints a count with an SI prefix, as the node table does.
+TEST_CASE("sweeping a gateway's session reads its connections: 1k then 2k") {
+  using simsys::sweep::MetricKind;
+  const auto metric = parse_metric("gw.connections");
+  INFO((metric ? "" : metric.error()));
+  REQUIRE(metric.has_value());
+  REQUIRE(metric->kind == MetricKind::connections);
+  const auto path = gateway_path();
+  const std::vector<SweepMetric> metrics{*metric};
+  const SweepParam param{.path = "nodes.gw.session", .values = {"10s", "20s"}};
+  const auto rows = run_sweep(path, param, metrics, 1);
+  std::filesystem::remove(path);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  REQUIRE_THAT((*rows)[0].metrics[0], WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT((*rows)[1].metrics[0], WithinRel(2000.0, 1e-9));
+  const auto table = split(render_sweep(param, metrics, *rows, SweepFormat::table), '\n');
+  CAPTURE(table);
+  REQUIRE(split_words(table[2]) == std::vector<std::string>{"10s", "1k"});
+  REQUIRE(split_words(table[3]) == std::vector<std::string>{"20s", "2k"});
+}
+
+TEST_CASE("a connections metric on a node that is not a gateway is an error naming its type") {
+  const std::vector<SweepMetric> metrics{*parse_metric("api.connections")};
+  const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1);
+  REQUIRE_FALSE(rows.has_value());
+  REQUIRE(rows.error() == std::string{hello_path} +
+                              ": error: --metric: api.connections: 'api' has type service, "
+                              "not ws_gateway: only a ws_gateway has connections");
+}
+
 TEST_CASE(
     "a dead_lettered metric on a node that is not a worker pool is an error naming its type") {
   const std::vector<SweepMetric> metrics{*parse_metric("api.dead_lettered")};

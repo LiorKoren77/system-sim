@@ -469,6 +469,9 @@ class Summary {
 // A rate as the tables print one, with an SI prefix and four significant digits and the unit:
 // "1.75k/s", "500/s". `simsys sweep` prints its rates with it.
 [[nodiscard]] std::string format_rate(double per_second);
+// A count as the node table prints a gateway's `connections`, with an SI prefix and four
+// significant digits: "2k", "1.5M". `simsys sweep` prints `<gateway>.connections` with it.
+[[nodiscard]] std::string format_count(double value);
 // A queue lag as the tables print one: format_duration, but "<1us" below a microsecond (an idle
 // consumer group's lag is a vanishing Erlang C figure, not a measurement).
 [[nodiscard]] std::string format_lag(double seconds);

@@ -5249,16 +5249,20 @@ TEST_CASE("faults written as one map instead of a list of them is refused") {
 // leaves "a gateway needs a level" to Simulation::create (tests/theory/test_gateways.cpp).
 
 namespace {
-// u (the clients) -> gw (a ws_gateway with `gateway_keys`) -> q and presence.
+// u (the clients) -> gw (a ws_gateway with `gateway_keys`) -> q and presence. `deliver_steps` is
+// the gateway's `deliver` step list, terminal (`[]`) unless a test says otherwise.
 std::string gateway_scenario(std::string_view gateway_keys,
-                             std::string_view client_ops = "{connect: 0.5, send: 0.5}") {
+                             std::string_view client_ops = "{connect: 0.5, send: 0.5}",
+                             std::string_view deliver_steps = "[]") {
   return scenario_with(
       "  u: {type: client, rate: {base: 200/s}, ops: " + std::string{client_ops} +
           "}\n"
           "  gw: {type: ws_gateway, " +
           std::string{gateway_keys} +
           ", ops: {send: [{to: q, op: publish}], heartbeat: [{to: presence, op: beat}], "
-          "deliver: []}}\n"
+          "deliver: " +
+          std::string{deliver_steps} +
+          "}}\n"
           "  q: {type: service}\n"
           "  presence: {type: service}\n",
       "links:\n"
@@ -5372,6 +5376,25 @@ TEST_CASE("a gateway's connections must be a positive integer") {
 TEST_CASE("a gateway with neither a connect op nor connections still loads") {
   require_loaded("simsys_gateway_no_level.yaml",
                  gateway_scenario("max_connections: 100k, heartbeat: 5s", "{send: 1}"));
+}
+
+// `deliver` is a message pushed to its recipient over the open connection: it ends at the gateway.
+// Steps under it were accepted and routed (a review found `deliver: [{to: d, op: deliverx}]`
+// sending d 50/s), a hop the model has no meaning for, so the loader refuses them and says what to
+// write.
+TEST_CASE("a gateway's deliver op with steps is refused: deliver is terminal") {
+  require_rejected("simsys_gateway_deliver_steps.yaml",
+                   gateway_scenario("max_connections: 100k", "{connect: 0.5, send: 0.5}",
+                                    "[{to: q, op: deliverx}]"),
+                   "node 'gw': op 'deliver' is terminal on a ws_gateway (write deliver: [])");
+}
+
+// The same op name on a service is an ordinary op: only a gateway gives `deliver` its meaning.
+TEST_CASE("a deliver op with steps on a service is an ordinary op") {
+  require_loaded("simsys_service_deliver_steps.yaml",
+                 scenario_with("  svc: {type: service, ops: {deliver: [{to: q, op: put}]}}\n"
+                               "  q: {type: service}\n",
+                               "links:\n  - {from: svc, to: q}\n"));
 }
 
 TEST_CASE("the gateway's keys are refused on other node types") {

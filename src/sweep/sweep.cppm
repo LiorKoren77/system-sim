@@ -59,7 +59,13 @@ enum class MetricKind {
   peak_queue_lag,  // `<queue>.lag`: a message queue's peak lag after warmup, seconds
   attempts_rate,   // `<client>.<op>.attempts`: what the client sent, retries included, per second
   answered_rate,   // `<client>.<op>.answered`: the part of its requests answered, per second
-  dead_lettered_rate  // `<pool>.dead_lettered`: a worker pool's dead letters, per second
+  dead_lettered_rate,  // `<pool>.dead_lettered`: a worker pool's dead letters, per second
+  // `<gateway>.connections`: a ws_gateway's open connections at the END of the run, a count: the
+  // `connections` of the node table and of the JSON, so one name means one number. Not the peak
+  // (JSON's `connections_peak`): under a steady connect rate the level only rises and the two are
+  // the same, and where they differ (a curve that falls, a gateway that fell) the end is where
+  // the run leaves the gateway, which is the table's number too.
+  connections
 };
 
 // One `--metric`. `name` is the text as typed: it heads the metric's column. `op` is empty except
@@ -77,9 +83,10 @@ struct SweepMetric {
 
 // One point: its value as written in the param, and one number per metric, in the order asked,
 // in SI base units (seconds for a latency or a lag, a plain ratio for a utilization or a drop
-// rate, per second for a rate), like report::SloResult::observed. `beyond_timeout` lists (by index
-// into `metrics`) the percentiles that are the client's timeout, not a latency it saw: more than
-// 1 − q of the delivered requests timed out, and the table prints them `>1s`, as the op table does.
+// rate, per second for a rate, a plain count for connections), like report::SloResult::observed.
+// `beyond_timeout` lists (by index into `metrics`) the percentiles that are the client's timeout,
+// not a latency it saw: more than 1 − q of the delivered requests timed out, and the table prints
+// them `>1s`, as the op table does.
 struct SweepRow {
   std::string value;
   std::vector<double> metrics;

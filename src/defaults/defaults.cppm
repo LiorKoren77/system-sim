@@ -397,6 +397,8 @@ inline constexpr SimTime retry_after = 100_ms;
 inline constexpr SimTime pool_retry_after = 1_s;
 
 // ---- Websocket gateways (phase 3 spec §8.2; book ch. 12) ----
+// The two constants are `constexpr` without `inline` (CLAUDE.md §3's seventh GCC 14.2 defect): a
+// default argument naming an exported inline variable leaves it undefined at link time.
 
 // How long a user stays connected to a ws_gateway on average, when the scenario does not say
 // (model::NodeSpec::session): 30 minutes. Chosen, not from the book: ch. 12 sizes the chat system
@@ -404,14 +406,14 @@ inline constexpr SimTime pool_retry_after = 1_s;
 // a typical mobile chat session (an app kept open through a commute or an evening, then
 // backgrounded). Each open connection ends at rate 1 / session, so the level settles at
 // connect rate × session (Little's law, behaviours::WsGatewayBehaviour).
-inline constexpr SimTime default_session = 30_min;
+constexpr SimTime default_session = 30_min;
 
 // How long the users of a fallen gateway take to come back, when the scenario does not say
 // (model::NodeSpec::reconnect_within): 30 seconds. Chosen, not from the book: ch. 12 has the
 // client reconnect after a lost heartbeat but gives no number; 30 s is a few heartbeats (the
 // book's 5 s each) of a client's backoff before it tries again. Read by the reconnect storm of a
 // node_down (phase 3 Task 15); stored and printed until then.
-inline constexpr SimTime default_reconnect_within = 30_s;
+constexpr SimTime default_reconnect_within = 30_s;
 
 // The session a gateway's connections last (the stated one, else default_session) and how soon
 // its users reconnect (the stated one, else default_reconnect_within): the one place the defaults

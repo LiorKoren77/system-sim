@@ -78,6 +78,10 @@ std::string format_rate(double per_second) {
   return fmt_rate(per_second);
 }
 
+std::string format_count(double value) {
+  return with_si_prefix(value);
+}
+
 // A queue lag as the node table and the SLO lines print it: a duration, or "<1us" for a lag that
 // would print below one microsecond. An idle consumer group's stochastic wait is Erlang C's tiny
 // chance of waiting times a job (youtube's completion_q: 6.3e-11 s, "0.0632ns"), a figure below
@@ -1772,9 +1776,10 @@ constexpr std::array op_numbers{
 
 // One node's numbers per seed, in json_node's order: each a list with an entry per seed, written as
 // json_node writes it (a number; null where an optional field has none, as it is for the node types
-// that do not have it).
+// that do not have it). `with_connections` (the run has a ws_gateway, some_gateway): then the
+// gateway's two levels last, as json_node_with_connections writes them.
 [[nodiscard]] std::string json_node_per_seed(std::span<const std::vector<NodeSummary>> nodes,
-                                             std::size_t i) {
+                                             std::size_t i, bool with_connections) {
   const auto plain = [&](std::string_view name, double NodeSummary::*field) {
     std::vector<std::string> values;
     for (const auto& run : nodes) values.push_back(json_number(run[i].*field));
@@ -1787,7 +1792,7 @@ constexpr std::array op_numbers{
   };
   std::vector<std::string> unavailable;
   for (const auto& run : nodes) unavailable.emplace_back(run[i].unavailable ? "true" : "false");
-  const std::array fields{
+  std::vector<std::string> fields{
       json_field("id", json_string(nodes.front()[i].id)),
       plain("mean_rho", &NodeSummary::mean_rho),
       plain("peak_rho", &NodeSummary::peak_rho),
@@ -1802,6 +1807,10 @@ constexpr std::array op_numbers{
       optional("replication_dropped_per_s", &NodeSummary::mean_replication_dropped_per_s),
       optional("committed_writes_per_s", &NodeSummary::mean_committed_writes_per_s),
       optional("peak_queue_lag_s", &NodeSummary::peak_queue_lag_s)};
+  if (with_connections) {
+    fields.push_back(optional("connections", &NodeSummary::connections));
+    fields.push_back(optional("connections_peak", &NodeSummary::connections_peak));
+  }
   return json_object(fields);
 }
 
@@ -1821,15 +1830,16 @@ constexpr std::array op_numbers{
   return json_object(fields);
 }
 
-// `per_seed`'s three lists, one object per op, node and SLO.
-[[nodiscard]] std::string json_per_seed_lists(const RunFigures& figures) {
+// `per_seed`'s three lists, one object per op, node and SLO; the nodes' with the gateway's levels
+// when `with_connections` (json_node_per_seed).
+[[nodiscard]] std::string json_per_seed_lists(const RunFigures& figures, bool with_connections) {
   std::vector<std::string> ops;
   for (std::size_t i = 0; i < figures.ops.front().size(); ++i) {
     ops.push_back(json_op_per_seed(figures.ops, i));
   }
   std::vector<std::string> nodes;
   for (std::size_t i = 0; i < figures.nodes.front().size(); ++i) {
-    nodes.push_back(json_node_per_seed(figures.nodes, i));
+    nodes.push_back(json_node_per_seed(figures.nodes, i, with_connections));
   }
   std::vector<std::string> slos;
   for (std::size_t j = 0; j < figures.slos.front().size(); ++j) {
@@ -1842,16 +1852,18 @@ constexpr std::array op_numbers{
 }
 
 // The `replications` key: the seeds, the seed of the run whose report surrounds it, and every op's,
-// node's and SLO's numbers per seed.
-[[nodiscard]] std::string json_replications(const ReplicationSummary& replicated) {
+// node's and SLO's numbers per seed (a gateway's levels among them when `with_connections`).
+[[nodiscard]] std::string json_replications(const ReplicationSummary& replicated,
+                                            bool with_connections) {
   std::vector<std::string> seeds;
   for (const int seed : replicated.seeds) seeds.push_back(std::to_string(seed));
   const std::string median_seed = std::to_string(seed_of_run(replicated, replicated.median_run));
-  return "  " +
-         json_field("replications",
-                    "{\n    " + json_per_seed("seeds", seeds) + ",\n    " +
-                        json_field("median_seed", median_seed) + ",\n    " +
-                        json_field("per_seed", json_per_seed_lists(replicated.per_run)) + "\n  }");
+  return "  " + json_field("replications",
+                           "{\n    " + json_per_seed("seeds", seeds) + ",\n    " +
+                               json_field("median_seed", median_seed) + ",\n    " +
+                               json_field("per_seed", json_per_seed_lists(replicated.per_run,
+                                                                          with_connections)) +
+                               "\n  }");
 }
 
 // The `slo` array's objects: each SLO's replicated verdict (its median run's) as json_slo writes
@@ -2606,7 +2618,7 @@ std::string render_replications_json(const ReplicationSummary& replicated,
   // `replications` after `faults`, the last of a run's own keys: a faulted scenario's JSON is the
   // median run's report, faults included, then the one key a replication adds.
   auto lines = json_report_lines(median, json_replicated_slos(replicated));
-  lines.push_back(json_replications(replicated));
+  lines.push_back(json_replications(replicated, some_gateway(median.graph())));
   return json_document(lines);
 }
 
