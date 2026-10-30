@@ -344,6 +344,32 @@ sweep metrics; 8 → the schema's claim softened to "warns if it does not settle
 - [ ] Tests: a queue fed 1k/s → pool (100 workers, 10 ms) → sink `failure_rate: 0.02`, `retries: 3`, `retry_after: 1s`, step 100 ms: at the fixed point attempts per job **1 + 0.02 + 0.0004 + 0.000008 = 1.020408**, the sink's demand **1020.4/s**, dead-lettered **1000 × 0.02⁴ = 1.6e-4/s** (JSON to 1e-6 relative), the pool's drop rate **0** and the sink's drops **20.4/s** (the attempts that failed and were retried are the sink's drops, as before; the dead letters are the pool's); the queue's lag includes the re-published jobs; `retries: 0` → phase 2 behaviour byte-identical; the SLO `drop_rate max 0.001` passes on notification-system's shape (pinned on a probe with its numbers: 1.9k/s through four channels, the providers' failure rates).
 - [ ] Commit `nodes: a worker pool retries a third party's failures and dead-letters the rest`.
 
+**Review of Task 11 at `645be72`** (adversarial, 2026-10-30): REQUEST_CHANGES. The fixed points
+(1.020408; ten retries at 50 %), the link delay, stacking with client retries, saturation, sweep,
+identity (youtube, chain, news-feed, chat-system) and §1–§3 verified.
+1. Critical: the pool re-publishes `D × (1 − d_sink)` of every drained job, so jobs lost at a `then`
+   step before the sink are retried too (a lossy `db` before the sink: 1031/s of outcomes for
+   1000/s published; the class comment says they are not retried).
+2. Important: notification-system's README quotes 1.82e-4 dead letters/s for iOS; with APNs's 1k/s
+   quota counted as failure the model gives 154/s and the pool saturates.
+3. Important: the `drop_rate` rule (a sink called by a non-retrying caller counts all its drops)
+   flips on a 1 % second caller: 0.02 FAIL where real losses are 2e-4.
+4. Important: re-published jobs reach every consumer group of the queue (a second pool gets 1875/s
+   of 1000 real jobs, 875/s duplicate writes).
+5. Important: nothing judges dead letters: an overflowing sink or a sink outage turns `drop_rate`
+   FAIL into PASS with retries; no sweep metric either.
+6. Minor: a retry replays the whole `then` list (a duplicate push): undocumented.
+7. Minor: `retries: 0` behaviour undocumented.
+8. Minor: `explain`'s load checks leave out the pools' retries (45.6 % green vs 100 % red in run).
+9. Minor: the fault block counts the sink's retried attempts as lost (the Task 10 item 2).
+Decisions: 1 → the retried share is `Σ S_before(call) × (1 − d_call)` over the sink calls, pinned
+with a lossy step before the sink; 2 → the README quotes the modelled 154/s and says why (Task 16
+sizes the providers); 3 → per-caller: losses = dropped × (demand from non-retrying callers / total
+demand); 4 → re-published jobs count on the queue's demand and lag but are routed only to the group
+that failed them; 5 → sweep metric `<pool>.dead_lettered` and SLO metric `dead_letter_rate`
+(dead-lettered / jobs published, per pool); 6, 7 documented; 8 → `explain` multiplies the pool's
+and the sink's paper load by `A(f, n) = Σ f^k`; 9 → with Task 10's item 2 after the twin lands.
+
 ### Task 12: `simsys run --replications N`
 
 **Files:** `src/session/session.cppm`, `session.cpp` (`run_replications(const Graph&, seed, N, jobs)` → `std::vector<Summary>` on the sweep's pool: one `Simulation` per seed; `ReplicationSummary` with per-metric median and 10–90 % band and per-SLO `passes_in`), `src/report/report.cppm`, `report.cpp` (the table prints `p99 212ms [198–231]`, `PASS in 9 of 10` with the median run's observed value; JSON `replications: {seeds: [...], per_seed: {...}}`), `src/cli/main.cpp` (`--replications N` (1–1000), `--jobs`; `--series`/`--series-ops` with `--replications` refused: `--series needs a single run (one series file per seed is phase 4 material)`; exit code of the median run), `tests/unit/test_session.cpp` (new), `test_report.cpp`, `tests/cli/replications.cmake` (byte-identical across `--jobs`, the noiseless note).
