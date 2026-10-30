@@ -344,7 +344,9 @@ settle, it warns `no steady state (a loop of
 gain >= 1 or a retry storm that no capacity stops, or delivered fractions that did not settle: a
 step after a failed step)`. A client's [`retries`](#node-types) are such a loop: each pass sends
 again what the pass before failed, read off the damped fractions, until the attempts stop moving,
-and `estimate` warns if they do not settle.
+and `estimate` warns if they do not settle; so are a worker pool's
+[`retries`](#message_queue-and-worker_pool), each pass re-publishing to the queue what its sink
+failed in the pass before.
 
 An op with an empty step list (`deliver: []`) is terminal: the node serves it and forwards
 nothing. *(graph)* Every step needs a link that carries demand from the node to its
@@ -375,13 +377,13 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `sql_db` | `replication_lag`, `shards` (int), `pool` (int connections), `write_ops`, `cost` | read and run (phase 2b), see [`sql_db`](#sql_db) |
 | `kv_cluster` | `nodes` (int, required), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp`, `write_ops` | read and run (phase 2c), see [`kv_cluster`](#kv_cluster); `mode` printed, not modelled (partitions are phase 3) |
 | `message_queue` | `partitions`, `retention` | read and run (phase 2c), see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool); `partitions` printed, not modelled |
-| `worker_pool` | `consumes` (queue node id, required), `workers`, `cost` (duration per job), `then` | `consumes`, `workers`, `cost` and `then` read and run (phase 2c), same section: the steps fire for every job it drains, `on: miss` and `on: failure` refused |
-| `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every **write** the store serves (an op in its `write_ops`; not one it drops) sends `factor` requests of the step's op to its target, and a read sends nothing (S3 notifies on ObjectCreated and ObjectRemoved, never on a GET: 1000 views/s of a video start no transcode; notifying on reads is phase 3). They are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. A step `on: miss` (`node 'store': a blob store's then steps fire for every write it stores (on: miss needs a cache)`) or `on: failure` (`... (on: failure: an event follows no step to report on; failure steps fire in an op's step list)`) is refused, and so is any `mode` (`node 'store': a blob store's then steps are event notifications nobody waits for (mode orders the calls a request waits for)`); an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, the delivery delay (an event arrives after the link's latency), failed notifications |
+| `worker_pool` | `consumes` (queue node id, required), `workers`, `cost` (duration per job), `then`, `retries`, `retry_after` | `consumes`, `workers`, `cost` and `then` read and run (phase 2c), same section: the steps fire for every job it drains, `on: miss` and `on: failure` refused; `retries` and `retry_after` read and run (phase 3), same section: the jobs whose call to an external sink failed go back on the pool's queue, and the last attempt's failures are dead letters |
+| `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every **write** the store serves (an op in its `write_ops`; not one it drops) sends `factor` requests of the step's op to its target, and a read sends nothing (S3 notifies on ObjectCreated and ObjectRemoved, never on a GET: 1000 views/s of a video start no transcode; notifying on reads is phase 3). They are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. A step `on: miss` (`node 'store': a blob store's then steps fire for every write it stores (on: miss needs a cache)`) or `on: failure` (`... (on: failure: an event reports no failure before phase 3)`) is refused, and so is any `mode` (`node 'store': a blob store's then steps are event notifications nobody waits for (mode orders the calls a request waits for)`); an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, the delivery delay (an event arrives after the link's latency), failed notifications |
 | `search_index` | `build_interval` (positive duration) | read and run (phase 2c), see [`search_index`](#search_index); `build_interval` printed, not modelled |
 | `ws_gateway` | `max_connections`, `heartbeat` (duration), `fanout` (avg recipients per message), `ops` | `ops` checked as step lists; others ignored; phase 3 |
 | `service_discovery` | `failover` (duration) | ignored; phase 3 |
 | `id_generator` | `algorithm` `snowflake|ticket_server|uuid` (required) | read and run (phase 2b), see [`id_generator`](#id_generator) |
-| `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) | read and run (phase 2c): a third party's API (ch. 10's APNs, FCM, SMS and e-mail providers), a leaf queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) whose served requests fail at `failure_rate` f (default 0; outside [0, 1]: `node 's': failure_rate must be between 0 and 1`): `dropped += f × served`, `drain = (1 − f) × served`, so 500/s at f = 0.02 is answered 490/s and the failures count in the node's drop rate, never as rejections. `politeness` (a positive rate) is printed by `explain` as `politeness=1/s (not modelled: phase 3)`: it needs per-host state. `then` and `ops` stay refused, and only a client's `retries` send a failure again (a worker pool's retries are a later phase 3 task) |
+| `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) | read and run (phase 2c): a third party's API (ch. 10's APNs, FCM, SMS and e-mail providers), a leaf queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) whose served requests fail at `failure_rate` f (default 0; outside [0, 1]: `node 's': failure_rate must be between 0 and 1`): `dropped += f × served`, `drain = (1 − f) × served`, so 500/s at f = 0.02 is answered 490/s and the failures count in the node's drop rate, never as rejections. `politeness` (a positive rate) is printed by `explain` as `politeness=1/s (not modelled: phase 3)`: it needs per-host state. `then` and `ops` stay refused; a client's `retries` and a [worker pool's](#message_queue-and-worker_pool) send a failure again (the sink's drop rate leaves out the failures pools retry) |
 | `notification_fanout` | `channels` (map name → node id), `dedup` (0–1), `then` | `then` checked as [steps](#steps) (`node 'fan': step refers to unknown node 'ghost'`); the others ignored; phase 3 |
 | `frontier` | `politeness` (rate per host), `hosts` (int), `then` | `then` checked as [steps](#steps); the others ignored; phase 3 |
 
@@ -971,6 +973,31 @@ own drop rate. `on: miss` (`node 'w': a worker pool's then steps fire for every 
 step to report on; failure steps fire in an op's step list)`) are refused. A pool takes jobs only from the queue it consumes, so a `then` step may not
 target another pool: it publishes to that pool's queue instead.
 
+A pool's **`retries`** (phase 3; book ch. 10's notification workers: a send that APNs, FCM or an
+SMS gateway answers with an error is put back on the queue with a retry count, and a message that
+has used its retries goes to a **dead-letter queue** the on-call team watches) are how many more
+times the pool calls an external sink for a job whose call failed: the job is re-published to the
+pool's own queue `retry_after` later (rounded to whole steps, at least one), up to `retries`
+times. The re-published jobs go through the queue like any message, so the queue's demand and
+lag, the pool's demand and rho and the sink's demand all include them (and every other consumer
+group of the queue reads them too, as Kafka's groups read the whole log). With f the share of the
+jobs whose sink call fails (the sink's undelivered share, its `failure_rate` when it has room) and
+n retries, a job is attempted **1 + f + … + f^n** times (a geometric series cut after n + 1
+terms) and its last attempt fails with probability **f^(n+1)**: that job is a **dead letter**,
+counted in the pool's `dead_lettered` total and `dead_lettered_per_s` rate and **never as a
+drop**, since nothing overflowed and nobody lost it for good (it is parked for an operator).
+Worked: 1000 jobs/s, f = 0.02, `retries: 3`: the sink is called 1000 × 1.020408 = 1020.408 times
+a second, fails 20.408 of them (its own drops, as before: its books balance), answers 999.99984,
+and the pool dead-letters 1000 × 0.02⁴ = 1.6e-4 jobs a second (one every 1.7 hours); at f = 0.5
+with 2 retries the sink is sent 1750/s, answers 875 and 125 a second are dead letters. The
+failed calls a pool retries are **not losses**: an external sink called only by pools with
+retries has a [drop rate](#drops-and-rejections) of 0 (with other callers too, every drop counts).
+`explain` ends the pool's line with `retries=3 after 1s, then dead-letter`. Ignored: exponential
+backoff and jitter (every wait is `retry_after`), a retry when the pool itself is overloaded (a
+job its room drops is gone), and a sink that overflows while the pool retries: the pool's f is
+the sink's whole undelivered share, so it retries a call the sink shed for being busy as it
+retries an error.
+
 | key | on | rule | message |
 |---|---|---|---|
 | `retention` | `message_queue` | a positive [duration](#values) (`7d` = 168 h); default **7 days**, Kafka's `log.retention.hours = 168` (an industry default: the book gives none) | `node 'q': retention must be positive` |
@@ -980,6 +1007,8 @@ target another pool: it publishes to that pool's queue instead.
 | `cost` | `worker_pool` | required, a positive duration: the time one worker spends on one job (a service's `cost` is a map of capacity units; same spelling, read by type) | `node 'w': worker_pool needs cost`, `cost must be positive` |
 | `capacity`, `latency`, `replicas`, `advanced.concurrency` | `worker_pool` | refused: each would restate `workers` or `cost` | `node 'w': a worker pool's rate is workers / cost` |
 | `advanced.queue_limit` | `worker_pool` | refused: the pool waits in its queue | `node 'w': a worker pool waits in its queue: set the queue's retention` |
+| `retries` | `worker_pool` | optional (phase 3), a whole number from 0 to 10 (absent: no retries, phase 2's pool); only on a pool with a `then` step to an `external_sink` (one among several suffices), whose failures it retries | `node 'w': retries must be a non-negative integer` (-1, 2.5, a word, a quoted `"2"`), `node 'w': retries must be at most 10`, `node 'w': retries need a then step to an external sink` |
+| `retry_after` | `worker_pool` | optional (phase 3), a positive duration, only beside `retries`; absent: **1 s, chosen, not from the book** (long enough for a provider's blip to pass, short beside an outage's minutes, the first wait of the usual exponential backoff), filled in by the loader so `explain` prints it | `node 'w': retry_after must be positive`, `node 'w': retry_after needs retries` |
 
 *(graph)* A link from a queue to anything but a pool that consumes it is refused: `node 'q': a
 message queue delivers only to the worker pools that consume it ('svc' does not)`; so is a queue no
@@ -1126,7 +1155,7 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 | metric | `node` | `op` | `max` | evaluates |
 |---|---|---|---|---|
 | `p50_latency`, `p95_latency`, `p99_latency` | required, a **client** | optional, one the client sends | duration | the client's estimated end-to-end percentile, fitted to the requests the path **delivered** (a refused or dropped request saw no latency); without `op`, the worst of its ops. Behind a client `timeout` the fit is to every delivered request before the timeout cut it, read at q and capped at the timeout; a percentile at quantile q of whose op more than 1 − q of the delivered requests timed out (more than 1 % for a p99) fails whatever its `max`, observing the timeout, with a note: `57.3% of delivered requests timed out (more than 1%)`, or, for an SLO without `op`, naming the op with the largest timed-out share, `57.3% of delivered upload requests timed out (more than 1%)` (see [Drops and rejections](#drops-and-rejections) and [How percentiles are estimated](#how-percentiles-are-estimated-and-where-they-mislead)) |
-| `drop_rate` | optional | not allowed | number in [0, 1] | the node's dropped / the work sent to it, after warmup; without `node`, the worst node's or bandwidth link pipe's (a `node` names a node only) |
+| `drop_rate` | optional | not allowed | number in [0, 1] | the node's dropped / the work sent to it, after warmup (a sink's failed calls that worker pools retry are not counted: [Drops and rejections](#drops-and-rejections)); without `node`, the worst node's or bandwidth link pipe's (a `node` names a node only) |
 | `reject_rate` | optional | not allowed | number in [0, 1] | **new in v1.2**: the node's rejected (a rate limiter's refusals, a leaky bucket's overflow included) / the requests sent to it, after warmup; without `node`, the worst node's |
 | `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup, of the copy the node reports: behind a `consistent_hash` balancer the **hottest copy** (`k = 1 + z_M/√vnodes` × the average share, z_M the expected maximum of M standard normals, see [`load_balancer`](#load_balancer)), on a `kv_cluster` its hottest machine (`k = min(1 + z_M/√(N·vnodes), nodes/N)`, see [`kv_cluster`](#kv_cluster)), on a `sql_db` the busier kind of copy (primary or replica); a byte-sized node's in megabytes |
 | `queue_lag` | optional; a `message_queue` | not allowed | duration | phase 2c: the named message queue's **peak** lag after warmup, its slowest consumer group's wait (see [Queue lag](#queue-lag)); without `node`, the worst queue's; `skipped` when no message queue ran. A `frontier` is accepted (the web crawler's queue) and skipped until it runs (phase 3); any other node is refused (`slo: queue_lag needs a message_queue node ('svc' is a service)`) |
@@ -1219,7 +1248,12 @@ Two different promises, kept apart on purpose:
   before they reach it (one post → 100 feed writes would make "dropped anywhere / offered
   by clients" 90). Without `node` it is the worst node's, since every node must keep the
   bound, and a bandwidth link's pipe counts as one (megabytes dropped over megabytes sent; the
-  header then names it `worst: a->b`).
+  header then names it `worst: a->b`). A failed call that a [worker pool
+  retries](#message_queue-and-worker_pool) is no loss (phase 3): it is attempted again, or ends as
+  the pool's dead letter, which is counted apart and never as a drop. So an `external_sink` whose
+  only callers are pools with `retries` has a `drop_rate` of 0, while its `dropped` and the
+  series' `drops_per_s` keep every failed call (its books still balance); a sink with other
+  callers too counts all its drops (the pools' share is not told apart).
 - a **rejection** is a rate limiter's **policy working** (ch. 4's 429): what a token bucket or a
   window algorithm refuses, and a leaky bucket's overflow. `reject_rate` = Σ rejected / Σ
   demand of that node, with the same rules.
@@ -1246,7 +1280,11 @@ some node refused anything; the node table has `dropped` and `rejected` columns;
 `replication_dropped_per_s`, the committed writes one replica missed per second, and
 `committed_writes_per_s`, the writes one shard's primary committed per second, all three `null`
 for other nodes, and (phase 2c) `peak_queue_lag_s`, a message queue's peak lag in seconds
-([Queue lag](#queue-lag)), `null` for other nodes. Each SLO object has a `note`: `null`, or why the verdict is not `observed`
+([Queue lag](#queue-lag)), `null` for other nodes, and (phase 3) `dead_lettered` and
+`dead_lettered_per_s`, a worker pool's [dead letters](#message_queue-and-worker_pool), `null` for
+other nodes. When some pool has `retries`, the node table has a `dead_lettered/s` column right
+after `dropped` (the pool's mean rate, `-` on every other row); without one the table is the one
+it always was. Each SLO object has a `note`: `null`, or why the verdict is not `observed`
 against `max` alone (a replica that falls behind without bound).
 
 **`run --report json` (and `estimate --report json`), key by key.** Every figure is over the
@@ -1262,6 +1300,7 @@ the observed seconds (`steps` × `step`).
 | `nodes[]` | `id`, `mean_rho`, `peak_rho` | the node; time-averaged and highest busy fraction of one copy |
 | `nodes[]` | `peak_backlog` | the most work waiting at the end of any step: requests, cost units at a node with a `cost`, MB at a byte-sized node |
 | `nodes[]` | `dropped`, `rejected` | **totals** over the observed steps, in the same units as `peak_backlog` (`rejected` in requests) |
+| `nodes[]` | `dead_lettered`, `dead_lettered_per_s` | jobs: the **total** over the observed steps and its mean rate per second (phase 3: a `worker_pool`'s jobs whose last retry failed; 0 on a pool without `retries`, `null` on every other node) |
 | `nodes[]` | `red_s`, `unavailable` | seconds spent red; `true` when the node's latency was infinite in some step |
 | `nodes[]` | `staleness_s`, `replication_dropped_per_s`, `committed_writes_per_s` | seconds; writes per second per replica; writes per second per shard (a `sql_db` only, else `null`) |
 | `nodes[]` | `peak_queue_lag_s` | seconds (a `message_queue` only, else `null`) |
@@ -1294,11 +1333,13 @@ the node's own numbers are in MB: the table's `dropped`, JSON's `dropped`, and t
 rates, each answered at its last byte (a write) or its first megabyte (a read).
 
 `run --series` writes one CSV row per node per step:
-`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone,queue_lag_s`
+`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,latency_ms,zone,queue_lag_s`
 (`rejected_per_s` new in v1.2, `demand_per_s` and `drain_per_s` in phase 2b, `queue_lag_s` in
-phase 2c: a message queue's lag in seconds, empty on every other row; demand, drain, drops and
-backlog in capacity units, megabytes at a byte-sized node; a client row has zeros, zone `none` and
-no lag), then one row per [bandwidth link](#links) and step, its `from->to` in the `node`
+phase 2c: a message queue's lag in seconds, empty on every other row; `dead_lettered_per_s` in
+phase 3: a worker pool's dead letters per second, 0 without `retries`, empty on every other row and
+outside the balance below, since the pool drained those jobs; demand, drain, drops and backlog in
+capacity units, megabytes at a byte-sized node; a sink's `drops_per_s` keeps the failures a pool
+retries; a client row has zeros, zone `none`, and no dead letters and no lag), then one row per [bandwidth link](#links) and step, its `from->to` in the `node`
 column, in megabytes, `rejected_per_s` 0 and `latency_ms` a request's wait plus its answer time
 on the wire (a write's whole serialisation, any other op's first megabyte; with no request in the
 step, the ops the link carries weighed alike).

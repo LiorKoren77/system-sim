@@ -1583,6 +1583,8 @@ TEST_CASE("the sink's rows keep conservation and its drops, 20.408 a second, wit
     drain += number(row[3]) * dt;
     drops += number(row[6]) * dt;
   }
-  REQUIRE_THAT(demand, WithinRel(drain + drops, 1e-9));
-  REQUIRE_THAT(number(rows.back()[6]), WithinRel(0.02 * 1020.408, 1e-6));
+  // The series prints six significant digits (1020.41, 20.4082), so the books read back from the
+  // CSV balance to about 1e-6, not to the 1e-9 of the raw samples (test_sinks pins those).
+  REQUIRE_THAT(demand, WithinRel(drain + drops, 1e-5));
+  REQUIRE_THAT(number(rows.back()[6]), WithinRel(0.02 * 1020.408, 1e-5));
 }

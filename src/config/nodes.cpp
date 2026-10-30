@@ -34,8 +34,9 @@ module;
 module simsys.config;
 
 import simsys.core;
-// Only for defaults::max_concurrency: the cap the engine's defaults apply is the cap the
-// loader enforces, one number in one place.
+// Only for defaults::max_concurrency (the cap the engine's defaults apply is the cap the loader
+// enforces, one number in one place) and defaults::pool_retry_after (the wait a pool with `retries`
+// and no `retry_after` gets).
 import simsys.defaults;
 // Only for fluid::Capacity's default zone thresholds (detail.hpp): one source of truth for
 // 0.7 / 0.9.
@@ -940,13 +941,49 @@ CheckResult read_consumes(const Site& site, const YAML::Node& body, model::NodeS
   return {};
 }
 
-CheckResult read_worker_pool_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+// Does one of the pool's `then` steps call an external sink? What a pool retries is a call to a
+// third party that failed (behaviours::WorkerPoolBehaviour); the steps' targets were checked to
+// exist when the `then` list was read (read_node_routing runs first).
+bool calls_external_sink(const model::NodeSpec& node, const Declarations& declared) {
+  // C++20 std::ranges::any_of: the algorithm takes the whole range, replacing std::any_of's
+  // begin()/end() pair.
+  return std::ranges::any_of(node.then, [&](const model::Step& step) {
+    const auto found = declared.ids.find(step.to);
+    return found != declared.ids.end() &&
+           declared.nodes[found->second].type == model::NodeType::external_sink;
+  });
+}
+
+// `retries: 3` and `retry_after: 1s` (phase 3 spec §6.2), both optional, read by the client's rules
+// and refused in the client's words (read_retry_count, read_retry_after). A pool retries the jobs
+// whose call to an external sink failed, so `retries` on a pool with no such `then` step has
+// nothing to retry and is refused rather than silently ignored. A pool that states `retries` and
+// no `retry_after` waits defaults::pool_retry_after, filled in here so explain prints the wait the
+// engine uses.
+CheckResult read_pool_retries(const Site& site, const YAML::Node& body, model::NodeSpec& node,
+                              const Declarations& declared) {
+  if (auto read = read_retry_after(site, body, node.retry_after); !read) return read;
+  if (!body["retries"]) return {};
+  if (auto checked = check_not_null(site, body, "retries", "retries"); !checked) return checked;
+  auto count = read_retry_count(site, body["retries"]);
+  if (!count) return std::unexpected(count.error());
+  if (!calls_external_sink(node, declared)) {
+    return site.fail(body["retries"], "retries need a then step to an external sink");
+  }
+  node.retries = *count;
+  if (!node.retry_after) node.retry_after = defaults::pool_retry_after;
+  return {};
+}
+
+CheckResult read_worker_pool_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node,
+                                  const Declarations& declared) {
   if (node.type != model::NodeType::worker_pool) return {};
   const auto this_node = node_site(site, node.id);
   return read_consumes(this_node, body, node)
       .and_then([&] { return read_workers(this_node, body, node); })
       .and_then([&] { return read_job_cost(this_node, body, node); })
-      .and_then([&] { return refused_worker_pool_keys(this_node, body); });
+      .and_then([&] { return refused_worker_pool_keys(this_node, body); })
+      .and_then([&] { return read_pool_retries(this_node, body, node, declared); });
 }
 
 // ---- External sink keys (spec §19 entry 8) ----
@@ -1130,7 +1167,9 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
     if (auto read = read_blob_store_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_id_generator_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_message_queue_keys(site, entry.second, *node); !read) return read;
-    if (auto read = read_worker_pool_keys(site, entry.second, *node); !read) return read;
+    if (auto read = read_worker_pool_keys(site, entry.second, *node, declared); !read) {
+      return read;
+    }
     if (auto read = read_external_sink_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_kv_cluster_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_search_index_keys(site, entry.second, *node); !read) return read;

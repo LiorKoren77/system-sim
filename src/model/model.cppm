@@ -577,6 +577,16 @@ struct NodeSpec {
   std::optional<int> workers{};
   std::optional<SimTime> job_cost{};
   std::optional<std::string> consumes{};
+  // A worker pool's retries (phase 3 spec §6.2; book ch. 10: a notification worker whose call to a
+  // provider failed puts the job back on its queue and tries again later): how many more times the
+  // pool calls an external sink for a job whose call failed (the loader allows 0 to 10, and only on
+  // a pool with a `then` step to an external sink), each time `retry_after` after the failure. The
+  // job that fails its last attempt is a dead letter, not a drop. Absent `retries`: phase 2's pool,
+  // which retries nothing. Absent `retry_after`: defaults::pool_retry_after, which the loader fills
+  // in whenever `retries` is stated, so explain prints the wait the engine uses. The model and what
+  // it ignores are at behaviours::WorkerPoolBehaviour.
+  std::optional<int> retries{};
+  std::optional<SimTime> retry_after{};
   // Message queues only (spec §19 entry 4): how long a message stays in the log before it is
   // deleted unconsumed (absent: defaults::default_retention, Kafka's 7 days), which sets each
   // consumer group's waiting room (Graph::build: retention x the pool's capacity), and
@@ -592,10 +602,10 @@ struct NodeSpec {
   // (engine.cppm's fail_share). A plain double, not an optional: "fails nothing" is the real value
   // 0, and a sink that states none is the plain queue it was before. `politeness` is how often one
   // host may be called (the crawler's "1/s per host"), stored and printed, not modelled (phase 3:
-  // it needs per-host state); absent when not stated. Ignored: retries (an `on: failure` step after
-  // the call is sent the failed share, but nothing calls the sink again), a provider's latency
-  // rising with OUR load (its queue is the type's 1k/s quota, not the provider's real fleet), and
-  // per-host politeness.
+  // it needs per-host state); absent when not stated. A failed call is sent again by a client's
+  // `retries` (Workload) or a worker pool's (`retries` above), which the sink sees as more demand.
+  // Ignored: a provider's latency rising with OUR load (its queue is the type's 1k/s quota, not the
+  // provider's real fleet), and per-host politeness.
   double failure_rate{0.0};
   std::optional<Rate> politeness{};
   // Key-value clusters only (spec §19 entry 9; declared after the external sink's keys, for

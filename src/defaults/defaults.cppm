@@ -381,6 +381,15 @@ inline constexpr int max_concurrency = 100'000;
 // answer from far away would have taken.
 inline constexpr SimTime retry_after = 100_ms;
 
+// How long a worker pool with `retries` waits before it puts a job whose call to an external sink
+// failed back on its queue, when the scenario does not say (model::NodeSpec::retry_after). Chosen,
+// not from the book: ch. 10 says a failed notification is retried but gives no backoff; 1 s is long
+// enough for a provider's blip (a 5xx under a burst, a dropped connection) to pass, short beside
+// the minutes a real outage lasts, and the first wait of the usual exponential backoff (1 s, 2 s,
+// 4 s, ...), of which the model keeps only the first. Ten times a client's retry_after: a worker is
+// not a user waiting for an answer.
+inline constexpr SimTime pool_retry_after = 1_s;
+
 // The number of servers c that makes a node one consistent machine. Little's law
 // (L = lambda * W) applied to the servers at full load: the requests in service equal
 // throughput times time in service, so c = service_rate * service_time. Rounded up

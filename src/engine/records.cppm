@@ -127,6 +127,13 @@ struct NodeSample {
   // lag is the pool's latency minus its cost. Assumes the backlog is read first in, first out (a
   // Kafka partition is). Empty for every node that is not a message queue (a 0 would be a claim).
   std::optional<double> queue_lag_s{};
+  // A worker pool's dead letters, per second (phase 3 spec §6.2; book ch. 10's dead-letter queue):
+  // the jobs whose LAST attempt at an external sink failed this step, which a pool with `retries`
+  // parks instead of trying again (behaviours::WorkerPoolBehaviour has the model). Not a drop: the
+  // pool's `dropped_per_s` and its balance above do not include them (the job was drained; what
+  // failed was its call), and nothing is lost from any node's books. 0 on a pool that retries
+  // nothing (it has the counter, at 0); empty on every other node, which has no dead-letter queue.
+  std::optional<double> dead_lettered_per_s{};
 };
 
 // What a client sees for one op: the rate it offers, the part of it that comes back answered, and

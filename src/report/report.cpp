@@ -14,6 +14,7 @@ module;
 #include <cmath>
 #include <cstddef>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <ostream>
@@ -519,15 +520,39 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
   return {node.unavailable ? "unavailable" : ""};
 }
 
+// Does some worker pool of the run retry (`retries` >= 1)? Only then has the node table its
+// `dead_lettered/s` column (phase 3 spec §6.2), so a run of phase 2's pools prints the table it
+// always did.
+[[nodiscard]] bool some_pool_retries(const graph::Graph& g) {
+  // C++20 std::ranges::any_of: the range itself instead of a begin/end pair (std::any_of).
+  return std::ranges::any_of(g.nodes(), [](const graph::ResolvedNode& node) {
+    return node.spec.type == model::NodeType::worker_pool && node.spec.retries.value_or(0) > 0;
+  });
+}
+
+// Where the `dead_lettered/s` column sits: right after `dropped` (node, mean_rho, peak_rho,
+// peak_backlog, dropped), since a dead letter is the pool's count beside the drops it is not.
+constexpr std::size_t dead_letter_column = 5;
+
 // Clients are sources with no queue: their queue columns show "-". A message queue's `peak_lag`
-// is its peak lag after warmup (NodeSummary::peak_queue_lag_s), "-" on every other row.
-[[nodiscard]] Row node_row(const NodeSummary& node, const graph::ResolvedNode& resolved,
-                           bool color) {
-  if (resolved.spec.type == model::NodeType::client)
-    return {{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}};
-  Row row = queue_cells(node, resolved.capacity, color);
-  row.push_back({node.peak_queue_lag_s ? format_lag(*node.peak_queue_lag_s) : "-"});
-  row.push_back(unavailable_cell(node));
+// is its peak lag after warmup (NodeSummary::peak_queue_lag_s), "-" on every other row. With
+// `dead_letters` the row has the `dead_lettered/s` cell too: a worker pool's mean rate of dead
+// letters (NodeSummary::mean_dead_lettered_per_s, 0 without retries), "-" on every other row.
+[[nodiscard]] Row node_row(const NodeSummary& node, const graph::ResolvedNode& resolved, bool color,
+                           bool dead_letters) {
+  Row row = resolved.spec.type == model::NodeType::client
+                ? Row{{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}}
+                : queue_cells(node, resolved.capacity, color);
+  if (resolved.spec.type != model::NodeType::client) {
+    row.push_back({node.peak_queue_lag_s ? format_lag(*node.peak_queue_lag_s) : "-"});
+    row.push_back(unavailable_cell(node));
+  }
+  if (dead_letters) {
+    const auto rate = node.mean_dead_lettered_per_s;
+    // std::next over a difference_type: the column index is a size_t, the iterator's offset signed.
+    row.insert(std::next(row.begin(), static_cast<std::ptrdiff_t>(dead_letter_column)),
+               Cell{rate ? with_si_prefix(*rate) : "-"});
+  }
   return row;
 }
 
@@ -540,9 +565,15 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
                          {"rejected"},
                          {"red_s"},
                          {"peak_lag"}}};
+  const bool dead_letters = some_pool_retries(summary.graph());
+  if (dead_letters) {
+    rows.front().insert(
+        std::next(rows.front().begin(), static_cast<std::ptrdiff_t>(dead_letter_column)),
+        Cell{"dead_lettered/s"});
+  }
   const auto nodes = summary.nodes();
   for (std::size_t i = 0; i < nodes.size(); ++i) {
-    rows.push_back(node_row(nodes[i], summary.graph().nodes()[i], color));
+    rows.push_back(node_row(nodes[i], summary.graph().nodes()[i], color, dead_letters));
   }
   return "nodes\n" + aligned(rows);
 }
@@ -914,6 +945,9 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
       json_field("peak_rho", json_number(n.peak_rho)),
       json_field("peak_backlog", json_number(n.peak_backlog)),
       json_field("dropped", json_number(n.total_dropped)),
+      // a worker pool's (0 without retries); null for every other node
+      json_field("dead_lettered", json_optional_number(n.total_dead_lettered)),
+      json_field("dead_lettered_per_s", json_optional_number(n.mean_dead_lettered_per_s)),
       json_field("rejected", json_number(n.total_rejected)),
       json_field("red_s", json_number(n.red_time_s)),
       json_field("unavailable", n.unavailable ? "true" : "false"),
@@ -1069,22 +1103,25 @@ template <class T, class F>
 
 [[nodiscard]] std::string csv_server_row(const std::string& t_s, const std::string& id,
                                          const engine::NodeSample& n) {
-  const std::array fields{t_s,
-                          id,
-                          significant(n.demand_per_s, 6),
-                          significant(n.drain_per_s, 6),
-                          significant(n.rho, 6),
-                          significant(n.backlog, 6),
-                          significant(n.dropped_per_s, 6),
-                          significant(n.rejected_per_s, 6),
-                          significant(n.latency.mean_s * 1000.0, 6),
-                          std::string{zone_name(n.zone)},
-                          n.queue_lag_s ? significant(*n.queue_lag_s, 6) : std::string{}};
+  const std::array fields{
+      t_s,
+      id,
+      significant(n.demand_per_s, 6),
+      significant(n.drain_per_s, 6),
+      significant(n.rho, 6),
+      significant(n.backlog, 6),
+      significant(n.dropped_per_s, 6),
+      n.dead_lettered_per_s ? significant(*n.dead_lettered_per_s, 6) : std::string{},
+      significant(n.rejected_per_s, 6),
+      significant(n.latency.mean_s * 1000.0, 6),
+      std::string{zone_name(n.zone)},
+      n.queue_lag_s ? significant(*n.queue_lag_s, 6) : std::string{}};
   return join(fields, ",") + "\n";
 }
 
-// A bandwidth link's pipe, in the same eleven columns as a node's, in megabytes; `rejected_per_s`
-// is 0 (a pipe refuses nothing by policy) and `queue_lag_s` empty (a pipe is no message queue).
+// A bandwidth link's pipe, in the same twelve columns as a node's, in megabytes;
+// `dead_lettered_per_s` empty (a pipe is no worker pool), `rejected_per_s` 0 (a pipe refuses
+// nothing by policy) and `queue_lag_s` empty (a pipe is no message queue).
 [[nodiscard]] std::string csv_link_row(const std::string& t_s, const std::string& name,
                                        const engine::LinkSample& l) {
   const std::array fields{t_s,
@@ -1094,6 +1131,7 @@ template <class T, class F>
                           significant(l.rho, 6),
                           significant(l.backlog, 6),
                           significant(l.dropped_per_s, 6),
+                          std::string{},
                           std::string{"0"},
                           significant(l.latency.mean_s * 1000.0, 6),
                           std::string{zone_name(l.zone)},
@@ -1101,9 +1139,10 @@ template <class T, class F>
   return join(fields, ",") + "\n";
 }
 
-// A client is a source: no queue, so zeros where a server has numbers, zone `none` and no lag.
+// A client is a source: no queue, so zeros where a server has numbers, zone `none`, and no dead
+// letters (a pool's) and no lag (a queue's).
 [[nodiscard]] std::string csv_client_row(const std::string& t_s, const std::string& id) {
-  return t_s + "," + id + ",0,0,0,0,0,0,0,none,\n";
+  return t_s + "," + id + ",0,0,0,0,0,,0,0,none,\n";
 }
 
 // One (client, op) of a step: what it offered, what it sent (its retries included), what came back
@@ -1192,6 +1231,9 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
     peak_queue_lag_s =
         flow::nan_propagating_max(*sample.queue_lag_s, peak_queue_lag_s.value_or(0.0));
   }
+  if (sample.dead_lettered_per_s) {  // a worker pool: 0 without retries
+    dead_lettered = dead_lettered.value_or(0.0) + *sample.dead_lettered_per_s * dt_s;
+  }
 }
 
 // A step whose response is infinite (a node on the path never answers) poisons the whole op: no
@@ -1244,6 +1286,32 @@ void Summary::LinkTotals::add(const engine::LinkSample& sample, double dt_s) {
   worst_zone = std::max(worst_zone, sample.zone);  // green < yellow < red, as declared
 }
 
+namespace {
+
+// Does a worker pool with `retries` send demand on `link`? Its links out carry only its `then`
+// steps (a pool calls nobody else), so every call on such a link is one it retries when it fails.
+[[nodiscard]] bool from_retrying_pool(const graph::Graph& g, const graph::ResolvedLink& link) {
+  const auto& sender = g.nodes()[graph::demand_sender(link)].spec;
+  return sender.type == model::NodeType::worker_pool && sender.retries.value_or(0) > 0;
+}
+
+}  // namespace
+
+// An external sink called by worker pools with `retries` and by nobody else (phase 3 spec §6.2):
+// every call it fails is attempted again or ends as a pool's dead letter, so none of its drops is
+// a loss (NodeTotals::losses_retried). The pool's failure share is the sink's whole loss, its
+// quota's overflow included (behaviours::WorkerPoolBehaviour), so this holds for every drop.
+bool Summary::losses_retried_by_pools(const graph::Graph& g, std::size_t node) {
+  if (g.nodes()[node].spec.type != model::NodeType::external_sink) return false;
+  bool called = false;
+  for (const auto& link : g.links()) {
+    if (graph::demand_receiver(link) != node) continue;
+    if (!from_retrying_pool(g, link)) return false;
+    called = true;
+  }
+  return called;
+}
+
 Summary::Summary(const graph::Graph& g, SimTime warmup) : Summary{g, warmup, true} {}
 
 Summary Summary::of_estimate(const graph::Graph& g, const engine::StepRecord& record) {
@@ -1255,6 +1323,9 @@ Summary Summary::of_estimate(const graph::Graph& g, const engine::StepRecord& re
 
 Summary::Summary(const graph::Graph& g, SimTime warmup, bool track_windows)
     : graph_{&g}, warmup_{warmup}, nodes_(g.nodes().size()) {
+  for (std::size_t node = 0; node < nodes_.size(); ++node) {
+    nodes_[node].losses_retried = losses_retried_by_pools(g, node);
+  }
   for (const auto& link : g.links()) {
     if (link.pipe) links_.push_back(LinkTotals{.name = graph::link_label(g.nodes(), link)});
   }
@@ -1500,6 +1571,11 @@ std::vector<NodeSummary> Summary::nodes() const {
                               .red_time_s = t.red_time_s,
                               .unavailable = t.unavailable,
                               .peak_queue_lag_s = t.peak_queue_lag_s});
+    if (t.dead_lettered) {
+      out.back().total_dead_lettered = *t.dead_lettered;
+      out.back().mean_dead_lettered_per_s =
+          observed_s_ > 0.0 ? *t.dead_lettered / observed_s_ : 0.0;
+    }
     if (t.staleness_seen_s > 0.0)
       out.back().mean_staleness_s = t.staleness_time / t.staleness_seen_s;
     if (t.replication_seen_s > 0.0) {
@@ -1587,8 +1663,10 @@ void Summary::fill_latencies(const OpTotals& totals, OpSummary& op) {
 // Per node, not per scenario: a node's drops are a fraction of what it was sent, so the
 // ratio stays in [0, 1] even when fan-out (ch. 11) multiplies the client's requests 100
 // times before they reach it. Dividing by what the clients offered would not be a ratio.
-// Drops only: a rate limiter's refusals are its policy, not a failure (reject_rate).
+// Drops only: a rate limiter's refusals are its policy, not a failure (reject_rate), and the failed
+// calls a pool retries are attempts, not losses (losses_retried, Summary::drop_rate).
 double Summary::NodeTotals::drop_rate() const {
+  if (losses_retried) return 0.0;
   return demand > 0.0 ? dropped / demand : 0.0;
 }
 
@@ -1774,12 +1852,12 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
   for (const auto& link : g.links()) {
     if (link.pipe) link_names_.push_back(graph::link_label(g.nodes(), link));
   }
-  *out_ << "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,"
-           "latency_ms,zone,queue_lag_s\n";
+  *out_ << "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,"
+           "rejected_per_s,latency_ms,zone,queue_lag_s\n";
 }
 
 // CSV is for machines, so every numeric column holds a number on every row the quantity exists
-// for, and is empty where it does not (only `queue_lag_s`, below):
+// for, and is empty where it does not (only `dead_lettered_per_s` and `queue_lag_s`, below):
 // - `t_s` is the shortest form that reads back to the same double (0.1, 2, 0.35), not a
 //   fixed number of decimals that would round a fine step away; the other numbers have 6
 //   significant digits;
@@ -1793,8 +1871,14 @@ SeriesWriter::SeriesWriter(std::ostream& out, const graph::Graph& g) : out_{&out
 //   `rejected_per_s` says how much of it); a leaky bucket's are its queue's overflow, written
 //   in `rejected_per_s` instead of `drops_per_s`, so for one the identity takes them in the
 //   drops' place;
-// - a client row writes 0 in every numeric column but `queue_lag_s` (a source has no queue), which
-//   it leaves empty, and `none` as its zone, so a plot can filter clients out by zone;
+// - a client row writes 0 in every numeric column but `dead_lettered_per_s` and `queue_lag_s` (a
+//   source has no queue), which it leaves empty, and `none` as its zone, so a plot can filter
+//   clients out by zone;
+// - `dead_lettered_per_s` (engine::NodeSample::dead_lettered_per_s) is a worker pool's jobs whose
+//   last retry failed, right after `drops_per_s` because they are not drops (the identity above
+//   does not include them: the pool drained those jobs); 0 on a pool without retries and EMPTY on
+//   every other row, clients' and links' included. A sink's rows keep the failures a pool retries
+//   in `drops_per_s`: its books balance whatever its callers do with them;
 // - an infinite latency is written as `inf` (which spreadsheet and plotting tools parse),
 //   unlike the table ("unavailable") and JSON (null), read by people or by parsers
 //   without an infinity;

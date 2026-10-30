@@ -43,7 +43,9 @@ struct NodeSummary {
   // reported as 0 when they are float residue, under 1e-9 of the queue's capacity per second.
   double peak_backlog{};
   // Requests shed because the waiting room was full, and an external sink's failed requests (its
-  // `failure_rate` of what it served, spec §19 entry 8): failures.
+  // `failure_rate` of what it served, spec §19 entry 8): failures. A sink's failed calls stay here
+  // when a pool retries them (its books, engine::NodeSample); only its drop rate leaves them out
+  // (Summary::drop_rate).
   double total_dropped{};
   // Requests refused by policy (a rate limiter's 429s, spec §17 entry 6): answered at once, never
   // forwarded, and counted apart from the drops (reject_rate, not drop_rate).
@@ -72,6 +74,12 @@ struct NodeSummary {
   // late whatever the day's average was). What the `queue_lag` SLO observes (spec §19 entry 14).
   // Empty for every node that is not a message queue.
   std::optional<double> peak_queue_lag_s{};
+  // A worker pool's dead letters (engine::NodeSample::dead_lettered_per_s: the jobs whose last
+  // retry at an external sink failed, phase 3 spec §6.2): their total over the observed steps
+  // (Σ rate·dt) and that total over the observed time, a mean rate. 0 on a pool without retries,
+  // empty on every other node. Never in total_dropped: a dead letter is parked, not lost.
+  std::optional<double> total_dead_lettered{};
+  std::optional<double> mean_dead_lettered_per_s{};
 };
 
 // One bandwidth link's pipe over the observed part of a run (engine::LinkSample), in MEGABYTES (per
@@ -238,8 +246,13 @@ class Summary {
   [[nodiscard]] std::size_t observed_steps() const { return observed_steps_; }
   // One node's drop rate: the requests it FAILED (shed from a full queue) over the requests
   // sent to it, summed over the observed steps (Σ dropped / Σ demand), so always in [0, 1];
-  // 0 when nothing reached it. An unknown id is a programmer error (the loader checks SLO
-  // nodes): throws std::invalid_argument.
+  // 0 when nothing reached it. Not a loss (phase 3 spec §6.2): a failed call that a worker pool
+  // retries, which is attempted again or ends as the pool's dead letter (counted apart, never as a
+  // drop). So an external sink whose only callers are pools with `retries` has a drop rate of 0,
+  // whatever its own books say (NodeSummary::total_dropped keeps them). A sink with other callers
+  // too counts all its drops: the share a pool retries is not told apart (conservative). An
+  // unknown id is a programmer error (the loader checks SLO nodes): throws
+  // std::invalid_argument.
   [[nodiscard]] double drop_rate(std::string_view node) const;
   // The worst node's drop rate: every node must keep its own, so the worst one decides. A bandwidth
   // link's pipe counts as a node here: a request its full room drops is lost as surely as one a
@@ -309,6 +322,10 @@ class Summary {
     double committed_writes{};     // Σ committed_writes_per_s·dt (writes, per shard)
     double replication_seen_s{};   // Σ dt over the steps that report the two above
     std::optional<double> peak_queue_lag_s{};  // the largest queue_lag_s: message queues only
+    std::optional<double> dead_lettered{};     // Σ dead_lettered_per_s·dt: worker pools only
+    // An external sink whose every caller is a pool with retries (losses_retried_by_pools): its
+    // drops are retried or dead-lettered, none a loss, so its drop rate is 0.
+    bool losses_retried{};
     void add(const engine::NodeSample& sample, double dt_s);
     [[nodiscard]] double drop_rate() const;
     [[nodiscard]] double reject_rate() const;
@@ -344,6 +361,8 @@ class Summary {
     void add(const engine::ResponseSample& sample, double dt_s);
   };
 
+  // NodeTotals::losses_retried for node `node` of `g` (report.cpp has the rule).
+  [[nodiscard]] static bool losses_retried_by_pools(const graph::Graph& g, std::size_t node);
   // An op's mean from the moments its answered requests left, its percentiles from the delivered
   // ones (Summary::ops).
   static void fill_latencies(const OpTotals& totals, OpSummary& op);
@@ -447,9 +466,10 @@ class Summary {
 [[nodiscard]] std::string render_explain(const graph::Graph& g);
 
 // For plotting: one CSV row per node per step,
-// `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone,
-// queue_lag_s` (the last empty except on a message queue's rows), then one per link with a
-// bandwidth, its `from->to` in the node column, in megabytes.
+// `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,
+// latency_ms,zone,queue_lag_s` (`dead_lettered_per_s` empty except on a worker pool's rows, the
+// last except on a message queue's), then one per link with a bandwidth, its `from->to` in the
+// node column, in megabytes.
 // The header is written on construction; the column rules are at SeriesWriter::observe in
 // report.cpp.
 // Pattern: Observer, like Summary. `out` and `g` must outlive the writer.
