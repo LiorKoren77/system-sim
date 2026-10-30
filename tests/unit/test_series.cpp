@@ -154,10 +154,10 @@ Scenario partly_behind_blob_store(double read_rate) {
 }
 
 // The same two clients and db, but the 10k/s of `post` go to `seeds`, a URL frontier (ch. 9) whose
-// `then` sends each post to db as a `write`: a type the paper load does not follow ("not modelled
-// yet"), so db's load is only the reader's part, a lower bound. `seeds` also has a link to `audit`
-// but no step along it: nothing would flow there. (A notification fan-out stood here until phase 3
-// Task 17 gave it a model; the frontier is the one blocking type left.)
+// `then` sends each post to db as a `write`: followed by the paper load since phase 3 Task 18, so
+// db's load is the reader's part plus the frontier's 10k/s. `seeds` also has a link to `audit` but
+// no step along it: nothing flows there. (A notification fan-out stood here until phase 3 Task 17
+// gave it a model, then the frontier as the last blocking type, until Task 18 gave it one.)
 Scenario partly_behind_frontier(double read_rate) {
   Scenario s{.name = "partial-frontier", .version = 1, .duration = 1s, .step = 100ms};
   s.nodes = {
@@ -862,12 +862,12 @@ TEST_CASE("the JSON's answered_per_s equals offered_per_s when nothing is droppe
 // The paper load (explain.cpp: paper_pass / forward_steps) forwards load from a client's routes,
 // from a service or worker over its `ops` steps, through load balancers and rate limiters over
 // their links (graph::forwards_by_link) and from caches and CDNs on misses (hits_or_misses). A
-// URL frontier's `then` is not followed (a type with no model yet), so
-// the nodes that only it feeds show 0 offered load: before this change, `0%, green`, a verdict on
-// a number that is missing, not zero. A blob store's `then` is followed (its steps are event
-// notifications that fire for every request it serves, and its capacity counts megabytes), and a
-// message queue's deliveries, a worker pool's `then` and a notification fan-out's `then` (phase 3
-// Task 17) too: what they feed has its load and its verdict.
+// blob store's `then` is followed (its steps are event notifications that fire for every request
+// it serves, and its capacity counts megabytes), and so are a message queue's deliveries and the
+// `then` of a worker pool, a notification fan-out (phase 3 Task 17) and a URL frontier (Task 18):
+// what they feed has its load and its verdict. No type is left unfollowed since then; until it was,
+// the nodes only such a type fed showed 0 offered load, `0%, green` before the marks, a verdict on
+// a number that is missing, not zero.
 
 // Peak (21:00) of youtube: both clients at base x 1.6 (200 -> 320/s, 100 -> 160/s), 480/s in all,
 // of which 2 % are uploads: 9.6/s. original_store's event publishes one message per upload to
@@ -1016,30 +1016,34 @@ TEST_CASE("a blob store's notifications add to the load a node gets from elsewhe
   REQUIRE_FALSE(line.contains("load not propagated"));
 }
 
-// A red lower bound is a true verdict: 3000/s of reads alone against 2k/s is 150 %, so db is
-// overloaded whatever else the frontier adds. Its line keeps the percentage as a lower bound ("≥"),
-// keeps "red", and names the type whose flow is missing. (Re-pinned on a type that stays blocking:
-// the blob store this test used first is followed, and so is the notification fan-out it used
-// next.)
-TEST_CASE("a red lower bound stays red", "[series]") {
+// The frontier's hand-offs add to the load a node gets from elsewhere, as a blob store's events do
+// (above): 3000/s of reads plus the frontier's 10k/s of writes is 13000/s against 2k/s, 650 %, a
+// complete number. This test pinned a red lower bound ("≥150%, red; load not propagated: ...")
+// while the frontier was the one type the paper load did not follow; no type is left to pin it on
+// since phase 3 Task 18, so it pins the full number instead.
+TEST_CASE("a URL frontier's hand-offs add to the load a node gets from elsewhere", "[series]") {
   const auto text = explain_of(partly_behind_frontier(3000.0));
   CAPTURE(text);
-  REQUIRE(check_line(text, "db")
-              .contains("(≥150%, red; load not propagated: frontier is not modelled yet)"));
+  const auto line = check_line(text, "db");
+  REQUIRE(line.contains("(650%, red)"));
+  REQUIRE_FALSE(line.contains("load not propagated"));
+  REQUIRE_FALSE(line.contains("≥"));
 }
 
-// The mark follows a blocking type's `then` steps, not its bare links: audit is linked from the
+// A frontier hands URLs on along its `then` steps, not its bare links: audit is linked from the
 // frontier but sent no step, so its 0 % is a real 0 and keeps its verdict, while db, which a step
-// reaches, is marked. (Rebased from the blob store, then from the notification fan-out, which no
-// longer block, onto a type that does, so the test still separates a step from a link.)
+// reaches, gets the frontier's 10k/s with the reader's 1/s: 500 %. (This test separated a step from
+// a link through the "load not propagated" mark while a type was left unfollowed; since phase 3
+// Task 18 none is, and the paper load itself makes the same distinction.)
 TEST_CASE("a node linked from a URL frontier but sent no step keeps its verdict", "[series]") {
   const auto text = explain_of(partly_behind_frontier(1.0));
   CAPTURE(text);
   const auto line = check_line(text, "audit");
   REQUIRE(line.contains("(0%, green)"));
   REQUIRE_FALSE(line.contains("load not propagated"));
-  REQUIRE(check_line(text, "db")
-              .contains("(≥0.05%; load not propagated: frontier is not modelled yet)"));
+  const auto db = check_line(text, "db");
+  REQUIRE(db.contains("(500%, red)"));
+  REQUIRE_FALSE(db.contains("load not propagated"));
 }
 
 // metadata_db at the peak: api's metadata reads that miss the cache and its upload_meta writes
@@ -1110,56 +1114,6 @@ TEST_CASE("explain notes the non-overlapping quorums of chat's presence and noti
   REQUIRE(node_line(notification, "log_db")
               .contains("nodes=3 N=2 W=1 R=1 (W + R ≤ N: a read may miss the latest write) "
                         "mode=ap (default; partitions: phase 3)  imbalance=1.05 (vnodes 150)"));
-}
-
-// Web crawler (ch. 9): the URL frontier hands URLs to the downloader along its `then` (a type the
-// model has no phase for yet), and the downloader, a worker pool, sends on along its own, which the
-// paper load follows. dns is behind both, but only the frontier is a type whose onward flow is
-// missing: the mark names it and no longer the worker pool. The frontier is reached by the seeds
-// (50/s) and also fed back by url_seen's misses, which come through the downloader and the frontier
-// itself: a lower bound as well.
-TEST_CASE("explain names only the frontier on the way to a web-crawler node", "[series]") {
-  const auto text = explain_shipped("web-crawler");
-  CAPTURE(text);
-  REQUIRE(check_line(text, "dns").contains("(load not propagated: frontier is not modelled yet)"));
-  REQUIRE(check_line(text, "downloader")
-              .contains("(load not propagated: frontier is not modelled yet)"));
-  REQUIRE(check_line(text, "frontier")
-              .contains("(≥1%; load not propagated: frontier is not modelled yet)"));
-}
-
-// A blocking type on the way to a node is named once, however many nodes of it lie on the way, and
-// a type the paper load follows is not named at all. A notification fan-out (followed since phase 3
-// Task 17, which also took away the second blocking type this test used to name: with only the
-// frontier left, "every blocking type, nearest first" is one type) feeds a frontier that hands
-// URLs to a second frontier, which hands them to db; nothing else reaches db. The fan-out's load
-// is followed into `seeds`, which shows its 10/s with no mark.
-TEST_CASE(
-    "explain names a blocking type on the way to a node once, and a followed fanout not at all",
-    "[series]") {
-  Scenario s{.name = "two-blockers", .version = 1, .duration = 1s, .step = 100ms};
-  s.nodes = {
-      NodeSpec{.id = "u",
-               .type = NodeType::client,
-               .workload = Workload{.curve = {.base = Rate{10}}, .op_shares = {{"fire", 1.0}}}},
-      NodeSpec{.id = "fan",
-               .type = NodeType::notification_fanout,
-               .then = {simsys::model::Step{.to = "seeds", .op = "url"}}},
-      NodeSpec{.id = "seeds",
-               .type = NodeType::frontier,
-               .then = {simsys::model::Step{.to = "more_seeds", .op = "url"}}},
-      NodeSpec{.id = "more_seeds",
-               .type = NodeType::frontier,
-               .then = {simsys::model::Step{.to = "db", .op = "write"}}},
-      NodeSpec{.id = "db", .type = NodeType::service, .capacity = Rate{2000}}};
-  s.links = {LinkSpec{.from = "u", .to = "fan"}, LinkSpec{.from = "fan", .to = "seeds"},
-             LinkSpec{.from = "seeds", .to = "more_seeds"},
-             LinkSpec{.from = "more_seeds", .to = "db"}};
-  const auto text = explain_of(s);
-  CAPTURE(text);
-  REQUIRE(check_line(text, "db").contains("(load not propagated: frontier is not modelled yet)"));
-  REQUIRE_FALSE(text.contains("notification_fanout is"));
-  REQUIRE(check_line(text, "seeds").contains("peak offered 10/s"));
 }
 
 // ---- `on: failure` steps on paper (spec §5) ----
@@ -1900,9 +1854,7 @@ TEST_CASE("explain on notification-system follows the fanout into its four queue
 //
 // The URL frontier runs now, so explain's paper load follows its `then` steps like a worker pool's,
 // and the last "load not propagated" mark of the shipped scenarios goes: no node of the web crawler
-// is marked on account of the frontier, in particular not the downloader it hands URLs to. (The
-// tests above, written while the frontier was a type with no phase, pin the marks this one
-// removes, and are to be deleted with the implementation.)
+// is marked on account of the frontier, in particular not the downloader it hands URLs to.
 TEST_CASE("explain follows the web crawler's frontier: no node of it is marked as not propagated",
           "[series]") {
   const auto text = explain_shipped("web-crawler");

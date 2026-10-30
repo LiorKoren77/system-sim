@@ -215,7 +215,9 @@ struct TypeDefaults {
       // (Little's law).
       return {Rate{20'000}, 1_ms};
     case frontier:
-      return {Rate{10'000}, 1_ms};  // chosen
+      // chosen: the prioritiser's own rate (behaviours::FrontierBehaviour), filing one URL in 1 ms
+      // on c = 10 servers; the scenario's `capacity` replaces it (web-crawler: 5k/s).
+      return {Rate{10'000}, 1_ms};
   }
   // C++23 std::unreachable(): tells the compiler this point cannot be reached, which
   // silences -Wreturn-type and lets it optimise. Replaces __builtin_unreachable() or a

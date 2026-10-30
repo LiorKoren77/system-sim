@@ -8,9 +8,9 @@ unit per concern: `header.cpp`, `nodes.cpp`, `steps.cpp`, `workload.cpp`, `links
 `slos.cpp`, `faults.cpp`, `overrides.cpp`), the graph builder (`src/engine/graph.cpp`), the node behaviours
 (`src/engine/behaviours.cppm`), the reports (`src/report/report.cpp`, `explain.cpp`) and the
 sweep (`src/sweep/sweep.cpp`). All 14 files under
-`scenarios/` load under it, and eleven of them run end to end ([below](#what-runs-in-phase-2c)):
+`scenarios/` load under it, and twelve of them run end to end ([below](#what-runs-in-phase-2c)):
 the ten of phase 2c and, since phase 3's [`notification_fanout`](#notification_fanout),
-`book/notification-system`.
+`book/notification-system` and, since its [`frontier`](#frontier), `book/web-crawler`.
 The design decisions behind the new rules, with what each ignores, are spec §18 (phase 2b) and
 §19 (phase 2c) (`docs/superpowers/specs/2026-10-27-system-sim-design.md`).
 
@@ -35,7 +35,8 @@ New in v1.4:
 - a `blob_store`'s `then` steps run as asynchronous **event notifications**, one per write it
   stores ([Node types](#node-types)), and `write_ops` on a blob store says which ops are writes;
 - [`external_sink`](#node-types): a third party's API that fails `failure_rate` of what it serves,
-  counted as drops (`politeness` printed, not modelled);
+  counted as drops (`politeness` caps its drain over the frontier's hosts since phase 3, see
+  [`frontier`](#frontier));
 - [`kv_cluster`](#kv_cluster): `nodes`, `vnodes`, `replication`, `write_quorum`, `read_quorum`,
   `mode` (printed, not modelled) and `write_ops`; the ring's hottest machine as its own queue, a
   quorum's latency and losses over its request's real replica set;
@@ -126,7 +127,8 @@ graph, which adds the checks marked *(graph)* below. `explain` works for every n
 | `service_discovery` | as a `service` answering `lookup` at the type's 50k/s and 0.5 ms unless stated; a `node_down` of a node its callers look up holds them on the dead replicas for `failover`, see [`service_discovery`](#service_discovery) (phase 3) |
 | `message_queue` | the broker's append, every message copied to each consumer group, the publisher answered at the append (phase 2c, see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
 | `worker_pool` | M/M/c over consumption, `workers / cost` jobs a second, its room its queue's `retention`; its `then` steps fire for every job it drains, nobody waiting for them (phase 2c, same section) |
-| `external_sink` | a third party's API: a queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) that fails `failure_rate` of what it serves, counted as drops (phase 2c, see [Node types](#node-types)) |
+| `external_sink` | a third party's API: a queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) that fails `failure_rate` of what it serves, counted as drops (phase 2c, see [Node types](#node-types)); `politeness` caps its drain at the frontier's `hosts` × politeness (phase 3, see [`frontier`](#frontier)) |
+| `frontier` | the URL frontier (phase 3): its prioritiser at `capacity`, its URLs handed along its `then` steps to the pool that consumes it, which drains at most `hosts × politeness`; its lag evaluated like a queue's (see [`frontier`](#frontier)) |
 | `kv_cluster` | `nodes` machines on a ring, every request sent to `replication` N of them, answered at the W-th (write) or R-th (read) fastest of its own replica set and lost when fewer come back; the ring's hottest machine as its own queue (phase 2c, see [`kv_cluster`](#kv_cluster)) |
 | `ws_gateway` | its open connections as a **level** that a client op named `connect` fills or a fixed `connections` states, capped at `max_connections × replicas`, loaded by `C / heartbeat` pings, its message ops fanned out by `fanout` (phase 3, see [`ws_gateway`](#ws_gateway)) |
 | `notification_fanout` | a service (the type's 20k/s at 1 ms) whose `then` steps fire for the `1 − dedup` of what it serves that its dedup step lets through, the rest counted as `deduplicated_per_s`; `channels` names the queue behind each channel (phase 3, see [`notification_fanout`](#notification_fanout)) |
@@ -135,21 +137,21 @@ Everything else is refused before the first step, with exit code 1:
 
 | what | message | runs from |
 |---|---|---|
-| `frontier` | `node 'x' has type 'frontier', which run/estimate do not support yet (phase 3)` | 3 |
 | a `ws_gateway` that no `connect` op reaches and that states no `connections` | `node 'x': a ws_gateway needs a client op named 'connect' or a fixed 'connections'` | now, once it has one |
 | a `ws_gateway` with both | `node 'x': a ws_gateway takes a 'connect' op or a fixed 'connections', not both` | now, with one |
+| an `external_sink` with `politeness` in a scenario without exactly one `frontier` | `node 'internet': politeness needs exactly one frontier in the scenario (found 0)` (or `found 2`) | now, with one frontier to take `hosts` from |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
 | a `cache_flush` on a cache with a fixed `hit_ratio` and no `keys` | `node 'x': cache_flush needs keys (a fixed hit ratio is back once keys requests have refilled it)` | now, once it states `keys` |
 | a `cache_flush` on a cache whose hit ratio is 1 | `node 'x': cache_flush on a cache that always hits (hit ratio 1): it has no miss path to warm through` | now, with a hit ratio below 1 |
 
-The type message names the phase that plans the type's model, phase 3 for the one left. The type
-check runs over the whole file first, and names the first node
-in file order whose type cannot run; only then are the nodes of runnable types checked (a CDN's
-`keys`, a gateway's level), in file order: google-drive is refused at its `ws_gateway`,
-`long_poll`, which states no level yet (`node 'long_poll': a ws_gateway needs a client op named
-'connect' or a fixed 'connections'`), chat-system at its `ws_gateway`, `chat_servers`, for the
-same reason (its `service_discovery` runs since phase 3), and web-crawler at its `frontier`. Of the
-14 shipped scenarios eleven run (`exit` is `simsys run`'s exit code, Release build):
+The type message names the phase that plans the type's model. Since phase 3 Task 18 every type
+has a model, so the type check refuses nothing a scenario can name today; it stays for a type
+added later. The nodes are then checked in file order (a CDN's `keys`, a gateway's level):
+google-drive is refused at its `ws_gateway`, `long_poll`, which states no level yet (`node
+'long_poll': a ws_gateway needs a client op named 'connect' or a fixed 'connections'`), and
+chat-system at its `ws_gateway`, `chat_servers`, for the same reason (its `service_discovery` runs
+since phase 3). Of the 14 shipped scenarios twelve run (`exit` is `simsys run`'s exit code,
+Release build):
 
 | scenario | exit | what it shows |
 |---|---|---|
@@ -164,6 +166,7 @@ same reason (its `service_discovery` runs since phase 3), and web-crawler at its
 | `book/news-feed` | 0 | ch. 11's fan-out on write through a queue, with a kv_cluster for the graph |
 | `book/search-autocomplete` | 0 | ch. 13's trie cache, search index and query-log pipeline |
 | `book/notification-system` | 0 | ch. 10's fan-out with dedup into four channel queues, pools that retry their providers and dead-letter the rest, a 20× marketing blast drained within the lag SLOs |
+| `book/web-crawler` | **2** | ch. 9's crawl loop **on purpose** over its gain: 3.5 new URLs per fetched page, so the frontier is offered 4.38k URLs/s against the downloaders' 2000; both SLOs fail (`utilization` 1 against 0.85, the frontier's `queue_lag` 7.13 h against 30 m), see its README |
 
 **`estimate` versus `explain`.** `estimate` evaluates the long-run state once, at
 t = 0 (00:00): the rate curve's value there, without noise. Its first line says so:
@@ -201,20 +204,16 @@ youtube's 600 transcoders are offered 9.6 uploads/s at the 21:00 peak, `9.6/s vs
 red)`, and their renditions bring `transcoded_store` to `9.811k MB/s (196.2/s) vs 20k MB/s
 (49.1%, green)`; at the 400 workers of its README's sweep the pool reads `9.6/s vs 6.667/s
 (144%, red)` and still hands on all 9.6/s on paper, while the engine forwards what a pool drains,
-at most its capacity) and along a `notification_fanout`'s `then` (phase 3: each target is sent
+at most its capacity), along a `notification_fanout`'s `then` (phase 3: each target is sent
 the fan-out's peak × `factor` × (1 − `dedup`), a `kv_cluster` that times N, as the engine
-publishes). They do **not** follow the `then` of a `frontier` (a type of phase 3 with no model
-yet). A node whose load can only come
-through one gets 0 on paper: a number that is missing, not zero. Its check line therefore
-has no percentage and no zone, but a mark naming each such type on the way to it, nearest first:
-`dns  peak offered 0/s vs 100k/s total capacity  (load not propagated: frontier is not modelled
-yet)`. The mark follows such a node's `then` steps (a frontier's links when it has none), not
-every link it has. A node that also receives load the checks do follow gets its percentage as a
-**lower bound**, with no zone unless even that is red (the real load is higher, so green or yellow
-might not hold, but red does): `frontier  peak offered 50/s vs 5k/s total capacity  (≥1%; load
-not propagated: frontier is not modelled yet)` (the web crawler's frontier, fed back through
-itself), `(≥150%, red; ...)`. A `kv_cluster` behind such a type keeps its own head (see
-[`kv_cluster`](#kv_cluster)) and takes the mark like any node.
+publishes) and along a `frontier`'s `then` (phase 3: every URL it is offered, to its
+downloaders). Since phase 3 Task 18 they follow every node type, so no check line is marked any
+more. Until then a node whose load could only come through a type without a model got 0 on paper,
+a number that is missing, not zero, and its check line had no percentage and no zone but a mark
+naming each such type on the way to it, nearest first (`(load not propagated: frontier is not
+modelled yet)`); a node that also received load the checks did follow got its percentage as a
+**lower bound** (`(≥1%; ...)`, `(≥150%, red; ...)`). The machinery stays for a type added later
+without a model.
 A lower-bound line has no per-copy figures (a database's primary/replica split, a ring's hottest
 copy or machine): they would be lower bounds too.
 
@@ -296,7 +295,7 @@ the file declares no datacenters. (The news-feed scenario relies on this.)
 | `advanced` | map | all but `client` | read | see next table |
 | `ops` | map | `client`, `service`, `ws_gateway` | read | client: op → share; otherwise op → step list (below; a `ws_gateway`'s message ops fanned out, see [`ws_gateway`](#ws_gateway)) |
 | `cost` | map op → number | `service`, `cache`, `sql_db` | read | **new in v1.2**: the capacity units one request of that op consumes; an op not listed costs 1. Each value is a positive finite number (`cost 'write' must be a positive finite number`, also for a quoted `"3"`) of at most 1e6 (`cost 'write' must be at most 1e6`); anything but a map is `cost must be a map of op to units`, a bare `cost:` is `cost must not be empty (write {} for none)`. `capacity` is then a rate of units: demand is `Σ rate_op × cost_op`, and the node's demand, drops and backlog are reported in units. What it forwards stays requests (a drained `write` of cost 3 is one `write` downstream). A `sql_db` charges its write ops 5 unless `cost` lists them (see [`sql_db`](#sql_db)). A load balancer and a rate limiter charge 1 per request, and `cost` is not a key of theirs. A `worker_pool`'s `cost` is a different key, a duration per job (see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)) |
-| `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | read (cache, blob_store, worker_pool, notification_fanout); checked (frontier) | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step; a cache's `then` steps run (an unconditional one carries everything the cache answered, an `on: miss` one `1 − h` of the reads and none of the writes; see [`then` steps on a cache](#then-steps-on-a-cache)), and `explain`'s paper load follows them the same way; a `blob_store`'s run as asynchronous event notifications, one per write it serves and none per read (see [Node types](#node-types)); a `worker_pool`'s fire for every job it drains (see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)); a `notification_fanout`'s fire for the `1 − dedup` of what it serves (see [`notification_fanout`](#notification_fanout)) |
+| `then` | list of steps | `cache`, `worker_pool`, `blob_store`, `notification_fanout`, `frontier` | read (cache, blob_store, worker_pool, notification_fanout, frontier) | steps after processing; on a `cache`, steps with `on: miss` receive the flow it did not serve. Validated like any step; a cache's `then` steps run (an unconditional one carries everything the cache answered, an `on: miss` one `1 − h` of the reads and none of the writes; see [`then` steps on a cache](#then-steps-on-a-cache)), and `explain`'s paper load follows them the same way; a `blob_store`'s run as asynchronous event notifications, one per write it serves and none per read (see [Node types](#node-types)); a `worker_pool`'s fire for every job it drains (see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool)); a `notification_fanout`'s fire for the `1 − dedup` of what it serves (see [`notification_fanout`](#notification_fanout)); a `frontier`'s hand every URL its prioritiser files to its downloaders (see [`frontier`](#frontier)) |
 
 A key outside its row is an error, e.g. `key 'capacity' is not valid for type 'client'`
 (a client is a traffic source with no service rate, service time or waiting room) or
@@ -390,9 +389,9 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `ws_gateway` | `max_connections` (count), `heartbeat` (duration), `fanout` (avg recipients per message, ≥ 1), `connections` (count: a fixed level), `session` (duration), `reconnect_within` (duration), `ops` | read and run (phase 3), see [`ws_gateway`](#ws_gateway); `reconnect_within` printed and stored for the reconnect storm (phase 3 Task 15) |
 | `service_discovery` | `failover` (positive duration) | read and run (phase 3), see [`service_discovery`](#service_discovery): a service answering `lookup`; `failover` (default 10 s, chosen) is how long its callers stay on a dead replica after a `node_down`; `node 'disc': failover must be positive`; on any other type `node 'api': key 'failover' is not valid for type 'service'` |
 | `id_generator` | `algorithm` `snowflake|ticket_server|uuid` (required) | read and run (phase 2b), see [`id_generator`](#id_generator) |
-| `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) | read and run (phase 2c): a third party's API (ch. 10's APNs, FCM, SMS and e-mail providers), a leaf queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) whose served requests fail at `failure_rate` f (default 0; outside [0, 1]: `node 's': failure_rate must be between 0 and 1`): `dropped += f × served`, `drain = (1 − f) × served`, so 500/s at f = 0.02 is answered 490/s and the failures count in the node's drop rate, never as rejections. `politeness` (a positive rate) is printed by `explain` as `politeness=1/s (not modelled: phase 3)`: it needs per-host state. `then` and `ops` stay refused; a client's `retries` and a [worker pool's](#message_queue-and-worker_pool) send a failure again (the sink's drop rate leaves out the share of its drops that came from retrying pools) |
+| `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) | read and run (phase 2c): a third party's API (ch. 10's APNs, FCM, SMS and e-mail providers), a leaf queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) whose served requests fail at `failure_rate` f (default 0; outside [0, 1]: `node 's': failure_rate must be between 0 and 1`): `dropped += f × served`, `drain = (1 − f) × served`, so 500/s at f = 0.02 is answered 490/s and the failures count in the node's drop rate, never as rejections. `politeness` (a positive rate, `node 's': politeness must be positive`) caps the sink's drain at hosts × politeness, the `hosts` of the scenario's one [`frontier`](#frontier) (phase 3; `explain` prints `politeness=1/s (drain cap 10M/s: 10M hosts x 1/s)`). `then` and `ops` stay refused; a client's `retries` and a [worker pool's](#message_queue-and-worker_pool) send a failure again (the sink's drop rate leaves out the share of its drops that came from retrying pools) |
 | `notification_fanout` | `channels` (map channel name → message queue id), `dedup` (in [0, 1)), `then` | read and run (phase 3), see [`notification_fanout`](#notification_fanout) |
-| `frontier` | `politeness` (rate per host), `hosts` (int), `then` | `then` checked as [steps](#steps); the others ignored; phase 3 |
+| `frontier` | `politeness` (rate per host), `hosts` (int), `then` | read and run (phase 3), see [`frontier`](#frontier) |
 
 "Ignored" own keys are still checked by name, so a misspelling is caught today; their
 values are typed in the phase that simulates the type.
@@ -1233,6 +1232,89 @@ kept (the book's dedup cache with a TTL: the share is stated, not derived from t
 lookup's own cost beyond the service time, per-user settings that turn a channel off (fold them
 into the `factor`s), ordering.
 
+### `frontier`
+
+Phase 3 (spec §8.4). Book ch. 9's **URL frontier**, the web crawler's store of URLs still to
+download: fed by the seed URLs and by the links the crawler extracts and has not seen before
+(`url_seen`'s misses, the crawl's feedback edge), drained by the HTML downloaders, a
+[`worker_pool`](#message_queue-and-worker_pool) that `consumes` it. The model has three parts:
+
+- **the prioritiser** (the book's front queues): the node's own queue, a service stage of
+  `capacity` URLs a second (absent: the type's 10k/s at 1 ms, chosen). What it cannot pass waits in
+  its room (`queue_limit`, 1000 by default) and is dropped once the room is full: the frontier's own
+  drops. A prioritiser of `3k/s` fed 5000 URLs/s drains 3000 and drops 2000 a second;
+- **the queue**: everything the prioritiser passes is handed, along the `then` steps, to the
+  consuming pool (`then: [{to: downloader, op: fetch}]`: each URL becomes one `fetch` per step and
+  `factor`, whatever op it arrived under). As behind a message queue, what the pool has not read
+  waits in the **pool's** queue. A frontier has no retention, so nothing is deleted unconsumed: the
+  pool's room is the default retention's 7 days of its draining, which no crawl of hours fills. The
+  sender (the seeds, `url_seen`) is answered when the prioritiser has filed the URL and waits for no
+  download;
+- **politeness as a rate cap** (the book's back queues: one host fetched by one worker at a time):
+  if the crawl touches `hosts` distinct hosts and each may be fetched `politeness` times a second,
+  the pool is handed at most
+
+  ```
+  cap   = hosts × politeness                 (URLs/s)
+  drain = min(workers / cost, cap)           (the pool's own capacity by Little's law)
+  ```
+
+  The engine lowers the pool's rate to the cap when it binds, and its servers in proportion
+  (Little's law: the workers busy at once are drain × cost, so 2000 workers at 500 ms under a cap
+  of 1000/s keep 500 busy). Pins: 1000 hosts at 1/s fed 1500 URLs/s into 2000 workers at 500 ms
+  (4000/s of their own) drain **1000/s**, and the backlog grows by 500 a second: 5000, 15,000 and
+  30,000 URLs after 10, 30 and 60 s; 10M hosts at 1/s cap at 10M/s and the pool's 4000/s binds
+  instead.
+
+| key | rule | message |
+|---|---|---|
+| `hosts` | optional, a [count](#values): a positive integer with an optional `k`, `M` or `G` (`10M`), at most 2147483647; absent: no cap | `node 'frontier': hosts must be a positive integer` (0, -5, 1.5, a word) |
+| `politeness` | optional, a positive rate per host (`1/s`); absent: no cap | `node 'frontier': politeness must be positive` |
+| `then` | the hand-off to the downloaders, read as [steps](#steps); a step to a pool that does not consume the frontier is refused *(graph)* like any sender to a pool | (see [Steps](#steps)) |
+
+**Lag.** A frontier's [lag](#queue-lag) is its consuming pool's wait, as a message queue's is, so
+the `queue_lag` SLO, the table's `peak_lag` column, JSON's `peak_queue_lag_s` and the series'
+`queue_lag_s` are filled on its row. Under the cap the FIFO drain time is the backlog over the
+**capped** drain: the 30,000 URLs above, drained 1000 a second, are a lag of **30 s** at t = 60 s
+(15 s at 30 s). Fed less than the cap (800/s of 1000/s) nothing queues and the lag is the pool's
+Erlang C wait alone, under a millisecond there.
+
+**An external sink's politeness.** The web the crawler calls (`internet`) states `politeness: 1/s`
+too: the same cap on the **sink's** drain, `hosts` taken from the one frontier of the scenario:
+
+```
+sink drain = min(sink capacity, frontier hosts × sink politeness)
+```
+
+A sink of 5k/s under 1/s per host over a frontier of 1000 hosts drains 1000/s of the 1500/s it is
+offered: the rest waits in its room and is shed once the room is full, and the downloaders are not
+slowed by it (a worker is busy for `cost` only). With no frontier, or with two, there is no single
+host count: `run`, `estimate` and `sweep` refuse the scenario, `node 'internet': politeness needs
+exactly one frontier in the scenario (found 0)` (`found 2`), and `explain` says so on the sink's
+line (`politeness=1/s (needs exactly one frontier, found 0: run refuses it)`).
+
+**The crawl loop.** `url_seen`'s misses go back to the frontier, so its inflow x is a feedback
+loop's fixed point: with F links a page and a hit ratio h,
+
+```
+x = seeds + F × (1 − h) × x        so    x = seeds / (1 − F (1 − h))      (a geometric series)
+```
+
+while the **loop gain** F (1 − h) is below 1: 50 seeds/s at F = 8 and h = 0.9 (gain 0.8) settle at
+250 URLs/s, which `estimate`, `run` (after a few hundred steps) and `explain` all reach. At the
+book's 50 links a page the gain is 5: the loop feeds itself faster than anything drains it, and in
+`run` and `estimate` it climbs until a node saturates (the downloaders' `workers / cost`, then the
+prioritiser, which drops the excess) and settles there; `explain`, whose paper load has no
+capacities, prints `unbounded` on the loop's lines and the footer `(no steady state: a loop of gain
+>= 1)`. `explain` prints the frontier's numbers as `hosts=10M politeness=1/s (drain cap 10M/s: 10M
+hosts x 1/s)`.
+
+Ignored: the priority **order** (a fluid has no individual URLs, so which one goes first changes no
+rate); a skewed spread of URLs over hosts (a few large sites hold most of a real crawl, and their
+back queues set the pace: the even spread is the optimistic case); robots.txt, the per-host pause
+beyond its rate, DNS-based host grouping; the frontier's disk (the book keeps most of it on disk
+with memory buffers: here it never fills).
+
 ## Rate curve (`client.rate`)
 
 ```yaml
@@ -1361,7 +1443,7 @@ A link longer than **1,000,000 steps** is an error: use a coarser `step`.
 | `dead_letter_rate` | required, a **`worker_pool`** | not allowed | number in [0, 1] | phase 3: the pool's [dead letters](#message_queue-and-worker_pool) / the jobs published to its queue (the queue's demand less the re-published retries), after warmup: the share of the work given up on once its retries ran out, which the drop rate does not count. 1.6e-7 for 1000/s into a sink failing 2 % with `retries: 3` (0.02⁴); 0.118 when the sink's capacity is 900/s for 1000/s offered with `retries: 10` (it answers at most 0.98 × 900 = 882/s, so 118/s run out of retries), where `drop_rate` reads 0. Refused on any other node (`slo: dead_letter_rate needs a worker_pool node ('q' is a message_queue)`) and without one (`slo: dead_letter_rate needs a node`) |
 | `reject_rate` | optional | not allowed | number in [0, 1] | **new in v1.2**: the node's rejected (a rate limiter's refusals, a leaky bucket's overflow included) / the requests sent to it, after warmup; without `node`, the worst node's |
 | `utilization` | required, not a client | not allowed | number in [0, 1] | the node's mean busy fraction (drain / capacity) after warmup, of the copy the node reports: behind a `consistent_hash` balancer the **hottest copy** (`k = 1 + z_M/√vnodes` × the average share, z_M the expected maximum of M standard normals, see [`load_balancer`](#load_balancer)), on a `kv_cluster` its hottest machine (`k = min(1 + z_M/√(N·vnodes), nodes/N)`, see [`kv_cluster`](#kv_cluster)), on a `sql_db` the busier kind of copy (primary or replica); a byte-sized node's in megabytes |
-| `queue_lag` | optional; a `message_queue` | not allowed | duration | phase 2c: the named message queue's **peak** lag after warmup, its slowest consumer group's wait (see [Queue lag](#queue-lag)); without `node`, the worst queue's; `skipped` when no message queue ran. A `frontier` is accepted (the web crawler's queue) and skipped until it runs (phase 3); any other node is refused (`slo: queue_lag needs a message_queue node ('svc' is a service)`) |
+| `queue_lag` | optional; a `message_queue` or a `frontier` | not allowed | duration | phase 2c: the named message queue's **peak** lag after warmup, its slowest consumer group's wait (see [Queue lag](#queue-lag)); without `node`, the worst queue's; `skipped` when no queue ran. A `frontier` is a queue too (the web crawler's, phase 3): its lag is its downloaders' wait, evaluated like a queue's (see [`frontier`](#frontier)); any other node is refused (`slo: queue_lag needs a message_queue node ('svc' is a service)`) |
 | `staleness` | optional; name a `sql_db` | not allowed | duration | phase 2b: the named database's mean staleness after warmup, its write sojourn at the primary + `replication_lag` + its sojourn at a replica (see [`sql_db`](#sql_db)); fails whatever that mean when a replica misses committed writes (it falls behind without bound; the note says how many per replica, of how many committed); `skipped` without a `node` or on a node that keeps no replicated data (any type but `sql_db`); a `sql_db` with `replicas: 1` reports 0 |
 
 The kind of `max` follows the metric, so `0.01` can never be read as 0.01 seconds
@@ -1398,7 +1480,7 @@ grid (00:15-00:25, 00:25-00:35), where the sliding window 00:20-00:30 holds all 
 
 ### Queue lag
 
-A message queue's **lag** (phase 2c) is how long a message published at that step waits until
+A message queue's **lag** (phase 2c; a [`frontier`](#frontier)'s the same way since phase 3) is how long a message published at that step waits until
 its slowest consumer group reads it: Kafka's consumer lag in records divided by the group's
 consume rate. The broker holds nothing back (it appends at 1M/s); what a group has not read
 waits in its worker pool's queue, so every step the lag is read off the pools:
@@ -2000,7 +2082,7 @@ a design review asks after `explain`: *how much of this do I need?*
 | option | rule | refused with |
 |---|---|---|
 | `--param` | required. `<dot.path>=<from>..<to>:<n>`: the key is a dot path through **maps only** (`nodes.users.rate.base`, `nodes.transcoders.workers`), which must exist in the file and hold a single value; a path through a list (`links.0.latency`) is refused, since list entries have no names, and a node whose id contains a dot cannot be swept or measured (the dot splits the path). The range gives `n` points, at least 2 and at most 10,000, evenly spaced from `from` to `to`, both included; both ends are numbers (each starts with a digit or `-`, so a third dot is an error) with the same unit text (`100/s..900/s`, `1ms..5ms`, `400..600`; `100/s..1k/s` is refused, not converted): `100/s..900/s:3` is 100/s, 500/s and 900/s. A key the loader reads as a whole number (a node's `workers`, `replicas`, `partitions`, `keys`, ..., an `advanced` block's `concurrency`) must get a whole number at every point, whole as written: the number before a `k`, `M` or `G` must be whole, as in a [count](#values) (`keys=1k..2k:3` gives 1.5k and is refused although 1500 keys are whole; write `1000..2000:3`) | (each after `<file>: error: `, as every refusal of an option) `--param: nodes.users.rate.bse: no such key in the scenario`; `--param: links.0.latency: '0' would index a list; a dot path goes through maps only (a list entry has no name)`; `--param: workers must be whole (400..600:4 gives 466.67)`; `--param: 1/s..2/s:20000: at most 10000 points`; `--param: 100/s..1k/s:2: both ends must be the same kind of value in the same unit (100/s and 1k/s)`; `--param: '.5ms' is not a number followed by a unit` (for `1ms...5ms`) |
-| `--metric` | required, repeatable (`--metric a --metric b`, or several names after one: `--metric a b`): `<client>.<op>.mean` (the op's mean latency as the client sees it, over the answered requests), `<client>.<op>.p50`, `.p95` or `.p99` (the op table's estimated percentiles; where more than 1 − q of the delivered requests timed out, the timeout itself, printed `>1s` in the table as in `run`'s), `<client>.<op>.attempts` (what the client sent per second, its [`retries`](#node-types) included: JSON's `attempts_per_s`, printed `1.75k/s`) or `.answered` (the part answered per second: `answered_per_s`), `<node>.mean_rho` (a server's time-averaged utilization), `<node>.peak_rho` (its highest utilization of any observed step), `<node>.drop_rate` (the share of the work sent to it that it dropped, the node's own `drop_rate`), `<queue>.lag` (a message queue's peak lag after warmup, what the `queue_lag` SLO observes), `<pool>.dead_lettered` (phase 3: a worker pool's dead letters per second, JSON's `dead_lettered_per_s`, printed as a rate: `62.5/s`) or `<gateway>.connections` (phase 3: a [`ws_gateway`](#ws_gateway)'s open connections at the **end** of the run, the node table's and JSON's `connections`, printed as a count: `2k`; the end, not JSON's `connections_peak`, so that one name is one number: under a steady connect rate the level only rises and the two agree). They are the numbers `run --report json` prints, after warmup. Each name is checked against the file before any point runs | after `<file>: error: `, a name outside the grammar, `--metric: bogus: not a metric (write <client>.<op>.mean\|p50\|p95\|p99\|attempts\|answered, <node>.mean_rho\|peak_rho\|drop_rate, <queue>.lag, <pool>.dead_lettered or <gateway>.connections)`, or one that does not fit the file: `--metric: api.lag: 'api' has type service, not message_queue: only a message queue has a lag`; `--metric: api.connections: 'api' has type service, not ws_gateway: only a ws_gateway has connections`; `--metric: api.dead_lettered: 'api' has type service, not worker_pool: only a worker pool has dead letters`; `--metric: users.drop_rate: 'users' is a client, which serves nothing, so it has no drop rate`; `--metric: nope.mean_rho: the scenario has no node 'nope'` |
+| `--metric` | required, repeatable (`--metric a --metric b`, or several names after one: `--metric a b`): `<client>.<op>.mean` (the op's mean latency as the client sees it, over the answered requests), `<client>.<op>.p50`, `.p95` or `.p99` (the op table's estimated percentiles; where more than 1 − q of the delivered requests timed out, the timeout itself, printed `>1s` in the table as in `run`'s), `<client>.<op>.attempts` (what the client sent per second, its [`retries`](#node-types) included: JSON's `attempts_per_s`, printed `1.75k/s`) or `.answered` (the part answered per second: `answered_per_s`), `<node>.mean_rho` (a server's time-averaged utilization), `<node>.peak_rho` (its highest utilization of any observed step), `<node>.drop_rate` (the share of the work sent to it that it dropped, the node's own `drop_rate`), `<queue>.lag` (a message queue's or a frontier's peak lag after warmup, what the `queue_lag` SLO observes), `<pool>.dead_lettered` (phase 3: a worker pool's dead letters per second, JSON's `dead_lettered_per_s`, printed as a rate: `62.5/s`) or `<gateway>.connections` (phase 3: a [`ws_gateway`](#ws_gateway)'s open connections at the **end** of the run, the node table's and JSON's `connections`, printed as a count: `2k`; the end, not JSON's `connections_peak`, so that one name is one number: under a steady connect rate the level only rises and the two agree). They are the numbers `run --report json` prints, after warmup. Each name is checked against the file before any point runs | after `<file>: error: `, a name outside the grammar, `--metric: bogus: not a metric (write <client>.<op>.mean\|p50\|p95\|p99\|attempts\|answered, <node>.mean_rho\|peak_rho\|drop_rate, <queue>.lag, <pool>.dead_lettered or <gateway>.connections)`, or one that does not fit the file: `--metric: api.lag: 'api' has type service, not message_queue: only a message queue has a lag`; `--metric: api.connections: 'api' has type service, not ws_gateway: only a ws_gateway has connections`; `--metric: api.dead_lettered: 'api' has type service, not worker_pool: only a worker pool has dead letters`; `--metric: users.drop_rate: 'users' is a client, which serves nothing, so it has no drop rate`; `--metric: nope.mean_rho: the scenario has no node 'nope'` |
 | `--jobs` | worker threads, 1 to 1024; default: the machine's hardware threads | CLI11's range message |
 | `--format` | `table` (latencies and lags as the report's tables print them: `1.61ms`, `<1us`, `>1s`; ratios to three significant digits) or `csv` (seconds and ratios, each number the shortest text that reads back to the same double) | |
 

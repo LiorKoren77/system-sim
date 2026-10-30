@@ -1013,8 +1013,9 @@ CheckResult read_worker_pool_keys(const Site& site, const YAML::Node& body, mode
 //
 // An external sink is a third party's API (book ch. 10's APNs, FCM, SMS and e-mail providers): a
 // queue of the type's numbers whose served requests fail a share `failure_rate`, and a
-// `politeness` printed, not modelled. Neither key names another node; `then` and `ops` stay
-// refused by own_keys_by_type (a provider calls nobody of ours).
+// `politeness` that caps its drain over the hosts of the scenario's frontier. Neither key names
+// another node; `then` and `ops` stay refused by own_keys_by_type (a provider calls nobody of
+// ours).
 
 // `failure_rate: 0.02`: the share of what the sink serves that fails (a 5xx), in [0, 1]. Both
 // bounds are meaningful: 0 is a provider that never fails, 1 one that is down. Absent stays
@@ -1030,8 +1031,9 @@ CheckResult read_failure_rate(const Site& site, const YAML::Node& body, model::N
 }
 
 // `politeness: 1/s`: how often one host may be called, a positive rate (0/s would be a provider
-// nobody may call, which a missing link says more plainly). Stored for explain, not modelled
-// (phase 3: it needs per-host state). Absent stays absent.
+// nobody may call, which a missing link says more plainly), on an external sink and on a URL
+// frontier alike: the engine caps the node's drain at hosts x politeness (spec §8.4,
+// behaviours::FrontierBehaviour). Absent stays absent.
 CheckResult read_politeness(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
   if (!body["politeness"]) return {};
   auto politeness = read_bounded_rate(site, body, "politeness", "politeness");
@@ -1048,6 +1050,34 @@ CheckResult read_external_sink_keys(const Site& site, const YAML::Node& body,
   if (node.type != model::NodeType::external_sink) return {};
   const auto this_node = node_site(site, node.id);
   return read_failure_rate(this_node, body, node).and_then([&] {
+    return read_politeness(this_node, body, node);
+  });
+}
+
+// ---- URL frontier keys (phase 3 Task 18, spec §8.4; book ch. 9) ----
+//
+// A URL frontier is the web crawler's queue of URLs to fetch: `hosts` distinct hosts, each fetched
+// at most `politeness` times a second, so it hands out at most hosts x politeness URLs a second.
+// `then` (the hand-off to the downloaders) is read with the other steps; `capacity` is the
+// prioritiser's rate, a common key.
+
+// `hosts: 10M`: a count, as a cache's `keys` (parse_count: a positive integer with an optional SI
+// suffix), that fits the int the model keeps. Absent stays absent: nothing is capped.
+CheckResult read_hosts(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  const auto value = body["hosts"];
+  if (!value) return {};
+  const auto count = parse_count(number_text(value));
+  if (!count || *count > std::numeric_limits<int>::max()) {
+    return site.fail(value, "hosts must be a positive integer");
+  }
+  node.hosts = static_cast<int>(*count);
+  return {};
+}
+
+CheckResult read_frontier_keys(const Site& site, const YAML::Node& body, model::NodeSpec& node) {
+  if (node.type != model::NodeType::frontier) return {};
+  const auto this_node = node_site(site, node.id);
+  return read_hosts(this_node, body, node).and_then([&] {
     return read_politeness(this_node, body, node);
   });
 }
@@ -1362,6 +1392,7 @@ CheckResult read_node_bodies(const Site& site, const YAML::Node& nodes, Declarat
       return read;
     }
     if (auto read = read_external_sink_keys(site, entry.second, *node); !read) return read;
+    if (auto read = read_frontier_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_kv_cluster_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_search_index_keys(site, entry.second, *node); !read) return read;
     if (auto read = read_gateway_keys(site, entry.second, *node); !read) return read;

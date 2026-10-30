@@ -280,8 +280,11 @@ std::optional<std::string> serving_problem(const model::NodeSpec& node, std::str
   return "'" + node.id + "' is a client, which serves nothing, so it has no " + std::string{what};
 }
 
+// A URL frontier has a lag too (phase 3 Task 18): its consumer pool's, as a message queue's.
 std::optional<std::string> lag_problem(const model::NodeSpec& node) {
-  if (node.type == model::NodeType::message_queue) return std::nullopt;
+  if (node.type == model::NodeType::message_queue || node.type == model::NodeType::frontier) {
+    return std::nullopt;
+  }
   return "'" + node.id + "' has type " + std::string{model::to_string(node.type)} +
          ", not message_queue: only a message queue has a lag";
 }

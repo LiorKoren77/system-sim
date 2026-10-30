@@ -307,8 +307,7 @@ struct SeenPercentile {
 
 // The peak lag after warmup (NodeSummary::peak_queue_lag_s) of the named message queue, or of the
 // worst queue when the SLO names none (every queue must keep the bound, so the worst decides; spec
-// §19 entry 14); empty when no message queue ran (a frontier's lag is phase 3's), and the SLO is
-// skipped.
+// §19 entry 14; a URL frontier is a queue too); empty when no queue ran, and the SLO is skipped.
 [[nodiscard]] std::optional<double> peak_queue_lag(std::span<const NodeSummary> nodes,
                                                    const model::SloSpec& slo) {
   if (slo.node) {
@@ -410,8 +409,8 @@ void fail_if_quantile_timed_out(SloResult& result, std::span<const OpSummary> op
 }
 
 // An SLO with nothing observed: the run has nothing the metric is measured on (a staleness on a
-// node that is no database, a queue lag with no message queue, a frontier's before phase 3), or
-// no step was observed.
+// node that is no database, a queue lag with no message queue or frontier that ran), or no step
+// was observed.
 [[nodiscard]] SloResult skipped(const model::SloSpec& slo) {
   return SloResult{.slo = slo, .observed = std::nullopt, .status = SloStatus::skipped};
 }

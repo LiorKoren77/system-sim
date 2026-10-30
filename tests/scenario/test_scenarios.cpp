@@ -173,9 +173,14 @@ TEST_CASE(
     //    SLO with the pools' retries; it is exempt here only for time: 24 h at 100 ms is 864k
     //    steps, far over the five seconds. Its own test below runs the day at a 1 s step and pins
     //    the SLO passing, the dead letters and the 09:00 blast's lag.
+    //  - web-crawler runs (its frontier is simulated since phase 3 Task 18) and FAILS its SLOs by
+    //    design: the crawl loop's gain is above 1, so the frontier's backlog grows until the
+    //    downloaders saturate (the README's lesson). It is exempt for that verdict and for time: 6
+    //    h at 1 s is 21,600 steps of a 12-node loop. Its own tests below run the day at a 60 s
+    //    step.
     if (s.name == "lab-unique-id" || s.name == "url-shortener" || s.name == "youtube" ||
         s.name == "news-feed" || s.name == "search-autocomplete" ||
-        s.name == "notification-system") {
+        s.name == "notification-system" || s.name == "web-crawler") {
       continue;  // not run here
     }
     ++ran;
@@ -250,84 +255,6 @@ TEST_CASE("the consistent-hashing lab under write_through needs set in db's writ
   const auto text = simsys::report::render_explain(*built);
   CAPTURE(text);
   REQUIRE(text.contains("primary 20k units/s vs 5k/s (400%, red)"));
-}
-
-TEST_CASE("book scenarios are refused by run until their node types exist", "[scenario]") {
-  // Phase 1 runs only client and service nodes; the book scenarios use more. The message must
-  // name the node and the phase so a student knows what is missing, not that the file is wrong.
-  // web-crawler is the one used here: it needs a frontier, which phase 3 has yet to model.
-  // (url-shortener used to stand here, then chat-system, until its service_discovery and websocket
-  // gateway got their models in phase 3, then notification-system, until its notification_fanout
-  // got its model in Task 17: see the pinned list below.)
-  const auto s =
-      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/web-crawler/scenario.yaml");
-  const auto g = build_or_fail(s);
-  const auto sim = simsys::engine::Simulation::create(g);
-  REQUIRE_FALSE(sim.has_value());
-  REQUIRE(sim.error().message.find("phase 3") != std::string::npos);
-}
-
-// Phase 2b runs the nodes up to the id generator: the two tutorials, the rate-limiter lab, the
-// consistent-hashing lab (client, load balancer, che cache, sql_db), the unique-id lab (client,
-// id_generator) and the book's URL shortener (client, rate limiter, caches, load balancer, service,
-// id_generator, sql_db) use only those. Phase 2c adds the byte-sized nodes, the queue and the pool
-// with its `then` steps: youtube (clients, CDNs, blob stores, balancer, service, cache, SQL
-// database, message queues, worker pools) is the first book scenario of 2c that runs; the
-// kv_cluster adds the kv-store lab and the book's news feed (its graph_db is the one node type it
-// lacked); the search index (a service with no steps) adds the book's search autocomplete. Phase
-// 3's notification fan-out (Task 17) adds the book's notification system. Every
-// other lab and book scenario still needs a later task (google-drive's gateway level, chat-system's
-// gateway level, ...), so the set of runnable scenarios is pinned by name: a node
-// type added later makes this fail and forces whoever adds it to update the list on purpose. A
-// scenario counts as runnable when Simulation::create accepts it: it refuses every scenario with a
-// type the node-type table says does not run (model::simulated), and, since phase 3 Task 14
-// simulates the ws_gateway, google-drive and chat-system too, whose gateways state no level until
-// their own tasks.
-TEST_CASE(
-    "exactly eleven shipped scenarios use only simulated node types: chain, hello, "
-    "consistent-hashing, kv-store, news-feed, notification-system, rate-limiter, "
-    "search-autocomplete, unique-id, url-shortener, youtube",
-    "[scenario]") {
-  std::vector<std::string> runnable;
-  for (const auto& file : scenario_files()) {
-    CAPTURE(file);
-    const auto loaded = simsys::config::load(file);
-    if (!loaded) FAIL(loaded.error().message);  // a broken file must fail here, not crash below
-    const auto& s = *loaded;
-    const bool every_type_runs = std::ranges::all_of(
-        s.nodes, [](const auto& node) { return simsys::model::simulated(node.type); });
-    const auto g = build_or_fail(s);
-    const auto created = simsys::engine::Simulation::create(g);
-    if (!every_type_runs) REQUIRE_FALSE(created.has_value());
-    // Every type simulated, yet refused: only for a websocket gateway without a level (google-drive
-    // until its own task states `connections: 2M`; the scenario test of google-drive pins it).
-    if (every_type_runs && !created) {
-      REQUIRE(created.error().message.contains(gateway_without_level));
-    }
-    if (created) runnable.push_back(s.name);
-  }
-  std::ranges::sort(runnable);
-  REQUIRE(runnable == std::vector<std::string>{"chain", "hello", "lab-consistent-hashing",
-                                               "lab-kv-store", "lab-rate-limiter", "lab-unique-id",
-                                               "news-feed", "notification-system",
-                                               "search-autocomplete", "url-shortener", "youtube"});
-}
-
-TEST_CASE("a refused scenario's message names the first unsupported node and the phase",
-          "[scenario]") {
-  // web-crawler: notification-system stood here until its fanout got a model (phase 3 Task 17).
-  const auto s =
-      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/web-crawler/scenario.yaml");
-  const auto g = build_or_fail(s);
-  const auto sim = simsys::engine::Simulation::create(g);
-  REQUIRE_FALSE(sim.has_value());
-  const auto& message = sim.error().message;
-  CAPTURE(message);
-  REQUIRE(message.find("phase 3") != std::string::npos);
-  // Name some node of the scenario: the engine reports the first unsupported one it meets.
-  const auto names_a_node = std::ranges::any_of(
-      s.nodes, [&](const auto& node) { return message.find(node.id) != std::string::npos; });
-  REQUIRE(names_a_node);
 }
 
 // ---- Request-based CDN (spec §18 entry 10) ----
@@ -813,8 +740,8 @@ TEST_CASE("byte-sized capacities are checked in MB per second", "[scenario]") {
 
 // explain's paper load follows a message queue into its consumers and a worker pool's `then` steps,
 // so no shipped scenario is marked "load not propagated" on account of a queue or a pool: whatever
-// mark remains names a type with no model yet (frontier). The check reads each
-// mark, the text from "load not propagated:" to the end of its line.
+// mark remains at all since phase 3 Task 18 followed the URL frontier, the last type it did not.
+// The check reads each mark, the text from "load not propagated:" to the end of its line.
 TEST_CASE("no shipped scenario's explain blames a message queue or a worker pool for missing load",
           "[scenario]") {
   const std::string key = "load not propagated:";
@@ -1896,11 +1823,19 @@ TEST_CASE(
 
 // ---- web-crawler runs end to end (phase 3 Task 18) ----
 //
-// The frontier is the last type the crawler lacked, so the book's ch. 9 scenario runs: the
-// simulated set grows from ten shipped scenarios to eleven. (The test of ten above is to be deleted
-// with the implementation, and the generic "run under five seconds" test above must exempt
-// web-crawler for time and SLO verdict, as it exempts youtube: 6 h at 1 s is 21,600 steps.)
-TEST_CASE("exactly eleven shipped scenarios use only simulated node types: the ten and web-crawler",
+// Phase 2b runs the nodes up to the id generator: the two tutorials, the rate-limiter lab, the
+// consistent-hashing lab, the unique-id lab and the book's URL shortener use only those. Phase 2c
+// adds the byte-sized nodes, the queue, the pool, the kv_cluster and the search index: youtube,
+// the kv-store lab, the news feed and search autocomplete. Phase 3's notification fan-out (Task 17)
+// adds the book's notification system, and the frontier, the last type the crawler lacked (Task
+// 18), the book's ch. 9 scenario: twelve shipped scenarios run. Since Task 18 every node type has
+// a model (model::simulated is true for all), so no scenario is refused for its types any more;
+// the two that still are, google-drive and chat-system, are refused at a websocket gateway that
+// states no level until their own tasks. The set of runnable scenarios is pinned by name: whoever
+// makes one more run updates the list on purpose. (The generic "run under five seconds" test above
+// exempts web-crawler for time and SLO verdict, as it exempts youtube: 6 h at 1 s is 21,600
+// steps.)
+TEST_CASE("exactly twelve shipped scenarios run: the eleven before Task 18 and web-crawler",
           "[scenario]") {
   std::vector<std::string> runnable;
   for (const auto& file : scenario_files()) {
@@ -1908,17 +1843,18 @@ TEST_CASE("exactly eleven shipped scenarios use only simulated node types: the t
     const auto loaded = simsys::config::load(file);
     if (!loaded) FAIL(loaded.error().message);
     const auto& s = *loaded;
-    const bool every_type_runs = std::ranges::all_of(
-        s.nodes, [](const auto& node) { return simsys::model::simulated(node.type); });
-    const auto g = build_or_fail(s);
-    REQUIRE(simsys::engine::Simulation::create(g).has_value() == every_type_runs);
-    if (every_type_runs) runnable.push_back(s.name);
+    REQUIRE(std::ranges::all_of(
+        s.nodes, [](const auto& node) { return simsys::model::simulated(node.type); }));
+    const auto created = simsys::engine::Simulation::create(build_or_fail(s));
+    // Refused although every type runs: only a websocket gateway without a level.
+    if (!created) REQUIRE(created.error().message.contains(gateway_without_level));
+    if (created) runnable.push_back(s.name);
   }
   std::ranges::sort(runnable);
-  REQUIRE(runnable == std::vector<std::string>{"chain", "hello", "lab-consistent-hashing",
-                                               "lab-kv-store", "lab-rate-limiter", "lab-unique-id",
-                                               "news-feed", "search-autocomplete", "url-shortener",
-                                               "web-crawler", "youtube"});
+  REQUIRE(runnable == std::vector<std::string>{
+                          "chain", "hello", "lab-consistent-hashing", "lab-kv-store",
+                          "lab-rate-limiter", "lab-unique-id", "news-feed", "notification-system",
+                          "search-autocomplete", "url-shortener", "web-crawler", "youtube"});
 }
 
 // What the plan promises of the shipped crawler, and no more: the engine accepts it (`run` no
