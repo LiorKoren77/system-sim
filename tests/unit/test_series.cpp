@@ -1588,3 +1588,62 @@ TEST_CASE("the sink's rows keep conservation and its drops, 20.408 a second, wit
   REQUIRE_THAT(demand, WithinRel(drain + drops, 1e-5));
   REQUIRE_THAT(number(rows.back()[6]), WithinRel(0.02 * 1020.408, 1e-5));
 }
+
+// ---- explain: a pool's retries are paper load too ----
+//
+// notification-system's iOS channel on its own (the shape of the README's probe): 1140/s published
+// to q, ios_workers (50 workers at 20 ms: 2500/s) sends each job to apns (an external sink at its
+// type's 1k/s quota that fails 2 %), `retries: 3`. The pool drains every attempt, so on paper it
+// and its sink are offered the jobs times the attempts per job, the capped geometric series
+//   A(f, n) = 1 + f + ... + f^n,  A(0.02, 3) = 1.020408
+// (behaviours::WorkerPoolBehaviour): 1140 x 1.020408 = 1163.3/s, 46.5 % of the pool (45.6 % without
+// the retries) and 116 % of apns's quota (114 % without).
+namespace {
+Scenario ios_channel(std::optional<int> retries) {
+  auto pool = group_of("ios_workers", 50, 20ms);
+  pool.then = {Step{.to = "apns", .op = "send"}};
+  pool.retries = retries;
+  auto s = published(1140.0, {std::move(pool)});
+  NodeSpec apns{.id = "apns", .type = NodeType::external_sink, .latency = 150ms};
+  apns.failure_rate = 0.02;
+  s.nodes.push_back(std::move(apns));
+  s.links.push_back(LinkSpec{.from = "ios_workers", .to = "apns", .latency = 0s});
+  return s;
+}
+}  // namespace
+
+TEST_CASE("explain offers a retrying pool and its sink A(f, n) times the jobs: 46.5 percent",
+          "[series]") {
+  const auto text = explain_of(ios_channel(3));
+  CAPTURE(text);
+  REQUIRE(check_line(text, "ios_workers").contains("(46.5%, green)"));
+  REQUIRE(check_line(text, "apns").contains("(116%, red)"));
+}
+
+TEST_CASE("explain offers a pool without retries its queue's jobs alone: 45.6 percent",
+          "[series]") {
+  const auto text = explain_of(ios_channel(std::nullopt));
+  CAPTURE(text);
+  REQUIRE(check_line(text, "ios_workers").contains("(45.6%, green)"));
+  REQUIRE(check_line(text, "apns").contains("(114%, red)"));
+}
+
+// Two sinks in a row, failing 10 % and 20 %: a job is retried when either fails it, the combined
+// share 1 − 0.9 × 0.8 = 0.28, so with one retry the pool drains A(0.28, 1) = 1.28 times its jobs:
+// 1000 x 1.28 = 1280/s of its 2500/s, 51.2 %.
+TEST_CASE("explain retries a pool calling two sinks at their combined failure share: 51.2 percent",
+          "[series]") {
+  auto pool = group_of("w", 50, 20ms);
+  pool.then = {Step{.to = "a", .op = "send"}, Step{.to = "b", .op = "send"}};
+  pool.retries = 1;
+  auto s = published(1000.0, {std::move(pool)});
+  for (const auto& [id, failure_rate] : {std::pair{"a", 0.1}, std::pair{"b", 0.2}}) {
+    NodeSpec sink{.id = id, .type = NodeType::external_sink, .capacity = Rate{5000}};
+    sink.failure_rate = failure_rate;
+    s.nodes.push_back(std::move(sink));
+    s.links.push_back(LinkSpec{.from = "w", .to = id, .latency = 0s});
+  }
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  REQUIRE(check_line(text, "w").contains("(51.2%, green)"));
+}

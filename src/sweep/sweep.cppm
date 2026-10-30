@@ -57,7 +57,8 @@ enum class MetricKind {
   drop_rate,       // `<node>.drop_rate`: the share of the work sent to it that it dropped, a ratio
   peak_queue_lag,  // `<queue>.lag`: a message queue's peak lag after warmup, seconds
   attempts_rate,   // `<client>.<op>.attempts`: what the client sent, retries included, per second
-  answered_rate    // `<client>.<op>.answered`: the part of its requests answered, per second
+  answered_rate,   // `<client>.<op>.answered`: the part of its requests answered, per second
+  dead_lettered_rate  // `<pool>.dead_lettered`: a worker pool's dead letters, per second
 };
 
 // One `--metric`. `name` is the text as typed: it heads the metric's column. `op` is empty except

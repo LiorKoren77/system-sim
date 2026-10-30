@@ -118,7 +118,8 @@ class Flow {
     Rate rate;
   };
   void add(std::string_view op, Rate rate);  // accumulates
-  // Rate{0} when absent. test helper: no caller in src (the engine walks entries()).
+  // Rate{0} when absent. Most callers walk entries(); the engine's
+  // Simulation::keep_retries_in_their_group looks single ops up.
   [[nodiscard]] Rate rate_of(std::string_view op) const;
   [[nodiscard]] Rate total() const;
   void scale(double factor);                       // multiplies every rate in place

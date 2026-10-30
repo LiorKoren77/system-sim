@@ -1813,12 +1813,21 @@ class MessageQueueBehaviour {
 // with a retry count and tries again later, and one that has run out of retries goes to a
 // dead-letter queue, which the on-call team watches). A pool with `retries: n` puts the jobs whose
 // call to an external sink failed back on its OWN queue `retry_after` later (b = retry_after /
-// step rounded to whole steps, at least one), up to n times. The re-published jobs go through the
-// queue like new ones: the queue's demand, the pool's demand, rho and wait, the queue's lag and the
-// sink's demand all include them. In a fluid model that is feedback demand, as a client's retries
-// are (ClientBehaviour): with f the share of the jobs whose sink call fails (1 − d, d the sink's
-// delivered fraction this step; 1 − Π d over the sink calls of a pool that calls several) and
-// R_k(t) the jobs of attempt k (k = 1..n) re-published at step t,
+// step rounded UP to whole steps, at least one: ClientBehaviour::backoff_steps), up to n times. The
+// re-published jobs go through the queue like new ones: the queue's demand, the pool's demand, rho
+// and wait, the queue's lag and the sink's demand all include them; but only this pool reads them
+// again (engine::Simulation::keep_retries_in_their_group): another consumer group of the queue
+// handled those jobs the first time, and ch. 10 gives each channel its own queue, as real designs
+// give each consumer group its own retry topic, so no other group sees a job twice. In a fluid
+// model that is feedback demand, as a client's retries are (ClientBehaviour). The jobs retried are
+// the ones that REACHED a sink and failed there (failed_share):
+//   f = Σ over the sink calls of S_before × (1 − d)
+// with d the call's delivered fraction this step and S_before the survival through the `then`
+// steps before it, as detail::HopBlocks::forward thins them (a job an earlier step lost never
+// reached the sink: it is that step's target's drop, not a retry; a parallel group's sink calls
+// count once, S_group × (1 − Π d), since a job any of them failed is retried once). With one sink
+// first in the list S_before = 1 and f = 1 − d. With R_k(t) the jobs of attempt k (k = 1..n)
+// re-published at step t,
 //   R_1(t + b) = F(t) × f                 F(t): the jobs of their first attempt drained at t
 //   R_k(t + b) = R_(k−1)(t) × f           k = 2..n: the share of attempt k − 1 that failed again
 //   dead(t)    = R_n(t) × f               attempt n failed too: a dead letter (n = 0: none)
@@ -1827,24 +1836,26 @@ class MessageQueueBehaviour {
 // f^k when every attempt fails independently with the same f) and is dead-lettered with
 // probability f^(n+1). At 1000 jobs/s, f = 0.02 and n = 3 the sink is called 1020.408 times a
 // second, fails 20.408 of them (its own drops, as before) and 1000 × 0.02⁴ = 1.6e-4 jobs a second
-// are dead letters: answered + dead-lettered = the jobs published.
-// Why a dead letter is not a drop: nothing overflowed and no node failed it for good; the job is
-// parked where an operator can read it, replay it or give up on it (a dead-letter queue keeps it),
-// which is a decision, not a loss the system made. So it is counted apart, in the pool's
-// dead_lettered_per_s, and the sink's failures that a pool retries are not losses either
-// (report::Summary leaves them out of the drop rate), while the sink's own books keep every failed
-// call as a drop, so its conservation does not change.
-// Ignored: exponential backoff (every retry waits the same `retry_after`), jitter, a retry when the
-// pool itself is overloaded (only a failed sink call is retried; a job its queue's room drops is
-// gone), the jobs a saturated pool leaves waiting (a re-published job not drained in the step it
-// arrives is counted as a first attempt when it is, and gets its retries again), and a sink that
-// overflows while the pool retries: f comes from the sink's delivered fraction, which mixes its
-// quota's overflow with its failures, so a pool retries a call the sink shed for being too busy as
-// it retries a 5xx (both make the provider say no), and its own retries load that quota further. A
-// job lost at a `then` step before the sink's is that step's target's drop and is not retried (f
-// is read off the sink calls alone). Re-published to the queue, a job is read again by every
-// consumer group of it, as Kafka's groups each read the whole log (a design with a retry topic per
-// group is not modelled).
+// are dead letters: answered + dead-lettered = the jobs published (+ the jobs a step before the
+// sink lost, when one does: every job has exactly one outcome). Why a dead letter is not a drop:
+// nothing overflowed and no node failed it for good; the job is parked where an operator can read
+// it, replay it or give up on it (a dead-letter queue keeps it), which is a decision, not a loss
+// the system made. So it is counted apart, in the pool's dead_lettered_per_s, and the sink's
+// failures that a pool retries are not losses either (report::Summary leaves the retrying callers'
+// share of a sink's drops out of the drop rate, and judges the dead letters with the
+// dead_letter_rate SLO instead), while the sink's own books keep every failed call as a drop, so
+// its conservation does not change. Ignored: exponential backoff (every retry waits the same
+// `retry_after`), jitter, a retry when the pool itself is overloaded (only a failed sink call is
+// retried; a job its queue's room drops is gone), the jobs a saturated pool leaves waiting (a
+// re-published job not drained in the step it arrives is counted as a first attempt when it is, and
+// gets its retries again), and a sink that overflows while the pool retries: f comes from the
+// sink's delivered fraction, which mixes its quota's overflow with its failures, so a pool retries
+// a call the sink shed for being too busy as it retries a 5xx (both make the provider say no), and
+// its own retries load that quota further (the `dead_letter_rate` SLO is what judges that:
+// report::Summary::dead_letter_rate). Idempotency: a retry replays the WHOLE `then` list, so a step
+// that had answered before the sink failed (a log write, another provider) is called again for the
+// job, a duplicate push or write the model counts as load and does not tell apart (real workers
+// keep an idempotency key per message, or retry only the failed call).
 class WorkerPoolBehaviour {
  public:
   WorkerPoolBehaviour(const graph::Graph& g, std::size_t self);
@@ -1897,13 +1908,29 @@ class WorkerPoolBehaviour {
   // (its inflow): what retry_failed splits into attempts. A no-op without retries.
   void note_jobs(const flow::Flow& drained, Rate arrived);
 
-  // The share f of this step's jobs whose call to an external sink failed: 1 − Π d over the pool's
-  // sink calls (the class comment), each d read through `delivered` (the engine passes this step's
-  // fractions, or estimate()'s damped ones). 0 for a pool that calls no sink.
+  // The share f of this step's jobs that reached an external sink and failed there (the class
+  // comment): Σ S_before × (1 − d) over the sink calls, S the survival through the steps before,
+  // as detail::HopBlocks::forward computes it (a sequential step thins by its d; the parallel group
+  // where it sits by Π d over its members, its sink calls counting once), each d read through
+  // `delivered` (the engine passes this step's fractions, or estimate()'s damped ones). 0 for a
+  // pool that calls no sink.
   [[nodiscard]] double failed_share(FractionLookup auto&& delivered) const {
-    double every_call_answers = 1.0;
-    for (const SinkCall& call : sink_calls_) every_call_answers *= delivered(call.target, call.op);
-    return 1.0 - every_call_answers;
+    double alive = 1.0;  // S: the share of the jobs no earlier step has failed
+    double failed = 0.0;
+    bool group_seen = false;
+    for (const ThenCall& call : calls_) {
+      if (call.mode == model::StepMode::parallel) {
+        if (group_seen) continue;  // the group's members are counted together, where it starts
+        group_seen = true;
+        failed += alive * (1.0 - parallel_answers(delivered, true));
+        alive *= parallel_answers(delivered, false);
+        continue;
+      }
+      const double answered = delivered(call.target, call.op);
+      if (call.to_sink) failed += alive * (1.0 - answered);
+      alive *= answered;
+    }
+    return failed;
   }
 
   // After the step: the jobs noted this step whose sink call failed (`failed_share` of each
@@ -1925,11 +1952,25 @@ class WorkerPoolBehaviour {
   // its hops is asynchronous (see the constructor). A key, never an op: nothing is asked about it.
   static constexpr std::string_view every_job = "";
 
-  // One call of a `then` step to an external sink: the calls whose failures the pool retries.
-  struct SinkCall {
+  // One `then` step's call, as failed_share reads it: whom it calls, in which mode, and whether the
+  // target is an external sink (the calls whose failures the pool retries).
+  struct ThenCall {
     std::size_t target;
     std::string op;
+    model::StepMode mode;
+    bool to_sink;
   };
+
+  // Π d over the parallel group's calls (`sinks_only`: over its calls to external sinks), the share
+  // of the jobs it lets through (1 for a pool without a parallel group).
+  [[nodiscard]] double parallel_answers(FractionLookup auto&& delivered, bool sinks_only) const {
+    double answered = 1.0;
+    for (const ThenCall& call : calls_) {
+      if (call.mode != model::StepMode::parallel || (sinks_only && !call.to_sink)) continue;
+      answered *= delivered(call.target, call.op);
+    }
+    return answered;
+  }
 
   // The re-published jobs in flight. Attempt k's jobs (k = 1..n, index k − 1) re-published in each
   // step from `delivery` steps ago (still on their way from the queue to the pool, the link's
@@ -1956,9 +1997,10 @@ class WorkerPoolBehaviour {
 
   // One block per `then` step (built in the constructor), only ever forwarded.
   detail::HopBlocks hand_offs_;
-  std::vector<SinkCall> sink_calls_;
+  std::vector<ThenCall> calls_;  // one per `then` step, in order
   int retries_{0};
-  int backoff_steps_{1};               // retry_after / step, at least one (detail::backoff_steps)
+  // retry_after / step rounded up, at least one (ClientBehaviour::backoff_steps)
+  int backoff_steps_{1};
   int delivery_steps_{0};              // the delay of the link from its queue, in steps
   std::optional<RepublishRing> ring_;  // empty without retries
   flow::Flow drained_{};               // note_jobs: this step's jobs
@@ -3015,9 +3057,9 @@ namespace detail {
 // pool's hop asynchronous for some op and not for another, the blocks would have to be per op.
 //
 // The retries (the class comment) are set up from the pool's `retries` and `retry_after` (absent:
-// defaults::pool_retry_after), the calls of its steps to external sinks (whose failures it
-// retries) and the delay of the link its queue delivers on (a job re-published at step t reaches
-// the pool that many steps later).
+// defaults::pool_retry_after), the calls of its steps (those to external sinks are the ones whose
+// failures it retries; the others thin the jobs that reach them) and the delay of the link its
+// queue delivers on (a job re-published at step t reaches the pool that many steps later).
 WorkerPoolBehaviour::WorkerPoolBehaviour(const graph::Graph& g, std::size_t self) {
   const auto& spec = g.nodes()[self].spec;
   auto& blocks = hand_offs_.blocks_for(std::string{every_job});
@@ -3028,13 +3070,15 @@ WorkerPoolBehaviour::WorkerPoolBehaviour(const graph::Graph& g, std::size_t self
                       .mode = step.mode,
                       .lookup = std::nullopt,
                       .hops = {detail::hop_with(g, self, target, step.op, step.factor, false)}});
-    if (g.nodes()[target].spec.type == model::NodeType::external_sink) {
-      sink_calls_.push_back(SinkCall{.target = target, .op = step.op});
-    }
+    calls_.push_back(
+        ThenCall{.target = target,
+                 .op = step.op,
+                 .mode = step.mode,
+                 .to_sink = g.nodes()[target].spec.type == model::NodeType::external_sink});
   }
   retries_ = spec.retries.value_or(0);
-  start_retries(detail::backoff_steps(spec.retry_after.value_or(defaults::pool_retry_after),
-                                      g.scenario().step),
+  start_retries(ClientBehaviour::backoff_steps(
+                    spec.retry_after.value_or(defaults::pool_retry_after), g.scenario().step),
                 detail::delivery_steps(g, self));
 }
 

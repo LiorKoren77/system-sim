@@ -1037,6 +1037,46 @@ void forward_then_steps(const graph::Graph& g, std::size_t from, const OpLoad& a
   }
 }
 
+// How many times a worker pool with `retries: n` drains each job on paper: the capped geometric
+// series of behaviours::WorkerPoolBehaviour,
+//   A(f, n) = 1 + f + f² + ... + f^n
+// (attempt k happens only if the k earlier ones failed, f^k when each fails independently with
+// the same f), with f the share of the jobs its external sinks fail: each sink's `failure_rate`
+// combined over its sink calls, 1 − Π (1 − failure_rate), a job any of them fails being retried
+// (on paper no other step loses anything, so every call is reached). The quota's shedding, which a
+// run counts as a failure too, is left out: a sink offered more than its capacity is red on its
+// own line. 1 for a pool without retries.
+[[nodiscard]] double paper_attempts_per_job(const graph::Graph& g, std::size_t pool) {
+  const auto& spec = g.nodes()[pool].spec;
+  const int retries = spec.retries.value_or(0);
+  if (retries == 0) return 1.0;
+  double every_sink_answers = 1.0;
+  for (const model::Step& step : spec.then) {
+    const auto target = g.index_of(step.to);
+    if (!target || g.nodes()[*target].spec.type != model::NodeType::external_sink) continue;
+    every_sink_answers *= 1.0 - g.nodes()[*target].spec.failure_rate;
+  }
+  const double failed = 1.0 - every_sink_answers;
+  double attempts = 0.0;
+  double chance_of_this_attempt = 1.0;  // f^k for the k-th retry
+  for (int k = 0; k <= retries; ++k) {
+    attempts += chance_of_this_attempt;
+    chance_of_this_attempt *= failed;
+  }
+  return attempts;
+}
+
+// A worker pool's offered load times its attempts per job (paper_attempts_per_job): the jobs it
+// re-publishes come back through its queue to it alone (engine::Simulation::
+// keep_retries_in_their_group), and every attempt runs its `then` steps, so its sinks are offered
+// the attempts too. In place: each pass rebuilds `load` from the clients (paper_pass), so the
+// factor never compounds.
+void add_pool_retries(const graph::Graph& g, std::size_t pool, std::vector<OpLoad>& load) {
+  const double attempts = paper_attempts_per_job(g, pool);
+  if (attempts == 1.0) return;
+  for (auto& [op, rate] : load[pool]) rate *= attempts;
+}
+
 // What a cache or a CDN passes on: to its store (a CDN's origin) and, for a cache, along its
 // `then` steps (a CDN has none). The hits stop here.
 void forward_cached(const graph::Graph& g, std::size_t from, std::vector<OpLoad>& load,
@@ -1077,8 +1117,10 @@ void forward_steps(const graph::Graph& g, const ForwardRoutes& table, std::size_
   // is OFFERED. On paper nothing queues or is dropped: every write that arrives is served and
   // notifies, and a pool offered more than its workers / cost passes all of it on (its own line is
   // red; what the engine forwards is what the pool drains, at most its capacity). The paper load
-  // answers "can this ever fit", not "what goes through".
+  // answers "can this ever fit", not "what goes through". A pool with retries drains each job
+  // A(f, n) times (add_pool_retries).
   if (spec.type == model::NodeType::blob_store || spec.type == model::NodeType::worker_pool) {
+    if (spec.type == model::NodeType::worker_pool) add_pool_retries(g, from, load);
     const OpLoad arriving = load[from];  // a copy: a step may target `from` itself
     forward_then_steps(g, from, arriving, load, fed_back);
     return;

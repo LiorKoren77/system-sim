@@ -330,6 +330,16 @@ class Simulation {
     // are its lag (record_queue_lags). Empty for every other node; a queue has at least one
     // (Graph::build refuses a queue nobody consumes).
     std::vector<std::size_t> consumer_groups{};
+    // A message queue's jobs re-published this step by its consumer groups (receive appends them):
+    // NodeSample::republished_per_s. 0 for every other node.
+    double republished_per_s{};
+    // An external sink's incoming links from worker pools with `retries`
+    // (connect_retrying_callers): the callers whose failed calls are attempted again, not lost.
+    // Empty for every other node.
+    std::vector<std::size_t> retrying_links{};
+    // What those links brought this step, in requests per second (receive):
+    // NodeSample::retried_demand_per_s.
+    double retrying_inflow_per_s{};
   };
 
   // A bandwidth link's pipe (spec §19 entry 3; defaults::pipe_capacity has its numbers and what it
@@ -388,6 +398,7 @@ class Simulation {
   void connect_pipes(const graph::Graph& g);
   void connect_cuttable(const graph::Graph& g);
   void connect_consumer_groups(const graph::Graph& g);
+  void connect_retrying_callers(const graph::Graph& g);
   void register_reachable_ops(const graph::Graph& g);
   [[nodiscard]] Simulation settling_copy() const;
   [[nodiscard]] StepRecord settle(SimTime at);
@@ -402,7 +413,10 @@ class Simulation {
   // the front of one), replacing a (pointer, count) pair or a `std::vector&` that would force the
   // caller to own a vector. Here the step's node samples, which this fills in place.
   void record_queue_lags(std::span<NodeSample> samples) const;
+  void record_retry_flows(std::span<NodeSample> samples) const;
   void receive(std::size_t index, Mode mode);
+  void keep_retries_in_their_group(std::size_t queue, behaviours::Routed& routed) const;
+  [[nodiscard]] flow::Flow republished_by_others(std::size_t queue, std::size_t group) const;
   // Any queueing node (service, load balancer, rate limiter): runs its queues and returns
   // what they drained, in requests per second, for the behaviour to route.
   [[nodiscard]] flow::Flow serve(std::size_t index, SimTime dt, Mode mode,
@@ -930,6 +944,7 @@ Simulation::Simulation(const graph::Graph& g, Faults faults)
   connect(g);
   connect_pipes(g);
   connect_consumer_groups(g);
+  connect_retrying_callers(g);
   register_reachable_ops(g);
   if (faults == Faults::stripped || g.scenario().faults.empty()) return;  // the run before faults
   add_faults(g);
@@ -1498,6 +1513,7 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
   warm_flushed_caches(now);
   forward_pass(now, dt, mode, record);
   record_queue_lags(record.nodes);
+  record_retry_flows(record.nodes);
   backward_pass();
   if (mode == Mode::settle) average_settling_fractions();
   record.responses = client_responses(now);
@@ -1560,6 +1576,20 @@ void Simulation::DampedFraction::move_towards(double measured) {
   value = (1.0 - weight) * value + weight * measured;
 }
 
+// Tells each external sink which of its incoming links come from a worker pool with `retries`
+// (Node::retrying_links): a pool's links out carry only its `then` steps, so every call on such a
+// link is one the pool attempts again when the sink fails it (behaviours::WorkerPoolBehaviour).
+void Simulation::connect_retrying_callers(const graph::Graph& g) {
+  for (std::size_t link = 0; link < g.links().size(); ++link) {
+    const auto& resolved = g.links()[link];
+    const auto& sender = g.nodes()[graph::demand_sender(resolved)].spec;
+    const std::size_t receiver = graph::demand_receiver(resolved);
+    if (g.nodes()[receiver].spec.type != model::NodeType::external_sink) continue;
+    if (sender.type != model::NodeType::worker_pool || sender.retries.value_or(0) == 0) continue;
+    nodes_[receiver].retrying_links.push_back(link);
+  }
+}
+
 // Each message queue's lag (NodeSample::queue_lag_s has the formula): the largest of its consumer
 // groups' waits this step. After the forward pass, since a queue comes before its pools in the
 // order and their waits are this step's only once they have served.
@@ -1574,6 +1604,22 @@ void Simulation::record_queue_lags(std::span<NodeSample> samples) const {
       lag = flow::nan_propagating_max(nodes_[pool].wait.mean_s, lag);
     }
     samples[queue].queue_lag_s = lag;
+  }
+}
+
+// What the retries moved this step, for the report's two retry metrics: on a message queue the
+// jobs its groups re-published (NodeSample::republished_per_s: the queue's demand less them is
+// what was published to it, the dead_letter_rate's denominator); on an external sink called by a
+// retrying pool the part of its demand those calls are (NodeSample::retried_demand_per_s: the
+// drops the drop_rate leaves out), demand × the share of its arrivals they were, in requests.
+void Simulation::record_retry_flows(std::span<NodeSample> samples) const {
+  for (std::size_t index = 0; index < nodes_.size(); ++index) {
+    const auto& node = nodes_[index];
+    if (!node.consumer_groups.empty()) samples[index].republished_per_s = node.republished_per_s;
+    if (node.retrying_links.empty()) continue;
+    const double arrived = node.inflow.total().per_second;
+    const double retrying_share = arrived > 0.0 ? node.retrying_inflow_per_s / arrived : 0.0;
+    samples[index].retried_demand_per_s = samples[index].demand_per_s * retrying_share;
   }
 }
 
@@ -1609,7 +1655,7 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
     };
     const Condition condition = faults_.condition_at(index, now);
     // A client's sample stays all zeros, green: a source has no queue.
-    const behaviours::Routed routed = std::visit(
+    behaviours::Routed routed = std::visit(
         core::Overloaded{[&](behaviours::ClientBehaviour& client) {
                            if (mode == Mode::advance) client.tick(now, dt);
                            client.set_rate_factor(condition.rate_factor);
@@ -1623,6 +1669,7 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
                                                now, dt, delivered_last_step);
                          }},
         nodes_[index].behaviour);
+    keep_retries_in_their_group(index, routed);
     account_rejections(index, routed, samples[index]);
     note_pool_jobs(index, routed);
     send(index, routed, now, dt, mode, record.links);
@@ -1670,24 +1717,65 @@ void Simulation::account_rejections(std::size_t index, const behaviours::Routed&
 // it is sent, so the target reads its source's latest output directly. A message queue also
 // receives the jobs its consumer groups re-publish this step (a worker pool's retries,
 // behaviours::WorkerPoolBehaviour::republished): they are appended like any message, so the
-// queue's demand counts them and every group reads them again. Nothing is added while no pool has
-// a retry due, so a queue whose pools retry nothing receives exactly what its links bring.
+// queue's demand counts them (and the lag they cause in their group), but only the group that
+// re-published them reads them (keep_retries_in_their_group). Nothing is added while no pool has
+// a retry due, so a queue whose pools retry nothing receives exactly what its links bring. An
+// external sink keeps apart what its retrying callers sent (Node::retrying_links).
 void Simulation::receive(std::size_t index, Mode mode) {
   auto& node = nodes_[index];
   node.inflow.clear();
+  node.retrying_inflow_per_s = 0.0;
   for (const std::size_t link : node.incoming_links) {
-    if (mode == Mode::advance) {
-      node.inflow += links_[link].line.pop();
-    } else {
-      node.inflow += links_[link].sent;
+    const flow::Flow arrived = mode == Mode::advance ? links_[link].line.pop() : links_[link].sent;
+    if (std::ranges::contains(node.retrying_links, link)) {
+      node.retrying_inflow_per_s += arrived.total().per_second;
     }
+    node.inflow += arrived;
   }
+  node.republished_per_s = 0.0;
   for (const std::size_t pool : node.consumer_groups) {
     const auto& group = std::get<behaviours::WorkerPoolBehaviour>(nodes_[pool].behaviour);
     if (const flow::Flow due = group.republished(); due.total().per_second > 0.0) {
+      node.republished_per_s += due.total().per_second;
       node.inflow += due;
     }
   }
+}
+
+// A queue routes every message to every consumer group (behaviours::MessageQueueBehaviour), the
+// jobs its groups re-published included (receive appended them). A re-published job is a retry of
+// the group that failed it: every other group read it once, the first time, and handled it, so
+// sending it to them again would be duplicate work (book ch. 10 gives each channel its own queue,
+// and a design that shares a topic gives each consumer group its own retry topic). So each group's
+// copy keeps, op by op, the share of the drained messages that no OTHER group re-published:
+//   sent_g(op) = drained(op) × (1 − R_others(op) / arrived(op))
+// R_others the jobs the other groups re-published this step. The broker drains what it is sent
+// (it appends at 1M/s), so the drained messages are the arrivals' mix, op by op. Nothing changes
+// while no other group has a retry due, so a queue whose pools retry nothing routes as before.
+void Simulation::keep_retries_in_their_group(std::size_t queue, behaviours::Routed& routed) const {
+  const auto& node = nodes_[queue];
+  if (node.republished_per_s <= 0.0) return;
+  for (auto& out : routed.outgoing) {
+    const flow::Flow others = republished_by_others(queue, out.target);
+    if (others.total().per_second <= 0.0) continue;
+    flow::Flow kept;
+    for (const auto& [op, rate] : out.flow.entries()) {
+      const double arrived = node.inflow.rate_of(op).per_second;
+      const double others_share = arrived > 0.0 ? others.rate_of(op).per_second / arrived : 0.0;
+      kept.add(op, Rate{rate.per_second * std::max(0.0, 1.0 - others_share)});
+    }
+    out.flow = std::move(kept);
+  }
+}
+
+// What the consumer groups of `queue` other than `group` re-published to it this step.
+flow::Flow Simulation::republished_by_others(std::size_t queue, std::size_t group) const {
+  flow::Flow others;
+  for (const std::size_t pool : nodes_[queue].consumer_groups) {
+    if (pool == group) continue;
+    others += std::get<behaviours::WorkerPoolBehaviour>(nodes_[pool].behaviour).republished();
+  }
+  return others;
 }
 
 // One step of a queueing node (service, load balancer, rate limiter): the group's arrivals

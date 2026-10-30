@@ -723,7 +723,8 @@ enum class SloMetric {
   reject_rate,
   utilization,
   queue_lag,
-  staleness
+  staleness,
+  dead_letter_rate
 };
 
 // Pattern: Table-driven method — the SLO metric names, read by the loader (`metric:`) and
@@ -737,6 +738,7 @@ inline constexpr auto slo_metric_table = std::to_array<core::EnumName<SloMetric>
     {SloMetric::utilization, "utilization"},
     {SloMetric::queue_lag, "queue_lag"},
     {SloMetric::staleness, "staleness"},
+    {SloMetric::dead_letter_rate, "dead_letter_rate"},
 });
 
 [[nodiscard]] constexpr std::string_view to_string(SloMetric m) {
@@ -904,7 +906,8 @@ static_assert(simsys::core::round_trips(simsys::model::step_mode_table));
 static_assert(simsys::core::round_trips(simsys::model::lb_policy_table));
 static_assert(simsys::model::node_type_table.back().value == simsys::model::NodeType::frontier);
 static_assert(simsys::model::direction_table.back().value == simsys::model::Direction::inout);
-static_assert(simsys::model::slo_metric_table.back().value == simsys::model::SloMetric::staleness);
+static_assert(simsys::model::slo_metric_table.back().value ==
+              simsys::model::SloMetric::dead_letter_rate);
 static_assert(simsys::model::step_condition_table.back().value ==
               simsys::model::StepCondition::failure);
 static_assert(simsys::model::step_mode_table.back().value == simsys::model::StepMode::parallel);

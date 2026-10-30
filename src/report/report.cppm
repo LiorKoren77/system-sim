@@ -248,11 +248,12 @@ class Summary {
   // sent to it, summed over the observed steps (Σ dropped / Σ demand), so always in [0, 1];
   // 0 when nothing reached it. Not a loss (phase 3 spec §6.2): a failed call that a worker pool
   // retries, which is attempted again or ends as the pool's dead letter (counted apart, never as a
-  // drop). So an external sink whose only callers are pools with `retries` has a drop rate of 0,
-  // whatever its own books say (NodeSummary::total_dropped keeps them). A sink with other callers
-  // too counts all its drops: the share a pool retries is not told apart (conservative). An
-  // unknown id is a programmer error (the loader checks SLO nodes): throws
-  // std::invalid_argument.
+  // drop; dead_letter_rate judges those). So an external sink counts, step by step, its drops
+  // times the share of its demand that came from callers that do NOT retry
+  // (engine::NodeSample::retried_demand_per_s): 0 when only retrying pools call it, whatever its
+  // own books say (NodeSummary::total_dropped keeps them), and 0.02 × 10 / 1030 when a client
+  // sends it 10/s beside a pool's 1020/s. An unknown id is a programmer error (the loader checks
+  // SLO nodes): throws std::invalid_argument.
   [[nodiscard]] double drop_rate(std::string_view node) const;
   // The worst node's drop rate: every node must keep its own, so the worst one decides. A bandwidth
   // link's pipe counts as a node here: a request its full room drops is lost as surely as one a
@@ -262,6 +263,13 @@ class Summary {
   // The id of the node with the highest drop rate (a link's `from->to` when its pipe is the worst;
   // the first of equals, nodes before links); empty when nothing dropped anything.
   [[nodiscard]] std::string_view worst_drop_node() const;
+  // A worker pool's dead-letter rate (phase 3 spec §6.2; book ch. 10's dead-letter queue): the jobs
+  // whose last attempt failed over the jobs PUBLISHED to its queue, both summed over the observed
+  // steps (Σ dead_lettered / Σ (queue demand − re-published)), so in [0, 1]: the share of the work
+  // the system gave up on, which the drop rate no longer sees once a pool retries. 0 for a pool
+  // that retries nothing or reads no message queue. An unknown id is a programmer error (the
+  // loader checks SLO nodes): throws std::invalid_argument.
+  [[nodiscard]] double dead_letter_rate(std::string_view pool) const;
   // The same three for REJECTIONS, a rate limiter's refusals by policy (Σ rejected / Σ
   // demand; a leaky bucket's overflow included): a limiter that sheds what its limit says
   // is working, not failing, so its refusals are kept out of the drop rate (D5 of the
@@ -323,9 +331,10 @@ class Summary {
     double replication_seen_s{};   // Σ dt over the steps that report the two above
     std::optional<double> peak_queue_lag_s{};  // the largest queue_lag_s: message queues only
     std::optional<double> dead_lettered{};     // Σ dead_lettered_per_s·dt: worker pools only
-    // An external sink whose every caller is a pool with retries (losses_retried_by_pools): its
-    // drops are retried or dead-lettered, none a loss, so its drop rate is 0.
-    bool losses_retried{};
+    std::optional<double> republished{};       // Σ republished_per_s·dt: message queues only
+    // Σ dropped_per_s × (retried_demand_per_s / demand_per_s) · dt: an external sink's drops of
+    // the calls from pools with retries, which are attempted again, not lost (drop_rate).
+    double retried_dropped{};
     void add(const engine::NodeSample& sample, double dt_s);
     [[nodiscard]] double drop_rate() const;
     [[nodiscard]] double reject_rate() const;
@@ -361,8 +370,6 @@ class Summary {
     void add(const engine::ResponseSample& sample, double dt_s);
   };
 
-  // NodeTotals::losses_retried for node `node` of `g` (report.cpp has the rule).
-  [[nodiscard]] static bool losses_retried_by_pools(const graph::Graph& g, std::size_t node);
   // An op's mean from the moments its answered requests left, its percentiles from the delivered
   // ones (Summary::ops).
   static void fill_latencies(const OpTotals& totals, OpSummary& op);
