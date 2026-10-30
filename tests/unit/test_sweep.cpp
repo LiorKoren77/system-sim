@@ -715,6 +715,19 @@ TEST_CASE(
                               "not worker_pool: only a worker pool has dead letters");
 }
 
+// A URL frontier has a lag too (phase 3 Task 18: its downloaders' wait, as a message queue's
+// consumer groups'), so the message names both types that have one.
+TEST_CASE(
+    "a lag metric on a node that is neither a queue nor a frontier names both that have one") {
+  const std::vector<SweepMetric> metrics{*parse_metric("api.lag")};
+  const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1);
+  REQUIRE_FALSE(rows.has_value());
+  REQUIRE(rows.error() == std::string{hello_path} +
+                              ": error: --metric: api.lag: 'api' has type service, not "
+                              "message_queue or frontier: only a message queue or a frontier has "
+                              "a lag");
+}
+
 TEST_CASE("an attempts metric on a node that is not a client is an error naming its type") {
   const std::vector<SweepMetric> metrics{*parse_metric("api.ping.attempts")};
   const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1);

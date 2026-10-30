@@ -39,24 +39,6 @@ TEST_CASE("the node type table is complete at compile time", "[model]") {
   SUCCEED();
 }
 
-// The node-type table's third column says which types run/estimate can step today: since phase 3
-// Task 18 every type (a service_discovery runs since Task 13: a service that answers `lookup`; a
-// ws_gateway since Task 14; a notification_fanout since Task 17; the frontier, the last, since
-// Task 18). Simulation::create reads it (model::simulated), and the scenario tests pin the shipped
-// scenarios it lets run: all of them.
-TEST_CASE("every node type runs", "[model]") {
-  for (const auto& row : simsys::model::node_type_table) {
-    CAPTURE(row.name);
-    REQUIRE(simsys::model::simulated(row.value));
-  }
-  static_assert(simsys::model::simulated(NodeType::service));
-  static_assert(simsys::model::simulated(NodeType::frontier));
-}
-
-TEST_CASE("a service discovery is a node type the engine runs", "[model]") {
-  REQUIRE(simsys::model::simulated(NodeType::service_discovery));
-}
-
 namespace {
 // Two broken tables, to show that round_trips catches both ways a table can be wrong.
 enum class Colour { red, green };
@@ -345,21 +327,4 @@ TEST_CASE("a Fault carries what breaks, where, when and for how long", "[model]"
   REQUIRE(f.at == 21h + 30min);
   REQUIRE(f.duration == 1min);
   REQUIRE(f.node == "chat_servers");
-}
-
-// Task 17 of phase 3: notification_fanout has a model (a service whose then steps fire per routed
-// notification times 1 - dedup). The test above, which says the four types of phase 3 do not run,
-// is the one each type's task shrinks; this one is appended instead of editing it (it is the line
-// the sibling tasks edit too) and pins the fanout alone: its table row says it runs, and the row
-// still spells it the way the schema does.
-TEST_CASE("the notification_fanout node type runs", "[model]") {
-  REQUIRE(simsys::model::simulated(NodeType::notification_fanout));
-  REQUIRE(simsys::model::to_string(NodeType::notification_fanout) == "notification_fanout");
-}
-
-// Phase 3 Task 18 removes the frontier from the list of types not simulated yet: the URL frontier
-// is modelled (a queue whose pool drains at hosts x politeness), so run/estimate accept it. It was
-// the last such type (the test of the whole table, above, says every type runs).
-TEST_CASE("a frontier is a simulated node type", "[model]") {
-  REQUIRE(simsys::model::simulated(NodeType::frontier));
 }

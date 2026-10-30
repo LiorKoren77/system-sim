@@ -9,6 +9,8 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -23,6 +25,7 @@ import simsys.core;
 import simsys.engine;
 import simsys.graph;
 import simsys.model;
+import simsys.report;
 import simsys.test_fixtures;
 
 // A note for test authors: `Approx(x).margin(m)` passes when the value is within the
@@ -53,6 +56,7 @@ using simsys::test_support::records_of;
 using simsys::test_support::simulation_of;
 // explain's lines (tests/support/explain_lines.hpp).
 using simsys::test_support::check_line;
+using simsys::test_support::node_line;
 
 // ---- The URL frontier: a queue whose drain is capped by politeness (spec §8.4; book ch. 9) ----
 //
@@ -458,4 +462,179 @@ TEST_CASE("the shipped web crawler's frontier is 10M hosts at 1 request a host a
   REQUIRE(*frontier.hosts == 10'000'000);  // "10M": the loader reads the SI suffix
   REQUIRE(frontier.politeness.has_value());
   REQUIRE_THAT(frontier.politeness->per_second, WithinRel(1.0, 1e-12));
+}
+
+// ---- The cap bounds the drain in front of the pool; the pool keeps its workers (Task 18 review)
+// --
+//
+// Politeness limits how fast URLs are HANDED to the downloaders, not how many downloaders there
+// are. The model is a token bucket in front of the pool, refilled at hosts x politeness tokens a
+// second, one token per URL handed over; the pool behind it keeps its 2000 workers at 500 ms. So
+//   drain = min(pool capacity, cap) = min(2000 / 0.5 s, 1000 x 1/s) = 1000 URLs/s
+// and the pool's utilization is the share of its workers busy, by Little's law (busy workers =
+// throughput x the time each job holds one):
+//   rho = drain x cost / workers = 1000 x 0.5 / 2000 = 0.25           (at the cap)
+//   rho = 900 x 0.5 / 2000 = 0.225                                     (at 900/s, below it)
+// More workers lower rho and drain nothing more: the cap is what binds, and the utilization SLO
+// sees the workers idle. (Until the review the engine shrank the pool to the cap, rate AND
+// servers: it read rho 1 at the cap and 0.9 at 900/s while 500 of the 2000 workers were busy, so
+// a utilization SLO failed for a reason that was not true.)
+TEST_CASE("at the politeness cap the pool keeps its 2000 workers: rho 0.25, drain 1000, lag 30 s",
+          "[theory]") {
+  const auto g = *Graph::build(crawl(1500, frontier_of(1000, 1.0, 5000)));
+  const auto records = records_of(g, 600);  // 60 s
+  const auto& downloader = records.back().nodes[*g.index_of("downloader")];
+  REQUIRE_THAT(downloader.drain_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(downloader.rho, WithinRel(0.25, 1e-9));          // 1000 x 0.5 s / 2000 workers
+  REQUIRE_THAT(downloader.backlog, WithinRel(30'000.0, 1e-6));  // (1500 - 1000) x 60 s
+  REQUIRE_THAT(frontier_lag_of(records.back(), g), WithinRel(30.0, 1e-6));  // 30k / 1000 a second
+}
+
+TEST_CASE("below the politeness cap at 900 a second the pool reads rho 0.225 and queues nothing",
+          "[theory]") {
+  const auto g = *Graph::build(crawl(900, frontier_of(1000, 1.0, 5000)));
+  const auto records = records_of(g, 100);  // 10 s
+  const auto& downloader = records.back().nodes[*g.index_of("downloader")];
+  REQUIRE_THAT(downloader.drain_per_s, WithinRel(900.0, 1e-9));
+  REQUIRE_THAT(downloader.rho, WithinRel(0.225, 1e-9));  // 900 x 0.5 s / 2000 workers
+  REQUIRE(downloader.backlog == 0.0);
+  const auto e = simulation_of(g).estimate();  // the long run agrees
+  REQUIRE_THAT(e.nodes[*g.index_of("downloader")].rho, WithinRel(0.225, 1e-9));
+}
+
+TEST_CASE("twice the workers behind the same cap halve the pool's rho and drain no more",
+          "[theory]") {
+  auto s = crawl(1500, frontier_of(1000, 1.0, 5000));
+  s.nodes[2] = group_of("downloader", 4000, 500ms);
+  s.nodes[2].consumes = "frontier";
+  const auto g = *Graph::build(s);
+  const auto& downloader = records_of(g, 100).back().nodes[*g.index_of("downloader")];
+  REQUIRE_THAT(downloader.drain_per_s, WithinRel(1000.0, 1e-9));  // still the cap
+  REQUIRE_THAT(downloader.rho, WithinRel(0.125, 1e-9));           // 1000 x 0.5 s / 4000 workers
+}
+
+// With 10M hosts the cap (10M/s) is far above the pool's own 4000/s, so the pool binds with its
+// real 2000 workers: every one of them busy, rho 1.
+TEST_CASE("with 10 million hosts the pool's own 4000 a second binds and every worker is busy",
+          "[theory]") {
+  const auto g = *Graph::build(crawl(5000, frontier_of(10'000'000, 1.0, 5000)));
+  const auto& downloader = records_of(g, 100).back().nodes[*g.index_of("downloader")];
+  REQUIRE_THAT(downloader.drain_per_s, WithinRel(4000.0, 1e-9));
+  REQUIRE_THAT(downloader.rho, WithinRel(1.0, 1e-9));  // 4000 x 0.5 s / 2000 workers
+}
+
+// ---- A frontier deletes nothing: its pool's room is unbounded (Task 18 review) ----
+//
+// A message queue deletes a message older than its retention, so its pool's room is retention x
+// the pool's rate and what overflows it is lost. A frontier has no retention: a URL waits until a
+// downloader takes it. So its pool's room is unbounded, and `estimate`, which jumps to the long
+// run, cannot fill it: offered 1500/s against a drain of 1000/s, the backlog grows by 500 URLs
+// every second for ever, and the long-run lag has no figure. estimate says so (an infinite lag and
+// backlog, printed "unbounded") and drops nothing, where a full room of 7 days of draining used to
+// drop the 500/s it could not hold and report a lag of 168 h.
+TEST_CASE(
+    "estimate of a frontier offered more than its drain reports an unbounded lag and no drops",
+    "[theory]") {
+  const auto g = *Graph::build(crawl(1500, frontier_of(1000, 1.0, 5000)));
+  const auto e = simulation_of(g).estimate();
+  REQUIRE(e.converged);
+  const auto& downloader = e.nodes[*g.index_of("downloader")];
+  REQUIRE_THAT(downloader.drain_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE(downloader.dropped_per_s == 0.0);  // nothing is deleted unconsumed
+  REQUIRE(std::isinf(downloader.backlog));
+  const auto& lag = e.nodes[*g.index_of("frontier")].queue_lag_s;
+  REQUIRE(lag.has_value());
+  REQUIRE(std::isinf(*lag));
+}
+
+TEST_CASE("estimate of a frontier fed below its drain reports a finite lag and no backlog",
+          "[theory]") {
+  const auto g = *Graph::build(crawl(900, frontier_of(1000, 1.0, 5000)));
+  const auto e = simulation_of(g).estimate();
+  REQUIRE(e.nodes[*g.index_of("downloader")].backlog == 0.0);
+  const auto& lag = e.nodes[*g.index_of("frontier")].queue_lag_s;
+  REQUIRE(lag.has_value());
+  REQUIRE(*lag < 0.1);  // the pool's Erlang wait alone
+}
+
+TEST_CASE("estimate's node table prints the frontier's lag and its pool's backlog as unbounded",
+          "[theory]") {
+  const auto g = *Graph::build(crawl(1500, frontier_of(1000, 1.0, 5000)));
+  const auto summary = simsys::report::Summary::of_estimate(g, simulation_of(g).estimate());
+  const auto table = simsys::report::render_table(summary, {}, false);
+  CAPTURE(table);
+  REQUIRE(table.contains("unbounded"));
+  REQUIRE_FALSE(table.contains("unavailable"));
+  REQUIRE(simsys::report::format_lag(std::numeric_limits<double>::infinity()) == "unbounded");
+}
+
+TEST_CASE("explain prints the room of a frontier's pool as unbounded", "[theory]") {
+  const auto text = explain_of(crawl(1500, frontier_of(1000, 1.0, 5000)));
+  CAPTURE(text);
+  REQUIRE(
+      node_line(text, "downloader").contains("queue_limit=unbounded (a frontier deletes nothing)"));
+}
+
+// ---- explain checks a frontier against what it can hand on: min(prioritiser, cap) ----
+//
+// The frontier's backlog grows when it is offered more than it can hand to its pool, and that is
+// the smaller of its prioritiser's capacity and the politeness cap:
+//   1500/s offered vs min(5000, 1000 hosts x 1/s) = 1000/s: 150 %, red (the backlog grows by 500/s)
+//   800/s offered vs 1000/s: 80 %, yellow
+// The check used to compare against the prioritiser alone (1500 of 5000: 30 %, green) while the
+// backlog grew without bound. With the cap above the prioritiser (10M hosts) the line is the plain
+// "total capacity" one (the crawl loop's test above pins it).
+TEST_CASE("explain checks a frontier against its drain cap when the cap is below its prioritiser",
+          "[theory]") {
+  const auto over = explain_of(crawl(1500, frontier_of(1000, 1.0, 5000)));
+  CAPTURE(over);
+  REQUIRE(check_line(over, "frontier")
+              .contains("peak offered 1.5k/s vs 1k/s drain cap (1k hosts x 1/s, below the "
+                        "prioritiser's 5k/s)  (150%, red)"));
+  const auto under = explain_of(crawl(800, frontier_of(1000, 1.0, 5000)));
+  CAPTURE(under);
+  REQUIRE(check_line(under, "frontier").contains("(80%, yellow)"));
+}
+
+// ---- What a frontier refuses (Task 18 review) ----
+//
+// Two consumer pools on one frontier would each be handed every URL (a frontier copies to its
+// `then` steps, as a message queue copies to its groups) and each would get the whole politeness
+// budget: twice the fetches per host the cap allows. A crawl has one bank of downloaders; a second
+// pool is refused, naming both.
+TEST_CASE("a frontier consumed by two pools is refused, naming both pools", "[theory]") {
+  auto s = crawl(1500, frontier_of(1000, 1.0, 5000));
+  auto second = group_of("downloader2", 2000, 500ms);
+  second.consumes = "frontier";
+  s.nodes[1].then.push_back(Step{.to = "downloader2", .op = "fetch"});
+  s.nodes.push_back(std::move(second));
+  s.links.push_back(LinkSpec{.from = "frontier", .to = "downloader2", .latency = 0s});
+  REQUIRE(refusal_of(s) ==
+          "node 'frontier': a frontier hands its URLs to one consumer pool "
+          "('downloader' and 'downloader2' consume it)");
+}
+
+// A sink's politeness multiplies the frontier's `hosts`: over a frontier that states none there is
+// nothing to multiply, and the sink would silently cap nothing. Refused like a scenario without a
+// frontier, and explain's sink line says why.
+TEST_CASE("a sink with politeness over a frontier without hosts is refused", "[theory]") {
+  auto s = crawl_into_internet(1.0);
+  s.nodes[1].hosts.reset();
+  REQUIRE(refusal_of(s) ==
+          "node 'internet': politeness needs the frontier's hosts ('frontier' states none)");
+  const auto text = explain_of(s);
+  CAPTURE(text);
+  REQUIRE(node_line(text, "internet")
+              .contains("politeness=1/s (the frontier states no hosts: run refuses it)"));
+}
+
+// The sink's cap is a bound in front of it too: its queue keeps the provider's 5k/s, so draining
+// the 1000/s the cap lets through it reads rho 1000 / 5000 = 0.2, not 1.
+TEST_CASE("an internet sink capped at 1000 a second by politeness reads rho 0.2 of its 5k/s",
+          "[theory]") {
+  const auto g = *Graph::build(crawl_into_internet(1.0));
+  const auto e = simulation_of(g).estimate();
+  const auto& internet = e.nodes[*g.index_of("internet")];
+  REQUIRE_THAT(internet.drain_per_s, WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(internet.rho, WithinRel(0.2, 1e-9));
 }
