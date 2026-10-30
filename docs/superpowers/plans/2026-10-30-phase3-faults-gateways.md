@@ -458,6 +458,13 @@ attempts`, `pool w re-published 999 jobs`; JSON `lost_requests`, `after.retries_
 - [ ] Tests: a client with `ops: {connect: 0.5, send: 0.5}` at 200/s (connect 100/s) → gateway `session: 1000s`, `heartbeat: 5s`, `max_connections: 200k`, `replicas: 1`: the level follows `C' = 100 − C / 1000`, so `C(t) = 100k (1 − e^{−t/1000})`: **63.2k** at t = 1000 s, **100k** at the fixed point (within 1 % at 4600 s); the heartbeat load is **C / 5** (20k/s at the fixed point) on the gateway's `heartbeat` op (visible as its demand); with `max_connections: 50k` the level stops at **50k** and connects are rejected at **100 − 50k / 1000 = 50/s** (`rejected_per_s`); `connections: 2M` fixed → C is 2M from the first step, heartbeat 60 s → **33.33k/s**; a `send` op with `then: [{to: q, op: publish}]` and `fanout: 1.4` sends `q` **1.4 ×** the send rate; `deliver` ops make no hops; `estimate` reports the fixed-point level; the explain line.
 - [ ] Commit `nodes: ws_gateway holds connections as a level and fans messages out`.
 
+Note for Task 15 (from Task 14's implementer, 2026-10-30): chat-system's gateway has `fanout: 1.4` and
+its `sync_workers` deliver with `factor: 1.4`, so the scenario now fans out twice on paper (message_store
+117 %, presence 99.3 %): Task 15 decides where the fan-out lives (keep the gateway's `fanout`, drop the
+workers' factor is the spec's reading) and re-pins the explain checks. The "needs a connect op or a
+fixed connections" refusal lives in `Simulation::create` (a graph fact), so google-drive is refused there
+until Task 16 gives `long_poll` `connections: 2M`.
+
 ### Task 15: the reconnect storm; chat-system runs end to end
 
 **Files:** `src/engine/behaviours.cppm`, `faults.cppm` (a `node_down` of `r / R` of a gateway drops `C × r / R` connections; they reconnect evenly over `reconnect_within` from the fault's end: `connects += dropped / reconnect_within` per second for that long; messages to dropped connections are lost; `FaultRecord::after` = the storm's size and the gateway's peak utilisation), `scenarios/book/chat-system/{scenario.yaml,README.md}` (the client gains `connect` in its ops or the gateway a `connections` level: decide from the book's 50M DAU and the README's reasoning, document it; sizing so the day passes its three SLOs with the 21:30 fault as the lesson: the storm's size, the gateway's peak, `send` p99 recovery time, a sweep over `reconnect_within` 10 s..60 s; `push` at 945 % and `lb` at 90 % resolved or explained), `tests/scenario/test_scenarios.cpp` (chat-system leaves the refused list; a day test at a coarser step pins the storm's size `C × 1` for the whole tier, the peak and the recovery within the fault block's numbers), `tests/unit/test_series.cpp`, `README.md`.
