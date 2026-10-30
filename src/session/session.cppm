@@ -56,7 +56,8 @@ struct RunObservers {
 };
 
 // `sim` run over the scenario's duration at its step, every record observed by a Summary that
-// starts at the scenario's warmup and by the given observers. `sim` must be a simulation of `g`.
+// starts at the scenario's warmup and by the given observers, and the faults' records attached to
+// it at the end (report::Summary::set_faults). `sim` must be a simulation of `g`.
 [[nodiscard]] report::Summary run_summary(const graph::Graph& g, engine::Simulation& sim,
                                           RunObservers observers = {});
 

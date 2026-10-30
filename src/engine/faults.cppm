@@ -133,6 +133,12 @@ class FaultSchedule {
   // misses (Simulation::warm_flushed_caches). Empty without a flush.
   [[nodiscard]] std::span<const std::size_t> flushed_caches() const { return flushed_; }
 
+  // The seconds the flush of cache `cache` at `at` takes to warm back: until its hit ratio factor
+  // is 1 again, full_at / reads_per_copy (WarmUp: t_c / rate for a che cache, keys / rate for a
+  // fixed ratio). Empty when no such flush changes anything (a cache without a hit ratio) or the
+  // cache is handed no reads, so that it never fills.
+  [[nodiscard]] std::optional<double> warm_up_s(std::size_t cache, SimTime at) const;
+
  private:
   // One fault that changes something on one node (a dc_down is one per node of the datacenter):
   // the node, when, and its effect alone.
@@ -203,6 +209,75 @@ class FaultSchedule {
   std::vector<WarmUp> warm_ups_;      // in the scenario's order
   std::vector<std::size_t> flushed_;  // flushed_caches()
   std::vector<int> kv_machines_;      // per node: a kv_cluster's machines, 0 for any other node
+};
+
+// ---- What a fault cost: the record behind the report's block per fault (spec §4.4) ----
+//
+// Models: the incident report (a postmortem) a team writes after an outage, in the three questions
+// System Design Interview (Alex Xu, vol. 1) asks of every failure in ch. 1 ("if one server goes
+// offline...", "if the master database goes offline...", "if any damage happens to one data
+// center...") and again in ch. 12: what did it cost while it lasted, what came after it, and when
+// was the system itself again. One record per fault, filled by the engine step by step
+// (engine::FaultLog), printed by the report as three lines:
+//   during    the blast radius: what the faulted node was sent and what it served (means over the
+//             fault), the requests its full room dropped, the backlog it built, and the SLOs the
+//             fault broke that held before it (`flipped`)
+//   after     the follow-on, the work a fault leaves behind once it has cleared: the backlog to
+//             drain (the requests that waited for the node to come back), a flushed cache's
+//             warm-up (ch. 1: every read misses an empty cache and goes to the database until it
+//             is full again); later a gateway's reconnect storm (Task 15) and a client's extra
+//             attempts (Task 10)
+//   recovery  the time to recover, the number an incident report and a scenario's README quote:
+//             the first step after the fault clears at which every client op's p99 and every
+//             node's utilisation (rho) are within 1 % of the step before the fault
+// Why "within 1 % of before" and not "the SLOs pass again": an SLO with room to spare passes
+// while a backlog is still draining and the system is far from its normal state, and one that
+// already failed before the fault never passes again; neither tells when the fault is over. Every
+// system has a state it was in before the fault, and being back in it is the question. 1 % is
+// tight enough that a queue still draining (rho 1 while it works off the backlog) does not count,
+// and loose enough that a fluid model's last digits do not delay it for ever.
+// Ignored: anything the run does not show (the time to detect the failure, the failover itself:
+// FaultSchedule's header), a rate curve's own drift (a diurnal curve moves rho too; over seconds it
+// is far under 1 %, over hours it is not, and a fault whose system never returns to the numbers
+// of the step before it is reported "not recovered"), and a fault at the run's first step, which
+// has no step before it to return to: no SLO can flip and no recovery is judged.
+struct FaultAfter {
+  // Seconds from the end of the fault to the end of the first step whose backlog at the faulted
+  // node is empty (0 when it was empty as the fault ended); empty when the fault built no backlog
+  // or the backlog was not drained by the end of the run.
+  std::optional<double> backlog_drained_in_s{};
+  // A cache_flush only: seconds from the flush until the cache is full again (its hit ratio
+  // factor back at 1: FaultSchedule::warm_up_s), once the run got that far; empty otherwise.
+  std::optional<double> cache_warm_in_s{};
+};
+
+// One fault's record. The faulted part is the node the fault names; for a dc_down it is the
+// datacenter: its nodes (but its clients) summed, plus the links the cut crosses (their requests
+// sent and lost, in requests, beside the nodes' capacity units); for a traffic_spike it is the
+// client, whose numbers are its requests (engine::ResponseSample): offered (the spiked rate),
+// served = answered, lost = offered − answered (lost on the way or timed out), and no backlog or
+// room of its own (the backlog the spike builds downstream is in the node table). Rates and
+// amounts are in the node's capacity units (engine::NodeSample), requests when every cost is 1. The
+// window "during" is [at, at + for); for a cache_flush, an instant, it is the warm-up [at, at +
+// cache_warm_in_s) (to the end of the run if the cache never warms), the time the flush costs
+// anything.
+struct FaultRecord {
+  model::FaultKind kind{};
+  std::string node{};  // as the fault names it (empty for a dc_down: see `datacenter`)
+  SimTime at{};
+  SimTime duration{};      // `for`; 0 for a cache_flush (model::lasts)
+  double offered_per_s{};  // the faulted node's demand, the mean over the steps "during"
+  double served_per_s{};   // ... and its drain
+  double lost{};           // Σ dropped × dt over them: what its full room dropped
+  double backlog_peak{};   // the most that waited at the end of any of them
+  double room{};           // queue_limit × copies: the room the backlog fills
+  std::vector<std::size_t> flipped{};  // indexes into Scenario::slos: held at the step before
+                                       // `at`, broken at some step "during" (FaultLog's rule)
+  FaultAfter after{};
+  // The start of the first step at or after at + for, inside no fault, with every client op's p99
+  // and every node's rho within 1 % of the step before `at`; empty when the run ended first.
+  std::optional<SimTime> recovered_at{};
+  std::string datacenter{};  // a dc_down's datacenter; empty for every other kind
 };
 
 }  // namespace simsys::engine
@@ -441,6 +516,17 @@ double FaultSchedule::warmth_at(std::size_t node, SimTime now) const {
     if (latest == nullptr || warm_up.at.count() >= latest->at.count()) latest = &warm_up;
   }
   return latest == nullptr ? 1.0 : warmth(*latest, now);
+}
+
+// The step at which warmth reaches 1, as a time from the flush: n = reads_per_copy × t reaches
+// full_at at t = full_at / reads_per_copy.
+std::optional<double> FaultSchedule::warm_up_s(std::size_t cache, SimTime at) const {
+  for (const auto& warm_up : warm_ups_) {
+    if (warm_up.cache != cache || warm_up.at.count() != at.count()) continue;
+    if (warm_up.reads_per_copy <= 0.0) return std::nullopt;
+    return warm_up.full_at / warm_up.reads_per_copy;
+  }
+  return std::nullopt;
 }
 
 // h(n) / h at n requests per copy since the flush (WarmUp's comment): exactly 1 once n reaches

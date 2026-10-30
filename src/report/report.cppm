@@ -227,6 +227,13 @@ class Summary {
   // scenario's SLOs with `over` (evaluate_slos asks for exactly those); another is `skipped`.
   [[nodiscard]] SloResult windowed_verdict(const model::SloSpec& slo) const;
 
+  // The scripted faults' records (engine::Simulation::fault_records, in `at` order), replacing any
+  // held: the renderers print one block per fault after the SLO table, and a `faults` array in the
+  // JSON (none without faults). session::run_summary sets them once the run is over; a Summary
+  // only ever sees step records, which do not say what a fault cost.
+  void set_faults(std::span<const engine::FaultRecord> records);
+  [[nodiscard]] std::span<const engine::FaultRecord> faults() const { return faults_; }
+
  private:
   // Weighted first and second moments of a latency, accumulated across steps.
   struct Moments {
@@ -327,6 +334,7 @@ class Summary {
   std::vector<LinkTotals> links_;     // one per link with a bandwidth, in Graph::links() order
   std::vector<WindowedSlo> windows_;  // one per scenario SLO with `over`, in the scenario's order
   bool estimate_{};                   // made by of_estimate: SLOs with `over` judged at t = 0
+  std::vector<engine::FaultRecord> faults_{};  // set_faults
 };
 
 // C++20 std::span<const T>: a non-owning view of contiguous elements, so callers can pass

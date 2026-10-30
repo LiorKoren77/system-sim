@@ -260,4 +260,32 @@ constexpr std::string_view ansi_reset = "\x1b[0m";
          two_digits(total_s % 60);
 }
 
+// A moment of a scripted fault on the run's clock (the report's fault block): window_clock's HH:MM
+// for a whole minute and HH:MM:SS for a whole second, otherwise HH:MM:SS and a tenth, rounded to
+// the nearest tenth (`00:00:20.2`, where window_clock would print the exact duration, `20200ms`): a
+// fault and its recovery are moments of the day, read beside the rate curve's clock. Past the
+// first day, the exact duration, as window_clock.
+[[nodiscard]] std::string fault_clock(SimTime t) {
+  constexpr auto tenth_ns = (100_ms).count();
+  constexpr auto day_ns = (24_h).count();
+  const auto ns = t.count();
+  if (ns < 0 || ns >= day_ns) return describe_duration(t);
+  const auto tenths = (ns + tenth_ns / 2) / tenth_ns;
+  if (tenths % 10 == 0) return window_clock(SimTime{tenths * tenth_ns});
+  const auto total_s = tenths / 10;
+  return two_digits(total_s / 3600) + ":" + two_digits(total_s / 60 % 60) + ":" +
+         two_digits(total_s % 60) + "." + std::to_string(tenths % 10);
+}
+
+// A span of seconds in the fault block's body: at most one decimal, none when it is a whole number
+// (`0.2s`, `12.1s`, `10s`, `0s`): the precision of a 100 ms step, without a `.0` that says nothing.
+[[nodiscard]] std::string tenths_of_seconds(double seconds_value) {
+  std::string text = to_chars_text(seconds_value, std::chars_format::fixed, 1);
+  // C++20 std::string::ends_with: a suffix test in one call, replacing
+  // `s.size() >= n && s.compare(s.size() - n, n, suffix) == 0`.
+  if (text.ends_with(".0")) text.resize(text.size() - 2);
+  if (text == "-0") text = "0";  // a residue below zero rounds to "-0.0"
+  return text + "s";
+}
+
 }  // namespace simsys::report

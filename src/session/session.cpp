@@ -70,6 +70,8 @@ report::Summary run_summary(const graph::Graph& g, engine::Simulation& sim,
   // C++20 designated initializers: the members named at the call site, in declaration order,
   // replacing a positional `{duration, step}` where a reader must remember which is which.
   sim.run({.duration = scenario.duration, .step = scenario.step}, observe);
+  // What each scripted fault cost, for the reports' block per fault (none without faults).
+  summary.set_faults(sim.fault_records());
   return summary;
 }
 
