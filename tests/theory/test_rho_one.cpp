@@ -1,4 +1,6 @@
 // Whole-simulation checks against closed-form queueing theory (spec §12).
+// Spec entries pinned here: §12's "a constant-rate run converges to estimate" at its edge, rho 1:
+// for a service, §19 entry 3's pipe and entry 8's sink.
 // This file: estimate equals run at exactly rho 1. One of the nine files the theory tests are split
 // into by topic; the scenario builders more than one of them needs live in
 // tests/support/fixtures.cppm (module simsys.test_fixtures).

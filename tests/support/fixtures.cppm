@@ -1,9 +1,9 @@
 // Module `simsys.test_fixtures`: the scenarios, numbers and helpers more than one test file
 // needs. The theory tests (tests/theory/test_*.cpp) share the M/M/1 probe, the pipe and the
 // message-queue pictures and the "fresh simulation" helpers; test_scenarios shares the ring
-// imbalance formula with test_core; test_report and test_series share the piped scenario and
-// `explain` of a scenario built in code. A helper one file alone uses stays in that file, next to
-// the tests that read it.
+// imbalance formula with test_core and test_kv; test_report and test_series share the piped
+// scenario and `explain` of a scenario built in code; test_graph shares `one_gbit`. A helper one
+// file alone uses stays in that file, next to the tests that read it.
 //
 // C++20 named module, interface unit (src/core/core.cppm has the longer note on modules versus
 // headers). A module instead of a header: each builder is compiled once, in fixtures.cpp, rather
@@ -51,8 +51,13 @@ engine::Simulation simulation_of(const graph::Graph& g);
 
 // ---- A link's bandwidth as a pipe (test_bytes_pipes.cpp has the picture and its numbers) --------
 
-inline constexpr ByteRate one_gbit{125e6};    // 1 Gbit/s = 1e9 / 8 bytes per second
-inline constexpr double pipe_mb_per_s = 125;  // 1 Gbit/s in megabytes per second
+// `constexpr` without `inline` (GCC 14.2, CLAUDE.md §3's seventh defect): a default argument below
+// names `one_gbit`, and GCC evaluates it in the caller's unit, which references an exported
+// `inline` variable without emitting it while this interface's object defines an inline variable
+// only if it uses it itself: an undefined reference at link time. A non-inline constant keeps
+// external linkage (it is exported) and this interface's object file defines it once.
+constexpr ByteRate one_gbit{125e6};    // 1 Gbit/s = 1e9 / 8 bytes per second
+constexpr double pipe_mb_per_s = 125;  // 1 Gbit/s in megabytes per second
 
 // a(`rate`/s of `get`, each `size` long: a read at b) -> b (1M/s, 1 ms) over a 250 us link with the
 // given bandwidth, in the given direction. Node indices: a 0, b 1. Steps of 100 ms (the default).
@@ -62,12 +67,10 @@ model::Scenario pipe_over(double rate, Bytes size, std::optional<ByteRate> bandw
 // The one pipe's sample of a step: the graphs here have exactly one link with a bandwidth.
 const engine::LinkSample& only_link(const engine::StepRecord& r);
 
-inline constexpr ByteRate one_gbit_per_s{125e6};  // piped's default link
-
 // a(`rate`/s of `put`, 1 MB each) -> b (a service of 1M/s) over a 250 us link of the given
 // bandwidth (1 Gbit/s = 125 MB/s unless given; none: a plain link). 3 s at 100 ms steps, the first
 // 500 ms warmup.
-model::Scenario piped(double rate, std::optional<ByteRate> bandwidth = one_gbit_per_s);
+model::Scenario piped(double rate, std::optional<ByteRate> bandwidth = one_gbit);
 
 // ---- Message queues and worker pools (test_queues_pools.cpp has the picture and its numbers) ----
 

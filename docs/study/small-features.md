@@ -168,7 +168,7 @@ narrow silently, and says nothing about why the cast is there.
 **Where.** Where an enumerator is used as a row index: `model::is_cataloged`,
 `core::follows_enum_order` (which proves that row `i` of a name table holds the enumerator
 whose value is `i`), and the loader's check that its per-type key table follows the
-`NodeType` order (`own_keys_follow_node_type_order` in `config.cpp`).
+`NodeType` order (`own_keys_follow_node_type_order` in `src/config/detail.hpp`).
 
 ## `std::unreachable`
 

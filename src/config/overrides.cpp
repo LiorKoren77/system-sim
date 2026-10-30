@@ -49,6 +49,12 @@ namespace simsys::config::detail {
 // map keys only: a list entry has no name a path could say (`links.0` would depend on the order
 // of the file's lines), so a path through a list is refused, not guessed.
 
+// Unnamed namespace: the helpers in these blocks are this unit's own (internal linkage).
+// Outside it a function of a module implementation unit has module linkage, so every unit
+// of simsys.config could call it and the linker sees its name; only what detail.hpp declares
+// is shared between the units.
+namespace {
+
 // A mistake in an override's path: on the command line, so it has no line in the file.
 std::unexpected<ConfigError> override_error(const std::string& file, std::string_view path,
                                             std::string_view what) {
@@ -78,6 +84,8 @@ bool is_all_digits(std::string_view text) {
   // iterator pair.
   return !text.empty() && std::ranges::all_of(text, [](char c) { return c >= '0' && c <= '9'; });
 }
+
+}  // namespace
 
 // The node at `path` in `root`, or why there is none. Only const lookups: yaml-cpp's
 // non-const `node[key]` inserts a missing key, which would turn a typo into a new key.

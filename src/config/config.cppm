@@ -3,11 +3,16 @@
 // required keys, node types, duplicate or empty ids, node references and unit strings.
 // That is enough to machine-check scenario drafts before the engine exists; behaviour
 // parameters (eviction policy, quorum sizes, ...) are left to the engine. The checks
-// themselves live in the implementation unit, config.cpp.
+// themselves live in the implementation units: config.cpp (`load` and the pipeline), one unit
+// per concern (header.cpp, nodes.cpp, steps.cpp, workload.cpp, links.cpp, slos.cpp,
+// overrides.cpp) and detail.hpp / detail.cpp for what they share.
 //
-// Compilation firewall: interface declares, implementation unit defines; importers never
-// recompile when only config.cpp changes. This is a build technique, not a GoF design
-// pattern, hence no `Pattern:` tag.
+// Compilation firewall: interface declares, implementation units define; the importers' BMI
+// does not change when only an implementation unit does. With CMake 3.31 an edit there
+// recompiles that unit alone; with CMake 3.28.3 (the system CMake; 3.28 is the minimum) every
+// importer recompiles anyway, because 3.28 rewrites every unit's module map after any edit
+// (docs/study/modules.md). This is a build technique, not a GoF design pattern, hence no
+// `Pattern:` tag.
 //
 // Why this interface is lean (verified 2026-10-28 with GCC 14.2): a module interface unit
 // that `import`s another module must not include, in its global module fragment, any

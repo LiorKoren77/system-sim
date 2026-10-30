@@ -51,6 +51,12 @@ namespace simsys::config::detail {
 // first, an iteration sees both. Readers of both kinds exist, so a repeated key would mean
 // different things to different checks; it is rejected before any of them runs.
 
+// Unnamed namespace: the helpers in these blocks are this unit's own (internal linkage).
+// Outside it a function of a module implementation unit has module linkage, so every unit
+// of simsys.config could call it and the linker sees its name; only what detail.hpp declares
+// is shared between the units.
+namespace {
+
 // `noun` names the key in the message: "key", or "node id" for the `nodes` map.
 CheckResult check_map_keys_unique(const Site& site, const YAML::Node& map, std::string_view noun) {
   // string_views into the document's own key text, which outlives this check.
@@ -273,6 +279,8 @@ CheckResult check_sections_not_null(const Site& site, const YAML::Node& root) {
   return {};
 }
 
+}  // namespace
+
 CheckResult check_top_level(const Site& site, const YAML::Node& root) {
   if (auto checked = check_root_is_map(site, root); !checked) return checked;
   if (auto checked = check_keys_and_expansion(site, root); !checked) return checked;
@@ -283,6 +291,8 @@ CheckResult check_top_level(const Site& site, const YAML::Node& root) {
 }
 
 // ---- Header ---------------------------------------------------------------------------
+
+namespace {
 
 // Read like every other integer key (a plain scalar through parse_whole), so "+1", "0x1",
 // "1.0" and a quoted "1" are no version.
@@ -350,6 +360,8 @@ CheckResult read_warmup(const Site& site, const YAML::Node& root, model::Scenari
   return site.fail(root["warmup"], "warmup must be shorter than duration");
 }
 
+}  // namespace
+
 // The scalar header fields; an absent optional one keeps the Scenario's default.
 CheckResult read_header(const Site& site, const YAML::Node& root, model::Scenario& scenario) {
   if (auto read = read_version(site, root, scenario.version); !read) return read;
@@ -361,6 +373,8 @@ CheckResult read_header(const Site& site, const YAML::Node& root, model::Scenari
 }
 
 // ---- Datacenters ----------------------------------------------------------------------
+
+namespace {
 
 // A key under `datacenters` is a name: a non-empty scalar. A list or map is valid YAML as a
 // key but names nothing.
@@ -406,6 +420,8 @@ CheckResult read_datacenter_entry(const Site& site, const YamlElement& entry, Da
   if (entry.first.Scalar() == "latency") return check_latency_overrides(site, entry);
   return read_datacenter(site, entry, names);
 }
+
+}  // namespace
 
 // `datacenters` maps each name to its settings; only the names, in file order, matter yet.
 std::expected<Datacenters, ConfigError> read_datacenters(const Site& site, const YAML::Node& root) {

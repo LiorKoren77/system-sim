@@ -723,6 +723,10 @@ void apply_kv_ring(ResolvedNode& node) {
 // scenario's `limit`), a database's connection pool and a kv cluster's ring applied. An id
 // generator needs nothing more: its algorithm's numbers are type defaults (defaults::defaults_of).
 [[nodiscard]] ResolvedNode resolved_server(const model::NodeSpec& spec) {
+  // C++20 designated initializers: `.capacity = ...` names the member it sets (in declaration
+  // order; an omitted one keeps its default), replacing positional `ResolvedNode{spec, ...}`, where
+  // a reader must count commas against the struct to know which value is which (database_shares
+  // below sets six numbers of the same type this way).
   ResolvedNode node{
       .spec = spec,
       .capacity = defaults::resolve_capacity(spec),
@@ -756,10 +760,6 @@ DatabaseShares database_shares(const model::NodeSpec& spec) {
   const double copies_per_shard = spec.replicas;
   const double shards = spec.shards.value_or(1);
   if (copies_per_shard < 2.0) {
-    // C++20 designated initializers: `.primaries = shards` names the member it sets (in
-    // declaration order; an omitted one keeps its default), replacing positional
-    // `DatabaseShares{shards, 0.0, ...}`, where a reader must count commas against the struct to
-    // know which share is which: here six numbers of the same type.
     return DatabaseShares{.primaries = shards,
                           .replicas = 0.0,
                           .primary_reads = 1.0 / shards,

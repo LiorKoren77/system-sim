@@ -1,4 +1,7 @@
 // Whole-simulation checks against closed-form queueing theory (spec §12).
+// Spec entries pinned here: §16 entries 4-6 (replicas, one-way link latency, feedback edges), §17
+// entries 2-9 and 13 (rate curve, noise, op cost, balancer policies, limiters, cache, rejections,
+// hot and cool copies, the leaky bucket), §18 entries 2 and 5 (Che, cache then steps).
 // This file: the phase 1 and 2a closed forms: M/M/1, chains, delay and feedback links, estimate,
 // load balancers, rate limiters, caches and the consistent-hashing lab. One of the nine files the
 // theory tests are split into by topic; the scenario builders more than one of them needs live in

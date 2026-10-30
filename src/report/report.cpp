@@ -66,22 +66,10 @@ constexpr double infinity = std::numeric_limits<double>::infinity();
 // (format_duration, format_lag).
 
 // Seconds in the largest unit that keeps the number >= 1, three significant digits:
-// 0.0005 -> "500us", 120 -> "2m". Infinity means the node never answers: "unavailable".
+// 0.0005 -> "500us", 120 -> "2m". Infinity means the node never answers: "unavailable". The body
+// is :shared's duration_text, which the SimTime overload there calls too.
 std::string format_duration(double seconds_value) {
-  if (!std::isfinite(seconds_value)) return "unavailable";
-  if (seconds_value == 0.0) return "0s";
-  for (const auto& unit : duration_units) {
-    if (std::abs(seconds_value) / unit.size >= rounds_to_one) {
-      return significant(seconds_value / unit.size, 3) + std::string{unit.name};
-    }
-  }
-  return significant(seconds_value / 1e-9, 3) + "ns";  // below one nanosecond
-}
-
-// The same for a SimTime (module linkage: not exported, but an overload of the exported name, so
-// one name serves both; declared in :shared, so explain.cpp calls it too).
-[[nodiscard]] std::string format_duration(SimTime t) {
-  return format_duration(seconds(t));
+  return duration_text(seconds_value);
 }
 
 // A queue lag as the node table and the SLO lines print it: a duration, or "<1us" for a lag that

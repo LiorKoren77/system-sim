@@ -1,7 +1,9 @@
 // Implementation unit of `simsys.test_fixtures`: the bodies of the shared test builders. Each
 // helper's description is on its declaration in fixtures.cppm. The end of the file works around
-// two GCC 14.2 release-link defects (see `detail` there); tests/CMakeLists.txt compiles this file
-// with -fno-inline for them, as the top-level CMakeLists.txt does src/model/model.cpp.
+// GCC 14.2's release-link defect (CLAUDE.md §3's fourth; see `detail` below); tests/CMakeLists.txt
+// compiles this file with -fno-inline for it, as the top-level CMakeLists.txt does
+// src/model/model.cpp. The seventh defect (an exported `inline` variable named by a default
+// argument) is avoided in fixtures.cppm, whose constants are `constexpr` without `inline`.
 module;
 #include <catch2/catch_test_macros.hpp>
 
@@ -171,24 +173,6 @@ template void emit_special_members(std::vector<model::Step>*, std::vector<model:
 // scenario_tests' release link once graph.cppm's definitions lived in graph.cpp (phase 3a,
 // Task 3) and this module was rebased onto them, verified 2026-10-30.
 template void emit_special_members(std::vector<std::size_t>*, std::vector<std::size_t>&);
-
-// The same defect for the exported `inline constexpr` variables of fixtures.cppm: a unit that binds
-// a reference to one (piped's default argument does: std::optional<ByteRate>'s converting
-// constructor takes `one_gbit_per_s` by reference) refers to the variable without emitting it,
-// trusting the module's object files to define it, and the interface unit's object defines
-// one_gbit but not one_gbit_per_s: unit_tests failed to link in Debug too ("undefined reference
-// to simsys::test_support::one_gbit_per_s@simsys.test_fixtures", verified 2026-10-29). Each
-// function below takes one constant's address, so this object file defines it. A new constant in
-// fixtures.cppm that some test binds by reference gets one more line here.
-const ByteRate* emit_one_gbit() {
-  return &one_gbit;
-}
-const ByteRate* emit_one_gbit_per_s() {
-  return &one_gbit_per_s;
-}
-const double* emit_pipe_mb_per_s() {
-  return &pipe_mb_per_s;
-}
 }  // namespace detail
 
 }  // namespace simsys::test_support

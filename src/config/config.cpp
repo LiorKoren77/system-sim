@@ -44,6 +44,12 @@ import simsys.model;
 
 namespace simsys::config::detail {
 
+// Unnamed namespace: the pipeline is this unit's own (internal linkage). Outside it a
+// function of a module implementation unit has module linkage, so every unit of
+// simsys.config could call it and the linker sees its name; only what detail.hpp declares is
+// shared between the units.
+namespace {
+
 // Pattern: Pipeline with early exit (railway-oriented error handling) — each stage returns
 // std::expected<T, ConfigError> (T is void for a pure check, the parsed value otherwise),
 // and the first error leaves the track and is returned, so the user sees one precise
@@ -74,6 +80,8 @@ std::expected<model::Scenario, ConfigError> validate(const std::string& file,
   scenario.slos = std::move(*slos);
   return scenario;
 }
+
+}  // namespace
 
 }  // namespace simsys::config::detail
 

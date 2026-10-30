@@ -14,7 +14,7 @@
 | `FractionLookup auto&& downstream` | every behaviour's `delivered`, and `route` where no default is needed | constrained placeholder parameter |
 | `template <FractionLookup Lookup = NothingLost>` | the `route` of `ServiceBehaviour`, `CacheBehaviour`, `CdnBehaviour` and `WorkerPoolBehaviour` | constrained template parameter with a default (a placeholder cannot have one) |
 | `StepObserver auto&& observer` | `engine::Simulation::run` | constrained placeholder parameter |
-| `template <std::invocable<const YamlElement&> Reader>` | `src/config/config.cpp`, `collect_each` | type-constraint in the template head |
+| `template <std::invocable<const YamlElement&> Reader>` | `src/config/detail.hpp`, `collect_each` | type-constraint in the template head |
 | `requires std::invocable<Survival&, double> && ...` | `src/queueing/queueing.cppm`, `moments_from_survival` | `requires` clause after the template head |
 | `const std::ranges::input_range auto& groups` | `src/queueing/queueing.cppm`, `replicas_in` | a standard concept as a placeholder: any range of groups |
 | `if constexpr (requires { node.megabyte_service(); })` | `src/engine/engine.cppm`, `megabyte_service_of` | a requires-expression used as a compile-time `bool` |
@@ -115,7 +115,7 @@ returns 1 ([small-features.md](small-features.md#static-operator)).
 
 **`HitRatioModel` is the same idea on data.** Spec §5 asked for a hit-ratio "model" a cache can
 swap. `caching.cppm` states it as a concept (`model.hit_ratio(capacity)` returns `double`), and
-`graph.cppm` holds the two models that satisfy it, `FixedHitRatio` and `CheHitRatio`, in a
+`graph.cpp` holds the two models that satisfy it, `FixedHitRatio` and `CheHitRatio`, in a
 `std::variant` that it `std::visit`s once per cache when the graph is built. The concept is the
 contract; the variant is the closed list of models.
 

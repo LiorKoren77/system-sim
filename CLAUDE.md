@@ -83,13 +83,21 @@ Write for a reader who has read the book but has not studied queueing theory.
   `std::views::chunk_by` in a function defined in a module (a member function or not) is
   emitted in more than one object file ("multiple definition" of the lambda's conversion to a
   function pointer at link time). Workaround: a named function in `detail::` instead of the lambda
-  (`graph.cppm`'s `detail::same_op`).
+  (`graph.cpp`'s `detail::same_op`).
 - Sixth GCC 14.2 defect (2026-10-28): each import maps the imported module's whole line table
   into the importer's source-location space, and the module units at the end of the import chain
   (simsys.behaviours on) run out of it: "unable to represent further imported source locations",
   then a crash in `write_location` while writing the module. Workaround: the `simsys` library
   target compiles with `-flarge-source-files` (CMakeLists.txt; a little compile time and memory);
   the tests and the CLI import modules but export none and do not need it. Do not remove it.
+- Seventh GCC 14.2 defect (2026-10-30), Debug and Release: a default argument in a module
+  interface that names an exported `inline` variable (`std::optional<ByteRate> bw = one_gbit`)
+  is evaluated in the caller's TU, which references the variable without emitting it; the
+  interface's object file defines an inline variable only if it uses it itself, so the link
+  fails with an undefined reference. A direct use in the importer is fine. Workaround: an
+  exported namespace-scope constant in a module interface is `constexpr` without `inline`: it
+  keeps external linkage (it is exported) and the interface's object file defines it once
+  (`tests/support/fixtures.cppm`).
 
 ## 4. Clean code, named patterns, TDD
 

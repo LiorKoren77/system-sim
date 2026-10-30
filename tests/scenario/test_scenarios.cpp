@@ -37,7 +37,8 @@ import simsys.test_fixtures;
 // explain's lines, shared with test_report and test_series.
 using simsys::test_support::check_line;
 using simsys::test_support::node_line;
-// The ring imbalance formula, shared with test_core (tests/support/fixtures.cppm).
+// The ring imbalance formula, shared with the theory tests test_core and test_kv
+// (tests/support/fixtures.cppm).
 using simsys::test_support::ring_factor;
 
 namespace {

@@ -394,7 +394,7 @@ nodes, once for each of the N copies of a key it holds (N = 1 behind a load bala
 `replication` in a kv_cluster). One machine's share is a sum of N v arc lengths, so its
 relative spread is about 1 / sqrt(N v) (the book: about 10 % at 100 virtual nodes). The
 engine needs the HOTTEST machine's share, the maximum of M such shares, and that grows with
-M. `ring_imbalance` (`src/engine/graph.cppm`) takes
+M. `ring_imbalance` (`src/engine/graph.cpp`) takes
 
     k = min(1 + z_M / sqrt(N v), M / N)
 

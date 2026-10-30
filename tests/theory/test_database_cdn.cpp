@@ -1,4 +1,6 @@
 // Whole-simulation checks against closed-form queueing theory (spec §12).
+// Spec entries pinned here: §18 entries 6-10 (the SQL database, its write cost, connection pool and
+// staleness, the CDN).
 // This file: a SQL database (a primary and read replicas) and the request-based CDN. One of the
 // nine files the theory tests are split into by topic; the scenario builders more than one of them
 // needs live in tests/support/fixtures.cppm (module simsys.test_fixtures).

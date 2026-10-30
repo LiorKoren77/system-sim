@@ -64,9 +64,11 @@
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer
 // explanation of modules versus headers). It declares; the definitions live in the
-// implementation unit graph.cpp, so an edit to a function body recompiles graph.cpp alone and
-// not every unit that imports simsys.graph. What stays here: the types, the declarations with
-// their contracts, the constants and the inline one-liners whose body is their documentation.
+// implementation unit graph.cpp, so an edit to a function body leaves this BMI unchanged: with
+// CMake 3.31 it recompiles graph.cpp alone, not every unit that imports simsys.graph (with CMake
+// 3.28.3, the system CMake, every importer still recompiles: 61 units, measured in phase 3a;
+// docs/study/modules.md). What stays here: the types, the declarations with their
+// contracts, the constants and the inline one-liners whose body is their documentation.
 module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this interface imports other modules
 // (GCC 14.2 'Bad file data' bug, CLAUDE.md §3). Only the headers the declarations need.

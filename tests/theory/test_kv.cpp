@@ -1,4 +1,5 @@
 // Whole-simulation checks against closed-form queueing theory (spec §12).
+// Spec entries pinned here: §19 entry 9 (kv_cluster in the steady state).
 // This file: kv_cluster in the steady state (book ch. 6, Dynamo). One of the nine files the theory
 // tests are split into by topic; the scenario builders more than one of them needs live in
 // tests/support/fixtures.cppm (module simsys.test_fixtures).

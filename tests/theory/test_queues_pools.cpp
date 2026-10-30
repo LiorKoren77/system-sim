@@ -1,4 +1,6 @@
 // Whole-simulation checks against closed-form queueing theory (spec §12).
+// Spec entries pinned here: §19 entries 4-6 (message queues and their lag, worker pools,
+// asynchronous completion).
 // This file: message queues and worker pools: backlog growth, retention, a pool's then steps, queue
 // lag. One of the nine files the theory tests are split into by topic; the scenario builders more
 // than one of them needs live in tests/support/fixtures.cppm (module simsys.test_fixtures).

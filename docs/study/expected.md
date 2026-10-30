@@ -7,10 +7,10 @@
   (`split_number`, `require_non_negative_finite`, `split_non_negative_number`,
   `nanoseconds_per`, `to_sim_time`, `parse_scaled_number`) chain the same type.
 - `src/config/config.cpp`: `simsys::config::load` returns `std::expected<Scenario, ConfigError>`;
-  every reader and check returns `std::expected<T, ConfigError>`, with
+  every reader and check of the config units (`header.cpp`, `nodes.cpp`, `workload.cpp`, ...) returns `std::expected<T, ConfigError>`, with
   `CheckResult = std::expected<void, ConfigError>` for a check that produces no value
   (`check_top_level`, `read_version`, `read_capacity`, ...), and `validate` chains them.
-- `src/engine/graph.cppm` and `src/engine/engine.cppm`: `Graph::build` returns
+- `src/engine/graph.cpp` and `src/engine/engine.cppm`: `Graph::build` returns
   `std::expected<Graph, EngineError>` (the refusals the loader cannot see, such as a step with
   no link) and `Simulation::create` returns `std::expected<Simulation, EngineError>` (a node
   type the engine does not run yet).
@@ -50,7 +50,7 @@ Three uses in this code base, and why they were the right ones:
 return detail::parse_scaled_number(number_text, text, detail::rate_prefixes)
     .transform([](double v) { return Rate{v}; });
 
-// config.cpp, parse_scalar: give the unit parser's error a location and the key's name
+// src/config/detail.hpp, parse_scalar: give the unit parser's error a location and the key's name
 return parse(value.Scalar()).transform_error([&](const ParseError& error) {
   return unit_error(site, value, label, error);
 });
@@ -69,7 +69,7 @@ becomes a string first, so that the graph builder's stage, which fails with a st
 chained with `and_then`, which requires the same error type on both sides.
 
 `transform` also turns "read a value" into "read it into this field". `store_in(target)`
-(`config.cpp`) returns a lambda that assigns its argument and returns nothing, so
+(`src/config/detail.hpp`) returns a lambda that assigns its argument and returns nothing, so
 `parse_rate(text).transform(store_in(node.capacity))` is an `expected<void, ParseError>`:
 stored, or why not. `read_capacity` chains such steps with `and_then`. Steps whose value the
 next line needs still use early return (below).
@@ -97,7 +97,8 @@ if (!split) return std::unexpected(split.error());
 auto [value, unit] = *split;
 ```
 
-`std::expected<void, E>` for checks that produce no value (`config.cpp`):
+`std::expected<void, E>` for checks that produce no value (`CheckResult` in `detail.hpp`;
+`read_version` in `header.cpp`):
 
 ```cpp
 using CheckResult = std::expected<void, ConfigError>;

@@ -1,8 +1,7 @@
 // Module implementation partition `simsys.report:shared`: the helpers both implementation units of
-// simsys.report need, and nothing else: number formatting, the zone names, the aligned text table,
-// and the declarations of the few helpers that are defined in one of the two units and called from
-// the other (the run's clock, the SimTime overload of format_duration). report.cpp (summaries,
-// SLOs, table, JSON, CSV) and explain.cpp (`simsys explain`) both `import :shared;`.
+// simsys.report need, and nothing else: number formatting (durations included), the run's clock,
+// the zone names and the aligned text table. report.cpp (summaries, SLOs, table, JSON, CSV) and
+// explain.cpp (`simsys explain`) both `import :shared;`.
 //
 // Why a partition and not a header (src/report/detail.hpp, `inline` functions included in both
 // global module fragments): a header is pasted into each unit and compiled twice, and its helpers
@@ -10,7 +9,11 @@
 // partition is compiled once, its names are attached to simsys.report and have module linkage:
 // visible in every unit of simsys.report that imports it, invisible outside, without `export`.
 // GCC 14.2 builds and links it as written in both presets, with none of the CLAUDE.md §3
-// workarounds (verified 2026-10-29), so the header fallback was not needed.
+// workarounds (verified 2026-10-29), so the header fallback was not needed. It imports no part of
+// simsys.report: the standard allows a partition to import the primary interface, but GCC 14.2
+// then refuses every unit that imports the partition ("cannot import module in its own purview";
+// Clang 18 accepts it, verified 2026-10-30), so what the exported format_duration(double) prints
+// is computed here, by duration_text, and report.cpp's exported overload returns it.
 //
 // Every number is formatted with std::to_chars (simsys::to_chars_text), never with a std::format
 // precision such as "{:.3f}": with GCC 14.2, a precision in a format spec throws std::format_error
@@ -23,6 +26,7 @@ module;
 #include <charconv>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <ranges>
 #include <span>
 #include <string>
@@ -65,6 +69,28 @@ constexpr std::array si_prefixes{Unit{"G", 1e9}, Unit{"M", 1e6}, Unit{"k", 1e3}}
 // 0.9995 of a unit already prints as "1" at three significant digits, so it is shown in
 // that unit: 999.7 us reads "1ms", not "1e+03us".
 constexpr double rounds_to_one = 0.9995;
+
+// Seconds in the largest unit that keeps the number >= 1, three significant digits:
+// 0.0005 -> "500us", 120 -> "2m". Infinity means the node never answers: "unavailable". The body
+// of the exported format_duration(double) (report.cppm), which returns it: this partition does not
+// import the interface (GCC 14.2; see the top of the file), so it cannot see the exported
+// declaration, and the shared overloads below call this.
+[[nodiscard]] std::string duration_text(double seconds_value) {
+  if (!std::isfinite(seconds_value)) return "unavailable";
+  if (seconds_value == 0.0) return "0s";
+  for (const auto& unit : duration_units) {
+    if (std::abs(seconds_value) / unit.size >= rounds_to_one) {
+      return significant(seconds_value / unit.size, 3) + std::string{unit.name};
+    }
+  }
+  return significant(seconds_value / 1e-9, 3) + "ns";  // below one nanosecond
+}
+
+// The same for a SimTime (module linkage: not exported, but an overload of the exported name, so
+// one name serves both units).
+[[nodiscard]] std::string format_duration(SimTime t) {
+  return duration_text(seconds(t));
+}
 
 // From here on the largest prefix, G, would need an exponent itself ("1e+04G").
 constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
@@ -142,6 +168,9 @@ constexpr double beyond_prefixes = 1e4 * si_prefixes.front().size;
 // C++23 std::views::join_with + std::ranges::to: joins the parts with a separator and
 // collects the characters into a std::string in one pipeline. Replaces a hand-written
 // loop that appends a separator before every part but the first.
+// C++20 std::span<const T>: a non-owning read-only view of contiguous elements (pointer + size),
+// so a caller passes a vector or an array of parts without a copy. Replaces a
+// `const std::vector<T>&` parameter, which accepts only a vector.
 [[nodiscard]] std::string join(std::span<const std::string> parts, std::string_view separator) {
   return parts | std::views::join_with(separator) | std::ranges::to<std::string>();
 }
@@ -197,14 +226,38 @@ constexpr std::string_view ansi_reset = "\x1b[0m";
   return out;
 }
 
-// ---- defined in one unit, called from the other ----
+// ---- the run's clock ----
 
-// A partition can only declare what needs the module's exported interface (format_duration(double)
-// is exported from report.cppm, which no partition can import), so these are defined beside their
-// callers, each with its own comment: format_duration(SimTime) in report.cpp, the run's clock in
-// explain.cpp (with the rate curve whose peak it prints) and called from report.cpp's SLO windows.
-[[nodiscard]] std::string format_duration(SimTime t);
-[[nodiscard]] std::string clock_or_duration(SimTime t);
-[[nodiscard]] std::string window_clock(SimTime t);
+[[nodiscard]] std::string two_digits(std::int64_t value) {
+  return (value < 10 ? "0" : "") + std::to_string(value);
+}
+
+// A point in simulated time as a scenario writes it: "20:00" for a whole minute of the first day (t
+// = 0 is midnight, spec §17 entry 1), otherwise a duration ("36h", "90s"). Integer nanoseconds, so
+// 19:59:59.9 is never rounded to "20:00". explain.cpp prints a wave's peak with it.
+[[nodiscard]] std::string clock_or_duration(SimTime t) {
+  constexpr auto minute_ns = (1_min).count();
+  constexpr auto day_ns = (24_h).count();
+  const auto ns = t.count();
+  if (ns < 0 || ns >= day_ns || ns % minute_ns != 0) return format_duration(t);
+  const auto minutes = ns / minute_ns;
+  return two_digits(minutes / 60) + ":" + two_digits(minutes % 60);
+}
+
+// A window's start on the run's clock: explain's HH:MM for a whole minute of the first day,
+// HH:MM:SS for a whole second (a warmup of 1199 s starts the first window at 00:19:59, which
+// clock_or_duration would round to "20m"), else the exact duration from the start of the run
+// ("1500ms"; "1502m" for 25:02, past the first day). report.cpp prints an SLO window's start with
+// it.
+[[nodiscard]] std::string window_clock(SimTime t) {
+  constexpr auto second_ns = (1_s).count();
+  constexpr auto day_ns = (24_h).count();
+  const auto ns = t.count();
+  if (ns < 0 || ns >= day_ns || ns % second_ns != 0) return describe_duration(t);
+  if (ns % (60 * second_ns) == 0) return clock_or_duration(t);
+  const auto total_s = ns / second_ns;
+  return two_digits(total_s / 3600) + ":" + two_digits(total_s / 60 % 60) + ":" +
+         two_digits(total_s % 60);
+}
 
 }  // namespace simsys::report

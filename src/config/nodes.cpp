@@ -51,6 +51,12 @@ namespace simsys::config::detail {
 
 // ---- Node declarations: the first pass ------------------------------------------------
 
+// Unnamed namespace: the helpers in these blocks are this unit's own (internal linkage).
+// Outside it a function of a module implementation unit has module linkage, so every unit
+// of simsys.config could call it and the linker sees its name; only what detail.hpp declares
+// is shared between the units.
+namespace {
+
 bool accepts_key(model::NodeType type, std::string_view key) {
   if (lists_word(common_node_keys, key)) return true;
   if (type != model::NodeType::client && lists_word(server_node_keys, key)) return true;
@@ -421,6 +427,8 @@ NodeIndex index_by_id(const std::vector<model::NodeSpec>& nodes) {
   return ids;
 }
 
+}  // namespace
+
 // yaml-cpp iterates a map in document order, so the declarations keep that order.
 std::expected<Declarations, ConfigError> collect_node_declarations(const Site& site,
                                                                    const YAML::Node& nodes,
@@ -438,6 +446,8 @@ std::expected<Declarations, ConfigError> collect_node_declarations(const Site& s
 //
 // Read in the second pass, where every reader above is declared and every node's type is
 // known (`backend` must name a cache). Order matters: the default burst is limit x window.
+
+namespace {
 
 // `algorithm: sliding_log`; absent means token_bucket (the book's first and most common
 // algorithm, ch. 4), filled in here so every later stage reads an algorithm.
@@ -1099,6 +1109,8 @@ CheckResult read_node_routing(const Site& site, const YAML::Node& body, model::N
   }
   return {};
 }
+
+}  // namespace
 
 // Pattern: Two-pass resolution (declare, then resolve), as an assembler resolves labels —
 // the first pass (collect_node_declarations) records every node id, this second pass reads

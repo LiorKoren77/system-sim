@@ -22,7 +22,21 @@
 //   the first defect of CLAUDE.md §3 ("Bad file data", "failed to load pendings for
 //   std::formatter"): yaml-cpp includes <memory>, <sstream> and <ostream>, each of which alone
 //   triggers it (in C++23 mode they bring in <format>). The shared templates read YAML::Node,
-//   so the partition cannot do without yaml-cpp.
+//   so the partition cannot do without yaml-cpp. (The first refusal is GCC's alone: the
+//   standard allows a partition to import its primary interface, and Clang 18 accepts it.)
+//
+// What this costs, said plainly: a deliberate departure from the standard, forced by GCC 14.2.
+// The structs (Site, Declarations, OwnKeys, ...), the `inline constexpr` tables and the
+// templates below are definitions attached to simsys.config, and each of the nine units that
+// includes this header defines them again. [basic.def.odr] allows such repeated definitions
+// only for entities attached to the global module (the reason headers work); for an entity
+// attached to a named module it requires one definition, in one unit, and repeating it is
+// ill-formed, no diagnostic required. GCC 14.2 accepts it: it emits these definitions in vague
+// linkage, as it would a header's, and the linker keeps one copy. The conforming design is a
+// module implementation partition (`module simsys.config:shared;`, imported by each unit with
+// `import :shared;`), as simsys.report does with shared.cppm; it replaces this header once GCC
+// builds it. Until then, the header grows no definitions it does not need: a helper that only
+// one unit uses stays in that unit, in an unnamed namespace.
 #pragma once
 
 namespace simsys::config::detail {

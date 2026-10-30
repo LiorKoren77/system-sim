@@ -1,4 +1,6 @@
 // Whole-simulation checks against closed-form queueing theory (spec §12).
+// Spec entries pinned here: §19 entries 1-3 and 6-7 (request sizes, byte-sized nodes, a link's
+// bandwidth as a pipe, a blob store's event notifications).
 // This file: byte-sized nodes, the room that bounds the wait, which byte-sized nodes the engine
 // runs, a blob store's event notifications, and a link's bandwidth as a pipe. One of the nine files
 // the theory tests are split into by topic; the scenario builders more than one of them needs live

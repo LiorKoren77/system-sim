@@ -3,9 +3,11 @@
 v1 was fitted to the 12 book and lab drafts plus the first tutorial; v1.1 wrote down the
 rules the phase 1 loader enforces; v1.2 added phase 2a's rate curves, balancers, limiters and
 fixed-ratio caches; v1.3 phase 2b's Che caches, SQL databases, CDNs and id generators.
-**v1.4** is the language as phase 2c reads it: the loader (`src/config/config.cpp`), the graph
-builder (`src/engine/graph.cppm`), the node behaviours (`src/engine/behaviours.cppm`), the
-reports (`src/report/report.cpp`) and the sweep (`src/sweep/sweep.cpp`). All 14 files under
+**v1.4** is the language as phase 2c reads it: the loader (`src/config/`, one implementation
+unit per concern: `header.cpp`, `nodes.cpp`, `steps.cpp`, `workload.cpp`, `links.cpp`,
+`slos.cpp`, `overrides.cpp`), the graph builder (`src/engine/graph.cpp`), the node behaviours
+(`src/engine/behaviours.cppm`), the reports (`src/report/report.cpp`, `explain.cpp`) and the
+sweep (`src/sweep/sweep.cpp`). All 14 files under
 `scenarios/` load under it, and ten of them run end to end ([below](#what-runs-in-phase-2c)).
 The design decisions behind the new rules, with what each ignores, are spec §18 (phase 2b) and
 §19 (phase 2c) (`docs/superpowers/specs/2026-10-27-system-sim-design.md`).
