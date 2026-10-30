@@ -23,6 +23,7 @@ module simsys.test_fixtures;
 
 // C++20 `import`: the compiled interfaces of the modules this unit reads from. The interface's
 // own imports would be visible anyway; listing them says what is used here.
+import simsys.caching;
 import simsys.core;
 import simsys.engine;
 import simsys.graph;
@@ -135,6 +136,22 @@ double ring_factor(int machines, int copies_per_key, int vnodes) {
   const double spread = 1.0 / std::sqrt(static_cast<double>(copies_per_key) * vnodes);
   return std::min(1.0 + queueing::expected_normal_maximum(machines) * spread,
                   static_cast<double>(machines) / copies_per_key);
+}
+
+double distinct_keys(const caching::Popularity& popularity, double requests) {
+  double keys = 0.0;
+  // C++20 std::span: buckets() is a non-owning read-only view of the popularity's buckets, which
+  // a range-for walks without copying them or exposing the vector behind them.
+  for (const auto& bucket : popularity.buckets()) {
+    // -expm1(-x) = 1 - e^{-x} without the cancellation for a small x (a cold key over a short run).
+    keys += bucket.count * -std::expm1(-bucket.key_probability * requests);
+  }
+  return keys;
+}
+
+double warm_hit_ratio(const caching::Popularity& popularity, double cache_keys, double requests) {
+  return caching::che_hit_ratio(std::min(cache_keys, distinct_keys(popularity, requests)),
+                                popularity);
 }
 
 std::string explain_of(const Scenario& s) {
