@@ -350,8 +350,8 @@ Fixed at `888b7a7` (1354 tests) except 2, which follows the twin (item 9 of Task
 
 **Files:** `src/model/model.cppm` (`NodeSpec::retries`, `retry_after` on a `worker_pool`), `src/config/nodes.cpp` (keys; default `retry_after` 1 s `// chosen`), `src/engine/behaviours.cppm` (`WorkerPoolBehaviour`: the `then` step's sink failure share re-published to the pool's own queue after the backoff, up to `retries` times; the last attempt's failures → `dead_lettered_per_s`), `src/engine/engine.cppm` (`NodeSample::dead_lettered_per_s`, totals), `src/report/*` (pool row `dead_lettered/s`, JSON `dead_lettered`, `dead_lettered_per_s`, CSV column; the `drop_rate` SLO ignores dead letters; `explain` prints `retries=3 after 1s, then dead-letter`), tests in `test_sinks.cpp` (3a's file), `test_report.cpp`.
 
-- [ ] Tests: a queue fed 1k/s → pool (100 workers, 10 ms) → sink `failure_rate: 0.02`, `retries: 3`, `retry_after: 1s`, step 100 ms: at the fixed point attempts per job **1 + 0.02 + 0.0004 + 0.000008 = 1.020408**, the sink's demand **1020.4/s**, dead-lettered **1000 × 0.02⁴ = 1.6e-4/s** (JSON to 1e-6 relative), the pool's drop rate **0** and the sink's drops **20.4/s** (the attempts that failed and were retried are the sink's drops, as before; the dead letters are the pool's); the queue's lag includes the re-published jobs; `retries: 0` → phase 2 behaviour byte-identical; the SLO `drop_rate max 0.001` passes on notification-system's shape (pinned on a probe with its numbers: 1.9k/s through four channels, the providers' failure rates).
-- [ ] Commit `nodes: a worker pool retries a third party's failures and dead-letters the rest`.
+- [x] Tests: a queue fed 1k/s → pool (100 workers, 10 ms) → sink `failure_rate: 0.02`, `retries: 3`, `retry_after: 1s`, step 100 ms: at the fixed point attempts per job **1 + 0.02 + 0.0004 + 0.000008 = 1.020408**, the sink's demand **1020.4/s**, dead-lettered **1000 × 0.02⁴ = 1.6e-4/s** (JSON to 1e-6 relative), the pool's drop rate **0** and the sink's drops **20.4/s** (the attempts that failed and were retried are the sink's drops, as before; the dead letters are the pool's); the queue's lag includes the re-published jobs; `retries: 0` → phase 2 behaviour byte-identical; the SLO `drop_rate max 0.001` passes on notification-system's shape (pinned on a probe with its numbers: 1.9k/s through four channels, the providers' failure rates).
+- [x] Commit `nodes: a worker pool retries a third party's failures and dead-letters the rest` (red `022cf95`, green `dab022d`, review fixes `956cc08`, 1430 tests).
 
 **Review of Task 11 at `645be72`** (adversarial, 2026-10-30): REQUEST_CHANGES. The fixed points
 (1.020408; ten retries at 50 %), the link delay, stacking with client retries, saturation, sweep,
@@ -378,6 +378,8 @@ demand); 4 → re-published jobs count on the queue's demand and lag but are rou
 that failed them; 5 → sweep metric `<pool>.dead_lettered` and SLO metric `dead_letter_rate`
 (dead-lettered / jobs published, per pool); 6, 7 documented; 8 → `explain` multiplies the pool's
 and the sink's paper load by `A(f, n) = Σ f^k`; 9 → with Task 10's item 2 after the twin lands.
+Fixed at `956cc08` (finding 8: the pool's paper load × A of the combined failure share, the sinks
+through the `then` steps, as `run` replays the whole list).
 
 ### Task 12: `simsys run --replications N`
 
