@@ -15,7 +15,8 @@
 // pipe's wait and serialisation with them, Simulation::hop_response). Captured:
 // saturation spreading downstream as reduced throughput (dropped flow never reaches the
 // next box), propagation delay, fan-out, the feedback loops of ch. 12 (chat) and a client's
-// retries, which are feedback demand too (Simulation::feed_back_retries). Ignored:
+// retries and a worker pool's, which are feedback demand too (Simulation::feed_back_retries,
+// Simulation::feed_back_pool_retries). Ignored:
 // individual requests (flow is a fluid), and anything that changes within a step
 // (demand is constant across one step). A scripted fault (the scenario's `faults:`, FaultSchedule)
 // changes a node's numbers for the steps it covers: forward_pass asks the schedule for the node's
@@ -457,6 +458,8 @@ class Simulation {
   static void count_final_timeouts(const behaviours::ClientBehaviour& client,
                                    ResponseSample& sample);
   void feed_back_retries(std::span<const ResponseSample> responses, Mode mode);
+  void feed_back_pool_retries(std::span<NodeSample> samples, Mode mode);
+  void note_pool_jobs(std::size_t index, const behaviours::Routed& routed);
   [[nodiscard]] double answered_share(const behaviours::ClientBehaviour& client,
                                       const ResponseSample& sample, Mode mode) const;
   [[nodiscard]] flow::LatencyEstimate response_of(std::size_t node, std::string_view op) const;
@@ -1466,6 +1469,9 @@ Simulation Simulation::settling_copy() const {
       client->reset_noise();
       client->settle_retries();
     }
+    if (auto* pool = std::get_if<behaviours::WorkerPoolBehaviour>(&node.behaviour)) {
+      pool->settle_retries();
+    }
     // Every settle pass starts at t = 0, so a window would never close and a full bucket
     // would take burst / ((in - limit) x dt) passes to drain: the scratch limiter admits
     // min(in, limit), each algorithm's long-run rate (RateLimiterBehaviour::use_long_run_rate).
@@ -1496,6 +1502,7 @@ StepRecord Simulation::evaluate(SimTime now, SimTime dt, Mode mode) {
   if (mode == Mode::settle) average_settling_fractions();
   record.responses = client_responses(now);
   feed_back_retries(record.responses, mode);
+  feed_back_pool_retries(record.nodes, mode);
   return record;
 }
 
@@ -1617,6 +1624,7 @@ void Simulation::forward_pass(SimTime now, SimTime dt, Mode mode, StepRecord& re
                          }},
         nodes_[index].behaviour);
     account_rejections(index, routed, samples[index]);
+    note_pool_jobs(index, routed);
     send(index, routed, now, dt, mode, record.links);
   }
 }
@@ -1659,7 +1667,11 @@ void Simulation::account_rejections(std::size_t index, const behaviours::Routed&
 }
 
 // In settle mode the links have no delay: in the long run a link delivers exactly what
-// it is sent, so the target reads its source's latest output directly.
+// it is sent, so the target reads its source's latest output directly. A message queue also
+// receives the jobs its consumer groups re-publish this step (a worker pool's retries,
+// behaviours::WorkerPoolBehaviour::republished): they are appended like any message, so the
+// queue's demand counts them and every group reads them again. Nothing is added while no pool has
+// a retry due, so a queue whose pools retry nothing receives exactly what its links bring.
 void Simulation::receive(std::size_t index, Mode mode) {
   auto& node = nodes_[index];
   node.inflow.clear();
@@ -1668,6 +1680,12 @@ void Simulation::receive(std::size_t index, Mode mode) {
       node.inflow += links_[link].line.pop();
     } else {
       node.inflow += links_[link].sent;
+    }
+  }
+  for (const std::size_t pool : node.consumer_groups) {
+    const auto& group = std::get<behaviours::WorkerPoolBehaviour>(nodes_[pool].behaviour);
+    if (const flow::Flow due = group.republished(); due.total().per_second > 0.0) {
+      node.inflow += due;
     }
   }
 }
@@ -2306,6 +2324,36 @@ void Simulation::feed_back_retries(std::span<const ResponseSample> responses, Mo
     auto& client = std::get<behaviours::ClientBehaviour>(nodes_[sample.client].behaviour);
     if (client.retries() == 0) continue;
     client.retry_failed(sample.op, sample.offered, 1.0 - answered_share(client, sample, mode));
+  }
+}
+
+// A worker pool's retries as feedback demand (behaviours::WorkerPoolBehaviour has the model): after
+// the step, every pool with retries hands its ring the share f of this step's jobs whose call to an
+// external sink failed, which it re-publishes to its queue `retry_after` later, and records the
+// jobs whose last attempt failed as its dead letters (NodeSample::dead_lettered_per_s; 0 on a pool
+// without retries, so every pool's sample has the field). Like the clients' feedback it reads the
+// sink calls of THIS step (the backward pass has run: f = 1 − d with this step's d), and in settle
+// mode the damped fractions (hop_delivered_for_thinning; see estimate for why).
+void Simulation::feed_back_pool_retries(std::span<NodeSample> samples, Mode mode) {
+  for (std::size_t index = 0; index < nodes_.size(); ++index) {
+    auto* pool = std::get_if<behaviours::WorkerPoolBehaviour>(&nodes_[index].behaviour);
+    if (pool == nullptr) continue;
+    if (pool->retries() > 0) {
+      const auto delivered = [this, index, mode](std::size_t target, std::string_view op) {
+        return hop_delivered_for_thinning(index, target, op, mode);
+      };
+      pool->retry_failed(pool->failed_share(delivered));
+    }
+    samples[index].dead_lettered_per_s = pool->dead_lettered_per_s();
+  }
+}
+
+// What a worker pool drained this step (the jobs its route was handed) and what arrived at it,
+// kept for feed_back_pool_retries, which runs once the backward pass knows which calls failed.
+void Simulation::note_pool_jobs(std::size_t index, const behaviours::Routed& routed) {
+  auto& node = nodes_[index];
+  if (auto* pool = std::get_if<behaviours::WorkerPoolBehaviour>(&node.behaviour)) {
+    pool->note_jobs(routed.served, node.inflow.total());
   }
 }
 

@@ -104,7 +104,7 @@ inline constexpr std::array<OwnKeys, model::node_type_names.size()> own_keys_by_
     {model::NodeType::kv_cluster,
      "nodes vnodes replication write_quorum read_quorum mode write_ops"},
     {model::NodeType::message_queue, "partitions retention"},
-    {model::NodeType::worker_pool, "consumes workers cost then"},
+    {model::NodeType::worker_pool, "consumes workers cost then retries retry_after"},
     {model::NodeType::blob_store, "then write_ops"},
     {model::NodeType::search_index, "build_interval"},
     {model::NodeType::ws_gateway, "max_connections heartbeat fanout ops"},
@@ -385,6 +385,15 @@ CheckResult read_optional_duration(const Site& site, const YAML::Node& parent, s
   // one; the lambda returns nothing, so the result is std::expected<void, ConfigError>.
   return parse_duration_key(site, parent, key).transform(store_in(target));
 }
+
+// A client's and a worker pool's `retries` (phase 3 spec §6.1 and §6.2): a whole number from 0 to
+// max_retries, in the same words on both (detail.cpp).
+std::expected<int, ConfigError> read_retry_count(const Site& site, const YAML::Node& value);
+
+// The `retry_after` beside them: a positive duration, and only beside `retries` (detail.cpp).
+// Absent stays absent: the caller fills in its own default once it has read `retries`.
+CheckResult read_retry_after(const Site& site, const YAML::Node& body,
+                             std::optional<SimTime>& retry_after);
 
 // Pattern: Higher-order function — "apply a fallible reader to each element of a YAML list
 // or map, stop at the first error, collect the values" is written once; the reader, the

@@ -686,16 +686,29 @@ struct QueueProvenance {
   return " " + write_ops_summary(g, node);
 }
 
+// "  retries=3 after 1s, then dead-letter": how often a worker pool puts a job whose call to an
+// external sink failed back on its queue, how long after the failure, and where the job goes after
+// its last retry (phase 3 spec §6.2, behaviours::WorkerPoolBehaviour). The loader filled in
+// defaults::pool_retry_after when the scenario gave no wait. Empty for a pool that retries
+// nothing, so its line stays what it was.
+[[nodiscard]] std::string pool_retries_summary(const model::NodeSpec& spec) {
+  if (spec.retries.value_or(0) == 0) return {};
+  return "  retries=" + std::to_string(*spec.retries) + " after " +
+         format_duration(spec.retry_after.value_or(defaults::pool_retry_after)) +
+         ", then dead-letter";
+}
+
 // A worker pool's model (spec §19 entry 5): "  consumes=transcode_q  workers=400 cost=1m", the two
-// numbers its capacity follows from. The capacity itself is stated once, in the queue numbers
-// before it, `capacity=6.667/s (workers / cost)` (queue_provenance). Nothing for a pool built in
-// code without both numbers (it runs on the type's, which server_details shows).
+// numbers its capacity follows from, and its retries when it has some (pool_retries_summary). The
+// capacity itself is stated once, in the queue numbers before it, `capacity=6.667/s (workers /
+// cost)` (queue_provenance). Nothing for a pool built in code without both numbers (it runs on the
+// type's, which server_details shows).
 [[nodiscard]] std::string worker_pool_summary(const graph::ResolvedNode& node) {
   const auto& spec = node.spec;
   if (!defaults::worker_pool_rate(spec)) return {};
   const std::string consumes = spec.consumes ? "  consumes=" + *spec.consumes : "";
   return consumes + "  workers=" + std::to_string(*spec.workers) +
-         " cost=" + format_duration(*spec.job_cost);
+         " cost=" + format_duration(*spec.job_cost) + pool_retries_summary(spec);
 }
 
 // A retention as a queue's is quoted: in whole days when it is some ("7d", Kafka's default of

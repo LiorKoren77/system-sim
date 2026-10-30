@@ -292,4 +292,39 @@ std::expected<Bytes, ConfigError> read_size(const Site& site, const YAML::Node& 
   return *size;
 }
 
+// The most retries a client or a worker pool may state. Chosen, not from the book: ten extra
+// attempts already let a failing path multiply the load by 11 (1 + 10 attempts per request), the
+// engine keeps one bucket per retry, and a larger number is a typo rather than a client or a
+// worker anyone ships.
+inline constexpr int max_retries = 10;
+
+// `retries: 2` (model::Workload::retries, model::NodeSpec::retries): a whole number from 0 to
+// max_retries. A count beyond an int is too many as well; a negative number, a fraction, a word or
+// a quoted "2" is no count (number_text: a quoted scalar is a string).
+std::expected<int, ConfigError> read_retry_count(const Site& site, const YAML::Node& value) {
+  const auto text = number_text(value);
+  const auto count = parse_whole<int>(text);
+  const bool beyond_an_int = !count && count.error() == NumberFault::out_of_range && text[0] != '-';
+  if (beyond_an_int || (count && *count > max_retries)) {
+    return site.fail(value, std::format("retries must be at most {}", max_retries));
+  }
+  if (!count || *count < 0) return site.fail(value, "retries must be a non-negative integer");
+  return *count;
+}
+
+// `retry_after: 250ms`: a positive wait, and only beside `retries`: a backoff with nothing to retry
+// is a mistake the author should hear about, as a `worker_pool` without `workers` is.
+CheckResult read_retry_after(const Site& site, const YAML::Node& body,
+                             std::optional<SimTime>& retry_after) {
+  if (auto read = read_optional_duration(site, body, "retry_after", retry_after); !read) {
+    return read;
+  }
+  if (!retry_after) return {};
+  if (retry_after->count() <= 0) {
+    return site.fail(body["retry_after"], "retry_after must be positive");
+  }
+  if (!body["retries"]) return site.fail(body["retry_after"], "retry_after needs retries");
+  return {};
+}
+
 }  // namespace simsys::config::detail

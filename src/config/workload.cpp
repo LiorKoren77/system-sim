@@ -652,46 +652,12 @@ CheckResult read_client_sizes(const Site& site, const YAML::Node& body, model::W
       });
 }
 
-// The most retries a client may state. Chosen, not from the book: ten extra attempts already let a
-// failing path multiply the client's load by 11 (1 + 10 attempts per request), the engine keeps
-// one bucket per retry, and a larger number is a typo rather than a client anyone ships.
-inline constexpr int max_client_retries = 10;
-
-// `retries: 2` (model::Workload::retries): a whole number from 0 to max_client_retries. A count
-// beyond an int is too many as well; a negative number, a fraction, a word or a quoted "2" is no
-// count (number_text: a quoted scalar is a string).
-std::expected<int, ConfigError> read_retry_count(const Site& site, const YAML::Node& value) {
-  const auto text = number_text(value);
-  const auto count = parse_whole<int>(text);
-  const bool beyond_an_int = !count && count.error() == NumberFault::out_of_range && text[0] != '-';
-  if (beyond_an_int || (count && *count > max_client_retries)) {
-    return site.fail(value, std::format("retries must be at most {}", max_client_retries));
-  }
-  if (!count || *count < 0) return site.fail(value, "retries must be a non-negative integer");
-  return *count;
-}
-
-// `retry_after: 250ms` (model::Workload::retry_after): a positive wait, and only beside `retries`:
-// a backoff with nothing to retry is a mistake the author should hear about, as a `worker_pool`
-// without `workers` is.
-CheckResult read_retry_after(const Site& site, const YAML::Node& body, model::Workload& workload) {
-  if (auto read = read_optional_duration(site, body, "retry_after", workload.retry_after); !read) {
-    return read;
-  }
-  if (!workload.retry_after) return {};
-  if (workload.retry_after->count() <= 0) {
-    return site.fail(body["retry_after"], "retry_after must be positive");
-  }
-  if (!body["retries"]) return site.fail(body["retry_after"], "retry_after needs retries");
-  return {};
-}
-
 // `retries` and `retry_after` (phase 3 spec §6.1), both optional. A client that states `retries`
 // and no `retry_after` waits defaults::retry_after, filled in here so that explain prints the wait
 // the engine uses.
 CheckResult read_client_retries(const Site& site, const YAML::Node& body,
                                 model::Workload& workload) {
-  if (auto read = read_retry_after(site, body, workload); !read) return read;
+  if (auto read = read_retry_after(site, body, workload.retry_after); !read) return read;
   if (!body["retries"]) return {};
   if (auto checked = check_not_null(site, body, "retries", "retries"); !checked) return checked;
   return read_retry_count(site, body["retries"]).transform([&](int count) {
