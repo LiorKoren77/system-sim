@@ -12,7 +12,7 @@ interface units and partitions in `FILE_SET CXX_MODULES` (`CMakeLists.txt`). The
 | `simsys.core` | `src/core/core.cppm` | interface only | none |
 | `simsys.workload` | `src/workload/workload.cppm` | interface only | core |
 | `simsys.model` | `src/model/model.cppm`, `model.cpp` | interface + implementation unit (the fourth defect's workaround, below) | core, workload |
-| `simsys.config` | `src/config/config.cppm`; `config.cpp`, `header.cpp`, `nodes.cpp`, `steps.cpp`, `workload.cpp`, `links.cpp`, `slos.cpp`, `overrides.cpp`, `detail.cpp`; `detail.hpp` | interface + nine implementation units (the loader, one unit per concern) sharing a header included in their purview (below) | core, model; the implementation units add defaults, fluid, workload |
+| `simsys.config` | `src/config/config.cppm`; `config.cpp`, `header.cpp`, `nodes.cpp`, `steps.cpp`, `workload.cpp`, `links.cpp`, `slos.cpp`, `faults.cpp`, `overrides.cpp`, `detail.cpp`; `detail.hpp` | interface + ten implementation units (the loader, one unit per concern) sharing a header included in their purview (below) | core, model; the implementation units add defaults, fluid, workload |
 | `simsys.queueing` | `src/queueing/queueing.cppm` | interface only | none |
 | `simsys.flow` | `src/flow/flow.cppm` | interface only | core |
 | `simsys.fluid` | `src/fluid/fluid.cppm` | interface only | core, flow, queueing |
@@ -196,10 +196,10 @@ The three large modules show three layouts.
   `simsys.core` and `simsys.fluid` but not the module's own interface (next paragraph), so it
   cannot see `format_duration(double)`; that is why the body lives in the partition and the
   exported function forwards to it, not the other way round.
-- **`simsys.config`: interface + nine implementation units + a header in the purview.** The
+- **`simsys.config`: interface + ten implementation units + a header in the purview.** The
   loader is cut by concern: `config.cpp` (`load`, the pipeline), `header.cpp`, `nodes.cpp`,
-  `steps.cpp`, `workload.cpp`, `links.cpp`, `slos.cpp`, `overrides.cpp`, and `detail.cpp`, which
-  defines the shared readers. What they share (the vocabulary types, the key tables, the
+  `steps.cpp`, `workload.cpp`, `links.cpp`, `slos.cpp`, `faults.cpp`, `overrides.cpp`, and
+  `detail.cpp`, which defines the shared readers. What they share (the vocabulary types, the key tables, the
   templates and the cross-unit declarations) is in `detail.hpp`, which each unit `#include`s
   *after* its imports, inside the module purview, so the declarations attach to
   `simsys.config` and can name `ConfigError`. Each unit's own helpers sit in an anonymous
@@ -209,7 +209,7 @@ The three large modules show three layouts.
 attached to a named module (a struct, an `inline constexpr` table, a template) must be defined
 in one unit only ([basic.def.odr]); the leave to repeat a definition in every unit that includes
 it is for the global module, which is what makes ordinary headers legal. `detail.hpp` repeats its
-structs, tables and templates in the nine units that include it: ill-formed, no diagnostic
+structs, tables and templates in the ten units that include it: ill-formed, no diagnostic
 required. GCC 14.2 accepts it (it emits them in vague linkage, as it would a header's, and the
 linker keeps one), and it is in the tree only because GCC 14.2 refused both partition designs:
 

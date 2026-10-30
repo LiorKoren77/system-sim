@@ -87,6 +87,43 @@ namespace {
          "datacenters: " + join(s.datacenters, ", ") + "\n";
 }
 
+// ---- the scripted faults in one line ----
+
+// What a fault acts on: its node, or for a dc_down its datacenter.
+[[nodiscard]] const std::string& fault_target(const model::Fault& fault) {
+  return fault.node.empty() ? fault.datacenter : fault.node;
+}
+
+// The key that sizes a fault, when its kind has one: " replicas=1", " replicas=primary",
+// " factor=0.5", " extra=50ms"; "" for a whole node_down, a cache_flush or a dc_down.
+[[nodiscard]] std::string fault_size(const model::Fault& fault) {
+  if (fault.primary) return " replicas=primary";
+  if (fault.replicas) return " replicas=" + std::to_string(*fault.replicas);
+  if (fault.factor) return " factor=" + significant(*fault.factor);
+  if (fault.extra) return " extra=" + format_duration(*fault.extra);
+  return "";
+}
+
+// "node_down chat_servers 21:30 for 1m": kind, target, start on the run's clock and length (a
+// cache_flush is an instant and has none), then its size.
+[[nodiscard]] std::string fault_summary(const model::Fault& fault) {
+  const bool lasts = fault.kind != model::FaultKind::cache_flush;
+  return std::string{model::to_string(fault.kind)} + " " + fault_target(fault) + " " +
+         clock_or_duration(fault.at) + (lasts ? " for " + format_duration(fault.duration) : "") +
+         fault_size(fault);
+}
+
+// "faults: 2 scripted (node_down chat_servers 21:30 for 1m, cache_flush feed_cache 09:00)", so a
+// reader sees what the run will break before running it. No line at all for a scenario without
+// faults, so the explain of every such scenario is unchanged.
+[[nodiscard]] std::string explain_faults(const model::Scenario& s) {
+  if (s.faults.empty()) return "";
+  std::vector<std::string> summaries;
+  for (const auto& fault : s.faults) summaries.push_back(fault_summary(fault));
+  return "faults: " + std::to_string(s.faults.size()) + " scripted (" + join(summaries, ", ") +
+         ")\n";
+}
+
 // ---- the rate curve in one line ----
 
 [[nodiscard]] std::string level_summary(const workload::RateCurve& curve) {
@@ -1710,8 +1747,8 @@ bool add_missing(std::vector<model::NodeType>& into, std::span<const model::Node
 }  // namespace
 
 std::string render_explain(const graph::Graph& g) {
-  return explain_header(g.scenario()) + explain_nodes(g) + explain_links(g) + explain_order(g) +
-         explain_checks(g);
+  return explain_header(g.scenario()) + explain_faults(g.scenario()) + explain_nodes(g) +
+         explain_links(g) + explain_order(g) + explain_checks(g);
 }
 
 }  // namespace simsys::report

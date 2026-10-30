@@ -5,7 +5,7 @@
 // parameters (eviction policy, quorum sizes, ...) are left to the engine. The checks
 // themselves live in the implementation units: config.cpp (`load` and the pipeline), one unit
 // per concern (header.cpp, nodes.cpp, steps.cpp, workload.cpp, links.cpp, slos.cpp,
-// overrides.cpp) and detail.hpp / detail.cpp for what they share.
+// faults.cpp, overrides.cpp) and detail.hpp / detail.cpp for what they share.
 //
 // Compilation firewall: interface declares, implementation units define; the importers' BMI
 // does not change when only an implementation unit does. With CMake 3.31 an edit there

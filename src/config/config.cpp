@@ -1,9 +1,9 @@
 // Module `simsys.config`, implementation unit: `load` and the pipeline it runs (`validate`).
 // The readers live in one implementation unit per concern: header.cpp (top level, header,
 // datacenters), nodes.cpp (both passes over `nodes`, every type's own keys), steps.cpp,
-// workload.cpp (a client's traffic), links.cpp, slos.cpp, overrides.cpp; what they share is
-// declared in detail.hpp and defined in detail.cpp. yaml-cpp and <format> are included in the
-// implementation units, not in config.cppm (see the GCC 14.2 note there).
+// workload.cpp (a client's traffic), links.cpp, slos.cpp, faults.cpp, overrides.cpp; what they
+// share is declared in detail.hpp and defined in detail.cpp. yaml-cpp and <format> are included
+// in the implementation units, not in config.cppm (see the GCC 14.2 note there).
 module;
 #include <yaml-cpp/yaml.h>
 
@@ -53,8 +53,9 @@ namespace {
 // Pattern: Pipeline with early exit (railway-oriented error handling) — each stage returns
 // std::expected<T, ConfigError> (T is void for a pure check, the parsed value otherwise),
 // and the first error leaves the track and is returned, so the user sees one precise
-// message. The stages are not independent: node bodies, links and SLOs need the ids the
-// declaration pass collects, and SLOs need the clients' ops, so their order is fixed.
+// message. The stages are not independent: node bodies, links, SLOs and faults need the ids the
+// declaration pass collects, SLOs need the clients' ops and faults the nodes' types and replicas,
+// so their order is fixed.
 std::expected<model::Scenario, ConfigError> validate(const std::string& file,
                                                      const YAML::Node& root) {
   // C++20 designated initializers: each member named where it is set, so two members of the
@@ -75,9 +76,12 @@ std::expected<model::Scenario, ConfigError> validate(const std::string& file,
   if (!links) return std::unexpected(links.error());
   auto slos = collect_slos(site, root, *declared, scenario);
   if (!slos) return std::unexpected(slos.error());
+  auto faults = read_faults(site, root, *declared, scenario);
+  if (!faults) return std::unexpected(faults.error());
   scenario.nodes = std::move(declared->nodes);
   scenario.links = std::move(*links);
   scenario.slos = std::move(*slos);
+  scenario.faults = std::move(*faults);
   return scenario;
 }
 
