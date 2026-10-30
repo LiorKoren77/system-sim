@@ -198,13 +198,15 @@ std::vector<int> replication_seeds(int seed, std::size_t count) {
 bool has_rate_noise(const graph::Graph& g) {
   // C++20 std::ranges::any_of: the range itself instead of a begin/end pair (std::any_of).
   return std::ranges::any_of(g.nodes(), [](const graph::ResolvedNode& node) {
-    return node.spec.workload && node.spec.workload->noise.has_value();
+    return node.spec.workload && node.spec.workload->noise &&
+           node.spec.workload->noise->sigma > 0.0;
   });
 }
 
 // Each replication is its own Simulation and writes only its own slot, so the workers share
-// nothing but `g` (read only) and the counter of run_in_parallel; the slots are read after the
-// joins. A slot is a std::optional because a Summary has no empty state to preallocate.
+// nothing but `g` (read only: concurrent reads do not race while Graph has no `mutable` or lazily
+// cached member, docs/study/threads.md) and the counter of run_in_parallel; the slots are read
+// after the joins. A slot is a std::optional because a Summary has no empty state to preallocate.
 std::vector<report::Summary> run_replications(const graph::Graph& g, int seed, std::size_t count,
                                               std::size_t jobs) {
   require_runnable(g);

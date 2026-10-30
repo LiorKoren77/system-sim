@@ -80,8 +80,9 @@ struct RunObservers {
 void run_in_parallel(std::size_t count, std::size_t jobs,
                      const std::function<void(std::size_t)>& work);
 
-// Does some client's rate carry noise (`rate: {noise: ...}`)? The noise is the only random input of
-// a run, so without it every seed gives the same run, and `run --replications` runs once.
+// Does some client's rate carry noise (`rate: {noise: ...}` with a sigma above 0)? The noise is the
+// only random input of a run, so without it, or with `sigma: 0` (a multiplier of exactly 1 at every
+// step), every seed gives the same run, and `run --replications` runs once.
 [[nodiscard]] bool has_rate_noise(const graph::Graph& g);
 
 // The seeds of `count` replications from `seed`: seed, seed + 1, ..., wrapping around past INT_MAX

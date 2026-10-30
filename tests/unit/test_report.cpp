@@ -3429,7 +3429,8 @@ TEST_CASE("a pool without retries has a dead_letter_rate of 0", "[report]") {
 namespace {
 
 // The value of rank ceil(percent n / 100) of `values`, sorted ascending; integer arithmetic, so
-// that no float rounding can move a rank (0.1 * 10 is not always exactly 1).
+// that no float rounding can move a rank (0.07 * 100 is 7.000000000000001 in binary floating point,
+// so a ceil would skip to rank 8).
 double nearest_rank(std::vector<double> values, std::size_t percent) {
   // C++20 std::ranges::sort: sorts the whole container, so the begin/end pair of std::sort (which
   // can be mismatched) goes away; `values` is a copy, so the caller's order survives.
@@ -3568,6 +3569,24 @@ TEST_CASE("an SLO the median run fails fails, whatever the few runs that pass it
   CHECK(replicated.slos[0].passes_in == 1);
   CHECK(replicated.slos[0].result.status == simsys::report::SloStatus::fail);
   CHECK(replicated.slos[0].result.observed == replicated.ops.at(0).p99_s.median);
+}
+
+TEST_CASE("each SLO row and each SLO of the JSON name the seed of that SLO's median run") {
+  // The median run is the demand-300 run, the first of the list: seed 11 of seeds 11..15.
+  const Runs probe{five_demands};
+  const Runs runs{five_demands, limit_between_ranks(probe, 3)};
+  constexpr std::array<int, 5> seeds{11, 12, 13, 14, 15};
+  const auto replicated = simsys::report::summarize_replications(runs.summaries, seeds);
+  REQUIRE(replicated.slos.at(0).median_run == 0);
+  const auto table = simsys::report::render_replications_table(replicated, runs.summaries, false);
+  const auto slo_row = table.substr(table.find("PASS in 3 of 5"));
+  CHECK(slo_row.substr(0, slo_row.find('\n')).ends_with("median run: seed 11"));
+  CHECK(table.contains("the summary line and the fault blocks are seed 11's"));
+  const auto json = simsys::report::render_replications_json(replicated, runs.summaries);
+  // once in the SLO's entry of `slo`, once as replications.median_seed
+  const auto first = json.find("\"median_seed\": 11");
+  REQUIRE(first != std::string::npos);
+  CHECK(json.find("\"median_seed\": 11", first + 1) != std::string::npos);
 }
 
 TEST_CASE("a scenario without SLOs has no SLO replications") {

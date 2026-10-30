@@ -98,16 +98,28 @@ Write for a reader who has read the book but has not studied queueing theory.
   exported namespace-scope constant in a module interface is `constexpr` without `inline`: it
   keeps external linkage (it is exported) and the interface's object file defines it once
   (`tests/support/fixtures.cppm`).
-- Eighth GCC 14.2 defect (2026-10-30): a standard header `#include`d AFTER an `import` is compiled
-  a second time against the library internals the imported module's global module fragment
-  already brought in, and clashes with them, even when the header itself is new to the importer.
-  `#include <set>` after `import simsys.graph;` (whose fragment has `<map>`, `<functional>`, ...)
-  fails with `bits/node_handle.h:67:56: error: template definition of non-template 'using
-  std::_Node_handle_common<_Val, _NodeAlloc>::_AllocTraits = ...'`; after `import simsys.core;`
-  with `ext/aligned_buffer.h:96:67: error: redeclaration of '... __aligned_buffer<_Tp>::_M_storage'`
-  (the test-writer saw a `_Hashtable` conflict: same cause, another shared internal). Workaround:
-  every `#include` before the first `import` of the file, the order every unit already follows;
-  `<set>` there compiles and works (verified with tests/unit/test_session.cpp).
+- Eighth GCC 14.2 defect (2026-10-30): a standard-library header `#include`d AFTER an `import` is
+  compiled a second time against the library internals the imported module's global module
+  fragment already brought in, and clashes with them, even when the header itself is new to the
+  importer. Minimal repro: `import simsys.graph;` then `#include <set>` fails, with a diagnostic that
+  varies with the header and the module (`bits/cpp_type_traits.h:81:12: error: redefinition of
+  'struct std::__truth_type<true>'`, or one in `bits/node_handle.h`); the same two lines swapped
+  compile. Workaround: every standard-library or third-party header before the first `import` of the
+  file. `src/config/detail.hpp` is no exception to it: it includes no header itself, and the ten
+  `src/config/*.cpp` units include it after their imports on purpose, so that its declarations
+  belong to simsys.config (its own comment says why).
+- Ninth GCC 14.2 defect (2026-10-30): `#include <memory>` in the global module fragment of
+  `src/engine/engine.cppm` breaks every importer of simsys.engine ("ignoring attributes applied to
+  'std::auto_ptr' after definition", the first defect's family). Workaround: no `<memory>` there, so
+  no `std::unique_ptr` member; the fault-free twin, a member of the class's own (still incomplete)
+  type, is held in a `std::vector<Simulation>` used as an optional (`Simulation::twin_`, whose
+  comment says why).
+- Tenth GCC 14.2 defect (2026-10-30), Release builds only: "internal compiler error: in
+  finish_function" (`stl_vector.h`) when an importer instantiates the implicit move constructor of
+  `FaultLog` (its `std::vector` members), the fourth defect's family. Workaround: the special
+  members are declared in the class and defaulted out of it, after it, so they are not inline: the
+  partition's object file defines them once and importers call them
+  (`src/engine/fault_log.cppm`).
 
 ## 4. Clean code, named patterns, TDD
 

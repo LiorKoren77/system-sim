@@ -198,7 +198,9 @@ constexpr std::string_view ansi_reset = "\x1b[0m";
 
 // How many columns `text` takes on a terminal: its UTF-8 code points, not its bytes. The en dash
 // of a replication's band (`1.62ms [1.61–1.63]`) is three bytes and one column. Every character
-// the tables print is one column wide (no CJK, no combining marks), so code points are columns.
+// the simulator itself prints is one column wide, so for them code points are columns; a wide
+// character in a node id (CJK, an emoji) or a combining mark still misaligns its row (a true
+// width needs the Unicode East Asian Width tables, wcwidth, which this does not carry).
 [[nodiscard]] std::size_t display_width(std::string_view text) {
   // C++20 std::ranges::count_if: counts over the whole range, replacing a begin/end pair.
   return static_cast<std::size_t>(std::ranges::count_if(text, starts_a_character));

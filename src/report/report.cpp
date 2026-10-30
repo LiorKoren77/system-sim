@@ -806,15 +806,18 @@ constexpr std::string_view op_title =
   return window + "  " + r.note;
 }
 
-// One SLO's row under the status cell given.
-[[nodiscard]] Row slo_row(const SloResult& r, Cell status) {
+// One SLO's row under the status cell given, `also` (`run --replications`' `median run: seed 5`)
+// after the remark.
+[[nodiscard]] Row slo_row(const SloResult& r, Cell status, std::string_view also = {}) {
   const auto observed =
       r.observed.transform([&](double v) { return fmt_slo_value(r.slo.metric, v); });
   Row row{std::move(status),          {std::string{model::to_string(r.slo.metric)}},
           {r.slo.node.value_or("-")}, {r.slo.op.value_or("-")},
           {observed.value_or("-")},   {fmt_limit(r.slo.max)}};
   // A seventh, unlabelled column: which window, and why.
-  if (const auto remark = slo_remark(r); !remark.empty()) row.push_back({remark});
+  std::string remark = slo_remark(r);
+  if (!also.empty()) remark += (remark.empty() ? "" : "  ") + std::string{also};
+  if (!remark.empty()) row.push_back({std::move(remark)});
   return row;
 }
 
@@ -1115,21 +1118,27 @@ constexpr std::string_view op_title =
 
 // `observed` and `max` are in seconds for the time SLOs (latency, staleness, queue lag), plain
 // ratios otherwise.
-[[nodiscard]] std::string json_slo(const SloResult& r) {
-  const std::array fields{json_field("metric", json_string(model::to_string(r.slo.metric))),
-                          json_field("node", json_optional_string(r.slo.node)),
-                          json_field("op", json_optional_string(r.slo.op)),
-                          json_field("observed", r.observed ? json_number(*r.observed) : "null"),
-                          json_field("max", json_number(limit_value(r.slo.max))),
-                          json_field("status", json_string(status_name(r.status))),
-                          json_field("note", r.note.empty() ? "null" : json_string(r.note))};
-  if (!r.slo.over || r.at_one_instant) return json_object(fields);
+// An SLO's fields in the JSON's `slo` array (json_slo puts them in braces; `run --replications`
+// adds its median_seed at the end).
+[[nodiscard]] std::vector<std::string> json_slo_fields(const SloResult& r) {
+  std::vector<std::string> fields{
+      json_field("metric", json_string(model::to_string(r.slo.metric))),
+      json_field("node", json_optional_string(r.slo.node)),
+      json_field("op", json_optional_string(r.slo.op)),
+      json_field("observed", r.observed ? json_number(*r.observed) : "null"),
+      json_field("max", json_number(limit_value(r.slo.max))),
+      json_field("status", json_string(status_name(r.status))),
+      json_field("note", r.note.empty() ? "null" : json_string(r.note))};
+  if (!r.slo.over || r.at_one_instant) return fields;
   // Only an SLO with `over` that `run` judged has the key (estimate measured no window): its worst
   // window's start, in seconds from the start of the run; null when every window was skipped.
-  std::vector<std::string> windowed{fields.begin(), fields.end()};
-  windowed.push_back(json_field("window_start_s",
-                                r.window_start ? json_number(seconds(*r.window_start)) : "null"));
-  return json_object(windowed);
+  fields.push_back(json_field("window_start_s",
+                              r.window_start ? json_number(seconds(*r.window_start)) : "null"));
+  return fields;
+}
+
+[[nodiscard]] std::string json_slo(const SloResult& r) {
+  return json_object(json_slo_fields(r));
 }
 
 // What a fault did to the SLOs, as JSON: `flipped`, the words of each SLO whose verdict differs
@@ -1212,10 +1221,11 @@ template <class T, class F>
   return items | std::views::transform(f) | std::ranges::to<std::vector<std::string>>();
 }
 
-// The top-level lines of a run's JSON report, one key each. With no observed step the drop and
-// reject rates are null: there is no data, not a rate of 0.
+// The top-level lines of a run's JSON report, one key each, the `slo` array's objects given
+// (json_slo's, or with a replication's median_seed). With no observed step the drop and reject
+// rates are null: there is no data, not a rate of 0.
 [[nodiscard]] std::vector<std::string> json_report_lines(const Summary& summary,
-                                                         std::span<const SloResult> slos) {
+                                                         std::span<const std::string> slo_objects) {
   const auto nodes = summary.nodes();
   const auto ops = summary.ops();
   const auto links = summary.links();
@@ -1233,7 +1243,7 @@ template <class T, class F>
       json_array("nodes", map_to_strings(std::span<const NodeSummary>{nodes}, json_node)),
       json_array("links", map_to_strings(std::span<const LinkSummary>{links}, json_link)),
       json_array("ops", map_to_strings(std::span<const OpSummary>{ops}, json_op)),
-      json_array("slo", map_to_strings(slos, json_slo))};
+      json_array("slo", slo_objects)};
   if (summary.faults().empty()) return lines;
   // The faults array, last and only with faults: a report without them is what it was before.
   std::vector<std::string> faults;
@@ -1242,6 +1252,12 @@ template <class T, class F>
   }
   lines.push_back(json_array("faults", faults));
   return lines;
+}
+
+// A run's own report: each SLO as json_slo writes it.
+[[nodiscard]] std::vector<std::string> json_report_lines(const Summary& summary,
+                                                         std::span<const SloResult> slos) {
+  return json_report_lines(summary, map_to_strings(slos, json_slo));
 }
 
 // The lines as one JSON object, a key per line.
@@ -1274,8 +1290,8 @@ struct NumberAndUnit {
 }
 
 // 1-based rank of the nearest-rank `percent` quantile of n values: ceil(percent·n / 100), at least
-// 1. Integer arithmetic, so no float rounding can move a rank (0.1 × 10 is not exactly 1 in
-// binary floating point).
+// 1. Integer arithmetic, so no float rounding can move a rank: in binary floating point 0.07 × 100
+// is 7.000000000000001, and ceil of it would skip rank 7 for rank 8.
 [[nodiscard]] std::size_t nearest_rank(std::size_t percent, std::size_t n) {
   return std::max<std::size_t>((percent * n + 99) / 100, 1);
 }
@@ -1292,10 +1308,11 @@ struct NumberAndUnit {
   // C++23 std::ranges::iota: fills the range with 0, 1, 2, ..., the range itself instead of
   // std::iota's begin/end pair.
   std::ranges::iota(order, std::size_t{0});
-  // std::ranges::stable_sort: stable, so runs with equal values keep their order and a tie always
-  // names the lower seed, whatever the threads did.
-  std::ranges::stable_sort(
-      order, [&](std::size_t a, std::size_t b) { return ranks_before(values[a], values[b]); });
+  // C++20 std::ranges::stable_sort with a projection: sorts the whole range (no begin/end pair as
+  // std::stable_sort takes) and compares what the projection returns, here each run's value, so the
+  // comparator stays ranks_before on two doubles instead of a lambda that looks both indices up.
+  // Stable: runs with equal values keep their order, and a tie always names the lower seed.
+  std::ranges::stable_sort(order, ranks_before, [&](std::size_t run) { return values[run]; });
   return order;
 }
 
@@ -1315,13 +1332,6 @@ struct NumberAndUnit {
               .low_run = low,
               .high_run = high};
 }
-
-// What a run's report is made of, computed once per run: its ops, its nodes and its SLO verdicts.
-struct RunFigures {
-  std::vector<std::vector<OpSummary>> ops{};
-  std::vector<std::vector<NodeSummary>> nodes{};
-  std::vector<std::vector<SloResult>> slos{};
-};
 
 // Throws std::invalid_argument unless every run has the first run's ops, nodes and SLOs: runs of
 // different scenarios cannot be ranked against each other (a programmer error).
@@ -1451,19 +1461,20 @@ template <class Item>
 // client's `-`); else the first mark that is not blank and how many runs printed it (`unavailable
 // in 2 of 5`), the one text cell that varies.
 [[nodiscard]] Cell text_band(std::span<const TableParts> runs, std::size_t row, std::size_t cell) {
-  const std::string* mark = nullptr;
-  for (const auto& run : runs) {
-    const auto& text = run.rows[row][cell].text;
-    if (!text.empty() && mark == nullptr) mark = &text;
-  }
+  const auto text_of = [&](const TableParts& run) -> const std::string& {
+    return run.rows[row][cell].text;
+  };
   const auto& first = runs.front().rows[row][cell];
-  if (mark == nullptr) return first;
-  std::size_t shown = 0;
-  for (const auto& run : runs) {
-    if (run.rows[row][cell].text == *mark) ++shown;
-  }
+  // C++20 std::ranges::find_if with a projection: the first run whose text (the projection) is not
+  // blank, an iterator into `runs`, end when every run left the cell blank.
+  const auto marked =
+      std::ranges::find_if(runs, [](const std::string& text) { return !text.empty(); }, text_of);
+  if (marked == runs.end()) return first;
+  const std::string& mark = text_of(*marked);
+  const auto shown = static_cast<std::size_t>(
+      std::ranges::count_if(runs, [&](const TableParts& run) { return text_of(run) == mark; }));
   if (shown == runs.size()) return first;
-  return {*mark + " in " + std::to_string(shown) + " of " + std::to_string(runs.size())};
+  return {mark + " in " + std::to_string(shown) + " of " + std::to_string(runs.size())};
 }
 
 // A cell across the runs: format_band of the texts the median, the 10 % and the 90 % runs printed
@@ -1500,7 +1511,9 @@ void require_same_shape(std::span<const TableParts> runs) {
     for (std::size_t cell = 0; cell < runs.front().rows[row].size(); ++cell) {
       cells.push_back(banded_cell(runs, row, cell));
     }
-    banded.add(std::move(cells), runs.front().numbers[row]);
+    // No numbers: a banded cell is the band of several runs' numbers, no one number of its own, and
+    // nothing bands a banded table again.
+    banded.add(std::move(cells), {});
   }
   return banded;
 }
@@ -1523,15 +1536,21 @@ template <class Build>
          table_text(op_title, banded_over(runs, op_parts));
 }
 
-// What the cells are, and which seed the median run is.
+// The seed of run `run` of `replicated`.
+[[nodiscard]] int seed_of_run(const ReplicationSummary& replicated, std::size_t run) {
+  return replicated.seeds.at(run);
+}
+
+// What the cells are, and whose the summary line and the fault blocks are (the run that stands for
+// all, ReplicationSummary::median_run); each SLO names its own median run in its row.
 [[nodiscard]] std::string replications_intro(const ReplicationSummary& replicated) {
   const auto& seeds = replicated.seeds;
+  const std::string standing = std::to_string(seed_of_run(replicated, replicated.median_run));
   return "replications: " + std::to_string(seeds.size()) + " runs, seeds " +
          std::to_string(seeds.front()) + ".." + std::to_string(seeds.back()) +
          "; a cell is the median across the runs [its 10" + std::string{en_dash} +
-         "90 % band], nearest rank\n" + "median run: seed " +
-         std::to_string(seeds[replicated.median_run]) +
-         " (the line below and the fault blocks are its own)\n";
+         "90 % band], nearest rank\n" + "each SLO is judged by its own median run; " +
+         "the summary line and the fault blocks are seed " + standing + "'s\n";
 }
 
 // `PASS in 3 of 5`: the median run passed, as did 3 of the 5 runs. `FAIL (passed in 2 of 5)`: the
@@ -1547,8 +1566,10 @@ template <class Build>
   if (replicated.slos.empty()) return {};
   std::vector<Row> rows{slo_header()};
   for (const auto& slo : replicated.slos) {
+    const std::string median =
+        "median run: seed " + std::to_string(seed_of_run(replicated, slo.median_run));
     rows.push_back(
-        slo_row(slo.result, replicated_status_cell(slo, replicated.seeds.size(), color)));
+        slo_row(slo.result, replicated_status_cell(slo, replicated.seeds.size(), color), median));
   }
   return "slo (each: its median run's verdict and observed value, and the runs that passed it)\n" +
          aligned(rows, Align::all_left);
@@ -1677,14 +1698,30 @@ constexpr std::array op_numbers{
          json_nested_array("slo", slos, indent) + "\n    }";
 }
 
-// The `replications` key: the seeds, and every op's, node's and SLO's numbers per seed.
-[[nodiscard]] std::string json_replications(const ReplicationSummary& replicated,
-                                            const RunFigures& figures) {
+// The `replications` key: the seeds, the seed of the run whose report surrounds it, and every op's,
+// node's and SLO's numbers per seed.
+[[nodiscard]] std::string json_replications(const ReplicationSummary& replicated) {
   std::vector<std::string> seeds;
   for (const int seed : replicated.seeds) seeds.push_back(std::to_string(seed));
-  return "  " + json_field("replications",
-                           "{\n    " + json_per_seed("seeds", seeds) + ",\n    " +
-                               json_field("per_seed", json_per_seed_lists(figures)) + "\n  }");
+  const std::string median_seed = std::to_string(seed_of_run(replicated, replicated.median_run));
+  return "  " +
+         json_field("replications",
+                    "{\n    " + json_per_seed("seeds", seeds) + ",\n    " +
+                        json_field("median_seed", median_seed) + ",\n    " +
+                        json_field("per_seed", json_per_seed_lists(replicated.per_run)) + "\n  }");
+}
+
+// The `slo` array's objects: each SLO's replicated verdict (its median run's) as json_slo writes
+// it, then `median_seed`, the seed of that SLO's own median run.
+[[nodiscard]] std::vector<std::string> json_replicated_slos(const ReplicationSummary& replicated) {
+  std::vector<std::string> objects;
+  for (const auto& slo : replicated.slos) {
+    auto fields = json_slo_fields(slo.result);
+    fields.push_back(
+        json_field("median_seed", std::to_string(seed_of_run(replicated, slo.median_run))));
+    objects.push_back(json_object(fields));
+  }
+  return objects;
 }
 
 // ---- CSV ----
@@ -2364,8 +2401,8 @@ ReplicationSummary summarize_replications(std::span<const Summary> runs,
   if (runs.empty() || seeds.size() != runs.size()) {
     throw std::invalid_argument{"report::summarize_replications: one seed per run, at least one"};
   }
-  const RunFigures figures = figures_of(runs);
-  ReplicationSummary replicated{.seeds = {seeds.begin(), seeds.end()}};
+  ReplicationSummary replicated{.seeds = {seeds.begin(), seeds.end()}, .per_run = figures_of(runs)};
+  const RunFigures& figures = replicated.per_run;
   for (std::size_t i = 0; i < figures.ops.front().size(); ++i) {
     replicated.ops.push_back(op_bands(figures.ops, i));
   }
@@ -2411,8 +2448,10 @@ std::string render_replications_table(const ReplicationSummary& replicated,
 std::string render_replications_json(const ReplicationSummary& replicated,
                                      std::span<const Summary> runs) {
   const Summary& median = median_summary(replicated, runs);
-  auto lines = json_report_lines(median, replicated_verdicts(replicated));
-  lines.push_back(json_replications(replicated, figures_of(runs)));
+  // `replications` after `faults`, the last of a run's own keys: a faulted scenario's JSON is the
+  // median run's report, faults included, then the one key a replication adds.
+  auto lines = json_report_lines(median, json_replicated_slos(replicated));
+  lines.push_back(json_replications(replicated));
   return json_document(lines);
 }
 

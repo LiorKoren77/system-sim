@@ -21,7 +21,7 @@
 // C++20 `import`: brings a named module's exported names into this translation unit without
 // textual inclusion (the compiler reads the module's compiled interface). It replaces
 // `#include` plus include guards; placed after the #includes because GCC 14 reports
-// redefinitions when a std header is included after a module that included it itself.
+// redefinitions when a standard header is included after an import (CLAUDE.md §3, eighth defect).
 import simsys.core;
 import simsys.graph;
 import simsys.model;
@@ -176,4 +176,14 @@ TEST_CASE("the replication seeds wrap around past the largest int instead of ove
 TEST_CASE("a scenario has rate noise when some client's rate has a noise block") {
   CHECK(simsys::session::has_rate_noise(graph_of(noisy(1))));
   CHECK_FALSE(simsys::session::has_rate_noise(graph_of(noiseless(1))));
+}
+
+TEST_CASE("a noise block of sigma 0 is no rate noise: every seed would give the same run") {
+  auto s = noisy(1);
+  s.nodes[0].workload->noise->sigma = 0.0;
+  const auto g = graph_of(s);
+  CHECK_FALSE(simsys::session::has_rate_noise(g));
+  // the premise: two seeds of it are the same run, byte for byte
+  const auto texts = rendered_all(simsys::session::run_replications(g, 1, 2, 1));
+  CHECK(texts[0] == texts[1]);
 }

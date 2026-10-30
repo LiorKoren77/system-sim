@@ -109,7 +109,7 @@ add_test(NAME "simsys curve applies a traffic_spike fault exactly as a spikes en
 # refusals, the exit code of the median run, and that --jobs cannot show in the output. One scratch
 # directory per check, so `ctest -j` runs them side by side.
 foreach(check bands same_bytes json exit_codes noiseless one_is_plain refusals series_refused
-              fault_once)
+              fault_once slo_median_seeds noiseless_json_note sigma_zero jobs_help)
   if(check STREQUAL "bands")
     set(name "simsys run --replications prints each metric's median and band and PASS in k of N")
   elseif(check STREQUAL "same_bytes")
@@ -117,7 +117,7 @@ foreach(check bands same_bytes json exit_codes noiseless one_is_plain refusals s
   elseif(check STREQUAL "json")
     set(name "simsys run --replications adds the seeds and the per-seed values to the JSON")
   elseif(check STREQUAL "exit_codes")
-    set(name "simsys run --replications exits with the median run's code")
+    set(name "simsys run --replications exits 2 only when an SLO's median run fails")
   elseif(check STREQUAL "noiseless")
     set(name "simsys run --replications runs a scenario without noise once and says so first")
   elseif(check STREQUAL "one_is_plain")
@@ -126,8 +126,16 @@ foreach(check bands same_bytes json exit_codes noiseless one_is_plain refusals s
     set(name "simsys run refuses a replication count outside 1 to 1000")
   elseif(check STREQUAL "series_refused")
     set(name "simsys run refuses a series file with more than one replication")
-  else()
+  elseif(check STREQUAL "fault_once")
     set(name "simsys run --replications prints a scripted fault's block once")
+  elseif(check STREQUAL "slo_median_seeds")
+    set(name "simsys run --replications names each SLO's own median seed and exits 2 when one fails")
+  elseif(check STREQUAL "noiseless_json_note")
+    set(name "simsys run --replications --report json without noise puts the note on stderr")
+  elseif(check STREQUAL "sigma_zero")
+    set(name "simsys run --replications treats noise of sigma 0 as no noise and runs once")
+  else()
+    set(name "simsys run --help says --jobs is ignored without --replications")
   endif()
   add_test(NAME "${name}"
            COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>

@@ -3,10 +3,10 @@
 //
 // Exit codes: 0 the run worked and every SLO passed, 2 it worked but an SLO failed, 1 an
 // error (bad file, bad option, a scenario the engine cannot run yet, or a run that observed
-// no step: no data is an error, not a pass). `run --replications N` exits with its median run's
-// code: 2 when some SLO's median run fails it (report::SloReplication), whatever the seeds that
-// passed. `sweep` reports numbers and judges none: 0 when every point ran, whatever its SLOs, 1 on
-// an error.
+// no step: no data is an error, not a pass). `run --replications N` judges each SLO by its own
+// median run (report::SloReplication), so two SLOs may be judged by two different seeds: it exits 2
+// when some SLO's median run fails it, whatever the seeds that passed. `sweep` reports numbers and
+// judges none: 0 when every point ran, whatever its SLOs, 1 on an error.
 #include <unistd.h>  // isatty, STDOUT_FILENO: POSIX, which is fine for this project
 #include <CLI/CLI.hpp>
 
@@ -334,7 +334,7 @@ void print_noiseless_note(const ReportOptions& options) {
 
 // `simsys run <file> --replications N`, N > 1, on a scenario with noise: N runs over the seeds
 // from the scenario's (or --seed's), on --jobs workers, printed as their median and band. The
-// exit code is the median run's (see the top of the file).
+// exit code is 2 when some SLO's median run fails it (see the top of the file).
 int run_replicated(const graph::Graph& g, int count, const RunArgs& args,
                    const ReportOptions& options) {
   const auto replications = static_cast<std::size_t>(count);
@@ -624,7 +624,8 @@ void add_run_options(CLI::App& run, RunArgs& args) {
                  "run N times over seeds seed .. seed+N-1 of the rate noise and print each "
                  "number's median and 10-90 % band (1 to 1000; default 1)");
   run.add_option("--jobs", args.jobs,
-                 "worker threads for --replications (default: the machine's hardware threads)")
+                 "worker threads for --replications, ignored without --replications (default: the "
+                 "machine's hardware threads)")
       ->check(CLI::Range(std::size_t{1}, simsys::sweep::max_jobs));
 }
 
