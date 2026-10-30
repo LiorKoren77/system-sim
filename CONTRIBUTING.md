@@ -13,7 +13,9 @@ unit (module, source or test file), add an inline comment that says:
 - what it replaces or improves over the pre-C++20 way,
 - why it is the right tool here.
 
-Keep it to 2–5 lines. Later uses in the same file need no comment. Example:
+Keep it to 2–5 lines. Later uses in the same file need no comment. A header included first in a
+translation unit, before the unit's own code (as `src/config/detail.hpp` in the `src/config/*.cpp`
+units), carries that unit's first-use comments for the constructs it uses. Example:
 
 ```cpp
 // C++23 std::expected<T, E>: a value-or-error return type. Replaces the old choice

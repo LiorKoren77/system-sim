@@ -43,8 +43,8 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   one live replica, below the quorum: those requests are lost (the closed form is pinned in
   `tests/theory/test_faults.cpp`). The run's fault block (after the SLO table) says it in three
   lines: nothing lost, no backlog, and every op's p99 and every machine's rho back within 1 % of
-  a twin of the run without the fault (stepped beside it) at the first step after it (the slower
-  quorum ends with the fault):
+  a twin of the run without the fault (stepped beside it) from the first step after it on (the
+  slower quorum ends with the fault):
 
   ```
   fault 00:10 node_down store for 3m

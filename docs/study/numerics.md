@@ -737,9 +737,18 @@ ended, so the waiting crowd decays at the same rate 1 / session, but **exactly**
 `end_waiting_sessions` multiplies it by e^(−dt / session) each step, so after a fault of length
 `for` there are C₀ e^(−for / session) left whatever the step. The users who tried to connect
 during the outage join them, each decaying from the moment it tried. When the fault clears the D
-still waiting come back evenly over W = `reconnect_within`:
+still waiting come back evenly over W = `reconnect_within`, and a user waiting for their turn goes
+on ending the session, so the one whose turn is u seconds into the window is still there with
+probability e^(−u / session) (the phase 3 review's decision 1):
 
-    connects = λ + D / W    for W seconds from the fault's end
+    connects(u) = λ + D / W · e^(−u / session)    for 0 ≤ u < W from the fault's end
+    back        = D · session / W · (1 − e^(−W / session))     the users who come back
+
+A step gets the integral of the storm over the part [a, b) of it the window covers, D / W ·
+session · (e^(−a / session) − e^(−b / session)), written e^(−a / session) · −expm1(−(b − a) /
+session) (`storm_in_step`): the difference of two exponentials this close (b − a = 1 s against a
+session of 1000 s) would lose three of its digits, which `expm1` keeps (§2). So the steps add up
+to `back` exactly, whatever the step.
 
 The probe is the theory test's (`tests/theory/test_gateways.cpp`, "The reconnect storm"): 100
 connects and 100 sends a second, `session: 1000s`, so C* = 100k; `heartbeat: 5s`, so the level
@@ -772,31 +781,32 @@ $ simsys run storm.yaml --series storm.csv
 ...
 fault 01:23:20 node_down gw for 1m
   during:   offered 200/s, served 0/s, lost 12k requests, backlog 0
-  after:    no backlog to drain, reconnect storm 99.33k connections over 30s, gw peak 72% at 01:24:49
-  recovery: back within 1% (every op's p99, every node's rho) at 01:31:45 (445s after the fault cleared)
+  after:    no backlog to drain, reconnect storm 97.89k users back over 30s, gw peak 70.8% at 01:24:49
+  recovery: back within 1% (every op's p99, every node's rho) at 01:24:50 (30s after the fault cleared)
 ```
 
-The fault drops C₀ = 99,327.89 connections (`--report json`'s `reconnect_storm_connections`: the
-level the 1 s Euler steps reach at 5000 s, 0.67 % short of C*). The gateway's row in `storm.csv`
-at the step that starts at 5060 s shows 3,512.14/s offered: the users' 100 sends and
-100 + D / 30 = 3,412.14 connects, 34.1 times the usual connect rate (the theory test pins
-D = 99,364.12), and no heartbeats yet, the level being 0. The block's 99.33k is the connections
-the fault dropped, not the users who come back. The peak is the storm's last step, not its first
-(5089 s, 01:24:49: 23,027.9/s, 72 % of 32k/s): the heartbeats of the recovering level (97,579 at
-the start of that step) keep growing while the storm's connects stay at D / 30. Over W = 300 s
-(`reconnect_within: 300s`) the same storm sends 100 + D / 300 = 431.21 connects a second, 4.3
-times the usual rate. A reconnect the gateway refuses (the cap) or drops (its room full) is tried
+The fault drops C₀ = 99,327.89 connections (the level the 1 s Euler steps reach at 5000 s, 0.67 %
+short of C*), and D = 99,364.12 users wait as it clears (the theory test pins both). The
+gateway's row in `storm.csv` at the step that starts at 5060 s shows 3,510.48/s offered: the
+users' 100 sends and 100 + 3,310.48 connects, 34.1 times the usual connect rate, and no
+heartbeats yet, the level being 0; the last storm step's connects are 3,215.86, e^(−29 / 1000)
+of the first's. The block's 97.89k (`--report json`'s `reconnect_storm_connections`,
+97,888.45) is `back`: 98.5 % of D, the rest having ended their sessions while they waited their
+turn (15 s on average). The peak is the storm's last step, not its first (5089 s, 01:24:49:
+22,658.3/s, 70.8 % of 32k/s): the heartbeats of the recovering level (96,212 at the start of that
+step) grow faster than the storm's connects fall. Over W = 300 s (`reconnect_within: 300s`) the
+same storm sends 100 + 331.05 connects a second at first, 4.3 times the usual rate, and 85.84k
+users come back. A reconnect the gateway refuses (the cap) or drops (its room full) is tried
 again after an exponential wait of mean W (a random wait in which short waits are the most
 likely and the average is W, the distribution a session's length has too): of R users retrying,
 R (1 − e^(−dt / W)) come back in a step (`retries_in_step`). The exponential is **memoryless**
 (the chance of coming back in the next step does not depend on how long a user has already
 waited), so R is one number whatever the moment each was refused.
 
-What the storm ignores, and the numbers above show: the storm's users end no session while they
-wait their turn within W, so after the storm the level stands above the fault-free twin's (on the
-probe 100,894 at 5090 s against the twin's 99,385.8, the same file without its `faults` line:
-1.5 % above), by about D · W / (2 · session) = 1,490 (a user waits W / 2 on average), and decays
-back with the session's time constant; that is what the fault block's `recovery` waits for
-(01:31:45 on the probe, 445 s after the fault cleared: the last number to come back is
-`presence`'s rho, which carries the heartbeats C / 5 and so follows the level, and 5505 s is the
-first step at which the level, 100,590, is within 1 % of the twin's 99,594.5).
+The thinning is what makes the storm end where the twin is: at 5090 s the level is 99,431.9
+against the twin's 99,385.8 (the same file without its `faults` line), 0.05 % above, and the
+fault block's `recovery` is that step, 01:24:50, 30 s after the fault cleared (the storm's
+length). Before the phase 3 review the storm's users ended no session while they waited their
+turn: the level stood 1.5 % above the twin's at the storm's end (100,894, about D · W / (2 ·
+session) = 1,490 too many, a user waiting W / 2 on average), decayed back with the session's time
+constant, and the block's recovery, 01:31:45 (445 s after the fault cleared), was that decay's.

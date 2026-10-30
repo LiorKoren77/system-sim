@@ -313,16 +313,21 @@ std::expected<int, ConfigError> read_retry_count(const Site& site, const YAML::N
 }
 
 // `retry_after: 250ms`: a positive wait, and only beside `retries`: a backoff with nothing to retry
-// is a mistake the author should hear about, as a `worker_pool` without `workers` is.
+// is a mistake the author should hear about, as a `worker_pool` without `workers` is. The sign is
+// read first, so that `-1s` gets the same message as `0s` (the duration reader would say "expected
+// a non-negative finite number", which does not tell that 0 is refused too).
 CheckResult read_retry_after(const Site& site, const YAML::Node& body,
                              std::optional<SimTime>& retry_after) {
+  const auto value = body["retry_after"];
+  // C++20 std::string::starts_with: a prefix test in one call, replacing `s.rfind("-", 0) == 0`.
+  if (value && value.IsScalar() && value.Scalar().starts_with('-')) {
+    return site.fail(value, "retry_after must be positive");
+  }
   if (auto read = read_optional_duration(site, body, "retry_after", retry_after); !read) {
     return read;
   }
   if (!retry_after) return {};
-  if (retry_after->count() <= 0) {
-    return site.fail(body["retry_after"], "retry_after must be positive");
-  }
+  if (retry_after->count() <= 0) return site.fail(value, "retry_after must be positive");
   if (!body["retries"]) return site.fail(body["retry_after"], "retry_after needs retries");
   return {};
 }

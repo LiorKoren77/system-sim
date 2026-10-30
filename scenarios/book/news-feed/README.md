@@ -167,7 +167,7 @@ every run is without it.
   ```
   nodes.fanout.workers  fanout_q.lag  fanout.mean_rho
   ---------------------------------------------------
-  8                            3.34m            0.631
+  8                            3.34m             0.63
   16                           101us            0.315
   24                            <1us             0.21
   32                            <1us            0.158

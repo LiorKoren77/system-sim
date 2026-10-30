@@ -1094,8 +1094,13 @@ the Release binary.
 5. **The fault block (Task 8; design §4.4).** The three lines per fault stand, but the baseline is
    not "the step before the fault": a scenario with faults is run **twice in lockstep**, the run
    and its fault-free twin (same seeds), and every figure compares the run with the twin's same
-   step. Recovery is the first step after the fault clears at which every client op's p99 and
-   every node's rho are within 1 % of the twin's (relative to the twin's value). Why (review items
+   step. Recovery is the step after the LAST step, from the fault's clearing on, at which some
+   client op's p99 or some node's rho is outside 1 % of the twin's (relative to the twin's value):
+   the block is written at the end of the run, so a step that crosses back within 1 % and leaves it
+   again does not count (corrected by the phase 3 review: the first step within 1 % had a gateway
+   recovered 0 s after its fault), and a run that ends outside is `not recovered`; the steps are
+   judged up to the scenario's next fault, where a record that is back is settled (the twin has no
+   fault at all, so the later fault's steps are its own). Why the twin (review items
    2–4): a fault at the run's first step has no step before it, a fault inside another has a
    broken one, and on a diurnal curve the step before is never "back" (a 5-minute outage at 15:00
    reported `not recovered`). The twin doubles a faulted run's cost and leaves a fault-free run
@@ -1178,14 +1183,19 @@ the Release binary.
     the faults have taken down (`down_share_` in the code; item 3), and the users' own connects
     that this smaller cap refuses are not retried (ignored, and documented so); two faults that
     strike one gateway in the same step split that step's drop in scenario order (pinned); the
-    storm's users end no session while they wait their turn in the window, so the level overshoots
-    the twin's by about `reconnect_within / 2 / session` of the storm (1.5 % on the numerics
-    note's probe; carried to the phase review); the block's peak is the offered utilisation
-    (demand / total capacity, uncapped) read over `[end, end + reconnect_within + one step]` and
-    named `peak_offered_rho` in JSON (items 4, 7). chat-system's 21:30 minute: 1.617M connections
-    storm back over 30 s, the tier peaks at 93.9 % at 21:31:29.9, and the run is back within 1 % of
-    its twin at 21:38:58.7. The block's count is the connections dropped, not the users who come
-    back (the two differ after a long fault; the schema says so).
+    block's peak is the offered utilisation (demand / total capacity, uncapped) read over
+    `[end, end + reconnect_within + one step]` and named `peak_offered_rho` in JSON (items 4, 7).
+    Corrected by the phase 3 review (decisions 1 and 8): a user waiting for their turn in the
+    window goes on ending the session, so the one whose turn is `u` into it is there with
+    probability `e^(−u/session)` (the storm's connects `D / W × e^(−u/session)`, a step getting
+    their integral over it), and `D × session / W × (1 − e^(−W/session))` come back; before, the
+    level overshot the twin's by about `W / 2 / session` of the storm. The block counts the users
+    who come back (the storm's connects that are the fault's users, each fault its share of a
+    storm that carries several) instead of the connections dropped; JSON's key keeps its name,
+    `reconnect_storm_connections`. chat-system's 21:30 minute: 1.551M users storm back over 30 s,
+    the tier peaks at 90.5 % at 21:31:29.9, and the run is back within 1 % of its twin at
+    21:31:30, as the storm ends (before the review: 1.617M connections, 93.9 %, 21:38:58.7, the
+    overshoot's decay).
 13. **google-drive (Task 16).** Its long polls are a gateway with a fixed `connections: 2M` (chosen:
     a fifth of the book's 10M daily users online at once) and `heartbeat: 60s` read as the poll's
     timeout, one re-poll a minute per device (33.33k/s);
