@@ -674,7 +674,7 @@ Carried to the phase review: an unbounded lag or backlog is written as JSON `nul
 "no lag"; the loader's `slo: queue_lag needs a message_queue node` message leaves out the
 frontier.
 
-- [ ] **3c push.** All fourteen scenarios run; CI green. The five-second-CPU scenario test is registered with `RUN_SERIAL` (`6173f62`, Task 16's note).
+- [x] **3c push** at `e5b35ad` (2026-10-30, CI run 41052919391 green, 1681 tests). All fourteen scenarios run. The five-second-CPU scenario test is registered with `RUN_SERIAL` (`6173f62`, Task 16's note).
 
 ---
 
