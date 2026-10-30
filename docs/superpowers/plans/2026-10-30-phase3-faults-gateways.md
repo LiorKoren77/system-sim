@@ -775,7 +775,20 @@ says Euler at 1 s is high, not low; the recovery rule → the step after the LAS
 of the twin (a crossing no longer counts; the block is written at the end of the run, so the
 whole run is known), schema and spec §20 updated; the per-seed JSON under `--replications` gains
 `deduplicated_per_s`.
-- [ ] Fix round; commit; push; CI.
+Fixed at `e9ff8fa` (1686 tests; fault-free scenarios byte-identical but `explain`'s kv_cluster note;
+kv-store, consistent-hashing and news-feed unchanged under the new recovery rule, recovery lines
+included). Beyond the decisions: a fault that is back within 1 % when the scenario's next fault
+strikes counts as recovered then (otherwise a later fault would push an earlier one's recovery
+back, since the twin has no faults; the "two faults declared out of order" test caught it); the
+gateway reports per step how many users each fault's storm brought back, the fault log sums them
+per fault (a retried reconnect is one user; faults clearing in one step share the storm pro rata;
+the old same-step drop-sharing code is gone); the JSON key `reconnect_storm_connections` keeps its
+name and holds the users back. chat-system re-measured: 1.551M users back over 30 s, peak 90.5 %
+at 21:31:29.9, back within 1 % at 21:31:30 (30 s after, the storm's end; was 478.7 s), presence
+peak rho 0.8038, connections peak 1.620M; the `reconnect_within` sweep's rows from 20 s on recover
+at their storm's end (peaks 95.8..85.3 %), 10 s peaks at 110 %; the numerics probe 97.89k users
+back, peak 70.8 %, back 30 s after.
+- [x] Fix round at `e9ff8fa`; push; CI (below).
 
 ## Phase 4 backlog
 
