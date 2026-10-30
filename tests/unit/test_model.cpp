@@ -5,6 +5,8 @@
 #include <array>
 #include <chrono>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 // C++20 `import`: brings the module's exported names into this translation unit without
@@ -290,4 +292,54 @@ TEST_CASE("a search index's build interval is a typed duration", "[model]") {
   simsys::model::NodeSpec index{.id = "trie_db", .type = NodeType::search_index};
   index.build_interval = 168h;  // search-autocomplete's file: rebuilt every week
   REQUIRE(*index.build_interval == 168h);
+}
+
+// ---- Scripted faults (phase 3b, design spec 4.1) ----
+//
+// A fault is a scripted event the scenario lists under `faults:`: at a time, a node goes down,
+// slows, loses capacity, a cache is flushed, a client's traffic spikes, or a whole datacenter is
+// lost. The model only carries it; the loader fills it and the engine applies it.
+TEST_CASE("a default Scenario scripts no faults", "[model]") {
+  const simsys::model::Scenario s{};
+  REQUIRE(s.faults.empty());
+}
+
+TEST_CASE("the fault kind table round-trips and ends at its last enumerator", "[model]") {
+  using simsys::model::FaultKind;
+  // The same compile-time proof as every other name table (see the test above): a duplicated or
+  // misordered row, or an enumerator appended without a row, breaks the build.
+  static_assert(simsys::core::round_trips(simsys::model::fault_kind_table));
+  static_assert(simsys::model::fault_kind_table.back().value == FaultKind::dc_down);
+  SUCCEED();
+}
+
+TEST_CASE("every fault kind name round-trips through parse_fault_kind and to_string", "[model]") {
+  using simsys::model::FaultKind;
+  const std::pair<FaultKind, std::string_view> kinds[] = {
+      {FaultKind::node_down, "node_down"},         {FaultKind::capacity, "capacity"},
+      {FaultKind::latency_spike, "latency_spike"}, {FaultKind::cache_flush, "cache_flush"},
+      {FaultKind::traffic_spike, "traffic_spike"}, {FaultKind::dc_down, "dc_down"},
+  };
+  for (const auto& [kind, name] : kinds) {
+    CAPTURE(name);
+    REQUIRE(simsys::model::to_string(kind) == name);
+    REQUIRE(simsys::model::parse_fault_kind(name) == kind);
+  }
+}
+
+TEST_CASE("parse_fault_kind rejects a kind the schema does not have", "[model]") {
+  // `partition` is on the backlog (kv_cluster partitions), not a kind of phase 3.
+  REQUIRE_FALSE(simsys::model::parse_fault_kind("partition").has_value());
+  REQUIRE_FALSE(simsys::model::parse_fault_kind("").has_value());
+}
+
+TEST_CASE("a Fault carries what breaks, where, when and for how long", "[model]") {
+  using simsys::model::FaultKind;
+  // The field names are the schema's keys (`for` is a C++ keyword, so `duration`).
+  const simsys::model::Fault f{
+      .kind = FaultKind::node_down, .at = 21h + 30min, .duration = 1min, .node = "chat_servers"};
+  REQUIRE(f.kind == FaultKind::node_down);
+  REQUIRE(f.at == 21h + 30min);
+  REQUIRE(f.duration == 1min);
+  REQUIRE(f.node == "chat_servers");
 }

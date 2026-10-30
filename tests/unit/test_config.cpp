@@ -4336,3 +4336,425 @@ TEST_CASE("an over that is not a duration is refused, naming over and duration")
                             {"over", "duration"});
   }
 }
+
+// ---- Phase 3b: the `faults` list, typed and validated (design spec 4.1) ----------------------
+//
+// A fault is a scripted event: at a time, something breaks for a while (a tier goes down, a
+// service slows, a cache is flushed, a client's traffic spikes, a datacenter is lost). The
+// loader turns each entry of the top-level `faults:` list into a model::Fault and refuses
+// every combination of keys that means nothing, naming the entry by its position
+// ("faults[2]: ..."). These tests pin what each kind reads and what each refusal says; what the
+// engine does with a fault is the theory tests' business.
+namespace {
+
+// One scenario every fault test builds on: a 24 h run over two datacenters with one node of each
+// kind a fault can name (a client; a service of 4 replicas; a SQL database; a cache; a CDN).
+// `faults` is the text after `faults:`, a YAML list written in flow style.
+std::string faults_scenario(std::string_view faults) {
+  return "version: 1\nname: t\nduration: 24h\n"
+         "datacenters:\n  us: {}\n  eu: {}\n"
+         "nodes:\n"
+         "  users: {type: client, dc: us, rate: {base: 100/s}, ops: {read: 1}}\n"
+         "  api: {type: service, dc: us, replicas: 4, capacity: 1k/s}\n"
+         "  db: {type: sql_db, dc: eu, replicas: 3}\n"
+         "  cache: {type: cache, dc: us, hit_ratio: {fixed: 0.5}}\n"
+         "  edge: {type: cdn, dc: us, origin: api}\n"
+         "links: []\n"
+         "faults: " +
+         std::string{faults} + "\n";
+}
+
+// Loads `yaml`, which must be accepted, and returns the typed faults in document order.
+std::vector<simsys::model::Fault> load_faults(std::string_view file_name, std::string_view yaml) {
+  CAPTURE(yaml);
+  const auto path = write_temp(file_name, yaml);
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  return s->faults;
+}
+
+// Three valid entries that put the entry under test at faults[3] (or faults[2] with two of them).
+constexpr std::string_view valid_node_down = "{at: 01:00, kind: node_down, node: api, for: 1m}";
+constexpr std::string_view valid_latency_spike =
+    "{at: 02:00, kind: latency_spike, node: api, extra: 5ms, for: 1m}";
+constexpr std::string_view valid_traffic_spike =
+    "{at: 03:00, kind: traffic_spike, node: users, factor: 2, for: 1m}";
+
+// `[a, b, entry]`: the entry under test comes after the valid ones, so its message carries its
+// position in the list.
+std::string after(std::initializer_list<std::string_view> valid, std::string_view entry) {
+  std::string list = "[";
+  for (const auto v : valid) list += std::string{v} + ", ";
+  return list + std::string{entry} + "]";
+}
+
+}  // namespace
+
+TEST_CASE("a scenario without faults loads with an empty fault list") {
+  const auto path = write_temp("simsys_faults_absent.yaml",
+                               "version: 1\nname: t\nduration: 1m\nnodes:\n  a: {type: service}\n"
+                               "links: []\n");
+  const auto s = simsys::config::load(path.string());
+  INFO((s ? "" : s.error().message));
+  REQUIRE(s.has_value());
+  REQUIRE(s->faults.empty());
+}
+
+TEST_CASE("an empty faults list loads as no faults") {
+  REQUIRE(load_faults("simsys_faults_empty.yaml", faults_scenario("[]")).empty());
+}
+
+// ---- Each kind loads with the keys it reads --------------------------------------------------
+
+TEST_CASE("a node_down fault loads its node, start and length") {
+  using simsys::model::FaultKind;
+  const auto faults =
+      load_faults("simsys_fault_node_down.yaml",
+                  faults_scenario("[{at: 21:30, kind: node_down, node: api, for: 1m}]"));
+  REQUIRE(faults.size() == 1);
+  CHECK(faults[0].kind == FaultKind::node_down);
+  CHECK(faults[0].at == 21h + 30min);
+  CHECK(faults[0].duration == 1min);
+  CHECK(faults[0].node == "api");
+}
+
+TEST_CASE("a node_down fault may take a count of replicas, or the primary of a sql_db") {
+  using simsys::model::FaultKind;
+  SECTION("a count of the node's replicas") {
+    const auto faults = load_faults(
+        "simsys_fault_replicas.yaml",
+        faults_scenario("[{at: 15:00, kind: node_down, node: api, replicas: 1, for: 30s}]"));
+    REQUIRE(faults.size() == 1);
+    CHECK(faults[0].kind == FaultKind::node_down);
+    CHECK(faults[0].replicas == 1);
+    CHECK(faults[0].duration == 30s);
+  }
+  SECTION("the whole node: replicas equal to its count is accepted") {
+    const auto faults = load_faults(
+        "simsys_fault_replicas_all.yaml",
+        faults_scenario("[{at: 15:00, kind: node_down, node: api, replicas: 4, for: 30s}]"));
+    REQUIRE(faults.size() == 1);
+    CHECK(faults[0].replicas == 4);
+  }
+  SECTION("the primary of a sql_db (the field name `primary` is the test's assumption)") {
+    const auto faults = load_faults(
+        "simsys_fault_primary.yaml",
+        faults_scenario("[{at: 15:00, kind: node_down, node: db, replicas: primary, for: 30s}]"));
+    REQUIRE(faults.size() == 1);
+    CHECK(faults[0].primary);
+  }
+}
+
+TEST_CASE("a latency_spike fault loads its node, the extra service time and its length") {
+  using simsys::model::FaultKind;
+  const auto faults = load_faults(
+      "simsys_fault_latency.yaml",
+      faults_scenario("[{at: 12:00, kind: latency_spike, node: api, extra: 50ms, for: 5m}]"));
+  REQUIRE(faults.size() == 1);
+  CHECK(faults[0].kind == FaultKind::latency_spike);
+  CHECK(faults[0].at == 12h);
+  CHECK(faults[0].node == "api");
+  CHECK(faults[0].extra == 50ms);
+  CHECK(faults[0].duration == 5min);
+}
+
+TEST_CASE("a capacity fault loads its node, the factor below 1 and its length") {
+  using simsys::model::FaultKind;
+  const auto faults = load_faults(
+      "simsys_fault_capacity.yaml",
+      faults_scenario("[{at: 03:00, kind: capacity, node: edge, factor: 0.5, for: 20m}]"));
+  REQUIRE(faults.size() == 1);
+  CHECK(faults[0].kind == FaultKind::capacity);
+  CHECK(faults[0].node == "edge");
+  CHECK(faults[0].factor == 0.5);
+  CHECK(faults[0].duration == 20min);
+}
+
+TEST_CASE("a cache_flush fault names a cache or a cdn and takes no length") {
+  using simsys::model::FaultKind;
+  SECTION("a cache") {
+    const auto faults =
+        load_faults("simsys_fault_flush_cache.yaml",
+                    faults_scenario("[{at: 09:00, kind: cache_flush, node: cache}]"));
+    REQUIRE(faults.size() == 1);
+    CHECK(faults[0].kind == FaultKind::cache_flush);
+    CHECK(faults[0].at == 9h);
+    CHECK(faults[0].node == "cache");
+  }
+  SECTION("a cdn") {
+    const auto faults =
+        load_faults("simsys_fault_flush_cdn.yaml",
+                    faults_scenario("[{at: 09:00, kind: cache_flush, node: edge}]"));
+    REQUIRE(faults.size() == 1);
+    CHECK(faults[0].node == "edge");
+  }
+}
+
+TEST_CASE("a traffic_spike fault loads its client, the factor and its length") {
+  using simsys::model::FaultKind;
+  const auto faults = load_faults(
+      "simsys_fault_traffic.yaml",
+      faults_scenario("[{at: 18:00, kind: traffic_spike, node: users, factor: 3, for: 10m}]"));
+  REQUIRE(faults.size() == 1);
+  CHECK(faults[0].kind == FaultKind::traffic_spike);
+  CHECK(faults[0].node == "users");
+  CHECK(faults[0].factor == 3.0);
+  CHECK(faults[0].duration == 10min);
+}
+
+TEST_CASE("a dc_down fault loads its datacenter and its length, and names no node") {
+  using simsys::model::FaultKind;
+  const auto faults =
+      load_faults("simsys_fault_dc_down.yaml",
+                  faults_scenario("[{at: 02:00, kind: dc_down, datacenter: eu, for: 2m}]"));
+  REQUIRE(faults.size() == 1);
+  CHECK(faults[0].kind == FaultKind::dc_down);
+  CHECK(faults[0].datacenter == "eu");
+  CHECK(faults[0].duration == 2min);
+  CHECK(faults[0].node.empty());
+}
+
+TEST_CASE("faults load in document order, each with its own kind") {
+  using simsys::model::FaultKind;
+  const auto faults = load_faults(
+      "simsys_faults_order.yaml",
+      faults_scenario(after({valid_node_down, valid_latency_spike}, valid_traffic_spike)));
+  REQUIRE(faults.size() == 3);
+  CHECK(faults[0].kind == FaultKind::node_down);
+  CHECK(faults[1].kind == FaultKind::latency_spike);
+  CHECK(faults[2].kind == FaultKind::traffic_spike);
+}
+
+// ---- `at`: a clock time or a duration from the start, inside the run --------------------------
+
+TEST_CASE("a fault's at is a clock time or a duration from the start of the run") {
+  SECTION("a clock time: 21:30 is 21 h 30 min after the start (t = 0 is midnight)") {
+    const auto faults =
+        load_faults("simsys_fault_at_clock.yaml",
+                    faults_scenario("[{at: 21:30, kind: node_down, node: api, for: 1m}]"));
+    REQUIRE(faults.size() == 1);
+    CHECK(faults[0].at == 21h + 30min);
+  }
+  // A duration is one number and one unit ("90m"); the parser has no compound "1h30m".
+  SECTION("a duration: 90m") {
+    const auto faults =
+        load_faults("simsys_fault_at_duration.yaml",
+                    faults_scenario("[{at: 90m, kind: node_down, node: api, for: 1m}]"));
+    REQUIRE(faults.size() == 1);
+    CHECK(faults[0].at == 90min);
+  }
+  SECTION("the last minute of the run") {
+    const auto faults =
+        load_faults("simsys_fault_at_last.yaml",
+                    faults_scenario("[{at: 1439m, kind: node_down, node: api, for: 1m}]"));
+    REQUIRE(faults.size() == 1);
+    CHECK(faults[0].at == 1439min);
+  }
+}
+
+TEST_CASE("a fault that starts outside the run is refused") {
+  SECTION("beyond the end") {
+    require_rejected("simsys_fault_at_beyond.yaml",
+                     faults_scenario("[{at: 25h, kind: node_down, node: api, for: 1m}]"),
+                     "faults[0]: at must fall inside the run (24h)");
+  }
+  SECTION("exactly at the end: nothing would be left to run") {
+    require_rejected("simsys_fault_at_end.yaml",
+                     faults_scenario("[{at: 24h, kind: node_down, node: api, for: 1m}]"),
+                     "faults[0]: at must fall inside the run (24h)");
+  }
+}
+
+// ---- `for`: positive, and required except for cache_flush -------------------------------------
+
+TEST_CASE("a fault that lasts needs a for, and a for must be positive") {
+  SECTION("a node_down without for") {
+    require_rejected("simsys_fault_no_for.yaml",
+                     faults_scenario("[{at: 01:00, kind: node_down, node: api}]"),
+                     "faults[0]: node_down needs a for");
+  }
+  SECTION("a zero length") {
+    require_rejected("simsys_fault_for_zero.yaml",
+                     faults_scenario("[{at: 01:00, kind: node_down, node: api, for: 0s}]"),
+                     "faults[0]: for must be positive");
+  }
+}
+
+TEST_CASE("a cache_flush with a for is refused, because a flush is an instant") {
+  require_rejected("simsys_fault_flush_for.yaml",
+                   faults_scenario(after({valid_node_down, valid_latency_spike},
+                                         "{at: 09:00, kind: cache_flush, node: cache, for: 1m}")),
+                   "faults[2]: cache_flush takes no for");
+}
+
+// ---- `node`: declared, and of a type the kind can act on -------------------------------------
+
+TEST_CASE("a fault that names a node that is not declared is refused") {
+  require_rejected("simsys_fault_undeclared_node.yaml",
+                   faults_scenario("[{at: 01:00, kind: node_down, node: x, for: 1m}]"),
+                   "faults[0]: node 'x' is not declared");
+}
+
+TEST_CASE("a node_down on a client is refused, because clients emit and do not serve") {
+  require_rejected("simsys_fault_down_client.yaml",
+                   faults_scenario("[{at: 01:00, kind: node_down, node: users, for: 1m}]"),
+                   "faults[0]: node_down cannot name a client (clients emit, they do not serve)");
+}
+
+TEST_CASE("a traffic_spike must name a client") {
+  require_rejected(
+      "simsys_fault_spike_service.yaml",
+      faults_scenario("[{at: 01:00, kind: traffic_spike, node: api, factor: 2, for: 1m}]"),
+      "faults[0]: traffic_spike needs a client, 'api' is a service");
+}
+
+TEST_CASE("a cache_flush must name a cache or a cdn") {
+  require_rejected("simsys_fault_flush_service.yaml",
+                   faults_scenario("[{at: 01:00, kind: cache_flush, node: api}]"),
+                   "faults[0]: cache_flush needs a cache or cdn, 'api' is a service");
+}
+
+TEST_CASE("a fault of a kind that names a node needs one") {
+  require_rejected("simsys_fault_no_node.yaml",
+                   faults_scenario("[{at: 01:00, kind: node_down, for: 1m}]"),
+                   "faults[0]: node_down needs a node");
+}
+
+// ---- `replicas` and `primary` -----------------------------------------------------------------
+
+TEST_CASE("replicas belongs to node_down only") {
+  require_rejected(
+      "simsys_fault_replicas_other_kind.yaml",
+      faults_scenario(
+          "[{at: 01:00, kind: latency_spike, node: api, extra: 5ms, replicas: 1, for: 1m}]"),
+      "faults[0]: replicas applies to node_down only");
+}
+
+TEST_CASE("replicas is a positive count at most the node's replicas") {
+  SECTION("more than the node has") {
+    require_rejected(
+        "simsys_fault_replicas_many.yaml",
+        faults_scenario("[{at: 01:00, kind: node_down, node: api, replicas: 5, for: 1m}]"),
+        "faults[0]: replicas 5 is more than node 'api' has (4)");
+  }
+  SECTION("zero") {
+    require_rejected(
+        "simsys_fault_replicas_zero.yaml",
+        faults_scenario("[{at: 01:00, kind: node_down, node: api, replicas: 0, for: 1m}]"),
+        "faults[0]: replicas must be at least 1");
+  }
+}
+
+TEST_CASE("the primary is a sql_db's: on any other node it is refused") {
+  require_rejected(
+      "simsys_fault_primary_service.yaml",
+      faults_scenario("[{at: 01:00, kind: node_down, node: api, replicas: primary, for: 1m}]"),
+      "faults[0]: primary applies to a sql_db only");
+}
+
+// ---- `factor` ---------------------------------------------------------------------------------
+
+TEST_CASE("a capacity fault needs a factor strictly between 0 and 1") {
+  const auto capacity_message =
+      "faults[3]: capacity factor must be between 0 and 1 (a gain is the scenario's capacity)";
+  const auto three_valid = {valid_node_down, valid_latency_spike, valid_traffic_spike};
+  SECTION("no factor") {
+    require_rejected(
+        "simsys_fault_capacity_no_factor.yaml",
+        faults_scenario(after(three_valid, "{at: 04:00, kind: capacity, node: api, for: 1m}")),
+        "faults[3]: capacity needs a factor");
+  }
+  SECTION("a factor of 1 changes nothing") {
+    require_rejected(
+        "simsys_fault_capacity_one.yaml",
+        faults_scenario(
+            after(three_valid, "{at: 04:00, kind: capacity, node: api, factor: 1, for: 1m}")),
+        capacity_message);
+  }
+  SECTION("a factor above 1 is a gain") {
+    require_rejected(
+        "simsys_fault_capacity_gain.yaml",
+        faults_scenario(
+            after(three_valid, "{at: 04:00, kind: capacity, node: api, factor: 1.5, for: 1m}")),
+        capacity_message);
+  }
+  SECTION("a factor of 0 is node_down") {
+    require_rejected(
+        "simsys_fault_capacity_zero.yaml",
+        faults_scenario(
+            after(three_valid, "{at: 04:00, kind: capacity, node: api, factor: 0, for: 1m}")),
+        capacity_message);
+  }
+}
+
+TEST_CASE("a traffic_spike needs a positive factor") {
+  SECTION("no factor") {
+    require_rejected("simsys_fault_spike_no_factor.yaml",
+                     faults_scenario("[{at: 01:00, kind: traffic_spike, node: users, for: 1m}]"),
+                     "faults[0]: traffic_spike needs a factor");
+  }
+  SECTION("zero") {
+    require_rejected(
+        "simsys_fault_spike_zero.yaml",
+        faults_scenario("[{at: 01:00, kind: traffic_spike, node: users, factor: 0, for: 1m}]"),
+        "faults[0]: traffic_spike factor must be positive");
+  }
+  SECTION("negative") {
+    require_rejected(
+        "simsys_fault_spike_negative.yaml",
+        faults_scenario("[{at: 01:00, kind: traffic_spike, node: users, factor: -2, for: 1m}]"),
+        "faults[0]: traffic_spike factor must be positive");
+  }
+}
+
+// ---- `extra` and `datacenter` -----------------------------------------------------------------
+
+TEST_CASE("a latency_spike needs an extra that is a positive duration") {
+  SECTION("no extra") {
+    require_rejected("simsys_fault_latency_no_extra.yaml",
+                     faults_scenario("[{at: 01:00, kind: latency_spike, node: api, for: 1m}]"),
+                     "faults[0]: latency_spike needs an extra");
+  }
+  SECTION("zero") {
+    require_rejected(
+        "simsys_fault_latency_zero.yaml",
+        faults_scenario("[{at: 01:00, kind: latency_spike, node: api, extra: 0ms, for: 1m}]"),
+        "faults[0]: extra must be positive");
+  }
+}
+
+TEST_CASE("a dc_down needs a declared datacenter") {
+  SECTION("one that is not declared") {
+    require_rejected("simsys_fault_dc_undeclared.yaml",
+                     faults_scenario("[{at: 01:00, kind: dc_down, datacenter: mars, for: 1m}]"),
+                     "faults[0]: datacenter 'mars' is not declared");
+  }
+  SECTION("none") {
+    require_rejected("simsys_fault_dc_none.yaml",
+                     faults_scenario("[{at: 01:00, kind: dc_down, for: 1m}]"),
+                     "faults[0]: dc_down needs a datacenter");
+  }
+}
+
+// ---- Kinds and keys the schema does not have --------------------------------------------------
+
+TEST_CASE("a partition fault is refused: phase 3 does not model partitions") {
+  require_rejected("simsys_fault_partition.yaml",
+                   faults_scenario("[{at: 01:00, kind: partition, node: api, for: 1m}]"),
+                   "faults[0]: partition is not modelled in phase 3 (see the backlog)");
+}
+
+TEST_CASE("a misspelt key in a fault is refused, like in every other map") {
+  require_rejected("simsys_fault_typo.yaml",
+                   faults_scenario("[{at: 01:00, kind: node_down, node: api, for: 1m, nod: api}]"),
+                   "faults[0]: unknown key 'nod'");
+}
+
+// A scalar `faults: 5` is pinned earlier ("faults must be a list"); a map is the likelier slip, one
+// fault written without the dash.
+TEST_CASE("faults written as one map instead of a list of them is refused") {
+  require_rejected("simsys_faults_map.yaml",
+                   faults_scenario("{at: 01:00, kind: node_down, node: api, for: 1m}"),
+                   "faults must be a list");
+}

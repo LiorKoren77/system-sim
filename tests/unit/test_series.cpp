@@ -1256,3 +1256,23 @@ TEST_CASE("explain describes youtube's transcode queue and transcoders", "[serie
   REQUIRE(queue.contains("retention=7d (default: Kafka's 168 h)"));
   REQUIRE(queue.contains("partitions=32 (not modelled)"));
 }
+
+// chat-system scripts one fault: its gateway tier (`chat_servers`) down at 21:30 for a minute, the
+// reconnect storm of book ch. 12. `explain` lists the scripted faults so a reader sees them before
+// running: a count, then each one as `kind node at for length`. A scenario that scripts none
+// prints no line at all (not `faults: none`), so every earlier scenario's explain is unchanged.
+TEST_CASE("explain lists chat-system's scripted fault", "[series]") {
+  const auto text = explain_shipped("chat-system");
+  CAPTURE(text);
+  REQUIRE(text.contains("faults: 1 scripted (node_down chat_servers 21:30 for 1m)"));
+}
+
+TEST_CASE("explain prints no faults line for a scenario without faults", "[series]") {
+  const auto loaded =
+      simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/tutorial/hello/scenario.yaml");
+  INFO((loaded ? "" : loaded.error().message));
+  REQUIRE(loaded.has_value());
+  const auto text = simsys::report::render_explain(graph_of(*loaded));
+  CAPTURE(text);
+  REQUIRE_FALSE(text.contains("faults:"));
+}
