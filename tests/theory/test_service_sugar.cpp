@@ -1,4 +1,6 @@
 // Whole-simulation checks against closed-form queueing theory (spec §12).
+// Spec entries pinned here: §18 entry 12 and §19 entry 10 (the id generator and the search index as
+// service sugar).
 // This file: the id generator and the search index, two node types that are a service with their
 // own defaults (service sugar). One of the nine files the theory tests are split into by topic; the
 // scenario builders more than one of them needs live in tests/support/fixtures.cppm (module

@@ -58,6 +58,12 @@ namespace simsys::config::detail {
 // the seeded `noise` process. The range rules below keep every term's multiplier finite
 // and non-negative, so no rate the engine computes from them can be negative or infinite.
 
+// Unnamed namespace: the helpers in these blocks are this unit's own (internal linkage).
+// Outside it a function of a module implementation unit has module linkage, so every unit
+// of simsys.config could call it and the linker sees its name; only what detail.hpp declares
+// is shared between the units.
+namespace {
+
 constexpr std::string_view rate_keys = "base wave spikes ramp points noise";
 // The keys of each curve block; every one of them is required.
 constexpr std::string_view wave_keys = "shape period amplitude peak_at";
@@ -80,12 +86,16 @@ std::expected<Rate, ConfigError> check_rate_bounded(const Site& site, const YAML
   return site.fail(at, std::format("{} must be at most 1e15/s", label));
 }
 
+}  // namespace
+
 std::expected<Rate, ConfigError> read_bounded_rate(const Site& site, const YAML::Node& parent,
                                                    std::string_view key, std::string_view label) {
   return parse_key(site, parent, key, label, parse_rate).and_then([&](Rate rate) {
     return check_rate_bounded(site, parent[std::string{key}], label, rate);
   });
 }
+
+namespace {
 
 // The words of a space-separated list, in order.
 std::vector<std::string> words_of(std::string_view words) {
@@ -527,6 +537,8 @@ std::expected<OpShares, ConfigError> read_op_shares(const Site& site, const YAML
   return check_shares_sum_to_one(site, ops, *shares).transform([&] { return std::move(*shares); });
 }
 
+}  // namespace
+
 // A count as the scenarios write cache sizes and key spaces: a positive integer with an optional SI
 // suffix k, M or G (x 1e3, 1e6, 1e9; the same letters a rate uses, without "/s"): 500, 10k, 20M,
 // 10G. Nothing for anything else (a fraction, a sign, an overflow of 64 bits). A local
@@ -552,6 +564,8 @@ std::optional<std::int64_t> parse_count(std::string_view text) {
 }
 
 // ---- Client keys (spec §18 entry 1) ----
+
+namespace {
 
 constexpr std::string_view client_keys_keys = "zipf space uniform";
 
@@ -606,11 +620,15 @@ CheckResult read_client_keys(const Site& site, const YAML::Node& body, model::Wo
   });
 }
 
+}  // namespace
+
 // True when the client sends `op`, i.e. it has a share in the client's op mix.
 bool sends_op(const model::Workload& workload, std::string_view op) {
   // C++20 std::views::keys: a view of each pair's first member (the op name).
   return std::ranges::contains(workload.op_shares | std::views::keys, op);
 }
+
+namespace {
 
 // One entry of `sizes: {stream: 50MB}`: an op the client sends, and its size.
 std::expected<std::pair<std::string, Bytes>, ConfigError> read_op_size(
@@ -646,6 +664,8 @@ CheckResult read_client_sizes(const Site& site, const YAML::Node& body, model::W
         workload.sizes = std::ranges::to<std::map<std::string, Bytes>>(entries);
       });
 }
+
+}  // namespace
 
 std::expected<model::Workload, ConfigError> read_workload(const Site& site,
                                                           const YAML::Node& body) {

@@ -5,18 +5,18 @@
 | Construct | Where (file: function) |
 |---|---|
 | `ranges::lower_bound` + member projection | `src/flow/flow.cppm`: `Flow::position_of` |
-| `ranges::find` + member projection | `src/config/config.cpp`: `find_advanced_number`; `src/report/report.cpp`: `mean_utilization`; `src/engine/behaviours.cppm`: `ClientBehaviour` constructor |
-| `ranges::find` + lambda projection | `src/engine/graph.cppm`: `Graph::index_of` |
-| `ranges::find_if_not` + member projection | `graph.cppm`: `detail::check_ring_only` (`&KeyArrival::sender`) |
-| `ranges::sort` (+ projection) | `graph.cppm`: `detail::find_async_hops`; `behaviours.cppm`: `detail::sort_by_destination`, the `ClientBehaviour` constructor; `config.cpp`: `read_op_shares` |
-| `ranges::unique`, `ranges::binary_search` | `graph.cppm`: `detail::find_async_hops`, `Graph::is_async_hop`, `op_cost`; `behaviours.cppm`: `ClientBehaviour::response` |
-| `views::values`, `views::keys`, `views::join` | `graph.cppm`: `Graph::connect_steps`, `Graph::route_clients`, `detail::call_roots`; `config.cpp`: `sends_op` |
-| C++23 `views::chunk_by` | `graph.cppm`: `Graph::resolve_request_sizes` (with `detail::same_op`, the fifth GCC defect's workaround, below) |
-| `views::split` + `ranges::any_of` | `config.cpp`: `lists_word` |
+| `ranges::find` + member projection | `src/config/nodes.cpp`: `find_advanced_number`; `src/report/report.cpp`: `mean_utilization`; `src/engine/behaviours.cppm`: `ClientBehaviour` constructor |
+| `ranges::find` + lambda projection | `src/engine/graph.cpp`: `Graph::index_of` |
+| `ranges::find_if_not` + member projection | `graph.cpp`: `detail::check_ring_only` (`&KeyArrival::sender`) |
+| `ranges::sort` (+ projection) | `graph.cpp`: `detail::find_async_hops`; `behaviours.cppm`: `detail::sort_by_destination`, the `ClientBehaviour` constructor; `src/config/workload.cpp`: `read_op_shares` |
+| `ranges::unique`, `ranges::binary_search` | `graph.cpp`: `detail::find_async_hops`, `Graph::is_async_hop`, `op_cost`; `behaviours.cppm`: `ClientBehaviour::response` |
+| `views::values`, `views::keys`, `views::join` | `graph.cpp`: `Graph::connect_steps`, `Graph::route_clients`, `detail::call_roots`; `workload.cpp`: `sends_op` |
+| C++23 `views::chunk_by` | `graph.cpp`: `Graph::resolve_request_sizes` (with `detail::same_op`, the fifth GCC defect's workaround, below) |
+| `views::split` + `ranges::any_of` | `src/config/detail.cpp`: `lists_word` |
 | `views::reverse` | `src/engine/engine.cppm`: `Simulation::backward_pass` |
-| C++23 `ranges::contains` | `graph.cppm`: `carries_op`, `Graph::add_edge`; `config.cpp`: `read_dc`, `sends_op`; `engine.cppm`: `add_once`; `behaviours.cppm`: `SqlDbBehaviour::is_write` |
-| C++23 `ranges::fold_left` | `config.cpp`: `check_shares_sum_to_one`; `report.cpp`: `forward_limited`, `paper_pass`; `behaviours.cppm`: `RateLimiterBehaviour::admit_sliding_log` |
-| C++23 `ranges::to`, `views::join_with`, `views::zip` | `report.cpp`: `join`, `map_to_strings`, `Summary::observe`, `explain_links`; `config.cpp`: `read_client_sizes` (`ranges::to<std::map>`) |
+| C++23 `ranges::contains` | `graph.cpp`: `carries_op`, `Graph::add_edge`; `nodes.cpp`: `read_dc`; `workload.cpp`: `sends_op`; `engine.cppm`: `add_once`; `behaviours.cppm`: `SqlDbBehaviour::is_write` |
+| C++23 `ranges::fold_left` | `workload.cpp`: `check_shares_sum_to_one`; `src/report/explain.cpp`: `forward_limited`, `paper_pass`; `behaviours.cppm`: `RateLimiterBehaviour::admit_sliding_log` |
+| C++23 `ranges::to`, `views::join_with`, `views::zip` | `src/report/shared.cppm`: `join`; `report.cpp`: `map_to_strings`, `Summary::observe`; `explain.cpp`: `explain_links`; `workload.cpp`: `read_client_sizes` (`ranges::to<std::map>`) |
 
 ## What
 
@@ -30,7 +30,7 @@ Two halves, both in `<ranges>` / `<algorithm>` under `std::ranges`:
   is computed or copied until the loop pulls an element.
 
 ```cpp
-// graph.cppm, Graph::connect_steps: every step of every op, in one loop
+// graph.cpp, Graph::connect_steps: every step of every op, in one loop
 for (const model::Step& step : spec.ops | std::views::values | std::views::join) { ... }
 
 // flow.cppm, Flow::position_of: binary search by op name, no comparator lambda
@@ -98,7 +98,7 @@ copying a single step.
   `views::chunk_by`, which starts a new chunk wherever two neighbours fail a predicate:
 
   ```cpp
-  // graph.cppm, Graph::resolve_request_sizes
+  // graph.cpp, Graph::resolve_request_sizes
   for (const auto op_arrivals : walk.at_nodes[node] | std::views::chunk_by(detail::same_op)) {
     const std::span<const detail::SizeArrival> one_op{op_arrivals};
     ...

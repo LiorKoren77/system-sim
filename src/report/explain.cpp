@@ -5,8 +5,8 @@
 // paper, without queueing. A separate concern from the run's summaries and renderers, which stay in
 // report.cpp (phase 3a split it out of that file's 3,249 lines).
 //
-// The helpers both units need (number formatting, zone names, the aligned text table, the run's
-// clock) are shared through the module implementation partition simsys.report:shared
+// The helpers both units need (number formatting, the run's clock, zone names, the aligned text
+// table) are shared through the module implementation partition simsys.report:shared
 // (shared.cppm), not a header: see the top of that file for why.
 module;
 #include <algorithm>
@@ -14,7 +14,6 @@ module;
 #include <charconv>
 #include <cmath>
 #include <cstddef>
-#include <cstdint>
 #include <deque>
 #include <functional>
 #include <map>
@@ -89,44 +88,6 @@ namespace {
 }
 
 // ---- the rate curve in one line ----
-
-[[nodiscard]] std::string two_digits(std::int64_t value) {
-  return (value < 10 ? "0" : "") + std::to_string(value);
-}
-
-}  // namespace
-
-// The run's clock: module linkage (outside the anonymous namespace), declared in :shared, because
-// report.cpp prints an SLO window's start with window_clock.
-
-// A point in simulated time as a scenario writes it: "20:00" for a whole minute of the first day (t
-// = 0 is midnight, spec §17 entry 1), otherwise a duration ("36h", "90s"). Integer nanoseconds, so
-// 19:59:59.9 is never rounded to "20:00".
-[[nodiscard]] std::string clock_or_duration(SimTime t) {
-  constexpr auto minute_ns = (1_min).count();
-  constexpr auto day_ns = (24_h).count();
-  const auto ns = t.count();
-  if (ns < 0 || ns >= day_ns || ns % minute_ns != 0) return format_duration(t);
-  const auto minutes = ns / minute_ns;
-  return two_digits(minutes / 60) + ":" + two_digits(minutes % 60);
-}
-
-// A window's start on the run's clock: explain's HH:MM for a whole minute of the first day,
-// HH:MM:SS for a whole second (a warmup of 1199 s starts the first window at 00:19:59, which
-// clock_or_duration would round to "20m"), else the exact duration from the start of the run
-// ("1500ms"; "1502m" for 25:02, past the first day).
-[[nodiscard]] std::string window_clock(SimTime t) {
-  constexpr auto second_ns = (1_s).count();
-  constexpr auto day_ns = (24_h).count();
-  const auto ns = t.count();
-  if (ns < 0 || ns >= day_ns || ns % second_ns != 0) return describe_duration(t);
-  if (ns % (60 * second_ns) == 0) return clock_or_duration(t);
-  const auto total_s = ns / second_ns;
-  return two_digits(total_s / 3600) + ":" + two_digits(total_s / 60 % 60) + ":" +
-         two_digits(total_s % 60);
-}
-
-namespace {
 
 [[nodiscard]] std::string level_summary(const workload::RateCurve& curve) {
   if (!curve.points) return "base " + fmt_rate(curve.base.per_second);
@@ -344,6 +305,9 @@ template <class T>
 }
 
 // "u", "a, b": the clients a che hit ratio took its key distribution from.
+// C++20 std::span<const T>: a non-owning read-only view of contiguous elements (pointer + size).
+// Replaces a `const std::vector<T>&` (which forces the caller to own a vector) or a pointer and a
+// count; here the graph's index list is passed without a copy, whatever container holds it.
 [[nodiscard]] std::string client_ids(const graph::Graph& g, std::span<const std::size_t> clients) {
   std::vector<std::string> ids;
   for (const auto client : clients) ids.push_back(g.nodes()[client].spec.id);

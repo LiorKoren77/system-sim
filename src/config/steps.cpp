@@ -43,6 +43,12 @@ namespace simsys::config::detail {
 
 // ---- Steps: how a node forwards an op (docs/scenario-schema.md, "step") ----------------
 
+// Unnamed namespace: the helpers in these blocks are this unit's own (internal linkage).
+// Outside it a function of a module implementation unit has module linkage, so every unit
+// of simsys.config could call it and the linker sees its name; only what detail.hpp declares
+// is shared between the units.
+namespace {
+
 constexpr std::string_view step_keys = "to op on mode factor size";
 
 CheckResult check_step_target(const StepScope& scope, const YAML::Node& step) {
@@ -149,6 +155,8 @@ CheckResult read_op_entry(const StepScope& scope, const YamlElement& entry, mode
     node.ops.emplace(std::move(*name), std::move(steps));
   });
 }
+
+}  // namespace
 
 // A forwarding node's `ops`: incoming op name -> the steps it triggers.
 CheckResult read_op_steps(const StepScope& scope, const YAML::Node& body, model::NodeSpec& node) {

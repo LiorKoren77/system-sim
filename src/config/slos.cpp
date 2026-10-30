@@ -49,6 +49,12 @@ namespace simsys::config::detail {
 // op; drop rate and utilization are ratios; queue lag (how far consumers trail producers)
 // and staleness (the age of the data served) are times.
 
+// Unnamed namespace: the helpers in these blocks are this unit's own (internal linkage).
+// Outside it a function of a module implementation unit has module linkage, so every unit
+// of simsys.config could call it and the linker sees its name; only what detail.hpp declares
+// is shared between the units.
+namespace {
+
 constexpr std::string_view slo_keys = "metric node op max over";
 
 using SloMaximum = decltype(model::SloSpec::max);
@@ -239,6 +245,8 @@ std::expected<model::SloSpec, ConfigError> read_slo(const Site& site, const YAML
   }
   return check_slo_shape(site, entry, slo, declared).transform([&] { return std::move(slo); });
 }
+
+}  // namespace
 
 // `run`: the scenario's header (duration, step, warmup), which bounds an SLO's `over`.
 std::expected<std::vector<model::SloSpec>, ConfigError> collect_slos(const Site& site,

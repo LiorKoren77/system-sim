@@ -5,13 +5,13 @@
 | Construct | Where (file: function) |
 |---|---|
 | `std::variant<SimTime, double>` | `src/model/model.cppm`: `SloSpec::max`, an SLO limit that is a duration or a ratio |
-| building the right alternative | `src/config/config.cpp`: `read_slo_max` (`SloMaximum{*time}` or `SloMaximum{*number}`, `using SloMaximum = decltype(model::SloSpec::max)`) |
+| building the right alternative | `src/config/slos.cpp`: `read_slo_max` (`SloMaximum{*time}` or `SloMaximum{*number}`, `using SloMaximum = decltype(model::SloSpec::max)`) |
 | `std::visit` + overload set | `src/report/report.cpp`: `limit_value`, `fmt_limit` |
 | `using Behaviour = std::variant<...>`, twelve alternatives | `src/engine/behaviours.cppm`, end of the exported namespace: `ClientBehaviour`, `ServiceBehaviour`, `LoadBalancerBehaviour`, `RateLimiterBehaviour`, `CacheBehaviour`, `SqlDbBehaviour`, `CdnBehaviour`, `BlobStoreBehaviour`, `MessageQueueBehaviour`, `WorkerPoolBehaviour`, `ExternalSinkBehaviour`, `KvClusterBehaviour` |
 | `std::visit` + overload set (a client lambda and one generic lambda for every server) | `src/engine/engine.cppm`: `Simulation::forward_pass`, `Simulation::backward_pass` |
 | `std::visit` with one generic lambda and `if constexpr (requires ...)` | `engine.cppm`: `megabyte_service_of` |
 | `std::get_if`, `std::holds_alternative` | `engine.cppm`: `Simulation::client_responses`, `is_write_at`, `failure_rate_of`, `report_machines`, `split_writes` |
-| `using HitRatioPolicy = std::variant<FixedHitRatio, CheHitRatio>` + `std::visit` | `src/engine/graph.cppm`: `detail::hit_ratio_over_arcs` |
+| `using HitRatioPolicy = std::variant<FixedHitRatio, CheHitRatio>` + `std::visit` | `src/engine/graph.cpp`: `detail::hit_ratio_over_arcs` |
 | the `Overloaded` helper | `simsys.core` (`src/core/core.cppm`), exported for `engine.cppm` and `report.cpp` |
 
 ## What

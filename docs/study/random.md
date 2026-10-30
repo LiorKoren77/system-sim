@@ -79,7 +79,7 @@ noise adds load as well as variability.
 - **`simsys curve --noise`** builds the same `NoiseProcess` with the same seed and ticks it
   at the scenario's step, so the printed path is the path `run` uses.
 - **The contract**: the same scenario, seed and standard library give byte-identical runs
-  (`tests/theory/test_theory.cpp`: "two runs with the same seed are identical and a
+  (`tests/theory/test_core.cpp`: "two runs with the same seed are identical and a
   different seed is not"). Across standard libraries the engine agrees and the normal
   values do not; GCC 14 with libstdc++ is the only supported toolchain.
 

@@ -732,7 +732,7 @@ TEST_CASE("the JSON's answered_per_s equals offered_per_s when nothing is droppe
 
 // ---- explain: load that the paper pass cannot follow is not a green verdict ----
 //
-// The paper load (report.cpp: paper_pass / forward_steps) forwards load from a client's routes,
+// The paper load (explain.cpp: paper_pass / forward_steps) forwards load from a client's routes,
 // from a service or worker over its `ops` steps, through load balancers and rate limiters over
 // their links (graph::forwards_by_link) and from caches and CDNs on misses (hits_or_misses). A
 // notification fan-out's and a URL frontier's `then` are not followed (types with no phase yet), so

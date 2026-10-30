@@ -44,6 +44,12 @@ namespace simsys::config::detail {
 
 // ---- Links ----------------------------------------------------------------------------
 
+// Unnamed namespace: the helpers in these blocks are this unit's own (internal linkage).
+// Outside it a function of a module implementation unit has module linkage, so every unit
+// of simsys.config could call it and the linker sees its name; only what detail.hpp declares
+// is shared between the units.
+namespace {
+
 constexpr std::string_view link_keys = "from to dir ops latency bandwidth weight";
 
 // A link is named by its ends before they are checked: "link a -> b" in every message.
@@ -215,6 +221,8 @@ std::expected<model::LinkSpec, ConfigError> read_unique_link(const Site& site,
   return link_site(site, spec->from, spec->to)
       .fail(link, "duplicate link (put several ops or a weight on one link)");
 }
+
+}  // namespace
 
 std::expected<std::vector<model::LinkSpec>, ConfigError> collect_links(
     const Site& site, const YAML::Node& links, const Declarations& declared) {

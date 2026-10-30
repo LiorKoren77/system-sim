@@ -1288,7 +1288,7 @@ void Simulation::require_scenario_step(SimTime dt) const {
 // (1/1024): the one limit left, f' > −2047, far steeper than any op calls one node (twenty calls
 // are −6.2). Five calls to `a` (3686/s, a room of one) at 1k/s settle at d = 0.9: load 4095, 10 %
 // dropped; ten and twenty calls at the capacity that makes d = 0.9 their fixed point settle there
-// too (tests/theory/test_theory.cpp). `run` cannot settle
+// too (tests/theory/test_failed_steps.cpp). `run` cannot settle
 // there in that case: its steps thin by the raw last step's fraction (the one-step lag), so it
 // shows a sawtooth, a step at 5000 offered and red alternating with one at 2988 and yellow, for the
 // whole run; its averages over many steps are not the fixed point either. The estimate of every
