@@ -282,16 +282,24 @@ earlier phases' chosen numbers (a waiting room of 1000, a cache's 100k/s, ...) a
 | a `notification_fanout`'s capacity and latency | 20k/s, 1 ms | `defaults::for_type` | a dedup lookup and a few in-memory publishes, a service's 1 ms of CPU; ten times a service's 2k/s, since the queues and the log store do the writing | notification-system runs on it with `replicas: 2`: `fanout  peak offered 27.93k/s vs 40k/s total capacity  (69.8%, green)` at the 09:00 blast |
 | a `frontier`'s capacity and latency (its prioritiser) | 10k/s, 1 ms | `defaults::for_type` | filing one URL in 1 ms on c = 10 servers | web-crawler states 10k/s, above the ~6.8k URLs/s its loop offers |
 
-The probes are small files that isolate one default; every number below is `simsys sweep`'s on
-them (Release build).
+The probes are small files that isolate one default; each is shown in full, and every number
+below is `simsys sweep`'s on it (Release build). Each probe **states the key it sweeps**, at its
+default: `sweep` replaces a value the file has and refuses a key the file leaves to the default
+(`--param: nodes.w.retry_after: no such key in the scenario`).
 
 **A client's `retry_after` decides whether its retries land inside an outage.** One client of
 100/s with `timeout: 100ms` and `retries: 2` into a service of 1k/s at 1 ms, down for 10 s from
 20 s in a 1-minute run:
 
 ```yaml
-users: {type: client, rate: {base: 100/s}, ops: {ping: 1.0}, timeout: 100ms, retries: 2, retry_after: 100ms}
-api:   {type: service, capacity: 1k/s, latency: 1ms}
+version: 1
+name: retry
+duration: 1m
+nodes:
+  users: {type: client, rate: {base: 100/s}, ops: {ping: 1.0}, timeout: 100ms, retries: 2, retry_after: 100ms}
+  api:   {type: service, capacity: 1k/s, latency: 1ms}
+links:
+  - {from: users, to: api, dir: inout}
 faults: [{at: 20s, kind: node_down, node: api, for: 10s}]
 ```
 
@@ -313,7 +321,23 @@ second retry of every such request comes after the service is back.
 **A pool's `retry_after` decides how much of an outage becomes dead letters.** A queue fed
 100 jobs/s, a pool of 10 workers at 10 ms with `retries: 3` calling a provider of 1k/s that fails
 2 % and has a room of 10 (`advanced: {queue_limit: 10}`), the provider down for 10 s from 30 s
-in a 2-minute run:
+in a 2-minute run; `retry_after: 1s` is the default, stated so that `sweep` can vary it:
+
+```yaml
+version: 1
+name: pool
+duration: 2m
+nodes:
+  u: {type: client, rate: {base: 100/s}, ops: {job: 1.0}}
+  q: {type: message_queue}
+  w: {type: worker_pool, consumes: q, workers: 10, cost: 10ms, retries: 3, retry_after: 1s, then: [{to: p, op: send}]}
+  p: {type: external_sink, capacity: 1k/s, failure_rate: 0.02, advanced: {queue_limit: 10}}
+links:
+  - {from: u, to: q}
+  - {from: q, to: w}
+  - {from: w, to: p}
+faults: [{at: 30s, kind: node_down, node: p, for: 10s}]
+```
 
 ```
 $ simsys sweep pool.yaml --param nodes.w.retry_after=1s..6s:6 --metric w.dead_lettered q.lag w.mean_rho
@@ -329,11 +353,25 @@ nodes.w.retry_after  w.dead_lettered   q.lag  w.mean_rho
 
 With 3 retries 1 s apart a job is given up 3 s after its first failure, inside the 10 s outage:
 the outage becomes dead letters. Once the retries span the outage (3 × 4 s = 12 s) almost every
-job lands; without the outage the same pool dead-letters 1.56e-5 jobs/s, its provider's steady
-2 % run out of retries (0.02⁴ of the jobs).
+job lands; without the outage (the file without its `faults` line, `simsys run --report json`)
+the same pool dead-letters 1.56e-5 jobs/s, its provider's steady 2 % run out of retries (0.02⁴ of
+the jobs).
 
 **A gateway's `session` sets its level by Little's law.** 200/s, half of it `connect`, into a
-gateway with `heartbeat: 30s` and no cap, a 4-hour run at 1 s steps:
+gateway with `heartbeat: 30s` and no cap, a 4-hour run at 1 s steps; `session: 30m` is the
+default, stated so that `sweep` can vary it:
+
+```yaml
+version: 1
+name: session
+duration: 4h
+step: 1s
+nodes:
+  c: {type: client, rate: {base: 200/s}, ops: {connect: 0.5, send: 0.5}}
+  gw: {type: ws_gateway, heartbeat: 30s, session: 30m}
+links:
+  - {from: c, to: gw, dir: inout}
+```
 
 ```
 $ simsys sweep session.yaml --param nodes.gw.session=10m..50m:5 --metric gw.connections gw.mean_rho
@@ -352,7 +390,25 @@ session gives the same level only with more connects (chat-system's 6 minutes at
 
 **A discovery's `failover` is how long callers keep losing requests to a dead replica.** The
 theory test's probe (1k/s through `[{to: disc, op: lookup}, {to: svc, op: call}]` into 4 replicas
-of 1k/s, one down for 30 s from 10 s, a 60-second run):
+of 1k/s, one down for 30 s from 10 s, a 60-second run; `failover: 10s` is the default, stated so
+that `sweep` can vary it):
+
+```yaml
+version: 1
+name: discovery
+duration: 60s
+step: 100ms
+nodes:
+  c: {type: client, rate: {base: 1000/s}, ops: {call: 1.0}}
+  api: {type: service, capacity: 100k/s, latency: 1ms, ops: {call: [{to: disc, op: lookup}, {to: svc, op: call}]}}
+  disc: {type: service_discovery, failover: 10s}
+  svc: {type: service, capacity: 1k/s, latency: 1ms, replicas: 4, advanced: {queue_limit: 100}}
+links:
+  - {from: c, to: api, dir: inout, latency: 0s}
+  - {from: api, to: disc, dir: inout, latency: 0s}
+  - {from: api, to: svc, dir: inout, latency: 0s}
+faults: [{at: 10s, kind: node_down, node: svc, replicas: 1, for: 30s}]
+```
 
 ```
 $ simsys sweep failover.yaml --param nodes.disc.failover=5s..30s:6 --metric c.call.answered svc.drop_rate
@@ -534,14 +590,14 @@ byte-sized node's sizes, `sizes: stream 50MB`.
 | `service` | `ops`, `cost` | read and run |
 | `cache` | `hit_ratio`, `strategy`, `write_ops`, `backend`, `keys`, `eviction`, `ttl`, `then`, `cost` | read and run (fixed or `che` hit ratio), see [`cache`](#cache) |
 | `sql_db` | `replication_lag`, `shards` (int), `pool` (int connections), `write_ops`, `cost` | read and run (phase 2b), see [`sql_db`](#sql_db) |
-| `kv_cluster` | `nodes` (int, required), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap|cp`, `write_ops` | read and run (phase 2c), see [`kv_cluster`](#kv_cluster); `mode` printed, not modelled (partitions are in the phase 4 backlog); a `node_down` of some of its machines runs since phase 3 ([Faults](#faults)) |
+| `kv_cluster` | `nodes` (int, required), `vnodes`, `replication` N, `write_quorum` W, `read_quorum` R, `mode` `ap\|cp`, `write_ops` | read and run (phase 2c), see [`kv_cluster`](#kv_cluster); `mode` printed, not modelled (partitions are in the phase 4 backlog); a `node_down` of some of its machines runs since phase 3 ([Faults](#faults)) |
 | `message_queue` | `partitions`, `retention` | read and run (phase 2c), see [`message_queue` and `worker_pool`](#message_queue-and-worker_pool); `partitions` printed, not modelled |
 | `worker_pool` | `consumes` (queue node id, required), `workers`, `cost` (duration per job), `then`, `retries`, `retry_after` | `consumes`, `workers`, `cost` and `then` read and run (phase 2c), same section: the steps fire for every job it drains, `on: miss` and `on: failure` refused; `retries` and `retry_after` read and run (phase 3), same section: the jobs whose call to an external sink failed go back on the pool's queue, read again by this pool only, and the last attempt's failures are dead letters (the `dead_letter_rate` SLO) |
 | `blob_store` | `then`, `write_ops` (its byte-rate `capacity` is the common key) | the store runs, counting megabytes; `write_ops` read as a [cache's](#cache) (default `[write]`): the ops it acknowledges at their last byte, every other op answered at its first megabyte (youtube's `original_store` lists `upload`), shown by `explain` as `write_ops=upload`, with `(never arrives)` when none of them reaches the store. Its `then` steps run as **event notifications** (S3 event notifications; ch. 14's "transcoding starts when the upload completes"): every **write** the store serves (an op in its `write_ops`; not one it drops) sends `factor` requests of the step's op to its target, and a read sends nothing (S3 notifies on ObjectCreated and ObjectRemoved, never on a GET: 1000 views/s of a video start no transcode; notifying on reads is not modelled). They are **asynchronous**: the uploader's response and answered rate end at the store, and what the notified node drops counts in that node's drop rate only; `explain` follows them. A step `on: miss` (`node 'store': a blob store's then steps fire for every write it stores (on: miss needs a cache)`) or `on: failure` (`... (on: failure: an event follows no step to report on; failure steps fire in an op's step list)`) is refused, and so is any `mode` (`node 'store': a blob store's then steps are event notifications nobody waits for (mode orders the calls a request waits for)`); an event keeps the request's size when the step keeps its op, else it carries the step's `size:` or none. Ignored: event batching, the delivery delay (an event arrives after the link's latency), failed notifications |
 | `search_index` | `build_interval` (positive duration) | read and run (phase 2c), see [`search_index`](#search_index); `build_interval` printed, not modelled |
 | `ws_gateway` | `max_connections` (count), `heartbeat` (duration), `fanout` (avg recipients per message, ≥ 1), `connections` (count: a fixed level), `session` (duration), `reconnect_within` (duration), `ops` | read and run (phase 3), see [`ws_gateway`](#ws_gateway); `reconnect_within` paces the reconnect storm after a `node_down` or a `dc_down` (phase 3 Task 15) |
 | `service_discovery` | `failover` (positive duration) | read and run (phase 3), see [`service_discovery`](#service_discovery): a service answering `lookup`; `failover` (default 10 s, chosen) is how long its callers stay on a dead replica after a `node_down`; `node 'disc': failover must be positive`; on any other type `node 'api': key 'failover' is not valid for type 'service'` |
-| `id_generator` | `algorithm` `snowflake|ticket_server|uuid` (required) | read and run (phase 2b), see [`id_generator`](#id_generator) |
+| `id_generator` | `algorithm` `snowflake\|ticket_server\|uuid` (required) | read and run (phase 2b), see [`id_generator`](#id_generator) |
 | `external_sink` | `failure_rate` (0–1), `politeness` (rate per host) | read and run (phase 2c): a third party's API (ch. 10's APNs, FCM, SMS and e-mail providers), a leaf queue of the type's numbers (1k/s, 100 ms, service SCV 2.0) whose served requests fail at `failure_rate` f (default 0; outside [0, 1]: `node 's': failure_rate must be between 0 and 1`): `dropped += f × served`, `drain = (1 − f) × served`, so 500/s at f = 0.02 is answered 490/s and the failures count in the node's drop rate, never as rejections. `politeness` (a positive rate, `node 's': politeness must be positive`) caps the sink's drain at hosts × politeness, the `hosts` of the scenario's one [`frontier`](#frontier) (phase 3; `explain` prints `politeness=1/s (drain cap 10M/s: 10M hosts x 1/s)`). `then` and `ops` stay refused; a client's `retries` and a [worker pool's](#message_queue-and-worker_pool) send a failure again (the sink's drop rate leaves out the share of its drops that came from retrying pools) |
 | `notification_fanout` | `channels` (map channel name → message queue id), `dedup` (in [0, 1)), `then` | read and run (phase 3), see [`notification_fanout`](#notification_fanout) |
 | `frontier` | `politeness` (rate per host), `hosts` (int), `then` | read and run (phase 3), see [`frontier`](#frontier) |
@@ -2193,8 +2249,8 @@ at which every client op's p99 (the step's lognormal fit) and every node's rho a
 the twin's same step (relative to the twin's value), with how long after the end of the fault
 (`after the flush`) that was, or `not recovered by the end of the run`. It is the first such
 step, not the first of a run of them: numbers that cross the twin's on their way elsewhere meet
-the rule there (a gateway whose storm connects, in the first step after the fault, happen to load
-it as much as the lost connections' heartbeats would have reads as back at once, although the
+the rule there (in the first step after the fault a gateway's storm connects can load it exactly
+as much as the lost connections' heartbeats would have, so it reads as back at once although the
 storm's overshoot follows). Durations in the body are seconds with at most one decimal
 (`0.2s`, `10s`), but `over its max for`, a duration as the tables print one (`300ms`), and a
 `failover`, as `explain` prints it. The

@@ -1174,7 +1174,13 @@ the Release binary.
     refuses or drops is retried after an exponential wait of mean `reconnect_within` (item 5); a
     storm stops only when every replica goes down again (narrower than the decision: a partial
     fault keeps it going to the survivors, item 1); the cap during a fault is the survivors',
-    `max_connections × R × (1 − share down)` (item 3); the block's peak is the offered utilisation
+    `max_connections × R × (1 − share down)`, the share down being the fraction of the R replicas
+    the faults have taken down (`down_share_` in the code; item 3), and the users' own connects
+    that this smaller cap refuses are not retried (ignored, and documented so); two faults that
+    strike one gateway in the same step split that step's drop in scenario order (pinned); the
+    storm's users end no session while they wait their turn in the window, so the level overshoots
+    the twin's by about `reconnect_within / 2 / session` of the storm (1.5 % on the numerics
+    note's probe; carried to the phase review); the block's peak is the offered utilisation
     (demand / total capacity, uncapped) read over `[end, end + reconnect_within + one step]` and
     named `peak_offered_rho` in JSON (items 4, 7). chat-system's 21:30 minute: 1.617M connections
     storm back over 30 s, the tier peaks at 93.9 % at 21:31:29.9, and the run is back within 1 % of
@@ -1199,8 +1205,13 @@ the Release binary.
     frontier's pool room is **unbounded** (nothing is deleted unconsumed) and `estimate` reports
     an unbounded lag rather than dropping URLs (item 2); `explain` checks the frontier against
     `min(prioritiser, cap)` (item 3); a second consumer pool is refused (item 5); a sink's
-    `politeness` over a frontier without `hosts` is refused (item 6); the machinery that refused a
-    type without a model was deleted, since none is left (item 7). web-crawler exits 2 on purpose:
+    `politeness` over a frontier without `hosts` is refused (item 6); a sink's own `politeness`
+    is the same drain cap in front of it (a sink capped at 1000/s with 5k/s of its own reads rho
+    0.2, pinned); the machinery that refused a type without a model was deleted, since none is
+    left (item 7). The crawler was resized so that the frontier's lag is the lesson (`internet`
+    1k → 1M/s, the prioritiser 5k → 10k/s, the parser 20 → 25 replicas, `content_store`
+    400 MB/s → 1 GB/s; with only `internet` and `content_store` resized the prioritiser dropped
+    26 % and the parser sat at 95 %). web-crawler exits 2 on purpose:
     its loop gain is above 1, the downloaders sit at utilisation 1 and the frontier's lag reaches
     14.4 h against a 30-minute SLO.
 16. **What phase 3 leaves.** The phase 4 backlog (the plan's last section): kv_cluster partitions

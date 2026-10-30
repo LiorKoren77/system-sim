@@ -663,18 +663,22 @@ t_s,client,op,offered_per_s,attempts_per_s,answered_per_s,timed_out_per_s,mean_m
 
 1000, 1000 + 500, 1000 + 500 + 250, then 1.75 attempts per request for ever, 875 of the 1000
 requests a second answered (the series' `answered_per_s` counts the attempts the path delivered,
-which at the fixed point are the requests answered). The q here is the same in every step; in an
+which at the fixed point are the requests answered; a **fixed point** is a state that one more
+step leaves unchanged, here the attempts each step sends once the series has stopped growing). The q here is the same in every step; in an
 outage it is 1 while the outage lasts, every attempt fails, and the attempts climb to (n + 1) times
 the curve: the retry storm, capped by n.
 
 **Why q is not a constant.** More attempts load the path more, and a loaded path loses more: q
 depends on the attempts, which depend on q. `run` does not solve that: each step reads the share
-the path failed in the step it was sent (the feedback is one step late, like every thinning of
-section 6), and the storm shows as it happens. `estimate` wants the fixed point, the attempts A
+the path failed in the step it was sent (the feedback is one step late, like every thinning:
+the engine's word for a later hop being sent only the share its caller delivered, which a
+section 6 step computes from that step's drops), and the storm shows as it happens. `estimate` wants the fixed point, the attempts A
 with A = curve × (1 − q(A)^(n+1)) / (1 − q(A)). It iterates: each pass sends again what the pass
 before failed (`settling_copy` makes every backoff one pass, since at a fixed point the wait
-changes nothing), with q read off the **damped** delivered fractions of section 6, d̄ ← (1 − w) d̄ +
-w d, whose weight halves each time an average overshoots. More attempts can only raise q, so the
+changes nothing), with q read off the **damped** delivered fractions (`Simulation::DampedFraction`,
+`src/engine/engine.cppm`), d̄ ← (1 − w) d̄ + w d: damped means each pass moves the fraction only
+the share w of the way to the new value, so a correction cannot swing past the answer and back;
+the weight halves each time an average overshoots. More attempts can only raise q, so the
 feedback climbs monotonically to the smallest fixed point; one that no capacity stops within the
 pass cap ends with `converged` false and `estimate` warns (`no steady state (... a retry storm that
 no capacity stops ...)`). The same probe at q = 0.5 settles at `1.75k` attempts a second; at
@@ -714,10 +718,16 @@ the theory tests (λ = 100/s, `session: 1000s`, so C* = 100k and C(1000 s) = 100
 | 10 s | 63,396.8 |
 | 100 s | 65,132.2 |
 
-At the default step the error is invisible; at a tenth of the session it is 3 %. A step of more
-than twice the session would make the level oscillate (|1 − dt/s| > 1), and one longer than the
-session would overshoot below 0, which `admit` clamps; keep `step` far below `session` (a chat
-session is minutes, the default step 100 ms). The cap is applied inside the same step: the
+At the default step the error is invisible; at a tenth of the session it is 3 %. The factor
+**(1 − dt / session)** decides the rest: each step multiplies the gap C* − C by it. Below one
+session it lies between 0 and 1 and the level climbs smoothly. Past one session it is negative,
+so the level jumps over C* every step and oscillates around it: between one and two sessions the
+swings shrink (|factor| < 1) and the level still settles (λ = 100/s, `session: 1s`, `step: 1500ms`:
+0, 150, 75, 112.5, 93.75, ... around C* = 100); past two sessions they grow (|factor| > 1) and the
+recurrence diverges. A rising level overshoots **above** C*; only a level coming down (λ falling,
+or its swing back after an overshoot) can be pushed below 0, which `admit` clamps, so at
+`step: 3s` the same probe jumps between 300 and 0 for ever. Keep `step` far below `session` (a
+chat session is minutes, the default step 100 ms). The cap is applied inside the same step: the
 connects admitted are those that bring the level exactly to `max_connections × replicas`, and at
 the cap the connects that get in are the disconnects, C / session.
 
@@ -731,17 +741,62 @@ still waiting come back evenly over W = `reconnect_within`:
 
     connects = λ + D / W    for W seconds from the fault's end
 
-On the probe (C₀ = 99,327.89 at 5000 s, the tier down for 60 s, W = 30 s) the binary's series
-shows the gateway offered 3,512.14/s at the step that starts at 5060 s: the users' 100 sends and
-100 + D / 30 = 3,412.14 connects, 34.1 times the usual connect rate (the theory test pins D =
-99,364.12); the fault block says `reconnect storm 99.33k connections over 30s, gw peak 46.1% at
-01:24:49`, the connections it dropped, not the users who came back. Over W = 300 s the same storm
-peaks at 4.3 times. A reconnect the gateway refuses (the cap) or drops (its room full) is tried
-again after an exponential wait of mean W: of R users retrying, R (1 − e^(−dt / W)) come back in a
-step (`retries_in_step`), memoryless, so R is one number whatever the moment each was refused.
+The probe is the theory test's (`tests/theory/test_gateways.cpp`, "The reconnect storm"): 100
+connects and 100 sends a second, `session: 1000s`, so C* = 100k; `heartbeat: 5s`, so the level
+also loads the gateway with C / 5 heartbeats a second, which go on to `presence` as the sends go
+on to `q`; 1 s steps; a gateway of 32k/s (not the type's default 50k/s: at 32k/s it serves 63 %
+at the fixed point and is never short of capacity in the storm) with a room of one request
+(`queue_limit: 1`: the default room of 1000 would hold the fault's first requests and release them
+after it, which has nothing to do with the storm); a cap of 200k the storm never reaches; and the
+whole tier down for 60 s from t = 5000 s, once the level is within 1 % of C*:
+
+```yaml
+version: 1
+name: gateway
+duration: 6500s
+step: 1s
+nodes:
+  u: {type: client, rate: {base: 200/s}, ops: {connect: 0.5, send: 0.5}}
+  gw: {type: ws_gateway, capacity: 32k/s, latency: 500us, session: 1000s, heartbeat: 5s, max_connections: 200k, reconnect_within: 30s, advanced: {queue_limit: 1}, ops: {deliver: [], heartbeat: [{to: presence, op: beat}], send: [{to: q, op: write}]}}
+  q: {type: service, capacity: 1000k/s, latency: 1ms}
+  presence: {type: service, capacity: 1000k/s, latency: 1ms}
+links:
+  - {from: u, to: gw, latency: 0s}
+  - {from: gw, to: q, latency: 0s}
+  - {from: gw, to: presence, latency: 0s}
+faults: [{at: 5000s, kind: node_down, node: gw, for: 60s}]
+```
+
+```
+$ simsys run storm.yaml --series storm.csv
+...
+fault 01:23:20 node_down gw for 1m
+  during:   offered 200/s, served 0/s, lost 12k requests, backlog 0
+  after:    no backlog to drain, reconnect storm 99.33k connections over 30s, gw peak 72% at 01:24:49
+  recovery: back within 1% (every op's p99, every node's rho) at 01:31:45 (445s after the fault cleared)
+```
+
+The fault drops C₀ = 99,327.89 connections (`--report json`'s `reconnect_storm_connections`: the
+level the 1 s Euler steps reach at 5000 s, 0.67 % short of C*). The gateway's row in `storm.csv`
+at the step that starts at 5060 s shows 3,512.14/s offered: the users' 100 sends and
+100 + D / 30 = 3,412.14 connects, 34.1 times the usual connect rate (the theory test pins
+D = 99,364.12), and no heartbeats yet, the level being 0. The block's 99.33k is the connections
+the fault dropped, not the users who come back. The peak is the storm's last step, not its first
+(5089 s, 01:24:49: 23,027.9/s, 72 % of 32k/s): the heartbeats of the recovering level (97,579 at
+the start of that step) keep growing while the storm's connects stay at D / 30. Over W = 300 s
+(`reconnect_within: 300s`) the same storm sends 100 + D / 300 = 431.21 connects a second, 4.3
+times the usual rate. A reconnect the gateway refuses (the cap) or drops (its room full) is tried
+again after an exponential wait of mean W (a random wait in which short waits are the most
+likely and the average is W, the distribution a session's length has too): of R users retrying,
+R (1 − e^(−dt / W)) come back in a step (`retries_in_step`). The exponential is **memoryless**
+(the chance of coming back in the next step does not depend on how long a user has already
+waited), so R is one number whatever the moment each was refused.
 
 What the storm ignores, and the numbers above show: the storm's users end no session while they
 wait their turn within W, so after the storm the level stands above the fault-free twin's (on the
-probe 100,894 at 5090 s against C* = 100k), by about D · W / (2 · session), and decays back with
-the session's time constant; that is what the fault block's `recovery` waits for (01:31:35 on the
-probe, 435 s after the fault cleared).
+probe 100,894 at 5090 s against the twin's 99,385.8, the same file without its `faults` line:
+1.5 % above), by about D · W / (2 · session) = 1,490 (a user waits W / 2 on average), and decays
+back with the session's time constant; that is what the fault block's `recovery` waits for
+(01:31:45 on the probe, 445 s after the fault cleared: the last number to come back is
+`presence`'s rho, which carries the heartbeats C / 5 and so follows the level, and 5505 s is the
+first step at which the level, 100,590, is within 1 % of the twin's 99,594.5).
