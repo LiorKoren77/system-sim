@@ -1897,3 +1897,255 @@ TEST_CASE("book/web-crawler's downloader retries a failed fetch twice", "[scenar
   REQUIRE(downloader != s.nodes.end());
   REQUIRE(downloader->retries == 2);
 }
+
+// ---- google-drive end to end (phase 3 Task 16) ----
+//
+// The shipped google-drive gives long_poll `connections: 2M` (the book's notification long polls:
+// 2M devices hold a connection open, a stock no client of this scenario creates), so the last thing
+// that kept it off the runnable list is gone. Two older tests state the opposite and the task
+// that edits the YAML must change them in the same commit, because they pass today and fail the
+// moment it does: "book/google-drive is refused at long_poll until it states a connections level"
+// (delete it: the first test below replaces it) and "exactly ten shipped scenarios use only
+// simulated node types" (its list gains google-drive; the second test below is the inverted
+// check that does not depend on how many scenarios the later tasks make runnable). The
+// "scenarios whose node types all exist run in under five seconds" test also runs google-drive
+// from then on, at the shipped 100 ms step (864k steps, minutes in Debug): it joins the exempt
+// scenarios there, as youtube and news-feed do, and the day test below runs it at 10 s.
+
+TEST_CASE("book/google-drive is accepted by Simulation::create once long_poll states its level",
+          "[scenario]") {
+  const auto g = build_or_fail(
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/google-drive/scenario.yaml"));
+  const auto sim = simsys::engine::Simulation::create(g);
+  // CAPTURE-d rather than a bare REQUIRE so that a refusal prints its reason: today
+  // "node 'long_poll': a ws_gateway needs a client op named 'connect' or a fixed 'connections'".
+  CAPTURE(sim ? std::string{} : sim.error().message);
+  REQUIRE(sim.has_value());
+}
+
+TEST_CASE("google-drive is among the runnable scenarios, beside the ten that ran before it",
+          "[scenario]") {
+  std::vector<std::string> runnable;
+  for (const auto& file : scenario_files()) {
+    CAPTURE(file);
+    const auto s = load_or_fail(file);
+    const auto g = build_or_fail(s);
+    if (simsys::engine::Simulation::create(g)) runnable.push_back(s.name);
+  }
+  // A membership test, not an equality: the later tasks of phase 3 (chat-system, ...) add to this
+  // set, and each of them must not have to edit this test to do so.
+  for (const char* name : {"chain", "hello", "lab-consistent-hashing", "lab-kv-store",
+                           "lab-rate-limiter", "lab-unique-id", "news-feed", "search-autocomplete",
+                           "url-shortener", "youtube", "google-drive"}) {
+    CAPTURE(name);
+    REQUIRE(std::ranges::find(runnable, name) != runnable.end());
+  }
+}
+
+namespace {
+
+// What a whole day of the shipped book/google-drive left, at `step`: every node's summary, the drop
+// rate, the SLO verdicts, and, over EVERY step of the run (warmup included: a fixed level has no
+// transient), the extremes of the websocket gateway's row that the per-node summary does not keep.
+struct GoogleDriveDay {
+  simsys::model::Scenario scenario;
+  std::vector<simsys::report::NodeSummary> nodes;
+  std::vector<simsys::report::SloResult> slos;
+  double drop_rate{};
+  bool every_step_has_a_level{true};  // long_poll's row carries `connections` on every step
+  double lowest_level{1e300};
+  double highest_level{-1e300};
+  double lowest_gateway_demand_per_s{1e300};
+  double highest_gateway_demand_per_s{-1e300};
+  double highest_gateway_rejected_per_s{};
+
+  [[nodiscard]] const simsys::report::NodeSummary& node(std::string_view id) const {
+    const auto found = std::ranges::find(nodes, id, &simsys::report::NodeSummary::id);
+    if (found == nodes.end()) FAIL("no node " << id);
+    return *found;
+  }
+  // The result of the SLO of `metric` on `op` of `node` (an empty `op` or `node` matches a SLO that
+  // names none, the drop_rate).
+  [[nodiscard]] const simsys::report::SloResult& slo(simsys::model::SloMetric metric,
+                                                     std::string_view op = {}) const {
+    const auto found = std::ranges::find_if(
+        slos, [&](const auto& r) { return r.slo.metric == metric && r.slo.op.value_or("") == op; });
+    if (found == slos.end()) FAIL("the scenario has no such SLO");
+    return *found;
+  }
+};
+
+GoogleDriveDay run_google_drive_day(simsys::SimTime step) {
+  GoogleDriveDay day;
+  day.scenario =
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/google-drive/scenario.yaml");
+  day.scenario.step = step;
+  const auto g = build_or_fail(day.scenario);
+  auto sim = simsys::engine::Simulation::create(g);
+  if (!sim) FAIL(sim.error().message);
+  const auto gateway = *g.index_of("long_poll");
+  simsys::report::Summary summary{g, day.scenario.warmup};
+  sim->run({.duration = day.scenario.duration, .step = day.scenario.step}, [&](const auto& r) {
+    summary.observe(r);
+    const auto& row = r.nodes[gateway];
+    if (!row.connections) {
+      day.every_step_has_a_level = false;
+    } else {
+      day.lowest_level = std::min(day.lowest_level, *row.connections);
+      day.highest_level = std::max(day.highest_level, *row.connections);
+    }
+    day.lowest_gateway_demand_per_s = std::min(day.lowest_gateway_demand_per_s, row.demand_per_s);
+    day.highest_gateway_demand_per_s = std::max(day.highest_gateway_demand_per_s, row.demand_per_s);
+    day.highest_gateway_rejected_per_s =
+        std::max(day.highest_gateway_rejected_per_s, row.rejected_per_s);
+  });
+  day.nodes = summary.nodes();
+  day.slos = simsys::report::evaluate_slos(summary, day.scenario.slos);
+  day.drop_rate = summary.drop_rate();
+  return day;
+}
+
+}  // namespace
+
+// `simsys run scenarios/book/google-drive/scenario.yaml` exits 0 when every SLO passes. The three
+// SLOs are the book's: a download (500 KB through the api, the cache and the block servers) in
+// 2 s at p99, a metadata read in 100 ms at p99, and at most 0.1 % of requests dropped anywhere.
+// The day runs at 10 s steps (8,610 observed, 2.7 s in Debug) instead of the shipped 100 ms
+// (864k steps); the 11:00 peak is a multiple of 10 s, so the step only blurs the sine's shape
+// slightly. Measured on a scratch copy of the YAML with only `connections: 2M` added and 3
+// backup workers (2026-10-30): download p99 125 ms, metadata p99 6.6 ms, drop rate 0. The
+// implementer re-measures on the shipped file; the verdicts, not those numbers, are pinned here.
+TEST_CASE("book/google-drive runs the day and passes its three SLOs", "[scenario]") {
+  using namespace std::chrono_literals;
+  const auto day = run_google_drive_day(10s);
+  for (const auto& r : day.slos) {
+    CAPTURE(r.slo.node.value_or("-"), r.slo.op.value_or("-"), static_cast<int>(r.slo.metric),
+            r.observed.value_or(-1.0), r.note);
+    REQUIRE(r.status == simsys::report::SloStatus::pass);
+  }
+  // The three of the book (a fourth, on the notification queue's lag, may join them).
+  REQUIRE(day.slos.size() >= 3);
+  const auto& download = day.slo(simsys::model::SloMetric::p99_latency, "download");
+  REQUIRE(std::get<simsys::SimTime>(download.slo.max) == simsys::SimTime{2s});
+  REQUIRE(download.observed.has_value());
+  REQUIRE(*download.observed < 2.0);
+  const auto& metadata = day.slo(simsys::model::SloMetric::p99_latency, "metadata");
+  REQUIRE(std::get<simsys::SimTime>(metadata.slo.max) == simsys::SimTime{100ms});
+  REQUIRE(metadata.observed.has_value());
+  REQUIRE(*metadata.observed < 0.1);
+  const auto& drops = day.slo(simsys::model::SloMetric::drop_rate);
+  REQUIRE(std::get<double>(drops.slo.max) == 0.001);
+  REQUIRE(drops.observed.has_value());
+  REQUIRE(*drops.observed <= 0.001);
+  REQUIRE(day.drop_rate <= 0.001);
+}
+
+// long_poll's level is the stated 2M on every step: a fixed `connections` is a number, not a
+// balance, so it does not start from 0 and climb (the engine's Euler step does that for a
+// `connect` op, which google-drive has none of) and nothing moves it (no disconnects).
+TEST_CASE("book/google-drive's long_poll holds 2M connections on every step, from the first",
+          "[scenario]") {
+  using namespace std::chrono_literals;
+  const auto day = run_google_drive_day(10s);
+  REQUIRE(day.every_step_has_a_level);
+  REQUIRE(day.lowest_level == 2'000'000.0);
+  REQUIRE(day.highest_level == 2'000'000.0);
+}
+
+// Ch. 15's notification service keeps 2M devices connected (long poll, so no websocket
+// heartbeat in the book, but the model's `heartbeat: 60s` stands for the keep-alive each open
+// connection sends: the scenario states it, the README says why). The heartbeat load is
+//   connections / heartbeat = 2,000,000 / 60 s = 33,333.33 requests/s      (Little's law read
+//   backwards: C open connections that each ping every T seconds send C / T pings a second)
+// and long_poll has no `heartbeat` op, so the gateway carries it alone, on top of the pushes
+// (notification_svc's 2 per upload, 511/s at the peak) and the api's sync polls (60/s). The
+// gateway's demand is therefore never below 33,333.33/s and, once the pushes and polls arrive,
+// above it at the peak. Its utilization depends on the replicas and capacity the YAML sizes (20k/s
+// x 4 = 80k/s there, 42 % at the peak, measured on a scratch copy), so only "below 1" is pinned.
+// The cap, max_connections x replicas = 2M x 4 = 8M, is four times the level: the level sits
+// under it, so the gateway refuses no connect (no `rejected`) at any step.
+TEST_CASE(
+    "book/google-drive's long_poll carries 2M / 60 s = 33.33k heartbeats a second, below its cap",
+    "[scenario]") {
+  using namespace std::chrono_literals;
+  const auto day = run_google_drive_day(10s);
+  constexpr double heartbeats_per_s = 2'000'000.0 / 60.0;
+  CAPTURE(day.lowest_gateway_demand_per_s, day.highest_gateway_demand_per_s);
+  // A relative 1e-9: the sum of the heartbeat and what arrives with it, rounded.
+  REQUIRE(day.lowest_gateway_demand_per_s >= heartbeats_per_s * (1.0 - 1e-9));
+  REQUIRE(day.highest_gateway_demand_per_s > heartbeats_per_s * (1.0 + 1e-9));  // pushes, polls
+  const auto& gateway = day.node("long_poll");
+  REQUIRE(gateway.peak_rho > 0.0);
+  REQUIRE(gateway.peak_rho < 1.0);
+  // The cap is the model's own formula over the scenario's two numbers, 2M x 4 replicas.
+  const auto& spec =
+      *std::ranges::find(day.scenario.nodes, "long_poll", &simsys::model::NodeSpec::id);
+  REQUIRE(simsys::model::connection_cap(spec) == std::optional<double>{8'000'000.0});
+  REQUIRE(day.highest_level < *simsys::model::connection_cap(spec));
+  REQUIRE(gateway.total_rejected == 0.0);
+  REQUIRE(day.highest_gateway_rejected_per_s == 0.0);
+}
+
+// notify_q's lag is the time a published notification waits until its slowest consumer group reads
+// it (engine::NodeSample::queue_lag_s). It is positive (the queue has a wait at all: the pools
+// are busy a fraction of the time) and bounded. If the scenario states a `queue_lag` SLO on
+// notify_q, the bound is that SLO's own `max`; if it does not, the bound is 10 minutes: a
+// "file changed" push that reaches the other devices later than that is not a sync any more, and
+// a scenario that lets the lag grow past it (backup_workers at the book's 2 workers: rho 1.28, an
+// hour of lag at the peak, measured) must state that as a SLO and say in its README that the
+// backlog is the lesson. The unsized pool without such an SLO fails this test on purpose.
+TEST_CASE("book/google-drive's notify_q lag is positive and bounded by its SLO, else by 10 minutes",
+          "[scenario]") {
+  using namespace std::chrono_literals;
+  const auto day = run_google_drive_day(10s);
+  const auto& queue = day.node("notify_q");
+  REQUIRE(queue.peak_queue_lag_s.has_value());
+  CAPTURE(*queue.peak_queue_lag_s);
+  REQUIRE(*queue.peak_queue_lag_s > 0.0);
+  double bound_s = 600.0;
+  const auto lag_slo = std::ranges::find_if(day.slos, [](const auto& r) {
+    return r.slo.metric == simsys::model::SloMetric::queue_lag && r.slo.node == "notify_q";
+  });
+  if (lag_slo != day.slos.end()) {
+    bound_s = std::chrono::duration<double>(std::get<simsys::SimTime>(lag_slo->slo.max)).count();
+    REQUIRE(lag_slo->status == simsys::report::SloStatus::pass);
+  }
+  CAPTURE(bound_s);
+  REQUIRE(*queue.peak_queue_lag_s <= bound_s);
+}
+
+// backup_workers (2 workers x 10 ms = 200 jobs/s against 255.6/s of uploads at the peak: rho 1.28
+// on paper, explain's red line) is the scenario's one oversized-on-paper node. Whether it is
+// sized to 3 workers (peak rho 0.852, measured) or left as the lesson (the run clamps its rho at
+// 1 and its backlog grows for the 18 hours the uploads exceed 200/s: 774k jobs, measured, with
+// no drop since the queue's retention is 7 days) is the README's decision; the test pins only
+// what holds either way: the run reports a peak rho for it, in (0, 1], and the drop_rate SLO
+// passes, so that the pool's backlog never turns into lost requests above 0.1 %.
+TEST_CASE(
+    "book/google-drive reports backup_workers' peak rho and drops under 0.1 percent of requests",
+    "[scenario]") {
+  using namespace std::chrono_literals;
+  const auto day = run_google_drive_day(10s);
+  const auto& backup = day.node("backup_workers");
+  CAPTURE(backup.peak_rho, backup.peak_backlog, day.drop_rate);
+  REQUIRE(backup.peak_rho > 0.0);
+  REQUIRE(backup.peak_rho <= 1.0 + 1e-9);
+  REQUIRE(day.slo(simsys::model::SloMetric::drop_rate).status == simsys::report::SloStatus::pass);
+  REQUIRE(day.drop_rate <= 0.001);
+}
+
+// The headline peaks the README quotes today as `explain`'s paper numbers, which the run must
+// reproduce: the block servers at 64.8 % (3.238k/s of 5k/s, 10 servers x 500/s: the downloads and
+// uploads, 0.70 + 0.06 of the clients' 4.26k/s at the 11:00 peak) and the blob store at 77.7 % of
+// 2 GB/s (1.555 GB/s: 500 KB per download, and per upload half that, `factor: 0.5` dedup). Measured
+// run at 10 s steps (2026-10-30): peak_rho 0.6475 and 0.7775, within 0.1 % of explain's. 2 %
+// leaves room for what the step and a re-sizing of the README's other nodes do; the
+// implementer re-measures on the shipped file and these targets follow the README it writes.
+TEST_CASE("book/google-drive's peaks match the README: block servers 64.8 percent, storage 77.7",
+          "[scenario]") {
+  using namespace std::chrono_literals;
+  using Catch::Matchers::WithinRel;
+  const auto day = run_google_drive_day(10s);
+  CHECK_THAT(day.node("block_servers").peak_rho, WithinRel(0.648, 0.02));
+  CHECK_THAT(day.node("cloud_storage").peak_rho, WithinRel(0.777, 0.02));
+}
