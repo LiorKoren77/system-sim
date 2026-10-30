@@ -721,6 +721,9 @@ header, anchors and links, §20's entries 5, 7, 8, 9, 11, 12, 15 against the pla
    code string (the code round).
 Decisions: 1–7 fixed in a docs fix round (every probe shown as YAML; the storm figure re-measured);
 8 in the code fix round after the comprehensive review.
+Fixed at `2474c61` (docs only). The storm probe is the theory test's (gateway 32k/s): peak 72 % at
+the storm's last step, recovery 01:31:45, 445 s after the fault cleared, `presence`'s rho the last
+to return; the four sweeps reproduce from their YAML; the Euler factor `(1 − dt/session)` named.
 ## Comprehensive phase 3 review, then push
 
 - [ ] An adversarial reviewer (fresh context, own worktree, both presets) checks: warning-free builds and the whole suite; clang-format as CI runs it; conservation from `--series` on all fourteen scenarios (node, link and client rows, `attempts`, `dead_lettered`, `deduplicated`, `connections` included); answered ≤ offered and attempts ≥ offered everywhere; `estimate` = `run` on steady probes with retries, failure steps, fanouts, frontiers and gateways; every fault kind's identity when absent (phase 2 bytes); every README number of the four new scenarios and of the eight that moved; `--replications` byte-identical across `--jobs`; the 3a splits' byte-identity still holds; first-use comments; `Pattern:` labels; test names; functions over ~50 lines; the ten GCC 14.2 workarounds of CLAUDE.md §3; the schema's "chosen" list complete.
