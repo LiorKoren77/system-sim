@@ -45,12 +45,15 @@ using simsys::model::LinkSpec;
 using simsys::model::NodeSpec;
 using simsys::model::NodeType;
 using simsys::model::Scenario;
+using simsys::model::Step;
 using simsys::model::Workload;
 using simsys::test_support::check_line;
 using simsys::test_support::node_line;
 // Shared with test_series / test_report (tests/support/fixtures.cppm, simsys.test_fixtures).
 using simsys::test_support::explain_of;
+using simsys::test_support::group_of;
 using simsys::test_support::piped;
+using simsys::test_support::published;
 
 namespace {
 
@@ -186,8 +189,9 @@ void run_into(const Scenario& s, const simsys::graph::Graph& g, Observer&& obser
 
 // The text of one CSV line split at commas: `line` is a row, with no newline. A trailing empty
 // cell is a field ("a,b," has three): the node series' last column, queue_lag_s, is empty on
-// every row but a message queue's, and std::getline(cells, field, ',') would drop it silently,
-// so that a row with and without the column would count the same.
+// every row but a message queue's, its dead_lettered_per_s empty on every row but a worker pool's,
+// and std::getline(cells, field, ',') would drop a trailing one silently, so that a row with and
+// without the column would count the same.
 std::vector<std::string> split_commas(const std::string& line) {
   std::vector<std::string> fields;
   std::size_t begin = 0;
@@ -227,8 +231,8 @@ double number(const std::string& cell) {
 }
 
 constexpr std::string_view node_header =
-    "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone,"
-    "queue_lag_s";
+    "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,"
+    "latency_ms,zone,queue_lag_s";
 constexpr std::string_view op_header =
     "t_s,client,op,offered_per_s,attempts_per_s,answered_per_s,timed_out_per_s,mean_ms";
 
@@ -299,7 +303,7 @@ TEST_CASE("a node series row carries the demand and drain of the NodeSample it w
   const auto rows = data_rows(out.str());
   REQUIRE(rows.size() == 2);  // one row per node: the client's and the server's
   const auto& server = rows[1];
-  REQUIRE(server.size() == 11);
+  REQUIRE(server.size() == 12);
   REQUIRE(server[0] == "0.1");
   REQUIRE(server[1] == "s");
   REQUIRE(server[2] == "1234.5");   // demand_per_s
@@ -307,10 +311,11 @@ TEST_CASE("a node series row carries the demand and drain of the NodeSample it w
   REQUIRE(server[4] == "0.8");      // rho
   REQUIRE(server[5] == "34.25");    // backlog
   REQUIRE(server[6] == "200");      // drops_per_s
-  REQUIRE(server[7] == "7");        // rejected_per_s
-  REQUIRE(server[8] == "12.5");     // latency_ms: 0.0125 s
-  REQUIRE(server[9] == "green");    // the NodeSample's default zone
-  REQUIRE(server[10] == "");        // queue_lag_s: a service has no lag, the cell is empty
+  REQUIRE(server[7] == "");         // dead_lettered_per_s: a service has none, the cell is empty
+  REQUIRE(server[8] == "7");        // rejected_per_s
+  REQUIRE(server[9] == "12.5");     // latency_ms: 0.0125 s
+  REQUIRE(server[10] == "green");   // the NodeSample's default zone
+  REQUIRE(server[11] == "");        // queue_lag_s: a service has no lag, the cell is empty
 }
 
 TEST_CASE("a client row has zeros for demand and drain: a source queues and serves nothing",
@@ -322,15 +327,16 @@ TEST_CASE("a client row has zeros for demand and drain: a source queues and serv
   run_into(s, g, [&](const auto& r) { writer.observe(r); });
   const auto text = out.str();
   CAPTURE(text);
-  // t, node, demand, drain, rho, backlog, drops, rejected, latency, zone, queue_lag_s: a client's
-  // engine sample is all zeros (engine.cppm: "a source has no queue"), its zone is `none` and its
-  // last cell (a lag is a message queue's) is empty.
+  // t, node, demand, drain, rho, backlog, drops, dead_lettered, rejected, latency, zone,
+  // queue_lag_s: a client's engine sample is all zeros (engine.cppm: "a source has no queue"), its
+  // zone is `none` and its dead_lettered and last cells (a pool's count, a message queue's lag) are
+  // empty.
   // C++23 std::string::contains: a substring test in one call, replacing
   // `find(...) != std::string::npos`.
-  REQUIRE(text.contains("\n0,c,0,0,0,0,0,0,0,none,\n"));
+  REQUIRE(text.contains("\n0,c,0,0,0,0,0,,0,0,none,\n"));
 }
 
-TEST_CASE("every row of a run has eleven fields, one row per node per step", "[series]") {
+TEST_CASE("every row of a run has twelve fields, one row per node per step", "[series]") {
   const auto s = mm1(500);  // 500 ms at 100 ms steps: 5 steps
   const auto g = graph_of(s);
   std::ostringstream out;
@@ -340,7 +346,7 @@ TEST_CASE("every row of a run has eleven fields, one row per node per step", "[s
   REQUIRE(rows.size() == 5 * 2);  // 5 steps x 2 nodes (the client and the server)
   // C++20 std::ranges::all_of: the algorithm takes the whole range and a predicate, replacing
   // the begin()/end() pair of std::all_of.
-  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 11; }));
+  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 12; }));
 }
 
 // ---- node series: queue_lag_s ----
@@ -380,9 +386,9 @@ TEST_CASE("the node series header ends with the queue_lag_s column", "[series]")
   std::ostringstream out;
   simsys::report::SeriesWriter writer{out, g};
   const auto header = split_commas(header_of(out.str()));
-  REQUIRE(header.size() == 11);
+  REQUIRE(header.size() == 12);
   REQUIRE(header.back() == "queue_lag_s");
-  REQUIRE(header[9] == "zone");  // the ten columns before it keep their places
+  REQUIRE(header[10] == "zone");  // the ten columns before it keep their places
 }
 
 TEST_CASE("a message queue's row ends with the lag of its sample and every other row ends empty",
@@ -397,12 +403,12 @@ TEST_CASE("a message queue's row ends with the lag of its sample and every other
   const auto rows = data_rows(out.str());
   REQUIRE(rows.size() == 3);
   REQUIRE(rows[1][1] == "q");
-  REQUIRE(rows[1].size() == 11);
-  REQUIRE(rows[1][10] == "1.5");
+  REQUIRE(rows[1].size() == 12);
+  REQUIRE(rows[1][11] == "1.5");
   for (const auto i : {std::size_t{0}, std::size_t{2}}) {
     CAPTURE(rows[i][1]);
-    REQUIRE(rows[i].size() == 11);
-    REQUIRE(rows[i][10] == "");  // the client's and the pool's: no lag, not a lag of 0
+    REQUIRE(rows[i].size() == 12);
+    REQUIRE(rows[i][11] == "");  // the client's and the pool's: no lag, not a lag of 0
   }
 }
 
@@ -417,12 +423,12 @@ TEST_CASE("a run's queue rows hold the lag in seconds and the client and pool ro
   REQUIRE(rows.size() == 10 * 3);  // 10 steps x (u, q, w)
   for (const auto& row : rows) {
     CAPTURE(row[0], row[1]);
-    REQUIRE(row.size() == 11);
+    REQUIRE(row.size() == 12);
     if (row[1] == "q") {
-      REQUIRE_FALSE(row[10].empty());
-      REQUIRE(number(row[10]) >= 0.0);
+      REQUIRE_FALSE(row[11].empty());
+      REQUIRE(number(row[11]) >= 0.0);
     } else {
-      REQUIRE(row[10].empty());
+      REQUIRE(row[11].empty());
     }
   }
   // C++20 std::ranges::find_if: the range itself and a predicate, replacing std::find_if's
@@ -430,7 +436,7 @@ TEST_CASE("a run's queue rows hold the lag in seconds and the client and pool ro
   const auto last_q =
       std::ranges::find_if(rows, [](const auto& row) { return row[0] == "0.9" && row[1] == "q"; });
   REQUIRE(last_q != rows.end());
-  REQUIRE_THAT(number((*last_q)[10]), WithinAbs(0.25, 1e-6));  // 300 waiting / 1200 a second
+  REQUIRE_THAT(number((*last_q)[11]), WithinAbs(0.25, 1e-6));  // 300 waiting / 1200 a second
 }
 
 // The fluid queue's balance, step by step: demand·dt = (drain + dropped)·dt + Δbacklog. Summed
@@ -486,7 +492,7 @@ TEST_CASE("a limiter's rejections are inside its drain, so the identity needs no
     demand += number(row[2]) * dt;
     drain += number(row[3]) * dt;
     drops += number(row[6]) * dt;
-    rejected += number(row[7]) * dt;
+    rejected += number(row[8]) * dt;
     backlog = number(row[5]);
   }
   REQUIRE_THAT(demand, WithinRel(4000.0, 1e-5));  // 10 steps x 0.1 s x 4000/s
@@ -1186,7 +1192,7 @@ TEST_CASE("explain notes that a node fed by failure steps only is sized by run o
 // ---- A link's bandwidth is a pipe: its rows in the series and the JSON ----
 //
 // A link with a bandwidth is a queue of megabytes and is plotted like a node: one CSV row per
-// step with the link's name, `from->to`, in the `node` column, the same eleven columns, in
+// step with the link's name, `from->to`, in the `node` column, the same twelve columns, in
 // MEGABYTES (a rate of MB/s; engine::StepRecord::links, one LinkSample per bandwidth link). So
 // the conservation law holds on those rows too, and a student checks the pipe from the file.
 // The JSON gets `links`: one object per bandwidth link (an empty array without any).
@@ -1218,7 +1224,7 @@ double number_of_key(const std::string& object, std::string_view key_prefix) {
 }  // namespace
 
 TEST_CASE(
-    "a link row of the node series carries the LinkSample it was fed, in the same eleven columns",
+    "a link row of the node series carries the LinkSample it was fed, in the same twelve columns",
     "[series]") {
   const auto s = piped(100);
   const auto g = graph_of(s);
@@ -1244,17 +1250,18 @@ TEST_CASE(
   const auto found = std::ranges::find_if(rows, [](const auto& row) { return row[1] == "a->b"; });
   REQUIRE(found != rows.end());
   const auto& row = *found;
-  REQUIRE(row.size() == 11);
+  REQUIRE(row.size() == 12);
   REQUIRE(row[0] == "0.1");
   REQUIRE(row[2] == "100.5");   // demand_per_s, MB/s
   REQUIRE(row[3] == "100.25");  // drain_per_s
   REQUIRE(row[4] == "0.8");     // rho
   REQUIRE(row[5] == "34.25");   // backlog, MB
   REQUIRE(row[6] == "5");       // drops_per_s
-  REQUIRE(row[7] == "0");       // rejected_per_s: a pipe refuses nothing by policy
-  REQUIRE(row[8] == "12.5");    // latency_ms: 0.0125 s
-  REQUIRE(row[9] == "yellow");
-  REQUIRE(row[10] == "");  // queue_lag_s: a pipe is not a message queue
+  REQUIRE(row[7] == "");        // dead_lettered_per_s: a pipe is not a worker pool
+  REQUIRE(row[8] == "0");       // rejected_per_s: a pipe refuses nothing by policy
+  REQUIRE(row[9] == "12.5");    // latency_ms: 0.0125 s
+  REQUIRE(row[10] == "yellow");
+  REQUIRE(row[11] == "");  // queue_lag_s: a pipe is not a message queue
 }
 
 // 1000 puts/s of 1 MB offer the pipe 1000 MB/s against 125 MB/s: the backlog grows by
@@ -1271,7 +1278,7 @@ TEST_CASE("the conservation identity holds on the link rows read back from the s
   const auto rows = data_rows(out.str());
   CAPTURE(out.str());
   REQUIRE(rows.size() == 30 * 3);  // 30 steps x (the client, b and the link)
-  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 11; }));
+  REQUIRE(std::ranges::all_of(rows, [](const auto& row) { return row.size() == 12; }));
   constexpr double dt = 0.1;
   double demand = 0.0;
   double drain = 0.0;
@@ -1345,6 +1352,14 @@ TEST_CASE("the JSON has an empty links array when no link has a bandwidth", "[se
 // byte (a number in the new column, a different empty cell) fails here. The op series had no new
 // column then: its hash was the old one.
 //
+// Re-pinned on purpose: the node series gained a `dead_lettered_per_s` column right after
+// `drops_per_s` (a worker pool's count of jobs whose last retry failed; empty on every row of a
+// node that is not a pool, so on every row of the chain, which has no pool), and nothing else
+// changed: the header has `,dead_lettered_per_s` after `drops_per_s` and each of the 3,600 rows an
+// empty cell (`,,`) in the same place. Derived like the one above: the series of the binary at
+// 61e047c (which reproduces the previous hash, 0xd0b4c7d05759bd57) with that header and that empty
+// cell inserted, hashed with this function: 0x6e28178622e2c40f.
+//
 // Re-pinned on purpose: the op series gained a `timed_out_per_s` column after `answered_per_s`, 0
 // on every row of the chain (its client has no timeout), and nothing else changed. Derived the same
 // way: the op series of the binary at 691a3ef (which reproduces the old hash, 0x9dfc7de84e1afe59)
@@ -1379,7 +1394,9 @@ TEST_CASE("the tutorial chain's series are byte for byte what they were before l
   REQUIRE(nodes_out.str().find("->") == std::string::npos);  // no link rows
   REQUIRE(data_rows(nodes_out.str()).size() == 1200 * 3);    // 2 min of 100 ms steps x 3 nodes
   REQUIRE(header_of(nodes_out.str()) == node_header);
-  REQUIRE(fnv1a(nodes_out.str()) == 0xd0b4c7d05759bd57ULL);  // re-pinned for queue_lag_s, above
+  // re-pinned for queue_lag_s, then for dead_lettered_per_s (phase 3 Task 11: an empty cell after
+  // drops_per_s on every row, since chain has no worker pool)
+  REQUIRE(fnv1a(nodes_out.str()) == 0x6e28178622e2c40fULL);
   // re-pinned for timed_out_per_s, then for attempts_per_s (phase 3 Task 10: the column after
   // offered_per_s, equal to it on every row, since chain has no retries)
   REQUIRE(fnv1a(ops_out.str()) == 0x66f6670d063b5f6fULL);
@@ -1451,4 +1468,121 @@ TEST_CASE("explain prints no faults line for a scenario without faults", "[serie
   const auto text = simsys::report::render_explain(graph_of(*loaded));
   CAPTURE(text);
   REQUIRE_FALSE(text.contains("faults:"));
+}
+
+// ---- node series: dead_lettered_per_s (phase 3 spec §6.2, §10) ----
+//
+// A worker pool's dead letters, the jobs whose last retry failed (engine::NodeSample::
+// dead_lettered_per_s), are the node series' column right after `drops_per_s`: they are not drops,
+// and the column says so by being a column of their own. Like `queue_lag_s` it is empty, not 0, on
+// every row of a node that is not a pool (a 0 would claim a dead-letter queue the node does not
+// have), the client's and the bandwidth links' rows included; a pool that retries nothing has 0.
+//
+// Picture: u publishes 1000/s to q; pool w (100 workers at 10 ms) calls the sink api (5k/s, fails
+// 2 %) with `retries: 3`, 1 s apart: at the fixed point w dead-letters 1000 x 0.02^4 = 1.6e-4 a
+// second and api is sent 1020.408/s, of which it drops 20.408 (its own books, which this file's
+// conservation tests read: the failures of calls that will be retried are still the sink's
+// drops in the series).
+
+TEST_CASE("the node series header has dead_lettered_per_s right after drops_per_s", "[series]") {
+  const auto g = graph_of(queue_and_group());
+  std::ostringstream out;
+  simsys::report::SeriesWriter writer{out, g};
+  const auto header = split_commas(header_of(out.str()));
+  REQUIRE(header.size() == 12);
+  REQUIRE(header[6] == "drops_per_s");
+  REQUIRE(header[7] == "dead_lettered_per_s");
+  REQUIRE(header[8] == "rejected_per_s");
+}
+
+TEST_CASE("a pool's row carries the dead letters of its sample and every other row is empty there",
+          "[series]") {
+  const auto s = queue_and_group();
+  const auto g = graph_of(s);
+  std::ostringstream out;
+  simsys::report::SeriesWriter writer{out, g};
+  std::vector<simsys::engine::NodeSample> nodes(3);  // u 0, q 1, w 2
+  nodes[2].dead_lettered_per_s = 0.25;               // exactly printable
+  writer.observe(simsys::engine::StepRecord{.t = 100ms, .nodes = nodes, .responses = {}});
+  const auto rows = data_rows(out.str());
+  REQUIRE(rows.size() == 3);
+  REQUIRE(rows[2][1] == "w");
+  REQUIRE(rows[2][7] == "0.25");
+  for (const auto i : {std::size_t{0}, std::size_t{1}}) {
+    CAPTURE(rows[i][1]);
+    REQUIRE(rows[i].size() == 12);
+    REQUIRE(rows[i][7] == "");  // the client's and the queue's: not a count of 0
+  }
+}
+
+namespace {
+// u -> q -> w (retries 3, 1 s apart) -> api, the picture above; the pool states `retries` only when
+// given. 5 s: 50 steps, past the three backoffs of 10.
+Scenario retrying_pool_series(std::optional<int> retries) {
+  auto pool = group_of("w", 100, 10ms);
+  pool.then = {Step{.to = "api", .op = "send"}};
+  if (retries) pool.retries = *retries;
+  if (retries) pool.retry_after = 1s;
+  auto s = published(1000, {std::move(pool)});
+  NodeSpec api{.id = "api", .type = NodeType::external_sink, .capacity = Rate{5000}};
+  api.failure_rate = 0.02;
+  s.nodes.push_back(std::move(api));
+  s.links.push_back(LinkSpec{.from = "w", .to = "api", .latency = 0s});
+  s.duration = 5s;
+  return s;
+}
+
+// The rows of node `id` of a run of `s`, in step order.
+std::vector<std::vector<std::string>> rows_of_node(const Scenario& s, std::string_view id) {
+  const auto g = graph_of(s);
+  std::ostringstream out;
+  simsys::report::SeriesWriter writer{out, g};
+  run_into(s, g, [&](const auto& r) { writer.observe(r); });
+  std::vector<std::vector<std::string>> mine;
+  for (auto& row : data_rows(out.str())) {
+    if (row[1] == id) mine.push_back(std::move(row));
+  }
+  return mine;
+}
+}  // namespace
+
+TEST_CASE("a run's pool rows hold the dead letters, 1.6e-4 a second, and the others stay empty",
+          "[series]") {
+  const auto s = retrying_pool_series(3);
+  const auto pool = rows_of_node(s, "w");
+  REQUIRE(pool.size() == 50);
+  REQUIRE(pool[0].size() == 12);
+  REQUIRE(number(pool[0][7]) == 0.0);  // nobody has used 3 retries at the first step
+  REQUIRE_THAT(number(pool.back()[7]), WithinRel(1.6e-4, 1e-6));
+  REQUIRE(number(pool.back()[6]) == 0.0);  // drops_per_s: a dead letter is not a drop
+  for (const auto* id : {"u", "q", "api"}) {
+    CAPTURE(id);
+    for (const auto& row : rows_of_node(s, id)) REQUIRE(row[7].empty());
+  }
+}
+
+TEST_CASE("a pool that retries nothing writes 0 in dead_lettered_per_s on every row", "[series]") {
+  for (const auto& row : rows_of_node(retrying_pool_series(std::nullopt), "w")) {
+    REQUIRE(row[7] == "0");
+  }
+}
+
+// The sink's books in the file are the sink's, whatever its callers do with the failures: the
+// identity demand = drain + drops holds on its rows (failures move flow from `drain` to `drops`),
+// and the drops are the 2 % of everything it was sent, 20.408/s at the fixed point.
+TEST_CASE("the sink's rows keep conservation and its drops, 20.408 a second, with retries",
+          "[series]") {
+  const auto rows = rows_of_node(retrying_pool_series(3), "api");
+  REQUIRE(rows.size() == 50);
+  constexpr double dt = 0.1;
+  double demand = 0.0;
+  double drain = 0.0;
+  double drops = 0.0;
+  for (const auto& row : rows) {
+    demand += number(row[2]) * dt;
+    drain += number(row[3]) * dt;
+    drops += number(row[6]) * dt;
+  }
+  REQUIRE_THAT(demand, WithinRel(drain + drops, 1e-9));
+  REQUIRE_THAT(number(rows.back()[6]), WithinRel(0.02 * 1020.408, 1e-6));
 }
