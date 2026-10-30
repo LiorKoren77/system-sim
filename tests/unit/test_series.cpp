@@ -897,8 +897,9 @@ TEST_CASE("explain follows youtube from the blob store through the queues and po
 
 // google-drive: api's upload_meta publishes to notify_q, 255.6/s at the peak (the line's own
 // number), and both groups consuming it are offered all of it. notification_svc (8 workers at
-// 1 ms = 8k/s): 255.6 / 8000 = 3.2 %, green; backup_workers (2 workers at 10 ms = 200/s):
-// 255.6 / 200 = 128 %, red; its `then` writes each message's 500 KB (the step's size, the book's
+// 1 ms = 8k/s): 255.6 / 8000 = 3.2 %, green; backup_workers (3 workers at 10 ms = 300/s, sized
+// in phase 3 Task 16; the 2 it first shipped with were 200/s, 128 %, red): 255.6 / 300 = 85.2 %,
+// yellow; its `then` writes each message's 500 KB (the step's size, the book's
 // average file) to cold_storage: 255.6 x 0.5 MB = 127.8 MB/s of 200 MB/s, 63.9 %, green. None
 // is marked by a queue or a pool any more. long_poll (a ws_gateway) is fed by the notification
 // service's pushes too; whatever it still says about its own type, it blames no queue or pool.
@@ -915,8 +916,8 @@ TEST_CASE("explain follows google-drive's notify_q into its consumers and the ba
   REQUIRE(notifier.contains(", green)"));
   REQUIRE_FALSE(notifier.contains("load not propagated"));
   const auto backup = check_line(text, "backup_workers");
-  REQUIRE(backup.contains("peak offered 255.6/s vs 200/s total capacity"));
-  REQUIRE(backup.contains(", red)"));
+  REQUIRE(backup.contains("peak offered 255.6/s vs 300/s total capacity"));
+  REQUIRE(backup.contains("(85.2%, yellow)"));
   REQUIRE_FALSE(backup.contains("load not propagated"));
   const auto cold = check_line(text, "cold_storage");
   REQUIRE(cold.contains("peak offered 127.8 MB/s (255.6/s) vs 200 MB/s total capacity"));

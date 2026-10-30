@@ -26,11 +26,11 @@ frontiers (per-host politeness as a cap on the downloaders' drain),
 key-value clusters (ring, replication and quorums), search indexes and id generators. A step after
 a failed step does not run, refused, dropped and timed-out requests are counted apart
 (`reject_rate`, `drop_rate`, `timed_out_per_s`), and an SLO can be checked per window (`over: 1h`).
-`simsys sweep` runs a scenario over a range of one key, the points in parallel. Twelve scenarios
-run end to end, six of the eight book systems among them (list below); chat-system and
-google-drive validate and `explain`, and wait for their gateways' levels (every node type runs
-since phase 3, but chat-system's and google-drive's gateways state no connection level yet). 1163
-tests (Catch2, via `ctest`). The scenario language is
+`simsys sweep` runs a scenario over a range of one key, the points in parallel. Thirteen scenarios
+run end to end, seven of the eight book systems among them (list below); chat-system validates and
+`explain` describes it, but it waits for its gateway's level (every node type runs since phase 3,
+but chat-system's gateway states no connection level yet). 1163 tests (Catch2, via `ctest`). The
+scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.4).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
@@ -249,7 +249,7 @@ service at the type's 5k/s and 5 ms; its rebuild is not modelled) and notificati
 publishes the rest to its channels' queues) and URL frontiers (ch. 9's: a prioritiser at its
 `capacity`, the URLs handed to the downloaders' pool, which drains at most `hosts × politeness`,
 and the frontier's lag read off that pool; an external sink's `politeness` caps it the same way
-over the frontier's hosts). These twelve scenarios run end to end:
+over the frontier's hosts). These thirteen scenarios run end to end:
 
 - [`tutorial/hello`](scenarios/tutorial/hello/), [`tutorial/chain`](scenarios/tutorial/chain/):
   one service, then two in a chain: the queueing basics.
@@ -298,11 +298,19 @@ over the frontier's hosts). These twelve scenarios run end to end:
   above 1, so the frontier is offered 4.38k URLs/s against the downloaders' 2000, their
   utilization is 1 and the frontier's lag reaches 7.13 h against 30 minutes.
 
+- [`book/google-drive`](scenarios/book/google-drive/): ch. 15 over 24 hours at 3k/s (peak 4.26k/s
+  at 11:00): block servers, cloud and cold blob stores, a sharded metadata database behind a Che
+  cache, and `notify_q` read by two consumer groups, the notification pushes and the backups. The
+  long polls are a websocket gateway holding a fixed 2M connections whose re-polls (2M / 60 s =
+  33.33k/s) are 98 % of its work. All four SLOs pass (download p99 125 ms of 2 s, metadata p99
+  6.6 ms of 100 ms, nothing dropped, `notify_q` 16.5 ms behind at worst); the backup pool is sized
+  at 3 workers, since at the 2 it first had it falls 1.07 h behind by 13:28.
+
 Every node type has a model since phase 3 (a WebSocket gateway, a service discovery, a
-notification fan-out and a URL frontier were its last four). chat-system and google-drive validate
-and appear in `explain`, but `estimate`, `run` and `sweep` stop at a gateway that states no
-connection level yet and exit 1; each of those two READMEs opens with its status: the exact
-refusal, what `explain` shows today and what is still to come. Scripted faults run (`faults:`: a
+notification fan-out and a URL frontier were its last four). chat-system validates and appears in
+`explain`, but `estimate`, `run` and `sweep` stop at a gateway that states no connection level
+yet and exit 1; its README opens with its status: the exact refusal, what `explain` shows today
+and what is still to come. Scripted faults run (`faults:`: a
 node or some of its replicas down, a capacity loss, a latency spike, a traffic spike, a cache
 flush, a datacenter down; `estimate` shows the steady state without them); retries and `on:
 failure` steps are phase 3 too; kv partitions are a phase 4 backlog item.
