@@ -520,6 +520,39 @@ until Task 16 gives `long_poll` `connections: 2M`.
 - [x] Scenario: chat-system exits 0, three SLOs pass (send p99 4.82 ms, message_q lag, drop rate 9.3e-5); the 21:30 fault block: 2.154M requests lost for good, storm 1.617M connections over 30 s, gateway peak 93.9 % at 21:31:29.9, back within 1 % at 21:39:00.2; the `reconnect_within` sweep 10..60 s quoted; a `connect` op (3k/s, session 6 min, 1.08M open on average, 1.62M at 21:00), users' heartbeats removed (the level pings), gateway 25k/s per server, presence 10 × 100k/s, push 20k/s, sync_workers `retries: 3` and no deliver factor.
 - [x] Commit `nodes: a gateway's node_down drops its connections and they storm back; chat-system runs end to end` (green `af87523` rebased, 1660 tests; `fanout` applies only to a message op's steps that target a `message_queue`; connects and heartbeats are lost at once during a full outage).
 
+**Review of Task 15 at `af87523`** (adversarial, bounded, 2026-10-30): REQUEST_CHANGES. The pinned
+probe, the chat-system day at 30 s and the 10 s sweep point, the fan-out numbers, the identity
+(google-drive, url-shortener, rate-limiter byte-identical), heartbeats not counted as lost
+(agreed: pings are the gateway's own load), §1–§4 verified. The storm's bookkeeping breaks once
+faults overlap or reconnects are refused:
+1. Important: a second full outage during a storm cuts off the storm's connects (`lost_share` 1)
+   and loses them for good (probe: 60 s then 30 s faults, level 56.1k vs the twin's 100.6k).
+2. Important: with overlapping partial faults the first clearing releases every waiting user,
+   including those whose replica is still down; the second block reports a storm that never ran.
+3. Important: the connection cap `max_connections × R` does not shrink with the dead replicas
+   (2 survivors hold 72.4k against 2 × 30k).
+4. Important: `peak_rho` is read from the fault's end to the end of the run, so a later event
+   (a spike 33 min after) is reported as the storm's peak.
+5. Important: refused storm connects vanish silently: never retried, not in "lost for good"
+   (`reconnect_within: 500ms` at 1 s steps loses two thirds of the users; the README's 10 s row
+   loses 42k uncounted, which is part of its "back within 1 % almost at once").
+6. Minor: waiting users never end their sessions during a long fault, so the storm overshoots the
+   cap for long after it. 7. Minor: the JSON key `peak_rho` means the busy fraction on nodes and
+the offered utilisation on a fault's `after`. 8. Minor: README's test count. 9. Minor: a
+`dc_down` of the gateway's datacenter drops no connections.
+Decisions: 1 → when `down_share` rises during a storm, the storm's remainder returns to the
+waiting users and the storm stops; 2 → waiting users are kept per fault (per dropped share) and
+each fault releases its own at its end, `connections_dropped` summed per fault; 3 → the cap is
+`max_connections × R × (1 − down_share)` during a fault, documented in the schema's storm
+paragraph; 4 → the peak's window is `[end, end + reconnect_within + one step]`, schema text
+updated; 5 → refused storm connects return to the waiting users and retry (the class comment's
+and the README's promise), the README's 10 s row re-measured and its explanation corrected;
+6 → the waiting users decay at `1 / session` during the fault (those whose session would have
+ended do not reconnect), documented; 7 → the fault's key renamed `peak_offered_rho`;
+9 → the storm follows the gateway's capacity derating from any fault kind, so a `dc_down` drops
+the replicas in that datacenter like a `node_down` (schema, `faults.cppm`, README updated);
+8 at the push. The fix round runs on its own branch beside the Task 18 fix round.
+
 ### Task 16: google-drive runs end to end
 
 **Files:** `scenarios/book/google-drive/{scenario.yaml,README.md}` (`long_poll` with `connections: 2M`, `heartbeat: 60s`, `fanout: 1`; `backup_workers` sized or kept as the lesson (today rho 1.28 at the peak: the README decides and says why); download p99 vs 2 s, metadata p99 vs 100 ms, drop rate), `tests/scenario/test_scenarios.cpp`, `test_series.cpp`, `README.md`.
