@@ -3091,7 +3091,9 @@ TEST_CASE("a record in MB prints its rates, loss, backlog and room in MB", "[rep
   REQUIRE(
       out.table.contains("  during:   offered 5k MB/s, served 0 MB/s, lost 24k MB, backlog 1k "
                          "MB (room 1k MB dropped the rest)\n"));
-  REQUIRE(out.json.contains("\"lost\": 24000, \"lost_unit\": \"MB\", \"lost_on_cut_links\": null"));
+  REQUIRE(
+      out.json.contains("\"lost\": 24000, \"lost_unit\": \"MB\", \"lost_requests\": null, "
+                        "\"lost_on_cut_links\": null"));
 }
 
 // A dc_down names its datacenter and keeps its cut links' requests apart from its nodes' loss.
@@ -3162,6 +3164,83 @@ TEST_CASE("a traffic_spike record names the downstream node whose backlog draine
   REQUIRE(out.table.contains("  after:    s backlog drained in 0.2s\n"));
 }
 
+// Retries (Tasks 10 and 11; ch. 1's retry storm): when retrying clients or pools reach the faulted
+// node, its drops are ATTEMPTS (lost_unit "attempts"), the servers' side, and the requests lost for
+// good beside them are the users' side. The storm probe of tests/theory/test_retries.cpp: 8907
+// attempts dropped, 2939 requests lost for good, 5968 attempts the retries added.
+TEST_CASE("a record in attempts prints its requests lost for good in a parenthesis after lost",
+          "[report]") {
+  auto record = node_down_record();
+  record.offered_per_s = 890.8;
+  record.lost = 8907;
+  record.lost_unit = "attempts";
+  record.lost_requests = 2939;
+  record.backlog_peak = record.room = 1;
+  const auto out = rendered_with({record});
+  CAPTURE(out.table, out.json);
+  REQUIRE(out.table.contains(
+      "  during:   offered 890.8/s, served 0/s, lost 8.907k attempts (2.939k requests lost for "
+      "good), backlog 1 (room 1 dropped the rest)\n"));
+  REQUIRE(
+      out.json.contains("\"lost\": 8907, \"lost_unit\": \"attempts\", \"lost_requests\": 2939, "
+                        "\"lost_on_cut_links\": null"));
+}
+
+// `after` joins what followed: the backlog's drain first, then the attempts the clients' retries
+// added and the jobs a pool re-published, each only when the fault made more of them than the twin.
+TEST_CASE(
+    "the after line adds the retries' attempts after the drain: retries added 5.968k attempts",
+    "[report]") {
+  auto record = node_down_record();
+  record.after.backlog_drained_in_s = 0.1;
+  record.after.retries_added_attempts = 5968;
+  const auto out = rendered_with({record});
+  CAPTURE(out.table, out.json);
+  REQUIRE(
+      out.table.contains("  after:    backlog drained in 0.1s, retries added 5.968k attempts\n"));
+  REQUIRE(out.json.contains("\"retries_added_attempts\": 5968, \"pool_republished_jobs\": null}"));
+}
+
+TEST_CASE("the after line names the pool that re-published jobs: pool w re-published 999 jobs",
+          "[report]") {
+  auto record = node_down_record();
+  record.after.backlog_drained_in_s = 0.1;
+  record.after.republishing_pools = "w";
+  record.after.pool_republished_jobs = 999;
+  const auto out = rendered_with({record});
+  CAPTURE(out.table, out.json);
+  REQUIRE(
+      out.table.contains("  after:    backlog drained in 0.1s, pool w re-published 999 jobs\n"));
+  REQUIRE(out.json.contains("\"retries_added_attempts\": null, \"pool_republished_jobs\": 999}"));
+}
+
+// Several pools are named together; with no backlog left the line starts with that fact.
+TEST_CASE("two pools are named together, after no backlog to drain and the retries' attempts",
+          "[report]") {
+  auto record = node_down_record();
+  record.after = {};
+  record.after.retries_added_attempts = 120;
+  record.after.republishing_pools = "v, w";
+  record.after.pool_republished_jobs = 1200;
+  const auto out = rendered_with({record});
+  CAPTURE(out.table);
+  REQUIRE(
+      out.table.contains("  after:    no backlog to drain, retries added 120 attempts, pools "
+                         "v, w re-published 1.2k jobs\n"));
+}
+
+// Float residue is no retry: a figure that rounds to 0 is not printed, and the JSON says null.
+TEST_CASE("a retries figure of float residue prints nothing and is null in the JSON", "[report]") {
+  auto record = node_down_record();
+  record.after.retries_added_attempts = 1e-12;
+  record.after.republishing_pools = "w";
+  record.after.pool_republished_jobs = -1e-12;
+  const auto out = rendered_with({record});
+  CAPTURE(out.table, out.json);
+  REQUIRE(out.table.contains("  after:    backlog drained in 0.2s\n"));
+  REQUIRE(out.json.contains("\"retries_added_attempts\": null, \"pool_republished_jobs\": null}"));
+}
+
 // Finding 3 of the review: a fault that starts while an earlier fault on the same node is still
 // counting (from its `at` to its recovery) says so after its header's `for`, naming the earlier
 // one's `at`, and the JSON lists it. A fault on another node overlaps nothing.
@@ -3191,11 +3270,12 @@ TEST_CASE(
       "    {\"at_s\": 10, \"kind\": \"node_down\", \"node\": \"s\", \"for_s\": 10, "
       "\"overlaps_at_s\": [], "
       "\"during\": {\"offered_per_s\": 400, \"served_per_s\": 0, \"lost\": 3900, "
-      "\"lost_unit\": \"requests\", \"lost_on_cut_links\": null, "
+      "\"lost_unit\": \"requests\", \"lost_requests\": null, \"lost_on_cut_links\": null, "
       "\"backlog_peak\": 100, \"room\": 100, \"extra_misses\": null, \"origin\": null, "
       "\"flipped\": [], \"over_max\": []}, "
       "\"after\": {\"backlog_node\": \"s\", \"backlog_drained_in_s\": 0.2, "
-      "\"cache_warm_in_s\": null}, "
+      "\"cache_warm_in_s\": null, \"retries_added_attempts\": null, "
+      "\"pool_republished_jobs\": null}, "
       "\"recovered_at_s\": 20.2}\n"
       "  ]\n}"));
 }

@@ -28,9 +28,10 @@
 // step BEFORE another one in the same op (the second step's flow is thinned by the first's
 // delivered share of the step before), which these probes do not have; it is not pinned here.
 //
-// The fault block's `after:` line ("retries added 20.0k attempts") belongs to Task 8's block; a
-// later commit pins it. The extra attempts this file counts (the storm below) are the number that
-// line will print.
+// The fault block (Task 8's, engine::FaultRecord) tells the attempts from the requests: on the
+// storm below its `during:` line counts the node's drops as ATTEMPTS, with the requests lost for
+// good beside them, and its `after:` line adds the attempts the retries cost, the 5968 this file
+// counts (`retries added 5.968k attempts`).
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
@@ -58,6 +59,7 @@ import simsys.graph;
 import simsys.model;
 import simsys.queueing;
 import simsys.report;
+import simsys.session;
 import simsys.test_fixtures;
 
 // A note for test authors: `Approx(x).margin(m)` passes when the value is within the absolute
@@ -475,6 +477,126 @@ TEST_CASE("the same node_down without retries leaves attempts equal to offered",
     CAPTURE(i);
     REQUIRE_THAT(attempts_of(op_of(records[i])), WithinRel(300.0, 1e-12));
   }
+}
+
+// ---- The storm in the fault block: attempts against requests lost for good
+// ---------------------------------
+//
+// Ch. 1's retry storm, as the incident report must tell it. The node's drops are ATTEMPTS: every
+// attempt the down node turned away, 29 at step 100 (30 arrive, the room keeps 1), then 59, 89 and
+// 97 x 90 as the attempts climb to 900/s:
+//   29 + 59 + 89 + 97 x 90 = 8907 attempts lost       (the twin loses none)
+// which is the servers' side of the story. The users' side is the requests whose LAST attempt
+// failed, `ResponseSample::lost`: attempt 2 of a request, sent two steps after its first, is its
+// last, so the requests lost for good are attempt 2's rate whenever the node drops everything:
+//   step 102: 290/s (the failures of attempt 1 at step 101, themselves 290/s)
+//   steps 103-199: 300/s                        step 200: the node is back, attempt 2 answered
+//   (290 + 97 x 300) x 0.1 s = 29 + 2910 = 2939 requests lost for good
+// against 2999 without retries (29 + 99 x 30, every attempt being the last): the retries saved 60
+// requests, those first sent in the outage's last two steps (2 x 30), whose later attempts reached
+// s after it came back, and cost 5968 extra attempts (above). The block prints both figures, the
+// attempts first because the backlog, the room and the rates beside them are in attempts too:
+//   during: offered 890.8/s (the mean demand at s: (300 + 590 + 890 + 97 x 900) / 100 steps),
+//           served 0/s, lost 8.907k attempts (2.939k requests lost for good),
+//           backlog 1 (room 1 dropped the rest)
+//   after:  the room's 1 is served in the step at 20 s (91 of the 100 a step s can serve), so the
+//           backlog drained in 0.1s; the retries added 5968 attempts from `at` to the recovery
+//   recovery: at 20.1 s every rho is the twin's again (s served 900/s at 20.0: rho 0.91, not 0.3)
+// The probe without retries prints the block it always did: requests, no parenthesis, no retries,
+// and the same drain and recovery (its room's 1 is served at 20.0 s, with 30 of the curve's: rho
+// 0.31, more than 1 % above the twin's 0.3).
+
+namespace {
+// What `simsys run` prints for the scenario (session::run_summary: the run, its fault-free twin,
+// and the fault blocks set from both), as the table and as the JSON.
+struct Reports {
+  std::string table;
+  std::string json;
+};
+
+Reports reports_of(const Scenario& s) {
+  const auto g = graph_of(s);
+  auto sim = simulation_of(g);
+  const auto summary = simsys::session::run_summary(g, sim);
+  return {simsys::report::render_table(summary, {}, /*color=*/false),
+          simsys::report::render_json(summary, {})};
+}
+
+constexpr std::string_view storm_recovery =
+    "  recovery: back within 1% (every op's p99, every node's rho) at 00:00:20.1 (0.1s after the "
+    "fault cleared)\n";
+}  // namespace
+
+TEST_CASE(
+    "each step's lost counts the requests whose last attempt was lost: 290, then 300 a second",
+    "[theory]") {
+  const auto g = graph_of(storm_probe());
+  const auto records = records_of(g, 300);
+  double lost_for_good = 0.0;
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    CAPTURE(i);
+    const double lost = op_of(records[i]).lost.per_second;
+    if (i < 102 || i >= 200) REQUIRE_THAT(lost, WithinAbs(0.0, 1e-9));  // no last attempt failed
+    if (i == 102) REQUIRE_THAT(lost, WithinRel(290.0, 1e-9));
+    if (i > 102 && i < 200) REQUIRE_THAT(lost, WithinRel(300.0, 1e-9));
+    lost_for_good += lost * dt_s;
+  }
+  REQUIRE_THAT(lost_for_good, WithinRel(2939.0, 1e-9));
+}
+
+// Without retries every attempt is a request's last: lost is offered x (1 - delivered), 290/s at
+// step 100 (d = 1/30) and 300/s from then on while the node is down, 2999 requests in all.
+TEST_CASE("without retries each step's lost is offered times the share not delivered: 2999 in all",
+          "[theory]") {
+  const auto g = graph_of(storm_probe(""));
+  const auto records = records_of(g, 300);
+  REQUIRE_THAT(op_of(records[100]).lost.per_second, WithinRel(290.0, 1e-9));
+  double lost_for_good = 0.0;
+  for (const auto& record : records) lost_for_good += op_of(record).lost.per_second * dt_s;
+  REQUIRE_THAT(lost_for_good, WithinRel(2999.0, 1e-9));
+}
+
+TEST_CASE(
+    "the storm's block counts 8.907k attempts lost, 2.939k requests lost for good, and the "
+    "5.968k attempts the retries added",
+    "[theory]") {
+  const auto out = reports_of(storm_probe());
+  CAPTURE(out.table);
+  REQUIRE(out.table.ends_with(
+      "fault 00:00:10 node_down s for 10s\n"
+      "  during:   offered 890.8/s, served 0/s, lost 8.907k attempts (2.939k requests lost for "
+      "good), backlog 1 (room 1 dropped the rest)\n"
+      "  after:    backlog drained in 0.1s, retries added 5.968k attempts\n" +
+      std::string{storm_recovery}));
+}
+
+TEST_CASE(
+    "the storm's JSON has lost in attempts, lost_requests 2939 and retries_added_attempts 5968",
+    "[theory]") {
+  const auto json = reports_of(storm_probe()).json;
+  CAPTURE(json);
+  REQUIRE_THAT(json_number(json, "lost"), WithinRel(8907.0, 1e-9));
+  REQUIRE(json.contains("\"lost_unit\": \"attempts\", \"lost_requests\": "));
+  REQUIRE_THAT(json_number(json, "lost_requests"), WithinRel(2939.0, 1e-9));
+  REQUIRE_THAT(json_number(json, "retries_added_attempts"), WithinRel(5968.0, 1e-9));
+  REQUIRE(json.contains("\"pool_republished_jobs\": null"));
+}
+
+// The identity: no retries, no attempts. The block and the JSON are what they were before the
+// fault block knew of retries: the node's drops in requests (29 + 99 x 30 = 2999), no parenthesis,
+// nothing added after, and the new keys null.
+TEST_CASE("the same node_down without retries prints requests, no lost for good and nothing added",
+          "[theory]") {
+  const auto out = reports_of(storm_probe(""));
+  CAPTURE(out.table, out.json);
+  REQUIRE(out.table.ends_with(
+      "fault 00:00:10 node_down s for 10s\n"
+      "  during:   offered 300/s, served 0/s, lost 2.999k requests, backlog 1 (room 1 dropped the "
+      "rest)\n"
+      "  after:    backlog drained in 0.1s\n" +
+      std::string{storm_recovery}));
+  REQUIRE(out.json.contains("\"lost_unit\": \"requests\", \"lost_requests\": null"));
+  REQUIRE(out.json.contains("\"retries_added_attempts\": null, \"pool_republished_jobs\": null"));
 }
 
 // ---- A timeout is a failure like a loss

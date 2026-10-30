@@ -1578,8 +1578,8 @@ both hold the steps they share and are not to be added.
 
 `during` reads the faulted part over the fault's steps (a `dc_down`: its datacenter's nodes,
 clients excepted; a `cache_flush`: the cache over its warm-up; a `traffic_spike`: the client, in
-requests, offered at the spiked rate, served as answered, lost as not answered, lost on the way or
-timed out, with no backlog of its own): the means of its demand and drain, then `lost`, its drops
+requests, offered at the spiked rate, served as answered, lost as its requests lost for good, their
+last attempt lost on the way or timed out, with no backlog of its own): the means of its demand and drain, then `lost`, its drops
 minus the twin's from `at` to the recovery step (to the end of the run without one), so the drain's
 losses after the fault are in it and an overload the twin has too is not. The figures are in the
 node's own unit, as its capacity is written: requests (capacity units: requests when every cost is
@@ -1599,11 +1599,46 @@ table's verdict (the run's, or for an SLO with `over` its worst window's) differ
 A flip belongs to the run, so it is named on each fault that broke the SLO during its window, or on
 every fault when none did.
 
+**Retries: attempts and requests lost for good.** A client's [`retries`](#node-types) and a
+[worker pool's](#message_queue-and-worker_pool) send a failure again, and a failing node is then
+sent every request several times: ch. 1's retry storm. Its drops count **attempts**, the servers'
+work, and a request dropped twice and answered on its third attempt cost its user nothing. When a
+retrying client's paths reach the faulted node (or datacenter), or a retrying pool calls into it,
+`during` says both: `lost 8.907k attempts (2.939k requests lost for good)`, the node's drops minus
+the twin's in attempts (and its rates, backlog and room in attempts too; a node that counts MB
+keeps MB), then the requests the users lost: the final losses of the clients whose paths reach it
+(their last attempts lost on the way or timed out), minus the twin's, over the same steps. A pool's
+failed calls lose no user request (the queue answered the publish), so a sink's outage under a
+retrying pool reads `lost 999 attempts (0 requests lost for good)`; the jobs come back on the queue
+(`after`, below) and the last attempts' failures are the pool's dead letters (the node table's
+`dead_lettered/s`). The storm probe of `tests/theory/test_retries.cpp` (300/s, `retries: 2` after
+100 ms, into a node with `queue_limit: 1` down for 10 s):
+
+```
+fault 00:00:10 node_down s for 10s
+  during:   offered 890.8/s, served 0/s, lost 8.907k attempts (2.939k requests lost for good), backlog 1 (room 1 dropped the rest)
+  after:    backlog drained in 0.1s, retries added 5.968k attempts
+  recovery: back within 1% (every op's p99, every node's rho) at 00:00:20.1 (0.1s after the fault cleared)
+```
+
+Without retries the same outage loses 2.999k requests: the retries saved 60 and cost 5,968
+attempts. A scenario where no retrying client or pool reaches the faulted node prints the block
+without either figure, as before retries existed.
+
 `after` is a flushed cache's warm-up (`cache warm again in 12.1s`, the time its hit ratio is whole
 again) or, for every other kind, the time from the end of the fault to the end of the first step
 at which the backlog it left is back at the twin's (`no backlog to drain` without one, `backlog
 not drained by the end of the run`); a `traffic_spike`'s backlog is downstream, and the line names
-the node with the most work left (`s backlog drained in 0.2s`).
+the node with the most work left (`s backlog drained in 0.2s`). Then what the retries cost beyond
+the twin's from `at` to the recovery, each only when there was some: `retries added 5.968k
+attempts`, the attempts the clients whose paths reach the faulted part (a `traffic_spike`: its
+client) sent beyond their offered load, and `pool w re-published 999 jobs` (`pools v, w ...` for
+several), the jobs the retrying pools that call into it put back on their queues.
+
+In `run --report json` each fault's `during` has `lost_unit` (`"requests"`, `"MB"` or
+`"attempts"`) and `lost_requests` (the requests lost for good; `null` when no retries are
+involved), and its `after` has `retries_added_attempts` and `pool_republished_jobs` (`null` when
+the text prints none).
 
 `recovery` is the start of the first step after the fault clears (a `cache_flush`: from the flush)
 at which every client op's p99 (the step's lognormal fit) and every node's rho are within 1 % of
