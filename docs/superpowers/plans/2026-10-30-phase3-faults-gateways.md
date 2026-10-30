@@ -152,7 +152,7 @@ for `datacenter:`; `is_written_as_number` moved to `detail.cpp` so the curve and
 
 **Files:** create `src/engine/faults.cppm` (`Condition`, `FaultSchedule`, `FaultRecord` skeleton); modify `src/engine/engine.cppm` (`Simulation` owns a schedule; `forward_pass` asks `condition_at(node, now)` and hands it to the node before its step), `src/engine/behaviours.cppm` (`ServiceBehaviour` and every M/M/c-based behaviour take `capacity_factor` and `extra_latency` into their `FluidQueue::set_service`/capacity for the step; `ClientBehaviour` multiplies its rate by `rate_factor`; the hit-ratio factor waits for Task 7), `src/report/report.cpp` (`estimate` prints `faults: 3 scripted (estimate shows the steady state without them; run applies them)`), `CMakeLists.txt`, tests in a new `tests/theory/test_faults.cpp` (registered in `theory_tests`) and `tests/unit/test_engine.cpp`.
 
-- [ ] Tests (theory; one M/M/1 probe: client 400/s → service capacity 1k/s, latency 1 ms, `queue_limit: 100`, step 100 ms, zero-latency link):
+- [x] Tests (theory; one M/M/1 probe: client 400/s → service capacity 1k/s, latency 1 ms, `queue_limit: 100`, step 100 ms, zero-latency link):
   - `node_down` for 10 s from 00:10: during the fault the service's drain is **0/s**, its backlog **100** (the room), dropped **400 × 10 − 100 = 3900** requests over the fault (the first 0.25 s fill the room: 100 / 400), the client's answered **0/s**; after the fault the backlog drains in **100 / (1000 − 400) = 0.1667 s** (two steps at 100 ms: 60 then 0) and the op's mean latency is back at the M/M/1 value `1 / (1 − 0.4) = 1.667 ms` by the third step after the fault clears (the recovery pin: within 1 % of the step before the fault).
   - `node_down` with `replicas: 1` of 4 on a `replicas: 4` service: capacity **× 0.75**, rho **0.4 / 0.75 = 0.5333** during the fault (closed form from `mmc_wait` with c = 3 of 4).
   - `latency_spike` `extra: 1ms`: service time 2 ms, capacity **500/s**, rho **0.8**, M/M/1 mean **2 / (1 − 0.8) = 10 ms** (from 1.667 ms); `capacity` `factor: 0.5`: capacity 500/s with the service time still 1 ms, rho 0.8, mean **1 / (1 − 0.8) = 5 ms** (the two kinds differ by exactly the service time: pin both).
@@ -160,8 +160,8 @@ for `datacenter:`; `is_written_as_number` moved to `detail.cpp` so the curve and
   - two faults on one node overlap: factors multiply (`capacity` 0.5 twice → 0.25), extra latencies add.
   - a scenario with faults twice → byte-identical run; without faults → byte-identical to the binary before this task (the identity condition).
   - `estimate` ignores faults and prints the note; `dc_down` is refused for now with `dc_down lands in Task 7` (a stub refusal in `Simulation::create`, replaced in Task 7).
-- [ ] Tests (unit, `FaultSchedule`): `condition_at` is the identity outside every fault, a fault is active on `[at, at + for)`, overlapping faults compose, a fault on replica `r` of `R` gives `(R − r) / R`.
-- [ ] Commit `engine: scripted faults as per-step conditions on capacity, latency and rate`.
+- [x] Tests (unit, `FaultSchedule`): `condition_at` is the identity outside every fault, a fault is active on `[at, at + for)`, overlapping faults compose, a fault on replica `r` of `R` gives `(R − r) / R`.
+- [x] Commit `engine: scripted faults as per-step conditions on capacity, latency and rate` (`9e13789`; review fixes `38f061e`).
 
 Red at `fbc7750` (2026-10-30). Notes from the test-writer: `at: 00:10` is a clock time (ten
 minutes from midnight), so the probe uses `at: 10s`; `capacity` is per replica with an even split
@@ -210,6 +210,14 @@ down, the share `N/M` of keys per down machine held it; those keys have `N − r
 request is lost when fewer than `W` (writes) or `R` (reads) are live, else it is served by the
 quorum of the live ones (the order statistic over `N − r`). 7 → moot (Task 7 removes the refusal).
 The fix round runs after Task 7's green commit (same files).
+Fixed at `38f061e` (1265 tests). Notes from the fix round, carried to the phase 3 review: the
+capacity factor on a sql_db's surviving read replicas also scales the writes they replay (1 of 2
+down: rho 0.14 → 0.28 where a real survivor sits at 0.18; exact would split the group's demand, not
+its capacity: documented in `Derating`); a kv_cluster's down machines are always cool ones, the
+survivors keep their own load (strict quorum), and the key share that held a down machine is
+hypergeometric; `back_in_s` is one number per node (a sql_db whose primary and replicas are down
+by faults ending at different times waits for the later end); news-feed's 30 s waits widen the
+lognormal moment fit (post p50 194 µs, p99 58 ms): a limit of the fit, reported as measured.
 
 ### Task 7: cache flush and `dc_down`
 
