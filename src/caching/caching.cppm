@@ -16,7 +16,8 @@
 // popularity, and what a cache passes on: its misses are the cold tail of the popularity,
 // which is all a second cache behind it ever sees (Popularity::filtered_by). Ignored: temporal
 // locality (a key requested now is no likelier to be requested again soon — the independent
-// reference model below), TTL expiry, cold start (the estimate is the steady state), and eviction
+// reference model below), TTL expiry, the cold start of a new cache (the estimate is the steady
+// state; a cache refilling after a flush is refill_hit_ratio), and eviction
 // policies other than LRU. FIFO (and random eviction) has a Che-like closed form too, Martina,
 // Garetto & Leonardi, "A unified approach to the performance analysis of caching systems", IEEE
 // INFOCOM 2014: a key is cached with probability p·t / (1 + p·t) instead of 1 − e^{−p·t}. Not
@@ -151,6 +152,27 @@ class Popularity {
 // misses (Popularity::filtered_by). +infinity when `capacity >= N` (nothing is ever evicted),
 // 0 when `capacity == 0`; the same errors as che_hit_ratio.
 [[nodiscard]] double che_characteristic_time(double capacity, const Popularity& popularity);
+
+// D(n) = Σ_i (1 − e^{−p_i n}): the expected number of DISTINCT keys among `requests` independent
+// requests drawn from `popularity` (the coupon-collector sum: each draw is a coupon, a key is
+// collected once some request asked for it). It is the left-hand side of Che's equation above,
+// with the characteristic time read as a count of requests: D(t_c) = C. A cache emptied by a flush
+// that has since seen n requests and evicted nothing yet holds exactly D(n) keys (phase 3's
+// cache_flush, engine::FaultSchedule). Throws std::invalid_argument for a negative or NaN count.
+[[nodiscard]] double keys_requested(const Popularity& popularity, double requests);
+
+// The hit ratio of an LRU cache of `capacity` keys that was emptied and has since seen `requests`
+// requests (phase 3 spec §4.3, the warm-up after a cache_flush): the Che hit ratio of a cache of
+//   min(capacity, D(requests))                                     entries.
+// While D(n) < capacity nothing has been evicted, so the cache holds every key asked for in the
+// last n requests: it IS an LRU cache whose characteristic time is n, and Che's hit ratio is read
+// at t = n with no equation to solve, h = Σ_i p_i (1 − e^{−p_i n}). Once D(n) reaches the capacity
+// the cache is full and evicts as usual: the steady che_hit_ratio(capacity). 0 for 0 requests.
+// Assumes what che_hit_ratio assumes (IRM, LRU), and that the cache refills only from the requests
+// it is asked (a miss fetches its key and keeps it). Same errors as keys_requested and
+// che_hit_ratio.
+[[nodiscard]] double refill_hit_ratio(double capacity, const Popularity& popularity,
+                                      double requests);
 
 // C++20 concepts and `requires` expressions: a concept is a named compile-time predicate
 // on a type. Replaces SFINAE and enable_if tricks (and "read the docs and hope" duck
@@ -391,6 +413,16 @@ double che_hit_ratio(double capacity, const Popularity& popularity) {
   if (std::isinf(t)) return 1.0;  // every key fits: no steady-state miss
   if (t == 0.0) return 0.0;
   return hit_ratio_at(popularity.buckets(), t);
+}
+
+double keys_requested(const Popularity& popularity, double requests) {
+  if (!(requests >= 0.0)) throw std::invalid_argument{"a count of requests must be >= 0"};
+  return keys_in_cache(popularity.buckets(), requests);
+}
+
+double refill_hit_ratio(double capacity, const Popularity& popularity, double requests) {
+  if (keys_requested(popularity, requests) >= capacity) return che_hit_ratio(capacity, popularity);
+  return hit_ratio_at(popularity.buckets(), requests);  // t_c of a cache of D(n) keys is n itself
 }
 
 Popularity Popularity::filtered_by(double characteristic_time) const {

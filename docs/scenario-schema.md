@@ -133,7 +133,8 @@ Everything else is refused before the first step, with exit code 1:
 | `ws_gateway`, `service_discovery` | `node 'x' has type 'ws_gateway', which run/estimate do not support yet (phase 3)` | 3 |
 | `notification_fanout`, `frontier` | the same message | 3 |
 | a `cdn` with `hit_ratio: che` and no `keys` | `node 'x': hit_ratio che needs keys (the cdn's size in objects)` | now, once it states `keys` |
-| a `dc_down` fault | `dc_down lands in Task 7` (the other kinds run: see [`faults`](#faults)) | 3 |
+| a `cache_flush` on a cache with a fixed `hit_ratio` and no `keys` | `node 'x': cache_flush needs keys (a fixed hit ratio is back once keys requests have refilled it)` | now, once it states `keys` |
+| a `cache_flush` on a cache whose hit ratio is 1 | `node 'x': cache_flush on a cache that always hits (hit ratio 1): it has no miss path to warm through` | now, with a hit ratio below 1 |
 
 The type message names the phase that plans the type's model, phase 3 for all four. The type
 check runs over the whole file first, and names the first node
@@ -261,7 +262,7 @@ copy or machine): they would be lower bounds too.
 | `nodes` | map id → node | yes | read | non-empty; ids are non-empty and unique |
 | `links` | list | yes | read | `[]` for none |
 | `slo` | list | no | read | |
-| `faults` | list | no | read | scripted failures, see [`faults`](#faults); `run` applies them (but `dc_down`, refused until phase 3 Task 7), `estimate` leaves them out |
+| `faults` | list | no | read | scripted failures, see [`faults`](#faults); `run` applies them, `estimate` leaves them out |
 
 ## `datacenters`
 
@@ -1396,8 +1397,24 @@ changes the numbers the node's queue is built from, and nothing else:
 | `capacity` | capacity × `factor`; a request still takes its service time |
 | `latency_spike` | service time + `extra`, so the node's servers drain c / (s + extra) a second |
 | `traffic_spike` | the client's rate × `factor`, exactly as a `spikes` entry on its rate curve |
-| `cache_flush` | nothing yet (the hit ratio warming back is phase 3 Task 7) |
-| `dc_down` | refused by `run` and `estimate`: `dc_down lands in Task 7` |
+| `cache_flush` | an instant, not a window: the cache's hit ratio is 0 at the step that starts at `at` and warms back (below) |
+| `dc_down` | a `node_down` of every node whose `dc` is the datacenter (clients excepted: they keep sending), and capacity 0 on every link with one end inside it and the other outside, either way. A link with a `bandwidth` is a queue of megabytes: it drains nothing, fills its room (1000 MB) and drops the rest, so nothing crosses it once the room is full. A plain link has no queue: it drops at once what it is sent, and every request over it is lost (it has no row in the link table to count them in). A link with both ends inside is not cut. Requests already in flight on a link when the cut begins still arrive |
+
+**The warm-up after a `cache_flush`** (phase 3 spec §4.3; `engine::FaultSchedule`). A flush empties
+the cache at `at`; it then refills from the reads it is handed, at the rate it was handed them at
+the flush in the long run (what `estimate` would show at that time: one rate for the whole warm-up,
+so a rate curve that rises or falls meanwhile is not followed; each of its replicas sees its share).
+After t seconds one copy has seen n = rate × t reads. A `che` cache then holds the D(n) distinct
+keys among them, D(n) = Σᵢ (1 − e^(−pᵢ n)) (the coupon-collector sum over the clients' key
+popularity), and hits like a Che cache of min(`keys`, D(n)) entries; it is full again, and back at
+its steady hit ratio exactly, once D(n) reaches `keys`, at n = t_c, Che's characteristic time (1k
+reads/s over Zipf 0.8 of 1M keys into 10k keys: h 0.232 steady, 0.127 after 2 s, within 1 % at
+11.8 s, full at 12.1 s). A fixed ratio is a number, not a curve: the cache gains one entry per
+read and warms linearly, h × min(1, n / `keys`), full after `keys` / rate seconds. While it is
+cold, a read_through cache or a CDN sends its store the extra misses, and for a `cache_aside` cache
+the service's `on: miss` steps do. A later flush of the same cache restarts the warm-up. Ignored:
+that an LRU cache refills in recency order, the thundering herd on the store, and what writes put
+back.
 
 Faults on one node compose: factors multiply, extra latencies add. The survivors of a `node_down`
 share the node's load evenly (every replica's capacity is scaled); the node comes back at full

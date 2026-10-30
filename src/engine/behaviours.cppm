@@ -267,11 +267,21 @@ struct Hop {
 // `then` steps, which a miss takes all of in turn; or a cache's store hop (fraction = its
 // graph::Graph::backend_fraction). `fraction` is the share of the requests that take the
 // block, in (0, 1].
+//
+// The cache whose misses a block carries (a service's `on: miss` steps after a lookup of it, a
+// read_through cache's or a CDN's store hop for a read, a cache's own `on: miss` then-steps), and
+// that cache's steady hit ratio h: the block is taken by the miss fraction 1 − h of the requests,
+// and by 1 − h × factor while the cache warms back after a cache_flush (HopBlocks::warm).
+struct MissesOf {
+  std::size_t cache;
+  double hit_ratio;
+};
 struct Block {
   double fraction;
   model::StepMode mode;
   std::optional<std::size_t> lookup;  // the lookup a service's miss block follows; else empty
   std::vector<Hop> hops{};  // `{}`: -Wmissing-field-initializers (see model::Step's comment)
+  std::optional<MissesOf> misses{};  // a miss block's cache; empty for a block every request takes
 };
 
 // The blocks of hops a node makes for each incoming op, and the three things the engine asks
@@ -284,6 +294,14 @@ class HopBlocks {
  public:
   // The blocks of `op`, created empty on first use: the owner fills them at construction.
   [[nodiscard]] std::vector<Block>& blocks_for(const std::string& op) { return blocks_by_op_[op]; }
+
+  // Every block that carries the misses of `cache` is taken from now on by 1 − h × `factor` of
+  // the requests (MissesOf): the cache's hit ratio h scaled by its cache_flush warm-up factor
+  // (engine::Condition::hit_ratio_factor), 0 just after the flush (every read misses), 1 once it is
+  // full again (the steady 1 − h, bit for bit Graph's miss fraction). Forwarding, response and
+  // delivered fraction all read the new share, so a cold cache sends more to its store, waits for
+  // it more often and fails more of its reads when the store does.
+  void warm(std::size_t cache, double factor);
 
   // std::span<const Block> rather than `const std::vector<Block>&`: a span can also say "no
   // blocks" (an empty view) without a static empty vector to point at.
@@ -451,6 +469,11 @@ class HopBlocks {
 void add_then_blocks(const graph::Graph& g, std::size_t self, const std::string& op,
                      HopBlocks& hops);
 
+// The misses of cache (or CDN) `self` for a read `op` (MissesOf: the share 1 − h its store hop
+// and its `on: miss` then-steps are taken by); none for a write, which does not miss.
+[[nodiscard]] std::optional<MissesOf> own_misses(const graph::Graph& g, std::size_t self,
+                                                 std::string_view op);
+
 }  // namespace simsys::behaviours::detail
 
 export namespace simsys::behaviours {
@@ -533,8 +556,15 @@ class ServiceBehaviour {
     return hops_.delivered(op, own, downstream);
   }
 
+  // The miss steps after a lookup of `cache` are taken by 1 − h × factor of the requests from now
+  // on (detail::HopBlocks::warm): the engine's call while that cache warms back after a
+  // cache_flush, the cache-aside case of the warm-up (the service, not the cache, fetches a miss).
+  void set_hit_ratio_factor(std::size_t cache, double factor) { hops_.warm(cache, factor); }
+
  private:
   void add_hops(const graph::Graph& g, const std::string& op);
+  [[nodiscard]] std::optional<detail::MissesOf> misses_of_lookup(
+      const graph::Graph& g, const std::string& op, std::optional<std::size_t> lookup) const;
 
   std::size_t self_;
   detail::HopBlocks hops_;  // per incoming op: its resolved steps, in blocks
@@ -1028,10 +1058,14 @@ class RateLimiterBehaviour {
 // not a class per strategy: graph::Graph::backend_fraction tests it (through
 // graph's sends_to_store) once per op at construction, and this behaviour only reads the
 // resulting shares.
+// A cache_flush (phase 3 spec §4.3, engine::FaultSchedule's WarmUp) empties the cache: the engine
+// scales h by the warm-up factor every step (set_hit_ratio_factor), 0 at the flush, so every read
+// misses, back to 1 once the cache is full; for a cache_aside cache it is the service's miss steps
+// that it scales (ServiceBehaviour::set_hit_ratio_factor), as they carry the misses.
 // Ignored: which keys are popular (h is a number here; graph::Graph turns a `che` hit ratio into
 // one at build), entries expiring by TTL and the
 // eviction order (`ttl`, `eviction` are read and printed only), a cold cache filling up
-// after a start or a flush, the thundering herd of misses when a hot key expires (every
+// after a start, the thundering herd of misses when a hot key expires (every
 // miss is an independent request to the store), invalidation traffic, and write-back's
 // dirty-entry queue: how far the store lags behind the cache, and the writes lost when the
 // cache dies before a flush.
@@ -1044,8 +1078,9 @@ class CacheBehaviour {
   // the step's share along each `then` step (the class comment), each block sent only the
   // requests the blocks before it delivered last step (detail::HopBlocks::forward: a `then` step
   // after a read_through fetch is sent the hits and the misses the store answered). `now` and
-  // `dt` are unused: with a fixed hit ratio the cache holds no state between steps. The template
-  // head as in ServiceBehaviour::route.
+  // `dt` are unused: the only state the cache holds between steps is its hit ratio's warm-up
+  // factor, which the engine sets (set_hit_ratio_factor). The template head as in
+  // ServiceBehaviour::route.
   template <FractionLookup Lookup = NothingLost>
   [[nodiscard]] Routed route(const flow::Flow& in, SimTime /*now*/, SimTime /*dt*/,
                              Lookup&& delivered_last_step = {}) const {
@@ -1081,6 +1116,12 @@ class CacheBehaviour {
                                  FractionLookup auto&& downstream) const {
     return hops_.delivered(op, own, downstream);
   }
+
+  // The cache's hit ratio is h × factor from now on (engine::Condition::hit_ratio_factor, a
+  // cache_flush's warm-up): its read misses, to the store and along its `on: miss` then-steps,
+  // are 1 − h × factor of the reads (detail::HopBlocks::warm). A `cache` other than this one
+  // changes nothing: a cache's own blocks carry only its own misses.
+  void set_hit_ratio_factor(std::size_t cache, double factor) { hops_.warm(cache, factor); }
 
  private:
   void add_backend_block(const graph::Graph& g, const std::string& op);
@@ -1294,12 +1335,13 @@ class MegabyteService {
 // MegabyteService) and a stream, a read, is answered at its first megabyte. What it forwards to the
 // origin is still the miss share of the REQUESTS: a cost prices work here, it does not multiply
 // requests. A CDN sized in requests (the default 100k/s) charges 1 per request whatever its size.
-// Ignored: the TTL and the stale content it serves (`ttl` is accepted and not modelled), a cold
-// edge warming up, invalidation, ch. 1's "CDN fallback" (the clients going to the origin while the
-// CDN is down: phase 3's faults), the choice of the nearest PoP (a client's links say which CDN it
-// uses), the CDN's price, and, sized in bytes, the transfer time of all but a stream's first
-// megabyte (see BlobStoreBehaviour). Pattern: Delegation (composition over inheritance) — a CDN IS
-// the read_through shape of a cache, so CdnBehaviour holds a CacheBehaviour and forwards
+// A cache_flush (a purge of the whole edge) warms back as a cache's does (CacheBehaviour). Ignored:
+// the TTL and the stale content it serves (`ttl` is accepted and not modelled), a cold edge
+// warming up after a start, invalidation, ch. 1's "CDN fallback" (the clients going to the origin
+// while the CDN is down: phase 3's faults), the choice of the nearest PoP (a client's links say
+// which CDN it uses), the CDN's price, and, sized in bytes, the transfer time of all but a stream's
+// first megabyte (see BlobStoreBehaviour). Pattern: Delegation (composition over inheritance) — a
+// CDN IS the read_through shape of a cache, so CdnBehaviour holds a CacheBehaviour and forwards
 // route/response/delivered to it rather than restating them. graph::Graph resolves the origin as
 // the cache's backend (ResolvedNode::backend) with the read_through share, which is all
 // CacheBehaviour reads. Only cost() and megabyte_service() are its own: a cache counts requests, a
@@ -1331,6 +1373,12 @@ class CdnBehaviour {
   [[nodiscard]] double delivered(std::string_view op, double own,
                                  FractionLookup auto&& downstream) const {
     return cache_.delivered(op, own, downstream);
+  }
+
+  // h × factor from now on, a cache_flush's warm-up (CacheBehaviour::set_hit_ratio_factor): the
+  // origin is sent 1 − h × factor of every read.
+  void set_hit_ratio_factor(std::size_t cache, double factor) {
+    cache_.set_hit_ratio_factor(cache, factor);
   }
 
   // How the CDN times a stream when it counts megabytes; null when it counts requests.
@@ -1903,6 +1951,20 @@ std::span<const detail::Block> detail::HopBlocks::blocks_of(std::string_view op)
   return found->second;
 }
 
+// The miss fraction 1 − h × factor (MissesOf): written so that factor 1 gives 1 − h exactly, the
+// share Graph::build resolved, and a warm cache routes bit for bit as before its flush.
+void detail::HopBlocks::warm(std::size_t cache, double factor) {
+  // C++20 std::views::values: a lazy view of each map entry's value (an op's blocks), replacing
+  // a loop over the pairs that ignores `.first`.
+  for (auto& blocks : blocks_by_op_ | std::views::values) {
+    for (Block& block : blocks) {
+      if (block.misses && block.misses->cache == cache) {
+        block.fraction = 1.0 - block.misses->hit_ratio * factor;
+      }
+    }
+  }
+}
+
 // ---- ServiceBehaviour ----
 
 // Only `ops` steps: a service has no `then` (loader-enforced, see the class comment).
@@ -1932,8 +1994,10 @@ void ServiceBehaviour::add_hops(const graph::Graph& g, const std::string& op) {
     const bool same_miss_block =
         resolved.lookup && !blocks.empty() && blocks.back().lookup == resolved.lookup;
     if (!same_miss_block) {
-      blocks.push_back(
-          Block{.fraction = resolved.fraction, .mode = resolved.mode, .lookup = resolved.lookup});
+      blocks.push_back(Block{.fraction = resolved.fraction,
+                             .mode = resolved.mode,
+                             .lookup = resolved.lookup,
+                             .misses = misses_of_lookup(g, op, resolved.lookup)});
     }
     // Graph::build already proved a link carries the demand.
     const auto link = *g.demand_link(self_, resolved.target);
@@ -1945,6 +2009,15 @@ void ServiceBehaviour::add_hops(const graph::Graph& g, const std::string& op) {
             .link_leg_s = seconds(g.links()[link].one_way),
             .asynchronous = g.is_async_hop(self_, op, resolved.target, resolved.op)});
   }
+}
+
+// The cache a miss block's lookup asks (graph::ServiceHop::lookup, a position among the op's hops)
+// and its hit ratio, which the block's fraction 1 − h was resolved from; empty for any other block.
+std::optional<detail::MissesOf> ServiceBehaviour::misses_of_lookup(
+    const graph::Graph& g, const std::string& op, std::optional<std::size_t> lookup) const {
+  if (!lookup) return std::nullopt;
+  const std::size_t cache = g.service_hops(self_, op)[*lookup].target;
+  return detail::MissesOf{.cache = cache, .hit_ratio = g.hit_ratio(cache).value_or(0.0)};
 }
 
 // ---- ClientBehaviour ----
@@ -2231,7 +2304,8 @@ detail::Hop detail::hop_with(const graph::Graph& g, std::size_t self, std::size_
 }
 
 // The store hop: the same op, for graph::Graph::backend_fraction of the requests. A share of 0
-// (cache_aside, a read under a write strategy) adds no block: it forwards nothing.
+// (cache_aside, a read under a write strategy) adds no block: it forwards nothing. A read's hop
+// carries the cache's misses (detail::own_misses); a write's is taken by every write.
 void CacheBehaviour::add_backend_block(const graph::Graph& g, const std::string& op) {
   const auto& resolved = g.nodes()[self_];
   const double share = g.backend_fraction(self_, op);
@@ -2240,7 +2314,8 @@ void CacheBehaviour::add_backend_block(const graph::Graph& g, const std::string&
       detail::Block{.fraction = share,
                     .mode = model::StepMode::sequential,
                     .lookup = std::nullopt,
-                    .hops = {detail::hop_to(g, self_, op, *resolved.backend, op, 1.0)}});
+                    .hops = {detail::hop_to(g, self_, op, *resolved.backend, op, 1.0)},
+                    .misses = detail::own_misses(g, self_, op)});
 }
 
 // Each `on: always` then-step is a block of its own, in its declared mode; the `on: miss` ones
@@ -2249,6 +2324,12 @@ void CacheBehaviour::add_backend_block(const graph::Graph& g, const std::string&
 // failure` before phase 3, a miss step on a write) is left out, as in ServiceBehaviour. A blob
 // store's steps are all unconditional (graph::Graph refuses one on miss or on failure): a block
 // each for a write, none for a read (then_fraction 0: an event fires for a write only).
+std::optional<detail::MissesOf> detail::own_misses(const graph::Graph& g, std::size_t self,
+                                                   std::string_view op) {
+  if (graph::is_write(g.nodes()[self].spec, op)) return std::nullopt;
+  return MissesOf{.cache = self, .hit_ratio = g.hit_ratio(self).value_or(0.0)};
+}
+
 void detail::add_then_blocks(const graph::Graph& g, std::size_t self, const std::string& op,
                              HopBlocks& hops) {
   auto& blocks = hops.blocks_for(op);
@@ -2266,8 +2347,10 @@ void detail::add_then_blocks(const graph::Graph& g, std::size_t self, const std:
     }
     if (!miss_block) {
       miss_block = blocks.size();
-      blocks.push_back(detail::Block{
-          .fraction = fraction, .mode = model::StepMode::sequential, .lookup = std::nullopt});
+      blocks.push_back(detail::Block{.fraction = fraction,
+                                     .mode = model::StepMode::sequential,
+                                     .lookup = std::nullopt,
+                                     .misses = own_misses(g, self, op)});
     }
     blocks[*miss_block].hops.push_back(std::move(hop));
   }

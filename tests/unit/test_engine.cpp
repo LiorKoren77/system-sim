@@ -71,6 +71,8 @@ TEST_CASE("a delay line that is popped before any push yields nothing", "[engine
 //   struct Condition { double capacity_factor = 1; SimTime extra_latency{};
 //                      double rate_factor = 1; double hit_ratio_factor = 1; };
 //   FaultSchedule(const model::Scenario&)                 // built from the scenario's typed faults
+//     (Task 7 made it FaultSchedule(const graph::Graph&, flush reads), which the engine builds:
+//     the helpers below take it from Simulation::fault_schedule_of(graph))
 //   Condition FaultSchedule::condition_at(std::size_t node, SimTime now) const
 // where `node` is the index the graph gives the node (Graph::index_of), the engine's own.
 //
@@ -131,7 +133,7 @@ struct Scheduled {
           if (!built) FAIL(built.error().message);
           return std::move(*built);
         }()},
-        schedule{s} {}
+        schedule{simsys::engine::Simulation::fault_schedule_of(graph)} {}
 };
 
 // The condition that changes nothing: what a node gets outside every fault.
@@ -266,7 +268,7 @@ struct ScheduledScenario {
           if (!built) FAIL(built.error().message);
           return std::move(*built);
         }()},
-        schedule{s} {}
+        schedule{simsys::engine::Simulation::fault_schedule_of(graph)} {}
 };
 
 // u (`rate`/s of `get`, with the client's `keys` text) -> cache -> origin, with `cache` the node
