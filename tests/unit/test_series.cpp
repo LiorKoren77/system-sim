@@ -952,7 +952,7 @@ TEST_CASE("explain follows news-feed's fanout pool into graph_db and the feed ca
   REQUIRE_FALSE(graph_db.contains("worker_pool"));
   REQUIRE_FALSE(graph_db.contains("message_queue"));
   REQUIRE(node_line(text, "graph_db")
-              .contains("nodes=6 N=3 W=2 R=2 mode=ap (default; partitions: phase 3)"));
+              .contains("nodes=6 N=3 W=2 R=2 mode=ap (default; partitions: phase 4 backlog)"));
   const auto feed_cache = check_line(text, "feed_cache");
   REQUIRE(feed_cache.contains("peak offered 661.5k/s vs 1M/s total capacity  (66.2%, green)"));
   REQUIRE_FALSE(feed_cache.contains("load not propagated"));
@@ -1125,14 +1125,16 @@ TEST_CASE("explain notes the non-overlapping quorums of chat's presence and noti
           "[series]") {
   const auto chat = explain_shipped("chat-system");
   CAPTURE(chat);
-  REQUIRE(node_line(chat, "presence")
-              .contains("nodes=10 N=2 W=1 R=1 (W + R ≤ N: a read may miss the latest write) "
-                        "mode=ap (default; partitions: phase 3)  imbalance=1.09 (vnodes 150)"));
+  REQUIRE(
+      node_line(chat, "presence")
+          .contains("nodes=10 N=2 W=1 R=1 (W + R ≤ N: a read may miss the latest write) "
+                    "mode=ap (default; partitions: phase 4 backlog)  imbalance=1.09 (vnodes 150)"));
   const auto notification = explain_shipped("notification-system");
   CAPTURE(notification);
-  REQUIRE(node_line(notification, "log_db")
-              .contains("nodes=3 N=2 W=1 R=1 (W + R ≤ N: a read may miss the latest write) "
-                        "mode=ap (default; partitions: phase 3)  imbalance=1.05 (vnodes 150)"));
+  REQUIRE(
+      node_line(notification, "log_db")
+          .contains("nodes=3 N=2 W=1 R=1 (W + R ≤ N: a read may miss the latest write) "
+                    "mode=ap (default; partitions: phase 4 backlog)  imbalance=1.05 (vnodes 150)"));
 }
 
 // ---- `on: failure` steps on paper (spec §5) ----

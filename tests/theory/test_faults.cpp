@@ -1578,12 +1578,15 @@ TEST_CASE("a node_down of two of a kv_cluster's six machines loses the reads who
 //                    fault to the end of the first step at which it is back at the twin's (a
 //                    traffic_spike names the downstream node that drained); a flushed cache's
 //                    warm-up time (keys read off Task 7's curve)
-//   recovery         the first step starting at or after the end of the fault at which every
-//                    client op's p99 and every node's rho are within 1 % of the twin's same step
+//   recovery         the step after the LAST step, from the end of the fault on, at which some
+//                    client op's p99 or some node's rho is outside 1 % of the twin's same step
 //                    (relative to it, with 1e-9 of absolute slack): the time of the START of that
-//                    step. On the M/M/1 probe below the third step after the fault is the first
-//                    with rho back at the twin's 0.4 (steps 20.0 and 20.1 s have rho 1 and 0.8),
-//                    so recovery is at 20.2 s, 0.2 s after the fault cleared.
+//                    step; the end of the fault itself when no step after it is outside, and "not
+//                    recovered" when the run's last step is. The block is written at the end of
+//                    the run, so the whole run is known: a step that crosses back within 1 % and
+//                    leaves it again does not count (the phase 3 review). On the M/M/1 probe below
+//                    the steps at 20.0 and 20.1 s have rho 1 and 0.8 and every later one the
+//                    twin's 0.4, so recovery is at 20.2 s, 0.2 s after the fault cleared.
 // Formats: the clock is window_clock's (a whole minute `00:10`, a whole second `00:00:10`) and,
 // for a time that is not a whole second, HH:MM:SS with a tenth (`00:00:20.2`); durations after
 // `in`, `for` and `after` are seconds with at most one decimal (`0.2s`, `12.1s`, `0s`), except the
@@ -1804,6 +1807,88 @@ TEST_CASE("a node_down that ends 0.1 s before the run does is not recovered by t
   REQUIRE(run.faults.size() == 1);
   REQUIRE_FALSE(run.faults[0].recovered_at.has_value());
   REQUIRE_FALSE(run.faults[0].after.backlog_drained_in_s.has_value());
+}
+
+// ---- The recovery rule: the step after the LAST step outside 1 % (the phase 3 review) ----------
+//
+// A probe whose system comes back within 1 % of the twin and leaves it again: the client sends
+// 400/s to a (1k/s) whose op calls b (1k/s, 1 ms), over a link with a 20 s latency, at 1 s steps.
+// What a does at t reaches b at t + 20 s. Before the review the recovery was the FIRST step within
+// 1 % once the fault had cleared, so a crossing counted, and the block said "0s after" about a
+// system whose worst moment was still to come.
+namespace {
+
+std::string delayed_probe(std::string_view a_room, std::string_view b_room,
+                          std::string_view duration, std::string_view fault) {
+  return "version: 1\nname: crossing\nduration: " + std::string{duration} +
+         "\nstep: 1s\n"
+         "nodes:\n"
+         "  c: {type: client, rate: {base: 400/s}, ops: {op: 1.0}}\n"
+         "  a: {type: service, capacity: " +
+         std::string{a_room} +
+         ", latency: 1ms, ops: {op: [{to: b, op: op}]}}\n"
+         "  b: {type: service, capacity: 1k/s, latency: 1ms" +
+         std::string{b_room} +
+         "}\n"
+         "links:\n"
+         "  - {from: c, to: a, dir: inout, latency: 0s}\n"
+         "  - {from: a, to: b, dir: out, latency: 20s}\n"
+         "faults:\n  - {" +
+         std::string{fault} + "}\n";
+}
+
+// a (1k/s, a room of one request) down for 5 s from 10 s: it drops the 400/s it is sent (1999 of
+// the 2000: the room keeps one) and b receives nothing from 30 s to 35 s. At 15 s, when the fault
+// clears, every rho and the p99 are the twin's (a has nothing left to work off; b still receives
+// what a sent before the fault); from 30 to 34 s b is idle where the twin's b runs at rho 0.4.
+std::string idle_later(std::string_view duration) {
+  return delayed_probe("1k/s, advanced: {queue_limit: 1}", "", duration,
+                       "at: 10s, kind: node_down, node: a, for: 5s");
+}
+
+}  // namespace
+
+// The crossing: within 1 % at 15 s, outside from 30 to 34 s, back from 35 s on. The recovery is
+// 35 s, 20 s after the fault cleared (the old rule said 15 s, "0s after").
+TEST_CASE("a step back within 1 percent that leaves it again is no recovery: back at 35 s, not 15",
+          "[theory]") {
+  const auto run = fault_run(load_yaml(idle_later("60s")));
+  CAPTURE(run.table);
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE(run.faults[0].recovered_at == simsys::SimTime{35s});
+  REQUIRE(
+      run.table.ends_with(std::string{back_within} + "00:00:35 (20s after the fault cleared)\n"));
+}
+
+// The same probe ended at 32 s: its last steps, 30 and 31 s, are outside 1 % (b idle), so the
+// system is not recovered by the end of the run, although it was within 1 % at 15 s.
+TEST_CASE("a run whose last step is outside 1 percent of the twin is not recovered by its end",
+          "[theory]") {
+  const auto run = fault_run(load_yaml(idle_later("32s")));
+  CAPTURE(run.table);
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE_FALSE(run.faults[0].recovered_at.has_value());
+  REQUIRE(run.table.ends_with("  recovery: not recovered by the end of the run\n"));
+}
+
+// What a fault costs counts to the recovery, so the losses after a crossing count too: a
+// traffic_spike of factor 3 on c for 5 s from 10 s; a (10k/s) passes the 1200/s, and b (1k/s, a
+// room of one request) receives them from 30 to 35 s and drops 200/s of them. The client's answered
+// share in those steps is b's delivered 1000 / 1200, so c loses 400 / 6 = 66.67 requests a second
+// for 5 s, less the one request the room keeps in the first step: 333.0 requests lost for good,
+// all of them after the spike has cleared and after the system was within 1 % at 15 s (the old
+// rule stopped counting there: lost 0). Back at 35 s.
+TEST_CASE(
+    "the losses after a crossing count to the recovery: a delayed overload loses 333 requests",
+    "[theory]") {
+  const auto run = fault_run(
+      load_yaml(delayed_probe("10k/s", ", advanced: {queue_limit: 1}", "60s",
+                              "at: 10s, kind: traffic_spike, node: c, for: 5s, factor: 3")));
+  CAPTURE(run.table);
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE_THAT(run.faults[0].lost, WithinAbs(333.0, 0.01));
+  REQUIRE(run.faults[0].recovered_at == simsys::SimTime{35s});
+  REQUIRE(run.table.contains("lost 333 requests"));
 }
 
 // A traffic_spike's block reads the client, in requests: 400 x 3 = 1200/s offered for 5 s from

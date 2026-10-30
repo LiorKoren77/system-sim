@@ -1363,7 +1363,8 @@ TEST_CASE("explain on labs/kv-store checks the store at 16 nodes", "[scenario]")
   REQUIRE(check_line(text, "store")
               .contains("peak offered 90k/s (30k/s × N 3) vs 160k/s (16 nodes)  "
                         "(hottest 60.9%, green)"));
-  REQUIRE(node_line(text, "store").contains("nodes=16 N=3 W=2 R=2 mode=ap (partitions: phase 3)"));
+  REQUIRE(node_line(text, "store")
+              .contains("nodes=16 N=3 W=2 R=2 mode=ap (partitions: phase 4 backlog)"));
 }
 
 // ---- Search autocomplete runs: the search index serves like a service --------
