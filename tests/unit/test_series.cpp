@@ -230,7 +230,7 @@ constexpr std::string_view node_header =
     "t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,rejected_per_s,latency_ms,zone,"
     "queue_lag_s";
 constexpr std::string_view op_header =
-    "t_s,client,op,offered_per_s,answered_per_s,timed_out_per_s,mean_ms";
+    "t_s,client,op,offered_per_s,attempts_per_s,answered_per_s,timed_out_per_s,mean_ms";
 
 // `explain` of a shipped book scenario, as `simsys explain scenarios/book/<name>/scenario.yaml`
 // prints it. SIMSYS_SCENARIOS_DIR is injected by tests/CMakeLists.txt, like in scenario_tests.
@@ -495,7 +495,7 @@ TEST_CASE("a limiter's rejections are inside its drain, so the identity needs no
   REQUIRE_THAT(demand, WithinRel(drain + drops + backlog, 1e-5));
 }
 
-// ---- op series: offered_per_s, answered_per_s, timed_out_per_s, mean_ms ----
+// ---- op series: offered_per_s, attempts_per_s, answered_per_s, timed_out_per_s, mean_ms ----
 
 TEST_CASE("the op series has its own writer and header, written on construction", "[series]") {
   const auto s = mm1(500);
@@ -514,7 +514,7 @@ TEST_CASE("the op series has one row per client op per step", "[series]") {
   const auto rows = data_rows(out.str());
   CAPTURE(out.str());
   REQUIRE(rows.size() == 5);  // 5 steps x 1 (client, op)
-  REQUIRE(rows[0].size() == 7);
+  REQUIRE(rows[0].size() == 8);
   REQUIRE(rows[0][0] == "0");
   REQUIRE(rows[0][1] == "c");
   REQUIRE(rows[0][2] == "op");
@@ -549,20 +549,24 @@ TEST_CASE(
   const auto g = graph_of(s);
   std::ostringstream out;
   simsys::report::OpSeriesWriter writer{out, g};
+  simsys::engine::ResponseSample sample{.client = 0,
+                                        .op = "op",
+                                        .offered = Rate{250.5},
+                                        .answered = Rate{125.25},
+                                        .timed_out = Rate{4.5},
+                                        .response = {.mean_s = 0.0125}};
+  // ASSUMED: `ResponseSample::attempts`, a Rate like `offered` (assigned, not in the initializer,
+  // so the position of the member does not matter).
+  sample.attempts = Rate{300.75};
   writer.observe(simsys::engine::StepRecord{
-      .t = 200ms,
-      .nodes = std::vector<simsys::engine::NodeSample>(2),
-      .responses = {simsys::engine::ResponseSample{.client = 0,
-                                                   .op = "op",
-                                                   .offered = Rate{250.5},
-                                                   .answered = Rate{125.25},
-                                                   .timed_out = Rate{4.5},
-                                                   .response = {.mean_s = 0.0125}}}});
+      .t = 200ms, .nodes = std::vector<simsys::engine::NodeSample>(2), .responses = {sample}});
   const auto rows = data_rows(out.str());
   REQUIRE(rows.size() == 1);
-  // t_s, client, op, offered_per_s, answered_per_s, timed_out_per_s (what the client gave up on,
-  // delivered after its timeout), mean_ms: 0.0125 s is 12.5 ms.
-  REQUIRE(rows[0] == std::vector<std::string>{"0.2", "c", "op", "250.5", "125.25", "4.5", "12.5"});
+  // t_s, client, op, offered_per_s, attempts_per_s (what the client sent, retries included),
+  // answered_per_s, timed_out_per_s (what the client gave up on, delivered after its timeout),
+  // mean_ms: 0.0125 s is 12.5 ms.
+  REQUIRE(rows[0] ==
+          std::vector<std::string>{"0.2", "c", "op", "250.5", "300.75", "125.25", "4.5", "12.5"});
 }
 
 // Same convention as the node series (report.cpp, SeriesWriter::observe): a CSV cell is
@@ -583,7 +587,8 @@ TEST_CASE("an op series row with an infinite mean writes inf", "[series]") {
           .response = {.mean_s = std::numeric_limits<double>::infinity()}}}});
   const auto rows = data_rows(out.str());
   REQUIRE(rows.size() == 1);
-  REQUIRE(rows[0][6] == "inf");
+  REQUIRE(rows[0].size() == 8);  // checked first: an index past the end is no test failure
+  REQUIRE(rows[0][7] == "inf");
 }
 
 TEST_CASE("answered never exceeds offered, and falls below it when a queue sheds", "[series]") {
@@ -600,7 +605,7 @@ TEST_CASE("answered never exceeds offered, and falls below it when a queue sheds
   bool some_below = false;
   for (const auto& row : rows) {
     const double offered = number(row[3]);
-    const double answered = number(row[4]);
+    const double answered = number(row[5]);
     REQUIRE_THAT(offered, WithinRel(1500.0, 1e-9));
     REQUIRE(answered <= offered * (1.0 + 1e-9));
     some_below = some_below || answered < offered * (1.0 - 1e-3);
@@ -615,7 +620,7 @@ TEST_CASE("answered equals offered when nothing is shed", "[series]") {
   simsys::report::OpSeriesWriter writer{out, g};
   run_into(s, g, [&](const auto& r) { writer.observe(r); });
   for (const auto& row : data_rows(out.str())) {
-    REQUIRE_THAT(number(row[4]), WithinRel(number(row[3]), 1e-9));
+    REQUIRE_THAT(number(row[5]), WithinRel(number(row[3]), 1e-9));
     REQUIRE_THAT(number(row[3]), WithinRel(500.0, 1e-9));
   }
 }
@@ -638,7 +643,79 @@ TEST_CASE("a limiter that refuses half of the requests shows answered = offered 
   REQUIRE(last[1] == "u");
   REQUIRE(last[2] == "call");
   REQUIRE_THAT(number(last[3]), WithinRel(4000.0, 1e-9));
-  REQUIRE_THAT(number(last[4]), WithinRel(2000.0, 1e-6));
+  REQUIRE_THAT(number(last[5]), WithinRel(2000.0, 1e-6));
+}
+
+// ---- op series: attempts_per_s ----
+//
+// The column right after offered_per_s: what the client SENT, its curve plus the retries of the
+// requests it lost or timed out (phase 3 Task 10). u sends 1000/s with `retries: 2` after 100 ms
+// into a sink that fails half of what it serves (room to spare), so at 100 ms steps its attempts
+// are 1000, 1500, then 1750 a second (1 + 0.5 + 0.25 per request) while it offers 1000.
+
+namespace {
+Scenario retrying_into_a_lossy_sink() {
+  Scenario s{.name = "retrying", .version = 1, .duration = 1s, .step = 100ms};
+  NodeSpec api{
+      .id = "api", .type = NodeType::external_sink, .capacity = Rate{100'000}, .latency = 1ms};
+  api.failure_rate = 0.5;
+  Workload workload{.curve = {.base = Rate{1000}}, .op_shares = {{"call", 1.0}}};
+  // ASSUMED names: `Workload::retries` (a count) and `Workload::retry_after` (a duration).
+  workload.retries = static_cast<decltype(workload.retries)>(2);
+  workload.retry_after = 100ms;
+  s.nodes = {NodeSpec{.id = "u", .type = NodeType::client, .workload = std::move(workload)},
+             std::move(api)};
+  s.links = {LinkSpec{.from = "u", .to = "api", .latency = 0s}};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("the op series has attempts_per_s right after offered_per_s", "[series]") {
+  const auto g = graph_of(mm1(500));
+  std::ostringstream out;
+  simsys::report::OpSeriesWriter writer{out, g};
+  const auto header = split_commas(header_of(out.str()));
+  REQUIRE(header.size() == 8);
+  REQUIRE(header[3] == "offered_per_s");
+  REQUIRE(header[4] == "attempts_per_s");
+  REQUIRE(header[5] == "answered_per_s");
+}
+
+TEST_CASE("a retrying client's attempts column climbs 1000, 1500, 1750 while offered stays 1000",
+          "[series]") {
+  const auto s = retrying_into_a_lossy_sink();
+  const auto g = graph_of(s);
+  std::ostringstream out;
+  simsys::report::OpSeriesWriter writer{out, g};
+  run_into(s, g, [&](const auto& r) { writer.observe(r); });
+  const auto rows = data_rows(out.str());
+  CAPTURE(out.str());
+  REQUIRE(rows.size() == 10);  // 10 steps of 100 ms
+  for (const auto& row : rows) REQUIRE_THAT(number(row[3]), WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(number(rows[0][4]), WithinRel(1000.0, 1e-9));
+  REQUIRE_THAT(number(rows[1][4]), WithinRel(1500.0, 1e-9));
+  for (std::size_t i = 2; i < rows.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE_THAT(number(rows[i][4]), WithinRel(1750.0, 1e-6));  // the file keeps 6 digits
+  }
+}
+
+// Without retries the client sends its curve and nothing else, whatever its path sheds: the
+// 1500/s into a 1000/s server with a room of 100 sheds a third, and attempts_per_s is still
+// offered_per_s on every row.
+TEST_CASE("a client without retries has attempts equal to offered on every row, even when it sheds",
+          "[series]") {
+  const auto s = mm1(1500, 100);
+  const auto g = graph_of(s);
+  std::ostringstream out;
+  simsys::report::OpSeriesWriter writer{out, g};
+  run_into(s, g, [&](const auto& r) { writer.observe(r); });
+  const auto rows = data_rows(out.str());
+  REQUIRE(rows.size() == 5);
+  for (const auto& row : rows) {
+    CAPTURE(row[0]);
+    REQUIRE(number(row[4]) == number(row[3]));
+  }
 }
 
 // ---- answered counts what was lost, not what was served in the same step ----
