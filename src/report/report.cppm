@@ -540,13 +540,24 @@ struct SloReplication {
   std::size_t median_run{};
 };
 
-// N runs of one scenario summarised. `seeds[k]` is run k's seed. `median_run` is the run whose
-// report stands for all of them where one run's figures are needed (the JSON around
+// What each run's report is made of, `ops[k]`, `nodes[k]` and `slos[k]` being run k's ops, nodes
+// and SLO verdicts (evaluate_slos), computed once per run: the bands are taken across them and the
+// JSON's per-seed lists are written from them.
+struct RunFigures {
+  std::vector<std::vector<OpSummary>> ops{};
+  std::vector<std::vector<NodeSummary>> nodes{};
+  std::vector<std::vector<SloResult>> slos{};
+};
+
+// N runs of one scenario summarised. `seeds[k]` is run k's seed. Each SLO is judged by its own
+// median run (SloReplication::median_run), and two SLOs can have different ones. `median_run` is
+// the run whose report stands for all of them where one run's figures are needed (the JSON around
 // `replications`, the table's summary line and its fault blocks): the first SLO's median run, so
 // that its verdict, its observed value and the report around them come from one run; without SLOs
 // the median run of the first op's mean latency; without either, the middle seed's.
 struct ReplicationSummary {
   std::vector<int> seeds{};
+  RunFigures per_run{};
   std::vector<OpBands> ops{};
   std::vector<NodeBands> nodes{};
   std::vector<SloReplication> slos{};
@@ -572,16 +583,19 @@ struct ReplicationSummary {
 [[nodiscard]] std::string format_band(std::string_view median, std::string_view low,
                                       std::string_view high);
 
-// For people: two lines saying what the cells are and which seed is the median run, the median
-// run's summary line, the node, link, database and op tables of a run with every number a
-// format_band cell, the SLO table with `PASS in 3 of 5` or `FAIL (passed in 2 of 5)` and each
-// SLO's median run's observed value, and the median run's fault blocks (scripted faults are the
-// same in every run). `runs` are the runs summarize_replications summarised.
+// For people: two lines saying what the cells are and whose the summary line and the fault blocks
+// are (ReplicationSummary::median_run's seed), that run's summary line, the node, link, database
+// and op tables of a run with every number a format_band cell, the SLO table with `PASS in 3 of 5`
+// or `FAIL (passed in 2 of 5)` and each SLO's median run's observed value and seed (`median run:
+// seed 5`), and the fault blocks of the run that stands for all (scripted faults are the same in
+// every run). `runs` are the runs summarize_replications summarised.
 [[nodiscard]] std::string render_replications_table(const ReplicationSummary& replicated,
                                                     std::span<const Summary> runs, bool color);
-// For programs: the median run's JSON report with the replicated SLO verdicts, and one more key,
-// `replications`: `seeds` and `per_seed`, where each op's, node's and SLO's numbers are lists with
-// one entry per seed, each written exactly as that seed's own `run --report json` writes it.
+// For programs: the median run's JSON report with the replicated SLO verdicts, each with the
+// `median_seed` of its own median run, and one more key after them all, `replications`: `seeds`,
+// `median_seed` (the run whose report surrounds it) and `per_seed`, where each op's, node's and
+// SLO's numbers are lists with one entry per seed, each written exactly as that seed's own `run
+// --report json` writes it.
 [[nodiscard]] std::string render_replications_json(const ReplicationSummary& replicated,
                                                    std::span<const Summary> runs);
 

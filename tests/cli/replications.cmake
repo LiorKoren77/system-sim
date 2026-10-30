@@ -46,7 +46,25 @@
 #   series_refused - --series and --series-ops with more than one replication are refused and
 #                    leave no file behind;
 #   fault_once     - a scripted fault is the same in every replication: its block is printed
-#                    once.
+#                    once;
+#   slo_median_seeds - each SLO names the seed of its own median run, in its row and in the JSON,
+#                    and the exit code is 2 when the median run of any SLO fails (the reviewer's
+#                    repro, below);
+#   noiseless_json_note - a scenario without noise under --report json: the note on stderr, the
+#                    plain run's JSON alone on stdout;
+#   sigma_zero     - `noise: {sigma: 0}` is no noise: the note and a single run;
+#   jobs_help      - `run --help` says --jobs is ignored without --replications.
+#
+# The two-SLO probe of slo_median_seeds adds `utilization api max 0.1163 over 10s` to the p99 SLO
+# at 5.7ms. The worst 10 s utilization of api per seed (`--report json`, 2026-10-30):
+#
+#   seed  1        2        3        4        5
+#         0.13267  0.11629  0.12097  0.10839  0.11636
+#
+# Sorted: seeds 4, 2, 5, 3, 1, so this SLO's median run is seed 5 (0.11636 > 0.1163: FAIL), while
+# the p99 SLO's median run is seed 2 (PASS). The run that stands for all (the summary line, the
+# JSON around `replications`) is the first SLO's median run, seed 2; the exit code is 2, from seed
+# 5's verdict on the second SLO.
 cmake_minimum_required(VERSION 3.28)
 
 file(REMOVE_RECURSE "${WORK}")
@@ -347,6 +365,57 @@ elseif(CHECK STREQUAL "fault_once")
     message(FATAL_ERROR "expected the fault block once, found ${header_count} headers:\n${run_out}")
   endif()
   require_contains("${run_out}" "fault 00:00:20 node_down api for 10s" "the fault header")
+elseif(CHECK STREQUAL "slo_median_seeds")
+  file(WRITE "${WORK}/two_slos.yaml" "${PROBE_HEAD}slo:
+  - {metric: p99_latency, node: users, op: ping, max: 5.7ms}
+  - {metric: utilization, node: api, max: 0.1163, over: 10s}
+")
+  simsys_run("${WORK}/two_slos.yaml" --replications 5)
+  require_exit(2 "--replications 5 where the second SLO's median run fails")
+  require_contains("${run_out}" "the summary line and the fault blocks are seed 2's" "the intro")
+  string(REGEX MATCH "[^\n]*p99_latency[^\n]*" p99_line "${run_out}")
+  require_contains("${p99_line}" "PASS in 3 of 5" "the p99 SLO's row")
+  require_contains("${p99_line}" "median run: seed 2" "the p99 SLO's row")
+  string(REGEX MATCH "[^\n]*utilization[^\n]*" utilization_line "${run_out}")
+  require_contains("${utilization_line}" "FAIL (passed in 2 of 5)" "the utilization SLO's row")
+  require_contains("${utilization_line}" "0.1164" "the utilization SLO's observed value, seed 5's")
+  require_contains("${utilization_line}" "median run: seed 5" "the utilization SLO's row")
+
+  simsys_run("${WORK}/two_slos.yaml" --replications 5 --report json)
+  require_exit(2 "--replications 5 --report json where the second SLO's median run fails")
+  json_at("${run_out}" slo 0 median_seed)
+  require_same("2" "${json_value}" "slo[0].median_seed")
+  json_at("${run_out}" slo 1 median_seed)
+  require_same("5" "${json_value}" "slo[1].median_seed")
+  json_at("${run_out}" replications median_seed)
+  require_same("2" "${json_value}" "replications.median_seed, the run around the object")
+elseif(CHECK STREQUAL "noiseless_json_note")
+  simsys_run("${SCENARIO}" --report json)
+  require_exit(0 "the plain run")
+  set(plain_json "${run_out}")
+  simsys_run("${SCENARIO}" --replications 3 --report json)
+  require_exit(0 "--replications 3 --report json on a scenario without noise")
+  require_same("${plain_json}" "${run_out}" "stdout, the plain run's JSON alone")
+  require_contains("${run_err}" "${NOISELESS_NOTE}" "stderr")
+elseif(CHECK STREQUAL "sigma_zero")
+  string(REPLACE "sigma: 0.2" "sigma: 0" zero_head "${PROBE_HEAD}")
+  file(WRITE "${WORK}/sigma_zero.yaml" "${zero_head}")
+  simsys_run("${WORK}/sigma_zero.yaml")
+  require_exit(0 "the plain run of sigma 0")
+  set(plain_table "${run_out}")
+  simsys_run("${WORK}/sigma_zero.yaml" --replications 5)
+  require_exit(0 "--replications 5 with sigma 0")
+  require_same("${NOISELESS_NOTE}\n${plain_table}" "${run_out}" "sigma 0: the note and one run")
+elseif(CHECK STREQUAL "jobs_help")
+  execute_process(COMMAND "${SIMSYS}" run --help OUTPUT_VARIABLE help ERROR_VARIABLE help_err)
+  # CLI11 may wrap a long description: compare with every run of blanks and newlines as one space.
+  string(REGEX REPLACE "[ \n]+" " " help "${help}")
+  string(FIND "${help}" "--jobs " at)
+  if(at EQUAL -1)
+    message(FATAL_ERROR "run --help has no --jobs:\n${help}")
+  endif()
+  string(SUBSTRING "${help}" ${at} 200 jobs_text)
+  require_contains("${jobs_text}" "ignored without --replications" "--jobs' help text")
 else()
   message(FATAL_ERROR "unknown CHECK '${CHECK}'")
 endif()

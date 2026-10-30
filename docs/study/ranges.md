@@ -17,7 +17,8 @@
 | C++23 `ranges::contains` | `graph.cpp`: `carries_op`, `Graph::add_edge`; `nodes.cpp`: `read_dc`; `workload.cpp`: `sends_op`; `engine.cppm`: `add_once`; `behaviours.cppm`: `SqlDbBehaviour::is_write` |
 | C++23 `ranges::fold_left` | `workload.cpp`: `check_shares_sum_to_one`; `src/report/explain.cpp`: `forward_limited`, `paper_pass`; `behaviours.cppm`: `RateLimiterBehaviour::admit_sliding_log` |
 | C++23 `ranges::to`, `views::join_with`, `views::zip` | `src/report/shared.cppm`: `join`; `report.cpp`: `map_to_strings`, `Summary::observe`; `explain.cpp`: `explain_links`; `workload.cpp`: `read_client_sizes` (`ranges::to<std::map>`) |
-| C++23 `ranges::iota`, `ranges::stable_sort` | `report.cpp`: `rank_order` (the runs of `run --replications` in the order of a value, ties in seed order) |
+| C++23 `ranges::iota`; `ranges::stable_sort` + lambda projection (C++20) | `report.cpp`: `rank_order` (the runs of `run --replications` sorted as indices, compared by the value the projection `[&](std::size_t run) { return values[run]; }` looks up, so the comparator stays `ranks_before(double, double)`; stable: ties in seed order) |
+| `ranges::find_if` + projection | `report.cpp`: `text_band` (the first run whose cell text, the projection, is not blank) |
 
 ## What
 

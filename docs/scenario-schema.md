@@ -1629,7 +1629,7 @@ are we" of a capacity plan (spec §7).
 | option | rule | refused with |
 |---|---|---|
 | `--replications` | 1 to 1000; default 1. 1 is the plain run, byte for byte, `--series` included | `<file>: error: --replications must be between 1 and 1000` |
-| `--jobs` | worker threads for the replications, 1 to 1024; default: the machine's hardware threads. Each replication is its own simulation, written into its own slot, so the output is the same bytes whatever `--jobs` says (the pool is `simsys sweep`'s, [threads](study/threads.md)) | CLI11's range message |
+| `--jobs` | worker threads for the replications, 1 to 1024, ignored without `--replications`; default: the machine's hardware threads. Each replication is its own simulation, written into its own slot, so the output is the same bytes whatever `--jobs` says (the pool is `simsys sweep`'s, [threads](study/threads.md)) | CLI11's range message |
 | `--series`, `--series-ops` | a single run's file: refused with more than one replication, before anything runs or any file is opened | `<file>: error: --series needs a single run (one series file per seed is phase 4 material)` (`--series-ops` likewise) |
 
 **The cells.** Every number of the node, link, database and op tables becomes the median of the N
@@ -1645,21 +1645,24 @@ interpolation would not give; with the handful of runs a replication has, an int
 quantile's extra digits would be precision the sample does not have. The band is the spread of
 the runs, not a confidence interval of their mean.
 
-**The SLOs.** Each SLO is judged by its **median run**, the run whose observed value for it is the
-median: `PASS in 3 of 5` (the median run passed, and 3 of the 5 runs did) or `FAIL (passed in 2
-of 5)`, with the median run's observed value. The exit code is the median runs': 2 when some SLO's
-median run fails, whatever the seeds that passed; 0 when every one passes, 1 on an error (or a run
-that observed no step).
+**The SLOs.** Each SLO is judged by its own **median run**, the run whose observed value for it is
+the median: `PASS in 3 of 5` (the median run passed, and 3 of the 5 runs did) or `FAIL (passed in 2
+of 5)`, with the median run's observed value, and its seed at the end of the row (`median run: seed
+5`). Two SLOs can have two different median runs. The exit code is the median runs': 2 when some
+SLO's median run fails, whatever the seeds that passed; 0 when every one passes, 1 on an error (or
+a run that observed no step).
 
-**The median run** stands for the N runs where one run's report is needed: the summary line
-(steps, drop rate), the fault blocks and, in JSON, everything around `replications`. It is the
-first SLO's median run (so that verdict, its observed value and the report around them are one
-run's); without SLOs the median run of the first op's mean latency. The table's first two lines
-say what the cells are and which seed it is. Scripted [faults](#faults) are the same in every
+**The run that stands for all** is needed where one run's report is: the summary line (steps, drop
+rate), the fault blocks and, in JSON, everything around `replications`. It is the first SLO's
+median run (so that verdict, its observed value and the report around them are one run's); without
+SLOs the median run of the first op's mean latency. The table's first two lines say what the cells
+are and which seed it is (`the summary line and the fault blocks are seed 2's`). Scripted [faults](#faults) are the same in every
 replication (they are part of the scenario, not of the noise), so their block is printed once,
 with the median run's numbers.
 
-**Without noise** every seed gives the same run: `--replications N` runs once and prints
+**Without noise** (no client's rate has a `noise` block with a `sigma` above 0: `sigma: 0`
+multiplies the rate by exactly 1 at every step) every seed gives the same run: `--replications N`
+runs once and prints
 `replications: the scenario has no noise, so every seed gives the same run` as its first line,
 then the plain run's table, byte for byte, with its exit code. Under `--report json` stdout is the
 plain run's JSON alone and the note goes to stderr.
@@ -1670,25 +1673,39 @@ users ping max 5.7ms` (seeds 1 and 3 fail it):
 ```
 $ simsys run probe.yaml --replications 5
 replications: 5 runs, seeds 1..5; a cell is the median across the runs [its 10–90 % band], nearest rank
-median run: seed 2 (the line below and the fault blocks are its own)
+each SLO is judged by its own median run; the summary line and the fault blocks are seed 2's
 scenario hello  600 steps observed  drop rate 0%
 nodes
   node                 mean_rho                peak_rho  peak_backlog  dropped  rejected  red_s  peak_lag
   users                       -                       -             -        -         -      -         -
   api    0.103 [0.09377–0.1124]  0.1388 [0.1305–0.1477]             0        0         0      0         -
 ops (percentiles estimated: lognormal fit to the response moments)
-  client.op           offered/s                mean                 p50                 p95                 p99  (estimated)
-  users.ping  103 [93.77–112.4]  1.62ms [1.61–1.63]  1.33ms [1.32–1.34]  3.72ms [3.69–3.75]  5.69ms [5.64–5.75]
+  client.op           offered/s         attempts/s                mean                 p50                 p95                 p99  (estimated)
+  users.ping  103 [93.77–112.4]  103 [93.77–112.4]  1.62ms [1.61–1.63]  1.33ms [1.32–1.34]  3.72ms [3.69–3.75]  5.69ms [5.64–5.75]
 slo (each: its median run's verdict and observed value, and the runs that passed it)
   status          metric       node   op    observed  max
-  PASS in 3 of 5  p99_latency  users  ping  5.69ms    5.7ms
+  PASS in 3 of 5  p99_latency  users  ping  5.69ms    5.7ms  median run: seed 2
 ```
 
-**JSON** (`--report json`) is the median run's report, its `slo` array holding the replicated
-verdicts (each SLO's median run's), plus one key, `replications`: `seeds`, the N seeds in order,
-and `per_seed`, with one object per op (`client`, `op`, then `offered_per_s`, `answered_per_s`,
-`timed_out_per_s`, `mean_s`, `p50_s`, `p95_s`, `p99_s`), per node (`id`, then `mean_rho`,
-`peak_rho`, `peak_backlog`, `dropped`, `rejected`, `red_s`, `unavailable`, `staleness_s`,
+With a second SLO, `utilization api max 0.1163 over 10s`, its worst 10 s windows over seeds 1..5
+are 0.1327, 0.1163, 0.1210, 0.1084 and 0.1164: its median run is seed 5, which fails it, so the run
+exits 2 while the p99 SLO is still judged by seed 2:
+
+```
+  status                   metric       node   op    observed  max
+  PASS in 3 of 5           p99_latency  users  ping  5.69ms    5.7ms   median run: seed 2
+  FAIL (passed in 2 of 5)  utilization  api    -     0.1164    0.1163  (worst 10s from 00:00:40)  median run: seed 5
+```
+
+**JSON** (`--report json`) is the report of the run that stands for all, its `slo` array holding
+the replicated verdicts (each SLO's median run's, with one more field, `median_seed`, that run's
+seed), plus one key after all of a run's own (after `faults`, when the scenario has some),
+`replications`: `seeds`, the N seeds in order, `median_seed`, the seed of the run whose report
+surrounds it, and `per_seed`, with one object per op (`client`, `op`, then `offered_per_s`,
+`attempts_per_s`, `answered_per_s`, `timed_out_per_s`, `timed_out_attempts_per_s`, `mean_s`,
+`p50_s`, `p95_s`, `p99_s`), per node (`id`, then `mean_rho`,
+`peak_rho`, `peak_backlog`, `dropped`, `dead_lettered`, `dead_lettered_per_s`, `rejected`, `red_s`,
+`unavailable`, `staleness_s`,
 `replication_dropped_per_s`, `committed_writes_per_s`, `peak_queue_lag_s`) and per SLO (`metric`,
 `node`, `op`, `observed`, `status`), each number a list with one entry per seed, in the order of
 `seeds`, written exactly as that seed's own `run --seed S --report json` writes it (null where it
@@ -1697,6 +1714,7 @@ writes null). The bandwidth links' per-seed numbers are not in it (the median ru
 ```
   "replications": {
     "seeds": [1, 2, 3, 4, 5],
+    "median_seed": 2,
     "per_seed": {
       "ops": [
         {"client": "users", "op": "ping", "offered_per_s": [104.97255928866007, ...], ..., "p99_s": [0.005712278457367183, 0.005693737870385378, ...]}

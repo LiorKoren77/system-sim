@@ -82,14 +82,16 @@ undefined behaviour: not "you might read a stale value", but anything, since the
 CPU are allowed to assume it never happens (keep a value in a register, reorder stores, tear a
 64-bit write in two).
 
-What the sweep's threads share, and why each is safe:
+What the threads of `simsys sweep` and of `run --replications` share, and why each is safe:
 
 | Shared | Who writes | Why it is not a race |
 |---|---|---|
 | `next`, the counter | every worker | `std::atomic`: every access is an atomic operation |
-| `results.values[i]`, `results.errors[i]` | only the worker that claimed index `i` | distinct elements of a `std::vector` are distinct memory locations; one writer each, and the main thread reads them only after the joins |
-| the scenario path, the `SweepParam`, the metrics | nobody (read only) | concurrent reads never race |
-| the yaml-cpp document, the `Graph`, the `Simulation`, the `Summary` | the worker of that point | each point has its own; nothing is shared between points |
+| `results.values[i]`, `results.errors[i]` (sweep), `slots[k]` (replications) | only the worker that claimed index `i` (`k`) | distinct elements of a `std::vector` are distinct memory locations; one writer each, and the main thread reads them only after the joins |
+| the scenario path, the `SweepParam`, the metrics (sweep) | nobody (read only) | concurrent reads never race |
+| the yaml-cpp document, the `Graph`, the `Simulation`, the `Summary` (sweep) | the worker of that point | each point has its own; nothing is shared between points |
+| the one `Graph` of `run --replications`, which every worker's `Simulation::create(g, seed)` reads and every `Summary` points back to (`Summary::graph`) | nobody (read only, `const graph::Graph&`) | concurrent reads of the same object do not race. That holds only while `Graph` has no `mutable` member and no lazily computed cache filled on first use: a `const` member function that wrote one would be a write from several threads at once, a data race that `const` does not prevent. Check this before giving `Graph` either |
+| each replication's `Simulation` and `Summary` | the worker of that seed | each seed has its own |
 
 The **join** is what makes the main thread's reads safe: everything a thread did *happens-before*
 its `join()` returns. So the vectors need no lock, and the comment at `PerPoint` says so.

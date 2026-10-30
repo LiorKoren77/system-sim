@@ -79,7 +79,8 @@ process: the same seed gives the same run, byte for byte; without a noise block 
 `seed + N − 1` of that noise, on `--jobs` worker threads (the output does not depend on them), and
 prints every number as its median across the runs with its 10–90 % band, nearest rank
 (`5.69ms [5.64–5.75]`), each SLO as `PASS in 3 of 5` or `FAIL (passed in 2 of 5)` with its median
-run's observed value; it exits with the median run's code. A scenario without noise runs once,
+run's observed value and seed (each SLO is judged by its own median run); it exits 2 when some
+SLO's median run fails. A scenario without noise runs once,
 after a line that says so; `--series` needs a single run
 ([schema](docs/scenario-schema.md#command-line-simsys-run---replications-phase-3)).
 
