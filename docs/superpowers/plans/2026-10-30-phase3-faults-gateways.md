@@ -110,8 +110,8 @@ plus `run --report json` and `sweep` on hello, and `ctest` in both presets (the 
 
 **Files:** `src/model/model.cppm` (`FaultKind {node_down, capacity, latency_spike, cache_flush, traffic_spike, dc_down}`, `Fault`, `Scenario::faults`), `src/config/faults.cpp` (new; `read_faults` replacing `check_faults_is_list`), `src/report/explain.cpp` (`faults: 3 scripted (node_down chat_servers 21:30 for 1m, …)`), tests in `test_config.cpp`, `test_model.cpp`, `test_series.cpp` (chat-system's explain line).
 
-- [ ] Tests (loader; every message verbatim from spec §4.1): each kind loads with its keys; `at` as a clock time (`21:30`) or a duration (`1h30m`) inside the run, else `faults[0]: at must fall inside the run (24h)`; `for` positive and required except for `cache_flush` (`faults[2]: cache_flush takes no for`); `node` a declared node (`faults[0]: node 'x' is not declared`), a client only for `traffic_spike` (`faults[0]: node_down cannot name a client (clients emit, they do not serve)`), a cache or cdn for `cache_flush`; `replicas` only with `node_down`, a positive count at most the node's replicas, `primary` only on a sql_db; `factor` required by `capacity` (in (0, 1): `faults[3]: capacity factor must be between 0 and 1 (a gain is the scenario's capacity)`) and `traffic_spike` (positive); `extra` a positive duration for `latency_spike`; `datacenter` declared for `dc_down`; `kind: partition` → `faults[0]: partition is not modelled in phase 3 (see the backlog)`; unknown keys refused like every map. Model: `Fault` fields and `Scenario::faults` default empty; a scenario without `faults` loads as before. Explain: the line above on chat-system; `faults: none` is not printed.
-- [ ] Commit `config: the faults list, typed`.
+- [x] Tests (loader; every message verbatim from spec §4.1): each kind loads with its keys; `at` as a clock time (`21:30`) or a duration (`1h30m`) inside the run, else `faults[0]: at must fall inside the run (24h)`; `for` positive and required except for `cache_flush` (`faults[2]: cache_flush takes no for`); `node` a declared node (`faults[0]: node 'x' is not declared`), a client only for `traffic_spike` (`faults[0]: node_down cannot name a client (clients emit, they do not serve)`), a cache or cdn for `cache_flush`; `replicas` only with `node_down`, a positive count at most the node's replicas, `primary` only on a sql_db; `factor` required by `capacity` (in (0, 1): `faults[3]: capacity factor must be between 0 and 1 (a gain is the scenario's capacity)`) and `traffic_spike` (positive); `extra` a positive duration for `latency_spike`; `datacenter` declared for `dc_down`; `kind: partition` → `faults[0]: partition is not modelled in phase 3 (see the backlog)`; unknown keys refused like every map. Model: `Fault` fields and `Scenario::faults` default empty; a scenario without `faults` loads as before. Explain: the line above on chat-system; `faults: none` is not printed.
+- [x] Commit `config: the faults list, typed` (`242b5b7`; review fixes `d032c5e`, 1230 tests in Debug and Release).
 
 Red at `ffe50dd` (2026-10-30). Notes from the test-writer: `1h30m` is not a duration the parser
 takes (one number, one unit), so the test uses `90m`; the spec gives six message texts and the
@@ -145,7 +145,8 @@ refuses kv-store's `partition` fault (dropped, noted as backlog in its README) a
    accepted but never reported.
 10. Minor: explain prints `replicas=primary` (just `primary`), `at: 10m` as `00:10`.
 Decisions: 1–6, 8, 9 (sentences, no warmup refusal) and the `primary` nit of 10 fixed; 7 left (the
-comment stands); 10's other nits left.
+comment stands); 10's other nits left. Fixed at `d032c5e` (also: youtube's README example used `dc:`
+for `datacenter:`; `is_written_as_number` moved to `detail.cpp` so the curve and the faults share it).
 
 ### Task 6: `FaultSchedule` and the conditions the engine applies
 
