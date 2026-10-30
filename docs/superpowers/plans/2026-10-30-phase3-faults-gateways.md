@@ -172,6 +172,45 @@ over independent M/M/1 copies, so the replicas pin is 1600/s on 4 replicas (rho 
 and back at 20.2; the `traffic_spike` ≡ `spikes` JSON comparison must drop the `faults` key once
 Task 8 adds it.
 
+**Review of Task 6 at `9e13789`** (adversarial, 2026-10-30): REQUEST_CHANGES. The M/M/1 pins, the
+derating of every queueing type, the spike product and the no-fault identity (six scenarios
+byte-identical to `5ffd737`) all verified.
+1. Critical: `backlog_wait_s` returns infinity at capacity 0 whatever the backlog, and
+   `OpTotals::add` flags the op unavailable on any infinite step, even one that delivered nothing:
+   a 30 s outage makes news-feed's `read_feed` unavailable for the day (exit 2) although its client
+   times out at 500 ms; the whole-run and the `over:` SLO disagree; a factor 0.0005 gives a finite
+   wait while 0 gives infinity.
+2. Important: `replicas: primary` on a sql_db runs identically to `replicas: 1` (every copy group
+   derated by 2/3; writes still answered).
+3. Important: `docs/scenario-schema.md` (news-feed exit 0), `README.md` ("all three SLOs pass",
+   "faults are phase 3 too") now wrong.
+4. Important: the new news-feed outage test pins `isinf(p99)`, the artefact of 1.
+5. Important: spec §4.2's "a down kv_cluster machine raises the loss of the requests whose replica
+   set held it" has no task.
+6. Minor: `curve` does not apply `traffic_spike` although the schema says the fault acts exactly as
+   a `spikes` entry.
+7. Minor: `estimate` refuses `dc_down` while ignoring faults (moot after Task 7).
+8. Minor (teaching): a `latency_spike` on a node whose server count comes from defaults (a load
+   balancer: c = 5 at 50 µs) collapses its capacity (1 ms extra → −95 %); say so in the schema row
+   and the `slowed_rate_per_s` comment.
+9. Minor: `docs/study/modules.md` blames GCC for a partition not importing its primary; the
+   standard forbids the cycle.
+10. Minor (§1): `faults.cppm` lacks first-use comments for `module;`, `import`, `export namespace`.
+11. Minor: news-feed's README outage paragraph omits that replicas now miss writes and that a
+    leaky-bucket limiter's leak is derated too.
+Decisions: 1 → the reviewer's option (b): `Condition`/`Derating` carry `back_in_s` (the latest end of
+the zero-capacity faults on the node); at derated capacity 0 the wait is `back_in_s + backlog /
+nominal capacity`; a step that delivers nothing (answered + timed out = 0) adds no latency and no
+"unavailable"; client timeouts then count the outage as timed out and cap the percentiles as in
+phase 2. 2 → derate copy groups separately: `primary` gives the primary group 0 and leaves the read
+replicas; `replicas: r` gives the read replicas `(N − 1 − r)/(N − 1)` and leaves the primary; unit
+tests for both. 3, 4 (pin the timed-out share and a finite capped p99), 6 (apply the factor in
+`curve`), 8, 9, 10, 11 fixed. 5 → added to the fix round: for a kv_cluster with `r` of `M` machines
+down, the share `N/M` of keys per down machine held it; those keys have `N − r` live replicas, and a
+request is lost when fewer than `W` (writes) or `R` (reads) are live, else it is served by the
+quorum of the live ones (the order statistic over `N − r`). 7 → moot (Task 7 removes the refusal).
+The fix round runs after Task 7's green commit (same files).
+
 ### Task 7: cache flush and `dc_down`
 
 **Files:** `src/engine/faults.cppm` (`hit_ratio_factor` from the warm-up curve: at `t` after the flush the cache holds the keys of `rate × t` requests; `caching::` Che hit ratio of the smaller of `keys` and the distinct keys seen in `t` under the cache's popularity; complete when the cache is full), `src/engine/behaviours.cppm` (`CacheBehaviour`, `CdnBehaviour` multiply their hit ratio by the factor; a fixed-ratio cache warms linearly to its ratio over its fill time, documented as the simple case), `src/engine/engine.cppm` (`dc_down` = `node_down` on every node of the datacenter and a capacity factor 0 on every link leaving it: a pipe's `passed` is 0; a non-pipe link drops what crosses it, counted on the link), tests in `test_faults.cpp`.
