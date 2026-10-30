@@ -1868,3 +1868,35 @@ TEST_CASE("explain follows the web crawler's frontier: no node of it is marked a
   REQUIRE_FALSE(text.contains("load not propagated"));
   REQUIRE_FALSE(text.contains("frontier is not modelled yet"));
 }
+
+// Phase 3 Task 16: google-drive's long_poll states `connections: 2M` (with max_connections 2M x 4
+// replicas, heartbeat 60 s), so explain's gateway line reads Task 14's fixed-level format: the
+// level 2M, "(fixed)", the heartbeat load 2M / 60 s = 33.33k/s, the cap 2M x 4 = 8M. Until the YAML
+// is edited it reads "connections: none (no connect op reaches it, no fixed connections: run
+// refuses it)", the line of a gateway run would refuse.
+TEST_CASE("explain on google-drive prints long_poll's fixed 2M level, 33.33k heartbeats and cap 8M",
+          "[series]") {
+  const auto text = explain_shipped("google-drive");
+  CAPTURE(text);
+  REQUIRE(node_line(text, "long_poll")
+              .ends_with("  connections: 2M (fixed), heartbeat 33.33k/s, cap 8M"));
+}
+
+// The paper load now follows every edge of google-drive: no check line says the load stops
+// somewhere (`load not propagated`), and no node line says a type is "not modelled yet". The
+// phrase "not modelled" alone stays legitimate on notify_q's line, "partitions=8 (not
+// modelled)": that is a key the model ignores on purpose, not a node it cannot follow.
+// The gateway's check line adds the heartbeats to the pushes and polls it is sent: peak offered
+// 33.33k/s + the 511/s of pushes + the 60/s of polls = 33.93k/s (measured on a scratch copy),
+// against 4 replicas x 20k/s = 80k/s, so 42.4 %, green. Sized as the shipped file does today;
+// the implementer re-measures if the replicas or the capacity change.
+TEST_CASE(
+    "explain on google-drive marks no load as not propagated and checks the gateway's heartbeats",
+    "[series]") {
+  const auto text = explain_shipped("google-drive");
+  CAPTURE(text);
+  REQUIRE_FALSE(text.contains("load not propagated"));
+  REQUIRE_FALSE(text.contains("not modelled yet"));
+  const auto gateway = check_line(text, "long_poll");
+  REQUIRE(gateway.contains("peak offered 33.93k/s vs 80k/s total capacity  (42.4%, green)"));
+}
