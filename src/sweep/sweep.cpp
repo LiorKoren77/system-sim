@@ -173,7 +173,7 @@ std::expected<std::vector<std::string>, std::string> expand(const SpecParts& par
 
 constexpr std::string_view metric_grammar =
     "<client>.<op>.mean|p50|p95|p99|attempts|answered, <node>.mean_rho|peak_rho|drop_rate, "
-    "<queue>.lag or <pool>.dead_lettered";
+    "<queue>.lag, <pool>.dead_lettered or <gateway>.connections";
 
 // A metric's last word and what it reads (sweep.cppm's MetricKind); one row each.
 struct MetricWord {
@@ -189,10 +189,12 @@ constexpr std::array op_metric_words{MetricWord{"mean", MetricKind::mean_latency
                                      MetricWord{"p99", MetricKind::p99_latency},
                                      MetricWord{"attempts", MetricKind::attempts_rate},
                                      MetricWord{"answered", MetricKind::answered_rate}};
-constexpr std::array node_metric_words{
-    MetricWord{"mean_rho", MetricKind::mean_rho}, MetricWord{"peak_rho", MetricKind::peak_rho},
-    MetricWord{"drop_rate", MetricKind::drop_rate}, MetricWord{"lag", MetricKind::peak_queue_lag},
-    MetricWord{"dead_lettered", MetricKind::dead_lettered_rate}};
+constexpr std::array node_metric_words{MetricWord{"mean_rho", MetricKind::mean_rho},
+                                       MetricWord{"peak_rho", MetricKind::peak_rho},
+                                       MetricWord{"drop_rate", MetricKind::drop_rate},
+                                       MetricWord{"lag", MetricKind::peak_queue_lag},
+                                       MetricWord{"dead_lettered", MetricKind::dead_lettered_rate},
+                                       MetricWord{"connections", MetricKind::connections}};
 
 // C++20 std::span<const T>: a non-owning view of contiguous elements (pointer + size), so a
 // function reads a vector or an array without a copy and without being a template.
@@ -241,6 +243,7 @@ std::optional<report::OpLatency> latency_column(MetricKind kind) {
     case MetricKind::attempts_rate:
     case MetricKind::answered_rate:
     case MetricKind::dead_lettered_rate:
+    case MetricKind::connections:
       return std::nullopt;
   }
   return std::nullopt;
@@ -289,6 +292,12 @@ std::optional<std::string> dead_letter_problem(const model::NodeSpec& node) {
          ", not worker_pool: only a worker pool has dead letters";
 }
 
+std::optional<std::string> connections_problem(const model::NodeSpec& node) {
+  if (node.type == model::NodeType::ws_gateway) return std::nullopt;
+  return "'" + node.id + "' has type " + std::string{model::to_string(node.type)} +
+         ", not ws_gateway: only a ws_gateway has connections";
+}
+
 std::optional<std::string> problem_with_node(const model::NodeSpec& node,
                                              const SweepMetric& metric) {
   switch (metric.kind) {
@@ -308,6 +317,8 @@ std::optional<std::string> problem_with_node(const model::NodeSpec& node,
       return serving_problem(node, "drop rate");
     case MetricKind::peak_queue_lag:
       return lag_problem(node);
+    case MetricKind::connections:
+      return connections_problem(node);
   }
   return std::nullopt;
 }
@@ -368,6 +379,8 @@ double node_metric(const report::Summary& summary, std::span<const report::NodeS
       return node->peak_queue_lag_s.value_or(no_value);
     case MetricKind::dead_lettered_rate:  // JSON's dead_lettered_per_s, 0 without retries
       return node->mean_dead_lettered_per_s.value_or(no_value);
+    case MetricKind::connections:  // the level at the end of the run, the table's `connections`
+      return node->connections.value_or(no_value);
     case MetricKind::mean_latency:  // an op's, read by read_metrics
     case MetricKind::p50_latency:
     case MetricKind::p95_latency:
@@ -491,8 +504,9 @@ PerPoint<T> for_each_point(std::size_t count, std::size_t jobs, const Stage& sta
 // ---- rendering ---------------------------------------------------------------------------------
 
 // A cell for people, as the report's tables print the same number (report::format_duration,
-// format_lag and format_rate: "1.61ms", "<1us", "1.75k/s"; `>1s` for a percentile that is the
-// client's timeout, as the op table prints it); "-" for a number the run did not produce.
+// format_lag, format_rate and format_count: "1.61ms", "<1us", "1.75k/s", "2k"; `>1s` for a
+// percentile that is the client's timeout, as the op table prints it); "-" for a number the run
+// did not produce.
 std::string human_cell(const SweepMetric& metric, double value, bool beyond_timeout) {
   if (std::isnan(value)) return "-";
   if (beyond_timeout) return ">" + report::format_duration(value);
@@ -501,6 +515,7 @@ std::string human_cell(const SweepMetric& metric, double value, bool beyond_time
     return report::format_rate(value);
   }
   if (metric.kind == MetricKind::peak_queue_lag) return report::format_lag(value);
+  if (metric.kind == MetricKind::connections) return report::format_count(value);
   return significant(value, 3);  // a utilization or a drop rate: a ratio
 }
 

@@ -1400,15 +1400,16 @@ constexpr double shrink_margin = 1e-6;
 }
 
 // A ws_gateway's line ends with what its connections will be and cost (phase 3 spec §8.2;
-// behaviours::WsGatewayBehaviour): "  connections: C*=100k (connect 100/s × session 16.7m),
-// heartbeat 20k/s, cap 200k". C* is the fixed point connect rate × session (Little's law), the
-// connect rate the clients' peak `connect` requests that reach the gateway (the paper load's), the
-// session marked "(default)" when the scenario left it to defaults::default_session; then the
-// heartbeat load at C* (C* / heartbeat) and the cap, max_connections × replicas. A capped fixed
-// point says what it would have been: "C*=50k (connect 100/s × session 16.7m = 100k, capped)". A
-// fixed level reads "connections: 2M (fixed)". A gateway with neither level, or both, is one run
-// and estimate refuse (engine::Simulation::create), and its line says so. Nothing on any other
-// type.
+// behaviours::WsGatewayBehaviour): "  connections: C*=100k at the peak connect rate (connect 100/s
+// × session 16.7m), heartbeat 20k/s, cap 200k". C* is the fixed point connect rate × session
+// (Little's law), the connect rate the clients' PEAK `connect` requests that reach the gateway (the
+// paper load's, which the line names: off the peak of a curve the level is lower), the session
+// marked "(default)" when the scenario left it to defaults::default_session; then the heartbeat
+// load at C* (C* / heartbeat) and the cap, max_connections × replicas. A capped fixed point says
+// what it would have been: "C*=50k at the peak connect rate (connect 100/s × session 16.7m = 100k,
+// capped)". A run too short to reach C* says so (settling_note). A fixed level reads "connections:
+// 2M (fixed)". A gateway with neither level, or both, is one run and estimate refuse
+// (engine::Simulation::create), and its line says so. Nothing on any other type.
 [[nodiscard]] std::string gateway_level_text(const model::NodeSpec& spec, double connects) {
   if (spec.connections) {
     const std::string fixed = with_si_prefix(static_cast<double>(*spec.connections)) + " (fixed)";
@@ -1423,8 +1424,31 @@ constexpr double shrink_margin = 1e-6;
   const double level = *paper_level(spec, connects);
   const std::string capped =
       level < unbounded ? " = " + with_si_prefix(unbounded) + ", capped" : "";
-  return "C*=" + with_si_prefix(level) + " (connect " + fmt_rate(connects) + " × session " +
-         format_duration(session) + (spec.session ? "" : " (default)") + capped + ")";
+  return "C*=" + with_si_prefix(level) + " at the peak connect rate (connect " +
+         fmt_rate(connects) + " × session " + format_duration(session) +
+         (spec.session ? "" : " (default)") + capped + ")";
+}
+
+// The level rises to C* as a first-order lag of time constant `session` (C(t) = C* (1 − e^{−t /
+// session})): 1 − e^{−3} = 95 % of the way after 3 sessions, the usual "settled" of a lag.
+constexpr int sessions_to_settle = 3;
+
+// "; settles in about 3 sessions (1.5h); this run lasts 1m" when the scenario's duration is under
+// 3 sessions: the run ends before the level gets near C*, so the reports' `connections` will be
+// below the line's C*. Nothing for a fixed level (no lag), a gateway without a level, or a capped
+// one: the cap stops the lag partway up, sooner than 3 sessions (at −session × ln(1 − cap / (λ
+// session))), so the note would overstate the wait.
+[[nodiscard]] std::string settling_note(const graph::Graph& g, const model::NodeSpec& spec,
+                                        double connects) {
+  if (spec.connections || !(connects > 0.0)) return {};
+  const SimTime session = defaults::session_of(spec);
+  if (*paper_level(spec, connects) < connects * seconds(session)) return {};  // capped
+  // In ticks: this unit does not include <chrono>, whose operators SimTime arithmetic needs.
+  const SimTime settles{sessions_to_settle * session.count()};
+  const SimTime duration = g.scenario().duration;
+  if (duration.count() >= settles.count()) return {};
+  return "; settles in about " + std::to_string(sessions_to_settle) + " sessions (" +
+         format_duration(settles) + "); this run lasts " + format_duration(duration);
 }
 
 std::string gateway_summary(const graph::Graph& g, std::size_t node) {
@@ -1439,7 +1463,7 @@ std::string gateway_summary(const graph::Graph& g, std::size_t node) {
   }
   const auto cap = model::connection_cap(spec);
   parts.push_back(cap ? "cap " + with_si_prefix(*cap) : "no cap");
-  return "  connections: " + join(parts, ", ");
+  return "  connections: " + join(parts, ", ") + settling_note(g, spec, connects);
 }
 
 // ---- loads that rest on an unknown hit ratio ----

@@ -583,6 +583,8 @@ namespace {
                                                               std::size_t node) {
   const auto& spec = g.nodes()[node].spec;
   if (spec.type != model::NodeType::ws_gateway) return std::nullopt;
+  // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
+  // `std::find(begin, end, value) != end`.
   const bool connected = std::ranges::contains(g.arriving_ops(node), model::connect_op);
   const std::string name = "node '" + spec.id + "': a ws_gateway ";
   if (!connected && !spec.connections) {
@@ -646,8 +648,6 @@ namespace {
 }
 
 void add_once(std::vector<std::size_t>& links, std::size_t link) {
-  // C++23 std::ranges::contains: "is this value in the range?" in one call, replacing
-  // `std::find(begin, end, value) != end`.
   if (!std::ranges::contains(links, link)) links.push_back(link);
 }
 

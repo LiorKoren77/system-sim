@@ -109,7 +109,7 @@ t_s,rate_per_s
 `sweep` runs the scenario once per value of one key, the runs in parallel (`--jobs`, default:
 the machine's hardware threads; the output does not depend on it), and prints one row per value
 with the metrics asked for: `<client>.<op>.mean`, `.p50`, `.p95` or `.p99`, `<node>.mean_rho`,
-`.peak_rho` or `.drop_rate`, `<queue>.lag`, or `<pool>.dead_lettered`
+`.peak_rho` or `.drop_rate`, `<queue>.lag`, `<pool>.dead_lettered`, or `<gateway>.connections`
 ([schema](docs/scenario-schema.md#command-line-simsys-sweep-phase-2c)). On the
 [hello tutorial](scenarios/tutorial/hello/), an M/M/1 queue with a 1 ms service time: the latency is
 s / (1 − rho) plus the 0.5 ms round trip, and it bends upward as rho nears 1:

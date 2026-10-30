@@ -2304,9 +2304,11 @@ class KvClusterBehaviour {
 // the level is untouched); users who go offline without a disconnect (the heartbeat timeout of
 // ch. 12's presence: every session simply ends at rate 1 / session); and the bandwidth of a
 // websocket frame.
-// Pattern: Delegation (composition over inheritance) — the per-op steps, their latency and their
-// delivered fractions are a service's, so the gateway holds a ServiceBehaviour and adds the level
-// around it, instead of inheriting from it.
+// Pattern: Decorator (static, over the NodeBehaviour concept) — the gateway wraps a
+// ServiceBehaviour and has the same interface (route, cost, response, delivered), forwarding each
+// call to it and adding the level around it: route admits the connects the cap leaves room for and
+// rejects the rest before the service routes them, delivered thins the connects by the admitted
+// share, and connections / heartbeats_per_s expose the level the service knows nothing of.
 class WsGatewayBehaviour {
  public:
   WsGatewayBehaviour(const graph::Graph& g, std::size_t self);

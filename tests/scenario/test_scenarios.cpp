@@ -82,6 +82,8 @@ constexpr std::string_view gateway_without_level =
 // Does Simulation::create's refusal wait for a later task of phase 3: a node type it has no model
 // of yet ("... (phase 3)"), or a gateway whose level the scenario does not state yet?
 bool waits_for_a_later_task(const std::string& refusal) {
+  // C++23 std::string::contains: a substring test in one call, replacing
+  // `find(...) != std::string::npos`, so the test reads as what it checks.
   return refusal.contains("phase 3") || refusal.contains(gateway_without_level);
 }
 
@@ -242,8 +244,6 @@ TEST_CASE("the consistent-hashing lab under write_through needs set in db's writ
   if (!built) FAIL(built.error().message);
   const auto text = simsys::report::render_explain(*built);
   CAPTURE(text);
-  // C++23 std::string::contains: a substring test in one call, replacing
-  // `find(...) != std::string::npos`, so the assertion reads as what it checks.
   REQUIRE(text.contains("primary 20k units/s vs 5k/s (400%, red)"));
 }
 

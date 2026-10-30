@@ -47,6 +47,7 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -694,6 +695,50 @@ TEST_CASE("the JSON gives every node that is not a gateway null connections", "[
   }
 }
 
+// `--replications N` adds `replications.per_seed`, each node's numbers as one list per field with
+// an entry per seed; a gateway's two levels are among them, in the order of the run's own JSON
+// (after peak_queue_lag_s), as lists of numbers on the gateway and of nulls elsewhere. Three
+// "seeds" whose levels differ: the ends 2000, 4000, 1000 and the peaks 3000, 5000, 1500.
+TEST_CASE("the per-seed JSON of replications lists the gateway's connections and its peak",
+          "[theory]") {
+  const auto g = graph_of(gateway_scenario(Shape{}));
+  std::vector<simsys::report::Summary> runs;
+  runs.push_back(summary_of_levels(g, {1000, 3000, 2000}));
+  runs.push_back(summary_of_levels(g, {5000, 4000}));
+  runs.push_back(summary_of_levels(g, {1500, 1000}));
+  constexpr std::array<int, 3> seeds{1, 2, 3};
+  const auto replicated = simsys::report::summarize_replications(runs, seeds);
+  const auto json = simsys::report::render_replications_json(replicated, runs);
+  CAPTURE(json);
+  const auto per_seed = json.substr(json.find("\"per_seed\""));
+  const auto gateway = json_node_object(per_seed, "gw");
+  // C++20 std::string::ends_with: a suffix test in one call, replacing a compare of the tail.
+  REQUIRE(
+      gateway.ends_with("\"peak_queue_lag_s\": [null, null, null], "
+                        "\"connections\": [2000, 4000, 1000], "
+                        "\"connections_peak\": [3000, 5000, 1500]"));
+  const auto presence = json_node_object(per_seed, "presence");
+  REQUIRE(
+      presence.ends_with("\"connections\": [null, null, null], "
+                         "\"connections_peak\": [null, null, null]"));
+}
+
+// A replicated run with no gateway keeps the per-seed node objects it always had.
+TEST_CASE("the per-seed JSON of a run with no gateway has no connections", "[theory]") {
+  const auto g = graph_of(simsys::test_support::mm1(500));
+  std::vector<simsys::report::Summary> runs;
+  for (int seed = 0; seed < 3; ++seed) {
+    runs.emplace_back(g, SimTime{0});
+    runs.back().observe(StepRecord{
+        .t = SimTime{0}, .nodes = std::vector<simsys::engine::NodeSample>(2), .responses = {}});
+  }
+  constexpr std::array<int, 3> seeds{1, 2, 3};
+  const auto json = simsys::report::render_replications_json(
+      simsys::report::summarize_replications(runs, seeds), runs);
+  CAPTURE(json);
+  REQUIRE_FALSE(json.contains("connections"));
+}
+
 // The CSV column is the last, so a plot script that reads columns by position loses nothing:
 // the header is pinned whole, and the cell is the level at 6 significant digits on the gateway's
 // row, empty on every other row (a 0 would claim a level a service cannot have). A real run, so
@@ -734,12 +779,17 @@ TEST_CASE("the node series ends with a connections column, filled on the gateway
 //
 // The gateway's `nodes:` line is a service's line (placement, capacity, service time, c, queue
 // limit, variability, burstiness) plus, at its end, what the level will be and what it costs:
-//   `  connections: C*=100k (connect 100/s × session 16.7m), heartbeat 20k/s, cap 200k`
+//   `  connections: C*=100k at the peak connect rate (connect 100/s × session 16.7m),
+//    heartbeat 20k/s, cap 200k; settles in about 3 sessions (50m); this run lasts 1m`
 // where C* = connect rate × session is the fixed point (Little's law), the connect rate the
-// client's peak rate for the ops named `connect` that reach the gateway (100/s), the session
-// printed as every duration is (1000 s is 16.7m), the heartbeat the load at C* (C* / 5 s) and the
-// cap max_connections × replicas. A fixed level reads `connections: 2M (fixed), heartbeat 33.33k/s,
-// cap 2M`; a session left to the default is marked `session 30m (default)`.
+// client's PEAK rate for the ops named `connect` that reach the gateway (100/s; the line says so,
+// since a curve's off-peak level is lower), the session printed as every duration is (1000 s is
+// 16.7m), the heartbeat the load at C* (C* / 5 s) and the cap max_connections × replicas. The
+// level is a first-order lag of time constant `session` (95 % of the way after 3 of them,
+// 1 − e^{−3}), so a run shorter than 3 sessions ends before it settles, and the line says how long
+// each takes (the probe runs 60 s against 3 × 1000 s). A fixed level reads `connections: 2M
+// (fixed), heartbeat 33.33k/s, cap 2M`; a session left to the default is marked `session 30m
+// (default)`.
 // The ids are u, gw, q and presence, so the id column is 8 wide and the type column 10
 // (ws_gateway).
 
@@ -755,7 +805,18 @@ TEST_CASE("explain prints the gateway's steady level, heartbeat load and cap", "
   CAPTURE(text);
   REQUIRE(node_line(text, "gw") ==
           gateway_line_start +
-              "  connections: C*=100k (connect 100/s × session 16.7m), heartbeat 20k/s, cap 200k");
+              "  connections: C*=100k at the peak connect rate (connect 100/s × session 16.7m), "
+              "heartbeat 20k/s, cap 200k; settles in about 3 sessions (50m); this run lasts 1m");
+}
+
+// A run of at least 3 sessions (60 s against a session of 20 s) reaches its level: no note.
+TEST_CASE("explain says nothing of settling when the run lasts 3 sessions or more", "[theory]") {
+  const auto text = explain_of(gateway_scenario(Shape{.session = 20s}));
+  CAPTURE(text);
+  // C* = 100/s x 20 s = 2k, heartbeat 2k / 5 s = 400/s.
+  REQUIRE(node_line(text, "gw") == gateway_line_start +
+                                       "  connections: C*=2k at the peak connect rate (connect "
+                                       "100/s × session 20s), heartbeat 400/s, cap 200k");
 }
 
 TEST_CASE("explain prints a fixed level as fixed, with its heartbeat load and cap", "[theory]") {
@@ -773,10 +834,10 @@ TEST_CASE("explain marks a session left to the default of 30 minutes", "[theory]
       explain_of(gateway_scenario(Shape{.session = std::nullopt, .max_connections = 1'000'000}));
   CAPTURE(text);
   // C* = 100/s x 1800 s = 180k, heartbeat 180k / 5 s = 36k/s.
-  // C++20 std::string::ends_with: a suffix test in one call, replacing a compare of the tail.
   REQUIRE(node_line(text, "gw")
-              .ends_with("  connections: C*=180k (connect 100/s × session 30m (default)), "
-                         "heartbeat 36k/s, cap 1M"));
+              .ends_with("  connections: C*=180k at the peak connect rate (connect 100/s × "
+                         "session 30m (default)), heartbeat 36k/s, cap 1M; settles in about 3 "
+                         "sessions (1.5h); this run lasts 1m"));
 }
 
 // Beyond the gateway's own line: the paper-load checks follow the gateway's flows, as the engine
