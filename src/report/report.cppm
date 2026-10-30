@@ -216,6 +216,8 @@ class Summary {
   [[nodiscard]] double reject_rate() const;
   [[nodiscard]] std::string_view worst_reject_node() const;
   [[nodiscard]] std::string_view scenario_name() const;
+  // Made by of_estimate: one steady-state record, which leaves the scenario's faults out.
+  [[nodiscard]] bool is_estimate() const { return estimate_; }
   [[nodiscard]] const graph::Graph& graph() const { return *graph_; }
   // The verdict of an SLO with `over`: its worst window's, the window still open at the end of the
   // run (a last window shorter than `over`) included. Every window is judged, except that a latency

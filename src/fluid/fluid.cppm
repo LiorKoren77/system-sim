@@ -70,6 +70,16 @@ struct ServiceMoments {
   double scv{};
 };
 
+// What a scripted fault does to one replica's queue for one step (engine::Condition, phase 3 spec
+// §4.2): the replica serves `capacity_factor` of its service rate, and every request holds a server
+// `extra_service_s` longer. The identity (1, 0) changes nothing. The room and the backlog are not
+// touched: requests that were waiting keep waiting while the node is down, and drain when it is
+// back. See FluidQueue::advance(Rate, SimTime, const Derating&) for the arithmetic.
+struct Derating {
+  double capacity_factor{1};
+  double extra_service_s{0};
+};
+
 enum class Zone { green, yellow, red };
 
 // The thresholds live in Capacity, as data, so each node can have its own alerting levels
@@ -103,6 +113,11 @@ class FluidQueue {
   // compiler prints in the warning, so a caller learns *why* dropping the value is a bug.
   [[nodiscard("the drained flow must be routed downstream")]] FluidStep advance(Rate demand,
                                                                                 SimTime dt);
+  // The same step with the replica derated for it (a scripted fault, see Derating): the capacity
+  // the step runs on is the derated one, the capacity kept for the next step is not. With the
+  // identity it is advance(demand, dt), bit for bit.
+  [[nodiscard("the drained flow must be routed downstream")]] FluidStep advance(
+      Rate demand, SimTime dt, const Derating& derating);
   // Jumps to the long-run state: empty at or below capacity, full (queue_limit) above it.
   // At exactly rho = 1 it keeps the room empty, as advance() does from an empty backlog
   // (drain = demand = capacity), so `estimate` and `run` agree there (the strict > in the body).
@@ -131,6 +146,7 @@ class FluidQueue {
   [[nodiscard]] flow::LatencyEstimate wait(double rho) const;
   [[nodiscard]] flow::LatencyEstimate sojourn(const flow::LatencyEstimate& waited) const;
   static void require_positive_step(SimTime dt);
+  [[nodiscard]] static double slowed_rate_per_s(const Capacity& capacity, double extra_s);
 
   Capacity capacity_;
   double backlog_{};
@@ -209,6 +225,50 @@ FluidStep FluidQueue::advance(Rate demand, SimTime dt) {
                    .latency = sojourn(waited),
                    .wait = waited,
                    .zone = zone_of(rho, capacity_)};
+}
+
+// A derated step (Derating) runs advance() on the capacity
+//   service_rate'   = service_rate × capacity_factor × s / (s + extra)
+//   service_time_s' = s + extra
+// and puts the nominal capacity back afterwards (the backlog it left stays). The two factors:
+//   capacity_factor  the share of the replica still serving (a node_down of r of its R replicas:
+//                    (R − r) / R; a degraded tier: the fault's factor). The servers c and the
+//                    service time stay, so the survivors are the same machines at a higher rho:
+//                    for independent copies (one queue per replica) that is exact, each copy
+//                    sees demand / R at a capacity × (R − r) / R, the rho of R − r copies seeing
+//                    demand / (R − r). For a pooled group it keeps c·R servers where R − r are
+//                    left: the Erlang C wait at that rho is then a little optimistic.
+//   extra            a slower request: c servers each holding a request s + extra drain
+//                    c / (s + extra) per second, which is the rate × s / (s + extra) (Little's law,
+//                    the Capacity invariant rate = c / s). The service time keeps its shape (its
+//                    SCV), so an exponential service stays exponential with the longer mean: the
+//                    M/M/1 closed form W = s' / (1 − rho') holds during a latency spike. A constant
+//                    added delay would have a smaller SCV and a slightly shorter wait (ignored).
+// capacity_factor 0 is a replica that serves nothing: drain 0, the room fills and the rest is
+// dropped, the wait is infinite (backlog_wait_s), rho 1. With the identity the nominal step is
+// taken directly, so a run without faults is bit-identical to one before faults existed.
+FluidStep FluidQueue::advance(Rate demand, SimTime dt, const Derating& derating) {
+  if (derating.capacity_factor == 1.0 && derating.extra_service_s == 0.0) {
+    return advance(demand, dt);
+  }
+  const Capacity nominal = capacity_;
+  capacity_.service_rate =
+      Rate{slowed_rate_per_s(nominal, derating.extra_service_s) * derating.capacity_factor};
+  capacity_.service_time_s = nominal.service_time_s + derating.extra_service_s;
+  const FluidStep step = advance(demand, dt);
+  capacity_ = nominal;
+  return step;
+}
+
+// The rate of servers that hold every request `extra_s` longer: rate × s / (s + extra) (see
+// above). A capacity that states no service time (s = 0: its rate is all it says) gets the rate of
+// c servers each busy `extra_s` per request, c / extra, if that is the lower.
+double FluidQueue::slowed_rate_per_s(const Capacity& capacity, double extra_s) {
+  const double rate = capacity.service_rate.per_second;
+  if (!(extra_s > 0.0)) return rate;
+  const double s = capacity.service_time_s;
+  if (s > 0.0) return rate * (s / (s + extra_s));
+  return std::min(rate, static_cast<double>(capacity.concurrency) / extra_s);
 }
 
 // Strictly above capacity: at demand = capacity exactly the fluid neither grows nor drains, so the

@@ -26,8 +26,17 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   16 such shares sits z_16 = 1.77 spreads above it (the expected maximum of 16 normals), so it
   carries 1 + 1.77/sqrt(450) = **1.0834** times the average: 5.625k/s on average (56.25 %),
   **6.094k/s (60.9 %)** on the hottest. The simulator runs that machine as its own queue, so the
-  `utilization` SLO reads it: `PASS utilization store 0.6094`. (A heuristic checked against
+  `utilization` SLO reads it: 0.6094 outside the fault below. (A heuristic checked against
   Monte Carlo rings: [numerics, section 8](../../../docs/study/numerics.md).)
+- **A machine down.** The lab scripts one of the 16 machines down for 3 minutes from 10 m
+  (`replicas: 1`). The model takes its share of the capacity: every machine serves 15/16 of its
+  10k/s while it lasts, the survivors sharing the load evenly, so the hot machine runs at 0.6094
+  × 16/15 = **0.65** for those 3 minutes (`peak_rho 0.65`), and the SLO's mean over the 29
+  observed minutes is 0.6094 × (26 + 3 × 16/15) / 29 = **0.6136**. Nothing is dropped and the
+  quorum barely notices: the mean request takes 1.55 ms instead of 1.54 ms, the p99 stays 2.31
+  ms. Only the capacity is modelled: the replica sets the down machine was in still count it
+  (the quorum's loss of a replica is later in phase 3), and its keys do not move to the next
+  machines on the ring.
 - **Quorum latency over the real replica set.** A read is answered when the R-th fastest of its
   key's three replicas replies, a write when the W-th does. The three are three DIFFERENT
   machines, so at most one is the hot one: it is in a request's set with probability
@@ -42,17 +51,17 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
 - **Loss over the same set.** A request is lost when fewer than its quorum of its three
   replica-requests come back: the binomial over its set, not the share of replica-requests
   dropped. Nothing is dropped here; see `nodes: 8` below.
-- `run` (30 minutes, 1 minute of warmup) passes all three SLOs, exit 0:
+- `run` (30 minutes, 1 minute of warmup, the fault included) passes all three SLOs, exit 0:
 
   ```
   PASS    p99_latency  clients  put  2.31ms    20ms
-  PASS    utilization  store    -    0.6094    0.8
+  PASS    utilization  store    -    0.6136    0.8
   PASS    drop_rate    -        -    0         0.01
   ```
 
 ## What it abstracts away
-- The fault in the YAML (one node down at 10 m, `replicas: 1`) is read and validated but does
-  nothing yet: faults run later in phase 3. Sloppy quorum and hinted handoff are not modelled.
+- A machine down costs capacity only (above): sloppy quorum and hinted handoff are not modelled,
+  nor is a down machine's place in its keys' replica sets.
 - Network partitions are not modelled: they are a phase 4 backlog item, and the loader refuses
   `kind: partition` (`partition is not modelled in phase 3 (see the backlog)`), so what `mode: ap`
   or `cp` does under a partition (stale versus unavailable) cannot be shown. `mode` is printed,
@@ -72,6 +81,8 @@ fits. Three SLOs: the `put` p99 under 20 ms, the store's utilization under 0.8, 
   timeout cuts off there anyway.
 
 ## Things to try
+The numbers below are runs without the fault (delete the `faults` entry), so that each shows its
+setting alone.
 - `nodes: 8`, the book's size: 90k replica-requests/s over 80k/s, 11.25k/s per machine on
   average (112.5 %) and **12.01k/s (120 %)** on the hottest (k = 1 + z_8/sqrt(450) = 1.068;
   `explain`: `(hottest 120%, red)`). Every machine is over capacity, every queue fills, and the

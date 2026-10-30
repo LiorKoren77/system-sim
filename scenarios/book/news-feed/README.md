@@ -63,7 +63,9 @@ run's peaks are 69.0 % and 69.4 %), less than a point from yellow (70 %); the ru
 ## What the model captures
 All numbers are from `simsys explain` and `simsys run` on `scenario.yaml` (24 h at 100 ms
 steps, 5 min warmup: 861,000 observed steps; about 20 s in a Release build on the author's
-machine).
+machine), the run's without the file's 15:00 outage (delete the `faults` entry): the day as
+sized. What the outage does to it is the last item of this list, and in "Things to try" too
+every run is without it.
 
 - **The day passes.** `run` exits 0: `PASS p99_latency users read_feed 5.99ms 200ms`, `PASS
   drop_rate - - 0 0.001`, `PASS queue_lag fanout_q - <1us 2m`. Nothing is dropped anywhere.
@@ -106,11 +108,22 @@ machine).
 - **Replication.** `post_db`'s reads are stale by `staleness 50.4ms` (the 50 ms replication lag
   plus the two sojourns); each shard's primary commits 168.1 writes/s over the day and no
   replica misses any.
+- **The 15:00 outage** (the file as shipped). Every copy of `post_db` (6 shards × 3) is down for
+  30 s: its capacity is 0, so it drains nothing, its rooms (500 units × 18 copies = 9k) fill
+  within the first second, and the rest of what reaches it is dropped, **372.8k** requests, the
+  day's only loss: `drop rate 0.039% (worst: post_db)`, `PASS drop_rate - - 0.0003902 0.001`.
+  When it is back the 9k drain at its full capacity. The writes of `post` reach it directly, the
+  `read_feed` hydrations on a post cache miss (5 %); media reads never do. The requests the rooms
+  hold are answered once `post_db` is back, but the model gives a node of capacity 0 an infinite
+  wait (the fluid wait is backlog / capacity), so the steps that still admitted requests leave
+  `post` and `read_feed` `unavailable` for the whole day, the replication's staleness too, and
+  `run` exits 2: `FAIL p99_latency users read_feed unavailable 200ms`. Everything else, the
+  peaks included, is the day above.
 
 ## What it abstracts away
-- **Faults.** The file declares a 30-second `post_db` outage at 15:00, but `run` ignores faults
-  until phase 3: the run above has no outage in it. (The design would ride it out on the caches
-  for reads; posts would fail for 30 s, since a post is written before it is published.)
+- **Faults**, beyond capacity: the 15:00 outage takes `post_db`'s capacity and nothing else.
+  The promotion of a replica (ch. 1), clients retrying, and a post failing fast instead of
+  waiting in a room are not modelled.
 - Celebrity handling (fan-out on read) — model as a second client with its own op in a variant.
 - Ranking, pagination, inactive-user skipping (which the book uses to shrink fan-out).
 - The queue's partitions (`partitions: 16`, printed, not modelled) and the order of feed entries.

@@ -211,13 +211,6 @@ CheckResult read_fault_node(const Site& site, const YAML::Node& entry, const Dec
   return {};
 }
 
-// How many copies of a node a node_down can take down: its replicas, or for a kv_cluster its
-// machines (`nodes:`, the loader refuses `replicas` on a cluster; model::NodeSpec::kv_nodes).
-int copies_of(const model::NodeSpec& node) {
-  if (node.type == model::NodeType::kv_cluster) return node.kv_nodes.value_or(node.replicas);
-  return node.replicas;
-}
-
 // `replicas: primary` (a sql_db's primary, ch. 1: writes stop until a replica is promoted) or a
 // count, 1 up to the node's copies; absent, the whole node goes down.
 CheckResult read_fault_replicas(const Site& site, const YAML::Node& entry,
@@ -236,9 +229,9 @@ CheckResult read_fault_replicas(const Site& site, const YAML::Node& entry,
   const auto count = parse_whole<int>(number_text(value));
   if (!count) return site.fail(value, "replicas must be a whole number or primary");
   if (*count < 1) return site.fail(value, "replicas must be at least 1");
-  if (*count > copies_of(node)) {
+  if (*count > model::copies_of(node)) {
     return site.fail(value, std::format("replicas {} is more than node '{}' has ({})", *count,
-                                        node.id, copies_of(node)));
+                                        node.id, model::copies_of(node)));
   }
   fault.replicas = *count;
   return {};

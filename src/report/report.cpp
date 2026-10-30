@@ -481,6 +481,16 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
          "\n";
 }
 
+// Under `estimate`, a scenario with scripted faults gets a line saying they are left out (phase 3
+// spec §4.2): estimate is the steady state of every node in the identity condition
+// (engine::Simulation::estimate), and only `run` steps through the faults. Nothing otherwise.
+[[nodiscard]] std::string faults_note(const Summary& summary) {
+  const auto scripted = summary.graph().scenario().faults.size();
+  if (!summary.is_estimate() || scripted == 0) return {};
+  return "faults: " + std::to_string(scripted) +
+         " scripted (estimate shows the steady state without them; run applies them)\n";
+}
+
 // A queue's cells (a node's, or a bandwidth link's pipe's), its rho cells coloured by the queue's
 // own zone thresholds; the tables add what follows them.
 [[nodiscard]] Row queue_cells(const NodeSummary& node, const fluid::Capacity& capacity,
@@ -1276,8 +1286,9 @@ bool all_pass(std::span<const SloResult> results) {
 // With no observed step there are no node or op figures to show, only the skipped SLOs.
 std::string render_table(const Summary& summary, std::span<const SloResult> slos, bool color) {
   if (summary.observed_steps() == 0) return table_header(summary) + slo_table(slos, color);
-  return table_header(summary) + node_table(summary, color) + link_table(summary, color) +
-         replication_table(summary) + op_table(summary) + slo_table(slos, color);
+  return table_header(summary) + faults_note(summary) + node_table(summary, color) +
+         link_table(summary, color) + replication_table(summary) + op_table(summary) +
+         slo_table(slos, color);
 }
 
 // With no observed step the drop and reject rates are null: there is no data, not a rate of 0.
