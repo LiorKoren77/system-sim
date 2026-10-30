@@ -75,7 +75,8 @@ simsys::graph::Graph build_or_fail(const simsys::model::Scenario& s) {
 }
 
 // What Simulation::create says of a websocket gateway that neither a `connect` op reaches nor a
-// fixed `connections` fills (phase 3 Task 14): google-drive's long_poll until its own task.
+// fixed `connections` fills (phase 3 Task 14): chat-system's chat_servers until its own task
+// (google-drive's long_poll states a fixed 2M since Task 16).
 constexpr std::string_view gateway_without_level =
     "a ws_gateway needs a client op named 'connect' or a fixed 'connections'";
 
@@ -119,10 +120,10 @@ TEST_CASE("every shipped scenario resolves into a graph that explain can print",
 // Which scenarios run grows with each phase, so the test does not name them: a scenario whose node
 // types the engine does not simulate yet is refused by Simulation::create with a message naming the
 // phase ("... do not support yet (phase 3)") and is skipped; so is one whose websocket gateway
-// states no level yet (google-drive until its own task gives long_poll `connections: 2M`: a
-// gateway is simulated since phase 3 Task 14, but needs a `connect` op or a fixed level); every
-// other one is run to its end and must meet its own SLOs. A scenario the engine refuses for any
-// other reason is a failure, not a skip. The time limit's point is "no shipped scenario takes
+// states no level yet (chat-system until its own task: a gateway is simulated since phase 3
+// Task 14, but needs a `connect` op or a fixed level, which google-drive states since Task 16);
+// every other one is run to its end and must meet its own SLOs. A scenario the engine refuses for
+// any other reason is a failure, not a skip. The time limit's point is "no shipped scenario takes
 // minutes", not a benchmark: each one run here costs at most 0.6 s of CPU in Debug and 0.04 s in
 // Release (measured 2026-10-29), but for the two with faults (kv-store, consistent-hashing), which
 // step a fault-free twin beside the run (engine::FaultRecord's header) and cost more: a whole Debug
@@ -178,9 +179,13 @@ TEST_CASE(
     //    downloaders saturate (the README's lesson). It is exempt for that verdict and for time: 6
     //    h at 1 s is 21,600 steps of a 12-node loop. Its own tests below run the day at a 60 s
     //    step.
+    //  - google-drive runs (long_poll holds a fixed 2M connections) and MEETS its four SLOs, its
+    //    backup pool sized at 3 workers; it is exempt here only for time: 24 h at 100 ms is 864k
+    //    steps, about 24 s of CPU in Release (measured 2026-10-30), far over the five seconds. Its
+    //    own tests below run the day at 10 s steps and pin the SLOs passing.
     if (s.name == "lab-unique-id" || s.name == "url-shortener" || s.name == "youtube" ||
         s.name == "news-feed" || s.name == "search-autocomplete" ||
-        s.name == "notification-system" || s.name == "web-crawler") {
+        s.name == "notification-system" || s.name == "web-crawler" || s.name == "google-drive") {
       continue;  // not run here
     }
     ++ran;
@@ -446,24 +451,6 @@ TEST_CASE("book/youtube at 400 transcoders fails its queue_lag SLO: 2.66 h of la
   REQUIRE(lag->observed.has_value());
   REQUIRE_THAT(*lag->observed, Catch::Matchers::WithinRel(9564.0, 0.01));
   REQUIRE(*lag->observed > 1800.0);  // the SLO's 30 m
-}
-
-// Ch. 15's Google Drive built its graph with the new queue wiring (notify_q's two consumer groups,
-// notification_svc and backup_workers, each consume it and are linked from it), and its queue and
-// pools are simulated. Since phase 3 Task 14 the ws_gateway is simulated too, but a gateway needs
-// a level: a `connect` op that reaches it or a fixed `connections`, and long_poll, the book's
-// notification long polls held open by devices no client here simulates, states neither yet
-// (a later task gives it `connections: 2M`). The loader and the graph accept it, explain describes
-// it, and Simulation::create refuses it, naming the node.
-TEST_CASE("book/google-drive is refused at long_poll until it states a connections level",
-          "[scenario]") {
-  const auto g = build_or_fail(
-      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/book/google-drive/scenario.yaml"));
-  const auto sim = simsys::engine::Simulation::create(g);
-  REQUIRE_FALSE(sim.has_value());
-  REQUIRE(sim.error().message ==
-          "node 'long_poll': a ws_gateway needs a client op named 'connect' or a fixed "
-          "'connections'");
 }
 
 // Ch. 11's news feed: its fan-out queue and pool are simulated, and so is graph_db, its kv_cluster,
@@ -1829,14 +1816,17 @@ TEST_CASE(
 // the kv-store lab, the news feed and search autocomplete. Phase 3's notification fan-out (Task 17)
 // adds the book's notification system, and the frontier, the last type the crawler lacked (Task
 // 18), the book's ch. 9 scenario: twelve shipped scenarios run. Since Task 18 every node type has
-// a model (model::simulated is true for all), so no scenario is refused for its types any more;
-// the two that still are, google-drive and chat-system, are refused at a websocket gateway that
-// states no level until their own tasks. The set of runnable scenarios is pinned by name: whoever
+// a model (model::simulated is true for all), so no scenario is refused for its types any more.
+// Task 16 gives google-drive's websocket gateway a fixed level (`connections: 2M`): thirteen run.
+// The one still refused, chat-system, is refused at a websocket gateway that states no level
+// until its own task. The set of runnable scenarios is pinned by name: whoever
 // makes one more run updates the list on purpose. (The generic "run under five seconds" test above
 // exempts web-crawler for time and SLO verdict, as it exempts youtube: 6 h at 1 s is 21,600
 // steps.)
-TEST_CASE("exactly twelve shipped scenarios run: the eleven before Task 18 and web-crawler",
-          "[scenario]") {
+TEST_CASE(
+    "exactly thirteen shipped scenarios run: the eleven before Task 18, web-crawler and "
+    "google-drive",
+    "[scenario]") {
   std::vector<std::string> runnable;
   for (const auto& file : scenario_files()) {
     CAPTURE(file);
@@ -1851,10 +1841,11 @@ TEST_CASE("exactly twelve shipped scenarios run: the eleven before Task 18 and w
     if (created) runnable.push_back(s.name);
   }
   std::ranges::sort(runnable);
-  REQUIRE(runnable == std::vector<std::string>{
-                          "chain", "hello", "lab-consistent-hashing", "lab-kv-store",
-                          "lab-rate-limiter", "lab-unique-id", "news-feed", "notification-system",
-                          "search-autocomplete", "url-shortener", "web-crawler", "youtube"});
+  REQUIRE(runnable == std::vector<std::string>{"chain", "google-drive", "hello",
+                                               "lab-consistent-hashing", "lab-kv-store",
+                                               "lab-rate-limiter", "lab-unique-id", "news-feed",
+                                               "notification-system", "search-autocomplete",
+                                               "url-shortener", "web-crawler", "youtube"});
 }
 
 // What the plan promises of the shipped crawler, and no more: the engine accepts it (`run` no
@@ -1905,8 +1896,8 @@ TEST_CASE("book/web-crawler's downloader retries a failed fetch twice", "[scenar
 // that kept it off the runnable list is gone. Two older tests state the opposite and the task
 // that edits the YAML must change them in the same commit, because they pass today and fail the
 // moment it does: "book/google-drive is refused at long_poll until it states a connections level"
-// (delete it: the first test below replaces it) and "exactly ten shipped scenarios use only
-// simulated node types" (its list gains google-drive; the second test below is the inverted
+// (delete it: the first test below replaces it) and "exactly twelve shipped scenarios run" (its
+// list gains google-drive, thirteen; the second test below is the inverted
 // check that does not depend on how many scenarios the later tasks make runnable). The
 // "scenarios whose node types all exist run in under five seconds" test also runs google-drive
 // from then on, at the shipped 100 ms step (864k steps, minutes in Debug): it joins the exempt
@@ -2117,7 +2108,7 @@ TEST_CASE("book/google-drive's notify_q lag is positive and bounded by its SLO, 
 // backup_workers (2 workers x 10 ms = 200 jobs/s against 255.6/s of uploads at the peak: rho 1.28
 // on paper, explain's red line) is the scenario's one oversized-on-paper node. Whether it is
 // sized to 3 workers (peak rho 0.852, measured) or left as the lesson (the run clamps its rho at
-// 1 and its backlog grows for the 18 hours the uploads exceed 200/s: 774k jobs, measured, with
+// 1 and its backlog grows for the 6.4 hours the uploads exceed 200/s: 774k jobs, measured, with
 // no drop since the queue's retention is 7 days) is the README's decision; the test pins only
 // what holds either way: the run reports a peak rho for it, in (0, 1], and the drop_rate SLO
 // passes, so that the pool's backlog never turns into lost requests above 0.1 %.

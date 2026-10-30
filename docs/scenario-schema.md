@@ -147,11 +147,10 @@ Everything else is refused before the first step, with exit code 1:
 The type message names the phase that plans the type's model. Since phase 3 Task 18 every type
 has a model, so the type check refuses nothing a scenario can name today; it stays for a type
 added later. The nodes are then checked in file order (a CDN's `keys`, a gateway's level):
-google-drive is refused at its `ws_gateway`, `long_poll`, which states no level yet (`node
-'long_poll': a ws_gateway needs a client op named 'connect' or a fixed 'connections'`), and
-chat-system at its `ws_gateway`, `chat_servers`, for the same reason (its `service_discovery` runs
-since phase 3). Of the 14 shipped scenarios twelve run (`exit` is `simsys run`'s exit code,
-Release build):
+chat-system is refused at its `ws_gateway`, `chat_servers`, which states no level yet (`node
+'chat_servers': a ws_gateway needs a client op named 'connect' or a fixed 'connections'`; its
+`service_discovery` runs since phase 3). Of the 14 shipped scenarios thirteen run (`exit` is
+`simsys run`'s exit code, Release build):
 
 | scenario | exit | what it shows |
 |---|---|---|
@@ -167,6 +166,7 @@ Release build):
 | `book/search-autocomplete` | 0 | ch. 13's trie cache, search index and query-log pipeline |
 | `book/notification-system` | 0 | ch. 10's fan-out with dedup into four channel queues, pools that retry their providers and dead-letter the rest, a 20× marketing blast drained within the lag SLOs |
 | `book/web-crawler` | **2** | ch. 9's crawl loop **on purpose** over its gain: 3.5 new URLs per fetched page, so the frontier is offered 4.38k URLs/s against the downloaders' 2000; both SLOs fail (`utilization` 1 against 0.85, the frontier's `queue_lag` 7.13 h against 30 m), see its README |
+| `book/google-drive` | 0 | ch. 15's block servers and two consumer groups on one queue, with long polls as a gateway's fixed 2M connections |
 
 **`estimate` versus `explain`.** `estimate` evaluates the long-run state once, at
 t = 0 (00:00): the rate curve's value there, without noise. Its first line says so:

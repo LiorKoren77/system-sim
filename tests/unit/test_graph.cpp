@@ -3906,9 +3906,9 @@ TEST_CASE("a search index states one number and takes the other from the type", 
 // fixed `connections` states. The graph's part is to say which ops reach a node (arriving_ops),
 // and that is all the engine's rule reads: Simulation::create refuses a gateway that no `connect`
 // reaches and that states no `connections`, and one that has both (tests/theory/test_gateways.cpp).
-// Graph::build itself accepts such a gateway on purpose: the shipped chat-system and google-drive
-// have neither until their own tasks give them one, and explain, the series and the scenario
-// tests still build and describe them.
+// Graph::build itself accepts such a gateway on purpose: the shipped chat-system has neither until
+// its own task gives it one (google-drive states a fixed 2M since phase 3 Task 16), and explain,
+// the series and the scenario tests still build and describe it.
 
 namespace {
 // u (client: `connect`, `send`) -> gw (ws_gateway: send -> q, heartbeat -> presence, deliver

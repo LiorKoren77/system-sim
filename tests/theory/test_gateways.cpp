@@ -514,8 +514,9 @@ TEST_CASE("a deliver makes no hops: q gets nothing and presence only the heartbe
 // A gateway needs a level: either a `connect` op that reaches it (the level is then a balance of
 // connects and disconnects) or a fixed `connections`, not both (two sources of the one number).
 // Whether a `connect` op REACHES a gateway is a fact of the graph (through links, balancers and
-// steps), known only once the graph is built, and the shipped chat-system and google-drive have
-// neither today (their phase-3 tasks give them one), so the loader and Graph::build accept such a
+// steps), known only once the graph is built, and the shipped chat-system has neither today (its
+// phase-3 task gives it one; google-drive's got a fixed 2M in Task 16), so the loader and
+// Graph::build accept such a
 // gateway, explain still describes it, and the refusal is Simulation::create's, in the words of
 // its other "cannot run this" messages.
 

@@ -73,12 +73,20 @@ nodes:
     cost: 1ms
     then: [{to: long_poll, op: push, factor: 2}]        # avg 2 other devices per user
 
-  long_poll: {type: ws_gateway, replicas: 4, max_connections: 2M, heartbeat: 60s, fanout: 1, capacity: 20k/s}
+  # Ch. 15's notification long polls: every signed-in device keeps one request open, waiting for
+  # a "file changed" event. The devices are not simulated (no client op `connect`): the level is
+  # stated, a fixed 2M connections (chosen, not from the book: a fifth of its 10M DAU online at
+  # once), each re-polling every 60 s, so the gateway serves 2M / 60 s = 33.33k re-polls a second
+  # on top of the pushes and the sync polls. Cap 2M x 4 replicas = 8M. README: why a fixed level.
+  long_poll: {type: ws_gateway, replicas: 4, max_connections: 2M, connections: 2M, heartbeat: 60s, fanout: 1, capacity: 20k/s}
 
   backup_workers:
     type: worker_pool
     consumes: notify_q
-    workers: 2
+    # 3, not the 2 first shipped: 2 x (1 / 10 ms) = 200 jobs/s is below the 255.6 uploads/s of
+    # the 11:00 peak: the backlog grows from 07:03 to 13:28 and the backups fall 1.07 h behind
+    # (README, "How it is sized").
+    workers: 3
     cost: 10ms
     # size: 500KB is the book's average file (ch. 15): the backup copies the file that was uploaded.
     then: [{to: cold_storage, op: write, size: 500KB}]
@@ -103,3 +111,7 @@ slo:
   - {metric: p99_latency, node: clients, op: download, max: 2s}
   - {metric: p99_latency, node: clients, op: metadata, max: 100ms}
   - {metric: drop_rate, max: 0.001}
+  # Not the book's: notify_q's lag is its slowest consumer group's, here the backups. An upload
+  # not yet copied to cold storage 10 minutes after it was made is a recovery point the scenario
+  # does not accept (README, "How it is sized"; at 2 workers this fails: the lesson).
+  - {metric: queue_lag, node: notify_q, max: 10m}
