@@ -3206,6 +3206,24 @@ TEST_CASE(
   REQUIRE(out.json.contains("\"retries_added_attempts\": 5968, \"pool_republished_jobs\": null}"));
 }
 
+// A failover behind a service discovery (Task 13) sends ATTEMPTS to the dead replica when retries
+// reach the node (a record with lost_requests), and the after line says so, as `lost` does; without
+// retries it says requests (tests/theory/test_faults.cpp's probe: `failover 10s: 2.5k requests`).
+TEST_CASE("the failover share of a record in attempts is printed in attempts", "[report]") {
+  auto record = node_down_record();
+  record.lost_unit = "attempts";
+  record.lost_requests = 0;
+  record.after.backlog_drained_in_s = 0.1;
+  record.after.failover_lost = 3281;
+  record.after.failover = SimTime{10s};
+  record.after.dead_replicas = 1;
+  const auto out = rendered_with({record});
+  CAPTURE(out.table);
+  REQUIRE(out.table.contains(
+      "  after:    backlog drained in 0.1s, failover 10s: 3.281k attempts sent to the dead "
+      "replica\n"));
+}
+
 TEST_CASE("the after line names the pool that re-published jobs: pool w re-published 999 jobs",
           "[report]") {
   auto record = node_down_record();

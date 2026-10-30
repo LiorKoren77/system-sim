@@ -477,7 +477,8 @@ FaultRecord FaultLog::record_of(const graph::Graph& g, const model::Fault& fault
 // A node_down's failover, when one applies (FaultSchedule's header): some caller looks the node up
 // through a service discovery (a failover route to it) and the fault kills replicas the capacity
 // counts (dead_share_of: not a sql_db's or a kv_cluster's partial one). The record then counts what
-// was sent to the dead replicas from 0, with the first route's window and the replicas it took.
+// was sent to the dead replicas from 0, with the window that applied, the first route's failover
+// cut to the fault's `for` (a replica that is back is not a dead one), and the replicas it took.
 void FaultLog::add_failover(const graph::Graph& g, std::span<const FailoverRoute> routes,
                             const model::Fault& fault, std::size_t node, FaultRecord& r) {
   const auto& spec = g.nodes()[node].spec;
@@ -487,7 +488,9 @@ void FaultLog::add_failover(const graph::Graph& g, std::span<const FailoverRoute
   const auto route = std::ranges::find(routes, node, &FailoverRoute::target);
   if (route == routes.end()) return;
   r.after.failover_lost = 0.0;
-  r.after.failover = route->failover;
+  // std::min on the tick counts: SimTime's comparisons go through .count() in a unit without
+  // <chrono> (faults.cppm's global module fragment).
+  r.after.failover = SimTime{std::min(route->failover.count(), fault.duration.count())};
   r.after.dead_replicas = fault.replicas.value_or(model::copies_of(spec));
 }
 

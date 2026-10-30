@@ -10,10 +10,11 @@ scenarios/book/chat-system/scenario.yaml: error: node 'chat_servers': a ws_gatew
 ```
 
 Both its phase 3 types now have a model. `discovery` (`service_discovery`, phase 3 Task 13) is a
-service answering `lookup` (the API servers' first step), whose `failover: 10s` holds the callers on
+service answering `lookup` (the API servers' last step), whose `failover: 10s` holds the callers on
 a dead replica of a node they looked up (see
 [`service_discovery`](../../../docs/scenario-schema.md#service_discovery)); `explain` ends its line
-with `failover=10s`. `chat_servers` (`ws_gateway`, Task 14) holds a level of open connections,
+with `failover=10s`. Nothing is called after the lookup here, so the failover does not reach
+`chat_servers`; a step after it to the gateway would. `chat_servers` (`ws_gateway`, Task 14) holds a level of open connections,
 filled by a client op named `connect` or fixed by `connections`, and this file states neither yet,
 so `run` stops there (see
 [What runs in phase 2c](../../../docs/scenario-schema.md#what-runs-in-phase-2c)).

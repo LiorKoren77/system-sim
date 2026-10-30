@@ -2429,14 +2429,14 @@ TEST_CASE("a run without faults prints no fault block and no faults key", "[theo
 // system keeps a service discovery in front of its stateful servers. A registry learns of a death
 // late (its health checks must time out), so a caller that LOOKED UP the node keeps using the
 // address the registry gave it. Model under test (phase 3 spec §8.1, Task 13): when an op reaches a
-// node through a lookup (its step list has a step to a service_discovery asking `lookup` before the
-// step to the node: Graph::lookup_before) and a node_down takes r of the node's R replicas, then
-// for `failover` seconds from the fault's start the share r / R of that op's requests keep going to
-// the dead replicas and are LOST at the node; after that they route to the survivors, whose
-// capacity is already down by r / R, so they queue. A node_down with no lookup before it just
-// removes capacity: the balancer in front spreads the load over the survivors (the model of
-// "node_down of some replicas" above). The share is of that op's requests only, and it lasts
-// min(failover, the fault's own `for`): a replica that is back is not a dead one.
+// node through a lookup (its step list has a step to a service_discovery asking `lookup` before a
+// step to the node, per step: Graph::lookup_before) and a node_down takes r of the node's R
+// replicas, then for `failover` seconds from the fault's start the share r / R of that op's
+// requests keep going to the dead replicas and are LOST at the node; after that they route to the
+// survivors, whose capacity is already down by r / R, so they queue. A node_down with no lookup
+// before it just removes capacity: the balancer in front spreads the load over the survivors (the
+// model of "node_down of some replicas" above). The share is of that op's requests only, and it
+// lasts min(failover, the fault's own `for`): a replica that is back is not a dead one.
 //
 // The probe: a client c (1k/s of `call`) -> api (a service of 100k/s, nothing of its own to
 // mind) -> [disc.lookup, svc.call], svc being 4 replicas of 1k/s and 1 ms (c = 1 server each,
@@ -2676,6 +2676,50 @@ TEST_CASE("a fault shorter than the failover loses only its own span: 1000 reque
   CAPTURE(run.table, run.json);
   REQUIRE_THAT(run.faults.at(0).lost, WithinRel(1000.0, 1e-9));
   REQUIRE_THAT(number_after(run.json, "\"failover_lost\": "), WithinRel(1000.0, 1e-9));
+}
+
+// The lookup rule is per step (Graph::discovery_before_step): `call` calls svc before the lookup
+// and again after it, so only the second call is held on the dead replica. svc gets 2000/s, the
+// dead share is a quarter of the second call's 1000/s: 250/s x 10 s = 2500 requests, as in the
+// one-call probe; a rule read from the first call alone would lose none.
+TEST_CASE("a node called before and after a lookup loses the share of the later call: 2.5k",
+          "[theory]") {
+  const auto run = fault_run(discovery_probe(
+      {.api_ops = "{call: [{to: svc, op: call}, {to: disc, op: lookup}, {to: svc, op: call}]}"}));
+  CAPTURE(run.table, run.json);
+  REQUIRE_THAT(number_after(run.json, "\"failover_lost\": "), WithinRel(2500.0, 1e-9));
+}
+
+// The after line names the window that applied, not the discovery's: a node_down of 5 s with a
+// failover of 10 s held the callers on the dead replica for min(10 s, 5 s) = 5 s, and lost
+// 250/s x 5 s = 1250 requests. Review finding of Task 13: the line said `failover 10s`.
+TEST_CASE("the after line prints the window that applied: failover 5s for a 5 s fault",
+          "[theory]") {
+  const auto run = fault_run(discovery_probe(
+      {.faults = one_fault("at: 10s, kind: node_down, node: svc, replicas: 1, for: 5s")}));
+  CAPTURE(run.table, run.json);
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE(run.faults[0].after.failover == simsys::SimTime{5s});
+  REQUIRE(line_starting(run.table, "  after:    ")
+              .contains("failover 5s: 1.25k requests sent to the dead replica"));
+}
+
+// With client retries the faulted node's drops are attempts (FaultRecord's header), and so is
+// what the failover sent to the dead replica: a dropped attempt is sent again, and a quarter of the
+// retry is looked up onto the dead replica too. With q = 1/4 of each attempt dropped and two
+// retries one step later, the attempts settle at 1000 (1 + q + q^2) = 1312.5/s, a quarter of them
+// to the dead replica: 25 + 31.25 attempts in the first two steps (no retry yet, then the first
+// ones), then 32.81 a step for the other 98, 3271.6 in all. The after line says `attempts`, as
+// `lost` does. Review finding of Task 13: it said `requests`.
+TEST_CASE("with client retries the failover counts attempts sent to the dead replica", "[theory]") {
+  const auto run =
+      fault_run(discovery_probe({.client_ops = "{call: 1.0}, retries: 2, retry_after: 100ms"}));
+  CAPTURE(run.table, run.json);
+  REQUIRE(run.faults.size() == 1);
+  REQUIRE(run.faults[0].lost_unit == "attempts");
+  const auto after = line_starting(run.table, "  after:    ");
+  CAPTURE(after);
+  REQUIRE(after.contains("failover 10s: 3.272k attempts sent to the dead replica"));
 }
 
 // The lost share is the looked-up op's, not the node's: `call` (500/s) looks svc up, `other`

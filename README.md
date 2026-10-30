@@ -29,7 +29,7 @@ a failed step does not run, refused, dropped and timed-out requests are counted 
 run end to end, five of the eight book systems among them (list below); chat-system, google-drive
 and web-crawler validate and `explain`, and wait for phase 3's last type and levels (`frontier`;
 `ws_gateway` and `service_discovery` run since phase 3, but chat-system's and google-drive's
-gateways state no connection level yet). 1163 tests (Catch2, via
+gateways state no connection level yet). 1610 tests (Catch2, via
 `ctest`). The scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.4).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
@@ -293,8 +293,8 @@ The one phase 3 type still to model (URL frontiers) already validates and appear
 with its resolved numbers, but `estimate`, `run` and `sweep` stop with "which run/estimate do not
 support yet" and exit 1, as do the book systems that need it (a WebSocket gateway, a service
 discovery and a notification fan-out run since phase 3; chat-system and google-drive now stop at a
-gateway that states no connection level). Each of those three READMEs opens with its
-status: the exact refusal, what `explain` shows today (its red checks and the nodes it cannot reach
+gateway that states no connection level). The READMEs of the three book systems that do not run yet
+(chat-system, google-drive, web-crawler) open with their status: the exact refusal, what `explain` shows today (its red checks and the nodes it cannot reach
 yet) and what phase 3 will model. Scripted faults run (`faults:`: a node or some of its replicas down, a capacity loss, a
 latency spike, a traffic spike, a cache flush, a datacenter down; `estimate` shows the steady
 state without them); retries and `on: failure` steps are phase 3 too; kv partitions are a phase 4

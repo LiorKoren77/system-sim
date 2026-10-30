@@ -480,9 +480,10 @@ class Graph {
   // for a server, then talks to the server it was handed). A DISCOVERY LOOKUP is a step to a
   // service_discovery node asking `lookup`; it is not ServiceHop::lookup, which is the position of
   // the CACHE lookup an `on: miss` step follows. Does node `node`, handling `op`, ask a discovery
-  // for `target`'s address before it calls it: is there a discovery lookup anywhere before its
-  // first step to `target`? The engine's failover rule reads it: a node_down of some of `target`'s
-  // replicas holds such callers on the dead ones (engine::FaultSchedule::dead_share).
+  // for `target`'s address before it calls it: is there a discovery lookup anywhere before some
+  // step to `target`? The rule is per step (discovery_before_step), as the engine's failover reads
+  // it: a node_down of some of `target`'s replicas holds the steps after a lookup on the dead ones
+  // (engine::FaultSchedule::dead_share), and `[svc, disc.lookup, svc]` reaches svc through it.
   [[nodiscard]] bool lookup_before(std::size_t node, std::string_view op, std::size_t target) const;
   // The discovery whose lookup comes last before step `position` of (node, op) (a position in
   // service_hops), the one that handed out the address that step calls; empty when no discovery
