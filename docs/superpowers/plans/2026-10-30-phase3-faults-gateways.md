@@ -270,6 +270,14 @@ summaries, and the during line also says `over its max for 300ms` for an SLO bre
 fault (5, and 8's duplicate SLO rules go); the record types move to a `simsys.engine:records`
 partition and `FaultLog` to `simsys.engine:fault_log` (8); wording of 9 and 10; 11 fixed. Spec §4.4's
 "step before the fault" is amended to "the same step of a fault-free run" in Task 19's spec update.
+Fixed at `be03792` (1380 tests; news-feed's block now `lost 372.8k`, no SLO flips, `over its max for
+29.9s`; the twin costs 2.2× on news-feed; the record types live in `simsys.engine:records`, the log
+in `simsys.engine:fault_log`). Notes: a datacenter with byte-sized and request-counting nodes counts
+only the latter in `lost`; the recovery rule compares p99 and rho only (two saturated runs compare
+equal); two GCC 14.2 traps found (`#include <memory>` in `engine.cppm`'s GMF breaks every importer
+with "ignoring attributes applied to 'std::auto_ptr'"; Release ICE "in finish_function" on
+`FaultLog`'s implicit move constructor, fixed by defaulting the special members out of class):
+to CLAUDE.md §3 after Task 12's eighth entry lands.
 
 ### Task 9: `on: failure` steps fire
 
@@ -308,8 +316,8 @@ notification-system an `on: failure` step once Task 11's pool retries exist.
 
 **Files:** `src/model/model.cppm` (`Workload::retries` count, `retry_after` duration), `src/config/workload.cpp` (`retries` a non-negative count ≤ 10: `node 'u': retries must be at most 10`; `retry_after` a positive duration, default `defaults::retry_after` = 100 ms `// chosen, not from the book`; `retry_after` without `retries` refused), `src/engine/behaviours.cppm` (`ClientBehaviour`: a ring of `retries` buckets per op holding the share to resend `k` backoffs later; `offered = curve + Σ pending`), `src/engine/engine.cppm` (`client_responses`: `attempts_per_s` in `ResponseSample`; answered counts a request once; the failed share of attempt `k` feeds bucket `k + 1`; settle mode damps the feedback with the delivered-fraction scheme), `src/report/*` (`attempts/s` column after `offered/s`; JSON `attempts_per_s`; CSV `attempts_per_s`; `explain` prints `retries=2 after 100ms`), tests in `test_failed_steps.cpp`, `test_report.cpp`, `test_series.cpp` (chain's hash re-pinned for the column).
 
-- [ ] Tests: a client at 1k/s with `retries: 2`, `retry_after: 100ms`, step 100 ms, whose path loses 50 % (a sink at `failure_rate: 0.5`): at the fixed point attempts per request **1 + 0.5 + 0.25 = 1.75** (`attempts/s` **1750**), answered **1 − 0.5³ = 0.875** (875/s), lost **125/s**; the sink's demand **1750/s**; `offered/s` stays **1000**; the first step sends 1000 (no history), the second 1500, the third 1750 (the backoff is one step); with `retries: 0` or no losses `attempts/s = offered/s`; `estimate` settles at the same 1.75 (and at 1 + Σ for a 90 % loss: `1 + 0.9 + 0.81 = 2.71`); a `node_down` for 10 s on the path with `retries: 2`: `attempts/s` rises to the retry storm's **3× the curve** during the fault (every attempt fails), falls back to the curve within `2 × retry_after` after the fault clears (the recovery pin), and the fault block's `after:` line says `retries added 20.0k attempts`; a timed-out request retries like a lost one (the client's `timeout` share feeds the same buckets).
-- [ ] Commit `nodes: a client's retries are feedback demand, shown as attempts/s`.
+- [x] Tests: a client at 1k/s with `retries: 2`, `retry_after: 100ms`, step 100 ms, whose path loses 50 % (a sink at `failure_rate: 0.5`): at the fixed point attempts per request **1 + 0.5 + 0.25 = 1.75** (`attempts/s` **1750**), answered **1 − 0.5³ = 0.875** (875/s), lost **125/s**; the sink's demand **1750/s**; `offered/s` stays **1000**; the first step sends 1000 (no history), the second 1500, the third 1750 (the backoff is one step); with `retries: 0` or no losses `attempts/s = offered/s`; `estimate` settles at the same 1.75 (and at 1 + Σ for a 90 % loss: `1 + 0.9 + 0.81 = 2.71`); a `node_down` for 10 s on the path with `retries: 2`: `attempts/s` rises to the retry storm's **3× the curve** during the fault (every attempt fails), falls back to the curve within `2 × retry_after` after the fault clears (the recovery pin), and the fault block's `after:` line says `retries added 20.0k attempts`; a timed-out request retries like a lost one (the client's `timeout` share feeds the same buckets).
+- [x] Commit `nodes: a client's retries are feedback demand, shown as attempts/s` (red `e3777fc`, green `3451851`, review fixes `888b7a7`).
 
 **Review of Task 10 at `91195f7`** (adversarial, 2026-10-30): REQUEST_CHANGES. The fixed points
 (1.75; 6861.89 for ten retries at 90 %), losses from rooms, links and sinks, spikes × storms, fan-out,
@@ -336,6 +344,7 @@ sweep metrics; 8 → the schema's claim softened to "warns if it does not settle
 8's twin lands (same code): node-side `lost N attempts` when any client reaching the node retries,
 `traffic_spike` counts last-attempt failures, and the `after:` line `retries added N attempts`
 (the storm probe's 5968).
+Fixed at `888b7a7` (1354 tests) except 2, which follows the twin (item 9 of Task 11's review joins it).
 
 ### Task 11: pool retries and the dead-letter count
 
