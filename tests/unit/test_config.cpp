@@ -5486,3 +5486,30 @@ TEST_CASE("two fanout channels naming one queue are refused") {
                    scenario_with(fanout_nodes("channels: {sms: sms_q, text: sms_q}")),
                    "node 'fanout': channel 'text' names 'sms_q', which channel 'sms' names too");
 }
+
+// ---- The frontier's keys: hosts and politeness (phase 3 Task 18; spec §8.4; book ch. 9) ----
+//
+// A URL frontier drains at most `hosts` x `politeness` URLs a second: the crawl touches `hosts`
+// distinct hosts and each may be fetched `politeness` times a second. `hosts` is a count (a
+// positive integer, with the SI suffixes a count takes: "10M"); `politeness` a positive rate, as
+// on an external sink (0/s would be a crawler that may fetch nothing, which a missing link says
+// more plainly). Both were accepted by name and ignored until the frontier ran.
+
+TEST_CASE("a frontier's hosts must be a positive integer") {
+  for (const auto* hosts : {"0", "-5", "1.5", "many"}) {
+    CAPTURE(hosts);
+    require_rejected("simsys_frontier_hosts.yaml",
+                     scenario_with("  frontier: {type: frontier, hosts: " + std::string{hosts} +
+                                   ", politeness: 1/s, then: [{to: d, op: fetch}]}\n"
+                                   "  d: {type: service}\n"),
+                     "node 'frontier': hosts must be a positive integer");
+  }
+}
+
+TEST_CASE("a frontier's politeness must be a positive rate") {
+  require_rejected("simsys_frontier_politeness_zero.yaml",
+                   scenario_with("  frontier: {type: frontier, hosts: 1000, politeness: 0/s, "
+                                 "then: [{to: d, op: fetch}]}\n"
+                                 "  d: {type: service}\n"),
+                   "node 'frontier': politeness must be positive");
+}

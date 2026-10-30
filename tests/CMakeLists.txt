@@ -37,6 +37,7 @@ add_executable(theory_tests
   theory/test_gateways.cpp
   theory/test_queues_pools.cpp
   theory/test_sinks.cpp
+  theory/test_frontier.cpp
   theory/test_kv.cpp
   theory/test_failed_steps.cpp
   theory/test_retries.cpp
