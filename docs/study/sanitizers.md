@@ -40,6 +40,8 @@ address-space layout and the allocator), hence two presets and two CI jobs.
 `gcc14-asan`:
 
 - `-fsanitize=address,undefined`: the two sanitizers.
+- `-fno-sanitize=shift,integer-divide-by-zero,unreachable,return,signed-integer-overflow,float-cast-overflow`:
+  the six UBSan checks GCC cannot combine with named modules (see the first pitfall below).
 - `-fno-sanitize-recover=all`: by default UBSan prints and carries on; this makes its first
   report end the process with a non-zero status, so the test (and CI) fails.
 - `-fno-omit-frame-pointer`: keeps the frame pointer so the reports' stack traces are complete.
@@ -68,14 +70,34 @@ the link step as well, which links the runtime library.
 
 ## Why TSan runs only some tests
 
-The preset's test filter (`workers|jobs|replication`) selects the tests that start threads:
+The preset's test filter (`workers ran|--jobs|--replications|run_replications`) selects the tests
+that start threads:
 `run_in_parallel` behind `simsys sweep` and `run --replications` ([threads.md](threads.md)), from
 the CLI and from the unit tests ("the summaries do not depend on how many workers ran the
 replications"). Every other test is single-threaded, where TSan has nothing to find and costs
-5-15x. A new test that starts threads should have one of those words in its name.
+5-15x. A new test that starts threads should have one of those phrases in its name.
+
+TSan still checks memory it is told was freed, so on its first run (2026-11-05), when its filter
+was still wider and took in a single-threaded test of `test_frontier.cpp`, it reported a
+heap-use-after-free there: `const auto& downloader = records_of(g, 100).back().nodes[i];` binds
+a reference into the vector `records_of` returns by value, a temporary destroyed at the `;`. The
+test read freed memory and passed by luck. The fix names the vector first
+(`const auto records = records_of(g, 100);`); the ASan job, which runs every test, now guards the
+whole suite against that mistake.
 
 ## Pitfalls
 
+- **UBSan and named modules: six checks crash GCC.** GCC PR 98735 (open since GCC 11): the
+  checks the C++ front end inserts (`shift`, `integer-divide-by-zero`, `unreachable`, `return`,
+  `signed-integer-overflow`, `float-cast-overflow`) leave trees in an inline body that the module
+  writer cannot stream, and every interface unit fails with "internal compiler error: in
+  tree_node, at cp/module.cc" at its `export module` line. A five-line module reproduces it:
+  `export module m; export inline int f(int a, int b) { return a + b; }` with
+  `-fsanitize=signed-integer-overflow`. The preset turns those six off and keeps the checks the
+  middle end inserts (null, bounds, alignment, object-size, bool, enum, vptr, pointer-overflow,
+  float-divide-by-zero, ...). What is lost matters here: a float cast out of range and a signed
+  overflow are exactly the bugs a numeric simulator makes. Clang's UBSan has no such limit, but
+  Clang cannot build the project (CLAUDE.md §3). CLAUDE.md §3 lists it as the eleventh defect.
 - **TSan on recent Linux kernels**: GCC 14's TSan runtime expects at most 28 bits of `mmap`
   randomisation; Ubuntu 24.04 uses 32, and every instrumented binary dies at start with
   "FATAL: ThreadSanitizer: unexpected memory mapping". Fix: `sudo sysctl vm.mmap_rnd_bits=28`

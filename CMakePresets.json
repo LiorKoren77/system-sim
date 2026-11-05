@@ -19,7 +19,7 @@
       "inherits": "gcc14-debug",
       "binaryDir": "${sourceDir}/build/gcc14-asan",
       "cacheVariables": {
-        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -D_GLIBCXX_ASSERTIONS"
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-sanitize=shift,integer-divide-by-zero,unreachable,return,signed-integer-overflow,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer -D_GLIBCXX_ASSERTIONS"
       }
     },
     {
@@ -52,7 +52,7 @@
       "configurePreset": "gcc14-tsan",
       "output": { "outputOnFailure": true },
       "environment": { "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1" },
-      "filter": { "include": { "name": "workers|jobs|replication" } }
+      "filter": { "include": { "name": "workers ran|--jobs|--replications|run_replications" } }
     }
   ]
 }

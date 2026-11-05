@@ -122,6 +122,13 @@ Write for a reader who has read the book but has not studied queueing theory.
   members are declared in the class and defaulted out of it, after it, so they are not inline: the
   partition's object file defines them once and importers call them
   (`src/engine/fault_log.cppm`).
+- Eleventh GCC defect (2026-11-05; GCC PR 98735, open since GCC 11), sanitizer builds only: the
+  UBSan checks that the C++ front end inserts (`shift`, `integer-divide-by-zero`, `unreachable`,
+  `return`, `signed-integer-overflow`, `float-cast-overflow`) put trees in an inline body that the
+  module writer cannot stream: "internal compiler error: in tree_node, at cp/module.cc" at the
+  `export module` line of every interface. Workaround: the `gcc14-asan` preset turns those six off
+  with `-fno-sanitize=` and keeps the rest of `-fsanitize=undefined` (null, bounds, alignment,
+  object-size, bool, enum, vptr, ...); docs/study/sanitizers.md says what is lost.
 
 ## 4. Clean code, named patterns, TDD
 

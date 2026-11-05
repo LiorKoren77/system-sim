@@ -272,8 +272,8 @@ definition it does not need: a helper one unit uses stays in that unit.
 
 ## The other GCC 14.2 module defects met while building
 
-`CLAUDE.md` §3 lists ten GCC 14.2 defects, each verified (the first six on 2026-10-28, the
-seventh to tenth on 2026-10-30, while phase 3 was built) and each with its workaround in the tree.
+`CLAUDE.md` §3 lists eleven GCC defects, each verified (the first six on 2026-10-28, the
+seventh to tenth on 2026-10-30, while phase 3 was built, the eleventh on 2026-11-05) and each with its workaround in the tree.
 The first is the "Bad file data" one above. The second, a format width
 or precision that throws at run time, is in [format-print.md](format-print.md). The rest:
 
@@ -330,6 +330,10 @@ or precision that throws at run time, is in [format-print.md](format-print.md). 
   the fourth defect's family. The workaround declares the special members in the class and
   defaults them after it, out of line, so they are not inline: the partition's object file
   defines them once and importers call them (`src/engine/fault_log.cppm`).
+- **Eleventh: `-fsanitize=undefined` and modules** (GCC PR 98735, every GCC since 11): six of
+  UBSan's checks are inserted by the C++ front end, and the module writer cannot stream the trees
+  they leave in an inline body ("internal compiler error: in tree_node" at `export module`). The
+  `gcc14-asan` preset turns those six off ([sanitizers.md](sanitizers.md)).
 
 ## Rules of thumb used here
 
