@@ -48,6 +48,7 @@ using simsys::model::Workload;
 // Shared builders (tests/support/fixtures.cppm).
 using simsys::test_support::first_step;
 using simsys::test_support::group_of;
+using simsys::test_support::last_record_of;
 using simsys::test_support::published;
 using simsys::test_support::records_of;
 using simsys::test_support::simulation_of;
