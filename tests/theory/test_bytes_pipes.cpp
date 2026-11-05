@@ -51,6 +51,7 @@ using simsys::model::Step;
 using simsys::model::Workload;
 // Shared builders (tests/support/fixtures.cppm).
 using simsys::test_support::first_step;
+using simsys::test_support::last_record_of;
 using simsys::test_support::mm1;
 using simsys::test_support::one_gbit;
 using simsys::test_support::only_link;
