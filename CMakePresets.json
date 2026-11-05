@@ -12,14 +12,47 @@
       "inherits": "gcc14-debug",
       "binaryDir": "${sourceDir}/build/gcc14-release",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "gcc14-asan",
+      "displayName": "GCC 14 Debug + AddressSanitizer + UndefinedBehaviorSanitizer (docs/study/sanitizers.md)",
+      "inherits": "gcc14-debug",
+      "binaryDir": "${sourceDir}/build/gcc14-asan",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -D_GLIBCXX_ASSERTIONS"
+      }
+    },
+    {
+      "name": "gcc14-tsan",
+      "displayName": "GCC 14 Debug + ThreadSanitizer (docs/study/sanitizers.md)",
+      "inherits": "gcc14-debug",
+      "binaryDir": "${sourceDir}/build/gcc14-tsan",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "-fsanitize=thread -fno-omit-frame-pointer -Wno-error=tsan"
+      }
     }
   ],
   "buildPresets": [
     { "name": "gcc14-debug", "configurePreset": "gcc14-debug" },
-    { "name": "gcc14-release", "configurePreset": "gcc14-release" }
+    { "name": "gcc14-release", "configurePreset": "gcc14-release" },
+    { "name": "gcc14-asan", "configurePreset": "gcc14-asan" },
+    { "name": "gcc14-tsan", "configurePreset": "gcc14-tsan" }
   ],
   "testPresets": [
     { "name": "gcc14-debug", "configurePreset": "gcc14-debug", "output": { "outputOnFailure": true } },
-    { "name": "gcc14-release", "configurePreset": "gcc14-release", "output": { "outputOnFailure": true } }
+    { "name": "gcc14-release", "configurePreset": "gcc14-release", "output": { "outputOnFailure": true } },
+    {
+      "name": "gcc14-asan",
+      "configurePreset": "gcc14-asan",
+      "output": { "outputOnFailure": true },
+      "environment": { "ASAN_OPTIONS": "detect_leaks=1:strict_string_checks=1:check_initialization_order=1" }
+    },
+    {
+      "name": "gcc14-tsan",
+      "configurePreset": "gcc14-tsan",
+      "output": { "outputOnFailure": true },
+      "environment": { "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1" },
+      "filter": { "include": { "name": "workers|jobs|replication" } }
+    }
   ]
 }
