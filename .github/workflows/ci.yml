@@ -2,6 +2,7 @@ name: ci
 on:
   push: { branches: [main] }
   pull_request:
+  workflow_dispatch:   # a "Run workflow" button on the Actions tab (and `gh workflow run ci`)
 jobs:
   build-test:
     runs-on: ubuntu-24.04
@@ -31,6 +32,39 @@ jobs:
         run: cmake --build --preset gcc14-release
       - name: Test
         run: ctest --preset gcc14-release
+  # Sanitizers (docs/study/sanitizers.md): the compiler instruments the code and a run stops at the
+  # first memory error (ASan), undefined behaviour (UBSan) or data race (TSan) a test reaches. TSan
+  # cannot share a binary with ASan, hence two jobs; UBSan rides with ASan.
+  build-test-asan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14 and Ninja
+        run: sudo apt-get update && sudo apt-get install -y gcc-14 g++-14 ninja-build
+      - name: Configure
+        run: cmake --preset gcc14-asan
+      - name: Build
+        run: cmake --build --preset gcc14-asan
+      - name: Test
+        run: ctest --preset gcc14-asan
+  # TSan runs only the tests that start threads (the preset's filter: `simsys sweep` and
+  # `run --replications`, from the CLI and the unit tests): it finds nothing in single-threaded code.
+  build-test-tsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14 and Ninja
+        run: sudo apt-get update && sudo apt-get install -y gcc-14 g++-14 ninja-build
+      # GCC 14's TSan runtime assumes at most 28 bits of mmap randomisation; Ubuntu 24.04's kernel
+      # uses 32, and every instrumented binary then dies at start ("unexpected memory mapping").
+      - name: Lower mmap randomisation for TSan
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure
+        run: cmake --preset gcc14-tsan
+      - name: Build
+        run: cmake --build --preset gcc14-tsan
+      - name: Test
+        run: ctest --preset gcc14-tsan
   format:
     runs-on: ubuntu-24.04
     steps:
