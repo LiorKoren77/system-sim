@@ -5,13 +5,18 @@
       "name": "gcc14-debug",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/gcc14-debug",
-      "cacheVariables": { "CMAKE_CXX_COMPILER": "g++-14", "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "g++-14",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
     },
     {
       "name": "gcc14-release",
       "inherits": "gcc14-debug",
       "binaryDir": "${sourceDir}/build/gcc14-release",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     },
     {
       "name": "gcc14-asan",
@@ -20,6 +25,9 @@
       "binaryDir": "${sourceDir}/build/gcc14-asan",
       "cacheVariables": {
         "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-sanitize=shift,integer-divide-by-zero,unreachable,return,signed-integer-overflow,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer -D_GLIBCXX_ASSERTIONS"
+      },
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=1:strict_string_checks=1:check_initialization_order=1:new_delete_type_mismatch=0"
       }
     },
     {
@@ -33,26 +41,59 @@
     }
   ],
   "buildPresets": [
-    { "name": "gcc14-debug", "configurePreset": "gcc14-debug" },
-    { "name": "gcc14-release", "configurePreset": "gcc14-release" },
-    { "name": "gcc14-asan", "configurePreset": "gcc14-asan" },
-    { "name": "gcc14-tsan", "configurePreset": "gcc14-tsan" }
+    {
+      "name": "gcc14-debug",
+      "configurePreset": "gcc14-debug"
+    },
+    {
+      "name": "gcc14-release",
+      "configurePreset": "gcc14-release"
+    },
+    {
+      "name": "gcc14-asan",
+      "configurePreset": "gcc14-asan"
+    },
+    {
+      "name": "gcc14-tsan",
+      "configurePreset": "gcc14-tsan"
+    }
   ],
   "testPresets": [
-    { "name": "gcc14-debug", "configurePreset": "gcc14-debug", "output": { "outputOnFailure": true } },
-    { "name": "gcc14-release", "configurePreset": "gcc14-release", "output": { "outputOnFailure": true } },
+    {
+      "name": "gcc14-debug",
+      "configurePreset": "gcc14-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "gcc14-release",
+      "configurePreset": "gcc14-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
     {
       "name": "gcc14-asan",
       "configurePreset": "gcc14-asan",
-      "output": { "outputOnFailure": true },
-      "environment": { "ASAN_OPTIONS": "detect_leaks=1:strict_string_checks=1:check_initialization_order=1" }
+      "output": {
+        "outputOnFailure": true
+      }
     },
     {
       "name": "gcc14-tsan",
       "configurePreset": "gcc14-tsan",
-      "output": { "outputOnFailure": true },
-      "environment": { "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1" },
-      "filter": { "include": { "name": "workers ran|--jobs|--replications|run_replications" } }
+      "output": {
+        "outputOnFailure": true
+      },
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1"
+      },
+      "filter": {
+        "include": {
+          "name": "workers ran|--jobs|--replications|run_replications"
+        }
+      }
     }
   ]
 }
