@@ -70,6 +70,11 @@ std::vector<engine::StepRecord> records_of(const graph::Graph& g, int steps) {
   return records;
 }
 
+engine::StepRecord last_record_of(const graph::Graph& g, int steps) {
+  auto records = records_of(g, steps);
+  return std::move(records.back());  // the vector is ours and about to go: move, do not copy
+}
+
 engine::Simulation simulation_of(const graph::Graph& g) {
   auto sim = engine::Simulation::create(g);
   if (!sim) FAIL(sim.error().message);

@@ -62,6 +62,14 @@ Write for a reader who has read the book but has not studied queueing theory.
 - Scenario YAML files get a README explaining the design and the mechanisms the model
   abstracts away.
 - Commit messages explain *why*; the diff shows *what*.
+- No reference into a temporary. Never bind `auto&` (or `const auto&`) to an expression that
+  starts with a call returning by value and then goes through a member call, `operator[]` or a
+  getter: `const auto& n = records_of(g, 100).back().nodes[i];` refers into a vector destroyed at
+  the `;` (two tests did this until ASan/TSan caught it, 2026-11-05). Only a reference bound
+  directly to the temporary extends its life, and GCC's -Wdangling-reference does not see through
+  member calls. Either name the owner first (`const auto records = records_of(g, 100);`) or copy
+  the leaf (`const auto n = ...;`). A helper that would invite the chain returns what the test
+  wants by value instead (`last_record_of` in `tests/support/fixtures.cppm`).
 - First GCC 14.2 defect: module interface units stay lean: no
   <chrono>/<filesystem>/<format>/<print> in the global module fragment of an interface
   that imports another module ('Bad file data' bug, verified 2026-10-28). Heavy headers go
