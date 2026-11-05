@@ -46,6 +46,13 @@ engine::StepRecord first_step(const graph::Graph& g);
 // The first `steps` steps of a fresh simulation of `g`, one record each.
 std::vector<engine::StepRecord> records_of(const graph::Graph& g, int steps);
 
+// The last of those records, by value. It exists so a test never writes
+// `records_of(g, n).back()`: a reference into that chain (`const auto& x =
+// records_of(g, n).back().nodes[i];`) points into a vector destroyed at the `;`, and GCC's
+// -Wdangling-reference does not see through a member call (CLAUDE.md §3, "No reference into a
+// temporary"). Returning the record itself leaves nothing to dangle.
+engine::StepRecord last_record_of(const graph::Graph& g, int steps);
+
 // A fresh simulation of `g`, failing the test with the engine's message when it refuses the
 // scenario (instead of dereferencing the refusal).
 engine::Simulation simulation_of(const graph::Graph& g);

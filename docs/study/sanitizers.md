@@ -82,8 +82,17 @@ was still wider and took in a single-threaded test of `test_frontier.cpp`, it re
 heap-use-after-free there: `const auto& downloader = records_of(g, 100).back().nodes[i];` binds
 a reference into the vector `records_of` returns by value, a temporary destroyed at the `;`. The
 test read freed memory and passed by luck. The fix names the vector first
-(`const auto records = records_of(g, 100);`); the ASan job, which runs every test, now guards the
-whole suite against that mistake.
+(`const auto records = records_of(g, 100);`, later a `last_record_of` helper that returns the
+record by value); the ASan job, which runs every test, now guards the whole suite against that
+mistake, and CLAUDE.md §3 makes it a rule ("No reference into a temporary").
+
+Why the compiler stayed silent: a reference extends a temporary's life only when it binds to the
+temporary itself (`const auto& v = records_of(g, 100);` is fine). Through a function that returns
+a reference, here `back()` and `operator[]`, the compiler no longer knows the result points into
+the temporary. GCC 13's `-Wdangling-reference` (in `-Wall`) catches the free-function form,
+`const auto& r = last(records_of(g, 100));`, but not a member call on the temporary. C++23's
+P2718 extends temporaries in a range-`for` initializer only (`for (auto& x : make().items())`),
+not in a declaration like this one.
 
 ## Pitfalls
 
