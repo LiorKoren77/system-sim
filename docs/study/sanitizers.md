@@ -98,6 +98,15 @@ whole suite against that mistake.
   float-divide-by-zero, ...). What is lost matters here: a float cast out of range and a signed
   overflow are exactly the bugs a numeric simulator makes. Clang's UBSan has no such limit, but
   Clang cannot build the project (CLAUDE.md §3). CLAUDE.md §3 lists it as the eleventh defect.
+- **ASan's `new_delete_type_mismatch` is off** (`ASAN_OPTIONS` in the `gcc14-asan` configure
+  preset, so the build's test discovery, which runs each test binary, sees it too). On its first
+  run (2026-11-05) it stopped every test binary at exit: a `std::string` in Catch2's own
+  `TestCaseInfo` (`catch_test_case_info.cpp`, its tag string) allocated 31 bytes and freed as 17,
+  so the destructor read a different capacity than the constructor wrote. Both ends are Catch2's
+  code, which Catch2's own CI runs under ASan; the suspect is the toolchain (Catch2's inline
+  destructor instantiated in a test unit that imports modules), but this is not reduced to a
+  reproducer yet. Every other ASan check stays on. To retry: set it back to 1 and run
+  `ctest --preset gcc14-asan`.
 - **TSan on recent Linux kernels**: GCC 14's TSan runtime expects at most 28 bits of `mmap`
   randomisation; Ubuntu 24.04 uses 32, and every instrumented binary dies at start with
   "FATAL: ThreadSanitizer: unexpected memory mapping". Fix: `sudo sysctl vm.mmap_rnd_bits=28`
