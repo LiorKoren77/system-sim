@@ -78,6 +78,14 @@
       "configurePreset": "gcc14-asan",
       "output": {
         "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 4
+      },
+      "filter": {
+        "exclude": {
+          "name": "seconds of CPU"
+        }
       }
     },
     {
