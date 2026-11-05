@@ -113,6 +113,11 @@ whole suite against that mistake.
   (the CI job does it; on WSL too).
 - **A sanitizer sees only what runs.** A clean ASan run says the tests do nothing undefined, not
   that the program cannot.
+- **Timing tests do not belong under a sanitizer.** The ASan preset excludes the test that holds
+  every shipped scenario to five seconds of CPU (`seconds of CPU` in its name): instrumented,
+  the scenarios take about twice that, and the budget measures the build, not the code. It
+  runs the other tests four at a time (`execution.jobs`); the `[serial]` cases keep ctest's
+  `RUN_SERIAL`.
 - **Do not ship it.** The instrumented binary is slower and its runtime changes behaviour (ASan
   delays reusing freed memory, on purpose). The presets build into their own `build/` directory.
 
