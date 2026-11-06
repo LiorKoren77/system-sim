@@ -37,6 +37,7 @@ jobs:
   # cannot share a binary with ASan, hence two jobs; UBSan rides with ASan.
   build-test-asan:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60   # a hang fails here, not at GitHub's 6 h
     steps:
       - uses: actions/checkout@v4
       - name: Install GCC 14 and Ninja
@@ -51,6 +52,7 @@ jobs:
   # `run --replications`, from the CLI and the unit tests): it finds nothing in single-threaded code.
   build-test-tsan:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60   # a hang fails here, not at GitHub's 6 h
     steps:
       - uses: actions/checkout@v4
       - name: Install GCC 14 and Ninja
