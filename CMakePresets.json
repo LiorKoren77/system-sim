@@ -80,7 +80,8 @@
         "outputOnFailure": true
       },
       "execution": {
-        "jobs": 4
+        "jobs": 4,
+        "timeout": 300
       },
       "filter": {
         "exclude": {
@@ -101,6 +102,9 @@
         "include": {
           "name": "workers ran|--jobs|--replications|run_replications"
         }
+      },
+      "execution": {
+        "timeout": 300
       }
     }
   ]

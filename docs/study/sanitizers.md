@@ -127,6 +127,12 @@ not in a declaration like this one.
   the scenarios take about twice that, and the budget measures the build, not the code. It
   runs the other tests four at a time (`execution.jobs`); the `[serial]` cases keep ctest's
   `RUN_SERIAL`.
+- **A hang needs a timeout to be seen.** On 2026-11-05 two `run --replications` CLI tests that
+  take 2-4 s under ASan hung for over an hour (they passed on the run before and after, on the
+  same code; not reproduced). Without a limit ctest waits, the job waits, and GitHub cancels
+  it only at 6 h, with no log until then. The sanitizer test presets give each test 300 s
+  (`execution.timeout`) and the jobs 60 minutes (`timeout-minutes`), so a hang fails fast and
+  ctest names the test.
 - **Do not ship it.** The instrumented binary is slower and its runtime changes behaviour (ASan
   delays reusing freed memory, on purpose). The presets build into their own `build/` directory.
 
