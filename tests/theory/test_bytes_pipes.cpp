@@ -51,6 +51,7 @@ using simsys::model::Step;
 using simsys::model::Workload;
 // Shared builders (tests/support/fixtures.cppm).
 using simsys::test_support::first_step;
+using simsys::test_support::last_record_of;
 using simsys::test_support::mm1;
 using simsys::test_support::one_gbit;
 using simsys::test_support::only_link;
@@ -1253,7 +1254,7 @@ TEST_CASE("estimate and run agree on the pipe, below capacity and above it", "[t
   SECTION("rho 0.8") {
     const auto g = *Graph::build(pipe_over(100, simsys::Bytes{1e6}));
     const auto e = (*Simulation::create(g)).estimate();
-    const auto ran = records_of(g, 20).back();
+    const auto ran = last_record_of(g, 20);
     REQUIRE(e.converged);
     const auto& settled = only_link(e);
     const auto& stepped = only_link(ran);

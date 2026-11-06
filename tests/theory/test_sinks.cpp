@@ -48,6 +48,7 @@ using simsys::model::Workload;
 // Shared builders (tests/support/fixtures.cppm).
 using simsys::test_support::first_step;
 using simsys::test_support::group_of;
+using simsys::test_support::last_record_of;
 using simsys::test_support::published;
 using simsys::test_support::records_of;
 using simsys::test_support::simulation_of;
@@ -542,8 +543,8 @@ TEST_CASE("the queue's lag includes the re-published jobs: the pool runs at rho 
           "[theory]") {
   const auto with = *Graph::build(retrying_pool(0.02, 3, 1s));
   const auto without = *Graph::build(retrying_pool(0.02, std::nullopt));
-  const auto lag_with = records_of(with, 60).back().nodes[q_index].queue_lag_s;
-  const auto lag_without = records_of(without, 60).back().nodes[q_index].queue_lag_s;
+  const auto lag_with = last_record_of(with, 60).nodes[q_index].queue_lag_s;
+  const auto lag_without = last_record_of(without, 60).nodes[q_index].queue_lag_s;
   REQUIRE(lag_with.has_value());
   REQUIRE(lag_without.has_value());
   const double rho_with = publish_rate * attempts_per_job(0.02, 3) * 0.010 / 100.0;

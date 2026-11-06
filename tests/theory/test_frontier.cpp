@@ -51,6 +51,7 @@ using simsys::model::Workload;
 using simsys::test_support::explain_of;
 using simsys::test_support::first_step;
 using simsys::test_support::group_of;
+using simsys::test_support::last_record_of;
 using simsys::test_support::published;
 using simsys::test_support::records_of;
 using simsys::test_support::simulation_of;
@@ -508,7 +509,7 @@ TEST_CASE("twice the workers behind the same cap halve the pool's rho and drain 
   s.nodes[2] = group_of("downloader", 4000, 500ms);
   s.nodes[2].consumes = "frontier";
   const auto g = *Graph::build(s);
-  const auto& downloader = records_of(g, 100).back().nodes[*g.index_of("downloader")];
+  const auto downloader = last_record_of(g, 100).nodes[*g.index_of("downloader")];
   REQUIRE_THAT(downloader.drain_per_s, WithinRel(1000.0, 1e-9));  // still the cap
   REQUIRE_THAT(downloader.rho, WithinRel(0.125, 1e-9));           // 1000 x 0.5 s / 4000 workers
 }
@@ -518,7 +519,7 @@ TEST_CASE("twice the workers behind the same cap halve the pool's rho and drain 
 TEST_CASE("with 10 million hosts the pool's own 4000 a second binds and every worker is busy",
           "[theory]") {
   const auto g = *Graph::build(crawl(5000, frontier_of(10'000'000, 1.0, 5000)));
-  const auto& downloader = records_of(g, 100).back().nodes[*g.index_of("downloader")];
+  const auto downloader = last_record_of(g, 100).nodes[*g.index_of("downloader")];
   REQUIRE_THAT(downloader.drain_per_s, WithinRel(4000.0, 1e-9));
   REQUIRE_THAT(downloader.rho, WithinRel(1.0, 1e-9));  // 4000 x 0.5 s / 2000 workers
 }
