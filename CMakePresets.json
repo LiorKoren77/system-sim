@@ -81,7 +81,7 @@
       },
       "execution": {
         "jobs": 4,
-        "timeout": 300
+        "timeout": 900
       },
       "filter": {
         "exclude": {

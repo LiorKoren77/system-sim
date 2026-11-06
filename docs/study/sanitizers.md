@@ -130,9 +130,11 @@ not in a declaration like this one.
 - **A hang needs a timeout to be seen.** On 2026-11-05 two `run --replications` CLI tests that
   take 2-4 s under ASan hung for over an hour (they passed on the run before and after, on the
   same code; not reproduced). Without a limit ctest waits, the job waits, and GitHub cancels
-  it only at 6 h, with no log until then. The sanitizer test presets give each test 300 s
-  (`execution.timeout`) and the jobs 60 minutes (`timeout-minutes`), so a hang fails fast and
-  ctest names the test.
+  it only at 6 h, with no log until then. The sanitizer test presets give each test a limit
+  (`execution.timeout`: 900 s under ASan, 300 s under TSan) and the jobs 60 minutes
+  (`timeout-minutes`), so a hang fails and ctest names the test. The ASan limit is generous on
+  purpose: the 24-hour book scenarios take 100-230 s each there (the notification-system one is
+  the slowest), and a first limit of 300 s failed it on a busy runner.
 - **Do not ship it.** The instrumented binary is slower and its runtime changes behaviour (ASan
   delays reusing freed memory, on purpose). The presets build into their own `build/` directory.
 
