@@ -47,6 +47,7 @@ using simsys::model::StepCondition;
 using simsys::model::Workload;
 // Shared builders (tests/support/fixtures.cppm).
 using simsys::test_support::group_of;
+using simsys::test_support::last_record_of;
 using simsys::test_support::published;
 using simsys::test_support::records_of;
 using simsys::test_support::simulation_of;
@@ -227,7 +228,7 @@ TEST_CASE("three sequential steps thin one another: the third is sent 1000 x 0.5
   const auto g = *Graph::build(steps_chain(
       {Step{.to = "a", .op = "x"}, Step{.to = "b", .op = "x"}, Step{.to = "c", .op = "x"}},
       {lossy_target("a", 500), lossy_target("b", 250), plain_target("c")}));
-  const auto last = records_of(g, 30).back();
+  const auto last = last_record_of(g, 30);
   REQUIRE_THAT(demand_at(last, g, "a"), WithinRel(1000.0, 1e-9));
   REQUIRE_THAT(demand_at(last, g, "b"), WithinRel(500.0, 1e-3));       // 1000 x 0.5
   REQUIRE_THAT(dropped_share_at(last, g, "b"), WithinRel(0.5, 1e-3));  // 250 of the 500 offered
@@ -568,7 +569,7 @@ TEST_CASE("a miss block stays one block across a failure step: db2 is sent 250 o
   const auto g = *Graph::build(steps_chain(
       {read_c, miss_step("db"), failure_step("log"), miss_step("db2")},
       {lookup_cache("c", 0.5), lossy_target("db", 250), plain_target("log"), plain_target("db2")}));
-  const auto last = records_of(g, 20).back();
+  const auto last = last_record_of(g, 20);
   REQUIRE_THAT(demand_at(last, g, "db"), WithinRel(500.0, 1e-9));
   REQUIRE_THAT(dropped_share_at(last, g, "db"), WithinRel(0.5, 1e-9));
   REQUIRE_THAT(demand_at(last, g, "db2"), WithinRel(250.0, 1e-9));  // 1000 x 0.5 x 0.5
@@ -586,7 +587,7 @@ TEST_CASE("a failure step's latency is not in the op's response: a 10 ms log mov
     log.latency = log_latency;
     const auto g = *Graph::build(steps_chain({write_step("db"), failure_step("log")},
                                              {lossy_target("db", 500), std::move(log)}));
-    const auto last = records_of(g, 20).back();
+    const auto last = last_record_of(g, 20);
     REQUIRE_THAT(demand_at(last, g, "log"), WithinRel(500.0, 1e-9));  // log is taken: not vacuous
     return last.responses[0].response;
   };

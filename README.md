@@ -389,6 +389,15 @@ cmake --preset gcc14-debug && cmake --build --preset gcc14-debug && ctest --pres
 ./build/gcc14-debug/simsys validate scenarios/book/news-feed/scenario.yaml
 ```
 
+Two more presets build the tests under the sanitizers (CI runs both; see
+[`docs/study/sanitizers.md`](docs/study/sanitizers.md)): `gcc14-asan` (AddressSanitizer and
+UndefinedBehaviorSanitizer, every test) and `gcc14-tsan` (ThreadSanitizer, the tests that start
+threads; on a recent kernel run `sudo sysctl vm.mmap_rnd_bits=28` first):
+
+```bash
+cmake --preset gcc14-asan && cmake --build --preset gcc14-asan && ctest --preset gcc14-asan
+```
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
