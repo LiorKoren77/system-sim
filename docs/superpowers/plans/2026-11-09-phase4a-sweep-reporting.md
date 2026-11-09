@@ -256,8 +256,16 @@ burst 100; url-shortener's "the start of that hour" for 13:00 against 13:02.
 ### The 4a review, then the PR
 
 - [ ] An adversarial review (fresh context, own worktree, all four presets): warning-free builds and the whole suite; clang-format as CI; byte-identity of every one-key sweep, of `run` on the fourteen scenarios (only the `units:` line added where §7 says), of `estimate --at 00:00` against `estimate`; every new message verbatim against the schema; first-use comments; `Pattern:` labels; test names (no `[` or `]`, named after the property); no reference into a temporary (CLAUDE.md §3); functions over ~50 lines; the GCC workarounds of CLAUDE.md §3 in place. Recorded here as "Review of 4a at <sha>" with decisions.
-- [ ] Fix round, one commit.
-- [ ] `cmake --preset gcc14-asan && cmake --build --preset gcc14-asan && ctest --preset gcc14-asan` green.
+- [x] Fix round, one commit per batch (`56249ff`, `48fe0ce`, `dcb5e8b`, `53a8fde`).
+- [x] `cmake --preset gcc14-asan && cmake --build --preset gcc14-asan && ctest --preset gcc14-asan` green.
+
+Closing checks at `53a8fde` (2026-11-09): Debug 1740/1740; Release builds and links clean;
+`gcc14-asan` 1739/1739 (its preset already excludes the CPU-time test), about 14 minutes with the
+build. Byte-identity against `main` (`b97cd0f`), both Release binaries, all fourteen scenarios ×
+`validate`, `explain`, `run` (the table without its new `units` line) and `run --report json`
+(without `dropped_per_s`, `rejected_per_s`, `queue_lag_unbounded`), and the hello one-key sweep:
+0 differences. Not checked locally: clang-format-18 (not installed on this machine; lines were
+held to 100 columns by hand), so CI's format job is the first formatter to see the branch.
 - [ ] **Ask the user**, then `git push -u origin phase4a/sweep-reporting` and `gh pr create` (body: what and why, the test count, the checkpoints' commits; ends with the attribution line). CI's five jobs decide; a red job gets a fix commit on the branch, never a force-push without asking.
 
 ---
