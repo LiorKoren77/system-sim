@@ -75,13 +75,15 @@ endforeach()
 # simsys sweep, run as a process: the output does not depend on --jobs, a bad --param is an error
 # (exit 1), a failing SLO at some point is not (exit 0). One scratch directory per check, so `ctest
 # -j` runs them side by side.
-foreach(check same_bytes refuses_bad_param error_prefixes slo_failure_exit_0)
+foreach(check same_bytes refuses_bad_param error_prefixes slo_failure_exit_0 grid_same_bytes)
   if(check STREQUAL "same_bytes")
     set(name "simsys sweep gives the same bytes with --jobs 1 and 3")
   elseif(check STREQUAL "refuses_bad_param")
     set(name "simsys sweep exits 1 on a bad --param")
   elseif(check STREQUAL "error_prefixes")
     set(name "simsys sweep words every option refusal as file, error, then the option")
+  elseif(check STREQUAL "grid_same_bytes")
+    set(name "simsys sweep over two keys gives the same bytes with --jobs 1 and 3")
   else()
     set(name "simsys sweep exits 0 when an SLO fails at some point")
   endif()
@@ -112,6 +114,14 @@ add_test(NAME "simsys curve applies a traffic_spike fault exactly as a spikes en
          COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
                  -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-curve-faults
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/curve_faults.cmake)
+add_test(NAME "simsys estimate --at evaluates the steady state at an instant inside the run"
+         COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
+                 -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-estimate-at
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/estimate_at.cmake)
+add_test(NAME "simsys curve refuses a seed without noise, which would change nothing"
+         COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
+                 -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-curve-seed
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/curve_seed.cmake)
 
 # simsys run --replications, run as a process: the median and the 10-90 % band across seeds, the
 # refusals, the exit code of the median run, and that --jobs cannot show in the output. One scratch

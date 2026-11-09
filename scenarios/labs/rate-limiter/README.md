@@ -125,3 +125,22 @@ p99 by 2 %.)
   bucket changes is how much of it arrives at once, and so the wait: the p99 SLO of 50 ms holds
   up to a bucket of about 300 and fails from 400, and at 500 the surge overflows the api's queue
   (its drop rate, 140 of 1.42M requests).
+
+  Since phase 4a the sweep reads the limiter's refusals and judges the SLOs itself (`--slos`: a
+  verdict per SLO and the exit code `simsys run` would give each point; the sweep still exits 0):
+
+  ```
+  $ simsys sweep scenarios/labs/rate-limiter/scenario.yaml --param nodes.limiter.burst=100..500:5 \
+        --metric limiter.reject_rate --metric api.peak_rho --metric clients.call.p99 --slos
+  nodes.limiter.burst  limiter.reject_rate  api.peak_rho  clients.call.p99  utilization:api  p99_latency:clients.call  exit
+  -------------------------------------------------------------------------------------------------------------------------
+  100                                0.143             1            24.8ms             PASS                      PASS     0
+  200                                0.142             1            32.4ms             PASS                      PASS     0
+  300                                0.142             1            45.4ms             PASS                      PASS     0
+  400                                0.142             1            58.2ms             PASS                      FAIL     2
+  500                                0.142             1            63.8ms             PASS                      FAIL     2
+  ```
+
+  The bucket refuses about the same share at every size, 14.2–14.3 %: the spikes' excess over the
+  1k/s refill is refused whatever the bucket holds, so `burst` buys no throughput, only a bigger first
+  moment of each spike in the api's queue.

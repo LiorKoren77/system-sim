@@ -5,8 +5,9 @@
 // error (bad file, bad option, a scenario the engine cannot run yet, or a run that observed
 // no step: no data is an error, not a pass). `run --replications N` judges each SLO by its own
 // median run (report::SloReplication), so two SLOs may be judged by two different seeds: it exits 2
-// when some SLO's median run fails it, whatever the seeds that passed. `sweep` reports numbers and
-// judges none: 0 when every point ran, whatever its SLOs, 1 on an error.
+// when some SLO's median run fails it, whatever the seeds that passed. `sweep` exits 0 when every
+// point ran, whatever its SLOs, 1 on an error; with --slos it prints each point's verdicts and the
+// exit code `run` would give it, but its own exit code stays the same (phase 4a spec §2).
 #include <unistd.h>  // isatty, STDOUT_FILENO: POSIX, which is fine for this project
 #include <CLI/CLI.hpp>
 
@@ -130,11 +131,42 @@ int run_explain(const std::filesystem::path& file) {
 }
 
 // What `estimate` evaluates, stated above its table: the steady state of the curve's value
-// at t = 0 (00:00), noise left out (Simulation::estimate). A daily wave's trough or peak
-// is not that value, so the line also says where the peak IS checked: explain's static
-// load check. Table only: a line of prose before the JSON would break its parsers.
-constexpr std::string_view estimate_header =
-    "estimate at t = 0 (00:00): the curve without noise; explain's checks use the peak";
+// at t = 0 (00:00), or at `--at`, noise left out (Simulation::estimate). A daily wave's trough or
+// peak is not that value, so the line also says where the peak IS checked: explain's static
+// load check. Table only: a line of prose before the JSON would break its parsers. Without --at the
+// line is what it always was.
+std::string estimate_header(simsys::SimTime at) {
+  // The clock in parentheses only when it says something the duration does not: an instant below a
+  // whole second, or past the first day, is the same text both ways.
+  const auto duration = simsys::describe_duration(at);
+  const auto clock = report::format_clock(at);
+  const std::string instant = at.count() == 0     ? std::string{"0 (00:00)"}
+                              : clock == duration ? duration
+                                                  : duration + " (" + clock + ")";
+  return "estimate at t = " + instant + ": the curve without noise; explain's checks use the peak";
+}
+
+// `--at <time>`: a clock time (`12:00`) or a duration from the start (`90m`), the syntax of a
+// fault's `at`, and like it inside the run (at < duration). Worded as `curve`'s duration options.
+std::expected<simsys::SimTime, std::string> estimate_instant(const std::filesystem::path& file,
+                                                             const simsys::graph::Graph& g,
+                                                             const std::optional<std::string>& at) {
+  if (!at) return simsys::SimTime{};
+  const auto parsed = simsys::parse_time_point(*at);
+  if (!parsed) {
+    // C++23 std::unexpected: wraps the message so it converts to the std::expected the function
+    // returns; C++20 std::format: type-safe `{}` formatting into a std::string, replacing a
+    // stringstream or a chain of `+`.
+    return std::unexpected(
+        std::format("{}: error: --at '{}': {}", file.string(), *at, parsed.error().message));
+  }
+  const auto duration = g.scenario().duration;
+  if (parsed->count() >= duration.count()) {
+    return std::unexpected(std::format("{}: error: --at '{}' must fall inside the run ({})",
+                                       file.string(), *at, simsys::describe_duration(duration)));
+  }
+  return *parsed;
+}
 
 // estimate admits min(in, limit) at a rate limiter: the long-run rate of a bucket, but not
 // of the sliding counter (about 10/11 of the limit under a flood), and blind to the fixed
@@ -154,10 +186,16 @@ constexpr std::string_view windowed_limiter_caveat =
 }
 
 // `simsys estimate <file>`: one steady-state evaluation, summarised as a run of one step.
-int run_estimate(const std::filesystem::path& file, const ReportOptions& options) {
+int run_estimate(const std::filesystem::path& file, const ReportOptions& options,
+                 const std::optional<std::string>& at_text) {
   const auto g = load_graph(file);
   if (!g) {
     print_error(g.error());
+    return 1;
+  }
+  const auto at = estimate_instant(file, *g, at_text);
+  if (!at) {
+    print_error(at.error());
     return 1;
   }
   const auto sim = simsys::session::create_simulation(*g, file.string());
@@ -165,7 +203,7 @@ int run_estimate(const std::filesystem::path& file, const ReportOptions& options
     print_error(sim.error());
     return 1;
   }
-  const auto record = sim->estimate();
+  const auto record = sim->estimate(*at);
   if (!record.converged) {
     print_error(file.string() +
                 ": warning: no steady state (a loop of gain >= 1 or a retry storm that no "
@@ -174,7 +212,7 @@ int run_estimate(const std::filesystem::path& file, const ReportOptions& options
                 "the numbers below are the last settle pass");
   }
   if (options.format == "table") {
-    std::println("{}{}", estimate_header,
+    std::println("{}{}", estimate_header(*at),
                  has_windowed_limiter(*g) ? windowed_limiter_caveat : std::string_view{});
   }
   return print_report(report::Summary::of_estimate(*g, record), options);
@@ -535,6 +573,14 @@ int run_curve(const std::filesystem::path& file, const CurveArgs& args) {
     print_error(describe(scenario.error()));
     return 1;
   }
+  // The seed feeds only the noise process, which --noise samples: without it the seed changes
+  // nothing, and a flag that silently does nothing is refused (as retry_after without retries).
+  // After the load, so that a file that is missing or wrong is reported as what it is.
+  if (args.seed && !args.noise) {
+    print_error(file.string() +
+                ": error: --seed needs --noise (without it the curve has no randomness)");
+    return 1;
+  }
   const auto client = find_client(file, *scenario, args.client);
   if (!client) {
     print_error(client.error());
@@ -556,10 +602,11 @@ int run_curve(const std::filesystem::path& file, const CurveArgs& args) {
 
 // What `sweep` takes beyond the file.
 struct SweepArgs {
-  std::string param{};
+  std::vector<std::string> params{};  // one key, or two for a grid
   std::vector<std::string> metrics{};
   std::size_t jobs{simsys::sweep::default_jobs()};
   std::string format{"table"};
+  bool slos{};  // --slos: each point's SLO verdicts and exit code
 };
 
 // The --metric texts, parsed; the first bad one is the error.
@@ -574,14 +621,15 @@ std::expected<std::vector<simsys::sweep::SweepMetric>, std::string> parse_metric
   return metrics;
 }
 
-// `simsys sweep <file> --param <spec> --metric <m>...`: one run per point, one row per point.
+// `simsys sweep <file> --param <spec> [--param <spec>] --metric <m>...`: one run per point (every
+// pair of the two keys' values with two), one row per point.
 // Nothing reaches stdout unless every point ran, so a script never reads half a table. A --param
 // or --metric refused for its text is worded as every other refusal of the command, after the
 // file and `error:`, so all of them read `<file>: error: --param: ...` or `... --metric: ...`.
 int run_sweep_command(const std::filesystem::path& file, const SweepArgs& args) {
-  const auto param = simsys::sweep::parse_param(args.param);
-  if (!param) {
-    print_error(file.string() + ": error: " + param.error());
+  const auto params = simsys::sweep::parse_params(args.params);
+  if (!params) {
+    print_error(file.string() + ": error: " + params.error());
     return 1;
   }
   const auto metrics = parse_metrics(args.metrics);
@@ -589,14 +637,20 @@ int run_sweep_command(const std::filesystem::path& file, const SweepArgs& args) 
     print_error(file.string() + ": error: " + metrics.error());
     return 1;
   }
-  const auto rows = simsys::sweep::run_sweep(file.string(), *param, *metrics, args.jobs);
+  const auto slos = args.slos ? simsys::sweep::SloColumns::on : simsys::sweep::SloColumns::off;
+  const auto rows = simsys::sweep::run_sweep(file.string(), *params, *metrics, args.jobs, slos);
   if (!rows) {
     print_error(rows.error());
     return 1;
   }
+  // Said once on stderr, so stdout stays the table alone: the verdict columns are empty, and the
+  // exit column only says that each point ran.
+  if (args.slos && !rows->empty() && rows->front().slos.empty()) {
+    print_error("the scenario has no SLOs, so no point can fail one");
+  }
   const auto format =
       args.format == "csv" ? simsys::sweep::SweepFormat::csv : simsys::sweep::SweepFormat::table;
-  std::print("{}", simsys::sweep::render_sweep(*param, *metrics, *rows, format));
+  std::print("{}", simsys::sweep::render_sweep(*params, *metrics, *rows, format));
   return 0;
 }
 
@@ -636,7 +690,7 @@ CLI::App* add_curve_command(CLI::App& app, CurveArgs& args, std::filesystem::pat
   curve->add_option("--step", args.step, "time between samples (default 1m)");
   curve->add_option("--until", args.until,
                     "end of the curve, exclusive (default: scenario's duration)");
-  curve->add_option("--seed", args.seed, "noise seed (default: scenario's seed)");
+  curve->add_option("--seed", args.seed, "noise seed (default: scenario's seed); needs --noise");
   curve->add_flag("--noise", args.noise,
                   "multiply in the client's seeded noise, advanced every scenario step as in a run "
                   "(--step must then be a multiple of it)");
@@ -645,21 +699,33 @@ CLI::App* add_curve_command(CLI::App& app, CurveArgs& args, std::filesystem::pat
 
 CLI::App* add_sweep_command(CLI::App& app, SweepArgs& args, std::filesystem::path& file) {
   auto* sweep = app.add_subcommand(
-      "sweep", "run the scenario once per value of one key, the runs in parallel; one row each");
+      "sweep",
+      "run the scenario once per value of one key (or per pair of two), the runs in parallel; one "
+      "row each");
   add_file_argument(*sweep, file);
   sweep
-      ->add_option("--param", args.param,
-                   "the swept key and its range, <dot.path>=<from>..<to>:<n>, "
-                   "e.g. nodes.users.rate.base=100/s..900/s:3")
+      // One value per --param: CLI11 lets a vector option take every word that follows it, so the
+      // scenario file written after `--param <spec>` would be read as a second spec.
+      ->add_option("--param", args.params,
+                   "the swept key and its range, <dot.path>=<from>..<to>:<n>[:log] "
+                   "(:log: geometric), e.g. nodes.users.rate.base=100/s..900/s:3; "
+                   "given twice, a grid of both keys")
+      ->expected(1)
+      ->allow_extra_args(false)
+      ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll)
       ->required();
   sweep
       ->add_option("--metric", args.metrics,
                    "a column: <client>.<op>.mean|p50|p95|p99|attempts|answered, "
-                   "<node>.mean_rho|peak_rho|drop_rate, <queue>.lag, <pool>.dead_lettered, "
+                   "<node>.mean_rho|peak_rho|drop_rate|reject_rate, <queue>.lag, "
+                   "<pool>.dead_lettered, "
                    "<fanout>.deduplicated or <gateway>.connections (repeatable)")
       ->required();
   sweep->add_option("--jobs", args.jobs, "worker threads (default: the machine's hardware threads)")
       ->check(CLI::Range(std::size_t{1}, simsys::sweep::max_jobs));
+  sweep->add_flag("--slos", args.slos,
+                  "a column per SLO with each point's verdict, and its exit code as run gives it "
+                  "(the sweep itself still exits 0)");
   sweep->add_option("--format", args.format, "output format: table (default) or csv")
       ->check(CLI::IsMember({"table", "csv"}));
   return sweep;
@@ -677,6 +743,7 @@ int main(int argc, char** argv) {
   RunArgs run_args;
   CurveArgs curve_args;
   SweepArgs sweep_args;
+  std::optional<std::string> estimate_at;
 
   auto* validate = app.add_subcommand("validate", "check a scenario's types, references and units");
   auto* explain = app.add_subcommand(
@@ -688,6 +755,9 @@ int main(int argc, char** argv) {
   auto* curve = add_curve_command(app, curve_args, scenario_file);
   auto* sweep = add_sweep_command(app, sweep_args, scenario_file);
   add_report_options(*estimate, report_options);
+  estimate->add_option("--at", estimate_at,
+                       "the instant to settle at: a clock time (12:00) or a duration from the "
+                       "start (90m), inside the run (default: 00:00)");
   add_report_options(*run, report_options);
   add_run_options(*run, run_args);
 
@@ -701,7 +771,7 @@ int main(int argc, char** argv) {
 
   if (validate->parsed()) return run_validate(scenario_file);
   if (explain->parsed()) return run_explain(scenario_file);
-  if (estimate->parsed()) return run_estimate(scenario_file, report_options);
+  if (estimate->parsed()) return run_estimate(scenario_file, report_options, estimate_at);
   if (run->parsed()) return run_scenario(scenario_file, run_args, report_options);
   if (curve->parsed()) return run_curve(scenario_file, curve_args);
   if (sweep->parsed()) return run_sweep_command(scenario_file, sweep_args);

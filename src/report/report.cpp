@@ -16,6 +16,7 @@ module;
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <map>  // unit_of: a node's priced ops grouped by their cost
 #include <numeric>
 #include <optional>
 #include <ostream>
@@ -503,8 +504,10 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
                                      ? std::string{}
                                      : "  reject rate " + percent(summary.reject_rate()) +
                                            " (worst: " + std::string{worst_rejecting} + ")";
-  return head + std::to_string(summary.observed_steps()) + " steps observed  drop rate " +
-         percent(summary.drop_rate()) +
+  const std::string observed = summary.is_estimate()
+                                   ? "steady state at " + format_clock(summary.estimate_at())
+                                   : std::to_string(summary.observed_steps()) + " steps observed";
+  return head + observed + "  drop rate " + percent(summary.drop_rate()) +
          (worst.empty() ? std::string{} : " (worst: " + std::string{worst} + ")") + rejections +
          "\n";
 }
@@ -564,6 +567,15 @@ constexpr double text_cell = std::numeric_limits<double>::quiet_NaN();
   const auto colour_of = [&](double rho) {
     return color ? ansi_for(fluid::zone_of(rho, capacity)) : std::string_view{};
   };
+  // estimate's steady state: the drops and refusals per second, and no red time (it lasts none).
+  if (node.steady_state) {
+    return {{node.id},
+            {significant(node.mean_rho), colour_of(node.mean_rho)},
+            {significant(node.peak_rho), colour_of(node.peak_rho)},
+            {peak_backlog_text(node.peak_backlog)},
+            {with_si_prefix(node.mean_dropped_per_s)},
+            {with_si_prefix(node.mean_rejected_per_s)}};
+  }
   return {{node.id},
           {significant(node.mean_rho), colour_of(node.mean_rho)},
           {significant(node.peak_rho), colour_of(node.peak_rho)},
@@ -575,6 +587,10 @@ constexpr double text_cell = std::numeric_limits<double>::quiet_NaN();
 
 // The numbers of queue_cells, cell by cell.
 [[nodiscard]] std::vector<double> queue_numbers(const NodeSummary& node) {
+  if (node.steady_state) {
+    return {text_cell,         node.mean_rho,           node.peak_rho,
+            node.peak_backlog, node.mean_dropped_per_s, node.mean_rejected_per_s};
+  }
   return {text_cell,          node.mean_rho,       node.peak_rho,  node.peak_backlog,
           node.total_dropped, node.total_rejected, node.red_time_s};
 }
@@ -656,8 +672,9 @@ void insert_at(Cells& cells, std::size_t column, Value value) {
 [[nodiscard]] Row node_row(const NodeSummary& node, const graph::ResolvedNode& resolved, bool color,
                            NodeColumns columns) {
   const bool client = resolved.spec.type == model::NodeType::client;
-  Row row = client ? Row{{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}}
+  Row row = client ? Row{{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}}
                    : queue_cells(node, resolved.capacity, color);
+  if (client && !node.steady_state) row.push_back({"-"});  // the red_s column
   if (!client) row.push_back({node.peak_queue_lag_s ? format_lag(*node.peak_queue_lag_s) : "-"});
   if (columns.connections) {
     row.push_back({node.connections ? with_si_prefix(*node.connections) : "-"});
@@ -679,7 +696,8 @@ void insert_at(Cells& cells, std::size_t column, Value value) {
                                                const graph::ResolvedNode& resolved,
                                                NodeColumns columns) {
   if (resolved.spec.type == model::NodeType::client) {
-    const std::size_t cells = 8 + std::size_t{columns.dead_letters} +
+    // node_row's dashes: one fewer in estimate's steady state, which has no red_s column.
+    const std::size_t cells = (node.steady_state ? 7 : 8) + std::size_t{columns.dead_letters} +
                               std::size_t{columns.connections} + std::size_t{columns.deduplicated};
     return std::vector<double>(cells, text_cell);
   }
@@ -705,6 +723,11 @@ void insert_at(Cells& cells, std::size_t column, Value value) {
                               {"rejected"},
                               {"red_s"},
                               {"peak_lag"}}};
+  if (summary.is_estimate()) {  // a steady state: rates, and no red time (queue_cells)
+    parts.header[4] = Cell{"dropped/s"};
+    parts.header[5] = Cell{"rejected/s"};
+    parts.header.erase(parts.header.begin() + 6);
+  }
   const NodeColumns columns{.dead_letters = some_pool_retries(summary.graph()),
                             .connections = some_gateway(summary.graph()),
                             .deduplicated = has_fanout(summary.graph())};
@@ -722,8 +745,70 @@ void insert_at(Cells& cells, std::size_t column, Value value) {
 
 constexpr std::string_view node_title = "nodes";
 
+// "delete, insert, update, write cost 5" ("a cost 2 and b cost 3" for two costs): a node's ops that
+// cost something other than 1 capacity unit, grouped by their cost, in name order; "" when every op
+// it prices costs 1. The ops priced are a database's write ops (their default cost of 5, spec §18
+// entry 7) and every op of a stated `cost` map (spec §17 entry 4), each priced as the engine
+// prices it (defaults::op_cost).
+[[nodiscard]] std::string priced_ops(const model::NodeSpec& spec, double unit_per_request = 1.0) {
+  // C++20 std::views::keys: the keys of a map as a lazy view, no copy of its pairs; C++23
+  // std::ranges::to<std::vector>(): collects a view into a container, replacing a reserve +
+  // push_back loop.
+  std::vector<std::string> ops{spec.cost | std::views::keys | std::ranges::to<std::vector>()};
+  if (spec.type == model::NodeType::sql_db) {
+    std::ranges::copy(model::write_ops_of(spec), std::back_inserter(ops));
+  }
+  // C++20 std::ranges::unique: returns the tail to erase as a subrange (unpacked by a structured
+  // binding), where std::unique returned only its first iterator.
+  std::ranges::sort(ops);
+  const auto [first_repeat, end] = std::ranges::unique(ops);
+  ops.erase(first_repeat, end);
+  std::map<double, std::vector<std::string>> by_cost;
+  for (const auto& op : ops) {
+    const double cost = defaults::op_cost(spec, op) / unit_per_request;
+    if (cost != 1.0) by_cost[cost].push_back(op);
+  }
+  std::vector<std::string> groups;
+  for (const auto& [cost, named] : by_cost) {
+    groups.push_back(join(named, ", ") + " cost " + significant(cost));
+  }
+  return join(groups, " and ");
+}
+
+// What a node's peak_backlog and drops count, when it is not requests: megabytes at a byte-sized
+// node (spec §19 entry 2), replica-requests at a kv_cluster (N of them per request, §19 entry 9),
+// capacity units at a node with an op that costs other than 1 (priced_ops); empty otherwise, and
+// for a client, which queues nothing.
+[[nodiscard]] std::optional<std::string> unit_of(const model::NodeSpec& spec) {
+  if (spec.type == model::NodeType::client) return std::nullopt;
+  if (defaults::is_byte_sized(spec)) return "MB";
+  if (spec.type == model::NodeType::kv_cluster) {
+    // Every request is N replica-requests; a stated `cost` prices each of them on top (op_cost is
+    // the product), so the line says both: "replica-requests (N 3; put cost 4 each)".
+    const int n = model::kv_replication(spec);
+    const auto priced = priced_ops(spec, static_cast<double>(n));
+    const std::string each = priced.empty() ? "" : "; " + priced + " each";
+    return "replica-requests (N " + std::to_string(n) + each + ")";
+  }
+  const auto priced = priced_ops(spec);
+  if (priced.empty()) return std::nullopt;
+  return "capacity units (" + priced + ")";
+}
+
+// "units (peak_backlog and drops are not requests here): url_db capacity units (...); cdn_us MB":
+// one line under the node table naming every node whose figures are in another unit (the 2a
+// leftover M7: the table's headers carry no unit), or nothing when every node counts requests.
+[[nodiscard]] std::string units_note(const Summary& summary) {
+  std::vector<std::string> named;
+  for (const auto& node : summary.graph().nodes()) {
+    if (const auto unit = unit_of(node.spec)) named.push_back(node.spec.id + " " + *unit);
+  }
+  if (named.empty()) return {};
+  return "units (peak_backlog and drops are not requests here): " + join(named, "; ") + "\n";
+}
+
 [[nodiscard]] std::string node_table(const Summary& summary, bool color) {
-  return table_text(node_title, node_parts(summary, color));
+  return table_text(node_title, node_parts(summary, color)) + units_note(summary);
 }
 
 // The bandwidth links' pipes, in the node table's columns but a table of their own, since their
@@ -737,6 +822,11 @@ constexpr std::string_view node_title = "nodes";
                               {"dropped"},
                               {"rejected"},
                               {"red_s"}}};
+  if (summary.is_estimate()) {  // a steady state: rates, and no red time (queue_cells)
+    parts.header[4] = Cell{"dropped/s"};
+    parts.header[5] = Cell{"rejected/s"};
+    parts.header.erase(parts.header.begin() + 6);
+  }
   const auto links = summary.links();
   std::size_t next = 0;  // links() follows Graph::links(), pipes only
   for (const auto& link : summary.graph().links()) {
@@ -856,12 +946,14 @@ constexpr std::string_view op_title =
 // Which window decided an SLO with `over`: `(worst 10m from 00:20)`, its length as `over` reads
 // and its start on the run's clock (window_clock). A last window cut short by the end of the run
 // is labelled with the length it had: `(worst 28m from 14:02, the run's short last window)`.
-// Under `estimate`, which measured no window: `(at 00:00 only: run checks each 1h)`. Empty
+// Under `estimate`, which measured no window: `(at 00:00 only: run checks each 1h)`, at the instant
+// it settled at (`--at`). Empty
 // without `over`, or when every window was skipped.
 [[nodiscard]] std::string window_text(const SloResult& r) {
   if (!r.slo.over) return {};
   if (r.at_one_instant) {
-    return "(at 00:00 only: run checks each " + describe_duration(*r.slo.over) + ")";
+    return "(at " + window_clock(r.instant) + " only: run checks each " +
+           describe_duration(*r.slo.over) + ")";
   }
   if (!r.window_start || !r.window_length) return {};
   const bool cut_short = r.window_length->count() < r.slo.over->count();
@@ -1214,18 +1306,34 @@ constexpr std::string_view op_title =
   return "  " + json_field(name, "[\n    " + join(objects, ",\n    ") + "\n  ]");
 }
 
+// Whether a node's lag grows without bound (estimate's frontier or queue that falls behind for
+// good: its peak_queue_lag_s is infinite, printed null), `false` on a queue whose lag is finite,
+// null on every node that has no lag: peak_queue_lag_s alone is null in the first and last case.
+[[nodiscard]] std::string json_lag_unbounded(const NodeSummary& n) {
+  if (!n.peak_queue_lag_s) return "null";
+  return std::isinf(*n.peak_queue_lag_s) ? "true" : "false";
+}
+
+// A total over the observed steps, or null in estimate's steady state, which lasts no time.
+[[nodiscard]] std::string json_total(const NodeSummary& n, double total) {
+  return n.steady_state ? "null" : json_number(total);
+}
+
 [[nodiscard]] std::vector<std::string> json_node_fields(const NodeSummary& n) {
   return {json_field("id", json_string(n.id)), json_field("mean_rho", json_number(n.mean_rho)),
           json_field("peak_rho", json_number(n.peak_rho)),
           json_field("peak_backlog", json_number(n.peak_backlog)),
-          json_field("dropped", json_number(n.total_dropped)),
+          json_field("dropped", json_total(n, n.total_dropped)),
+          json_field("dropped_per_s", json_number(n.mean_dropped_per_s)),
           // a worker pool's (0 without retries); null for every other node
-          json_field("dead_lettered", json_optional_number(n.total_dead_lettered)),
+          json_field("dead_lettered",
+                     n.steady_state ? "null" : json_optional_number(n.total_dead_lettered)),
           json_field("dead_lettered_per_s", json_optional_number(n.mean_dead_lettered_per_s)),
-          json_field("rejected", json_number(n.total_rejected)),
+          json_field("rejected", json_total(n, n.total_rejected)),
+          json_field("rejected_per_s", json_number(n.mean_rejected_per_s)),
           // a notification fanout's mean rate (0 with dedup 0); null for every other node
           json_field("deduplicated_per_s", json_optional_number(n.mean_deduplicated_per_s)),
-          json_field("red_s", json_number(n.red_time_s)),
+          json_field("red_s", json_total(n, n.red_time_s)),
           json_field("unavailable", n.unavailable ? "true" : "false"),
           // null for a node with no lagging copies, and for an infinite one
           json_field("staleness_s", n.mean_staleness_s ? json_number(*n.mean_staleness_s) : "null"),
@@ -1235,7 +1343,8 @@ constexpr std::string_view op_title =
           json_field("committed_writes_per_s", json_optional_number(n.mean_committed_writes_per_s)),
           // seconds; null for every node that is not a message queue or a frontier, and on one
           // for an unbounded lag (estimate's, infinite: the schema's JSON key table)
-          json_field("peak_queue_lag_s", json_optional_number(n.peak_queue_lag_s))};
+          json_field("peak_queue_lag_s", json_optional_number(n.peak_queue_lag_s)),
+          json_field("queue_lag_unbounded", json_lag_unbounded(n))};
 }
 
 [[nodiscard]] std::string json_node(const NodeSummary& n) {
@@ -1255,17 +1364,18 @@ constexpr std::string_view op_title =
 // A bandwidth link's pipe (LinkSummary), in megabytes: its time-averaged rates and backlog, the
 // fields a step's engine::LinkSample has, then its peaks and red time as a node's.
 [[nodiscard]] std::string json_link(const LinkSummary& link) {
-  const std::array fields{json_field("name", json_string(link.queue.id)),
-                          json_field("demand_per_s", json_number(link.demand_per_s)),
-                          json_field("drain_per_s", json_number(link.drain_per_s)),
-                          json_field("dropped_per_s", json_number(link.dropped_per_s)),
-                          json_field("backlog", json_number(link.backlog)),
-                          json_field("rho", json_number(link.queue.mean_rho)),
-                          json_field("latency_s", json_number(link.latency_s)),
-                          json_field("zone", json_string(zone_name(link.zone))),
-                          json_field("peak_rho", json_number(link.queue.peak_rho)),
-                          json_field("peak_backlog", json_number(link.queue.peak_backlog)),
-                          json_field("red_s", json_number(link.queue.red_time_s))};
+  const std::array fields{
+      json_field("name", json_string(link.queue.id)),
+      json_field("demand_per_s", json_number(link.demand_per_s)),
+      json_field("drain_per_s", json_number(link.drain_per_s)),
+      json_field("dropped_per_s", json_number(link.dropped_per_s)),
+      json_field("backlog", json_number(link.backlog)),
+      json_field("rho", json_number(link.queue.mean_rho)),
+      json_field("latency_s", json_number(link.latency_s)),
+      json_field("zone", json_string(zone_name(link.zone))),
+      json_field("peak_rho", json_number(link.queue.peak_rho)),
+      json_field("peak_backlog", json_number(link.queue.peak_backlog)),
+      json_field("red_s", link.queue.steady_state ? "null" : json_number(link.queue.red_time_s))};
   return json_object(fields);
 }
 
@@ -1477,6 +1587,11 @@ template <class T, class F>
       json_array("links", map_to_strings(std::span<const LinkSummary>{links}, json_link)),
       json_array("ops", map_to_strings(std::span<const OpSummary>{ops}, json_op)),
       json_array("slo", slo_objects)};
+  // estimate only, after `steps`: the instant it settled at, in seconds (`--at`; 0 without it).
+  if (summary.is_estimate()) {
+    lines.insert(lines.begin() + 2,
+                 "  " + json_field("at_s", json_number(seconds(summary.estimate_at()))));
+  }
   if (summary.faults().empty()) return lines;
   // The faults array, last and only with faults: a report without them is what it was before.
   std::vector<std::string> faults;
@@ -1764,7 +1879,7 @@ template <class Build>
 [[nodiscard]] std::string banded_tables(std::span<const Summary> runs, bool color) {
   const auto nodes = [&](const Summary& run) { return node_parts(run, color); };
   const auto links = [&](const Summary& run) { return link_parts(run, color); };
-  return table_text(node_title, banded_over(runs, nodes)) +
+  return table_text(node_title, banded_over(runs, nodes)) + units_note(runs.front()) +
          table_text_if_any(link_title, banded_over(runs, links)) +
          table_text_if_any(replication_title, banded_over(runs, replication_parts)) +
          table_text(op_title, banded_over(runs, op_parts));
@@ -1879,22 +1994,27 @@ constexpr std::array op_numbers{
   };
   std::vector<std::string> unavailable;
   for (const auto& run : nodes) unavailable.emplace_back(run[i].unavailable ? "true" : "false");
+  std::vector<std::string> lag_unbounded;
+  for (const auto& run : nodes) lag_unbounded.push_back(json_lag_unbounded(run[i]));
   std::vector<std::string> fields{
       json_field("id", json_string(nodes.front()[i].id)),
       plain("mean_rho", &NodeSummary::mean_rho),
       plain("peak_rho", &NodeSummary::peak_rho),
       plain("peak_backlog", &NodeSummary::peak_backlog),
       plain("dropped", &NodeSummary::total_dropped),
+      plain("dropped_per_s", &NodeSummary::mean_dropped_per_s),
       optional("dead_lettered", &NodeSummary::total_dead_lettered),
       optional("dead_lettered_per_s", &NodeSummary::mean_dead_lettered_per_s),
       plain("rejected", &NodeSummary::total_rejected),
+      plain("rejected_per_s", &NodeSummary::mean_rejected_per_s),
       optional("deduplicated_per_s", &NodeSummary::mean_deduplicated_per_s),
       plain("red_s", &NodeSummary::red_time_s),
       json_per_seed("unavailable", unavailable),
       optional("staleness_s", &NodeSummary::mean_staleness_s),
       optional("replication_dropped_per_s", &NodeSummary::mean_replication_dropped_per_s),
       optional("committed_writes_per_s", &NodeSummary::mean_committed_writes_per_s),
-      optional("peak_queue_lag_s", &NodeSummary::peak_queue_lag_s)};
+      optional("peak_queue_lag_s", &NodeSummary::peak_queue_lag_s),
+      json_per_seed("queue_lag_unbounded", lag_unbounded)};
   if (with_connections) {
     fields.push_back(optional("connections", &NodeSummary::connections));
     fields.push_back(optional("connections_peak", &NodeSummary::connections_peak));
@@ -2181,6 +2301,7 @@ Summary::Summary(const graph::Graph& g, SimTime warmup) : Summary{g, warmup, tru
 Summary Summary::of_estimate(const graph::Graph& g, const engine::StepRecord& record) {
   Summary summary{g, SimTime{0}, false};
   summary.estimate_ = true;
+  summary.estimate_at_ = record.t;
   summary.observe(record);
   return summary;
 }
@@ -2411,6 +2532,7 @@ SloResult Summary::windowed_verdict(const model::SloSpec& slo) const {
   if (estimate_) {
     SloResult result = evaluate_slo(*this, nodes(), ops(), slo);
     result.at_one_instant = true;
+    result.instant = estimate_at_;
     return result;
   }
   const auto found = std::ranges::find_if(
@@ -2426,17 +2548,23 @@ std::vector<NodeSummary> Summary::nodes() const {
   for (std::size_t i = 0; i < nodes_.size(); ++i) {
     const auto& t = nodes_[i];
     const double capacity = graph_->nodes()[i].capacity.service_rate.per_second;
-    out.push_back(NodeSummary{.id = graph_->nodes()[i].spec.id,
-                              .mean_rho = observed_s_ > 0.0 ? t.rho_time / observed_s_ : 0.0,
-                              .peak_rho = t.peak_rho,
-                              .peak_backlog = without_residue(t.peak_backlog, capacity),
-                              .total_dropped = without_residue(t.dropped, capacity),
-                              .total_rejected = without_residue(t.rejected, capacity),
-                              .red_time_s = t.red_time_s,
-                              .unavailable = t.unavailable,
-                              .peak_queue_lag_s = t.peak_queue_lag_s,
-                              .connections = t.last_connections,
-                              .connections_peak = t.peak_connections});
+    const double dropped = without_residue(t.dropped, capacity);
+    const double rejected = without_residue(t.rejected, capacity);
+    out.push_back(
+        NodeSummary{.id = graph_->nodes()[i].spec.id,
+                    .mean_rho = observed_s_ > 0.0 ? t.rho_time / observed_s_ : 0.0,
+                    .peak_rho = t.peak_rho,
+                    .peak_backlog = without_residue(t.peak_backlog, capacity),
+                    .total_dropped = dropped,
+                    .total_rejected = rejected,
+                    .red_time_s = t.red_time_s,
+                    .mean_dropped_per_s = observed_s_ > 0.0 ? dropped / observed_s_ : 0.0,
+                    .mean_rejected_per_s = observed_s_ > 0.0 ? rejected / observed_s_ : 0.0,
+                    .steady_state = estimate_,
+                    .unavailable = t.unavailable,
+                    .peak_queue_lag_s = t.peak_queue_lag_s,
+                    .connections = t.last_connections,
+                    .connections_peak = t.peak_connections});
     if (t.dead_lettered) {
       out.back().total_dead_lettered = *t.dead_lettered;
       out.back().mean_dead_lettered_per_s =
@@ -2472,6 +2600,8 @@ std::vector<LinkSummary> Summary::links() const {
                              .total_dropped = without_residue(t.queue.dropped, capacity),
                              .total_rejected = 0.0,
                              .red_time_s = t.queue.red_time_s,
+                             .mean_dropped_per_s = per_s(t.queue.dropped),
+                             .steady_state = estimate_,
                              .unavailable = t.queue.unavailable},
         .demand_per_s = per_s(t.queue.demand),
         .drain_per_s = per_s(t.drained),
@@ -2652,6 +2782,10 @@ std::string render_table(const Summary& summary, std::span<const SloResult> slos
   return table_header(summary) + faults_note(summary) + node_table(summary, color) +
          link_table(summary, color) + replication_table(summary) + op_table(summary) +
          slo_table(slos, color) + fault_blocks(summary);
+}
+
+std::string format_clock(SimTime t) {
+  return window_clock(t);
 }
 
 std::string render_json(const Summary& summary, std::span<const SloResult> slos) {

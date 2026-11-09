@@ -233,6 +233,10 @@ bool is_declared(const NodeIndex& ids, std::string_view id);
 // True when `word` is one of the space-separated words of `words`.
 bool lists_word(std::string_view words, std::string_view word);
 
+// The first element of a list of scalars that repeats an earlier one, if any: a list of op names
+// is a set (a link's `ops`, a node's `write_ops`), and both refuse a repeat with it.
+std::optional<YAML::Node> first_repeat(const YAML::Node& list);
+
 // A callable that stores its argument in `target`. Passed to std::expected::transform it
 // turns "read a value" into "read it into this field": the result is expected<void, E>.
 // C++20 abbreviated function template: an `auto&` parameter makes this a template without

@@ -10,7 +10,11 @@ reproducible. Built to practise the systems in
 *System Design Interview* (Alex Xu, vol. 1) and, at the same time, to study and teach
 C++20/23: modules, concepts, ranges, coroutines, `std::expected` and friends.
 
-Status: phase 3 is built. Phase 2 added the node types, rate curves, bytes, queues and the sweep;
+Status: phase 4a is built on top of phase 3: `simsys sweep` crosses two keys in a grid, spaces its
+points geometrically (`:log`), reads a node's `reject_rate` and, with `--slos`, judges every point's
+SLOs; `simsys estimate --at 13:00` evaluates the steady state at any instant, and reports rates
+rather than one step's totals; the tables say which nodes count capacity units or megabytes.
+Phase 2 added the node types, rate curves, bytes, queues and the sweep;
 phase 3 added scripted faults (a node or some of its replicas down, a capacity loss, a latency or
 traffic spike, a cache flush, a datacenter down), each reported as an incident block measured
 against a fault-free twin of the run, client and worker-pool retries (`attempts/s`, dead letters),
@@ -30,10 +34,10 @@ frontiers (per-host politeness as a cap on the downloaders' drain),
 key-value clusters (ring, replication and quorums), search indexes and id generators. A step after
 a failed step does not run, refused, dropped and timed-out requests are counted apart
 (`reject_rate`, `drop_rate`, `timed_out_per_s`), and an SLO can be checked per window (`over: 1h`).
-`simsys sweep` runs a scenario over a range of one key, the points in parallel. All fourteen
-shipped scenarios run end to end, the eight book systems among them (list below). 1686 tests
+`simsys sweep` runs a scenario over a range of one key (or a grid of two), the points in parallel. All fourteen
+shipped scenarios run end to end, the eight book systems among them (list below). 1740 tests
 (Catch2, via `ctest`). The scenario language is
-[`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.5).
+[`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.6).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
 
@@ -42,17 +46,18 @@ for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling 
 ```
 simsys validate scenario.yaml        # types, references and units
 simsys explain  scenario.yaml        # every resolved number and where it came from
-simsys estimate scenario.yaml [--report table|json] [--no-color]
+simsys estimate scenario.yaml [--at 13:00] [--report table|json] [--no-color]
 simsys run      scenario.yaml [--duration 30s] [--seed N] [--report table|json]
                               [--series out.csv] [--series-ops ops.csv] [--no-color]
                               [--replications N [--jobs J]]
 simsys curve    scenario.yaml <client> [--step 1m] [--until 1h] [--seed N] [--noise]
-simsys sweep    scenario.yaml --param <dot.path>=<from>..<to>:<n> --metric <m>...
-                              [--jobs N] [--format table|csv]
+simsys sweep    scenario.yaml --param <dot.path>=<from>..<to>:<n>[:log] [--param ...]
+                              --metric <m>... [--slos] [--jobs N] [--format table|csv]
 ```
 
-`estimate` evaluates the long-run (steady) state once, at t = 0 (midnight): the rate curve's
-value there, without noise (its first line says so); `explain`'s static load checks use the
+`estimate` evaluates the long-run (steady) state once, at t = 0 (midnight) or at `--at`: the rate
+curve's value there, without noise (its first line says so), its drops and refusals as rates
+(`dropped/s`, `rejected/s`); `explain`'s static load checks use the
 curve's peak instead. `run` steps through the scenario and,
 with `--series`, writes one CSV row per node per step
 (`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,deduplicated_per_s,latency_ms,zone,queue_lag_s,connections`,
@@ -156,11 +161,13 @@ t_s,rate_per_s
 360,800
 ```
 
-`sweep` runs the scenario once per value of one key, the runs in parallel (`--jobs`, default:
-the machine's hardware threads; the output does not depend on it), and prints one row per value
-with the metrics asked for: `<client>.<op>.mean`, `.p50`, `.p95` or `.p99`, `<node>.mean_rho`,
-`.peak_rho` or `.drop_rate`, `<queue>.lag`, `<pool>.dead_lettered`, `<fanout>.deduplicated`, or
-`<gateway>.connections`
+`sweep` runs the scenario once per value of one key (or, with `--param` twice, per pair of two:
+a grid), the runs in parallel (`--jobs`, default: the machine's hardware threads; the output does
+not depend on it), and prints one row per point with the metrics asked for: `<client>.<op>.mean`,
+`.p50`, `.p95` or `.p99`, `<node>.mean_rho`, `.peak_rho`, `.drop_rate` or `.reject_rate`,
+`<queue>.lag`, `<pool>.dead_lettered`, `<fanout>.deduplicated`, or `<gateway>.connections`; a
+range ending in `:log` is spaced geometrically, and `--slos` adds each point's SLO verdicts and the
+exit code `run` would give it
 ([schema](docs/scenario-schema.md#command-line-simsys-sweep-phase-2c)). On the
 [hello tutorial](scenarios/tutorial/hello/), an M/M/1 queue with a 1 ms service time: the latency is
 s / (1 − rho) plus the 0.5 ms round trip, and it bends upward as rho nears 1:
@@ -374,8 +381,9 @@ Scripted faults run (`faults:`: a node or some of its replicas down, a capacity 
 spike, a traffic spike, a cache flush, a datacenter down; `estimate` shows the steady state
 without them), and so do client and pool retries, `on: failure` steps and replications. kv
 partitions, random faults and the rest of the phase 4 backlog are in the
-[phase 3 plan](docs/superpowers/plans/2026-10-30-phase3-faults-gateways.md)'s last section; the
-rules as built are spec §20.
+[phase 3 plan](docs/superpowers/plans/2026-10-30-phase3-faults-gateways.md)'s last section (4a's
+items are done: [its plan](docs/superpowers/plans/2026-11-09-phase4a-sweep-reporting.md)); the
+rules as built are spec §20 and §21.
 
 ## Toolchain
 

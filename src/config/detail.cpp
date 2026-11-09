@@ -18,6 +18,7 @@ module;
 #include <map>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -101,6 +102,14 @@ bool is_declared(const NodeIndex& ids, std::string_view id) {
   // C++20 contains(): "is this key in the map?" in one call, replacing the
   // `find(key) != end()` comparison.
   return ids.contains(id);
+}
+
+std::optional<YAML::Node> first_repeat(const YAML::Node& list) {
+  std::set<std::string_view> seen;  // views into the document's own text
+  for (const auto& element : list) {
+    if (!seen.insert(element.Scalar()).second) return element;
+  }
+  return std::nullopt;
 }
 
 bool lists_word(std::string_view words, std::string_view word) {
