@@ -720,6 +720,7 @@ TEST_CASE("the per-seed JSON of replications lists the gateway's connections and
   // C++20 std::string::ends_with: a suffix test in one call, replacing a compare of the tail.
   REQUIRE(
       gateway.ends_with("\"peak_queue_lag_s\": [null, null, null], "
+                        "\"queue_lag_unbounded\": [null, null, null], "
                         "\"connections\": [2000, 4000, 1000], "
                         "\"connections_peak\": [3000, 5000, 1500]"));
   const auto presence = json_node_object(per_seed, "presence");

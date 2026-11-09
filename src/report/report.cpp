@@ -503,7 +503,10 @@ void keep_if_worse(std::optional<SloResult>& worst, SloResult candidate) {
                                      ? std::string{}
                                      : "  reject rate " + percent(summary.reject_rate()) +
                                            " (worst: " + std::string{worst_rejecting} + ")";
-  return head + std::to_string(summary.observed_steps()) + " steps observed  drop rate " +
+  const std::string observed =
+      summary.is_estimate() ? "steady state at " + format_clock(summary.estimate_at())
+                            : std::to_string(summary.observed_steps()) + " steps observed";
+  return head + observed + "  drop rate " +
          percent(summary.drop_rate()) +
          (worst.empty() ? std::string{} : " (worst: " + std::string{worst} + ")") + rejections +
          "\n";
@@ -564,6 +567,15 @@ constexpr double text_cell = std::numeric_limits<double>::quiet_NaN();
   const auto colour_of = [&](double rho) {
     return color ? ansi_for(fluid::zone_of(rho, capacity)) : std::string_view{};
   };
+  // estimate's steady state: the drops and refusals per second, and no red time (it lasts none).
+  if (node.steady_state) {
+    return {{node.id},
+            {significant(node.mean_rho), colour_of(node.mean_rho)},
+            {significant(node.peak_rho), colour_of(node.peak_rho)},
+            {peak_backlog_text(node.peak_backlog)},
+            {with_si_prefix(node.mean_dropped_per_s)},
+            {with_si_prefix(node.mean_rejected_per_s)}};
+  }
   return {{node.id},
           {significant(node.mean_rho), colour_of(node.mean_rho)},
           {significant(node.peak_rho), colour_of(node.peak_rho)},
@@ -575,6 +587,10 @@ constexpr double text_cell = std::numeric_limits<double>::quiet_NaN();
 
 // The numbers of queue_cells, cell by cell.
 [[nodiscard]] std::vector<double> queue_numbers(const NodeSummary& node) {
+  if (node.steady_state) {
+    return {text_cell,      node.mean_rho,           node.peak_rho,
+            node.peak_backlog, node.mean_dropped_per_s, node.mean_rejected_per_s};
+  }
   return {text_cell,          node.mean_rho,       node.peak_rho,  node.peak_backlog,
           node.total_dropped, node.total_rejected, node.red_time_s};
 }
@@ -656,8 +672,9 @@ void insert_at(Cells& cells, std::size_t column, Value value) {
 [[nodiscard]] Row node_row(const NodeSummary& node, const graph::ResolvedNode& resolved, bool color,
                            NodeColumns columns) {
   const bool client = resolved.spec.type == model::NodeType::client;
-  Row row = client ? Row{{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}}
+  Row row = client ? Row{{node.id}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}, {"-"}}
                    : queue_cells(node, resolved.capacity, color);
+  if (client && !node.steady_state) row.push_back({"-"});  // the red_s column
   if (!client) row.push_back({node.peak_queue_lag_s ? format_lag(*node.peak_queue_lag_s) : "-"});
   if (columns.connections) {
     row.push_back({node.connections ? with_si_prefix(*node.connections) : "-"});
@@ -679,7 +696,8 @@ void insert_at(Cells& cells, std::size_t column, Value value) {
                                                const graph::ResolvedNode& resolved,
                                                NodeColumns columns) {
   if (resolved.spec.type == model::NodeType::client) {
-    const std::size_t cells = 8 + std::size_t{columns.dead_letters} +
+    // node_row's dashes: one fewer in estimate's steady state, which has no red_s column.
+    const std::size_t cells = (node.steady_state ? 7 : 8) + std::size_t{columns.dead_letters} +
                               std::size_t{columns.connections} + std::size_t{columns.deduplicated};
     return std::vector<double>(cells, text_cell);
   }
@@ -705,6 +723,11 @@ void insert_at(Cells& cells, std::size_t column, Value value) {
                               {"rejected"},
                               {"red_s"},
                               {"peak_lag"}}};
+  if (summary.is_estimate()) {  // a steady state: rates, and no red time (queue_cells)
+    parts.header[4] = Cell{"dropped/s"};
+    parts.header[5] = Cell{"rejected/s"};
+    parts.header.erase(parts.header.begin() + 6);
+  }
   const NodeColumns columns{.dead_letters = some_pool_retries(summary.graph()),
                             .connections = some_gateway(summary.graph()),
                             .deduplicated = has_fanout(summary.graph())};
@@ -1214,18 +1237,33 @@ constexpr std::string_view op_title =
   return "  " + json_field(name, "[\n    " + join(objects, ",\n    ") + "\n  ]");
 }
 
+// Whether a node's lag grows without bound (estimate's frontier or queue that falls behind for
+// good: its peak_queue_lag_s is infinite, printed null), `false` on a queue whose lag is finite,
+// null on every node that has no lag: peak_queue_lag_s alone is null in the first and last case.
+[[nodiscard]] std::string json_lag_unbounded(const NodeSummary& n) {
+  if (!n.peak_queue_lag_s) return "null";
+  return std::isinf(*n.peak_queue_lag_s) ? "true" : "false";
+}
+
+// A total over the observed steps, or null in estimate's steady state, which lasts no time.
+[[nodiscard]] std::string json_total(const NodeSummary& n, double total) {
+  return n.steady_state ? "null" : json_number(total);
+}
+
 [[nodiscard]] std::vector<std::string> json_node_fields(const NodeSummary& n) {
   return {json_field("id", json_string(n.id)), json_field("mean_rho", json_number(n.mean_rho)),
           json_field("peak_rho", json_number(n.peak_rho)),
           json_field("peak_backlog", json_number(n.peak_backlog)),
-          json_field("dropped", json_number(n.total_dropped)),
+          json_field("dropped", json_total(n, n.total_dropped)),
+          json_field("dropped_per_s", json_number(n.mean_dropped_per_s)),
           // a worker pool's (0 without retries); null for every other node
           json_field("dead_lettered", json_optional_number(n.total_dead_lettered)),
           json_field("dead_lettered_per_s", json_optional_number(n.mean_dead_lettered_per_s)),
-          json_field("rejected", json_number(n.total_rejected)),
+          json_field("rejected", json_total(n, n.total_rejected)),
+          json_field("rejected_per_s", json_number(n.mean_rejected_per_s)),
           // a notification fanout's mean rate (0 with dedup 0); null for every other node
           json_field("deduplicated_per_s", json_optional_number(n.mean_deduplicated_per_s)),
-          json_field("red_s", json_number(n.red_time_s)),
+          json_field("red_s", json_total(n, n.red_time_s)),
           json_field("unavailable", n.unavailable ? "true" : "false"),
           // null for a node with no lagging copies, and for an infinite one
           json_field("staleness_s", n.mean_staleness_s ? json_number(*n.mean_staleness_s) : "null"),
@@ -1235,7 +1273,8 @@ constexpr std::string_view op_title =
           json_field("committed_writes_per_s", json_optional_number(n.mean_committed_writes_per_s)),
           // seconds; null for every node that is not a message queue or a frontier, and on one
           // for an unbounded lag (estimate's, infinite: the schema's JSON key table)
-          json_field("peak_queue_lag_s", json_optional_number(n.peak_queue_lag_s))};
+          json_field("peak_queue_lag_s", json_optional_number(n.peak_queue_lag_s)),
+          json_field("queue_lag_unbounded", json_lag_unbounded(n))};
 }
 
 [[nodiscard]] std::string json_node(const NodeSummary& n) {
@@ -1884,22 +1923,27 @@ constexpr std::array op_numbers{
   };
   std::vector<std::string> unavailable;
   for (const auto& run : nodes) unavailable.emplace_back(run[i].unavailable ? "true" : "false");
+  std::vector<std::string> lag_unbounded;
+  for (const auto& run : nodes) lag_unbounded.push_back(json_lag_unbounded(run[i]));
   std::vector<std::string> fields{
       json_field("id", json_string(nodes.front()[i].id)),
       plain("mean_rho", &NodeSummary::mean_rho),
       plain("peak_rho", &NodeSummary::peak_rho),
       plain("peak_backlog", &NodeSummary::peak_backlog),
       plain("dropped", &NodeSummary::total_dropped),
+      plain("dropped_per_s", &NodeSummary::mean_dropped_per_s),
       optional("dead_lettered", &NodeSummary::total_dead_lettered),
       optional("dead_lettered_per_s", &NodeSummary::mean_dead_lettered_per_s),
       plain("rejected", &NodeSummary::total_rejected),
+      plain("rejected_per_s", &NodeSummary::mean_rejected_per_s),
       optional("deduplicated_per_s", &NodeSummary::mean_deduplicated_per_s),
       plain("red_s", &NodeSummary::red_time_s),
       json_per_seed("unavailable", unavailable),
       optional("staleness_s", &NodeSummary::mean_staleness_s),
       optional("replication_dropped_per_s", &NodeSummary::mean_replication_dropped_per_s),
       optional("committed_writes_per_s", &NodeSummary::mean_committed_writes_per_s),
-      optional("peak_queue_lag_s", &NodeSummary::peak_queue_lag_s)};
+      optional("peak_queue_lag_s", &NodeSummary::peak_queue_lag_s),
+      json_per_seed("queue_lag_unbounded", lag_unbounded)};
   if (with_connections) {
     fields.push_back(optional("connections", &NodeSummary::connections));
     fields.push_back(optional("connections_peak", &NodeSummary::connections_peak));
@@ -2432,13 +2476,19 @@ std::vector<NodeSummary> Summary::nodes() const {
   for (std::size_t i = 0; i < nodes_.size(); ++i) {
     const auto& t = nodes_[i];
     const double capacity = graph_->nodes()[i].capacity.service_rate.per_second;
+    const double dropped = without_residue(t.dropped, capacity);
+    const double rejected = without_residue(t.rejected, capacity);
     out.push_back(NodeSummary{.id = graph_->nodes()[i].spec.id,
                               .mean_rho = observed_s_ > 0.0 ? t.rho_time / observed_s_ : 0.0,
                               .peak_rho = t.peak_rho,
                               .peak_backlog = without_residue(t.peak_backlog, capacity),
-                              .total_dropped = without_residue(t.dropped, capacity),
-                              .total_rejected = without_residue(t.rejected, capacity),
+                              .total_dropped = dropped,
+                              .total_rejected = rejected,
                               .red_time_s = t.red_time_s,
+                              .mean_dropped_per_s = observed_s_ > 0.0 ? dropped / observed_s_ : 0.0,
+                              .mean_rejected_per_s =
+                                  observed_s_ > 0.0 ? rejected / observed_s_ : 0.0,
+                              .steady_state = estimate_,
                               .unavailable = t.unavailable,
                               .peak_queue_lag_s = t.peak_queue_lag_s,
                               .connections = t.last_connections,

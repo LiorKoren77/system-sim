@@ -51,6 +51,13 @@ struct NodeSummary {
   // forwarded, and counted apart from the drops (reject_rate, not drop_rate).
   double total_rejected{};
   double red_time_s{};  // seconds spent in the red zone
+  // The two totals per observed second: in a run their mean rate, in estimate the steady rates
+  // (its one record's totals over its one step), so the two commands compare (phase 4a §6).
+  double mean_dropped_per_s{};
+  double mean_rejected_per_s{};
+  // Made by estimate (Summary::of_estimate): one steady state, which lasts no stretch of time, so
+  // the totals and the red time above mean nothing; the reports print the rates instead.
+  bool steady_state{};
   bool unavailable{};   // the node's latency was infinite in some observed step
   // A SQL database's staleness (engine::NodeSample::staleness_s: the write's sojourn at the
   // primary + the replication lag + its sojourn at a replica), time-averaged over the observed
