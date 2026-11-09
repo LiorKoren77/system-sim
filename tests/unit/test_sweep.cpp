@@ -28,6 +28,8 @@
 import simsys.config;
 import simsys.core;
 import simsys.model;
+import simsys.report;   // evaluate_slos: what run judges, beside what a sweep point judges
+import simsys.session;  // load_graph, run_summary: a point loaded and run as `simsys run` does
 import simsys.sweep;
 
 using namespace std::chrono_literals;
@@ -1230,4 +1232,153 @@ TEST_CASE("a count written as a word gets the count's own message, not a spacing
   const auto param = parse_param("nodes.w.workers=1..10:three");
   REQUIRE_FALSE(param.has_value());
   REQUIRE(param.error() == "--param: 1..10:three: the count after ':' must be a whole number");
+}
+
+// ---- --slos: a verdict per SLO and an exit code per point (phase 4a Task 5; spec 4a §4.4) -----
+// Each point is judged exactly as `simsys run` judges the same file with the point's value written
+// in: report::evaluate_slos on the point's summary, windows and the timeout rule included.
+
+namespace {
+// hello with one latency SLO. Its p99 (measured from the Release binary, 2026-11-09) is 5.66 ms,
+// 10.0 ms and 49.3 ms at 100, 500 and 900/s, an M/M/1 bending up as rho nears 1, so a 20 ms max
+// passes, passes, fails. `extra` adds more SLOs after it.
+std::string hello_with_slos(std::string_view extra = "") {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("simsys-sweep-slos-" + std::to_string(getpid()) + ".yaml");
+  std::ofstream{path} << "version: 1\nname: hello-slos\nduration: 1m\nnodes:\n"
+                         "  users: {type: client, rate: {base: 100/s}, ops: {ping: 1.0}}\n"
+                         "  api: {type: service, capacity: 1k/s, latency: 1ms}\n"
+                         "links:\n  - {from: users, to: api, dir: inout}\n"
+                         "slo:\n  - {metric: p99_latency, node: users, op: ping, max: 20ms}\n"
+                      << extra;
+  return path.string();
+}
+
+using simsys::sweep::SloColumns;
+using simsys::sweep::SloVerdict;
+}  // namespace
+
+TEST_CASE("with --slos each point gets its SLO verdicts and the exit code run would give") {
+  const auto path = hello_with_slos("  - {metric: drop_rate, max: 0}\n");
+  const auto rows = run_sweep(path, hello_rate_sweep(), hello_metrics(), 2, SloColumns::on);
+  std::filesystem::remove(path);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  const std::array p99{SloVerdict::pass, SloVerdict::pass, SloVerdict::fail};
+  const std::array exit_code{0, 0, 2};
+  for (std::size_t i = 0; i < 3; ++i) {
+    CAPTURE(i);
+    const auto& row = (*rows)[i];
+    REQUIRE(row.slos.size() == 2);
+    REQUIRE(row.slos[0].heading == "p99_latency:users.ping");
+    REQUIRE(row.slos[0].verdict == p99[i]);
+    REQUIRE(row.slos[1].heading == "drop_rate");
+    REQUIRE(row.slos[1].verdict == SloVerdict::pass);
+    REQUIRE(row.exit_code == exit_code[i]);
+  }
+}
+
+TEST_CASE("without --slos a row has no verdicts and the output is as before") {
+  const auto path = hello_with_slos();
+  const auto metrics = hello_metrics();
+  const auto rows = run_sweep(path, hello_rate_sweep(), metrics, 1);
+  std::filesystem::remove(path);
+  REQUIRE(rows.has_value());
+  for (const auto& row : *rows) {
+    REQUIRE(row.slos.empty());
+    REQUIRE_FALSE(row.exit_code.has_value());
+  }
+}
+
+TEST_CASE("a point's verdicts are those of run on the same file with the value written in") {
+  const auto path = hello_with_slos("  - {metric: utilization, node: api, max: 0.4}\n");
+  const auto rows = run_sweep(path, hello_rate_sweep(), hello_metrics(), 1, SloColumns::on);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  for (std::size_t i = 0; i < 3; ++i) {
+    CAPTURE(i);
+    // What `simsys run` does with the file, the point's value written in (session::load_graph,
+    // run_summary, then report::evaluate_slos and its exit code, as main.cpp's print_report).
+    const std::vector<Override> overrides{
+        {.path = "nodes.users.rate.base", .value = hello_rate_sweep().values[i]}};
+    const auto g = simsys::session::load_graph(path, overrides);
+    REQUIRE(g.has_value());
+    const auto summary = simsys::session::run_summary(*g, path);
+    REQUIRE(summary.has_value());
+    const auto results = simsys::report::evaluate_slos(*summary, g->scenario().slos);
+    REQUIRE((*rows)[i].slos.size() == results.size());
+    for (std::size_t k = 0; k < results.size(); ++k) {
+      const bool passed = results[k].status == simsys::report::SloStatus::pass;
+      const bool failed = results[k].status == simsys::report::SloStatus::fail;
+      REQUIRE(((*rows)[i].slos[k].verdict == SloVerdict::pass) == passed);
+      REQUIRE(((*rows)[i].slos[k].verdict == SloVerdict::fail) == failed);
+    }
+    REQUIRE((*rows)[i].exit_code == (simsys::report::all_pass(results) ? 0 : 2));
+  }
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("two SLOs of one heading are told apart by their place") {
+  const auto path = hello_with_slos("  - {metric: p99_latency, node: users, op: ping, max: 1s}\n");
+  const auto rows = run_sweep(path, hello_rate_sweep(), hello_metrics(), 1, SloColumns::on);
+  std::filesystem::remove(path);
+  REQUIRE(rows.has_value());
+  REQUIRE((*rows)[0].slos[0].heading == "p99_latency:users.ping");
+  REQUIRE((*rows)[0].slos[1].heading == "p99_latency:users.ping#2");
+}
+
+TEST_CASE("the table and csv show each verdict and the exit code after the metrics") {
+  const auto path = hello_with_slos();
+  const auto metrics = hello_metrics();
+  const auto rows = run_sweep(path, hello_rate_sweep(), metrics, 1, SloColumns::on);
+  std::filesystem::remove(path);
+  REQUIRE(rows.has_value());
+  const auto table = split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::table), '\n');
+  CAPTURE(table);
+  REQUIRE(split_words(table[0]) ==
+          std::vector<std::string>{"nodes.users.rate.base", "users.ping.mean", "api.mean_rho",
+                                   "p99_latency:users.ping", "exit"});
+  REQUIRE(split_words(table[2]).back() == "0");
+  REQUIRE(split_words(table[4]) ==
+          std::vector<std::string>{"900/s", "10.5ms", "0.9", "FAIL", "2"});
+  const auto csv = split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::csv), '\n');
+  REQUIRE(csv[0] == "nodes.users.rate.base,users.ping.mean,api.mean_rho,p99_latency:users.ping,exit");
+  REQUIRE(csv[1].ends_with(",pass,0"));
+  REQUIRE(csv[3].ends_with(",fail,2"));
+}
+
+TEST_CASE("a scenario without SLOs gets an exit column of zeros under --slos") {
+  const auto metrics = hello_metrics();
+  const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1, SloColumns::on);
+  REQUIRE(rows.has_value());
+  for (const auto& row : *rows) {
+    REQUIRE(row.slos.empty());
+    REQUIRE(row.exit_code == 0);
+  }
+  const auto csv = split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::csv), '\n');
+  REQUIRE(csv[0] == "nodes.users.rate.base,users.ping.mean,api.mean_rho,exit");
+}
+
+TEST_CASE("a skipped SLO is a dash in the table and skipped in the csv") {
+  // A third party that fails everything it serves answers nobody, so a latency SLO on the op has
+  // no latency to observe and is skipped (spec §19 entry 8), at every point.
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("simsys-sweep-skipped-" + std::to_string(getpid()) + ".yaml");
+  std::ofstream{path} << "version: 1\nname: skipped\nduration: 1m\nnodes:\n"
+                         "  users: {type: client, rate: {base: 100/s}, ops: {ping: 1.0}}\n"
+                         "  api: {type: external_sink, failure_rate: 1}\n"
+                         "links:\n  - {from: users, to: api, dir: inout}\n"
+                         "slo:\n  - {metric: p99_latency, node: users, op: ping, max: 1s}\n";
+  const std::vector<SweepMetric> metrics{*parse_metric("api.mean_rho")};
+  const auto rows = run_sweep(path.string(), hello_rate_sweep(), metrics, 1, SloColumns::on);
+  std::filesystem::remove(path);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  REQUIRE((*rows)[0].slos[0].verdict == SloVerdict::skipped);
+  REQUIRE((*rows)[0].exit_code == 0);  // skipped counts as a pass, as in run
+  const auto table =
+      split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::table), '\n');
+  REQUIRE(split_words(table[2])[2] == "-");
+  const auto csv = split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::csv), '\n');
+  REQUIRE(csv[1].ends_with(",skipped,0"));
 }
