@@ -114,6 +114,10 @@ add_test(NAME "simsys curve applies a traffic_spike fault exactly as a spikes en
          COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
                  -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-curve-faults
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/curve_faults.cmake)
+add_test(NAME "simsys estimate --at evaluates the steady state at an instant inside the run"
+         COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
+                 -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-estimate-at
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/estimate_at.cmake)
 add_test(NAME "simsys curve refuses a seed without noise, which would change nothing"
          COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
                  -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-curve-seed
