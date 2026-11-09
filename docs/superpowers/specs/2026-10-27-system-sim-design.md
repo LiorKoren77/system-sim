@@ -1230,3 +1230,65 @@ the Release binary.
     replication varies the rate noise only); queue partitions capping a group's parallelism; a
     worker blocked on its `then` hops; `error_latency`; one series file per seed; sweep SLO columns,
     sweeps over seeds or two keys.
+
+## 21. Phase 4a: the sweep and the reports, as implemented (2026-11-09)
+
+Phase 4a (design `docs/superpowers/specs/2026-11-09-phase4a-sweep-reporting-design.md`, "the 4a
+design" below; plan `docs/superpowers/plans/2026-11-09-phase4a-sweep-reporting.md`) took the
+reporting and command-line items of §20 entry 16's backlog and four 2a leftovers. It changes no node
+model: every number `run` prints is the same. It ran as four batches of tasks, each task a red and a
+green commit, each batch closed by a code review whose findings and decisions the plan records.
+Where an entry conflicts with an earlier section or with the 4a design, this section wins. The rules
+a scenario author meets are in `docs/scenario-schema.md` (v1.6).
+
+1. **Duplicate `write_ops` and `curve --seed` (Task 1, M9 and M13).** A `write_ops` list naming an op
+   twice is refused in a link's words, `node 'c': duplicate write_ops op 'write'`; one helper
+   (`config::detail::first_repeat`) serves both lists (batch A review, item 5). `curve --seed`
+   without `--noise` exits 1, `--seed needs --noise (without it the curve has no randomness)`,
+   checked after the file loads, so a missing file says so (review item 9).
+2. **`<node>.reject_rate` (Task 2).** The sweep reads `Summary::reject_rate`, the number of the JSON
+   and the `reject_rate` SLO; a client is refused as having no reject rate.
+3. **Geometric points, `:log` (Task 3).** `from × (to / from)^(k / (n − 1))`, computed in
+   logarithms so that a range as wide as 1e-300..1e300 does not overflow (review item 2), the last
+   point `to` itself. Corrected by the batch A review (items 1, 3, 10): a whole key's ends must be
+   whole, as on a linear range, and only the points between round; two equal points are refused on
+   any key, not only a whole one; a word after the last colon is a spacing only after a count of
+   digits, so `:three` keeps the count's message. Left: a clock-time range with its count forgotten
+   (`10:00..12:00:log`) reads the minutes as the count (item 4, documented).
+4. **The grid (Task 4).** `--param` twice: the pairs of `std::views::cartesian_product` (C++23), the
+   first key the outer loop, a column per key; at most two keys, no key twice, at most 10,000 points.
+   Two paths that reach one anchored value are refused (`config::same_override_target` compares
+   yaml-cpp node identity: an alias loads as its anchor's node). Corrected by the batch B review:
+   each `--param` takes one value (`expected(1)`, `allow_extra_args(false)`), since CLI11 let a vector
+   option swallow the file written after it (item 1); the grid's checks live in one `grid_problem`
+   that the exported `run_sweep` asks too, so a direct caller cannot pass an empty span or three
+   keys (items 2–5).
+5. **`--slos` (Task 5).** One column per SLO (headed `metric:node.op`, a repeat `#2`) and `exit`,
+   each point judged by `report::evaluate_slos` on its own summary, exactly as `run` judges it; the
+   sweep itself still exits 0 (a sweep explores; the 4a design §2). `sweep.cppm` names its own
+   `SloVerdict` so that the interface imports no module (the first GCC defect's precaution). Changed
+   by the batch B review: the note for a scenario without SLOs says `the scenario has no SLOs, so no
+   point can fail one` (it promised exit 0, and a point that observes no step exits 1); headings are
+   worked out once per sweep; the two switches over verdicts end in `std::unreachable`.
+6. **`estimate --at` (Task 6).** The engine already settled at a given instant
+   (`Simulation::settle(at)`); `estimate(at)` passes it through. The rule is a fault's `at`: a clock
+   time or a duration, `0 <= at < duration`, refused in `curve`'s words. Faults stay out at any
+   instant. The first line names the instant (`t = 13h (13:00)`), and is unchanged without `--at`;
+   JSON gains `at_s`. url-shortener's `url_db` at 13:00 reads 0.6382 (0.244 at midnight; its
+   windowed SLO's worst hour, 13:02–14:02, 0.6433).
+7. **`estimate`'s shape (Task 7, M12 and the per-second backlog item).** Under `estimate` a node's
+   JSON `dropped`, `rejected` and `red_s` are `null`; `dropped_per_s` and `rejected_per_s` are in
+   both commands (a run's mean, the steady rates), `queue_lag_unbounded` separates an unbounded lag
+   from none, and the per-seed replication objects gain the same keys. The table says `steady state
+   at 00:00`, shows `dropped/s` and `rejected/s` and drops `red_s`; `run`'s table is unchanged. A
+   steady state is marked on each `NodeSummary` (`steady_state`), not passed to the JSON writers,
+   because they run under `std::views::transform`, where a capturing lambda would meet the fifth
+   GCC defect.
+8. **Unit labels (Task 8, M7).** One line under the node table, `units (peak_backlog and drops are
+   not requests here): ...`, naming each node whose figures are capacity units (a database's write
+   ops at their default cost 5, a stated `cost`), replica-requests (a kv_cluster, `N`) or megabytes
+   (a byte-sized node), priced by `defaults::op_cost` so it cannot disagree with the engine; ten of
+   the fourteen scenarios get it.
+9. **What 4a leaves.** Sweeps over seeds, replications per point and the diurnal table (M10) go to
+   4b with the rest of the randomness; three keys, list values and adaptive search stay out; the
+   links table under `estimate` still shows one step's totals (no link has a steady-state flag yet).

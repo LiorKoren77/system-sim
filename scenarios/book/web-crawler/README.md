@@ -22,6 +22,7 @@ nodes
   link_extractor    0.6647    0.6647             0        0                -         0        0         -
   url_filter        0.3323    0.3323             0        0                -         0        0         -
   url_seen          0.6647    0.6647             0        0                -         0        0         -
+units (peak_backlog and drops are not requests here): content_store MB
 ...
 slo
   status  metric       node        op  observed  max

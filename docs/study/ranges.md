@@ -19,6 +19,8 @@
 | C++23 `ranges::to`, `views::join_with`, `views::zip` | `src/report/shared.cppm`: `join`; `report.cpp`: `map_to_strings`, `Summary::observe`; `explain.cpp`: `explain_links`; `workload.cpp`: `read_client_sizes` (`ranges::to<std::map>`) |
 | C++23 `ranges::iota`; `ranges::stable_sort` + lambda projection (C++20) | `report.cpp`: `rank_order` (the runs of `run --replications` sorted as indices, compared by the value the projection `[&](std::size_t run) { return values[run]; }` looks up, so the comparator stays `ranks_before(double, double)`; stable: ties in seed order) |
 | `ranges::find_if` + projection | `report.cpp`: `text_band` (the first run whose cell text, the projection, is not blank) |
+| C++23 `views::cartesian_product` | `src/sweep/sweep.cpp`: `grid_points` (phase 4a: a sweep's grid, every pair of two keys' values) |
+| `views::keys` + `ranges::to`, `ranges::unique` | `report.cpp`: `priced_ops` (phase 4a: a node's ops with a cost, for the tables' `units` line) |
 
 ## What
 
@@ -41,6 +43,23 @@ return std::ranges::lower_bound(self.entries_, op, {}, &Entry::op);
 
 `{}` is the default comparison, `std::ranges::less`. C++23 added `ranges::to<C>()` to
 collect a view into a container, `contains`, `fold_left`, `zip` and `join_with`.
+
+C++23 also added `views::cartesian_product(a, b)`: every pair `(x, y)` with `x` from `a` and `y`
+from `b`, as a view of tuples, `a` the outer loop. `simsys sweep` with two `--param`s runs one
+point per pair (phase 4a):
+
+```cpp
+// sweep.cpp, grid_points: (a1, b1) (a1, b2) ... (a2, b1) ..., the first key the outer loop
+for (const auto& [outer, inner] :
+     std::views::cartesian_product(params[0].values, params[1].values)) {
+  points.push_back({outer, inner});
+}
+```
+
+It replaces two nested `for` loops whose order a reader has to check by eye; here the order is
+the product's own and is the order of the table's rows. It takes no lambda, so the fifth GCC 14.2
+defect (a lambda handed to a range adaptor in a module function is emitted in two object files,
+below) does not arise; a projection the sweep needs would go into a named `detail::` function.
 
 ## The pre-C++20 way
 
