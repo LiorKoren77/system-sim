@@ -4116,3 +4116,67 @@ TEST_CASE("estimate's table shows a steady state, with drops and refusals per se
   REQUIRE(run.contains("red_s"));
   REQUIRE_FALSE(run.contains("dropped/s"));
 }
+
+// ---- Unit labels (phase 4a Task 8; spec 4a §7; the 2a leftover M7) ------------------------------
+// A node's peak_backlog and dropped are in its own capacity unit, which is a request only when
+// every op it serves costs 1: a SQL database's writes cost 5 by default (spec §18 entry 7), a
+// kv_cluster's request is N replica-requests (§19 entry 9), a byte-sized node counts megabytes
+// (§19 entry 2). The tables say so in one line under the node table, only where it is needed.
+
+namespace {
+std::string estimate_table_of(std::string_view scenario) {
+  const auto loaded = simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/" +
+                                           std::string{scenario} + "/scenario.yaml");
+  REQUIRE(loaded.has_value());
+  const auto g = *simsys::graph::Graph::build(*loaded);
+  return simsys::report::render_table(estimated(g), {}, /*color=*/false);
+}
+
+// The `units` line of a table, or "" when it has none.
+std::string units_line(const std::string& table) {
+  const auto at = table.find("\nunits ");
+  if (at == std::string::npos) return {};
+  return table.substr(at + 1, table.find('\n', at + 1) - at - 1);
+}
+}  // namespace
+
+TEST_CASE("a database whose writes cost 5 is named as counting capacity units", "[report]") {
+  const auto line = units_line(estimate_table_of("book/url-shortener"));
+  CAPTURE(line);
+  // url_db states no cost, so each of a database's four default write ops costs 5.
+  REQUIRE(line == "units (peak_backlog and drops are not requests here): url_db capacity units "
+                  "(delete, insert, update, write cost 5)");
+}
+
+TEST_CASE("byte-sized nodes are named as counting megabytes", "[report]") {
+  const auto line = units_line(estimate_table_of("book/youtube"));
+  CAPTURE(line);
+  REQUIRE(line.starts_with("units (peak_backlog and drops are not requests here): "));
+  for (const std::string_view mb : {"cdn_us MB", "cdn_eu MB", "transcoded_store MB"}) {
+    CAPTURE(mb);
+    REQUIRE(line.contains(mb));
+  }
+}
+
+TEST_CASE("a key-value cluster is named as counting replica-requests", "[report]") {
+  const auto line = units_line(estimate_table_of("labs/kv-store"));
+  CAPTURE(line);
+  REQUIRE(line.contains("replica-requests (N 3)"));
+}
+
+TEST_CASE("a table whose every node counts requests has no units line", "[report]") {
+  REQUIRE(units_line(estimate_table_of("tutorial/hello")).empty());
+  REQUIRE(units_line(estimate_table_of("tutorial/chain")).empty());
+  const auto s = mm1(1500, 100);
+  const auto g = *simsys::graph::Graph::build(s);
+  REQUIRE(units_line(simsys::report::render_table(summarize(s, g), {}, false)).empty());
+}
+
+TEST_CASE("a stated cost other than 1 makes a service count capacity units", "[report]") {
+  Scenario s = mm1(100);
+  s.nodes[1].cost = {{"op", 3.0}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto line = units_line(simsys::report::render_table(summarize(s, g), {}, false));
+  REQUIRE(line == "units (peak_backlog and drops are not requests here): s capacity units "
+                  "(op cost 3)");
+}
