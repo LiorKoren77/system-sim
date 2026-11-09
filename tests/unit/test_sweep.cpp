@@ -1096,7 +1096,8 @@ TEST_CASE("a grid's table and csv have a column per key, then the metrics") {
   CAPTURE(table);
   REQUIRE(split_words(table[0]) ==
           std::vector<std::string>{"nodes.users.rate.base", "nodes.api.capacity", "api.mean_rho"});
-  REQUIRE(split_words(table[3]) == std::vector<std::string>{"300/s", "1k/s", "0.3"});
+  // table[1] is the rule of dashes under the header; the third point is the fourth line.
+  REQUIRE(split_words(table[4]) == std::vector<std::string>{"300/s", "1k/s", "0.3"});
   const auto csv = split(render_sweep(params, metrics, *rows, SweepFormat::csv), '\n');
   REQUIRE(csv[0] == "nodes.users.rate.base,nodes.api.capacity,api.mean_rho");
   REQUIRE(csv[1].starts_with("100/s,1k/s,"));

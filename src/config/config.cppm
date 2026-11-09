@@ -94,6 +94,14 @@ struct Override {
 [[nodiscard]] std::expected<void, ConfigError> check_override_path(const std::string& path,
                                                                    std::string_view override_path);
 
+// Whether two override paths lead to the same scalar of the file at `path`: a YAML anchor (`&cap`)
+// and its alias (`*cap`) load as one node, so replacing the value at either path replaces it at
+// both, and a grid sweeping both would write one key's value over the other's (`simsys sweep`).
+// The paths' own mistakes are the same errors as check_override_path's.
+[[nodiscard]] std::expected<bool, ConfigError> same_override_target(const std::string& path,
+                                                                    std::string_view first,
+                                                                    std::string_view second);
+
 // The keys of a dot path, in order: "nodes.users.rate.base" -> {nodes, users, rate, base}. Empty
 // pieces are kept ("a..b" has an empty middle key, which no map holds). `simsys sweep` splits its
 // metric names with it too.

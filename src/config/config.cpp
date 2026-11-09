@@ -122,6 +122,23 @@ std::expected<void, ConfigError> check_override_path(const std::string& file,
   }
 }
 
+std::expected<bool, ConfigError> same_override_target(const std::string& file,
+                                                      std::string_view first,
+                                                      std::string_view second) {
+  try {
+    const auto root = YAML::LoadFile(file);
+    const auto a = detail::find_override_target(file, root, first);
+    if (!a) return std::unexpected(a.error());
+    const auto b = detail::find_override_target(file, root, second);
+    if (!b) return std::unexpected(b.error());
+    // yaml-cpp's Node::is: the same node in the document (identity), not equal text; an alias
+    // is its anchor's node.
+    return a->is(*b);
+  } catch (const YAML::Exception& e) {
+    return std::unexpected(detail::error_at_mark(file, e.mark, e.msg));
+  }
+}
+
 std::string describe(const ConfigError& error) {
   if (error.line == 0) return std::format("{}: error: {}", error.file, error.message);
   return std::format("{}:{}:{}: error: {}", error.file, error.line, error.column, error.message);

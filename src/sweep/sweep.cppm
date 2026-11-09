@@ -90,14 +90,26 @@ struct SweepMetric {
 // (run_sweep checks). Errors start with "--metric: " and name the metric.
 [[nodiscard]] std::expected<SweepMetric, std::string> parse_metric(std::string_view name);
 
-// One point: its value as written in the param, and one number per metric, in the order asked,
+// The keys one sweep may cross: two, a grid (spec 4a §4.3). A table of two keys still reads as
+// one row per point; a third axis is a script's job. `constexpr` without `inline`: exported (this
+// is the export block), it keeps external linkage, and the seventh GCC 14.2 defect (CLAUDE.md §3)
+// bites an exported inline variable named by a default argument.
+constexpr std::size_t max_params = 2;
+
+// `--param` given once or twice: each spec parsed (parse_param), at most max_params of them, no key
+// twice, and the grid's product of point counts at most the one-key limit (10,000), since every
+// point's graph is built before any runs. Errors start with "--param: ".
+[[nodiscard]] std::expected<std::vector<SweepParam>, std::string> parse_params(
+    std::span<const std::string> specs);
+
+// One point: its value for each param, as written there, and one number per metric, in the order asked,
 // in SI base units (seconds for a latency or a lag, a plain ratio for a utilization or a drop
 // rate, per second for a rate, a plain count for connections), like report::SloResult::observed.
 // `beyond_timeout` lists (by index into `metrics`) the percentiles that are the client's timeout,
 // not a latency it saw: more than 1 − q of the delivered requests timed out, and the table prints
 // them `>1s`, as the op table does.
 struct SweepRow {
-  std::string value;
+  std::vector<std::string> values;  // one per param, in the order of the params
   std::vector<double> metrics;
   std::vector<std::size_t> beyond_timeout{};
 };
@@ -111,6 +123,14 @@ enum class SweepFormat { table, csv };
 // with `jobs` worker threads (at least 1, at most one per point). Each point is its own
 // Simulation, deterministic, so the rows do not depend on `jobs`. An error names the file, or
 // the lowest-numbered failing point (from 1) and its override: "point 2 (key=value): ...".
+// With two params the points are every pair of their values, the first param the outer loop; an
+// error at a point names every value: "point 3 (a=300/s, b=1k/s): ...". Two params that reach one
+// value of the file (a YAML anchor and its alias) are refused.
+[[nodiscard]] std::expected<std::vector<SweepRow>, std::string> run_sweep(
+    const std::string& scenario_path, std::span<const SweepParam> params,
+    std::span<const SweepMetric> metrics, std::size_t jobs);
+
+// A sweep of one key: run_sweep over a span of one param.
 [[nodiscard]] std::expected<std::vector<SweepRow>, std::string> run_sweep(
     const std::string& scenario_path, const SweepParam& param, std::span<const SweepMetric> metrics,
     std::size_t jobs);
@@ -126,6 +146,12 @@ inline constexpr std::size_t max_jobs = 1024;
 // latencies in readable units (1.61 ms). `csv`: for programs, the same header with commas and
 // each number as the shortest text that reads back to the same double (report::format_number).
 // Both end with a newline.
+// A column per param, in order, then one per metric.
+[[nodiscard]] std::string render_sweep(std::span<const SweepParam> params,
+                                       std::span<const SweepMetric> metrics,
+                                       std::span<const SweepRow> rows, SweepFormat format);
+
+// The table or CSV of a sweep of one key.
 [[nodiscard]] std::string render_sweep(const SweepParam& param,
                                        std::span<const SweepMetric> metrics,
                                        std::span<const SweepRow> rows, SweepFormat format);

@@ -563,7 +563,7 @@ int run_curve(const std::filesystem::path& file, const CurveArgs& args) {
 
 // What `sweep` takes beyond the file.
 struct SweepArgs {
-  std::string param{};
+  std::vector<std::string> params{};  // one key, or two for a grid
   std::vector<std::string> metrics{};
   std::size_t jobs{simsys::sweep::default_jobs()};
   std::string format{"table"};
@@ -581,14 +581,15 @@ std::expected<std::vector<simsys::sweep::SweepMetric>, std::string> parse_metric
   return metrics;
 }
 
-// `simsys sweep <file> --param <spec> --metric <m>...`: one run per point, one row per point.
+// `simsys sweep <file> --param <spec> [--param <spec>] --metric <m>...`: one run per point (every
+// pair of the two keys' values with two), one row per point.
 // Nothing reaches stdout unless every point ran, so a script never reads half a table. A --param
 // or --metric refused for its text is worded as every other refusal of the command, after the
 // file and `error:`, so all of them read `<file>: error: --param: ...` or `... --metric: ...`.
 int run_sweep_command(const std::filesystem::path& file, const SweepArgs& args) {
-  const auto param = simsys::sweep::parse_param(args.param);
-  if (!param) {
-    print_error(file.string() + ": error: " + param.error());
+  const auto params = simsys::sweep::parse_params(args.params);
+  if (!params) {
+    print_error(file.string() + ": error: " + params.error());
     return 1;
   }
   const auto metrics = parse_metrics(args.metrics);
@@ -596,14 +597,14 @@ int run_sweep_command(const std::filesystem::path& file, const SweepArgs& args) 
     print_error(file.string() + ": error: " + metrics.error());
     return 1;
   }
-  const auto rows = simsys::sweep::run_sweep(file.string(), *param, *metrics, args.jobs);
+  const auto rows = simsys::sweep::run_sweep(file.string(), *params, *metrics, args.jobs);
   if (!rows) {
     print_error(rows.error());
     return 1;
   }
   const auto format =
       args.format == "csv" ? simsys::sweep::SweepFormat::csv : simsys::sweep::SweepFormat::table;
-  std::print("{}", simsys::sweep::render_sweep(*param, *metrics, *rows, format));
+  std::print("{}", simsys::sweep::render_sweep(*params, *metrics, *rows, format));
   return 0;
 }
 
@@ -655,9 +656,10 @@ CLI::App* add_sweep_command(CLI::App& app, SweepArgs& args, std::filesystem::pat
       "sweep", "run the scenario once per value of one key, the runs in parallel; one row each");
   add_file_argument(*sweep, file);
   sweep
-      ->add_option("--param", args.param,
+      ->add_option("--param", args.params,
                    "the swept key and its range, <dot.path>=<from>..<to>:<n>[:log] "
-                   "(:log: geometric), e.g. nodes.users.rate.base=100/s..900/s:3")
+                   "(:log: geometric), e.g. nodes.users.rate.base=100/s..900/s:3; "
+                   "given twice, a grid of both keys")
       ->required();
   sweep
       ->add_option("--metric", args.metrics,
