@@ -12,7 +12,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
+#include <numbers>  // std::numbers::pi: the wave's cosine at 12:05 (estimate during a spike)
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -1276,4 +1278,81 @@ TEST_CASE("the consistent-hashing lab's cache hits 0.963 on even arcs and 0.920 
   INFO((g ? "" : g.error().message));
   REQUIRE(g.has_value());
   REQUIRE_THAT(*g->hit_ratio(*g->index_of("cache")), WithinAbs(0.920318, 1e-5));
+}
+
+// ---- estimate at an instant (phase 4a Task 6; spec 4a §5) -------------------------------------
+// estimate(at) is the steady state of the curve's value at `at`, without noise or faults: the
+// clients offer rate(at), every queue settles at it. The probe: mm1's client at base 1k/s on a sine
+// of amplitude 0.5 peaking at 12:00 (rate = 1k × (1 + 0.5 cos(2π (t − 12:00) / 24h))), into a
+// service of 2k/s at 0.5 ms (c = ceil(2000 × 0.0005) = 1: an M/M/1). M/M/1, Poisson arrivals and
+// exponential service (the defaults' SCVs of 1): sojourn W = s / (1 − ρ), ρ = λ / μ.
+
+namespace {
+Scenario waved_mm1() {
+  Scenario s = mm1(1000);
+  s.duration = 24h;
+  s.nodes[0].workload->curve.wave =
+      simsys::workload::Wave{.shape = simsys::workload::WaveShape::sine,
+                             .period = 24h,
+                             .amplitude = 0.5,
+                             .peak_at = 12h};
+  s.nodes[1].capacity = Rate{2000};
+  s.nodes[1].latency = 500us;
+  return s;
+}
+}  // namespace
+
+TEST_CASE("estimate at the wave's peak settles at the peak's rate: 1.5k/s, rho 0.75, W 2 ms",
+          "[theory]") {
+  const auto g = *simsys::graph::Graph::build(waved_mm1());
+  const auto e = (*Simulation::create(g)).estimate(12h);
+  REQUIRE_THAT(e.nodes[1].demand_per_s, WithinRel(1500.0, 1e-9));  // 1k × (1 + 0.5 cos 0)
+  REQUIRE_THAT(e.nodes[1].rho, WithinRel(0.75, 1e-9));             // 1500 / 2000
+  REQUIRE_THAT(e.nodes[1].latency.mean_s, WithinRel(0.002, 1e-9));  // 0.5 ms / (1 − 0.75)
+}
+
+TEST_CASE("estimate at midnight is the wave's trough and the estimate without an instant",
+          "[theory]") {
+  const auto g = *simsys::graph::Graph::build(waved_mm1());
+  const auto at_midnight = (*Simulation::create(g)).estimate(0h);
+  const auto plain = (*Simulation::create(g)).estimate();
+  REQUIRE_THAT(at_midnight.nodes[1].demand_per_s, WithinRel(500.0, 1e-9));  // 1 + 0.5 cos π
+  REQUIRE_THAT(at_midnight.nodes[1].rho, WithinRel(0.25, 1e-9));
+  // 0.5 ms / (1 − 0.25) = 0.6667 ms
+  REQUIRE_THAT(at_midnight.nodes[1].latency.mean_s, WithinRel(0.0005 / 0.75, 1e-9));
+  REQUIRE(at_midnight.nodes[1].rho == plain.nodes[1].rho);
+  REQUIRE(at_midnight.nodes[1].latency.mean_s == plain.nodes[1].latency.mean_s);
+}
+
+TEST_CASE("estimate during a spike multiplies the wave by the spike's factor and drops the excess",
+          "[theory]") {
+  Scenario s = waved_mm1();
+  s.nodes[0].workload->curve.spikes = {
+      simsys::workload::Spike{.at = 12h, .duration = 10min, .factor = 2}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto e = (*Simulation::create(g)).estimate(12h + 5min);
+  // 1k × (1 + 0.5 cos(2π × 5 / 1440)) × 2 = 2999.762/s against 2000/s: the full room drains at
+  // capacity and the excess, 999.762/s, is dropped.
+  // C++20 std::numbers::pi: π as a typed constexpr constant, replacing the POSIX macro M_PI (not in
+  // the C++ standard) or a computed std::acos(-1.0).
+  const double offered =
+      1000.0 * (1.0 + 0.5 * std::cos(2.0 * std::numbers::pi * 5.0 / 1440.0)) * 2.0;
+  REQUIRE_THAT(e.nodes[1].demand_per_s, WithinRel(offered, 1e-9));
+  REQUIRE_THAT(e.nodes[1].dropped_per_s, WithinRel(offered - 2000.0, 1e-9));
+}
+
+TEST_CASE("estimate at an instant leaves the scripted faults out, as estimate always has",
+          "[theory]") {
+  Scenario faulted = waved_mm1();
+  faulted.faults = {simsys::model::Fault{.kind = simsys::model::FaultKind::node_down,
+                                         .at = 12h,
+                                         .duration = 1h,
+                                         .node = "s"}};
+  const auto with_fault = *simsys::graph::Graph::build(faulted);
+  const auto without = *simsys::graph::Graph::build(waved_mm1());
+  const auto a = (*Simulation::create(with_fault)).estimate(12h + 30min);
+  const auto b = (*Simulation::create(without)).estimate(12h + 30min);
+  REQUIRE(a.nodes[1].rho == b.nodes[1].rho);
+  REQUIRE(a.nodes[1].dropped_per_s == b.nodes[1].dropped_per_s);
+  REQUIRE(a.nodes[1].latency.mean_s == b.nodes[1].latency.mean_s);
 }
