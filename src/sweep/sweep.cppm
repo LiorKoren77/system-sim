@@ -32,17 +32,24 @@ export module simsys.sweep;
 
 export namespace simsys::sweep {
 
+// How the points of a range are spread: `linear`, evenly spaced (the default), or `geometric`
+// (the `:log` suffix), a constant ratio from one point to the next.
+enum class Spacing { linear, geometric };
+
 // The swept key and the text of each point, in the scenario's own unit syntax (`100/s`, `5ms`,
 // `400`), so each value can replace the file's text as it stands (config::Override).
 struct SweepParam {
   std::string path;
   std::vector<std::string> values;
+  Spacing spacing{Spacing::linear};
 };
 
-// `<dot.path>=<from>..<to>:<n>`: n >= 2 evenly spaced points from `from` to `to`, both ends
-// included. Both ends are a number followed by the same unit text (`100/s..900/s`, `1ms..5ms`,
-// `400..600`), which every point repeats; a key that counts whole things (`workers`, `replicas`,
-// ...) must get a whole number at every point. Errors start with "--param: ".
+// `<dot.path>=<from>..<to>:<n>[:log]`: n >= 2 points from `from` to `to`, both ends included,
+// evenly spaced, or with `:log` at a constant ratio (two positive ends; a whole key's points are
+// rounded, and two that round alike are refused). Both ends are a number followed by the same unit
+// text (`100/s..900/s`, `1ms..5ms`, `400..600`), which every point repeats; on a linear range a key
+// that counts whole things (`workers`, `replicas`, ...) must get a whole number at every point.
+// Errors start with "--param: ".
 // C++23 std::expected<T, E>: the parsed value or the message, replacing an exception or an
 // out-parameter plus bool; the caller must look before it uses the value.
 [[nodiscard]] std::expected<SweepParam, std::string> parse_param(std::string_view spec);

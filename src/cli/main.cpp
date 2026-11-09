@@ -656,13 +656,14 @@ CLI::App* add_sweep_command(CLI::App& app, SweepArgs& args, std::filesystem::pat
   add_file_argument(*sweep, file);
   sweep
       ->add_option("--param", args.param,
-                   "the swept key and its range, <dot.path>=<from>..<to>:<n>, "
-                   "e.g. nodes.users.rate.base=100/s..900/s:3")
+                   "the swept key and its range, <dot.path>=<from>..<to>:<n>[:log] "
+                   "(:log: geometric), e.g. nodes.users.rate.base=100/s..900/s:3")
       ->required();
   sweep
       ->add_option("--metric", args.metrics,
                    "a column: <client>.<op>.mean|p50|p95|p99|attempts|answered, "
-                   "<node>.mean_rho|peak_rho|drop_rate, <queue>.lag, <pool>.dead_lettered, "
+                   "<node>.mean_rho|peak_rho|drop_rate|reject_rate, <queue>.lag, "
+                   "<pool>.dead_lettered, "
                    "<fanout>.deduplicated or <gateway>.connections (repeatable)")
       ->required();
   sweep->add_option("--jobs", args.jobs, "worker threads (default: the machine's hardware threads)")
