@@ -112,6 +112,10 @@ add_test(NAME "simsys curve applies a traffic_spike fault exactly as a spikes en
          COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
                  -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-curve-faults
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/curve_faults.cmake)
+add_test(NAME "simsys curve refuses a seed without noise, which would change nothing"
+         COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
+                 -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-curve-seed
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/curve_seed.cmake)
 
 # simsys run --replications, run as a process: the median and the 10-90 % band across seeds, the
 # refusals, the exit code of the median run, and that --jobs cannot show in the output. One scratch
