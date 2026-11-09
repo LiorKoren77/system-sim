@@ -56,6 +56,7 @@ enum class MetricKind {
   mean_rho,        // `<node>.mean_rho`: the node's time-averaged utilization, a ratio
   peak_rho,        // `<node>.peak_rho`: its highest utilization of any observed step, a ratio
   drop_rate,       // `<node>.drop_rate`: the share of the work sent to it that it dropped, a ratio
+  reject_rate,     // `<node>.reject_rate`: the share of it that its behaviour refused, a ratio
   peak_queue_lag,  // `<queue>.lag`: a message queue's peak lag after warmup, seconds
   attempts_rate,   // `<client>.<op>.attempts`: what the client sent, retries included, per second
   answered_rate,   // `<client>.<op>.answered`: the part of its requests answered, per second
