@@ -194,8 +194,12 @@ its `peak_backlog` and `dropped` in its own unit. `run`'s and `estimate`'s table
 under the node table listing those nodes and their unit, and only when some node needs it:
 
 ```
-units: url_db counts capacity units (write cost 5); cdn_us, transcoded_store count MB
+units (peak_backlog and drops are not requests here): url_db capacity units (delete, insert, update, write cost 5)
+units (peak_backlog and drops are not requests here): message_store replica-requests (N 3); presence replica-requests (N 2); user_db capacity units (delete, insert, update, write cost 5)
 ```
+
+(as built: url-shortener's line, then chat-system's; ten of the fourteen scenarios get one, the
+two tutorials, the rate-limiter and unique-id labs none).
 
 `explain` already prints `units/s` and `MB/s` in its checks (phase 2c), so it does not change. The
 comments in `report.cppm` that say "requests" where the value is capacity units are corrected.
