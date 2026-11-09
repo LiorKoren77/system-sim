@@ -751,17 +751,23 @@ constexpr std::string_view node_title = "nodes";
 // it prices costs 1. The ops priced are a database's write ops (their default cost of 5, spec §18
 // entry 7) and every op of a stated `cost` map (spec §17 entry 4), each priced as the engine
 // prices it (defaults::op_cost).
-[[nodiscard]] std::string priced_ops(const model::NodeSpec& spec) {
+[[nodiscard]] std::string priced_ops(const model::NodeSpec& spec,
+                                     double unit_per_request = 1.0) {
+  // C++20 std::views::keys: the keys of a map as a lazy view, no copy of its pairs; C++23
+  // std::ranges::to<std::vector>(): collects a view into a container, replacing a reserve +
+  // push_back loop.
   std::vector<std::string> ops{spec.cost | std::views::keys | std::ranges::to<std::vector>()};
   if (spec.type == model::NodeType::sql_db) {
     std::ranges::copy(model::write_ops_of(spec), std::back_inserter(ops));
   }
+  // C++20 std::ranges::unique: returns the tail to erase as a subrange (unpacked by a structured
+  // binding), where std::unique returned only its first iterator.
   std::ranges::sort(ops);
   const auto [first_repeat, end] = std::ranges::unique(ops);
   ops.erase(first_repeat, end);
   std::map<double, std::vector<std::string>> by_cost;
   for (const auto& op : ops) {
-    const double cost = defaults::op_cost(spec, op);
+    const double cost = defaults::op_cost(spec, op) / unit_per_request;
     if (cost != 1.0) by_cost[cost].push_back(op);
   }
   std::vector<std::string> groups;
@@ -779,7 +785,12 @@ constexpr std::string_view node_title = "nodes";
   if (spec.type == model::NodeType::client) return std::nullopt;
   if (defaults::is_byte_sized(spec)) return "MB";
   if (spec.type == model::NodeType::kv_cluster) {
-    return "replica-requests (N " + std::to_string(model::kv_replication(spec)) + ")";
+    // Every request is N replica-requests; a stated `cost` prices each of them on top (op_cost is
+    // the product), so the line says both: "replica-requests (N 3; put cost 4 each)".
+    const int n = model::kv_replication(spec);
+    const auto priced = priced_ops(spec, static_cast<double>(n));
+    const std::string each = priced.empty() ? "" : "; " + priced + " each";
+    return "replica-requests (N " + std::to_string(n) + each + ")";
   }
   const auto priced = priced_ops(spec);
   if (priced.empty()) return std::nullopt;
@@ -813,6 +824,11 @@ constexpr std::string_view node_title = "nodes";
                               {"dropped"},
                               {"rejected"},
                               {"red_s"}}};
+  if (summary.is_estimate()) {  // a steady state: rates, and no red time (queue_cells)
+    parts.header[4] = Cell{"dropped/s"};
+    parts.header[5] = Cell{"rejected/s"};
+    parts.header.erase(parts.header.begin() + 6);
+  }
   const auto links = summary.links();
   std::size_t next = 0;  // links() follows Graph::links(), pipes only
   for (const auto& link : summary.graph().links()) {
@@ -932,12 +948,14 @@ constexpr std::string_view op_title =
 // Which window decided an SLO with `over`: `(worst 10m from 00:20)`, its length as `over` reads
 // and its start on the run's clock (window_clock). A last window cut short by the end of the run
 // is labelled with the length it had: `(worst 28m from 14:02, the run's short last window)`.
-// Under `estimate`, which measured no window: `(at 00:00 only: run checks each 1h)`. Empty
+// Under `estimate`, which measured no window: `(at 00:00 only: run checks each 1h)`, at the instant
+// it settled at (`--at`). Empty
 // without `over`, or when every window was skipped.
 [[nodiscard]] std::string window_text(const SloResult& r) {
   if (!r.slo.over) return {};
   if (r.at_one_instant) {
-    return "(at 00:00 only: run checks each " + describe_duration(*r.slo.over) + ")";
+    return "(at " + window_clock(r.instant) + " only: run checks each " +
+           describe_duration(*r.slo.over) + ")";
   }
   if (!r.window_start || !r.window_length) return {};
   const bool cut_short = r.window_length->count() < r.slo.over->count();
@@ -1310,7 +1328,8 @@ constexpr std::string_view op_title =
           json_field("dropped", json_total(n, n.total_dropped)),
           json_field("dropped_per_s", json_number(n.mean_dropped_per_s)),
           // a worker pool's (0 without retries); null for every other node
-          json_field("dead_lettered", json_optional_number(n.total_dead_lettered)),
+          json_field("dead_lettered", n.steady_state ? "null"
+                                                     : json_optional_number(n.total_dead_lettered)),
           json_field("dead_lettered_per_s", json_optional_number(n.mean_dead_lettered_per_s)),
           json_field("rejected", json_total(n, n.total_rejected)),
           json_field("rejected_per_s", json_number(n.mean_rejected_per_s)),
@@ -1357,7 +1376,9 @@ constexpr std::string_view op_title =
                           json_field("zone", json_string(zone_name(link.zone))),
                           json_field("peak_rho", json_number(link.queue.peak_rho)),
                           json_field("peak_backlog", json_number(link.queue.peak_backlog)),
-                          json_field("red_s", json_number(link.queue.red_time_s))};
+                          json_field("red_s", link.queue.steady_state
+                                                  ? "null"
+                                                  : json_number(link.queue.red_time_s))};
   return json_object(fields);
 }
 
@@ -1861,7 +1882,7 @@ template <class Build>
 [[nodiscard]] std::string banded_tables(std::span<const Summary> runs, bool color) {
   const auto nodes = [&](const Summary& run) { return node_parts(run, color); };
   const auto links = [&](const Summary& run) { return link_parts(run, color); };
-  return table_text(node_title, banded_over(runs, nodes)) +
+  return table_text(node_title, banded_over(runs, nodes)) + units_note(runs.front()) +
          table_text_if_any(link_title, banded_over(runs, links)) +
          table_text_if_any(replication_title, banded_over(runs, replication_parts)) +
          table_text(op_title, banded_over(runs, op_parts));
@@ -2514,6 +2535,7 @@ SloResult Summary::windowed_verdict(const model::SloSpec& slo) const {
   if (estimate_) {
     SloResult result = evaluate_slo(*this, nodes(), ops(), slo);
     result.at_one_instant = true;
+    result.instant = estimate_at_;
     return result;
   }
   const auto found = std::ranges::find_if(
@@ -2581,6 +2603,8 @@ std::vector<LinkSummary> Summary::links() const {
                              .total_dropped = without_residue(t.queue.dropped, capacity),
                              .total_rejected = 0.0,
                              .red_time_s = t.queue.red_time_s,
+                             .mean_dropped_per_s = per_s(t.queue.dropped),
+                             .steady_state = estimate_,
                              .unavailable = t.queue.unavailable},
         .demand_per_s = per_s(t.queue.demand),
         .drain_per_s = per_s(t.drained),

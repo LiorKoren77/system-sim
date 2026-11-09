@@ -177,39 +177,60 @@ SLOs, so no point can fail one`; `std::unreachable` (C++23) closes the two switc
 
 **Files:** `src/engine/engine.cppm` (`estimate(SimTime at = SimTime{})`: `settle(at)`), `src/cli/main.cpp` (`--at`, parsed with the fault `at` parser the loader uses for `at:`; if that parser lives only in `simsys.config`'s `detail`, the CLI calls an exported `config::parse_instant` added for it), `src/report/report.cppm`, `report.cpp` (`of_estimate(g, record, at)`, the table's first line, JSON `at_s`); tests in `tests/theory/test_core.cpp`, `tests/unit/test_report.cpp`, a `tests/cli` check.
 
-- [ ] Tests (theory; probe: client `base: 1k/s`, `wave: {shape: sine, period: 24h, amplitude: 0.5, peak_at: 12:00}`, into a service of **2k/s**, latency **0.5 ms**, `concurrency: 1`, zero-latency link):
+- [x] Tests (theory; probe: client `base: 1k/s`, `wave: {shape: sine, period: 24h, amplitude: 0.5, peak_at: 12:00}`, into a service of **2k/s**, latency **0.5 ms**, `concurrency: 1`, zero-latency link):
   - `estimate(12:00)`: offered **1.5k/s** (1 + 0.5 cos 0), rho **0.75**, the service's mean wait **0.5 ms × 0.75 / 0.25 = 1.5 ms** (M/M/1, `Wq = s ρ / (1 − ρ)`, Poisson arrivals and exponential service, the defaults' SCVs of 1), its sojourn **2 ms**;
   - `estimate(00:00)`: offered **500/s** (1 + 0.5 cos π), rho **0.25**, wait **0.5 × 0.25 / 0.75 = 0.1667 ms**; byte-identical to `estimate()` without `at` (table and JSON);
   - a `spikes: [{at: 12:00, for: 10m, factor: 2}]` added: `estimate(12:05)` offers 1k × (1 + 0.5 cos(2π × 5/1440)) × 2 (the cosine is **0.999762**, so **2999.76/s** and rho **1.49988**: the overload's dropped rate **999.76/s**, in JSON's `dropped_per_s` after Task 7; until Task 7 the test reads the record);
   - a fault active at `at` is still left out (`node_down` on the service at 12:00 for 1h: `estimate(12:30)` equals the same file without the fault).
-- [ ] Tests (CLI): `--at 25:00` on a 24h run → exit 1, `--at: 25:00 must fall inside the run (24h)`; `--at 90m` accepted; JSON `"at_s": 43200` at `--at 12:00`, `0` without; the table's first line `estimate at t = 12:00: the curve without noise; explain's checks use the peak`.
-- [ ] Red commit; implementation; green commit `estimate: the steady state at any instant of the day`.
+- [x] Tests (CLI): `--at 25:00` on a 24h run → exit 1, `--at: 25:00 must fall inside the run (24h)`; `--at 90m` accepted; JSON `"at_s": 43200` at `--at 12:00`, `0` without; the table's first line `estimate at t = 12:00: the curve without noise; explain's checks use the peak`.
+- [x] Red commit; implementation; green commit `estimate: the steady state at any instant of the day`.
 
 ### Task 7: `estimate`'s shape (M12, per-second drops, `queue_lag_unbounded`)
 
 **Files:** `src/report/report.cpp` (`render_json`'s node object, the estimate table's columns and summary line, the replications JSON's per-seed nodes), `src/report/report.cppm` (comments); tests in `tests/unit/test_report.cpp`, and every existing test that pins an estimate table or an estimate JSON node object (found with `grep -rn 'of_estimate\|"estimate"' tests`; each is updated in the red commit with the new shape, so the red reason is visible per test).
 
-- [ ] Tests:
+- [x] Tests:
   - probe: client **1.5k/s** into a service of **1k/s**, `queue_limit: 100`, step 100 ms. `estimate --report json`: `dropped_per_s` **500** (the full room drains 1k/s, the excess is dropped), `dropped`, `rejected` and `red_s` **null**. `run --report json` over 60 s with warmup 10 s: `dropped_per_s` **500** within 1e-9 relative once the room filled before warmup (100 / 500 = 0.2 s), `dropped` **25000** (500 × 50 s), unchanged keys keep their values;
   - `rejected_per_s` on the rate-limiter probe of Task 2: **500** in both commands;
   - `queue_lag_unbounded`: web-crawler's `frontier` `true` in `estimate` (its lag is unbounded there: phase 3 review, decision 2) with `peak_queue_lag_s` `null`; `false` in `run`; `null` on a service; `false` on a message queue that keeps up (youtube's `transcode_q` in `estimate`);
   - the estimate table: the summary line `scenario hello  steady state at 00:00  drop rate 0%`, the columns `dropped/s` and `rejected/s`, no `red_s`; `run`'s table byte-identical to today on hello and chain;
   - the replications JSON's per-seed node objects carry `dropped_per_s`, `rejected_per_s`, `queue_lag_unbounded`.
-- [ ] Red commit; implementation; green commit `report: estimate reports rates, and an unbounded lag says so`.
+- [x] Red commit; implementation; green commit `report: estimate reports rates, and an unbounded lag says so`.
 
 ### Task 8: unit labels (M7)
 
 **Files:** `src/report/report.cpp` (`unit_note`: the nodes whose `dropped` and `peak_backlog` are not requests, from the graph: a stated `cost` ≠ 1 on some op, a `sql_db` with a write op at the default cost 5, a `kv_cluster`, a byte-sized node), `src/report/report.cppm` (the comments that say "requests" where the value is capacity units); tests in `tests/unit/test_report.cpp`, `tests/scenario/test_scenarios.cpp`.
 
-- [ ] Tests:
+- [x] Tests:
   - url-shortener's `run` table contains `units: url_db counts capacity units (write cost 5)` once, under the node table (the exact list of nodes is pinned from the binary in the red commit, *measured*, and its derivation from the YAML written beside it);
   - youtube's contains `count MB` naming its byte-sized nodes (the CDNs and blob stores);
   - kv-store's names the cluster: `store counts replica-requests (N 3)`;
   - hello's and chain's tables have no `units:` line and are byte-identical to today;
   - the line is the same in `estimate`'s table.
-- [ ] Red commit; implementation; green commit `report: say which nodes count capacity units or megabytes`.
+- [x] Red commit; implementation; green commit `report: say which nodes count capacity units or megabytes`.
 
 **Checkpoint C.** Stop; report, and the size of Batch D.
+
+Done: Task 6 red `b7f31ae`, green `8a9bc0c`; Task 7 red `3bb5556`, green `dfed9a6`; Task 8 red
+`d2216c0`, green `6d139e0` (1737 tests). As built: `--at` is refused in `curve`'s words (`--at
+'30h' must fall inside the run (24h)`; at < duration, a fault's rule, not the plan's closed
+interval); the CLI parses it with `core::parse_time_point` (no new config export); the header reads
+`estimate at t = 13h (13:00)`; the run JSON's per-second figure is 499.99999999999994 (a sum of
+0.1 s steps), so its test pins the key and the NodeSummary test the value; the steady state is a
+`NodeSummary::steady_state` flag, not a writer argument, since the JSON writers run under
+`std::views::transform` (fifth defect); the units line reads `units (peak_backlog and drops are not
+requests here): ...`, cost groups joined by `and`.
+
+**Review of batch C at `6d139e0`** (code-review skill, medium): 1. the windowed-SLO note still said
+`at 00:00` under `--at`; 2. `dead_lettered` was still a one-step total under `estimate`; 3. the
+links table and JSON kept one step's totals and red time; 4, 5. first-use comments missing in
+`priced_ops` (`views::keys`, `ranges::to`, `ranges::unique`) and late in `estimate_instant`
+(`std::unexpected`, `std::format`); 6. no units line under `run --replications`' banded tables;
+7. the schema's key table (reviewed before the docs task updated it); 8. the header repeated an
+instant the clock cannot show (`500ms (500ms)`); 9. a kv_cluster's stated `cost` was missing from
+its units line. Decisions: all fixed but 7 (already done in Task 9's schema edit); the link pipes
+get the steady-state flag and the same `dropped/s` header; the kv line reads `replica-requests (N
+3; op cost 4 each)`.
 
 ---
 
