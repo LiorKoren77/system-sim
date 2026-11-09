@@ -109,9 +109,11 @@ nine tenths of the points above 100k/s.
 gets one column per key, then the metrics; the CSV the same header. Refused:
 
 - a third `--param`: `--param: at most two keys (a grid of two); script a third`;
-- the same key twice, as written or through a YAML anchor that both paths reach:
-  `--param: nodes.api.capacity is given twice`;
-- a grid of more than 10,000 points: `--param: 200 × 100 = 20000 points: at most 10000`.
+- the same key twice: `--param: nodes.api.capacity is given twice`; two paths that reach one value
+  through a YAML anchor and its alias (yaml-cpp loads both as one node):
+  `<file>: error: --param: nodes.b.capacity reaches the same value as nodes.a.capacity (a YAML
+  anchor and its alias)`;
+- a grid of more than 10,000 points: `--param: 200 x 100 = 20000 points: at most 10000`.
 
 Every point is loaded with both overrides applied (`config::load(path, overrides)` already takes a
 span of them) and built before any runs. Errors name the point by both values:
