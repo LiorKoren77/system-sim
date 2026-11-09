@@ -924,3 +924,69 @@ TEST_CASE("a queue lag below a microsecond prints as the report prints it") {
   const auto table = split(render_sweep(param, metrics, rows, SweepFormat::table), '\n');
   REQUIRE(table.back().ends_with("<1us"));
 }
+
+// ---- <node>.reject_rate (phase 4a Task 2; spec 4a §4.1) ----------------------------------------
+
+namespace {
+// u offers 1.5k/s to a token bucket of 1k/s with a one-token burst, in front of a service with
+// room to spare. Past the first step the bucket holds no burst, so it passes its refill, 1k/s,
+// and refuses the other 500/s: a reject rate of 500 / 1500 = 1/3 of what it is sent. `api_rate`
+// is swept so that a test can also see a node that refuses nothing.
+std::string limited_path() {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("simsys-sweep-limited-" + std::to_string(getpid()) + ".yaml");
+  std::ofstream{path} << "version: 1\nname: limited\nduration: 10s\nstep: 100ms\nwarmup: 1s\n"
+                         "nodes:\n"
+                         "  u: {type: client, rate: {base: 1.5k/s}, ops: {call: 1.0}}\n"
+                         "  limiter: {type: rate_limiter, algorithm: token_bucket, limit: 1k/s, "
+                         "burst: 1}\n"
+                         "  api: {type: service, capacity: 10k/s, latency: 1ms}\n"
+                         "links:\n"
+                         "  - {from: u, to: limiter, dir: inout}\n"
+                         "  - {from: limiter, to: api, dir: inout}\n";
+  return path.string();
+}
+}  // namespace
+
+TEST_CASE("a node's reject_rate is a metric") {
+  const auto metric = parse_metric("limiter.reject_rate");
+  INFO((metric ? "" : metric.error()));
+  REQUIRE(metric.has_value());
+  REQUIRE(metric->kind == simsys::sweep::MetricKind::reject_rate);
+  REQUIRE(metric->node == "limiter");
+  REQUIRE(metric->op.empty());
+}
+
+// The sweep reads the number `run --report json` prints as the node's reject_rate: the token
+// bucket past its burst refuses (1.5k − 1k) / 1.5k = 1/3 of what it is sent, at every rate of the
+// service behind it, which refuses nothing.
+TEST_CASE("sweeping past a token bucket reads its reject rate: a third refused, none behind it") {
+  const auto path = limited_path();
+  const std::vector<SweepMetric> metrics{*parse_metric("limiter.reject_rate"),
+                                         *parse_metric("api.reject_rate")};
+  const SweepParam param{.path = "nodes.api.capacity", .values = {"5k/s", "10k/s"}};
+  const auto rows = run_sweep(path, param, metrics, 1);
+  std::filesystem::remove(path);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  for (const auto& row : *rows) {
+    CAPTURE(row.value);
+    REQUIRE_THAT(row.metrics[0], WithinRel(1.0 / 3.0, 1e-6));
+    REQUIRE(row.metrics[1] == 0.0);
+  }
+}
+
+TEST_CASE("a client has no reject rate to sweep, as it has no drop rate") {
+  const std::vector<SweepMetric> metrics{*parse_metric("users.reject_rate")};
+  const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1);
+  REQUIRE_FALSE(rows.has_value());
+  REQUIRE(rows.error() == std::string{hello_path} +
+                              ": error: --metric: users.reject_rate: 'users' is a client, which "
+                              "serves nothing, so it has no reject rate");
+}
+
+TEST_CASE("the unknown-metric message names reject_rate among the node metrics") {
+  const auto metric = parse_metric("api.bogus");
+  REQUIRE_FALSE(metric.has_value());
+  REQUIRE(metric.error().contains("<node>.mean_rho|peak_rho|drop_rate|reject_rate"));
+}
