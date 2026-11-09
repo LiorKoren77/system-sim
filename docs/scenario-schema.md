@@ -23,8 +23,8 @@ from what that design first said, this file and spec §20 have the rule as built
 New in v1.6 (phase 4a; design `docs/superpowers/specs/2026-11-09-phase4a-sweep-reporting-design.md`,
 rules as built in spec §21):
 
-- **JSON, may break a reader:** under `estimate --report json` a node's `dropped`, `rejected` and
-  `red_s` are `null` (a steady state lasts no time, so it has no totals; they were one step's
+- **JSON, may break a reader:** under `estimate --report json` a node's `dropped`, `rejected`,
+  `red_s` and (a worker pool's) `dead_lettered` are `null`, and so is a bandwidth link's `red_s` (a steady state lasts no time, so it has no totals; they were one step's
   worth); the new `dropped_per_s` and `rejected_per_s` (in `run` too) carry the rates. **JSON,
   added:** `queue_lag_unbounded` on every node (`true` where a lag grows for good, `false` on a
   queue whose lag is finite, `null` elsewhere: `peak_queue_lag_s` alone is `null` in the first and
@@ -118,7 +118,8 @@ New in v1.4:
   read at q and capped at the timeout, and a latency SLO whose quantile timed out fails;
 - an SLO's [`over`](#slo): the SLO is checked per window and the worst window decides
   (`(worst 1h from 13:02)`, JSON's `window_start_s`);
-- [`simsys sweep`](#command-line-simsys-sweep-phase-2c): one scenario over a range of one key, the
+- [`simsys sweep`](#command-line-simsys-sweep-phase-2c): one scenario over a range of one key (since
+  v1.6, or a grid of two), the
   points run in parallel;
 - the duration unit `d` (a day), the [step rule of thumb](#top-level) in the `step` row, and the
   runnable set: the six of v1.3 plus `book/youtube`, `book/news-feed`,
@@ -1772,8 +1773,9 @@ duration from the start); a last window cut short by the end of the run is named
 it had (url-shortener, `run --duration 870m`: `(worst 28m from 14:02, the run's short last
 window)`). JSON gives the start as
 `window_start_s` (seconds from the start of the run; `null` when skipped), a key only an SLO with
-`over` has. `estimate` measures no window (one steady state at t = 0): it checks an SLO with
-`over` on that state and says so, `(at 00:00 only: run checks each 1h)`, with no `window_start_s`.
+`over` has. `estimate` measures no window (one steady state, at t = 0 or at `--at`): it checks an
+SLO with `over` on that state and says so, naming the instant, `(at 00:00 only: run checks each
+1h)` (`(at 13:00 only: ...)` under `--at 13:00`), with no `window_start_s`.
 `over` must be a whole number of steps, at least one, and at most duration − warmup: `slo: over
 must be at least one step (50ms < step 100ms)`, `slo: over must be a whole number of steps
 (1500ms, step 1s)` (windows of two steps and of one in turn otherwise), `slo: over must fit in the
@@ -1903,7 +1905,7 @@ steady state, which stands for no stretch of time: its node `dropped`, `rejected
 | `nodes[]` | `peak_backlog` | the most work waiting at the end of any step: requests, cost units at a node with a `cost`, MB at a byte-sized node |
 | `nodes[]` | `dropped`, `rejected` | **totals** over the observed steps, in the same units as `peak_backlog` (`rejected` in requests); `null` under `estimate` (phase 4a) |
 | `nodes[]` | `dropped_per_s`, `rejected_per_s` | the totals per observed second, `run` and `estimate` alike (phase 4a): a run's mean rates, `estimate`'s steady ones |
-| `nodes[]` | `dead_lettered`, `dead_lettered_per_s` | jobs: the **total** over the observed steps and its mean rate per second (phase 3: a `worker_pool`'s jobs whose last retry failed; 0 on a pool without `retries`, `null` on every other node) |
+| `nodes[]` | `dead_lettered`, `dead_lettered_per_s` | jobs: the **total** over the observed steps and its mean rate per second (phase 3: a `worker_pool`'s jobs whose last retry failed; 0 on a pool without `retries`, `null` on every other node); `dead_lettered` is `null` under `estimate`, phase 4a) |
 | `nodes[]` | `deduplicated_per_s` | notifications per second, the mean over the observed steps (phase 3: a `notification_fanout`'s duplicates, drain × `dedup`; 0 with `dedup: 0`, `null` on every other node) |
 | `nodes[]` | `red_s`, `unavailable` | seconds spent red (`null` under `estimate`, phase 4a); `true` when the node's latency was infinite in some step |
 | `nodes[]` | `staleness_s`, `replication_dropped_per_s`, `committed_writes_per_s` | seconds; writes per second per replica; writes per second per shard (a `sql_db` only, else `null`) |
@@ -1913,7 +1915,7 @@ steady state, which stands for no stretch of time: its node `dropped`, `rejected
 | `links[]` | `name` | `from->to` as written |
 | `links[]` | `demand_per_s`, `drain_per_s`, `dropped_per_s` | MB per second, **time-averaged rates** |
 | `links[]` | `backlog`, `peak_backlog` | MB, time-averaged and highest |
-| `links[]` | `rho`, `peak_rho`, `latency_s`, `zone`, `red_s` | busy fraction, mean and highest; seconds (a request's wait plus its time on the wire); the worst zone of any step; seconds red |
+| `links[]` | `rho`, `peak_rho`, `latency_s`, `zone`, `red_s` | busy fraction, mean and highest; seconds (a request's wait plus its time on the wire); the worst zone of any step; seconds red (`red_s` `null` under `estimate`, phase 4a) |
 | `ops[]` | `client`, `op`, `offered_per_s`, `attempts_per_s`, `answered_per_s`, `timed_out_per_s`, `timed_out_attempts_per_s` | requests per second, time-averaged; `attempts_per_s` (phase 3) is what the client sent, the offered rate plus its [`retries`](#node-types), equal to `offered_per_s` without them; `timed_out_per_s` counts the requests given up on for good (their last attempt timed out), `timed_out_attempts_per_s` (phase 3) every attempt that timed out, the share a percentile reads (equal to `timed_out_per_s` without retries) |
 | `ops[]` | `mean_s`, `p50_s`, `p95_s`, `p99_s` | seconds; `null` when nothing was answered (in time) or the path never answers |
 | `slo[]` | `metric`, `node`, `op`, `status`, `note` | as written (`null` when absent); `pass`, `fail` or `skipped`; `null` or the reason |
@@ -2351,8 +2353,8 @@ in its worst hour, 13:02–14:02 (an hour's mean on a rising curve, beside the v
 
 **The table of a steady state** (phase 4a): the summary line says `steady state at 13:00` instead
 of `1 steps observed`, the node table shows `dropped/s` and `rejected/s` (the steady rates) in
-place of the totals, and no `red_s` (a steady state lasts no time to be red in). `run`'s table is
-unchanged.
+place of the totals, and no `red_s` (a steady state lasts no time to be red in); so does the links
+table of a scenario with bandwidth pipes. `run`'s tables are unchanged.
 
 ## Command line: `simsys run --replications` (phase 3)
 
@@ -2489,8 +2491,9 @@ a design review asks after `explain`: *how much of this do I need?*
 
 | option | rule | refused with |
 |---|---|---|
-| `--param` | required. `<dot.path>=<from>..<to>:<n>`: the key is a dot path through **maps only** (`nodes.users.rate.base`, `nodes.transcoders.workers`), which must exist in the file and hold a single value; a path through a list (`links.0.latency`) is refused, since list entries have no names, and a node whose id contains a dot cannot be swept or measured (the dot splits the path). The range gives `n` points, at least 2 and at most 10,000, evenly spaced from `from` to `to`, both included; both ends are numbers (each starts with a digit or `-`, so a third dot is an error) with the same unit text (`100/s..900/s`, `1ms..5ms`, `400..600`; `100/s..1k/s` is refused, not converted): `100/s..900/s:3` is 100/s, 500/s and 900/s. A key the loader reads as a whole number (a node's `workers`, `replicas`, `partitions`, `keys`, ..., an `advanced` block's `concurrency`) must get a whole number at every point, whole as written: the number before a `k`, `M` or `G` must be whole, as in a [count](#values) (`keys=1k..2k:3` gives 1.5k and is refused although 1500 keys are whole; write `1000..2000:3`) | (each after `<file>: error: `, as every refusal of an option) `--param: nodes.users.rate.bse: no such key in the scenario`; `--param: links.0.latency: '0' would index a list; a dot path goes through maps only (a list entry has no name)`; `--param: workers must be whole (400..600:4 gives 466.67)`; `--param: 1/s..2/s:20000: at most 10000 points`; `--param: 100/s..1k/s:2: both ends must be the same kind of value in the same unit (100/s and 1k/s)`; `--param: '.5ms' is not a number followed by a unit` (for `1ms...5ms`) |
+| `--param` | required, once or twice (twice: a grid, below). `<dot.path>=<from>..<to>:<n>[:log]` (`:log`: geometric points, below; the rules here are the linear range's): the key is a dot path through **maps only** (`nodes.users.rate.base`, `nodes.transcoders.workers`), which must exist in the file and hold a single value; a path through a list (`links.0.latency`) is refused, since list entries have no names, and a node whose id contains a dot cannot be swept or measured (the dot splits the path). The range gives `n` points, at least 2 and at most 10,000, evenly spaced from `from` to `to`, both included; both ends are numbers (each starts with a digit or `-`, so a third dot is an error) with the same unit text (`100/s..900/s`, `1ms..5ms`, `400..600`; `100/s..1k/s` is refused, not converted): `100/s..900/s:3` is 100/s, 500/s and 900/s. A key the loader reads as a whole number (a node's `workers`, `replicas`, `partitions`, `keys`, ..., an `advanced` block's `concurrency`) must get a whole number at every point, whole as written: the number before a `k`, `M` or `G` must be whole, as in a [count](#values) (`keys=1k..2k:3` gives 1.5k and is refused although 1500 keys are whole; write `1000..2000:3`) | (each after `<file>: error: `, as every refusal of an option) `--param: nodes.users.rate.bse: no such key in the scenario`; `--param: links.0.latency: '0' would index a list; a dot path goes through maps only (a list entry has no name)`; `--param: workers must be whole (400..600:4 gives 466.67)`; `--param: 1/s..2/s:20000: at most 10000 points`; `--param: 100/s..1k/s:2: both ends must be the same kind of value in the same unit (100/s and 1k/s)`; `--param: '.5ms' is not a number followed by a unit` (for `1ms...5ms`) |
 | `--metric` | required, repeatable (`--metric a --metric b`, or several names after one: `--metric a b`): `<client>.<op>.mean` (the op's mean latency as the client sees it, over the answered requests), `<client>.<op>.p50`, `.p95` or `.p99` (the op table's estimated percentiles; where more than 1 − q of the delivered requests timed out, the timeout itself, printed `>1s` in the table as in `run`'s), `<client>.<op>.attempts` (what the client sent per second, its [`retries`](#node-types) included: JSON's `attempts_per_s`, printed `1.75k/s`) or `.answered` (the part answered per second: `answered_per_s`), `<node>.mean_rho` (a server's time-averaged utilization), `<node>.peak_rho` (its highest utilization of any observed step), `<node>.drop_rate` (the share of the work sent to it that it dropped, the node's own `drop_rate`), `<node>.reject_rate` (phase 4a: the share its behaviour refused, a rate limiter's 429s or a gateway's refused connects, the node's own `reject_rate`), `<queue>.lag` (a message queue's or a frontier's peak lag after warmup, what the `queue_lag` SLO observes), `<pool>.dead_lettered` (phase 3: a worker pool's dead letters per second, JSON's `dead_lettered_per_s`, printed as a rate: `62.5/s`), `<fanout>.deduplicated` (phase 3: a [`notification_fanout`](#notification_fanout)'s duplicates per second, JSON's `deduplicated_per_s`, printed as a rate: `20/s`) or `<gateway>.connections` (phase 3: a [`ws_gateway`](#ws_gateway)'s open connections at the **end** of the run, the node table's and JSON's `connections`, printed as a count: `2k`; the end, not JSON's `connections_peak`, so that one name is one number: under a steady connect rate the level only rises and the two agree). They are the numbers `run --report json` prints, after warmup. Each name is checked against the file before any point runs | after `<file>: error: `, a name outside the grammar, `--metric: bogus: not a metric (write <client>.<op>.mean\|p50\|p95\|p99\|attempts\|answered, <node>.mean_rho\|peak_rho\|drop_rate\|reject_rate, <queue>.lag, <pool>.dead_lettered, <fanout>.deduplicated or <gateway>.connections)`, or one that does not fit the file: `--metric: api.lag: 'api' has type service, not message_queue or frontier: only a message queue or a frontier has a lag`; `--metric: api.connections: 'api' has type service, not ws_gateway: only a ws_gateway has connections`; `--metric: api.dead_lettered: 'api' has type service, not worker_pool: only a worker pool has dead letters`; `--metric: api.deduplicated: 'api' has type service, not notification_fanout: only a notification fanout has duplicates`; `--metric: users.drop_rate: 'users' is a client, which serves nothing, so it has no drop rate` (and `... so it has no reject rate`); `--metric: nope.mean_rho: the scenario has no node 'nope'` |
+| `--slos` | a flag (phase 4a): after the metrics, a verdict column per SLO of the scenario and `run`'s exit code per point (below); the sweep's own exit code does not change | |
 | `--jobs` | worker threads, 1 to 1024; default: the machine's hardware threads | CLI11's range message |
 | `--format` | `table` (latencies and lags as the report's tables print them: `1.61ms`, `<1us`, `>1s`; ratios to three significant digits) or `csv` (seconds and ratios, each number the shortest text that reads back to the same double) | |
 
@@ -2537,7 +2540,7 @@ node and op (`p99_latency:users.ping`, `utilization:url_db`, `drop_rate`; a seco
 heading `...#2`), then `exit`. Each point is judged exactly as `simsys run` judges the file with
 the point's value written in (`report::evaluate_slos`, windows and the timeout rule included):
 `PASS`, `FAIL` or `-` (skipped) in the table, `pass`, `fail` or `skipped` in the CSV, and `exit`
-the point's `run` exit code (0 every SLO passed, 2 one failed). A scenario without SLOs gets only
+the point's `run` exit code (0 every SLO passed, 2 one failed, 1 the run observed no step). A scenario without SLOs gets only
 the `exit` column and a line on stderr, `the scenario has no SLOs, so no point can fail one`.
 
 **Parallel, and the same bytes for any `--jobs`.** The points run on `std::jthread` workers that

@@ -141,6 +141,6 @@ p99 by 2 %.)
   500                                0.142             1            63.8ms             PASS                      FAIL     2
   ```
 
-  The bucket refuses the same share at every size, 14.2 %: the spikes' excess over the 1k/s
-  refill is refused whatever the bucket holds, so `burst` buys no throughput, only a bigger first
+  The bucket refuses about the same share at every size, 14.2–14.3 %: the spikes' excess over the
+  1k/s refill is refused whatever the bucket holds, so `burst` buys no throughput, only a bigger first
   moment of each spike in the api's queue.

@@ -1290,5 +1290,7 @@ a scenario author meets are in `docs/scenario-schema.md` (v1.6).
    (a byte-sized node), priced by `defaults::op_cost` so it cannot disagree with the engine; ten of
    the fourteen scenarios get it.
 9. **What 4a leaves.** Sweeps over seeds, replications per point and the diurnal table (M10) go to
-   4b with the rest of the randomness; three keys, list values and adaptive search stay out; the
-   links table under `estimate` still shows one step's totals (no link has a steady-state flag yet).
+   4b with the rest of the randomness; three keys, list values and adaptive search stay out.
+   (Corrected by the batch C review: a bandwidth link's pipe carries the steady-state flag too, so
+   `estimate`'s links table shows `dropped/s` and no `red_s`, its JSON `red_s` is `null`, and a
+   worker pool's `dead_lettered` total is `null` there as well.)
