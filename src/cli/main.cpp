@@ -131,11 +131,36 @@ int run_explain(const std::filesystem::path& file) {
 }
 
 // What `estimate` evaluates, stated above its table: the steady state of the curve's value
-// at t = 0 (00:00), noise left out (Simulation::estimate). A daily wave's trough or peak
-// is not that value, so the line also says where the peak IS checked: explain's static
-// load check. Table only: a line of prose before the JSON would break its parsers.
-constexpr std::string_view estimate_header =
-    "estimate at t = 0 (00:00): the curve without noise; explain's checks use the peak";
+// at t = 0 (00:00), or at `--at`, noise left out (Simulation::estimate). A daily wave's trough or
+// peak is not that value, so the line also says where the peak IS checked: explain's static
+// load check. Table only: a line of prose before the JSON would break its parsers. Without --at the
+// line is what it always was.
+std::string estimate_header(simsys::SimTime at) {
+  const std::string instant =
+      at.count() == 0 ? std::string{"0 (00:00)"}
+                      : simsys::describe_duration(at) + " (" + report::format_clock(at) + ")";
+  return "estimate at t = " + instant +
+         ": the curve without noise; explain's checks use the peak";
+}
+
+// `--at <time>`: a clock time (`12:00`) or a duration from the start (`90m`), the syntax of a
+// fault's `at`, and like it inside the run (at < duration). Worded as `curve`'s duration options.
+std::expected<simsys::SimTime, std::string> estimate_instant(const std::filesystem::path& file,
+                                                             const simsys::graph::Graph& g,
+                                                             const std::optional<std::string>& at) {
+  if (!at) return simsys::SimTime{};
+  const auto parsed = simsys::parse_time_point(*at);
+  if (!parsed) {
+    return std::unexpected(std::format("{}: error: --at '{}': {}", file.string(), *at,
+                                       parsed.error().message));
+  }
+  const auto duration = g.scenario().duration;
+  if (parsed->count() >= duration.count()) {
+    return std::unexpected(std::format("{}: error: --at '{}' must fall inside the run ({})",
+                                       file.string(), *at, simsys::describe_duration(duration)));
+  }
+  return *parsed;
+}
 
 // estimate admits min(in, limit) at a rate limiter: the long-run rate of a bucket, but not
 // of the sliding counter (about 10/11 of the limit under a flood), and blind to the fixed
@@ -155,10 +180,16 @@ constexpr std::string_view windowed_limiter_caveat =
 }
 
 // `simsys estimate <file>`: one steady-state evaluation, summarised as a run of one step.
-int run_estimate(const std::filesystem::path& file, const ReportOptions& options) {
+int run_estimate(const std::filesystem::path& file, const ReportOptions& options,
+                 const std::optional<std::string>& at_text) {
   const auto g = load_graph(file);
   if (!g) {
     print_error(g.error());
+    return 1;
+  }
+  const auto at = estimate_instant(file, *g, at_text);
+  if (!at) {
+    print_error(at.error());
     return 1;
   }
   const auto sim = simsys::session::create_simulation(*g, file.string());
@@ -166,7 +197,7 @@ int run_estimate(const std::filesystem::path& file, const ReportOptions& options
     print_error(sim.error());
     return 1;
   }
-  const auto record = sim->estimate();
+  const auto record = sim->estimate(*at);
   if (!record.converged) {
     print_error(file.string() +
                 ": warning: no steady state (a loop of gain >= 1 or a retry storm that no "
@@ -175,7 +206,7 @@ int run_estimate(const std::filesystem::path& file, const ReportOptions& options
                 "the numbers below are the last settle pass");
   }
   if (options.format == "table") {
-    std::println("{}{}", estimate_header,
+    std::println("{}{}", estimate_header(*at),
                  has_windowed_limiter(*g) ? windowed_limiter_caveat : std::string_view{});
   }
   return print_report(report::Summary::of_estimate(*g, record), options);
@@ -706,6 +737,7 @@ int main(int argc, char** argv) {
   RunArgs run_args;
   CurveArgs curve_args;
   SweepArgs sweep_args;
+  std::optional<std::string> estimate_at;
 
   auto* validate = app.add_subcommand("validate", "check a scenario's types, references and units");
   auto* explain = app.add_subcommand(
@@ -717,6 +749,9 @@ int main(int argc, char** argv) {
   auto* curve = add_curve_command(app, curve_args, scenario_file);
   auto* sweep = add_sweep_command(app, sweep_args, scenario_file);
   add_report_options(*estimate, report_options);
+  estimate->add_option("--at", estimate_at,
+                       "the instant to settle at: a clock time (12:00) or a duration from the "
+                       "start (90m), inside the run (default: 00:00)");
   add_report_options(*run, report_options);
   add_run_options(*run, run_args);
 
@@ -730,7 +765,7 @@ int main(int argc, char** argv) {
 
   if (validate->parsed()) return run_validate(scenario_file);
   if (explain->parsed()) return run_explain(scenario_file);
-  if (estimate->parsed()) return run_estimate(scenario_file, report_options);
+  if (estimate->parsed()) return run_estimate(scenario_file, report_options, estimate_at);
   if (run->parsed()) return run_scenario(scenario_file, run_args, report_options);
   if (curve->parsed()) return run_curve(scenario_file, curve_args);
   if (sweep->parsed()) return run_sweep_command(scenario_file, sweep_args);

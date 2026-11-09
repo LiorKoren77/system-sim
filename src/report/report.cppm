@@ -294,6 +294,8 @@ class Summary {
   [[nodiscard]] std::string_view scenario_name() const;
   // Made by of_estimate: one steady-state record, which leaves the scenario's faults out.
   [[nodiscard]] bool is_estimate() const { return estimate_; }
+  // The instant an estimate settled at (`simsys estimate --at`; 0 without it), from its record.
+  [[nodiscard]] SimTime estimate_at() const { return estimate_at_; }
   [[nodiscard]] const graph::Graph& graph() const { return *graph_; }
   // The verdict of an SLO with `over`: its worst window's, the window still open at the end of the
   // run (a last window shorter than `over`) included. Every window is judged, except that a latency
@@ -431,7 +433,8 @@ class Summary {
   std::vector<OpTotals> ops_;
   std::vector<LinkTotals> links_;     // one per link with a bandwidth, in Graph::links() order
   std::vector<WindowedSlo> windows_;  // one per scenario SLO with `over`, in the scenario's order
-  bool estimate_{};                   // made by of_estimate: SLOs with `over` judged at t = 0
+  bool estimate_{};                   // made by of_estimate: SLOs with `over` judged at its instant
+  SimTime estimate_at_{};             // of_estimate: the record's time, the instant it settled at
   // One step judged alone inside a watched window (watch_faults): its start, its length, and each
   // scenario SLO's verdict on it, in the scenario's order.
   struct JudgedStep {
@@ -468,6 +471,10 @@ class Summary {
                                        bool color);
 // For programs: the same content as JSON (two-space indent, seconds, null for infinity).
 [[nodiscard]] std::string render_json(const Summary& summary, std::span<const SloResult> slos);
+
+// A moment of the run's clock as a report prints it: `12:00` for a whole minute, `00:19:59` for a
+// whole second, the exact duration from the start otherwise or past the first day.
+[[nodiscard]] std::string format_clock(SimTime t);
 // A number for machines (CSV): the shortest text that reads back to the same double (0.1,
 // 2, 4000), locale-independent (std::to_chars). `simsys curve` prints its columns with it.
 [[nodiscard]] std::string format_number(double value);
