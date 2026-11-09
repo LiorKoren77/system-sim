@@ -4011,3 +4011,106 @@ TEST_CASE("the CSV series has the deduplicated_per_s column after rejected_per_s
     REQUIRE(other_cells[9] == "");  // only a fanout has the counter: empty, not 0
   }
 }
+
+// ---- estimate's shape (phase 4a Task 7; spec 4a §6) --------------------------------------------
+// A steady state has rates, not totals: estimate's one record stands for no length of time, so its
+// node totals are null in JSON and its table shows dropped/s and rejected/s. Both commands' JSON
+// gain the per-second figures. The probe: mm1 at 1.5k/s into 1k/s with a room of 100: once the
+// room is full the service drains 1000/s and drops the other 500/s.
+
+namespace {
+Summary estimated(const simsys::graph::Graph& g) {
+  return Summary::of_estimate(g, (*simsys::engine::Simulation::create(g)).estimate());
+}
+}  // namespace
+
+TEST_CASE("a node's drops and refusals per second are the same in a run and in estimate",
+          "[report]") {
+  const auto s = mm1(1500, 100);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto run = summarize(s, g).nodes();
+  const auto steady = estimated(g).nodes();
+  // The room (100) fills in 100 / 500 = 0.2 s, before the 0.5 s warmup ends.
+  REQUIRE_THAT(run[1].mean_dropped_per_s, WithinRel(500.0, 1e-9));
+  REQUIRE_THAT(steady[1].mean_dropped_per_s, WithinRel(500.0, 1e-9));
+  REQUIRE(run[1].mean_rejected_per_s == 0.0);
+  REQUIRE_FALSE(run[1].steady_state);
+  REQUIRE(steady[1].steady_state);
+  // A token bucket of 1k/s sent 4k/s refuses 3000/s once its burst is spent (before warmup).
+  const auto l = limited();
+  const auto lg = *simsys::graph::Graph::build(l);
+  REQUIRE_THAT(summarize(l, lg).nodes()[1].mean_rejected_per_s, WithinRel(3000.0, 1e-9));
+  REQUIRE_THAT(estimated(lg).nodes()[1].mean_rejected_per_s, WithinRel(3000.0, 1e-9));
+}
+
+TEST_CASE("estimate's JSON nodes have rates and no totals; run's have both", "[report]") {
+  const auto s = mm1(1500, 100);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto steady = simsys::report::render_json(estimated(g), {});
+  CAPTURE(steady);
+  REQUIRE(steady.contains("\"dropped\": null"));
+  REQUIRE(steady.contains("\"rejected\": null"));
+  REQUIRE(steady.contains("\"red_s\": null"));
+  REQUIRE(steady.contains("\"dropped_per_s\": 500"));
+  REQUIRE(steady.contains("\"rejected_per_s\": 0"));
+  const auto run = simsys::report::render_json(summarize(s, g), {});
+  CAPTURE(run);
+  REQUIRE(run.contains("\"dropped\": 750"));  // 500/s over the 1.5 s observed
+  REQUIRE(run.contains("\"dropped_per_s\": 500"));
+  REQUIRE(run.contains("\"red_s\": 1.5"));
+}
+
+TEST_CASE("a lag that grows without bound in estimate says so; a run's lag is finite", "[report]") {
+  // web-crawler's frontier is offered more URLs than its downloaders drain (a loop gain above 1),
+  // so its steady state has no finite lag (phase 3 review, decision 2). peak_queue_lag_s is null
+  // there and for a node with no lag; queue_lag_unbounded tells the two apart.
+  const auto loaded = simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} +
+                                           "/book/web-crawler/scenario.yaml");
+  REQUIRE(loaded.has_value());
+  const auto g = *simsys::graph::Graph::build(*loaded);
+  const auto steady = simsys::report::render_json(estimated(g), {});
+  const auto frontier = steady.find("{\"id\": \"frontier\"");
+  REQUIRE(frontier != std::string::npos);
+  const auto frontier_object = steady.substr(frontier, steady.find('}', frontier) - frontier);
+  CAPTURE(frontier_object);
+  REQUIRE(frontier_object.contains("\"peak_queue_lag_s\": null"));
+  REQUIRE(frontier_object.contains("\"queue_lag_unbounded\": true"));
+  const auto service = steady.find("{\"id\": \"parser\"");
+  REQUIRE(service != std::string::npos);
+  const auto service_object = steady.substr(service, steady.find('}', service) - service);
+  REQUIRE(service_object.contains("\"queue_lag_unbounded\": null"));
+}
+
+TEST_CASE("a queue that keeps up reports a bounded lag in a run", "[report]") {
+  Scenario s = mm1(100);
+  s.nodes.push_back(NodeSpec{.id = "q", .type = NodeType::message_queue});
+  s.nodes.push_back(NodeSpec{.id = "w",
+                             .type = NodeType::worker_pool,
+                             .workers = 4,
+                             .job_cost = 1ms,
+                             .consumes = "q"});
+  s.nodes[1].ops["op"] = {Step{.to = "q", .op = "publish"}};
+  s.links.push_back(LinkSpec{.from = "s", .to = "q", .latency = 0s});
+  s.links.push_back(LinkSpec{.from = "q", .to = "w", .latency = 0s});
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto run = simsys::report::render_json(summarize(s, g), {});
+  CAPTURE(run);
+  REQUIRE(run.contains("\"queue_lag_unbounded\": false"));
+}
+
+TEST_CASE("estimate's table shows a steady state, with drops and refusals per second",
+          "[report]") {
+  const auto s = mm1(1500, 100);
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto table = simsys::report::render_table(estimated(g), {}, /*color=*/false);
+  CAPTURE(table);
+  REQUIRE(table.starts_with("scenario mm1  steady state at 00:00  drop rate"));
+  REQUIRE(table.contains("dropped/s"));
+  REQUIRE(table.contains("rejected/s"));
+  REQUIRE_FALSE(table.contains("red_s"));
+  REQUIRE_FALSE(table.contains("steps observed"));
+  // run's table keeps its totals and its red time.
+  const auto run = simsys::report::render_table(summarize(s, g), {}, /*color=*/false);
+  REQUIRE(run.contains("red_s"));
+  REQUIRE_FALSE(run.contains("dropped/s"));
+}
