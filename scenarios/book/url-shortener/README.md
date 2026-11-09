@@ -78,8 +78,9 @@ warmup).
   `shards: 2` that hour is 0.965 and the SLO fails while the day-long ones still pass (below).
   `simsys estimate` says the same at an instant (phase 4a, `--at`): at midnight, the curve's
   trough, `url_db` sits at 0.244, and `simsys estimate scenarios/book/url-shortener/scenario.yaml
-  --at 13:00` prints `url_db  0.6382  0.6382` under `steady state at 13:00`, the value of the
-  curve at the start of that hour where `run`'s 0.6433 is its mean.
+  --at 13:00` prints `url_db  0.6382  0.6382` under `steady state at 13:00`: the load at one
+  instant, two minutes before the worst hour 13:02-14:02 begins, where `run`'s 0.6433 is the mean
+  over that hour.
 - **The step size.** The scenario runs at `step: 1s` (86,280 observed steps) where the first
   draft ran at 100 ms (862,800 steps), ten times fewer steps and so about a tenth of the time
   (on the author's machine 0.4 s against 4.4 s in a Release build, 6.4 s against 65 s in

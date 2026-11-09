@@ -34,7 +34,7 @@ frontiers (per-host politeness as a cap on the downloaders' drain),
 key-value clusters (ring, replication and quorums), search indexes and id generators. A step after
 a failed step does not run, refused, dropped and timed-out requests are counted apart
 (`reject_rate`, `drop_rate`, `timed_out_per_s`), and an SLO can be checked per window (`over: 1h`).
-`simsys sweep` runs a scenario over a range of one key, the points in parallel. All fourteen
+`simsys sweep` runs a scenario over a range of one key (or a grid of two), the points in parallel. All fourteen
 shipped scenarios run end to end, the eight book systems among them (list below). 1740 tests
 (Catch2, via `ctest`). The scenario language is
 [`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.6).

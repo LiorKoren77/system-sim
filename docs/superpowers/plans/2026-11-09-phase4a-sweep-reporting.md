@@ -238,11 +238,20 @@ get the steady-state flag and the same `dropped/s` header; the kv line reads `re
 
 ### Task 9: docs
 
-- [ ] Schema **v1.6**: "New in v1.6", the JSON changes first (`dropped`, `rejected`, `red_s` `null` in `estimate`; `dropped_per_s`, `rejected_per_s`, `queue_lag_unbounded`, `at_s` new), then the sweep (`reject_rate`, `:log`, the grid, `--slos`), `estimate --at`, the duplicate `write_ops` refusal, `curve --seed`; the sweep section's "Ignored" sentence and "A sweep has no SLO columns" sentence rewritten; the JSON key table extended; the `estimate` paragraph at "`run --report json` (and `estimate --report json`), key by key" rewritten.
-- [ ] Spec **§21**: the rules as built, each review's corrections, in §20's style; §19 entry 15's "Narrower than the plan's header" note points at §21.
-- [ ] Study notes: `ranges.md` gains `std::views::cartesian_product` (C++23): what it is, the nested loops it replaces, the order of its tuples, that it takes no lambda (so the fifth defect does not apply), its use in `sweep.cpp`; `docs/study/README.md`'s ranges row names it.
-- [ ] READMEs (numbers *measured* from the Release binary): the rate-limiter lab's `burst` sweep with `limiter.reject_rate` and `api.peak_rho`; youtube's workers sweep with `--slos`; url-shortener's `estimate --at 13:00` against its windowed SLO; the root README's sweep example, status line ("phase 4a is built") and test count.
-- [ ] Commit `docs: schema v1.6, spec §21, the sweep's grid and verdicts, estimate at an instant`.
+- [x] Schema **v1.6**: "New in v1.6", the JSON changes first (`dropped`, `rejected`, `red_s` `null` in `estimate`; `dropped_per_s`, `rejected_per_s`, `queue_lag_unbounded`, `at_s` new), then the sweep (`reject_rate`, `:log`, the grid, `--slos`), `estimate --at`, the duplicate `write_ops` refusal, `curve --seed`; the sweep section's "Ignored" sentence and "A sweep has no SLO columns" sentence rewritten; the JSON key table extended; the `estimate` paragraph at "`run --report json` (and `estimate --report json`), key by key" rewritten.
+- [x] Spec **§21**: the rules as built, each review's corrections, in §20's style; §19 entry 15's "Narrower than the plan's header" note points at §21.
+- [x] Study notes: `ranges.md` gains `std::views::cartesian_product` (C++23): what it is, the nested loops it replaces, the order of its tuples, that it takes no lambda (so the fifth defect does not apply), its use in `sweep.cpp`; `docs/study/README.md`'s ranges row names it.
+- [x] READMEs (numbers *measured* from the Release binary): the rate-limiter lab's `burst` sweep with `limiter.reject_rate` and `api.peak_rho`; youtube's workers sweep with `--slos`; url-shortener's `estimate --at 13:00` against its windowed SLO; the root README's sweep example, status line ("phase 4a is built") and test count.
+- [x] Commit `docs: schema v1.6, spec §21, the sweep's grid and verdicts, estimate at an instant`.
+
+Done at `faf5a76` (docs only). **Review of batch D at `faf5a76`** (code-review skill, medium,
+docs): nine findings, all fixed in the docs fix commit: spec §21 entry 9 still said the links
+table keeps one step's totals (batch C changed it); the schema's v1.6 list, key table and spec
+omitted that a pool's `dead_lettered` and a link's `red_s` are `null` under `estimate`; the
+links-table change was undocumented; the windowed-SLO text still printed `(at 00:00 only ...)`;
+the `--slos` exit column omitted 1; the sweep option table missed `--param` twice, `:log` and
+`--slos`; two "one key" sentences; the rate-limiter README's "the same share" against 0.143 at
+burst 100; url-shortener's "the start of that hour" for 13:00 against 13:02.
 
 ### The 4a review, then the PR
 
