@@ -16,6 +16,7 @@ module;
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <map>  // unit_of: a node's priced ops grouped by their cost
 #include <numeric>
 #include <optional>
 #include <ostream>
@@ -745,8 +746,60 @@ void insert_at(Cells& cells, std::size_t column, Value value) {
 
 constexpr std::string_view node_title = "nodes";
 
+// "delete, insert, update, write cost 5" ("a cost 2 and b cost 3" for two costs): a node's ops that
+// cost something other than 1 capacity unit, grouped by their cost, in name order; "" when every op
+// it prices costs 1. The ops priced are a database's write ops (their default cost of 5, spec §18
+// entry 7) and every op of a stated `cost` map (spec §17 entry 4), each priced as the engine
+// prices it (defaults::op_cost).
+[[nodiscard]] std::string priced_ops(const model::NodeSpec& spec) {
+  std::vector<std::string> ops{spec.cost | std::views::keys | std::ranges::to<std::vector>()};
+  if (spec.type == model::NodeType::sql_db) {
+    std::ranges::copy(model::write_ops_of(spec), std::back_inserter(ops));
+  }
+  std::ranges::sort(ops);
+  const auto [first_repeat, end] = std::ranges::unique(ops);
+  ops.erase(first_repeat, end);
+  std::map<double, std::vector<std::string>> by_cost;
+  for (const auto& op : ops) {
+    const double cost = defaults::op_cost(spec, op);
+    if (cost != 1.0) by_cost[cost].push_back(op);
+  }
+  std::vector<std::string> groups;
+  for (const auto& [cost, named] : by_cost) {
+    groups.push_back(join(named, ", ") + " cost " + significant(cost));
+  }
+  return join(groups, " and ");
+}
+
+// What a node's peak_backlog and drops count, when it is not requests: megabytes at a byte-sized
+// node (spec §19 entry 2), replica-requests at a kv_cluster (N of them per request, §19 entry 9),
+// capacity units at a node with an op that costs other than 1 (priced_ops); empty otherwise, and
+// for a client, which queues nothing.
+[[nodiscard]] std::optional<std::string> unit_of(const model::NodeSpec& spec) {
+  if (spec.type == model::NodeType::client) return std::nullopt;
+  if (defaults::is_byte_sized(spec)) return "MB";
+  if (spec.type == model::NodeType::kv_cluster) {
+    return "replica-requests (N " + std::to_string(model::kv_replication(spec)) + ")";
+  }
+  const auto priced = priced_ops(spec);
+  if (priced.empty()) return std::nullopt;
+  return "capacity units (" + priced + ")";
+}
+
+// "units (peak_backlog and drops are not requests here): url_db capacity units (...); cdn_us MB":
+// one line under the node table naming every node whose figures are in another unit (the 2a
+// leftover M7: the table's headers carry no unit), or nothing when every node counts requests.
+[[nodiscard]] std::string units_note(const Summary& summary) {
+  std::vector<std::string> named;
+  for (const auto& node : summary.graph().nodes()) {
+    if (const auto unit = unit_of(node.spec)) named.push_back(node.spec.id + " " + *unit);
+  }
+  if (named.empty()) return {};
+  return "units (peak_backlog and drops are not requests here): " + join(named, "; ") + "\n";
+}
+
 [[nodiscard]] std::string node_table(const Summary& summary, bool color) {
-  return table_text(node_title, node_parts(summary, color));
+  return table_text(node_title, node_parts(summary, color)) + units_note(summary);
 }
 
 // The bandwidth links' pipes, in the node table's columns but a table of their own, since their
