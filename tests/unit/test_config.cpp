@@ -5532,3 +5532,44 @@ TEST_CASE("a frontier's politeness must be a positive rate") {
                                  "  d: {type: service}\n"),
                    "node 'frontier': politeness must be positive");
 }
+
+// ---- Duplicate write ops (phase 4a Task 1; the 2a leftover M9) ----
+
+// `write_ops` is a set of op names, as a link's `ops` is: one written twice is a typo or a leftover
+// edit, and it is refused in the link's words (`duplicate op 'x'`), naming the key it sits in.
+TEST_CASE("a duplicate write op is refused on every type that reads write_ops") {
+  // One case per type that reads the key: the node's id, its YAML line(s), and the op it repeats.
+  struct Case {
+    std::string_view id;
+    std::string_view nodes;
+    std::string_view repeated;
+  };
+  for (const auto& c :
+       {Case{.id = "c",
+             .nodes = "  c: {type: cache, hit_ratio: {fixed: 0.5}, write_ops: [write, write]}\n",
+             .repeated = "write"},
+        Case{.id = "cdn",
+             .nodes = "  cdn: {type: cdn, write_ops: [upload, upload], origin: o}\n"
+                      "  o: {type: service}\n",
+             .repeated = "upload"},
+        Case{.id = "db",
+             .nodes = "  db: {type: sql_db, write_ops: [insert, insert]}\n",
+             .repeated = "insert"},
+        Case{.id = "b",
+             .nodes = "  b: {type: blob_store, write_ops: [upload, upload]}\n",
+             .repeated = "upload"},
+        Case{.id = "store",
+             .nodes = "  store: {type: kv_cluster, nodes: 3, write_ops: [put, put]}\n",
+             .repeated = "put"}}) {
+    CAPTURE(c.id);
+    require_rejected("simsys_write_ops_duplicate.yaml", scenario_with(c.nodes),
+                     "node '" + std::string{c.id} + "': duplicate write_ops op '" +
+                         std::string{c.repeated} + "'");
+  }
+}
+
+TEST_CASE("a duplicate write op is named at its first repeat") {
+  require_rejected("simsys_write_ops_first_repeat.yaml",
+                   scenario_with("  db: {type: sql_db, write_ops: [write, delete, write, delete]}\n"),
+                   "node 'db': duplicate write_ops op 'write'");
+}
