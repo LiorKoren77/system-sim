@@ -28,8 +28,8 @@
 import simsys.config;
 import simsys.core;
 import simsys.model;
-import simsys.report;   // evaluate_slos: what run judges, beside what a sweep point judges
-import simsys.session;  // load_graph, run_summary: a point loaded and run as `simsys run` does
+import simsys.report;  // evaluate_slos: what run judges, beside what a sweep point judges
+import simsys.session; // load_graph, run_summary: a point loaded and run as `simsys run` does
 import simsys.sweep;
 
 using namespace std::chrono_literals;
@@ -1061,9 +1061,8 @@ TEST_CASE("log is the only spacing suffix") {
 
 namespace {
 std::vector<SweepParam> hello_grid() {
-  const auto params =
-      parse_params(std::vector<std::string>{"nodes.users.rate.base=100/s..300/s:2",
-                                            "nodes.api.capacity=1k/s..2k/s:2"});
+  const auto params = parse_params(std::vector<std::string>{"nodes.users.rate.base=100/s..300/s:2",
+                                                            "nodes.api.capacity=1k/s..2k/s:2"});
   INFO((params ? "" : params.error()));
   REQUIRE(params.has_value());
   return *params;
@@ -1118,9 +1117,9 @@ TEST_CASE("a grid's rows do not depend on how many workers ran the points") {
 }
 
 TEST_CASE("a grid takes at most two keys") {
-  const auto params = parse_params(std::vector<std::string>{
-      "nodes.users.rate.base=100/s..300/s:2", "nodes.api.capacity=1k/s..2k/s:2",
-      "nodes.api.latency=1ms..2ms:2"});
+  const auto params = parse_params(std::vector<std::string>{"nodes.users.rate.base=100/s..300/s:2",
+                                                            "nodes.api.capacity=1k/s..2k/s:2",
+                                                            "nodes.api.latency=1ms..2ms:2"});
   REQUIRE_FALSE(params.has_value());
   REQUIRE(params.error() == "--param: at most two keys (a grid of two); script a third");
 }
@@ -1157,8 +1156,8 @@ std::string anchored_path() {
 }  // namespace
 
 TEST_CASE("a grid cannot sweep two paths that reach one anchored value") {
-  const auto params = parse_params(std::vector<std::string>{"nodes.a.capacity=1k/s..2k/s:2",
-                                                            "nodes.b.capacity=3k/s..4k/s:2"});
+  const auto params = parse_params(
+      std::vector<std::string>{"nodes.a.capacity=1k/s..2k/s:2", "nodes.b.capacity=3k/s..4k/s:2"});
   REQUIRE(params.has_value());
   const std::vector<SweepMetric> metrics{*parse_metric("a.mean_rho")};
   const auto path = anchored_path();
@@ -1177,8 +1176,8 @@ TEST_CASE("a grid point the loader refuses is named by both of its values") {
   REQUIRE(params.has_value());
   const auto rows = run_sweep(hello_path, *params, hello_metrics(), 2);
   REQUIRE_FALSE(rows.has_value());
-  REQUIRE(rows.error().starts_with(
-      "point 3 (nodes.users.rate.base=-1/s, nodes.api.capacity=1k/s): "));
+  REQUIRE(
+      rows.error().starts_with("point 3 (nodes.users.rate.base=-1/s, nodes.api.capacity=1k/s): "));
 }
 
 TEST_CASE("one --param is a sweep of one key, as before the grid") {
@@ -1336,12 +1335,11 @@ TEST_CASE("the table and csv show each verdict and the exit code after the metri
   const auto table =
       split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::table), '\n');
   CAPTURE(table);
-  REQUIRE(split_words(table[0]) ==
-          std::vector<std::string>{"nodes.users.rate.base", "users.ping.mean", "api.mean_rho",
-                                   "p99_latency:users.ping", "exit"});
+  REQUIRE(split_words(table[0]) == std::vector<std::string>{"nodes.users.rate.base",
+                                                            "users.ping.mean", "api.mean_rho",
+                                                            "p99_latency:users.ping", "exit"});
   REQUIRE(split_words(table[2]).back() == "0");
-  REQUIRE(split_words(table[4]) ==
-          std::vector<std::string>{"900/s", "10.5ms", "0.9", "FAIL", "2"});
+  REQUIRE(split_words(table[4]) == std::vector<std::string>{"900/s", "10.5ms", "0.9", "FAIL", "2"});
   const auto csv = split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::csv), '\n');
   REQUIRE(csv[0] ==
           "nodes.users.rate.base,users.ping.mean,api.mean_rho,p99_latency:users.ping,exit");

@@ -58,7 +58,7 @@ struct NodeSummary {
   // Made by estimate (Summary::of_estimate): one steady state, which lasts no stretch of time, so
   // the totals and the red time above mean nothing; the reports print the rates instead.
   bool steady_state{};
-  bool unavailable{};   // the node's latency was infinite in some observed step
+  bool unavailable{};  // the node's latency was infinite in some observed step
   // A SQL database's staleness (engine::NodeSample::staleness_s: the write's sojourn at the
   // primary + the replication lag + its sojourn at a replica), time-averaged over the observed
   // steps; infinite when a queue never answered in one of them; empty for every node that keeps

@@ -264,8 +264,10 @@ Closing checks at `53a8fde` (2026-11-09): Debug 1740/1740; Release builds and li
 build. Byte-identity against `main` (`b97cd0f`), both Release binaries, all fourteen scenarios ×
 `validate`, `explain`, `run` (the table without its new `units` line) and `run --report json`
 (without `dropped_per_s`, `rejected_per_s`, `queue_lag_unbounded`), and the hello one-key sweep:
-0 differences. Not checked locally: clang-format-18 (not installed on this machine; lines were
-held to 100 columns by hand), so CI's format job is the first formatter to see the branch.
+0 differences. clang-format-18 (18.1.3, installed after the first pass) found 100 places in the
+eight files the branch touched, all in this branch's lines (main passes CI's format job); the
+formatting commit after this note fixes them, and CI's command then reports nothing. Debug
+1740/1740 and Release clean again after it.
 - [ ] **Ask the user**, then `git push -u origin phase4a/sweep-reporting` and `gh pr create` (body: what and why, the test count, the checkpoints' commits; ends with the attribution line). CI's five jobs decide; a red job gets a fix commit on the branch, never a force-push without asking.
 
 ---
