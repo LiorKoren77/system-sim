@@ -45,36 +45,50 @@
 
 **Files:** `src/config/nodes.cpp` (`read_write_ops`), `src/cli/main.cpp` (`curve`); tests in `tests/unit/test_config.cpp`, `tests/cli/curve_seed.cmake` (new), `tests/CMakeLists.txt`.
 
-- [ ] Tests (loader; message verbatim): `write_ops: [write, write]` on a `cache` → `node 'c': duplicate write_ops op 'write'`; the same on a `cdn`, a `sql_db`, a `blob_store`, a `kv_cluster` (one `TEST_CASE` per type, named after the property: "a duplicate write op is refused on every type that reads write_ops"); `[write, delete, write]` names `write`, the first repeated name. The wording is checked against the link reader's duplicate-`ops` message in `links.cpp` and follows its form if it differs.
-- [ ] Tests (process, `curve_seed.cmake`): `simsys curve scenarios/tutorial/hello/scenario.yaml users --seed 3` exits **1** with `--seed needs --noise (without it the curve has no randomness)` on stderr and nothing on stdout; with `--noise` it exits 0 and its output equals today's.
-- [ ] Red commit `tests: a duplicate write op and a seed without noise are refused`.
-- [ ] Implementation: in `read_write_ops`, after reading the list, find the first repeat (a `std::set<std::string>` or `std::ranges::sort` + `std::ranges::adjacent_find` on a copy: C++20 ranges, first-use comment if new in `nodes.cpp`, which is covered by `detail.hpp`'s comments only for what `detail.hpp` uses). In `main.cpp`, after parsing `curve`, `if (args.seed && !args.noise)` refuse. No shipped scenario has a duplicate (`grep -n write_ops scenarios -r` checked in the red commit's message).
-- [ ] Green commit `config, cli: refuse a duplicate write op and a seed the curve cannot use`.
+- [x] Tests (loader; message verbatim): `write_ops: [write, write]` on a `cache` → `node 'c': duplicate write_ops op 'write'`; the same on a `cdn`, a `sql_db`, a `blob_store`, a `kv_cluster` (one `TEST_CASE` per type, named after the property: "a duplicate write op is refused on every type that reads write_ops"); `[write, delete, write]` names `write`, the first repeated name. The wording is checked against the link reader's duplicate-`ops` message in `links.cpp` and follows its form if it differs.
+- [x] Tests (process, `curve_seed.cmake`): `simsys curve scenarios/tutorial/hello/scenario.yaml users --seed 3` exits **1** with `--seed needs --noise (without it the curve has no randomness)` on stderr and nothing on stdout; with `--noise` it exits 0 and its output equals today's.
+- [x] Red commit `tests: a duplicate write op and a seed without noise are refused`.
+- [x] Implementation: in `read_write_ops`, after reading the list, find the first repeat (a `std::set<std::string>` or `std::ranges::sort` + `std::ranges::adjacent_find` on a copy: C++20 ranges, first-use comment if new in `nodes.cpp`, which is covered by `detail.hpp`'s comments only for what `detail.hpp` uses). In `main.cpp`, after parsing `curve`, `if (args.seed && !args.noise)` refuse. No shipped scenario has a duplicate (`grep -n write_ops scenarios -r` checked in the red commit's message).
+- [x] Green commit `config, cli: refuse a duplicate write op and a seed the curve cannot use`.
+
+Done: red `0268467`, green `20c6cda` (1689 tests). The message follows the link reader's form,
+`node 'c': duplicate write_ops op 'write'` (spec and plan updated); the check runs after every
+element is read as an op name, so a non-scalar is still reported as one. `curve --seed`'s help
+says "needs --noise".
 
 ### Task 2: `<node>.reject_rate`
 
 **Files:** `src/sweep/sweep.cppm` (`MetricKind::reject_rate`), `src/sweep/sweep.cpp` (`node_metric_words`, `metric_grammar`, `node_metric`, `problem_with_node`, `human_cell`); tests in `tests/unit/test_sweep.cpp`.
 
-- [ ] Tests:
+- [x] Tests:
   - `parse_metric("limiter.reject_rate")` gives `MetricKind::reject_rate`, node `limiter`;
   - on a probe (a client at **1.5k/s** into a token bucket of `limit: 1k/s` and a `burst` that is empty after the first step, step 100 ms, then a service of 10k/s): the sweep's value equals `Summary::reject_rate("limiter")` exactly, and after warmup is **(1.5k − 1k) / 1.5k = 0.3333** to 4 digits;
   - a service that refuses nothing: **0**;
   - on a client: `--metric: users.reject_rate: 'users' is a client, which serves nothing, so it has no reject rate`;
   - the unknown-metric message lists `reject_rate` after `drop_rate` (the grammar text is pinned verbatim, so its old pin is updated in this commit).
-- [ ] Red commit; implementation (one table row, one `case`, the grammar string); green commit `sweep: a node's reject_rate as a metric`.
+- [x] Red commit; implementation (one table row, one `case`, the grammar string); green commit `sweep: a node's reject_rate as a metric`.
+
+Done: red `c0e5d0b`, green `28dbe90` (1693 tests). The probe is a token bucket with `burst: 1`
+before a 5k/s or 10k/s service: the limiter's reject rate is 1/3 within 1e-6, the service's 0. The
+grammar is pinned by `contains`, not verbatim (no test pinned it before).
 
 ### Task 3: geometric spacing `:log`
 
 **Files:** `src/sweep/sweep.cppm` (`enum class Spacing { linear, geometric }`, a field in `SweepParam`), `src/sweep/sweep.cpp` (`split_spec` reads the suffix, `expand` branches); tests in `tests/unit/test_sweep.cpp`.
 
-- [ ] Tests (`parse_param`, values as text):
+- [x] Tests (`parse_param`, values as text):
   - `nodes.users.rate.base=1k/s..100k/s:3:log` → **`1k/s`, `10k/s`, `100k/s`** (1000 × 100^(k/2); the text is the same 12-significant-digit form `point_text` writes, so `10000/s` or `10k/s` is decided by today's formatter: the test pins what `point_text` gives for 1e4 with the unit `k/s`, i.e. the unit text of `from` repeated after the number in `from`'s unit);
   - `1ms..1000ms:4:log` → `1ms`, `10ms`, `100ms`, `1000ms`; the last value is the `to` text's number exactly (no `999.999999`);
   - `nodes.w.workers=10..1000:3:log` → `10`, `100`, `1000`; `nodes.w.workers=1..4:8:log` → `--param: workers=1..4:8:log gives 1 twice (rounded to whole workers); use fewer points` (4^(k/7) = 1, 1.219, 1.486, 1.811, 2.208, 2.692, 3.281, 4 round to 1, 1, 1, 2, 2, 3, 3, 4: the first repeat is **1**);
   - `0/s..1k/s:4:log` → `--param: 0/s..1k/s:4:log: geometric points need two positive ends`; `-1ms..1ms:3:log` the same;
   - `1..10:3:lin` → `--param: 1..10:3:lin: the only spacing suffix is :log`;
   - a linear spec parses exactly as before (`spacing == linear`, values unchanged: the existing tests stay green).
-- [ ] Red commit; implementation (`point_at` gains a geometric twin: `from * std::pow(to / from, k / (n − 1.0))`, `k == n − 1` returns `to`; whole keys round and check for a repeat; `n` limits unchanged); green commit `sweep: geometric points for a key read on a log axis`.
+- [x] Red commit; implementation (`point_at` gains a geometric twin: `from * std::pow(to / from, k / (n − 1.0))`, `k == n − 1` returns `to`; whole keys round and check for a repeat; `n` limits unchanged); green commit `sweep: geometric points for a key read on a log axis`.
+
+Done: red `bb01db7`, green `82bdfc2` (1699 tests). The suffix is found from the right, after the
+count, so an end holding a colon (a clock time) still parses. The positive-ends case is
+`0/s..1000/s:4:log`: `0/s..1k/s` is refused first for its two units. The CLI help names `:log` and
+`reject_rate`.
 
 **Checkpoint A.** Stop; report the three tasks' commits, the test count, and the size of Batch B.
 
