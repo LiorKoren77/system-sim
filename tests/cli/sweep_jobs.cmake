@@ -15,7 +15,9 @@
 #                       file does not have and a value the loader refuses each exit 1, with the
 #                       reason on stderr and nothing on stdout;
 #   slo_failure_exit_0 - a sweep where an SLO fails at every point still exits 0 (`run` on the
-#                       same file exits 2): a sweep reports numbers, it does not judge them;
+#                       same file exits 2): a sweep reports numbers, it does not judge them; with
+#                       --slos it prints the verdicts and still exits 0, and on a scenario without
+#                       SLOs it says so on stderr;
 #   error_prefixes    - every refusal of an option starts as the CLI's other errors do, with the
 #                       file and `error:`, then names its option the same way, `--param: ` or
 #                       `--metric: `, whether the text, the file or the loader found the mistake;
@@ -172,6 +174,21 @@ elseif(CHECK STREQUAL "slo_failure_exit_0")
   endif()
   run_sweep("${WORK}/hello-slo.yaml" --param "${PARAM}" --metric users.ping.mean)
   require_output("a sweep over a failing SLO")
+  # --slos prints the verdicts (FAIL at every point, exit column 2) and still exits 0: a sweep
+  # explores, its interesting rows are the failing ones (spec 4a §2).
+  run_sweep("${WORK}/hello-slo.yaml" --param "${PARAM}" --metric users.ping.mean --slos)
+  require_output("--slos over a failing SLO")
+  string(FIND "${sweep_out}" "FAIL" at)
+  if(at EQUAL -1)
+    message(FATAL_ERROR "--slos printed no FAIL:\n${sweep_out}")
+  endif()
+  # hello itself has no SLOs: --slos says so on stderr, and every exit cell is 0.
+  run_sweep("${SCENARIO}" --param "${PARAM}" --metric users.ping.mean --slos)
+  require_output("--slos on a scenario without SLOs")
+  string(FIND "${sweep_err}" "the scenario has no SLOs: every point exits 0" at)
+  if(at EQUAL -1)
+    message(FATAL_ERROR "no note for a scenario without SLOs:\n${sweep_err}")
+  endif()
 elseif(CHECK STREQUAL "grid_same_bytes")
   set(grid --param nodes.users.rate.base=100/s..300/s:2 --param nodes.api.capacity=1k/s..2k/s:2
            --metric api.mean_rho --format csv)
