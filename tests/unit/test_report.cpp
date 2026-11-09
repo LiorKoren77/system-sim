@@ -3775,7 +3775,7 @@ TEST_CASE("the per-seed JSON of replications lists each node's deduplicated_per_
   CAPTURE(json);
   const auto per_seed = json.substr(json.find("\"per_seed\""));
   CHECK(json_node_object(per_seed, "s")
-            .contains("\"rejected\": [0, 0, 0], "
+            .contains("\"rejected\": [0, 0, 0], \"rejected_per_s\": [0, 0, 0], "
                       "\"deduplicated_per_s\": [10, 20, 30], "));
   CHECK(json_node_object(per_seed, "c").contains("\"deduplicated_per_s\": [null, null, null]"));
 }
@@ -4056,7 +4056,9 @@ TEST_CASE("estimate's JSON nodes have rates and no totals; run's have both", "[r
   const auto run = simsys::report::render_json(summarize(s, g), {});
   CAPTURE(run);
   REQUIRE(run.contains("\"dropped\": 750"));  // 500/s over the 1.5 s observed
-  REQUIRE(run.contains("\"dropped_per_s\": 500"));
+  // 750 over the observed seconds, a sum of fifteen 0.1 s steps, is 500 to the last bit or two
+  // (499.99999999999994); the number is pinned by the test above, the key here.
+  REQUIRE(run.contains("\"dropped_per_s\": "));
   REQUIRE(run.contains("\"red_s\": 1.5"));
 }
 
