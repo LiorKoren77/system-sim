@@ -130,14 +130,14 @@ std::expected<SpecParts, std::string> split_spec(std::string_view spec) {
   const auto ends = range.substr(0, count_colon);
   const auto dots = ends.find("..");
   if (dots == std::string_view::npos) return bad_shape;
-  return SpecParts{
-      .path = spec.substr(0, equals),
-      .range = range,
-      .from = ends.substr(0, dots),
-      .to = ends.substr(dots + 2),
-      .count = has_spacing ? range.substr(count_colon + 1, last_colon - count_colon - 1)
-                           : after_last,
-      .spacing = has_spacing ? after_last : std::string_view{}};
+  return SpecParts{.path = spec.substr(0, equals),
+                   .range = range,
+                   .from = ends.substr(0, dots),
+                   .to = ends.substr(dots + 2),
+                   .count = has_spacing
+                                ? range.substr(count_colon + 1, last_colon - count_colon - 1)
+                                : after_last,
+                   .spacing = has_spacing ? after_last : std::string_view{}};
 }
 
 // The most points a sweep runs. Chosen, not from the book: each point is a whole simulation, so
@@ -443,7 +443,7 @@ constexpr double no_value = std::numeric_limits<double>::quiet_NaN();
 struct Measured {
   std::vector<double> numbers;
   std::vector<std::size_t> beyond_timeout;
-  std::vector<SloCell> slos{};      // with --slos only
+  std::vector<SloCell> slos{};     // with --slos only
   std::optional<int> exit_code{};  // with --slos only
 };
 
@@ -849,8 +849,8 @@ std::expected<SweepParam, std::string> parse_param(std::string_view spec) {
   if (geometric && (from->number <= 0 || to->number <= 0)) {
     return param_error(std::string{parts->range} + ": geometric points need two positive ends");
   }
-  auto values = geometric ? expand_geometric(*parts, *from, *to, *count)
-                          : expand(*parts, *from, *to, *count);
+  auto values =
+      geometric ? expand_geometric(*parts, *from, *to, *count) : expand(*parts, *from, *to, *count);
   if (!values) return std::unexpected(values.error());
   return SweepParam{.path = std::string{parts->path},
                     .values = std::move(*values),

@@ -1291,11 +1291,8 @@ namespace {
 Scenario waved_mm1() {
   Scenario s = mm1(1000);
   s.duration = 24h;
-  s.nodes[0].workload->curve.wave =
-      simsys::workload::Wave{.shape = simsys::workload::WaveShape::sine,
-                             .period = 24h,
-                             .amplitude = 0.5,
-                             .peak_at = 12h};
+  s.nodes[0].workload->curve.wave = simsys::workload::Wave{
+      .shape = simsys::workload::WaveShape::sine, .period = 24h, .amplitude = 0.5, .peak_at = 12h};
   s.nodes[1].capacity = Rate{2000};
   s.nodes[1].latency = 500us;
   return s;
@@ -1306,8 +1303,8 @@ TEST_CASE("estimate at the wave's peak settles at the peak's rate: 1.5k/s, rho 0
           "[theory]") {
   const auto g = *simsys::graph::Graph::build(waved_mm1());
   const auto e = (*Simulation::create(g)).estimate(12h);
-  REQUIRE_THAT(e.nodes[1].demand_per_s, WithinRel(1500.0, 1e-9));  // 1k × (1 + 0.5 cos 0)
-  REQUIRE_THAT(e.nodes[1].rho, WithinRel(0.75, 1e-9));             // 1500 / 2000
+  REQUIRE_THAT(e.nodes[1].demand_per_s, WithinRel(1500.0, 1e-9));   // 1k × (1 + 0.5 cos 0)
+  REQUIRE_THAT(e.nodes[1].rho, WithinRel(0.75, 1e-9));              // 1500 / 2000
   REQUIRE_THAT(e.nodes[1].latency.mean_s, WithinRel(0.002, 1e-9));  // 0.5 ms / (1 − 0.75)
 }
 
@@ -1344,10 +1341,8 @@ TEST_CASE("estimate during a spike multiplies the wave by the spike's factor and
 TEST_CASE("estimate at an instant leaves the scripted faults out, as estimate always has",
           "[theory]") {
   Scenario faulted = waved_mm1();
-  faulted.faults = {simsys::model::Fault{.kind = simsys::model::FaultKind::node_down,
-                                         .at = 12h,
-                                         .duration = 1h,
-                                         .node = "s"}};
+  faulted.faults = {simsys::model::Fault{
+      .kind = simsys::model::FaultKind::node_down, .at = 12h, .duration = 1h, .node = "s"}};
   const auto with_fault = *simsys::graph::Graph::build(faulted);
   const auto without = *simsys::graph::Graph::build(waved_mm1());
   const auto a = (*Simulation::create(with_fault)).estimate(12h + 30min);

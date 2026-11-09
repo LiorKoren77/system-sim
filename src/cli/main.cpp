@@ -140,11 +140,10 @@ std::string estimate_header(simsys::SimTime at) {
   // whole second, or past the first day, is the same text both ways.
   const auto duration = simsys::describe_duration(at);
   const auto clock = report::format_clock(at);
-  const std::string instant = at.count() == 0 ? std::string{"0 (00:00)"}
+  const std::string instant = at.count() == 0     ? std::string{"0 (00:00)"}
                               : clock == duration ? duration
                                                   : duration + " (" + clock + ")";
-  return "estimate at t = " + instant +
-         ": the curve without noise; explain's checks use the peak";
+  return "estimate at t = " + instant + ": the curve without noise; explain's checks use the peak";
 }
 
 // `--at <time>`: a clock time (`12:00`) or a duration from the start (`90m`), the syntax of a
@@ -158,8 +157,8 @@ std::expected<simsys::SimTime, std::string> estimate_instant(const std::filesyst
     // C++23 std::unexpected: wraps the message so it converts to the std::expected the function
     // returns; C++20 std::format: type-safe `{}` formatting into a std::string, replacing a
     // stringstream or a chain of `+`.
-    return std::unexpected(std::format("{}: error: --at '{}': {}", file.string(), *at,
-                                       parsed.error().message));
+    return std::unexpected(
+        std::format("{}: error: --at '{}': {}", file.string(), *at, parsed.error().message));
   }
   const auto duration = g.scenario().duration;
   if (parsed->count() >= duration.count()) {

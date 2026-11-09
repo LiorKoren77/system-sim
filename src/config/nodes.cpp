@@ -648,8 +648,8 @@ CheckResult read_write_ops(const Site& site, const YAML::Node& body, model::Node
   }
   return collect_each(list,
                       [&](const YAML::Node& op) { return read_op_name(site, op, "write_ops op"); })
-      .and_then([&](std::vector<std::string> ops) -> std::expected<std::vector<std::string>,
-                                                                ConfigError> {
+      .and_then([&](std::vector<std::string> ops)
+                    -> std::expected<std::vector<std::string>, ConfigError> {
         if (const auto repeat = first_repeat(list)) {
           return site.fail(*repeat, std::format("duplicate write_ops op '{}'", repeat->Scalar()));
         }

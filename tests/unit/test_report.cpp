@@ -4066,8 +4066,8 @@ TEST_CASE("a lag that grows without bound in estimate says so; a run's lag is fi
   // web-crawler's frontier is offered more URLs than its downloaders drain (a loop gain above 1),
   // so its steady state has no finite lag (phase 3 review, decision 2). peak_queue_lag_s is null
   // there and for a node with no lag; queue_lag_unbounded tells the two apart.
-  const auto loaded = simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} +
-                                           "/book/web-crawler/scenario.yaml");
+  const auto loaded =
+      simsys::config::load(std::string{SIMSYS_SCENARIOS_DIR} + "/book/web-crawler/scenario.yaml");
   REQUIRE(loaded.has_value());
   const auto g = *simsys::graph::Graph::build(*loaded);
   const auto steady = simsys::report::render_json(estimated(g), {});
@@ -4086,11 +4086,8 @@ TEST_CASE("a lag that grows without bound in estimate says so; a run's lag is fi
 TEST_CASE("a queue that keeps up reports a bounded lag in a run", "[report]") {
   Scenario s = mm1(100);
   s.nodes.push_back(NodeSpec{.id = "q", .type = NodeType::message_queue});
-  s.nodes.push_back(NodeSpec{.id = "w",
-                             .type = NodeType::worker_pool,
-                             .workers = 4,
-                             .job_cost = 1ms,
-                             .consumes = "q"});
+  s.nodes.push_back(NodeSpec{
+      .id = "w", .type = NodeType::worker_pool, .workers = 4, .job_cost = 1ms, .consumes = "q"});
   s.nodes[1].ops["op"] = {Step{.to = "q", .op = "publish"}};
   s.links.push_back(LinkSpec{.from = "s", .to = "q", .latency = 0s});
   s.links.push_back(LinkSpec{.from = "q", .to = "w", .latency = 0s});
@@ -4100,8 +4097,7 @@ TEST_CASE("a queue that keeps up reports a bounded lag in a run", "[report]") {
   REQUIRE(run.contains("\"queue_lag_unbounded\": false"));
 }
 
-TEST_CASE("estimate's table shows a steady state, with drops and refusals per second",
-          "[report]") {
+TEST_CASE("estimate's table shows a steady state, with drops and refusals per second", "[report]") {
   const auto s = mm1(1500, 100);
   const auto g = *simsys::graph::Graph::build(s);
   const auto table = simsys::report::render_table(estimated(g), {}, /*color=*/false);
@@ -4144,8 +4140,9 @@ TEST_CASE("a database whose writes cost 5 is named as counting capacity units", 
   const auto line = units_line(estimate_table_of("book/url-shortener"));
   CAPTURE(line);
   // url_db states no cost, so each of a database's four default write ops costs 5.
-  REQUIRE(line == "units (peak_backlog and drops are not requests here): url_db capacity units "
-                  "(delete, insert, update, write cost 5)");
+  REQUIRE(line ==
+          "units (peak_backlog and drops are not requests here): url_db capacity units "
+          "(delete, insert, update, write cost 5)");
 }
 
 TEST_CASE("byte-sized nodes are named as counting megabytes", "[report]") {
@@ -4177,8 +4174,9 @@ TEST_CASE("a stated cost other than 1 makes a service count capacity units", "[r
   s.nodes[1].cost = {{"op", 3.0}};
   const auto g = *simsys::graph::Graph::build(s);
   const auto line = units_line(simsys::report::render_table(summarize(s, g), {}, false));
-  REQUIRE(line == "units (peak_backlog and drops are not requests here): s capacity units "
-                  "(op cost 3)");
+  REQUIRE(line ==
+          "units (peak_backlog and drops are not requests here): s capacity units "
+          "(op cost 3)");
 }
 
 // ---- Batch C review fixes (phase 4a) -----------------------------------------------------------
@@ -4190,17 +4188,16 @@ TEST_CASE("a kv_cluster's stated cost is named beside its replica-requests", "[r
   s.nodes[1].cost = {{"op", 4.0}};
   const auto g = *simsys::graph::Graph::build(s);
   const auto line = units_line(simsys::report::render_table(estimated(g), {}, false));
-  REQUIRE(line == "units (peak_backlog and drops are not requests here): s replica-requests (N 3; "
-                  "op cost 4 each)");
+  REQUIRE(line ==
+          "units (peak_backlog and drops are not requests here): s replica-requests (N 3; "
+          "op cost 4 each)");
 }
 
 TEST_CASE("estimate's windowed SLO note names the instant it settled at", "[report]") {
   Scenario s = mm1(100);
   s.duration = 2h;
-  s.slos = {simsys::model::SloSpec{.metric = simsys::model::SloMetric::utilization,
-                                   .node = "s",
-                                   .max = 0.9,
-                                   .over = 1h}};
+  s.slos = {simsys::model::SloSpec{
+      .metric = simsys::model::SloMetric::utilization, .node = "s", .max = 0.9, .over = 1h}};
   const auto g = *simsys::graph::Graph::build(s);
   const auto summary =
       Summary::of_estimate(g, (*simsys::engine::Simulation::create(g)).estimate(90min));
