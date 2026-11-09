@@ -4180,3 +4180,60 @@ TEST_CASE("a stated cost other than 1 makes a service count capacity units", "[r
   REQUIRE(line == "units (peak_backlog and drops are not requests here): s capacity units "
                   "(op cost 3)");
 }
+
+// ---- Batch C review fixes (phase 4a) -----------------------------------------------------------
+
+TEST_CASE("a kv_cluster's stated cost is named beside its replica-requests", "[report]") {
+  // op_cost = the stated cost × N, so a put of cost 4 at N 3 is 12 units: the line says both.
+  Scenario s = mm1(100);
+  s.nodes[1] = NodeSpec{.id = "s", .type = NodeType::kv_cluster, .kv_nodes = 3};
+  s.nodes[1].cost = {{"op", 4.0}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto line = units_line(simsys::report::render_table(estimated(g), {}, false));
+  REQUIRE(line == "units (peak_backlog and drops are not requests here): s replica-requests (N 3; "
+                  "op cost 4 each)");
+}
+
+TEST_CASE("estimate's windowed SLO note names the instant it settled at", "[report]") {
+  Scenario s = mm1(100);
+  s.duration = 2h;
+  s.slos = {simsys::model::SloSpec{.metric = simsys::model::SloMetric::utilization,
+                                   .node = "s",
+                                   .max = 0.9,
+                                   .over = 1h}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto summary =
+      Summary::of_estimate(g, (*simsys::engine::Simulation::create(g)).estimate(90min));
+  const auto results = simsys::report::evaluate_slos(summary, s.slos);
+  const auto table = simsys::report::render_table(summary, results, false);
+  CAPTURE(table);
+  REQUIRE(table.contains("(at 01:30 only: run checks each 1h)"));
+}
+
+TEST_CASE("estimate's JSON has no dead-letter total either", "[report]") {
+  // A worker pool's dead letters are a total like its drops: null in a steady state.
+  Scenario s = mm1(100);
+  s.nodes.push_back(NodeSpec{.id = "q", .type = NodeType::message_queue});
+  s.nodes.push_back(NodeSpec{.id = "x", .type = NodeType::external_sink});
+  s.nodes.push_back(NodeSpec{.id = "w",
+                             .type = NodeType::worker_pool,
+                             .then = {Step{.to = "x", .op = "send"}},
+                             .workers = 4,
+                             .job_cost = 1ms,
+                             .consumes = "q",
+                             .retries = 2});
+  s.nodes[1].ops["op"] = {Step{.to = "q", .op = "publish"}};
+  s.links.push_back(LinkSpec{.from = "s", .to = "q", .latency = 0s});
+  s.links.push_back(LinkSpec{.from = "q", .to = "w", .latency = 0s});
+  s.links.push_back(LinkSpec{.from = "w", .to = "x", .latency = 0s});
+  const auto g = simsys::graph::Graph::build(s);
+  INFO((g ? "" : g.error().message));
+  REQUIRE(g.has_value());
+  const auto json = simsys::report::render_json(estimated(*g), {});
+  const auto pool = json.find("{\"id\": \"w\"");
+  REQUIRE(pool != std::string::npos);
+  const auto object = json.substr(pool, json.find('}', pool) - pool);
+  CAPTURE(object);
+  REQUIRE(object.contains("\"dead_lettered\": null"));
+  REQUIRE(object.contains("\"dead_lettered_per_s\": "));
+}

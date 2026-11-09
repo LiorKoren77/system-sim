@@ -204,6 +204,7 @@ struct SloResult {
   std::optional<SimTime> window_start{};
   std::optional<SimTime> window_length{};
   bool at_one_instant{};
+  SimTime instant{};  // with at_one_instant: the instant estimate settled at (`--at`, else 0)
 };
 
 // What a scripted fault did to one of the scenario's SLOs, judged against the fault-free twin run
