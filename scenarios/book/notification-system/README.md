@@ -29,6 +29,7 @@ nodes
   sms_provider        0.09343      0.75             0   483.7k                -         0               -      0         -
   email_provider       0.2582       0.8             0   556.9k                -         0               -      0         -
   log_db              0.04971    0.6399             0        0                -         0               -      0         -
+units (peak_backlog and drops are not requests here): user_db capacity units (delete, insert, update, write cost 5); log_db replica-requests (N 2)
 ...
 slo
   status  metric     node   op  observed  max

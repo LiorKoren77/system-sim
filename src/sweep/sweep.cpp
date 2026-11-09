@@ -15,8 +15,10 @@ module;
 #include <cstddef>
 #include <expected>
 #include <functional>  // std::function: session::run_in_parallel's parameter
+#include <iterator>    // std::back_inserter: a row's verdict cells after its numbers
 #include <limits>
 #include <optional>
+#include <ranges>  // std::views::cartesian_product: the grid's pairs (grid_points)
 #include <span>
 #include <string>
 #include <string_view>
@@ -45,7 +47,7 @@ namespace {
 
 // ---- --param: <dot.path>=<from>..<to>:<n> ------------------------------------------------------
 
-constexpr std::string_view param_grammar = "<dot.path>=<from>..<to>:<n>";
+constexpr std::string_view param_grammar = "<dot.path>=<from>..<to>:<n>[:log]";
 
 std::unexpected<std::string> param_error(std::string_view what) {
   // C++23 std::unexpected<E>: wraps an error so it converts to any std::expected<T, E>.
@@ -91,7 +93,23 @@ struct SpecParts {
   std::string_view from;
   std::string_view to;
   std::string_view count;
+  std::string_view spacing;  // the word after a second ':' (`log`), empty without one
 };
+
+// Whether the text after the range's last ':' is a spacing word (`log`) rather than the count:
+// a word starts with a letter, and only counts as one when what precedes it, back to the colon
+// before, is a count of digits (`:5:log`). A mistyped count (`:three`) is then still the count,
+// and gets the count's own message.
+bool is_spacing_word(std::string_view range, std::size_t last_colon) {
+  const auto word = range.substr(last_colon + 1);
+  const bool starts_with_letter = !word.empty() && ((word.front() >= 'a' && word.front() <= 'z') ||
+                                                    (word.front() >= 'A' && word.front() <= 'Z'));
+  if (!starts_with_letter || last_colon == 0) return false;
+  const auto count_colon = range.rfind(':', last_colon - 1);
+  if (count_colon == std::string_view::npos) return false;
+  const auto count = range.substr(count_colon + 1, last_colon - count_colon - 1);
+  return !count.empty() && std::ranges::all_of(count, [](char c) { return c >= '0' && c <= '9'; });
+}
 
 std::expected<SpecParts, std::string> split_spec(std::string_view spec) {
   const auto bad_shape =
@@ -99,16 +117,27 @@ std::expected<SpecParts, std::string> split_spec(std::string_view spec) {
   const auto equals = spec.find('=');
   if (equals == std::string_view::npos || equals == 0) return bad_shape;
   const auto range = spec.substr(equals + 1);
-  const auto colon = range.rfind(':');
-  if (colon == std::string_view::npos) return bad_shape;
-  const auto ends = range.substr(0, colon);
+  // The colons are found from the right: an end may hold one itself (a clock time, `10:00`).
+  const auto last_colon = range.rfind(':');
+  if (last_colon == std::string_view::npos) return bad_shape;
+  const auto after_last = range.substr(last_colon + 1);
+  const bool has_spacing = is_spacing_word(range, last_colon);
+  // With a spacing word the count sits between the last two colons, else after the last one.
+  const auto count_colon = !has_spacing     ? last_colon
+                           : last_colon > 0 ? range.rfind(':', last_colon - 1)
+                                            : std::string_view::npos;
+  if (count_colon == std::string_view::npos) return bad_shape;
+  const auto ends = range.substr(0, count_colon);
   const auto dots = ends.find("..");
   if (dots == std::string_view::npos) return bad_shape;
   return SpecParts{.path = spec.substr(0, equals),
                    .range = range,
                    .from = ends.substr(0, dots),
                    .to = ends.substr(dots + 2),
-                   .count = range.substr(colon + 1)};
+                   .count = has_spacing
+                                ? range.substr(count_colon + 1, last_colon - count_colon - 1)
+                                : after_last,
+                   .spacing = has_spacing ? after_last : std::string_view{}};
 }
 
 // The most points a sweep runs. Chosen, not from the book: each point is a whole simulation, so
@@ -151,6 +180,14 @@ std::string point_text(double value, bool whole) {
   return significant(whole ? std::round(value) : value, whole ? 17 : 12);
 }
 
+// "workers must be whole (400..600:4 gives 466.67)": a whole key's point that is not whole.
+std::unexpected<std::string> not_whole(const SpecParts& parts, double value,
+                                       std::string_view unit) {
+  return param_error(std::string{last_key(parts.path)} + " must be whole (" +
+                     std::string{parts.range} + " gives " +
+                     to_chars_text(value, std::chars_format::fixed, 2) + std::string{unit} + ")");
+}
+
 std::expected<std::vector<std::string>, std::string> expand(const SpecParts& parts,
                                                             const RangeEnd& from,
                                                             const RangeEnd& to, std::size_t n) {
@@ -159,12 +196,46 @@ std::expected<std::vector<std::string>, std::string> expand(const SpecParts& par
   std::vector<std::string> values;
   for (std::size_t k = 0; k < n; ++k) {
     const double value = point_at(from.number, to.number, k, n);
-    if (whole && !is_whole(value)) {
-      return param_error(std::string{last_key(parts.path)} + " must be whole (" +
-                         std::string{parts.range} + " gives " +
-                         to_chars_text(value, std::chars_format::fixed, 2) + from.unit + ")");
-    }
+    if (whole && !is_whole(value)) return not_whole(parts, value, from.unit);
     values.push_back(point_text(value, whole) + from.unit);
+  }
+  return values;
+}
+
+// Point k of n geometric points from `from` to `to` (both positive), both included: a constant
+// ratio r = (to / from)^(1 / (n − 1)) between neighbours, from × r^k, computed as
+// exp(ln from + k/(n − 1) × (ln to − ln from)) so that a range as wide as 1e-300..1e300 does not
+// overflow `to / from`. The last point is `to` itself, so the floating-point arithmetic cannot
+// leave it a bit short (1000^(1/3) = 9.999999999999998).
+double geometric_point_at(double from, double to, std::size_t k, std::size_t n) {
+  if (k + 1 == n) return to;
+  const double share = static_cast<double>(k) / static_cast<double>(n - 1);
+  return std::exp(std::log(from) + share * (std::log(to) - std::log(from)));
+}
+
+// The `:log` points. A whole key's ends must be whole, as on a linear range (the ends are what
+// the user typed); the points between are rounded, since a geometric point is almost never whole
+// (a linear one is, if n is chosen for it). Two points that come out alike (rounded, or from equal
+// ends) would run the same scenario twice and are refused, naming the first repeat.
+std::expected<std::vector<std::string>, std::string> expand_geometric(const SpecParts& parts,
+                                                                      const RangeEnd& from,
+                                                                      const RangeEnd& to,
+                                                                      std::size_t n) {
+  const bool whole = config::counts_whole_things(parts.path);
+  if (whole && !is_whole(from.number)) return not_whole(parts, from.number, from.unit);
+  if (whole && !is_whole(to.number)) return not_whole(parts, to.number, to.unit);
+  std::vector<std::string> values;
+  for (std::size_t k = 0; k < n; ++k) {
+    double value = geometric_point_at(from.number, to.number, k, n);
+    if (whole) value = std::round(value);
+    auto text = point_text(value, whole) + from.unit;
+    if (!values.empty() && values.back() == text) {
+      const auto key = std::string{last_key(parts.path)};
+      return param_error(key + "=" + std::string{parts.range} + " gives " + text + " twice" +
+                         (whole ? " (rounded to whole " + key + ")" : std::string{}) +
+                         "; use fewer points");
+    }
+    values.push_back(std::move(text));
   }
   return values;
 }
@@ -172,7 +243,8 @@ std::expected<std::vector<std::string>, std::string> expand(const SpecParts& par
 // ---- --metric --------------------------------------------------------------------------------
 
 constexpr std::string_view metric_grammar =
-    "<client>.<op>.mean|p50|p95|p99|attempts|answered, <node>.mean_rho|peak_rho|drop_rate, "
+    "<client>.<op>.mean|p50|p95|p99|attempts|answered, "
+    "<node>.mean_rho|peak_rho|drop_rate|reject_rate, "
     "<queue>.lag, <pool>.dead_lettered, <fanout>.deduplicated or <gateway>.connections";
 
 // A metric's last word and what it reads (sweep.cppm's MetricKind); one row each.
@@ -192,6 +264,7 @@ constexpr std::array op_metric_words{MetricWord{"mean", MetricKind::mean_latency
 constexpr std::array node_metric_words{MetricWord{"mean_rho", MetricKind::mean_rho},
                                        MetricWord{"peak_rho", MetricKind::peak_rho},
                                        MetricWord{"drop_rate", MetricKind::drop_rate},
+                                       MetricWord{"reject_rate", MetricKind::reject_rate},
                                        MetricWord{"lag", MetricKind::peak_queue_lag},
                                        MetricWord{"dead_lettered", MetricKind::dead_lettered_rate},
                                        MetricWord{"deduplicated", MetricKind::deduplicated_rate},
@@ -240,6 +313,7 @@ std::optional<report::OpLatency> latency_column(MetricKind kind) {
     case MetricKind::mean_rho:
     case MetricKind::peak_rho:
     case MetricKind::drop_rate:
+    case MetricKind::reject_rate:
     case MetricKind::peak_queue_lag:
     case MetricKind::attempts_rate:
     case MetricKind::answered_rate:
@@ -326,6 +400,8 @@ std::optional<std::string> problem_with_node(const model::NodeSpec& node,
       return serving_problem(node, "utilization");
     case MetricKind::drop_rate:
       return serving_problem(node, "drop rate");
+    case MetricKind::reject_rate:
+      return serving_problem(node, "reject rate");
     case MetricKind::peak_queue_lag:
       return lag_problem(node);
     case MetricKind::connections:
@@ -367,6 +443,8 @@ constexpr double no_value = std::numeric_limits<double>::quiet_NaN();
 struct Measured {
   std::vector<double> numbers;
   std::vector<std::size_t> beyond_timeout;
+  std::vector<SloCell> slos{};     // with --slos only
+  std::optional<int> exit_code{};  // with --slos only
 };
 
 // A client op metric's op, or nothing when the run has no row for it.
@@ -388,6 +466,8 @@ double node_metric(const report::Summary& summary, std::span<const report::NodeS
       return node->peak_rho;
     case MetricKind::drop_rate:
       return summary.drop_rate(metric.node);
+    case MetricKind::reject_rate:  // what the behaviour refused, a share of what it was sent
+      return summary.reject_rate(metric.node);
     case MetricKind::peak_queue_lag:
       return node->peak_queue_lag_s.value_or(no_value);
     case MetricKind::dead_lettered_rate:  // JSON's dead_lettered_per_s, 0 without retries
@@ -442,35 +522,156 @@ Measured read_metrics(const report::Summary& summary, std::span<const SweepMetri
 
 // ---- one point ---------------------------------------------------------------------------------
 
-// "point 2 (nodes.users.rate.base=-1/s): ": points count from 1, as a person counts them.
-std::string point_label(const SweepParam& param, std::size_t index) {
-  return "point " + std::to_string(index + 1) + " (" + param.path + "=" + param.values[index] +
-         "): ";
+// Every point's values, one per param, in run order. One param: its values. Two: every pair,
+// the first param the outer loop, so (a1, b1) (a1, b2) ... (a2, b1) ...
+// C++23 std::views::cartesian_product: the pairs of two ranges as a view of tuples, in that order.
+// It replaces two nested loops whose order a reader must check, and takes no lambda, so the fifth
+// GCC 14.2 defect (a lambda in a range adaptor in a module function) does not arise.
+// One or two params: grid_problem has refused any other count before this runs.
+std::vector<std::vector<std::string>> grid_points(std::span<const SweepParam> params) {
+  std::vector<std::vector<std::string>> points;
+  if (params.size() == 1) {
+    for (const auto& value : params[0].values) points.push_back({value});
+    return points;
+  }
+  for (const auto& [outer, inner] :
+       std::views::cartesian_product(params[0].values, params[1].values)) {
+    points.push_back({outer, inner});
+  }
+  return points;
+}
+
+// "point 2 (nodes.users.rate.base=-1/s): ", or with two keys "point 3 (a=300/s, b=1k/s): ":
+// points count from 1, as a person counts them.
+std::string point_label(std::span<const SweepParam> params, std::span<const std::string> values,
+                        std::size_t index) {
+  std::string pairs;
+  for (std::size_t k = 0; k < params.size(); ++k) {
+    pairs += (k == 0 ? "" : ", ") + params[k].path + "=" + values[k];
+  }
+  return "point " + std::to_string(index + 1) + " (" + pairs + "): ";
 }
 
 // Phase 1 for one point: the scenario with the point's value in place, checked by the loader
 // and resolved by the graph builder, exactly as `simsys explain` and `run` load a file
 // (session::load_graph). No simulation yet.
 std::expected<graph::Graph, std::string> prepare_point(const std::string& path,
-                                                       const SweepParam& param, std::size_t index) {
-  const std::array overrides{config::Override{.path = param.path, .value = param.values[index]}};
+                                                       std::span<const SweepParam> params,
+                                                       std::span<const std::string> values,
+                                                       std::size_t index) {
+  std::vector<config::Override> overrides;
+  for (std::size_t k = 0; k < params.size(); ++k) {
+    overrides.push_back(config::Override{.path = params[k].path, .value = values[k]});
+  }
   // C++23 std::expected::transform_error: rewrites only an error (here: the point's label in front
   // of the message), passing a value through.
   return session::load_graph(path, overrides).transform_error([&](const std::string& message) {
-    return point_label(param, index) + message;
+    return point_label(params, values, index) + message;
   });
 }
 
+// Each SLO's column heading: its metric, then `:node` and `.op` where it names them; a heading that
+// an earlier SLO already took gets `#2`, `#3`, ... in file order, so every column has its own name.
+std::vector<std::string> slo_headings(std::span<const model::SloSpec> slos) {
+  std::vector<std::string> plain;
+  std::vector<std::string> headings;
+  for (const auto& slo : slos) {
+    std::string heading{model::to_string(slo.metric)};
+    if (slo.node) heading += ":" + *slo.node;
+    if (slo.node && slo.op) heading += "." + *slo.op;
+    const auto earlier = std::ranges::count(plain, heading);
+    plain.push_back(heading);
+    headings.push_back(earlier == 0 ? heading : heading + "#" + std::to_string(earlier + 1));
+  }
+  return headings;
+}
+
+SloVerdict verdict_of(report::SloStatus status) {
+  switch (status) {
+    case report::SloStatus::pass:
+      return SloVerdict::pass;
+    case report::SloStatus::fail:
+      return SloVerdict::fail;
+    case report::SloStatus::skipped:
+      return SloVerdict::skipped;
+  }
+  // C++23 std::unreachable: tells the compiler (and the reader) that the switch above covers every
+  // value, replacing a made-up fallback return that would hide a value added to the enum later;
+  // reaching it is undefined behaviour, and -Wswitch already refuses a missing case at compile
+  // time.
+  std::unreachable();
+}
+
+// The point judged as `simsys run` judges its file (main.cpp's print_report): every SLO by
+// report::evaluate_slos, and the exit code 0 when all pass (skipped counts as a pass), 2 when one
+// fails, 1 when the run observed no step.
+void judge(const report::Summary& summary, const graph::Graph& g,
+           std::span<const std::string> headings, Measured& measured) {
+  const auto results = report::evaluate_slos(summary, g.scenario().slos);
+  for (std::size_t k = 0; k < results.size(); ++k) {
+    measured.slos.push_back(
+        SloCell{.heading = headings[k], .verdict = verdict_of(results[k].status)});
+  }
+  if (summary.observed_steps() == 0) {
+    measured.exit_code = 1;
+  } else {
+    measured.exit_code = report::all_pass(results) ? 0 : 2;
+  }
+}
+
 // Phase 2 for one point: a run of the whole scenario, exactly as `simsys run` does it (its
-// duration, its step, its warmup: session::run_summary), and each metric read off the summary.
-// The Simulation, the Summary and the graph belong to this point alone: nothing here is shared
-// with another thread.
+// duration, its step, its warmup: session::run_summary), and each metric read off the summary;
+// with --slos, the point judged (judge). The Simulation, the Summary and the graph belong to this
+// point alone: nothing here is shared with another thread. `headings` are the SLOs' column names,
+// the same at every point (an override changes a value, never the SLO list), worked out once.
 std::expected<Measured, std::string> measure_point(const std::string& path, const graph::Graph& g,
-                                                   std::span<const SweepMetric> metrics) {
+                                                   std::span<const SweepMetric> metrics,
+                                                   SloColumns slos,
+                                                   std::span<const std::string> headings) {
   // C++23 std::expected::transform: maps the value (a summary into its metrics) and passes an
   // error through untouched.
-  return session::run_summary(g, path).transform(
-      [&](const report::Summary& summary) { return read_metrics(summary, metrics); });
+  return session::run_summary(g, path).transform([&](const report::Summary& summary) {
+    auto measured = read_metrics(summary, metrics);
+    if (slos == SloColumns::on) judge(summary, g, headings, measured);
+    return measured;
+  });
+}
+
+std::unexpected<std::string> too_many_keys() {
+  return param_error("at most two keys (a grid of two); script a third");
+}
+
+// Why `params` cannot be swept as one grid, or nothing: one or two keys, no key twice, and at
+// most max_points points in all (every point's graph is built before any runs). parse_params and
+// run_sweep both ask, so a caller of the exported run_sweep cannot step past it.
+std::optional<std::string> grid_problem(std::span<const SweepParam> params) {
+  if (params.empty()) return "--param: a sweep needs a key";
+  if (params.size() > max_params) return too_many_keys().error();
+  if (params.size() == 1) return std::nullopt;
+  if (params[0].path == params[1].path) return "--param: " + params[1].path + " is given twice";
+  const auto rows = params[0].values.size();
+  const auto columns = params[1].values.size();
+  if (rows * columns <= max_points) return std::nullopt;
+  return "--param: " + std::to_string(rows) + " x " + std::to_string(columns) + " = " +
+         std::to_string(rows * columns) + " points: at most " + std::to_string(max_points);
+}
+
+// The params' path mistakes (a missing key, a list on the way) are the same at every point:
+// reported once, with no point to blame. Two paths that reach one value of the file (an anchor
+// and its alias) would write one key's points over the other's, so the grid is refused.
+std::optional<std::string> first_path_problem(const std::string& scenario_path,
+                                              std::span<const SweepParam> params) {
+  for (const auto& param : params) {
+    if (const auto path = config::check_override_path(scenario_path, param.path); !path) {
+      return config::describe(path.error());
+    }
+  }
+  if (params.size() < 2) return std::nullopt;
+  const auto same = config::same_override_target(scenario_path, params[0].path, params[1].path);
+  if (!same) return config::describe(same.error());
+  if (!*same) return std::nullopt;
+  return scenario_path + ": error: --param: " + params[1].path + " reaches the same value as " +
+         params[0].path + " (a YAML anchor and its alias)";
 }
 
 // ---- the points in parallel --------------------------------------------------------------------
@@ -544,20 +745,57 @@ std::string csv_cell(double value) {
 // The table's cells, the header first.
 using Cells = std::vector<std::vector<std::string>>;
 
+// A verdict as each format prints it: for people in capitals, a skipped SLO a dash as a missing
+// number is; for programs in the SLO table's JSON words.
+std::string verdict_cell(SloVerdict verdict, SweepFormat format) {
+  const bool table = format == SweepFormat::table;
+  switch (verdict) {
+    case SloVerdict::pass:
+      return table ? "PASS" : "pass";
+    case SloVerdict::fail:
+      return table ? "FAIL" : "fail";
+    case SloVerdict::skipped:
+      return table ? "-" : "skipped";
+  }
+  std::unreachable();
+}
+
+// The verdict columns' headings, `exit` last; none when the rows carry no verdicts (no --slos).
+// Every row of one sweep has the same SLOs, so the first row's headings are every row's.
+std::vector<std::string> verdict_headings(std::span<const SweepRow> rows) {
+  if (rows.empty() || !rows.front().exit_code) return {};
+  std::vector<std::string> headings;
+  for (const auto& cell : rows.front().slos) headings.push_back(cell.heading);
+  headings.emplace_back("exit");
+  return headings;
+}
+
+// A row's verdict cells, its exit code last; none without --slos.
+std::vector<std::string> verdict_cells(const SweepRow& row, SweepFormat format) {
+  if (!row.exit_code) return {};
+  std::vector<std::string> cells;
+  for (const auto& cell : row.slos) cells.push_back(verdict_cell(cell.verdict, format));
+  cells.push_back(std::to_string(*row.exit_code));
+  return cells;
+}
+
 std::vector<std::string> table_row(std::span<const SweepMetric> metrics, const SweepRow& row) {
-  std::vector<std::string> line{row.value};
+  std::vector<std::string> line{row.values};
   for (std::size_t m = 0; m < metrics.size() && m < row.metrics.size(); ++m) {
     const bool beyond = std::ranges::contains(row.beyond_timeout, m);
     line.push_back(human_cell(metrics[m], row.metrics[m], beyond));
   }
+  std::ranges::move(verdict_cells(row, SweepFormat::table), std::back_inserter(line));
   return line;
 }
 
-Cells table_cells(const SweepParam& param, std::span<const SweepMetric> metrics,
+Cells table_cells(std::span<const SweepParam> params, std::span<const SweepMetric> metrics,
                   std::span<const SweepRow> rows) {
   Cells cells;
-  auto& header = cells.emplace_back(std::vector<std::string>{param.path});
+  auto& header = cells.emplace_back();
+  for (const auto& param : params) header.push_back(param.path);
   for (const auto& metric : metrics) header.push_back(metric.name);
+  std::ranges::move(verdict_headings(rows), std::back_inserter(header));
   for (const auto& row : rows) cells.push_back(table_row(metrics, row));
   return cells;
 }
@@ -571,14 +809,17 @@ std::string render_table(const Cells& cells) {
          aligned.substr(header_end + 1);
 }
 
-std::string render_csv(const SweepParam& param, std::span<const SweepMetric> metrics,
+std::string render_csv(std::span<const SweepParam> params, std::span<const SweepMetric> metrics,
                        std::span<const SweepRow> rows) {
-  std::string text = param.path;
+  std::string text;
+  for (const auto& param : params) text += (text.empty() ? "" : ",") + param.path;
   for (const auto& metric : metrics) text += "," + metric.name;
+  for (const auto& heading : verdict_headings(rows)) text += "," + heading;
   text += "\n";
   for (const auto& row : rows) {
-    text += row.value;
+    for (std::size_t k = 0; k < row.values.size(); ++k) text += (k == 0 ? "" : ",") + row.values[k];
     for (const double number : row.metrics) text += "," + csv_cell(number);
+    for (const auto& cell : verdict_cells(row, SweepFormat::csv)) text += "," + cell;
     text += "\n";
   }
   return text;
@@ -590,6 +831,10 @@ std::expected<SweepParam, std::string> parse_param(std::string_view spec) {
   const auto parts = split_spec(spec);
   if (!parts) return std::unexpected(parts.error());
   if (auto problem = config::dot_path_problem(parts->path)) return param_error(*problem);
+  const bool geometric = parts->spacing == "log";
+  if (!parts->spacing.empty() && !geometric) {
+    return param_error(std::string{parts->range} + ": the only spacing suffix is :log");
+  }
   const auto count = parse_count(*parts);
   if (!count) return std::unexpected(count.error());
   const auto from = parse_end(parts->from);
@@ -601,9 +846,28 @@ std::expected<SweepParam, std::string> parse_param(std::string_view spec) {
                        ": both ends must be the same kind of value in the same unit (" +
                        std::string{parts->from} + " and " + std::string{parts->to} + ")");
   }
-  auto values = expand(*parts, *from, *to, *count);
+  if (geometric && (from->number <= 0 || to->number <= 0)) {
+    return param_error(std::string{parts->range} + ": geometric points need two positive ends");
+  }
+  auto values =
+      geometric ? expand_geometric(*parts, *from, *to, *count) : expand(*parts, *from, *to, *count);
   if (!values) return std::unexpected(values.error());
-  return SweepParam{.path = std::string{parts->path}, .values = std::move(*values)};
+  return SweepParam{.path = std::string{parts->path},
+                    .values = std::move(*values),
+                    .spacing = geometric ? Spacing::geometric : Spacing::linear};
+}
+
+std::expected<std::vector<SweepParam>, std::string> parse_params(
+    std::span<const std::string> specs) {
+  if (specs.size() > max_params) return too_many_keys();
+  std::vector<SweepParam> params;
+  for (const auto& spec : specs) {
+    auto param = parse_param(spec);
+    if (!param) return std::unexpected(param.error());
+    params.push_back(std::move(*param));
+  }
+  if (auto problem = grid_problem(params)) return std::unexpected(*problem);
+  return params;
 }
 
 std::expected<SweepMetric, std::string> parse_metric(std::string_view name) {
@@ -617,9 +881,9 @@ std::expected<SweepMetric, std::string> parse_metric(std::string_view name) {
 // Every point is loaded before any is simulated, so a bad value at point 9 costs no simulation of
 // points 1 to 8.
 std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& scenario_path,
-                                                            const SweepParam& param,
+                                                            std::span<const SweepParam> params,
                                                             std::span<const SweepMetric> metrics,
-                                                            std::size_t jobs) {
+                                                            std::size_t jobs, SloColumns slos) {
   const auto base = config::load(scenario_path);
   if (!base) return std::unexpected(config::describe(base.error()));
   // A metric the file cannot answer is the file's mistake as much as the option's: worded as the
@@ -627,31 +891,43 @@ std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& s
   if (auto problem = first_metric_problem(*base, metrics)) {
     return std::unexpected(scenario_path + ": error: " + *problem);
   }
-  // The path's mistakes (a missing key, a list on the way) are the same at every point: reported
-  // once, with no point to blame.
-  if (const auto path = config::check_override_path(scenario_path, param.path); !path) {
-    return std::unexpected(config::describe(path.error()));
+  if (auto problem = grid_problem(params)) {
+    return std::unexpected(scenario_path + ": error: " + *problem);
   }
+  if (auto problem = first_path_problem(scenario_path, params)) return std::unexpected(*problem);
 
-  const auto count = param.values.size();
-  const auto graphs = for_each_point<graph::Graph>(
-      count, jobs, [&](std::size_t i) { return prepare_point(scenario_path, param, i); });
+  auto points = grid_points(params);
+  const auto headings = slo_headings(base->slos);
+  const auto count = points.size();
+  const auto graphs = for_each_point<graph::Graph>(count, jobs, [&](std::size_t i) {
+    return prepare_point(scenario_path, params, points[i], i);
+  });
   if (auto error = graphs.first_error()) return std::unexpected(*error);
 
   const auto measured = for_each_point<Measured>(count, jobs, [&](std::size_t i) {
-    return measure_point(scenario_path, *graphs.values[i], metrics)
-        .transform_error([&](const std::string& e) { return point_label(param, i) + e; });
+    return measure_point(scenario_path, *graphs.values[i], metrics, slos, headings)
+        .transform_error(
+            [&](const std::string& e) { return point_label(params, points[i], i) + e; });
   });
   if (auto error = measured.first_error()) return std::unexpected(*error);
 
   std::vector<SweepRow> rows;
   for (std::size_t i = 0; i < count; ++i) {
     const auto& point = *measured.values[i];
-    rows.push_back(SweepRow{.value = param.values[i],
+    rows.push_back(SweepRow{.values = std::move(points[i]),
                             .metrics = point.numbers,
-                            .beyond_timeout = point.beyond_timeout});
+                            .beyond_timeout = point.beyond_timeout,
+                            .slos = point.slos,
+                            .exit_code = point.exit_code});
   }
   return rows;
+}
+
+std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& scenario_path,
+                                                            const SweepParam& param,
+                                                            std::span<const SweepMetric> metrics,
+                                                            std::size_t jobs, SloColumns slos) {
+  return run_sweep(scenario_path, std::span{&param, 1}, metrics, jobs, slos);
 }
 
 std::size_t default_jobs() {
@@ -659,10 +935,15 @@ std::size_t default_jobs() {
   return std::max(1U, std::thread::hardware_concurrency());
 }
 
+std::string render_sweep(std::span<const SweepParam> params, std::span<const SweepMetric> metrics,
+                         std::span<const SweepRow> rows, SweepFormat format) {
+  if (format == SweepFormat::csv) return render_csv(params, metrics, rows);
+  return render_table(table_cells(params, metrics, rows));
+}
+
 std::string render_sweep(const SweepParam& param, std::span<const SweepMetric> metrics,
                          std::span<const SweepRow> rows, SweepFormat format) {
-  if (format == SweepFormat::csv) return render_csv(param, metrics, rows);
-  return render_table(table_cells(param, metrics, rows));
+  return render_sweep(std::span{&param, 1}, metrics, rows, format);
 }
 
 }  // namespace simsys::sweep

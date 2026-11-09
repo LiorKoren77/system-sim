@@ -159,10 +159,11 @@ class Simulation {
 
   // The long-run state at the scenario's step, without disturbing this simulation and
   // independent of what it ran before: settle passes from a clean state until nothing
-  // changes (see the definition). Clients offer their rate curve at t = 0 without noise
-  // (estimating at another time, `--at`, is in the Phase 3 backlog). Record time is 0; `converged`
-  // says whether a steady state was found.
-  [[nodiscard]] StepRecord estimate() const;
+  // changes (see the definition). Clients offer their rate curve's value at `at` (t = 0 unless
+  // `simsys estimate --at` says otherwise: wave, ramp, points and active spikes, without noise);
+  // the scripted faults are left out at any instant. The record's time is `at`; `converged` says
+  // whether a steady state was found.
+  [[nodiscard]] StepRecord estimate(SimTime at = SimTime{}) const;
 
   // The fault schedule a Simulation of `g` steps by (FaultSchedule): the scenario's faults resolved
   // against the graph, before any step (every flushed cache has been sent no reads yet:
@@ -1600,13 +1601,13 @@ void Simulation::require_scenario_step(SimTime dt) const {
 // (each pass adds the loop's input once, so it takes about capacity / input passes), or
 // the gain is so close to one that log(tolerance) / log(g) exceeds the cap, the result is
 // the last pass with `converged` false: no steady state in reach.
-StepRecord Simulation::estimate() const {
+StepRecord Simulation::estimate(SimTime at) const {
   Simulation scratch = settling_copy();  // estimate must not move a running simulation
-  return scratch.settle(SimTime{0});
+  return scratch.settle(at);
 }
 
 // estimate()'s passes, on this simulation (a settling_copy), with the clients offering their curves
-// at time `at`: the long-run state at that moment. estimate() asks for t = 0.
+// at time `at`: the long-run state at that moment.
 StepRecord Simulation::settle(SimTime at) {
   StepRecord previous = evaluate(at, step_, Mode::settle);
   for (int pass = 2; pass <= max_settle_passes; ++pass) {

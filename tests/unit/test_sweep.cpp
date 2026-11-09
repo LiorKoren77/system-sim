@@ -28,6 +28,8 @@
 import simsys.config;
 import simsys.core;
 import simsys.model;
+import simsys.report;  // evaluate_slos: what run judges, beside what a sweep point judges
+import simsys.session; // load_graph, run_summary: a point loaded and run as `simsys run` does
 import simsys.sweep;
 
 using namespace std::chrono_literals;
@@ -37,6 +39,7 @@ using simsys::Rate;
 using simsys::config::Override;
 using simsys::sweep::parse_metric;
 using simsys::sweep::parse_param;
+using simsys::sweep::parse_params;
 using simsys::sweep::render_sweep;
 using simsys::sweep::run_sweep;
 using simsys::sweep::SweepFormat;
@@ -430,16 +433,16 @@ TEST_CASE("sweeping hello's rate gives the M/M/1 latency and utilization at each
   const auto rows = hello_rows(1);
   REQUIRE(rows.size() == 3);
 
-  REQUIRE(rows[0].value == "100/s");
+  REQUIRE(rows[0].values == std::vector<std::string>{"100/s"});
   REQUIRE(rows[0].metrics.size() == 2);  // one number per metric, in the order asked
   REQUIRE_THAT(rows[0].metrics[0], WithinRel(mean_100, rel_tolerance));  // 1.61 ms
   REQUIRE_THAT(rows[0].metrics[1], WithinAbs(0.1, 1e-9));
 
-  REQUIRE(rows[1].value == "500/s");
+  REQUIRE(rows[1].values == std::vector<std::string>{"500/s"});
   REQUIRE_THAT(rows[1].metrics[0], WithinRel(mean_500, rel_tolerance));  // 2.5 ms
   REQUIRE_THAT(rows[1].metrics[1], WithinAbs(0.5, 1e-9));
 
-  REQUIRE(rows[2].value == "900/s");
+  REQUIRE(rows[2].values == std::vector<std::string>{"900/s"});
   REQUIRE_THAT(rows[2].metrics[0], WithinRel(mean_900, rel_tolerance));  // 10.5 ms
   REQUIRE_THAT(rows[2].metrics[1], WithinAbs(0.9, 1e-9));
 }
@@ -747,9 +750,9 @@ TEST_CASE("the rows do not depend on how many workers ran the points") {
   REQUIRE(one.size() == more_workers_than_points.size());
   for (std::size_t i = 0; i < one.size(); ++i) {
     CAPTURE(i);
-    REQUIRE(three[i].value == one[i].value);
+    REQUIRE(three[i].values == one[i].values);
     REQUIRE(three[i].metrics == one[i].metrics);  // exact: no tolerance
-    REQUIRE(more_workers_than_points[i].value == one[i].value);
+    REQUIRE(more_workers_than_points[i].values == one[i].values);
     REQUIRE(more_workers_than_points[i].metrics == one[i].metrics);
   }
 }
@@ -821,9 +824,9 @@ TEST_CASE("a metric naming a node or op the scenario does not have is an error n
 
 namespace {
 std::vector<SweepRow> hello_rows_by_hand() {
-  return {SweepRow{.value = "100/s", .metrics = {0.00161, 0.1}},
-          SweepRow{.value = "500/s", .metrics = {0.0025, 0.5}},
-          SweepRow{.value = "900/s", .metrics = {0.0105, 0.9}}};
+  return {SweepRow{.values = {"100/s"}, .metrics = {0.00161, 0.1}},
+          SweepRow{.values = {"500/s"}, .metrics = {0.0025, 0.5}},
+          SweepRow{.values = {"900/s"}, .metrics = {0.0105, 0.9}}};
 }
 }  // namespace
 
@@ -886,7 +889,7 @@ TEST_CASE("the csv of a real sweep holds the same numbers as its rows") {
     CAPTURE(i);
     const auto cells = split(lines[i + 1], ',');
     REQUIRE(cells.size() == 3);
-    REQUIRE(cells[0] == rows[i].value);
+    REQUIRE(cells[0] == rows[i].values[0]);
     // Round trip: format_number's text reads back to the very double in the row.
     REQUIRE(parse_double(cells[1]) == rows[i].metrics[0]);
     REQUIRE(parse_double(cells[2]) == rows[i].metrics[1]);
@@ -903,7 +906,7 @@ TEST_CASE("a number the run did not produce is a dash in the table and an empty 
   REQUIRE(latency.has_value());
   const std::vector<SweepMetric> metrics{*latency};
   const std::vector<SweepRow> rows{
-      SweepRow{.value = "100/s", .metrics = {std::numeric_limits<double>::quiet_NaN()}}};
+      SweepRow{.values = {"100/s"}, .metrics = {std::numeric_limits<double>::quiet_NaN()}}};
   const auto csv = split(render_sweep(hello_rate_sweep(), metrics, rows, SweepFormat::csv), '\n');
   REQUIRE(csv.size() == 2);
   REQUIRE(csv[1] == "100/s,");
@@ -919,8 +922,480 @@ TEST_CASE("a queue lag below a microsecond prints as the report prints it") {
   const auto lag = parse_metric("transcode_q.lag");
   REQUIRE(lag.has_value());
   const std::vector<SweepMetric> metrics{*lag};
-  const std::vector<SweepRow> rows{SweepRow{.value = "400", .metrics = {6.3e-11}}};
+  const std::vector<SweepRow> rows{SweepRow{.values = {"400"}, .metrics = {6.3e-11}}};
   const SweepParam param{.path = "nodes.transcoders.workers", .values = {"400"}};
   const auto table = split(render_sweep(param, metrics, rows, SweepFormat::table), '\n');
   REQUIRE(table.back().ends_with("<1us"));
+}
+
+// ---- <node>.reject_rate (phase 4a Task 2; spec 4a §4.1) ----------------------------------------
+
+namespace {
+// u offers 1.5k/s to a token bucket of 1k/s with a one-token burst, in front of a service with
+// room to spare. Past the first step the bucket holds no burst, so it passes its refill, 1k/s,
+// and refuses the other 500/s: a reject rate of 500 / 1500 = 1/3 of what it is sent. `api_rate`
+// is swept so that a test can also see a node that refuses nothing.
+std::string limited_path() {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("simsys-sweep-limited-" + std::to_string(getpid()) + ".yaml");
+  std::ofstream{path} << "version: 1\nname: limited\nduration: 10s\nstep: 100ms\nwarmup: 1s\n"
+                         "nodes:\n"
+                         "  u: {type: client, rate: {base: 1.5k/s}, ops: {call: 1.0}}\n"
+                         "  limiter: {type: rate_limiter, algorithm: token_bucket, limit: 1k/s, "
+                         "burst: 1}\n"
+                         "  api: {type: service, capacity: 10k/s, latency: 1ms}\n"
+                         "links:\n"
+                         "  - {from: u, to: limiter, dir: inout}\n"
+                         "  - {from: limiter, to: api, dir: inout}\n";
+  return path.string();
+}
+}  // namespace
+
+TEST_CASE("a node's reject_rate is a metric") {
+  const auto metric = parse_metric("limiter.reject_rate");
+  INFO((metric ? "" : metric.error()));
+  REQUIRE(metric.has_value());
+  REQUIRE(metric->kind == simsys::sweep::MetricKind::reject_rate);
+  REQUIRE(metric->node == "limiter");
+  REQUIRE(metric->op.empty());
+}
+
+// The sweep reads the number `run --report json` prints as the node's reject_rate: the token
+// bucket past its burst refuses (1.5k − 1k) / 1.5k = 1/3 of what it is sent, at every rate of the
+// service behind it, which refuses nothing.
+TEST_CASE("sweeping past a token bucket reads its reject rate: a third refused, none behind it") {
+  const auto path = limited_path();
+  const std::vector<SweepMetric> metrics{*parse_metric("limiter.reject_rate"),
+                                         *parse_metric("api.reject_rate")};
+  const SweepParam param{.path = "nodes.api.capacity", .values = {"5k/s", "10k/s"}};
+  const auto rows = run_sweep(path, param, metrics, 1);
+  std::filesystem::remove(path);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  for (const auto& row : *rows) {
+    CAPTURE(row.values);
+    REQUIRE_THAT(row.metrics[0], WithinRel(1.0 / 3.0, 1e-6));
+    REQUIRE(row.metrics[1] == 0.0);
+  }
+}
+
+TEST_CASE("a client has no reject rate to sweep, as it has no drop rate") {
+  const std::vector<SweepMetric> metrics{*parse_metric("users.reject_rate")};
+  const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1);
+  REQUIRE_FALSE(rows.has_value());
+  REQUIRE(rows.error() == std::string{hello_path} +
+                              ": error: --metric: users.reject_rate: 'users' is a client, which "
+                              "serves nothing, so it has no reject rate");
+}
+
+TEST_CASE("the unknown-metric message names reject_rate among the node metrics") {
+  const auto metric = parse_metric("api.bogus");
+  REQUIRE_FALSE(metric.has_value());
+  REQUIRE(metric.error().contains("<node>.mean_rho|peak_rho|drop_rate|reject_rate"));
+}
+
+// ---- Geometric points, `:log` (phase 4a Task 3; spec 4a §4.2) ----------------------------------
+// x_k = from × (to / from)^(k / (n − 1)), both ends included: a constant ratio between neighbours,
+// what a log axis plots evenly. The knee of hello's s / (1 − rho), or a cache's hit ratio against
+// its size, is read on such an axis.
+
+TEST_CASE("a geometric range multiplies by the same ratio from point to point") {
+  // 1 × 100^(k/2) for k = 0, 1, 2, in from's unit text, repeated after every point.
+  const auto param = parse_param("nodes.users.rate.base=1k/s..100k/s:3:log");
+  INFO((param ? "" : param.error()));
+  REQUIRE(param.has_value());
+  REQUIRE(param->values == std::vector<std::string>{"1k/s", "10k/s", "100k/s"});
+}
+
+TEST_CASE("a geometric range ends exactly at its upper end") {
+  // 1000^(1/3) is 9.999999999999998 in floating point; the points are written at 12 significant
+  // digits, and the last one is `to` itself, never a power that misses it.
+  const auto param = parse_param("nodes.api.latency=1ms..1000ms:4:log");
+  INFO((param ? "" : param.error()));
+  REQUIRE(param.has_value());
+  REQUIRE(param->values == std::vector<std::string>{"1ms", "10ms", "100ms", "1000ms"});
+}
+
+TEST_CASE("a geometric range of a whole key gets whole points") {
+  const auto param = parse_param("nodes.w.workers=10..1000:3:log");
+  INFO((param ? "" : param.error()));
+  REQUIRE(param.has_value());
+  REQUIRE(param->values == std::vector<std::string>{"10", "100", "1000"});
+}
+
+TEST_CASE("a geometric range of a whole key rounds, and refuses two points that round alike") {
+  // 4^(k/7) = 1, 1.219, 1.486, 1.811, ... rounds to 1, 1, 1, 2, ...: the first repeat is 1. A
+  // linear range refuses a point that is not whole; geometric points almost never are, so they
+  // round, and only a repeat (the same run twice) is refused.
+  // 10^(1/2) = 3.162 rounds to 3.
+  const auto rounded = parse_param("nodes.w.workers=1..10:3:log");
+  REQUIRE(rounded.has_value());
+  REQUIRE(rounded->values == std::vector<std::string>{"1", "3", "10"});
+  const auto repeated = parse_param("nodes.w.workers=1..4:8:log");
+  REQUIRE_FALSE(repeated.has_value());
+  REQUIRE(repeated.error() ==
+          "--param: workers=1..4:8:log gives 1 twice (rounded to whole workers); use fewer points");
+}
+
+TEST_CASE("a geometric range needs two positive ends") {
+  for (const std::string_view bad :
+       {"nodes.users.rate.base=0/s..1000/s:4:log", "nodes.api.latency=-1ms..1ms:3:log"}) {
+    CAPTURE(bad);
+    const auto param = parse_param(bad);
+    REQUIRE_FALSE(param.has_value());
+    const auto range = bad.substr(bad.find('=') + 1);
+    REQUIRE(param.error() ==
+            "--param: " + std::string{range} + ": geometric points need two positive ends");
+  }
+}
+
+TEST_CASE("log is the only spacing suffix") {
+  const auto param = parse_param("nodes.w.workers=1..10:3:lin");
+  REQUIRE_FALSE(param.has_value());
+  REQUIRE(param.error() == "--param: 1..10:3:lin: the only spacing suffix is :log");
+}
+
+// ---- Two keys: a grid (phase 4a Task 4; spec 4a §4.3) ------------------------------------------
+// Every pair of the two keys' values, the first --param the outer loop: a table of two keys is
+// still one row per point, readable; a third axis is a script's job.
+
+namespace {
+std::vector<SweepParam> hello_grid() {
+  const auto params = parse_params(std::vector<std::string>{"nodes.users.rate.base=100/s..300/s:2",
+                                                            "nodes.api.capacity=1k/s..2k/s:2"});
+  INFO((params ? "" : params.error()));
+  REQUIRE(params.has_value());
+  return *params;
+}
+}  // namespace
+
+// hello's api is one M/M/c server pool sent the users' rate: rho = rate / capacity, so the four
+// points give 100/1000, 100/2000, 300/1000 and 300/2000.
+TEST_CASE("a grid runs every pair of two keys, the first key the outer loop") {
+  const auto params = hello_grid();
+  const std::vector<SweepMetric> metrics{*parse_metric("api.mean_rho")};
+  const auto rows = run_sweep(hello_path, params, metrics, 1);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  REQUIRE(rows->size() == 4);
+  const std::array<std::vector<std::string>, 4> pairs{
+      std::vector<std::string>{"100/s", "1k/s"}, std::vector<std::string>{"100/s", "2k/s"},
+      std::vector<std::string>{"300/s", "1k/s"}, std::vector<std::string>{"300/s", "2k/s"}};
+  const std::array rho{0.1, 0.05, 0.3, 0.15};
+  for (std::size_t i = 0; i < 4; ++i) {
+    CAPTURE(i);
+    REQUIRE((*rows)[i].values == pairs[i]);
+    REQUIRE_THAT((*rows)[i].metrics[0], WithinRel(rho[i], rel_tolerance));
+  }
+}
+
+TEST_CASE("a grid's table and csv have a column per key, then the metrics") {
+  const auto params = hello_grid();
+  const std::vector<SweepMetric> metrics{*parse_metric("api.mean_rho")};
+  const auto rows = run_sweep(hello_path, params, metrics, 1);
+  REQUIRE(rows.has_value());
+  const auto table = split(render_sweep(params, metrics, *rows, SweepFormat::table), '\n');
+  CAPTURE(table);
+  REQUIRE(split_words(table[0]) ==
+          std::vector<std::string>{"nodes.users.rate.base", "nodes.api.capacity", "api.mean_rho"});
+  // table[1] is the rule of dashes under the header; the third point is the fourth line.
+  REQUIRE(split_words(table[4]) == std::vector<std::string>{"300/s", "1k/s", "0.3"});
+  const auto csv = split(render_sweep(params, metrics, *rows, SweepFormat::csv), '\n');
+  REQUIRE(csv[0] == "nodes.users.rate.base,nodes.api.capacity,api.mean_rho");
+  REQUIRE(csv[1].starts_with("100/s,1k/s,"));
+}
+
+TEST_CASE("a grid's rows do not depend on how many workers ran the points") {
+  const auto params = hello_grid();
+  const auto metrics = hello_metrics();
+  const auto one = run_sweep(hello_path, params, metrics, 1);
+  const auto three = run_sweep(hello_path, params, metrics, 3);
+  REQUIRE(one.has_value());
+  REQUIRE(three.has_value());
+  REQUIRE(render_sweep(params, metrics, *one, SweepFormat::csv) ==
+          render_sweep(params, metrics, *three, SweepFormat::csv));
+}
+
+TEST_CASE("a grid takes at most two keys") {
+  const auto params = parse_params(std::vector<std::string>{"nodes.users.rate.base=100/s..300/s:2",
+                                                            "nodes.api.capacity=1k/s..2k/s:2",
+                                                            "nodes.api.latency=1ms..2ms:2"});
+  REQUIRE_FALSE(params.has_value());
+  REQUIRE(params.error() == "--param: at most two keys (a grid of two); script a third");
+}
+
+TEST_CASE("a grid cannot sweep one key twice") {
+  const auto params = parse_params(std::vector<std::string>{"nodes.api.capacity=1k/s..2k/s:2",
+                                                            "nodes.api.capacity=3k/s..4k/s:2"});
+  REQUIRE_FALSE(params.has_value());
+  REQUIRE(params.error() == "--param: nodes.api.capacity is given twice");
+}
+
+TEST_CASE("a grid of more than 10000 points is refused before anything is loaded") {
+  const auto params = parse_params(
+      std::vector<std::string>{"nodes.users.rate.base=1/s..200/s:200", "seed=1..100:100"});
+  REQUIRE_FALSE(params.has_value());
+  REQUIRE(params.error() == "--param: 200 x 100 = 20000 points: at most 10000");
+}
+
+namespace {
+// Two services share one capacity through a YAML anchor: `&cap` on a's, `*cap` on b's. yaml-cpp
+// loads the alias as the same node, so sweeping either path moves both, and sweeping both in a
+// grid would write one value over the other.
+std::string anchored_path() {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("simsys-sweep-anchored-" + std::to_string(getpid()) + ".yaml");
+  std::ofstream{path} << "version: 1\nname: anchored\nduration: 10s\nnodes:\n"
+                         "  u: {type: client, rate: {base: 100/s}, ops: {call: 1.0}}\n"
+                         "  a: {type: service, capacity: &cap 1k/s, latency: 1ms}\n"
+                         "  b: {type: service, capacity: *cap, latency: 1ms}\n"
+                         "links:\n  - {from: u, to: a, dir: inout}\n"
+                         "  - {from: u, to: b, dir: inout}\n";
+  return path.string();
+}
+}  // namespace
+
+TEST_CASE("a grid cannot sweep two paths that reach one anchored value") {
+  const auto params = parse_params(
+      std::vector<std::string>{"nodes.a.capacity=1k/s..2k/s:2", "nodes.b.capacity=3k/s..4k/s:2"});
+  REQUIRE(params.has_value());
+  const std::vector<SweepMetric> metrics{*parse_metric("a.mean_rho")};
+  const auto path = anchored_path();
+  const auto rows = run_sweep(path, *params, metrics, 1);
+  std::filesystem::remove(path);
+  REQUIRE_FALSE(rows.has_value());
+  REQUIRE(rows.error() == path +
+                              ": error: --param: nodes.b.capacity reaches the same value as "
+                              "nodes.a.capacity (a YAML anchor and its alias)");
+}
+
+TEST_CASE("a grid point the loader refuses is named by both of its values") {
+  // The second point's rate, -1/s, is refused by the loader; the message names the pair.
+  const auto params = parse_params(std::vector<std::string>{"nodes.users.rate.base=1/s..-1/s:2",
+                                                            "nodes.api.capacity=1k/s..2k/s:2"});
+  REQUIRE(params.has_value());
+  const auto rows = run_sweep(hello_path, *params, hello_metrics(), 2);
+  REQUIRE_FALSE(rows.has_value());
+  REQUIRE(
+      rows.error().starts_with("point 3 (nodes.users.rate.base=-1/s, nodes.api.capacity=1k/s): "));
+}
+
+TEST_CASE("one --param is a sweep of one key, as before the grid") {
+  const auto params =
+      parse_params(std::vector<std::string>{"nodes.users.rate.base=100/s..900/s:3"});
+  REQUIRE(params.has_value());
+  REQUIRE(params->size() == 1);
+  const auto metrics = hello_metrics();
+  const auto grid = run_sweep(hello_path, *params, metrics, 1);
+  const auto single = run_sweep(hello_path, hello_rate_sweep(), metrics, 1);
+  REQUIRE(grid.has_value());
+  REQUIRE(single.has_value());
+  REQUIRE(render_sweep(*params, metrics, *grid, SweepFormat::table) ==
+          render_sweep(hello_rate_sweep(), metrics, *single, SweepFormat::table));
+}
+
+// ---- Batch A review fixes (phase 4a) -----------------------------------------------------------
+
+TEST_CASE("a range says how its points are spread") {
+  const auto linear = parse_param("nodes.w.workers=1..10:2");
+  const auto geometric = parse_param("nodes.w.workers=1..10:2:log");
+  REQUIRE(linear.has_value());
+  REQUIRE(geometric.has_value());
+  REQUIRE(linear->spacing == simsys::sweep::Spacing::linear);
+  REQUIRE(geometric->spacing == simsys::sweep::Spacing::geometric);
+}
+
+TEST_CASE("a geometric range of a whole key needs whole ends, as a linear one does") {
+  // The ends are what the user typed: rounding them would run values nobody asked for (0.4..10
+  // would even start at 0 workers). The points between are still rounded.
+  const auto param = parse_param("nodes.w.workers=1.4..9.6:2:log");
+  REQUIRE_FALSE(param.has_value());
+  REQUIRE(param.error() == "--param: workers must be whole (1.4..9.6:2:log gives 1.40)");
+}
+
+TEST_CASE("a geometric range as wide as a double allows does not overflow between its ends") {
+  // to / from = 1e600 is beyond a double; the points are computed in logarithms instead.
+  const auto param = parse_param("nodes.api.latency=1e-300ms..1e300ms:3:log");
+  INFO((param ? "" : param.error()));
+  REQUIRE(param.has_value());
+  REQUIRE(param->values[1] == "1ms");
+}
+
+TEST_CASE("a geometric range with equal ends is refused on any key, as it runs one point twice") {
+  const auto param = parse_param("nodes.api.latency=5ms..5ms:4:log");
+  REQUIRE_FALSE(param.has_value());
+  REQUIRE(param.error() == "--param: latency=5ms..5ms:4:log gives 5ms twice; use fewer points");
+}
+
+TEST_CASE("a count written as a word gets the count's own message, not a spacing's") {
+  const auto param = parse_param("nodes.w.workers=1..10:three");
+  REQUIRE_FALSE(param.has_value());
+  REQUIRE(param.error() == "--param: 1..10:three: the count after ':' must be a whole number");
+}
+
+// ---- --slos: a verdict per SLO and an exit code per point (phase 4a Task 5; spec 4a §4.4) -----
+// Each point is judged exactly as `simsys run` judges the same file with the point's value written
+// in: report::evaluate_slos on the point's summary, windows and the timeout rule included.
+
+namespace {
+// hello with one latency SLO. Its p99 (measured from the Release binary, 2026-11-09) is 5.66 ms,
+// 10.0 ms and 49.3 ms at 100, 500 and 900/s, an M/M/1 bending up as rho nears 1, so a 20 ms max
+// passes, passes, fails. `extra` adds more SLOs after it.
+std::string hello_with_slos(std::string_view extra = "") {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("simsys-sweep-slos-" + std::to_string(getpid()) + ".yaml");
+  std::ofstream{path} << "version: 1\nname: hello-slos\nduration: 1m\nnodes:\n"
+                         "  users: {type: client, rate: {base: 100/s}, ops: {ping: 1.0}}\n"
+                         "  api: {type: service, capacity: 1k/s, latency: 1ms}\n"
+                         "links:\n  - {from: users, to: api, dir: inout}\n"
+                         "slo:\n  - {metric: p99_latency, node: users, op: ping, max: 20ms}\n"
+                      << extra;
+  return path.string();
+}
+
+using simsys::sweep::SloColumns;
+using simsys::sweep::SloVerdict;
+}  // namespace
+
+TEST_CASE("with --slos each point gets its SLO verdicts and the exit code run would give") {
+  const auto path = hello_with_slos("  - {metric: drop_rate, max: 0}\n");
+  const auto rows = run_sweep(path, hello_rate_sweep(), hello_metrics(), 2, SloColumns::on);
+  std::filesystem::remove(path);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  const std::array p99{SloVerdict::pass, SloVerdict::pass, SloVerdict::fail};
+  const std::array exit_code{0, 0, 2};
+  for (std::size_t i = 0; i < 3; ++i) {
+    CAPTURE(i);
+    const auto& row = (*rows)[i];
+    REQUIRE(row.slos.size() == 2);
+    REQUIRE(row.slos[0].heading == "p99_latency:users.ping");
+    REQUIRE(row.slos[0].verdict == p99[i]);
+    REQUIRE(row.slos[1].heading == "drop_rate");
+    REQUIRE(row.slos[1].verdict == SloVerdict::pass);
+    REQUIRE(row.exit_code == exit_code[i]);
+  }
+}
+
+TEST_CASE("without --slos a row has no verdicts and the output is as before") {
+  const auto path = hello_with_slos();
+  const auto metrics = hello_metrics();
+  const auto rows = run_sweep(path, hello_rate_sweep(), metrics, 1);
+  std::filesystem::remove(path);
+  REQUIRE(rows.has_value());
+  for (const auto& row : *rows) {
+    REQUIRE(row.slos.empty());
+    REQUIRE_FALSE(row.exit_code.has_value());
+  }
+}
+
+TEST_CASE("a point's verdicts are those of run on the same file with the value written in") {
+  const auto path = hello_with_slos("  - {metric: utilization, node: api, max: 0.4}\n");
+  const auto rows = run_sweep(path, hello_rate_sweep(), hello_metrics(), 1, SloColumns::on);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  for (std::size_t i = 0; i < 3; ++i) {
+    CAPTURE(i);
+    // What `simsys run` does with the file, the point's value written in (session::load_graph,
+    // run_summary, then report::evaluate_slos and its exit code, as main.cpp's print_report).
+    const std::vector<Override> overrides{
+        {.path = "nodes.users.rate.base", .value = hello_rate_sweep().values[i]}};
+    const auto g = simsys::session::load_graph(path, overrides);
+    REQUIRE(g.has_value());
+    const auto summary = simsys::session::run_summary(*g, path);
+    REQUIRE(summary.has_value());
+    const auto results = simsys::report::evaluate_slos(*summary, g->scenario().slos);
+    REQUIRE((*rows)[i].slos.size() == results.size());
+    for (std::size_t k = 0; k < results.size(); ++k) {
+      const bool passed = results[k].status == simsys::report::SloStatus::pass;
+      const bool failed = results[k].status == simsys::report::SloStatus::fail;
+      REQUIRE(((*rows)[i].slos[k].verdict == SloVerdict::pass) == passed);
+      REQUIRE(((*rows)[i].slos[k].verdict == SloVerdict::fail) == failed);
+    }
+    REQUIRE((*rows)[i].exit_code == (simsys::report::all_pass(results) ? 0 : 2));
+  }
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("two SLOs of one heading are told apart by their place") {
+  const auto path = hello_with_slos("  - {metric: p99_latency, node: users, op: ping, max: 1s}\n");
+  const auto rows = run_sweep(path, hello_rate_sweep(), hello_metrics(), 1, SloColumns::on);
+  std::filesystem::remove(path);
+  REQUIRE(rows.has_value());
+  REQUIRE((*rows)[0].slos[0].heading == "p99_latency:users.ping");
+  REQUIRE((*rows)[0].slos[1].heading == "p99_latency:users.ping#2");
+}
+
+TEST_CASE("the table and csv show each verdict and the exit code after the metrics") {
+  const auto path = hello_with_slos();
+  const auto metrics = hello_metrics();
+  const auto rows = run_sweep(path, hello_rate_sweep(), metrics, 1, SloColumns::on);
+  std::filesystem::remove(path);
+  REQUIRE(rows.has_value());
+  const auto table =
+      split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::table), '\n');
+  CAPTURE(table);
+  REQUIRE(split_words(table[0]) == std::vector<std::string>{"nodes.users.rate.base",
+                                                            "users.ping.mean", "api.mean_rho",
+                                                            "p99_latency:users.ping", "exit"});
+  REQUIRE(split_words(table[2]).back() == "0");
+  REQUIRE(split_words(table[4]) == std::vector<std::string>{"900/s", "10.5ms", "0.9", "FAIL", "2"});
+  const auto csv = split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::csv), '\n');
+  REQUIRE(csv[0] ==
+          "nodes.users.rate.base,users.ping.mean,api.mean_rho,p99_latency:users.ping,exit");
+  REQUIRE(csv[1].ends_with(",pass,0"));
+  REQUIRE(csv[3].ends_with(",fail,2"));
+}
+
+TEST_CASE("a scenario without SLOs gets an exit column of zeros under --slos") {
+  const auto metrics = hello_metrics();
+  const auto rows = run_sweep(hello_path, hello_rate_sweep(), metrics, 1, SloColumns::on);
+  REQUIRE(rows.has_value());
+  for (const auto& row : *rows) {
+    REQUIRE(row.slos.empty());
+    REQUIRE(row.exit_code == 0);
+  }
+  const auto csv = split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::csv), '\n');
+  REQUIRE(csv[0] == "nodes.users.rate.base,users.ping.mean,api.mean_rho,exit");
+}
+
+TEST_CASE("a skipped SLO is a dash in the table and skipped in the csv") {
+  // A third party that fails everything it serves answers nobody, so a latency SLO on the op has
+  // no latency to observe and is skipped (spec §19 entry 8), at every point.
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("simsys-sweep-skipped-" + std::to_string(getpid()) + ".yaml");
+  std::ofstream{path} << "version: 1\nname: skipped\nduration: 1m\nnodes:\n"
+                         "  users: {type: client, rate: {base: 100/s}, ops: {ping: 1.0}}\n"
+                         "  api: {type: external_sink, failure_rate: 1}\n"
+                         "links:\n  - {from: users, to: api, dir: inout}\n"
+                         "slo:\n  - {metric: p99_latency, node: users, op: ping, max: 1s}\n";
+  const std::vector<SweepMetric> metrics{*parse_metric("api.mean_rho")};
+  const auto rows = run_sweep(path.string(), hello_rate_sweep(), metrics, 1, SloColumns::on);
+  std::filesystem::remove(path);
+  INFO((rows ? "" : rows.error()));
+  REQUIRE(rows.has_value());
+  REQUIRE((*rows)[0].slos[0].verdict == SloVerdict::skipped);
+  REQUIRE((*rows)[0].exit_code == 0);  // skipped counts as a pass, as in run
+  const auto table =
+      split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::table), '\n');
+  REQUIRE(split_words(table[2])[2] == "-");
+  const auto csv = split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::csv), '\n');
+  REQUIRE(csv[1].ends_with(",skipped,0"));
+}
+
+TEST_CASE("run_sweep refuses a grid that parse_params would refuse, whoever built the params") {
+  const auto rate = hello_rate_sweep();
+  const SweepParam latency{.path = "nodes.api.latency", .values = {"1ms", "2ms"}};
+  const auto metrics = hello_metrics();
+  const auto none = run_sweep(hello_path, std::span<const SweepParam>{}, metrics, 1);
+  REQUIRE_FALSE(none.has_value());
+  REQUIRE(none.error() == hello_path + ": error: --param: a sweep needs a key");
+  const std::vector three{rate, latency, latency};
+  const auto too_many = run_sweep(hello_path, three, metrics, 1);
+  REQUIRE_FALSE(too_many.has_value());
+  REQUIRE(too_many.error().ends_with("--param: at most two keys (a grid of two); script a third"));
+  const std::vector twice{rate, rate};
+  const auto repeated = run_sweep(hello_path, twice, metrics, 1);
+  REQUIRE_FALSE(repeated.has_value());
+  REQUIRE(repeated.error().ends_with("--param: nodes.users.rate.base is given twice"));
 }

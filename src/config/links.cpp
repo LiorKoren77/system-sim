@@ -84,10 +84,8 @@ std::expected<std::string, ConfigError> read_link_op(const Site& site, const YAM
 // The filter is a set of ops: one listed twice is a typo or a leftover edit. Runs after
 // read_link_op has checked that every element is a scalar.
 CheckResult check_link_ops_unique(const Site& site, const YAML::Node& list) {
-  std::set<std::string_view> seen;  // views into the document's own text, as in the key check
-  for (const auto& op : list) {
-    if (seen.insert(op.Scalar()).second) continue;
-    return site.fail(op, std::format("duplicate op '{}'", op.Scalar()));
+  if (const auto repeat = first_repeat(list)) {
+    return site.fail(*repeat, std::format("duplicate op '{}'", repeat->Scalar()));
   }
   return {};
 }

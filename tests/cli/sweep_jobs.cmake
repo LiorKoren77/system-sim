@@ -15,10 +15,15 @@
 #                       file does not have and a value the loader refuses each exit 1, with the
 #                       reason on stderr and nothing on stdout;
 #   slo_failure_exit_0 - a sweep where an SLO fails at every point still exits 0 (`run` on the
-#                       same file exits 2): a sweep reports numbers, it does not judge them;
+#                       same file exits 2): a sweep reports numbers, it does not judge them; with
+#                       --slos it prints the verdicts and still exits 0, and on a scenario without
+#                       SLOs it says so on stderr;
 #   error_prefixes    - every refusal of an option starts as the CLI's other errors do, with the
 #                       file and `error:`, then names its option the same way, `--param: ` or
-#                       `--metric: `, whether the text, the file or the loader found the mistake.
+#                       `--metric: `, whether the text, the file or the loader found the mistake;
+#   grid_same_bytes   - a grid over two keys (`--param` given twice: hello's rate and the api's
+#                       capacity, 2 x 2 points) prints the same bytes with --jobs 1 and --jobs 3,
+#                       a header naming both keys and four rows, the first key the outer loop.
 cmake_minimum_required(VERSION 3.28)
 
 file(REMOVE_RECURSE "${WORK}")
@@ -169,6 +174,43 @@ elseif(CHECK STREQUAL "slo_failure_exit_0")
   endif()
   run_sweep("${WORK}/hello-slo.yaml" --param "${PARAM}" --metric users.ping.mean)
   require_output("a sweep over a failing SLO")
+  # --slos prints the verdicts (FAIL at every point, exit column 2) and still exits 0: a sweep
+  # explores, its interesting rows are the failing ones (spec 4a §2).
+  run_sweep("${WORK}/hello-slo.yaml" --param "${PARAM}" --metric users.ping.mean --slos)
+  require_output("--slos over a failing SLO")
+  string(FIND "${sweep_out}" "FAIL" at)
+  if(at EQUAL -1)
+    message(FATAL_ERROR "--slos printed no FAIL:\n${sweep_out}")
+  endif()
+  # hello itself has no SLOs: --slos says so on stderr, and every exit cell is 0.
+  run_sweep("${SCENARIO}" --param "${PARAM}" --metric users.ping.mean --slos)
+  require_output("--slos on a scenario without SLOs")
+  string(FIND "${sweep_err}" "the scenario has no SLOs, so no point can fail one" at)
+  if(at EQUAL -1)
+    message(FATAL_ERROR "no note for a scenario without SLOs:\n${sweep_err}")
+  endif()
+elseif(CHECK STREQUAL "grid_same_bytes")
+  set(grid --param nodes.users.rate.base=100/s..300/s:2 --param nodes.api.capacity=1k/s..2k/s:2
+           --metric api.mean_rho --format csv)
+  run_sweep("${SCENARIO}" ${grid} --jobs 1)
+  require_output("a grid with --jobs 1")
+  set(one "${sweep_out}")
+  run_sweep("${SCENARIO}" ${grid} --jobs 3)
+  require_output("a grid with --jobs 3")
+  if(NOT one STREQUAL sweep_out)
+    message(FATAL_ERROR "the grid differs with --jobs 3:\n${one}\nvs\n${sweep_out}")
+  endif()
+  string(FIND "${one}" "nodes.users.rate.base,nodes.api.capacity,api.mean_rho\n100/s,1k/s," at)
+  if(NOT at EQUAL 0)
+    message(FATAL_ERROR "the grid's header or first row is not as expected:\n${one}")
+  endif()
+  # The file written after a --param is still the file: each --param takes one value.
+  execute_process(COMMAND "${SIMSYS}" sweep --param nodes.users.rate.base=100/s..300/s:2
+                          "${SCENARIO}" --metric api.mean_rho --format csv
+                  RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT code EQUAL 0)
+    message(FATAL_ERROR "the file after --param was not read as the file: exit ${code}\n${err}")
+  endif()
 else()
   message(FATAL_ERROR "unknown CHECK '${CHECK}'")
 endif()

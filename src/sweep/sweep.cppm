@@ -23,6 +23,7 @@
 module;
 #include <cstddef>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -32,17 +33,24 @@ export module simsys.sweep;
 
 export namespace simsys::sweep {
 
+// How the points of a range are spread: `linear`, evenly spaced (the default), or `geometric`
+// (the `:log` suffix), a constant ratio from one point to the next.
+enum class Spacing { linear, geometric };
+
 // The swept key and the text of each point, in the scenario's own unit syntax (`100/s`, `5ms`,
 // `400`), so each value can replace the file's text as it stands (config::Override).
 struct SweepParam {
   std::string path;
   std::vector<std::string> values;
+  Spacing spacing{Spacing::linear};
 };
 
-// `<dot.path>=<from>..<to>:<n>`: n >= 2 evenly spaced points from `from` to `to`, both ends
-// included. Both ends are a number followed by the same unit text (`100/s..900/s`, `1ms..5ms`,
-// `400..600`), which every point repeats; a key that counts whole things (`workers`, `replicas`,
-// ...) must get a whole number at every point. Errors start with "--param: ".
+// `<dot.path>=<from>..<to>:<n>[:log]`: n >= 2 points from `from` to `to`, both ends included,
+// evenly spaced, or with `:log` at a constant ratio (two positive ends; a whole key's points are
+// rounded, and two that round alike are refused). Both ends are a number followed by the same unit
+// text (`100/s..900/s`, `1ms..5ms`, `400..600`), which every point repeats; on a linear range a key
+// that counts whole things (`workers`, `replicas`, ...) must get a whole number at every point.
+// Errors start with "--param: ".
 // C++23 std::expected<T, E>: the parsed value or the message, replacing an exception or an
 // out-parameter plus bool; the caller must look before it uses the value.
 [[nodiscard]] std::expected<SweepParam, std::string> parse_param(std::string_view spec);
@@ -56,6 +64,7 @@ enum class MetricKind {
   mean_rho,        // `<node>.mean_rho`: the node's time-averaged utilization, a ratio
   peak_rho,        // `<node>.peak_rho`: its highest utilization of any observed step, a ratio
   drop_rate,       // `<node>.drop_rate`: the share of the work sent to it that it dropped, a ratio
+  reject_rate,     // `<node>.reject_rate`: the share of it that its behaviour refused, a ratio
   peak_queue_lag,  // `<queue>.lag`: a message queue's peak lag after warmup, seconds
   attempts_rate,   // `<client>.<op>.attempts`: what the client sent, retries included, per second
   answered_rate,   // `<client>.<op>.answered`: the part of its requests answered, per second
@@ -82,16 +91,50 @@ struct SweepMetric {
 // (run_sweep checks). Errors start with "--metric: " and name the metric.
 [[nodiscard]] std::expected<SweepMetric, std::string> parse_metric(std::string_view name);
 
-// One point: its value as written in the param, and one number per metric, in the order asked,
-// in SI base units (seconds for a latency or a lag, a plain ratio for a utilization or a drop
-// rate, per second for a rate, a plain count for connections), like report::SloResult::observed.
+// The keys one sweep may cross: two, a grid (spec 4a §4.3). A table of two keys still reads as
+// one row per point; a third axis is a script's job. `constexpr` without `inline`: exported (this
+// is the export block), it keeps external linkage, and the seventh GCC 14.2 defect (CLAUDE.md §3)
+// bites an exported inline variable named by a default argument.
+constexpr std::size_t max_params = 2;
+
+// `--param` given once or twice: each spec parsed (parse_param), at most max_params of them, no key
+// twice, and the grid's product of point counts at most the one-key limit (10,000), since every
+// point's graph is built before any runs. Errors start with "--param: ".
+[[nodiscard]] std::expected<std::vector<SweepParam>, std::string> parse_params(
+    std::span<const std::string> specs);
+
+// Whether a sweep judges each point's SLOs (`--slos`): off by default, so a sweep's output is what
+// it was before verdicts existed.
+enum class SloColumns { off, on };
+
+// One SLO's verdict at one point, as `simsys run` reaches it (report::SloStatus; this interface
+// imports no other module, so it names its own three values).
+enum class SloVerdict { pass, fail, skipped };
+
+// One SLO column of a point: its heading, the SLO's metric and, where it has them, its node and
+// op (`p99_latency:users.ping`, `utilization:url_db`, `drop_rate`; a second SLO with the same
+// heading `...#2`), and the point's verdict.
+struct SloCell {
+  std::string heading;
+  SloVerdict verdict{};
+};
+
+// One point: its value for each param, as written there, and one number per metric, in the order
+// asked, in SI base units (seconds for a latency or a lag, a plain ratio for a utilization or a
+// drop rate, per second for a rate, a plain count for connections), like
+// report::SloResult::observed.
 // `beyond_timeout` lists (by index into `metrics`) the percentiles that are the client's timeout,
 // not a latency it saw: more than 1 − q of the delivered requests timed out, and the table prints
 // them `>1s`, as the op table does.
 struct SweepRow {
-  std::string value;
+  std::vector<std::string> values;  // one per param, in the order of the params
   std::vector<double> metrics;
   std::vector<std::size_t> beyond_timeout{};
+  // With SloColumns::on: one cell per SLO of the scenario, in file order, and the exit code
+  // `simsys run` gives the point (0 every SLO passed, 2 one failed, 1 the run observed no step).
+  // Empty and absent otherwise.
+  std::vector<SloCell> slos{};
+  std::optional<int> exit_code{};
 };
 
 enum class SweepFormat { table, csv };
@@ -103,9 +146,18 @@ enum class SweepFormat { table, csv };
 // with `jobs` worker threads (at least 1, at most one per point). Each point is its own
 // Simulation, deterministic, so the rows do not depend on `jobs`. An error names the file, or
 // the lowest-numbered failing point (from 1) and its override: "point 2 (key=value): ...".
+// With two params the points are every pair of their values, the first param the outer loop; an
+// error at a point names every value: "point 3 (a=300/s, b=1k/s): ...". Two params that reach one
+// value of the file (a YAML anchor and its alias) are refused.
+// With SloColumns::on every point's row also holds its SLO verdicts and exit code (SweepRow).
+[[nodiscard]] std::expected<std::vector<SweepRow>, std::string> run_sweep(
+    const std::string& scenario_path, std::span<const SweepParam> params,
+    std::span<const SweepMetric> metrics, std::size_t jobs, SloColumns slos = SloColumns::off);
+
+// A sweep of one key: run_sweep over a span of one param.
 [[nodiscard]] std::expected<std::vector<SweepRow>, std::string> run_sweep(
     const std::string& scenario_path, const SweepParam& param, std::span<const SweepMetric> metrics,
-    std::size_t jobs);
+    std::size_t jobs, SloColumns slos = SloColumns::off);
 
 // The CLI's default --jobs: the machine's hardware threads, or 1 when it cannot tell.
 [[nodiscard]] std::size_t default_jobs();
@@ -118,6 +170,13 @@ inline constexpr std::size_t max_jobs = 1024;
 // latencies in readable units (1.61 ms). `csv`: for programs, the same header with commas and
 // each number as the shortest text that reads back to the same double (report::format_number).
 // Both end with a newline.
+// A column per param, in order, then one per metric; when the rows carry verdicts, one per SLO
+// (`PASS`, `FAIL`, `-` for skipped in the table; `pass`, `fail`, `skipped` in the CSV) and `exit`.
+[[nodiscard]] std::string render_sweep(std::span<const SweepParam> params,
+                                       std::span<const SweepMetric> metrics,
+                                       std::span<const SweepRow> rows, SweepFormat format);
+
+// The table or CSV of a sweep of one key.
 [[nodiscard]] std::string render_sweep(const SweepParam& param,
                                        std::span<const SweepMetric> metrics,
                                        std::span<const SweepRow> rows, SweepFormat format);
