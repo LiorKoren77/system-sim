@@ -26,8 +26,30 @@ if(at EQUAL -1)
   message(FATAL_ERROR "the refusal does not say why:\n${err}")
 endif()
 
-execute_process(COMMAND "${SIMSYS}" curve "${WORK}/noisy.yaml" c --seed 3 --noise
+# With --noise the seed reaches the curve: two seeds print two different noise paths, and one
+# seed the same path twice.
+function(noisy_curve seed out_var)
+  execute_process(COMMAND "${SIMSYS}" curve "${WORK}/noisy.yaml" c --seed ${seed} --noise
+                  RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT code EQUAL 0)
+    message(FATAL_ERROR "--seed ${seed} --noise: exit ${code}\nstderr: ${err}")
+  endif()
+  set(${out_var} "${out}" PARENT_SCOPE)
+endfunction()
+noisy_curve(3 three)
+noisy_curve(3 three_again)
+noisy_curve(4 four)
+if(NOT three STREQUAL three_again)
+  message(FATAL_ERROR "one seed gave two curves")
+endif()
+if(three STREQUAL four)
+  message(FATAL_ERROR "--seed 3 and --seed 4 with --noise print the same curve: the seed is ignored")
+endif()
+
+# A missing file is reported as missing, not as a seed problem.
+execute_process(COMMAND "${SIMSYS}" curve "${WORK}/missing.yaml" c --seed 3
                 RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE err)
-if(NOT code EQUAL 0)
-  message(FATAL_ERROR "--seed with --noise: exit ${code}\nstderr: ${err}")
+string(FIND "${err}" "--seed needs --noise" at)
+if(NOT at EQUAL -1)
+  message(FATAL_ERROR "a missing file is reported as a seed problem:\n${err}")
 endif()

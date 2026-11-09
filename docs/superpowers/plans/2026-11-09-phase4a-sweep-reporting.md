@@ -92,6 +92,22 @@ count, so an end holding a colon (a clock time) still parses. The positive-ends 
 
 **Checkpoint A.** Stop; report the three tasks' commits, the test count, and the size of Batch B.
 
+**Review of batch A at `c93cd02`** (code-review skill, medium, 2026-11-09; the user asked for a
+review after every batch): ten findings. 1. A `:log` range rounded a whole key's non-whole ends
+silently (`workers=1.4..9.6:2:log` ran 1 and 10; `0.4..10` reached 0 workers). 2. `to / from`
+overflowed on a range as wide as 1e-300..1e300. 3. `:three` as a count got the grammar message
+instead of the count's. 4. `x=10:00..12:00:log` with the count forgotten reads the minutes as the
+count. 5. The duplicate-op check was copied from `links.cpp`. 6. `SweepParam::spacing` untested.
+7. The rounding test's `1..100:3:log` rounds nothing. 8. `curve_seed.cmake` checked the exit code
+only. 9. The seed refusal ran before the file was loaded. 10. Equal ends under `:log` ran one
+scenario several times on a non-whole key.
+Decisions: 1 → the ends of a whole key must be whole on `:log` too, the points between round;
+2 → the points are computed in logarithms; 3 → a word after the last colon is a spacing only after
+a count of digits; 4 → left, a documented limit (the minutes of a clock time look like a count);
+5 → one `detail::first_repeat` for both; 6, 7 → tests; 8 → two seeds give two curves, one seed the
+same twice, a missing file is not reported as a seed problem; 9 → after the load; 10 → any two equal
+points of a `:log` range are refused, on every key. Fixed in the commit after Task 4's green.
+
 ---
 
 ## Batch B

@@ -96,10 +96,18 @@ struct SpecParts {
 };
 
 // Whether the text after the range's last ':' is a spacing word (`log`) rather than the count:
-// a count starts with a digit, a word with a letter.
-bool is_spacing_word(std::string_view text) {
-  return !text.empty() && ((text.front() >= 'a' && text.front() <= 'z') ||
-                           (text.front() >= 'A' && text.front() <= 'Z'));
+// a word starts with a letter, and only counts as one when what precedes it, back to the colon
+// before, is a count of digits (`:5:log`). A mistyped count (`:three`) is then still the count,
+// and gets the count's own message.
+bool is_spacing_word(std::string_view range, std::size_t last_colon) {
+  const auto word = range.substr(last_colon + 1);
+  const bool starts_with_letter = !word.empty() && ((word.front() >= 'a' && word.front() <= 'z') ||
+                                                    (word.front() >= 'A' && word.front() <= 'Z'));
+  if (!starts_with_letter || last_colon == 0) return false;
+  const auto count_colon = range.rfind(':', last_colon - 1);
+  if (count_colon == std::string_view::npos) return false;
+  const auto count = range.substr(count_colon + 1, last_colon - count_colon - 1);
+  return !count.empty() && std::ranges::all_of(count, [](char c) { return c >= '0' && c <= '9'; });
 }
 
 std::expected<SpecParts, std::string> split_spec(std::string_view spec) {
@@ -112,7 +120,7 @@ std::expected<SpecParts, std::string> split_spec(std::string_view spec) {
   const auto last_colon = range.rfind(':');
   if (last_colon == std::string_view::npos) return bad_shape;
   const auto after_last = range.substr(last_colon + 1);
-  const bool has_spacing = is_spacing_word(after_last);
+  const bool has_spacing = is_spacing_word(range, last_colon);
   // With a spacing word the count sits between the last two colons, else after the last one.
   const auto count_colon = !has_spacing     ? last_colon
                            : last_colon > 0 ? range.rfind(':', last_colon - 1)
@@ -171,6 +179,14 @@ std::string point_text(double value, bool whole) {
   return significant(whole ? std::round(value) : value, whole ? 17 : 12);
 }
 
+// "workers must be whole (400..600:4 gives 466.67)": a whole key's point that is not whole.
+std::unexpected<std::string> not_whole(const SpecParts& parts, double value,
+                                       std::string_view unit) {
+  return param_error(std::string{last_key(parts.path)} + " must be whole (" +
+                     std::string{parts.range} + " gives " +
+                     to_chars_text(value, std::chars_format::fixed, 2) + std::string{unit} + ")");
+}
+
 std::expected<std::vector<std::string>, std::string> expand(const SpecParts& parts,
                                                             const RangeEnd& from,
                                                             const RangeEnd& to, std::size_t n) {
@@ -179,45 +195,46 @@ std::expected<std::vector<std::string>, std::string> expand(const SpecParts& par
   std::vector<std::string> values;
   for (std::size_t k = 0; k < n; ++k) {
     const double value = point_at(from.number, to.number, k, n);
-    if (whole && !is_whole(value)) {
-      return param_error(std::string{last_key(parts.path)} + " must be whole (" +
-                         std::string{parts.range} + " gives " +
-                         to_chars_text(value, std::chars_format::fixed, 2) + from.unit + ")");
-    }
+    if (whole && !is_whole(value)) return not_whole(parts, value, from.unit);
     values.push_back(point_text(value, whole) + from.unit);
   }
   return values;
 }
 
 // Point k of n geometric points from `from` to `to` (both positive), both included: a constant
-// ratio r = (to / from)^(1 / (n − 1)) between neighbours, from × r^k. The last point is `to`
-// itself, so the floating-point power cannot leave it a bit short (1000^(1/3) = 9.999999999999998).
+// ratio r = (to / from)^(1 / (n − 1)) between neighbours, from × r^k, computed as
+// exp(ln from + k/(n − 1) × (ln to − ln from)) so that a range as wide as 1e-300..1e300 does not
+// overflow `to / from`. The last point is `to` itself, so the floating-point arithmetic cannot
+// leave it a bit short (1000^(1/3) = 9.999999999999998).
 double geometric_point_at(double from, double to, std::size_t k, std::size_t n) {
   if (k + 1 == n) return to;
-  return from * std::pow(to / from, static_cast<double>(k) / static_cast<double>(n - 1));
+  const double share = static_cast<double>(k) / static_cast<double>(n - 1);
+  return std::exp(std::log(from) + share * (std::log(to) - std::log(from)));
 }
 
-// The `:log` points. A key the loader reads as a whole number gets each point rounded, since a
-// geometric point is almost never whole (a linear one is, if n is chosen for it); two points that
-// round alike would run the same scenario twice and are refused, naming the first repeat.
+// The `:log` points. A whole key's ends must be whole, as on a linear range (the ends are what
+// the user typed); the points between are rounded, since a geometric point is almost never whole
+// (a linear one is, if n is chosen for it). Two points that come out alike (rounded, or from equal
+// ends) would run the same scenario twice and are refused, naming the first repeat.
 std::expected<std::vector<std::string>, std::string> expand_geometric(const SpecParts& parts,
                                                                       const RangeEnd& from,
                                                                       const RangeEnd& to,
                                                                       std::size_t n) {
   const bool whole = config::counts_whole_things(parts.path);
+  if (whole && !is_whole(from.number)) return not_whole(parts, from.number, from.unit);
+  if (whole && !is_whole(to.number)) return not_whole(parts, to.number, to.unit);
   std::vector<std::string> values;
-  std::optional<double> previous{};
   for (std::size_t k = 0; k < n; ++k) {
     double value = geometric_point_at(from.number, to.number, k, n);
     if (whole) value = std::round(value);
-    if (whole && previous == value) {
+    auto text = point_text(value, whole) + from.unit;
+    if (!values.empty() && values.back() == text) {
       const auto key = std::string{last_key(parts.path)};
-      return param_error(key + "=" + std::string{parts.range} + " gives " +
-                         point_text(value, whole) + from.unit + " twice (rounded to whole " + key +
-                         "); use fewer points");
+      return param_error(key + "=" + std::string{parts.range} + " gives " + text + " twice" +
+                         (whole ? " (rounded to whole " + key + ")" : std::string{}) +
+                         "; use fewer points");
     }
-    previous = value;
-    values.push_back(point_text(value, whole) + from.unit);
+    values.push_back(std::move(text));
   }
   return values;
 }
