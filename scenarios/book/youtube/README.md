@@ -194,7 +194,20 @@ diurnal scenario with a pool, `run` is the verdict.
   600                                  573ms
   ```
 
-  Only 600 passes the 30-minute `queue_lag` SLO. At 400 (6.667 videos/s) the uploads exceed
+  Only 600 passes the 30-minute `queue_lag` SLO. With `--slos` (phase 4a) the sweep says so
+  itself, a verdict per SLO and `run`'s exit code per point (the sweep still exits 0):
+
+  ```
+  $ simsys sweep scenarios/book/youtube/scenario.yaml --param nodes.transcoders.workers=400..600:3 \
+        --metric transcode_q.lag --slos
+  nodes.transcoders.workers  transcode_q.lag  p99_latency:viewers_eu.stream  queue_lag:transcode_q  utilization:cdn_us  exit
+  --------------------------------------------------------------------------------------------------------------------------
+  400                                  2.66h                           PASS                   FAIL                PASS     2
+  500                                  39.5m                           PASS                   FAIL                PASS     2
+  600                                  573ms                           PASS                   PASS                PASS     0
+  ```
+
+  The viewers' SLO passes at every size: nobody waits for a transcoder. At 400 (6.667 videos/s) the uploads exceed
   the pool from 15:43, so the backlog is still growing at 24:00, where the run ends: 63.76k
   videos, 63.76k / 6.667/s = 2.66 h of lag. Its true peak comes the next morning, when the
   uploads fall back under 6.667/s at 02:17: `simsys run --duration 27h` shows it, 71.91k videos

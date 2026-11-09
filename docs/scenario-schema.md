@@ -1,10 +1,13 @@
-# Scenario schema v1.5 (phase 3)
+# Scenario schema v1.6 (phase 4a)
 
 v1 was fitted to the 12 book and lab drafts plus the first tutorial; v1.1 wrote down the
 rules the phase 1 loader enforces; v1.2 added phase 2a's rate curves, balancers, limiters and
 fixed-ratio caches; v1.3 phase 2b's Che caches, SQL databases, CDNs and id generators; v1.4
 phase 2c's bytes, queues, worker pools, external sinks, key-value clusters and the sweep.
-**v1.5** is the language as phase 3 reads it: the loader (`src/config/`, one implementation
+v1.5 phase 3's faults, retries, replications and last four types. **v1.6** (phase 4a) changes no
+scenario key's meaning; it adds to the command line (the sweep's `:log`, grid, `reject_rate` and
+`--slos`, `estimate --at`) and changes what `estimate` reports (see "New in v1.6": two JSON changes
+can break a reader). The language is as phase 3 reads it: the loader (`src/config/`, one implementation
 unit per concern: `header.cpp`, `nodes.cpp`, `steps.cpp`, `workload.cpp`, `links.cpp`,
 `slos.cpp`, `faults.cpp`, `overrides.cpp`), the graph builder (`src/engine/graph.cpp`), the node
 behaviours (`src/engine/behaviours.cppm`), the fault schedule and the fault log
@@ -16,6 +19,32 @@ what each ignores, are spec §18 (phase 2b), §19 (phase 2c) and §20 (phase 3)
 (`docs/superpowers/specs/2026-10-27-system-sim-design.md`), with the phase 3 design in
 `docs/superpowers/specs/2026-10-30-phase3-faults-gateways-design.md`. Where a phase 3 rule differs
 from what that design first said, this file and spec §20 have the rule as built.
+
+New in v1.6 (phase 4a; design `docs/superpowers/specs/2026-11-09-phase4a-sweep-reporting-design.md`,
+rules as built in spec §21):
+
+- **JSON, may break a reader:** under `estimate --report json` a node's `dropped`, `rejected` and
+  `red_s` are `null` (a steady state lasts no time, so it has no totals; they were one step's
+  worth); the new `dropped_per_s` and `rejected_per_s` (in `run` too) carry the rates. **JSON,
+  added:** `queue_lag_unbounded` on every node (`true` where a lag grows for good, `false` on a
+  queue whose lag is finite, `null` elsewhere: `peak_queue_lag_s` alone is `null` in the first and
+  last case), `at_s` at the top of `estimate`'s JSON, and the same node keys in `run
+  --replications`' per-seed objects ([the key table](#drops-and-rejections));
+- [`simsys estimate --at <time>`](#command-line-simsys-estimate---at-phase-4a): the steady state at
+  any instant of the run (a clock time or a duration, inside the run), its first line naming it;
+  `estimate`'s table says `steady state at 00:00` instead of `1 steps observed` and shows
+  `dropped/s` and `rejected/s`, with no `red_s`;
+- `run`'s and `estimate`'s tables gain one line under the node table naming the nodes whose
+  `peak_backlog` and drops are not requests: `units (peak_backlog and drops are not requests here):
+  url_db capacity units (delete, insert, update, write cost 5)` (a database's writes, a stated
+  `cost`, a kv_cluster's `replica-requests (N 3)`, a byte-sized node's `MB`); no line where every
+  node counts requests;
+- [`simsys sweep`](#command-line-simsys-sweep-phase-2c): geometric points (`1k/s..100k/s:3:log`), a
+  grid over two keys (`--param` twice), the metric `<node>.reject_rate`, and `--slos` (a verdict
+  per SLO and `run`'s exit code per point; the sweep still exits 0);
+- refused: a `write_ops` list that names an op twice (`node 'c': duplicate write_ops op 'write'`,
+  as a link's `ops`), and `simsys curve --seed` without `--noise` (`--seed needs --noise (without it
+  the curve has no randomness)`).
 
 New in v1.5:
 
@@ -469,7 +498,7 @@ dead replica`, and at 30 s the window is the whole fault.
 |---|---|---|---|---|
 | `version` | integer | yes | read | always `1` (unquoted) |
 | `name` | string | yes | read | non-empty; shown in reports |
-| `seed` | integer | no | read | default 1; within the range of `int`. Printed by `explain`; seeds every client's `rate.noise` (`run --seed N` and `curve --seed N` override it). Client `i` (its index among all nodes, in file order) gets the engine seed `(seed × 0x9E3779B97F4A7C15) XOR i` mod 2^64, so appending a node at the end of the file never changes another client's noise (inserting one before a client shifts that client's index, and so its noise) |
+| `seed` | integer | no | read | default 1; within the range of `int`. Printed by `explain`; seeds every client's `rate.noise` (`run --seed N` and `curve --seed N --noise` override it; `curve --seed` without `--noise` is refused: `<file>: error: --seed needs --noise (without it the curve has no randomness)`). Client `i` (its index among all nodes, in file order) gets the engine seed `(seed × 0x9E3779B97F4A7C15) XOR i` mod 2^64, so appending a node at the end of the file never changes another client's noise (inserting one before a client shifts that client's index, and so its noise) |
 | `duration` | duration | yes | read | simulated span of `run`; must be positive |
 | `step` | duration | no | read | default `100ms`; must be positive. A rule of thumb (spec §19 entry 16; the derivation and a measured lab are in [numerics, "Choosing the step"](study/numerics.md)): a step is a lump the model cannot see inside, so make it shorter than what you want to see. A token bucket of `burst` B under a peak offered rate `λ` above its `limit` L empties in `B / (λ − L)`, and a longer step passes the whole burst in its first step (a 2,000-token burst at `step: 1s` does), so `step ≤ B / (λ_peak − L)`; for a queue, `step ≤` a tenth of the shortest spike. Shorter steps cost run time, not accuracy of the totals: conservation holds at any step |
 | `warmup` | duration | no | read | steps before it are left out of the report; default 0; must be shorter than `duration`, so the report never covers an empty window (`run --duration` obeys the same rule, and leaves room for every SLO's `over`) |
@@ -716,7 +745,7 @@ own (default 100k/s, 250 µs) that answers every request it receives, hit or mis
 | `hit_ratio` | required: `{fixed: h}` with `0 ≤ h ≤ 1`, or `che` (computed at build from `keys` and the clients' key distribution, see [`che` hit ratios](#che-hit-ratios)) | `cache needs a hit_ratio`, `hit_ratio must be che or {fixed: h}`, `hit_ratio.fixed must be between 0 and 1` (also for a quoted `"0.5"`) |
 | `strategy` | `cache_aside` (default), `read_through`, `write_through`, `write_around`, `write_back` | `strategy must be cache_aside, read_through, write_through, write_around or write_back` |
 | `backend` | a declared node; required by every strategy but `cache_aside`, and refused there (the application reads the store; the backend would never be called) | `strategy read_through needs a backend`, `backend is unused with strategy cache_aside`, `backend refers to unknown node 'x'`; *(graph)* `backend 'db' needs a link from the cache`, and the link must carry every op the cache passes on (`link c -> db does not carry op 'read' (ops: write)`); a fetch on any call cycle is refused, since a fetch is always waited for: a store that calls back into the cache (`db.read -> c.read -> db.read`), whether the clients call the cache, the store or a service in front: `node 'c': backend 'db' closes a call cycle` |
-| `write_ops` | a non-empty list of op names; default `[write]`. Every other op is a read. A stated list is taken exactly as written (it replaces the default) | `write_ops must be a list of op names`, `write_ops must name at least one op`; *(graph)* a write the cache passes to a `sql_db` or `cache` backend must be a write there too, or the store would serve it as a read (a database from a replica, its primary idle): `node 'c': sends write 'set' to 'db', which counts 'set' as a read; add it to db's write_ops` |
+| `write_ops` | a non-empty list of distinct op names; default `[write]`. Every other op is a read. A stated list is taken exactly as written (it replaces the default). The same on a cdn, a sql_db, a blob store and a kv_cluster | `write_ops must be a list of op names`, `write_ops must name at least one op`, `duplicate write_ops op 'write'` (phase 4a: as a link's `duplicate op 'x'`); *(graph)* a write the cache passes to a `sql_db` or `cache` backend must be a write there too, or the store would serve it as a read (a database from a replica, its primary idle): `node 'c': sends write 'set' to 'db', which counts 'set' as a read; add it to db's write_ops` |
 | `keys` | a [count](#values) (`20M`): the entries the cache holds, the Che approximation's cache size; required by `hit_ratio: che` | `keys must be a positive integer`; *(graph)* `node 'c': hit_ratio che needs keys (the cache's capacity in keys)` |
 | `eviction` | `lru`, `lfu`, `fifo`, `ttl` | `eviction must be lru, lfu, fifo or ttl` |
 | `ttl` | a positive duration | `ttl must be positive` |
@@ -1858,25 +1887,28 @@ against `max` alone (a replica that falls behind without bound).
 
 **`run --report json` (and `estimate --report json`), key by key.** Every figure is over the
 observed steps (after warmup). A node's `dropped` and `rejected` are **totals** over those steps,
-a link's `dropped_per_s` a **rate**: compare a link with a node by multiplying the link's rate by
-the observed seconds (`steps` × `step`). `estimate --report json` observes ONE step (`steps` is 1),
-the steady state, so its node `dropped` is one step's worth, the steady drop rate × `step` (at
-100 ms, a tenth of the rate per second), not a total of anything; a per-second figure for
-`estimate` is on the phase 4 backlog.
+and `dropped_per_s` and `rejected_per_s` (phase 4a) the same totals per observed second; a link's
+`dropped_per_s` is a **rate** too. `estimate --report json` observes ONE step (`steps` is 1), the
+steady state, which stands for no stretch of time: its node `dropped`, `rejected` and `red_s` are
+`null` (until phase 4a they were one step's worth, a tenth of the rate at 100 ms), and its
+`dropped_per_s` and `rejected_per_s` are the steady rates, the numbers to compare with a run's.
 
 | object | key | unit |
 |---|---|---|
 | top level | `scenario`, `steps` | the name; the number of observed steps |
+| top level | `at_s` | `estimate` only (phase 4a): the instant it settled at, seconds from the start (`--at`; 0 without it) |
 | top level | `drop_rate`, `reject_rate` | ratios in [0, 1], the worst node's (a pipe's counts for drops); `null` when no step was observed |
 | top level | `worst_drop_node`, `worst_reject_node` | a node id or `from->to`; `null` when nothing was dropped or refused |
 | `nodes[]` | `id`, `mean_rho`, `peak_rho` | the node; time-averaged and highest busy fraction of one copy |
 | `nodes[]` | `peak_backlog` | the most work waiting at the end of any step: requests, cost units at a node with a `cost`, MB at a byte-sized node |
-| `nodes[]` | `dropped`, `rejected` | **totals** over the observed steps, in the same units as `peak_backlog` (`rejected` in requests) |
+| `nodes[]` | `dropped`, `rejected` | **totals** over the observed steps, in the same units as `peak_backlog` (`rejected` in requests); `null` under `estimate` (phase 4a) |
+| `nodes[]` | `dropped_per_s`, `rejected_per_s` | the totals per observed second, `run` and `estimate` alike (phase 4a): a run's mean rates, `estimate`'s steady ones |
 | `nodes[]` | `dead_lettered`, `dead_lettered_per_s` | jobs: the **total** over the observed steps and its mean rate per second (phase 3: a `worker_pool`'s jobs whose last retry failed; 0 on a pool without `retries`, `null` on every other node) |
 | `nodes[]` | `deduplicated_per_s` | notifications per second, the mean over the observed steps (phase 3: a `notification_fanout`'s duplicates, drain × `dedup`; 0 with `dedup: 0`, `null` on every other node) |
-| `nodes[]` | `red_s`, `unavailable` | seconds spent red; `true` when the node's latency was infinite in some step |
+| `nodes[]` | `red_s`, `unavailable` | seconds spent red (`null` under `estimate`, phase 4a); `true` when the node's latency was infinite in some step |
 | `nodes[]` | `staleness_s`, `replication_dropped_per_s`, `committed_writes_per_s` | seconds; writes per second per replica; writes per second per shard (a `sql_db` only, else `null`) |
-| `nodes[]` | `peak_queue_lag_s` | seconds (a `message_queue` or a `frontier`, else `null`); on a `message_queue` or a `frontier`, `null` means **unbounded** (`estimate`'s lag of a pool that falls behind for good, printed `unbounded` in the table; JSON has no infinity), on other nodes it means no lag. A separate `queue_lag_unbounded` flag is on the phase 4 backlog |
+| `nodes[]` | `peak_queue_lag_s` | seconds (a `message_queue` or a `frontier`, else `null`); on a `message_queue` or a `frontier`, `null` means **unbounded** (`estimate`'s lag of a pool that falls behind for good, printed `unbounded` in the table; JSON has no infinity), on other nodes it means no lag; `queue_lag_unbounded` tells the two apart |
+| `nodes[]` | `queue_lag_unbounded` | phase 4a: `true` on a `message_queue` or `frontier` whose lag is unbounded (`peak_queue_lag_s` is then `null`), `false` on one whose lag is finite (always so in a `run`), `null` on every other node |
 | `nodes[]` | `connections`, `connections_peak` | open connections (a level, not a rate): at the end of the run, and the highest of any observed step (phase 3: a `ws_gateway` only, else `null`; both keys only when the scenario has a gateway) |
 | `links[]` | `name` | `from->to` as written |
 | `links[]` | `demand_per_s`, `drain_per_s`, `dropped_per_s` | MB per second, **time-averaged rates** |
@@ -2282,6 +2314,46 @@ decimal
 criterion is "back where it would have been", not "the SLOs pass again": an SLO with room to spare
 passes while the backlog still drains, and one that fails without the fault never passes.
 
+## Command line: `simsys estimate --at` (phase 4a)
+
+```
+simsys estimate scenario.yaml [--at <time>] [--report table|json] [--no-color]
+```
+
+`estimate` evaluates the long-run (steady) state once: the clients offer their rate curve's value
+at one instant, without noise, and every queue settles at it (spec §3.6). That instant is midnight,
+t = 0, unless `--at` names another: a clock time (`13:00`) or a duration from the start (`90m`),
+the syntax of a fault's `at`, and like it inside the run, `0 <= at < duration`
+(`<file>: error: --at '30h' must fall inside the run (24h)`; a malformed time gets the parser's
+reason, `--at '25:00': hour must be 00-23`). Everything the curve has at that moment counts (its
+wave, ramp, points and active spikes); the scripted faults are still left out, even one active then
+(`estimate` is the steady state without them, and says so). The first line names the instant,
+`estimate at t = 13h (13:00): the curve without noise; explain's checks use the peak` (without
+`--at`, `t = 0 (00:00)`, the line it always printed), and JSON carries it as `at_s`.
+
+A diurnal scenario's midnight is its trough, so `estimate` without `--at` says little about the
+hour a design is sized for. url-shortener's database at 13:00, the hour its windowed SLO judges:
+
+```
+$ simsys estimate scenarios/book/url-shortener/scenario.yaml --at 13:00
+estimate at t = 13h (13:00): the curve without noise; explain's checks use the peak
+scenario url-shortener  steady state at 13:00  drop rate 0%
+nodes
+  node          mean_rho   peak_rho  peak_backlog  dropped/s  rejected/s  peak_lag
+  ...
+  web             0.7909     0.7909             0          0           0         -
+  url_db          0.6382     0.6382             0          0           0         -
+units (peak_backlog and drops are not requests here): url_db capacity units (delete, insert, update, write cost 5)
+```
+
+0.6382 against the 0.244 of midnight, and close to the 0.6433 that `run`'s `over: 1h` SLO observes
+in its worst hour, 13:02–14:02 (an hour's mean on a rising curve, beside the value at one instant).
+
+**The table of a steady state** (phase 4a): the summary line says `steady state at 13:00` instead
+of `1 steps observed`, the node table shows `dropped/s` and `rejected/s` (the steady rates) in
+place of the totals, and no `red_s` (a steady state lasts no time to be red in). `run`'s table is
+unchanged.
+
 ## Command line: `simsys run --replications` (phase 3)
 
 ```
@@ -2373,9 +2445,10 @@ seed), plus one key after all of a run's own (after `faults`, when the scenario 
 surrounds it, and `per_seed`, with one object per op (`client`, `op`, then `offered_per_s`,
 `attempts_per_s`, `answered_per_s`, `timed_out_per_s`, `timed_out_attempts_per_s`, `mean_s`,
 `p50_s`, `p95_s`, `p99_s`), per node (`id`, then `mean_rho`,
-`peak_rho`, `peak_backlog`, `dropped`, `dead_lettered`, `dead_lettered_per_s`, `rejected`,
-`deduplicated_per_s` (since the phase 3 review), `red_s`, `unavailable`, `staleness_s`,
-`replication_dropped_per_s`, `committed_writes_per_s`, `peak_queue_lag_s`, then, only when the
+`peak_rho`, `peak_backlog`, `dropped`, `dropped_per_s` (phase 4a), `dead_lettered`,
+`dead_lettered_per_s`, `rejected`, `rejected_per_s` (phase 4a), `deduplicated_per_s` (since the
+phase 3 review), `red_s`, `unavailable`, `staleness_s`, `replication_dropped_per_s`,
+`committed_writes_per_s`, `peak_queue_lag_s`, `queue_lag_unbounded` (phase 4a), then, only when the
 scenario has a [`ws_gateway`](#ws_gateway), `connections` and `connections_peak`, as in the run's
 own node objects) and per SLO (`metric`,
 `node`, `op`, `observed`, `status`), each number a list with one entry per seed, in the order of
@@ -2405,8 +2478,8 @@ sweep's points.
 ## Command line: `simsys sweep` (phase 2c)
 
 ```
-simsys sweep scenario.yaml --param <dot.path>=<from>..<to>:<n> --metric <m> [--metric <m> ...]
-             [--jobs N] [--format table|csv]
+simsys sweep scenario.yaml --param <dot.path>=<from>..<to>:<n>[:log] [--param ...]
+             --metric <m> [--metric <m> ...] [--slos] [--jobs N] [--format table|csv]
 ```
 
 Runs the scenario once per point, each run exactly as `simsys run` would (the file's duration,
@@ -2417,7 +2490,7 @@ a design review asks after `explain`: *how much of this do I need?*
 | option | rule | refused with |
 |---|---|---|
 | `--param` | required. `<dot.path>=<from>..<to>:<n>`: the key is a dot path through **maps only** (`nodes.users.rate.base`, `nodes.transcoders.workers`), which must exist in the file and hold a single value; a path through a list (`links.0.latency`) is refused, since list entries have no names, and a node whose id contains a dot cannot be swept or measured (the dot splits the path). The range gives `n` points, at least 2 and at most 10,000, evenly spaced from `from` to `to`, both included; both ends are numbers (each starts with a digit or `-`, so a third dot is an error) with the same unit text (`100/s..900/s`, `1ms..5ms`, `400..600`; `100/s..1k/s` is refused, not converted): `100/s..900/s:3` is 100/s, 500/s and 900/s. A key the loader reads as a whole number (a node's `workers`, `replicas`, `partitions`, `keys`, ..., an `advanced` block's `concurrency`) must get a whole number at every point, whole as written: the number before a `k`, `M` or `G` must be whole, as in a [count](#values) (`keys=1k..2k:3` gives 1.5k and is refused although 1500 keys are whole; write `1000..2000:3`) | (each after `<file>: error: `, as every refusal of an option) `--param: nodes.users.rate.bse: no such key in the scenario`; `--param: links.0.latency: '0' would index a list; a dot path goes through maps only (a list entry has no name)`; `--param: workers must be whole (400..600:4 gives 466.67)`; `--param: 1/s..2/s:20000: at most 10000 points`; `--param: 100/s..1k/s:2: both ends must be the same kind of value in the same unit (100/s and 1k/s)`; `--param: '.5ms' is not a number followed by a unit` (for `1ms...5ms`) |
-| `--metric` | required, repeatable (`--metric a --metric b`, or several names after one: `--metric a b`): `<client>.<op>.mean` (the op's mean latency as the client sees it, over the answered requests), `<client>.<op>.p50`, `.p95` or `.p99` (the op table's estimated percentiles; where more than 1 − q of the delivered requests timed out, the timeout itself, printed `>1s` in the table as in `run`'s), `<client>.<op>.attempts` (what the client sent per second, its [`retries`](#node-types) included: JSON's `attempts_per_s`, printed `1.75k/s`) or `.answered` (the part answered per second: `answered_per_s`), `<node>.mean_rho` (a server's time-averaged utilization), `<node>.peak_rho` (its highest utilization of any observed step), `<node>.drop_rate` (the share of the work sent to it that it dropped, the node's own `drop_rate`), `<queue>.lag` (a message queue's or a frontier's peak lag after warmup, what the `queue_lag` SLO observes), `<pool>.dead_lettered` (phase 3: a worker pool's dead letters per second, JSON's `dead_lettered_per_s`, printed as a rate: `62.5/s`), `<fanout>.deduplicated` (phase 3: a [`notification_fanout`](#notification_fanout)'s duplicates per second, JSON's `deduplicated_per_s`, printed as a rate: `20/s`) or `<gateway>.connections` (phase 3: a [`ws_gateway`](#ws_gateway)'s open connections at the **end** of the run, the node table's and JSON's `connections`, printed as a count: `2k`; the end, not JSON's `connections_peak`, so that one name is one number: under a steady connect rate the level only rises and the two agree). They are the numbers `run --report json` prints, after warmup. Each name is checked against the file before any point runs | after `<file>: error: `, a name outside the grammar, `--metric: bogus: not a metric (write <client>.<op>.mean\|p50\|p95\|p99\|attempts\|answered, <node>.mean_rho\|peak_rho\|drop_rate, <queue>.lag, <pool>.dead_lettered, <fanout>.deduplicated or <gateway>.connections)`, or one that does not fit the file: `--metric: api.lag: 'api' has type service, not message_queue or frontier: only a message queue or a frontier has a lag`; `--metric: api.connections: 'api' has type service, not ws_gateway: only a ws_gateway has connections`; `--metric: api.dead_lettered: 'api' has type service, not worker_pool: only a worker pool has dead letters`; `--metric: api.deduplicated: 'api' has type service, not notification_fanout: only a notification fanout has duplicates`; `--metric: users.drop_rate: 'users' is a client, which serves nothing, so it has no drop rate`; `--metric: nope.mean_rho: the scenario has no node 'nope'` |
+| `--metric` | required, repeatable (`--metric a --metric b`, or several names after one: `--metric a b`): `<client>.<op>.mean` (the op's mean latency as the client sees it, over the answered requests), `<client>.<op>.p50`, `.p95` or `.p99` (the op table's estimated percentiles; where more than 1 − q of the delivered requests timed out, the timeout itself, printed `>1s` in the table as in `run`'s), `<client>.<op>.attempts` (what the client sent per second, its [`retries`](#node-types) included: JSON's `attempts_per_s`, printed `1.75k/s`) or `.answered` (the part answered per second: `answered_per_s`), `<node>.mean_rho` (a server's time-averaged utilization), `<node>.peak_rho` (its highest utilization of any observed step), `<node>.drop_rate` (the share of the work sent to it that it dropped, the node's own `drop_rate`), `<node>.reject_rate` (phase 4a: the share its behaviour refused, a rate limiter's 429s or a gateway's refused connects, the node's own `reject_rate`), `<queue>.lag` (a message queue's or a frontier's peak lag after warmup, what the `queue_lag` SLO observes), `<pool>.dead_lettered` (phase 3: a worker pool's dead letters per second, JSON's `dead_lettered_per_s`, printed as a rate: `62.5/s`), `<fanout>.deduplicated` (phase 3: a [`notification_fanout`](#notification_fanout)'s duplicates per second, JSON's `deduplicated_per_s`, printed as a rate: `20/s`) or `<gateway>.connections` (phase 3: a [`ws_gateway`](#ws_gateway)'s open connections at the **end** of the run, the node table's and JSON's `connections`, printed as a count: `2k`; the end, not JSON's `connections_peak`, so that one name is one number: under a steady connect rate the level only rises and the two agree). They are the numbers `run --report json` prints, after warmup. Each name is checked against the file before any point runs | after `<file>: error: `, a name outside the grammar, `--metric: bogus: not a metric (write <client>.<op>.mean\|p50\|p95\|p99\|attempts\|answered, <node>.mean_rho\|peak_rho\|drop_rate\|reject_rate, <queue>.lag, <pool>.dead_lettered, <fanout>.deduplicated or <gateway>.connections)`, or one that does not fit the file: `--metric: api.lag: 'api' has type service, not message_queue or frontier: only a message queue or a frontier has a lag`; `--metric: api.connections: 'api' has type service, not ws_gateway: only a ws_gateway has connections`; `--metric: api.dead_lettered: 'api' has type service, not worker_pool: only a worker pool has dead letters`; `--metric: api.deduplicated: 'api' has type service, not notification_fanout: only a notification fanout has duplicates`; `--metric: users.drop_rate: 'users' is a client, which serves nothing, so it has no drop rate` (and `... so it has no reject rate`); `--metric: nope.mean_rho: the scenario has no node 'nope'` |
 | `--jobs` | worker threads, 1 to 1024; default: the machine's hardware threads | CLI11's range message |
 | `--format` | `table` (latencies and lags as the report's tables print them: `1.61ms`, `<1us`, `>1s`; ratios to three significant digits) or `csv` (seconds and ratios, each number the shortest text that reads back to the same double) | |
 
@@ -2429,15 +2502,51 @@ on hello: `point 1 (nodes.users.rate.base=-1/s): scenarios/tutorial/hello/scenar
 node 'users': rate.base: expected a non-negative finite number`; a missing key or a bad path is reported once, without a point: every point would fail alike). A
 value under a YAML anchor (`&a`) is shared with every alias (`*a`): sweeping it through either path
 sweeps it everywhere the anchor is used. A number a run did not produce (a latency of an op of
-which nothing was answered) is `-` in the table and an empty cell in the CSV. A sweep has no SLO
-columns and no exit code per point (the phase 4 backlog).
+which nothing was answered) is `-` in the table and an empty cell in the CSV.
+
+**Geometric points, `:log` (phase 4a).** `<from>..<to>:<n>:log` spaces the n points at a constant
+ratio, `from × (to / from)^(k / (n − 1))`, both ends included, the last point the upper end as
+typed: `1k/s..100k/s:3:log` is 1k/s, 10k/s and 100k/s. The knee of the latency curve and a cache's
+hit ratio against its size are read on a log axis; evenly spaced points over 1k/s..1M/s spend
+nine tenths of the runs above 100k/s. Both ends must be positive (`--param: 0/s..1000/s:4:log:
+geometric points need two positive ends`); on a key the loader reads as a whole number the ends
+must be whole, as on a linear range, and the points between are **rounded** (`workers=1..10:3:log`
+runs 1, 3 and 10), since a geometric point is almost never whole; two points that come out alike
+run one scenario twice and are refused (`--param: workers=1..4:8:log gives 1 twice (rounded to
+whole workers); use fewer points`, on any key: `latency=5ms..5ms:4:log gives 5ms twice; use fewer
+points`). Any other suffix: `--param: 1..10:3:lin: the only spacing suffix is :log`. A count written
+as a word keeps the count's message (`1..10:three: the count after ':' must be a whole number`).
+Known limit: a range of clock times with its count left out (`10:00..12:00:log`) reads the
+minutes of the upper end as the count.
+
+**Two keys: a grid (phase 4a).** `--param` given twice runs every pair of the two keys' values,
+the first `--param` the outer loop (`--param a=1..2:2 --param b=10..30:3`: (1, 10) (1, 20) (1, 30)
+(2, 10) ...), with one column per key before the metrics, in the table and the CSV. Each point is
+loaded with both values in place; an error at a point names both (`point 3
+(nodes.users.rate.base=-1/s, nodes.api.capacity=1k/s): ...`). Refused: a third key (`--param: at
+most two keys (a grid of two); script a third`), one key twice (`--param: nodes.api.capacity is
+given twice`), two paths that reach one value through a YAML anchor and its alias, which yaml-cpp
+loads as one node (`<file>: error: --param: nodes.b.capacity reaches the same value as
+nodes.a.capacity (a YAML anchor and its alias)`), and more than 10,000 points in all (`--param: 200
+x 100 = 20000 points: at most 10000`), since every point's graph is built before any runs. Each
+`--param` takes one value, so a file written after it is still the file.
+
+**`--slos` (phase 4a): a verdict per SLO and an exit code per point.** After the metrics, one
+column per SLO of the scenario, in file order, headed by its metric and, where it names them, its
+node and op (`p99_latency:users.ping`, `utilization:url_db`, `drop_rate`; a second SLO with the same
+heading `...#2`), then `exit`. Each point is judged exactly as `simsys run` judges the file with
+the point's value written in (`report::evaluate_slos`, windows and the timeout rule included):
+`PASS`, `FAIL` or `-` (skipped) in the table, `pass`, `fail` or `skipped` in the CSV, and `exit`
+the point's `run` exit code (0 every SLO passed, 2 one failed). A scenario without SLOs gets only
+the `exit` column and a line on stderr, `the scenario has no SLOs, so no point can fail one`.
 
 **Parallel, and the same bytes for any `--jobs`.** The points run on `std::jthread` workers that
 take the next point index from one atomic counter; each point owns its YAML tree, graph,
 simulation and summary, and writes its row into its own slot, so nothing is shared while they run
 and the output is the same, byte for byte, whatever `--jobs` says ([threads](study/threads.md)).
 
-**Exit codes.** A sweep reports numbers and judges none: it exits 0 when every point ran, even if
+**Exit codes.** A sweep reports numbers (and, with `--slos`, each point's verdicts) but its own
+exit code judges none: it exits 0 when every point ran, even if
 an SLO fails at some point, and 1 on any error (the file, `--param`, `--metric`, or a point the
 loader refuses), with the message on stderr and nothing on stdout.
 
@@ -2457,5 +2566,24 @@ nodes.transcoders.workers  transcode_q.lag  viewers_eu.stream.mean  transcoders.
 Only 600 keeps the queue within its 30-minute SLO; the viewers never notice, since nobody waits
 for a transcoder (the hop from the queue to the pool is asynchronous).
 
-Ignored: grids over two keys, geometric spacing, list values, replications per point (all in the
-phase 4 backlog; `run --replications` replicates one run, not a sweep).
+The rate-limiter lab's question, which `burst` keeps its p99 SLO, as one sweep (Release build,
+under a second):
+
+```
+$ simsys sweep scenarios/labs/rate-limiter/scenario.yaml --param nodes.limiter.burst=100..500:5 \
+      --metric limiter.reject_rate --metric api.peak_rho --metric clients.call.p99 --slos
+nodes.limiter.burst  limiter.reject_rate  api.peak_rho  clients.call.p99  utilization:api  p99_latency:clients.call  exit
+-------------------------------------------------------------------------------------------------------------------------
+100                                0.143             1            24.8ms             PASS                      PASS     0
+200                                0.142             1            32.4ms             PASS                      PASS     0
+300                                0.142             1            45.4ms             PASS                      PASS     0
+400                                0.142             1            58.2ms             PASS                      FAIL     2
+500                                0.142             1            63.8ms             PASS                      FAIL     2
+```
+
+The bucket refuses the same share at every size (the spikes' excess over 1k/s); a bigger burst
+only lets more of each spike's first moment through to the api's queue, and from 400 tokens that
+wait breaks the 50 ms p99.
+
+Ignored: grids over three keys or more, list values, replications per point and sweeps over seeds
+(phase 4b; `run --replications` replicates one run, not a sweep).

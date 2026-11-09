@@ -187,7 +187,10 @@ is one of them. `Simulation::make_node` (`src/engine/engine.cppm`) has a case fo
 and no `default:`, and ends in `std::unreachable()` after its `switch`; until phase 3 gave the last
 four types a model, those four cases ended in it themselves, behind a refusal in
 `Simulation::create` that phase 3 deleted ([variant-visit.md](variant-visit.md) has the story).
-The fault schedule's switch over `FaultKind` (`src/engine/faults.cppm`) ends the same way.
+The fault schedule's switch over `FaultKind` (`src/engine/faults.cppm`) ends the same way, and so
+do the sweep's two switches over SLO verdicts (`verdict_of`, `verdict_cell` in
+`src/sweep/sweep.cpp`, phase 4a), where a dummy return of `skipped` would have hidden a verdict
+added to `report::SloStatus` later as a pass.
 
 **Pitfall: it is a promise, not a check.** If the promise is wrong, the program has
 undefined behaviour, with no message. So it goes only where a proof sits right before it.
