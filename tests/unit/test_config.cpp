@@ -5569,7 +5569,8 @@ TEST_CASE("a duplicate write op is refused on every type that reads write_ops") 
 }
 
 TEST_CASE("a duplicate write op is named at its first repeat") {
-  require_rejected("simsys_write_ops_first_repeat.yaml",
-                   scenario_with("  db: {type: sql_db, write_ops: [write, delete, write, delete]}\n"),
-                   "node 'db': duplicate write_ops op 'write'");
+  require_rejected(
+      "simsys_write_ops_first_repeat.yaml",
+      scenario_with("  db: {type: sql_db, write_ops: [write, delete, write, delete]}\n"),
+      "node 'db': duplicate write_ops op 'write'");
 }

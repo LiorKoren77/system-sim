@@ -45,7 +45,7 @@ namespace {
 
 // ---- --param: <dot.path>=<from>..<to>:<n> ------------------------------------------------------
 
-constexpr std::string_view param_grammar = "<dot.path>=<from>..<to>:<n>";
+constexpr std::string_view param_grammar = "<dot.path>=<from>..<to>:<n>[:log]";
 
 std::unexpected<std::string> param_error(std::string_view what) {
   // C++23 std::unexpected<E>: wraps an error so it converts to any std::expected<T, E>.
@@ -91,7 +91,15 @@ struct SpecParts {
   std::string_view from;
   std::string_view to;
   std::string_view count;
+  std::string_view spacing;  // the word after a second ':' (`log`), empty without one
 };
+
+// Whether the text after the range's last ':' is a spacing word (`log`) rather than the count:
+// a count starts with a digit, a word with a letter.
+bool is_spacing_word(std::string_view text) {
+  return !text.empty() && ((text.front() >= 'a' && text.front() <= 'z') ||
+                           (text.front() >= 'A' && text.front() <= 'Z'));
+}
 
 std::expected<SpecParts, std::string> split_spec(std::string_view spec) {
   const auto bad_shape =
@@ -99,16 +107,27 @@ std::expected<SpecParts, std::string> split_spec(std::string_view spec) {
   const auto equals = spec.find('=');
   if (equals == std::string_view::npos || equals == 0) return bad_shape;
   const auto range = spec.substr(equals + 1);
-  const auto colon = range.rfind(':');
-  if (colon == std::string_view::npos) return bad_shape;
-  const auto ends = range.substr(0, colon);
+  // The colons are found from the right: an end may hold one itself (a clock time, `10:00`).
+  const auto last_colon = range.rfind(':');
+  if (last_colon == std::string_view::npos) return bad_shape;
+  const auto after_last = range.substr(last_colon + 1);
+  const bool has_spacing = is_spacing_word(after_last);
+  // With a spacing word the count sits between the last two colons, else after the last one.
+  const auto count_colon = !has_spacing     ? last_colon
+                           : last_colon > 0 ? range.rfind(':', last_colon - 1)
+                                            : std::string_view::npos;
+  if (count_colon == std::string_view::npos) return bad_shape;
+  const auto ends = range.substr(0, count_colon);
   const auto dots = ends.find("..");
   if (dots == std::string_view::npos) return bad_shape;
-  return SpecParts{.path = spec.substr(0, equals),
-                   .range = range,
-                   .from = ends.substr(0, dots),
-                   .to = ends.substr(dots + 2),
-                   .count = range.substr(colon + 1)};
+  return SpecParts{
+      .path = spec.substr(0, equals),
+      .range = range,
+      .from = ends.substr(0, dots),
+      .to = ends.substr(dots + 2),
+      .count = has_spacing ? range.substr(count_colon + 1, last_colon - count_colon - 1)
+                           : after_last,
+      .spacing = has_spacing ? after_last : std::string_view{}};
 }
 
 // The most points a sweep runs. Chosen, not from the book: each point is a whole simulation, so
@@ -169,10 +188,44 @@ std::expected<std::vector<std::string>, std::string> expand(const SpecParts& par
   return values;
 }
 
+// Point k of n geometric points from `from` to `to` (both positive), both included: a constant
+// ratio r = (to / from)^(1 / (n − 1)) between neighbours, from × r^k. The last point is `to`
+// itself, so the floating-point power cannot leave it a bit short (1000^(1/3) = 9.999999999999998).
+double geometric_point_at(double from, double to, std::size_t k, std::size_t n) {
+  if (k + 1 == n) return to;
+  return from * std::pow(to / from, static_cast<double>(k) / static_cast<double>(n - 1));
+}
+
+// The `:log` points. A key the loader reads as a whole number gets each point rounded, since a
+// geometric point is almost never whole (a linear one is, if n is chosen for it); two points that
+// round alike would run the same scenario twice and are refused, naming the first repeat.
+std::expected<std::vector<std::string>, std::string> expand_geometric(const SpecParts& parts,
+                                                                      const RangeEnd& from,
+                                                                      const RangeEnd& to,
+                                                                      std::size_t n) {
+  const bool whole = config::counts_whole_things(parts.path);
+  std::vector<std::string> values;
+  std::optional<double> previous{};
+  for (std::size_t k = 0; k < n; ++k) {
+    double value = geometric_point_at(from.number, to.number, k, n);
+    if (whole) value = std::round(value);
+    if (whole && previous == value) {
+      const auto key = std::string{last_key(parts.path)};
+      return param_error(key + "=" + std::string{parts.range} + " gives " +
+                         point_text(value, whole) + from.unit + " twice (rounded to whole " + key +
+                         "); use fewer points");
+    }
+    previous = value;
+    values.push_back(point_text(value, whole) + from.unit);
+  }
+  return values;
+}
+
 // ---- --metric --------------------------------------------------------------------------------
 
 constexpr std::string_view metric_grammar =
-    "<client>.<op>.mean|p50|p95|p99|attempts|answered, <node>.mean_rho|peak_rho|drop_rate|reject_rate, "
+    "<client>.<op>.mean|p50|p95|p99|attempts|answered, "
+    "<node>.mean_rho|peak_rho|drop_rate|reject_rate, "
     "<queue>.lag, <pool>.dead_lettered, <fanout>.deduplicated or <gateway>.connections";
 
 // A metric's last word and what it reads (sweep.cppm's MetricKind); one row each.
@@ -596,6 +649,10 @@ std::expected<SweepParam, std::string> parse_param(std::string_view spec) {
   const auto parts = split_spec(spec);
   if (!parts) return std::unexpected(parts.error());
   if (auto problem = config::dot_path_problem(parts->path)) return param_error(*problem);
+  const bool geometric = parts->spacing == "log";
+  if (!parts->spacing.empty() && !geometric) {
+    return param_error(std::string{parts->range} + ": the only spacing suffix is :log");
+  }
   const auto count = parse_count(*parts);
   if (!count) return std::unexpected(count.error());
   const auto from = parse_end(parts->from);
@@ -607,9 +664,15 @@ std::expected<SweepParam, std::string> parse_param(std::string_view spec) {
                        ": both ends must be the same kind of value in the same unit (" +
                        std::string{parts->from} + " and " + std::string{parts->to} + ")");
   }
-  auto values = expand(*parts, *from, *to, *count);
+  if (geometric && (from->number <= 0 || to->number <= 0)) {
+    return param_error(std::string{parts->range} + ": geometric points need two positive ends");
+  }
+  auto values = geometric ? expand_geometric(*parts, *from, *to, *count)
+                          : expand(*parts, *from, *to, *count);
   if (!values) return std::unexpected(values.error());
-  return SweepParam{.path = std::string{parts->path}, .values = std::move(*values)};
+  return SweepParam{.path = std::string{parts->path},
+                    .values = std::move(*values),
+                    .spacing = geometric ? Spacing::geometric : Spacing::linear};
 }
 
 std::expected<SweepMetric, std::string> parse_metric(std::string_view name) {
