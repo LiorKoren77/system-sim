@@ -568,6 +568,7 @@ struct SweepArgs {
   std::vector<std::string> metrics{};
   std::size_t jobs{simsys::sweep::default_jobs()};
   std::string format{"table"};
+  bool slos{};  // --slos: each point's SLO verdicts and exit code
 };
 
 // The --metric texts, parsed; the first bad one is the error.
@@ -598,10 +599,15 @@ int run_sweep_command(const std::filesystem::path& file, const SweepArgs& args) 
     print_error(file.string() + ": error: " + metrics.error());
     return 1;
   }
-  const auto rows = simsys::sweep::run_sweep(file.string(), *params, *metrics, args.jobs);
+  const auto slos = args.slos ? simsys::sweep::SloColumns::on : simsys::sweep::SloColumns::off;
+  const auto rows = simsys::sweep::run_sweep(file.string(), *params, *metrics, args.jobs, slos);
   if (!rows) {
     print_error(rows.error());
     return 1;
+  }
+  // The exit column is then all zeros; said once on stderr, so stdout stays the table alone.
+  if (args.slos && !rows->empty() && rows->front().slos.empty()) {
+    print_error("the scenario has no SLOs: every point exits 0");
   }
   const auto format =
       args.format == "csv" ? simsys::sweep::SweepFormat::csv : simsys::sweep::SweepFormat::table;
@@ -671,6 +677,9 @@ CLI::App* add_sweep_command(CLI::App& app, SweepArgs& args, std::filesystem::pat
       ->required();
   sweep->add_option("--jobs", args.jobs, "worker threads (default: the machine's hardware threads)")
       ->check(CLI::Range(std::size_t{1}, simsys::sweep::max_jobs));
+  sweep->add_flag("--slos", args.slos,
+                  "a column per SLO with each point's verdict, and its exit code as run gives it "
+                  "(the sweep itself still exits 0)");
   sweep->add_option("--format", args.format, "output format: table (default) or csv")
       ->check(CLI::IsMember({"table", "csv"}));
   return sweep;

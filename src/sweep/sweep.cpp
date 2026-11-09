@@ -14,6 +14,7 @@ module;
 #include <cmath>
 #include <cstddef>
 #include <expected>
+#include <iterator>  // std::back_inserter: a row's verdict cells after its numbers
 #include <functional>  // std::function: session::run_in_parallel's parameter
 #include <limits>
 #include <optional>
@@ -442,6 +443,8 @@ constexpr double no_value = std::numeric_limits<double>::quiet_NaN();
 struct Measured {
   std::vector<double> numbers;
   std::vector<std::size_t> beyond_timeout;
+  std::vector<SloCell> slos{};      // with --slos only
+  std::optional<int> exit_code{};  // with --slos only
 };
 
 // A client op metric's op, or nothing when the run has no row for it.
@@ -570,12 +573,62 @@ std::expected<graph::Graph, std::string> prepare_point(const std::string& path,
 // duration, its step, its warmup: session::run_summary), and each metric read off the summary.
 // The Simulation, the Summary and the graph belong to this point alone: nothing here is shared
 // with another thread.
+// Each SLO's column heading: its metric, then `:node` and `.op` where it names them; a heading that
+// an earlier SLO already took gets `#2`, `#3`, ... in file order, so every column has its own name.
+std::vector<std::string> slo_headings(std::span<const model::SloSpec> slos) {
+  std::vector<std::string> plain;
+  std::vector<std::string> headings;
+  for (const auto& slo : slos) {
+    std::string heading{model::to_string(slo.metric)};
+    if (slo.node) heading += ":" + *slo.node;
+    if (slo.node && slo.op) heading += "." + *slo.op;
+    const auto earlier = std::ranges::count(plain, heading);
+    plain.push_back(heading);
+    headings.push_back(earlier == 0 ? heading : heading + "#" + std::to_string(earlier + 1));
+  }
+  return headings;
+}
+
+SloVerdict verdict_of(report::SloStatus status) {
+  switch (status) {
+    case report::SloStatus::pass:
+      return SloVerdict::pass;
+    case report::SloStatus::fail:
+      return SloVerdict::fail;
+    case report::SloStatus::skipped:
+      return SloVerdict::skipped;
+  }
+  return SloVerdict::skipped;
+}
+
+// The point judged as `simsys run` judges its file (main.cpp's print_report): every SLO by
+// report::evaluate_slos, and the exit code 0 when all pass (skipped counts as a pass), 2 when one
+// fails, 1 when the run observed no step.
+void judge(const report::Summary& summary, const graph::Graph& g, Measured& measured) {
+  const auto& slos = g.scenario().slos;
+  const auto results = report::evaluate_slos(summary, slos);
+  const auto headings = slo_headings(slos);
+  for (std::size_t k = 0; k < results.size(); ++k) {
+    measured.slos.push_back(
+        SloCell{.heading = headings[k], .verdict = verdict_of(results[k].status)});
+  }
+  if (summary.observed_steps() == 0) {
+    measured.exit_code = 1;
+  } else {
+    measured.exit_code = report::all_pass(results) ? 0 : 2;
+  }
+}
+
 std::expected<Measured, std::string> measure_point(const std::string& path, const graph::Graph& g,
-                                                   std::span<const SweepMetric> metrics) {
+                                                   std::span<const SweepMetric> metrics,
+                                                   SloColumns slos) {
   // C++23 std::expected::transform: maps the value (a summary into its metrics) and passes an
   // error through untouched.
-  return session::run_summary(g, path).transform(
-      [&](const report::Summary& summary) { return read_metrics(summary, metrics); });
+  return session::run_summary(g, path).transform([&](const report::Summary& summary) {
+    auto measured = read_metrics(summary, metrics);
+    if (slos == SloColumns::on) judge(summary, g, measured);
+    return measured;
+  });
 }
 
 // The params' path mistakes (a missing key, a list on the way) are the same at every point:
@@ -667,12 +720,47 @@ std::string csv_cell(double value) {
 // The table's cells, the header first.
 using Cells = std::vector<std::vector<std::string>>;
 
+// A verdict as each format prints it: for people in capitals, a skipped SLO a dash as a missing
+// number is; for programs in the SLO table's JSON words.
+std::string verdict_cell(SloVerdict verdict, SweepFormat format) {
+  const bool table = format == SweepFormat::table;
+  switch (verdict) {
+    case SloVerdict::pass:
+      return table ? "PASS" : "pass";
+    case SloVerdict::fail:
+      return table ? "FAIL" : "fail";
+    case SloVerdict::skipped:
+      return table ? "-" : "skipped";
+  }
+  return "-";
+}
+
+// The verdict columns' headings, `exit` last; none when the rows carry no verdicts (no --slos).
+// Every row of one sweep has the same SLOs, so the first row's headings are every row's.
+std::vector<std::string> verdict_headings(std::span<const SweepRow> rows) {
+  if (rows.empty() || !rows.front().exit_code) return {};
+  std::vector<std::string> headings;
+  for (const auto& cell : rows.front().slos) headings.push_back(cell.heading);
+  headings.emplace_back("exit");
+  return headings;
+}
+
+// A row's verdict cells, its exit code last; none without --slos.
+std::vector<std::string> verdict_cells(const SweepRow& row, SweepFormat format) {
+  if (!row.exit_code) return {};
+  std::vector<std::string> cells;
+  for (const auto& cell : row.slos) cells.push_back(verdict_cell(cell.verdict, format));
+  cells.push_back(std::to_string(*row.exit_code));
+  return cells;
+}
+
 std::vector<std::string> table_row(std::span<const SweepMetric> metrics, const SweepRow& row) {
   std::vector<std::string> line{row.values};
   for (std::size_t m = 0; m < metrics.size() && m < row.metrics.size(); ++m) {
     const bool beyond = std::ranges::contains(row.beyond_timeout, m);
     line.push_back(human_cell(metrics[m], row.metrics[m], beyond));
   }
+  std::ranges::move(verdict_cells(row, SweepFormat::table), std::back_inserter(line));
   return line;
 }
 
@@ -682,6 +770,7 @@ Cells table_cells(std::span<const SweepParam> params, std::span<const SweepMetri
   auto& header = cells.emplace_back();
   for (const auto& param : params) header.push_back(param.path);
   for (const auto& metric : metrics) header.push_back(metric.name);
+  std::ranges::move(verdict_headings(rows), std::back_inserter(header));
   for (const auto& row : rows) cells.push_back(table_row(metrics, row));
   return cells;
 }
@@ -700,10 +789,12 @@ std::string render_csv(std::span<const SweepParam> params, std::span<const Sweep
   std::string text;
   for (const auto& param : params) text += (text.empty() ? "" : ",") + param.path;
   for (const auto& metric : metrics) text += "," + metric.name;
+  for (const auto& heading : verdict_headings(rows)) text += "," + heading;
   text += "\n";
   for (const auto& row : rows) {
     for (std::size_t k = 0; k < row.values.size(); ++k) text += (k == 0 ? "" : ",") + row.values[k];
     for (const double number : row.metrics) text += "," + csv_cell(number);
+    for (const auto& cell : verdict_cells(row, SweepFormat::csv)) text += "," + cell;
     text += "\n";
   }
   return text;
@@ -780,7 +871,7 @@ std::expected<SweepMetric, std::string> parse_metric(std::string_view name) {
 std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& scenario_path,
                                                             std::span<const SweepParam> params,
                                                             std::span<const SweepMetric> metrics,
-                                                            std::size_t jobs) {
+                                                            std::size_t jobs, SloColumns slos) {
   const auto base = config::load(scenario_path);
   if (!base) return std::unexpected(config::describe(base.error()));
   // A metric the file cannot answer is the file's mistake as much as the option's: worded as the
@@ -798,7 +889,7 @@ std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& s
   if (auto error = graphs.first_error()) return std::unexpected(*error);
 
   const auto measured = for_each_point<Measured>(count, jobs, [&](std::size_t i) {
-    return measure_point(scenario_path, *graphs.values[i], metrics)
+    return measure_point(scenario_path, *graphs.values[i], metrics, slos)
         .transform_error(
             [&](const std::string& e) { return point_label(params, points[i], i) + e; });
   });
@@ -807,8 +898,11 @@ std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& s
   std::vector<SweepRow> rows;
   for (std::size_t i = 0; i < count; ++i) {
     const auto& point = *measured.values[i];
-    rows.push_back(SweepRow{
-        .values = points[i], .metrics = point.numbers, .beyond_timeout = point.beyond_timeout});
+    rows.push_back(SweepRow{.values = points[i],
+                            .metrics = point.numbers,
+                            .beyond_timeout = point.beyond_timeout,
+                            .slos = point.slos,
+                            .exit_code = point.exit_code});
   }
   return rows;
 }
@@ -816,8 +910,8 @@ std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& s
 std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& scenario_path,
                                                             const SweepParam& param,
                                                             std::span<const SweepMetric> metrics,
-                                                            std::size_t jobs) {
-  return run_sweep(scenario_path, std::span{&param, 1}, metrics, jobs);
+                                                            std::size_t jobs, SloColumns slos) {
+  return run_sweep(scenario_path, std::span{&param, 1}, metrics, jobs, slos);
 }
 
 std::size_t default_jobs() {

@@ -23,6 +23,7 @@
 module;
 #include <cstddef>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -102,16 +103,36 @@ constexpr std::size_t max_params = 2;
 [[nodiscard]] std::expected<std::vector<SweepParam>, std::string> parse_params(
     std::span<const std::string> specs);
 
-// One point: its value for each param, as written there, and one number per metric, in the order asked,
-// in SI base units (seconds for a latency or a lag, a plain ratio for a utilization or a drop
+// One point: its value for each param, as written there, and one number per metric, in the order
+// asked, in SI base units (seconds for a latency or a lag, a plain ratio for a utilization or a drop
 // rate, per second for a rate, a plain count for connections), like report::SloResult::observed.
 // `beyond_timeout` lists (by index into `metrics`) the percentiles that are the client's timeout,
 // not a latency it saw: more than 1 − q of the delivered requests timed out, and the table prints
 // them `>1s`, as the op table does.
+// Whether a sweep judges each point's SLOs (`--slos`): off by default, so a sweep's output is what
+// it was before verdicts existed.
+enum class SloColumns { off, on };
+
+// One SLO's verdict at one point, as `simsys run` reaches it (report::SloStatus; this interface
+// imports no other module, so it names its own three values).
+enum class SloVerdict { pass, fail, skipped };
+
+// One SLO column of a point: its heading, the SLO's metric and, where it has them, its node and
+// op (`p99_latency:users.ping`, `utilization:url_db`, `drop_rate`; a second SLO with the same
+// heading `...#2`), and the point's verdict.
+struct SloCell {
+  std::string heading;
+  SloVerdict verdict{};
+};
+
 struct SweepRow {
   std::vector<std::string> values;  // one per param, in the order of the params
   std::vector<double> metrics;
   std::vector<std::size_t> beyond_timeout{};
+  // With SloColumns::on: one cell per SLO of the scenario, in file order, and the exit code
+  // `simsys run` gives the point (0 every SLO passed, 2 one failed). Empty and absent otherwise.
+  std::vector<SloCell> slos{};
+  std::optional<int> exit_code{};
 };
 
 enum class SweepFormat { table, csv };
@@ -126,14 +147,15 @@ enum class SweepFormat { table, csv };
 // With two params the points are every pair of their values, the first param the outer loop; an
 // error at a point names every value: "point 3 (a=300/s, b=1k/s): ...". Two params that reach one
 // value of the file (a YAML anchor and its alias) are refused.
+// With SloColumns::on every point's row also holds its SLO verdicts and exit code (SweepRow).
 [[nodiscard]] std::expected<std::vector<SweepRow>, std::string> run_sweep(
     const std::string& scenario_path, std::span<const SweepParam> params,
-    std::span<const SweepMetric> metrics, std::size_t jobs);
+    std::span<const SweepMetric> metrics, std::size_t jobs, SloColumns slos = SloColumns::off);
 
 // A sweep of one key: run_sweep over a span of one param.
 [[nodiscard]] std::expected<std::vector<SweepRow>, std::string> run_sweep(
     const std::string& scenario_path, const SweepParam& param, std::span<const SweepMetric> metrics,
-    std::size_t jobs);
+    std::size_t jobs, SloColumns slos = SloColumns::off);
 
 // The CLI's default --jobs: the machine's hardware threads, or 1 when it cannot tell.
 [[nodiscard]] std::size_t default_jobs();
@@ -146,7 +168,8 @@ inline constexpr std::size_t max_jobs = 1024;
 // latencies in readable units (1.61 ms). `csv`: for programs, the same header with commas and
 // each number as the shortest text that reads back to the same double (report::format_number).
 // Both end with a newline.
-// A column per param, in order, then one per metric.
+// A column per param, in order, then one per metric; when the rows carry verdicts, one per SLO
+// (`PASS`, `FAIL`, `-` for skipped in the table; `pass`, `fail`, `skipped` in the CSV) and `exit`.
 [[nodiscard]] std::string render_sweep(std::span<const SweepParam> params,
                                        std::span<const SweepMetric> metrics,
                                        std::span<const SweepRow> rows, SweepFormat format);
