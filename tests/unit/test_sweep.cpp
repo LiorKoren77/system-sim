@@ -990,3 +990,63 @@ TEST_CASE("the unknown-metric message names reject_rate among the node metrics")
   REQUIRE_FALSE(metric.has_value());
   REQUIRE(metric.error().contains("<node>.mean_rho|peak_rho|drop_rate|reject_rate"));
 }
+
+// ---- Geometric points, `:log` (phase 4a Task 3; spec 4a §4.2) ----------------------------------
+// x_k = from × (to / from)^(k / (n − 1)), both ends included: a constant ratio between neighbours,
+// what a log axis plots evenly. The knee of hello's s / (1 − rho), or a cache's hit ratio against
+// its size, is read on such an axis.
+
+TEST_CASE("a geometric range multiplies by the same ratio from point to point") {
+  // 1 × 100^(k/2) for k = 0, 1, 2, in from's unit text, repeated after every point.
+  const auto param = parse_param("nodes.users.rate.base=1k/s..100k/s:3:log");
+  INFO((param ? "" : param.error()));
+  REQUIRE(param.has_value());
+  REQUIRE(param->values == std::vector<std::string>{"1k/s", "10k/s", "100k/s"});
+}
+
+TEST_CASE("a geometric range ends exactly at its upper end") {
+  // 1000^(1/3) is 9.999999999999998 in floating point; the points are written at 12 significant
+  // digits, and the last one is `to` itself, never a power that misses it.
+  const auto param = parse_param("nodes.api.latency=1ms..1000ms:4:log");
+  INFO((param ? "" : param.error()));
+  REQUIRE(param.has_value());
+  REQUIRE(param->values == std::vector<std::string>{"1ms", "10ms", "100ms", "1000ms"});
+}
+
+TEST_CASE("a geometric range of a whole key gets whole points") {
+  const auto param = parse_param("nodes.w.workers=10..1000:3:log");
+  INFO((param ? "" : param.error()));
+  REQUIRE(param.has_value());
+  REQUIRE(param->values == std::vector<std::string>{"10", "100", "1000"});
+}
+
+TEST_CASE("a geometric range of a whole key rounds, and refuses two points that round alike") {
+  // 4^(k/7) = 1, 1.219, 1.486, 1.811, ... rounds to 1, 1, 1, 2, ...: the first repeat is 1. A
+  // linear range refuses a point that is not whole; geometric points almost never are, so they
+  // round, and only a repeat (the same run twice) is refused.
+  const auto rounded = parse_param("nodes.w.workers=1..100:3:log");
+  REQUIRE(rounded.has_value());
+  REQUIRE(rounded->values == std::vector<std::string>{"1", "10", "100"});
+  const auto repeated = parse_param("nodes.w.workers=1..4:8:log");
+  REQUIRE_FALSE(repeated.has_value());
+  REQUIRE(repeated.error() ==
+          "--param: workers=1..4:8:log gives 1 twice (rounded to whole workers); use fewer points");
+}
+
+TEST_CASE("a geometric range needs two positive ends") {
+  for (const std::string_view bad :
+       {"nodes.users.rate.base=0/s..1000/s:4:log", "nodes.api.latency=-1ms..1ms:3:log"}) {
+    CAPTURE(bad);
+    const auto param = parse_param(bad);
+    REQUIRE_FALSE(param.has_value());
+    const auto range = bad.substr(bad.find('=') + 1);
+    REQUIRE(param.error() ==
+            "--param: " + std::string{range} + ": geometric points need two positive ends");
+  }
+}
+
+TEST_CASE("log is the only spacing suffix") {
+  const auto param = parse_param("nodes.w.workers=1..10:3:lin");
+  REQUIRE_FALSE(param.has_value());
+  REQUIRE(param.error() == "--param: 1..10:3:lin: the only spacing suffix is :log");
+}
