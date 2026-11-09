@@ -211,7 +211,7 @@ JSON is unchanged (the schema's key table already gives each key's unit).
 
 ## 9. Tests to write first
 
-- **Loader / CLI (4a.1):** `write_ops: [write, write]` → `node 'c': write_ops names 'write' twice`
+- **Loader / CLI (4a.1):** `write_ops: [write, write]` → `node 'c': duplicate write_ops op 'write'` (the link reader's `duplicate op 'x'` form)
   on a cache, a cdn, a sql_db, a blob store, a kv_cluster; `simsys curve f c --seed 3` without
   `--noise` → exit 1 and `--seed needs --noise (without it the curve has no randomness)`; with
   `--noise` unchanged.

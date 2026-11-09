@@ -20,6 +20,7 @@ module;
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -630,6 +631,16 @@ CheckResult read_cache_strategy(const Site& site, const YAML::Node& body, model:
   return site.fail(at, std::format("strategy {} needs a backend", strategy));
 }
 
+// The first element of a list of op names that repeats an earlier one, if any: `write_ops` is a
+// set, as a link's `ops` is (links.cpp's check_link_ops_unique, whose words the refusal uses).
+std::optional<YAML::Node> first_repeat(const YAML::Node& list) {
+  std::set<std::string_view> seen;  // views into the document's own text
+  for (const auto& op : list) {
+    if (!seen.insert(op.Scalar()).second) return op;
+  }
+  return std::nullopt;
+}
+
 // `write_ops: [write, delete]`: the ops that change data; every other op is a read. Stored
 // exactly as written; absent stays absent (model::write_ops_of applies the type's default, a
 // cache's or a CDN's `write` or a database's four SQL writes). An empty list would make every op
@@ -648,6 +659,13 @@ CheckResult read_write_ops(const Site& site, const YAML::Node& body, model::Node
   }
   return collect_each(list,
                       [&](const YAML::Node& op) { return read_op_name(site, op, "write_ops op"); })
+      .and_then([&](std::vector<std::string> ops) -> std::expected<std::vector<std::string>,
+                                                                ConfigError> {
+        if (const auto repeat = first_repeat(list)) {
+          return site.fail(*repeat, std::format("duplicate write_ops op '{}'", repeat->Scalar()));
+        }
+        return ops;
+      })
       .transform(store_in(node.write_ops));
 }
 
