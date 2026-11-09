@@ -5,8 +5,9 @@
 // error (bad file, bad option, a scenario the engine cannot run yet, or a run that observed
 // no step: no data is an error, not a pass). `run --replications N` judges each SLO by its own
 // median run (report::SloReplication), so two SLOs may be judged by two different seeds: it exits 2
-// when some SLO's median run fails it, whatever the seeds that passed. `sweep` reports numbers and
-// judges none: 0 when every point ran, whatever its SLOs, 1 on an error.
+// when some SLO's median run fails it, whatever the seeds that passed. `sweep` exits 0 when every
+// point ran, whatever its SLOs, 1 on an error; with --slos it prints each point's verdicts and the
+// exit code `run` would give it, but its own exit code stays the same (phase 4a spec §2).
 #include <unistd.h>  // isatty, STDOUT_FILENO: POSIX, which is fine for this project
 #include <CLI/CLI.hpp>
 
@@ -605,9 +606,10 @@ int run_sweep_command(const std::filesystem::path& file, const SweepArgs& args) 
     print_error(rows.error());
     return 1;
   }
-  // The exit column is then all zeros; said once on stderr, so stdout stays the table alone.
+  // Said once on stderr, so stdout stays the table alone: the verdict columns are empty, and the
+  // exit column only says that each point ran.
   if (args.slos && !rows->empty() && rows->front().slos.empty()) {
-    print_error("the scenario has no SLOs: every point exits 0");
+    print_error("the scenario has no SLOs, so no point can fail one");
   }
   const auto format =
       args.format == "csv" ? simsys::sweep::SweepFormat::csv : simsys::sweep::SweepFormat::table;
@@ -660,13 +662,20 @@ CLI::App* add_curve_command(CLI::App& app, CurveArgs& args, std::filesystem::pat
 
 CLI::App* add_sweep_command(CLI::App& app, SweepArgs& args, std::filesystem::path& file) {
   auto* sweep = app.add_subcommand(
-      "sweep", "run the scenario once per value of one key, the runs in parallel; one row each");
+      "sweep",
+      "run the scenario once per value of one key (or per pair of two), the runs in parallel; one "
+      "row each");
   add_file_argument(*sweep, file);
   sweep
+      // One value per --param: CLI11 lets a vector option take every word that follows it, so the
+      // scenario file written after `--param <spec>` would be read as a second spec.
       ->add_option("--param", args.params,
                    "the swept key and its range, <dot.path>=<from>..<to>:<n>[:log] "
                    "(:log: geometric), e.g. nodes.users.rate.base=100/s..900/s:3; "
                    "given twice, a grid of both keys")
+      ->expected(1)
+      ->allow_extra_args(false)
+      ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll)
       ->required();
   sweep
       ->add_option("--metric", args.metrics,

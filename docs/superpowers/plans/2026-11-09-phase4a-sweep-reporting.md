@@ -116,7 +116,7 @@ points of a `:log` range are refused, on every key. Fixed in the commit after Ta
 
 **Files:** `src/sweep/sweep.cppm` (`run_sweep` takes `std::span<const SweepParam>`; `SweepRow::value` becomes `values`, one text per param; `render_sweep` takes the span), `src/sweep/sweep.cpp` (`grid_points`, `point_label`, `prepare_point` with two overrides, the renderers' header), `src/cli/main.cpp` (`--param` repeatable: a `std::vector<std::string>`, at most 2); tests in `tests/unit/test_sweep.cpp`, `tests/cli/sweep_jobs.cmake`, `tests/CMakeLists.txt`.
 
-- [ ] Tests:
+- [x] Tests:
   - on hello, `--param nodes.users.rate.base=100/s..300/s:2 --param nodes.api.capacity=1k/s..2k/s:2`: **4 rows** in the order (100/s, 1k/s), (100/s, 2k/s), (300/s, 1k/s), (300/s, 2k/s); `api.mean_rho` **0.1, 0.05, 0.3, 0.15** (rho = rate / capacity, one replica: the key names are checked against hello's YAML in the red commit, and the probe's own file is used if hello's capacity key is not `capacity`);
   - the table's header is `nodes.users.rate.base  nodes.api.capacity  api.mean_rho` and the CSV's the same with commas;
   - a third `--param` → `--param: at most two keys (a grid of two); script a third`;
@@ -124,25 +124,50 @@ points of a `:log` range are refused, on every key. Fixed in the commit after Ta
   - `--param a=1..200:200 --param b=1..100:100` → `--param: 200 × 100 = 20000 points: at most 10000`;
   - an error at a point names both values: `point 3 (nodes.users.rate.base=300/s, nodes.api.capacity=1k/s): ...` (forced by a value the loader refuses at that point only);
   - process level: the grid's bytes are the same for `--jobs 1` and `--jobs 3` (a new `CHECK` in `sweep_jobs.cmake`, ctest name `simsys sweep over two keys gives the same bytes with --jobs 1 and 3`); every one-key sweep's bytes are unchanged (the existing checks).
-- [ ] Red commit (`run_sweep`'s new signature makes the test file fail to compile: the red reason is the missing overload; the message tests compile against `parse_params`, a new free function that checks the list).
-- [ ] Implementation: C++23 `std::views::cartesian_product` over two `std::views::iota` index ranges (first-use comment: what it is, that it replaces two nested loops whose order a reader must check, why here: the outer/inner order is the product's own; `docs/study/ranges.md` gets the longer note in Task 9). No lambda goes into an adaptor (fifth defect): an index pair is turned into overrides by a named `detail::overrides_at(params, i, j)`. One key is the grid of one (the same code path, so a one-key sweep's output is unchanged by construction).
-- [ ] Release build checked (fourth defect: `std::vector<SweepParam>` and `std::vector<std::vector<std::string>>` crossing into the CLI); an `emit_special_members` line added only for an undefined reference that appears.
-- [ ] Green commit `sweep: a grid over two keys, the first the outer loop`.
+- [x] Red commit (`run_sweep`'s new signature makes the test file fail to compile: the red reason is the missing overload; the message tests compile against `parse_params`, a new free function that checks the list).
+- [x] Implementation: C++23 `std::views::cartesian_product` over two `std::views::iota` index ranges (first-use comment: what it is, that it replaces two nested loops whose order a reader must check, why here: the outer/inner order is the product's own; `docs/study/ranges.md` gets the longer note in Task 9). No lambda goes into an adaptor (fifth defect): an index pair is turned into overrides by a named `detail::overrides_at(params, i, j)`. One key is the grid of one (the same code path, so a one-key sweep's output is unchanged by construction).
+- [x] Release build checked (fourth defect: `std::vector<SweepParam>` and `std::vector<std::vector<std::string>>` crossing into the CLI); an `emit_special_members` line added only for an undefined reference that appears.
+- [x] Green commit `sweep: a grid over two keys, the first the outer loop`.
 
 ### Task 5: `--slos`, a verdict per SLO and an exit code per point
 
 **Files:** `src/sweep/sweep.cppm` (`enum class SloColumns { off, on }`; `SweepRow::slos`, a `std::vector<report::SloStatus>`; the importer then needs `simsys.report`'s `SloStatus`, so `sweep.cppm` gains `import simsys.report;` or carries its own three-value enum: the second keeps the interface importing nothing, which is what its header comment promises against the first defect, and is the choice), `src/sweep/sweep.cpp` (`measure_point` calls `report::evaluate_slos` on the summary it already has; `slo_headings`; the cells), `src/cli/main.cpp` (`--slos` flag; the stderr note for a scenario without SLOs); tests in `tests/unit/test_sweep.cpp`, `tests/cli/sweep_jobs.cmake`.
 
-- [ ] Tests:
+- [x] Tests:
   - hello with an SLO `{metric: p99_latency, node: users, op: ping, max: 5ms}` (a test-owned copy of the file), swept over `nodes.users.rate.base=100/s..900/s:3`: the cells are **PASS, PASS, FAIL** and the `exit` cells **0, 0, 2**. Derivation: hello's README gives the mean 1.61 ms, 2.5 ms, 10.5 ms at 100, 500, 900/s; the p99 of the lognormal fit is above 5 ms at 900/s by a wide margin and below it at 100/s; 500/s is pinned from the binary in the red commit (*measured*, with its value in the test comment), and the SLO's `max` is chosen so that it passes there;
   - each cell equals `simsys run`'s verdict on the same file with the point's value written in (a test that runs `session::run_summary` + `evaluate_slos` on a `config::load(path, override)` and compares, for every point);
   - headings: `p99_latency:users.ping`, `drop_rate`; two SLOs `p99_latency:users.ping` with different `max` → the second is `p99_latency:users.ping#2`;
   - CSV cells `pass`/`fail`/`skipped`, the exit column `0`/`2`;
   - a scenario with no SLOs: only an `exit` column, all `0`, and the CLI's stderr says `the scenario has no SLOs: every point exits 0`;
   - process level: exit code **0** with a failing point (the existing "exits 0 when an SLO fails at some point" check gains `--slos`); without `--slos` the bytes are unchanged.
-- [ ] Red commit; implementation; Release build; green commit `sweep: each point's SLO verdicts and exit code, on request`.
+- [x] Red commit; implementation; Release build; green commit `sweep: each point's SLO verdicts and exit code, on request`.
 
 **Checkpoint B.** Stop; report, and the size of Batch C.
+
+Done: Task 4 red `8c9a058`, green `c27b484`; Task 5 red `added2f`, green `bfccd47` (1721 tests).
+As built: the grid's size message reads `200 x 100 = 20000 points` (ASCII); two paths reaching one
+anchored value are refused as `<file>: error: --param: nodes.b.capacity reaches the same value as
+nodes.a.capacity (a YAML anchor and its alias)` (`config::same_override_target` compares yaml-cpp
+node identity); the SLO test's `max` is 20 ms, since hello's measured p99 is 5.66, 10.0 and 49.3 ms
+at 100, 500 and 900/s (the plan's 5 ms fails everywhere); `sweep.cppm` names its own `SloVerdict`
+and keeps importing no module; a skipped SLO is pinned with an external sink of `failure_rate: 1`.
+
+**Review of batch B** (code-review skill, medium, two passes: Task 4 at `c27b484`, Task 5 at
+`bfccd47`). Task 4: 1. `--param` as a vector option swallowed a file written after it (CLI11 takes
+every following word); 2–5, 8. the exported `run_sweep(span)` trusted its caller (an empty span
+indexed past the end, three params were silently cut to two, the 10,000-point and duplicate checks
+lived only in `parse_params`, the same path twice blamed an anchor); 6. `sweep --help` said one key;
+7. the YAML file is parsed once per check; 9. rows copied their points; 10. a temp file outlived a
+failing REQUIRE. Task 5: 1. the no-SLO note promised exit 0 although a point that observed no step
+exits 1; 2. the interface omitted exit code 1; 3. main.cpp's header still said sweep judges
+nothing; 4, 5. two doc comments separated from their functions; 6. three lines over 100 columns and
+an include out of order; 7. headings recomputed per point; 8. a temp file (as 10 above); 9. dead
+fallback returns after exhaustive switches.
+Decisions: fixed all but 7 of Task 4 (four parses of a small file before runs of seconds: left) and
+8 of Task 5 (the loop needs the file; left). `--param` takes one value per occurrence
+(`expected(1)`, `allow_extra_args(false)`, `TakeAll`), pinned by a CLI check with the file after
+it; one `grid_problem` serves `parse_params` and `run_sweep`; the note reads `the scenario has no
+SLOs, so no point can fail one`; `std::unreachable` (C++23) closes the two switches.
 
 ---
 

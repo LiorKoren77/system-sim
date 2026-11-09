@@ -14,8 +14,8 @@ module;
 #include <cmath>
 #include <cstddef>
 #include <expected>
-#include <iterator>  // std::back_inserter: a row's verdict cells after its numbers
 #include <functional>  // std::function: session::run_in_parallel's parameter
+#include <iterator>    // std::back_inserter: a row's verdict cells after its numbers
 #include <limits>
 #include <optional>
 #include <ranges>  // std::views::cartesian_product: the grid's pairs (grid_points)
@@ -527,6 +527,7 @@ Measured read_metrics(const report::Summary& summary, std::span<const SweepMetri
 // C++23 std::views::cartesian_product: the pairs of two ranges as a view of tuples, in that order.
 // It replaces two nested loops whose order a reader must check, and takes no lambda, so the fifth
 // GCC 14.2 defect (a lambda in a range adaptor in a module function) does not arise.
+// One or two params: grid_problem has refused any other count before this runs.
 std::vector<std::vector<std::string>> grid_points(std::span<const SweepParam> params) {
   std::vector<std::vector<std::string>> points;
   if (params.size() == 1) {
@@ -569,10 +570,6 @@ std::expected<graph::Graph, std::string> prepare_point(const std::string& path,
   });
 }
 
-// Phase 2 for one point: a run of the whole scenario, exactly as `simsys run` does it (its
-// duration, its step, its warmup: session::run_summary), and each metric read off the summary.
-// The Simulation, the Summary and the graph belong to this point alone: nothing here is shared
-// with another thread.
 // Each SLO's column heading: its metric, then `:node` and `.op` where it names them; a heading that
 // an earlier SLO already took gets `#2`, `#3`, ... in file order, so every column has its own name.
 std::vector<std::string> slo_headings(std::span<const model::SloSpec> slos) {
@@ -598,16 +595,19 @@ SloVerdict verdict_of(report::SloStatus status) {
     case report::SloStatus::skipped:
       return SloVerdict::skipped;
   }
-  return SloVerdict::skipped;
+  // C++23 std::unreachable: tells the compiler (and the reader) that the switch above covers every
+  // value, replacing a made-up fallback return that would hide a value added to the enum later;
+  // reaching it is undefined behaviour, and -Wswitch already refuses a missing case at compile
+  // time.
+  std::unreachable();
 }
 
 // The point judged as `simsys run` judges its file (main.cpp's print_report): every SLO by
 // report::evaluate_slos, and the exit code 0 when all pass (skipped counts as a pass), 2 when one
 // fails, 1 when the run observed no step.
-void judge(const report::Summary& summary, const graph::Graph& g, Measured& measured) {
-  const auto& slos = g.scenario().slos;
-  const auto results = report::evaluate_slos(summary, slos);
-  const auto headings = slo_headings(slos);
+void judge(const report::Summary& summary, const graph::Graph& g,
+           std::span<const std::string> headings, Measured& measured) {
+  const auto results = report::evaluate_slos(summary, g.scenario().slos);
   for (std::size_t k = 0; k < results.size(); ++k) {
     measured.slos.push_back(
         SloCell{.heading = headings[k], .verdict = verdict_of(results[k].status)});
@@ -619,16 +619,41 @@ void judge(const report::Summary& summary, const graph::Graph& g, Measured& meas
   }
 }
 
+// Phase 2 for one point: a run of the whole scenario, exactly as `simsys run` does it (its
+// duration, its step, its warmup: session::run_summary), and each metric read off the summary;
+// with --slos, the point judged (judge). The Simulation, the Summary and the graph belong to this
+// point alone: nothing here is shared with another thread. `headings` are the SLOs' column names,
+// the same at every point (an override changes a value, never the SLO list), worked out once.
 std::expected<Measured, std::string> measure_point(const std::string& path, const graph::Graph& g,
                                                    std::span<const SweepMetric> metrics,
-                                                   SloColumns slos) {
+                                                   SloColumns slos,
+                                                   std::span<const std::string> headings) {
   // C++23 std::expected::transform: maps the value (a summary into its metrics) and passes an
   // error through untouched.
   return session::run_summary(g, path).transform([&](const report::Summary& summary) {
     auto measured = read_metrics(summary, metrics);
-    if (slos == SloColumns::on) judge(summary, g, measured);
+    if (slos == SloColumns::on) judge(summary, g, headings, measured);
     return measured;
   });
+}
+
+std::unexpected<std::string> too_many_keys() {
+  return param_error("at most two keys (a grid of two); script a third");
+}
+
+// Why `params` cannot be swept as one grid, or nothing: one or two keys, no key twice, and at
+// most max_points points in all (every point's graph is built before any runs). parse_params and
+// run_sweep both ask, so a caller of the exported run_sweep cannot step past it.
+std::optional<std::string> grid_problem(std::span<const SweepParam> params) {
+  if (params.empty()) return "--param: a sweep needs a key";
+  if (params.size() > max_params) return too_many_keys().error();
+  if (params.size() == 1) return std::nullopt;
+  if (params[0].path == params[1].path) return "--param: " + params[1].path + " is given twice";
+  const auto rows = params[0].values.size();
+  const auto columns = params[1].values.size();
+  if (rows * columns <= max_points) return std::nullopt;
+  return "--param: " + std::to_string(rows) + " x " + std::to_string(columns) + " = " +
+         std::to_string(rows * columns) + " points: at most " + std::to_string(max_points);
 }
 
 // The params' path mistakes (a missing key, a list on the way) are the same at every point:
@@ -732,7 +757,7 @@ std::string verdict_cell(SloVerdict verdict, SweepFormat format) {
     case SloVerdict::skipped:
       return table ? "-" : "skipped";
   }
-  return "-";
+  std::unreachable();
 }
 
 // The verdict columns' headings, `exit` last; none when the rows carry no verdicts (no --slos).
@@ -834,27 +859,14 @@ std::expected<SweepParam, std::string> parse_param(std::string_view spec) {
 
 std::expected<std::vector<SweepParam>, std::string> parse_params(
     std::span<const std::string> specs) {
-  if (specs.size() > max_params) {
-    return param_error("at most two keys (a grid of two); script a third");
-  }
+  if (specs.size() > max_params) return too_many_keys();
   std::vector<SweepParam> params;
   for (const auto& spec : specs) {
     auto param = parse_param(spec);
     if (!param) return std::unexpected(param.error());
-    if (std::ranges::contains(params, param->path, &SweepParam::path)) {
-      return param_error(param->path + " is given twice");
-    }
     params.push_back(std::move(*param));
   }
-  if (params.size() == max_params) {
-    const auto rows = params[0].values.size();
-    const auto columns = params[1].values.size();
-    if (rows * columns > max_points) {
-      return param_error(std::to_string(rows) + " x " + std::to_string(columns) + " = " +
-                         std::to_string(rows * columns) + " points: at most " +
-                         std::to_string(max_points));
-    }
-  }
+  if (auto problem = grid_problem(params)) return std::unexpected(*problem);
   return params;
 }
 
@@ -879,9 +891,13 @@ std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& s
   if (auto problem = first_metric_problem(*base, metrics)) {
     return std::unexpected(scenario_path + ": error: " + *problem);
   }
+  if (auto problem = grid_problem(params)) {
+    return std::unexpected(scenario_path + ": error: " + *problem);
+  }
   if (auto problem = first_path_problem(scenario_path, params)) return std::unexpected(*problem);
 
-  const auto points = grid_points(params);
+  auto points = grid_points(params);
+  const auto headings = slo_headings(base->slos);
   const auto count = points.size();
   const auto graphs = for_each_point<graph::Graph>(count, jobs, [&](std::size_t i) {
     return prepare_point(scenario_path, params, points[i], i);
@@ -889,7 +905,7 @@ std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& s
   if (auto error = graphs.first_error()) return std::unexpected(*error);
 
   const auto measured = for_each_point<Measured>(count, jobs, [&](std::size_t i) {
-    return measure_point(scenario_path, *graphs.values[i], metrics, slos)
+    return measure_point(scenario_path, *graphs.values[i], metrics, slos, headings)
         .transform_error(
             [&](const std::string& e) { return point_label(params, points[i], i) + e; });
   });
@@ -898,7 +914,7 @@ std::expected<std::vector<SweepRow>, std::string> run_sweep(const std::string& s
   std::vector<SweepRow> rows;
   for (std::size_t i = 0; i < count; ++i) {
     const auto& point = *measured.values[i];
-    rows.push_back(SweepRow{.values = points[i],
+    rows.push_back(SweepRow{.values = std::move(points[i]),
                             .metrics = point.numbers,
                             .beyond_timeout = point.beyond_timeout,
                             .slos = point.slos,

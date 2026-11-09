@@ -103,12 +103,6 @@ constexpr std::size_t max_params = 2;
 [[nodiscard]] std::expected<std::vector<SweepParam>, std::string> parse_params(
     std::span<const std::string> specs);
 
-// One point: its value for each param, as written there, and one number per metric, in the order
-// asked, in SI base units (seconds for a latency or a lag, a plain ratio for a utilization or a drop
-// rate, per second for a rate, a plain count for connections), like report::SloResult::observed.
-// `beyond_timeout` lists (by index into `metrics`) the percentiles that are the client's timeout,
-// not a latency it saw: more than 1 − q of the delivered requests timed out, and the table prints
-// them `>1s`, as the op table does.
 // Whether a sweep judges each point's SLOs (`--slos`): off by default, so a sweep's output is what
 // it was before verdicts existed.
 enum class SloColumns { off, on };
@@ -125,12 +119,20 @@ struct SloCell {
   SloVerdict verdict{};
 };
 
+// One point: its value for each param, as written there, and one number per metric, in the order
+// asked, in SI base units (seconds for a latency or a lag, a plain ratio for a utilization or a
+// drop rate, per second for a rate, a plain count for connections), like
+// report::SloResult::observed.
+// `beyond_timeout` lists (by index into `metrics`) the percentiles that are the client's timeout,
+// not a latency it saw: more than 1 − q of the delivered requests timed out, and the table prints
+// them `>1s`, as the op table does.
 struct SweepRow {
   std::vector<std::string> values;  // one per param, in the order of the params
   std::vector<double> metrics;
   std::vector<std::size_t> beyond_timeout{};
   // With SloColumns::on: one cell per SLO of the scenario, in file order, and the exit code
-  // `simsys run` gives the point (0 every SLO passed, 2 one failed). Empty and absent otherwise.
+  // `simsys run` gives the point (0 every SLO passed, 2 one failed, 1 the run observed no step).
+  // Empty and absent otherwise.
   std::vector<SloCell> slos{};
   std::optional<int> exit_code{};
 };

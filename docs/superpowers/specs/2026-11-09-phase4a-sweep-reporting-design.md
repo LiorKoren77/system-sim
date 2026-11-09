@@ -138,7 +138,7 @@ function.
 A column is headed by the SLO's metric and, where it has them, its node and op:
 `p99_latency:users.read`, `drop_rate`, `utilization:url_db`. Two SLOs that would get the same
 heading take `#2`, `#3` in file order. A scenario without SLOs gets only the `exit` column (all 0),
-and the CLI says so on stderr: `the scenario has no SLOs: every point exits 0`. The process exit code
+and the CLI says so on stderr: `the scenario has no SLOs, so no point can fail one`. The process exit code
 stays 0 (every point ran) or 1 (an error) with or without `--slos` (§2).
 
 The youtube example of the schema then reads its own SLO:

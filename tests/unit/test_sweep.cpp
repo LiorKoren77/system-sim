@@ -1157,11 +1157,11 @@ std::string anchored_path() {
 }  // namespace
 
 TEST_CASE("a grid cannot sweep two paths that reach one anchored value") {
-  const auto path = anchored_path();
   const auto params = parse_params(std::vector<std::string>{"nodes.a.capacity=1k/s..2k/s:2",
                                                             "nodes.b.capacity=3k/s..4k/s:2"});
   REQUIRE(params.has_value());
   const std::vector<SweepMetric> metrics{*parse_metric("a.mean_rho")};
+  const auto path = anchored_path();
   const auto rows = run_sweep(path, *params, metrics, 1);
   std::filesystem::remove(path);
   REQUIRE_FALSE(rows.has_value());
@@ -1333,7 +1333,8 @@ TEST_CASE("the table and csv show each verdict and the exit code after the metri
   const auto rows = run_sweep(path, hello_rate_sweep(), metrics, 1, SloColumns::on);
   std::filesystem::remove(path);
   REQUIRE(rows.has_value());
-  const auto table = split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::table), '\n');
+  const auto table =
+      split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::table), '\n');
   CAPTURE(table);
   REQUIRE(split_words(table[0]) ==
           std::vector<std::string>{"nodes.users.rate.base", "users.ping.mean", "api.mean_rho",
@@ -1342,7 +1343,8 @@ TEST_CASE("the table and csv show each verdict and the exit code after the metri
   REQUIRE(split_words(table[4]) ==
           std::vector<std::string>{"900/s", "10.5ms", "0.9", "FAIL", "2"});
   const auto csv = split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::csv), '\n');
-  REQUIRE(csv[0] == "nodes.users.rate.base,users.ping.mean,api.mean_rho,p99_latency:users.ping,exit");
+  REQUIRE(csv[0] ==
+          "nodes.users.rate.base,users.ping.mean,api.mean_rho,p99_latency:users.ping,exit");
   REQUIRE(csv[1].ends_with(",pass,0"));
   REQUIRE(csv[3].ends_with(",fail,2"));
 }
@@ -1381,4 +1383,21 @@ TEST_CASE("a skipped SLO is a dash in the table and skipped in the csv") {
   REQUIRE(split_words(table[2])[2] == "-");
   const auto csv = split(render_sweep(hello_rate_sweep(), metrics, *rows, SweepFormat::csv), '\n');
   REQUIRE(csv[1].ends_with(",skipped,0"));
+}
+
+TEST_CASE("run_sweep refuses a grid that parse_params would refuse, whoever built the params") {
+  const auto rate = hello_rate_sweep();
+  const SweepParam latency{.path = "nodes.api.latency", .values = {"1ms", "2ms"}};
+  const auto metrics = hello_metrics();
+  const auto none = run_sweep(hello_path, std::span<const SweepParam>{}, metrics, 1);
+  REQUIRE_FALSE(none.has_value());
+  REQUIRE(none.error() == hello_path + ": error: --param: a sweep needs a key");
+  const std::vector three{rate, latency, latency};
+  const auto too_many = run_sweep(hello_path, three, metrics, 1);
+  REQUIRE_FALSE(too_many.has_value());
+  REQUIRE(too_many.error().ends_with("--param: at most two keys (a grid of two); script a third"));
+  const std::vector twice{rate, rate};
+  const auto repeated = run_sweep(hello_path, twice, metrics, 1);
+  REQUIRE_FALSE(repeated.has_value());
+  REQUIRE(repeated.error().ends_with("--param: nodes.users.rate.base is given twice"));
 }

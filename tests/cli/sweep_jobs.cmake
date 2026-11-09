@@ -185,7 +185,7 @@ elseif(CHECK STREQUAL "slo_failure_exit_0")
   # hello itself has no SLOs: --slos says so on stderr, and every exit cell is 0.
   run_sweep("${SCENARIO}" --param "${PARAM}" --metric users.ping.mean --slos)
   require_output("--slos on a scenario without SLOs")
-  string(FIND "${sweep_err}" "the scenario has no SLOs: every point exits 0" at)
+  string(FIND "${sweep_err}" "the scenario has no SLOs, so no point can fail one" at)
   if(at EQUAL -1)
     message(FATAL_ERROR "no note for a scenario without SLOs:\n${sweep_err}")
   endif()
@@ -203,6 +203,13 @@ elseif(CHECK STREQUAL "grid_same_bytes")
   string(FIND "${one}" "nodes.users.rate.base,nodes.api.capacity,api.mean_rho\n100/s,1k/s," at)
   if(NOT at EQUAL 0)
     message(FATAL_ERROR "the grid's header or first row is not as expected:\n${one}")
+  endif()
+  # The file written after a --param is still the file: each --param takes one value.
+  execute_process(COMMAND "${SIMSYS}" sweep --param nodes.users.rate.base=100/s..300/s:2
+                          "${SCENARIO}" --metric api.mean_rho --format csv
+                  RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT code EQUAL 0)
+    message(FATAL_ERROR "the file after --param was not read as the file: exit ${code}\n${err}")
   endif()
 else()
   message(FATAL_ERROR "unknown CHECK '${CHECK}'")
