@@ -1025,9 +1025,10 @@ TEST_CASE("a geometric range of a whole key rounds, and refuses two points that 
   // 4^(k/7) = 1, 1.219, 1.486, 1.811, ... rounds to 1, 1, 1, 2, ...: the first repeat is 1. A
   // linear range refuses a point that is not whole; geometric points almost never are, so they
   // round, and only a repeat (the same run twice) is refused.
-  const auto rounded = parse_param("nodes.w.workers=1..100:3:log");
+  // 10^(1/2) = 3.162 rounds to 3.
+  const auto rounded = parse_param("nodes.w.workers=1..10:3:log");
   REQUIRE(rounded.has_value());
-  REQUIRE(rounded->values == std::vector<std::string>{"1", "10", "100"});
+  REQUIRE(rounded->values == std::vector<std::string>{"1", "3", "10"});
   const auto repeated = parse_param("nodes.w.workers=1..4:8:log");
   REQUIRE_FALSE(repeated.has_value());
   REQUIRE(repeated.error() ==
@@ -1190,4 +1191,43 @@ TEST_CASE("one --param is a sweep of one key, as before the grid") {
   REQUIRE(single.has_value());
   REQUIRE(render_sweep(*params, metrics, *grid, SweepFormat::table) ==
           render_sweep(hello_rate_sweep(), metrics, *single, SweepFormat::table));
+}
+
+// ---- Batch A review fixes (phase 4a) -----------------------------------------------------------
+
+TEST_CASE("a range says how its points are spread") {
+  const auto linear = parse_param("nodes.w.workers=1..10:2");
+  const auto geometric = parse_param("nodes.w.workers=1..10:2:log");
+  REQUIRE(linear.has_value());
+  REQUIRE(geometric.has_value());
+  REQUIRE(linear->spacing == simsys::sweep::Spacing::linear);
+  REQUIRE(geometric->spacing == simsys::sweep::Spacing::geometric);
+}
+
+TEST_CASE("a geometric range of a whole key needs whole ends, as a linear one does") {
+  // The ends are what the user typed: rounding them would run values nobody asked for (0.4..10
+  // would even start at 0 workers). The points between are still rounded.
+  const auto param = parse_param("nodes.w.workers=1.4..9.6:2:log");
+  REQUIRE_FALSE(param.has_value());
+  REQUIRE(param.error() == "--param: workers must be whole (1.4..9.6:2:log gives 1.40)");
+}
+
+TEST_CASE("a geometric range as wide as a double allows does not overflow between its ends") {
+  // to / from = 1e600 is beyond a double; the points are computed in logarithms instead.
+  const auto param = parse_param("nodes.api.latency=1e-300ms..1e300ms:3:log");
+  INFO((param ? "" : param.error()));
+  REQUIRE(param.has_value());
+  REQUIRE(param->values[1] == "1ms");
+}
+
+TEST_CASE("a geometric range with equal ends is refused on any key, as it runs one point twice") {
+  const auto param = parse_param("nodes.api.latency=5ms..5ms:4:log");
+  REQUIRE_FALSE(param.has_value());
+  REQUIRE(param.error() == "--param: latency=5ms..5ms:4:log gives 5ms twice; use fewer points");
+}
+
+TEST_CASE("a count written as a word gets the count's own message, not a spacing's") {
+  const auto param = parse_param("nodes.w.workers=1..10:three");
+  REQUIRE_FALSE(param.has_value());
+  REQUIRE(param.error() == "--param: 1..10:three: the count after ':' must be a whole number");
 }

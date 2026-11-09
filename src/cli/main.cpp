@@ -530,16 +530,17 @@ void print_samples(std::generator<simsys::workload::Sample>& samples,
 
 // `simsys curve <file> <client>`: the client's offered rate over time as CSV, for a plot.
 int run_curve(const std::filesystem::path& file, const CurveArgs& args) {
-  // The seed feeds only the noise process, which --noise samples: without it the seed changes
-  // nothing, and a flag that silently does nothing is refused (as retry_after without retries).
-  if (args.seed && !args.noise) {
-    print_error(file.string() +
-                ": error: --seed needs --noise (without it the curve has no randomness)");
-    return 1;
-  }
   const auto scenario = simsys::config::load(file.string());
   if (!scenario) {
     print_error(describe(scenario.error()));
+    return 1;
+  }
+  // The seed feeds only the noise process, which --noise samples: without it the seed changes
+  // nothing, and a flag that silently does nothing is refused (as retry_after without retries).
+  // After the load, so that a file that is missing or wrong is reported as what it is.
+  if (args.seed && !args.noise) {
+    print_error(file.string() +
+                ": error: --seed needs --noise (without it the curve has no randomness)");
     return 1;
   }
   const auto client = find_client(file, *scenario, args.client);

@@ -20,7 +20,6 @@ module;
 #include <limits>
 #include <map>
 #include <optional>
-#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -629,16 +628,6 @@ CheckResult read_cache_strategy(const Site& site, const YAML::Node& body, model:
   if (!model::needs_backend(node.strategy) || node.backend) return {};
   const auto at = body["strategy"] ? body["strategy"] : body;
   return site.fail(at, std::format("strategy {} needs a backend", strategy));
-}
-
-// The first element of a list of op names that repeats an earlier one, if any: `write_ops` is a
-// set, as a link's `ops` is (links.cpp's check_link_ops_unique, whose words the refusal uses).
-std::optional<YAML::Node> first_repeat(const YAML::Node& list) {
-  std::set<std::string_view> seen;  // views into the document's own text
-  for (const auto& op : list) {
-    if (!seen.insert(op.Scalar()).second) return op;
-  }
-  return std::nullopt;
 }
 
 // `write_ops: [write, delete]`: the ops that change data; every other op is a read. Stored
