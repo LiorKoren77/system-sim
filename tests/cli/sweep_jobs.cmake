@@ -18,7 +18,10 @@
 #                       same file exits 2): a sweep reports numbers, it does not judge them;
 #   error_prefixes    - every refusal of an option starts as the CLI's other errors do, with the
 #                       file and `error:`, then names its option the same way, `--param: ` or
-#                       `--metric: `, whether the text, the file or the loader found the mistake.
+#                       `--metric: `, whether the text, the file or the loader found the mistake;
+#   grid_same_bytes   - a grid over two keys (`--param` given twice: hello's rate and the api's
+#                       capacity, 2 x 2 points) prints the same bytes with --jobs 1 and --jobs 3,
+#                       a header naming both keys and four rows, the first key the outer loop.
 cmake_minimum_required(VERSION 3.28)
 
 file(REMOVE_RECURSE "${WORK}")
@@ -169,6 +172,21 @@ elseif(CHECK STREQUAL "slo_failure_exit_0")
   endif()
   run_sweep("${WORK}/hello-slo.yaml" --param "${PARAM}" --metric users.ping.mean)
   require_output("a sweep over a failing SLO")
+elseif(CHECK STREQUAL "grid_same_bytes")
+  set(grid --param nodes.users.rate.base=100/s..300/s:2 --param nodes.api.capacity=1k/s..2k/s:2
+           --metric api.mean_rho --format csv)
+  run_sweep("${SCENARIO}" ${grid} --jobs 1)
+  require_output("a grid with --jobs 1")
+  set(one "${sweep_out}")
+  run_sweep("${SCENARIO}" ${grid} --jobs 3)
+  require_output("a grid with --jobs 3")
+  if(NOT one STREQUAL sweep_out)
+    message(FATAL_ERROR "the grid differs with --jobs 3:\n${one}\nvs\n${sweep_out}")
+  endif()
+  string(FIND "${one}" "nodes.users.rate.base,nodes.api.capacity,api.mean_rho\n100/s,1k/s," at)
+  if(NOT at EQUAL 0)
+    message(FATAL_ERROR "the grid's header or first row is not as expected:\n${one}")
+  endif()
 else()
   message(FATAL_ERROR "unknown CHECK '${CHECK}'")
 endif()

@@ -75,13 +75,15 @@ endforeach()
 # simsys sweep, run as a process: the output does not depend on --jobs, a bad --param is an error
 # (exit 1), a failing SLO at some point is not (exit 0). One scratch directory per check, so `ctest
 # -j` runs them side by side.
-foreach(check same_bytes refuses_bad_param error_prefixes slo_failure_exit_0)
+foreach(check same_bytes refuses_bad_param error_prefixes slo_failure_exit_0 grid_same_bytes)
   if(check STREQUAL "same_bytes")
     set(name "simsys sweep gives the same bytes with --jobs 1 and 3")
   elseif(check STREQUAL "refuses_bad_param")
     set(name "simsys sweep exits 1 on a bad --param")
   elseif(check STREQUAL "error_prefixes")
     set(name "simsys sweep words every option refusal as file, error, then the option")
+  elseif(check STREQUAL "grid_same_bytes")
+    set(name "simsys sweep over two keys gives the same bytes with --jobs 1 and 3")
   else()
     set(name "simsys sweep exits 0 when an SLO fails at some point")
   endif()
