@@ -1477,6 +1477,11 @@ template <class T, class F>
       json_array("links", map_to_strings(std::span<const LinkSummary>{links}, json_link)),
       json_array("ops", map_to_strings(std::span<const OpSummary>{ops}, json_op)),
       json_array("slo", slo_objects)};
+  // estimate only, after `steps`: the instant it settled at, in seconds (`--at`; 0 without it).
+  if (summary.is_estimate()) {
+    lines.insert(lines.begin() + 2,
+                 "  " + json_field("at_s", json_number(seconds(summary.estimate_at()))));
+  }
   if (summary.faults().empty()) return lines;
   // The faults array, last and only with faults: a report without them is what it was before.
   std::vector<std::string> faults;
@@ -2181,6 +2186,7 @@ Summary::Summary(const graph::Graph& g, SimTime warmup) : Summary{g, warmup, tru
 Summary Summary::of_estimate(const graph::Graph& g, const engine::StepRecord& record) {
   Summary summary{g, SimTime{0}, false};
   summary.estimate_ = true;
+  summary.estimate_at_ = record.t;
   summary.observe(record);
   return summary;
 }
@@ -2653,6 +2659,8 @@ std::string render_table(const Summary& summary, std::span<const SloResult> slos
          link_table(summary, color) + replication_table(summary) + op_table(summary) +
          slo_table(slos, color) + fault_blocks(summary);
 }
+
+std::string format_clock(SimTime t) { return window_clock(t); }
 
 std::string render_json(const Summary& summary, std::span<const SloResult> slos) {
   return json_document(json_report_lines(summary, slos));

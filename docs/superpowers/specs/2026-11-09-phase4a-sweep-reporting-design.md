@@ -156,13 +156,15 @@ nodes.transcoders.workers  transcode_q.lag  p99_latency:viewers_eu.stream  ...  
 ## 5. `estimate --at`
 
 `simsys estimate <file> --at <time>`: `<time>` is a clock time (`20:00`) or a duration from the
-run's start (`90m`), the syntax of a fault's `at`, and must lie in `[0, duration]`
-(`--at: 25:00 must fall inside the run (24h)`). The engine already settles at a given instant
+run's start (`90m`), the syntax of a fault's `at`, and like it must fall inside the run,
+`0 <= at < duration` (`<file>: error: --at '30h' must fall inside the run (24h)`; a malformed time
+gets the parser's reason, `--at '25:00': hour must be 00-23`, worded as `curve`'s options). The engine already settles at a given instant
 (`Simulation::settle(at)`, called today with 0); `estimate(at)` passes it through. The clients
 offer their curve's value at `at` (wave, ramp, points, active spikes), without noise; faults are still
 left out, even one active at `at` (the steady state without the faults, as today). The table's first
-line names the instant: `estimate at t = 20:00: the curve without noise; explain's checks use the
-peak`; JSON gains `"at_s": 72000` (0 without `--at`).
+line names the instant: `estimate at t = 20h (20:00): the curve without noise; explain's checks use
+the peak` (without `--at` it is today's line, `t = 0 (00:00)`, so `estimate`'s output is unchanged);
+JSON gains `"at_s": 72000` after `steps` (0 without `--at`; `run`'s JSON has no `at_s`).
 
 Why: a diurnal scenario's midnight is its trough; url-shortener's database at 00:00 says nothing
 about 13:00. `--at` makes `estimate` the instant version of a windowed SLO.
