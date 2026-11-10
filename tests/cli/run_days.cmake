@@ -6,8 +6,8 @@
 #   needs_day - a scenario that is not 24 h long is refused, on stderr and under --stream as an
 #               error line naming the scenario (its fault, not the command line's);
 #   duration  - --days with --duration is refused: --days sets the duration;
-#   one_day   - --days 1 is the plain run: the same report, and the same stream but for the run
-#               line's "days":1.
+#   one_day   - --days 1 is the plain run: the same stream, its summary's report included, but for
+#               the run line's "days":1.
 cmake_minimum_required(VERSION 3.28)
 
 set(hello "${SCENARIOS}/tutorial/hello/scenario.yaml")
@@ -52,12 +52,8 @@ elseif(CHECK STREQUAL "duration")
   require_exit("duration" 1)
   require_contains("duration" "${err}" "error: --days sets the duration; drop --duration")
 elseif(CHECK STREQUAL "one_day")
-  simsys(run "${url_shortener}" --report json)
-  set(plain "${out}")
-  simsys(run "${url_shortener}" --report json --days 1)
-  if(NOT out STREQUAL plain)
-    message(FATAL_ERROR "one_day: --days 1 --report json differs from the plain run")
-  endif()
+  # The stream ends with the summary, which is `--report json`'s report: one comparison covers the
+  # frames and the report (each run of the day is slow under the sanitizers).
   simsys(run "${url_shortener}" --stream --points 24)
   set(plain "${out}")
   simsys(run "${url_shortener}" --stream --points 24 --days 1)
