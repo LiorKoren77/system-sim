@@ -58,6 +58,13 @@ describe("the shipped scenarios the precompute runs", () => {
     expect(simsysArgs(run)).toEqual(["run", "scenarios/tutorial/hello/scenario.yaml", "--stream"]);
   });
 
+  it("reads web-crawler's diagram.yaml beside its scenario, and none where there is none", async () => {
+    const scenarios = await findScenarios(repoRoot);
+    const crawler = scenarios.find((s) => s.id === "book/web-crawler");
+    expect(crawler?.diagram?.cells?.frontier).toEqual([1, 1]);
+    expect(scenarios.find((s) => s.id === "tutorial/hello")?.diagram).toBeNull();
+  });
+
   it("takes the title and the book chapter from the README's heading", () => {
     expect(readmeHeading("# Chat system (ch. 12)\n\nText")).toEqual({
       title: "Chat system",
