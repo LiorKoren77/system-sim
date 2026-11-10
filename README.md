@@ -406,7 +406,10 @@ rules as built are spec §20 and §21.
 
 ## Toolchain
 
-GCC 14 is required (it builds the named modules); Clang 18 is used for clang-format only.
+GCC 14, Clang 19 or Clang 20 builds the project (named modules); every test passes with each, over
+GCC's standard library (libstdc++) and, with Clang 20, over LLVM's (libc++ 20, the library a
+WebAssembly build through Emscripten would use). CI builds GCC 14 (Debug, Release, ASan, TSan),
+Clang 19 over libstdc++ and Clang 20 over libc++. Clang 18 is used for clang-format only.
 CMake ≥ 3.28, Ninja. C++23 with named modules.
 
 ## Build
@@ -414,6 +417,8 @@ CMake ≥ 3.28, Ninja. C++23 with named modules.
 ```bash
 cmake --preset gcc14-debug && cmake --build --preset gcc14-debug && ctest --preset gcc14-debug
 ./build/gcc14-debug/simsys validate scenarios/book/news-feed/scenario.yaml
+# the same with Clang: clang19-debug, clang20-debug (libstdc++) or clang20-libcxx-debug (libc++)
+cmake --preset clang20-libcxx-debug && cmake --build --preset clang20-libcxx-debug && ctest --preset clang20-libcxx-debug
 ```
 
 Two more presets build the tests under the sanitizers (CI runs both; see

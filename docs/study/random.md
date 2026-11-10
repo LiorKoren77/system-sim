@@ -9,7 +9,7 @@ whole project leans on ("same scenario + same seed = the same run, byte for byte
 | Construct | File | Function or member |
 |---|---|---|
 | `std::mt19937_64` engine, seeded with one `std::uint64_t` | `src/workload/workload.cppm` | `NoiseProcess::engine_`, `NoiseProcess::NoiseProcess` |
-| `std::normal_distribution<double>{0.0, 1.0}` | `src/workload/workload.cppm` | `NoiseProcess::normal_`, drawn in `NoiseProcess::next` |
+| `workload::StandardNormal`, the polar method written out over the engine (it replaced `std::normal_distribution<double>{0.0, 1.0}` on 2026-11-10) | `src/workload/workload.cppm` | `NoiseProcess::normal_`, drawn in `NoiseProcess::next` |
 | the per-client seed | `src/workload/workload.cppm` | `workload::client_seed(seed, index)` (beside the noise it seeds, so the CLI's `curve --noise` and the tests need not import the behaviours) |
 | one process per client, ticked once per step | `src/engine/behaviours.cppm`, `src/engine/engine.cppm` | `ClientBehaviour::tick`, `ClientBehaviour::reset_noise`, `Simulation::make_node` |
 | the same path printed | `src/cli/main.cpp`, `src/workload/workload.cppm` | `curve_samples` (`--noise`, `--seed`), the noisy `samples` overload |
@@ -92,8 +92,15 @@ noise adds load as well as variability.
   `ClientBehaviour::reset_noise` re-creates the whole process (`emplace`) rather than
   re-seeding the engine alone, which would leave a stale cached value.
 - **`std::default_random_engine` is implementation-defined**; so is every distribution.
-  Name the engine (`mt19937_64`), and accept that the distribution ties results to the
-  standard library.
+  Name the engine (`mt19937_64`), and do not use a standard distribution where a result must
+  be the same everywhere. Met on 2026-11-10: libc++ also uses the polar method but returns
+  each pair in the other order (libstdc++ gives `-0.3868, -0.0394` for seed 1, libc++
+  `-0.0394, -0.3868`), so one seed gave two noise paths and a replication's SLO verdict
+  flipped. `workload::StandardNormal` is the polar method written out, in libstdc++'s order
+  and over the same uniform (`std::generate_canonical<double, 53>`: the 64-bit draw times
+  2^-64, kept below 1), so every toolchain draws what GCC always drew; a test pins the first
+  draws of two seeds. What stays the platform's: the last bit of `std::log` and `std::sqrt`
+  (the math library; every native Linux build shares glibc's).
 - **`std::random_device` is the opposite of reproducible.** It is the right seed for a
   game, the wrong one for a simulator whose runs must be compared.
 - **A negative `seed`** converts to `std::uint64_t` modulo 2^64. That conversion has always
