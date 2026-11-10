@@ -37,6 +37,12 @@ export interface GraphNode {
   readonly queue_limit: number | null; // the room: requests that may wait before drops begin
   readonly workers?: number;
   readonly connection_cap?: number;
+  // A client's rate spikes (phase 5b): a surge of load from `at_s` for `for_s`, the rate × factor.
+  readonly spikes?: readonly {
+    readonly at_s: number;
+    readonly for_s: number;
+    readonly factor: number;
+  }[];
 }
 
 export interface GraphLink {

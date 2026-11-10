@@ -6,7 +6,9 @@ import { FrameContext } from "./frame-context";
 import type { NodeData } from "./to-flow-elements";
 
 // One node of the system. The band across the top names its category in the category's colour
-// (what the box is); the border and the pill say its zone at the slider's frame (how it is doing):
+// (what the box is); the bars show its load at the slider's frame (bars.ts: utilisation, the queue
+// building, a client's offered rate against its peak); the border and the pill say its zone (how it
+// is doing):
 // a plain border and a quiet "ok" when green, amber when yellow, a thick red border and a red fill
 // when red, so trouble stands out and a calm system is not a wall of green. The zone is written
 // as a word too: colour is never the only signal. A client shows the rate it offers instead,
@@ -30,22 +32,73 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
           {shards}
         </div>
         {state?.copies && <CopySlots copies={state.copies} />}
-        <div className="node-state">
-          {state?.offeredPerSecond != null ? (
-            <span>offers {rate(state.offeredPerSecond)}</span>
-          ) : (
-            <>
-              <span>{state?.rhoPercent == null ? "–" : `${state.rhoPercent}% busy`}</span>
-              {zone !== null && <span className={`zone-pill zone-${zone}`}>{zoneWord[zone]}</span>}
-            </>
-          )}
-        </div>
+        {state?.offeredPerSecond != null ? (
+          <BarRow
+            label={`offers ${rate(state.offeredPerSecond)}`}
+            fill={state.load}
+            className="load"
+          />
+        ) : (
+          <BarRow
+            label={state?.busy ? `${Math.round(state.busy.mean * 100)}% busy` : "–"}
+            fill={state?.busy?.mean ?? null}
+            peak={state?.busy?.peak ?? null}
+            ticks={[data.yellow, data.red]}
+            className={`busy zone-${zone ?? "none"}`}
+            pill={zone}
+          />
+        )}
+        {state?.queue && (
+          <BarRow
+            label={`${count(state.queue.backlog)} waiting`}
+            fill={state.queue.fill}
+            className="queue"
+          />
+        )}
       </div>
     </div>
   );
 }
 
 const zoneWord = { green: "ok", yellow: "yellow", red: "red" } as const;
+
+// A bar with its label: `fill` from 0 to 1 (past 1 drawn full), the bucket's `peak` as a thin
+// mark, and `ticks` (the zones' thresholds) as notches. The fill's width glides over a quarter of
+// a second when the frame changes (theme.css): an animation between two real frames, so a jump
+// reads as motion; it shows nothing between buckets that the data does not have.
+function BarRow(props: {
+  label: string;
+  fill: number | null;
+  className: string;
+  peak?: number | null;
+  ticks?: readonly (number | null)[];
+  pill?: "green" | "yellow" | "red" | null;
+}) {
+  const percent = (v: number) => `${Math.min(Math.max(v, 0), 1) * 100}%`;
+  return (
+    <div className={`bar-row ${props.className}`}>
+      <div className="bar">
+        {props.fill !== null && <div className="fill" style={{ width: percent(props.fill) }} />}
+        {props.ticks?.map((t, i) =>
+          t === null ? null : <div key={i} className="tick" style={{ left: percent(t) }} />,
+        )}
+        {props.peak != null && <div className="peak" style={{ left: percent(props.peak) }} />}
+      </div>
+      <span className="bar-label">{props.label}</span>
+      {props.pill != null && (
+        <span className={`zone-pill zone-${props.pill}`}>{zoneWord[props.pill]}</span>
+      )}
+    </div>
+  );
+}
+
+// 2923830 → "2.92M", 50 → "50".
+function count(n: number): string {
+  if (n >= 1e9) return `${Number((n / 1e9).toPrecision(3))}G`;
+  if (n >= 1e6) return `${Number((n / 1e6).toPrecision(3))}M`;
+  if (n >= 1e3) return `${Number((n / 1e3).toPrecision(3))}k`;
+  return String(Number(n.toPrecision(3)));
+}
 
 // One slot per copy, filled while it is up; the slots narrow as the copies grow, so a stack of 20
 // or 100 still fits the box. Shown for a node with copies, and for a single copy only while it is
