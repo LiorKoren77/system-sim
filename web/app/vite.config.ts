@@ -6,4 +6,7 @@ import { defineConfig } from "vite";
 export default defineConfig({
   plugins: [react()],
   base: "./",
+  // ELK's layout engine is one 1.5 MB file (452 kB gzipped), loaded on first use (diagram/layout.ts):
+  // large, but split off and expected.
+  build: { chunkSizeWarningLimit: 1600 },
 });
