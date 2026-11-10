@@ -24,7 +24,7 @@ const required: Readonly<Record<StreamMessage["type"], readonly string[]>> = {
 };
 
 const optional: Readonly<Record<StreamMessage["type"], readonly string[]>> = {
-  dataset: ["title", "chapter", "seam", "source"],
+  dataset: ["title", "chapter", "seam", "source", "diagram"],
   run: ["seed", "days"],
   graph: ["scenario", "datacenters", "zones", "slos", "faults", "estimated_columns"],
   frame: [],

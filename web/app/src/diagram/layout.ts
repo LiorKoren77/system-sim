@@ -6,7 +6,7 @@
 //
 // Computed once per graph: nodes keep their places through the day, so the eye follows the
 // colours, not motion. ELK is deterministic, so the same graph always gets the same places.
-import type { GraphLine } from "@simsys/stream";
+import type { Diagram, GraphLine } from "@simsys/stream";
 import type { ELK, ElkExtendedEdge, ElkNode, ElkPort } from "elkjs/lib/elk-api";
 import { sidesFor, type Box, type Side } from "./sides";
 
@@ -66,21 +66,93 @@ const groupOptions = { "elk.padding": "[top=32,left=16,bottom=16,right=16]" };
 
 export const groupId = (datacenter: string) => `dc:${datacenter}`;
 
-// Two passes. The first lays the boxes out with edges attached anywhere; from where the boxes
-// land, each link gets the pair of sides that face each other (sides.ts: right to left along the
-// flow, top or bottom between stacked boxes, bottom to bottom for a loop back). The second pass
-// lays out again with each link's ends fixed to those sides as ELK ports, and ELK routes every
-// edge around the boxes into them. Without ports, a left-to-right layout attaches edges only on
-// the left and right sides.
-export async function layoutGraph(graph: GraphLine): Promise<Layout> {
+// A grid cell of a hand-placed diagram: a box and the space to its right and below.
+export const CELL_WIDTH = NODE_WIDTH + 72;
+export const CELL_HEIGHT = NODE_HEIGHT + 56;
+
+type LinkSides = { source: Side; target: Side };
+
+// The layout of `graph`, following its scenario's diagram.yaml when it has one (`diagram`, from the
+// dataset line):
+// - with `cells`, every box goes on its cell of a grid, and each link joins the sides the file
+//   names or the sides that face each other, drawn as right-angled lines (React Flow's
+//   smoothstep); ELK places nothing, since it cannot route around boxes it did not place;
+// - otherwise ELK places the boxes, in two passes. The first lays them out with edges attached
+//   anywhere; from where the boxes land, each link gets the sides the file names or the pair that
+//   face each other (sides.ts). The second pass fixes each link's ends to those sides as ELK ports
+//   and routes every edge around the boxes into them. Without ports, a left-to-right layout attaches
+//   edges only on the left and right sides.
+export async function layoutGraph(graph: GraphLine, diagram?: Diagram): Promise<Layout> {
+  if (diagram?.cells) return placeOnCells(graph, diagram.cells, diagram.sides);
   const first = await runElk(graph, null);
-  const sides = new Map<string, { source: Side; target: Side }>();
+  const sides = chooseSides(graph, first, diagram?.sides);
+  return { ...(await runElk(graph, sides)), sides };
+}
+
+// Each link's sides: the file's for the links it names (`"<from> -> <to>"`), else those that face
+// each other in `placed`.
+function chooseSides(
+  graph: GraphLine,
+  placed: Pick<Layout, "nodes" | "groups">,
+  named: Diagram["sides"],
+): Map<string, LinkSides> {
+  const sides = new Map<string, LinkSides>();
   graph.links.forEach((link, i) => {
-    const from = absoluteBox(first, link.from);
-    const to = absoluteBox(first, link.to);
+    const pair = named?.[`${link.from} -> ${link.to}`];
+    if (pair) {
+      sides.set(`link-${i}`, { source: pair[0], target: pair[1] });
+      return;
+    }
+    const from = absoluteBox(placed, link.from);
+    const to = absoluteBox(placed, link.to);
     if (from && to) sides.set(`link-${i}`, sidesFor(from, to));
   });
-  return { ...(await runElk(graph, sides)), sides };
+  return sides;
+}
+
+// The boxes on their cells; a datacenter's box around its nodes' cells, the nodes placed relative to
+// it (as React Flow places a node inside a parent).
+function placeOnCells(
+  graph: GraphLine,
+  cells: NonNullable<Diagram["cells"]>,
+  named: Diagram["sides"],
+): Layout {
+  const grouped = graph.datacenters.length > 1;
+  const absolute = new Map<string, Placed>();
+  for (const node of graph.nodes) {
+    const [column, row] = cells[node.id] ?? [0, 0];
+    absolute.set(node.id, {
+      x: column * CELL_WIDTH,
+      y: row * CELL_HEIGHT,
+      width: NODE_WIDTH,
+      height: NODE_HEIGHT,
+      parent: null,
+    });
+  }
+  const groups = new Map<string, Placed>();
+  const nodes = new Map<string, Placed>();
+  if (!grouped) {
+    for (const [id, box] of absolute) nodes.set(id, box);
+  } else {
+    const pad = { side: 16, top: 32 };
+    for (const dc of graph.datacenters) {
+      const members = graph.nodes.filter((n) => n.datacenter === dc.name);
+      const boxes = members.map((n) => absolute.get(n.id)).filter((b) => b !== undefined);
+      if (boxes.length === 0) continue;
+      const x = Math.min(...boxes.map((b) => b.x)) - pad.side;
+      const y = Math.min(...boxes.map((b) => b.y)) - pad.top;
+      const right = Math.max(...boxes.map((b) => b.x + b.width)) + pad.side;
+      const bottom = Math.max(...boxes.map((b) => b.y + b.height)) + pad.side;
+      const id = groupId(dc.name);
+      groups.set(id, { x, y, width: right - x, height: bottom - y, parent: null });
+      for (const n of members) {
+        const b = absolute.get(n.id);
+        if (b) nodes.set(n.id, { ...b, x: b.x - x, y: b.y - y, parent: id });
+      }
+    }
+  }
+  const placed = { nodes, groups };
+  return { ...placed, routes: new Map(), sides: chooseSides(graph, placed, named) };
 }
 
 const elkSide: Readonly<Record<Side, string>> = {

@@ -3,6 +3,7 @@
 // any other is a run, played once.
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
+import type { Diagram } from "@simsys/stream";
 import { parse } from "yaml";
 
 export interface ScenarioEntry {
@@ -11,6 +12,9 @@ export interface ScenarioEntry {
   readonly kind: "day" | "run";
   readonly title: string | null;
   readonly chapter: number | null;
+  // The scenario's diagram.yaml as written, unchecked: the precompute checks it against the graph
+  // simsys resolves (diagram.ts). null when the scenario has none.
+  readonly diagram: Diagram | null;
 }
 
 // Every scenario under `<repoRoot>/scenarios`, sorted by id.
@@ -28,11 +32,13 @@ export async function findScenarios(repoRoot: string): Promise<ScenarioEntry[]> 
       const yamlText = await readFile(path.join(dir, "scenario.yaml"), "utf8").catch(() => null);
       if (yamlText === null) continue;
       const readme = await readFile(path.join(dir, "README.md"), "utf8").catch(() => "");
+      const diagramText = await readFile(path.join(dir, "diagram.yaml"), "utf8").catch(() => null);
       entries.push({
         id: `${group.name}/${name.name}`,
         path: `scenarios/${group.name}/${name.name}/scenario.yaml`,
         kind: isDay(yamlText) ? "day" : "run",
         ...readmeHeading(readme),
+        diagram: diagramText === null ? null : (parse(diagramText) as Diagram),
       });
     }
   }

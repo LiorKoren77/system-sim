@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { indexJson, type IndexEntry } from "../src/index-file";
+import { indexJson, mergeEntries, type IndexEntry } from "../src/index-file";
 
 function entry(id: string): IndexEntry {
   return {
@@ -41,5 +41,16 @@ describe("the index of the datasets", () => {
       "datasets",
     ]);
     expect(index).toMatchObject({ index_version: 1, format_version: 1, simsys_commit: "abc1234" });
+  });
+
+  it("replaces only the datasets a partial run rewrote, keeping the others (precompute --only)", () => {
+    const kept = mergeEntries(
+      [entry("book/youtube"), { ...entry("tutorial/hello"), frames: 1 }],
+      [{ ...entry("tutorial/hello"), frames: 600 }],
+    );
+    expect(kept.map((e) => [e.id, e.frames])).toEqual([
+      ["book/youtube", 2],
+      ["tutorial/hello", 600],
+    ]);
   });
 });
