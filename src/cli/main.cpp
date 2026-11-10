@@ -119,14 +119,19 @@ int run_validate(const std::filesystem::path& file) {
   return 0;
 }
 
-// `simsys explain <file>`: every resolved number and where it came from.
-int run_explain(const std::filesystem::path& file) {
+// `simsys explain <file>`: every resolved number and where it came from; with `--report json` the
+// resolved graph as data (report::render_graph_json), what a frontend draws its diagram from.
+int run_explain(const std::filesystem::path& file, const std::string& format) {
   const auto g = load_graph(file);
   if (!g) {
     print_error(g.error());
     return 1;
   }
-  std::print("{}", report::render_explain(*g));
+  if (format == "json") {
+    std::println("{}", report::render_graph_json(*g));
+  } else {
+    std::print("{}", report::render_explain(*g));
+  }
   return 0;
 }
 
@@ -744,6 +749,7 @@ int main(int argc, char** argv) {
   CurveArgs curve_args;
   SweepArgs sweep_args;
   std::optional<std::string> estimate_at;
+  std::string explain_format{"table"};
 
   auto* validate = app.add_subcommand("validate", "check a scenario's types, references and units");
   auto* explain = app.add_subcommand(
@@ -754,6 +760,8 @@ int main(int argc, char** argv) {
     add_file_argument(*command, scenario_file);
   auto* curve = add_curve_command(app, curve_args, scenario_file);
   auto* sweep = add_sweep_command(app, sweep_args, scenario_file);
+  explain->add_option("--report", explain_format, "output format: table (default) or json")
+      ->check(CLI::IsMember({"table", "json"}));
   add_report_options(*estimate, report_options);
   estimate->add_option("--at", estimate_at,
                        "the instant to settle at: a clock time (12:00) or a duration from the "
@@ -770,7 +778,7 @@ int main(int argc, char** argv) {
   }
 
   if (validate->parsed()) return run_validate(scenario_file);
-  if (explain->parsed()) return run_explain(scenario_file);
+  if (explain->parsed()) return run_explain(scenario_file, explain_format);
   if (estimate->parsed()) return run_estimate(scenario_file, report_options, estimate_at);
   if (run->parsed()) return run_scenario(scenario_file, run_args, report_options);
   if (curve->parsed()) return run_curve(scenario_file, curve_args);

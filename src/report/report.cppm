@@ -481,16 +481,15 @@ class Summary {
 // `estimate`, `explain` and replications with `--report json`, the stream's `run` message). A
 // frontend checks it before it reads a key. Adding a key, a message type or a column keeps it;
 // removing or renaming one, or changing a value's meaning or unit, raises it (schema v1.7, "the
-// output contract"). `constexpr` without `inline`: an exported namespace-scope constant (the seventh
-// GCC 14.2 defect, CLAUDE.md §3).
+// output contract"). `constexpr` without `inline`: an exported namespace-scope constant (the
+// seventh GCC 14.2 defect, CLAUDE.md §3).
 constexpr int format_version = 1;
 
 // For programs: the same content as JSON (two-space indent, seconds, null for infinity).
 [[nodiscard]] std::string render_json(const Summary& summary, std::span<const SloResult> slos);
 // The same document on one line, without the layout's whitespace: the `report` of the stream's
 // `summary` message (`run --stream`), where one line is one message.
-[[nodiscard]] std::string render_json_line(const Summary& summary,
-                                           std::span<const SloResult> slos);
+[[nodiscard]] std::string render_json_line(const Summary& summary, std::span<const SloResult> slos);
 // Any JSON text on one line: the whitespace between tokens removed, the text inside strings kept
 // byte for byte (render_json_line, the stream's graph). `json` must be valid JSON.
 [[nodiscard]] std::string json_on_one_line(std::string_view json);
@@ -655,6 +654,18 @@ struct ReplicationSummary {
 // `simsys explain`: every resolved number with its provenance, the links, the step order
 // and a static load check (offered load vs capacity, no queueing).
 [[nodiscard]] std::string render_explain(const graph::Graph& g);
+
+// `simsys explain --report json`: the resolved graph as data, the source a frontend draws the
+// system's diagram from (phase 5a spec §6.1): the datacenters, every node in the engine's order
+// (the order every frame's rows follow) with its type, datacenter, copies, total capacity and the
+// unit it counts, its zone thresholds and waiting room; the links with their direction, one-way
+// latency and bandwidth; every client op with its share; the SLOs and scripted faults as the
+// scenario states them; and the names of the numbers in each row of a stream's frames.
+// `format_version` first.
+[[nodiscard]] std::string render_graph_json(const graph::Graph& g);
+// The same keys, one `"key": value` per element, without `format_version`: the body of the
+// stream's `graph` message (render_graph_line), which puts its own `type` and `rev` first.
+[[nodiscard]] std::vector<std::string> graph_json_fields(const graph::Graph& g);
 
 // For plotting: one CSV row per node per step,
 // `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,

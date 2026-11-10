@@ -22,6 +22,7 @@ module;
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 // C++20 module implementation unit: `module simsys.report;` (no `export`) makes this file
@@ -1920,6 +1921,167 @@ constexpr std::string_view failure_fed_note =
 }
 
 }  // namespace
+
+// ---- explain --report json: the resolved graph as data ----
+
+namespace {
+
+// The names of each frame row's numbers, in order (phase 5a spec §6.2): the contract of
+// `run --stream`. A new column is added at the end of its list, never between (schema v1.7).
+constexpr std::array node_columns{"demand_per_s",
+                                  "drain_per_s",
+                                  "dropped_per_s",
+                                  "rejected_per_s",
+                                  "backlog",
+                                  "peak_backlog",
+                                  "mean_rho",
+                                  "peak_rho",
+                                  "zone",
+                                  "red_s",
+                                  "latency_ms",
+                                  "queue_lag_s",
+                                  "connections",
+                                  "dead_lettered_per_s",
+                                  "deduplicated_per_s"};
+constexpr std::array link_columns{"demand_per_s", "drain_per_s", "dropped_per_s", "backlog",
+                                  "peak_backlog", "mean_rho",    "peak_rho",      "zone",
+                                  "red_s",        "latency_ms"};
+constexpr std::array op_columns{"offered_per_s",   "attempts_per_s", "answered_per_s",
+                                "timed_out_per_s", "mean_ms",        "p99_ms"};
+// The columns that are estimates, not exact consequences of the fluid model: the lognormal fit's
+// percentiles (spec §3.5), labelled "estimated" wherever they are shown.
+constexpr std::array estimated_columns{"p99_ms"};
+// A frame's `zone` is the zone's number (fluid::Zone's order); this list gives the names.
+constexpr std::array zone_names{"green", "yellow", "red"};
+
+// `"a", "b"` as a JSON array of strings.
+template <std::size_t N>
+[[nodiscard]] std::string json_strings(const std::array<const char*, N>& names) {
+  std::vector<std::string> quoted;
+  for (const auto* name : names) quoted.push_back(json_string(name));
+  return "[" + join(quoted, ", ") + "]";
+}
+
+[[nodiscard]] std::string json_strings(std::span<const std::string> names) {
+  std::vector<std::string> quoted;
+  for (const auto& name : names) quoted.push_back(json_string(name));
+  return "[" + join(quoted, ", ") + "]";
+}
+
+// A node: what a diagram needs to draw and label it. A client serves nothing, so its capacity,
+// unit, thresholds and room are null. Type-specific keys only where a diagram shows them: a
+// worker pool's workers, a gateway's connection cap.
+[[nodiscard]] std::string json_graph_node(const graph::ResolvedNode& node) {
+  const auto& spec = node.spec;
+  const bool client = spec.type == model::NodeType::client;
+  const auto unit = unit_word(spec);
+  std::vector<std::string> fields{
+      json_field("id", json_string(spec.id)),
+      json_field("type", json_string(model::to_string(spec.type))),
+      json_field("datacenter", json_string(spec.dc)),
+      json_field("replicas", std::to_string(model::copies_of(spec))),
+      json_field("capacity_per_s", client ? "null" : json_number(total_capacity(node))),
+      json_field("unit", unit ? json_string(*unit) : "null"),
+      json_field("yellow", client ? "null" : json_number(node.capacity.yellow)),
+      json_field("red", client ? "null" : json_number(node.capacity.red)),
+      json_field("queue_limit", client ? "null" : json_number(node.capacity.queue_limit))};
+  if (spec.type == model::NodeType::worker_pool && spec.workers) {
+    fields.push_back(json_field("workers", std::to_string(*spec.workers)));
+  }
+  if (spec.type == model::NodeType::ws_gateway) {
+    fields.push_back(
+        json_field("connection_cap", json_optional_number(model::connection_cap(spec))));
+  }
+  return json_object(fields);
+}
+
+// A link: its ends by id, its direction, the ops it carries (empty: every op), its one-way latency
+// and, for a pipe, its bandwidth in MB/s (the pipe's service rate: it counts megabytes).
+[[nodiscard]] std::string json_graph_link(std::span<const graph::ResolvedNode> nodes,
+                                          const graph::ResolvedLink& link) {
+  return json_object(std::vector<std::string>{
+      json_field("from", json_string(nodes[link.from].spec.id)),
+      json_field("to", json_string(nodes[link.to].spec.id)),
+      json_field("direction", json_string(model::to_string(link.dir))),
+      json_field("ops", json_strings(link.ops)),
+      json_field("one_way_s", json_number(seconds(link.one_way))),
+      json_field("bandwidth_mb_s",
+                 link.pipe ? json_number(link.pipe->service_rate.per_second) : "null")});
+}
+
+// Every client op with its share of the client's mix, clients in node order and each client's ops
+// by name: the order of every frame's op rows (engine::StepRecord::responses).
+[[nodiscard]] std::vector<std::string> json_graph_ops(const graph::Graph& g) {
+  std::vector<std::string> ops;
+  for (const auto& node : g.nodes()) {
+    if (!node.spec.workload) continue;
+    for (const auto& [op, share] : node.spec.workload->op_shares) {
+      ops.push_back(json_object(std::vector<std::string>{
+          json_field("client", json_string(node.spec.id)), json_field("op", json_string(op)),
+          json_field("share", json_number(share))}));
+    }
+  }
+  return ops;
+}
+
+// An SLO as the scenario states it: its metric, node and op (null when it names none), its bound
+// (seconds for a time metric, else the number) and its window in seconds (null: the whole run).
+[[nodiscard]] std::string json_graph_slo(const model::SloSpec& slo) {
+  // C++17 std::get_if on a std::variant: the bound is a time or a number, checked here.
+  const auto* time = std::get_if<SimTime>(&slo.max);
+  const double bound = time ? seconds(*time) : std::get<double>(slo.max);
+  return json_object(std::vector<std::string>{
+      json_field("metric", json_string(model::to_string(slo.metric))),
+      json_field("node", json_optional_string(slo.node)),
+      json_field("op", json_optional_string(slo.op)), json_field("max", json_number(bound)),
+      json_field("over_s", slo.over ? json_number(seconds(*slo.over)) : "null")});
+}
+
+// A scripted fault: its kind, what it strikes (a node, or a datacenter for dc_down), when and for
+// how long, in seconds from the run's start (t = 0 is midnight).
+[[nodiscard]] std::string json_graph_fault(const model::Fault& fault) {
+  const auto& target = fault.kind == model::FaultKind::dc_down ? fault.datacenter : fault.node;
+  return json_object(std::vector<std::string>{
+      json_field("kind", json_string(model::to_string(fault.kind))),
+      json_field("target", json_string(target)), json_field("at_s", json_number(seconds(fault.at))),
+      json_field("for_s", json_number(seconds(fault.duration)))});
+}
+
+template <class T, class F>
+[[nodiscard]] std::vector<std::string> each_as_json(std::span<const T> items, F to_json) {
+  std::vector<std::string> out;
+  for (const auto& item : items) out.push_back(to_json(item));
+  return out;
+}
+
+}  // namespace
+
+std::vector<std::string> graph_json_fields(const graph::Graph& g) {
+  const auto& scenario = g.scenario();
+  std::vector<std::string> links;
+  for (const auto& link : g.links()) links.push_back(json_graph_link(g.nodes(), link));
+  return {"  " + json_field("scenario", json_string(scenario.name)),
+          "  " + json_field("datacenters", json_strings(scenario.datacenters)),
+          "  " + json_field("zones", json_strings(zone_names)),
+          json_array("nodes", each_as_json(g.nodes(), json_graph_node)),
+          json_array("links", links),
+          json_array("ops", json_graph_ops(g)),
+          json_array("slos",
+                     each_as_json(std::span<const model::SloSpec>{scenario.slos}, json_graph_slo)),
+          json_array("faults", each_as_json(std::span<const model::Fault>{scenario.faults},
+                                            json_graph_fault)),
+          "  " + json_field("node_columns", json_strings(node_columns)),
+          "  " + json_field("link_columns", json_strings(link_columns)),
+          "  " + json_field("op_columns", json_strings(op_columns)),
+          "  " + json_field("estimated_columns", json_strings(estimated_columns))};
+}
+
+std::string render_graph_json(const graph::Graph& g) {
+  auto fields = graph_json_fields(g);
+  fields.insert(fields.begin(),
+                "  " + json_field("format_version", std::to_string(format_version)));
+  return "{\n" + join(fields, ",\n") + "\n}";
+}
 
 std::string render_explain(const graph::Graph& g) {
   return explain_header(g.scenario()) + explain_faults(g.scenario()) + explain_nodes(g) +

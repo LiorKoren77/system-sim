@@ -1,8 +1,8 @@
 // The output contract a frontend reads (phase 5a, spec 2026-11-10-phase5a-streaming-design.md):
 // the format_version every JSON document carries, the report on one line, the resolved graph as
-// JSON, the frames of `run --stream` and the stream's lines. Lines of JSON are parsed with yaml-cpp:
-// JSON is YAML 1.2's flow syntax, so a JSON object loads as a YAML map and a test compares trees,
-// not text.
+// JSON, the frames of `run --stream` and the stream's lines. Lines of JSON are parsed with
+// yaml-cpp: JSON is YAML 1.2's flow syntax, so a JSON object loads as a YAML map and a test
+// compares trees, not text.
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
@@ -31,8 +31,8 @@ std::string shipped(std::string_view relative) {
 
 // A scratch scenario file of this process, written fresh by each test that needs one.
 std::string scratch_scenario(std::string_view name, std::string_view yaml) {
-  const auto dir = std::filesystem::temp_directory_path() /
-                   ("simsys_stream_" + std::to_string(::getpid()));
+  const auto dir =
+      std::filesystem::temp_directory_path() / ("simsys_stream_" + std::to_string(::getpid()));
   std::filesystem::create_directories(dir);
   const auto path = dir / (std::string{name} + ".yaml");
   std::ofstream{path} << yaml;
@@ -148,9 +148,9 @@ links:
 }
 
 TEST_CASE("the report on one line holds exactly the values of the pretty report", "[stream]") {
-  for (const auto& path : {shipped("tutorial/chain/scenario.yaml"),
-                           shipped("labs/rate-limiter/scenario.yaml"),
-                           scratch_scenario("probe", probe_yaml)}) {
+  for (const auto& path :
+       {shipped("tutorial/chain/scenario.yaml"), shipped("labs/rate-limiter/scenario.yaml"),
+        scratch_scenario("probe", probe_yaml)}) {
     INFO(path);
     const auto reports = reports_of(path);
     CHECK(reports.line.find('\n') == std::string::npos);
@@ -231,7 +231,7 @@ TEST_CASE("explain's JSON lists the chain's nodes in the engine's order with the
   CHECK(api["unit"].Scalar() == "requests");
   CHECK(api["yellow"].as<double>() == 0.7);  // the defaults of every queue (spec §3.3)
   CHECK(api["red"].as<double>() == 0.9);
-  CHECK(api["queue_limit"].as<double>() == 1000);         // the default
+  CHECK(api["queue_limit"].as<double>() == 1000);             // the default
   CHECK(doc["nodes"][2]["queue_limit"].as<double>() == 500);  // the scenario's
   CHECK(scalars(doc["datacenters"]) == std::vector<std::string>{"main"});
 }
@@ -263,8 +263,9 @@ TEST_CASE("explain's JSON says which nodes count megabytes, capacity units or re
   CHECK(entry(youtube["nodes"], "id", "cdn_us")["unit"].Scalar() == "MB");
   CHECK(entry(youtube["nodes"], "id", "api")["unit"].Scalar() == "requests");
   // 40 Gbit/s / 8 = 5 GB/s = 5000 MB/s (explain's check line: 5k MB/s)
-  CHECK(link_between(youtube["links"], "cdn_eu", "transcoded_store")["bandwidth_mb_s"]
-            .as<double>() == 5000);
+  CHECK(
+      link_between(youtube["links"], "cdn_eu", "transcoded_store")["bandwidth_mb_s"].as<double>() ==
+      5000);
   CHECK(entry(youtube["nodes"], "id", "transcoders")["workers"].as<int>() == 600);
   const auto shortener = graph_json_of("book/url-shortener/scenario.yaml");
   CHECK(entry(shortener["nodes"], "id", "url_db")["unit"].Scalar() == "units");  // writes cost 5
@@ -296,16 +297,16 @@ TEST_CASE("explain's JSON names the columns of every frame row: the stream's con
   const auto doc = graph_json_of("tutorial/hello/scenario.yaml");
   CHECK(scalars(doc["node_columns"]) ==
         std::vector<std::string>{"demand_per_s", "drain_per_s", "dropped_per_s", "rejected_per_s",
-                                 "backlog", "peak_backlog", "mean_rho", "peak_rho", "zone",
-                                 "red_s", "latency_ms", "queue_lag_s", "connections",
-                                 "dead_lettered_per_s", "deduplicated_per_s"});
+                                 "backlog", "peak_backlog", "mean_rho", "peak_rho", "zone", "red_s",
+                                 "latency_ms", "queue_lag_s", "connections", "dead_lettered_per_s",
+                                 "deduplicated_per_s"});
   CHECK(scalars(doc["link_columns"]) ==
         std::vector<std::string>{"demand_per_s", "drain_per_s", "dropped_per_s", "backlog",
                                  "peak_backlog", "mean_rho", "peak_rho", "zone", "red_s",
                                  "latency_ms"});
-  CHECK(scalars(doc["op_columns"]) ==
-        std::vector<std::string>{"offered_per_s", "attempts_per_s", "answered_per_s",
-                                 "timed_out_per_s", "mean_ms", "p99_ms"});
+  CHECK(scalars(doc["op_columns"]) == std::vector<std::string>{"offered_per_s", "attempts_per_s",
+                                                               "answered_per_s", "timed_out_per_s",
+                                                               "mean_ms", "p99_ms"});
   CHECK(scalars(doc["estimated_columns"]) == std::vector<std::string>{"p99_ms"});
   CHECK(scalars(doc["zones"]) == std::vector<std::string>{"green", "yellow", "red"});
 }

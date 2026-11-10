@@ -745,56 +745,6 @@ void insert_at(Cells& cells, std::size_t column, Value value) {
 
 constexpr std::string_view node_title = "nodes";
 
-// "delete, insert, update, write cost 5" ("a cost 2 and b cost 3" for two costs): a node's ops that
-// cost something other than 1 capacity unit, grouped by their cost, in name order; "" when every op
-// it prices costs 1. The ops priced are a database's write ops (their default cost of 5, spec §18
-// entry 7) and every op of a stated `cost` map (spec §17 entry 4), each priced as the engine
-// prices it (defaults::op_cost).
-[[nodiscard]] std::string priced_ops(const model::NodeSpec& spec, double unit_per_request = 1.0) {
-  // C++20 std::views::keys: the keys of a map as a lazy view, no copy of its pairs; C++23
-  // std::ranges::to<std::vector>(): collects a view into a container, replacing a reserve +
-  // push_back loop.
-  std::vector<std::string> ops{spec.cost | std::views::keys | std::ranges::to<std::vector>()};
-  if (spec.type == model::NodeType::sql_db) {
-    std::ranges::copy(model::write_ops_of(spec), std::back_inserter(ops));
-  }
-  // C++20 std::ranges::unique: returns the tail to erase as a subrange (unpacked by a structured
-  // binding), where std::unique returned only its first iterator.
-  std::ranges::sort(ops);
-  const auto [first_repeat, end] = std::ranges::unique(ops);
-  ops.erase(first_repeat, end);
-  std::map<double, std::vector<std::string>> by_cost;
-  for (const auto& op : ops) {
-    const double cost = defaults::op_cost(spec, op) / unit_per_request;
-    if (cost != 1.0) by_cost[cost].push_back(op);
-  }
-  std::vector<std::string> groups;
-  for (const auto& [cost, named] : by_cost) {
-    groups.push_back(join(named, ", ") + " cost " + significant(cost));
-  }
-  return join(groups, " and ");
-}
-
-// What a node's peak_backlog and drops count, when it is not requests: megabytes at a byte-sized
-// node (spec §19 entry 2), replica-requests at a kv_cluster (N of them per request, §19 entry 9),
-// capacity units at a node with an op that costs other than 1 (priced_ops); empty otherwise, and
-// for a client, which queues nothing.
-[[nodiscard]] std::optional<std::string> unit_of(const model::NodeSpec& spec) {
-  if (spec.type == model::NodeType::client) return std::nullopt;
-  if (defaults::is_byte_sized(spec)) return "MB";
-  if (spec.type == model::NodeType::kv_cluster) {
-    // Every request is N replica-requests; a stated `cost` prices each of them on top (op_cost is
-    // the product), so the line says both: "replica-requests (N 3; put cost 4 each)".
-    const int n = model::kv_replication(spec);
-    const auto priced = priced_ops(spec, static_cast<double>(n));
-    const std::string each = priced.empty() ? "" : "; " + priced + " each";
-    return "replica-requests (N " + std::to_string(n) + each + ")";
-  }
-  const auto priced = priced_ops(spec);
-  if (priced.empty()) return std::nullopt;
-  return "capacity units (" + priced + ")";
-}
-
 // "units (peak_backlog and drops are not requests here): url_db capacity units (...); cdn_us MB":
 // one line under the node table naming every node whose figures are in another unit (the 2a
 // leftover M7: the table's headers carry no unit), or nothing when every node counts requests.
@@ -1258,53 +1208,8 @@ constexpr std::string_view op_title =
 
 // ---- JSON ----
 
-// Quotes and backslashes are escaped, control characters become \u00XX; everything
-// else (UTF-8 included) passes through, as JSON allows.
-[[nodiscard]] std::string json_string(std::string_view text) {
-  constexpr std::string_view hex = "0123456789abcdef";
-  std::string out = "\"";
-  for (const char c : text) {
-    const unsigned code = static_cast<unsigned char>(c);
-    if (c == '"' || c == '\\') {
-      out += '\\';
-      out += c;
-    } else if (code < 0x20) {
-      out += "\\u00";
-      out += hex[code >> 4];
-      out += hex[code & 0xFu];
-    } else {
-      out += c;
-    }
-  }
-  return out + '"';
-}
-
-// JSON has no infinity: a latency that never arrives is null.
-[[nodiscard]] std::string json_number(double value) {
-  return std::isfinite(value) ? format_number(value) : "null";
-}
-
-[[nodiscard]] std::string json_optional_number(const std::optional<double>& value) {
-  return value ? json_number(*value) : "null";
-}
-
-[[nodiscard]] std::string json_optional_string(const std::optional<std::string>& text) {
-  return text ? json_string(*text) : "null";
-}
-
-[[nodiscard]] std::string json_field(std::string_view name, const std::string& value) {
-  return json_string(name) + ": " + value;
-}
-
-[[nodiscard]] std::string json_object(std::span<const std::string> fields) {
-  return "{" + join(fields, ", ") + "}";
-}
-
-// `"name": [ ... ]` at the top level, one object per line.
-[[nodiscard]] std::string json_array(std::string_view name, std::span<const std::string> objects) {
-  if (objects.empty()) return "  " + json_field(name, "[]");
-  return "  " + json_field(name, "[\n    " + join(objects, ",\n    ") + "\n  ]");
-}
+// The primitives (json_string, json_number, json_field, json_object, json_array) are in the
+// :shared partition, which the graph JSON and the stream use too.
 
 // Whether a node's lag grows without bound (estimate's frontier or queue that falls behind for
 // good: its peak_queue_lag_s is infinite, printed null), `false` on a queue whose lag is finite,
