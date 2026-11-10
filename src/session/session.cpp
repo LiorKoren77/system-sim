@@ -115,6 +115,7 @@ std::expected<report::Summary, std::string> run_summary(const graph::Graph& g,
 
 std::expected<std::size_t, std::string> bucket_for_points(std::size_t steps, long long points) {
   if (points < 1 || points > static_cast<long long>(max_points)) {
+    // C++23 std::unexpected<E>: wraps the error so it converts to the std::expected returned.
     return std::unexpected(std::format("--points must be between 1 and {}", max_points));
   }
   const auto n = static_cast<std::size_t>(points);

@@ -293,6 +293,9 @@ TEST_CASE("explain's JSON says which nodes count megabytes, capacity units or re
       link_between(youtube["links"], "cdn_eu", "transcoded_store")["bandwidth_mb_s"].as<double>() ==
       5000);
   CHECK(entry(youtube["nodes"], "id", "transcoders")["workers"].as<int>() == 600);
+  // youtube's one pipe is the first row of every frame's `links`, wherever it is among the links.
+  CHECK(link_between(youtube["links"], "cdn_eu", "transcoded_store")["pipe_row"].as<int>() == 0);
+  CHECK(youtube["links"][0]["pipe_row"].IsNull());
   const auto shortener = graph_json_of("book/url-shortener/scenario.yaml");
   CHECK(entry(shortener["nodes"], "id", "url_db")["unit"].Scalar() == "units");  // writes cost 5
   const auto kv = graph_json_of("labs/kv-store/scenario.yaml");
@@ -353,11 +356,17 @@ TEST_CASE("every shipped scenario's graph JSON parses, one node per node of the 
     CHECK(doc["nodes"].size() == g.nodes().size());
     std::size_t piped = 0;
     for (const auto& link : g.links()) piped += link.pipe ? 1U : 0U;
-    std::size_t with_bandwidth = 0;
+    // Each pipe names its row in a frame's `links`: 0, 1, ... in the graph's order, which is
+    // engine::StepRecord::links' order; a link without a bandwidth has no row.
+    std::size_t next_row = 0;
     for (const auto& link : doc["links"]) {
-      with_bandwidth += link["bandwidth_mb_s"].IsNull() ? 0U : 1U;
+      if (link["bandwidth_mb_s"].IsNull()) {
+        CHECK(link["pipe_row"].IsNull());
+      } else {
+        CHECK(link["pipe_row"].as<std::size_t>() == next_row++);
+      }
     }
-    CHECK(with_bandwidth == piped);
+    CHECK(next_row == piped);
   }
 }
 

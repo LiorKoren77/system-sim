@@ -2425,8 +2425,9 @@ The rules a frontend may rely on, for every JSON document simsys writes:
 2. Adding a line type, a key, or a column at the end of a `*_columns` list keeps `format_version`.
 3. Removing or renaming any of them, reordering columns, or changing a value's meaning or unit raises
    it, and this file's "New in" list names the change.
-4. Rows refer to nodes, links and ops by their position in the latest `graph`; the graph's ids are
-   the scenario's ids, stable across runs of the same file.
+4. Rows refer to nodes and ops by their position in the latest `graph`'s `nodes` and `ops`, and a
+   frame's `links` rows to the graph's links by their `pipe_row` (only a link with a bandwidth has
+   a row); the graph's ids are the scenario's ids, stable across runs of the same file.
 5. Same file, same seed, same bucket: the same stream, byte for byte.
 
 Kept open for later (phase 5a spec §8), none of it built yet: a live change (a node down now, a
@@ -2449,7 +2450,7 @@ YAML or re-derives a default). `format_version` first, then:
 | `datacenters` | objects, `{"name": ...}`; the latencies between them are on the links |
 | `zones` | `["green", "yellow", "red"]`: the names of a frame's `zone` numbers |
 | `nodes` | in the engine's order (every frame's): `id`, `type`, `datacenter`, `replicas` (a kv_cluster's machines), `shards` (`null` unless sharded), `capacity_per_s` (the total over replicas and shards, the number explain's check line uses), `unit` (`requests`, `units` for a node with an op that costs other than 1, `MB` for a byte-sized node, `replica-requests` for a kv_cluster), `yellow`, `red`, `queue_limit`; all `null` on a client but the first four; a worker pool's `workers`, a websocket gateway's `connection_cap` |
-| `links` | `from`, `to`, `direction`, `ops` (empty: every op), `one_way_s`, `bandwidth_mb_s` (`null` without a bandwidth) |
+| `links` | `from`, `to`, `direction`, `ops` (empty: every op), `one_way_s`, `bandwidth_mb_s` (`null` without a bandwidth), `pipe_row` (the link's index among a frame's `links` rows, which are the bandwidth links only; `null` without a bandwidth) |
 | `ops` | `client`, `op`, `share`: clients in node order, each client's ops by name (every frame's op rows) |
 | `slos` | `metric`, `node`, `op`, `max` (seconds for a time metric), `over_s` |
 | `faults` | `kind`, `target` (a node, or a datacenter for `dc_down`), `at_s`, `for_s` (`null` for an instant `cache_flush`) |

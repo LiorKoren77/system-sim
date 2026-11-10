@@ -1998,9 +1998,11 @@ constexpr std::array<std::string_view, 1> estimated_columns{"p99_ms"};
 }
 
 // A link: its ends by id, its direction, the ops it carries (empty: every op), its one-way latency
-// and, for a pipe, its bandwidth in MB/s (the pipe's service rate: it counts megabytes).
+// and, for a pipe, its bandwidth in MB/s (the pipe's service rate: it counts megabytes) and the
+// index of its row in every frame.
 [[nodiscard]] std::string json_graph_link(std::span<const graph::ResolvedNode> nodes,
-                                          const graph::ResolvedLink& link) {
+                                          const graph::ResolvedLink& link,
+                                          std::optional<std::size_t> pipe_row) {
   return json_object(std::vector<std::string>{
       json_field("from", json_string(nodes[link.from].spec.id)),
       json_field("to", json_string(nodes[link.to].spec.id)),
@@ -2008,7 +2010,11 @@ constexpr std::array<std::string_view, 1> estimated_columns{"p99_ms"};
       json_field("ops", json_strings(link.ops)),
       json_field("one_way_s", json_number(seconds(link.one_way))),
       json_field("bandwidth_mb_s",
-                 link.pipe ? json_number(link.pipe->service_rate.per_second) : "null")});
+                 link.pipe ? json_number(link.pipe->service_rate.per_second) : "null"),
+      // Where this link's numbers are in a frame: its index among the frame's `links` rows, which
+      // are the pipes only (engine::StepRecord::links, in this list's order); null for a link
+      // without a bandwidth, which only adds latency and has no row.
+      json_field("pipe_row", pipe_row ? std::to_string(*pipe_row) : "null")});
 }
 
 // Every client op with its share of the client's mix, clients in node order and each client's ops
@@ -2060,7 +2066,11 @@ constexpr std::array<std::string_view, 1> estimated_columns{"p99_ms"};
 std::vector<std::string> graph_json_fields(const graph::Graph& g) {
   const auto& scenario = g.scenario();
   std::vector<std::string> links;
-  for (const auto& link : g.links()) links.push_back(json_graph_link(g.nodes(), link));
+  std::size_t pipes = 0;
+  for (const auto& link : g.links()) {
+    const auto row = link.pipe ? std::optional{pipes++} : std::nullopt;
+    links.push_back(json_graph_link(g.nodes(), link, row));
+  }
   return {
       "  " + json_field("scenario", json_string(scenario.name)),
       json_array("datacenters", map_to_strings(std::span<const std::string>{scenario.datacenters},

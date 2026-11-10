@@ -297,7 +297,7 @@ std::expected<graph::Graph, RunRefusal> load_for_run(const std::filesystem::path
   if (args.duration) {
     if (auto refused = unparsable_duration(file, *args.duration)) {
       // C++23 std::unexpected<E>: wraps the error so it converts to any std::expected<T, E>.
-      return std::unexpected(RunRefusal{.text = std::move(*refused)});
+      return std::unexpected(RunRefusal{.text = std::move(*refused), .command_line = true});
     }
     // C++20 designated initializers: the members named where the value is built, in declaration
     // order, replacing positional braces where a reader must remember which string is which.
@@ -418,18 +418,19 @@ int run_replicated(const graph::Graph& g, int count, const RunArgs& args,
 
 // ---- `run --stream` (phase 5a spec §4, §6): the run as lines of JSON for a web server ----
 
-// Does the command line ask for `run --stream` (`--stream` or `--stream=<value>`, after `run`)?
+// Does the command line ask for `run --stream` (`--stream` or `--stream=<value>`, run the command)?
 // Read from argv itself for a command line CLI11 refused, whose parse cannot say. `estimate
 // --stream` is not a stream: CLI11's own message for it goes to stderr as for any command.
 bool asks_for_stream(int argc, char** argv) {
   // C++20 std::span: argv as a range with its length, instead of pointer arithmetic over argc.
   const std::span arguments{argv, static_cast<std::size_t>(argc)};
-  bool after_run = false;
-  for (const char* argument : arguments) {
+  // The subcommand is the first argument (simsys has no global option before it but --help and
+  // --version); a later `run` is a file name or an option's value, not the command.
+  if (arguments.size() < 2 || std::string_view{arguments[1]} != "run") return false;
+  for (const char* argument : arguments.subspan(2)) {
     const std::string_view text{argument};
-    if (text == "run") after_run = true;
     // C++20 std::string_view::starts_with: a prefix test without `substr(0, n) ==`.
-    if (after_run && (text == "--stream" || text.starts_with("--stream="))) return true;
+    if (text == "--stream" || text.starts_with("--stream=")) return true;
   }
   return false;
 }
@@ -471,7 +472,8 @@ std::optional<std::string> stream_flags_refused(const std::filesystem::path& fil
   const std::array carried{std::pair{"--series", args.series.has_value()},
                            std::pair{"--series-ops", args.series_ops.has_value()},
                            std::pair{"--report", args.report_given},
-                           std::pair{"--replications", args.replications.has_value()}};
+                           // `--replications 1` is the plain run, which a stream is.
+                           std::pair{"--replications", args.replications.value_or(1) > 1}};
   for (const auto& [flag, given] : carried) {
     if (given) {
       return refused(std::format("--stream carries the report and the series; drop {}", flag));
