@@ -1294,3 +1294,52 @@ a scenario author meets are in `docs/scenario-schema.md` (v1.6).
    (Corrected by the batch C review: a bandwidth link's pipe carries the steady-state flag too, so
    `estimate`'s links table shows `dropped/s` and no `red_s`, its JSON `red_s` is `null`, and a
    worker pool's `dead_lettered` total is `null` there as well.)
+
+## 22. Phase 5a: the simulator as a streaming data source, as implemented (2026-11-10)
+
+Phase 5a (design `docs/superpowers/specs/2026-11-10-phase5a-streaming-design.md`, "the 5a design"
+below; plan `docs/superpowers/plans/2026-11-10-phase5a-streaming.md`) makes `simsys` the data source
+of the web frontend of 5b: a Node server runs it as a child process and reads its stdout. Phase 4b is
+postponed. No node model changes and the engine is untouched; every existing output is byte-identical
+but for the new first key of the JSON reports. §1's "Out of scope for v1: a GUI" and §11's "`--series`
+... the contract for the future GUI" are superseded: the frontend's contract is the stream below.
+Where an entry conflicts with an earlier section or with the 5a design, this section wins. The rules
+a reader meets are in `docs/scenario-schema.md` (v1.7).
+
+1. **`format_version` (Task 1).** `"format_version": 1` is the first key of every JSON document:
+   `run`, `estimate`, replications and `explain` with `--report json`, and the stream's `run` line.
+   It is written once, by `json_document` (batch A review). `render_json_line` is the same report on
+   one line: JSON minification (`json_on_one_line`: whitespace outside strings dropped, RFC 8259 §2),
+   one rule for every document instead of a second renderer per document, which the plan first
+   proposed and the implementation replaced.
+2. **The graph as data (Task 2).** `explain --report json` (`report::render_graph_json`) gives the
+   datacenters (objects, so later keys are additive; their latencies are on the links), the zone
+   names, every node in the engine's order with its total capacity and one-word unit (`unit_word`,
+   the rule of §21's units line), its thresholds, room, `shards`, a pool's `workers` and a
+   gateway's `connection_cap`; the links, the ops (sorted by name, as the engine sorts them), the
+   SLOs and faults (`for_s` null for a cache flush), and the frame column lists. The JSON primitives
+   and the unit rule moved to the `:shared` partition.
+3. **Frames (Tasks 3 and 4).** `report::FrameAggregator`, an Observer of `StepRecord` like
+   `Summary`, hands a `Frame` to a sink every `steps_per_bucket` records (Strategy: the stream
+   writes it, a test collects it). Rates are means, peaks maxima (a lag through
+   `flow::nan_propagating_max`), levels the last value, the zone the worst; so the conservation law
+   balances per bucket (a theory test to 1e-9). A node's latency is drain-weighted, a pipe's
+   demand-weighted, as `Summary` weighs a link's (batch B review). An op's rates (`OpRates`) and its
+   response mixtures (`ResponseMoments`) are module-internal structs `Summary` uses too, read by one
+   rule (`seen_latencies`), so a constant run's bucket p99 is the run's to 1e-9. A bucket that
+   answered nothing has null latencies, as the report's JSON does. A client's row is all null (the
+   5a design said it kept its rates; they are its op rows).
+4. **The stream (Task 5).** `session::stream_run` writes `run`, `graph`, the frames as their buckets
+   close and `summary` (`run --report json`'s report, `report::exit_code`). The CLI writes each line
+   with one `fwrite` and a flush; under `--stream` every refusal, a CLI11 parse error included, is an
+   `error` line with the loader's line and column (`RunRefusal`), and stderr stays empty. `--points`
+   defaults to 720; frame numbers have six significant digits (the CSV series' rule; the shortest
+   round-trip form doubled a frame for float noise). GCC 14.2 could not find the views pipe for a
+   span of `NodeRow` instantiated from the partition, so `stream.cpp` builds its rows with a loop.
+5. **Measured (Release, 2026-11-10).** youtube 27.4 s without and 24.3 s with `--stream`; chat-system
+   59.9 s and 60.2 s: no cost. youtube's stream is 723 lines, 1.13 MB, about 1.55 KB a frame;
+   chat-system's 874 KB. The first frame is out after 43 ms.
+6. **What 5a leaves.** The Node server and the browser (5b); commands on stdin and mid-run changes of
+   topology (the 5a design §8: reserved, `rev` always 0); `--series-every`, `validate --report json`,
+   streamed replications or sweeps, compression; sorting `op_shares` once in `Graph::build`
+   (batch B review: each reader sorts them today).

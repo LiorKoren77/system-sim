@@ -200,3 +200,27 @@ CLI11's own parse errors (an unknown flag, a missing file) happen before `--stre
 - Every spec section has a task: §4 (CLI) → 5; §5 (`format_version`) → 1; §6.1 (`run`, `graph`) → 2, 5; §6.2 (frames) → 3, 4; §6.3 (summary) → 1, 5; §6.4 (size, speed) → 5 measured; §6.5 (errors) → 5; §7 (contract) → 2 (columns pinned), 5 (determinism), 6 (written down); §8 (later) → nothing built; `rev` written as 0 (2, 5); stdin read by nothing (5: no code reads it).
 - Each bold number has its derivation in the task. The one taken from a README (chain's `users.write` p99 **18.9 ms**) is the table's rounding: the test compares the bucket's p99 with the Summary's value, not with the printed text.
 - Risks: the move of `Moments` into `:shared` (a partition that imports no part of simsys.report: `Moments` has no dependency on report, and the percentile rule needs only `simsys.queueing`, which `:shared` may import). The `std::function` sink in an exported class needs `<functional>` in `report.cppm`'s global module fragment, which today has `<cstddef>`, `<iosfwd>`, `<optional>`, `<span>`, `<string>`, `<string_view>`, `<vector>`; `<functional>` is not on the first defect's list (`session.cppm` already includes it beside its imports), so it is added there.
+
+---
+
+## As built (2026-11-10)
+
+- **Task 1:** red `339b4eb`, green `a528311`. The one-line report is JSON minification
+  (`json_on_one_line`) of the pretty one, not a separator parameter through every renderer.
+- **Task 2:** red `2df1a91`, green `a488e96`; batch A review fixes `13c9812` (cache flush `for_s`
+  null, datacenters as objects, `shards`, ops sorted, `format_version` written once by
+  `json_document`, shared helpers in `:shared`). The graph JSON lives in `explain.cpp`.
+- **Task 3:** red `4fd12a0`, green `979ab02`. The aggregator is a unit of simsys.report
+  (`src/report/stream.cpp`), not a module of its own. Plan numbers corrected: the conservation probe
+  is mm1's 100 steps in buckets of 7 (15 frames, the last 0.2 s); 600 steps in buckets of 7 are 86
+  frames, the last 0.5 s.
+- **Task 4:** red `508e2b8`, refactor `4c96067` (Moments, ResponseMoments, seen_latencies:
+  module-internal declarations in `report.cppm`, not the `:shared` partition), green `c016bdb`. The
+  hand-computed p99 of the identical-steps test is 9.810 ms (the first draft's 9.106 was an
+  arithmetic slip).
+- **Task 5:** red `a33c3ae`, green `f215d68`; batch B review fixes `829d21a` (NaN-propagating lag,
+  pipe latency by demand, `OpRates`, `as_node_sample`). Frame numbers have six significant digits.
+  The process tests are `tests/cli/stream.cmake` (five checks).
+- **Measured (Release):** youtube 27.4 s without, 24.3 s with `--stream`; chat-system 59.9 s and
+  60.2 s (within the 5 %). youtube's stream: 723 lines, 1,134,255 bytes, 1.55 KB a frame;
+  chat-system's 873,526 bytes. First frame after 43 ms.
