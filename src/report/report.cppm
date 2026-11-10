@@ -32,6 +32,60 @@ import simsys.fluid; // Zone: a link's worst zone
 import simsys.graph;
 import simsys.model;
 
+// ---- module-internal: shared by the units of simsys.report, not exported ----
+//
+// Declared without `export`, these have module linkage: every unit of simsys.report sees them
+// (report.cpp defines them; Summary and the stream's FrameAggregator both use them), no importer
+// does. One rule for a run's latency figures and a bucket's, so a chart of a bucket's p99 and the
+// report's p99 agree.
+namespace simsys::report {
+
+// Weighted first and second moments of a latency, accumulated across steps: the moments of the
+// mixture of the steps' latency distributions, each weighted by `w` (the requests it answered).
+struct Moments {
+  double weight{};
+  double weighted_mean{};    // Σ w·m
+  double weighted_square{};  // Σ w·(v + m²) = Σ w·E[X²]
+  void add(double w, double mean_s, double variance_s2);
+  // The mixture's mean and variance; precondition: weight > 0.
+  [[nodiscard]] double mean_s() const;
+  [[nodiscard]] double variance_s2() const;
+};
+
+// One (client, op)'s response over many steps (a run, a window, a bucket of a stream).
+struct ResponseMoments {
+  Moments by_answered{};  // weighted by requests answered: what an average answer sees
+  Moments by_time{};      // weighted by time: the fallback when nothing was answered
+  // The delivered requests' latency before the client gave up (ResponseSample::
+  // delivered_response), weighted by the attempts delivered, answered + timed out (every
+  // attempt): what a timed-out client's percentiles are read off (percentile_seen_by_client).
+  Moments by_delivered{};
+  bool unavailable{};  // some step's path never answered (an infinite latency)
+  void add(const engine::ResponseSample& sample, double dt_s);
+};
+
+// The latency figures of an op, in seconds: the answered requests' mean and the percentiles the
+// client saw.
+struct SeenLatencies {
+  double mean_s{};
+  double p50_s{};
+  double p95_s{};
+  double p99_s{};
+};
+
+// An op's mean from the moments its answered requests left, its percentiles from the delivered
+// ones, read by the client's rule (percentile_seen_by_client in report.cpp: capped at `timeout_s`,
+// the timeout itself when more than 1 − q of them timed out). Empty when no step was observed.
+[[nodiscard]] std::optional<SeenLatencies> seen_latencies(const ResponseMoments& moments,
+                                                          std::optional<double> timeout_s,
+                                                          double share_timed_out);
+
+// timed_out / (answered + timed_out): the share of the attempts the path delivered that came back
+// after the client had given up; 0 when nothing was delivered.
+[[nodiscard]] double timed_out_share(double answered, double timed_out);
+
+}  // namespace simsys::report
+
 export namespace simsys::report {
 
 // One node over the observed part of a run (after warmup). Rates are summed over
@@ -334,16 +388,6 @@ class Summary {
   [[nodiscard]] std::span<const FaultBlock> faults() const { return faults_; }
 
  private:
-  // Weighted first and second moments of a latency, accumulated across steps.
-  struct Moments {
-    double weight{};
-    double weighted_mean{};    // Σ w·m
-    double weighted_square{};  // Σ w·(v + m²) = Σ w·E[X²]
-    void add(double w, double mean_s, double variance_s2);
-    // The mixture's mean and variance; precondition: weight > 0.
-    [[nodiscard]] double mean_s() const;
-    [[nodiscard]] double variance_s2() const;
-  };
   struct NodeTotals {
     double rho_time{};  // Σ rho·dt
     double peak_rho{};
@@ -392,13 +436,7 @@ class Summary {
     double answered{};   // Σ answered·dt, requests: the part of `offered` that came back
     double timed_out{};  // Σ timed_out·dt, requests: delivered, but after the client gave up
     double timed_out_attempts{};  // Σ timed_out_attempts·dt: every attempt that timed out
-    Moments by_answered{};        // weighted by requests answered: what an average answer sees
-    Moments by_time{};            // weighted by time: the fallback when nothing was answered
-    // The delivered requests' latency before the client gave up (ResponseSample::
-    // delivered_response), weighted by the attempts delivered, answered + timed out (every
-    // attempt): what a timed-out client's percentiles are read off (percentile_seen_by_client).
-    Moments by_delivered{};
-    bool unavailable{};
+    ResponseMoments response{};   // the latency the op's requests saw (ResponseMoments)
     void add(const engine::ResponseSample& sample, double dt_s);
   };
 

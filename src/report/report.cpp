@@ -156,15 +156,6 @@ constexpr Quantile median{.level = 0.50, .z = queueing::z_p50};
 constexpr Quantile ninety_fifth{.level = 0.95, .z = queueing::z_p95};
 constexpr Quantile ninety_ninth{.level = 0.99, .z = queueing::z_p99};
 
-// timed_out / (answered + timed_out): the share of the attempts the path delivered that came back
-// after the client had given up; 0 when nothing was delivered. `timed_out` counts every attempt
-// that timed out (OpTotals::timed_out_attempts), the retried ones too: the client waited past its
-// timeout on each, and that is the share a percentile asks about.
-[[nodiscard]] double timed_out_share(double answered, double timed_out) {
-  const double delivered = answered + timed_out;
-  return delivered > 0.0 ? timed_out / delivered : 0.0;
-}
-
 // Did more than 1 − q of the delivered requests time out (more than 1 % for a p99)? Then no
 // request at quantile q was answered: the client saw the timeout there.
 [[nodiscard]] bool quantile_timed_out(double share_timed_out, Quantile q) {
@@ -2072,20 +2063,20 @@ constexpr double residue_per_capacity = 1e-9;
 // Weighted moments of a mixture: each step contributes its mean m and variance v with
 // weight w (requests answered in that step), so E[X] = Σ w·m / Σ w and
 // E[X²] = Σ w·(v + m²) / Σ w (E[X²] of one component is its variance plus its squared mean).
-void Summary::Moments::add(double w, double mean_s, double variance_s2) {
+void Moments::add(double w, double mean_s, double variance_s2) {
   weight += w;
   weighted_mean += w * mean_s;
   weighted_square += w * (variance_s2 + mean_s * mean_s);
 }
 
-double Summary::Moments::mean_s() const {
+double Moments::mean_s() const {
   return weighted_mean / weight;
 }
 
 // Law of total variance over the steps: Var X = E[X²] − (E[X])², where E[X²] already holds each
 // step's own spread (v) and the spread between step means (m²). Assumes a request's step is chosen
 // in proportion to the weight (requests) the step added.
-double Summary::Moments::variance_s2() const {
+double Moments::variance_s2() const {
   const double mean = mean_s();
   return weighted_square / weight - mean * mean;
 }
@@ -2154,6 +2145,17 @@ void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
   answered += sample.answered.per_second * dt_s;
   timed_out += sample.timed_out.per_second * dt_s;
   timed_out_attempts += sample.timed_out_attempts.per_second * dt_s;
+  response.add(sample, dt_s);
+}
+
+// `timed_out` counts every attempt that timed out (OpTotals::timed_out_attempts), the retried ones
+// too: the client waited past its timeout on each, and that is the share a percentile asks about.
+double timed_out_share(double answered, double timed_out) {
+  const double delivered = answered + timed_out;
+  return delivered > 0.0 ? timed_out / delivered : 0.0;
+}
+
+void ResponseMoments::add(const engine::ResponseSample& sample, double dt_s) {
   const double delivered_per_s = sample.answered.per_second + sample.timed_out_attempts.per_second;
   if (!(delivered_per_s > 0.0)) return;
   const auto& response = sample.response;
@@ -2522,7 +2524,7 @@ std::vector<OpSummary> Summary::ops() const {
         .timed_out_attempts_per_s = observed_s_ > 0.0 ? t.timed_out_attempts / observed_s_ : 0.0,
         .timeout_s = graph::client_timeout_s(client),
         .timed_out_share = timed_out_share(t.answered, t.timed_out_attempts)};
-    if (t.unavailable) {
+    if (t.response.unavailable) {
       op.mean_s = op.p50_s = op.p95_s = op.p99_s = infinity;
     } else {
       fill_latencies(t, op);
@@ -2538,20 +2540,32 @@ std::vector<OpSummary> Summary::ops() const {
 // delivered requests' moments, before any timeout cut them (identical to the answered ones without
 // a timeout), and applies the client's timeout. Whichever moments are empty fall back to the
 // time-weighted ones: an op nothing reached, which no renderer prints a latency for.
-void Summary::fill_latencies(const OpTotals& totals, OpSummary& op) {
-  const Moments& answered = totals.by_answered.weight > 0.0 ? totals.by_answered : totals.by_time;
-  if (answered.weight <= 0.0) return;  // no step observed
-  op.mean_s = answered.mean_s();
-  const bool timed = op.timeout_s.has_value() && totals.by_delivered.weight > 0.0;
-  const Moments& delivered = timed ? totals.by_delivered : answered;
+std::optional<SeenLatencies> seen_latencies(const ResponseMoments& moments,
+                                            std::optional<double> timeout_s,
+                                            double share_timed_out) {
+  const Moments& answered =
+      moments.by_answered.weight > 0.0 ? moments.by_answered : moments.by_time;
+  if (answered.weight <= 0.0) return std::nullopt;  // no step observed
+  const bool timed = timeout_s.has_value() && moments.by_delivered.weight > 0.0;
+  const Moments& delivered = timed ? moments.by_delivered : answered;
   const auto seen = [&](Quantile q) {
-    return percentile_seen_by_client(delivered.mean_s(), delivered.variance_s2(),
-                                     op.timed_out_share, op.timeout_s, q)
+    return percentile_seen_by_client(delivered.mean_s(), delivered.variance_s2(), share_timed_out,
+                                     timeout_s, q)
         .seconds;
   };
-  op.p50_s = seen(median);
-  op.p95_s = seen(ninety_fifth);
-  op.p99_s = seen(ninety_ninth);
+  return SeenLatencies{.mean_s = answered.mean_s(),
+                       .p50_s = seen(median),
+                       .p95_s = seen(ninety_fifth),
+                       .p99_s = seen(ninety_ninth)};
+}
+
+void Summary::fill_latencies(const OpTotals& totals, OpSummary& op) {
+  const auto seen = seen_latencies(totals.response, op.timeout_s, op.timed_out_share);
+  if (!seen) return;
+  op.mean_s = seen->mean_s;
+  op.p50_s = seen->p50_s;
+  op.p95_s = seen->p95_s;
+  op.p99_s = seen->p99_s;
 }
 
 // Per node, not per scenario: a node's drops are a fraction of what it was sent, so the
