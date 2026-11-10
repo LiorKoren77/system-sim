@@ -7,7 +7,8 @@
 // Computed once per graph: nodes keep their places through the day, so the eye follows the
 // colours, not motion. ELK is deterministic, so the same graph always gets the same places.
 import type { GraphLine } from "@simsys/stream";
-import type { ELK, ElkExtendedEdge, ElkNode } from "elkjs/lib/elk-api";
+import type { ELK, ElkExtendedEdge, ElkNode, ElkPort } from "elkjs/lib/elk-api";
+import { sidesFor, type Box, type Side } from "./sides";
 
 export const NODE_WIDTH = 176;
 export const NODE_HEIGHT = 68;
@@ -30,6 +31,8 @@ export interface Layout {
   // Each link's route, `link-<i>` in the graph's link order: ELK's orthogonal path from the source
   // box's border to the target's, around the boxes in between, in the diagram's coordinates.
   readonly routes: ReadonlyMap<string, readonly Point[]>;
+  // The sides each link joins, `link-<i>`: where its route leaves and enters the boxes.
+  readonly sides: ReadonlyMap<string, { readonly source: Side; readonly target: Side }>;
   readonly groups: ReadonlyMap<string, Placed>; // by `dc:<name>`, in the graph's datacenter order
 }
 
@@ -63,16 +66,60 @@ const groupOptions = { "elk.padding": "[top=32,left=16,bottom=16,right=16]" };
 
 export const groupId = (datacenter: string) => `dc:${datacenter}`;
 
+// Two passes. The first lays the boxes out with edges attached anywhere; from where the boxes
+// land, each link gets the pair of sides that face each other (sides.ts: right to left along the
+// flow, top or bottom between stacked boxes, bottom to bottom for a loop back). The second pass
+// lays out again with each link's ends fixed to those sides as ELK ports, and ELK routes every
+// edge around the boxes into them. Without ports, a left-to-right layout attaches edges only on
+// the left and right sides.
 export async function layoutGraph(graph: GraphLine): Promise<Layout> {
-  const grouped = graph.datacenters.length > 1;
-  const leaf = (node: GraphLine["nodes"][number]): ElkNode => ({
-    id: node.id,
-    width: NODE_WIDTH,
-    height: NODE_HEIGHT,
-    ...(node.type === "client"
-      ? { layoutOptions: { "elk.layered.layering.layerConstraint": "FIRST" } }
-      : {}),
+  const first = await runElk(graph, null);
+  const sides = new Map<string, { source: Side; target: Side }>();
+  graph.links.forEach((link, i) => {
+    const from = absoluteBox(first, link.from);
+    const to = absoluteBox(first, link.to);
+    if (from && to) sides.set(`link-${i}`, sidesFor(from, to));
   });
+  return { ...(await runElk(graph, sides)), sides };
+}
+
+const elkSide: Readonly<Record<Side, string>> = {
+  left: "WEST",
+  right: "EAST",
+  top: "NORTH",
+  bottom: "SOUTH",
+};
+
+async function runElk(
+  graph: GraphLine,
+  sides: ReadonlyMap<string, { source: Side; target: Side }> | null,
+): Promise<Omit<Layout, "sides">> {
+  const grouped = graph.datacenters.length > 1;
+  // A port per link end, on its side: `link-3:source` on the box the link leaves.
+  const portsOf = (id: string): ElkPort[] =>
+    sides === null
+      ? []
+      : graph.links.flatMap((link, i) => {
+          const pair = sides.get(`link-${i}`);
+          if (pair === undefined) return [];
+          const ends: ElkPort[] = [];
+          if (link.from === id) ends.push(port(`link-${i}:source`, pair.source));
+          if (link.to === id) ends.push(port(`link-${i}:target`, pair.target));
+          return ends;
+        });
+  const leaf = (node: GraphLine["nodes"][number]): ElkNode => {
+    const ports = portsOf(node.id);
+    return {
+      id: node.id,
+      width: NODE_WIDTH,
+      height: NODE_HEIGHT,
+      ports,
+      layoutOptions: {
+        ...(node.type === "client" ? { "elk.layered.layering.layerConstraint": "FIRST" } : {}),
+        ...(ports.length > 0 ? { "elk.portConstraints": "FIXED_SIDE" } : {}),
+      },
+    };
+  };
   const children: ElkNode[] = grouped
     ? byFlow(graph).map((dc) => ({
         id: groupId(dc.name),
@@ -80,15 +127,37 @@ export async function layoutGraph(graph: GraphLine): Promise<Layout> {
         children: graph.nodes.filter((n) => n.datacenter === dc.name).map(leaf),
       }))
     : graph.nodes.map(leaf);
-  const edges: ElkExtendedEdge[] = graph.links.map((link, i) => ({
-    id: `link-${i}`,
-    sources: [link.from],
-    targets: [link.to],
-  }));
+  const edges: ElkExtendedEdge[] = graph.links.map((link, i) => {
+    const id = `link-${i}`;
+    const fixed = sides?.has(id) ?? false;
+    return {
+      id,
+      sources: [fixed ? `${id}:source` : link.from],
+      targets: [fixed ? `${id}:target` : link.to],
+    };
+  });
   const root = await (
     await loadElk()
   ).layout({ id: "root", layoutOptions: rootOptions, children, edges });
   return collect(root, grouped);
+}
+
+function port(id: string, side: Side): ElkPort {
+  // Zero-sized, so a route ends exactly on the box's border.
+  return { id, width: 0, height: 0, layoutOptions: { "elk.port.side": elkSide[side] } };
+}
+
+// A node's box in the diagram's coordinates: a node inside a datacenter box is placed relative to it.
+export function absoluteBox(layout: Pick<Layout, "nodes" | "groups">, id: string): Box | undefined {
+  const place = layout.nodes.get(id);
+  if (place === undefined) return undefined;
+  const parent = place.parent === null ? undefined : layout.groups.get(place.parent);
+  return {
+    x: place.x + (parent?.x ?? 0),
+    y: place.y + (parent?.y ?? 0),
+    width: place.width,
+    height: place.height,
+  };
 }
 
 // The datacenters in the order their traffic flows: the one whose links mostly leave it for the
@@ -110,7 +179,7 @@ function byFlow(graph: GraphLine): GraphLine["datacenters"] {
   return [...graph.datacenters].sort((a, b) => (net.get(b.name) ?? 0) - (net.get(a.name) ?? 0));
 }
 
-function collect(root: ElkNode, grouped: boolean): Layout {
+function collect(root: ElkNode, grouped: boolean): Omit<Layout, "sides"> {
   const nodes = new Map<string, Placed>();
   const groups = new Map<string, Placed>();
   const routes = new Map<string, Point[]>();
