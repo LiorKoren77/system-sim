@@ -7,11 +7,15 @@
 // chosen so that the fluid queue's conservation law (spec §3.3) still balances over a bucket.
 module;
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <functional>
 #include <optional>
+#include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -220,6 +224,139 @@ void FrameAggregator::hand_over() {
   for (const auto& sums : ops_) frame.ops.push_back(op_row(sums));
   steps_ = 0;
   sink_(frame);
+}
+
+// ---- the lines ----
+
+namespace {
+
+// `"type":"<type>"`, every line's first key.
+[[nodiscard]] std::string type_field(std::string_view type) {
+  return json_field("type", json_string(type));
+}
+
+// A frame's number: six significant digits, as the CSV series writes its cells (significant), or
+// null when there is none or it is not finite. Six digits are what a chart can show; the shortest
+// round-trip form of a bucket's mean (0.10000000000000006 for 0.1) would double a frame's size for
+// noise. The summary line keeps the report's full precision.
+[[nodiscard]] std::string frame_number(const std::optional<double>& value) {
+  if (!value || !std::isfinite(*value)) return "null";
+  return significant(*value, 6);
+}
+
+// One frame row as a JSON array of numbers, in the order of the columns the graph names
+// (explain.cpp's node_columns, link_columns, op_columns): the order is the contract.
+[[nodiscard]] std::string json_numbers(std::span<const std::string> values) {
+  return "[" + join(values, ",") + "]";
+}
+
+[[nodiscard]] std::string optional_int(const std::optional<int>& value) {
+  return value ? std::to_string(*value) : "null";
+}
+
+[[nodiscard]] std::string json_node_row(const NodeRow& r) {
+  const std::array values{frame_number(r.demand_per_s),
+                          frame_number(r.drain_per_s),
+                          frame_number(r.dropped_per_s),
+                          frame_number(r.rejected_per_s),
+                          frame_number(r.backlog),
+                          frame_number(r.peak_backlog),
+                          frame_number(r.mean_rho),
+                          frame_number(r.peak_rho),
+                          optional_int(r.zone),
+                          frame_number(r.red_s),
+                          frame_number(r.latency_ms),
+                          frame_number(r.queue_lag_s),
+                          frame_number(r.connections),
+                          frame_number(r.dead_lettered_per_s),
+                          frame_number(r.deduplicated_per_s)};
+  return json_numbers(values);
+}
+
+// A pipe's row has a node's columns but its refusals and its type-specific ones (link_columns).
+[[nodiscard]] std::string json_link_row(const NodeRow& r) {
+  const std::array values{frame_number(r.demand_per_s),  frame_number(r.drain_per_s),
+                          frame_number(r.dropped_per_s), frame_number(r.backlog),
+                          frame_number(r.peak_backlog),  frame_number(r.mean_rho),
+                          frame_number(r.peak_rho),      optional_int(r.zone),
+                          frame_number(r.red_s),         frame_number(r.latency_ms)};
+  return json_numbers(values);
+}
+
+[[nodiscard]] std::string json_op_row(const OpRow& r) {
+  const std::array values{frame_number(r.offered_per_s),  frame_number(r.attempts_per_s),
+                          frame_number(r.answered_per_s), frame_number(r.timed_out_per_s),
+                          frame_number(r.mean_ms),        frame_number(r.p99_ms)};
+  return json_numbers(values);
+}
+
+// `"name":[row,row,...]`, each row through `to_json`. A plain loop, not :shared's map_to_strings:
+// GCC 14.2 cannot find the views pipe operator for a span of a type this module's interface
+// declares (NodeRow, OpRow) when the template is instantiated from the partition ("no match for
+// operator|"), one more face of the module defects of CLAUDE.md §3.
+template <class Row>
+[[nodiscard]] std::string json_rows(std::string_view name, const std::vector<Row>& rows,
+                                    std::string (*to_json)(const Row&)) {
+  std::vector<std::string> texts;
+  texts.reserve(rows.size());
+  for (const auto& row : rows) texts.push_back(to_json(row));
+  return json_field(name, "[" + join(texts, ",") + "]");
+}
+
+// The revision of the graph every line of 5a refers to: the scenario as loaded (spec §8).
+constexpr int first_revision = 0;
+
+}  // namespace
+
+std::string render_run_line(const graph::Graph& g, std::size_t steps_per_bucket,
+                            std::size_t frames) {
+  const auto& scenario = g.scenario();
+  const double step_s = seconds(scenario.step);
+  const std::array fields{
+      type_field("run"),
+      json_field("format_version", std::to_string(format_version)),
+      json_field("scenario", json_string(scenario.name)),
+      json_field("seed", std::to_string(scenario.seed)),
+      json_field("duration_s", json_number(seconds(scenario.duration))),
+      json_field("step_s", json_number(step_s)),
+      json_field("warmup_s", json_number(seconds(scenario.warmup))),
+      json_field("bucket_s", json_number(step_s * static_cast<double>(steps_per_bucket))),
+      json_field("frames", std::to_string(frames))};
+  return json_on_one_line(json_object(fields));
+}
+
+std::string render_graph_line(const graph::Graph& g) {
+  auto fields = graph_json_fields(g);
+  fields.insert(fields.begin(), {"  " + type_field("graph"),
+                                 "  " + json_field("rev", std::to_string(first_revision))});
+  return json_on_one_line("{" + join(fields, ",") + "}");
+}
+
+std::string render_frame_line(const Frame& frame) {
+  const std::array fields{type_field("frame"),
+                          json_field("rev", std::to_string(first_revision)),
+                          json_field("t_s", json_number(seconds(frame.t))),
+                          json_field("dt_s", json_number(frame.dt_s)),
+                          json_rows("nodes", frame.nodes, json_node_row),
+                          json_rows("links", frame.links, json_link_row),
+                          json_rows("ops", frame.ops, json_op_row)};
+  return json_on_one_line(json_object(fields));
+}
+
+std::string render_summary_line(const Summary& summary, std::span<const SloResult> slos,
+                                int exit_code) {
+  return json_on_one_line("{" + type_field("summary") + "," +
+                          json_field("exit_code", std::to_string(exit_code)) + "," +
+                          json_field("report", render_json_line(summary, slos)) + "}");
+}
+
+std::string render_error_line(const std::optional<std::string>& file, int line, int column,
+                              const std::string& message) {
+  const std::array fields{type_field("error"), json_field("file", json_optional_string(file)),
+                          json_field("line", std::to_string(line)),
+                          json_field("column", std::to_string(column)),
+                          json_field("message", json_string(message))};
+  return json_on_one_line(json_object(fields));
 }
 
 }  // namespace simsys::report

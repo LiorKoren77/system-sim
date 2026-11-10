@@ -15,6 +15,7 @@ module;
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -26,6 +27,7 @@ module simsys.session;
 // C++20 `import`: the compiled interfaces of the modules used here, instead of re-parsing their
 // text as an #include would.
 import simsys.config;
+import simsys.core;
 import simsys.engine;
 import simsys.graph;
 import simsys.model;
@@ -89,10 +91,12 @@ report::Summary run_summary(const graph::Graph& g, engine::Simulation& sim,
     if (twin_record != nullptr) twin.observe(*twin_record);
     if (observers.series != nullptr) observers.series->observe(record);
     if (observers.series_ops != nullptr) observers.series_ops->observe(record);
+    if (observers.frames != nullptr) observers.frames->observe(record);
   };
   // C++20 designated initializers: the members named at the call site, in declaration order,
   // replacing a positional `{duration, step}` where a reader must remember which is which.
   sim.run({.duration = scenario.duration, .step = scenario.step}, observe);
+  if (observers.frames != nullptr) observers.frames->finish();
   // What each scripted fault cost, against the twin, for the reports' block per fault (none
   // without faults).
   summary.set_faults(sim.fault_records(), twin);
@@ -105,6 +109,59 @@ std::expected<report::Summary, std::string> run_summary(const graph::Graph& g,
   // passes an error through untouched; unlike and_then, the mapping itself cannot fail.
   return create_simulation(g, path).transform(
       [&](engine::Simulation sim) { return run_summary(g, sim); });
+}
+
+// ---- `run --stream` ----
+
+std::expected<std::size_t, std::string> bucket_for_points(std::size_t steps, long long points) {
+  if (points < 1 || points > static_cast<long long>(max_points)) {
+    return std::unexpected(std::format("--points must be between 1 and {}", max_points));
+  }
+  const auto n = static_cast<std::size_t>(points);
+  return std::max<std::size_t>((steps + n - 1) / n, 1);
+}
+
+std::expected<std::size_t, std::string> bucket_for_every(SimTime step, SimTime duration,
+                                                         SimTime every,
+                                                         std::string_view every_text) {
+  if (every.count() <= 0) {
+    return std::unexpected(std::format("--every {}: a bucket needs a length", every_text));
+  }
+  if (every.count() > duration.count()) {
+    return std::unexpected(std::format("--every {} is longer than the run ({})", every_text,
+                                       describe_duration(duration)));
+  }
+  if (every.count() % step.count() != 0) {
+    return std::unexpected(std::format("--every {}: not a whole number of {} steps", every_text,
+                                       describe_duration(step)));
+  }
+  return static_cast<std::size_t>(every.count() / step.count());
+}
+
+std::size_t frame_count(std::size_t steps, std::size_t steps_per_bucket) {
+  return (steps + steps_per_bucket - 1) / steps_per_bucket;
+}
+
+std::size_t steps_of(const graph::Graph& g) {
+  const auto duration = g.scenario().duration.count();
+  const auto step = g.scenario().step.count();
+  return static_cast<std::size_t>((duration + step - 1) / step);
+}
+
+int stream_run(const graph::Graph& g, engine::Simulation& sim, std::size_t steps_per_bucket,
+               const std::function<void(std::string_view)>& write_line) {
+  write_line(
+      report::render_run_line(g, steps_per_bucket, frame_count(steps_of(g), steps_per_bucket)));
+  write_line(report::render_graph_line(g));
+  // Pattern: Strategy — the aggregator's sink is where a frame goes: here, out as a line at once.
+  report::FrameAggregator frames{g, steps_per_bucket, [&](const report::Frame& frame) {
+                                   write_line(report::render_frame_line(frame));
+                                 }};
+  const auto summary = run_summary(g, sim, {.frames = &frames});
+  const auto results = report::evaluate_slos(summary, g.scenario().slos);
+  const int code = report::exit_code(summary, results);
+  write_line(report::render_summary_line(summary, results, code));
+  return code;
 }
 
 // ---- the worker pool ----------------------------------------------------------------------------

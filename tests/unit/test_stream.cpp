@@ -59,14 +59,15 @@ std::string scratch_scenario(std::string_view name, std::string_view yaml) {
 }
 
 // A minute of 100 MB/s over a 1 Gbit/s pipe into a service that is down from 20 s to 30 s: a link
-// row, a fault block and an SLO in one small report.
+// row, a fault block and an SLO in one small report. The service's room of 500 fills in the
+// outage's first 5 s (100 requests/s), so it drops the other 500: a drop total to check.
 constexpr std::string_view probe_yaml = R"(version: 1
 name: probe
 duration: 1m
 warmup: 5s
 nodes:
   users: {type: client, rate: {base: 100/s}, ops: {get: 1}, sizes: {get: 1MB}}
-  api: {type: service, capacity: 1k/s, latency: 1ms}
+  api: {type: service, capacity: 1k/s, latency: 1ms, advanced: {queue_limit: 500}}
 links:
   - {from: users, to: api, dir: inout, bandwidth: 1Gbit/s}
 faults: [{at: 20s, kind: node_down, node: api, for: 10s}]
@@ -769,7 +770,8 @@ TEST_CASE("a bucket of N points is the steps over N, rounded up", "[stream]") {
   CHECK(*simsys::session::bucket_for_points(72'000, 720) == 100);
   CHECK(*simsys::session::bucket_for_points(600, 1000) == 1);  // fewer steps than points
   CHECK(*simsys::session::bucket_for_points(600, 7) == 86);    // ceil(600 / 7)
-  CHECK(simsys::session::frame_count(600, 7) == 7);            // ceil(600 / 86)
+  CHECK(simsys::session::frame_count(600, 86) == 7);           // ceil(600 / 86): 7 points
+  CHECK(simsys::session::frame_count(600, 7) == 86);           // ceil(600 / 7)
   CHECK(simsys::session::frame_count(600, 1) == 600);
   CHECK(simsys::session::bucket_for_points(600, 0).error() ==
         "--points must be between 1 and 100000");

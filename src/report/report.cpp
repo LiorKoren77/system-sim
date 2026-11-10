@@ -2701,6 +2701,11 @@ std::string render_json(const Summary& summary, std::span<const SloResult> slos)
   return json_document(format_version, json_report_lines(summary, slos));
 }
 
+int exit_code(const Summary& summary, std::span<const SloResult> results) {
+  if (summary.observed_steps() == 0) return 1;
+  return all_pass(results) ? 0 : 2;
+}
+
 std::string render_json_line(const Summary& summary, std::span<const SloResult> slos) {
   return json_on_one_line(render_json(summary, slos));
 }
