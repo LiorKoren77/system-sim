@@ -86,6 +86,8 @@ struct BothReports {
   std::string line;
 };
 
+// C++20 designated initializers below (`{.pretty = ..., .line = ...}`): each member named where the
+// value is built, replacing positional braces where a reader must remember which string is which.
 BothReports reports_of(const std::string& path) {
   const auto g = graph_of(path);
   const auto summary = simsys::session::run_summary(g, path);
@@ -133,6 +135,8 @@ std::size_t occurrences(std::string_view text, std::string_view word) {
 
 TEST_CASE("a run's JSON report names the output format it follows, first", "[stream]") {
   const auto json = reports_of(shipped("tutorial/chain/scenario.yaml")).pretty;
+  // C++20 std::string::starts_with: a prefix test without the old `rfind(prefix, 0) == 0` or a
+  // compare on a substring.
   CHECK(json.starts_with("{\n  \"format_version\": 1,\n  \"scenario\": \"chain\","));
   CHECK(occurrences(json, "format_version") == 1);
   CHECK(simsys::report::format_version == 1);
@@ -187,12 +191,12 @@ TEST_CASE("the probe's one-line report keeps its link, its fault block and its S
 }
 
 TEST_CASE("a space inside a JSON string survives the one-line layout", "[stream]") {
-  // The fault block's texts and the SLO notes carry spaces; only the layout's whitespace goes.
-  const auto reports = reports_of(scratch_scenario("probe", probe_yaml));
-  const auto pretty = YAML::Load(reports.pretty);
-  const auto line = YAML::Load(reports.line);
-  CHECK(line["faults"][0]["kind"].Scalar() == pretty["faults"][0]["kind"].Scalar());
-  CHECK(same_tree(line["slo"], pretty["slo"]));
+  // Only the layout's whitespace goes: a scenario named with spaces keeps them.
+  std::string yaml{probe_yaml};
+  yaml.replace(yaml.find("name: probe"), 11, "name: a probe  with spaces");
+  const auto reports = reports_of(scratch_scenario("spaced", yaml));
+  CHECK(YAML::Load(reports.line)["scenario"].Scalar() == "a probe  with spaces");
+  CHECK(same_tree(YAML::Load(reports.line), YAML::Load(reports.pretty)));
 }
 
 // ---- the resolved graph as JSON (Task 2) --------------------------------------------------------
@@ -252,7 +256,9 @@ TEST_CASE("explain's JSON lists the chain's nodes in the engine's order with the
   CHECK(api["red"].as<double>() == 0.9);
   CHECK(api["queue_limit"].as<double>() == 1000);             // the default
   CHECK(doc["nodes"][2]["queue_limit"].as<double>() == 500);  // the scenario's
-  CHECK(scalars(doc["datacenters"]) == std::vector<std::string>{"main"});
+  REQUIRE(doc["datacenters"].size() == 1);
+  CHECK(doc["datacenters"][0]["name"].Scalar() == "main");
+  CHECK(api["shards"].IsNull());
 }
 
 TEST_CASE("explain's JSON gives each link its direction, one-way latency and bandwidth",
@@ -373,7 +379,9 @@ StepRecord record_at(int k, const NodeSample& s) {
 }
 
 NodeSample serving(double rho, double drain = 0.0, double latency_s = 0.001) {
-  NodeSample sample{.drain_per_s = drain, .rho = rho};
+  NodeSample sample{};
+  sample.drain_per_s = drain;
+  sample.rho = rho;
   sample.latency.mean_s = latency_s;
   return sample;
 }
@@ -506,4 +514,42 @@ TEST_CASE("finish hands over nothing when the last bucket was full, or a second 
 
 TEST_CASE("a bucket of no step size is refused: a programmer error", "[stream]") {
   CHECK_THROWS_AS((FrameAggregator{probe_graph(), 0, [](const Frame&) {}}), std::invalid_argument);
+}
+
+TEST_CASE("explain's JSON gives a sharded database its shards beside its copies", "[stream]") {
+  const auto doc = graph_json_of("book/url-shortener/scenario.yaml");
+  const auto db = entry(doc["nodes"], "id", "url_db");
+  CHECK(db["shards"].as<int>() == 3);
+  CHECK(db["replicas"].as<int>() == 3);                // a primary and two read replicas per shard
+  CHECK(db["capacity_per_s"].as<double>() == 45'000);  // 3 copies x 3 shards x 5k/s
+}
+
+TEST_CASE("explain's JSON gives an instant fault no duration", "[stream]") {
+  const auto path = scratch_scenario("flush", R"(version: 1
+name: flush
+duration: 1m
+nodes:
+  users: {type: client, rate: {base: 100/s}, ops: {get: 1}, keys: {zipf: 0.8, space: 1M}}
+  c: {type: cache, strategy: read_through, backend: origin, keys: 10k, hit_ratio: che}
+  origin: {type: service, capacity: 100k/s, latency: 1ms}
+links:
+  - {from: users, to: c, dir: inout}
+  - {from: c, to: origin, dir: inout}
+faults: [{at: 20s, kind: cache_flush, node: c}]
+)");
+  const auto doc = YAML::Load(simsys::report::render_graph_json(graph_of(path)));
+  REQUIRE(doc["faults"].size() == 1);
+  CHECK(doc["faults"][0]["kind"].Scalar() == "cache_flush");
+  CHECK(doc["faults"][0]["for_s"].IsNull());
+}
+
+TEST_CASE("explain's JSON lists a client's ops by name whatever order the scenario gave",
+          "[stream]") {
+  auto s = simsys::test_support::mm1(100);
+  s.nodes[0].workload->op_shares = {{"write", 0.25}, {"read", 0.75}};
+  const auto g = *simsys::graph::Graph::build(s);
+  const auto doc = YAML::Load(simsys::report::render_graph_json(g));
+  REQUIRE(doc["ops"].size() == 2);
+  CHECK(doc["ops"][0]["op"].Scalar() == "read");
+  CHECK(doc["ops"][1]["op"].Scalar() == "write");
 }

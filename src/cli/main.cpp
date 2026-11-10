@@ -660,9 +660,14 @@ int run_sweep_command(const std::filesystem::path& file, const SweepArgs& args) 
 }
 
 // The options `estimate` and `run` share.
-void add_report_options(CLI::App& command, ReportOptions& options) {
-  command.add_option("--report", options.format, "output format: table (default) or json")
+// `--report table|json`: every command that can answer in JSON (estimate, run, explain).
+void add_format_option(CLI::App& command, std::string& format) {
+  command.add_option("--report", format, "output format: table (default) or json")
       ->check(CLI::IsMember({"table", "json"}));
+}
+
+void add_report_options(CLI::App& command, ReportOptions& options) {
+  add_format_option(command, options.format);
   command.add_flag("--no-color", options.no_color,
                    "never colour the table (default: colour when stdout is a terminal)");
 }
@@ -760,8 +765,7 @@ int main(int argc, char** argv) {
     add_file_argument(*command, scenario_file);
   auto* curve = add_curve_command(app, curve_args, scenario_file);
   auto* sweep = add_sweep_command(app, sweep_args, scenario_file);
-  explain->add_option("--report", explain_format, "output format: table (default) or json")
-      ->check(CLI::IsMember({"table", "json"}));
+  add_format_option(*explain, explain_format);
   add_report_options(*estimate, report_options);
   estimate->add_option("--at", estimate_at,
                        "the instant to settle at: a clock time (12:00) or a duration from the "
