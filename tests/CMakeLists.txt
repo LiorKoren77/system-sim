@@ -109,6 +109,22 @@ foreach(check warmup over)
                    -DCHECK=${check} -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/run_duration.cmake)
 endforeach()
 
+# simsys run --days, run as a process (phase 5b): its refusals where a user meets them, and one day
+# as the plain run.
+foreach(check needs_day duration one_day)
+  if(check STREQUAL "needs_day")
+    set(name "simsys run --days refuses a scenario that is not a 24 h day")
+  elseif(check STREQUAL "duration")
+    set(name "simsys run --days refuses --duration, since it sets the duration")
+  else()
+    set(name "simsys run --days 1 is the plain run")
+  endif()
+  add_test(NAME "${name}"
+           COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
+                   -DSCENARIOS=${CMAKE_SOURCE_DIR}/scenarios -DCHECK=${check}
+                   -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/run_days.cmake)
+endforeach()
+
 # simsys curve, run as a process: a traffic_spike fault shows on the client's curve exactly as the
 # same `spikes` entry does (phase 3 Task 6's review).
 add_test(NAME "simsys curve applies a traffic_spike fault exactly as a spikes entry"
