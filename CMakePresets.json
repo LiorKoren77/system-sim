@@ -51,10 +51,20 @@
       }
     },
     {
-      "name": "clang19-libcxx-debug",
-      "displayName": "Clang 19 Debug with LLVM's standard library (libc++), the one Emscripten uses",
+      "name": "clang20-debug",
+      "displayName": "Clang 20 Debug with GCC 14's standard library (libstdc++)",
       "inherits": "clang19-debug",
-      "binaryDir": "${sourceDir}/build/clang19-libcxx-debug",
+      "binaryDir": "${sourceDir}/build/clang20-debug",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++-20",
+        "CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS": "clang-scan-deps-20"
+      }
+    },
+    {
+      "name": "clang20-libcxx-debug",
+      "displayName": "Clang 20 Debug with LLVM's standard library (libc++ 20), the one Emscripten uses",
+      "inherits": "clang20-debug",
+      "binaryDir": "${sourceDir}/build/clang20-libcxx-debug",
       "cacheVariables": {
         "CMAKE_CXX_FLAGS": "-stdlib=libc++",
         "CMAKE_EXE_LINKER_FLAGS": "-stdlib=libc++"
@@ -83,8 +93,12 @@
       "configurePreset": "clang19-debug"
     },
     {
-      "name": "clang19-libcxx-debug",
-      "configurePreset": "clang19-libcxx-debug"
+      "name": "clang20-debug",
+      "configurePreset": "clang20-debug"
+    },
+    {
+      "name": "clang20-libcxx-debug",
+      "configurePreset": "clang20-libcxx-debug"
     }
   ],
   "testPresets": [
@@ -144,8 +158,15 @@
       }
     },
     {
-      "name": "clang19-libcxx-debug",
-      "configurePreset": "clang19-libcxx-debug",
+      "name": "clang20-debug",
+      "configurePreset": "clang20-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "clang20-libcxx-debug",
+      "configurePreset": "clang20-libcxx-debug",
       "output": {
         "outputOnFailure": true
       }

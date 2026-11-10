@@ -1540,9 +1540,10 @@ struct NumberAndUnit {
 // The runs' indices in ascending order of their values, equal values in run order.
 [[nodiscard]] std::vector<std::size_t> rank_order(std::span<const double> values) {
   std::vector<std::size_t> order(values.size());
-  // C++23 std::ranges::iota: fills the range with 0, 1, 2, ..., the range itself instead of
-  // std::iota's begin/end pair.
-  std::ranges::iota(order, std::size_t{0});
+  // std::iota (C++11, <numeric>): fills the range with 0, 1, 2, .... Not C++23's std::ranges::iota,
+  // which takes the range itself: LLVM's standard library (libc++ 20, the one Emscripten uses)
+  // lacks it, and one version of the code must build with every toolchain.
+  std::iota(order.begin(), order.end(), std::size_t{0});
   // C++20 std::ranges::stable_sort with a projection: sorts the whole range (no begin/end pair as
   // std::stable_sort takes) and compares what the projection returns, here each run's value, so the
   // comparator stays ranks_before on two doubles instead of a lambda that looks both indices up.
