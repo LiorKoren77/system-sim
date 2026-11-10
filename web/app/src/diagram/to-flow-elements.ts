@@ -11,6 +11,7 @@
 import type { DatasetStore, GraphLine } from "@simsys/stream";
 import { MarkerType, type Edge, type EdgeMarker, type Node } from "@xyflow/react";
 import { categoryOf, type Category } from "./categories";
+import { peaksOf, type Peaks } from "./bars";
 import { copiesAt, type Copies } from "./copies";
 import { absoluteBox, type Layout } from "./layout";
 import { sidesFor, type Side } from "./sides";
@@ -26,6 +27,8 @@ export interface NodeData {
   readonly replicas: number;
   readonly shards: number | null;
   readonly category: Category;
+  readonly yellow: number | null; // the utilisation thresholds of its zones, ticks on its busy bar
+  readonly red: number | null;
 }
 
 // What a node card shows for one frame.
@@ -36,6 +39,11 @@ export interface NodeState {
   readonly rhoPercent: number | null; // the bucket's mean utilisation (drain / capacity)
   readonly offeredPerSecond: number | null; // a client's: the sum of its ops' offered rates
   readonly copies: Copies | null; // how many of its copies are up (copies.ts); null on a client
+  // The bars (bars.ts): utilisation (mean and the bucket's peak); the backlog against the node's own
+  // largest; a client's offered rate against its own busiest frame. null where it does not apply.
+  readonly busy: { readonly mean: number; readonly peak: number } | null;
+  readonly queue: { readonly fill: number; readonly backlog: number } | null;
+  readonly load: number | null;
 }
 
 export function toFlowElements(
@@ -62,6 +70,8 @@ export function toFlowElements(
       replicas: node.replicas,
       shards: node.shards,
       category: categoryOf(node.type),
+      yellow: node.yellow,
+      red: node.red,
     };
     return {
       id: node.id,
@@ -101,16 +111,28 @@ export function nodeStatesAt(
   graph: GraphLine,
   store: DatasetStore,
   frame: number,
+  peaks: Peaks = peaksOf(graph, store),
 ): Map<string, NodeState> {
   const states = new Map<string, NodeState>();
   const copies = copiesAt(graph, store.times()[frame] ?? 0, store.durations()[frame] ?? 0);
   graph.nodes.forEach((node, row) => {
     const isClient = node.type === "client";
+    const value = (name: string) => at(store.nodeColumn(row, name), frame);
+    const mean = value("mean_rho");
+    const peakBacklog = peaks.backlog.get(node.id) ?? 0;
+    const peakOffered = peaks.offered.get(node.id) ?? 0;
+    const offered = isClient ? offeredAt(graph, store, node.id, frame) : null;
     states.set(node.id, {
       zone: isClient ? null : zoneName(graph, at(store.nodeColumn(row, "zone"), frame)),
       rhoPercent: isClient ? null : rhoAt(store, row, frame),
-      offeredPerSecond: isClient ? offeredAt(graph, store, node.id, frame) : null,
+      offeredPerSecond: offered,
       copies: copies.get(node.id) ?? null,
+      busy: isClient || Number.isNaN(mean) ? null : { mean, peak: value("peak_rho") || mean },
+      queue:
+        isClient || !(peakBacklog > 0)
+          ? null
+          : { fill: (value("backlog") || 0) / peakBacklog, backlog: value("backlog") || 0 },
+      load: offered !== null && peakOffered > 0 ? offered / peakOffered : null,
     });
   });
   return states;

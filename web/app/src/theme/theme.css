@@ -20,6 +20,7 @@
   --client-bg: #2a2e33;
   --fault: #ff6b5e;
   --edge: #8a8f96;
+  --surge: #b48cff;
   font-family:
     system-ui,
     -apple-system,
@@ -193,12 +194,20 @@ main h1 .chapter {
   pointer-events: none;
 }
 
-.timeline .fault-mark {
+.timeline .mark {
   position: absolute;
   min-width: 4px;
   height: 7px;
-  background: var(--fault);
   border-radius: 2px;
+}
+
+/* A failure in red; a surge of load in violet, a colour no zone uses: nothing broke. */
+.timeline .mark.failure {
+  background: var(--fault);
+}
+
+.timeline .mark.surge {
+  background: var(--surge);
 }
 
 .timeline .speed {
@@ -255,7 +264,7 @@ main h1 .chapter {
 }
 
 .node-card {
-  height: 96px;
+  height: 108px;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -292,12 +301,6 @@ main h1 .chapter {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.node-card .node-state {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
 }
 
 .zone-pill {
@@ -482,4 +485,76 @@ main h1 .chapter {
 
 .diagram .react-flow__attribution a {
   color: var(--muted);
+}
+
+/* ---- a box's bars ---- */
+.bar-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 16px;
+}
+
+.bar-row .bar {
+  position: relative;
+  flex: 0 0 64px;
+  height: 7px;
+  border-radius: 4px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.bar-row .fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--zone-green);
+  transition: width 250ms ease-out;
+}
+
+.bar-row.busy.zone-yellow .fill {
+  background: var(--zone-yellow);
+}
+
+.bar-row.busy.zone-red .fill {
+  background: var(--zone-red);
+}
+
+.bar-row.load .fill {
+  background: var(--surge);
+}
+
+.bar-row.queue .fill {
+  background: var(--cat-queue);
+}
+
+.bar-row .tick {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 100%;
+  background: var(--bg);
+}
+
+.bar-row .peak {
+  position: absolute;
+  top: -1px;
+  width: 2px;
+  height: 9px;
+  margin-left: -1px;
+  background: var(--ink);
+  transition: left 250ms ease-out;
+}
+
+.bar-row .bar-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bar-row .fill,
+  .bar-row .peak {
+    transition: none;
+  }
 }

@@ -1,11 +1,12 @@
 import type { DatasetStore } from "@simsys/stream";
 import type { Dispatch } from "react";
 import { clockLabel } from "./clock";
+import { timelineMarks } from "./marks";
 import { SPEEDS, type PlayerAction, type PlayerState } from "./player";
 
 // The time bar: play and pause, the clock, the slider over the frames, the speed, and a mark for
-// each scripted fault of the window (its `for` as a band), so the eye knows where to look before it
-// happens.
+// each failure and surge of load in the window (marks.ts; its length as a band), so the eye knows
+// where to look before it happens.
 export function Timeline(props: {
   store: DatasetStore;
   player: PlayerState;
@@ -15,9 +16,7 @@ export function Timeline(props: {
   const { store, player, dispatch, shown } = props;
   const t = store.times()[player.frame] ?? shown.window.from_s;
   const span = shown.window.to_s - shown.window.from_s;
-  const faults = (store.graph?.faults ?? []).filter(
-    (f) => f.at_s >= shown.window.from_s && f.at_s < shown.window.to_s,
-  );
+  const marks = store.graph ? timelineMarks(store.graph, shown.window) : [];
   return (
     <div className="timeline">
       <button
@@ -45,14 +44,14 @@ export function Timeline(props: {
           }}
         />
         <div className="marks" aria-hidden="true">
-          {faults.map((f) => (
+          {marks.map((m) => (
             <span
-              key={`${f.kind}-${f.target}-${f.at_s}`}
-              className="fault-mark"
-              title={`${f.kind} ${f.target}`}
+              key={`${m.kind}-${m.label}-${m.at_s}`}
+              className={`mark ${m.kind}`}
+              title={m.label}
               style={{
-                left: `${((f.at_s - shown.window.from_s) / span) * 100}%`,
-                width: `max(3px, ${(((f.for_s ?? 0) / span) * 100).toFixed(3)}%)`,
+                left: `${((m.at_s - shown.window.from_s) / span) * 100}%`,
+                width: `max(4px, ${((m.for_s / span) * 100).toFixed(3)}%)`,
               }}
             />
           ))}

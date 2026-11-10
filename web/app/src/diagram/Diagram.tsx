@@ -6,6 +6,7 @@ import { layoutGraph, type Layout } from "./layout";
 import { DatacenterBox } from "./DatacenterBox";
 import { NodeCard } from "./NodeCard";
 import { RoutedEdge } from "./RoutedEdge";
+import { peaksOf } from "./bars";
 import { busiestFlow, flowDuration, linkFlowsAt } from "./flow";
 import { FlowContext, FrameContext } from "./frame-context";
 import { nodeStatesAt, pipeZonesAt, toFlowElements, withPipeZones } from "./to-flow-elements";
@@ -59,10 +60,16 @@ export function Diagram(props: {
   );
   // The frame's state. The store mutates as frames arrive; its version marks a change.
   const version = store.version;
-  const states = useMemo(
-    () => (graph ? nodeStatesAt(graph, store, frame) : new Map()),
+  // The bars' scales, over the whole dataset (bars.ts): computed once it has loaded.
+  const peaks = useMemo(
+    () => (graph ? peaksOf(graph, store) : null),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- version stands for the store's contents
-    [graph, store, version, frame],
+    [graph, store, store.status === "ready" ? version : -1],
+  );
+  const states = useMemo(
+    () => (graph && peaks ? nodeStatesAt(graph, store, frame, peaks) : new Map()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- version stands for the store's contents
+    [graph, store, version, frame, peaks],
   );
   // The links' traffic: dash speeds on a scale up to the busiest link of the whole dataset.
   const busiest = useMemo(
