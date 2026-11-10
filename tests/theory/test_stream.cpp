@@ -159,3 +159,44 @@ TEST_CASE("over every bucket the fluid queue conserves flow: in = served + shed 
   // The first bucket: 5 of its 7 steps shed 500/s.
   CHECK_THAT(*run.frames[0].nodes[1].dropped_per_s, WithinRel(500.0 * 5 / 7, 1e-9));
 }
+
+TEST_CASE("a bucket of one step is that step for every client op", "[stream]") {
+  for (const auto* relative : {"tutorial/chain/scenario.yaml", "labs/rate-limiter/scenario.yaml"}) {
+    INFO(relative);
+    const auto g = simsys::session::load_graph(shipped(relative));
+    REQUIRE(g);
+    const auto run = run_and_frames(*g, 1);
+    for (std::size_t k = 0; k < run.records.size(); k += 97) {
+      const auto& responses = run.records[k].responses;
+      REQUIRE(run.frames[k].ops.size() == responses.size());
+      for (std::size_t j = 0; j < responses.size(); ++j) {
+        const auto& op = run.frames[k].ops[j];
+        const auto& r = responses[j];
+        check_equal(op.offered_per_s, r.offered.per_second);
+        check_equal(op.attempts_per_s, r.attempts.per_second);
+        check_equal(op.answered_per_s, r.answered.per_second);
+        check_equal(op.timed_out_per_s, r.timed_out.per_second);
+        if (r.answered.per_second > 0.0) check_equal(op.mean_ms, r.response.mean_s * 1000.0);
+      }
+    }
+  }
+}
+
+TEST_CASE("a constant run's every bucket after warmup has the run's own p99", "[stream]") {
+  // The chain tutorial's rate is constant and has no noise: after its 10 s warmup (100 steps)
+  // every step is the same, so a bucket of 100 steps pools the moments of identical steps and its
+  // p99 is the whole run's (Summary pools the same moments over the observed run).
+  const auto g = simsys::session::load_graph(shipped("tutorial/chain/scenario.yaml"));
+  REQUIRE(g);
+  const auto run = run_and_frames(*g, 100);
+  const auto summary = simsys::session::run_summary(*g, shipped("tutorial/chain/scenario.yaml"));
+  REQUIRE(summary);
+  const auto ops = summary->ops();
+  REQUIRE(run.frames.size() == 12);  // 2 min in buckets of 10 s
+  for (std::size_t k = 1; k < run.frames.size(); ++k) {
+    for (std::size_t j = 0; j < ops.size(); ++j) {
+      CHECK_THAT(*run.frames[k].ops[j].p99_ms, WithinRel(ops[j].p99_s * 1000.0, 1e-9));
+      CHECK_THAT(*run.frames[k].ops[j].mean_ms, WithinRel(ops[j].mean_s * 1000.0, 1e-9));
+    }
+  }
+}
