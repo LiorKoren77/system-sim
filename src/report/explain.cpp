@@ -1928,44 +1928,42 @@ namespace {
 
 // The names of each frame row's numbers, in order (phase 5a spec §6.2): the contract of
 // `run --stream`. A new column is added at the end of its list, never between (schema v1.7).
-constexpr std::array node_columns{"demand_per_s",
-                                  "drain_per_s",
-                                  "dropped_per_s",
-                                  "rejected_per_s",
-                                  "backlog",
-                                  "peak_backlog",
-                                  "mean_rho",
-                                  "peak_rho",
-                                  "zone",
-                                  "red_s",
-                                  "latency_ms",
-                                  "queue_lag_s",
-                                  "connections",
-                                  "dead_lettered_per_s",
-                                  "deduplicated_per_s"};
-constexpr std::array link_columns{"demand_per_s", "drain_per_s", "dropped_per_s", "backlog",
-                                  "peak_backlog", "mean_rho",    "peak_rho",      "zone",
-                                  "red_s",        "latency_ms"};
-constexpr std::array op_columns{"offered_per_s",   "attempts_per_s", "answered_per_s",
-                                "timed_out_per_s", "mean_ms",        "p99_ms"};
+constexpr std::array<std::string_view, 15> node_columns{"demand_per_s",
+                                                        "drain_per_s",
+                                                        "dropped_per_s",
+                                                        "rejected_per_s",
+                                                        "backlog",
+                                                        "peak_backlog",
+                                                        "mean_rho",
+                                                        "peak_rho",
+                                                        "zone",
+                                                        "red_s",
+                                                        "latency_ms",
+                                                        "queue_lag_s",
+                                                        "connections",
+                                                        "dead_lettered_per_s",
+                                                        "deduplicated_per_s"};
+constexpr std::array<std::string_view, 10> link_columns{
+    "demand_per_s", "drain_per_s", "dropped_per_s", "backlog", "peak_backlog",
+    "mean_rho",     "peak_rho",    "zone",          "red_s",   "latency_ms"};
+constexpr std::array<std::string_view, 6> op_columns{
+    "offered_per_s", "attempts_per_s", "answered_per_s", "timed_out_per_s", "mean_ms", "p99_ms"};
 // The columns that are estimates, not exact consequences of the fluid model: the lognormal fit's
 // percentiles (spec §3.5), labelled "estimated" wherever they are shown.
-constexpr std::array estimated_columns{"p99_ms"};
-// A frame's `zone` is the zone's number (fluid::Zone's order); this list gives the names.
-constexpr std::array zone_names{"green", "yellow", "red"};
+constexpr std::array<std::string_view, 1> estimated_columns{"p99_ms"};
 
-// `"a", "b"` as a JSON array of strings.
-template <std::size_t N>
-[[nodiscard]] std::string json_strings(const std::array<const char*, N>& names) {
-  std::vector<std::string> quoted;
-  for (const auto* name : names) quoted.push_back(json_string(name));
-  return "[" + join(quoted, ", ") + "]";
+// A frame's `zone` is the zone's number, fluid::Zone's underlying value; this list gives the name
+// of each number, as every report spells it (zone_name).
+[[nodiscard]] std::vector<std::string_view> zone_names() {
+  using enum fluid::Zone;
+  return {zone_name(green), zone_name(yellow), zone_name(red)};
 }
 
-[[nodiscard]] std::string json_strings(std::span<const std::string> names) {
-  std::vector<std::string> quoted;
-  for (const auto& name : names) quoted.push_back(json_string(name));
-  return "[" + join(quoted, ", ") + "]";
+// A datacenter: an object, not a bare name, so that what a later version adds about it (a region,
+// a state over time) is a new key, not a new type (the contract's rule 2). The latencies between
+// datacenters are on the links (each link's one_way_s), the numbers the engine uses.
+[[nodiscard]] std::string json_graph_datacenter(const std::string& name) {
+  return json_object(std::vector<std::string>{json_field("name", json_string(name))});
 }
 
 // A node: what a diagram needs to draw and label it. A client serves nothing, so its capacity,
@@ -1979,7 +1977,11 @@ template <std::size_t N>
       json_field("id", json_string(spec.id)),
       json_field("type", json_string(model::to_string(spec.type))),
       json_field("datacenter", json_string(spec.dc)),
+      // The copies of one shard (a kv_cluster's machines), and the shards of a sharded database
+      // (null elsewhere): capacity_per_s is the total over all of them, replicas x shards x one
+      // copy's rate (total_capacity), the number explain's check line holds the load against.
       json_field("replicas", std::to_string(model::copies_of(spec))),
+      json_field("shards", spec.shards ? std::to_string(*spec.shards) : "null"),
       json_field("capacity_per_s", client ? "null" : json_number(total_capacity(node))),
       json_field("unit", unit ? json_string(*unit) : "null"),
       json_field("yellow", client ? "null" : json_number(node.capacity.yellow)),
@@ -2015,7 +2017,11 @@ template <std::size_t N>
   std::vector<std::string> ops;
   for (const auto& node : g.nodes()) {
     if (!node.spec.workload) continue;
-    for (const auto& [op, share] : node.spec.workload->op_shares) {
+    // Sorted by op here, as the engine sorts them (ClientBehaviour), not trusted to arrive sorted:
+    // a Graph built in code may list them in any order.
+    auto shares = node.spec.workload->op_shares;
+    std::ranges::sort(shares);
+    for (const auto& [op, share] : shares) {
       ops.push_back(json_object(std::vector<std::string>{
           json_field("client", json_string(node.spec.id)), json_field("op", json_string(op)),
           json_field("share", json_number(share))}));
@@ -2038,20 +2044,15 @@ template <std::size_t N>
 }
 
 // A scripted fault: its kind, what it strikes (a node, or a datacenter for dc_down), when and for
-// how long, in seconds from the run's start (t = 0 is midnight).
+// how long, in seconds from the run's start (t = 0 is midnight). An instant fault (a cache flush)
+// lasts no time: its for_s is null, as the run report's fault block writes it.
 [[nodiscard]] std::string json_graph_fault(const model::Fault& fault) {
   const auto& target = fault.kind == model::FaultKind::dc_down ? fault.datacenter : fault.node;
+  const auto lasting = model::lasts(fault.kind);
   return json_object(std::vector<std::string>{
       json_field("kind", json_string(model::to_string(fault.kind))),
       json_field("target", json_string(target)), json_field("at_s", json_number(seconds(fault.at))),
-      json_field("for_s", json_number(seconds(fault.duration)))});
-}
-
-template <class T, class F>
-[[nodiscard]] std::vector<std::string> each_as_json(std::span<const T> items, F to_json) {
-  std::vector<std::string> out;
-  for (const auto& item : items) out.push_back(to_json(item));
-  return out;
+      json_field("for_s", lasting ? json_number(seconds(fault.duration)) : "null")});
 }
 
 }  // namespace
@@ -2060,27 +2061,26 @@ std::vector<std::string> graph_json_fields(const graph::Graph& g) {
   const auto& scenario = g.scenario();
   std::vector<std::string> links;
   for (const auto& link : g.links()) links.push_back(json_graph_link(g.nodes(), link));
-  return {"  " + json_field("scenario", json_string(scenario.name)),
-          "  " + json_field("datacenters", json_strings(scenario.datacenters)),
-          "  " + json_field("zones", json_strings(zone_names)),
-          json_array("nodes", each_as_json(g.nodes(), json_graph_node)),
-          json_array("links", links),
-          json_array("ops", json_graph_ops(g)),
-          json_array("slos",
-                     each_as_json(std::span<const model::SloSpec>{scenario.slos}, json_graph_slo)),
-          json_array("faults", each_as_json(std::span<const model::Fault>{scenario.faults},
-                                            json_graph_fault)),
-          "  " + json_field("node_columns", json_strings(node_columns)),
-          "  " + json_field("link_columns", json_strings(link_columns)),
-          "  " + json_field("op_columns", json_strings(op_columns)),
-          "  " + json_field("estimated_columns", json_strings(estimated_columns))};
+  return {
+      "  " + json_field("scenario", json_string(scenario.name)),
+      json_array("datacenters", map_to_strings(std::span<const std::string>{scenario.datacenters},
+                                               json_graph_datacenter)),
+      "  " + json_field("zones", json_strings(zone_names())),
+      json_array("nodes", map_to_strings(g.nodes(), json_graph_node)),
+      json_array("links", links),
+      json_array("ops", json_graph_ops(g)),
+      json_array("slos",
+                 map_to_strings(std::span<const model::SloSpec>{scenario.slos}, json_graph_slo)),
+      json_array("faults",
+                 map_to_strings(std::span<const model::Fault>{scenario.faults}, json_graph_fault)),
+      "  " + json_field("node_columns", json_strings(node_columns)),
+      "  " + json_field("link_columns", json_strings(link_columns)),
+      "  " + json_field("op_columns", json_strings(op_columns)),
+      "  " + json_field("estimated_columns", json_strings(estimated_columns))};
 }
 
 std::string render_graph_json(const graph::Graph& g) {
-  auto fields = graph_json_fields(g);
-  fields.insert(fields.begin(),
-                "  " + json_field("format_version", std::to_string(format_version)));
-  return "{\n" + join(fields, ",\n") + "\n}";
+  return json_document(format_version, graph_json_fields(g));
 }
 
 std::string render_explain(const graph::Graph& g) {

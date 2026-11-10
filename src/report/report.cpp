@@ -1460,13 +1460,6 @@ void json_storm(const engine::FaultAfter& after, std::vector<std::string>& field
   return json_object(fields);
 }
 
-// C++20 std::views::transform + C++23 std::ranges::to: map every element through `f` and
-// collect the results into a vector, replacing a reserve + push_back loop.
-template <class T, class F>
-[[nodiscard]] std::vector<std::string> map_to_strings(std::span<const T> items, F f) {
-  return items | std::views::transform(f) | std::ranges::to<std::vector<std::string>>();
-}
-
 // The top-level lines of a run's JSON report, one key each, the `slo` array's objects given
 // (json_slo's, or with a replication's median_seed). With no observed step the drop and reject
 // rates are null: there is no data, not a rate of 0.
@@ -1478,10 +1471,11 @@ template <class T, class F>
   const bool observed = summary.observed_steps() > 0;
   const auto worst = summary.worst_drop_node();
   const auto worst_rejecting = summary.worst_reject_node();
+  const std::string steps_line =
+      "  " + json_field("steps", std::to_string(summary.observed_steps()));
   std::vector<std::string> lines{
-      "  " + json_field("format_version", std::to_string(format_version)),
       "  " + json_field("scenario", json_string(summary.scenario_name())),
-      "  " + json_field("steps", std::to_string(summary.observed_steps())),
+      steps_line,
       "  " + json_field("drop_rate", observed ? json_number(summary.drop_rate()) : "null"),
       "  " + json_field("worst_drop_node", worst.empty() ? "null" : json_string(worst)),
       "  " + json_field("reject_rate", observed ? json_number(summary.reject_rate()) : "null"),
@@ -1495,7 +1489,7 @@ template <class T, class F>
       json_array("slo", slo_objects)};
   // estimate only, after `steps`: the instant it settled at, in seconds (`--at`; 0 without it).
   if (summary.is_estimate()) {
-    lines.insert(lines.begin() + 3,
+    lines.insert(std::ranges::find(lines, steps_line) + 1,
                  "  " + json_field("at_s", json_number(seconds(summary.estimate_at()))));
   }
   if (summary.faults().empty()) return lines;
@@ -1513,11 +1507,6 @@ template <class T, class F>
 [[nodiscard]] std::vector<std::string> json_report_lines(const Summary& summary,
                                                          std::span<const SloResult> slos) {
   return json_report_lines(summary, map_to_strings(slos, json_slo));
-}
-
-// The lines as one JSON object, a key per line.
-[[nodiscard]] std::string json_document(std::span<const std::string> lines) {
-  return "{\n" + join(lines, ",\n") + "\n}";
 }
 
 // ---- replications (`run --replications`: report.cppm says what the cells and the verdicts are) --
@@ -2695,7 +2684,7 @@ std::string format_clock(SimTime t) {
 }
 
 std::string render_json(const Summary& summary, std::span<const SloResult> slos) {
-  return json_document(json_report_lines(summary, slos));
+  return json_document(format_version, json_report_lines(summary, slos));
 }
 
 std::string render_json_line(const Summary& summary, std::span<const SloResult> slos) {
@@ -2791,7 +2780,7 @@ std::string render_replications_json(const ReplicationSummary& replicated,
   // median run's report, faults included, then the one key a replication adds.
   auto lines = json_report_lines(median, json_replicated_slos(replicated));
   lines.push_back(json_replications(replicated, some_gateway(median.graph())));
-  return json_document(lines);
+  return json_document(format_version, lines);
 }
 
 double op_latency_s(const OpSummary& op, OpLatency column) {

@@ -366,6 +366,30 @@ constexpr std::string_view ansi_reset = "\x1b[0m";
   return "  " + json_field(name, "[\n    " + join(objects, ",\n    ") + "\n  ]");
 }
 
+// C++20 std::views::transform + C++23 std::ranges::to: map every element through `f` and
+// collect the results into a vector, replacing a reserve + push_back loop.
+template <class T, class F>
+[[nodiscard]] std::vector<std::string> map_to_strings(std::span<const T> items, F f) {
+  return items | std::views::transform(f) | std::ranges::to<std::vector<std::string>>();
+}
+
+// A document of simsys's JSON output: `format_version` first (the output contract's version,
+// report::format_version, written here once for every document), then the given lines, one
+// top-level key each. The version is passed in: this partition cannot see the interface's
+// exported constant (the top of the file says why).
+[[nodiscard]] std::string json_document(int version, std::span<const std::string> lines) {
+  return "{\n  " + json_field("format_version", std::to_string(version)) + ",\n" +
+         join(lines, ",\n") + "\n}";
+}
+
+// A JSON array of strings: `["a", "b"]`, from any range of things a string_view takes.
+template <class Names>
+[[nodiscard]] std::string json_strings(const Names& names) {
+  std::vector<std::string> quoted;
+  for (const auto& name : names) quoted.push_back(json_string(name));
+  return "[" + join(quoted, ", ") + "]";
+}
+
 // ---- the unit of a node's work ----
 
 // "delete, insert, update, write cost 5" ("a cost 2 and b cost 3" for two costs): a node's ops that
