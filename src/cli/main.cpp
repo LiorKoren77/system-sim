@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <expected>
 #include <filesystem>
 #include <format>
@@ -103,8 +104,7 @@ int print_report(const report::Summary& summary, const ReportOptions& options) {
   } else {
     std::print("{}", report::render_table(summary, results, use_color(options)));
   }
-  if (summary.observed_steps() == 0) return 1;
-  return report::all_pass(results) ? 0 : 2;
+  return report::exit_code(summary, results);
 }
 
 // `simsys validate <file>`: structural check of one scenario.
@@ -231,6 +231,10 @@ struct RunArgs {
   std::optional<int> seed{};                // overrides the scenario's (see load_for_run)
   std::optional<int> replications{};        // runs over seeds seed .. seed + N - 1 (run_replicated)
   std::size_t jobs{simsys::sweep::default_jobs()};  // the replications' worker threads
+  bool stream{};                       // `--stream`: the run as lines of JSON (run_streamed)
+  std::optional<long long> points{};   // `--points N`: at most N frames
+  std::optional<std::string> every{};  // `--every <duration>`: a frame per bucket of that length
+  bool report_given{};                 // `--report` was on the command line (--stream refuses it)
 };
 
 // The largest --replications. Chosen, not from the book: a nearest-rank 10-90 % band needs ten
@@ -275,13 +279,22 @@ std::string duration_refusal(const std::filesystem::path& file, const std::strin
 // rule); `--seed` replaces the scenario's before the graph is built: the engine
 // seeds every client's noise from Graph::scenario().seed (workload::client_seed), so replacing
 // it any later would not reach the clients.
-std::expected<graph::Graph, std::string> load_for_run(const std::filesystem::path& file,
-                                                      const RunArgs& args) {
+// Why `run` cannot start: the message stderr prints, and where the loader put the blame (line and
+// column 0 when it names none: a bad flag, the graph builder's refusals), which `--stream`'s error
+// line carries for an editor to jump to.
+struct RunRefusal {
+  std::string text;
+  int line{};
+  int column{};
+};
+
+std::expected<graph::Graph, RunRefusal> load_for_run(const std::filesystem::path& file,
+                                                     const RunArgs& args) {
   std::vector<simsys::config::Override> overrides;
   if (args.duration) {
     if (auto refused = unparsable_duration(file, *args.duration)) {
       // C++23 std::unexpected<E>: wraps the error so it converts to any std::expected<T, E>.
-      return std::unexpected(std::move(*refused));
+      return std::unexpected(RunRefusal{.text = std::move(*refused)});
     }
     // C++20 designated initializers: the members named where the value is built, in declaration
     // order, replacing positional braces where a reader must remember which string is which.
@@ -289,11 +302,15 @@ std::expected<graph::Graph, std::string> load_for_run(const std::filesystem::pat
   }
   auto scenario = simsys::config::load(file.string(), overrides);
   if (!scenario) {
-    return std::unexpected(args.duration ? duration_refusal(file, *args.duration, scenario.error())
-                                         : describe(scenario.error()));
+    const auto& refused = scenario.error();
+    return std::unexpected(RunRefusal{
+        .text = args.duration ? duration_refusal(file, *args.duration, refused) : describe(refused),
+        .line = refused.line,
+        .column = refused.column});
   }
   if (args.seed) scenario->seed = *args.seed;
-  return simsys::session::build_graph(file.string(), std::move(*scenario));
+  return simsys::session::build_graph(file.string(), std::move(*scenario))
+      .transform_error([](std::string text) { return RunRefusal{.text = std::move(text)}; });
 }
 
 // Opens `path` for a series file (`--series`, `--series-ops`), or says why it cannot.
@@ -402,15 +419,110 @@ int run_replicated(const graph::Graph& g, int count, const RunArgs& args,
 // and a different seed is not").
 // With `--replications N`, N > 1, the scenario runs N times (run_replicated), or once with a note
 // when nothing in it is random.
+// ---- `run --stream` (phase 5a spec §4, §6): the run as lines of JSON for a web server ----
+
+// One line of the stream on stdout, written whole and flushed at once: the server reading the pipe
+// sees each frame when it is made, and a process stopped mid-run leaves at most a partial last
+// line. std::fwrite and std::fflush, not std::print: one call per line, nothing buffered behind it.
+void write_stream_line(std::string_view line) {
+  std::string text{line};
+  text += '\n';
+  std::fwrite(text.data(), 1, text.size(), stdout);
+  std::fflush(stdout);
+}
+
+// Why the stream cannot start, as its one error line: the scenario file, the line and column the
+// loader blamed (0 when none), and the message stderr would have printed.
+int stream_refusal(const std::filesystem::path& file, const RunRefusal& refusal) {
+  write_stream_line(
+      report::render_error_line(file.string(), refusal.line, refusal.column, refusal.text));
+  return 1;
+}
+
+// What `--points` and `--every` are refused for, `--stream` or not: either without `--stream`, both
+// at once, and with `--stream` every flag whose output the stream already carries (the report, the
+// series) or that runs more than one run (`--replications`).
+std::optional<std::string> stream_flags_refused(const std::filesystem::path& file,
+                                                const RunArgs& args) {
+  const auto refused = [&](std::string_view why) {
+    return std::format("{}: error: {}", file.string(), why);
+  };
+  if (!args.stream) {
+    if (args.points) return refused("--points needs --stream");
+    if (args.every) return refused("--every needs --stream");
+    return std::nullopt;
+  }
+  if (args.points && args.every) {
+    return refused("--points and --every both set the bucket; give one");
+  }
+  const std::array carried{std::pair{"--series", args.series.has_value()},
+                           std::pair{"--series-ops", args.series_ops.has_value()},
+                           std::pair{"--report", args.report_given},
+                           std::pair{"--replications", args.replications.has_value()}};
+  for (const auto& [flag, given] : carried) {
+    if (given) {
+      return refused(std::format("--stream carries the report and the series; drop {}", flag));
+    }
+  }
+  return std::nullopt;
+}
+
+// The steps of one bucket: `--every`'s length, or the steps over `--points` (default 720).
+std::expected<std::size_t, RunRefusal> bucket_of(const std::filesystem::path& file,
+                                                 const graph::Graph& g, const RunArgs& args) {
+  const auto refused = [&](const std::string& why) {
+    return std::unexpected(RunRefusal{.text = std::format("{}: error: {}", file.string(), why)});
+  };
+  if (args.every) {
+    const auto every = simsys::parse_duration(*args.every);
+    if (!every) return refused(std::format("--every '{}': {}", *args.every, every.error().message));
+    const auto& scenario = g.scenario();
+    const auto steps =
+        simsys::session::bucket_for_every(scenario.step, scenario.duration, *every, *args.every);
+    if (!steps) return refused(steps.error());
+    return *steps;
+  }
+  const auto steps = simsys::session::bucket_for_points(
+      simsys::session::steps_of(g),
+      args.points.value_or(static_cast<long long>(simsys::session::default_points)));
+  if (!steps) return refused(steps.error());
+  return *steps;
+}
+
+// `simsys run <file> --stream`: stdout carries nothing but the stream's lines
+// (session::stream_run), and every way it can fail is an error line there, so the server always
+// learns why a stream ended early: a refused flag or scenario, an engine that cannot run it, or a
+// programmer error (an exception) during the run. stderr stays empty. Exit codes as `run`'s.
+int run_streamed(const std::filesystem::path& file, const RunArgs& args) {
+  const auto g = load_for_run(file, args);
+  if (!g) return stream_refusal(file, g.error());
+  auto sim = simsys::session::create_simulation(*g, file.string());
+  if (!sim) return stream_refusal(file, RunRefusal{.text = sim.error()});
+  const auto steps = bucket_of(file, *g, args);
+  if (!steps) return stream_refusal(file, steps.error());
+  try {
+    return simsys::session::stream_run(*g, *sim, *steps, write_stream_line);
+  } catch (const std::exception& e) {
+    return stream_refusal(
+        file, RunRefusal{.text = std::format("{}: error: {}", file.string(), e.what())});
+  }
+}
+
 int run_scenario(const std::filesystem::path& file, const RunArgs& args,
                  const ReportOptions& options) {
+  if (const auto refused = stream_flags_refused(file, args)) {
+    if (args.stream) return stream_refusal(file, RunRefusal{.text = *refused});
+    print_error(*refused);
+    return 1;
+  }
+  if (args.stream) return run_streamed(file, args);
   if (const auto refused = replications_refused(file, args)) {
     print_error(*refused);
     return 1;
   }
   const auto g = load_for_run(file, args);
   if (!g) {
-    print_error(g.error());
+    print_error(g.error().text);
     return 1;
   }
   auto sim = simsys::session::create_simulation(*g, file.string());
@@ -691,6 +803,13 @@ void add_run_options(CLI::App& run, RunArgs& args) {
                  "worker threads for --replications, ignored without --replications (default: the "
                  "machine's hardware threads)")
       ->check(CLI::Range(std::size_t{1}, simsys::sweep::max_jobs));
+  run.add_flag("--stream", args.stream,
+               "write the run as lines of JSON on stdout as it goes: a run line, the graph, a "
+               "frame per bucket of steps, the report (for a web frontend)");
+  run.add_option("--points", args.points,
+                 "with --stream: at most N frames, the steps over N each (default 720)");
+  run.add_option("--every", args.every,
+                 "with --stream: a frame per bucket of this length, a whole number of steps");
 }
 
 CLI::App* add_curve_command(CLI::App& app, CurveArgs& args, std::filesystem::path& file) {
@@ -776,6 +895,17 @@ int main(int argc, char** argv) {
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
+    // Under --stream even a command line CLI11 refuses is an error line on stdout (spec §6.5): the
+    // server reads only stdout. Asked by name in argv, since the parse that would say so failed.
+    // C++20 std::ranges::find over the arguments as a std::span (C++20): no begin/end pair.
+    const std::span arguments{argv, static_cast<std::size_t>(argc)};
+    const bool streamed =
+        std::ranges::find(arguments, std::string_view{"--stream"},
+                          [](const char* a) { return std::string_view{a}; }) != arguments.end();
+    if (streamed && e.get_exit_code() != 0) {
+      write_stream_line(report::render_error_line(std::nullopt, 0, 0, e.what()));
+      return 1;
+    }
     // app.exit prints help / version / the error exactly as CLI11 intends; its own error
     // codes (105, 106, ...) are folded into our 1 so scripts see one documented contract.
     return app.exit(e) == 0 ? 0 : 1;
@@ -784,6 +914,7 @@ int main(int argc, char** argv) {
   if (validate->parsed()) return run_validate(scenario_file);
   if (explain->parsed()) return run_explain(scenario_file, explain_format);
   if (estimate->parsed()) return run_estimate(scenario_file, report_options, estimate_at);
+  run_args.report_given = run->count("--report") > 0;
   if (run->parsed()) return run_scenario(scenario_file, run_args, report_options);
   if (curve->parsed()) return run_curve(scenario_file, curve_args);
   if (sweep->parsed()) return run_sweep_command(scenario_file, sweep_args);

@@ -511,6 +511,9 @@ class Summary {
 [[nodiscard]] std::vector<SloResult> evaluate_slos(const Summary& summary,
                                                    std::span<const model::SloSpec> slos);
 [[nodiscard]] bool all_pass(std::span<const SloResult> results);  // skipped counts as pass
+// `simsys run`'s exit code for a summary and its SLO verdicts: 0 every SLO passed (skipped counts
+// as passed), 2 one failed, 1 when no step was observed (no data is an error, not a pass).
+[[nodiscard]] int exit_code(const Summary& summary, std::span<const SloResult> results);
 
 // For people: a header line, a node table (rho cells coloured by zone when `color`), an
 // op table with estimated percentiles, and the SLO verdicts.
@@ -822,6 +825,32 @@ struct Frame {
 // bucket when the run's steps did not fill it (nothing otherwise, and nothing the second time). `g`
 // must outlive the aggregator; a bucket of 0 steps is a programmer error (std::invalid_argument).
 // Not copyable: it is watched by pointer, like the series writers.
+// ---- the lines of `run --stream` (phase 5a spec §6) ----
+//
+// One JSON object per line, each with a `type`, no whitespace between tokens: a reader splits the
+// stream on newlines and parses each line alone, and a process stopped mid-write leaves at most a
+// partial last line, which it drops. The order: `run`, `graph`, the `frame`s in time order, then
+// `summary`; or an `error` at any point, after which nothing follows. Each line comes without its
+// newline.
+
+// The run's header: the version of the output contract, the scenario, its seed, its length, step
+// and warmup in seconds, a bucket's length (`steps_per_bucket` steps) and how many frames follow.
+[[nodiscard]] std::string render_run_line(const graph::Graph& g, std::size_t steps_per_bucket,
+                                          std::size_t frames);
+// The resolved graph (render_graph_json's keys), at revision 0, the scenario as loaded: a later
+// change of topology mid-run would send another `graph` with the next revision.
+[[nodiscard]] std::string render_graph_line(const graph::Graph& g);
+// A bucket: its start and length in seconds, then its rows of numbers in the graph's column order
+// (`node_columns`, `link_columns`, `op_columns`), null where a row has no such value.
+[[nodiscard]] std::string render_frame_line(const Frame& frame);
+// The run's report, exactly `run --report json`'s on one line, and `simsys run`'s exit code.
+[[nodiscard]] std::string render_summary_line(const Summary& summary,
+                                              std::span<const SloResult> slos, int exit_code);
+// Why the stream ends early: the file (or none, for a bad command line), the line and column the
+// loader blamed (0 when it names none), and the message stderr would have printed.
+[[nodiscard]] std::string render_error_line(const std::optional<std::string>& file, int line,
+                                            int column, const std::string& message);
+
 class FrameAggregator {
  public:
   FrameAggregator(const graph::Graph& g, std::size_t steps_per_bucket,
