@@ -98,3 +98,26 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang-format-18
       - name: Check formatting
         run: find src tests \( -name '*.cpp' -o -name '*.cppm' -o -name '*.hpp' \) -print0 | xargs -0 clang-format-18 --dry-run -Werror
+  # The web app (phase 5b, web/): the TypeScript type-checks, lints, is formatted, passes its tests
+  # and builds. Node 22 LTS, the version the project develops with; `npm ci` installs exactly the
+  # versions web/package-lock.json pins.
+  web:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Type-check, lint, format
+        run: npm run check
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build

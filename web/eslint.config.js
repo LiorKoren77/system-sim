@@ -10,7 +10,10 @@ export default tseslint.config(
   {
     languageOptions: {
       globals: { ...globals.browser, ...globals.node },
-      parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname },
+      parserOptions: {
+        projectService: { allowDefaultProject: ["vitest.config.ts", "eslint.config.js"] },
+        tsconfigRootDir: import.meta.dirname,
+      },
     },
     rules: {
       "@typescript-eslint/no-explicit-any": "error",
