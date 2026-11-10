@@ -11,7 +11,7 @@ import type { ELK, ElkExtendedEdge, ElkNode, ElkPort } from "elkjs/lib/elk-api";
 import { sidesFor, type Box, type Side } from "./sides";
 
 export const NODE_WIDTH = 176;
-export const NODE_HEIGHT = 68;
+export const NODE_HEIGHT = 84;
 
 export interface Placed {
   readonly x: number; // relative to the node's datacenter box when it has one

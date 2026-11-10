@@ -83,7 +83,7 @@ describe("the diagram's elements, from the graph and the frame", () => {
   it("puts each node of a two-datacenter system in its datacenter's box", async () => {
     const layout = await layoutGraph(youtube);
     const { nodes } = toFlowElements(youtube, layout, null);
-    const groups = nodes.filter((n) => n.type === "group");
+    const groups = nodes.filter((n) => n.type === "datacenter");
     // eu-west first: its viewers' links flow into us-east, so its box goes on the left (layout.ts).
     expect(groups.map((g) => g.id)).toEqual(["dc:eu-west", "dc:us-east"]);
     expect(layout.groups.get("dc:eu-west")?.x).toBeLessThan(
@@ -98,7 +98,7 @@ describe("the diagram's elements, from the graph and the frame", () => {
     const graph = store.graph;
     if (!graph) throw new Error("no graph");
     const { nodes } = toFlowElements(graph, await layoutGraph(graph), null);
-    expect(nodes.some((n) => n.type === "group")).toBe(false);
+    expect(nodes.some((n) => n.type === "datacenter")).toBe(false);
   });
 
   it("ends every link with an arrowhead at the box it sends to", async () => {

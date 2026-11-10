@@ -3,13 +3,14 @@ import { ReactFlow, type EdgeTypes, type NodeTypes } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useEffect, useMemo, useState } from "react";
 import { layoutGraph, type Layout } from "./layout";
+import { DatacenterBox } from "./DatacenterBox";
 import { NodeCard } from "./NodeCard";
 import { RoutedEdge } from "./RoutedEdge";
 import { FrameContext } from "./frame-context";
 import { nodeStatesAt, pipeZonesAt, toFlowElements, withPipeZones } from "./to-flow-elements";
 
 // A module constant: React Flow warns when the node types object changes between renders.
-const nodeTypes: NodeTypes = { system: NodeCard };
+const nodeTypes: NodeTypes = { system: NodeCard, datacenter: DatacenterBox };
 const edgeTypes: EdgeTypes = { routed: RoutedEdge };
 
 // One layout per graph object, kept while the page lives (a graph is never edited in place, and a
