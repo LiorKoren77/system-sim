@@ -63,7 +63,11 @@ describe("the diagram's elements, from the graph and the frame", () => {
     const graph = store.graph;
     if (!graph) throw new Error("no graph");
     const { nodes } = toFlowElements(graph, await layoutGraph(graph), null);
-    expect(dataOf(nodes, "api")).toMatchObject({ type: "service", replicas: 2 });
+    expect(dataOf(nodes, "api")).toMatchObject({
+      type: "service",
+      replicas: 2,
+      category: "compute",
+    });
     expect(nodes.find((n) => n.id === "users")?.className).toBe("client");
   });
 
@@ -95,6 +99,11 @@ describe("the diagram's elements, from the graph and the frame", () => {
     if (!graph) throw new Error("no graph");
     const { nodes } = toFlowElements(graph, await layoutGraph(graph), null);
     expect(nodes.some((n) => n.type === "group")).toBe(false);
+  });
+
+  it("ends every link with an arrowhead at the box it sends to", async () => {
+    const { edges } = toFlowElements(youtube, await layoutGraph(youtube), null);
+    for (const edge of edges) expect(edge.markerEnd).toMatchObject({ type: "arrowclosed" });
   });
 
   it("marks a bandwidth link as a pipe and a plain link not", async () => {
