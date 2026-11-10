@@ -5,7 +5,8 @@ import type { Copies } from "./copies";
 import { FrameContext } from "./frame-context";
 import type { NodeData } from "./to-flow-elements";
 
-// One node of the system. The band across the top names its category in the category's colour
+// One node of the system (each bar's label is short, so a box drawn small still shows it: the busy
+// bar's percentage is utilisation, the load bar's rate what the client offers). The band across the top names its category in the category's colour
 // (what the box is); the bars show its load at the slider's frame (bars.ts: utilisation, the queue
 // building, a client's offered rate against its peak); the border and the pill say its zone (how it
 // is doing):
@@ -33,14 +34,10 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
         </div>
         {state?.copies && <CopySlots copies={state.copies} />}
         {state?.offeredPerSecond != null ? (
-          <BarRow
-            label={`offers ${rate(state.offeredPerSecond)}`}
-            fill={state.load}
-            className="load"
-          />
+          <BarRow label={rate(state.offeredPerSecond)} fill={state.load} className="load" />
         ) : (
           <BarRow
-            label={state?.busy ? `${Math.round(state.busy.mean * 100)}% busy` : "–"}
+            label={state?.busy ? `${Math.round(state.busy.mean * 100)}%` : "–"}
             fill={state?.busy?.mean ?? null}
             peak={state?.busy?.peak ?? null}
             ticks={[data.yellow, data.red]}
@@ -50,7 +47,7 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
         )}
         {state?.queue && (
           <BarRow
-            label={`${count(state.queue.backlog)} waiting`}
+            label={`${count(state.queue.backlog)} queued`}
             fill={state.queue.fill}
             className="queue"
           />

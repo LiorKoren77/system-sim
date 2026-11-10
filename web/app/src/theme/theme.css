@@ -497,7 +497,7 @@ main h1 .chapter {
 
 .bar-row .bar {
   position: relative;
-  flex: 0 0 64px;
+  flex: 0 0 56px;
   height: 7px;
   border-radius: 4px;
   background: var(--line);
