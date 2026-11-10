@@ -20,6 +20,7 @@ module;
 #include <functional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 export module simsys.session;
@@ -27,6 +28,7 @@ export module simsys.session;
 // C++20 `import`: the compiled interfaces of the modules used here, instead of re-parsing their
 // text as an #include would.
 import simsys.config;
+import simsys.core;
 import simsys.engine;
 import simsys.graph;
 import simsys.model;
@@ -59,6 +61,8 @@ export namespace simsys::session {
 struct RunObservers {
   report::SeriesWriter* series{};
   report::OpSeriesWriter* series_ops{};
+  // The frames of `run --stream`: every record, then finish() after the last (a partial bucket).
+  report::FrameAggregator* frames{};
 };
 
 // `sim` run over the scenario's duration at its step, every record observed by a Summary that
@@ -68,6 +72,45 @@ struct RunObservers {
 // `g`. `simsys sweep` reaches it too (each point); its rows show no fault block.
 [[nodiscard]] report::Summary run_summary(const graph::Graph& g, engine::Simulation& sim,
                                           RunObservers observers = {});
+
+// ---- `run --stream` (phase 5a spec §4, §6) ----
+
+// The frames a stream aims at when neither --points nor --every is given: 720, two minutes of a
+// 24 h day, so a day's chart has a point every two minutes and the stream is about 1.5 MB
+// (youtube). A choice, not from the book. `constexpr` without `inline`: an exported constant (the
+// seventh GCC 14.2 defect, CLAUDE.md §3).
+constexpr std::size_t default_points = 720;
+constexpr std::size_t max_points = 100'000;
+
+// The steps of a bucket that gives at most `points` frames over a run of `steps` steps:
+// ceil(steps / points), at least 1. Refused outside 1..max_points:
+// `--points must be between 1 and 100000`.
+[[nodiscard]] std::expected<std::size_t, std::string> bucket_for_points(std::size_t steps,
+                                                                        long long points);
+
+// The steps of a bucket `every` long (its text as the user wrote it, for the messages): a whole
+// number of `step`s, positive and not longer than the run (`duration`).
+[[nodiscard]] std::expected<std::size_t, std::string> bucket_for_every(SimTime step,
+                                                                       SimTime duration,
+                                                                       SimTime every,
+                                                                       std::string_view every_text);
+
+// The frames a run of `steps` steps makes in buckets of `steps_per_bucket`: the last one partial
+// when they do not divide.
+[[nodiscard]] std::size_t frame_count(std::size_t steps, std::size_t steps_per_bucket);
+
+// The steps a run of `g` takes: its duration over its step, rounded up (Simulation::run's loop).
+[[nodiscard]] std::size_t steps_of(const graph::Graph& g);
+
+// `simsys run --stream`: `sim` (a simulation of `g`) run to the end, each line of the stream handed
+// to `write_line` as soon as it exists (report's "lines of run --stream": run, graph, a frame per
+// bucket of `steps_per_bucket` steps, summary). Returns `simsys run`'s exit code
+// (report::exit_code). Pattern: Observer again: the frames are one more observer of run_summary's
+// records, beside the summary the last line reports, so the frames and the report come from one
+// pass over the run.
+[[nodiscard]] int stream_run(const graph::Graph& g, engine::Simulation& sim,
+                             std::size_t steps_per_bucket,
+                             const std::function<void(std::string_view)>& write_line);
 
 // The same from the graph alone: create_simulation, then the run (a point of `simsys sweep`).
 [[nodiscard]] std::expected<report::Summary, std::string> run_summary(const graph::Graph& g,

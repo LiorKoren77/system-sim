@@ -27,6 +27,9 @@ module;
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
+#include <map>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
@@ -42,9 +45,12 @@ module;
 module simsys.report:shared;
 
 // C++20 `import`: the compiled interfaces of the modules this partition reads from (SimTime and
-// the number formatters from core, Zone from fluid).
+// the number formatters from core, Zone from fluid, a node's spec and its ops' costs from model and
+// defaults: the unit a node counts its work in).
 import simsys.core;
+import simsys.defaults;
 import simsys.fluid;
+import simsys.model;
 
 namespace simsys::report {
 
@@ -308,6 +314,143 @@ constexpr std::string_view ansi_reset = "\x1b[0m";
   if (text.ends_with(".0")) text.resize(text.size() - 2);
   if (text == "-0") text = "0";  // a residue below zero rounds to "-0.0"
   return text + "s";
+}
+
+// ---- JSON (run and estimate reports, the resolved graph, the stream's lines) ----
+
+// Quotes and backslashes are escaped, control characters become \u00XX; everything
+// else (UTF-8 included) passes through, as JSON allows.
+[[nodiscard]] std::string json_string(std::string_view text) {
+  constexpr std::string_view hex = "0123456789abcdef";
+  std::string out = "\"";
+  for (const char c : text) {
+    const unsigned code = static_cast<unsigned char>(c);
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (code < 0x20) {
+      out += "\\u00";
+      out += hex[code >> 4];
+      out += hex[code & 0xFu];
+    } else {
+      out += c;
+    }
+  }
+  return out + '"';
+}
+
+// JSON has no infinity: a latency that never arrives is null.
+[[nodiscard]] std::string json_number(double value) {
+  return std::isfinite(value) ? to_chars_text(value) : "null";
+}
+
+[[nodiscard]] std::string json_optional_number(const std::optional<double>& value) {
+  return value ? json_number(*value) : "null";
+}
+
+[[nodiscard]] std::string json_optional_string(const std::optional<std::string>& text) {
+  return text ? json_string(*text) : "null";
+}
+
+[[nodiscard]] std::string json_field(std::string_view name, const std::string& value) {
+  return json_string(name) + ": " + value;
+}
+
+[[nodiscard]] std::string json_object(std::span<const std::string> fields) {
+  return "{" + join(fields, ", ") + "}";
+}
+
+// `"name": [ ... ]` at the top level, one object per line.
+[[nodiscard]] std::string json_array(std::string_view name, std::span<const std::string> objects) {
+  if (objects.empty()) return "  " + json_field(name, "[]");
+  return "  " + json_field(name, "[\n    " + join(objects, ",\n    ") + "\n  ]");
+}
+
+// C++20 std::views::transform + C++23 std::ranges::to: map every element through `f` and
+// collect the results into a vector, replacing a reserve + push_back loop.
+template <class T, class F>
+[[nodiscard]] std::vector<std::string> map_to_strings(std::span<const T> items, F f) {
+  return items | std::views::transform(f) | std::ranges::to<std::vector<std::string>>();
+}
+
+// A document of simsys's JSON output: `format_version` first (the output contract's version,
+// report::format_version, written here once for every document), then the given lines, one
+// top-level key each. The version is passed in: this partition cannot see the interface's
+// exported constant (the top of the file says why).
+[[nodiscard]] std::string json_document(int version, std::span<const std::string> lines) {
+  return "{\n  " + json_field("format_version", std::to_string(version)) + ",\n" +
+         join(lines, ",\n") + "\n}";
+}
+
+// A JSON array of strings: `["a", "b"]`, from any range of things a string_view takes.
+template <class Names>
+[[nodiscard]] std::string json_strings(const Names& names) {
+  std::vector<std::string> quoted;
+  for (const auto& name : names) quoted.push_back(json_string(name));
+  return "[" + join(quoted, ", ") + "]";
+}
+
+// ---- the unit of a node's work ----
+
+// "delete, insert, update, write cost 5" ("a cost 2 and b cost 3" for two costs): a node's ops that
+// cost something other than 1 capacity unit, grouped by their cost, in name order; "" when every op
+// it prices costs 1. The ops priced are a database's write ops (their default cost of 5, spec §18
+// entry 7) and every op of a stated `cost` map (spec §17 entry 4), each priced as the engine
+// prices it (defaults::op_cost).
+[[nodiscard]] std::string priced_ops(const model::NodeSpec& spec, double unit_per_request = 1.0) {
+  // C++20 std::views::keys: the keys of a map as a lazy view, no copy of its pairs; C++23
+  // std::ranges::to<std::vector>(): collects a view into a container, replacing a reserve +
+  // push_back loop.
+  std::vector<std::string> ops{spec.cost | std::views::keys | std::ranges::to<std::vector>()};
+  if (spec.type == model::NodeType::sql_db) {
+    std::ranges::copy(model::write_ops_of(spec), std::back_inserter(ops));
+  }
+  // C++20 std::ranges::unique: returns the tail to erase as a subrange (unpacked by a structured
+  // binding), where std::unique returned only its first iterator.
+  std::ranges::sort(ops);
+  const auto [first_repeat, end] = std::ranges::unique(ops);
+  ops.erase(first_repeat, end);
+  std::map<double, std::vector<std::string>> by_cost;
+  for (const auto& op : ops) {
+    const double cost = defaults::op_cost(spec, op) / unit_per_request;
+    if (cost != 1.0) by_cost[cost].push_back(op);
+  }
+  std::vector<std::string> groups;
+  for (const auto& [cost, named] : by_cost) {
+    groups.push_back(join(named, ", ") + " cost " + significant(cost));
+  }
+  return join(groups, " and ");
+}
+
+// What a node's peak_backlog and drops count, when it is not requests: megabytes at a byte-sized
+// node (spec §19 entry 2), replica-requests at a kv_cluster (N of them per request, §19 entry 9),
+// capacity units at a node with an op that costs other than 1 (priced_ops); empty otherwise, and
+// for a client, which queues nothing.
+[[nodiscard]] std::optional<std::string> unit_of(const model::NodeSpec& spec) {
+  if (spec.type == model::NodeType::client) return std::nullopt;
+  if (defaults::is_byte_sized(spec)) return "MB";
+  if (spec.type == model::NodeType::kv_cluster) {
+    // Every request is N replica-requests; a stated `cost` prices each of them on top (op_cost is
+    // the product), so the line says both: "replica-requests (N 3; put cost 4 each)".
+    const int n = model::kv_replication(spec);
+    const auto priced = priced_ops(spec, static_cast<double>(n));
+    const std::string each = priced.empty() ? "" : "; " + priced + " each";
+    return "replica-requests (N " + std::to_string(n) + each + ")";
+  }
+  const auto priced = priced_ops(spec);
+  if (priced.empty()) return std::nullopt;
+  return "capacity units (" + priced + ")";
+}
+
+// The unit of a node's work as one word, for programs (the graph JSON's `unit`): "MB" at a
+// byte-sized node, "replica-requests" at a kv_cluster, "units" at a node with an op that costs
+// other than 1 (unit_of's capacity units), "requests" otherwise; empty for a client, which serves
+// nothing. unit_of says the same in words for people, with the costs.
+[[nodiscard]] std::optional<std::string_view> unit_word(const model::NodeSpec& spec) {
+  if (spec.type == model::NodeType::client) return std::nullopt;
+  if (defaults::is_byte_sized(spec)) return "MB";
+  if (spec.type == model::NodeType::kv_cluster) return "replica-requests";
+  return priced_ops(spec).empty() ? "requests" : "units";
 }
 
 }  // namespace simsys::report

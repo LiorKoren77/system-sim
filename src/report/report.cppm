@@ -14,6 +14,7 @@ module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this interface imports other modules
 // (GCC 14.2 'Bad file data' bug, CLAUDE.md §3). Heavy headers go in report.cpp.
 #include <cstddef>
+#include <functional>
 #include <iosfwd>
 #include <optional>
 #include <span>
@@ -30,6 +31,81 @@ import simsys.engine;
 import simsys.fluid; // Zone: a link's worst zone
 import simsys.graph;
 import simsys.model;
+
+// ---- module-internal: shared by the units of simsys.report, not exported ----
+//
+// Declared without `export`, these have module linkage: every unit of simsys.report sees them
+// (report.cpp defines them; Summary and the stream's FrameAggregator both use them), no importer
+// does. One rule for a run's latency figures and a bucket's, so a chart of a bucket's p99 and the
+// report's p99 agree.
+namespace simsys::report {
+
+// Weighted first and second moments of a latency, accumulated across steps: the moments of the
+// mixture of the steps' latency distributions, each weighted by `w` (the requests it answered).
+struct Moments {
+  double weight{};
+  double weighted_mean{};    // Σ w·m
+  double weighted_square{};  // Σ w·(v + m²) = Σ w·E[X²]
+  void add(double w, double mean_s, double variance_s2);
+  // The mixture's mean and variance; precondition: weight > 0.
+  [[nodiscard]] double mean_s() const;
+  [[nodiscard]] double variance_s2() const;
+};
+
+// One (client, op)'s response over many steps (a run, a window, a bucket of a stream).
+struct ResponseMoments {
+  Moments by_answered{};  // weighted by requests answered: what an average answer sees
+  Moments by_time{};      // weighted by time: the fallback when nothing was answered
+  // The delivered requests' latency before the client gave up (ResponseSample::
+  // delivered_response), weighted by the attempts delivered, answered + timed out (every
+  // attempt): what a timed-out client's percentiles are read off (percentile_seen_by_client).
+  Moments by_delivered{};
+  bool unavailable{};  // some step's path never answered (an infinite latency)
+  void add(const engine::ResponseSample& sample, double dt_s);
+};
+
+// One (client, op)'s rates summed over many steps (Σ rate·dt, in requests), the same sums for a run
+// (Summary) and a bucket of a stream (FrameAggregator): one copy, so a frame and the report cannot
+// count an op differently.
+struct OpRates {
+  double offered{};             // Σ offered·dt
+  double attempts{};            // Σ attempts·dt: `offered` and the retries
+  double answered{};            // Σ answered·dt: the part of `offered` that came back
+  double timed_out{};           // Σ timed_out·dt: delivered, but after the client gave up
+  double timed_out_attempts{};  // Σ timed_out_attempts·dt: every attempt that timed out
+  void add(const engine::ResponseSample& sample, double dt_s);
+};
+
+// The length of a bucket of `steps` steps of `step`, in seconds, computed in whole nanoseconds: 3
+// steps of 100 ms are 0.3 exactly (as the next bucket's start is), where 0.1 × 3 in floating point
+// is 0.30000000000000004. The run line's bucket_s and every frame's dt_s.
+[[nodiscard]] double bucket_seconds(SimTime step, std::size_t steps);
+
+// A bandwidth link's pipe as a node's sample: the fields of the same names (in megabytes), none of
+// a node type's own (Summary's link totals and the frames' link rows both read it so).
+[[nodiscard]] engine::NodeSample as_node_sample(const engine::LinkSample& sample);
+
+// The latency figures of an op, in seconds: the answered requests' mean and the percentiles the
+// client saw.
+struct SeenLatencies {
+  double mean_s{};
+  double p50_s{};
+  double p95_s{};
+  double p99_s{};
+};
+
+// An op's mean from the moments its answered requests left, its percentiles from the delivered
+// ones, read by the client's rule (percentile_seen_by_client in report.cpp: capped at `timeout_s`,
+// the timeout itself when more than 1 − q of them timed out). Empty when no step was observed.
+[[nodiscard]] std::optional<SeenLatencies> seen_latencies(const ResponseMoments& moments,
+                                                          std::optional<double> timeout_s,
+                                                          double share_timed_out);
+
+// timed_out / (answered + timed_out): the share of the attempts the path delivered that came back
+// after the client had given up; 0 when nothing was delivered.
+[[nodiscard]] double timed_out_share(double answered, double timed_out);
+
+}  // namespace simsys::report
 
 export namespace simsys::report {
 
@@ -333,16 +409,6 @@ class Summary {
   [[nodiscard]] std::span<const FaultBlock> faults() const { return faults_; }
 
  private:
-  // Weighted first and second moments of a latency, accumulated across steps.
-  struct Moments {
-    double weight{};
-    double weighted_mean{};    // Σ w·m
-    double weighted_square{};  // Σ w·(v + m²) = Σ w·E[X²]
-    void add(double w, double mean_s, double variance_s2);
-    // The mixture's mean and variance; precondition: weight > 0.
-    [[nodiscard]] double mean_s() const;
-    [[nodiscard]] double variance_s2() const;
-  };
   struct NodeTotals {
     double rho_time{};  // Σ rho·dt
     double peak_rho{};
@@ -386,18 +452,8 @@ class Summary {
   struct OpTotals {
     std::size_t client{};
     std::string op{};
-    double offered{};    // Σ offered·dt, requests
-    double attempts{};   // Σ attempts·dt, requests sent: `offered` and the retries
-    double answered{};   // Σ answered·dt, requests: the part of `offered` that came back
-    double timed_out{};  // Σ timed_out·dt, requests: delivered, but after the client gave up
-    double timed_out_attempts{};  // Σ timed_out_attempts·dt: every attempt that timed out
-    Moments by_answered{};        // weighted by requests answered: what an average answer sees
-    Moments by_time{};            // weighted by time: the fallback when nothing was answered
-    // The delivered requests' latency before the client gave up (ResponseSample::
-    // delivered_response), weighted by the attempts delivered, answered + timed out (every
-    // attempt): what a timed-out client's percentiles are read off (percentile_seen_by_client).
-    Moments by_delivered{};
-    bool unavailable{};
+    OpRates rates{};             // the op's rates over the observed steps
+    ResponseMoments response{};  // the latency the op's requests saw (ResponseMoments)
     void add(const engine::ResponseSample& sample, double dt_s);
   };
 
@@ -472,13 +528,30 @@ class Summary {
 [[nodiscard]] std::vector<SloResult> evaluate_slos(const Summary& summary,
                                                    std::span<const model::SloSpec> slos);
 [[nodiscard]] bool all_pass(std::span<const SloResult> results);  // skipped counts as pass
+// `simsys run`'s exit code for a summary and its SLO verdicts: 0 every SLO passed (skipped counts
+// as passed), 2 one failed, 1 when no step was observed (no data is an error, not a pass).
+[[nodiscard]] int exit_code(const Summary& summary, std::span<const SloResult> results);
 
 // For people: a header line, a node table (rho cells coloured by zone when `color`), an
 // op table with estimated percentiles, and the SLO verdicts.
 [[nodiscard]] std::string render_table(const Summary& summary, std::span<const SloResult> slos,
                                        bool color);
+// The version of the output contract: the first key of every JSON document simsys writes (`run`,
+// `estimate`, `explain` and replications with `--report json`, the stream's `run` message). A
+// frontend checks it before it reads a key. Adding a key, a message type or a column keeps it;
+// removing or renaming one, or changing a value's meaning or unit, raises it (schema v1.7, "the
+// output contract"). `constexpr` without `inline`: an exported namespace-scope constant (the
+// seventh GCC 14.2 defect, CLAUDE.md §3).
+constexpr int format_version = 1;
+
 // For programs: the same content as JSON (two-space indent, seconds, null for infinity).
 [[nodiscard]] std::string render_json(const Summary& summary, std::span<const SloResult> slos);
+// The same document on one line, without the layout's whitespace: the `report` of the stream's
+// `summary` message (`run --stream`), where one line is one message.
+[[nodiscard]] std::string render_json_line(const Summary& summary, std::span<const SloResult> slos);
+// Any JSON text on one line: the whitespace between tokens removed, the text inside strings kept
+// byte for byte (render_json_line, the stream's graph). `json` must be valid JSON.
+[[nodiscard]] std::string json_on_one_line(std::string_view json);
 
 // A moment of the run's clock as a report prints it: `12:00` for a whole minute, `00:19:59` for a
 // whole second, the exact duration from the start otherwise or past the first day.
@@ -641,6 +714,18 @@ struct ReplicationSummary {
 // and a static load check (offered load vs capacity, no queueing).
 [[nodiscard]] std::string render_explain(const graph::Graph& g);
 
+// `simsys explain --report json`: the resolved graph as data, the source a frontend draws the
+// system's diagram from (phase 5a spec §6.1): the datacenters, every node in the engine's order
+// (the order every frame's rows follow) with its type, datacenter, copies, total capacity and the
+// unit it counts, its zone thresholds and waiting room; the links with their direction, one-way
+// latency and bandwidth; every client op with its share; the SLOs and scripted faults as the
+// scenario states them; and the names of the numbers in each row of a stream's frames.
+// `format_version` first.
+[[nodiscard]] std::string render_graph_json(const graph::Graph& g);
+// The same keys, one `"key": value` per element, without `format_version`: the body of the
+// stream's `graph` message (render_graph_line), which puts its own `type` and `rev` first.
+[[nodiscard]] std::vector<std::string> graph_json_fields(const graph::Graph& g);
+
 // For plotting: one CSV row per node per step,
 // `t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,
 // deduplicated_per_s,latency_ms,zone,queue_lag_s,connections` (`dead_lettered_per_s` empty except
@@ -676,6 +761,175 @@ class OpSeriesWriter {
  private:
   std::ostream* out_;
   std::vector<std::string> ids_;  // node ids, indexed like Graph::nodes(): a sample's client
+};
+
+// ---- the frames of `run --stream` (phase 5a spec §6.2) ----
+//
+// What a web page draws from: one frame per BUCKET of consecutive steps, so that a day of 864,000
+// steps reaches the browser as about 720 frames of a few kilobytes each. The engine still steps at
+// the scenario's step (accuracy is decided there); only what is written is reduced, and each number
+// keeps its meaning by the aggregate it gets:
+//   rates (demand, drain, drops, refusals)  the bucket's mean, Σ x·dt / Σ dt
+//   peaks (rho, backlog, a queue's lag)      the bucket's largest
+//   levels (backlog, open connections)       the bucket's last value
+//   the zone                                 the worst of its steps (red if any step was red)
+// The means and the last backlog keep the fluid queue's conservation law per bucket:
+//   mean_demand · Δt = (mean_drain + mean_dropped) · Δt + backlog(end) − backlog(start)
+// (the per-step law of engine::NodeSample, summed over the bucket's steps); a max of the rates or a
+// mean of the backlog would break it. A short overload inside a long bucket is diluted in the means
+// and kept in the peaks, the worst zone and red_s.
+
+// One node's or one bandwidth link's numbers over a bucket, in the frame's units (latency in ms; a
+// pipe's in megabytes). A column the row does not have is empty: a client's queue (a source has
+// none: its rates are its op rows), a service's lag or connections, a pipe's refusals. A latency is
+// empty too when some step of the bucket never answered (infinite).
+struct NodeRow {
+  std::optional<double> demand_per_s{};    // mean
+  std::optional<double> drain_per_s{};     // mean
+  std::optional<double> dropped_per_s{};   // mean
+  std::optional<double> rejected_per_s{};  // mean (a rate limiter's refusals); none on a pipe
+  std::optional<double> backlog{};         // the level at the bucket's end
+  std::optional<double> peak_backlog{};    // max
+  std::optional<double> mean_rho{};        // mean
+  std::optional<double> peak_rho{};        // max
+  std::optional<int> zone{};               // the worst: 0 green, 1 yellow, 2 red (fluid::Zone)
+  std::optional<double> red_s{};           // seconds of the bucket in red
+  std::optional<double> latency_ms{};   // drain-weighted mean sojourn (time mean if none drained)
+  std::optional<double> queue_lag_s{};  // max: a message queue's or a frontier's
+  std::optional<double> connections{};  // the last level: a websocket gateway's
+  std::optional<double> dead_lettered_per_s{};  // mean: a worker pool's
+  std::optional<double> deduplicated_per_s{};   // mean: a notification fan-out's
+};
+
+// One (client, op) over a bucket: the rates as means, the answered requests' mean response and
+// their 99th percentile, estimated by the run's rule (a lognormal fit to the response moments
+// pooled over the bucket's steps, capped at the client's timeout); both empty when nothing was
+// answered.
+struct OpRow {
+  std::optional<double> offered_per_s{};
+  std::optional<double> attempts_per_s{};
+  std::optional<double> answered_per_s{};
+  std::optional<double> timed_out_per_s{};
+  std::optional<double> mean_ms{};
+  std::optional<double> p99_ms{};
+};
+
+// A bucket: from `t` (its first step's time) for `dt_s` seconds (shorter for a last bucket that the
+// run's steps did not fill). Rows in the graph's order: nodes as Graph::nodes(), links as the
+// bandwidth links of engine::StepRecord::links, ops as engine::StepRecord::responses (clients in
+// node order, each client's ops by name). The special members are declared here and defaulted in
+// stream.cpp, out of line (the tenth GCC 14.2 defect, CLAUDE.md §3: an importer that instantiated
+// the implicit ones over the vectors would hit an ICE in Release).
+struct Frame {
+  SimTime t{};
+  double dt_s{};
+  std::vector<NodeRow> nodes{};
+  std::vector<NodeRow> links{};
+  std::vector<OpRow> ops{};
+
+  Frame();
+  Frame(const Frame& other);
+  Frame(Frame&& other) noexcept;
+  Frame& operator=(const Frame& other);
+  Frame& operator=(Frame&& other) noexcept;
+  ~Frame();
+};
+
+// ---- the lines of `run --stream` (phase 5a spec §6) ----
+//
+// One JSON object per line, each with a `type`, no whitespace between tokens: a reader splits the
+// stream on newlines and parses each line alone, and a process stopped mid-write leaves at most a
+// partial last line, which it drops. The order: `run`, `graph`, the `frame`s in time order, then
+// `summary`; or an `error` at any point, after which nothing follows. Each line comes without its
+// newline.
+
+// The run's header: the version of the output contract, the scenario, its seed, its length, step
+// and warmup in seconds, a bucket's length (`steps_per_bucket` steps) and how many frames follow.
+[[nodiscard]] std::string render_run_line(const graph::Graph& g, std::size_t steps_per_bucket,
+                                          std::size_t frames);
+// The resolved graph (render_graph_json's keys), at revision 0, the scenario as loaded: a later
+// change of topology mid-run would send another `graph` with the next revision.
+[[nodiscard]] std::string render_graph_line(const graph::Graph& g);
+// A bucket: its start and length in seconds, then its rows of numbers in the graph's column order
+// (`node_columns`, `link_columns`, `op_columns`), null where a row has no such value.
+[[nodiscard]] std::string render_frame_line(const Frame& frame);
+// The run's report, exactly `run --report json`'s on one line, and `simsys run`'s exit code.
+[[nodiscard]] std::string render_summary_line(const Summary& summary,
+                                              std::span<const SloResult> slos, int exit_code);
+// Why the stream ends early: the file (or none, for a bad command line), the line and column the
+// loader blamed (0 when it names none), and the message stderr would have printed.
+[[nodiscard]] std::string render_error_line(const std::optional<std::string>& file, int line,
+                                            int column, const std::string& message);
+
+// Pattern: Observer — like Summary and SeriesWriter, it watches every StepRecord of a run
+// (session::RunObservers); every `steps_per_bucket` records it hands the finished Frame to `sink`.
+// Pattern: Strategy for what becomes of a frame: the stream writes it as a line of JSON, a test
+// collects it, so the aggregation rules are tested without any output. `finish` hands over the last
+// bucket when the run's steps did not fill it (nothing otherwise, and nothing the second time). `g`
+// must outlive the aggregator; a bucket of 0 steps is a programmer error (std::invalid_argument).
+// Not copyable: it is watched by pointer, like the series writers.
+class FrameAggregator {
+ public:
+  FrameAggregator(const graph::Graph& g, std::size_t steps_per_bucket,
+                  std::function<void(const Frame&)> sink);
+  FrameAggregator(const FrameAggregator&) = delete;
+  FrameAggregator& operator=(const FrameAggregator&) = delete;
+  ~FrameAggregator();
+
+  void observe(const engine::StepRecord& record);
+  void finish();
+
+ private:
+  // One node's or pipe's sums over the bucket so far (NodeRow says what each becomes).
+  struct QueueSums {
+    double demand{};    // Σ demand_per_s·dt
+    double drain{};     // Σ drain_per_s·dt
+    double dropped{};   // Σ dropped_per_s·dt
+    double rejected{};  // Σ rejected_per_s·dt
+    double rho{};       // Σ rho·dt
+    double backlog{};   // the last step's
+    double peak_backlog{};
+    double peak_rho{};
+    int zone{};  // the worst so far
+    double red_s{};
+    double latency_weighted{};  // Σ latency·w·dt, w the drain (a node) or the demand (a pipe)
+    double latency_weight{};    // Σ w·dt
+    double latency_by_time{};   // Σ latency·dt
+    bool unanswered{};          // some step's latency was infinite
+    std::optional<double> queue_lag_s{};    // max
+    std::optional<double> connections{};    // last
+    std::optional<double> dead_lettered{};  // Σ ·dt
+    std::optional<double> deduplicated{};   // Σ ·dt
+  };
+
+  // One (client, op)'s sums over the bucket so far (OpRow says what each becomes).
+  struct OpSums {
+    std::size_t client{};        // the client's node index
+    OpRates rates{};             // the run's sums, over this bucket only
+    ResponseMoments response{};  // the run's mixtures, over this bucket only
+  };
+
+  void start_bucket(const engine::StepRecord& record);
+  // `weight` the rate a step's latency counts with: a node's drain, a pipe's demand (as Summary
+  // weighs them, so a frame of the whole run gives the report's figure).
+  void add_queue(QueueSums& sums, const engine::NodeSample& sample, double weight) const;
+  void add_node(QueueSums& sums, const engine::NodeSample& sample) const;
+  void add_link(QueueSums& sums, const engine::LinkSample& sample) const;
+  static void add_op(OpSums& sums, const engine::ResponseSample& sample, double dt_s);
+  [[nodiscard]] NodeRow node_row(const QueueSums& sums, bool client) const;
+  [[nodiscard]] OpRow op_row(const OpSums& sums) const;
+  void hand_over();
+
+  const graph::Graph* graph_;
+  std::size_t steps_per_bucket_;
+  std::function<void(const Frame&)> sink_;
+  SimTime step_;         // every step's length: the scenario's step
+  double step_s_;        // the same in seconds, for the sums
+  std::size_t steps_{};  // steps in the bucket so far; 0: no bucket open
+  SimTime start_{};      // the bucket's first step
+  std::vector<QueueSums> nodes_{};
+  std::vector<QueueSums> links_{};
+  std::vector<OpSums> ops_{};
 };
 
 }  // namespace simsys::report

@@ -10,7 +10,11 @@ reproducible. Built to practise the systems in
 *System Design Interview* (Alex Xu, vol. 1) and, at the same time, to study and teach
 C++20/23: modules, concepts, ranges, coroutines, `std::expected` and friends.
 
-Status: phase 4a is built on top of phase 3: `simsys sweep` crosses two keys in a grid, spaces its
+Status: phase 5a makes simsys the data source of a web frontend (phase 5b): `simsys run --stream`
+writes the run as lines of JSON on stdout while it runs, one frame per bucket of steps aggregated at
+the source (youtube's day: 723 lines, 1.13 MB, the first frame out after 43 ms), `simsys explain
+--report json` gives the resolved graph as data, and every JSON document starts with its
+`format_version`. Phase 4a, below it, is built on top of phase 3: `simsys sweep` crosses two keys in a grid, spaces its
 points geometrically (`:log`), reads a node's `reject_rate` and, with `--slos`, judges every point's
 SLOs; `simsys estimate --at 13:00` evaluates the steady state at any instant, and reports rates
 rather than one step's totals; the tables say which nodes count capacity units or megabytes.
@@ -35,9 +39,9 @@ key-value clusters (ring, replication and quorums), search indexes and id genera
 a failed step does not run, refused, dropped and timed-out requests are counted apart
 (`reject_rate`, `drop_rate`, `timed_out_per_s`), and an SLO can be checked per window (`over: 1h`).
 `simsys sweep` runs a scenario over a range of one key (or a grid of two), the points in parallel. All fourteen
-shipped scenarios run end to end, the eight book systems among them (list below). 1740 tests
+shipped scenarios run end to end, the eight book systems among them (list below). 1792 tests
 (Catch2, via `ctest`). The scenario language is
-[`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.6).
+[`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.7).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
 
@@ -45,14 +49,29 @@ for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling 
 
 ```
 simsys validate scenario.yaml        # types, references and units
-simsys explain  scenario.yaml        # every resolved number and where it came from
+simsys explain  scenario.yaml [--report table|json]  # every resolved number and where it came from
 simsys estimate scenario.yaml [--at 13:00] [--report table|json] [--no-color]
 simsys run      scenario.yaml [--duration 30s] [--seed N] [--report table|json]
                               [--series out.csv] [--series-ops ops.csv] [--no-color]
                               [--replications N [--jobs J]]
+simsys run      scenario.yaml --stream [--points N | --every 30s]  # lines of JSON for a frontend
 simsys curve    scenario.yaml <client> [--step 1m] [--until 1h] [--seed N] [--noise]
 simsys sweep    scenario.yaml --param <dot.path>=<from>..<to>:<n>[:log] [--param ...]
                               --metric <m>... [--slos] [--jobs N] [--format table|csv]
+```
+
+`run --stream` is what a web server reads from a child process: one JSON object per line on stdout,
+written as soon as it exists: a `run` line, the resolved `graph`, a `frame` per bucket of steps
+(`--points N`, default 720, or `--every <duration>`) and the run's report with its exit code, or an
+`error` line with the file, line and column. A frame keeps each number's meaning: rates as the
+bucket's mean (so the conservation law below still balances per bucket), peaks as its maximum, levels
+as its last value, the zone as its worst ([schema](docs/scenario-schema.md#command-line-simsys-run---stream-phase-5a)):
+
+```
+$ simsys run scenarios/tutorial/hello/scenario.yaml --stream --points 2 | head -3
+{"type":"run","format_version":1,"scenario":"hello","seed":1,"duration_s":60,"step_s":0.1,"warmup_s":0,"bucket_s":30,"frames":2}
+{"type":"graph","rev":0,"scenario":"hello","datacenters":[{"name":"main"}],"zones":["green","yellow","red"],"nodes":[...],...}
+{"type":"frame","rev":0,"t_s":0,"dt_s":30,"nodes":[[null,...],[100,100,0,0,0,0,0.1,0.1,0,0,1.11111,null,null,null,null]],"links":[],"ops":[[100,100,100,0,1.61111,5.66029]]}
 ```
 
 `estimate` evaluates the long-run (steady) state once, at t = 0 (midnight) or at `--at`: the rate
