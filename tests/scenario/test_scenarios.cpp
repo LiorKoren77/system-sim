@@ -2317,7 +2317,8 @@ TEST_CASE("book/chat-system runs the day, passes its three SLOs and storms back 
   REQUIRE(recovered_at_s <= 21 * 3600 + 31 * 60 + 30 + 30);
 }
 
-// ---- run --days (phase 5b spec §5): the shipped days lived twice ----------------------------------
+// ---- run --days (phase 5b spec §5): the shipped days lived twice
+// ----------------------------------
 
 namespace {
 
@@ -2335,8 +2336,8 @@ TEST_CASE("book/chat-system lived for two days has its 21:30 outage on both days
   const auto g = build_or_fail(two_days_of("book/chat-system/scenario.yaml"));
   const auto& faults = g.scenario().faults;
   REQUIRE(faults.size() == 2);
-  CHECK(faults[0].at == 21h + 30min);         // 77400 s
-  CHECK(faults[1].at == 24h + 21h + 30min);   // 163800 s
+  CHECK(faults[0].at == 21h + 30min);        // 77400 s
+  CHECK(faults[1].at == 24h + 21h + 30min);  // 163800 s
 }
 
 TEST_CASE("book/news-feed lived for two days has its noon spike on both days", "[scenario]") {

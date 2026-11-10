@@ -18,6 +18,7 @@ module;
 #include <cstddef>
 #include <expected>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -51,6 +52,26 @@ export namespace simsys::session {
 // (`run --seed` replaces the seed, which is not a value of the file an override could replace).
 [[nodiscard]] std::expected<graph::Graph, std::string> build_graph(const std::string& path,
                                                                    model::Scenario scenario);
+
+// ---- `run --days N` (phase 5b spec §5) ----
+
+// A 24 h scenario's day lived `days` times in a row: the run lasts days × 24 h, each rate spike and
+// scripted fault recurs at the same clock time every day (day by day, each day in the file's
+// order), and the report observes the last day only (warmup (days − 1) × 24 h: by then the queues
+// and connections are as full as that day makes them; the file's own warmup is replaced). The
+// engine and the loader are untouched: this transforms the input, so `explain` of the result shows
+// exactly what runs. Why: the web app loops a day that has reached its periodic steady state, and a
+// spike or fault written once would happen on the first day only. Refused (the message, without
+// the file, which the caller adds): `days` outside 1..7, a duration other than 24 h, a wave whose
+// period does not divide 24 h, a points trace (held flat after its last entry: not periodic), a
+// ramp longer than a day. Noise is kept: each day draws its own. days == 1 is the scenario as is.
+[[nodiscard]] std::expected<model::Scenario, std::string> repeat_days(model::Scenario scenario,
+                                                                      int days);
+
+// The most days `--days` runs: a week, past which a looped day shows nothing a second one did not
+// (a choice, not from the book). `constexpr` without `inline`: an exported constant (the seventh
+// GCC 14.2 defect, CLAUDE.md §3).
+constexpr int max_days = 7;
 
 // A simulation of `g`, or `path: error: why not` (a node type the engine does not run yet).
 [[nodiscard]] std::expected<engine::Simulation, std::string> create_simulation(
@@ -108,9 +129,12 @@ constexpr std::size_t max_points = 100'000;
 // (report::exit_code). Pattern: Observer again: the frames are one more observer of run_summary's
 // records, beside the summary the last line reports, so the frames and the report come from one
 // pass over the run.
+// `days` is `run --days`'s count, written as the run line's `days` key; absent without the flag,
+// so a plain stream stays the 5a stream byte for byte.
 [[nodiscard]] int stream_run(const graph::Graph& g, engine::Simulation& sim,
                              std::size_t steps_per_bucket,
-                             const std::function<void(std::string_view)>& write_line);
+                             const std::function<void(std::string_view)>& write_line,
+                             std::optional<int> days = std::nullopt);
 
 // The same from the graph alone: create_simulation, then the run (a point of `simsys sweep`).
 [[nodiscard]] std::expected<report::Summary, std::string> run_summary(const graph::Graph& g,
