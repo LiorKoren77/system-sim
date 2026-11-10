@@ -118,7 +118,11 @@ bool lists_word(std::string_view words, std::string_view word) {
   // view of the pieces between separators, replacing a hand-written find/substr loop; each
   // piece is a contiguous range of chars, so the C++20 iterator-pair constructor of
   // std::string_view can view it without copying.
-  return std::ranges::any_of(words | std::views::split(' '), [word](auto piece) {
+  // std::ranges::split_view constructed directly, not `words | std::views::split(' ')`: Clang 19
+  // sees the adaptor's call operator twice in this unit (once through <ranges> here, once through
+  // an imported module's global module fragment) and calls it ambiguous (CLAUDE.md §3, the Clang
+  // defects). The view is the same one the adaptor would build.
+  return std::ranges::any_of(std::ranges::split_view{words, ' '}, [word](auto piece) {
     return std::string_view{piece.begin(), piece.end()} == word;
   });
 }
