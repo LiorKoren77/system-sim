@@ -10,8 +10,8 @@
 //   the edges only when it changes (withPipeZones).
 import type { DatasetStore, GraphLine } from "@simsys/stream";
 import type { Edge, Node } from "@xyflow/react";
-import type { Layout, Placed } from "./layout";
-import { sidesFor, type Box } from "./sides";
+import { absoluteBox, type Layout } from "./layout";
+import { sidesFor, type Side } from "./sides";
 
 export type Zone = "green" | "yellow" | "red";
 
@@ -70,9 +70,7 @@ export function toFlowElements(
     };
   });
   const edges: Edge[] = graph.links.map((link, i) => {
-    const from = absoluteBox(layout, link.from);
-    const to = absoluteBox(layout, link.to);
-    const sides = from && to ? sidesFor(from, to) : { source: "right", target: "left" };
+    const sides = layout.sides.get(`link-${i}`) ?? fallbackSides(layout, link.from, link.to);
     const id = `link-${i}`;
     const route = layout.routes.get(id);
     return {
@@ -154,16 +152,9 @@ function offeredAt(graph: GraphLine, store: DatasetStore, client: string, frame:
   return sum;
 }
 
-// A node's box in the diagram's coordinates: the layout places a node inside a datacenter box
-// relative to that box.
-function absoluteBox(layout: Layout, id: string): Box | undefined {
-  const place: Placed | undefined = layout.nodes.get(id);
-  if (place === undefined) return undefined;
-  const parent = place.parent === null ? undefined : layout.groups.get(place.parent);
-  return {
-    x: place.x + (parent?.x ?? 0),
-    y: place.y + (parent?.y ?? 0),
-    width: place.width,
-    height: place.height,
-  };
+// The facing sides from the boxes' places, for a link the layout gave no sides.
+function fallbackSides(layout: Layout, from: string, to: string): { source: Side; target: Side } {
+  const a = absoluteBox(layout, from);
+  const b = absoluteBox(layout, to);
+  return a && b ? sidesFor(a, b) : { source: "right", target: "left" };
 }
