@@ -559,8 +559,9 @@ TEST_CASE("explain's JSON gives a sharded database its shards beside its copies"
   CHECK(db["capacity_per_s"].as<double>() == 45'000);  // 3 copies x 3 shards x 5k/s
 }
 
-TEST_CASE("explain's JSON says how many copies a node_down takes, so a diagram can show the rest up",
-          "[stream]") {
+TEST_CASE(
+    "explain's JSON says how many copies a node_down takes, so a diagram can show the rest up",
+    "[stream]") {
   // The consistent-hashing lab takes one of its four cache servers down at 10 m (`replicas: 1`).
   const auto doc = graph_json_of("labs/consistent-hashing/scenario.yaml");
   REQUIRE(doc["faults"].size() == 1);
