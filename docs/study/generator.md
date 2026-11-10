@@ -1,5 +1,17 @@
 # C++20 coroutines and C++23 `std::generator`
 
+**Since 2026-11-10 the code uses `simsys::Generator<T>`** (`src/core/generator.cppm`), the
+project's own generator, in place of `std::generator`: LLVM's standard library (libc++ 20, the one
+a WebAssembly build uses) has no `<generator>`. It is about a hundred lines and shows what the
+standard type hides: the `promise_type` the compiler asks a coroutine's return type for
+(`get_return_object`, `initial_suspend`, `yield_value`, `final_suspend`, `unhandled_exception`) and
+an iterator that resumes the frame on `++`. It gives up `std::generator`'s nested generators
+(`co_yield std::ranges::elements_of(...)`), which `samples()` never needed. The sentinel
+comparison is a member, not a hidden friend: GCC 14.2 defines a friend of a module's class template
+in every unit that instantiates it (a "multiple definition" at link time). `tests/unit/test_generator.cpp`
+pins its properties (lazy, in order, exceptions at `begin` or `++`, an input range). What follows
+describes `std::generator`; everything in it holds for `simsys::Generator` too.
+
 ## Used in
 
 | Construct | File | Function |

@@ -67,6 +67,29 @@ jobs:
         run: cmake --build --preset gcc14-tsan
       - name: Test
         run: ctest --preset gcc14-tsan
+  # The same tests built by Clang (CLAUDE.md §3): the oldest Clang the project supports, over GCC's
+  # standard library, and Clang 20 over LLVM's own (libc++), the library a WebAssembly build
+  # (Emscripten) uses. Each one has found what GCC accepts and the standard does not promise.
+  build-test-clang:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - preset: clang19-debug
+            packages: gcc-14 g++-14 clang-19 clang-tools-19
+          - preset: clang20-libcxx-debug
+            packages: clang-20 clang-tools-20 libc++-20-dev libc++abi-20-dev
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ${{ matrix.preset }}'s toolchain and Ninja
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }} ninja-build
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
   format:
     runs-on: ubuntu-24.04
     steps:

@@ -21,7 +21,6 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <generator>
 #include <optional>
 #include <print>
 #include <span>
@@ -677,11 +676,11 @@ std::expected<CurveGrid, std::string> curve_grid(const std::filesystem::path& fi
 // every scenario step (the engine's dt) whatever --step prints, and ticked before each
 // value is read, as the engine ticks a client before it offers. The t = 0 row therefore
 // already includes one noise step, like the first step of a run.
-// C++23 std::generator<T> (from <generator>): a coroutine-backed, lazy, single-pass range.
-// simsys.workload produces samples one co_yield at a time; this file only iterates the
-// range, so a day at 1 s steps (86 400 rows) is printed without ever being stored. The
-// pre-C++23 way was a std::vector filled up front or a callback parameter.
-std::expected<std::generator<simsys::workload::Sample>, std::string> curve_samples(
+// simsys::Generator<T> (simsys.generator, the project's stand-in for C++23 std::generator): a
+// coroutine-backed, lazy, single-pass range. simsys.workload produces samples one co_yield at a
+// time; this file only iterates the range, so a day at 1 s steps (86 400 rows) is printed without
+// ever being stored. The pre-C++20 way was a std::vector filled up front or a callback parameter.
+std::expected<simsys::Generator<simsys::workload::Sample>, std::string> curve_samples(
     const std::filesystem::path& file, const simsys::model::Scenario& scenario,
     const ClientRef& client, const CurveArgs& args, const CurveGrid& grid) {
   const auto& workload = *client.spec->workload;
@@ -701,7 +700,7 @@ std::expected<std::generator<simsys::workload::Sample>, std::string> curve_sampl
 // so a fault shows on the curve exactly as the same `spikes` entry does. With --noise the noise
 // multiplies before the factor, where `run` multiplies after it: the two orders may differ in the
 // last bit.
-void print_samples(std::generator<simsys::workload::Sample>& samples,
+void print_samples(simsys::Generator<simsys::workload::Sample>& samples,
                    const simsys::model::Scenario& scenario, std::string_view client) {
   std::println("t_s,rate_per_s");
   for (const auto& sample : samples) {

@@ -16,10 +16,10 @@
 | `views::reverse` | `src/engine/engine.cppm`: `Simulation::backward_pass` |
 | C++23 `ranges::contains` | `graph.cpp`: `carries_op`, `Graph::add_edge`; `nodes.cpp`: `read_dc`; `workload.cpp`: `sends_op`; `engine.cppm`: `add_once`; `behaviours.cppm`: `SqlDbBehaviour::is_write` |
 | C++23 `ranges::fold_left` | `workload.cpp`: `check_shares_sum_to_one`; `src/report/explain.cpp`: `forward_limited`, `paper_pass`; `behaviours.cppm`: `RateLimiterBehaviour::admit_sliding_log` |
-| C++23 `ranges::to`, `views::join_with`, `views::zip` | `src/report/shared.cppm`: `join`; `report.cpp`: `map_to_strings`, `Summary::observe`; `explain.cpp`: `explain_links`; `workload.cpp`: `read_client_sizes` (`ranges::to<std::map>`) |
-| C++23 `ranges::iota`; `ranges::stable_sort` + lambda projection (C++20) | `report.cpp`: `rank_order` (the runs of `run --replications` sorted as indices, compared by the value the projection `[&](std::size_t run) { return values[run]; }` looks up, so the comparator stays `ranks_before(double, double)`; stable: ties in seed order) |
+| C++23 `ranges::to`, `views::join_with` (an example since 2026-11-10: libc++ 20 lacks it, so `join` is a loop), `views::zip` | `src/report/shared.cppm`: `join`; `report.cpp`: `map_to_strings`, `Summary::observe`; `explain.cpp`: `explain_links`; `workload.cpp`: `read_client_sizes` (`ranges::to<std::map>`) |
+| C++23 `ranges::iota` (replaced by C++11 `std::iota` on 2026-11-10: libc++ 20 lacks it); `ranges::stable_sort` + lambda projection (C++20) | `report.cpp`: `rank_order` (the runs of `run --replications` sorted as indices, compared by the value the projection `[&](std::size_t run) { return values[run]; }` looks up, so the comparator stays `ranks_before(double, double)`; stable: ties in seed order) |
 | `ranges::find_if` + projection | `report.cpp`: `text_band` (the first run whose cell text, the projection, is not blank) |
-| C++23 `views::cartesian_product` | `src/sweep/sweep.cpp`: `grid_points` (phase 4a: a sweep's grid, every pair of two keys' values) |
+| C++23 `views::cartesian_product` (an example since 2026-11-10: libc++ 20 lacks it, so `grid_points` is two nested loops) | `src/sweep/sweep.cpp`: `grid_points` (phase 4a: a sweep's grid, every pair of two keys' values) |
 | `views::keys` + `ranges::to`, `ranges::unique` | `report.cpp`: `priced_ops` (phase 4a: a node's ops with a cost, for the tables' `units` line) |
 
 ## What
@@ -43,6 +43,14 @@ return std::ranges::lower_bound(self.entries_, op, {}, &Entry::op);
 
 `{}` is the default comparison, `std::ranges::less`. C++23 added `ranges::to<C>()` to
 collect a view into a container, `contains`, `fold_left`, `zip` and `join_with`.
+
+**Portability, 2026-11-10.** Three of these C++23 additions are not in LLVM's standard library
+(libc++ 20), which a WebAssembly build uses: `views::join_with`, `views::cartesian_product` and
+`ranges::iota`. One version of the code must build with every toolchain, so `join`, `grid_points`
+and `rank_order` now use a loop, two nested loops and `std::iota`; the examples below are what the
+code was and will be again when libc++ has them. A piped `| std::ranges::to<C>()` is also written
+`std::ranges::to<C>(view)` in `shared.cppm`: Clang 20 over libstdc++ cannot instantiate the pipe's
+closure object in a module unit.
 
 C++23 also added `views::cartesian_product(a, b)`: every pair `(x, y)` with `x` from `a` and `y`
 from `b`, as a view of tuples, `a` the outer loop. `simsys sweep` with two `--param`s runs one
