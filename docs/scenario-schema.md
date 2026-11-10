@@ -2453,7 +2453,7 @@ YAML or re-derives a default). `format_version` first, then:
 | `links` | `from`, `to`, `direction`, `ops` (empty: every op), `one_way_s`, `bandwidth_mb_s` (`null` without a bandwidth), `pipe_row` (the link's index among a frame's `links` rows, which are the bandwidth links only; `null` without a bandwidth) |
 | `ops` | `client`, `op`, `share`: clients in node order, each client's ops by name (every frame's op rows) |
 | `slos` | `metric`, `node`, `op`, `max` (seconds for a time metric), `over_s` |
-| `faults` | `kind`, `target` (a node, or a datacenter for `dc_down`), `at_s`, `for_s` (`null` for an instant `cache_flush`) |
+| `faults` | `kind`, `target` (a node, or a datacenter for `dc_down`), `at_s`, `for_s` (`null` for an instant `cache_flush`), `replicas` (how many copies a `node_down` takes; `null`: every copy, and for every other kind) and `primary` (a `node_down` of a `sql_db`'s primary, `replicas: primary`), phase 5b |
 | `node_columns`, `link_columns`, `op_columns`, `estimated_columns` | the names of a frame's numbers, in order |
 
 ## Command line: `simsys estimate --at` (phase 4a)

@@ -2051,14 +2051,19 @@ constexpr std::array<std::string_view, 1> estimated_columns{"p99_ms"};
 
 // A scripted fault: its kind, what it strikes (a node, or a datacenter for dc_down), when and for
 // how long, in seconds from the run's start (t = 0 is midnight). An instant fault (a cache flush)
-// lasts no time: its for_s is null, as the run report's fault block writes it.
+// lasts no time: its for_s is null, as the run report's fault block writes it. A node_down's
+// `replicas` is how many copies it takes (null: every copy; model::Fault::replicas) and `primary`
+// whether it takes a sql_db's primary (`replicas: primary`), so a diagram can show the copies still
+// up (phase 5b; added keys, the format version unchanged).
 [[nodiscard]] std::string json_graph_fault(const model::Fault& fault) {
   const auto& target = fault.kind == model::FaultKind::dc_down ? fault.datacenter : fault.node;
   const auto lasting = model::lasts(fault.kind);
   return json_object(std::vector<std::string>{
       json_field("kind", json_string(model::to_string(fault.kind))),
       json_field("target", json_string(target)), json_field("at_s", json_number(seconds(fault.at))),
-      json_field("for_s", lasting ? json_number(seconds(fault.duration)) : "null")});
+      json_field("for_s", lasting ? json_number(seconds(fault.duration)) : "null"),
+      json_field("replicas", fault.replicas ? std::to_string(*fault.replicas) : "null"),
+      json_field("primary", fault.primary ? "true" : "false")});
 }
 
 }  // namespace
