@@ -9,7 +9,8 @@
 //   cards from a React context (FrameContext.ts), and the zone of each bandwidth link, applied to
 //   the edges only when it changes (withPipeZones).
 import type { DatasetStore, GraphLine } from "@simsys/stream";
-import type { Edge, Node } from "@xyflow/react";
+import { MarkerType, type Edge, type EdgeMarker, type Node } from "@xyflow/react";
+import { categoryOf, type Category } from "./categories";
 import { absoluteBox, type Layout } from "./layout";
 import { sidesFor, type Side } from "./sides";
 
@@ -23,6 +24,7 @@ export interface NodeData {
   readonly type: string;
   readonly replicas: number;
   readonly shards: number | null;
+  readonly category: Category;
 }
 
 // What a node card shows for one frame.
@@ -42,7 +44,7 @@ export function toFlowElements(
   // React Flow needs a box before the nodes inside it.
   const groups: Node[] = [...layout.groups].map(([id, box]) => ({
     id,
-    type: "group",
+    type: "datacenter",
     position: { x: box.x, y: box.y },
     style: { width: box.width, height: box.height },
     data: { label: id.slice("dc:".length) },
@@ -57,6 +59,7 @@ export function toFlowElements(
       type: node.type,
       replicas: node.replicas,
       shards: node.shards,
+      category: categoryOf(node.type),
     };
     return {
       id: node.id,
@@ -82,6 +85,8 @@ export function toFlowElements(
       // ELK's route around the boxes when it gave one; otherwise right-angled lines between the
       // facing sides (sides.ts).
       ...(route ? { type: "routed", data: { points: route } } : { type: "smoothstep" }),
+      // The arrowhead points at the box the link sends requests to.
+      markerEnd: arrow(null),
       ...(link.pipe_row === null ? {} : { className: "pipe" }),
     };
   });
@@ -125,7 +130,8 @@ export function pipeZonesAt(
 export function withPipeZones(edges: readonly Edge[], zones: readonly (Zone | null)[]): Edge[] {
   return edges.map((edge, i) => {
     const zone = zones[i];
-    return zone === null || zone === undefined ? edge : { ...edge, className: `pipe zone-${zone}` };
+    if (zone === null || zone === undefined) return edge;
+    return { ...edge, className: `pipe zone-${zone}`, markerEnd: arrow(zone) };
   });
 }
 
@@ -157,4 +163,22 @@ function fallbackSides(layout: Layout, from: string, to: string): { source: Side
   const a = absoluteBox(layout, from);
   const b = absoluteBox(layout, to);
   return a && b ? sidesFor(a, b) : { source: "right", target: "left" };
+}
+
+// An arrowhead for a link: the lines' grey, or a pipe's zone colour. React Flow draws a marker with
+// a fill colour, not a CSS variable, so the colours are given here (theme.css has the same ones).
+const arrowColours: Readonly<Record<Zone | "none", string>> = {
+  none: "#8a8f96",
+  green: "#1b8a4a",
+  yellow: "#b07800",
+  red: "#c62b1f",
+};
+
+function arrow(zone: Zone | null): EdgeMarker {
+  return {
+    type: MarkerType.ArrowClosed,
+    width: 18,
+    height: 18,
+    color: arrowColours[zone ?? "none"],
+  };
 }

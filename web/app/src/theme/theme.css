@@ -227,6 +227,57 @@ main h1 .chapter {
 }
 
 /* ---- the diagram ---- */
+/* A box's category is its band's colour (categories.ts), its zone the border and the pill. The
+   category hues keep clear of the zones' green, amber and red. */
+:root {
+  --cat-client: #374151;
+  --cat-traffic: #6d28d9;
+  --cat-compute: #1d4ed8;
+  --cat-cache: #0e7490;
+  --cat-database: #a21caf;
+  --cat-storage: #854d0e;
+  --cat-queue: #475569;
+  --cat-external: #6b7280;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --cat-client: #9ca3af;
+    --cat-traffic: #a78bfa;
+    --cat-compute: #60a5fa;
+    --cat-cache: #22d3ee;
+    --cat-database: #e879f9;
+    --cat-storage: #d6a35c;
+    --cat-queue: #94a3b8;
+    --cat-external: #9ca3af;
+  }
+}
+
+.cat-client {
+  --cat: var(--cat-client);
+}
+.cat-traffic-routing {
+  --cat: var(--cat-traffic);
+}
+.cat-compute {
+  --cat: var(--cat-compute);
+}
+.cat-cache {
+  --cat: var(--cat-cache);
+}
+.cat-database {
+  --cat: var(--cat-database);
+}
+.cat-storage {
+  --cat: var(--cat-storage);
+}
+.cat-queue {
+  --cat: var(--cat-queue);
+}
+.cat-external {
+  --cat: var(--cat-external);
+}
+
 .diagram .react-flow__node-system {
   width: 176px;
   padding: 0;
@@ -235,15 +286,34 @@ main h1 .chapter {
 }
 
 .node-card {
-  height: 68px;
-  padding: 6px 10px;
-  border: 2px solid var(--line);
-  border-left-width: 6px;
+  height: 84px;
+  overflow: hidden;
+  border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
   color: var(--ink);
   font-size: 12px;
   line-height: 1.35;
+}
+
+.node-card .node-category {
+  padding: 1px 8px;
+  background: var(--cat);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+@media (prefers-color-scheme: dark) {
+  .node-card .node-category {
+    color: #111;
+  }
+}
+
+.node-card .node-body {
+  padding: 4px 8px;
 }
 
 .node-card .node-id {
@@ -261,24 +331,43 @@ main h1 .chapter {
   text-overflow: ellipsis;
 }
 
-.node-card.zone-green {
-  border-color: var(--zone-green);
+.node-card .node-state {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.zone-pill {
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.zone-pill.zone-green {
+  color: var(--zone-green);
   background: var(--zone-green-bg);
 }
 
-.node-card.zone-yellow {
-  border-color: var(--zone-yellow);
+.zone-pill.zone-yellow {
+  color: var(--ink);
   background: var(--zone-yellow-bg);
+  border: 1px solid var(--zone-yellow);
+}
+
+.zone-pill.zone-red {
+  color: #fff;
+  background: var(--zone-red);
+}
+
+/* Green is the normal state: a plain border. Yellow and red stand out. */
+.node-card.zone-yellow {
+  border: 2px solid var(--zone-yellow);
 }
 
 .node-card.zone-red {
-  border-color: var(--zone-red);
+  border: 3px solid var(--zone-red);
   background: var(--zone-red-bg);
-}
-
-.client .node-card {
-  border-color: var(--client);
-  background: var(--client-bg);
 }
 
 .react-flow__node.selected .node-card {
@@ -286,18 +375,24 @@ main h1 .chapter {
   outline-offset: 2px;
 }
 
-.diagram .react-flow__node-group.datacenter {
+.diagram .react-flow__node-datacenter {
   border: 1px dashed var(--muted);
   border-radius: 10px;
   background: transparent;
 }
 
-.diagram .react-flow__node-group.datacenter::before {
-  content: attr(data-id);
+.datacenter-label {
+  padding: 6px 10px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .diagram .react-flow__edge-path {
-  stroke: var(--muted);
+  stroke: #8a8f96;
+  stroke-width: 1.5;
 }
 
 .diagram .react-flow__edge.pipe .react-flow__edge-path {
