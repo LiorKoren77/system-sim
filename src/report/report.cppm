@@ -14,6 +14,7 @@ module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this interface imports other modules
 // (GCC 14.2 'Bad file data' bug, CLAUDE.md §3). Heavy headers go in report.cpp.
 #include <cstddef>
+#include <functional>
 #include <iosfwd>
 #include <optional>
 #include <span>
@@ -702,6 +703,135 @@ class OpSeriesWriter {
  private:
   std::ostream* out_;
   std::vector<std::string> ids_;  // node ids, indexed like Graph::nodes(): a sample's client
+};
+
+// ---- the frames of `run --stream` (phase 5a spec §6.2) ----
+//
+// What a web page draws from: one frame per BUCKET of consecutive steps, so that a day of 864,000
+// steps reaches the browser as about 720 frames of a few kilobytes each. The engine still steps at
+// the scenario's step (accuracy is decided there); only what is written is reduced, and each number
+// keeps its meaning by the aggregate it gets:
+//   rates (demand, drain, drops, refusals)  the bucket's mean, Σ x·dt / Σ dt
+//   peaks (rho, backlog, a queue's lag)      the bucket's largest
+//   levels (backlog, open connections)       the bucket's last value
+//   the zone                                 the worst of its steps (red if any step was red)
+// The means and the last backlog keep the fluid queue's conservation law per bucket:
+//   mean_demand · Δt = (mean_drain + mean_dropped) · Δt + backlog(end) − backlog(start)
+// (the per-step law of engine::NodeSample, summed over the bucket's steps); a max of the rates or a
+// mean of the backlog would break it. A short overload inside a long bucket is diluted in the means
+// and kept in the peaks, the worst zone and red_s.
+
+// One node's or one bandwidth link's numbers over a bucket, in the frame's units (latency in ms; a
+// pipe's in megabytes). A column the row does not have is empty: a client's queue (a source has
+// none: its rates are its op rows), a service's lag or connections, a pipe's refusals. A latency is
+// empty too when some step of the bucket never answered (infinite).
+struct NodeRow {
+  std::optional<double> demand_per_s{};    // mean
+  std::optional<double> drain_per_s{};     // mean
+  std::optional<double> dropped_per_s{};   // mean
+  std::optional<double> rejected_per_s{};  // mean (a rate limiter's refusals); none on a pipe
+  std::optional<double> backlog{};         // the level at the bucket's end
+  std::optional<double> peak_backlog{};    // max
+  std::optional<double> mean_rho{};        // mean
+  std::optional<double> peak_rho{};        // max
+  std::optional<int> zone{};               // the worst: 0 green, 1 yellow, 2 red (fluid::Zone)
+  std::optional<double> red_s{};           // seconds of the bucket in red
+  std::optional<double> latency_ms{};   // drain-weighted mean sojourn (time mean if none drained)
+  std::optional<double> queue_lag_s{};  // max: a message queue's or a frontier's
+  std::optional<double> connections{};  // the last level: a websocket gateway's
+  std::optional<double> dead_lettered_per_s{};  // mean: a worker pool's
+  std::optional<double> deduplicated_per_s{};   // mean: a notification fan-out's
+};
+
+// One (client, op) over a bucket: the rates as means, the answered requests' mean response and
+// their 99th percentile, estimated by the run's rule (a lognormal fit to the response moments
+// pooled over the bucket's steps, capped at the client's timeout); both empty when nothing was
+// answered.
+struct OpRow {
+  std::optional<double> offered_per_s{};
+  std::optional<double> attempts_per_s{};
+  std::optional<double> answered_per_s{};
+  std::optional<double> timed_out_per_s{};
+  std::optional<double> mean_ms{};
+  std::optional<double> p99_ms{};
+};
+
+// A bucket: from `t` (its first step's time) for `dt_s` seconds (shorter for a last bucket that the
+// run's steps did not fill). Rows in the graph's order: nodes as Graph::nodes(), links as the
+// bandwidth links of engine::StepRecord::links, ops as engine::StepRecord::responses (clients in
+// node order, each client's ops by name). The special members are declared here and defaulted in
+// stream.cpp, out of line (the tenth GCC 14.2 defect, CLAUDE.md §3: an importer that instantiated
+// the implicit ones over the vectors would hit an ICE in Release).
+struct Frame {
+  SimTime t{};
+  double dt_s{};
+  std::vector<NodeRow> nodes{};
+  std::vector<NodeRow> links{};
+  std::vector<OpRow> ops{};
+
+  Frame();
+  Frame(const Frame& other);
+  Frame(Frame&& other) noexcept;
+  Frame& operator=(const Frame& other);
+  Frame& operator=(Frame&& other) noexcept;
+  ~Frame();
+};
+
+// Pattern: Observer — like Summary and SeriesWriter, it watches every StepRecord of a run
+// (session::RunObservers); every `steps_per_bucket` records it hands the finished Frame to `sink`.
+// Pattern: Strategy for what becomes of a frame: the stream writes it as a line of JSON, a test
+// collects it, so the aggregation rules are tested without any output. `finish` hands over the last
+// bucket when the run's steps did not fill it (nothing otherwise, and nothing the second time). `g`
+// must outlive the aggregator; a bucket of 0 steps is a programmer error (std::invalid_argument).
+// Not copyable: it is watched by pointer, like the series writers.
+class FrameAggregator {
+ public:
+  FrameAggregator(const graph::Graph& g, std::size_t steps_per_bucket,
+                  std::function<void(const Frame&)> sink);
+  FrameAggregator(const FrameAggregator&) = delete;
+  FrameAggregator& operator=(const FrameAggregator&) = delete;
+  ~FrameAggregator();
+
+  void observe(const engine::StepRecord& record);
+  void finish();
+
+ private:
+  // One node's or pipe's sums over the bucket so far (NodeRow says what each becomes).
+  struct QueueSums {
+    double demand{};    // Σ demand_per_s·dt
+    double drain{};     // Σ drain_per_s·dt
+    double dropped{};   // Σ dropped_per_s·dt
+    double rejected{};  // Σ rejected_per_s·dt
+    double rho{};       // Σ rho·dt
+    double backlog{};   // the last step's
+    double peak_backlog{};
+    double peak_rho{};
+    int zone{};  // the worst so far
+    double red_s{};
+    double latency_by_drain{};              // Σ latency·drain·dt
+    double latency_by_time{};               // Σ latency·dt
+    bool unanswered{};                      // some step's latency was infinite
+    std::optional<double> queue_lag_s{};    // max
+    std::optional<double> connections{};    // last
+    std::optional<double> dead_lettered{};  // Σ ·dt
+    std::optional<double> deduplicated{};   // Σ ·dt
+  };
+
+  void start_bucket(const engine::StepRecord& record);
+  void add_node(QueueSums& sums, const engine::NodeSample& sample) const;
+  void add_link(QueueSums& sums, const engine::LinkSample& sample) const;
+  [[nodiscard]] NodeRow node_row(const QueueSums& sums, bool client) const;
+  [[nodiscard]] NodeRow link_row(const QueueSums& sums) const;
+  void hand_over();
+
+  const graph::Graph* graph_;
+  std::size_t steps_per_bucket_;
+  std::function<void(const Frame&)> sink_;
+  double step_s_;        // every step's length: the scenario's step
+  std::size_t steps_{};  // steps in the bucket so far; 0: no bucket open
+  SimTime start_{};      // the bucket's first step
+  std::vector<QueueSums> nodes_{};
+  std::vector<QueueSums> links_{};
 };
 
 }  // namespace simsys::report
