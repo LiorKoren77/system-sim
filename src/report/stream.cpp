@@ -59,6 +59,9 @@ void FrameAggregator::observe(const engine::StepRecord& record) {
   for (std::size_t i = 0; i < links_.size() && i < record.links.size(); ++i) {
     add_link(links_[i], record.links[i]);
   }
+  for (std::size_t j = 0; j < ops_.size() && j < record.responses.size(); ++j) {
+    add_op(ops_[j], record.responses[j], step_s_);
+  }
   if (++steps_ == steps_per_bucket_) hand_over();
 }
 
@@ -72,6 +75,8 @@ void FrameAggregator::start_bucket(const engine::StepRecord& record) {
   start_ = record.t;
   nodes_.assign(record.nodes.size(), QueueSums{});
   links_.assign(record.links.size(), QueueSums{});
+  ops_.clear();
+  for (const auto& response : record.responses) ops_.push_back(OpSums{.client = response.client});
 }
 
 namespace {
@@ -90,6 +95,17 @@ void add_optional(std::optional<double>& sum, const std::optional<double>& value
 }
 
 }  // namespace
+
+// The op's rates as Summary sums them, and its response into the bucket's own mixtures
+// (ResponseMoments::add: weighted by the requests answered and delivered).
+void FrameAggregator::add_op(OpSums& sums, const engine::ResponseSample& sample, double dt_s) {
+  sums.offered += sample.offered.per_second * dt_s;
+  sums.attempts += sample.attempts.per_second * dt_s;
+  sums.answered += sample.answered.per_second * dt_s;
+  sums.timed_out += sample.timed_out.per_second * dt_s;
+  sums.timed_out_attempts += sample.timed_out_attempts.per_second * dt_s;
+  sums.response.add(sample, dt_s);
+}
 
 void FrameAggregator::add_node(QueueSums& sums, const engine::NodeSample& sample) const {
   const double dt = step_s_;
@@ -169,6 +185,28 @@ NodeRow FrameAggregator::link_row(const QueueSums& sums) const {
   return row;
 }
 
+// The op's rates as means; its mean response and p99 by the run's rule (seen_latencies, capped at
+// the client's timeout), or empty when the bucket answered nothing or its path never answered.
+OpRow FrameAggregator::op_row(const OpSums& sums) const {
+  const double length = step_s_ * static_cast<double>(steps_);
+  OpRow row{.offered_per_s = sums.offered / length,
+            .attempts_per_s = sums.attempts / length,
+            .answered_per_s = sums.answered / length,
+            .timed_out_per_s = sums.timed_out / length};
+  if (!(sums.answered > 0.0) || sums.response.unavailable) return row;
+  const auto timeout_s = graph::client_timeout_s(graph_->nodes()[sums.client].spec);
+  const auto seen = seen_latencies(sums.response, timeout_s,
+                                   timed_out_share(sums.answered, sums.timed_out_attempts));
+  if (!seen) return row;
+  const auto in_ms = [](double s) -> std::optional<double> {
+    if (!std::isfinite(s)) return std::nullopt;
+    return s * 1000.0;
+  };
+  row.mean_ms = in_ms(seen->mean_s);
+  row.p99_ms = in_ms(seen->p99_s);
+  return row;
+}
+
 void FrameAggregator::hand_over() {
   Frame frame;
   frame.t = start_;
@@ -179,6 +217,7 @@ void FrameAggregator::hand_over() {
     frame.nodes.push_back(node_row(nodes_[i], client));
   }
   for (const auto& sums : links_) frame.links.push_back(link_row(sums));
+  for (const auto& sums : ops_) frame.ops.push_back(op_row(sums));
   steps_ = 0;
   sink_(frame);
 }

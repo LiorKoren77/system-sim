@@ -855,11 +855,24 @@ class FrameAggregator {
     std::optional<double> deduplicated{};   // Σ ·dt
   };
 
+  // One (client, op)'s sums over the bucket so far (OpRow says what each becomes).
+  struct OpSums {
+    std::size_t client{};         // the client's node index
+    double offered{};             // Σ offered·dt
+    double attempts{};            // Σ attempts·dt
+    double answered{};            // Σ answered·dt
+    double timed_out{};           // Σ timed_out·dt
+    double timed_out_attempts{};  // Σ timed_out_attempts·dt: the share a percentile asks about
+    ResponseMoments response{};   // the run's mixtures, over this bucket only
+  };
+
   void start_bucket(const engine::StepRecord& record);
   void add_node(QueueSums& sums, const engine::NodeSample& sample) const;
   void add_link(QueueSums& sums, const engine::LinkSample& sample) const;
+  static void add_op(OpSums& sums, const engine::ResponseSample& sample, double dt_s);
   [[nodiscard]] NodeRow node_row(const QueueSums& sums, bool client) const;
   [[nodiscard]] NodeRow link_row(const QueueSums& sums) const;
+  [[nodiscard]] OpRow op_row(const OpSums& sums) const;
   void hand_over();
 
   const graph::Graph* graph_;
@@ -870,6 +883,7 @@ class FrameAggregator {
   SimTime start_{};      // the bucket's first step
   std::vector<QueueSums> nodes_{};
   std::vector<QueueSums> links_{};
+  std::vector<OpSums> ops_{};
 };
 
 }  // namespace simsys::report
