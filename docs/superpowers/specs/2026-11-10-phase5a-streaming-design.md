@@ -170,8 +170,10 @@ A node row, its columns as `node_columns` lists them:
 | `connections` | last | a gateway's open connections, a level; `null` elsewhere |
 | `dead_lettered_per_s`, `deduplicated_per_s` | mean | a worker pool's, a fan-out's; `null` elsewhere |
 
-A client's row is all `null` except the rates it offers (a source has no queue: today's series leaves
-those cells empty). A link row: the node columns that `--series` gives a link, in MB.
+A client's row is all `null`: a source has no queue, and what it offers is in its op rows (as built:
+the draft said the client row would keep its offered rate, which would have said the same thing
+twice). A link row: the columns `link_columns` names, in MB, its latency weighted by the megabytes
+offered, as the run report weighs a link's.
 
 **Conservation.** The fluid queue's balance per step (`demand·dt = (drain + dropped)·dt + Δbacklog`,
 spec §3.3 and `engine::NodeSample`) sums over a bucket's steps into the same balance for the bucket,

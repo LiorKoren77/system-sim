@@ -1462,11 +1462,15 @@ void json_storm(const engine::FaultAfter& after, std::vector<std::string>& field
   const bool observed = summary.observed_steps() > 0;
   const auto worst = summary.worst_drop_node();
   const auto worst_rejecting = summary.worst_reject_node();
-  const std::string steps_line =
-      "  " + json_field("steps", std::to_string(summary.observed_steps()));
   std::vector<std::string> lines{
       "  " + json_field("scenario", json_string(summary.scenario_name())),
-      steps_line,
+      "  " + json_field("steps", std::to_string(summary.observed_steps()))};
+  // estimate only, right after `steps`: the instant it settled at, in seconds (`--at`; 0 without
+  // it).
+  if (summary.is_estimate()) {
+    lines.push_back("  " + json_field("at_s", json_number(seconds(summary.estimate_at()))));
+  }
+  const std::array rest{
       "  " + json_field("drop_rate", observed ? json_number(summary.drop_rate()) : "null"),
       "  " + json_field("worst_drop_node", worst.empty() ? "null" : json_string(worst)),
       "  " + json_field("reject_rate", observed ? json_number(summary.reject_rate()) : "null"),
@@ -1478,11 +1482,7 @@ void json_storm(const engine::FaultAfter& after, std::vector<std::string>& field
       json_array("links", map_to_strings(std::span<const LinkSummary>{links}, json_link)),
       json_array("ops", map_to_strings(std::span<const OpSummary>{ops}, json_op)),
       json_array("slo", slo_objects)};
-  // estimate only, after `steps`: the instant it settled at, in seconds (`--at`; 0 without it).
-  if (summary.is_estimate()) {
-    lines.insert(std::ranges::find(lines, steps_line) + 1,
-                 "  " + json_field("at_s", json_number(seconds(summary.estimate_at()))));
-  }
+  lines.insert(lines.end(), rest.begin(), rest.end());
   if (summary.faults().empty()) return lines;
   // The faults array, last and only with faults: a report without them is what it was before.
   std::vector<std::string> faults;
@@ -2140,12 +2140,28 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
 // (phase 3 Task 6's review: a node that is down drops what its full room cannot hold, and those
 // steps must not decide the op's latency for the whole run).
 void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
+  rates.add(sample, dt_s);
+  response.add(sample, dt_s);
+}
+
+void OpRates::add(const engine::ResponseSample& sample, double dt_s) {
   offered += sample.offered.per_second * dt_s;
   attempts += sample.attempts.per_second * dt_s;
   answered += sample.answered.per_second * dt_s;
   timed_out += sample.timed_out.per_second * dt_s;
   timed_out_attempts += sample.timed_out_attempts.per_second * dt_s;
-  response.add(sample, dt_s);
+}
+
+engine::NodeSample as_node_sample(const engine::LinkSample& sample) {
+  // C++20 designated initializers: the fields named, in declaration order; the rest of NodeSample
+  // (a node type's own figures) stays empty.
+  return engine::NodeSample{.demand_per_s = sample.demand_per_s,
+                            .drain_per_s = sample.drain_per_s,
+                            .dropped_per_s = sample.dropped_per_s,
+                            .backlog = sample.backlog,
+                            .rho = sample.rho,
+                            .latency = sample.latency,
+                            .zone = sample.zone};
 }
 
 // `timed_out` counts every attempt that timed out (OpTotals::timed_out_attempts), the retried ones
@@ -2178,14 +2194,7 @@ void ResponseMoments::add(const engine::ResponseSample& sample, double dt_s) {
 // the same names, in megabytes), so its node-table columns accumulate exactly as a node's do
 // (NodeTotals::add); a pipe never rejects. What only the link's JSON shows comes beside them.
 void Summary::LinkTotals::add(const engine::LinkSample& sample, double dt_s) {
-  queue.add(engine::NodeSample{.demand_per_s = sample.demand_per_s,
-                               .drain_per_s = sample.drain_per_s,
-                               .dropped_per_s = sample.dropped_per_s,
-                               .backlog = sample.backlog,
-                               .rho = sample.rho,
-                               .latency = sample.latency,
-                               .zone = sample.zone},
-            dt_s);
+  queue.add(as_node_sample(sample), dt_s);
   drained += sample.drain_per_s * dt_s;
   backlog_time += sample.backlog * dt_s;
   by_demand.add(sample.demand_per_s * dt_s, sample.latency.mean_s, sample.latency.variance_s2);
@@ -2514,16 +2523,16 @@ std::vector<OpSummary> Summary::ops() const {
   std::vector<OpSummary> out;
   for (const auto& t : ops_) {
     const auto& client = graph_->nodes()[t.client].spec;
-    OpSummary op{
-        .client = client.id,
-        .op = t.op,
-        .offered_per_s = observed_s_ > 0.0 ? t.offered / observed_s_ : 0.0,
-        .attempts_per_s = observed_s_ > 0.0 ? t.attempts / observed_s_ : 0.0,
-        .answered_per_s = observed_s_ > 0.0 ? t.answered / observed_s_ : 0.0,
-        .timed_out_per_s = observed_s_ > 0.0 ? t.timed_out / observed_s_ : 0.0,
-        .timed_out_attempts_per_s = observed_s_ > 0.0 ? t.timed_out_attempts / observed_s_ : 0.0,
-        .timeout_s = graph::client_timeout_s(client),
-        .timed_out_share = timed_out_share(t.answered, t.timed_out_attempts)};
+    OpSummary op{.client = client.id,
+                 .op = t.op,
+                 .offered_per_s = observed_s_ > 0.0 ? t.rates.offered / observed_s_ : 0.0,
+                 .attempts_per_s = observed_s_ > 0.0 ? t.rates.attempts / observed_s_ : 0.0,
+                 .answered_per_s = observed_s_ > 0.0 ? t.rates.answered / observed_s_ : 0.0,
+                 .timed_out_per_s = observed_s_ > 0.0 ? t.rates.timed_out / observed_s_ : 0.0,
+                 .timed_out_attempts_per_s =
+                     observed_s_ > 0.0 ? t.rates.timed_out_attempts / observed_s_ : 0.0,
+                 .timeout_s = graph::client_timeout_s(client),
+                 .timed_out_share = timed_out_share(t.rates.answered, t.rates.timed_out_attempts)};
     if (t.response.unavailable) {
       op.mean_s = op.p50_s = op.p95_s = op.p99_s = infinity;
     } else {

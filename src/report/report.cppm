@@ -64,6 +64,22 @@ struct ResponseMoments {
   void add(const engine::ResponseSample& sample, double dt_s);
 };
 
+// One (client, op)'s rates summed over many steps (Σ rate·dt, in requests), the same sums for a run
+// (Summary) and a bucket of a stream (FrameAggregator): one copy, so a frame and the report cannot
+// count an op differently.
+struct OpRates {
+  double offered{};             // Σ offered·dt
+  double attempts{};            // Σ attempts·dt: `offered` and the retries
+  double answered{};            // Σ answered·dt: the part of `offered` that came back
+  double timed_out{};           // Σ timed_out·dt: delivered, but after the client gave up
+  double timed_out_attempts{};  // Σ timed_out_attempts·dt: every attempt that timed out
+  void add(const engine::ResponseSample& sample, double dt_s);
+};
+
+// A bandwidth link's pipe as a node's sample: the fields of the same names (in megabytes), none of
+// a node type's own (Summary's link totals and the frames' link rows both read it so).
+[[nodiscard]] engine::NodeSample as_node_sample(const engine::LinkSample& sample);
+
 // The latency figures of an op, in seconds: the answered requests' mean and the percentiles the
 // client saw.
 struct SeenLatencies {
@@ -431,12 +447,8 @@ class Summary {
   struct OpTotals {
     std::size_t client{};
     std::string op{};
-    double offered{};    // Σ offered·dt, requests
-    double attempts{};   // Σ attempts·dt, requests sent: `offered` and the retries
-    double answered{};   // Σ answered·dt, requests: the part of `offered` that came back
-    double timed_out{};  // Σ timed_out·dt, requests: delivered, but after the client gave up
-    double timed_out_attempts{};  // Σ timed_out_attempts·dt: every attempt that timed out
-    ResponseMoments response{};   // the latency the op's requests saw (ResponseMoments)
+    OpRates rates{};             // the op's rates over the observed steps
+    ResponseMoments response{};  // the latency the op's requests saw (ResponseMoments)
     void add(const engine::ResponseSample& sample, double dt_s);
   };
 
@@ -875,9 +887,10 @@ class FrameAggregator {
     double peak_rho{};
     int zone{};  // the worst so far
     double red_s{};
-    double latency_by_drain{};              // Σ latency·drain·dt
-    double latency_by_time{};               // Σ latency·dt
-    bool unanswered{};                      // some step's latency was infinite
+    double latency_weighted{};  // Σ latency·w·dt, w the drain (a node) or the demand (a pipe)
+    double latency_weight{};    // Σ w·dt
+    double latency_by_time{};   // Σ latency·dt
+    bool unanswered{};          // some step's latency was infinite
     std::optional<double> queue_lag_s{};    // max
     std::optional<double> connections{};    // last
     std::optional<double> dead_lettered{};  // Σ ·dt
@@ -886,16 +899,15 @@ class FrameAggregator {
 
   // One (client, op)'s sums over the bucket so far (OpRow says what each becomes).
   struct OpSums {
-    std::size_t client{};         // the client's node index
-    double offered{};             // Σ offered·dt
-    double attempts{};            // Σ attempts·dt
-    double answered{};            // Σ answered·dt
-    double timed_out{};           // Σ timed_out·dt
-    double timed_out_attempts{};  // Σ timed_out_attempts·dt: the share a percentile asks about
-    ResponseMoments response{};   // the run's mixtures, over this bucket only
+    std::size_t client{};        // the client's node index
+    OpRates rates{};             // the run's sums, over this bucket only
+    ResponseMoments response{};  // the run's mixtures, over this bucket only
   };
 
   void start_bucket(const engine::StepRecord& record);
+  // `weight` the rate a step's latency counts with: a node's drain, a pipe's demand (as Summary
+  // weighs them, so a frame of the whole run gives the report's figure).
+  void add_queue(QueueSums& sums, const engine::NodeSample& sample, double weight) const;
   void add_node(QueueSums& sums, const engine::NodeSample& sample) const;
   void add_link(QueueSums& sums, const engine::LinkSample& sample) const;
   static void add_op(OpSums& sums, const engine::ResponseSample& sample, double dt_s);

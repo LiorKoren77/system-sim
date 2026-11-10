@@ -387,6 +387,8 @@ NodeSample serving(double rho, double drain = 0.0, double latency_s = 0.001) {
   return sample;
 }
 
+// C++20 std::span<const T>: a view of contiguous records without a copy; a vector, an array or
+// `.first(n)` of either passes as one.
 std::vector<Frame> frames_of(std::span<const StepRecord> records, std::size_t steps_per_bucket,
                              const simsys::graph::Graph& g = probe_graph()) {
   std::vector<Frame> frames;
@@ -469,6 +471,27 @@ TEST_CASE("a bucket that served nothing reports the time mean of its sojourns", 
   const std::vector<StepRecord> records{record_at(0, serving(0.0, 0.0, 0.001)),
                                         record_at(1, serving(0.0, 0.0, 0.003))};
   CHECK_THAT(*frames_of(records, 2)[0].nodes[1].latency_ms, WithinRel(2.0, 1e-12));
+}
+
+TEST_CASE("a pipe's bucket latency is weighted by the megabytes it was offered", "[stream]") {
+  // The run report weighs a link's latency by demand (Summary's by_demand), not by what it drained:
+  // a saturated pipe drains the same in both steps while its demand differs. Demands 100 and 300
+  // MB/s at 10 ms and 30 ms: (100 x 10 + 300 x 30) / 400 = 25 ms (weighted by drain, equal here,
+  // it would be 20 ms).
+  const auto g = *simsys::graph::Graph::build(simsys::test_support::piped(400));
+  const auto pipe_step = [](int k, double demand, double latency_s) {
+    StepRecord record{.t = k * 100ms, .nodes = {NodeSample{}, NodeSample{}}};
+    simsys::engine::LinkSample link{};
+    link.demand_per_s = demand;
+    link.drain_per_s = 125;
+    link.latency.mean_s = latency_s;
+    record.links = {link};
+    return record;
+  };
+  const std::vector<StepRecord> records{pipe_step(0, 100, 0.010), pipe_step(1, 300, 0.030)};
+  const auto frames = frames_of(records, 2, g);
+  REQUIRE(frames[0].links.size() == 1);
+  CHECK_THAT(*frames[0].links[0].latency_ms, WithinRel(25.0, 1e-12));
 }
 
 TEST_CASE("columns a node does not have are null in its row, and a client has no queue",

@@ -28,6 +28,7 @@ import :shared;
 // C++20 `import`: the compiled interfaces of the modules this unit reads from.
 import simsys.core;
 import simsys.engine;
+import simsys.flow; // nan_propagating_max: a NaN lag stays visible, as in the run's report
 import simsys.fluid;
 import simsys.graph;
 import simsys.model;
@@ -80,6 +81,8 @@ void FrameAggregator::start_bucket(const engine::StepRecord& record) {
   nodes_.assign(record.nodes.size(), QueueSums{});
   links_.assign(record.links.size(), QueueSums{});
   ops_.clear();
+  // C++20 designated initializers: the member named where the value is built; the others keep
+  // their default member initializers (here: empty sums).
   for (const auto& response : record.responses) ops_.push_back(OpSums{.client = response.client});
 }
 
@@ -103,15 +106,22 @@ void add_optional(std::optional<double>& sum, const std::optional<double>& value
 // The op's rates as Summary sums them, and its response into the bucket's own mixtures
 // (ResponseMoments::add: weighted by the requests answered and delivered).
 void FrameAggregator::add_op(OpSums& sums, const engine::ResponseSample& sample, double dt_s) {
-  sums.offered += sample.offered.per_second * dt_s;
-  sums.attempts += sample.attempts.per_second * dt_s;
-  sums.answered += sample.answered.per_second * dt_s;
-  sums.timed_out += sample.timed_out.per_second * dt_s;
-  sums.timed_out_attempts += sample.timed_out_attempts.per_second * dt_s;
+  sums.rates.add(sample, dt_s);
   sums.response.add(sample, dt_s);
 }
 
 void FrameAggregator::add_node(QueueSums& sums, const engine::NodeSample& sample) const {
+  add_queue(sums, sample, sample.drain_per_s);
+}
+
+// A pipe has a node's queue numbers and none of its type-specific ones (as_node_sample); its
+// latency is weighted by the megabytes it was offered, as Summary weighs a link's (by_demand).
+void FrameAggregator::add_link(QueueSums& sums, const engine::LinkSample& sample) const {
+  add_queue(sums, as_node_sample(sample), sample.demand_per_s);
+}
+
+void FrameAggregator::add_queue(QueueSums& sums, const engine::NodeSample& sample,
+                                double weight) const {
   const double dt = step_s_;
   sums.demand += sample.demand_per_s * dt;
   sums.drain += sample.drain_per_s * dt;
@@ -124,33 +134,25 @@ void FrameAggregator::add_node(QueueSums& sums, const engine::NodeSample& sample
   sums.zone = std::max(sums.zone, zone_number(sample.zone));
   if (sample.zone == fluid::Zone::red) sums.red_s += dt;
   if (std::isfinite(sample.latency.mean_s)) {
-    sums.latency_by_drain += sample.latency.mean_s * sample.drain_per_s * dt;
+    sums.latency_weighted += sample.latency.mean_s * weight * dt;
+    sums.latency_weight += weight * dt;
     sums.latency_by_time += sample.latency.mean_s * dt;
   } else {
     sums.unanswered = true;
   }
   if (sample.queue_lag_s) {
-    sums.queue_lag_s = std::max(sums.queue_lag_s.value_or(0.0), *sample.queue_lag_s);
+    sums.queue_lag_s = sums.queue_lag_s
+                           ? flow::nan_propagating_max(*sums.queue_lag_s, *sample.queue_lag_s)
+                           : *sample.queue_lag_s;
   }
   if (sample.connections) sums.connections = sample.connections;
   add_optional(sums.dead_lettered, sample.dead_lettered_per_s, dt);
   add_optional(sums.deduplicated, sample.deduplicated_per_s, dt);
 }
 
-// A pipe has a node's queue numbers and none of its type-specific ones (engine::LinkSample).
-void FrameAggregator::add_link(QueueSums& sums, const engine::LinkSample& sample) const {
-  add_node(sums, engine::NodeSample{.demand_per_s = sample.demand_per_s,
-                                    .drain_per_s = sample.drain_per_s,
-                                    .dropped_per_s = sample.dropped_per_s,
-                                    .backlog = sample.backlog,
-                                    .rho = sample.rho,
-                                    .latency = sample.latency,
-                                    .zone = sample.zone});
-}
-
 // The row of a bucket of `steps_` steps: each sum over its length, each peak and level as kept. The
 // latency is weighted by the requests each step served (the sojourn an average request of the
-// bucket saw), or by time when the bucket served nothing.
+// bucket saw; a pipe's by the megabytes it was offered), or by time when that weight was 0.
 NodeRow FrameAggregator::node_row(const QueueSums& sums, bool client) const {
   if (client) return {};  // a source has no queue: its rates are its op rows
   const double length = step_s_ * static_cast<double>(steps_);
@@ -161,8 +163,8 @@ NodeRow FrameAggregator::node_row(const QueueSums& sums, bool client) const {
   };
   std::optional<double> latency_ms{};
   if (!sums.unanswered) {
-    const double latency_s =
-        sums.drain > 0.0 ? sums.latency_by_drain / sums.drain : sums.latency_by_time / length;
+    const double latency_s = sums.latency_weight > 0.0 ? sums.latency_weighted / sums.latency_weight
+                                                       : sums.latency_by_time / length;
     latency_ms = latency_s * 1000.0;
   }
   return NodeRow{.demand_per_s = mean(sums.demand),
@@ -193,14 +195,17 @@ NodeRow FrameAggregator::link_row(const QueueSums& sums) const {
 // the client's timeout), or empty when the bucket answered nothing or its path never answered.
 OpRow FrameAggregator::op_row(const OpSums& sums) const {
   const double length = step_s_ * static_cast<double>(steps_);
-  OpRow row{.offered_per_s = sums.offered / length,
-            .attempts_per_s = sums.attempts / length,
-            .answered_per_s = sums.answered / length,
-            .timed_out_per_s = sums.timed_out / length};
-  if (!(sums.answered > 0.0) || sums.response.unavailable) return row;
+  OpRow row{.offered_per_s = sums.rates.offered / length,
+            .attempts_per_s = sums.rates.attempts / length,
+            .answered_per_s = sums.rates.answered / length,
+            .timed_out_per_s = sums.rates.timed_out / length};
+  // Nothing answered: no latency, as the run report's JSON writes null for an op nobody answered
+  // (nothing_answered), even when its requests were delivered after the timeout.
+  if (!(sums.rates.answered > 0.0) || sums.response.unavailable) return row;
   const auto timeout_s = graph::client_timeout_s(graph_->nodes()[sums.client].spec);
-  const auto seen = seen_latencies(sums.response, timeout_s,
-                                   timed_out_share(sums.answered, sums.timed_out_attempts));
+  const auto seen =
+      seen_latencies(sums.response, timeout_s,
+                     timed_out_share(sums.rates.answered, sums.rates.timed_out_attempts));
   if (!seen) return row;
   const auto in_ms = [](double s) -> std::optional<double> {
     if (!std::isfinite(s)) return std::nullopt;
