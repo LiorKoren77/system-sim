@@ -7,9 +7,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)          # -std=c++23, not gnu++23
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)     # let CMake discover `export module` / `import` dependencies
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
-  message(FATAL_ERROR "system-sim needs GCC >= 14 (std::expected, std::generator, named modules). "
-                      "Clang 18 cannot build it; use it for clang-format/clang-tidy only.")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 14)
+  set(SIMSYS_GCC ON)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 19)
+  set(SIMSYS_GCC OFF)
+else()
+  message(FATAL_ERROR "system-sim needs GCC >= 14 or Clang >= 19 (std::expected, std::generator, "
+                      "named modules).")
 endif()
 
 include(cmake/Dependencies.cmake)
@@ -25,13 +29,16 @@ target_compile_options(simsys_warnings INTERFACE -Wall -Wextra -Wpedantic -Wconv
 # -fno-ipa-sra) only IPA-SRA, interprocedural scalar replacement of aggregates, avoids
 # it, at -O2 and -O3. The cost: some by-reference struct parameters stay unsplit.
 # Verified 2026-10-28; the gcc14-release CI job guards it.
-target_compile_options(simsys_warnings INTERFACE -fno-ipa-sra)
+if(SIMSYS_GCC)
+  target_compile_options(simsys_warnings INTERFACE -fno-ipa-sra)
+endif()
 
 # --- library: one named module per layer ------------------------------------
 add_library(simsys)
 target_sources(simsys
   PUBLIC FILE_SET CXX_MODULES FILES     # FILE_SET CXX_MODULES is how CMake 3.28 declares module interface units
     src/core/core.cppm
+    src/core/generator.cppm               # simsys.generator: the project's coroutine generator
     src/config/config.cppm
     src/queueing/queueing.cppm
     src/flow/flow.cppm
@@ -82,7 +89,9 @@ target_link_libraries(simsys PUBLIC yaml-cpp::yaml-cpp Threads::Threads PRIVATE 
 # (graph.cppm: 1.91 s -> 1.98 s, 332 MB -> 366 MB). Only the library's module units need
 # it: the tests and the CLI import the modules but export none, and compile without it.
 # Verified 2026-10-28.
-target_compile_options(simsys PRIVATE -flarge-source-files)
+if(SIMSYS_GCC)
+  target_compile_options(simsys PRIVATE -flarge-source-files)
+endif()
 # GCC 14.2 at -O2/-O3: a unit importing simsys.model calls compiler-generated special
 # members of std templates over model types (std::optional<Workload>'s move constructor,
 # the NodeSpec::ops map's destructor) out of line without emitting them, and once the
