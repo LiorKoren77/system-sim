@@ -80,7 +80,11 @@ describe("the diagram's elements, from the graph and the frame", () => {
     const layout = await layoutGraph(youtube);
     const { nodes } = toFlowElements(youtube, layout, null);
     const groups = nodes.filter((n) => n.type === "group");
-    expect(groups.map((g) => g.id)).toEqual(["dc:us-east", "dc:eu-west"]);
+    // eu-west first: its viewers' links flow into us-east, so its box goes on the left (layout.ts).
+    expect(groups.map((g) => g.id)).toEqual(["dc:eu-west", "dc:us-east"]);
+    expect(layout.groups.get("dc:eu-west")?.x).toBeLessThan(
+      layout.groups.get("dc:us-east")?.x ?? 0,
+    );
     expect(nodes.find((n) => n.id === "cdn_eu")?.parentId).toBe("dc:eu-west");
     expect(nodes.find((n) => n.id === "api")?.parentId).toBe("dc:us-east");
   });
@@ -121,6 +125,17 @@ describe("the diagram's elements, from the graph and the frame", () => {
 });
 
 describe("the diagram's layout", () => {
+  it("gives every link a route of at least two points", async () => {
+    const layout = await layoutGraph(youtube);
+    expect(layout.routes.size).toBe(youtube.links.length);
+    for (const route of layout.routes.values()) expect(route.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("draws a link along its route", async () => {
+    const { edges } = toFlowElements(youtube, await layoutGraph(youtube), null);
+    expect(edges.every((e) => e.type === "routed")).toBe(true);
+  });
+
   it("places every node, clients first from the left", async () => {
     const store = await fixtureStore("tutorial-chain");
     const graph = store.graph;

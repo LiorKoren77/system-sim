@@ -24,9 +24,9 @@ describe("which sides of two boxes an edge joins", () => {
   });
 
   it("weighs the gap between the boxes, not their centres: wide boxes side by side are horizontal", () => {
-    // Centres 200 apart across and 100 down, but the boxes overlap vertically less than across.
-    expect(sidesFor(box(0, 0), box(200, 100))).toEqual({ source: "right", target: "left" });
-    // Stacked with a small horizontal offset: vertical.
+    // Centres 240 across and 60 down: 64 px of gap across, the boxes overlapping in height.
+    expect(sidesFor(box(0, 0), box(240, 60))).toEqual({ source: "right", target: "left" });
+    // Centres 60 across and 100 down: overlapping in width, 32 px of gap down.
     expect(sidesFor(box(0, 0), box(60, 100))).toEqual({ source: "bottom", target: "top" });
   });
 });

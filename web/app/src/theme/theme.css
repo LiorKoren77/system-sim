@@ -320,3 +320,14 @@ main h1 .chapter {
 .diagram .react-flow {
   background: var(--bg);
 }
+
+/* Each box has a connection point on every side (NodeCard.tsx); they are where edges attach, not
+   controls (the diagram is watch-only), so they are not drawn. */
+.diagram .react-flow__handle {
+  width: 1px;
+  height: 1px;
+  min-width: 0;
+  min-height: 0;
+  border: 0;
+  background: transparent;
+}

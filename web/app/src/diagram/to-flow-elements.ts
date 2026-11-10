@@ -10,7 +10,8 @@
 //   the edges only when it changes (withPipeZones).
 import type { DatasetStore, GraphLine } from "@simsys/stream";
 import type { Edge, Node } from "@xyflow/react";
-import type { Layout } from "./layout";
+import type { Layout, Placed } from "./layout";
+import { sidesFor, type Box } from "./sides";
 
 export type Zone = "green" | "yellow" | "red";
 
@@ -68,12 +69,24 @@ export function toFlowElements(
       draggable: false,
     };
   });
-  const edges: Edge[] = graph.links.map((link, i) => ({
-    id: `link-${i}`,
-    source: link.from,
-    target: link.to,
-    ...(link.pipe_row === null ? {} : { className: "pipe" }),
-  }));
+  const edges: Edge[] = graph.links.map((link, i) => {
+    const from = absoluteBox(layout, link.from);
+    const to = absoluteBox(layout, link.to);
+    const sides = from && to ? sidesFor(from, to) : { source: "right", target: "left" };
+    const id = `link-${i}`;
+    const route = layout.routes.get(id);
+    return {
+      id,
+      source: link.from,
+      target: link.to,
+      sourceHandle: `source-${sides.source}`,
+      targetHandle: `target-${sides.target}`,
+      // ELK's route around the boxes when it gave one; otherwise right-angled lines between the
+      // facing sides (sides.ts).
+      ...(route ? { type: "routed", data: { points: route } } : { type: "smoothstep" }),
+      ...(link.pipe_row === null ? {} : { className: "pipe" }),
+    };
+  });
   return { nodes: [...groups, ...nodes], edges };
 }
 
@@ -139,4 +152,18 @@ function offeredAt(graph: GraphLine, store: DatasetStore, client: string, frame:
     if (op.client === client) sum += at(store.opColumn(row, "offered_per_s"), frame) || 0;
   });
   return sum;
+}
+
+// A node's box in the diagram's coordinates: the layout places a node inside a datacenter box
+// relative to that box.
+function absoluteBox(layout: Layout, id: string): Box | undefined {
+  const place: Placed | undefined = layout.nodes.get(id);
+  if (place === undefined) return undefined;
+  const parent = place.parent === null ? undefined : layout.groups.get(place.parent);
+  return {
+    x: place.x + (parent?.x ?? 0),
+    y: place.y + (parent?.y ?? 0),
+    width: place.width,
+    height: place.height,
+  };
 }

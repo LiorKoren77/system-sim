@@ -13,7 +13,6 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
   const shards = data.shards !== null ? ` · ${data.shards} shards` : "";
   return (
     <div className={`node-card zone-${zone ?? "none"}`}>
-      <Handle type="target" position={Position.Left} />
       <div className="node-id">{data.id}</div>
       <div className="node-type">
         {data.type}
@@ -25,9 +24,25 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
           ? `offers ${rate(state.offeredPerSecond)}`
           : `${state?.rhoPercent == null ? "–" : `${state.rhoPercent}%`} · ${zone ?? "no data"}`}
       </div>
-      <Handle type="source" position={Position.Right} />
+      <Handles />
     </div>
   );
+}
+
+// A connection point on each side, for edges arriving (target) and leaving (source): an edge picks
+// the pair of sides that face the other box (sides.ts). The ids are what an edge names.
+const sides = [
+  ["left", Position.Left],
+  ["right", Position.Right],
+  ["top", Position.Top],
+  ["bottom", Position.Bottom],
+] as const;
+
+function Handles() {
+  return sides.flatMap(([side, position]) => [
+    <Handle key={`t-${side}`} id={`target-${side}`} type="target" position={position} />,
+    <Handle key={`s-${side}`} id={`source-${side}`} type="source" position={position} />,
+  ]);
 }
 
 // 1500 → "1.5k/s", 2000000 → "2M/s".
