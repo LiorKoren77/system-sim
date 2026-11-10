@@ -33,9 +33,9 @@ module;
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <coroutine>  // samples() are coroutines: they need std::coroutine_traits
 #include <cstddef>
 #include <cstdint>
-#include <generator>
 #include <iterator>
 #include <numbers>
 #include <optional>
@@ -48,6 +48,9 @@ module;
 export module simsys.workload;
 
 import simsys.core;
+// C++20 `export import`: re-exports simsys.generator, so an importer of simsys.workload can name
+// the Generator<Sample> that samples() returns without importing it itself.
+export import simsys.generator;
 
 export namespace simsys::workload {
 
@@ -207,7 +210,8 @@ struct Sample {
   Rate rate{};
 };
 
-// C++20 coroutines + C++23 std::generator<T>: a function that `co_yield`s values becomes a
+// C++20 coroutines + simsys::Generator<T> (src/core/generator.cppm, the project's stand-in for
+// C++23 std::generator, which libc++ 19 lacks): a function that `co_yield`s values becomes a
 // lazy range. It replaces building a whole std::vector up front or hand-writing an iterator
 // class; the curve is sampled only as far as the consumer reads (a day at 1 s steps is
 // 86400 samples nobody has to store). Each co_yield suspends the coroutine and hands one
@@ -225,7 +229,7 @@ struct Sample {
 // stream stops early, cleanly, where the next step would overflow the int64 clock (only
 // reachable with a step or an end of hundreds of years). Throws std::invalid_argument if
 // `step` is not positive.
-[[nodiscard]] std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until);
+[[nodiscard]] Generator<Sample> samples(RateCurve curve, SimTime step, SimTime until);
 
 // The same stream with workload noise (spec §9.2), exactly as the engine offers it: the
 // generator owns a NoiseProcess seeded with `seed` and advances it every `noise_step`
@@ -237,12 +241,12 @@ struct Sample {
 // Throws std::invalid_argument, on the first begin(), for a non-positive `step` or
 // `noise_step`, a `step` that is not a multiple of `noise_step`, or the NoiseProcess's own
 // errors (negative sigma, non-positive correlation).
-[[nodiscard]] std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until,
-                                             Noise noise, std::uint64_t seed, SimTime noise_step);
+[[nodiscard]] Generator<Sample> samples(RateCurve curve, SimTime step, SimTime until, Noise noise,
+                                        std::uint64_t seed, SimTime noise_step);
 
 // The noisy stream with the noise advanced at the sample step itself (noise_step = step).
-[[nodiscard]] std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until,
-                                             Noise noise, std::uint64_t seed);
+[[nodiscard]] Generator<Sample> samples(RateCurve curve, SimTime step, SimTime until, Noise noise,
+                                        std::uint64_t seed);
 
 }  // namespace simsys::workload
 
@@ -492,7 +496,7 @@ Rate RateCurve::rate_at(SimTime t) const {
   return Rate{detail::level_at(*this, t) * wave_term * detail::spikes_multiplier(spikes, t)};
 }
 
-std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until) {
+Generator<Sample> samples(RateCurve curve, SimTime step, SimTime until) {
   if (step.count() <= 0) throw std::invalid_argument{"sample step must be positive"};
   // Loop on integer nanoseconds (exact; no floating-point drift accumulates in t).
   for (std::int64_t t = 0; t < until.count();) {
@@ -502,8 +506,8 @@ std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until) {
   }
 }
 
-std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until, Noise noise,
-                               std::uint64_t seed, SimTime noise_step) {
+Generator<Sample> samples(RateCurve curve, SimTime step, SimTime until, Noise noise,
+                          std::uint64_t seed, SimTime noise_step) {
   if (step.count() <= 0) throw std::invalid_argument{"sample step must be positive"};
   if (noise_step.count() <= 0) throw std::invalid_argument{"noise step must be positive"};
   if (step.count() % noise_step.count() != 0) {
@@ -527,8 +531,8 @@ std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until, Noi
 
 // Not a coroutine itself (no co_yield here): it returns the generator the overload above
 // creates, which is where the checks run, on the first begin().
-std::generator<Sample> samples(RateCurve curve, SimTime step, SimTime until, Noise noise,
-                               std::uint64_t seed) {
+Generator<Sample> samples(RateCurve curve, SimTime step, SimTime until, Noise noise,
+                          std::uint64_t seed) {
   return samples(std::move(curve), step, until, noise, seed, step);
 }
 
