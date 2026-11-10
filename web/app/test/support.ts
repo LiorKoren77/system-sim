@@ -1,11 +1,15 @@
 // The committed fixtures (web/stream/test/fixtures), as the app's tests read them.
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { DatasetStore, MemorySource } from "@simsys/stream";
 import type { Index, IndexEntry } from "../src/catalogue/index-file";
 
 export function fixtureLines(name: string): string[] {
-  const gz = readFileSync(new URL(`../../stream/test/fixtures/${name}.ndjson.gz`, import.meta.url));
+  // A path from this file's directory: under Vite, import.meta.url is a dev-server URL, not a file.
+  const gz = readFileSync(
+    path.resolve(import.meta.dirname, `../../stream/test/fixtures/${name}.ndjson.gz`),
+  );
   return gunzipSync(gz)
     .toString("utf8")
     .split("\n")

@@ -28,7 +28,7 @@ describe("the player", () => {
   });
 
   it("stops at the end of a day that does not repeat, and plays again from the start", () => {
-    const s = tick(play(day(719, false)), 1);
+    const s = tick({ ...day(719, false), playing: true }, 1);
     expect(s.frame).toBe(719);
     expect(s.playing).toBe(false);
     expect(play(s).frame).toBe(0);

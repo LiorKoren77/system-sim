@@ -1,0 +1,226 @@
+/* The page's look: tokens on :root, a light and a dark set (from the system setting).
+   The zone colours are chosen so the three zones differ in lightness as well as hue: a reader with
+   red-green colour blindness still tells them apart, and every node also writes its zone as a word. */
+:root {
+  color-scheme: light dark;
+  --bg: #f7f7f5;
+  --panel: #ffffff;
+  --ink: #1d1f21;
+  --muted: #62666b;
+  --line: #d9dbde;
+  --accent: #2f5fd0;
+  --zone-green: #1b8a4a;
+  --zone-green-bg: #e3f4e9;
+  --zone-yellow: #b07800;
+  --zone-yellow-bg: #fff1cc;
+  --zone-red: #c62b1f;
+  --zone-red-bg: #fbe0dc;
+  --client: #6b7280;
+  --client-bg: #eef0f3;
+  --fault: #c62b1f;
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+  font-size: 14px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15171a;
+    --panel: #1d2024;
+    --ink: #e6e7e9;
+    --muted: #9aa0a6;
+    --line: #34383d;
+    --accent: #7aa2ff;
+    --zone-green: #4cc27e;
+    --zone-green-bg: #173523;
+    --zone-yellow: #f0b429;
+    --zone-yellow-bg: #3d3112;
+    --zone-red: #ff6b5e;
+    --zone-red-bg: #4a1c18;
+    --client: #a1a7af;
+    --client-bg: #262a2f;
+    --fault: #ff6b5e;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  height: 100vh;
+}
+
+.notice {
+  padding: 24px;
+  color: var(--muted);
+}
+
+.notice.error {
+  color: var(--zone-red);
+}
+
+/* ---- the catalogue ---- */
+.catalogue {
+  overflow-y: auto;
+  border-right: 1px solid var(--line);
+  background: var(--panel);
+  padding: 8px 0;
+}
+
+.catalogue h2 {
+  margin: 12px 16px 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.catalogue ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.catalogue button {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 8px;
+  width: 100%;
+  padding: 6px 16px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.catalogue button:hover {
+  background: var(--bg);
+}
+
+.catalogue button[aria-current="true"] {
+  background: var(--bg);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.catalogue .chapter {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.badge {
+  grid-column: 1 / -1;
+  justify-self: start;
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.badge.loops {
+  color: var(--zone-green);
+  border-color: var(--zone-green);
+}
+
+.badge.drifts {
+  color: var(--zone-yellow);
+  border-color: var(--zone-yellow);
+}
+
+/* ---- the dataset ---- */
+main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+main h1 {
+  margin: 0;
+  padding: 12px 16px;
+  font-size: 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+main h1 .chapter {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+.diagram {
+  flex: 1;
+  min-height: 0;
+}
+
+/* ---- the time bar ---- */
+.timeline {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.timeline .play {
+  width: 36px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.timeline .clock {
+  min-width: 96px;
+  font-variant-numeric: tabular-nums;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.timeline .track {
+  position: relative;
+  flex: 1;
+}
+
+.timeline input[type="range"] {
+  width: 100%;
+}
+
+.timeline .marks {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -6px;
+  height: 4px;
+  pointer-events: none;
+}
+
+.timeline .fault-mark {
+  position: absolute;
+  height: 4px;
+  background: var(--fault);
+  border-radius: 2px;
+}
+
+.timeline .speed {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  color: var(--muted);
+}

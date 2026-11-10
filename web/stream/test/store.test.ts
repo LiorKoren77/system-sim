@@ -87,6 +87,18 @@ describe("the dataset store", () => {
     expect(store.nodeColumn(1, "dropped_per_s").at(-1)).toBe(500);
   });
 
+  it("starts over when read again, and the superseded read leaves it alone", async () => {
+    // React runs an effect twice in development: the first read is aborted, the second owns it.
+    const store = new DatasetStore();
+    const first = new AbortController();
+    const reading = store.consume(new MemorySource(helloLines), first.signal);
+    first.abort();
+    await store.consume(new MemorySource(helloLines));
+    await reading;
+    expect(store.status).toBe("ready");
+    expect(store.frameCount).toBe(2);
+  });
+
   it("can stop reading when the page no longer wants the dataset", async () => {
     const controller = new AbortController();
     controller.abort();
