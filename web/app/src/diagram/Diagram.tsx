@@ -6,7 +6,8 @@ import { layoutGraph, type Layout } from "./layout";
 import { DatacenterBox } from "./DatacenterBox";
 import { NodeCard } from "./NodeCard";
 import { RoutedEdge } from "./RoutedEdge";
-import { FrameContext } from "./frame-context";
+import { busiestFlow, flowDuration, linkFlowsAt } from "./flow";
+import { FlowContext, FrameContext } from "./frame-context";
 import { nodeStatesAt, pipeZonesAt, toFlowElements, withPipeZones } from "./to-flow-elements";
 
 // A module constant: React Flow warns when the node types object changes between renders.
@@ -34,8 +35,9 @@ export function Diagram(props: {
   frame: number;
   selected: string | null;
   onSelect: (id: string | null) => void;
+  playing: boolean; // the dashes move only while the day plays
 }) {
-  const { store, frame, selected, onSelect } = props;
+  const { store, frame, selected, onSelect, playing } = props;
   const graph = store.graph;
   const diagramFile = store.dataset?.diagram;
   const [layout, setLayout] = useState<{ graph: GraphLine; layout: Layout } | null>(null);
@@ -62,6 +64,21 @@ export function Diagram(props: {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- version stands for the store's contents
     [graph, store, version, frame],
   );
+  // The links' traffic: dash speeds on a scale up to the busiest link of the whole dataset.
+  const busiest = useMemo(
+    () => (graph && store.status === "ready" ? busiestFlow(graph, store) : 0),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- version stands for the store's contents
+    [graph, store, version],
+  );
+  const durationsKey = graph
+    ? linkFlowsAt(graph, store, frame)
+        .map((f) => flowDuration(f, busiest) ?? "")
+        .join(",")
+    : "";
+  const durations = useMemo(
+    () => durationsKey.split(",").map((d) => (d === "" ? null : Number(d))),
+    [durationsKey],
+  );
   // The pipes' zones as one string, so the edges are rebuilt only when one of them changes.
   const zonesKey = graph ? pipeZonesAt(graph, store, frame).join(",") : "";
   const edges = useMemo(
@@ -77,25 +94,27 @@ export function Diagram(props: {
   if (structure === null) return <div className="diagram" />;
   return (
     <FrameContext value={states}>
-      <div className="diagram">
-        <ReactFlow
-          nodes={structure.nodes}
-          edges={edges}
-          nodeTypes={nodeTypes}
-          edgeTypes={edgeTypes}
-          nodesDraggable={false}
-          nodesConnectable={false}
-          elementsSelectable
-          fitView
-          minZoom={0.2}
-          onNodeClick={(_, node) => {
-            if (node.type === "system") onSelect(node.id);
-          }}
-          onPaneClick={() => {
-            onSelect(null);
-          }}
-        />
-      </div>
+      <FlowContext value={durations}>
+        <div className={playing ? "diagram playing" : "diagram"}>
+          <ReactFlow
+            nodes={structure.nodes}
+            edges={edges}
+            nodeTypes={nodeTypes}
+            edgeTypes={edgeTypes}
+            nodesDraggable={false}
+            nodesConnectable={false}
+            elementsSelectable
+            fitView
+            minZoom={0.2}
+            onNodeClick={(_, node) => {
+              if (node.type === "system") onSelect(node.id);
+            }}
+            onPaneClick={() => {
+              onSelect(null);
+            }}
+          />
+        </div>
+      </FlowContext>
     </FrameContext>
   );
 }

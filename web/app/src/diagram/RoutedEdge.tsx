@@ -1,20 +1,30 @@
-import { BaseEdge, type Edge, type EdgeProps } from "@xyflow/react";
+import { BaseEdge, getSmoothStepPath, type Edge, type EdgeProps } from "@xyflow/react";
+import { useContext } from "react";
+import { FlowContext } from "./frame-context";
 import type { Point } from "./layout";
 
-export type RoutedEdgeData = { readonly points: readonly Point[] };
+export type RoutedEdgeData = { readonly index: number; readonly points?: readonly Point[] };
 
-// An edge drawn along the route ELK computed (layout.ts): straight segments at right angles that
-// go around the boxes in between. React Flow would otherwise draw its own line between the two
-// connection points, blind to the boxes it crosses.
-export function RoutedEdge({ id, data, markerEnd, style }: EdgeProps<Edge<RoutedEdgeData>>) {
-  const points = data?.points ?? [];
-  const path = points.map((p, i) => `${i === 0 ? "M" : "L"}${p.x},${p.y}`).join(" ");
+// A link of the diagram. Its line follows the route ELK computed (layout.ts), right-angled segments
+// around the boxes; where there is none (a diagram placed by hand), right-angled segments between
+// the two connection points. Its dashes move toward the target at the speed of the traffic the
+// link carries in the frame (flow.ts), read from a context so that a new frame changes only the
+// dashes' speed, not the edge React Flow holds.
+export function RoutedEdge(props: EdgeProps<Edge<RoutedEdgeData>>) {
+  const { id, data, markerEnd, style } = props;
+  const duration = useContext(FlowContext)[data?.index ?? -1] ?? null;
+  const points = data?.points;
+  const path =
+    points && points.length >= 2
+      ? points.map((p, i) => `${i === 0 ? "M" : "L"}${p.x},${p.y}`).join(" ")
+      : getSmoothStepPath(props)[0];
   return (
     <BaseEdge
       id={id}
       path={path}
       {...(markerEnd ? { markerEnd } : {})}
-      {...(style ? { style } : {})}
+      className={duration === null ? "" : "flowing"}
+      style={{ ...style, ...(duration === null ? {} : { animationDuration: `${duration}s` }) }}
     />
   );
 }

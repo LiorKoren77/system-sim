@@ -45,9 +45,9 @@ describe("a diagram placed by hand", () => {
     const layout = await layoutGraph(graph, { cells: { users: [0, 0], api: [1, 0], db: [2, 0] } });
     expect(layout.routes.size).toBe(0);
     const { edges } = toFlowElements(graph, layout, null);
-    expect(edges.map((e) => [e.type, e.sourceHandle, e.targetHandle])).toEqual([
-      ["smoothstep", "source-right", "target-left"],
-      ["smoothstep", "source-right", "target-left"],
+    expect(edges.map((e) => [e.data?.points, e.sourceHandle, e.targetHandle])).toEqual([
+      [undefined, "source-right", "target-left"],
+      [undefined, "source-right", "target-left"],
     ]);
   });
 
