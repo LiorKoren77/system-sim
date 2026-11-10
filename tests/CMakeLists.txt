@@ -119,6 +119,25 @@ add_test(NAME "simsys estimate --at evaluates the steady state at an instant ins
          COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
                  -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-estimate-at
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/estimate_at.cmake)
+# `run --stream` as the web server sees it (phase 5a): stdout, stderr and the exit code.
+foreach(check only_json error_line refusals parse_error exit_code)
+  if(check STREQUAL "only_json")
+    set(name "simsys run --stream writes nothing but lines of JSON on stdout")
+  elseif(check STREQUAL "error_line")
+    set(name "simsys run --stream reports a refused scenario as one error line with its location")
+  elseif(check STREQUAL "refusals")
+    set(name "simsys run --stream refuses the flags whose output it already carries")
+  elseif(check STREQUAL "parse_error")
+    set(name "simsys run --stream reports an unknown flag as an error line")
+  else()
+    set(name "simsys run --stream exits as run exits and ends with the summary")
+  endif()
+  add_test(NAME "${name}"
+           COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
+                   -DSCENARIOS=${CMAKE_SOURCE_DIR}/scenarios
+                   -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-stream-${check} -DCHECK=${check}
+                   -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/stream.cmake)
+endforeach()
 add_test(NAME "simsys curve refuses a seed without noise, which would change nothing"
          COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
                  -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-curve-seed

@@ -635,3 +635,165 @@ TEST_CASE("a bucket in which nothing was answered has no mean and no p99", "[str
   CHECK_FALSE(op.mean_ms.has_value());
   CHECK_FALSE(op.p99_ms.has_value());
 }
+
+// ---- the stream's lines (Task 5)
+// -----------------------------------------------------------------
+
+namespace {
+
+// The lines `simsys run --stream` writes for `g`, in buckets of `steps_per_bucket`, and the exit
+// code it returns.
+struct Stream {
+  std::vector<std::string> lines;
+  int exit_code{};
+};
+
+Stream stream_of(const simsys::graph::Graph& g, std::size_t steps_per_bucket) {
+  Stream out;
+  auto sim = simsys::test_support::simulation_of(g);
+  out.exit_code = simsys::session::stream_run(
+      g, sim, steps_per_bucket, [&](std::string_view line) { out.lines.emplace_back(line); });
+  return out;
+}
+
+Stream stream_of(const std::string& path, std::size_t steps_per_bucket) {
+  return stream_of(graph_of(path), steps_per_bucket);
+}
+
+}  // namespace
+
+TEST_CASE("a stream is a run line, the graph, a frame per bucket and the summary, in that order",
+          "[stream]") {
+  const auto stream = stream_of(shipped("tutorial/hello/scenario.yaml"), 1);
+  REQUIRE(stream.lines.size() == 603);  // 600 steps of 100 ms in buckets of one step, and 3 more
+  const auto run = YAML::Load(stream.lines[0]);
+  CHECK(run["type"].Scalar() == "run");
+  CHECK(run["format_version"].as<int>() == 1);
+  CHECK(run["scenario"].Scalar() == "hello");
+  CHECK(run["seed"].as<int>() == 1);
+  CHECK(run["duration_s"].as<double>() == 60);
+  CHECK(run["step_s"].as<double>() == 0.1);
+  CHECK(run["bucket_s"].as<double>() == 0.1);
+  CHECK(run["frames"].as<int>() == 600);
+  const auto graph = YAML::Load(stream.lines[1]);
+  CHECK(graph["type"].Scalar() == "graph");
+  CHECK(graph["rev"].as<int>() == 0);
+  CHECK(graph["nodes"].size() == 2);
+  CHECK_FALSE(graph["format_version"]);  // the run line names the version once
+  double previous_t = -1;
+  for (std::size_t k = 2; k < 602; ++k) {
+    const auto frame = YAML::Load(stream.lines[k]);
+    REQUIRE(frame["type"].Scalar() == "frame");
+    CHECK(frame["rev"].as<int>() == 0);
+    CHECK(frame["t_s"].as<double>() > previous_t);
+    previous_t = frame["t_s"].as<double>();
+  }
+  CHECK(YAML::Load(stream.lines.back())["type"].Scalar() == "summary");
+  for (const auto& line : stream.lines) CHECK(line.find('\n') == std::string::npos);
+}
+
+TEST_CASE("a frame's rows follow the graph's column lists, nulls where a node has no such column",
+          "[stream]") {
+  const auto stream = stream_of(shipped("tutorial/hello/scenario.yaml"), 100);
+  const auto graph = YAML::Load(stream.lines[1]);
+  const auto frame = YAML::Load(stream.lines[2]);
+  REQUIRE(frame["nodes"].size() == graph["nodes"].size());
+  const auto api = frame["nodes"][1];
+  REQUIRE(api.size() == graph["node_columns"].size());
+  CHECK(api[0].as<double>() > 0);  // demand_per_s
+  CHECK(api[8].as<int>() == 0);    // zone: green
+  CHECK(api[11].IsNull());         // queue_lag_s: a service has no lag
+  const auto users = frame["nodes"][0];
+  REQUIRE(users.size() == graph["node_columns"].size());
+  CHECK(users[0].IsNull());  // a client has no queue
+  REQUIRE(frame["ops"].size() == graph["ops"].size());
+  CHECK(frame["ops"][0].size() == graph["op_columns"].size());
+  CHECK(frame["dt_s"].as<double>() == 10);
+  CHECK(frame["links"].size() == 0);
+}
+
+TEST_CASE("the stream's summary is run --report json's report, and its exit code run's",
+          "[stream]") {
+  const auto chain = shipped("tutorial/chain/scenario.yaml");
+  const auto stream = stream_of(chain, 100);
+  const auto summary = YAML::Load(stream.lines.back());
+  CHECK(summary["exit_code"].as<int>() == 0);
+  CHECK(stream.exit_code == 0);
+  CHECK(same_tree(summary["report"], YAML::Load(reports_of(chain).pretty)));
+  // The unique-id lab fails its drop-rate SLO on purpose: exit 2, as `simsys run` exits.
+  const auto failing = stream_of(shipped("labs/unique-id/scenario.yaml"), 600);
+  CHECK(failing.exit_code == 2);
+  CHECK(YAML::Load(failing.lines.back())["exit_code"].as<int>() == 2);
+}
+
+TEST_CASE("the same scenario and seed stream the same bytes; another seed of noise does not",
+          "[stream]") {
+  const auto hello = shipped("tutorial/hello/scenario.yaml");
+  CHECK(stream_of(hello, 30).lines == stream_of(hello, 30).lines);
+  const auto noisy = scratch_scenario("noisy_stream", R"(version: 1
+name: noisy
+duration: 10s
+nodes:
+  users: {type: client, rate: {base: 100/s, noise: {sigma: 0.2, correlation: 1s}}, ops: {ping: 1}}
+  api: {type: service, capacity: 1k/s, latency: 1ms}
+links:
+  - {from: users, to: api, dir: inout}
+)");
+  auto scenario = simsys::config::load(noisy);
+  REQUIRE(scenario);
+  scenario->seed = 2;
+  const auto reseeded = simsys::session::build_graph(noisy, *scenario);
+  REQUIRE(reseeded);
+  CHECK(stream_of(noisy, 10).lines != stream_of(*reseeded, 10).lines);
+}
+
+TEST_CASE("the frames after warmup add up to the summary's totals: one run, two readers",
+          "[stream]") {
+  // The probe's api is down from 20 s to 30 s and drops what it is sent. Its warmup is 5 s, a whole
+  // number of 1 s buckets, so the frames that start at or after it cover exactly the observed run.
+  const auto stream = stream_of(scratch_scenario("probe", probe_yaml), 10);
+  const auto report = YAML::Load(stream.lines.back())["report"];
+  double dropped = 0;
+  for (std::size_t k = 2; k + 1 < stream.lines.size(); ++k) {
+    const auto frame = YAML::Load(stream.lines[k]);
+    if (frame["t_s"].as<double>() < 5.0) continue;
+    dropped += frame["nodes"][1][2].as<double>() * frame["dt_s"].as<double>();
+  }
+  const auto api = report["nodes"][1];
+  REQUIRE(api["dropped"].as<double>() > 0);
+  CHECK_THAT(dropped, WithinRel(api["dropped"].as<double>(), 1e-5));  // 6 significant digits
+}
+
+TEST_CASE("a bucket of N points is the steps over N, rounded up", "[stream]") {
+  CHECK(*simsys::session::bucket_for_points(864'000, 720) == 1200);  // youtube's day: 2 min
+  CHECK(*simsys::session::bucket_for_points(72'000, 720) == 100);
+  CHECK(*simsys::session::bucket_for_points(600, 1000) == 1);  // fewer steps than points
+  CHECK(*simsys::session::bucket_for_points(600, 7) == 86);    // ceil(600 / 7)
+  CHECK(simsys::session::frame_count(600, 7) == 7);            // ceil(600 / 86)
+  CHECK(simsys::session::frame_count(600, 1) == 600);
+  CHECK(simsys::session::bucket_for_points(600, 0).error() ==
+        "--points must be between 1 and 100000");
+  CHECK(simsys::session::bucket_for_points(600, 100'001).error() ==
+        "--points must be between 1 and 100000");
+  CHECK(simsys::session::default_points == 720);
+}
+
+TEST_CASE("a bucket of a duration is a whole number of steps inside the run", "[stream]") {
+  using simsys::session::bucket_for_every;
+  CHECK(*bucket_for_every(100ms, 1h, 30s, "30s") == 300);
+  CHECK(bucket_for_every(100ms, 1h, 250ms, "250ms").error() ==
+        "--every 250ms: not a whole number of 100ms steps");
+  CHECK(bucket_for_every(100ms, 1h, 2h, "2h").error() == "--every 2h is longer than the run (1h)");
+  CHECK(bucket_for_every(100ms, 1h, 0s, "0s").error() == "--every 0s: a bucket needs a length");
+}
+
+TEST_CASE("an error line carries the file, the line and column, and the message", "[stream]") {
+  const auto line = simsys::report::render_error_line("a.yaml", 12, 5, "a.yaml:12:5: error: bad");
+  const auto doc = YAML::Load(line);
+  CHECK(doc["type"].Scalar() == "error");
+  CHECK(doc["file"].Scalar() == "a.yaml");
+  CHECK(doc["line"].as<int>() == 12);
+  CHECK(doc["column"].as<int>() == 5);
+  CHECK(doc["message"].Scalar() == "a.yaml:12:5: error: bad");
+  CHECK(YAML::Load(simsys::report::render_error_line(std::nullopt, 0, 0, "x"))["file"].IsNull());
+}
