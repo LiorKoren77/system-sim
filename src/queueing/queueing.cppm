@@ -276,9 +276,13 @@ struct BelowLimit {
 // cancellation), and the quadrature below has failure itself to the last digit, Phi(-z). A group
 // built without it gets 1 - success, as before: a default member initializer may read a member
 // declared above it.
+// `trials` and `success` start at 0 so that `failure` never reads an indeterminate value: a
+// default-initialized `TrialGroup g;` read `success` before anything set it (Clang 19's
+// -Wuninitialized, 2026-11-10; `std::vector<TrialGroup>(n)` value-initializes, so it zeroed the
+// members first and got failure = 1, which these initializers keep).
 struct TrialGroup {
-  int trials;
-  double success;
+  int trials{};
+  double success{};
   double failure = 1.0 - success;
 };
 
