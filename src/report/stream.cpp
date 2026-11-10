@@ -28,7 +28,7 @@ import :shared;
 // C++20 `import`: the compiled interfaces of the modules this unit reads from.
 import simsys.core;
 import simsys.engine;
-import simsys.flow; // nan_propagating_max: a NaN lag stays visible, as in the run's report
+import simsys.flow; // nan_propagating_max: a bucket's peak lag is the run report's, NaN included
 import simsys.fluid;
 import simsys.graph;
 import simsys.model;
@@ -48,6 +48,7 @@ FrameAggregator::FrameAggregator(const graph::Graph& g, std::size_t steps_per_bu
     : graph_{&g},
       steps_per_bucket_{steps_per_bucket},
       sink_{std::move(sink)},
+      step_{g.scenario().step},
       step_s_{seconds(g.scenario().step)} {
   if (steps_per_bucket_ == 0) {
     throw std::invalid_argument{"report::FrameAggregator: a bucket needs at least one step"};
@@ -219,7 +220,9 @@ OpRow FrameAggregator::op_row(const OpSums& sums) const {
 void FrameAggregator::hand_over() {
   Frame frame;
   frame.t = start_;
-  frame.dt_s = step_s_ * static_cast<double>(steps_);
+  // The length in whole nanoseconds, then in seconds: 3 steps of 100 ms are 0.3 s exactly as the
+  // next frame's t_s is, where 0.1 × 3 in floating point is 0.30000000000000004.
+  frame.dt_s = seconds(SimTime{step_.count() * static_cast<SimTime::rep>(steps_)});
   const auto nodes = graph_->nodes();
   for (std::size_t i = 0; i < nodes_.size(); ++i) {
     const bool client = i < nodes.size() && nodes[i].spec.type == model::NodeType::client;
@@ -241,9 +244,10 @@ namespace {
 }
 
 // A frame's number: six significant digits, as the CSV series writes its cells (significant), or
-// null when there is none or it is not finite. Six digits are what a chart can show; the shortest
-// round-trip form of a bucket's mean (0.10000000000000006 for 0.1) would double a frame's size for
-// noise. The summary line keeps the report's full precision.
+// null when there is none or it is not finite (JSON has no NaN or infinity, so a NaN reads as null
+// here as in every JSON report; the summary's report keeps it null too). Six digits are what a
+// chart can show; the shortest round-trip form of a bucket's mean (0.10000000000000006 for 0.1)
+// would double a frame's size for noise. The summary line keeps the report's full precision.
 [[nodiscard]] std::string frame_number(const std::optional<double>& value) {
   if (!value || !std::isfinite(*value)) return "null";
   return significant(*value, 6);
@@ -251,6 +255,7 @@ namespace {
 
 // One frame row as a JSON array of numbers, in the order of the columns the graph names
 // (explain.cpp's node_columns, link_columns, op_columns): the order is the contract.
+// C++20 std::span<const T>: the row's texts viewed without a copy, whatever array holds them.
 [[nodiscard]] std::string json_numbers(std::span<const std::string> values) {
   return "[" + join(values, ",") + "]";
 }
@@ -325,7 +330,9 @@ std::string render_run_line(const graph::Graph& g, std::size_t steps_per_bucket,
       json_field("duration_s", json_number(seconds(scenario.duration))),
       json_field("step_s", json_number(step_s)),
       json_field("warmup_s", json_number(seconds(scenario.warmup))),
-      json_field("bucket_s", json_number(step_s * static_cast<double>(steps_per_bucket))),
+      json_field("bucket_s",
+                 json_number(seconds(SimTime{scenario.step.count() *
+                                             static_cast<SimTime::rep>(steps_per_bucket)}))),
       json_field("frames", std::to_string(frames))};
   return json_on_one_line(json_object(fields));
 }

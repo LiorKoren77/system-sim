@@ -830,13 +830,6 @@ struct Frame {
   ~Frame();
 };
 
-// Pattern: Observer — like Summary and SeriesWriter, it watches every StepRecord of a run
-// (session::RunObservers); every `steps_per_bucket` records it hands the finished Frame to `sink`.
-// Pattern: Strategy for what becomes of a frame: the stream writes it as a line of JSON, a test
-// collects it, so the aggregation rules are tested without any output. `finish` hands over the last
-// bucket when the run's steps did not fill it (nothing otherwise, and nothing the second time). `g`
-// must outlive the aggregator; a bucket of 0 steps is a programmer error (std::invalid_argument).
-// Not copyable: it is watched by pointer, like the series writers.
 // ---- the lines of `run --stream` (phase 5a spec §6) ----
 //
 // One JSON object per line, each with a `type`, no whitespace between tokens: a reader splits the
@@ -863,6 +856,13 @@ struct Frame {
 [[nodiscard]] std::string render_error_line(const std::optional<std::string>& file, int line,
                                             int column, const std::string& message);
 
+// Pattern: Observer — like Summary and SeriesWriter, it watches every StepRecord of a run
+// (session::RunObservers); every `steps_per_bucket` records it hands the finished Frame to `sink`.
+// Pattern: Strategy for what becomes of a frame: the stream writes it as a line of JSON, a test
+// collects it, so the aggregation rules are tested without any output. `finish` hands over the last
+// bucket when the run's steps did not fill it (nothing otherwise, and nothing the second time). `g`
+// must outlive the aggregator; a bucket of 0 steps is a programmer error (std::invalid_argument).
+// Not copyable: it is watched by pointer, like the series writers.
 class FrameAggregator {
  public:
   FrameAggregator(const graph::Graph& g, std::size_t steps_per_bucket,
@@ -919,7 +919,8 @@ class FrameAggregator {
   const graph::Graph* graph_;
   std::size_t steps_per_bucket_;
   std::function<void(const Frame&)> sink_;
-  double step_s_;        // every step's length: the scenario's step
+  SimTime step_;         // every step's length: the scenario's step
+  double step_s_;        // the same in seconds, for the sums
   std::size_t steps_{};  // steps in the bucket so far; 0: no bucket open
   SimTime start_{};      // the bucket's first step
   std::vector<QueueSums> nodes_{};
