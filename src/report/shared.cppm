@@ -178,14 +178,21 @@ constexpr double rounds_to_one_at_four_digits = 0.99995;
 
 // ---- small text helpers ----
 
-// C++23 std::views::join_with + std::ranges::to: joins the parts with a separator and
-// collects the characters into a std::string in one pipeline. Replaces a hand-written
-// loop that appends a separator before every part but the first.
+// A loop that appends the separator before every part but the first. C++23 has a one-line
+// pipeline for it, `parts | std::views::join_with(separator) | std::ranges::to<std::string>()`,
+// which this used until 2026-11-10: LLVM's standard library (libc++ 20, the one Emscripten uses)
+// has no views::join_with yet, and one version of the code must build with every toolchain
+// (docs/study/ranges.md keeps the pipeline as an example).
 // C++20 std::span<const T>: a non-owning read-only view of contiguous elements (pointer + size),
 // so a caller passes a vector or an array of parts without a copy. Replaces a
 // `const std::vector<T>&` parameter, which accepts only a vector.
 [[nodiscard]] std::string join(std::span<const std::string> parts, std::string_view separator) {
-  return parts | std::views::join_with(separator) | std::ranges::to<std::string>();
+  std::string joined;
+  for (std::size_t i = 0; i < parts.size(); ++i) {
+    if (i > 0) joined += separator;
+    joined += parts[i];
+  }
+  return joined;
 }
 
 // One cell of an aligned text table; `colour` is an ANSI escape, or empty.
@@ -370,7 +377,8 @@ constexpr std::string_view ansi_reset = "\x1b[0m";
 // collect the results into a vector, replacing a reserve + push_back loop.
 template <class T, class F>
 [[nodiscard]] std::vector<std::string> map_to_strings(std::span<const T> items, F f) {
-  return items | std::views::transform(f) | std::ranges::to<std::vector<std::string>>();
+  // ranges::to called on the view, not piped: see priced_ops below (Clang 20 over libstdc++).
+  return std::ranges::to<std::vector<std::string>>(items | std::views::transform(f));
 }
 
 // A document of simsys's JSON output: `format_version` first (the output contract's version,
@@ -399,9 +407,12 @@ template <class Names>
 // prices it (defaults::op_cost).
 [[nodiscard]] std::string priced_ops(const model::NodeSpec& spec, double unit_per_request = 1.0) {
   // C++20 std::views::keys: the keys of a map as a lazy view, no copy of its pairs; C++23
-  // std::ranges::to<std::vector>(): collects a view into a container, replacing a reserve +
-  // push_back loop.
-  std::vector<std::string> ops{spec.cost | std::views::keys | std::ranges::to<std::vector>()};
+  // std::ranges::to<C>(range): collects a view into a container, replacing a reserve + push_back
+  // loop. Called on the view, not piped (`| std::ranges::to<std::vector>()`): Clang 20 over
+  // libstdc++ cannot instantiate the pipe's partial-application object in this module unit
+  // (`forward_like ... cannot be used before it is defined`); the direct call builds the same
+  // vector on every toolchain.
+  auto ops = std::ranges::to<std::vector<std::string>>(spec.cost | std::views::keys);
   if (spec.type == model::NodeType::sql_db) {
     std::ranges::copy(model::write_ops_of(spec), std::back_inserter(ops));
   }

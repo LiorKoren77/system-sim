@@ -105,7 +105,9 @@ std::vector<std::string> words_of(std::string_view words) {
   std::vector<std::string> parts;
   // C++20 std::views::split: a lazy view of the pieces between separators, replacing a
   // hand-written find/substr loop.
-  for (const auto piece : words | std::views::split(' '))
+  // split_view constructed directly: Clang 19 finds the views::split adaptor ambiguous here (see
+  // detail.cpp's lists_word).
+  for (const auto piece : std::ranges::split_view{words, ' '})
     parts.emplace_back(piece.begin(), piece.end());
   return parts;
 }

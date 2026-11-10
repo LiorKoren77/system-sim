@@ -524,9 +524,10 @@ Measured read_metrics(const report::Summary& summary, std::span<const SweepMetri
 
 // Every point's values, one per param, in run order. One param: its values. Two: every pair,
 // the first param the outer loop, so (a1, b1) (a1, b2) ... (a2, b1) ...
-// C++23 std::views::cartesian_product: the pairs of two ranges as a view of tuples, in that order.
-// It replaces two nested loops whose order a reader must check, and takes no lambda, so the fifth
-// GCC 14.2 defect (a lambda in a range adaptor in a module function) does not arise.
+// Two nested loops, the outer over the first param. C++23 std::views::cartesian_product gives the
+// same pairs in the same order as a view of tuples, which this used until 2026-11-10: LLVM's
+// standard library (libc++ 20, the one Emscripten uses) has no cartesian_product yet, and one
+// version of the code must build with every toolchain (docs/study/ranges.md keeps the example).
 // One or two params: grid_problem has refused any other count before this runs.
 std::vector<std::vector<std::string>> grid_points(std::span<const SweepParam> params) {
   std::vector<std::vector<std::string>> points;
@@ -534,9 +535,8 @@ std::vector<std::vector<std::string>> grid_points(std::span<const SweepParam> pa
     for (const auto& value : params[0].values) points.push_back({value});
     return points;
   }
-  for (const auto& [outer, inner] :
-       std::views::cartesian_product(params[0].values, params[1].values)) {
-    points.push_back({outer, inner});
+  for (const auto& outer : params[0].values) {
+    for (const auto& inner : params[1].values) points.push_back({outer, inner});
   }
   return points;
 }
