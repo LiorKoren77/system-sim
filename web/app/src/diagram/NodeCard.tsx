@@ -1,14 +1,18 @@
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
+import { useContext } from "react";
+import { FrameContext } from "./frame-context";
 import type { NodeData } from "./to-flow-elements";
 
 // One node of the system: its id, its type and copies, and, for the frame on the slider, its mean
 // utilisation and its zone (as a word too: colour is never the only signal). A client shows the
 // rate it offers instead, since a source has no queue to fill.
 export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
+  const state = useContext(FrameContext).get(data.id);
+  const zone = state?.zone ?? null;
   const copies = data.replicas > 1 ? ` ×${data.replicas}` : "";
   const shards = data.shards !== null ? ` · ${data.shards} shards` : "";
   return (
-    <div className="node-card">
+    <div className={`node-card zone-${zone ?? "none"}`}>
       <Handle type="target" position={Position.Left} />
       <div className="node-id">{data.id}</div>
       <div className="node-type">
@@ -17,9 +21,9 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
         {shards}
       </div>
       <div className="node-state">
-        {data.offeredPerSecond !== null
-          ? `offers ${rate(data.offeredPerSecond)}`
-          : `${data.rhoPercent === null ? "–" : `${data.rhoPercent}%`} · ${data.zone ?? "no data"}`}
+        {state?.offeredPerSecond != null
+          ? `offers ${rate(state.offeredPerSecond)}`
+          : `${state?.rhoPercent == null ? "–" : `${state.rhoPercent}%`} · ${zone ?? "no data"}`}
       </div>
       <Handle type="source" position={Position.Right} />
     </div>

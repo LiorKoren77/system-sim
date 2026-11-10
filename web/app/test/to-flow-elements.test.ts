@@ -3,7 +3,13 @@ import path from "node:path";
 import type { GraphLine } from "@simsys/stream";
 import { describe, expect, it } from "vitest";
 import { layoutGraph } from "../src/diagram/layout";
-import { toFlowElements, type NodeData } from "../src/diagram/to-flow-elements";
+import {
+  nodeStatesAt,
+  pipeZonesAt,
+  toFlowElements,
+  withPipeZones,
+  type NodeData,
+} from "../src/diagram/to-flow-elements";
 import { fixtureStore } from "./support";
 
 // youtube's resolved graph (`simsys explain scenarios/book/youtube/scenario.yaml --report json`),
@@ -27,7 +33,7 @@ describe("the diagram's elements, from the graph and the frame", () => {
     const store = await fixtureStore("tutorial-chain");
     const graph = store.graph;
     if (!graph) throw new Error("no graph");
-    const { nodes, edges } = toFlowElements(graph, await layoutGraph(graph), store, 0, null);
+    const { nodes, edges } = toFlowElements(graph, await layoutGraph(graph), null);
     expect(nodes.map((n) => n.id)).toEqual(["users", "api", "db"]);
     expect(edges.map((e) => [e.source, e.target])).toEqual([
       ["users", "api"],
@@ -35,39 +41,39 @@ describe("the diagram's elements, from the graph and the frame", () => {
     ]);
   });
 
-  it("colours a node by its zone in the frame and writes the zone as a word", async () => {
-    // chain's api at 1500/s on 2 × 1000/s: utilisation 0.75, above yellow (0.7), below red (0.9).
+  it("gives each node its zone, utilisation and, for a client, what it offers, per frame", async () => {
+    // chain's api at 1500/s on 2 × 1000/s: utilisation 0.75, above yellow (0.7), below red (0.9);
+    // db at 0.36; the users client offers read 1200/s + write 300/s.
     const store = await fixtureStore("tutorial-chain");
     const graph = store.graph;
     if (!graph) throw new Error("no graph");
-    const { nodes } = toFlowElements(graph, await layoutGraph(graph), store, 0, null);
-    expect(nodes.find((n) => n.id === "api")?.className).toContain("zone-yellow");
-    expect(dataOf(nodes, "api")).toMatchObject({ zone: "yellow", rhoPercent: 75, replicas: 2 });
-    expect(dataOf(nodes, "db")).toMatchObject({ zone: "green", rhoPercent: 36 });
+    const states = nodeStatesAt(graph, store, 0);
+    expect(states.get("api")).toEqual({ zone: "yellow", rhoPercent: 75, offeredPerSecond: null });
+    expect(states.get("db")).toMatchObject({ zone: "green", rhoPercent: 36 });
+    expect(states.get("users")).toEqual({ zone: null, rhoPercent: null, offeredPerSecond: 1500 });
   });
 
-  it("shows a client with what it offers, the sum of its ops, and no zone", async () => {
-    // chain's users: read 1200/s + write 300/s.
+  it("keeps a node's copies and its client look in the structure, which no frame changes", async () => {
     const store = await fixtureStore("tutorial-chain");
     const graph = store.graph;
     if (!graph) throw new Error("no graph");
-    const { nodes } = toFlowElements(graph, await layoutGraph(graph), store, 0, null);
-    expect(nodes.find((n) => n.id === "users")?.className).toContain("client");
-    expect(dataOf(nodes, "users")).toMatchObject({ zone: null, offeredPerSecond: 1500 });
+    const { nodes } = toFlowElements(graph, await layoutGraph(graph), null);
+    expect(dataOf(nodes, "api")).toMatchObject({ type: "service", replicas: 2 });
+    expect(nodes.find((n) => n.id === "users")?.className).toBe("client");
   });
 
   it("marks the selected node", async () => {
     const store = await fixtureStore("tutorial-chain");
     const graph = store.graph;
     if (!graph) throw new Error("no graph");
-    const { nodes } = toFlowElements(graph, await layoutGraph(graph), store, 0, "db");
+    const { nodes } = toFlowElements(graph, await layoutGraph(graph), "db");
     expect(nodes.find((n) => n.id === "db")?.selected).toBe(true);
     expect(nodes.find((n) => n.id === "api")?.selected).toBe(false);
   });
 
   it("puts each node of a two-datacenter system in its datacenter's box", async () => {
     const layout = await layoutGraph(youtube);
-    const { nodes } = toFlowElements(youtube, layout, null, 0, null);
+    const { nodes } = toFlowElements(youtube, layout, null);
     const groups = nodes.filter((n) => n.type === "group");
     expect(groups.map((g) => g.id)).toEqual(["dc:us-east", "dc:eu-west"]);
     expect(nodes.find((n) => n.id === "cdn_eu")?.parentId).toBe("dc:eu-west");
@@ -78,16 +84,34 @@ describe("the diagram's elements, from the graph and the frame", () => {
     const store = await fixtureStore("tutorial-chain");
     const graph = store.graph;
     if (!graph) throw new Error("no graph");
-    const { nodes } = toFlowElements(graph, await layoutGraph(graph), store, 0, null);
+    const { nodes } = toFlowElements(graph, await layoutGraph(graph), null);
     expect(nodes.some((n) => n.type === "group")).toBe(false);
   });
 
   it("marks a bandwidth link as a pipe and a plain link not", async () => {
-    const { edges } = toFlowElements(youtube, await layoutGraph(youtube), null, 0, null);
+    const { edges } = toFlowElements(youtube, await layoutGraph(youtube), null);
     const pipe = edges.find((e) => e.source === "cdn_eu" && e.target === "transcoded_store");
-    expect(pipe?.className).toContain("pipe");
+    expect(pipe?.className).toBe("pipe");
     const plain = edges.find((e) => e.source === "lb" && e.target === "api");
-    expect(plain?.className ?? "").not.toContain("pipe");
+    expect(plain?.className).toBeUndefined();
+  });
+
+  it("colours a pipe by its zone in the frame, and leaves a plain link alone", async () => {
+    const { edges } = toFlowElements(youtube, await layoutGraph(youtube), null);
+    const zones = youtube.links.map((link) => (link.pipe_row === null ? null : ("red" as const)));
+    const coloured = withPipeZones(edges, zones);
+    const at = youtube.links.findIndex((l) => l.from === "cdn_eu" && l.to === "transcoded_store");
+    expect(coloured[at]?.className).toBe("pipe zone-red");
+    const plain = youtube.links.findIndex((l) => l.from === "lb" && l.to === "api");
+    expect(coloured[plain]).toBe(edges[plain]); // the same object: React Flow redraws nothing
+  });
+
+  it("reads no pipe zone without a store, and one per link otherwise", async () => {
+    const store = await fixtureStore("tutorial-chain");
+    const graph = store.graph;
+    if (!graph) throw new Error("no graph");
+    expect(pipeZonesAt(graph, store, 0)).toEqual([null, null]); // chain has no bandwidth link
+    expect(pipeZonesAt(youtube, null, 0).every((z) => z === null)).toBe(true);
   });
 });
 

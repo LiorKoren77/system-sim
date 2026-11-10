@@ -4,7 +4,8 @@ import "@xyflow/react/dist/style.css";
 import { useEffect, useMemo, useState } from "react";
 import { layoutGraph, type Layout } from "./layout";
 import { NodeCard } from "./NodeCard";
-import { toFlowElements } from "./to-flow-elements";
+import { FrameContext } from "./frame-context";
+import { nodeStatesAt, pipeZonesAt, toFlowElements, withPipeZones } from "./to-flow-elements";
 
 // A module constant: React Flow warns when the node types object changes between renders.
 const nodeTypes: NodeTypes = { system: NodeCard };
@@ -44,31 +45,51 @@ export function Diagram(props: {
     };
   }, [graph]);
   const current = layout !== null && layout.graph === graph ? layout.layout : null;
-  // store.version changes when frames arrive; the elements depend on it through the store.
-  const elements = useMemo(
-    () => (graph && current ? toFlowElements(graph, current, store, frame, selected) : null),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- the store mutates; version marks it
-    [graph, current, store, store.version, frame, selected],
+  // The structure: new objects only when the layout or the selection changes, never per frame.
+  const structure = useMemo(
+    () => (graph && current ? toFlowElements(graph, current, selected) : null),
+    [graph, current, selected],
   );
-  if (elements === null) return <div className="diagram" />;
+  // The frame's state. The store mutates as frames arrive; its version marks a change.
+  const version = store.version;
+  const states = useMemo(
+    () => (graph ? nodeStatesAt(graph, store, frame) : new Map()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- version stands for the store's contents
+    [graph, store, version, frame],
+  );
+  // The pipes' zones as one string, so the edges are rebuilt only when one of them changes.
+  const zonesKey = graph ? pipeZonesAt(graph, store, frame).join(",") : "";
+  const edges = useMemo(
+    () =>
+      structure && graph
+        ? withPipeZones(
+            structure.edges,
+            zonesKey.split(",").map((z) => (z === "" ? null : (z as "green" | "yellow" | "red"))),
+          )
+        : [],
+    [structure, graph, zonesKey],
+  );
+  if (structure === null) return <div className="diagram" />;
   return (
-    <div className="diagram">
-      <ReactFlow
-        nodes={elements.nodes}
-        edges={elements.edges}
-        nodeTypes={nodeTypes}
-        nodesDraggable={false}
-        nodesConnectable={false}
-        elementsSelectable
-        fitView
-        minZoom={0.2}
-        onNodeClick={(_, node) => {
-          if (node.type === "system") onSelect(node.id);
-        }}
-        onPaneClick={() => {
-          onSelect(null);
-        }}
-      />
-    </div>
+    <FrameContext value={states}>
+      <div className="diagram">
+        <ReactFlow
+          nodes={structure.nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          nodesDraggable={false}
+          nodesConnectable={false}
+          elementsSelectable
+          fitView
+          minZoom={0.2}
+          onNodeClick={(_, node) => {
+            if (node.type === "system") onSelect(node.id);
+          }}
+          onPaneClick={() => {
+            onSelect(null);
+          }}
+        />
+      </div>
+    </FrameContext>
   );
 }

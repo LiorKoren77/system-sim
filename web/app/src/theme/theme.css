@@ -261,17 +261,17 @@ main h1 .chapter {
   text-overflow: ellipsis;
 }
 
-.zone-green .node-card {
+.node-card.zone-green {
   border-color: var(--zone-green);
   background: var(--zone-green-bg);
 }
 
-.zone-yellow .node-card {
+.node-card.zone-yellow {
   border-color: var(--zone-yellow);
   background: var(--zone-yellow-bg);
 }
 
-.zone-red .node-card {
+.node-card.zone-red {
   border-color: var(--zone-red);
   background: var(--zone-red-bg);
 }
