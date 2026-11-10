@@ -771,13 +771,13 @@ int run_sweep_command(const std::filesystem::path& file, const SweepArgs& args) 
   return 0;
 }
 
-// The options `estimate` and `run` share.
 // `--report table|json`: every command that can answer in JSON (estimate, run, explain).
 void add_format_option(CLI::App& command, std::string& format) {
   command.add_option("--report", format, "output format: table (default) or json")
       ->check(CLI::IsMember({"table", "json"}));
 }
 
+// The options `estimate` and `run` share.
 void add_report_options(CLI::App& command, ReportOptions& options) {
   add_format_option(command, options.format);
   command.add_flag("--no-color", options.no_color,

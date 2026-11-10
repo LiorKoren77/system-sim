@@ -43,6 +43,7 @@ RunAndFrames run_and_frames(const simsys::graph::Graph& g, std::size_t steps_per
   RunAndFrames out;
   FrameAggregator aggregator{g, steps_per_bucket, [&](const Frame& f) { out.frames.push_back(f); }};
   auto sim = simsys::test_support::simulation_of(g);
+  // C++20 designated initializers: RunOptions' members named at the call, not by position.
   sim.run({.duration = g.scenario().duration, .step = g.scenario().step}, [&](const StepRecord& r) {
     out.records.push_back(r);
     aggregator.observe(r);
