@@ -317,6 +317,8 @@ TEST_CASE("explain's JSON lists the scripted faults and the SLOs, so a timeline 
   CHECK(fault["target"].Scalar() == "post_db");
   CHECK(fault["at_s"].as<double>() == 54000);  // 15:00
   CHECK(fault["for_s"].as<double>() == 30);
+  CHECK(fault["replicas"].IsNull());  // no `replicas:`: every copy of post_db goes down
+  CHECK(fault["primary"].as<bool>() == false);
   CHECK(doc["slos"].size() == 3);
   CHECK(doc["slos"][0]["metric"].IsScalar());
 }
@@ -555,6 +557,16 @@ TEST_CASE("explain's JSON gives a sharded database its shards beside its copies"
   CHECK(db["shards"].as<int>() == 3);
   CHECK(db["replicas"].as<int>() == 3);                // a primary and two read replicas per shard
   CHECK(db["capacity_per_s"].as<double>() == 45'000);  // 3 copies x 3 shards x 5k/s
+}
+
+TEST_CASE("explain's JSON says how many copies a node_down takes, so a diagram can show the rest up",
+          "[stream]") {
+  // The consistent-hashing lab takes one of its four cache servers down at 10 m (`replicas: 1`).
+  const auto doc = graph_json_of("labs/consistent-hashing/scenario.yaml");
+  REQUIRE(doc["faults"].size() == 1);
+  CHECK(doc["faults"][0]["target"].Scalar() == "cache_servers");
+  CHECK(doc["faults"][0]["replicas"].as<int>() == 1);
+  CHECK(doc["faults"][0]["primary"].as<bool>() == false);
 }
 
 TEST_CASE("explain's JSON gives an instant fault no duration", "[stream]") {
