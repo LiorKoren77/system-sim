@@ -116,9 +116,10 @@ runs that day N times in a row, as the same system would live through them:
   app shows the looped day's (§9.6).
 - **The stream** says so: the `run` line gains `"days": N` (an added key: `format_version` stays
   1). `duration_s` and `warmup_s` are the run's (172800 and 86400 for two days). The `graph`'s
-  `faults` list every copy, in time order.
+  `faults` list every copy, day by day, each day in the file's order.
 - **Where.** A pure function `session::repeat_days(model::Scenario, int days) ->
-  std::expected<model::Scenario, RunRefusal>` makes the N-day scenario before the graph is built.
+  std::expected<model::Scenario, std::string>` makes the N-day scenario before the graph is built
+  (the CLI wraps its message in its `RunRefusal`, as it does `build_graph`'s).
   The engine and the loader are untouched, and `explain` of the result shows what will run. It is
   a plain transformation of the input, not a named pattern, and its comment says so.
 
@@ -140,7 +141,7 @@ A dataset is a 5a stream (schema, "simsys run --stream"), one JSON object per li
 {"type":"dataset","dataset_version":1,"id":"book/chat-system","title":"Chat system","chapter":12,
  "kind":"day","window":{"from_s":86400,"to_s":172800},"loops":true,
  "seam":{"status":"repeats","worst":{"row":"node","id":"chat_servers","column":"connections","a":181234,"b":181234,"rel":0}},
- "source":{"scenario":"scenarios/book/chat-system/scenario.yaml","args":["run","…","--stream","--days","2","--every","2m"],"simsys_commit":"dbcf013"}}
+ "source":{"scenario":"scenarios/book/chat-system/scenario.yaml","args":["run","…","--stream","--days","2","--every","2m"]}}
 ```
 
 | key | meaning |
@@ -152,7 +153,7 @@ A dataset is a 5a stream (schema, "simsys run --stream"), one JSON object per li
 | `window` | the run time the frames cover: day 2 (`86400`–`172800`) for a day that repeats; the whole run otherwise |
 | `loops` | `true` only for a day whose seam check passed |
 | `seam` | for a `day`: `status` (`repeats` or `drifts`) and the worst column (§7.2); `null` for a `run` |
-| `source` | how to regenerate it: the file, the exact arguments, the simsys commit (`git rev-parse --short HEAD`, `dirty` appended for an unclean tree) |
+| `source` | how to regenerate it: the file and the exact arguments. The simsys commit is in `index.json`, not here: a dataset's bytes then depend only on what `simsys` wrote, so the committed fixtures (§10) do not change at every commit |
 
 **Buckets.** A day is written with `--every 2m`: 720 frames a day, the 5a default for 24 h, so a
 48 h run gives 1440 and the dataset keeps the second 720. A `run` keeps `--points 720`.
@@ -165,13 +166,15 @@ to download per scenario. The plan records every dataset's size in `index.json` 
 first:
 
 ```json
-{"index_version":1,"format_version":1,"datasets":[
+{"index_version":1,"format_version":1,"simsys_commit":"dbcf013","datasets":[
   {"id":"book/chat-system","file":"book-chat-system.ndjson.gz","bytes":131072,"title":"Chat system",
    "chapter":12,"kind":"day","loops":true,"seam":"repeats","frames":720,"slo_passed":true}, …]}
 ```
 
-No time stamps in either file: the same commit gives the same bytes (Node's gzip writes mtime 0),
-so CI can compare them byte for byte.
+No time stamps in either file (Node's gzip writes mtime 0). The same `simsys` output gives the
+same dataset, and CI compares the fixtures' inflated text, not the gzip bytes, which a different
+zlib could compress differently. `simsys_commit` is `git rev-parse --short HEAD`, with `-dirty`
+appended for an unclean tree.
 
 **Why not cut the frames in C++** (`--stream --from 24h`): the precompute needs day 1's last frame
 for the seam check, and a cut is one line of TypeScript. The stream stays the full run.
@@ -410,10 +413,9 @@ seed twice gives the same bytes.
 except for the release job's upload step. The format job's command stays C++ only; Prettier is in
 `npm run check`.
 
-**Fixtures** (committed in `web/stream/test/fixtures/`, written by `npm run fixtures`): hello's and
-chain's streams, kv-store's (a fault and its block), and url-shortener's day dataset (gzipped,
-about 90 KB) as the one real day. CI's `--check` regenerates them and fails on any byte of
-difference, so a change of the C++ output cannot leave the web code testing an old contract.
+**Fixtures** (committed in `web/stream/test/fixtures/`, written by `npm run fixtures`): the datasets
+of hello, chain, kv-store (a fault and its block) and url-shortener (gzipped, about 90 KB: the one
+real day). CI's `--check` regenerates them and fails on any difference in their inflated text, so a change of the C++ output cannot leave the web code testing an old contract.
 
 ## 11. Repository layout and conventions
 
