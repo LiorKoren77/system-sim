@@ -228,7 +228,9 @@ These are written into the schema (v1.7) as the frontend's guarantee:
 2. Adding a message type, a key or a column (at the end of a `*_columns` list) keeps `format_version`.
 3. Removing or renaming any of them, reordering columns, or changing a value's meaning or unit raises
    it, and the schema's "New in" list names the change.
-4. Rows refer to nodes, links and ops by their position in the latest `graph`; the `graph`'s ids are
+4. Rows refer to nodes and ops by their position in the latest `graph`, and link rows to a link by its
+   `pipe_row` (as built: only a bandwidth link has a row, so a link's position in `links` is not its
+   row; the final review caught the draft's rule); the `graph`'s ids are
    the scenario's ids, stable across runs of the same file.
 5. Same file, same seed, same `--points`: the same stream, byte for byte (the engine's determinism,
    spec §3.6, carried through).

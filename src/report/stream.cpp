@@ -35,6 +35,10 @@ import simsys.model;
 
 namespace simsys::report {
 
+double bucket_seconds(SimTime step, std::size_t steps) {
+  return seconds(SimTime{step.count() * static_cast<SimTime::rep>(steps)});
+}
+
 // Defaulted out of line, in this unit (report.cppm's Frame says why).
 Frame::Frame() = default;
 Frame::Frame(const Frame& other) = default;
@@ -185,13 +189,6 @@ NodeRow FrameAggregator::node_row(const QueueSums& sums, bool client) const {
                  .deduplicated_per_s = mean_of(sums.deduplicated)};
 }
 
-// A pipe's row: a node's, without the refusals (a pipe refuses nothing by policy).
-NodeRow FrameAggregator::link_row(const QueueSums& sums) const {
-  auto row = node_row(sums, false);
-  row.rejected_per_s.reset();
-  return row;
-}
-
 // The op's rates as means; its mean response and p99 by the run's rule (seen_latencies, capped at
 // the client's timeout), or empty when the bucket answered nothing or its path never answered.
 OpRow FrameAggregator::op_row(const OpSums& sums) const {
@@ -220,15 +217,14 @@ OpRow FrameAggregator::op_row(const OpSums& sums) const {
 void FrameAggregator::hand_over() {
   Frame frame;
   frame.t = start_;
-  // The length in whole nanoseconds, then in seconds: 3 steps of 100 ms are 0.3 s exactly as the
-  // next frame's t_s is, where 0.1 × 3 in floating point is 0.30000000000000004.
-  frame.dt_s = seconds(SimTime{step_.count() * static_cast<SimTime::rep>(steps_)});
+  frame.dt_s = bucket_seconds(step_, steps_);
   const auto nodes = graph_->nodes();
   for (std::size_t i = 0; i < nodes_.size(); ++i) {
     const bool client = i < nodes.size() && nodes[i].spec.type == model::NodeType::client;
     frame.nodes.push_back(node_row(nodes_[i], client));
   }
-  for (const auto& sums : links_) frame.links.push_back(link_row(sums));
+  for (const auto& sums : links_)
+    frame.links.push_back(node_row(sums, false));  // json_link_row picks link_columns
   for (const auto& sums : ops_) frame.ops.push_back(op_row(sums));
   steps_ = 0;
   sink_(frame);
@@ -330,9 +326,7 @@ std::string render_run_line(const graph::Graph& g, std::size_t steps_per_bucket,
       json_field("duration_s", json_number(seconds(scenario.duration))),
       json_field("step_s", json_number(step_s)),
       json_field("warmup_s", json_number(seconds(scenario.warmup))),
-      json_field("bucket_s",
-                 json_number(seconds(SimTime{scenario.step.count() *
-                                             static_cast<SimTime::rep>(steps_per_bucket)}))),
+      json_field("bucket_s", json_number(bucket_seconds(scenario.step, steps_per_bucket))),
       json_field("frames", std::to_string(frames))};
   return json_on_one_line(json_object(fields));
 }
@@ -357,9 +351,10 @@ std::string render_frame_line(const Frame& frame) {
 
 std::string render_summary_line(const Summary& summary, std::span<const SloResult> slos,
                                 int exit_code) {
-  return json_on_one_line("{" + type_field("summary") + "," +
-                          json_field("exit_code", std::to_string(exit_code)) + "," +
-                          json_field("report", render_json_line(summary, slos)) + "}");
+  // The report is on one line already (render_json_line); the two keys before it are written
+  // without spaces, so the line needs no second pass.
+  return R"({"type":"summary","exit_code":)" + std::to_string(exit_code) + R"(,"report":)" +
+         render_json_line(summary, slos) + "}";
 }
 
 std::string render_error_line(const std::optional<std::string>& file, int line, int column,

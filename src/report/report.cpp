@@ -2132,13 +2132,6 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
   }
 }
 
-// A step whose response is infinite (a node on the path never answers) poisons the whole op: no
-// finite average describes it. It is flagged instead of accumulated, so no 0 × inf = NaN can reach
-// the sums. A step that delivered nothing (answered + timed-out attempts = 0: every request it sent
-// was dropped or refused, or it sent none) adds its counts and nothing else: no request saw its
-// latency, so it weighs no moment and flags nothing, whatever the latency a request WOULD have seen
-// (phase 3 Task 6's review: a node that is down drops what its full room cannot hold, and those
-// steps must not decide the op's latency for the whole run).
 void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
   rates.add(sample, dt_s);
   response.add(sample, dt_s);
@@ -2171,6 +2164,13 @@ double timed_out_share(double answered, double timed_out) {
   return delivered > 0.0 ? timed_out / delivered : 0.0;
 }
 
+// A step whose response is infinite (a node on the path never answers) poisons the whole op: no
+// finite average describes it. It is flagged instead of accumulated, so no 0 × inf = NaN can reach
+// the sums. A step that delivered nothing (answered + timed-out attempts = 0: every request it sent
+// was dropped or refused, or it sent none) adds its counts and nothing else: no request saw its
+// latency, so it weighs no moment and flags nothing, whatever the latency a request WOULD have seen
+// (phase 3 Task 6's review: a node that is down drops what its full room cannot hold, and those
+// steps must not decide the op's latency for the whole run).
 void ResponseMoments::add(const engine::ResponseSample& sample, double dt_s) {
   const double delivered_per_s = sample.answered.per_second + sample.timed_out_attempts.per_second;
   if (!(delivered_per_s > 0.0)) return;

@@ -130,7 +130,6 @@ TEST_CASE("a bucket of one step is that step on a bandwidth link's pipe", "[stre
     check_equal(row.backlog, pipe.backlog);
     check_equal(row.peak_rho, pipe.rho);
     CHECK(row.zone == static_cast<int>(pipe.zone));
-    CHECK_FALSE(row.rejected_per_s.has_value());  // not a link column
   }
 }
 

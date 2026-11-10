@@ -1339,7 +1339,13 @@ a reader meets are in `docs/scenario-schema.md` (v1.7).
 5. **Measured (Release, 2026-11-10).** youtube 27.4 s without and 24.3 s with `--stream`; chat-system
    59.9 s and 60.2 s: no cost. youtube's stream is 723 lines, 1.13 MB, about 1.55 KB a frame;
    chat-system's 874 KB. The first frame is out after 43 ms.
-6. **What 5a leaves.** The Node server and the browser (5b); commands on stdin and mid-run changes of
+6. **The final review.** A frame's `links` rows are the bandwidth links only, so each graph link
+   carries `pipe_row`, its row's index (null without a bandwidth): the draft's "rows by position in
+   the graph" would have put a pipe's numbers on the wrong edge. The stream fallback for a CLI11
+   parse error looks at the subcommand only (`argv[1] == "run"`); a bad `--duration` is the command
+   line's fault (`file` null); `--replications 1` streams, being the plain run; the bucket length
+   has one helper (`bucket_seconds`); the summary line is minified once.
+7. **What 5a leaves.** The Node server and the browser (5b); commands on stdin and mid-run changes of
    topology (the 5a design §8: reserved, `rev` always 0); `--series-every`, `validate --report json`,
    streamed replications or sweeps, compression; sorting `op_shares` once in `Graph::build`
    (batch B review: each reader sorts them today).

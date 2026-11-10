@@ -76,6 +76,11 @@ struct OpRates {
   void add(const engine::ResponseSample& sample, double dt_s);
 };
 
+// The length of a bucket of `steps` steps of `step`, in seconds, computed in whole nanoseconds: 3
+// steps of 100 ms are 0.3 exactly (as the next bucket's start is), where 0.1 × 3 in floating point
+// is 0.30000000000000004. The run line's bucket_s and every frame's dt_s.
+[[nodiscard]] double bucket_seconds(SimTime step, std::size_t steps);
+
 // A bandwidth link's pipe as a node's sample: the fields of the same names (in megabytes), none of
 // a node type's own (Summary's link totals and the frames' link rows both read it so).
 [[nodiscard]] engine::NodeSample as_node_sample(const engine::LinkSample& sample);
@@ -912,7 +917,6 @@ class FrameAggregator {
   void add_link(QueueSums& sums, const engine::LinkSample& sample) const;
   static void add_op(OpSums& sums, const engine::ResponseSample& sample, double dt_s);
   [[nodiscard]] NodeRow node_row(const QueueSums& sums, bool client) const;
-  [[nodiscard]] NodeRow link_row(const QueueSums& sums) const;
   [[nodiscard]] OpRow op_row(const OpSums& sums) const;
   void hand_over();
 
