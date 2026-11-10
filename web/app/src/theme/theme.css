@@ -204,16 +204,17 @@ main h1 .chapter {
 
 .timeline .marks {
   position: absolute;
-  left: 0;
-  right: 0;
-  bottom: -6px;
-  height: 4px;
+  left: 8px;
+  right: 8px;
+  bottom: -9px;
+  height: 7px;
   pointer-events: none;
 }
 
 .timeline .fault-mark {
   position: absolute;
-  height: 4px;
+  min-width: 4px;
+  height: 7px;
   background: var(--fault);
   border-radius: 2px;
 }
@@ -223,4 +224,99 @@ main h1 .chapter {
   gap: 6px;
   align-items: center;
   color: var(--muted);
+}
+
+/* ---- the diagram ---- */
+.diagram .react-flow__node-system {
+  width: 176px;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+.node-card {
+  height: 68px;
+  padding: 6px 10px;
+  border: 2px solid var(--line);
+  border-left-width: 6px;
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.node-card .node-id {
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.node-card .node-type {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.zone-green .node-card {
+  border-color: var(--zone-green);
+  background: var(--zone-green-bg);
+}
+
+.zone-yellow .node-card {
+  border-color: var(--zone-yellow);
+  background: var(--zone-yellow-bg);
+}
+
+.zone-red .node-card {
+  border-color: var(--zone-red);
+  background: var(--zone-red-bg);
+}
+
+.client .node-card {
+  border-color: var(--client);
+  background: var(--client-bg);
+}
+
+.react-flow__node.selected .node-card {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.diagram .react-flow__node-group.datacenter {
+  border: 1px dashed var(--muted);
+  border-radius: 10px;
+  background: transparent;
+}
+
+.diagram .react-flow__node-group.datacenter::before {
+  content: attr(data-id);
+}
+
+.diagram .react-flow__edge-path {
+  stroke: var(--muted);
+}
+
+.diagram .react-flow__edge.pipe .react-flow__edge-path {
+  stroke-width: 4;
+}
+
+.diagram .react-flow__edge.pipe.zone-green .react-flow__edge-path {
+  stroke: var(--zone-green);
+}
+
+.diagram .react-flow__edge.pipe.zone-yellow .react-flow__edge-path {
+  stroke: var(--zone-yellow);
+}
+
+.diagram .react-flow__edge.pipe.zone-red .react-flow__edge-path {
+  stroke: var(--zone-red);
+}
+
+.diagram .react-flow__background,
+.diagram .react-flow {
+  background: var(--bg);
 }
