@@ -174,9 +174,9 @@ function fallbackSides(layout: Layout, from: string, to: string): { source: Side
 // a fill colour, not a CSS variable, so the colours are given here (theme.css has the same ones).
 const arrowColours: Readonly<Record<Zone | "none", string>> = {
   none: "#8a8f96",
-  green: "#1b8a4a",
-  yellow: "#b07800",
-  red: "#c62b1f",
+  green: "#4cc27e",
+  yellow: "#f0b429",
+  red: "#ff6b5e",
 };
 
 function arrow(zone: Zone | null): EdgeMarker {
