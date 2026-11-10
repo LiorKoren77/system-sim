@@ -16,7 +16,7 @@ target_link_libraries(simsys_test_support PUBLIC simsys Catch2::Catch2 PRIVATE s
 # keeps its calls to them out of line, so its object file defines them (as for src/model/model.cpp).
 set_source_files_properties(support/fixtures.cpp PROPERTIES COMPILE_OPTIONS -fno-inline)
 
-add_executable(unit_tests unit/test_units.cpp unit/test_config.cpp unit/test_queueing.cpp unit/test_flow.cpp unit/test_fluid.cpp unit/test_workload.cpp unit/test_caching.cpp unit/test_model.cpp unit/test_defaults.cpp unit/test_graph.cpp unit/test_behaviours.cpp unit/test_engine.cpp unit/test_report.cpp unit/test_series.cpp unit/test_sweep.cpp unit/test_session.cpp)
+add_executable(unit_tests unit/test_units.cpp unit/test_config.cpp unit/test_queueing.cpp unit/test_flow.cpp unit/test_fluid.cpp unit/test_workload.cpp unit/test_caching.cpp unit/test_model.cpp unit/test_defaults.cpp unit/test_graph.cpp unit/test_behaviours.cpp unit/test_engine.cpp unit/test_report.cpp unit/test_series.cpp unit/test_sweep.cpp unit/test_session.cpp unit/test_stream.cpp)
 target_link_libraries(unit_tests PRIVATE simsys simsys_test_support Catch2::Catch2WithMain simsys_warnings)
 # test_series.cpp explains shipped scenarios and test_sweep.cpp sweeps tutorial/hello, so they need
 # the directory, like scenario_tests.
