@@ -36,6 +36,16 @@ describe("reading a line by the output contract", () => {
     });
   });
 
+  it("keeps a dataset's diagram, the scenario's hand-made layout", () => {
+    const parsed = parseLine(
+      '{"type":"dataset","dataset_version":1,"id":"x","kind":"run","window":{"from_s":0,"to_s":60},"loops":false,"diagram":{"cells":{"a":[0,0]}}}',
+      1,
+    );
+    expect(parsed.kind === "message" && parsed.message).toMatchObject({
+      diagram: { cells: { a: [0, 0] } },
+    });
+  });
+
   it("refuses another dataset_version likewise", () => {
     const parsed = parseLine('{"type":"dataset","dataset_version":3,"id":"x"}', 1);
     expect(parsed).toEqual({

@@ -11,6 +11,7 @@ const entry: ScenarioEntry = {
   kind: "day",
   title: "Chat system",
   chapter: 12,
+  diagram: null,
 };
 
 const stream = {
@@ -51,6 +52,16 @@ describe("a dataset file", () => {
       "seam",
       "source",
     ]);
+  });
+
+  it("carries the scenario's diagram.yaml in the dataset line, when it has one", () => {
+    const withDiagram = {
+      ...entry,
+      diagram: { sides: { "users -> q": ["bottom", "top"] as const } },
+    };
+    const dataset = buildDataset(withDiagram, stream, cut, ["run", entry.path, "--stream"]);
+    expect(dataset.line.diagram).toEqual({ sides: { "users -> q": ["bottom", "top"] } });
+    expect(buildDataset(entry, stream, cut, []).line).not.toHaveProperty("diagram");
   });
 
   it("is the same bytes every time it is written: no time stamp, gzip's mtime 0", () => {
