@@ -1,6 +1,7 @@
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
 import { useContext } from "react";
 import { categoryClass } from "./categories";
+import type { Copies } from "./copies";
 import { FrameContext } from "./frame-context";
 import type { NodeData } from "./to-flow-elements";
 
@@ -15,8 +16,10 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
   const zone = state?.zone ?? null;
   const copies = data.replicas > 1 ? ` ×${data.replicas}` : "";
   const shards = data.shards !== null ? ` · ${data.shards} shards` : "";
+  // A node with copies is drawn as a stack of cards (theme.css), its slots the copies up.
+  const stacked = data.replicas > 1 ? " stacked" : "";
   return (
-    <div className={`node-card ${categoryClass(data.category)} zone-${zone ?? "none"}`}>
+    <div className={`node-card ${categoryClass(data.category)} zone-${zone ?? "none"}${stacked}`}>
       <Handles />
       <div className="node-category">{data.category}</div>
       <div className="node-body">
@@ -26,6 +29,7 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
           {copies}
           {shards}
         </div>
+        {state?.copies && <CopySlots copies={state.copies} />}
         <div className="node-state">
           {state?.offeredPerSecond != null ? (
             <span>offers {rate(state.offeredPerSecond)}</span>
@@ -42,6 +46,34 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
 }
 
 const zoneWord = { green: "ok", yellow: "yellow", red: "red" } as const;
+
+// The most copies drawn as slots; above it, a count ("19 of 20 up").
+const maxSlots = 12;
+
+// One slot per copy, filled while it is up; a count when the copies are many. Shown for a node with
+// copies, and for a single copy only while it is down. simsys knows how many copies are down, not
+// which (copies.ts), so the slots up are always the first ones.
+function CopySlots({ copies }: { copies: Copies }) {
+  if (copies.of === 1 && copies.up === 1) return null;
+  const label = copies.primaryDown
+    ? `primary down, ${copies.up} of ${copies.of} up`
+    : `${copies.up} of ${copies.of} up`;
+  if (copies.of > maxSlots) {
+    return (
+      <div className={`copies${copies.up < copies.of ? " some-down" : ""}`} title={label}>
+        {label}
+      </div>
+    );
+  }
+  return (
+    <div className="copies" title={label} aria-label={label}>
+      {Array.from({ length: copies.of }, (_, i) => (
+        <span key={i} className={i < copies.up ? "slot up" : "slot down"} />
+      ))}
+      {copies.up < copies.of && <span className="copies-label">{label}</span>}
+    </div>
+  );
+}
 
 // A connection point on each side, for edges arriving (target) and leaving (source): an edge picks
 // the pair of sides that face the other box (sides.ts). The ids are what an edge names.
