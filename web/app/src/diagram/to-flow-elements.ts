@@ -85,8 +85,9 @@ export function toFlowElements(
       sourceHandle: `source-${sides.source}`,
       targetHandle: `target-${sides.target}`,
       // ELK's route around the boxes when it gave one; otherwise right-angled lines between the
-      // facing sides (sides.ts).
-      ...(route ? { type: "routed", data: { points: route } } : { type: "smoothstep" }),
+      // facing sides (sides.ts). `index` is the link's place in the graph, for its traffic.
+      type: "routed",
+      data: route ? { index: i, points: route } : { index: i },
       // The arrowhead points at the box the link sends requests to.
       markerEnd: arrow(null),
       ...(link.pipe_row === null ? {} : { className: "pipe" }),

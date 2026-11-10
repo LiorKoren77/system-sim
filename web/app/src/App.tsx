@@ -108,6 +108,7 @@ function Dataset(props: {
         frame={Math.min(effective.frame, store.frameCount - 1)}
         selected={props.node}
         onSelect={props.onSelectNode}
+        playing={effective.playing}
       />
       <Timeline store={store} player={effective} dispatch={dispatch} shown={shown} />
     </>

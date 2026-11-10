@@ -47,29 +47,22 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
 
 const zoneWord = { green: "ok", yellow: "yellow", red: "red" } as const;
 
-// The most copies drawn as slots; above it, a count ("19 of 20 up").
-const maxSlots = 12;
-
-// One slot per copy, filled while it is up; a count when the copies are many. Shown for a node with
-// copies, and for a single copy only while it is down. simsys knows how many copies are down, not
-// which (copies.ts), so the slots up are always the first ones.
+// One slot per copy, filled while it is up; the slots narrow as the copies grow, so a stack of 20
+// or 100 still fits the box. Shown for a node with copies, and for a single copy only while it is
+// down. simsys knows how many copies are down, not which (copies.ts), so the slots up are always
+// the first ones.
 function CopySlots({ copies }: { copies: Copies }) {
   if (copies.of === 1 && copies.up === 1) return null;
   const label = copies.primaryDown
     ? `primary down, ${copies.up} of ${copies.of} up`
     : `${copies.up} of ${copies.of} up`;
-  if (copies.of > maxSlots) {
-    return (
-      <div className={`copies${copies.up < copies.of ? " some-down" : ""}`} title={label}>
-        {label}
-      </div>
-    );
-  }
   return (
     <div className="copies" title={label} aria-label={label}>
-      {Array.from({ length: copies.of }, (_, i) => (
-        <span key={i} className={i < copies.up ? "slot up" : "slot down"} />
-      ))}
+      <span className="slots">
+        {Array.from({ length: copies.of }, (_, i) => (
+          <span key={i} className={i < copies.up ? "slot up" : "slot down"} />
+        ))}
+      </span>
       {copies.up < copies.of && <span className="copies-label">{label}</span>}
     </div>
   );
