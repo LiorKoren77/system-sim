@@ -306,7 +306,8 @@ TEST_CASE("samples yields one rate per step from zero up to but excluding until"
   RateCurve c{.base = Rate{100}};
   c.spikes = {Spike{.at = 300ms, .duration = 100ms, .factor = 3}};
   std::vector<double> got;
-  // C++23 std::generator: a lazy coroutine range; the curve is sampled only as far as consumed.
+  // simsys::Generator (the project's std::generator): a lazy coroutine range; the curve is sampled
+  // only as far as consumed.
   // It replaces building a whole std::vector up front or hand-writing an iterator class.
   for (const auto& s : simsys::workload::samples(c, 100ms, 500ms)) got.push_back(s.rate.per_second);
   REQUIRE(got == std::vector<double>{100, 100, 100, 300, 100});
@@ -315,7 +316,7 @@ TEST_CASE("samples yields one rate per step from zero up to but excluding until"
 TEST_CASE("samples carries the time of each sample", "[workload]") {
   const RateCurve c{.base = Rate{1}};
   auto gen = simsys::workload::samples(c, 1s, 3s);
-  // std::generator's iterator is input-only: it has operator* but no operator->, so (*it).t.
+  // A generator's iterator is input-only: it has operator* but no operator->, so (*it).t.
   auto it = gen.begin();
   REQUIRE((*it).t == 0s);
   ++it;
