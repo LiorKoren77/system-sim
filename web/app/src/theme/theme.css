@@ -1,49 +1,31 @@
-/* The page's look: tokens on :root, a light and a dark set (from the system setting).
+/* The page's look: tokens on :root, one dark set whatever the system setting (a very dark grey
+   page, panels and boxes a step lighter: chosen by the user, 2026-11-10).
    The zone colours are chosen so the three zones differ in lightness as well as hue: a reader with
    red-green colour blindness still tells them apart, and every node also writes its zone as a word. */
 :root {
-  color-scheme: light dark;
-  --bg: #f7f7f5;
-  --panel: #ffffff;
-  --ink: #1d1f21;
-  --muted: #62666b;
-  --line: #d9dbde;
-  --accent: #2f5fd0;
-  --zone-green: #1b8a4a;
-  --zone-green-bg: #e3f4e9;
-  --zone-yellow: #b07800;
-  --zone-yellow-bg: #fff1cc;
-  --zone-red: #c62b1f;
-  --zone-red-bg: #fbe0dc;
-  --client: #6b7280;
-  --client-bg: #eef0f3;
-  --fault: #c62b1f;
+  color-scheme: dark;
+  --bg: #18191b;
+  --panel: #222427;
+  --ink: #e6e7e9;
+  --muted: #9aa0a6;
+  --line: #3a3e44;
+  --accent: #7aa2ff;
+  --zone-green: #4cc27e;
+  --zone-green-bg: #173523;
+  --zone-yellow: #f0b429;
+  --zone-yellow-bg: #3d3112;
+  --zone-red: #ff6b5e;
+  --zone-red-bg: #4a1c18;
+  --client: #a1a7af;
+  --client-bg: #2a2e33;
+  --fault: #ff6b5e;
+  --edge: #8a8f96;
   font-family:
     system-ui,
     -apple-system,
     "Segoe UI",
     sans-serif;
   font-size: 14px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #15171a;
-    --panel: #1d2024;
-    --ink: #e6e7e9;
-    --muted: #9aa0a6;
-    --line: #34383d;
-    --accent: #7aa2ff;
-    --zone-green: #4cc27e;
-    --zone-green-bg: #173523;
-    --zone-yellow: #f0b429;
-    --zone-yellow-bg: #3d3112;
-    --zone-red: #ff6b5e;
-    --zone-red-bg: #4a1c18;
-    --client: #a1a7af;
-    --client-bg: #262a2f;
-    --fault: #ff6b5e;
-  }
 }
 
 * {
@@ -230,27 +212,14 @@ main h1 .chapter {
 /* A box's category is its band's colour (categories.ts), its zone the border and the pill. The
    category hues keep clear of the zones' green, amber and red. */
 :root {
-  --cat-client: #374151;
-  --cat-traffic: #6d28d9;
-  --cat-compute: #1d4ed8;
-  --cat-cache: #0e7490;
-  --cat-database: #a21caf;
-  --cat-storage: #854d0e;
-  --cat-queue: #475569;
-  --cat-external: #6b7280;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --cat-client: #9ca3af;
-    --cat-traffic: #a78bfa;
-    --cat-compute: #60a5fa;
-    --cat-cache: #22d3ee;
-    --cat-database: #e879f9;
-    --cat-storage: #d6a35c;
-    --cat-queue: #94a3b8;
-    --cat-external: #9ca3af;
-  }
+  --cat-client: #9ca3af;
+  --cat-traffic: #a78bfa;
+  --cat-compute: #60a5fa;
+  --cat-cache: #22d3ee;
+  --cat-database: #e879f9;
+  --cat-storage: #d6a35c;
+  --cat-queue: #94a3b8;
+  --cat-external: #9ca3af;
 }
 
 .cat-client {
@@ -299,17 +268,11 @@ main h1 .chapter {
 .node-card .node-category {
   padding: 1px 8px;
   background: var(--cat);
-  color: #fff;
+  color: #111;
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-}
-
-@media (prefers-color-scheme: dark) {
-  .node-card .node-category {
-    color: #111;
-  }
 }
 
 .node-card .node-body {
@@ -356,7 +319,7 @@ main h1 .chapter {
 }
 
 .zone-pill.zone-red {
-  color: #fff;
+  color: #111;
   background: var(--zone-red);
 }
 
@@ -391,7 +354,7 @@ main h1 .chapter {
 }
 
 .diagram .react-flow__edge-path {
-  stroke: #8a8f96;
+  stroke: var(--edge);
   stroke-width: 1.5;
 }
 
@@ -510,4 +473,13 @@ main h1 .chapter {
   .diagram .react-flow__edge-path.flowing {
     animation: none;
   }
+}
+
+/* React Flow's credit, kept (its MIT licence asks for it politely) and drawn in the page's colours. */
+.diagram .react-flow__attribution {
+  background: transparent;
+}
+
+.diagram .react-flow__attribution a {
+  color: var(--muted);
 }
