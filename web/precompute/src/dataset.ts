@@ -38,6 +38,7 @@ export function buildDataset(
     loops: cut.loops,
     seam: cut.seam,
     source: { scenario: entry.path, args },
+    ...(entry.diagram === null ? {} : { diagram: entry.diagram }),
   };
   const lines = [
     JSON.stringify(line),

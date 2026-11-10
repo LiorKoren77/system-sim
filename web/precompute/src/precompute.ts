@@ -1,6 +1,7 @@
 // One scenario into one dataset, and a pool that runs several at once.
 import type { SummaryLine } from "@simsys/stream";
 import { buildDataset, datasetFileName, type DatasetFile } from "./dataset";
+import { checkDiagram } from "./diagram";
 import type { IndexEntry } from "./index-file";
 import { readStream, runSimsys } from "./run-simsys";
 import { simsysArgs, type ScenarioEntry } from "./scenarios";
@@ -28,7 +29,11 @@ export async function precomputeOne(
     stream.run.message.duration_s,
     stream.frames.map((f) => f.text),
   );
-  const dataset = buildDataset(entry, stream, cut, args);
+  // The diagram file is checked against the graph simsys resolved: it cannot name what is not there.
+  const diagramFile = entry.path.replace(/scenario\.yaml$/, "diagram.yaml");
+  const checked =
+    entry.diagram === null ? null : checkDiagram(entry.diagram, stream.graph.message, diagramFile);
+  const dataset = buildDataset({ ...entry, diagram: checked }, stream, cut, args);
   const index: IndexEntry = {
     id: entry.id,
     file: datasetFileName(entry.id),

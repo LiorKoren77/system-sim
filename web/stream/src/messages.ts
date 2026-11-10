@@ -158,6 +158,18 @@ export interface Seam {
   } | null;
 }
 
+// A side of a box in the diagram, where a link leaves or enters it.
+export type Side = "left" | "right" | "top" | "bottom";
+
+// A scenario's diagram.yaml (phase 5b, beside its scenario.yaml), checked by the precompute against
+// the graph: `cells` puts every box on a [column, row] of a grid; `sides` chooses which sides a
+// link joins, by `"<from> -> <to>"`. Either may be absent: ELK then places the boxes, or picks the
+// sides that face each other.
+export interface Diagram {
+  readonly cells?: Readonly<Record<string, readonly [number, number]>>;
+  readonly sides?: Readonly<Record<string, readonly [Side, Side]>>;
+}
+
 export interface DatasetLine {
   readonly type: "dataset";
   readonly dataset_version: number;
@@ -169,6 +181,7 @@ export interface DatasetLine {
   readonly loops: boolean;
   readonly seam: Seam | null;
   readonly source: { readonly scenario: string; readonly args: readonly string[] };
+  readonly diagram?: Diagram; // the scenario's diagram.yaml, when it has one
 }
 
 export type StreamMessage = DatasetLine | RunLine | GraphLine | FrameLine | SummaryLine | ErrorLine;

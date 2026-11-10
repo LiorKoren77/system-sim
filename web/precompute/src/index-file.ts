@@ -28,3 +28,13 @@ export function indexJson(entries: readonly IndexEntry[], simsysCommit: string):
   };
   return JSON.stringify(index, null, 2) + "\n";
 }
+
+// The entries of an index after a run that rewrote only `fresh` (`--only`): the earlier entries of
+// the other datasets kept, the rewritten ones replaced.
+export function mergeEntries(
+  earlier: readonly IndexEntry[],
+  fresh: readonly IndexEntry[],
+): IndexEntry[] {
+  const rewritten = new Set(fresh.map((e) => e.id));
+  return [...earlier.filter((e) => !rewritten.has(e.id)), ...fresh];
+}

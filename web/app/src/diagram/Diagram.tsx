@@ -1,4 +1,4 @@
-import type { DatasetStore, GraphLine } from "@simsys/stream";
+import type { DatasetStore, Diagram as DiagramFile, GraphLine } from "@simsys/stream";
 import { ReactFlow, type EdgeTypes, type NodeTypes } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useEffect, useMemo, useState } from "react";
@@ -12,13 +12,14 @@ import { nodeStatesAt, pipeZonesAt, toFlowElements, withPipeZones } from "./to-f
 const nodeTypes: NodeTypes = { system: NodeCard };
 const edgeTypes: EdgeTypes = { routed: RoutedEdge };
 
-// One layout per graph object, kept while the page lives (a graph is never edited in place).
+// One layout per graph object, kept while the page lives (a graph is never edited in place, and a
+// dataset's diagram comes with its graph).
 const layouts = new WeakMap<GraphLine, Promise<Layout>>();
 
-function layoutOf(graph: GraphLine): Promise<Layout> {
+function layoutOf(graph: GraphLine, diagram: DiagramFile | undefined): Promise<Layout> {
   let layout = layouts.get(graph);
   if (layout === undefined) {
-    layout = layoutGraph(graph);
+    layout = layoutGraph(graph, diagram);
     layouts.set(graph, layout);
   }
   return layout;
@@ -35,17 +36,18 @@ export function Diagram(props: {
 }) {
   const { store, frame, selected, onSelect } = props;
   const graph = store.graph;
+  const diagramFile = store.dataset?.diagram;
   const [layout, setLayout] = useState<{ graph: GraphLine; layout: Layout } | null>(null);
   useEffect(() => {
     if (graph === undefined) return;
     let live = true;
-    void layoutOf(graph).then((l) => {
+    void layoutOf(graph, diagramFile).then((l) => {
       if (live) setLayout({ graph, layout: l });
     });
     return () => {
       live = false;
     };
-  }, [graph]);
+  }, [graph, diagramFile]);
   const current = layout !== null && layout.graph === graph ? layout.layout : null;
   // The structure: new objects only when the layout or the selection changes, never per frame.
   const structure = useMemo(
