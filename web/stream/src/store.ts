@@ -93,6 +93,7 @@ export class DatasetStore {
   version = 0; // bumped at each notification
 
   private readonly graphs = new Map<number, GraphLine>();
+  private generation = 0; // which call of consume() owns the store
   private readonly listeners = new Set<() => void>();
   private readonly batchFrames: number;
   private sinceNotified = 0;
@@ -112,13 +113,19 @@ export class DatasetStore {
     return () => this.listeners.delete(listener);
   }
 
-  // Reads `source` to its end (or to `signal`'s abort), applying each line. Never throws: a failure
-  // of the source becomes the `error` status with its message.
+  // Reads `source` to its end (or to `signal`'s abort), applying each line, from an empty store: a
+  // second call starts over, and the first, if it is still reading, stops touching the store (React
+  // runs an effect twice in development, on the same store). Never throws: a failure of the source
+  // becomes the `error` status with its message.
   async consume(source: DatasetSource, signal?: AbortSignal): Promise<void> {
+    const generation = ++this.generation;
+    this.reset();
+    const current = () => generation === this.generation;
     let lineNumber = 0;
     let unparsedLast: string | undefined; // a line that failed to parse, held until we know it was the last
     try {
       for await (const line of source.lines(signal)) {
+        if (!current()) return;
         if (signal?.aborted) break;
         if (unparsedLast !== undefined) {
           // A broken line followed by more lines: not a killed run's partial last line.
@@ -139,6 +146,7 @@ export class DatasetStore {
         if (!this.apply(parsed.message)) return;
       }
     } catch (error) {
+      if (!current()) return;
       if (signal?.aborted) {
         this.finish("aborted");
         return;
@@ -146,8 +154,22 @@ export class DatasetStore {
       this.fail({ message: error instanceof Error ? error.message : String(error) });
       return;
     }
+    if (!current()) return;
     if (signal?.aborted) this.finish("aborted");
     else if (this.status === "loading") this.finish(this.summary ? "ready" : "truncated");
+  }
+
+  private reset(): void {
+    this.status = "loading";
+    this.problem = undefined;
+    this.dataset = undefined;
+    this.run = undefined;
+    this.graph = undefined;
+    this.summary = undefined;
+    this.frameCount = 0;
+    this.graphs.clear();
+    this.sinceNotified = 0;
+    this.nodes = this.links = this.ops = undefined;
   }
 
   times(): Float64Array {
