@@ -605,13 +605,13 @@ TEST_CASE("a bucket's op mean is weighted by the requests each step answered", "
 TEST_CASE("a bucket of identical steps has the p99 of one step's lognormal fit", "[stream]") {
   // Mean 2 ms, variance 4e-6 s² (a coefficient of variation of 1): the lognormal of those moments
   // has sigma² = ln(1 + 1) and mu = ln(0.002) − sigma²/2, so p99 = exp(mu + 2.3263 sigma)
-  // = 0.002 / sqrt(2) × exp(2.3263 × sqrt(ln 2)) = 9.106 ms.
+  // = 0.002 / sqrt(2) × exp(2.3263 × sqrt(ln 2)) = 1.4142 ms × e^1.9369 = 9.810 ms.
   std::vector<StepRecord> records;
   for (int k = 0; k < 10; ++k) records.push_back(responding(k, answered_at(100, 0.002, 4e-6)));
   const double sigma = std::sqrt(std::log(2.0));
   const double expected_ms = 2.0 / std::sqrt(2.0) * std::exp(2.326347874 * sigma);
   CHECK_THAT(*frames_of(records, 10)[0].ops[0].p99_ms, WithinRel(expected_ms, 1e-6));
-  CHECK_THAT(expected_ms, WithinRel(9.106, 1e-3));
+  CHECK_THAT(expected_ms, WithinRel(9.810, 1e-3));
 }
 
 TEST_CASE("a bucket where more than 1 % timed out has the timeout as its p99", "[stream]") {
