@@ -716,6 +716,17 @@ TEST_CASE("a stream is a run line, the graph, a frame per bucket and the summary
   for (const auto& line : stream.lines) CHECK(line.find('\n') == std::string::npos);
 }
 
+TEST_CASE("a bucket's length is exact in seconds, so t_s plus dt_s is the next frame's t_s",
+          "[stream]") {
+  // 3 steps of 100 ms: 0.3 s, where 0.1 x 3 in floating point is 0.30000000000000004.
+  const auto stream = stream_of(shipped("tutorial/hello/scenario.yaml"), 3);
+  CHECK(YAML::Load(stream.lines[0])["bucket_s"].Scalar() == "0.3");
+  const auto first = YAML::Load(stream.lines[2]);
+  const auto second = YAML::Load(stream.lines[3]);
+  CHECK(first["dt_s"].Scalar() == "0.3");
+  CHECK(second["t_s"].Scalar() == "0.3");
+}
+
 TEST_CASE("a frame's rows follow the graph's column lists, nulls where a node has no such column",
           "[stream]") {
   const auto stream = stream_of(shipped("tutorial/hello/scenario.yaml"), 100);
