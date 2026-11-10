@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -402,4 +403,42 @@ TEST_CASE("wave shape names round-trip through one table", "[workload]") {
     REQUIRE(simsys::workload::to_string(row.value) == row.name);
   }
   REQUIRE_FALSE(simsys::workload::parse_wave_shape("triangle").has_value());
+}
+
+// ---- the noise's standard normal draws: the same on every standard library ----------------------
+//
+// std::normal_distribution's algorithm is left to the library: libstdc++ and libc++ both use
+// Marsaglia's polar method but hand out each pair in the opposite order, so one seed gave two
+// different noise paths. workload::StandardNormal is the polar method written out, in libstdc++'s
+// order, so every toolchain draws these exact values from std::mt19937_64 (whose sequence the
+// standard does fix). The values were taken from GCC 14's std::normal_distribution{0, 1}.
+TEST_CASE("the noise's normal draws are exactly libstdc++'s on every standard library",
+          "[workload]") {
+  const auto draws = [](std::uint64_t seed) {
+    std::mt19937_64 engine{seed};
+    simsys::workload::StandardNormal normal;
+    std::vector<double> out;
+    for (int i = 0; i < 6; ++i) out.push_back(normal(engine));
+    return out;
+  };
+  CHECK(draws(1) == std::vector{-0.38683176162103994, -0.039399956754155308, 0.68682363917932543,
+                                -0.24894784633514505, -0.79514624370949216, -0.05464685232137164});
+  CHECK(draws(42) == std::vector{0.70498826642085988, 1.2938204232729367, -0.5740948067202617,
+                                 0.39797739618378897, -1.9066853448304646, 1.1185550524574792});
+}
+
+TEST_CASE("the noise's normal draws have mean 0 and variance 1", "[workload]") {
+  std::mt19937_64 engine{7};
+  simsys::workload::StandardNormal normal;
+  constexpr int n = 200'000;
+  double sum = 0;
+  double squares = 0;
+  for (int i = 0; i < n; ++i) {
+    const double z = normal(engine);
+    sum += z;
+    squares += z * z;
+  }
+  // Standard errors: 1 / sqrt(n) = 0.0022 for the mean, sqrt(2 / n) = 0.0032 for the variance.
+  CHECK_THAT(sum / n, WithinAbs(0.0, 0.01));
+  CHECK_THAT(squares / n, WithinAbs(1.0, 0.015));
 }
