@@ -192,11 +192,11 @@ TEST_CASE("a noise block of sigma 0 is no rate noise: every seed would give the 
 
 // ---- run --days N (phase 5b spec §5) ------------------------------------------------------------
 //
-// session::repeat_days(Scenario, int days) -> std::expected<Scenario, std::string>: a 24 h day lived
-// `days` times. The properties: the run lasts days × 24 h; every rate spike and scripted fault recurs
-// at the same clock time each day; the report observes the last day only; an input that would not
-// repeat (a wave period that does not divide the day, a points trace, a ramp longer than a day) is
-// refused, so the day the web app loops is really the same day.
+// session::repeat_days(Scenario, int days) -> std::expected<Scenario, std::string>: a 24 h day
+// lived `days` times. The properties: the run lasts days × 24 h; every rate spike and scripted
+// fault recurs at the same clock time each day; the report observes the last day only; an input
+// that would not repeat (a wave period that does not divide the day, a points trace, a ramp longer
+// than a day) is refused, so the day the web app loops is really the same day.
 
 namespace {
 
@@ -211,13 +211,14 @@ using simsys::workload::Wave;
 Scenario a_day() {
   Scenario s{.name = "day", .version = 1, .duration = 24h, .warmup = 5min};
   s.nodes = {
-      NodeSpec{.id = "users",
-               .type = NodeType::client,
-               .workload = Workload{.curve = {.base = Rate{100},
-                                              .wave = Wave{.period = 24h},
-                                              .spikes = {Spike{.at = 12h, .duration = 10min,
-                                                               .factor = 3.0}}},
-                                    .op_shares = {{"op", 1.0}}}},
+      NodeSpec{
+          .id = "users",
+          .type = NodeType::client,
+          .workload =
+              Workload{.curve = {.base = Rate{100},
+                                 .wave = Wave{.period = 24h},
+                                 .spikes = {Spike{.at = 12h, .duration = 10min, .factor = 3.0}}},
+                       .op_shares = {{"op", 1.0}}}},
       NodeSpec{.id = "s", .type = NodeType::service, .capacity = Rate{1000}, .latency = 1ms}};
   s.links = {LinkSpec{.from = "users", .to = "s", .dir = simsys::model::Direction::inout}};
   s.faults = {Fault{.kind = FaultKind::node_down, .at = 15h, .duration = 1min, .node = "s"},
