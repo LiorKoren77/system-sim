@@ -27,6 +27,6 @@ describe("splitting a stream into lines", () => {
   });
 
   it("gives every line of a whole stream, one chunk per character", async () => {
-    expect(await collect(textStream([...helloText]))).toEqual(helloLines);
+    expect(await collect(textStream(Array.from(helloText)))).toEqual(helloLines);
   });
 });
