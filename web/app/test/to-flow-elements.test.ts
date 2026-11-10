@@ -39,6 +39,11 @@ describe("the diagram's elements, from the graph and the frame", () => {
       ["users", "api"],
       ["api", "db"],
     ]);
+    // A chain laid out left to right: every edge leaves a right side and enters a left side.
+    expect(edges.map((e) => [e.sourceHandle, e.targetHandle])).toEqual([
+      ["source-right", "target-left"],
+      ["source-right", "target-left"],
+    ]);
   });
 
   it("gives each node its zone, utilisation and, for a client, what it offers, per frame", async () => {
