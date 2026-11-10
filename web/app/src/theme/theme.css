@@ -286,7 +286,7 @@ main h1 .chapter {
 }
 
 .node-card {
-  height: 84px;
+  height: 96px;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -425,4 +425,53 @@ main h1 .chapter {
   min-height: 0;
   border: 0;
   background: transparent;
+}
+
+/* ---- a node's copies ---- */
+/* A node with replicas is a stack of cards: two offset cards behind the box. */
+.node-card.stacked {
+  overflow: visible;
+  box-shadow:
+    4px 4px 0 -1px var(--panel),
+    4px 4px 0 0 var(--line),
+    8px 8px 0 -1px var(--panel),
+    8px 8px 0 0 var(--line);
+}
+
+.node-card.stacked .node-category {
+  border-radius: 7px 7px 0 0;
+}
+
+.copies {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 10px;
+  margin: 1px 0;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.copies .slot {
+  width: 7px;
+  height: 7px;
+  border-radius: 1px;
+  border: 1px solid var(--cat);
+}
+
+.copies .slot.up {
+  background: var(--cat);
+}
+
+.copies .slot.down {
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--zone-red);
+}
+
+.copies .copies-label,
+.copies.some-down {
+  margin-left: 4px;
+  color: var(--zone-red);
+  font-weight: 600;
 }

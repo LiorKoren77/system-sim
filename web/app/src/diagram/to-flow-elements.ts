@@ -11,6 +11,7 @@
 import type { DatasetStore, GraphLine } from "@simsys/stream";
 import { MarkerType, type Edge, type EdgeMarker, type Node } from "@xyflow/react";
 import { categoryOf, type Category } from "./categories";
+import { copiesAt, type Copies } from "./copies";
 import { absoluteBox, type Layout } from "./layout";
 import { sidesFor, type Side } from "./sides";
 
@@ -34,6 +35,7 @@ export interface NodeState {
   readonly zone: Zone | null;
   readonly rhoPercent: number | null; // the bucket's mean utilisation (drain / capacity)
   readonly offeredPerSecond: number | null; // a client's: the sum of its ops' offered rates
+  readonly copies: Copies | null; // how many of its copies are up (copies.ts); null on a client
 }
 
 export function toFlowElements(
@@ -100,12 +102,14 @@ export function nodeStatesAt(
   frame: number,
 ): Map<string, NodeState> {
   const states = new Map<string, NodeState>();
+  const copies = copiesAt(graph, store.times()[frame] ?? 0, store.durations()[frame] ?? 0);
   graph.nodes.forEach((node, row) => {
     const isClient = node.type === "client";
     states.set(node.id, {
       zone: isClient ? null : zoneName(graph, at(store.nodeColumn(row, "zone"), frame)),
       rhoPercent: isClient ? null : rhoAt(store, row, frame),
       offeredPerSecond: isClient ? offeredAt(graph, store, node.id, frame) : null,
+      copies: copies.get(node.id) ?? null,
     });
   });
   return states;

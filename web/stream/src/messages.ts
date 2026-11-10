@@ -68,6 +68,8 @@ export interface GraphFault {
   readonly target: string;
   readonly at_s: number;
   readonly for_s: number | null; // null for an instant cache_flush
+  readonly replicas?: number | null; // a node_down's copies taken; null: every copy (phase 5b)
+  readonly primary?: boolean; // a node_down of a sql_db's primary (phase 5b)
 }
 
 export interface GraphLine {

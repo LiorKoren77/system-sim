@@ -53,9 +53,19 @@ describe("the diagram's elements, from the graph and the frame", () => {
     const graph = store.graph;
     if (!graph) throw new Error("no graph");
     const states = nodeStatesAt(graph, store, 0);
-    expect(states.get("api")).toEqual({ zone: "yellow", rhoPercent: 75, offeredPerSecond: null });
+    expect(states.get("api")).toEqual({
+      zone: "yellow",
+      rhoPercent: 75,
+      offeredPerSecond: null,
+      copies: { up: 2, of: 2, primaryDown: false },
+    });
     expect(states.get("db")).toMatchObject({ zone: "green", rhoPercent: 36 });
-    expect(states.get("users")).toEqual({ zone: null, rhoPercent: null, offeredPerSecond: 1500 });
+    expect(states.get("users")).toEqual({
+      zone: null,
+      rhoPercent: null,
+      offeredPerSecond: 1500,
+      copies: null,
+    });
   });
 
   it("keeps a node's copies and its client look in the structure, which no frame changes", async () => {
