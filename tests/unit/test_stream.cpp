@@ -553,3 +553,85 @@ TEST_CASE("explain's JSON lists a client's ops by name whatever order the scenar
   CHECK(doc["ops"][0]["op"].Scalar() == "read");
   CHECK(doc["ops"][1]["op"].Scalar() == "write");
 }
+
+// ---- the frames: op rows (Task 4)
+// ----------------------------------------------------------------
+
+namespace {
+
+simsys::engine::ResponseSample answered_at(double answered_per_s, double mean_s, double variance_s2,
+                                           double timed_out_per_s = 0.0) {
+  simsys::engine::ResponseSample sample{};
+  sample.client = 0;
+  sample.op = "op";
+  sample.offered = simsys::Rate{answered_per_s + timed_out_per_s};
+  sample.attempts = sample.offered;
+  sample.answered = simsys::Rate{answered_per_s};
+  sample.timed_out = simsys::Rate{timed_out_per_s};
+  sample.timed_out_attempts = simsys::Rate{timed_out_per_s};
+  sample.response = {.mean_s = mean_s, .variance_s2 = variance_s2};
+  sample.delivered_response = {.mean_s = mean_s, .variance_s2 = variance_s2};
+  return sample;
+}
+
+StepRecord responding(int k, const simsys::engine::ResponseSample& sample) {
+  auto record = record_at(k, serving(0.5));
+  record.responses = {sample};
+  return record;
+}
+
+}  // namespace
+
+TEST_CASE("a bucket's op rates are the means of its steps'", "[stream]") {
+  // 100/s then 300/s answered: a mean of 200/s.
+  const std::vector<StepRecord> records{responding(0, answered_at(100, 0.002, 1e-6)),
+                                        responding(1, answered_at(300, 0.002, 1e-6))};
+  const auto frames = frames_of(records, 2);
+  REQUIRE(frames[0].ops.size() == 1);
+  const auto& op = frames[0].ops[0];
+  CHECK_THAT(*op.offered_per_s, WithinRel(200.0, 1e-12));
+  CHECK_THAT(*op.attempts_per_s, WithinRel(200.0, 1e-12));
+  CHECK_THAT(*op.answered_per_s, WithinRel(200.0, 1e-12));
+  CHECK(*op.timed_out_per_s == 0.0);
+}
+
+TEST_CASE("a bucket's op mean is weighted by the requests each step answered", "[stream]") {
+  // 100/s at 2 ms and 300/s at 4 ms: (100 x 2 + 300 x 4) / 400 = 3.5 ms.
+  const std::vector<StepRecord> records{responding(0, answered_at(100, 0.002, 1e-6)),
+                                        responding(1, answered_at(300, 0.004, 1e-6))};
+  CHECK_THAT(*frames_of(records, 2)[0].ops[0].mean_ms, WithinRel(3.5, 1e-12));
+}
+
+TEST_CASE("a bucket of identical steps has the p99 of one step's lognormal fit", "[stream]") {
+  // Mean 2 ms, variance 4e-6 s² (a coefficient of variation of 1): the lognormal of those moments
+  // has sigma² = ln(1 + 1) and mu = ln(0.002) − sigma²/2, so p99 = exp(mu + 2.3263 sigma)
+  // = 0.002 / sqrt(2) × exp(2.3263 × sqrt(ln 2)) = 9.106 ms.
+  std::vector<StepRecord> records;
+  for (int k = 0; k < 10; ++k) records.push_back(responding(k, answered_at(100, 0.002, 4e-6)));
+  const double sigma = std::sqrt(std::log(2.0));
+  const double expected_ms = 2.0 / std::sqrt(2.0) * std::exp(2.326347874 * sigma);
+  CHECK_THAT(*frames_of(records, 10)[0].ops[0].p99_ms, WithinRel(expected_ms, 1e-6));
+  CHECK_THAT(expected_ms, WithinRel(9.106, 1e-3));
+}
+
+TEST_CASE("a bucket where more than 1 % timed out has the timeout as its p99", "[stream]") {
+  // A client with a 5 ms timeout: 2 of 100 delivered requests per second came back after it, more
+  // than the 1 % a p99 allows, so no answered request sits at the 99th percentile: the client saw
+  // its timeout there (the run's rule, percentile_seen_by_client).
+  auto s = simsys::test_support::mm1(100);
+  s.nodes[0].workload->timeout = 5ms;
+  const auto g = *simsys::graph::Graph::build(s);
+  const std::vector<StepRecord> records{responding(0, answered_at(98, 0.002, 4e-6, 2))};
+  const auto op = frames_of(records, 1, g)[0].ops[0];
+  CHECK_THAT(*op.p99_ms, WithinRel(5.0, 1e-12));
+  CHECK_THAT(*op.timed_out_per_s, WithinRel(2.0, 1e-12));
+}
+
+TEST_CASE("a bucket in which nothing was answered has no mean and no p99", "[stream]") {
+  const std::vector<StepRecord> records{responding(0, answered_at(0, 0.002, 4e-6)),
+                                        responding(1, answered_at(0, 0.002, 4e-6))};
+  const auto op = frames_of(records, 2)[0].ops[0];
+  CHECK(*op.answered_per_s == 0.0);
+  CHECK_FALSE(op.mean_ms.has_value());
+  CHECK_FALSE(op.p99_ms.has_value());
+}
