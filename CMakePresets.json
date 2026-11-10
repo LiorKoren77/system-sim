@@ -38,6 +38,27 @@
       "cacheVariables": {
         "CMAKE_CXX_FLAGS": "-fsanitize=thread -fno-omit-frame-pointer -Wno-error=tsan"
       }
+    },
+    {
+      "name": "clang19-debug",
+      "displayName": "Clang 19 Debug with GCC 14's standard library (libstdc++)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/clang19-debug",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++-19",
+        "CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS": "clang-scan-deps-19",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "clang19-libcxx-debug",
+      "displayName": "Clang 19 Debug with LLVM's standard library (libc++), the one Emscripten uses",
+      "inherits": "clang19-debug",
+      "binaryDir": "${sourceDir}/build/clang19-libcxx-debug",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "-stdlib=libc++",
+        "CMAKE_EXE_LINKER_FLAGS": "-stdlib=libc++"
+      }
     }
   ],
   "buildPresets": [
@@ -56,6 +77,14 @@
     {
       "name": "gcc14-tsan",
       "configurePreset": "gcc14-tsan"
+    },
+    {
+      "name": "clang19-debug",
+      "configurePreset": "clang19-debug"
+    },
+    {
+      "name": "clang19-libcxx-debug",
+      "configurePreset": "clang19-libcxx-debug"
     }
   ],
   "testPresets": [
@@ -105,6 +134,20 @@
       },
       "execution": {
         "timeout": 300
+      }
+    },
+    {
+      "name": "clang19-debug",
+      "configurePreset": "clang19-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "clang19-libcxx-debug",
+      "configurePreset": "clang19-libcxx-debug",
+      "output": {
+        "outputOnFailure": true
       }
     }
   ]

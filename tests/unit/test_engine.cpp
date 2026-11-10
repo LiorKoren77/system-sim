@@ -477,7 +477,9 @@ TEST_CASE(
   for (const auto* eu_node : {"x", "y"}) {  // x has two replicas: all of them go down, not one
     CAPTURE(eu_node);
     require_identity(x.at(eu_node, SimTime{10s} - 1ns));
-    for (const SimTime now : {SimTime{10s}, SimTime{15s}, SimTime{20s} - 1ns}) {
+    // SimTime{...} around the difference: 20s - 1ns has the common type of the two literals'
+    // representations, which libc++ spells differently from SimTime's (long long vs int64_t).
+    for (const SimTime now : {SimTime{10s}, SimTime{15s}, SimTime{SimTime{20s} - 1ns}}) {
       CAPTURE(now.count());
       const auto c = x.at(eu_node, now);
       REQUIRE(c.capacity_factor == 0.0);

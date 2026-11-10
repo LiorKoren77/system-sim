@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>  // std::get on an SLO's max
 #include <vector>
 
 #include "../support/explain_lines.hpp"
