@@ -52,10 +52,18 @@ Write for a reader who has read the book but has not studied queueing theory.
 
 ## 3. General
 
-- C++23. GCC 14 is the only compiler that builds the project (Clang 18 lacks
-  std::expected/std::generator with both standard libraries); Clang 18 is used for
-  clang-format only. Named modules. No raw `new`, no macros,
-  exceptions only for programmer errors.
+- C++23. GCC 14, Clang 19 and Clang 20 build the project, over GCC's standard library
+  (libstdc++) and, from Clang 20, over LLVM's (libc++ 20, the library a WebAssembly build
+  uses); CI builds GCC 14, Clang 19 + libstdc++ and Clang 20 + libc++. Code must build with
+  all of them: no compiler- or library-specific branches, so a facility one of them lacks is
+  replaced for all (simsys::Generator for std::generator; plain loops for views::join_with
+  and views::cartesian_product; std::iota for ranges::iota). Clang 18 is used for
+  clang-format only. Named modules. No raw `new`, no macros, exceptions only for
+  programmer errors.
+- Results must not depend on the toolchain: no standard random distribution (its algorithm
+  is the library's; libc++ and libstdc++ order the polar method's pairs differently), use
+  workload::StandardNormal over std::mt19937_64; no iteration over unordered containers into
+  output; no std::sort over elements that compare equal but differ.
 - Tests are part of the teaching material: name them after the property they prove.
   Test names must not contain `[` or `]`: Catch2's ctest discovery reads those as tags and
   merges every later case into one failing entry (hit twice on 2026-10-28).
@@ -137,6 +145,13 @@ Write for a reader who has read the book but has not studied queueing theory.
   `export module` line of every interface. Workaround: the `gcc14-asan` preset turns those six off
   with `-fno-sanitize=` and keeps the rest of `-fsanitize=undefined` (null, bounds, alignment,
   object-size, bool, enum, vptr, ...); docs/study/sanitizers.md says what is lost.
+- Clang defects (2026-11-10): Clang 19 calls `words | std::views::split(' ')` ambiguous in a
+  unit that includes <ranges> and imports a module that also did (build
+  std::ranges::split_view directly); Clang 20 over libstdc++ cannot instantiate a piped
+  `| std::ranges::to<C>()` in a module unit (call `std::ranges::to<C>(view)`). And a twelfth
+  GCC 14.2 one: a hidden friend defined in a class template of a module is defined in every
+  unit that instantiates it ("multiple definition"); make it a member (simsys::Generator's
+  sentinel ==).
 
 ## 4. Clean code, named patterns, TDD
 
