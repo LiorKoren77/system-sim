@@ -1,0 +1,307 @@
+{
+  "format_version": 1,
+  "scenario": "web-crawler",
+  "datacenters": [{ "name": "main" }],
+  "zones": ["green", "yellow", "red"],
+  "nodes": [
+    {
+      "id": "seeds",
+      "type": "client",
+      "datacenter": "main",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": null,
+      "unit": null,
+      "yellow": null,
+      "red": null,
+      "queue_limit": null
+    },
+    {
+      "id": "frontier",
+      "type": "frontier",
+      "datacenter": "main",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 10000,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "downloader",
+      "type": "worker_pool",
+      "datacenter": "main",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 2000,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": null,
+      "workers": 1000
+    },
+    {
+      "id": "dns",
+      "type": "cache",
+      "datacenter": "main",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 1e5,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "dns_upstream",
+      "type": "external_sink",
+      "datacenter": "main",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 1000,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "internet",
+      "type": "external_sink",
+      "datacenter": "main",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 1e6,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "parser",
+      "type": "service",
+      "datacenter": "main",
+      "replicas": 25,
+      "shards": null,
+      "capacity_per_s": 2500,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "content_seen",
+      "type": "cache",
+      "datacenter": "main",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 1e5,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "content_store",
+      "type": "blob_store",
+      "datacenter": "main",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 1000,
+      "unit": "MB",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "link_extractor",
+      "type": "service",
+      "datacenter": "main",
+      "replicas": 10,
+      "shards": null,
+      "capacity_per_s": 2000,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "url_filter",
+      "type": "service",
+      "datacenter": "main",
+      "replicas": 10,
+      "shards": null,
+      "capacity_per_s": 2e5,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "url_seen",
+      "type": "cache",
+      "datacenter": "main",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 1e5,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    }
+  ],
+  "links": [
+    {
+      "from": "seeds",
+      "to": "frontier",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "frontier",
+      "to": "downloader",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "downloader",
+      "to": "dns",
+      "direction": "inout",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "dns",
+      "to": "dns_upstream",
+      "direction": "inout",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "downloader",
+      "to": "internet",
+      "direction": "inout",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "downloader",
+      "to": "parser",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "parser",
+      "to": "content_seen",
+      "direction": "inout",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "parser",
+      "to": "content_store",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "parser",
+      "to": "link_extractor",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "link_extractor",
+      "to": "url_filter",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "url_filter",
+      "to": "url_seen",
+      "direction": "inout",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "url_seen",
+      "to": "frontier",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    }
+  ],
+  "ops": [{ "client": "seeds", "op": "crawl", "share": 1 }],
+  "slos": [
+    { "metric": "utilization", "node": "downloader", "op": null, "max": 0.85, "over_s": null },
+    { "metric": "queue_lag", "node": "frontier", "op": null, "max": 1800, "over_s": null }
+  ],
+  "faults": [],
+  "node_columns": [
+    "demand_per_s",
+    "drain_per_s",
+    "dropped_per_s",
+    "rejected_per_s",
+    "backlog",
+    "peak_backlog",
+    "mean_rho",
+    "peak_rho",
+    "zone",
+    "red_s",
+    "latency_ms",
+    "queue_lag_s",
+    "connections",
+    "dead_lettered_per_s",
+    "deduplicated_per_s"
+  ],
+  "link_columns": [
+    "demand_per_s",
+    "drain_per_s",
+    "dropped_per_s",
+    "backlog",
+    "peak_backlog",
+    "mean_rho",
+    "peak_rho",
+    "zone",
+    "red_s",
+    "latency_ms"
+  ],
+  "op_columns": [
+    "offered_per_s",
+    "attempts_per_s",
+    "answered_per_s",
+    "timed_out_per_s",
+    "mean_ms",
+    "p99_ms"
+  ],
+  "estimated_columns": ["p99_ms"]
+}
