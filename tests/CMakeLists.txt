@@ -16,7 +16,7 @@ target_link_libraries(simsys_test_support PUBLIC simsys Catch2::Catch2 PRIVATE s
 # keeps its calls to them out of line, so its object file defines them (as for src/model/model.cpp).
 set_source_files_properties(support/fixtures.cpp PROPERTIES COMPILE_OPTIONS -fno-inline)
 
-add_executable(unit_tests unit/test_units.cpp unit/test_config.cpp unit/test_queueing.cpp unit/test_flow.cpp unit/test_fluid.cpp unit/test_workload.cpp unit/test_caching.cpp unit/test_model.cpp unit/test_defaults.cpp unit/test_graph.cpp unit/test_behaviours.cpp unit/test_engine.cpp unit/test_report.cpp unit/test_series.cpp unit/test_sweep.cpp unit/test_session.cpp)
+add_executable(unit_tests unit/test_units.cpp unit/test_config.cpp unit/test_queueing.cpp unit/test_flow.cpp unit/test_fluid.cpp unit/test_workload.cpp unit/test_caching.cpp unit/test_model.cpp unit/test_defaults.cpp unit/test_graph.cpp unit/test_behaviours.cpp unit/test_engine.cpp unit/test_report.cpp unit/test_series.cpp unit/test_sweep.cpp unit/test_session.cpp unit/test_stream.cpp)
 target_link_libraries(unit_tests PRIVATE simsys simsys_test_support Catch2::Catch2WithMain simsys_warnings)
 # test_series.cpp explains shipped scenarios and test_sweep.cpp sweeps tutorial/hello, so they need
 # the directory, like scenario_tests.
@@ -50,7 +50,8 @@ add_executable(theory_tests
   theory/test_rho_one.cpp
   theory/test_timeout.cpp
   theory/test_faults.cpp
-  theory/test_windows.cpp)
+  theory/test_windows.cpp
+  theory/test_stream.cpp)
 target_link_libraries(theory_tests PRIVATE simsys simsys_test_support Catch2::Catch2WithMain simsys_warnings)
 # test_timeout.cpp pins the shipped youtube scenario's uploads and test_windows.cpp the shipped
 # url-shortener's hours, so they need the directory too.
@@ -118,6 +119,25 @@ add_test(NAME "simsys estimate --at evaluates the steady state at an instant ins
          COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
                  -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-estimate-at
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/estimate_at.cmake)
+# `run --stream` as the web server sees it (phase 5a): stdout, stderr and the exit code.
+foreach(check only_json error_line refusals parse_error exit_code)
+  if(check STREQUAL "only_json")
+    set(name "simsys run --stream writes nothing but lines of JSON on stdout")
+  elseif(check STREQUAL "error_line")
+    set(name "simsys run --stream reports a refused scenario as one error line with its location")
+  elseif(check STREQUAL "refusals")
+    set(name "simsys run --stream refuses the flags whose output it already carries")
+  elseif(check STREQUAL "parse_error")
+    set(name "simsys run --stream reports an unknown flag as an error line")
+  else()
+    set(name "simsys run --stream exits as run exits and ends with the summary")
+  endif()
+  add_test(NAME "${name}"
+           COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
+                   -DSCENARIOS=${CMAKE_SOURCE_DIR}/scenarios
+                   -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-stream-${check} -DCHECK=${check}
+                   -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/stream.cmake)
+endforeach()
 add_test(NAME "simsys curve refuses a seed without noise, which would change nothing"
          COMMAND ${CMAKE_COMMAND} -DSIMSYS=$<TARGET_FILE:simsys_cli>
                  -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-curve-seed

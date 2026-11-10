@@ -156,15 +156,6 @@ constexpr Quantile median{.level = 0.50, .z = queueing::z_p50};
 constexpr Quantile ninety_fifth{.level = 0.95, .z = queueing::z_p95};
 constexpr Quantile ninety_ninth{.level = 0.99, .z = queueing::z_p99};
 
-// timed_out / (answered + timed_out): the share of the attempts the path delivered that came back
-// after the client had given up; 0 when nothing was delivered. `timed_out` counts every attempt
-// that timed out (OpTotals::timed_out_attempts), the retried ones too: the client waited past its
-// timeout on each, and that is the share a percentile asks about.
-[[nodiscard]] double timed_out_share(double answered, double timed_out) {
-  const double delivered = answered + timed_out;
-  return delivered > 0.0 ? timed_out / delivered : 0.0;
-}
-
 // Did more than 1 − q of the delivered requests time out (more than 1 % for a p99)? Then no
 // request at quantile q was answered: the client saw the timeout there.
 [[nodiscard]] bool quantile_timed_out(double share_timed_out, Quantile q) {
@@ -745,56 +736,6 @@ void insert_at(Cells& cells, std::size_t column, Value value) {
 
 constexpr std::string_view node_title = "nodes";
 
-// "delete, insert, update, write cost 5" ("a cost 2 and b cost 3" for two costs): a node's ops that
-// cost something other than 1 capacity unit, grouped by their cost, in name order; "" when every op
-// it prices costs 1. The ops priced are a database's write ops (their default cost of 5, spec §18
-// entry 7) and every op of a stated `cost` map (spec §17 entry 4), each priced as the engine
-// prices it (defaults::op_cost).
-[[nodiscard]] std::string priced_ops(const model::NodeSpec& spec, double unit_per_request = 1.0) {
-  // C++20 std::views::keys: the keys of a map as a lazy view, no copy of its pairs; C++23
-  // std::ranges::to<std::vector>(): collects a view into a container, replacing a reserve +
-  // push_back loop.
-  std::vector<std::string> ops{spec.cost | std::views::keys | std::ranges::to<std::vector>()};
-  if (spec.type == model::NodeType::sql_db) {
-    std::ranges::copy(model::write_ops_of(spec), std::back_inserter(ops));
-  }
-  // C++20 std::ranges::unique: returns the tail to erase as a subrange (unpacked by a structured
-  // binding), where std::unique returned only its first iterator.
-  std::ranges::sort(ops);
-  const auto [first_repeat, end] = std::ranges::unique(ops);
-  ops.erase(first_repeat, end);
-  std::map<double, std::vector<std::string>> by_cost;
-  for (const auto& op : ops) {
-    const double cost = defaults::op_cost(spec, op) / unit_per_request;
-    if (cost != 1.0) by_cost[cost].push_back(op);
-  }
-  std::vector<std::string> groups;
-  for (const auto& [cost, named] : by_cost) {
-    groups.push_back(join(named, ", ") + " cost " + significant(cost));
-  }
-  return join(groups, " and ");
-}
-
-// What a node's peak_backlog and drops count, when it is not requests: megabytes at a byte-sized
-// node (spec §19 entry 2), replica-requests at a kv_cluster (N of them per request, §19 entry 9),
-// capacity units at a node with an op that costs other than 1 (priced_ops); empty otherwise, and
-// for a client, which queues nothing.
-[[nodiscard]] std::optional<std::string> unit_of(const model::NodeSpec& spec) {
-  if (spec.type == model::NodeType::client) return std::nullopt;
-  if (defaults::is_byte_sized(spec)) return "MB";
-  if (spec.type == model::NodeType::kv_cluster) {
-    // Every request is N replica-requests; a stated `cost` prices each of them on top (op_cost is
-    // the product), so the line says both: "replica-requests (N 3; put cost 4 each)".
-    const int n = model::kv_replication(spec);
-    const auto priced = priced_ops(spec, static_cast<double>(n));
-    const std::string each = priced.empty() ? "" : "; " + priced + " each";
-    return "replica-requests (N " + std::to_string(n) + each + ")";
-  }
-  const auto priced = priced_ops(spec);
-  if (priced.empty()) return std::nullopt;
-  return "capacity units (" + priced + ")";
-}
-
 // "units (peak_backlog and drops are not requests here): url_db capacity units (...); cdn_us MB":
 // one line under the node table naming every node whose figures are in another unit (the 2a
 // leftover M7: the table's headers carry no unit), or nothing when every node counts requests.
@@ -1258,53 +1199,8 @@ constexpr std::string_view op_title =
 
 // ---- JSON ----
 
-// Quotes and backslashes are escaped, control characters become \u00XX; everything
-// else (UTF-8 included) passes through, as JSON allows.
-[[nodiscard]] std::string json_string(std::string_view text) {
-  constexpr std::string_view hex = "0123456789abcdef";
-  std::string out = "\"";
-  for (const char c : text) {
-    const unsigned code = static_cast<unsigned char>(c);
-    if (c == '"' || c == '\\') {
-      out += '\\';
-      out += c;
-    } else if (code < 0x20) {
-      out += "\\u00";
-      out += hex[code >> 4];
-      out += hex[code & 0xFu];
-    } else {
-      out += c;
-    }
-  }
-  return out + '"';
-}
-
-// JSON has no infinity: a latency that never arrives is null.
-[[nodiscard]] std::string json_number(double value) {
-  return std::isfinite(value) ? format_number(value) : "null";
-}
-
-[[nodiscard]] std::string json_optional_number(const std::optional<double>& value) {
-  return value ? json_number(*value) : "null";
-}
-
-[[nodiscard]] std::string json_optional_string(const std::optional<std::string>& text) {
-  return text ? json_string(*text) : "null";
-}
-
-[[nodiscard]] std::string json_field(std::string_view name, const std::string& value) {
-  return json_string(name) + ": " + value;
-}
-
-[[nodiscard]] std::string json_object(std::span<const std::string> fields) {
-  return "{" + join(fields, ", ") + "}";
-}
-
-// `"name": [ ... ]` at the top level, one object per line.
-[[nodiscard]] std::string json_array(std::string_view name, std::span<const std::string> objects) {
-  if (objects.empty()) return "  " + json_field(name, "[]");
-  return "  " + json_field(name, "[\n    " + join(objects, ",\n    ") + "\n  ]");
-}
+// The primitives (json_string, json_number, json_field, json_object, json_array) are in the
+// :shared partition, which the graph JSON and the stream use too.
 
 // Whether a node's lag grows without bound (estimate's frontier or queue that falls behind for
 // good: its peak_queue_lag_s is infinite, printed null), `false` on a queue whose lag is finite,
@@ -1555,13 +1451,6 @@ void json_storm(const engine::FaultAfter& after, std::vector<std::string>& field
   return json_object(fields);
 }
 
-// C++20 std::views::transform + C++23 std::ranges::to: map every element through `f` and
-// collect the results into a vector, replacing a reserve + push_back loop.
-template <class T, class F>
-[[nodiscard]] std::vector<std::string> map_to_strings(std::span<const T> items, F f) {
-  return items | std::views::transform(f) | std::ranges::to<std::vector<std::string>>();
-}
-
 // The top-level lines of a run's JSON report, one key each, the `slo` array's objects given
 // (json_slo's, or with a replication's median_seed). With no observed step the drop and reject
 // rates are null: there is no data, not a rate of 0.
@@ -1575,7 +1464,13 @@ template <class T, class F>
   const auto worst_rejecting = summary.worst_reject_node();
   std::vector<std::string> lines{
       "  " + json_field("scenario", json_string(summary.scenario_name())),
-      "  " + json_field("steps", std::to_string(summary.observed_steps())),
+      "  " + json_field("steps", std::to_string(summary.observed_steps()))};
+  // estimate only, right after `steps`: the instant it settled at, in seconds (`--at`; 0 without
+  // it).
+  if (summary.is_estimate()) {
+    lines.push_back("  " + json_field("at_s", json_number(seconds(summary.estimate_at()))));
+  }
+  const std::array rest{
       "  " + json_field("drop_rate", observed ? json_number(summary.drop_rate()) : "null"),
       "  " + json_field("worst_drop_node", worst.empty() ? "null" : json_string(worst)),
       "  " + json_field("reject_rate", observed ? json_number(summary.reject_rate()) : "null"),
@@ -1587,11 +1482,7 @@ template <class T, class F>
       json_array("links", map_to_strings(std::span<const LinkSummary>{links}, json_link)),
       json_array("ops", map_to_strings(std::span<const OpSummary>{ops}, json_op)),
       json_array("slo", slo_objects)};
-  // estimate only, after `steps`: the instant it settled at, in seconds (`--at`; 0 without it).
-  if (summary.is_estimate()) {
-    lines.insert(lines.begin() + 2,
-                 "  " + json_field("at_s", json_number(seconds(summary.estimate_at()))));
-  }
+  lines.insert(lines.end(), rest.begin(), rest.end());
   if (summary.faults().empty()) return lines;
   // The faults array, last and only with faults: a report without them is what it was before.
   std::vector<std::string> faults;
@@ -1607,11 +1498,6 @@ template <class T, class F>
 [[nodiscard]] std::vector<std::string> json_report_lines(const Summary& summary,
                                                          std::span<const SloResult> slos) {
   return json_report_lines(summary, map_to_strings(slos, json_slo));
-}
-
-// The lines as one JSON object, a key per line.
-[[nodiscard]] std::string json_document(std::span<const std::string> lines) {
-  return "{\n" + join(lines, ",\n") + "\n}";
 }
 
 // ---- replications (`run --replications`: report.cppm says what the cells and the verdicts are) --
@@ -2177,20 +2063,20 @@ constexpr double residue_per_capacity = 1e-9;
 // Weighted moments of a mixture: each step contributes its mean m and variance v with
 // weight w (requests answered in that step), so E[X] = Σ w·m / Σ w and
 // E[X²] = Σ w·(v + m²) / Σ w (E[X²] of one component is its variance plus its squared mean).
-void Summary::Moments::add(double w, double mean_s, double variance_s2) {
+void Moments::add(double w, double mean_s, double variance_s2) {
   weight += w;
   weighted_mean += w * mean_s;
   weighted_square += w * (variance_s2 + mean_s * mean_s);
 }
 
-double Summary::Moments::mean_s() const {
+double Moments::mean_s() const {
   return weighted_mean / weight;
 }
 
 // Law of total variance over the steps: Var X = E[X²] − (E[X])², where E[X²] already holds each
 // step's own spread (v) and the spread between step means (m²). Assumes a request's step is chosen
 // in proportion to the weight (requests) the step added.
-double Summary::Moments::variance_s2() const {
+double Moments::variance_s2() const {
   const double mean = mean_s();
   return weighted_square / weight - mean * mean;
 }
@@ -2246,6 +2132,38 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
   }
 }
 
+void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
+  rates.add(sample, dt_s);
+  response.add(sample, dt_s);
+}
+
+void OpRates::add(const engine::ResponseSample& sample, double dt_s) {
+  offered += sample.offered.per_second * dt_s;
+  attempts += sample.attempts.per_second * dt_s;
+  answered += sample.answered.per_second * dt_s;
+  timed_out += sample.timed_out.per_second * dt_s;
+  timed_out_attempts += sample.timed_out_attempts.per_second * dt_s;
+}
+
+engine::NodeSample as_node_sample(const engine::LinkSample& sample) {
+  // C++20 designated initializers: the fields named, in declaration order; the rest of NodeSample
+  // (a node type's own figures) stays empty.
+  return engine::NodeSample{.demand_per_s = sample.demand_per_s,
+                            .drain_per_s = sample.drain_per_s,
+                            .dropped_per_s = sample.dropped_per_s,
+                            .backlog = sample.backlog,
+                            .rho = sample.rho,
+                            .latency = sample.latency,
+                            .zone = sample.zone};
+}
+
+// `timed_out` counts every attempt that timed out (OpTotals::timed_out_attempts), the retried ones
+// too: the client waited past its timeout on each, and that is the share a percentile asks about.
+double timed_out_share(double answered, double timed_out) {
+  const double delivered = answered + timed_out;
+  return delivered > 0.0 ? timed_out / delivered : 0.0;
+}
+
 // A step whose response is infinite (a node on the path never answers) poisons the whole op: no
 // finite average describes it. It is flagged instead of accumulated, so no 0 × inf = NaN can reach
 // the sums. A step that delivered nothing (answered + timed-out attempts = 0: every request it sent
@@ -2253,12 +2171,7 @@ void Summary::NodeTotals::add(const engine::NodeSample& sample, double dt_s) {
 // latency, so it weighs no moment and flags nothing, whatever the latency a request WOULD have seen
 // (phase 3 Task 6's review: a node that is down drops what its full room cannot hold, and those
 // steps must not decide the op's latency for the whole run).
-void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
-  offered += sample.offered.per_second * dt_s;
-  attempts += sample.attempts.per_second * dt_s;
-  answered += sample.answered.per_second * dt_s;
-  timed_out += sample.timed_out.per_second * dt_s;
-  timed_out_attempts += sample.timed_out_attempts.per_second * dt_s;
+void ResponseMoments::add(const engine::ResponseSample& sample, double dt_s) {
   const double delivered_per_s = sample.answered.per_second + sample.timed_out_attempts.per_second;
   if (!(delivered_per_s > 0.0)) return;
   const auto& response = sample.response;
@@ -2281,14 +2194,7 @@ void Summary::OpTotals::add(const engine::ResponseSample& sample, double dt_s) {
 // the same names, in megabytes), so its node-table columns accumulate exactly as a node's do
 // (NodeTotals::add); a pipe never rejects. What only the link's JSON shows comes beside them.
 void Summary::LinkTotals::add(const engine::LinkSample& sample, double dt_s) {
-  queue.add(engine::NodeSample{.demand_per_s = sample.demand_per_s,
-                               .drain_per_s = sample.drain_per_s,
-                               .dropped_per_s = sample.dropped_per_s,
-                               .backlog = sample.backlog,
-                               .rho = sample.rho,
-                               .latency = sample.latency,
-                               .zone = sample.zone},
-            dt_s);
+  queue.add(as_node_sample(sample), dt_s);
   drained += sample.drain_per_s * dt_s;
   backlog_time += sample.backlog * dt_s;
   by_demand.add(sample.demand_per_s * dt_s, sample.latency.mean_s, sample.latency.variance_s2);
@@ -2617,17 +2523,17 @@ std::vector<OpSummary> Summary::ops() const {
   std::vector<OpSummary> out;
   for (const auto& t : ops_) {
     const auto& client = graph_->nodes()[t.client].spec;
-    OpSummary op{
-        .client = client.id,
-        .op = t.op,
-        .offered_per_s = observed_s_ > 0.0 ? t.offered / observed_s_ : 0.0,
-        .attempts_per_s = observed_s_ > 0.0 ? t.attempts / observed_s_ : 0.0,
-        .answered_per_s = observed_s_ > 0.0 ? t.answered / observed_s_ : 0.0,
-        .timed_out_per_s = observed_s_ > 0.0 ? t.timed_out / observed_s_ : 0.0,
-        .timed_out_attempts_per_s = observed_s_ > 0.0 ? t.timed_out_attempts / observed_s_ : 0.0,
-        .timeout_s = graph::client_timeout_s(client),
-        .timed_out_share = timed_out_share(t.answered, t.timed_out_attempts)};
-    if (t.unavailable) {
+    OpSummary op{.client = client.id,
+                 .op = t.op,
+                 .offered_per_s = observed_s_ > 0.0 ? t.rates.offered / observed_s_ : 0.0,
+                 .attempts_per_s = observed_s_ > 0.0 ? t.rates.attempts / observed_s_ : 0.0,
+                 .answered_per_s = observed_s_ > 0.0 ? t.rates.answered / observed_s_ : 0.0,
+                 .timed_out_per_s = observed_s_ > 0.0 ? t.rates.timed_out / observed_s_ : 0.0,
+                 .timed_out_attempts_per_s =
+                     observed_s_ > 0.0 ? t.rates.timed_out_attempts / observed_s_ : 0.0,
+                 .timeout_s = graph::client_timeout_s(client),
+                 .timed_out_share = timed_out_share(t.rates.answered, t.rates.timed_out_attempts)};
+    if (t.response.unavailable) {
       op.mean_s = op.p50_s = op.p95_s = op.p99_s = infinity;
     } else {
       fill_latencies(t, op);
@@ -2643,20 +2549,32 @@ std::vector<OpSummary> Summary::ops() const {
 // delivered requests' moments, before any timeout cut them (identical to the answered ones without
 // a timeout), and applies the client's timeout. Whichever moments are empty fall back to the
 // time-weighted ones: an op nothing reached, which no renderer prints a latency for.
-void Summary::fill_latencies(const OpTotals& totals, OpSummary& op) {
-  const Moments& answered = totals.by_answered.weight > 0.0 ? totals.by_answered : totals.by_time;
-  if (answered.weight <= 0.0) return;  // no step observed
-  op.mean_s = answered.mean_s();
-  const bool timed = op.timeout_s.has_value() && totals.by_delivered.weight > 0.0;
-  const Moments& delivered = timed ? totals.by_delivered : answered;
+std::optional<SeenLatencies> seen_latencies(const ResponseMoments& moments,
+                                            std::optional<double> timeout_s,
+                                            double share_timed_out) {
+  const Moments& answered =
+      moments.by_answered.weight > 0.0 ? moments.by_answered : moments.by_time;
+  if (answered.weight <= 0.0) return std::nullopt;  // no step observed
+  const bool timed = timeout_s.has_value() && moments.by_delivered.weight > 0.0;
+  const Moments& delivered = timed ? moments.by_delivered : answered;
   const auto seen = [&](Quantile q) {
-    return percentile_seen_by_client(delivered.mean_s(), delivered.variance_s2(),
-                                     op.timed_out_share, op.timeout_s, q)
+    return percentile_seen_by_client(delivered.mean_s(), delivered.variance_s2(), share_timed_out,
+                                     timeout_s, q)
         .seconds;
   };
-  op.p50_s = seen(median);
-  op.p95_s = seen(ninety_fifth);
-  op.p99_s = seen(ninety_ninth);
+  return SeenLatencies{.mean_s = answered.mean_s(),
+                       .p50_s = seen(median),
+                       .p95_s = seen(ninety_fifth),
+                       .p99_s = seen(ninety_ninth)};
+}
+
+void Summary::fill_latencies(const OpTotals& totals, OpSummary& op) {
+  const auto seen = seen_latencies(totals.response, op.timeout_s, op.timed_out_share);
+  if (!seen) return;
+  op.mean_s = seen->mean_s;
+  op.p50_s = seen->p50_s;
+  op.p95_s = seen->p95_s;
+  op.p99_s = seen->p99_s;
 }
 
 // Per node, not per scenario: a node's drops are a fraction of what it was sent, so the
@@ -2789,7 +2707,47 @@ std::string format_clock(SimTime t) {
 }
 
 std::string render_json(const Summary& summary, std::span<const SloResult> slos) {
-  return json_document(json_report_lines(summary, slos));
+  return json_document(format_version, json_report_lines(summary, slos));
+}
+
+int exit_code(const Summary& summary, std::span<const SloResult> results) {
+  if (summary.observed_steps() == 0) return 1;
+  return all_pass(results) ? 0 : 2;
+}
+
+std::string render_json_line(const Summary& summary, std::span<const SloResult> slos) {
+  return json_on_one_line(render_json(summary, slos));
+}
+
+// JSON minification. RFC 8259 §2: whitespace is allowed before and after every structural
+// character and value and means nothing there; inside a string every character counts. So a scan
+// that copies strings whole (honouring a backslash, which escapes the next character, a quote
+// included) and drops the four whitespace characters elsewhere changes the layout and no value.
+// One rule for every document instead of a second, one-line renderer per document, which would have
+// to be kept in step with the pretty one key by key.
+std::string json_on_one_line(std::string_view json) {
+  std::string out;
+  out.reserve(json.size());
+  bool in_string = false;
+  bool escaped = false;
+  for (const char c : json) {
+    if (in_string) {
+      out += c;
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        in_string = false;
+      }
+    } else if (c == '"') {
+      in_string = true;
+      out += c;
+    } else if (c != ' ' && c != '\n' && c != '\t' && c != '\r') {
+      out += c;
+    }
+  }
+  return out;
 }
 
 // ---- replications ----
@@ -2850,7 +2808,7 @@ std::string render_replications_json(const ReplicationSummary& replicated,
   // median run's report, faults included, then the one key a replication adds.
   auto lines = json_report_lines(median, json_replicated_slos(replicated));
   lines.push_back(json_replications(replicated, some_gateway(median.graph())));
-  return json_document(lines);
+  return json_document(format_version, lines);
 }
 
 double op_latency_s(const OpSummary& op, OpLatency column) {

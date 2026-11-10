@@ -65,6 +65,7 @@ target_sources(simsys
     src/model/model.cpp
     src/report/explain.cpp
     src/report/report.cpp
+    src/report/stream.cpp
     src/session/session.cpp
     src/sweep/sweep.cpp)
 # std::jthread (simsys.sweep's workers) needs the platform's thread library; Threads::Threads is
