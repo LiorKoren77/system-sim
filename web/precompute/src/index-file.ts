@@ -11,6 +11,7 @@ export interface IndexEntry {
   readonly title: string | null;
   readonly chapter: number | null;
   readonly kind: "day" | "run";
+  readonly duration_s: number; // the run's length: 172800 for a day lived twice
   readonly loops: boolean;
   readonly seam: "repeats" | "drifts" | null;
   readonly frames: number;

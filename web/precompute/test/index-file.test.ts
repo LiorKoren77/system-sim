@@ -9,6 +9,7 @@ function entry(id: string): IndexEntry {
     title: id,
     chapter: null,
     kind: "run",
+    duration_s: 60,
     loops: false,
     seam: null,
     frames: 2,
