@@ -570,6 +570,22 @@ TEST_CASE(
   CHECK(doc["faults"][0]["primary"].as<bool>() == false);
 }
 
+TEST_CASE("explain's JSON gives a client its rate spikes, so a timeline can mark a surge of load",
+          "[stream]") {
+  // notification-system's marketing blast: the clients send 20x their rate from 09:00 for 15 min.
+  const auto doc = graph_json_of("book/notification-system/scenario.yaml");
+  const auto services = entry(doc["nodes"], "id", "services");
+  REQUIRE(services["spikes"].size() == 1);
+  CHECK(services["spikes"][0]["at_s"].as<double>() == 32400);  // 09:00
+  CHECK(services["spikes"][0]["for_s"].as<double>() == 900);
+  CHECK(services["spikes"][0]["factor"].as<double>() == 20);
+  // A node that is not a client offers nothing, so it has no spikes key.
+  CHECK_FALSE(entry(doc["nodes"], "id", "ios_q")["spikes"]);
+  // A client without spikes has an empty list.
+  CHECK(entry(graph_json_of("tutorial/hello/scenario.yaml")["nodes"], "id", "users")["spikes"]
+            .size() == 0);
+}
+
 TEST_CASE("explain's JSON gives an instant fault no duration", "[stream]") {
   const auto path = scratch_scenario("flush", R"(version: 1
 name: flush
