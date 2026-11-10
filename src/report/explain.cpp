@@ -1966,6 +1966,19 @@ constexpr std::array<std::string_view, 1> estimated_columns{"p99_ms"};
   return json_object(std::vector<std::string>{json_field("name", json_string(name))});
 }
 
+// A client's spikes: when each starts and how long it lasts, in seconds from the run's start, and
+// the factor it multiplies the rate by.
+[[nodiscard]] std::string json_spikes(const std::vector<workload::Spike>& spikes) {
+  std::vector<std::string> items;
+  for (const auto& spike : spikes) {
+    items.push_back(json_object(
+        std::vector<std::string>{json_field("at_s", json_number(seconds(spike.at))),
+                                 json_field("for_s", json_number(seconds(spike.duration))),
+                                 json_field("factor", json_number(spike.factor))}));
+  }
+  return json_field("spikes", "[" + join(items, ",") + "]");
+}
+
 // A node: what a diagram needs to draw and label it. A client serves nothing, so its capacity,
 // unit, thresholds and room are null. Type-specific keys only where a diagram shows them: a
 // worker pool's workers, a gateway's connection cap.
@@ -1990,6 +2003,10 @@ constexpr std::array<std::string_view, 1> estimated_columns{"p99_ms"};
   if (spec.type == model::NodeType::worker_pool && spec.workers) {
     fields.push_back(json_field("workers", std::to_string(*spec.workers)));
   }
+  // A client's rate spikes (`rate.spikes`: a flash crowd, a marketing blast), so a timeline can
+  // mark a surge of load as it marks a fault (phase 5b; an added key, the format version
+  // unchanged).
+  if (client && spec.workload) fields.push_back(json_spikes(spec.workload->curve.spikes));
   if (spec.type == model::NodeType::ws_gateway) {
     fields.push_back(
         json_field("connection_cap", json_optional_number(model::connection_cap(spec))));
