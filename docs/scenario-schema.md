@@ -1,4 +1,4 @@
-# Scenario schema v1.6 (phase 4a)
+# Scenario schema v1.7 (phase 5a)
 
 v1 was fitted to the 12 book and lab drafts plus the first tutorial; v1.1 wrote down the
 rules the phase 1 loader enforces; v1.2 added phase 2a's rate curves, balancers, limiters and
@@ -7,7 +7,9 @@ phase 2c's bytes, queues, worker pools, external sinks, key-value clusters and t
 v1.5 phase 3's faults, retries, replications and last four types. **v1.6** (phase 4a) changes no
 scenario key's meaning; it adds to the command line (the sweep's `:log`, grid, `reject_rate` and
 `--slos`, `estimate --at`) and changes what `estimate` reports (see "New in v1.6": two JSON changes
-can break a reader). The language is as phase 3 reads it: the loader (`src/config/`, one implementation
+can break a reader). **v1.7** (phase 5a) changes no scenario key either: it adds the output a web
+frontend reads, `run --stream` and `explain --report json`, and names the output contract's version,
+`format_version`, first in every JSON document (see "New in v1.7"). The language is as phase 3 reads it: the loader (`src/config/`, one implementation
 unit per concern: `header.cpp`, `nodes.cpp`, `steps.cpp`, `workload.cpp`, `links.cpp`,
 `slos.cpp`, `faults.cpp`, `overrides.cpp`), the graph builder (`src/engine/graph.cpp`), the node
 behaviours (`src/engine/behaviours.cppm`), the fault schedule and the fault log
@@ -19,6 +21,19 @@ what each ignores, are spec §18 (phase 2b), §19 (phase 2c) and §20 (phase 3)
 (`docs/superpowers/specs/2026-10-27-system-sim-design.md`), with the phase 3 design in
 `docs/superpowers/specs/2026-10-30-phase3-faults-gateways-design.md`. Where a phase 3 rule differs
 from what that design first said, this file and spec §20 have the rule as built.
+
+New in v1.7 (phase 5a; design `docs/superpowers/specs/2026-11-10-phase5a-streaming-design.md`,
+rules as built in spec §22):
+
+- **JSON, added first:** `"format_version": 1` is the first key of `run`, `estimate` and `run
+  --replications` with `--report json`, and of `explain --report json`. A reader that keys on the
+  first line of the document sees it moved down by one; nothing else changes. The rules of what
+  keeps and what raises the version are [the output contract](#the-output-contract);
+- [`simsys run --stream`](#command-line-simsys-run---stream-phase-5a): the run as lines of JSON on
+  stdout as it goes (a `run` line, the `graph`, a `frame` per bucket of steps aggregated at the
+  source, the `summary`, or an `error`), `--points N` (default 720) or `--every <duration>`;
+- [`simsys explain --report json`](#command-line-simsys-explain---report-json-phase-5a): the resolved
+  graph as data, the object the stream's `graph` line carries.
 
 New in v1.6 (phase 4a; design `docs/superpowers/specs/2026-11-09-phase4a-sweep-reporting-design.md`,
 rules as built in spec §21):
@@ -1897,6 +1912,7 @@ steady state, which stands for no stretch of time: its node `dropped`, `rejected
 
 | object | key | unit |
 |---|---|---|
+| top level | `format_version` | the first key (phase 5a): the version of the output contract, 1 ([the output contract](#the-output-contract)) |
 | top level | `scenario`, `steps` | the name; the number of observed steps |
 | top level | `at_s` | `estimate` only (phase 4a): the instant it settled at, seconds from the start (`--at`; 0 without it) |
 | top level | `drop_rate`, `reject_rate` | ratios in [0, 1], the worst node's (a pipe's counts for drops); `null` when no step was observed |
@@ -2315,6 +2331,129 @@ decimal
 `failover`, as `explain` prints it. The
 criterion is "back where it would have been", not "the SLOs pass again": an SLO with room to spare
 passes while the backlog still drains, and one that fails without the fault never passes.
+
+## Command line: `simsys run --stream` (phase 5a)
+
+```
+simsys run scenario.yaml --stream [--points N | --every <duration>] [--seed N] [--duration <d>]
+```
+
+The run as a web server reads it from a child process: newline-delimited JSON on stdout, one object
+per line, each with a `type`, written and flushed as soon as it exists, so the first frame of a 24 h
+youtube run is out after 43 ms (Release, measured 2026-11-10) and the page fills while the run takes
+its 24 s. stdout carries nothing else and stderr stays empty. The engine still steps at the
+scenario's `step`; only what is written is reduced, to one **frame** per **bucket** of consecutive
+steps.
+
+The lines, in this order: `run`, `graph`, the `frame`s in time order, `summary`; or an `error` at any
+point, after which nothing follows. A stream that ends without a `summary` or an `error` was killed.
+The hello tutorial in two buckets (the graph and summary lines trimmed):
+
+```
+$ simsys run scenarios/tutorial/hello/scenario.yaml --stream --points 2
+{"type":"run","format_version":1,"scenario":"hello","seed":1,"duration_s":60,"step_s":0.1,"warmup_s":0,"bucket_s":30,"frames":2}
+{"type":"graph","rev":0,"scenario":"hello","datacenters":[{"name":"main"}],"zones":["green","yellow","red"],"nodes":[...],...}
+{"type":"frame","rev":0,"t_s":0,"dt_s":30,"nodes":[[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],[100,100,0,0,0,0,0.1,0.1,0,0,1.11111,null,null,null,null]],"links":[],"ops":[[100,100,100,0,1.61111,5.66029]]}
+{"type":"frame","rev":0,"t_s":30,"dt_s":30,"nodes":[...],"links":[],"ops":[[100,100,100,0,1.61111,5.66029]]}
+{"type":"summary","exit_code":0,"report":{"format_version":1,"scenario":"hello","steps":600,...}}
+```
+
+| line | keys |
+|---|---|
+| `run` | `format_version`; `scenario`, `seed`; `duration_s`, `step_s`, `warmup_s`; `bucket_s` (a bucket's length) and `frames` (how many follow) |
+| `graph` | `rev` (0: the scenario as loaded), then the keys of [`explain --report json`](#command-line-simsys-explain---report-json-phase-5a) without `format_version` |
+| `frame` | `rev`; `t_s` (the bucket's first step) and `dt_s` (its length, shorter for a last bucket the steps did not fill); `nodes`, `links`, `ops`: one row of numbers each, in the graph's order and its column order |
+| `summary` | `exit_code` (`run`'s: 0, 2, or 1 when no step was observed) and `report`, exactly `run --report json`'s object |
+| `error` | `file` (`null` for a command line CLI11 refused), `line` and `column` (where the loader put the blame, 0 when it names none), `message` (what stderr would have printed) |
+
+**Buckets.** `--points N` (1 to 100,000, default 720: a point every two minutes of a day) makes a
+bucket `ceil(steps / N)` steps long, so a run shorter than N steps gets a frame per step. `--every
+<duration>` makes it that long: a whole number of steps (`--every 250ms: not a whole number of 100ms
+steps`), positive, and not longer than the run (`--every 2h is longer than the run (1h)`). Frames
+cover the whole run from t = 0, the warmup included (`warmup_s` says where the summary starts to
+observe).
+
+**Rows.** A frame's rows are arrays of numbers in the order the graph's `node_columns`,
+`link_columns` and `op_columns` name; `null` where a row has no such value or it is not finite. Each
+number has six significant digits, as the CSV series' cells. Each column keeps its meaning by the
+aggregate it gets over the bucket:
+
+| node column | in the bucket |
+|---|---|
+| `demand_per_s`, `drain_per_s`, `dropped_per_s`, `rejected_per_s` | the mean, Σ x·dt / Σ dt |
+| `backlog` | the level at the bucket's end |
+| `peak_backlog`, `peak_rho` | the largest |
+| `mean_rho` | the mean |
+| `zone` | the worst: 0 green, 1 yellow, 2 red (the graph's `zones` names them); red if any step was red |
+| `red_s` | the seconds of the bucket in red |
+| `latency_ms` | the sojourn weighted by each step's drain (by time if nothing drained); `null` if some step never answered |
+| `queue_lag_s` | the largest (a message queue's, a frontier's; `null` elsewhere) |
+| `connections` | the last level (a websocket gateway's; `null` elsewhere) |
+| `dead_lettered_per_s`, `deduplicated_per_s` | the mean (a worker pool's, a notification fan-out's; `null` elsewhere) |
+
+A client's node row is all `null`: a source has no queue, and what it offers is in its op rows. A
+bandwidth link's row (`link_columns`) has the node columns without `rejected_per_s` and the
+type-specific ones, in megabytes, its latency weighted by the megabytes offered (as the report weighs
+a link's). An op row: `offered_per_s`, `attempts_per_s`, `answered_per_s`, `timed_out_per_s` (means),
+`mean_ms` (weighted by the requests answered) and `p99_ms`, read by the run's rule from the response
+moments pooled over the bucket (a lognormal fit, capped at the client's timeout, the timeout itself
+when more than 1 % timed out; the graph's `estimated_columns` lists it); both `null` when the bucket
+answered nothing.
+
+**Conservation over a bucket.** The fluid queue's per-step balance (`demand·dt = (drain +
+dropped)·dt + Δbacklog`) summed over the bucket's steps is the same balance with the means and the
+bucket's ends: `demand_per_s · dt_s = (drain_per_s + dropped_per_s) · dt_s + backlog − previous
+frame's backlog` (0 before the first). That is why the rates are means and the backlog a level: the
+law can still be checked from the frames. A one-minute outage inside a two-minute bucket is diluted
+in the means and kept in `peak_rho`, `zone` and `red_s`.
+
+**Size.** youtube's day: 723 lines, 1.13 MB (a frame about 1.55 KB); chat-system's 874 KB, against
+the hundreds of megabytes `--series` and `--series-ops` write for the same runs. A run takes as long
+with `--stream` as without (youtube 24.3 s and 27.4 s, chat-system 60.2 s and 59.9 s, Release).
+
+**Refused:** with `--stream`, `--report`, `--series`, `--series-ops` and `--replications`
+(`--stream carries the report and the series; drop --series`); `--points` and `--every` together
+(`--points and --every both set the bucket; give one`); either without `--stream` (`--points needs
+--stream`, on stderr). Under `--stream` every refusal, a scenario the loader refuses (with its line
+and column) and a flag the command line does not know, is an `error` line and exit 1.
+
+### The output contract
+
+The rules a frontend may rely on, for every JSON document simsys writes:
+
+1. A reader ignores a line `type` and a key it does not know.
+2. Adding a line type, a key, or a column at the end of a `*_columns` list keeps `format_version`.
+3. Removing or renaming any of them, reordering columns, or changing a value's meaning or unit raises
+   it, and this file's "New in" list names the change.
+4. Rows refer to nodes, links and ops by their position in the latest `graph`; the graph's ids are
+   the scenario's ids, stable across runs of the same file.
+5. Same file, same seed, same bucket: the same stream, byte for byte.
+
+Kept open for later (phase 5a spec §8), none of it built yet: a live change (a node down now, a
+replica added) will come as a command on stdin, apply at a bucket boundary and be echoed as a line,
+so a session's scenario and echoed commands replay exactly; a changed topology will send a new
+`graph` with the next `rev`, and frames name the `rev` their rows follow.
+
+## Command line: `simsys explain --report json` (phase 5a)
+
+```
+simsys explain scenario.yaml --report json
+```
+
+The resolved graph as data, the source a frontend draws the system from (it never re-parses the
+YAML or re-derives a default). `format_version` first, then:
+
+| key | content |
+|---|---|
+| `scenario` | the name |
+| `datacenters` | objects, `{"name": ...}`; the latencies between them are on the links |
+| `zones` | `["green", "yellow", "red"]`: the names of a frame's `zone` numbers |
+| `nodes` | in the engine's order (every frame's): `id`, `type`, `datacenter`, `replicas` (a kv_cluster's machines), `shards` (`null` unless sharded), `capacity_per_s` (the total over replicas and shards, the number explain's check line uses), `unit` (`requests`, `units` for a node with an op that costs other than 1, `MB` for a byte-sized node, `replica-requests` for a kv_cluster), `yellow`, `red`, `queue_limit`; all `null` on a client but the first four; a worker pool's `workers`, a websocket gateway's `connection_cap` |
+| `links` | `from`, `to`, `direction`, `ops` (empty: every op), `one_way_s`, `bandwidth_mb_s` (`null` without a bandwidth) |
+| `ops` | `client`, `op`, `share`: clients in node order, each client's ops by name (every frame's op rows) |
+| `slos` | `metric`, `node`, `op`, `max` (seconds for a time metric), `over_s` |
+| `faults` | `kind`, `target` (a node, or a datacenter for `dc_down`), `at_s`, `for_s` (`null` for an instant `cache_flush`) |
+| `node_columns`, `link_columns`, `op_columns`, `estimated_columns` | the names of a frame's numbers, in order |
 
 ## Command line: `simsys estimate --at` (phase 4a)
 
