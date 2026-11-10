@@ -124,6 +124,62 @@ describe("the diagram's elements, from the graph and the frame", () => {
   });
 });
 
+// web-crawler's resolved graph: a pipeline with a loop, url_seen → frontier.
+const crawler = {
+  type: "graph",
+  rev: 0,
+  ...(JSON.parse(
+    readFileSync(path.resolve(import.meta.dirname, "fixtures/web-crawler-graph.json"), "utf8"),
+  ) as object),
+} as GraphLine;
+
+// A node's box in the diagram's coordinates (its datacenter box's offset added).
+function boxOf(layout: Awaited<ReturnType<typeof layoutGraph>>, id: string) {
+  const place = layout.nodes.get(id);
+  if (!place) throw new Error(`no node ${id}`);
+  const parent = place.parent ? layout.groups.get(place.parent) : undefined;
+  return { ...place, x: place.x + (parent?.x ?? 0), y: place.y + (parent?.y ?? 0) };
+}
+
+function routeOf(
+  layout: Awaited<ReturnType<typeof layoutGraph>>,
+  graph: GraphLine,
+  from: string,
+  to: string,
+) {
+  const i = graph.links.findIndex((l) => l.from === from && l.to === to);
+  const route = layout.routes.get(`link-${i}`);
+  if (!route) throw new Error(`no route ${from} -> ${to}`);
+  return route;
+}
+
+describe("the diagram's four-sided connections", () => {
+  it("joins boxes along the flow right side to left side", async () => {
+    const layout = await layoutGraph(crawler);
+    const route = routeOf(layout, crawler, "frontier", "downloader");
+    const from = boxOf(layout, "frontier");
+    const to = boxOf(layout, "downloader");
+    expect(route[0]?.x).toBeCloseTo(from.x + from.width, 0);
+    expect(route.at(-1)?.x).toBeCloseTo(to.x, 0);
+  });
+
+  it("loops url_seen back into the frontier underneath, bottom side to bottom side", async () => {
+    // The book draws the crawler's loop this way: newly seen URLs return to the frontier from below.
+    const layout = await layoutGraph(crawler);
+    const route = routeOf(layout, crawler, "url_seen", "frontier");
+    const from = boxOf(layout, "url_seen");
+    const to = boxOf(layout, "frontier");
+    expect(route[0]?.y).toBeCloseTo(from.y + from.height, 0);
+    expect(route.at(-1)?.y).toBeCloseTo(to.y + to.height, 0);
+  });
+
+  it("names the sides each link joins, for the page's connection points", async () => {
+    const layout = await layoutGraph(crawler);
+    const i = crawler.links.findIndex((l) => l.from === "url_seen" && l.to === "frontier");
+    expect(layout.sides.get(`link-${i}`)).toEqual({ source: "bottom", target: "bottom" });
+  });
+});
+
 describe("the diagram's layout", () => {
   it("gives every link a route of at least two points", async () => {
     const layout = await layoutGraph(youtube);
