@@ -36,6 +36,7 @@ export async function precomputeOne(
     title: entry.title,
     chapter: entry.chapter,
     kind: entry.kind,
+    duration_s: stream.run.message.duration_s,
     loops: cut.loops,
     seam: cut.seam?.status ?? null,
     frames: cut.frames.length,
