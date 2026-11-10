@@ -477,8 +477,23 @@ class Summary {
 // op table with estimated percentiles, and the SLO verdicts.
 [[nodiscard]] std::string render_table(const Summary& summary, std::span<const SloResult> slos,
                                        bool color);
+// The version of the output contract: the first key of every JSON document simsys writes (`run`,
+// `estimate`, `explain` and replications with `--report json`, the stream's `run` message). A
+// frontend checks it before it reads a key. Adding a key, a message type or a column keeps it;
+// removing or renaming one, or changing a value's meaning or unit, raises it (schema v1.7, "the
+// output contract"). `constexpr` without `inline`: an exported namespace-scope constant (the seventh
+// GCC 14.2 defect, CLAUDE.md §3).
+constexpr int format_version = 1;
+
 // For programs: the same content as JSON (two-space indent, seconds, null for infinity).
 [[nodiscard]] std::string render_json(const Summary& summary, std::span<const SloResult> slos);
+// The same document on one line, without the layout's whitespace: the `report` of the stream's
+// `summary` message (`run --stream`), where one line is one message.
+[[nodiscard]] std::string render_json_line(const Summary& summary,
+                                           std::span<const SloResult> slos);
+// Any JSON text on one line: the whitespace between tokens removed, the text inside strings kept
+// byte for byte (render_json_line, the stream's graph). `json` must be valid JSON.
+[[nodiscard]] std::string json_on_one_line(std::string_view json);
 
 // A moment of the run's clock as a report prints it: `12:00` for a whole minute, `00:19:59` for a
 // whole second, the exact duration from the start otherwise or past the first day.

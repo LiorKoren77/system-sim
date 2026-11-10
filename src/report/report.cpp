@@ -1574,6 +1574,7 @@ template <class T, class F>
   const auto worst = summary.worst_drop_node();
   const auto worst_rejecting = summary.worst_reject_node();
   std::vector<std::string> lines{
+      "  " + json_field("format_version", std::to_string(format_version)),
       "  " + json_field("scenario", json_string(summary.scenario_name())),
       "  " + json_field("steps", std::to_string(summary.observed_steps())),
       "  " + json_field("drop_rate", observed ? json_number(summary.drop_rate()) : "null"),
@@ -1589,7 +1590,7 @@ template <class T, class F>
       json_array("slo", slo_objects)};
   // estimate only, after `steps`: the instant it settled at, in seconds (`--at`; 0 without it).
   if (summary.is_estimate()) {
-    lines.insert(lines.begin() + 2,
+    lines.insert(lines.begin() + 3,
                  "  " + json_field("at_s", json_number(seconds(summary.estimate_at()))));
   }
   if (summary.faults().empty()) return lines;
@@ -2790,6 +2791,41 @@ std::string format_clock(SimTime t) {
 
 std::string render_json(const Summary& summary, std::span<const SloResult> slos) {
   return json_document(json_report_lines(summary, slos));
+}
+
+std::string render_json_line(const Summary& summary, std::span<const SloResult> slos) {
+  return json_on_one_line(render_json(summary, slos));
+}
+
+// JSON minification. RFC 8259 §2: whitespace is allowed before and after every structural
+// character and value and means nothing there; inside a string every character counts. So a scan
+// that copies strings whole (honouring a backslash, which escapes the next character, a quote
+// included) and drops the four whitespace characters elsewhere changes the layout and no value.
+// One rule for every document instead of a second, one-line renderer per document, which would have
+// to be kept in step with the pretty one key by key.
+std::string json_on_one_line(std::string_view json) {
+  std::string out;
+  out.reserve(json.size());
+  bool in_string = false;
+  bool escaped = false;
+  for (const char c : json) {
+    if (in_string) {
+      out += c;
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        in_string = false;
+      }
+    } else if (c == '"') {
+      in_string = true;
+      out += c;
+    } else if (c != ' ' && c != '\n' && c != '\t' && c != '\r') {
+      out += c;
+    }
+  }
+  return out;
 }
 
 // ---- replications ----
