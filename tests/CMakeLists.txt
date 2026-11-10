@@ -50,7 +50,8 @@ add_executable(theory_tests
   theory/test_rho_one.cpp
   theory/test_timeout.cpp
   theory/test_faults.cpp
-  theory/test_windows.cpp)
+  theory/test_windows.cpp
+  theory/test_stream.cpp)
 target_link_libraries(theory_tests PRIVATE simsys simsys_test_support Catch2::Catch2WithMain simsys_warnings)
 # test_timeout.cpp pins the shipped youtube scenario's uploads and test_windows.cpp the shipped
 # url-shortener's hours, so they need the directory too.

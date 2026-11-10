@@ -4,10 +4,17 @@
 // yaml-cpp: JSON is YAML 1.2's flow syntax, so a JSON object loads as a YAML map and a test
 // compares trees, not text.
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <optional>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -19,9 +26,21 @@
 // C++20 `import`: the compiled interfaces of the modules under test, after every #include (the
 // eighth GCC 14.2 defect: a std header included after an import clashes with the module's).
 import simsys.config;
+import simsys.core;
+import simsys.engine;
+import simsys.fluid;
 import simsys.graph;
+import simsys.model;
 import simsys.report;
 import simsys.session;
+import simsys.test_fixtures;
+
+using namespace std::chrono_literals;
+using Catch::Matchers::WithinRel;
+using simsys::engine::NodeSample;
+using simsys::engine::StepRecord;
+using simsys::report::Frame;
+using simsys::report::FrameAggregator;
 
 namespace {
 
@@ -333,4 +352,158 @@ TEST_CASE("every shipped scenario's graph JSON parses, one node per node of the 
     }
     CHECK(with_bandwidth == piped);
   }
+}
+
+// ---- the frames: node buckets (Task 3)
+// -----------------------------------------------------------
+//
+// The aggregator only reads StepRecords, so its rules are pinned on records written by hand for the
+// M/M/1 probe's graph (node 0 the client `c`, node 1 the service `s`; steps of 100 ms).
+
+namespace {
+
+const simsys::graph::Graph& probe_graph() {
+  static const auto g = *simsys::graph::Graph::build(simsys::test_support::mm1(500));
+  return g;
+}
+
+// A record at step k (t = k x 100 ms) whose service sample is `s`; the client's sample is empty.
+StepRecord record_at(int k, const NodeSample& s) {
+  return StepRecord{.t = k * 100ms, .nodes = {NodeSample{}, s}};
+}
+
+NodeSample serving(double rho, double drain = 0.0, double latency_s = 0.001) {
+  NodeSample sample{.drain_per_s = drain, .rho = rho};
+  sample.latency.mean_s = latency_s;
+  return sample;
+}
+
+std::vector<Frame> frames_of(std::span<const StepRecord> records, std::size_t steps_per_bucket,
+                             const simsys::graph::Graph& g = probe_graph()) {
+  std::vector<Frame> frames;
+  FrameAggregator aggregator{g, steps_per_bucket, [&](const Frame& f) { frames.push_back(f); }};
+  for (const auto& record : records) aggregator.observe(record);
+  aggregator.finish();
+  return frames;
+}
+
+}  // namespace
+
+TEST_CASE("a bucket's utilization is the mean of its steps' and its peak the largest", "[stream]") {
+  // Ten steps at rho 0.25, then ten at 0.75 (a client stepping from 500/s to 1.5k/s into 2k/s):
+  // mean (10 x 0.25 + 10 x 0.75) / 20 = 0.5, peak 0.75.
+  std::vector<StepRecord> records;
+  for (int k = 0; k < 20; ++k) records.push_back(record_at(k, serving(k < 10 ? 0.25 : 0.75)));
+  const auto frames = frames_of(records, 20);
+  REQUIRE(frames.size() == 1);
+  CHECK_THAT(*frames[0].nodes[1].mean_rho, WithinRel(0.5, 1e-12));
+  CHECK(*frames[0].nodes[1].peak_rho == 0.75);
+  CHECK_THAT(frames[0].dt_s, WithinRel(2.0, 1e-12));
+}
+
+TEST_CASE("one red step makes its bucket red, with that step's seconds in red", "[stream]") {
+  std::vector<StepRecord> records;
+  for (int k = 0; k < 10; ++k) {
+    auto sample = serving(k == 4 ? 0.95 : 0.3);
+    if (k == 4) sample.zone = simsys::fluid::Zone::red;
+    records.push_back(record_at(k, sample));
+  }
+  const auto frames = frames_of(records, 10);
+  REQUIRE(frames.size() == 1);
+  CHECK(frames[0].nodes[1].zone == 2);
+  CHECK_THAT(*frames[0].nodes[1].red_s, WithinRel(0.1, 1e-12));
+  // A bucket that never left green: zone 0, no red time.
+  const auto calm = frames_of(std::span{records}.first(4), 4);
+  CHECK(calm[0].nodes[1].zone == 0);
+  CHECK(*calm[0].nodes[1].red_s == 0.0);
+}
+
+TEST_CASE("a bucket's worst zone is yellow when no step was red", "[stream]") {
+  std::vector<StepRecord> records;
+  for (int k = 0; k < 3; ++k) {
+    auto sample = serving(0.8);
+    sample.zone = k == 1 ? simsys::fluid::Zone::yellow : simsys::fluid::Zone::green;
+    records.push_back(record_at(k, sample));
+  }
+  CHECK(frames_of(records, 3)[0].nodes[1].zone == 1);
+}
+
+TEST_CASE("a level is the bucket's last value: backlog and open connections", "[stream]") {
+  std::vector<StepRecord> records;
+  for (int k = 0; k < 5; ++k) {
+    auto sample = serving(0.5);
+    sample.backlog = k == 2 ? 80.0 : 10.0 * k;  // 0, 10, 80, 30, 40
+    sample.connections = 1000.0 + k;
+    records.push_back(record_at(k, sample));
+  }
+  const auto row = frames_of(records, 5)[0].nodes[1];
+  CHECK(*row.backlog == 40.0);
+  CHECK(*row.peak_backlog == 80.0);
+  CHECK(*row.connections == 1004.0);
+}
+
+TEST_CASE("a bucket's latency is the drain-weighted mean of its steps' sojourns", "[stream]") {
+  // Drains 1 and 3 with sojourns 2 ms and 4 ms: (1 x 2 + 3 x 4) / 4 = 3.5 ms.
+  const std::vector<StepRecord> records{record_at(0, serving(0.1, 1.0, 0.002)),
+                                        record_at(1, serving(0.1, 3.0, 0.004))};
+  CHECK_THAT(*frames_of(records, 2)[0].nodes[1].latency_ms, WithinRel(3.5, 1e-12));
+}
+
+TEST_CASE("a bucket whose node never answered in some step has no latency", "[stream]") {
+  const std::vector<StepRecord> records{
+      record_at(0, serving(0.1, 1.0, 0.002)),
+      record_at(1, serving(1.0, 0.0, std::numeric_limits<double>::infinity()))};
+  CHECK_FALSE(frames_of(records, 2)[0].nodes[1].latency_ms.has_value());
+}
+
+TEST_CASE("a bucket that served nothing reports the time mean of its sojourns", "[stream]") {
+  const std::vector<StepRecord> records{record_at(0, serving(0.0, 0.0, 0.001)),
+                                        record_at(1, serving(0.0, 0.0, 0.003))};
+  CHECK_THAT(*frames_of(records, 2)[0].nodes[1].latency_ms, WithinRel(2.0, 1e-12));
+}
+
+TEST_CASE("columns a node does not have are null in its row, and a client has no queue",
+          "[stream]") {
+  std::vector<StepRecord> records{record_at(0, serving(0.5))};
+  const auto frame = frames_of(records, 1)[0];
+  const auto& client = frame.nodes[0];
+  CHECK_FALSE(client.demand_per_s.has_value());
+  CHECK_FALSE(client.mean_rho.has_value());
+  CHECK_FALSE(client.zone.has_value());
+  CHECK_FALSE(client.latency_ms.has_value());
+  const auto& service = frame.nodes[1];
+  CHECK(service.demand_per_s.has_value());
+  CHECK_FALSE(service.queue_lag_s.has_value());
+  CHECK_FALSE(service.connections.has_value());
+  CHECK_FALSE(service.dead_lettered_per_s.has_value());
+  CHECK_FALSE(service.deduplicated_per_s.has_value());
+}
+
+TEST_CASE("600 steps in buckets of 7 make 85 full frames and a last one of 5 steps", "[stream]") {
+  std::vector<StepRecord> records;
+  for (int k = 0; k < 600; ++k) records.push_back(record_at(k, serving(0.5)));
+  const auto frames = frames_of(records, 7);
+  REQUIRE(frames.size() == 86);  // 600 = 85 x 7 + 5
+  CHECK_THAT(frames[0].dt_s, WithinRel(0.7, 1e-12));
+  CHECK_THAT(frames.back().dt_s, WithinRel(0.5, 1e-12));
+  CHECK(simsys::seconds(frames[3].t) ==
+        simsys::seconds(21 * 100ms));  // frame k starts at k x 0.7 s
+  CHECK(frames.back().t == 595 * 100ms);
+}
+
+TEST_CASE("finish hands over nothing when the last bucket was full, or a second time", "[stream]") {
+  std::vector<Frame> frames;
+  FrameAggregator aggregator{probe_graph(), 2, [&](const Frame& f) { frames.push_back(f); }};
+  for (int k = 0; k < 4; ++k) aggregator.observe(record_at(k, serving(0.5)));
+  CHECK(frames.size() == 2);
+  aggregator.finish();
+  CHECK(frames.size() == 2);
+  aggregator.observe(record_at(4, serving(0.5)));
+  aggregator.finish();
+  aggregator.finish();
+  CHECK(frames.size() == 3);
+}
+
+TEST_CASE("a bucket of no step size is refused: a programmer error", "[stream]") {
+  CHECK_THROWS_AS((FrameAggregator{probe_graph(), 0, [](const Frame&) {}}), std::invalid_argument);
 }
