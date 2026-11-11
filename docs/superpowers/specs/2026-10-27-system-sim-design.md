@@ -1365,7 +1365,8 @@ with the 5b design, this section wins. The rules a reader meets are in `docs/sce
    std::expected<model::Scenario, std::string>` copies each spike and scripted fault to every day
    (`every_day`, day by day, each day in the file's order), sets the duration to N × 24 h and the
    warmup to (N − 1) × 24 h; `not_periodic` refuses a wave whose period does not divide the day, a
-   `points` curve and a ramp longer than a day. `load_for_run` applies it after the seed and wraps
+   `points` curve and a ramp longer than a day, and with `overlaps_next_day` a spike or a fault
+   longer than a day (its copy would overlap it; found by the branch review). `load_for_run` applies it after the seed and wraps
    its message in `RunRefusal`; a count outside 1 to 7 is the command line's fault (the error line
    names no file), the rest the scenario's. The `run` line's `days` is rendered only when given, so
    every existing stream is unchanged. Deviation: the 5b design refused `--days` with
