@@ -74,7 +74,9 @@ constexpr SimTime one_day = std::chrono::hours{24};
 
 // Why a client's curve would not repeat with the day, or nothing. A wave repeats if a whole number
 // of its periods fills the day; a points trace is held flat after its last entry; a ramp is a
-// one-off that the first day, a warm-up anyway, absorbs only if it ends within it.
+// one-off that the first day, a warm-up anyway, absorbs only if it ends within it. A spike longer
+// than the day would overlap its own copy the next day, and the two factors would multiply past
+// the bound the loader checks on one.
 std::optional<std::string> not_periodic(const model::NodeSpec& client) {
   const auto& curve = client.workload->curve;
   if (curve.wave && one_day.count() % curve.wave->period.count() != 0) {
@@ -87,7 +89,23 @@ std::optional<std::string> not_periodic(const model::NodeSpec& client) {
     return std::format("--days: client '{}' ramps over {}, longer than a day", client.id,
                        describe_duration(curve.ramp->over));
   }
+  for (const auto& spike : curve.spikes) {
+    if (spike.duration > one_day) {
+      return std::format("--days: client '{}' has a spike of {}, longer than a day", client.id,
+                         describe_duration(spike.duration));
+    }
+  }
   return std::nullopt;
+}
+
+// Why a fault would not repeat with the day, or nothing: one longer than the day would overlap its
+// own copy the next day (two node_downs of some replicas each would add up to more than either).
+std::optional<std::string> overlaps_next_day(const model::Fault& fault) {
+  if (fault.duration <= one_day) return std::nullopt;
+  const auto& target = fault.node.empty() ? fault.datacenter : fault.node;
+  return std::format("--days: the {} of '{}' at {} lasts {}, longer than a day",
+                     model::to_string(fault.kind), target, describe_duration(fault.at),
+                     describe_duration(fault.duration));
 }
 
 // `items` followed by a copy of them shifted by one day, by two, ... up to `days` − 1 days: the day
@@ -118,6 +136,9 @@ std::expected<model::Scenario, std::string> repeat_days(model::Scenario scenario
   for (const auto& node : scenario.nodes) {
     if (!node.workload) continue;  // only a client has a rate curve
     if (auto why = not_periodic(node)) return std::unexpected(std::move(*why));
+  }
+  for (const auto& fault : scenario.faults) {
+    if (auto why = overlaps_next_day(fault)) return std::unexpected(std::move(*why));
   }
   if (days == 1) return scenario;
   for (auto& node : scenario.nodes) {
