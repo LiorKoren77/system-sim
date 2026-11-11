@@ -1,5 +1,5 @@
 // What the slider's clock says for a frame. A frame is a bucket of steps (5a §6.2: a day's is
-// 2 min), so the clock names the bucket's start and the page never interpolates between frames:
+// 1 min), so the clock names the bucket's start and the page never interpolates between frames:
 // there is no state between two buckets to show, only the bucket the time is in.
 
 const day_s = 86400;

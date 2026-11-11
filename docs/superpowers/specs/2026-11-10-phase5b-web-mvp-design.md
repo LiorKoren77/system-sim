@@ -21,7 +21,7 @@ The architecture, agreed on 2026-11-10 (memory: web architecture decisions) and 
 
 ```
 offline: npm run precompute                                   live: static files only
-  simsys run <file> --stream --days 2 --every 2m   ─┐
+  simsys run <file> --stream --days 2 --every 1m   ─┐
   (one child process per shipped scenario,          ├─>  web/app/public/datasets/<id>.ndjson.gz
    at most one per core)                            │    web/app/public/datasets/index.json
   the day-2 frames, the repeat check, gzip        ──┘              │  HTTP GET (any static server)
@@ -141,7 +141,7 @@ A dataset is a 5a stream (schema, "simsys run --stream"), one JSON object per li
 {"type":"dataset","dataset_version":1,"id":"book/chat-system","title":"Chat system","chapter":12,
  "kind":"day","window":{"from_s":86400,"to_s":172800},"loops":true,
  "seam":{"status":"repeats","worst":{"row":"node","id":"chat_servers","column":"connections","a":181234,"b":181234,"rel":0}},
- "source":{"scenario":"scenarios/book/chat-system/scenario.yaml","args":["run","…","--stream","--days","2","--every","2m"]}}
+ "source":{"scenario":"scenarios/book/chat-system/scenario.yaml","args":["run","…","--stream","--days","2","--every","1m"]}}
 ```
 
 | key | meaning |
@@ -155,8 +155,10 @@ A dataset is a 5a stream (schema, "simsys run --stream"), one JSON object per li
 | `seam` | for a `day`: `status` (`repeats` or `drifts`) and the worst column (§7.2); `null` for a `run` |
 | `source` | how to regenerate it: the file and the exact arguments. The simsys commit is in `index.json`, not here: a dataset's bytes then depend only on what `simsys` wrote, so the committed fixtures (§10) do not change at every commit |
 
-**Buckets.** A day is written with `--every 2m`: 720 frames a day, the 5a default for 24 h, so a
-48 h run gives 1440 and the dataset keeps the second 720. A `run` keeps `--points 720`.
+**Buckets.** A day is written with `--every 1m`: 1440 frames a day, so a 48 h run gives 2880 and the
+dataset keeps the second 1440. (First 2 min, 5a's default for 24 h; changed to 1 min at the user's
+request, 2026-11-11, so a 1 min outage has a frame of its own: the datasets doubled to 164–437 KB.)
+A `run` keeps `--points 720`.
 
 **Size (measured on the 48 h trial, 2026-11-10).** url-shortener's 48 h stream is 1.12 MB, 175 KB
 gzipped; news-feed's 1.63 MB, 289 KB. A one-day dataset is about half of that: roughly 90–150 KB
@@ -168,7 +170,7 @@ first:
 ```json
 {"index_version":1,"format_version":1,"simsys_commit":"dbcf013","datasets":[
   {"id":"book/chat-system","file":"book-chat-system.ndjson.gz","bytes":131072,"title":"Chat system",
-   "chapter":12,"kind":"day","loops":true,"seam":"repeats","frames":720,"slo_passed":true}, …]}
+   "chapter":12,"kind":"day","loops":true,"seam":"repeats","frames":1440,"slo_passed":true}, …]}
 ```
 
 No time stamps in either file (Node's gzip writes mtime 0). The same `simsys` output gives the
@@ -186,11 +188,11 @@ time:
 
 1. Read `duration` from the scenario's YAML (the only key it reads; the `yaml` package). 24 h →
    `day`, else `run`. The YAML is read for this one decision, never rewritten.
-2. Spawn `simsys run <file> --stream` (+ `--days 2 --every 2m` for a day). Read the stdout line by
+2. Spawn `simsys run <file> --stream` (+ `--days 2 --every 1m` for a day). Read the stdout line by
    line with `@simsys/stream`'s splitter. Exit 0 and 2 are data (2: an SLO failed, which the
    app shows). An `error` line, exit 1, or a stream that ends without a `summary` stop the
    precompute with the file, line and column: a broken dataset is never written.
-3. For a day: the seam check (§7.2) on frames 719 and 1439, the window, `loops`.
+3. For a day: the seam check (§7.2) on frames 1439 and 2879, the window, `loops`.
 4. Write the `dataset` line and the kept lines, gzip, then `index.json`.
 
 **Cost.** One core per scenario: about 2× a 24 h run (news-feed's 48 h: 80 s Release; chat-system
@@ -289,10 +291,11 @@ on a fresh clone).
 The slider's position is a frame index, shown as the clock: `HH:MM` = (`t_s` − `window.from_s`)
 mod 24 h for a day, the run time `1h 05m` for a run.
 
-- **Play** advances one frame per tick. A day takes 60 s at the default speed (12 frames a second).
-  Other speeds: 30 s, 2 min, 5 min a day. A frame is a bucket, so nothing is interpolated: the page
+- **Play** advances one frame per tick. A speed is how long the whole window takes: a day takes
+  60 s at the default speed (24 frames a second), a run of 720 frames too (12 a second). Other
+  speeds: 30 s, 2 min, 5 min. A frame is a bucket, so nothing is interpolated: the page
   shows the bucket the clock is in.
-- **Loop**: a day with `loops` wraps from 23:58 to 00:00 without a pause. A day that does not repeat
+- **Loop**: a day with `loops` wraps from 23:59 to 00:00 without a pause. A day that does not repeat
   and a run stop at the end; play again starts over.
 - Scrubbing, ← / → one frame, Shift+← / → one hour, Space play/pause, Home midnight.
 - Marks on the slider: the scripted faults of the window (`graph.faults`, at their `at_s`, their
@@ -378,17 +381,17 @@ fallback). It is responsive enough to read on a laptop. A phone layout is not a 
 - the seam check on synthetic frames: identical → `repeats`; a backlog that grows → `drifts` naming
   that node and column; a 0.0001 backlog against 0 on a node with a peak of 5000 → `repeats`;
   `null` against a number → `drifts`;
-- the window: 1440 frames → the last 720, `t_s` from 86400; a `run` keeps everything;
+- the window: 2880 frames → the last 1440, `t_s` from 86400; a `run` keeps everything;
 - the dataset line and `index.json`: keys, sorted ids, the same bytes twice (no time stamps, gzip
   mtime 0), whatever order the runs finish in;
 - a stream that ends without a `summary`, or with an `error`, writes nothing and fails with the
   message;
-- integration (needs `SIMSYS`, skipped without it): url-shortener's real 48 h run → `repeats`, 720
+- integration (needs `SIMSYS`, skipped without it): url-shortener's real 48 h run → `repeats`, 1440
   frames, `summary.report` equal to `simsys run --days 2 --report json`.
 
 **`@simsys/app` (5b.5–5b.7)**, Vitest with jsdom and Testing Library; uPlot and React Flow's canvas
 parts are not rendered in jsdom, and their inputs are pure functions tested instead:
-- the clock: frame 0 of a day is 00:00, 719 is 23:58; a run's clock is its run time;
+- the clock: frame 0 of a day is 00:00, 1439 is 23:59; a run's clock is its run time;
 - the loop: play past the last frame of a looping day wraps to 0; past the last frame of a day that
   does not repeat, it stops;
 - `toFlowElements`: chain's graph gives 3 nodes and 2 edges in the graph's order; a node in zone 2

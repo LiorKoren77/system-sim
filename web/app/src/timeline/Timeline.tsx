@@ -58,16 +58,16 @@ export function Timeline(props: {
         </div>
       </div>
       <label className="speed">
-        {shown.kind === "day" ? "day in" : "speed"}
+        {shown.kind === "day" ? "day in" : "run in"}
         <select
-          value={player.framesPerSecond}
+          value={player.seconds}
           onChange={(e) => {
-            dispatch({ type: "setSpeed", framesPerSecond: Number(e.target.value) });
+            dispatch({ type: "setSpeed", seconds: Number(e.target.value) });
           }}
         >
           {SPEEDS.map((s) => (
-            <option key={s.label} value={s.framesPerSecond}>
-              {shown.kind === "day" ? s.label : `${s.framesPerSecond} frames/s`}
+            <option key={s.label} value={s.seconds}>
+              {s.label}
             </option>
           ))}
         </select>

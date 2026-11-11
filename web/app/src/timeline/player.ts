@@ -7,7 +7,7 @@ export interface PlayerState {
   readonly frames: number;
   readonly loops: boolean; // a day that repeats wraps from its last frame to its first
   readonly framesPerHour: number;
-  readonly framesPerSecond: number;
+  readonly seconds: number; // how long the whole window takes to play
   readonly playing: boolean;
   readonly carry: number; // the part of a frame the ticks so far have not yet made a whole frame
 }
@@ -20,16 +20,16 @@ export type PlayerAction =
   | { readonly type: "seek"; readonly frame: number }
   | { readonly type: "step"; readonly by: number }
   | { readonly type: "stepHour"; readonly by: number }
-  | { readonly type: "setSpeed"; readonly framesPerSecond: number };
+  | { readonly type: "setSpeed"; readonly seconds: number };
 
-// A day is 720 frames of 2 min (5a's default bucket for 24 h), so these play it in 30 s, 1 min,
-// 2 min and 5 min. Chosen, not from the book: a minute is long enough to see a wave rise and short
-// enough to watch a whole day.
+// A speed is how long the whole window takes to play, whatever its frames: a day of 1440 frames of
+// 1 min in a minute is 24 frames a second, a run of 720 frames in a minute 12. Chosen, not from the
+// book: a minute is long enough to see a wave rise and short enough to watch a whole day.
 export const SPEEDS = [
-  { label: "30 s", framesPerSecond: 24 },
-  { label: "1 min", framesPerSecond: 12 },
-  { label: "2 min", framesPerSecond: 6 },
-  { label: "5 min", framesPerSecond: 2.4 },
+  { label: "30 s", seconds: 30 },
+  { label: "1 min", seconds: 60 },
+  { label: "2 min", seconds: 120 },
+  { label: "5 min", seconds: 300 },
 ] as const;
 
 export function createPlayer(options: {
@@ -37,7 +37,7 @@ export function createPlayer(options: {
   loops: boolean;
   framesPerHour: number;
 }): PlayerState {
-  return { ...options, frame: 0, framesPerSecond: 12, playing: false, carry: 0 };
+  return { ...options, frame: 0, seconds: 60, playing: false, carry: 0 };
 }
 
 export function playerReducer(state: PlayerState, action: PlayerAction): PlayerState {
@@ -58,13 +58,13 @@ export function playerReducer(state: PlayerState, action: PlayerAction): PlayerS
     case "stepHour":
       return { ...state, frame: moveBy(state, action.by * state.framesPerHour), carry: 0 };
     case "setSpeed":
-      return { ...state, framesPerSecond: action.framesPerSecond };
+      return { ...state, seconds: action.seconds };
   }
 }
 
 function advance(state: PlayerState, seconds: number): PlayerState {
-  const exact = state.carry + seconds * state.framesPerSecond;
-  // A small epsilon: 12 ticks of 1/144 s at 12 frames a second must make exactly one frame, not
+  const exact = state.carry + (seconds * state.frames) / state.seconds;
+  // A small epsilon: 12 ticks of 1/288 s at 24 frames a second must make exactly one frame, not
   // 0.9999999999999999 of one.
   const whole = Math.floor(exact + 1e-9);
   const carry = Math.max(0, exact - whole);
