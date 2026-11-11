@@ -1,9 +1,13 @@
 import { FileSource, type DatasetSource, type DatasetStore } from "@simsys/stream";
 import { useEffect, useMemo, useReducer, useState } from "react";
 import { Catalogue } from "./catalogue/Catalogue";
+import { Details } from "./charts/Details";
+import { ZoneStrip } from "./charts/ZoneStrip";
 import { defaultEntry, fetchIndex, type Index, type IndexEntry } from "./catalogue/index-file";
 import { Diagram } from "./diagram/Diagram";
 import { readHash, writeHash } from "./hash";
+import { FaultBlocks } from "./report/FaultBlocks";
+import { SloTable } from "./report/SloTable";
 import {
   createPlayer,
   playerReducer,
@@ -68,8 +72,9 @@ export function App(props: {
   );
 }
 
-// One dataset on the page: its status while it loads or when it failed, then the diagram and the
-// time bar. Keyed by the dataset's id, so a new choice starts at frame 0.
+// One dataset on the page: its status while it loads or when it failed, then the diagram with the
+// selected box's charts and the report beside it, and across the bottom the time bar and the zone
+// strip. Keyed by the dataset's id, so a new choice starts at frame 0.
 function Dataset(props: {
   store: DatasetStore;
   node: string | null;
@@ -101,16 +106,38 @@ function Dataset(props: {
     return <p className="notice">The dataset ended early: rebuild it with npm run precompute</p>;
   }
   if (store.frameCount === 0) return <p className="notice">Loading…</p>;
+  const frame = Math.min(effective.frame, store.frameCount - 1);
+  const seek = (to: number) => {
+    dispatch({ type: "seek", frame: to });
+  };
   return (
     <>
-      <Diagram
+      <div className="stage">
+        <Diagram
+          store={store}
+          frame={frame}
+          selected={props.node}
+          onSelect={props.onSelectNode}
+          playing={effective.playing}
+        />
+        <aside className="side">
+          <Details store={store} selected={props.node} frame={frame} shown={shown} onSeek={seek} />
+          <section className="report" aria-label="Report">
+            <h2>SLOs {shown.kind === "day" ? "of the day" : "of the run"}</h2>
+            <SloTable store={store} />
+            <h2>Faults</h2>
+            <FaultBlocks store={store} onSeek={seek} />
+          </section>
+        </aside>
+      </div>
+      <Timeline store={store} player={effective} dispatch={dispatch} shown={shown} />
+      <ZoneStrip
         store={store}
-        frame={Math.min(effective.frame, store.frameCount - 1)}
+        frame={frame}
         selected={props.node}
         onSelect={props.onSelectNode}
-        playing={effective.playing}
+        onSeek={seek}
       />
-      <Timeline store={store} player={effective} dispatch={dispatch} shown={shown} />
     </>
   );
 }

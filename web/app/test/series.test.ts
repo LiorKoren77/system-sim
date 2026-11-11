@@ -3,7 +3,7 @@ import path from "node:path";
 import { DatasetStore, MemorySource, type GraphLine } from "@simsys/stream";
 import { describe, expect, it } from "vitest";
 import { chartsFor, rateUnit, toAligned, xValues } from "../src/charts/series";
-import { fixtureLines, fixtureStore } from "./support";
+import { fixtureLines, fixtureStore, queueAndPool } from "./support";
 
 const youtube = {
   type: "graph",
@@ -120,6 +120,20 @@ describe("a node's charts, as uPlot's inputs", () => {
     const keys = chartsFor(graphOf(store), store, "api").map((c) => c.key);
     expect(keys).toContain("connections");
     expect(keys).not.toContain("queue_lag_s");
+  });
+});
+
+describe("a queue's charts", () => {
+  it("show the messages its pool has not read yet, which its box shows (pull.ts)", async () => {
+    const store = await queueAndPool(2_900_000, 225);
+    const backlog = chart(chartsFor(graphOf(store), store, "q"), "backlog");
+    expect(backlog.series.map((s) => s.label)).toEqual([
+      "waiting",
+      "peak",
+      "unread by w",
+      "room 1000",
+    ]);
+    expect(backlog.series[2]?.values).toEqual(store.nodeColumn(2, "backlog"));
   });
 });
 

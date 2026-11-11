@@ -24,7 +24,8 @@ describe("the fault blocks", () => {
     const block = screen.getByRole("button", { name: /node_down store/ });
     // At 600 s for 180 s; the report has it recovered at 780 s.
     expect(within(block).getByText("at 10m 00s · for 3 min")).toBeVisible();
-    expect(within(block).getByText("84.4k/s")).toBeVisible(); // offered during the fault
+    // Offered and served alike during the fault: one store copy of 16 down, the rest absorbed it.
+    expect(within(block).getAllByText("84.4k/s")).toHaveLength(2);
     expect(within(block).getByText("0 requests")).toBeVisible(); // lost
     expect(within(block).getByText("10m 00s → 13m 00s")).toBeVisible(); // down, then recovered
   });

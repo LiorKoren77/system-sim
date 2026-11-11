@@ -3,11 +3,11 @@
 // messages the pool has not read yet are drawn in the queue's box, where they wait.
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { DatasetStore, MemorySource, type GraphLine } from "@simsys/stream";
+import type { GraphLine } from "@simsys/stream";
 import { describe, expect, it } from "vitest";
 import { layoutGraph } from "../src/diagram/layout";
 import { nodeStatesAt, toFlowElements } from "../src/diagram/to-flow-elements";
-import { helloLines } from "../../stream/test/support/hello";
+import { queueAndPool } from "./support";
 
 const youtube = {
   type: "graph",
@@ -34,75 +34,6 @@ describe("a link a worker pool pulls from", () => {
     expect(pull?.source).toBe("transcode_q");
   });
 });
-
-// hello's stream with its graph replaced by publisher → queue q → pool w, w queueing `backlog`
-// messages and q lagging `lag` seconds in the one frame.
-async function queueAndPool(backlog: number, lag: number, lagSlo?: number): Promise<DatasetStore> {
-  const graph = JSON.parse(helloLines[1] ?? "") as Record<string, unknown>;
-  const node = (id: string, type: string) => ({
-    id,
-    type,
-    datacenter: "main",
-    replicas: 1,
-    shards: null,
-    capacity_per_s: type === "client" ? null : 1000,
-    unit: type === "client" ? null : "requests",
-    yellow: type === "client" ? null : 0.7,
-    red: type === "client" ? null : 0.9,
-    queue_limit: type === "client" ? null : 1000,
-  });
-  const link = (from: string, to: string) => ({
-    from,
-    to,
-    direction: "out",
-    ops: [],
-    one_way_s: 0,
-    bandwidth_mb_s: null,
-    pipe_row: null,
-  });
-  graph.nodes = [node("pub", "client"), node("q", "message_queue"), node("w", "worker_pool")];
-  graph.links = [link("pub", "q"), link("q", "w")];
-  graph.slos =
-    lagSlo === undefined
-      ? []
-      : [{ metric: "queue_lag", node: "q", op: null, max: lagSlo, over_s: null }];
-  const row = (b: number, l: number | null) => [
-    500,
-    500,
-    0,
-    0,
-    b,
-    b,
-    0.02,
-    0.02,
-    0,
-    0,
-    1,
-    l,
-    null,
-    null,
-    null,
-  ];
-  const frame = {
-    type: "frame",
-    rev: 0,
-    t_s: 0,
-    dt_s: 60,
-    nodes: [Array(15).fill(null), row(0, lag), row(backlog, null)],
-    links: [],
-    ops: [[500, 500, 500, 0, 1, 2]],
-  };
-  const store = new DatasetStore();
-  await store.consume(
-    new MemorySource([
-      helloLines[0] ?? "",
-      JSON.stringify(graph),
-      JSON.stringify(frame),
-      helloLines[4] ?? "",
-    ]),
-  );
-  return store;
-}
 
 describe("the messages a pool has not read yet", () => {
   it("are drawn in the queue's box, named after the pool that will read them", async () => {

@@ -14,7 +14,7 @@ import { categoryOf, type Category } from "./categories";
 import { peaksOf, type Peaks } from "./bars";
 import { copiesAt, type Copies } from "./copies";
 import { isPull, queueOfPool } from "./pull";
-import { lagSloOf, queueZone } from "./queue-zone";
+import { lagSloOf, queueZone, worstZone } from "./queue-zone";
 import { absoluteBox, type Layout } from "./layout";
 import { sidesFor, type Side } from "./sides";
 
@@ -50,6 +50,17 @@ export interface NodeState {
   readonly lagSeconds: number | null; // a queue's lag: how long a message now published waits
   readonly lagZone: Zone | null; // its lag against the scenario's queue_lag SLO (queue-zone.ts)
   readonly load: number | null;
+}
+
+// The zone a box shows, and the zone strip with it: a queue's box the worse of its broker's zone and
+// its queue's (lag against its SLO, messages against their room: queue-zone.ts); any other box its
+// own.
+export function boxZone(state: NodeState | undefined): Zone | null {
+  return worstZone([
+    state?.zone ?? null,
+    state?.lagZone ?? null,
+    ...(state?.queues ?? []).map((q) => q.zone),
+  ]);
 }
 
 export interface Queue {

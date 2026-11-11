@@ -7,3 +7,8 @@ import { afterEach } from "vitest";
 afterEach(() => {
   cleanup();
 });
+
+// jsdom has no canvas (it would need a native package): getContext answers null, as a browser does
+// for a context it cannot make, and the zone strip then draws nothing. Without this stub jsdom
+// prints "Not implemented" for each strip rendered.
+HTMLCanvasElement.prototype.getContext = () => null;
