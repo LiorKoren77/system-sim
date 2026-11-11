@@ -18,9 +18,12 @@ export interface SloRow {
 const durations = new Set(["p50_latency", "p95_latency", "p99_latency", "queue_lag", "staleness"]);
 
 export function sloRows(report: Report, graph: GraphLine, dataset: DatasetLine): SloRow[] {
-  return report.slo.map((slo, i) => {
+  return report.slo.map((slo) => {
     const value = (v: number) => (durations.has(slo.metric) ? latency(v) : percent(v));
-    const over = graph.slos[i]?.over_s ?? null;
+    // The graph's SLO this result judges, for its window's length: the same metric, node and op.
+    const over =
+      graph.slos.find((g) => g.metric === slo.metric && g.node === slo.node && g.op === slo.op)
+        ?.over_s ?? null;
     const start = slo.window_start_s;
     return {
       metric: slo.metric.replaceAll("_", " "),
