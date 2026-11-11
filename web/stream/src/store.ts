@@ -76,7 +76,7 @@ class Columns {
 
 export interface StoreOptions {
   // Subscribers are told after every `batchFrames` frames and at each change of status, not after
-  // each frame: a day is 720 frames, and redrawing the page 720 times while it loads is wasted work.
+  // each frame: a day is 1440 frames, and redrawing the page 1440 times while it loads is wasted work.
   readonly batchFrames?: number;
 }
 

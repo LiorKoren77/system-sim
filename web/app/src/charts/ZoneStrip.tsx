@@ -12,7 +12,7 @@ function rgb(name: string): [number, number, number] {
 
 // The window's health at a glance, under the slider: a row per node, a cell per frame, in the
 // frame's zone colour ("red at 21:30 for two buckets, then yellow for half an hour"). The canvas
-// holds one pixel per cell and the page stretches it, so a day of 720 frames costs 720 × rows
+// holds one pixel per cell and the page stretches it, so a day of 1440 frames costs 1440 × rows
 // pixels whatever the screen. A row's name selects the node; a click on a cell also moves the
 // slider there. A line marks the slider's frame.
 export function ZoneStrip(props: {

@@ -46,10 +46,11 @@ export async function findScenarios(repoRoot: string): Promise<ScenarioEntry[]> 
 }
 
 // The arguments simsys runs a scenario with: a day for two days (`run --days`, spec §5) in buckets
-// of 2 min, 720 a day; a run as it is, in simsys's default 720 buckets.
+// of 1 min, 1440 a day (2 min at first; the user chose 1 min, 2026-11-11, so a 1 min outage has a
+// frame of its own); a run as it is, in simsys's default 720 buckets.
 export function simsysArgs(entry: ScenarioEntry): string[] {
   const base = ["run", entry.path, "--stream"];
-  return entry.kind === "day" ? [...base, "--days", "2", "--every", "2m"] : base;
+  return entry.kind === "day" ? [...base, "--days", "2", "--every", "1m"] : base;
 }
 
 // The README's first heading, `# Chat system (ch. 12)`: the title, and the book's chapter when the
