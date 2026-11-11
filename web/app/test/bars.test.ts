@@ -29,14 +29,12 @@ describe("the bars in a box", () => {
     const graph = store.graph;
     if (!graph) throw new Error("no graph");
     const peaks = peaksOf(graph, store);
-    expect(nodeStatesAt(graph, store, 0, peaks).get("api")?.queue).toEqual({
-      fill: 0.5,
-      backlog: 50,
-    });
-    expect(nodeStatesAt(graph, store, 5, peaks).get("api")?.queue).toEqual({
-      fill: 1,
-      backlog: 100,
-    });
+    expect(nodeStatesAt(graph, store, 0, peaks).get("api")?.queues).toEqual([
+      { fill: 0.5, backlog: 50, consumer: null },
+    ]);
+    expect(nodeStatesAt(graph, store, 5, peaks).get("api")?.queues).toEqual([
+      { fill: 1, backlog: 100, consumer: null },
+    ]);
   });
 
   it("draws no queue bar for a node that never queues in the dataset", async () => {

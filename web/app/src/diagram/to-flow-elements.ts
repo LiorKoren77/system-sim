@@ -13,6 +13,7 @@ import { MarkerType, type Edge, type EdgeMarker, type Node } from "@xyflow/react
 import { categoryOf, type Category } from "./categories";
 import { peaksOf, type Peaks } from "./bars";
 import { copiesAt, type Copies } from "./copies";
+import { isPull, queueOfPool } from "./pull";
 import { absoluteBox, type Layout } from "./layout";
 import { sidesFor, type Side } from "./sides";
 
@@ -42,8 +43,17 @@ export interface NodeState {
   // The bars (bars.ts): utilisation (mean and the bucket's peak); the backlog against the node's own
   // largest; a client's offered rate against its own busiest frame. null where it does not apply.
   readonly busy: { readonly mean: number; readonly peak: number } | null;
-  readonly queue: { readonly fill: number; readonly backlog: number } | null;
+  // One row per backlog drawn in this box: its own, or, in a queue's box, the messages each pool
+  // pulling from it has not read yet (`consumer`: that pool; pull.ts says why they are drawn here).
+  readonly queues: readonly Queue[];
+  readonly lagSeconds: number | null; // a queue's lag: how long a message now published waits
   readonly load: number | null;
+}
+
+export interface Queue {
+  readonly fill: number; // the backlog against the largest it reaches in the dataset (bars.ts)
+  readonly backlog: number;
+  readonly consumer: string | null;
 }
 
 export function toFlowElements(
@@ -98,8 +108,10 @@ export function toFlowElements(
       // facing sides (sides.ts). `index` is the link's place in the graph, for its traffic.
       type: "routed",
       data: route ? { index: i, points: route } : { index: i },
-      // The arrowhead points at the box the link sends requests to.
-      markerEnd: arrow(null),
+      // The arrowhead points from the caller to the callee: at the box the link sends requests to,
+      // or, on a link a worker pool pulls from, at the queue (pull.ts). The dashes always move
+      // from source to target, the way the data goes.
+      ...(isPull(graph, link) ? { markerStart: arrow(null) } : { markerEnd: arrow(null) }),
       ...(link.pipe_row === null ? {} : { className: "pipe" }),
     };
   });
@@ -115,23 +127,36 @@ export function nodeStatesAt(
 ): Map<string, NodeState> {
   const states = new Map<string, NodeState>();
   const copies = copiesAt(graph, store.times()[frame] ?? 0, store.durations()[frame] ?? 0);
+  const rowOf = new Map(graph.nodes.map((n, row) => [n.id, row]));
+  const queueOf = queueOfPool(graph);
+  // A backlog row of node `id` (its own backlog), or null when it never queues in the dataset.
+  const backlogRow = (id: string, consumer: string | null): Queue | null => {
+    const peak = peaks.backlog.get(id) ?? 0;
+    if (!(peak > 0)) return null;
+    const backlog = at(store.nodeColumn(rowOf.get(id) ?? 0, "backlog"), frame) || 0;
+    return { fill: backlog / peak, backlog, consumer };
+  };
   graph.nodes.forEach((node, row) => {
     const isClient = node.type === "client";
     const value = (name: string) => at(store.nodeColumn(row, name), frame);
     const mean = value("mean_rho");
-    const peakBacklog = peaks.backlog.get(node.id) ?? 0;
     const peakOffered = peaks.offered.get(node.id) ?? 0;
     const offered = isClient ? offeredAt(graph, store, node.id, frame) : null;
+    // A pool's backlog is drawn in its queue's box; a queue's box draws its pools'.
+    const pools = [...queueOf].filter(([, queue]) => queue === node.id).map(([pool]) => pool);
+    const own = isClient || queueOf.has(node.id) ? null : backlogRow(node.id, null);
+    const queues = [own, ...pools.map((pool) => backlogRow(pool, pool))].filter(
+      (q): q is Queue => q !== null,
+    );
+    const lag = value("queue_lag_s");
     states.set(node.id, {
-      zone: isClient ? null : zoneName(graph, at(store.nodeColumn(row, "zone"), frame)),
+      zone: isClient ? null : zoneName(graph, value("zone")),
       rhoPercent: isClient ? null : rhoAt(store, row, frame),
       offeredPerSecond: offered,
       copies: copies.get(node.id) ?? null,
       busy: isClient || Number.isNaN(mean) ? null : { mean, peak: value("peak_rho") || mean },
-      queue:
-        isClient || !(peakBacklog > 0)
-          ? null
-          : { fill: (value("backlog") || 0) / peakBacklog, backlog: value("backlog") || 0 },
+      queues,
+      lagSeconds: Number.isNaN(lag) ? null : lag,
       load: offered !== null && peakOffered > 0 ? offered / peakOffered : null,
     });
   });

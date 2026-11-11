@@ -3,7 +3,7 @@ import { useContext } from "react";
 import { categoryClass } from "./categories";
 import type { Copies } from "./copies";
 import { FrameContext } from "./frame-context";
-import type { NodeData } from "./to-flow-elements";
+import type { NodeData, Queue } from "./to-flow-elements";
 
 // One node of the system (each bar's label is short, so a box drawn small still shows it: the busy
 // bar's percentage is utilisation, the load bar's rate what the client offers). The band across the top names its category in the category's colour
@@ -37,7 +37,8 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
           <BarRow label={rate(state.offeredPerSecond)} fill={state.load} className="load" />
         ) : (
           <BarRow
-            label={state?.busy ? `${Math.round(state.busy.mean * 100)}%` : "–"}
+            label={busyLabel(data.type, state?.busy?.mean ?? null, state?.lagSeconds ?? null)}
+            title={busyTitle(data.type, state?.busy?.mean ?? null)}
             fill={state?.busy?.mean ?? null}
             peak={state?.busy?.peak ?? null}
             ticks={[data.yellow, data.red]}
@@ -45,13 +46,19 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
             pill={zone}
           />
         )}
-        {state?.queue && (
+        {state?.queues.map((q) => (
           <BarRow
-            label={`${count(state.queue.backlog)} queued`}
-            fill={state.queue.fill}
+            key={q.consumer ?? "own"}
+            label={queueLabel(q, state.queues.length)}
+            title={
+              q.consumer === null
+                ? `${count(q.backlog)} waiting`
+                : `${count(q.backlog)} messages waiting for ${q.consumer}`
+            }
+            fill={q.fill}
             className="queue"
           />
-        )}
+        ))}
       </div>
     </div>
   );
@@ -65,6 +72,7 @@ const zoneWord = { green: "ok", yellow: "yellow", red: "red" } as const;
 // reads as motion; it shows nothing between buckets that the data does not have.
 function BarRow(props: {
   label: string;
+  title?: string;
   fill: number | null;
   className: string;
   peak?: number | null;
@@ -73,7 +81,7 @@ function BarRow(props: {
 }) {
   const percent = (v: number) => `${Math.min(Math.max(v, 0), 1) * 100}%`;
   return (
-    <div className={`bar-row ${props.className}`}>
+    <div className={`bar-row ${props.className}`} {...(props.title ? { title: props.title } : {})}>
       <div className="bar">
         {props.fill !== null && <div className="fill" style={{ width: percent(props.fill) }} />}
         {props.ticks?.map((t, i) =>
@@ -87,6 +95,35 @@ function BarRow(props: {
       )}
     </div>
   );
+}
+
+// A queue's busy bar is its broker's (accepting and handing out messages, about a million a second),
+// not how full it is: its waiting messages are the rows below. While messages wait a second or more,
+// its label is the queue's lag instead, the number a reader of a queue wants: how long a message
+// published now waits for a worker. The broker's share stays in the bar and the tooltip.
+function busyLabel(type: string, mean: number | null, lag: number | null): string {
+  if (mean === null) return "–";
+  if (type !== "message_queue") return `${Math.round(mean * 100)}%`;
+  return lag !== null && lag >= 1 ? `lag ${duration(lag)}` : `broker ${Math.round(mean * 100)}%`;
+}
+
+function busyTitle(type: string, mean: number | null): string {
+  if (mean === null) return "";
+  const percent = `${Math.round(mean * 100)}%`;
+  return type === "message_queue" ? `broker ${percent} busy` : `${percent} busy`;
+}
+
+// "2.92M waiting"; with several consumer groups, each row names its pool instead.
+function queueLabel(q: Queue, rows: number): string {
+  if (rows > 1 && q.consumer !== null) return `${count(q.backlog)} · ${q.consumer}`;
+  return `${count(q.backlog)} waiting`;
+}
+
+// 45 → "45s", 225 → "3.8m", 7560 → "2.1h".
+function duration(seconds: number): string {
+  if (seconds < 90) return `${Math.round(seconds)}s`;
+  if (seconds < 5400) return `${(seconds / 60).toFixed(1)}m`;
+  return `${(seconds / 3600).toFixed(1)}h`;
 }
 
 // 2923830 → "2.92M", 50 → "50".

@@ -111,9 +111,11 @@ describe("the diagram's elements, from the graph and the frame", () => {
     expect(nodes.some((n) => n.type === "datacenter")).toBe(false);
   });
 
-  it("ends every link with an arrowhead at the box it sends to", async () => {
+  it("gives every link one arrowhead, at its callee (a queue, for the link a pool pulls from)", async () => {
     const { edges } = toFlowElements(youtube, await layoutGraph(youtube), null);
-    for (const edge of edges) expect(edge.markerEnd).toMatchObject({ type: "arrowclosed" });
+    for (const edge of edges) {
+      expect([edge.markerEnd, edge.markerStart].filter((m) => m !== undefined)).toHaveLength(1);
+    }
   });
 
   it("marks a bandwidth link as a pipe and a plain link not", async () => {
