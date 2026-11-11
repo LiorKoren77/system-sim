@@ -40,7 +40,7 @@ describe("the shipped scenarios the precompute runs", () => {
     expect(scenarios.filter((s) => s.kind === "run")).toHaveLength(7);
   });
 
-  it("runs a day for two days in 2 min buckets, and a run as it is", async () => {
+  it("runs a day for two days in 1 min buckets, and a run as it is", async () => {
     const scenarios = await findScenarios(repoRoot);
     const byId = new Map(scenarios.map((s) => [s.id, s]));
     const day = byId.get("book/chat-system");
@@ -53,7 +53,7 @@ describe("the shipped scenarios the precompute runs", () => {
       "--days",
       "2",
       "--every",
-      "2m",
+      "1m",
     ]);
     expect(simsysArgs(run)).toEqual(["run", "scenarios/tutorial/hello/scenario.yaml", "--stream"]);
   });

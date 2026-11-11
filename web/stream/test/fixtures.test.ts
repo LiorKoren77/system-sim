@@ -48,7 +48,7 @@ describe("the committed fixtures", () => {
     const store = await fixture("book-url-shortener");
     expect(store.dataset?.kind).toBe("day");
     expect(store.dataset?.loops).toBe(true);
-    expect(store.frameCount).toBe(720);
+    expect(store.frameCount).toBe(1440); // a day of 1 min frames
     expect(store.times()[0]).toBe(86400);
     // The loop's seam: the first frame's previous backlog is the last frame's, which the seam
     // check made equal to the backlog at 24:00.

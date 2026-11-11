@@ -89,7 +89,7 @@ describe("the page", () => {
     await userEvent.keyboard("{Shift>}{ArrowRight}{/Shift}");
     expect(screen.getByText("01:00")).toBeVisible();
     await userEvent.keyboard("{ArrowLeft}");
-    expect(screen.getByText("00:58")).toBeVisible();
+    expect(screen.getByText("00:59")).toBeVisible();
     await userEvent.keyboard(" ");
     expect(screen.getByRole("button", { name: "Pause" })).toBeVisible();
     act(() => undefined);

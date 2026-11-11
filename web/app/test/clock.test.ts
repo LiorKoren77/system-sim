@@ -6,10 +6,10 @@ const run = { kind: "run", window: { from_s: 0, to_s: 7200 } } as const;
 
 describe("the clock the slider shows", () => {
   it("reads a day's frames as the time of day, from midnight", () => {
-    // A frame is a 2 min bucket; frame k starts at 86400 + 120 k.
+    // A frame is a 1 min bucket; frame k starts at 86400 + 60 k.
     expect(clockLabel(86400, day)).toBe("00:00");
-    expect(clockLabel(86400 + 120, day)).toBe("00:02");
-    expect(clockLabel(86400 + 719 * 120, day)).toBe("23:58");
+    expect(clockLabel(86400 + 60, day)).toBe("00:01");
+    expect(clockLabel(86400 + 1439 * 60, day)).toBe("23:59");
   });
 
   it("reads a day that does not repeat, kept whole, as day and time", () => {

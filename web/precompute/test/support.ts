@@ -96,8 +96,8 @@ export function frame(t_s: number, backlog: number | null, peakBacklog = 5000): 
   };
 }
 
-// The frames of a `--days 2` run in 2 min buckets: 1440, each at its t_s, the service's backlog
+// The frames of a `--days 2` run in 1 min buckets: 2880, each at its t_s, the service's backlog
 // `backlogAt(k)` in frame k.
 export function twoDays(backlogAt: (k: number) => number | null = () => 0): FrameLine[] {
-  return Array.from({ length: 1440 }, (_, k) => frame(k * 120, backlogAt(k)));
+  return Array.from({ length: 2880 }, (_, k) => frame(k * 60, backlogAt(k)));
 }
