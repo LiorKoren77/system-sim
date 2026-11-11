@@ -725,6 +725,22 @@ main h1 .chapter {
 }
 
 /* ---- the zone strip ---- */
+.strip-toggle {
+  padding: 2px 16px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.strip-toggle:hover {
+  color: var(--ink);
+}
+
 .zone-strip {
   display: grid;
   grid-template-columns: var(--time-columns);

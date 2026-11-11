@@ -1,7 +1,13 @@
 import type { DatasetStore, Diagram as DiagramFile, GraphLine } from "@simsys/stream";
-import { ReactFlow, type EdgeTypes, type NodeTypes } from "@xyflow/react";
+import {
+  Controls,
+  ReactFlow,
+  type EdgeTypes,
+  type NodeTypes,
+  type ReactFlowInstance,
+} from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { layoutGraph, type Layout } from "./layout";
 import { DatacenterBox } from "./DatacenterBox";
 import { NodeCard } from "./NodeCard";
@@ -10,6 +16,10 @@ import { peaksOf } from "./bars";
 import { busiestFlow, flowDuration, linkFlowsAt } from "./flow";
 import { FlowContext, FrameContext } from "./frame-context";
 import { nodeStatesAt, pipeZonesAt, toFlowElements, withPipeZones } from "./to-flow-elements";
+
+// The margin a fit leaves around the system, as a share of the area: React Flow's default is 0.1,
+// and every pixel of margin is taken from the boxes' size.
+const FIT = { padding: 0.03 } as const;
 
 // A module constant: React Flow warns when the node types object changes between renders.
 const nodeTypes: NodeTypes = { system: NodeCard, datacenter: DatacenterBox };
@@ -31,6 +41,11 @@ function layoutOf(graph: GraphLine, diagram: DiagramFile | undefined): Promise<L
 // The system's diagram at the slider's frame, drawn by React Flow (pan and zoom; nodes stay where
 // the layout put them). Clicking a node, or a link with a bandwidth, selects it for the charts;
 // clicking the background clears the selection.
+//
+// The view: the whole system is fitted into the diagram's area, and fitted again when that area
+// changes (a pane hidden, the splitter dragged, the window resized), so room given to the diagram
+// makes the boxes larger. Once the viewer has zoomed or panned (the wheel, a drag, the + and −
+// buttons) the view is theirs and is left alone, until the fit button hands it back.
 export function Diagram(props: {
   store: DatasetStore;
   frame: number;
@@ -52,6 +67,23 @@ export function Diagram(props: {
       live = false;
     };
   }, [graph, diagramFile]);
+  const flow = useRef<ReactFlowInstance | null>(null);
+  const area = useRef<HTMLDivElement>(null);
+  const viewIsTheViewers = useRef(false);
+  const ready = layout !== null;
+  useEffect(() => {
+    const element = area.current;
+    if (element === null) return;
+    // ResizeObserver also reports once when it starts observing: harmless, the view is fitted.
+    const observer = new ResizeObserver(() => {
+      if (!viewIsTheViewers.current) void flow.current?.fitView(FIT);
+    });
+    observer.observe(element);
+    return () => {
+      observer.disconnect();
+    };
+    // The area's div exists only once there is a layout to draw: observe it from then on.
+  }, [ready]);
   const current = layout !== null && layout.graph === graph ? layout.layout : null;
   // The structure: new objects only when the layout or the selection changes, never per frame.
   const structure = useMemo(
@@ -102,7 +134,7 @@ export function Diagram(props: {
   return (
     <FrameContext value={states}>
       <FlowContext value={durations}>
-        <div className={playing ? "diagram playing" : "diagram"}>
+        <div ref={area} className={playing ? "diagram playing" : "diagram"}>
           <ReactFlow
             nodes={structure.nodes}
             edges={edges}
@@ -112,7 +144,18 @@ export function Diagram(props: {
             nodesConnectable={false}
             elementsSelectable
             fitView
+            fitViewOptions={FIT}
             minZoom={0.2}
+            maxZoom={4}
+            colorMode="dark"
+            onInit={(instance) => {
+              flow.current = instance;
+            }}
+            // React Flow passes the event that moved the view, null for a move the code made
+            // (fitView): only the viewer's own zoom or pan takes the view from the automatic fit.
+            onMoveEnd={(event) => {
+              if (event !== null) viewIsTheViewers.current = true;
+            }}
             onNodeClick={(_, node) => {
               if (node.type === "system") onSelect(node.id);
             }}
@@ -125,7 +168,22 @@ export function Diagram(props: {
             onPaneClick={() => {
               onSelect(null);
             }}
-          />
+          >
+            {/* +, − and fit. The lock button is left out: nothing here is draggable to lock. */}
+            <Controls
+              showInteractive={false}
+              fitViewOptions={FIT}
+              onZoomIn={() => {
+                viewIsTheViewers.current = true;
+              }}
+              onZoomOut={() => {
+                viewIsTheViewers.current = true;
+              }}
+              onFitView={() => {
+                viewIsTheViewers.current = false;
+              }}
+            />
+          </ReactFlow>
         </div>
       </FlowContext>
     </FrameContext>
