@@ -327,6 +327,23 @@ TEST_CASE("a ramp is kept if it ends within the first day, which is a warm-up an
   CHECK(refusal_of(s, 2) == "--days: client 'users' ramps over 25h, longer than a day");
 }
 
+TEST_CASE("a spike longer than a day is refused: it would overlap its own copy the next day") {
+  // Two copies active at once would multiply their factors, past the bound the loader checks on
+  // the file's spikes (it never sees the copies).
+  auto s = a_day();
+  s.nodes[0].workload->curve.spikes[0].duration = 24h;
+  CHECK(simsys::session::repeat_days(s, 2).has_value());
+  s.nodes[0].workload->curve.spikes[0].duration = 30h;
+  CHECK(refusal_of(s, 2) == "--days: client 'users' has a spike of 30h, longer than a day");
+}
+
+TEST_CASE("a fault longer than a day is refused: it would overlap its own copy the next day") {
+  // Two node_downs of some replicas at once would take down the sum, which the file never does.
+  auto s = a_day();
+  s.faults[1].duration = 25h;
+  CHECK(refusal_of(s, 2) == "--days: the node_down of 's' at 9h lasts 25h, longer than a day");
+}
+
 TEST_CASE("the number of days is between 1 and 7") {
   CHECK(refusal_of(a_day(), 0) == "--days must be between 1 and 7");
   CHECK(refusal_of(a_day(), 8) == "--days must be between 1 and 7");
