@@ -1,0 +1,24 @@
+# How the web app draws this system (web/precompute checks it against the scenario's graph; simsys
+# itself never reads it). Laid out after the book's figure 9-2: the crawl runs left to right along
+# the middle row, and the URLs it discovers come back right to left along the bottom row, up into
+# the frontier: the crawler's loop.
+#
+# cells: [column, row] of each box on a grid; every node must have one.
+# sides: which sides of its two boxes a link joins, [source side, target side], for the links whose
+#        boxes do not face each other the way the line should run (the others join facing sides).
+cells:
+  dns: [2, 0]
+  dns_upstream: [3, 0]
+  seeds: [0, 1]
+  frontier: [1, 1]
+  downloader: [2, 1]
+  parser: [3, 1]
+  content_seen: [4, 1]
+  internet: [2, 2]
+  content_store: [4, 2]
+  url_seen: [1, 3]
+  url_filter: [2, 3]
+  link_extractor: [3, 3]
+sides:
+  link_extractor -> url_filter: [left, right]
+  url_filter -> url_seen: [left, right]

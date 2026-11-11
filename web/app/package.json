@@ -1,0 +1,25 @@
+{
+  "name": "@simsys/app",
+  "private": true,
+  "description": "The page: pick a shipped scenario and watch its day.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@simsys/stream": "*",
+    "@xyflow/react": "^12.12.1",
+    "elkjs": "^0.12.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "uplot": "^1.6.32"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "vite": "^8.3.7"
+  }
+}

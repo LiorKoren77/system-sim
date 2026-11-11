@@ -1,0 +1,141 @@
+{
+  "format_version": 1,
+  "scenario": "lab-consistent-hashing",
+  "datacenters": [{ "name": "main" }],
+  "zones": ["green", "yellow", "red"],
+  "nodes": [
+    {
+      "id": "clients",
+      "type": "client",
+      "datacenter": "main",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": null,
+      "unit": null,
+      "yellow": null,
+      "red": null,
+      "queue_limit": null
+    },
+    {
+      "id": "ring",
+      "type": "load_balancer",
+      "datacenter": "main",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 2e5,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "cache_servers",
+      "type": "cache",
+      "datacenter": "main",
+      "replicas": 4,
+      "shards": null,
+      "capacity_per_s": 60000,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "db",
+      "type": "sql_db",
+      "datacenter": "main",
+      "replicas": 2,
+      "shards": null,
+      "capacity_per_s": 10000,
+      "unit": "units",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    }
+  ],
+  "links": [
+    {
+      "from": "clients",
+      "to": "ring",
+      "direction": "inout",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "ring",
+      "to": "cache_servers",
+      "direction": "inout",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "cache_servers",
+      "to": "db",
+      "direction": "inout",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    }
+  ],
+  "ops": [
+    { "client": "clients", "op": "get", "share": 0.9 },
+    { "client": "clients", "op": "set", "share": 0.1 }
+  ],
+  "slos": [
+    { "metric": "utilization", "node": "cache_servers", "op": null, "max": 0.85, "over_s": null },
+    { "metric": "utilization", "node": "db", "op": null, "max": 0.7, "over_s": null }
+  ],
+  "faults": [
+    {
+      "kind": "node_down",
+      "target": "cache_servers",
+      "at_s": 600,
+      "for_s": 300,
+      "replicas": 1,
+      "primary": false
+    }
+  ],
+  "node_columns": [
+    "demand_per_s",
+    "drain_per_s",
+    "dropped_per_s",
+    "rejected_per_s",
+    "backlog",
+    "peak_backlog",
+    "mean_rho",
+    "peak_rho",
+    "zone",
+    "red_s",
+    "latency_ms",
+    "queue_lag_s",
+    "connections",
+    "dead_lettered_per_s",
+    "deduplicated_per_s"
+  ],
+  "link_columns": [
+    "demand_per_s",
+    "drain_per_s",
+    "dropped_per_s",
+    "backlog",
+    "peak_backlog",
+    "mean_rho",
+    "peak_rho",
+    "zone",
+    "red_s",
+    "latency_ms"
+  ],
+  "op_columns": [
+    "offered_per_s",
+    "attempts_per_s",
+    "answered_per_s",
+    "timed_out_per_s",
+    "mean_ms",
+    "p99_ms"
+  ],
+  "estimated_columns": ["p99_ms"]
+}

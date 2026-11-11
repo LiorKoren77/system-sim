@@ -1,0 +1,396 @@
+{
+  "format_version": 1,
+  "scenario": "youtube",
+  "datacenters": [{ "name": "us-east" }, { "name": "eu-west" }],
+  "zones": ["green", "yellow", "red"],
+  "nodes": [
+    {
+      "id": "viewers_us",
+      "type": "client",
+      "datacenter": "us-east",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": null,
+      "unit": null,
+      "yellow": null,
+      "red": null,
+      "queue_limit": null
+    },
+    {
+      "id": "viewers_eu",
+      "type": "client",
+      "datacenter": "eu-west",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": null,
+      "unit": null,
+      "yellow": null,
+      "red": null,
+      "queue_limit": null
+    },
+    {
+      "id": "cdn_us",
+      "type": "cdn",
+      "datacenter": "us-east",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 1e5,
+      "unit": "MB",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "cdn_eu",
+      "type": "cdn",
+      "datacenter": "eu-west",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 50000,
+      "unit": "MB",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "lb",
+      "type": "load_balancer",
+      "datacenter": "us-east",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 1e5,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "api",
+      "type": "service",
+      "datacenter": "us-east",
+      "replicas": 6,
+      "shards": null,
+      "capacity_per_s": 12000,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "metadata_cache",
+      "type": "cache",
+      "datacenter": "us-east",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 1e5,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "metadata_db",
+      "type": "sql_db",
+      "datacenter": "us-east",
+      "replicas": 3,
+      "shards": null,
+      "capacity_per_s": 9000,
+      "unit": "units",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "original_store",
+      "type": "blob_store",
+      "datacenter": "us-east",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 5000,
+      "unit": "MB",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "transcode_q",
+      "type": "message_queue",
+      "datacenter": "us-east",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 1e6,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "transcoders",
+      "type": "worker_pool",
+      "datacenter": "us-east",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 10,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 6048000,
+      "workers": 600
+    },
+    {
+      "id": "transcoded_store",
+      "type": "blob_store",
+      "datacenter": "us-east",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 20000,
+      "unit": "MB",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "completion_q",
+      "type": "message_queue",
+      "datacenter": "us-east",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 1e6,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 1000
+    },
+    {
+      "id": "completion_handler",
+      "type": "worker_pool",
+      "datacenter": "us-east",
+      "replicas": 1,
+      "shards": null,
+      "capacity_per_s": 800,
+      "unit": "requests",
+      "yellow": 0.7,
+      "red": 0.9,
+      "queue_limit": 483840000,
+      "workers": 4
+    }
+  ],
+  "links": [
+    {
+      "from": "viewers_us",
+      "to": "cdn_us",
+      "direction": "inout",
+      "ops": ["stream"],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "viewers_eu",
+      "to": "cdn_eu",
+      "direction": "inout",
+      "ops": ["stream"],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "cdn_us",
+      "to": "transcoded_store",
+      "direction": "inout",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "cdn_eu",
+      "to": "transcoded_store",
+      "direction": "inout",
+      "ops": [],
+      "one_way_s": 0.075,
+      "bandwidth_mb_s": 5000,
+      "pipe_row": 0
+    },
+    {
+      "from": "viewers_us",
+      "to": "lb",
+      "direction": "inout",
+      "ops": ["metadata", "upload_meta"],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "viewers_eu",
+      "to": "lb",
+      "direction": "inout",
+      "ops": ["metadata", "upload_meta"],
+      "one_way_s": 0.075,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "lb",
+      "to": "api",
+      "direction": "inout",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "api",
+      "to": "metadata_cache",
+      "direction": "inout",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "api",
+      "to": "metadata_db",
+      "direction": "inout",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "viewers_us",
+      "to": "original_store",
+      "direction": "out",
+      "ops": ["upload"],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "viewers_eu",
+      "to": "original_store",
+      "direction": "out",
+      "ops": ["upload"],
+      "one_way_s": 0.075,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "original_store",
+      "to": "transcode_q",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "transcode_q",
+      "to": "transcoders",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "transcoders",
+      "to": "transcoded_store",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "transcoders",
+      "to": "completion_q",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "completion_q",
+      "to": "completion_handler",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "completion_handler",
+      "to": "metadata_db",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    },
+    {
+      "from": "completion_handler",
+      "to": "metadata_cache",
+      "direction": "out",
+      "ops": [],
+      "one_way_s": 0.00025,
+      "bandwidth_mb_s": null,
+      "pipe_row": null
+    }
+  ],
+  "ops": [
+    { "client": "viewers_us", "op": "metadata", "share": 0.08 },
+    { "client": "viewers_us", "op": "stream", "share": 0.88 },
+    { "client": "viewers_us", "op": "upload", "share": 0.02 },
+    { "client": "viewers_us", "op": "upload_meta", "share": 0.02 },
+    { "client": "viewers_eu", "op": "metadata", "share": 0.08 },
+    { "client": "viewers_eu", "op": "stream", "share": 0.88 },
+    { "client": "viewers_eu", "op": "upload", "share": 0.02 },
+    { "client": "viewers_eu", "op": "upload_meta", "share": 0.02 }
+  ],
+  "slos": [
+    { "metric": "p99_latency", "node": "viewers_eu", "op": "stream", "max": 2, "over_s": null },
+    { "metric": "queue_lag", "node": "transcode_q", "op": null, "max": 1800, "over_s": null },
+    { "metric": "utilization", "node": "cdn_us", "op": null, "max": 0.8, "over_s": 3600 }
+  ],
+  "faults": [],
+  "node_columns": [
+    "demand_per_s",
+    "drain_per_s",
+    "dropped_per_s",
+    "rejected_per_s",
+    "backlog",
+    "peak_backlog",
+    "mean_rho",
+    "peak_rho",
+    "zone",
+    "red_s",
+    "latency_ms",
+    "queue_lag_s",
+    "connections",
+    "dead_lettered_per_s",
+    "deduplicated_per_s"
+  ],
+  "link_columns": [
+    "demand_per_s",
+    "drain_per_s",
+    "dropped_per_s",
+    "backlog",
+    "peak_backlog",
+    "mean_rho",
+    "peak_rho",
+    "zone",
+    "red_s",
+    "latency_ms"
+  ],
+  "op_columns": [
+    "offered_per_s",
+    "attempts_per_s",
+    "answered_per_s",
+    "timed_out_per_s",
+    "mean_ms",
+    "p99_ms"
+  ],
+  "estimated_columns": ["p99_ms"]
+}

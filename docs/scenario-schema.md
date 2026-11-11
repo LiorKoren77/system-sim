@@ -1,4 +1,4 @@
-# Scenario schema v1.7 (phase 5a)
+# Scenario schema v1.8 (phase 5b)
 
 v1 was fitted to the 12 book and lab drafts plus the first tutorial; v1.1 wrote down the
 rules the phase 1 loader enforces; v1.2 added phase 2a's rate curves, balancers, limiters and
@@ -9,7 +9,9 @@ scenario key's meaning; it adds to the command line (the sweep's `:log`, grid, `
 `--slos`, `estimate --at`) and changes what `estimate` reports (see "New in v1.6": two JSON changes
 can break a reader). **v1.7** (phase 5a) changes no scenario key either: it adds the output a web
 frontend reads, `run --stream` and `explain --report json`, and names the output contract's version,
-`format_version`, first in every JSON document (see "New in v1.7"). The language is as phase 3 reads it: the loader (`src/config/`, one implementation
+`format_version`, first in every JSON document (see "New in v1.7"). **v1.8** (phase 5b) changes no
+scenario key either: it adds `run --days N`, three keys of the resolved graph, and the datasets the
+web app plays, with a scenario's optional `diagram.yaml` (see "New in v1.8"). The language is as phase 3 reads it: the loader (`src/config/`, one implementation
 unit per concern: `header.cpp`, `nodes.cpp`, `steps.cpp`, `workload.cpp`, `links.cpp`,
 `slos.cpp`, `faults.cpp`, `overrides.cpp`), the graph builder (`src/engine/graph.cpp`), the node
 behaviours (`src/engine/behaviours.cppm`), the fault schedule and the fault log
@@ -21,6 +23,18 @@ what each ignores, are spec §18 (phase 2b), §19 (phase 2c) and §20 (phase 3)
 (`docs/superpowers/specs/2026-10-27-system-sim-design.md`), with the phase 3 design in
 `docs/superpowers/specs/2026-10-30-phase3-faults-gateways-design.md`. Where a phase 3 rule differs
 from what that design first said, this file and spec §20 have the rule as built.
+
+New in v1.8 (phase 5b; design `docs/superpowers/specs/2026-11-10-phase5b-web-mvp-design.md`,
+rules as built in spec §23):
+
+- [`simsys run --days N`](#command-line-simsys-run---days-phase-5b): a 24 h scenario's day lived N
+  times (1 to 7), its spikes and scripted faults every day, the report on the last day; the stream's
+  `run` line gains `days` (an added key: `format_version` stays 1);
+- [`explain --report json`](#command-line-simsys-explain---report-json-phase-5a) and the stream's
+  `graph` line gain a client's `spikes` and a fault's `replicas` and `primary` (added keys);
+- [the web app's datasets](#the-web-apps-datasets-phase-5b): the stream behind a `dataset` line,
+  cut to the window the page plays, the seam check that lets a day loop, `index.json`, and a
+  scenario's optional `diagram.yaml` (where its boxes go on the page).
 
 New in v1.7 (phase 5a; design `docs/superpowers/specs/2026-11-10-phase5a-streaming-design.md`,
 rules as built in spec §22):
@@ -2332,6 +2346,104 @@ decimal
 criterion is "back where it would have been", not "the SLOs pass again": an SLO with room to spare
 passes while the backlog still drains, and one that fails without the fault never passes.
 
+## Command line: `simsys run --days` (phase 5b)
+
+```
+simsys run scenario.yaml --days N [--stream [--points N | --every <duration>]] [--report table|json] [--seed N]
+```
+
+A day of a 24 h scenario is the unit the book reasons in (peak QPS, the daily wave). `--days N`
+lives that day N times in a row, as the same system would:
+
+- **The run lasts N × 24 h.** Each client's `rate.spikes` entry and each scripted fault recurs at
+  `at + k · 24h` for k = 1 … N − 1, day by day, each day's in the file's order. A `wave` repeats by
+  itself, since its period divides the day; `noise` draws anew each day, as days do.
+- **The report observes the last day.** The warmup becomes (N − 1) × 24 h, replacing the
+  scenario's own: by then the queues and connections are as full as that day gets them. A windowed
+  SLO's windows start at a midnight; the table names the worst one's start on the run's clock
+  (`(worst 1h from 38h)` is 14:00 of day 2). Fault blocks are judged in the warmup too ([Faults](#faults)),
+  so the report has a block for every day's copy of a fault; a reader of the last day keeps those
+  whose `at_s` falls in it, as the web app does.
+- **`--days 1`** is the plain run: the same report and the same stream, but for the `run` line's
+  `"days": 1`.
+- **The stream** says so: the `run` line gains `"days": N`; `duration_s` and `warmup_s` are the
+  run's (172800 and 86400 for two days), and the `graph`'s `faults` list every copy.
+- With `--replications`, each replication lives the N days.
+
+**Refused** (on stderr, or as the stream's `error` line):
+
+| case | message |
+|---|---|
+| N outside 1 to 7 | `--days must be between 1 and 7` (the command line's fault: the error line's `file` is `null`) |
+| a scenario not 24 h long | `--days needs a 24h scenario (this one runs 1m)` |
+| with `--duration` | `--days sets the duration; drop --duration` |
+| a `wave` whose period does not divide 24 h | `--days: client 'users' has a wave period of 168h, which does not divide the day` |
+| a `rate.points` curve (held flat after its last point, so not periodic) | `--days: client 'users' rate.points is not periodic` |
+| a `ramp` longer than a day | `--days: client 'users' ramps over 36h, longer than a day` |
+| a spike longer than a day (it would overlap its own copy the next day, and the two factors multiply) | `--days: client 'users' has a spike of 30h, longer than a day` |
+| a fault longer than a day (likewise: two partial `node_down`s would add up) | `--days: the node_down of 's' at 9h lasts 25h, longer than a day` |
+
+Where: `session::repeat_days` turns the scenario into the N-day one before the graph is built, so
+the engine and the loader are untouched and `explain` of the result is what runs.
+
+## The web app's datasets (phase 5b)
+
+`web/`'s precompute (`npm run precompute`) runs every shipped scenario through `simsys run
+--stream` and writes what the page plays to `web/app/public/datasets/`: a gzipped dataset per
+scenario and an `index.json`. A 24 h scenario is a **day**, run `--days 2 --every 1m`; any other is
+a **run**, streamed as it is (`--points 720`, the default).
+
+**A dataset** is a stream (one JSON object per line, gzipped, mtime 0) with:
+
+1. a first line of type `dataset`, which a stream reader ignores ([the output
+   contract](#the-output-contract), rule 1);
+2. the stream's `run` and `graph` lines, unchanged;
+3. the frames of the **window** only, their `t_s` unchanged (run time);
+4. the `summary`, unchanged (for a day, the report of day 2, the one the page plays).
+
+| `dataset` key | meaning |
+|---|---|
+| `dataset_version` | the dataset line's version, 1; the other lines keep the stream's `format_version` |
+| `id` | the scenario's path under `scenarios/` without `/scenario.yaml`, `book/chat-system`; the file is the id with `/` → `-`, `book-chat-system.ndjson.gz` |
+| `title`, `chapter` | from the scenario README's heading; `null` if absent |
+| `kind` | `day` or `run` |
+| `window` | `from_s`, `to_s`: the run time the frames cover; day 2 (86400–172800) for a day that repeats, the whole run otherwise |
+| `loops` | `true` for a day whose seam check passed: the page plays it round and round |
+| `seam` | a day's check: `status` (`repeats` or `drifts`) and `worst` (`row`, `id`, `column`, `a`, `b`, `rel`: the column that differed most, or `null`); `null` for a run |
+| `source` | `scenario` and `args`: how to make it again |
+| `diagram` | the scenario's `diagram.yaml`, when it has one (below) |
+
+**The seam check.** The engine is deterministic and, under `--days`, every day's input is the same;
+so if what the system holds at 48:00 equals what it held at 24:00, day 3 replays day 2 and so does
+every later day: day 2 is the periodic steady state, and looping it is faithful. The check compares
+the frame ending at 24:00 (`a`, day 1's last) with the one ending at 48:00 (`b`), every node, link
+and op column: both `null`, or `|a − b| ≤ 1e-3 · max(|a|, |b|) + 1e-6 · M`, M the column's largest
+absolute value on day 2 for that row (the relative term absorbs the six significant digits; the
+absolute term keeps 0.0001 against 0 from counting as drift on a node that queues thousands). Any
+column outside it: `drifts`, and the dataset keeps both days and plays them once. A frame is not the
+whole engine state (a cache's warm-up is not in it), so the check is what a reader can see, not a
+proof. All seven shipped days repeat (2026-11-11).
+
+**`index.json`**, sorted by `id`: `index_version` 1, `format_version` 1, `simsys_commit` (`git
+rev-parse --short HEAD` of the sources, `-dirty` for a changed tree; in the index, not the
+datasets, so a dataset's bytes depend only on simsys's output), and `datasets`: per dataset `id`,
+`file`, `bytes`, `title`, `chapter`, `kind`, `duration_s`, `loops`, `seam` (its `status`, or
+`null`), `frames`, `slo_passed`.
+
+**`diagram.yaml`** (optional, beside `scenario.yaml`): where the page draws the boxes, which ELK
+lays out by itself otherwise. Two keys, both optional. The precompute refuses an id or a link the
+graph does not have (`cells: no node 'x' in the scenario`), two boxes in one cell, and a `cells`
+that leaves a node out (`cells place 11 of 12 nodes; also place: dns`): a diagram is placed by hand
+or by ELK, not half and half.
+
+```yaml
+cells:            # every node on a [column, row] of a grid, or none
+  frontier: [1, 1]
+  downloader: [2, 1]
+sides:            # which sides chosen links leave and enter: left, right, top, bottom
+  "link_extractor -> url_filter": [left, right]
+```
+
 ## Command line: `simsys run --stream` (phase 5a)
 
 ```
@@ -2449,11 +2561,11 @@ YAML or re-derives a default). `format_version` first, then:
 | `scenario` | the name |
 | `datacenters` | objects, `{"name": ...}`; the latencies between them are on the links |
 | `zones` | `["green", "yellow", "red"]`: the names of a frame's `zone` numbers |
-| `nodes` | in the engine's order (every frame's): `id`, `type`, `datacenter`, `replicas` (a kv_cluster's machines), `shards` (`null` unless sharded), `capacity_per_s` (the total over replicas and shards, the number explain's check line uses), `unit` (`requests`, `units` for a node with an op that costs other than 1, `MB` for a byte-sized node, `replica-requests` for a kv_cluster), `yellow`, `red`, `queue_limit`; all `null` on a client but the first four; a worker pool's `workers`, a websocket gateway's `connection_cap` |
+| `nodes` | in the engine's order (every frame's): `id`, `type`, `datacenter`, `replicas` (a kv_cluster's machines), `shards` (`null` unless sharded), `capacity_per_s` (the total over replicas and shards, the number explain's check line uses), `unit` (`requests`, `units` for a node with an op that costs other than 1, `MB` for a byte-sized node, `replica-requests` for a kv_cluster), `yellow`, `red`, `queue_limit`; all `null` on a client but the first four; a worker pool's `workers`, a websocket gateway's `connection_cap`; a client's `spikes` (its `rate.spikes`: `at_s`, `for_s`, `factor`; phase 5b) |
 | `links` | `from`, `to`, `direction`, `ops` (empty: every op), `one_way_s`, `bandwidth_mb_s` (`null` without a bandwidth), `pipe_row` (the link's index among a frame's `links` rows, which are the bandwidth links only; `null` without a bandwidth) |
 | `ops` | `client`, `op`, `share`: clients in node order, each client's ops by name (every frame's op rows) |
 | `slos` | `metric`, `node`, `op`, `max` (seconds for a time metric), `over_s` |
-| `faults` | `kind`, `target` (a node, or a datacenter for `dc_down`), `at_s`, `for_s` (`null` for an instant `cache_flush`) |
+| `faults` | `kind`, `target` (a node, or a datacenter for `dc_down`), `at_s`, `for_s` (`null` for an instant `cache_flush`), `replicas` (how many copies a `node_down` takes; `null`: every copy, and for every other kind) and `primary` (a `node_down` of a `sql_db`'s primary, `replicas: primary`), phase 5b |
 | `node_columns`, `link_columns`, `op_columns`, `estimated_columns` | the names of a frame's numbers, in order |
 
 ## Command line: `simsys estimate --at` (phase 4a)

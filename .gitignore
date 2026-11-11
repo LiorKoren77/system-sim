@@ -5,3 +5,7 @@ compile_commands.json
 *.jsonl
 .vscode/
 .idea/
+web/node_modules/
+web/*/node_modules/
+web/*/dist/
+web/app/public/datasets/

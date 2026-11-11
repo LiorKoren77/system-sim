@@ -844,9 +844,11 @@ struct Frame {
 // newline.
 
 // The run's header: the version of the output contract, the scenario, its seed, its length, step
-// and warmup in seconds, a bucket's length (`steps_per_bucket` steps) and how many frames follow.
+// and warmup in seconds, a bucket's length (`steps_per_bucket` steps) and how many frames follow;
+// last, `days` when the run is `run --days`' (phase 5b; an added key: absent otherwise).
 [[nodiscard]] std::string render_run_line(const graph::Graph& g, std::size_t steps_per_bucket,
-                                          std::size_t frames);
+                                          std::size_t frames,
+                                          std::optional<int> days = std::nullopt);
 // The resolved graph (render_graph_json's keys), at revision 0, the scenario as loaded: a later
 // change of topology mid-run would send another `graph` with the next revision.
 [[nodiscard]] std::string render_graph_line(const graph::Graph& g);
