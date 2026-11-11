@@ -37,7 +37,7 @@ describe("a link a worker pool pulls from", () => {
 
 // hello's stream with its graph replaced by publisher → queue q → pool w, w queueing `backlog`
 // messages and q lagging `lag` seconds in the one frame.
-async function queueAndPool(backlog: number, lag: number): Promise<DatasetStore> {
+async function queueAndPool(backlog: number, lag: number, lagSlo?: number): Promise<DatasetStore> {
   const graph = JSON.parse(helloLines[1] ?? "") as Record<string, unknown>;
   const node = (id: string, type: string) => ({
     id,
@@ -62,6 +62,10 @@ async function queueAndPool(backlog: number, lag: number): Promise<DatasetStore>
   });
   graph.nodes = [node("pub", "client"), node("q", "message_queue"), node("w", "worker_pool")];
   graph.links = [link("pub", "q"), link("q", "w")];
+  graph.slos =
+    lagSlo === undefined
+      ? []
+      : [{ metric: "queue_lag", node: "q", op: null, max: lagSlo, over_s: null }];
   const row = (b: number, l: number | null) => [
     500,
     500,
@@ -122,5 +126,26 @@ describe("the messages a pool has not read yet", () => {
     const graph = store.graph;
     if (!graph) throw new Error("no graph");
     expect(nodeStatesAt(graph, store, 0).get("q")?.queues).toEqual([]);
+  });
+});
+
+describe("the colour of a queue's waiting messages", () => {
+  it("follows the queue's lag against its SLO", async () => {
+    const store = await queueAndPool(2_900_000, 225, 300); // 75% of 5 min
+    const graph = store.graph;
+    if (!graph) throw new Error("no graph");
+    const q = nodeStatesAt(graph, store, 0).get("q");
+    expect(q?.lagZone).toBe("yellow");
+    expect(q?.queues[0]?.zone).toBe("yellow");
+  });
+
+  it("stays uncoloured for a queue no SLO judges, far from its room", async () => {
+    const store = await queueAndPool(750, 225);
+    const graph = store.graph;
+    if (!graph) throw new Error("no graph");
+    const q = nodeStatesAt(graph, store, 0).get("q");
+    expect(q?.lagZone).toBeNull();
+    // 750 of the pool's room of 1000, 75%: yellow for the room, whatever the lag.
+    expect(q?.queues[0]?.zone).toBe("yellow");
   });
 });
