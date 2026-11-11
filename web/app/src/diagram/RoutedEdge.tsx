@@ -11,7 +11,7 @@ export type RoutedEdgeData = { readonly index: number; readonly points?: readonl
 // link carries in the frame (flow.ts), read from a context so that a new frame changes only the
 // dashes' speed, not the edge React Flow holds.
 export function RoutedEdge(props: EdgeProps<Edge<RoutedEdgeData>>) {
-  const { id, data, markerEnd, style } = props;
+  const { id, data, markerEnd, markerStart, style } = props;
   const duration = useContext(FlowContext)[data?.index ?? -1] ?? null;
   const points = data?.points;
   const path =
@@ -23,6 +23,7 @@ export function RoutedEdge(props: EdgeProps<Edge<RoutedEdgeData>>) {
       id={id}
       path={path}
       {...(markerEnd ? { markerEnd } : {})}
+      {...(markerStart ? { markerStart } : {})}
       className={duration === null ? "" : "flowing"}
       style={{ ...style, ...(duration === null ? {} : { animationDuration: `${duration}s` }) }}
     />
