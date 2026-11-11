@@ -43,6 +43,6 @@ describe("the bars in a box", () => {
     const store = await fixtureStore("tutorial-chain");
     const graph = store.graph;
     if (!graph) throw new Error("no graph");
-    expect(nodeStatesAt(graph, store, 0).get("api")?.queue).toBeNull();
+    expect(nodeStatesAt(graph, store, 0).get("api")?.queues).toEqual([]);
   });
 });
