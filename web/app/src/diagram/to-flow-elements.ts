@@ -14,6 +14,7 @@ import { categoryOf, type Category } from "./categories";
 import { peaksOf, type Peaks } from "./bars";
 import { copiesAt, type Copies } from "./copies";
 import { isPull, queueOfPool } from "./pull";
+import { lagSloOf, queueZone } from "./queue-zone";
 import { absoluteBox, type Layout } from "./layout";
 import { sidesFor, type Side } from "./sides";
 
@@ -47,6 +48,7 @@ export interface NodeState {
   // pulling from it has not read yet (`consumer`: that pool; pull.ts says why they are drawn here).
   readonly queues: readonly Queue[];
   readonly lagSeconds: number | null; // a queue's lag: how long a message now published waits
+  readonly lagZone: Zone | null; // its lag against the scenario's queue_lag SLO (queue-zone.ts)
   readonly load: number | null;
 }
 
@@ -54,6 +56,7 @@ export interface Queue {
   readonly fill: number; // the backlog against the largest it reaches in the dataset (bars.ts)
   readonly backlog: number;
   readonly consumer: string | null;
+  readonly zone: Zone | null; // the lag against its SLO and the backlog against its room
 }
 
 export function toFlowElements(
@@ -129,12 +132,19 @@ export function nodeStatesAt(
   const copies = copiesAt(graph, store.times()[frame] ?? 0, store.durations()[frame] ?? 0);
   const rowOf = new Map(graph.nodes.map((n, row) => [n.id, row]));
   const queueOf = queueOfPool(graph);
-  // A backlog row of node `id` (its own backlog), or null when it never queues in the dataset.
-  const backlogRow = (id: string, consumer: string | null): Queue | null => {
+  // A backlog row of node `id` (its own backlog), or null when it never queues in the dataset. Its
+  // zone judges it against `id`'s room and the lag of the queue whose box draws it.
+  const backlogRow = (
+    id: string,
+    consumer: string | null,
+    lag: { seconds: number | null; max: number | null },
+  ): Queue | null => {
     const peak = peaks.backlog.get(id) ?? 0;
     if (!(peak > 0)) return null;
     const backlog = at(store.nodeColumn(rowOf.get(id) ?? 0, "backlog"), frame) || 0;
-    return { fill: backlog / peak, backlog, consumer };
+    const room = graph.nodes[rowOf.get(id) ?? 0]?.queue_limit ?? null;
+    const zone = queueZone({ lag: lag.seconds, lagMax: lag.max, backlog, room });
+    return { fill: backlog / peak, backlog, consumer, zone };
   };
   graph.nodes.forEach((node, row) => {
     const isClient = node.type === "client";
@@ -144,11 +154,15 @@ export function nodeStatesAt(
     const offered = isClient ? offeredAt(graph, store, node.id, frame) : null;
     // A pool's backlog is drawn in its queue's box; a queue's box draws its pools'.
     const pools = [...queueOf].filter(([, queue]) => queue === node.id).map(([pool]) => pool);
-    const own = isClient || queueOf.has(node.id) ? null : backlogRow(node.id, null);
-    const queues = [own, ...pools.map((pool) => backlogRow(pool, pool))].filter(
+    const lagValue = value("queue_lag_s");
+    const lag = {
+      seconds: Number.isNaN(lagValue) ? null : lagValue,
+      max: lagSloOf(graph.slos, node.id),
+    };
+    const own = isClient || queueOf.has(node.id) ? null : backlogRow(node.id, null, lag);
+    const queues = [own, ...pools.map((pool) => backlogRow(pool, pool, lag))].filter(
       (q): q is Queue => q !== null,
     );
-    const lag = value("queue_lag_s");
     states.set(node.id, {
       zone: isClient ? null : zoneName(graph, value("zone")),
       rhoPercent: isClient ? null : rhoAt(store, row, frame),
@@ -156,7 +170,8 @@ export function nodeStatesAt(
       copies: copies.get(node.id) ?? null,
       busy: isClient || Number.isNaN(mean) ? null : { mean, peak: value("peak_rho") || mean },
       queues,
-      lagSeconds: Number.isNaN(lag) ? null : lag,
+      lagSeconds: lag.seconds,
+      lagZone: queueZone({ lag: lag.seconds, lagMax: lag.max, backlog: 0, room: null }),
       load: offered !== null && peakOffered > 0 ? offered / peakOffered : null,
     });
   });

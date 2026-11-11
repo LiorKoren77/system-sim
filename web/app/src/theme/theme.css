@@ -523,8 +523,31 @@ main h1 .chapter {
   background: var(--surge);
 }
 
+/* A queue's waiting messages: grey unless its lag SLO or its room judges them (queue-zone.ts). */
 .bar-row.queue .fill {
   background: var(--cat-queue);
+}
+
+.bar-row.queue.zone-green .fill {
+  background: var(--zone-green);
+}
+
+.bar-row.queue.zone-yellow .fill {
+  background: var(--zone-yellow);
+}
+
+.bar-row.queue.zone-red .fill {
+  background: var(--zone-red);
+}
+
+/* A queue's lag label, coloured by its SLO. */
+.bar-row.lag-yellow .bar-label {
+  color: var(--zone-yellow);
+}
+
+.bar-row.lag-red .bar-label {
+  color: var(--zone-red);
+  font-weight: 600;
 }
 
 .bar-row .tick {

@@ -42,7 +42,7 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
             fill={state?.busy?.mean ?? null}
             peak={state?.busy?.peak ?? null}
             ticks={[data.yellow, data.red]}
-            className={`busy zone-${zone ?? "none"}`}
+            className={`busy zone-${zone ?? "none"}${state?.lagZone ? ` lag-${state.lagZone}` : ""}`}
             pill={zone}
           />
         )}
@@ -56,7 +56,7 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
                 : `${count(q.backlog)} messages waiting for ${q.consumer}`
             }
             fill={q.fill}
-            className="queue"
+            className={`queue zone-${q.zone ?? "none"}`}
           />
         ))}
       </div>

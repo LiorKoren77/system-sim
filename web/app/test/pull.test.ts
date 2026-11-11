@@ -110,7 +110,10 @@ describe("the messages a pool has not read yet", () => {
     const graph = store.graph;
     if (!graph) throw new Error("no graph");
     const states = nodeStatesAt(graph, store, 0);
-    expect(states.get("q")?.queues).toEqual([{ fill: 1, backlog: 2_900_000, consumer: "w" }]);
+    // 2.9M against the test pool's room of 1000: past 90%, red.
+    expect(states.get("q")?.queues).toEqual([
+      { fill: 1, backlog: 2_900_000, consumer: "w", zone: "red" },
+    ]);
     expect(states.get("w")?.queues).toEqual([]);
   });
 
@@ -131,7 +134,8 @@ describe("the messages a pool has not read yet", () => {
 
 describe("the colour of a queue's waiting messages", () => {
   it("follows the queue's lag against its SLO", async () => {
-    const store = await queueAndPool(2_900_000, 225, 300); // 75% of 5 min
+    // 75% of 5 min; 500 of the pool's room of 1000 keeps the room green, so the lag decides.
+    const store = await queueAndPool(500, 225, 300);
     const graph = store.graph;
     if (!graph) throw new Error("no graph");
     const q = nodeStatesAt(graph, store, 0).get("q");
