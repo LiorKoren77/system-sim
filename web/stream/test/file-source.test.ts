@@ -5,10 +5,10 @@ import { DatasetStore } from "../src/store";
 import { helloText } from "./support/hello";
 import { byteStream } from "./support/streams";
 
-function serve(body: Uint8Array, status = 200, statusText = "OK"): void {
+function serve(body: Uint8Array, status = 200, statusText = "OK", chunkSize = 100): void {
   vi.stubGlobal(
     "fetch",
-    vi.fn(() => Promise.resolve(new Response(byteStream(body, 100), { status, statusText }))),
+    vi.fn(() => Promise.resolve(new Response(byteStream(body, chunkSize), { status, statusText }))),
   );
 }
 
@@ -25,6 +25,13 @@ afterEach(() => {
 describe("a dataset read from a static file", () => {
   it("inflates a gzipped file as it arrives", async () => {
     serve(gzipSync(helloText));
+    const store = await load("datasets/hello.ndjson.gz");
+    expect(store.status).toBe("ready");
+    expect(store.frameCount).toBe(2);
+  });
+
+  it("knows a gzipped file even when the network delivers its first byte alone", async () => {
+    serve(gzipSync(helloText), 200, "OK", 1);
     const store = await load("datasets/hello.ndjson.gz");
     expect(store.status).toBe("ready");
     expect(store.frameCount).toBe(2);

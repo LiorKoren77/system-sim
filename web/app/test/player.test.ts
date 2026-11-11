@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { createPlayer, playerReducer, SPEEDS, type PlayerState } from "../src/timeline/player";
+import {
+  createPlayer,
+  playerConfig,
+  playerReducer,
+  SPEEDS,
+  type PlayerState,
+} from "../src/timeline/player";
 
 // A day: 1440 frames of 1 min, 60 to the hour.
 function day(frame: number, loops = true): PlayerState {
@@ -55,5 +61,20 @@ describe("the player", () => {
     expect(SPEEDS.map((s) => s.seconds)).toEqual([30, 60, 120, 300]);
     const fast = playerReducer(play(day(0)), { type: "setSpeed", seconds: 30 });
     expect(tick(fast, 1).frame).toBe(48);
+  });
+});
+
+describe("the player's frames, from the store as it fills", () => {
+  const looping = { loops: true, window: { from_s: 0, to_s: 86400 } } as const;
+
+  it("wraps a looping day only once the whole day has arrived", () => {
+    const loading = { frameCount: 300, status: "loading", dataset: looping, run: { bucket_s: 60 } };
+    expect(playerConfig(loading)).toEqual({ frames: 300, loops: false, framesPerHour: 60 });
+    expect(playerConfig({ ...loading, frameCount: 1440, status: "ready" }).loops).toBe(true);
+  });
+
+  it("does not wrap a run, which plays once", () => {
+    const run = { frameCount: 720, status: "ready", dataset: undefined, run: { bucket_s: 5 } };
+    expect(playerConfig(run)).toEqual({ frames: 720, loops: false, framesPerHour: 720 });
   });
 });

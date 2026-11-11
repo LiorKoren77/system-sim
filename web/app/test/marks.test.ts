@@ -56,4 +56,22 @@ describe("the marks on the time slider", () => {
       600, 1000,
     ]);
   });
+
+  it("clips a fault that runs past the window's end to the window", () => {
+    expect(timelineMarks(lab, { from_s: 0, to_s: 700 })).toEqual([
+      { kind: "failure", at_s: 600, for_s: 100, label: "node_down cache_servers (1 of 4)" },
+    ]);
+  });
+
+  it("marks from the window's start a fault that began before it and still runs", () => {
+    // A looping day's window is the run's second: the first day's copy of a fault that crosses
+    // midnight still holds at 00:00.
+    expect(timelineMarks(lab, { from_s: 700, to_s: 1200 })).toEqual([
+      { kind: "failure", at_s: 700, for_s: 200, label: "node_down cache_servers (1 of 4)" },
+    ]);
+  });
+
+  it("leaves out a fault that ended before the window", () => {
+    expect(timelineMarks(lab, { from_s: 900, to_s: 1200 })).toEqual([]);
+  });
 });

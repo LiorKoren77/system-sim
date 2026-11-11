@@ -23,6 +23,10 @@ describe("reading simsys's stream in the precompute", () => {
     expect(stream.summary.message.exit_code).toBe(2); // a failed SLO is data, not a failure
   });
 
+  it("fails with the reason when simsys cannot be started, as the run of that scenario", async () => {
+    await expect(runSimsys("/nowhere/simsys", [], process.cwd())).rejects.toThrow("ENOENT");
+  });
+
   it("refuses a stream that ends without its summary: the run was killed", async () => {
     const result = await fake([run, graph, frame], 0);
     expect(() => readStream(result, "x.yaml")).toThrow(
