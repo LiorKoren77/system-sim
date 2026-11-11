@@ -59,7 +59,7 @@ describe("a node's charts, as uPlot's inputs", () => {
   it("put the frames on the window's clock: a day's first frame at 0, not at 24:00", async () => {
     const day = await fixtureStore("book-url-shortener");
     expect(xValues(day, 86400)[0]).toBe(0);
-    expect(xValues(day, 86400)[1]).toBe(120);
+    expect(xValues(day, 86400)[1]).toBe(60);
     const run = await fixtureStore("tutorial-chain");
     expect(Array.from(xValues(run, 0).subarray(0, 2))).toEqual([0, 0.2]);
   });
