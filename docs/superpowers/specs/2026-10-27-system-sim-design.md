@@ -1349,3 +1349,88 @@ a reader meets are in `docs/scenario-schema.md` (v1.7).
    topology (the 5a design §8: reserved, `rev` always 0); `--series-every`, `validate --report json`,
    streamed replications or sweeps, compression; sorting `op_shares` once in `Graph::build`
    (batch B review: each reader sorts them today).
+
+## 23. Phase 5b: the watch-only web app, as implemented (2026-11-11)
+
+Phase 5b (design `docs/superpowers/specs/2026-11-10-phase5b-web-mvp-design.md`, "the 5b design"
+below; plan `docs/superpowers/plans/2026-11-10-phase5b-web-mvp.md`, whose "As built" lists the
+versions, sizes and timings) is a page on localhost where one picks a shipped scenario and watches
+its day. Everything it shows is precomputed offline; the page is static files. The 5a design's
+picture of a Node server running `simsys` per browser is superseded: there is no server process,
+and §22's stream reaches the page as files. Where an entry conflicts with an earlier section or
+with the 5b design, this section wins. The rules a reader meets are in `docs/scenario-schema.md`
+(v1.8) and `web/README.md`.
+
+1. **`run --days N` (Task 1).** `session::repeat_days(model::Scenario, int) ->
+   std::expected<model::Scenario, std::string>` copies each spike and scripted fault to every day
+   (`every_day`, day by day, each day in the file's order), sets the duration to N × 24 h and the
+   warmup to (N − 1) × 24 h; `not_periodic` refuses a wave whose period does not divide the day, a
+   `points` curve and a ramp longer than a day. `load_for_run` applies it after the seed and wraps
+   its message in `RunRefusal`; a count outside 1 to 7 is the command line's fault (the error line
+   names no file), the rest the scenario's. The `run` line's `days` is rendered only when given, so
+   every existing stream is unchanged. Deviation: the 5b design refused `--days` with
+   `--replications` above 1; the replications path loads through `load_for_run` too, so each
+   replication lives the N days, which is correct and was kept. A windowed SLO's worst window is
+   named on the run's clock (`from 38h`), not as day 2's 14:00: the text report is unchanged by 5b.
+   The `--days 1` process test compares one stream pair only (304 s under ASan otherwise).
+2. **The graph gains three keys (Batch D refinements).** A client's `spikes` (`at_s`, `for_s`,
+   `factor`) and a fault's `replicas` (a number, or `null` for every copy) and `primary`, all added
+   keys under the output contract. They let the slider mark surges and the boxes show which copies
+   are down. The 5b design's §13 had spikes out of the graph; superseded.
+3. **`web/` (Tasks 2–3).** npm workspaces `@simsys/stream` (the contract: message types, the
+   parser, the sources, the store), `@simsys/precompute`, `@simsys/app`. Strict TypeScript (`noUncheckedIndexedAccess`,
+   `exactOptionalPropertyTypes`), ESLint `strictTypeChecked` with react-hooks 7's compiler rules,
+   Prettier at 100 columns, Vitest projects. `DatasetSource` (Strategy) yields lines; the file
+   source sniffs the gzip magic so a server that inflates `.gz` itself still works.
+   `DatasetStore` (Observer) holds columnar `Float64Array`s, `NaN` for `null`, notifies per 64
+   frames, and `consume` restarts from empty with a generation guard (React runs an effect twice
+   in development on the same store). `bucketBalance` checks the conservation law on the
+   fixtures.
+4. **The precompute (Task 4).** As the 5b design §7: the seam check on day 1's and day 2's last
+   frames; a day that repeats keeps day 2 and loops, one that drifts keeps both days and plays
+   once. All seven shipped days repeat. `--only` merges into the existing `index.json` (it first
+   truncated it). `simsys_commit` lives in the index, so the fixtures compare by their inflated
+   text and do not change with each commit. **Frames are 1 min** (`--every 1m`, 1440 a day): the
+   design's 2 min merged a 1 min outage with the minute after it (chat-system's outage and its
+   reconnect storm read as one frame); changed at the user's request, the datasets doubled to
+   164–437 KB for a day.
+5. **Time (Task 5).** The player is a pure reducer. A speed is how long the whole window takes to
+   play (30 s, 1 min, 2 min, 5 min), not a frame rate: a day of 1440 frames and a run of 720 both
+   play in a minute by default. The clock names the bucket's start; nothing is interpolated.
+6. **The diagram (Task 6 and the user's refinements).** React Flow with a structure that stays put
+   while the day plays: nodes and edges are rebuilt only when the layout or the selection changes,
+   and the frame's state reaches the boxes through a context (`FrameContext`, `FlowContext`). The
+   first version rebuilt the nodes each frame and React Flow re-measured them about 220 times a
+   second, which made the cursor flicker over a box (the user's report). Layout by ELK in two
+   passes: the boxes first, then each link's sides (`sidesFor`, the sides facing each other) fixed
+   as zero-size ports and the edges routed orthogonally; cycles broken by the file's order;
+   datacenters ordered by their traffic's flow. A scenario's optional `diagram.yaml` places every
+   box on a grid (`cells`) and chooses chosen links' sides (`sides`); web-crawler has one, to look
+   like the book's figure. Boxes carry their category (eight, by type, each its colour band), their
+   copies as a stack and slots (copies down counted from the faults per bucket), bars (busy: mean
+   with the bucket's peak and threshold ticks; a queue's waiting messages; a client's offered
+   rate), and their zone by border and pill. Links: an arrowhead from caller to callee; a pool
+   pulling from a queue is the caller of a link simsys declares queue → pool, so its arrowhead is
+   at the queue, its dashes move with the data toward the pool, and the messages it has not read
+   (the pool's backlog in simsys) are drawn in the queue's box. A queue's zone is the worse of its
+   lag against a `queue_lag` SLO (yellow from 70 %, red past it) and its backlog against its room
+   (yellow from 70 %, red from 90 %; the room only warns); a queue nothing judges has no zone of its
+   own. Dashes move at a speed on a log scale of the target's drain, frozen while paused. The slider
+   marks failures in red and surges of load in violet.
+7. **Charts, zone strip, report (Task 7).** uPlot behind an Adapter component (created on mount,
+   new data on change, a frame line that moves without a redraw, a click seeks, the charts share
+   the pointer). The series are pure functions (`chartsFor`) and each chart says what it models.
+   A queue's waiting chart includes what its pools have not read, as its box does. The zone strip
+   shares the time bar's columns, one canvas pixel per cell stretched; its zone per cell is
+   `boxZone`, the box's own, so the strip and the diagram never disagree (they first did for a
+   lagging queue). The SLO table matches each result to the graph's SLO by metric, node and op
+   for its window's length; the fault blocks keep the window's faults (day 1's copies left out).
+8. **Look.** One dark theme whatever the system setting (the user's choice; the design had light
+   and dark). Zone colours differ in lightness as well as hue; the zone is also a word. The four
+   chart series hues were validated as a set on the dark panel for lightness, contrast and
+   colour-blind separation.
+9. **CI.** The release job uploads its binary; the `web` job runs check, test and build, the
+   fixture check against that binary and the precompute's integration test.
+10. **What 5b leaves.** The 5b design §12–13: the change menu (5c), user-built systems
+   (WebAssembly), a server, hosting, comparing scenarios, a phone layout; also a day-aware window
+   label in the text report and finer frames only around events.

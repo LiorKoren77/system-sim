@@ -10,7 +10,12 @@ reproducible. Built to practise the systems in
 *System Design Interview* (Alex Xu, vol. 1) and, at the same time, to study and teach
 C++20/23: modules, concepts, ranges, coroutines, `std::expected` and friends.
 
-Status: phase 5a makes simsys the data source of a web frontend (phase 5b): `simsys run --stream`
+Status: phase 5b adds a **web app** ([below](#web-app)): pick a shipped scenario and watch its day
+on a diagram that turns yellow and red, with a looping time slider, a zone strip of the whole day,
+charts of any box, the SLO table and the fault blocks. It is static files on localhost, every
+dataset precomputed by `simsys run --days 2 --stream`: `--days N` lives a 24 h scenario's day N
+times, its spikes and faults every day, and reports the last, so the second day is the one the
+system settles into and the page can loop it. Phase 5a made simsys the data source of that frontend: `simsys run --stream`
 writes the run as lines of JSON on stdout while it runs, one frame per bucket of steps aggregated at
 the source (youtube's day: 723 lines, 1.13 MB, the first frame out after 43 ms), `simsys explain
 --report json` gives the resolved graph as data, and every JSON document starts with its
@@ -41,7 +46,7 @@ a failed step does not run, refused, dropped and timed-out requests are counted 
 `simsys sweep` runs a scenario over a range of one key (or a grid of two), the points in parallel. All fourteen
 shipped scenarios run end to end, the eight book systems among them (list below). 1792 tests
 (Catch2, via `ctest`). The scenario language is
-[`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.7).
+[`docs/scenario-schema.md`](docs/scenario-schema.md) (v1.8).
 See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](docs/superpowers/specs/2026-10-27-system-sim-design.md)
 for the design and [`docs/approaches.md`](docs/approaches.md) for the modelling approaches considered.
 
@@ -55,6 +60,7 @@ simsys run      scenario.yaml [--duration 30s] [--seed N] [--report table|json]
                               [--series out.csv] [--series-ops ops.csv] [--no-color]
                               [--replications N [--jobs J]]
 simsys run      scenario.yaml --stream [--points N | --every 30s]  # lines of JSON for a frontend
+simsys run      scenario.yaml --days N [--stream] [--report table|json]  # a 24 h day lived N times
 simsys curve    scenario.yaml <client> [--step 1m] [--until 1h] [--seed N] [--noise]
 simsys sweep    scenario.yaml --param <dot.path>=<from>..<to>:<n>[:log] [--param ...]
                               --metric <m>... [--slos] [--jobs N] [--format table|csv]
@@ -73,6 +79,10 @@ $ simsys run scenarios/tutorial/hello/scenario.yaml --stream --points 2 | head -
 {"type":"graph","rev":0,"scenario":"hello","datacenters":[{"name":"main"}],"zones":["green","yellow","red"],"nodes":[...],...}
 {"type":"frame","rev":0,"t_s":0,"dt_s":30,"nodes":[[null,...],[100,100,0,0,0,0,0.1,0.1,0,0,1.11111,null,null,null,null]],"links":[],"ops":[[100,100,100,0,1.61111,5.66029]]}
 ```
+
+`run --days N` (1 to 7) runs a 24 h scenario for N days: each rate spike and scripted fault comes
+back at the same time every day, the warmup is the first N − 1 days, and the report judges the last
+([schema](docs/scenario-schema.md#command-line-simsys-run---days-phase-5b)).
 
 `estimate` evaluates the long-run (steady) state once, at t = 0 (midnight) or at `--at`: the rate
 curve's value there, without noise (its first line says so), its drops and refusals as rates
@@ -403,6 +413,23 @@ partitions, random faults and the rest of the phase 4 backlog are in the
 [phase 3 plan](docs/superpowers/plans/2026-10-30-phase3-faults-gateways.md)'s last section (4a's
 items are done: [its plan](docs/superpowers/plans/2026-11-09-phase4a-sweep-reporting.md)); the
 rules as built are spec §20 and §21.
+
+## Web app
+
+```
+cd web
+npm ci
+npm run precompute -- --simsys ../build/gcc14-release/simsys   # about 3 min: every scenario's day
+npm run serve                                                  # http://localhost:4173
+```
+
+![chat-system at 21:30, its gateway down](docs/images/web-chat-system.png)
+
+The page plays each book system's day in a minute, round and round (the second day of a two-day
+run, checked to end as it began), and each lab or tutorial run once. Click a box for its charts,
+a fault block or the zone strip to jump there; ← → move a minute, Shift an hour, Space plays.
+Node 22 is needed. How it works, and how to place a scenario's boxes with a `diagram.yaml`:
+[`web/README.md`](web/README.md).
 
 ## Toolchain
 
