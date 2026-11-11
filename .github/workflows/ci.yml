@@ -32,6 +32,12 @@ jobs:
         run: cmake --build --preset gcc14-release
       - name: Test
         run: ctest --preset gcc14-release
+      # The web job's fixture check and the precompute's integration test run this binary.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simsys-release
+          path: build/gcc14-release/simsys
+          retention-days: 1
   # Sanitizers (docs/study/sanitizers.md): the compiler instruments the code and a run stops at the
   # first memory error (ASan), undefined behaviour (UBSan) or data race (TSan) a test reaches. TSan
   # cannot share a binary with ASan, hence two jobs; UBSan rides with ASan.
@@ -98,3 +104,39 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang-format-18
       - name: Check formatting
         run: find src tests \( -name '*.cpp' -o -name '*.cppm' -o -name '*.hpp' \) -print0 | xargs -0 clang-format-18 --dry-run -Werror
+  # The web app (phase 5b, web/): the TypeScript type-checks, lints, is formatted, passes its tests
+  # and builds. Node 22 LTS, the version the project develops with; `npm ci` installs exactly the
+  # versions web/package-lock.json pins.
+  web:
+    runs-on: ubuntu-24.04
+    needs: build-test-release
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Type-check, lint, format
+        run: npm run check
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+      # The committed fixtures are still what simsys writes, and the precompute works through the
+      # real binary: a change of simsys's output cannot leave the web code testing an old contract.
+      - uses: actions/download-artifact@v4
+        with:
+          name: simsys-release
+          path: ${{ github.workspace }}/simsys-bin
+      - name: Fixtures are current
+        run: |
+          chmod +x "$GITHUB_WORKSPACE/simsys-bin/simsys"
+          SIMSYS="$GITHUB_WORKSPACE/simsys-bin/simsys" npm run fixtures -- --check
+      - name: Precompute through simsys
+        run: SIMSYS="$GITHUB_WORKSPACE/simsys-bin/simsys" npx vitest run --project precompute

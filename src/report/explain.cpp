@@ -1966,6 +1966,19 @@ constexpr std::array<std::string_view, 1> estimated_columns{"p99_ms"};
   return json_object(std::vector<std::string>{json_field("name", json_string(name))});
 }
 
+// A client's spikes: when each starts and how long it lasts, in seconds from the run's start, and
+// the factor it multiplies the rate by.
+[[nodiscard]] std::string json_spikes(const std::vector<workload::Spike>& spikes) {
+  std::vector<std::string> items;
+  for (const auto& spike : spikes) {
+    items.push_back(json_object(
+        std::vector<std::string>{json_field("at_s", json_number(seconds(spike.at))),
+                                 json_field("for_s", json_number(seconds(spike.duration))),
+                                 json_field("factor", json_number(spike.factor))}));
+  }
+  return json_field("spikes", "[" + join(items, ",") + "]");
+}
+
 // A node: what a diagram needs to draw and label it. A client serves nothing, so its capacity,
 // unit, thresholds and room are null. Type-specific keys only where a diagram shows them: a
 // worker pool's workers, a gateway's connection cap.
@@ -1990,6 +2003,10 @@ constexpr std::array<std::string_view, 1> estimated_columns{"p99_ms"};
   if (spec.type == model::NodeType::worker_pool && spec.workers) {
     fields.push_back(json_field("workers", std::to_string(*spec.workers)));
   }
+  // A client's rate spikes (`rate.spikes`: a flash crowd, a marketing blast), so a timeline can
+  // mark a surge of load as it marks a fault (phase 5b; an added key, the format version
+  // unchanged).
+  if (client && spec.workload) fields.push_back(json_spikes(spec.workload->curve.spikes));
   if (spec.type == model::NodeType::ws_gateway) {
     fields.push_back(
         json_field("connection_cap", json_optional_number(model::connection_cap(spec))));
@@ -2051,14 +2068,19 @@ constexpr std::array<std::string_view, 1> estimated_columns{"p99_ms"};
 
 // A scripted fault: its kind, what it strikes (a node, or a datacenter for dc_down), when and for
 // how long, in seconds from the run's start (t = 0 is midnight). An instant fault (a cache flush)
-// lasts no time: its for_s is null, as the run report's fault block writes it.
+// lasts no time: its for_s is null, as the run report's fault block writes it. A node_down's
+// `replicas` is how many copies it takes (null: every copy; model::Fault::replicas) and `primary`
+// whether it takes a sql_db's primary (`replicas: primary`), so a diagram can show the copies still
+// up (phase 5b; added keys, the format version unchanged).
 [[nodiscard]] std::string json_graph_fault(const model::Fault& fault) {
   const auto& target = fault.kind == model::FaultKind::dc_down ? fault.datacenter : fault.node;
   const auto lasting = model::lasts(fault.kind);
   return json_object(std::vector<std::string>{
       json_field("kind", json_string(model::to_string(fault.kind))),
       json_field("target", json_string(target)), json_field("at_s", json_number(seconds(fault.at))),
-      json_field("for_s", lasting ? json_number(seconds(fault.duration)) : "null")});
+      json_field("for_s", lasting ? json_number(seconds(fault.duration)) : "null"),
+      json_field("replicas", fault.replicas ? std::to_string(*fault.replicas) : "null"),
+      json_field("primary", fault.primary ? "true" : "false")});
 }
 
 }  // namespace

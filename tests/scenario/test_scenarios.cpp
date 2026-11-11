@@ -2316,3 +2316,63 @@ TEST_CASE("book/chat-system runs the day, passes its three SLOs and storms back 
   REQUIRE(recovered_at_s >= 21 * 3600 + 31 * 60 + 30);
   REQUIRE(recovered_at_s <= 21 * 3600 + 31 * 60 + 30 + 30);
 }
+
+// ---- run --days (phase 5b spec §5): the shipped days lived twice
+// ----------------------------------
+
+namespace {
+
+simsys::model::Scenario two_days_of(const std::string& relative) {
+  auto days = simsys::session::repeat_days(
+      load_or_fail(std::string{SIMSYS_SCENARIOS_DIR} + "/" + relative), 2);
+  if (!days) FAIL(days.error());
+  return std::move(*days);
+}
+
+}  // namespace
+
+TEST_CASE("book/chat-system lived for two days has its 21:30 outage on both days", "[scenario]") {
+  using namespace std::chrono_literals;
+  const auto g = build_or_fail(two_days_of("book/chat-system/scenario.yaml"));
+  const auto& faults = g.scenario().faults;
+  REQUIRE(faults.size() == 2);
+  CHECK(faults[0].at == 21h + 30min);        // 77400 s
+  CHECK(faults[1].at == 24h + 21h + 30min);  // 163800 s
+}
+
+TEST_CASE("book/news-feed lived for two days has its noon spike on both days", "[scenario]") {
+  using namespace std::chrono_literals;
+  const auto s = two_days_of("book/news-feed/scenario.yaml");
+  const auto client = std::ranges::find_if(
+      s.nodes, [](const auto& node) { return node.type == simsys::model::NodeType::client; });
+  REQUIRE(client != s.nodes.end());
+  const auto& curve = client->workload->curve;
+  auto without_spikes = curve;
+  without_spikes.spikes.clear();
+  // Five minutes into each spike (12:00 for 10 min, factor 3): the same rate on both days (the
+  // wave's period is the day), and 3 × the curve without its spikes.
+  for (const auto t : {12h + 5min, 36h + 5min}) {
+    CHECK_THAT(curve.rate_at(t).per_second,
+               Catch::Matchers::WithinRel(3.0 * without_spikes.rate_at(t).per_second, 1e-12));
+  }
+  CHECK_THAT(curve.rate_at(36h + 5min).per_second,
+             Catch::Matchers::WithinRel(curve.rate_at(12h + 5min).per_second, 1e-9));
+}
+
+TEST_CASE("book/url-shortener lived for two days reports its second day, which ends as the first",
+          "[scenario]") {
+  const auto g = build_or_fail(two_days_of("book/url-shortener/scenario.yaml"));
+  std::vector<std::string> lines;
+  auto sim = simsys::test_support::simulation_of(g);
+  // Buckets of 2 min at its 1 s step: 120 steps, 1440 frames over 48 h.
+  static_cast<void>(simsys::session::stream_run(
+      g, sim, 120, [&](std::string_view line) { lines.emplace_back(line); }, 2));
+  REQUIRE(lines.size() == 1443);
+  // The summary observes the last day: 86400 steps of 1 s.
+  CHECK(lines.back().find("\"steps\":86400,") != std::string::npos);
+  // The seam: the bucket ending at 24:00 (frame 719, line 721) and the one ending at 48:00 (frame
+  // 1439, line 1441) hold the same numbers; only their t_s differs. The trial of 2026-11-10 found
+  // them equal to the six digits a frame keeps.
+  const auto rows_of = [](const std::string& line) { return line.substr(line.find("\"nodes\"")); };
+  CHECK(rows_of(lines[721]) == rows_of(lines[1441]));
+}

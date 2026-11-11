@@ -164,3 +164,25 @@ Write for a reader who has read the book but has not studied queueing theory.
 - **Test-driven**: tests are written before the implementation, in small batches; the
   implementation is the minimum that makes them pass; then refactor. Integration-level
   tests are added once the units they combine exist.
+
+## 5. The web app (`web/`, TypeScript)
+
+- TypeScript strict (`tsconfig.base.json`: `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`),
+  no `any`, no non-null `!` without a comment saying why it holds. ESLint and Prettier clean:
+  `npm run check` in `web/` is what CI runs. nvm loads only in an interactive shell, so a script
+  starts with `source ~/.nvm/nvm.sh`.
+- §2 applies to the views: what a view shows from the model (a zone, a bucket mean, a level, an
+  estimated p99) is explained where it is drawn, for a reader who has read the book.
+- §4 applies: `Pattern:` comments, tests first (a red commit, then a green one), tests named after
+  the property they prove. What can be a pure function (a chart's series, a box's state at a frame,
+  the layout's input) is one, tested without a browser; jsdom does not render React Flow or uPlot.
+- A React or TypeScript idiom a C++ reader would not guess (a hook's dependency list, a
+  discriminated union's narrowing, `useSyncExternalStore`) gets a one-line comment on first use in
+  a file.
+- The diagram's structure stays put while the day plays: nodes and edges are rebuilt only when the
+  layout or the selection changes, and per-frame state goes through a context. React Flow
+  re-measures every node it is handed anew (rebuilding them each frame made the cursor flicker,
+  2026-11-10).
+- The page reads only `@simsys/stream`'s store; where its data comes from is a `DatasetSource`.
+  A new kind of data is a key or a line under the output contract (schema, "The output contract"),
+  never a second channel.

@@ -1,0 +1,10 @@
+{
+  "name": "@simsys/precompute",
+  "private": true,
+  "description": "Runs simsys offline for every shipped scenario and writes the static datasets the page plays.",
+  "type": "module",
+  "dependencies": {
+    "@simsys/stream": "*",
+    "yaml": "^2.9.1"
+  }
+}

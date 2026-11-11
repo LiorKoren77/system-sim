@@ -225,6 +225,7 @@ int run_estimate(const std::filesystem::path& file, const ReportOptions& options
 // What `run` takes beyond the report options.
 struct RunArgs {
   std::optional<std::string> duration{};    // overrides the scenario's
+  std::optional<int> days{};                // `--days N`: a 24 h day lived N times (repeat_days)
   std::optional<std::string> series{};      // CSV output path, one row per node per step
   std::optional<std::string> series_ops{};  // CSV output path, one row per client op per step
   std::optional<int> seed{};                // overrides the scenario's (see load_for_run)
@@ -292,6 +293,11 @@ struct RunRefusal {
 
 std::expected<graph::Graph, RunRefusal> load_for_run(const std::filesystem::path& file,
                                                      const RunArgs& args) {
+  if (args.days && args.duration) {
+    return std::unexpected(RunRefusal{
+        .text = std::format("{}: error: --days sets the duration; drop --duration", file.string()),
+        .command_line = true});
+  }
   std::vector<simsys::config::Override> overrides;
   if (args.duration) {
     if (auto refused = unparsable_duration(file, *args.duration)) {
@@ -311,6 +317,18 @@ std::expected<graph::Graph, RunRefusal> load_for_run(const std::filesystem::path
         .column = refused.column});
   }
   if (args.seed) scenario->seed = *args.seed;
+  if (args.days) {
+    auto days = simsys::session::repeat_days(std::move(*scenario), *args.days);
+    if (!days) {
+      // A count out of range is the command line's fault; a scenario that is not a repeatable day
+      // is the file's (its error line names the file, at no particular line).
+      const bool flag_fault = *args.days < 1 || *args.days > simsys::session::max_days;
+      return std::unexpected(
+          RunRefusal{.text = std::format("{}: error: {}", file.string(), days.error()),
+                     .command_line = flag_fault});
+    }
+    *scenario = std::move(*days);
+  }
   return simsys::session::build_graph(file.string(), std::move(*scenario))
       // C++23 std::expected::transform_error: rewrites only the error (the graph builder's message
       // into a RunRefusal) and passes a value through, where C++20 code needed an if and an
@@ -518,7 +536,7 @@ int run_streamed(const std::filesystem::path& file, const RunArgs& args) {
     if (!sim) return stream_refusal(file, RunRefusal{.text = sim.error()});
     const auto steps = bucket_of(file, *g, args);
     if (!steps) return stream_refusal(file, steps.error());
-    return simsys::session::stream_run(*g, *sim, *steps, write_stream_line);
+    return simsys::session::stream_run(*g, *sim, *steps, write_stream_line, args.days);
   } catch (const std::exception& e) {
     return stream_refusal(
         file, RunRefusal{.text = std::format("{}: error: {}", file.string(), e.what())});
@@ -820,6 +838,9 @@ void add_file_argument(CLI::App& command, std::filesystem::path& file) {
 void add_run_options(CLI::App& run, RunArgs& args) {
   run.add_option("--duration", args.duration, "simulated time, e.g. 30s (default: scenario's)");
   run.add_option("--seed", args.seed, "seed of the clients' rate noise (default: scenario's)");
+  run.add_option("--days", args.days,
+                 "live a 24h scenario's day N times (1 to 7): its spikes and faults every day, "
+                 "the report on the last day");
   run.add_option("--series", args.series, "write one CSV row per node per step to this file");
   run.add_option("--series-ops", args.series_ops,
                  "write one CSV row per client op per step to this file");

@@ -1,0 +1,9 @@
+{
+  "name": "@simsys/stream",
+  "private": true,
+  "description": "The simulator's stream in TypeScript: its line types, the contract's rules, the dataset sources and the columnar store the page reads.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

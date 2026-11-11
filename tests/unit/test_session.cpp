@@ -15,7 +15,9 @@
 #include <chrono>
 #include <cstddef>
 #include <limits>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // C++20 `import`: brings a named module's exported names into this translation unit without
@@ -186,4 +188,208 @@ TEST_CASE("a noise block of sigma 0 is no rate noise: every seed would give the 
   // the premise: two seeds of it are the same run, byte for byte
   const auto texts = rendered_all(simsys::session::run_replications(g, 1, 2, 1));
   CHECK(texts[0] == texts[1]);
+}
+
+// ---- run --days N (phase 5b spec §5) ------------------------------------------------------------
+//
+// session::repeat_days(Scenario, int days) -> std::expected<Scenario, std::string>: a 24 h day
+// lived `days` times. The properties: the run lasts days × 24 h; every rate spike and scripted
+// fault recurs at the same clock time each day; the report observes the last day only; an input
+// that would not repeat (a wave period that does not divide the day, a points trace, a ramp longer
+// than a day) is refused, so the day the web app loops is really the same day.
+
+namespace {
+
+using simsys::model::Fault;
+using simsys::model::FaultKind;
+using simsys::workload::Ramp;
+using simsys::workload::Spike;
+using simsys::workload::Wave;
+
+// One client at 100/s with a 3× spike at 12:00 for 10 min, into one service; a day long, 5 min of
+// warmup; faults at 15:00 and 09:00, in that (file) order.
+Scenario a_day() {
+  Scenario s{.name = "day", .version = 1, .duration = 24h, .warmup = 5min};
+  s.nodes = {
+      NodeSpec{
+          .id = "users",
+          .type = NodeType::client,
+          .workload =
+              Workload{.curve = {.base = Rate{100},
+                                 .wave = Wave{.period = 24h},
+                                 .spikes = {Spike{.at = 12h, .duration = 10min, .factor = 3.0}}},
+                       .op_shares = {{"op", 1.0}}}},
+      NodeSpec{.id = "s", .type = NodeType::service, .capacity = Rate{1000}, .latency = 1ms}};
+  s.links = {LinkSpec{.from = "users", .to = "s", .dir = simsys::model::Direction::inout}};
+  s.faults = {Fault{.kind = FaultKind::node_down, .at = 15h, .duration = 1min, .node = "s"},
+              Fault{.kind = FaultKind::node_down, .at = 9h, .duration = 30s, .node = "s"}};
+  return s;
+}
+
+Scenario repeated(const Scenario& s, int days) {
+  auto result = simsys::session::repeat_days(s, days);
+  INFO((result ? "" : result.error()));
+  REQUIRE(result.has_value());
+  return std::move(*result);
+}
+
+std::string refusal_of(const Scenario& s, int days) {
+  const auto result = simsys::session::repeat_days(s, days);
+  REQUIRE_FALSE(result.has_value());
+  return result.error();
+}
+
+std::vector<simsys::SimTime> spike_times(const Scenario& s) {
+  std::vector<simsys::SimTime> times;
+  for (const auto& spike : s.nodes[0].workload->curve.spikes) times.push_back(spike.at);
+  return times;
+}
+
+std::vector<simsys::SimTime> fault_times(const Scenario& s) {
+  std::vector<simsys::SimTime> times;
+  for (const auto& fault : s.faults) times.push_back(fault.at);
+  return times;
+}
+
+}  // namespace
+
+TEST_CASE("one day lived once is the scenario as it is") {
+  const auto s = a_day();
+  const auto once = repeated(s, 1);
+  CHECK(once.duration == s.duration);
+  CHECK(once.warmup == s.warmup);
+  CHECK(spike_times(once) == spike_times(s));
+  CHECK(fault_times(once) == fault_times(s));
+}
+
+TEST_CASE("a day lived three times lasts three days and observes only the last") {
+  const auto s = repeated(a_day(), 3);
+  CHECK(s.duration == 72h);
+  // (days − 1) × 24 h, the file's 5 min warmup replaced: by the last day the queues are as full as
+  // that day makes them.
+  CHECK(s.warmup == 48h);
+}
+
+TEST_CASE("a rate spike recurs at the same clock time every day") {
+  const auto s = repeated(a_day(), 3);
+  // 12:00 + k × 24 h: 43200, 129600, 216000 s.
+  CHECK(spike_times(s) == std::vector<simsys::SimTime>{12h, 36h, 60h});
+  for (const auto& spike : s.nodes[0].workload->curve.spikes) {
+    CHECK(spike.duration == 10min);
+    CHECK(spike.factor == 3.0);
+  }
+}
+
+TEST_CASE("a scripted fault recurs every day, day by day in the file's order") {
+  const auto s = repeated(a_day(), 3);
+  // The file's order (15:00, then 09:00) kept within each day.
+  CHECK(fault_times(s) == std::vector<simsys::SimTime>{15h, 9h, 39h, 33h, 63h, 57h});
+  for (const auto& fault : s.faults) CHECK(fault.node == "s");
+  CHECK(s.faults[2].duration == 1min);
+  CHECK(s.faults[3].duration == 30s);
+}
+
+TEST_CASE("a wave repeats with the day when its period divides 24 h") {
+  for (const auto period : {24h, 12h, 8h}) {
+    auto s = a_day();
+    s.nodes[0].workload->curve.wave->period = period;
+    CHECK(simsys::session::repeat_days(s, 2).has_value());
+  }
+}
+
+TEST_CASE("a wave whose period does not divide the day is refused") {
+  auto s = a_day();
+  s.nodes[0].workload->curve.wave->period = 168h;
+  CHECK(refusal_of(s, 2) ==
+        "--days: client 'users' has a wave period of 168h, which does not divide the day");
+  s.nodes[0].workload->curve.wave->period = 5h;
+  CHECK(refusal_of(s, 2) ==
+        "--days: client 'users' has a wave period of 5h, which does not divide the day");
+}
+
+TEST_CASE("only a 24 h scenario can be lived for several days") {
+  auto s = a_day();
+  s.duration = 6h;
+  CHECK(refusal_of(s, 2) == "--days needs a 24h scenario (this one runs 6h)");
+}
+
+TEST_CASE("a points trace is refused: it is held flat after its last entry, not periodic") {
+  auto s = a_day();
+  s.nodes[0].workload->curve.points = simsys::workload::Points{.at = {{0s, Rate{100}}}};
+  CHECK(refusal_of(s, 2) == "--days: client 'users' rate.points is not periodic");
+}
+
+TEST_CASE("a ramp is kept if it ends within the first day, which is a warm-up anyway") {
+  auto s = a_day();
+  s.nodes[0].workload->curve.ramp = Ramp{.from = Rate{0}, .to = Rate{100}, .over = 5min};
+  CHECK(simsys::session::repeat_days(s, 2).has_value());
+  s.nodes[0].workload->curve.ramp->over = 25h;
+  CHECK(refusal_of(s, 2) == "--days: client 'users' ramps over 25h, longer than a day");
+}
+
+TEST_CASE("a spike longer than a day is refused: it would overlap its own copy the next day") {
+  // Two copies active at once would multiply their factors, past the bound the loader checks on
+  // the file's spikes (it never sees the copies).
+  auto s = a_day();
+  s.nodes[0].workload->curve.spikes[0].duration = 24h;
+  CHECK(simsys::session::repeat_days(s, 2).has_value());
+  s.nodes[0].workload->curve.spikes[0].duration = 30h;
+  CHECK(refusal_of(s, 2) == "--days: client 'users' has a spike of 30h, longer than a day");
+}
+
+TEST_CASE("a fault longer than a day is refused: it would overlap its own copy the next day") {
+  // Two node_downs of some replicas at once would take down the sum, which the file never does.
+  auto s = a_day();
+  s.faults[1].duration = 25h;
+  CHECK(refusal_of(s, 2) == "--days: the node_down of 's' at 9h lasts 25h, longer than a day");
+}
+
+TEST_CASE("the number of days is between 1 and 7") {
+  CHECK(refusal_of(a_day(), 0) == "--days must be between 1 and 7");
+  CHECK(refusal_of(a_day(), 8) == "--days must be between 1 and 7");
+  CHECK(simsys::session::repeat_days(a_day(), 7).has_value());
+}
+
+TEST_CASE("noise is kept: each day draws its own, as days do") {
+  auto s = a_day();
+  s.nodes[0].workload->noise = simsys::workload::Noise{.sigma = 0.3, .correlation = 2s};
+  const auto days = repeated(s, 2);
+  REQUIRE(days.nodes[0].workload->noise.has_value());
+  CHECK(days.nodes[0].workload->noise->sigma == 0.3);
+}
+
+namespace {
+
+// The run line of a stream of `s`, `days` as the CLI passes it (absent without --days).
+std::string run_line_of(const Scenario& s, std::optional<int> days) {
+  const auto g = graph_of(s);
+  auto sim = simsys::session::create_simulation(g, "day");
+  REQUIRE(sim.has_value());
+  std::vector<std::string> lines;
+  static_cast<void>(simsys::session::stream_run(
+      g, *sim, 1, [&](std::string_view line) { lines.emplace_back(line); }, days));
+  REQUIRE_FALSE(lines.empty());
+  return lines.front();
+}
+
+// a_day() at a 10 min step: 144 steps a day, quick to run twice.
+Scenario a_coarse_day() {
+  auto s = a_day();
+  s.step = 10min;
+  return s;
+}
+
+}  // namespace
+
+TEST_CASE("a stream of a day lived twice says so, and lasts and observes as the run does") {
+  const auto line = run_line_of(repeated(a_coarse_day(), 2), 2);
+  CHECK(line.find("\"duration_s\":172800,") != std::string::npos);
+  CHECK(line.find("\"warmup_s\":86400,") != std::string::npos);
+  CHECK(line.find("\"frames\":288") != std::string::npos);  // 2 × 144 steps, a bucket each
+  CHECK(line.ends_with(",\"days\":2}"));
+}
+
+TEST_CASE("a stream without --days has no days key: the 5a stream, byte for byte") {
+  const auto line = run_line_of(a_coarse_day(), std::nullopt);
+  CHECK(line.find("days") == std::string::npos);
 }

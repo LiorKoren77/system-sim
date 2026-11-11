@@ -7,6 +7,7 @@
 module;
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <expected>
 #include <format>
@@ -62,6 +63,93 @@ std::expected<graph::Graph, std::string> build_graph(const std::string& path,
   return graph::Graph::build(std::move(scenario))
       .transform_error(
           [&](const graph::EngineError& error) { return engine_refusal(path, error); });
+}
+
+// ---- `run --days N` ----------------------------------------------------------------------------
+
+namespace {
+
+// The day `--days` repeats.
+constexpr SimTime one_day = std::chrono::hours{24};
+
+// Why a client's curve would not repeat with the day, or nothing. A wave repeats if a whole number
+// of its periods fills the day; a points trace is held flat after its last entry; a ramp is a
+// one-off that the first day, a warm-up anyway, absorbs only if it ends within it. A spike longer
+// than the day would overlap its own copy the next day, and the two factors would multiply past
+// the bound the loader checks on one.
+std::optional<std::string> not_periodic(const model::NodeSpec& client) {
+  const auto& curve = client.workload->curve;
+  if (curve.wave && one_day.count() % curve.wave->period.count() != 0) {
+    return std::format("--days: client '{}' has a wave period of {}, which does not divide the day",
+                       client.id, describe_duration(curve.wave->period));
+  }
+  if (curve.points)
+    return std::format("--days: client '{}' rate.points is not periodic", client.id);
+  if (curve.ramp && curve.ramp->over > one_day) {
+    return std::format("--days: client '{}' ramps over {}, longer than a day", client.id,
+                       describe_duration(curve.ramp->over));
+  }
+  for (const auto& spike : curve.spikes) {
+    if (spike.duration > one_day) {
+      return std::format("--days: client '{}' has a spike of {}, longer than a day", client.id,
+                         describe_duration(spike.duration));
+    }
+  }
+  return std::nullopt;
+}
+
+// Why a fault would not repeat with the day, or nothing: one longer than the day would overlap its
+// own copy the next day (two node_downs of some replicas each would add up to more than either).
+std::optional<std::string> overlaps_next_day(const model::Fault& fault) {
+  if (fault.duration <= one_day) return std::nullopt;
+  const auto& target = fault.node.empty() ? fault.datacenter : fault.node;
+  return std::format("--days: the {} of '{}' at {} lasts {}, longer than a day",
+                     model::to_string(fault.kind), target, describe_duration(fault.at),
+                     describe_duration(fault.duration));
+}
+
+// `items` followed by a copy of them shifted by one day, by two, ... up to `days` − 1 days: the day
+// by day order, each day in the original order. `at` is the member that holds the start time.
+template <typename T>
+std::vector<T> every_day(const std::vector<T>& items, int days, SimTime T::*at) {
+  std::vector<T> all;
+  all.reserve(items.size() * static_cast<std::size_t>(days));
+  for (int day = 0; day < days; ++day) {
+    for (auto item : items) {
+      item.*at += day * one_day;
+      all.push_back(std::move(item));
+    }
+  }
+  return all;
+}
+
+}  // namespace
+
+std::expected<model::Scenario, std::string> repeat_days(model::Scenario scenario, int days) {
+  if (days < 1 || days > max_days) {
+    return std::unexpected(std::format("--days must be between 1 and {}", max_days));
+  }
+  if (scenario.duration != one_day) {
+    return std::unexpected(std::format("--days needs a 24h scenario (this one runs {})",
+                                       describe_duration(scenario.duration)));
+  }
+  for (const auto& node : scenario.nodes) {
+    if (!node.workload) continue;  // only a client has a rate curve
+    if (auto why = not_periodic(node)) return std::unexpected(std::move(*why));
+  }
+  for (const auto& fault : scenario.faults) {
+    if (auto why = overlaps_next_day(fault)) return std::unexpected(std::move(*why));
+  }
+  if (days == 1) return scenario;
+  for (auto& node : scenario.nodes) {
+    if (!node.workload) continue;
+    auto& spikes = node.workload->curve.spikes;
+    spikes = every_day(spikes, days, &workload::Spike::at);
+  }
+  scenario.faults = every_day(scenario.faults, days, &model::Fault::at);
+  scenario.duration = days * one_day;
+  scenario.warmup = (days - 1) * one_day;
+  return scenario;
 }
 
 std::expected<engine::Simulation, std::string> create_simulation(const graph::Graph& g,
@@ -150,9 +238,9 @@ std::size_t steps_of(const graph::Graph& g) {
 }
 
 int stream_run(const graph::Graph& g, engine::Simulation& sim, std::size_t steps_per_bucket,
-               const std::function<void(std::string_view)>& write_line) {
-  write_line(
-      report::render_run_line(g, steps_per_bucket, frame_count(steps_of(g), steps_per_bucket)));
+               const std::function<void(std::string_view)>& write_line, std::optional<int> days) {
+  write_line(report::render_run_line(g, steps_per_bucket,
+                                     frame_count(steps_of(g), steps_per_bucket), days));
   write_line(report::render_graph_line(g));
   // Pattern: Strategy — the aggregator's sink is where a frame goes: here, out as a line at once.
   report::FrameAggregator frames{g, steps_per_bucket, [&](const report::Frame& frame) {

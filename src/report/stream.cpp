@@ -314,11 +314,11 @@ constexpr int first_revision = 0;
 
 }  // namespace
 
-std::string render_run_line(const graph::Graph& g, std::size_t steps_per_bucket,
-                            std::size_t frames) {
+std::string render_run_line(const graph::Graph& g, std::size_t steps_per_bucket, std::size_t frames,
+                            std::optional<int> days) {
   const auto& scenario = g.scenario();
   const double step_s = seconds(scenario.step);
-  const std::array fields{
+  std::vector fields{
       type_field("run"),
       json_field("format_version", std::to_string(format_version)),
       json_field("scenario", json_string(scenario.name)),
@@ -328,6 +328,7 @@ std::string render_run_line(const graph::Graph& g, std::size_t steps_per_bucket,
       json_field("warmup_s", json_number(seconds(scenario.warmup))),
       json_field("bucket_s", json_number(bucket_seconds(scenario.step, steps_per_bucket))),
       json_field("frames", std::to_string(frames))};
+  if (days) fields.push_back(json_field("days", std::to_string(*days)));
   return json_on_one_line(json_object(fields));
 }
 

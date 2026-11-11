@@ -1,0 +1,847 @@
+/* The page's look: tokens on :root, one dark set whatever the system setting (a very dark grey
+   page, panels and boxes a step lighter: chosen by the user, 2026-11-10).
+   The zone colours are chosen so the three zones differ in lightness as well as hue: a reader with
+   red-green colour blindness still tells them apart, and every node also writes its zone as a word. */
+:root {
+  color-scheme: dark;
+  --bg: #18191b;
+  --panel: #222427;
+  --ink: #e6e7e9;
+  --muted: #9aa0a6;
+  --line: #3a3e44;
+  --accent: #7aa2ff;
+  --zone-green: #4cc27e;
+  --zone-green-bg: #173523;
+  --zone-yellow: #f0b429;
+  --zone-yellow-bg: #3d3112;
+  --zone-red: #ff6b5e;
+  --zone-red-bg: #4a1c18;
+  --client: #a1a7af;
+  --client-bg: #2a2e33;
+  --fault: #ff6b5e;
+  --edge: #8a8f96;
+  --surge: #b48cff;
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+  font-size: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  height: 100vh;
+}
+
+.notice {
+  padding: 24px;
+  color: var(--muted);
+}
+
+.notice.error {
+  color: var(--zone-red);
+}
+
+/* ---- the catalogue ---- */
+.catalogue {
+  overflow-y: auto;
+  border-right: 1px solid var(--line);
+  background: var(--panel);
+  padding: 8px 0;
+}
+
+.catalogue h2 {
+  margin: 12px 16px 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.catalogue ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.catalogue button {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 8px;
+  width: 100%;
+  padding: 6px 16px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.catalogue button:hover {
+  background: var(--bg);
+}
+
+.catalogue button[aria-current="true"] {
+  background: var(--bg);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.catalogue .chapter {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.badge {
+  grid-column: 1 / -1;
+  justify-self: start;
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.badge.loops {
+  color: var(--zone-green);
+  border-color: var(--zone-green);
+}
+
+.badge.drifts {
+  color: var(--zone-yellow);
+  border-color: var(--zone-yellow);
+}
+
+/* ---- the dataset ---- */
+main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+main h1 {
+  margin: 0;
+  padding: 12px 16px;
+  font-size: 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+main h1 .chapter {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+/* The diagram, with the selected box's charts and the report in a column beside it. */
+.stage {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 420px;
+}
+
+.diagram {
+  min-height: 0;
+  min-width: 0;
+}
+
+.side {
+  overflow-y: auto;
+  border-left: 1px solid var(--line);
+  background: var(--panel);
+  padding: 8px 12px 16px;
+}
+
+.side h2 {
+  margin: 12px 0 6px;
+  font-size: 13px;
+}
+
+.side .type {
+  margin: -4px 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.hint {
+  color: var(--muted);
+  margin: 8px 0;
+}
+
+/* ---- the time bar ---- */
+/* The time bar and the zone strip under it share their columns, so the strip's frames sit under
+   the slider's: play, the clock, the track, the speed. */
+:root {
+  --time-columns: 36px 96px 1fr 150px;
+}
+
+.timeline {
+  display: grid;
+  grid-template-columns: var(--time-columns);
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.timeline .play {
+  width: 36px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.timeline .clock {
+  min-width: 96px;
+  font-variant-numeric: tabular-nums;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.timeline .track {
+  position: relative;
+}
+
+.timeline input[type="range"] {
+  width: 100%;
+}
+
+.timeline .marks {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: -9px;
+  height: 7px;
+  pointer-events: none;
+}
+
+.timeline .mark {
+  position: absolute;
+  min-width: 4px;
+  height: 7px;
+  border-radius: 2px;
+}
+
+/* A failure in red; a surge of load in violet, a colour no zone uses: nothing broke. */
+.timeline .mark.failure {
+  background: var(--fault);
+}
+
+.timeline .mark.surge {
+  background: var(--surge);
+}
+
+.timeline .speed {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  color: var(--muted);
+  justify-self: end;
+}
+
+/* ---- the diagram ---- */
+/* A box's category is its band's colour (categories.ts), its zone the border and the pill. The
+   category hues keep clear of the zones' green, amber and red. */
+:root {
+  --cat-client: #9ca3af;
+  --cat-traffic: #a78bfa;
+  --cat-compute: #60a5fa;
+  --cat-cache: #22d3ee;
+  --cat-database: #e879f9;
+  --cat-storage: #d6a35c;
+  --cat-queue: #94a3b8;
+  --cat-external: #9ca3af;
+}
+
+.cat-client {
+  --cat: var(--cat-client);
+}
+.cat-traffic-routing {
+  --cat: var(--cat-traffic);
+}
+.cat-compute {
+  --cat: var(--cat-compute);
+}
+.cat-cache {
+  --cat: var(--cat-cache);
+}
+.cat-database {
+  --cat: var(--cat-database);
+}
+.cat-storage {
+  --cat: var(--cat-storage);
+}
+.cat-queue {
+  --cat: var(--cat-queue);
+}
+.cat-external {
+  --cat: var(--cat-external);
+}
+
+.diagram .react-flow__node-system {
+  width: 176px;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+.node-card {
+  height: 108px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.node-card .node-category {
+  padding: 1px 8px;
+  background: var(--cat);
+  color: #111;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.node-card .node-body {
+  padding: 4px 8px;
+}
+
+.node-card .node-id {
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.node-card .node-type {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.zone-pill {
+  flex: none;
+  padding: 0 4px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.zone-pill.zone-green {
+  color: var(--zone-green);
+  background: var(--zone-green-bg);
+}
+
+.zone-pill.zone-yellow {
+  color: var(--ink);
+  background: var(--zone-yellow-bg);
+  border: 1px solid var(--zone-yellow);
+}
+
+.zone-pill.zone-red {
+  color: #111;
+  background: var(--zone-red);
+}
+
+/* Green is the normal state: a plain border. Yellow and red stand out. */
+.node-card.zone-yellow {
+  border: 2px solid var(--zone-yellow);
+}
+
+.node-card.zone-red {
+  border: 3px solid var(--zone-red);
+  background: var(--zone-red-bg);
+}
+
+.react-flow__node.selected .node-card {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.diagram .react-flow__node-datacenter {
+  border: 1px dashed var(--muted);
+  border-radius: 10px;
+  background: transparent;
+}
+
+.datacenter-label {
+  padding: 6px 10px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.diagram .react-flow__edge-path {
+  stroke: var(--edge);
+  stroke-width: 1.5;
+}
+
+.diagram .react-flow__edge.pipe .react-flow__edge-path {
+  stroke-width: 4;
+}
+
+.diagram .react-flow__edge.pipe.zone-green .react-flow__edge-path {
+  stroke: var(--zone-green);
+}
+
+.diagram .react-flow__edge.pipe.zone-yellow .react-flow__edge-path {
+  stroke: var(--zone-yellow);
+}
+
+.diagram .react-flow__edge.pipe.zone-red .react-flow__edge-path {
+  stroke: var(--zone-red);
+}
+
+.diagram .react-flow__background,
+.diagram .react-flow {
+  background: var(--bg);
+}
+
+/* Each box has a connection point on every side (NodeCard.tsx); they are where edges attach, not
+   controls (the diagram is watch-only), so they are not drawn. */
+.diagram .react-flow__handle {
+  width: 1px;
+  height: 1px;
+  min-width: 0;
+  min-height: 0;
+  border: 0;
+  background: transparent;
+}
+
+/* ---- a node's copies ---- */
+/* A node with replicas is a stack of cards: two offset cards behind the box. */
+.node-card.stacked {
+  overflow: visible;
+  box-shadow:
+    4px 4px 0 -1px var(--panel),
+    4px 4px 0 0 var(--line),
+    8px 8px 0 -1px var(--panel),
+    8px 8px 0 0 var(--line);
+}
+
+.node-card.stacked .node-category {
+  border-radius: 7px 7px 0 0;
+}
+
+.copies {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 10px;
+  margin: 1px 0;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+/* The slots share the row: each up to 7 px wide, narrower when there are many. */
+.copies .slots {
+  display: flex;
+  flex: 1;
+  gap: 1px;
+  min-width: 0;
+}
+
+.copies .slot {
+  flex: 0 1 7px;
+  min-width: 1px;
+  height: 7px;
+  border-radius: 1px;
+  border: 1px solid var(--cat);
+}
+
+.copies .slot.up {
+  background: var(--cat);
+}
+
+.copies .slot.down {
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--zone-red);
+}
+
+.copies .copies-label {
+  flex: none;
+  color: var(--zone-red);
+  font-weight: 600;
+}
+
+/* ---- traffic on the links ---- */
+/* Dashes moving from a link's source to its target, one dash cycle per animation-duration (set per
+   link from its traffic, flow.ts); frozen while the clock is paused. */
+@keyframes flow {
+  from {
+    stroke-dashoffset: 16;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+.diagram .react-flow__edge-path.flowing {
+  stroke-dasharray: 8 8;
+  animation: flow linear infinite;
+  animation-play-state: paused;
+}
+
+.diagram.playing .react-flow__edge-path.flowing {
+  animation-play-state: running;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .diagram .react-flow__edge-path.flowing {
+    animation: none;
+  }
+}
+
+/* React Flow's credit, kept (its MIT licence asks for it politely) and drawn in the page's colours. */
+.diagram .react-flow__attribution {
+  background: transparent;
+}
+
+.diagram .react-flow__attribution a {
+  color: var(--muted);
+}
+
+/* ---- a box's bars ---- */
+.bar-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 16px;
+}
+
+.bar-row .bar {
+  position: relative;
+  flex: 0 0 48px;
+  height: 7px;
+  border-radius: 4px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.bar-row .fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--zone-green);
+  transition: width 250ms ease-out;
+}
+
+.bar-row.busy.zone-yellow .fill {
+  background: var(--zone-yellow);
+}
+
+.bar-row.busy.zone-red .fill {
+  background: var(--zone-red);
+}
+
+.bar-row.load .fill {
+  background: var(--surge);
+}
+
+/* A queue's waiting messages: grey unless its lag SLO or its room judges them (queue-zone.ts). */
+.bar-row.queue .fill {
+  background: var(--cat-queue);
+}
+
+.bar-row.queue.zone-green .fill {
+  background: var(--zone-green);
+}
+
+.bar-row.queue.zone-yellow .fill {
+  background: var(--zone-yellow);
+}
+
+.bar-row.queue.zone-red .fill {
+  background: var(--zone-red);
+}
+
+/* A queue's lag, coloured by its SLO (queue-zone.ts). */
+.lag-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 16px;
+  color: var(--muted);
+}
+
+.lag-row.lag-green {
+  color: var(--zone-green);
+}
+
+.lag-row.lag-yellow {
+  color: var(--zone-yellow);
+}
+
+.lag-row.lag-red {
+  color: var(--zone-red);
+  font-weight: 600;
+}
+
+.bar-row .tick {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 100%;
+  background: var(--bg);
+}
+
+.bar-row .peak {
+  position: absolute;
+  top: -1px;
+  width: 2px;
+  height: 9px;
+  margin-left: -1px;
+  background: var(--ink);
+  transition: left 250ms ease-out;
+}
+
+.bar-row .bar-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bar-row .fill,
+  .bar-row .peak {
+    transition: none;
+  }
+}
+
+/* ---- the charts (uPlot) ---- */
+.chart {
+  margin: 0 0 10px;
+}
+
+.chart figcaption {
+  font-size: 12px;
+  color: var(--ink);
+  margin-bottom: 2px;
+}
+
+.chart figcaption .unit {
+  color: var(--muted);
+}
+
+.chart .u-over {
+  cursor: pointer;
+}
+
+.chart .u-legend {
+  font-size: 11px;
+  color: var(--muted);
+  text-align: left;
+}
+
+.chart .u-legend .u-series {
+  padding: 0 6px 0 0;
+}
+
+.chart .u-legend th {
+  font-weight: normal;
+}
+
+.chart .u-legend .u-value {
+  color: var(--ink);
+}
+
+.chart-cursor {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 100%;
+  background: var(--ink);
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+/* ---- the zone strip ---- */
+.zone-strip {
+  display: grid;
+  grid-template-columns: var(--time-columns);
+  gap: 0 12px;
+  padding: 6px 16px 10px;
+  background: var(--panel);
+  max-height: 30vh;
+  overflow-y: auto;
+}
+
+.zone-strip .names {
+  grid-column: 1 / 3;
+}
+
+.zone-strip .names button {
+  display: block;
+  width: 100%;
+  padding: 0 6px 0 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font:
+    10px/12px system-ui,
+    sans-serif;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.zone-strip .names button[aria-current="true"] {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* The slider's thumb keeps 8px from each end of the track (the marks' inset, above). */
+.zone-strip .cells {
+  position: relative;
+  margin: 0 8px;
+}
+
+.zone-strip canvas {
+  display: block;
+  width: 100%;
+  image-rendering: pixelated;
+  cursor: pointer;
+}
+
+.zone-strip .strip-cursor {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--ink);
+  pointer-events: none;
+}
+
+/* ---- the report ---- */
+table.slo {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+table.slo th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: normal;
+  border-bottom: 1px solid var(--line);
+  padding: 2px 4px;
+}
+
+table.slo td {
+  padding: 4px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+table.slo small {
+  display: block;
+  color: var(--muted);
+}
+
+.verdict {
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+}
+
+.verdict.pass {
+  color: var(--zone-green);
+  border-color: var(--zone-green);
+}
+
+.verdict.fail {
+  color: var(--zone-red);
+  border-color: var(--zone-red);
+}
+
+.verdict.skipped {
+  color: var(--muted);
+}
+
+ul.faults {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+button.fault {
+  display: block;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--fault);
+  border-radius: 4px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+button.fault:hover {
+  border-color: var(--fault);
+}
+
+button.fault .what {
+  display: block;
+  font-weight: 600;
+}
+
+button.fault .when {
+  display: block;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+button.fault .facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0 10px;
+  margin-top: 4px;
+}
+
+button.fault .facts-title {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+button.fault .fact {
+  display: contents;
+}
+
+button.fault .fact .name {
+  color: var(--muted);
+}
