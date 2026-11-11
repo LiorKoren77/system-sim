@@ -304,9 +304,10 @@ main h1 .chapter {
 }
 
 .zone-pill {
-  padding: 0 6px;
+  flex: none;
+  padding: 0 4px;
   border-radius: 8px;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 600;
 }
 
@@ -497,7 +498,7 @@ main h1 .chapter {
 
 .bar-row .bar {
   position: relative;
-  flex: 0 0 56px;
+  flex: 0 0 48px;
   height: 7px;
   border-radius: 4px;
   background: var(--line);
@@ -540,12 +541,24 @@ main h1 .chapter {
   background: var(--zone-red);
 }
 
-/* A queue's lag label, coloured by its SLO. */
-.bar-row.lag-yellow .bar-label {
+/* A queue's lag, coloured by its SLO (queue-zone.ts). */
+.lag-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 16px;
+  color: var(--muted);
+}
+
+.lag-row.lag-green {
+  color: var(--zone-green);
+}
+
+.lag-row.lag-yellow {
   color: var(--zone-yellow);
 }
 
-.bar-row.lag-red .bar-label {
+.lag-row.lag-red {
   color: var(--zone-red);
   font-weight: 600;
 }

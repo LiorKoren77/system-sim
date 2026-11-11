@@ -3,6 +3,7 @@ import { useContext } from "react";
 import { categoryClass } from "./categories";
 import type { Copies } from "./copies";
 import { FrameContext } from "./frame-context";
+import { worstZone } from "./queue-zone";
 import type { NodeData, Queue } from "./to-flow-elements";
 
 // One node of the system (each bar's label is short, so a box drawn small still shows it: the busy
@@ -16,7 +17,22 @@ import type { NodeData, Queue } from "./to-flow-elements";
 // since a source has no queue to fill.
 export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
   const state = useContext(FrameContext).get(data.id);
-  const zone = state?.zone ?? null;
+  // A queue's box shows the worse of its broker's zone and its queue's (lag against its SLO,
+  // messages against their room: queue-zone.ts); any other box its own.
+  const zone = worstZone([
+    state?.zone ?? null,
+    state?.lagZone ?? null,
+    ...(state?.queues ?? []).map((q) => q.zone),
+  ]);
+  // A queue's lag gets a row of its own, which also carries the zone pill (it has the room); with
+  // several consumer groups the lag goes to the tooltip, so the box does not overflow.
+  const lag =
+    state !== undefined &&
+    state.lagSeconds !== null &&
+    state.lagSeconds >= 1 &&
+    state.queues.length <= 1
+      ? state.lagSeconds
+      : null;
   const copies = data.replicas > 1 ? ` ×${data.replicas}` : "";
   const shards = data.shards !== null ? ` · ${data.shards} shards` : "";
   // A node with copies is drawn as a stack of cards (theme.css), its slots the copies up.
@@ -37,28 +53,34 @@ export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
           <BarRow label={rate(state.offeredPerSecond)} fill={state.load} className="load" />
         ) : (
           <BarRow
-            label={busyLabel(data.type, state?.busy?.mean ?? null, state?.lagSeconds ?? null)}
+            label={busyLabel(data.type, state?.busy?.mean ?? null)}
             title={busyTitle(data.type, state?.busy?.mean ?? null)}
             fill={state?.busy?.mean ?? null}
             peak={state?.busy?.peak ?? null}
             ticks={[data.yellow, data.red]}
-            className={`busy zone-${zone ?? "none"}${state?.lagZone ? ` lag-${state.lagZone}` : ""}`}
-            pill={zone}
+            className={`busy zone-${zone ?? "none"}`}
+            pill={lag !== null ? null : zone}
           />
         )}
         {state?.queues.map((q) => (
           <BarRow
             key={q.consumer ?? "own"}
             label={queueLabel(q, state.queues.length)}
-            title={
-              q.consumer === null
-                ? `${count(q.backlog)} waiting`
-                : `${count(q.backlog)} messages waiting for ${q.consumer}`
-            }
+            title={`${count(q.backlog)} ${q.consumer === null ? "waiting" : `messages waiting for ${q.consumer}`}${
+              state.lagSeconds != null && state.lagSeconds >= 1
+                ? `, lag ${duration(state.lagSeconds)}`
+                : ""
+            }`}
             fill={q.fill}
             className={`queue zone-${q.zone ?? "none"}`}
           />
         ))}
+        {lag !== null && (
+          <div className={`lag-row lag-${state?.lagZone ?? "none"}`}>
+            <span>lag {duration(lag)}</span>
+            {zone !== null && <span className={`zone-pill zone-${zone}`}>{zoneWord[zone]}</span>}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -98,13 +120,11 @@ function BarRow(props: {
 }
 
 // A queue's busy bar is its broker's (accepting and handing out messages, about a million a second),
-// not how full it is: its waiting messages are the rows below. While messages wait a second or more,
-// its label is the queue's lag instead, the number a reader of a queue wants: how long a message
-// published now waits for a worker. The broker's share stays in the bar and the tooltip.
-function busyLabel(type: string, mean: number | null, lag: number | null): string {
+// not how full it is: its waiting messages and its lag are the rows below it.
+function busyLabel(type: string, mean: number | null): string {
   if (mean === null) return "–";
-  if (type !== "message_queue") return `${Math.round(mean * 100)}%`;
-  return lag !== null && lag >= 1 ? `lag ${duration(lag)}` : `broker ${Math.round(mean * 100)}%`;
+  const percent = `${Math.round(mean * 100)}%`;
+  return type === "message_queue" ? `broker ${percent}` : percent;
 }
 
 function busyTitle(type: string, mean: number | null): string {
@@ -119,11 +139,11 @@ function queueLabel(q: Queue, rows: number): string {
   return `${count(q.backlog)} waiting`;
 }
 
-// 45 → "45s", 225 → "3.8m", 7560 → "2.1h".
+// 45 → "45 s", 225 → "3.8 min", 7560 → "2.1 h" (min, not m: "2.92M" is a count).
 function duration(seconds: number): string {
-  if (seconds < 90) return `${Math.round(seconds)}s`;
-  if (seconds < 5400) return `${(seconds / 60).toFixed(1)}m`;
-  return `${(seconds / 3600).toFixed(1)}h`;
+  if (seconds < 90) return `${Math.round(seconds)} s`;
+  if (seconds < 5400) return `${(seconds / 60).toFixed(1)} min`;
+  return `${(seconds / 3600).toFixed(1)} h`;
 }
 
 // 2923830 → "2.92M", 50 → "50".

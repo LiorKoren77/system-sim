@@ -12,7 +12,10 @@ describe("the zone of a queue", () => {
   it("is yellow from 70% of its room and red from 90%, where messages start to be deleted unread", () => {
     expect(queueZone({ lag: null, lagMax: null, backlog: 700, room: 1000 })).toBe("yellow");
     expect(queueZone({ lag: null, lagMax: null, backlog: 900, room: 1000 })).toBe("red");
-    expect(queueZone({ lag: null, lagMax: null, backlog: 100, room: 1000 })).toBe("green");
+    // Far from its room, a queue no SLO judges keeps no promise: no zone, not green.
+    expect(queueZone({ lag: null, lagMax: null, backlog: 100, room: 1000 })).toBeNull();
+    // A lag SLO that is met makes it green, whatever its room.
+    expect(queueZone({ lag: 10, lagMax: 300, backlog: 100, room: 1000 })).toBe("green");
   });
 
   it("is the worse of the two, as a node's zone is the worst of its bucket", () => {
@@ -27,5 +30,15 @@ describe("the zone of a queue", () => {
 
   it("judges the room alone when the lag is unbounded or unknown", () => {
     expect(queueZone({ lag: null, lagMax: 300, backlog: 950, room: 1000 })).toBe("red");
+  });
+});
+
+describe("the zone a queue's box shows", () => {
+  it("is the worse of its broker's and its queue's, as a node's zone is its worst", async () => {
+    const { worstZone } = await import("../src/diagram/queue-zone");
+    expect(worstZone(["green", "yellow", null])).toBe("yellow");
+    expect(worstZone(["green", null])).toBe("green");
+    expect(worstZone(["yellow", "red"])).toBe("red");
+    expect(worstZone([null, null])).toBeNull();
   });
 });

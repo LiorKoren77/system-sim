@@ -30,10 +30,10 @@ describe("the bars in a box", () => {
     if (!graph) throw new Error("no graph");
     const peaks = peaksOf(graph, store);
     expect(nodeStatesAt(graph, store, 0, peaks).get("api")?.queues).toEqual([
-      { fill: 0.5, backlog: 50, consumer: null, zone: "green" },
+      { fill: 0.5, backlog: 50, consumer: null, zone: null },
     ]);
     expect(nodeStatesAt(graph, store, 5, peaks).get("api")?.queues).toEqual([
-      { fill: 1, backlog: 100, consumer: null, zone: "green" },
+      { fill: 1, backlog: 100, consumer: null, zone: null },
     ]);
   });
 
