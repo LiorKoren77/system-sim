@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemorySource } from "@simsys/stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -159,5 +159,17 @@ describe("the page", () => {
     await userEvent.keyboard("{ArrowLeft}{ArrowLeft}");
     await userEvent.dblClick(splitter);
     expect(splitter.getAttribute("aria-valuenow")).toBe("420");
+  });
+
+  it("hides the zone strip to give the diagram its height, and keeps the time bar", async () => {
+    renderApp({ "book/url-shortener": fixtureLines("book-url-shortener") });
+    await screen.findByText("00:00");
+    const rows = screen.getByRole("group", { name: "Zones of the window" });
+    expect(within(rows).getByRole("button", { name: "url_db" })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Hide the zone strip" }));
+    expect(screen.queryByRole("group", { name: "Zones of the window" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Play" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: "Show the zone strip" }));
+    expect(screen.getByRole("group", { name: "Zones of the window" })).toBeVisible();
   });
 });

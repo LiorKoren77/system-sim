@@ -55,15 +55,17 @@ describe("the width of the charts panel", () => {
 
 describe("the panes a viewer left", () => {
   it("come back as they were saved", () => {
-    expect(parsePanes(JSON.stringify({ catalogueOpen: false, sideWidth: 600 }))).toEqual({
-      catalogueOpen: false,
-      sideWidth: 600,
-    });
+    const saved = { catalogueOpen: false, stripOpen: false, sideWidth: 600 };
+    expect(parsePanes(JSON.stringify(saved))).toEqual(saved);
   });
 
   it("are the defaults when nothing was saved", () => {
     expect(parsePanes(null)).toEqual(defaultPanes);
-    expect(defaultPanes).toEqual({ catalogueOpen: true, sideWidth: SIDE_DEFAULT });
+    expect(defaultPanes).toEqual({
+      catalogueOpen: true,
+      stripOpen: true,
+      sideWidth: SIDE_DEFAULT,
+    });
   });
 
   it("are the defaults for what is not a saved layout", () => {
@@ -75,11 +77,11 @@ describe("the panes a viewer left", () => {
   it("keep the valid part of a half-valid layout", () => {
     expect(parsePanes(JSON.stringify({ catalogueOpen: false, sideWidth: "wide" }))).toEqual({
       catalogueOpen: false,
+      stripOpen: true,
       sideWidth: SIDE_DEFAULT,
     });
-    expect(parsePanes(JSON.stringify({ catalogueOpen: "no", sideWidth: 10 }))).toEqual({
-      catalogueOpen: true,
-      sideWidth: SIDE_MIN,
-    });
+    expect(
+      parsePanes(JSON.stringify({ catalogueOpen: "no", stripOpen: false, sideWidth: 10 })),
+    ).toEqual({ catalogueOpen: true, stripOpen: false, sideWidth: SIDE_MIN });
   });
 });
