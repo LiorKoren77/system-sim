@@ -8,7 +8,7 @@ describe("the precompute's command line", () => {
 
   it("refuses a --jobs that is not a positive whole number, rather than run nothing", () => {
     for (const jobs of ["four", "0", "-2", "1.5", ""]) {
-      expect(() => readOptions(["--jobs", jobs], "out")).toThrow(
+      expect(() => readOptions([`--jobs=${jobs}`], "out")).toThrow(
         `--jobs must be a positive whole number, not '${jobs}'`,
       );
     }

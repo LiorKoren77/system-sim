@@ -40,6 +40,22 @@ export function createPlayer(options: {
   return { ...options, frame: 0, seconds: 60, playing: false, carry: 0 };
 }
 
+// The player's frames from the store as it fills: as many as have arrived, and a looping day wraps
+// only once all of it has (wrapping at the part loaded so far would replay the morning over and
+// over while the evening downloads).
+export function playerConfig(store: {
+  readonly frameCount: number;
+  readonly status: string;
+  readonly dataset: { readonly loops: boolean } | undefined;
+  readonly run: { readonly bucket_s: number } | undefined;
+}): { frames: number; loops: boolean; framesPerHour: number } {
+  return {
+    frames: store.frameCount,
+    loops: store.status === "ready" && (store.dataset?.loops ?? false),
+    framesPerHour: store.run ? 3600 / store.run.bucket_s : 1,
+  };
+}
+
 export function playerReducer(state: PlayerState, action: PlayerAction): PlayerState {
   switch (action.type) {
     case "play":

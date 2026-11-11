@@ -28,8 +28,10 @@ export function FaultBlocks(props: { store: DatasetStore; onSeek: (frame: number
   if (faults.length === 0) return <p className="hint">No scripted fault in this window.</p>;
   return (
     <ul className="faults">
-      {faults.map((fault) => (
-        <li key={`${fault.kind}-${fault.at_s}`}>
+      {faults.map((fault, i) => (
+        <li
+          key={`${fault.kind}-${fault.node ?? fault.datacenter ?? ""}-${String(fault.at_s)}-${String(i)}`}
+        >
           <button
             type="button"
             className="fault"
