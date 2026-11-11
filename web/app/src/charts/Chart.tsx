@@ -56,9 +56,11 @@ export function Chart(props: {
   const plot = useRef<uPlot | null>(null);
   const cursor = useRef<HTMLDivElement | null>(null);
   const seek = useRef(onSeek);
+  const at = useRef(x[frame]); // the slider's x, for a resize between two frames
   useEffect(() => {
     seek.current = onSeek;
-  }, [onSeek]);
+    at.current = x[frame];
+  });
 
   useEffect(() => {
     const element = box.current;
@@ -116,6 +118,7 @@ export function Chart(props: {
     cursor.current = line;
     const resize = new ResizeObserver(() => {
       u.setSize({ width: element.clientWidth, height: HEIGHT });
+      if (at.current !== undefined) line.style.left = `${u.valToPos(at.current, "x")}px`;
     });
     resize.observe(element);
     return () => {
@@ -129,9 +132,9 @@ export function Chart(props: {
   useEffect(() => {
     const u = plot.current;
     const line = cursor.current;
-    const at = x[frame];
-    if (u === null || line === null || at === undefined) return;
-    line.style.left = `${u.valToPos(at, "x")}px`;
+    const position = x[frame];
+    if (u === null || line === null || position === undefined) return;
+    line.style.left = `${u.valToPos(position, "x")}px`;
   });
 
   return (
