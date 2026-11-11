@@ -41,7 +41,8 @@ body {
 
 .app {
   display: grid;
-  grid-template-columns: 260px 1fr;
+  /* The catalogue's own width: 260 px open, a narrow rail when hidden. */
+  grid-template-columns: auto minmax(0, 1fr);
   height: 100vh;
 }
 
@@ -56,10 +57,38 @@ body {
 
 /* ---- the catalogue ---- */
 .catalogue {
+  width: 260px;
   overflow-y: auto;
   border-right: 1px solid var(--line);
   background: var(--panel);
   padding: 8px 0;
+}
+
+.catalogue.collapsed {
+  width: 32px;
+  padding: 8px 0;
+}
+
+/* Scoped past `.catalogue button`, the rule of the list's rows. */
+.catalogue button.pane-toggle {
+  display: block;
+  width: 24px;
+  height: 24px;
+  margin: 0 4px 0 auto;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  text-align: center;
+  line-height: 1;
+}
+
+.catalogue.collapsed button.pane-toggle {
+  margin: 0 auto;
+}
+
+.catalogue button.pane-toggle:hover {
+  color: var(--ink);
 }
 
 .catalogue h2 {
@@ -149,7 +178,22 @@ main h1 .chapter {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 1fr 420px;
+  /* The diagram, the splitter, the panel at the width the viewer dragged it to (App.tsx sets
+     --side-width; layout/panes.ts bounds it). */
+  grid-template-columns: minmax(0, 1fr) 6px var(--side-width, 420px);
+}
+
+/* The border between the diagram and the charts panel, wide enough to grab. */
+.splitter {
+  cursor: col-resize;
+  background: var(--line);
+  touch-action: none; /* a touch drag resizes instead of scrolling the page */
+}
+
+.splitter:hover,
+.splitter:focus-visible {
+  background: var(--accent);
+  outline: none;
 }
 
 .diagram {
@@ -158,8 +202,8 @@ main h1 .chapter {
 }
 
 .side {
+  min-width: 0;
   overflow-y: auto;
-  border-left: 1px solid var(--line);
   background: var(--panel);
   padding: 8px 12px 16px;
 }

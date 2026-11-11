@@ -1,11 +1,13 @@
 import { FileSource, type DatasetSource, type DatasetStore } from "@simsys/stream";
-import { useEffect, useMemo, useReducer, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { Catalogue } from "./catalogue/Catalogue";
 import { Details } from "./charts/Details";
 import { ZoneStrip } from "./charts/ZoneStrip";
 import { defaultEntry, fetchIndex, type Index, type IndexEntry } from "./catalogue/index-file";
 import { Diagram } from "./diagram/Diagram";
 import { readHash, writeHash } from "./hash";
+import { readPanes, writePanes, type Panes } from "./layout/panes";
+import { Splitter } from "./layout/Splitter";
 import { FaultBlocks } from "./report/FaultBlocks";
 import { SloTable } from "./report/SloTable";
 import {
@@ -28,6 +30,13 @@ export function App(props: {
   const [indexFailed, setIndexFailed] = useState(false);
   const [selected, setSelected] = useState<string | null>(() => readHash().id);
   const [node, setNode] = useState<string | null>(() => readHash().node);
+  // How the viewer left the panes (the list hidden, the charts' width), kept in this browser.
+  const [panes, setPanes] = useState<Panes>(readPanes);
+  const changePanes = (change: Partial<Panes>) => {
+    const next = { ...panes, ...change };
+    setPanes(next);
+    writePanes(next);
+  };
   // The injected functions are taken once: a new function per render must not reload anything.
   const [loadIndex] = useState(() => props.loadIndex ?? (() => fetchIndex()));
   const [sourceFor] = useState(
@@ -59,7 +68,15 @@ export function App(props: {
   if (index === null) return <p className="notice">Loading the catalogue…</p>;
   return (
     <div className="app">
-      <Catalogue index={index} selected={entry?.id ?? null} onSelect={choose} />
+      <Catalogue
+        index={index}
+        selected={entry?.id ?? null}
+        onSelect={choose}
+        open={panes.catalogueOpen}
+        onToggle={() => {
+          changePanes({ catalogueOpen: !panes.catalogueOpen });
+        }}
+      />
       <main>
         {entry && (
           <h1>
@@ -67,21 +84,36 @@ export function App(props: {
             {entry.chapter !== null && <span className="chapter"> · ch. {entry.chapter}</span>}
           </h1>
         )}
-        {store && <Dataset key={entry?.id} store={store} node={node} onSelectNode={chooseNode} />}
+        {store && (
+          <Dataset
+            key={entry?.id}
+            store={store}
+            node={node}
+            onSelectNode={chooseNode}
+            sideWidth={panes.sideWidth}
+            onResizeSide={(sideWidth) => {
+              changePanes({ sideWidth });
+            }}
+          />
+        )}
       </main>
     </div>
   );
 }
 
 // One dataset on the page: its status while it loads or when it failed, then the diagram with the
-// selected box's charts and the report beside it, and across the bottom the time bar and the zone
-// strip. Keyed by the dataset's id, so a new choice starts at frame 0.
+// selected box's charts and the report beside it (the border between them is dragged: Splitter),
+// and across the bottom the time bar and the zone strip. Keyed by the dataset's id, so a new choice
+// starts at frame 0.
 function Dataset(props: {
   store: DatasetStore;
   node: string | null;
   onSelectNode: (id: string | null) => void;
+  sideWidth: number;
+  onResizeSide: (width: number) => void;
 }) {
   const { store } = props;
+  const stage = useRef<HTMLDivElement>(null);
   const dataset = store.dataset;
   const shown = {
     kind: dataset?.kind ?? "run",
@@ -109,7 +141,14 @@ function Dataset(props: {
   };
   return (
     <>
-      <div className="stage">
+      {/* The panel's width goes to the stylesheet as a custom property: the grid's columns are
+          written there, in one place. A custom property is not in React's style type, hence the
+          cast. */}
+      <div
+        className="stage"
+        ref={stage}
+        style={{ "--side-width": `${props.sideWidth}px` } as React.CSSProperties}
+      >
         <Diagram
           store={store}
           frame={frame}
@@ -117,6 +156,7 @@ function Dataset(props: {
           onSelect={props.onSelectNode}
           playing={effective.playing}
         />
+        <Splitter width={props.sideWidth} stage={stage} onResize={props.onResizeSide} />
         <aside className="side">
           <Details store={store} selected={props.node} frame={frame} shown={shown} onSeek={seek} />
           <section className="report" aria-label="Report">
