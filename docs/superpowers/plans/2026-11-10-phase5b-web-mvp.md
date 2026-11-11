@@ -261,4 +261,40 @@
 
 ## As built
 
-(Filled in as the tasks land: package versions, the fixtures' sizes, the precompute's table, review corrections.)
+Rules as built and every deviation: main spec §23. Here: what was installed and measured.
+
+**Versions** (pinned by `web/package-lock.json`, 2026-11-10): Node 22.23.4, TypeScript 6.0.3,
+React 19.3.1, Vite 8.3.7, Vitest 5.1.0, jsdom 31.0.0, Testing Library React 16.3.3, ESLint 10.14.0,
+typescript-eslint 8.72.2, eslint-plugin-react-hooks 7.1.1, Prettier 3.9.10, @xyflow/react 12.12.1,
+elkjs 0.12.1, uPlot 1.6.32, yaml 2.9.1, tsx 4.23.15.
+
+**Fixtures** (`web/stream/test/fixtures`, gzipped): book-url-shortener 168,160 B (a day of 1440
+frames), labs-kv-store 4,483 B, tutorial-chain 3,745 B, tutorial-hello 3,099 B.
+
+**The precompute** (2026-11-11, gcc14-release, 14 jobs, 3 min 2 s wall clock):
+
+| dataset | kind | seam | frames | size | time |
+|---|---|---|---|---|---|
+| book/chat-system | day | repeats | 1440 | 332 KB | 186 s |
+| book/google-drive | day | repeats | 1440 | 281 KB | 47 s |
+| book/news-feed | day | repeats | 1440 | 275 KB | 125 s |
+| book/notification-system | day | repeats | 1440 | 437 KB | 123 s |
+| book/search-autocomplete | day | repeats | 1440 | 210 KB | 23 s |
+| book/url-shortener | day | repeats | 1440 | 164 KB | 2.5 s |
+| book/youtube | day | repeats | 1440 | 347 KB | 91 s |
+| book/web-crawler | run | — | 720 | 19 KB | 14 s |
+| labs/consistent-hashing | run | — | 706 | 6 KB | 0.2 s |
+| labs/kv-store | run | — | 720 | 4 KB | 0.2 s |
+| labs/rate-limiter | run | — | 720 | 5 KB | 0.1 s |
+| labs/unique-id | run | — | 667 | 4 KB | 0.1 s |
+| tutorial/chain | run | — | 600 | 4 KB | 0.1 s |
+| tutorial/hello | run | — | 600 | 3 KB | 0.1 s |
+
+**Deviations from the tasks above** (each in spec §23): day frames of 1 min, not 2 (the tasks'
+720-frame and 12-frames-a-second numbers became 1440 and 24); a speed is the window's playing time;
+`--days` with `--replications` is allowed; the graph gained `spikes`, `replicas` and `primary`;
+`diagram.yaml`; one dark theme; the diagram's refinements after the Batch D checkpoint (categories,
+copy stacks, flow dashes, bars, pull links, queue zones), each asked for by the user at the screen.
+
+**Tests at the end of Batch E:** 1821 C++ tests (gcc14-debug), 181 web tests (one more, the
+precompute's integration test, runs with `SIMSYS` set).
