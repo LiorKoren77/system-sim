@@ -10,6 +10,10 @@ import { entry, fixtureLines, index } from "./support";
 vi.mock("../src/diagram/Diagram", () => ({
   Diagram: () => <div data-testid="diagram" />,
 }));
+// uPlot draws on a canvas jsdom does not have: its inputs are tested in series.test.ts.
+vi.mock("../src/charts/Chart", () => ({
+  Chart: (props: { spec: { title: string } }) => <figure aria-label={props.spec.title} />,
+}));
 
 const datasets = index([
   entry("book/url-shortener", {
@@ -89,5 +93,25 @@ describe("the page", () => {
     await userEvent.keyboard(" ");
     expect(screen.getByRole("button", { name: "Pause" })).toBeVisible();
     act(() => undefined);
+  });
+
+  it("shows the day's SLO table, and the charts of the box the address names", async () => {
+    window.location.hash = "#book/url-shortener&node=url_db";
+    renderApp({ "book/url-shortener": fixtureLines("book-url-shortener") });
+    expect(await screen.findByRole("table", { name: "SLOs" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "url_db" })).toBeVisible();
+    expect(screen.getByRole("figure", { name: "busy" })).toBeVisible();
+  });
+
+  it("asks for a box to chart while none is chosen", async () => {
+    renderApp({ "book/url-shortener": fixtureLines("book-url-shortener") });
+    expect(await screen.findByText("Click a box to chart its day.")).toBeVisible();
+  });
+
+  it("chooses a box from its row in the zone strip", async () => {
+    renderApp({ "book/url-shortener": fixtureLines("book-url-shortener") });
+    await userEvent.click(await screen.findByRole("button", { name: "web" }));
+    expect(window.location.hash).toBe("#book/url-shortener&node=web");
+    expect(screen.getByRole("heading", { name: "web" })).toBeVisible();
   });
 });
