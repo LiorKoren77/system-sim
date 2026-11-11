@@ -3,8 +3,8 @@ import { useContext } from "react";
 import { categoryClass } from "./categories";
 import type { Copies } from "./copies";
 import { FrameContext } from "./frame-context";
-import { worstZone } from "./queue-zone";
-import type { NodeData, Queue } from "./to-flow-elements";
+import { count, duration, rate } from "../format";
+import { boxZone, type NodeData, type Queue } from "./to-flow-elements";
 
 // One node of the system (each bar's label is short, so a box drawn small still shows it: the busy
 // bar's percentage is utilisation, the load bar's rate what the client offers). The band across the top names its category in the category's colour
@@ -17,13 +17,7 @@ import type { NodeData, Queue } from "./to-flow-elements";
 // since a source has no queue to fill.
 export function NodeCard({ data }: NodeProps<Node<NodeData>>) {
   const state = useContext(FrameContext).get(data.id);
-  // A queue's box shows the worse of its broker's zone and its queue's (lag against its SLO,
-  // messages against their room: queue-zone.ts); any other box its own.
-  const zone = worstZone([
-    state?.zone ?? null,
-    state?.lagZone ?? null,
-    ...(state?.queues ?? []).map((q) => q.zone),
-  ]);
+  const zone = boxZone(state);
   // A queue's lag gets a row of its own, which also carries the zone pill (it has the room); with
   // several consumer groups the lag goes to the tooltip, so the box does not overflow.
   const lag =
@@ -139,21 +133,6 @@ function queueLabel(q: Queue, rows: number): string {
   return `${count(q.backlog)} waiting`;
 }
 
-// 45 → "45 s", 225 → "3.8 min", 7560 → "2.1 h" (min, not m: "2.92M" is a count).
-function duration(seconds: number): string {
-  if (seconds < 90) return `${Math.round(seconds)} s`;
-  if (seconds < 5400) return `${(seconds / 60).toFixed(1)} min`;
-  return `${(seconds / 3600).toFixed(1)} h`;
-}
-
-// 2923830 → "2.92M", 50 → "50".
-function count(n: number): string {
-  if (n >= 1e9) return `${Number((n / 1e9).toPrecision(3))}G`;
-  if (n >= 1e6) return `${Number((n / 1e6).toPrecision(3))}M`;
-  if (n >= 1e3) return `${Number((n / 1e3).toPrecision(3))}k`;
-  return String(Number(n.toPrecision(3)));
-}
-
 // One slot per copy, filled while it is up; the slots narrow as the copies grow, so a stack of 20
 // or 100 still fits the box. Shown for a node with copies, and for a single copy only while it is
 // down. simsys knows how many copies are down, not which (copies.ts), so the slots up are always
@@ -189,13 +168,4 @@ function Handles() {
     <Handle key={`t-${side}`} id={`target-${side}`} type="target" position={position} />,
     <Handle key={`s-${side}`} id={`source-${side}`} type="source" position={position} />,
   ]);
-}
-
-// 1500 → "1.5k/s", 2000000 → "2M/s".
-export function rate(perSecond: number): string {
-  const scaled = (value: number, unit: string) => `${Number(value.toPrecision(3))}${unit}/s`;
-  if (perSecond >= 1e9) return scaled(perSecond / 1e9, "G");
-  if (perSecond >= 1e6) return scaled(perSecond / 1e6, "M");
-  if (perSecond >= 1e3) return scaled(perSecond / 1e3, "k");
-  return scaled(perSecond, "");
 }

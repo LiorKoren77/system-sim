@@ -111,7 +111,7 @@ export interface Report {
   readonly scenario: string;
   readonly steps: number;
   readonly slo: readonly SloResult[];
-  readonly faults: readonly FaultBlock[];
+  readonly faults?: readonly FaultBlock[]; // absent in a scenario without faults
   readonly [key: string]: unknown;
 }
 
@@ -123,7 +123,7 @@ export interface SloResult {
   readonly max: number;
   readonly status: string; // pass, fail, skipped
   readonly note: string | null;
-  readonly window_start_s?: number;
+  readonly window_start_s?: number | null; // only an SLO with `over`; null when skipped
 }
 
 export interface FaultBlock {

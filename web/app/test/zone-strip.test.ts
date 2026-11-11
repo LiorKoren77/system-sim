@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { frameAtX, rowAtY, zoneGrid } from "../src/charts/zone-strip";
-import { fixtureStore } from "./support";
+import { fixtureStore, queueAndPool } from "./support";
 
 describe("the zone strip's grid", () => {
   it("has a row per node but the clients, a cell per frame, each the frame's zone", async () => {
@@ -27,5 +27,17 @@ describe("a click on the strip", () => {
     expect(rowAtY(0, 8, 2)).toBe(0);
     expect(rowAtY(9, 8, 2)).toBe(1);
     expect(rowAtY(16, 8, 2)).toBeNull();
+  });
+});
+
+describe("a queue's row in the strip", () => {
+  it("is the zone its box shows: the lag against its SLO, not only the broker's", async () => {
+    // 240 s of lag against a queue_lag SLO of 300 s: 80% of the bound, yellow; the broker is idle.
+    const store = await queueAndPool(0, 240, 300);
+    if (!store.graph) throw new Error("no graph");
+    const grid = zoneGrid(store.graph, store);
+    const q = grid.rows.findIndex((r) => r.id === "q");
+    expect(store.nodeColumn(1, "zone")[0]).toBe(0);
+    expect(grid.cells[q * grid.frames]).toBe(1);
   });
 });

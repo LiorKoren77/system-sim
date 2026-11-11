@@ -29,8 +29,8 @@ function layoutOf(graph: GraphLine, diagram: DiagramFile | undefined): Promise<L
 }
 
 // The system's diagram at the slider's frame, drawn by React Flow (pan and zoom; nodes stay where
-// the layout put them). Clicking a node selects it for the charts; clicking the background clears
-// the selection.
+// the layout put them). Clicking a node, or a link with a bandwidth, selects it for the charts;
+// clicking the background clears the selection.
 export function Diagram(props: {
   store: DatasetStore;
   frame: number;
@@ -115,6 +115,12 @@ export function Diagram(props: {
             minZoom={0.2}
             onNodeClick={(_, node) => {
               if (node.type === "system") onSelect(node.id);
+            }}
+            onEdgeClick={(_, edge) => {
+              // A bandwidth link has columns of its own to chart; it is selected as "from->to".
+              const index = (edge.data as { index?: number } | undefined)?.index;
+              const link = index === undefined ? undefined : graph?.links[index];
+              if (link && link.pipe_row !== null) onSelect(`${link.from}->${link.to}`);
             }}
             onPaneClick={() => {
               onSelect(null);

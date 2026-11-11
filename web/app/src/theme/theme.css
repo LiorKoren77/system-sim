@@ -144,14 +144,52 @@ main h1 .chapter {
   font-weight: normal;
 }
 
-.diagram {
+/* The diagram, with the selected box's charts and the report in a column beside it. */
+.stage {
   flex: 1;
   min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 420px;
+}
+
+.diagram {
+  min-height: 0;
+  min-width: 0;
+}
+
+.side {
+  overflow-y: auto;
+  border-left: 1px solid var(--line);
+  background: var(--panel);
+  padding: 8px 12px 16px;
+}
+
+.side h2 {
+  margin: 12px 0 6px;
+  font-size: 13px;
+}
+
+.side .type {
+  margin: -4px 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.hint {
+  color: var(--muted);
+  margin: 8px 0;
 }
 
 /* ---- the time bar ---- */
+/* The time bar and the zone strip under it share their columns, so the strip's frames sit under
+   the slider's: play, the clock, the track, the speed. */
+:root {
+  --time-columns: 36px 96px 1fr 150px;
+}
+
 .timeline {
-  display: flex;
+  display: grid;
+  grid-template-columns: var(--time-columns);
   align-items: center;
   gap: 12px;
   padding: 10px 16px;
@@ -178,7 +216,6 @@ main h1 .chapter {
 
 .timeline .track {
   position: relative;
-  flex: 1;
 }
 
 .timeline input[type="range"] {
@@ -215,6 +252,7 @@ main h1 .chapter {
   gap: 6px;
   align-items: center;
   color: var(--muted);
+  justify-self: end;
 }
 
 /* ---- the diagram ---- */
@@ -593,4 +631,217 @@ main h1 .chapter {
   .bar-row .peak {
     transition: none;
   }
+}
+
+/* ---- the charts (uPlot) ---- */
+.chart {
+  margin: 0 0 10px;
+}
+
+.chart figcaption {
+  font-size: 12px;
+  color: var(--ink);
+  margin-bottom: 2px;
+}
+
+.chart figcaption .unit {
+  color: var(--muted);
+}
+
+.chart .u-over {
+  cursor: pointer;
+}
+
+.chart .u-legend {
+  font-size: 11px;
+  color: var(--muted);
+  text-align: left;
+}
+
+.chart .u-legend .u-series {
+  padding: 0 6px 0 0;
+}
+
+.chart .u-legend th {
+  font-weight: normal;
+}
+
+.chart .u-legend .u-value {
+  color: var(--ink);
+}
+
+.chart-cursor {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 100%;
+  background: var(--ink);
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+/* ---- the zone strip ---- */
+.zone-strip {
+  display: grid;
+  grid-template-columns: var(--time-columns);
+  gap: 0 12px;
+  padding: 6px 16px 10px;
+  background: var(--panel);
+  max-height: 30vh;
+  overflow-y: auto;
+}
+
+.zone-strip .names {
+  grid-column: 1 / 3;
+}
+
+.zone-strip .names button {
+  display: block;
+  width: 100%;
+  padding: 0 6px 0 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font:
+    10px/12px system-ui,
+    sans-serif;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.zone-strip .names button[aria-current="true"] {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* The slider's thumb keeps 8px from each end of the track (the marks' inset, above). */
+.zone-strip .cells {
+  position: relative;
+  margin: 0 8px;
+}
+
+.zone-strip canvas {
+  display: block;
+  width: 100%;
+  image-rendering: pixelated;
+  cursor: pointer;
+}
+
+.zone-strip .strip-cursor {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--ink);
+  pointer-events: none;
+}
+
+/* ---- the report ---- */
+table.slo {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+table.slo th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: normal;
+  border-bottom: 1px solid var(--line);
+  padding: 2px 4px;
+}
+
+table.slo td {
+  padding: 4px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+table.slo small {
+  display: block;
+  color: var(--muted);
+}
+
+.verdict {
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+}
+
+.verdict.pass {
+  color: var(--zone-green);
+  border-color: var(--zone-green);
+}
+
+.verdict.fail {
+  color: var(--zone-red);
+  border-color: var(--zone-red);
+}
+
+.verdict.skipped {
+  color: var(--muted);
+}
+
+ul.faults {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+button.fault {
+  display: block;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--fault);
+  border-radius: 4px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+button.fault:hover {
+  border-color: var(--fault);
+}
+
+button.fault .what {
+  display: block;
+  font-weight: 600;
+}
+
+button.fault .when {
+  display: block;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+button.fault .facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0 10px;
+  margin-top: 4px;
+}
+
+button.fault .facts-title {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+button.fault .fact {
+  display: contents;
+}
+
+button.fault .fact .name {
+  color: var(--muted);
 }
