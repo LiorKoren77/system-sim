@@ -10,6 +10,7 @@ import { FaultBlocks } from "./report/FaultBlocks";
 import { SloTable } from "./report/SloTable";
 import {
   createPlayer,
+  playerConfig,
   playerReducer,
   type PlayerAction,
   type PlayerState,
@@ -88,11 +89,7 @@ function Dataset(props: {
   };
   // The store fills while the file downloads: the player's frames follow it. A reducer declared in
   // the component sees this render's values, so each action is applied to the frames there are now.
-  const config = {
-    frames: store.frameCount,
-    loops: dataset?.loops ?? false,
-    framesPerHour: store.run ? 3600 / store.run.bucket_s : 1,
-  };
+  const config = playerConfig(store);
   const [player, dispatch] = useReducer(
     (state: PlayerState, action: PlayerAction) => playerReducer({ ...state, ...config }, action),
     createPlayer(config),

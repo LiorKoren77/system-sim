@@ -49,9 +49,17 @@ export async function runSimsys(
   const text = (
     Readable.toWeb(child.stdout) as ReadableStream<Uint8Array<ArrayBuffer>>
   ).pipeThrough(new TextDecoderStream());
-  const lines: string[] = [];
-  for await (const line of splitLines(text)) lines.push(line);
-  return { lines, code: await exited, stderr };
+  // Promise.all awaits both at once: a spawn that fails (no such binary) rejects `exited` while the
+  // lines are still read, and that rejection must have a handler from the start, or Node reports it
+  // as unhandled and stops.
+  const [lines, code] = await Promise.all([collect(splitLines(text)), exited]);
+  return { lines, code, stderr };
+}
+
+async function collect(lines: AsyncIterable<string>): Promise<string[]> {
+  const all: string[] = [];
+  for await (const line of lines) all.push(line);
+  return all;
 }
 
 // The stream of a finished run, or an Error saying why it is no dataset: an error line (with the

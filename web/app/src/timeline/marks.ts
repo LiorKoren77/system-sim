@@ -36,9 +36,22 @@ export function timelineMarks(
       });
     }
   }
-  return marks
-    .filter((m) => m.at_s >= window.from_s && m.at_s < window.to_s)
-    .sort((a, b) => a.at_s - b.at_s);
+  return marks.flatMap((m) => clipped(m, window)).sort((a, b) => a.at_s - b.at_s);
+}
+
+// The part of `mark` inside the window, or nothing. A mark that began before the window and still
+// holds starts at its edge (a looping day's window is the run's second day, so the first day's copy
+// of a fault across midnight holds at 00:00), and one that runs past the end stops there, so its
+// band stays on the slider. An instant is in the window when it happens there.
+function clipped(mark: Mark, window: { readonly from_s: number; readonly to_s: number }): Mark[] {
+  const end = mark.at_s + mark.for_s;
+  const inside =
+    mark.for_s === 0
+      ? mark.at_s >= window.from_s && mark.at_s < window.to_s
+      : mark.at_s < window.to_s && end > window.from_s;
+  if (!inside) return [];
+  const at_s = Math.max(mark.at_s, window.from_s);
+  return [{ ...mark, at_s, for_s: Math.min(end, window.to_s) - at_s }];
 }
 
 // " (1 of 4)" for a node_down that takes some of a node's copies, " (primary)" for a sql_db's.

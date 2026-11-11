@@ -44,9 +44,9 @@ export function Timeline(props: {
           }}
         />
         <div className="marks" aria-hidden="true">
-          {marks.map((m) => (
+          {marks.map((m, i) => (
             <span
-              key={`${m.kind}-${m.label}-${m.at_s}`}
+              key={`${m.kind}-${m.label}-${m.at_s}-${String(i)}`}
               className={`mark ${m.kind}`}
               title={m.label}
               style={{

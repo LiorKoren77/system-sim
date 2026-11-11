@@ -25,14 +25,21 @@ export class FileSource implements DatasetSource {
   }
 }
 
-// The body again, whole, and whether it starts with gzip's magic bytes: the first chunk is read to
-// look, then put back in front of the rest.
+// The body again, whole, and whether it starts with gzip's magic bytes: chunks are read until there
+// are two bytes to look at (the network may deliver one alone), then put back in front of the rest.
 async function withFirstChunk(
   body: ReadableStream<Uint8Array<ArrayBuffer>>,
 ): Promise<{ gzipped: boolean; stream: ReadableStream<Uint8Array<ArrayBuffer>> }> {
   const reader = body.getReader();
-  const first = await reader.read();
-  const head: Uint8Array<ArrayBuffer> = first.done ? new Uint8Array() : first.value;
+  let head: Uint8Array<ArrayBuffer> = new Uint8Array();
+  while (head.length < gzipMagic.length) {
+    const next = await reader.read();
+    if (next.done) break;
+    const joined = new Uint8Array(head.length + next.value.length);
+    joined.set(head);
+    joined.set(next.value, head.length);
+    head = joined;
+  }
   const gzipped = head[0] === gzipMagic[0] && head[1] === gzipMagic[1];
   const stream = new ReadableStream<Uint8Array<ArrayBuffer>>({
     start(controller) {
