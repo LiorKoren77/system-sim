@@ -1,10 +1,12 @@
-// The page's panes: the list of scenarios on the left, which hides, and the charts panel on the
-// right, whose border with the diagram is dragged. Everything here is a pure function of numbers
-// (tested without a browser); `Splitter.tsx` and `App.tsx` feed it pointer positions and keys.
+// The page's panes: the list of scenarios on the left and the zone strip at the bottom, which hide,
+// and the charts panel on the right, whose border with the diagram is dragged. Everything here is a
+// pure function of numbers (tested without a browser); `Splitter.tsx` and `App.tsx` feed it pointer
+// positions and keys.
 
 export const SIDE_DEFAULT = 420;
-// Under this the charts' y axis (52 px) and legend leave too little plot to read.
-export const SIDE_MIN = 280;
+// Under this the SLO table's last column (met or missed) is cut off, and the charts' y axis (52 px)
+// and legend leave little plot to read.
+export const SIDE_MIN = 340;
 // What the diagram keeps however wide the charts are dragged: about two boxes side by side.
 export const DIAGRAM_MIN = 320;
 // One arrow key's move: small enough to place the border, large enough to cross the stage quickly.
@@ -12,10 +14,15 @@ const KEY_STEP = 24;
 
 export interface Panes {
   catalogueOpen: boolean;
+  stripOpen: boolean;
   sideWidth: number;
 }
 
-export const defaultPanes: Panes = { catalogueOpen: true, sideWidth: SIDE_DEFAULT };
+export const defaultPanes: Panes = {
+  catalogueOpen: true,
+  stripOpen: true,
+  sideWidth: SIDE_DEFAULT,
+};
 
 // The widest the charts panel may be on a stage of this width. A stage not measured yet (0, as in
 // jsdom, which lays nothing out) bounds nothing; one too narrow for both keeps the panel's minimum.
@@ -73,9 +80,11 @@ export function parsePanes(text: string | null): Panes {
   if (typeof saved !== "object" || saved === null) return defaultPanes;
   // `in` narrows `object` to one that has the key: TypeScript's way to read a key of unknown JSON.
   const open = "catalogueOpen" in saved ? saved.catalogueOpen : undefined;
+  const strip = "stripOpen" in saved ? saved.stripOpen : undefined;
   const width = "sideWidth" in saved ? saved.sideWidth : undefined;
   return {
     catalogueOpen: typeof open === "boolean" ? open : defaultPanes.catalogueOpen,
+    stripOpen: typeof strip === "boolean" ? strip : defaultPanes.stripOpen,
     sideWidth:
       typeof width === "number" && Number.isFinite(width)
         ? clampSideWidth(width, 0)

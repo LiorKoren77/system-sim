@@ -90,10 +90,8 @@ export function App(props: {
             store={store}
             node={node}
             onSelectNode={chooseNode}
-            sideWidth={panes.sideWidth}
-            onResizeSide={(sideWidth) => {
-              changePanes({ sideWidth });
-            }}
+            panes={panes}
+            onChangePanes={changePanes}
           />
         )}
       </main>
@@ -109,10 +107,10 @@ function Dataset(props: {
   store: DatasetStore;
   node: string | null;
   onSelectNode: (id: string | null) => void;
-  sideWidth: number;
-  onResizeSide: (width: number) => void;
+  panes: Panes;
+  onChangePanes: (change: Partial<Panes>) => void;
 }) {
-  const { store } = props;
+  const { store, panes, onChangePanes } = props;
   const stage = useRef<HTMLDivElement>(null);
   const dataset = store.dataset;
   const shown = {
@@ -147,7 +145,7 @@ function Dataset(props: {
       <div
         className="stage"
         ref={stage}
-        style={{ "--side-width": `${props.sideWidth}px` } as React.CSSProperties}
+        style={{ "--side-width": `${panes.sideWidth}px` } as React.CSSProperties}
       >
         <Diagram
           store={store}
@@ -156,7 +154,13 @@ function Dataset(props: {
           onSelect={props.onSelectNode}
           playing={effective.playing}
         />
-        <Splitter width={props.sideWidth} stage={stage} onResize={props.onResizeSide} />
+        <Splitter
+          width={panes.sideWidth}
+          stage={stage}
+          onResize={(sideWidth) => {
+            onChangePanes({ sideWidth });
+          }}
+        />
         <aside className="side">
           <Details store={store} selected={props.node} frame={frame} shown={shown} onSeek={seek} />
           <section className="report" aria-label="Report">
@@ -168,13 +172,29 @@ function Dataset(props: {
         </aside>
       </div>
       <Timeline store={store} player={effective} dispatch={dispatch} shown={shown} />
-      <ZoneStrip
-        store={store}
-        frame={frame}
-        selected={props.node}
-        onSelect={props.onSelectNode}
-        onSeek={seek}
-      />
+      {/* The strip takes up to 30 % of the window's height, and the diagram is fitted to the
+          smaller of its width and height: hiding the strip is what makes the boxes larger on a
+          wide screen. The time bar stays. */}
+      <button
+        type="button"
+        className="strip-toggle"
+        aria-expanded={panes.stripOpen}
+        aria-label={panes.stripOpen ? "Hide the zone strip" : "Show the zone strip"}
+        onClick={() => {
+          onChangePanes({ stripOpen: !panes.stripOpen });
+        }}
+      >
+        {panes.stripOpen ? "▾" : "▸"} zones of every node
+      </button>
+      {panes.stripOpen && (
+        <ZoneStrip
+          store={store}
+          frame={frame}
+          selected={props.node}
+          onSelect={props.onSelectNode}
+          onSeek={seek}
+        />
+      )}
     </>
   );
 }

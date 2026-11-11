@@ -51,7 +51,7 @@ export function ZoneStrip(props: {
   if (!grid || grid.rows.length === 0) return null;
   const at = grid.frames > 0 ? ((frame + 0.5) / grid.frames) * 100 : 0;
   return (
-    <div className="zone-strip">
+    <div className="zone-strip" role="group" aria-label="Zones of the window">
       <div className="names">
         {grid.rows.map((row) => (
           <button
