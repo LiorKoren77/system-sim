@@ -2380,6 +2380,8 @@ lives that day N times in a row, as the same system would:
 | a `wave` whose period does not divide 24 h | `--days: client 'users' has a wave period of 168h, which does not divide the day` |
 | a `rate.points` curve (held flat after its last point, so not periodic) | `--days: client 'users' rate.points is not periodic` |
 | a `ramp` longer than a day | `--days: client 'users' ramps over 36h, longer than a day` |
+| a spike longer than a day (it would overlap its own copy the next day, and the two factors multiply) | `--days: client 'users' has a spike of 30h, longer than a day` |
+| a fault longer than a day (likewise: two partial `node_down`s would add up) | `--days: the node_down of 's' at 9h lasts 25h, longer than a day` |
 
 Where: `session::repeat_days` turns the scenario into the N-day one before the graph is built, so
 the engine and the loader are untouched and `explain` of the result is what runs.
