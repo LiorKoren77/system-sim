@@ -44,6 +44,13 @@ Three workspaces: `stream/` (`@simsys/stream`: the contract's types, the parser,
 store), `precompute/` (`@simsys/precompute`: runs simsys, cuts the window, writes the datasets),
 `app/` (`@simsys/app`: the page, React + Vite).
 
+**The panes and the view.** The list of scenarios hides to a rail (« and »), the zone strip hides
+under the time bar, and the border between the diagram and the charts panel is dragged (or moved
+with ← → Home End when it has the focus; a double click gives the first width back). All three are
+remembered per browser (`localStorage`, `layout/panes.ts`). The diagram is fitted to its area again
+whenever that area changes, so the room goes to the boxes; the wheel, a drag or the + and − buttons
+make the view the viewer's (no more automatic fit) until the fit button hands it back.
+
 **A day loops because it repeats.** A 24 h scenario is run for two days (`run --days 2`): day 1 is
 the warmup, day 2 what the system settles into. The engine is deterministic and every day's input
 the same, so if the frame ending at 48:00 equals the one ending at 24:00, day 3 would replay day 2:
