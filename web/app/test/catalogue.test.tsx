@@ -24,7 +24,15 @@ const datasets = index([
 
 describe("the catalogue of datasets", () => {
   it("groups the datasets as the scenarios folder does", () => {
-    render(<Catalogue index={datasets} selected={null} onSelect={() => undefined} />);
+    render(
+      <Catalogue
+        index={datasets}
+        selected={null}
+        onSelect={() => undefined}
+        open
+        onToggle={() => undefined}
+      />,
+    );
     expect(screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent)).toEqual([
       "book",
       "labs",
@@ -32,7 +40,15 @@ describe("the catalogue of datasets", () => {
   });
 
   it("badges a looping day, a day that does not repeat, and a run with its length", () => {
-    render(<Catalogue index={datasets} selected={null} onSelect={() => undefined} />);
+    render(
+      <Catalogue
+        index={datasets}
+        selected={null}
+        onSelect={() => undefined}
+        open
+        onToggle={() => undefined}
+      />,
+    );
     expect(
       within(screen.getByRole("button", { name: /Chat system/ })).getByText("repeating day"),
     ).toBeVisible();
@@ -45,13 +61,29 @@ describe("the catalogue of datasets", () => {
   });
 
   it("names the book chapter beside the title", () => {
-    render(<Catalogue index={datasets} selected={null} onSelect={() => undefined} />);
+    render(
+      <Catalogue
+        index={datasets}
+        selected={null}
+        onSelect={() => undefined}
+        open
+        onToggle={() => undefined}
+      />,
+    );
     expect(screen.getByRole("button", { name: /Chat system/ })).toHaveTextContent("ch. 12");
   });
 
   it("tells which dataset was chosen", async () => {
     const onSelect = vi.fn();
-    render(<Catalogue index={datasets} selected="book/youtube" onSelect={onSelect} />);
+    render(
+      <Catalogue
+        index={datasets}
+        selected="book/youtube"
+        onSelect={onSelect}
+        open
+        onToggle={() => undefined}
+      />,
+    );
     expect(screen.getByRole("button", { name: /YouTube/ })).toHaveAttribute("aria-current", "true");
     await userEvent.click(screen.getByRole("button", { name: /Chat system/ }));
     expect(onSelect).toHaveBeenCalledWith("book/chat-system");

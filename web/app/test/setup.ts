@@ -12,3 +12,8 @@ afterEach(() => {
 // for a context it cannot make, and the zone strip then draws nothing. Without this stub jsdom
 // prints "Not implemented" for each strip rendered.
 HTMLCanvasElement.prototype.getContext = () => null;
+
+// jsdom has no pointer capture: the splitter asks for it on pointer down, so that a drag keeps
+// reaching it over the diagram. A stub that does nothing: jsdom lays nothing out, so no test drags
+// by pixels (the drag's arithmetic is tested in panes.test.ts).
+Element.prototype.setPointerCapture = () => undefined;

@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemorySource } from "@simsys/stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -37,6 +37,7 @@ function renderApp(lines: Record<string, string[]>) {
 
 afterEach(() => {
   window.location.hash = "";
+  window.localStorage.clear();
 });
 
 describe("the page", () => {
@@ -113,5 +114,62 @@ describe("the page", () => {
     await userEvent.click(await screen.findByRole("button", { name: "web" }));
     expect(window.location.hash).toBe("#book/url-shortener&node=web");
     expect(screen.getByRole("heading", { name: "web" })).toBeVisible();
+  });
+
+  it("hides the list of scenarios to give the diagram its width, and brings it back", async () => {
+    renderApp({ "book/url-shortener": fixtureLines("book-url-shortener") });
+    await screen.findByText("00:00");
+    await userEvent.click(screen.getByRole("button", { name: "Hide the scenarios" }));
+    expect(screen.queryByRole("button", { name: /Tutorial 1: hello/ })).toBeNull();
+    expect(screen.getByRole("heading", { level: 1, name: /URL shortener/ })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Show the scenarios" }));
+    expect(screen.getByRole("button", { name: /Tutorial 1: hello/ })).toBeVisible();
+  });
+
+  it("opens with the panes as the viewer left them", async () => {
+    const first = renderApp({ "book/url-shortener": fixtureLines("book-url-shortener") });
+    await screen.findByText("00:00");
+    await userEvent.click(screen.getByRole("button", { name: "Hide the scenarios" }));
+    screen.getByRole("separator", { name: "Resize the charts panel" }).focus();
+    await userEvent.keyboard("{ArrowLeft}");
+    const width = screen.getByRole("separator").getAttribute("aria-valuenow");
+    first.unmount();
+    renderApp({ "book/url-shortener": fixtureLines("book-url-shortener") });
+    await screen.findByText("00:00");
+    expect(screen.getByRole("button", { name: "Show the scenarios" })).toBeVisible();
+    expect(screen.getByRole("separator").getAttribute("aria-valuenow")).toBe(width);
+  });
+
+  it("resizes the charts panel from the keyboard without moving the day", async () => {
+    renderApp({ "book/url-shortener": fixtureLines("book-url-shortener") });
+    await screen.findByText("00:00");
+    const splitter = screen.getByRole("separator", { name: "Resize the charts panel" });
+    expect(splitter.getAttribute("aria-valuenow")).toBe("420");
+    splitter.focus();
+    await userEvent.keyboard("{ArrowLeft}");
+    expect(Number(splitter.getAttribute("aria-valuenow"))).toBeGreaterThan(420);
+    expect(screen.getByText("00:00")).toBeVisible();
+  });
+
+  it("gives the charts panel its first width back on a double click of the splitter", async () => {
+    renderApp({ "book/url-shortener": fixtureLines("book-url-shortener") });
+    await screen.findByText("00:00");
+    const splitter = screen.getByRole("separator", { name: "Resize the charts panel" });
+    splitter.focus();
+    await userEvent.keyboard("{ArrowLeft}{ArrowLeft}");
+    await userEvent.dblClick(splitter);
+    expect(splitter.getAttribute("aria-valuenow")).toBe("420");
+  });
+
+  it("hides the zone strip to give the diagram its height, and keeps the time bar", async () => {
+    renderApp({ "book/url-shortener": fixtureLines("book-url-shortener") });
+    await screen.findByText("00:00");
+    const rows = screen.getByRole("group", { name: "Zones of the window" });
+    expect(within(rows).getByRole("button", { name: "url_db" })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Hide the zone strip" }));
+    expect(screen.queryByRole("group", { name: "Zones of the window" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Play" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: "Show the zone strip" }));
+    expect(screen.getByRole("group", { name: "Zones of the window" })).toBeVisible();
   });
 });
