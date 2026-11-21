@@ -164,6 +164,9 @@ Write for a reader who has read the book but has not studied queueing theory.
 - **Test-driven**: tests are written before the implementation, in small batches; the
   implementation is the minimum that makes them pass; then refactor. Integration-level
   tests are added once the units they combine exist.
+- **Shared work**: when a task is split among a test-writer, an implementer and a reviewer, with an
+  orchestrator between them, `docs/working-with-agents.md` says who does what, what a brief holds
+  and how a task is checked.
 
 ## 5. The web app (`web/`, TypeScript)
 
