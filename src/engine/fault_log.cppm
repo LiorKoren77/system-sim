@@ -19,8 +19,8 @@
 // instead of being attached to simsys.engine (src/core/core.cppm has the longer note).
 module;
 // NO <chrono>/<format>/<print>/<filesystem> here: this unit imports other modules (GCC 14.2 'Bad
-// file data' bug, CONTRIBUTING.md §3). Like every unit from simsys.behaviours on, it is compiled with
-// -flarge-source-files (the sixth defect; the simsys library target sets it).
+// file data' bug, CONTRIBUTING.md §3). Like every unit from simsys.behaviours on, it is compiled
+// with -flarge-source-files (the sixth defect; the simsys library target sets it).
 #include <algorithm>
 #include <cmath>
 #include <cstddef>

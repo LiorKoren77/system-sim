@@ -59,8 +59,8 @@ engine::Simulation simulation_of(const graph::Graph& g);
 
 // ---- A link's bandwidth as a pipe (test_bytes_pipes.cpp has the picture and its numbers) --------
 
-// `constexpr` without `inline` (GCC 14.2, CONTRIBUTING.md §3's seventh defect): a default argument below
-// names `one_gbit`, and GCC evaluates it in the caller's unit, which references an exported
+// `constexpr` without `inline` (GCC 14.2, CONTRIBUTING.md §3's seventh defect): a default argument
+// below names `one_gbit`, and GCC evaluates it in the caller's unit, which references an exported
 // `inline` variable without emitting it while this interface's object defines an inline variable
 // only if it uses it itself: an undefined reference at link time. A non-inline constant keeps
 // external linkage (it is exported) and this interface's object file defines it once.

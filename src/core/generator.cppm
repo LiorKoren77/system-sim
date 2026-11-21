@@ -3,9 +3,10 @@
 //
 // Why our own: std::generator is in GCC 14's standard library (libstdc++) but not in LLVM's
 // (libc++ 19), the library Clang uses with -stdlib=libc++ and Emscripten always uses. One type of
-// our own builds with every toolchain, without conditional compilation (CONTRIBUTING.md: no macros).
-// What it gives up: std::generator's nested generators (`co_yield std::ranges::elements_of(...)`)
-// and its reference/value type parameters; samples() yields plain values and needs neither.
+// our own builds with every toolchain, without conditional compilation (CONTRIBUTING.md: no
+// macros). What it gives up: std::generator's nested generators (`co_yield
+// std::ranges::elements_of(...)`) and its reference/value type parameters; samples() yields plain
+// values and needs neither.
 //
 // How a coroutine generator works (docs/study/generator.md has the longer note). A function whose
 // body contains `co_yield` is a C++20 coroutine. The compiler turns it into a state machine whose
@@ -78,8 +79,9 @@ class Generator {
     // C++20 std::default_sentinel_t: an empty end marker; the range ends when the body has. A
     // member, not the usual hidden friend: GCC 14.2 gives a friend defined in a class template of a
     // module a strong definition in every unit that instantiates it ("multiple definition" at link
-    // time, the fifth defect's family, CONTRIBUTING.md §3), while a member of a class template is emitted
-    // once. C++20 rewritten comparisons still let `std::default_sentinel == it` and `!=` work.
+    // time, the fifth defect's family, CONTRIBUTING.md §3), while a member of a class template is
+    // emitted once. C++20 rewritten comparisons still let `std::default_sentinel == it` and `!=`
+    // work.
     bool operator==(std::default_sentinel_t) const { return !frame_ || frame_.done(); }
 
    private:

@@ -818,8 +818,8 @@ struct OpRow {
 // run's steps did not fill). Rows in the graph's order: nodes as Graph::nodes(), links as the
 // bandwidth links of engine::StepRecord::links, ops as engine::StepRecord::responses (clients in
 // node order, each client's ops by name). The special members are declared here and defaulted in
-// stream.cpp, out of line (the tenth GCC 14.2 defect, CONTRIBUTING.md §3: an importer that instantiated
-// the implicit ones over the vectors would hit an ICE in Release).
+// stream.cpp, out of line (the tenth GCC 14.2 defect, CONTRIBUTING.md §3: an importer that
+// instantiated the implicit ones over the vectors would hit an ICE in Release).
 struct Frame {
   SimTime t{};
   double dt_s{};
