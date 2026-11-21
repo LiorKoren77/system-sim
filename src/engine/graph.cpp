@@ -13,9 +13,9 @@
 // where the std headers are #included, so that their declarations stay in the global module
 // instead of being attached to simsys.graph (src/core/core.cppm has the longer note).
 module;
-// No <chrono> although an implementation unit may include it (CONTRIBUTING.md §3's first defect binds
-// interfaces only): these definitions moved here from graph.cppm unchanged, and compare SimTime
-// through count() as they did there.
+// No <chrono> although an implementation unit may include it (CONTRIBUTING.md §3's first defect
+// binds interfaces only): these definitions moved here from graph.cppm unchanged, and compare
+// SimTime through count() as they did there.
 #include <algorithm>
 #include <cmath>
 #include <compare>

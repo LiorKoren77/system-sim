@@ -1,8 +1,8 @@
 // Implementation unit of `simsys.test_fixtures`: the bodies of the shared test builders. Each
 // helper's description is on its declaration in fixtures.cppm. The end of the file works around
-// GCC 14.2's release-link defect (CONTRIBUTING.md §3's fourth; see `detail` below); tests/CMakeLists.txt
-// compiles this file with -fno-inline for it, as the top-level CMakeLists.txt does
-// src/model/model.cpp. The seventh defect (an exported `inline` variable named by a default
+// GCC 14.2's release-link defect (CONTRIBUTING.md §3's fourth; see `detail` below);
+// tests/CMakeLists.txt compiles this file with -fno-inline for it, as the top-level CMakeLists.txt
+// does src/model/model.cpp. The seventh defect (an exported `inline` variable named by a default
 // argument) is avoided in fixtures.cppm, whose constants are `constexpr` without `inline`.
 module;
 #include <catch2/catch_test_macros.hpp>
@@ -168,15 +168,16 @@ std::string explain_of(const Scenario& s) {
 
 namespace detail {
 
-// GCC 14.2, CONTRIBUTING.md §3's fourth defect, in the release build: a unit that imports simsys.model
-// calls compiler-generated special members of std templates over model types out of line without
-// emitting them. src/model/model.cpp emits the ones the library's importers need; a test file can
-// need more. test_scenarios.cpp did once its scenario helpers came from this module instead of a
-// header: "undefined reference to std::vector<simsys::model::Step@simsys.model>::vector(...&&)"
-// (verified 2026-10-29). As in model.cpp: each explicit instantiation below calls T's five special
-// members, and -fno-inline keeps those calls out of line, so this object file defines them. A new
-// undefined reference of this kind in a test executable gets one more line here.
-// `dst` is raw storage for one T; `src` is a live T that is copied and moved from.
+// GCC 14.2, CONTRIBUTING.md §3's fourth defect, in the release build: a unit that imports
+// simsys.model calls compiler-generated special members of std templates over model types out of
+// line without emitting them. src/model/model.cpp emits the ones the library's importers need; a
+// test file can need more. test_scenarios.cpp did once its scenario helpers came from this module
+// instead of a header: "undefined reference to
+// std::vector<simsys::model::Step@simsys.model>::vector(...&&)" (verified 2026-10-29). As in
+// model.cpp: each explicit instantiation below calls T's five special members, and -fno-inline
+// keeps those calls out of line, so this object file defines them. A new undefined reference of
+// this kind in a test executable gets one more line here. `dst` is raw storage for one T; `src` is
+// a live T that is copied and moved from.
 template <typename T>
 void emit_special_members(T* dst, T& src) {
   // C++20 std::construct_at: placement-new as a (constexpr) library function, replacing

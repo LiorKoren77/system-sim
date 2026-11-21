@@ -23,7 +23,8 @@
 // C++20 `import`: brings a named module's exported names into this translation unit without
 // textual inclusion (the compiler reads the module's compiled interface). It replaces
 // `#include` plus include guards; placed after the #includes because GCC 14 reports
-// redefinitions when a standard header is included after an import (CONTRIBUTING.md §3, eighth defect).
+// redefinitions when a standard header is included after an import (CONTRIBUTING.md §3, eighth
+// defect).
 import simsys.core;
 import simsys.graph;
 import simsys.model;

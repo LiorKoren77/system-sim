@@ -1,7 +1,7 @@
 // Module `simsys.session`, implementation unit: the loading and running every command shares
 // (see session.cppm), the worker pool, and the replications of `run --replications`. <format>,
-// <thread> and <atomic> are included here, not in the interface (CONTRIBUTING.md §3: <format> must not
-// be in it; the threads are how runs are spread, not part of what a session is, so no importer
+// <thread> and <atomic> are included here, not in the interface (CONTRIBUTING.md §3: <format> must
+// not be in it; the threads are how runs are spread, not part of what a session is, so no importer
 // parses those headers). Only `{}` placeholders, never a width or a precision (the second GCC
 // 14.2 defect).
 module;
