@@ -404,8 +404,8 @@ inline constexpr SimTime retry_after = 100_ms;
 inline constexpr SimTime pool_retry_after = 1_s;
 
 // ---- Websocket gateways (phase 3 spec §8.2; book ch. 12) ----
-// The two constants are `constexpr` without `inline` (CONTRIBUTING.md §3's seventh GCC 14.2 defect): a
-// default argument naming an exported inline variable leaves it undefined at link time.
+// The two constants are `constexpr` without `inline` (CONTRIBUTING.md §3's seventh GCC 14.2
+// defect): a default argument naming an exported inline variable leaves it undefined at link time.
 
 // How long a user stays connected to a ws_gateway on average, when the scenario does not say
 // (model::NodeSpec::session): 30 minutes. Chosen, not from the book: ch. 12 sizes the chat system

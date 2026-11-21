@@ -12,9 +12,9 @@
 // Lean by design: <thread> lives in sweep.cpp (default_jobs) and the worker pool in session.cpp,
 // not here. The threads are how the points run, not part of what a sweep is, so no importer
 // should parse those headers. (The GCC
-// 14.2 'Bad file data' defect of CONTRIBUTING.md §3 would not bite here: it needs <chrono>, <format>,
-// <filesystem> or <print> in an interface that imports another module, and this one imports
-// none.)
+// 14.2 'Bad file data' defect of CONTRIBUTING.md §3 would not bite here: it needs <chrono>,
+// <format>, <filesystem> or <print> in an interface that imports another module, and this one
+// imports none.)
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer explanation of
 // modules versus headers): `module;` opens the global module fragment for the #includes, and
@@ -93,8 +93,8 @@ struct SweepMetric {
 
 // The keys one sweep may cross: two, a grid (spec 4a §4.3). A table of two keys still reads as
 // one row per point; a third axis is a script's job. `constexpr` without `inline`: exported (this
-// is the export block), it keeps external linkage, and the seventh GCC 14.2 defect (CONTRIBUTING.md §3)
-// bites an exported inline variable named by a default argument.
+// is the export block), it keeps external linkage, and the seventh GCC 14.2 defect (CONTRIBUTING.md
+// §3) bites an exported inline variable named by a default argument.
 constexpr std::size_t max_params = 2;
 
 // `--param` given once or twice: each spec parsed (parse_param), at most max_params of them, no key

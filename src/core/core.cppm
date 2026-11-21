@@ -468,11 +468,11 @@ export namespace simsys {
 
 // The one place a double becomes text, for every module (five copies of this wrapper had grown
 // before it). std::to_chars (C++17): locale-independent, allocation-free, and free of the GCC 14.2
-// defect of CONTRIBUTING.md §3, under which a std::format width or precision throws at run time in every
-// unit that imports this module. `format` and `precision` as std::to_chars takes them: neither, the
-// shortest text that reads back to the same double (0.1, 4000, 1e+20); a format alone, the shortest
-// in that notation (fixed never writes an exponent); both, rounded to `precision` digits
-// (significant ones for general, after the point for fixed). A precision without a format is
+// defect of CONTRIBUTING.md §3, under which a std::format width or precision throws at run time in
+// every unit that imports this module. `format` and `precision` as std::to_chars takes them:
+// neither, the shortest text that reads back to the same double (0.1, 4000, 1e+20); a format alone,
+// the shortest in that notation (fixed never writes an exponent); both, rounded to `precision`
+// digits (significant ones for general, after the point for fixed). A precision without a format is
 // general. The buffer holds any finite double in fixed notation (at most 309 digits before the
 // point; 327 characters for the smallest subnormal, 5e-324 = "0.000...5") with room for a precision
 // of up to 200; a longer result falls back to the shortest text.

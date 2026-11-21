@@ -1,7 +1,14 @@
 name: ci
+# A change that touches only documentation (docs/ or any Markdown file) builds and tests nothing, so
+# the heavy jobs are skipped. A change that touches anything else besides runs everything. No test and
+# no step reads a Markdown file; if one ever does, take its path out of this list. If branch protection
+# ever requires these jobs, a skipped run leaves them pending: then run a light job for docs instead.
 on:
-  push: { branches: [main] }
+  push:
+    branches: [main]
+    paths-ignore: ['docs/**', '**/*.md']
   pull_request:
+    paths-ignore: ['docs/**', '**/*.md']
   workflow_dispatch:   # a "Run workflow" button on the Actions tab (and `gh workflow run ci`)
 jobs:
   build-test:

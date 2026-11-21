@@ -12,8 +12,8 @@
 //
 // C++20 named module, interface unit (see src/core/core.cppm for the longer explanation). Lean
 // on purpose, like every interface that imports another module: no <chrono>, <format>,
-// <filesystem> or <print> here (the GCC 14.2 'Bad file data' defect, CONTRIBUTING.md §3); the messages
-// are formatted in session.cpp.
+// <filesystem> or <print> here (the GCC 14.2 'Bad file data' defect, CONTRIBUTING.md §3); the
+// messages are formatted in session.cpp.
 module;
 #include <cstddef>
 #include <expected>
