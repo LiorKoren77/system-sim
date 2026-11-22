@@ -1,0 +1,464 @@
+# system-sim: technical reference
+
+The detailed reference that the project's [README](../README.md) leaves out: the status of every phase, every command and flag, and how each part works.
+
+A fluid-flow **system design simulator** in modern C++23.
+
+Describe a distributed system in YAML — clients, load balancers, caches, SQL and NoSQL
+stores, message queues, CDNs, datacenters and the links between them — then push a day of
+traffic through it (waves, spikes, noise, failures) and watch where it turns yellow and red.
+Traffic is modelled as rates with analytic queueing per node, so every run is instant and
+reproducible. Built to practise the systems in
+*System Design Interview* (Alex Xu, vol. 1) and, at the same time, to study and teach
+C++20/23: modules, concepts, ranges, coroutines, `std::expected` and friends.
+
+Status: phase 5b adds a **web app** ([below](#web-app)): pick a shipped scenario and watch its day
+on a diagram that turns yellow and red, with a looping time slider, a zone strip of the whole day,
+charts of any box, the SLO table and the fault blocks. It is static files on localhost, every
+dataset precomputed by `simsys run --days 2 --stream`: `--days N` lives a 24 h scenario's day N
+times, its spikes and faults every day, and reports the last, so the second day is the one the
+system settles into and the page can loop it. Phase 5a made simsys the data source of that frontend: `simsys run --stream`
+writes the run as lines of JSON on stdout while it runs, one frame per bucket of steps aggregated at
+the source (youtube's day: 723 lines, 1.13 MB, the first frame out after 43 ms), `simsys explain
+--report json` gives the resolved graph as data, and every JSON document starts with its
+`format_version`. Phase 4a, below it, is built on top of phase 3: `simsys sweep` crosses two keys in a grid, spaces its
+points geometrically (`:log`), reads a node's `reject_rate` and, with `--slos`, judges every point's
+SLOs; `simsys estimate --at 13:00` evaluates the steady state at any instant, and reports rates
+rather than one step's totals; the tables say which nodes count capacity units or megabytes.
+Phase 2 added the node types, rate curves, bytes, queues and the sweep;
+phase 3 added scripted faults (a node or some of its replicas down, a capacity loss, a latency or
+traffic spike, a cache flush, a datacenter down), each reported as an incident block measured
+against a fault-free twin of the run, client and worker-pool retries (`attempts/s`, dead letters),
+`on: failure` steps, `run --replications N` (medians and 10–90 % bands over seeds of the rate
+noise), and the last four node types: service discovery, WebSocket gateways (open connections as
+a level, heartbeats, the reconnect storm), notification fan-outs and URL frontiers.
+Clients follow rate curves (daily waves, ramps, scripted spikes, replayed points) with seeded
+Ornstein–Uhlenbeck noise, state the key popularity they ask for (Zipf or uniform) and the size
+of each op (`sizes: {stream: 50MB}`), and may give up after a `timeout`; nodes charge a per-op
+`cost`. Next to clients and services run load balancers (four policies), rate limiters (the five
+algorithms of ch. 4, with a counter store), caches (a fixed hit ratio or one computed with the Che
+approximation from the clients' keys; every write strategy including write-back; `then` steps),
+SQL databases (a primary and read replicas, shards, a connection pool, replication lag and
+staleness), CDNs and blob stores sized in bytes, links with a `bandwidth` (a pipe that queues and
+drops megabytes), message queues and the worker pools that consume them, external sinks, URL
+frontiers (per-host politeness as a cap on the downloaders' drain),
+key-value clusters (ring, replication and quorums), search indexes and id generators. A step after
+a failed step does not run, refused, dropped and timed-out requests are counted apart
+(`reject_rate`, `drop_rate`, `timed_out_per_s`), and an SLO can be checked per window (`over: 1h`).
+`simsys sweep` runs a scenario over a range of one key (or a grid of two), the points in parallel. All fourteen
+shipped scenarios run end to end, the eight book systems among them (list below). 1823 tests
+(Catch2, via `ctest`). The scenario language is
+[`docs/scenario-schema.md`](scenario-schema.md) (v1.8).
+See [`docs/superpowers/specs/2026-10-27-system-sim-design.md`](superpowers/specs/2026-10-27-system-sim-design.md)
+for the design and [`docs/approaches.md`](approaches.md) for the modelling approaches considered.
+
+## Usage
+
+```
+simsys validate scenario.yaml        # types, references and units
+simsys explain  scenario.yaml [--report table|json]  # every resolved number and where it came from
+simsys estimate scenario.yaml [--at 13:00] [--report table|json] [--no-color]
+simsys run      scenario.yaml [--duration 30s] [--seed N] [--report table|json]
+                              [--series out.csv] [--series-ops ops.csv] [--no-color]
+                              [--replications N [--jobs J]]
+simsys run      scenario.yaml --stream [--points N | --every 30s]  # lines of JSON for a frontend
+simsys run      scenario.yaml --days N [--stream] [--report table|json]  # a 24 h day lived N times
+simsys curve    scenario.yaml <client> [--step 1m] [--until 1h] [--seed N] [--noise]
+simsys sweep    scenario.yaml --param <dot.path>=<from>..<to>:<n>[:log] [--param ...]
+                              --metric <m>... [--slos] [--jobs N] [--format table|csv]
+```
+
+`run --stream` is what a web server reads from a child process: one JSON object per line on stdout,
+written as soon as it exists: a `run` line, the resolved `graph`, a `frame` per bucket of steps
+(`--points N`, default 720, or `--every <duration>`) and the run's report with its exit code, or an
+`error` line with the file, line and column. A frame keeps each number's meaning: rates as the
+bucket's mean (so the conservation law below still balances per bucket), peaks as its maximum, levels
+as its last value, the zone as its worst ([schema](scenario-schema.md#command-line-simsys-run---stream-phase-5a)):
+
+```
+$ simsys run scenarios/tutorial/hello/scenario.yaml --stream --points 2 | head -3
+{"type":"run","format_version":1,"scenario":"hello","seed":1,"duration_s":60,"step_s":0.1,"warmup_s":0,"bucket_s":30,"frames":2}
+{"type":"graph","rev":0,"scenario":"hello","datacenters":[{"name":"main"}],"zones":["green","yellow","red"],"nodes":[...],...}
+{"type":"frame","rev":0,"t_s":0,"dt_s":30,"nodes":[[null,...],[100,100,0,0,0,0,0.1,0.1,0,0,1.11111,null,null,null,null]],"links":[],"ops":[[100,100,100,0,1.61111,5.66029]]}
+```
+
+`run --days N` (1 to 7) runs a 24 h scenario for N days: each rate spike and scripted fault comes
+back at the same time every day, the warmup is the first N − 1 days, and the report judges the last
+([schema](scenario-schema.md#command-line-simsys-run---days-phase-5b)).
+
+`estimate` evaluates the long-run (steady) state once, at t = 0 (midnight) or at `--at`: the rate
+curve's value there, without noise (its first line says so), its drops and refusals as rates
+(`dropped/s`, `rejected/s`); `explain`'s static load checks use the
+curve's peak instead. `run` steps through the scenario and,
+with `--series`, writes one CSV row per node per step
+(`t_s,node,demand_per_s,drain_per_s,rho,backlog,drops_per_s,dead_lettered_per_s,rejected_per_s,deduplicated_per_s,latency_ms,zone,queue_lag_s,connections`,
+`dead_lettered_per_s` a worker pool's dead letters, `deduplicated_per_s` a notification fan-out's
+duplicates, `queue_lag_s` a message queue's lag in seconds, the last a websocket gateway's open
+connections, each empty on other rows), the file a plot or GUI reads; demand, drain, drops and backlog balance, so the fluid queue's
+conservation law, Σ demand·dt = Σ (drain + drops)·dt + backlog, can be checked from the file (a
+token bucket's or a window's refusals are inside drain; a leaky bucket's overflow is in
+`rejected_per_s`, in the drops' place). A link with a `bandwidth` is a pipe that queues and drops
+megabytes: it gets a row of its own, named `from->to`, after the nodes in the series (same
+columns, in MB), in the table's `links` section and in JSON's `links`, and a check line in
+`explain`. With `--series-ops`, it writes one CSV row per client op
+per step (`t_s,client,op,offered_per_s,attempts_per_s,answered_per_s,timed_out_per_s,mean_ms`):
+what each client offered, what it sent with its `retries` (equal without them), the part of it that came back answered (a limiter's refusals and a queue's drops are not;
+a request waiting in a queue is answered later), the part that came back after the client's
+`timeout`, and the mean response in milliseconds (`inf` when the path never answers). The JSON report's ops
+carry `answered_per_s` beside `offered_per_s` too, and `timed_out_per_s`: the requests the
+client gave up on (0 without a `timeout`; `run`'s table shows them as `timed out/s`); a client's
+percentile at q is read off the fit to every request the path delivered, before the timeout cut
+it (the fit that decided which requests timed out, so its fastest q are all answered), capped at
+the timeout; when more than 1 − q of them timed out (more than 1 % for a p99) the percentile is
+the timeout itself (`>1s` in the table), which fails a latency SLO whatever its `max`.
+Exit codes: 0 every SLO passed, 2 an SLO failed, 1 an error.
+Colour is on when stdout is a terminal; `--no-color` turns it off and JSON never has it.
+`run --seed N` replaces the scenario's `seed`, which seeds every client's `rate.noise`
+process: the same seed gives the same run, byte for byte; without a noise block it changes nothing.
+`run --replications N` (1 to 1000) runs the scenario N times, with seeds `seed`, `seed + 1`, ...,
+`seed + N − 1` of that noise, on `--jobs` worker threads (the output does not depend on them), and
+prints every number as its median across the runs with its 10–90 % band, nearest rank
+(`5.69ms [5.64–5.75]`), each SLO as `PASS in 3 of 5` or `FAIL (passed in 2 of 5)` with its median
+run's observed value and seed (each SLO is judged by its own median run); it exits 2 when some
+SLO's median run fails. A scenario without noise runs once,
+after a line that says so; `--series` needs a single run
+([schema](scenario-schema.md#command-line-simsys-run---replications-phase-3)).
+
+A scenario's `faults:` list runs in `run` (`estimate` shows the steady state without it), and
+after the SLO table each fault gets a block: what it cost while it lasted, what followed, and when
+every op's p99 and every node's utilization were back within 1 % of a fault-free twin run in
+lockstep. The [chat system](../scenarios/book/chat-system/) (ch. 12) loses its whole gateway tier for
+a minute at 21:30, just past the evening peak (trimmed):
+
+```
+$ simsys run scenarios/book/chat-system/scenario.yaml
+scenario chat-system  861000 steps observed  drop rate 0.00933% (worst: chat_servers)
+nodes
+  node           mean_rho  peak_rho  peak_backlog  dropped  dead_lettered/s  rejected  red_s  peak_lag  connections
+  ...
+  chat_servers     0.5383         1             0   2.159M                -         0   60.3         -       1.472M
+  ...
+fault 21:30 node_down chat_servers for 1m
+  during:   offered 35.98k/s, served 0/s, lost 2.159M attempts (2.154M requests lost for good), backlog 0, drop_rate over its max for 1m
+  after:    no backlog to drain, reconnect storm 1.551M users back over 30s, chat_servers peak 90.5% at 21:31:29.9
+  recovery: back within 1% (every op's p99, every node's rho) at 21:31:30 (30s after the fault cleared)
+```
+
+The 1.617M open connections drop at once and their users come back over `reconnect_within`
+(30 s, a default chosen, not from the book), 1.551M of them: the others' sessions end while they
+wait. The tier is at 90.5 % at the storm's last second (110 % if they all come back within 10 s:
+its README runs the window from 10 to 60 s), and back at its fault-free twin as the storm ends.
+`lost` counts
+attempts, the servers' work, because the sync workers retry; the requests the users lost for
+good are beside it.
+
+`run --replications N` repeats a run over N seeds of the clients' rate noise. On the hello
+tutorial with `rate: {base: 100/s, noise: {sigma: 0.2, correlation: 10s}}` and a p99 SLO of
+5.7 ms (the shipped scenarios have no noise, so for them it runs once and says so):
+
+```
+$ simsys run probe.yaml --replications 5
+replications: 5 runs, seeds 1..5; a cell is the median across the runs [its 10–90 % band], nearest rank
+each SLO is judged by its own median run; the summary line and the fault blocks are seed 2's
+scenario hello  600 steps observed  drop rate 0%
+...
+ops (percentiles estimated: lognormal fit to the response moments)
+  client.op           offered/s         attempts/s                mean                 p50                 p95                 p99  (estimated)
+  users.ping  103 [93.77–112.4]  103 [93.77–112.4]  1.62ms [1.61–1.63]  1.33ms [1.32–1.34]  3.72ms [3.69–3.75]  5.69ms [5.64–5.75]
+slo (each: its median run's verdict and observed value, and the runs that passed it)
+  status          metric       node   op    observed  max
+  PASS in 3 of 5  p99_latency  users  ping  5.69ms    5.7ms  median run: seed 2
+```
+
+`curve` prints one client's offered rate over time as CSV (`t_s,rate_per_s`), sampled every
+`--step` from t = 0 (midnight) up to `--until` (default: the scenario's duration), so the
+`rate:` block (base, points or a ramp, times wave and spikes) can be plotted before anything
+runs. `--noise` multiplies in the client's `rate.noise` process exactly as a run sees it:
+seeded from `--seed` (default: the scenario's seed) as the engine seeds that client, advanced
+every scenario `step` (so `--step` must be a multiple of it; every k-th value is printed),
+and stepped once before each value is read, as the engine ticks a client before it offers,
+so the t = 0 row already includes one noise step. On the
+[rate-limiter lab](../scenarios/labs/rate-limiter/), the 5x spike at 5 minutes:
+
+```
+$ simsys curve scenarios/labs/rate-limiter/scenario.yaml clients --step 1m | head -8
+t_s,rate_per_s
+0,800
+60,800
+120,800
+180,800
+240,800
+300,4000
+360,800
+```
+
+`sweep` runs the scenario once per value of one key (or, with `--param` twice, per pair of two:
+a grid), the runs in parallel (`--jobs`, default: the machine's hardware threads; the output does
+not depend on it), and prints one row per point with the metrics asked for: `<client>.<op>.mean`,
+`.p50`, `.p95` or `.p99`, `<node>.mean_rho`, `.peak_rho`, `.drop_rate` or `.reject_rate`,
+`<queue>.lag`, `<pool>.dead_lettered`, `<fanout>.deduplicated`, or `<gateway>.connections`; a
+range ending in `:log` is spaced geometrically, and `--slos` adds each point's SLO verdicts and the
+exit code `run` would give it
+([schema](scenario-schema.md#command-line-simsys-sweep-phase-2c)). On the
+[hello tutorial](../scenarios/tutorial/hello/), an M/M/1 queue with a 1 ms service time: the latency is
+s / (1 − rho) plus the 0.5 ms round trip, and it bends upward as rho nears 1:
+
+```
+$ simsys sweep scenarios/tutorial/hello/scenario.yaml --param nodes.users.rate.base=100/s..900/s:3 \
+      --metric users.ping.mean --metric api.mean_rho
+nodes.users.rate.base  users.ping.mean  api.mean_rho
+----------------------------------------------------
+100/s                           1.61ms           0.1
+500/s                            2.5ms           0.5
+900/s                           10.5ms           0.9
+```
+
+`explain` on the [chain tutorial](../scenarios/tutorial/chain/) (trimmed):
+
+```
+$ simsys explain scenarios/tutorial/chain/scenario.yaml
+scenario chain  version 1  duration 2m  step 100ms  warmup 10s  seed 1
+nodes:
+  users  client   dc=main  rate: base 1.5k/s  ops: read 80%, write 20%
+  api    service  dc=main  replicas=2  capacity=1k/s (scenario)  service_time=500us (scenario)  c=1 (implied)  queue_limit=1000 (default)  ...
+  db     service  dc=main  replicas=1  capacity=5k/s (scenario)  service_time=2ms (scenario)  c=10 (implied)  queue_limit=500 (scenario)  ...
+links:
+  users -> api  inout  one_way=250us (intra_dc_rtt/2)  delay_steps=0
+  api -> db     inout  one_way=250us (intra_dc_rtt/2)  delay_steps=0
+order: users, api, db
+checks (peak offered load over the first 2m, no queueing):
+  api  peak offered 1.5k/s vs 2k/s total capacity  (75%, yellow)
+  db   peak offered 1.8k/s vs 5k/s total capacity  (36%, green)
+```
+
+The checks use each client's peak rate over the run (its curve sampled every minute, no
+noise), the number a back-of-the-envelope estimate sizes for. Here the rate is constant, so
+`run`'s utilizations agree with them:
+
+```
+$ simsys run scenarios/tutorial/chain/scenario.yaml
+scenario chain  1100 steps observed  drop rate 0%
+nodes
+  node   mean_rho  peak_rho  peak_backlog  dropped  rejected  red_s  peak_lag
+  users         -         -             -        -         -      -         -
+  api        0.75      0.75             0        0         0      0         -
+  db         0.36      0.36             0        0         0      0         -
+ops (percentiles estimated: lognormal fit to the response moments)
+  client.op    offered/s  attempts/s  timed out/s   mean     p50     p95     p99  (estimated)
+  users.read        1.2k        1.2k            0    5ms  4.35ms  10.4ms  14.8ms
+  users.write        300         300            0  7.5ms  6.81ms    14ms  18.9ms
+slo
+  status  metric       node   op     observed  max
+  PASS    p99_latency  users  read   14.8ms    20ms
+  PASS    p99_latency  users  write  18.9ms    40ms
+  PASS    drop_rate    -      -      0         0
+```
+
+The second worked example is the [rate-limiter lab](../scenarios/labs/rate-limiter/)
+(ch. 4): 800/s of `call` with three spikes (5x, 2x, 20x) through a 1k/s token bucket with
+`burst: 100`, whose counters live in a cache, in front of an api of 2 x 600/s. Each
+checked request reads and increments its counter; what the bucket refuses is rejected (the
+book's 429), never forwarded, and reported apart from drops:
+
+```
+$ simsys run scenarios/labs/rate-limiter/scenario.yaml
+scenario lab-rate-limiter  17400 steps observed  drop rate 0%  reject rate 14.3% (worst: limiter)
+nodes
+  node      mean_rho  peak_rho  peak_backlog  dropped  rejected  red_s  peak_lag
+  clients          -         -             -        -         -      -         -
+  limiter    0.00954      0.16             0        0    236.7k      0         -
+  counters   0.00954      0.16             0        0         0      0         -
+  api         0.6817         1            80        0         0    1.5         -
+ops (percentiles estimated: lognormal fit to the response moments)
+  client.op     offered/s  attempts/s  timed out/s    mean     p50     p95     p99  (estimated)
+  clients.call        954         954    0.0002833  5.73ms  4.32ms  14.9ms  24.8ms
+slo
+  status  metric       node     op    observed  max
+  PASS    utilization  api      -     0.6817    0.9
+  PASS    p99_latency  clients  call  24.8ms    50ms
+```
+
+At the start of each spike the full bucket lets its 100 tokens through on top of the
+refill, the api's queue absorbs them (backlog 80, 1.5 s red in 29 minutes), and from then
+on exactly 1k/s passes. Latency counts only the requests that were answered (the 80 that
+waited in the api's queue were, late). The lab's
+README compares the five algorithms at `burst: 500`, where the same surge overflows the
+api's queue and the p99 SLO fails.
+
+`run --series-ops` on the URL shortener (24 hours at 1 s steps; the first rows):
+
+```
+$ simsys run scenarios/book/url-shortener/scenario.yaml --series nodes.csv --series-ops ops.csv
+$ head -3 ops.csv
+t_s,client,op,offered_per_s,attempts_per_s,answered_per_s,timed_out_per_s,mean_ms
+0,users,redirect,6604.27,6604.27,6604.27,0,3.61342
+0,users,shorten,653.169,653.169,653.169,0,3.98179
+```
+
+`explain` follows the load through every tier the engine runs. On
+[YouTube](../scenarios/book/youtube/) (ch. 14) the CDNs are sized in bytes, so they count megabytes
+and are checked in MB/s, the requests beside; each upload's event goes through the transcoding
+queue to the transcoders, a worker pool whose capacity is workers / cost (600 transcoders at 60 s
+a video: 10/s), and on paper every video they are offered writes four renditions to the
+transcoded store and a completion the metadata tier records (in a run, every video they drain).
+The paper load does not queue, so the pool passes on all it is offered; its red line is a
+utilization verdict (96 % at the evening peak), not a backlog, and the cross-DC origin link, with
+a bandwidth, is checked in MB/s too (trimmed):
+
+```
+$ simsys explain scenarios/book/youtube/scenario.yaml
+...
+  cdn_us                    peak offered 14.08k MB/s (281.6/s) vs 100k MB/s total capacity  (14.1%, green)
+  api                       peak offered 48/s vs 12k/s total capacity  (0.4%, green)
+  metadata_db               peak offered 98.28 units/s vs 9k/s total capacity  (1.09%, green)  ...
+  transcoders               peak offered 9.6/s vs 10/s total capacity  (96%, red)
+  transcoded_store          peak offered 9.811k MB/s (196.2/s) vs 20k MB/s total capacity  (49.1%, green)
+  cdn_eu->transcoded_store  peak offered 2.856k MB/s vs 5k MB/s  (57.1%, green)
+```
+
+The paper load follows every node type's onward load since phase 3 (the URL frontier was the
+last it did not): no check line is marked `(load not propagated: ...)` any more.
+
+What runs today: clients, services, load balancers, rate limiters, caches (a fixed or a
+Che hit ratio), SQL databases (primary, read replicas, shards), CDNs and blob stores (sized in
+bytes, they count megabytes, wait for whole objects and answer a write at its last byte, a read
+at its first megabyte; a blob store's `then` steps are asynchronous event notifications, fired by
+its writes only), id generators, message queues (the publisher answered at the append, every
+message copied to each consumer group, the slowest group's lag reported and checked by the
+`queue_lag` SLO), worker pools (M/M/c at workers / cost, waiting in their
+queue's retention; their `then` steps fire for every job they drain, and nobody waits for them),
+external sinks (a third party's API at the type's 1k/s and 100 ms, failing its `failure_rate`
+of what it serves, counted as drops), key-value clusters (ch. 6's Dynamo-style store: `nodes`
+machines on a ring whose hottest machine is its own queue, every request sent to N replicas,
+answered at the W-th or R-th fastest of its own replica set and lost when fewer answer), search indexes (ch. 13's trie database, served like a
+service at the type's 5k/s and 5 ms; its rebuild is not modelled) and notification fan-outs (ch.
+10: a service that drops a `dedup` share as duplicates, counted apart as `deduplicated/s`, and
+publishes the rest to its channels' queues) and URL frontiers (ch. 9's: a prioritiser at its
+`capacity`, the URLs handed to the downloaders' pool, which drains at most `hosts × politeness`,
+and the frontier's lag read off that pool; an external sink's `politeness` caps it the same way
+over the frontier's hosts), and service discoveries and WebSocket gateways (ch. 12: open
+connections as a level, their heartbeats, and the reconnect storm after a gateway falls). These
+fourteen scenarios run end to end:
+
+- [`tutorial/hello`](../scenarios/tutorial/hello/), [`tutorial/chain`](../scenarios/tutorial/chain/):
+  one service, then two in a chain: the queueing basics.
+- [`labs/rate-limiter`](../scenarios/labs/rate-limiter/): ch. 4's five algorithms against spikes.
+- [`labs/consistent-hashing`](../scenarios/labs/consistent-hashing/): ch. 5's hash ring over four
+  Che caches in front of a SQL database.
+- [`labs/unique-id`](../scenarios/labs/unique-id/): ch. 7's ticket server vs snowflake; fails its
+  drop-rate SLO on purpose (exit 2).
+- [`labs/kv-store`](../scenarios/labs/kv-store/): ch. 6's key-value store, 30k requests/s on 16
+  machines with N = 3, W = R = 2: 90k replica-requests/s, the ring's hottest machine at 60.9 %,
+  put p99 2.31 ms; every SLO passes (at the book's 8 machines it drops a ninth: "Things to try").
+- [`book/url-shortener`](../scenarios/book/url-shortener/): ch. 8 over 24 hours at 12.8k/s
+  (peak 19.2k/s): limiter, 8 stateless web servers, a Che cache (h = 0.881), snowflake ids
+  and a SQL database in 3 shards; all three SLOs pass (redirect p99 7.49 ms, nothing dropped, the
+  database at 0.6433 in its worst hour, 13:02-14:02, against `max: 0.9, over: 1h`).
+- [`book/youtube`](../scenarios/book/youtube/): ch. 14 over 24 hours in bytes: two CDNs, blob
+  stores, a 40 Gbit/s cross-DC origin link, the transcoding queue and 600 workers, the metadata
+  tier. Every SLO passes (exit 0): European stream p99 465 ms, `transcode_q` 573 ms behind at
+  worst, `cdn_us` at 0.1403 in its worst hour; the 300 MB uploads are answered at about 12 s
+  within the 30 s timeout that stands for the book's resumable chunks. Its README sweeps the pool:
+  at 400 workers the queue falls 2.66 h behind by midnight.
+- [`book/news-feed`](../scenarios/book/news-feed/): ch. 11 over 24 hours, sized for its 12:00 spike
+  (21.6k/s): fan-out on write through a queue and 32 workers, feed, post and user caches, a SQL
+  database in 6 shards and the friendship graph as a key-value cluster. Each post's 300 feed
+  writes make the feed cache the biggest tier (10 replicas, 66 % at the peak); all three SLOs
+  pass, through a scripted 30 s outage of the database at 15:00 (feed p99 66.1 ms, 5.99 ms
+  without the outage; 0.039 % dropped, all of it in the outage; fan-out lag under a
+  microsecond).
+- [`book/search-autocomplete`](../scenarios/book/search-autocomplete/): ch. 13 over 24 hours at
+  24k keystrokes/s (peak 36k/s): browser cache, a Che-sized trie cache (h = 0.995) in front of a
+  4-replica search index, and the query-log pipeline. Both SLOs pass (suggest p99 6.86 ms of
+  100 ms, nothing dropped); the busiest node is on the data-gathering side, the log aggregators at
+  60 % at the peak (6 workers; at 4 they sit on the red threshold, 90 %).
+- [`book/notification-system`](../scenarios/book/notification-system/): ch. 10 over 24 hours at
+  1.9k notifications/s with a 20× marketing blast at 09:00 (27.93k/s): a fan-out that drops 2 % as
+  duplicates and publishes to four channel queues, one worker pool per channel retrying its
+  provider (`retries: 3`) and dead-lettering the rest. All three SLOs pass (nothing dropped, `ios_q`
+  4.03 min and `sms_q` 8.3 min behind at worst); its README shows what had to grow from the first
+  sizing (the notification servers from 140 %, the user database's replicas from 173 %, the iOS
+  pool to 260 workers to drain the blast within 5 minutes, the providers' quotas).
+
+- [`book/web-crawler`](../scenarios/book/web-crawler/): ch. 9's crawl loop over 6 hours: seeds, the
+  URL frontier (a 10k/s prioritiser, 10M hosts at one request a host a second), 1000 downloaders
+  that retry a failed fetch twice, DNS, the content and URL-seen filters. It fails both SLOs **on
+  purpose** (exit 2): each fetched page brings back 0.7 × 50 × 0.1 = 3.5 new URLs, a loop of gain
+  above 1, so the frontier is offered 6.8k URLs/s against the downloaders' 2000, their
+  utilization is 1 and the frontier's lag reaches 14.4 h against 30 minutes; its README sweeps
+  `hosts` (politeness caps the downloaders, the lag hardly moves) and the URL-seen filter.
+
+- [`book/google-drive`](../scenarios/book/google-drive/): ch. 15 over 24 hours at 3k/s (peak 4.26k/s
+  at 11:00): block servers, cloud and cold blob stores, a sharded metadata database behind a Che
+  cache, and `notify_q` read by two consumer groups, the notification pushes and an archive copy
+  of each upload to cold storage (a modelling addition, not the book's). The long polls are a
+  websocket gateway holding a fixed 2M connections whose re-polls (2M / 60 s = 33.33k/s) are 98 %
+  of its work. All four SLOs pass (download p99 125 ms of 2 s, metadata p99
+  6.6 ms of 100 ms, nothing dropped, `notify_q` 16.5 ms behind at worst); the backup pool is sized
+  at 3 workers, since at the 2 it first had it falls 1.07 h behind by 13:28.
+
+- [`book/chat-system`](../scenarios/book/chat-system/): ch. 12 over 24 hours: 50M daily users, 1.08M
+  connections open on average (1.62M at 21:00), whose 5 s heartbeats (324k/s at the peak) size
+  the 20 chat servers and the presence store; messages fanned out 1.4 times into the sync queue.
+  At 21:30 the whole gateway tier is down for a minute: 1.617M connections drop at once and 1.551M
+  users storm back over 30 s, the tier peaking at 90.5 % of its capacity (110 % if they all come
+  back within 10 s: its README sweeps the window). All three SLOs pass (send p99 4.82 ms, the
+  queue's lag under a microsecond, 0.0093 % dropped), and the run is back at its fault-free twin
+  as the storm ends, 30 s after the fault.
+
+Every node type has a model since phase 3 (a WebSocket gateway, a service discovery, a
+notification fan-out and a URL frontier were its last four), and every shipped scenario runs.
+Scripted faults run (`faults:`: a node or some of its replicas down, a capacity loss, a latency
+spike, a traffic spike, a cache flush, a datacenter down; `estimate` shows the steady state
+without them), and so do client and pool retries, `on: failure` steps and replications. kv
+partitions, random faults and the rest of the phase 4 backlog are in the
+[phase 3 plan](superpowers/plans/2026-10-30-phase3-faults-gateways.md)'s last section (4a's
+items are done: [its plan](superpowers/plans/2026-11-09-phase4a-sweep-reporting.md)); the
+rules as built are spec §20 and §21.
+
+## Web app
+
+```
+cd web
+npm ci
+npm run precompute -- --simsys ../build/gcc14-release/simsys   # about 3 min: every scenario's day
+npm run serve                                                  # http://localhost:4173
+```
+
+![chat-system at 21:30, its gateway down](images/web-chat-system.png)
+
+The page plays each book system's day in a minute, round and round (the second day of a two-day
+run, checked to end as it began), and each lab or tutorial run once. Click a box for its charts,
+a fault block or the zone strip to jump there; ← → move a minute, Shift an hour, Space plays.
+Node 22 is needed. How it works, and how to place a scenario's boxes with a `diagram.yaml`:
+[`web/README.md`](../web/README.md).
+
+## Toolchain
+
+GCC 14, Clang 19 or Clang 20 builds the project (named modules); every test passes with each, over
+GCC's standard library (libstdc++) and, with Clang 20, over LLVM's (libc++ 20, the library a
+WebAssembly build through Emscripten would use). CI builds GCC 14 (Debug, Release, ASan, TSan),
+Clang 19 over libstdc++ and Clang 20 over libc++. Clang 18 is used for clang-format only.
+CMake ≥ 3.28, Ninja. C++23 with named modules.
+
+## Build
+
+```bash
+cmake --preset gcc14-debug && cmake --build --preset gcc14-debug && ctest --preset gcc14-debug
+./build/gcc14-debug/simsys validate scenarios/book/news-feed/scenario.yaml
+# the same with Clang: clang19-debug, clang20-debug (libstdc++) or clang20-libcxx-debug (libc++)
+cmake --preset clang20-libcxx-debug && cmake --build --preset clang20-libcxx-debug && ctest --preset clang20-libcxx-debug
+```
+
+Two more presets build the tests under the sanitizers (CI runs both; see
+[`docs/study/sanitizers.md`](study/sanitizers.md)): `gcc14-asan` (AddressSanitizer and
+UndefinedBehaviorSanitizer, every test) and `gcc14-tsan` (ThreadSanitizer, the tests that start
+threads; on a recent kernel run `sudo sysctl vm.mmap_rnd_bits=28` first):
+
+```bash
+cmake --preset gcc14-asan && cmake --build --preset gcc14-asan && ctest --preset gcc14-asan
+```
+
+## Licence
+
+MIT — see [LICENSE](../LICENSE).
