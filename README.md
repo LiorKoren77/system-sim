@@ -3,6 +3,9 @@
 **A system design simulator you can play with.** Describe a distributed system, push a day of
 traffic through it, and watch where it bends: the boxes in the diagram turn yellow, then red.
 
+**Live demo: [syssim.stackchameleon.com](https://syssim.stackchameleon.com)**: pick one of the book's
+systems and watch its day.
+
 ![A chat system at 21:30, its gateway tier down](docs/images/web-chat-system.png)
 
 *The chat system from the book at 21:30, when its gateway tier goes down. The diagram, the charts
@@ -132,6 +135,7 @@ random failures, and a hosted version that runs in the browser.
 
 - [Technical reference](docs/reference.md): every command and flag, how each part works, the
   status of every phase.
+- [Deploying the web app](docs/deploy.md): how the live site is hosted and updated.
 - [The scenario language](docs/scenario-schema.md): what you can write in a YAML file.
 - [Study notes](docs/study/README.md): one note per modern C++ feature used in the code.
 - [The web app](web/README.md) and [the design challenges plan](docs/superpowers/specs/2026-11-12-phase6-design-challenges-design.md).
