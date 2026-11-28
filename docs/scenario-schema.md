@@ -2405,7 +2405,7 @@ a **run**, streamed as it is (`--points 720`, the default).
 |---|---|
 | `dataset_version` | the dataset line's version, 1; the other lines keep the stream's `format_version` |
 | `id` | the scenario's path under `scenarios/` without `/scenario.yaml`, `book/chat-system`; the file is the id with `/` → `-`, `book-chat-system.ndjson.gz` |
-| `title`, `chapter` | from the scenario README's heading; `null` if absent |
+| `title` | from the scenario README's heading, a trailing ` (ch. N)` stripped; `null` if absent |
 | `kind` | `day` or `run` |
 | `window` | `from_s`, `to_s`: the run time the frames cover; day 2 (86400–172800) for a day that repeats, the whole run otherwise |
 | `loops` | `true` for a day whose seam check passed: the page plays it round and round |
@@ -2427,7 +2427,7 @@ proof. All seven shipped days repeat (2026-11-11).
 **`index.json`**, sorted by `id`: `index_version` 1, `format_version` 1, `simsys_commit` (`git
 rev-parse --short HEAD` of the sources, `-dirty` for a changed tree; in the index, not the
 datasets, so a dataset's bytes depend only on simsys's output), and `datasets`: per dataset `id`,
-`file`, `bytes`, `title`, `chapter`, `kind`, `duration_s`, `loops`, `seam` (its `status`, or
+`file`, `bytes`, `title`, `kind`, `duration_s`, `loops`, `seam` (its `status`, or
 `null`), `frames`, `slo_passed`.
 
 **`diagram.yaml`** (optional, beside `scenario.yaml`): where the page draws the boxes, which ELK

@@ -81,7 +81,7 @@ says "does not repeat". All seven shipped days repeat.
 ## Placing a scenario's boxes: `diagram.yaml`
 
 ELK lays out a scenario by itself (left to right, clients first, each link joined to the sides of
-its boxes that face each other). To draw it like the book's figure, put a `diagram.yaml` beside the
+its boxes that face each other). To draw it like the usual architecture diagram, put a `diagram.yaml` beside the
 `scenario.yaml` (web-crawler has one):
 
 ```yaml

@@ -78,12 +78,7 @@ export function App(props: {
         }}
       />
       <main>
-        {entry && (
-          <h1>
-            {entry.title ?? entry.id}
-            {entry.chapter !== null && <span className="chapter"> · ch. {entry.chapter}</span>}
-          </h1>
-        )}
+        {entry && <h1>{entry.title ?? entry.id}</h1>}
         {store && (
           <Dataset
             key={entry?.id}

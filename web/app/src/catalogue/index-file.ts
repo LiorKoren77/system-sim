@@ -6,7 +6,6 @@ export interface IndexEntry {
   readonly file: string;
   readonly bytes: number;
   readonly title: string | null;
-  readonly chapter: number | null;
   readonly kind: "day" | "run";
   readonly duration_s: number;
   readonly loops: boolean;

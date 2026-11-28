@@ -39,7 +39,6 @@ export async function precomputeOne(
     file: datasetFileName(entry.id),
     bytes: dataset.gz.length,
     title: entry.title,
-    chapter: entry.chapter,
     kind: entry.kind,
     duration_s: stream.run.message.duration_s,
     loops: cut.loops,

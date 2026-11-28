@@ -183,7 +183,6 @@ export interface DatasetLine {
   readonly dataset_version: number;
   readonly id: string;
   readonly title: string | null;
-  readonly chapter: number | null;
   readonly kind: "day" | "run";
   readonly window: { readonly from_s: number; readonly to_s: number };
   readonly loops: boolean;

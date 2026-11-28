@@ -1,6 +1,6 @@
 // Where each node of the diagram goes, computed by ELK (the Eclipse Layout Kernel, compiled to
 // JavaScript): its "layered" algorithm draws a directed graph left to right in columns, the way
-// the book draws a request's path from clients to storage, with as few crossing edges as it can.
+// a typical architecture diagram draws a request's path from clients to storage, with as few crossing edges as it can.
 // Clients are put in the first column. With two or more datacenters, each is a box (an ELK compound
 // node) holding its nodes, and edges may cross between boxes.
 //
@@ -48,8 +48,8 @@ const rootOptions = {
   "elk.algorithm": "layered",
   "elk.direction": "RIGHT",
   "elk.hierarchyHandling": "INCLUDE_CHILDREN",
-  // ELK routes the edges too: right-angled lines that go around the boxes, the way the book draws a
-  // system, with their coordinates relative to the whole diagram (not to a datacenter box).
+  // ELK routes the edges too: right-angled lines that go around the boxes, the way an architecture
+  // diagram is usually drawn, with their coordinates relative to the whole diagram (not to a datacenter box).
   "elk.edgeRouting": "ORTHOGONAL",
   "elk.json.edgeCoords": "ROOT",
   "elk.layered.spacing.edgeNodeBetweenLayers": "24",

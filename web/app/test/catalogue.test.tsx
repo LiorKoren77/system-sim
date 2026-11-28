@@ -21,7 +21,7 @@ const datasets = index([
 ]);
 
 describe("the catalogue of datasets", () => {
-  it("groups the datasets as the scenarios folder does, labelling the book folder "systems"", () => {
+  it("groups the datasets as the scenarios folder does, showing the book folder as systems", () => {
     render(
       <Catalogue
         index={datasets}

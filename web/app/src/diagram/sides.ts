@@ -4,8 +4,8 @@
 // - the other box to the right: right side to left side, the direction the diagram flows in;
 // - the other box above or below: top or bottom to the facing side;
 // - the other box to the left, an edge back against the flow (web-crawler's url_seen → frontier,
-//   a loop): it leaves and enters on the bottom, and runs back under the boxes between, as the book
-//   draws such loops; on the top when the box it returns to is lower.
+//   a loop): it leaves and enters on the bottom, and runs back under the boxes between, as architecture
+//   diagrams usually draw such loops; on the top when the box it returns to is lower.
 //
 // "Above or below" against "beside" is decided by the gap between the two boxes on each axis, not
 // by the distance between their centres: the boxes are much wider than tall.

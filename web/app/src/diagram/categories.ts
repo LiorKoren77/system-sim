@@ -1,16 +1,16 @@
-// The categories a diagram's boxes are coloured by: the kinds of component the book's chapters
-// talk about, eight of them for simsys's eighteen node types. The colour says what a box is; the
+// The categories a diagram's boxes are coloured by: the kinds of component architecture diagrams
+// usually show, eight of them for simsys's eighteen node types. The colour says what a box is; the
 // zone (its border and pill, NodeCard.tsx) says how it is doing, so the category hues keep clear of
 // the zones' green, amber and red (theme.css).
 
 export const CATEGORIES = [
   "client",
-  "traffic & routing", // what spreads, limits or directs requests: ch. 1, 4, 12
-  "compute", // stateless servers and workers: ch. 1, 7, 10
-  "cache", // copies close to the reader: ch. 1, 14
-  "database", // the system of record: ch. 1, 6, 13
-  "storage", // blobs and files: ch. 14, 15
-  "queue", // work waiting for a consumer: ch. 9, 10
+  "traffic & routing", // what spreads, limits or directs requests
+  "compute", // stateless servers and workers
+  "cache", // copies close to the reader
+  "database", // the system of record
+  "storage", // blobs and files
+  "queue", // work waiting for a consumer
   "external", // outside the system: a third-party service, the web
 ] as const;
 

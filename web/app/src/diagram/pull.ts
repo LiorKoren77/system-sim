@@ -1,4 +1,4 @@
-// A worker pool pulls from the queue it consumes (book ch. 10: the notification workers read their
+// A worker pool pulls from the queue it consumes (the notification workers read their
 // channel's queue; Kafka's consumers fetch from the broker). simsys declares that link queue → pool,
 // the way the messages move, so on the diagram the pool is the caller of a link it is the target of:
 // its arrowhead points at the queue (caller to callee), its dashes still move toward the pool (the

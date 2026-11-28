@@ -11,7 +11,6 @@ export interface ScenarioEntry {
   readonly path: string; // relative to the repository root, as simsys is given it
   readonly kind: "day" | "run";
   readonly title: string | null;
-  readonly chapter: number | null;
   // The scenario's diagram.yaml as written, unchecked: the precompute checks it against the graph
   // simsys resolves (diagram.ts). null when the scenario has none.
   readonly diagram: Diagram | null;
@@ -37,7 +36,7 @@ export async function findScenarios(repoRoot: string): Promise<ScenarioEntry[]> 
         id: `${group.name}/${name.name}`,
         path: `scenarios/${group.name}/${name.name}/scenario.yaml`,
         kind: isDay(yamlText) ? "day" : "run",
-        ...readmeHeading(readme),
+        title: readmeHeading(readme),
         diagram: diagramText === null ? null : (parse(diagramText) as Diagram),
       });
     }
@@ -53,15 +52,12 @@ export function simsysArgs(entry: ScenarioEntry): string[] {
   return entry.kind === "day" ? [...base, "--days", "2", "--every", "1m"] : base;
 }
 
-// The README's first heading, `# Chat system (ch. 12)`: the title, and the book's chapter when the
-// heading names one.
-export function readmeHeading(readme: string): { title: string | null; chapter: number | null } {
+// The README's first heading, `# Chat system (ch. 12)`, as the title: a trailing chapter mark, which
+// older READMEs carry, is stripped so the title stays clean. Null when there is no heading.
+export function readmeHeading(readme: string): string | null {
   const heading = /^# (.+)$/m.exec(readme)?.[1]?.trim();
-  if (heading === undefined) return { title: null, chapter: null };
-  const chapter = /^(.*?)\s*\(ch\. (\d+)\)$/.exec(heading);
-  if (chapter?.[1] === undefined || chapter[2] === undefined)
-    return { title: heading, chapter: null };
-  return { title: chapter[1], chapter: Number(chapter[2]) };
+  if (heading === undefined) return null;
+  return heading.replace(/\s*\(ch\. \d+\)$/, "");
 }
 
 // Whether the scenario's `duration` is one day. The one key the precompute reads from a scenario;
