@@ -29,7 +29,6 @@ export function entry(id: string, overrides: Partial<IndexEntry> = {}): IndexEnt
     file: `${id.replace("/", "-")}.ndjson.gz`,
     bytes: 1000,
     title: id,
-    chapter: null,
     kind: "run",
     duration_s: 1800,
     loops: false,

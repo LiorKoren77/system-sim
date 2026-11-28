@@ -185,7 +185,7 @@ describe("the diagram's four-sided connections", () => {
   });
 
   it("loops url_seen back into the frontier underneath, bottom side to bottom side", async () => {
-    // The book draws the crawler's loop this way: newly seen URLs return to the frontier from below.
+    // The usual diagram draws the crawler's loop this way: newly seen URLs return to the frontier from below.
     const layout = await layoutGraph(crawler);
     const route = routeOf(layout, crawler, "url_seen", "frontier");
     const from = boxOf(layout, "url_seen");

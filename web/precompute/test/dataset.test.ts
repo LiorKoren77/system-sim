@@ -10,7 +10,6 @@ const entry: ScenarioEntry = {
   path: "scenarios/book/chat-system/scenario.yaml",
   kind: "day",
   title: "Chat system",
-  chapter: 12,
   diagram: null,
 };
 
@@ -45,7 +44,6 @@ describe("a dataset file", () => {
       "dataset_version",
       "id",
       "title",
-      "chapter",
       "kind",
       "window",
       "loops",

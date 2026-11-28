@@ -25,7 +25,7 @@ describe("the shipped scenarios the precompute runs", () => {
     ]);
   });
 
-  it("calls the seven 24 h book scenarios days and the rest runs", async () => {
+  it("calls the seven 24 h system scenarios days and the rest runs", async () => {
     const scenarios = await findScenarios(repoRoot);
     const days = scenarios.filter((s) => s.kind === "day").map((s) => s.id);
     expect(days).toEqual([
@@ -65,15 +65,11 @@ describe("the shipped scenarios the precompute runs", () => {
     expect(scenarios.find((s) => s.id === "tutorial/hello")?.diagram).toBeNull();
   });
 
-  it("takes the title and the book chapter from the README's heading", () => {
-    expect(readmeHeading("# Chat system (ch. 12)\n\nText")).toEqual({
-      title: "Chat system",
-      chapter: 12,
-    });
-    expect(readmeHeading("# Tutorial 1: hello, one client and one service\n")).toEqual({
-      title: "Tutorial 1: hello, one client and one service",
-      chapter: null,
-    });
-    expect(readmeHeading("no heading")).toEqual({ title: null, chapter: null });
+  it("takes the title from the README's heading and strips a trailing chapter mark", () => {
+    expect(readmeHeading("# Chat system (ch. 12)\n\nText")).toBe("Chat system");
+    expect(readmeHeading("# Tutorial 1: hello, one client and one service\n")).toBe(
+      "Tutorial 1: hello, one client and one service",
+    );
+    expect(readmeHeading("no heading")).toBeNull();
   });
 });
