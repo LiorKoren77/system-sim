@@ -23,8 +23,8 @@ export type PlayerAction =
   | { readonly type: "setSpeed"; readonly seconds: number };
 
 // A speed is how long the whole window takes to play, whatever its frames: a day of 1440 frames of
-// 1 min in a minute is 24 frames a second, a run of 720 frames in a minute 12. Chosen, not from the
-// book: a minute is long enough to see a wave rise and short enough to watch a whole day.
+// 1 min in a minute is 24 frames a second, a run of 720 frames in a minute 12. Chosen by feel,
+// not derived: a minute is long enough to see a wave rise and short enough to watch a whole day.
 export const SPEEDS = [
   { label: "30 s", seconds: 30 },
   { label: "1 min", seconds: 60 },

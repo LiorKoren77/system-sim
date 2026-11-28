@@ -9,7 +9,6 @@ export interface IndexEntry {
   readonly file: string;
   readonly bytes: number;
   readonly title: string | null;
-  readonly chapter: number | null;
   readonly kind: "day" | "run";
   readonly duration_s: number; // the run's length: 172800 for a day lived twice
   readonly loops: boolean;

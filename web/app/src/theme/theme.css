@@ -128,11 +128,6 @@ body {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
-.catalogue .chapter {
-  color: var(--muted);
-  font-size: 12px;
-}
-
 .badge {
   grid-column: 1 / -1;
   justify-self: start;
@@ -166,11 +161,6 @@ main h1 {
   padding: 12px 16px;
   font-size: 18px;
   border-bottom: 1px solid var(--line);
-}
-
-main h1 .chapter {
-  color: var(--muted);
-  font-weight: normal;
 }
 
 /* The diagram, with the selected box's charts and the report in a column beside it. */

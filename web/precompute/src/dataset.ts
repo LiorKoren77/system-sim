@@ -32,7 +32,6 @@ export function buildDataset(
     dataset_version: DATASET_VERSION,
     id: entry.id,
     title: entry.title,
-    chapter: entry.chapter,
     kind: entry.kind,
     window: cut.window,
     loops: cut.loops,

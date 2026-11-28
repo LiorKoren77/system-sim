@@ -1,7 +1,8 @@
 import { durationLabel } from "../timeline/clock";
+import { groupLabel } from "./group-label";
 import type { Index, IndexEntry } from "./index-file";
 
-// The list of datasets, grouped as scenarios/ is (book, labs, tutorial), each with a badge that says
+// The list of datasets, grouped as scenarios/ is (systems, labs, tutorial), each with a badge that says
 // how it plays: a repeating day loops; a day that does not repeat plays both of its days once; a
 // run plays once. The list hides to a narrow rail with the button that brings it back, which gives
 // its 260 px to the diagram.
@@ -25,7 +26,7 @@ export function Catalogue(props: {
       <PaneToggle open onToggle={props.onToggle} />
       {[...groups].map(([group, entries]) => (
         <section key={group}>
-          <h2>{group}</h2>
+          <h2>{groupLabel(group)}</h2>
           <ul>
             {entries.map((entry) => (
               <li key={entry.id}>
@@ -37,7 +38,6 @@ export function Catalogue(props: {
                   }}
                 >
                   <span className="title">{entry.title ?? entry.id}</span>
-                  {entry.chapter !== null && <span className="chapter">ch. {entry.chapter}</span>}
                   <Badge entry={entry} />
                 </button>
               </li>

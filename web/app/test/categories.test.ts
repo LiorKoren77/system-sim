@@ -29,7 +29,7 @@ describe("the categories a box is coloured by", () => {
     for (const type of nodeTypes) expect(CATEGORIES).toContain(categoryOf(type));
   });
 
-  it("groups the types as the book's chapters talk about them", () => {
+  it("groups the types as architecture diagrams usually do", () => {
     expect(
       ["load_balancer", "rate_limiter", "ws_gateway", "service_discovery"].map(categoryOf),
     ).toEqual(Array(4).fill("traffic & routing"));

@@ -7,23 +7,21 @@ import { entry, index } from "./support";
 const datasets = index([
   entry("book/chat-system", {
     title: "Chat system",
-    chapter: 12,
     kind: "day",
     loops: true,
     seam: "repeats",
   }),
   entry("book/youtube", {
     title: "YouTube",
-    chapter: 14,
     kind: "day",
     loops: false,
     seam: "drifts",
   }),
-  entry("labs/kv-store", { title: "Lab: key-value store", chapter: 6, duration_s: 1800 }),
+  entry("labs/kv-store", { title: "Lab: key-value store", duration_s: 1800 }),
 ]);
 
 describe("the catalogue of datasets", () => {
-  it("groups the datasets as the scenarios folder does", () => {
+  it("groups the datasets as the scenarios folder does, showing the book folder as systems", () => {
     render(
       <Catalogue
         index={datasets}
@@ -34,7 +32,7 @@ describe("the catalogue of datasets", () => {
       />,
     );
     expect(screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent)).toEqual([
-      "book",
+      "systems",
       "labs",
     ]);
   });
@@ -60,7 +58,7 @@ describe("the catalogue of datasets", () => {
     ).toBeVisible();
   });
 
-  it("names the book chapter beside the title", () => {
+  it("shows no chapter badge beside a title", () => {
     render(
       <Catalogue
         index={datasets}
@@ -70,7 +68,7 @@ describe("the catalogue of datasets", () => {
         onToggle={() => undefined}
       />,
     );
-    expect(screen.getByRole("button", { name: /Chat system/ })).toHaveTextContent("ch. 12");
+    expect(screen.getByRole("button", { name: /Chat system/ })).not.toHaveTextContent("ch.");
   });
 
   it("tells which dataset was chosen", async () => {

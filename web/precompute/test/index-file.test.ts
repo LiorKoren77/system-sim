@@ -7,7 +7,6 @@ function entry(id: string): IndexEntry {
     file: `${id.replace("/", "-")}.ndjson.gz`,
     bytes: 100,
     title: id,
-    chapter: null,
     kind: "run",
     duration_s: 60,
     loops: false,

@@ -18,7 +18,6 @@ vi.mock("../src/charts/Chart", () => ({
 const datasets = index([
   entry("book/url-shortener", {
     title: "URL shortener",
-    chapter: 8,
     kind: "day",
     loops: true,
     seam: "repeats",
